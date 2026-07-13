@@ -122,6 +122,7 @@ import {
   startAutoRefresh as startAgentRunAutoRefresh,
   getAgentRunState,
   clearAgentRunProjection,
+  setAgentRunBridgeConnected,
 } from '../../stores/agent-run-store.svelte';
 import { refreshCurrentGoal } from '../../stores/goal-store.svelte';
 import { sanitizeSvgContent } from '../svg-sanitizer';
@@ -196,6 +197,8 @@ let recoveryInFlight: Promise<void> | null = null;
 let recoveryInFlightBindingKey = '';
 let eventStreamSnapshotRefreshInFlight: Promise<void> | null = null;
 let eventStreamSnapshotRefreshBindingKey = '';
+let eventStreamTunnelSyncInFlight: Promise<void> | null = null;
+let eventStreamTunnelSyncBindingKey = '';
 let initialWindowBindingHydrated = false;
 let workspaceSessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 const inFlightChangeMutationScopes = new Set<string>();
@@ -809,6 +812,52 @@ function refreshBootstrapForSilentEventStream(reason: string, error: Error): voi
   eventStreamSnapshotRefreshInFlight = request;
 }
 
+function syncTunnelRuntimeForSilentEventStream(reason: string, error: Error): void {
+  const binding = resolveWorkspaceQuery();
+  const syncBindingKey = bootstrapBindingKey(binding);
+  if (
+    eventStreamTunnelSyncInFlight
+    && eventStreamTunnelSyncBindingKey === syncBindingKey
+  ) {
+    return;
+  }
+  eventStreamTunnelSyncBindingKey = syncBindingKey;
+  const request = (async (): Promise<void> => {
+    if (!binding.workspaceId || !binding.sessionId) {
+      return;
+    }
+    const snapshot = await getWorkspaceSessions(
+      binding.workspaceId,
+      binding.sessionId,
+      binding.workspacePath,
+    );
+    if (bootstrapBindingKey(resolveWorkspaceQuery()) !== syncBindingKey) {
+      return;
+    }
+    emitDataMessage('sessionsUpdated', { sessions: snapshot.sessions });
+    const currentSession = snapshot.sessions.find((session) => session.id === binding.sessionId);
+    if (currentSession?.isRunning !== false) {
+      return;
+    }
+    emitForcedProcessingIdle('event_stream_tunnel_terminal_summary', {
+      sessionId: binding.sessionId,
+    });
+    await fetchBootstrap({
+      forceFresh: true,
+      forceEventStreamReconnect: false,
+      refreshSettingsBootstrapOnBindingChange: false,
+    });
+  })().catch((syncError) => {
+    scheduleRecovery(reason, syncError || error, true);
+  }).finally(() => {
+    if (eventStreamTunnelSyncInFlight === request) {
+      eventStreamTunnelSyncInFlight = null;
+      eventStreamTunnelSyncBindingKey = '';
+    }
+  });
+  eventStreamTunnelSyncInFlight = request;
+}
+
 function stopEventStreamIdleCheck(): void {
   if (eventStreamIdleCheckTimer !== null) {
     window.clearInterval(eventStreamIdleCheckTimer);
@@ -838,7 +887,7 @@ function startEventStreamIdleCheck(): void {
       && idleMs >= EVENT_STREAM_TUNNEL_BUSY_REFRESH_INTERVAL_MS
     ) {
       markEventStreamActive();
-      refreshBootstrapForSilentEventStream(
+      syncTunnelRuntimeForSilentEventStream(
         'event_stream_tunnel_busy_snapshot',
         new Error(`Tunnel SSE 静默刷新：${Math.round(idleMs / 1000)}s`),
       );
@@ -2035,6 +2084,7 @@ function dispatchEmptyWorkspaceState(): void {
 
 
 function closeEventStream(): void {
+  setAgentRunBridgeConnected(false);
   clearEventStreamOpenTimeout();
   stopEventStreamIdleCheck();
   activeEventStreamOpenReject?.(new Error('事件流连接已关闭'));
@@ -2196,6 +2246,7 @@ async function ensureEventStream(
           return;
         }
         activeEventStreamState = 'open';
+        setAgentRunBridgeConnected(true);
         startEventStreamIdleCheck();
         resolveEventStreamOpen();
       },

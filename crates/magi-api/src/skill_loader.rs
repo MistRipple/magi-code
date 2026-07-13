@@ -215,27 +215,35 @@ pub fn skills_config_object(store: &SettingsStore) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-pub fn save_skills_config_object(store: &SettingsStore, config: Map<String, Value>) {
+pub fn save_skills_config_object(
+    store: &SettingsStore,
+    config: Map<String, Value>,
+) -> Result<(), std::io::Error> {
     let mut snapshot = HashMap::from([(SKILLS_CONFIG_SECTION.to_string(), Value::Object(config))]);
     normalize_skills_config_sections(&mut snapshot);
     let canonical = snapshot
         .remove(SKILLS_CONFIG_SECTION)
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
-    store.set_section(SKILLS_CONFIG_SECTION, Value::Object(canonical));
-    store.remove_section(TOP_LEVEL_INSTRUCTION_SKILLS_SECTION);
-    store.remove_section(TOP_LEVEL_CUSTOM_TOOLS_SECTION);
+    store.apply_section_changes(
+        [(SKILLS_CONFIG_SECTION.to_string(), Value::Object(canonical))],
+        [
+            TOP_LEVEL_INSTRUCTION_SKILLS_SECTION.to_string(),
+            TOP_LEVEL_CUSTOM_TOOLS_SECTION.to_string(),
+        ],
+    )
 }
 
-fn canonicalize_skills_config_store(store: &SettingsStore) {
+fn canonicalize_skills_config_store(store: &SettingsStore) -> Result<(), std::io::Error> {
     let canonical = skills_config_object(store);
     let current = store.get_section(SKILLS_CONFIG_SECTION);
     let needs_update = current.as_object() != Some(&canonical)
         || store.get(TOP_LEVEL_INSTRUCTION_SKILLS_SECTION).is_some()
         || store.get(TOP_LEVEL_CUSTOM_TOOLS_SECTION).is_some();
     if needs_update {
-        save_skills_config_object(store, canonical);
+        save_skills_config_object(store, canonical)?;
     }
+    Ok(())
 }
 
 fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistry {
@@ -321,13 +329,14 @@ pub fn load_skills_into_registry(store: &SettingsStore) -> SkillRegistry {
     build_skill_registry_from_config(&config)
 }
 
-pub fn build_skill_runtime_from_settings(store: &SettingsStore) -> SkillRuntime {
-    canonicalize_skills_config_store(store);
-    SkillRuntime::new(load_skills_into_registry(store))
+pub fn build_skill_runtime_from_settings(
+    store: &SettingsStore,
+) -> Result<SkillRuntime, std::io::Error> {
+    canonicalize_skills_config_store(store)?;
+    Ok(SkillRuntime::new(load_skills_into_registry(store)))
 }
 
 pub fn reload_skill_runtime_from_settings(skill_runtime: &SkillRuntime, store: &SettingsStore) {
-    canonicalize_skills_config_store(store);
     let loaded = load_skills_into_registry(store);
     let registry = skill_runtime.registry();
     registry.clear();
@@ -364,18 +373,20 @@ mod tests {
             "# Prompt Only Skill\n\n先取证，再回答。\n",
         );
         let store = SettingsStore::default();
-        store.set_section(
-            SKILLS_CONFIG_SECTION,
-            serde_json::json!({
-                "instructionSkills": [{
-                    "skillId": "prompt-only",
-                    "name": "Prompt Only",
-                    "directoryPath": skill_dir.to_string_lossy().to_string()
-                }]
-            }),
-        );
+        store
+            .set_section(
+                SKILLS_CONFIG_SECTION,
+                serde_json::json!({
+                    "instructionSkills": [{
+                        "skillId": "prompt-only",
+                        "name": "Prompt Only",
+                        "directoryPath": skill_dir.to_string_lossy().to_string()
+                    }]
+                }),
+            )
+            .unwrap();
 
-        let runtime = build_skill_runtime_from_settings(&store);
+        let runtime = build_skill_runtime_from_settings(&store).unwrap();
         let plan = runtime.build_tool_runtime_plan(SkillSelection {
             skill_ids: vec!["prompt-only".to_string()],
             requested_tools: Vec::new(),
@@ -431,18 +442,20 @@ mod tests {
             make_local_skill_dir("skill-md", "# 中文工程规范\n\n请输出 skill-loader-e2e。\n");
 
         let store = SettingsStore::new();
-        store.set_section(
-            "skillsConfig",
-            serde_json::json!({
-                "instructionSkills": [
-                    {
-                        "skillId": "cn-engineering-standard",
-                        "name": "cn-engineering-standard",
-                        "directoryPath": skill_dir.to_string_lossy().to_string()
-                    }
-                ]
-            }),
-        );
+        store
+            .set_section(
+                "skillsConfig",
+                serde_json::json!({
+                    "instructionSkills": [
+                        {
+                            "skillId": "cn-engineering-standard",
+                            "name": "cn-engineering-standard",
+                            "directoryPath": skill_dir.to_string_lossy().to_string()
+                        }
+                    ]
+                }),
+            )
+            .unwrap();
 
         let registry = load_skills_into_registry(&store);
         let plan = registry.build_tool_runtime_plan(&SkillSelection {
@@ -482,28 +495,30 @@ mod tests {
         let missing_dir = unique_test_dir("missing-skill");
 
         let store = SettingsStore::new();
-        store.set_section(
-            "skillsConfig",
-            serde_json::json!({
-                "instructionSkills": [
-                    {
-                        "skillId": "valid-skill",
-                        "name": "valid-skill",
-                        "directoryPath": valid_dir.to_string_lossy().to_string()
-                    },
-                    {
-                        "skillId": "empty-skill",
-                        "name": "empty-skill",
-                        "directoryPath": empty_dir.to_string_lossy().to_string()
-                    },
-                    {
-                        "skillId": "missing-skill",
-                        "name": "missing-skill",
-                        "directoryPath": missing_dir.to_string_lossy().to_string()
-                    }
-                ]
-            }),
-        );
+        store
+            .set_section(
+                "skillsConfig",
+                serde_json::json!({
+                    "instructionSkills": [
+                        {
+                            "skillId": "valid-skill",
+                            "name": "valid-skill",
+                            "directoryPath": valid_dir.to_string_lossy().to_string()
+                        },
+                        {
+                            "skillId": "empty-skill",
+                            "name": "empty-skill",
+                            "directoryPath": empty_dir.to_string_lossy().to_string()
+                        },
+                        {
+                            "skillId": "missing-skill",
+                            "name": "missing-skill",
+                            "directoryPath": missing_dir.to_string_lossy().to_string()
+                        }
+                    ]
+                }),
+            )
+            .unwrap();
 
         let registry = load_skills_into_registry(&store);
         let plan = registry.build_tool_runtime_plan(&SkillSelection {
@@ -553,18 +568,20 @@ mod tests {
         .expect("skill config should be written");
 
         let store = SettingsStore::new();
-        store.set_section(
-            "skillsConfig",
-            serde_json::json!({
-                "instructionSkills": [
-                    {
-                        "skillId": "custom-skill",
-                        "name": "custom-skill",
-                        "directoryPath": skill_dir.to_string_lossy().to_string()
-                    }
-                ]
-            }),
-        );
+        store
+            .set_section(
+                "skillsConfig",
+                serde_json::json!({
+                    "instructionSkills": [
+                        {
+                            "skillId": "custom-skill",
+                            "name": "custom-skill",
+                            "directoryPath": skill_dir.to_string_lossy().to_string()
+                        }
+                    ]
+                }),
+            )
+            .unwrap();
 
         let registry = load_skills_into_registry(&store);
         let skill = registry.get("custom-skill").expect("skill should exist");
@@ -595,18 +612,20 @@ mod tests {
             "# Runtime build\n\n请输出 runtime-build。\n",
         );
         let store = SettingsStore::new();
-        store.set_section(
-            "skills",
-            serde_json::json!([
-                {
-                    "skillId": "runtime-skill",
-                    "name": "runtime-skill",
-                    "directoryPath": skill_dir.to_string_lossy().to_string()
-                }
-            ]),
-        );
+        store
+            .set_section(
+                "skills",
+                serde_json::json!([
+                    {
+                        "skillId": "runtime-skill",
+                        "name": "runtime-skill",
+                        "directoryPath": skill_dir.to_string_lossy().to_string()
+                    }
+                ]),
+            )
+            .unwrap();
 
-        let runtime = build_skill_runtime_from_settings(&store);
+        let runtime = build_skill_runtime_from_settings(&store).unwrap();
         let registry = runtime.registry();
         assert!(registry.get("runtime-skill").is_none());
         assert!(store.get("skills").is_none());
@@ -622,34 +641,38 @@ mod tests {
             make_local_skill_dir("reload-second", "# Second\n\n请输出 second-skill。\n");
 
         let store = SettingsStore::new();
-        store.set_section(
-            "skillsConfig",
-            serde_json::json!({
-                "instructionSkills": [
-                    {
-                        "skillId": "first-skill",
-                        "name": "first-skill",
-                        "directoryPath": first_dir.to_string_lossy().to_string()
-                    }
-                ]
-            }),
-        );
+        store
+            .set_section(
+                "skillsConfig",
+                serde_json::json!({
+                    "instructionSkills": [
+                        {
+                            "skillId": "first-skill",
+                            "name": "first-skill",
+                            "directoryPath": first_dir.to_string_lossy().to_string()
+                        }
+                    ]
+                }),
+            )
+            .unwrap();
 
-        let runtime = build_skill_runtime_from_settings(&store);
+        let runtime = build_skill_runtime_from_settings(&store).unwrap();
         assert!(runtime.registry().get("first-skill").is_some());
 
-        store.set_section(
-            "skillsConfig",
-            serde_json::json!({
-                "instructionSkills": [
-                    {
-                        "skillId": "second-skill",
-                        "name": "second-skill",
-                        "directoryPath": second_dir.to_string_lossy().to_string()
-                    }
-                ]
-            }),
-        );
+        store
+            .set_section(
+                "skillsConfig",
+                serde_json::json!({
+                    "instructionSkills": [
+                        {
+                            "skillId": "second-skill",
+                            "name": "second-skill",
+                            "directoryPath": second_dir.to_string_lossy().to_string()
+                        }
+                    ]
+                }),
+            )
+            .unwrap();
 
         reload_skill_runtime_from_settings(&runtime, &store);
         let registry = runtime.registry();
@@ -663,14 +686,18 @@ mod tests {
     #[test]
     fn save_skills_config_object_removes_obsolete_sections_without_loading_them() {
         let store = SettingsStore::new();
-        store.set_section(
-            "skills",
-            serde_json::json!([{ "skillId": "obsolete-skill" }]),
-        );
-        store.set_section(
-            "customTools",
-            serde_json::json!([{ "name": "obsolete-tool" }]),
-        );
+        store
+            .set_section(
+                "skills",
+                serde_json::json!([{ "skillId": "obsolete-skill" }]),
+            )
+            .unwrap();
+        store
+            .set_section(
+                "customTools",
+                serde_json::json!([{ "name": "obsolete-tool" }]),
+            )
+            .unwrap();
 
         save_skills_config_object(
             &store,
@@ -685,7 +712,8 @@ mod tests {
             .as_object()
             .cloned()
             .expect("skills config should be an object"),
-        );
+        )
+        .unwrap();
 
         assert!(store.get("skills").is_none());
         assert!(store.get("customTools").is_none());
@@ -733,7 +761,8 @@ mod tests {
             .as_object()
             .cloned()
             .expect("skills config should be an object"),
-        );
+        )
+        .unwrap();
 
         let saved = store.get_section("skillsConfig");
         for key in [

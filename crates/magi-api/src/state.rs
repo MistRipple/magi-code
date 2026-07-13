@@ -1669,6 +1669,9 @@ impl ApiState {
         if let Some(manager) = self.runner_manager() {
             manager.unbind_session(session_id).await;
         }
+        self.settings_store
+            .remove_session(session_id)
+            .map_err(crate::errors::settings_persistence_error)?;
         self.clear_all_regular_session_turn_queues(session_id);
 
         let mut mission_ids = HashSet::new();
@@ -1722,7 +1725,6 @@ impl ApiState {
             .map_err(|error| ApiError::internal_assembly("清理会话 SpawnGraph 失败", error))?
             .remove_tasks(&task_ids);
         self.conversation_registry.remove_session(session_id);
-        self.settings_store.remove_session(session_id);
         self.session_store
             .delete_session(session_id)
             .map_err(|error| ApiError::internal_assembly("删除会话失败", error))

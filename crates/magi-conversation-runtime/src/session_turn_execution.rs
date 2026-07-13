@@ -5,6 +5,10 @@
 //! 等方式桥接到 `ApiError` 枚举。
 
 use crate::{
+    conversation_loop::{
+        compact_history_for_prompt, latest_session_usage_observation,
+        thread_chat_message_to_chat_message,
+    },
     model_error::{
         provider_empty_assistant_response_error, public_model_image_invocation_error_message,
         public_model_invocation_error_message,
@@ -35,7 +39,7 @@ use magi_bridge_client::{
 };
 use magi_core::{AccessProfile, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::InMemoryEventBus;
-use magi_session_store::{CanonicalTurnItemKind, SessionStore};
+use magi_session_store::{CanonicalTurnItemKind, SessionStore, ThreadChatMessage};
 use magi_settings_store::SettingsStore;
 use magi_snapshot::SnapshotManager;
 use magi_tool_runtime::ToolRegistry;
@@ -44,7 +48,6 @@ use std::{fmt, path::PathBuf, sync::Arc};
 
 const BASE_TOOL_CALL_ROUNDS: usize = 16;
 const MAX_TOOL_CALL_ROUNDS: usize = 32;
-const MAX_SESSION_CONTEXT_MESSAGES: usize = 12;
 pub const BUSINESS_MODEL_PROVIDER: &str = "openai-compatible";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -204,6 +207,7 @@ fn request_turn_is_writable(
 }
 
 fn build_session_turn_messages(
+    event_bus: Option<&InMemoryEventBus>,
     session_store: &SessionStore,
     request: &SessionTurnExecutionRequest,
     prompt: &str,
@@ -243,7 +247,7 @@ fn build_session_turn_messages(
                     if content.is_empty() {
                         return None;
                     }
-                    Some(ChatMessage {
+                    Some(ThreadChatMessage {
                         role: role.to_string(),
                         content: Some(content),
                         images: Vec::new(),
@@ -254,9 +258,9 @@ fn build_session_turn_messages(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if history.len() > MAX_SESSION_CONTEXT_MESSAGES {
-        history = history.split_off(history.len() - MAX_SESSION_CONTEXT_MESSAGES);
-    }
+    let usage_observation = event_bus
+        .and_then(|event_bus| latest_session_usage_observation(event_bus, &request.session_id));
+    history = compact_history_for_prompt(history, usage_observation.as_ref());
     let mut messages = if request.use_tools {
         workspace_context_messages(request)
     } else {
@@ -270,7 +274,7 @@ fn build_session_turn_messages(
             reference_prompt,
         ));
     }
-    messages.append(&mut history);
+    messages.extend(history.iter().map(thread_chat_message_to_chat_message));
     messages.push(system_prompt_fragment_message(
         PromptFragmentKind::CurrentTurnPriority,
         current_turn_context_priority_prompt(),
@@ -351,7 +355,8 @@ pub fn run_session_turn_execution(
     let orchestrator_thread_id = orchestrator_thread.thread_id;
     let orchestrator_mission_id = orchestrator_thread.mission_id;
 
-    let mut messages = build_session_turn_messages(session_store, &request, &prompt);
+    let mut messages =
+        build_session_turn_messages(Some(event_bus), session_store, &request, &prompt);
     let mut final_content: Option<String> = None;
     let mut final_item_id: Option<String> = None;
     let mut main_timeline_entry_id: Option<String> = None;
@@ -1977,7 +1982,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             workspace_root_path: None,
         };
-        let messages = build_session_turn_messages(&store, &request, &request.prompt);
+        let messages = build_session_turn_messages(None, &store, &request, &request.prompt);
 
         assert_eq!(
             messages
@@ -2002,6 +2007,145 @@ mod tests {
             contents[3],
             "请基于上一轮结果，用一句话回答：再加 4 等于几？"
         );
+    }
+
+    #[test]
+    fn session_turn_messages_do_not_drop_early_history_after_six_rounds() {
+        let session_id = SessionId::new("session-context-history-long");
+        let thread_id = magi_core::ThreadId::new("thread-context-history-long");
+        let canonical_turns = (0..7)
+            .map(|index| {
+                let turn_seq = 1_000 + index * 100;
+                CanonicalTurn {
+                    session_id: session_id.clone(),
+                    turn_id: format!("turn-history-{index}"),
+                    turn_seq,
+                    accepted_at: ts(turn_seq),
+                    completed_at: Some(ts(turn_seq + 10)),
+                    status: CanonicalTurnStatus::Completed,
+                    response_duration_ms: Some(10),
+                    usage: None,
+                    items: vec![
+                        CanonicalTurnItem {
+                            session_id: session_id.clone(),
+                            turn_id: format!("turn-history-{index}"),
+                            turn_seq,
+                            item_id: format!("history-user-{index}"),
+                            item_seq: 1,
+                            kind: CanonicalTurnItemKind::UserMessage,
+                            created_at: ts(turn_seq),
+                            status: CanonicalTurnItemStatus::Completed,
+                            item_version: None,
+                            updated_at: ts(turn_seq),
+                            title: None,
+                            content: Some(if index == 0 {
+                                "最早上下文标记：银杏-7429-海盐".to_string()
+                            } else {
+                                format!("第 {index} 轮用户消息")
+                            }),
+                            blocks: Vec::new(),
+                            tool: None,
+                            worker: None,
+                            source_thread_id: thread_id.clone(),
+                            visibility: CanonicalTurnVisibility::default(),
+                            metadata: HashMap::new(),
+                        },
+                        CanonicalTurnItem {
+                            session_id: session_id.clone(),
+                            turn_id: format!("turn-history-{index}"),
+                            turn_seq,
+                            item_id: format!("history-assistant-{index}"),
+                            item_seq: 2,
+                            kind: CanonicalTurnItemKind::AssistantText,
+                            created_at: ts(turn_seq + 10),
+                            status: CanonicalTurnItemStatus::Completed,
+                            item_version: None,
+                            updated_at: ts(turn_seq + 10),
+                            title: None,
+                            content: Some(format!("第 {index} 轮助手回复")),
+                            blocks: Vec::new(),
+                            tool: None,
+                            worker: None,
+                            source_thread_id: thread_id.clone(),
+                            visibility: CanonicalTurnVisibility::default(),
+                            metadata: HashMap::new(),
+                        },
+                    ],
+                    metadata: HashMap::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let store = SessionStore::from_state(SessionStoreState {
+            current_session_id: Some(session_id.clone()),
+            sessions: vec![SessionRecord {
+                session_id: session_id.clone(),
+                title: "long context history".to_string(),
+                status: SessionLifecycleStatus::Active,
+                created_at: ts(900),
+                updated_at: ts(2_000),
+                message_count: None,
+                workspace_id: None,
+            }],
+            timeline: Vec::new(),
+            canonical_turns,
+            notifications: Vec::new(),
+            goals: Vec::new(),
+            todo_lists: Vec::new(),
+            execution_sidecar_store: Default::default(),
+            thread_registry: vec![ExecutionThread {
+                thread_id: thread_id.clone(),
+                session_id: session_id.clone(),
+                mission_id: magi_core::MissionId::new("mission-context-history-long"),
+                role_id: ORCHESTRATOR_ROLE_ID.to_string(),
+                worker_instance_id: magi_core::WorkerId::new("worker-context-history-long"),
+                status: ExecutionThreadStatus::Idle,
+                created_at: ts(900),
+                last_used_at: ts(1_700),
+                handled_task_ids: Vec::new(),
+                message_history: Vec::new(),
+            }],
+        });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-session-2000".to_string(),
+                    turn_seq: 2_000,
+                    accepted_at: ts(2_000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("最早的上下文标记是什么？".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("current turn should be stored");
+        let request = SessionTurnExecutionRequest {
+            session_id,
+            turn_id: "turn-session-2000".to_string(),
+            workspace_id: None,
+            prompt: "最早的上下文标记是什么？".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: false,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            workspace_root_path: None,
+        };
+
+        let messages = build_session_turn_messages(None, &store, &request, &request.prompt);
+
+        assert!(messages.iter().any(|message| {
+            message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("银杏-7429-海盐"))
+        }));
     }
 
     #[test]
@@ -2044,7 +2188,7 @@ mod tests {
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
-        let messages = build_session_turn_messages(&store, &request, &request.prompt);
+        let messages = build_session_turn_messages(None, &store, &request, &request.prompt);
 
         assert_eq!(messages[0].role, "system");
         let context = messages[0].content.as_deref().unwrap_or_default();
@@ -2095,7 +2239,7 @@ mod tests {
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
-        let messages = build_session_turn_messages(&store, &request, &request.prompt);
+        let messages = build_session_turn_messages(None, &store, &request, &request.prompt);
         let reference_context = messages
             .iter()
             .filter_map(|message| message.content.as_deref())
@@ -2154,7 +2298,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let messages = build_session_turn_messages(&store, &request, &request.prompt);
+        let messages = build_session_turn_messages(None, &store, &request, &request.prompt);
         let current_user_message = messages.last().expect("current user message");
 
         assert_eq!(current_user_message.role, "user");
@@ -2204,7 +2348,7 @@ mod tests {
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
-        let messages = build_session_turn_messages(&store, &request, &request.prompt);
+        let messages = build_session_turn_messages(None, &store, &request, &request.prompt);
 
         assert_eq!(
             messages

@@ -281,7 +281,7 @@
   // ToolCall 流中的一张内嵌卡片，多个并行 agent_spawn 即多张并列卡片，点击卡片
   // 打开右侧 RightPane 代理 transcript（按 metadata.taskId 过滤）。
   //
-  // input 形态：{ role, display_name, goal, access_mode }
+  // input 形态：{ role, display_name, goal }
   // output 形态：{ tool, status: 'started', child_task_id, role, title, assignment, ... }
   // 代理终态结果由主线后续 agent_wait 收集。
   const isAgentSpawn = $derived(name === 'agent_spawn');

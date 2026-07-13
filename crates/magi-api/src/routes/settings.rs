@@ -19,7 +19,7 @@ use std::str::FromStr;
 
 use super::session_scope;
 use crate::{
-    errors::ApiError,
+    errors::{ApiError, settings_persistence_error},
     model_config::{
         NormalizedModelConfig, merge_orchestrator_session_override,
         reject_deprecated_model_config_fields, strip_orchestrator_session_owned_fields,
@@ -140,7 +140,8 @@ pub(super) fn save_orchestrator_session_override_for_session(
     }
     state
         .settings_store
-        .set_session_section(session_id, "orchestrator", next_config.clone());
+        .set_session_section(session_id, "orchestrator", next_config.clone())
+        .map_err(settings_persistence_error)?;
     Ok(Some(next_config))
 }
 
@@ -660,11 +661,6 @@ pub(crate) fn load_registry_engines(state: &ApiState) -> Vec<Value> {
     let worker_configs =
         normalize_worker_model_config_entries(&state.settings_store.get_section("workers"));
     align_engine_llm_with_worker_configs(&mut normalized, &worker_configs);
-    if raw_engines != Value::Array(normalized.clone()) {
-        state
-            .settings_store
-            .set_section("engines", Value::Array(normalized.clone()));
-    }
     normalized
 }
 
@@ -754,11 +750,6 @@ fn load_agent_overrides(
             }
             normalized.push(normalized_entry);
         }
-    }
-    if raw_agents != Value::Array(normalized.clone()) {
-        state
-            .settings_store
-            .set_section("agents", Value::Array(normalized.clone()));
     }
     normalized
 }
@@ -911,7 +902,8 @@ async fn update_setting(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .settings_store
-        .set(&request.key, request.value.clone());
+        .set(&request.key, request.value.clone())
+        .map_err(settings_persistence_error)?;
     Ok(Json(state.settings_runtime_json()))
 }
 
@@ -938,11 +930,13 @@ async fn save_worker_config(
         workers.insert(worker_id.to_string(), worker_config);
         state
             .settings_store
-            .set_section("workers", serde_json::Value::Object(workers));
+            .set_section("workers", serde_json::Value::Object(workers))
+            .map_err(settings_persistence_error)?;
     } else {
         state
             .settings_store
-            .set_section("workers", model_settings_section_request(&request)?);
+            .set_section("workers", model_settings_section_request(&request)?)
+            .map_err(settings_persistence_error)?;
     }
     Ok(Json(serde_json::json!({ "saved": true })))
 }
@@ -955,7 +949,10 @@ async fn remove_worker_config(
         .get("worker")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    state.settings_store.remove_section_entry("workers", worker);
+    state
+        .settings_store
+        .remove_section_entry("workers", worker)
+        .map_err(settings_persistence_error)?;
     Ok(Json(serde_json::json!({ "removed": true })))
 }
 
@@ -970,10 +967,13 @@ async fn save_orchestrator_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state.settings_store.set_section(
-        "orchestrator",
-        orchestrator_connection_section_request(&request)?,
-    );
+    state
+        .settings_store
+        .set_section(
+            "orchestrator",
+            orchestrator_connection_section_request(&request)?,
+        )
+        .map_err(settings_persistence_error)?;
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -999,13 +999,13 @@ async fn save_orchestrator_session_config(
     {
         state
             .settings_store
-            .remove_session_section(&scope.session_id, "orchestrator");
+            .remove_session_section(&scope.session_id, "orchestrator")
+            .map_err(settings_persistence_error)?;
     } else {
-        state.settings_store.set_session_section(
-            &scope.session_id,
-            "orchestrator",
-            override_config.clone(),
-        );
+        state
+            .settings_store
+            .set_session_section(&scope.session_id, "orchestrator", override_config.clone())
+            .map_err(settings_persistence_error)?;
     }
 
     let mut effective_config = state.settings_store.get_section("orchestrator");
@@ -1050,7 +1050,8 @@ async fn save_auxiliary_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .settings_store
-        .set_section("auxiliary", model_settings_section_request(&request)?);
+        .set_section("auxiliary", model_settings_section_request(&request)?)
+        .map_err(settings_persistence_error)?;
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -1067,7 +1068,8 @@ async fn save_user_rules(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state
         .settings_store
-        .set_section("userRules", scoped_settings_section_request(&request)?);
+        .set_section("userRules", scoped_settings_section_request(&request)?)
+        .map_err(settings_persistence_error)?;
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -1079,7 +1081,8 @@ async fn save_safeguard_config(
         crate::state::normalize_safeguard_config_value(scoped_settings_section_request(&request)?);
     state
         .settings_store
-        .set_section("safeguardConfig", normalized);
+        .set_section("safeguardConfig", normalized)
+        .map_err(settings_persistence_error)?;
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -1130,7 +1133,8 @@ async fn upsert_engine(
     }
     state
         .settings_store
-        .set_section("engines", Value::Array(engines.clone()));
+        .set_section("engines", Value::Array(engines.clone()))
+        .map_err(settings_persistence_error)?;
     Ok(Json(json!({ "engines": engines })))
 }
 
@@ -1142,9 +1146,6 @@ async fn remove_engine(
         .get("engineId")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    state
-        .settings_store
-        .remove_array_entry("engines", "id", engine_id);
     let mut engines = load_registry_engines(&state);
     engines.retain(|entry| {
         entry
@@ -1154,7 +1155,8 @@ async fn remove_engine(
     });
     state
         .settings_store
-        .set_section("engines", Value::Array(engines.clone()));
+        .set_section("engines", Value::Array(engines.clone()))
+        .map_err(settings_persistence_error)?;
     Ok(Json(json!({ "engines": engines })))
 }
 
@@ -1216,7 +1218,8 @@ async fn upsert_agent(
     }
     state
         .settings_store
-        .set_section("agents", Value::Array(overrides));
+        .set_section("agents", Value::Array(overrides))
+        .map_err(settings_persistence_error)?;
 
     Ok(Json(json!({ "agents": resolve_registry_agents(&state) })))
 }
@@ -1240,7 +1243,8 @@ async fn remove_agent(
     });
     state
         .settings_store
-        .set_section("agents", Value::Array(overrides));
+        .set_section("agents", Value::Array(overrides))
+        .map_err(settings_persistence_error)?;
     Ok(Json(json!({ "agents": resolve_registry_agents(&state) })))
 }
 
@@ -2270,39 +2274,48 @@ mod tests {
     #[tokio::test]
     async fn settings_bootstrap_removes_deprecated_model_provider_fields() {
         let state = test_state();
-        state.settings_store.set_section(
-            "orchestrator",
-            json!({
-                "provider": "anthropic",
-                "baseUrl": "https://api.anthropic.com",
-                "model": "claude-sonnet-test",
-                "urlMode": "standard"
-            }),
-        );
-        state.settings_store.set_section(
-            "workers",
-            json!({
-                "sonnet-worker": {
+        state
+            .settings_store
+            .set_section(
+                "orchestrator",
+                json!({
                     "provider": "anthropic",
                     "baseUrl": "https://api.anthropic.com",
-                    "model": "claude-worker-test",
+                    "model": "claude-sonnet-test",
                     "urlMode": "standard"
-                }
-            }),
-        );
-        state.settings_store.set_section(
-            "engines",
-            json!([{
-                "id": "sonnet-worker",
-                "displayName": "Sonnet Worker",
-                "llm": {
-                    "provider": "anthropic",
-                    "baseUrl": "https://api.anthropic.com",
-                    "model": "claude-worker-test",
-                    "urlMode": "standard"
-                }
-            }]),
-        );
+                }),
+            )
+            .unwrap();
+        state
+            .settings_store
+            .set_section(
+                "workers",
+                json!({
+                    "sonnet-worker": {
+                        "provider": "anthropic",
+                        "baseUrl": "https://api.anthropic.com",
+                        "model": "claude-worker-test",
+                        "urlMode": "standard"
+                    }
+                }),
+            )
+            .unwrap();
+        state
+            .settings_store
+            .set_section(
+                "engines",
+                json!([{
+                    "id": "sonnet-worker",
+                    "displayName": "Sonnet Worker",
+                    "llm": {
+                        "provider": "anthropic",
+                        "baseUrl": "https://api.anthropic.com",
+                        "model": "claude-worker-test",
+                        "urlMode": "standard"
+                    }
+                }]),
+            )
+            .unwrap();
 
         let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
             .await
@@ -2329,40 +2342,52 @@ mod tests {
     #[tokio::test]
     async fn settings_bootstrap_ignores_persisted_public_alias_sections() {
         let state = test_state();
-        state.settings_store.set_section(
-            "orchestrator",
-            json!({
-                "baseUrl": "https://api.current.example/v1",
-                "apiKey": "sk-current",
-                "model": "current-main",
-                "urlMode": "standard"
-            }),
-        );
-        state.settings_store.set_section(
-            "orchestratorConfig",
-            json!({
-                "baseUrl": "https://api.alias.example/v1",
-                "apiKey": "sk-alias",
-                "model": "alias-main",
-                "urlMode": "standard"
-            }),
-        );
-        state.settings_store.set_section(
-            "workerConfigs",
-            json!({
-                "alias-worker": {
+        state
+            .settings_store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://api.current.example/v1",
+                    "apiKey": "sk-current",
+                    "model": "current-main",
+                    "urlMode": "standard"
+                }),
+            )
+            .unwrap();
+        state
+            .settings_store
+            .set_section(
+                "orchestratorConfig",
+                json!({
                     "baseUrl": "https://api.alias.example/v1",
-                    "model": "alias-worker"
-                }
-            }),
-        );
-        state.settings_store.set_section(
-            "auxiliaryConfig",
-            json!({
-                "baseUrl": "https://api.alias.example/v1",
-                "model": "alias-aux"
-            }),
-        );
+                    "apiKey": "sk-alias",
+                    "model": "alias-main",
+                    "urlMode": "standard"
+                }),
+            )
+            .unwrap();
+        state
+            .settings_store
+            .set_section(
+                "workerConfigs",
+                json!({
+                    "alias-worker": {
+                        "baseUrl": "https://api.alias.example/v1",
+                        "model": "alias-worker"
+                    }
+                }),
+            )
+            .unwrap();
+        state
+            .settings_store
+            .set_section(
+                "auxiliaryConfig",
+                json!({
+                    "baseUrl": "https://api.alias.example/v1",
+                    "model": "alias-aux"
+                }),
+            )
+            .unwrap();
 
         let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
             .await
@@ -2396,30 +2421,36 @@ mod tests {
     #[tokio::test]
     async fn settings_bootstrap_aligns_registry_engine_llm_from_worker_config() {
         let state = test_state();
-        state.settings_store.set_section(
-            "workers",
-            json!({
-                "sonnet-worker": {
-                    "provider": "anthropic",
-                    "baseUrl": "https://api.anthropic.com",
-                    "model": "claude-worker-test",
-                    "urlMode": "standard"
-                }
-            }),
-        );
-        state.settings_store.set_section(
-            "engines",
-            json!([{
-                "id": "sonnet-worker",
-                "displayName": "Sonnet Worker",
-                "llm": {
-                    "provider": "openai",
-                    "baseUrl": "https://api.openai.com",
-                    "model": "stale-openai-model",
-                    "urlMode": "standard"
-                }
-            }]),
-        );
+        state
+            .settings_store
+            .set_section(
+                "workers",
+                json!({
+                    "sonnet-worker": {
+                        "provider": "anthropic",
+                        "baseUrl": "https://api.anthropic.com",
+                        "model": "claude-worker-test",
+                        "urlMode": "standard"
+                    }
+                }),
+            )
+            .unwrap();
+        state
+            .settings_store
+            .set_section(
+                "engines",
+                json!([{
+                    "id": "sonnet-worker",
+                    "displayName": "Sonnet Worker",
+                    "llm": {
+                        "provider": "openai",
+                        "baseUrl": "https://api.openai.com",
+                        "model": "stale-openai-model",
+                        "urlMode": "standard"
+                    }
+                }]),
+            )
+            .unwrap();
 
         let bootstrap = settings_bootstrap(State(state.clone()), Query(HashMap::new()))
             .await
@@ -2439,7 +2470,7 @@ mod tests {
         assert!(persisted_engines[0]["llm"].get("provider").is_none());
         assert_eq!(
             persisted_engines[0]["llm"]["model"],
-            json!("claude-worker-test")
+            json!("stale-openai-model")
         );
     }
 
@@ -2550,7 +2581,8 @@ mod tests {
                 { "id": "valid-server", "command": "npx", "enabled": false },
                 "invalid-entry"
             ]),
-        );
+        )
+        .unwrap();
 
         let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
             .await
@@ -2583,22 +2615,25 @@ mod tests {
     #[tokio::test]
     async fn settings_bootstrap_redacts_mcp_env_values() {
         let state = test_state();
-        state.settings_store.set_section(
-            "mcpServers",
-            json!([
-                {
-                    "id": "secret-server",
-                    "command": "npx",
-                    "enabled": false,
-                    "workspaceId": "workspace-old",
-                    "workspacePath": "/tmp/old",
-                    "sessionId": "session-old",
-                    "env": {
-                        "TOKEN": "secret-token"
+        state
+            .settings_store
+            .set_section(
+                "mcpServers",
+                json!([
+                    {
+                        "id": "secret-server",
+                        "command": "npx",
+                        "enabled": false,
+                        "workspaceId": "workspace-old",
+                        "workspacePath": "/tmp/old",
+                        "sessionId": "session-old",
+                        "env": {
+                            "TOKEN": "secret-token"
+                        }
                     }
-                }
-            ]),
-        );
+                ]),
+            )
+            .unwrap();
 
         let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
             .await
@@ -2620,16 +2655,19 @@ mod tests {
     #[tokio::test]
     async fn settings_bootstrap_does_not_probe_unconnected_mcp_servers() {
         let state = test_state();
-        state.settings_store.set_section(
-            "mcpServers",
-            json!([
-                {
-                    "id": "slow-or-missing-server",
-                    "command": "definitely-not-existing-magi-mcp-command",
-                    "enabled": true
-                }
-            ]),
-        );
+        state
+            .settings_store
+            .set_section(
+                "mcpServers",
+                json!([
+                    {
+                        "id": "slow-or-missing-server",
+                        "command": "definitely-not-existing-magi-mcp-command",
+                        "enabled": true
+                    }
+                ]),
+            )
+            .unwrap();
 
         let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
             .await
@@ -2661,17 +2699,20 @@ mod tests {
             }],
             mcp_tools: Vec::new(),
         }));
-        state.settings_store.set_section(
-            "mcpServers",
-            json!([
-                {
-                    "id": "loopback-mcp",
-                    "name": "loopback-mcp",
-                    "command": "npx",
-                    "enabled": true
-                }
-            ]),
-        );
+        state
+            .settings_store
+            .set_section(
+                "mcpServers",
+                json!([
+                    {
+                        "id": "loopback-mcp",
+                        "name": "loopback-mcp",
+                        "command": "npx",
+                        "enabled": true
+                    }
+                ]),
+            )
+            .unwrap();
 
         let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
             .await
@@ -2842,15 +2883,18 @@ mod tests {
             &state,
             test_session_record(&session_id, "workspace-session-model", "会话模型覆盖"),
         );
-        state.settings_store.set_section(
-            "orchestrator",
-            json!({
-                "baseUrl": "https://api.example.com/v1",
-                "apiKey": "sk-global",
-                "model": "global-main-model",
-                "reasoningEffort": "medium"
-            }),
-        );
+        state
+            .settings_store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-global",
+                    "model": "global-main-model",
+                    "reasoningEffort": "medium"
+                }),
+            )
+            .unwrap();
 
         let response = save_orchestrator_session_config(
             State(state.clone()),
@@ -2905,23 +2949,29 @@ mod tests {
                 "会话有效主模型",
             ),
         );
-        state.settings_store.set_section(
-            "orchestrator",
-            json!({
-                "baseUrl": "https://api.example.com/v1",
-                "apiKey": "sk-global",
-                "model": "global-main-model",
-                "reasoningEffort": "medium"
-            }),
-        );
-        state.settings_store.set_session_section(
-            &session_id,
-            "orchestrator",
-            json!({
-                "model": "session-main-model",
-                "reasoningEffort": "xhigh"
-            }),
-        );
+        state
+            .settings_store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-global",
+                    "model": "global-main-model",
+                    "reasoningEffort": "medium"
+                }),
+            )
+            .unwrap();
+        state
+            .settings_store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                json!({
+                    "model": "session-main-model",
+                    "reasoningEffort": "xhigh"
+                }),
+            )
+            .unwrap();
 
         let bootstrap = settings_bootstrap(
             State(state.clone()),

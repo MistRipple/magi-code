@@ -18,6 +18,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/goals/current/pause", post(pause_current_goal))
         .route("/goals/current/resume", post(resume_current_goal))
         .route("/goals/current/clear", post(clear_current_goal))
+        .route("/goals/current/todos/clear", post(clear_current_todos))
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,15 +87,19 @@ async fn get_current_goal(
         query.workspace_path.as_deref(),
         "读取当前目标",
     )?;
+    Ok(Json(current_goal_response(&state, scope)))
+}
+
+fn current_goal_response(state: &ApiState, scope: SessionWorkspaceScope) -> CurrentGoalResponseDto {
     let goal = state.session_store.current_visible_goal(&scope.session_id);
-    let todo_items = current_goal_todo_items(&state, &scope.session_id);
-    Ok(Json(CurrentGoalResponseDto {
+    let todo_items = current_goal_todo_items(state, &scope.session_id);
+    CurrentGoalResponseDto {
         session_id: scope.session_id.to_string(),
         workspace_id: scope.workspace_id.to_string(),
         workspace_path: scope.workspace_path,
         goal,
         todo_items,
-    }))
+    }
 }
 
 fn current_goal_todo_items(state: &ApiState, session_id: &SessionId) -> Vec<GoalTodoItemDto> {
@@ -188,6 +193,25 @@ async fn clear_current_goal(
     Ok(Json(goal_mutation_response(scope, None)))
 }
 
+async fn clear_current_todos(
+    State(state): State<ApiState>,
+    Json(request): Json<GoalActionRequest>,
+) -> Result<Json<CurrentGoalResponseDto>, ApiError> {
+    let scope = require_session_workspace_scope(
+        &state,
+        request.session_id.as_deref(),
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+        "清除当前任务清单",
+    )?;
+    state
+        .session_store
+        .replace_todo_items(&scope.session_id, Vec::new())
+        .map_err(map_goal_domain_error)?;
+    state.persist_session_state_checkpoint("goal_todos_cleared")?;
+    Ok(Json(current_goal_response(&state, scope)))
+}
+
 async fn mutate_current_goal_status(
     state: ApiState,
     request: GoalActionRequest,
@@ -252,7 +276,10 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header::CONTENT_TYPE};
     use magi_conversation_runtime::{
-        task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
+        ConversationRegistry,
+        task_execution_dispatcher::{
+            ExecutionPipeline, LlmTaskDispatcher, LlmTaskDispatcherDependencies,
+        },
         task_execution_registry::TaskExecutionRegistry,
         task_runner_bridge::EventBasedResultReceiver,
     };
@@ -292,10 +319,14 @@ mod tests {
                 execution_runtime,
                 memory_store: MemoryStore::new(),
             },
-            session_store,
-            TaskExecutionRegistry::default(),
-            Arc::new(EventBasedResultReceiver::new()),
-            Arc::new(std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new())),
+            LlmTaskDispatcherDependencies {
+                session_store,
+                execution_registry: TaskExecutionRegistry::default(),
+                result_receiver: Arc::new(EventBasedResultReceiver::new()),
+                spawn_graph: Arc::new(std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new())),
+                conversation_registry: Arc::new(ConversationRegistry::new()),
+                agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
+            },
             std::env::temp_dir().join("magi-goal-route-dispatcher"),
         ))
     }
@@ -333,6 +364,7 @@ mod tests {
                 session_id.clone(),
                 ThreadId::new("thread-goal-route"),
                 "完成 Goal API",
+                magi_core::AccessProfile::Restricted,
                 Some(2048),
             )
             .expect("goal should be creatable");
@@ -408,6 +440,7 @@ mod tests {
                 session_id.clone(),
                 ThreadId::new("thread-goal-todo-route"),
                 "完成目标任务清单展示",
+                magi_core::AccessProfile::Restricted,
                 None,
             )
             .expect("goal should be creatable");
@@ -493,6 +526,7 @@ mod tests {
                 session_id.clone(),
                 ThreadId::new("thread-goal-actions"),
                 "原目标",
+                magi_core::AccessProfile::Restricted,
                 Some(4096),
             )
             .expect("goal should be creatable");
@@ -597,6 +631,82 @@ mod tests {
         let payload = response_json(response).await;
         assert!(payload["goal"].is_null());
         assert_eq!(payload["todoItems"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[tokio::test]
+    async fn completed_todo_list_can_be_cleared_without_removing_goal() {
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let workspace_id = WorkspaceId::new("workspace-goal-todo-clear");
+        let workspace_path = std::env::temp_dir().join("magi-goal-todo-clear");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new(workspace_path.display().to_string()),
+            )
+            .expect("workspace should register");
+        let session_id = SessionId::new("session-goal-todo-clear");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "goal todo clear",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should be creatable");
+        let goal = state
+            .session_store
+            .create_goal(
+                session_id.clone(),
+                ThreadId::new("thread-goal-todo-clear"),
+                "保留目标，仅关闭任务清单",
+                magi_core::AccessProfile::Restricted,
+                None,
+            )
+            .expect("goal should be creatable");
+        state
+            .session_store
+            .set_goal_status(&session_id, &goal.goal_id, GoalStatus::Complete)
+            .expect("goal should complete");
+        state
+            .session_store
+            .replace_todo_items(
+                &session_id,
+                vec![TodoItem::new(
+                    "已完成任务",
+                    "正在完成任务",
+                    TodoStatus::Completed,
+                )],
+            )
+            .expect("todo list should write");
+
+        let app = Router::new().merge(routes()).with_state(state.clone());
+        let response = app
+            .oneshot(json_post(
+                "/goals/current/todos/clear",
+                serde_json::json!({
+                    "sessionId": session_id.to_string(),
+                    "workspaceId": workspace_id.to_string(),
+                }),
+            ))
+            .await
+            .expect("todo clear should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(
+            payload["goal"]["goalId"].as_str(),
+            Some(goal.goal_id.as_str())
+        );
+        assert_eq!(payload["goal"]["status"].as_str(), Some("complete"));
+        assert_eq!(payload["todoItems"].as_array().map(Vec::len), Some(0));
+        assert!(state.session_store.todo_items(&session_id).is_empty());
     }
 
     fn json_post(path: &str, body: serde_json::Value) -> Request<Body> {

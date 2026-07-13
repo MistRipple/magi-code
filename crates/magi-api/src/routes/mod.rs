@@ -17,7 +17,7 @@ mod workspaces;
 use axum::{
     Json, Router,
     extract::{Query, Request, State},
-    http::{HeaderMap, HeaderName, StatusCode, header::HOST},
+    http::{HeaderMap, HeaderName, StatusCode, Uri, header::HOST},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -101,7 +101,7 @@ pub fn build_router(state: ApiState) -> Router {
 
 async fn enforce_public_tunnel_auth(
     State(tunnel_manager): State<crate::tunnel::TunnelManager>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     if !is_public_tunnel_request(request.headers())
@@ -115,6 +115,7 @@ async fn enforce_public_tunnel_auth(
         .authorize_public_request(token.as_deref())
         .await
     {
+        *request.uri_mut() = without_query_parameter(request.uri(), "tunnel_token");
         return next.run(request).await;
     }
 
@@ -157,6 +158,32 @@ fn query_parameter(query: Option<&str>, expected_key: &str) -> Option<String> {
             })
             .flatten()
     })
+}
+
+fn without_query_parameter(uri: &Uri, excluded_key: &str) -> Uri {
+    let Some(query) = uri.query() else {
+        return uri.clone();
+    };
+    let filtered_query = query
+        .split('&')
+        .filter(|part| {
+            let key = part.split_once('=').map_or(*part, |(key, _value)| key);
+            key != excluded_key
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let path_and_query = if filtered_query.is_empty() {
+        uri.path().to_owned()
+    } else {
+        format!("{}?{filtered_query}", uri.path())
+    };
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(
+        path_and_query
+            .parse()
+            .expect("移除已存在查询参数后 URI 仍应保持合法"),
+    );
+    Uri::from_parts(parts).expect("替换合法 path-and-query 后 URI 仍应保持合法")
 }
 
 async fn health(State(state): State<ApiState>) -> Json<HealthDto> {
@@ -411,6 +438,69 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(local_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn public_tunnel_auth_parameter_is_not_exposed_to_business_query_parsing() {
+        let mut state = test_state();
+        state.tunnel_manager =
+            crate::tunnel::TunnelManager::new_with_token_for_test(38123, "secret-token");
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/bootstrap?tunnel_token=secret-token")
+                    .header("host", "example.trycloudflare.com")
+                    .header("cf-ray", "test-ray")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn public_tunnel_auth_removes_only_transport_query_parameter() {
+        let uri = Uri::from_static(
+            "/bootstrap?workspacePath=%2Ftmp%2Fmagi&tunnel_token=secret-token&sessionId=session-1&tunnel_token=duplicate",
+        );
+
+        assert_eq!(
+            without_query_parameter(&uri, "tunnel_token"),
+            Uri::from_static("/bootstrap?workspacePath=%2Ftmp%2Fmagi&sessionId=session-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_tunnel_event_stream_accepts_token_without_leaking_it_to_query_parsing() {
+        let mut state = test_state();
+        state.tunnel_manager =
+            crate::tunnel::TunnelManager::new_with_token_for_test(38123, "secret-token");
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/events?afterSequence=0&tunnel_token=secret-token")
+                    .header("host", "example.trycloudflare.com")
+                    .header("cf-ray", "test-ray")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
     }
 
     async fn post_json_body(

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use crate::{
-    errors::ApiError,
+    errors::{ApiError, settings_persistence_error},
     mcp_config::{
         build_mcp_config_from_entry, mcp_server_entry_enabled, mcp_server_entry_id,
         normalize_mcp_server_request_entry as normalize_mcp_server_entry,
@@ -77,9 +77,11 @@ fn load_skills_config_object(state: &ApiState) -> serde_json::Map<String, serde_
 fn persist_skills_config_object(
     state: &ApiState,
     config: serde_json::Map<String, serde_json::Value>,
-) {
-    skill_loader::save_skills_config_object(&state.settings_store, config);
+) -> Result<(), ApiError> {
+    skill_loader::save_skills_config_object(&state.settings_store, config)
+        .map_err(settings_persistence_error)?;
     reload_skill_registry(state);
+    Ok(())
 }
 
 fn reload_skill_registry(state: &ApiState) {
@@ -95,13 +97,16 @@ fn load_instruction_skills(state: &ApiState) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
-fn persist_instruction_skills(state: &ApiState, instruction_skills: Vec<serde_json::Value>) {
+fn persist_instruction_skills(
+    state: &ApiState,
+    instruction_skills: Vec<serde_json::Value>,
+) -> Result<(), ApiError> {
     let mut config = load_skills_config_object(state);
     config.insert(
         "instructionSkills".to_string(),
         serde_json::Value::Array(instruction_skills),
     );
-    persist_skills_config_object(state, config);
+    persist_skills_config_object(state, config)
 }
 
 fn normalize_instruction_skill_entry(
@@ -778,7 +783,8 @@ async fn add_mcp_server(
     let normalized = normalize_mcp_server_entry(&request)?;
     state
         .settings_store
-        .upsert_array_entry("mcpServers", "id", &normalized);
+        .upsert_array_entry("mcpServers", "id", &normalized)
+        .map_err(settings_persistence_error)?;
     Ok(Json(serde_json::json!({ "added": true })))
 }
 
@@ -797,7 +803,8 @@ async fn update_mcp_server(
     preserve_redacted_mcp_env_values(&mut normalized, existing.as_ref());
     state
         .settings_store
-        .upsert_array_entry("mcpServers", "id", &normalized);
+        .upsert_array_entry("mcpServers", "id", &normalized)
+        .map_err(settings_persistence_error)?;
     if !mcp_server_entry_enabled(&normalized) {
         remove_mcp_connection(&state, &server_id);
     }
@@ -814,7 +821,8 @@ async fn delete_mcp_server(
         .unwrap_or_default();
     state
         .settings_store
-        .remove_array_entry("mcpServers", "id", server_id);
+        .remove_array_entry("mcpServers", "id", server_id)
+        .map_err(settings_persistence_error)?;
     {
         let mut pool = state
             .mcp_connections()
@@ -1189,11 +1197,6 @@ async fn list_repositories(State(state): State<ApiState>) -> Json<serde_json::Va
         .cloned()
         .map(clean_repository_scope_fields)
         .collect::<Vec<_>>();
-    if repos != stored_repos {
-        state
-            .settings_store
-            .set_section("repositories", serde_json::Value::Array(repos.clone()));
-    }
     Json(serde_json::json!({ "repositories": repos }))
 }
 
@@ -1211,7 +1214,8 @@ async fn add_repository(
     let normalized = normalize_repository_entry(&request, false)?;
     state
         .settings_store
-        .upsert_array_entry("repositories", "repositoryId", &normalized);
+        .upsert_array_entry("repositories", "repositoryId", &normalized)
+        .map_err(settings_persistence_error)?;
     Ok(Json(serde_json::json!({ "added": true })))
 }
 
@@ -1241,7 +1245,8 @@ async fn update_repository(
         .map(ToOwned::to_owned);
     state
         .settings_store
-        .upsert_array_entry("repositories", "repositoryId", &normalized);
+        .upsert_array_entry("repositories", "repositoryId", &normalized)
+        .map_err(settings_persistence_error)?;
     if let Some(previous_url) = previous_url
         && normalized
             .get("url")
@@ -1280,7 +1285,8 @@ async fn delete_repository(
         .map(ToOwned::to_owned);
     state
         .settings_store
-        .remove_array_entry("repositories", "repositoryId", repo_id);
+        .remove_array_entry("repositories", "repositoryId", repo_id)
+        .map_err(settings_persistence_error)?;
     if let Some(repository_url) = repository_url
         && let Ok(repository) = parse_github_repository_url(&repository_url)
         && let Ok(cache_root) = skill_repository_cache_root(&state)
@@ -1336,7 +1342,8 @@ async fn refresh_repository(
     updated_repos[pos] = serde_json::Value::Object(entry);
     state
         .settings_store
-        .set_section("repositories", serde_json::Value::Array(updated_repos));
+        .set_section("repositories", serde_json::Value::Array(updated_repos))
+        .map_err(settings_persistence_error)?;
 
     Ok(Json(serde_json::json!({
         "refreshed": true,
@@ -1465,7 +1472,7 @@ async fn install_skill(
 
     let mut instruction_skills = load_instruction_skills(&state);
     upsert_named_object_array_entry(&mut instruction_skills, normalized, &["skillId"]);
-    persist_instruction_skills(&state, instruction_skills);
+    persist_instruction_skills(&state, instruction_skills)?;
     Ok(Json(serde_json::json!({
         "installed": true,
         "skillId": skill_id,
@@ -1497,7 +1504,7 @@ async fn install_local_skill(
     for entry in &entries {
         upsert_named_object_array_entry(&mut instruction_skills, entry.clone(), &["skillId"]);
     }
-    persist_instruction_skills(&state, instruction_skills);
+    persist_instruction_skills(&state, instruction_skills)?;
 
     Ok(Json(serde_json::json!({
         "installed": true,
@@ -1533,7 +1540,7 @@ async fn save_skills_config(
         .as_object()
         .cloned()
         .ok_or_else(|| ApiError::InvalidInput("skillsConfig 必须是对象".to_string()))?;
-    persist_skills_config_object(&state, config);
+    persist_skills_config_object(&state, config)?;
     Ok(Json(serde_json::json!({ "saved": true })))
 }
 
@@ -1571,7 +1578,7 @@ async fn add_custom_tool(
         "customTools".to_string(),
         serde_json::Value::Array(custom_tools),
     );
-    persist_skills_config_object(&state, config);
+    persist_skills_config_object(&state, config)?;
     Ok(Json(serde_json::json!({ "added": true })))
 }
 
@@ -1609,7 +1616,7 @@ async fn remove_installed_skill(
                 "customTools".to_string(),
                 serde_json::Value::Array(custom_tools),
             );
-            persist_skills_config_object(&state, config);
+            persist_skills_config_object(&state, config)?;
             Ok(Json(serde_json::json!({
                 "removed": true,
                 "source": "custom",
@@ -1630,7 +1637,7 @@ async fn remove_installed_skill(
             if !removed {
                 return Err(ApiError::not_found("技能未安装", skill_id));
             }
-            persist_instruction_skills(&state, instruction_skills);
+            persist_instruction_skills(&state, instruction_skills)?;
             if removed_skill
                 .as_ref()
                 .and_then(|skill| skill.get("source"))
@@ -1699,7 +1706,7 @@ async fn update_skill(
             updated_entry.insert("lastModified".to_string(), serde_json::json!(ts));
         }
         instruction_skills[pos] = serde_json::Value::Object(updated_entry);
-        persist_instruction_skills(&state, instruction_skills);
+        persist_instruction_skills(&state, instruction_skills)?;
     }
 
     Ok(Json(serde_json::json!({ "updated": true })))
@@ -1734,7 +1741,7 @@ async fn update_all_skills(
     }
 
     if updated_count > 0 {
-        persist_instruction_skills(&state, instruction_skills);
+        persist_instruction_skills(&state, instruction_skills)?;
     }
 
     Ok(Json(serde_json::json!({
@@ -1932,13 +1939,16 @@ mod tests {
             .expect("skill script should write");
 
         let state = test_state_with_persistence(state_root.path());
-        state.settings_store.set_section(
-            "repositories",
-            serde_json::json!([{
-                "repositoryId": "https://github.com/stellarlinkco/myclaude",
-                "url": "https://github.com/stellarlinkco/myclaude"
-            }]),
-        );
+        state
+            .settings_store
+            .set_section(
+                "repositories",
+                serde_json::json!([{
+                    "repositoryId": "https://github.com/stellarlinkco/myclaude",
+                    "url": "https://github.com/stellarlinkco/myclaude"
+                }]),
+            )
+            .unwrap();
 
         let library = get_json(
             Router::new().merge(routes()).with_state(state.clone()),
@@ -2057,19 +2067,22 @@ mod tests {
     #[tokio::test]
     async fn mcp_server_list_redacts_env_values() {
         let state = test_state();
-        state.settings_store.upsert_array_entry(
-            "mcpServers",
-            "id",
-            &serde_json::json!({
-                "id": "server-redacted",
-                "name": "server-redacted",
-                "command": "node",
-                "enabled": false,
-                "env": {
-                    "TOKEN": "secret-token"
-                }
-            }),
-        );
+        state
+            .settings_store
+            .upsert_array_entry(
+                "mcpServers",
+                "id",
+                &serde_json::json!({
+                    "id": "server-redacted",
+                    "name": "server-redacted",
+                    "command": "node",
+                    "enabled": false,
+                    "env": {
+                        "TOKEN": "secret-token"
+                    }
+                }),
+            )
+            .unwrap();
         let app = Router::new().merge(routes()).with_state(state);
 
         let body = get_json(app, "/settings/mcp").await;
@@ -2083,19 +2096,22 @@ mod tests {
     #[tokio::test]
     async fn mcp_server_update_preserves_redacted_env_values() {
         let state = test_state();
-        state.settings_store.upsert_array_entry(
-            "mcpServers",
-            "id",
-            &serde_json::json!({
-                "id": "server-preserve-env",
-                "name": "server-preserve-env",
-                "command": "node",
-                "env": {
-                    "TOKEN": "secret-token",
-                    "MODE": "old"
-                }
-            }),
-        );
+        state
+            .settings_store
+            .upsert_array_entry(
+                "mcpServers",
+                "id",
+                &serde_json::json!({
+                    "id": "server-preserve-env",
+                    "name": "server-preserve-env",
+                    "command": "node",
+                    "env": {
+                        "TOKEN": "secret-token",
+                        "MODE": "old"
+                    }
+                }),
+            )
+            .unwrap();
         let app = Router::new().merge(routes()).with_state(state.clone());
 
         let body = post_json(
@@ -2189,22 +2205,25 @@ mod tests {
     #[tokio::test]
     async fn mcp_server_list_filters_legacy_wrapped_entries() {
         let state = test_state();
-        state.settings_store.set_section(
-            "mcpServers",
-            serde_json::json!([
-                {
-                    "server": {
-                        "id": "wrapped-server",
-                        "command": "node"
+        state
+            .settings_store
+            .set_section(
+                "mcpServers",
+                serde_json::json!([
+                    {
+                        "server": {
+                            "id": "wrapped-server",
+                            "command": "node"
+                        }
+                    },
+                    {
+                        "id": "canonical-server",
+                        "command": "node",
+                        "enabled": false
                     }
-                },
-                {
-                    "id": "canonical-server",
-                    "command": "node",
-                    "enabled": false
-                }
-            ]),
-        );
+                ]),
+            )
+            .unwrap();
         let app = Router::new().merge(routes()).with_state(state);
 
         let body = get_json(app, "/settings/mcp").await;
@@ -2305,27 +2324,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_list_cleans_legacy_scope_fields() {
+    async fn repository_list_cleans_response_without_mutating_persisted_settings() {
         let state = test_state();
-        state.settings_store.set_section(
-            "repositories",
-            serde_json::json!([
-                {
-                    "repositoryId": "legacy-repo",
-                    "url": "https://github.com/example/skills",
-                    "workspaceId": "workspace-old",
-                    "workspace_path": "/tmp/old",
-                    "sessionId": "session-old"
-                }
-            ]),
-        );
+        state
+            .settings_store
+            .set_section(
+                "repositories",
+                serde_json::json!([
+                    {
+                        "repositoryId": "legacy-repo",
+                        "url": "https://github.com/example/skills",
+                        "workspaceId": "workspace-old",
+                        "workspace_path": "/tmp/old",
+                        "sessionId": "session-old"
+                    }
+                ]),
+            )
+            .unwrap();
         let app = Router::new().merge(routes()).with_state(state.clone());
 
         let body = get_json(app, "/settings/repositories").await;
 
         assert_scope_fields_absent(&body["repositories"][0]);
         let stored = state.settings_store.get_section("repositories");
-        assert_scope_fields_absent(&stored[0]);
+        assert_eq!(stored[0]["workspaceId"], serde_json::json!("workspace-old"));
+        assert_eq!(stored[0]["sessionId"], serde_json::json!("session-old"));
     }
 
     #[test]
@@ -2463,23 +2486,26 @@ mod tests {
         )
         .expect("skill markdown should write");
         let missing_dir = valid_dir.path().join("missing-skill");
-        state.settings_store.set_section(
-            "skillsConfig",
-            serde_json::json!({
-                "instructionSkills": [
-                    {
-                        "skillId": "valid-skill",
-                        "name": "valid-skill",
-                        "directoryPath": valid_dir.path().to_string_lossy().to_string()
-                    },
-                    {
-                        "skillId": "missing-skill",
-                        "name": "missing-skill",
-                        "directoryPath": missing_dir.to_string_lossy().to_string()
-                    }
-                ]
-            }),
-        );
+        state
+            .settings_store
+            .set_section(
+                "skillsConfig",
+                serde_json::json!({
+                    "instructionSkills": [
+                        {
+                            "skillId": "valid-skill",
+                            "name": "valid-skill",
+                            "directoryPath": valid_dir.path().to_string_lossy().to_string()
+                        },
+                        {
+                            "skillId": "missing-skill",
+                            "name": "missing-skill",
+                            "directoryPath": missing_dir.to_string_lossy().to_string()
+                        }
+                    ]
+                }),
+            )
+            .unwrap();
         let app = Router::new().merge(routes()).with_state(state);
 
         let body = get_json(app, "/settings/skills/library").await;
@@ -2498,18 +2524,21 @@ mod tests {
         let state = test_state();
         let missing_dir =
             std::env::temp_dir().join(format!("magi-missing-skill-{}", epoch_ms_now()));
-        state.settings_store.set_section(
-            "skillsConfig",
-            serde_json::json!({
-                "instructionSkills": [
-                    {
-                        "skillId": "missing-skill",
-                        "name": "missing-skill",
-                        "directoryPath": missing_dir.to_string_lossy().to_string()
-                    }
-                ]
-            }),
-        );
+        state
+            .settings_store
+            .set_section(
+                "skillsConfig",
+                serde_json::json!({
+                    "instructionSkills": [
+                        {
+                            "skillId": "missing-skill",
+                            "name": "missing-skill",
+                            "directoryPath": missing_dir.to_string_lossy().to_string()
+                        }
+                    ]
+                }),
+            )
+            .unwrap();
 
         let error = get_instruction_skill_preview(
             State(state),
@@ -2689,17 +2718,20 @@ mod tests {
     #[tokio::test]
     async fn disabled_mcp_server_routes_do_not_report_connection_error() {
         let state = test_state();
-        state.settings_store.upsert_array_entry(
-            "mcpServers",
-            "id",
-            &serde_json::json!({
-                "id": "disabled-mcp",
-                "name": "disabled-mcp",
-                "command": "node",
-                "enabled": false,
-                "error": "/private/path/raw transport error"
-            }),
-        );
+        state
+            .settings_store
+            .upsert_array_entry(
+                "mcpServers",
+                "id",
+                &serde_json::json!({
+                    "id": "disabled-mcp",
+                    "name": "disabled-mcp",
+                    "command": "node",
+                    "enabled": false,
+                    "error": "/private/path/raw transport error"
+                }),
+            )
+            .unwrap();
 
         let app = Router::new().merge(routes()).with_state(state.clone());
         let list = get_json(app, "/settings/mcp").await;

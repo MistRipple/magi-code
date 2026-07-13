@@ -412,6 +412,7 @@ mod tests {
                 session_id.clone(),
                 ThreadId::new("thread-goal-accounting"),
                 "完成目标记账",
+                magi_core::AccessProfile::Restricted,
                 Some(12),
             )
             .expect("goal should be creatable");
@@ -525,21 +526,25 @@ mod tests {
         let session_store = SessionStore::new();
         let settings_store = Arc::new(SettingsStore::new());
         let session_id = SessionId::new("session-1");
-        settings_store.set_section(
-            "orchestrator",
-            json!({
-                "baseUrl": "https://example.test",
-                "provider": "openai-compatible"
-            }),
-        );
-        settings_store.set_session_section(
-            &session_id,
-            "orchestrator",
-            json!({
-                "model": "gpt-session-test",
-                "reasoningEffort": "high"
-            }),
-        );
+        settings_store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://example.test",
+                    "provider": "openai-compatible"
+                }),
+            )
+            .unwrap();
+        settings_store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                json!({
+                    "model": "gpt-session-test",
+                    "reasoningEffort": "high"
+                }),
+            )
+            .unwrap();
         let binding = session_turn_model_usage_binding(true);
         let workspace_id = Some(WorkspaceId::new("workspace-1"));
 
@@ -590,20 +595,24 @@ mod tests {
         let session_store = SessionStore::new();
         let settings_store = Arc::new(SettingsStore::new());
         let session_id = SessionId::new("session-1");
-        settings_store.set_section(
-            "orchestrator",
-            json!({
-                "baseUrl": "https://example.test",
-                "provider": "openai-compatible"
-            }),
-        );
-        settings_store.set_session_section(
-            &session_id,
-            "orchestrator",
-            json!({
-                "model": "gpt-session-test"
-            }),
-        );
+        settings_store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://example.test",
+                    "provider": "openai-compatible"
+                }),
+            )
+            .unwrap();
+        settings_store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                json!({
+                    "model": "gpt-session-test"
+                }),
+            )
+            .unwrap();
         let binding = session_turn_model_usage_binding(true);
 
         publish_model_usage_record(

@@ -11,6 +11,7 @@
   } from '../shared/rust-backend-types';
   import type { IconName } from '../lib/icons';
   import {
+    applyCurrentGoalResponse,
     ensureGoalState,
     getGoalState,
     refreshCurrentGoal,
@@ -28,6 +29,7 @@
   let isEditingGoal = $state(false);
   let goalObjectiveDraft = $state('');
   let goalActionLoading = $state<'save' | 'pause' | 'resume' | 'clear' | null>(null);
+  let todoClearLoading = $state(false);
 
   $effect(() => {
     ensureGoalState(currentSessionId, currentWorkspaceId, currentWorkspacePathValue());
@@ -301,14 +303,35 @@
   async function clearGoal(): Promise<void> {
     if (!currentGoal) return;
     await runGoalAction('clear', async () => {
-      await createClient().clearCurrentGoal(goalActionRequest());
-      await refreshGoalAfterMutation();
+      const response = await createClient().clearCurrentGoal(goalActionRequest());
+      applyCurrentGoalResponse({
+        sessionId: response.sessionId,
+        workspaceId: response.workspaceId,
+        workspacePath: response.workspacePath,
+        goal: null,
+        todoItems: [],
+      });
       isEditingGoal = false;
       addToast('info', i18n.t('goalPanel.action.goalCleared'));
     }).catch((err) => {
       console.warn('[GoalRunDrawers] goal clear failed:', err);
       addToast('error', i18n.t('goalPanel.action.goalClearFailed'));
     });
+  }
+
+  async function clearTodos(): Promise<void> {
+    if (!hasGoalTodos || todoClearLoading) return;
+    todoClearLoading = true;
+    try {
+      const response = await createClient().clearCurrentGoalTodos(goalActionRequest());
+      applyCurrentGoalResponse(response);
+      todoDrawerExpanded = false;
+    } catch (err) {
+      console.warn('[GoalRunDrawers] todo clear failed:', err);
+      addToast('error', i18n.t('goalPanel.action.todoClearFailed'));
+    } finally {
+      todoClearLoading = false;
+    }
   }
 
 </script>
@@ -337,6 +360,20 @@
           {/if}
           <Icon name="chevron-right" size={13} class={todoDrawerExpanded ? 'drawer-chevron drawer-chevron--open' : 'drawer-chevron'} />
         </button>
+        {#if todoSummary.total > 0 && todoSummary.completed === todoSummary.total}
+          <div class="goal-actions">
+            <button
+              type="button"
+              class="icon-action icon-action--danger"
+              disabled={todoClearLoading}
+              onclick={clearTodos}
+              title={i18n.t('goalPanel.action.clearTodoTitle')}
+              aria-label={i18n.t('goalPanel.action.clearTodoTitle')}
+            >
+              <Icon name={todoClearLoading ? 'loader' : 'trash'} size={13} class={todoClearLoading ? 'spinning' : ''} />
+            </button>
+          </div>
+        {/if}
       </div>
 
       {#if todoDrawerExpanded}

@@ -7,8 +7,8 @@ use crate::models::{
     SessionStoreState,
 };
 use magi_core::{
-    ExecutionOwnership, MissionId, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId,
-    ThreadId, TodoItem, TodoStatus, UtcMillis, WorkerId, WorkspaceId,
+    AccessProfile, ExecutionOwnership, MissionId, RecoveryResumeInput, SessionId,
+    TaskExecutionTarget, TaskId, ThreadId, TodoItem, TodoStatus, UtcMillis, WorkerId, WorkspaceId,
 };
 use serde_json::json;
 use std::{thread, time::Duration};
@@ -155,6 +155,7 @@ fn goal_store_rejects_second_unfinished_goal_for_same_session() {
             session_id.clone(),
             ThreadId::new("thread-main"),
             "完成项目级重构",
+            AccessProfile::Restricted,
             Some(1_000),
         )
         .expect("first goal should be creatable");
@@ -165,6 +166,7 @@ fn goal_store_rejects_second_unfinished_goal_for_same_session() {
             session_id.clone(),
             ThreadId::new("thread-main"),
             "另一个未结束目标",
+            AccessProfile::Restricted,
             None,
         )
         .expect_err("second unfinished goal must be rejected");
@@ -179,6 +181,7 @@ fn goal_store_rejects_second_unfinished_goal_for_same_session() {
             session_id,
             ThreadId::new("thread-main"),
             "完成下一阶段",
+            AccessProfile::Restricted,
             None,
         )
         .expect("new goal after terminal status should be allowed");
@@ -232,6 +235,7 @@ fn goal_accounting_budget_limits_active_goal_without_cross_session_leakage() {
             session_a.clone(),
             ThreadId::new("thread-a"),
             "分析并修复 A",
+            AccessProfile::Restricted,
             Some(10),
         )
         .expect("goal a should be creatable");
@@ -240,6 +244,7 @@ fn goal_accounting_budget_limits_active_goal_without_cross_session_leakage() {
             session_b.clone(),
             ThreadId::new("thread-b"),
             "分析并修复 B",
+            AccessProfile::Restricted,
             Some(100),
         )
         .expect("goal b should be creatable");

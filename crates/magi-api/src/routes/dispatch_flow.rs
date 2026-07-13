@@ -151,6 +151,10 @@ async fn execute_dispatch_submission(
         )?;
     }
     state
+        .session_store
+        .set_active_goal_access_profile(&session_id, request.requested_access_profile())
+        .map_err(|error| ApiError::internal_assembly("更新 active goal 访问模式失败", error))?;
+    state
         .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
         .await?;
     let user_timeline_entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);

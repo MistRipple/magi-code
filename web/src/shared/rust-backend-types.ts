@@ -1417,7 +1417,7 @@ export interface AgentProjectionDto {
   status: TaskStatus;
   statusLabel: string;
   lifecycle: 'queued' | 'running' | 'completed' | 'failed' | 'killed' | 'degraded' | string;
-  accessMode: 'read_only' | 'restricted' | 'full_access' | string;
+  accessProfile: 'read_only' | 'restricted' | 'full_access' | string;
   parallelismGroup?: string | null;
   workerId?: string | null;
   threadId?: string | null;

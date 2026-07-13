@@ -414,34 +414,6 @@ impl SessionStore {
             .unwrap_or_default()
     }
 
-    pub fn switch_session(&self, session_id: &SessionId) -> DomainResult<()> {
-        let mut state = self
-            .state
-            .write()
-            .expect("session state write lock poisoned");
-        if !state
-            .sessions
-            .iter()
-            .any(|session| &session.session_id == session_id)
-        {
-            return Err(DomainError::NotFound { entity: "session" });
-        }
-        let occurred_at = UtcMillis::now();
-        state.current_session_id = Some(session_id.clone());
-        let entry_id = unique_timeline_entry_id(
-            &state.timeline,
-            format!("timeline-session-switched-{}-{}", session_id, occurred_at.0),
-        );
-        state.timeline.push(TimelineEntry {
-            entry_id,
-            session_id: session_id.clone(),
-            kind: TimelineEntryKind::SessionSwitched,
-            message: "当前会话已切换".to_string(),
-            occurred_at,
-        });
-        Ok(())
-    }
-
     pub fn append_timeline_entry(
         &self,
         session_id: SessionId,

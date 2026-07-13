@@ -210,6 +210,10 @@ impl From<JsonRejection> for ApiError {
     }
 }
 
+pub(crate) fn settings_persistence_error(error: std::io::Error) -> ApiError {
+    ApiError::internal_assembly("保存设置失败", error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +244,15 @@ mod tests {
             ApiError::InternalAssemblyError("boom".into()).error_code(),
             "INTERNAL_ASSEMBLY_ERROR"
         );
+    }
+
+    #[test]
+    fn settings_persistence_errors_use_internal_error_boundary() {
+        let error = settings_persistence_error(std::io::Error::other("disk full"));
+
+        assert_eq!(error.error_code(), "INTERNAL_ASSEMBLY_ERROR");
+        assert!(error.message().contains("保存设置失败"));
+        assert!(error.message().contains("disk full"));
     }
 
     #[test]

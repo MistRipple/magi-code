@@ -94,6 +94,19 @@ export function getGoalState(
   return key && goalStates[key] ? goalStates[key] : EMPTY_GOAL_STATE;
 }
 
+export function applyCurrentGoalResponse(response: CurrentGoalResponseDto): void {
+  const key = goalScopeKey(response.workspaceId, response.sessionId);
+  if (!key) return;
+  writeGoalState(key, {
+    sessionId: normalizeKey(response.sessionId),
+    workspaceId: normalizeKey(response.workspaceId),
+    workspacePath: normalizeKey(response.workspacePath),
+    response,
+    loading: false,
+    error: null,
+  });
+}
+
 export async function refreshCurrentGoal(
   sessionId: string | null | undefined,
   workspaceId: string | null | undefined,

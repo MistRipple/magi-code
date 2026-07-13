@@ -367,7 +367,7 @@ fn shell_command_has_write_indicator(command: &str) -> bool {
             .iter()
             .any(|token| shell_token_is_write_indicator(token))
         || shell_tokens_include_download_output_write(&tokens)
-        || shell_tokens_include_mutating_git(&tokens)
+        || shell_command_includes_mutating_git(command)
 }
 
 fn shell_command_has_unsafe_unquoted_output_redirection(command: &str) -> bool {
@@ -571,19 +571,76 @@ fn wget_tokens_write_output(tokens: &[String]) -> bool {
     !has_stdout_output && !has_spider
 }
 
-fn shell_tokens_include_mutating_git(tokens: &[String]) -> bool {
-    for (index, token) in tokens.iter().enumerate() {
-        if token != "git" {
+fn shell_command_includes_mutating_git(command: &str) -> bool {
+    shell_command_segments(command).into_iter().any(|segment| {
+        let tokens = shell_command_tokens(&segment);
+        let Some(command_index) = shell_command_token_index(&tokens) else {
+            return false;
+        };
+        if tokens[command_index] != "git" {
+            return false;
+        }
+        git_subcommand_after(&tokens[command_index + 1..])
+            .is_some_and(|subcommand| !git_subcommand_is_read_only(subcommand))
+    })
+}
+
+fn shell_command_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut segment = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for ch in command.chars() {
+        if escaped {
+            segment.push(ch);
+            escaped = false;
             continue;
         }
-        let Some(subcommand) = git_subcommand_after(&tokens[index + 1..]) else {
+        if ch == '\\' && quote != Some('\'') {
+            segment.push(ch);
+            escaped = true;
             continue;
-        };
-        if !git_subcommand_is_read_only(subcommand) {
-            return true;
+        }
+        if let Some(active_quote) = quote {
+            segment.push(ch);
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            segment.push(ch);
+            continue;
+        }
+        if matches!(ch, ';' | '|' | '&' | '\n') {
+            if !segment.trim().is_empty() {
+                segments.push(std::mem::take(&mut segment));
+            }
+            continue;
+        }
+        segment.push(ch);
+    }
+    if !segment.trim().is_empty() {
+        segments.push(segment);
+    }
+    segments
+}
+
+fn shell_command_token_index(tokens: &[String]) -> Option<usize> {
+    let mut index = 0usize;
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            "if" | "then" | "do" | "else" | "elif" | "time" | "command" | "builtin" | "exec"
+            | "sudo" | "env" => index += 1,
+            token if token.contains('=') && !token.starts_with('/') && !token.starts_with("./") => {
+                index += 1
+            }
+            _ => return Some(index),
         }
     }
-    false
+    None
 }
 
 fn git_subcommand_after(tokens: &[String]) -> Option<&str> {
@@ -915,6 +972,17 @@ mod tests {
         let args = r#"{"command":"printf 'a > b'","access_mode":"read_only"}"#;
 
         assert!(PermissionEngine::shell_arguments_request_read_only(args));
+    }
+
+    #[test]
+    fn shell_read_only_allows_compound_repository_inspection() {
+        let args = serde_json::json!({
+            "access_mode": "read_only",
+            "command": "cd /Users/xie/code/magi && {\n  echo \"=== ROOT LISTING ===\";\n  ls -la;\n  echo;\n  echo \"=== GIT STATE ===\";\n  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n    git rev-parse --is-inside-work-tree;\n    git status --short | head -50;\n    echo \"--- recent commits ---\";\n    git log --oneline -15 2>/dev/null || echo \"(no commits)\";\n  else\n    echo \"NOT_GIT_WORKTREE\";\n  fi\n  echo;\n  echo \"=== FILE COUNT BY TYPE (top-level dirs only) ===\";\n  for d in */; do printf \"%s \" \"$d\"; find \"$d\" -type f 2>/dev/null | wc -l; done | head -40;\n} 2>&1 | head -200"
+        })
+        .to_string();
+
+        assert!(PermissionEngine::shell_arguments_request_read_only(&args));
     }
 
     #[test]

@@ -502,6 +502,8 @@ fn semantic_required_tool_references(text: &str) -> Vec<(&'static str, usize)> {
             "创建文件",
             "新建文件",
             "写入文件",
+            "写入内容",
+            "写入指定内容",
             "写文件",
             "生成文件",
             "保存到",
@@ -510,6 +512,7 @@ fn semantic_required_tool_references(text: &str) -> Vec<(&'static str, usize)> {
             "create a file",
             "write file",
             "write a file",
+            "write content",
             "file content must contain",
         ],
     );

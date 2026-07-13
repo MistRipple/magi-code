@@ -1,6 +1,6 @@
 use super::{SessionStore, unique_timeline_entry_id};
 use crate::models::{GoalStatus, SessionGoal, TimelineEntry, TimelineEntryKind};
-use magi_core::{DomainError, DomainResult, GoalId, SessionId, ThreadId, UtcMillis};
+use magi_core::{AccessProfile, DomainError, DomainResult, GoalId, SessionId, ThreadId, UtcMillis};
 
 fn normalize_objective(objective: impl Into<String>) -> DomainResult<String> {
     let objective = objective.into();
@@ -33,6 +33,7 @@ impl SessionStore {
         session_id: SessionId,
         thread_id: ThreadId,
         objective: impl Into<String>,
+        access_profile: AccessProfile,
         token_budget: Option<u64>,
     ) -> DomainResult<SessionGoal> {
         let objective = normalize_objective(objective)?;
@@ -63,6 +64,7 @@ impl SessionStore {
             thread_id,
             objective: objective.clone(),
             status: GoalStatus::Active,
+            access_profile,
             token_budget,
             tokens_used: 0,
             time_used_seconds: 0,
@@ -83,6 +85,37 @@ impl SessionStore {
             occurred_at: now,
         });
         Ok(goal)
+    }
+
+    pub fn set_active_goal_access_profile(
+        &self,
+        session_id: &SessionId,
+        access_profile: AccessProfile,
+    ) -> DomainResult<Option<SessionGoal>> {
+        let now = UtcMillis::now();
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if !state
+            .sessions
+            .iter()
+            .any(|session| &session.session_id == session_id)
+        {
+            return Err(DomainError::NotFound { entity: "session" });
+        }
+        let Some(goal) = state
+            .goals
+            .iter_mut()
+            .find(|goal| &goal.session_id == session_id && goal.status == GoalStatus::Active)
+        else {
+            return Ok(None);
+        };
+        if goal.access_profile != access_profile {
+            goal.access_profile = access_profile;
+            goal.updated_at = now;
+        }
+        Ok(Some(goal.clone()))
     }
 
     pub fn current_goal(&self, session_id: &SessionId) -> Option<SessionGoal> {
@@ -313,6 +346,42 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::SessionExecutionSidecarStoreState;
+
+    #[test]
+    fn active_goal_access_profile_change_survives_durable_restore() {
+        let store = SessionStore::new();
+        let session_id = SessionId::new("session-goal-access-profile");
+        store
+            .create_session(session_id.clone(), "goal access profile")
+            .expect("session should be created");
+        let goal = store
+            .create_goal(
+                session_id.clone(),
+                ThreadId::new("thread-goal-access-profile"),
+                "验证访问模式持久化",
+                AccessProfile::ReadOnly,
+                None,
+            )
+            .expect("goal should be created");
+
+        let updated = store
+            .set_active_goal_access_profile(&session_id, AccessProfile::FullAccess)
+            .expect("active goal access profile should update")
+            .expect("active goal should exist");
+        assert_eq!(updated.goal_id, goal.goal_id);
+        assert_eq!(updated.access_profile, AccessProfile::FullAccess);
+
+        let restored = SessionStore::from_persisted_parts(
+            store.durable_state(),
+            SessionExecutionSidecarStoreState::default(),
+        );
+        let restored_goal = restored
+            .active_goal(&session_id)
+            .expect("active goal should survive durable restore");
+        assert_eq!(restored_goal.goal_id, goal.goal_id);
+        assert_eq!(restored_goal.access_profile, AccessProfile::FullAccess);
+    }
 
     #[test]
     fn clearing_latest_goal_does_not_reveal_older_completed_goal() {
@@ -326,6 +395,7 @@ mod tests {
                 session_id.clone(),
                 ThreadId::new("thread-goal-history"),
                 "第一个目标",
+                AccessProfile::Restricted,
                 None,
             )
             .expect("first goal should be created");
@@ -337,6 +407,7 @@ mod tests {
                 session_id.clone(),
                 ThreadId::new("thread-goal-history"),
                 "第二个目标",
+                AccessProfile::Restricted,
                 None,
             )
             .expect("second goal should be created");
@@ -359,6 +430,7 @@ mod tests {
                 session_id.clone(),
                 ThreadId::new("thread-goal-terminal"),
                 "终态目标",
+                AccessProfile::Restricted,
                 None,
             )
             .expect("goal should be created");
@@ -384,6 +456,7 @@ mod tests {
                 session_id.clone(),
                 ThreadId::new("thread-goal-failure-streak"),
                 "完成目标",
+                AccessProfile::Restricted,
                 None,
             )
             .expect("goal should be created");

@@ -1235,6 +1235,10 @@ async fn submit_regular_session_turn(
         accepted_at,
     )?;
     apply_turn_orchestrator_session_override(&state, &request, &session_id)?;
+    state
+        .session_store
+        .set_active_goal_access_profile(&session_id, request.requested_access_profile())
+        .map_err(|error| ApiError::internal_assembly("更新 active goal 访问模式失败", error))?;
     let workspace_root_path = state
         .workspace_root_path(&workspace_id)
         .map(|path| path.display().to_string());
@@ -1723,7 +1727,7 @@ async fn submit_goal_continuation_turn(
             images: Vec::new(),
             context_references: Vec::new(),
             use_tools: true,
-            access_profile: AccessProfile::default(),
+            access_profile: goal_continuation_access_profile(&goal),
             skill_name: None,
             request_id: None,
             user_message_id: None,
@@ -1738,6 +1742,10 @@ async fn submit_goal_continuation_turn(
         false,
     );
     Ok(())
+}
+
+fn goal_continuation_access_profile(goal: &SessionGoal) -> AccessProfile {
+    goal.access_profile
 }
 
 fn goal_continuation_prompt(goal: &SessionGoal) -> String {
@@ -2625,18 +2633,13 @@ async fn switch_session(
         request.requested_workspace_path(),
     )?;
     require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
-    state
+    let current_session = state
         .session_store
-        .switch_session(&session_id)
-        .map_err(|e| ApiError::internal_assembly("切换会话失败", e))?;
-    state.persist_session_durable_state_for_api()?;
-    let current_session = state.session_store.current_session();
+        .session(&session_id)
+        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
     Ok(Json(SessionSelectionResponseDto {
-        session_id: current_session
-            .as_ref()
-            .map(|session| session.session_id.to_string())
-            .unwrap_or_default(),
-        current_session,
+        session_id: current_session.session_id.to_string(),
+        current_session: Some(current_session),
     }))
 }
 
@@ -3284,6 +3287,7 @@ mod tests {
     use magi_session_store::{
         CanonicalTurnItemKind, SessionExecutionSidecarStoreState, SessionStore,
     };
+    use magi_settings_store::SettingsStore;
     use magi_workspace::WorkspaceStore;
     use std::{fs, sync::Arc};
     use tower::ServiceExt;
@@ -3360,6 +3364,7 @@ mod tests {
             thread_id: ThreadId::new("thread-goal-prompt"),
             objective: "完成任务系统升级并验证".to_string(),
             status: GoalStatus::Active,
+            access_profile: AccessProfile::FullAccess,
             token_budget: Some(4096),
             tokens_used: 1024,
             time_used_seconds: 30,
@@ -3381,6 +3386,11 @@ mod tests {
         assert!(prompt.contains("update_goal(status=\"complete\")"));
         assert!(prompt.contains("update_goal(status=\"blocked\")"));
         assert!(prompt.contains("目标仍为 active 时不要输出面向用户的最终总结"));
+        assert_eq!(
+            goal_continuation_access_profile(&goal),
+            AccessProfile::FullAccess,
+            "Goal 自动续跑必须沿用目标最近一次用户选择的访问模式"
+        );
     }
 
     #[test]
@@ -5673,11 +5683,14 @@ mod tests {
         state
             .conversation_registry
             .conversation_for_task(&session_id, &child_task.task_id);
-        state.settings_store.set_session_section(
-            &session_id,
-            "orchestrator",
-            json!({"model": "delete-model", "reasoningEffort": "high"}),
-        );
+        state
+            .settings_store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                json!({"model": "delete-model", "reasoningEffort": "high"}),
+            )
+            .unwrap();
         state.enqueue_regular_session_turn(QueuedRegularSessionTurn {
             request: session_turn_request("排队消息"),
             images: Vec::new(),
@@ -5744,6 +5757,49 @@ mod tests {
                 .canonical_turns_for_session(&session_id)
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn delete_session_keeps_session_when_settings_cleanup_cannot_persist() {
+        let root = unique_temp_dir("session-delete-settings-failure");
+        let blocked_parent = root.join("blocked-parent");
+        fs::write(&blocked_parent, b"not-a-directory").unwrap();
+        let settings_store = Arc::new(SettingsStore::with_persistence_path(
+            blocked_parent.join("settings.json"),
+        ));
+        let state = test_state().with_settings_store(settings_store);
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-delete-settings-failure",
+            "workspace-delete-settings-failure",
+        );
+        let session_id = SessionId::new("session-delete-settings-failure");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "设置失败保留会话",
+                Some(workspace_id.to_string()),
+            )
+            .unwrap();
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/delete",
+            json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected body: {body}"
+        );
+        assert!(state.session_store.session(&session_id).is_some());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -6007,6 +6063,53 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
         assert_eq!(body["sessionId"], session_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn switch_session_is_navigation_only_without_backend_selection_side_effects() {
+        let state = test_state();
+        register_workspace(&state, "workspace-a", "session-switch-navigation-only");
+        let first_session_id = SessionId::new("session-switch-navigation-first");
+        let second_session_id = SessionId::new("session-switch-navigation-second");
+        state
+            .session_store
+            .create_session_for_workspace(
+                first_session_id.clone(),
+                "第一会话",
+                Some("workspace-a".to_string()),
+            )
+            .unwrap();
+        state
+            .session_store
+            .create_session_for_workspace(
+                second_session_id.clone(),
+                "第二会话",
+                Some("workspace-a".to_string()),
+            )
+            .unwrap();
+        let timeline_count = state.session_store.timeline().len();
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/switch",
+            serde_json::json!({
+                "workspaceId": "workspace-a",
+                "sessionId": first_session_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["sessionId"], first_session_id.as_str());
+        assert_eq!(
+            body["currentSession"]["sessionId"],
+            first_session_id.as_str()
+        );
+        assert_eq!(
+            state.session_store.current_session().unwrap().session_id,
+            second_session_id
+        );
+        assert_eq!(state.session_store.timeline().len(), timeline_count);
     }
 
     #[tokio::test]

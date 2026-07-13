@@ -74,12 +74,6 @@ const TOOL_VISIBILITY_REJECTED_PUBLIC_ERROR: &str = "该工具在当前任务角
 const TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR: &str =
     "受限访问已拦截该操作，请切换为完全访问权限后重试";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AgentSpawnAccessMode {
-    ReadOnly,
-    ReadWrite,
-}
-
 pub(crate) struct ToolPreflightDecision {
     pub(crate) payload: String,
     pub(crate) status: ExecutionResultStatus,
@@ -185,23 +179,6 @@ fn tool_arguments_preview(value: &str) -> String {
         preview.push_str("...");
     }
     preview
-}
-
-impl AgentSpawnAccessMode {
-    fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "read_only" | "readonly" | "read-only" | "read" => Some(Self::ReadOnly),
-            "read_write" | "readwrite" | "read-write" | "write" | "full" => Some(Self::ReadWrite),
-            _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "read_only",
-            Self::ReadWrite => "read_write",
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -574,23 +551,6 @@ fn execute_coordinator_tool(
                 Some(context) if context != goal => format!("{goal}\n\n上下文：{context}"),
                 _ => goal.clone(),
             };
-            let access_mode = match parsed.get("access_mode").and_then(|v| v.as_str()) {
-                Some(value) => match AgentSpawnAccessMode::parse(value) {
-                    Some(mode) => mode,
-                    None => {
-                        return (
-                            serde_json::json!({
-                                "tool": tool.as_str(),
-                                "status": "failed",
-                                "error": "agent_spawn access_mode 只能是 read_only 或 read_write",
-                            })
-                            .to_string(),
-                            ExecutionResultStatus::Failed,
-                        );
-                    }
-                },
-                None => default_agent_spawn_access_mode(&role),
-            };
             let task_kind = parsed
                 .get("task_kind")
                 .and_then(|v| v.as_str())
@@ -616,7 +576,8 @@ fn execute_coordinator_tool(
                 seq
             ));
             let child_policy_snapshot =
-                agent_spawn_child_policy_snapshot(task.policy_snapshot.as_ref(), access_mode);
+                agent_spawn_child_policy_snapshot(task.policy_snapshot.as_ref());
+            let child_access_profile = child_policy_snapshot.access_profile;
             let child_dependency_ids = agent_spawn_child_dependency_ids(task);
             let child_input_refs = agent_spawn_child_input_refs(task);
             let child = magi_core::Task {
@@ -710,7 +671,7 @@ fn execute_coordinator_tool(
                     "parent_task_id": task.task_id.to_string(),
                     "child_task_id": child_id.to_string(),
                     "role": role,
-                    "access_mode": access_mode.as_str(),
+                    "access_profile": child_access_profile.as_str(),
                     "goal": goal,
                     "task_kind": format!("{:?}", task_kind),
                     "worker_id": registered_execution.worker_id.to_string(),
@@ -733,13 +694,13 @@ fn execute_coordinator_tool(
                     "status": "started",
                     "child_task_id": child_id.to_string(),
                     "role": role,
-                    "access_mode": access_mode.as_str(),
+                    "access_profile": child_access_profile.as_str(),
                     "title": child.title,
                     "assignment": {
                         "title": child.title,
                         "goal": child.goal,
                         "role": role,
-                        "access_mode": access_mode.as_str(),
+                        "access_profile": child_access_profile.as_str(),
                     },
                     "worker_id": registered_execution.worker_id.to_string(),
                     "thread_id": registered_execution.thread_id.to_string(),
@@ -769,6 +730,7 @@ pub(crate) fn execute_goal_tool(
     session_store: &SessionStore,
     session_id: &SessionId,
     thread_id: magi_core::ThreadId,
+    access_profile: AccessProfile,
     tool: BuiltinToolName,
     arguments: &str,
 ) -> (String, ExecutionResultStatus) {
@@ -844,8 +806,13 @@ pub(crate) fn execute_goal_tool(
                     ExecutionResultStatus::Failed,
                 );
             }
-            match session_store.create_goal(session_id.clone(), thread_id, objective, token_budget)
-            {
+            match session_store.create_goal(
+                session_id.clone(),
+                thread_id,
+                objective,
+                access_profile,
+                token_budget,
+            ) {
                 Ok(goal) => (
                     serde_json::json!({
                         "tool": tool.as_str(),
@@ -961,29 +928,10 @@ fn objective_text_explicitly_allows_goal_budget(objective: &str, token_budget: u
     normalized.contains(&token_budget.to_string())
 }
 
-fn default_agent_spawn_access_mode(role: &str) -> AgentSpawnAccessMode {
-    match role.trim() {
-        "architect" | "explorer" | "reviewer" => AgentSpawnAccessMode::ReadOnly,
-        _ => AgentSpawnAccessMode::ReadWrite,
-    }
-}
-
-fn agent_spawn_child_policy_snapshot(
-    parent_policy: Option<&TaskPolicy>,
-    access_mode: AgentSpawnAccessMode,
-) -> TaskPolicy {
-    let mut policy = parent_policy
+fn agent_spawn_child_policy_snapshot(parent_policy: Option<&TaskPolicy>) -> TaskPolicy {
+    parent_policy
         .cloned()
-        .unwrap_or_else(default_agent_spawn_policy);
-    if access_mode == AgentSpawnAccessMode::ReadOnly
-        || policy.command_mode.eq_ignore_ascii_case("read_only")
-    {
-        policy.access_profile = magi_core::AccessProfile::ReadOnly;
-        policy.command_mode = "read_only".to_string();
-    } else if policy.command_mode.trim().is_empty() {
-        policy.command_mode = "full".to_string();
-    }
-    policy
+        .unwrap_or_else(default_agent_spawn_policy)
 }
 
 fn agent_spawn_child_dependency_ids(parent: &magi_core::Task) -> Vec<TaskId> {
@@ -1060,7 +1008,12 @@ fn enqueue_agent_assignment_message(
     role: &str,
     now: UtcMillis,
 ) {
-    let access_mode = task_policy_access_mode(child.policy_snapshot.as_ref()).as_str();
+    let access_profile = child
+        .policy_snapshot
+        .as_ref()
+        .map(|policy| policy.access_profile)
+        .unwrap_or_default()
+        .as_str();
     let child_conversation =
         conversation_registry.conversation_for_task(session_id, &child.task_id);
     child_conversation
@@ -1077,23 +1030,12 @@ fn enqueue_agent_assignment_message(
                 "title": child.title,
                 "goal": child.goal,
                 "role": role,
-                "access_mode": access_mode,
+                "access_profile": access_profile,
                 "dependency_ids": child.dependency_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 "input_refs": &child.input_refs,
             }),
             enqueued_at: now,
         });
-}
-
-fn task_policy_access_mode(policy: Option<&TaskPolicy>) -> AgentSpawnAccessMode {
-    if policy
-        .map(|policy| policy.access_profile == AccessProfile::ReadOnly)
-        .unwrap_or(false)
-    {
-        AgentSpawnAccessMode::ReadOnly
-    } else {
-        AgentSpawnAccessMode::ReadWrite
-    }
 }
 
 fn execute_agent_wait(
@@ -1503,6 +1445,10 @@ fn execute_task_tool_call(
                         task.mission_id.clone()
                     })
                     .1,
+                task.policy_snapshot
+                    .as_ref()
+                    .map(|policy| policy.access_profile)
+                    .unwrap_or_default(),
                 canonical,
                 &tool_call.function.arguments,
             );
@@ -1809,7 +1755,7 @@ pub(crate) fn access_profile_tool_decision(
     };
     let engine = builtin_permission_engine();
     let is_write_tool = BuiltinToolName::from_name(canonical_tool_name.as_str())
-        .is_some_and(|tool| tool.is_write_operation());
+        .is_some_and(|tool| tool.is_access_profile_write_operation());
     let mut pending_decision = None;
 
     let tool_request = magi_permissions::PermissionRequest::ToolInvocation {
@@ -2200,57 +2146,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn agent_spawn_access_mode_defaults_to_read_only_for_review_roles() {
-        assert_eq!(
-            default_agent_spawn_access_mode("explorer"),
-            AgentSpawnAccessMode::ReadOnly
-        );
-        assert_eq!(
-            default_agent_spawn_access_mode("reviewer"),
-            AgentSpawnAccessMode::ReadOnly
-        );
-        assert_eq!(
-            default_agent_spawn_access_mode("architect"),
-            AgentSpawnAccessMode::ReadOnly
-        );
-        assert_eq!(
-            default_agent_spawn_access_mode("executor"),
-            AgentSpawnAccessMode::ReadWrite
-        );
+    fn read_only_agent_spawn_policy() -> TaskPolicy {
+        let mut policy = default_agent_spawn_policy();
+        policy.access_profile = magi_core::AccessProfile::ReadOnly;
+        policy.command_mode = "read_only".to_string();
+        policy
     }
 
     #[test]
-    fn agent_spawn_child_policy_applies_read_only_access_mode() {
+    fn agent_spawn_child_policy_preserves_parent_full_access() {
         let parent = default_agent_spawn_policy();
-        let child =
-            agent_spawn_child_policy_snapshot(Some(&parent), AgentSpawnAccessMode::ReadOnly);
+        let child = agent_spawn_child_policy_snapshot(Some(&parent));
 
-        assert_eq!(child.access_profile, magi_core::AccessProfile::ReadOnly);
-        assert_eq!(child.command_mode, "read_only");
+        assert_eq!(child.access_profile, parent.access_profile);
+        assert_eq!(child.command_mode, parent.command_mode);
         assert_eq!(child.network_mode, parent.network_mode);
         assert_eq!(child.task_tier, parent.task_tier);
 
         let mut full_access_parent = default_agent_spawn_policy();
         full_access_parent.access_profile = magi_core::AccessProfile::FullAccess;
-        let full_access_child = agent_spawn_child_policy_snapshot(
-            Some(&full_access_parent),
-            AgentSpawnAccessMode::ReadOnly,
-        );
+        let full_access_child = agent_spawn_child_policy_snapshot(Some(&full_access_parent));
         assert_eq!(
             full_access_child.access_profile,
-            magi_core::AccessProfile::ReadOnly
+            magi_core::AccessProfile::FullAccess
         );
-        assert_eq!(full_access_child.command_mode, "read_only");
+        assert_eq!(full_access_child.command_mode, "full");
     }
 
     #[test]
     fn agent_spawn_child_policy_never_escalates_parent_read_only() {
-        let mut parent = default_agent_spawn_policy();
-        parent.command_mode = "read_only".to_string();
+        let parent = read_only_agent_spawn_policy();
 
-        let child =
-            agent_spawn_child_policy_snapshot(Some(&parent), AgentSpawnAccessMode::ReadWrite);
+        let child = agent_spawn_child_policy_snapshot(Some(&parent));
 
         assert_eq!(child.access_profile, magi_core::AccessProfile::ReadOnly);
         assert_eq!(child.command_mode, "read_only");
@@ -2259,14 +2186,23 @@ mod tests {
     #[test]
     fn agent_spawn_child_policy_inherits_parent_reference_boundaries() {
         let mut parent = default_agent_spawn_policy();
+        parent.allowed_tools = vec!["file_read".to_string(), "shell_exec".to_string()];
+        parent.denied_tools = vec!["memory_write".to_string()];
         parent.allowed_paths = vec!["/tmp/workspace".to_string(), "/tmp/reference".to_string()];
+        parent.denied_paths = vec!["/tmp/workspace/private".to_string()];
         parent.read_only_paths = vec!["/tmp/reference".to_string()];
+        parent.network_mode = "disabled".to_string();
+        parent.command_mode = "read_only".to_string();
 
-        let child =
-            agent_spawn_child_policy_snapshot(Some(&parent), AgentSpawnAccessMode::ReadWrite);
+        let child = agent_spawn_child_policy_snapshot(Some(&parent));
 
+        assert_eq!(child.allowed_tools, parent.allowed_tools);
+        assert_eq!(child.denied_tools, parent.denied_tools);
         assert_eq!(child.allowed_paths, parent.allowed_paths);
+        assert_eq!(child.denied_paths, parent.denied_paths);
         assert_eq!(child.read_only_paths, parent.read_only_paths);
+        assert_eq!(child.network_mode, parent.network_mode);
+        assert_eq!(child.command_mode, parent.command_mode);
     }
 
     #[test]
@@ -2310,10 +2246,9 @@ mod tests {
     #[test]
     fn read_only_agent_policy_rejects_write_tool() {
         let mut task = test_task("task-read-only-agent", "task-read-only-agent", None);
-        task.policy_snapshot = Some(agent_spawn_child_policy_snapshot(
-            Some(&default_agent_spawn_policy()),
-            AgentSpawnAccessMode::ReadOnly,
-        ));
+        task.policy_snapshot = Some(agent_spawn_child_policy_snapshot(Some(
+            &read_only_agent_spawn_policy(),
+        )));
 
         let decision = task_policy_tool_decision(
             &task,
@@ -2335,44 +2270,36 @@ mod tests {
     }
 
     #[test]
-    fn read_only_agent_policy_rejects_state_write_tools() {
+    fn read_only_policy_allows_internal_coordination_but_rejects_project_memory_write() {
         let mut task = test_task(
             "task-read-only-state-tools",
             "task-read-only-state-tools",
             None,
         );
-        task.policy_snapshot = Some(agent_spawn_child_policy_snapshot(
-            Some(&default_agent_spawn_policy()),
-            AgentSpawnAccessMode::ReadOnly,
-        ));
+        task.policy_snapshot = Some(agent_spawn_child_policy_snapshot(Some(
+            &read_only_agent_spawn_policy(),
+        )));
 
         for tool in [
             BuiltinToolName::AgentSpawn,
             BuiltinToolName::CreateGoal,
             BuiltinToolName::UpdateGoal,
             BuiltinToolName::TodoWrite,
-            BuiltinToolName::MemoryWrite,
         ] {
-            let decision = task_policy_tool_decision(&task, tool.as_str(), "{}")
-                .unwrap_or_else(|| panic!("read-only agent should reject {}", tool.as_str()));
-            let payload: serde_json::Value =
-                serde_json::from_str(&decision.payload).expect("rejection should be json");
-
-            assert_eq!(decision.status, ExecutionResultStatus::Rejected);
-            assert_eq!(payload["status"].as_str(), Some("rejected"));
-            assert_eq!(payload["tool"].as_str(), Some(tool.as_str()));
-            assert_eq!(
-                payload["error_code"].as_str(),
-                Some("tool_policy_rejected"),
-                "{} should be rejected as a write tool, got {}",
-                tool.as_str(),
-                decision.payload
-            );
-            assert_eq!(
-                payload["error"].as_str(),
-                Some("该工具在当前访问模式下不可用")
+            assert!(
+                task_policy_tool_decision(&task, tool.as_str(), "{}").is_none(),
+                "只读访问只限制外部副作用，内部协调工具 {} 应保持可用",
+                tool.as_str()
             );
         }
+
+        let decision = task_policy_tool_decision(
+            &task,
+            BuiltinToolName::MemoryWrite.as_str(),
+            r#"{"action":"save"}"#,
+        )
+        .expect("project memory write should remain blocked in read-only mode");
+        assert_eq!(decision.status, ExecutionResultStatus::Rejected);
     }
 
     #[test]
@@ -2405,7 +2332,7 @@ mod tests {
     }
 
     #[test]
-    fn task_runtime_preflight_blocks_read_only_state_tool_before_special_execution() {
+    fn task_runtime_allows_todo_write_in_read_only_mode() {
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let task_store = TaskStore::new();
@@ -2416,6 +2343,9 @@ mod tests {
         let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
         let session_id = SessionId::new("session-read-only-state-tool");
         let workspace_id = Some(WorkspaceId::new("workspace-read-only-state-tool"));
+        session_store
+            .create_session(session_id.clone(), "read only internal state")
+            .expect("session should exist");
         let mut task = coordinator_task(test_task(
             "task-read-only-state-tool",
             "task-read-only-state-tool",
@@ -2432,7 +2362,8 @@ mod tests {
                 arguments: serde_json::json!({
                     "todos": [
                         {
-                            "content": "不应写入",
+                            "content": "保持只读任务进度可见",
+                            "activeForm": "正在保持只读任务进度可见",
                             "status": "pending"
                         }
                     ]
@@ -2463,22 +2394,13 @@ mod tests {
             None,
             &tool_call,
         );
-        let parsed: serde_json::Value =
-            serde_json::from_str(&payload).expect("preflight rejection should be json");
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("todo payload json");
 
-        assert_eq!(status, ExecutionResultStatus::Rejected);
-        assert_eq!(
-            parsed["tool"].as_str(),
-            Some(BuiltinToolName::TodoWrite.as_str())
-        );
-        assert_eq!(parsed["error_code"].as_str(), Some("tool_policy_rejected"));
-        assert_eq!(
-            parsed["error"].as_str(),
-            Some("该工具在当前访问模式下不可用")
-        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded);
+        assert_eq!(parsed["status"].as_str(), Some("succeeded"));
         assert!(
-            todo_ledger.is_empty(),
-            "只读 preflight 必须发生在 todo_write 特殊执行前"
+            !todo_ledger.is_empty(),
+            "只读访问不能阻止会话内部任务清单更新"
         );
     }
 
@@ -2627,10 +2549,9 @@ mod tests {
             "task-read-only-shell-redirection",
             None,
         );
-        task.policy_snapshot = Some(agent_spawn_child_policy_snapshot(
-            Some(&default_agent_spawn_policy()),
-            AgentSpawnAccessMode::ReadOnly,
-        ));
+        task.policy_snapshot = Some(agent_spawn_child_policy_snapshot(Some(
+            &read_only_agent_spawn_policy(),
+        )));
 
         let decision = task_policy_tool_decision(
             &task,

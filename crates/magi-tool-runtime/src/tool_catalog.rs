@@ -725,7 +725,9 @@ fn effective_approval_policy_label(
     access_profile: magi_core::AccessProfile,
 ) -> &'static str {
     match access_profile {
-        magi_core::AccessProfile::ReadOnly if tool.is_write_operation() => "not_applicable",
+        magi_core::AccessProfile::ReadOnly if tool.is_access_profile_write_operation() => {
+            "not_applicable"
+        }
         magi_core::AccessProfile::ReadOnly => "none",
         magi_core::AccessProfile::Restricted if tool.uses_input_sensitive_invocation_policy() => {
             "input_sensitive"
@@ -747,7 +749,7 @@ fn access_profile_behavior_label(
     access_profile: magi_core::AccessProfile,
 ) -> &'static str {
     match access_profile {
-        magi_core::AccessProfile::ReadOnly if tool.is_write_operation() => {
+        magi_core::AccessProfile::ReadOnly if tool.is_access_profile_write_operation() => {
             "unavailable_in_read_only"
         }
         magi_core::AccessProfile::ReadOnly => "read_only_allowed",
@@ -1051,7 +1053,9 @@ mod tests {
                 );
 
                 let (expected_approval, expected_behavior) = match access_profile {
-                    magi_core::AccessProfile::ReadOnly if builtin.is_write_operation() => {
+                    magi_core::AccessProfile::ReadOnly
+                        if builtin.is_access_profile_write_operation() =>
+                    {
                         ("not_applicable", "unavailable_in_read_only")
                     }
                     magi_core::AccessProfile::ReadOnly => ("none", "read_only_allowed"),

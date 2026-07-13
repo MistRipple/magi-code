@@ -130,9 +130,9 @@ pub struct LlmTaskDispatcher {
     skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
     snapshot_manager: Option<Arc<magi_snapshot::SnapshotManager>>,
     /// 任务系统：Conversation 注册中心，承载 Turn 状态机与单 Conversation 不并发不变式。
-    conversation_registry: Option<Arc<ConversationRegistry>>,
+    conversation_registry: Arc<ConversationRegistry>,
     /// 任务系统：AgentRole 注册表（来自 ApiState，注入到 conversation_loop）。
-    agent_role_registry: Option<Arc<magi_agent_role::AgentRoleRegistry>>,
+    agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
     /// 任务系统 — L5：父子任务拓扑图。S7 协调器工具 agent_spawn
     /// 需要在 conversation_loop 中读写。设计为构造期必填，避免运行期再做空检查。
     spawn_graph: Arc<std::sync::Mutex<magi_spawn_graph::SpawnGraph>>,
@@ -144,6 +144,15 @@ pub struct LlmTaskDispatcher {
     /// store，conversation_loop 中每轮 LLM 调用后调用一次 `record_mission_turn`
     /// 累加 token / 时间。daemon bootstrap 未注入时为 `None`，行为退回到不记账。
     mission_metrics_registry: Arc<MissionMetricsRegistry>,
+}
+
+pub struct LlmTaskDispatcherDependencies {
+    pub session_store: Arc<SessionStore>,
+    pub execution_registry: TaskExecutionRegistry,
+    pub result_receiver: Arc<EventBasedResultReceiver>,
+    pub spawn_graph: Arc<std::sync::Mutex<magi_spawn_graph::SpawnGraph>>,
+    pub conversation_registry: Arc<ConversationRegistry>,
+    pub agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
 }
 
 struct ExecutionPlanCleanup<'a> {
@@ -277,12 +286,17 @@ impl LlmTaskDispatcher {
     pub fn new(
         event_bus: Arc<InMemoryEventBus>,
         pipeline: ExecutionPipeline,
-        session_store: Arc<SessionStore>,
-        execution_registry: TaskExecutionRegistry,
-        result_receiver: Arc<EventBasedResultReceiver>,
-        spawn_graph: Arc<std::sync::Mutex<magi_spawn_graph::SpawnGraph>>,
+        dependencies: LlmTaskDispatcherDependencies,
         mission_state_root: PathBuf,
     ) -> Self {
+        let LlmTaskDispatcherDependencies {
+            session_store,
+            execution_registry,
+            result_receiver,
+            spawn_graph,
+            conversation_registry,
+            agent_role_registry,
+        } = dependencies;
         Self {
             event_bus,
             pipeline,
@@ -301,8 +315,8 @@ impl LlmTaskDispatcher {
             skill_runtime: None,
             skill_dispatch_runtime: None,
             snapshot_manager: None,
-            conversation_registry: None,
-            agent_role_registry: None,
+            conversation_registry,
+            agent_role_registry,
             spawn_graph,
             project_memory_registry: Arc::new(
                 magi_project_memory::ProjectMemoryRegistry::with_home(mission_state_root.clone()),
@@ -397,11 +411,6 @@ impl LlmTaskDispatcher {
         self
     }
 
-    pub fn with_conversation_registry(mut self, registry: Arc<ConversationRegistry>) -> Self {
-        self.conversation_registry = Some(registry);
-        self
-    }
-
     pub fn with_mission_metrics_registry(mut self, registry: Arc<MissionMetricsRegistry>) -> Self {
         self.mission_metrics_registry = registry;
         self
@@ -409,14 +418,6 @@ impl LlmTaskDispatcher {
 
     pub fn mission_metrics_registry(&self) -> Arc<MissionMetricsRegistry> {
         self.mission_metrics_registry.clone()
-    }
-
-    pub fn with_agent_role_registry(
-        mut self,
-        registry: Arc<magi_agent_role::AgentRoleRegistry>,
-    ) -> Self {
-        self.agent_role_registry = Some(registry);
-        self
     }
 
     pub fn with_project_memory_registry(
@@ -794,7 +795,7 @@ impl LlmTaskDispatcher {
             .into_iter()
             .filter(|definition| {
                 BuiltinToolName::from_name(definition.function.name.as_str()).is_some_and(|tool| {
-                    task_can_see_builtin_tool(task, self.agent_role_registry.as_deref(), tool)
+                    task_can_see_builtin_tool(task, Some(self.agent_role_registry.as_ref()), tool)
                         && (task.is_some() || session_turn_can_execute_builtin_tool(tool))
                         && builtin_tool_visible_in_access_profile(tool, tool_surface_access_profile)
                 })
@@ -917,7 +918,7 @@ fn builtin_tool_visible_in_access_profile(
     tool: BuiltinToolName,
     access_profile: AccessProfile,
 ) -> bool {
-    access_profile != AccessProfile::ReadOnly || !tool.is_write_operation()
+    access_profile != AccessProfile::ReadOnly || !tool.is_access_profile_write_operation()
 }
 
 impl LlmTaskDispatcher {
@@ -977,7 +978,7 @@ impl LlmTaskDispatcher {
         if task.kind != TaskKind::LocalAgent {
             return None;
         }
-        let registry = self.agent_role_registry.as_deref();
+        let registry = Some(self.agent_role_registry.as_ref());
         if task_is_coordinator(Some(task), registry) {
             return Some(root_multi_agent_mode_prompt());
         }
@@ -1414,14 +1415,6 @@ impl LlmTaskDispatcher {
             None
         };
 
-        let conversation_registry = self
-            .conversation_registry
-            .as_ref()
-            .expect("LlmTaskDispatcher 缺少 ConversationRegistry，无法走 任务系统 Turn 状态机");
-        let agent_role_registry = self
-            .agent_role_registry
-            .as_ref()
-            .expect("LlmTaskDispatcher 缺少 AgentRoleRegistry，无法解析 task→role");
         let safety_gate = self.build_safety_gate(execution_settings);
         let todo_ledger =
             magi_todo_ledger::TodoLedger::new(self.session_store.clone(), session_id.clone());
@@ -1467,8 +1460,8 @@ impl LlmTaskDispatcher {
             skill_name: skill_name.clone(),
             task_store: self.pipeline.execution_runtime.task_store(),
             execution_registry: &self.execution_registry,
-            conversation_registry: conversation_registry.as_ref(),
-            agent_role_registry: agent_role_registry.as_ref(),
+            conversation_registry: self.conversation_registry.as_ref(),
+            agent_role_registry: self.agent_role_registry.as_ref(),
             spawn_graph: self.spawn_graph.as_ref(),
             safety_gate: safety_gate.as_ref(),
             todo_ledger: &todo_ledger,
@@ -1967,14 +1960,17 @@ mod tests {
         LlmTaskDispatcher::new(
             Arc::clone(&event_bus),
             pipeline,
-            Arc::new(SessionStore::new()),
-            TaskExecutionRegistry::default(),
-            Arc::new(EventBasedResultReceiver::new()),
-            Arc::new(std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new())),
+            LlmTaskDispatcherDependencies {
+                session_store: Arc::new(SessionStore::new()),
+                execution_registry: TaskExecutionRegistry::default(),
+                result_receiver: Arc::new(EventBasedResultReceiver::new()),
+                spawn_graph: Arc::new(std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new())),
+                conversation_registry: Arc::new(ConversationRegistry::new()),
+                agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
+            },
             test_mission_state_root("dispatcher-default-tool-surface"),
         )
         .with_tool_registry(tool_registry)
-        .with_agent_role_registry(Arc::new(magi_agent_role::AgentRoleRegistry::load_default()))
     }
 
     fn test_mission_state_root(label: &str) -> PathBuf {
@@ -2226,7 +2222,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_tool_surface_hides_write_tools_before_model_call() {
+    fn read_only_coordinator_surface_keeps_internal_coordination_tools() {
         let dispatcher = dispatcher_with_default_tool_surface();
         let mut task = task_with_role("coordinator", TaskTier::ExecutionChain);
         task.policy_snapshot
@@ -2248,7 +2244,6 @@ mod tests {
             "file_mkdir",
             "file_copy",
             "file_move",
-            "agent_spawn",
             "memory_write",
         ] {
             assert!(
@@ -2259,7 +2254,64 @@ mod tests {
         assert!(names.iter().any(|name| name == "file_read"));
         assert!(names.iter().any(|name| name == "search_text"));
         assert!(names.iter().any(|name| name == "shell_exec"));
+        assert!(names.iter().any(|name| name == "agent_spawn"));
         assert!(names.iter().any(|name| name == "agent_wait"));
+        for internal in ["get_goal", "create_goal", "update_goal", "todo_write"] {
+            assert!(
+                names.iter().any(|name| name == internal),
+                "只读访问只限制外部副作用，不能屏蔽内部协调工具 {internal}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn access_profile_tool_surface_distinguishes_coordinator_and_subagent_roles() {
+        let dispatcher = dispatcher_with_default_tool_surface();
+
+        for access_profile in [
+            magi_core::AccessProfile::ReadOnly,
+            magi_core::AccessProfile::Restricted,
+            magi_core::AccessProfile::FullAccess,
+        ] {
+            let mut coordinator = task_with_role("coordinator", TaskTier::ExecutionChain);
+            coordinator
+                .policy_snapshot
+                .as_mut()
+                .expect("coordinator policy")
+                .access_profile = access_profile;
+            let coordinator_names = dispatcher
+                .build_tool_definitions(Some(&coordinator), None, access_profile)
+                .into_iter()
+                .map(|definition| definition.function.name)
+                .collect::<Vec<_>>();
+            assert!(
+                coordinator_names.iter().any(|name| name == "agent_spawn"),
+                "主线在 {access_profile:?} 模式下都必须能够创建继承同模式的子代理"
+            );
+
+            let mut worker = task_with_role("executor", TaskTier::ExecutionChain);
+            worker
+                .policy_snapshot
+                .as_mut()
+                .expect("worker policy")
+                .access_profile = access_profile;
+            let worker_names = dispatcher
+                .build_tool_definitions(Some(&worker), None, access_profile)
+                .into_iter()
+                .map(|definition| definition.function.name)
+                .collect::<Vec<_>>();
+            assert!(worker_names.iter().any(|name| name == "file_read"));
+            assert!(worker_names.iter().any(|name| name == "shell_exec"));
+            assert!(
+                !worker_names.iter().any(|name| name == "agent_spawn"),
+                "子代理在 {access_profile:?} 模式下都不能递归创建代理"
+            );
+            assert_eq!(
+                worker_names.iter().any(|name| name == "file_write"),
+                access_profile != magi_core::AccessProfile::ReadOnly,
+                "子代理文件写入工具可见性必须与访问模式一致"
+            );
+        }
     }
 
     #[test]
@@ -2277,6 +2329,12 @@ mod tests {
         assert!(!names.iter().any(|name| name == "file_write"));
         assert!(!names.iter().any(|name| name == "apply_patch"));
         assert!(!names.iter().any(|name| name == "memory_write"));
+        for internal in ["get_goal", "create_goal", "update_goal", "todo_write"] {
+            assert!(
+                names.iter().any(|name| name == internal),
+                "只读主会话仍应能维护内部目标与任务清单 {internal}: {names:?}"
+            );
+        }
     }
 
     #[test]
@@ -2347,7 +2405,7 @@ mod tests {
 
         assert!(names.iter().any(|name| name == "file_read"));
         assert!(!names.iter().any(|name| name == "file_write"));
-        assert!(!names.iter().any(|name| name == "agent_spawn"));
+        assert!(names.iter().any(|name| name == "agent_spawn"));
     }
 
     #[test]
@@ -2811,16 +2869,18 @@ mod tests {
         use magi_settings_store::SettingsStore;
 
         let store = Arc::new(SettingsStore::new());
-        store.set_section(
-            "orchestrator",
-            serde_json::json!({
-                "baseUrl": "https://api.example.com/v1",
-                "apiKey": "sk-orch",
-                "model": "gpt-5.5",
-                "urlMode": "standard",
-                "reasoningEffort": "xhigh",
-            }),
-        );
+        store
+            .set_section(
+                "orchestrator",
+                serde_json::json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-orch",
+                    "model": "gpt-5.5",
+                    "urlMode": "standard",
+                    "reasoningEffort": "xhigh",
+                }),
+            )
+            .unwrap();
 
         let resolved = resolve_target_for_role(Some(&store), None, RoleTarget::Orchestrator, None)
             .expect("orchestrator 段构造不应失败");
@@ -2929,25 +2989,29 @@ mod tests {
         use magi_settings_store::SettingsStore;
 
         let store = Arc::new(SettingsStore::new());
-        store.set_section(
-            "orchestrator",
-            serde_json::json!({
-                "baseUrl": "https://api.example.com/v1",
-                "apiKey": "sk-orch",
-                "model": "global-default-model",
-                "urlMode": "standard",
-                "reasoningEffort": "medium",
-            }),
-        );
+        store
+            .set_section(
+                "orchestrator",
+                serde_json::json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-orch",
+                    "model": "global-default-model",
+                    "urlMode": "standard",
+                    "reasoningEffort": "medium",
+                }),
+            )
+            .unwrap();
         let session_id = SessionId::new("session-model-scope");
-        store.set_session_section(
-            &session_id,
-            "orchestrator",
-            serde_json::json!({
-                "model": "session-only-model",
-                "reasoningEffort": "xhigh",
-            }),
-        );
+        store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                serde_json::json!({
+                    "model": "session-only-model",
+                    "reasoningEffort": "xhigh",
+                }),
+            )
+            .unwrap();
 
         // 会话级覆盖存在时，主路径必须返回业务模型 client。
         let resolved = resolve_target_for_role(
@@ -2977,19 +3041,21 @@ mod tests {
 
         let dispatcher = dispatcher_with_default_tool_surface();
         let store = Arc::new(SettingsStore::new());
-        store.set_section(
-            "safeguardConfig",
-            serde_json::json!({
-                "rules": [
-                    {
-                        "pattern": "rm -rf",
-                        "enabled": false,
-                        "category": "bulk_delete",
-                        "action": "require_approval_in_restricted"
-                    }
-                ]
-            }),
-        );
+        store
+            .set_section(
+                "safeguardConfig",
+                serde_json::json!({
+                    "rules": [
+                        {
+                            "pattern": "rm -rf",
+                            "enabled": false,
+                            "category": "bulk_delete",
+                            "action": "require_approval_in_restricted"
+                        }
+                    ]
+                }),
+            )
+            .unwrap();
 
         let gate = dispatcher
             .build_safety_gate(Some(&store))
@@ -3016,37 +3082,39 @@ mod tests {
 
         let dispatcher = dispatcher_with_default_tool_surface();
         let store = Arc::new(SettingsStore::new());
-        store.set_section(
-            "safeguardConfig",
-            serde_json::json!({
-                "rules": [
-                    {
-                        "pattern": "custom hard block",
-                        "enabled": true,
-                        "category": "custom",
-                        "action": "hard_block"
-                    },
-                    {
-                        "pattern": "custom approval command",
-                        "enabled": true,
-                        "category": "custom",
-                        "action": "require_approval_in_restricted"
-                    },
-                    {
-                        "pattern": "custom audit command",
-                        "enabled": true,
-                        "category": "custom",
-                        "action": "audit_only"
-                    },
-                    {
-                        "pattern": "disabled hard block",
-                        "enabled": false,
-                        "category": "custom",
-                        "action": "hard_block"
-                    }
-                ]
-            }),
-        );
+        store
+            .set_section(
+                "safeguardConfig",
+                serde_json::json!({
+                    "rules": [
+                        {
+                            "pattern": "custom hard block",
+                            "enabled": true,
+                            "category": "custom",
+                            "action": "hard_block"
+                        },
+                        {
+                            "pattern": "custom approval command",
+                            "enabled": true,
+                            "category": "custom",
+                            "action": "require_approval_in_restricted"
+                        },
+                        {
+                            "pattern": "custom audit command",
+                            "enabled": true,
+                            "category": "custom",
+                            "action": "audit_only"
+                        },
+                        {
+                            "pattern": "disabled hard block",
+                            "enabled": false,
+                            "category": "custom",
+                            "action": "hard_block"
+                        }
+                    ]
+                }),
+            )
+            .unwrap();
 
         let prompt = dispatcher
             .resolve_safeguard_prompt(Some(&store))
@@ -3085,27 +3153,33 @@ mod tests {
         use magi_settings_store::SettingsStore;
 
         let live_store = Arc::new(SettingsStore::new());
-        live_store.set_section(
-            "orchestrator",
-            serde_json::json!({
-                "baseUrl": "https://api.example.com/v1",
-                "apiKey": "sk-old",
-                "model": "model-old",
-                "urlMode": "standard",
-            }),
-        );
+        live_store
+            .set_section(
+                "orchestrator",
+                serde_json::json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-old",
+                    "model": "model-old",
+                    "urlMode": "standard",
+                }),
+            )
+            .unwrap();
         let session_id = SessionId::new("session-snapshot-model");
-        live_store.set_session_section(
-            &session_id,
-            "orchestrator",
-            serde_json::json!({
-                "model": "model-snapshot",
-            }),
-        );
+        live_store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                serde_json::json!({
+                    "model": "model-snapshot",
+                }),
+            )
+            .unwrap();
         let snapshot = Arc::new(live_store.execution_snapshot());
 
-        live_store.remove_section("orchestrator");
-        live_store.remove_session_section(&session_id, "orchestrator");
+        live_store.remove_section("orchestrator").unwrap();
+        live_store
+            .remove_session_section(&session_id, "orchestrator")
+            .unwrap();
 
         let snapshot_client = resolve_target_for_role(
             Some(&snapshot),

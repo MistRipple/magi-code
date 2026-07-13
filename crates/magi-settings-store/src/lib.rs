@@ -2,9 +2,8 @@ use magi_core::SessionId;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use tracing::warn;
 
 const SESSION_SECTION_PREFIX: &str = "__session__:";
 const PUBLIC_RESPONSE_ALIAS_SECTIONS: &[&str] = &[
@@ -82,19 +81,16 @@ impl SettingsStore {
         match serde_json::from_str::<HashMap<String, Value>>(&content) {
             Ok(mut data) => {
                 let changed = canonicalize_settings_sections(&mut data);
-                let mut sections = self.sections.write().unwrap();
-                *sections = data;
-                drop(sections);
                 if changed {
-                    self.save_to_disk()?;
+                    Self::save_sections(path, &data)?;
                 }
+                *self.sections.write().unwrap() = data;
             }
             Err(error) => {
-                warn!(
-                    path = %path.display(),
-                    error = %error,
-                    "设置文件解析失败，使用空默认值"
-                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("设置文件解析失败 {}: {error}", path.display()),
+                ));
             }
         }
         Ok(())
@@ -110,36 +106,48 @@ impl SettingsStore {
             fs::create_dir_all(parent)?;
         }
         let sections = self.sections.read().unwrap();
-        let content = serde_json::to_vec_pretty(&*sections).map_err(std::io::Error::other)?;
-        magi_core::fs_atomic::write_atomic(path, content)?;
-        Ok(())
+        Self::save_sections(path, &sections)
     }
 
-    /// 自动持久化：写操作后静默保存，失败仅打印警告
-    fn auto_persist(&self) {
-        if self.persistence_path.is_some()
-            && let Err(error) = self.save_to_disk()
-        {
-            warn!(error = %error, "设置自动持久化失败");
+    fn save_sections(path: &Path, sections: &HashMap<String, Value>) -> Result<(), std::io::Error> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
         }
+        let content = serde_json::to_vec_pretty(sections).map_err(std::io::Error::other)?;
+        magi_core::fs_atomic::write_atomic(path, content)
+    }
+
+    fn mutate<R>(
+        &self,
+        mutation: impl FnOnce(&mut HashMap<String, Value>) -> R,
+    ) -> Result<R, std::io::Error> {
+        let mut sections = self.sections.write().unwrap();
+        let previous = self.persistence_path.as_ref().map(|_| sections.clone());
+        let result = mutation(&mut sections);
+        if let Some(path) = self.persistence_path.as_ref()
+            && let Err(error) = Self::save_sections(path, &sections)
+        {
+            if let Some(previous) = previous {
+                *sections = previous;
+            }
+            return Err(error);
+        }
+        Ok(result)
     }
 
     pub fn get(&self, key: &str) -> Option<Value> {
         self.sections.read().unwrap().get(key).cloned()
     }
 
-    pub fn set(&self, key: &str, value: Value) {
+    pub fn set(&self, key: &str, value: Value) -> Result<(), std::io::Error> {
         if is_public_response_alias_section(key) {
-            self.remove_section(key);
-            return;
+            return self.remove_section(key);
         }
         let mut value = value;
         canonicalize_settings_section_value(key, &mut value);
-        {
-            let mut sections = self.sections.write().unwrap();
+        self.mutate(|sections| {
             sections.insert(key.to_string(), value);
-        }
-        self.auto_persist();
+        })
     }
 
     pub fn get_section(&self, section: &str) -> Value {
@@ -151,99 +159,133 @@ impl SettingsStore {
             .unwrap_or(Value::Null)
     }
 
-    pub fn set_section(&self, section: &str, value: Value) {
+    pub fn set_section(&self, section: &str, value: Value) -> Result<(), std::io::Error> {
         if is_public_response_alias_section(section) {
-            self.remove_section(section);
-            return;
+            return self.remove_section(section);
         }
         let mut value = value;
         canonicalize_settings_section_value(section, &mut value);
-        {
-            let mut sections = self.sections.write().unwrap();
+        self.mutate(|sections| {
             sections.insert(section.to_string(), value);
-        }
-        self.auto_persist();
+        })
     }
 
-    pub fn remove_section(&self, section: &str) {
-        {
-            let mut sections = self.sections.write().unwrap();
+    pub fn remove_section(&self, section: &str) -> Result<(), std::io::Error> {
+        self.mutate(|sections| {
             sections.remove(section);
-        }
-        self.auto_persist();
+        })
+    }
+
+    pub fn apply_section_changes(
+        &self,
+        updates: impl IntoIterator<Item = (String, Value)>,
+        removals: impl IntoIterator<Item = String>,
+    ) -> Result<(), std::io::Error> {
+        let updates = updates
+            .into_iter()
+            .map(|(section, mut value)| {
+                canonicalize_settings_section_value(&section, &mut value);
+                (section, value)
+            })
+            .collect::<Vec<_>>();
+        let removals = removals.into_iter().collect::<Vec<_>>();
+        self.mutate(|sections| {
+            for section in removals {
+                sections.remove(&section);
+            }
+            for (section, value) in updates {
+                if is_public_response_alias_section(&section) {
+                    sections.remove(&section);
+                } else {
+                    sections.insert(section, value);
+                }
+            }
+        })
     }
 
     pub fn get_session_section(&self, session_id: &SessionId, section: &str) -> Value {
         self.get_section(&session_section_key(session_id, section))
     }
 
-    pub fn set_session_section(&self, session_id: &SessionId, section: &str, value: Value) {
-        self.set_section(&session_section_key(session_id, section), value);
+    pub fn set_session_section(
+        &self,
+        session_id: &SessionId,
+        section: &str,
+        value: Value,
+    ) -> Result<(), std::io::Error> {
+        self.set_section(&session_section_key(session_id, section), value)
     }
 
-    pub fn remove_session_section(&self, session_id: &SessionId, section: &str) {
-        self.remove_section(&session_section_key(session_id, section));
+    pub fn remove_session_section(
+        &self,
+        session_id: &SessionId,
+        section: &str,
+    ) -> Result<(), std::io::Error> {
+        self.remove_section(&session_section_key(session_id, section))
     }
 
     /// 删除一个 session 拥有的全部设置 section。会话级模型与推理强度属于会话，
     /// 不能在会话删除后继续留在全局 settings 文件中。
-    pub fn remove_session(&self, session_id: &SessionId) -> usize {
+    pub fn remove_session(&self, session_id: &SessionId) -> Result<usize, std::io::Error> {
         let prefix = format!("{SESSION_SECTION_PREFIX}{}:", session_id.as_str());
-        let removed = {
-            let mut sections = self.sections.write().unwrap();
+        self.mutate(|sections| {
             let before = sections.len();
             sections.retain(|key, _| !key.starts_with(&prefix));
             before.saturating_sub(sections.len())
+        })
+    }
+
+    pub fn remove_section_entry(&self, section: &str, key: &str) -> Result<(), std::io::Error> {
+        self.mutate(|sections| {
+            if let Some(Value::Object(map)) = sections.get_mut(section) {
+                map.remove(key);
+            }
+        })
+    }
+
+    pub fn upsert_array_entry(
+        &self,
+        section: &str,
+        id_field: &str,
+        entry: &Value,
+    ) -> Result<(), std::io::Error> {
+        let Some(id_val) = Self::extract_id_str(entry, id_field).map(ToOwned::to_owned) else {
+            return Ok(());
         };
-        if removed > 0 {
-            self.auto_persist();
-        }
-        removed
-    }
-
-    pub fn remove_section_entry(&self, section: &str, key: &str) {
-        let mut sections = self.sections.write().unwrap();
-        if let Some(Value::Object(map)) = sections.get_mut(section) {
-            map.remove(key);
-        }
-        drop(sections);
-        self.auto_persist();
-    }
-
-    pub fn upsert_array_entry(&self, section: &str, id_field: &str, entry: &Value) {
-        let mut sections = self.sections.write().unwrap();
-        let arr = sections
-            .entry(section.to_string())
-            .or_insert_with(|| Value::Array(vec![]));
-        if let Value::Array(items) = arr {
-            let Some(id_val) = Self::extract_id_str(entry, id_field) else {
+        self.mutate(|sections| {
+            let arr = sections
+                .entry(section.to_string())
+                .or_insert_with(|| Value::Array(vec![]));
+            let Value::Array(items) = arr else {
                 return;
             };
             if let Some(pos) = items
                 .iter()
-                .position(|item| Self::extract_id_str(item, id_field) == Some(id_val))
+                .position(|item| Self::extract_id_str(item, id_field) == Some(id_val.as_str()))
             {
                 items[pos] = entry.clone();
             } else {
                 items.push(entry.clone());
             }
             canonicalize_settings_section_value(section, arr);
-        }
-        drop(sections);
-        self.auto_persist();
+        })
     }
 
-    pub fn remove_array_entry(&self, section: &str, id_field: &str, id_value: &str) {
-        let mut sections = self.sections.write().unwrap();
-        if let Some(Value::Array(items)) = sections.get_mut(section) {
-            items.retain(|item| {
-                Self::extract_id_str(item, id_field)
-                    .map(|v| v != id_value)
-                    .unwrap_or(true)
-            });
-        }
-        drop(sections);
-        self.auto_persist();
+    pub fn remove_array_entry(
+        &self,
+        section: &str,
+        id_field: &str,
+        id_value: &str,
+    ) -> Result<(), std::io::Error> {
+        self.mutate(|sections| {
+            if let Some(Value::Array(items)) = sections.get_mut(section) {
+                items.retain(|item| {
+                    Self::extract_id_str(item, id_field)
+                        .map(|v| v != id_value)
+                        .unwrap_or(true)
+                });
+            }
+        })
     }
 
     fn extract_id_str<'a>(item: &'a Value, primary_field: &str) -> Option<&'a str> {
@@ -401,8 +443,10 @@ mod tests {
         let path = dir.join("settings.json");
 
         let store = SettingsStore::with_persistence_path(path.clone());
-        store.set("theme", json!("dark"));
-        store.set_section("workers", json!({"primary": "gpu-0"}));
+        store.set("theme", json!("dark")).unwrap();
+        store
+            .set_section("workers", json!({"primary": "gpu-0"}))
+            .unwrap();
         assert!(path.exists(), "设置文件应已被自动创建");
 
         // 用新实例从磁盘加载
@@ -421,9 +465,83 @@ mod tests {
     }
 
     #[test]
+    fn load_from_disk_rejects_corrupt_settings_without_clearing_memory() {
+        let dir = std::env::temp_dir().join(format!(
+            "magi-settings-test-corrupt-load-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let store = SettingsStore::with_persistence_path(path.clone());
+        store.set("theme", json!("dark")).unwrap();
+        std::fs::write(&path, b"{not-json").unwrap();
+
+        let error = store
+            .load_from_disk()
+            .expect_err("损坏的设置文件必须显式失败");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(store.get("theme"), Some(json!("dark")));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not-json");
+    }
+
+    #[test]
+    fn failed_persistence_does_not_publish_uncommitted_setting_to_memory() {
+        let root = std::env::temp_dir().join(format!(
+            "magi-settings-test-persist-failure-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::write(&root, b"parent-is-a-file").unwrap();
+        let store = SettingsStore::with_persistence_path(root.join("settings.json"));
+
+        let result = store.set("theme", json!("dark"));
+
+        assert!(result.is_err());
+        assert_eq!(store.get("theme"), None);
+    }
+
+    #[test]
+    fn apply_section_changes_persists_updates_and_removals_as_one_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "magi-settings-test-batch-mutation-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let store = SettingsStore::with_persistence_path(path.clone());
+        store
+            .set_section("legacy", json!({"enabled": true}))
+            .unwrap();
+
+        store
+            .apply_section_changes(
+                [("skillsConfig".to_string(), json!({"customTools": []}))],
+                ["legacy".to_string()],
+            )
+            .unwrap();
+
+        let reloaded = SettingsStore::with_persistence_path(path);
+        reloaded.load_from_disk().unwrap();
+        assert_eq!(
+            reloaded.get_section("skillsConfig"),
+            json!({"customTools": []})
+        );
+        assert_eq!(reloaded.get_section("legacy"), Value::Null);
+    }
+
+    #[test]
     fn pure_memory_mode_does_not_write_files() {
         let store = SettingsStore::new();
-        store.set("key", json!("value"));
+        store.set("key", json!("value")).unwrap();
         // 纯内存模式不应产生任何磁盘操作
         assert_eq!(store.get("key"), Some(json!("value")));
     }
@@ -431,22 +549,26 @@ mod tests {
     #[test]
     fn execution_snapshot_is_detached_from_later_mutations() {
         let store = SettingsStore::new();
-        store.set_section(
-            "orchestrator",
-            json!({
-                "baseUrl": "https://old.example.com/v1",
-                "model": "model-old",
-            }),
-        );
+        store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://old.example.com/v1",
+                    "model": "model-old",
+                }),
+            )
+            .unwrap();
 
         let snapshot = store.execution_snapshot();
-        store.set_section(
-            "orchestrator",
-            json!({
-                "baseUrl": "https://new.example.com/v1",
-                "model": "model-new",
-            }),
-        );
+        store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://new.example.com/v1",
+                    "model": "model-new",
+                }),
+            )
+            .unwrap();
 
         assert_eq!(
             snapshot.get_section("orchestrator"),
@@ -475,14 +597,18 @@ mod tests {
         let path = dir.join("settings.json");
 
         let store = SettingsStore::with_persistence_path(path.clone());
-        store.upsert_array_entry(
-            "engines",
-            "engineId",
-            &json!({"engineId": "e1", "name": "test"}),
-        );
-        store.remove_array_entry("engines", "engineId", "e1");
-        store.set_section("config", json!({"a": 1}));
-        store.remove_section_entry("config", "a");
+        store
+            .upsert_array_entry(
+                "engines",
+                "engineId",
+                &json!({"engineId": "e1", "name": "test"}),
+            )
+            .unwrap();
+        store
+            .remove_array_entry("engines", "engineId", "e1")
+            .unwrap();
+        store.set_section("config", json!({"a": 1})).unwrap();
+        store.remove_section_entry("config", "a").unwrap();
 
         // 验证最终状态被持久化
         let store2 = SettingsStore::with_persistence_path(path);
@@ -592,18 +718,20 @@ mod tests {
     fn session_orchestrator_section_keeps_only_session_owned_fields() {
         let store = SettingsStore::new();
         let session_id = SessionId::new("session-main-model");
-        store.set_session_section(
-            &session_id,
-            "orchestrator",
-            json!({
-                "baseUrl": "https://api.example.com/v1",
-                "apiKey": "sk-session-should-not-own",
-                "urlMode": "standard",
-                "model": "session-main",
-                "reasoningEffort": "xhigh",
-                "provider": "openai"
-            }),
-        );
+        store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-session-should-not-own",
+                    "urlMode": "standard",
+                    "model": "session-main",
+                    "reasoningEffort": "xhigh",
+                    "provider": "openai"
+                }),
+            )
+            .unwrap();
 
         let section = store.get_session_section(&session_id, "orchestrator");
         assert_eq!(section["model"], json!("session-main"));
@@ -617,39 +745,45 @@ mod tests {
     #[test]
     fn array_upsert_uses_only_top_level_canonical_ids() {
         let store = SettingsStore::new();
-        store.upsert_array_entry(
-            "engines",
-            "id",
-            &json!({
-                "id": "reviewer",
-                "llm": {
-                    "provider": "openai",
-                    "model": "old-worker"
-                }
-            }),
-        );
-        store.upsert_array_entry(
-            "engines",
-            "id",
-            &json!({
-                "engine": {
-                    "id": "reviewer"
-                },
-                "llm": {
-                    "model": "wrapped-worker"
-                }
-            }),
-        );
-        store.upsert_array_entry(
-            "engines",
-            "id",
-            &json!({
-                "id": "reviewer",
-                "llm": {
-                    "model": "current-worker"
-                }
-            }),
-        );
+        store
+            .upsert_array_entry(
+                "engines",
+                "id",
+                &json!({
+                    "id": "reviewer",
+                    "llm": {
+                        "provider": "openai",
+                        "model": "old-worker"
+                    }
+                }),
+            )
+            .unwrap();
+        store
+            .upsert_array_entry(
+                "engines",
+                "id",
+                &json!({
+                    "engine": {
+                        "id": "reviewer"
+                    },
+                    "llm": {
+                        "model": "wrapped-worker"
+                    }
+                }),
+            )
+            .unwrap();
+        store
+            .upsert_array_entry(
+                "engines",
+                "id",
+                &json!({
+                    "id": "reviewer",
+                    "llm": {
+                        "model": "current-worker"
+                    }
+                }),
+            )
+            .unwrap();
 
         let engines = store.get_section("engines");
         let engines = engines.as_array().expect("engines should be array");
@@ -664,9 +798,15 @@ mod tests {
         let session_a = SessionId::new("session-a");
         let session_b = SessionId::new("session-b");
 
-        store.set_section("workers", json!({"primary": "gpu-0"}));
-        store.set_session_section(&session_a, "userRules", json!({"userRules": "A"}));
-        store.set_session_section(&session_b, "userRules", json!({"userRules": "B"}));
+        store
+            .set_section("workers", json!({"primary": "gpu-0"}))
+            .unwrap();
+        store
+            .set_session_section(&session_a, "userRules", json!({"userRules": "A"}))
+            .unwrap();
+        store
+            .set_session_section(&session_b, "userRules", json!({"userRules": "B"}))
+            .unwrap();
 
         assert_eq!(
             store.get_session_section(&session_a, "userRules"),
@@ -688,11 +828,17 @@ mod tests {
         let store = SettingsStore::new();
         let session_a = SessionId::new("session-a");
         let session_b = SessionId::new("session-b");
-        store.set_session_section(&session_a, "orchestrator", json!({"model": "model-a"}));
-        store.set_session_section(&session_a, "userRules", json!({"userRules": "A"}));
-        store.set_session_section(&session_b, "orchestrator", json!({"model": "model-b"}));
+        store
+            .set_session_section(&session_a, "orchestrator", json!({"model": "model-a"}))
+            .unwrap();
+        store
+            .set_session_section(&session_a, "userRules", json!({"userRules": "A"}))
+            .unwrap();
+        store
+            .set_session_section(&session_b, "orchestrator", json!({"model": "model-b"}))
+            .unwrap();
 
-        assert_eq!(store.remove_session(&session_a), 2);
+        assert_eq!(store.remove_session(&session_a).unwrap(), 2);
         assert_eq!(
             store.get_session_section(&session_a, "orchestrator"),
             Value::Null

@@ -23,6 +23,9 @@ const bridgeMutationInterceptors = [];
 const sessionTurnInterceptors = [];
 let messagesSnapshotRequestCount = 0;
 let switchSessionRequestCount = 0;
+let bootstrapRequestCount = 0;
+let workspaceSessionsRequestCount = 0;
+let workspaceSessionIsRunning = false;
 
 class MemoryStorage {
   constructor() {
@@ -365,6 +368,7 @@ function installFetchStub() {
       return jsonResponse({ ok: true });
     }
     if (parsed.pathname === '/bootstrap') {
+      bootstrapRequestCount += 1;
       const interceptor = bootstrapInterceptors.shift();
       if (interceptor) {
         return interceptor(parsed);
@@ -375,11 +379,15 @@ function installFetchStub() {
       return jsonResponse({ workspaces: workspaceListPayload });
     }
     if (parsed.pathname === '/api/workspaces/sessions') {
+      workspaceSessionsRequestCount += 1;
       const payload = bootstrapPayload();
       return jsonResponse({
         workspace: payload.workspace,
         sessionId: payload.currentSession?.sessionId || '',
-        sessions: payload.sessions,
+        sessions: payload.sessions.map((session) => ({
+          ...session,
+          isRunning: workspaceSessionIsRunning,
+        })),
       });
     }
     if (parsed.pathname === '/api/settings/bootstrap') {
@@ -688,6 +696,7 @@ await withGoldenViteServer(async (server) => {
     'current-session message events must refresh the workspace session summary without waiting for a full page reload',
   );
 
+  const bootstrapRequestsBeforeTerminalEvent = bootstrapRequestCount;
   terminalPublished = true;
   recoveredStream.onmessage?.({ data: JSON.stringify(completedEnvelope()) });
   await waitFor(
@@ -703,6 +712,60 @@ await withGoldenViteServer(async (server) => {
     false,
     'terminal session turn event must project the final assistant item as non-streaming',
   );
+  await waitFor(
+    () => bootstrapRequestCount > bootstrapRequestsBeforeTerminalEvent,
+    'terminal session turn event must finish its authoritative bootstrap refresh',
+  );
+
+  const localUrlBeforeTunnelSync = window.location.href;
+  const workspaceSessionRequestsBeforeTunnelSync = workspaceSessionsRequestCount;
+  const bootstrapRequestsBeforeTunnelSync = bootstrapRequestCount;
+  messagesStore.addPendingRequest('tunnel-stale-running-state', { resetAntiLiftBack: true });
+  workspaceSessionIsRunning = true;
+  window.location.href = `${localUrlBeforeTunnelSync}&tunnel_token=golden-token`;
+  const originalDateNowForTunnelSync = Date.now;
+  try {
+    Date.now = () => originalDateNowForTunnelSync() + 3_000;
+    window.__runGoldenIntervals();
+    await waitFor(
+      () => workspaceSessionsRequestCount > workspaceSessionRequestsBeforeTunnelSync,
+      'tunnel busy sync must query the lightweight workspace session summary',
+    );
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(
+      bootstrapRequestCount,
+      bootstrapRequestsBeforeTunnelSync,
+      'tunnel busy sync must not repeatedly fetch the heavy bootstrap while the backend is still running',
+    );
+    assert.equal(
+      messagesStore.messagesState.isProcessing,
+      true,
+      'backend running summary must preserve the public tunnel processing state',
+    );
+
+    workspaceSessionIsRunning = false;
+    Date.now = () => originalDateNowForTunnelSync() + 6_000;
+    window.__runGoldenIntervals();
+    await waitFor(
+      () => messagesStore.messagesState.isProcessing === false,
+      'backend terminal summary must settle stale public tunnel processing state',
+    );
+    assert.equal(
+      workspaceSessionsRequestCount,
+      workspaceSessionRequestsBeforeTunnelSync + 2,
+      'tunnel terminal sync must recheck the lightweight workspace session summary',
+    );
+    assert.equal(
+      bootstrapRequestCount,
+      bootstrapRequestsBeforeTunnelSync + 1,
+      'tunnel terminal sync must fetch the full bootstrap exactly once for final content',
+    );
+  } finally {
+    Date.now = originalDateNowForTunnelSync;
+    workspaceSessionIsRunning = false;
+    window.location.href = localUrlBeforeTunnelSync;
+    messagesStore.clearPendingRequest('tunnel-stale-running-state');
+  }
 
   const sessionsBeforeDraft = messagesStore.messagesState.sessions.map((session) => session.id);
   bridge.postMessage({

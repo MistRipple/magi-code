@@ -85,18 +85,36 @@ impl ToolRegistry {
             .mcp_tools
             .into_iter()
             .find(|tool| tool.model_tool_name == model_tool_name)?;
-        if access_profile == AccessProfile::ReadOnly && !binding.read_only {
-            return Some((
-                serde_json::json!({
-                    "tool": model_tool_name,
-                    "status": "rejected",
-                    "error_code": "mcp_blocked_in_read_only",
-                    "error": "只读访问模式不允许调用 MCP 工具",
-                    "access_profile": "read_only",
-                })
-                .to_string(),
-                ExecutionResultStatus::Rejected,
-            ));
+        if !binding.read_only {
+            match access_profile {
+                AccessProfile::ReadOnly => {
+                    return Some((
+                        serde_json::json!({
+                            "tool": model_tool_name,
+                            "status": "rejected",
+                            "error_code": "mcp_blocked_in_read_only",
+                            "error": "只读访问模式不允许调用有外部副作用的 MCP 工具",
+                            "access_profile": "read_only",
+                        })
+                        .to_string(),
+                        ExecutionResultStatus::Rejected,
+                    ));
+                }
+                AccessProfile::Restricted => {
+                    return Some((
+                        serde_json::json!({
+                            "tool": model_tool_name,
+                            "status": "needs_approval",
+                            "error_code": "mcp_requires_full_access",
+                            "error": "受限访问已拦截该 MCP 工具，请切换为完全访问权限后重试",
+                            "access_profile": "restricted",
+                        })
+                        .to_string(),
+                        ExecutionResultStatus::NeedsApproval,
+                    ));
+                }
+                AccessProfile::FullAccess => {}
+            }
         }
         let executor = self.runtime_resources.external_mcp_tool_executor.as_ref()?;
         Some(executor(&binding.server_id, &binding.tool_name, arguments))

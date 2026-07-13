@@ -295,6 +295,22 @@ await withGoldenViteServer(async (server) => {
   await Promise.all([firstSlowProjection, secondSlowProjection]);
   await delay(50);
 
+  agentRunStore.setAgentRunBridgeConnected(false);
+  agentRunStore.startAutoRefresh(30);
+  const disconnectedFetchCount = agentRunFetches.length;
+  await delay(120);
+  assert.equal(
+    agentRunFetches.length,
+    disconnectedFetchCount,
+    'daemon 断线期间不得继续轮询代理投影',
+  );
+  agentRunStore.setAgentRunBridgeConnected(true);
+  await delay(50);
+  assert.ok(
+    agentRunFetches.length > disconnectedFetchCount,
+    'daemon 恢复后应集中刷新一次仍在跟踪的代理投影',
+  );
+
   agentRunStore.stopAutoRefresh();
   console.log('agent run store golden replay passed');
 });

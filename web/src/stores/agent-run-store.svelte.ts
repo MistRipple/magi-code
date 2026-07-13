@@ -49,6 +49,8 @@ let sessionStates = $state<Record<string, InternalSessionAgentRunState>>({});
 let activeAgentRunScopeKey = '';
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 let settleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let autoRefreshIntervalMs: number | null = null;
+let agentRunBridgeConnected = true;
 let sseUnsubscribe: (() => void) | null = null;
 let sseDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 const pendingSseRefreshScopeKeys = new Set<string>();
@@ -503,8 +505,19 @@ function disconnectFromSSE(): void {
 }
 
 export function startAutoRefresh(intervalMs = 5000): void {
-  stopAutoRefresh();
+  autoRefreshIntervalMs = intervalMs;
+  clearAutoRefreshTimers();
   connectToSSE();
+  if (!agentRunBridgeConnected) {
+    return;
+  }
+  scheduleAutoRefreshTimers(intervalMs, false);
+}
+
+function scheduleAutoRefreshTimers(intervalMs: number, refreshImmediately: boolean): void {
+  if (refreshImmediately) {
+    void refreshTrackedSessions();
+  }
   settleRefreshTimer = setTimeout(() => {
     settleRefreshTimer = null;
     void refreshTrackedSessions();
@@ -514,7 +527,7 @@ export function startAutoRefresh(intervalMs = 5000): void {
   }, intervalMs);
 }
 
-export function stopAutoRefresh(): void {
+function clearAutoRefreshTimers(): void {
   if (refreshTimer !== null) {
     clearInterval(refreshTimer);
     refreshTimer = null;
@@ -523,6 +536,23 @@ export function stopAutoRefresh(): void {
     clearTimeout(settleRefreshTimer);
     settleRefreshTimer = null;
   }
+}
+
+export function setAgentRunBridgeConnected(connected: boolean): void {
+  if (agentRunBridgeConnected === connected) {
+    return;
+  }
+  agentRunBridgeConnected = connected;
+  clearAutoRefreshTimers();
+  if (!connected || autoRefreshIntervalMs === null || trackedSessionStates().length === 0) {
+    return;
+  }
+  scheduleAutoRefreshTimers(autoRefreshIntervalMs, true);
+}
+
+export function stopAutoRefresh(): void {
+  autoRefreshIntervalMs = null;
+  clearAutoRefreshTimers();
   disconnectFromSSE();
 }
 

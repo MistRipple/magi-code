@@ -1,6 +1,7 @@
 use magi_core::{
-    DomainError, DomainResult, ExecutionOwnership, GoalId, LeaseId, MissionId, SessionId,
-    SessionLifecycleStatus, TaskId, ThreadId, TodoItem, UtcMillis, WorkerId, WorkspaceId,
+    AccessProfile, DomainError, DomainResult, ExecutionOwnership, GoalId, LeaseId, MissionId,
+    SessionId, SessionLifecycleStatus, TaskId, ThreadId, TodoItem, UtcMillis, WorkerId,
+    WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -644,7 +645,6 @@ impl SessionExecutionSidecarStoreState {
 pub enum TimelineEntryKind {
     SessionCreated,
     SessionRenamed,
-    SessionSwitched,
     SessionArchived,
     NotificationPublished,
     SystemNote,
@@ -788,6 +788,8 @@ pub struct SessionGoal {
     pub thread_id: ThreadId,
     pub objective: String,
     pub status: GoalStatus,
+    #[serde(default)]
+    pub access_profile: AccessProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<u64>,
     #[serde(default)]

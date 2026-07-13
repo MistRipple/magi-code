@@ -3572,6 +3572,31 @@ fn file_remove_rejects_absolute_working_directory_even_in_full_access() {
 }
 
 #[test]
+fn file_read_reports_missing_path_without_mislabeling_it_as_permission_failure() {
+    let root = unique_temp_dir("magi-tool-file-read-missing");
+    let registry = make_registry();
+
+    let output = exec_tool_with_context_and_policy(
+        &registry,
+        BuiltinToolName::FileRead,
+        &serde_json::json!({ "path": "missing.txt" }).to_string(),
+        ToolExecutionContext {
+            working_directory: Some(root),
+            ..ToolExecutionContext::default()
+        },
+        ToolExecutionPolicy {
+            access_profile: magi_core::AccessProfile::FullAccess,
+            ..ToolExecutionPolicy::default()
+        },
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    let payload: Value = serde_json::from_str(&output.payload).unwrap();
+    assert_eq!(payload["error_code"], "file_read_not_found");
+    assert_eq!(payload["error"], "目标路径不存在，请检查路径");
+}
+
+#[test]
 fn file_remove_rejects_filesystem_root_even_in_full_access() {
     let registry = make_registry();
 
@@ -3883,6 +3908,29 @@ fn restricted_profile_write_policy_is_explicitly_classified() {
         BuiltinToolName::FileRead.restricted_write_profile_policy(),
         None
     );
+}
+
+#[test]
+fn read_only_access_profile_only_blocks_external_side_effect_operations() {
+    for internal in [
+        BuiltinToolName::AgentSpawn,
+        BuiltinToolName::CreateGoal,
+        BuiltinToolName::UpdateGoal,
+        BuiltinToolName::TodoWrite,
+    ] {
+        assert!(internal.is_write_operation());
+        assert!(
+            !internal.is_access_profile_write_operation(),
+            "内部协调状态不应被只读工作区权限屏蔽: {internal:?}"
+        );
+    }
+    for external in [
+        BuiltinToolName::FileWrite,
+        BuiltinToolName::FileRemove,
+        BuiltinToolName::MemoryWrite,
+    ] {
+        assert!(external.is_access_profile_write_operation());
+    }
 }
 
 #[test]
@@ -5331,6 +5379,53 @@ fn external_mcp_tool_is_blocked_before_executor_in_read_only_profile() {
     let payload: serde_json::Value =
         serde_json::from_str(&result.0).expect("blocked MCP payload json");
     assert_eq!(payload["error_code"], "mcp_blocked_in_read_only");
+}
+
+#[test]
+fn external_mcp_write_tool_requires_full_access_before_executor_runs() {
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let execute_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let execute_count_for_executor = execute_count.clone();
+    let registry = ToolRegistry::new(governance, event_bus)
+        .with_external_tool_catalog_provider(Arc::new(|| ExternalToolCatalogSnapshot {
+            mcp_tools: vec![ExternalMcpToolCatalogEntry {
+                server_id: "repo-tools".to_string(),
+                server_name: "Repository Tools".to_string(),
+                model_tool_name: "mcp__repo_tools__write".to_string(),
+                tool_name: "write".to_string(),
+                description: "Write repository".to_string(),
+                read_only: false,
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            }],
+            ..ExternalToolCatalogSnapshot::default()
+        }))
+        .with_external_mcp_tool_executor(Arc::new(move |_, _, _| {
+            execute_count_for_executor.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (
+                serde_json::json!({ "status": "succeeded" }).to_string(),
+                ExecutionResultStatus::Succeeded,
+            )
+        }));
+
+    let result = registry
+        .execute_external_mcp_tool(
+            "mcp__repo_tools__write",
+            "{}",
+            magi_core::AccessProfile::Restricted,
+        )
+        .expect("registered MCP tool should return an approval decision");
+
+    assert_eq!(result.1, ExecutionResultStatus::NeedsApproval);
+    assert_eq!(
+        execute_count.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "受限访问必须在调用外部 MCP 前阻断未知写副作用"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.0).expect("restricted MCP payload json");
+    assert_eq!(payload["error_code"], "mcp_requires_full_access");
+    assert_eq!(payload["access_profile"], "restricted");
 }
 
 #[test]

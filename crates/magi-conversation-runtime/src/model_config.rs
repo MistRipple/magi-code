@@ -708,28 +708,32 @@ mod tests {
     #[test]
     fn role_engine_model_config_resolves_agent_binding() {
         let store = magi_settings_store::SettingsStore::new();
-        store.set_section(
-            "agents",
-            json!([{
-                "templateId": "reviewer",
-                "engineId": "sonnet-4-5",
-                "bindingRevision": 7,
-                "enabled": true
-            }]),
-        );
-        store.set_section(
-            "engines",
-            json!([{
-                "id": "sonnet-4-5",
-                "llm": {
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "sk-role",
-                    "model": "role-sonnet",
-                    "urlMode": "standard",
-                    "reasoningEffort": "high"
-                }
-            }]),
-        );
+        store
+            .set_section(
+                "agents",
+                json!([{
+                    "templateId": "reviewer",
+                    "engineId": "sonnet-4-5",
+                    "bindingRevision": 7,
+                    "enabled": true
+                }]),
+            )
+            .unwrap();
+        store
+            .set_section(
+                "engines",
+                json!([{
+                    "id": "sonnet-4-5",
+                    "llm": {
+                        "baseUrl": "https://api.example.com/v1",
+                        "apiKey": "sk-role",
+                        "model": "role-sonnet",
+                        "urlMode": "standard",
+                        "reasoningEffort": "high"
+                    }
+                }]),
+            )
+            .unwrap();
 
         let resolved = configured_role_engine_model_config(&store, "reviewer")
             .expect("role binding should parse")
@@ -748,14 +752,16 @@ mod tests {
     #[test]
     fn role_engine_model_config_returns_none_for_orchestrator_inheritance() {
         let store = magi_settings_store::SettingsStore::new();
-        store.set_section(
-            "agents",
-            json!([{
-                "templateId": "executor",
-                "engineId": "",
-                "enabled": true
-            }]),
-        );
+        store
+            .set_section(
+                "agents",
+                json!([{
+                    "templateId": "executor",
+                    "engineId": "",
+                    "enabled": true
+                }]),
+            )
+            .unwrap();
 
         assert!(
             configured_role_engine_model_config(&store, "executor")

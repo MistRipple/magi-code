@@ -228,6 +228,13 @@ impl BuiltinToolName {
         )
     }
 
+    /// 用户访问模式只约束工作区、进程、网络外接能力和持久项目记忆等外部副作用。
+    /// Goal、Todo 与 agent_spawn 属于会话内部协调状态，必须在只读模式下保持可用，
+    /// 否则只读分析无法使用目标推进、任务清单和只读子代理。
+    pub fn is_access_profile_write_operation(&self) -> bool {
+        self.mutates_workspace_files() || matches!(self, Self::MemoryWrite)
+    }
+
     fn mutates_workspace_files(&self) -> bool {
         matches!(
             self,
@@ -514,10 +521,9 @@ impl BuiltinToolName {
                 - 每个代理角色同一时刻最多运行 5 个活跃实例；不设置会话级代理总数下限或额外总人数上限\n\
                 - 不同角色容量彼此独立；达到角色上限时返回 role、active_role_agent_count 与 max_active_agents_per_role\n\
                 - 先 agent_wait 收集该角色已运行代理，有实例退出活跃状态后再继续创建同角色实例\n\n\
-                # 权限模式\n\
-                - access_mode 必须表达本次代理是否允许写入：read_only 禁止写文件和写类 shell；read_write 按父任务策略允许必要写入\n\
-                - 用户要求只读、审查、探索、方案分析、风险验证时使用 read_only\n\
-                - 只有明确需要落地修改、生成文件、补测试或执行修复时才使用 read_write\n\n\
+                # 访问模式\n\
+                - 子代理继承当前主线由用户选择的访问模式，模型和角色不能自行降级或升级权限\n\
+                - 只读调查、审查和探索要求写入 goal，由代理按任务语义约束行为，不再创建第二套权限状态\n\n\
                 # 何时不用\n\
                 - 1-3 步能自己完成的任务 → 直接做，派发开销不值\n\
                 - 子任务需要你在场即时回答澄清问题 → 自己做更顺\n\
@@ -525,7 +531,7 @@ impl BuiltinToolName {
                 # display_name 写法\n\
                 - 长度 3-30 个字符，前端代理卡片直接展示\n\
                 - 如果用户明确给出了 display_name 或要求使用某个代理名称，必须原样使用该名称，不要自行改写、缩短或泛化\n\
-                - 如果用户同时指定 role / display_name / access_mode，把这些值视为强制参数契约逐项转写；不要替换 role、不要重命名、不要把两个代理合并成一个\n\
+                - 如果用户同时指定 role / display_name，把这些值视为强制参数契约逐项转写；不要替换 role、不要重命名、不要把两个代理合并成一个\n\
                 - 要让用户一眼看出『谁在做什么具体的事』，写成「职责 + 对象」短语\n\
                 - ✅ 例：『登录流程审查员』『订单模块迁移设计师』『支付冒烟测试执行人』\n\
                 - ❌ 反例：纯角色名『executor』『reviewer-1』；冗长重复『执行删除日志模块的所有引用并跑通测试的执行器』\n\n\
@@ -942,11 +948,6 @@ impl BuiltinToolName {
                     "role": { "type": "string", "description": "已注册的代理角色 id，如 architect / executor / explorer / reviewer / tester。不要传 coordinator，主线协调身份由当前主模型承接。若用户明确指定 role，必须原样使用，不得替换成你认为更接近的角色。" },
                     "display_name": { "type": "string", "description": "本次派发的代理实例展示名（3-30 个字符），用于前端代理卡片标题。若用户明确给出 display_name 或指定代理名称，必须原样使用；不得自行改写、缩短、泛化或把两个指定代理合并。否则要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
                     "goal": { "type": "string", "description": "子任务的具体目标；角色级 system prompt 会与该目标合并使用" },
-                    "access_mode": {
-                        "type": "string",
-                        "enum": ["read_only", "read_write"],
-                        "description": "本次代理的权限模式。read_only 禁止写工具和写类 shell；read_write 按父任务策略允许必要写入。用户要求只读、审查、探索、方案分析或风险验证时必须用 read_only。"
-                    },
                     "task_kind": {
                         "type": "string",
                         "enum": ["work_package", "action", "validation", "repair"],
@@ -956,7 +957,7 @@ impl BuiltinToolName {
                     "working_dir": { "type": "string", "description": "可选的绝对工作目录；默认沿用父任务的 workspace 根目录" },
                     "parallelism_group": { "type": "string", "description": "可选的并行组名；同一 SpawnGraph 分支下相同组名的子 agent 互斥执行" }
                 },
-                "required": ["role", "display_name", "goal", "access_mode"]
+                "required": ["role", "display_name", "goal"]
             }),
             Self::AgentWait => serde_json::json!({
                 "type": "object",
@@ -1271,5 +1272,19 @@ mod tests {
         assert_eq!(properties.len(), 1);
         assert!(properties.contains_key("url"));
         assert!(!properties.contains_key("prompt"));
+    }
+
+    #[test]
+    fn agent_spawn_inherits_parent_access_profile_without_model_controlled_permission_field() {
+        let schema = BuiltinToolName::AgentSpawn.parameters_schema();
+        let properties = schema["properties"]
+            .as_object()
+            .expect("agent_spawn properties should be an object");
+        let required = schema["required"]
+            .as_array()
+            .expect("agent_spawn required should be an array");
+
+        assert!(!properties.contains_key("access_mode"));
+        assert!(!required.iter().any(|value| value == "access_mode"));
     }
 }

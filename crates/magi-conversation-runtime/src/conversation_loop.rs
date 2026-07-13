@@ -43,8 +43,8 @@ use magi_bridge_client::{
     ModelInvocationRequest, ModelStreamingDelta,
 };
 use magi_core::{
-    AccessProfile, EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskId, TaskStatus,
-    ThreadId, UtcMillis, WorkspaceId, estimate_text_tokens,
+    EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskId, TaskStatus, ThreadId,
+    UtcMillis, WorkspaceId, estimate_text_tokens,
 };
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, SessionRuntimeUsageObservation,
@@ -135,7 +135,7 @@ pub struct ConversationLoopRequest<'a> {
 /// P6b：把 thread 持久化的消息记录（`ThreadChatMessage`）还原为 bridge-client 的
 /// `ChatMessage`。两者字段一一对应，独立类型仅是为了避免 session-store 反向依赖
 /// bridge-client，不承担额外语义。
-fn thread_chat_message_to_chat_message(message: &ThreadChatMessage) -> ChatMessage {
+pub(crate) fn thread_chat_message_to_chat_message(message: &ThreadChatMessage) -> ChatMessage {
     ChatMessage {
         role: message.role.clone(),
         content: message.content.clone(),
@@ -249,7 +249,7 @@ impl ThreadHistoryCompactionDecision {
     }
 }
 
-fn latest_session_usage_observation(
+pub(crate) fn latest_session_usage_observation(
     event_bus: &InMemoryEventBus,
     session_id: &SessionId,
 ) -> Option<SessionRuntimeUsageObservation> {
@@ -277,6 +277,12 @@ fn thread_history_compaction_decision(
                 token_limit: context_window.max(0) as u64,
                 threshold_tokens,
                 resolved_model: observation.resolved_model.clone(),
+            });
+        }
+        if estimated_tokens >= threshold_tokens as usize {
+            return Some(ThreadHistoryCompactionDecision::EstimatedPrefill {
+                estimated_tokens,
+                threshold_tokens: threshold_tokens as usize,
             });
         }
         return None;
@@ -502,6 +508,16 @@ fn compact_thread_history_if_needed(
         return None;
     }
     Some(compacted)
+}
+
+pub(crate) fn compact_history_for_prompt(
+    history: Vec<ThreadChatMessage>,
+    usage_observation: Option<&SessionRuntimeUsageObservation>,
+) -> Vec<ThreadChatMessage> {
+    let Some(decision) = thread_history_compaction_decision(&history, usage_observation) else {
+        return history;
+    };
+    compact_thread_history_if_needed(&history, &decision).unwrap_or(history)
 }
 
 fn compact_and_replace_thread_history(
@@ -1333,7 +1349,7 @@ fn run_conversation_loop_inner(
             );
             let canonical_tool_name = canonical_tool_call_name(&tool_call.function.name);
             if !matches!(tool_status, ExecutionResultStatus::Succeeded)
-                && !tool_result_is_recoverable_coordination_signal(&result)
+                && !tool_result_is_recoverable_failure(&result)
             {
                 let failure_summary = format!(
                     "{}: {}",
@@ -1937,7 +1953,7 @@ fn agent_spawn_requirement_recovery_prompt(
     }
 
     Some(
-        "用户已经明确要求启动或派发代理。本轮必须调用 agent_spawn 履行代理契约；不要把主线 shell_exec、file_read 或直接总结冒充为代理执行结果。若需要多个代理，应在同一轮发起多次 agent_spawn 并为每个代理写清 display_name、role、goal 与 access_mode。"
+        "用户已经明确要求启动或派发代理。本轮必须调用 agent_spawn 履行代理契约；不要把主线 shell_exec、file_read 或直接总结冒充为代理执行结果。若需要多个代理，应在同一轮发起多次 agent_spawn 并为每个代理写清 display_name、role 与 goal。子代理自动继承当前主线访问模式。"
             .to_string(),
     )
 }
@@ -1969,10 +1985,7 @@ fn agent_spawn_requirement_is_policy_reachable(task: &Task) -> bool {
     let Some(policy) = task.policy_snapshot.as_ref() else {
         return true;
     };
-    if policy.access_profile == AccessProfile::ReadOnly
-        || policy.command_mode.eq_ignore_ascii_case("read_only")
-        || policy.command_mode.eq_ignore_ascii_case("no_tools")
-    {
+    if policy.command_mode.eq_ignore_ascii_case("no_tools") {
         return false;
     }
     if policy
@@ -2102,7 +2115,7 @@ fn tool_result_content_field(tool_result: &str) -> Option<String> {
         })
 }
 
-fn tool_result_is_recoverable_coordination_signal(result: &str) -> bool {
+fn tool_result_is_recoverable_failure(result: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(result)
         .ok()
         .and_then(|value| {
@@ -2111,7 +2124,12 @@ fn tool_result_is_recoverable_coordination_signal(result: &str) -> bool {
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned)
         })
-        .is_some_and(|code| code == "agent_spawn_capacity_exceeded")
+        .is_some_and(|code| {
+            matches!(
+                code.as_str(),
+                "agent_spawn_capacity_exceeded" | "file_read_not_found"
+            )
+        })
 }
 
 fn task_has_validation_gate(task: &Task) -> bool {
@@ -2727,6 +2745,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn thread_history_compaction_keeps_estimated_guard_after_prior_compaction() {
+        let huge_history = repeated_thread_history(1_000, 1_000);
+        let low_usage_after_compaction = SessionRuntimeUsageObservation {
+            context_window_tokens: 20_000,
+            resolved_model: Some("gpt-5-codex".to_string()),
+            observed_at: Some(UtcMillis(3)),
+        };
+
+        let decision =
+            thread_history_compaction_decision(&huge_history, Some(&low_usage_after_compaction))
+                .expect("完整历史仍超过窗口水位时必须继续压缩，不能因上轮压缩后用量降低而反弹");
+
+        assert!(matches!(
+            decision,
+            ThreadHistoryCompactionDecision::EstimatedPrefill { .. }
+        ));
+    }
+
     impl ModelBridgeClient for TaskToolBatchModelBridgeClient {
         fn invoke(
             &self,
@@ -3153,6 +3190,35 @@ mod tests {
         assert!(
             task_required_tool_chain(&task, None).is_empty(),
             "只读阶段即使复述用户目标，也不能强制执行写工具链"
+        );
+    }
+
+    #[test]
+    fn natural_write_then_read_goal_requires_file_write_before_file_read() {
+        let mut task = make_task_loop_test_task("task-natural-write-read-chain");
+        task.goal =
+            "在工作区创建 probe.txt，写入内容 FULL_ACCESS_OK，再读取该文件验证内容。".to_string();
+        task.policy_snapshot = Some(magi_core::TaskPolicy {
+            autonomy_level: "Autonomous".to_string(),
+            access_profile: magi_core::AccessProfile::FullAccess,
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_paths: Vec::new(),
+            denied_paths: Vec::new(),
+            read_only_paths: Vec::new(),
+            network_mode: "full".to_string(),
+            command_mode: "full".to_string(),
+            retry_limit: 1,
+            validation_profile: None,
+            checkpoint_mode: "turn".to_string(),
+            task_tier: TaskTier::ExecutionChain,
+            background_allowed: true,
+            escalation_conditions: Vec::new(),
+        });
+
+        assert_eq!(
+            task_required_tool_chain(&task, None),
+            vec!["file_write".to_string(), "file_read".to_string()]
         );
     }
 
@@ -3934,8 +4000,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_agent_request_does_not_force_unreachable_agent_spawn_in_read_only_mode() {
-        let mut task = make_task_loop_test_task("task-agent-spawn-read-only-unreachable");
+    fn explicit_agent_request_still_requires_agent_spawn_in_read_only_mode() {
+        let mut task = make_task_loop_test_task("task-agent-spawn-read-only-reachable");
         task.goal = "只读验证：请启动 explorer 代理检查目录结构。".to_string();
         task.policy_snapshot = Some(magi_core::TaskPolicy {
             autonomy_level: "Autonomous".to_string(),
@@ -3959,8 +4025,11 @@ mod tests {
             run_static_task_final(&task, "当前只读访问模式不启动代理；我在主线完成只读分析。");
 
         match outcome {
-            TaskOutcome::Completed { .. } => {}
-            other => panic!("agent_spawn 不可达时不应制造无法满足的代理硬约束，got {other:?}"),
+            TaskOutcome::Failed { error } => {
+                assert!(error.contains("agent_spawn"));
+                assert!(error.contains("代理契约"));
+            }
+            other => panic!("只读模式仍应保护真实子代理契约，got {other:?}"),
         }
     }
 
@@ -4054,8 +4123,7 @@ mod tests {
                 arguments: serde_json::json!({
                     "role": "explorer",
                     "display_name": "目录观察代理",
-                    "goal": "检查 /tmp 顶层结构",
-                    "access_mode": "read_only"
+                    "goal": "检查 /tmp 顶层结构"
                 })
                 .to_string(),
             },
@@ -4329,13 +4397,22 @@ mod tests {
         })
         .to_string();
 
-        assert!(tool_result_is_recoverable_coordination_signal(
-            &capacity_signal
-        ));
-        assert!(!tool_result_is_recoverable_coordination_signal(
-            &safety_rejection
-        ));
-        assert!(!tool_result_is_recoverable_coordination_signal("not json"));
+        assert!(tool_result_is_recoverable_failure(&capacity_signal));
+        assert!(!tool_result_is_recoverable_failure(&safety_rejection));
+        assert!(!tool_result_is_recoverable_failure("not json"));
+    }
+
+    #[test]
+    fn missing_file_probe_does_not_poison_task_completion() {
+        let missing_file = serde_json::json!({
+            "tool": "file_read",
+            "status": "failed",
+            "error_code": "file_read_not_found",
+            "error": "目标路径不存在，请检查路径",
+        })
+        .to_string();
+
+        assert!(tool_result_is_recoverable_failure(&missing_file));
     }
 
     #[test]

@@ -76,7 +76,7 @@ struct AgentProjectionDto {
     status: String,
     status_label: String,
     lifecycle: String,
-    access_mode: String,
+    access_profile: String,
     parallelism_group: Option<String>,
     worker_id: Option<String>,
     thread_id: Option<String>,
@@ -288,7 +288,7 @@ fn agent_projection_from_task(
         status: status.to_string(),
         status_label: task_status_label(task.status).to_string(),
         lifecycle: lifecycle.to_string(),
-        access_mode: task
+        access_profile: task
             .policy_snapshot
             .as_ref()
             .map(|policy| policy.access_profile.as_str())
@@ -913,7 +913,7 @@ mod tests {
         assert_eq!(agent.model.as_deref(), Some("gpt-reviewer"));
         assert_eq!(agent.model_source, "engine");
         assert_eq!(agent.lifecycle, "completed");
-        assert_eq!(agent.access_mode, "read_only");
+        assert_eq!(agent.access_profile, "read_only");
         assert_eq!(agent.parallelism_group.as_deref(), Some("review-wave"));
         assert_eq!(agent.worker_id.as_deref(), Some("worker-agent-child"));
         assert_eq!(agent.thread_id.as_deref(), Some("thread-agent-child"));
@@ -973,7 +973,7 @@ mod tests {
             status: "running".to_string(),
             status_label: "运行中".to_string(),
             lifecycle: "running".to_string(),
-            access_mode: "read_only".to_string(),
+            access_profile: "read_only".to_string(),
             parallelism_group: None,
             worker_id: Some("worker-response".to_string()),
             thread_id: Some("thread-response".to_string()),
@@ -1004,35 +1004,43 @@ mod tests {
             value["agents"][0]["modelSource"].as_str(),
             Some("inherited_orchestrator")
         );
+        assert_eq!(value["agents"][0]["accessProfile"], "read_only");
+        assert!(value["agents"][0].get("accessMode").is_none());
     }
 
     #[test]
     fn agent_model_bindings_resolve_registry_engine_id_model_contract() {
         let state = build_state();
-        state.settings_store.set_section(
-            "engines",
-            serde_json::json!([
-                {
-                    "id": "glm-5-1",
-                    "displayName": "GLM-5.1",
-                    "llm": {
-                        "baseUrl": "http://localhost:8317/",
-                        "apiKey": "test-key",
-                        "model": "glm-5.1"
+        state
+            .settings_store
+            .set_section(
+                "engines",
+                serde_json::json!([
+                    {
+                        "id": "glm-5-1",
+                        "displayName": "GLM-5.1",
+                        "llm": {
+                            "baseUrl": "http://localhost:8317/",
+                            "apiKey": "test-key",
+                            "model": "glm-5.1"
+                        }
                     }
-                }
-            ]),
-        );
-        state.settings_store.set_section(
-            "agents",
-            serde_json::json!([
-                {
-                    "templateId": "explorer",
-                    "engineId": "glm-5-1",
-                    "order": 1
-                }
-            ]),
-        );
+                ]),
+            )
+            .unwrap();
+        state
+            .settings_store
+            .set_section(
+                "agents",
+                serde_json::json!([
+                    {
+                        "templateId": "explorer",
+                        "engineId": "glm-5-1",
+                        "order": 1
+                    }
+                ]),
+            )
+            .unwrap();
 
         let bindings = agent_model_bindings_for_state(&state);
         let explorer = bindings

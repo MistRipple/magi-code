@@ -325,6 +325,18 @@ fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
 
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                tool = "file_read",
+                path = %path.display(),
+                "file_read target path does not exist"
+            );
+            return builtin_error_with_code(
+                "file_read",
+                "file_read_not_found",
+                PATH_NOT_FOUND_PUBLIC_ERROR,
+            );
+        }
         Err(error) => {
             return builtin_filesystem_error(
                 "file_read",
@@ -1539,10 +1551,18 @@ fn execute_diff_preview(input: &str, context: &ToolExecutionContext) -> String {
 }
 
 fn builtin_error(tool: &str, message: impl Into<String>) -> String {
+    builtin_error_with_code(tool, builtin_error_code(tool, "failed"), message)
+}
+
+fn builtin_error_with_code(
+    tool: &str,
+    error_code: impl Into<String>,
+    message: impl Into<String>,
+) -> String {
     serde_json::json!({
         "tool": tool,
         "status": "failed",
-        "error_code": builtin_error_code(tool, "failed"),
+        "error_code": error_code.into(),
         "error": message.into(),
     })
     .to_string()
@@ -3279,7 +3299,6 @@ fn execute_search_semantic(
             max_context_tokens: Some(max_context_tokens),
             preferred_scopes: preferred_scopes.clone(),
             prefer_recent_edits,
-            ..Default::default()
         },
     ) else {
         return builtin_error("search_semantic", "代码索引引擎未就绪");

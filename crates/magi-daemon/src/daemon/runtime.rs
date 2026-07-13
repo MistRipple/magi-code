@@ -21,7 +21,7 @@ use magi_conversation_runtime::{
     session_turn_finalize::{
         current_turn_status_is_terminal, publish_task_status_turn_item_for_active_sessions,
     },
-    task_execution_dispatcher::LlmTaskDispatcher,
+    task_execution_dispatcher::{LlmTaskDispatcher, LlmTaskDispatcherDependencies},
     task_runner_bridge::{EventBasedResultReceiver, TaskOutcome, TaskResult},
 };
 use magi_core::{EventId, ExecutionOwnership, LeaseId, SessionId, TaskStatus, UtcMillis};
@@ -938,7 +938,7 @@ impl DaemonRuntime {
         ));
     }
 
-    fn build_api_state(&self, service_name: String) -> ApiState {
+    fn build_api_state(&self, service_name: String) -> Result<ApiState, DaemonError> {
         self.build_api_state_with_options(service_name, &[], None)
     }
 
@@ -947,7 +947,7 @@ impl DaemonRuntime {
         service_name: String,
         bridge_env: &[(&str, &str)],
         model_bridge_override: Option<Arc<dyn magi_bridge_client::ModelBridgeClient>>,
-    ) -> ApiState {
+    ) -> Result<ApiState, DaemonError> {
         let orchestrator = OrchestratorService::new(self.event_bus.clone());
         let mcp_connections = Arc::new(RwLock::new(HashMap::new()));
         let model_transport =
@@ -959,13 +959,16 @@ impl DaemonRuntime {
         let settings_store = Arc::new(SettingsStore::with_persistence_path(
             self.state_root.join("settings.json"),
         ));
-        if let Err(error) = settings_store.load_from_disk() {
-            warn!(error = %error, "设置文件加载失败，使用空默认值");
-        }
-        Self::seed_orchestrator_settings_from_env_if_empty(&settings_store, bridge_env);
+        settings_store
+            .load_from_disk()
+            .map_err(|error| DaemonError::internal(format!("加载设置文件失败: {error}")))?;
+        Self::seed_orchestrator_settings_from_env_if_empty(&settings_store, bridge_env)
+            .map_err(|error| DaemonError::internal(format!("保存环境模型设置失败: {error}")))?;
         let agent_role_registry = Arc::new(magi_agent_role::AgentRoleRegistry::load_default());
         let app_skill_runtime = Arc::new(
-            magi_api::skill_loader::build_skill_runtime_from_settings(&settings_store),
+            magi_api::skill_loader::build_skill_runtime_from_settings(&settings_store).map_err(
+                |error| DaemonError::internal(format!("规范化 Skill 设置失败: {error}")),
+            )?,
         );
         let external_tool_catalog_provider = build_external_tool_catalog_provider(
             settings_store.clone(),
@@ -1264,10 +1267,14 @@ impl DaemonRuntime {
                 .execution_pipeline()
                 .expect("execution pipeline should exist when daemon wires task runner")
                 .clone(),
-            state.session_store.clone(),
-            state.task_execution_registry().clone(),
-            runner_result_receiver.clone(),
-            state.spawn_graph.clone(),
+            LlmTaskDispatcherDependencies {
+                session_store: state.session_store.clone(),
+                execution_registry: state.task_execution_registry().clone(),
+                result_receiver: runner_result_receiver.clone(),
+                spawn_graph: state.spawn_graph.clone(),
+                conversation_registry: state.conversation_registry.clone(),
+                agent_role_registry: state.agent_role_registry.clone(),
+            },
             self.state_root.clone(),
         );
         let llm_task_dispatcher = Arc::new(
@@ -1282,9 +1289,7 @@ impl DaemonRuntime {
                 .with_workspace_registry(state.workspace_registry.clone())
                 .with_tool_registry(tool_registry_for_dispatcher)
                 .with_skill_runtime(app_skill_runtime)
-                .with_snapshot_manager(state.snapshot_manager.clone())
-                .with_conversation_registry(state.conversation_registry.clone())
-                .with_agent_role_registry(state.agent_role_registry.clone()),
+                .with_snapshot_manager(state.snapshot_manager.clone()),
         );
         let session_turn_dispatcher = llm_task_dispatcher.clone();
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(
@@ -1321,7 +1326,7 @@ impl DaemonRuntime {
         // 测试可用 ApiState::new 直接构造而不调用此函数，惰性 fallback 仍兜底。
         state.install_snapshot_lifecycle_observer();
 
-        state
+        Ok(state)
     }
 
     fn reconcile_stale_session_task_chains(&self, task_store: &TaskStore) -> usize {
@@ -1504,8 +1509,8 @@ impl DaemonRuntime {
         );
     }
 
-    pub(crate) fn router(&self, service_name: String) -> axum::Router {
-        build_router(self.build_api_state(service_name))
+    pub(crate) fn router(&self, service_name: String) -> Result<axum::Router, DaemonError> {
+        Ok(build_router(self.build_api_state(service_name)?))
     }
 
     #[cfg(test)]
@@ -1513,11 +1518,13 @@ impl DaemonRuntime {
         &self,
         service_name: String,
     ) -> (axum::Router, ApiState) {
-        let state = self.build_api_state_with_options(
-            service_name,
-            &[],
-            Some(Arc::new(StaticTestModelBridgeClient)),
-        );
+        let state = self
+            .build_api_state_with_options(
+                service_name,
+                &[],
+                Some(Arc::new(StaticTestModelBridgeClient)),
+            )
+            .expect("测试 API 状态应成功构造");
         (build_router(state.clone()), state)
     }
 
@@ -1527,7 +1534,9 @@ impl DaemonRuntime {
         service_name: String,
         bridge_env: &[(&str, &str)],
     ) -> (axum::Router, ApiState) {
-        let state = self.build_api_state_with_options(service_name, bridge_env, None);
+        let state = self
+            .build_api_state_with_options(service_name, bridge_env, None)
+            .expect("测试 API 状态应成功构造");
         (build_router(state.clone()), state)
     }
 
@@ -1620,12 +1629,12 @@ impl DaemonRuntime {
     fn seed_orchestrator_settings_from_env_if_empty(
         settings_store: &Arc<SettingsStore>,
         bridge_env: &[(&str, &str)],
-    ) {
+    ) -> Result<(), std::io::Error> {
         if orchestrator_settings_is_configured(&settings_store.get_section("orchestrator")) {
-            return;
+            return Ok(());
         }
         let Some(config) = Self::openai_compat_env_config(bridge_env) else {
-            return;
+            return Ok(());
         };
         let mut section = serde_json::json!({
             "baseUrl": config.base_url,
@@ -1634,7 +1643,7 @@ impl DaemonRuntime {
         if let Some(api_key) = config.api_key {
             section["apiKey"] = serde_json::Value::String(api_key);
         }
-        settings_store.set_section("orchestrator", section);
+        settings_store.set_section("orchestrator", section)
     }
 
     fn openai_compat_env_config(bridge_env: &[(&str, &str)]) -> Option<OpenAiCompatEnvConfig> {
@@ -1872,6 +1881,23 @@ mod tests {
         "MAGI_OPENAI_COMPAT_MODEL",
     ];
     static OPENAI_COMPAT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn router_rejects_corrupt_settings_file() {
+        let state_root =
+            std::env::temp_dir().join(format!("magi-corrupt-settings-{}", UtcMillis::now().0));
+        fs::create_dir_all(&state_root).unwrap();
+        fs::write(state_root.join("settings.json"), b"{not-json").unwrap();
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
+        let runtime = DaemonRuntime::restore(&config).unwrap();
+
+        let error = runtime
+            .router("daemon-test".to_string())
+            .expect_err("损坏设置文件必须阻止路由启动");
+
+        assert!(error.to_string().contains("加载设置文件失败"));
+        fs::remove_dir_all(state_root).unwrap();
+    }
 
     #[test]
     fn external_mcp_catalog_uses_live_tool_list_instead_of_saved_count() {
@@ -2356,17 +2382,19 @@ done
     #[test]
     fn settings_backed_mcp_bridge_rejects_disabled_configured_target_before_default_client() {
         let settings_store = Arc::new(SettingsStore::new());
-        settings_store.set_section(
-            "mcpServers",
-            json!([
-                {
-                    "id": "disabled-mcp",
-                    "name": "disabled-mcp",
-                    "command": "node",
-                    "enabled": false
-                }
-            ]),
-        );
+        settings_store
+            .set_section(
+                "mcpServers",
+                json!([
+                    {
+                        "id": "disabled-mcp",
+                        "name": "disabled-mcp",
+                        "command": "node",
+                        "enabled": false
+                    }
+                ]),
+            )
+            .unwrap();
         let fallback = Arc::new(RecordingMcpClient::default());
         let calls = fallback.calls.clone();
         let connections = Arc::new(RwLock::new(HashMap::new()));
@@ -2428,7 +2456,9 @@ done
         .expect("bootstrap workspace source file should be writable");
         seed_registered_test_workspace(&config, Some("test-session-001"));
         let runtime = DaemonRuntime::restore(&config).expect("runtime restore should load state");
-        let app = runtime.router("daemon-test".to_string());
+        let app = runtime
+            .router("daemon-test".to_string())
+            .expect("测试路由应成功构造");
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let _ =
@@ -2580,7 +2610,9 @@ done
         let runtime = DaemonRuntime::restore(&config)
             .expect("runtime restore should load the registered workspace");
 
-        let app = runtime.router("daemon-test".to_string());
+        let app = runtime
+            .router("daemon-test".to_string())
+            .expect("测试路由应成功构造");
         let knowledge = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let knowledge =
@@ -2652,7 +2684,9 @@ done
             let runtime = DaemonRuntime::restore(&config)
                 .expect("initial runtime restore should bootstrap state");
             let (status, body) = post_json(
-                runtime.router("daemon-test".to_string()),
+                runtime
+                    .router("daemon-test".to_string())
+                    .expect("测试路由应成功构造"),
                 "/api/workspaces/register",
                 json!({ "path": secondary_root.to_string_lossy() }),
             )
@@ -2690,7 +2724,9 @@ done
         );
 
         let bootstrap = get_json(
-            restored.router("daemon-test".to_string()),
+            restored
+                .router("daemon-test".to_string())
+                .expect("测试路由应成功构造"),
             &format!("/api/settings/bootstrap?scope=core&workspaceId={secondary_workspace_id}"),
         )
         .await;
@@ -2702,7 +2738,9 @@ done
             .expect("workspace_code_index dependency should be exposed");
         assert_eq!(workspace_code_index["status"], "not_ready");
 
-        let app = restored.router("daemon-test".to_string());
+        let app = restored
+            .router("daemon-test".to_string())
+            .expect("测试路由应成功构造");
         let knowledge = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let knowledge = get_json(
@@ -3357,7 +3395,9 @@ done
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
         let runtime = DaemonRuntime::restore_with_test_fixture(&config)
             .expect("runtime restore should load explicit test fixture");
-        let app = runtime.router("daemon-test".to_string());
+        let app = runtime
+            .router("daemon-test".to_string())
+            .expect("测试路由应成功构造");
 
         let snapshot = get_json(app, "/bridges/services").await;
         let services = service_entries_by_kind(&snapshot);
@@ -3455,7 +3495,9 @@ done
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
         let runtime = DaemonRuntime::restore_with_test_fixture(&config)
             .expect("runtime restore should load explicit test fixture");
-        let app = runtime.router("daemon-test".to_string());
+        let app = runtime
+            .router("daemon-test".to_string())
+            .expect("测试路由应成功构造");
         let services_snapshot = get_json(app.clone(), "/bridges/services").await;
 
         let snapshot = get_json(app, "/bridges/preflight").await;
@@ -3542,7 +3584,9 @@ done
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
         let runtime = DaemonRuntime::restore_with_test_fixture(&config)
             .expect("runtime restore should load explicit test fixture");
-        let app = runtime.router("daemon-test".to_string());
+        let app = runtime
+            .router("daemon-test".to_string())
+            .expect("测试路由应成功构造");
         let services_snapshot = get_json(app.clone(), "/bridges/services").await;
         let snapshot = get_json(app, "/bridges/cutover-smoke").await;
         let services = service_entries_by_kind(&snapshot);
@@ -4677,7 +4721,9 @@ done
         let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
         let runtime = DaemonRuntime::restore_with_test_fixture(&config)
             .expect("runtime restore should load explicit test fixture");
-        let app = runtime.router("daemon-test".to_string());
+        let app = runtime
+            .router("daemon-test".to_string())
+            .expect("测试路由应成功构造");
 
         let bootstrap = get_json(app.clone(), "/bootstrap").await;
         let bridge_services = get_json(app.clone(), "/bridges/services").await;

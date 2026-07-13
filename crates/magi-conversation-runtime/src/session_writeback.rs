@@ -1231,6 +1231,7 @@ fn execute_session_turn_tool_call_scoped(
             session_store,
             session_id,
             thread_id,
+            access_profile,
             canonical,
             &tool_call.function.arguments,
         );
@@ -2073,7 +2074,7 @@ mod tests {
                     model_tool_name: "mcp__repo-tools__inspect".to_string(),
                     tool_name: "inspect".to_string(),
                     description: "Inspect repository".to_string(),
-                    read_only: false,
+                    read_only: true,
                     input_schema: serde_json::json!({ "type": "object", "properties": {} }),
                 }],
                 ..magi_tool_runtime::ExternalToolCatalogSnapshot::default()

@@ -46,14 +46,14 @@ impl Daemon {
 
     pub async fn run(&self) -> Result<(), DaemonError> {
         let runtime = DaemonRuntime::restore(&self.config)?;
+        let api_router = runtime.router(self.config.service_name.clone())?;
         runtime.start_background_tasks();
         runtime.publish_started_event(&self.config.service_name);
 
         let frontend = resolve_frontend_mode(&self.config).await?;
         let listener = TcpListener::bind(self.config.socket_addr()?).await?;
         let frontend_entry_available = frontend.entry_available();
-        let app =
-            build_application_router(runtime.router(self.config.service_name.clone()), &frontend);
+        let app = build_application_router(api_router, &frontend);
         info!(
             service_name = %self.config.service_name,
             host = %self.config.host,

@@ -1002,10 +1002,6 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("newer session should create");
-        state
-            .session_store
-            .switch_session(&newer_session_id)
-            .expect("current session should switch");
         tokio::time::sleep(Duration::from_millis(2)).await;
         state.session_store.append_timeline_entry(
             newer_session_id.clone(),
