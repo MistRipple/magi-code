@@ -788,6 +788,7 @@ await withGoldenViteServer(async (server) => {
   );
 
   const bootstrapRequestsBeforeTerminalEvent = bootstrapRequestCount;
+  summaryUpdatedAt = ACCEPTED_AT + 2_000;
   terminalPublished = true;
   recoveredStream.onmessage?.({ data: JSON.stringify(completedEnvelope()) });
   await waitFor(
@@ -806,6 +807,10 @@ await withGoldenViteServer(async (server) => {
   await waitFor(
     () => bootstrapRequestCount > bootstrapRequestsBeforeTerminalEvent,
     'terminal session turn event must finish its authoritative bootstrap refresh',
+  );
+  await waitFor(
+    () => currentSessionSummary(messagesStore)?.updatedAt === summaryUpdatedAt,
+    'terminal bootstrap refresh must finish applying before tunnel reconciliation starts',
   );
 
   const localUrlBeforeTunnelSync = window.location.href;
