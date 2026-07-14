@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 校验构建输入不含本地运行时配置
         shell: bash
@@ -38,7 +38,7 @@ jobs:
           fi
 
       - name: 安装 Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -68,7 +68,7 @@ jobs:
           npm --prefix web run build
 
       - name: 上传前端资源
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: magi-web-dist
           path: web/dist
@@ -83,7 +83,7 @@ jobs:
       matrix:
         include:
           - platform: macos
-            runner: macos-latest
+            runner: macos-15
             bundles: app,dmg
           - platform: linux
             runner: ubuntu-22.04
@@ -94,7 +94,7 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 校验构建输入不含本地运行时配置
         shell: bash
@@ -112,7 +112,7 @@ jobs:
           fi
 
       - name: 下载前端资源
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: magi-web-dist
           path: web/dist
@@ -240,11 +240,19 @@ jobs:
           set -euo pipefail
           version="$(node -p "require('./apps/desktop/tauri.conf.json').version")"
           mkdir -p dist/package-assets
+          host_triple="$(rustc -vV | sed -n 's/^host: //p')"
+          host_arch="${host_triple%%-*}"
+          case "$host_arch" in
+            x86_64|aarch64|i686|armv7|riscv64) ;;
+            *)
+              echo "无法从 Rust host triple 识别发布架构：$host_triple" >&2
+              exit 1
+              ;;
+          esac
           case "${{ matrix.platform }}" in
             macos)
               updater=(target/release/bundle/macos/*.app.tar.gz)
               signatures=(target/release/bundle/macos/*.app.tar.gz.sig)
-              host_arch="$(rustc -vV | sed -n 's/^host: .*\-\(x86_64\|aarch64\|i686\|armv7\|riscv64\)\-.*/\1/p')"
               target="darwin-${host_arch}-app"
               updater_suffix="tar.gz"
               install=(target/release/bundle/dmg/*.dmg)
@@ -252,7 +260,6 @@ jobs:
             linux)
               updater=(target/release/bundle/appimage/*.AppImage)
               signatures=(target/release/bundle/appimage/*.AppImage.sig)
-              host_arch="$(rustc -vV | sed -n 's/^host: .*\-\(x86_64\|aarch64\|i686\|armv7\|riscv64\)\-.*/\1/p')"
               target="linux-${host_arch}-appimage"
               updater_suffix="AppImage"
               install=(target/release/bundle/deb/*.deb)
@@ -260,7 +267,6 @@ jobs:
             windows)
               updater=(target/release/bundle/nsis/*.exe)
               signatures=(target/release/bundle/nsis/*.exe.sig)
-              host_arch="$(rustc -vV | sed -n 's/^host: .*\-\(x86_64\|aarch64\|i686\|armv7\|riscv64\)\-.*/\1/p')"
               target="windows-${host_arch}-nsis"
               updater_suffix="exe"
               install=()
@@ -282,7 +288,7 @@ jobs:
           ls -lh dist/package-assets
 
       - name: 上传安装包
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: magi-bundle-${{ matrix.platform }}
           path: dist/package-assets
@@ -295,12 +301,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: 收集三平台安装包
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: magi-bundle-*
           path: dist/release-assets
@@ -334,7 +340,7 @@ jobs:
           ls -lh dist/release-assets
 
       - name: 安装 Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
 

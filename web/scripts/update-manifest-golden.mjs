@@ -44,6 +44,32 @@ assert.doesNotMatch(
 );
 assert.match(releaseWorkflow, /\.AppImage\.sig/, 'Linux updater validation must use the signed AppImage');
 assert.match(releaseWorkflow, /\.exe\.sig/, 'Windows updater validation must use the signed NSIS installer');
+assert.match(releaseWorkflow, /runner: macos-15/, 'release builds must pin the macOS runner image');
+assert.doesNotMatch(releaseWorkflow, /macos-latest/, 'release builds must not drift with macos-latest');
+assert.match(releaseWorkflow, /actions\/checkout@v7/g, 'release workflow must use the Node 24 checkout action');
+assert.match(releaseWorkflow, /actions\/setup-node@v7/g, 'release workflow must use the Node 24 setup-node action');
+assert.match(releaseWorkflow, /actions\/upload-artifact@v7/g, 'release workflow must use the current artifact uploader');
+assert.match(releaseWorkflow, /actions\/download-artifact@v8/g, 'release workflow must use the current artifact downloader');
+assert.doesNotMatch(
+  releaseWorkflow,
+  /actions\/(?:checkout|setup-node|upload-artifact|download-artifact)@v4/,
+  'release workflow must not depend on deprecated Node 20 action runtimes',
+);
+assert.match(
+  releaseWorkflow,
+  /host_triple="\$\(rustc -vV \| sed -n 's\/\^host: \/\/p'\)"/,
+  'release workflow must read the complete Rust host triple before extracting its architecture',
+);
+assert.match(
+  releaseWorkflow,
+  /host_arch="\$\{host_triple%%-\*\}"/,
+  'release workflow must extract the leading architecture component from the Rust host triple',
+);
+assert.doesNotMatch(
+  releaseWorkflow,
+  /host: \.\*\\-\\\(x86_64\\\|aarch64/,
+  'release workflow must not require a separator before the leading host architecture',
+);
 
 const releaseNotes = fs.readFileSync(path.resolve('../.github/releases/v3.0.1.md'), 'utf8');
 assert.match(releaseNotes, /Turn ID/, '3.0.1 notes must explain the Turn ID race convergence');
