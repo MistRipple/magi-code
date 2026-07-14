@@ -899,7 +899,7 @@ pub fn append_session_tool_call_items_batch_with_context(
 
     let mut succeeded_tool_names = Vec::new();
     let mut activated_skill_id = None;
-    for (tool_call, (tool_result, tool_status)) in tool_calls.iter().zip(tool_results.into_iter()) {
+    for (tool_call, (tool_result, tool_status)) in tool_calls.iter().zip(tool_results) {
         if !write_allowed() {
             return SessionToolCallBatchOutcome::default();
         }

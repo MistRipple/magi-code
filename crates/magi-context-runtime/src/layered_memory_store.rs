@@ -128,7 +128,7 @@ impl LayeredMemoryStore {
             .values()
             .filter(|e| e.signal_type == signal_type && !self.is_expired(e))
             .collect();
-        results.sort_by(|a, b| b.importance.cmp(&a.importance));
+        results.sort_by_key(|entry| std::cmp::Reverse(entry.importance));
         results
     }
 
@@ -138,7 +138,7 @@ impl LayeredMemoryStore {
             .values()
             .filter(|e| !self.is_expired(e) && e.tags.iter().any(|t| tags.contains(t)))
             .collect();
-        results.sort_by(|a, b| b.importance.cmp(&a.importance));
+        results.sort_by_key(|entry| std::cmp::Reverse(entry.importance));
         results
     }
 
@@ -148,7 +148,7 @@ impl LayeredMemoryStore {
             .values()
             .filter(|e| e.layer == layer && !self.is_expired(e))
             .collect();
-        results.sort_by(|a, b| b.importance.cmp(&a.importance));
+        results.sort_by_key(|entry| std::cmp::Reverse(entry.importance));
         results
     }
 

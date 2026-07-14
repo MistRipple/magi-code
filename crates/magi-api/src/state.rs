@@ -1698,11 +1698,7 @@ impl ApiState {
             .execution_task_ids_for_session(session_id)
             .into_iter()
             .collect::<HashSet<_>>();
-        task_ids.extend(
-            self.task_execution_registry
-                .remove_session(session_id)
-                .into_iter(),
-        );
+        task_ids.extend(self.task_execution_registry.remove_session(session_id));
         if let Some(task_store) = self.task_store() {
             for task_id in task_ids.clone() {
                 if let Some(task) = task_store.get_task(&task_id) {

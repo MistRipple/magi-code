@@ -417,14 +417,13 @@ pub fn collect_dependency_output_validation_facts(
                     failed_tools.push(tool_name);
                 }
             }
-            Some("text") => {
+            Some("text")
                 if block
                     .get("content")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|content| !content.trim().is_empty())
-                {
-                    *has_final_text = true;
-                }
+                    .is_some_and(|content| !content.trim().is_empty()) =>
+            {
+                *has_final_text = true;
             }
             _ => {}
         }

@@ -1680,7 +1680,7 @@ async fn submit_goal_continuation_turn(
     let turn_id = format!("turn-goal-continuation-{}", accepted_at.0);
     let mut turn = ActiveExecutionTurn {
         turn_id: turn_id.clone(),
-        turn_seq: accepted_at.0 as u64,
+        turn_seq: accepted_at.0,
         accepted_at,
         completed_at: None,
         status: "running".to_string(),

@@ -348,10 +348,8 @@ impl PlanLedgerService {
         item.status = status;
         match status {
             PlanItemStatus::Completed => item.progress = 100.0,
-            PlanItemStatus::Failed | PlanItemStatus::Cancelled => {
-                if item.progress < 1.0 {
-                    item.progress = 1.0;
-                }
+            PlanItemStatus::Failed | PlanItemStatus::Cancelled if item.progress < 1.0 => {
+                item.progress = 1.0;
             }
             _ => {}
         }
@@ -674,7 +672,7 @@ impl PlanLedgerService {
             return Vec::new();
         };
         let mut sorted: Vec<&PlanIndexEntry> = index.iter().collect();
-        sorted.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        sorted.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
         sorted.truncate(limit);
 
         let session_plans = match self.plans.get(session_id) {
@@ -690,7 +688,7 @@ impl PlanLedgerService {
     pub fn get_active_plan(&self, session_id: &str) -> Option<&PlanRecord> {
         let index = self.index.get(session_id)?;
         let mut sorted: Vec<&PlanIndexEntry> = index.iter().collect();
-        sorted.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        sorted.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
         let session_plans = self.plans.get(session_id)?;
         for entry in sorted {
             if entry.status.is_terminal() {
@@ -715,7 +713,7 @@ impl PlanLedgerService {
             .iter()
             .filter(|e| e.mission_id.as_deref() == Some(mission_id))
             .collect();
-        sorted.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        sorted.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
         for entry in sorted {
             if !include_terminal && entry.status.is_terminal() {
                 continue;

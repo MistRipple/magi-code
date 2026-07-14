@@ -182,7 +182,7 @@ impl MissionSharedContextPool {
             })
             .collect();
 
-        results.sort_by(|a, b| b.importance.cmp(&a.importance));
+        results.sort_by_key(|entry| std::cmp::Reverse(entry.importance));
 
         if let Some(max_tokens) = options.max_tokens {
             let mut total_tokens = 0usize;
@@ -214,7 +214,7 @@ impl MissionSharedContextPool {
             .filter_map(|id| self.entries.get(id))
             .filter(|e| e.expires_at.is_none_or(|exp| exp >= now))
             .collect();
-        entries.sort_by(|a, b| b.importance.cmp(&a.importance));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.importance));
         entries
     }
 

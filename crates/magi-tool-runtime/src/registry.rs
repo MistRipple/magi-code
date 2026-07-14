@@ -174,7 +174,7 @@ impl ToolRegistry {
                     .any(|builtin| builtin.as_str() == name.as_str())
             })
             .collect::<Vec<_>>();
-        custom_tools.sort_by(|(left, _), (right, _)| left.cmp(right));
+        custom_tools.sort_by_key(|(name, _)| *name);
         specs.extend(custom_tools.into_iter().map(|(_, tool)| tool.spec()));
         specs
     }
