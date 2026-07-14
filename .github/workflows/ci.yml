@@ -33,6 +33,9 @@ jobs:
       - name: 前端契约测试
         run: npm --prefix web run test
 
+      - name: 前端生产构建
+        run: npm --prefix web run build
+
       - name: 前端生产依赖安全检查
         run: npm --prefix web audit --omit=dev
 
