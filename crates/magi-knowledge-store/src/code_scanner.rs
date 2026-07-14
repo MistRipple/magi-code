@@ -559,7 +559,7 @@ fn detect_tech_stack(root: &Path, files: &[ScannedFile], tech_stack: &mut Vec<St
 
             let all_deps: HashSet<String> = deps
                 .into_iter()
-                .chain(dev_deps.into_iter())
+                .chain(dev_deps)
                 .flat_map(|m| m.keys().cloned())
                 .collect();
 

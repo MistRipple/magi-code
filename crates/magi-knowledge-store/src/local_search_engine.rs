@@ -476,11 +476,7 @@ impl LocalSearchEngine {
             total_dep_edges: dep_stats.total_edges,
             cache_hit_rate: cache_stats.hit_rate,
             query_count,
-            average_query_micros: if query_count == 0 {
-                0
-            } else {
-                total_query_micros / query_count
-            },
+            average_query_micros: total_query_micros.checked_div(query_count).unwrap_or(0),
             max_query_micros: self.max_query_micros.load(Ordering::Relaxed),
             index_version: self.index_version,
             index_cache_status: self.index_cache_status,
@@ -836,7 +832,7 @@ impl LocalSearchEngine {
         self.recent_edited_files.insert(file_path.to_string(), now);
         if self.recent_edited_files.len() > RECENT_EDIT_MAX_FILES {
             let mut sorted: Vec<(String, u64)> = self.recent_edited_files.drain().collect();
-            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             sorted.truncate(RECENT_EDIT_MAX_FILES);
             self.recent_edited_files = sorted.into_iter().collect();
         }

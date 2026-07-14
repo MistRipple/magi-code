@@ -218,7 +218,7 @@ impl InvertedIndex {
 
         // proximity boost
         if query_tokens.len() >= 2 {
-            for (_file_path, (score, lines, matched, _)) in file_scores.iter_mut() {
+            for (score, lines, matched, _) in file_scores.values_mut() {
                 if matched.len() >= 2 {
                     let mut sorted_lines = lines.clone();
                     sorted_lines.sort();
