@@ -524,6 +524,8 @@ mod tests {
                 updated_at: timestamp,
                 message_count: None,
                 workspace_id: None,
+                last_completed_at: None,
+                last_viewed_at: None,
             }],
             timeline: vec![TimelineEntry {
                 entry_id: "timeline-session-1".to_string(),
@@ -702,6 +704,8 @@ mod tests {
                 updated_at: ts(1),
                 message_count: None,
                 workspace_id: None,
+                last_completed_at: None,
+                last_viewed_at: None,
             }],
             timeline: (1..=3)
                 .map(|i| TimelineEntry {
@@ -956,6 +960,8 @@ mod tests {
                 updated_at: timestamp(1),
                 message_count: None,
                 workspace_id: None,
+                last_completed_at: None,
+                last_viewed_at: None,
             }],
             timeline: vec![TimelineEntry {
                 entry_id: "timeline-exec-1".to_string(),
@@ -1504,6 +1510,8 @@ mod tests {
                 updated_at: ts(1),
                 message_count: None,
                 workspace_id: None,
+                last_completed_at: None,
+                last_viewed_at: None,
             }],
             timeline: vec![
                 TimelineEntry {

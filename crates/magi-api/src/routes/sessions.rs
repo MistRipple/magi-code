@@ -447,14 +447,18 @@ async fn submit_steer_current_turn(
 fn steer_input_error(error: SessionTurnInputError) -> ApiError {
     match error {
         SessionTurnInputError::NoActiveTurn => {
-            ApiError::Conflict("当前回复已经结束，无法继续引导".to_string())
+            ApiError::turn_conflict("no_active_turn", None, "当前回复已经结束，无法继续引导")
         }
-        SessionTurnInputError::TurnMismatch { .. } => {
-            ApiError::Conflict("当前回复已经切换，请基于最新状态重新发送".to_string())
-        }
-        SessionTurnInputError::AlreadyActive { .. } => {
-            ApiError::Conflict("当前会话的引导通道状态冲突".to_string())
-        }
+        SessionTurnInputError::TurnMismatch { active_turn_id, .. } => ApiError::turn_conflict(
+            "expected_turn_mismatch",
+            Some(active_turn_id),
+            "当前回复已经切换，请基于最新状态重新发送",
+        ),
+        SessionTurnInputError::AlreadyActive { active_turn_id } => ApiError::turn_conflict(
+            "channel_already_active",
+            Some(active_turn_id),
+            "当前会话的引导通道状态冲突",
+        ),
     }
 }
 
@@ -654,6 +658,23 @@ fn normalize_session_turn_decision(
                 .push("显式复杂任务/代理编排请求".to_string());
         }
     }
+    if !matches!(decision.route, SessionTurnRouteDto::Continue)
+        && !session_turn_requests_explicit_task_or_agent_mode(request)
+        && session_turn_requests_image_generation_by_local_rules(request)
+    {
+        decision.route = SessionTurnRouteDto::Execute;
+        decision.task_title = None;
+        decision.execution_goal = None;
+        decision.task_tier = TaskTier::ExecutionChain;
+        decision.tool_intent = Some(explicit_builtin_tool_intent("image_generate"));
+        decision.forced_tool_name = Some("image_generate".to_string());
+        decision.required_tool_chain.clear();
+        decision.confidence = decision.confidence.max(0.98);
+        decision.reason_code = Some("image_generation_request".to_string());
+        decision.route_reason =
+            Some("用户明确要求生成图片，必须调用 image_generate 并展示真实生成结果。".to_string());
+        decision.task_evidence.clear();
+    }
     let requests_direct_execution = session_turn_requests_simple_execution_by_local_rules(request)
         || session_turn_requested_public_builtin_tools(request).is_some()
         || (request
@@ -849,6 +870,79 @@ fn session_turn_requests_simple_execution_by_local_rules(request: &SessionTurnRe
     .iter()
     .any(|marker| normalized.contains(marker));
     has_direct_work && has_small_scope
+}
+
+fn session_turn_requests_image_generation_by_local_rules(request: &SessionTurnRequestDto) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    let normalized = text.to_ascii_lowercase();
+    let requests_diagram = [
+        "流程图",
+        "架构图",
+        "时序图",
+        "关系图",
+        "拓扑图",
+        "思维导图",
+        "图表",
+        "mermaid",
+        "graphviz",
+        "flowchart",
+        "sequence diagram",
+        "architecture diagram",
+        "chart",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    if requests_diagram {
+        return false;
+    }
+
+    let has_creation_intent = [
+        "生成",
+        "画一个",
+        "画一张",
+        "画幅",
+        "绘制",
+        "创作",
+        "制作",
+        "设计一个",
+        "设计一张",
+        "来一张",
+        "给我一张",
+        "generate ",
+        "create ",
+        "draw ",
+        "make ",
+        "design ",
+        "render ",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let has_image_target = [
+        "图片",
+        "照片",
+        "图像",
+        "插画",
+        "海报",
+        "封面",
+        "壁纸",
+        "头像",
+        "图标",
+        "photo",
+        "image",
+        "picture",
+        "illustration",
+        "poster",
+        "cover",
+        "wallpaper",
+        "avatar",
+        "icon",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+
+    has_creation_intent && has_image_target
 }
 
 fn session_turn_has_structured_task_scope(normalized: &str) -> bool {
@@ -4259,7 +4353,9 @@ mod tests {
         )
         .await;
         assert_eq!(stale_status, StatusCode::CONFLICT);
-        assert_eq!(stale_body["error_code"], "CONFLICT");
+        assert_eq!(stale_body["error_code"], "TURN_CONFLICT");
+        assert_eq!(stale_body["conflict_kind"], "expected_turn_mismatch");
+        assert_eq!(stale_body["active_turn_id"], "turn-session-steer");
         let turn = state
             .session_store
             .runtime_sidecar(&session_id)
@@ -4313,6 +4409,56 @@ mod tests {
         let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
         assert!(tool_intent.contains("file_mkdir"));
         assert!(tool_intent.contains("不要只输出文字说明"));
+    }
+
+    #[test]
+    fn natural_image_generation_request_forces_image_generate() {
+        for prompt in [
+            "画一个乌龟的照片",
+            "生成一张产品封面图片",
+            "请绘制一个蓝色圆形图标",
+            "create an image of a white rabbit",
+        ] {
+            let request = session_turn_request(prompt);
+            let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+            assert!(
+                matches!(decision.route, SessionTurnRouteDto::Execute),
+                "{prompt} should route to direct execution"
+            );
+            assert_eq!(
+                decision.forced_tool_name.as_deref(),
+                Some("image_generate"),
+                "{prompt} should force image_generate instead of allowing a text-only claim"
+            );
+            assert!(
+                decision
+                    .tool_intent
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("不要只输出文字说明")
+            );
+        }
+    }
+
+    #[test]
+    fn image_generation_detection_does_not_capture_view_or_diagram_requests() {
+        for prompt in [
+            "查看这张图片",
+            "图片保存在哪里",
+            "画一个系统流程图",
+            "生成一张性能趋势图表",
+            "create a sequence diagram for login",
+        ] {
+            let request = session_turn_request(prompt);
+            let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+            assert_ne!(
+                decision.forced_tool_name.as_deref(),
+                Some("image_generate"),
+                "{prompt} should not be treated as raster image generation"
+            );
+        }
     }
 
     #[test]

@@ -25,9 +25,9 @@
     try {
       update = await checkDesktopUpdate();
       promptState = update ? 'available' : 'idle';
-    } catch (reason) {
-      promptState = 'error';
-      error = reason instanceof Error ? reason.message : String(reason);
+    } catch {
+      promptState = 'idle';
+      error = '';
     }
   }
 
@@ -100,7 +100,7 @@
         {i18n.t('app.update.later')}
       </button>
     {:else if promptState === 'error'}
-      <button type="button" class="primary-action" onclick={() => void checkForUpdate()}>
+      <button type="button" class="primary-action" onclick={() => void installUpdate()}>
         {i18n.t('app.update.retry')}
       </button>
       <button type="button" class="icon-action" onclick={() => void dismiss()} title={i18n.t('app.update.close')} aria-label={i18n.t('app.update.close')}>

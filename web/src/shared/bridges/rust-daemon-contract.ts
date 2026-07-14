@@ -2,6 +2,7 @@ import type { SessionBootstrapSnapshot } from '../session-bootstrap';
 import type { CanonicalTurn } from '../protocol/canonical-turn';
 import { normalizeCanonicalTurn } from '../protocol/canonical-turn';
 import { deriveProcessingStateFromCanonicalTurns } from '../protocol/canonical-processing';
+import { deriveHasUnreadCompletion } from '../../lib/session-activity-indicator';
 import type {
   AppState,
   OrchestrationRuntimeAssignmentSummary,
@@ -50,6 +51,8 @@ interface RustBootstrapSessionRecord {
   createdAt?: number;
   updatedAt?: number;
   messageCount?: number;
+  lastCompletedAt?: number;
+  lastViewedAt?: number;
 }
 
 interface RustBootstrapWorkspaceRecord {
@@ -637,6 +640,8 @@ function normalizeRustSessions(
     const createdAt = normalizeNumber(session.createdAt, generatedAt);
     const updatedAt = normalizeNumber(session.updatedAt, createdAt);
     const messageCount = normalizeNumber(session.messageCount, NaN);
+    const lastCompletedAt = normalizeNumber(session.lastCompletedAt, NaN);
+    const lastViewedAt = normalizeNumber(session.lastViewedAt, NaN);
     sessions.push({
       id: sessionId,
       ...(sessionWorkspaceId ? { workspaceId: sessionWorkspaceId } : {}),
@@ -644,6 +649,10 @@ function normalizeRustSessions(
       createdAt,
       updatedAt,
       ...(Number.isFinite(messageCount) ? { messageCount } : {}),
+      hasUnreadCompletion: deriveHasUnreadCompletion(
+        Number.isFinite(lastCompletedAt) ? lastCompletedAt : undefined,
+        Number.isFinite(lastViewedAt) ? lastViewedAt : undefined,
+      ),
     });
   }
   return sessions;

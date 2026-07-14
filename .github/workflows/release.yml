@@ -11,12 +11,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.97.0"
   TAURI_CLI_VERSION: "2.11.4"
 
 jobs:
   build-web:
     name: 构建前端资源
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -88,7 +89,7 @@ jobs:
             runner: ubuntu-22.04
             bundles: appimage,deb
           - platform: windows
-            runner: windows-latest
+            runner: windows-2022
             bundles: nsis
 
     steps:
@@ -144,7 +145,8 @@ jobs:
             wget
 
       - name: 安装 Rust
-        uses: dtolnay/rust-toolchain@stable
+        shell: bash
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
 
       - name: 缓存 Rust 构建产物
         uses: Swatinem/rust-cache@v2
@@ -158,6 +160,7 @@ jobs:
         run: cargo test -p magi-desktop --all-targets --locked
 
       - name: 构建桌面安装包
+        shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -347,34 +350,27 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          commit="${GITHUB_SHA}"
-          generated_at="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           release_kind="正式版"
           if [[ "$tag" =~ (test|alpha|beta|rc) ]]; then
             release_kind="测试版"
           fi
+          notes_file=".github/releases/${tag}.md"
+          test -s "$notes_file" || {
+            echo "缺少版本化中文发布说明：$notes_file" >&2
+            exit 1
+          }
 
-          previous_tag="$(git describe --tags --abbrev=0 "${commit}^" 2>/dev/null || true)"
-          if [ -n "$previous_tag" ]; then
-            change_title="自 $previous_tag 以来的变更"
-            git log --pretty='- %s (%h)' "$previous_tag..$commit" > dist/release-changes.md
-          else
-            change_title="最近变更"
-            git log --pretty='- %s (%h)' -n 50 "$commit" > dist/release-changes.md
-          fi
-          if [ ! -s dist/release-changes.md ]; then
-            echo "- 本次发布没有检测到新的提交摘要。" > dist/release-changes.md
-          fi
-
-          macos_asset="$(basename "$(find dist/release-assets/normalized -maxdepth 1 -name '*.dmg' -print -quit)")"
-          linux_appimage="$(basename "$(find dist/release-assets/normalized -maxdepth 1 -name '*.AppImage' -print -quit)")"
-          linux_deb="$(basename "$(find dist/release-assets/normalized -maxdepth 1 -name '*.deb' -print -quit)")"
-          windows_installer="$(basename "$(find dist/release-assets/normalized -maxdepth 1 -name '*.exe' -print -quit)")"
+          macos_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.dmg' -print -quit)")"
+          linux_appimage="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.AppImage' -print -quit)")"
+          linux_deb="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.deb' -print -quit)")"
+          windows_installer="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.exe' -print -quit)")"
 
           {
             echo "# Magi $tag"
             echo
             echo "版本类型：$release_kind"
+            echo
+            cat "$notes_file"
             echo
             echo "## 下载"
             echo
@@ -395,15 +391,10 @@ jobs:
               echo "当前测试包默认不做商业签名和公证。macOS 首次打开可能需要右键打开，Windows 可能出现 SmartScreen 提示。"
               echo
             fi
-            echo "## $change_title"
-            echo
-            cat dist/release-changes.md
-            echo
             echo "## 构建信息"
             echo
             echo "- Tag：\`$tag\`"
-            echo "- Commit：\`$commit\`"
-            echo "- 生成时间：$generated_at"
+            echo "- Rust 工具链：\`$RUST_TOOLCHAIN\`"
           } > dist/release-notes.md
 
       - name: 生成自动更新清单
@@ -428,5 +419,5 @@ jobs:
           name: Magi ${{ github.ref_name }}
           body_path: dist/release-notes.md
           prerelease: ${{ contains(github.ref_name, 'test') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
-          files: dist/release-assets/normalized/*
+          files: dist/release-assets/*
           fail_on_unmatched_files: true

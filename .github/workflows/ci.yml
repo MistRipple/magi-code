@@ -9,10 +9,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.97.0"
+
 jobs:
   validate:
     name: 检查与测试
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -37,10 +46,27 @@ jobs:
         run: npm --prefix web run build
 
       - name: 前端生产依赖安全检查
-        run: npm --prefix web audit --omit=dev
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if npm --prefix web audit --omit=dev; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "前端依赖安全检查连续失败 3 次。" >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
 
       - name: 安装 Rust
-        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy && rustup default "$RUST_TOOLCHAIN"
+
+      - name: 缓存 Rust 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-ubuntu-22.04-rust-1.97
 
       - name: 安装 Linux 桌面依赖
         run: |
@@ -64,7 +90,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Rust 全量测试
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --locked
 
       - name: Rust 依赖安全检查
         run: |
@@ -73,13 +99,19 @@ jobs:
 
   windows-desktop:
     name: Windows 桌面进程策略
-    runs-on: windows-latest
+    runs-on: windows-2022
+    timeout-minutes: 20
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
       - name: 安装 Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install "$env:RUST_TOOLCHAIN" --profile minimal && rustup default "$env:RUST_TOOLCHAIN"
+
+      - name: 缓存 Rust 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-windows-2022-rust-1.97
 
       - name: 验证 Windows 子进程与桌面宿主
         run: |

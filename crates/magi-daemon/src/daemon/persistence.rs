@@ -429,6 +429,8 @@ mod tests {
                 updated_at: now,
                 message_count: Some(1),
                 workspace_id: Some("workspace-persisted".to_string()),
+                last_completed_at: None,
+                last_viewed_at: None,
             }],
             timeline: vec![TimelineEntry {
                 entry_id: "timeline-persisted-user".to_string(),
@@ -496,6 +498,8 @@ mod tests {
                     updated_at: now,
                     message_count: Some(1),
                     workspace_id: Some("workspace-missing".to_string()),
+                    last_completed_at: None,
+                    last_viewed_at: None,
                 }],
                 timeline: vec![TimelineEntry {
                     entry_id: "timeline-unknown-workspace".to_string(),
@@ -553,6 +557,8 @@ mod tests {
                     updated_at: now,
                     message_count: Some(1),
                     workspace_id: Some("workspace-registered".to_string()),
+                    last_completed_at: None,
+                    last_viewed_at: None,
                 }],
                 timeline: vec![TimelineEntry {
                     entry_id: "timeline-global-workspace-bound".to_string(),
@@ -615,6 +621,8 @@ mod tests {
                     updated_at: now,
                     message_count: Some(1),
                     workspace_id: None,
+                    last_completed_at: None,
+                    last_viewed_at: None,
                 }],
                 timeline: vec![TimelineEntry {
                     entry_id: "timeline-global-session".to_string(),
@@ -643,6 +651,8 @@ mod tests {
                         updated_at: now,
                         message_count: Some(2),
                         workspace_id: Some("workspace-bound".to_string()),
+                        last_completed_at: None,
+                        last_viewed_at: None,
                     }],
                     timeline: vec![TimelineEntry {
                         entry_id: "timeline-workspace-session".to_string(),
@@ -699,6 +709,8 @@ mod tests {
                     updated_at: now,
                     message_count: Some(0),
                     workspace_id: None,
+                    last_completed_at: None,
+                    last_viewed_at: None,
                 }],
                 timeline: vec![],
                 canonical_turns: vec![],

@@ -3,16 +3,19 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
+use magi_core::{EventId, UtcMillis};
+use magi_event_bus::{EventContext, EventEnvelope};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use super::session_scope::require_registered_workspace_binding;
+use super::session_scope::{require_registered_workspace_binding, require_session_workspace_scope};
 use crate::{errors::ApiError, state::ApiState};
 
 static WORKSPACE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SESSION_VIEW_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -21,6 +24,10 @@ pub fn routes() -> Router<ApiState> {
         .route("/workspaces/remove", post(remove_workspace))
         .route("/workspaces/pick", get(pick_workspace))
         .route("/workspaces/sessions", get(workspace_sessions))
+        .route(
+            "/workspaces/sessions/viewed",
+            post(mark_workspace_session_viewed),
+        )
 }
 
 #[derive(Debug, Serialize)]
@@ -50,6 +57,7 @@ struct WorkspaceSessionDto {
     message_count: usize,
     is_running: bool,
     running_task_count: usize,
+    has_unread_completion: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -226,6 +234,64 @@ struct WorkspaceSessionsQuery {
     session_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MarkWorkspaceSessionViewedRequest {
+    workspace_id: Option<String>,
+    workspace_path: Option<String>,
+    session_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MarkWorkspaceSessionViewedResponse {
+    session_id: String,
+    has_unread_completion: bool,
+}
+
+async fn mark_workspace_session_viewed(
+    State(state): State<ApiState>,
+    Json(request): Json<MarkWorkspaceSessionViewedRequest>,
+) -> Result<Json<MarkWorkspaceSessionViewedResponse>, ApiError> {
+    let scope = require_session_workspace_scope(
+        &state,
+        Some(request.session_id.as_str()),
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+        "标记为已查看",
+    )?;
+    let session = state
+        .session_store
+        .mark_session_viewed(&scope.session_id)
+        .map_err(|error| ApiError::internal_assembly("标记会话已查看失败", error))?;
+    state.persist_session_state_checkpoint("session_viewed")?;
+    let event_suffix = SESSION_VIEW_EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    state.event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-session-viewed-{}-{}-{event_suffix}",
+                scope.session_id,
+                UtcMillis::now().0,
+            )),
+            "session.viewed",
+            serde_json::json!({
+                "sessionId": scope.session_id.as_str(),
+                "workspaceId": scope.workspace_id.as_str(),
+                "hasUnreadCompletion": session.has_unread_completion(),
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(scope.session_id.clone()),
+            workspace_id: Some(scope.workspace_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    Ok(Json(MarkWorkspaceSessionViewedResponse {
+        session_id: scope.session_id.to_string(),
+        has_unread_completion: session.has_unread_completion(),
+    }))
+}
+
 async fn workspace_sessions(
     State(state): State<ApiState>,
     Query(query): Query<WorkspaceSessionsQuery>,
@@ -287,6 +353,7 @@ async fn workspace_sessions(
                 message_count: session.message_count.unwrap_or(0),
                 is_running: running_task_count > 0,
                 running_task_count,
+                has_unread_completion: session.has_unread_completion(),
             }
         })
         .collect::<Vec<_>>();
@@ -642,6 +709,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_sessions_reports_unread_completion_without_clearing_it() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-unread-completion");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-workspace-unread-completion"),
+            )
+            .expect("workspace should register");
+        let session_id = SessionId::new("session-unread-completion");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "未读完成会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state.session_store.append_timeline_entry(
+            session_id.clone(),
+            TimelineEntryKind::UserMessage,
+            "触发未读完成",
+        );
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-unread-completion".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis(10),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("触发未读完成".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("current turn should upsert");
+        state
+            .session_store
+            .update_current_turn_status(&session_id, "completed")
+            .expect("turn should complete");
+
+        for _ in 0..2 {
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/workspaces/sessions?workspaceId=workspace-unread-completion&sessionId=session-unread-completion")
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("route should respond");
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload = read_json_response(response).await;
+            assert_eq!(payload["sessions"][0]["hasUnreadCompletion"], true);
+        }
+
+        assert!(
+            state
+                .session_store
+                .session(&session_id)
+                .expect("session should exist")
+                .has_unread_completion()
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_workspace_session_viewed_clears_unread_completion() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-mark-viewed");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-workspace-mark-viewed"),
+            )
+            .expect("workspace should register");
+        let session_id = SessionId::new("session-mark-viewed");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "已查看完成会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-mark-viewed".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis(10),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("触发已查看".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("current turn should upsert");
+        state
+            .session_store
+            .update_current_turn_status(&session_id, "completed")
+            .expect("turn should complete");
+
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workspaces/sessions/viewed")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workspaceId": workspace_id.as_str(),
+                            "sessionId": session_id.as_str(),
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["sessionId"], session_id.as_str());
+        assert_eq!(payload["hasUnreadCompletion"], false);
+        assert!(
+            !state
+                .session_store
+                .session(&session_id)
+                .expect("session should exist")
+                .has_unread_completion()
+        );
+        assert!(
+            state
+                .event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .any(|event| event.event_type == "session.viewed"),
+            "标记已查看必须广播事件，让其他客户端同步清除未读状态"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_workspace_session_viewed_rejects_workspace_mismatch() {
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-viewed-owner");
+        let foreign_workspace_id = WorkspaceId::new("workspace-viewed-foreign");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-workspace-viewed-owner"),
+            )
+            .expect("workspace should register");
+        state
+            .workspace_registry
+            .register(
+                foreign_workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-workspace-viewed-foreign"),
+            )
+            .expect("foreign workspace should register");
+        let session_id = SessionId::new("session-viewed-owner");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "归属会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workspaces/sessions/viewed")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workspaceId": foreign_workspace_id.as_str(),
+                            "sessionId": session_id.as_str(),
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn workspace_sessions_marks_non_terminal_current_turn_running() {
         let state = test_state();
         let workspace_id = WorkspaceId::new("workspace-running-session");
@@ -893,6 +1162,8 @@ mod tests {
                 updated_at: now,
                 message_count: None,
                 workspace_id: Some(workspace_a_id.to_string()),
+                last_completed_at: None,
+                last_viewed_at: None,
             }],
             timeline: Vec::new(),
             canonical_turns: Vec::new(),

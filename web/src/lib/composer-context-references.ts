@@ -14,7 +14,7 @@ export const MAX_COMPOSER_CONTEXT_REFERENCES = 20;
 
 function normalizePath(path: string): string {
   const trimmed = path.trim();
-  if (trimmed === '/') return trimmed;
+  if (trimmed === '/' || trimmed === '\\' || /^[A-Za-z]:[\\/]$/u.test(trimmed)) return trimmed;
   return trimmed.replace(/[\\/]+$/u, '');
 }
 

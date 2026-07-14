@@ -6,9 +6,24 @@
   import MagiWordmark from '../components/MagiWordmark.svelte';
   import Modal from '../components/Modal.svelte';
   import { runActionWithFeedback } from '../lib/action-feedback';
+  import {
+    DESKTOP_CONTEXT_DROP_EVENT,
+    normalizeDesktopDropPaths,
+    physicalToCssPoint,
+    registerDesktopFileDropListener,
+    resolveDesktopDroppedPath,
+    resolveDesktopDropZone,
+    type DesktopDragDropEvent,
+    type DesktopDropRect,
+    type DesktopDropZone,
+  } from '../lib/desktop-file-drop';
   import type { IconName } from '../lib/icons';
   import { addToast, messagesState, setCurrentSessionId, updateSessions } from '../stores/messages.svelte';
   import { reportIncident } from '../lib/notifications';
+  import {
+    resolveSessionActivityIndicator,
+    shouldMarkSessionCompletionViewed,
+  } from '../lib/session-activity-indicator';
   import { getClientBridge } from '../shared/bridges/bridge-runtime';
   import { i18n } from '../stores/i18n.svelte';
   import type { EditContentKind, Session } from '../types/message';
@@ -23,8 +38,10 @@
   } from './theme';
   import {
     RUNTIME_CONNECTION_EVENT,
+    browseAgentDirectory,
     getWorkspaceSessions,
     listAgentWorkspaces,
+    markAgentSessionViewed,
     registerAgentWorkspace,
     removeAgentWorkspace,
     resolveAgentBaseUrl,
@@ -91,9 +108,15 @@
   let sidebarCollapsed = $state(false);
   let previewPanelWidth = $state<number | null>(null);
   let isPreviewPanelResizing = $state(false);
+  let sidebarElement = $state<HTMLElement | null>(null);
+  let desktopDropIndicator = $state<{
+    zone: DesktopDropZone;
+    rect: DesktopDropRect;
+  } | null>(null);
   let pendingSessionSwitchTimer: ReturnType<typeof setTimeout> | null = null;
   let workspaceSessionRequestSeq = 0;
   const workspaceSessionRequestSeqByWorkspace = new Map<string, number>();
+  const sessionViewedRequests = new Set<string>();
 
   const INTERNAL_SESSION_NAME_PATTERNS = [
     /^auto-deep-followup-\d+$/i,
@@ -254,7 +277,8 @@
           || session.updatedAt !== next.updatedAt
           || session.messageCount !== next.messageCount
           || session.isRunning !== next.isRunning
-          || session.runningTaskCount !== next.runningTaskCount;
+          || session.runningTaskCount !== next.runningTaskCount
+          || session.hasUnreadCompletion !== next.hasUnreadCompletion;
       });
     if (sessionsChanged) {
       sessionsByWorkspace = {
@@ -262,6 +286,59 @@
         [authoritativeWorkspaceId]: currentSessions,
       };
     }
+  });
+
+  $effect(() => {
+    const workspaceId = currentBootstrapWorkspaceId();
+    const sessionId = typeof messagesState.currentSessionId === 'string'
+      ? messagesState.currentSessionId.trim()
+      : '';
+    if (!workspaceId || !sessionId) {
+      return;
+    }
+    const session = (sessionsByWorkspace[workspaceId] ?? [])
+      .find((candidate) => candidate.id === sessionId);
+    if (!session) {
+      return;
+    }
+    const isRunning = isSessionRunning(workspaceId, session);
+    if (!shouldMarkSessionCompletionViewed({
+      bootstrapped: messagesState.bootstrapped === true,
+      sessionHydrating: messagesState.sessionHydrating === true,
+      isCurrentSession: workspaceId === selectedWorkspaceId && sessionId === currentSessionId,
+      isRunning,
+      hasUnreadCompletion: session.hasUnreadCompletion === true,
+    })) {
+      return;
+    }
+    const requestKey = `${workspaceId}:${sessionId}`;
+    if (sessionViewedRequests.has(requestKey)) {
+      return;
+    }
+    sessionViewedRequests.add(requestKey);
+    const workspacePath = workspacePathForId(workspaceId);
+    void markAgentSessionViewed(sessionId, {
+      workspaceId,
+      workspacePath,
+      sessionId,
+    }).then(() => {
+      const nextSessions = (sessionsByWorkspace[workspaceId] ?? []).map((candidate) => (
+        candidate.id === sessionId
+          ? { ...candidate, hasUnreadCompletion: false }
+          : candidate
+      ));
+      sessionsByWorkspace = {
+        ...sessionsByWorkspace,
+        [workspaceId]: nextSessions,
+      };
+      if (currentBootstrapWorkspaceId() === workspaceId) {
+        updateSessions(nextSessions);
+      }
+    }).catch((error) => {
+      console.warn('[WebWorkbenchShell] 标记会话已查看失败:', error);
+    }).finally(() => {
+      sessionViewedRequests.delete(requestKey);
+    });
   });
 
   // 工作区指针同步 effect：bootstrap 是工作区选择真值。
@@ -977,6 +1054,39 @@
     }
   }
 
+  async function registerWorkspaceRoot(rootPath: string, openDraft: boolean): Promise<void> {
+    const next = await registerAgentWorkspace(rootPath);
+    const addedWorkspace = next.find((workspace) => workspace.rootPath === rootPath) ?? null;
+    if (!addedWorkspace) {
+      throw new Error(`注册后未找到工作区: ${rootPath}`);
+    }
+
+    workspaces = next;
+    selectedWorkspaceId = addedWorkspace.workspaceId;
+    expandedWorkspaceIds = {
+      ...expandedWorkspaceIds,
+      [addedWorkspace.workspaceId]: true,
+    };
+
+    if (openDraft) {
+      syncComposerWorkspaces(next, addedWorkspace.workspaceId);
+      selectComposerDraftWorkspace(addedWorkspace.workspaceId);
+      clearPendingSessionSwitchState();
+      currentSessionId = null;
+      setCurrentSessionId(null);
+      requestWorkspaceBindingSync(addedWorkspace, null);
+      await loadWorkspaceSessionsForSidebar(addedWorkspace);
+      if (sidebarIsDrawer) sidebarOpen = false;
+      return;
+    }
+
+    await refreshWorkspaceSessions(
+      addedWorkspace.workspaceId,
+      preferredSessionIdForWorkspace(addedWorkspace.workspaceId),
+      addedWorkspace.rootPath,
+    );
+  }
+
   async function handleFolderSelected(rootPath: string, _name: string): Promise<void> {
     if (workspaceActionPending) {
       return;
@@ -990,40 +1100,35 @@
     closeAddWorkspaceDialog({ force: true });
     workspaceActionPending = true;
     try {
-      const next = await runActionWithFeedback(
-        () => registerAgentWorkspace(normalizedRootPath),
+      await runActionWithFeedback(
+        () => registerWorkspaceRoot(normalizedRootPath, onboardingOrigin === 'composer'),
         {
           actionLabel: i18n.t('web.action.addWorkspace'),
           successMessage: i18n.t('web.workspaceAdded'),
         },
       );
-      if (!next) {
+    } finally {
+      workspaceActionPending = false;
+    }
+  }
+
+  async function handleDesktopWorkspaceDrop(paths: string[]): Promise<void> {
+    if (workspaceActionPending) return;
+    const droppedPaths = normalizeDesktopDropPaths(paths);
+    if (droppedPaths.length === 0) return;
+    workspaceActionPending = true;
+    try {
+      for (const path of droppedPaths) {
+        const result = await browseAgentDirectory(path);
+        const dropped = resolveDesktopDroppedPath(path, result);
+        if (!dropped || dropped.kind !== 'directory') continue;
+        await registerWorkspaceRoot(dropped.path, true);
         return;
       }
-      workspaces = next;
-      const addedWorkspace = next.find((workspace) => workspace.rootPath === normalizedRootPath);
-      const addedWorkspaceId = addedWorkspace?.workspaceId || '';
-      if (onboardingOrigin === 'composer' && addedWorkspaceId) {
-        syncComposerWorkspaces(next, addedWorkspaceId);
-        selectComposerDraftWorkspace(addedWorkspaceId);
-        if (addedWorkspace) {
-          requestWorkspaceBindingSync(addedWorkspace, null);
-          await loadWorkspaceSessionsForSidebar(addedWorkspace);
-        }
-      } else {
-        selectedWorkspaceId = addedWorkspaceId || next[0]?.workspaceId || '';
-      }
-      if (onboardingOrigin !== 'composer' && selectedWorkspaceId) {
-        expandedWorkspaceIds = {
-          ...expandedWorkspaceIds,
-          [selectedWorkspaceId]: true,
-        };
-        await refreshWorkspaceSessions(
-          selectedWorkspaceId,
-          preferredSessionIdForWorkspace(selectedWorkspaceId),
-          workspacePathForId(selectedWorkspaceId),
-        );
-      }
+      addToast('warning', i18n.t('web.desktopDropDirectoryOnly'));
+    } catch (error) {
+      console.warn('[WebWorkbenchShell] 拖入工作区失败:', error);
+      addToast('error', i18n.t('web.desktopDropWorkspaceFailed'));
     } finally {
       workspaceActionPending = false;
     }
@@ -1129,6 +1234,60 @@
     };
     if (!isExpanded && getWorkspaceSessionList(workspace.workspaceId).length === 0) {
       void loadWorkspaceSessionsForSidebar(workspace);
+    }
+  }
+
+  async function openWorkspaceDraft(workspace: AgentWorkspaceSummary): Promise<void> {
+    if (workspaceActionPending || messagesState.sessionHydrating || pendingSessionSwitchId) {
+      return;
+    }
+    const workspaceId = workspace.workspaceId.trim();
+    const workspacePath = workspace.rootPath.trim();
+    if (!workspaceId || !workspacePath) {
+      return;
+    }
+
+    const alreadyCurrentDraft = !messagesState.currentSessionId?.trim()
+      && currentBootstrapWorkspaceId() === workspaceId;
+    const sessionsAlreadyLoaded = Object.prototype.hasOwnProperty.call(
+      sessionsByWorkspace,
+      workspaceId,
+    );
+
+    selectedWorkspaceId = workspaceId;
+    expandedWorkspaceIds = {
+      ...expandedWorkspaceIds,
+      [workspaceId]: true,
+    };
+    syncComposerWorkspaces(workspaces, workspaceId);
+    if (!selectComposerDraftWorkspace(workspaceId)) {
+      return;
+    }
+
+    clearPendingSessionSwitchState();
+    currentSessionId = null;
+    setCurrentSessionId(null);
+    updateSessions(getWorkspaceSessionList(workspaceId));
+
+    if (!alreadyCurrentDraft) {
+      getClientBridge().postMessage({
+        type: 'newSession',
+        workspaceId,
+        workspacePath,
+      });
+    }
+    if (sidebarIsDrawer) {
+      sidebarOpen = false;
+    }
+
+    if (!sessionsAlreadyLoaded) {
+      await loadWorkspaceSessionsForSidebar(workspace);
+      if (
+        !messagesState.currentSessionId?.trim()
+        && currentBootstrapWorkspaceId() === workspaceId
+      ) {
+        updateSessions(getWorkspaceSessionList(workspaceId));
+      }
     }
   }
 
@@ -1304,6 +1463,61 @@
     }
   });
 
+  function readDesktopDropRect(element: Element | null): DesktopDropRect | null {
+    if (!element) return null;
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    return {
+      left: rect.left,
+      top: rect.top,
+      right: rect.right,
+      bottom: rect.bottom,
+      width: rect.width,
+      height: rect.height,
+    };
+  }
+
+  function handleDesktopDragDropEvent(event: DesktopDragDropEvent): void {
+    if (event.type === 'leave') {
+      desktopDropIndicator = null;
+      return;
+    }
+    const point = physicalToCssPoint(event.position, window.devicePixelRatio);
+    const zones = {
+      sidebar: sidebarHidden ? null : readDesktopDropRect(sidebarElement),
+      conversation: readDesktopDropRect(
+        document.querySelector('[data-desktop-drop-zone="conversation"]'),
+      ),
+    };
+    let zone = resolveDesktopDropZone(point, zones);
+    const hitTarget = document.elementFromPoint(point.x, point.y);
+    if (hitTarget && zone === 'sidebar' && !sidebarElement?.contains(hitTarget)) {
+      zone = null;
+    } else if (
+      hitTarget
+      && zone === 'conversation'
+      && !hitTarget.closest('[data-desktop-drop-zone="conversation"]')
+    ) {
+      zone = null;
+    }
+    const rect = zone ? zones[zone] : null;
+    desktopDropIndicator = zone && rect ? { zone, rect } : null;
+    if (event.type !== 'drop') return;
+
+    desktopDropIndicator = null;
+    const paths = normalizeDesktopDropPaths(event.paths);
+    if (paths.length === 0) return;
+    if (zone === 'sidebar') {
+      void handleDesktopWorkspaceDrop(paths);
+      return;
+    }
+    if (zone === 'conversation') {
+      window.dispatchEvent(new CustomEvent(DESKTOP_CONTEXT_DROP_EVENT, {
+        detail: { paths },
+      }));
+    }
+  }
+
   onMount(() => {
     applyViewportMode();
     loadStoredSidebarWidth();
@@ -1311,6 +1525,8 @@
     loadStoredPreviewPanelWidth();
     // 节流 resize：手机虚拟键盘弹出/收起会短时间内触发大量 resize 事件
     let resizeRaf: number | null = null;
+    let desktopDropDisposed = false;
+    let stopDesktopFileDrop: (() => void) | null = null;
     const handleResize = () => {
       if (resizeRaf !== null) return;
       resizeRaf = requestAnimationFrame(() => {
@@ -1384,8 +1600,22 @@
     window.addEventListener('magi:previewFile', handlePreviewFile as EventListener);
     window.addEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
     window.addEventListener('keydown', handlePanelEscape);
+    void registerDesktopFileDropListener(handleDesktopDragDropEvent)
+      .then((stop) => {
+        if (desktopDropDisposed) {
+          stop();
+          return;
+        }
+        stopDesktopFileDrop = stop;
+      })
+      .catch((error) => {
+        console.warn('[WebWorkbenchShell] 注册 Desktop 文件拖放监听失败:', error);
+      });
     void refreshWorkspaces();
     return () => {
+      desktopDropDisposed = true;
+      stopDesktopFileDrop?.();
+      desktopDropIndicator = null;
       window.removeEventListener('resize', handleResize);
       window.removeEventListener('magi:previewFile', handlePreviewFile as EventListener);
       window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
@@ -1416,6 +1646,24 @@
   class:web-workbench-shell--preview-resizing={isPreviewPanelResizing}
   style={shellLayoutStyle}
 >
+  {#if desktopDropIndicator}
+    <div
+      class="desktop-drop-overlay"
+      class:desktop-drop-overlay--sidebar={desktopDropIndicator.zone === 'sidebar'}
+      style={`left:${desktopDropIndicator.rect.left}px;top:${desktopDropIndicator.rect.top}px;width:${desktopDropIndicator.rect.width}px;height:${desktopDropIndicator.rect.height}px;`}
+      aria-hidden="true"
+    >
+      <div class="desktop-drop-overlay__label">
+        <Icon name={desktopDropIndicator.zone === 'sidebar' ? 'folder' : 'document'} size={18} />
+        <span>
+          {desktopDropIndicator.zone === 'sidebar'
+            ? i18n.t('web.desktopDropWorkspaceHint')
+            : i18n.t('input.add.contextDropHint')}
+        </span>
+      </div>
+    </div>
+  {/if}
+
   {#if sidebarIsDrawer && sidebarOpen}
     <button
       type="button"
@@ -1428,7 +1676,7 @@
   {/if}
 
   {#if !sidebarHidden}
-  <aside class="sidebar" class:sidebar--open={sidebarIsDrawer && sidebarOpen}>
+  <aside bind:this={sidebarElement} class="sidebar" class:sidebar--open={sidebarIsDrawer && sidebarOpen}>
     <div class="sidebar-header">
       <div class="sidebar-toolbar">
         <MagiWordmark />
@@ -1516,6 +1764,19 @@
                   </button>
                   <button
                     type="button"
+                    class="workspace-new-session-btn"
+                    title={i18n.t('web.newWorkspaceSessionTitle')}
+                    aria-label={i18n.t('web.newWorkspaceSessionAria', { name: workspace.name })}
+                    disabled={workspaceActionPending || messagesState.sessionHydrating || Boolean(pendingSessionSwitchId)}
+                    onclick={(event) => {
+                      event.stopPropagation();
+                      void openWorkspaceDraft(workspace);
+                    }}
+                  >
+                    <Icon name="plus" size={12} />
+                  </button>
+                  <button
+                    type="button"
                     class="workspace-remove-btn"
                     title={i18n.t('web.removeWorkspaceTitle')}
                     aria-label={i18n.t('web.removeWorkspaceAria', { name: workspace.name })}
@@ -1537,6 +1798,10 @@
                       <div class="session-list session-list--nested">
                         {#each getWorkspaceSessionList(workspace.workspaceId) as session (session.id)}
                           {@const sessionRunning = isSessionRunning(workspace.workspaceId, session)}
+                          {@const sessionIndicator = resolveSessionActivityIndicator({
+                            isRunning: sessionRunning,
+                            hasUnreadCompletion: session.hasUnreadCompletion === true,
+                          })}
                           <div class="session-row" class:active={session.id === currentSessionId && workspace.workspaceId === selectedWorkspaceId}>
                             <button
                               type="button"
@@ -1548,7 +1813,12 @@
                               title={session.name || i18n.t('header.unnamedSession')}
                               onclick={() => switchSession(workspace, session.id)}
                             >
-                              <span class="session-running-dot" class:active={sessionRunning} aria-hidden="true"></span>
+                              <span
+                                class="session-running-dot"
+                                class:running={sessionIndicator === 'running'}
+                                class:unread={sessionIndicator === 'unread'}
+                                aria-hidden="true"
+                              ></span>
                               <span class="session-name">{session.name || i18n.t('header.unnamedSession')}</span>
                               <span class="session-meta">
                                 <span class="session-msg-count" title={i18n.t('header.messageCount', { count: session.messageCount ?? 0 })}>{session.messageCount ?? 0}</span>
@@ -1720,6 +1990,43 @@
     color: var(--foreground);
     isolation: isolate;
     overflow: hidden;
+  }
+
+  .desktop-drop-overlay {
+    position: fixed;
+    z-index: var(--z-modal, 1000);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    padding: 16px;
+    border: 2px dashed color-mix(in srgb, var(--primary) 70%, var(--border));
+    border-radius: var(--radius-lg);
+    background: color-mix(in srgb, var(--primary) 10%, var(--background));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 12%, transparent);
+    pointer-events: none;
+  }
+
+  .desktop-drop-overlay--sidebar {
+    border-color: color-mix(in srgb, var(--success) 70%, var(--border));
+    background: color-mix(in srgb, var(--success) 9%, var(--background));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--success) 12%, transparent);
+  }
+
+  .desktop-drop-overlay__label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    max-width: min(320px, 90%);
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--dropdown-bg);
+    color: var(--foreground);
+    box-shadow: var(--shadow-md);
+    font-size: var(--text-base);
+    font-weight: var(--font-medium);
+    text-align: center;
   }
 
   .sidebar {
@@ -2077,8 +2384,10 @@
     background: color-mix(in srgb, var(--surface-hover) 60%, transparent);
   }
 
+  .workspace-row:hover .workspace-new-session-btn,
   .workspace-row:hover .workspace-remove-btn,
-  .workspace-row:focus-within .workspace-remove-btn {
+  .workspace-new-session-btn:focus-visible,
+  .workspace-remove-btn:focus-visible {
     opacity: 1;
     pointer-events: auto;
   }
@@ -2144,10 +2453,10 @@
     margin-top: 2px;
   }
 
+  .workspace-new-session-btn,
   .workspace-remove-btn {
     width: 22px;
     height: 22px;
-    margin-right: 4px;
     border: none;
     border-radius: var(--radius-sm);
     background: transparent;
@@ -2162,6 +2471,29 @@
     pointer-events: none;
     transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
     flex-shrink: 0;
+  }
+
+  .workspace-new-session-btn {
+    color: var(--foreground-muted);
+  }
+
+  .workspace-new-session-btn:hover {
+    color: var(--foreground);
+    background: var(--surface-hover);
+  }
+
+  .workspace-new-session-btn:disabled {
+    cursor: default;
+    color: var(--foreground-subtle);
+  }
+
+  .workspace-row:hover .workspace-new-session-btn:disabled,
+  .workspace-new-session-btn:focus-visible:disabled {
+    opacity: 0.35;
+  }
+
+  .workspace-remove-btn {
+    margin-right: 4px;
   }
 
   .workspace-remove-btn:hover {
@@ -2237,12 +2569,14 @@
     flex-shrink: 0;
   }
 
-  .session-running-dot.active {
+  .session-running-dot.running,
+  .session-running-dot.unread {
     opacity: 1;
   }
 
-  .session-running-dot.active::before,
-  .session-running-dot.active::after {
+  .session-running-dot.running::before,
+  .session-running-dot.running::after,
+  .session-running-dot.unread::before {
     content: '';
     position: absolute;
     inset: 50% auto auto 50%;
@@ -2251,18 +2585,25 @@
     pointer-events: none;
   }
 
-  .session-running-dot.active::before {
+  .session-running-dot.running::before {
     width: 6px;
     height: 6px;
     background: var(--info);
     box-shadow: 0 0 8px color-mix(in srgb, var(--info) 58%, transparent);
   }
 
-  .session-running-dot.active::after {
+  .session-running-dot.running::after {
     width: 6px;
     height: 6px;
     border: 1px solid color-mix(in srgb, var(--info) 52%, transparent);
     animation: session-running-breath 1.65s ease-out infinite;
+  }
+
+  .session-running-dot.unread::before {
+    width: 6px;
+    height: 6px;
+    background: var(--success);
+    box-shadow: 0 0 7px color-mix(in srgb, var(--success) 42%, transparent);
   }
 
   @keyframes session-running-breath {
@@ -2281,7 +2622,7 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .session-running-dot.active::after {
+    .session-running-dot.running::after {
       animation: none;
       opacity: 0.32;
       transform: translate(-50%, -50%) scale(1.65);
@@ -2583,11 +2924,16 @@
       font-size: var(--text-base);
     }
 
+    .workspace-new-session-btn,
     .workspace-remove-btn {
       width: 28px;
       height: 28px;
       opacity: 1;
       pointer-events: auto;
+    }
+
+    .workspace-new-session-btn:disabled {
+      opacity: 0.35;
     }
 
     .sidebar-drawer-close {

@@ -35,7 +35,7 @@
   const runtimeState = $derived.by<OrchestratorRuntimeState | null>(() => messagesState.orchestratorRuntimeState);
 </script>
 
-<div class="thread-panel">
+<div class="thread-panel" data-desktop-drop-zone="conversation">
   <RuntimeStatePanel
     {runtimeState}
     isProcessing={messagesState.isProcessing}

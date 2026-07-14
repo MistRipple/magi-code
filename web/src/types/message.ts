@@ -619,6 +619,7 @@ export interface Session {
   messageCount?: number;
   isRunning?: boolean;
   runningTaskCount?: number;
+  hasUnreadCompletion?: boolean;
   preview?: string;  // 会话预览
   messages?: { id: string; role: string; content: string }[];
   notifications?: {

@@ -139,10 +139,12 @@ import {
   markMessageActive,
   setCurrentSessionId,
   setQueuedMessages,
+  removeQueuedMessage,
   updateRequestBinding,
 } from '../../stores/messages.svelte';
 import { resolveModelListFetchBlockReason } from '../model-governance';
 import type { QueuedMessage } from '../../types/message';
+import { canGuideQueuedMessage, queuedMessageText } from '../../lib/queued-message-guidance';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
 const pendingBridgeMessages: ClientBridgeMessage[] = [];
@@ -153,6 +155,7 @@ let currentWorkspacePath = '';
 let currentSessionId = '';
 let currentInterruptTaskId = '';
 let currentRuntimeEpoch = '';
+const guidingQueuedMessageIds = new Set<string>();
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
 let cachedSettingsBootstrapBindingKey = '';
@@ -236,6 +239,7 @@ const EXTERNAL_SESSION_SUMMARY_EVENTS = new Set([
   'session.turn.failed',
   'session.turn.interrupted',
   'session.title.updated',
+  'session.viewed',
   'message.created',
 ]);
 const WEBVIEW_STATE_STORAGE_KEY = 'webview-state';
@@ -1379,7 +1383,7 @@ function shouldRefreshExternalWorkspaceSessionSummary(eventType: string, event: 
 }
 
 function shouldRefreshCurrentWorkspaceSessionSummary(eventType: string): boolean {
-  return eventType === 'message.created';
+  return eventType === 'message.created' || eventType === 'session.viewed';
 }
 
 const TURN_TERMINAL_EVENTS = new Set([
@@ -2835,7 +2839,7 @@ async function steerActiveSessionTurn(input: {
   sessionId: string;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
 }): Promise<boolean> {
-  const expectedTurnId = activeCanonicalTurnIdForSession(input.sessionId);
+  let expectedTurnId = activeCanonicalTurnIdForSession(input.sessionId);
   if (!expectedTurnId) {
     throw new Error(i18n.t('input.followUp.activeTurnUnavailable'));
   }
@@ -2848,24 +2852,70 @@ async function steerActiveSessionTurn(input: {
     console.warn('[web-client-bridge] 引导发送前事件流预连接失败，继续提交:', preflightError);
   }
   const userMessageId = generateMessageId();
-  const turnResult = await submitSessionTurn({
-    text: input.text,
-    images: [],
-    accessProfile: input.accessProfile ?? null,
-    requestId: input.requestId,
-    userMessageId,
-    steerCurrentTurn: true,
-    expectedTurnId,
-  }, {
-    workspaceId: input.workspaceId,
-    workspacePath: input.workspacePath,
-    sessionId: input.sessionId,
-  });
-  if (turnResult.steeredTurnId !== expectedTurnId) {
-    throw new Error(i18n.t('input.followUp.activeTurnUnavailable'));
+  let retriedAfterTurnMismatch = false;
+  while (true) {
+    try {
+      const turnResult = await submitSessionTurn({
+        text: input.text,
+        images: [],
+        accessProfile: input.accessProfile ?? null,
+        requestId: input.requestId,
+        userMessageId,
+        steerCurrentTurn: true,
+        expectedTurnId,
+      }, {
+        workspaceId: input.workspaceId,
+        workspacePath: input.workspacePath,
+        sessionId: input.sessionId,
+      });
+      if (turnResult.steeredTurnId !== expectedTurnId) {
+        throw new Error(i18n.t('input.followUp.activeTurnUnavailable'));
+      }
+      emitAcceptedCanonicalTurnFromResult(turnResult);
+      return true;
+    } catch (error) {
+      const retryTurnId = error instanceof AgentApiError
+        && error.status === 409
+        && error.errorCode === 'TURN_CONFLICT'
+        && error.conflictKind === 'expected_turn_mismatch'
+        && typeof error.activeTurnId === 'string'
+        && error.activeTurnId !== expectedTurnId
+        && !retriedAfterTurnMismatch
+        ? error.activeTurnId
+        : '';
+      if (!retryTurnId) {
+        throw error;
+      }
+      expectedTurnId = retryTurnId;
+      retriedAfterTurnMismatch = true;
+    }
   }
-  emitAcceptedCanonicalTurnFromResult(turnResult);
-  return true;
+}
+
+async function guideQueuedMessage(queuedMessageId: string): Promise<void> {
+  const normalizedId = queuedMessageId.trim();
+  if (!normalizedId || guidingQueuedMessageIds.has(normalizedId)) return;
+  const queued = messagesState.queuedMessages.find((message) => message.id === normalizedId);
+  if (!queued || !canGuideQueuedMessage(queued)) return;
+
+  const sessionId = trimBridgeString(queued.sessionId) || currentSessionId;
+  if (!sessionId) return;
+  guidingQueuedMessageIds.add(normalizedId);
+  try {
+    await steerActiveSessionTurn({
+      text: queuedMessageText(queued),
+      requestId: queued.requestId || queued.id,
+      workspaceId: trimBridgeString(queued.workspaceId) || currentWorkspaceId,
+      workspacePath: trimBridgeString(queued.workspacePath) || currentWorkspacePath,
+      sessionId,
+      accessProfile: queued.accessProfile ?? null,
+    });
+    removeQueuedMessage(normalizedId);
+  } catch (error) {
+    emitBridgeErrorToast(i18n.t('input.queue.guide'), error);
+  } finally {
+    guidingQueuedMessageIds.delete(normalizedId);
+  }
 }
 
 function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string): void {
@@ -2909,6 +2959,11 @@ async function drainQueuedTurns(reason: string): Promise<void> {
     if (messagesState.queuedMessages.length > 0) {
       scheduleQueuedTurnDrain(`${reason}:busy_retry`, QUEUE_DRAIN_BUSY_RETRY_MS);
     }
+    return;
+  }
+  const firstQueuedMessage = messagesState.queuedMessages[0];
+  if (firstQueuedMessage && guidingQueuedMessageIds.has(firstQueuedMessage.id)) {
+    scheduleQueuedTurnDrain(`${reason}:guidance_in_flight`, QUEUE_DRAIN_BUSY_RETRY_MS);
     return;
   }
   const next = dequeueQueuedMessage();
@@ -4245,6 +4300,11 @@ export function createWebClientBridge(): ClientBridge {
                   }>
                 : [],
             });
+          }
+          return;
+        case 'guideQueuedMessage':
+          if (typeof message.queuedMessageId === 'string') {
+            void guideQueuedMessage(message.queuedMessageId);
           }
           return;
         case 'interruptTask':

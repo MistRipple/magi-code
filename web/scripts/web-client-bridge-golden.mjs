@@ -629,6 +629,7 @@ await withGoldenViteServer(async (server) => {
   const bridgeModule = await server.ssrLoadModule('/src/shared/bridges/web-client-bridge.ts');
   const messageHandler = await server.ssrLoadModule('/src/lib/message-handler.ts');
   const messagesStore = await server.ssrLoadModule('/src/stores/messages.svelte.ts');
+  const turnStore = await server.ssrLoadModule('/src/stores/turn-store.svelte.ts');
 
   const bridge = bridgeModule.createWebClientBridge();
   bridgeRuntime.setClientBridge(bridge);
@@ -759,6 +760,163 @@ await withGoldenViteServer(async (server) => {
     false,
     'guide follow-up must not create an assistant card before the active turn continues',
   );
+
+  const staleTurnId = 'turn-bridge-live-stale-cache';
+  turnStore.replaceCanonicalSessionTurns(SESSION_ID, [{
+    sessionId: SESSION_ID,
+    turnId: staleTurnId,
+    turnSeq: ACCEPTED_AT,
+    acceptedAt: ACCEPTED_AT,
+    status: 'running',
+    items: [acceptedCanonicalUserItem()].map((item) => ({
+      ...item,
+      turnId: staleTurnId,
+    })),
+  }]);
+  const steerRaceRequestId = 'request-guide-turn-race';
+  const steerRaceStartIndex = capturedTurnBodies.length;
+  sessionTurnInterceptors.push(() => new Response(JSON.stringify({
+    error_code: 'TURN_CONFLICT',
+    message: '当前回复已经切换，请基于最新状态重新发送',
+    conflict_kind: 'expected_turn_mismatch',
+    active_turn_id: TURN_ID,
+  }), {
+    status: 409,
+    headers: { 'content-type': 'application/json' },
+  }));
+  sessionTurnInterceptors.push((_parsed, _init, body) => {
+    const canonicalItem = {
+      ...guidedCanonicalUserItem(),
+      itemId: 'user-guide-turn-race',
+      content: body.text,
+      metadata: {
+        ...guidedCanonicalUserItem().metadata,
+        requestId: body.requestId,
+        userMessageId: body.userMessageId,
+      },
+    };
+    return jsonResponse({
+      sessionId: SESSION_ID,
+      entryId: 'timeline-guide-turn-race',
+      eventId: 'event-guide-turn-race',
+      acceptedAt: ACCEPTED_AT + 550,
+      createdSession: false,
+      route: 'steer',
+      userMessageItemId: canonicalItem.itemId,
+      canonicalSchemaVersion: 'canonical-turn.v1',
+      canonicalEventKind: 'turn_item_upsert',
+      canonicalTurn: {
+        sessionId: SESSION_ID,
+        turnId: TURN_ID,
+        turnSeq: ACCEPTED_AT,
+        acceptedAt: ACCEPTED_AT,
+        status: 'running',
+        items: [acceptedCanonicalUserItem(), canonicalItem],
+      },
+      canonicalItem,
+      steeredTurnId: TURN_ID,
+    });
+  });
+  bridge.postMessage({
+    type: 'executeTask',
+    text: 'Turn ID 竞争时必须自动重试一次。',
+    requestId: steerRaceRequestId,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+    followUpMode: 'guide',
+  });
+  await waitFor(
+    () => capturedTurnBodies.length >= steerRaceStartIndex + 2,
+    'stale steer turn id must retry once with the server-reported active turn id',
+  );
+  const steerRaceBodies = capturedTurnBodies.slice(steerRaceStartIndex, steerRaceStartIndex + 2);
+  assert.deepEqual(
+    steerRaceBodies.map((body) => body.expectedTurnId),
+    [staleTurnId, TURN_ID],
+    'turn steer retry must converge from stale cached turn id to the server active turn id',
+  );
+  assert.deepEqual(
+    steerRaceBodies.map((body) => body.requestId),
+    [steerRaceRequestId, steerRaceRequestId],
+    'turn steer retry must preserve the idempotent request id',
+  );
+  assert.equal(
+    steerRaceBodies[0].userMessageId,
+    steerRaceBodies[1].userMessageId,
+    'turn steer retry must preserve the same user message id',
+  );
+  turnStore.replaceCanonicalSessionTurns(SESSION_ID, [{
+    sessionId: SESSION_ID,
+    turnId: TURN_ID,
+    turnSeq: ACCEPTED_AT,
+    acceptedAt: ACCEPTED_AT,
+    status: 'running',
+    items: [acceptedCanonicalUserItem(), guidedCanonicalUserItem()],
+  }]);
+
+  messagesStore.addPendingRequest('busy-before-queued-to-guide');
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '这条排队消息要转换成当前轮引导。',
+    requestId: 'request-queued-to-guide',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+    followUpMode: 'queue',
+  });
+  await waitFor(
+    () => messagesStore.messagesState.queuedMessages.some((message) => message.id === 'request-queued-to-guide'),
+    'busy follow-up must enter the queue before the user converts it to guidance',
+  );
+  sessionTurnInterceptors.push((_parsed, _init, body) => {
+    const canonicalItem = {
+      ...guidedCanonicalUserItem(),
+      itemId: 'user-queued-to-guide',
+      content: body.text,
+      metadata: {
+        ...guidedCanonicalUserItem().metadata,
+        requestId: body.requestId,
+      },
+    };
+    return jsonResponse({
+      sessionId: SESSION_ID,
+      entryId: 'timeline-queued-to-guide',
+      eventId: 'event-queued-to-guide',
+      acceptedAt: ACCEPTED_AT + 600,
+      createdSession: false,
+      route: 'steer',
+      userMessageItemId: canonicalItem.itemId,
+      canonicalSchemaVersion: 'canonical-turn.v1',
+      canonicalEventKind: 'turn_item_upsert',
+      canonicalTurn: {
+        sessionId: SESSION_ID,
+        turnId: TURN_ID,
+        turnSeq: ACCEPTED_AT,
+        acceptedAt: ACCEPTED_AT,
+        status: 'running',
+        items: [acceptedCanonicalUserItem(), canonicalItem],
+      },
+      canonicalItem,
+      steeredTurnId: TURN_ID,
+    });
+  });
+  bridge.postMessage({
+    type: 'guideQueuedMessage',
+    queuedMessageId: 'request-queued-to-guide',
+  });
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === 'request-queued-to-guide'),
+    'queued guidance action must immediately submit the selected message to the active turn',
+  );
+  const queuedGuidanceBody = capturedTurnBodies.find((body) => body.requestId === 'request-queued-to-guide');
+  assert.equal(queuedGuidanceBody.steerCurrentTurn, true);
+  assert.equal(queuedGuidanceBody.expectedTurnId, TURN_ID);
+  await waitFor(
+    () => !messagesStore.messagesState.queuedMessages.some((message) => message.id === 'request-queued-to-guide'),
+    'successfully guided message must leave the independent turn queue',
+  );
+  messagesStore.clearPendingRequest('busy-before-queued-to-guide');
 
   const streamCountBeforeActiveIdleCheck = FakeEventSource.instances.length;
   const originalDateNowForActiveIdleCheck = Date.now;

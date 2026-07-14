@@ -1,5 +1,44 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { createUpdateManifest } from './generate-update-manifest.mjs';
+
+const releaseWorkflow = fs.readFileSync(path.resolve('../.github/workflows/release.yml'), 'utf8');
+
+assert.doesNotMatch(
+  releaseWorkflow,
+  /dist\/release-assets\/normalized/,
+  'release workflow must keep one authoritative release-assets directory',
+);
+assert.match(
+  releaseWorkflow,
+  /--output dist\/release-assets\/latest\.json/,
+  'release workflow must generate latest.json beside the release assets',
+);
+assert.match(
+  releaseWorkflow,
+  /files: dist\/release-assets\/\*/,
+  'GitHub Release must upload installers, updater archives, signatures, and latest.json',
+);
+assert.match(
+  releaseWorkflow,
+  /notes_file="\.github\/releases\/\$\{tag\}\.md"/,
+  'release workflow must read the versioned product release notes',
+);
+assert.doesNotMatch(
+  releaseWorkflow,
+  /git log|release-changes\.md|previous_tag/,
+  'release notes must not expose raw commit history',
+);
+assert.match(
+  releaseWorkflow,
+  /- name: 构建桌面安装包\n\s+shell: bash\n\s+env:/,
+  'cross-platform desktop packaging must use bash for its shell script',
+);
+
+const releaseNotes = fs.readFileSync(path.resolve('../.github/releases/v3.0.1.md'), 'utf8');
+assert.match(releaseNotes, /Turn ID/, '3.0.1 notes must explain the Turn ID race convergence');
+assert.match(releaseNotes, /Windows|macOS|Linux/, '3.0.1 notes must explain desktop delivery scope');
 
 const manifest = createUpdateManifest({
   version: '3.0.1',

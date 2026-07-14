@@ -8,6 +8,8 @@
     messagesState,
     removeQueuedMessage,
   } from '../stores/messages.svelte';
+  import { canGuideQueuedMessage } from '../lib/queued-message-guidance';
+  import type { QueuedMessage } from '../types/message';
   import { getAgentRunState, refreshAgentRunProjection } from '../stores/agent-run-store.svelte';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
   import {
@@ -18,6 +20,7 @@
     saveAgentOrchestratorSessionConfig,
     fetchWorkspaceBranches,
     checkoutWorkspaceBranch,
+    browseAgentDirectory,
     type AgentSettingsBootstrapSnapshot,
     type WorkspaceVcsStatus,
     settingsBootstrapMatchesCurrentWorkspace,
@@ -57,6 +60,11 @@
     type ComposerContextReference,
     type ComposerContextReferenceKind,
   } from '../lib/composer-context-references';
+  import {
+    DESKTOP_CONTEXT_DROP_EVENT,
+    normalizeDesktopDropPaths,
+    resolveDesktopDroppedPath,
+  } from '../lib/desktop-file-drop';
 
   interface SelectedImage {
     id: string;
@@ -202,8 +210,12 @@
   const workspaceOptions = $derived.by(() => composerWorkspaceState.workspaces);
   const agentRunState = $derived(getAgentRunState(currentSessionId, currentWorkspaceId));
 
+  function currentComposerReferenceScopeKey(): string {
+    return `${currentWorkspaceId ?? ''}\u0000${currentSessionId ?? ''}`;
+  }
+
   $effect(() => {
-    const nextScopeKey = `${currentWorkspaceId ?? ''}\u0000${currentSessionId ?? ''}`;
+    const nextScopeKey = currentComposerReferenceScopeKey();
     if (!composerReferenceScopeKey) {
       composerReferenceScopeKey = nextScopeKey;
       return;
@@ -661,17 +673,65 @@
     name: string,
     kind: ComposerContextReferenceKind,
   ) {
-    const next = addComposerContextReference(selectedContextReferences, { kind, path, name });
+    addContextReference({ kind, path, name });
+    contextPickerOpen = false;
+    queueMicrotask(focusEditor);
+  }
+
+  function addContextReference(input: {
+    kind: ComposerContextReferenceKind;
+    path: string;
+    name: string;
+  }): boolean {
+    const next = addComposerContextReference(selectedContextReferences, input);
     if (next === selectedContextReferences) {
       if (selectedContextReferences.length >= MAX_COMPOSER_CONTEXT_REFERENCES) {
         addToast('warning', i18n.t('input.add.contextLimit', {
           max: MAX_COMPOSER_CONTEXT_REFERENCES,
         }));
       }
+      return false;
     } else {
       selectedContextReferences = next;
     }
-    contextPickerOpen = false;
+    return true;
+  }
+
+  async function handleDesktopContextDrop(event: Event): Promise<void> {
+    const paths = (event as CustomEvent<{ paths?: unknown }>).detail?.paths;
+    if (!Array.isArray(paths)) return;
+    const dropScopeKey = currentComposerReferenceScopeKey();
+    const remaining = MAX_COMPOSER_CONTEXT_REFERENCES - selectedContextReferences.length;
+    if (remaining <= 0) {
+      addToast('warning', i18n.t('input.add.contextLimit', {
+        max: MAX_COMPOSER_CONTEXT_REFERENCES,
+      }));
+      return;
+    }
+    const droppedPaths = normalizeDesktopDropPaths(
+      paths.filter((path): path is string => typeof path === 'string'),
+      selectedContextReferences.map((reference) => reference.path),
+    );
+    for (const path of droppedPaths) {
+      if (currentComposerReferenceScopeKey() !== dropScopeKey) return;
+      if (selectedContextReferences.length >= MAX_COMPOSER_CONTEXT_REFERENCES) {
+        addToast('warning', i18n.t('input.add.contextLimit', {
+          max: MAX_COMPOSER_CONTEXT_REFERENCES,
+        }));
+        break;
+      }
+      try {
+        const result = await browseAgentDirectory(path);
+        if (currentComposerReferenceScopeKey() !== dropScopeKey) return;
+        const reference = resolveDesktopDroppedPath(path, result);
+        if (reference) addContextReference(reference);
+      } catch (error) {
+        console.warn(`[InputArea] 无法添加拖入的上下文路径(${path}):`, error);
+        addToast('error', i18n.t('input.add.contextDropFailed', {
+          name: path.split(/[\\/]/u).filter(Boolean).pop() || path,
+        }));
+      }
+    }
     queueMicrotask(focusEditor);
   }
 
@@ -813,10 +873,12 @@
     }
     window.addEventListener('magi:fillComposer', handleFillComposer as EventListener);
     window.addEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
+    window.addEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
     document.addEventListener('pointerdown', handlePickerOutsidePointerDown, true);
     return () => {
       window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
       window.removeEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
+      window.removeEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
       document.removeEventListener('pointerdown', handlePickerOutsidePointerDown, true);
     };
   });
@@ -1081,6 +1143,21 @@
     const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
     if (!normalizedId) return;
     removeQueuedMessage(normalizedId);
+  }
+
+  function canGuideQueued(queued: QueuedMessage): boolean {
+    return canGuideCurrentTurn
+      && queued.sessionId?.trim() === currentSessionId?.trim()
+      && canGuideQueuedMessage(queued);
+  }
+
+  function guideQueuedMessage(queuedMessageId: string): void {
+    const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
+    if (!normalizedId) return;
+    vscode.postMessage({
+      type: 'guideQueuedMessage',
+      queuedMessageId: normalizedId,
+    });
   }
 
   // 修改：取出排队消息内容回填到输入框，并从队列移除；用户重新点击发送后会按当前会话状态再次进入排队。
@@ -1668,10 +1745,22 @@
       </div>
       <div class="ia-queue-list">
         {#each queuedMessages as queued, index (queued.id)}
+          {@const guideAvailable = canGuideQueued(queued)}
           <div class="ia-queue-item">
             <span class="ia-queue-index">{index + 1}</span>
             <div class="ia-queue-content" title={queued.content}>{queued.content}</div>
             <div class="ia-queue-actions">
+              <button
+                type="button"
+                class="ia-queue-action ia-queue-guide"
+                disabled={!guideAvailable}
+                onclick={() => guideQueuedMessage(queued.id)}
+                title={i18n.t(guideAvailable ? 'input.queue.guideTitle' : 'input.queue.guideUnavailable')}
+                aria-label={i18n.t(guideAvailable ? 'input.queue.guideTitle' : 'input.queue.guideUnavailable')}
+              >
+                <Icon name="undo" size={12} />
+                <span>{i18n.t('input.queue.guide')}</span>
+              </button>
               <button
                 type="button"
                 class="ia-queue-action"
@@ -3481,6 +3570,7 @@
     gap: 4px;
     margin-top: 0;
     opacity: 0;
+    pointer-events: none;
     transform: translateX(3px);
     transition: opacity 120ms ease, transform 120ms ease;
   }
@@ -3488,6 +3578,7 @@
   .ia-queue-item:hover .ia-queue-actions,
   .ia-queue-item:focus-within .ia-queue-actions {
     opacity: 1;
+    pointer-events: auto;
     transform: translateX(0);
   }
 
@@ -3506,6 +3597,19 @@
     transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
   }
 
+  .ia-queue-guide {
+    width: auto;
+    min-width: 48px;
+    gap: 4px;
+    padding: 0 7px;
+    border-radius: var(--radius-sm);
+  }
+
+  .ia-queue-guide:disabled {
+    cursor: not-allowed;
+    opacity: 0.42;
+  }
+
   .ia-queue-action:hover {
     background: color-mix(in srgb, var(--primary) 14%, transparent);
     border-color: color-mix(in srgb, var(--primary) 40%, transparent);
@@ -3521,6 +3625,7 @@
   @media (hover: none) {
     .ia-queue-actions {
       opacity: 1;
+      pointer-events: auto;
       transform: none;
     }
   }

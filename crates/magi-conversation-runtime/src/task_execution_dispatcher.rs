@@ -2004,6 +2004,8 @@ mod tests {
                 updated_at: UtcMillis(1),
                 message_count: None,
                 workspace_id: Some(workspace_id.to_string()),
+                last_completed_at: None,
+                last_viewed_at: None,
             }],
             timeline: vec![magi_session_store::TimelineEntry {
                 entry_id: "timeline-context-prompt".to_string(),

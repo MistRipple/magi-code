@@ -28,6 +28,19 @@ pub struct SessionRecord {
     pub message_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_completed_at: Option<UtcMillis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_viewed_at: Option<UtcMillis>,
+}
+
+impl SessionRecord {
+    pub fn has_unread_completion(&self) -> bool {
+        self.last_completed_at.is_some_and(|completed_at| {
+            self.last_viewed_at
+                .is_none_or(|viewed_at| completed_at > viewed_at)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

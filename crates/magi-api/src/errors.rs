@@ -31,6 +31,12 @@ pub enum ApiError {
     InternalAssemblyError(String),
     /// 资源状态冲突（如 runner 已启动）
     Conflict(String),
+    /// 当前 Turn 前置条件冲突。携带服务端权威 Turn ID，供客户端仅重试一次。
+    TurnConflict {
+        message: String,
+        conflict_kind: String,
+        active_turn_id: Option<String>,
+    },
 }
 
 /// 对外统一错误响应 DTO
@@ -42,6 +48,10 @@ pub struct ErrorResponseDto {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conflict_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_turn_id: Option<String>,
 }
 
 impl ApiError {
@@ -69,6 +79,18 @@ impl ApiError {
         Self::Conflict(format!("{}: {}", context, id))
     }
 
+    pub fn turn_conflict(
+        conflict_kind: impl Into<String>,
+        active_turn_id: Option<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::TurnConflict {
+            message: message.into(),
+            conflict_kind: conflict_kind.into(),
+            active_turn_id,
+        }
+    }
+
     pub fn invalid_request_body(err: impl Display) -> Self {
         Self::InvalidRequestBody(format!("请求体解析失败: {}", err))
     }
@@ -83,6 +105,7 @@ impl ApiError {
             ApiError::ModelInvocationFailed(_) => "MODEL_INVOCATION_FAILED",
             ApiError::InternalAssemblyError(_) => "INTERNAL_ASSEMBLY_ERROR",
             ApiError::Conflict(_) => "CONFLICT",
+            ApiError::TurnConflict { .. } => "TURN_CONFLICT",
         }
     }
 
@@ -96,6 +119,7 @@ impl ApiError {
             ApiError::ModelInvocationFailed(_) => StatusCode::BAD_GATEWAY,
             ApiError::InternalAssemblyError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::TurnConflict { .. } => StatusCode::CONFLICT,
         }
     }
 
@@ -109,6 +133,7 @@ impl ApiError {
             ApiError::ModelInvocationFailed(message) => message,
             ApiError::InternalAssemblyError(message) => message,
             ApiError::Conflict(message) => message,
+            ApiError::TurnConflict { message, .. } => message,
         }
     }
 
@@ -129,6 +154,17 @@ impl ApiError {
                 | ApiError::InternalAssemblyError(_)
         )
     }
+
+    fn turn_conflict_context(&self) -> (Option<String>, Option<String>) {
+        match self {
+            ApiError::TurnConflict {
+                conflict_kind,
+                active_turn_id,
+                ..
+            } => (Some(conflict_kind.clone()), active_turn_id.clone()),
+            _ => (None, None),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -137,6 +173,7 @@ impl IntoResponse for ApiError {
         let error_code = self.error_code();
         let private_message = self.message().to_string();
         let public_message = self.public_message().to_string();
+        let (conflict_kind, active_turn_id) = self.turn_conflict_context();
         if self.hides_private_message() {
             tracing::warn!(
                 error_code,
@@ -148,6 +185,8 @@ impl IntoResponse for ApiError {
             error_code: error_code.to_string(),
             message: public_message,
             detail: None,
+            conflict_kind,
+            active_turn_id,
         };
         (status, Json(body)).into_response()
     }
@@ -244,6 +283,15 @@ mod tests {
             ApiError::InternalAssemblyError("boom".into()).error_code(),
             "INTERNAL_ASSEMBLY_ERROR"
         );
+        assert_eq!(
+            ApiError::turn_conflict(
+                "expected_turn_mismatch",
+                Some("turn-current".to_string()),
+                "当前回复已经切换",
+            )
+            .error_code(),
+            "TURN_CONFLICT"
+        );
     }
 
     #[test]
@@ -289,6 +337,8 @@ mod tests {
             error_code: "INPUT_INVALID".to_string(),
             message: "bad request".to_string(),
             detail: None,
+            conflict_kind: None,
+            active_turn_id: None,
         };
         let json = serde_json::to_string(&dto).unwrap();
         assert!(!json.contains("detail"));
@@ -300,10 +350,32 @@ mod tests {
             error_code: "INPUT_INVALID".to_string(),
             message: "bad request".to_string(),
             detail: Some("field 'text' is required".to_string()),
+            conflict_kind: None,
+            active_turn_id: None,
         };
         let json = serde_json::to_string(&dto).unwrap();
         assert!(json.contains("detail"));
         assert!(json.contains("field 'text' is required"));
+    }
+
+    #[test]
+    fn turn_conflict_response_exposes_structured_retry_context() {
+        let response = ApiError::turn_conflict(
+            "expected_turn_mismatch",
+            Some("turn-current".to_string()),
+            "当前回复已经切换，请基于最新状态重新发送",
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should create");
+        let bytes = runtime
+            .block_on(to_bytes(response.into_body(), 16 * 1024))
+            .expect("error response body should read");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("error response should be json");
+        assert_eq!(payload["error_code"], "TURN_CONFLICT");
+        assert_eq!(payload["conflict_kind"], "expected_turn_mismatch");
+        assert_eq!(payload["active_turn_id"], "turn-current");
     }
 
     #[test]

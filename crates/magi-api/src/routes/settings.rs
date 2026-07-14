@@ -1626,6 +1626,8 @@ mod tests {
             updated_at: now,
             message_count: None,
             workspace_id: Some(workspace_id.to_string()),
+            last_completed_at: None,
+            last_viewed_at: None,
         }
     }
 

@@ -519,6 +519,26 @@ fn upsert_runtime_sidecar_in_state(state: &mut SessionStoreState, sidecar: Sessi
     }
 }
 
+fn record_session_completion(
+    state: &mut SessionStoreState,
+    session_id: &SessionId,
+    completed_at: UtcMillis,
+) {
+    let Some(session) = state
+        .sessions
+        .iter_mut()
+        .find(|session| &session.session_id == session_id)
+    else {
+        return;
+    };
+    if session
+        .last_completed_at
+        .is_none_or(|last_completed_at| completed_at > last_completed_at)
+    {
+        session.last_completed_at = Some(completed_at);
+    }
+}
+
 fn append_item_to_current_turn(
     sidecar: &mut SessionRuntimeSidecar,
     mut item: ActiveExecutionTurnItem,
@@ -1801,6 +1821,14 @@ impl SessionStore {
                 sidecar.updated_at = UtcMillis::now();
                 Some(sidecar.clone())
             };
+            let completed_at = updated
+                .as_ref()
+                .and_then(|sidecar| sidecar.current_turn.as_ref())
+                .filter(|turn| turn.status == "completed")
+                .and_then(|turn| turn.completed_at);
+            if let Some(completed_at) = completed_at {
+                record_session_completion(&mut state, session_id, completed_at);
+            }
             if let Some(updated) = updated.as_ref()
                 && let Some(turn) = updated.current_turn.as_ref()
             {
@@ -1868,6 +1896,13 @@ impl SessionStore {
                 sidecar.updated_at = UtcMillis::now();
                 Some(sidecar.clone())
             };
+            if let Some(completed_at) = updated
+                .as_ref()
+                .and_then(|sidecar| sidecar.current_turn.as_ref())
+                .and_then(|turn| turn.completed_at)
+            {
+                record_session_completion(&mut state, session_id, completed_at);
+            }
             if let Some(updated) = updated.as_ref()
                 && let Some(turn) = updated.current_turn.as_ref()
             {

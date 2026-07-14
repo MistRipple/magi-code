@@ -2081,6 +2081,8 @@ mod tests {
                 updated_at: ts(2000),
                 message_count: None,
                 workspace_id: None,
+                last_completed_at: None,
+                last_viewed_at: None,
             }],
             timeline: vec![
                 TimelineEntry {
@@ -2319,6 +2321,8 @@ mod tests {
                 updated_at: ts(2_000),
                 message_count: None,
                 workspace_id: None,
+                last_completed_at: None,
+                last_viewed_at: None,
             }],
             timeline: Vec::new(),
             canonical_turns,

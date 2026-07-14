@@ -208,6 +208,8 @@ impl SessionStore {
             updated_at: created_at,
             message_count: None,
             workspace_id: workspace_id.clone(),
+            last_completed_at: None,
+            last_viewed_at: None,
         };
         state.sessions.push(session.clone());
         state.current_session_id = Some(session_id.clone());
@@ -223,6 +225,33 @@ impl SessionStore {
             observer.on_session_created(&session_id, workspace_id.as_deref());
         }
         Ok(session)
+    }
+
+    pub fn mark_session_viewed(&self, session_id: &SessionId) -> DomainResult<SessionRecord> {
+        self.mark_session_viewed_at(session_id, UtcMillis::now())
+    }
+
+    pub fn mark_session_viewed_at(
+        &self,
+        session_id: &SessionId,
+        viewed_at: UtcMillis,
+    ) -> DomainResult<SessionRecord> {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        let session = state
+            .sessions
+            .iter_mut()
+            .find(|session| &session.session_id == session_id)
+            .ok_or(DomainError::NotFound { entity: "session" })?;
+        if session
+            .last_viewed_at
+            .is_none_or(|last_viewed_at| viewed_at > last_viewed_at)
+        {
+            session.last_viewed_at = Some(viewed_at);
+        }
+        Ok(session.clone())
     }
 
     /// 按 workspace_id 过滤返回会话列表，按更新时间倒序排序（最近活跃在前）。

@@ -4,7 +4,31 @@ import path from 'node:path';
 import { withGoldenViteServer } from './golden-vite.mjs';
 
 const appSource = fs.readFileSync(path.resolve('src/App.svelte'), 'utf8');
+const promptSource = fs.readFileSync(path.resolve('src/components/DesktopUpdatePrompt.svelte'), 'utf8');
 assert.match(appSource, /DesktopUpdatePrompt/, 'desktop startup must mount the update prompt');
+assert.match(
+  promptSource,
+  /setTimeout\(\(\) => void checkForUpdate\(\), 1200\)/,
+  'desktop startup must perform a non-blocking update check',
+);
+const checkFunctionSource = promptSource.match(
+  /async function checkForUpdate[\s\S]*?(?=\n  async function installUpdate)/,
+)?.[0] ?? '';
+assert.match(
+  checkFunctionSource,
+  /catch(?: \([^)]*\))? \{[\s\S]*?promptState = 'idle'[\s\S]*?error = ''/,
+  'update discovery failures must remain silent instead of showing a startup error prompt',
+);
+assert.doesNotMatch(
+  checkFunctionSource,
+  /promptState = 'error'/,
+  'only update installation failures may use the global desktop update error prompt',
+);
+assert.match(
+  promptSource,
+  /promptState === 'error'[\s\S]*?onclick=\{\(\) => void installUpdate\(\)\}/,
+  'installation failures must retry installation instead of repeating update discovery',
+);
 
 await withGoldenViteServer(async (server) => {
   const updater = await server.ssrLoadModule('/src/lib/desktop-updater.ts');

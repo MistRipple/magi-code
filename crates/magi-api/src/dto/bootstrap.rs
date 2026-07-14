@@ -446,6 +446,8 @@ mod tests {
             updated_at: now,
             message_count: None,
             workspace_id: None,
+            last_completed_at: None,
+            last_viewed_at: None,
         }
     }
 

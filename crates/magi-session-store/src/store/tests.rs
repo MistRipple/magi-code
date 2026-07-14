@@ -860,6 +860,152 @@ fn current_turn_writes_update_durable_canonical_turn_log() {
 }
 
 #[test]
+fn completed_current_turn_marks_session_completion_unread() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-unread-completion");
+    store
+        .create_session(session_id.clone(), "Unread Completion")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn("turn-unread-completion", "running", 10),
+        )
+        .expect("running turn should upsert");
+
+    store
+        .update_current_turn_status(&session_id, "completed")
+        .expect("turn should complete");
+
+    let session = store.session(&session_id).expect("session should exist");
+    assert!(session.last_completed_at.is_some());
+    assert!(session.has_unread_completion());
+}
+
+#[test]
+fn completed_root_task_marks_session_completion_unread() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-root-task-unread-completion");
+    store
+        .create_session(session_id.clone(), "Root Task Unread Completion")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn("turn-root-task-unread-completion", "running", 10),
+        )
+        .expect("running turn should upsert");
+
+    store
+        .complete_current_turn_from_completed_root_task(&session_id)
+        .expect("root task should complete current turn");
+
+    let session = store.session(&session_id).expect("session should exist");
+    assert!(session.last_completed_at.is_some());
+    assert!(session.has_unread_completion());
+}
+
+#[test]
+fn marking_session_viewed_clears_unread_completion_and_survives_restore() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-viewed-completion");
+    store
+        .create_session(session_id.clone(), "Viewed Completion")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn("turn-viewed-completion", "running", 10),
+        )
+        .expect("running turn should upsert");
+    store
+        .update_current_turn_status(&session_id, "completed")
+        .expect("turn should complete");
+    let completed_at = store
+        .session(&session_id)
+        .and_then(|session| session.last_completed_at)
+        .expect("completion timestamp should exist");
+
+    store
+        .mark_session_viewed_at(&session_id, UtcMillis(completed_at.0.saturating_add(1)))
+        .expect("session should be marked viewed");
+
+    let session = store.session(&session_id).expect("session should exist");
+    assert_eq!(
+        session.last_viewed_at,
+        Some(UtcMillis(completed_at.0.saturating_add(1)))
+    );
+    assert!(!session.has_unread_completion());
+
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        store.execution_sidecar_store_state(),
+    );
+    let restored_session = restored
+        .session(&session_id)
+        .expect("session should restore");
+    assert_eq!(restored_session.last_completed_at, Some(completed_at));
+    assert_eq!(restored_session.last_viewed_at, session.last_viewed_at);
+    assert!(!restored_session.has_unread_completion());
+}
+
+#[test]
+fn failed_current_turn_does_not_mark_successful_completion_unread() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-failed-no-unread-completion");
+    store
+        .create_session(session_id.clone(), "Failed Completion")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn("turn-failed-no-unread-completion", "running", 10),
+        )
+        .expect("running turn should upsert");
+
+    store
+        .update_current_turn_status(&session_id, "failed")
+        .expect("turn should fail");
+
+    let session = store.session(&session_id).expect("session should exist");
+    assert_eq!(session.last_completed_at, None);
+    assert!(!session.has_unread_completion());
+}
+
+#[test]
+fn replaying_completed_current_turn_keeps_original_completion_read_state() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-completed-replay-idempotent");
+    store
+        .create_session(session_id.clone(), "Completed Replay")
+        .expect("session should be creatable");
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn("turn-completed-replay", "running", 10),
+        )
+        .expect("running turn should upsert");
+    store
+        .update_current_turn_status(&session_id, "completed")
+        .expect("turn should complete");
+    let completed_at = store
+        .session(&session_id)
+        .and_then(|session| session.last_completed_at)
+        .expect("completion timestamp should exist");
+    store
+        .mark_session_viewed_at(&session_id, UtcMillis(completed_at.0.saturating_add(1)))
+        .expect("session should be marked viewed");
+
+    store
+        .update_current_turn_status(&session_id, "completed")
+        .expect("completed replay should remain valid");
+
+    let session = store.session(&session_id).expect("session should exist");
+    assert_eq!(session.last_completed_at, Some(completed_at));
+    assert!(!session.has_unread_completion());
+}
+
+#[test]
 fn current_turn_hides_runtime_internal_tool_calls_in_durable_canonical_log() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-durable-internal-tool-hidden");

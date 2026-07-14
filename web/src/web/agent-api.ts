@@ -74,6 +74,7 @@ export interface AgentSessionSummary {
   messageCount?: number;
   isRunning?: boolean;
   runningTaskCount?: number;
+  hasUnreadCompletion?: boolean;
   preview?: string;
 }
 
@@ -115,6 +116,7 @@ interface RawAgentSessionSummary {
   messageCount?: number;
   isRunning?: boolean;
   runningTaskCount?: number;
+  hasUnreadCompletion?: boolean;
   preview?: string | null;
 }
 
@@ -407,13 +409,24 @@ export class AgentApiError extends Error {
   readonly status: number;
   readonly action: string;
   readonly errorCode?: string;
+  readonly conflictKind?: string;
+  readonly activeTurnId?: string;
 
-  constructor(status: number, message: string, action: string, errorCode?: string) {
+  constructor(
+    status: number,
+    message: string,
+    action: string,
+    errorCode?: string,
+    conflictKind?: string,
+    activeTurnId?: string,
+  ) {
     super(message);
     this.name = 'AgentApiError';
     this.status = status;
     this.action = action;
     this.errorCode = errorCode;
+    this.conflictKind = conflictKind;
+    this.activeTurnId = activeTurnId;
   }
 }
 
@@ -501,6 +514,7 @@ function normalizeSessionSummary(raw: RawAgentSessionSummary): AgentSessionSumma
   const messageCount = raw.messageCount;
   const runningTaskCount = raw.runningTaskCount;
   const isRunning = raw.isRunning;
+  const hasUnreadCompletion = raw.hasUnreadCompletion;
   return {
     id,
     ...(workspaceId ? { workspaceId } : {}),
@@ -510,6 +524,7 @@ function normalizeSessionSummary(raw: RawAgentSessionSummary): AgentSessionSumma
     ...(typeof messageCount === 'number' ? { messageCount } : {}),
     ...(typeof isRunning === 'boolean' ? { isRunning } : {}),
     ...(typeof runningTaskCount === 'number' ? { runningTaskCount: Math.max(0, Math.floor(runningTaskCount)) } : {}),
+    ...(typeof hasUnreadCompletion === 'boolean' ? { hasUnreadCompletion } : {}),
     ...(preview ? { preview } : {}),
   };
 }
@@ -591,10 +606,19 @@ async function parseAgentJson<T>(response: Response, action: string): Promise<T>
   if (!response.ok) {
     let backendError: string | null = null;
     let backendErrorCode: string | undefined;
+    let conflictKind: string | undefined;
+    let activeTurnId: string | undefined;
     const contentType = response.headers.get('content-type') || '';
     if (contentType.includes('application/json')) {
       try {
-        const payload = await response.json() as { error?: string; message?: string; error_code?: string; code?: string };
+        const payload = await response.json() as {
+          error?: string;
+          message?: string;
+          error_code?: string;
+          code?: string;
+          conflict_kind?: string;
+          active_turn_id?: string;
+        };
         if (typeof payload?.error === 'string' && payload.error.trim()) {
           backendError = payload.error.trim();
         } else if (typeof payload?.message === 'string' && payload.message.trim()) {
@@ -606,6 +630,12 @@ async function parseAgentJson<T>(response: Response, action: string): Promise<T>
         if (rawErrorCode) {
           backendErrorCode = rawErrorCode;
         }
+        conflictKind = typeof payload?.conflict_kind === 'string' && payload.conflict_kind.trim()
+          ? payload.conflict_kind.trim()
+          : undefined;
+        activeTurnId = typeof payload?.active_turn_id === 'string' && payload.active_turn_id.trim()
+          ? payload.active_turn_id.trim()
+          : undefined;
       } catch {
         // ignore malformed error payload and fallback to generic message
       }
@@ -615,6 +645,8 @@ async function parseAgentJson<T>(response: Response, action: string): Promise<T>
       backendError || `${action} failed: ${response.status}`,
       action,
       backendErrorCode,
+      conflictKind,
+      activeTurnId,
     );
   }
 
@@ -1053,6 +1085,18 @@ export async function deleteAgentSession(
     '/api/session/delete',
     { sessionId },
     'delete session',
+    bindingOverride,
+  );
+}
+
+export async function markAgentSessionViewed(
+  sessionId: string,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<{ sessionId: string; hasUnreadCompletion: boolean }> {
+  return await postWorkspaceBoundJson<{ sessionId: string; hasUnreadCompletion: boolean }>(
+    '/api/workspaces/sessions/viewed',
+    { sessionId },
+    'mark session viewed',
     bindingOverride,
   );
 }

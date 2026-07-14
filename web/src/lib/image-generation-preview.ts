@@ -11,6 +11,21 @@ export function isImageGenerationTool(toolName: string): boolean {
   return parseToolIdentity(toolName).baseName === 'image_generate';
 }
 
+export function imageGenerationAspectRatio(input: unknown): string {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return '1 / 1';
+  const size = typeof (input as Record<string, unknown>).size === 'string'
+    ? (input as Record<string, unknown>).size as string
+    : '';
+  const match = size.trim().match(/^(\d{2,5})\s*[x×]\s*(\d{2,5})$/i);
+  if (!match) return '1 / 1';
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return '1 / 1';
+  }
+  return `${width} / ${height}`;
+}
+
 export function parseImageGenerationPreview(
   toolName: string,
   content: unknown,

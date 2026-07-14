@@ -100,7 +100,10 @@
   function getBuiltinToolLabel(name: string): string {
     const key = builtinToolI18nKey(name);
     const translated = key ? i18n.t(key) : '';
-    return translated && translated !== key ? translated : formatBuiltinToolFallbackLabel(name);
+    if (translated && translated !== key) return translated;
+    return i18n.locale === 'zh-CN'
+      ? i18n.t('settings.tools.builtin.unknown')
+      : formatBuiltinToolFallbackLabel(name);
   }
 
   function getBuiltinToolAccessLabel(accessMode: string): string {
@@ -622,7 +625,7 @@
             </div>
           </div>
           {#if builtinExpanded}
-            <div class="tools-fixed-panel tools-fixed-panel--builtin" style="margin-top: 12px;">
+            <div class="tools-fixed-panel tools-fixed-panel--builtin builtin-tool-panel">
               {#if builtinTools.length === 0}
                 <div class="empty-state">
                   <Icon name="tools" size={48} />
@@ -632,19 +635,17 @@
                 <div class="builtin-tool-list">
                   {#each builtinTools as tool (tool.name)}
                     <div class="builtin-tool-row">
-                      <div class="brand-group">
-                        <div class="avatar-squircle" style="background: rgba(var(--primary-rgb, 0, 122, 255), 0.12); color: var(--primary);">
-                          <Icon name={tool.name.includes('process') || tool.name.includes('shell') ? 'terminal' : 'tools'} size={13} />
-                        </div>
-                        <div class="identity-stack">
-                          <span
-                            class="main-label"
-                            title={`${getBuiltinToolLabel(tool.name)} · ${tool.name}`}
-                          >
-                            {getBuiltinToolLabel(tool.name)}
-                          </span>
-                          <span class="tool-code">{getBuiltinToolScopeLabel(tool)}</span>
-                        </div>
+                      <div class="avatar-squircle builtin-tool-avatar" style="background: rgba(var(--primary-rgb, 0, 122, 255), 0.12); color: var(--primary);">
+                        <Icon name={tool.name.includes('process') || tool.name.includes('shell') ? 'terminal' : 'tools'} size={13} />
+                      </div>
+                      <div class="builtin-tool-identity">
+                        <span
+                          class="builtin-tool-name"
+                          title={`${getBuiltinToolLabel(tool.name)} · ${tool.name}`}
+                        >
+                          {getBuiltinToolLabel(tool.name)}
+                        </span>
+                        <span class="tool-code" title={getBuiltinToolScopeLabel(tool)}>{getBuiltinToolScopeLabel(tool)}</span>
                       </div>
                       <div class="builtin-tool-badges">
                         <span class="tool-badge">{getBuiltinToolAccessLabel(tool.accessMode)}</span>
@@ -1124,37 +1125,73 @@
 
   .builtin-tool-list {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-    gap: 8px;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .builtin-tool-panel {
+    margin-top: 8px;
   }
 
   .builtin-tool-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: 26px minmax(0, 1fr) auto;
     align-items: center;
-    justify-content: space-between;
-    gap: 10px;
+    gap: 7px;
     min-width: 0;
-    padding: 10px 12px;
+    min-height: 46px;
+    padding: 5px 8px;
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: 10px;
     background: rgba(var(--foreground-rgb), 0.035);
   }
 
+  .builtin-tool-avatar {
+    width: 24px;
+    height: 24px;
+    align-self: center;
+  }
+
+  .builtin-tool-identity {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .builtin-tool-name {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--foreground);
+    font-size: 13px;
+    font-weight: 650;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .tool-code {
-    font-size: 10px;
+    min-width: 0;
+    overflow: hidden;
+    font-size: 9.5px;
     color: var(--foreground-muted);
-    font-family: var(--font-mono);
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .builtin-tool-badges {
     display: flex;
     align-items: center;
-    gap: 6px;
-    flex-shrink: 0;
+    justify-content: flex-end;
+    flex-wrap: nowrap;
+    gap: 4px;
+    min-width: 0;
   }
 
   .tool-badge {
-    padding: 2px 6px;
+    padding: 1px 5px;
     border-radius: 999px;
     background: rgba(var(--foreground-rgb), 0.06);
     color: var(--foreground-muted);
@@ -1172,6 +1209,31 @@
     font-size: 10px;
     color: var(--foreground-muted);
     white-space: nowrap;
+  }
+
+  @container tools-tab (max-width: 1120px) {
+    .builtin-tool-list {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  @container tools-tab (max-width: 680px) {
+    .builtin-tool-list {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  @container tools-tab (max-width: 560px) {
+    .builtin-tool-row {
+      grid-template-columns: 26px minmax(0, 1fr);
+      min-height: 56px;
+    }
+
+    .builtin-tool-badges {
+      grid-column: 2;
+      justify-content: flex-start;
+      flex-wrap: wrap;
+    }
   }
 
   .mcp-tools-popover {
