@@ -831,9 +831,8 @@ await withGoldenViteServer(async (server) => {
       () => currentSessionSummary(messagesStore)?.isRunning === true,
       'tunnel busy sync must apply the running workspace session summary',
     );
-    assert.equal(
-      messagesStore.messagesState.isProcessing,
-      true,
+    await waitFor(
+      () => messagesStore.messagesState.isProcessing === true,
       'backend running summary must preserve the public tunnel processing state',
     );
     await new Promise((resolve) => setTimeout(resolve, 0));
