@@ -982,6 +982,7 @@ fn terminate_process_group(child: &mut Child) {
         let process_group = format!("-{}", child.id());
         let _ = std_command("kill")
             .arg("-TERM")
+            .arg("--")
             .arg(&process_group)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -989,6 +990,7 @@ fn terminate_process_group(child: &mut Child) {
         thread::sleep(Duration::from_millis(50));
         let _ = std_command("kill")
             .arg("-KILL")
+            .arg("--")
             .arg(&process_group)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
