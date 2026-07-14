@@ -9,6 +9,6 @@ mod types;
 #[cfg(test)]
 mod tests;
 
-pub use app::Daemon;
+pub use app::{Daemon, DaemonHandle};
 pub use config::{DaemonConfig, DaemonError};
 pub use types::{DaemonMaintenanceMode, DaemonMaintenancePolicyProfile, DaemonRuntimeStatus};

@@ -3,6 +3,7 @@
   import App from '../App.svelte';
   import { setWebSidebarContext } from './sidebar-context';
   import Icon from '../components/Icon.svelte';
+  import MagiWordmark from '../components/MagiWordmark.svelte';
   import Modal from '../components/Modal.svelte';
   import { runActionWithFeedback } from '../lib/action-feedback';
   import type { IconName } from '../lib/icons';
@@ -1235,11 +1236,15 @@
     }
   }
 
-  function openRightPaneFromHeader(): void {
-    if (sidebarIsDrawer) {
+  function toggleRightPaneFromHeader(): void {
+    const scopeKey = rightPaneState.activeScopeKey;
+    if (!scopeKey) {
+      return;
+    }
+    if (!rightPaneVisible && sidebarIsDrawer) {
       sidebarOpen = false;
     }
-    setRightPaneCollapsed(rightPaneState.activeScopeKey, false);
+    setRightPaneCollapsed(scopeKey, rightPaneVisible);
   }
 
   setWebSidebarContext({
@@ -1247,7 +1252,7 @@
     get isDrawer() { return sidebarIsDrawer; },
     get drawerOpen() { return sidebarOpen; },
     toggle: toggleSidebarFromHeader,
-    openRightPane: openRightPaneFromHeader,
+    toggleRightPane: toggleRightPaneFromHeader,
   });
 
   function applySidebarModeFromEvent(event: Event): void {
@@ -1425,8 +1430,8 @@
   {#if !sidebarHidden}
   <aside class="sidebar" class:sidebar--open={sidebarIsDrawer && sidebarOpen}>
     <div class="sidebar-header">
-      <div class="sidebar-brand">
-        <div class="sidebar-title">Magi</div>
+      <div class="sidebar-toolbar">
+        <MagiWordmark />
         <div class="sidebar-header-tools">
           <button
             class="theme-toggle-btn"
@@ -1744,7 +1749,7 @@
     flex-shrink: 0;
   }
 
-  .sidebar-brand {
+  .sidebar-toolbar {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -1824,13 +1829,6 @@
 
   .sidebar-icon-btn:disabled::after {
     display: none;
-  }
-
-  .sidebar-title {
-    font-size: var(--text-lg);
-    font-weight: var(--font-bold);
-    line-height: 1.15;
-    letter-spacing: -0.02em;
   }
 
   .session-meta,
@@ -2602,10 +2600,6 @@
       gap: var(--space-3);
     }
 
-    .sidebar-brand {
-      flex-wrap: wrap;
-    }
-
     .sidebar-header,
     .sidebar-section {
       background: color-mix(in srgb, var(--foreground) 3%, var(--vscode-sideBar-secondaryBackground, var(--background)));
@@ -2640,10 +2634,6 @@
     .sidebar {
       width: min(92vw, 360px);
       max-width: 360px;
-    }
-
-    .sidebar-title {
-      font-size: var(--text-lg);
     }
 
     .sidebar-header {

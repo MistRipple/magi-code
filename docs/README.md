@@ -1,6 +1,6 @@
 # 项目架构文档
 
-本目录承载 `magi-rust-rewrite` 的架构说明与工程基线。
+本目录承载 `Magi` 的架构说明与工程基线。
 
 ## 项目定位
 
@@ -14,6 +14,28 @@
 - 前端以现有产品方案为基线，不发散成新的 UI 产品方向
 - UI 层可以继续完善产品表达，但不能反向定义后端协议
 - 禁止长期双实现、回退逻辑与补丁式兼容分支
+
+## 运行入口
+
+- `magi-desktop` 是 Windows、Linux、macOS 的桌面产品入口，只负责系统窗口、托盘、单实例与进程生命周期。
+- `magi-daemon` 是唯一业务内核。桌面端在同一进程内启动它，桌面 WebView、浏览器、局域网设备与公网隧道共享同一个运行实例。
+- 主窗口关闭后默认隐藏到系统托盘，daemon 继续运行；只有托盘中的“退出 Magi”或操作系统显式退出动作会触发优雅关闭。
+- `magi-daemon-app` 仅保留为开发和无头部署入口，不参与桌面安装包，也不复制桌面宿主逻辑。
+
+开发模式仍使用 daemon 托管入口：
+
+```bash
+./scripts/dev-daemon.sh
+```
+
+桌面宿主开发运行前先构建静态前端：
+
+```bash
+npm --prefix web run build
+cargo run -p magi-desktop
+```
+
+三平台发布统一由 Tauri 生成 macOS DMG、Linux AppImage/Deb 与 Windows NSIS 安装器，旧手工包装脚本已移除。
 
 ## 目标与代理运行设计
 

@@ -31,6 +31,22 @@ await withGoldenViteServer(async (server) => {
 
   assert.deepEqual(
     display.resolveToolCardTarget({
+      toolName: 'image_generate',
+      input: { prompt: 'blue square' },
+      output: JSON.stringify({
+        status: 'succeeded',
+        path: 'generated-images/blue-square.png',
+      }),
+    }),
+    {
+      primaryPath: 'generated-images/blue-square.png',
+      paths: ['generated-images/blue-square.png'],
+    },
+    'image_generate should locate its generated workspace file from the tool result',
+  );
+
+  assert.deepEqual(
+    display.resolveToolCardTarget({
       toolName: 'apply_patch',
       input: {
         patch: [

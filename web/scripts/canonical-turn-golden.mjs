@@ -1763,7 +1763,9 @@ function assertBootstrapProcessingStateFromRunningCanonicalTurn(contract) {
   );
   const userItem = user(c, 1, '刷新后仍应恢复运行态。');
   userItem.metadata = { requestId: 'request-bootstrap-running' };
-  const assistantItem = assistantPlaceholderText(c, 2, 'assistant-bootstrap-running', 'running');
+  const guidedUserItem = user(c, 2, '同一轮引导不应成为新的处理中请求。');
+  guidedUserItem.metadata = { requestId: 'request-bootstrap-guide' };
+  const assistantItem = assistantPlaceholderText(c, 3, 'assistant-bootstrap-running', 'running');
   assistantItem.metadata = { requestId: 'request-bootstrap-running' };
   const bootstrap = contract.normalizeRustBootstrapPayload({
     generatedAt: 7100,
@@ -1782,7 +1784,7 @@ function assertBootstrapProcessingStateFromRunningCanonicalTurn(contract) {
       messageCount: 1,
     }],
     canonicalTurns: [
-      turn(c, 'running', [userItem, assistantItem]),
+      turn(c, 'running', [userItem, guidedUserItem, assistantItem]),
     ],
     runtimeReadModel: {
       details: {
@@ -1801,7 +1803,7 @@ function assertBootstrapProcessingStateFromRunningCanonicalTurn(contract) {
   assert.deepEqual(
     bootstrap.state.processingState?.pendingRequestIds,
     ['request-bootstrap-running'],
-    'bootstrap should carry request binding metadata from canonical items',
+    'bootstrap should recover only the root request and ignore same-turn guide request ids',
   );
 }
 

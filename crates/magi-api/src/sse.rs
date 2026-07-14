@@ -5,7 +5,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use futures_util::{Stream, StreamExt, stream};
+use futures_util::{Stream, StreamExt, future, stream};
 use magi_core::{EventId, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
 use std::{convert::Infallible, time::Duration};
@@ -119,33 +119,49 @@ fn event_envelope_stream(
                 snapshot_session_id.as_ref(),
             )
     }));
-    let live_stream = BroadcastStream::new(receiver).filter_map(move |event| {
-        let live_state = live_state.clone();
-        let live_workspace_id = live_workspace_id.clone();
-        let live_session_id = live_session_id.clone();
-        async move {
-            match event {
-                Ok(envelope) => {
-                    let matches_sequence =
-                        after_sequence.is_none_or(|sequence| envelope.sequence > sequence);
-                    (matches_sequence
-                        && event_matches_scope(
-                            &live_state,
-                            &envelope,
-                            live_workspace_id.as_ref(),
-                            live_session_id.as_ref(),
-                        ))
-                    .then_some(envelope)
-                }
-                Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                    Some(lagged_recovery_event(skipped, live_workspace_id.as_ref()))
+    let live_stream = BroadcastStream::new(receiver)
+        .take_while(|event| {
+            future::ready(match event {
+                Ok(envelope) => !is_runtime_shutdown_complete(envelope),
+                Err(_) => true,
+            })
+        })
+        .filter_map(move |event| {
+            let live_state = live_state.clone();
+            let live_workspace_id = live_workspace_id.clone();
+            let live_session_id = live_session_id.clone();
+            async move {
+                match event {
+                    Ok(envelope) => {
+                        let matches_sequence =
+                            after_sequence.is_none_or(|sequence| envelope.sequence > sequence);
+                        (matches_sequence
+                            && event_matches_scope(
+                                &live_state,
+                                &envelope,
+                                live_workspace_id.as_ref(),
+                                live_session_id.as_ref(),
+                            ))
+                        .then_some(envelope)
+                    }
+                    Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                        Some(lagged_recovery_event(skipped, live_workspace_id.as_ref()))
+                    }
                 }
             }
-        }
-    });
+        });
     stream::iter(snapshot_gap_recovery)
         .chain(recent_stream)
         .chain(live_stream)
+}
+
+fn is_runtime_shutdown_complete(event: &EventEnvelope) -> bool {
+    event.event_type == "system.runtime.maintenance.status"
+        && event
+            .payload
+            .get("maintenance_mode")
+            .and_then(serde_json::Value::as_str)
+            == Some("shutdown-complete")
 }
 
 fn snapshot_gap_skipped_count(
@@ -700,6 +716,28 @@ mod tests {
             event.payload["skipped"].as_u64().unwrap_or_default() > 0,
             "lagged event should expose skipped event count"
         );
+    }
+
+    #[tokio::test]
+    async fn event_stream_closes_when_daemon_shutdown_completes() {
+        let state = test_state();
+        let mut events = Box::pin(event_envelope_stream(
+            state.clone(),
+            Some(workspace_id("workspace-shutdown")),
+            Some(SessionId::new("session-shutdown")),
+            None,
+        ));
+
+        state.event_bus.publish(EventEnvelope::system(
+            EventId::new("runtime-shutdown-complete"),
+            "system.runtime.maintenance.status",
+            json!({ "maintenance_mode": "shutdown-complete" }),
+        ));
+
+        let next = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await
+            .expect("shutdown event should close the stream immediately");
+        assert!(next.is_none());
     }
 
     #[tokio::test]

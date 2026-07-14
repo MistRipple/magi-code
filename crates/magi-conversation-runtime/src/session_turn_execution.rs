@@ -5,6 +5,7 @@
 //! 等方式桥接到 `ApiError` 枚举。
 
 use crate::{
+    ConversationRegistry, SessionTurnInputBoundary, UserSignal,
     conversation_loop::{
         compact_history_for_prompt, latest_session_usage_observation,
         thread_chat_message_to_chat_message,
@@ -309,6 +310,7 @@ pub struct SessionTurnExecutionRuntime<'a> {
     pub client: &'a dyn ModelBridgeClient,
     pub event_bus: &'a InMemoryEventBus,
     pub session_store: &'a SessionStore,
+    pub conversation_registry: &'a ConversationRegistry,
     pub todo_ledger: &'a magi_todo_ledger::TodoLedger,
     pub settings_store: Option<&'a Arc<SettingsStore>>,
     pub safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
@@ -330,6 +332,7 @@ pub fn run_session_turn_execution(
         client,
         event_bus,
         session_store,
+        conversation_registry,
         todo_ledger,
         settings_store,
         safety_gate,
@@ -366,8 +369,9 @@ pub fn run_session_turn_execution(
     let mut completed_required_tool_names: Vec<String> = Vec::new();
     let usage_binding = session_turn_model_usage_binding(request.use_tools);
 
-    let tool_call_round_limit = tool_call_round_limit(&request.required_tool_chain);
-    for round in 0..tool_call_round_limit {
+    let mut round_limit = tool_call_round_limit(&request.required_tool_chain);
+    let mut round = 0usize;
+    while round < round_limit {
         if request.use_tools
             && let Some(registry) = tool_registry
         {
@@ -500,12 +504,48 @@ pub fn run_session_turn_execution(
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
+                let steers = conversation_registry
+                    .drain_session_turn_steers(&request.session_id, &request.turn_id);
+                if append_session_turn_steers_to_messages(&mut messages, steers) {
+                    round_limit = round_limit
+                        .max(round.saturating_add(2))
+                        .min(MAX_TOOL_CALL_ROUNDS);
+                }
+                round = round.saturating_add(1);
                 continue;
+            }
+            match conversation_registry
+                .take_session_turn_steers_or_close(&request.session_id, &request.turn_id)
+            {
+                SessionTurnInputBoundary::Pending(steers) => {
+                    messages.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: Some(content),
+                        images: Vec::new(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                    append_session_turn_steers_to_messages(&mut messages, steers);
+                    round_limit = round_limit
+                        .max(round.saturating_add(2))
+                        .min(MAX_TOOL_CALL_ROUNDS);
+                    round = round.saturating_add(1);
+                    continue;
+                }
+                SessionTurnInputBoundary::Closed => {}
             }
             final_item_id = streamed_content.final_item_id;
             final_content = Some(content);
             break;
         }
+        let steers =
+            conversation_registry.drain_session_turn_steers(&request.session_id, &request.turn_id);
+        if append_session_turn_steers_to_messages(&mut messages, steers) {
+            round_limit = round_limit
+                .max(round.saturating_add(2))
+                .min(MAX_TOOL_CALL_ROUNDS);
+        }
+        round = round.saturating_add(1);
     }
 
     let final_content = if let Some(content) = final_content {
@@ -550,6 +590,31 @@ pub fn run_session_turn_execution(
     );
 
     Ok(SessionTurnExecutionOutput::completed(final_content))
+}
+
+fn append_session_turn_steers_to_messages(
+    messages: &mut Vec<ChatMessage>,
+    steers: Vec<UserSignal>,
+) -> bool {
+    let mut appended = false;
+    for signal in steers {
+        let Some(text) = signal
+            .text
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: Some(text),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+        appended = true;
+    }
+    appended
 }
 
 fn session_turn_model_error(
@@ -1206,6 +1271,7 @@ mod tests {
         TimelineEntry, TimelineEntryKind,
     };
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn ts(value: u64) -> UtcMillis {
         UtcMillis(value)
@@ -1268,6 +1334,171 @@ mod tests {
     struct StreamingThenFailingModelBridgeClient {
         delta_content: String,
         message: String,
+    }
+
+    struct SteeringModelBridgeClient {
+        registry: Arc<ConversationRegistry>,
+        session_id: SessionId,
+        turn_id: String,
+        calls: AtomicUsize,
+        requests: std::sync::Mutex<Vec<ModelInvocationRequest>>,
+    }
+
+    impl ModelBridgeClient for SteeringModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests
+                .lock()
+                .expect("request log lock")
+                .push(request);
+            if call == 0 {
+                self.registry
+                    .try_steer_session_turn(
+                        &self.session_id,
+                        &self.turn_id,
+                        UserSignal {
+                            text: Some("优先收口，不要继续扩展".to_string()),
+                            request_id: Some("request-steer-runtime".to_string()),
+                            user_message_id: Some("user-steer-runtime".to_string()),
+                            placeholder_message_id: None,
+                            accepted_at: ts(1_100),
+                        },
+                    )
+                    .expect("steer should be accepted while first model call is active");
+            }
+            let content = if call == 0 {
+                "第一段回复"
+            } else {
+                "最终收口"
+            };
+            Ok(BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "content": content,
+                    "finish_reason": "stop"
+                })
+                .to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            let next_call = self.calls.load(Ordering::SeqCst);
+            on_delta(&ModelStreamingDelta {
+                content: if next_call == 0 {
+                    "第一段回复".to_string()
+                } else {
+                    "最终收口".to_string()
+                },
+                thinking: String::new(),
+            });
+            self.invoke(request)
+        }
+    }
+
+    #[test]
+    fn active_turn_steer_continues_same_turn_with_a_second_model_call() {
+        let session_id = SessionId::new("session-runtime-steer");
+        let turn_id = "turn-runtime-steer".to_string();
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "runtime steer")
+            .expect("session should be creatable");
+        let (_mission_id, orchestrator_thread_id) =
+            store.ensure_session_mission(&session_id, ts(900), || {
+                magi_core::MissionId::new("mission-runtime-steer")
+            });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: turn_id.clone(),
+                    turn_seq: 1_000,
+                    accepted_at: ts(1_000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("请给出完整方案".to_string()),
+                    items: vec![session_turn_item(
+                        "user_message",
+                        "completed",
+                        None,
+                        Some("请给出完整方案".to_string()),
+                        Some("user-runtime-steer".to_string()),
+                        orchestrator_thread_id,
+                    )],
+                },
+            )
+            .expect("current turn should be stored");
+        let registry = Arc::new(ConversationRegistry::new());
+        registry
+            .begin_session_turn_input(session_id.clone(), turn_id.clone())
+            .expect("turn input should begin");
+        let client = SteeringModelBridgeClient {
+            registry: registry.clone(),
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            calls: AtomicUsize::new(0),
+            requests: std::sync::Mutex::new(Vec::new()),
+        };
+        let event_bus = InMemoryEventBus::new(32);
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id,
+            workspace_id: None,
+            prompt: "请给出完整方案".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: false,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: Some("request-runtime-steer".to_string()),
+            user_message_id: Some("user-runtime-steer".to_string()),
+            placeholder_message_id: Some("assistant-runtime-steer".to_string()),
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            workspace_root_path: None,
+        };
+
+        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &store,
+            conversation_registry: registry.as_ref(),
+            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+            settings_store: None,
+            safety_gate: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            snapshot_manager: None,
+            request,
+            prompt: "请给出完整方案".to_string(),
+            tools: None,
+            persist_session_state: None,
+        })
+        .expect("steered turn should complete");
+
+        assert_eq!(output.final_content, "最终收口");
+        let requests = client.requests.lock().expect("request log lock");
+        assert_eq!(requests.len(), 2);
+        let second_messages = requests[1]
+            .messages
+            .as_ref()
+            .expect("second call should carry messages");
+        assert!(second_messages.iter().any(|message| {
+            message.role == "assistant" && message.content.as_deref() == Some("第一段回复")
+        }));
+        assert!(second_messages.iter().any(|message| {
+            message.role == "user" && message.content.as_deref() == Some("优先收口，不要继续扩展")
+        }));
     }
 
     impl ModelBridgeClient for StreamingThenFailingModelBridgeClient {
@@ -1473,6 +1704,7 @@ mod tests {
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
+            conversation_registry: &ConversationRegistry::new(),
             todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
             settings_store: None,
             safety_gate: None,
@@ -1565,6 +1797,7 @@ mod tests {
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
+            conversation_registry: &ConversationRegistry::new(),
             todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
             settings_store: None,
             safety_gate: None,
@@ -1667,6 +1900,7 @@ mod tests {
             client: &client,
             event_bus: &event_bus,
             session_store: &store,
+            conversation_registry: &ConversationRegistry::new(),
             todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
             settings_store: None,
             safety_gate: None,

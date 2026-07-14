@@ -10,6 +10,7 @@ const PUBLIC_RESPONSE_ALIAS_SECTIONS: &[&str] = &[
     "workerConfigs",
     "orchestratorConfig",
     "auxiliaryConfig",
+    "imageGenerationConfig",
     "userRulesConfig",
     "registryEngines",
     "registryAgents",
@@ -346,6 +347,7 @@ fn canonicalize_settings_section_value(section: &str, value: &mut Value) -> bool
         return canonicalize_session_orchestrator_section(value);
     }
     if section == "auxiliary"
+        || section == "imageGeneration"
         || (is_session_section_key(section) && section.ends_with(":auxiliary"))
     {
         return remove_deprecated_model_fields(value);

@@ -185,6 +185,24 @@ pub type AgentRoleCatalogProvider =
 pub type RuntimeCapabilityDependencyProvider = Arc<
     dyn Fn(&ToolExecutionContext) -> Vec<RuntimeCapabilityDependencyEntry> + Send + Sync + 'static,
 >;
+pub type ImageGenerationExecutor = Arc<
+    dyn Fn(ImageGenerationRequest) -> Result<GeneratedImageData, String> + Send + Sync + 'static,
+>;
+pub type ImageGenerationReadinessProvider = Arc<dyn Fn() -> bool + Send + Sync + 'static>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageGenerationRequest {
+    pub prompt: String,
+    pub size: String,
+    pub quality: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratedImageData {
+    pub bytes: Vec<u8>,
+    pub media_type: String,
+    pub revised_prompt: Option<String>,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExternalToolCatalogSnapshot {
@@ -326,6 +344,8 @@ pub struct ToolRuntimeResources {
     pub external_mcp_tool_executor: Option<ExternalMcpToolExecutor>,
     pub agent_role_catalog_provider: Option<AgentRoleCatalogProvider>,
     pub runtime_capability_dependency_provider: Option<RuntimeCapabilityDependencyProvider>,
+    pub image_generation_executor: Option<ImageGenerationExecutor>,
+    pub image_generation_readiness_provider: Option<ImageGenerationReadinessProvider>,
 }
 
 pub trait BuiltinTool: Send + Sync {

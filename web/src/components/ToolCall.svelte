@@ -22,6 +22,11 @@
     parseViewImagePreview,
   } from '../lib/view-image-preview';
   import {
+    formatImageGenerationToolOutput,
+    parseImageGenerationPreview,
+  } from '../lib/image-generation-preview';
+  import { agentUrl, buildFilePreviewQuery } from '../web/agent-api';
+  import {
     ACCESS_MODE_APPROVAL_ERROR_CODES,
     isAccessModeApprovalErrorPayload,
     isStructuredToolErrorPayload,
@@ -84,6 +89,7 @@
     'shell_exec': 'toolCall.displayName.shell',
     'file_read': 'toolCall.displayName.fileView',
     'view_image': 'toolCall.displayName.viewImage',
+    'image_generate': 'toolCall.displayName.imageGenerate',
     'file_write': 'toolCall.displayName.fileCreate',
     'file_patch': 'toolCall.displayName.fileEdit',
     'apply_patch': 'toolCall.displayName.applyPatch',
@@ -172,6 +178,10 @@
   }
 
   function formatToolOutput(toolName: string, content: unknown): string {
+    const generatedImageOutput = formatImageGenerationToolOutput(toolName, content);
+    if (generatedImageOutput !== null) {
+      return generatedImageOutput;
+    }
     const viewImageOutput = formatViewImageToolOutput(toolName, content);
     if (viewImageOutput !== null) {
       return viewImageOutput;
@@ -211,6 +221,7 @@
 
     const iconMap: Record<string, IconName> = {
       'view_image': 'eye',
+      'image_generate': 'sparkles',
       'file_remove': 'trash',
       'web_search': 'search',
       'web_fetch': 'globe',
@@ -406,7 +417,23 @@
   const inputText = $derived(formatToolInput(input));
   const hasInput = $derived(!!inputText);
   const outputIsStructuredError = $derived(isStructuredToolErrorPayload(output));
-  const imagePreview = $derived(outputIsStructuredError ? null : parseViewImagePreview(name, output));
+  const generatedImagePreview = $derived(
+    outputIsStructuredError ? null : parseImageGenerationPreview(name, output),
+  );
+  const imagePreview = $derived.by(() => {
+    if (outputIsStructuredError) return null;
+    const viewed = parseViewImagePreview(name, output);
+    if (viewed) return { ...viewed, revisedPrompt: '' };
+    if (!generatedImagePreview) return null;
+    return {
+      ...generatedImagePreview,
+      src: agentUrl('/api/files/raw', buildFilePreviewQuery(generatedImagePreview.path, {
+        workspaceId: filePreviewScope?.workspaceId,
+        workspacePath: filePreviewScope?.workspacePath,
+        sessionId: '',
+      })),
+    };
+  });
   const outputText = $derived(outputIsStructuredError ? '' : formatToolOutput(name, output));
   const hasOutput = $derived(!!output && (!!outputText || !!imagePreview));
   const structuredErrorText = $derived.by(() => {
@@ -432,6 +459,12 @@
 
   $effect(() => {
     if (diagramPayload && status === 'success' && !userToggled) {
+      collapsed = false;
+    }
+  });
+
+  $effect(() => {
+    if (generatedImagePreview && status === 'success' && !userToggled) {
       collapsed = false;
     }
   });
@@ -486,6 +519,8 @@
       case 'apply_patch': {
         return firstToolDisplayText(args.path, args.file_path, args.image_path);
       }
+      case 'image_generate':
+        return normalizeToolDisplayText(args.prompt);
       case 'search_text':
         return firstToolDisplayText(args.pattern, args.query);
       case 'search_semantic':
@@ -970,7 +1005,15 @@
                 </div>
                 {#if imagePreview}
                   <div class="image-output-preview">
-                    <img src={imagePreview.src} alt={imagePreview.path || toolDisplayName} />
+                    <button
+                      type="button"
+                      class="image-output-open"
+                      onclick={imagePreview.path ? handleOpenFile : undefined}
+                      disabled={!imagePreview.path}
+                      title={imagePreview.path ? i18n.t('toolCall.openGeneratedImage') : undefined}
+                    >
+                      <img src={imagePreview.src} alt={imagePreview.path || toolDisplayName} />
+                    </button>
                     <div class="image-output-meta">
                       {#if imagePreview.path}
                         <span title={imagePreview.path}>{imagePreview.path}</span>
@@ -978,6 +1021,9 @@
                       <span>{imagePreview.mime}</span>
                       {#if typeof imagePreview.bytes === 'number'}
                         <span>{imagePreview.bytes.toLocaleString()} bytes</span>
+                      {/if}
+                      {#if imagePreview.revisedPrompt}
+                        <span title={imagePreview.revisedPrompt}>{imagePreview.revisedPrompt}</span>
                       {/if}
                     </div>
                   </div>
@@ -1331,6 +1377,25 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: var(--code-bg);
+  }
+
+  .image-output-open {
+    width: fit-content;
+    max-width: 100%;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .image-output-open:disabled {
+    cursor: default;
+  }
+
+  .image-output-open:not(:disabled):focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
   }
 
   .image-output-meta {

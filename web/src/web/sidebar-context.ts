@@ -5,7 +5,7 @@ export interface WebSidebarContext {
   readonly isDrawer: boolean;
   readonly drawerOpen: boolean;
   toggle(): void;
-  openRightPane(): void;
+  toggleRightPane(): void;
 }
 
 const WEB_SIDEBAR_CONTEXT_KEY = Symbol('webSidebar');

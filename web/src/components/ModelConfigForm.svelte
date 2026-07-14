@@ -3,7 +3,7 @@
   import { resolveModelApiProtocol } from '../shared/model-governance';
   import Icon from './Icon.svelte';
 
-  type FormType = 'orch' | 'comp' | 'worker';
+  type FormType = 'orch' | 'comp' | 'image' | 'worker';
 
   let {
     formType,

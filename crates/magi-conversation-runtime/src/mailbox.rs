@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use magi_core::UtcMillis;
 use serde::{Deserialize, Serialize};
 
-/// 用户信号载荷。S1 仅含从前端进入的 user input，不区分 chat / task / continue /
-/// supplement_context 路由——路由分流由 routes 层在 drain 后判定。
+/// 用户信号载荷。独立 Turn 的入口由 routes 层注入 Conversation；当前活跃 Turn
+/// 的引导输入由 ConversationRegistry 的 session-turn input 通道单独承载。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserSignal {
     pub text: Option<String>,

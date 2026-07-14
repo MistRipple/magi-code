@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+  TAURI_CLI_VERSION: "2.11.4"
+
 jobs:
   build-web:
     name: 构建前端资源
@@ -27,8 +31,10 @@ jobs:
       - name: 安装前端依赖
         run: npm --prefix web ci
 
-      - name: 构建前端
-        run: npm --prefix web run build
+      - name: 校验并构建前端
+        run: |
+          npm --prefix web run check
+          npm --prefix web run build
 
       - name: 上传前端资源
         uses: actions/upload-artifact@v4
@@ -37,7 +43,7 @@ jobs:
           path: web/dist
           if-no-files-found: error
 
-  package-unix:
+  package-desktop:
     name: 打包 ${{ matrix.platform }}
     needs: build-web
     runs-on: ${{ matrix.runner }}
@@ -47,10 +53,19 @@ jobs:
         include:
           - platform: macos
             runner: macos-latest
-            artifact_glob: dist/*.dmg
+            bundles: dmg
+            artifact_paths: target/release/bundle/dmg/*.dmg
           - platform: linux
-            runner: ubuntu-latest
-            artifact_glob: dist/*.AppImage
+            runner: ubuntu-22.04
+            bundles: appimage,deb
+            artifact_paths: |
+              target/release/bundle/appimage/*.AppImage
+              target/release/bundle/deb/*.deb
+          - platform: windows
+            runner: windows-latest
+            bundles: nsis
+            artifact_paths: target/release/bundle/nsis/*.exe
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -61,117 +76,100 @@ jobs:
           name: magi-web-dist
           path: web/dist
 
+      - name: 安装 Linux 桌面依赖
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget
+
       - name: 安装 Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: 构建 daemon
-        run: cargo build --release -p magi-daemon-app --locked
+      - name: 缓存 Rust 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-${{ matrix.platform }}
 
-      - name: 打包产物
-        run: bash scripts/package/package-unix.sh ${{ matrix.platform }}
+      - name: 安装 Tauri CLI
+        run: cargo install tauri-cli --version ${{ env.TAURI_CLI_VERSION }} --locked
 
-      - name: 校验产品包结构
+      - name: 校验桌面宿主
+        run: cargo test -p magi-desktop --all-targets --locked
+
+      - name: 构建桌面安装包
+        run: cargo tauri build --ci --bundles "${{ matrix.bundles }}" -- --locked
+
+      - name: 校验安装包
+        shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          platform="${{ matrix.platform }}"
+          case "${{ matrix.platform }}" in
+            macos)
+              shopt -s nullglob
+              assets=(target/release/bundle/dmg/*.dmg)
+              test "${#assets[@]}" -eq 1
+              test -s "${assets[0]}"
+              mount_dir="$(mktemp -d)"
+              device="$(hdiutil attach -nobrowse -readonly -mountpoint "$mount_dir" "${assets[0]}" | awk '/^\/dev\// {print $1; exit}')"
+              trap 'hdiutil detach "$device" >/dev/null 2>&1 || true; rmdir "$mount_dir" 2>/dev/null || true' EXIT
+              test -n "$device"
+              test -x "$mount_dir/Magi.app/Contents/MacOS/Magi"
+              test -f "$mount_dir/Magi.app/Contents/Resources/web/dist/web.html"
+              if find "$mount_dir/Magi.app" -type f \( -name 'magi-daemon-app*' -o -name 'start-magi*' \) | grep -q .; then
+                echo "macOS 安装包暴露了旧技术入口" >&2
+                exit 1
+              fi
+              hdiutil detach "$device" >/dev/null
+              rmdir "$mount_dir"
+              trap - EXIT
+              ;;
+            linux)
+              shopt -s nullglob
+              appimages=(target/release/bundle/appimage/*.AppImage)
+              debs=(target/release/bundle/deb/*.deb)
+              test "${#appimages[@]}" -eq 1
+              test "${#debs[@]}" -eq 1
+              test -s "${appimages[0]}"
+              test -s "${debs[0]}"
+              ;;
+            windows)
+              shopt -s nullglob
+              installers=(target/release/bundle/nsis/*.exe)
+              test "${#installers[@]}" -eq 1
+              test -s "${installers[0]}"
+              ;;
+            *)
+              echo "不支持的平台：${{ matrix.platform }}" >&2
+              exit 1
+              ;;
+          esac
 
-          if [ "$platform" = "macos" ]; then
-            assets=(dist/*-macos-*.dmg)
-            apps=(dist/*-macos-*/Magi.app)
-            if [ "${#assets[@]}" -ne 1 ]; then
-              echo "macOS dmg 数量异常：${#assets[@]}" >&2
-              exit 1
-            fi
-            if [ "${#apps[@]}" -ne 1 ]; then
-              echo "macOS app bundle 数量异常：${#apps[@]}" >&2
-              exit 1
-            fi
-            test -x "${apps[0]}/Contents/MacOS/Magi"
-            test -f "${apps[0]}/Contents/Resources/web/dist/web.html"
-            if find "${apps[0]}" \( -name 'magi-daemon-app*' -o -name 'start-magi*' \) | grep -q .; then
-              echo "Magi.app 暴露了技术入口" >&2
-              exit 1
-            fi
-          elif [ "$platform" = "linux" ]; then
-            assets=(dist/*-linux-*.AppImage)
-            appdirs=(dist/*-linux-*/Magi.AppDir)
-            if [ "${#assets[@]}" -ne 1 ]; then
-              echo "Linux AppImage 数量异常：${#assets[@]}" >&2
-              exit 1
-            fi
-            if [ "${#appdirs[@]}" -ne 1 ]; then
-              echo "Linux AppDir 数量异常：${#appdirs[@]}" >&2
-              exit 1
-            fi
-            test -x "${assets[0]}"
-            test -x "${appdirs[0]}/AppRun"
-            test -x "${appdirs[0]}/usr/bin/Magi"
-            test -f "${appdirs[0]}/usr/share/magi/web/dist/web.html"
-            if find "${appdirs[0]}" \( -name 'magi-daemon-app*' -o -name 'start-magi*' \) | grep -q .; then
-              echo "Linux AppDir 暴露了技术入口" >&2
-              exit 1
-            fi
-          else
-            echo "不支持的平台：$platform" >&2
+          if find target/release/bundle -type f \( -name 'magi-daemon-app*' -o -name 'start-magi*' \) | grep -q .; then
+            echo "桌面安装包暴露了旧技术入口" >&2
             exit 1
           fi
 
-      - name: 上传产物
+      - name: 上传安装包
         uses: actions/upload-artifact@v4
         with:
-          name: magi-${{ matrix.platform }}
-          path: ${{ matrix.artifact_glob }}
-          if-no-files-found: error
-
-  package-windows:
-    name: 打包 windows
-    needs: build-web
-    runs-on: windows-latest
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 下载前端资源
-        uses: actions/download-artifact@v4
-        with:
-          name: magi-web-dist
-          path: web/dist
-
-      - name: 安装 Rust
-        run: rustup toolchain install stable --profile minimal; rustup default stable
-
-      - name: 构建 daemon
-        run: cargo build --release -p magi-daemon-app --locked
-
-      - name: 打包产物
-        shell: pwsh
-        run: ./scripts/package/package-windows.ps1
-
-      - name: 校验产品包结构
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $archive = Get-ChildItem dist -Filter *.zip | Select-Object -First 1
-          if (-not $archive) { throw "缺少 Windows 产品包 zip" }
-          $entries = & tar -tf $archive.FullName
-          if (-not ($entries -match '^[^/]+/Magi\.exe$')) { throw "产品包缺少 Magi.exe 入口" }
-          if (-not ($entries -match '^[^/]+/resources/web/dist/web\.html$')) { throw "产品包缺少内置 UI 入口" }
-          if ($entries -match 'magi-daemon-app|start-magi') { throw "产品包暴露了技术入口" }
-
-      - name: 上传产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: magi-windows
-          path: dist/*.zip
+          name: magi-bundle-${{ matrix.platform }}
+          path: ${{ matrix.artifact_paths }}
           if-no-files-found: error
 
   publish-release:
     name: 发布 GitHub Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs:
-      - package-unix
-      - package-windows
+    needs: package-desktop
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
@@ -179,60 +177,30 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 下载 macOS 产物
+      - name: 收集三平台安装包
         uses: actions/download-artifact@v4
         with:
-          name: magi-macos
-          path: dist/artifacts/magi-macos
+          pattern: magi-bundle-*
+          path: dist/release-assets
+          merge-multiple: true
 
-      - name: 下载 Linux 产物
-        uses: actions/download-artifact@v4
-        with:
-          name: magi-linux
-          path: dist/artifacts/magi-linux
-
-      - name: 下载 Windows 产物
-        uses: actions/download-artifact@v4
-        with:
-          name: magi-windows
-          path: dist/artifacts/magi-windows
-
-      - name: 收集并校验发布文件
+      - name: 校验发布文件
         run: |
           set -euo pipefail
-          mkdir -p dist/release-assets
-          find dist/artifacts -type f \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.zip' \) -exec cp {} dist/release-assets/ \;
-
           shopt -s nullglob
-          macos_assets=(dist/release-assets/*-macos-*.dmg)
-          linux_assets=(dist/release-assets/*-linux-*.AppImage)
-          windows_assets=(dist/release-assets/*-windows-*.zip)
+          macos_assets=(dist/release-assets/*.dmg)
+          linux_appimages=(dist/release-assets/*.AppImage)
+          linux_debs=(dist/release-assets/*.deb)
+          windows_installers=(dist/release-assets/*.exe)
 
-          if [ "${#macos_assets[@]}" -ne 1 ]; then
-            echo "macOS 发布文件数量异常：${#macos_assets[@]}" >&2
-            exit 1
-          fi
-          if [ "${#linux_assets[@]}" -ne 1 ]; then
-            echo "Linux 发布文件数量异常：${#linux_assets[@]}" >&2
-            exit 1
-          fi
-          if [ "${#windows_assets[@]}" -ne 1 ]; then
-            echo "Windows 发布文件数量异常：${#windows_assets[@]}" >&2
-            exit 1
-          fi
-
+          test "${#macos_assets[@]}" -eq 1
+          test "${#linux_appimages[@]}" -eq 1
+          test "${#linux_debs[@]}" -eq 1
+          test "${#windows_installers[@]}" -eq 1
           test -s "${macos_assets[0]}"
-          test -s "${linux_assets[0]}"
-
-          windows_entries="$(mktemp)"
-          unzip -Z1 "${windows_assets[0]}" | tr '\\' '/' | sed 's/\r$//' > "$windows_entries"
-          grep -Eq '^[^/]+/Magi\.exe$' "$windows_entries"
-          grep -Eq '^[^/]+/resources/web/dist/web\.html$' "$windows_entries"
-          if grep -Eq 'magi-daemon-app|start-magi' "$windows_entries"; then
-            echo "Windows 产品包暴露了技术入口" >&2
-            exit 1
-          fi
-
+          test -s "${linux_appimages[0]}"
+          test -s "${linux_debs[0]}"
+          test -s "${windows_installers[0]}"
           ls -lh dist/release-assets
 
       - name: 生成发布说明
@@ -241,7 +209,6 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           commit="${GITHUB_SHA}"
           generated_at="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-
           release_kind="正式版"
           if [[ "$tag" =~ (test|alpha|beta|rc) ]]; then
             release_kind="测试版"
@@ -249,21 +216,20 @@ jobs:
 
           previous_tag="$(git describe --tags --abbrev=0 "${commit}^" 2>/dev/null || true)"
           if [ -n "$previous_tag" ]; then
-            change_range="$previous_tag..$commit"
             change_title="自 $previous_tag 以来的变更"
-            git log --pretty='- %s (%h)' "$change_range" > dist/release-changes.md
+            git log --pretty='- %s (%h)' "$previous_tag..$commit" > dist/release-changes.md
           else
             change_title="最近变更"
             git log --pretty='- %s (%h)' -n 50 "$commit" > dist/release-changes.md
           fi
-
           if [ ! -s dist/release-changes.md ]; then
             echo "- 本次发布没有检测到新的提交摘要。" > dist/release-changes.md
           fi
 
-          macos_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*-macos-*.dmg' -print -quit)")"
-          linux_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*-linux-*.AppImage' -print -quit)")"
-          windows_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*-windows-*.zip' -print -quit)")"
+          macos_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.dmg' -print -quit)")"
+          linux_appimage="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.AppImage' -print -quit)")"
+          linux_deb="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.deb' -print -quit)")"
+          windows_installer="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.exe' -print -quit)")"
 
           {
             echo "# Magi $tag"
@@ -273,64 +239,22 @@ jobs:
             echo "## 下载"
             echo
             echo "- macOS：\`$macos_asset\`"
-            echo "- Linux：\`$linux_asset\`"
-            echo "- Windows：\`$windows_asset\`"
+            echo "- Linux AppImage：\`$linux_appimage\`"
+            echo "- Linux Deb：\`$linux_deb\`"
+            echo "- Windows NSIS：\`$windows_installer\`"
             echo
             echo "## 运行方式"
             echo
-            echo "Magi 是本地一体化应用。下载对应平台的软件包后启动："
+            echo "安装并启动 Magi 桌面端后，应用会在同一进程内启动唯一 daemon，并打开桌面工作台。关闭主窗口只会隐藏到系统托盘；从托盘选择“退出 Magi”才会停止服务并退出。"
             echo
-            echo "- macOS：打开 dmg 后启动 \`Magi.app\`"
-            echo "- Linux：给 AppImage 赋予执行权限后启动"
-            echo "- Windows：解压 zip 后启动 \`Magi.exe\`"
-            echo
-            echo "应用会自行托管内置 UI、API、SSE、工具运行时和会话状态；不要把包内实现理解成传统前后端分离部署。"
+            echo "桌面窗口、本机浏览器、局域网设备和公网隧道访问的是同一个 Magi 运行实例、工作区、会话与任务状态。"
             echo
             if [ "$release_kind" = "测试版" ]; then
               echo "## 测试版提示"
               echo
-              echo "当前测试包默认不做商业签名和公证。macOS 首次打开可能需要右键打开；Windows 可能出现 SmartScreen 提示；Linux AppImage 可能需要先赋予执行权限。"
+              echo "当前测试包默认不做商业签名和公证。macOS 首次打开可能需要右键打开，Windows 可能出现 SmartScreen 提示。"
               echo
             fi
-            echo "## 版本线说明"
-            echo
-            echo "- 1.x：VS Code 插件版，核心体验绑定编辑器侧边栏和插件生命周期。"
-            echo "- 2.x：Web + VSCodeX 双版本，在编辑器入口之外补充 Web 客户端，并通过 Local Agent 连接本地能力。"
-            echo "- 3.x：Rust 重构后的独立本地 Web 应用，Magi 自身就是完整产品入口，不再把 VS Code 插件或 Node Local Agent 作为主要承载形态。"
-            echo
-            echo "## 3.x 版本定位"
-            echo
-            echo "3.x 不是 2.x 的界面搬迁，而是把 Magi 从“插件 + 本地代理”的组合形态，升级为一个独立运行、浏览器访问、多端协同的本地 AI 编程工作台。用户启动的是 Magi 应用本身，应用内部负责托管 UI、API、事件流、工具运行时、会话状态和本地文件能力。"
-            echo
-            echo "## 3.x 重点优势"
-            echo
-            echo "### 独立产品入口"
-            echo
-            echo "- 不再依赖 VS Code 插件作为主入口：即使不打开编辑器，也可以直接启动 Magi 并进入 Web 工作台。"
-            echo "- 不再把前端和 Local Agent 当成用户需要理解的两套东西：桌面包启动后由 Magi 自己托管 UI、API、SSE 和运行时。"
-            echo "- macOS、Linux、Windows 都按桌面软件方式分发：macOS 是 dmg + Magi.app，Linux 是 AppImage，Windows 是 Magi.exe。"
-            echo
-            echo "### 多端 Web 与移动场景"
-            echo
-            echo "- 纯 Web 入口让桌面、手机、平板都能访问同一个本地 Magi，同一个 workspace/session 可以跨页面持续查看。"
-            echo "- 局域网访问适合在电脑运行 Magi、手机或其他设备查看响应、切换会话和观察长任务进度。"
-            echo "- Tunnel 模式适合把本地 Magi 临时暴露给外部网络，在移动网络或异地设备上继续查看和操作。"
-            echo "- 多端同步不再是附加能力，而是 3.x 的主路径：会话、消息、运行状态和事件流按 Web 多端体验设计。"
-            echo
-            echo "### Rust 本地运行时"
-            echo
-            echo "- 统一的 Rust daemon 承担本地状态、事件总线、SSE 推送、工具调度、文件访问和前端静态资源托管。"
-            echo "- 相比 2.x 的 Web + Local Agent 组合，3.x 的运行边界更清晰，用户只需要启动一个 Magi 应用。"
-            echo "- workspace/session 由后端作为权威来源管理，减少前端猜测当前工作区或会话带来的错配风险。"
-            echo "- 浏览器断开后，后台任务仍由本地运行时继续处理；重新打开页面后通过持久化会话和消息恢复当前状态。"
-            echo
-            echo "### 更完整的 AI 编程底座"
-            echo
-            echo "- 内置工具、权限审批、只读/受限/完全访问模式、安全防护、文件快照和变更展示统一纳入产品运行时。"
-            echo "- 本地索引、上下文、知识库、项目记忆、MCP、Skill、subagent 等能力不再只是散落能力，而是围绕同一个会话和 workspace 组合使用。"
-            echo "- 工具调用、文件查看、文件编辑、diff、变更面板和任务状态都面向 Web 产品体验重新收敛，减少“能用但不好用”的断点。"
-            echo "- 对长任务、多 session、多 workspace、多端同时打开等场景做了更完整的状态同步、恢复和隔离设计。"
-            echo
             echo "## $change_title"
             echo
             cat dist/release-changes.md
@@ -341,8 +265,6 @@ jobs:
             echo "- Commit：\`$commit\`"
             echo "- 生成时间：$generated_at"
           } > dist/release-notes.md
-
-          cat dist/release-notes.md
 
       - name: 创建 Release 并上传产物
         uses: softprops/action-gh-release@v2

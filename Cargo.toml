@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "apps/daemon",
+  "apps/desktop",
   "crates/magi-core",
   "crates/magi-daemon",
   "crates/magi-api",

@@ -11,6 +11,7 @@ use axum::{
 };
 use std::{
     env,
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     sync::{Arc, Mutex},
@@ -18,7 +19,8 @@ use std::{
 };
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, watch};
+use tokio::task::JoinHandle;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{info, warn};
 
@@ -39,36 +41,96 @@ pub struct Daemon {
     config: DaemonConfig,
 }
 
+pub struct DaemonHandle {
+    web_url: String,
+    bound_addr: SocketAddr,
+    runtime: DaemonRuntime,
+    shutdown_tx: watch::Sender<bool>,
+    server_task: JoinHandle<Result<(), DaemonError>>,
+}
+
+impl DaemonHandle {
+    pub fn web_url(&self) -> &str {
+        &self.web_url
+    }
+
+    pub fn bound_addr(&self) -> SocketAddr {
+        self.bound_addr
+    }
+
+    pub fn shutdown(&self, reason: impl Into<String>) -> Result<(), DaemonError> {
+        if !*self.shutdown_tx.borrow() {
+            self.runtime.prepare_graceful_shutdown(reason)?;
+            self.shutdown_tx.send_replace(true);
+        }
+        Ok(())
+    }
+
+    pub async fn wait(self) -> Result<(), DaemonError> {
+        self.server_task
+            .await
+            .map_err(|error| DaemonError::internal(format!("daemon server task failed: {error}")))?
+    }
+}
+
 impl Daemon {
     pub fn new(config: DaemonConfig) -> Self {
         Self { config }
     }
 
     pub async fn run(&self) -> Result<(), DaemonError> {
-        let runtime = DaemonRuntime::restore(&self.config)?;
+        self.start().await?.wait().await
+    }
+
+    pub async fn start(&self) -> Result<DaemonHandle, DaemonError> {
+        let frontend = resolve_frontend_mode(&self.config).await?;
+        let listener = TcpListener::bind(self.config.socket_addr()?).await?;
+        let bound_addr = listener.local_addr()?;
+        let bound_port = bound_addr.port();
+        let mut effective_config = self.config.clone();
+        effective_config.port = bound_port;
+
+        let runtime = DaemonRuntime::restore(&effective_config)?;
         let api_router = runtime.router(self.config.service_name.clone())?;
         runtime.start_background_tasks();
         runtime.publish_started_event(&self.config.service_name);
 
-        let frontend = resolve_frontend_mode(&self.config).await?;
-        let listener = TcpListener::bind(self.config.socket_addr()?).await?;
         let frontend_entry_available = frontend.entry_available();
         let app = build_application_router(api_router, &frontend);
         info!(
             service_name = %self.config.service_name,
             host = %self.config.host,
-            port = self.config.port,
+            port = bound_port,
             "Rust 影子后端已启动"
         );
         if self.config.open_browser && frontend_entry_available {
-            let url = web_entry_url(&self.config);
+            let url = web_entry_url(&effective_config);
             if let Err(error) = open_browser(&url) {
                 warn!(error = %error, url = %url, "打开 Magi 界面失败");
             }
         }
-        let _frontend_guard = frontend;
-        axum::serve(listener, app).await?;
-        Ok(())
+
+        let web_url = web_entry_url(&effective_config);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let server_task = tokio::spawn(async move {
+            let _frontend_guard = frontend;
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    if !*shutdown_rx.borrow() {
+                        let _ = shutdown_rx.changed().await;
+                    }
+                })
+                .await?;
+            Ok(())
+        });
+
+        Ok(DaemonHandle {
+            web_url,
+            bound_addr,
+            runtime,
+            shutdown_tx,
+            server_task,
+        })
     }
 }
 
@@ -239,7 +301,9 @@ impl Drop for WebDevServerInner {
 
 async fn resolve_frontend_mode(config: &DaemonConfig) -> Result<FrontendMode, DaemonError> {
     if !env_flag_enabled(WEB_DEV_ENABLED_ENV) {
-        return Ok(FrontendMode::Static(resolve_static_web_assets()));
+        return Ok(FrontendMode::Static(resolve_static_web_assets(
+            config.web_dist_root.as_deref(),
+        )));
     }
 
     let host =
@@ -683,7 +747,11 @@ fn resolve_web_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web")
 }
 
-fn resolve_web_dist_root() -> Option<PathBuf> {
+fn resolve_web_dist_root(explicit_root: Option<&Path>) -> Option<PathBuf> {
+    if let Some(explicit_root) = explicit_root {
+        return Some(explicit_root.to_path_buf());
+    }
+
     if let Ok(raw) = env::var("MAGI_WEB_DIST_ROOT") {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
@@ -708,8 +776,8 @@ fn resolve_web_dist_root() -> Option<PathBuf> {
     None
 }
 
-fn resolve_static_web_assets() -> Option<StaticWebAssets> {
-    let Some(web_dist_root) = resolve_web_dist_root() else {
+fn resolve_static_web_assets(explicit_root: Option<&Path>) -> Option<StaticWebAssets> {
+    let Some(web_dist_root) = resolve_web_dist_root(explicit_root) else {
         warn!("未找到 web/dist 构建产物，daemon 仅提供 API 路由");
         return None;
     };
@@ -797,5 +865,17 @@ mod tests {
         assert!(candidates.contains(&PathBuf::from("/opt/magi/bin/../Resources/web/dist")));
         assert!(candidates.contains(&PathBuf::from("/opt/magi/resources/web/dist")));
         assert!(candidates.contains(&PathBuf::from("/opt/magi/Resources/web/dist")));
+    }
+
+    #[test]
+    fn explicit_web_dist_root_is_authoritative() {
+        let explicit_root = std::env::temp_dir().join("magi-explicit-web-dist");
+        let config = DaemonConfig::new("127.0.0.1", 38123, "daemon-test", ".")
+            .with_web_dist_root(&explicit_root);
+
+        assert_eq!(
+            resolve_web_dist_root(config.web_dist_root.as_deref()),
+            Some(explicit_root)
+        );
     }
 }

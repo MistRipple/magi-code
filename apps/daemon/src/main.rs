@@ -78,13 +78,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let runtime_state_manager = RuntimeStateManager::new(state_root.join("runtime"));
     let pid = process::id();
-    runtime_state_manager.write_runtime_state(pid, Some(&host), port);
-    runtime_state_manager.write_pid(pid);
-
-    let config = DaemonConfig::new(host, port, service_name, state_root)
+    let config = DaemonConfig::new(host.clone(), port, service_name, state_root)
         .with_open_browser(should_open_browser());
     let daemon = Daemon::new(config);
-    let result = daemon.run().await;
+    let handle = daemon.start().await?;
+    runtime_state_manager.write_runtime_state(pid, Some(&host), handle.bound_addr().port());
+    runtime_state_manager.write_pid(pid);
+    let result = handle.wait().await;
 
     runtime_state_manager.remove_runtime_state();
     runtime_state_manager.remove_pid();

@@ -50,8 +50,8 @@ impl Conversation {
         &self.session_id
     }
 
-    /// 推入一个 user 信号。所有 user input（chat / task / continue /
-    /// supplement_context 等）必须经此通道进入任务系统。
+    /// 推入一个独立 Turn 的 user 信号。当前活跃 Turn 的引导输入不经过该
+    /// Mailbox，而由 ConversationRegistry 的 turn-id 绑定通道接收。
     pub fn ingest_user_signal(&mut self, signal: UserSignal) {
         self.mailbox.push(MailboxItem::user(signal));
     }

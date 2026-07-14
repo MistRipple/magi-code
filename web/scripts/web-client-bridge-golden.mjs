@@ -443,7 +443,7 @@ function completedCanonicalAssistantItem() {
     turnId: TURN_ID,
     turnSeq: ACCEPTED_AT,
     itemId: 'assistant-bridge-live-terminal',
-    itemSeq: 2,
+    itemSeq: 3,
     kind: 'assistant_text',
     createdAt: ACCEPTED_AT,
     status: 'completed',
@@ -454,6 +454,29 @@ function completedCanonicalAssistantItem() {
       renderable: true,
     },
     metadata: {},
+  };
+}
+
+function guidedCanonicalUserItem() {
+  return {
+    sessionId: SESSION_ID,
+    turnId: TURN_ID,
+    turnSeq: ACCEPTED_AT,
+    itemId: 'user-bridge-live-guide',
+    itemSeq: 2,
+    kind: 'user_message',
+    createdAt: ACCEPTED_AT + 500,
+    status: 'completed',
+    updatedAt: ACCEPTED_AT + 500,
+    content: '优先收口，不要继续扩展。',
+    sourceThreadId: `thread-${SESSION_ID}`,
+    visibility: {
+      renderable: true,
+    },
+    metadata: {
+      requestId: 'request-guide-current-turn',
+      userMessageId: 'user-bridge-live-guide',
+    },
   };
 }
 
@@ -669,6 +692,74 @@ await withGoldenViteServer(async (server) => {
     window.location.href.includes(`sessionId=${encodeURIComponent(SESSION_ID)}`),
     'live accepted session must update the browser binding',
   );
+
+  const pendingRequestIdsBeforeGuide = [...messagesStore.messagesState.pendingRequests];
+  sessionTurnInterceptors.push((_parsed, _init, body) => {
+    const canonicalItem = guidedCanonicalUserItem();
+    return jsonResponse({
+      sessionId: SESSION_ID,
+      entryId: 'timeline-guide-current-turn',
+      eventId: 'event-guide-current-turn',
+      acceptedAt: ACCEPTED_AT + 500,
+      createdSession: false,
+      route: 'steer',
+      userMessageItemId: canonicalItem.itemId,
+      canonicalSchemaVersion: 'canonical-turn.v1',
+      canonicalEventKind: 'turn_item_upsert',
+      canonicalTurn: {
+        sessionId: SESSION_ID,
+        turnId: TURN_ID,
+        turnSeq: ACCEPTED_AT,
+        acceptedAt: ACCEPTED_AT,
+        status: 'running',
+        items: [acceptedCanonicalUserItem(), canonicalItem],
+      },
+      canonicalItem,
+      steeredTurnId: TURN_ID,
+    });
+  });
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '优先收口，不要继续扩展。',
+    requestId: 'request-guide-current-turn',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+    followUpMode: 'guide',
+  });
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === 'request-guide-current-turn'),
+    'guide follow-up must submit immediately while the active turn is running',
+  );
+  const guidedTurnBody = capturedTurnBodies.find((body) => body.requestId === 'request-guide-current-turn');
+  assert.equal(guidedTurnBody.steerCurrentTurn, true, 'guide follow-up must use same-turn steer route');
+  assert.equal(guidedTurnBody.expectedTurnId, TURN_ID, 'guide follow-up must bind to the active canonical turn');
+  assert.equal(
+    messagesStore.messagesState.queuedMessages.some((message) => message.requestId === 'request-guide-current-turn'),
+    false,
+    'guide follow-up must not enter the independent turn queue',
+  );
+  assert.deepEqual(
+    [...messagesStore.messagesState.pendingRequests],
+    pendingRequestIdsBeforeGuide,
+    'guide follow-up must not create a second processing request or assistant placeholder',
+  );
+  await waitFor(
+    () => Boolean(findArtifactByTurnItemId(
+      messagesStore.messagesState.canonicalTimelineProjection,
+      'user-bridge-live-guide',
+    )),
+    'accepted guide follow-up must append a user item to the active turn',
+  );
+  assert.equal(
+    messagesStore.messagesState.canonicalTimelineProjection?.artifacts?.some((artifact) => (
+      artifact.message?.role === 'assistant'
+      && artifact.message?.metadata?.requestId === 'request-guide-current-turn'
+    )),
+    false,
+    'guide follow-up must not create an assistant card before the active turn continues',
+  );
+
   const streamCountBeforeActiveIdleCheck = FakeEventSource.instances.length;
   const originalDateNowForActiveIdleCheck = Date.now;
   try {

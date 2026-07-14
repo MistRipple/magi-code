@@ -32,6 +32,7 @@ const CRATE_META = {
   'magi-core': ['base', '地基：错误、ID、路径、原子写、执行原语、公开文本'],
   'magi-daemon': ['api', '把全部子系统组装成可运行 daemon'],
   'magi-daemon-app': ['api', '二进制入口（apps/daemon）'],
+  'magi-desktop': ['api', '三平台桌面宿主：窗口、托盘、单实例与 daemon 生命周期'],
   'magi-event-bus': ['bus', '事件总线与事件账本（EventEnvelope / Ledger）'],
   'magi-governance': ['bus', '审批 / 决策请求模型'],
   'magi-knowledge-store': ['storage', '本地代码检索引擎：扫描、分词、倒排索引、依赖图'],
@@ -59,7 +60,7 @@ const BUSINESS_FLOW = [
     id: 'entry',
     title: '入口与工作区绑定',
     desc: '前端只提交用户意图、workspaceId、session hint；daemon/api 负责把请求绑定到后端权威 workspace 与 session。',
-    crates: ['magi-daemon-app', 'magi-runtime-state', 'magi-daemon', 'magi-api', 'magi-workspace'],
+    crates: ['magi-desktop', 'magi-daemon-app', 'magi-runtime-state', 'magi-daemon', 'magi-api', 'magi-workspace'],
     risk: 'URL sessionId 只能是 bootstrap hint，不能反向覆盖后端权威会话。',
   },
   {

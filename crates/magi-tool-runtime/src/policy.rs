@@ -623,6 +623,25 @@ pub fn tool_path_access_requests(
         | crate::BuiltinToolName::FileRemove => {
             push_tool_path_fields(&mut paths, object, &["path"], write, workspace_root_path);
         }
+        crate::BuiltinToolName::ImageGenerate => {
+            push_tool_path_fields(
+                &mut paths,
+                object,
+                &["output_path"],
+                write,
+                workspace_root_path,
+            );
+            if paths.is_empty()
+                && let Some(root) = workspace_root_path
+            {
+                paths.push(ToolPathAccessRequest {
+                    absolute_path: canonicalize_tool_permission_path(
+                        &root.join("generated-images"),
+                    ),
+                    kind: write,
+                });
+            }
+        }
         crate::BuiltinToolName::FileMkdir => {
             push_tool_path_fields(&mut paths, object, &["path"], write, workspace_root_path);
         }

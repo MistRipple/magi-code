@@ -4,7 +4,8 @@ use axum::{
     routing::{get, post},
 };
 use magi_bridge_client::{
-    BridgeClientError, BridgeErrorLayer, HttpModelBridgeProtocol, ModelBridgeClient,
+    BridgeClientError, BridgeErrorLayer, HttpModelBridgeProtocol,
+    ImageGenerationRequest as BridgeImageGenerationRequest, ModelBridgeClient,
     ModelInvocationRequest,
 };
 use magi_core::{AccessProfile, SessionId, UtcMillis};
@@ -412,6 +413,14 @@ pub fn routes() -> Router<ApiState> {
         )
         .route("/settings/auxiliary/save", post(save_auxiliary_config))
         .route("/settings/auxiliary/test", post(test_auxiliary_connection))
+        .route(
+            "/settings/image-generation/save",
+            post(save_image_generation_config),
+        )
+        .route(
+            "/settings/image-generation/test",
+            post(test_image_generation_connection),
+        )
         .route("/settings/user-rules/save", post(save_user_rules))
         .route("/settings/safeguard/save", post(save_safeguard_config))
         .route(
@@ -1062,6 +1071,91 @@ async fn test_auxiliary_connection(
     probe_connection_response(request).await
 }
 
+fn image_generation_section_request(request: &Value) -> Result<Value, ApiError> {
+    let config = model_settings_section_request(request)?;
+    let normalized =
+        NormalizedModelConfig::from_settings_value(&config).map_err(ApiError::InvalidInput)?;
+    normalized
+        .require_base_url()
+        .map_err(ApiError::InvalidInput)?;
+    normalized
+        .require_api_key()
+        .map_err(ApiError::InvalidInput)?;
+    normalized.require_model().map_err(ApiError::InvalidInput)?;
+
+    let mut canonical = Map::new();
+    for field in ["baseUrl", "apiKey", "model", "urlMode"] {
+        if let Some(value) = config.get(field).cloned() {
+            canonical.insert(field.to_string(), value);
+        }
+    }
+    Ok(Value::Object(canonical))
+}
+
+async fn save_image_generation_config(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    state
+        .settings_store
+        .set_section(
+            "imageGeneration",
+            image_generation_section_request(&request)?,
+        )
+        .map_err(settings_persistence_error)?;
+    Ok(Json(json!({ "saved": true })))
+}
+
+async fn test_image_generation_connection(
+    State(_state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let config = image_generation_section_request(&request)?;
+    let normalized =
+        NormalizedModelConfig::from_settings_value(&config).map_err(ApiError::InvalidInput)?;
+    let client = normalized
+        .to_http_image_generation_client()
+        .map_err(ApiError::InvalidInput)?;
+    let generated = tokio::task::spawn_blocking(move || {
+        client.generate(BridgeImageGenerationRequest {
+            prompt: "A simple blue square on a white background".to_string(),
+            size: "1024x1024".to_string(),
+            quality: None,
+        })
+    })
+    .await
+    .map_err(|error| {
+        tracing::warn!(error = %error, "image generation connection probe thread failed");
+        ApiError::InvalidInput("图片生成连接测试失败".to_string())
+    })?
+    .map_err(image_generation_probe_error)?;
+    Ok(Json(json!({
+        "success": true,
+        "message": "图片生成测试成功",
+        "mediaType": generated.media_type,
+        "bytes": generated.bytes.len(),
+    })))
+}
+
+fn image_generation_probe_error(error: BridgeClientError) -> ApiError {
+    let raw = error.to_string();
+    tracing::warn!(error = %raw, "image generation connection probe failed");
+    if let Some(status) = error.http_status() {
+        return ApiError::InvalidInput(model_http_status_error_message(status).to_string());
+    }
+    match error.layer() {
+        Some(BridgeErrorLayer::Transport) => {
+            ApiError::InvalidInput("图片生成服务连接失败".to_string())
+        }
+        Some(BridgeErrorLayer::Protocol) => {
+            ApiError::InvalidInput("图片生成服务响应格式异常".to_string())
+        }
+        Some(BridgeErrorLayer::RemoteBusiness) | None => {
+            ApiError::InvalidInput("图片生成服务暂不可用".to_string())
+        }
+    }
+}
+
 async fn save_user_rules(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
@@ -1650,6 +1744,30 @@ mod tests {
         }))
     }
 
+    async fn image_generation_probe_stub(
+        headers: HeaderMap,
+        Json(payload): Json<Value>,
+    ) -> Json<Value> {
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-image-key")
+        );
+        assert_eq!(payload["model"], json!("gpt-image-test"));
+        assert_eq!(
+            payload["prompt"],
+            json!("A simple blue square on a white background")
+        );
+        assert_eq!(payload["response_format"], json!("b64_json"));
+        Json(json!({
+            "data": [{
+                "b64_json": "iVBORw0KGgo=",
+                "revised_prompt": "a blue square"
+            }]
+        }))
+    }
+
     #[tokio::test]
     async fn connection_probe_supports_anthropic_messages_api() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1784,6 +1902,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_generation_test_uses_real_standard_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("stub addr should exist")
+        );
+        let app = Router::new().route("/v1/images/generations", post(image_generation_probe_stub));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("stub server should run");
+        });
+
+        let result = test_image_generation_connection(
+            State(test_state()),
+            Json(json!({
+                "config": {
+                    "baseUrl": base_url,
+                    "apiKey": "test-image-key",
+                    "model": "gpt-image-test",
+                    "urlMode": "standard"
+                }
+            })),
+        )
+        .await
+        .expect("image generation probe should succeed");
+
+        assert_eq!(result.0["success"], json!(true));
+        assert_eq!(result.0["mediaType"], json!("image/png"));
+        assert_eq!(result.0["bytes"], json!(8));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn fetch_models_redacts_remote_error_message() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1867,6 +2021,7 @@ mod tests {
             "workerConfigs",
             "orchestratorConfig",
             "auxiliaryConfig",
+            "imageGenerationConfig",
             "userRulesConfig",
             "skillsConfig",
             "safeguardConfig",
@@ -1892,7 +2047,7 @@ mod tests {
         let builtin_tools = bootstrap["builtinTools"]
             .as_array()
             .expect("builtin tools should be an array");
-        assert_eq!(builtin_tools.len(), 27);
+        assert_eq!(builtin_tools.len(), 28);
         let builtin_names: Vec<_> = builtin_tools
             .iter()
             .map(|tool| tool["name"].as_str().expect("tool name"))
@@ -1917,6 +2072,7 @@ mod tests {
                 "web_search",
                 "web_fetch",
                 "diagram_render",
+                "image_generate",
                 "knowledge_query",
                 "code_symbols",
                 "tool_catalog",
@@ -1996,7 +2152,7 @@ mod tests {
         let capability_dependencies = bootstrap["capabilityDependencies"]
             .as_array()
             .expect("capability dependencies should be an array");
-        assert_eq!(capability_dependencies.len(), 7);
+        assert_eq!(capability_dependencies.len(), 8);
         assert_eq!(
             capability_dependencies[0]["name"],
             serde_json::json!("knowledge_store")
@@ -2061,27 +2217,39 @@ mod tests {
         );
         assert_eq!(
             capability_dependencies[5]["name"],
-            serde_json::json!("context_runtime")
+            serde_json::json!("image_generation_model")
         );
         assert_eq!(
             capability_dependencies[5]["status"],
-            serde_json::json!("ready")
+            serde_json::json!("unavailable")
         );
         assert_eq!(
-            capability_dependencies[5]["sessionId"],
-            serde_json::json!("session-empty-contract")
+            capability_dependencies[5]["requiredBy"],
+            serde_json::json!(["image_generate"])
         );
         assert_eq!(
             capability_dependencies[6]["name"],
-            serde_json::json!("file_snapshot")
+            serde_json::json!("context_runtime")
         );
         assert_eq!(
             capability_dependencies[6]["status"],
+            serde_json::json!("ready")
+        );
+        assert_eq!(
+            capability_dependencies[6]["sessionId"],
+            serde_json::json!("session-empty-contract")
+        );
+        assert_eq!(
+            capability_dependencies[7]["name"],
+            serde_json::json!("file_snapshot")
+        );
+        assert_eq!(
+            capability_dependencies[7]["status"],
             serde_json::json!("ready"),
             "snapshot dependency should report the lazy snapshot capability as ready before the session starts"
         );
         assert_eq!(
-            capability_dependencies[6]["sessionId"],
+            capability_dependencies[7]["sessionId"],
             serde_json::json!("session-empty-contract")
         );
         assert!(
@@ -2872,6 +3040,34 @@ mod tests {
                 .is_null(),
             "全局连接保存接口不得写会话模型覆盖"
         );
+    }
+
+    #[tokio::test]
+    async fn save_image_generation_config_persists_canonical_model_fields() {
+        let state = test_state();
+        let _ = save_image_generation_config(
+            State(state.clone()),
+            Json(json!({
+                "config": {
+                    "baseUrl": "https://cpa.example.com/v1",
+                    "apiKey": "sk-image",
+                    "model": "gpt-image-1",
+                    "urlMode": "standard",
+                    "reasoningEffort": "high",
+                    "workspaceId": "workspace-ignored"
+                }
+            })),
+        )
+        .await
+        .expect("image generation config should save");
+
+        let saved = state.settings_store.get_section("imageGeneration");
+        assert_eq!(saved["baseUrl"], json!("https://cpa.example.com/v1"));
+        assert_eq!(saved["apiKey"], json!("sk-image"));
+        assert_eq!(saved["model"], json!("gpt-image-1"));
+        assert_eq!(saved["urlMode"], json!("standard"));
+        assert!(saved.get("reasoningEffort").is_none());
+        assert!(saved.get("workspaceId").is_none());
     }
 
     #[tokio::test]

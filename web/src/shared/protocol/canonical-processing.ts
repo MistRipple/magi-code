@@ -10,19 +10,16 @@ function readMetadataString(
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function collectTurnRequestIds(turn: CanonicalTurn): string[] {
-  const requestIds = new Set<string>();
+function readTurnRootRequestId(turn: CanonicalTurn): string {
   const turnRequestId = readMetadataString(turn.metadata, 'requestId');
   if (turnRequestId) {
-    requestIds.add(turnRequestId);
+    return turnRequestId;
   }
-  for (const item of turn.items) {
-    const itemRequestId = readMetadataString(item.metadata, 'requestId');
-    if (itemRequestId) {
-      requestIds.add(itemRequestId);
-    }
-  }
-  return [...requestIds];
+
+  const rootUserItem = turn.items
+    .filter((item) => item.kind === 'user_message')
+    .sort((left, right) => left.itemSeq - right.itemSeq || left.itemId.localeCompare(right.itemId))[0];
+  return readMetadataString(rootUserItem?.metadata, 'requestId');
 }
 
 export function deriveProcessingStateFromCanonicalTurns(
@@ -46,7 +43,8 @@ export function deriveProcessingStateFromCanonicalTurns(
   let startedAt = Number.POSITIVE_INFINITY;
   for (const turn of activeTurns) {
     startedAt = Math.min(startedAt, turn.acceptedAt);
-    for (const requestId of collectTurnRequestIds(turn)) {
+    const requestId = readTurnRootRequestId(turn);
+    if (requestId) {
       pendingRequestIds.add(requestId);
     }
   }

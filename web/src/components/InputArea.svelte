@@ -41,6 +41,8 @@
     type ComposerWorkspaceOption,
   } from '../stores/composer-workspace.svelte';
   import { openWorkspaceFolderPicker } from '../stores/workspace-onboarding.svelte';
+  import { turnStoreState } from '../stores/turn-store.svelte';
+  import { canFetchModelList } from '../shared/model-governance';
   import {
     buildComposerActions,
     filterSlashCommands,
@@ -67,6 +69,7 @@
   type SkillOption = ComposerSkillOption;
 
   type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
+  type FollowUpMode = 'queue' | 'guide';
 
   const reasoningOptions: Array<{
     value: ReasoningEffort;
@@ -127,6 +130,7 @@
   let selectedImages = $state<SelectedImage[]>([]);
   let pendingImageReadCount = $state(0);
   let sendPreparing = $state(false);
+  let followUpMode = $state<FollowUpMode>('queue');
   const MAX_IMAGES = 5;  // 最多支持 5 张图片
   const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
   const IMAGE_FILE_NAME_PATTERN = /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i;
@@ -226,6 +230,11 @@
   ));
 
   const isSending = $derived.by(() => messagesState.isProcessing || shouldInterruptAgentRunFromComposer);
+  const canGuideCurrentTurn = $derived.by(() => (
+    Boolean(currentSessionId?.trim())
+    && turnStoreState.reducer.sessionId === currentSessionId?.trim()
+    && turnStoreState.reducer.turns.some((turn) => turn.status === 'running' || turn.status === 'pending')
+  ));
   const activeInteraction = $derived.by(() => getActiveInteractionType());
   const isInteractionBlocking = $derived.by(() => Boolean(activeInteraction));
   const queuedMessages = $derived.by(() => getQueuedMessages());
@@ -235,7 +244,9 @@
   let pendingCaretOffset = $state<number | null>(null);
   const sendButtonTitle = $derived.by(() => {
     if (isSending) {
-      return i18n.t('input.followUp.queueTitle');
+      return i18n.t(
+        followUpMode === 'guide' ? 'input.followUp.guideTitle' : 'input.followUp.queueTitle',
+      );
     }
     if (!mainModelReady) {
       return i18n.t('input.mainModelRequired');
@@ -245,6 +256,12 @@
   const sendDisabled = $derived.by(() => (
     sessionInputLocked || isInteractionBlocking || sendPreparing || pendingImageReadCount > 0 || !mainModelReady
   ));
+
+  $effect(() => {
+    if (!isSending || (followUpMode === 'guide' && !canGuideCurrentTurn)) {
+      followUpMode = 'queue';
+    }
+  });
   // 按钮双态状态 - 使用 $derived 计算
   const hasContent = $derived.by(() => {
     if (inputValue.trim().length > 0) return true;
@@ -901,6 +918,19 @@
         addToast('warning', i18n.t('input.noImageDuringExecution'));
         return;
       }
+      if (
+        isSending
+        && followUpMode === 'guide'
+        && (
+          !normalizedContent
+          || selectedSkill !== null
+          || selectedGoalMode
+          || selectedContextReferences.length > 0
+        )
+      ) {
+        addToast('warning', i18n.t('input.followUp.guideTextOnly'));
+        return;
+      }
 
       const submissionText = normalizedContent
         ? rawContent
@@ -934,7 +964,7 @@
         goalMode: selectedGoalMode,
         accessProfile: selectedAccessProfile,
         orchestratorSessionConfig: getTurnOrchestratorSessionConfigPayload(),
-        followUpMode: !isDraftSession && isSending ? 'queue' : undefined,
+        followUpMode: !isDraftSession && isSending ? followUpMode : undefined,
         images: selectedImages.map((img) => ({
           name: img.name,
           dataUrl: img.dataUrl,
@@ -1225,7 +1255,7 @@
   }
 
   function orchestratorModelListConfigKey(config: Record<string, unknown> | null): string {
-    if (!config) return '';
+    if (!config || !canFetchModelList(config)) return '';
     const baseUrl = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : '';
     const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : '';
     const urlMode = typeof config.urlMode === 'string' ? config.urlMode.trim() : '';
@@ -1325,6 +1355,8 @@
       pickerModelsConfigKey = configKey;
       pickerLoadedOnce = true;
     } catch (error) {
+      pickerModelsConfigKey = configKey;
+      pickerLoadedOnce = true;
       console.warn('[InputArea] 拉取主线模型列表失败:', error);
       pickerError = i18n.t('input.modelListLoadFailed');
     } finally {
@@ -2198,6 +2230,25 @@
           </button>
           {/if}
           {#if isSending}
+          <button
+            type="button"
+            class="ia-followup-mode"
+            class:guide={followUpMode === 'guide'}
+            data-testid="input-followup-mode-button"
+            onclick={() => {
+              followUpMode = followUpMode === 'queue' && canGuideCurrentTurn ? 'guide' : 'queue';
+            }}
+            disabled={!canGuideCurrentTurn && followUpMode === 'queue'}
+            title={i18n.t(
+              followUpMode === 'guide' ? 'input.followUp.guideTitle' : 'input.followUp.queueTitle',
+            )}
+            aria-label={`${i18n.t('input.followUp.mode')}: ${i18n.t(
+              followUpMode === 'guide' ? 'input.followUp.guide' : 'input.followUp.queue',
+            )}`}
+          >
+            <Icon name={followUpMode === 'guide' ? 'git-branch' : 'clock'} size={12} />
+            <span>{i18n.t(followUpMode === 'guide' ? 'input.followUp.guide' : 'input.followUp.queue')}</span>
+          </button>
           {#if hasContent}
             <button
               class="ia-send ready"
@@ -2429,6 +2480,35 @@
   .ia-send:disabled { opacity: 0.35; cursor: not-allowed; }
   .ia-send.stop { background: var(--error); color: white; animation: ia-pulse 1.2s ease-in-out infinite; }
   @keyframes ia-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.65; } }
+
+  .ia-followup-mode {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 24px;
+    max-width: 86px;
+    padding: 0 7px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: var(--foreground-muted);
+    font-size: 11px;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: color var(--transition-fast), border-color var(--transition-fast), background var(--transition-fast);
+  }
+
+  .ia-followup-mode:hover:not(:disabled),
+  .ia-followup-mode.guide {
+    color: var(--primary);
+    border-color: color-mix(in srgb, var(--primary) 42%, transparent);
+    background: color-mix(in srgb, var(--primary) 10%, transparent);
+  }
+
+  .ia-followup-mode:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
 
   .ia-enhance {
     display: inline-flex;
@@ -3575,6 +3655,11 @@
       flex: 0 0 28px;
     }
 
+    .ia-followup-mode {
+      flex: 0 0 auto;
+      max-width: 72px;
+    }
+
     .ia-picker-popover {
       width: min(280px, calc(100vw - 24px));
       max-height: min(360px, 56vh);
@@ -3599,6 +3684,17 @@
     .ia-workspace-btn-label,
     .ia-branch-btn-label {
       min-width: 0;
+    }
+
+    .ia-followup-mode {
+      width: 24px;
+      max-width: 24px;
+      padding: 0;
+      justify-content: center;
+    }
+
+    .ia-followup-mode span {
+      display: none;
     }
   }
 

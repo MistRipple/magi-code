@@ -30,6 +30,7 @@ const APPLY_PATCH_TEXT_KEYS = ['patch', 'input', 'text'];
 const SINGLE_FILE_TOOLS = new Set([
   'file_read',
   'view_image',
+  'image_generate',
   'file_write',
   'file_patch',
   'file_mkdir',

@@ -6,6 +6,14 @@ const headerSource = await readFile(
   new URL('../src/components/Header.svelte', import.meta.url),
   'utf8',
 );
+const workbenchShellSource = await readFile(
+  new URL('../src/web/WebWorkbenchShell.svelte', import.meta.url),
+  'utf8',
+);
+const rightPaneSource = await readFile(
+  new URL('../src/web/RightPane.svelte', import.meta.url),
+  'utf8',
+);
 const topTabsSource = await readFile(
   new URL('../src/components/TopTabs.svelte', import.meta.url),
   'utf8',
@@ -20,6 +28,10 @@ const settingsAgentsSource = await readFile(
 );
 const settingsToolsSource = await readFile(
   new URL('../src/components/SettingsToolsTab.svelte', import.meta.url),
+  'utf8',
+);
+const inputAreaSource = await readFile(
+  new URL('../src/components/InputArea.svelte', import.meta.url),
   'utf8',
 );
 const zhLocaleSource = await readFile(
@@ -88,8 +100,33 @@ assert.doesNotMatch(
 );
 assert.doesNotMatch(
   headerSource,
-  /\.header-notification-btn,\s*\.header-right-pane-btn\s*\{\s*display:\s*none;/,
-  '手机端只能隐藏通知按钮，右侧面板按钮必须保持独立可见',
+  /\{#if\s+showRightPaneToggle\s+&&\s+currentRightPane\.collapsed\}/,
+  '右栏开关不能只在折叠态出现，展开后仍应留在 Header 右侧图标组内',
+);
+assert.match(
+  headerSource,
+  /class="btn-icon header-action-btn header-right-pane-btn"[\s\S]*?onclick=\{toggleRightPane\}/,
+  '右栏开关必须作为 Header 右侧图标组的一员常驻渲染',
+);
+assert.doesNotMatch(
+  headerSource,
+  /class:active=\{!currentRightPane\.collapsed\}/,
+  '右栏开关只负责展开和折叠，不得因面板已展开而持续显示选中态',
+);
+assert.doesNotMatch(
+  workbenchShellSource,
+  /right-pane-edge-toggle/,
+  '工作台外壳不得保留脱离 Header 图标组的绝对定位右栏开关',
+);
+assert.doesNotMatch(
+  rightPaneSource,
+  /right-pane-collapse-btn/,
+  '右栏内部不得保留第二套折叠按钮',
+);
+assert.match(
+  workbenchShellSource,
+  /import MagiWordmark[\s\S]*?<MagiWordmark\s*\/>/,
+  '产品标识应保留在左侧面板顶部，不能因清理应用 Header 而一并删除',
 );
 assert.match(
   settingsAgentsSource,
@@ -125,6 +162,16 @@ assert.match(
   settingsToolsSource,
   /@container tools-tab \(max-width:\s*760px\)[\s\S]*?\.capability-dependency-strip\s*\{[\s\S]*?grid-column:\s*1 \/ -1;[\s\S]*?width:\s*100%;/,
   '窄屏依赖状态必须占据完整第二行并按自然宽度换行',
+);
+assert.match(
+  inputAreaSource,
+  /type FollowUpMode = 'queue' \| 'guide'/,
+  '运行中发送必须明确区分独立排队和当前轮引导',
+);
+assert.match(
+  inputAreaSource,
+  /data-testid="input-followup-mode-button"/,
+  '运行中输入区必须提供可见的排队与引导模式入口',
 );
 
 await withGoldenViteServer(async (server) => {

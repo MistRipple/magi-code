@@ -15,10 +15,6 @@
     setRightPaneCollapsed,
   } from '../stores/right-pane.svelte';
 
-  // 右侧面板：折叠/展开切换按钮作为常驻入口；作用域由 store 的 activeScopeKey 决定。
-  const currentRightPane = $derived(getRightPaneState(rightPaneState.activeScopeKey));
-  const showRightPaneToggle = $derived(Boolean(rightPaneState.activeScopeKey));
-
   import type { Snippet } from 'svelte';
   interface Props {
     onOpenSettings?: () => void;
@@ -29,6 +25,8 @@
   const appState = getState();
   // Web 外壳通过 context 注入 sidebar 切换能力，桌面/Tauri 路径无 context 时按钮不渲染。
   const webSidebar = getWebSidebarContext();
+  const currentRightPane = $derived(getRightPaneState(rightPaneState.activeScopeKey));
+  const showRightPaneToggle = $derived(Boolean(rightPaneState.activeScopeKey));
 
   type HeaderPanel = 'notifications' | 'more' | 'lan';
   let activeHeaderPanel = $state<HeaderPanel | null>(null);
@@ -73,13 +71,13 @@
     activeHeaderPanel = open ? 'notifications' : null;
   }
 
-  function openRightPane() {
+  function toggleRightPane() {
     activeHeaderPanel = null;
     if (webSidebar) {
-      webSidebar.openRightPane();
+      webSidebar.toggleRightPane();
       return;
     }
-    setRightPaneCollapsed(rightPaneState.activeScopeKey, false);
+    setRightPaneCollapsed(rightPaneState.activeScopeKey, !currentRightPane.collapsed);
   }
 
   onMount(() => {
@@ -138,12 +136,13 @@
         <span class="header-action-badge">{unreadNotificationCount > 99 ? '99+' : unreadNotificationCount}</span>
       {/if}
     </button>
-    {#if showRightPaneToggle && currentRightPane.collapsed}
+    {#if showRightPaneToggle}
       <button
         class="btn-icon header-action-btn header-right-pane-btn"
-        onclick={openRightPane}
-        title={i18n.t('rightPane.expand')}
-        aria-label={i18n.t('rightPane.expand')}
+        onclick={toggleRightPane}
+        title={i18n.t(currentRightPane.collapsed ? 'rightPane.expand' : 'rightPane.collapse')}
+        aria-label={i18n.t(currentRightPane.collapsed ? 'rightPane.expand' : 'rightPane.collapse')}
+        aria-expanded={!currentRightPane.collapsed}
       >
         <Icon name="sidebar-toggle" size={14} class="right-pane-toggle-icon" />
       </button>
@@ -268,6 +267,10 @@
     color: var(--foreground);
   }
 
+  :global(.right-pane-toggle-icon) {
+    transform: scaleX(-1);
+  }
+
   .header-action-badge {
     position: absolute;
     top: -2px;
@@ -295,10 +298,6 @@
     border-radius: var(--radius-full);
     background: var(--error);
     box-shadow: 0 0 0 2px var(--glass-bg);
-  }
-
-  :global(.right-pane-toggle-icon) {
-    transform: scaleX(-1);
   }
 
   .header-more-menu {

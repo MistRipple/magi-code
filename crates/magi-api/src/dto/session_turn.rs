@@ -51,14 +51,13 @@ pub struct SessionTurnRequestDto {
     pub request_id: Option<String>,
     pub user_message_id: Option<String>,
     pub placeholder_message_id: Option<String>,
-    /// 当为 true 时，本次输入直接作为运行时 followup 信号投递到目标任务 Mailbox，
-    /// 不进入分类器，也不创建新任务。
+    /// 当为 true 时，本次输入作为引导追加到当前活跃 Turn，不进入分类器，
+    /// 也不创建新的独立 Turn。
     #[serde(default)]
-    pub supplement_context: bool,
-    /// 当 `supplement_context` 为 true 时，可选指定投递到哪个任务；
-    /// 缺省投递到当前 mission 的 root task。
+    pub steer_current_turn: bool,
+    /// 引导必须绑定调用方观察到的当前 Turn，防止完成边界后的迟到输入串入下一轮。
     #[serde(default)]
-    pub target_task_id: Option<String>,
+    pub expected_turn_id: Option<String>,
 }
 
 impl SessionTurnRequestDto {
@@ -189,6 +188,10 @@ impl SessionTurnRequestDto {
         trimmed_non_empty(self.placeholder_message_id.as_deref())
     }
 
+    pub fn expected_turn_id(&self) -> Option<String> {
+        trimmed_non_empty(self.expected_turn_id.as_deref())
+    }
+
     pub fn timeline_message(&self, trimmed_text: Option<&str>) -> String {
         let mut message_lines = Vec::new();
 
@@ -225,7 +228,7 @@ pub enum SessionTurnRouteDto {
     Execute,
     Task,
     Continue,
-    SupplementContext,
+    Steer,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -258,12 +261,9 @@ pub struct SessionTurnResponseDto {
     pub canonical_turn: Option<CanonicalTurn>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_item: Option<CanonicalTurnItem>,
-    /// 仅在 supplement_context 路由下返回：本次入栈的 mailbox signal ID。
+    /// 仅在 steer 路由下返回：本次引导实际写入的活跃 Turn ID。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub signal_ref: Option<String>,
-    /// 仅在 supplement_context 路由下返回：被投递的任务 ID。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_task_id: Option<String>,
+    pub steered_turn_id: Option<String>,
 }
 
 pub struct SessionTurnResponseInput {
@@ -311,8 +311,7 @@ impl SessionTurnResponseDto {
             canonical_event_kind: None,
             canonical_turn: None,
             canonical_item: None,
-            signal_ref: None,
-            target_task_id: None,
+            steered_turn_id: None,
         }
     }
 
@@ -323,9 +322,8 @@ impl SessionTurnResponseDto {
         self
     }
 
-    pub fn with_supplement_signal(mut self, signal_ref: String, target_task_id: String) -> Self {
-        self.signal_ref = Some(signal_ref);
-        self.target_task_id = Some(target_task_id);
+    pub fn with_steered_turn(mut self, turn_id: String) -> Self {
+        self.steered_turn_id = Some(turn_id);
         self
     }
 
@@ -381,8 +379,8 @@ mod tests {
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            supplement_context: false,
-            target_task_id: None,
+            steer_current_turn: false,
+            expected_turn_id: None,
         };
 
         assert_eq!(

@@ -1,4 +1,5 @@
 use super::{
+    app::Daemon,
     config::DaemonConfig,
     events::ledger_status_payload,
     maintenance::{
@@ -3636,5 +3637,37 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
             .iter()
             .any(|m| m["mission_id"] == session_mission_id),
         "bootstrap should contain session-level execution group"
+    );
+}
+
+#[tokio::test]
+async fn daemon_handle_starts_serves_and_shuts_down_idempotently() {
+    let state_root = temp_state_root("daemon-handle-lifecycle");
+    let daemon = Daemon::new(DaemonConfig::new(
+        "127.0.0.1",
+        0,
+        "daemon-handle-test",
+        state_root,
+    ));
+
+    let handle = daemon.start().await.expect("daemon should start");
+    assert_ne!(handle.bound_addr().port(), 0);
+    let health_url = handle.web_url().replace("/web.html", "/health");
+    let response = reqwest::get(&health_url)
+        .await
+        .expect("health endpoint should be reachable");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    handle
+        .shutdown("desktop exit")
+        .expect("first shutdown request should succeed");
+    handle
+        .shutdown("duplicate desktop exit")
+        .expect("duplicate shutdown request should be idempotent");
+    handle.wait().await.expect("daemon should stop cleanly");
+
+    assert!(
+        reqwest::get(&health_url).await.is_err(),
+        "daemon port should be released after shutdown"
     );
 }

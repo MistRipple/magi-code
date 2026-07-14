@@ -8,19 +8,16 @@ use magi_conversation_runtime::session_turn_execution::{
 };
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_conversation_runtime::{
-    MailboxAuthor, MailboxKind, RuntimeSignal, public_builtin_tool_references,
-    task_execution_registry::TaskExecutionPlan, tool_reference_position,
+    SessionTurnInputCommitError, SessionTurnInputError, UserSignal, public_builtin_tool_references,
+    tool_reference_position,
 };
 use magi_core::{AccessProfile, TaskStatus};
-use magi_core::{
-    DomainError, EventId, MissionId, SessionId, Task, TaskId, TaskTier, UtcMillis, WorkerId,
-    WorkspaceId,
-};
+use magi_core::{DomainError, EventId, SessionId, TaskTier, UtcMillis, WorkerId, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn,
     GoalStatus, NotificationRecord, NotificationScope, SessionGoal, SessionRecord,
-    ThreadChatMessage, TimelineEntryKind,
+    TimelineEntryKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -105,8 +102,8 @@ async fn submit_session_turn(
         requested_workspace_id.as_deref(),
         requested_workspace_path.as_deref(),
     )?;
-    if request.supplement_context {
-        return submit_supplement_context_turn(&state, &request, &workspace_id, accepted_at)
+    if request.steer_current_turn {
+        return submit_steer_current_turn(&state, &request, &workspace_id, accepted_at)
             .await
             .map(Json);
     }
@@ -190,8 +187,8 @@ async fn submit_session_turn(
                 ),
             ))
         }
-        SessionTurnRouteDto::SupplementContext => {
-            unreachable!("supplement_context route should be handled before classifier")
+        SessionTurnRouteDto::Steer => {
+            unreachable!("steer route should be handled before classifier")
         }
         SessionTurnRouteDto::Continue => {
             let session_id = request
@@ -263,7 +260,6 @@ struct SessionTurnIntentDecision {
     task_evidence: Vec<String>,
 }
 
-static SUPPLEMENT_SIGNAL_COUNTER: AtomicU64 = AtomicU64::new(1);
 static INCIDENT_NOTIFICATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct EnqueueSessionTurnInput<'a> {
@@ -332,7 +328,7 @@ fn enqueue_session_turn_response(input: EnqueueSessionTurnInput<'_>) -> SessionT
     .with_queued(queue_id, queue_position)
 }
 
-async fn submit_supplement_context_turn(
+async fn submit_steer_current_turn(
     state: &ApiState,
     request: &SessionTurnRequestDto,
     workspace_id: &WorkspaceId,
@@ -340,96 +336,95 @@ async fn submit_supplement_context_turn(
 ) -> Result<SessionTurnResponseDto, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
     require_session_record_in_workspace(state, &session_id, Some(workspace_id.as_str()))?;
+    let expected_turn_id = request
+        .expected_turn_id()
+        .ok_or_else(|| ApiError::InvalidInput("引导当前回复必须提供 expectedTurnId".to_string()))?;
+    if request.skill_name.is_some()
+        || request.goal_mode
+        || !request.images.is_empty()
+        || !request.context_references.is_empty()
+    {
+        return Err(ApiError::InvalidInput(
+            "引导当前回复仅支持文字输入".to_string(),
+        ));
+    }
     state
         .ensure_snapshot_session_for_workspace_id(&session_id, &Some(workspace_id.clone()))
         .await?;
-    // S1：user 信号经 Conversation Mailbox 入栈，下游一律读 signal.* 不再读 request.*
-    let signal = super::ingest_user_input_to_conversation(state, &session_id, request, accepted_at);
-    let message = signal
-        .text
-        .clone()
-        .ok_or_else(|| ApiError::InvalidInput("运行时 followup 消息不能为空".to_string()))?;
-    let store = state
-        .task_store()
-        .ok_or_else(|| ApiError::internal_assembly("supplement context", "task_store 未配置"))?;
-
-    let ownership = state
+    let message = request
+        .trimmed_text()
+        .ok_or_else(|| ApiError::InvalidInput("引导消息不能为空".to_string()))?;
+    let orchestrator_thread_id = state
         .session_store
-        .execution_ownership(&session_id)
-        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
-    let mission_id = ownership
-        .mission_id
-        .ok_or_else(|| ApiError::InvalidInput("当前会话没有活跃任务".to_string()))?;
-
-    let root_task = store
-        .get_tasks_by_mission(&mission_id)
-        .into_iter()
-        .find(|task| task.parent_task_id.is_none())
-        .ok_or_else(|| ApiError::InvalidInput("当前 Mission 没有根任务".to_string()))?;
-    let target_task = resolve_supplement_target_task(
-        store,
-        &mission_id,
-        &root_task,
-        request.target_task_id.as_deref(),
-    )?;
-    let target_task_id = target_task.task_id.clone();
-
-    let mailbox_signal_ref = format!(
-        "mailbox-signal-{}-{}",
-        UtcMillis::now().0,
-        SUPPLEMENT_SIGNAL_COUNTER.fetch_add(1, Ordering::SeqCst)
-    );
-    let thread_id = match state.task_execution_registry().get(&target_task_id) {
-        Some(TaskExecutionPlan::Dispatch { thread_id, .. }) => Some(thread_id),
-        None if target_task_id == root_task.task_id => state
-            .session_store
-            .orchestrator_thread_for_session(&session_id)
-            .map(|thread| thread.thread_id),
-        None => None,
-    }
-    .ok_or_else(|| {
-        ApiError::InvalidInput(format!(
-            "任务 {} 尚未注册执行 thread，无法投递运行时输入",
-            target_task_id
-        ))
-    })?;
-
-    let signal_payload = json!({
-        "signal_ref": mailbox_signal_ref,
-        "text": message,
-        "target_task_id": target_task_id.to_string(),
-    });
+        .orchestrator_thread_for_session(&session_id)
+        .map(|thread| thread.thread_id)
+        .ok_or_else(|| ApiError::InvalidInput("当前会话没有主线执行线程".to_string()))?;
+    let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
+    let request_id = request.request_id();
+    let user_message_id = request.user_message_id();
+    let (user_message_item_id, mut user_message_item) =
+        build_user_message_turn_item(UserMessageTurnItemInput {
+            accepted_at,
+            message: &message,
+            entry_id: &entry_id,
+            request_id: request_id.clone(),
+            user_message_id: user_message_id.clone(),
+            placeholder_message_id: None,
+            metadata: Default::default(),
+            task_id: None,
+            source_thread_id: orchestrator_thread_id,
+        });
+    user_message_item.item_seq = 0;
+    let signal = UserSignal {
+        text: Some(message),
+        request_id,
+        user_message_id,
+        placeholder_message_id: None,
+        accepted_at,
+    };
     state
         .conversation_registry
-        .conversation_for_task(&session_id, &target_task_id)
-        .lock()
-        .expect("target task Conversation mutex poisoned")
-        .ingest_runtime_signal(RuntimeSignal {
-            author: MailboxAuthor::User,
-            kind: MailboxKind::Followup,
-            trigger_turn: true,
-            payload: signal_payload.clone(),
-            enqueued_at: accepted_at,
-        });
-    state.session_store.append_thread_messages(
-        &thread_id,
-        vec![ThreadChatMessage {
-            role: "system".to_string(),
-            content: Some(format!(
-                "[mailbox]\nauthor=user\nkind=followup\npayload={}",
-                signal_payload
-            )),
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }],
-        accepted_at,
+        .try_steer_session_turn_with(&session_id, &expected_turn_id, signal, || {
+            state
+                .session_store
+                .append_current_turn_item(&session_id, user_message_item)
+                .and_then(|sidecar| {
+                    sidecar.ok_or(magi_core::DomainError::InvalidState {
+                        message: "当前会话没有可写入的活跃 Turn".to_string(),
+                    })
+                })
+        })
+        .map_err(|error| match error {
+            SessionTurnInputCommitError::Input(input_error) => steer_input_error(input_error),
+            SessionTurnInputCommitError::Commit(error) => {
+                ApiError::internal_assembly("写入当前 Turn 引导失败", error)
+            }
+        })?;
+    state.persist_session_state_checkpoint("session_turn_steered")?;
+    publish_current_session_turn_item_event(
+        state.event_bus.as_ref(),
+        state.session_store.as_ref(),
+        &session_id,
+        &Some(workspace_id.clone()),
+        &user_message_item_id,
+        state.task_store(),
     );
-    let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
-    state.persist_session_state_checkpoint("session_supplement_context")?;
+    let canonical_turn = state
+        .session_store
+        .canonical_turns_for_session(&session_id)
+        .into_iter()
+        .find(|turn| turn.turn_id == expected_turn_id);
+    let canonical_item = canonical_turn
+        .as_ref()
+        .and_then(|turn| {
+            turn.items
+                .iter()
+                .find(|item| item.item_id == user_message_item_id)
+        })
+        .cloned();
 
     let event_id = EventId::new(format!(
-        "event-session-supplement-context-{}-{}",
+        "event-session-turn-steered-{}-{}",
         session_id, accepted_at.0
     ));
 
@@ -439,35 +434,28 @@ async fn submit_supplement_context_turn(
         event_id,
         accepted_at,
         created_session: false,
-        route: SessionTurnRouteDto::SupplementContext,
+        route: SessionTurnRouteDto::Steer,
         root_task_id: None,
         action_task_id: None,
         execution_chain_ref: None,
-        user_message_item_id: None,
+        user_message_item_id: Some(user_message_item_id),
     })
-    .with_supplement_signal(mailbox_signal_ref, target_task_id.to_string()))
+    .with_steered_turn(expected_turn_id)
+    .with_canonical_event("turn_item_upsert", canonical_turn, canonical_item))
 }
 
-fn resolve_supplement_target_task(
-    store: &magi_orchestrator::task_store::TaskStore,
-    mission_id: &MissionId,
-    root_task: &Task,
-    target_task_id: Option<&str>,
-) -> Result<Task, ApiError> {
-    let Some(raw) = target_task_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(root_task.clone());
-    };
-    let task_id = TaskId::new(raw);
-    let task = store
-        .get_task(&task_id)
-        .ok_or_else(|| ApiError::InvalidInput(format!("目标任务不存在: {raw}")))?;
-    if task.mission_id != *mission_id {
-        return Err(ApiError::InvalidInput(format!("任务 {raw} 不属于当前会话")));
+fn steer_input_error(error: SessionTurnInputError) -> ApiError {
+    match error {
+        SessionTurnInputError::NoActiveTurn => {
+            ApiError::Conflict("当前回复已经结束，无法继续引导".to_string())
+        }
+        SessionTurnInputError::TurnMismatch { .. } => {
+            ApiError::Conflict("当前回复已经切换，请基于最新状态重新发送".to_string())
+        }
+        SessionTurnInputError::AlreadyActive { .. } => {
+            ApiError::Conflict("当前会话的引导通道状态冲突".to_string())
+        }
     }
-    Ok(task)
 }
 
 fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), ApiError> {
@@ -586,7 +574,7 @@ fn local_session_turn_intent_decision(
                 SessionTurnRouteDto::Continue => "continue_requested",
                 SessionTurnRouteDto::Task => "explicit_task_request",
                 SessionTurnRouteDto::Execute => "tool_request",
-                SessionTurnRouteDto::Chat | SessionTurnRouteDto::SupplementContext => {
+                SessionTurnRouteDto::Chat | SessionTurnRouteDto::Steer => {
                     if requests_goal_mode {
                         "goal_mode_request"
                     } else {
@@ -601,7 +589,7 @@ fn local_session_turn_intent_decision(
                 SessionTurnRouteDto::Continue => "用户要求继续且存在可恢复链",
                 SessionTurnRouteDto::Task => "用户请求需要结构化任务执行",
                 SessionTurnRouteDto::Execute => "用户请求需要工具执行但不需要代理运行记录",
-                SessionTurnRouteDto::Chat | SessionTurnRouteDto::SupplementContext => {
+                SessionTurnRouteDto::Chat | SessionTurnRouteDto::Steer => {
                     if requests_goal_mode {
                         "用户请求目标模式，由主线会话使用 Goal 工具持续推进"
                     } else {
@@ -1327,6 +1315,10 @@ async fn submit_regular_session_turn(
         }
     };
     state.persist_session_state_checkpoint("session_turn_accepted")?;
+    state
+        .conversation_registry
+        .begin_session_turn_input(session_id.clone(), turn_id.clone())
+        .map_err(|error| ApiError::internal_assembly("开启当前 Turn 引导通道失败", error))?;
     // S1：user 信号只在 turn 被正式接受后入栈，避免排队/冲突请求污染当前 Conversation。
     super::ingest_user_input_to_conversation(&state, &session_id, &request, accepted_at);
     publish_session_user_message_created_event(
@@ -1447,35 +1439,15 @@ fn spawn_regular_session_turn_execution(
     route: SessionTurnRouteDto,
     created_session: bool,
 ) {
-    tokio::task::spawn_blocking(move || {
-        let session_id = execution_request.session_id.clone();
-        let workspace_id = execution_request.workspace_id.clone();
-        let dispatcher = match state.session_turn_dispatcher() {
-            Some(dispatcher) => dispatcher.clone(),
-            None => {
-                tracing::error!(
-                    session_id = %session_id,
-                    "regular session turn background execution failed: dispatcher missing"
-                );
-                publish_regular_session_turn_early_failed(
-                    &state,
-                    &session_id,
-                    workspace_id.clone(),
-                    accepted_at,
-                    route,
-                    SessionTurnFailedReason::DispatcherUnavailable,
-                );
-                record_active_goal_turn_failure(&state, &session_id);
-                schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
-                return;
-            }
-        };
-
-        if let Err(error) = super::begin_session_turn(&state, &session_id) {
+    let session_id = execution_request.session_id.clone();
+    let workspace_id = execution_request.workspace_id.clone();
+    let turn_id = execution_request.turn_id.clone();
+    let dispatcher = match state.session_turn_dispatcher() {
+        Some(dispatcher) => dispatcher.clone(),
+        None => {
             tracing::error!(
                 session_id = %session_id,
-                error = ?error,
-                "regular session turn background execution rejected: active turn already exists"
+                "regular session turn background execution failed: dispatcher missing"
             );
             publish_regular_session_turn_early_failed(
                 &state,
@@ -1483,14 +1455,42 @@ fn spawn_regular_session_turn_execution(
                 workspace_id.clone(),
                 accepted_at,
                 route,
-                SessionTurnFailedReason::ActiveTurnConflict,
+                SessionTurnFailedReason::DispatcherUnavailable,
             );
+            state
+                .conversation_registry
+                .close_session_turn_input(&session_id, &turn_id);
             record_active_goal_turn_failure(&state, &session_id);
             schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
             return;
         }
-        let turn_id = execution_request.turn_id.clone();
+    };
+    if let Err(error) = super::begin_session_turn(&state, &session_id) {
+        tracing::error!(
+            session_id = %session_id,
+            error = ?error,
+            "regular session turn background execution rejected: active turn already exists"
+        );
+        publish_regular_session_turn_early_failed(
+            &state,
+            &session_id,
+            workspace_id.clone(),
+            accepted_at,
+            route,
+            SessionTurnFailedReason::ActiveTurnConflict,
+        );
+        state
+            .conversation_registry
+            .close_session_turn_input(&session_id, &turn_id);
+        record_active_goal_turn_failure(&state, &session_id);
+        schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
         let outcome = dispatcher.execute_session_turn(execution_request);
+        state
+            .conversation_registry
+            .close_session_turn_input(&session_id, &turn_id);
         super::finalize_session_turn(&state, &session_id, outcome.is_ok());
         match outcome {
             Ok(output) => {
@@ -1702,6 +1702,10 @@ async fn submit_goal_continuation_turn(
             map_current_turn_accept_error("接受 goal continuation turn 失败", error)
         })?;
     state.persist_session_state_checkpoint("goal_continuation_turn_accepted")?;
+    state
+        .conversation_registry
+        .begin_session_turn_input(session_id.clone(), turn_id.clone())
+        .map_err(|error| ApiError::internal_assembly("开启目标续跑 Turn 引导通道失败", error))?;
     let accepted_canonical_turn = state
         .session_store
         .canonical_turns_for_session(&session_id)
@@ -1813,7 +1817,7 @@ async fn drain_next_queued_regular_session_turn(
             )
             .await
         }
-        SessionTurnRouteDto::Continue | SessionTurnRouteDto::SupplementContext => Err(
+        SessionTurnRouteDto::Continue | SessionTurnRouteDto::Steer => Err(
             ApiError::internal_assembly("执行排队 session turn", "不支持的排队 route"),
         ),
     };
@@ -3277,6 +3281,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
+    use magi_conversation_runtime::task_execution_registry::TaskExecutionPlan;
     use magi_core::{
         AbsolutePath, ExecutionOwnership, GoalId, MissionId, Task, TaskExecutionTarget, TaskId,
         TaskKind, TaskRuntimePayload, TaskStatus, ThreadId, UtcMillis, WorkerId, WorkspaceId,
@@ -3533,8 +3538,8 @@ mod tests {
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
-            supplement_context: false,
-            target_task_id: None,
+            steer_current_turn: false,
+            expected_turn_id: None,
         }
     }
 
@@ -4168,92 +4173,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supplement_context_turn_enqueues_followup_mailbox_signal() {
-        let task_store = Arc::new(TaskStore::new());
-        let state = test_state().with_task_store(task_store.clone());
-        let workspace_id =
-            register_workspace(&state, "workspace-supplement-mailbox", "supplement-mailbox");
-        let session_id = SessionId::new("session-supplement-mailbox");
-        let mission_id = MissionId::new("mission-supplement-mailbox");
-        let root_task = test_root_task("task-root-supplement", mission_id.as_str());
-        task_store.insert_task(root_task.clone());
+    async fn steer_route_targets_the_matching_active_session_turn() {
+        let state = test_state();
+        let workspace_id = register_workspace(&state, "workspace-session-steer", "session-steer");
+        let session_id = SessionId::new("session-session-steer");
+        let accepted_at = UtcMillis(1_777_100_000_000);
         state
             .session_store
             .create_session_for_workspace(
                 session_id.clone(),
-                "Supplement Mailbox",
+                "Session steer",
                 Some(workspace_id.to_string()),
             )
-            .expect("session should be creatable");
-        state.session_store.bind_execution_ownership(
-            session_id.clone(),
-            ExecutionOwnership {
-                session_id: Some(session_id.clone()),
-                workspace_id: Some(workspace_id.clone()),
-                mission_id: Some(mission_id.clone()),
-                task_id: Some(root_task.task_id.clone()),
-                execution_chain_ref: Some("chain-supplement-mailbox".to_string()),
-                ..ExecutionOwnership::default()
-            },
-        );
+            .expect("session should create");
         let (_, orchestrator_thread_id) =
             state
                 .session_store
-                .ensure_session_mission(&session_id, UtcMillis::now(), || mission_id.clone());
-
-        let mut request = session_turn_request("请优先处理这个 followup");
-        request.session_id = Some(session_id.to_string());
-        request.workspace_id = Some(workspace_id.to_string());
-        request.supplement_context = true;
-        let response =
-            submit_supplement_context_turn(&state, &request, &workspace_id, UtcMillis::now())
-                .await
-                .expect("supplement should enqueue mailbox signal");
-
-        assert_eq!(response.route, SessionTurnRouteDto::SupplementContext);
-        assert!(
-            response
-                .signal_ref
-                .as_deref()
-                .is_some_and(|id| id.starts_with("mailbox-signal-"))
-        );
-        assert_eq!(
-            response.target_task_id.as_deref(),
-            Some(root_task.task_id.as_str())
-        );
-
-        let pending = state
-            .conversation_registry
-            .conversation_for_task(&session_id, &root_task.task_id)
-            .lock()
-            .expect("task conversation lock")
-            .drain_mailbox_items();
-        assert_eq!(pending.len(), 1);
-        match &pending[0] {
-            magi_conversation_runtime::MailboxItem::Runtime(signal) => {
-                assert_eq!(signal.author, MailboxAuthor::User);
-                assert_eq!(signal.kind, MailboxKind::Followup);
-                assert!(signal.trigger_turn);
-                assert_eq!(
-                    signal.payload["text"].as_str(),
-                    Some("请优先处理这个 followup")
-                );
-            }
-            magi_conversation_runtime::MailboxItem::User(_) => {
-                panic!("supplement must enqueue a runtime followup signal")
-            }
-        }
-
-        let history = state
+                .ensure_session_mission(&session_id, accepted_at, || {
+                    MissionId::new("mission-session-steer")
+                });
+        state
             .session_store
-            .thread_message_history(&orchestrator_thread_id);
-        assert_eq!(history.len(), 1);
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-session-steer".to_string(),
+                    turn_seq: accepted_at.0,
+                    accepted_at,
+                    status: "running".to_string(),
+                    completed_at: None,
+                    user_message: Some("请生成详细方案".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("active turn should persist");
+        let _active_input = state
+            .conversation_registry
+            .begin_session_turn_input(session_id.clone(), "turn-session-steer".to_string());
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/turn",
+            serde_json::json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+                "text": "优先收口，不要扩展",
+                "requestId": "request-session-steer",
+                "userMessageId": "user-session-steer",
+                "steerCurrentTurn": true,
+                "expectedTurnId": "turn-session-steer"
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["route"], "steer");
+        assert_eq!(body["steeredTurnId"], "turn-session-steer");
+        assert_eq!(body["userMessageItemId"], "user-session-steer");
+        let drained = state
+            .conversation_registry
+            .drain_session_turn_steers(&session_id, "turn-session-steer");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].text.as_deref(), Some("优先收口，不要扩展"));
+        let turn = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("active turn should remain");
+        assert!(turn.items.iter().any(|item| {
+            item.item_id == "user-session-steer" && item.source_thread_id == orchestrator_thread_id
+        }));
+
+        let (stale_status, stale_body) = post_json(
+            state.clone(),
+            "/session/turn",
+            serde_json::json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+                "text": "迟到引导",
+                "requestId": "request-session-steer-stale",
+                "userMessageId": "user-session-steer-stale",
+                "steerCurrentTurn": true,
+                "expectedTurnId": "turn-session-steer-stale"
+            }),
+        )
+        .await;
+        assert_eq!(stale_status, StatusCode::CONFLICT);
+        assert_eq!(stale_body["error_code"], "CONFLICT");
+        let turn = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("active turn should remain after stale steer");
         assert!(
-            history[0]
-                .content
-                .as_deref()
-                .unwrap_or_default()
-                .contains("kind=followup")
+            !turn
+                .items
+                .iter()
+                .any(|item| item.item_id == "user-session-steer-stale")
         );
     }
 
@@ -4740,8 +4756,8 @@ mod tests {
                 request_id: Some("request-canonical-first-frame".to_string()),
                 user_message_id: Some("user-canonical-first-frame".to_string()),
                 placeholder_message_id: Some("assistant-canonical-first-frame".to_string()),
-                supplement_context: false,
-                target_task_id: None,
+                steer_current_turn: false,
+                expected_turn_id: None,
             },
             Vec::new(),
             workspace_id,
@@ -4823,8 +4839,8 @@ mod tests {
                 request_id: Some("request-draft-orchestrator-model".to_string()),
                 user_message_id: Some("user-draft-orchestrator-model".to_string()),
                 placeholder_message_id: Some("assistant-draft-orchestrator-model".to_string()),
-                supplement_context: false,
-                target_task_id: None,
+                steer_current_turn: false,
+                expected_turn_id: None,
             },
             Vec::new(),
             workspace_id,
@@ -4863,8 +4879,8 @@ mod tests {
             request_id: Some("request-image-turn".to_string()),
             user_message_id: Some("user-image-turn".to_string()),
             placeholder_message_id: Some("assistant-image-turn".to_string()),
-            supplement_context: false,
-            target_task_id: None,
+            steer_current_turn: false,
+            expected_turn_id: None,
         };
         let images = request.parsed_images().expect("image should parse");
         let response = submit_regular_session_turn(
@@ -4979,8 +4995,8 @@ mod tests {
                 request_id: Some("request-queued-turn".to_string()),
                 user_message_id: Some("user-queued-turn".to_string()),
                 placeholder_message_id: Some("assistant-queued-turn".to_string()),
-                supplement_context: false,
-                target_task_id: None,
+                steer_current_turn: false,
+                expected_turn_id: None,
             },
             Vec::new(),
             workspace_id.clone(),
@@ -5108,8 +5124,8 @@ mod tests {
                 request_id: Some("request-queue-a".to_string()),
                 user_message_id: Some("user-queue-a".to_string()),
                 placeholder_message_id: Some("assistant-queue-a".to_string()),
-                supplement_context: false,
-                target_task_id: None,
+                steer_current_turn: false,
+                expected_turn_id: None,
             },
             Vec::new(),
             workspace_a.clone(),
@@ -5134,8 +5150,8 @@ mod tests {
                 request_id: Some("request-queue-b".to_string()),
                 user_message_id: Some("user-queue-b".to_string()),
                 placeholder_message_id: Some("assistant-queue-b".to_string()),
-                supplement_context: false,
-                target_task_id: None,
+                steer_current_turn: false,
+                expected_turn_id: None,
             },
             Vec::new(),
             workspace_b.clone(),
@@ -5424,8 +5440,8 @@ mod tests {
             request_id: Some("request-simple-chat".to_string()),
             user_message_id: Some("user-simple-chat".to_string()),
             placeholder_message_id: Some("assistant-simple-chat".to_string()),
-            supplement_context: false,
-            target_task_id: None,
+            steer_current_turn: false,
+            expected_turn_id: None,
         };
         let accepted_at = UtcMillis(1_700_000_000_000);
         let response = submit_regular_session_turn(
@@ -5485,8 +5501,8 @@ mod tests {
             request_id: Some("request-simple-execute".to_string()),
             user_message_id: Some("user-simple-execute".to_string()),
             placeholder_message_id: Some("assistant-simple-execute".to_string()),
-            supplement_context: false,
-            target_task_id: None,
+            steer_current_turn: false,
+            expected_turn_id: None,
         };
         let accepted_at = UtcMillis(1_700_000_001_000);
         let mut decision = classifier_chat_decision();

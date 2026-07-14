@@ -31,6 +31,8 @@ pub enum BuiltinToolName {
     WebFetch,
     // ── 可视化 ──
     DiagramRender,
+    /// 通过已配置的图片生成模型生成图片并保存到当前工作区。
+    ImageGenerate,
     // ── 知识库 ──
     KnowledgeQuery,
     // ── 代码符号导航（基于本地索引引擎的符号表）──
@@ -69,7 +71,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -92,6 +94,7 @@ impl BuiltinToolName {
         Self::WebSearch,
         Self::WebFetch,
         Self::DiagramRender,
+        Self::ImageGenerate,
         Self::KnowledgeQuery,
         Self::CodeSymbols,
         Self::ToolCatalog,
@@ -128,6 +131,7 @@ impl BuiltinToolName {
             Self::WebSearch => "web_search",
             Self::WebFetch => "web_fetch",
             Self::DiagramRender => "diagram_render",
+            Self::ImageGenerate => "image_generate",
             Self::KnowledgeQuery => "knowledge_query",
             Self::CodeSymbols => "code_symbols",
             Self::ToolCatalog => "tool_catalog",
@@ -162,7 +166,7 @@ impl BuiltinToolName {
             | Self::ProcessInspect => "process",
             Self::DiffPreview => "diff",
             Self::WebSearch | Self::WebFetch => "web",
-            Self::DiagramRender => "visualization",
+            Self::DiagramRender | Self::ImageGenerate => "visualization",
             Self::KnowledgeQuery => "knowledge",
             Self::ToolCatalog => "tooling",
             Self::GetGoal | Self::CreateGoal | Self::UpdateGoal => "session_goal",
@@ -196,6 +200,7 @@ impl BuiltinToolName {
             "web_search" => Some(Self::WebSearch),
             "web_fetch" => Some(Self::WebFetch),
             "diagram_render" => Some(Self::DiagramRender),
+            "image_generate" => Some(Self::ImageGenerate),
             "knowledge_query" => Some(Self::KnowledgeQuery),
             "code_symbols" => Some(Self::CodeSymbols),
             "tool_catalog" => Some(Self::ToolCatalog),
@@ -220,6 +225,7 @@ impl BuiltinToolName {
                 | Self::FileMkdir
                 | Self::FileCopy
                 | Self::FileMove
+                | Self::ImageGenerate
                 | Self::AgentSpawn
                 | Self::CreateGoal
                 | Self::UpdateGoal
@@ -245,6 +251,7 @@ impl BuiltinToolName {
                 | Self::FileMkdir
                 | Self::FileCopy
                 | Self::FileMove
+                | Self::ImageGenerate
         )
     }
 
@@ -274,6 +281,7 @@ impl BuiltinToolName {
             | Self::FileMkdir
             | Self::FileCopy
             | Self::FileMove
+            | Self::ImageGenerate
             | Self::AgentSpawn
             | Self::CreateGoal
             | Self::UpdateGoal
@@ -348,6 +356,7 @@ impl BuiltinToolName {
             | Self::ApplyPatch
             | Self::FileCopy
             | Self::FileMove
+            | Self::ImageGenerate
             | Self::ProcessWrite
             | Self::AgentSpawn => RiskLevel::Medium,
             Self::FileRemove | Self::ShellExec | Self::ProcessLaunch => RiskLevel::High,
@@ -481,6 +490,16 @@ impl BuiltinToolName {
             Self::WebFetch => "抓取一个 URL 的内容并将 HTML 转为 markdown",
             Self::DiagramRender => {
                 "渲染图表：支持 Mermaid、DOT、结构化 graph 节点/边、结构化 flow 节点/边"
+            }
+            Self::ImageGenerate => {
+                "根据文本提示生成图片并保存到当前工作区。\n\n\
+                # 何时用\n\
+                - 用户明确要求生成、绘制或创作位图图片\n\
+                - 需要为项目生成插图、素材、封面或视觉草图\n\n\
+                # 约束\n\
+                - 依赖设置中已启用且测试可用的图片生成模型\n\
+                - 生成结果只允许写入当前工作区，默认保存到 generated-images/\n\
+                - 不覆盖已有文件；需要检查图片内容时继续调用 view_image"
             }
             Self::KnowledgeQuery => "查询项目知识库：检索 README、文档与代码文档",
             Self::CodeSymbols => {
@@ -861,6 +880,29 @@ impl BuiltinToolName {
                     "theme": { "type": "string", "description": "图表主题提示" }
                 },
                 "required": ["kind"]
+            }),
+            Self::ImageGenerate => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "要生成图片的完整视觉描述"
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": "图片尺寸，使用 auto 或 WIDTHxHEIGHT；默认 1024x1024"
+                    },
+                    "quality": {
+                        "type": "string",
+                        "enum": ["auto", "low", "medium", "high", "standard", "hd"],
+                        "description": "可选的图片质量，具体支持范围由已配置模型决定"
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": "可选的工作区内输出路径；扩展名会按服务实际返回格式规范化，默认保存到 generated-images/"
+                    }
+                },
+                "required": ["prompt"]
             }),
             Self::KnowledgeQuery => serde_json::json!({
                 "type": "object",

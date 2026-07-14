@@ -1,9 +1,10 @@
 use crate::{
     BridgeBindingDispatchPlan, BridgeBindingKind, BridgeBindingReference, BridgeClientError,
     BridgeDispatchAction, BridgeDispatchInput, BridgeDispatchRuntime, BridgeTransport,
-    BridgeTransportError, BridgeTransportRequest, BridgeTransportResponse, JsonRpcMcpBridgeClient,
-    JsonRpcModelBridgeClient, JsonRpcStdioTransport, McpBridgeClient, McpToolCallRequest,
-    ModelBridgeClient, ModelInvocationRequest,
+    BridgeTransportError, BridgeTransportRequest, BridgeTransportResponse,
+    HttpImageGenerationClient, ImageGenerationRequest, ImageGenerationUrlMode,
+    JsonRpcMcpBridgeClient, JsonRpcModelBridgeClient, JsonRpcStdioTransport, McpBridgeClient,
+    McpToolCallRequest, ModelBridgeClient, ModelInvocationRequest,
     base_adapter::ToolExecutor,
     llm_types::{
         ImageSource, LlmContentBlock, LlmMessage, LlmMessageContent, ToolCall, ToolResult,
@@ -874,4 +875,69 @@ fn sanitize_tool_order_preserves_valid_pairs() {
 
     let sanitized = sanitize_tool_order(&messages);
     assert_eq!(sanitized.len(), 3);
+}
+
+#[test]
+fn image_generation_client_builds_standard_openai_request_and_parses_base64_result() {
+    let client = HttpImageGenerationClient::new(
+        "http://127.0.0.1:8317/v1".to_string(),
+        Some("sk-image-test".to_string()),
+        "gpt-image-1".to_string(),
+        ImageGenerationUrlMode::Standard,
+    );
+    let request = ImageGenerationRequest {
+        prompt: "一张极简的蓝色方块".to_string(),
+        size: "1024x1024".to_string(),
+        quality: Some("high".to_string()),
+    };
+
+    let built = client
+        .build_request_for_test(&request)
+        .expect("image request should build");
+    assert_eq!(built.url, "http://127.0.0.1:8317/v1/images/generations");
+    assert_eq!(built.body["model"], "gpt-image-1");
+    assert_eq!(built.body["prompt"], "一张极简的蓝色方块");
+    assert_eq!(built.body["size"], "1024x1024");
+    assert_eq!(built.body["quality"], "high");
+    assert_eq!(built.body["response_format"], "b64_json");
+    assert!(
+        built
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "Authorization" && value == "Bearer sk-image-test" })
+    );
+
+    let result = HttpImageGenerationClient::parse_response_for_test(
+        &serde_json::json!({
+            "created": 123,
+            "data": [{
+                "b64_json": "iVBORw0KGgo=",
+                "revised_prompt": "一个蓝色方块"
+            }]
+        })
+        .to_string(),
+    )
+    .expect("base64 image response should parse");
+    assert_eq!(result.bytes, b"\x89PNG\r\n\x1a\n");
+    assert_eq!(result.media_type, "image/png");
+    assert_eq!(result.revised_prompt.as_deref(), Some("一个蓝色方块"));
+}
+
+#[test]
+fn image_generation_client_uses_full_endpoint_without_rewriting() {
+    let client = HttpImageGenerationClient::new(
+        "http://127.0.0.1:8317/custom/images".to_string(),
+        None,
+        "image-model".to_string(),
+        ImageGenerationUrlMode::Full,
+    );
+    let built = client
+        .build_request_for_test(&ImageGenerationRequest {
+            prompt: "test".to_string(),
+            size: "1024x1024".to_string(),
+            quality: None,
+        })
+        .expect("full endpoint request should build");
+    assert_eq!(built.url, "http://127.0.0.1:8317/custom/images");
+    assert!(built.body.get("quality").is_none());
 }

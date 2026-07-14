@@ -277,7 +277,6 @@ impl RuntimeMaintenance {
         state.mode_reason = Some(reason.into());
     }
 
-    #[cfg(test)]
     pub(crate) fn request_graceful_shutdown(&self, reason: impl Into<String>) {
         let mut state = self
             .state

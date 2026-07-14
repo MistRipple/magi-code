@@ -1330,6 +1330,7 @@ impl LlmTaskDispatcher {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
             session_store: self.session_store.as_ref(),
+            conversation_registry: self.conversation_registry.as_ref(),
             todo_ledger: &todo_ledger,
             settings_store: execution_settings,
             safety_gate: safety_gate.as_ref(),

@@ -1,0 +1,23 @@
+[package]
+name = "magi-desktop"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "magi_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "magi-desktop"
+path = "src/main.rs"
+
+[dependencies]
+magi-daemon = { path = "../../crates/magi-daemon" }
+magi-runtime-state = { path = "../../crates/magi-runtime-state" }
+dirs = "6"
+tauri = { version = "2.11.5", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2.4.2"
+tokio.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }

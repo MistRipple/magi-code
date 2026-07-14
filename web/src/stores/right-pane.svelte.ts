@@ -324,6 +324,42 @@ function pickLruVictim(state: SessionPaneState): RightPaneTab | null {
   return victim;
 }
 
+function migrateWorkspacePaneIntoSession(workspaceId: string, targetScopeKey: string): void {
+  const sourceScopeKey = workspaceScopeKey(workspaceId);
+  if (!sourceScopeKey || sourceScopeKey === targetScopeKey) {
+    return;
+  }
+  const source = rightPaneState.perSession[sourceScopeKey];
+  if (!source || source.openTabs.length === 0) {
+    return;
+  }
+
+  const target = ensureSession(targetScopeKey);
+  for (const sourceTab of source.openTabs) {
+    const existingIndex = target.openTabs.findIndex((tab) => tab.id === sourceTab.id);
+    if (existingIndex >= 0) {
+      if (sourceTab.lastActivatedAt > target.openTabs[existingIndex].lastActivatedAt) {
+        target.openTabs[existingIndex] = sourceTab;
+      }
+      continue;
+    }
+    target.openTabs = [...target.openTabs, sourceTab];
+  }
+
+  if (source.activeTabId && target.openTabs.some((tab) => tab.id === source.activeTabId)) {
+    target.activeTabId = source.activeTabId;
+  }
+  target.collapsed = target.openTabs.length === 0 ? true : target.collapsed && source.collapsed;
+  while (target.openTabs.length > RIGHT_PANE_TAB_CAP) {
+    const victim = pickLruVictim(target);
+    if (!victim) {
+      break;
+    }
+    target.openTabs = target.openTabs.filter((tab) => tab.id !== victim.id);
+  }
+  delete rightPaneState.perSession[sourceScopeKey];
+}
+
 /** 内部：插入或激活已有 tab；负责 LRU 淘汰、自动展开、设为 active */
 function upsertTab(
   scopeKey: string,
@@ -390,6 +426,9 @@ export function activateRightPaneSession(
   const normalizedWorkspaceId = normalizeWorkspaceId(workspaceId);
   const normalizedSessionId = normalizeSessionId(sessionId);
   const scopeKey = paneScopeKey(normalizedWorkspaceId, normalizedSessionId);
+  if (normalizedWorkspaceId && normalizedSessionId) {
+    migrateWorkspacePaneIntoSession(normalizedWorkspaceId, scopeKey);
+  }
   rightPaneState.activeWorkspaceId = normalizedWorkspaceId;
   rightPaneState.activeSessionId = normalizedSessionId;
   rightPaneState.activeScopeKey = scopeKey;
@@ -475,13 +514,13 @@ export function openCodeTab(
   if (!trimmedFilepath) {
     return;
   }
-  const hasExplicitSessionScope = Object.prototype.hasOwnProperty.call(options ?? {}, 'sessionId');
-  const normalizedSession = hasExplicitSessionScope
+  const workspaceId = normalizeWorkspaceId(options?.workspaceId)
+    || rightPaneState.activeWorkspaceId;
+  const requestedSession = Object.prototype.hasOwnProperty.call(options ?? {}, 'sessionId')
     ? normalizeSessionId(options?.sessionId)
     : normalizeSessionId(sessionId);
-  const workspaceId = normalizeWorkspaceId(options?.workspaceId)
-    || (normalizedSession === rightPaneState.activeSessionId ? rightPaneState.activeWorkspaceId : '')
-    || rightPaneState.activeWorkspaceId;
+  const normalizedSession = requestedSession
+    || (workspaceId === rightPaneState.activeWorkspaceId ? rightPaneState.activeSessionId : '');
   const scopeKey = paneScopeKey(workspaceId, normalizedSession);
   if (!scopeKey) {
     return;

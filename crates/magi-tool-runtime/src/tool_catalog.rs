@@ -298,6 +298,8 @@ struct RuntimeHealth {
     agent_role_registry_available: bool,
     agent_role_count: usize,
     spawnable_agent_role_count: usize,
+    image_generation_available: bool,
+    image_generation_configured: bool,
 }
 
 struct RuntimeToolStatus {
@@ -360,6 +362,12 @@ impl RuntimeHealth {
             agent_role_registry_available: resources.agent_role_catalog_provider.is_some(),
             agent_role_count: agent_roles.len(),
             spawnable_agent_role_count: agent_roles.iter().filter(|role| role.spawnable).count(),
+            image_generation_available: resources.image_generation_executor.is_some()
+                && resources.image_generation_readiness_provider.is_some(),
+            image_generation_configured: resources
+                .image_generation_readiness_provider
+                .as_ref()
+                .is_some_and(|provider| provider()),
         }
     }
 
@@ -371,10 +379,30 @@ impl RuntimeHealth {
             BuiltinToolName::AgentSpawn | BuiltinToolName::AgentWait => {
                 self.agent_role_tool_status()
             }
+            BuiltinToolName::ImageGenerate => self.image_generation_tool_status(),
             _ => RuntimeToolStatus {
                 status: "ready",
                 warnings: Vec::new(),
             },
+        }
+    }
+
+    fn image_generation_tool_status(&self) -> RuntimeToolStatus {
+        if !self.image_generation_available {
+            return RuntimeToolStatus {
+                status: "unavailable",
+                warnings: vec!["图片生成运行时暂不可用".to_string()],
+            };
+        }
+        if !self.image_generation_configured {
+            return RuntimeToolStatus {
+                status: "not_ready",
+                warnings: vec!["图片生成模型尚未配置".to_string()],
+            };
+        }
+        RuntimeToolStatus {
+            status: "ready",
+            warnings: Vec::new(),
         }
     }
 
@@ -469,6 +497,11 @@ impl RuntimeHealth {
             }),
         ];
         dependencies.extend(external_capability_dependencies(external_source));
+        dependencies.push(serde_json::json!({
+            "name": "image_generation_model",
+            "status": self.image_generation_tool_status().status,
+            "required_by": ["image_generate"],
+        }));
 
         if let Some(provider) = &resources.runtime_capability_dependency_provider {
             dependencies.extend(provider(context).into_iter().map(|entry| {
@@ -954,6 +987,45 @@ mod tests {
             "agent_role_registry"
         );
         assert_eq!(payload["runtime_dependencies"][2]["status"], "unavailable");
+    }
+
+    #[test]
+    fn image_generation_tool_health_tracks_live_model_configuration() {
+        let executor: crate::ImageGenerationExecutor =
+            Arc::new(|_| panic!("catalog health must not invoke image generation"));
+        let not_configured = ToolRuntimeResources {
+            image_generation_executor: Some(Arc::clone(&executor)),
+            image_generation_readiness_provider: Some(Arc::new(|| false)),
+            ..ToolRuntimeResources::default()
+        };
+        let configured = ToolRuntimeResources {
+            image_generation_executor: Some(executor),
+            image_generation_readiness_provider: Some(Arc::new(|| true)),
+            ..ToolRuntimeResources::default()
+        };
+
+        for (resources, expected) in [
+            (&ToolRuntimeResources::default(), "unavailable"),
+            (&not_configured, "not_ready"),
+            (&configured, "ready"),
+        ] {
+            let payload =
+                build_tool_catalog_value("{}", &ToolExecutionContext::default(), resources);
+            let image_tool = payload["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .find(|tool| tool["name"] == "image_generate")
+                .expect("image_generate should be listed");
+            assert_eq!(image_tool["runtime_status"], expected);
+            let dependency = payload["runtime_dependencies"]
+                .as_array()
+                .expect("dependencies")
+                .iter()
+                .find(|dependency| dependency["name"] == "image_generation_model")
+                .expect("image generation dependency should be listed");
+            assert_eq!(dependency["status"], expected);
+        }
     }
 
     #[test]

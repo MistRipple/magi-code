@@ -8,22 +8,53 @@ await withGoldenViteServer(async (server) => {
 
   rightPane.activateRightPaneSession('workspace-active', 'session-active');
   rightPane.openCodeTab('session-stale', 'README.md', {
-    workspaceId: 'workspace-tree',
-    workspacePath: '/tmp/workspace-tree',
+    workspaceId: 'workspace-active',
+    workspacePath: '/tmp/workspace-active',
     sessionId: '',
   });
 
   assert.equal(
     rightPane.rightPaneState.activeScopeKey,
-    'workspace:workspace-tree',
-    'explicit empty session must keep project-file preview in workspace scope',
+    'workspace-active\u0000session-active',
+    'file preview should join the active session pane instead of replacing it with a workspace-only pane',
   );
   const workspacePane = rightPane.getRightPaneState(rightPane.rightPaneState.activeScopeKey);
   const workspaceTab = workspacePane.openTabs.find((tab) => tab.kind === 'code');
   assert.equal(
     workspaceTab?.payload.sessionId,
-    undefined,
-    'workspace-scoped file preview tab must not persist a stale session id',
+    'session-active',
+    'file preview opened from the project tree should inherit the active session scope',
+  );
+
+  rightPane.openAgentTab('session-active', 'task-active-agent', {
+    workspaceId: 'workspace-active',
+    workspacePath: '/tmp/workspace-active',
+    label: '当前会话代理',
+  });
+  const unifiedPane = rightPane.getRightPaneState(rightPane.rightPaneState.activeScopeKey);
+  assert.deepEqual(
+    unifiedPane.openTabs.map((tab) => tab.id),
+    ['code:README.md', 'agent:task-active-agent'],
+    'agent preview must append to the existing file-preview tab strip',
+  );
+
+  rightPane.activateRightPaneSession('workspace-draft', null);
+  rightPane.openCodeTab(null, 'draft.md', {
+    workspaceId: 'workspace-draft',
+    workspacePath: '/tmp/workspace-draft',
+    sessionId: '',
+  });
+  rightPane.activateRightPaneSession('workspace-draft', 'session-created');
+  rightPane.openAgentTab('session-created', 'task-created-agent', {
+    workspaceId: 'workspace-draft',
+    workspacePath: '/tmp/workspace-draft',
+    label: '新会话代理',
+  });
+  const migratedDraftPane = rightPane.getRightPaneState(rightPane.rightPaneState.activeScopeKey);
+  assert.deepEqual(
+    migratedDraftPane.openTabs.map((tab) => tab.id),
+    ['code:draft.md', 'agent:task-created-agent'],
+    'workspace draft tabs must migrate into the created session before agent tabs append',
   );
 
   rightPane.openCodeTab('session-edit', 'src/lib.rs', {

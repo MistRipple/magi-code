@@ -1,6 +1,7 @@
 mod apply_patch;
 mod builtin;
 mod builtin_catalog;
+mod image_generate;
 mod policy;
 mod registry;
 mod tool_catalog;
@@ -25,10 +26,11 @@ pub use types::external_mcp_model_tool_name;
 pub use types::{
     AgentRoleCatalogEntry, AgentRoleCatalogProvider, BuiltinTool, ExternalMcpServerCatalogEntry,
     ExternalMcpToolCatalogEntry, ExternalMcpToolExecutor, ExternalToolCatalogEntry,
-    ExternalToolCatalogProvider, ExternalToolCatalogSnapshot, RuntimeCapabilityDependencyEntry,
-    RuntimeCapabilityDependencyProvider, ToolExecutionContext, ToolExecutionContextQuery,
-    ToolExecutionInput, ToolExecutionOutput, ToolExecutionPolicy, ToolExecutionSummary,
-    ToolInvocationRecord, ToolRuntimeResources, WriteProtectionScope,
+    ExternalToolCatalogProvider, ExternalToolCatalogSnapshot, GeneratedImageData,
+    ImageGenerationExecutor, ImageGenerationReadinessProvider, ImageGenerationRequest,
+    RuntimeCapabilityDependencyEntry, RuntimeCapabilityDependencyProvider, ToolExecutionContext,
+    ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput, ToolExecutionPolicy,
+    ToolExecutionSummary, ToolInvocationRecord, ToolRuntimeResources, WriteProtectionScope,
 };
 
 #[cfg(test)]

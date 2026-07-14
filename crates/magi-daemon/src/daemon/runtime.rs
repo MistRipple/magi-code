@@ -11,13 +11,15 @@ use magi_api::{
 };
 use magi_bridge_client::{
     BridgeBindingKind, BridgeClientError, BridgeDispatchRuntime, BridgeResponse, BridgeServerKind,
-    BridgeTransport, HttpModelBridgeClient, HttpModelBridgeProtocol, JsonRpcMcpBridgeClient,
+    BridgeTransport, HttpModelBridgeClient, HttpModelBridgeProtocol,
+    ImageGenerationRequest as BridgeImageGenerationRequest, JsonRpcMcpBridgeClient,
     JsonRpcStdioTransport, McpBridgeClient, McpToolCallRequest, StdioMcpBridgeClient,
 };
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, FileSummaryStore, ProjectRecentTurnStore, SharedContextPool,
 };
 use magi_conversation_runtime::{
+    model_config::NormalizedModelConfig,
     session_turn_finalize::{
         current_turn_status_is_terminal, publish_task_status_turn_item_for_active_sessions,
     },
@@ -37,7 +39,8 @@ use magi_snapshot::SnapshotManager;
 use magi_tool_runtime::{
     AgentRoleCatalogEntry, AgentRoleCatalogProvider, ExternalMcpServerCatalogEntry,
     ExternalMcpToolCatalogEntry, ExternalMcpToolExecutor, ExternalToolCatalogEntry,
-    ExternalToolCatalogProvider, ExternalToolCatalogSnapshot, ToolRegistry,
+    ExternalToolCatalogProvider, ExternalToolCatalogSnapshot, GeneratedImageData,
+    ImageGenerationExecutor, ImageGenerationReadinessProvider, ToolRegistry,
     external_mcp_model_tool_name,
 };
 use magi_worker_runtime::WorkerRuntime;
@@ -927,6 +930,15 @@ impl DaemonRuntime {
         });
     }
 
+    pub(crate) fn prepare_graceful_shutdown(
+        &self,
+        reason: impl Into<String>,
+    ) -> Result<(), DaemonError> {
+        self.runtime_maintenance.request_graceful_shutdown(reason);
+        self.runtime_maintenance.run_once()?;
+        Ok(())
+    }
+
     pub(crate) fn publish_started_event(&self, service_name: &str) {
         let _ = self.event_bus.publish(EventEnvelope::system(
             EventId::new("system-started"),
@@ -995,11 +1007,47 @@ impl DaemonRuntime {
             self.workspace_store.clone(),
             true,
         );
+        let image_generation_executor: ImageGenerationExecutor = {
+            let settings_store = Arc::clone(&settings_store);
+            Arc::new(move |request| {
+                let config = settings_store.get_section("imageGeneration");
+                let normalized = NormalizedModelConfig::from_settings_value(&config)
+                    .map_err(|error| format!("图片生成模型配置无效: {error}"))?;
+                let client = normalized
+                    .to_http_image_generation_client()
+                    .map_err(|error| format!("图片生成模型配置无效: {error}"))?;
+                let generated = client
+                    .generate(BridgeImageGenerationRequest {
+                        prompt: request.prompt,
+                        size: request.size,
+                        quality: request.quality,
+                    })
+                    .map_err(|error| error.to_string())?;
+                Ok(GeneratedImageData {
+                    bytes: generated.bytes,
+                    media_type: generated.media_type,
+                    revised_prompt: generated.revised_prompt,
+                })
+            })
+        };
+        let image_generation_readiness_provider: ImageGenerationReadinessProvider = {
+            let settings_store = Arc::clone(&settings_store);
+            Arc::new(move || {
+                let config = settings_store.get_section("imageGeneration");
+                NormalizedModelConfig::from_settings_value(&config)
+                    .and_then(|normalized| normalized.to_http_image_generation_client().map(|_| ()))
+                    .is_ok()
+            })
+        };
         let mut tool_registry = ToolRegistry::new(self.governance.clone(), self.event_bus.clone())
             .with_knowledge_store(self.knowledge_store.clone())
             .with_external_tool_catalog_provider(external_tool_catalog_provider)
             .with_external_mcp_tool_executor(external_mcp_tool_executor)
             .with_agent_role_catalog_provider(agent_role_catalog_provider)
+            .with_image_generation_runtime(
+                image_generation_executor,
+                image_generation_readiness_provider,
+            )
             .with_runtime_capability_dependency_provider(runtime_capability_dependency_provider);
         tool_registry.register_default_builtins();
 

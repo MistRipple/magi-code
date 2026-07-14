@@ -8,6 +8,7 @@ pub struct DaemonConfig {
     pub port: u16,
     pub service_name: String,
     pub state_root: PathBuf,
+    pub web_dist_root: Option<PathBuf>,
     pub open_browser: bool,
 }
 
@@ -24,12 +25,18 @@ impl DaemonConfig {
             port,
             service_name: service_name.into(),
             state_root,
+            web_dist_root: None,
             open_browser: false,
         }
     }
 
     pub fn with_open_browser(mut self, open_browser: bool) -> Self {
         self.open_browser = open_browser;
+        self
+    }
+
+    pub fn with_web_dist_root(mut self, web_dist_root: impl Into<PathBuf>) -> Self {
+        self.web_dist_root = Some(web_dist_root.into());
         self
     }
 

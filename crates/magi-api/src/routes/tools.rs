@@ -90,7 +90,7 @@ mod tests {
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_session_store::SessionStore;
-    use magi_tool_runtime::ToolRegistry;
+    use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
     use magi_workspace::WorkspaceStore;
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["tool"], "tool_catalog");
         assert_eq!(body["status"], "succeeded");
-        assert_eq!(body["builtinTotal"], 32);
+        assert_eq!(body["builtinTotal"], BuiltinToolName::ALL.len());
         assert_eq!(body["externalCatalogStatus"], "unavailable");
         assert_eq!(body["agentRoleCatalogStatus"], "unavailable");
         assert_eq!(

@@ -43,7 +43,10 @@ pub use builtin_tool_schema::{
 pub use conversation::{AdvanceTurnError, BeginTurnError, Conversation, TurnAdvanceError};
 pub use driver::{RoundOutcome, TurnDriver};
 pub use mailbox::{MailboxAuthor, MailboxItem, MailboxKind, RuntimeSignal, UserSignal};
-pub use registry::ConversationRegistry;
+pub use registry::{
+    ConversationRegistry, SessionTurnInputBoundary, SessionTurnInputCommitError,
+    SessionTurnInputError,
+};
 pub use skill_apply_tool::{
     SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime, skill_apply_tool_definition,
 };

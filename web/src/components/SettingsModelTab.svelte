@@ -13,6 +13,7 @@
     modelConfigTab = $bindable(),
     orchConfig = $bindable(),
     compConfig = $bindable(),
+    imageConfig = $bindable(),
     workerConfigs = $bindable(),
     workerModelTabs,
     modelStatuses,
@@ -44,6 +45,7 @@
     modelConfigTab: string;
     orchConfig: any;
     compConfig: any;
+    imageConfig: any;
     workerConfigs: Record<string, any>;
     workerModelTabs: string[];
     modelStatuses: Record<string, { status?: string }>;
@@ -60,10 +62,10 @@
     shouldRecommendStandardUrlMode: (baseUrl: string) => boolean;
     openModelDropdown: (type: string, target: HTMLElement) => void;
     closeModelDropdown: (key: string) => void;
-    fetchModelList: (type: 'orch' | 'comp' | 'worker') => void;
+    fetchModelList: (type: 'orch' | 'comp' | 'image' | 'worker') => void;
     selectModel: (type: string, model: string) => void;
-    saveModelConfig: (type: 'orch' | 'comp' | 'worker') => void;
-    testModelConnection: (type: 'orch' | 'comp' | 'worker') => void;
+    saveModelConfig: (type: 'orch' | 'comp' | 'image' | 'worker') => void;
+    testModelConnection: (type: 'orch' | 'comp' | 'image' | 'worker') => void;
     getStatusClass: (status: string) => string;
     getStatusText: (status: string) => string;
     getWorkerDisplayName: (workerId: string) => string;
@@ -127,7 +129,7 @@
   let renameInputEl: HTMLInputElement | undefined = $state();
 
   function startRename(engineId: string) {
-    if (engineId === 'orch' || engineId === 'comp') return;
+    if (engineId === 'orch' || engineId === 'comp' || engineId === 'image') return;
     editingTab = engineId;
     editingName = getWorkerDisplayName(engineId);
     requestAnimationFrame(() => {
@@ -210,6 +212,23 @@
                 title={getStatusText(resolveModelConfigTabStatus('comp', modelStatuses))}
               ></span>
               <span class="role-tab-name">{i18n.t('settings.model.auxiliaryModel')}</span>
+            </button>
+
+            <!-- 图片生成模型 -->
+            <button
+              type="button"
+              class="role-tab"
+              class:active={modelConfigTab === 'image'}
+              role="tab"
+              aria-selected={modelConfigTab === 'image'}
+              data-tab-id="image"
+              onclick={() => selectTab('image')}
+            >
+              <span
+                class="role-tab-status {getStatusClass(resolveModelConfigTabStatus('imageGeneration', modelStatuses))}"
+                title={getStatusText(resolveModelConfigTabStatus('imageGeneration', modelStatuses))}
+              ></span>
+              <span class="role-tab-name">{i18n.t('settings.model.imageGenerationModel')}</span>
             </button>
 
             <!-- 代理引擎 -->
@@ -329,6 +348,29 @@
             {saveModelConfig}
             {testModelConnection}
           />
+        {:else if modelConfigTab === 'image'}
+          <ModelConfigForm
+            formType="image"
+            statusKey="image"
+            bind:config={imageConfig}
+            bind:keyVisible
+            showAdvancedOptions={false}
+            description={i18n.t('settings.model.imageGenerationDesc')}
+            {saveStatus}
+            {testStatus}
+            {fetchingModels}
+            {modelDropdownOpen}
+            {dropdownPosition}
+            {modelLists}
+            {getBaseUrlPlaceholder}
+            {shouldRecommendStandardUrlMode}
+            {openModelDropdown}
+            {closeModelDropdown}
+            {fetchModelList}
+            {selectModel}
+            {saveModelConfig}
+            {testModelConnection}
+          />
         {:else if workerConfigs[modelConfigTab]}
           <ModelConfigForm
             formType="worker"
@@ -395,6 +437,25 @@
                 {/each}
               </div>
             {/if}
+          </div>
+        </div>
+
+        <div class="engine-usage-row engine-usage-row--system">
+          <div class="engine-avatar engine-avatar--image" aria-hidden="true">
+            <Icon name="sparkles" size={15} />
+            <span
+              class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('imageGeneration', modelStatuses))}"
+              title={getStatusText(resolveModelConfigTabStatus('imageGeneration', modelStatuses))}
+            ></span>
+          </div>
+          <div class="engine-identity">
+            <span class="engine-name">{i18n.t('settings.model.imageGenerationModel')}</span>
+            {#if imageConfig?.model}
+              <span class="engine-model-tag">{imageConfig.model}</span>
+            {/if}
+          </div>
+          <div class="engine-consumers">
+            <span class="engine-system-note">{i18n.t('settings.model.imageGenerationSystemUsage')}</span>
           </div>
         </div>
 
@@ -731,6 +792,10 @@
   }
   .engine-avatar--auxiliary {
     color: var(--ind-foreground-secondary, var(--foreground));
+  }
+  .engine-avatar--image {
+    color: var(--warning, #d97706);
+    background: color-mix(in srgb, var(--warning, #d97706) 11%, var(--ind-bg-control, var(--surface-2)));
   }
   .engine-avatar > .model-status-dot,
   .engine-avatar > .worker-dot {

@@ -125,6 +125,7 @@ import {
   setAgentRunBridgeConnected,
 } from '../../stores/agent-run-store.svelte';
 import { refreshCurrentGoal } from '../../stores/goal-store.svelte';
+import { turnStoreState } from '../../stores/turn-store.svelte';
 import { sanitizeSvgContent } from '../svg-sanitizer';
 import {
   dequeueQueuedMessage,
@@ -2790,7 +2791,7 @@ interface ExecuteTaskInput {
   goalMode?: boolean;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
-  followUpMode?: 'queue';
+  followUpMode?: 'queue' | 'guide';
   images: Array<{
     name: string;
     dataUrl: string;
@@ -2810,6 +2811,61 @@ function bridgeRuntimeIsBusy(): boolean {
       || messagesState.pendingRequests.size > 0
       || messagesState.activeMessageIds.size > 0,
   );
+}
+
+function activeCanonicalTurnIdForSession(sessionId: string): string {
+  const normalizedSessionId = trimBridgeString(sessionId);
+  if (!normalizedSessionId || turnStoreState.reducer.sessionId !== normalizedSessionId) {
+    return '';
+  }
+  for (let index = turnStoreState.reducer.turns.length - 1; index >= 0; index -= 1) {
+    const turn = turnStoreState.reducer.turns[index];
+    if (turn && (turn.status === 'running' || turn.status === 'pending')) {
+      return turn.turnId;
+    }
+  }
+  return '';
+}
+
+async function steerActiveSessionTurn(input: {
+  text: string;
+  requestId: string;
+  workspaceId: string;
+  workspacePath: string;
+  sessionId: string;
+  accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
+}): Promise<boolean> {
+  const expectedTurnId = activeCanonicalTurnIdForSession(input.sessionId);
+  if (!expectedTurnId) {
+    throw new Error(i18n.t('input.followUp.activeTurnUnavailable'));
+  }
+  try {
+    await warmLiveBridgeForSubmission('steer_active_turn_preflight');
+  } catch (preflightError) {
+    if (!input.workspaceId) {
+      throw preflightError;
+    }
+    console.warn('[web-client-bridge] 引导发送前事件流预连接失败，继续提交:', preflightError);
+  }
+  const userMessageId = generateMessageId();
+  const turnResult = await submitSessionTurn({
+    text: input.text,
+    images: [],
+    accessProfile: input.accessProfile ?? null,
+    requestId: input.requestId,
+    userMessageId,
+    steerCurrentTurn: true,
+    expectedTurnId,
+  }, {
+    workspaceId: input.workspaceId,
+    workspacePath: input.workspacePath,
+    sessionId: input.sessionId,
+  });
+  if (turnResult.steeredTurnId !== expectedTurnId) {
+    throw new Error(i18n.t('input.followUp.activeTurnUnavailable'));
+  }
+  emitAcceptedCanonicalTurnFromResult(turnResult);
+  return true;
 }
 
 function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string): void {
@@ -2933,6 +2989,28 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     : [];
   if (!normalizedText && !skillName && images.length === 0 && contextReferences.length === 0) {
     return false;
+  }
+  if (input.followUpMode === 'guide') {
+    if (!bridgeRuntimeIsBusy() || !targetSessionId) {
+      throw new Error(i18n.t('input.followUp.activeTurnUnavailable'));
+    }
+    if (
+      !normalizedText
+      || skillName
+      || input.goalMode === true
+      || images.length > 0
+      || contextReferences.length > 0
+    ) {
+      throw new Error(i18n.t('input.followUp.guideTextOnly'));
+    }
+    return await steerActiveSessionTurn({
+      text: normalizedText,
+      requestId: input.requestId || generateMessageId(),
+      workspaceId: targetWorkspaceId,
+      workspacePath: targetWorkspacePath,
+      sessionId: targetSessionId,
+      accessProfile: input.accessProfile ?? null,
+    });
   }
   if (input.followUpMode === 'queue' && bridgeRuntimeIsBusy() && !queueDrainActive) {
     enqueueFollowUpTurn(
@@ -4153,7 +4231,9 @@ export function createWebClientBridge(): ClientBridge {
                 && !Array.isArray(message.orchestratorSessionConfig)
                 ? message.orchestratorSessionConfig as Record<string, unknown>
                 : null,
-              followUpMode: message.followUpMode === 'queue' ? 'queue' : undefined,
+              followUpMode: message.followUpMode === 'queue' || message.followUpMode === 'guide'
+                ? message.followUpMode
+                : undefined,
               images: Array.isArray(message.images)
                 ? message.images as Array<{ name: string; dataUrl: string }>
                 : [],

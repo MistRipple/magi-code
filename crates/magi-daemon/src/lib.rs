@@ -1,6 +1,6 @@
 mod daemon;
 
 pub use daemon::{
-    Daemon, DaemonConfig, DaemonError, DaemonMaintenanceMode, DaemonMaintenancePolicyProfile,
-    DaemonRuntimeStatus,
+    Daemon, DaemonConfig, DaemonError, DaemonHandle, DaemonMaintenanceMode,
+    DaemonMaintenancePolicyProfile, DaemonRuntimeStatus,
 };

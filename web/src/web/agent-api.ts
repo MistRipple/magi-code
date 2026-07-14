@@ -258,6 +258,7 @@ function normalizeSettingsBootstrapPayload(
     orchestratorSessionConfig: normalizeSettingsSectionConfig(payload.orchestratorSessionConfig),
     effectiveOrchestratorConfig: normalizeSettingsSectionConfig(payload.effectiveOrchestratorConfig),
     auxiliaryConfig: normalizeSettingsSectionConfig(payload.auxiliaryConfig),
+    imageGenerationConfig: normalizeSettingsSectionConfig(payload.imageGenerationConfig),
     userRulesConfig: normalizeSettingsSectionConfig(payload.userRulesConfig),
     skillsConfig: normalizeSettingsSectionConfig(payload.skillsConfig),
     safeguardConfig: normalizeSettingsSectionConfig(payload.safeguardConfig),
@@ -383,7 +384,7 @@ export interface AgentSessionTurnResult {
   eventId: string;
   acceptedAt: number;
   createdSession: boolean;
-  route: 'chat' | 'execute' | 'task' | 'continue' | 'supplement_context';
+  route: 'chat' | 'execute' | 'task' | 'continue' | 'steer';
   /** Root task ID when the backend created an agent run for this action. */
   rootTaskId?: string | null;
   /** 当前轮次实际执行的 action task ID。 */
@@ -398,10 +399,8 @@ export interface AgentSessionTurnResult {
   canonicalEventKind?: string | null;
   canonicalTurn?: CanonicalTurn | null;
   canonicalItem?: CanonicalTurnItem | null;
-  /** 仅在 supplement_context 路由下返回：本次入栈的 mailbox signal ID。 */
-  signalRef?: string | null;
-  /** 仅在 supplement_context 路由下返回：被投递的任务 ID。 */
-  targetTaskId?: string | null;
+  /** 仅在 steer 路由下返回：实际接收引导的 Turn ID。 */
+  steeredTurnId?: string | null;
 }
 
 export class AgentApiError extends Error {
@@ -1159,8 +1158,8 @@ export async function submitSessionTurn(
     requestId?: string | null;
     userMessageId?: string | null;
     placeholderMessageId?: string | null;
-    supplementContext?: boolean;
-    targetTaskId?: string | null;
+    steerCurrentTurn?: boolean;
+    expectedTurnId?: string | null;
   },
   bindingOverride?: Partial<AgentBindingContext>,
 ): Promise<AgentSessionTurnResult> {
@@ -1183,8 +1182,8 @@ export async function submitSessionTurn(
         requestId: payload.requestId ?? null,
         userMessageId: payload.userMessageId ?? null,
         placeholderMessageId: payload.placeholderMessageId ?? null,
-        supplementContext: payload.supplementContext === true,
-        targetTaskId: payload.targetTaskId ?? null,
+        steerCurrentTurn: payload.steerCurrentTurn === true,
+        expectedTurnId: payload.expectedTurnId ?? null,
         images: payload.images.map((image) => ({
           name: image.name,
           dataUrl: image.dataUrl,
@@ -1203,7 +1202,7 @@ export async function submitSessionTurn(
       eventId: string;
       acceptedAt: number;
       createdSession: boolean;
-      route: 'chat' | 'execute' | 'task' | 'continue' | 'supplement_context';
+      route: 'chat' | 'execute' | 'task' | 'continue' | 'steer';
       rootTaskId?: string | null;
       actionTaskId?: string | null;
       executionChainRef?: string | null;
@@ -1215,8 +1214,7 @@ export async function submitSessionTurn(
       canonicalEventKind?: string | null;
       canonicalTurn?: CanonicalTurn | null;
       canonicalItem?: CanonicalTurnItem | null;
-      signalRef?: string | null;
-      targetTaskId?: string | null;
+      steeredTurnId?: string | null;
     }>(response, 'submit session turn');
     return {
       sessionId: raw.sessionId,
@@ -1250,9 +1248,8 @@ export async function submitSessionTurn(
         : null,
       canonicalTurn: raw.canonicalTurn ?? null,
       canonicalItem: raw.canonicalItem ?? null,
-      signalRef: typeof raw.signalRef === 'string' && raw.signalRef.trim() ? raw.signalRef.trim() : null,
-      targetTaskId: typeof raw.targetTaskId === 'string' && raw.targetTaskId.trim()
-        ? raw.targetTaskId.trim()
+      steeredTurnId: typeof raw.steeredTurnId === 'string' && raw.steeredTurnId.trim()
+        ? raw.steeredTurnId.trim()
         : null,
     };
   } catch (error) {
@@ -1458,6 +1455,10 @@ export async function saveAgentAuxiliaryConfig(config: Record<string, unknown>):
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/auxiliary/save', config, 'save auxiliary config');
 }
 
+export async function saveAgentImageGenerationConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/image-generation/save', config, 'save image generation config');
+}
+
 export async function removeAgentWorkerConfig(worker: string): Promise<Record<string, unknown>> {
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/worker/remove', { worker }, 'remove worker config');
 }
@@ -1472,6 +1473,10 @@ export async function testAgentOrchestratorConnection(config: Record<string, unk
 
 export async function testAgentAuxiliaryConnection(config: Record<string, unknown>): Promise<Record<string, unknown>> {
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/auxiliary/test', config, 'test auxiliary connection');
+}
+
+export async function testAgentImageGenerationConnection(config: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/image-generation/test', config, 'test image generation connection');
 }
 
 

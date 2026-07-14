@@ -295,7 +295,7 @@ await withGoldenViteServer(async (server) => {
         headers: { 'content-type': 'application/json' },
       });
     };
-    await agentApi.getAgentSettingsBootstrap({ scope: 'core', accessProfile: 'read_only' });
+    const settingsBootstrap = await agentApi.getAgentSettingsBootstrap({ scope: 'core', accessProfile: 'read_only' });
     const settingsBootstrapQuery = new URL(capturedSettingsBootstrapUrl).searchParams;
     assert.equal(settingsBootstrapQuery.get('scope'), 'core');
     assert.equal(
@@ -303,6 +303,62 @@ await withGoldenViteServer(async (server) => {
       'read_only',
       'settings bootstrap must request tool diagnostics under the requested access profile',
     );
+    assert.deepEqual(
+      settingsBootstrap.imageGenerationConfig,
+      {},
+      'settings bootstrap must expose a normalized image generation config section',
+    );
+  } finally {
+    if (originalFetch === undefined) {
+      delete globalThis.fetch;
+    } else {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
+  try {
+    const imageGenerationRequests = [];
+    globalThis.fetch = async (url, init = {}) => {
+      imageGenerationRequests.push({
+        url: String(url),
+        method: init.method || 'GET',
+        body: init.body ? JSON.parse(String(init.body)) : null,
+      });
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+
+    const imageConfig = {
+      baseUrl: 'https://cpa.example.com/v1',
+      apiKey: 'sk-image',
+      model: 'gpt-image-1',
+      urlMode: 'standard',
+    };
+    await agentApi.saveAgentImageGenerationConfig(imageConfig);
+    await agentApi.testAgentImageGenerationConnection(imageConfig);
+
+    assert.deepEqual(imageGenerationRequests, [
+      {
+        url: 'http://127.0.0.1:38123/api/settings/image-generation/save',
+        method: 'POST',
+        body: {
+          ...imageConfig,
+          workspaceId: 'workspace-query-golden',
+          workspacePath: '/tmp/workspace-query-golden',
+        },
+      },
+      {
+        url: 'http://127.0.0.1:38123/api/settings/image-generation/test',
+        method: 'POST',
+        body: {
+          ...imageConfig,
+          workspaceId: 'workspace-query-golden',
+          workspacePath: '/tmp/workspace-query-golden',
+        },
+      },
+    ]);
   } finally {
     if (originalFetch === undefined) {
       delete globalThis.fetch;

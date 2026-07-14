@@ -315,17 +315,33 @@
     }
   }
 
-  function editActorLabel(edit: Edit): string | null {
-    if (edit.workerId?.trim()) return i18n.t('edits.actor.agent');
-    if (edit.sourceKind === 'tool') return i18n.t('edits.actor.mainline');
-    if (edit.sourceKind === 'watcher' || edit.sourceKind === 'external') return i18n.t('edits.actor.external');
+  function editActorPresentation(edit: Edit): {
+    kind: 'mainline' | 'agent' | 'external';
+    label: string;
+    title: string;
+  } | null {
+    if (edit.sourceKind === 'tool') {
+      if (edit.workerId?.trim()) {
+        return {
+          kind: 'agent',
+          label: i18n.t('edits.actor.agent'),
+          title: i18n.t('edits.actor.agentTitle'),
+        };
+      }
+      return {
+        kind: 'mainline',
+        label: i18n.t('edits.actor.mainline'),
+        title: i18n.t('edits.actor.mainlineTitle'),
+      };
+    }
+    if (edit.sourceKind === 'watcher' || edit.sourceKind === 'external') {
+      return {
+        kind: 'external',
+        label: i18n.t('edits.actor.external'),
+        title: i18n.t('edits.actor.externalTitle'),
+      };
+    }
     return null;
-  }
-
-  function editActorTitle(edit: Edit): string {
-    if (edit.workerId?.trim()) return i18n.t('edits.actor.agentTitle');
-    if (edit.sourceKind === 'tool') return i18n.t('edits.actor.mainlineTitle');
-    return i18n.t('edits.actor.externalTitle');
   }
 </script>
 
@@ -334,6 +350,7 @@
   {@const oldName = edit.oldPath ? splitPath(edit.oldPath).name : ''}
   {@const kind = edit.contentKind ?? 'text'}
   {@const isText = kind === 'text'}
+  {@const actor = editActorPresentation(edit)}
   <div
     class="file-row"
     role="button"
@@ -347,20 +364,22 @@
       <Icon name={getFileIconName(edit)} size={14} />
     </div>
     <div class="file-info">
-      {#if edit.type === 'rename' && oldName}
-        <span class="file-name rename-name"><span class="old-path">{oldName}</span><span class="rename-arrow">→</span><span>{name}</span></span>
-      {:else}
-        <span class="file-name">{name}</span>
-      {/if}
-      {#if !isText}
-        <span class="file-kind-tag" title={contentKindLabel(kind)}>{contentKindLabel(kind)}</span>
-      {/if}
-      {#if edit.hasError}
-        <span class="file-error-tag" title={i18n.t('edits.row.errorTitle')}>{i18n.t('edits.row.error')}</span>
-      {/if}
-      {#if editActorLabel(edit)}
-        <span class="file-actor-tag" title={editActorTitle(edit)}>{editActorLabel(edit)}</span>
-      {/if}
+      <div class="file-primary">
+        {#if actor}
+          <span class="file-actor-tag actor-{actor.kind}" title={actor.title}>{actor.label}</span>
+        {/if}
+        {#if edit.type === 'rename' && oldName}
+          <span class="file-name rename-name"><span class="old-path">{oldName}</span><span class="rename-arrow">→</span><span>{name}</span></span>
+        {:else}
+          <span class="file-name">{name}</span>
+        {/if}
+        {#if !isText}
+          <span class="file-kind-tag" title={contentKindLabel(kind)}>{contentKindLabel(kind)}</span>
+        {/if}
+        {#if edit.hasError}
+          <span class="file-error-tag" title={i18n.t('edits.row.errorTitle')}>{i18n.t('edits.row.error')}</span>
+        {/if}
+      </div>
     </div>
     <div class="file-stats">
       {#if isText}
@@ -707,8 +726,17 @@
     overflow: hidden;
   }
 
+  .file-primary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+
   .file-name {
     display: block;
+    flex: 0 1 auto;
+    min-width: 0;
     overflow: hidden;
     color: var(--foreground);
     font-size: var(--text-sm);
@@ -751,8 +779,8 @@
   .file-error-tag,
   .file-actor-tag {
     display: inline-flex;
+    flex: 0 0 auto;
     align-items: center;
-    margin-left: 6px;
     padding: 1px 6px;
     border: 1px solid var(--edits-card-border);
     border-radius: var(--radius-sm);
@@ -771,9 +799,25 @@
   }
 
   .file-actor-tag {
-    background: color-mix(in srgb, var(--info) 13%, transparent);
-    color: var(--foreground-muted);
-    border-color: color-mix(in srgb, var(--info) 28%, var(--edits-card-border));
+    font-weight: var(--font-semibold);
+  }
+
+  .file-actor-tag.actor-mainline {
+    border-color: color-mix(in srgb, var(--info) 42%, var(--edits-card-border));
+    background: color-mix(in srgb, var(--info) 16%, transparent);
+    color: var(--info);
+  }
+
+  .file-actor-tag.actor-external {
+    border-color: color-mix(in srgb, var(--warning) 44%, var(--edits-card-border));
+    background: color-mix(in srgb, var(--warning) 16%, transparent);
+    color: var(--warning);
+  }
+
+  .file-actor-tag.actor-agent {
+    border-color: color-mix(in srgb, var(--color-orchestrator) 42%, var(--edits-card-border));
+    background: color-mix(in srgb, var(--color-orchestrator) 16%, transparent);
+    color: var(--color-orchestrator);
   }
 
   .file-actions {

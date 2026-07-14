@@ -6,6 +6,7 @@ mod dispatch;
 pub mod execution_outcome;
 pub mod final_text_policy;
 mod http_model_client;
+mod image_generation;
 pub mod llm_types;
 mod local_process_protocol;
 mod mcp_client;
@@ -28,6 +29,9 @@ pub use clients::{
 };
 pub use dispatch::BridgeDispatchRuntime;
 pub use http_model_client::{HttpModelBridgeClient, HttpModelBridgeProtocol};
+pub use image_generation::{
+    GeneratedImage, HttpImageGenerationClient, ImageGenerationRequest, ImageGenerationUrlMode,
+};
 pub use local_process_protocol::{
     BridgeServerCommandCapabilityProfile, BridgeServerContextResolutionBoundary,
     BridgeServerHandshake, BridgeServerHealth, BridgeServerKind, BridgeServerServiceCatalog,

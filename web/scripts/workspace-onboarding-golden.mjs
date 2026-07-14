@@ -71,5 +71,15 @@ assert.match(
   /onboardingOrigin !== 'composer' && selectedWorkspaceId[\s\S]*?refreshWorkspaceSessions\(/,
   '输入区添加目录不能自动切入该项目的历史会话',
 );
+assert.match(
+  inputAreaSource,
+  /async function loadPickerModels\(\)[\s\S]*?catch \(error\) \{[\s\S]*?pickerModelsConfigKey = configKey;[\s\S]*?pickerLoadedOnce = true;[\s\S]*?console\.warn\('\[InputArea\] 拉取主线模型列表失败:'/,
+  '主模型列表自动加载失败后必须记录当前配置已尝试，后续仅由用户显式重试',
+);
+assert.match(
+  inputAreaSource,
+  /import \{ canFetchModelList \} from '\.\.\/shared\/model-governance';[\s\S]*?function orchestratorModelListConfigKey[\s\S]*?if \(!config \|\| !canFetchModelList\(config\)\) return '';/,
+  '主模型列表自动加载必须复用统一连接配置校验，未配置连接时不能发起请求',
+);
 
 console.log('workspace onboarding golden passed');

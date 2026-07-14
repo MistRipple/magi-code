@@ -1271,6 +1271,7 @@ impl ApiState {
             "workerConfigs": object_section(&snapshot, "workers"),
             "orchestratorConfig": object_section(&snapshot, "orchestrator"),
             "auxiliaryConfig": object_section(&snapshot, "auxiliary"),
+            "imageGenerationConfig": object_section(&snapshot, "imageGeneration"),
             "userRulesConfig": object_section(&snapshot, "userRulesConfig"),
             "skillsConfig": skills_config,
             "safeguardConfig": object_section(&snapshot, "safeguardConfig"),
@@ -1783,7 +1784,12 @@ impl ApiState {
 }
 
 fn normalize_settings_snapshot_sections(snapshot: &mut HashMap<String, serde_json::Value>) {
-    for key in ["orchestrator", "auxiliary", "safeguardConfig"] {
+    for key in [
+        "orchestrator",
+        "auxiliary",
+        "imageGeneration",
+        "safeguardConfig",
+    ] {
         if let Some(value) = snapshot.get_mut(key) {
             strip_scope_binding_fields(value);
             if key == "orchestrator" {

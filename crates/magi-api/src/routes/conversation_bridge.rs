@@ -3,7 +3,8 @@
 //! 该 helper 是 routes 层读取 user 信号字段与切换 Turn 生命周期的**唯一来源**：
 //! routes 不再直接调 `SessionTurnRequestDto::trimmed_text` 等方法来驱动业务路径。
 //!
-//! S1：4 个 user-input 入口经 `ingest_user_input_to_conversation` 推 Mailbox + drain。
+//! S1：独立 Turn 的 user-input 入口经 `ingest_user_input_to_conversation` 推 Mailbox + drain；
+//! 当前活跃 Turn 的引导由 ConversationRegistry 的 turn-id 绑定通道处理。
 //! S2：执行路径外层经 `begin_session_turn` / `finalize_session_turn` 维护 Turn 生命周期。
 //!
 //! Turn 生命周期是 session 级 Conversation 的硬不变式：同一 Conversation 不允许

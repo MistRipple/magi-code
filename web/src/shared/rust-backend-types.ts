@@ -26,7 +26,7 @@ export type SessionTurnRouteDto =
   | 'execute'
   | 'task'
   | 'continue'
-  | 'supplement_context';
+  | 'steer';
 
 export interface SessionTurnRequestDto {
   sessionId?: string | null;
@@ -41,10 +41,10 @@ export interface SessionTurnRequestDto {
   requestId?: string | null;
   userMessageId?: string | null;
   placeholderMessageId?: string | null;
-  /** 当为 true 时，本次输入直接作为运行时 followup 信号投递到目标任务 Mailbox，不进入分类器。 */
-  supplementContext?: boolean;
-  /** 当 supplementContext 为 true 时，可选指定投递到哪个任务。 */
-  targetTaskId?: string | null;
+  /** 当为 true 时，本次输入作为引导追加到当前活跃 Turn，不创建独立 Turn。 */
+  steerCurrentTurn?: boolean;
+  /** 调用方观察到的当前活跃 Turn ID。 */
+  expectedTurnId?: string | null;
 }
 
 export interface SessionTurnResponseDto {
@@ -64,10 +64,8 @@ export interface SessionTurnResponseDto {
   queued?: boolean;
   queueId?: string | null;
   queuePosition?: number | null;
-  /** 仅在 supplement_context 路由下返回：本次入栈的 mailbox signal ID。 */
-  signalRef?: string | null;
-  /** 仅在 supplement_context 路由下返回：被投递的任务 ID。 */
-  targetTaskId?: string | null;
+  /** 仅在 steer 路由下返回：实际接收引导的 Turn ID。 */
+  steeredTurnId?: string | null;
 }
 
 export interface TaskInterruptResponseDto {

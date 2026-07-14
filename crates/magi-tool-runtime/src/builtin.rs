@@ -1,7 +1,8 @@
 use crate::{
     BuiltinTool, BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec, ToolExecutionContext,
     ToolExecutionContextQuery, ToolRuntimeResources, apply_patch::execute_apply_patch,
-    tool_catalog::execute_tool_catalog, view_image::execute_view_image,
+    image_generate::execute_image_generate, tool_catalog::execute_tool_catalog,
+    view_image::execute_view_image,
 };
 use base64::Engine as _;
 use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, UtcMillis};
@@ -131,6 +132,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
         match self.name {
             BuiltinToolName::FileRead => execute_file_read(input, context),
             BuiltinToolName::ViewImage => execute_view_image(input, context),
+            BuiltinToolName::ImageGenerate => execute_image_generate(input, context, resources),
             BuiltinToolName::FileWrite => execute_file_write(input, context),
             BuiltinToolName::FilePatch => execute_file_patch(input, context),
             BuiltinToolName::ApplyPatch => execute_apply_patch(input, context),

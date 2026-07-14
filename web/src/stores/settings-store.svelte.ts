@@ -31,12 +31,14 @@ import {
   resetAgentExecutionStats,
   settingsBootstrapMatchesCurrentWorkspace,
   saveAgentAuxiliaryConfig,
+  saveAgentImageGenerationConfig,
   saveAgentUserRules,
   saveAgentSafeguardConfig,
   saveAgentWorkerConfig,
   saveAgentOrchestratorConfig,
   removeAgentWorkerConfig,
   testAgentAuxiliaryConnection,
+  testAgentImageGenerationConnection,
   testAgentOrchestratorConnection,
   testAgentWorkerConnection,
   updateAgentMcpServer,
@@ -72,6 +74,8 @@ export interface InteractiveModelFormConfig extends BaseModelFormConfig {
 }
 
 export interface WorkerModelFormConfig extends InteractiveModelFormConfig {}
+
+type ModelConfigTarget = "orch" | "comp" | "image" | "worker";
 
 type BaseModelConfigPayload = Record<string, unknown> & {
   baseUrl: string;
@@ -273,12 +277,14 @@ function createSettingsStore(props: { onClose?: () => void }) {
   });
 
   // Model Tab 状态
-  // 统一 tab 选择：'orch' | 'comp' | 任意 engineId（worker）
+  // 统一 tab 选择：'orch' | 'comp' | 'image' | 任意 engineId（worker）
   let modelConfigTab = $state<string>("orch");
-  // worker 模式下的当前引擎 ID；'orch' / 'comp' 时为空串。
+  // worker 模式下的当前引擎 ID；系统模型 tab 时为空串。
   // 给保留依赖 worker key 的 API（saveModelConfig/probeModelStatus 等）一个稳定入口。
   const activeWorkerEngineId = $derived(
-    modelConfigTab === "orch" || modelConfigTab === "comp" ? "" : modelConfigTab,
+    modelConfigTab === "orch" || modelConfigTab === "comp" || modelConfigTab === "image"
+      ? ""
+      : modelConfigTab,
   );
 
   function createInteractiveConfig(
@@ -387,26 +393,31 @@ function createSettingsStore(props: { onClose?: () => void }) {
   >({
     orch: "idle",
     comp: "idle",
+    image: "idle",
   });
 
   // 模型列表（从 API 获取）
   let modelLists = $state<Record<string, string[]>>({
     orch: [],
     comp: [],
+    image: [],
   });
   let modelListSignatures = $state<Record<string, string>>({
     orch: "",
     comp: "",
+    image: "",
   });
   // 模型列表获取状态
   let fetchingModels = $state<Record<string, boolean>>({
     orch: false,
     comp: false,
+    image: false,
   });
   // 模型下拉是否展开
   let modelDropdownOpen = $state<Record<string, boolean>>({
     orch: false,
     comp: false,
+    image: false,
   });
 
   // 模型下拉的 fixed 定位坐标（用于突破 overflow 容器限制）
@@ -475,8 +486,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
   $effect(() => {
     syncModelListSignature("orch", buildModelListSignature(orchConfig));
     syncModelListSignature("comp", buildModelListSignature(compConfig));
+    syncModelListSignature("image", buildModelListSignature(imageConfig));
 
-    const liveWorkerKeys = new Set<string>(["orch", "comp"]);
+    const liveWorkerKeys = new Set<string>(["orch", "comp", "image"]);
     for (const [workerId, config] of Object.entries(workerConfigs)) {
       liveWorkerKeys.add(workerId);
       syncModelListSignature(workerId, buildModelListSignature(config));
@@ -507,6 +519,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   >({
     orch: "idle",
     comp: "idle",
+    image: "idle",
     mcp: "idle",
   });
 
@@ -536,6 +549,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     createInteractiveConfig(),
   );
   let compConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
+  let imageConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
   let workerConfigs = $state<Record<string, WorkerModelFormConfig>>({});
 
   function deriveWorkerModelTabs(): string[] {
@@ -596,6 +610,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   let keyVisible = $state<Record<string, boolean>>({
     orch: false,
     comp: false,
+    image: false,
     worker: false,
   });
 
@@ -883,6 +898,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
       model: auxiliaryModel,
     };
 
+    const imageModel = imageConfig.model?.trim() || undefined;
+    const incomingImage = resolveIncoming("imageGeneration", imageModel);
+    next.imageGeneration = incomingImage || {
+      status: hasUsableModelConfig(imageConfig) ? "configured" : "not_configured",
+      model: imageModel,
+    };
+
     for (const workerId of deriveWorkerModelTabs()) {
       const config = workerConfigs[workerId];
       const incomingWorker = resolveIncoming(workerId, config?.model?.trim() || undefined);
@@ -916,7 +938,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   async function probeModelStatus(
-    target: "orch" | "comp" | "worker",
+    target: ModelConfigTarget,
     explicitWorkerKey?: string,
   ): Promise<{ key: string; value: ModelStatus }> {
     const workerKey = explicitWorkerKey || activeWorkerEngineId;
@@ -925,7 +947,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
         ? workerKey
         : target === "orch"
           ? "orchestrator"
-          : "auxiliary";
+          : target === "comp"
+            ? "auxiliary"
+            : "imageGeneration";
     const config:
       | InteractiveModelFormConfig
       | BaseModelFormConfig
@@ -935,7 +959,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
         ? workerConfigs[workerKey]
         : target === "orch"
           ? orchConfig
-          : compConfig;
+          : target === "comp"
+            ? compConfig
+            : imageConfig;
     const model = config?.model?.trim() || undefined;
 
     const hasUsableConfig =
@@ -959,8 +985,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
         await testAgentOrchestratorConnection(
           buildOrchestratorConnectionConfigPayload(config as InteractiveModelFormConfig),
         );
-      } else {
+      } else if (target === "comp") {
         await testAgentAuxiliaryConnection(
+          buildBaseModelConfigPayload(config as BaseModelFormConfig),
+        );
+      } else {
+        await testAgentImageGenerationConnection(
           buildBaseModelConfigPayload(config as BaseModelFormConfig),
         );
       }
@@ -1426,7 +1456,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   async function testModelConnection(
-    target: "orch" | "comp" | "worker",
+    target: ModelConfigTarget,
     explicitWorkerKey?: string,
   ) {
     if (target === "worker" && !explicitWorkerKey && !activeWorkerEngineId) {
@@ -1441,7 +1471,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
         ? workerKey
         : target === "orch"
           ? "orchestrator"
-          : "auxiliary";
+          : target === "comp"
+            ? "auxiliary"
+            : "imageGeneration";
     testStatus[statusKey] = "testing";
     testStatus = { ...testStatus };
     appState.modelStatus = {
@@ -1453,7 +1485,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
             ? workerConfigs[workerKey]?.model
             : target === "orch"
               ? orchConfig.model
-              : compConfig.model)?.trim() || undefined,
+              : target === "comp"
+                ? compConfig.model
+                : imageConfig.model)?.trim() || undefined,
         status: "checking",
       },
     };
@@ -1480,7 +1514,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
               ? workerConfigs[workerKey]?.model
               : target === "orch"
                 ? orchConfig.model
-                : compConfig.model)?.trim() || undefined,
+                : target === "comp"
+                  ? compConfig.model
+                  : imageConfig.model)?.trim() || undefined,
         },
       };
       notifySettingsError(i18n.t("settings.toast.action.testConnection"), e);
@@ -1489,15 +1525,17 @@ function createSettingsStore(props: { onClose?: () => void }) {
     resetTestStatus(statusKey);
   }
 
-  async function fetchModelList(target: "orch" | "comp" | "worker") {
+  async function fetchModelList(target: ModelConfigTarget) {
     const key = target === "worker" ? activeWorkerEngineId : target;
     let config: any;
     if (target === "worker") {
       config = workerConfigs[activeWorkerEngineId];
     } else if (target === "orch") {
       config = orchConfig;
-    } else {
+    } else if (target === "comp") {
       config = compConfig;
+    } else {
+      config = imageConfig;
     }
 
     if (!config) {
@@ -1549,6 +1587,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
       return;
     } else if (target === "comp") {
       compConfig.model = model;
+    } else if (target === "image") {
+      imageConfig.model = model;
     } else if (workerConfigs[target]) {
       workerConfigs[target].model = model;
     }
@@ -1582,7 +1622,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     }, 2000);
   }
 
-  async function saveModelConfig(target: "orch" | "comp" | "worker") {
+  async function saveModelConfig(target: ModelConfigTarget) {
     const key = target === "worker" ? activeWorkerEngineId : target;
 
     // 设置保存中状态
@@ -1616,6 +1656,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
         );
       } else if (target === "comp") {
         await saveAgentAuxiliaryConfig(buildBaseModelConfigPayload(compConfig));
+      } else if (target === "image") {
+        await saveAgentImageGenerationConfig(buildBaseModelConfigPayload(imageConfig));
       }
 
       saveStatus[key] = "saved";
@@ -2399,6 +2441,18 @@ function createSettingsStore(props: { onClose?: () => void }) {
     });
   }
 
+  function applyImageGenerationConfig(config: any): void {
+    if (!config) {
+      return;
+    }
+    imageConfig = createAuxiliaryConfig({
+      baseUrl: config.baseUrl || "",
+      urlMode: normalizeUrlMode(config.urlMode),
+      apiKey: config.apiKey || "",
+      model: config.model || "",
+    });
+  }
+
   function applyMcpServersPayload(serversPayload: unknown): void {
     const servers = ensureArray<any>(serversPayload);
     mcpServers = servers.map((s: any) => {
@@ -2720,6 +2774,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       );
       applyOrchestratorConfig(snapshot.orchestratorConfig);
       applyAuxiliaryConfig(snapshot.auxiliaryConfig);
+      applyImageGenerationConfig(snapshot.imageGenerationConfig);
     });
   });
 
@@ -2897,6 +2952,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     set compConfig(v) {
       compConfig = v;
+    },
+    get imageConfig() {
+      return imageConfig;
+    },
+    set imageConfig(v) {
+      imageConfig = v;
     },
     get workerConfigs() {
       return workerConfigs;

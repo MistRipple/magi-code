@@ -12,7 +12,10 @@
 //! 配置输入不再接受 `provider` / `openaiProtocol` / `protocolEndpoint`，避免持久化
 //! 字段和推断结果形成双事实源。
 
-use magi_bridge_client::{HttpModelBridgeClient, HttpModelBridgeProtocol};
+use magi_bridge_client::{
+    HttpImageGenerationClient, HttpModelBridgeClient, HttpModelBridgeProtocol,
+    ImageGenerationUrlMode,
+};
 use magi_core::SessionId;
 use magi_settings_store::DEPRECATED_MODEL_CONFIG_FIELDS;
 use magi_usage_authority::{LlmConfig, ReasoningEffort, UrlMode};
@@ -189,6 +192,21 @@ impl NormalizedModelConfig {
             protocol,
             self.reasoning_effort
                 .map(ModelReasoningEffort::to_usage_reasoning_effort),
+        ))
+    }
+
+    pub fn to_http_image_generation_client(&self) -> Result<HttpImageGenerationClient, String> {
+        let base_url = self.normalized_http_base_url()?;
+        let model = self.require_model()?.to_string();
+        let url_mode = match self.url_mode {
+            ModelUrlMode::Full => ImageGenerationUrlMode::Full,
+            ModelUrlMode::Standard | ModelUrlMode::Proxy => ImageGenerationUrlMode::Standard,
+        };
+        Ok(HttpImageGenerationClient::new(
+            base_url,
+            self.api_key.clone(),
+            model,
+            url_mode,
         ))
     }
 

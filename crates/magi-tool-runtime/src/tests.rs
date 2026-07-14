@@ -12,7 +12,10 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::Command,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -4562,6 +4565,7 @@ fn public_builtin_specs_exclude_shell_internal_process_tools() {
             "web_search",
             "web_fetch",
             "diagram_render",
+            "image_generate",
             "knowledge_query",
             "code_symbols",
             "tool_catalog",
@@ -5801,4 +5805,256 @@ fn code_symbols_definition_and_file_symbols() {
     }
 
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn image_generate_writes_provider_bytes_to_workspace_without_persisting_base64() {
+    let root = unique_temp_dir("magi-tool-image-generate");
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let executor: ImageGenerationExecutor = Arc::new(|request| {
+        assert_eq!(request.prompt, "生成一个蓝色方块");
+        assert_eq!(request.size, "1024x1024");
+        assert_eq!(request.quality.as_deref(), Some("high"));
+        Ok(GeneratedImageData {
+            bytes: b"\x89PNG\r\n\x1a\n".to_vec(),
+            media_type: "image/png".to_string(),
+            revised_prompt: Some("一个蓝色方块".to_string()),
+        })
+    });
+    let mut registry = ToolRegistry::new(governance, event_bus)
+        .with_image_generation_runtime(executor, Arc::new(|| true));
+    registry.register_default_builtins();
+
+    let output = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tool-call-image-generate"),
+            "image_generate",
+            serde_json::json!({
+                "prompt": "生成一个蓝色方块",
+                "size": "1024x1024",
+                "quality": "high",
+                "output_path": "generated-images/blue-square.png"
+            })
+            .to_string(),
+        ),
+        ToolExecutionContext {
+            working_directory: Some(root.clone()),
+            access_profile: magi_core::AccessProfile::FullAccess,
+            ..ToolExecutionContext::default()
+        },
+        &ToolExecutionPolicy {
+            access_profile: magi_core::AccessProfile::FullAccess,
+            ..ToolExecutionPolicy::default()
+        },
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    assert_eq!(
+        fs::read(root.join("generated-images/blue-square.png")).expect("generated image"),
+        b"\x89PNG\r\n\x1a\n"
+    );
+    let payload: Value = serde_json::from_str(&output.payload).expect("image payload json");
+    assert_eq!(payload["tool"], "image_generate");
+    assert_eq!(payload["path"], "generated-images/blue-square.png");
+    assert_eq!(payload["media_type"], "image/png");
+    assert_eq!(payload["bytes"], 8);
+    assert_eq!(payload["revised_prompt"], "一个蓝色方块");
+    assert!(!output.payload.contains("iVBOR"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn image_generate_is_unavailable_in_read_only_access_profile() {
+    let root = unique_temp_dir("magi-tool-image-generate-readonly");
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let executor: ImageGenerationExecutor =
+        Arc::new(|_| panic!("read-only policy must reject before provider invocation"));
+    let mut registry = ToolRegistry::new(governance, event_bus)
+        .with_image_generation_runtime(executor, Arc::new(|| true));
+    registry.register_default_builtins();
+
+    let output = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tool-call-image-generate-readonly"),
+            "image_generate",
+            serde_json::json!({ "prompt": "test" }).to_string(),
+        ),
+        ToolExecutionContext {
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        },
+        &ToolExecutionPolicy {
+            access_profile: magi_core::AccessProfile::ReadOnly,
+            ..ToolExecutionPolicy::default()
+        },
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Rejected);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn image_generate_rejects_unconfigured_runtime_before_provider_call() {
+    let root = unique_temp_dir("magi-tool-image-generate-unconfigured");
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let executor: ImageGenerationExecutor = {
+        let provider_calls = Arc::clone(&provider_calls);
+        Arc::new(move |_| {
+            provider_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("unconfigured image runtime must not call provider")
+        })
+    };
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let mut registry = ToolRegistry::new(governance, event_bus)
+        .with_image_generation_runtime(executor, Arc::new(|| false));
+    registry.register_default_builtins();
+    let context = ToolExecutionContext {
+        working_directory: Some(root.clone()),
+        access_profile: magi_core::AccessProfile::FullAccess,
+        ..ToolExecutionContext::default()
+    };
+    let policy = ToolExecutionPolicy {
+        access_profile: magi_core::AccessProfile::FullAccess,
+        ..ToolExecutionPolicy::default()
+    };
+
+    let output = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tool-call-image-generate-unconfigured"),
+            "image_generate",
+            serde_json::json!({ "prompt": "test image" }).to_string(),
+        ),
+        context,
+        &policy,
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+    let payload: Value = serde_json::from_str(&output.payload).expect("image error payload");
+    assert_eq!(payload["error_code"], "image_generate_not_configured");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn image_generate_rejects_workspace_escape_before_calling_provider() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let root = unique_temp_dir("magi-tool-image-generate-workspace");
+    let outside = unique_temp_dir("magi-tool-image-generate-outside").join("escaped.png");
+    let provider_calls = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::clone(&provider_calls);
+    let executor: ImageGenerationExecutor = Arc::new(move |_| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Ok(GeneratedImageData {
+            bytes: b"\x89PNG\r\n\x1a\n".to_vec(),
+            media_type: "image/png".to_string(),
+            revised_prompt: None,
+        })
+    });
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let mut registry = ToolRegistry::new(governance, event_bus)
+        .with_image_generation_runtime(executor, Arc::new(|| true));
+    registry.register_default_builtins();
+
+    let output = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tool-call-image-generate-workspace-escape"),
+            "image_generate",
+            serde_json::json!({
+                "prompt": "test",
+                "output_path": outside,
+            })
+            .to_string(),
+        ),
+        ToolExecutionContext {
+            working_directory: Some(root.clone()),
+            access_profile: magi_core::AccessProfile::FullAccess,
+            ..ToolExecutionContext::default()
+        },
+        &ToolExecutionPolicy {
+            access_profile: magi_core::AccessProfile::FullAccess,
+            ..ToolExecutionPolicy::default()
+        },
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+    let payload: Value = serde_json::from_str(&output.payload).expect("image error payload");
+    assert_eq!(payload["error_code"], "image_generate_invalid_output_path");
+
+    let _ = fs::remove_dir_all(root);
+    if let Some(parent) = outside.parent() {
+        let _ = fs::remove_dir_all(parent);
+    }
+}
+
+#[test]
+fn image_generate_normalizes_extension_and_never_overwrites_existing_image() {
+    let root = unique_temp_dir("magi-tool-image-generate-extension");
+    fs::write(root.join("poster.png"), b"keep-existing-png").expect("seed existing png");
+    let executor: ImageGenerationExecutor = Arc::new(|_| {
+        Ok(GeneratedImageData {
+            bytes: vec![0xff, 0xd8, 0xff, 0xd9],
+            media_type: "image/jpeg".to_string(),
+            revised_prompt: None,
+        })
+    });
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let mut registry = ToolRegistry::new(governance, event_bus)
+        .with_image_generation_runtime(executor, Arc::new(|| true));
+    registry.register_default_builtins();
+    let context = ToolExecutionContext {
+        working_directory: Some(root.clone()),
+        access_profile: magi_core::AccessProfile::FullAccess,
+        ..ToolExecutionContext::default()
+    };
+    let policy = ToolExecutionPolicy {
+        access_profile: magi_core::AccessProfile::FullAccess,
+        ..ToolExecutionPolicy::default()
+    };
+    let invocation = || {
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tool-call-image-generate-extension"),
+            "image_generate",
+            serde_json::json!({
+                "prompt": "poster",
+                "output_path": "poster.png",
+            })
+            .to_string(),
+        )
+    };
+
+    let first = registry.execute_with_policy(invocation(), context.clone(), &policy);
+    assert_eq!(first.status, ExecutionResultStatus::Succeeded);
+    let first_payload: Value = serde_json::from_str(&first.payload).expect("first payload");
+    assert_eq!(first_payload["path"], "poster.jpg");
+    assert_eq!(
+        fs::read(root.join("poster.png")).unwrap(),
+        b"keep-existing-png"
+    );
+    assert_eq!(
+        fs::read(root.join("poster.jpg")).unwrap(),
+        vec![0xff, 0xd8, 0xff, 0xd9]
+    );
+
+    let second = registry.execute_with_policy(invocation(), context, &policy);
+    assert_eq!(second.status, ExecutionResultStatus::Failed);
+    let second_payload: Value = serde_json::from_str(&second.payload).expect("second payload");
+    assert_eq!(
+        second_payload["error_code"],
+        "image_generate_invalid_output_path"
+    );
+    assert_eq!(
+        fs::read(root.join("poster.jpg")).unwrap(),
+        vec![0xff, 0xd8, 0xff, 0xd9]
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
