@@ -231,8 +231,7 @@ pub fn is_process_alive(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
-        use std::process::Command;
-        Command::new("kill")
+        magi_process::std_command("kill")
             .args(["-0", &pid.to_string()])
             .output()
             .is_ok_and(|o| o.status.success())

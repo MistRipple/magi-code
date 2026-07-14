@@ -6,13 +6,14 @@
 //! 3. 生成一次性访问 token
 //! 4. 解析隧道公网 URL
 
+use magi_process::tokio_command;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::Mutex;
 
 const TUNNEL_ERROR_DEPENDENCY_UNAVAILABLE: &str = "tunnel_dependency_unavailable";
@@ -210,7 +211,7 @@ impl TunnelManager {
         let port = inner.local_port;
 
         // 启动子进程
-        let result = Command::new(&bin_path)
+        let result = tokio_command(&bin_path)
             .args(["tunnel", "--url", &format!("http://127.0.0.1:{port}")])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -323,10 +324,7 @@ async fn resolve_cloudflared_path() -> Option<PathBuf> {
     } else {
         "which"
     };
-    if let Ok(output) = tokio::process::Command::new(which)
-        .arg("cloudflared")
-        .output()
-        .await
+    if let Ok(output) = tokio_command(which).arg("cloudflared").output().await
         && output.status.success()
     {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -352,7 +350,7 @@ async fn install_cloudflared() -> Result<PathBuf, String> {
         dest.clone()
     };
 
-    let status = tokio::process::Command::new("curl")
+    let status = tokio_command("curl")
         .args(["-fsSL", "-o", download_dest.to_str().unwrap(), artifact.url])
         .status()
         .await
@@ -371,7 +369,7 @@ async fn install_cloudflared() -> Result<PathBuf, String> {
         let extract_dir = bin_dir.join(format!("cloudflared-{CLOUDFLARED_VERSION}-extract"));
         let _ = std::fs::remove_dir_all(&extract_dir);
         std::fs::create_dir_all(&extract_dir).map_err(|error| error.to_string())?;
-        let status = tokio::process::Command::new("tar")
+        let status = tokio_command("tar")
             .args([
                 "-xzf",
                 download_dest.to_str().unwrap(),

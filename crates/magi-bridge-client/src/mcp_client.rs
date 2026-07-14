@@ -1,6 +1,7 @@
 use crate::types::{
     BridgeClientError, BridgeErrorLayer, BridgeResponse, McpBridgeClient, McpToolCallRequest,
 };
+use magi_process::std_command;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -8,7 +9,7 @@ use std::{
     env,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::{
         Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -178,7 +179,7 @@ impl StdioMcpBridgeClient {
             return Ok(());
         }
 
-        let mut cmd = Command::new(&self.config.command);
+        let mut cmd = std_command(&self.config.command);
         cmd.args(&self.config.args);
         if let Some(dir) = &self.config.working_directory {
             cmd.current_dir(dir);

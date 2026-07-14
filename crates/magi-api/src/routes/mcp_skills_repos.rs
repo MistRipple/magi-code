@@ -1083,7 +1083,7 @@ async fn ensure_cached_github_repository(
             .map_err(|error| skill_cache_error("清理 Skill 仓库临时目录失败", &staging, error))?;
     }
 
-    let clone_future = tokio::process::Command::new("git")
+    let clone_future = magi_process::tokio_command("git")
         .args(["clone", "--depth", "1", "--no-tags", "--quiet", "--"])
         .arg(repository.clone_url())
         .arg(&staging)

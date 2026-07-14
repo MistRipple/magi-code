@@ -1,11 +1,11 @@
 use crate::{BuiltinToolName, ToolExecutionContext, ToolExecutionInput};
 use magi_governance::ToolKind;
+use magi_process::std_command;
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    process::Command,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,7 +143,7 @@ fn append_changed_paths_to_json_payload(payload: String, changed_paths: &[String
 }
 
 fn run_git_capture(workdir: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let output = std_command("git")
         .args(args)
         .current_dir(workdir)
         .output()

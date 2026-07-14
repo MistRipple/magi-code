@@ -1,6 +1,6 @@
+use magi_process::std_command;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -311,7 +311,7 @@ impl VerificationRunner {
             "-c"
         };
 
-        let output = Command::new(shell)
+        let output = std_command(shell)
             .arg(flag)
             .arg(command)
             .current_dir(cwd)

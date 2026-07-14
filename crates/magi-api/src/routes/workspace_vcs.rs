@@ -5,8 +5,8 @@
 //! 底层直接调用系统 `git` CLI，与用户终端行为一致；不引入 git2/libgit2。
 
 use axum::{Json, Router, extract::State, routing::post};
+use magi_process::tokio_command;
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 
 use crate::{errors::ApiError, state::ApiState};
 
@@ -79,7 +79,7 @@ struct CheckoutResponse {
 
 /// 在指定工作目录运行一条 git 命令，返回 (是否成功, stdout, stderr)。
 async fn run_git(workspace_path: &str, args: &[&str]) -> Result<(bool, String, String), ApiError> {
-    let output = Command::new("git")
+    let output = tokio_command("git")
         .arg("-C")
         .arg(workspace_path)
         .args(args)

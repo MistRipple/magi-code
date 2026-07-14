@@ -6,6 +6,7 @@ use crate::{
 };
 use base64::Engine as _;
 use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, UtcMillis};
+use magi_process::std_command;
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -13,7 +14,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, ExitStatus, Stdio},
     sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -781,7 +782,7 @@ fn resolve_git_probe_path(path: &str, cwd: &Path) -> PathBuf {
 
 fn is_git_worktree(path: &Path) -> bool {
     let path_arg = path.to_string_lossy().to_string();
-    Command::new("git")
+    std_command("git")
         .args([
             "-C",
             path_arg.as_str(),
@@ -802,7 +803,7 @@ fn execute_shell_command_with_timeout(
     timeout_ms: u64,
     context: &ToolExecutionContext,
 ) -> Result<ShellExecOutput, String> {
-    let mut command_builder = Command::new(shell);
+    let mut command_builder = std_command(shell);
     command_builder
         .arg(shell_arg())
         .arg(command)
@@ -979,14 +980,14 @@ fn terminate_process_group(child: &mut Child) {
     #[cfg(unix)]
     {
         let process_group = format!("-{}", child.id());
-        let _ = Command::new("kill")
+        let _ = std_command("kill")
             .arg("-TERM")
             .arg(&process_group)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
         thread::sleep(Duration::from_millis(50));
-        let _ = Command::new("kill")
+        let _ = std_command("kill")
             .arg("-KILL")
             .arg(&process_group)
             .stdout(Stdio::null())
@@ -1067,7 +1068,7 @@ fn execute_process_launch_with_surface(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(default_shell_binary);
 
-    let mut child = match Command::new(&shell)
+    let mut child = match std_command(&shell)
         .arg(shell_arg())
         .arg(&command)
         .current_dir(&cwd)
@@ -1422,7 +1423,7 @@ fn execute_process_inspect(input: &str) -> String {
         .clamp(1, 100);
 
     let output = if query.is_some() {
-        match Command::new("ps")
+        match std_command("ps")
             .args(["-ax", "-o", "pid=,ppid=,state=,comm="])
             .output()
         {
@@ -1437,7 +1438,7 @@ fn execute_process_inspect(input: &str) -> String {
             }
         }
     } else {
-        match Command::new("ps")
+        match std_command("ps")
             .args(["-p", &pid.to_string(), "-o", "pid=,ppid=,state=,comm="])
             .output()
         {

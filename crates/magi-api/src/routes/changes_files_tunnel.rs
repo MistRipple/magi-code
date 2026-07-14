@@ -875,12 +875,12 @@ async fn lan_access_status(
 
 /// 获取首选的局域网 IPv4 地址（遍历网卡接口 + 评分）
 fn resolve_preferred_lan_ipv4() -> String {
-    use std::process::Command;
-
     // 通过 ifconfig (macOS/Linux) 获取所有 IPv4 地址
-    let output = Command::new("ifconfig")
-        .output()
-        .or_else(|_| Command::new("ip").args(["addr", "show"]).output());
+    let output = magi_process::std_command("ifconfig").output().or_else(|_| {
+        magi_process::std_command("ip")
+            .args(["addr", "show"])
+            .output()
+    });
 
     let text = match output {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),

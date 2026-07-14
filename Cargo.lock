@@ -2340,6 +2340,7 @@ dependencies = [
  "magi-memory-store",
  "magi-mission-metrics",
  "magi-orchestrator",
+ "magi-process",
  "magi-safety-gate",
  "magi-session-store",
  "magi-settings-store",
@@ -2369,6 +2370,7 @@ version = "3.0.0"
 dependencies = [
  "base64 0.22.1",
  "magi-permissions",
+ "magi-process",
  "magi-usage-authority",
  "once_cell",
  "regex",
@@ -2451,6 +2453,7 @@ dependencies = [
  "magi-knowledge-store",
  "magi-memory-store",
  "magi-orchestrator",
+ "magi-process",
  "magi-session-store",
  "magi-settings-store",
  "magi-skill-runtime",
@@ -2567,6 +2570,7 @@ dependencies = [
  "magi-governance",
  "magi-knowledge-store",
  "magi-memory-store",
+ "magi-process",
  "magi-skill-runtime",
  "magi-tool-runtime",
  "magi-worker-runtime",
@@ -2586,6 +2590,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "magi-process"
+version = "3.0.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "magi-project-memory"
 version = "3.0.0"
 dependencies = [
@@ -2602,6 +2613,7 @@ dependencies = [
 name = "magi-runtime-state"
 version = "3.0.0"
 dependencies = [
+ "magi-process",
  "serde",
  "serde_json",
 ]
@@ -2694,6 +2706,7 @@ dependencies = [
  "magi-governance",
  "magi-knowledge-store",
  "magi-permissions",
+ "magi-process",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -2720,6 +2733,7 @@ dependencies = [
  "magi-core",
  "magi-event-bus",
  "magi-governance",
+ "magi-process",
  "magi-skill-runtime",
  "magi-tool-runtime",
  "serde",

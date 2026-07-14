@@ -14,12 +14,13 @@ use crate::{
     WorkerExecutorRequest, WorkerStage,
 };
 use magi_core::{TaskResultKind, TerminationReason, UtcMillis, VerificationStatus};
+use magi_process::std_command;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     io::Write,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{Arc, RwLock},
 };
 
@@ -400,7 +401,7 @@ impl LocalProcessWorkerExecutor {
         &self,
         request: &LocalProcessProtocolRequest,
     ) -> Result<LocalProcessProtocolResponse, WorkerExecutorFailure> {
-        let mut command = Command::new(&self.config.executable);
+        let mut command = std_command(&self.config.executable);
         command.args(&self.config.args);
         if let Some(working_directory) = &self.config.working_directory {
             command.current_dir(working_directory);

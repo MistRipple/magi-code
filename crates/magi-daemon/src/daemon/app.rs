@@ -9,6 +9,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
+use magi_process::{std_command, tokio_command};
 use std::{
     env,
     net::SocketAddr,
@@ -18,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::net::TcpListener;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
 use tower_http::services::{ServeDir, ServeFile};
@@ -438,21 +439,21 @@ fn open_browser(url: &str) -> std::io::Result<()> {
 fn browser_open_command(url: &str) -> StdCommand {
     #[cfg(target_os = "macos")]
     {
-        let mut command = StdCommand::new("open");
+        let mut command = std_command("open");
         command.arg(url);
         command
     }
 
     #[cfg(target_os = "windows")]
     {
-        let mut command = StdCommand::new("cmd");
+        let mut command = std_command("cmd");
         command.args(["/C", "start", "", url]);
         command
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let mut command = StdCommand::new("xdg-open");
+        let mut command = std_command("xdg-open");
         command.arg(url);
         command
     }
@@ -669,7 +670,7 @@ fn spawn_web_dev_server(
     agent_origin: &str,
     web_root: &Path,
 ) -> Result<Child, String> {
-    Command::new("npm")
+    tokio_command("npm")
         .arg("--prefix")
         .arg(web_root)
         .arg("run")

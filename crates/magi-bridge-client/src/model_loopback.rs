@@ -6,9 +6,10 @@ use crate::{
         LocalProcessBridgeServerError, run_local_process_bridge_server,
     },
 };
+use magi_process::std_command;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use std::{env, fmt, process::Command, sync::Arc};
+use std::{env, fmt, sync::Arc};
 use thiserror::Error;
 
 const OPENAI_COMPAT_PROVIDER: &str = "openai-compatible";
@@ -816,7 +817,7 @@ impl OpenAiCompatibleHttpExecutor for CurlOpenAiCompatibleHttpExecutor {
         request: &OpenAiCompatibleHttpRequest,
         api_key: &str,
     ) -> Result<OpenAiCompatibleHttpResponse, OpenAiCompatibleHttpExecutorError> {
-        let output = Command::new(OPENAI_HTTP_EXECUTABLE)
+        let output = std_command(OPENAI_HTTP_EXECUTABLE)
             .arg("-sS")
             .arg("-L")
             .arg("--connect-timeout")

@@ -16,6 +16,7 @@ magi-knowledge-store = { path = "../magi-knowledge-store" }
 magi-memory-store = { path = "../magi-memory-store" }
 magi-bridge-client = { path = "../magi-bridge-client" }
 magi-governance = { path = "../magi-governance" }
+magi-process = { path = "../magi-process" }
 serde_json.workspace = true
 tracing.workspace = true
 

@@ -11,4 +11,5 @@ magi-skill-runtime = { path = "../magi-skill-runtime" }
 magi-tool-runtime = { path = "../magi-tool-runtime" }
 magi-bridge-client = { path = "../magi-bridge-client" }
 magi-governance = { path = "../magi-governance" }
+magi-process = { path = "../magi-process" }
 serde_json.workspace = true

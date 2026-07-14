@@ -52,3 +52,16 @@ jobs:
         uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  windows-desktop:
+    name: Windows 桌面进程策略
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 验证 Windows 子进程与桌面宿主
+        run: cargo test -p magi-process -p magi-desktop --all-targets --locked

@@ -4,6 +4,7 @@ members = [
   "apps/daemon",
   "apps/desktop",
   "crates/magi-core",
+  "crates/magi-process",
   "crates/magi-daemon",
   "crates/magi-api",
   "crates/magi-session-store",

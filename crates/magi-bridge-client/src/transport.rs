@@ -2,13 +2,14 @@ use crate::types::{
     BridgeErrorLayer, BridgeTransport, BridgeTransportError, BridgeTransportRequest,
     BridgeTransportResponse,
 };
+use magi_process::std_command;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::Stdio,
     thread,
 };
 
@@ -64,7 +65,7 @@ impl BridgeTransport for JsonRpcStdioTransport {
         &self,
         request: BridgeTransportRequest,
     ) -> Result<BridgeTransportResponse, BridgeTransportError> {
-        let mut command = Command::new(&self.config.executable);
+        let mut command = std_command(&self.config.executable);
         command.args(&self.config.args);
         if let Some(working_directory) = &self.config.working_directory {
             command.current_dir(working_directory);

@@ -1,0 +1,7 @@
+[package]
+name = "magi-process"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
