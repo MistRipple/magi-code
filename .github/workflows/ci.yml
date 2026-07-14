@@ -39,6 +39,21 @@ jobs:
       - name: 安装 Rust
         run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
 
+      - name: 安装 Linux 桌面依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget
+
       - name: Rust 编译检查
         run: cargo check --workspace --all-targets --locked
 
