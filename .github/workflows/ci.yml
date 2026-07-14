@@ -64,4 +64,4 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: 验证 Windows 子进程与桌面宿主
-        run: cargo test -p magi-process -p magi-desktop --all-targets --locked
+        run: cargo test -p magi-process -p magi-daemon --all-targets --locked
