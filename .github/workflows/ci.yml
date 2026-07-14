@@ -67,9 +67,9 @@ jobs:
         run: cargo test --workspace --all-targets --locked
 
       - name: Rust 依赖安全检查
-        uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit
 
   windows-desktop:
     name: Windows 桌面进程策略
