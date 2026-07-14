@@ -228,21 +228,29 @@ jobs:
       - name: 校验发布文件
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          macos_assets=(dist/release-assets/*.dmg)
-          linux_appimages=(dist/release-assets/*.AppImage)
-          linux_debs=(dist/release-assets/*.deb)
-          windows_installers=(dist/release-assets/*.exe)
+          macos_assets=()
+          linux_appimages=()
+          linux_debs=()
+          windows_installers=()
+          while IFS= read -r file; do macos_assets+=("$file"); done < <(find dist/release-assets -type f -name '*.dmg' -print)
+          while IFS= read -r file; do linux_appimages+=("$file"); done < <(find dist/release-assets -type f -name '*.AppImage' -print)
+          while IFS= read -r file; do linux_debs+=("$file"); done < <(find dist/release-assets -type f -name '*.deb' -print)
+          while IFS= read -r file; do windows_installers+=("$file"); done < <(find dist/release-assets -type f -name '*.exe' -print)
 
           test "${#macos_assets[@]}" -eq 1
           test "${#linux_appimages[@]}" -eq 1
           test "${#linux_debs[@]}" -eq 1
           test "${#windows_installers[@]}" -eq 1
-          test -s "${macos_assets[0]}"
-          test -s "${linux_appimages[0]}"
-          test -s "${linux_debs[0]}"
-          test -s "${windows_installers[0]}"
-          ls -lh dist/release-assets
+          mkdir -p dist/release-assets/normalized
+          cp "${macos_assets[0]}" "dist/release-assets/normalized/$(basename "${macos_assets[0]}")"
+          cp "${linux_appimages[0]}" "dist/release-assets/normalized/$(basename "${linux_appimages[0]}")"
+          cp "${linux_debs[0]}" "dist/release-assets/normalized/$(basename "${linux_debs[0]}")"
+          cp "${windows_installers[0]}" "dist/release-assets/normalized/$(basename "${windows_installers[0]}")"
+          test -s dist/release-assets/normalized/*.dmg
+          test -s dist/release-assets/normalized/*.AppImage
+          test -s dist/release-assets/normalized/*.deb
+          test -s dist/release-assets/normalized/*.exe
+          ls -lh dist/release-assets/normalized
 
       - name: 生成发布说明
         run: |
@@ -267,10 +275,10 @@ jobs:
             echo "- 本次发布没有检测到新的提交摘要。" > dist/release-changes.md
           fi
 
-          macos_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.dmg' -print -quit)")"
-          linux_appimage="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.AppImage' -print -quit)")"
-          linux_deb="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.deb' -print -quit)")"
-          windows_installer="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.exe' -print -quit)")"
+          macos_asset="$(basename "$(find dist/release-assets/normalized -maxdepth 1 -name '*.dmg' -print -quit)")"
+          linux_appimage="$(basename "$(find dist/release-assets/normalized -maxdepth 1 -name '*.AppImage' -print -quit)")"
+          linux_deb="$(basename "$(find dist/release-assets/normalized -maxdepth 1 -name '*.deb' -print -quit)")"
+          windows_installer="$(basename "$(find dist/release-assets/normalized -maxdepth 1 -name '*.exe' -print -quit)")"
 
           {
             echo "# Magi $tag"
@@ -314,5 +322,5 @@ jobs:
           name: Magi ${{ github.ref_name }}
           body_path: dist/release-notes.md
           prerelease: ${{ contains(github.ref_name, 'test') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
-          files: dist/release-assets/*
+          files: dist/release-assets/normalized/*
           fail_on_unmatched_files: true
