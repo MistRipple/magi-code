@@ -822,17 +822,21 @@ await withGoldenViteServer(async (server) => {
       () => workspaceSessionsRequestCount > workspaceSessionRequestsBeforeTunnelSync,
       'tunnel busy sync must query the lightweight workspace session summary',
     );
-    await new Promise((resolve) => setTimeout(resolve, 30));
     assert.equal(
       bootstrapRequestCount,
       bootstrapRequestsBeforeTunnelSync,
       'tunnel busy sync must not repeatedly fetch the heavy bootstrap while the backend is still running',
+    );
+    await waitFor(
+      () => currentSessionSummary(messagesStore)?.isRunning === true,
+      'tunnel busy sync must apply the running workspace session summary',
     );
     assert.equal(
       messagesStore.messagesState.isProcessing,
       true,
       'backend running summary must preserve the public tunnel processing state',
     );
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     workspaceSessionIsRunning = false;
     Date.now = () => originalDateNowForTunnelSync() + 6_000;
