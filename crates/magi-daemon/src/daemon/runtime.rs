@@ -1093,7 +1093,7 @@ impl DaemonRuntime {
                             orchestrator_configured = orchestrator_settings_is_configured(
                                 &settings_store.get_section("orchestrator"),
                             ),
-                            "业务模型默认桥未配置真实 HTTP client；真实会话将优先解析会话/设置中的主模型配置，仍缺失时返回可操作配置错误。loopback-model 仅保留用于桥探测/冒烟，不参与业务流式对话"
+                            "业务模型的环境默认桥未配置；真实会话仍会按会话/设置中的主模型配置创建 HTTP client，只有解析不到有效主模型时才返回可操作配置错误。loopback-model 仅保留用于桥探测/冒烟，不参与业务流式对话"
                         );
                         Arc::new(UnavailableBusinessModelBridgeClient::new(
                             self.state_root.clone(),

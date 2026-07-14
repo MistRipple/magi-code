@@ -21,6 +21,21 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      - name: 校验构建输入不含本地运行时配置
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden_files="$(find . -path './.git' -prune -o -path './target' -prune -o -path './web/node_modules' -prune -o -type f \( -name 'settings.json' -o -name '.env' -o -name '.env.*' \) -print)"
+          if [ -n "$forbidden_files" ]; then
+            echo "构建输入包含不应进入发布流程的本地配置文件：" >&2
+            printf '%s\n' "$forbidden_files" >&2
+            exit 1
+          fi
+          if [ -d "$HOME/.magi" ]; then
+            echo "构建环境检测到本地 Magi 运行时目录，拒绝继续打包。" >&2
+            exit 1
+          fi
+
       - name: 安装 Node.js
         uses: actions/setup-node@v4
         with:
@@ -70,11 +85,37 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      - name: 校验构建输入不含本地运行时配置
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden_files="$(find . -path './.git' -prune -o -path './target' -prune -o -path './web/node_modules' -prune -o -type f \( -name 'settings.json' -o -name '.env' -o -name '.env.*' \) -print)"
+          if [ -n "$forbidden_files" ]; then
+            echo "构建输入包含不应进入发布流程的本地配置文件：" >&2
+            printf '%s\n' "$forbidden_files" >&2
+            exit 1
+          fi
+          if [ -d "$HOME/.magi" ]; then
+            echo "构建环境检测到本地 Magi 运行时目录，拒绝继续打包。" >&2
+            exit 1
+          fi
+
       - name: 下载前端资源
         uses: actions/download-artifact@v4
         with:
           name: magi-web-dist
           path: web/dist
+
+      - name: 校验前端资源不含本地运行时配置
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden_files="$(find web/dist -type f \( -name 'settings.json' -o -name '.env' -o -name '.env.*' \) -print)"
+          if [ -n "$forbidden_files" ]; then
+            echo "前端发布资源包含本地配置文件：" >&2
+            printf '%s\n' "$forbidden_files" >&2
+            exit 1
+          fi
 
       - name: 安装 Linux 桌面依赖
         if: matrix.platform == 'linux'

@@ -19,6 +19,21 @@ await withGoldenViteServer(async (server) => {
     bytes: 8,
     revisedPrompt: '一个蓝色方块',
   });
+  assert.deepEqual(
+    preview.parseImageGenerationPreview('mcp__images__image_generate', JSON.stringify({
+      status: 'succeeded',
+      path: 'generated-images/namespaced.png',
+      media_type: 'image/png',
+      bytes: 8,
+    })),
+    {
+      path: 'generated-images/namespaced.png',
+      mime: 'image/png',
+      bytes: 8,
+      revisedPrompt: '',
+    },
+    'namespaced image_generate results should use the same inline preview path',
+  );
   assert.equal(
     preview.parseImageGenerationPreview('view_image', '{}'),
     null,

@@ -14,6 +14,7 @@ const TOOL_NAME: &str = "image_generate";
 const DEFAULT_SIZE: &str = "1024x1024";
 const PUBLIC_PROVIDER_ERROR: &str = "图片生成服务暂不可用，请检查图片模型配置后重试";
 const PUBLIC_WRITE_ERROR: &str = "生成图片暂不可保存，请检查工作区路径或权限";
+const MAX_OUTPUT_NAME_ATTEMPTS: u32 = 10_000;
 
 pub(crate) fn execute_image_generate(
     input: &str,
@@ -68,18 +69,24 @@ pub(crate) fn execute_image_generate(
         Ok(extension) => extension,
         Err(error) => return image_generation_error("image_generate_invalid_result", error),
     };
-    let output_path =
+    let requested_output_path =
         match resolve_output_path(&workspace_root, requested_output_path.as_deref(), extension) {
             Ok(path) => path,
             Err(error) => {
                 return image_generation_error("image_generate_invalid_output_path", error);
             }
         };
-
-    if let Err(error) = write_generated_image(&workspace_root, &output_path, &generated.bytes) {
-        tracing::warn!(path = %output_path.display(), error = %error, "generated image write failed");
-        return image_generation_error("image_generate_write_failed", PUBLIC_WRITE_ERROR);
-    }
+    let output_path = match write_generated_image(
+        &workspace_root,
+        &requested_output_path,
+        &generated.bytes,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(path = %requested_output_path.display(), error = %error, "generated image write failed");
+            return image_generation_error("image_generate_write_failed", PUBLIC_WRITE_ERROR);
+        }
+    };
 
     let relative_path = output_path
         .strip_prefix(&workspace_root)
@@ -214,9 +221,6 @@ fn resolve_output_path(
     if candidate == workspace_root || candidate.file_name().is_none() {
         return Err("output_path 必须指向具体图片文件".to_string());
     }
-    if candidate.exists() {
-        return Err("目标图片文件已存在，image_generate 不会覆盖已有文件".to_string());
-    }
     Ok(candidate)
 }
 
@@ -252,7 +256,11 @@ fn image_extension(generated: &GeneratedImageData) -> Result<&'static str, Strin
     }
 }
 
-fn write_generated_image(root: &Path, output_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_generated_image(
+    root: &Path,
+    output_path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<PathBuf> {
     let parent = output_path
         .parent()
         .ok_or_else(|| std::io::Error::other("output path has no parent"))?;
@@ -264,11 +272,41 @@ fn write_generated_image(root: &Path, output_path: &Path, bytes: &[u8]) -> std::
             "output parent escaped workspace",
         ));
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output_path)?;
-    file.write_all(bytes)
+    for attempt in 0..MAX_OUTPUT_NAME_ATTEMPTS {
+        let candidate = if attempt == 0 {
+            output_path.to_path_buf()
+        } else {
+            output_path_with_suffix(output_path, attempt)
+        };
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        file.write_all(bytes)?;
+        return Ok(candidate);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "无法为生成图片分配未占用的文件名",
+    ))
+}
+
+fn output_path_with_suffix(path: &Path, suffix: u32) -> PathBuf {
+    let mut file_name = path
+        .file_stem()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    file_name.push(format!("-{suffix}"));
+    if let Some(extension) = path.extension() {
+        file_name.push(".");
+        file_name.push(extension);
+    }
+    path.with_file_name(file_name)
 }
 
 fn image_generation_error(code: &str, message: impl Into<String>) -> String {

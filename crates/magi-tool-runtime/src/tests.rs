@@ -5995,7 +5995,7 @@ fn image_generate_rejects_workspace_escape_before_calling_provider() {
 }
 
 #[test]
-fn image_generate_normalizes_extension_and_never_overwrites_existing_image() {
+fn image_generate_normalizes_extension_and_avoids_overwriting_existing_image() {
     let root = unique_temp_dir("magi-tool-image-generate-extension");
     fs::write(root.join("poster.png"), b"keep-existing-png").expect("seed existing png");
     let executor: ImageGenerationExecutor = Arc::new(|_| {
@@ -6045,14 +6045,15 @@ fn image_generate_normalizes_extension_and_never_overwrites_existing_image() {
     );
 
     let second = registry.execute_with_policy(invocation(), context, &policy);
-    assert_eq!(second.status, ExecutionResultStatus::Failed);
+    assert_eq!(second.status, ExecutionResultStatus::Succeeded);
     let second_payload: Value = serde_json::from_str(&second.payload).expect("second payload");
-    assert_eq!(
-        second_payload["error_code"],
-        "image_generate_invalid_output_path"
-    );
+    assert_eq!(second_payload["path"], "poster-1.jpg");
     assert_eq!(
         fs::read(root.join("poster.jpg")).unwrap(),
+        vec![0xff, 0xd8, 0xff, 0xd9]
+    );
+    assert_eq!(
+        fs::read(root.join("poster-1.jpg")).unwrap(),
         vec![0xff, 0xd8, 0xff, 0xd9]
     );
 

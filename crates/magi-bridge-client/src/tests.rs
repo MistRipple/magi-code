@@ -12,6 +12,8 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
+    io::{Read, Write},
+    net::TcpListener,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -921,6 +923,84 @@ fn image_generation_client_builds_standard_openai_request_and_parses_base64_resu
     assert_eq!(result.bytes, b"\x89PNG\r\n\x1a\n");
     assert_eq!(result.media_type, "image/png");
     assert_eq!(result.revised_prompt.as_deref(), Some("一个蓝色方块"));
+}
+
+#[test]
+fn image_generation_client_performs_real_http_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("image mock server should bind");
+    let address = listener
+        .local_addr()
+        .expect("image mock server address should be available");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("image mock server should accept the request");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let header_end = loop {
+            let read = stream
+                .read(&mut buffer)
+                .expect("image mock request should be readable");
+            assert!(read > 0, "image mock request ended before headers");
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length:")
+                    .or_else(|| line.strip_prefix("content-length:"))
+            })
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .expect("image request should include content length");
+        while request.len() < header_end + content_length {
+            let read = stream
+                .read(&mut buffer)
+                .expect("image mock request body should be readable");
+            assert!(read > 0, "image mock request ended before body");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let body = String::from_utf8_lossy(&request[header_end..header_end + content_length]);
+        assert!(body.contains("\"model\":\"gpt-image-test\""));
+        assert!(body.contains("\"prompt\":\"draw a blue square\""));
+        assert!(body.contains("\"response_format\":\"b64_json\""));
+
+        let response_body = serde_json::json!({
+            "data": [{
+                "b64_json": "iVBORw0KGgo=",
+                "revised_prompt": "a blue square"
+            }]
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body,
+        )
+        .expect("image mock response should be writable");
+    });
+
+    let client = HttpImageGenerationClient::new(
+        format!("http://{address}/v1"),
+        Some("sk-image-test".to_string()),
+        "gpt-image-test".to_string(),
+        ImageGenerationUrlMode::Standard,
+    );
+    let generated = client
+        .generate(ImageGenerationRequest {
+            prompt: "draw a blue square".to_string(),
+            size: "1024x1024".to_string(),
+            quality: None,
+        })
+        .expect("image generation client should call the HTTP endpoint");
+    server.join().expect("image mock server should finish");
+    assert_eq!(generated.media_type, "image/png");
+    assert_eq!(generated.bytes, b"\x89PNG\r\n\x1a\n");
+    assert_eq!(generated.revised_prompt.as_deref(), Some("a blue square"));
 }
 
 #[test]

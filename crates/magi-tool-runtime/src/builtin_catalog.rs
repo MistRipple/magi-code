@@ -499,7 +499,7 @@ impl BuiltinToolName {
                 # 约束\n\
                 - 依赖设置中已启用且测试可用的图片生成模型\n\
                 - 生成结果只允许写入当前工作区，默认保存到 generated-images/\n\
-                - 不覆盖已有文件；需要检查图片内容时继续调用 view_image"
+                - 不覆盖已有文件；如果目标文件已存在，会自动生成带序号的新文件名；需要检查图片内容时继续调用 view_image"
             }
             Self::KnowledgeQuery => "查询项目知识库：检索 README、文档与代码文档",
             Self::CodeSymbols => {
@@ -899,7 +899,7 @@ impl BuiltinToolName {
                     },
                     "output_path": {
                         "type": "string",
-                        "description": "可选的工作区内输出路径；扩展名会按服务实际返回格式规范化，默认保存到 generated-images/"
+                        "description": "可选的工作区内输出路径；扩展名会按服务实际返回格式规范化，默认保存到 generated-images/；目标已存在时自动追加序号，不覆盖原文件"
                     }
                 },
                 "required": ["prompt"]
