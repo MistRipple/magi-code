@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { createUpdateManifest } from './generate-update-manifest.mjs';
 
@@ -35,6 +37,13 @@ assert.match(
   /- name: 构建桌面安装包\n\s+shell: bash\n\s+env:/,
   'cross-platform desktop packaging must use bash for its shell script',
 );
+assert.doesNotMatch(
+  releaseWorkflow,
+  /AppImage\.tar\.gz|nsis\.zip/,
+  'Tauri v2 self-contained Linux and Windows updater artifacts must not use legacy v1 archive names',
+);
+assert.match(releaseWorkflow, /\.AppImage\.sig/, 'Linux updater validation must use the signed AppImage');
+assert.match(releaseWorkflow, /\.exe\.sig/, 'Windows updater validation must use the signed NSIS installer');
 
 const releaseNotes = fs.readFileSync(path.resolve('../.github/releases/v3.0.1.md'), 'utf8');
 assert.match(releaseNotes, /Turn ID/, '3.0.1 notes must explain the Turn ID race convergence');
@@ -85,5 +94,32 @@ assert.throws(
   /signature is required/,
   'manifest generation must reject unsigned update targets',
 );
+
+const cliFixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'magi-update-manifest-'));
+try {
+  const fixtureAssets = [
+    'Magi_3.0.1_darwin-aarch64-app.tar.gz',
+    'Magi_3.0.1_linux-x86_64-appimage.AppImage',
+    'Magi_3.0.1_windows-x86_64-nsis.exe',
+  ];
+  for (const filename of fixtureAssets) {
+    fs.writeFileSync(path.join(cliFixtureDir, filename), 'artifact');
+    fs.writeFileSync(path.join(cliFixtureDir, `${filename}.sig`), `signature-${filename}`);
+  }
+  const outputPath = path.join(cliFixtureDir, 'latest.json');
+  execFileSync(process.execPath, [
+    path.resolve('scripts/generate-update-manifest.mjs'),
+    '--version', '3.0.1',
+    '--tag', 'v3.0.1',
+    '--repository', 'MistRipple/magi-code',
+    '--assets-dir', cliFixtureDir,
+    '--output', outputPath,
+  ]);
+  const cliManifest = JSON.parse(fs.readFileSync(outputPath, 'utf8'));
+  assert.match(cliManifest.platforms['linux-x86_64'].url, /\.AppImage$/);
+  assert.match(cliManifest.platforms['windows-x86_64'].url, /\.exe$/);
+} finally {
+  fs.rmSync(cliFixtureDir, { recursive: true, force: true });
+}
 
 console.log('update manifest golden replay passed');

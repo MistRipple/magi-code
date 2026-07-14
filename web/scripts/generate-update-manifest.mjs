@@ -71,7 +71,7 @@ function parseArgs(argv) {
 
 function scanUpdaterAssets(assetsDir, version) {
   const escapedVersion = version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const pattern = new RegExp(`^Magi_${escapedVersion}_(?<target>(?:darwin|linux|windows)-[a-z0-9_]+-[a-z0-9_]+)\\.(?:tar\\.gz|zip)$`);
+  const pattern = new RegExp(`^Magi_${escapedVersion}_(?<target>(?:darwin|linux|windows)-[a-z0-9_]+-[a-z0-9_]+)\\.(?:tar\\.gz|AppImage|exe)$`);
   const files = fs.readdirSync(assetsDir).filter((filename) => pattern.test(filename));
   if (files.length === 0) {
     throw new Error(`no normalized updater assets found in ${assetsDir}`);

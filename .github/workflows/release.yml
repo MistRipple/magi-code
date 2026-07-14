@@ -210,11 +210,8 @@ jobs:
               test "${#debs[@]}" -eq 1
               test -s "${appimages[0]}"
               test -s "${debs[0]}"
-              updater=(target/release/bundle/appimage/*.AppImage.tar.gz)
-              signatures=(target/release/bundle/appimage/*.AppImage.tar.gz.sig)
-              test "${#updater[@]}" -eq 1
+              signatures=(target/release/bundle/appimage/*.AppImage.sig)
               test "${#signatures[@]}" -eq 1
-              test -s "${updater[0]}"
               test -s "${signatures[0]}"
               ;;
             windows)
@@ -222,13 +219,8 @@ jobs:
               installers=(target/release/bundle/nsis/*.exe)
               test "${#installers[@]}" -eq 1
               test -s "${installers[0]}"
-              updater=()
-              while IFS= read -r file; do updater+=("$file"); done < <(find target/release/bundle -type f -name '*.nsis.zip' -print)
-              signatures=()
-              while IFS= read -r file; do signatures+=("$file"); done < <(find target/release/bundle -type f -name '*.nsis.zip.sig' -print)
-              test "${#updater[@]}" -eq 1
+              signatures=(target/release/bundle/nsis/*.exe.sig)
               test "${#signatures[@]}" -eq 1
-              test -s "${updater[0]}"
               test -s "${signatures[0]}"
               ;;
             *)
@@ -254,23 +246,24 @@ jobs:
               signatures=(target/release/bundle/macos/*.app.tar.gz.sig)
               host_arch="$(rustc -vV | sed -n 's/^host: .*\-\(x86_64\|aarch64\|i686\|armv7\|riscv64\)\-.*/\1/p')"
               target="darwin-${host_arch}-app"
+              updater_suffix="tar.gz"
               install=(target/release/bundle/dmg/*.dmg)
               ;;
             linux)
-              updater=(target/release/bundle/appimage/*.AppImage.tar.gz)
-              signatures=(target/release/bundle/appimage/*.AppImage.tar.gz.sig)
+              updater=(target/release/bundle/appimage/*.AppImage)
+              signatures=(target/release/bundle/appimage/*.AppImage.sig)
               host_arch="$(rustc -vV | sed -n 's/^host: .*\-\(x86_64\|aarch64\|i686\|armv7\|riscv64\)\-.*/\1/p')"
               target="linux-${host_arch}-appimage"
-              install=(target/release/bundle/appimage/*.AppImage target/release/bundle/deb/*.deb)
+              updater_suffix="AppImage"
+              install=(target/release/bundle/deb/*.deb)
               ;;
             windows)
-              updater=()
-              while IFS= read -r file; do updater+=("$file"); done < <(find target/release/bundle -type f -name '*.nsis.zip' -print)
-              signatures=()
-              while IFS= read -r file; do signatures+=("$file"); done < <(find target/release/bundle -type f -name '*.nsis.zip.sig' -print)
+              updater=(target/release/bundle/nsis/*.exe)
+              signatures=(target/release/bundle/nsis/*.exe.sig)
               host_arch="$(rustc -vV | sed -n 's/^host: .*\-\(x86_64\|aarch64\|i686\|armv7\|riscv64\)\-.*/\1/p')"
               target="windows-${host_arch}-nsis"
-              install=(target/release/bundle/nsis/*.exe)
+              updater_suffix="exe"
+              install=()
               ;;
             *)
               echo "不支持的平台：${{ matrix.platform }}" >&2
@@ -279,8 +272,7 @@ jobs:
           esac
           test "${#updater[@]}" -eq 1
           test "${#signatures[@]}" -eq 1
-          test "${#install[@]}" -ge 1
-          updater_name="Magi_${version}_${target}.$([[ "${updater[0]}" == *.zip ]] && echo zip || echo tar.gz)"
+          updater_name="Magi_${version}_${target}.${updater_suffix}"
           cp "${updater[0]}" "dist/package-assets/$updater_name"
           cp "${signatures[0]}" "dist/package-assets/$updater_name.sig"
           for file in "${install[@]}"; do
@@ -332,9 +324,9 @@ jobs:
           test "${#windows_installers[@]}" -eq 1
           update_assets=()
           update_signatures=()
-          while IFS= read -r file; do update_assets+=("$file"); done < <(find dist/release-assets -maxdepth 1 -type f \( -name 'Magi_*_darwin-*.tar.gz' -o -name 'Magi_*_linux-*.tar.gz' -o -name 'Magi_*_windows-*.zip' \) -print)
-          while IFS= read -r file; do update_signatures+=("$file"); done < <(find dist/release-assets -maxdepth 1 -type f \( -name 'Magi_*_*.tar.gz.sig' -o -name 'Magi_*_*.zip.sig' \) -print)
-          test "${#update_assets[@]}" -ge 3
+          while IFS= read -r file; do update_assets+=("$file"); done < <(find dist/release-assets -maxdepth 1 -type f \( -name 'Magi_*_darwin-*.tar.gz' -o -name 'Magi_*_linux-*.AppImage' -o -name 'Magi_*_windows-*.exe' \) -print)
+          while IFS= read -r file; do update_signatures+=("$file"); done < <(find dist/release-assets -maxdepth 1 -type f \( -name 'Magi_*_*.tar.gz.sig' -o -name 'Magi_*_*.AppImage.sig' -o -name 'Magi_*_*.exe.sig' \) -print)
+          test "${#update_assets[@]}" -eq 3
           test "${#update_assets[@]}" -eq "${#update_signatures[@]}"
           for file in "${macos_assets[@]}" "${linux_appimages[@]}" "${linux_debs[@]}" "${windows_installers[@]}" "${update_assets[@]}" "${update_signatures[@]}"; do
             test -s "$file"
