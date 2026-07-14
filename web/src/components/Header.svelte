@@ -147,6 +147,30 @@
         <Icon name="sidebar-toggle" size={14} class="right-pane-toggle-icon" />
       </button>
     {/if}
+    <div class="header-remote-wrapper">
+      <button
+        class="btn-icon header-action-btn header-remote-btn"
+        class:active={activeHeaderPanel === 'lan'}
+        onclick={openRemoteAccess}
+        title={i18n.t('lanAccess.title')}
+        aria-label={i18n.t('lanAccess.title')}
+        aria-expanded={activeHeaderPanel === 'lan'}
+      >
+        <Icon name="qrcode" size={14} />
+      </button>
+      <LanAccessPanel
+        visible={activeHeaderPanel === 'lan'}
+        onClose={() => { activeHeaderPanel = null; }}
+      />
+    </div>
+    <button
+      class="btn-icon header-action-btn header-settings-btn"
+      onclick={openSettings}
+      title={i18n.t('header.settings')}
+      aria-label={i18n.t('header.settings')}
+    >
+      <Icon name="settings" size={14} />
+    </button>
     <div class="header-more-wrapper">
       <button
         class="btn-icon header-action-btn"
@@ -167,32 +191,29 @@
       </button>
       {#if activeHeaderPanel === 'more'}
         <div class="header-more-menu">
-          <button class="header-mobile-menu-item" type="button" onclick={() => setNotificationOpen(true)}>
+          <div class="header-menu-section-label">{i18n.t('header.more')}</div>
+          <button class="header-menu-item header-mobile-menu-item" type="button" onclick={() => setNotificationOpen(true)}>
             <Icon name="bell" size={14} />
             <span>{i18n.t('notification.title')}</span>
             {#if unreadNotificationCount > 0}
               <span class="header-menu-badge">{unreadNotificationCount > 99 ? '99+' : unreadNotificationCount}</span>
             {/if}
           </button>
-          <button type="button" onclick={openRemoteAccess}>
+          <button class="header-menu-item" type="button" onclick={openRemoteAccess}>
             <Icon name="qrcode" size={14} />
             <span>{i18n.t('lanAccess.title')}</span>
           </button>
-          <button type="button" onclick={openSettings}>
+          <button class="header-menu-item" type="button" onclick={openSettings}>
             <Icon name="settings" size={14} />
             <span>{i18n.t('header.settings')}</span>
           </button>
         </div>
       {/if}
-      <LanAccessPanel
-        visible={activeHeaderPanel === 'lan'}
-        onClose={() => { activeHeaderPanel = null; }}
-      />
-      <NotificationCenter
-        open={activeHeaderPanel === 'notifications'}
-        onOpenChange={setNotificationOpen}
-      />
     </div>
+    <NotificationCenter
+      open={activeHeaderPanel === 'notifications'}
+      onOpenChange={setNotificationOpen}
+    />
   </div>
 </header>
 
@@ -255,6 +276,11 @@
     display: inline-flex;
   }
 
+  .header-remote-wrapper {
+    position: relative;
+    display: inline-flex;
+  }
+
   .header-action-btn {
     position: relative;
     width: 32px;
@@ -305,8 +331,8 @@
     top: calc(100% + 6px);
     right: 0;
     z-index: var(--z-popover);
-    width: 168px;
-    padding: 5px;
+    width: 196px;
+    padding: 6px;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     background: var(--dropdown-bg);
@@ -326,6 +352,18 @@
     color: var(--foreground);
     font-size: var(--text-sm);
     cursor: pointer;
+  }
+
+  .header-menu-section-label {
+    padding: 5px 9px 6px;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--font-semibold);
+    line-height: 16px;
+  }
+
+  .header-menu-item {
+    flex: 0 0 34px;
   }
 
   .header-more-menu button:hover {
@@ -394,6 +432,15 @@
       display: none;
     }
 
+    .header-remote-btn,
+    .header-settings-btn {
+      display: none;
+    }
+
+    .header-remote-wrapper {
+      position: static;
+    }
+
     .header-more-unread-dot {
       display: block;
     }
@@ -405,6 +452,12 @@
 
     .header-more-menu .header-mobile-menu-item {
       display: flex;
+    }
+  }
+
+  @media (min-width: 769px) {
+    .header-more-wrapper {
+      display: none;
     }
   }
 

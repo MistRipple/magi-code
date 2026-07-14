@@ -6,6 +6,7 @@
   import EditsPanel from './components/EditsPanel.svelte';
   import KnowledgePanel from './components/KnowledgePanel.svelte';
   import SettingsPanel from './components/SettingsPanel.svelte';
+  import DesktopUpdatePrompt from './components/DesktopUpdatePrompt.svelte';
   import ToastContainer from './components/ToastContainer.svelte';
   import Icon from './components/Icon.svelte';
   import { setCurrentTopTab, messagesState } from './stores/messages.svelte';
@@ -79,6 +80,8 @@
   <Header onOpenSettings={openSettings}>
     <TopTabs activeTopTab={currentTopTab} onTabChange={handleTabChange} />
   </Header>
+
+  <DesktopUpdatePrompt />
 
   <!-- Tab 内容区域：常驻 ThreadPanel + 按需挂载的其他 top-tab -->
   <div class="tab-content-wrapper">

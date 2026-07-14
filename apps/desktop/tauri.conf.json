@@ -14,6 +14,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "category": "DeveloperTool",
     "shortDescription": "Local AI coding workspace",
@@ -34,6 +35,14 @@
       "nsis": {
         "installMode": "currentUser"
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkxNzMzRURENEM2RkVGNjUKUldSbDcyOU0zVDV6a1RVR29YRVhXcmNrcnh3UmhLRFJ4eHdhRSs3Y2p5dzY2TzNGSGtGajJXSkQK",
+      "endpoints": [
+        "https://github.com/MistRipple/magi-code/releases/latest/download/latest.json"
+      ]
     }
   }
 }

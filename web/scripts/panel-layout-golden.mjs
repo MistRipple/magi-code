@@ -70,7 +70,7 @@ assert.doesNotMatch(
 );
 assert.match(
   headerSource,
-  /class="header-mobile-menu-item"[\s\S]*?setNotificationOpen\(true\)/,
+  /class="header-menu-item header-mobile-menu-item"[\s\S]*?setNotificationOpen\(true\)/,
   '手机端更多菜单必须提供通知入口',
 );
 assert.match(

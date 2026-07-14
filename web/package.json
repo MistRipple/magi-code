@@ -10,7 +10,7 @@
     "build": "vite build --config vite.web.config.ts",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test": "npm run test:canonical && npm run test:transport && npm run test:agent-api && npm run test:right-pane && npm run test:file-reference && npm run test:image-generation-preview && npm run test:panel-layout && npm run test:agent-run && npm run test:active-agent-center && npm run test:workspace-onboarding && npm run test:goal && npm run test:slash-command && npm run test:tool-error && npm run test:tool-call-display && npm run test:context-ring && npm run test:runtime-state && npm run test:notification-policy && npm run test:notification-runtime && npm run test:mermaid-source && npm run test:tool-catalog && npm run test:bridge",
+    "test": "npm run test:canonical && npm run test:transport && npm run test:agent-api && npm run test:right-pane && npm run test:file-reference && npm run test:image-generation-preview && npm run test:panel-layout && npm run test:agent-run && npm run test:active-agent-center && npm run test:workspace-onboarding && npm run test:goal && npm run test:slash-command && npm run test:tool-error && npm run test:tool-call-display && npm run test:context-ring && npm run test:runtime-state && npm run test:notification-policy && npm run test:notification-runtime && npm run test:mermaid-source && npm run test:tool-catalog && npm run test:tool-display && npm run test:desktop-updater && npm run test:update-manifest && npm run test:bridge",
     "test:agent-api": "node scripts/agent-api-golden.mjs",
     "test:bridge": "node scripts/web-client-bridge-golden.mjs",
     "test:canonical": "node scripts/canonical-turn-golden.mjs",
@@ -30,6 +30,9 @@
     "test:notification-runtime": "node scripts/notification-runtime-golden.mjs",
     "test:mermaid-source": "node scripts/mermaid-source-golden.mjs",
     "test:tool-catalog": "node scripts/tool-catalog-normalization-golden.mjs",
+    "test:tool-display": "node scripts/tool-display-golden.mjs",
+    "test:desktop-updater": "node scripts/desktop-updater-golden.mjs",
+    "test:update-manifest": "node scripts/update-manifest-golden.mjs",
     "test:tool-error": "node scripts/tool-error-payload-golden.mjs",
     "test:transport": "node scripts/live-transport-golden.mjs"
   },
@@ -43,6 +46,9 @@
     "vite": "^6.3.5"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "@humanspeak/svelte-markdown": "^1.7.10",
     "@types/qrcode": "^1.5.6",
     "@viz-js/viz": "^3.26.0",

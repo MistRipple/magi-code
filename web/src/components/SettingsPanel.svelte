@@ -1,5 +1,6 @@
 <script lang="ts">
 import '../styles/settings.css';
+import { onMount } from 'svelte';
 import SettingsStatsTab from './SettingsStatsTab.svelte';
 import SettingsRulesTab from './SettingsRulesTab.svelte';
 import SettingsAgentsTab from './SettingsAgentsTab.svelte';
@@ -13,6 +14,12 @@ import {
   } from '../web/agent-api';
 import WebFolderPicker from '../web/WebFolderPicker.svelte';
 import { getAgentColor } from '../lib/agent-colors';
+import {
+  checkDesktopUpdate,
+  isDesktopRuntime,
+  type DesktopUpdateInfo,
+  type DesktopUpdateProgress,
+} from '../lib/desktop-updater';
 
   import { useSettingsStore } from '../stores/settings-store.svelte';
   
@@ -24,6 +31,70 @@ import { getAgentColor } from '../lib/agent-colors';
 
   const store = useSettingsStore({
     onClose: () => onClose?.(),
+  });
+
+  const desktopRuntime = isDesktopRuntime();
+  type UpdateState = 'idle' | 'checking' | 'latest' | 'available' | 'installing' | 'error';
+  let updateState = $state<UpdateState>('idle');
+  let updateInfo = $state<DesktopUpdateInfo | null>(null);
+  let updateProgress = $state<DesktopUpdateProgress | null>(null);
+  let updateError = $state('');
+
+  async function checkForDesktopUpdate(): Promise<void> {
+    if (!desktopRuntime || updateState === 'checking' || updateState === 'installing') {
+      return;
+    }
+    if (updateInfo) {
+      await updateInfo.close().catch(() => undefined);
+      updateInfo = null;
+    }
+    updateState = 'checking';
+    updateProgress = null;
+    updateError = '';
+    try {
+      updateInfo = await checkDesktopUpdate();
+      updateState = updateInfo ? 'available' : 'latest';
+    } catch (error) {
+      updateState = 'error';
+      updateError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function installDesktopUpdate(): Promise<void> {
+    if (!updateInfo || updateState !== 'available') {
+      await checkForDesktopUpdate();
+      return;
+    }
+    updateState = 'installing';
+    updateProgress = null;
+    updateError = '';
+    try {
+      await updateInfo.install((progress) => {
+        updateProgress = progress;
+      });
+    } catch (error) {
+      updateState = 'error';
+      updateError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  function updateAction(): void {
+    if (updateState === 'available') {
+      void installDesktopUpdate();
+      return;
+    }
+    void checkForDesktopUpdate();
+  }
+
+  onMount(() => {
+    if (desktopRuntime) {
+      void checkForDesktopUpdate();
+    }
+    return () => {
+      if (updateInfo) {
+        void updateInfo.close();
+      }
+    };
   });
 </script>
 
@@ -132,6 +203,36 @@ import { getAgentColor } from '../lib/agent-colors';
           {/if}
         </div>
         <div class="header-actions">
+          {#if desktopRuntime}
+            <button
+              type="button"
+              class="update-check-btn"
+              class:update-check-btn--available={updateState === 'available'}
+              class:update-check-btn--error={updateState === 'error'}
+              onclick={updateAction}
+              disabled={updateState === 'checking' || updateState === 'installing'}
+              title={updateState === 'error' ? updateError : (updateInfo?.body || i18n.t('settings.update.checkTitle'))}
+            >
+              <Icon name={updateState === 'available' ? 'download' : 'refresh'} size={13} />
+              <span>
+                {#if updateState === 'checking'}
+                  {i18n.t('settings.update.checking')}
+                {:else if updateState === 'latest'}
+                  {i18n.t('settings.update.latest')}
+                {:else if updateState === 'available'}
+                  {i18n.t('settings.update.available', { version: updateInfo?.version || '' })}
+                {:else if updateState === 'installing'}
+                  {updateProgress?.percent !== undefined
+                    ? i18n.t('settings.update.installingProgress', { percent: updateProgress.percent })
+                    : i18n.t('settings.update.installing')}
+                {:else if updateState === 'error'}
+                  {i18n.t('settings.update.retry')}
+                {:else}
+                  {i18n.t('settings.update.check')}
+                {/if}
+              </span>
+            </button>
+          {/if}
           <div class="locale-selector">
             <button
               class="locale-btn"
@@ -479,6 +580,45 @@ import { getAgentColor } from '../lib/agent-colors';
     border-radius: var(--radius-md);
     overflow: hidden;
     margin-left: auto;
+  }
+
+  .update-check-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 28px;
+    padding: 0 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    color: var(--foreground-muted);
+    background: transparent;
+    font: inherit;
+    font-size: var(--text-xs);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color var(--transition-fast), background var(--transition-fast), border-color var(--transition-fast);
+  }
+
+  .update-check-btn:hover:not(:disabled) {
+    color: var(--foreground);
+    background: var(--surface-3);
+    border-color: var(--primary-muted);
+  }
+
+  .update-check-btn:disabled {
+    cursor: wait;
+    opacity: 0.72;
+  }
+
+  .update-check-btn--available {
+    color: var(--primary);
+    border-color: color-mix(in srgb, var(--primary) 42%, var(--border));
+    background: color-mix(in srgb, var(--primary) 10%, transparent);
+  }
+
+  .update-check-btn--error {
+    color: var(--error);
+    border-color: color-mix(in srgb, var(--error) 36%, var(--border));
   }
 
   .locale-btn {

@@ -1996,6 +1996,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
       return i18n.t("settings.tools.mcpHealthConnected");
     if (server.health === "degraded")
       return i18n.t("settings.tools.mcpHealthDegraded");
+    if (!server.error && (server.reconnectAttempts ?? 0) === 0)
+      return i18n.t("settings.tools.mcpHealthChecking");
     return i18n.t("settings.tools.mcpHealthDisconnected");
   }
 

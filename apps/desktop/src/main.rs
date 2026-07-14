@@ -243,6 +243,8 @@ fn start_daemon(app: AppHandle, state_root: PathBuf, web_dist_root: PathBuf) {
 
 fn main() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let runtime = app.state::<DesktopRuntime>();
             if runtime.lifecycle.request_show() == DesktopAction::ShowWindow {

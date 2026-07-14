@@ -3,6 +3,11 @@
   import Icon from './Icon.svelte';
   import Toggle from './Toggle.svelte';
   import type { IconName } from '../lib/icons';
+  import {
+    getBuiltinToolFallbackLabel,
+    getCapabilityDependencyFallbackLabel,
+    summarizeMcpServers,
+  } from '../shared/tool-display';
 
   let {
     mcpServers,
@@ -89,9 +94,7 @@
   }
 
   function formatBuiltinToolFallbackLabel(name: string): string {
-    return name.trim()
-      ? i18n.t('settings.tools.builtin.unknown')
-      : i18n.t('settings.tools.unknown');
+    return getBuiltinToolFallbackLabel(name);
   }
 
   function getBuiltinToolLabel(name: string): string {
@@ -120,7 +123,7 @@
       case 'low':
         return i18n.t('settings.tools.riskLow');
       default:
-        return i18n.t('settings.tools.unknown');
+        return i18n.t('settings.tools.riskUnspecified');
     }
   }
 
@@ -137,7 +140,7 @@
       case 'unavailable':
         return i18n.t('settings.tools.runtimeUnavailable');
       default:
-        return i18n.t('settings.tools.unknown');
+        return i18n.t('settings.tools.runtimeChecking');
     }
   }
 
@@ -201,7 +204,7 @@
       case 'none':
         return i18n.t('settings.tools.effectiveApproval.none');
       default:
-        return i18n.t('settings.tools.unknown');
+        return i18n.t('settings.tools.effectiveApproval.unspecified');
     }
   }
 
@@ -222,7 +225,7 @@
       case 'full_access_allowed':
         return i18n.t('settings.tools.accessProfileBehavior.fullAccessAllowed');
       default:
-        return i18n.t('settings.tools.unknown');
+        return i18n.t('settings.tools.accessProfileBehavior.undetermined');
     }
   }
 
@@ -261,8 +264,10 @@
         return i18n.t('settings.tools.dependency.skillRuntime');
       case 'mcp_servers':
         return i18n.t('settings.tools.dependency.mcpServers');
+      case 'image_generation_model':
+        return i18n.t('settings.tools.dependency.imageGenerationModel');
       default:
-        return i18n.t('settings.tools.unknown');
+        return getCapabilityDependencyFallbackLabel(name);
     }
   }
 
@@ -281,7 +286,7 @@
       case 'unavailable':
         return i18n.t('settings.tools.dependency.status.unavailable');
       default:
-        return i18n.t('settings.tools.unknown');
+        return i18n.t('settings.tools.dependency.status.checking');
     }
   }
 
@@ -296,8 +301,10 @@
         return 'warning';
       case 'unavailable':
         return 'error';
+      case 'checking':
+        return 'warning';
       default:
-        return 'disabled';
+        return 'warning';
     }
   }
 
@@ -317,6 +324,8 @@
         return 'skill';
       case 'mcp_servers':
         return 'plug';
+      case 'image_generation_model':
+        return 'sparkles';
       default:
         return 'tools';
     }
@@ -427,9 +436,8 @@
     readyToolCount?: number | null;
     toolCount?: number | null;
   }): string {
-    const parts = [
-      `${getCapabilityDependencyLabel(dependency.name)}: ${getCapabilityDependencyStatusLabel(dependency.status)}`,
-    ];
+    const displayStatus = getCapabilityDependencyDisplayStatus(dependency);
+    const parts = [`${getCapabilityDependencyLabel(dependency.name)}: ${displayStatus}`];
     const metric = getCapabilityDependencyMetric(dependency);
     if (metric) parts.push(metric);
     if (dependency.requiredBy.length > 0) {
@@ -438,6 +446,55 @@
       }));
     }
     return parts.join('\n');
+  }
+
+  function getMCPOverviewSummary() {
+    return summarizeMcpServers(mcpServers, mcpServersHydrated, mcpServersLoading);
+  }
+
+  function getMCPOverviewStatusLabel(): string {
+    const summary = getMCPOverviewSummary();
+    switch (summary.kind) {
+      case 'checking':
+        return i18n.t('settings.tools.mcpHealthChecking');
+      case 'not_configured':
+        return i18n.t('settings.tools.mcpHealthNotConfigured');
+      case 'disabled':
+        return i18n.t('settings.tools.disabledLabel');
+      case 'connected':
+        return i18n.t('settings.tools.mcpHealthConnected');
+      case 'partial':
+        return i18n.t('settings.tools.mcpHealthPartial', {
+          connected: summary.connected,
+          total: summary.enabled,
+        });
+      case 'disconnected':
+        return i18n.t('settings.tools.mcpHealthDisconnected');
+    }
+  }
+
+  function getCapabilityDependencyDisplayStatus(dependency: { name: string; status: string }): string {
+    return dependency.name === 'mcp_servers'
+      ? getMCPOverviewStatusLabel()
+      : getCapabilityDependencyStatusLabel(dependency.status);
+  }
+
+  function getCapabilityDependencyDisplayClass(dependency: { name: string; status: string }): string {
+    if (dependency.name !== 'mcp_servers') {
+      return getCapabilityDependencyClass(dependency.status);
+    }
+    const summary = getMCPOverviewSummary();
+    switch (summary.kind) {
+      case 'disconnected':
+        return 'error';
+      case 'disabled':
+      case 'not_configured':
+        return 'disabled';
+      case 'connected':
+        return 'success';
+      default:
+        return 'warning';
+    }
   }
 
   function getMCPStatusTitle(server: any): string {
@@ -534,13 +591,13 @@
                   >
                     {#each capabilityDependencies as dependency (dependency.name)}
                       <span
-                        class={`capability-dependency-chip capability-dependency-chip--${getCapabilityDependencyClass(dependency.status)}`}
+                        class={`capability-dependency-chip capability-dependency-chip--${getCapabilityDependencyDisplayClass(dependency)}`}
                         title={getCapabilityDependencyTitle(dependency)}
                       >
                         <Icon name={getCapabilityDependencyIcon(dependency.name)} size={11} />
                         <span>{getCapabilityDependencyLabel(dependency.name)}</span>
                         <span class="capability-dependency-status">
-                          {getCapabilityDependencyStatusLabel(dependency.status)}
+                          {getCapabilityDependencyDisplayStatus(dependency)}
                         </span>
                       </span>
                     {/each}
@@ -580,7 +637,12 @@
                           <Icon name={tool.name.includes('process') || tool.name.includes('shell') ? 'terminal' : 'tools'} size={13} />
                         </div>
                         <div class="identity-stack">
-                          <span class="main-label">{getBuiltinToolLabel(tool.name)}</span>
+                          <span
+                            class="main-label"
+                            title={`${getBuiltinToolLabel(tool.name)} · ${tool.name}`}
+                          >
+                            {getBuiltinToolLabel(tool.name)}
+                          </span>
                           <span class="tool-code">{getBuiltinToolScopeLabel(tool)}</span>
                         </div>
                       </div>
@@ -641,7 +703,7 @@
                         <Icon name="plug" size={13} />
                       </div>
                       <div class="identity-stack">
-                        <span class="main-label">{server.name}</span>
+                        <span class="main-label" title={server.name}>{server.name}</span>
                         <span style="font-size: 10px; color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px;">{getMCPServerSubtitle(server)}</span>
                       </div>
                     </div>
@@ -649,9 +711,9 @@
                       <span
                         class="apple-indicator"
                         class:success={server.health === 'connected'}
-                        class:warning={server.health === 'degraded'}
+                        class:warning={server.health === 'degraded' || (server.enabled !== false && server.health === 'disconnected' && !server.error)}
                         class:disabled={server.health === 'disabled' || server.enabled === false}
-                        class:error={server.enabled !== false && (server.health === 'disconnected' || !server.health)}
+                        class:error={server.enabled !== false && (Boolean(server.error) || !server.health)}
                         title={getMCPStatusTitle(server)}
                       ></span>
                       <span class="mcp-expand-icon" class:expanded={mcpExpandedServer === server.id} style="margin-left: 4px;">
@@ -700,7 +762,7 @@
                           {#each mcpServerTools[server.id] as tool}
                             <div class="mcp-tool-item" style="background: rgba(var(--foreground-rgb), 0.04); border-radius: 6px; padding: 6px 8px;">
                               <div class="mcp-tool-row" style="display: flex; justify-content: space-between; align-items: center;">
-                                <div class="mcp-tool-name" style="font-size: 11px; font-weight: 500;">{tool.name}</div>
+                                <div class="mcp-tool-name" title={tool.description ? `${tool.name}\n${tool.description}` : tool.name} style="font-size: 11px; font-weight: 500;">{tool.name}</div>
                                 {#if tool.description}
                                   <button
                                     class="mcp-tool-desc-btn"

@@ -189,7 +189,9 @@ cargo run -p magi-desktop
 - Linux AppImage 与 Deb
 - Windows NSIS 安装器
 
-推送 v* 标签后，GitHub Actions 会构建三平台安装包并创建 Release。
+推送与版本号一致的 `v*` 标签后，GitHub Actions 会构建三平台安装包、签名 updater 归档并创建 Release。已安装的桌面端启动后会自动检查 `latest.json`；用户确认后，应用会下载、校验签名、安装新版本并自动重启。更新只替换应用本体，`~/.magi` 中的模型配置、会话、工作区、任务和知识库不会被打包或覆盖。
+
+发布更新需要在 GitHub Repository Secrets 中配置 `TAURI_SIGNING_PRIVATE_KEY`，可选配置 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。私钥只供 GitHub Actions 使用，不应写入仓库或桌面包；更新公钥只保存在 `apps/desktop/tauri.conf.json` 中。
 
 ### 配置模型与角色
 
@@ -367,7 +369,9 @@ npm --prefix web run build
 cargo run -p magi-desktop
 ~~~
 
-The Tauri 2 desktop host targets macOS DMG, Linux AppImage/Deb, and Windows NSIS. Pushing a v* tag triggers GitHub Actions to build all three platforms and publish a Release.
+The Tauri 2 desktop host targets macOS DMG, Linux AppImage/Deb, and Windows NSIS. Pushing a version-matching `v*` tag triggers GitHub Actions to build the installers, signed updater archives, and a Release containing `latest.json`. Installed desktop builds check for updates on startup; after confirmation they download, verify, install, and relaunch the new version. Runtime data under `~/.magi` stays outside the application bundle and is preserved across updates.
+
+Release builds require the `TAURI_SIGNING_PRIVATE_KEY` GitHub Repository Secret and may use `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The private key is used only by GitHub Actions and is never committed or bundled; the public key is stored in `apps/desktop/tauri.conf.json` for client-side verification.
 
 ### Configure models and roles
 
