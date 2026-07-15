@@ -359,5 +359,139 @@ await withGoldenViteServer(async (server) => {
     );
   }
 
+  // 场景 12：知识能力的五种决策必须完整投影到当前会话诊断，且不泄漏知识正文。
+  {
+    const decisions = [
+      'not_needed',
+      'missing_workspace',
+      'queried_no_match',
+      'matched_not_injected',
+      'injected',
+    ];
+    const recentEvents = decisions.map((decision, index) => ({
+      event_id: `knowledge-event-${index}`,
+      event_type: 'knowledge.context.selected',
+      category: 'audit',
+      occurred_at: 1_780_000_001_000 + index,
+      sequence: index + 1,
+      session_id: 'session-knowledge-audit',
+      workspace_id: 'workspace-knowledge-audit',
+      payload: {
+        consumer: index === 0 ? 'mainline' : 'task_execution',
+        decision,
+        knowledge_ids: decision === 'injected' ? ['adr-runtime'] : [],
+        result_kinds: decision === 'injected' ? ['adr'] : [],
+        matched_count: decision === 'queried_no_match' ? 0 : index,
+        injected_count: decision === 'injected' ? 1 : 0,
+        injected_chars: decision === 'injected' ? 128 : 0,
+        truncated: false,
+        content: '不得进入前端诊断的知识正文',
+      },
+    }));
+    recentEvents.push({
+      event_id: 'learning-extraction-failed',
+      event_type: 'knowledge.learning.extraction',
+      category: 'audit',
+      occurred_at: 1_780_000_001_010,
+      sequence: 6,
+      session_id: 'session-knowledge-audit',
+      workspace_id: 'workspace-knowledge-audit',
+      payload: {
+        status: 'failed',
+        failure_reason: 'model_invocation_failed',
+        candidate_count: 0,
+        inserted_count: 0,
+      },
+    });
+    recentEvents.push({
+      event_id: 'knowledge-event-other-session',
+      event_type: 'knowledge.context.selected',
+      category: 'audit',
+      occurred_at: 1_780_000_001_100,
+      sequence: 99,
+      session_id: 'session-other',
+      payload: { consumer: 'mainline', decision: 'injected', knowledge_ids: ['faq-other'] },
+    });
+
+    const normalized = contract.normalizeRustBootstrapPayload({
+      generatedAt: 1_780_000_001_200,
+      currentSession: {
+        sessionId: 'session-knowledge-audit',
+        title: '知识诊断会话',
+        createdAt: 1_780_000_001_000,
+        updatedAt: 1_780_000_001_200,
+        messageCount: 1,
+        workspaceId: 'workspace-knowledge-audit',
+      },
+      sessions: [{
+        sessionId: 'session-knowledge-audit',
+        title: '知识诊断会话',
+        createdAt: 1_780_000_001_000,
+        updatedAt: 1_780_000_001_200,
+        messageCount: 1,
+        workspaceId: 'workspace-knowledge-audit',
+      }],
+      workspaces: [{
+        workspaceId: 'workspace-knowledge-audit',
+        rootPath: '/tmp/knowledge-audit',
+        displayName: 'knowledge-audit',
+        lastOpenedAt: 1_780_000_001_000,
+      }],
+      runtimeReadModel: {
+        details: {
+          sessions: [{ session_id: 'session-knowledge-audit', current_status: 'idle' }],
+          assignments: [],
+          tasks: [],
+          knowledge_audit: recentEvents
+            .filter((event) => event.session_id === 'session-knowledge-audit')
+            .map((event) => ({
+              event_id: event.event_id,
+              event_type: event.event_type,
+              occurred_at: event.occurred_at,
+              sequence: event.sequence,
+              workspace_id: event.workspace_id,
+              session_id: event.session_id,
+              consumer: event.payload.consumer,
+              decision: event.payload.decision,
+              status: event.payload.status,
+              failure_reason: event.payload.failure_reason,
+              knowledge_ids: event.payload.knowledge_ids ?? [],
+              result_kinds: event.payload.result_kinds ?? [],
+              matched_count: event.payload.matched_count ?? 0,
+              injected_count: event.payload.injected_count ?? 0,
+              injected_chars: event.payload.injected_chars ?? 0,
+              truncated: event.payload.truncated === true,
+              candidate_count: event.payload.candidate_count ?? 0,
+              inserted_count: event.payload.inserted_count ?? 0,
+            })),
+        },
+      },
+      recentEvents: [{
+        event_id: 'stream-event-after-knowledge',
+        event_type: 'model.stream.delta',
+        category: 'projection',
+        occurred_at: 1_780_000_001_300,
+        sequence: 100,
+        session_id: 'session-knowledge-audit',
+        payload: {},
+      }],
+      agent: { runtimeEpoch: 'knowledge-audit-runtime' },
+    });
+
+    const knowledgeAudit = normalized.orchestratorRuntimeState?.opsView?.knowledgeAudit;
+    assert.equal(knowledgeAudit?.eventCount, 6);
+    assert.deepEqual(
+      knowledgeAudit?.recentEntries?.map((entry) => entry.decision).filter(Boolean),
+      decisions,
+    );
+    const injectedEntry = knowledgeAudit?.recentEntries?.find((entry) => entry.decision === 'injected');
+    assert.deepEqual(injectedEntry?.knowledgeIds, ['adr-runtime']);
+    assert.equal(injectedEntry?.injectedChars, 128);
+    assert.equal(injectedEntry?.content, undefined);
+    const extractionFailure = knowledgeAudit?.recentEntries?.find((entry) => entry.status === 'failed');
+    assert.equal(extractionFailure?.failureReason, 'model_invocation_failed');
+    assert.equal(extractionFailure?.purpose, '自动经验抽取失败');
+  }
+
   console.log('context-usage-ring-golden: all scenarios passed');
 });

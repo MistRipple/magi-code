@@ -248,6 +248,14 @@ impl BootstrapDto {
                 .as_deref()
                 .is_some_and(|session_id| entry.session_id == session_id)
         });
+        self.runtime_read_model
+            .details
+            .knowledge_audit
+            .retain(|entry| {
+                current_session_id
+                    .as_deref()
+                    .is_some_and(|session_id| entry.session_id.as_deref() == Some(session_id))
+            });
         let current_runtime_session = self.runtime_read_model.details.sessions.first();
         let current_recovery_ids = current_runtime_session
             .map(|entry| entry.recovery_ids.clone())

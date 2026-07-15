@@ -571,6 +571,85 @@ pub struct RuntimeDetailsSummary {
     pub tools: Vec<ToolRuntimeSummaryEntry>,
     pub sessions: Vec<SessionRuntimeSummaryEntry>,
     pub workspaces: Vec<WorkspaceRuntimeSummaryEntry>,
+    #[serde(default)]
+    pub knowledge_audit: Vec<KnowledgeAuditRuntimeEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnowledgeAuditRuntimeEntry {
+    pub event_id: String,
+    pub event_type: String,
+    pub occurred_at: UtcMillis,
+    pub sequence: u64,
+    pub workspace_id: Option<String>,
+    pub session_id: Option<String>,
+    pub mission_id: Option<String>,
+    pub task_id: Option<String>,
+    pub consumer: Option<String>,
+    pub decision: Option<String>,
+    pub status: Option<String>,
+    pub failure_reason: Option<String>,
+    pub knowledge_ids: Vec<String>,
+    pub result_kinds: Vec<String>,
+    pub matched_count: usize,
+    pub injected_count: usize,
+    pub injected_chars: usize,
+    pub truncated: bool,
+    pub candidate_count: usize,
+    pub inserted_count: usize,
+}
+
+impl KnowledgeAuditRuntimeEntry {
+    fn from_event(event: &EventEnvelope) -> Option<Self> {
+        if !matches!(
+            event.event_type.as_str(),
+            "knowledge.context.selected" | "knowledge.learning.extraction"
+        ) {
+            return None;
+        }
+        Some(Self {
+            event_id: event.event_id.to_string(),
+            event_type: event.event_type.clone(),
+            occurred_at: event.occurred_at,
+            sequence: event.sequence,
+            workspace_id: event.workspace_id.as_ref().map(ToString::to_string),
+            session_id: event.session_id.as_ref().map(ToString::to_string),
+            mission_id: event.mission_id.as_ref().map(ToString::to_string),
+            task_id: event.task_id.as_ref().map(ToString::to_string),
+            consumer: event
+                .payload
+                .get("consumer")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            decision: event
+                .payload
+                .get("decision")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            status: event
+                .payload
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            failure_reason: event
+                .payload
+                .get("failure_reason")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            knowledge_ids: nested_string_vec_field(&event.payload, "knowledge_ids"),
+            result_kinds: nested_string_vec_field(&event.payload, "result_kinds"),
+            matched_count: nested_usize_field(&event.payload, "matched_count"),
+            injected_count: nested_usize_field(&event.payload, "injected_count"),
+            injected_chars: nested_usize_field(&event.payload, "injected_chars"),
+            truncated: event
+                .payload
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            candidate_count: nested_usize_field(&event.payload, "candidate_count"),
+            inserted_count: nested_usize_field(&event.payload, "inserted_count"),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1060,6 +1139,7 @@ impl RuntimeReadModelInput {
         let mut tool_map = BTreeMap::<String, ToolRuntimeSummaryEntry>::new();
         let mut session_map = BTreeMap::<String, SessionRuntimeSummaryEntry>::new();
         let mut workspace_map = BTreeMap::<String, WorkspaceRuntimeSummaryEntry>::new();
+        let mut knowledge_audit = Vec::new();
         let mut dispatch = DispatchRuntimeSummary::default();
         let mut governance_total_count = 0usize;
         let mut governance_allowed_count = 0usize;
@@ -1073,6 +1153,9 @@ impl RuntimeReadModelInput {
         let mut governance_approval_required_worker_ids = Vec::new();
         let mut governance_rejected_worker_ids = Vec::new();
         for event in events {
+            if let Some(entry) = KnowledgeAuditRuntimeEntry::from_event(event) {
+                knowledge_audit.push(entry);
+            }
             let resolved_mission_id = event_mission_id(event);
             let resolved_task_id = event_task_id(event);
             match event.category {
@@ -1747,6 +1830,10 @@ impl RuntimeReadModelInput {
         let tools = tool_map.into_values().collect::<Vec<_>>();
         let sessions = session_map.into_values().collect::<Vec<_>>();
         let workspaces = workspace_map.into_values().collect::<Vec<_>>();
+        knowledge_audit.sort_by_key(|entry| entry.sequence);
+        if knowledge_audit.len() > 64 {
+            knowledge_audit.drain(..knowledge_audit.len() - 64);
+        }
         let aggregate_components = RuntimeAggregateComponents {
             execution_groups: &execution_groups,
             tasks: &tasks,
@@ -1804,6 +1891,7 @@ impl RuntimeReadModelInput {
             tools,
             sessions,
             workspaces,
+            knowledge_audit,
         };
 
         let meta = RuntimeMetaSummary {
@@ -1901,6 +1989,9 @@ impl RuntimeReadModelInput {
         self.details
             .workspaces
             .sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
+        self.details
+            .knowledge_audit
+            .sort_by_key(|entry| entry.sequence);
 
         for entry in &mut self.details.execution_groups {
             sort_string_vec(&mut entry.active_task_ids);
@@ -2506,7 +2597,7 @@ impl RecoveryDiagnosticSummaryEntry {
 mod tests {
     use super::*;
     use crate::EventContext;
-    use magi_core::EventId;
+    use magi_core::{EventId, SessionId, WorkspaceId};
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -2748,6 +2839,81 @@ mod tests {
                 .context_extracted_memory_count,
             2
         );
+    }
+
+    #[test]
+    fn knowledge_context_events_remain_session_scoped_in_runtime_read_model() {
+        let decisions = [
+            "not_needed",
+            "missing_workspace",
+            "queried_no_match",
+            "matched_not_injected",
+            "injected",
+        ];
+        let mut events = decisions
+            .iter()
+            .enumerate()
+            .map(|(index, decision)| {
+                let mut event = EventEnvelope::audit(
+                    EventId::new(format!("knowledge-event-{index}")),
+                    "knowledge.context.selected",
+                    json!({
+                        "consumer": "mainline",
+                        "decision": decision,
+                        "knowledge_ids": [],
+                        "result_kinds": [],
+                        "matched_count": 0,
+                        "injected_count": 0,
+                        "injected_chars": 0,
+                        "truncated": false
+                    }),
+                )
+                .with_context(EventContext {
+                    session_id: Some(SessionId::new("session-knowledge-audit")),
+                    workspace_id: Some(WorkspaceId::new("workspace-knowledge-audit")),
+                    ..EventContext::default()
+                });
+                event.sequence = index as u64 + 1;
+                event
+            })
+            .collect::<Vec<_>>();
+        let mut other_session_event = EventEnvelope::audit(
+            EventId::new("knowledge-event-other"),
+            "knowledge.context.selected",
+            json!({ "consumer": "mainline", "decision": "injected" }),
+        )
+        .with_context(EventContext {
+            session_id: Some(SessionId::new("session-knowledge-other")),
+            workspace_id: Some(WorkspaceId::new("workspace-knowledge-audit")),
+            ..EventContext::default()
+        });
+        other_session_event.sequence = 99;
+        events.push(other_session_event);
+
+        let read_model = RuntimeReadModelInput::from_events(&events);
+        let session = read_model
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-knowledge-audit")
+            .expect("knowledge audit session");
+
+        assert_eq!(session.event_count, 5);
+        assert_eq!(session.audit_event_count, 5);
+        assert_eq!(
+            session.latest_event_type.as_deref(),
+            Some("knowledge.context.selected")
+        );
+        assert_eq!(read_model.details.knowledge_audit.len(), 6);
+        let scoped_entries = read_model
+            .details
+            .knowledge_audit
+            .iter()
+            .filter(|entry| entry.session_id.as_deref() == Some("session-knowledge-audit"))
+            .collect::<Vec<_>>();
+        assert_eq!(scoped_entries.len(), 5);
+        assert_eq!(scoped_entries[0].decision.as_deref(), Some("not_needed"));
+        assert_eq!(scoped_entries[4].decision.as_deref(), Some("injected"));
     }
 
     #[test]

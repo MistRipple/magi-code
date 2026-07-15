@@ -85,6 +85,7 @@ pub enum PromptFragmentKind {
     TodoLedger,
     Mailbox,
     ThreadHistoryBoundary,
+    KnowledgeContext,
     CurrentTurnPriority,
 }
 
@@ -98,6 +99,7 @@ impl PromptFragmentKind {
             Self::TodoLedger => "todo_ledger",
             Self::Mailbox => "mailbox",
             Self::ThreadHistoryBoundary => "thread_history_boundary",
+            Self::KnowledgeContext => "knowledge_context",
             Self::CurrentTurnPriority => "current_turn_priority",
         }
     }

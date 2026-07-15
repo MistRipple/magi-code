@@ -1,7 +1,7 @@
 use crate::{
-    CodeIndexSource, KnowledgeAuditLink, KnowledgeGovernanceLink, KnowledgeIndexer, KnowledgeMatch,
-    KnowledgeQuery, KnowledgeQueryResult, KnowledgeQueryService, KnowledgeRecord,
-    normalization::{merge_unique_terms, normalize_tags, tokenize},
+    CodeIndexSource, KnowledgeAuditLink, KnowledgeGovernanceLink, KnowledgeIndexer, KnowledgeKind,
+    KnowledgeMatch, KnowledgeQuery, KnowledgeQueryResult, KnowledgeQueryService, KnowledgeRecord,
+    normalization::{merge_unique_terms, normalize_tags, tokenize_business_text},
 };
 use std::collections::{HashMap, HashSet};
 
@@ -15,7 +15,11 @@ impl KnowledgeQueryService {
         governance_links: &HashMap<String, KnowledgeGovernanceLink>,
         query: &KnowledgeQuery,
     ) -> KnowledgeQueryResult {
-        let query_terms = query.text.as_deref().map(tokenize).unwrap_or_default();
+        let query_terms = query
+            .text
+            .as_deref()
+            .map(tokenize_business_text)
+            .unwrap_or_default();
         let normalized_tags = normalize_tags(query.tags.clone());
 
         let candidate_ids = if query_terms.is_empty() {
@@ -63,11 +67,18 @@ impl KnowledgeQueryService {
                     return None;
                 }
 
-                let matched_query_terms = query_terms
-                    .iter()
-                    .filter(|term| indexed_terms.contains(term))
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let (matched_query_terms, query_score) = if record.kind == KnowledgeKind::CodeIndex
+                {
+                    let matched = query_terms
+                        .iter()
+                        .filter(|term| indexed_terms.contains(term))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let score = matched.len() * 3;
+                    (matched, score)
+                } else {
+                    score_business_fields(record, &query_terms)
+                };
 
                 if !query_terms.is_empty() && matched_query_terms.is_empty() {
                     return None;
@@ -79,7 +90,7 @@ impl KnowledgeQueryService {
                     .cloned()
                     .collect::<Vec<_>>();
 
-                let score = matched_query_terms.len() * 3 + matched_tags.len() * 2;
+                let score = query_score + matched_tags.len() * 2;
                 let matched_terms =
                     merge_unique_terms(matched_query_terms.into_iter().chain(matched_tags));
 
@@ -118,4 +129,39 @@ impl KnowledgeQueryService {
             truncated,
         }
     }
+}
+
+fn score_business_fields(record: &KnowledgeRecord, query_terms: &[String]) -> (Vec<String>, usize) {
+    let title_terms = tokenize_business_text(&record.title);
+    let content_terms = tokenize_business_text(&record.content);
+    let tag_terms = record
+        .tags
+        .iter()
+        .flat_map(|tag| tokenize_business_text(tag))
+        .collect::<HashSet<_>>();
+
+    let mut matched_terms = Vec::new();
+    let mut field_score = 0usize;
+    for term in query_terms {
+        let weight = if title_terms.contains(term) {
+            9
+        } else if tag_terms.contains(term) {
+            7
+        } else if content_terms.contains(term) {
+            4
+        } else {
+            0
+        };
+        if weight > 0 {
+            matched_terms.push(term.clone());
+            field_score += weight;
+        }
+    }
+
+    let coverage_score = if query_terms.is_empty() {
+        0
+    } else {
+        matched_terms.len() * 100 / query_terms.len()
+    };
+    (matched_terms, coverage_score + field_score)
 }

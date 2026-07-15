@@ -7,6 +7,117 @@ use crate::{
 use magi_core::{UtcMillis, WorkspaceId};
 
 #[test]
+fn business_knowledge_query_matches_natural_chinese_phrases() {
+    let store = KnowledgeStore::new();
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "faq-refresh-token".to_string(),
+        kind: KnowledgeKind::Faq,
+        title: "登录失败后如何刷新令牌".to_string(),
+        content: "先刷新令牌，再重试原请求。".to_string(),
+        tags: vec!["登录".to_string(), "令牌".to_string()],
+        workspace_id: None,
+        source_ref: None,
+        created_at: UtcMillis(10),
+        updated_at: UtcMillis(10),
+    });
+
+    let result = store.query(&KnowledgeQuery {
+        kind: None,
+        text: Some("登录失败时怎么刷新令牌".to_string()),
+        tags: vec![],
+        workspace_id: None,
+        limit: 5,
+    });
+
+    assert_eq!(result.total_matches, 1);
+    assert_eq!(result.matches[0].record.knowledge_id, "faq-refresh-token");
+    assert!(
+        result.matches[0]
+            .matched_terms
+            .iter()
+            .any(|term| term == "登录" || term == "刷新" || term == "令牌")
+    );
+}
+
+#[test]
+fn business_knowledge_title_match_outranks_newer_content_match() {
+    let store = KnowledgeStore::new();
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "adr-title-match".to_string(),
+        kind: KnowledgeKind::Adr,
+        title: "架构决策".to_string(),
+        content: "事件事实生成只读投影。".to_string(),
+        tags: vec![],
+        workspace_id: None,
+        source_ref: None,
+        created_at: UtcMillis(10),
+        updated_at: UtcMillis(10),
+    });
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "adr-content-match".to_string(),
+        kind: KnowledgeKind::Adr,
+        title: "运行态设计".to_string(),
+        content: "这里讨论架构方案。".to_string(),
+        tags: vec![],
+        workspace_id: None,
+        source_ref: None,
+        created_at: UtcMillis(20),
+        updated_at: UtcMillis(20),
+    });
+
+    let result = store.query(&KnowledgeQuery {
+        kind: Some(KnowledgeKind::Adr),
+        text: Some("架构".to_string()),
+        tags: vec![],
+        workspace_id: None,
+        limit: 5,
+    });
+
+    assert_eq!(result.matches.len(), 2);
+    assert_eq!(result.matches[0].record.knowledge_id, "adr-title-match");
+    assert!(result.matches[0].score > result.matches[1].score);
+}
+
+#[test]
+fn business_knowledge_tag_match_outranks_content_match() {
+    let store = KnowledgeStore::new();
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "faq-tag-match".to_string(),
+        kind: KnowledgeKind::Faq,
+        title: "请求失败排查".to_string(),
+        content: "检查认证状态。".to_string(),
+        tags: vec!["令牌".to_string()],
+        workspace_id: None,
+        source_ref: None,
+        created_at: UtcMillis(10),
+        updated_at: UtcMillis(10),
+    });
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "faq-content-match".to_string(),
+        kind: KnowledgeKind::Faq,
+        title: "认证排查".to_string(),
+        content: "失败时刷新令牌。".to_string(),
+        tags: vec![],
+        workspace_id: None,
+        source_ref: None,
+        created_at: UtcMillis(20),
+        updated_at: UtcMillis(20),
+    });
+
+    let result = store.query(&KnowledgeQuery {
+        kind: Some(KnowledgeKind::Faq),
+        text: Some("令牌".to_string()),
+        tags: vec![],
+        workspace_id: None,
+        limit: 5,
+    });
+
+    assert_eq!(result.matches.len(), 2);
+    assert_eq!(result.matches[0].record.knowledge_id, "faq-tag-match");
+    assert!(result.matches[0].score > result.matches[1].score);
+}
+
+#[test]
 fn list_uses_deterministic_tie_breaker() {
     let store = KnowledgeStore::new();
     let updated_at = UtcMillis(42);

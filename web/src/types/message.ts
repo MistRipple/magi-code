@@ -163,8 +163,39 @@ export interface OrchestrationRuntimeOpsView {
   governance?: OrchestrationRuntimeGovernanceView;
   projectInstructions?: unknown;
   knowledgeSnapshot?: unknown;
-  knowledgeAudit?: unknown;
+  knowledgeAudit?: OrchestrationRuntimeKnowledgeAuditView;
   evidenceLedger?: unknown;
+}
+
+export type OrchestrationRuntimeKnowledgeDecision =
+  | 'not_needed'
+  | 'missing_workspace'
+  | 'queried_no_match'
+  | 'matched_not_injected'
+  | 'injected';
+
+export interface OrchestrationRuntimeKnowledgeAuditEntry {
+  timestamp: number;
+  consumer: string;
+  decision?: OrchestrationRuntimeKnowledgeDecision;
+  status?: string;
+  failureReason?: string;
+  candidateCount?: number;
+  insertedCount?: number;
+  knowledgeIds: string[];
+  resultKinds: string[];
+  matchedCount: number;
+  injectedCount: number;
+  injectedChars: number;
+  truncated: boolean;
+  purpose: string;
+  resultKind: string;
+  referenceCount: number;
+}
+
+export interface OrchestrationRuntimeKnowledgeAuditView {
+  eventCount: number;
+  recentEntries: OrchestrationRuntimeKnowledgeAuditEntry[];
 }
 
 // --- 从 types.ts 内联 UIProcessingState ---

@@ -212,6 +212,7 @@ fn build_session_turn_messages(
     session_store: &SessionStore,
     request: &SessionTurnExecutionRequest,
     prompt: &str,
+    knowledge_context_prompt: Option<&str>,
 ) -> Vec<ChatMessage> {
     let current_turn = session_store
         .runtime_sidecar(&request.session_id)
@@ -275,6 +276,12 @@ fn build_session_turn_messages(
             reference_prompt,
         ));
     }
+    if let Some(knowledge_context_prompt) = knowledge_context_prompt {
+        messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::KnowledgeContext,
+            knowledge_context_prompt,
+        ));
+    }
     messages.extend(history.iter().map(thread_chat_message_to_chat_message));
     messages.push(system_prompt_fragment_message(
         PromptFragmentKind::CurrentTurnPriority,
@@ -321,6 +328,7 @@ pub struct SessionTurnExecutionRuntime<'a> {
     pub snapshot_manager: Option<&'a Arc<SnapshotManager>>,
     pub request: SessionTurnExecutionRequest,
     pub prompt: String,
+    pub knowledge_context_prompt: Option<String>,
     pub tools: Option<Vec<ChatToolDefinition>>,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
 }
@@ -343,6 +351,7 @@ pub fn run_session_turn_execution(
         snapshot_manager,
         request,
         prompt,
+        knowledge_context_prompt,
         tools,
         persist_session_state,
     } = runtime;
@@ -358,8 +367,13 @@ pub fn run_session_turn_execution(
     let orchestrator_thread_id = orchestrator_thread.thread_id;
     let orchestrator_mission_id = orchestrator_thread.mission_id;
 
-    let mut messages =
-        build_session_turn_messages(Some(event_bus), session_store, &request, &prompt);
+    let mut messages = build_session_turn_messages(
+        Some(event_bus),
+        session_store,
+        &request,
+        &prompt,
+        knowledge_context_prompt.as_deref(),
+    );
     let mut final_content: Option<String> = None;
     let mut final_item_id: Option<String> = None;
     let mut main_timeline_entry_id: Option<String> = None;
@@ -1481,6 +1495,7 @@ mod tests {
             snapshot_manager: None,
             request,
             prompt: "请给出完整方案".to_string(),
+            knowledge_context_prompt: None,
             tools: None,
             persist_session_state: None,
         })
@@ -1715,6 +1730,7 @@ mod tests {
             snapshot_manager: None,
             request,
             prompt: "请回复一句话".to_string(),
+            knowledge_context_prompt: None,
             tools: None,
             persist_session_state: None,
         }) {
@@ -1808,6 +1824,7 @@ mod tests {
             snapshot_manager: None,
             request,
             prompt: "请输出长回复".to_string(),
+            knowledge_context_prompt: None,
             tools: None,
             persist_session_state: None,
         }) {
@@ -1911,6 +1928,7 @@ mod tests {
             snapshot_manager: None,
             request,
             prompt: "请识别这张图片".to_string(),
+            knowledge_context_prompt: None,
             tools: None,
             persist_session_state: None,
         }) {
@@ -2218,7 +2236,7 @@ mod tests {
             goal_turn_mode: SessionGoalTurnMode::None,
             workspace_root_path: None,
         };
-        let messages = build_session_turn_messages(None, &store, &request, &request.prompt);
+        let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
 
         assert_eq!(
             messages
@@ -2376,7 +2394,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let messages = build_session_turn_messages(None, &store, &request, &request.prompt);
+        let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
 
         assert!(messages.iter().any(|message| {
             message
@@ -2426,7 +2444,7 @@ mod tests {
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
-        let messages = build_session_turn_messages(None, &store, &request, &request.prompt);
+        let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
 
         assert_eq!(messages[0].role, "system");
         let context = messages[0].content.as_deref().unwrap_or_default();
@@ -2477,7 +2495,7 @@ mod tests {
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
-        let messages = build_session_turn_messages(None, &store, &request, &request.prompt);
+        let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
         let reference_context = messages
             .iter()
             .filter_map(|message| message.content.as_deref())
@@ -2490,6 +2508,64 @@ mod tests {
                 .last()
                 .and_then(|message| message.content.as_deref()),
             Some("分析引用内容")
+        );
+    }
+
+    #[test]
+    fn build_session_turn_messages_injects_current_turn_knowledge_as_system_fragment() {
+        let session_id = SessionId::new("session-knowledge-context");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "knowledge context")
+            .expect("session should be created");
+        let request = SessionTurnExecutionRequest {
+            session_id,
+            turn_id: "turn-knowledge-context".to_string(),
+            workspace_id: Some(WorkspaceId::new("workspace-knowledge-context")),
+            prompt: "为什么采用单一事实源架构？".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: true,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            workspace_root_path: Some("/tmp/current-project".to_string()),
+        };
+
+        let messages = build_session_turn_messages(
+            None,
+            &store,
+            &request,
+            &request.prompt,
+            Some("[reference:knowledge:adr] 单一事实源\n只读投影来自事件事实。"),
+        );
+
+        let knowledge = messages
+            .iter()
+            .find(|message| {
+                message.role == "system"
+                    && message
+                        .content
+                        .as_deref()
+                        .is_some_and(|content| content.contains("kind=\"knowledge_context\""))
+            })
+            .expect("knowledge context should be injected as a system fragment");
+        assert!(
+            knowledge
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("只读投影来自事件事实"))
+        );
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|message| message.content.as_deref()),
+            Some("为什么采用单一事实源架构？")
         );
     }
 
@@ -2536,7 +2612,7 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let messages = build_session_turn_messages(None, &store, &request, &request.prompt);
+        let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
         let current_user_message = messages.last().expect("current user message");
 
         assert_eq!(current_user_message.role, "user");
@@ -2586,7 +2662,7 @@ mod tests {
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
-        let messages = build_session_turn_messages(None, &store, &request, &request.prompt);
+        let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
 
         assert_eq!(
             messages

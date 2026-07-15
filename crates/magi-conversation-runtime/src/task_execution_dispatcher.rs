@@ -33,7 +33,7 @@ use crate::{
 use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest};
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
-    RecentTurnSource,
+    KnowledgeConsumer, KnowledgeContextRequest, KnowledgeContextSelection, RecentTurnSource,
 };
 use magi_core::{
     AccessProfile, EventId, ExecutionOwnership, LeaseId, SessionId, TaskId, TaskKind, UtcMillis,
@@ -574,16 +574,43 @@ impl LlmTaskDispatcher {
                 .ok()
                 .flatten()
         else {
+            self.publish_learning_extraction_diagnostic(
+                session_id,
+                workspace_id.as_ref(),
+                "skipped",
+                Some("auxiliary_model_unconfigured"),
+                0,
+                0,
+            );
             return;
         };
-        let Some(learnings) = extract_learnings_via_auxiliary(client, &extraction_text) else {
-            return;
+        let learnings = match extract_learnings_via_auxiliary(client, &extraction_text) {
+            Ok(Some(learnings)) => learnings,
+            Ok(None) => {
+                self.publish_learning_extraction_diagnostic(
+                    session_id,
+                    workspace_id.as_ref(),
+                    "completed",
+                    None,
+                    0,
+                    0,
+                );
+                return;
+            }
+            Err(failure) => {
+                self.publish_learning_extraction_diagnostic(
+                    session_id,
+                    workspace_id.as_ref(),
+                    "failed",
+                    Some(failure.as_str()),
+                    0,
+                    0,
+                );
+                return;
+            }
         };
-        if learnings.is_empty() {
-            return;
-        }
-
-        let existing = store.list();
+        let candidate_count = learnings.len();
+        let mut existing = store.list();
         let mut inserted = 0usize;
         for (index, learning) in learnings.into_iter().enumerate() {
             if knowledge_duplicate(
@@ -595,7 +622,7 @@ impl LlmTaskDispatcher {
                 continue;
             }
             let now = UtcMillis::now();
-            store.upsert(KnowledgeRecord {
+            let record = KnowledgeRecord {
                 knowledge_id: format!("learning-auto-{}-{index}", now.0),
                 kind: KnowledgeKind::Learning,
                 title: title_from_learning_content(&learning.content),
@@ -609,7 +636,9 @@ impl LlmTaskDispatcher {
                 ),
                 created_at: now,
                 updated_at: now,
-            });
+            };
+            store.upsert(record.clone());
+            existing.push(record);
             inserted += 1;
         }
         if inserted > 0
@@ -617,6 +646,14 @@ impl LlmTaskDispatcher {
         {
             callback();
         }
+        self.publish_learning_extraction_diagnostic(
+            session_id,
+            workspace_id.as_ref(),
+            "completed",
+            None,
+            candidate_count,
+            inserted,
+        );
     }
 
     /// 走辅助模型把当前会话压缩成 5 类结构化记忆（currentWork / decisions /
@@ -758,6 +795,73 @@ impl LlmTaskDispatcher {
             session_id: Some(session_id.clone()),
             mission_id: Some(task.mission_id.clone()),
             task_id: Some(task.task_id.clone()),
+            ..EventContext::default()
+        });
+        let _ = self.event_bus.publish(event);
+    }
+
+    fn publish_knowledge_context_diagnostic(
+        &self,
+        selection: &KnowledgeContextSelection,
+        session_id: &SessionId,
+        workspace_id: Option<&WorkspaceId>,
+        mission_id: Option<&magi_core::MissionId>,
+        task_id: Option<&TaskId>,
+    ) {
+        let event = EventEnvelope::audit(
+            EventId::new(format!(
+                "event-knowledge-context-{}-{}",
+                session_id,
+                UtcMillis::now().0
+            )),
+            "knowledge.context.selected",
+            serde_json::json!({
+                "consumer": selection.consumer,
+                "decision": selection.decision,
+                "knowledge_ids": selection.results.iter().map(|item| item.knowledge_id.clone()).collect::<Vec<_>>(),
+                "result_kinds": selection.results.iter().map(|item| knowledge_kind_label(item.kind)).collect::<Vec<_>>(),
+                "matched_count": selection.matched_count,
+                "injected_count": selection.results.len(),
+                "injected_chars": selection.injected_chars,
+                "truncated": selection.truncated,
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.cloned(),
+            session_id: Some(session_id.clone()),
+            mission_id: mission_id.cloned(),
+            task_id: task_id.cloned(),
+            ..EventContext::default()
+        });
+        let _ = self.event_bus.publish(event);
+    }
+
+    fn publish_learning_extraction_diagnostic(
+        &self,
+        session_id: &SessionId,
+        workspace_id: Option<&WorkspaceId>,
+        status: &str,
+        failure_reason: Option<&str>,
+        candidate_count: usize,
+        inserted_count: usize,
+    ) {
+        let event = EventEnvelope::audit(
+            EventId::new(format!(
+                "event-learning-extraction-{}-{}",
+                session_id,
+                UtcMillis::now().0
+            )),
+            "knowledge.learning.extraction",
+            serde_json::json!({
+                "status": status,
+                "failure_reason": failure_reason,
+                "candidate_count": candidate_count,
+                "inserted_count": inserted_count,
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.cloned(),
+            session_id: Some(session_id.clone()),
             ..EventContext::default()
         });
         let _ = self.event_bus.publish(event);
@@ -1039,6 +1143,24 @@ impl LlmTaskDispatcher {
                 None,
             );
         };
+        let knowledge_selection = ctx_runtime.select_knowledge_on_demand(KnowledgeContextRequest {
+            consumer: KnowledgeConsumer::TaskExecution,
+            workspace_id: Some(ws_id.clone()),
+            query: base_prompt.clone(),
+        });
+        self.publish_knowledge_context_diagnostic(
+            &knowledge_selection,
+            session_id,
+            Some(&ws_id),
+            Some(&task.mission_id),
+            Some(&task.task_id),
+        );
+        let knowledge_context_prompt = knowledge_selection.render_for_prompt();
+        let mut context_budget = self
+            .context_budget
+            .clone()
+            .unwrap_or_else(fallback_context_budget);
+        context_budget.max_knowledge = 0;
         let result = ctx_runtime.assemble_execution_context(&ExecutionContextAssemblyRequest {
             session_id: session_id.clone(),
             workspace_id: ws_id,
@@ -1048,19 +1170,36 @@ impl LlmTaskDispatcher {
                 assignment: None,
                 task: Some(task.goal.clone()),
             },
-            budget: self
-                .context_budget
-                .clone()
-                .unwrap_or_else(fallback_context_budget),
+            budget: context_budget,
         });
         let has_context = !result.selected_recent_turns.is_empty()
-            || !result.selected_knowledge.is_empty()
+            || knowledge_context_prompt.is_some()
             || !result.selected_memory.is_empty()
             || !result.selected_shared_context.is_empty()
             || !result.selected_file_summaries.is_empty()
             || !task_fact_context_parts.is_empty();
 
-        let context_summary = ExecutionContextSummary::from_context_assembly(&result);
+        let mut context_summary = ExecutionContextSummary::from_context_assembly(&result);
+        context_summary.used_knowledge = knowledge_selection.results.len();
+        context_summary.knowledge_ids = knowledge_selection
+            .results
+            .iter()
+            .map(|item| item.knowledge_id.clone())
+            .collect();
+        context_summary.knowledge_ids.sort();
+        context_summary.knowledge_ids.dedup();
+        if knowledge_selection.truncated
+            && !context_summary
+                .truncation_parts
+                .iter()
+                .any(|part| part == "knowledge")
+        {
+            context_summary
+                .truncation_parts
+                .push("knowledge".to_string());
+            context_summary.truncation_parts.sort();
+            context_summary.truncation_count = context_summary.truncation_parts.len();
+        }
 
         if !has_context {
             return (
@@ -1074,7 +1213,7 @@ impl LlmTaskDispatcher {
         }
         let mut ctx_parts: Vec<String> = Vec::new();
         let has_reference_context = !result.selected_recent_turns.is_empty()
-            || !result.selected_knowledge.is_empty()
+            || knowledge_context_prompt.is_some()
             || !result.selected_memory.is_empty()
             || !result.selected_shared_context.is_empty()
             || !result.selected_file_summaries.is_empty();
@@ -1089,11 +1228,8 @@ impl LlmTaskDispatcher {
                 item.content
             ));
         }
-        for item in &result.selected_knowledge {
-            ctx_parts.push(format!(
-                "[reference:knowledge] {}: {}",
-                item.title, item.excerpt
-            ));
+        if let Some(knowledge_context_prompt) = knowledge_context_prompt {
+            ctx_parts.push(knowledge_context_prompt);
         }
         for item in &result.selected_memory {
             ctx_parts.push(format!("[reference:memory] {}", item.content));
@@ -1326,6 +1462,21 @@ impl LlmTaskDispatcher {
             self.session_store.clone(),
             request.session_id.clone(),
         );
+        let knowledge_context_prompt = self.context_runtime.as_ref().and_then(|runtime| {
+            let selection = runtime.select_knowledge_on_demand(KnowledgeContextRequest {
+                consumer: KnowledgeConsumer::Mainline,
+                workspace_id: request.workspace_id.clone(),
+                query: request.prompt.clone(),
+            });
+            self.publish_knowledge_context_diagnostic(
+                &selection,
+                &request.session_id,
+                request.workspace_id.as_ref(),
+                None,
+                None,
+            );
+            selection.render_for_prompt()
+        });
         run_session_turn_execution(SessionTurnExecutionRuntime {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
@@ -1341,6 +1492,7 @@ impl LlmTaskDispatcher {
             snapshot_manager: self.snapshot_manager.as_ref(),
             request,
             prompt,
+            knowledge_context_prompt,
             tools,
             persist_session_state: self.session_state_persist_callback.as_deref(),
         })
@@ -1593,10 +1745,36 @@ fn recent_turn_source_label(source: RecentTurnSource) -> &'static str {
     }
 }
 
+fn knowledge_kind_label(kind: KnowledgeKind) -> &'static str {
+    match kind {
+        KnowledgeKind::Adr => "adr",
+        KnowledgeKind::Faq => "faq",
+        KnowledgeKind::Learning => "learning",
+        KnowledgeKind::CodeIndex => "code_index",
+    }
+}
+
 struct LearningCandidate {
     content: String,
     context: Option<String>,
     tags: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LearningExtractionFailure {
+    ModelRejected,
+    InvocationFailed,
+    MissingContent,
+}
+
+impl LearningExtractionFailure {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelRejected => "model_rejected",
+            Self::InvocationFailed => "model_invocation_failed",
+            Self::MissingContent => "missing_content",
+        }
+    }
 }
 
 /// 会话记忆水位线（粗略 token 估算）。自上一次抽取以来新增 timeline 文本
@@ -1656,12 +1834,12 @@ struct SessionMemorySlice {
 ///
 /// 与 `session_title::refine_new_session_title` 保持同一套约定：
 /// - 辅助模型未配置时调用方应在外层短路（缺失则不会进入本函数）。
-/// - 模型返回失败、`ok=false`、payload 非 JSON 等异常一律 `tracing::debug!`，
-///   返回 `None` 让上层跳过本轮抽取，不做任何降级到 marker 路径的回退。
+/// - 模型返回失败、`ok=false` 等异常一律 `tracing::debug!` 并返回明确失败原因，
+///   由上层发布诊断事件；不做任何降级到 marker 路径的回退。
 fn extract_learnings_via_auxiliary(
     client: Arc<dyn ModelBridgeClient>,
     text: &str,
-) -> Option<Vec<LearningCandidate>> {
+) -> Result<Option<Vec<LearningCandidate>>, LearningExtractionFailure> {
     let prompt = build_knowledge_extraction_prompt(text);
     let request = ModelInvocationRequest {
         provider: BUSINESS_MODEL_PROVIDER.to_string(),
@@ -1674,25 +1852,28 @@ fn extract_learnings_via_auxiliary(
         Ok(resp) if resp.ok => resp,
         Ok(resp) => {
             tracing::debug!(payload = %resp.payload, "辅助模型 ok=false，跳过知识抽取");
-            return None;
+            return Err(LearningExtractionFailure::ModelRejected);
         }
         Err(err) => {
             tracing::debug!(error = %err, "辅助模型调用失败，跳过知识抽取");
-            return None;
+            return Err(LearningExtractionFailure::InvocationFailed);
         }
     };
     let payload = response.parse_chat_payload();
-    let raw = payload.content?;
-    parse_learning_candidates(&raw)
+    let raw = payload
+        .content
+        .ok_or(LearningExtractionFailure::MissingContent)?;
+    Ok(parse_learning_candidates(&raw))
 }
 
 fn build_knowledge_extraction_prompt(text: &str) -> String {
     format!(
-        "请从下面的会话片段中提取最多 5 条可复用的“经验/结论/教训”。\n\n\
+        "请从下面的会话片段中提取最多 3 条可复用的“经验/结论/教训”。\n\n\
          输出要求：\n\
          - 严格 JSON 数组，每项形如 {{\"content\": \"...\", \"tags\": [\"...\"]}}\n\
          - content 必须是完整成句的一句话陈述，10-200 字之间\n\
          - 不要复述具体的任务上下文，只保留有跨场景复用价值的结论\n\
+         - 不要输出“先调用某工具、再运行某命令”这类纯工具操作流水\n\
          - 没有可提取的内容时直接输出 []\n\
          - 不要任何 markdown、代码块包装、解释性前后缀\n\n\
          会话片段：\n{text}"
@@ -1709,9 +1890,9 @@ fn parse_learning_candidates(raw: &str) -> Option<Vec<LearningCandidate>> {
     let trimmed = raw.trim();
     let list: Vec<Wire> = serde_json::from_str(trimmed).ok()?;
     let mut out = Vec::new();
-    for item in list.into_iter().take(5) {
+    for item in list {
         let cnt = item.content.chars().count();
-        if !(10..=600).contains(&cnt) {
+        if !(10..=600).contains(&cnt) || is_pure_tool_sequence(&item.content) {
             continue;
         }
         let mut tags = item.tags;
@@ -1722,8 +1903,40 @@ fn parse_learning_candidates(raw: &str) -> Option<Vec<LearningCandidate>> {
             context: None,
             tags,
         });
+        if out.len() == 3 {
+            break;
+        }
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+fn is_pure_tool_sequence(content: &str) -> bool {
+    let normalized = content.to_ascii_lowercase();
+    let tool_markers = [
+        "file_read",
+        "file_write",
+        "apply_patch",
+        "shell_exec",
+        "cargo test",
+        "npm run",
+        "git status",
+        "git diff",
+    ]
+    .iter()
+    .filter(|marker| normalized.contains(**marker))
+    .count();
+    let sequence_markers = ["先", "然后", "再", "最后", "调用", "运行", "执行"]
+        .iter()
+        .filter(|marker| normalized.contains(**marker))
+        .count();
+    let has_reusable_rationale = [
+        "必须", "应该", "应当", "需要", "避免", "确保", "不能", "禁止", "否则", "因为", "原因",
+        "原则", "约束",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+
+    tool_markers >= 2 && sequence_markers >= 2 && !has_reusable_rationale
 }
 
 /// 调用辅助模型生成 5 类会话记忆切片。
@@ -1836,6 +2049,7 @@ fn knowledge_duplicate(
             record_text == normalized
                 || record_text.contains(&normalized)
                 || normalized.contains(&record_text)
+                || magi_knowledge_store::business_text_similarity(&record.content, content) >= 0.35
         }
     })
 }
@@ -1891,6 +2105,31 @@ mod tests {
     use super::*;
     use crate::model_config::merge_orchestrator_session_override;
     use magi_core::{MissionId, Task, TaskPolicy, TaskRuntimePayload, TaskTier};
+
+    struct FailingAuxiliaryClient;
+
+    impl ModelBridgeClient for FailingAuxiliaryClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        {
+            Err(magi_bridge_client::BridgeClientError::CallFailed {
+                layer: magi_bridge_client::BridgeErrorLayer::Transport,
+                code: None,
+                message: "test failure".to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
+        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        {
+            self.invoke(request)
+        }
+    }
 
     fn task_with_role(role: &str, task_tier: TaskTier) -> Task {
         let now = UtcMillis(1_000);
@@ -2110,6 +2349,114 @@ mod tests {
             "缺少 workspace 时不得伪造 default workspace 并注入知识库内容"
         );
         assert!(summary.is_none());
+    }
+
+    #[test]
+    fn assemble_prompt_skips_matching_knowledge_when_task_has_no_knowledge_intent() {
+        let session_id = SessionId::new("session-task-no-knowledge-intent");
+        let workspace_id = WorkspaceId::new("workspace-task-no-knowledge-intent");
+        let knowledge_store = KnowledgeStore::new();
+        knowledge_store.upsert(KnowledgeRecord {
+            knowledge_id: "learning-read-readme".to_string(),
+            kind: KnowledgeKind::Learning,
+            title: "读取 README 文件".to_string(),
+            content: "读取 README 文件时使用 file_read。".to_string(),
+            tags: vec!["readme".to_string()],
+            workspace_id: Some(workspace_id.clone()),
+            source_ref: Some("session:test".to_string()),
+            created_at: UtcMillis(1),
+            updated_at: UtcMillis(1),
+        });
+        let dispatcher = dispatcher_with_default_tool_surface()
+            .with_context_runtime(Arc::new(ContextRuntime::new(
+                knowledge_store,
+                MemoryStore::new(),
+            )))
+            .with_context_budget(ContextBudget {
+                max_turns: 0,
+                max_knowledge: 4,
+                max_memory: 0,
+                max_shared_items: 0,
+                max_file_summaries: 0,
+            });
+        let mut task = task_with_role("executor", TaskTier::ExecutionChain);
+        task.title = "读取 README 文件".to_string();
+        task.goal = "读取 README 文件".to_string();
+
+        let (prompt, summary) =
+            dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id));
+
+        assert!(!prompt.contains("读取 README 文件时使用 file_read"));
+        assert_eq!(summary.expect("context summary").used_knowledge, 0);
+        let events = dispatcher.event_bus.snapshot().recent_events;
+        let diagnostic = events
+            .iter()
+            .find(|event| event.event_type == "knowledge.context.selected")
+            .expect("knowledge diagnostic event");
+        assert_eq!(diagnostic.payload["consumer"], "task_execution");
+        assert_eq!(diagnostic.payload["decision"], "not_needed");
+        assert_eq!(diagnostic.payload["injected_count"], 0);
+    }
+
+    #[test]
+    fn assemble_prompt_injects_full_relevant_adr_and_records_knowledge_id() {
+        let session_id = SessionId::new("session-task-adr-context");
+        let workspace_id = WorkspaceId::new("workspace-task-adr-context");
+        let knowledge_store = KnowledgeStore::new();
+        let adr_content = format!(
+            "运行态采用单一事实源，事件事实负责写入，只读投影负责展示。{}最终约束是禁止多个状态源互相覆盖。",
+            "背景信息。".repeat(24)
+        );
+        knowledge_store.upsert(KnowledgeRecord {
+            knowledge_id: "adr-single-source".to_string(),
+            kind: KnowledgeKind::Adr,
+            title: "为什么运行态采用单一事实源架构".to_string(),
+            content: adr_content,
+            tags: vec!["架构".to_string(), "单一事实源".to_string()],
+            workspace_id: Some(workspace_id.clone()),
+            source_ref: Some("adr:runtime-state".to_string()),
+            created_at: UtcMillis(1),
+            updated_at: UtcMillis(1),
+        });
+        let dispatcher = dispatcher_with_default_tool_surface()
+            .with_context_runtime(Arc::new(ContextRuntime::new(
+                knowledge_store,
+                MemoryStore::new(),
+            )))
+            .with_context_budget(ContextBudget {
+                max_turns: 0,
+                max_knowledge: 4,
+                max_memory: 0,
+                max_shared_items: 0,
+                max_file_summaries: 0,
+            });
+        let mut task = task_with_role("executor", TaskTier::ExecutionChain);
+        task.title = "分析运行态架构决策".to_string();
+        task.goal = "说明为什么运行态采用单一事实源架构".to_string();
+
+        let (prompt, summary) =
+            dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id));
+
+        assert!(prompt.contains("[reference:knowledge:adr]"));
+        assert!(prompt.contains("最终约束是禁止多个状态源互相覆盖"));
+        let summary = summary.expect("context summary");
+        assert_eq!(summary.used_knowledge, 1);
+        assert_eq!(summary.knowledge_ids, vec!["adr-single-source".to_string()]);
+        let events = dispatcher.event_bus.snapshot().recent_events;
+        let diagnostic = events
+            .iter()
+            .find(|event| event.event_type == "knowledge.context.selected")
+            .expect("knowledge diagnostic event");
+        assert_eq!(diagnostic.payload["decision"], "injected");
+        assert_eq!(
+            diagnostic.payload["knowledge_ids"],
+            serde_json::json!(["adr-single-source"])
+        );
+        assert_eq!(
+            diagnostic.payload["result_kinds"],
+            serde_json::json!(["adr"])
+        );
+        assert!(diagnostic.payload.get("content").is_none());
     }
 
     #[test]
@@ -2779,6 +3126,41 @@ mod tests {
     }
 
     #[test]
+    fn auxiliary_learning_extraction_exposes_model_invocation_failure() {
+        let result = extract_learnings_via_auxiliary(
+            Arc::new(FailingAuxiliaryClient),
+            "这是一段用于验证辅助模型失败诊断的会话内容",
+        );
+
+        assert!(matches!(
+            result,
+            Err(LearningExtractionFailure::InvocationFailed)
+        ));
+
+        let dispatcher = dispatcher_with_default_tool_surface();
+        let session_id = SessionId::new("session-learning-extraction-failure");
+        let workspace_id = WorkspaceId::new("workspace-learning-extraction-failure");
+        dispatcher.publish_learning_extraction_diagnostic(
+            &session_id,
+            Some(&workspace_id),
+            "failed",
+            Some(LearningExtractionFailure::InvocationFailed.as_str()),
+            0,
+            0,
+        );
+        let event = dispatcher
+            .event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "knowledge.learning.extraction")
+            .expect("learning extraction diagnostic");
+        assert_eq!(event.payload["status"], "failed");
+        assert_eq!(event.payload["failure_reason"], "model_invocation_failed");
+        assert!(event.payload.get("content").is_none());
+    }
+
+    #[test]
     fn parse_learning_candidates_drops_out_of_range_content() {
         let raw = r#"[
             {"content": "太短", "tags": []},
@@ -2801,7 +3183,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_learning_candidates_caps_at_five_items() {
+    fn parse_learning_candidates_caps_at_three_items() {
         let mut parts = Vec::new();
         for i in 0..8 {
             parts.push(format!(
@@ -2810,7 +3192,43 @@ mod tests {
         }
         let raw = format!("[{}]", parts.join(","));
         let result = parse_learning_candidates(&raw).expect("应解析成功");
-        assert_eq!(result.len(), 5);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn parse_learning_candidates_filters_pure_tool_sequences() {
+        let raw = r#"[
+            {"content": "先调用 file_read，然后调用 apply_patch，最后运行 cargo test", "tags": []},
+            {"content": "修改状态逻辑后必须同时验证事件事实和只读投影，避免多个状态源互相覆盖", "tags": []}
+        ]"#;
+
+        let result = parse_learning_candidates(raw).expect("应保留可复用经验");
+
+        assert_eq!(result.len(), 1);
+        assert!(result[0].content.contains("事件事实"));
+    }
+
+    #[test]
+    fn knowledge_duplicate_recognizes_chinese_paraphrases() {
+        let workspace_id = WorkspaceId::new("workspace-learning-duplicate");
+        let existing = vec![KnowledgeRecord {
+            knowledge_id: "learning-existing".to_string(),
+            kind: KnowledgeKind::Learning,
+            title: "状态逻辑验证".to_string(),
+            content: "修改状态逻辑后必须验证事件投影".to_string(),
+            tags: vec![],
+            workspace_id: Some(workspace_id.clone()),
+            source_ref: Some("session:existing".to_string()),
+            created_at: UtcMillis(1),
+            updated_at: UtcMillis(1),
+        }];
+
+        assert!(knowledge_duplicate(
+            &existing,
+            KnowledgeKind::Learning,
+            Some(&workspace_id),
+            "状态逻辑改动后需要检查事件投影"
+        ));
     }
 
     #[test]

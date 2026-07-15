@@ -1,5 +1,6 @@
 mod budgeting;
 mod execution_context;
+mod knowledge_context;
 pub mod layered_memory_store;
 pub mod memory_document;
 pub mod shared_context_pool;
@@ -17,6 +18,10 @@ use std::{
 };
 
 pub use execution_context::{ExecutionContextAssemblyRequest, ExecutionContextClues};
+pub use knowledge_context::{
+    KnowledgeConsumer, KnowledgeContextDecision, KnowledgeContextRequest,
+    KnowledgeContextSelection, SelectedKnowledgeContext,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContextBudget {

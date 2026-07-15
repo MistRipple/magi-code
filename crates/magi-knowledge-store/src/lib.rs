@@ -22,7 +22,7 @@ mod tests;
 
 use magi_core::{DomainError, UtcMillis, WorkspaceId};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -37,6 +37,23 @@ pub use source_model::{
 pub use state::KnowledgeState;
 
 const PROJECT_CODE_INDEX_ID: &str = "project-code-index";
+
+pub fn business_text_similarity(left: &str, right: &str) -> f32 {
+    let left_terms = normalization::tokenize_business_text(left)
+        .into_iter()
+        .filter(|term| term.chars().count() >= 2)
+        .collect::<HashSet<_>>();
+    let right_terms = normalization::tokenize_business_text(right)
+        .into_iter()
+        .filter(|term| term.chars().count() >= 2)
+        .collect::<HashSet<_>>();
+    let min_size = left_terms.len().min(right_terms.len());
+    if min_size == 0 {
+        return 0.0;
+    }
+    let overlap = left_terms.intersection(&right_terms).count();
+    overlap as f32 / min_size as f32
+}
 
 fn zero_utc_millis() -> UtcMillis {
     UtcMillis(0)

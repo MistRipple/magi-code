@@ -109,6 +109,9 @@ fn select_knowledge(
     mut knowledge_query: KnowledgeQuery,
 ) -> (Vec<GovernedKnowledgeOutput>, Option<TruncationRecord>) {
     knowledge_query.limit = budget.max_knowledge.min(knowledge_query.limit);
+    if knowledge_query.limit == 0 {
+        return (Vec::new(), None);
+    }
     let knowledge_query_result = runtime.knowledge_store.governed_query(&knowledge_query);
     let knowledge_truncation = knowledge_query_result
         .truncated

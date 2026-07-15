@@ -4279,6 +4279,56 @@ fn knowledge_query_reads_workspace_knowledge_store() {
 }
 
 #[test]
+fn knowledge_query_uses_business_chinese_recall_and_typed_fields() {
+    let store = Arc::new(magi_knowledge_store::KnowledgeStore::new());
+    let workspace_id = WorkspaceId::new("workspace-knowledge-query-chinese");
+    store.upsert(magi_knowledge_store::KnowledgeRecord {
+        knowledge_id: "faq-refresh-token".to_string(),
+        kind: magi_knowledge_store::KnowledgeKind::Faq,
+        title: "登录失败后如何刷新令牌".to_string(),
+        content: "先刷新令牌，再重试原请求。".to_string(),
+        tags: vec!["登录".to_string(), "令牌".to_string()],
+        workspace_id: Some(workspace_id.clone()),
+        source_ref: Some("faq:auth".to_string()),
+        created_at: UtcMillis(100),
+        updated_at: UtcMillis(100),
+    });
+
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let mut registry = ToolRegistry::new(governance, event_bus).with_knowledge_store(store);
+    registry.register_default_builtins();
+
+    let output = registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-knowledge-query-chinese"),
+            tool_name: BuiltinToolName::KnowledgeQuery.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({
+                "query": "登录失败时怎么刷新令牌",
+                "limit": 5
+            })
+            .to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        ToolExecutionContext {
+            workspace_id: Some(workspace_id),
+            ..ToolExecutionContext::default()
+        },
+        &ToolExecutionPolicy::default(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    let payload: Value = serde_json::from_str(&output.payload).unwrap();
+    assert_eq!(payload["returned_matches"], 1);
+    assert_eq!(payload["results"][0]["knowledge_id"], "faq-refresh-token");
+    assert_eq!(payload["results"][0]["kind"], "faq");
+    assert_eq!(payload["results"][0]["source_ref"], "faq:auth");
+    assert!(payload["results"][0]["matched_terms"].as_array().is_some());
+}
+
+#[test]
 fn skill_apply_is_not_registered_as_builtin() {
     let registry = make_registry();
     assert!(registry.builtin_access_mode("skill_apply").is_none());

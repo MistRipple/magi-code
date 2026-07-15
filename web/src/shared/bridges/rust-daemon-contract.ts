@@ -7,6 +7,9 @@ import type {
   AppState,
   OrchestrationRuntimeAssignmentSummary,
   OrchestrationRuntimeFailureRootCause,
+  OrchestrationRuntimeKnowledgeAuditEntry,
+  OrchestrationRuntimeKnowledgeAuditView,
+  OrchestrationRuntimeKnowledgeDecision,
   OrchestrationRuntimeOpsView,
   OrchestrationRuntimeRecoverySummary,
   OrchestrationRuntimeTimelineEntry,
@@ -115,6 +118,29 @@ interface RustExecutionGroupRuntimeSummary {
   context_governed_knowledge_count?: number;
   context_extracted_memory_count?: number;
   context_provenance_linked_memory_count?: number;
+}
+
+interface RustKnowledgeAuditRuntimeEntry {
+  event_id?: string;
+  event_type?: string;
+  occurred_at?: number;
+  sequence?: number;
+  workspace_id?: string | null;
+  session_id?: string | null;
+  mission_id?: string | null;
+  task_id?: string | null;
+  consumer?: string | null;
+  decision?: string | null;
+  status?: string | null;
+  failure_reason?: string | null;
+  knowledge_ids?: string[];
+  result_kinds?: string[];
+  matched_count?: number;
+  injected_count?: number;
+  injected_chars?: number;
+  truncated?: boolean;
+  candidate_count?: number;
+  inserted_count?: number;
 }
 
 interface RustAssignmentRuntimeSummary {
@@ -296,6 +322,7 @@ interface RustRuntimeReadModelDto {
     tasks?: RustTaskRuntimeSummary[];
     workers?: RustWorkerRuntimeSummary[];
     sessions?: RustSessionRuntimeSummary[];
+    knowledge_audit?: RustKnowledgeAuditRuntimeEntry[];
   };
   overview?: {
     category_counts?: RustEventCategoryCounts;
@@ -1165,6 +1192,10 @@ function formatRuntimeEventLabel(eventType: string): string {
       return '任务状态更新';
     case 'mission.execution.overview':
       return '执行概览';
+    case 'knowledge.context.selected':
+      return '知识按需决策';
+    case 'knowledge.learning.extraction':
+      return '自动经验抽取';
     case 'mission.resume.dispatch.created':
       return '恢复调度已创建';
     case 'worker.reported':
@@ -1260,6 +1291,149 @@ function deriveFailureRootCause(
   };
 }
 
+function normalizeKnowledgeDecision(value: unknown): OrchestrationRuntimeKnowledgeDecision | null {
+  switch (normalizeString(value)) {
+    case 'not_needed':
+    case 'missing_workspace':
+    case 'queried_no_match':
+    case 'matched_not_injected':
+    case 'injected':
+      return normalizeString(value) as OrchestrationRuntimeKnowledgeDecision;
+    default:
+      return null;
+  }
+}
+
+function knowledgeDecisionSummary(
+  decision: OrchestrationRuntimeKnowledgeDecision,
+  injectedCount: number,
+): string {
+  switch (decision) {
+    case 'not_needed':
+      return '当前请求无需知识检索';
+    case 'missing_workspace':
+      return '缺少工作区，未执行知识检索';
+    case 'queried_no_match':
+      return '已检索当前工作区知识，但未命中';
+    case 'matched_not_injected':
+      return '知识已命中，但受预算约束未注入';
+    case 'injected':
+      return `已按需注入 ${injectedCount} 条知识`;
+  }
+}
+
+function knowledgeDecisionResultKind(decision: OrchestrationRuntimeKnowledgeDecision): string {
+  switch (decision) {
+    case 'injected':
+      return 'matched';
+    case 'queried_no_match':
+    case 'not_needed':
+    case 'missing_workspace':
+      return 'empty';
+    case 'matched_not_injected':
+      return 'matched_not_injected';
+  }
+}
+
+function deriveKnowledgeAudit(
+  runtimeReadModel: RustRuntimeReadModelDto,
+  recentEvents: RustEventEnvelope[],
+  sessionId: string,
+): OrchestrationRuntimeKnowledgeAuditView | undefined {
+  const persistedEvents = Array.isArray(runtimeReadModel.details?.knowledge_audit)
+    ? runtimeReadModel.details.knowledge_audit.map((entry): RustEventEnvelope => ({
+        event_id: entry.event_id,
+        event_type: entry.event_type,
+        occurred_at: entry.occurred_at,
+        sequence: entry.sequence,
+        workspace_id: entry.workspace_id,
+        session_id: entry.session_id,
+        mission_id: entry.mission_id,
+        task_id: entry.task_id,
+        payload: {
+          consumer: entry.consumer,
+          decision: entry.decision,
+          status: entry.status,
+          failure_reason: entry.failure_reason,
+          knowledge_ids: entry.knowledge_ids,
+          result_kinds: entry.result_kinds,
+          matched_count: entry.matched_count,
+          injected_count: entry.injected_count,
+          injected_chars: entry.injected_chars,
+          truncated: entry.truncated,
+          candidate_count: entry.candidate_count,
+          inserted_count: entry.inserted_count,
+        },
+      }))
+    : [];
+  const sourceEvents = persistedEvents.length > 0 ? persistedEvents : recentEvents;
+  const recentEntries = sourceEvents
+    .filter((event) => event.event_type === 'knowledge.context.selected'
+      || event.event_type === 'knowledge.learning.extraction')
+    .filter((event) => normalizeString(event.session_id) === sessionId)
+    .map((event): OrchestrationRuntimeKnowledgeAuditEntry | null => {
+      const payload = resolveEventPayload(event);
+      if (event.event_type === 'knowledge.learning.extraction') {
+        const status = normalizeString(payload.status);
+        const failureReason = normalizeString(payload.failure_reason);
+        const candidateCount = Math.max(0, normalizeNumber(payload.candidate_count, 0));
+        const insertedCount = Math.max(0, normalizeNumber(payload.inserted_count, 0));
+        const failed = status === 'failed';
+        return {
+          timestamp: normalizeNumber(event.occurred_at, 0),
+          consumer: 'auxiliary',
+          status,
+          failureReason: failureReason || undefined,
+          candidateCount,
+          insertedCount,
+          knowledgeIds: [],
+          resultKinds: insertedCount > 0 ? ['learning'] : [],
+          matchedCount: candidateCount,
+          injectedCount: 0,
+          injectedChars: 0,
+          truncated: false,
+          purpose: failed
+            ? '自动经验抽取失败'
+            : insertedCount > 0
+              ? `已写入 ${insertedCount} 条自动经验`
+              : '自动经验抽取未产生可写入内容',
+          resultKind: failed ? 'error' : insertedCount > 0 ? 'matched' : 'empty',
+          referenceCount: insertedCount,
+        };
+      }
+      const decision = normalizeKnowledgeDecision(payload.decision);
+      if (!decision) {
+        return null;
+      }
+      const injectedCount = Math.max(0, normalizeNumber(payload.injected_count, 0));
+      return {
+        timestamp: normalizeNumber(event.occurred_at, 0),
+        consumer: normalizeString(payload.consumer),
+        decision,
+        knowledgeIds: normalizeStringArray(payload.knowledge_ids),
+        resultKinds: normalizeStringArray(payload.result_kinds),
+        matchedCount: Math.max(0, normalizeNumber(payload.matched_count, 0)),
+        injectedCount,
+        injectedChars: Math.max(0, normalizeNumber(payload.injected_chars, 0)),
+        truncated: payload.truncated === true,
+        purpose: knowledgeDecisionSummary(decision, injectedCount),
+        resultKind: knowledgeDecisionResultKind(decision),
+        referenceCount: injectedCount,
+      };
+    })
+    .filter((entry): entry is OrchestrationRuntimeKnowledgeAuditEntry => entry !== null)
+    .sort((left, right) => left.timestamp - right.timestamp)
+    .slice(-8);
+
+  if (recentEntries.length === 0) {
+    return undefined;
+  }
+  return {
+    eventCount: recentEntries.length,
+    recentEntries,
+  };
+}
+
 /**
  * 构建 opsView：聚合 recovery、timeline、diagnostics 等后端已有数据。
  */
@@ -1277,12 +1451,14 @@ function deriveOpsView(
   const failureRootCause = status === 'failed' || status === 'blocked'
     ? deriveFailureRootCause(generatedAt, failedTaskLabels)
     : undefined;
+  const knowledgeAudit = deriveKnowledgeAudit(runtimeReadModel, recentEvents, sessionId);
   const eventCount = recentTimeline.length;
 
   // 没有任何有意义数据时返回 null，避免空壳
   const hasContent = recentTimeline.length > 0
     || recovery !== undefined
-    || failureRootCause !== undefined;
+    || failureRootCause !== undefined
+    || knowledgeAudit !== undefined;
   if (!hasContent) {
     return null;
   }
@@ -1298,6 +1474,7 @@ function deriveOpsView(
     recentStateDiffs: [],
     recovery,
     failureRootCause,
+    knowledgeAudit,
   };
 }
 

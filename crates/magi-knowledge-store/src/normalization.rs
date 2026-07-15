@@ -44,6 +44,66 @@ pub(crate) fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
+pub(crate) fn tokenize_business_text(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut current_is_cjk = None;
+
+    for character in text.chars() {
+        let is_cjk = is_cjk_character(character);
+        let is_token_character = is_cjk || character.is_alphanumeric();
+        if !is_token_character {
+            append_business_segment(&mut terms, &mut current, current_is_cjk);
+            current_is_cjk = None;
+            continue;
+        }
+
+        if current_is_cjk.is_some_and(|kind| kind != is_cjk) {
+            append_business_segment(&mut terms, &mut current, current_is_cjk);
+        }
+        current_is_cjk = Some(is_cjk);
+        current.push(character);
+    }
+    append_business_segment(&mut terms, &mut current, current_is_cjk);
+    merge_unique_terms(terms)
+}
+
+fn append_business_segment(
+    terms: &mut Vec<String>,
+    current: &mut String,
+    current_is_cjk: Option<bool>,
+) {
+    if current.is_empty() {
+        return;
+    }
+    let normalized = current.trim().to_ascii_lowercase();
+    current.clear();
+    if normalized.is_empty() {
+        return;
+    }
+    terms.push(normalized.clone());
+    if current_is_cjk != Some(true) {
+        return;
+    }
+
+    let characters = normalized.chars().collect::<Vec<_>>();
+    for window_size in [2usize, 3usize] {
+        if characters.len() < window_size {
+            continue;
+        }
+        for window in characters.windows(window_size) {
+            terms.push(window.iter().collect());
+        }
+    }
+}
+
+fn is_cjk_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'
+    )
+}
+
 pub(crate) fn merge_unique_terms(terms: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut merged = terms.into_iter().collect::<Vec<_>>();
     merged.sort();

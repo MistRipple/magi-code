@@ -6,6 +6,8 @@
   import type {
     OrchestratorRuntimeState,
     OrchestratorRuntimeDecisionTraceEntry,
+    OrchestrationRuntimeKnowledgeAuditEntry,
+    OrchestrationRuntimeKnowledgeAuditView,
   } from '../types/message';
   import Icon from './Icon.svelte';
   import type { IconName } from '../lib/icons';
@@ -22,24 +24,6 @@
     runtimeState: OrchestratorRuntimeState | null;
     isProcessing?: boolean;
     processingStartedAt?: number | null;
-  }
-
-  /** knowledgeAudit 运行时结构（后端类型为 unknown，这里给出前端期望的形状） */
-  interface KnowledgeAuditView {
-    recentEntries?: KnowledgeAuditEntry[];
-    eventCount?: number;
-  }
-
-  /** knowledgeAudit.recentEntries 中的单条记录 */
-  interface KnowledgeAuditEntry {
-    timestamp?: number;
-    kind?: string;
-    summary?: string;
-    purpose?: string;
-    consumer?: string;
-    resultKind?: string;
-    referenceCount?: number;
-    [key: string]: unknown;
   }
 
   let {
@@ -115,7 +99,7 @@
   });
 
   const opsView = $derived.by(() => runtimeState?.opsView || null);
-  const knowledgeAudit = $derived.by(() => (opsView?.knowledgeAudit || null) as KnowledgeAuditView | null);
+  const knowledgeAudit = $derived.by(() => (opsView?.knowledgeAudit || null) as OrchestrationRuntimeKnowledgeAuditView | null);
   const executionGroupSummary = $derived.by(() => opsView?.executionGroup || null);
   const planSummary = $derived.by(() => opsView?.plan || null);
 
@@ -779,12 +763,12 @@
     }
   }
 
-  function formatKnowledgeAuditScope(entry: KnowledgeAuditEntry): string {
+  function formatKnowledgeAuditScope(entry: OrchestrationRuntimeKnowledgeAuditEntry): string {
     void entry;
     return '';
   }
 
-  function formatKnowledgeAuditMeta(entry: KnowledgeAuditEntry): string {
+  function formatKnowledgeAuditMeta(entry: OrchestrationRuntimeKnowledgeAuditEntry): string {
     const parts: string[] = [];
     const consumer = formatKnowledgeConsumer(entry.consumer);
     if (consumer) {
@@ -806,6 +790,14 @@
       return '';
     }
     switch (normalized) {
+      case 'mainline':
+        return '主线对话';
+      case 'task_execution':
+        return '任务执行';
+      case 'knowledge_query_tool':
+        return '知识查询工具';
+      case 'auxiliary':
+        return '辅助模型';
       case 'prompt':
       case 'prompt_context':
       case 'prompt-context':
@@ -838,6 +830,8 @@
       case 'error':
       case 'failed':
         return '查询失败';
+      case 'matched_not_injected':
+        return '命中但未注入';
       default:
         return formatHumanizedRuntimeText(normalized);
     }
@@ -853,6 +847,10 @@
         return '任务状态更新';
       case 'mission.execution.overview':
         return '执行概览';
+      case 'knowledge.context.selected':
+        return '知识按需决策';
+      case 'knowledge.learning.extraction':
+        return '自动经验抽取';
       case 'mission.resume.dispatch.created':
         return '恢复调度已创建';
       case 'worker.reported':

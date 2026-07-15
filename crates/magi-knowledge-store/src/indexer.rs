@@ -1,6 +1,7 @@
 use crate::{
-    CodeIndexSource, KnowledgeAuditLink, KnowledgeGovernanceLink, KnowledgeIndexer,
-    KnowledgeRecord, normalization::tokenize,
+    CodeIndexSource, KnowledgeAuditLink, KnowledgeGovernanceLink, KnowledgeIndexer, KnowledgeKind,
+    KnowledgeRecord,
+    normalization::{tokenize, tokenize_business_text},
 };
 
 impl KnowledgeIndexer {
@@ -14,9 +15,14 @@ impl KnowledgeIndexer {
         audit_link: Option<&KnowledgeAuditLink>,
         governance_link: Option<&KnowledgeGovernanceLink>,
     ) -> Vec<String> {
-        let mut terms = tokenize(&record.title);
-        terms.extend(tokenize(&record.content));
-        terms.extend(record.tags.iter().map(|tag| tag.to_ascii_lowercase()));
+        let record_tokenizer = if record.kind == KnowledgeKind::CodeIndex {
+            tokenize
+        } else {
+            tokenize_business_text
+        };
+        let mut terms = record_tokenizer(&record.title);
+        terms.extend(record_tokenizer(&record.content));
+        terms.extend(record.tags.iter().flat_map(|tag| record_tokenizer(tag)));
         if let Some(source_ref) = &record.source_ref {
             terms.extend(tokenize(source_ref));
         }
