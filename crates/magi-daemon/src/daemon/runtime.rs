@@ -13,7 +13,8 @@ use magi_bridge_client::{
     BridgeBindingKind, BridgeClientError, BridgeDispatchRuntime, BridgeResponse, BridgeServerKind,
     BridgeTransport, HttpModelBridgeClient, HttpModelBridgeProtocol,
     ImageGenerationRequest as BridgeImageGenerationRequest, JsonRpcMcpBridgeClient,
-    JsonRpcStdioTransport, McpBridgeClient, McpToolCallRequest, StdioMcpBridgeClient,
+    JsonRpcStdioTransport, McpBridgeClient, McpServerClient, McpToolCallRequest,
+    StdioMcpBridgeClient,
 };
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, FileSummaryStore, ProjectRecentTurnStore, SharedContextPool,
@@ -59,7 +60,7 @@ struct StaticTestModelBridgeClient;
 fn build_external_tool_catalog_provider(
     settings_store: Arc<SettingsStore>,
     skill_runtime: Arc<magi_skill_runtime::SkillRuntime>,
-    mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+    mcp_connections: Arc<RwLock<HashMap<String, Arc<McpServerClient>>>>,
 ) -> ExternalToolCatalogProvider {
     Arc::new(move || {
         let instruction_skills = skill_runtime.registry().list();
@@ -131,7 +132,7 @@ fn build_external_tool_catalog_provider(
 
 fn build_external_mcp_tool_executor(
     settings_store: Arc<SettingsStore>,
-    mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+    mcp_connections: Arc<RwLock<HashMap<String, Arc<McpServerClient>>>>,
 ) -> ExternalMcpToolExecutor {
     Arc::new(move |server_id, tool_name, arguments| {
         let entry = settings_store
@@ -266,14 +267,14 @@ fn external_binding_policy_labels(
 #[cfg(test)]
 fn external_mcp_server_catalog_entry(
     entry: &serde_json::Value,
-    mcp_connections: &Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+    mcp_connections: &Arc<RwLock<HashMap<String, Arc<McpServerClient>>>>,
 ) -> Option<ExternalMcpServerCatalogEntry> {
     external_mcp_server_catalog_snapshot(entry, mcp_connections).map(|(server, _)| server)
 }
 
 fn external_mcp_server_catalog_snapshot(
     entry: &serde_json::Value,
-    mcp_connections: &Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+    mcp_connections: &Arc<RwLock<HashMap<String, Arc<McpServerClient>>>>,
 ) -> Option<(
     ExternalMcpServerCatalogEntry,
     Vec<ExternalMcpToolCatalogEntry>,
@@ -346,8 +347,8 @@ fn external_mcp_server_catalog_snapshot(
 
 fn mcp_client_for_settings_entry(
     entry: &serde_json::Value,
-    mcp_connections: &Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
-) -> Result<Arc<StdioMcpBridgeClient>, String> {
+    mcp_connections: &Arc<RwLock<HashMap<String, Arc<McpServerClient>>>>,
+) -> Result<Arc<McpServerClient>, String> {
     let server_id = mcp_server_entry_id(entry)
         .map(str::to_string)
         .ok_or_else(|| "MCP 服务缺少稳定 ID".to_string())?;
@@ -368,7 +369,7 @@ fn mcp_client_for_settings_entry(
     }
     let config = build_mcp_config_from_entry(entry)
         .ok_or_else(|| format!("MCP server {server_id} config is incomplete"))?;
-    let client = Arc::new(StdioMcpBridgeClient::new(config));
+    let client = Arc::new(McpServerClient::new(config));
     mcp_connections
         .write()
         .expect("mcp connections write lock poisoned")
@@ -386,14 +387,14 @@ fn external_mcp_error_marker(entry: &serde_json::Value) -> Option<String> {
 #[derive(Clone)]
 struct SettingsBackedMcpBridgeClient {
     settings_store: Arc<SettingsStore>,
-    mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+    mcp_connections: Arc<RwLock<HashMap<String, Arc<McpServerClient>>>>,
     default_client: Arc<dyn McpBridgeClient>,
 }
 
 impl SettingsBackedMcpBridgeClient {
     fn new(
         settings_store: Arc<SettingsStore>,
-        mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+        mcp_connections: Arc<RwLock<HashMap<String, Arc<McpServerClient>>>>,
         default_client: Arc<dyn McpBridgeClient>,
     ) -> Self {
         Self {
@@ -417,7 +418,7 @@ impl SettingsBackedMcpBridgeClient {
         &self,
         _server_id: &str,
         entry: &serde_json::Value,
-    ) -> Result<Arc<StdioMcpBridgeClient>, BridgeClientError> {
+    ) -> Result<Arc<McpServerClient>, BridgeClientError> {
         mcp_client_for_settings_entry(entry, &self.mcp_connections)
             .map_err(mcp_config_unavailable_error)
     }
@@ -1894,8 +1895,8 @@ mod tests {
         http::{Request, StatusCode},
     };
     use magi_bridge_client::{
-        BridgeClientError, BridgeResponse, McpBridgeClient, McpServerConfig, McpToolCallRequest,
-        ModelInvocationRequest, StdioMcpBridgeClient,
+        BridgeClientError, BridgeResponse, McpBridgeClient, McpServerClient, McpServerConfig,
+        McpToolCallRequest, ModelInvocationRequest,
     };
     use magi_core::{
         AbsolutePath, MissionId, SessionId, Task, TaskId, TaskKind, TaskRuntimePayload, TaskStatus,
@@ -1965,7 +1966,7 @@ while IFS= read -r line; do
     esac
 done
 "#;
-        let client = Arc::new(StdioMcpBridgeClient::new(McpServerConfig::new(
+        let client = Arc::new(McpServerClient::from_stdio(McpServerConfig::new(
             "sh",
             vec!["-c".to_string(), script.to_string()],
         )));
@@ -2451,7 +2452,7 @@ done
             .expect("mcp connection pool should lock")
             .insert(
                 "disabled-mcp".to_string(),
-                Arc::new(StdioMcpBridgeClient::new(McpServerConfig {
+                Arc::new(McpServerClient::from_stdio(McpServerConfig {
                     command: "node".to_string(),
                     args: Vec::new(),
                     working_directory: None,

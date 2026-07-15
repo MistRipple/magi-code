@@ -15,7 +15,7 @@ use crate::{
     tool_execution_policy_scope,
 };
 use magi_bridge_client::{
-    ChatMessage, ChatToolCall,
+    ChatMessage, ChatToolCall, ModelRetryRuntimeEvent, ModelRetryRuntimePhase,
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
 use magi_core::{
@@ -529,6 +529,47 @@ pub fn publish_session_turn_item_event(
         "canonical_item": published.canonical_item,
     });
     publish_session_turn_item_payload(event_bus, session_id, workspace_id, payload);
+}
+
+pub fn publish_model_retry_runtime_event(
+    event_bus: &InMemoryEventBus,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    message_id: &str,
+    task_id: Option<&TaskId>,
+    event: &ModelRetryRuntimeEvent,
+) {
+    let phase = match event.phase {
+        ModelRetryRuntimePhase::Scheduled => "scheduled",
+        ModelRetryRuntimePhase::AttemptStarted => "attempt_started",
+        ModelRetryRuntimePhase::Settled => "settled",
+    };
+    let payload = serde_json::json!({
+        "session_id": session_id.to_string(),
+        "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+        "message_id": message_id,
+        "phase": phase,
+        "attempt": event.attempt,
+        "max_attempts": event.max_attempts,
+        "delay_ms": event.delay_ms,
+    });
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "model-retry-runtime-{}-{}",
+                message_id,
+                UtcMillis::now().0
+            )),
+            "model.retry.runtime",
+            payload,
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.clone(),
+            session_id: Some(session_id.clone()),
+            task_id: task_id.cloned(),
+            ..EventContext::default()
+        }),
+    );
 }
 
 pub fn publish_session_turn_item_stream_event(
@@ -1392,7 +1433,8 @@ mod tests {
     use super::*;
     use magi_bridge_client::{
         BridgeBindingKind, BridgeDispatchAction, BridgeDispatchRuntime, BridgeResponse,
-        ChatToolFunction, McpBridgeClient, McpToolCallRequest,
+        ChatToolFunction, McpBridgeClient, McpToolCallRequest, ModelRetryRuntimeEvent,
+        ModelRetryRuntimePhase,
     };
     use magi_core::{ApprovalRequirement, MissionId, RiskLevel, ThreadId};
     use magi_governance::GovernanceService;
@@ -1416,6 +1458,42 @@ mod tests {
         active: AtomicUsize,
         max_active: AtomicUsize,
         delay: Duration,
+    }
+
+    #[test]
+    fn model_retry_runtime_event_is_session_scoped() {
+        let event_bus = InMemoryEventBus::new(8);
+        let session_id = SessionId::new("session-model-retry-runtime");
+        let workspace_id = Some(WorkspaceId::new("workspace-model-retry-runtime"));
+
+        publish_model_retry_runtime_event(
+            &event_bus,
+            &session_id,
+            &workspace_id,
+            "assistant-message-retry",
+            Some(&TaskId::new("task-model-retry-runtime")),
+            &ModelRetryRuntimeEvent {
+                phase: ModelRetryRuntimePhase::Scheduled,
+                attempt: 2,
+                max_attempts: 5,
+                delay_ms: Some(15_000),
+            },
+        );
+
+        let snapshot = event_bus.snapshot();
+        let event = snapshot.recent_events.last().expect("retry event");
+        assert_eq!(event.event_type, "model.retry.runtime");
+        assert_eq!(event.session_id.as_ref(), Some(&session_id));
+        assert_eq!(event.workspace_id.as_ref(), workspace_id.as_ref());
+        assert_eq!(
+            event.task_id.as_ref().map(TaskId::as_str),
+            Some("task-model-retry-runtime")
+        );
+        assert_eq!(event.payload["message_id"], "assistant-message-retry");
+        assert_eq!(event.payload["phase"], "scheduled");
+        assert_eq!(event.payload["attempt"], 2);
+        assert_eq!(event.payload["max_attempts"], 5);
+        assert_eq!(event.payload["delay_ms"], 15_000);
     }
 
     #[test]

@@ -39,7 +39,10 @@ pub use local_process_protocol::{
     BridgeServerShellProfile, BridgeServerWorkspaceContext, LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD,
     LOCAL_BRIDGE_HANDSHAKE_METHOD, LOCAL_BRIDGE_HEALTH_METHOD, LOCAL_BRIDGE_PROTOCOL_VERSION,
 };
-pub use mcp_client::{McpServerConfig, McpToolInfo, StdioMcpBridgeClient};
+pub use mcp_client::{
+    HttpMcpServerConfig, McpServerClient, McpServerConfig, McpServerConnectionConfig, McpToolInfo,
+    StdioMcpBridgeClient, StreamableHttpMcpBridgeClient,
+};
 pub use mcp_loopback::{run_mcp_bridge_loopback_server, run_mcp_manager_server};
 pub use model_loopback::run_model_bridge_loopback_server;
 pub use transport::{JsonRpcStdioTransport, JsonRpcStdioTransportConfig};
@@ -54,5 +57,6 @@ pub use types::{
     McpManagerListServersResponse, McpManagerServerHealthUpdateRequest,
     McpManagerServerLifecycleState, McpManagerServerOperationResponse,
     McpManagerServerRegistrationRequest, McpManagerServerSelectionRequest, McpToolCallRequest,
-    ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta,
+    ModelBridgeClient, ModelInvocationRequest, ModelRetryRuntimeEvent, ModelRetryRuntimePhase,
+    ModelStreamingDelta,
 };

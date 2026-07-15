@@ -10,6 +10,7 @@ import {
   type AgentSettingsBootstrapSnapshot,
   addAgentMcpServer,
   addAgentRepository,
+  connectAgentMcpServer,
   deleteAgentMcpServer,
   deleteAgentRepository,
   fetchAgentModelList,
@@ -58,6 +59,7 @@ import {
   resolveModelListFetchBlockReason,
 } from "../shared/model-governance";
 import { normalizeToolRuntimeStatus } from "../shared/tool-catalog";
+import { normalizeMcpServerDraft } from "../shared/mcp-config";
 
 export type UrlMode = "standard" | "full";
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
@@ -112,10 +114,13 @@ export interface SafeguardRule {
 export interface MCPServer {
   id: string;
   name: string;
-  type: "stdio";
+  type: "stdio" | "streamable-http";
   command?: string;
   args?: string[];
   env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  requestTimeoutMs?: number;
   enabled: boolean;
   connected?: boolean;
   health?: "connected" | "degraded" | "disconnected" | "disabled";
@@ -627,6 +632,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   >({});
   let currentEditingMCPServer = $state<MCPServer | null>(null);
   let mcpRefreshingServers = $state<Set<string>>(new Set()); // 正在刷新工具的服务器 ID
+  let mcpConnectingServers = $state<Set<string>>(new Set());
 
   // Skills 完整结构（内置工具已迁移到 ToolManager，不再通过 Skills 配置）
   let skills = $state<SkillItem[]>([]);
@@ -1703,10 +1709,20 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (server) {
       // 编辑模式：从实际数据序列化，去掉内部状态字段
       const cfg: Record<string, any> = {};
-      if (server.command) cfg.command = server.command;
-      if (server.args && server.args.length > 0) cfg.args = server.args;
-      if (server.env && Object.keys(server.env).length > 0)
-        cfg.env = server.env;
+      if (server.type === "streamable-http") {
+        cfg.type = "streamable-http";
+        if (server.url) cfg.url = server.url;
+        if (server.headers && Object.keys(server.headers).length > 0) {
+          cfg.headers = server.headers;
+        }
+      } else {
+        cfg.command = server.command || "";
+        if (server.args && server.args.length > 0) cfg.args = server.args;
+        if (server.env && Object.keys(server.env).length > 0) {
+          cfg.env = server.env;
+        }
+      }
+      if (server.requestTimeoutMs) cfg.requestTimeoutMs = server.requestTimeoutMs;
       defaultJSON = JSON.stringify(
         { mcpServers: { [server.name]: cfg } },
         null,
@@ -1790,34 +1806,22 @@ function createSettingsStore(props: { onClose?: () => void }) {
         return false;
       }
 
-      const command = String(cfg.command || "").trim();
-
-      if (!command) {
-        mcpDialogError = i18n.t("settings.mcp.missingCommand", { name });
+      const normalized = normalizeMcpServerDraft(name, cfg);
+      if (!normalized.ok) {
+        const errorKeys = {
+          unsupportedType: "settings.mcp.unsupportedType",
+          missingCommand: "settings.mcp.missingCommand",
+          argsMustBeArray: "settings.mcp.argsMustBeArray",
+          envMustBeObject: "settings.mcp.envMustBeObject",
+          missingUrl: "settings.mcp.missingUrl",
+          invalidUrl: "settings.mcp.invalidUrl",
+          headersMustBeObject: "settings.mcp.headersMustBeObject",
+        } as const;
+        mcpDialogError = i18n.t(errorKeys[normalized.error], { name });
         return false;
       }
 
-      const args = cfg.args ?? [];
-      if (!Array.isArray(args)) {
-        mcpDialogError = i18n.t("settings.mcp.argsMustBeArray", { name });
-        return false;
-      }
-
-      const env = cfg.env ?? {};
-      if (typeof env !== "object" || Array.isArray(env)) {
-        mcpDialogError = i18n.t("settings.mcp.envMustBeObject", { name });
-        return false;
-      }
-
-      const serverData: any = {
-        id: name,
-        name,
-        command,
-        args,
-        env,
-        enabled: cfg.enabled !== false,
-        type: "stdio",
-      };
+      const serverData = normalized.server;
 
       if (isUpdate && currentEditingMCPServer) {
         await updateAgentMcpServer(currentEditingMCPServer.id, {
@@ -2482,10 +2486,19 @@ function createSettingsStore(props: { onClose?: () => void }) {
       return {
         id,
         name,
-        type: "stdio",
+        type: s.type === "streamable-http" || s.type === "http"
+          ? "streamable-http"
+          : "stdio",
         command: s.command || "",
         args: s.args || [],
         env: s.env || {},
+        url: typeof s.url === "string" ? s.url : "",
+        headers: s.headers && typeof s.headers === "object" && !Array.isArray(s.headers)
+          ? s.headers
+          : {},
+        requestTimeoutMs: Number.isFinite(s.requestTimeoutMs)
+          ? Number(s.requestTimeoutMs)
+          : undefined,
         enabled,
         connected: enabled && s.connected === true,
         health,
@@ -2508,6 +2521,52 @@ function createSettingsStore(props: { onClose?: () => void }) {
           : undefined,
       };
     });
+    void connectEnabledMcpServers();
+  }
+
+  async function connectEnabledMcpServers(): Promise<void> {
+    const targets = mcpServers.filter((server) =>
+      server.enabled !== false
+      && server.connected !== true
+      && !mcpConnectingServers.has(server.id)
+    );
+    if (targets.length === 0) return;
+
+    mcpConnectingServers = new Set([
+      ...mcpConnectingServers,
+      ...targets.map((server) => server.id),
+    ]);
+    await Promise.all(targets.map(async (server) => {
+      try {
+        const result = await connectAgentMcpServer(server.id);
+        const connected = result.connected === true;
+        mcpServers = mcpServers.map((current) => current.id === server.id
+          ? {
+              ...current,
+              connected,
+              health: connected ? "connected" : "disconnected",
+              error: connected ? undefined : "connection_issue",
+              toolCount: Number.isFinite(result.toolCount)
+                ? Number(result.toolCount)
+                : current.toolCount,
+            }
+          : current);
+      } catch (error) {
+        console.error(`[SettingsPanel] 自动连接 MCP 服务器 ${server.id} 失败:`, error);
+        mcpServers = mcpServers.map((current) => current.id === server.id
+          ? {
+              ...current,
+              connected: false,
+              health: "disconnected",
+              error: "connection_issue",
+            }
+          : current);
+      } finally {
+        const next = new Set(mcpConnectingServers);
+        next.delete(server.id);
+        mcpConnectingServers = next;
+      }
+    }));
   }
 
   function applyBuiltinToolsPayload(toolsPayload: unknown): void {

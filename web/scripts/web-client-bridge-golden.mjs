@@ -526,6 +526,27 @@ function acceptedEnvelope() {
   };
 }
 
+function modelRetryRuntimeEnvelope(phase, sequence = 3) {
+  return {
+    event_id: `event-model-retry-runtime-${phase}`,
+    event_type: 'model.retry.runtime',
+    category: 'domain',
+    occurred_at: ACCEPTED_AT + sequence,
+    sequence,
+    workspace_id: WORKSPACE_ID,
+    session_id: SESSION_ID,
+    payload: {
+      session_id: SESSION_ID,
+      workspace_id: WORKSPACE_ID,
+      message_id: 'assistant-bridge-retry-runtime',
+      phase,
+      attempt: 1,
+      max_attempts: 5,
+      ...(phase === 'scheduled' ? { delay_ms: 10000 } : {}),
+    },
+  };
+}
+
 function completedEnvelope() {
   const canonicalTurn = completedCanonicalTurn();
   const canonicalItem = completedCanonicalAssistantItem();
@@ -668,6 +689,25 @@ await withGoldenViteServer(async (server) => {
   await waitFor(
     () => messagesStore.messagesState.currentSessionId === SESSION_ID,
     'workspace-only page must adopt live accepted session',
+  );
+
+  recoveredStream.onmessage?.({ data: JSON.stringify(modelRetryRuntimeEnvelope('scheduled')) });
+  assert.equal(
+    messagesStore.retryRuntimeState.byMessageId.get('assistant-bridge-retry-runtime')?.phase,
+    'scheduled',
+    '当前会话的模型重连事件必须进入消息运行态存储',
+  );
+  recoveredStream.onmessage?.({ data: JSON.stringify(modelRetryRuntimeEnvelope('attempt_started', 4)) });
+  assert.equal(
+    messagesStore.retryRuntimeState.byMessageId.get('assistant-bridge-retry-runtime')?.phase,
+    'attempt_started',
+    '重连开始事件必须更新同一条消息的运行态',
+  );
+  recoveredStream.onmessage?.({ data: JSON.stringify(modelRetryRuntimeEnvelope('settled', 5)) });
+  assert.equal(
+    messagesStore.retryRuntimeState.byMessageId.has('assistant-bridge-retry-runtime'),
+    false,
+    '重连结束事件必须清理消息运行态，不能留下永久动画',
   );
 
   const artifact = findArtifactByTurnItemId(

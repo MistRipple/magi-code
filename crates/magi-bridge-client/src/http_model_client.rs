@@ -9,7 +9,7 @@ use crate::protocol::{
 };
 use crate::types::{
     BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelBridgeClient, ModelInvocationRequest,
-    ModelStreamingDelta,
+    ModelRetryRuntimeEvent, ModelRetryRuntimePhase, ModelStreamingDelta,
 };
 use magi_usage_authority::ReasoningEffort;
 use serde::Deserialize;
@@ -19,14 +19,15 @@ use std::env;
 use std::io::Read as IoRead;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 const OPENAI_BASE_URL_ENV: &str = "MAGI_OPENAI_COMPAT_BASE_URL";
 const OPENAI_API_KEY_ENV: &str = "MAGI_OPENAI_COMPAT_API_KEY";
 const OPENAI_MODEL_ENV: &str = "MAGI_OPENAI_COMPAT_MODEL";
 const MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 16;
-const MODEL_PROVIDER_MAX_RETRIES: usize = 2;
-const MODEL_PROVIDER_BACKOFF_BASE_MS: u64 = 200;
+const MODEL_PROVIDER_MAX_RETRIES: usize = 5;
+const MODEL_PROVIDER_RETRY_DELAYS_SECONDS: [u64; MODEL_PROVIDER_MAX_RETRIES] = [10, 15, 30, 45, 60];
+const MODEL_PROVIDER_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpModelBridgeProtocol {
@@ -204,6 +205,42 @@ impl HttpModelBridgeClient {
             model = self.model.trim(),
         )
     }
+
+    fn invoke_streaming_observed(
+        &self,
+        request: ModelInvocationRequest,
+        on_delta: &dyn Fn(&ModelStreamingDelta),
+        on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+    ) -> Result<BridgeResponse, BridgeClientError> {
+        if request.prompt.trim().is_empty() && request.messages.is_none() {
+            return Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                code: Some(-32002),
+                message: "empty prompt".to_string(),
+            });
+        }
+
+        let http_request = self.build_http_request(&request, true)?;
+
+        let (status, response_body, _retry_after) = execute_streaming_http_post_with_retries(
+            self.provider_request_key(),
+            http_request.url,
+            http_request.body,
+            http_request.headers,
+            self.provider_family(),
+            on_delta,
+            on_retry,
+        )?;
+
+        if !(200..300).contains(&status) {
+            return Err(provider_http_status_error(status, &response_body));
+        }
+
+        Ok(BridgeResponse {
+            ok: true,
+            payload: response_body,
+        })
+    }
 }
 
 impl HttpModelBridgeProtocol {
@@ -286,15 +323,29 @@ fn normalize_provider_base_url(base_url: &str) -> String {
     base_url.trim().trim_end_matches('/').to_string()
 }
 
-fn retry_delay(attempt: usize, provider_key: &str) -> Duration {
-    let exponent = attempt.saturating_sub(1).min(4) as u32;
-    let base = MODEL_PROVIDER_BACKOFF_BASE_MS.saturating_mul(2_u64.saturating_pow(exponent));
-    let jitter_window = (base / 10).max(1);
-    let jitter_seed = provider_key.bytes().fold(attempt as u64, |acc, byte| {
-        acc.wrapping_mul(31).wrapping_add(byte as u64)
-    });
-    let jitter = jitter_seed % (jitter_window + 1);
-    Duration::from_millis(base + jitter)
+fn retry_delay(attempt: usize, _provider_key: &str) -> Duration {
+    let index = attempt
+        .saturating_sub(1)
+        .min(MODEL_PROVIDER_RETRY_DELAYS_SECONDS.len().saturating_sub(1));
+    Duration::from_secs(MODEL_PROVIDER_RETRY_DELAYS_SECONDS[index])
+}
+
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let delay = value
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .or_else(|| {
+            httpdate::parse_http_date(value)
+                .ok()?
+                .duration_since(now)
+                .ok()
+        })?;
+    Some(delay.min(MODEL_PROVIDER_MAX_RETRY_DELAY))
 }
 
 fn retryable_http_status(status: u16) -> bool {
@@ -312,7 +363,14 @@ fn retryable_bridge_error(error: &BridgeClientError) -> bool {
 }
 
 fn sleep_before_retry(provider_key: &str, retry_attempt: usize) {
-    std::thread::sleep(retry_delay(retry_attempt, provider_key));
+    sleep_retry_delay(retry_delay(retry_attempt, provider_key));
+}
+
+fn sleep_retry_delay(delay: Duration) {
+    #[cfg(not(test))]
+    std::thread::sleep(delay);
+    #[cfg(test)]
+    let _ = delay;
 }
 
 /// Execute a blocking HTTP POST on a dedicated thread so we never conflict
@@ -326,7 +384,7 @@ fn execute_http_post(
     url: String,
     body: serde_json::Value,
     headers: Vec<(String, String)>,
-) -> Result<(u16, String), BridgeClientError> {
+) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
     std::thread::spawn(move || {
         let _permit = model_provider_gate().acquire(&provider_key);
         let client = reqwest::blocking::Client::builder()
@@ -358,6 +416,11 @@ fn execute_http_post(
             })?;
 
         let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_retry_after(value, SystemTime::now()));
         let response_body = response
             .text()
             .map_err(|error| BridgeClientError::CallFailed {
@@ -366,7 +429,7 @@ fn execute_http_post(
                 message: format!("reading response body failed: {error}"),
             })?;
 
-        Ok((status, response_body))
+        Ok((status, response_body, retry_after))
     })
     .join()
     .map_err(|_| BridgeClientError::CallFailed {
@@ -381,7 +444,7 @@ fn execute_http_post_with_retries(
     url: String,
     body: serde_json::Value,
     headers: Vec<(String, String)>,
-) -> Result<(u16, String), BridgeClientError> {
+) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
     let mut retries = 0usize;
     loop {
         let result = execute_http_post(
@@ -391,11 +454,13 @@ fn execute_http_post_with_retries(
             headers.clone(),
         );
         match result {
-            Ok((status, _response_body))
+            Ok((status, _response_body, retry_after))
                 if retryable_http_status(status) && retries < MODEL_PROVIDER_MAX_RETRIES =>
             {
                 retries += 1;
-                sleep_before_retry(&provider_key, retries);
+                sleep_retry_delay(
+                    retry_after.unwrap_or_else(|| retry_delay(retries, &provider_key)),
+                );
                 continue;
             }
             Err(error)
@@ -415,7 +480,7 @@ enum StreamMessage {
     /// LLM 增量快照——携带已累积的正文与上游 thinking。
     Chunk(ModelStreamingDelta),
     /// HTTP I/O 结束——携带最终结果。
-    Done(Result<(u16, String), BridgeClientError>),
+    Done(Result<(u16, String, Option<Duration>), BridgeClientError>),
 }
 
 fn provider_stream_event_error(
@@ -515,7 +580,7 @@ fn execute_streaming_http_post(
     headers: Vec<(String, String)>,
     provider_family: ProviderFamily,
     on_chunk: &dyn Fn(&ModelStreamingDelta),
-) -> Result<(u16, String), BridgeClientError> {
+) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
     let (tx, rx) = std::sync::mpsc::channel::<StreamMessage>();
 
     std::thread::spawn(move || {
@@ -552,7 +617,8 @@ fn execute_streaming_http_post_with_retries(
     headers: Vec<(String, String)>,
     provider_family: ProviderFamily,
     on_chunk: &dyn Fn(&ModelStreamingDelta),
-) -> Result<(u16, String), BridgeClientError> {
+    on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
     let mut retries = 0usize;
     loop {
         let emitted_delta = AtomicBool::new(false);
@@ -573,17 +639,55 @@ fn execute_streaming_http_post_with_retries(
         let can_retry =
             !emitted_delta.load(Ordering::SeqCst) && retries < MODEL_PROVIDER_MAX_RETRIES;
         match result {
-            Ok((status, _response_body)) if can_retry && retryable_http_status(status) => {
+            Ok((status, _response_body, retry_after))
+                if can_retry && retryable_http_status(status) =>
+            {
                 retries += 1;
-                sleep_before_retry(&provider_key, retries);
+                let delay = retry_after.unwrap_or_else(|| retry_delay(retries, &provider_key));
+                on_retry(&ModelRetryRuntimeEvent {
+                    phase: ModelRetryRuntimePhase::Scheduled,
+                    attempt: retries,
+                    max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+                    delay_ms: Some(delay.as_millis() as u64),
+                });
+                sleep_retry_delay(delay);
+                on_retry(&ModelRetryRuntimeEvent {
+                    phase: ModelRetryRuntimePhase::AttemptStarted,
+                    attempt: retries,
+                    max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+                    delay_ms: None,
+                });
                 continue;
             }
             Err(error) if can_retry && retryable_bridge_error(&error) => {
                 retries += 1;
+                let delay = retry_delay(retries, &provider_key);
+                on_retry(&ModelRetryRuntimeEvent {
+                    phase: ModelRetryRuntimePhase::Scheduled,
+                    attempt: retries,
+                    max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+                    delay_ms: Some(delay.as_millis() as u64),
+                });
                 sleep_before_retry(&provider_key, retries);
+                on_retry(&ModelRetryRuntimeEvent {
+                    phase: ModelRetryRuntimePhase::AttemptStarted,
+                    attempt: retries,
+                    max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+                    delay_ms: None,
+                });
                 continue;
             }
-            other => return other,
+            other => {
+                if retries > 0 {
+                    on_retry(&ModelRetryRuntimeEvent {
+                        phase: ModelRetryRuntimePhase::Settled,
+                        attempt: retries,
+                        max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+                        delay_ms: None,
+                    });
+                }
+                return other;
+            }
         }
     }
 }
@@ -595,7 +699,7 @@ fn streaming_http_io(
     headers: Vec<(String, String)>,
     provider_family: ProviderFamily,
     tx: &std::sync::mpsc::Sender<StreamMessage>,
-) -> Result<(u16, String), BridgeClientError> {
+) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         // 流式场景下 timeout 用于检测 LLM 长时间无输出（卡死），
@@ -627,6 +731,11 @@ fn streaming_http_io(
         })?;
 
     let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_retry_after(value, SystemTime::now()));
 
     // 非 2xx 状态码时直接读取完整响应体
     if !(200..300).contains(&status) {
@@ -637,7 +746,7 @@ fn streaming_http_io(
                 code: Some(-32005),
                 message: format!("reading error response body failed: {error}"),
             })?;
-        return Ok((status, response_body));
+        return Ok((status, response_body, retry_after));
     }
 
     // 流式读取 SSE 事件
@@ -745,7 +854,7 @@ fn streaming_http_io(
     }
     let payload = adapted_response_to_bridge_payload(&adapted);
 
-    Ok((status, payload))
+    Ok((status, payload, retry_after))
 }
 
 impl ModelBridgeClient for HttpModelBridgeClient {
@@ -760,7 +869,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
 
         let http_request = self.build_http_request(&request, false)?;
 
-        let (status, response_body) = execute_http_post_with_retries(
+        let (status, response_body, _retry_after) = execute_http_post_with_retries(
             self.provider_request_key(),
             http_request.url,
             http_request.body,
@@ -781,35 +890,16 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         request: ModelInvocationRequest,
         on_delta: &dyn Fn(&ModelStreamingDelta),
     ) -> Result<BridgeResponse, BridgeClientError> {
-        if request.prompt.trim().is_empty() && request.messages.is_none() {
-            return Err(BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::RemoteBusiness,
-                code: Some(-32002),
-                message: "empty prompt".to_string(),
-            });
-        }
+        self.invoke_streaming_observed(request, on_delta, &|_| {})
+    }
 
-        let http_request = self.build_http_request(&request, true)?;
-
-        let (status, response_body) = execute_streaming_http_post_with_retries(
-            self.provider_request_key(),
-            http_request.url,
-            http_request.body,
-            http_request.headers,
-            self.provider_family(),
-            on_delta,
-        )?;
-
-        if !(200..300).contains(&status) {
-            return Err(provider_http_status_error(status, &response_body));
-        }
-
-        // 流式路径的 response_body 已经是 BridgeResponse payload 格式，
-        // 由 adapted_response_to_bridge_payload 直接生成，无需再反序列化。
-        Ok(BridgeResponse {
-            ok: true,
-            payload: response_body,
-        })
+    fn invoke_streaming_with_retry_events(
+        &self,
+        request: ModelInvocationRequest,
+        on_delta: &dyn Fn(&ModelStreamingDelta),
+        on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+    ) -> Result<BridgeResponse, BridgeClientError> {
+        self.invoke_streaming_observed(request, on_delta, on_retry)
     }
 }
 
@@ -2887,6 +2977,111 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("mock server should receive reconnect attempts");
         }
+    }
+
+    #[test]
+    fn model_retry_policy_uses_fixed_five_step_backoff() {
+        assert_eq!(MODEL_PROVIDER_MAX_RETRIES, 5);
+        assert_eq!(retry_delay(1, "provider"), Duration::from_secs(10));
+        assert_eq!(retry_delay(2, "provider"), Duration::from_secs(15));
+        assert_eq!(retry_delay(3, "provider"), Duration::from_secs(30));
+        assert_eq!(retry_delay(4, "provider"), Duration::from_secs(45));
+        assert_eq!(retry_delay(5, "provider"), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn streaming_retry_reports_runtime_lifecycle() {
+        let server = spawn_mock_server_sequence(vec![
+            MockHttpResponse {
+                status: 503,
+                content_type: "application/json".to_string(),
+                response_text: serde_json::json!({
+                    "error": {
+                        "message": "provider warming up",
+                        "type": "server_error"
+                    }
+                })
+                .to_string(),
+            },
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n",
+                    "data: [DONE]\n\n",
+                )
+                .to_string(),
+            },
+        ]);
+        let client = HttpModelBridgeClient::new(
+            server.address,
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+        let events = std::cell::RefCell::new(Vec::new());
+
+        client
+            .invoke_streaming_with_retry_events(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|_| {},
+                &|event| events.borrow_mut().push(event.clone()),
+            )
+            .expect("retry should recover");
+
+        assert_eq!(
+            events.into_inner(),
+            vec![
+                ModelRetryRuntimeEvent {
+                    phase: ModelRetryRuntimePhase::Scheduled,
+                    attempt: 1,
+                    max_attempts: 5,
+                    delay_ms: Some(10_000),
+                },
+                ModelRetryRuntimeEvent {
+                    phase: ModelRetryRuntimePhase::AttemptStarted,
+                    attempt: 1,
+                    max_attempts: 5,
+                    delay_ms: None,
+                },
+                ModelRetryRuntimeEvent {
+                    phase: ModelRetryRuntimePhase::Settled,
+                    attempt: 1,
+                    max_attempts: 5,
+                    delay_ms: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn retry_policy_rejects_permanent_provider_failures() {
+        assert!(!retryable_http_status(400));
+        assert!(!retryable_http_status(401));
+        assert!(!retryable_http_status(403));
+        assert!(!retryable_http_status(404));
+        assert!(retryable_http_status(408));
+        assert!(retryable_http_status(429));
+        assert!(retryable_http_status(500));
+        assert!(retryable_http_status(529));
+    }
+
+    #[test]
+    fn retry_after_supports_seconds_http_dates_and_sixty_second_cap() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert_eq!(parse_retry_after("12", now), Some(Duration::from_secs(12)));
+        assert_eq!(parse_retry_after("120", now), Some(Duration::from_secs(60)));
+        let http_date = httpdate::fmt_http_date(now + Duration::from_secs(30));
+        assert_eq!(
+            parse_retry_after(&http_date, now),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(parse_retry_after("invalid", now), None);
     }
 
     #[test]

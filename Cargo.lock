@@ -2369,6 +2369,7 @@ name = "magi-bridge-client"
 version = "3.0.1"
 dependencies = [
  "base64 0.22.1",
+ "httpdate",
  "magi-permissions",
  "magi-process",
  "magi-usage-authority",

@@ -18,8 +18,8 @@ use crate::routes::settings::{
 use crate::scope_binding::strip_scope_binding_fields;
 use crate::skill_loader;
 use magi_bridge_client::{
-    BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, ModelBridgeClient,
-    StdioMcpBridgeClient,
+    BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerClient,
+    ModelBridgeClient,
 };
 use magi_conversation_runtime::{
     ConversationRegistry,
@@ -613,7 +613,7 @@ pub struct ApiState {
     task_store: Option<Arc<TaskStore>>,
     runner_manager: Option<RunnerManager>,
     session_turn_dispatcher: Option<Arc<LlmTaskDispatcher>>,
-    mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+    mcp_connections: Arc<RwLock<HashMap<String, Arc<McpServerClient>>>>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
     model_bridge_client_is_real: bool,
     tool_registry: Option<ToolRegistry>,
@@ -1756,7 +1756,7 @@ impl ApiState {
 
     pub fn with_mcp_connections(
         mut self,
-        mcp_connections: Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>>,
+        mcp_connections: Arc<RwLock<HashMap<String, Arc<McpServerClient>>>>,
     ) -> Self {
         self.mcp_connections = mcp_connections;
         self
@@ -1766,7 +1766,7 @@ impl ApiState {
         self.runner_manager.as_ref()
     }
 
-    pub fn mcp_connections(&self) -> &Arc<RwLock<HashMap<String, Arc<StdioMcpBridgeClient>>>> {
+    pub fn mcp_connections(&self) -> &Arc<RwLock<HashMap<String, Arc<McpServerClient>>>> {
         &self.mcp_connections
     }
 

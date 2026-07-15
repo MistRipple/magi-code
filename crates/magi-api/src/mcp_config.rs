@@ -1,9 +1,11 @@
 use crate::{errors::ApiError, scope_binding::strip_scope_binding_fields_from_map};
-use magi_bridge_client::McpServerConfig;
+use magi_bridge_client::{HttpMcpServerConfig, McpServerConfig, McpServerConnectionConfig};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 pub(crate) const REDACTED_MCP_ENV_VALUE: &str = "********";
+const MCP_TRANSPORT_STDIO: &str = "stdio";
+const MCP_TRANSPORT_STREAMABLE_HTTP: &str = "streamable-http";
 
 pub fn mcp_server_entry_id(entry: &Value) -> Option<&str> {
     entry
@@ -40,21 +42,23 @@ pub fn normalize_mcp_server_snapshot_entry(entry: &Value) -> Option<Value> {
         object.insert("name".to_string(), serde_json::json!(server_id));
     }
 
-    if let Some(command) = object
-        .get("command")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-    {
-        object.insert("command".to_string(), serde_json::json!(command));
-    } else {
-        object.remove("command");
+    let transport = canonical_mcp_transport(&object);
+    object.insert("type".to_string(), serde_json::json!(transport));
+    match transport {
+        MCP_TRANSPORT_STREAMABLE_HTTP => {
+            normalize_trimmed_string_field(&mut object, "url");
+            normalize_string_map_field(&mut object, "headers");
+            object.remove("command");
+            object.remove("args");
+            object.remove("workingDirectory");
+            object.remove("env");
+        }
+        _ => {
+            normalize_trimmed_string_field(&mut object, "command");
+            object.remove("url");
+            object.remove("headers");
+        }
     }
-
-    object.insert("type".to_string(), serde_json::json!("stdio"));
-    object.remove("url");
-    object.remove("headers");
     strip_scope_binding_fields_from_map(&mut object);
     Some(Value::Object(object))
 }
@@ -65,48 +69,56 @@ pub(crate) fn normalize_mcp_server_request_entry(request: &Value) -> Result<Valu
             "MCP server 配置必须作为顶层对象提交，不能包裹在 server/updates 中".to_string(),
         ));
     }
+    validate_requested_transport(request)?;
     let normalized = normalize_mcp_server_snapshot_entry(request)
         .ok_or_else(|| ApiError::InvalidInput("serverId 不能为空".to_string()))?;
-    let command = normalized
-        .get("command")
+    let transport = normalized
+        .get("type")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("MCP server 配置中缺少 command".to_string()))?;
-
-    let mut object = normalized.as_object().cloned().unwrap_or_default();
-    object.insert("command".to_string(), serde_json::json!(command));
-    Ok(Value::Object(object))
+        .unwrap_or(MCP_TRANSPORT_STDIO);
+    match transport {
+        MCP_TRANSPORT_STREAMABLE_HTTP => {
+            let url = normalized
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::InvalidInput("HTTP MCP server 配置中缺少 url".to_string())
+                })?;
+            let parsed = reqwest::Url::parse(url)
+                .map_err(|_| ApiError::InvalidInput("HTTP MCP server 的 url 无效".to_string()))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(ApiError::InvalidInput(
+                    "HTTP MCP server 的 url 仅支持 http 或 https".to_string(),
+                ));
+            }
+        }
+        _ => {
+            normalized
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::InvalidInput("MCP server 配置中缺少 command".to_string())
+                })?;
+        }
+    }
+    Ok(normalized)
 }
 
 pub(crate) fn redact_mcp_server_public_entry(entry: Value) -> Value {
     let mut entry = entry;
-    if let Some(env) = entry.get_mut("env").and_then(Value::as_object_mut) {
-        for value in env.values_mut() {
-            if value.as_str().is_some() {
-                *value = serde_json::json!(REDACTED_MCP_ENV_VALUE);
-            }
-        }
+    for field in ["env", "headers"] {
+        redact_string_map_values(&mut entry, field);
     }
     entry
 }
 
-pub(crate) fn preserve_redacted_mcp_env_values(entry: &mut Value, existing: Option<&Value>) {
-    let Some(existing_env) = existing
-        .and_then(|value| value.get("env"))
-        .and_then(Value::as_object)
-    else {
-        return;
-    };
-    let Some(next_env) = entry.get_mut("env").and_then(Value::as_object_mut) else {
-        return;
-    };
-    for (key, value) in next_env.iter_mut() {
-        if value.as_str() == Some(REDACTED_MCP_ENV_VALUE)
-            && let Some(existing_value) = existing_env.get(key).and_then(Value::as_str)
-        {
-            *value = serde_json::json!(existing_value);
-        }
+pub(crate) fn preserve_redacted_mcp_secret_values(entry: &mut Value, existing: Option<&Value>) {
+    for field in ["env", "headers"] {
+        preserve_redacted_string_map_values(entry, existing, field);
     }
 }
 
@@ -117,9 +129,30 @@ pub fn mcp_server_entry_enabled(entry: &Value) -> bool {
         .unwrap_or(true)
 }
 
-pub fn build_mcp_config_from_entry(entry: &Value) -> Option<McpServerConfig> {
+pub fn build_mcp_config_from_entry(entry: &Value) -> Option<McpServerConnectionConfig> {
     let normalized = normalize_mcp_server_snapshot_entry(entry)?;
     let object = normalized.as_object()?;
+    let request_timeout = Duration::from_millis(
+        object
+            .get("requestTimeoutMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(30_000)
+            .clamp(1_000, 300_000),
+    );
+    if object.get("type").and_then(Value::as_str) == Some(MCP_TRANSPORT_STREAMABLE_HTTP) {
+        let url = object.get("url")?.as_str()?.trim().to_string();
+        if url.is_empty() {
+            return None;
+        }
+        let headers = string_map_from_object(object.get("headers"));
+        return Some(McpServerConnectionConfig::StreamableHttp(
+            HttpMcpServerConfig {
+                url,
+                headers,
+                request_timeout,
+            },
+        ));
+    }
     let command = object.get("command")?.as_str()?.trim().to_string();
     if command.is_empty() {
         return None;
@@ -148,21 +181,133 @@ pub fn build_mcp_config_from_entry(entry: &Value) -> Option<McpServerConfig> {
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
-    let request_timeout = Duration::from_millis(
-        object
-            .get("requestTimeoutMs")
-            .and_then(Value::as_u64)
-            .unwrap_or(30_000)
-            .clamp(1_000, 300_000),
-    );
-
-    Some(McpServerConfig {
+    Some(McpServerConnectionConfig::Stdio(McpServerConfig {
         command,
         args,
         working_directory,
         env,
         request_timeout,
-    })
+    }))
+}
+
+fn canonical_mcp_transport(object: &serde_json::Map<String, Value>) -> &'static str {
+    let requested = object
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        requested.as_str(),
+        "http" | "streamable-http" | "streamable_http"
+    ) || (requested.is_empty()
+        && object
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| !url.trim().is_empty()))
+    {
+        MCP_TRANSPORT_STREAMABLE_HTTP
+    } else {
+        MCP_TRANSPORT_STDIO
+    }
+}
+
+fn validate_requested_transport(request: &Value) -> Result<(), ApiError> {
+    let Some(object) = request.as_object() else {
+        return Ok(());
+    };
+    if let Some(requested) = object.get("type").and_then(Value::as_str) {
+        let requested = requested.trim().to_ascii_lowercase();
+        if !requested.is_empty()
+            && !matches!(
+                requested.as_str(),
+                "stdio" | "http" | "streamable-http" | "streamable_http"
+            )
+        {
+            return Err(ApiError::InvalidInput(format!(
+                "不支持的 MCP transport 类型: {requested}"
+            )));
+        }
+    }
+    if let Some(headers) = object.get("headers") {
+        let Some(headers) = headers.as_object() else {
+            return Err(ApiError::InvalidInput(
+                "HTTP MCP server 的 headers 必须是对象".to_string(),
+            ));
+        };
+        if headers.values().any(|value| !value.is_string()) {
+            return Err(ApiError::InvalidInput(
+                "HTTP MCP server 的 headers 值必须是字符串".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_trimmed_string_field(object: &mut serde_json::Map<String, Value>, field: &str) {
+    if let Some(value) = object
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    {
+        object.insert(field.to_string(), serde_json::json!(value));
+    } else {
+        object.remove(field);
+    }
+}
+
+fn normalize_string_map_field(object: &mut serde_json::Map<String, Value>, field: &str) {
+    let values = string_map_from_object(object.get(field));
+    if values.is_empty() {
+        object.remove(field);
+    } else {
+        object.insert(field.to_string(), serde_json::json!(values));
+    }
+}
+
+fn string_map_from_object(value: Option<&Value>) -> BTreeMap<String, String> {
+    value
+        .and_then(Value::as_object)
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn redact_string_map_values(entry: &mut Value, field: &str) {
+    if let Some(values) = entry.get_mut(field).and_then(Value::as_object_mut) {
+        for value in values.values_mut() {
+            if value.as_str().is_some() {
+                *value = serde_json::json!(REDACTED_MCP_ENV_VALUE);
+            }
+        }
+    }
+}
+
+fn preserve_redacted_string_map_values(entry: &mut Value, existing: Option<&Value>, field: &str) {
+    let Some(existing_values) = existing
+        .and_then(|value| value.get(field))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let Some(next_values) = entry.get_mut(field).and_then(Value::as_object_mut) else {
+        return;
+    };
+    for (key, value) in next_values.iter_mut() {
+        if value.as_str() == Some(REDACTED_MCP_ENV_VALUE)
+            && let Some(existing_value) = existing_values.get(key).and_then(Value::as_str)
+        {
+            *value = serde_json::json!(existing_value);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -170,12 +315,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_normalization_rejects_url_only_server() {
+    fn request_normalization_accepts_url_only_http_server() {
+        let entry = normalize_mcp_server_request_entry(&serde_json::json!({
+            "id": "remote-server",
+            "type": "http",
+            "url": " https://example.test/mcp ",
+            "headers": {
+                "Authorization": "Bearer test"
+            },
+            "command": "must-be-removed"
+        }))
+        .expect("HTTP MCP server should normalize");
+
+        assert_eq!(entry["type"], serde_json::json!("streamable-http"));
+        assert_eq!(entry["url"], serde_json::json!("https://example.test/mcp"));
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            serde_json::json!("Bearer test")
+        );
+        assert!(entry.get("command").is_none());
+    }
+
+    #[test]
+    fn request_normalization_rejects_invalid_http_url() {
         let error = normalize_mcp_server_request_entry(&serde_json::json!({
             "id": "remote-server",
-            "url": "https://example.test/mcp"
+            "type": "http",
+            "url": "file:///tmp/mcp"
         }))
-        .expect_err("当前运行时没有 HTTP MCP client，不应保存 URL-only 配置");
+        .expect_err("HTTP MCP should reject non-HTTP URL schemes");
+
+        match error {
+            ApiError::InvalidInput(message) => assert!(message.contains("http 或 https")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_normalization_keeps_stdio_command_required() {
+        let error = normalize_mcp_server_request_entry(&serde_json::json!({
+            "id": "stdio-server",
+            "type": "stdio"
+        }))
+        .expect_err("stdio MCP should continue requiring command");
 
         match error {
             ApiError::InvalidInput(message) => assert!(message.contains("缺少 command")),
@@ -188,9 +370,6 @@ mod tests {
         let entry = normalize_mcp_server_request_entry(&serde_json::json!({
             "id": "stdio-server",
             "command": " npx ",
-            "url": "https://example.test/mcp",
-            "headers": { "Authorization": "Bearer test" },
-            "type": "streamable-http",
             "workspaceId": "workspace-old",
             "workspacePath": "/tmp/old",
             "sessionId": "session-old"
@@ -229,10 +408,10 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_normalization_keeps_invalid_server_visible_with_canonical_id() {
+    fn snapshot_normalization_infers_http_transport_from_url() {
         let entry = normalize_mcp_server_snapshot_entry(&serde_json::json!({
             "serverId": " legacy ",
-            "url": "https://example.test/mcp",
+            "url": " https://example.test/mcp ",
             "workspace_id": "workspace-old",
             "workspace_path": "/tmp/old",
             "session_id": "session-old"
@@ -242,9 +421,9 @@ mod tests {
         assert_eq!(entry["id"], serde_json::json!("legacy"));
         assert_eq!(entry["serverId"], serde_json::json!("legacy"));
         assert_eq!(entry["name"], serde_json::json!("legacy"));
-        assert_eq!(entry["type"], serde_json::json!("stdio"));
+        assert_eq!(entry["type"], serde_json::json!("streamable-http"));
         assert!(entry.get("command").is_none());
-        assert!(entry.get("url").is_none());
+        assert_eq!(entry["url"], serde_json::json!("https://example.test/mcp"));
         assert!(entry.get("workspace_id").is_none());
         assert!(entry.get("workspace_path").is_none());
         assert!(entry.get("session_id").is_none());
@@ -281,6 +460,9 @@ mod tests {
         }))
         .expect("config should build");
 
+        let McpServerConnectionConfig::Stdio(config) = config else {
+            panic!("expected stdio MCP config");
+        };
         assert_eq!(config.command, "npx");
         assert_eq!(
             config.args,
@@ -292,6 +474,32 @@ mod tests {
         assert_eq!(config.working_directory, Some(PathBuf::from("/tmp")));
         assert_eq!(config.env.get("A").map(String::as_str), Some("1"));
         assert!(!config.env.contains_key("IGNORED"));
+        assert_eq!(config.request_timeout, Duration::from_millis(45_000));
+    }
+
+    #[test]
+    fn config_builder_builds_streamable_http_config() {
+        let config = build_mcp_config_from_entry(&serde_json::json!({
+            "id": "remote-server",
+            "type": "streamable-http",
+            "url": "https://example.test/mcp",
+            "headers": {
+                "Authorization": "Bearer test",
+                "IGNORED": 2
+            },
+            "requestTimeoutMs": 45_000
+        }))
+        .expect("HTTP config should build");
+
+        let McpServerConnectionConfig::StreamableHttp(config) = config else {
+            panic!("expected streamable HTTP MCP config");
+        };
+        assert_eq!(config.url, "https://example.test/mcp");
+        assert_eq!(
+            config.headers.get("Authorization").map(String::as_str),
+            Some("Bearer test")
+        );
+        assert!(!config.headers.contains_key("IGNORED"));
         assert_eq!(config.request_timeout, Duration::from_millis(45_000));
     }
 
@@ -313,6 +521,28 @@ mod tests {
     }
 
     #[test]
+    fn public_entry_redacts_http_header_values_but_keeps_keys() {
+        let public = redact_mcp_server_public_entry(serde_json::json!({
+            "id": "server",
+            "type": "streamable-http",
+            "url": "https://example.test/mcp",
+            "headers": {
+                "Authorization": "Bearer secret",
+                "X-API-Key": "secret-key"
+            }
+        }));
+
+        assert_eq!(
+            public["headers"]["Authorization"],
+            serde_json::json!(REDACTED_MCP_ENV_VALUE)
+        );
+        assert_eq!(
+            public["headers"]["X-API-Key"],
+            serde_json::json!(REDACTED_MCP_ENV_VALUE)
+        );
+    }
+
+    #[test]
     fn redacted_env_values_preserve_existing_secret_on_update() {
         let existing = serde_json::json!({
             "id": "server",
@@ -329,7 +559,7 @@ mod tests {
             }
         });
 
-        preserve_redacted_mcp_env_values(&mut next, Some(&existing));
+        preserve_redacted_mcp_secret_values(&mut next, Some(&existing));
 
         assert_eq!(next["env"]["TOKEN"], serde_json::json!("secret"));
         assert_eq!(next["env"]["OTHER"], serde_json::json!("new"));

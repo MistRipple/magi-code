@@ -1001,21 +1001,16 @@ async fn save_orchestrator_session_config(
         workspace_path,
         "保存会话主模型配置",
     )?;
-    let override_config = orchestrator_session_override_request(&request)?;
-    if override_config
-        .as_object()
-        .is_none_or(|config| config.is_empty())
-    {
+    let override_config = save_orchestrator_session_override_for_session(
+        &state,
+        &scope.session_id,
+        request.get("config").unwrap_or(&request),
+    )?
+    .unwrap_or_else(|| {
         state
             .settings_store
-            .remove_session_section(&scope.session_id, "orchestrator")
-            .map_err(settings_persistence_error)?;
-    } else {
-        state
-            .settings_store
-            .set_session_section(&scope.session_id, "orchestrator", override_config.clone())
-            .map_err(settings_persistence_error)?;
-    }
+            .get_session_section(&scope.session_id, "orchestrator")
+    });
 
     let mut effective_config = state.settings_store.get_section("orchestrator");
     strip_orchestrator_session_owned_fields(&mut effective_config);
@@ -3131,6 +3126,61 @@ mod tests {
         assert_eq!(
             response["effectiveOrchestratorConfig"]["model"],
             json!("session-main-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn save_orchestrator_session_config_merges_independent_model_fields() {
+        let state = test_state();
+        let _workspace = register_test_workspace(&state, "workspace-session-model-merge");
+        let session_id = SessionId::new("session-model-merge");
+        seed_session(
+            &state,
+            test_session_record(
+                &session_id,
+                "workspace-session-model-merge",
+                "会话模型字段独立保存",
+            ),
+        );
+        state
+            .settings_store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                json!({
+                    "model": "model-before",
+                    "reasoningEffort": "high"
+                }),
+            )
+            .unwrap();
+
+        let response = save_orchestrator_session_config(
+            State(state.clone()),
+            Json(json!({
+                "sessionId": session_id.as_str(),
+                "workspaceId": "workspace-session-model-merge",
+                "config": {
+                    "model": "model-after"
+                }
+            })),
+        )
+        .await
+        .expect("model-only session update should save")
+        .0;
+
+        let saved = state
+            .settings_store
+            .get_session_section(&session_id, "orchestrator");
+        assert_eq!(saved["model"], json!("model-after"));
+        assert_eq!(
+            saved["reasoningEffort"],
+            json!("high"),
+            "单独切换模型不得清空当前会话的推理强度"
+        );
+        assert_eq!(response["orchestratorSessionConfig"], saved);
+        assert_eq!(
+            response["effectiveOrchestratorConfig"]["reasoningEffort"],
+            json!("high")
         );
     }
 

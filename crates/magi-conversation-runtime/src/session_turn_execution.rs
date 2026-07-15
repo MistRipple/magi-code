@@ -24,9 +24,9 @@ use crate::{
         SessionStatePersistCallback, SessionTurnStreamPublishGate,
         append_session_tool_call_items_batch_with_context, append_session_turn_error_item,
         append_session_turn_item, persist_session_state_checkpoint,
-        publish_current_session_turn_item_event, publish_session_turn_item_event,
-        publish_session_turn_item_stream_event, session_turn_item, session_turn_stream_update,
-        upsert_session_turn_item,
+        publish_current_session_turn_item_event, publish_model_retry_runtime_event,
+        publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
+        session_turn_stream_update, upsert_session_turn_item,
     },
     tool_surface_state::{activate_skill_tool_definitions, refresh_live_mcp_tool_definitions},
     usage_recording::{
@@ -924,8 +924,18 @@ fn stream_session_turn_round(
         completed_required_tool_names,
     );
     let round_started_at = UtcMillis::now();
+    let on_retry = |retry_event: &magi_bridge_client::ModelRetryRuntimeEvent| {
+        publish_model_retry_runtime_event(
+            event_bus,
+            &request.session_id,
+            &request.workspace_id,
+            &stream_item_id,
+            None,
+            retry_event,
+        );
+    };
     let response = client
-        .invoke_streaming(
+        .invoke_streaming_with_retry_events(
             ModelInvocationRequest {
                 provider: BUSINESS_MODEL_PROVIDER.to_string(),
                 prompt: prompt.to_string(),
@@ -934,6 +944,7 @@ fn stream_session_turn_round(
                 tool_choice,
             },
             &on_delta,
+            &on_retry,
         )
         .map_err(|error| error.to_string())?;
     let parsed = response.parse_chat_payload();
@@ -1276,7 +1287,10 @@ fn append_final_item(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_bridge_client::{BridgeClientError, BridgeErrorLayer, BridgeResponse};
+    use magi_bridge_client::{
+        BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelRetryRuntimeEvent,
+        ModelRetryRuntimePhase,
+    };
     use magi_core::SessionLifecycleStatus;
     use magi_session_store::{
         ActiveExecutionTurn, CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind,
@@ -1294,6 +1308,60 @@ mod tests {
     struct StreamingTextModelBridgeClient {
         delta_content: String,
         payload: String,
+    }
+
+    struct RetryEventModelBridgeClient;
+
+    impl ModelBridgeClient for RetryEventModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Ok(BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({ "content": "重连后完成" }).to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            on_delta(&ModelStreamingDelta {
+                content: "重连后完成".to_string(),
+                thinking: String::new(),
+            });
+            self.invoke(request)
+        }
+
+        fn invoke_streaming_with_retry_events(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+            on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            on_retry(&ModelRetryRuntimeEvent {
+                phase: ModelRetryRuntimePhase::Scheduled,
+                attempt: 1,
+                max_attempts: 5,
+                delay_ms: Some(10_000),
+            });
+            on_retry(&ModelRetryRuntimeEvent {
+                phase: ModelRetryRuntimePhase::AttemptStarted,
+                attempt: 1,
+                max_attempts: 5,
+                delay_ms: None,
+            });
+            let response = self.invoke_streaming(request, on_delta);
+            on_retry(&ModelRetryRuntimeEvent {
+                phase: ModelRetryRuntimePhase::Settled,
+                attempt: 1,
+                max_attempts: 5,
+                delay_ms: None,
+            });
+            response
+        }
     }
 
     impl ModelBridgeClient for StreamingTextModelBridgeClient {
@@ -2084,6 +2152,111 @@ mod tests {
             CanonicalTurnItemStatus::Completed
         );
         assert_eq!(assistant_items[0].content.as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn session_turn_round_forwards_model_retry_runtime_events() {
+        let session_id = SessionId::new("session-model-retry-runtime");
+        let workspace_id = Some(WorkspaceId::new("workspace-model-retry-runtime"));
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "model retry runtime")
+            .expect("session should be creatable");
+        let (mission_id, orchestrator_thread_id) =
+            store.ensure_session_mission(&session_id, ts(900), || {
+                magi_core::MissionId::new("mission-model-retry-runtime")
+            });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-model-retry-runtime".to_string(),
+                    turn_seq: 1_000,
+                    accepted_at: ts(1_000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("请继续".to_string()),
+                    items: vec![session_turn_item(
+                        "user_message",
+                        "completed",
+                        None,
+                        Some("请继续".to_string()),
+                        Some("user-model-retry-runtime".to_string()),
+                        orchestrator_thread_id.clone(),
+                    )],
+                },
+            )
+            .expect("current turn should be stored");
+        let event_bus = InMemoryEventBus::new(16);
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: "turn-model-retry-runtime".to_string(),
+            workspace_id: workspace_id.clone(),
+            prompt: "请继续".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: false,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: Some("assistant-model-retry-runtime".to_string()),
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            workspace_root_path: None,
+        };
+        let usage_binding = session_turn_model_usage_binding(false);
+        let mut messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(request.prompt.clone()),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }];
+
+        stream_session_turn_round(
+            SessionTurnRoundRuntime {
+                client: &RetryEventModelBridgeClient,
+                event_bus: &event_bus,
+                session_store: &store,
+                todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+                settings_store: None,
+                safety_gate: None,
+                request: &request,
+                usage_binding: &usage_binding,
+                prompt: &request.prompt,
+                tools: None,
+                messages: &mut messages,
+                completed_required_tool_names: &[],
+                snapshot_manager: None,
+                round: 0,
+                orchestrator_thread_id: &orchestrator_thread_id,
+                orchestrator_mission_id: &mission_id,
+                persist_session_state: None,
+            },
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("round should complete after retry");
+
+        let retry_events = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .filter(|event| event.event_type == "model.retry.runtime")
+            .collect::<Vec<_>>();
+        assert_eq!(retry_events.len(), 3);
+        assert_eq!(retry_events[0].payload["phase"], "scheduled");
+        assert_eq!(retry_events[1].payload["phase"], "attempt_started");
+        assert_eq!(retry_events[2].payload["phase"], "settled");
+        assert!(retry_events.iter().all(|event| {
+            event.payload["message_id"] == "assistant-model-retry-runtime"
+                && event.session_id.as_ref() == Some(&session_id)
+                && event.workspace_id.as_ref() == workspace_id.as_ref()
+        }));
     }
 
     #[test]

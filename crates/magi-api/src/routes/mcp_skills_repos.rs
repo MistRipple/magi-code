@@ -3,7 +3,7 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-use magi_bridge_client::{McpToolInfo, StdioMcpBridgeClient};
+use magi_bridge_client::{McpServerClient, McpToolInfo};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ use crate::{
     mcp_config::{
         build_mcp_config_from_entry, mcp_server_entry_enabled, mcp_server_entry_id,
         normalize_mcp_server_request_entry as normalize_mcp_server_entry,
-        normalize_mcp_server_snapshot_entry, preserve_redacted_mcp_env_values,
+        normalize_mcp_server_snapshot_entry, preserve_redacted_mcp_secret_values,
         redact_mcp_server_public_entry,
     },
     scope_binding::strip_scope_binding_fields_from_map,
@@ -30,7 +30,7 @@ const SKILL_CACHE_PUBLIC_ERROR: &str = "Skill 缓存不可保存，请检查本�
 const SKILL_REPOSITORY_URL_PUBLIC_ERROR: &str = "仅支持标准 GitHub HTTPS 仓库地址";
 static SKILL_REPOSITORY_SYNC_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
-async fn list_mcp_tools(client: Arc<StdioMcpBridgeClient>) -> Result<Vec<McpToolInfo>, String> {
+async fn list_mcp_tools(client: Arc<McpServerClient>) -> Result<Vec<McpToolInfo>, String> {
     tokio::task::spawn_blocking(move || client.list_tools())
         .await
         .map_err(|error| format!("MCP worker join failed: {error}"))?
@@ -800,7 +800,7 @@ async fn update_mcp_server(
         .trim()
         .to_string();
     let existing = stored_mcp_server_entry(&state, &server_id);
-    preserve_redacted_mcp_env_values(&mut normalized, existing.as_ref());
+    preserve_redacted_mcp_secret_values(&mut normalized, existing.as_ref());
     state
         .settings_store
         .upsert_array_entry("mcpServers", "id", &normalized)
@@ -866,6 +866,44 @@ fn mcp_tools_disabled_response(server_id: &str) -> Json<serde_json::Value> {
     }))
 }
 
+async fn connect_configured_mcp_server(
+    state: &ApiState,
+    server_id: &str,
+) -> Result<(Arc<McpServerClient>, Vec<McpToolInfo>), String> {
+    let existing = state
+        .mcp_connections()
+        .read()
+        .expect("mcp connections read lock poisoned")
+        .get(server_id)
+        .cloned();
+    if let Some(client) = existing {
+        match list_mcp_tools(client.clone()).await {
+            Ok(tools) => return Ok((client, tools)),
+            Err(error) => {
+                tracing::warn!(server_id = %server_id, error = %error, "existing MCP connection is unavailable; reconnecting");
+                remove_mcp_connection(state, server_id);
+            }
+        }
+    }
+
+    let entry = find_server_entry(state, server_id)
+        .ok_or_else(|| format!("MCP server {server_id} 配置不存在"))?;
+    if !mcp_server_entry_enabled(&entry) {
+        remove_mcp_connection(state, server_id);
+        return Err(format!("MCP server {server_id} 已禁用"));
+    }
+    let config = build_mcp_config_from_entry(&entry)
+        .ok_or_else(|| format!("MCP server {server_id} 配置不完整"))?;
+    let client = Arc::new(McpServerClient::new(config));
+    let tools = list_mcp_tools(client.clone()).await?;
+    state
+        .mcp_connections()
+        .write()
+        .expect("mcp connections write lock poisoned")
+        .insert(server_id.to_string(), client.clone());
+    Ok((client, tools))
+}
+
 async fn connect_mcp_server(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
@@ -884,26 +922,16 @@ async fn connect_mcp_server(
         return Ok(mcp_tools_disabled_response(&server_id));
     }
 
-    let config = build_mcp_config_from_entry(&entry)
-        .ok_or_else(|| ApiError::InvalidInput("MCP server 配置中缺少 command".to_string()))?;
-
-    let client = Arc::new(StdioMcpBridgeClient::new(config));
-    let tools = list_mcp_tools(client.clone()).await.map_err(|err| {
-        tracing::warn!(
-            server_id = %server_id,
-            error = ?err,
-            "MCP server connect failed"
-        );
-        ApiError::InvalidInput("MCP server 连接失败".to_string())
-    })?;
-
-    {
-        let mut pool = state
-            .mcp_connections()
-            .write()
-            .expect("mcp connections write lock poisoned");
-        pool.insert(server_id.clone(), client);
-    }
+    let (_, tools) = connect_configured_mcp_server(&state, &server_id)
+        .await
+        .map_err(|err| {
+            tracing::warn!(
+                server_id = %server_id,
+                error = ?err,
+                "MCP server connect failed"
+            );
+            ApiError::InvalidInput("MCP server 连接失败".to_string())
+        })?;
 
     Ok(Json(serde_json::json!({
         "connected": true,
@@ -951,20 +979,8 @@ async fn get_mcp_tools(
         return Ok(mcp_tools_disabled_response(server_id));
     }
 
-    let client = {
-        let pool = state
-            .mcp_connections()
-            .read()
-            .expect("mcp connections read lock poisoned");
-        pool.get(server_id).cloned()
-    };
-
-    let Some(client) = client else {
-        return Ok(mcp_tools_unavailable_response(server_id));
-    };
-
-    let tools = match list_mcp_tools(client).await {
-        Ok(tools) => tools,
+    let tools = match connect_configured_mcp_server(&state, server_id).await {
+        Ok((_, tools)) => tools,
         Err(err) => {
             tracing::warn!(
                 server_id = %server_id,
@@ -999,20 +1015,9 @@ async fn refresh_mcp_tools(
         return Ok(mcp_tools_disabled_response(server_id));
     }
 
-    let client = {
-        let pool = state
-            .mcp_connections()
-            .read()
-            .expect("mcp connections read lock poisoned");
-        pool.get(server_id).cloned()
-    };
-
-    let Some(client) = client else {
-        return Ok(mcp_tools_unavailable_response(server_id));
-    };
-
-    let tools = match list_mcp_tools(client).await {
-        Ok(tools) => tools,
+    remove_mcp_connection(&state, server_id);
+    let tools = match connect_configured_mcp_server(&state, server_id).await {
+        Ok((_, tools)) => tools,
         Err(err) => {
             tracing::warn!(
                 server_id = %server_id,
@@ -2136,6 +2141,124 @@ mod tests {
         assert_eq!(stored["env"]["TOKEN"], serde_json::json!("secret-token"));
         assert_eq!(stored["env"]["MODE"], serde_json::json!("new"));
         assert_eq!(stored["enabled"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn mcp_http_server_save_and_update_preserve_header_secrets() {
+        let state = test_state();
+        let app = Router::new().merge(routes()).with_state(state.clone());
+        let added = post_json(
+            app,
+            "/settings/mcp/add",
+            serde_json::json!({
+                "id": "http-server",
+                "name": "http-server",
+                "type": "http",
+                "url": "https://example.test/mcp",
+                "headers": {
+                    "Authorization": "Bearer secret"
+                },
+                "enabled": false
+            }),
+        )
+        .await;
+        assert_eq!(added["added"], true);
+
+        let public = get_json(
+            Router::new().merge(routes()).with_state(state.clone()),
+            "/settings/mcp",
+        )
+        .await;
+        assert_eq!(
+            public["servers"][0]["type"],
+            serde_json::json!("streamable-http")
+        );
+        assert_eq!(
+            public["servers"][0]["headers"]["Authorization"],
+            serde_json::json!(crate::mcp_config::REDACTED_MCP_ENV_VALUE)
+        );
+
+        let updated = post_json(
+            Router::new().merge(routes()).with_state(state.clone()),
+            "/settings/mcp/update",
+            serde_json::json!({
+                "id": "http-server",
+                "name": "http-server",
+                "type": "streamable-http",
+                "url": "https://example.test/mcp-v2",
+                "headers": {
+                    "Authorization": crate::mcp_config::REDACTED_MCP_ENV_VALUE
+                },
+                "enabled": false
+            }),
+        )
+        .await;
+        assert_eq!(updated["updated"], true);
+        let stored = stored_mcp_server_entry(&state, "http-server")
+            .expect("HTTP MCP server should remain stored");
+        assert_eq!(
+            stored["url"],
+            serde_json::json!("https://example.test/mcp-v2")
+        );
+        assert_eq!(
+            stored["headers"]["Authorization"],
+            serde_json::json!("Bearer secret")
+        );
+        assert!(stored.get("command").is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_request_connects_enabled_server_on_demand() {
+        let state = test_state();
+        let script = r#"
+while IFS= read -r line; do
+    method=$(echo "$line" | grep -o '"method":"[^"]*"' | head -1 | cut -d'"' -f4)
+    id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+    case "$method" in
+        initialize)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"mock-mcp","version":"1.0.0"}}}\n' "$id"
+            ;;
+        notifications/initialized)
+            ;;
+        tools/list)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"search.web","description":"Search the web"}]}}\n' "$id"
+            ;;
+    esac
+done
+"#;
+        state
+            .settings_store
+            .upsert_array_entry(
+                "mcpServers",
+                "id",
+                &serde_json::json!({
+                    "id": "auto-connect",
+                    "name": "auto-connect",
+                    "type": "stdio",
+                    "command": "sh",
+                    "args": ["-c", script],
+                    "enabled": true
+                }),
+            )
+            .unwrap();
+        let app = Router::new().merge(routes()).with_state(state.clone());
+
+        let body = post_json(
+            app,
+            "/settings/mcp/tools",
+            serde_json::json!({ "serverId": "auto-connect" }),
+        )
+        .await;
+
+        assert_eq!(body["connected"], true, "unexpected body: {body}");
+        assert_eq!(body["tools"][0]["name"], serde_json::json!("search.web"));
+        assert!(
+            state
+                .mcp_connections()
+                .read()
+                .expect("mcp connections should lock")
+                .contains_key("auto-connect")
+        );
     }
 
     #[tokio::test]

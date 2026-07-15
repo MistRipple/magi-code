@@ -1,9 +1,9 @@
 use crate::session_writeback::{
     SessionStatePersistCallback, SessionTurnStreamPublishGate, SessionTurnStreamUpdate,
     append_session_turn_item_with_task_store, persist_session_state_checkpoint,
-    publish_current_session_turn_item_event, publish_session_turn_item_event,
-    publish_session_turn_item_stream_event, session_turn_item, session_turn_stream_update,
-    upsert_session_turn_item_with_task_store,
+    publish_current_session_turn_item_event, publish_model_retry_runtime_event,
+    publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
+    session_turn_stream_update, upsert_session_turn_item_with_task_store,
 };
 use crate::task_execution_registry::TaskExecutionRegistry;
 use crate::task_runner_bridge::TaskOutcome;
@@ -1067,7 +1067,22 @@ fn run_conversation_loop_inner(
                 );
             };
 
-            match client.invoke_streaming(invocation_request, &on_delta) {
+            let on_retry = |retry_event: &magi_bridge_client::ModelRetryRuntimeEvent| {
+                publish_model_retry_runtime_event(
+                    turn_writeback_context.event_bus,
+                    turn_writeback_context.session_id,
+                    turn_writeback_context.workspace_id,
+                    &stream_item_id,
+                    Some(&task.task_id),
+                    retry_event,
+                );
+            };
+
+            match client.invoke_streaming_with_retry_events(
+                invocation_request,
+                &on_delta,
+                &on_retry,
+            ) {
                 Ok(response) => response,
                 Err(error) => {
                     let raw_error_message = error.to_string();
@@ -2623,7 +2638,10 @@ fn task_stream_item_id(task_id: &TaskId, round: usize, streaming_entry_id: Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_bridge_client::{BridgeClientError, BridgeErrorLayer, BridgeResponse};
+    use magi_bridge_client::{
+        BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelRetryRuntimeEvent,
+        ModelRetryRuntimePhase,
+    };
     use magi_core::{
         ApprovalRequirement, MissionId, RiskLevel, Task, TaskKind, TaskStatus, TaskTier, WorkerId,
         WorkspaceRootPath,
@@ -2654,6 +2672,7 @@ mod tests {
     struct StaticTaskFinalModelBridgeClient {
         content: &'static str,
     }
+    struct RetryEventTaskModelBridgeClient;
     struct RecordingImageTaskModelBridgeClient {
         image_count: AtomicUsize,
     }
@@ -2961,6 +2980,56 @@ mod tests {
                 thinking: String::new(),
             });
             self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for RetryEventTaskModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Ok(BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "content": "子代理重连后完成",
+                    "finish_reason": "stop"
+                })
+                .to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            on_delta(&ModelStreamingDelta {
+                content: "子代理重连后完成".to_string(),
+                thinking: String::new(),
+            });
+            self.invoke(request)
+        }
+
+        fn invoke_streaming_with_retry_events(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+            on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            on_retry(&ModelRetryRuntimeEvent {
+                phase: ModelRetryRuntimePhase::Scheduled,
+                attempt: 1,
+                max_attempts: 5,
+                delay_ms: Some(10_000),
+            });
+            let response = self.invoke_streaming(request, on_delta);
+            on_retry(&ModelRetryRuntimeEvent {
+                phase: ModelRetryRuntimePhase::Settled,
+                attempt: 1,
+                max_attempts: 5,
+                delay_ms: None,
+            });
+            response
         }
     }
 
@@ -3700,6 +3769,90 @@ mod tests {
             persist_session_state: None,
         });
         outcome
+    }
+
+    #[test]
+    fn task_conversation_loop_forwards_model_retry_runtime_events() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(64);
+        let task_store = TaskStore::new();
+        let task = make_task_loop_test_task("task-model-retry-runtime");
+        task_store.insert_task(task.clone());
+        let worker_id = WorkerId::new("worker-model-retry-runtime");
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "executor",
+                60_000,
+            )
+            .expect("lease should be granted");
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+        let session_id = SessionId::new("session-task-model-retry-runtime");
+        let workspace_id = Some(WorkspaceId::new("workspace-task-model-retry-runtime"));
+        session_store
+            .create_session(session_id.clone(), "task retry runtime fixture")
+            .expect("session should be creatable");
+        let now = UtcMillis::now();
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
+
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+            client: &RetryEventTaskModelBridgeClient,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
+            conversation_registry: &ConversationRegistry::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
+            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+            project_memory: None,
+            mission_metrics: None,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "请执行任务".to_string(),
+            images: Vec::new(),
+            tools: None,
+            usage_binding: &usage_binding,
+            streaming_entry_id: Some("assistant-task-model-retry-runtime"),
+            is_sidechain: false,
+            worker_id: Some(&worker_id),
+            thread_id: &orchestrator_thread_id,
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
+            persist_session_state: None,
+        });
+
+        assert!(matches!(outcome, TaskOutcome::Completed { .. }));
+        let retry_events = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .filter(|event| event.event_type == "model.retry.runtime")
+            .collect::<Vec<_>>();
+        assert_eq!(retry_events.len(), 2);
+        assert_eq!(retry_events[0].payload["phase"], "scheduled");
+        assert_eq!(retry_events[1].payload["phase"], "settled");
+        assert!(retry_events.iter().all(|event| {
+            event.payload["message_id"] == "assistant-task-model-retry-runtime"
+                && event.session_id.as_ref() == Some(&session_id)
+                && event.workspace_id.as_ref() == workspace_id.as_ref()
+                && event.task_id.as_ref() == Some(&task.task_id)
+        }));
     }
 
     #[test]

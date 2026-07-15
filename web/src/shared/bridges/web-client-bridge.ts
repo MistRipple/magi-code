@@ -1421,6 +1421,38 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
 
+  if (eventType === 'model.retry.runtime' && event.payload) {
+    const messageId = trimBridgeString(event.payload.message_id)
+      || trimBridgeString(event.payload.messageId);
+    const phase = trimBridgeString(event.payload.phase);
+    if (messageId && (phase === 'scheduled' || phase === 'attempt_started' || phase === 'settled')) {
+      const attempt = typeof event.payload.attempt === 'number' && Number.isFinite(event.payload.attempt)
+        ? Math.floor(event.payload.attempt)
+        : 0;
+      const maxAttempts = typeof event.payload.max_attempts === 'number' && Number.isFinite(event.payload.max_attempts)
+        ? Math.floor(event.payload.max_attempts)
+        : typeof event.payload.maxAttempts === 'number' && Number.isFinite(event.payload.maxAttempts)
+          ? Math.floor(event.payload.maxAttempts)
+          : 0;
+      const delayMs = typeof event.payload.delay_ms === 'number' && Number.isFinite(event.payload.delay_ms)
+        ? Math.max(0, Math.floor(event.payload.delay_ms))
+        : typeof event.payload.delayMs === 'number' && Number.isFinite(event.payload.delayMs)
+          ? Math.max(0, Math.floor(event.payload.delayMs))
+          : undefined;
+      emitDataMessage('llmRetryRuntime', {
+        messageId,
+        phase,
+        attempt,
+        maxAttempts,
+        ...(delayMs === undefined ? {} : { delayMs }),
+        ...(phase === 'scheduled' && delayMs !== undefined
+          ? { nextRetryAt: Date.now() + delayMs }
+          : {}),
+      });
+    }
+    return;
+  }
+
   if ((eventType === 'session.turn.accepted' || eventType === 'session.turn.task.accepted') && event.payload) {
     const acceptedSessionId = trimBridgeString(event.payload.session_id)
       || trimBridgeString(event.payload.sessionId)

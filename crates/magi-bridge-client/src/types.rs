@@ -126,6 +126,21 @@ pub struct ModelStreamingDelta {
     pub thinking: String,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ModelRetryRuntimePhase {
+    Scheduled,
+    AttemptStarted,
+    Settled,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelRetryRuntimeEvent {
+    pub phase: ModelRetryRuntimePhase,
+    pub attempt: usize,
+    pub max_attempts: usize,
+    pub delay_ms: Option<u64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct McpToolCallRequest {
     pub server_name: String,
@@ -400,6 +415,15 @@ pub trait ModelBridgeClient: Send + Sync {
         request: ModelInvocationRequest,
         on_delta: &dyn Fn(&ModelStreamingDelta),
     ) -> Result<BridgeResponse, BridgeClientError>;
+
+    fn invoke_streaming_with_retry_events(
+        &self,
+        request: ModelInvocationRequest,
+        on_delta: &dyn Fn(&ModelStreamingDelta),
+        _on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+    ) -> Result<BridgeResponse, BridgeClientError> {
+        self.invoke_streaming(request, on_delta)
+    }
 }
 
 pub trait McpBridgeClient: Send + Sync {

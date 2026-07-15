@@ -47,6 +47,11 @@
   import { turnStoreState } from '../stores/turn-store.svelte';
   import { canFetchModelList } from '../shared/model-governance';
   import {
+    resolveOrchestratorReasoningEffort,
+    withOrchestratorReasoningEffort,
+    type OrchestratorReasoningEffort,
+  } from '../shared/orchestrator-session-config';
+  import {
     buildComposerActions,
     filterSlashCommands,
     resolveSlashTrigger,
@@ -76,7 +81,7 @@
   // 这一组才是 `/` 唤起的指令型技能，与 customTools（已注册到工具表）的语义不同。
   type SkillOption = ComposerSkillOption;
 
-  type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
+  type ReasoningEffort = OrchestratorReasoningEffort;
   type FollowUpMode = 'queue' | 'guide';
 
   const reasoningOptions: Array<{
@@ -1284,10 +1289,13 @@
   function getTurnOrchestratorSessionConfigPayload(): Record<string, unknown> | null {
     const config = getCurrentOrchestratorSessionConfigSnapshot();
     const model = readOrchestratorModel();
-    const nextConfig = {
-      ...config,
-      ...(typeof config.model === 'string' && config.model.trim() ? {} : (model ? { model } : {})),
-    };
+    const nextConfig = withOrchestratorReasoningEffort(
+      config,
+      readOrchestratorReasoningEffort(),
+      typeof config.model === 'string' && config.model.trim()
+        ? {}
+        : (model ? { model } : {}),
+    );
     return Object.keys(nextConfig).length > 0 ? nextConfig : null;
   }
 
@@ -1304,23 +1312,14 @@
     return getFirstAvailablePickerModel();
   }
 
-  function normalizeReasoningEffort(value: unknown): ReasoningEffort | null {
-    return value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh'
-      ? value
-      : null;
-  }
-
-  function readOrchestratorReasoningEffort(): ReasoningEffort | null {
-    const sessionEffort = normalizeReasoningEffort(
-      getCurrentOrchestratorSessionConfigSnapshot().reasoningEffort,
+  function readOrchestratorReasoningEffort(): ReasoningEffort {
+    return resolveOrchestratorReasoningEffort(
+      getCurrentOrchestratorSessionConfigSnapshot(),
+      getEffectiveOrchestratorConfigSnapshot(),
     );
-    if (sessionEffort) return sessionEffort;
-    const config = getEffectiveOrchestratorConfigSnapshot();
-    return normalizeReasoningEffort(config?.reasoningEffort);
   }
 
-  function reasoningEffortLabel(value: ReasoningEffort | null): string {
-    if (!value) return '';
+  function reasoningEffortLabel(value: ReasoningEffort): string {
     const match = reasoningOptions.find((option) => option.value === value);
     return match ? i18n.t(match.labelKey) : '';
   }
@@ -1448,18 +1447,24 @@
       return;
     }
     const sessionId = currentSessionId?.trim() || '';
+    const reasoningEffort = readOrchestratorReasoningEffort();
     if (!sessionId) {
-      applyDraftOrchestratorSessionPatch({ model: normalizedModel });
+      draftOrchestratorSessionConfig = withOrchestratorReasoningEffort(
+        draftOrchestratorSessionConfig,
+        reasoningEffort,
+        { model: normalizedModel },
+      );
       pickerError = null;
       pickerOpen = false;
       return;
     }
     pickerSavingModel = normalizedModel;
     pickerError = null;
-    const nextSessionConfig = {
-      ...getOrchestratorSessionConfigSnapshot(),
-      model: normalizedModel,
-    };
+    const nextSessionConfig = withOrchestratorReasoningEffort(
+      getOrchestratorSessionConfigSnapshot(),
+      reasoningEffort,
+      { model: normalizedModel },
+    );
     try {
       const saved = await saveAgentOrchestratorSessionConfig(nextSessionConfig, {
         sessionId,
