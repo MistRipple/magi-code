@@ -4928,6 +4928,65 @@ fn shell_exec_schema_warns_against_read_only_temp_writes() {
 }
 
 #[test]
+fn filesystem_schemas_prefer_workspace_relative_or_native_absolute_paths() {
+    for tool in [
+        BuiltinToolName::FileRead,
+        BuiltinToolName::ViewImage,
+        BuiltinToolName::FileWrite,
+        BuiltinToolName::FilePatch,
+        BuiltinToolName::FileRemove,
+        BuiltinToolName::FileMkdir,
+    ] {
+        let schema = tool.parameters_schema();
+        let description = schema["properties"]["path"]["description"]
+            .as_str()
+            .expect("path description");
+        assert!(
+            description.contains("工作区相对路径"),
+            "{tool:?}: {description}"
+        );
+        assert!(description.contains("当前平台"), "{tool:?}: {description}");
+    }
+
+    for tool in [BuiltinToolName::FileCopy, BuiltinToolName::FileMove] {
+        let schema = tool.parameters_schema();
+        for field in ["source", "destination"] {
+            let description = schema["properties"][field]["description"]
+                .as_str()
+                .expect("copy/move path description");
+            assert!(
+                description.contains("工作区相对路径"),
+                "{tool:?}.{field}: {description}"
+            );
+            assert!(
+                description.contains("当前平台"),
+                "{tool:?}.{field}: {description}"
+            );
+        }
+    }
+}
+
+#[test]
+fn shell_schema_describes_platform_native_dialect() {
+    let schema = BuiltinToolName::ShellExec.parameters_schema();
+    let command = schema["properties"]["command"]["description"]
+        .as_str()
+        .expect("command description");
+    let shell = schema["properties"]["shell"]["description"]
+        .as_str()
+        .expect("shell description");
+    let access_mode = schema["properties"]["access_mode"]["description"]
+        .as_str()
+        .expect("access mode description");
+
+    assert!(command.contains("当前平台"));
+    assert!(shell.contains("Windows"));
+    assert!(shell.contains("Linux"));
+    assert!(access_mode.contains("NUL"));
+    assert!(access_mode.contains("/dev/null"));
+}
+
+#[test]
 fn diagram_renderer_names_are_not_builtin_tools() {
     for name in [
         "mermaid_diagram",

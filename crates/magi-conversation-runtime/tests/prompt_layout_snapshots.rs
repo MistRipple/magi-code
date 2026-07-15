@@ -7,7 +7,7 @@
 
 use insta::assert_snapshot;
 use magi_conversation_runtime::prompt_utils::{
-    prepend_session_instructions, workspace_context_system_prompt,
+    prepend_session_instructions, workspace_context_system_prompt_for_platform,
 };
 
 #[test]
@@ -41,6 +41,6 @@ fn snapshot_prepend_no_sections_returns_prompt_only() {
 
 #[test]
 fn snapshot_workspace_context_system_prompt() {
-    let prompt = workspace_context_system_prompt("/workspace/demo");
+    let prompt = workspace_context_system_prompt_for_platform("/workspace/demo", "linux");
     assert_snapshot!(prompt);
 }

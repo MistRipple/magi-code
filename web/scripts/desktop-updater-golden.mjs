@@ -5,7 +5,20 @@ import { withGoldenViteServer } from './golden-vite.mjs';
 
 const appSource = fs.readFileSync(path.resolve('src/App.svelte'), 'utf8');
 const promptSource = fs.readFileSync(path.resolve('src/components/DesktopUpdatePrompt.svelte'), 'utf8');
+const settingsSource = fs.readFileSync(path.resolve('src/components/SettingsPanel.svelte'), 'utf8');
 assert.match(appSource, /DesktopUpdatePrompt/, 'desktop startup must mount the update prompt');
+assert.match(
+  settingsSource,
+  /getDesktopAppVersion/,
+  'desktop settings must load the installed application version',
+);
+const currentVersionPosition = settingsSource.indexOf('current-version-label');
+const updateButtonPosition = settingsSource.indexOf('update-check-btn');
+assert.ok(currentVersionPosition >= 0, 'desktop settings must render the current version label');
+assert.ok(
+  currentVersionPosition < updateButtonPosition,
+  'the current version label must appear before the update button',
+);
 assert.match(
   promptSource,
   /setTimeout\(\(\) => void checkForUpdate\(\), 1200\)/,
@@ -32,6 +45,12 @@ assert.match(
 
 await withGoldenViteServer(async (server) => {
   const updater = await server.ssrLoadModule('/src/lib/desktop-updater.ts');
+
+  assert.equal(
+    await updater.getDesktopAppVersion(),
+    null,
+    'browser runtime must not report a desktop application version',
+  );
 
   assert.deepEqual(
     updater.formatUpdateProgress(512, 1024),

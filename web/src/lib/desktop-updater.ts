@@ -18,6 +18,14 @@ export function isDesktopRuntime(): boolean {
     && typeof (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ !== 'undefined';
 }
 
+export async function getDesktopAppVersion(): Promise<string | null> {
+  if (!isDesktopRuntime()) {
+    return null;
+  }
+  const { getVersion } = await import('@tauri-apps/api/app');
+  return getVersion();
+}
+
 export function formatUpdateProgress(downloadedBytes: number, contentLength?: number): DesktopUpdateProgress {
   const downloaded = Math.max(0, Math.round(downloadedBytes));
   const total = typeof contentLength === 'number' && Number.isFinite(contentLength) && contentLength > 0

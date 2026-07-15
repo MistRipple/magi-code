@@ -389,10 +389,6 @@ jobs:
               echo "当前测试包默认不做商业签名和公证。macOS 首次打开可能需要右键打开，Windows 可能出现 SmartScreen 提示。"
               echo
             fi
-            echo "## 构建信息"
-            echo
-            echo "- Tag：\`$tag\`"
-            echo "- Rust 工具链：\`$RUST_TOOLCHAIN\`"
           } > dist/release-notes.md
 
       - name: 生成自动更新清单

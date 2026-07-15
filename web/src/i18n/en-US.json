@@ -497,6 +497,7 @@
   "settings.zone.rolesDesc": "Configure model bindings for spawnable agent roles",
   "settings.closeSettings": "Close Settings",
   "settings.update.checkTitle": "Check for Magi updates",
+  "settings.update.currentVersion": "Current version",
   "settings.update.check": "Check for updates",
   "settings.update.checking": "Checking for updates",
   "settings.update.latest": "Up to date",

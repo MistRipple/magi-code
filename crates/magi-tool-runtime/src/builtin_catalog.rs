@@ -470,12 +470,11 @@ impl BuiltinToolName {
                 # 何时不用\n\
                 - 读文件内容 → file_read（更安全、有大小保护）\n\
                 - 写文件内容 → file_write（避免引号转义陷阱）\n\
-                - 改文件局部 → file_patch（避免 sed 转义灾难）\n\
-                - 找文件路径 → 优先 search_text；search_text 不便时再 shell `find`\n\
+                - 改文件局部 → file_patch（避免 Shell 转义问题）\n\
+                - 找文件路径 → 优先 search_text，避免依赖平台专属命令\n\
                 - 不要直接调用 process_launch / process_read / process_write / process_kill / process_list；它们是 shell_exec 的内部后台能力\n\n\
                 # 反例\n\
-                - ❌ `shell_exec: cat /path/file` 仅为读文件 → 失去字节限制保护\n\
-                - ❌ `shell_exec: sed -i 's/foo/bar/'` 改文件 → 引号转义易错且不可预览\n\
+                - ❌ 用平台专属 Shell 命令仅为读取或修改文件 → 跨平台不稳定且失去专用工具保护\n\
                 - ✅ `shell_exec: cargo test -p magi-agent-role` 跑测试\n\
                 - ✅ `shell_exec: git log --oneline -20` 查提交历史"
             }
@@ -604,7 +603,7 @@ impl BuiltinToolName {
             Self::FileRead => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "要读取文件的绝对路径" },
+                    "path": { "type": "string", "description": "要读取文件的工作区相对路径（推荐）或当前平台原生绝对路径" },
                     "max_bytes": {
                         "type": "integer",
                         "minimum": 1,
@@ -617,7 +616,7 @@ impl BuiltinToolName {
             Self::ViewImage => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "要查看的本地图片路径，可为绝对路径或相对当前工作目录的路径" },
+                    "path": { "type": "string", "description": "要查看图片的工作区相对路径（推荐）或当前平台原生绝对路径" },
                     "max_bytes": { "type": "integer", "description": "允许读取的最大字节数，默认 10MiB，硬上限 20MiB" }
                 },
                 "required": ["path"]
@@ -625,7 +624,7 @@ impl BuiltinToolName {
             Self::FileWrite => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "要写入文件的绝对路径" },
+                    "path": { "type": "string", "description": "要写入文件的工作区相对路径（推荐）或当前平台原生绝对路径" },
                     "content": { "type": "string", "description": "要写入的文件内容" },
                     "overwrite": { "type": "boolean", "description": "是否覆盖已存在的文件（默认：true）" },
                     "create_dirs": { "type": "boolean", "description": "是否创建父目录（默认：true）" }
@@ -635,7 +634,7 @@ impl BuiltinToolName {
             Self::FilePatch => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "要修改文件的绝对路径" },
+                    "path": { "type": "string", "description": "要修改文件的工作区相对路径（推荐）或当前平台原生绝对路径" },
                     "old_string": { "type": "string", "description": "要查找的原文本（必须在文件中精确匹配一次）" },
                     "new_string": { "type": "string", "description": "替换后的文本" },
                     "patches": {
@@ -666,7 +665,7 @@ impl BuiltinToolName {
             Self::FileRemove => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "要删除文件或目录的绝对路径" },
+                    "path": { "type": "string", "description": "要删除文件或目录的工作区相对路径（推荐）或当前平台原生绝对路径" },
                     "recursive": { "type": "boolean", "description": "是否递归删除目录（默认：false）" }
                 },
                 "required": ["path"]
@@ -674,15 +673,15 @@ impl BuiltinToolName {
             Self::FileMkdir => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "要创建目录的绝对路径" }
+                    "path": { "type": "string", "description": "要创建目录的工作区相对路径（推荐）或当前平台原生绝对路径" }
                 },
                 "required": ["path"]
             }),
             Self::FileCopy => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "source": { "type": "string", "description": "源文件或目录的绝对路径" },
-                    "destination": { "type": "string", "description": "目标位置的绝对路径" },
+                    "source": { "type": "string", "description": "源文件或目录的工作区相对路径（推荐）或当前平台原生绝对路径" },
+                    "destination": { "type": "string", "description": "目标位置的工作区相对路径（推荐）或当前平台原生绝对路径" },
                     "overwrite": { "type": "boolean", "description": "目标存在时是否覆盖（默认：false）" }
                 },
                 "required": ["source", "destination"]
@@ -690,8 +689,8 @@ impl BuiltinToolName {
             Self::FileMove => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "source": { "type": "string", "description": "源文件或目录的绝对路径" },
-                    "destination": { "type": "string", "description": "目标位置的绝对路径" },
+                    "source": { "type": "string", "description": "源文件或目录的工作区相对路径（推荐）或当前平台原生绝对路径" },
+                    "destination": { "type": "string", "description": "目标位置的工作区相对路径（推荐）或当前平台原生绝对路径" },
                     "overwrite": { "type": "boolean", "description": "目标存在时是否覆盖（默认：false）" }
                 },
                 "required": ["source", "destination"]
@@ -725,9 +724,9 @@ impl BuiltinToolName {
             Self::ShellExec => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "要执行的 shell 命令" },
-                    "cwd": { "type": "string", "description": "工作目录" },
-                    "shell": { "type": "string", "description": "使用的 shell 程序" },
+                    "command": { "type": "string", "description": "要执行的当前平台原生 shell 命令；必须遵循工作区上下文声明的 Shell 方言" },
+                    "cwd": { "type": "string", "description": "工作区相对路径或当前平台原生绝对路径；默认当前工作区" },
+                    "shell": { "type": "string", "description": "可选 Shell 程序；默认 Windows 使用 cmd.exe，Linux/macOS 使用 sh" },
                     "timeout_ms": { "type": "integer", "description": "执行超时（毫秒）" },
                     "action": {
                         "type": "string",
@@ -739,7 +738,7 @@ impl BuiltinToolName {
                     "max_bytes": { "type": "integer", "description": "action=read 时 stdout / stderr 预览最多读取的字节数" },
                     "access_mode": {
                         "type": "string",
-                        "description": "声明命令访问模式：read_only / maybe_write / explicit_write。ls、cat、grep、git status、git diff、不会改文件的测试等只读探查请用 read_only。read_only 必须实际不写文件：不得创建、修改、删除文件，不得把输出重定向到普通文件或临时文件（如 > /tmp/...、>> file），不得使用 tee、touch、mktemp、rm、mv、cp 等写类操作；仅允许在条件探测中把输出丢弃到 /dev/null。需要 scratch 文件、缓存结果或任何写入时必须声明 maybe_write 或 explicit_write，或改用管道/标准输出完成验证。只读探测中“文件不存在/无匹配”属于可汇报结果时，命令必须用 if/else、|| true 或末尾 true 保证整体退出码为 0，避免把可恢复探测误判为任务失败。",
+                        "description": "声明命令访问模式：read_only / maybe_write / explicit_write。git status、git diff、不会改文件的测试等只读探查请用 read_only。read_only 必须实际不写文件：不得创建、修改、删除文件，不得把输出重定向到普通文件或临时文件，不得执行创建、删除、复制、移动类命令；仅允许在条件探测中把输出丢弃到当前平台空设备（Windows 为 NUL，Linux/macOS 为 /dev/null）。需要临时文件、缓存结果或任何写入时必须声明 maybe_write 或 explicit_write，或改用管道/标准输出完成验证。只读探测中“文件不存在/无匹配”属于可汇报结果时，命令必须使用当前 Shell 的条件语法保证整体退出码为 0，避免把可恢复探测误判为任务失败。",
                         "enum": ["read_only", "maybe_write", "explicit_write"]
                     },
                     "background": { "type": "boolean", "description": "在后台启动而不阻塞等待完成" }

@@ -152,12 +152,37 @@ pub fn prepend_session_instructions(
     format!("{}{SEGMENT_SEP}{}", sections.join(SEGMENT_SEP), prompt)
 }
 
-/// 工作区上下文 system prompt 模板。运行时只替换 `{{root_path}}`。
+/// 工作区上下文 system prompt 模板。运行时注入工作区与宿主平台契约。
 const TPL_WORKSPACE_CONTEXT: &str = include_str!("../templates/workspace_context.md");
 
 pub fn workspace_context_system_prompt(root_path: &str) -> String {
+    workspace_context_system_prompt_for_platform(root_path, std::env::consts::OS)
+}
+
+pub fn workspace_context_system_prompt_for_platform(root_path: &str, platform: &str) -> String {
+    let is_windows = platform.eq_ignore_ascii_case("windows");
+    let platform_name = match platform {
+        "windows" => "Windows",
+        "linux" => "Linux",
+        "macos" => "macOS",
+        other => other,
+    };
+    let path_contract = if is_windows {
+        "原生路径使用反斜杠 `\\`，绝对路径包含盘符"
+    } else {
+        "原生路径使用正斜杠 `/`，绝对路径从 `/` 开始"
+    };
+    let shell_contract = if is_windows {
+        "默认 Shell 是 `cmd.exe /C`。命令必须使用 cmd.exe 语法；丢弃输出使用 `NUL`。Git worktree 探测可使用 `git -C \"<root>\" rev-parse --is-inside-work-tree >NUL 2>&1 && echo GIT_WORKTREE || echo NOT_GIT_WORKTREE`，确保非 Git 目录也以成功状态结束。不要生成 `/dev/null`、`if ...; then`、`find`、`cat`、`sed` 等 Unix 专属语法。"
+    } else {
+        "默认 Shell 是 `sh -lc`。命令必须使用 POSIX shell 语法；丢弃输出使用 `/dev/null`。Git worktree 探测可使用 `if git -C \"<root>\" rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo GIT_WORKTREE; else echo NOT_GIT_WORKTREE; fi`，确保非 Git 目录也以成功状态结束。"
+    };
+
     TPL_WORKSPACE_CONTEXT
         .replace("{{root_path}}", root_path)
+        .replace("{{platform_name}}", platform_name)
+        .replace("{{path_contract}}", path_contract)
+        .replace("{{shell_contract}}", shell_contract)
         .trim_end()
         .to_string()
 }
@@ -226,6 +251,31 @@ mod tests {
         assert!(prompt.contains("maybe_write"));
         assert!(prompt.contains("explicit_write"));
         assert!(prompt.contains("不要继续重复 Git 状态命令"));
+    }
+
+    #[test]
+    fn workspace_context_prompt_describes_windows_native_shell_and_paths() {
+        let prompt =
+            workspace_context_system_prompt_for_platform(r"C:\Users\demo\project", "windows");
+
+        assert!(prompt.contains("Windows"));
+        assert!(prompt.contains(r"C:\Users\demo\project"));
+        assert!(prompt.contains("cmd.exe /C"));
+        assert!(prompt.contains("NUL"));
+        assert!(prompt.contains("反斜杠"));
+        assert!(!prompt.contains("只能出现在 if 条件中"));
+    }
+
+    #[test]
+    fn workspace_context_prompt_describes_linux_native_shell_and_paths() {
+        let prompt = workspace_context_system_prompt_for_platform("/home/demo/project", "linux");
+
+        assert!(prompt.contains("Linux"));
+        assert!(prompt.contains("/home/demo/project"));
+        assert!(prompt.contains("sh -lc"));
+        assert!(prompt.contains("/dev/null"));
+        assert!(prompt.contains("正斜杠"));
+        assert!(!prompt.contains("cmd.exe /C"));
     }
 
     #[test]

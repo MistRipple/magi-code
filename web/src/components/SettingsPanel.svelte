@@ -16,6 +16,7 @@ import WebFolderPicker from '../web/WebFolderPicker.svelte';
 import { getAgentColor } from '../lib/agent-colors';
 import {
   checkDesktopUpdate,
+  getDesktopAppVersion,
   isDesktopRuntime,
   type DesktopUpdateInfo,
   type DesktopUpdateProgress,
@@ -39,6 +40,15 @@ import {
   let updateInfo = $state<DesktopUpdateInfo | null>(null);
   let updateProgress = $state<DesktopUpdateProgress | null>(null);
   let updateError = $state('');
+  let currentVersion = $state('');
+
+  async function loadDesktopVersion(): Promise<void> {
+    try {
+      currentVersion = (await getDesktopAppVersion()) || '';
+    } catch {
+      currentVersion = '';
+    }
+  }
 
   async function checkForDesktopUpdate(): Promise<void> {
     if (!desktopRuntime || updateState === 'checking' || updateState === 'installing') {
@@ -88,6 +98,7 @@ import {
 
   onMount(() => {
     if (desktopRuntime) {
+      void loadDesktopVersion();
       void checkForDesktopUpdate();
     }
     return () => {
@@ -204,6 +215,12 @@ import {
         </div>
         <div class="header-actions">
           {#if desktopRuntime}
+            {#if currentVersion}
+              <span class="current-version-label" title={`${i18n.t('settings.update.currentVersion')} v${currentVersion}`}>
+                <span class="current-version-label__prefix">{i18n.t('settings.update.currentVersion')}</span>
+                <span>v{currentVersion}</span>
+              </span>
+            {/if}
             <button
               type="button"
               class="update-check-btn"
@@ -597,6 +614,16 @@ import {
     cursor: pointer;
     white-space: nowrap;
     transition: color var(--transition-fast), background var(--transition-fast), border-color var(--transition-fast);
+  }
+
+  .current-version-label {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   .update-check-btn:hover:not(:disabled) {
@@ -1001,6 +1028,10 @@ import {
     .header-actions .locale-selector .locale-btn {
       padding: 4px 8px;
       font-size: 12px;
+    }
+
+    .current-version-label__prefix {
+      display: none;
     }
 
   }
