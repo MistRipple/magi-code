@@ -509,11 +509,11 @@ export class RustDaemonClient {
   }
 
   public async fetchFilesystemBrowse(
-    path?: string,
+    pathRef?: string,
     showHidden = false,
   ): Promise<FilesystemBrowseResponseDto> {
     const params = new URLSearchParams();
-    if (path) params.set('path', path);
+    if (pathRef) params.set('pathRef', pathRef);
     if (showHidden) params.set('showHidden', '1');
     const qs = params.toString();
     return this.getJson<FilesystemBrowseResponseDto>(

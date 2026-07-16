@@ -1,15 +1,19 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { browseAgentDirectory, type DirectoryEntry } from './agent-api';
+  import {
+    browseAgentDirectory,
+    resolveAgentPath,
+    type DirectoryPathNode,
+    type DirectoryPickerEntry,
+  } from './agent-api';
   import Icon from '../components/Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
 
   interface Props {
     title?: string;
-    onSelect: (path: string, name: string, kind: 'file' | 'directory') => void;
+    onSelect: (selection: { pathRef: string; displayPath: string; name: string }) => void;
     onCancel: () => void;
     disabled?: boolean;
-    selectionMode?: 'directory' | 'file-or-directory';
   }
 
   const {
@@ -17,15 +21,17 @@
     onSelect,
     onCancel,
     disabled = false,
-    selectionMode = 'directory',
   }: Props = $props();
 
-  let currentPath = $state('');
-  let parentPath = $state('');
-  let entries = $state<DirectoryEntry[]>([]);
+  let currentPathRef = $state('');
+  let currentDisplayPath = $state('');
+  let parentPathRef = $state('');
+  let breadcrumbs = $state<DirectoryPathNode[]>([]);
+  let roots = $state<DirectoryPathNode[]>([]);
+  let entries = $state<DirectoryPickerEntry[]>([]);
   let loading = $state(true);
   let error = $state('');
-  let selectedPath = $state('');
+  let selectedPathRef = $state('');
   let manualPathInput = $state('');
   let showManualInput = $state(false);
   let showHidden = $state(false);
@@ -37,14 +43,14 @@
     void loadDirectory();
   });
 
-  async function loadDirectory(dirPath?: string): Promise<void> {
+  async function loadDirectory(pathRef?: string): Promise<void> {
     const token = ++requestToken;
     loading = true;
     error = '';
-    selectedPath = '';
+    selectedPathRef = '';
 
     try {
-      const result = await browseAgentDirectory(dirPath, showHidden);
+      const result = await browseAgentDirectory({ pathRef, showHidden });
       if (token !== requestToken) {
         return;
       }
@@ -53,13 +59,13 @@
         error = directoryLoadFailedText();
         return;
       }
-      currentPath = result.path;
-      parentPath = result.parent;
+      currentPathRef = result.pathRef;
+      currentDisplayPath = result.displayPath;
+      parentPathRef = result.parentPathRef?.trim() || '';
+      breadcrumbs = result.breadcrumbs;
+      roots = result.roots;
       entries = result.entries;
-      selectedPath = selectionMode === 'file-or-directory' && result.selectedKind === 'file'
-        ? result.selectedPath?.trim() || ''
-        : '';
-      manualPathInput = result.path;
+      manualPathInput = result.displayPath;
       hasLoaded = true;
     } catch (err) {
       if (token !== requestToken) {
@@ -74,121 +80,92 @@
     }
   }
 
-  function enterDirectory(entry: DirectoryEntry): void {
-    void loadDirectory(entry.path);
+  function enterDirectory(entry: DirectoryPickerEntry): void {
+    void loadDirectory(entry.pathRef);
   }
 
   function toggleShowHidden(): void {
     showHidden = !showHidden;
-    void loadDirectory(currentPath || undefined);
+    void loadDirectory(currentPathRef || undefined);
   }
 
   function goUp(): void {
-    const resolvedCurrent = currentPath.trim();
-    const resolvedParent = parentPath.trim();
-    if (!resolvedCurrent || !resolvedParent || resolvedCurrent === resolvedParent) {
+    if (!currentPathRef || !parentPathRef || currentPathRef === parentPathRef) {
       return;
     }
-    void loadDirectory(resolvedParent);
+    void loadDirectory(parentPathRef);
   }
 
-  function selectEntry(entry: DirectoryEntry): void {
-    selectedPath = entry.path;
+  function selectEntry(entry: DirectoryPickerEntry): void {
+    selectedPathRef = entry.pathRef;
   }
 
-  function handleDblClick(entry: DirectoryEntry): void {
-    if (entry.isDirectory) {
-      enterDirectory(entry);
-    } else if (selectionMode === 'file-or-directory') {
-      onSelect(entry.path, entry.name, 'file');
-    }
+  function handleDblClick(entry: DirectoryPickerEntry): void {
+    enterDirectory(entry);
   }
 
-  function getPathSegments(rawPath: string): string[] {
-    return rawPath
-      .replace(/\\/g, '/')
-      .split('/')
-      .filter(Boolean);
+  function navigateToNode(node: DirectoryPathNode): void {
+    void loadDirectory(node.pathRef);
   }
 
-  function getPathBasename(rawPath: string): string {
-    const normalized = rawPath.trim();
-    if (!normalized) {
-      return '';
-    }
-    const segments = getPathSegments(normalized);
-    if (segments.length > 0) {
-      return segments[segments.length - 1];
-    }
-    return normalized === '/' ? '/' : normalized.replace(/\/+$/, '');
-  }
-
-  function buildPathFromSegments(segments: string[], upToIndex: number): string {
-    const isWindows = currentPath.includes('\\') || (segments.length > 0 && /^[A-Za-z]:$/.test(segments[0]));
-    const joined = segments.slice(0, upToIndex + 1).join('/');
-    if (isWindows) {
-      return joined;
-    }
-    return '/' + joined;
-  }
-
-  function navigateToSegment(index: number): void {
-    const segments = getPathSegments(currentPath);
-    const targetPath = buildPathFromSegments(segments, index);
-    void loadDirectory(targetPath);
-  }
-
-  function navigateToRoot(): void {
-    const isWindows = currentPath.includes('\\') || (/^[A-Za-z]:/.test(currentPath));
-    if (isWindows) {
-      const segments = getPathSegments(currentPath);
-      if (segments.length > 0) {
-        void loadDirectory(segments[0] + '/');
-      }
-    } else {
-      void loadDirectory('/');
-    }
+  function handleRootChange(event: Event): void {
+    const pathRef = (event.currentTarget as HTMLSelectElement).value;
+    if (pathRef) void loadDirectory(pathRef);
   }
 
   function confirmSelection(): void {
-    const targetPath = selectedPath || currentPath;
-    if (!targetPath) {
+    const selectedEntry = entries.find((entry) => entry.pathRef === selectedPathRef);
+    if (!selectedEntry) {
       return;
     }
-    const selectedEntry = entries.find((entry) => entry.path === selectedPath);
-    onSelect(
-      targetPath,
-      getPathBasename(targetPath),
-      selectedEntry && !selectedEntry.isDirectory ? 'file' : 'directory',
-    );
+    onSelect(selectedEntry);
   }
 
   function selectCurrentDir(): void {
-    if (!currentPath) {
+    if (!currentPathRef) {
       return;
     }
-    onSelect(currentPath, getPathBasename(currentPath), 'directory');
+    const current = breadcrumbs.at(-1);
+    onSelect({
+      pathRef: currentPathRef,
+      displayPath: currentDisplayPath,
+      name: current?.name || currentDisplayPath,
+    });
   }
 
   function toggleManualInput(): void {
     showManualInput = !showManualInput;
     if (showManualInput) {
-      manualPathInput = currentPath;
+      manualPathInput = currentDisplayPath;
     }
   }
 
-  function goToManualPath(): void {
+  async function goToManualPath(): Promise<void> {
     const target = manualPathInput.trim();
     if (!target) {
       return;
     }
-    showManualInput = false;
-    void loadDirectory(target);
+    loading = true;
+    error = '';
+    try {
+      const resolved = await resolveAgentPath(target, currentPathRef || undefined);
+      if (resolved.kind !== 'directory') {
+        error = directoryLoadFailedText();
+        return;
+      }
+      showManualInput = false;
+      await loadDirectory(resolved.pathRef);
+    } catch (err) {
+      console.warn('[WebFolderPicker] manual path resolve failed:', err);
+      error = directoryLoadFailedText();
+    } finally {
+      loading = false;
+    }
   }
 
   function handleManualInputKeydown(event: KeyboardEvent): void {
     if (event.key === 'Enter') {
-      goToManualPath();
+      void goToManualPath();
     }
     if (event.key === 'Escape') {
       showManualInput = false;
@@ -196,20 +173,17 @@
   }
 
   function retryLoad(): void {
-    void loadDirectory(currentPath || undefined);
+    void loadDirectory(currentPathRef || undefined);
   }
 
   const canGoUp = $derived(
     !loading
-      && !!currentPath.trim()
-      && !!parentPath.trim()
-      && currentPath.trim() !== parentPath.trim()
+      && !!currentPathRef
+      && !!parentPathRef
+      && currentPathRef !== parentPathRef
   );
-
-  const breadcrumbSegments = $derived(getPathSegments(currentPath));
-
   const selectedBasename = $derived(
-    selectedPath ? getPathBasename(selectedPath) : ''
+    entries.find((entry) => entry.pathRef === selectedPathRef)?.name || ''
   );
 </script>
 
@@ -230,21 +204,25 @@
         <button class="mac-icon-btn" onclick={goUp} disabled={!canGoUp} title={i18n.t('web.folderPickerGoUp')}>
           <Icon name="chevron-up" size={16} />
         </button>
+        {#if roots.length > 1}
+          <select class="mac-root-select" aria-label={i18n.t('web.folderPickerManualPath')} onchange={handleRootChange} disabled={loading}>
+            {#each roots as root (root.pathRef)}
+              <option value={root.pathRef}>{root.name}</option>
+            {/each}
+          </select>
+        {/if}
       </div>
 
       <div class="mac-breadcrumbs-wrapper">
-        {#if currentPath}
+        {#if currentPathRef}
           <div class="mac-breadcrumbs">
-            <button class="mac-crumb-btn" onclick={navigateToRoot} disabled={loading} title="/">
-              <Icon name="model" size={12} />
-            </button>
-            {#each breadcrumbSegments as segment, i (i)}
-              <span class="mac-crumb-sep"><Icon name="chevron-right" size={10} /></span>
-              {#if i === breadcrumbSegments.length - 1}
-                <span class="mac-crumb-text current">{segment}</span>
+            {#each breadcrumbs as crumb, i (crumb.pathRef)}
+              {#if i > 0}<span class="mac-crumb-sep"><Icon name="chevron-right" size={10} /></span>{/if}
+              {#if i === breadcrumbs.length - 1}
+                <span class="mac-crumb-text current">{crumb.name}</span>
               {:else}
-                <button class="mac-crumb-btn" onclick={() => navigateToSegment(i)} disabled={loading}>
-                  {segment}
+                <button class="mac-crumb-btn" onclick={() => navigateToNode(crumb)} disabled={loading} title={crumb.displayPath}>
+                  {crumb.name}
                 </button>
               {/if}
             {/each}
@@ -277,7 +255,7 @@
           placeholder={i18n.t('web.folderPickerManualPathPlaceholder')}
         />
       </div>
-      <button class="apple-action-btn primary" onclick={goToManualPath} disabled={loading || !manualPathInput.trim()}>
+      <button class="apple-action-btn primary" onclick={() => void goToManualPath()} disabled={loading || !manualPathInput.trim()}>
         {i18n.t('web.folderPickerGo')}
       </button>
     </div>
@@ -306,25 +284,19 @@
       </div>
     {:else}
       <div class="mac-list">
-        {#each entries as entry (entry.path)}
+        {#each entries as entry (entry.pathRef)}
           <button
             class="mac-list-item"
-            class:selected={selectedPath === entry.path}
-            class:is-file={!entry.isDirectory}
+            class:selected={selectedPathRef === entry.pathRef}
             type="button"
-            disabled={!entry.isDirectory && selectionMode === 'directory'}
-            onclick={() => {
-              if (entry.isDirectory || selectionMode === 'file-or-directory') selectEntry(entry);
-            }}
+            onclick={() => selectEntry(entry)}
             ondblclick={() => handleDblClick(entry)}
           >
-            <div class="mac-item-icon" class:is-file={!entry.isDirectory}>
-              <Icon name={entry.isDirectory ? 'folder' : 'document'} size={16} />
+            <div class="mac-item-icon">
+              <Icon name="folder" size={16} />
             </div>
             <span class="mac-item-name">{entry.name}</span>
-            {#if entry.isDirectory && entry.hasChildren !== false}
-              <div class="mac-item-chevron"><Icon name="chevron-right" size={12} /></div>
-            {/if}
+            <div class="mac-item-chevron"><Icon name="chevron-right" size={12} /></div>
           </button>
         {/each}
       </div>
@@ -348,7 +320,7 @@
     
     <div class="mac-footer-right">
       <button class="apple-action-btn secondary" onclick={onCancel} disabled={disabled}>{i18n.t('web.folderPickerCancel')}</button>
-      {#if selectedPath}
+      {#if selectedPathRef}
         <button class="apple-action-btn primary" onclick={confirmSelection} disabled={disabled || loading}>{i18n.t('web.folderPickerConfirm')}</button>
       {:else}
         <button class="apple-action-btn primary" onclick={selectCurrentDir} disabled={disabled || loading || !hasLoaded}>{i18n.t('web.folderPickerSelectCurrent')}</button>
@@ -607,20 +579,6 @@
     box-shadow: 0 2px 6px rgba(var(--primary-rgb, 0, 122, 255), 0.3);
   }
 
-  .mac-list-item.is-file {
-    opacity: 0.6;
-    cursor: default;
-  }
-
-  .mac-list-item.is-file:not(:disabled) {
-    opacity: 1;
-    cursor: pointer;
-  }
-
-  .mac-list-item.is-file:disabled:hover {
-    background: transparent;
-  }
-
   .mac-item-icon {
     display: flex;
     align-items: center;
@@ -628,11 +586,6 @@
     /* Apple 风格蓝色文件夹 */
     color: var(--primary);
     filter: drop-shadow(0 1px 1px rgba(0,0,0,0.1));
-  }
-
-  .mac-item-icon.is-file {
-    color: var(--foreground-muted);
-    filter: none;
   }
 
   .mac-list-item.selected .mac-item-icon {

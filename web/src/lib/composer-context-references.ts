@@ -3,6 +3,7 @@ export type ComposerContextReferenceKind = 'file' | 'directory';
 export interface ComposerContextReferenceInput {
   kind: ComposerContextReferenceKind;
   path: string;
+  pathRef?: string;
   name: string;
 }
 
@@ -24,15 +25,21 @@ export function addComposerContextReference(
 ): ComposerContextReference[] {
   const path = normalizePath(input.path);
   if (!path) return references;
-  const id = `${input.kind}:${path}`;
+  const pathRef = input.pathRef?.trim() || undefined;
+  const id = `${input.kind}:${pathRef || path}`;
   if (references.some((reference) => reference.id === id)) return references;
   if (references.length >= MAX_COMPOSER_CONTEXT_REFERENCES) return references;
   const name = input.name.trim() || path.split(/[\\/]/u).filter(Boolean).pop() || path;
-  return [...references, { id, kind: input.kind, path, name }];
+  return [...references, { id, kind: input.kind, path, pathRef, name }];
 }
 
 export function toSessionContextReferencePayload(
   references: ComposerContextReference[],
 ): ComposerContextReferenceInput[] {
-  return references.map(({ kind, path, name }) => ({ kind, path, name }));
+  return references.map(({ kind, path, pathRef, name }) => ({
+    kind,
+    path,
+    ...(pathRef ? { pathRef } : {}),
+    name,
+  }));
 }

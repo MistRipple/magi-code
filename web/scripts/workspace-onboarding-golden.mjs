@@ -92,8 +92,13 @@ assert.match(
 );
 assert.match(
   inputAreaSource,
-  /function selectWorkspace\([\s\S]*?type: 'workspaceBindingChanged'[\s\S]*?workspaceId: workspace\.workspaceId[\s\S]*?workspacePath: workspace\.rootPath[\s\S]*?sessionId: ''/,
-  '草稿态选择已有项目后必须切换权威工作空间绑定并继续保留新会话',
+  /function workspaceBindingPath\(workspace: ComposerWorkspaceOption\)[\s\S]*?workspace\.rootPathRef\?\.trim\(\) \|\| workspace\.rootPath\.trim\(\)/,
+  '输入区工作空间绑定必须优先使用后端不透明 pathRef',
+);
+assert.match(
+  inputAreaSource,
+  /function selectWorkspace\([\s\S]*?type: 'workspaceBindingChanged'[\s\S]*?workspaceId: workspace\.workspaceId[\s\S]*?workspacePath: workspaceBindingPath\(workspace\)[\s\S]*?sessionId: ''/,
+  '草稿态选择已有项目后必须使用权威 pathRef 切换工作空间绑定',
 );
 assert.match(
   shellSource,
@@ -117,8 +122,8 @@ assert.match(
 );
 assert.match(
   shellSource,
-  /async function openWorkspaceDraft\(workspace: AgentWorkspaceSummary\): Promise<void>[\s\S]*?selectComposerDraftWorkspace\(workspaceId\)[\s\S]*?type: 'newSession'[\s\S]*?workspaceId,[\s\S]*?workspacePath,[\s\S]*?loadWorkspaceSessionsForSidebar\(workspace\)/,
-  '工作空间快捷新会话必须复用单一草稿绑定并由 bridge 进入新会话',
+  /async function openWorkspaceDraft\(workspace: AgentWorkspaceSummary\): Promise<void>[\s\S]*?const workspacePath = workspaceBindingPath\(workspace\)[\s\S]*?selectComposerDraftWorkspace\(workspaceId\)[\s\S]*?type: 'newSession'[\s\S]*?workspaceId,[\s\S]*?workspacePath,[\s\S]*?loadWorkspaceSessionsForSidebar\(workspace\)/,
+  '工作空间快捷新会话必须使用权威 pathRef 进入 bridge',
 );
 assert.match(
   shellSource,

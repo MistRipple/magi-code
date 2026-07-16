@@ -762,11 +762,13 @@ fn workspace_root_path_from_registry(
         .workspaces()
         .into_iter()
         .find(|workspace| workspace.workspace_id == *workspace_id)
-        .map(|workspace| PathBuf::from(workspace.root_path.as_str()))
+        .map(|workspace| workspace.native_root_path())
 }
 
 fn canonicalize_path_for_workspace_match(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    magi_core::HostPath::canonicalize(path)
+        .map(magi_core::HostPath::into_path_buf)
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 impl ApiState {
@@ -1123,13 +1125,21 @@ impl ApiState {
         let requested_path = requested_workspace_path
             .map(str::trim)
             .filter(|path| !path.is_empty())
-            .map(PathBuf::from)?;
+            .and_then(|path| {
+                magi_core::HostPath::resolve_native_input(
+                    path,
+                    std::env::current_dir().ok().as_deref(),
+                    dirs::home_dir().as_deref(),
+                )
+                .ok()
+            })
+            .map(magi_core::HostPath::into_path_buf)?;
         let requested_path = canonicalize_path_for_workspace_match(&requested_path);
         self.workspace_registry
             .workspaces()
             .into_iter()
             .find(|workspace| {
-                let stored_path = PathBuf::from(workspace.root_path.as_str());
+                let stored_path = workspace.native_root_path();
                 canonicalize_path_for_workspace_match(&stored_path) == requested_path
             })
             .map(|workspace| workspace.workspace_id)
@@ -1425,7 +1435,7 @@ impl ApiState {
         for workspace in &workspaces {
             let ws_id = workspace.workspace_id.to_string();
             let ws_state = workspace_states.remove(&ws_id).unwrap_or_default();
-            let magi_dir = std::path::Path::new(workspace.root_path.as_str()).join(".magi");
+            let magi_dir = workspace.native_root_path().join(".magi");
             let session_path = magi_dir.join("sessions.json");
             persistence.save_json(&session_path, &ws_state)?;
         }

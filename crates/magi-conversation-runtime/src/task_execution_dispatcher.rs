@@ -1033,7 +1033,7 @@ impl LlmTaskDispatcher {
             .workspaces()
             .into_iter()
             .find(|workspace| workspace.workspace_id == *workspace_id)
-            .map(|workspace| PathBuf::from(workspace.root_path.as_str()))
+            .map(|workspace| workspace.native_root_path())
     }
 
     fn task_fact_context_parts(&self, task: &magi_core::Task) -> Vec<String> {

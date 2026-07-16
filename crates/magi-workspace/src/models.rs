@@ -3,6 +3,7 @@ use magi_core::{
     WorkspaceLifecycleStatus, public_runtime_summary,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -10,10 +11,22 @@ pub struct WorkspaceRecord {
     pub workspace_id: WorkspaceId,
     pub name: Option<String>,
     pub root_path: AbsolutePath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_path_ref: Option<String>,
     pub worktree_root: Option<AbsolutePath>,
     pub status: WorkspaceLifecycleStatus,
     pub created_at: UtcMillis,
     pub updated_at: UtcMillis,
+}
+
+impl WorkspaceRecord {
+    pub fn native_root_path(&self) -> PathBuf {
+        self.root_path_ref
+            .as_deref()
+            .and_then(|value| magi_core::HostPath::from_path_ref(value).ok())
+            .map(magi_core::HostPath::into_path_buf)
+            .unwrap_or_else(|| PathBuf::from(self.root_path.as_str()))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -425,13 +425,22 @@ fn count_diff_lines(diff: &str) -> (usize, usize) {
 }
 
 pub(crate) fn safe_relative_path(file_path: &str) -> Result<&str, ApiError> {
+    let bytes = file_path.as_bytes();
+    let has_windows_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    let has_unc_prefix = file_path.starts_with(r"\\");
+    if has_windows_prefix || has_unc_prefix {
+        return Err(ApiError::InvalidInput("路径不允许为绝对路径".to_string()));
+    }
     let path = Path::new(file_path);
     for component in path.components() {
-        if matches!(component, std::path::Component::ParentDir) {
-            return Err(ApiError::InvalidInput("路径不允许包含 ..".to_string()));
-        }
-        if matches!(component, std::path::Component::RootDir) {
-            return Err(ApiError::InvalidInput("路径不允许为绝对路径".to_string()));
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(ApiError::InvalidInput("路径不允许包含 ..".to_string()));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(ApiError::InvalidInput("路径不允许为绝对路径".to_string()));
+            }
+            std::path::Component::CurDir | std::path::Component::Normal(_) => {}
         }
     }
     Ok(file_path)
@@ -452,18 +461,26 @@ pub(crate) fn safe_workspace_path(
     if trimmed.is_empty() {
         return Err(ApiError::InvalidInput("文件路径不能为空".to_string()));
     }
-    let candidate = Path::new(trimmed);
+    let decoded_path = trimmed
+        .starts_with("mhp1:")
+        .then(|| magi_core::HostPath::from_path_ref(trimmed))
+        .transpose()
+        .map_err(|_| ApiError::InvalidInput("路径引用无效".to_string()))?
+        .map(magi_core::HostPath::into_path_buf);
+    let candidate = decoded_path
+        .as_deref()
+        .unwrap_or_else(|| Path::new(trimmed));
     let candidate_abs = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
         let rel = safe_relative_path(trimmed)?;
         workspace_root.join(rel)
     };
-    let canonical_root = workspace_root
-        .canonicalize()
+    let canonical_root = magi_core::HostPath::canonicalize(workspace_root)
+        .map(magi_core::HostPath::into_path_buf)
         .map_err(|e| path_access_error("规范化工作区根目录失败", workspace_root, e))?;
-    let canonical_path = candidate_abs
-        .canonicalize()
+    let canonical_path = magi_core::HostPath::canonicalize(&candidate_abs)
+        .map(magi_core::HostPath::into_path_buf)
         .map_err(|e| path_access_error("规范化文件路径失败", &candidate_abs, e))?;
     let relative = canonical_path
         .strip_prefix(&canonical_root)
@@ -492,7 +509,7 @@ fn resolve_workspace_root(
         .iter()
         .find(|workspace| workspace.workspace_id == *workspace_id)
         .ok_or_else(|| ApiError::not_found("workspace 不存在", workspace_id.as_str()))?;
-    Ok(PathBuf::from(workspace.root_path.as_str()))
+    Ok(workspace.native_root_path())
 }
 
 fn session_execution_group_id(session_id: &SessionId) -> String {
@@ -831,6 +848,8 @@ mod tests {
     fn safe_relative_path_rejects_parent_and_root() {
         assert!(safe_relative_path("../etc/passwd").is_err());
         assert!(safe_relative_path("/etc/passwd").is_err());
+        assert!(safe_relative_path(r"C:\Windows\System32").is_err());
+        assert!(safe_relative_path(r"\\server\share\file.txt").is_err());
         assert_eq!(safe_relative_path("foo/bar.txt").unwrap(), "foo/bar.txt");
     }
 
@@ -843,6 +862,21 @@ mod tests {
         let abs = outside_file.to_string_lossy().into_owned();
         let err = safe_workspace_path(&root, &abs).unwrap_err();
         assert!(matches!(err, ApiError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn safe_workspace_path_accepts_host_path_ref() {
+        let root = unique_temp_dir("magi-change-projection-path-ref");
+        let file = root.join("path-ref.txt");
+        fs::write(&file, "path-ref\n").expect("file should write");
+        let path_ref = magi_core::HostPath::from_path(file.clone())
+            .to_path_ref()
+            .as_str()
+            .to_string();
+
+        let (resolved, relative) = safe_workspace_path(&root, &path_ref).expect("path ref");
+        assert_eq!(resolved, file.canonicalize().unwrap());
+        assert_eq!(relative, "path-ref.txt");
     }
 
     #[test]

@@ -304,6 +304,7 @@ export interface MessageImage {
 export interface MessageContextReference {
   kind: 'file' | 'directory';
   path: string;
+  pathRef?: string;
   name: string;
 }
 
@@ -667,6 +668,7 @@ export interface QueuedMessageImage {
 export interface QueuedMessageContextReference {
   kind: 'file' | 'directory';
   path: string;
+  pathRef?: string;
   name: string;
 }
 

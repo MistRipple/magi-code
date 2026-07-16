@@ -20,7 +20,8 @@
     saveAgentOrchestratorSessionConfig,
     fetchWorkspaceBranches,
     checkoutWorkspaceBranch,
-    browseAgentDirectory,
+    resolveAgentPath,
+    type ResolvedAgentPath,
     type AgentSettingsBootstrapSnapshot,
     type WorkspaceVcsStatus,
     settingsBootstrapMatchesCurrentWorkspace,
@@ -674,11 +675,14 @@
   }
 
   function handleContextReferenceSelected(
-    path: string,
-    name: string,
-    kind: ComposerContextReferenceKind,
+    selection: { pathRef: string; displayPath: string; name: string },
   ) {
-    addContextReference({ kind, path, name });
+    addContextReference({
+      kind: 'directory',
+      path: selection.displayPath,
+      pathRef: selection.pathRef,
+      name: selection.name,
+    });
     contextPickerOpen = false;
     queueMicrotask(focusEditor);
   }
@@ -686,6 +690,7 @@
   function addContextReference(input: {
     kind: ComposerContextReferenceKind;
     path: string;
+    pathRef?: string;
     name: string;
   }): boolean {
     const next = addComposerContextReference(selectedContextReferences, input);
@@ -726,7 +731,7 @@
         break;
       }
       try {
-        const result = await browseAgentDirectory(path);
+        const result: ResolvedAgentPath = await resolveAgentPath(path);
         if (currentComposerReferenceScopeKey() !== dropScopeKey) return;
         const reference = resolveDesktopDroppedPath(path, result);
         if (reference) addContextReference(reference);
@@ -787,17 +792,21 @@
     writeStoredAccessProfile(profile);
   }
 
+  function workspaceBindingPath(workspace: ComposerWorkspaceOption): string {
+    return workspace.rootPathRef?.trim() || workspace.rootPath.trim();
+  }
+
   function workspaceBinding(workspace: ComposerWorkspaceOption | null): { workspaceId?: string; workspacePath?: string } {
     if (!workspace) return {};
     return {
       workspaceId: workspace.workspaceId,
-      workspacePath: workspace.rootPath,
+      workspacePath: workspaceBindingPath(workspace),
     };
   }
 
   function workspaceKey(workspace: ComposerWorkspaceOption | null): string {
     if (!workspace) return '';
-    return `${workspace.workspaceId}::${workspace.rootPath}`;
+    return `${workspace.workspaceId}::${workspaceBindingPath(workspace)}`;
   }
 
   function composerWorkspaceLabel(workspace: ComposerWorkspaceOption | null): string {
@@ -829,7 +838,7 @@
     vscode.postMessage({
       type: 'workspaceBindingChanged',
       workspaceId: workspace.workspaceId,
-      workspacePath: workspace.rootPath,
+      workspacePath: workspaceBindingPath(workspace),
       sessionId: '',
     });
     void refreshBranchState();
@@ -1025,7 +1034,7 @@
         text: submissionText,
         requestId,
         workspaceId: targetWorkspace.workspaceId,
-        workspacePath: targetWorkspace.rootPath,
+        workspacePath: workspaceBindingPath(targetWorkspace),
         sessionId: isDraftSession ? '' : (messagesState.currentSessionId || ''),
         skillName: selectedSkill?.skillId ?? null,
         goalMode: selectedGoalMode,
@@ -2401,7 +2410,6 @@
   >
     <WebFolderPicker
       title={i18n.t('input.add.contextPickerTitle')}
-      selectionMode="file-or-directory"
       onSelect={handleContextReferenceSelected}
       onCancel={() => (contextPickerOpen = false)}
     />

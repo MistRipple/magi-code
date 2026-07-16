@@ -524,6 +524,11 @@ pub fn normalize_tool_policy_paths(
 }
 
 fn resolve_tool_policy_path(path: &str, workspace_root_path: Option<&Path>) -> PathBuf {
+    if path.starts_with("mhp1:")
+        && let Ok(decoded) = magi_core::HostPath::from_path_ref(path)
+    {
+        return canonicalize_tool_permission_path(decoded.as_path());
+    }
     let path = PathBuf::from(path);
     let resolved = if path.is_absolute() {
         path
@@ -757,7 +762,13 @@ fn shell_exec_command_path_accesses(
     let Some(command) = object.and_then(|object| field_string(object, &["command"])) else {
         return Vec::new();
     };
-    let tokens = shell_command_tokens(&command);
+    let dialect = ShellDialect::from_shell(
+        object
+            .and_then(|object| field_string(object, &["shell"]))
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    let tokens = shell_command_tokens(&command, dialect);
     if tokens.is_empty() {
         return Vec::new();
     }
@@ -779,7 +790,35 @@ enum ShellToken {
     Operator(String),
 }
 
-fn shell_command_tokens(command: &str) -> Vec<ShellToken> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellDialect {
+    Posix,
+    Cmd,
+    PowerShell,
+}
+
+impl ShellDialect {
+    fn from_shell(shell: &str) -> Self {
+        let shell = shell.trim().to_ascii_lowercase();
+        if shell.contains("powershell") || shell.ends_with("pwsh") || shell.ends_with("pwsh.exe") {
+            Self::PowerShell
+        } else if shell.contains("cmd") || (shell.is_empty() && cfg!(windows)) {
+            Self::Cmd
+        } else {
+            Self::Posix
+        }
+    }
+
+    fn escape_char(self) -> char {
+        match self {
+            Self::Posix => '\\',
+            Self::Cmd => '^',
+            Self::PowerShell => '`',
+        }
+    }
+}
+
+fn shell_command_tokens(command: &str, dialect: ShellDialect) -> Vec<ShellToken> {
     let mut tokens = Vec::new();
     let mut word = String::new();
     let mut chars = command.chars().peekable();
@@ -792,7 +831,7 @@ fn shell_command_tokens(command: &str) -> Vec<ShellToken> {
             escaped = false;
             continue;
         }
-        if ch == '\\' && quote != Some('\'') {
+        if ch == dialect.escape_char() && quote != Some('\'') {
             escaped = true;
             continue;
         }
@@ -834,7 +873,7 @@ fn shell_command_tokens(command: &str) -> Vec<ShellToken> {
         word.push(ch);
     }
     if escaped {
-        word.push('\\');
+        word.push(dialect.escape_char());
     }
     push_shell_word(&mut tokens, &mut word);
     tokens
@@ -861,7 +900,12 @@ fn shell_redirection_write_paths(
         let Some(ShellToken::Word(target)) = tokens.get(index + 1) else {
             continue;
         };
-        if target == "/dev/null" || target.starts_with('&') || target == "-" {
+        if target == "/dev/null"
+            || target.eq_ignore_ascii_case("NUL")
+            || target.eq_ignore_ascii_case("$null")
+            || target.starts_with('&')
+            || target == "-"
+        {
             continue;
         }
         push_shell_path(
@@ -910,12 +954,13 @@ fn shell_segment_path_accesses(
     let Some(command_index) = shell_command_word_index(&words) else {
         return Vec::new();
     };
-    let command = shell_command_basename(words[command_index]);
+    let command = shell_command_basename(words[command_index]).to_ascii_lowercase();
     let arguments = &words[command_index + 1..];
     let mut paths = Vec::new();
 
-    match command {
-        "cp" | "mv" | "install" => {
+    match command.as_str() {
+        "cp" | "mv" | "install" | "copy" | "xcopy" | "robocopy" | "move" | "copy-item"
+        | "move-item" => {
             let operands = shell_non_option_operands(arguments);
             for source in operands.iter().take(operands.len().saturating_sub(1)) {
                 push_shell_path(
@@ -944,7 +989,9 @@ fn shell_segment_path_accesses(
                 );
             }
         }
-        "touch" | "mkdir" | "rmdir" | "rm" | "unlink" | "truncate" => {
+        "touch" | "mkdir" | "rmdir" | "rm" | "unlink" | "truncate" | "del" | "erase"
+        | "remove-item" | "new-item" | "set-content" | "add-content" | "clear-content"
+        | "out-file" => {
             for path in shell_non_option_operands(arguments) {
                 push_shell_path(
                     &mut paths,
@@ -985,7 +1032,7 @@ fn shell_command_word_index(words: &[&str]) -> Option<usize> {
 }
 
 fn shell_command_basename(command: &str) -> &str {
-    command.rsplit('/').next().unwrap_or(command)
+    command.rsplit(['/', '\\']).next().unwrap_or(command)
 }
 
 fn shell_non_option_operands<'a>(arguments: &'a [&'a str]) -> Vec<&'a str> {
@@ -1001,6 +1048,12 @@ fn shell_word_looks_like_path(value: &str) -> bool {
         || value.starts_with("./")
         || value.starts_with("../")
         || value.contains('/')
+        || value.starts_with("\\\\")
+        || value.contains('\\')
+        || (value.len() >= 3
+            && value.as_bytes()[0].is_ascii_alphabetic()
+            && value.as_bytes()[1] == b':'
+            && matches!(value.as_bytes()[2], b'\\' | b'/'))
 }
 
 fn push_shell_path(
@@ -1139,5 +1192,34 @@ fn normalize_path_for_lock(path: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         normalized
+    }
+}
+
+#[cfg(test)]
+mod shell_path_parser_tests {
+    use super::{
+        ShellDialect, ShellToken, shell_command_basename, shell_command_tokens,
+        shell_word_looks_like_path,
+    };
+
+    #[test]
+    fn cmd_tokenizer_preserves_windows_backslashes() {
+        assert_eq!(
+            shell_command_tokens(r#"type "C:\Users\demo\file.txt""#, ShellDialect::Cmd),
+            vec![
+                ShellToken::Word("type".to_string()),
+                ShellToken::Word(r#"C:\Users\demo\file.txt"#.to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_paths_are_recognized_by_shell_policy() {
+        assert_eq!(
+            shell_command_basename(r#"C:\Windows\System32\cmd.exe"#),
+            "cmd.exe"
+        );
+        assert!(shell_word_looks_like_path(r#"C:\Users\demo\file.txt"#));
+        assert!(shell_word_looks_like_path(r#"\\server\share\folder"#));
     }
 }

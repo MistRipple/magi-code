@@ -2,6 +2,7 @@ export interface ComposerWorkspaceOption {
   workspaceId: string;
   name: string;
   rootPath: string;
+  rootPathRef?: string;
   isActive: boolean;
 }
 
@@ -35,6 +36,7 @@ function normalizeWorkspaceOption(input: ComposerWorkspaceOption): ComposerWorks
   return {
     workspaceId,
     rootPath,
+    rootPathRef: normalizeWorkspacePath(input.rootPathRef) || undefined,
     name,
     isActive: input.isActive === true,
   };
@@ -57,7 +59,9 @@ function findWorkspaceByBinding(
     if (byId) return byId;
   }
   if (normalizedPath) {
-    return composerWorkspaceState.workspaces.find((workspace) => workspace.rootPath === normalizedPath) ?? null;
+    return composerWorkspaceState.workspaces.find((workspace) => (
+      workspace.rootPathRef === normalizedPath || workspace.rootPath === normalizedPath
+    )) ?? null;
   }
   return null;
 }

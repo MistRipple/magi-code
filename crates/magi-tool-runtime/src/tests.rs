@@ -105,6 +105,43 @@ fn file_read_uses_schema_path_and_directory_listing() {
 }
 
 #[test]
+fn file_read_accepts_host_path_ref_without_reconstructing_native_path() {
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let mut tool_registry = ToolRegistry::new(governance, event_bus);
+    tool_registry.register_default_builtins();
+    let root = std::env::temp_dir().join(format!("magi-tool-path-ref-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("root should create");
+    let file = root.join("path-ref.txt");
+    std::fs::write(&file, "path-ref-content").expect("file should write");
+    let path_ref = magi_core::HostPath::from_path(file)
+        .to_path_ref()
+        .as_str()
+        .to_string();
+
+    let output = tool_registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-file-read-path-ref"),
+            tool_name: BuiltinToolName::FileRead.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({ "path": path_ref }).to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        ToolExecutionContext {
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        },
+        &ToolExecutionPolicy::default(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert_eq!(payload["content"], "path-ref-content");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn file_read_rejects_raw_path_input() {
     let root = unique_temp_dir("magi-tool-file-read-raw-rejected");
     let file_path = root.join("hello.txt");

@@ -149,11 +149,6 @@ fn is_local_skill_dir(dir: &std::path::Path) -> bool {
 fn build_local_instruction_skill_entry(
     dir: &std::path::Path,
 ) -> Result<serde_json::Value, ApiError> {
-    let directory_path = dir
-        .to_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("本地 Skill 目录不可用".to_string()))?;
     let skill_name = dir
         .file_name()
         .and_then(|value| value.to_str())
@@ -166,7 +161,8 @@ fn build_local_instruction_skill_entry(
         "name": skill_name,
         "skillId": skill_name,
         "fullName": skill_name,
-        "directoryPath": directory_path,
+        "directoryPath": dir.to_string_lossy(),
+        "directoryPathRef": magi_core::HostPath::from_path(dir.to_path_buf()).to_path_ref().as_str(),
         "description": description,
         "source": "local",
         "fileCount": metadata.file_count,
@@ -291,7 +287,13 @@ fn normalize_local_instruction_skill_request_path(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::InvalidInput("请选择本地 Skill 目录".to_string()))?;
-    Ok(std::path::PathBuf::from(directory_path))
+    magi_core::HostPath::resolve_native_input(
+        directory_path,
+        std::env::current_dir().ok().as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+    .map(magi_core::HostPath::into_path_buf)
+    .map_err(|error| ApiError::InvalidInput(error.to_string()))
 }
 
 fn normalize_local_instruction_skill_request_skill_id(
@@ -308,6 +310,7 @@ fn normalize_local_instruction_skill_request_skill_id(
 fn public_local_instruction_skill_entry(entry: &serde_json::Value) -> serde_json::Value {
     let mut obj = entry.as_object().cloned().unwrap_or_default();
     obj.remove("directoryPath");
+    obj.remove("directoryPathRef");
     if !obj.contains_key("localSkillId")
         && let Some(skill_id) = instruction_skill_id(entry)
     {
@@ -1371,6 +1374,7 @@ async fn list_skills(State(state): State<ApiState>) -> Json<serde_json::Value> {
         .map(|skill| {
             let mut entry = skill.as_object().cloned().unwrap_or_default();
             entry.remove("directoryPath");
+            entry.remove("directoryPathRef");
             entry.insert("installed".to_string(), serde_json::json!(true));
             serde_json::Value::Object(entry)
         })
@@ -1648,17 +1652,13 @@ async fn remove_installed_skill(
                 .and_then(|skill| skill.get("source"))
                 .and_then(|value| value.as_str())
                 == Some("repository")
-                && let Some(directory_path) = removed_skill
+                && let Some(directory) = removed_skill
                     .as_ref()
-                    .and_then(|skill| skill.get("directoryPath"))
-                    .and_then(|value| value.as_str())
+                    .and_then(skill_loader::instruction_skill_directory_path)
+                && directory.is_dir()
             {
-                let directory = PathBuf::from(directory_path);
-                if directory.is_dir() {
-                    std::fs::remove_dir_all(&directory).map_err(|error| {
-                        skill_cache_error("删除 Skill 缓存失败", &directory, error)
-                    })?;
-                }
+                std::fs::remove_dir_all(&directory)
+                    .map_err(|error| skill_cache_error("删除 Skill 缓存失败", &directory, error))?;
             }
             Ok(Json(serde_json::json!({
                 "removed": true,
@@ -1693,15 +1693,14 @@ async fn update_skill(
     };
 
     let skill = &instruction_skills[pos];
-    if let Some(dir_path) = skill.get("directoryPath").and_then(|v| v.as_str()) {
-        let path = std::path::Path::new(dir_path);
+    if let Some(path) = skill_loader::instruction_skill_directory_path(skill) {
         if !path.is_dir() {
             return Err(ApiError::InvalidInput(
                 "技能源不可用，请重新导入该 Skill".to_string(),
             ));
         }
         let mut updated_entry = skill.as_object().cloned().unwrap_or_default();
-        let meta = read_local_skill_metadata(path);
+        let meta = read_local_skill_metadata(&path);
         updated_entry.insert("fileCount".to_string(), serde_json::json!(meta.file_count));
         updated_entry.insert(
             "lastRefreshed".to_string(),
@@ -1724,15 +1723,14 @@ async fn update_all_skills(
     let mut updated_count = 0u32;
 
     for skill in instruction_skills.iter_mut() {
-        let Some(dir_path) = skill.get("directoryPath").and_then(|v| v.as_str()) else {
+        let Some(path) = skill_loader::instruction_skill_directory_path(skill) else {
             continue;
         };
-        let path = std::path::Path::new(dir_path);
         if !path.is_dir() {
             continue;
         }
         let mut entry = skill.as_object().cloned().unwrap_or_default();
-        let meta = read_local_skill_metadata(path);
+        let meta = read_local_skill_metadata(&path);
         entry.insert("fileCount".to_string(), serde_json::json!(meta.file_count));
         entry.insert(
             "lastRefreshed".to_string(),
@@ -1795,14 +1793,8 @@ async fn get_instruction_skill_preview(
         .find(|item| instruction_skill_matches(item, skill_id))
         .ok_or_else(|| ApiError::not_found("技能未安装", skill_id))?;
 
-    let directory_path = matched
-        .get("directoryPath")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    let dir = skill_loader::instruction_skill_directory_path(matched)
         .ok_or_else(|| ApiError::InvalidInput("技能源不可用，请重新导入该 Skill".to_string()))?;
-
-    let dir = PathBuf::from(directory_path);
     let instruction = skill_loader::read_available_skill_instruction(&dir)
         .ok_or_else(|| ApiError::InvalidInput("技能源不可用，请重新导入该 Skill".to_string()))?;
     let preview: String = instruction.chars().take(200).collect();
@@ -1860,6 +1852,22 @@ mod tests {
             read_local_skill_description(dir.path()),
             "用于验证 Skill 快捷引用"
         );
+    }
+
+    #[test]
+    fn local_skill_request_accepts_host_path_ref() {
+        let dir = tempfile::tempdir().expect("temp skill dir should create");
+        let path_ref = magi_core::HostPath::from_path(dir.path().to_path_buf())
+            .to_path_ref()
+            .as_str()
+            .to_string();
+
+        let resolved = normalize_local_instruction_skill_request_path(
+            &serde_json::json!({ "directoryPath": path_ref }),
+        )
+        .expect("local skill path ref should resolve");
+
+        assert_eq!(resolved, dir.path());
     }
 
     #[test]

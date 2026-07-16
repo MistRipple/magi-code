@@ -272,13 +272,16 @@ function normalizeQueuedMessageContextReference(
   reference: unknown,
 ): QueuedMessageContextReferenceItem | null {
   if (!reference || typeof reference !== 'object') return null;
-  const item = reference as { kind?: unknown; path?: unknown; name?: unknown };
+  const item = reference as { kind?: unknown; path?: unknown; pathRef?: unknown; name?: unknown };
   if (item.kind !== 'file' && item.kind !== 'directory') return null;
   if (typeof item.path !== 'string' || !item.path.trim()) return null;
   const path = item.path.trim();
   return {
     kind: item.kind,
     path,
+    ...(typeof item.pathRef === 'string' && item.pathRef.trim()
+      ? { pathRef: item.pathRef.trim() }
+      : {}),
     name: typeof item.name === 'string' && item.name.trim()
       ? item.name.trim()
       : path.split(/[\\/]/u).filter(Boolean).pop() || path,

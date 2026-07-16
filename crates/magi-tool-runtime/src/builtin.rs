@@ -288,18 +288,18 @@ pub(crate) fn resolve_path_with_context(
     input: &str,
     context: &ToolExecutionContext,
 ) -> Result<PathBuf, String> {
-    let path = PathBuf::from(input);
-    if path.is_absolute() {
-        return Ok(path);
-    }
     let cwd = context_working_directory(context)?;
-    if path
+    let trimmed = input.trim();
+    let text_path = Path::new(trimmed);
+    if text_path
         .components()
         .all(|component| matches!(component, std::path::Component::CurDir))
     {
         return Ok(cwd);
     }
-    Ok(cwd.join(path))
+    magi_core::HostPath::resolve_native_input(trimmed, Some(&cwd), dirs::home_dir().as_deref())
+        .map(magi_core::HostPath::into_path_buf)
+        .map_err(|error| error.to_string())
 }
 
 fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
@@ -805,7 +805,7 @@ fn execute_shell_command_with_timeout(
 ) -> Result<ShellExecOutput, String> {
     let mut command_builder = std_command(shell);
     command_builder
-        .arg(shell_arg())
+        .arg(shell_arg(shell))
         .arg(command)
         .current_dir(cwd)
         .stdout(Stdio::piped())
@@ -1071,7 +1071,7 @@ fn execute_process_launch_with_surface(
         .unwrap_or_else(default_shell_binary);
 
     let mut child = match std_command(&shell)
-        .arg(shell_arg())
+        .arg(shell_arg(&shell))
         .arg(&command)
         .current_dir(&cwd)
         .stdin(Stdio::piped())
@@ -1424,35 +1424,15 @@ fn execute_process_inspect(input: &str) -> String {
         .unwrap_or(20)
         .clamp(1, 100);
 
-    let output = if query.is_some() {
-        match std_command("ps")
-            .args(["-ax", "-o", "pid=,ppid=,state=,comm="])
-            .output()
-        {
-            Ok(output) => output.stdout,
-            Err(error) => {
-                return builtin_runtime_error(
-                    "process_inspect",
-                    PROCESS_INSPECT_PUBLIC_ERROR,
-                    "查询进程列表失败",
-                    error,
-                );
-            }
-        }
-    } else {
-        match std_command("ps")
-            .args(["-p", &pid.to_string(), "-o", "pid=,ppid=,state=,comm="])
-            .output()
-        {
-            Ok(output) => output.stdout,
-            Err(error) => {
-                return builtin_runtime_error(
-                    "process_inspect",
-                    PROCESS_INSPECT_PUBLIC_ERROR,
-                    "查询进程信息失败",
-                    error,
-                );
-            }
+    let output = match platform_process_listing(query.is_some(), pid) {
+        Ok(output) => output,
+        Err(error) => {
+            return builtin_runtime_error(
+                "process_inspect",
+                PROCESS_INSPECT_PUBLIC_ERROR,
+                "查询进程信息失败",
+                error,
+            );
         }
     };
 
@@ -1493,6 +1473,47 @@ fn execute_process_inspect(input: &str) -> String {
         }
     })
     .to_string()
+}
+
+#[cfg(not(windows))]
+fn platform_process_listing(list_all: bool, pid: u32) -> std::io::Result<Vec<u8>> {
+    let mut command = std_command("ps");
+    if list_all {
+        command.args(["-ax", "-o", "pid=,ppid=,state=,comm="]);
+    } else {
+        command.args(["-p", &pid.to_string(), "-o", "pid=,ppid=,state=,comm="]);
+    }
+    command.output().map(|output| output.stdout)
+}
+
+#[cfg(windows)]
+fn platform_process_listing(list_all: bool, pid: u32) -> std::io::Result<Vec<u8>> {
+    let mut command = std_command("tasklist");
+    command.args(["/FO", "CSV", "/NH"]);
+    if !list_all {
+        command.args(["/FI", &format!("PID eq {pid}")]);
+    }
+    let output = command.output()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut normalized = String::new();
+    for line in text.lines() {
+        let fields = parse_windows_csv_line(line);
+        let Some(process_pid) = fields.get(1).and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let command = fields.first().cloned().unwrap_or_default();
+        normalized.push_str(&format!("{process_pid} 0 R {command}\n"));
+    }
+    Ok(normalized.into_bytes())
+}
+
+#[cfg(windows)]
+fn parse_windows_csv_line(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_matches('"')
+        .split("\",\"")
+        .map(str::to_string)
+        .collect()
 }
 
 fn execute_diff_preview(input: &str, context: &ToolExecutionContext) -> String {
@@ -1664,8 +1685,19 @@ fn default_shell_binary() -> String {
     }
 }
 
-fn shell_arg() -> &'static str {
-    if cfg!(windows) { "/C" } else { "-lc" }
+fn shell_arg(shell: &str) -> &'static str {
+    let executable = shell
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    if executable.contains("powershell") || executable == "pwsh" || executable == "pwsh.exe" {
+        "-Command"
+    } else if executable == "cmd" || executable == "cmd.exe" {
+        "/C"
+    } else {
+        "-lc"
+    }
 }
 
 fn should_skip_directory(path: &Path, include_hidden: bool) -> bool {
@@ -3500,6 +3532,30 @@ fn knowledge_kind_label(kind: magi_knowledge_store::KnowledgeKind) -> &'static s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_tool_path_resolver_expands_home_directory() {
+        let home = dirs::home_dir().expect("home directory should exist for test");
+        let context = ToolExecutionContext {
+            working_directory: Some(std::env::temp_dir()),
+            ..ToolExecutionContext::default()
+        };
+
+        let resolved = resolve_path_with_context("~", &context).expect("home path should resolve");
+
+        assert_eq!(resolved, home);
+    }
+
+    #[test]
+    fn shell_argument_matches_selected_shell_dialect() {
+        assert_eq!(shell_arg("cmd.exe"), "/C");
+        assert_eq!(
+            shell_arg(r#"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"#),
+            "-Command"
+        );
+        assert_eq!(shell_arg("pwsh"), "-Command");
+        assert_eq!(shell_arg("/bin/zsh"), "-lc");
+    }
 
     #[test]
     fn search_challenge_page_is_not_treated_as_empty_success() {

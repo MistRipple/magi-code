@@ -2231,23 +2231,26 @@ function createSettingsStore(props: { onClose?: () => void }) {
     }
   }
 
-  async function handleLocalSkillFolderSelected(path: string): Promise<void> {
+  async function handleLocalSkillFolderSelected(
+    selection: { pathRef: string; displayPath: string; name: string },
+  ): Promise<void> {
     showLocalSkillFolderPicker = false;
-    if (!path) {
+    const pathRef = selection.pathRef.trim();
+    if (!pathRef) {
       return;
     }
     localSkillInstalling = true;
     localSkillInstallError = "";
     localSkillScanRootPath = "";
     try {
-      const result = await scanAgentLocalSkillDirectory(path);
+      const result = await scanAgentLocalSkillDirectory(pathRef);
       localSkillInstalling = false;
       const scannedSkills = ensureArray<any>((result as any)?.skills);
       if (scannedSkills.length === 0) {
         localSkillInstallError = i18n.t("settings.skillLibrary.noSkillsFound");
         return;
       }
-      localSkillScanRootPath = path;
+      localSkillScanRootPath = pathRef;
       const localEntries: LibrarySkill[] = scannedSkills.map((s: any) => ({
         name: s.name || s.skillId || "",
         fullName: s.fullName || s.name || s.skillId || "",

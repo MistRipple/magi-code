@@ -10,7 +10,10 @@ use magi_core::{
     AbsolutePath, DomainError, DomainResult, ExecutionOwnership, UtcMillis, WorkspaceId,
     WorkspaceLifecycleStatus,
 };
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::{
+    path::PathBuf,
+    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
+};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct RecoverySidecarFlushState {
@@ -147,6 +150,26 @@ impl WorkspaceStore {
         workspace_id: WorkspaceId,
         root_path: AbsolutePath,
     ) -> DomainResult<WorkspaceRecord> {
+        self.register_with_path_ref(workspace_id, root_path, None)
+    }
+
+    pub fn register_native_path(
+        &self,
+        workspace_id: WorkspaceId,
+        root_path: PathBuf,
+    ) -> DomainResult<WorkspaceRecord> {
+        let host_path = magi_core::HostPath::from_path(root_path);
+        let display_path = AbsolutePath::new(host_path.display_string());
+        let root_path_ref = host_path.to_path_ref().as_str().to_string();
+        self.register_with_path_ref(workspace_id, display_path, Some(root_path_ref))
+    }
+
+    fn register_with_path_ref(
+        &self,
+        workspace_id: WorkspaceId,
+        root_path: AbsolutePath,
+        root_path_ref: Option<String>,
+    ) -> DomainResult<WorkspaceRecord> {
         let mut state = self.write_state();
         if state
             .workspaces
@@ -157,10 +180,15 @@ impl WorkspaceStore {
                 entity: "workspace",
             });
         }
+        let native_root_path = root_path_ref
+            .as_deref()
+            .and_then(|value| magi_core::HostPath::from_path_ref(value).ok())
+            .map(magi_core::HostPath::into_path_buf)
+            .unwrap_or_else(|| PathBuf::from(root_path.as_str()));
         if state
             .workspaces
             .iter()
-            .any(|workspace| workspace.root_path == root_path)
+            .any(|workspace| workspace.native_root_path() == native_root_path)
         {
             return Err(DomainError::AlreadyExists {
                 entity: "workspace_root_path",
@@ -172,6 +200,7 @@ impl WorkspaceStore {
             workspace_id: workspace_id.clone(),
             name: None,
             root_path,
+            root_path_ref,
             worktree_root: None,
             status: WorkspaceLifecycleStatus::Registered,
             created_at: now,
@@ -286,6 +315,25 @@ mod tests {
     use crate::models::RecoveryStatus;
     use magi_core::{AbsolutePath, ExecutionOwnership, SessionId, WorkspaceId};
     use serde_json::json;
+
+    #[test]
+    fn native_workspace_registration_keeps_authoritative_path_ref() {
+        let store = WorkspaceStore::new();
+        let workspace_id = WorkspaceId::new("workspace-native-path");
+        let root = std::env::temp_dir().join("magi-native-workspace");
+
+        let workspace = store
+            .register_native_path(workspace_id, root.clone())
+            .expect("native workspace should register");
+
+        assert!(
+            workspace
+                .root_path_ref
+                .as_deref()
+                .is_some_and(|value| value.starts_with("mhp1:"))
+        );
+        assert_eq!(workspace.native_root_path(), root);
+    }
 
     #[test]
     fn recovery_sidecar_store_keeps_status_and_round_trips() {

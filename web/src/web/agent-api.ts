@@ -62,6 +62,7 @@ export interface AgentWorkspaceSummary {
   workspaceId: string;
   name: string;
   rootPath: string;
+  rootPathRef?: string;
   isActive: boolean;
 }
 
@@ -101,6 +102,7 @@ export interface AgentWorkspacePickResult {
 interface RawAgentWorkspaceSummary {
   workspaceId?: string;
   rootPath?: string;
+  rootPathRef?: string | null;
   name?: string | null;
   isActive?: boolean;
 }
@@ -475,6 +477,7 @@ function normalizeWorkspaceSummary(raw: RawAgentWorkspaceSummary): AgentWorkspac
   return {
     workspaceId,
     rootPath,
+    rootPathRef: raw.rootPathRef?.trim() || undefined,
     name: deriveWorkspaceName(rootPath, workspaceId),
     isActive: raw.isActive === true,
   };
@@ -942,25 +945,51 @@ export async function pickAgentWorkspace(): Promise<AgentWorkspacePickResult> {
   }
 }
 
-export interface DirectoryEntry {
+export interface WorkspaceDirectoryEntry {
   name: string;
   path: string;
+  pathRef: string;
+  displayPath: string;
   isDirectory: boolean;
   hasChildren?: boolean;
 }
 
+export interface DirectoryPathNode {
+  name: string;
+  pathRef: string;
+  displayPath: string;
+}
+
+export interface DirectoryPickerEntry extends DirectoryPathNode {
+  isDirectory: true;
+  isHidden: boolean;
+}
+
 export interface DirectoryListResult {
-  path: string;
-  parent: string;
-  entries: DirectoryEntry[];
-  selectedPath?: string;
-  selectedKind?: 'file';
+  pathRef: string;
+  displayPath: string;
+  parentPathRef?: string | null;
+  breadcrumbs: DirectoryPathNode[];
+  roots: DirectoryPathNode[];
+  entries: DirectoryPickerEntry[];
   error?: string;
 }
 
-export interface WorkspaceDirectoryListResult extends DirectoryListResult {
+export interface WorkspaceDirectoryListResult {
   workspaceId: string;
   workspacePath: string;
+  path: string;
+  pathRef: string;
+  parent: string;
+  parentPathRef: string;
+  entries: WorkspaceDirectoryEntry[];
+}
+
+export interface ResolvedAgentPath {
+  pathRef: string;
+  displayPath: string;
+  name: string;
+  kind: 'file' | 'directory';
 }
 
 function throwNormalizedDirectoryError(error: unknown): never {
@@ -1001,15 +1030,25 @@ export async function listAgentDirectory(
 }
 
 export async function browseAgentDirectory(
-  dirPath?: string,
-  showHidden = false,
+  options: {
+    pathRef?: string;
+    input?: string;
+    basePathRef?: string;
+    showHidden?: boolean;
+  } = {},
 ): Promise<DirectoryListResult> {
   try {
     const query = new URLSearchParams();
-    if (dirPath) {
-      query.set('path', dirPath);
+    if (options.pathRef) {
+      query.set('pathRef', options.pathRef);
     }
-    if (showHidden) {
+    if (options.input) {
+      query.set('path', options.input);
+    }
+    if (options.basePathRef) {
+      query.set('basePathRef', options.basePathRef);
+    }
+    if (options.showHidden) {
       query.set('showHidden', '1');
     }
     const response = await getTransport().request(agentUrl('/api/filesystem/browse', query.toString()));
@@ -1017,6 +1056,19 @@ export async function browseAgentDirectory(
   } catch (error) {
     throwNormalizedDirectoryError(error);
   }
+}
+
+export async function resolveAgentPath(
+  input: string,
+  basePathRef?: string,
+): Promise<ResolvedAgentPath> {
+  return await postJsonWithBinding<ResolvedAgentPath>(
+    '/api/filesystem/resolve',
+    { input, ...(basePathRef ? { basePathRef } : {}) },
+    'resolve filesystem path',
+    undefined,
+    false,
+  );
 }
 
 export async function getWorkspaceSessions(
@@ -1185,6 +1237,7 @@ export async function submitSessionTurn(
     contextReferences?: Array<{
       kind: 'file' | 'directory';
       path: string;
+      pathRef?: string;
       name: string;
     }>;
     accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
@@ -1225,6 +1278,7 @@ export async function submitSessionTurn(
         contextReferences: (payload.contextReferences ?? []).map((reference) => ({
           kind: reference.kind,
           path: reference.path,
+          ...(reference.pathRef ? { pathRef: reference.pathRef } : {}),
           name: reference.name,
         })),
         orchestratorSessionConfig: payload.orchestratorSessionConfig ?? null,

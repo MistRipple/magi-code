@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import Icon from '../components/Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { listAgentDirectory, type DirectoryEntry } from './agent-api';
+  import { listAgentDirectory, type WorkspaceDirectoryEntry as DirectoryEntry } from './agent-api';
   import { isMarkdownFile, isWordFile } from '../lib/file-preview-utils';
   import type { IconName } from '../lib/icons';
 
@@ -12,7 +12,7 @@
     title?: string;
     titlePath?: string;
     selectedFilePath?: string | null;
-    onFileSelect?: (path: string) => void;
+    onFileSelect?: (selection: { pathRef: string; displayPath: string; name: string }) => void;
   }
 
   let { rootPath, workspaceId, title = '', titlePath = '', selectedFilePath = null, onFileSelect }: Props = $props();
@@ -23,10 +23,11 @@
   let dirErrors = $state<Map<string, string>>(new Map());
   let showHidden = $state(false);
   let loadedRootPath = $state('');
+  const ROOT_DIRECTORY_KEY = '__workspace_root__';
 
-  const rootEntries = $derived(dirCache.get(rootPath) ?? []);
-  const rootLoading = $derived(loadingDirPaths.has(rootPath));
-  const rootError = $derived(dirErrors.get(rootPath) ?? '');
+  const rootEntries = $derived(dirCache.get(ROOT_DIRECTORY_KEY) ?? []);
+  const rootLoading = $derived(loadingDirPaths.has(ROOT_DIRECTORY_KEY));
+  const rootError = $derived(dirErrors.get(ROOT_DIRECTORY_KEY) ?? '');
 
   $effect(() => {
     const nextRoot = rootPath?.trim() || '';
@@ -34,7 +35,7 @@
       return;
     }
     resetTree(nextRoot);
-    void loadDirectory(nextRoot, { force: true });
+    void loadDirectory(undefined, { force: true });
   });
 
   function resetTree(nextRoot = rootPath): void {
@@ -45,33 +46,34 @@
     dirErrors = new Map();
   }
 
-  async function loadDirectory(path: string, options: { force?: boolean } = {}): Promise<void> {
-    if (!path || loadingDirPaths.has(path)) {
+  async function loadDirectory(pathRef?: string, options: { force?: boolean } = {}): Promise<void> {
+    const cacheKey = pathRef || ROOT_DIRECTORY_KEY;
+    if (loadingDirPaths.has(cacheKey)) {
       return;
     }
-    if (!options.force && dirCache.has(path)) {
+    if (!options.force && dirCache.has(cacheKey)) {
       return;
     }
 
-    loadingDirPaths = new Set(loadingDirPaths).add(path);
+    loadingDirPaths = new Set(loadingDirPaths).add(cacheKey);
     const nextErrors = new Map(dirErrors);
-    nextErrors.delete(path);
+    nextErrors.delete(cacheKey);
     dirErrors = nextErrors;
 
     try {
-      const result = await listAgentDirectory(path, showHidden, workspaceId);
+      const result = await listAgentDirectory(pathRef || '', showHidden, workspaceId);
       const entries = [...(result.entries ?? [])].sort(compareEntries);
       const nextCache = new Map(dirCache);
-      nextCache.set(path, entries);
+      nextCache.set(cacheKey, entries);
       dirCache = nextCache;
     } catch (error) {
       console.warn('[ProjectFileTree] directory load failed:', error);
       const nextErrorMap = new Map(dirErrors);
-      nextErrorMap.set(path, i18n.t('web.projectFilesLoadFailed'));
+      nextErrorMap.set(cacheKey, i18n.t('web.projectFilesLoadFailed'));
       dirErrors = nextErrorMap;
     } finally {
       const nextLoading = new Set(loadingDirPaths);
-      nextLoading.delete(path);
+      nextLoading.delete(cacheKey);
       loadingDirPaths = nextLoading;
     }
   }
@@ -83,21 +85,21 @@
     return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
   }
 
-  function toggleDirectory(path: string): void {
+  function toggleDirectory(pathRef: string): void {
     const nextExpanded = new Set(expandedDirPaths);
-    if (nextExpanded.has(path)) {
-      nextExpanded.delete(path);
+    if (nextExpanded.has(pathRef)) {
+      nextExpanded.delete(pathRef);
       expandedDirPaths = nextExpanded;
       return;
     }
-    nextExpanded.add(path);
+    nextExpanded.add(pathRef);
     expandedDirPaths = nextExpanded;
-    void loadDirectory(path);
+    void loadDirectory(pathRef);
   }
 
   function refreshRoot(): void {
     resetTree(rootPath);
-    void loadDirectory(rootPath, { force: true });
+    void loadDirectory(undefined, { force: true });
   }
 
   // 工作区内容变更（如切分支）后刷新文件树，避免停留在旧分支的目录结构。
@@ -114,16 +116,20 @@
 
   function handleEntryClick(entry: DirectoryEntry): void {
     if (entry.isDirectory) {
-      toggleDirectory(entry.path);
+      toggleDirectory(entry.pathRef);
       return;
     }
-    onFileSelect?.(entry.path);
+    onFileSelect?.({
+      pathRef: entry.pathRef,
+      displayPath: entry.displayPath,
+      name: entry.name,
+    });
   }
 
   function getEntryIcon(entry: DirectoryEntry): IconName {
     if (entry.isDirectory) return 'folder';
-    if (isMarkdownFile(entry.path)) return 'file-text';
-    if (isWordFile(entry.path)) return 'document';
+    if (isMarkdownFile(entry.displayPath)) return 'file-text';
+    if (isWordFile(entry.displayPath)) return 'document';
     return 'file';
   }
 </script>
@@ -169,7 +175,7 @@
     <div class="file-tree-empty">{i18n.t('web.projectFilesEmpty')}</div>
   {:else}
     <div class="file-tree-list" role="tree" aria-label={i18n.t('web.projectFiles')}>
-      {#each rootEntries as entry (entry.path)}
+      {#each rootEntries as entry (entry.pathRef)}
         {@render treeNode(entry, 0)}
       {/each}
     </div>
@@ -177,22 +183,22 @@
 </div>
 
 {#snippet treeNode(entry: DirectoryEntry, depth: number)}
-  {@const expanded = expandedDirPaths.has(entry.path)}
-  {@const children = dirCache.get(entry.path) ?? []}
-  {@const loading = loadingDirPaths.has(entry.path)}
-  {@const error = dirErrors.get(entry.path) ?? ''}
+  {@const expanded = expandedDirPaths.has(entry.pathRef)}
+  {@const children = dirCache.get(entry.pathRef) ?? []}
+  {@const loading = loadingDirPaths.has(entry.pathRef)}
+  {@const error = dirErrors.get(entry.pathRef) ?? ''}
   <div
     class="file-tree-node"
     role="treeitem"
     aria-expanded={entry.isDirectory ? expanded : undefined}
-    aria-selected={!entry.isDirectory && entry.path === selectedFilePath}
+    aria-selected={!entry.isDirectory && entry.pathRef === selectedFilePath}
   >
     <button
       type="button"
       class="file-tree-row"
-      class:selected={!entry.isDirectory && entry.path === selectedFilePath}
+      class:selected={!entry.isDirectory && entry.pathRef === selectedFilePath}
       style={`--tree-depth: ${depth}`}
-      title={entry.path}
+      title={entry.displayPath}
       onclick={() => handleEntryClick(entry)}
     >
       <span class="file-tree-chevron" class:file-tree-chevron--expanded={expanded} aria-hidden="true">
@@ -213,7 +219,7 @@
         {:else if children.length === 0}
           <div class="file-tree-status" style={`--tree-depth: ${depth + 1}`}>{i18n.t('web.projectFilesEmpty')}</div>
         {:else}
-          {#each children as child (child.path)}
+          {#each children as child (child.pathRef)}
             {@render treeNode(child, depth + 1)}
           {/each}
         {/if}

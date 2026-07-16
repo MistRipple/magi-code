@@ -1078,7 +1078,7 @@ function emitLocalPendingCanonicalTurn(input: {
   placeholderMessageId: string;
   text: string;
   images: Array<{ name: string; dataUrl: string }>;
-  contextReferences: Array<{ kind: 'file' | 'directory'; path: string; name: string }>;
+  contextReferences: Array<{ kind: 'file' | 'directory'; path: string; pathRef?: string; name: string }>;
   turnSeq: number;
   createdAt: number;
 }): boolean {
@@ -1165,7 +1165,7 @@ function emitLocalPendingCanonicalTurnFailed(input: {
   placeholderMessageId: string;
   text: string;
   images: Array<{ name: string; dataUrl: string }>;
-  contextReferences: Array<{ kind: 'file' | 'directory'; path: string; name: string }>;
+  contextReferences: Array<{ kind: 'file' | 'directory'; path: string; pathRef?: string; name: string }>;
   turnSeq: number;
   createdAt: number;
   failedAt: number;
@@ -2835,6 +2835,7 @@ interface ExecuteTaskInput {
   contextReferences?: Array<{
     kind: 'file' | 'directory';
     path: string;
+    pathRef?: string;
     name: string;
   }>;
 }
@@ -3069,6 +3070,9 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       .map((reference) => ({
         kind: reference.kind,
         path: reference.path.trim(),
+        ...(typeof reference.pathRef === 'string' && reference.pathRef.trim()
+          ? { pathRef: reference.pathRef.trim() }
+          : {}),
         name: typeof reference.name === 'string' && reference.name.trim()
           ? reference.name.trim()
           : reference.path.trim().split(/[\\/]/u).filter(Boolean).pop() || reference.path.trim(),
@@ -4328,6 +4332,7 @@ export function createWebClientBridge(): ClientBridge {
                 ? message.contextReferences as Array<{
                     kind: 'file' | 'directory';
                     path: string;
+                    pathRef?: string;
                     name: string;
                   }>
                 : [],

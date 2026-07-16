@@ -534,7 +534,7 @@ import {
   >
     <WebFolderPicker
       title={i18n.t('settings.tools.selectLocalSkillFolder')}
-      onSelect={(path) => store.handleLocalSkillFolderSelected(path)}
+      onSelect={store.handleLocalSkillFolderSelected}
       onCancel={store.cancelLocalSkillFolderPicker}
       disabled={store.localSkillInstalling}
     />

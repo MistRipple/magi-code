@@ -36,6 +36,12 @@ export interface SessionTurnRequestDto {
   skillName?: string | null;
   goalMode?: boolean;
   images: SessionTurnImageDto[];
+  contextReferences?: Array<{
+    kind: 'file' | 'directory';
+    path: string;
+    pathRef?: string;
+    name: string;
+  }>;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
   requestId?: string | null;
@@ -898,6 +904,7 @@ export type ReportIncidentResponseDto = NotificationsResponseDto;
 export interface WorkspaceListItemDto {
   workspaceId: string;
   path: string;
+  rootPathRef?: string | null;
   name?: string | null;
   isActive: boolean;
 }
@@ -1239,6 +1246,17 @@ export interface FilesystemEntryDto {
   isDirectory: boolean;
 }
 
+export interface FilesystemPathNodeDto {
+  name: string;
+  pathRef: string;
+  displayPath: string;
+}
+
+export interface FilesystemDirectoryEntryDto extends FilesystemPathNodeDto {
+  isDirectory: true;
+  isHidden: boolean;
+}
+
 export interface FilesystemListResponseDto {
   workspaceId: string;
   workspacePath: string;
@@ -1248,9 +1266,12 @@ export interface FilesystemListResponseDto {
 }
 
 export interface FilesystemBrowseResponseDto {
-  path: string;
-  parent: string;
-  entries: FilesystemEntryDto[];
+  pathRef: string;
+  displayPath: string;
+  parentPathRef?: string | null;
+  breadcrumbs: FilesystemPathNodeDto[];
+  roots: FilesystemPathNodeDto[];
+  entries: FilesystemDirectoryEntryDto[];
 }
 
 export interface EnhancePromptRequestDto extends Record<string, unknown> {

@@ -31,7 +31,7 @@ impl SnapshotLifecycleObserver {
             .workspaces()
             .into_iter()
             .find(|workspace| workspace.workspace_id == target)
-            .map(|workspace| PathBuf::from(workspace.root_path.as_str()))
+            .map(|workspace| workspace.native_root_path())
     }
 }
 

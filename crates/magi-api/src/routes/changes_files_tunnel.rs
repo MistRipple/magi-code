@@ -27,6 +27,10 @@ use crate::{
         safe_relative_path, safe_workspace_path,
     },
     errors::ApiError,
+    host_paths::{
+        browse_directory, decode_path_ref, display_path, path_ref, resolve_existing_path,
+        resolved_path_dto,
+    },
     state::ApiState,
     tunnel::RemoteAccessBinding,
 };
@@ -47,6 +51,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/files/raw", get(get_file_raw))
         .route("/filesystem/list", get(list_filesystem))
         .route("/filesystem/browse", get(browse_filesystem))
+        .route("/filesystem/resolve", post(resolve_filesystem_path))
         .route("/tunnel/start", post(start_tunnel))
         .route("/tunnel/stop", post(stop_tunnel))
         .route("/tunnel/status", get(tunnel_status))
@@ -121,8 +126,14 @@ fn safe_file_preview_path(
                 .runtime_persistence()
                 .and_then(|persistence| persistence.state_root())
                 .map(|state_root| state_root.join("skills_cache"))
-                .and_then(|root| root.canonicalize().ok());
-            let canonical_candidate = candidate.canonicalize().ok();
+                .and_then(|root| {
+                    magi_core::HostPath::canonicalize(root)
+                        .ok()
+                        .map(magi_core::HostPath::into_path_buf)
+                });
+            let canonical_candidate = magi_core::HostPath::canonicalize(candidate)
+                .ok()
+                .map(magi_core::HostPath::into_path_buf);
             if let Some((root, path)) = managed_skill_root.zip(canonical_candidate)
                 && path.starts_with(root)
             {
@@ -689,8 +700,8 @@ fn canonical_directory_path(
     path: PathBuf,
     error_context: &'static str,
 ) -> Result<PathBuf, ApiError> {
-    let canonical = path
-        .canonicalize()
+    let canonical = magi_core::HostPath::canonicalize(&path)
+        .map(magi_core::HostPath::into_path_buf)
         .map_err(|e| directory_access_error(error_context, &path, e))?;
     if !canonical.is_dir() {
         return Err(ApiError::InvalidInput("路径不是目录".to_string()));
@@ -718,9 +729,12 @@ fn read_directory_entries(
         })
         .map(|entry| {
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let entry_path = entry.path();
             serde_json::json!({
                 "name": entry.file_name().to_string_lossy(),
-                "path": entry.path().to_string_lossy(),
+                "path": display_path(&entry_path),
+                "pathRef": path_ref(&entry_path),
+                "displayPath": display_path(&entry_path),
                 "isDirectory": is_dir,
             })
         })
@@ -728,12 +742,11 @@ fn read_directory_entries(
     Ok(entries)
 }
 
-fn directory_parent(path: &Path, boundary: Option<&Path>) -> String {
-    let parent = path
-        .parent()
+fn directory_parent(path: &Path, boundary: Option<&Path>) -> PathBuf {
+    path.parent()
         .filter(|parent| boundary.is_none_or(|boundary| parent.starts_with(boundary)))
-        .unwrap_or(path);
-    parent.to_string_lossy().to_string()
+        .unwrap_or(path)
+        .to_path_buf()
 }
 
 async fn list_filesystem(
@@ -758,11 +771,14 @@ async fn list_filesystem(
     let path = canonical_directory_path(path, "规范化目录失败")?;
     let show_hidden = show_hidden_enabled(query.show_hidden.as_deref());
     let entries = read_directory_entries(&path, show_hidden)?;
+    let parent = directory_parent(&path, Some(&canonical_workspace_root));
     Ok(Json(serde_json::json!({
         "workspaceId": scope.workspace_id.as_str(),
         "workspacePath": workspace_path_string(&scope.workspace_root),
-        "path": path.to_string_lossy(),
-        "parent": directory_parent(&path, Some(&canonical_workspace_root)),
+        "path": display_path(&path),
+        "pathRef": path_ref(&path),
+        "parent": display_path(&parent),
+        "parentPathRef": path_ref(&parent),
         "entries": entries,
     })))
 }
@@ -771,6 +787,8 @@ async fn list_filesystem(
 #[serde(rename_all = "camelCase")]
 struct FilesystemBrowseQuery {
     path: Option<String>,
+    path_ref: Option<String>,
+    base_path_ref: Option<String>,
     #[serde(default)]
     show_hidden: Option<String>,
 }
@@ -778,40 +796,39 @@ struct FilesystemBrowseQuery {
 async fn browse_filesystem(
     Query(query): Query<FilesystemBrowseQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let raw_path = query
+    let path = if let Some(path_ref) = query.path_ref.as_deref().filter(|value| !value.is_empty()) {
+        decode_path_ref(path_ref)?.into_path_buf()
+    } else if let Some(input) = query
         .path
         .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/"))
-        });
-    let canonical = raw_path
-        .canonicalize()
-        .map_err(|e| directory_access_error("规范化目录失败", &raw_path, e))?;
-    let (path, selected_path, selected_kind) = if canonical.is_dir() {
-        (canonical, None, None)
-    } else if canonical.is_file() {
-        let parent = canonical
-            .parent()
-            .ok_or_else(|| ApiError::InvalidInput("文件缺少可浏览的父目录".to_string()))?
-            .to_path_buf();
-        (parent, Some(canonical), Some("file"))
+        .filter(|value| !value.trim().is_empty())
+    {
+        resolve_existing_path(input, query.base_path_ref.as_deref())
+            .map_err(|_| ApiError::InvalidInput("目录不可读取或不存在".to_string()))?
     } else {
-        return Err(ApiError::InvalidInput("路径不是文件或目录".to_string()));
+        dirs::home_dir().ok_or_else(|| ApiError::InvalidInput("无法获取系统主目录".to_string()))?
     };
+    let canonical = magi_core::HostPath::canonicalize(&path)
+        .map(magi_core::HostPath::into_path_buf)
+        .map_err(|e| directory_access_error("规范化目录失败", &path, e))?;
     let show_hidden = show_hidden_enabled(query.show_hidden.as_deref());
-    let entries = read_directory_entries(&path, show_hidden)?;
-    Ok(Json(serde_json::json!({
-        "path": path.to_string_lossy(),
-        "parent": directory_parent(&path, None),
-        "entries": entries,
-        "selectedPath": selected_path.map(|path| path.to_string_lossy().to_string()),
-        "selectedKind": selected_kind,
-    })))
+    let payload = browse_directory(canonical, show_hidden)?;
+    Ok(Json(serde_json::to_value(payload).unwrap_or_default()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveFilesystemPathRequest {
+    input: String,
+    base_path_ref: Option<String>,
+}
+
+async fn resolve_filesystem_path(
+    Json(request): Json<ResolveFilesystemPathRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let path = resolve_existing_path(&request.input, request.base_path_ref.as_deref())?;
+    let payload = resolved_path_dto(path)?;
+    Ok(Json(serde_json::to_value(payload).unwrap_or_default()))
 }
 
 // ─── Tunnel ──────────────────────────────────────────────────────────────────
@@ -1413,9 +1430,10 @@ mod tests {
     async fn filesystem_browse_lists_picker_directory_without_workspace_scope() {
         let root = unique_temp_dir("magi-filesystem-browse-picker");
         fs::write(root.join("visible.txt"), "visible\n").expect("visible file should write");
-        fs::write(root.join(".hidden"), "hidden\n").expect("hidden file should write");
-        fs::create_dir_all(root.join("workspace-candidate"))
-            .expect("workspace candidate dir should create");
+        fs::create_dir_all(root.join(".hidden-z")).expect("hidden dir should create");
+        fs::create_dir_all(root.join(".hidden-a")).expect("hidden dir should create");
+        fs::create_dir_all(root.join("workspace-z")).expect("workspace dir should create");
+        fs::create_dir_all(root.join("workspace-a")).expect("workspace dir should create");
         let state = build_state();
 
         let response = routes()
@@ -1439,22 +1457,32 @@ mod tests {
             "browse payload must not claim a workspace binding"
         );
         assert!(
-            payload["path"]
+            payload["displayPath"]
                 .as_str()
                 .is_some_and(|path| path.contains("magi-filesystem-browse-picker")),
             "browse payload must carry listed path"
         );
+        assert!(
+            payload["pathRef"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("mhp1:"))
+        );
+        assert!(
+            payload["breadcrumbs"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
         let entries = payload["entries"].as_array().expect("entries array");
         assert!(
-            entries
-                .iter()
-                .any(|entry| entry["name"] == "workspace-candidate"),
+            entries.iter().any(|entry| entry["name"] == "workspace-a"),
             "directory candidates should be listed"
         );
         assert!(
-            entries.iter().all(|entry| entry["name"] != ".hidden"),
+            entries.iter().all(|entry| entry["name"] != ".hidden-a"),
             "hidden entries should be filtered by default"
         );
+        assert!(entries.iter().all(|entry| entry["isDirectory"] == true));
+        assert!(entries.iter().all(|entry| entry["name"] != "visible.txt"));
 
         let response = routes()
             .with_state(state)
@@ -1473,14 +1501,90 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let payload = read_json_response(response).await;
         let entries = payload["entries"].as_array().expect("entries array");
-        assert!(
-            entries.iter().any(|entry| entry["name"] == ".hidden"),
-            "showHidden=1 should include hidden entries"
+        let names = entries
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![".hidden-a", ".hidden-z", "workspace-a", "workspace-z"],
+            "隐藏目录必须优先，组内按名称排序"
         );
     }
 
     #[tokio::test]
-    async fn filesystem_browse_resolves_file_path_to_parent_and_selection() {
+    async fn filesystem_list_returns_entry_path_refs_for_lossless_navigation() {
+        let root = unique_temp_dir("magi-filesystem-list-path-ref");
+        let file = root.join("preview.txt");
+        fs::write(&file, "preview\n").expect("preview file should write");
+        let state = build_state_with_workspace_root(&root, "workspace-filesystem-path-ref");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/filesystem/list?workspaceId=workspace-filesystem-path-ref")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        let entry = payload["entries"]
+            .as_array()
+            .and_then(|entries| entries.first())
+            .expect("file entry should be returned");
+        let decoded =
+            magi_core::HostPath::from_path_ref(entry["pathRef"].as_str().expect("entry path ref"))
+                .expect("entry path ref should decode");
+        let canonical_file = file.canonicalize().expect("file should canonicalize");
+        assert_eq!(decoded.as_path(), canonical_file.as_path());
+        assert_eq!(
+            entry["displayPath"],
+            canonical_file.to_string_lossy().as_ref()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn filesystem_list_preserves_non_utf8_entries_with_path_ref() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = unique_temp_dir("magi-filesystem-list-non-utf8");
+        let name = std::ffi::OsString::from_vec(vec![b'f', b'i', b'l', b'e', b'-', 0xff]);
+        let file = root.join(&name);
+        fs::write(&file, "lossless\n").expect("non utf8 file should write");
+        let state = build_state_with_workspace_root(&root, "workspace-filesystem-non-utf8");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/filesystem/list?workspaceId=workspace-filesystem-non-utf8")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        let entry = payload["entries"]
+            .as_array()
+            .and_then(|entries| entries.first())
+            .expect("non utf8 entry should be returned");
+        let decoded =
+            magi_core::HostPath::from_path_ref(entry["pathRef"].as_str().expect("entry path ref"))
+                .expect("entry path ref should decode");
+        assert_eq!(decoded.as_path(), file.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn filesystem_resolve_returns_file_path_ref_without_using_directory_browse() {
         let root = unique_temp_dir("magi-filesystem-browse-file-selection");
         let file = root.join("reference.txt");
         fs::write(&file, "reference\n").expect("reference file should write");
@@ -1490,9 +1594,49 @@ mod tests {
             .with_state(state)
             .oneshot(
                 Request::builder()
+                    .uri("/filesystem/resolve")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "input": file.to_string_lossy() }).to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        let canonical_file = file.canonicalize().expect("file should canonicalize");
+        assert_eq!(
+            payload["displayPath"],
+            canonical_file.to_string_lossy().as_ref()
+        );
+        assert_eq!(payload["kind"], "file");
+        assert!(
+            payload["pathRef"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("mhp1:"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn filesystem_browse_preserves_non_utf8_directory_with_path_ref() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = unique_temp_dir("magi-filesystem-browse-non-utf8");
+        let name = std::ffi::OsString::from_vec(vec![b'n', b'o', b'n', b'-', 0xff]);
+        fs::create_dir_all(root.join(&name)).expect("non utf8 dir should create");
+        let state = build_state();
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
                     .uri(format!(
                         "/filesystem/browse?path={}",
-                        file.to_string_lossy()
+                        urlencoding::encode(root.to_string_lossy().as_ref())
                     ))
                     .method("GET")
                     .body(Body::empty())
@@ -1503,19 +1647,14 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let payload = read_json_response(response).await;
-        let canonical_root = root.canonicalize().expect("root should canonicalize");
-        let canonical_file = file.canonicalize().expect("file should canonicalize");
-        assert_eq!(payload["path"], canonical_root.to_string_lossy().as_ref());
-        assert_eq!(
-            payload["selectedPath"],
-            canonical_file.to_string_lossy().as_ref()
-        );
-        assert_eq!(payload["selectedKind"], "file");
-        assert!(
-            payload["entries"].as_array().is_some_and(|entries| entries
-                .iter()
-                .any(|entry| entry["name"] == "reference.txt"))
-        );
+        let entry = payload["entries"]
+            .as_array()
+            .and_then(|entries| entries.first())
+            .expect("non utf8 directory should be returned");
+        let decoded =
+            magi_core::HostPath::from_path_ref(entry["pathRef"].as_str().expect("entry path ref"))
+                .expect("path ref should decode");
+        assert_eq!(decoded.as_path(), root.join(name).canonicalize().unwrap());
     }
 
     #[tokio::test]
@@ -2062,6 +2201,50 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("payload should deserialize");
         assert_eq!(payload["content"], "alpha changed\n");
+    }
+
+    #[tokio::test]
+    async fn first_file_preview_accepts_path_refs_without_session_bootstrap() {
+        let root = unique_temp_dir("magi-first-path-ref-preview");
+        let file = root.join("README.md");
+        fs::write(&file, "first preview works\n").expect("preview file should write");
+        let state = build_state();
+        state
+            .workspace_registry
+            .register_native_path(
+                WorkspaceId::new("workspace-first-path-ref-preview"),
+                root.clone(),
+            )
+            .expect("native workspace should register");
+        let workspace_path_ref = magi_core::HostPath::from_path(root.clone())
+            .to_path_ref()
+            .as_str()
+            .to_string();
+        let file_path_ref = magi_core::HostPath::from_path(file)
+            .to_path_ref()
+            .as_str()
+            .to_string();
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/files/content?workspaceId=workspace-first-path-ref-preview&workspacePath={}&filePath={}",
+                        urlencoding::encode(&workspace_path_ref),
+                        urlencoding::encode(&file_path_ref),
+                    ))
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["content"], "first preview works\n");
+        assert_eq!(payload["workspaceId"], "workspace-first-path-ref-preview");
     }
 
     #[tokio::test]

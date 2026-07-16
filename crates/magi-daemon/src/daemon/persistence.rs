@@ -297,7 +297,7 @@ impl RuntimeSidecarPersistence {
             let workspace_id = workspace.workspace_id.to_string();
             let workspace_state = workspace_states.remove(&workspace_id).unwrap_or_default();
             self.state_repository.save_workspace_session_state(
-                Path::new(workspace.root_path.as_str()),
+                workspace.native_root_path().as_path(),
                 &workspace_state,
             )?;
         }

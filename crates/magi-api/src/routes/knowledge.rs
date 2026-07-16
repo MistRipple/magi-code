@@ -356,7 +356,7 @@ fn ensure_workspace_code_index(
     else {
         return Err(ApiError::not_found("工作区不存在", workspace_id.as_str()));
     };
-    let workspace_root = PathBuf::from(workspace.root_path.as_str());
+    let workspace_root = workspace.native_root_path();
 
     if workspace_root_scan_failure(&workspace_root).is_some() {
         let outcome = state

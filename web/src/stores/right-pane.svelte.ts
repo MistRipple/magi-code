@@ -24,6 +24,7 @@ export interface AgentTabPayload {
 /** Code tab payload —— filepath 必填；diff 存在时走 diff 视图，否则走单文件 viewer */
 export interface CodeTabPayload {
   filepath: string;
+  displayPath?: string;
   workspaceId?: string;
   workspacePath?: string;
   sessionId?: string;
@@ -163,6 +164,7 @@ function sanitizeTabForPersist(tab: RightPaneTab): RightPaneTab {
   const payload = tab.payload as CodeTabPayload;
   const slim: CodeTabPayload = {
     filepath: payload.filepath,
+    displayPath: payload.displayPath,
     workspaceId: payload.workspaceId,
     workspacePath: payload.workspacePath,
     sessionId: payload.sessionId,
@@ -452,6 +454,7 @@ export function openAgentTab(
   agentRunId: string | null | undefined,
   options?: {
     label?: string;
+    displayPath?: string;
     accentToken?: string | null;
     workspaceId?: string | null;
     workspacePath?: string | null;
@@ -495,6 +498,7 @@ export function openCodeTab(
   filepath: string | null | undefined,
   options?: {
     label?: string;
+    displayPath?: string;
     diff?: string | null;
     isChangeDiff?: boolean;
     content?: string | null;
@@ -525,7 +529,8 @@ export function openCodeTab(
   if (!scopeKey) {
     return;
   }
-  const baseName = trimmedFilepath.split('/').pop() || trimmedFilepath;
+  const displayPath = options?.displayPath?.trim() || trimmedFilepath;
+  const baseName = displayPath.split(/[\\/]/u).pop() || displayPath;
   const label = options?.label?.trim() || baseName;
   rightPaneState.activeWorkspaceId = workspaceId;
   rightPaneState.activeSessionId = normalizedSession;
@@ -534,6 +539,7 @@ export function openCodeTab(
     'code',
     {
       filepath: trimmedFilepath,
+      displayPath,
       workspaceId,
       workspacePath: options?.workspacePath,
       sessionId: normalizedSession || undefined,

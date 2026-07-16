@@ -16,14 +16,20 @@
     onClick
   }: Props = $props();
 
+  function lastPathSeparatorIndex(path: string): number {
+    return Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  }
+
   // 获取文件名
-  const filename = $derived(filepath.split('/').pop() || filepath);
+  const filename = $derived.by(() => {
+    const separatorIndex = lastPathSeparatorIndex(filepath);
+    return separatorIndex >= 0 ? filepath.slice(separatorIndex + 1) || filepath : filepath;
+  });
 
   // 获取目录路径
   const directory = $derived.by(() => {
-    const parts = filepath.split('/');
-    parts.pop();
-    return parts.join('/');
+    const separatorIndex = lastPathSeparatorIndex(filepath);
+    return separatorIndex >= 0 ? filepath.slice(0, separatorIndex) : '';
   });
 
   // 获取文件扩展名图标
@@ -151,4 +157,3 @@
     text-align: left;
   }
 </style>
-

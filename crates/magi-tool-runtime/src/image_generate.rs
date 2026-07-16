@@ -231,12 +231,13 @@ fn resolve_requested_output_path(
     let Some(requested) = requested else {
         return Ok(None);
     };
-    let requested = PathBuf::from(requested);
-    let candidate = if requested.is_absolute() {
-        requested
-    } else {
-        workspace_root.join(requested)
-    };
+    let candidate = magi_core::HostPath::resolve_native_input(
+        requested,
+        Some(workspace_root),
+        dirs::home_dir().as_deref(),
+    )
+    .map(magi_core::HostPath::into_path_buf)
+    .map_err(|error| error.to_string())?;
     let candidate = canonicalize_tool_permission_path(&candidate);
     if !candidate.starts_with(workspace_root) {
         return Err("output_path 必须位于当前工作区内".to_string());

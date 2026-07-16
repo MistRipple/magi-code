@@ -32,15 +32,29 @@ pub fn read_available_skill_instruction(dir_path: &Path) -> Option<String> {
 }
 
 pub fn instruction_skill_source_available(skill: &Value) -> bool {
-    let Some(dir_path) = skill
+    let Some(dir_path) = instruction_skill_directory_path(skill) else {
+        return false;
+    };
+    read_available_skill_instruction(&dir_path).is_some()
+}
+
+pub fn instruction_skill_directory_path(skill: &Value) -> Option<PathBuf> {
+    if let Some(path_ref) = skill
+        .get("directoryPathRef")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return magi_core::HostPath::from_path_ref(path_ref)
+            .ok()
+            .map(magi_core::HostPath::into_path_buf);
+    }
+    skill
         .get("directoryPath")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    else {
-        return false;
-    };
-    read_available_skill_instruction(Path::new(dir_path)).is_some()
+        .map(PathBuf::from)
 }
 
 fn normalize_skills_config_value(value: Value) -> Map<String, Value> {
@@ -254,9 +268,8 @@ fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistr
     {
         for skill_val in skills {
             if let Some(skill_id) = skill_val.get("skillId").and_then(|v| v.as_str())
-                && let Some(dir_path) = skill_val.get("directoryPath").and_then(|v| v.as_str())
+                && let Some(skill_dir) = instruction_skill_directory_path(skill_val)
             {
-                let skill_dir = PathBuf::from(dir_path);
                 let Some(instruction) = read_available_skill_instruction(&skill_dir) else {
                     continue;
                 };

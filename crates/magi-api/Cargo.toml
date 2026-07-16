@@ -38,6 +38,9 @@ dirs = "6"
 getrandom.workspace = true
 sha2.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
 magi-skill-runtime = { path = "../magi-skill-runtime" }

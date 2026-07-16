@@ -1118,6 +1118,7 @@ await withGoldenViteServer(async (server) => {
     contextReferences: [{
       kind: 'file',
       path: '/tmp/reference-queued.md',
+      pathRef: 'mhp1:u:reference-queued',
       name: 'reference-queued.md',
     }],
   });
@@ -1141,9 +1142,10 @@ await withGoldenViteServer(async (server) => {
     [{
       kind: 'file',
       path: '/tmp/reference-queued.md',
+      pathRef: 'mhp1:u:reference-queued',
       name: 'reference-queued.md',
     }],
-    'queued follow-up must preserve structured context references in the POST body',
+    'queued follow-up must preserve authoritative pathRef context references in the POST body',
   );
   assert.ok(
     findArtifactByRequestId(

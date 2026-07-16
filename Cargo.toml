@@ -34,7 +34,7 @@ members = [
 ]
 
 [workspace.package]
-version = "3.0.3"
+version = "3.0.4"
 edition = "2024"
 
 [workspace.dependencies]
@@ -54,6 +54,7 @@ getrandom = "0.3"
 zstd = "0.13"
 ignore = "0.4"
 insta = "1.41"
+dunce = "1.0.5"
 
 [profile.dev]
 # 开发态只保留行号级调试信息，避免频繁 cargo run/check 后 target 目录快速膨胀。

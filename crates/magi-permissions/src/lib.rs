@@ -295,7 +295,12 @@ impl PermissionEngine {
         let Some(command) = json_string(&object, &["command", "script", "line"]) else {
             return false;
         };
-        !shell_command_has_write_indicator(&command)
+        let dialect = shell_dialect(
+            json_string(&object, &["shell"])
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        !shell_command_has_write_indicator(&command, dialect)
     }
 
     fn shell_arguments_have_permission_relevant_operation(arguments_json: &str) -> bool {
@@ -360,17 +365,38 @@ fn json_has_any(object: &serde_json::Map<String, serde_json::Value>, keys: &[&st
     keys.iter().any(|key| object.contains_key(*key))
 }
 
-fn shell_command_has_write_indicator(command: &str) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellDialect {
+    Posix,
+    Cmd,
+    PowerShell,
+}
+
+fn shell_dialect(shell: &str) -> ShellDialect {
+    let shell = shell.trim().to_ascii_lowercase();
+    if shell.contains("powershell") || shell.ends_with("pwsh") || shell.ends_with("pwsh.exe") {
+        ShellDialect::PowerShell
+    } else if shell.contains("cmd") || (shell.is_empty() && cfg!(windows)) {
+        ShellDialect::Cmd
+    } else {
+        ShellDialect::Posix
+    }
+}
+
+fn shell_command_has_write_indicator(command: &str, dialect: ShellDialect) -> bool {
     let tokens = shell_command_tokens(command);
-    shell_command_has_unsafe_unquoted_output_redirection(command)
+    shell_command_has_unsafe_unquoted_output_redirection(command, dialect)
         || tokens
             .iter()
-            .any(|token| shell_token_is_write_indicator(token))
+            .any(|token| shell_token_is_write_indicator(token, dialect))
         || shell_tokens_include_download_output_write(&tokens)
         || shell_command_includes_mutating_git(command)
 }
 
-fn shell_command_has_unsafe_unquoted_output_redirection(command: &str) -> bool {
+fn shell_command_has_unsafe_unquoted_output_redirection(
+    command: &str,
+    dialect: ShellDialect,
+) -> bool {
     let mut single_quoted = false;
     let mut double_quoted = false;
     let mut escaped = false;
@@ -392,7 +418,7 @@ fn shell_command_has_unsafe_unquoted_output_redirection(command: &str) -> bool {
             '\'' if !double_quoted => single_quoted = !single_quoted,
             '"' if !single_quoted => double_quoted = !double_quoted,
             '>' if !single_quoted && !double_quoted => {
-                if output_redirection_targets_safe_sink(&chars, index) {
+                if output_redirection_targets_safe_sink(&chars, index, dialect) {
                     index += 1;
                     continue;
                 }
@@ -405,7 +431,11 @@ fn shell_command_has_unsafe_unquoted_output_redirection(command: &str) -> bool {
     false
 }
 
-fn output_redirection_targets_safe_sink(chars: &[char], redirect_index: usize) -> bool {
+fn output_redirection_targets_safe_sink(
+    chars: &[char],
+    redirect_index: usize,
+    dialect: ShellDialect,
+) -> bool {
     let mut index = redirect_index + 1;
     if chars.get(index) == Some(&'>') || chars.get(index) == Some(&'|') {
         index += 1;
@@ -436,16 +466,22 @@ fn output_redirection_targets_safe_sink(chars: &[char], redirect_index: usize) -
         return false;
     }
     let target: String = chars[start..index].iter().collect();
-    redirection_target_is_dev_null(&target)
+    redirection_target_is_null_device(&target, dialect)
 }
 
 fn redirection_word_boundary(ch: Option<&char>) -> bool {
     ch.is_none_or(|ch| ch.is_whitespace() || matches!(*ch, ';' | '|' | '&' | '(' | ')'))
 }
 
-fn redirection_target_is_dev_null(target: &str) -> bool {
+fn redirection_target_is_null_device(target: &str, dialect: ShellDialect) -> bool {
     let trimmed = target.trim_matches(|ch| matches!(ch, '"' | '\''));
-    trimmed == "/dev/null"
+    match dialect {
+        ShellDialect::Posix => trimmed == "/dev/null",
+        ShellDialect::Cmd => trimmed.eq_ignore_ascii_case("NUL"),
+        ShellDialect::PowerShell => {
+            trimmed.eq_ignore_ascii_case("NUL") || trimmed.eq_ignore_ascii_case("$null")
+        }
+    }
 }
 
 fn shell_command_tokens(command: &str) -> Vec<String> {
@@ -463,8 +499,8 @@ fn shell_command_tokens(command: &str) -> Vec<String> {
         .collect()
 }
 
-fn shell_token_is_write_indicator(token: &str) -> bool {
-    matches!(
+fn shell_token_is_write_indicator(token: &str, dialect: ShellDialect) -> bool {
+    let common = matches!(
         token,
         "rm" | "rmdir"
             | "mv"
@@ -481,7 +517,27 @@ fn shell_token_is_write_indicator(token: &str) -> bool {
             | "install"
             | "rsync"
             | "scp"
-    )
+    );
+    common
+        || match dialect {
+            ShellDialect::Posix => false,
+            ShellDialect::Cmd => matches!(
+                token,
+                "del" | "erase" | "copy" | "xcopy" | "robocopy" | "move" | "ren" | "rename"
+            ),
+            ShellDialect::PowerShell => matches!(
+                token,
+                "remove-item"
+                    | "set-content"
+                    | "add-content"
+                    | "clear-content"
+                    | "copy-item"
+                    | "move-item"
+                    | "rename-item"
+                    | "new-item"
+                    | "out-file"
+            ),
+        }
 }
 
 fn shell_tokens_include_download_output_write(tokens: &[String]) -> bool {
@@ -893,6 +949,56 @@ mod tests {
             engine.decide(&req, &policy, AccessProfile::Restricted),
             Decision::Allow
         );
+    }
+
+    #[test]
+    fn shell_read_only_declaration_allows_windows_null_device() {
+        let args =
+            r#"{"shell":"cmd.exe","command":"git status >NUL 2>&1","access_mode":"read_only"}"#;
+        assert!(PermissionEngine::shell_arguments_request_read_only(args));
+    }
+
+    #[test]
+    fn shell_read_only_declaration_rejects_cmd_write_commands() {
+        for command in [
+            "del notes.txt",
+            "copy source.txt target.txt",
+            "move source.txt target.txt",
+            "mkdir output",
+        ] {
+            let args = serde_json::json!({
+                "shell": "cmd.exe",
+                "command": command,
+                "access_mode": "read_only"
+            })
+            .to_string();
+            assert!(
+                !PermissionEngine::shell_arguments_request_read_only(&args),
+                "cmd write command must be rejected: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_read_only_declaration_rejects_powershell_write_commands() {
+        for command in [
+            "Remove-Item notes.txt",
+            "Set-Content notes.txt value",
+            "Copy-Item source.txt target.txt",
+            "Move-Item source.txt target.txt",
+            "New-Item output -ItemType Directory",
+        ] {
+            let args = serde_json::json!({
+                "shell": "powershell.exe",
+                "command": command,
+                "access_mode": "read_only"
+            })
+            .to_string();
+            assert!(
+                !PermissionEngine::shell_arguments_request_read_only(&args),
+                "PowerShell write command must be rejected: {command}"
+            );
+        }
     }
 
     #[test]

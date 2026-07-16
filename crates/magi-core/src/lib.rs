@@ -1,6 +1,7 @@
 pub mod errors;
 pub mod execution;
 pub mod fs_atomic;
+pub mod host_path;
 pub mod ids;
 pub mod paths;
 pub mod public_text;
@@ -14,6 +15,7 @@ mod tests;
 
 pub use errors::{DomainError, DomainResult};
 pub use execution::{ExecutionOwnership, RecoveryResumeInput, TaskExecutionTarget};
+pub use host_path::{HostPath, HostPathError, HostPathRef};
 pub use ids::{
     AssignmentId, EventId, GoalId, LeaseId, MissionId, SessionId, TaskId, ThreadId, ToolCallId,
     WorkerId, WorkspaceId,

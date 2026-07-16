@@ -83,6 +83,7 @@
   });
 
   const activeFilePath = $derived(activeCodePayload?.filepath ?? '');
+  const activeDisplayFilePath = $derived(activeCodePayload?.displayPath ?? activeFilePath);
   function codePayloadCacheKey(payload: CodeTabPayload | null | undefined): string {
     if (!payload?.filepath) return '';
     return [
@@ -146,7 +147,7 @@
     if (typeof explicitDiff === 'string' && explicitDiff.trim().length > 0) return; // diff 模式
     if (activeWantsDiff) return; // 变更 tab 缺 diff 时由 changes/diff 恢复，不退化成源码预览
     if (activeContentKind !== 'text') return; // 非文本类不拉取
-    if (isWordFile(filepath) || isKnownBinaryFile(filepath)) return;
+    if (isWordFile(activeDisplayFilePath) || isKnownBinaryFile(activeDisplayFilePath)) return;
     if (typeof fetchedContents[cacheKey] === 'string') return; // 已成功拉过
     if (typeof fetchErrors[cacheKey] === 'string' && fetchErrors[cacheKey].length > 0) return; // 已失败过，停止重试避免死循环
     if (fetchingFlags[cacheKey]) return; // 拉取中
@@ -233,8 +234,8 @@
   };
 
   const fileLanguage = $derived.by(() => {
-    if (!activeFilePath) return '';
-    const ext = activeFilePath.split('.').pop()?.toLowerCase() ?? '';
+    if (!activeDisplayFilePath) return '';
+    const ext = activeDisplayFilePath.split('.').pop()?.toLowerCase() ?? '';
     return EXT_LANG_MAP[ext] ?? '';
   });
 
@@ -259,14 +260,14 @@
   const hasDiff = $derived(diffCode.trim().length > 0);
 
   // ============ 文件类型派生 ============
-  const displayPath = $derived(getDisplayPath(activeFilePath, workspaceRoot));
-  const markdownFile = $derived(isMarkdownFile(activeFilePath));
-  const wordFile = $derived(isWordFile(activeFilePath));
-  const imageFile = $derived(activeFilePath ? isImageFile(activeFilePath) : false);
+  const displayPath = $derived(getDisplayPath(activeDisplayFilePath, workspaceRoot));
+  const markdownFile = $derived(isMarkdownFile(activeDisplayFilePath));
+  const wordFile = $derived(isWordFile(activeDisplayFilePath));
+  const imageFile = $derived(activeDisplayFilePath ? isImageFile(activeDisplayFilePath) : false);
   // 图片虽属二进制，但走专门的 <img> 预览分支，故从 binaryFile（元信息兜底）排除。
   const binaryFile = $derived(
     !imageFile
-      && (activeContentKind === 'binary' || (activeFilePath ? isKnownBinaryFile(activeFilePath) : false)),
+      && (activeContentKind === 'binary' || (activeDisplayFilePath ? isKnownBinaryFile(activeDisplayFilePath) : false)),
   );
   const largeTextFile = $derived(activeContentKind === 'large_text');
   const symlinkFile = $derived(activeContentKind === 'symlink');
@@ -411,7 +412,8 @@
 
   function tabTooltip(tab: RightPaneTab): string {
     if (tab.kind === 'code') {
-      return (tab.payload as CodeTabPayload).filepath;
+      const payload = tab.payload as CodeTabPayload;
+      return payload.displayPath || payload.filepath;
     }
     return tabLabel(tab);
   }
@@ -583,7 +585,7 @@
   <!-- 当前 code tab 的副标题：路径 + Markdown 渲染/源码切换 -->
   {#if activeTab && activeTab.kind === 'code'}
     <div class="right-pane-subbar">
-      <div class="right-pane-path" title={activeFilePath}>{displayPath}</div>
+      <div class="right-pane-path" title={activeDisplayFilePath}>{displayPath}</div>
       {#if markdownFile && !hasDiff && !previewLoading && !previewError && !wordFile && !binaryFile && !largeTextFile && !symlinkFile && !specialFile && hasContent}
         <div class="right-pane-markdown-modes" role="tablist" aria-label={i18n.t('web.filePreviewTitle')}>
           <button

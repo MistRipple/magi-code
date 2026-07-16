@@ -3,6 +3,7 @@
 mod change_projection;
 mod dto;
 mod errors;
+mod host_paths;
 pub mod mcp_config;
 mod model_config;
 mod public_canonical;

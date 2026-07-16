@@ -1,5 +1,5 @@
 import { isDesktopRuntime } from './desktop-updater';
-import type { DirectoryListResult } from '../web/agent-api';
+import type { ResolvedAgentPath } from '../web/agent-api';
 import type {
   ComposerContextReferenceInput,
   ComposerContextReferenceKind,
@@ -115,19 +115,16 @@ export function normalizeDesktopDropPaths(
 
 export function resolveDesktopDroppedPath(
   requestedPath: string,
-  result: DirectoryListResult,
+  result: ResolvedAgentPath,
 ): ComposerContextReferenceInput | null {
-  const kind: ComposerContextReferenceKind = result.selectedKind === 'file'
-    ? 'file'
-    : 'directory';
-  const resolvedPath = normalizeDropPath(
-    kind === 'file' ? (result.selectedPath || '') : result.path,
-  );
+  const kind: ComposerContextReferenceKind = result.kind;
+  const resolvedPath = normalizeDropPath(result.displayPath);
   if (!resolvedPath) return null;
   return {
     kind,
     path: resolvedPath,
-    name: pathName(resolvedPath) || pathName(requestedPath),
+    pathRef: result.pathRef,
+    name: result.name || pathName(resolvedPath) || pathName(requestedPath),
   };
 }
 

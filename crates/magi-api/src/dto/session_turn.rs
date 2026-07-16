@@ -26,6 +26,8 @@ pub enum SessionContextReferenceKindDto {
 pub struct SessionContextReferenceDto {
     pub kind: SessionContextReferenceKindDto,
     pub path: String,
+    #[serde(default)]
+    pub path_ref: Option<String>,
     pub name: String,
 }
 
@@ -71,11 +73,22 @@ impl SessionTurnRequestDto {
 
         let mut validated = Vec::new();
         for reference in self.context_references.clone() {
-            let raw_path = reference.path.trim();
-            if raw_path.is_empty() {
-                return Err("上下文引用路径不能为空".to_string());
-            }
-            let path = std::path::PathBuf::from(raw_path);
+            let path = if let Some(path_ref) = reference
+                .path_ref
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                magi_core::HostPath::from_path_ref(path_ref)
+                    .map_err(|_| "上下文引用路径引用无效".to_string())?
+                    .into_path_buf()
+            } else {
+                let raw_path = reference.path.trim();
+                if raw_path.is_empty() {
+                    return Err("上下文引用路径不能为空".to_string());
+                }
+                std::path::PathBuf::from(raw_path)
+            };
             if !path.is_absolute() {
                 return Err("上下文引用必须使用绝对路径".to_string());
             }
@@ -127,6 +140,12 @@ impl SessionTurnRequestDto {
                     }
                 },
                 path: reference.path.display().to_string(),
+                path_ref: Some(
+                    magi_core::HostPath::from_path(reference.path.clone())
+                        .to_path_ref()
+                        .as_str()
+                        .to_string(),
+                ),
                 name: reference.name.clone(),
             })
             .collect();
@@ -143,7 +162,12 @@ impl SessionTurnRequestDto {
                         SessionContextReferenceKind::Directory
                     }
                 },
-                path: std::path::PathBuf::from(&reference.path),
+                path: reference
+                    .path_ref
+                    .as_deref()
+                    .and_then(|value| magi_core::HostPath::from_path_ref(value).ok())
+                    .map(magi_core::HostPath::into_path_buf)
+                    .unwrap_or_else(|| std::path::PathBuf::from(&reference.path)),
                 name: reference.name.clone(),
             })
             .collect()
@@ -507,5 +531,33 @@ mod tests {
         assert!(invalid.validate_context_references().is_err());
 
         std::fs::remove_dir_all(root).expect("reference fixture should clean up");
+    }
+
+    #[test]
+    fn context_reference_accepts_host_path_ref_as_authoritative_path() {
+        let root = std::env::temp_dir().join(format!(
+            "magi-context-reference-path-ref-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("reference directory should create");
+        let path_ref = magi_core::HostPath::from_path(root.clone())
+            .to_path_ref()
+            .as_str()
+            .to_string();
+        let mut request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "text": "inspect",
+            "contextReferences": [{
+                "kind": "directory",
+                "path": "display-only",
+                "pathRef": path_ref,
+                "name": "reference"
+            }]
+        }))
+        .expect("request should deserialize");
+
+        let references = request
+            .validate_context_references()
+            .expect("path ref should validate");
+        assert_eq!(references[0].path, root.canonicalize().unwrap());
     }
 }

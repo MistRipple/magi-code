@@ -726,12 +726,7 @@ impl DaemonRuntime {
         let workspace_roots: Vec<(String, std::path::PathBuf)> = workspace_store
             .workspaces()
             .into_iter()
-            .map(|w| {
-                (
-                    w.workspace_id.to_string(),
-                    std::path::PathBuf::from(w.root_path.as_str()),
-                )
-            })
+            .map(|w| (w.workspace_id.to_string(), w.native_root_path()))
             .collect();
 
         // 从全局未绑定会话和各工作区 .magi/sessions.json 加载会话。
@@ -887,7 +882,7 @@ impl DaemonRuntime {
         }
         let knowledge_store = self.knowledge_store.clone();
         let state_repository = StateRepository::new(self.state_root.clone());
-        let scan_root = PathBuf::from(active_workspace.root_path.as_str());
+        let scan_root = active_workspace.native_root_path();
         tokio::spawn(async move {
             let build_store = knowledge_store.clone();
             let build_workspace_id = active_workspace_id.clone();
@@ -1609,7 +1604,7 @@ impl DaemonRuntime {
         let durable = session_store.durable_state();
         let (global_state, mut workspace_states) = durable.partition_by_workspace();
         for workspace in workspace_store.workspaces() {
-            let root = std::path::PathBuf::from(workspace.root_path.as_str());
+            let root = workspace.native_root_path();
             let ws_id = workspace.workspace_id.to_string();
             let ws_state = workspace_states.remove(&ws_id).unwrap_or_default();
             state_repository.save_workspace_session_state(&root, &ws_state)?;

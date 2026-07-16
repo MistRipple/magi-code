@@ -38,7 +38,7 @@
   } from './theme';
   import {
     RUNTIME_CONNECTION_EVENT,
-    browseAgentDirectory,
+    resolveAgentPath,
     getWorkspaceSessions,
     listAgentWorkspaces,
     markAgentSessionViewed,
@@ -95,6 +95,7 @@
   let viewportWidth = $state(typeof window !== 'undefined' ? window.innerWidth : 1440);
   let sidebarOpen = $state(false);
   let workspaceActionPending = $state(false);
+  let pendingWorkspaceRegistrationDisplayPath = '';
   let showRemoveWorkspaceDialog = $state(false);
   let pendingRemoveWorkspace = $state<AgentWorkspaceSummary | null>(null);
   let workspaceDialogError = $state('');
@@ -234,7 +235,12 @@
   }
 
   function workspacePathForId(workspaceId: string): string {
-    return workspaces.find((workspace) => workspace.workspaceId === workspaceId)?.rootPath?.trim() || '';
+    const workspace = workspaces.find((candidate) => candidate.workspaceId === workspaceId);
+    return workspace ? workspaceBindingPath(workspace) : '';
+  }
+
+  function workspaceBindingPath(workspace: AgentWorkspaceSummary): string {
+    return workspace.rootPathRef?.trim() || workspace.rootPath.trim();
   }
 
   function resolveBackendWorkspaceSelection(nextWorkspaces: AgentWorkspaceSummary[]): string {
@@ -372,7 +378,7 @@
     if (pendingSessionSwitchId === bootstrapSessionId && pendingSessionSwitchWorkspaceId === authoritativeWorkspaceId) {
       clearPendingSessionSwitchState();
     }
-    syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, bootstrapSessionId || null);
+      syncBrowserSessionBinding(workspace.workspaceId, workspaceBindingPath(workspace), bootstrapSessionId || null);
     const currentSessions = sessionsByWorkspace[authoritativeWorkspaceId] ?? [];
     if (currentSessions.length === 0 || (bootstrapSessionId && !currentSessions.some((session) => session.id === bootstrapSessionId))) {
       void refreshWorkspaceSessions(
@@ -420,7 +426,7 @@
       currentSessionId = '';
       clearPendingSessionSwitchState();
       if (workspace) {
-        syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, null);
+        syncBrowserSessionBinding(workspace.workspaceId, workspaceBindingPath(workspace), null);
         void loadWorkspaceSessionsForSidebar(workspace);
       }
       return;
@@ -437,7 +443,7 @@
       clearPendingSessionSwitchState();
     }
     if (workspace) {
-      syncBrowserSessionBinding(workspace.workspaceId, workspace.rootPath, bootstrapSessionId);
+      syncBrowserSessionBinding(workspace.workspaceId, workspaceBindingPath(workspace), bootstrapSessionId);
     }
   });
 
@@ -456,7 +462,7 @@
     ) {
       return;
     }
-    const workspacePath = selectedWorkspace?.rootPath?.trim() || '';
+    const workspacePath = selectedWorkspace ? workspaceBindingPath(selectedWorkspace) : '';
     const sessionId = typeof currentSessionId === 'string' ? currentSessionId.trim() : '';
     syncBrowserSessionBinding(workspaceId, workspacePath, sessionId || null);
   });
@@ -595,7 +601,7 @@
     getClientBridge().postMessage({
       type: 'workspaceBindingChanged',
       workspaceId: workspace.workspaceId,
-      workspacePath: workspace.rootPath,
+      workspacePath: workspaceBindingPath(workspace),
       sessionId: sessionId || '',
     });
   }
@@ -662,21 +668,21 @@
       if (bootstrapSessionId === resolvedSessionId) {
         currentSessionId = resolvedSessionId;
         updateSessions(snapshot.sessions);
-        syncBrowserSessionBinding(authoritativeWorkspaceId, snapshot.workspace.rootPath, resolvedSessionId);
+        syncBrowserSessionBinding(authoritativeWorkspaceId, workspaceBindingPath(snapshot.workspace), resolvedSessionId);
         return resolvedSessionId;
       }
       getClientBridge().postMessage({
         type: 'switchSession',
         sessionId: resolvedSessionId,
         workspaceId: authoritativeWorkspaceId,
-        workspacePath: snapshot.workspace.rootPath,
+        workspacePath: workspaceBindingPath(snapshot.workspace),
       });
     } else {
-      syncBrowserSessionBinding(authoritativeWorkspaceId, snapshot.workspace.rootPath, null);
+      syncBrowserSessionBinding(authoritativeWorkspaceId, workspaceBindingPath(snapshot.workspace), null);
       requestWorkspaceBindingSync(snapshot.workspace, null);
       clearCurrentSessionBeforeWorkspaceChange(authoritativeWorkspaceId);
       messagesState.currentWorkspaceId = authoritativeWorkspaceId;
-      messagesState.currentWorkspacePath = snapshot.workspace.rootPath;
+      messagesState.currentWorkspacePath = workspaceBindingPath(snapshot.workspace);
       updateSessions(snapshot.sessions);
       setCurrentSessionId(null);
     }
@@ -903,18 +909,6 @@
     window.addEventListener('pointerup', handlePointerUp);
   }
 
-  function resolvePreviewFilePath(filePath: string, workspaceRootHint = ''): string {
-    const trimmedPath = filePath.trim();
-    if (!trimmedPath) {
-      return '';
-    }
-    if (/^(?:[a-zA-Z]:[\\/]|\/|\\\\)/.test(trimmedPath)) {
-      return trimmedPath;
-    }
-    const workspaceRoot = workspaceRootHint.trim() || selectedWorkspace?.rootPath?.trim() || '';
-    return workspaceRoot ? `${workspaceRoot.replace(/[\\/]+$/, '')}/${trimmedPath.replace(/^[\\/]+/, '')}` : trimmedPath;
-  }
-
   /**
    * 把文件推到右栏的 code tab。
    * - 文件元信息（contentKind / size / mime / symlinkTarget / head|tailSummary）通过 store 透传给 RightPane
@@ -932,19 +926,24 @@
       symlinkTarget?: string;
       headSummary?: string;
       tailSummary?: string;
+      displayPath?: string;
+      label?: string;
     } = {},
   ): boolean {
     const sessionId = metadata.sessionId?.trim() || '';
     const workspaceId = metadata.workspaceId?.trim() || selectedWorkspace?.workspaceId?.trim() || selectedWorkspaceId.trim();
-    const workspacePath = metadata.workspacePath?.trim() || selectedWorkspace?.rootPath?.trim() || '';
+    const workspacePath = metadata.workspacePath?.trim()
+      || (selectedWorkspace ? workspaceBindingPath(selectedWorkspace) : '');
     if (!workspaceId || !workspacePath) {
       return false;
     }
-    const resolvedFilePath = resolvePreviewFilePath(filePath, workspacePath);
-    if (!resolvedFilePath) {
+    const normalizedFilePath = filePath.trim();
+    if (!normalizedFilePath) {
       return false;
     }
-    openCodeTab(sessionId, resolvedFilePath, {
+    openCodeTab(sessionId, normalizedFilePath, {
+      displayPath: metadata.displayPath,
+      label: metadata.label,
       workspaceId,
       workspacePath,
       sessionId,
@@ -1001,7 +1000,7 @@
     workspaceSessionRequestSeqByWorkspace.set(requestedWorkspaceId, requestSeq);
     loadingWorkspaceIds = { ...loadingWorkspaceIds, [requestedWorkspaceId]: true };
     try {
-      const snapshot = await getWorkspaceSessions(requestedWorkspaceId, '', workspace.rootPath);
+      const snapshot = await getWorkspaceSessions(requestedWorkspaceId, '', workspaceBindingPath(workspace));
       if (workspaceSessionRequestSeqByWorkspace.get(requestedWorkspaceId) !== requestSeq) {
         return;
       }
@@ -1055,10 +1054,11 @@
   }
 
   async function registerWorkspaceRoot(rootPath: string, openDraft: boolean): Promise<void> {
+    const expectedDisplayPath = pendingWorkspaceRegistrationDisplayPath || rootPath;
     const next = await registerAgentWorkspace(rootPath);
-    const addedWorkspace = next.find((workspace) => workspace.rootPath === rootPath) ?? null;
+    const addedWorkspace = next.find((workspace) => workspace.rootPath === expectedDisplayPath) ?? null;
     if (!addedWorkspace) {
-      throw new Error(`注册后未找到工作区: ${rootPath}`);
+      throw new Error(`注册后未找到工作区: ${expectedDisplayPath}`);
     }
 
     workspaces = next;
@@ -1087,18 +1087,22 @@
     );
   }
 
-  async function handleFolderSelected(rootPath: string, _name: string): Promise<void> {
+  async function handleFolderSelected(
+    selection: { pathRef: string; displayPath: string; name: string },
+  ): Promise<void> {
     if (workspaceActionPending) {
       return;
     }
     workspaceDialogError = '';
-    const normalizedRootPath = rootPath.trim();
-    if (!normalizedRootPath) {
+    const normalizedRootPath = selection.pathRef.trim();
+    const displayPath = selection.displayPath.trim();
+    if (!normalizedRootPath || !displayPath) {
       return;
     }
     const onboardingOrigin = workspaceOnboardingState.origin;
     closeAddWorkspaceDialog({ force: true });
     workspaceActionPending = true;
+    pendingWorkspaceRegistrationDisplayPath = displayPath;
     try {
       await runActionWithFeedback(
         () => registerWorkspaceRoot(normalizedRootPath, onboardingOrigin === 'composer'),
@@ -1108,6 +1112,7 @@
         },
       );
     } finally {
+      pendingWorkspaceRegistrationDisplayPath = '';
       workspaceActionPending = false;
     }
   }
@@ -1119,7 +1124,7 @@
     workspaceActionPending = true;
     try {
       for (const path of droppedPaths) {
-        const result = await browseAgentDirectory(path);
+        const result = await resolveAgentPath(path);
         const dropped = resolveDesktopDroppedPath(path, result);
         if (!dropped || dropped.kind !== 'directory') continue;
         await registerWorkspaceRoot(dropped.path, true);
@@ -1242,7 +1247,7 @@
       return;
     }
     const workspaceId = workspace.workspaceId.trim();
-    const workspacePath = workspace.rootPath.trim();
+    const workspacePath = workspaceBindingPath(workspace);
     if (!workspaceId || !workspacePath) {
       return;
     }
@@ -1311,7 +1316,7 @@
       clearPendingSessionSwitchState();
       messagesState.sessionHydrating = false;
       if (selectedWorkspace) {
-        syncBrowserSessionBinding(selectedWorkspace.workspaceId, selectedWorkspace.rootPath, currentSessionId);
+        syncBrowserSessionBinding(selectedWorkspace.workspaceId, workspaceBindingPath(selectedWorkspace), currentSessionId);
       }
     }, 6000);
     addToast('info', i18n.t('web.sessionSwitching', { name: nextSessionName }), undefined, {
@@ -1322,7 +1327,7 @@
       type: 'switchSession',
       sessionId,
       workspaceId: workspace.workspaceId,
-      workspacePath: workspace.rootPath,
+      workspacePath: workspaceBindingPath(workspace),
     });
     if (sidebarIsDrawer) {
       sidebarOpen = false;
@@ -1354,7 +1359,7 @@
       type: 'deleteSession',
       sessionId: session.id,
       workspaceId: workspace.workspaceId,
-      workspacePath: workspace.rootPath,
+      workspacePath: workspaceBindingPath(workspace),
       requireConfirm: false,
     });
     closeDeleteSessionDialog();
@@ -1870,7 +1875,10 @@
           title={selectedWorkspace?.name || i18n.t('web.projectFiles')}
           titlePath={selectedWorkspace?.rootPath || ''}
           selectedFilePath={activeCodeTabFilePath}
-          onFileSelect={(path) => handleFileSelect(path)}
+          onFileSelect={(selection) => handleFileSelect(selection.pathRef, {
+            displayPath: selection.displayPath,
+            label: selection.name,
+          })}
         />
       </section>
     {/if}
@@ -1932,7 +1940,7 @@
     {/if}
     <WebFolderPicker
       title={i18n.t('web.selectWorkspaceFolder')}
-      onSelect={(path, name) => void handleFolderSelected(path, name)}
+      onSelect={(selection) => void handleFolderSelected(selection)}
       onCancel={closeAddWorkspaceDialog}
       disabled={workspaceActionPending}
     />

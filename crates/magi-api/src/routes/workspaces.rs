@@ -35,6 +35,7 @@ pub fn routes() -> Router<ApiState> {
 struct WorkspaceDto {
     workspace_id: String,
     root_path: String,
+    root_path_ref: Option<String>,
     name: Option<String>,
     is_active: bool,
 }
@@ -78,6 +79,7 @@ async fn list_workspaces(State(state): State<ApiState>) -> Json<WorkspaceListRes
             WorkspaceDto {
                 workspace_id: w.workspace_id.to_string(),
                 root_path: w.root_path.to_string(),
+                root_path_ref: w.root_path_ref.clone(),
                 name: w.name.clone(),
                 is_active: active_id.as_ref() == Some(&w.workspace_id),
             }
@@ -97,7 +99,6 @@ async fn register_workspace(
     Json(request): Json<RegisterWorkspaceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let canonical_path = canonical_workspace_path(&request.path)?;
-    let path = magi_core::AbsolutePath::new(canonical_path.to_string_lossy().to_string());
 
     // 已注册过的 workspace：复用已有记录，仍异步刷新索引。
     if let Some(workspace) = registered_workspace_for_path(&state, &canonical_path) {
@@ -118,7 +119,7 @@ async fn register_workspace(
     let workspace_id = new_workspace_id();
     match state
         .workspace_registry
-        .register(workspace_id.clone(), path.clone())
+        .register_native_path(workspace_id.clone(), canonical_path.clone())
     {
         Ok(_) => {}
         Err(error) => {
@@ -166,8 +167,15 @@ pub(crate) fn canonical_workspace_path(raw_path: &str) -> Result<PathBuf, ApiErr
     if trimmed_path.is_empty() {
         return Err(ApiError::InvalidInput("工作区路径不能为空".to_string()));
     }
-    let canonical_path = PathBuf::from(trimmed_path)
-        .canonicalize()
+    let path = magi_core::HostPath::resolve_native_input(
+        trimmed_path,
+        std::env::current_dir().ok().as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+    .map(magi_core::HostPath::into_path_buf)
+    .map_err(|_| ApiError::InvalidInput("工作区路径不可访问".to_string()))?;
+    let canonical_path = magi_core::HostPath::canonicalize(&path)
+        .map(magi_core::HostPath::into_path_buf)
         .map_err(|_| ApiError::InvalidInput("工作区路径不可访问".to_string()))?;
     if !canonical_path.is_dir() {
         return Err(ApiError::InvalidInput("工作区路径必须是目录".to_string()));
@@ -183,13 +191,16 @@ pub(crate) fn registered_workspace_for_path(
         .workspace_registry
         .workspaces()
         .into_iter()
-        .find(|workspace| workspace_root_matches(&workspace.root_path, canonical_path))
+        .find(|workspace| workspace_root_matches(workspace, canonical_path))
 }
 
-fn workspace_root_matches(root_path: &magi_core::AbsolutePath, canonical_path: &Path) -> bool {
-    let stored_path = PathBuf::from(root_path.as_str());
-    stored_path
-        .canonicalize()
+fn workspace_root_matches(
+    workspace: &magi_workspace::WorkspaceRecord,
+    canonical_path: &Path,
+) -> bool {
+    let stored_path = workspace.native_root_path();
+    magi_core::HostPath::canonicalize(&stored_path)
+        .map(magi_core::HostPath::into_path_buf)
         .map(|path| path == canonical_path)
         .unwrap_or_else(|_| stored_path == canonical_path)
 }
@@ -220,6 +231,7 @@ async fn pick_workspace(State(state): State<ApiState>) -> Json<serde_json::Value
         "workspaces": workspaces.iter().map(|w| serde_json::json!({
             "workspaceId": w.workspace_id.to_string(),
             "rootPath": w.root_path.to_string(),
+            "rootPathRef": w.root_path_ref.clone(),
             "name": w.name.clone(),
             "isActive": active_id.as_ref() == Some(&w.workspace_id),
         })).collect::<Vec<_>>(),
@@ -332,6 +344,7 @@ async fn workspace_sessions(
     let workspace_dto = WorkspaceDto {
         workspace_id: workspace.workspace_id.to_string(),
         root_path: workspace.root_path.to_string(),
+        root_path_ref: workspace.root_path_ref.clone(),
         name: workspace.name.clone(),
         is_active: active_id.as_ref() == Some(&workspace.workspace_id),
     };
@@ -515,6 +528,22 @@ mod tests {
         let file_path_text = file_path.to_string_lossy().to_string();
         assert!(!error.message().contains(&file_path_text));
         let _ = fs::remove_file(file_path);
+    }
+
+    #[test]
+    fn canonical_workspace_path_accepts_host_path_ref() {
+        let root =
+            std::env::temp_dir().join(format!("magi-workspace-path-ref-{}", UtcMillis::now().0));
+        fs::create_dir_all(&root).expect("workspace dir should create");
+        let path_ref = magi_core::HostPath::from_path(root.clone())
+            .to_path_ref()
+            .as_str()
+            .to_string();
+
+        let resolved =
+            canonical_workspace_path(&path_ref).expect("workspace path ref should resolve");
+
+        assert_eq!(resolved, root.canonicalize().unwrap());
     }
 
     #[tokio::test]
