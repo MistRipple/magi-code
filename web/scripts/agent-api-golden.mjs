@@ -521,5 +521,39 @@ await withGoldenViteServer(async (server) => {
     }
   }
 
+  binding.setAgentBindingContext({
+    workspaceId: '',
+    workspacePath: '',
+    sessionId: '',
+  });
+  const fetchBeforeEmptyStats = globalThis.fetch;
+  let emptyStatsRequestCount = 0;
+  globalThis.fetch = async () => {
+    emptyStatsRequestCount += 1;
+    throw new Error('empty workspace stats must not reach transport');
+  };
+  try {
+    const emptyStats = await agentApi.getAgentExecutionStats();
+    assert.equal(emptyStatsRequestCount, 0);
+    assert.equal(emptyStats.workspaceId, '');
+    assert.deepEqual(emptyStats.items, []);
+    assert.deepEqual(emptyStats.totals, {
+      llmCallCount: 0,
+      assignmentCount: 0,
+      turnCount: 0,
+      totalTokens: 0,
+      netInputTokens: 0,
+      netOutputTokens: 0,
+      successCount: 0,
+      failureCount: 0,
+    });
+  } finally {
+    if (fetchBeforeEmptyStats === undefined) {
+      delete globalThis.fetch;
+    } else {
+      globalThis.fetch = fetchBeforeEmptyStats;
+    }
+  }
+
   console.log('agent api golden replay passed');
 });

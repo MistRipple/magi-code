@@ -161,14 +161,8 @@ export interface CapabilityDependencyItem {
   name: string;
   status: string;
   requiredBy: string[];
-  workspaceId?: string | null;
-  sessionId?: string | null;
-  fileCount?: number | null;
-  lastIndexed?: number | null;
-  cacheStatus?: string | null;
   roleCount?: number | null;
   spawnableRoleCount?: number | null;
-  snapshotActive?: boolean | null;
   configuredCount?: number | null;
   enabledCount?: number | null;
   readyCount?: number | null;
@@ -2614,27 +2608,11 @@ function createSettingsStore(props: { onClose?: () => void }) {
         requiredBy: ensureArray<string>(dependency?.requiredBy)
           .filter((tool): tool is string => typeof tool === "string" && tool.trim().length > 0)
           .map((tool) => tool.trim()),
-        workspaceId: typeof dependency?.workspaceId === "string"
-          ? dependency.workspaceId
-          : null,
-        sessionId: typeof dependency?.sessionId === "string"
-          ? dependency.sessionId
-          : null,
-        fileCount: typeof dependency?.fileCount === "number" && Number.isFinite(dependency.fileCount)
-          ? dependency.fileCount
-          : null,
-        lastIndexed: typeof dependency?.lastIndexed === "number" && Number.isFinite(dependency.lastIndexed)
-          ? dependency.lastIndexed
-          : null,
-        cacheStatus: typeof dependency?.cacheStatus === "string" ? dependency.cacheStatus : null,
         roleCount: typeof dependency?.roleCount === "number" && Number.isFinite(dependency.roleCount)
           ? dependency.roleCount
           : null,
         spawnableRoleCount: typeof dependency?.spawnableRoleCount === "number" && Number.isFinite(dependency.spawnableRoleCount)
           ? dependency.spawnableRoleCount
-          : null,
-        snapshotActive: typeof dependency?.snapshotActive === "boolean"
-          ? dependency.snapshotActive
           : null,
         configuredCount: typeof dependency?.configuredCount === "number" && Number.isFinite(dependency.configuredCount)
           ? dependency.configuredCount

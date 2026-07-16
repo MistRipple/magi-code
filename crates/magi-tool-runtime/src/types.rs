@@ -182,9 +182,8 @@ pub type ExternalMcpToolExecutor =
     Arc<dyn Fn(&str, &str, &str) -> (String, ExecutionResultStatus) + Send + Sync + 'static>;
 pub type AgentRoleCatalogProvider =
     Arc<dyn Fn() -> Vec<AgentRoleCatalogEntry> + Send + Sync + 'static>;
-pub type RuntimeCapabilityDependencyProvider = Arc<
-    dyn Fn(&ToolExecutionContext) -> Vec<RuntimeCapabilityDependencyEntry> + Send + Sync + 'static,
->;
+pub type RuntimeCapabilityDependencyProvider =
+    Arc<dyn Fn() -> Vec<RuntimeCapabilityDependencyEntry> + Send + Sync + 'static>;
 pub type ImageGenerationExecutor = Arc<
     dyn Fn(ImageGenerationRequest) -> Result<GeneratedImageData, String> + Send + Sync + 'static,
 >;
@@ -308,21 +307,9 @@ pub struct RuntimeCapabilityDependencyEntry {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_by: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_count: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_indexed: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_status: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawnable_role_count: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshot_active: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configured_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

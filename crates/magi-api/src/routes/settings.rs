@@ -1568,11 +1568,7 @@ mod tests {
         let session_store = Arc::new(SessionStore::default());
         let snapshot_manager = Arc::new(SnapshotManager::new());
         let runtime_capability_dependency_provider =
-            crate::state::build_runtime_capability_dependency_provider(
-                snapshot_manager.clone(),
-                workspace_store.clone(),
-                true,
-            );
+            crate::state::build_runtime_capability_dependency_provider(true);
         let mut tool_registry = ToolRegistry::new(Arc::clone(&governance), Arc::clone(&event_bus))
             .with_runtime_capability_dependency_provider(runtime_capability_dependency_provider);
         if let Some(snapshot) = external_catalog_snapshot {
@@ -2171,9 +2167,10 @@ mod tests {
             serde_json::json!("workspace_code_index")
         );
         assert_eq!(
-            capability_dependencies[1]["workspaceId"],
-            serde_json::json!("workspace-contract")
+            capability_dependencies[1]["status"],
+            serde_json::json!("unavailable")
         );
+        assert!(capability_dependencies[1].get("workspaceId").is_none());
         assert_eq!(
             capability_dependencies[2]["name"],
             serde_json::json!("agent_role_registry")
@@ -2232,10 +2229,7 @@ mod tests {
             capability_dependencies[6]["status"],
             serde_json::json!("ready")
         );
-        assert_eq!(
-            capability_dependencies[6]["sessionId"],
-            serde_json::json!("session-empty-contract")
-        );
+        assert!(capability_dependencies[6].get("sessionId").is_none());
         assert_eq!(
             capability_dependencies[7]["name"],
             serde_json::json!("file_snapshot")
@@ -2245,10 +2239,7 @@ mod tests {
             serde_json::json!("ready"),
             "snapshot dependency should report the lazy snapshot capability as ready before the session starts"
         );
-        assert_eq!(
-            capability_dependencies[7]["sessionId"],
-            serde_json::json!("session-empty-contract")
-        );
+        assert!(capability_dependencies[7].get("sessionId").is_none());
         assert!(
             builtin_tools
                 .iter()
@@ -2297,6 +2288,28 @@ mod tests {
         assert!(!object.contains_key("engines"));
         assert!(!object.contains_key("agents"));
         let _ = std::fs::remove_dir_all(&workspace_root);
+    }
+
+    #[tokio::test]
+    async fn settings_bootstrap_reports_product_capabilities_without_tool_context() {
+        let state = test_state();
+        let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
+            .await
+            .expect("settings bootstrap should build")
+            .0;
+        let dependencies = bootstrap["capabilityDependencies"]
+            .as_array()
+            .expect("capability dependencies should be listed");
+
+        for name in ["context_runtime", "file_snapshot"] {
+            let dependency = dependencies
+                .iter()
+                .find(|dependency| dependency["name"] == name)
+                .unwrap_or_else(|| panic!("{name} dependency should be listed"));
+            assert_eq!(dependency["status"], json!("ready"));
+            assert!(dependency.get("workspaceId").is_none());
+            assert!(dependency.get("sessionId").is_none());
+        }
     }
 
     #[tokio::test]

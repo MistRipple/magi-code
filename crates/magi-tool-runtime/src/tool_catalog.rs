@@ -2,7 +2,6 @@ use crate::{
     AgentRoleCatalogEntry, BuiltinToolAccessMode, BuiltinToolName, ExternalToolCatalogEntry,
     ExternalToolCatalogSnapshot, ToolExecutionContext, ToolRuntimeResources,
 };
-use magi_knowledge_store::code_scanner::workspace_root_scan_failure;
 
 pub(crate) fn execute_tool_catalog(
     input: &str,
@@ -82,7 +81,7 @@ pub(crate) fn build_tool_catalog_value(
             roles
         })
         .unwrap_or_default();
-    let runtime_health = RuntimeHealth::from_context(context, resources, &agent_roles);
+    let runtime_health = RuntimeHealth::from_resources(resources, &agent_roles);
     let mut runtime_warning_count = 0usize;
     let access_profile = context.access_profile;
 
@@ -145,7 +144,7 @@ pub(crate) fn build_tool_catalog_value(
         ExternalCapabilityDependencySource::Disabled
     };
     let runtime_dependencies =
-        runtime_health.dependencies_json(context, resources, external_dependency_source);
+        runtime_health.dependencies_json(resources, external_dependency_source);
     let (instruction_skill_count, raw_skill_tools, external_mcp_servers, external_mcp_tools) =
         external_catalog
             .map(|catalog| {
@@ -290,11 +289,6 @@ fn tool_catalog_summary(input: ToolCatalogSummaryInput) -> String {
 
 struct RuntimeHealth {
     knowledge_store_available: bool,
-    workspace_id: Option<String>,
-    workspace_code_index_ready: bool,
-    workspace_code_index_file_count: Option<usize>,
-    workspace_code_index_last_indexed: Option<u64>,
-    workspace_code_index_cache_status: Option<String>,
     agent_role_registry_available: bool,
     agent_role_count: usize,
     spawnable_agent_role_count: usize,
@@ -315,50 +309,14 @@ enum ExternalCapabilityDependencySource<'a> {
 }
 
 impl RuntimeHealth {
-    fn from_context(
-        context: &ToolExecutionContext,
+    fn from_resources(
         resources: &ToolRuntimeResources,
         agent_roles: &[AgentRoleCatalogEntry],
     ) -> Self {
         let knowledge_store_available = resources.knowledge_store.is_some();
-        let workspace_id = context
-            .workspace_id
-            .as_ref()
-            .map(|id| id.as_str().to_string());
-        let workspace_root_available = match context.working_directory.as_deref() {
-            Some(root) => workspace_root_scan_failure(root).is_none(),
-            None => true,
-        };
-        let (
-            workspace_code_index_ready,
-            workspace_code_index_file_count,
-            workspace_code_index_last_indexed,
-            workspace_code_index_cache_status,
-        ) = match (
-            resources.knowledge_store.as_ref(),
-            context.workspace_id.as_ref(),
-        ) {
-            (Some(_), Some(_)) if !workspace_root_available => (false, None, None, None),
-            (Some(store), Some(workspace_id)) => {
-                let health = store.workspace_code_index_health(workspace_id);
-                let ready = health.as_ref().is_some_and(|health| health.is_ready);
-                let file_count = health.as_ref().map(|health| health.file_count);
-                let last_indexed = health.as_ref().and_then(|health| health.last_indexed);
-                let cache_status = health
-                    .as_ref()
-                    .map(|health| health.cache_status.to_string());
-                (ready, file_count, last_indexed, cache_status)
-            }
-            _ => (false, None, None, None),
-        };
 
         Self {
             knowledge_store_available,
-            workspace_id,
-            workspace_code_index_ready,
-            workspace_code_index_file_count,
-            workspace_code_index_last_indexed,
-            workspace_code_index_cache_status,
             agent_role_registry_available: resources.agent_role_catalog_provider.is_some(),
             agent_role_count: agent_roles.len(),
             spawnable_agent_role_count: agent_roles.iter().filter(|role| role.spawnable).count(),
@@ -413,12 +371,6 @@ impl RuntimeHealth {
                 warnings: vec!["知识检索能力暂不可用".to_string()],
             };
         }
-        if self.workspace_id.is_none() {
-            return RuntimeToolStatus {
-                status: "missing_context",
-                warnings: vec!["需要先选择工作区".to_string()],
-            };
-        }
         RuntimeToolStatus {
             status: "ready",
             warnings: Vec::new(),
@@ -445,31 +397,11 @@ impl RuntimeHealth {
     }
 
     fn code_index_tool_status(&self) -> RuntimeToolStatus {
-        let base = self.knowledge_tool_status();
-        if base.status != "ready" {
-            return base;
-        }
-        if !self.workspace_code_index_ready {
-            return RuntimeToolStatus {
-                status: "not_ready",
-                warnings: vec!["当前工作区本地索引尚未就绪".to_string()],
-            };
-        }
-        if self.workspace_code_index_cache_status.as_deref() == Some("degraded") {
-            return RuntimeToolStatus {
-                status: "degraded",
-                warnings: vec!["本地索引缓存暂不可持久化，当前检索仍可用".to_string()],
-            };
-        }
-        RuntimeToolStatus {
-            status: "ready",
-            warnings: Vec::new(),
-        }
+        self.knowledge_tool_status()
     }
 
     fn dependencies_json(
         &self,
-        context: &ToolExecutionContext,
         resources: &ToolRuntimeResources,
         external_source: ExternalCapabilityDependencySource<'_>,
     ) -> serde_json::Value {
@@ -481,11 +413,7 @@ impl RuntimeHealth {
             }),
             serde_json::json!({
                 "name": "workspace_code_index",
-                "status": self.workspace_code_index_status(),
-                "workspace_id": self.workspace_id,
-                "file_count": self.workspace_code_index_file_count,
-                "last_indexed": self.workspace_code_index_last_indexed,
-                "cache_status": self.workspace_code_index_cache_status,
+                "status": if self.knowledge_store_available { "ready" } else { "unavailable" },
                 "required_by": ["search_semantic", "code_symbols"],
             }),
             serde_json::json!({
@@ -504,29 +432,13 @@ impl RuntimeHealth {
         }));
 
         if let Some(provider) = &resources.runtime_capability_dependency_provider {
-            dependencies.extend(provider(context).into_iter().map(|entry| {
+            dependencies.extend(provider().into_iter().map(|entry| {
                 serde_json::to_value(entry)
                     .expect("runtime capability dependency entry should serialize")
             }));
         }
 
         serde_json::Value::Array(dependencies)
-    }
-
-    fn workspace_code_index_status(&self) -> &'static str {
-        if !self.knowledge_store_available {
-            "unavailable"
-        } else if self.workspace_id.is_none() {
-            "missing_context"
-        } else if self.workspace_code_index_ready
-            && self.workspace_code_index_cache_status.as_deref() == Some("degraded")
-        {
-            "degraded"
-        } else if self.workspace_code_index_ready {
-            "ready"
-        } else {
-            "not_ready"
-        }
     }
 
     fn agent_role_registry_status(&self) -> &'static str {
@@ -1190,23 +1102,13 @@ mod tests {
     #[test]
     fn tool_catalog_includes_runtime_capability_dependency_provider_entries() {
         let resources = ToolRuntimeResources {
-            runtime_capability_dependency_provider: Some(std::sync::Arc::new(|context| {
+            runtime_capability_dependency_provider: Some(std::sync::Arc::new(|| {
                 vec![crate::RuntimeCapabilityDependencyEntry {
                     name: "file_snapshot".to_string(),
-                    status: if context.session_id.is_some() {
-                        "not_ready".to_string()
-                    } else {
-                        "missing_context".to_string()
-                    },
+                    status: "ready".to_string(),
                     required_by: vec!["changes/diff".to_string()],
-                    workspace_id: context.workspace_id.as_ref().map(ToString::to_string),
-                    session_id: context.session_id.as_ref().map(ToString::to_string),
-                    file_count: None,
-                    last_indexed: None,
-                    cache_status: None,
                     role_count: None,
                     spawnable_role_count: None,
-                    snapshot_active: Some(false),
                     configured_count: None,
                     enabled_count: None,
                     ready_count: None,
@@ -1230,10 +1132,9 @@ mod tests {
             .find(|dependency| dependency["name"] == "file_snapshot")
             .expect("provider dependency should be included");
 
-        assert_eq!(dependency["status"], "not_ready");
-        assert_eq!(dependency["workspace_id"], "workspace-tool-catalog");
-        assert_eq!(dependency["session_id"], "session-tool-catalog");
-        assert_eq!(dependency["snapshot_active"], false);
+        assert_eq!(dependency["status"], "ready");
+        assert!(dependency.get("workspace_id").is_none());
+        assert!(dependency.get("session_id").is_none());
     }
 
     #[test]
@@ -1638,169 +1539,69 @@ mod tests {
     }
 
     #[test]
-    fn tool_catalog_reports_ready_workspace_code_index() {
-        let root = std::env::temp_dir().join(format!(
-            "magi-tool-catalog-index-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(root.join("src")).expect("create test workspace");
-        std::fs::write(
-            root.join("src/lib.rs"),
-            "pub fn catalog_index_probe() -> bool { true }\n",
-        )
-        .expect("write test source");
-
-        let workspace_id = magi_core::WorkspaceId::new("workspace-tool-catalog-index");
-        let store = std::sync::Arc::new(magi_knowledge_store::KnowledgeStore::new());
-        store.build_workspace_index(&workspace_id, &root);
+    fn tool_catalog_reports_initialized_knowledge_capabilities_without_workspace_context() {
         let resources = ToolRuntimeResources {
-            knowledge_store: Some(store),
+            knowledge_store: Some(std::sync::Arc::new(
+                magi_knowledge_store::KnowledgeStore::new(),
+            )),
+            ..ToolRuntimeResources::default()
+        };
+
+        let payload = build_tool_catalog_value("{}", &ToolExecutionContext::default(), &resources);
+        let tools = payload["tools"].as_array().expect("tools should be listed");
+        for name in ["knowledge_query", "search_semantic", "code_symbols"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} should be listed"));
+            assert_eq!(tool["runtime_status"], "ready");
+            assert_eq!(tool["runtime_warnings"], serde_json::json!([]));
+        }
+
+        let code_index = payload["runtime_dependencies"]
+            .as_array()
+            .expect("runtime dependencies should be listed")
+            .iter()
+            .find(|dependency| dependency["name"] == "workspace_code_index")
+            .expect("workspace code index dependency should be listed");
+        assert_eq!(code_index["status"], "ready");
+        assert!(code_index.get("workspace_id").is_none());
+        assert!(code_index.get("file_count").is_none());
+        assert!(code_index.get("last_indexed").is_none());
+        assert!(code_index.get("cache_status").is_none());
+    }
+
+    #[test]
+    fn tool_catalog_product_health_is_independent_of_workspace_index_state() {
+        let resources = ToolRuntimeResources {
+            knowledge_store: Some(std::sync::Arc::new(
+                magi_knowledge_store::KnowledgeStore::new(),
+            )),
             ..ToolRuntimeResources::default()
         };
         let context = ToolExecutionContext {
-            workspace_id: Some(workspace_id),
-            working_directory: Some(root.clone()),
+            workspace_id: Some(magi_core::WorkspaceId::new("empty-workspace")),
+            working_directory: Some(std::env::temp_dir().join("missing-magi-workspace")),
             ..ToolExecutionContext::default()
         };
 
-        let output = execute_tool_catalog("{}", &context, &resources);
-        let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
+        let payload = build_tool_catalog_value("{}", &context, &resources);
         let search_semantic = payload["tools"]
             .as_array()
-            .expect("tools")
+            .expect("tools should be listed")
             .iter()
             .find(|tool| tool["name"] == "search_semantic")
             .expect("search_semantic should be listed");
-        let code_symbols = payload["tools"]
+        let code_index = payload["runtime_dependencies"]
             .as_array()
-            .expect("tools")
+            .expect("runtime dependencies should be listed")
             .iter()
-            .find(|tool| tool["name"] == "code_symbols")
-            .expect("code_symbols should be listed");
+            .find(|dependency| dependency["name"] == "workspace_code_index")
+            .expect("workspace code index dependency should be listed");
 
         assert_eq!(search_semantic["runtime_status"], "ready");
-        assert_eq!(code_symbols["runtime_status"], "ready");
-        assert_eq!(
-            payload["runtime_dependencies"][1]["name"],
-            "workspace_code_index"
-        );
-        assert_eq!(payload["runtime_dependencies"][1]["status"], "ready");
-        assert_eq!(payload["runtime_dependencies"][1]["file_count"], 1);
-        assert!(payload["runtime_dependencies"][1]["last_indexed"].is_number());
-        assert_eq!(payload["runtime_dependencies"][1]["cache_status"], "ready");
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn tool_catalog_revalidates_workspace_code_index_root_before_ready_status() {
-        let root = std::env::temp_dir().join(format!(
-            "magi-tool-catalog-index-missing-root-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(root.join("src")).expect("create test workspace");
-        std::fs::write(
-            root.join("src/lib.rs"),
-            "pub fn catalog_index_missing_root_probe() -> bool { true }\n",
-        )
-        .expect("write test source");
-
-        let workspace_id = magi_core::WorkspaceId::new("workspace-tool-catalog-index-missing-root");
-        let store = std::sync::Arc::new(magi_knowledge_store::KnowledgeStore::new());
-        store.build_workspace_index(&workspace_id, &root);
-        assert!(
-            store.workspace_index_ready(&workspace_id),
-            "fixture should start with a ready runtime index"
-        );
-        std::fs::remove_dir_all(&root).expect("remove test workspace");
-
-        let resources = ToolRuntimeResources {
-            knowledge_store: Some(store),
-            ..ToolRuntimeResources::default()
-        };
-        let context = ToolExecutionContext {
-            workspace_id: Some(workspace_id),
-            working_directory: Some(root),
-            ..ToolExecutionContext::default()
-        };
-
-        let output = execute_tool_catalog("{}", &context, &resources);
-        let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
-        let search_semantic = payload["tools"]
-            .as_array()
-            .expect("tools")
-            .iter()
-            .find(|tool| tool["name"] == "search_semantic")
-            .expect("search_semantic should be listed");
-        let workspace_code_index = payload["runtime_dependencies"]
-            .as_array()
-            .expect("runtime dependencies")
-            .iter()
-            .find(|dependency| dependency["name"] == "workspace_code_index")
-            .expect("workspace_code_index dependency should be listed");
-
-        assert_eq!(search_semantic["runtime_status"], "not_ready");
-        assert_eq!(workspace_code_index["status"], "not_ready");
-        assert!(workspace_code_index["file_count"].is_null());
-        assert!(workspace_code_index["last_indexed"].is_null());
-    }
-
-    #[test]
-    fn tool_catalog_reports_degraded_workspace_code_index_cache() {
-        let root = std::env::temp_dir().join(format!(
-            "magi-tool-catalog-index-degraded-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(root.join("src")).expect("create test workspace");
-        std::fs::write(
-            root.join("src/lib.rs"),
-            "pub fn catalog_index_degraded_probe() -> bool { true }\n",
-        )
-        .expect("write test source");
-        std::fs::write(root.join(".magi"), "occupied").expect("occupy cache root");
-
-        let workspace_id = magi_core::WorkspaceId::new("workspace-tool-catalog-index-degraded");
-        let store = std::sync::Arc::new(magi_knowledge_store::KnowledgeStore::new());
-        store.build_workspace_index(&workspace_id, &root);
-        let resources = ToolRuntimeResources {
-            knowledge_store: Some(store),
-            ..ToolRuntimeResources::default()
-        };
-        let context = ToolExecutionContext {
-            workspace_id: Some(workspace_id),
-            working_directory: Some(root.clone()),
-            ..ToolExecutionContext::default()
-        };
-
-        let output = execute_tool_catalog("{}", &context, &resources);
-        let payload: serde_json::Value = serde_json::from_str(&output).expect("json output");
-        let search_semantic = payload["tools"]
-            .as_array()
-            .expect("tools")
-            .iter()
-            .find(|tool| tool["name"] == "search_semantic")
-            .expect("search_semantic should be listed");
-        let workspace_code_index = payload["runtime_dependencies"]
-            .as_array()
-            .expect("runtime dependencies")
-            .iter()
-            .find(|dependency| dependency["name"] == "workspace_code_index")
-            .expect("workspace_code_index dependency should be listed");
-
-        assert_eq!(search_semantic["runtime_status"], "degraded");
-        assert_eq!(workspace_code_index["status"], "degraded");
-        assert_eq!(workspace_code_index["cache_status"], "degraded");
-        assert!(workspace_code_index.get("cache_error_code").is_none());
-
-        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(code_index["status"], "ready");
+        assert!(code_index.get("workspace_id").is_none());
+        assert!(code_index.get("file_count").is_none());
     }
 }

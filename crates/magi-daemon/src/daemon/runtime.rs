@@ -1003,11 +1003,8 @@ impl DaemonRuntime {
             ProjectRecentTurnStore::default(),
         );
         let context_runtime_for_dispatcher = Arc::new(context_runtime.clone());
-        let runtime_capability_dependency_provider = build_runtime_capability_dependency_provider(
-            snapshot_manager.clone(),
-            self.workspace_store.clone(),
-            true,
-        );
+        let runtime_capability_dependency_provider =
+            build_runtime_capability_dependency_provider(true);
         let image_generation_executor: ImageGenerationExecutor = {
             let settings_store = Arc::clone(&settings_store);
             Arc::new(move |request| {
@@ -2546,17 +2543,17 @@ done
             .iter()
             .find(|dependency| dependency["name"] == "workspace_code_index")
             .expect("workspace_code_index dependency should be exposed");
-        assert_eq!(workspace_code_index["workspaceId"], "test-workspace-001");
         assert_eq!(workspace_code_index["status"], "ready");
+        assert!(workspace_code_index.get("workspaceId").is_none());
         let context_runtime = catalog["runtimeDependencies"]
             .as_array()
             .expect("runtime dependencies should be an array")
             .iter()
             .find(|dependency| dependency["name"] == "context_runtime")
             .expect("context_runtime dependency should be exposed");
-        assert_eq!(context_runtime["workspaceId"], "test-workspace-001");
-        assert_eq!(context_runtime["sessionId"], "test-session-001");
         assert_eq!(context_runtime["status"], "ready");
+        assert!(context_runtime.get("workspaceId").is_none());
+        assert!(context_runtime.get("sessionId").is_none());
         let process_launch = catalog["tools"]
             .as_array()
             .expect("tools should be an array")
@@ -2785,7 +2782,8 @@ done
             .iter()
             .find(|dependency| dependency["name"] == "workspace_code_index")
             .expect("workspace_code_index dependency should be exposed");
-        assert_eq!(workspace_code_index["status"], "not_ready");
+        assert_eq!(workspace_code_index["status"], "ready");
+        assert!(workspace_code_index.get("workspaceId").is_none());
 
         let app = restored
             .router("daemon-test".to_string())

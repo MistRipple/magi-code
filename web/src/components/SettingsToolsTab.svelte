@@ -59,13 +59,8 @@
       name: string;
       status: string;
       requiredBy: string[];
-      workspaceId?: string | null;
-      sessionId?: string | null;
-      fileCount?: number | null;
-      lastIndexed?: number | null;
       roleCount?: number | null;
       spawnableRoleCount?: number | null;
-      snapshotActive?: boolean | null;
       configuredCount?: number | null;
       enabledCount?: number | null;
       readyCount?: number | null;
@@ -138,8 +133,6 @@
         return i18n.t('settings.tools.runtimeDegraded');
       case 'not_ready':
         return i18n.t('settings.tools.runtimeNotReady');
-      case 'missing_context':
-        return i18n.t('settings.tools.runtimeMissingContext');
       case 'unavailable':
         return i18n.t('settings.tools.runtimeUnavailable');
       default:
@@ -153,7 +146,6 @@
         return 'success';
       case 'degraded':
       case 'not_ready':
-      case 'missing_context':
         return 'warning';
       case 'unavailable':
         return 'error';
@@ -284,8 +276,6 @@
         return i18n.t('settings.tools.dependency.status.degraded');
       case 'not_ready':
         return i18n.t('settings.tools.dependency.status.notReady');
-      case 'missing_context':
-        return i18n.t('settings.tools.dependency.status.missingContext');
       case 'unavailable':
         return i18n.t('settings.tools.dependency.status.unavailable');
       default:
@@ -300,7 +290,6 @@
         return 'success';
       case 'degraded':
       case 'not_ready':
-      case 'missing_context':
         return 'warning';
       case 'unavailable':
         return 'error';
@@ -336,9 +325,7 @@
 
   function getCapabilityDependencyMetric(dependency: {
     name: string;
-    fileCount?: number | null;
     spawnableRoleCount?: number | null;
-    snapshotActive?: boolean | null;
     configuredCount?: number | null;
     enabledCount?: number | null;
     readyCount?: number | null;
@@ -346,18 +333,10 @@
     readyToolCount?: number | null;
     toolCount?: number | null;
   }): string {
-    if (dependency.name === 'workspace_code_index' && typeof dependency.fileCount === 'number') {
-      return i18n.t('settings.tools.dependency.fileCount', { count: dependency.fileCount });
-    }
     if (dependency.name === 'agent_role_registry' && typeof dependency.spawnableRoleCount === 'number') {
       return i18n.t('settings.tools.dependency.spawnableRoleCount', {
         count: dependency.spawnableRoleCount,
       });
-    }
-    if (dependency.name === 'file_snapshot' && typeof dependency.snapshotActive === 'boolean') {
-      return i18n.t(dependency.snapshotActive
-        ? 'settings.tools.dependency.snapshotActive'
-        : 'settings.tools.dependency.snapshotInactive');
     }
     if (
       dependency.name === 'skill_runtime'
@@ -429,9 +408,7 @@
     name: string;
     status: string;
     requiredBy: string[];
-    fileCount?: number | null;
     spawnableRoleCount?: number | null;
-    snapshotActive?: boolean | null;
     configuredCount?: number | null;
     enabledCount?: number | null;
     readyCount?: number | null;

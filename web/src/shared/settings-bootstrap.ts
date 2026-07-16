@@ -37,14 +37,8 @@ export interface SettingsCapabilityDependency {
   name: string;
   status: string;
   requiredBy: string[];
-  workspaceId?: string | null;
-  sessionId?: string | null;
-  fileCount?: number | null;
-  lastIndexed?: number | null;
-  cacheStatus?: string | null;
   roleCount?: number | null;
   spawnableRoleCount?: number | null;
-  snapshotActive?: boolean | null;
   configuredCount?: number | null;
   enabledCount?: number | null;
   readyCount?: number | null;

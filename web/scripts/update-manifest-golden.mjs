@@ -76,49 +76,49 @@ assert.doesNotMatch(
   'release workflow must not require a separator before the leading host architecture',
 );
 
-const releaseNotes = fs.readFileSync(path.resolve('../.github/releases/v3.0.2.md'), 'utf8');
-assert.match(releaseNotes, /知识系统/, '3.0.2 notes must explain on-demand knowledge retrieval');
-assert.match(releaseNotes, /Windows|macOS|Linux/, '3.0.2 notes must explain desktop delivery scope');
-assert.doesNotMatch(releaseNotes, /[0-9a-f]{7,40}/i, '3.0.2 notes must not expose commit hashes');
+const releaseNotes = fs.readFileSync(path.resolve('../.github/releases/v3.0.3.md'), 'utf8');
+assert.match(releaseNotes, /工具状态/, '3.0.3 notes must explain product-level tool status');
+assert.match(releaseNotes, /空白工作区/, '3.0.3 notes must explain empty-workspace behavior');
+assert.doesNotMatch(releaseNotes, /[0-9a-f]{7,40}/i, '3.0.3 notes must not expose commit hashes');
 
 const manifest = createUpdateManifest({
-  version: '3.0.2',
-  tag: 'v3.0.2',
+  version: '3.0.3',
+  tag: 'v3.0.3',
   repository: 'MistRipple/magi-code',
   pubDate: '2026-07-14T00:00:00Z',
   notes: '测试更新',
   platforms: [
     {
       target: 'darwin-aarch64-app',
-      filename: 'Magi_3.0.2_darwin-aarch64-app.tar.gz',
+      filename: 'Magi_3.0.3_darwin-aarch64-app.tar.gz',
       signature: 'signed-macos',
     },
     {
       target: 'linux-x86_64-appimage',
-      filename: 'Magi_3.0.2_linux-x86_64-appimage.tar.gz',
+      filename: 'Magi_3.0.3_linux-x86_64-appimage.tar.gz',
       signature: 'signed-linux',
     },
   ],
 });
 
-assert.equal(manifest.version, '3.0.2');
+assert.equal(manifest.version, '3.0.3');
 assert.equal(manifest.pub_date, '2026-07-14T00:00:00Z');
 assert.equal(
   manifest.platforms['darwin-aarch64-app'].url,
-  'https://github.com/MistRipple/magi-code/releases/download/v3.0.2/Magi_3.0.2_darwin-aarch64-app.tar.gz',
+  'https://github.com/MistRipple/magi-code/releases/download/v3.0.3/Magi_3.0.3_darwin-aarch64-app.tar.gz',
 );
 assert.equal(manifest.platforms['darwin-aarch64-app'].signature, 'signed-macos');
 assert.equal(manifest.platforms['linux-x86_64-appimage'].signature, 'signed-linux');
 
 assert.throws(
   () => createUpdateManifest({
-    version: '3.0.2',
-    tag: 'v3.0.2',
+    version: '3.0.3',
+    tag: 'v3.0.3',
     repository: 'MistRipple/magi-code',
     platforms: [
       {
         target: 'darwin-aarch64-app',
-        filename: 'Magi_3.0.2_darwin-aarch64-app.tar.gz',
+        filename: 'Magi_3.0.3_darwin-aarch64-app.tar.gz',
         signature: '',
       },
     ],
@@ -130,9 +130,9 @@ assert.throws(
 const cliFixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'magi-update-manifest-'));
 try {
   const fixtureAssets = [
-    'Magi_3.0.2_darwin-aarch64-app.tar.gz',
-    'Magi_3.0.2_linux-x86_64-appimage.AppImage',
-    'Magi_3.0.2_windows-x86_64-nsis.exe',
+    'Magi_3.0.3_darwin-aarch64-app.tar.gz',
+    'Magi_3.0.3_linux-x86_64-appimage.AppImage',
+    'Magi_3.0.3_windows-x86_64-nsis.exe',
   ];
   for (const filename of fixtureAssets) {
     fs.writeFileSync(path.join(cliFixtureDir, filename), 'artifact');
@@ -141,8 +141,8 @@ try {
   const outputPath = path.join(cliFixtureDir, 'latest.json');
   execFileSync(process.execPath, [
     path.resolve('scripts/generate-update-manifest.mjs'),
-    '--version', '3.0.2',
-    '--tag', 'v3.0.2',
+    '--version', '3.0.3',
+    '--tag', 'v3.0.3',
     '--repository', 'MistRipple/magi-code',
     '--assets-dir', cliFixtureDir,
     '--output', outputPath,

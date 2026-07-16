@@ -183,10 +183,7 @@ mod tests {
         assert_eq!(body["builtinTotal"], BuiltinToolName::ALL.len());
         assert_eq!(body["externalCatalogStatus"], "unavailable");
         assert_eq!(body["agentRoleCatalogStatus"], "unavailable");
-        assert_eq!(
-            body["runtimeDependencies"][1]["workspaceId"],
-            "workspace-tools"
-        );
+        assert!(body["runtimeDependencies"][1].get("workspaceId").is_none());
         assert!(
             body["tools"]
                 .as_array()
@@ -311,10 +308,7 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "succeeded");
-        assert_eq!(
-            body["runtimeDependencies"][1]["workspaceId"],
-            "workspace-tools"
-        );
+        assert!(body["runtimeDependencies"][1].get("workspaceId").is_none());
     }
 
     #[tokio::test]

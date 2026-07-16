@@ -700,32 +700,21 @@ fn public_runtime_persistence_error(
 }
 
 pub fn build_runtime_capability_dependency_provider(
-    snapshot_manager: Arc<SnapshotManager>,
-    workspace_registry: Arc<WorkspaceStore>,
     context_runtime_available: bool,
 ) -> RuntimeCapabilityDependencyProvider {
-    Arc::new(move |context| {
+    Arc::new(move || {
         vec![
-            context_runtime_capability_dependency(context, context_runtime_available),
-            file_snapshot_capability_dependency(
-                snapshot_manager.as_ref(),
-                workspace_registry.as_ref(),
-                context,
-            ),
+            context_runtime_capability_dependency(context_runtime_available),
+            file_snapshot_capability_dependency(),
         ]
     })
 }
 
 fn context_runtime_capability_dependency(
-    context: &ToolExecutionContext,
     context_runtime_available: bool,
 ) -> RuntimeCapabilityDependencyEntry {
-    let session_id = context.session_id.as_ref().map(ToString::to_string);
-    let workspace_id = context.workspace_id.as_ref().map(ToString::to_string);
     let status = if !context_runtime_available {
         "unavailable"
-    } else if session_id.is_none() || workspace_id.is_none() {
-        "missing_context"
     } else {
         "ready"
     };
@@ -738,14 +727,8 @@ fn context_runtime_capability_dependency(
             "conversation_context".to_string(),
             "knowledge_memory_selection".to_string(),
         ],
-        workspace_id,
-        session_id,
-        file_count: None,
-        last_indexed: None,
-        cache_status: None,
         role_count: None,
         spawnable_role_count: None,
-        snapshot_active: None,
         configured_count: None,
         enabled_count: None,
         ready_count: None,
@@ -753,51 +736,17 @@ fn context_runtime_capability_dependency(
     }
 }
 
-fn file_snapshot_capability_dependency(
-    snapshot_manager: &SnapshotManager,
-    workspace_registry: &WorkspaceStore,
-    context: &ToolExecutionContext,
-) -> RuntimeCapabilityDependencyEntry {
-    let session_id = context.session_id.as_ref().map(ToString::to_string);
-    let workspace_id = context.workspace_id.as_ref().map(ToString::to_string);
-    let workspace_root = match context.workspace_id.as_ref() {
-        Some(workspace_id) => workspace_root_path_from_registry(workspace_registry, workspace_id),
-        None => context.working_directory.clone(),
-    };
-    let workspace_root_available = workspace_root
-        .as_deref()
-        .is_some_and(|workspace_root| workspace_root.is_absolute() && workspace_root.is_dir());
-    let snapshot_active = session_id.as_deref().is_some_and(|session_id| {
-        workspace_root.as_ref().is_some_and(|workspace_root| {
-            snapshot_manager
-                .get_session_for_workspace(session_id, workspace_root)
-                .is_some()
-        })
-    });
-    let status = if session_id.is_none() || workspace_id.is_none() {
-        "missing_context"
-    } else if !workspace_root_available {
-        "unavailable"
-    } else {
-        "ready"
-    };
-
+fn file_snapshot_capability_dependency() -> RuntimeCapabilityDependencyEntry {
     RuntimeCapabilityDependencyEntry {
         name: "file_snapshot".to_string(),
-        status: status.to_string(),
+        status: "ready".to_string(),
         required_by: vec![
             "changes/diff".to_string(),
             "changes/approve".to_string(),
             "changes/revert".to_string(),
         ],
-        workspace_id,
-        session_id,
-        file_count: None,
-        last_indexed: None,
-        cache_status: None,
         role_count: None,
         spawnable_role_count: None,
-        snapshot_active: Some(snapshot_active),
         configured_count: None,
         enabled_count: None,
         ready_count: None,
@@ -1822,26 +1771,38 @@ fn public_skills_config_section(value: serde_json::Value) -> serde_json::Value {
 }
 
 fn normalize_capability_dependency_json(raw: &serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "name": raw.get("name").cloned().unwrap_or(serde_json::Value::Null),
-        "status": raw.get("status").cloned().unwrap_or(serde_json::Value::String("unknown".to_string())),
-        "requiredBy": capability_dependency_field(raw, "required_by")
-            .unwrap_or_else(|| serde_json::json!([])),
-        "workspaceId": capability_dependency_field(raw, "workspace_id"),
-        "sessionId": capability_dependency_field(raw, "session_id"),
-        "fileCount": capability_dependency_field(raw, "file_count"),
-        "lastIndexed": capability_dependency_field(raw, "last_indexed"),
-        "cacheStatus": capability_dependency_field(raw, "cache_status"),
-        "roleCount": capability_dependency_field(raw, "role_count"),
-        "spawnableRoleCount": capability_dependency_field(raw, "spawnable_role_count"),
-        "snapshotActive": capability_dependency_field(raw, "snapshot_active"),
-        "configuredCount": capability_dependency_field(raw, "configured_count"),
-        "enabledCount": capability_dependency_field(raw, "enabled_count"),
-        "readyCount": capability_dependency_field(raw, "ready_count"),
-        "enabledToolCount": capability_dependency_field(raw, "enabled_tool_count"),
-        "readyToolCount": capability_dependency_field(raw, "ready_tool_count"),
-        "toolCount": capability_dependency_field(raw, "tool_count"),
-    })
+    let mut normalized = serde_json::Map::from_iter([
+        (
+            "name".to_string(),
+            raw.get("name").cloned().unwrap_or(serde_json::Value::Null),
+        ),
+        (
+            "status".to_string(),
+            raw.get("status")
+                .cloned()
+                .unwrap_or(serde_json::Value::String("unknown".to_string())),
+        ),
+        (
+            "requiredBy".to_string(),
+            capability_dependency_field(raw, "required_by")
+                .unwrap_or_else(|| serde_json::json!([])),
+        ),
+    ]);
+    for (source, target) in [
+        ("role_count", "roleCount"),
+        ("spawnable_role_count", "spawnableRoleCount"),
+        ("configured_count", "configuredCount"),
+        ("enabled_count", "enabledCount"),
+        ("ready_count", "readyCount"),
+        ("enabled_tool_count", "enabledToolCount"),
+        ("ready_tool_count", "readyToolCount"),
+        ("tool_count", "toolCount"),
+    ] {
+        if let Some(value) = capability_dependency_field(raw, source) {
+            normalized.insert(target.to_string(), value);
+        }
+    }
+    serde_json::Value::Object(normalized)
 }
 
 fn normalize_public_tool_catalog_item_json(raw: &serde_json::Value) -> serde_json::Value {
@@ -2868,38 +2829,21 @@ mod tests {
     }
 
     #[test]
-    fn file_snapshot_dependency_does_not_trust_working_directory_for_unregistered_workspace_id() {
-        let snapshot_manager = SnapshotManager::new();
-        let workspace_store = WorkspaceStore::default();
-        let workspace_root = std::env::temp_dir().join(format!(
-            "magi-api-file-snapshot-unregistered-{}",
-            UtcMillis::now().0
-        ));
-        std::fs::create_dir_all(&workspace_root).expect("workspace root should create");
+    fn product_capability_dependencies_do_not_require_workspace_or_session_context() {
+        let provider = build_runtime_capability_dependency_provider(true);
 
-        let entry = file_snapshot_capability_dependency(
-            &snapshot_manager,
-            &workspace_store,
-            &ToolExecutionContext {
-                session_id: Some(SessionId::new("session-file-snapshot-unregistered")),
-                workspace_id: Some(WorkspaceId::new("workspace-file-snapshot-unregistered")),
-                working_directory: Some(workspace_root.clone()),
-                ..ToolExecutionContext::default()
-            },
-        );
+        let entries = provider();
+        let context_runtime = entries
+            .iter()
+            .find(|entry| entry.name == "context_runtime")
+            .expect("context runtime dependency should be listed");
+        let file_snapshot = entries
+            .iter()
+            .find(|entry| entry.name == "file_snapshot")
+            .expect("file snapshot dependency should be listed");
 
-        assert_eq!(entry.status, "unavailable");
-        assert_eq!(
-            entry.workspace_id.as_deref(),
-            Some("workspace-file-snapshot-unregistered")
-        );
-        assert_eq!(
-            entry.session_id.as_deref(),
-            Some("session-file-snapshot-unregistered")
-        );
-        assert_eq!(entry.snapshot_active, Some(false));
-
-        let _ = std::fs::remove_dir_all(workspace_root);
+        assert_eq!(context_runtime.status, "ready");
+        assert_eq!(file_snapshot.status, "ready");
     }
 
     #[test]

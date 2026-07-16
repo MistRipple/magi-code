@@ -149,10 +149,6 @@ function normalizeNullableNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-function normalizeNullableString(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() ? value.trim() : null;
-}
-
 function normalizeBindingString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -215,14 +211,8 @@ function normalizeCapabilityDependencies(value: unknown): SettingsCapabilityDepe
       name,
       status,
       requiredBy: normalizeRequiredBy(record.requiredBy),
-      workspaceId: normalizeNullableString(record.workspaceId),
-      sessionId: normalizeNullableString(record.sessionId),
-      fileCount: normalizeNullableNumber(record.fileCount),
-      lastIndexed: normalizeNullableNumber(record.lastIndexed),
-      cacheStatus: normalizeNullableString(record.cacheStatus),
       roleCount: normalizeNullableNumber(record.roleCount),
       spawnableRoleCount: normalizeNullableNumber(record.spawnableRoleCount),
-      snapshotActive: typeof record.snapshotActive === 'boolean' ? record.snapshotActive : null,
       configuredCount: normalizeNullableNumber(record.configuredCount),
       enabledCount: normalizeNullableNumber(record.enabledCount),
       readyCount: normalizeNullableNumber(record.readyCount),
@@ -1406,6 +1396,28 @@ export async function resetAgentExecutionStats(): Promise<Record<string, unknown
 
 export async function getAgentExecutionStats(): Promise<AgentExecutionStatsPayload> {
   try {
+    const binding = resolveBindingWithOverride();
+    if (!binding.workspaceId && !binding.workspacePath) {
+      return {
+        scope: 'workspace',
+        workspaceId: '',
+        sessionId: null,
+        version: 0,
+        lastAppliedLedgerSeq: 0,
+        updatedAt: 0,
+        totals: {
+          llmCallCount: 0,
+          assignmentCount: 0,
+          turnCount: 0,
+          totalTokens: 0,
+          netInputTokens: 0,
+          netOutputTokens: 0,
+          successCount: 0,
+          failureCount: 0,
+        },
+        items: [],
+      };
+    }
     const query = buildWorkspaceBoundQuery({});
     const response = await getTransport().request(agentUrl('/api/settings/stats/session', query));
     return await parseAgentJson<AgentExecutionStatsPayload>(response, 'load execution stats');
