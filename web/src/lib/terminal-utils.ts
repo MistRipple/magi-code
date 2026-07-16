@@ -110,3 +110,48 @@ export function parseLeadingJson(content?: string): Record<string, unknown> | un
     return null;
   }
 }
+
+function readTerminalString(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function joinTerminalStreams(stdout: unknown, stderr: unknown): string {
+  const stdoutText = readTerminalString(stdout);
+  const stderrText = readTerminalString(stderr);
+  if (!stdoutText) return stderrText;
+  if (!stderrText) return stdoutText;
+  return stdoutText.endsWith('\n') ? `${stdoutText}${stderrText}` : `${stdoutText}\n${stderrText}`;
+}
+
+export function resolveTerminalArgumentId(argumentsValue?: Record<string, unknown>): number | undefined {
+  const terminalId = argumentsValue?.terminal_id;
+  if (!Number.isInteger(terminalId) || (terminalId as number) <= 0) {
+    return undefined;
+  }
+
+  const action = readTerminalString(argumentsValue?.action).trim().toLowerCase();
+  const command = readTerminalString(argumentsValue?.command).trim();
+  if (action === 'run' || (!action && command)) {
+    return undefined;
+  }
+  return terminalId as number;
+}
+
+export function terminalPayloadOutput(payload?: Record<string, unknown> | null): string {
+  if (!payload) return '';
+  return (
+    readTerminalString(payload.output)
+    || readTerminalString(payload.final_output)
+    || joinTerminalStreams(payload.stdout, payload.stderr)
+  );
+}
+
+export function terminalPayloadErrorText(payload?: Record<string, unknown> | null): string {
+  if (!payload) return '';
+  return (
+    readTerminalString(payload.error).trim()
+    || readTerminalString(payload.summary).trim()
+    || readTerminalString(payload.message).trim()
+    || readTerminalString(payload.stderr).trim()
+  );
+}

@@ -122,5 +122,7 @@ jobs:
           cargo test -p magi-tool-runtime process_inspect_reports_current_process --locked
           cargo test -p magi-tool-runtime shell_path_parser_tests --locked
           cargo test -p magi-tool-runtime shell_argument_matches_selected_shell_dialect --locked
+          cargo test -p magi-tool-runtime shell_exec_accepts_shell_program_with_arguments --locked
+          cargo test -p magi-tool-runtime builtins_use_context_working_directory_for_relative_inputs --locked
           cargo test -p magi-api path_ref --locked
           cargo check -p magi-daemon --all-targets --locked

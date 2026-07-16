@@ -72,6 +72,16 @@ assert.match(
 );
 assert.match(
   railSource,
+  /function focusTurn\([\s\S]*?container\.scrollTop\s*=\s*Math\.max\(0,\s*targetTop\);[\s\S]*?activeTurnId\s*=\s*item\.turnId/,
+  '点击轮次必须同步定位到目标消息，不能播放消息区滚动过程',
+);
+assert.doesNotMatch(
+  railSource,
+  /function focusTurn\([\s\S]*?behavior:\s*['"]smooth['"][\s\S]*?activeTurnId\s*=\s*item\.turnId/,
+  '消息区轮次跳转不得保留平滑滚动兼容路径',
+);
+assert.match(
+  railSource,
   /\.turn-navigation-marker\s*\{[\s\S]*?width:\s*6px;/,
   '静默态轨道节点长度必须缩短一半',
 );

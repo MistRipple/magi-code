@@ -53,7 +53,13 @@ import type {
 } from "../shared/types/registry-types";
 import type { LLMConfig } from "../shared/types/agent-types";
 import type { ModelStatus, ModelStatusMap, ModelStatusType } from "../types/message";
-import { setEnabledAgents, getState } from "../stores/messages.svelte";
+import {
+  getModelStatus,
+  getState,
+  messagesState,
+  setEnabledAgents,
+  setModelStatus,
+} from "../stores/messages.svelte";
 import type { EnabledAgent } from "../stores/messages.svelte";
 import {
   resolveModelListFetchBlockReason,
@@ -244,7 +250,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   // 使用全局 store 的模型状态（与执行状态共用）
   const appState = getState();
-  const modelStatuses = $derived(appState.modelStatus);
+  const modelStatuses = $derived(getModelStatus());
 
   let isRefreshing = $state(false);
   let totalInputTokens = $state(0);
@@ -934,7 +940,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   function normalizeModelStatuses(
     incoming: Record<string, any> | undefined,
   ): void {
-    appState.modelStatus = buildConfiguredModelStatuses(incoming);
+    setModelStatus(buildConfiguredModelStatuses(incoming));
   }
 
   async function probeModelStatus(
@@ -1227,10 +1233,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
     const displayName = i18n.t("settings.model.defaultEngineName", { n });
     workerConfigs[engineId] = createWorkerConfig();
     // 注入 modelStatuses 让 workerModelTabs 立即包含新 id
-    appState.modelStatus = {
-      ...appState.modelStatus,
+    setModelStatus({
+      ...getModelStatus(),
       [engineId]: { status: "not_configured" },
-    };
+    });
     unsavedEngines.add(engineId);
     engineDisplayNames = { ...engineDisplayNames, [engineId]: displayName };
     modelConfigTab = engineId;
@@ -1252,8 +1258,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
   function purgeEngineFromFrontend(engineId: string) {
     delete workerConfigs[engineId];
     workerConfigs = { ...workerConfigs };
-    const { [engineId]: _, ...restStatus } = appState.modelStatus;
-    appState.modelStatus = restStatus as ModelStatusMap;
+    const { [engineId]: _, ...restStatus } = getModelStatus();
+    setModelStatus(restStatus as ModelStatusMap);
     unsavedEngines.delete(engineId);
     const { [engineId]: _name, ...restNames } = engineDisplayNames;
     engineDisplayNames = restNames;
@@ -1339,7 +1345,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
             ? { ...value, status: "checking" }
             : value;
       }
-      appState.modelStatus = checking as ModelStatusMap;
+      setModelStatus(checking as ModelStatusMap);
 
       const probes = [
         probeModelStatus("orch"),
@@ -1353,7 +1359,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       for (const result of results) {
         next[result.key] = result.value;
       }
-      appState.modelStatus = next as ModelStatusMap;
+      setModelStatus(next as ModelStatusMap);
     } finally {
       isRefreshing = false;
     }
@@ -1476,10 +1482,11 @@ function createSettingsStore(props: { onClose?: () => void }) {
             : "imageGeneration";
     testStatus[statusKey] = "testing";
     testStatus = { ...testStatus };
-    appState.modelStatus = {
-      ...buildConfiguredModelStatuses(appState.modelStatus),
+    const currentModelStatus = getModelStatus();
+    setModelStatus({
+      ...buildConfiguredModelStatuses(currentModelStatus),
       [modelStatusKey]: {
-        ...(appState.modelStatus?.[modelStatusKey] || {}),
+        ...(currentModelStatus[modelStatusKey] || {}),
         model:
           (target === "worker"
             ? workerConfigs[workerKey]?.model
@@ -1490,14 +1497,14 @@ function createSettingsStore(props: { onClose?: () => void }) {
                 : imageConfig.model)?.trim() || undefined,
         status: "checking",
       },
-    };
+    });
 
     try {
       const result = await probeModelStatus(target, explicitWorkerKey);
-      appState.modelStatus = {
-        ...buildConfiguredModelStatuses(appState.modelStatus),
+      setModelStatus({
+        ...buildConfiguredModelStatuses(getModelStatus()),
         [result.key]: result.value,
-      };
+      });
       testStatus[statusKey] =
         result.value.status === "connected" ? "success" : "error";
       notifySettingsSuccess(i18n.t("settings.toast.connectionTestCompleted"));
@@ -1505,8 +1512,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
       console.error("[SettingsPanel] 连接测试失败:", e);
       testStatus[statusKey] = "error";
       const failed = inferModelErrorStatus(e);
-      appState.modelStatus = {
-        ...buildConfiguredModelStatuses(appState.modelStatus),
+      setModelStatus({
+        ...buildConfiguredModelStatuses(getModelStatus()),
         [modelStatusKey]: {
           ...failed,
           model:
@@ -1518,7 +1525,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
                   ? compConfig.model
                   : imageConfig.model)?.trim() || undefined,
         },
-      };
+      });
       notifySettingsError(i18n.t("settings.toast.action.testConnection"), e);
     }
     testStatus = { ...testStatus };
@@ -2804,7 +2811,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   // 用 untrack 包裹避免把它们登记为依赖造成自循环——本 effect 只应由 snapshot
   // 引用变化驱动。
   $effect(() => {
-    const snapshot = appState.settingsBootstrapSnapshot as
+    const snapshot = messagesState.settingsBootstrapSnapshot as
       | AgentSettingsBootstrapSnapshot
       | null;
     if (!snapshot) {

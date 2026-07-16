@@ -1,6 +1,6 @@
 {
   "name": "magi-web",
-  "version": "3.0.4",
+  "version": "3.0.5",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,8 +10,9 @@
     "build": "vite build --config vite.web.config.ts",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test": "npm run test:canonical && npm run test:transport && npm run test:agent-api && npm run test:mcp-config && npm run test:orchestrator-session-config && npm run test:right-pane && npm run test:file-reference && npm run test:desktop-file-drop && npm run test:image-generation-preview && npm run test:queued-message-guidance && npm run test:panel-layout && npm run test:agent-run && npm run test:active-agent-center && npm run test:workspace-onboarding && npm run test:goal && npm run test:slash-command && npm run test:tool-error && npm run test:tool-call-display && npm run test:context-ring && npm run test:runtime-state && npm run test:notification-policy && npm run test:notification-runtime && npm run test:mermaid-source && npm run test:tool-catalog && npm run test:tool-display && npm run test:desktop-updater && npm run test:update-manifest && npm run test:ci-workflow && npm run test:bridge && npm run test:turn-navigation",
+    "test": "npm run test:canonical && npm run test:transport && npm run test:agent-api && npm run test:settings-store && npm run test:mcp-config && npm run test:orchestrator-session-config && npm run test:right-pane && npm run test:file-reference && npm run test:desktop-file-drop && npm run test:image-generation-preview && npm run test:queued-message-guidance && npm run test:panel-layout && npm run test:agent-run && npm run test:active-agent-center && npm run test:workspace-onboarding && npm run test:goal && npm run test:slash-command && npm run test:tool-error && npm run test:tool-call-display && npm run test:context-ring && npm run test:runtime-state && npm run test:notification-policy && npm run test:notification-runtime && npm run test:mermaid-source && npm run test:tool-catalog && npm run test:tool-display && npm run test:desktop-updater && npm run test:update-manifest && npm run test:ci-workflow && npm run test:bridge && npm run test:turn-navigation",
     "test:agent-api": "node scripts/agent-api-golden.mjs",
+    "test:settings-store": "node scripts/settings-store-golden.mjs",
     "test:mcp-config": "node scripts/mcp-config-golden.mjs",
     "test:orchestrator-session-config": "node scripts/orchestrator-session-config-golden.mjs",
     "test:bridge": "node scripts/web-client-bridge-golden.mjs",

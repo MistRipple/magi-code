@@ -336,6 +336,37 @@ mod tests {
     }
 
     #[test]
+    fn persisted_legacy_workspace_is_upgraded_to_authoritative_path_ref() {
+        let store = WorkspaceStore::new();
+        let workspace_id = WorkspaceId::new("workspace-legacy-path");
+        let root = std::env::temp_dir().join("magi-legacy-workspace");
+        store
+            .register_native_path(workspace_id.clone(), root.clone())
+            .expect("native workspace should register");
+
+        let mut durable_state = store.durable_state();
+        durable_state.workspaces[0].root_path_ref = None;
+        let restored = WorkspaceStore::from_persisted_parts(
+            durable_state,
+            WorkspaceRecoverySidecarStoreState::default(),
+        );
+        let workspace = restored
+            .workspaces()
+            .into_iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .expect("legacy workspace should restore");
+
+        assert!(
+            workspace
+                .root_path_ref
+                .as_deref()
+                .is_some_and(|value| value.starts_with("mhp1:")),
+            "legacy workspace must be upgraded before tool execution"
+        );
+        assert_eq!(workspace.native_root_path(), root);
+    }
+
+    #[test]
     fn recovery_sidecar_store_keeps_status_and_round_trips() {
         let store = WorkspaceStore::new();
         let workspace_id = WorkspaceId::new("workspace-1");

@@ -4,6 +4,65 @@ import { withGoldenViteServer } from './golden-vite.mjs';
 await withGoldenViteServer(async (server) => {
   const display = await server.ssrLoadModule('/src/lib/tool-call-display.ts');
   const fileChange = await server.ssrLoadModule('/src/lib/canonical-tool-file-change.ts');
+  const terminal = await server.ssrLoadModule('/src/lib/terminal-utils.ts');
+
+  assert.equal(
+    terminal.resolveTerminalArgumentId({ command: 'npm test', action: 'run', terminal_id: 0 }),
+    undefined,
+    '前台 shell_exec 不得把模型占位 terminal_id=0 显示为真实终端会话',
+  );
+  assert.equal(
+    terminal.resolveTerminalArgumentId({ action: 'read', terminal_id: 12 }),
+    12,
+    '后台终端控制动作必须保留真实 terminal_id',
+  );
+  assert.equal(
+    terminal.terminalPayloadOutput({
+      status: 'failed',
+      stdout: '',
+      stderr: 'npm ERR! Unknown option --runInBand',
+    }),
+    'npm ERR! Unknown option --runInBand',
+    '失败的 shell_exec 必须把 stderr 作为终端输出展示',
+  );
+  assert.equal(
+    terminal.terminalPayloadErrorText({
+      status: 'failed',
+      error_code: 'shell_exec_working_directory_unavailable',
+      error: '当前工作区目录不可访问，请重新选择工作区',
+    }),
+    '当前工作区目录不可访问，请重新选择工作区',
+    '失败的 shell_exec 必须展示结构化公开错误，不能退回通用提示',
+  );
+
+  const { render } = await server.ssrLoadModule('svelte/server');
+  const terminalCard = await server.ssrLoadModule('/src/components/TerminalSessionCard.svelte');
+  const failedTerminalMarkup = render(terminalCard.default, {
+    props: {
+      status: 'running',
+      toolCall: {
+        id: 'shell-failure',
+        name: 'shell_exec',
+        arguments: {
+          command: 'npm test -- --runInBand',
+          action: 'run',
+          terminal_id: 0,
+        },
+        status: 'error',
+        error: JSON.stringify({
+          status: 'failed',
+          error_code: 'shell_exec_failed',
+          error: '测试命令参数无效',
+          stderr: 'npm ERR! Unknown option --runInBand',
+          exit_code: 1,
+        }),
+      },
+    },
+  }).body;
+  assert.doesNotMatch(failedTerminalMarkup, /终端会话 #0|data-terminal-id="0"/);
+  assert.match(failedTerminalMarkup, /npm ERR! Unknown option --runInBand/);
+  assert.match(failedTerminalMarkup, /测试命令参数无效/);
+  assert.doesNotMatch(failedTerminalMarkup, /占用状态[^<]*否/);
 
   assert.deepEqual(
     display.coerceToolArgumentsRecord('src/App.svelte'),
@@ -122,4 +181,4 @@ await withGoldenViteServer(async (server) => {
   assert.match(applyPatchBlocks[0].fileChange.diff, /\+new/);
 
   console.log('tool call display golden replay passed');
-});
+}, { configFile: './vite.web.config.ts' });

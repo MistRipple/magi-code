@@ -83,7 +83,6 @@
   type SkillOption = ComposerSkillOption;
 
   type ReasoningEffort = OrchestratorReasoningEffort;
-  type FollowUpMode = 'queue' | 'guide';
 
   const reasoningOptions: Array<{
     value: ReasoningEffort;
@@ -144,7 +143,6 @@
   let selectedImages = $state<SelectedImage[]>([]);
   let pendingImageReadCount = $state(0);
   let sendPreparing = $state(false);
-  let followUpMode = $state<FollowUpMode>('queue');
   const MAX_IMAGES = 5;  // 最多支持 5 张图片
   const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
   const IMAGE_FILE_NAME_PATTERN = /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i;
@@ -262,9 +260,7 @@
   let pendingCaretOffset = $state<number | null>(null);
   const sendButtonTitle = $derived.by(() => {
     if (isSending) {
-      return i18n.t(
-        followUpMode === 'guide' ? 'input.followUp.guideTitle' : 'input.followUp.queueTitle',
-      );
+      return i18n.t('input.followUp.queueTitle');
     }
     if (!mainModelReady) {
       return i18n.t('input.mainModelRequired');
@@ -275,11 +271,6 @@
     sessionInputLocked || isInteractionBlocking || sendPreparing || pendingImageReadCount > 0 || !mainModelReady
   ));
 
-  $effect(() => {
-    if (!isSending || (followUpMode === 'guide' && !canGuideCurrentTurn)) {
-      followUpMode = 'queue';
-    }
-  });
   // 按钮双态状态 - 使用 $derived 计算
   const hasContent = $derived.by(() => {
     if (inputValue.trim().length > 0) return true;
@@ -994,20 +985,6 @@
         addToast('warning', i18n.t('input.noImageDuringExecution'));
         return;
       }
-      if (
-        isSending
-        && followUpMode === 'guide'
-        && (
-          !normalizedContent
-          || selectedSkill !== null
-          || selectedGoalMode
-          || selectedContextReferences.length > 0
-        )
-      ) {
-        addToast('warning', i18n.t('input.followUp.guideTextOnly'));
-        return;
-      }
-
       const submissionText = normalizedContent
         ? rawContent
         : selectedImages.length > 0
@@ -1040,7 +1017,7 @@
         goalMode: selectedGoalMode,
         accessProfile: selectedAccessProfile,
         orchestratorSessionConfig: getTurnOrchestratorSessionConfigPayload(),
-        followUpMode: !isDraftSession && isSending ? followUpMode : undefined,
+        followUpMode: !isDraftSession && isSending ? 'queue' : undefined,
         images: selectedImages.map((img) => ({
           name: img.name,
           dataUrl: img.dataUrl,
@@ -1752,16 +1729,14 @@
     <div class="ia-queue-panel">
       <div class="ia-queue-header">
         <span class="ia-queue-header-title">
-          <Icon name="clock" size={12} />
-          <span>{i18n.t('input.queue.banner')}</span>
+          {i18n.t('input.queue.header', { count: queuedMessages.length })}
         </span>
-        <span class="ia-queue-header-count">{queuedMessages.length}</span>
       </div>
       <div class="ia-queue-list">
-        {#each queuedMessages as queued, index (queued.id)}
+        {#each queuedMessages as queued (queued.id)}
           {@const guideAvailable = canGuideQueued(queued)}
           <div class="ia-queue-item">
-            <span class="ia-queue-index">{index + 1}</span>
+            <span class="ia-queue-index" aria-hidden="true"></span>
             <div class="ia-queue-content" title={queued.content}>{queued.content}</div>
             <div class="ia-queue-actions">
               <button
@@ -1772,7 +1747,7 @@
                 title={i18n.t(guideAvailable ? 'input.queue.guideTitle' : 'input.queue.guideUnavailable')}
                 aria-label={i18n.t(guideAvailable ? 'input.queue.guideTitle' : 'input.queue.guideUnavailable')}
               >
-                <Icon name="undo" size={12} />
+                <Icon name="corner-down-right" size={14} />
                 <span>{i18n.t('input.queue.guide')}</span>
               </button>
               <button
@@ -2333,25 +2308,6 @@
           </button>
           {/if}
           {#if isSending}
-          <button
-            type="button"
-            class="ia-followup-mode"
-            class:guide={followUpMode === 'guide'}
-            data-testid="input-followup-mode-button"
-            onclick={() => {
-              followUpMode = followUpMode === 'queue' && canGuideCurrentTurn ? 'guide' : 'queue';
-            }}
-            disabled={!canGuideCurrentTurn && followUpMode === 'queue'}
-            title={i18n.t(
-              followUpMode === 'guide' ? 'input.followUp.guideTitle' : 'input.followUp.queueTitle',
-            )}
-            aria-label={`${i18n.t('input.followUp.mode')}: ${i18n.t(
-              followUpMode === 'guide' ? 'input.followUp.guide' : 'input.followUp.queue',
-            )}`}
-          >
-            <Icon name={followUpMode === 'guide' ? 'git-branch' : 'clock'} size={12} />
-            <span>{i18n.t(followUpMode === 'guide' ? 'input.followUp.guide' : 'input.followUp.queue')}</span>
-          </button>
           {#if hasContent}
             <button
               class="ia-send ready"
@@ -2582,35 +2538,6 @@
   .ia-send:disabled { opacity: 0.35; cursor: not-allowed; }
   .ia-send.stop { background: var(--error); color: white; animation: ia-pulse 1.2s ease-in-out infinite; }
   @keyframes ia-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.65; } }
-
-  .ia-followup-mode {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    height: 24px;
-    max-width: 86px;
-    padding: 0 7px;
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-full);
-    background: transparent;
-    color: var(--foreground-muted);
-    font-size: 11px;
-    white-space: nowrap;
-    cursor: pointer;
-    transition: color var(--transition-fast), border-color var(--transition-fast), background var(--transition-fast);
-  }
-
-  .ia-followup-mode:hover:not(:disabled),
-  .ia-followup-mode.guide {
-    color: var(--primary);
-    border-color: color-mix(in srgb, var(--primary) 42%, transparent);
-    background: color-mix(in srgb, var(--primary) 10%, transparent);
-  }
-
-  .ia-followup-mode:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-  }
 
   .ia-enhance {
     display: inline-flex;
@@ -3487,101 +3414,69 @@
   .ia-img-clear:hover { border-color: var(--destructive); color: var(--destructive); }
 
   .ia-queue-panel {
-    border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
-    border-radius: var(--radius-lg);
-    background: color-mix(in srgb, var(--surface-1) 96%, transparent);
-    padding: 7px 9px;
+    border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+    border-radius: 9px;
+    background: color-mix(in srgb, var(--surface-1) 94%, transparent);
     display: flex;
     flex-direction: column;
-    gap: 7px;
-    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--foreground-muted) 6%, transparent);
+    overflow: hidden;
   }
 
   .ia-queue-header {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    gap: 8px;
+    min-height: 27px;
+    padding: 7px 10px 6px;
+    border-bottom: 1px solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
   }
 
   .ia-queue-header-title {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    color: color-mix(in srgb, var(--foreground) 84%, transparent);
-    font-size: 12px;
+    color: color-mix(in srgb, var(--foreground) 72%, transparent);
+    font-size: 11px;
     font-weight: var(--font-medium);
     line-height: 1.2;
-  }
-
-  .ia-queue-header-count {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 20px;
-    height: 20px;
-    padding: 0 6px;
-    border-radius: var(--radius-full);
-    background: color-mix(in srgb, var(--surface-hover) 72%, transparent);
-    border: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
-    color: var(--foreground-muted);
-    font-size: 11px;
-    font-weight: var(--font-semibold);
   }
 
   .ia-queue-list {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    max-height: 124px;
+    max-height: 140px;
     overflow-y: auto;
   }
 
   .ia-queue-item {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr) auto;
-    align-items: start;
-    gap: 8px;
-    padding: 6px 8px;
-    border-radius: var(--radius-sm);
-    border: 1px solid color-mix(in srgb, var(--border-subtle) 70%, transparent);
-    background: color-mix(in srgb, var(--surface-2) 40%, var(--surface-1));
-    min-height: 32px;
+    align-items: center;
+    gap: 9px;
+    min-height: 35px;
+    padding: 0 10px;
+  }
+
+  .ia-queue-item + .ia-queue-item {
+    border-top: 1px solid color-mix(in srgb, var(--border-subtle) 52%, transparent);
   }
 
   .ia-queue-index {
-    width: 16px;
-    height: 16px;
-    border-radius: 999px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    margin-top: 1px;
-    font-size: 10px;
-    line-height: 1;
-    color: var(--foreground-muted);
-    background: color-mix(in srgb, var(--surface-hover) 75%, transparent);
-    border: 1px solid color-mix(in srgb, var(--border) 68%, transparent);
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--primary) 42%, var(--foreground-muted));
   }
 
   .ia-queue-content {
     font-size: 12px;
-    line-height: 1.3;
-    color: var(--foreground);
-    white-space: normal;
+    line-height: 1.35;
+    color: color-mix(in srgb, var(--foreground) 80%, transparent);
+    white-space: nowrap;
     overflow: hidden;
-    word-break: break-word;
-    display: -webkit-box;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
+    text-overflow: ellipsis;
   }
 
   .ia-queue-actions {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
-    margin-top: 0;
+    gap: 8px;
     opacity: 0;
     pointer-events: none;
     transform: translateX(3px);
@@ -3599,23 +3494,22 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 22px;
-    height: 22px;
+    width: 20px;
+    height: 24px;
     padding: 0;
-    border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
-    border-radius: var(--radius-full);
-    background: color-mix(in srgb, var(--surface-1) 92%, transparent);
+    border: 0;
+    background: transparent;
     color: var(--foreground-muted);
     cursor: pointer;
-    transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+    transition: color 120ms ease, opacity 120ms ease;
   }
 
   .ia-queue-guide {
     width: auto;
-    min-width: 48px;
     gap: 4px;
-    padding: 0 7px;
-    border-radius: var(--radius-sm);
+    color: color-mix(in srgb, var(--foreground) 72%, transparent);
+    font-size: 12px;
+    white-space: nowrap;
   }
 
   .ia-queue-guide:disabled {
@@ -3624,14 +3518,10 @@
   }
 
   .ia-queue-action:hover {
-    background: color-mix(in srgb, var(--primary) 14%, transparent);
-    border-color: color-mix(in srgb, var(--primary) 40%, transparent);
     color: var(--primary);
   }
 
   .ia-queue-action.danger:hover {
-    background: color-mix(in srgb, var(--error) 14%, transparent);
-    border-color: color-mix(in srgb, var(--error) 45%, transparent);
     color: var(--error);
   }
 
@@ -3773,11 +3663,6 @@
       flex: 0 0 28px;
     }
 
-    .ia-followup-mode {
-      flex: 0 0 auto;
-      max-width: 72px;
-    }
-
     .ia-picker-popover {
       width: min(280px, calc(100vw - 24px));
       max-height: min(360px, 56vh);
@@ -3804,16 +3689,6 @@
       min-width: 0;
     }
 
-    .ia-followup-mode {
-      width: 24px;
-      max-width: 24px;
-      padding: 0;
-      justify-content: center;
-    }
-
-    .ia-followup-mode span {
-      display: none;
-    }
   }
 
   @media (max-width: 360px) {

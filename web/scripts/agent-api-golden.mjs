@@ -14,6 +14,36 @@ await withGoldenViteServer(async (server) => {
     sessionId: 'session-query-golden',
   });
 
+  binding.setAgentBindingContext({
+    workspaceId: 'workspace-path-ref-golden',
+    workspacePath: 'mhp1:u:L3RtcC93b3Jrc3BhY2UtcGF0aC1yZWYtZ29sZGVu',
+    sessionId: 'session-path-ref-golden',
+  });
+  assert.equal(
+    agentApi.settingsBootstrapMatchesCurrentWorkspace({
+      workspaceId: 'workspace-path-ref-golden',
+      workspacePath: '/tmp/workspace-path-ref-golden',
+      sessionId: 'session-path-ref-golden',
+    }),
+    true,
+    'workspace identity must not reject bootstrap data when the binding uses an opaque path ref and the response uses a display path',
+  );
+  assert.equal(
+    agentApi.settingsBootstrapMatchesCurrentWorkspace({
+      workspaceId: 'workspace-other',
+      workspacePath: '/tmp/workspace-path-ref-golden',
+      sessionId: 'session-path-ref-golden',
+    }),
+    false,
+    'workspaceId mismatch must remain authoritative even when display paths match',
+  );
+
+  binding.setAgentBindingContext({
+    workspaceId: 'workspace-query-golden',
+    workspacePath: '/tmp/workspace-query-golden',
+    sessionId: 'session-query-golden',
+  });
+
   const defaultPreviewQuery = new URLSearchParams(
     agentApi.buildFilePreviewQuery('src/main.ts'),
   );

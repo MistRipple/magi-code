@@ -540,6 +540,14 @@ let modelStatus = $state<ModelStatusMap>({
   auxiliary: { status: 'checking' },
 });
 
+export function getModelStatus(): ModelStatusMap {
+  return modelStatus;
+}
+
+export function setModelStatus(next: ModelStatusMap): void {
+  modelStatus = next;
+}
+
 // ============ 角色驱动 Tab 状态 ============
 // 前端轻量 Agent 信息（从 AgentBinding + RoleTemplate 合成）
 export interface EnabledAgent {

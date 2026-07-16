@@ -2,7 +2,12 @@
   import { untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import AccessProfileSwitchAction from './AccessProfileSwitchAction.svelte';
-  import { parseLeadingJson } from '../lib/terminal-utils';
+  import {
+    parseLeadingJson,
+    resolveTerminalArgumentId,
+    terminalPayloadErrorText,
+    terminalPayloadOutput,
+  } from '../lib/terminal-utils';
   import { i18n } from '../stores/i18n.svelte';
   import type { ToolCall, TerminalSessionBlock } from '../types/message';
   import {
@@ -58,15 +63,6 @@
     return typeof value === 'string' ? value : undefined;
   }
 
-  function joinTerminalStreams(stdout: unknown, stderr: unknown): string | undefined {
-    const stdoutText = readString(stdout) || '';
-    const stderrText = readString(stderr) || '';
-    if (!stdoutText && !stderrText) return undefined;
-    if (!stdoutText) return stderrText;
-    if (!stderrText) return stdoutText;
-    return stdoutText.endsWith('\n') ? `${stdoutText}${stderrText}` : `${stdoutText}\n${stderrText}`;
-  }
-
   function terminalStatusFromCanonical(
     canonicalStatus?: 'pending' | 'running' | 'success' | 'error',
     payloadStatus?: string,
@@ -101,43 +97,46 @@
 
   const parsedResult = $derived(parseJson(toolCall?.result));
   const parsedErrorResult = $derived(parseJson(toolCall?.error));
+  const terminalPayload = $derived(parsedResult || parsedErrorResult);
   const terminal = $derived.by((): Partial<TerminalSessionBlock> | undefined => {
-    if (!parsedResult && !toolCall) {
+    if (!terminalPayload && !toolCall) {
       return undefined;
     }
-    const rawMode = parsedResult?.run_mode;
+    const rawMode = terminalPayload?.run_mode;
     const runMode = rawMode === 'service' || rawMode === 'task' ? rawMode : undefined;
-    const streamOutput = joinTerminalStreams(parsedResult?.stdout, parsedResult?.stderr);
+    const payloadTerminalId = readInt(terminalPayload?.terminal_id);
     return {
-      terminalId: readInt(parsedResult?.terminal_id) ?? readInt(toolCall?.arguments?.terminal_id),
-      status: readString(parsedResult?.status) || undefined,
-      phase: readString(parsedResult?.phase),
+      terminalId: payloadTerminalId && payloadTerminalId > 0
+        ? payloadTerminalId
+        : resolveTerminalArgumentId(toolCall?.arguments),
+      status: readString(terminalPayload?.status) || undefined,
+      phase: readString(terminalPayload?.phase),
       runMode,
-      terminalName: readString(parsedResult?.terminal_name),
-      cwd: readString(parsedResult?.cwd),
-      command: readString(parsedResult?.command)
+      terminalName: readString(terminalPayload?.terminal_name),
+      cwd: readString(terminalPayload?.cwd),
+      command: readString(terminalPayload?.command)
         ?? (typeof toolCall?.arguments?.command === 'string' ? toolCall.arguments.command : undefined),
-      output: readString(parsedResult?.output) || readString(parsedResult?.final_output) || streamOutput,
-      outputCursor: readInt(parsedResult?.output_cursor),
-      outputStartCursor: readInt(parsedResult?.output_start_cursor),
-      fromCursor: readInt(parsedResult?.from_cursor),
-      nextCursor: readInt(parsedResult?.next_cursor),
-      delta: readBool(parsedResult?.delta),
-      truncated: readBool(parsedResult?.truncated),
-      startupStatus: parsedResult?.startup_status === 'pending'
-        || parsedResult?.startup_status === 'confirmed'
-        || parsedResult?.startup_status === 'timeout'
-        || parsedResult?.startup_status === 'failed'
-        || parsedResult?.startup_status === 'skipped'
-        ? parsedResult.startup_status as TerminalSessionBlock['startupStatus']
+      output: terminalPayloadOutput(terminalPayload) || undefined,
+      outputCursor: readInt(terminalPayload?.output_cursor),
+      outputStartCursor: readInt(terminalPayload?.output_start_cursor),
+      fromCursor: readInt(terminalPayload?.from_cursor),
+      nextCursor: readInt(terminalPayload?.next_cursor),
+      delta: readBool(terminalPayload?.delta),
+      truncated: readBool(terminalPayload?.truncated),
+      startupStatus: terminalPayload?.startup_status === 'pending'
+        || terminalPayload?.startup_status === 'confirmed'
+        || terminalPayload?.startup_status === 'timeout'
+        || terminalPayload?.startup_status === 'failed'
+        || terminalPayload?.startup_status === 'skipped'
+        ? terminalPayload.startup_status as TerminalSessionBlock['startupStatus']
         : undefined,
-      startupMessage: readString(parsedResult?.startup_message),
-      locked: readBool(parsedResult?.locked),
-      returnCode: readNullableInt(parsedResult?.return_code) ?? readNullableInt(parsedResult?.exit_code),
-      accepted: readBool(parsedResult?.accepted),
-      killed: readBool(parsedResult?.killed),
-      releasedLock: readBool(parsedResult?.released_lock),
-      error: readString(parsedResult?.error),
+      startupMessage: readString(terminalPayload?.startup_message),
+      locked: readBool(terminalPayload?.locked),
+      returnCode: readNullableInt(terminalPayload?.return_code) ?? readNullableInt(terminalPayload?.exit_code),
+      accepted: readBool(terminalPayload?.accepted),
+      killed: readBool(terminalPayload?.killed),
+      releasedLock: readBool(terminalPayload?.released_lock),
+      error: terminalPayloadErrorText(terminalPayload) || undefined,
     };
   });
   const terminalId = $derived(terminal?.terminalId);
@@ -167,25 +166,6 @@
     }
     return formatOutput(raw);
   });
-
-  function structuredErrorText(errorPayload: Record<string, unknown> | unknown[] | null): string {
-    if (!errorPayload || Array.isArray(errorPayload)) {
-      return '';
-    }
-    const stderr = readString(errorPayload.stderr)?.trim();
-    if (stderr) {
-      return stderr;
-    }
-    const error = readString(errorPayload.error)?.trim();
-    if (error) {
-      return error;
-    }
-    const summary = readString(errorPayload.summary)?.trim();
-    if (summary) {
-      return summary;
-    }
-    return '';
-  }
 
   function normalizeDisplayText(value: string): string {
     return value.trim().replace(/\s+/g, ' ');
@@ -254,7 +234,7 @@
 
   const outputCursor = $derived(terminal?.outputCursor);
   const returnCode = $derived(terminal?.returnCode);
-  const locked = $derived(Boolean(terminal?.locked));
+  const locked = $derived(terminal?.locked);
   const startupMessage = $derived(terminal?.startupMessage || '');
   const publicErrorText = $derived(
     publicToolPayloadMessage(parsedErrorResult)
@@ -273,7 +253,7 @@
   const errorText = $derived(
     terminal?.error
     || publicToolPayloadMessage(terminal?.output)
-    || structuredErrorText(parsedErrorResult)
+    || terminalPayloadErrorText(parsedErrorResult)
     || publicToolPayloadMessage(toolCall?.error)
     || toolCall?.error
     || ''
@@ -336,8 +316,12 @@
       collapsed = true;
     }
   });
-  const titleText = $derived(i18n.t('terminalSession.title', { id: terminalId ?? '-' }));
   const toolNameLabel = $derived(i18n.t('toolCall.displayName.shell'));
+  const titleText = $derived(
+    typeof terminalId === 'number'
+      ? i18n.t('terminalSession.title', { id: terminalId })
+      : toolNameLabel
+  );
   const toolSummary = $derived(displayCommand?.trim() || '');
 
   const isExpandable = $derived(Boolean(
@@ -348,12 +332,21 @@
     || showErrorHint
     || typeof outputCursor === 'number'
     || typeof returnCode === 'number'
+    || typeof locked === 'boolean'
     || typeof accepted === 'boolean'
     || typeof killed === 'boolean'
     || typeof releasedLock === 'boolean'
   ));
   const canToggle = $derived(isExpandable);
   const isExpanded = $derived(canToggle && !collapsed);
+  const showFooter = $derived(
+    typeof outputCursor === 'number'
+    || typeof returnCode === 'number'
+    || typeof locked === 'boolean'
+    || typeof accepted === 'boolean'
+    || typeof killed === 'boolean'
+    || typeof releasedLock === 'boolean'
+  );
 
   let outputElement = $state<HTMLPreElement | null>(null);
   let followTail = $state(true);
@@ -425,7 +418,9 @@
     {#if canToggle && !collapsed}
       <div class="tool-content terminal-content">
         <div class="terminal-meta-grid">
-          <div class="terminal-meta-item">{i18n.t('terminalSession.title', { id: terminalId ?? '-' })}</div>
+          {#if typeof terminalId === 'number'}
+            <div class="terminal-meta-item">{i18n.t('terminalSession.title', { id: terminalId })}</div>
+          {/if}
           <div class="terminal-meta-item">{i18n.t('terminalSession.status')}: {displayStatusLabel}</div>
           {#if displayModeLabel}
             <div class="terminal-meta-item">{i18n.t('terminalSession.mode')}: {displayModeLabel}</div>
@@ -458,31 +453,35 @@
         {/if}
 
         {#if showErrorHint}
-          <div class="terminal-error">{i18n.t('terminalSession.error')}: {publicErrorText || i18n.t('terminalSession.errorHint')}</div>
+          <div class="terminal-error">{i18n.t('terminalSession.error')}: {publicErrorText || errorText || i18n.t('terminalSession.errorHint')}</div>
         {/if}
         {#if shouldOfferFullAccessSwitch}
           <div class="terminal-hint">{i18n.t('toolCall.errorDiagnosis.permission.hint')}</div>
           <AccessProfileSwitchAction />
         {/if}
 
-        <div class="terminal-footer">
-          {#if typeof outputCursor === 'number'}
-            <span>{i18n.t('terminalSession.cursor')}: {outputCursor}</span>
-          {/if}
-          {#if typeof returnCode === 'number'}
-            <span>{i18n.t('terminalSession.returnCode')}: {returnCode}</span>
-          {/if}
-          <span>{i18n.t('terminalSession.locked')}: {locked ? i18n.t('terminalSession.yes') : i18n.t('terminalSession.no')}</span>
-          {#if typeof accepted === 'boolean'}
-            <span>{i18n.t('terminalSession.accepted')}: {accepted ? i18n.t('terminalSession.yes') : i18n.t('terminalSession.no')}</span>
-          {/if}
-          {#if typeof killed === 'boolean'}
-            <span>{i18n.t('terminalSession.killed')}: {killed ? i18n.t('terminalSession.yes') : i18n.t('terminalSession.no')}</span>
-          {/if}
-          {#if typeof releasedLock === 'boolean'}
-            <span>{i18n.t('terminalSession.releasedLock')}: {releasedLock ? i18n.t('terminalSession.yes') : i18n.t('terminalSession.no')}</span>
-          {/if}
-        </div>
+        {#if showFooter}
+          <div class="terminal-footer">
+            {#if typeof outputCursor === 'number'}
+              <span>{i18n.t('terminalSession.cursor')}: {outputCursor}</span>
+            {/if}
+            {#if typeof returnCode === 'number'}
+              <span>{i18n.t('terminalSession.returnCode')}: {returnCode}</span>
+            {/if}
+            {#if typeof locked === 'boolean'}
+              <span>{i18n.t('terminalSession.locked')}: {locked ? i18n.t('terminalSession.yes') : i18n.t('terminalSession.no')}</span>
+            {/if}
+            {#if typeof accepted === 'boolean'}
+              <span>{i18n.t('terminalSession.accepted')}: {accepted ? i18n.t('terminalSession.yes') : i18n.t('terminalSession.no')}</span>
+            {/if}
+            {#if typeof killed === 'boolean'}
+              <span>{i18n.t('terminalSession.killed')}: {killed ? i18n.t('terminalSession.yes') : i18n.t('terminalSession.no')}</span>
+            {/if}
+            {#if typeof releasedLock === 'boolean'}
+              <span>{i18n.t('terminalSession.releasedLock')}: {releasedLock ? i18n.t('terminalSession.yes') : i18n.t('terminalSession.no')}</span>
+            {/if}
+          </div>
+        {/if}
       </div>
     {/if}
   </div>

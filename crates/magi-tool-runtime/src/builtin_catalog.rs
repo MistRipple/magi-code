@@ -459,7 +459,9 @@ impl BuiltinToolName {
             Self::FileMkdir => "创建一个目录（包含父目录）",
             Self::FileCopy => "把文件或目录复制到新位置",
             Self::FileMove => "移动或重命名文件 / 目录",
-            Self::SearchText => "在指定目录下按文本模式搜索（grep 风格）",
+            Self::SearchText => {
+                "在当前工作区或指定目录下按非空文本模式搜索（grep 风格）。query 必填且不得为空；不知道搜索关键词时禁止调用。"
+            }
             Self::SearchSemantic => "本地混合代码检索：联合词法、符号和依赖关系定位相关代码",
             Self::ShellExec => {
                 "执行一条 shell 命令并返回 stdout / stderr。\n\n\
@@ -467,6 +469,9 @@ impl BuiltinToolName {
                 - 没有专用工具能完成的任务：构建（cargo build / npm run）、运行测试、git 操作、查 PID\n\
                 - 一次性 ad-hoc 命令（解压、统计行数、查磁盘占用）\n\
                 - 启动后台命令时设置 background=true；后续用同一个 shell_exec 传 action=read/write/kill/list 和 terminal_id 管理\n\n\
+                # 命令准确性\n\
+                - 执行项目测试或构建前，先读取 package.json、Cargo.toml 等项目清单确认已有脚本和参数\n\
+                - 禁止臆造 --runInBand 等测试框架参数；只使用项目清单、用户指令或工具帮助中已确认支持的参数\n\n\
                 # 何时不用\n\
                 - 读文件内容 → file_read（更安全、有大小保护）\n\
                 - 写文件内容 → file_write（避免引号转义陷阱）\n\
@@ -698,13 +703,13 @@ impl BuiltinToolName {
             Self::SearchText => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "root": { "type": "string", "description": "搜索根目录" },
-                    "query": { "type": "string", "description": "要搜索的文本模式" },
+                    "root": { "type": "string", "description": "可选搜索根目录；默认当前工作区" },
+                    "query": { "type": "string", "minLength": 1, "description": "必填、非空的文本搜索模式" },
                     "limit": { "type": "integer", "description": "最大结果数" },
                     "case_sensitive": { "type": "boolean", "description": "是否区分大小写" },
                     "include_hidden": { "type": "boolean", "description": "是否包含隐藏文件与目录" }
                 },
-                "required": ["root", "query"]
+                "required": ["query"]
             }),
             Self::SearchSemantic => serde_json::json!({
                 "type": "object",
@@ -726,7 +731,7 @@ impl BuiltinToolName {
                 "properties": {
                     "command": { "type": "string", "description": "要执行的当前平台原生 shell 命令；必须遵循工作区上下文声明的 Shell 方言" },
                     "cwd": { "type": "string", "description": "工作区相对路径或当前平台原生绝对路径；默认当前工作区" },
-                    "shell": { "type": "string", "description": "可选 Shell 程序；默认 Windows 使用 cmd.exe，Linux/macOS 使用 sh" },
+                    "shell": { "type": "string", "description": "可选 Shell 程序或程序加启动参数；默认 Windows 使用 cmd.exe /C，Linux/macOS 使用 sh -lc" },
                     "timeout_ms": { "type": "integer", "description": "执行超时（毫秒）" },
                     "action": {
                         "type": "string",
@@ -750,7 +755,7 @@ impl BuiltinToolName {
                 "properties": {
                     "command": { "type": "string", "description": "在后台启动的 shell 命令" },
                     "cwd": { "type": "string", "description": "工作目录" },
-                    "shell": { "type": "string", "description": "使用的 shell 程序" }
+                    "shell": { "type": "string", "description": "使用的 Shell 程序或程序加启动参数" }
                 },
                 "required": ["command"]
             }),

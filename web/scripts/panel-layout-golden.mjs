@@ -163,15 +163,15 @@ assert.match(
   /@container tools-tab \(max-width:\s*760px\)[\s\S]*?\.capability-dependency-strip\s*\{[\s\S]*?grid-column:\s*1 \/ -1;[\s\S]*?width:\s*100%;/,
   '窄屏依赖状态必须占据完整第二行并按自然宽度换行',
 );
-assert.match(
+assert.doesNotMatch(
   inputAreaSource,
-  /type FollowUpMode = 'queue' \| 'guide'/,
-  '运行中发送必须明确区分独立排队和当前轮引导',
+  /type FollowUpMode = 'queue' \| 'guide'|data-testid="input-followup-mode-button"|ia-followup-mode/,
+  '运行中输入区必须默认排队，不得保留排队与引导模式切换入口',
 );
-assert.match(
-  inputAreaSource,
-  /data-testid="input-followup-mode-button"/,
-  '运行中输入区必须提供可见的排队与引导模式入口',
+assert.doesNotMatch(
+  `${zhLocaleSource}\n${enLocaleSource}`,
+  /"input\.followUp\.(mode|queue|guide|guideTitle)"|"input\.queue\.banner"/,
+  '删除输入区模式切换后必须同步清理废弃文案',
 );
 
 await withGoldenViteServer(async (server) => {

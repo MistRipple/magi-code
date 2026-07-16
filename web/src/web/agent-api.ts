@@ -281,9 +281,18 @@ export function settingsBootstrapMatchesCurrentWorkspace(
 ): boolean {
   if (!snapshot) return false;
   const binding = resolveAgentBindingContext();
-  return normalizeBindingString(snapshot.workspaceId) === binding.workspaceId
-    && normalizeBindingString(snapshot.workspacePath) === binding.workspacePath
-    && normalizeBindingString(snapshot.sessionId) === binding.sessionId;
+  const snapshotWorkspaceId = normalizeBindingString(snapshot.workspaceId);
+  const snapshotWorkspacePath = normalizeBindingString(snapshot.workspacePath);
+  const snapshotSessionId = normalizeBindingString(snapshot.sessionId);
+  if (snapshotSessionId !== binding.sessionId) {
+    return false;
+  }
+  if (snapshotWorkspaceId || binding.workspaceId) {
+    return Boolean(snapshotWorkspaceId)
+      && Boolean(binding.workspaceId)
+      && snapshotWorkspaceId === binding.workspaceId;
+  }
+  return snapshotWorkspacePath === binding.workspacePath;
 }
 
 export interface AgentExecutionStatsItem {

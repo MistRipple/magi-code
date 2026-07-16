@@ -73,6 +73,12 @@ struct ShellExecOutput {
     cancelled: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShellCommandSpec {
+    program: String,
+    arguments: Vec<String>,
+}
+
 pub(crate) struct ShellPipeOutput {
     pub(crate) bytes: Vec<u8>,
     pub(crate) truncated: bool,
@@ -553,6 +559,13 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
             }
         },
     };
+    if !cwd.is_dir() {
+        return builtin_error_with_code(
+            "shell_exec",
+            "shell_exec_working_directory_unavailable",
+            "当前工作区目录不可访问，请重新选择工作区",
+        );
+    }
     let shell = request
         .as_ref()
         .and_then(|object| field_string(object, &["shell"]))
@@ -803,9 +816,10 @@ fn execute_shell_command_with_timeout(
     timeout_ms: u64,
     context: &ToolExecutionContext,
 ) -> Result<ShellExecOutput, String> {
-    let mut command_builder = std_command(shell);
+    let shell = parse_shell_command_spec(shell)?;
+    let mut command_builder = std_command(&shell.program);
     command_builder
-        .arg(shell_arg(shell))
+        .args(&shell.arguments)
         .arg(command)
         .current_dir(cwd)
         .stdout(Stdio::piped())
@@ -1070,8 +1084,24 @@ fn execute_process_launch_with_surface(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(default_shell_binary);
 
-    let mut child = match std_command(&shell)
-        .arg(shell_arg(&shell))
+    let shell = match parse_shell_command_spec(&shell) {
+        Ok(shell) => shell,
+        Err(error) => {
+            return builtin_runtime_error(
+                surface_tool,
+                if surface_tool == "shell_exec" {
+                    SHELL_EXEC_PUBLIC_ERROR
+                } else {
+                    PROCESS_LAUNCH_PUBLIC_ERROR
+                },
+                "解析 Shell 启动配置失败",
+                error,
+            );
+        }
+    };
+
+    let mut child = match std_command(&shell.program)
+        .args(&shell.arguments)
         .arg(&command)
         .current_dir(&cwd)
         .stdin(Stdio::piped())
@@ -1683,6 +1713,47 @@ fn default_shell_binary() -> String {
     } else {
         "sh".to_string()
     }
+}
+
+fn parse_shell_command_spec(shell: &str) -> Result<ShellCommandSpec, String> {
+    let tokens = tokenize_shell_command_spec(shell)?;
+    let Some(program) = tokens.first().cloned() else {
+        return Err("Shell 程序不能为空".to_string());
+    };
+    let arguments = if tokens.len() == 1 {
+        vec![shell_arg(&program).to_string()]
+    } else {
+        tokens.into_iter().skip(1).collect()
+    };
+    Ok(ShellCommandSpec { program, arguments })
+}
+
+fn tokenize_shell_command_spec(shell: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+
+    for character in shell.trim().chars() {
+        match quote {
+            Some(active_quote) if character == active_quote => quote = None,
+            Some(_) => current.push(character),
+            None if matches!(character, '\'' | '"') => quote = Some(character),
+            None if character.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(character),
+        }
+    }
+
+    if quote.is_some() {
+        return Err("Shell 程序包含未闭合引号".to_string());
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Ok(tokens)
 }
 
 fn shell_arg(shell: &str) -> &'static str {
@@ -3555,6 +3626,25 @@ mod tests {
         );
         assert_eq!(shell_arg("pwsh"), "-Command");
         assert_eq!(shell_arg("/bin/zsh"), "-lc");
+    }
+
+    #[test]
+    fn shell_command_spec_accepts_program_and_argument_prefix() {
+        assert_eq!(
+            parse_shell_command_spec("sh -lc").expect("shell spec"),
+            ShellCommandSpec {
+                program: "sh".to_string(),
+                arguments: vec!["-lc".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_shell_command_spec(r#""C:\Program Files\PowerShell\7\pwsh.exe" -Command"#)
+                .expect("quoted shell spec"),
+            ShellCommandSpec {
+                program: r#"C:\Program Files\PowerShell\7\pwsh.exe"#.to_string(),
+                arguments: vec!["-Command".to_string()],
+            }
+        );
     }
 
     #[test]

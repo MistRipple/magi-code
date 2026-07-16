@@ -2623,6 +2623,55 @@ done
         assert!(ledger.usage_entries.is_empty());
     }
 
+    #[test]
+    fn restore_persists_authoritative_path_ref_for_legacy_workspace_state() {
+        let state_root = temp_state_root("legacy-workspace-path");
+        let workspace_root = state_root.join("legacy-workspace");
+        fs::create_dir_all(&workspace_root).expect("legacy workspace should exist");
+        fs::write(
+            state_root.join("workspaces.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "active_workspace_id": "legacy-workspace",
+                "workspaces": [{
+                    "workspaceId": "legacy-workspace",
+                    "name": null,
+                    "rootPath": workspace_root.to_string_lossy(),
+                    "worktreeRoot": null,
+                    "status": "Registered",
+                    "createdAt": 1,
+                    "updatedAt": 1
+                }],
+                "worktree_allocations": [],
+                "snapshots": []
+            }))
+            .expect("legacy workspace state should serialize"),
+        )
+        .expect("legacy workspace state should persist");
+        let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());
+
+        let runtime = DaemonRuntime::restore(&config).expect("legacy workspace should restore");
+
+        let restored_workspace = runtime
+            .workspace_store
+            .workspaces()
+            .into_iter()
+            .find(|workspace| workspace.workspace_id.as_str() == "legacy-workspace")
+            .expect("legacy workspace should remain registered");
+        assert_eq!(restored_workspace.native_root_path(), workspace_root);
+
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &fs::read(state_root.join("workspaces.json"))
+                .expect("normalized workspace state should be readable"),
+        )
+        .expect("normalized workspace state should deserialize");
+        assert!(
+            persisted["workspaces"][0]["rootPathRef"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("mhp1:")),
+            "daemon restore must persist the authoritative host path reference"
+        );
+    }
+
     #[tokio::test]
     async fn knowledge_endpoint_returns_code_index_after_bootstrap_scan() {
         let state_root = temp_state_root("knowledge-code-index");

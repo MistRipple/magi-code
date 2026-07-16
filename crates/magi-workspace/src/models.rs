@@ -27,6 +27,18 @@ impl WorkspaceRecord {
             .map(magi_core::HostPath::into_path_buf)
             .unwrap_or_else(|| PathBuf::from(self.root_path.as_str()))
     }
+
+    pub(crate) fn normalize_persisted_host_path(&mut self) {
+        let host_path = self
+            .root_path_ref
+            .as_deref()
+            .and_then(|value| magi_core::HostPath::from_path_ref(value).ok())
+            .unwrap_or_else(|| {
+                magi_core::HostPath::from_path(PathBuf::from(self.root_path.as_str()))
+            });
+        self.root_path = AbsolutePath::new(host_path.display_string());
+        self.root_path_ref = Some(host_path.to_path_ref().as_str().to_string());
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -285,9 +297,12 @@ pub struct WorkspaceDurableState {
 
 impl WorkspaceStoreState {
     pub fn from_persisted_parts(
-        durable_state: WorkspaceDurableState,
+        mut durable_state: WorkspaceDurableState,
         recovery_sidecar_store: WorkspaceRecoverySidecarStoreState,
     ) -> Self {
+        for workspace in &mut durable_state.workspaces {
+            workspace.normalize_persisted_host_path();
+        }
         Self {
             active_workspace_id: durable_state.active_workspace_id,
             workspaces: durable_state.workspaces,

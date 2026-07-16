@@ -430,6 +430,89 @@ fn shell_exec_spawn_failure_uses_public_error_message() {
 }
 
 #[test]
+fn shell_exec_accepts_shell_program_with_arguments() {
+    let registry = make_registry();
+    let workspace = unique_temp_dir("magi-shell-prefix-workspace");
+    let (shell, command) = if cfg!(windows) {
+        ("cmd.exe /C", "echo shell-prefix-ok")
+    } else {
+        ("sh -lc", "printf shell-prefix-ok")
+    };
+
+    let output = registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-shell-prefix"),
+            tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({
+                "command": command,
+                "shell": shell,
+                "cwd": ".",
+                "access_mode": "read_only",
+                "action": "run",
+                "background": false,
+                "terminal_id": 0,
+                "input": "",
+                "max_bytes": 20_000,
+                "timeout_ms": 10_000,
+            })
+            .to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        ToolExecutionContext {
+            working_directory: Some(workspace),
+            ..ToolExecutionContext::default()
+        },
+        &full_access_policy(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert_eq!(
+        payload["stdout"].as_str().map(str::trim),
+        Some("shell-prefix-ok")
+    );
+}
+
+#[test]
+fn shell_exec_reports_unavailable_workspace_before_starting_shell() {
+    let registry = make_registry();
+    let missing_workspace = std::env::temp_dir().join(format!(
+        "magi-missing-shell-workspace-{}",
+        magi_core::UtcMillis::now().0
+    ));
+
+    let output = registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-shell-missing-workspace"),
+            tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({
+                "command": "echo ok",
+                "access_mode": "read_only",
+            })
+            .to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        ToolExecutionContext {
+            working_directory: Some(missing_workspace),
+            ..ToolExecutionContext::default()
+        },
+        &full_access_policy(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert_eq!(
+        payload["error_code"],
+        "shell_exec_working_directory_unavailable"
+    );
+    assert_eq!(payload["error"], "当前工作区目录不可访问，请重新选择工作区");
+}
+
+#[test]
 fn shell_exec_rejects_read_only_mode_with_write_redirection() {
     let governance = Arc::new(GovernanceService::default());
     let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
@@ -1149,13 +1232,18 @@ fn builtins_use_context_working_directory_for_relative_inputs() {
         ..ToolExecutionContext::default()
     };
 
+    let shell_command = if cfg!(windows) {
+        "if exist marker.txt echo workspace-ok"
+    } else {
+        "test -f marker.txt && printf workspace-ok"
+    };
     let shell_output = tool_registry.execute_with_policy(
         ToolExecutionInput {
             tool_call_id: ToolCallId::new("tool-call-context-shell"),
             tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
             tool_kind: ToolKind::Builtin,
             input: serde_json::json!({
-                "command": "test -f marker.txt && printf workspace-ok",
+                "command": shell_command,
                 "access_mode": "read_only"
             })
             .to_string(),
@@ -1168,7 +1256,10 @@ fn builtins_use_context_working_directory_for_relative_inputs() {
     let shell_payload: Value =
         serde_json::from_str(&shell_output.payload).expect("shell payload should parse");
     assert_eq!(shell_output.status, ExecutionResultStatus::Succeeded);
-    assert_eq!(shell_payload["stdout"], "workspace-ok");
+    assert_eq!(
+        shell_payload["stdout"].as_str().map(str::trim),
+        Some("workspace-ok")
+    );
 
     let file_output = tool_registry.execute_with_policy(
         ToolExecutionInput {
@@ -4962,6 +5053,26 @@ fn shell_exec_schema_warns_against_read_only_temp_writes() {
     assert!(description.contains("重定向到普通文件"));
     assert!(description.contains("maybe_write"));
     assert!(description.contains("explicit_write"));
+}
+
+#[test]
+fn search_text_schema_requires_query_and_keeps_root_optional() {
+    let schema = BuiltinToolName::SearchText.parameters_schema();
+
+    assert_eq!(schema["required"], serde_json::json!(["query"]));
+    let query_description = schema["properties"]["query"]["description"]
+        .as_str()
+        .expect("query description");
+    assert!(query_description.contains("必填"));
+    assert!(query_description.contains("非空"));
+}
+
+#[test]
+fn shell_schema_forbids_inventing_test_runner_arguments() {
+    let description = BuiltinToolName::ShellExec.description();
+
+    assert!(description.contains("package.json"));
+    assert!(description.contains("禁止臆造"));
 }
 
 #[test]

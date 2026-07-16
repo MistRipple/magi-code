@@ -155,6 +155,31 @@ assert.doesNotMatch(
   /getPathSegments|buildPathFromSegments|selectionMode/,
   '目录选择器不得自行拆分路径或保留文件选择模式',
 );
+assert.doesNotMatch(
+  folderPickerSource,
+  /class="mac-path-editor"/,
+  '目录选择器不得额外渲染第二行路径编辑栏',
+);
+assert.match(
+  folderPickerSource,
+  /mac-breadcrumbs-wrapper[\s\S]*?showManualInput[\s\S]*?mac-path-input/,
+  '路径输入必须在面包屑区域原位切换，不能改变工具栏布局',
+);
+assert.match(
+  folderPickerSource,
+  /await tick\(\)[\s\S]*?manualPathInputElement\?\.focus\(\)/,
+  '切换到路径编辑时必须自动聚焦输入框，支持直接粘贴路径',
+);
+assert.match(
+  folderPickerSource,
+  /event\.key === 'Escape'[\s\S]*?event\.stopPropagation\(\)[\s\S]*?showManualInput = false/,
+  '路径输入按 Escape 时必须阻止冒泡，只退出编辑而不关闭目录选择器',
+);
+assert.match(
+  folderPickerSource,
+  /\.mac-root-select\s*\{[\s\S]*?appearance:\s*none[\s\S]*?background:/,
+  '根目录选择器必须使用统一的 macOS 风格样式',
+);
 assert.match(
   folderPickerSource,
   /result\.breadcrumbs[\s\S]*?entry\.pathRef[\s\S]*?resolveAgentPath\(target, currentPathRef/,

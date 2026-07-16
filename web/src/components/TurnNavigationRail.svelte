@@ -139,7 +139,7 @@
     const containerRect = container.getBoundingClientRect();
     const elementRect = element.getBoundingClientRect();
     const targetTop = container.scrollTop + elementRect.top - containerRect.top - 24;
-    container.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+    container.scrollTop = Math.max(0, targetTop);
     activeTurnId = item.turnId;
     selectedTurnId = item.turnId;
     menuOpen = false;

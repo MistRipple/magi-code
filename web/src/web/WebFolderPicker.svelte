@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import {
     browseAgentDirectory,
     resolveAgentPath,
@@ -33,6 +33,7 @@
   let error = $state('');
   let selectedPathRef = $state('');
   let manualPathInput = $state('');
+  let manualPathInputElement = $state<HTMLInputElement>();
   let showManualInput = $state(false);
   let showHidden = $state(false);
   let hasLoaded = $state(false);
@@ -133,10 +134,13 @@
     });
   }
 
-  function toggleManualInput(): void {
+  async function toggleManualInput(): Promise<void> {
     showManualInput = !showManualInput;
     if (showManualInput) {
       manualPathInput = currentDisplayPath;
+      await tick();
+      manualPathInputElement?.focus();
+      manualPathInputElement?.select();
     }
   }
 
@@ -168,6 +172,7 @@
       void goToManualPath();
     }
     if (event.key === 'Escape') {
+      event.stopPropagation();
       showManualInput = false;
     }
   }
@@ -213,8 +218,18 @@
         {/if}
       </div>
 
-      <div class="mac-breadcrumbs-wrapper">
-        {#if currentPathRef}
+      <div class="mac-breadcrumbs-wrapper" class:editing={showManualInput}>
+        {#if showManualInput}
+          <input
+            class="mac-path-input"
+            type="text"
+            bind:this={manualPathInputElement}
+            bind:value={manualPathInput}
+            onkeydown={handleManualInputKeydown}
+            placeholder={i18n.t('web.folderPickerManualPathPlaceholder')}
+            aria-label={i18n.t('web.folderPickerManualPath')}
+          />
+        {:else if currentPathRef}
           <div class="mac-breadcrumbs">
             {#each breadcrumbs as crumb, i (crumb.pathRef)}
               {#if i > 0}<span class="mac-crumb-sep"><Icon name="chevron-right" size={10} /></span>{/if}
@@ -235,31 +250,19 @@
       </div>
 
       <div class="mac-actions-group">
-        <button class="mac-icon-btn" onclick={toggleManualInput} disabled={loading} title={i18n.t('web.folderPickerManualPath')} class:active={showManualInput}>
-          <Icon name="pencil" size={14} />
+        <button
+          class="mac-icon-btn"
+          onclick={toggleManualInput}
+          disabled={loading}
+          title={showManualInput ? i18n.t('common.close') : i18n.t('web.folderPickerManualPath')}
+          aria-label={showManualInput ? i18n.t('common.close') : i18n.t('web.folderPickerManualPath')}
+          class:active={showManualInput}
+        >
+          <Icon name={showManualInput ? 'close' : 'pencil'} size={14} />
         </button>
       </div>
     </div>
   </div>
-
-  <!-- ── 手动输入路径栏 ── -->
-  {#if showManualInput}
-    <div class="mac-path-editor">
-      <div class="mac-input-wrapper">
-        <div class="mac-input-icon"><Icon name="pencil" size={12} /></div>
-        <input
-          class="mac-path-input"
-          type="text"
-          bind:value={manualPathInput}
-          onkeydown={handleManualInputKeydown}
-          placeholder={i18n.t('web.folderPickerManualPathPlaceholder')}
-        />
-      </div>
-      <button class="apple-action-btn primary" onclick={() => void goToManualPath()} disabled={loading || !manualPathInput.trim()}>
-        {i18n.t('web.folderPickerGo')}
-      </button>
-    </div>
-  {/if}
 
   <!-- ── 目录列表 ── -->
   <div class="mac-list-area">
@@ -400,6 +403,10 @@
     gap: 4px;
   }
 
+  .mac-nav-group {
+    min-width: 0;
+  }
+
   .mac-icon-btn {
     display: flex;
     align-items: center;
@@ -429,6 +436,43 @@
     color: var(--primary);
   }
 
+  .mac-root-select {
+    appearance: none;
+    height: 28px;
+    min-width: 64px;
+    max-width: 112px;
+    padding: 0 26px 0 10px;
+    border: 1px solid rgba(var(--foreground-rgb, 100, 100, 100), 0.12);
+    border-radius: 6px;
+    background: rgba(var(--foreground-rgb, 100, 100, 100), 0.04);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%23888' d='M1 1l4 4 4-4' stroke='%23888' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 9px center;
+    color: var(--foreground);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    text-overflow: ellipsis;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+  }
+
+  .mac-root-select:hover:not(:disabled) {
+    background-color: rgba(var(--foreground-rgb, 100, 100, 100), 0.08);
+    border-color: rgba(var(--foreground-rgb, 100, 100, 100), 0.18);
+  }
+
+  .mac-root-select:focus-visible {
+    outline: none;
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px rgba(var(--primary-rgb, 0, 122, 255), 0.16);
+  }
+
+  .mac-root-select:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
   /* 面包屑导航 */
   .mac-breadcrumbs-wrapper {
     flex: 1;
@@ -441,6 +485,12 @@
     border-radius: 8px;
     padding: 0 10px;
     box-shadow: inset 0 1px 2px rgba(0,0,0,0.02);
+  }
+
+  .mac-breadcrumbs-wrapper.editing {
+    padding: 0;
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px rgba(var(--primary-rgb, 0, 122, 255), 0.16);
   }
 
   .mac-breadcrumbs {
@@ -493,49 +543,21 @@
     font-weight: 600;
   }
 
-  /* 手动路径输入 */
-  .mac-path-editor {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 16px;
-    background: rgba(var(--foreground-rgb, 100, 100, 100), 0.02);
-    border-bottom: 1px solid rgba(var(--foreground-rgb, 100, 100, 100), 0.08);
-  }
-
-  .mac-input-wrapper {
-    flex: 1;
-    position: relative;
-    display: flex;
-    align-items: center;
-  }
-
-  .mac-input-icon {
-    position: absolute;
-    left: 10px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--foreground-muted);
-  }
-
   .mac-path-input {
     width: 100%;
-    height: 32px;
-    padding: 0 12px 0 32px;
-    border-radius: 6px;
-    border: 1px solid rgba(var(--foreground-rgb, 100, 100, 100), 0.15);
-    background: var(--background);
+    height: 100%;
+    min-width: 0;
+    padding: 0 10px;
+    border: none;
+    border-radius: inherit;
+    background: transparent;
     color: var(--foreground);
     font-size: 13px;
     font-family: var(--font-mono, monospace);
-    transition: border-color 0.2s, box-shadow 0.2s;
   }
 
   .mac-path-input:focus {
     outline: none;
-    border-color: var(--primary);
-    box-shadow: 0 0 0 2px rgba(var(--primary-rgb, 0, 122, 255), 0.2);
   }
 
   /* 列表区域 */
