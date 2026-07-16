@@ -5,6 +5,7 @@
     TimelineRenderItem,
   } from '../types/message';
   import MessageItem from './MessageItem.svelte';
+  import TurnNavigationRail from './TurnNavigationRail.svelte';
   import Icon from './Icon.svelte';
   import { tick, onDestroy } from 'svelte';
   import {
@@ -16,6 +17,11 @@
   } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { formatElapsed } from '../lib/utils';
+  import {
+    buildTurnNavigationItems,
+    isTurnNavigationStatus,
+    type TurnNavigationMessage,
+  } from '../lib/turn-navigation';
 
   // Props - Svelte 5 语法
   interface Props {
@@ -56,6 +62,30 @@
   );
 
   const activeRenderItems = $derived(safeRenderItems);
+
+  const turnNavigationItems = $derived.by(() => {
+    if (displayContext !== 'thread') return [];
+    const navigationMessages: TurnNavigationMessage[] = [];
+    for (const item of activeRenderItems) {
+      const metadata = item.message.metadata || {};
+      const turnId = typeof metadata.turnId === 'string' ? metadata.turnId.trim() : '';
+      const turnSeq = typeof metadata.turnSeq === 'number' && Number.isFinite(metadata.turnSeq)
+        ? Math.floor(metadata.turnSeq)
+        : null;
+      const turnStatus = metadata.turnStatus;
+      if (!turnId || turnSeq === null || !isTurnNavigationStatus(turnStatus)) continue;
+      navigationMessages.push({
+        id: item.message.id,
+        turnId,
+        turnSeq,
+        turnStatus,
+        type: item.message.type || '',
+        content: item.message.content || '',
+      });
+    }
+    return buildTurnNavigationItems(navigationMessages);
+  });
+  const showTurnNavigation = $derived(displayContext === 'thread' && turnNavigationItems.length > 1);
 
   const currentSessionId = $derived.by(() => (
     typeof messagesState.currentSessionId === 'string' ? messagesState.currentSessionId.trim() : ''
@@ -609,7 +639,8 @@
   });
 </script>
 
-<div class="message-list-wrapper">
+<div class="message-list-wrapper" class:has-turn-navigation={showTurnNavigation}>
+  <TurnNavigationRail items={turnNavigationItems} container={containerRef} />
   <div
     class="message-list"
     bind:this={containerRef}
@@ -679,7 +710,7 @@
 
   <!-- 滚动按钮：绝对定位在消息列表右下角 -->
   {#if showScrollBtn}
-    <button class="scroll-to-bottom" onclick={scrollToBottom} title={i18n.t('messageList.scrollToBottom')}>
+    <button class="scroll-to-bottom floating-overlay-control" onclick={scrollToBottom} title={i18n.t('messageList.scrollToBottom')}>
       <Icon name="chevron-down" size={16} />
     </button>
   {/if}
@@ -692,6 +723,8 @@
     min-height: 0; /* flex 布局防溢出 */
     display: flex;
     flex-direction: column;
+    container-type: inline-size;
+    container-name: message-list;
   }
 
   .message-list {
@@ -707,6 +740,12 @@
     padding-right: var(--space-2);
     /* 🔧 优化：禁用浏览器默认的滚动锚定，防止与自动滚动逻辑冲突导致抖动 */
     overflow-anchor: none;
+  }
+
+  @container message-list (min-width: 640px) {
+    .message-list-wrapper.has-turn-navigation .message-list {
+      padding-left: calc(var(--space-4) + 8px);
+    }
   }
 
   .history-sentinel {
@@ -881,13 +920,8 @@
     width: 36px;
     height: 36px;
     padding: 0;
-    background: var(--surface-2);
     color: var(--primary);
-    border: 1px solid var(--border);
     border-radius: var(--radius-full);
-    box-shadow: var(--shadow-lg);
-    cursor: pointer;
-    transition: all var(--transition-fast);
     z-index: 100;
     animation: slideUp 0.2s ease-out;
   }
@@ -895,13 +929,6 @@
   @keyframes slideUp {
     from { opacity: 0; transform: translateY(8px); }
     to { opacity: 1; transform: translateY(0); }
-  }
-
-  .scroll-to-bottom:hover {
-    background: var(--primary);
-    color: white;
-    border-color: var(--primary);
-    transform: translateY(-2px);
   }
 
 </style>

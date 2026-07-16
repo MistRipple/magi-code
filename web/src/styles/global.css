@@ -463,6 +463,33 @@ button:disabled {
   opacity: 0.5;
 }
 
+/* 右下角悬浮控件统一视觉外壳，组件仅维护尺寸、位置与内容。 */
+.floating-overlay-control {
+  opacity: 0.46;
+  background: color-mix(in srgb, var(--surface-2) 68%, transparent);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  cursor: pointer;
+  transition:
+    opacity 160ms ease,
+    background 160ms ease,
+    border-color 160ms ease,
+    transform 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.floating-overlay-control:hover,
+.floating-overlay-control:focus-visible,
+.floating-overlay-control[aria-expanded='true'] {
+  opacity: 1;
+  background: var(--surface-2);
+  border-color: var(--border);
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+
 /* 输入框基础样式 */
 input,
 textarea {

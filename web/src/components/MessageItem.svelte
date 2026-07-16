@@ -61,6 +61,9 @@
   const placeholderState = $derived((message.metadata?.placeholderState || 'pending') as PlaceholderState);
   const sendingAnimation = $derived(Boolean(message.metadata?.sendingAnimation));
   const isSupplementary = $derived(Boolean(message.metadata?.isSupplementary));
+  const messageTurnId = $derived(
+    typeof message.metadata?.turnId === 'string' ? message.metadata.turnId.trim() : '',
+  );
 
   // 动态 agent 颜色：为消息左侧色带和流式动画提供颜色
   const agentColorStyle = $derived.by(() => {
@@ -261,7 +264,7 @@
 
 <!-- 系统通知消息：居中显示（必须有实际文本内容才渲染） -->
 {#if isNotice && message.content && message.content.trim()}
-  <div class="system-notice {noticeType}">
+  <div class="system-notice {noticeType}" data-message-id={message.id} data-turn-id={messageTurnId || undefined}>
     <span class="notice-icon" style="color: {noticeColors[noticeType] || noticeColors.info}">
       <Icon name={noticeIcons[noticeType] || 'info'} size={14} />
     </span>
@@ -272,7 +275,7 @@
   </div>
 <!-- 用户消息：简洁显示 -->
 {:else if isUser}
-  <div class="message-item user" class:sending={sendingAnimation} class:supplementary={isSupplementary} data-message-id={message.id} data-source="user">
+  <div class="message-item user" class:sending={sendingAnimation} class:supplementary={isSupplementary} data-message-id={message.id} data-turn-id={messageTurnId || undefined} data-source="user">
     {#if messageContextReferences.length > 0}
       <div class="user-context-references">
         {#each messageContextReferences as reference (`${message.id}-${reference.kind}-${reference.path}`)}
@@ -327,6 +330,7 @@
     class:placeholder={isPlaceholder}
     class:no-visible-content={!hasVisibleContent && !isNativeSource}
     data-message-id={message.id}
+    data-turn-id={messageTurnId || undefined}
     data-source={message.source}
     data-interaction={isInteraction ? 'true' : 'false'}
     data-placeholder-state={isPlaceholder ? placeholderState : undefined}
