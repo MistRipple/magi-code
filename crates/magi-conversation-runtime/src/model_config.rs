@@ -216,6 +216,7 @@ impl NormalizedModelConfig {
             model: self.model.clone()?,
             base_url: self.base_url.clone()?,
             api_key: self.api_key.clone(),
+            account_fingerprint: None,
             url_mode: self.url_mode.to_usage_url_mode(),
             reasoning_effort: self
                 .reasoning_effort

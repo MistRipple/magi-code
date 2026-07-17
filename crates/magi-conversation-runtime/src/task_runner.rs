@@ -192,6 +192,34 @@ impl TaskRunner {
         Ok(())
     }
 
+    pub fn finalize_unexpected_failure(
+        &self,
+        root_task_id: &TaskId,
+        reason: &str,
+    ) -> Result<(), String> {
+        let task_ids = self.collect_subtree_ids(root_task_id);
+        if task_ids.is_empty() {
+            return Err(format!("任务树不存在: {root_task_id}"));
+        }
+        for task_id in task_ids {
+            let Some(task) = self.store.get_task(&task_id) else {
+                continue;
+            };
+            if matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
+                if let Some(lease) = self.store.get_active_lease(&task_id) {
+                    self.store.revoke_lease(&task_id, &lease.lease_id);
+                }
+                self.store
+                    .set_output_refs(&task_id, vec![reason.to_string()]);
+                self.store
+                    .update_status(&task_id, TaskStatus::Failed)
+                    .map_err(|error| format!("收口异常任务 {task_id} 失败: {error}"))?;
+            }
+        }
+        self.set_checkpoint_signal();
+        Ok(())
+    }
+
     fn stalled_task_reason(&self, task: &Task) -> String {
         let role = resolve_task_role(task, &self.agent_role_registry)
             .or_else(|| task.executor_binding_target_role())
@@ -256,7 +284,14 @@ impl TaskRunner {
 
     fn apply_results(&self) -> Result<(), String> {
         for result in self.result_receiver.poll_results() {
-            self.store.complete_lease(&result.task_id, &result.lease_id);
+            if !self.store.complete_lease(&result.task_id, &result.lease_id) {
+                tracing::warn!(
+                    task_id = %result.task_id,
+                    lease_id = %result.lease_id,
+                    "忽略非当前活跃租约的迟到任务结果"
+                );
+                continue;
+            }
             match result.outcome {
                 TaskOutcome::Completed { output_refs } => {
                     self.store.set_output_refs(&result.task_id, output_refs);
@@ -386,8 +421,8 @@ enum TerminalState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task_runner_bridge::EventBasedResultReceiver;
-    use magi_core::{MissionId, TaskKind, TaskRuntimePayload, UtcMillis};
+    use crate::task_runner_bridge::{EventBasedResultReceiver, TaskResult};
+    use magi_core::{MissionId, TaskKind, TaskRuntimePayload, UtcMillis, WorkerId};
 
     struct RejectingDispatcher;
 
@@ -462,5 +497,63 @@ mod tests {
             TaskStatus::Pending
         );
         assert!(store.get_active_lease(&root.task_id).is_none());
+    }
+
+    #[test]
+    fn stale_lease_result_cannot_overwrite_restarted_task() {
+        let store = Arc::new(TaskStore::new());
+        let mut root = test_task("task-stale-result", "task-stale-result", None);
+        root.status = TaskStatus::Running;
+        store.insert_task(root.clone());
+        let worker_id = WorkerId::new("worker-stale-result");
+        let stale_lease = store
+            .grant_lease(
+                &root.task_id,
+                &root.root_task_id,
+                &worker_id,
+                "executor",
+                DEFAULT_LEASE_DURATION_MS,
+            )
+            .expect("stale lease should grant");
+        assert!(store.revoke_lease(&root.task_id, &stale_lease.lease_id));
+        let current_lease = store
+            .grant_lease(
+                &root.task_id,
+                &root.root_task_id,
+                &worker_id,
+                "executor",
+                DEFAULT_LEASE_DURATION_MS,
+            )
+            .expect("current lease should grant");
+        let receiver = Arc::new(EventBasedResultReceiver::new());
+        receiver.push_result(TaskResult {
+            task_id: root.task_id.clone(),
+            lease_id: stale_lease.lease_id,
+            outcome: TaskOutcome::Failed {
+                error: "旧执行轮迟到失败".to_string(),
+            },
+        });
+        let runner = TaskRunner::with_dispatcher(
+            Arc::clone(&store),
+            Vec::new(),
+            Arc::new(RejectingDispatcher),
+            receiver,
+        );
+
+        assert_eq!(runner.run_cycle(&root.task_id), RunCycleOutcome::Continue);
+        assert_eq!(
+            store
+                .get_task(&root.task_id)
+                .expect("task should exist")
+                .status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            store
+                .get_active_lease(&root.task_id)
+                .expect("current lease should remain")
+                .lease_id,
+            current_lease.lease_id
+        );
     }
 }

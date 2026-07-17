@@ -296,8 +296,10 @@ pub struct LlmConfig {
     pub provider: String,
     pub model: String,
     pub base_url: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_fingerprint: Option<String>,
     pub url_mode: UrlMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,

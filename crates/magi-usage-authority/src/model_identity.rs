@@ -58,7 +58,10 @@ pub fn build_model_resolution_identity(
         if m.is_empty() { "unknown" } else { m }
     }
     .to_string();
-    let account_fingerprint = fingerprint_secret(model_config.api_key.as_deref());
+    let account_fingerprint = model_config
+        .account_fingerprint
+        .clone()
+        .or_else(|| fingerprint_secret(model_config.api_key.as_deref()));
     let url_mode_str = match model_config.url_mode {
         UrlMode::Full => "full",
         UrlMode::Proxy => "proxy",
@@ -91,4 +94,12 @@ pub fn build_model_resolution_identity(
         effective_context_modifiers: ecm,
         model_identity_key,
     }
+}
+
+pub fn prepare_llm_config_for_persistence(mut model_config: LlmConfig) -> LlmConfig {
+    if model_config.account_fingerprint.is_none() {
+        model_config.account_fingerprint = fingerprint_secret(model_config.api_key.as_deref());
+    }
+    model_config.api_key = None;
+    model_config
 }

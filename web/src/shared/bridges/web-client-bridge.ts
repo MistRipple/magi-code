@@ -113,6 +113,7 @@ import {
 import {
   CANONICAL_TURN_SCHEMA_VERSION,
   parseCanonicalTurnEventPayload,
+  isCanonicalTerminalStatus,
   type CanonicalTurnEvent,
 } from '../protocol/canonical-turn';
 import type { SseConnection } from '../transport';
@@ -135,6 +136,7 @@ import {
   addPendingRequest,
   adoptAcceptedSessionIdForLocalTurn,
   clearRequestBinding,
+  clearPendingRequest,
   createRequestBinding,
   markMessageActive,
   setCurrentSessionId,
@@ -154,6 +156,7 @@ let currentWorkspaceId = '';
 let currentWorkspacePath = '';
 let currentSessionId = '';
 let currentInterruptTaskId = '';
+let continueRequestId = '';
 let currentRuntimeEpoch = '';
 const guidingQueuedMessageIds = new Set<string>();
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
@@ -215,6 +218,13 @@ function invalidateBootstrapRequests(): void {
 
 function clearActiveTurnInFlight(): void {
   // 实时 turn 投影由后端 canonical snapshot 驱动，这里保留统一清理入口。
+}
+
+function clearContinueRequestInFlight(): void {
+  if (continueRequestId) {
+    clearPendingRequest(continueRequestId);
+    continueRequestId = '';
+  }
 }
 
 const RECOVERY_BASE_DELAY_MS = 1000;
@@ -719,6 +729,7 @@ function isExpectedRecoveryBridgeFailure(error: unknown): boolean {
 }
 
 function emitForcedProcessingIdle(reason: string, extra?: Record<string, unknown>): void {
+  clearContinueRequestInFlight();
   clearCurrentInterruptTaskId();
   emitDataMessage('processingStateChanged', {
     isProcessing: false,
@@ -1065,6 +1076,13 @@ function emitDataMessage(dataType: DataMessageType, payload: Record<string, unkn
 }
 
 function emitSessionTurnCanonicalEvent(canonicalEvent: CanonicalTurnEvent): void {
+  if (
+    canonicalEvent.sessionId === currentSessionId
+    && canonicalEvent.turn
+    && isCanonicalTerminalStatus(canonicalEvent.turn.status)
+  ) {
+    clearContinueRequestInFlight();
+  }
   emitDataMessage('sessionTurnCanonicalEventUpdated', {
     sessionId: canonicalEvent.sessionId,
     canonicalEvent,
@@ -1390,6 +1408,7 @@ const TURN_TERMINAL_EVENTS = new Set([
   'session.turn.completed',
   'session.turn.failed',
   'session.turn.interrupted',
+  'session.turn.queue_failed',
 ]);
 
 function handleRustEventStreamMessage(event: RustEventEnvelope): void {
@@ -1521,10 +1540,15 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     const terminalPublicMessage = trimBridgeString(event.payload?.public_message)
       || trimBridgeString(event.payload?.publicMessage)
       || trimBridgeString(event.payload?.error);
+    if (eventType === 'session.turn.queue_failed' && terminalPublicMessage) {
+      emitBridgeErrorToast(i18n.t('bridge.action.sendMessage'), new Error(terminalPublicMessage));
+    }
     const terminalReason = eventType === 'session.turn.failed'
       ? (terminalErrorCode || 'session_turn_failed_without_reason')
       : eventType === 'session.turn.interrupted'
         ? 'session_turn_interrupted'
+        : eventType === 'session.turn.queue_failed'
+          ? (terminalErrorCode || 'queued_session_turn_failed')
         : 'session_turn_completed';
     emitForcedProcessingIdle(
       terminalReason,
@@ -1982,6 +2006,13 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = incomingSessionId;
+  if (
+    previousWorkspaceId !== normalizedWorkspaceId
+    || previousWorkspacePath !== normalizedWorkspacePath
+    || previousSessionId !== incomingSessionId
+  ) {
+    clearContinueRequestInFlight();
+  }
   setAgentBindingContext({
     workspaceId: normalizedWorkspaceId,
     workspacePath: normalizedWorkspacePath,
@@ -2033,6 +2064,7 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = '';
+  clearContinueRequestInFlight();
   setAgentBindingContext({
     workspaceId: normalizedWorkspaceId,
     workspacePath: normalizedWorkspacePath,
@@ -2091,6 +2123,7 @@ function clearPersistedWorkspaceBinding(): void {
   currentWorkspaceId = '';
   currentWorkspacePath = '';
   currentSessionId = '';
+  clearContinueRequestInFlight();
   clearAgentBindingContext({ authoritative: true });
   clearCurrentInterruptTaskId();
   clearAgentRunProjection();
@@ -3305,22 +3338,43 @@ async function interruptTask(): Promise<void> {
 }
 
 async function continueSessionExecution(): Promise<void> {
-  if (!currentSessionId) {
+  const sessionId = currentSessionId.trim();
+  if (!sessionId) {
     emitBridgeErrorToast(
       i18n.t('bridge.action.continueSession'),
       new Error(i18n.t('bridge.detail.noContinuableSession')),
     );
     return;
   }
+  if (continueRequestId) {
+    if (messagesState.pendingRequests.has(continueRequestId)) {
+      return;
+    }
+    continueRequestId = '';
+  }
+  const requestId = `continue-${generateMessageId()}`;
+  continueRequestId = requestId;
+  addPendingRequest(requestId, { resetAntiLiftBack: true });
   try {
     await ensureFreshLiveBridge('continue_session_preflight');
-    await continueAgentSession(currentSessionId);
+    const result = await continueAgentSession(sessionId);
+    const rootTaskId = trimBridgeString(result.rootTaskId)
+      || trimBridgeString(result.root_task_id);
+    if (!rootTaskId) {
+      throw new Error('继续会话响应缺少 rootTaskId');
+    }
+    setCurrentInterruptTaskId(rootTaskId);
+    initAgentRunTracking(sessionId, rootTaskId, currentWorkspaceId, currentWorkspacePath);
+    void ensureEventStream({ forceReconnect: false, waitUntilOpen: false }).catch((error) => {
+      console.warn('[web-client-bridge] continueTask 后 SSE 连接确认失败:', error);
+    });
   } catch (error) {
     console.error('[web-client-bridge] 继续会话失败:', error);
     emitBridgeErrorToast(i18n.t('bridge.action.continueSession'), error);
     emitForcedProcessingIdle('continue_session_failed', {
       error: normalizeErrorMessage(error),
-      sessionId: currentSessionId,
+      sessionId,
+      requestId,
     });
     if (shouldRecoverFromBridgeError(error)) {
       closeEventStream();

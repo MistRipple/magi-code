@@ -11,8 +11,8 @@ use crate::{
         thread_chat_message_to_chat_message,
     },
     model_error::{
-        provider_empty_assistant_response_error, public_model_image_invocation_error_message,
-        public_model_invocation_error_message,
+        classify_model_invocation_error, provider_empty_assistant_response_error,
+        public_model_image_invocation_error_message,
     },
     prompt_utils::{
         PromptFragmentKind, current_turn_context_priority_prompt,
@@ -135,6 +135,7 @@ impl SessionTurnFailureReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionTurnExecutionError {
     pub reason: SessionTurnFailureReason,
+    pub diagnostic_code: String,
     pub public_message: String,
 }
 
@@ -142,6 +143,19 @@ impl SessionTurnExecutionError {
     fn new(reason: SessionTurnFailureReason, public_message: impl Into<String>) -> Self {
         Self {
             reason,
+            diagnostic_code: reason.code().to_string(),
+            public_message: public_message.into(),
+        }
+    }
+
+    fn with_diagnostic_code(
+        reason: SessionTurnFailureReason,
+        diagnostic_code: impl Into<String>,
+        public_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            reason,
+            diagnostic_code: diagnostic_code.into(),
             public_message: public_message.into(),
         }
     }
@@ -231,7 +245,9 @@ fn build_session_turn_messages(
                 .canonical_turns_for_session(&request.session_id)
                 .into_iter()
                 .filter(|turn| {
-                    turn.turn_id != request.turn_id && turn.accepted_at.0 < accepted_at.0
+                    turn.turn_id != request.turn_id
+                        && turn.accepted_at.0 < accepted_at.0
+                        && turn.status != magi_session_store::CanonicalTurnStatus::Cancelled
                 })
                 .flat_map(|turn| turn.items.into_iter())
                 .filter_map(|item| {
@@ -334,6 +350,24 @@ pub struct SessionTurnExecutionRuntime<'a> {
 }
 
 pub fn run_session_turn_execution(
+    runtime: SessionTurnExecutionRuntime<'_>,
+) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
+    let todo_ledger = runtime.todo_ledger;
+    let session_id = runtime.request.session_id.clone();
+    let result = run_session_turn_execution_inner(runtime);
+    if result.is_err()
+        && let Err(todo_error) = todo_ledger.pause_in_progress()
+    {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %todo_error,
+            "对话轮次失败后暂停 TodoLedger 进行项失败"
+        );
+    }
+    result
+}
+
+fn run_session_turn_execution_inner(
     runtime: SessionTurnExecutionRuntime<'_>,
 ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
     let SessionTurnExecutionRuntime {
@@ -641,12 +675,17 @@ fn session_turn_model_error(
             public_model_image_invocation_error_message(error),
         );
     }
-    let reason = if model_error_is_stream_interruption(error) {
+    let classification = classify_model_invocation_error(error);
+    let reason = if classification.code == "model_stream_interrupted" {
         SessionTurnFailureReason::ModelStreamInterrupted
     } else {
         SessionTurnFailureReason::ModelInvocationFailed
     };
-    SessionTurnExecutionError::new(reason, public_model_invocation_error_message(error))
+    SessionTurnExecutionError::with_diagnostic_code(
+        reason,
+        classification.code,
+        classification.public_message,
+    )
 }
 
 fn session_turn_empty_response_error(
@@ -668,15 +707,6 @@ fn session_turn_empty_response_error(
         reason,
         provider_empty_assistant_response_error(after_tool_calls),
     )
-}
-
-fn model_error_is_stream_interruption(error: &str) -> bool {
-    let normalized = error.to_ascii_lowercase();
-    normalized.contains("incomplete stream")
-        || normalized.contains("missing terminal")
-        || normalized.contains("stream interrupted")
-        || normalized.contains("stream closed")
-        || normalized.contains("unexpected eof")
 }
 
 struct SessionTurnRoundRuntime<'a> {
@@ -934,20 +964,46 @@ fn stream_session_turn_round(
             retry_event,
         );
     };
-    let response = client
-        .invoke_streaming_with_retry_events(
-            ModelInvocationRequest {
-                provider: BUSINESS_MODEL_PROVIDER.to_string(),
-                prompt: prompt.to_string(),
-                messages: Some(messages.clone()),
-                tools: tools.clone(),
-                tool_choice,
-            },
-            &on_delta,
-            &on_retry,
-        )
-        .map_err(|error| error.to_string())?;
+    let call_id = format!("session-turn-{round}-{}", UtcMillis::now().0);
+    let response = match client.invoke_streaming_with_retry_events(
+        ModelInvocationRequest {
+            provider: BUSINESS_MODEL_PROVIDER.to_string(),
+            prompt: prompt.to_string(),
+            messages: Some(messages.clone()),
+            tools: tools.clone(),
+            tool_choice,
+        },
+        &on_delta,
+        &on_retry,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            let raw_error = error.to_string();
+            let classification = classify_model_invocation_error(&raw_error);
+            publish_model_usage_record(
+                event_bus,
+                session_store,
+                settings_store,
+                crate::usage_recording::ModelUsageRecordInput {
+                    session_id: &request.session_id,
+                    workspace_id: &request.workspace_id,
+                    binding: usage_binding,
+                    call_id,
+                    usage: None,
+                    status: UsageCallStatus::Failed,
+                    assignment_id: None,
+                    error_code: Some(classification.code.to_string()),
+                },
+            );
+            return Err(raw_error);
+        }
+    };
     let parsed = response.parse_chat_payload();
+    let has_actionable_output = parsed
+        .content
+        .as_deref()
+        .is_some_and(|content| !content.trim().is_empty())
+        || !parsed.tool_calls.is_empty();
     publish_model_usage_record(
         event_bus,
         session_store,
@@ -956,11 +1012,15 @@ fn stream_session_turn_round(
             session_id: &request.session_id,
             workspace_id: &request.workspace_id,
             binding: usage_binding,
-            call_id: format!("session-turn-{round}-{}", UtcMillis::now().0),
+            call_id,
             usage: parsed.usage.as_ref(),
-            status: UsageCallStatus::Success,
+            status: if has_actionable_output {
+                UsageCallStatus::Success
+            } else {
+                UsageCallStatus::Failed
+            },
             assignment_id: None,
-            error_code: None,
+            error_code: (!has_actionable_output).then(|| "model_empty_response".to_string()),
         },
     );
     account_active_goal_turn(
@@ -1724,9 +1784,97 @@ mod tests {
     }
 
     #[test]
+    fn runtime_invalid_state_pauses_in_progress_todo() {
+        let session_id = SessionId::new("session-runtime-invalid-state");
+        let store = Arc::new(SessionStore::new());
+        store
+            .create_session(session_id.clone(), "runtime invalid state")
+            .expect("session should be creatable");
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-runtime-invalid-state".to_string(),
+                    turn_seq: 1,
+                    accepted_at: ts(1_000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("继续处理".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("current turn should be stored");
+        let todo_ledger = magi_todo_ledger::TodoLedger::new(store.clone(), session_id.clone());
+        todo_ledger
+            .replace(vec![magi_core::TodoItem::new(
+                "继续处理当前步骤",
+                "正在处理当前步骤",
+                magi_core::TodoStatus::InProgress,
+            )])
+            .expect("todo should write");
+        let client = StreamingTextModelBridgeClient {
+            delta_content: "不会执行".to_string(),
+            payload: serde_json::json!({
+                "content": "不会执行",
+                "finish_reason": "stop"
+            })
+            .to_string(),
+        };
+
+        let result = run_session_turn_execution(SessionTurnExecutionRuntime {
+            client: &client,
+            event_bus: &InMemoryEventBus::new(16),
+            session_store: store.as_ref(),
+            conversation_registry: &ConversationRegistry::new(),
+            todo_ledger: &todo_ledger,
+            settings_store: None,
+            safety_gate: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            snapshot_manager: None,
+            request: SessionTurnExecutionRequest {
+                session_id: session_id.clone(),
+                turn_id: "turn-runtime-invalid-state".to_string(),
+                workspace_id: None,
+                prompt: "继续处理".to_string(),
+                images: Vec::new(),
+                context_references: Vec::new(),
+                use_tools: false,
+                access_profile: AccessProfile::Restricted,
+                skill_name: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+                forced_tool_name: None,
+                required_tool_chain: Vec::new(),
+                goal_turn_mode: SessionGoalTurnMode::None,
+                workspace_root_path: None,
+            },
+            prompt: "继续处理".to_string(),
+            knowledge_context_prompt: None,
+            tools: None,
+            persist_session_state: None,
+        });
+
+        assert!(matches!(
+            result,
+            Err(SessionTurnExecutionError {
+                reason: SessionTurnFailureReason::RuntimeInvalidState,
+                ..
+            })
+        ));
+        assert_eq!(
+            todo_ledger.snapshot()[0].status,
+            magi_core::TodoStatus::Pending
+        );
+    }
+
+    #[test]
     fn empty_session_turn_response_uses_public_failure_message() {
         let session_id = SessionId::new("session-empty-response-layer");
-        let store = SessionStore::new();
+        let store = Arc::new(SessionStore::new());
         store
             .create_session(session_id.clone(), "empty response layer")
             .expect("session should be creatable");
@@ -1764,6 +1912,14 @@ mod tests {
             .to_string(),
         };
         let event_bus = InMemoryEventBus::new(16);
+        let todo_ledger = magi_todo_ledger::TodoLedger::new(store.clone(), session_id.clone());
+        todo_ledger
+            .replace(vec![magi_core::TodoItem::new(
+                "继续处理当前步骤",
+                "正在处理当前步骤",
+                magi_core::TodoStatus::InProgress,
+            )])
+            .expect("todo should write");
         let request = SessionTurnExecutionRequest {
             session_id: session_id.clone(),
             turn_id: "turn-empty-response-layer".to_string(),
@@ -1786,9 +1942,9 @@ mod tests {
         let error = match run_session_turn_execution(SessionTurnExecutionRuntime {
             client: &client,
             event_bus: &event_bus,
-            session_store: &store,
+            session_store: store.as_ref(),
             conversation_registry: &ConversationRegistry::new(),
-            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+            todo_ledger: &todo_ledger,
             settings_store: None,
             safety_gate: None,
             tool_registry: None,
@@ -1807,7 +1963,10 @@ mod tests {
         };
 
         assert_eq!(error.reason, SessionTurnFailureReason::ModelEmptyResponse);
-        assert_eq!(error.public_message, "模型服务暂时不可用，请稍后重试。");
+        assert_eq!(
+            error.public_message,
+            "模型本轮未返回有效内容，可直接继续重试。"
+        );
         let turn = store
             .runtime_sidecar(&session_id)
             .and_then(|sidecar| sidecar.current_turn)
@@ -1817,6 +1976,10 @@ mod tests {
             item.kind == "assistant_error"
                 && item.content.as_deref() == Some(error.public_message.as_str())
         }));
+        assert_eq!(
+            todo_ledger.snapshot()[0].status,
+            magi_core::TodoStatus::Pending
+        );
     }
 
     #[test]
@@ -1904,7 +2067,7 @@ mod tests {
             error.reason,
             SessionTurnFailureReason::ModelStreamInterrupted
         );
-        assert_eq!(error.public_message, "模型服务暂时不可用，请稍后重试。");
+        assert_eq!(error.public_message, "模型响应流中断，可直接继续重试。");
         let turn = store
             .runtime_sidecar(&session_id)
             .and_then(|sidecar| sidecar.current_turn)
@@ -2434,6 +2597,119 @@ mod tests {
             contents[3],
             "请基于上一轮结果，用一句话回答：再加 4 等于几？"
         );
+    }
+
+    #[test]
+    fn session_turn_messages_exclude_cancelled_turn_from_model_history() {
+        let session_id = SessionId::new("session-context-history-cancelled");
+        let thread_id = magi_core::ThreadId::new("thread-context-history-cancelled");
+        let store = SessionStore::from_state(SessionStoreState {
+            current_session_id: Some(session_id.clone()),
+            sessions: vec![SessionRecord {
+                session_id: session_id.clone(),
+                title: "cancelled context history".to_string(),
+                status: SessionLifecycleStatus::Active,
+                created_at: ts(900),
+                updated_at: ts(2_000),
+                message_count: None,
+                workspace_id: None,
+                last_completed_at: None,
+                last_viewed_at: None,
+            }],
+            timeline: Vec::new(),
+            canonical_turns: vec![CanonicalTurn {
+                session_id: session_id.clone(),
+                turn_id: "turn-cancelled".to_string(),
+                turn_seq: 1_000,
+                accepted_at: ts(1_000),
+                completed_at: Some(ts(1_100)),
+                status: CanonicalTurnStatus::Cancelled,
+                response_duration_ms: Some(100),
+                usage: None,
+                items: vec![CanonicalTurnItem {
+                    session_id: session_id.clone(),
+                    turn_id: "turn-cancelled".to_string(),
+                    turn_seq: 1_000,
+                    item_id: "turn-cancelled-user".to_string(),
+                    item_seq: 1,
+                    kind: CanonicalTurnItemKind::UserMessage,
+                    created_at: ts(1_000),
+                    status: CanonicalTurnItemStatus::Cancelled,
+                    item_version: None,
+                    updated_at: ts(1_100),
+                    title: None,
+                    content: Some("执行 sleep 20，完成后回复未被停止".to_string()),
+                    blocks: Vec::new(),
+                    tool: None,
+                    worker: None,
+                    source_thread_id: thread_id.clone(),
+                    visibility: CanonicalTurnVisibility::default(),
+                    metadata: HashMap::new(),
+                }],
+                metadata: HashMap::new(),
+            }],
+            notifications: Vec::new(),
+            goals: Vec::new(),
+            todo_lists: Vec::new(),
+            execution_sidecar_store: Default::default(),
+            thread_registry: vec![ExecutionThread {
+                thread_id,
+                session_id: session_id.clone(),
+                mission_id: magi_core::MissionId::new("mission-context-history-cancelled"),
+                role_id: ORCHESTRATOR_ROLE_ID.to_string(),
+                worker_instance_id: magi_core::WorkerId::new("worker-context-history-cancelled"),
+                status: ExecutionThreadStatus::Idle,
+                created_at: ts(900),
+                last_used_at: ts(1_100),
+                handled_task_ids: Vec::new(),
+                message_history: Vec::new(),
+            }],
+        });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-current".to_string(),
+                    turn_seq: 2_000,
+                    accepted_at: ts(2_000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("只回复停止后恢复正常".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("current turn should be stored");
+        let request = SessionTurnExecutionRequest {
+            session_id,
+            turn_id: "turn-current".to_string(),
+            workspace_id: None,
+            prompt: "只回复停止后恢复正常".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: false,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            workspace_root_path: None,
+        };
+
+        let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
+        let contents = messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>();
+
+        assert!(
+            contents
+                .iter()
+                .all(|content| !content.contains("sleep 20") && !content.contains("未被停止"))
+        );
+        assert_eq!(contents.last().copied(), Some("只回复停止后恢复正常"));
     }
 
     #[test]

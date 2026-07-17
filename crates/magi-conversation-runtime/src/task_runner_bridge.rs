@@ -80,16 +80,14 @@ pub trait TaskResultReceiver: Send + Sync {
 /// callback pushes a `TaskResult` into this receiver so the Runner's
 /// `apply_results` step can process it on the next cycle.
 ///
-/// Results are deduplicated by task ID: once a result for a given task has been
-/// pushed, subsequent pushes for the same task are silently ignored.  This
-/// prevents feedback loops when the Runner's own `apply_results` re-applies
-/// the terminal status via `update_status`, which would otherwise re-trigger
-/// the status-change callback.  Call `clear_task_result_state` when a task is
-/// reset to a non-terminal state so stale terminal results cannot be consumed
-/// after recovery.
+/// Results are deduplicated by task ID and lease ID. A recovered task may have
+/// an old execution result arrive after a new lease has started; the two results
+/// must remain distinguishable so the Runner can reject only the stale lease.
+/// Call `clear_task_result_state` when a task is reset to a non-terminal state
+/// so buffered terminal results from earlier execution rounds are removed.
 pub struct EventBasedResultReceiver {
     results: Mutex<Vec<TaskResult>>,
-    seen: Mutex<HashSet<TaskId>>,
+    seen: Mutex<HashSet<(TaskId, LeaseId)>>,
 }
 
 impl Default for EventBasedResultReceiver {
@@ -116,8 +114,7 @@ impl EventBasedResultReceiver {
             .seen
             .lock()
             .expect("EventBasedResultReceiver seen lock poisoned");
-        if !seen.insert(result.task_id.clone()) {
-            // Already pushed a result for this task — skip.
+        if !seen.insert((result.task_id.clone(), result.lease_id.clone())) {
             return;
         }
         self.results
@@ -134,7 +131,7 @@ impl EventBasedResultReceiver {
         self.seen
             .lock()
             .expect("EventBasedResultReceiver seen lock poisoned")
-            .remove(task_id);
+            .retain(|(seen_task_id, _)| seen_task_id != task_id);
         self.results
             .lock()
             .expect("EventBasedResultReceiver results lock poisoned")
@@ -186,5 +183,31 @@ mod tests {
             }
             TaskOutcome::Failed { error } => panic!("不应消费旧失败结果: {error}"),
         }
+    }
+
+    #[test]
+    fn results_from_different_leases_are_not_deduplicated() {
+        let receiver = EventBasedResultReceiver::new();
+        let task_id = TaskId::new("task-multi-lease-results");
+
+        receiver.push_result(TaskResult {
+            task_id: task_id.clone(),
+            lease_id: LeaseId::new("lease-stale"),
+            outcome: TaskOutcome::Failed {
+                error: "stale failure".to_string(),
+            },
+        });
+        receiver.push_result(TaskResult {
+            task_id,
+            lease_id: LeaseId::new("lease-current"),
+            outcome: TaskOutcome::Completed {
+                output_refs: vec!["current result".to_string()],
+            },
+        });
+
+        let results = receiver.poll_results();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].lease_id, LeaseId::new("lease-stale"));
+        assert_eq!(results[1].lease_id, LeaseId::new("lease-current"));
     }
 }

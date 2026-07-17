@@ -19,7 +19,7 @@ pub use context_window::{
 };
 pub use costing::{NormalizedUsageTotals, normalize_usage_delta};
 pub use ledger_store::InMemoryLedgerStore;
-pub use model_identity::build_model_resolution_identity;
+pub use model_identity::{build_model_resolution_identity, prepare_llm_config_for_persistence};
 pub use query_service::UsageQueryService;
 pub use reducer::{rebuild_session_snapshot_from_events, rebuild_workspace_snapshot_from_sessions};
 pub use runtime_recorder::{RuntimeCallRecordInput, RuntimeRecorder};

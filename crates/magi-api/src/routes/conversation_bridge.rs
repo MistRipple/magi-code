@@ -53,7 +53,11 @@ pub(super) fn begin_session_turn(
 
 /// 把 Turn 推进到给定终态并回收槽位。当前实现接受"未开始即 finalize"的边界
 /// 情况并记录 warning；新写入路径应先成功 begin 再 finalize。
-pub(super) fn finalize_session_turn(state: &ApiState, session_id: &SessionId, success: bool) {
+pub(super) fn finalize_session_turn(
+    state: &ApiState,
+    session_id: &SessionId,
+    success: bool,
+) -> bool {
     let conv = state.conversation_registry.conversation_for(session_id);
     let mut guard = conv.lock().expect("conversation turn lock poisoned");
     let target = if success {
@@ -72,18 +76,22 @@ pub(super) fn finalize_session_turn(state: &ApiState, session_id: &SessionId, su
         Ok(()) => {
             if let Err(err) = guard.end_turn() {
                 tracing::warn!(%session_id, ?err, target = %target, "end_turn after finalize failed");
+                return false;
             }
+            true
         }
         Err(TurnAdvanceError::NoActiveTurn) => {
-            tracing::warn!(
+            tracing::debug!(
                 %session_id,
                 target = %target,
                 "finalize_session_turn called without active turn"
             );
+            false
         }
         Err(other) => {
             tracing::warn!(%session_id, ?other, target = %target, "finalize_session_turn transition failed");
             let _ = guard.end_turn();
+            false
         }
     }
 }

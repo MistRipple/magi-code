@@ -15,7 +15,10 @@ use magi_conversation_runtime::{
     },
     task_execution_registry::TaskExecutionPlan,
 };
-use magi_core::{ExecutionOwnership, SessionId, TaskExecutionTarget, TaskStatus, WorkerId};
+use magi_core::{
+    ExecutionOwnership, SessionId, SessionLifecycleStatus, TaskExecutionTarget, TaskStatus,
+    WorkerId,
+};
 use magi_orchestrator::ExecutionWritebackPlans;
 use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain};
 use magi_settings_store::SettingsStore;
@@ -78,7 +81,7 @@ fn rebuild_dispatch_plan_for_branch(
     }
 }
 
-pub(crate) fn continue_execution_chain(
+pub(crate) async fn continue_execution_chain(
     state: &ApiState,
     session_id: &SessionId,
     requested_agent_ids: &[WorkerId],
@@ -127,6 +130,19 @@ pub(crate) fn continue_execution_chain(
                 "active chain 的 mission_id 与根任务不一致: {} != {}",
                 chain.mission_id, root_task.mission_id
             ),
+        ));
+    }
+    let manager = state
+        .runner_manager()
+        .ok_or_else(|| ApiError::internal_assembly("继续会话失败", "runner_manager 未配置"))?;
+    let _session_lifecycle_guard = manager.lock_session_lifecycle(session_id).await;
+    let session = state
+        .session_store
+        .session(session_id)
+        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+    if session.status != SessionLifecycleStatus::Active {
+        return Err(ApiError::InvalidInput(
+            "当前会话已关闭，不能继续执行".to_string(),
         ));
     }
     let worker_runtime_handle = state
@@ -199,6 +215,49 @@ pub(crate) fn continue_execution_chain(
     if branches_to_resume.is_empty() {
         return Err(ApiError::InvalidInput(
             "请求继续的代理当前不可继续".to_string(),
+        ));
+    }
+
+    let _restart_guard = manager.lock_for_restart(chain.root_task_id.as_str()).await;
+    manager
+        .quiesce_for_restart(chain.root_task_id.as_str())
+        .await;
+
+    chain = state
+        .session_store
+        .active_execution_chain(session_id)
+        .ok_or_else(|| ApiError::InvalidInput("当前会话没有可继续的执行链".to_string()))?;
+    let root_task = task_store
+        .get_task(&chain.root_task_id)
+        .ok_or_else(|| ApiError::not_found("根任务不存在", chain.root_task_id.as_str()))?;
+    let resumable_branches = chain
+        .branches
+        .iter()
+        .filter(|&branch| {
+            active_execution_branch_is_continue_recoverable(
+                worker_runtime_handle,
+                state.task_store(),
+                &chain,
+                branch,
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let branches_to_resume = if requested_agent_ids.is_empty() {
+        resumable_branches
+    } else {
+        resumable_branches
+            .into_iter()
+            .filter(|branch| {
+                requested_agent_ids
+                    .iter()
+                    .any(|agent_id| agent_id == &branch.worker_id)
+            })
+            .collect::<Vec<_>>()
+    };
+    if branches_to_resume.is_empty() {
+        return Err(ApiError::InvalidInput(
+            "执行状态已经变化，当前没有可继续的 branch".to_string(),
         ));
     }
 
@@ -290,9 +349,6 @@ pub(crate) fn continue_execution_chain(
         )
         .map_err(|error| ApiError::internal_assembly("继续会话失败", error))?;
 
-    let manager = state
-        .runner_manager()
-        .ok_or_else(|| ApiError::internal_assembly("继续会话失败", "runner_manager 未配置"))?;
     match root_status {
         TaskStatus::Failed if requested_agent_ids.is_empty() => manager
             .resume_tree(chain.root_task_id.as_str())
@@ -314,13 +370,22 @@ pub(crate) fn continue_execution_chain(
             .map_err(|msg| ApiError::internal_assembly("继续会话失败", msg))?;
     }
 
-    // 所有 tier 统一由后台 RunnerManager 驱动：恢复任务状态后立即重启 runner。
-    // `AlreadyRunning` 视为
-    // 幂等结果（重复恢复同一 root task 的常见场景）。
-    match manager.start(chain.root_task_id.as_str(), Some(session_id.clone())) {
-        Ok(_) | Err(RunnerStartError::AlreadyRunning) => {}
+    // 旧 runner 已在恢复状态前完成退出；这里只允许启动一个全新的执行轮。
+    match manager.start_after_quiesce(chain.root_task_id.as_str(), Some(session_id.clone())) {
+        Ok(_) => {}
+        Err(RunnerStartError::AlreadyRunning) => {
+            return Err(ApiError::internal_assembly(
+                "继续会话失败",
+                "恢复锁内仍存在活动 runner",
+            ));
+        }
         Err(RunnerStartError::NotFound) => {
             return Err(ApiError::internal_assembly("继续会话失败", "根任务不存在"));
+        }
+        Err(RunnerStartError::SessionUnavailable) => {
+            return Err(ApiError::InvalidInput(
+                "当前会话已关闭，不能继续执行".to_string(),
+            ));
         }
     }
 

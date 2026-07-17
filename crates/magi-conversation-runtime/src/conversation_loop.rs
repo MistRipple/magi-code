@@ -26,7 +26,7 @@ use crate::{
     validation_result_rejects_delivery,
 };
 use crate::{
-    model_error::{provider_empty_assistant_response_error, public_model_invocation_error_message},
+    model_error::{classify_model_invocation_error, provider_empty_assistant_response_error},
     prompt_utils::{
         PromptFragmentKind, current_turn_context_priority_prompt,
         normalize_model_stream_preview_content, normalize_model_visible_content,
@@ -1086,7 +1086,23 @@ fn run_conversation_loop_inner(
                 Ok(response) => response,
                 Err(error) => {
                     let raw_error_message = error.to_string();
-                    let error_message = public_model_invocation_error_message(&raw_error_message);
+                    let classification = classify_model_invocation_error(&raw_error_message);
+                    let error_message = classification.public_message.to_string();
+                    publish_model_usage_record(
+                        event_bus,
+                        session_store,
+                        settings_store,
+                        crate::usage_recording::ModelUsageRecordInput {
+                            session_id,
+                            workspace_id,
+                            binding: usage_binding,
+                            call_id: format!("task-{}-{}-{round}", task_id, lease_id),
+                            usage: None,
+                            status: UsageCallStatus::Failed,
+                            assignment_id: Some(lease_id.to_string()),
+                            error_code: Some(classification.code.to_string()),
+                        },
+                    );
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM streaming invocation failed");
                     if task_lease_is_current(task_store, task_id, lease_id) {
                         append_task_error_turn_item(
@@ -1108,7 +1124,23 @@ fn run_conversation_loop_inner(
                 Ok(response) => response,
                 Err(error) => {
                     let raw_error_message = error.to_string();
-                    let error_message = public_model_invocation_error_message(&raw_error_message);
+                    let classification = classify_model_invocation_error(&raw_error_message);
+                    let error_message = classification.public_message.to_string();
+                    publish_model_usage_record(
+                        event_bus,
+                        session_store,
+                        settings_store,
+                        crate::usage_recording::ModelUsageRecordInput {
+                            session_id,
+                            workspace_id,
+                            binding: usage_binding,
+                            call_id: format!("task-{}-{}-{round}", task_id, lease_id),
+                            usage: None,
+                            status: UsageCallStatus::Failed,
+                            assignment_id: Some(lease_id.to_string()),
+                            error_code: Some(classification.code.to_string()),
+                        },
+                    );
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM invocation failed");
                     if task_lease_is_current(task_store, task_id, lease_id) {
                         append_task_error_turn_item(
@@ -1172,6 +1204,7 @@ fn run_conversation_loop_inner(
                 &stream_publish_gate,
             );
         }
+        let has_actionable_output = completed_stream_content.is_some() || round_has_tool_calls;
         publish_model_usage_record(
             event_bus,
             session_store,
@@ -1182,9 +1215,13 @@ fn run_conversation_loop_inner(
                 binding: usage_binding,
                 call_id: format!("task-{}-{}-{round}", task_id, lease_id),
                 usage: parsed.usage.as_ref(),
-                status: UsageCallStatus::Success,
+                status: if has_actionable_output {
+                    UsageCallStatus::Success
+                } else {
+                    UsageCallStatus::Failed
+                },
                 assignment_id: Some(lease_id.to_string()),
-                error_code: None,
+                error_code: (!has_actionable_output).then(|| "model_empty_response".to_string()),
             },
         );
         account_active_goal_turn(
@@ -5019,7 +5056,7 @@ mod tests {
 
         match outcome {
             TaskOutcome::Failed { error } => {
-                assert_eq!(error, "模型服务暂时不可用，请稍后重试。");
+                assert_eq!(error, "模型请求未完成，可直接继续重试。");
                 assert!(!error.contains("RemoteBusiness"));
                 assert!(!error.contains("model bridge unavailable"));
                 assert!(!error.contains("LLM invocation failed"));
@@ -5043,7 +5080,7 @@ mod tests {
         assert_eq!(error_item.status, "failed");
         assert_eq!(error_item.task_id.as_ref(), Some(&task_id));
         assert!(error_item.content.as_deref().is_some_and(|content| {
-            content == "模型服务暂时不可用，请稍后重试。"
+            content == "模型请求未完成，可直接继续重试。"
                 && !content.contains("RemoteBusiness")
                 && !content.contains("model bridge unavailable")
                 && !content.contains("LLM invocation failed")
@@ -5063,7 +5100,7 @@ mod tests {
                     && item
                         .content
                         .as_deref()
-                        .is_some_and(|content| content == "模型服务暂时不可用，请稍后重试。")
+                        .is_some_and(|content| content == "模型请求未完成，可直接继续重试。")
             }),
             "failed task loop must persist the visible failure as canonical assistant_text"
         );

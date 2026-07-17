@@ -14,6 +14,7 @@ fn make_llm_config() -> LlmConfig {
         model: "claude-sonnet-4-20250514".to_string(),
         base_url: "https://api.anthropic.com/v1".to_string(),
         api_key: Some("sk-test-key-12345".to_string()),
+        account_fingerprint: None,
         url_mode: UrlMode::Default,
         reasoning_effort: None,
     }
@@ -57,6 +58,34 @@ fn make_call_record_input(
         status: UsageCallStatus::Success,
         error_code: None,
     }
+}
+
+#[test]
+fn persisted_llm_config_redacts_secret_and_preserves_account_identity() {
+    let config = make_llm_config();
+    let binding = build_execution_binding_identity(
+        "orchestrator",
+        "orchestrator",
+        0,
+        UsageSourceRole::Orchestrator,
+    );
+    let original_identity =
+        build_model_resolution_identity(&config, &binding, Some(&config.model), None);
+
+    let persisted = crate::prepare_llm_config_for_persistence(config);
+    let replayed_identity =
+        build_model_resolution_identity(&persisted, &binding, Some(&persisted.model), None);
+
+    assert!(persisted.api_key.is_none());
+    assert!(persisted.account_fingerprint.is_some());
+    assert_eq!(
+        original_identity.account_fingerprint,
+        replayed_identity.account_fingerprint
+    );
+    assert_eq!(
+        original_identity.model_identity_key,
+        replayed_identity.model_identity_key
+    );
 }
 
 #[test]

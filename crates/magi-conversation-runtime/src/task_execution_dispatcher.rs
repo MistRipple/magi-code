@@ -1419,22 +1419,37 @@ impl LlmTaskDispatcher {
         &self,
         request: SessionTurnExecutionRequest,
     ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
+        let todo_ledger = magi_todo_ledger::TodoLedger::new(
+            self.session_store.clone(),
+            request.session_id.clone(),
+        );
         let execution_settings_snapshot = self.execution_settings_snapshot();
         let execution_settings =
             self.execution_settings_or_live(execution_settings_snapshot.as_ref());
-        let client = self
-            .resolve_model_client_for_task(
-                execution_settings,
-                None,
-                None,
-                Some(&request.session_id),
-            )
-            .map_err(|_| SessionTurnExecutionError {
+        let client = match self.resolve_model_client_for_task(
+            execution_settings,
+            None,
+            None,
+            Some(&request.session_id),
+        ) {
+            Ok(client) => client,
+            Err(_) => {
+                if let Err(todo_error) = todo_ledger.pause_in_progress() {
+                    tracing::warn!(
+                        session_id = %request.session_id,
+                        error = %todo_error,
+                        "模型配置解析失败后暂停 TodoLedger 进行项失败"
+                    );
+                }
+                return Err(SessionTurnExecutionError {
                 reason:
                     crate::session_turn_execution::SessionTurnFailureReason::ModelInvocationFailed,
+                diagnostic_code: "model_configuration_unavailable".to_string(),
                 public_message: crate::model_error::PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE
                     .to_string(),
-            })?;
+                });
+            }
+        };
 
         let active_skill_name = self.resolve_registered_skill_id(request.skill_name.as_deref());
         let prompt = self.apply_skill_prompt_injections(
@@ -1458,10 +1473,6 @@ impl LlmTaskDispatcher {
             None
         };
         let safety_gate = self.build_safety_gate(execution_settings);
-        let todo_ledger = magi_todo_ledger::TodoLedger::new(
-            self.session_store.clone(),
-            request.session_id.clone(),
-        );
         let knowledge_context_prompt = self.context_runtime.as_ref().and_then(|runtime| {
             let selection = runtime.select_knowledge_on_demand(KnowledgeContextRequest {
                 consumer: KnowledgeConsumer::Mainline,
@@ -2075,6 +2086,9 @@ impl TaskDispatcher for LlmTaskDispatcher {
         let lease = lease.clone();
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let task_id = task.task_id.clone();
+            let lease_id = lease.lease_id.clone();
+            let join_observer = self.clone();
             let join = handle.spawn_blocking(move || {
                 if let Err(err) = dispatcher.dispatch_inner(&task, &worker, &lease) {
                     tracing::error!("dispatch_inner failed: {}", err);
@@ -2088,9 +2102,7 @@ impl TaskDispatcher for LlmTaskDispatcher {
                 }
             });
             handle.spawn(async move {
-                if let Err(err) = join.await {
-                    tracing::error!("dispatch spawn_blocking panicked: {:?}", err);
-                }
+                record_dispatch_join_outcome(join_observer, task_id, lease_id, join).await;
             });
             Ok(())
         } else {
@@ -2100,10 +2112,29 @@ impl TaskDispatcher for LlmTaskDispatcher {
     }
 }
 
+async fn record_dispatch_join_outcome(
+    dispatcher: LlmTaskDispatcher,
+    task_id: TaskId,
+    lease_id: LeaseId,
+    join: tokio::task::JoinHandle<()>,
+) {
+    if let Err(error) = join.await {
+        tracing::error!(task_id = %task_id, lease_id = %lease_id, ?error, "dispatch spawn_blocking panicked");
+        dispatcher.push_result(
+            &task_id,
+            &lease_id,
+            TaskOutcome::Failed {
+                error: "模型执行线程异常退出，可直接继续重试。".to_string(),
+            },
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model_config::merge_orchestrator_session_override;
+    use crate::task_runner_bridge::TaskResultReceiver;
     use magi_core::{MissionId, Task, TaskPolicy, TaskRuntimePayload, TaskTier};
 
     struct FailingAuxiliaryClient;
@@ -2211,6 +2242,116 @@ mod tests {
             test_mission_state_root("dispatcher-default-tool-surface"),
         )
         .with_tool_registry(tool_registry)
+    }
+
+    #[test]
+    fn session_turn_model_configuration_failure_pauses_todo() {
+        let dispatcher = dispatcher_with_default_tool_surface();
+        let session_id = SessionId::new("session-model-config-failure");
+        let accepted_at = UtcMillis(2_000);
+        dispatcher
+            .session_store
+            .create_session(session_id.clone(), "model config failure")
+            .expect("session should create");
+        let (_mission_id, orchestrator_thread_id) = dispatcher
+            .session_store
+            .ensure_session_mission(&session_id, accepted_at, || {
+                MissionId::new("mission-model-config-failure")
+            });
+        dispatcher
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                magi_session_store::ActiveExecutionTurn {
+                    turn_id: "turn-model-config-failure".to_string(),
+                    turn_seq: accepted_at.0,
+                    accepted_at,
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("继续执行".to_string()),
+                    items: vec![magi_session_store::ActiveExecutionTurnItem {
+                        item_id: "user-model-config-failure".to_string(),
+                        item_seq: 1,
+                        kind: "user_message".to_string(),
+                        status: "completed".to_string(),
+                        source: "orchestrator".to_string(),
+                        title: None,
+                        content: Some("继续执行".to_string()),
+                        task_id: None,
+                        worker_id: None,
+                        role_id: None,
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_status: None,
+                        tool_arguments: None,
+                        tool_result: None,
+                        tool_error: None,
+                        request_id: None,
+                        user_message_id: None,
+                        placeholder_message_id: None,
+                        metadata: Default::default(),
+                        timeline_entry_id: None,
+                        source_thread_id: orchestrator_thread_id,
+                    }],
+                },
+            )
+            .expect("current turn should persist");
+        let todo_ledger =
+            magi_todo_ledger::TodoLedger::new(dispatcher.session_store.clone(), session_id.clone());
+        todo_ledger
+            .replace(vec![magi_core::TodoItem::new(
+                "执行当前步骤",
+                "正在执行当前步骤",
+                magi_core::TodoStatus::InProgress,
+            )])
+            .expect("todo should persist");
+
+        let result = dispatcher.execute_session_turn(SessionTurnExecutionRequest {
+            session_id,
+            turn_id: "turn-model-config-failure".to_string(),
+            workspace_id: None,
+            prompt: "继续执行".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: true,
+            access_profile: magi_core::AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: crate::session_turn_execution::SessionGoalTurnMode::None,
+            workspace_root_path: None,
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            todo_ledger.snapshot()[0].status,
+            magi_core::TodoStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_thread_panic_is_reported_as_task_failure() {
+        let dispatcher = dispatcher_with_default_tool_surface();
+        let result_receiver = dispatcher.result_receiver.clone();
+        let task_id = TaskId::new("task-dispatch-thread-panic");
+        let lease_id = LeaseId::new("lease-dispatch-thread-panic");
+        let join = tokio::task::spawn_blocking(|| panic!("模拟模型执行线程 panic"));
+
+        record_dispatch_join_outcome(dispatcher, task_id.clone(), lease_id.clone(), join).await;
+
+        let results = result_receiver.poll_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].task_id, task_id);
+        assert_eq!(results[0].lease_id, lease_id);
+        match &results[0].outcome {
+            TaskOutcome::Failed { error } => {
+                assert!(error.contains("模型执行线程异常退出"));
+            }
+            TaskOutcome::Completed { .. } => panic!("panic 不得被记录为成功"),
+        }
     }
 
     fn test_mission_state_root(label: &str) -> PathBuf {

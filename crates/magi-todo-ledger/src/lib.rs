@@ -63,6 +63,21 @@ impl TodoLedger {
         self.snapshot().is_empty()
     }
 
+    pub fn pause_in_progress(&self) -> magi_core::DomainResult<bool> {
+        let mut items = self.snapshot();
+        let mut changed = false;
+        for item in &mut items {
+            if item.status == TodoStatus::InProgress {
+                item.status = TodoStatus::Pending;
+                changed = true;
+            }
+        }
+        if changed {
+            self.replace(items)?;
+        }
+        Ok(changed)
+    }
+
     /// 渲染成注入下一轮 Turn 用的 system prompt 片段。空列表返回 `None`，
     /// 避免给模型添加无意义的"todo 为空"提示。
     pub fn render_for_prompt(&self) -> Option<String> {
@@ -324,6 +339,31 @@ mod tests {
             .expect("replace should succeed");
         assert_eq!(stored, items);
         assert_eq!(ledger.snapshot(), items);
+    }
+
+    #[test]
+    fn pause_in_progress_returns_active_item_to_pending() {
+        let ledger = test_ledger("pause-in-progress");
+        ledger
+            .replace(vec![
+                TodoItem::new("已完成", "已完成", TodoStatus::Completed),
+                TodoItem::new("当前步骤", "正在处理当前步骤", TodoStatus::InProgress),
+                TodoItem::new("后续步骤", "正在处理后续步骤", TodoStatus::Pending),
+            ])
+            .expect("todo should write");
+
+        assert!(ledger.pause_in_progress().expect("todo should pause"));
+
+        let items = ledger.snapshot();
+        assert_eq!(items[0].status, TodoStatus::Completed);
+        assert_eq!(items[1].status, TodoStatus::Pending);
+        assert_eq!(items[1].active_form, "正在处理当前步骤");
+        assert_eq!(items[2].status, TodoStatus::Pending);
+        assert!(
+            !ledger
+                .pause_in_progress()
+                .expect("second pause should no-op")
+        );
     }
 
     #[test]

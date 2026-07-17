@@ -1335,6 +1335,7 @@ impl DaemonRuntime {
         let session_turn_dispatcher = llm_task_dispatcher.clone();
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(
             Arc::clone(&task_store),
+            state.session_store.clone(),
             Arc::new(move || state_for_task_workers.task_worker_catalog()),
             llm_task_dispatcher,
             runner_result_receiver,

@@ -13,7 +13,7 @@ use magi_session_store::SessionStore;
 use magi_settings_store::SettingsStore;
 use magi_usage_authority::{
     ExecutionBindingIdentity, LlmConfig, UsageCallIdentity, UsageCallRecordInput, UsageCallStatus,
-    UsagePhase, UsageSourceRole, UsageTokenInput,
+    UsagePhase, UsageSourceRole, UsageTokenInput, prepare_llm_config_for_persistence,
 };
 use std::sync::Arc;
 
@@ -104,8 +104,17 @@ pub fn publish_model_usage_record(
         assignment_id,
         error_code,
     } = input;
-    let Some(usage) = usage_tokens_from_payload(usage) else {
-        return;
+    let usage = match usage_tokens_from_payload(usage) {
+        Some(usage) => usage,
+        None if !matches!(status, UsageCallStatus::Success) => UsageTokenInput {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: Some(0),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cache_read_included_in_input: false,
+        },
+        None => return,
     };
     let Some(model_config) = usage_model_config_for_binding(settings_store, binding, session_id)
     else {
@@ -142,7 +151,7 @@ pub fn publish_model_usage_record(
             binding_revision: binding.binding_revision,
             role: binding.role,
         },
-        model_config,
+        model_config: prepare_llm_config_for_persistence(model_config),
         call_identity: UsageCallIdentity {
             call_id,
             parent_call_id: None,
@@ -531,7 +540,8 @@ mod tests {
                 "orchestrator",
                 json!({
                     "baseUrl": "https://example.test",
-                    "provider": "openai-compatible"
+                    "provider": "openai-compatible",
+                    "apiKey": "secret-success-call-key"
                 }),
             )
             .unwrap();
@@ -586,6 +596,89 @@ mod tests {
         assert_eq!(
             snapshot.recent_events[0].payload["modelConfig"]["reasoningEffort"],
             json!("high")
+        );
+        assert!(
+            snapshot.recent_events[0].payload["modelConfig"]
+                .get("apiKey")
+                .is_none()
+        );
+        assert!(
+            !snapshot.recent_events[0]
+                .payload
+                .to_string()
+                .contains("secret-success-call-key")
+        );
+    }
+
+    #[test]
+    fn publish_model_usage_record_keeps_failed_call_without_token_usage() {
+        let event_bus = InMemoryEventBus::new(8);
+        let session_store = SessionStore::new();
+        let settings_store = Arc::new(SettingsStore::new());
+        let session_id = SessionId::new("session-failed-call");
+        settings_store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://example.test",
+                    "provider": "openai-compatible",
+                    "apiKey": "secret-failed-call-key"
+                }),
+            )
+            .unwrap();
+        settings_store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                json!({"model": "model-failed-call"}),
+            )
+            .unwrap();
+        let binding = session_turn_model_usage_binding(true);
+        let workspace_id = Some(WorkspaceId::new("workspace-failed-call"));
+
+        publish_model_usage_record(
+            &event_bus,
+            &session_store,
+            Some(&settings_store),
+            ModelUsageRecordInput {
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                binding: &binding,
+                call_id: "call-failed".to_string(),
+                usage: None,
+                status: UsageCallStatus::Failed,
+                assignment_id: None,
+                error_code: Some("model_stream_interrupted".to_string()),
+            },
+        );
+
+        let snapshot = event_bus.snapshot();
+        assert_eq!(snapshot.recent_events.len(), 1);
+        assert_eq!(snapshot.recent_events[0].payload["status"], json!("failed"));
+        assert_eq!(
+            snapshot.recent_events[0].payload["errorCode"],
+            json!("model_stream_interrupted")
+        );
+        assert_eq!(snapshot.recent_events[0].payload["usage"]["inputTokens"], 0);
+        assert_eq!(
+            snapshot.recent_events[0].payload["usage"]["outputTokens"],
+            0
+        );
+        assert!(
+            snapshot.recent_events[0].payload["modelConfig"]
+                .get("apiKey")
+                .is_none()
+        );
+        assert!(
+            snapshot.recent_events[0].payload["modelConfig"]["accountFingerprint"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            !snapshot.recent_events[0]
+                .payload
+                .to_string()
+                .contains("secret-failed-call-key")
         );
     }
 

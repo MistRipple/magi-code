@@ -51,20 +51,28 @@ pub fn submit_dispatch_submission(
 ///
 /// agent_spawn 只创建代理并投递初始任务消息；后台 runner 模型下 dispatch
 /// 由独立调度循环持续推进，父代理后续通过 agent_wait 收集代理终态。
-pub fn drive_dispatch_submission(
+pub async fn drive_dispatch_submission(
     state: &ApiState,
     accepted: &mut DispatchSubmissionAccepted,
 ) -> Result<(), ApiError> {
     let manager = state
         .runner_manager()
         .ok_or_else(|| ApiError::internal_assembly("驱动任务派发", "runner_manager 未配置"))?;
-    match manager.start(
-        accepted.root_task_id.as_str(),
-        Some(accepted.session_id.clone()),
-    ) {
+    match manager
+        .start(
+            accepted.root_task_id.as_str(),
+            Some(accepted.session_id.clone()),
+        )
+        .await
+    {
         Ok(_) | Err(RunnerStartError::AlreadyRunning) => {}
         Err(RunnerStartError::NotFound) => {
             return Err(ApiError::internal_assembly("驱动任务派发", "根任务不存在"));
+        }
+        Err(RunnerStartError::SessionUnavailable) => {
+            return Err(ApiError::InvalidInput(
+                "当前会话已关闭，不能启动任务执行".to_string(),
+            ));
         }
     }
     accepted.runner_started = true;

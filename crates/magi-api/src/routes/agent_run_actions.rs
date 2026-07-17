@@ -8,6 +8,7 @@ use super::{
     dispatch_flow::{accept_session_task_submission, finalize_session_task_dispatch},
     session_scope::{SessionWorkspaceScope, require_session_workspace_scope},
 };
+use crate::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal;
 use crate::{dto::SessionTurnRequestDto, errors::ApiError, state::ApiState};
 use magi_conversation_runtime::execution_chain_recovery::finalize_terminal_worker_branches;
 use magi_orchestrator::task_store::TaskStore;
@@ -245,9 +246,22 @@ async fn interrupt_task(
         &session_id,
     )
     .map_err(|msg| ApiError::internal_assembly("收敛代理终态失败", msg))?;
-    let _ = state
-        .session_store
-        .update_current_turn_status(&session_id, "failed");
+    if !finalize_background_session_task_turn_if_root_terminal(
+        &state,
+        &session_id,
+        &root_task_id,
+        "killed",
+    ) {
+        let _ = state
+            .session_store
+            .update_current_turn_status(&session_id, "cancelled");
+        let _ = state.persist_session_durable_state();
+        super::sessions::schedule_next_queued_regular_session_turn(
+            state.clone(),
+            session_id.clone(),
+            Some(scope.workspace_id.clone()),
+        );
+    }
 
     let event = EventEnvelope::domain(
         event_id.clone(),
@@ -341,7 +355,7 @@ async fn restart_task(
         task_tier,
     )
     .await?;
-    finalize_session_task_dispatch(state.clone(), accepted.clone());
+    finalize_session_task_dispatch(state.clone(), accepted.clone()).await;
     let execution_chain_ref = state
         .session_store
         .runtime_sidecar(&accepted.session_id)

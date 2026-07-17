@@ -106,7 +106,7 @@ const CANONICAL_TURN_ITEM_KINDS: CanonicalTurnItemKind[] = [
   'system_notice',
 ];
 const CANONICAL_TURN_EVENT_KINDS: CanonicalTurnEventKind[] = ['turn_started', 'turn_item_upsert', 'turn_completed'];
-const PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE = '模型服务暂时不可用，请稍后重试。';
+const PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE = '模型请求未完成，可直接继续重试。';
 const INTERNAL_MODEL_FAILURE_MARKERS = [
   '桥接调用失败[RemoteBusiness]',
   'provider response invalid',

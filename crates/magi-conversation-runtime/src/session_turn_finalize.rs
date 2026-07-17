@@ -515,6 +515,9 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     let Some(turn) = sidecar.current_turn.as_ref() else {
         return false;
     };
+    if current_turn_status_is_terminal(&turn.status) {
+        return current_turn_status_is_completed(&turn.status);
+    }
     let Some(orchestrator_thread) = session_store.orchestrator_thread_for_session(session_id)
     else {
         return false;

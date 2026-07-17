@@ -121,7 +121,10 @@ pub(crate) fn session_has_user_content(session: &SessionRecord) -> bool {
 #[derive(Clone)]
 pub struct RunnerManager {
     runners: Arc<Mutex<HashMap<String, Arc<RunnerHandle>>>>,
+    restart_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    session_lifecycle_locks: Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
     task_store: Arc<TaskStore>,
+    session_store: Arc<SessionStore>,
     worker_catalog: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
     agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
     dispatcher: Option<Arc<dyn TaskDispatcher>>,
@@ -143,13 +146,17 @@ const CHECKPOINT_INTERVAL_CYCLES: u64 = 5;
 impl RunnerManager {
     pub fn with_dispatcher_and_worker_catalog(
         task_store: Arc<TaskStore>,
+        session_store: Arc<SessionStore>,
         worker_catalog: Arc<dyn Fn() -> Vec<WorkerInfo> + Send + Sync>,
         dispatcher: Arc<dyn TaskDispatcher>,
         result_receiver: Arc<EventBasedResultReceiver>,
     ) -> Self {
         Self {
             runners: Arc::new(Mutex::new(HashMap::new())),
+            restart_locks: Arc::new(Mutex::new(HashMap::new())),
+            session_lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
             task_store,
+            session_store,
             worker_catalog,
             agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
             dispatcher: Some(dispatcher),
@@ -220,18 +227,39 @@ impl RunnerManager {
         &self.result_receiver
     }
 
-    /// Attempt to start a runner for the given root task.
-    /// Returns Err if the root task doesn't exist or a runner is already active.
-    pub fn start(
+    /// 串行化 session 与 root task 生命周期后启动 runner。
+    pub async fn start(
+        &self,
+        root_task_id: &str,
+        session_id: Option<SessionId>,
+    ) -> Result<Arc<RunnerHandle>, RunnerStartError> {
+        let _session_guard = match session_id.as_ref() {
+            Some(session_id) => Some(self.lock_session_lifecycle(session_id).await),
+            None => None,
+        };
+        let _restart_guard = self.lock_for_restart(root_task_id).await;
+        self.start_after_quiesce(root_task_id, session_id)
+    }
+
+    /// 调用方已持有 session 生命周期锁与 root restart 锁时启动 runner。
+    pub(crate) fn start_after_quiesce(
         &self,
         root_task_id: &str,
         session_id: Option<SessionId>,
     ) -> Result<Arc<RunnerHandle>, RunnerStartError> {
         let tid = TaskId::new(root_task_id);
-        // Verify the root task exists.
         self.task_store
             .get_task(&tid)
             .ok_or(RunnerStartError::NotFound)?;
+        if let Some(session_id) = session_id.as_ref() {
+            let session = self
+                .session_store
+                .session(session_id)
+                .ok_or(RunnerStartError::SessionUnavailable)?;
+            if session.status != SessionLifecycleStatus::Active {
+                return Err(RunnerStartError::SessionUnavailable);
+            }
+        }
 
         let mut runners = self.runners.lock().expect("runners lock should hold");
         if let Some(existing) = runners.get(root_task_id)
@@ -249,15 +277,7 @@ impl RunnerManager {
             join_handle: Mutex::new(None),
         });
 
-        runners.insert(root_task_id.to_string(), Arc::clone(&handle));
-        drop(runners);
-
         let observer_session_id = session_id.clone();
-        if let Some(session_id) = session_id {
-            self.bind_session(session_id, root_task_id);
-        }
-
-        // Spawn the background loop.
         let task_runner = self.build_task_runner();
         let root_id = tid;
         let bg_handle = Arc::clone(&handle);
@@ -276,7 +296,37 @@ impl RunnerManager {
                     break;
                 }
 
-                let outcome = task_runner.run_cycle(&root_id);
+                let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    task_runner.run_cycle(&root_id)
+                })) {
+                    Ok(outcome) => outcome,
+                    Err(panic_payload) => {
+                        let panic_message =
+                            if let Some(message) = panic_payload.downcast_ref::<&str>() {
+                                (*message).to_string()
+                            } else if let Some(message) = panic_payload.downcast_ref::<String>() {
+                                message.clone()
+                            } else {
+                                "任务 Runner 执行线程异常退出".to_string()
+                            };
+                        tracing::error!(
+                            root_task_id = %root_id,
+                            panic_message = %panic_message,
+                            "任务 Runner 执行线程发生 panic，开始收口任务树"
+                        );
+                        let public_message = "任务 Runner 执行线程异常退出，可直接继续重试。";
+                        if let Err(error) =
+                            task_runner.finalize_unexpected_failure(&root_id, public_message)
+                        {
+                            tracing::error!(
+                                root_task_id = %root_id,
+                                ?error,
+                                "任务 Runner panic 后任务树收口失败"
+                            );
+                        }
+                        RunCycleOutcome::Error(public_message.to_string())
+                    }
+                };
                 let cycle = bg_handle.cycle_count.fetch_add(1, Ordering::Relaxed) + 1;
 
                 // Checkpoint policy consumption (design 3.2).
@@ -417,8 +467,89 @@ impl RunnerManager {
             .join_handle
             .lock()
             .expect("runner join handle lock should hold") = Some(join_handle);
+        runners.insert(root_task_id.to_string(), Arc::clone(&handle));
+        drop(runners);
+
+        if let Some(session_id) = session_id {
+            self.bind_session(session_id, root_task_id);
+        }
 
         Ok(handle)
+    }
+
+    pub async fn lock_session_lifecycle(
+        &self,
+        session_id: &SessionId,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .session_lifecycle_locks
+                .lock()
+                .expect("session lifecycle locks should hold");
+            locks
+                .entry(session_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    pub async fn lock_for_restart(&self, root_task_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .restart_locks
+                .lock()
+                .expect("runner restart locks should hold");
+            locks
+                .entry(root_task_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    pub async fn quiesce_for_restart(&self, root_task_id: &str) {
+        let existing = {
+            self.runners
+                .lock()
+                .expect("runners lock should hold")
+                .get(root_task_id)
+                .cloned()
+        };
+        let Some(handle) = existing else {
+            return;
+        };
+
+        handle.cancel.store(true, Ordering::Relaxed);
+        let join = handle
+            .join_handle
+            .lock()
+            .expect("runner join handle lock should hold")
+            .take();
+        if let Some(join) = join
+            && let Err(error) = join.await
+        {
+            *handle.status.lock().expect("status lock should hold") = "error".to_string();
+            *handle
+                .last_error
+                .lock()
+                .expect("last_error lock should hold") =
+                Some(format!("旧 runner 异常退出: {error}"));
+            tracing::error!(
+                root_task_id,
+                ?error,
+                "旧 runner join 异常，已完成生命周期清理"
+            );
+        }
+        handle.active.store(false, Ordering::Relaxed);
+
+        let mut runners = self.runners.lock().expect("runners lock should hold");
+        if runners
+            .get(root_task_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &handle))
+        {
+            runners.remove(root_task_id);
+        }
     }
 
     /// Signal a runner to stop.
@@ -441,49 +572,37 @@ impl RunnerManager {
             .session_runner_index
             .lock()
             .expect("session_runner_index lock should hold");
-        index
-            .entry(session_id)
-            .or_default()
-            .push(root_task_id.to_string());
+        let roots = index.entry(session_id).or_default();
+        if !roots.iter().any(|existing| existing == root_task_id) {
+            roots.push(root_task_id.to_string());
+        }
     }
 
     /// Cancel all runners bound to the given session and remove the binding.
     /// Called when a session is closed.
     pub async fn unbind_session(&self, session_id: &SessionId) -> usize {
-        let root_task_ids = {
+        let _session_guard = self.lock_session_lifecycle(session_id).await;
+        self.unbind_session_after_lifecycle_lock(session_id).await
+    }
+
+    pub async fn unbind_session_after_lifecycle_lock(&self, session_id: &SessionId) -> usize {
+        let mut root_task_ids = {
             let mut index = self
                 .session_runner_index
                 .lock()
                 .expect("session_runner_index lock should hold");
             index.remove(session_id).unwrap_or_default()
         };
-        let mut joins = Vec::new();
+        if let Some(chain) = self.session_store.active_execution_chain(session_id)
+            && !root_task_ids
+                .iter()
+                .any(|root_task_id| root_task_id == chain.root_task_id.as_str())
         {
-            let runners = self.runners.lock().expect("runners lock should hold");
-            for root_task_id in &root_task_ids {
-                let Some(handle) = runners.get(root_task_id) else {
-                    continue;
-                };
-                handle.cancel.store(true, Ordering::Relaxed);
-                if handle.active.load(Ordering::Relaxed) {
-                    *handle.status.lock().expect("status lock should hold") = "killed".to_string();
-                }
-                if let Some(join) = handle
-                    .join_handle
-                    .lock()
-                    .expect("runner join handle lock should hold")
-                    .take()
-                {
-                    joins.push(join);
-                }
-            }
+            root_task_ids.push(chain.root_task_id.to_string());
         }
-        for join in joins {
-            let _ = join.await;
-        }
-        let mut runners = self.runners.lock().expect("runners lock should hold");
         for root_task_id in &root_task_ids {
-            runners.remove(root_task_id);
+            let _restart_guard = self.lock_for_restart(root_task_id).await;
+            self.quiesce_for_restart(root_task_id).await;
         }
         root_task_ids.len()
     }
@@ -576,6 +695,7 @@ fn stalled_outcome_is_terminally_unrunnable(
 pub enum RunnerStartError {
     NotFound,
     AlreadyRunning,
+    SessionUnavailable,
 }
 
 #[derive(Debug)]
@@ -1587,20 +1707,6 @@ impl ApiState {
             .unwrap_or(0)
     }
 
-    pub(crate) fn clear_regular_session_turn_queue(
-        &self,
-        session_id: &SessionId,
-        workspace_id: Option<&WorkspaceId>,
-    ) -> usize {
-        let key = SessionTurnQueueKey::new(session_id, workspace_id);
-        self.session_turn_queue
-            .lock()
-            .expect("session turn queue lock poisoned")
-            .remove(&key)
-            .map(|queue| queue.len())
-            .unwrap_or(0)
-    }
-
     /// 删除 session 时清空该 session 的全部队列键。不能只按当前 workspace 键删除，
     /// 否则历史错误绑定或无 workspace 的排队消息会成为孤儿。
     pub(crate) fn clear_all_regular_session_turn_queues(&self, session_id: &SessionId) -> usize {
@@ -1626,8 +1732,15 @@ impl ApiState {
         &self,
         session_id: &SessionId,
     ) -> Result<(), ApiError> {
-        if let Some(manager) = self.runner_manager() {
-            manager.unbind_session(session_id).await;
+        let manager = self.runner_manager();
+        let _session_lifecycle_guard = match manager {
+            Some(manager) => Some(manager.lock_session_lifecycle(session_id).await),
+            None => None,
+        };
+        if let Some(manager) = manager {
+            manager
+                .unbind_session_after_lifecycle_lock(session_id)
+                .await;
         }
         self.settings_store
             .remove_session(session_id)
@@ -2151,6 +2264,7 @@ mod tests {
     use magi_agent_role::{AgentRole, AgentRoleRegistry, TaskKindLabel};
     use magi_core::{AbsolutePath, MissionId, Task, TaskKind, WorkerId};
     use magi_orchestrator::task_store::TaskLease;
+    use magi_session_store::{ActiveExecutionChain, ActiveExecutionDispatchContext};
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -2201,6 +2315,19 @@ mod tests {
         }
     }
 
+    struct PanickingDispatcher;
+
+    impl TaskDispatcher for PanickingDispatcher {
+        fn dispatch(
+            &self,
+            _task: &Task,
+            _worker: &WorkerInfo,
+            _lease: &TaskLease,
+        ) -> Result<(), String> {
+            panic!("模拟 Runner 派发 panic");
+        }
+    }
+
     fn test_agent_role(id: &str) -> AgentRole {
         AgentRole {
             id: id.to_string(),
@@ -2227,6 +2354,7 @@ mod tests {
         });
         let manager = RunnerManager::with_dispatcher_and_worker_catalog(
             store,
+            Arc::new(SessionStore::new()),
             Arc::new(|| {
                 vec![
                     WorkerInfo {
@@ -2270,6 +2398,7 @@ mod tests {
         let store = Arc::new(TaskStore::new());
         let manager = RunnerManager::with_dispatcher_and_worker_catalog(
             store,
+            Arc::new(SessionStore::new()),
             Arc::new(Vec::new),
             Arc::new(RecordingDispatcher {
                 observed_role: Arc::new(Mutex::new(None)),
@@ -2303,6 +2432,248 @@ mod tests {
 
         assert_eq!(manager.unbind_session(&session_id).await, 1);
         assert!(manager.status(root_task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn unbind_session_stops_active_chain_runner_before_session_binding_exists() {
+        let store = Arc::new(TaskStore::new());
+        let session_store = Arc::new(SessionStore::new());
+        let session_id = SessionId::new("session-active-chain-runner-cleanup");
+        let root_task_id = TaskId::new("task-active-chain-runner-cleanup");
+        session_store
+            .create_session(session_id.clone(), "active chain cleanup")
+            .expect("session should create");
+        session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: MissionId::new("mission-active-chain-runner-cleanup"),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-active-runner-cleanup".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: Vec::new(),
+                    active_worker_bindings: Vec::new(),
+                    branches: Vec::new(),
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: UtcMillis::now(),
+                        entry_id: "entry-active-runner-cleanup".to_string(),
+                        trimmed_text: None,
+                        skill_name: None,
+                    },
+                    current_turn: None,
+                },
+            )
+            .expect("active chain should persist");
+        let manager = RunnerManager::with_dispatcher_and_worker_catalog(
+            store,
+            session_store,
+            Arc::new(Vec::new),
+            Arc::new(RecordingDispatcher {
+                observed_role: Arc::new(Mutex::new(None)),
+            }),
+            Arc::new(EventBasedResultReceiver::new()),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let background_cancel = cancel.clone();
+        let join_handle = tokio::spawn(async move {
+            while !background_cancel.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        manager.runners.lock().expect("runners should lock").insert(
+            root_task_id.to_string(),
+            Arc::new(RunnerHandle {
+                cancel,
+                active: Arc::new(AtomicBool::new(true)),
+                cycle_count: Arc::new(AtomicU64::new(0)),
+                status: Arc::new(Mutex::new("running".to_string())),
+                last_error: Arc::new(Mutex::new(None)),
+                join_handle: Mutex::new(Some(join_handle)),
+            }),
+        );
+
+        assert_eq!(manager.unbind_session(&session_id).await, 1);
+        assert!(manager.status(root_task_id.as_str()).is_none());
+    }
+
+    #[tokio::test]
+    async fn quiesce_runner_waits_for_exit_and_removes_handle_before_restart() {
+        let store = Arc::new(TaskStore::new());
+        let root_task_id = "task-runner-restart-race";
+        let mut root_task = task_with_status(root_task_id, TaskStatus::Running);
+        root_task.root_task_id = root_task.task_id.clone();
+        store.insert_task(root_task);
+        let session_store = Arc::new(SessionStore::new());
+        let manager = RunnerManager::with_dispatcher_and_worker_catalog(
+            store,
+            session_store,
+            Arc::new(Vec::new),
+            Arc::new(RecordingDispatcher {
+                observed_role: Arc::new(Mutex::new(None)),
+            }),
+            Arc::new(EventBasedResultReceiver::new()),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicBool::new(true));
+        let background_cancel = cancel.clone();
+        let background_active = active.clone();
+        let join_handle = tokio::spawn(async move {
+            while !background_cancel.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            background_active.store(false, Ordering::Relaxed);
+        });
+        manager.runners.lock().expect("runners should lock").insert(
+            root_task_id.to_string(),
+            Arc::new(RunnerHandle {
+                cancel,
+                active: active.clone(),
+                cycle_count: Arc::new(AtomicU64::new(1)),
+                status: Arc::new(Mutex::new("error".to_string())),
+                last_error: Arc::new(Mutex::new(Some("旧执行轮即将退出".to_string()))),
+                join_handle: Mutex::new(Some(join_handle)),
+            }),
+        );
+
+        let _restart_guard = manager.lock_for_restart(root_task_id).await;
+        manager.quiesce_for_restart(root_task_id).await;
+
+        assert!(!active.load(Ordering::Relaxed));
+        assert!(manager.status(root_task_id).is_none());
+        assert!(manager.start_after_quiesce(root_task_id, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn quiesce_runner_cleans_handle_when_old_join_panics() {
+        let manager = RunnerManager::with_dispatcher_and_worker_catalog(
+            Arc::new(TaskStore::new()),
+            Arc::new(SessionStore::new()),
+            Arc::new(Vec::new),
+            Arc::new(RecordingDispatcher {
+                observed_role: Arc::new(Mutex::new(None)),
+            }),
+            Arc::new(EventBasedResultReceiver::new()),
+        );
+        let root_task_id = "task-runner-join-panic";
+        let join_handle = tokio::spawn(async move {
+            panic!("模拟旧 runner panic");
+        });
+        manager.runners.lock().expect("runners should lock").insert(
+            root_task_id.to_string(),
+            Arc::new(RunnerHandle {
+                cancel: Arc::new(AtomicBool::new(false)),
+                active: Arc::new(AtomicBool::new(true)),
+                cycle_count: Arc::new(AtomicU64::new(0)),
+                status: Arc::new(Mutex::new("running".to_string())),
+                last_error: Arc::new(Mutex::new(None)),
+                join_handle: Mutex::new(Some(join_handle)),
+            }),
+        );
+
+        manager.quiesce_for_restart(root_task_id).await;
+
+        assert!(manager.status(root_task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn runner_start_rejects_archived_session() {
+        let store = Arc::new(TaskStore::new());
+        let root_task_id = "task-archived-session-runner";
+        let mut root_task = task_with_status(root_task_id, TaskStatus::Pending);
+        root_task.root_task_id = root_task.task_id.clone();
+        store.insert_task(root_task);
+        let session_store = Arc::new(SessionStore::new());
+        let session_id = SessionId::new("session-archived-runner");
+        session_store
+            .create_session(session_id.clone(), "archived")
+            .expect("session should create");
+        session_store
+            .archive_session(&session_id)
+            .expect("session should archive");
+        let manager = RunnerManager::with_dispatcher_and_worker_catalog(
+            store,
+            session_store,
+            Arc::new(Vec::new),
+            Arc::new(RecordingDispatcher {
+                observed_role: Arc::new(Mutex::new(None)),
+            }),
+            Arc::new(EventBasedResultReceiver::new()),
+        );
+
+        assert!(matches!(
+            manager.start(root_task_id, Some(session_id)).await,
+            Err(RunnerStartError::SessionUnavailable)
+        ));
+        assert!(manager.status(root_task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn runner_panic_fails_root_task_and_notifies_terminal_observer() {
+        let store = Arc::new(TaskStore::new());
+        let root_task_id = "task-runner-cycle-panic";
+        let mut root_task = task_with_status(root_task_id, TaskStatus::Pending);
+        root_task.root_task_id = root_task.task_id.clone();
+        store.insert_task(root_task);
+        let observed_status = Arc::new(Mutex::new(None));
+        let observed_status_for_observer = observed_status.clone();
+        let manager = RunnerManager::with_dispatcher_and_worker_catalog(
+            store.clone(),
+            Arc::new(SessionStore::new()),
+            Arc::new(|| {
+                vec![WorkerInfo {
+                    worker_id: WorkerId::new("worker-runner-cycle-panic"),
+                    role: "executor".to_string(),
+                    supported_kinds: vec![TaskKind::LocalAgent],
+                    parallelism_limit: None,
+                    system_prompt_template: None,
+                }]
+            }),
+            Arc::new(PanickingDispatcher),
+            Arc::new(EventBasedResultReceiver::new()),
+        )
+        .with_terminal_observer(move |_task_id, _session_id, status| {
+            *observed_status_for_observer
+                .lock()
+                .expect("observer status lock should not poison") = Some(status);
+        });
+
+        manager
+            .start_after_quiesce(root_task_id, None)
+            .expect("runner should start");
+        for _ in 0..20 {
+            if observed_status
+                .lock()
+                .expect("observer status lock should not poison")
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            observed_status
+                .lock()
+                .expect("observer status lock should not poison")
+                .as_deref(),
+            Some("error")
+        );
+        assert_eq!(
+            store
+                .get_task(&TaskId::new(root_task_id))
+                .expect("root task should remain available")
+                .status,
+            TaskStatus::Failed
+        );
+        assert_eq!(
+            manager
+                .status(root_task_id)
+                .expect("runner status should remain inspectable")
+                .status,
+            "error"
+        );
     }
 
     #[test]

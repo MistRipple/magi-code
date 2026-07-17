@@ -17,7 +17,9 @@ use crate::{
     },
 };
 use magi_conversation_runtime::session_images::SessionTurnImage;
-use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
+use magi_conversation_runtime::session_writeback::{
+    SessionTurnErrorInput, append_session_turn_error_item, publish_current_session_turn_item_event,
+};
 use magi_session_store::{
     CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind,
 };
@@ -182,7 +184,10 @@ async fn execute_dispatch_submission(
         placeholder_message_id: request.placeholder_message_id(),
     };
     let accepted = submit_dispatch_submission(state, dispatch)?;
-    state.persist_session_state_checkpoint("session_task_turn_accepted")?;
+    if let Err(error) = state.persist_session_state_checkpoint("session_task_turn_accepted") {
+        fail_accepted_task_submission(state, &accepted);
+        return Err(error);
+    }
     ingest_user_input_to_conversation(state, &session_id, request, accepted_at);
     publish_session_user_message_event(
         state,
@@ -245,12 +250,12 @@ pub(super) fn dispatch_accepted_canonical_event(
     (canonical_turn, canonical_item)
 }
 
-pub(super) fn finalize_session_task_dispatch(
+pub(super) async fn finalize_session_task_dispatch(
     state: ApiState,
     accepted: DispatchSubmissionAccepted,
 ) {
     let mut accepted = accepted;
-    if let Err(error) = drive_dispatch_submission(&state, &mut accepted) {
+    if let Err(error) = drive_dispatch_submission(&state, &mut accepted).await {
         tracing::error!(
             session_id = %accepted.session_id,
             root_task_id = %accepted.root_task_id,
@@ -258,10 +263,62 @@ pub(super) fn finalize_session_task_dispatch(
             ?error,
             "session turn task dispatch failed"
         );
-        let _ = state.persist_session_state_checkpoint("session_task_turn_failed");
+        fail_accepted_task_submission(&state, &accepted);
         return;
     }
     append_dispatch_assistant_message(&state, &accepted);
+}
+
+fn fail_accepted_task_submission(state: &ApiState, accepted: &DispatchSubmissionAccepted) {
+    if let Some(task_store) = state.task_store()
+        && task_store.get_task(&accepted.root_task_id).is_some()
+    {
+        let _ = task_store.set_output_refs(
+            &accepted.root_task_id,
+            vec!["任务执行启动失败，可直接重试。".to_string()],
+        );
+        let _ = task_store.update_status(&accepted.root_task_id, TaskStatus::Failed);
+        if crate::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
+            state,
+            &accepted.session_id,
+            &accepted.root_task_id,
+            "error",
+        ) {
+            let _ = state.persist_session_state_checkpoint("session_task_turn_failed");
+            return;
+        }
+    }
+
+    if let Some(thread) = state
+        .session_store
+        .orchestrator_thread_for_session(&accepted.session_id)
+    {
+        let workspace_id = state
+            .session_store
+            .execution_ownership(&accepted.session_id)
+            .and_then(|ownership| ownership.workspace_id);
+        append_session_turn_error_item(
+            &state.event_bus,
+            &state.session_store,
+            SessionTurnErrorInput {
+                session_id: &accepted.session_id,
+                workspace_id: &workspace_id,
+                task_id: Some(&accepted.root_task_id),
+                request_id: None,
+                user_message_id: Some(&accepted.user_message_item_id),
+                placeholder_message_id: None,
+                error_text: "任务执行启动失败，可直接重试。",
+                streaming_entry_id: None,
+                source_thread_id: thread.thread_id,
+                persist_session_state: None,
+            },
+        );
+    } else {
+        let _ = state
+            .session_store
+            .update_current_turn_status(&accepted.session_id, "failed");
+    }
+    let _ = state.persist_session_state_checkpoint("session_task_turn_failed");
 }
 
 fn format_action_task_title(mission_title: &str) -> String {
@@ -408,6 +465,11 @@ pub(super) fn append_dispatch_assistant_message(
         .session_store
         .runtime_sidecar(&accepted.session_id)
         .and_then(|sidecar| sidecar.current_turn);
+    if current_turn.as_ref().is_some_and(|turn| {
+        turn.status != "completed" && turn.status != "running" && turn.status != "accepted"
+    }) {
+        return;
+    }
     let current_turn_matches = current_turn
         .as_ref()
         .is_some_and(|turn| turn_matches_accepted_dispatch(turn, accepted));
