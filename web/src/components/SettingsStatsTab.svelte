@@ -2,7 +2,11 @@
   import { i18n } from '../stores/i18n.svelte';
   import { getAgentColor } from '../lib/agent-colors';
   import Icon from './Icon.svelte';
-  import type { ModelStatusMap } from '../types/message';
+  import type { ModelStatus, ModelStatusMap } from '../types/message';
+  import type {
+    AgentExecutionModelStatsItem,
+    AgentExecutionStatsItem,
+  } from '../web/agent-api';
 
   let {
     totalInputTokens,
@@ -12,7 +16,10 @@
     refreshConnections,
     showResetConfirmDialog,
     modelStatuses,
+    bindingUsageStats,
+    modelUsageStats,
     getWorkerStats,
+    getStatsRoleModelStatus,
     getStatusClass,
     getWorkerDisplayName,
     statusTexts,
@@ -25,7 +32,10 @@
     refreshConnections: () => void;
     showResetConfirmDialog: () => void;
     modelStatuses: ModelStatusMap;
+    bindingUsageStats: AgentExecutionStatsItem[];
+    modelUsageStats: AgentExecutionModelStatsItem[];
     getWorkerStats: (worker: string) => any;
+    getStatsRoleModelStatus: (roleKey: string) => ModelStatus | undefined;
     getStatusClass: (status: string) => string;
     getWorkerDisplayName: (worker: string) => string;
     statusTexts: Record<string, () => string>;
@@ -33,7 +43,7 @@
   }>();
 
   type Perspective = 'role' | 'engine';
-  let perspective = $state<Perspective>('role');
+  let perspective = $state<Perspective>('engine');
   let selectedKey = $state<string | null>(null);
 
   function formatTokens(tokens: number | undefined | null): string {
@@ -51,27 +61,35 @@
   function workerLabel(worker: string): string {
     if (worker === 'orchestrator') return i18n.t('settings.stats.orchestratorModel');
     if (worker === 'auxiliary') return i18n.t('settings.stats.auxiliaryModel');
+    if (worker === 'imageGeneration') return i18n.t('settings.stats.imageModel');
     return getWorkerDisplayName(worker);
+  }
+
+  function formatList(items: string[]): string {
+    return new Intl.ListFormat(i18n.locale, { style: 'short', type: 'conjunction' }).format(items);
   }
 
   function workerModelLabel(worker: string): string {
     const stats = getWorkerStats(worker);
-    const status = modelStatuses[worker];
-    return (
-      stats?.resolvedModel
-      || status?.model
-      || (status?.status === 'not_configured'
-        ? i18n.t('settings.stats.notConfigured')
-        : status?.status === 'disabled'
-          ? i18n.t('settings.stats.disabled')
-          : i18n.t('settings.stats.unknownModel'))
-    );
+    if (!stats) {
+      return i18n.t('settings.stats.noUsage');
+    }
+    const resolvedModels = Array.isArray(stats?.resolvedModels) ? stats.resolvedModels : [];
+    if (resolvedModels.length === 1) {
+      return i18n.t('settings.stats.usedModel', { model: resolvedModels[0] });
+    }
+    if (resolvedModels.length > 1) {
+      return i18n.t('settings.stats.usedModels', {
+        count: resolvedModels.length,
+        models: resolvedModels.join(' · '),
+      });
+    }
+    return i18n.t('settings.stats.unknownModel');
   }
 
   // ============ 底层：每个角色（statsDisplayKeys）的原子统计 ============
   interface RoleAtom {
     worker: string;
-    resolvedModel: string | null;
     label: string;
     modelLabel: string;
     statusObj: any;
@@ -90,15 +108,13 @@
   const roleAtoms = $derived<RoleAtom[]>(
     statsDisplayKeys.map((worker: string): RoleAtom => {
       const stats = getWorkerStats(worker);
-      const statusObj = modelStatuses[worker] || { status: stats ? 'configured' : 'checking' };
+      const statusObj = getStatsRoleModelStatus(worker) || { status: stats ? 'recorded' : 'checking' };
       const totalIn = stats?.totalInputTokens ?? 0;
       const totalOut = stats?.totalOutputTokens ?? 0;
       const calls = stats?.totalExecutions ?? 0;
       const successCount = stats?.successCount ?? 0;
-      const resolvedModel = stats?.resolvedModel || statusObj?.model || null;
       return {
         worker,
-        resolvedModel,
         label: workerLabel(worker),
         modelLabel: workerModelLabel(worker),
         statusObj,
@@ -116,15 +132,51 @@
     })
   );
 
-  // ============ 按引擎聚合：相同 resolvedModel 的角色合并成一行 ============
+  function resolveModelRuntimeStatus(identityKeys: string[]) {
+    const identitySet = new Set(identityKeys);
+    const bindings: AgentExecutionStatsItem[] = bindingUsageStats.filter((item: AgentExecutionStatsItem) => (
+      item.modelIdentityKey && identitySet.has(item.modelIdentityKey)
+    ));
+    const statusKeys: string[] = Array.from(new Set(bindings.map((binding: AgentExecutionStatsItem) => {
+      if (binding.role === 'orchestrator') return 'orchestrator';
+      if (binding.role === 'auxiliary') return 'auxiliary';
+      return binding.engineId || 'orchestrator';
+    })));
+    const statuses = statusKeys
+      .map((key) => modelStatuses[key])
+      .filter((status): status is ModelStatus => Boolean(status));
+    const status = statuses.find((item) => item.status === 'error')
+      || statuses.find((item) => item.status === 'available' || item.status === 'connected')
+      || statuses.find((item) => item.status === 'configured')
+      || statuses[0];
+    if (!status) {
+      return {
+        statusClass: 'recorded',
+        statusKey: 'recorded',
+        isError: false,
+        errorMsg: null,
+        isCore: bindings.some((binding: AgentExecutionStatsItem) => binding.role !== 'worker'),
+      };
+    }
+    const statusKey = status?.status || 'recorded';
+    const statusClass = getStatusClass(statusKey);
+    return {
+      statusClass,
+      statusKey,
+      isError: statusClass === 'error',
+      errorMsg: status?.error || null,
+      isCore: bindings.some((binding: AgentExecutionStatsItem) => binding.role !== 'worker'),
+    };
+  }
+
+  // ============ 模型视角：直接使用后端按模型身份聚合的权威统计 ============
   interface EngineRow {
     key: string;
     rowKind: 'engine';
-    resolvedModel: string | null;
-    label: string;        // 模型 id 或 "未解析模型"
-    subLabel: string;     // "N 个角色绑定"
-    avatarSeed: string;   // 用首个 member 的 worker 做色卡 seed
-    members: RoleAtom[];
+    resolvedModel: string;
+    label: string;
+    subLabel: string;
+    avatarSeed: string;
     totalIn: number;
     totalOut: number;
     totalTokens: number;
@@ -135,56 +187,87 @@
     statusClass: string;
     statusKey: string;
     errorMsg: string | null;
+    isCore: boolean;
+    identityKeys: string[];
+    connectionCount: number;
+    sourceLabels: string[];
+  }
+
+  interface ModelBucket {
+    resolvedModel: string;
+    identityKeys: string[];
+    totalIn: number;
+    totalOut: number;
+    calls: number;
+    successCount: number;
   }
 
   const engineRows = $derived.by<EngineRow[]>(() => {
-    const buckets = new Map<string, EngineRow>();
-    for (const atom of roleAtoms) {
-      // 没解析出 resolvedModel 时，每个角色独立成桶（用 worker key 兜底，避免与他人合并）
-      const bucketKey = atom.resolvedModel
-        ? `model:${atom.resolvedModel}`
-        : `unbound:${atom.worker}`;
-      let bucket = buckets.get(bucketKey);
-      if (!bucket) {
-        bucket = {
-          key: bucketKey,
-          rowKind: 'engine',
-          resolvedModel: atom.resolvedModel,
-          label: atom.resolvedModel || atom.modelLabel,
-          subLabel: '',
-          avatarSeed: atom.worker,
-          members: [],
-          totalIn: 0,
-          totalOut: 0,
-          totalTokens: 0,
-          calls: 0,
-          successCount: 0,
-          successRate: null,
-          isError: false,
-          statusClass: atom.statusClass,
-          statusKey: atom.statusKey,
-          errorMsg: null,
-        };
-        buckets.set(bucketKey, bucket);
-      }
-      bucket.members.push(atom);
-      bucket.totalIn += atom.totalIn;
-      bucket.totalOut += atom.totalOut;
-      bucket.totalTokens += atom.totalTokens;
-      bucket.calls += atom.calls;
-      bucket.successCount += atom.successCount;
-      if (atom.isError) {
-        bucket.isError = true;
-        bucket.statusClass = 'error';
-        bucket.statusKey = 'error';
-        bucket.errorMsg = atom.errorMsg || bucket.errorMsg;
-      }
+    const buckets = new Map<string, ModelBucket>();
+    for (const model of [...modelUsageStats].sort((left, right) => (
+      right.totals.totalTokens - left.totals.totalTokens
+      || left.resolvedModel.localeCompare(right.resolvedModel)
+    ))) {
+      const resolvedModel = model.resolvedModel.trim() || model.declaredModelSpec.trim() || i18n.t('settings.stats.unknownModel');
+      const key = resolvedModel.toLocaleLowerCase();
+      const bucket: ModelBucket = buckets.get(key) || {
+        resolvedModel,
+        identityKeys: [],
+        totalIn: 0,
+        totalOut: 0,
+        calls: 0,
+        successCount: 0,
+      };
+      bucket.identityKeys.push(model.modelIdentityKey);
+      bucket.totalIn += model.totals.netInputTokens;
+      bucket.totalOut += model.totals.netOutputTokens;
+      bucket.calls += model.totals.llmCallCount;
+      bucket.successCount += model.totals.successCount;
+      buckets.set(key, bucket);
     }
-    return Array.from(buckets.values()).map((b): EngineRow => ({
-      ...b,
-      subLabel: i18n.t('settings.stats.engineRowMembers', { count: b.members.length }),
-      successRate: b.calls > 0 ? b.successCount / b.calls : null,
-    }));
+
+    return Array.from(buckets.entries())
+      .map(([key, bucket]): EngineRow => {
+        const identitySet = new Set(bucket.identityKeys);
+        const sourceBindings = bindingUsageStats
+            .filter((binding: AgentExecutionStatsItem) => binding.modelIdentityKey && identitySet.has(binding.modelIdentityKey))
+            .sort((left: AgentExecutionStatsItem, right: AgentExecutionStatsItem) => {
+              const sourceOrder = (binding: AgentExecutionStatsItem) => {
+                if (binding.role === 'orchestrator') return 0;
+                if (binding.role === 'auxiliary') return 1;
+                const roleIndex = statsDisplayKeys.indexOf(binding.templateId);
+                return roleIndex >= 0 ? roleIndex + 2 : Number.MAX_SAFE_INTEGER;
+              };
+              return sourceOrder(left) - sourceOrder(right)
+                || left.templateId.localeCompare(right.templateId);
+            });
+        const sourceLabels: string[] = Array.from(new Set<string>(
+          sourceBindings.map((binding: AgentExecutionStatsItem) => (
+            workerLabel(binding.role === 'worker' ? binding.templateId : binding.role)
+          )),
+        ));
+        return {
+          key,
+          rowKind: 'engine',
+          resolvedModel: bucket.resolvedModel,
+          label: bucket.resolvedModel,
+          subLabel: sourceLabels.length > 0
+            ? i18n.t('settings.stats.modelUsedBy', { roles: formatList(sourceLabels) })
+            : i18n.t('settings.stats.recordedUsage'),
+          avatarSeed: key,
+          totalIn: bucket.totalIn,
+          totalOut: bucket.totalOut,
+          totalTokens: bucket.totalIn + bucket.totalOut,
+          calls: bucket.calls,
+          successCount: bucket.successCount,
+          successRate: bucket.calls > 0 ? bucket.successCount / bucket.calls : null,
+          identityKeys: bucket.identityKeys,
+          connectionCount: bucket.identityKeys.length,
+          sourceLabels,
+          ...resolveModelRuntimeStatus(bucket.identityKeys),
+        };
+      })
+      .sort((a: EngineRow, b: EngineRow) => b.totalTokens - a.totalTokens);
   });
 
   // ============ 视角统一行 shape，下游只看 rows ============
@@ -224,7 +307,7 @@
           statusClass: er.statusClass,
           statusKey: er.statusKey,
           errorMsg: er.errorMsg,
-          isCore: er.members.some((m: RoleAtom) => m.worker === 'orchestrator' || m.worker === 'auxiliary'),
+          isCore: er.isCore,
           engineRow: er,
         }))
       : roleAtoms.map((atom: RoleAtom): DisplayRow => ({
@@ -270,6 +353,64 @@
     selectedKey = key;
   }
 
+  interface UsageBreakdownRow {
+    key: string;
+    label: string;
+    avatarSeed: string;
+    totalIn: number;
+    totalOut: number;
+    totalTokens: number;
+    calls: number;
+    successCount: number;
+    successRate: number | null;
+  }
+
+  function bindingRoleKey(binding: AgentExecutionStatsItem): string {
+    if (binding.role === 'orchestrator') return 'orchestrator';
+    if (binding.role === 'auxiliary') return 'auxiliary';
+    return binding.templateId.trim();
+  }
+
+  function bindingModelLabel(binding: AgentExecutionStatsItem): string {
+    return binding.resolvedModel?.trim()
+      || binding.declaredModelSpec?.trim()
+      || i18n.t('settings.stats.unknownModel');
+  }
+
+  function aggregateUsageBreakdown(
+    items: AgentExecutionStatsItem[],
+    keyOf: (binding: AgentExecutionStatsItem) => string,
+    labelOf: (binding: AgentExecutionStatsItem) => string,
+  ): UsageBreakdownRow[] {
+    const buckets = new Map<string, UsageBreakdownRow>();
+    for (const binding of items) {
+      const key = keyOf(binding);
+      if (!key) continue;
+      const bucket = buckets.get(key) || {
+        key,
+        label: labelOf(binding),
+        avatarSeed: key,
+        totalIn: 0,
+        totalOut: 0,
+        totalTokens: 0,
+        calls: 0,
+        successCount: 0,
+        successRate: null,
+      };
+      bucket.totalIn += binding.netInputTokens;
+      bucket.totalOut += binding.netOutputTokens;
+      bucket.totalTokens += binding.totalTokens;
+      bucket.calls += binding.llmCallCount;
+      bucket.successCount += binding.successCount;
+      bucket.successRate = bucket.calls > 0 ? bucket.successCount / bucket.calls : null;
+      buckets.set(key, bucket);
+    }
+    return Array.from(buckets.values()).sort((left, right) => (
+      right.totalTokens - left.totalTokens
+      || left.label.localeCompare(right.label)
+    ));
+  }
+
   // ============ Insight 派生（始终按引擎维度算 Top，避免视角切换跳变）============
   const errorRoles = $derived(roleAtoms.filter((a) => a.isError));
   const topEngine = $derived(
@@ -294,40 +435,59 @@
   const selectedRow = $derived(rows.find((r) => r.key === selectedKey) || null);
   const selectedColor = $derived(selectedRow ? getAgentColor(selectedRow.avatarSeed) : null);
 
+  const selectedBreakdown = $derived.by<UsageBreakdownRow[]>(() => {
+    if (!selectedRow) return [];
+
+    if (perspective === 'engine') {
+      const identityKeys = new Set(selectedRow.engineRow?.identityKeys || []);
+      return aggregateUsageBreakdown(
+        bindingUsageStats.filter((binding: AgentExecutionStatsItem) => (
+          Boolean(binding.modelIdentityKey) && identityKeys.has(binding.modelIdentityKey as string)
+        )),
+        bindingRoleKey,
+        (binding) => workerLabel(bindingRoleKey(binding)),
+      );
+    }
+
+    const roleKey = selectedRow.roleAtom?.worker || selectedRow.key;
+    return aggregateUsageBreakdown(
+      bindingUsageStats.filter((binding: AgentExecutionStatsItem) => bindingRoleKey(binding) === roleKey),
+      (binding) => bindingModelLabel(binding).toLocaleLowerCase(),
+      bindingModelLabel,
+    );
+  });
+
   // role 视角下 I/O bar 上限
   const barMaxIO = $derived(
     selectedRow ? Math.max(selectedRow.totalIn, selectedRow.totalOut, 1) : 1
   );
 
-  // engine 视角下成员角色 token 占比 bar 上限
-  const memberMaxToken = $derived.by(() => {
-    if (!selectedRow?.engineRow) return 1;
-    return Math.max(...selectedRow.engineRow.members.map((m) => m.totalTokens), 1);
-  });
 </script>
 
 <div class="stats-tab-inner scroll-proxy">
   <div class="stats-scroll-panel">
     <!-- 顶部全局动作行（刷新 / 重置）-->
     <div class="actions-row">
-      <button
-        class="ghost-action"
-        class:saving={isRefreshing}
-        onclick={refreshConnections}
-        disabled={isRefreshing}
-        title={isRefreshing ? i18n.t('settings.stats.checking') : i18n.t('settings.stats.check')}
-      >
-        <Icon name="refresh" size={12} />
-        <span>{isRefreshing ? i18n.t('settings.stats.checking') : i18n.t('settings.stats.check')}</span>
-      </button>
-      <button
-        class="ghost-action danger"
-        onclick={showResetConfirmDialog}
-        title={i18n.t('settings.stats.resetTokens')}
-      >
-        <Icon name="trash" size={11} />
-        <span>{i18n.t('settings.stats.resetTokens')}</span>
-      </button>
+      <div class="action-buttons">
+        <button
+          class="ghost-action"
+          class:saving={isRefreshing}
+          onclick={refreshConnections}
+          disabled={isRefreshing}
+          title={isRefreshing ? i18n.t('settings.stats.checking') : i18n.t('settings.stats.check')}
+        >
+          <Icon name="refresh" size={12} />
+          <span>{isRefreshing ? i18n.t('settings.stats.checking') : i18n.t('settings.stats.check')}</span>
+        </button>
+        <button
+          class="ghost-action danger"
+          onclick={showResetConfirmDialog}
+          title={i18n.t('settings.stats.resetWorkspace')}
+        >
+          <Icon name="trash" size={11} />
+          <span>{i18n.t('settings.stats.resetWorkspace')}</span>
+        </button>
+      </div>
     </div>
 
     <!-- Insight Strip · 3 个洞察单元 -->
@@ -410,7 +570,9 @@
         </div>
         <div class="col-head">
           <span></span>
-          <span>{perspective === 'engine' ? i18n.t('settings.stats.colEngine') : i18n.t('settings.stats.colRole')}</span>
+          <span>{perspective === 'engine'
+              ? i18n.t('settings.stats.colEngine')
+              : i18n.t('settings.stats.colRole')}</span>
           <span class="num">{i18n.t('settings.stats.colCalls')}</span>
           <span class="num">{i18n.t('settings.stats.colSuccess')}</span>
           <span class="num">{i18n.t('settings.stats.colToken')}</span>
@@ -429,7 +591,7 @@
               onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectRow(row.key); } }}
             >
               <div class="row-avatar" style="background: {colorPair.muted}; color: {colorPair.color}">
-                <Icon name="model" size={11} />
+                <Icon name={perspective === 'role' ? 'bot' : 'model'} size={11} />
               </div>
               <div class="row-label-stack">
                 <span class="row-name-txt">
@@ -459,12 +621,12 @@
           <div class="slice-head">
             <span class="slice-kicker">
               {perspective === 'engine'
-                ? i18n.t('settings.stats.sliceKickerByRoleDist')
-                : i18n.t('settings.stats.sliceKickerByEngineDist')}
+                ? i18n.t('settings.stats.sliceKickerByModelUsage')
+                : i18n.t('settings.stats.sliceKickerByRoleUsage')}
             </span>
             <div class="slice-title-row">
               <div class="slice-avatar" style="background: {selectedColor?.muted}; color: {selectedColor?.color}">
-                <Icon name="model" size={13} />
+                <Icon name={perspective === 'role' ? 'bot' : 'model'} size={13} />
               </div>
               <span class="slice-title">{selectedRow.label}</span>
               <span class="slice-badge {selectedRow.statusClass}">
@@ -490,60 +652,69 @@
             </div>
           </div>
 
-          {#if perspective === 'engine' && selectedRow.engineRow}
-            <!-- 引擎视角下：列出该引擎的成员角色（哪些角色在跑这个引擎） -->
-            <div class="slice-section">
-              <div class="slice-section-head">
-                <span>{i18n.t('settings.stats.sectionEngineMembers')}</span>
-                <span class="small-note">{i18n.t('settings.stats.sectionMonthly')}</span>
+          <div class="slice-section">
+            <div class="slice-section-head">
+              <span>{perspective === 'engine'
+                ? i18n.t('settings.stats.breakdownByRole')
+                : i18n.t('settings.stats.breakdownByModel')}</span>
+              <span class="small-note">{i18n.t('settings.stats.sectionMonthly')}</span>
+            </div>
+            {#if selectedBreakdown.length > 0}
+              <div class="breakdown-head">
+                <span>{perspective === 'engine'
+                  ? i18n.t('settings.stats.colRole')
+                  : i18n.t('settings.stats.colEngine')}</span>
+                <span class="num">{i18n.t('settings.stats.colCalls')}</span>
+                <span class="num">{i18n.t('settings.stats.colSuccess')}</span>
+                <span class="num">{i18n.t('settings.stats.colToken')}</span>
               </div>
-              <div class="bar-list">
-                {#each [...selectedRow.engineRow.members].sort((a, b) => b.totalTokens - a.totalTokens) as member (member.worker)}
-                  {@const memberShare = selectedRow.engineRow.totalTokens > 0
-                    ? member.totalTokens / selectedRow.engineRow.totalTokens
-                    : 0}
-                  <div class="bar-item">
-                    <span class="bar-label" title={member.label}>{member.label}</span>
-                    <div class="bar-track">
-                      <div class="bar-fill" style="width: {(member.totalTokens / memberMaxToken) * 100}%"></div>
+              <div class="breakdown-list">
+                {#each selectedBreakdown as breakdown (breakdown.key)}
+                  {@const breakdownColor = getAgentColor(breakdown.avatarSeed)}
+                  <div class="breakdown-row">
+                    <div class="breakdown-label">
+                      <span class="breakdown-avatar" style="background: {breakdownColor.muted}; color: {breakdownColor.color}">
+                        <Icon name={perspective === 'engine' ? 'bot' : 'model'} size={10} />
+                      </span>
+                      <span title={breakdown.label}>{breakdown.label}</span>
                     </div>
-                    <span class="bar-meta">
-                      <span class="strong">{formatTokens(member.totalTokens)}</span>
-                      <span class="dim"> · {formatPct(memberShare)}</span>
-                    </span>
+                    <span class="breakdown-metric num">{breakdown.calls || '--'}</span>
+                    <span class="breakdown-metric num">{formatPct(breakdown.successRate)}</span>
+                    <span class="breakdown-metric num">{formatTokens(breakdown.totalTokens)}</span>
                   </div>
                 {/each}
               </div>
+            {:else}
+              <div class="breakdown-empty">{i18n.t('settings.stats.breakdownEmpty')}</div>
+            {/if}
+          </div>
+
+          <div class="slice-section">
+            <div class="slice-section-head">
+              <span>{i18n.t('settings.stats.sectionIO')}</span>
+              <span class="small-note">{i18n.t('settings.stats.sectionMonthly')}</span>
             </div>
-          {:else}
-            <!-- 角色视角下：保留 I/O 分布 -->
-            <div class="slice-section">
-              <div class="slice-section-head">
-                <span>{i18n.t('settings.stats.sectionIO')}</span>
-                <span class="small-note">{i18n.t('settings.stats.sectionMonthly')}</span>
+            <div class="bar-list">
+              <div class="bar-item">
+                <span class="bar-label">{i18n.t('settings.stats.barInputLabel')}</span>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: {(selectedRow.totalIn / barMaxIO) * 100}%"></div>
+                </div>
+                <span class="bar-meta">
+                  <span class="strong">{formatTokens(selectedRow.totalIn)}</span>
+                </span>
               </div>
-              <div class="bar-list">
-                <div class="bar-item">
-                  <span class="bar-label">{i18n.t('settings.stats.barInputLabel')}</span>
-                  <div class="bar-track">
-                    <div class="bar-fill" style="width: {(selectedRow.totalIn / barMaxIO) * 100}%"></div>
-                  </div>
-                  <span class="bar-meta">
-                    <span class="strong">{formatTokens(selectedRow.totalIn)}</span>
-                  </span>
+              <div class="bar-item muted">
+                <span class="bar-label">{i18n.t('settings.stats.barOutputLabel')}</span>
+                <div class="bar-track">
+                  <div class="bar-fill" style="width: {(selectedRow.totalOut / barMaxIO) * 100}%"></div>
                 </div>
-                <div class="bar-item muted">
-                  <span class="bar-label">{i18n.t('settings.stats.barOutputLabel')}</span>
-                  <div class="bar-track">
-                    <div class="bar-fill" style="width: {(selectedRow.totalOut / barMaxIO) * 100}%"></div>
-                  </div>
-                  <span class="bar-meta">
-                    <span class="strong">{formatTokens(selectedRow.totalOut)}</span>
-                  </span>
-                </div>
+                <span class="bar-meta">
+                  <span class="strong">{formatTokens(selectedRow.totalOut)}</span>
+                </span>
               </div>
             </div>
-          {/if}
+          </div>
 
           {#if selectedRow.errorMsg}
             <div class="slice-error">
@@ -553,7 +724,7 @@
           {/if}
         {:else}
           <div class="slice-empty">
-            <Icon name="model" size={28} />
+            <Icon name={perspective === 'role' ? 'bot' : 'model'} size={28} />
             <span>{i18n.t('settings.stats.sliceEmptyTitle')}</span>
           </div>
         {/if}
@@ -624,6 +795,11 @@
     align-items: center;
     justify-content: flex-end;
     gap: 8px;
+  }
+  .action-buttons {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
   }
   .ghost-action {
     display: inline-flex;
@@ -1033,6 +1209,70 @@
   .bar-meta .strong { color: var(--ind-foreground); font-weight: 600; }
   .bar-meta .dim { color: var(--ind-foreground-muted); }
 
+  .breakdown-head,
+  .breakdown-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 46px 52px 64px;
+    align-items: center;
+    gap: 8px;
+  }
+  .breakdown-head {
+    padding: 0 8px 4px;
+    color: var(--ind-foreground-soft);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .breakdown-head .num { text-align: right; }
+  .breakdown-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .breakdown-row {
+    min-height: 30px;
+    padding: 4px 8px;
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--ind-foreground) 3%, transparent);
+  }
+  .breakdown-label {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    gap: 7px;
+    color: var(--ind-foreground);
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .breakdown-label > span:last-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .breakdown-avatar {
+    width: 18px;
+    height: 18px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    border-radius: 5px;
+  }
+  .breakdown-metric {
+    color: var(--ind-foreground-secondary);
+    font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .breakdown-metric.num { text-align: right; }
+  .breakdown-empty {
+    padding: 9px 8px;
+    color: var(--ind-foreground-muted);
+    font-size: 10.5px;
+  }
+
   .slice-error {
     display: flex;
     align-items: center;
@@ -1067,6 +1307,11 @@
 
   /* ---------- Container-driven Responsive ---------- */
   @container stats-tab (max-width: 760px) {
+    .action-buttons { width: 100%; }
+    .ghost-action {
+      flex: 1;
+      justify-content: center;
+    }
     .insight-strip {
       grid-template-columns: 1fr;
     }

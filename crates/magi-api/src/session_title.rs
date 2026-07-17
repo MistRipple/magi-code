@@ -14,9 +14,14 @@ use std::sync::Arc;
 
 use magi_bridge_client::{ModelBridgeClient, ModelInvocationRequest};
 use magi_conversation_runtime::session_turn_execution::BUSINESS_MODEL_PROVIDER;
+use magi_conversation_runtime::usage_recording::{
+    AuxiliaryModelUsageContext, invoke_auxiliary_model_with_usage,
+};
 use magi_core::{EventId, SessionId, UtcMillis};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::SessionStore;
+use magi_settings_store::SettingsStore;
+use magi_usage_authority::UsagePhase;
 use serde_json::json;
 
 use crate::state::ApiState;
@@ -24,6 +29,12 @@ use crate::state::ApiState;
 pub(crate) const NEW_SESSION_PLACEHOLDER_TITLE: &str = "新会话";
 /// 辅助模型返回内容若超过该字符数则视为越权输出（多半是直接把整段消息回吐），直接丢弃。
 const TITLE_MAX_CHARS: usize = 40;
+
+struct SessionTitleUsageContext<'a> {
+    event_bus: &'a magi_event_bus::InMemoryEventBus,
+    settings_store: &'a Arc<SettingsStore>,
+    workspace_id: &'a magi_core::WorkspaceId,
+}
 
 /// 新建会话时，把首条用户消息丢给辅助模型异步生成一个更易读的会话标题。
 ///
@@ -80,12 +91,24 @@ pub(crate) fn refine_new_session_title_and_publish(
         );
         return false;
     };
-    let refined_title = refine_new_session_title(
+    let workspace_id = state
+        .session_store
+        .session(session_id)
+        .and_then(|session| state.session_workspace_id(&session));
+    let usage_context = workspace_id
+        .as_ref()
+        .map(|workspace_id| SessionTitleUsageContext {
+            event_bus: state.event_bus.as_ref(),
+            settings_store: &state.settings_store,
+            workspace_id,
+        });
+    let refined_title = refine_new_session_title_inner(
         client,
         state.session_store.clone(),
         session_id.clone(),
         first_message.to_string(),
         placeholder_title.to_string(),
+        usage_context,
     );
     let Some(title) = refined_title else {
         return false;
@@ -97,10 +120,6 @@ pub(crate) fn refine_new_session_title_and_publish(
             "辅助模型会话标题持久化失败"
         );
     }
-    let workspace_id = state
-        .session_store
-        .session(session_id)
-        .and_then(|session| state.session_workspace_id(&session));
     let event_id = EventId::new(format!(
         "event-session-title-updated-{}-{}",
         session_id,
@@ -135,6 +154,24 @@ pub fn refine_new_session_title(
     first_message: String,
     placeholder_title: String,
 ) -> Option<String> {
+    refine_new_session_title_inner(
+        client,
+        session_store,
+        session_id,
+        first_message,
+        placeholder_title,
+        None,
+    )
+}
+
+fn refine_new_session_title_inner(
+    client: Arc<dyn ModelBridgeClient>,
+    session_store: Arc<SessionStore>,
+    session_id: SessionId,
+    first_message: String,
+    placeholder_title: String,
+    usage_context: Option<SessionTitleUsageContext<'_>>,
+) -> Option<String> {
     let trimmed = first_message.trim();
     let prompt = build_title_prompt(trimmed);
     let request = ModelInvocationRequest {
@@ -144,7 +181,31 @@ pub fn refine_new_session_title(
         tools: None,
         tool_choice: None,
     };
-    let response = match client.invoke(request) {
+    let call_id = format!(
+        "auxiliary-session-title-{}-{}",
+        session_id,
+        UtcMillis::now().0
+    );
+    let response = match usage_context {
+        Some(usage_context) => {
+            let workspace_binding = Some(usage_context.workspace_id.clone());
+            invoke_auxiliary_model_with_usage(
+                client,
+                request,
+                AuxiliaryModelUsageContext {
+                    event_bus: usage_context.event_bus,
+                    session_store: session_store.as_ref(),
+                    settings_store: Some(usage_context.settings_store),
+                    session_id: &session_id,
+                    workspace_id: &workspace_binding,
+                    call_id,
+                    phase: UsagePhase::Integration,
+                },
+            )
+        }
+        _ => client.invoke(request),
+    };
+    let response = match response {
         Ok(resp) if resp.ok => resp,
         Ok(resp) => {
             tracing::debug!(

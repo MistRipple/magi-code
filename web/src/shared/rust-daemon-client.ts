@@ -59,7 +59,7 @@ import type {
   SessionInterruptResponseDto,
   NotificationsResponseDto,
   SessionRenameRequestDto,
-  SessionStatsResponseDto,
+  ExecutionStatsResponseDto,
   SessionTurnRequestDto,
   SessionTurnResponseDto,
   SettingsUpdateRequestDto,
@@ -331,8 +331,8 @@ export class RustDaemonClient {
     return this.postJson<FetchModelsResponseDto>('/api/settings/models/fetch', request);
   }
 
-  public async fetchSessionStats(): Promise<SessionStatsResponseDto> {
-    return this.getJson<SessionStatsResponseDto>('/api/settings/stats/session');
+  public async fetchExecutionStats(): Promise<ExecutionStatsResponseDto> {
+    return this.getJson<ExecutionStatsResponseDto>('/api/settings/stats');
   }
 
   public async resetStats(): Promise<ResetStatsResponseDto> {

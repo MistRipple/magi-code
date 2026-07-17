@@ -7,6 +7,9 @@ import { aggregateUsageStatsForDisplay } from "../lib/usage-stats-aggregation";
 import { i18n } from "./i18n.svelte";
 import { reportIncident, showFeedback } from "../lib/notifications";
 import {
+  type AgentExecutionModelStatsItem,
+  type AgentExecutionStatsItem,
+  type AgentExecutionStatsPayload,
   type AgentSettingsBootstrapSnapshot,
   addAgentMcpServer,
   addAgentRepository,
@@ -718,6 +721,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     network_error: () => i18n.t("settings.status.networkError"),
     timeout: () => i18n.t("settings.status.timeout"),
     orchestrator: () => i18n.t("settings.status.orchestrator"),
+    recorded: () => i18n.t("settings.stats.recordedUsage"),
   };
 
   function getStatusClass(status: string): string {
@@ -728,6 +732,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       return "success";
     if (status === "configured" || status === "orchestrator") return "warning";
     if (status === "checking") return "checking";
+    if (status === "recorded") return "recorded";
     if (status === "disabled" || status === "not_configured") return "disabled";
     if (
       status === "error" ||
@@ -1031,26 +1036,78 @@ function createSettingsStore(props: { onClose?: () => void }) {
       totalOutputTokens: stats.totalOutputTokens,
       totalTokens: stats.totalTokens,
       resolvedModel: stats.resolvedModel,
+      resolvedModels: stats.resolvedModels,
     };
   }
 
+  function getStatsRoleModelStatus(roleKey: string): ModelStatus | undefined {
+    if (roleKey === "orchestrator" || roleKey === "auxiliary" || roleKey === "imageGeneration") {
+      return modelStatuses[roleKey];
+    }
+    const binding = registryAgents.find((item) => item.templateId === roleKey);
+    return binding ? modelStatuses[binding.engineId] : undefined;
+  }
+
   function getStatsDisplayKeys(): string[] {
-    // 仅展示真正"配置过"的模型：两个核心位永远在；worker 引擎需具备可用配置。
-    // 这样 stats tab 不会被 registry 里未填模型的引擎噪声污染。
+    // 角色视角保持稳定的产品顺序；没有历史用量的内置角色也要展示，避免列表随调用历史漂移。
+    const orderedBuiltIns = [
+      "orchestrator",
+      "auxiliary",
+      "imageGeneration",
+      "executor",
+      "explorer",
+      "reviewer",
+      "tester",
+      "architect",
+    ];
     const keys = new Set<string>();
-    keys.add("orchestrator");
-    keys.add("auxiliary");
-    for (const [workerId, config] of Object.entries(workerConfigs)) {
-      if (!workerId.trim()) continue;
-      if (!hasUsableModelConfig(config)) continue;
-      keys.add(workerId);
+    for (const key of orderedBuiltIns) {
+      keys.add(key);
+    }
+
+    // 自定义角色只在产生过真实用量后追加，且不改变内置角色的固定顺序。
+    for (const item of executionStats) {
+      if (item.role === "worker" && item.templateId.trim()) {
+        keys.add(item.templateId);
+      }
     }
     return Array.from(keys);
   }
 
-  function recomputeTokenStatsSummary() {
-    totalInputTokens = executionStats.reduce((sum, stats) => sum + toSafeTokenCount(stats.netInputTokens), 0);
-    totalOutputTokens = executionStats.reduce((sum, stats) => sum + toSafeTokenCount(stats.netOutputTokens), 0);
+  function applyExecutionStatsPayload(payload: AgentExecutionStatsPayload): void {
+    executionStats = payload.items.map((item) => ({
+      ...item,
+      totalTokens: toSafeTokenCount(item.totalTokens),
+      netInputTokens: toSafeTokenCount(item.netInputTokens),
+      netOutputTokens: toSafeTokenCount(item.netOutputTokens),
+    }));
+    executionModelStats = payload.models.map((item) => ({
+      ...item,
+      totals: {
+        ...item.totals,
+        llmCallCount: toSafeTokenCount(item.totals.llmCallCount),
+        assignmentCount: toSafeTokenCount(item.totals.assignmentCount),
+        turnCount: toSafeTokenCount(item.totals.turnCount),
+        totalTokens: toSafeTokenCount(item.totals.totalTokens),
+        netInputTokens: toSafeTokenCount(item.totals.netInputTokens),
+        netOutputTokens: toSafeTokenCount(item.totals.netOutputTokens),
+        successCount: toSafeTokenCount(item.totals.successCount),
+        failureCount: toSafeTokenCount(item.totals.failureCount),
+      },
+    }));
+    totalInputTokens = toSafeTokenCount(payload.totals.netInputTokens);
+    totalOutputTokens = toSafeTokenCount(payload.totals.netOutputTokens);
+  }
+
+  let executionStatsRequestSeq = 0;
+
+  async function loadExecutionStats(): Promise<void> {
+    const requestSeq = ++executionStatsRequestSeq;
+    const payload = await getAgentExecutionStats();
+    if (requestSeq !== executionStatsRequestSeq) {
+      return;
+    }
+    applyExecutionStatsPayload(payload);
   }
 
   function applySettingsBootstrapPayload(
@@ -1327,7 +1384,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     const displayName = engineDisplayNames[workerId];
     if (displayName) return displayName;
     const roleTemplate = roleTemplates.find((template) => template.templateId === workerId);
-    if (roleTemplate?.displayName) return roleTemplate.displayName;
+    if (roleTemplate) {
+      const key = roleTemplate.i18n?.displayNameKey || `roleTemplate.${roleTemplate.templateId}.displayName`;
+      const translated = i18n.t(key);
+      if (translated !== key) return translated;
+      if (roleTemplate.displayName) return roleTemplate.displayName;
+    }
     const engine = registryEngines.find((e) => e.id === workerId);
     if (engine?.displayName) return engine.displayName;
     return workerId.charAt(0).toUpperCase() + workerId.slice(1);
@@ -1354,12 +1416,20 @@ function createSettingsStore(props: { onClose?: () => void }) {
           probeModelStatus("worker", workerId),
         ),
       ];
+      const statsRefresh = loadExecutionStats().catch((error) => {
+        console.error("[SettingsPanel] 刷新执行统计失败:", error);
+        notifySettingsError(
+          i18n.t("settings.toast.action.fetchExecutionStats"),
+          error,
+        );
+      });
       const results = await Promise.all(probes);
       const next = { ...buildConfiguredModelStatuses() } as Record<string, any>;
       for (const result of results) {
         next[result.key] = result.value;
       }
       setModelStatus(next as ModelStatusMap);
+      await statsRefresh;
     } finally {
       isRefreshing = false;
     }
@@ -1373,8 +1443,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     showResetConfirm = false;
     try {
       await resetAgentExecutionStats();
-      executionStats = [];
-      recomputeTokenStatsSummary();
+      await loadExecutionStats();
       notifySettingsSuccess(i18n.t("settings.toast.executionStatsReset"));
     } catch (e) {
       console.error("[SettingsPanel] 重置统计失败:", e);
@@ -2359,25 +2428,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
   });
 
   // 执行统计数据
-  let executionStats = $state<
-    Array<{
-      templateId: string;
-      engineId: string;
-      bindingRevision: number;
-      role: "worker" | "orchestrator" | "auxiliary";
-      displayName: string;
-      provider?: string;
-      declaredModelSpec?: string;
-      resolvedModel?: string;
-      llmCallCount: number;
-      assignmentCount: number;
-      successCount: number;
-      failureCount: number;
-      totalTokens: number;
-      netInputTokens: number;
-      netOutputTokens: number;
-    }>
-  >([]);
+  let executionStats = $state<AgentExecutionStatsItem[]>([]);
+  let executionModelStats = $state<AgentExecutionModelStatsItem[]>([]);
 
   function applyUserRulesConfig(config: any): void {
     if (
@@ -2854,39 +2906,15 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
       // 执行统计更新（SSE 推送）
       if (dataType === "executionStatsUpdate") {
-        if (Array.isArray(payload?.items)) {
-          executionStats = payload.items.map((item: any) => ({
-            ...item,
-            totalTokens: toSafeTokenCount(item?.totalTokens),
-            netInputTokens: toSafeTokenCount(item?.netInputTokens),
-            netOutputTokens: toSafeTokenCount(item?.netOutputTokens),
-          }));
-          recomputeTokenStatsSummary();
-        } else if (payload?.totals) {
-          totalInputTokens = toSafeTokenCount(
-            payload.totals.netInputTokens,
-          );
-          totalOutputTokens = toSafeTokenCount(
-            payload.totals.netOutputTokens,
-          );
-        }
+        void loadExecutionStats().catch((error) => {
+          console.error("[SettingsPanel] 刷新执行统计失败:", error);
+        });
       }
     });
 
     // 初始化请求数据
     requestSettingsBootstrap();
-    getAgentExecutionStats()
-      .then((payload) => {
-        if (Array.isArray((payload as any)?.items)) {
-          executionStats = (payload as any).items.map((item: any) => ({
-            ...item,
-            totalTokens: toSafeTokenCount(item?.totalTokens),
-            netInputTokens: toSafeTokenCount(item?.netInputTokens),
-            netOutputTokens: toSafeTokenCount(item?.netOutputTokens),
-          }));
-          recomputeTokenStatsSummary();
-        }
-      })
+    loadExecutionStats()
       .catch((e) => {
         console.error("[SettingsPanel] 获取执行统计失败:", e);
         notifySettingsError(
@@ -2907,6 +2935,15 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     set activeTab(v) {
       activeTab = v;
+      if (v === "stats") {
+        void loadExecutionStats().catch((e) => {
+          console.error("[SettingsPanel] 刷新执行统计失败:", e);
+          notifySettingsError(
+            i18n.t("settings.toast.action.fetchExecutionStats"),
+            e,
+          );
+        });
+      }
       if (v === "tools") {
         ensureToolsBootstrapHydrated();
       }
@@ -2937,6 +2974,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     get statsDisplayKeys() {
       return getStatsDisplayKeys();
+    },
+    get executionModelStats() {
+      return executionModelStats;
+    },
+    get executionStats() {
+      return executionStats;
     },
     get userInfo() {
       return userInfo;
@@ -3153,6 +3196,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     getStatusClass,
     getStatusText,
     getWorkerStats,
+    getStatsRoleModelStatus,
     openAddEngineDialog,
     deleteEngine,
     renameEngineDisplay,

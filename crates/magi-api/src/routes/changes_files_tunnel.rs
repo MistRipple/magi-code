@@ -13,6 +13,9 @@ use std::sync::Arc;
 use magi_bridge_client::ModelInvocationRequest;
 use magi_conversation_runtime::session_turn_execution::BUSINESS_MODEL_PROVIDER;
 use magi_conversation_runtime::task_execution_dispatcher::{RoleTarget, resolve_target_for_role};
+use magi_conversation_runtime::usage_recording::{
+    AuxiliaryModelUsageContext, invoke_auxiliary_model_with_usage,
+};
 use magi_core::UtcMillis;
 use magi_snapshot::SnapshotSession;
 
@@ -1025,6 +1028,12 @@ fn fallback_udp_ip() -> String {
 struct EnhancePromptRequest {
     prompt: String,
     #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    workspace_path: Option<String>,
+    #[serde(default)]
     skill_name: Option<String>,
     #[serde(default)]
     skill_description: Option<String>,
@@ -1070,6 +1079,21 @@ async fn enhance_prompt(
     if prompt.is_empty() {
         return Err(ApiError::InvalidInput("提示词不能为空".to_string()));
     }
+    let scope = resolve_optional_session_workspace_scope(
+        &state,
+        request.session_id.as_deref(),
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+    )?;
+    let session_id = scope
+        .session_id()
+        .cloned()
+        .ok_or_else(|| ApiError::InvalidInput("sessionId 不能为空".to_string()))?;
+    let workspace_id = scope
+        .workspace_id()
+        .cloned()
+        .ok_or_else(|| ApiError::InvalidInput("workspaceId 不能为空".to_string()))?;
+    let workspace_binding = Some(workspace_id);
     let Some(client) = resolve_target_for_role(
         Some(&state.settings_store),
         None,
@@ -1095,7 +1119,24 @@ async fn enhance_prompt(
         tool_choice: None,
     };
 
-    let response = match client.invoke(invocation) {
+    let call_id = format!(
+        "auxiliary-prompt-enhance-{}-{}",
+        session_id,
+        UtcMillis::now().0
+    );
+    let response = match invoke_auxiliary_model_with_usage(
+        client,
+        invocation,
+        AuxiliaryModelUsageContext {
+            event_bus: state.event_bus.as_ref(),
+            session_store: state.session_store.as_ref(),
+            settings_store: Some(&state.settings_store),
+            session_id: &session_id,
+            workspace_id: &workspace_binding,
+            call_id,
+            phase: magi_usage_authority::UsagePhase::Integration,
+        },
+    ) {
         Ok(resp) if resp.ok => resp,
         Ok(resp) => {
             tracing::warn!(

@@ -1,8 +1,21 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { aggregateUsageStatsForDisplay } from '../src/lib/usage-stats-aggregation.ts';
 
 const settingsStoreSource = await readFile(
   new URL('../src/stores/settings-store.svelte.ts', import.meta.url),
+  'utf8',
+);
+const settingsStatsTabSource = await readFile(
+  new URL('../src/components/SettingsStatsTab.svelte', import.meta.url),
+  'utf8',
+);
+const settingsPanelSource = await readFile(
+  new URL('../src/components/SettingsPanel.svelte', import.meta.url),
+  'utf8',
+);
+const usageAggregationSource = await readFile(
+  new URL('../src/lib/usage-stats-aggregation.ts', import.meta.url),
   'utf8',
 );
 
@@ -42,5 +55,151 @@ assert.doesNotMatch(
   /appState\.settingsBootstrapSnapshot/,
   '模型表单草稿不能通过不可追踪的 getState() 返回对象读取 snapshot',
 );
+
+assert.match(
+  settingsStoreSource,
+  /executionModelStats\s*=\s*payload\.models\.map/,
+  '设置统计必须消费后端按模型身份聚合的 models 数据',
+);
+assert.match(
+  settingsStoreSource,
+  /resetAgentExecutionStats\(\);[\s\S]*?loadExecutionStats\(\)/,
+  '重置统计必须统一清理累计统计，并从后端重新读取权威结果',
+);
+assert.match(
+  settingsStoreSource,
+  /totalInputTokens\s*=\s*toSafeTokenCount\(payload\.totals\.netInputTokens\)/,
+  '统计总量必须使用权威 totals，不能把角色和模型两个维度重复相加',
+);
+assert.match(
+  settingsStoreSource,
+  /if\s*\(v\s*===\s*["']stats["']\)\s*\{[\s\S]*?loadExecutionStats\(\)/,
+  '每次进入统计页都必须重新加载累计权威统计',
+);
+assert.match(
+  settingsPanelSource,
+  /bindingUsageStats=\{store\.executionStats\}[\s\S]*?modelUsageStats=\{store\.executionModelStats\}/,
+  '设置面板必须把角色绑定和模型统计传给统计视图',
+);
+assert.doesNotMatch(settingsPanelSource, /statsScope|statsSession|sessionUsageStats/, '统计视图不能再暴露范围与会话切换');
+const statsDisplayKeysSource = settingsStoreSource.match(
+  /function getStatsDisplayKeys\(\): string\[\] \{[\s\S]*?return Array\.from\(keys\);\n  \}/,
+);
+assert.ok(statsDisplayKeysSource, '必须保留统计角色集合的唯一派生入口');
+assert.match(
+  statsDisplayKeysSource[0],
+  /const orderedBuiltIns = \[[\s\S]*?orchestrator[\s\S]*?auxiliary[\s\S]*?imageGeneration[\s\S]*?executor[\s\S]*?explorer[\s\S]*?reviewer[\s\S]*?tester[\s\S]*?architect[\s\S]*?\]/,
+  '角色统计必须包含固定顺序的主模型、辅助模型、图片模型和五类内置角色',
+);
+assert.doesNotMatch(
+  statsDisplayKeysSource[0],
+  /keys\.add\("orchestrator"\)|keys\.add\("auxiliary"\)/,
+  '内置角色必须由固定顺序集合统一管理，不能在历史循环中重复追加',
+);
+assert.doesNotMatch(
+  statsDisplayKeysSource[0],
+  /item\.role === ["']orchestrator["']|item\.role === ["']auxiliary["']/,
+  '主模型和辅助模型不能依赖历史事件循环决定是否展示',
+);
+assert.match(
+  settingsStatsTabSource,
+  /for\s*\(const model of \[\.\.\.modelUsageStats\][\s\S]*?model\.totals\.llmCallCount/,
+  '模型视角必须从后端模型身份统计构建，不得再从角色当前配置反向推导',
+);
+assert.match(
+  settingsStatsTabSource,
+  /const key = resolvedModel\.toLocaleLowerCase\(\)/,
+  '产品模型视角必须只按模型名称聚合',
+);
+assert.match(
+  settingsStatsTabSource,
+  /bucket\.identityKeys\.push\(model\.modelIdentityKey\)/,
+  '模型聚合必须保留底层连接身份，以便准确关联来源与连接状态',
+);
+assert.doesNotMatch(
+  settingsStatsTabSource,
+  /for\s*\(const atom of roleAtoms\)[\s\S]*?buckets\.set/,
+  '模型视角不能再按角色当前模型分桶，否则切换模型会丢失历史模型',
+);
+assert.match(
+  settingsStatsTabSource,
+  /type Perspective = ['"]role['"] \| ['"]engine['"]/,
+  '统计面板只保留模型和角色两个维度',
+);
+assert.doesNotMatch(
+  settingsStatsTabSource,
+  /scopeSession|scopeWorkspace|perspectiveBySession|sessionUsageStats/,
+  '统计面板不能再展示会话、工作区或轮次范围',
+);
+assert.match(
+  usageAggregationSource,
+  /resolvedModels:\s*string\[\][\s\S]*?resolvedModels,/,
+  '角色聚合必须保留实际使用过的全部模型，不能只返回最后一个模型',
+);
+assert.doesNotMatch(
+  settingsStatsTabSource,
+  /settings\.stats\.configuredModel/,
+  '角色累计统计不能用当前配置模型冒充历史使用模型',
+);
+assert.match(
+  settingsStatsTabSource,
+  /function aggregateUsageBreakdown\([\s\S]*?bucket\.totalIn \+= binding\.netInputTokens[\s\S]*?bucket\.successCount \+= binding\.successCount/s,
+  '右侧交叉明细必须从角色绑定历史用量聚合调用、Token 和成功数',
+);
+assert.match(
+  settingsStatsTabSource,
+  /const selectedBreakdown = \$derived\.by[\s\S]*?identityKeys\.has\(binding\.modelIdentityKey as string\)/s,
+  '点击模型时必须按模型身份筛选并展示角色明细',
+);
+assert.match(
+  settingsStatsTabSource,
+  /const roleKey = selectedRow\.roleAtom\?\.worker \|\| selectedRow\.key[\s\S]*?bindingRoleKey\(binding\) === roleKey/s,
+  '点击角色时必须按角色身份筛选并展示模型明细',
+);
+
+const roleStats = aggregateUsageStatsForDisplay([
+  {
+    templateId: 'reviewer',
+    engineId: 'shared-engine',
+    role: 'worker',
+    llmCallCount: 1,
+    assignmentCount: 1,
+    successCount: 1,
+    failureCount: 0,
+    totalTokens: 15,
+    netInputTokens: 10,
+    netOutputTokens: 5,
+    resolvedModel: 'model-a',
+  },
+  {
+    templateId: 'reviewer',
+    engineId: 'replacement-engine',
+    role: 'worker',
+    llmCallCount: 1,
+    assignmentCount: 1,
+    successCount: 1,
+    failureCount: 0,
+    totalTokens: 28,
+    netInputTokens: 20,
+    netOutputTokens: 8,
+    resolvedModel: 'model-b',
+  },
+  {
+    templateId: 'implementer',
+    engineId: 'shared-engine',
+    role: 'worker',
+    llmCallCount: 1,
+    assignmentCount: 1,
+    successCount: 1,
+    failureCount: 0,
+    totalTokens: 9,
+    netInputTokens: 6,
+    netOutputTokens: 3,
+    resolvedModel: 'model-a',
+  },
+], 'reviewer');
+assert.equal(roleStats?.totalExecutions, 2, '角色换引擎后必须继续聚合到同一个角色');
+assert.equal(roleStats?.totalTokens, 43, '共享引擎的其他角色不能混入当前角色统计');
+assert.deepEqual(roleStats?.resolvedModels.sort(), ['model-a', 'model-b']);
 
 console.log('settings store golden tests passed');

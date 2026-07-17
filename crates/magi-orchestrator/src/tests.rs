@@ -709,6 +709,48 @@ fn agent_run_projection_aggregates_governance_summaries_by_layer() {
 }
 
 #[test]
+fn agent_run_projection_preserves_all_completed_children_after_later_status_updates() {
+    let task_store = TaskStore::new();
+    let mission_id = MissionId::new("mission-agent-projection-history");
+    let child_ids = (1..=4)
+        .map(|index| TaskId::new(format!("task-agent-history-{index}")))
+        .collect::<Vec<_>>();
+    let root_task_id = seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "验证代理集合完整性",
+        &[
+            (child_ids[0].clone(), "任务 1", TaskStatus::Completed),
+            (child_ids[1].clone(), "任务 2", TaskStatus::Completed),
+            (child_ids[2].clone(), "任务 3", TaskStatus::Running),
+            (child_ids[3].clone(), "任务 4", TaskStatus::Pending),
+        ],
+    );
+
+    task_store
+        .update_status(&child_ids[2], TaskStatus::Completed)
+        .expect("第三个代理任务应完成");
+    task_store
+        .update_status(&child_ids[3], TaskStatus::Completed)
+        .expect("第四个代理任务应完成");
+
+    let projection = task_store
+        .build_agent_run_projection(&root_task_id)
+        .expect("应生成代理运行投影");
+    let projected_child_ids = projection
+        .tasks
+        .iter()
+        .filter(|task| task.parent_task_id.as_ref() == Some(&root_task_id))
+        .map(|task| task.task_id.clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(projected_child_ids, child_ids);
+    assert_eq!(projection.completed_tasks, child_ids);
+    assert_eq!(projection.progress_summary.completed_tasks, 4);
+    assert_eq!(projection.progress_summary.total_tasks, 5);
+}
+
+#[test]
 fn execution_runtime_can_run_dispatch_through_worker_loop() {
     let event_bus = Arc::new(InMemoryEventBus::new(32));
     let service = OrchestratorService::new(Arc::clone(&event_bus));

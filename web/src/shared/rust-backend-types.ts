@@ -990,7 +990,7 @@ export interface FetchModelsRequestDto {
   target: string;
 }
 
-export interface SessionStatsTotalsDto {
+export interface ExecutionStatsTotalsDto {
   llmCallCount: number;
   assignmentCount: number;
   turnCount: number;
@@ -1001,7 +1001,7 @@ export interface SessionStatsTotalsDto {
   failureCount: number;
 }
 
-export interface SessionStatsItemDto {
+export interface ExecutionStatsItemDto {
   templateId: string;
   engineId: string;
   bindingRevision: number;
@@ -1020,34 +1020,23 @@ export interface SessionStatsItemDto {
   netOutputTokens: number;
 }
 
-export interface SessionStatsModelDto {
+export interface ExecutionStatsModelDto {
   modelIdentityKey: string;
   provider: string;
   declaredModelSpec: string;
   resolvedModel: string;
   baseUrlFingerprint: string;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | null;
-  totals: SessionStatsTotalsDto;
+  totals: ExecutionStatsTotalsDto;
 }
 
-export interface SessionStatsSessionDto {
-  sessionId: string;
-  version: number;
-  updatedAt: number;
-  totals: SessionStatsTotalsDto;
-}
-
-export interface SessionStatsResponseDto {
-  scope: 'session' | 'workspace';
-  workspaceId: string;
-  sessionId?: string | null;
+export interface ExecutionStatsResponseDto {
   version: number;
   lastAppliedLedgerSeq?: number;
   updatedAt: number;
-  totals: SessionStatsTotalsDto;
-  items: SessionStatsItemDto[];
-  models?: SessionStatsModelDto[];
-  sessions?: SessionStatsSessionDto[];
+  totals: ExecutionStatsTotalsDto;
+  items: ExecutionStatsItemDto[];
+  models: ExecutionStatsModelDto[];
 }
 
 export interface ResetStatsResponseDto {

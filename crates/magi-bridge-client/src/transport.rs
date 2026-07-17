@@ -2,7 +2,7 @@ use crate::types::{
     BridgeErrorLayer, BridgeTransport, BridgeTransportError, BridgeTransportRequest,
     BridgeTransportResponse,
 };
-use magi_process::std_command;
+use magi_process::{spawn_managed, std_command};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -77,27 +77,23 @@ impl BridgeTransport for JsonRpcStdioTransport {
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
-        let mut child = command
-            .spawn()
-            .map_err(|error| BridgeTransportError::Transport {
+        let mut child =
+            spawn_managed(&mut command).map_err(|error| BridgeTransportError::Transport {
                 message: format!("spawn {} failed: {error}", self.config.executable),
             })?;
 
         let mut stdin = child
-            .stdin
-            .take()
+            .take_stdin()
             .ok_or_else(|| BridgeTransportError::Transport {
                 message: format!("{} stdin unavailable", self.config.executable),
             })?;
         let stdout = child
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or_else(|| BridgeTransportError::Transport {
                 message: format!("{} stdout unavailable", self.config.executable),
             })?;
         let stderr = child
-            .stderr
-            .take()
+            .take_stderr()
             .ok_or_else(|| BridgeTransportError::Transport {
                 message: format!("{} stderr unavailable", self.config.executable),
             })?;

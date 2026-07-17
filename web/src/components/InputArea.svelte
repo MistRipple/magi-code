@@ -34,6 +34,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import {
     type AccessProfile,
+    ACCESS_PROFILE_STORAGE_KEY,
     isAccessProfile,
     readStoredAccessProfile,
     writeStoredAccessProfile,
@@ -48,6 +49,7 @@
   import { turnStoreState } from '../stores/turn-store.svelte';
   import { canFetchModelList } from '../shared/model-governance';
   import {
+    resolveOrchestratorModel,
     resolveOrchestratorReasoningEffort,
     withOrchestratorReasoningEffort,
     type OrchestratorReasoningEffort,
@@ -162,6 +164,7 @@
   let pickerError = $state<string | null>(null);
   let pickerLoadedOnce = false;
   let pickerModelsConfigKey = '';
+  let pickerLoadPromise: Promise<void> | null = null;
   let draftOrchestratorSessionConfig = $state<Record<string, unknown>>({});
 
   // Git 分支切换器：仅在工作区是 git 仓库时显示。分支信息为即时查询的瞬态状态，
@@ -876,14 +879,31 @@
         addMenuOpen = false;
       }
     }
+    function handleStoredAccessProfileChange(event: StorageEvent) {
+      if (event.key !== ACCESS_PROFILE_STORAGE_KEY) return;
+      const nextProfile = readStoredAccessProfile();
+      if (nextProfile === selectedAccessProfile) return;
+      selectedAccessProfile = nextProfile;
+      void getAgentSettingsBootstrap({ scope: 'core', accessProfile: nextProfile })
+        .then((latest) => {
+          if (settingsBootstrapMatchesCurrentWorkspace(latest)) {
+            messagesState.settingsBootstrapSnapshot = latest;
+          }
+        })
+        .catch((error) => {
+          console.warn('[InputArea] 跨窗口同步访问模式后刷新设置快照失败:', error);
+        });
+    }
     window.addEventListener('magi:fillComposer', handleFillComposer as EventListener);
     window.addEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
     window.addEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
+    window.addEventListener('storage', handleStoredAccessProfileChange);
     document.addEventListener('pointerdown', handlePickerOutsidePointerDown, true);
     return () => {
       window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
       window.removeEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
       window.removeEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
+      window.removeEventListener('storage', handleStoredAccessProfileChange);
       document.removeEventListener('pointerdown', handlePickerOutsidePointerDown, true);
     };
   });
@@ -1005,6 +1025,11 @@
         return;
       }
 
+      const orchestratorSessionConfig = await resolveTurnOrchestratorSessionConfigPayload();
+      if (!orchestratorSessionConfig) {
+        return;
+      }
+
       const requestId = generateId();
       vscode.postMessage({
         type: 'executeTask',
@@ -1016,7 +1041,7 @@
         skillName: selectedSkill?.skillId ?? null,
         goalMode: selectedGoalMode,
         accessProfile: selectedAccessProfile,
-        orchestratorSessionConfig: getTurnOrchestratorSessionConfigPayload(),
+        orchestratorSessionConfig,
         followUpMode: !isDraftSession && isSending ? 'queue' : undefined,
         images: selectedImages.map((img) => ({
           name: img.name,
@@ -1272,30 +1297,41 @@
     return getOrchestratorSessionConfigSnapshot();
   }
 
-  function getTurnOrchestratorSessionConfigPayload(): Record<string, unknown> | null {
+  function buildTurnOrchestratorSessionConfigPayload(model: string): Record<string, unknown> {
     const config = getCurrentOrchestratorSessionConfigSnapshot();
-    const model = readOrchestratorModel();
-    const nextConfig = withOrchestratorReasoningEffort(
+    return withOrchestratorReasoningEffort(
       config,
       readOrchestratorReasoningEffort(),
       typeof config.model === 'string' && config.model.trim()
         ? {}
-        : (model ? { model } : {}),
+        : { model },
     );
-    return Object.keys(nextConfig).length > 0 ? nextConfig : null;
+  }
+
+  async function resolveTurnOrchestratorSessionConfigPayload(): Promise<Record<string, unknown> | null> {
+    let model = readOrchestratorModel();
+    if (!model && !pickerLoadedOnce) {
+      await loadPickerModels();
+      model = readOrchestratorModel();
+    }
+    if (!model) {
+      pickerOpen = true;
+      addToast('warning', i18n.t('input.mainModelRequired'));
+      return null;
+    }
+    const nextConfig = buildTurnOrchestratorSessionConfigPayload(model);
+    if (isDraftSession) {
+      draftOrchestratorSessionConfig = nextConfig;
+    }
+    return nextConfig;
   }
 
   function readOrchestratorModel(): string {
-    const sessionModel = getCurrentOrchestratorSessionConfigSnapshot().model;
-    if (typeof sessionModel === 'string' && sessionModel.trim()) {
-      return sessionModel.trim();
-    }
-    const config = getEffectiveOrchestratorConfigSnapshot();
-    const model = config?.model;
-    if (typeof model === 'string' && model.trim()) {
-      return model.trim();
-    }
-    return getFirstAvailablePickerModel();
+    return resolveOrchestratorModel(
+      getCurrentOrchestratorSessionConfigSnapshot(),
+      getEffectiveOrchestratorConfigSnapshot(),
+      pickerModels,
+    );
   }
 
   function readOrchestratorReasoningEffort(): ReasoningEffort {
@@ -1329,10 +1365,6 @@
       ...draftOrchestratorSessionConfig,
       ...patch,
     };
-  }
-
-  function getFirstAvailablePickerModel(): string {
-    return pickerModels.find((model) => model.trim().length > 0)?.trim() ?? '';
   }
 
   function getAuxiliaryConfigSnapshot(): Record<string, unknown> | null {
@@ -1396,34 +1428,53 @@
     }
   }
   async function loadPickerModels() {
-    const orchestratorConfig = getOrchestratorConfigSnapshot();
-    if (!orchestratorConfig) {
-      pickerError = i18n.t('input.modelPickerNotReady');
-      pickerLoading = false;
+    if (pickerLoadPromise) {
+      await pickerLoadPromise;
       return;
     }
-    const configKey = orchestratorModelListConfigKey(orchestratorConfig);
-    if (pickerLoadedOnce && pickerModelsConfigKey === configKey && pickerModels.length > 0) {
-      return;
-    }
-    pickerLoading = true;
-    pickerError = null;
+    const loadPromise = (async () => {
+      const orchestratorConfig = getOrchestratorConfigSnapshot();
+      if (!orchestratorConfig) {
+        pickerError = i18n.t('input.modelPickerNotReady');
+        pickerLoading = false;
+        return;
+      }
+      const configKey = orchestratorModelListConfigKey(orchestratorConfig);
+      if (pickerLoadedOnce && pickerModelsConfigKey === configKey && pickerModels.length > 0) {
+        return;
+      }
+      pickerLoading = true;
+      pickerError = null;
+      try {
+        const payload = await fetchAgentModelList(
+          orchestratorConfig as Record<string, unknown>,
+          'orch',
+        );
+        pickerModels = Array.isArray(payload.models) ? payload.models : [];
+        pickerModelsConfigKey = configKey;
+        pickerLoadedOnce = true;
+      } catch (error) {
+        pickerModelsConfigKey = configKey;
+        pickerLoadedOnce = true;
+        console.warn('[InputArea] 拉取主线模型列表失败:', error);
+        pickerError = i18n.t('input.modelListLoadFailed');
+      } finally {
+        pickerLoading = false;
+      }
+    })();
+    pickerLoadPromise = loadPromise;
     try {
-      const payload = await fetchAgentModelList(
-        orchestratorConfig as Record<string, unknown>,
-        'orch',
-      );
-      pickerModels = Array.isArray(payload.models) ? payload.models : [];
-      pickerModelsConfigKey = configKey;
-      pickerLoadedOnce = true;
-    } catch (error) {
-      pickerModelsConfigKey = configKey;
-      pickerLoadedOnce = true;
-      console.warn('[InputArea] 拉取主线模型列表失败:', error);
-      pickerError = i18n.t('input.modelListLoadFailed');
+      await loadPromise;
     } finally {
-      pickerLoading = false;
+      if (pickerLoadPromise === loadPromise) {
+        pickerLoadPromise = null;
+      }
     }
+  }
+  async function refreshPickerModels() {
+    if (pickerLoading) return;
+    pickerLoadedOnce = false;
+    await loadPickerModels();
   }
   async function selectPickerModel(model: string) {
     const normalizedModel = model.trim();
@@ -2246,6 +2297,16 @@
               <div class="ia-model-list-section">
                 <div class="ia-section-header-row">
                   <div class="ia-picker-header">{i18n.t('input.mainModelPicker.header')}</div>
+                  <button
+                    type="button"
+                    class="ia-picker-refresh"
+                    onclick={() => void refreshPickerModels()}
+                    disabled={pickerLoading || pickerSavingModel !== null || pickerSavingReasoning !== null}
+                    title={i18n.t('input.mainModelPicker.refresh')}
+                    aria-label={i18n.t('input.mainModelPicker.refresh')}
+                  >
+                    <Icon name="refresh" size={13} class={pickerLoading ? 'spinning' : ''} />
+                  </button>
                 </div>
                 {#if pickerLoading}
                   <div class="ia-picker-status">{i18n.t('input.mainModelPicker.loading')}</div>
@@ -2990,6 +3051,27 @@
   .ia-section-header-row .ia-picker-header {
     margin-bottom: 0;
     border-bottom: none;
+  }
+  .ia-picker-refresh {
+    display: inline-grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-full);
+    color: var(--foreground-muted);
+    background: transparent;
+    cursor: pointer;
+    transition: color var(--transition-fast), background var(--transition-fast);
+  }
+  .ia-picker-refresh:hover:not(:disabled) {
+    color: var(--foreground);
+    background: var(--surface-2);
+  }
+  .ia-picker-refresh:disabled {
+    cursor: wait;
+    opacity: 0.55;
   }
   .ia-picker-popover.ia-access-popover {
     box-sizing: border-box;

@@ -930,6 +930,17 @@ impl DaemonRuntime {
         &self,
         reason: impl Into<String>,
     ) -> Result<(), DaemonError> {
+        let cancelled_process_count = ToolRegistry::cancel_all_active_processes();
+        if cancelled_process_count > 0 {
+            info!(cancelled_process_count, "daemon 关闭前已终止全部工具进程树");
+        }
+        let cancelled_managed_process_count = magi_process::terminate_all_managed_processes();
+        if cancelled_managed_process_count > 0 {
+            info!(
+                cancelled_managed_process_count,
+                "daemon 关闭前已终止全部受管子进程树"
+            );
+        }
         self.runtime_maintenance.request_graceful_shutdown(reason);
         self.runtime_maintenance.run_once()?;
         Ok(())

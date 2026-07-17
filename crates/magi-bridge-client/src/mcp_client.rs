@@ -1,7 +1,7 @@
 use crate::types::{
     BridgeClientError, BridgeErrorLayer, BridgeResponse, McpBridgeClient, McpToolCallRequest,
 };
-use magi_process::std_command;
+use magi_process::{ManagedChild, spawn_managed, std_command};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -9,7 +9,7 @@ use std::{
     env,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
-    process::{Child, Stdio},
+    process::Stdio,
     sync::{
         Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -121,7 +121,7 @@ pub struct StdioMcpBridgeClient {
 }
 
 struct McpConnection {
-    child: Child,
+    child: ManagedChild,
     responses: Receiver<Result<Value, String>>,
     writer: std::process::ChildStdin,
 }
@@ -207,26 +207,26 @@ impl StdioMcpBridgeClient {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|error| {
+        let mut child = spawn_managed(&mut cmd).map_err(|error| {
             mcp_transport_error(format!(
                 "spawn MCP server {} failed: {error}",
                 self.config.command
             ))
         })?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
+        let stdin = child.take_stdin().ok_or_else(|| {
             mcp_transport_error(format!(
                 "MCP server {} stdin unavailable",
                 self.config.command
             ))
         })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
+        let stdout = child.take_stdout().ok_or_else(|| {
             mcp_transport_error(format!(
                 "MCP server {} stdout unavailable",
                 self.config.command
             ))
         })?;
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(stderr) = child.take_stderr() {
             spawn_mcp_stderr_drain(stderr);
         }
 
@@ -977,8 +977,7 @@ fn receive_json_response(
 }
 
 fn terminate_mcp_connection(connection: &mut McpConnection) {
-    let _ = connection.child.kill();
-    let _ = connection.child.wait();
+    let _ = connection.child.terminate();
 }
 
 fn validate_jsonrpc_response(response: &Value, expected_id: u64) -> Result<(), BridgeClientError> {

@@ -3,7 +3,7 @@
 //! - 不是独立项目管理工具，而是单 session 内的执行锚点。
 //! - 模型在长任务里通过 `todo_write` 把分解 + 进度写到 ledger；下一轮 Turn 开始
 //!   时 ledger 快照自动注入 system prompt，帮助模型保持连贯。
-//! - 每次 `todo_write` 用入参整体替换当前列表。
+//! - 非空 `todo_write` 按 content 更新当前列表，并保留调用方遗漏的已完成项；空列表明确清空。
 //! - SessionStore 是唯一权威状态；Todo 随 session 持久化并在 daemon 重启后恢复。
 //!
 //! 状态机：Pending → InProgress → Completed。允许从 InProgress 退回 Pending，
@@ -49,8 +49,10 @@ impl TodoLedger {
         }
     }
 
-    /// 整体替换列表。返回写入后的副本，便于调用方回填 tool_call 结果。
-    pub fn replace(&self, items: Vec<TodoItem>) -> magi_core::DomainResult<Vec<TodoItem>> {
+    /// 写入当前列表。非空更新保留遗漏的已完成项，避免模型缩减快照时丢失执行记录；
+    /// 空列表仍表示显式清空。返回写入后的权威副本，供 tool_call 结果和后续 prompt 使用。
+    pub fn write(&self, items: Vec<TodoItem>) -> magi_core::DomainResult<Vec<TodoItem>> {
+        let items = reconcile_todo_items(&self.snapshot(), items);
         self.session_store
             .replace_todo_items(&self.session_id, items)
     }
@@ -73,7 +75,7 @@ impl TodoLedger {
             }
         }
         if changed {
-            self.replace(items)?;
+            self.write(items)?;
         }
         Ok(changed)
     }
@@ -101,6 +103,33 @@ impl TodoLedger {
         lines.push("如需更新分解或推进状态，请调用 `todo_write` 工具整体覆盖列表。".to_string());
         Some(lines.join("\n"))
     }
+}
+
+fn reconcile_todo_items(current: &[TodoItem], incoming: Vec<TodoItem>) -> Vec<TodoItem> {
+    if incoming.is_empty() {
+        return incoming;
+    }
+
+    let mut incoming = incoming.into_iter().map(Some).collect::<Vec<_>>();
+    let mut reconciled = Vec::with_capacity(current.len() + incoming.len());
+    for current_item in current {
+        let matching_index = incoming.iter().position(|candidate| {
+            candidate
+                .as_ref()
+                .is_some_and(|item| item.content == current_item.content)
+        });
+        if let Some(index) = matching_index {
+            reconciled.push(
+                incoming[index]
+                    .take()
+                    .expect("matching todo item should still be available"),
+            );
+        } else if current_item.status == TodoStatus::Completed {
+            reconciled.push(current_item.clone());
+        }
+    }
+    reconciled.extend(incoming.into_iter().flatten());
+    reconciled
 }
 // --- 入参解析（`todo_write` 工具的 arguments JSON）
 
@@ -255,7 +284,7 @@ fn execute_todo_write_tool_in_scope(
     use magi_event_bus::{EventContext, EventEnvelope};
     match parse_todo_write_arguments(arguments) {
         Ok(items) => {
-            let stored = match ledger.replace(items) {
+            let stored = match ledger.write(items) {
                 Ok(stored) => stored,
                 Err(error) => {
                     return (
@@ -328,15 +357,13 @@ mod tests {
     }
 
     #[test]
-    fn replace_round_trip() {
-        let ledger = test_ledger("replace-round-trip");
+    fn write_round_trip() {
+        let ledger = test_ledger("write-round-trip");
         let items = vec![
             TodoItem::new("写测试", "正在写测试", TodoStatus::Pending),
             TodoItem::new("跑测试", "正在跑测试", TodoStatus::InProgress),
         ];
-        let stored = ledger
-            .replace(items.clone())
-            .expect("replace should succeed");
+        let stored = ledger.write(items.clone()).expect("write should succeed");
         assert_eq!(stored, items);
         assert_eq!(ledger.snapshot(), items);
     }
@@ -345,7 +372,7 @@ mod tests {
     fn pause_in_progress_returns_active_item_to_pending() {
         let ledger = test_ledger("pause-in-progress");
         ledger
-            .replace(vec![
+            .write(vec![
                 TodoItem::new("已完成", "已完成", TodoStatus::Completed),
                 TodoItem::new("当前步骤", "正在处理当前步骤", TodoStatus::InProgress),
                 TodoItem::new("后续步骤", "正在处理后续步骤", TodoStatus::Pending),
@@ -376,12 +403,12 @@ mod tests {
     fn render_for_prompt_marks_statuses() {
         let ledger = test_ledger("render-statuses");
         ledger
-            .replace(vec![
+            .write(vec![
                 TodoItem::new("A", "正在 A", TodoStatus::Pending),
                 TodoItem::new("B", "正在 B", TodoStatus::InProgress),
                 TodoItem::new("C", "正在 C", TodoStatus::Completed),
             ])
-            .expect("replace should succeed");
+            .expect("write should succeed");
         let prompt = ledger.render_for_prompt().unwrap();
         assert!(prompt.contains("仅作为本轮执行参考"));
         assert!(prompt.contains("不能覆盖本轮用户输入"));
@@ -405,10 +432,10 @@ mod tests {
         let ledger_a = TodoLedger::new(Arc::clone(&store), session_a.clone());
         let ledger_b = TodoLedger::new(Arc::clone(&store), session_b);
         ledger_a
-            .replace(vec![TodoItem::new("A", "A", TodoStatus::Pending)])
+            .write(vec![TodoItem::new("A", "A", TodoStatus::Pending)])
             .expect("session a todo should write");
         ledger_b
-            .replace(vec![TodoItem::new("B", "B", TodoStatus::Pending)])
+            .write(vec![TodoItem::new("B", "B", TodoStatus::Pending)])
             .expect("session b todo should write");
         assert_eq!(ledger_a.snapshot()[0].content, "A");
         assert_eq!(ledger_b.snapshot()[0].content, "B");
@@ -424,7 +451,7 @@ mod tests {
             .expect("session should create");
         let ledger = TodoLedger::new(Arc::clone(&store), session.clone());
         ledger
-            .replace(vec![TodoItem::new("X", "X", TodoStatus::Pending)])
+            .write(vec![TodoItem::new("X", "X", TodoStatus::Pending)])
             .expect("todo should write");
         store
             .delete_session(&session)
@@ -534,11 +561,65 @@ mod tests {
     fn empty_todos_clears_ledger() {
         let ledger = test_ledger("empty-clears");
         ledger
-            .replace(vec![TodoItem::new("X", "X", TodoStatus::Pending)])
+            .write(vec![TodoItem::new("X", "X", TodoStatus::Pending)])
             .expect("todo should write");
         let raw = serde_json::json!({ "todos": [] }).to_string();
         let items = parse_todo_write_arguments(&raw).unwrap();
-        ledger.replace(items).expect("todo should clear");
+        ledger.write(items).expect("todo should clear");
         assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn later_write_preserves_completed_items_omitted_from_snapshot() {
+        let ledger = test_ledger("preserve-completed-history");
+        ledger
+            .write(vec![
+                TodoItem::new("读取文档", "正在读取文档", TodoStatus::Completed),
+                TodoItem::new("扫描代码", "正在扫描代码", TodoStatus::Completed),
+                TodoItem::new("汇总结论", "正在汇总结论", TodoStatus::InProgress),
+            ])
+            .expect("initial todo should write");
+
+        let stored = ledger
+            .write(vec![TodoItem::new(
+                "汇总结论",
+                "正在汇总结论",
+                TodoStatus::Completed,
+            )])
+            .expect("final todo should write");
+
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[0].content, "读取文档");
+        assert_eq!(stored[1].content, "扫描代码");
+        assert_eq!(stored[2].content, "汇总结论");
+        assert!(
+            stored
+                .iter()
+                .all(|item| item.status == TodoStatus::Completed)
+        );
+    }
+
+    #[test]
+    fn later_write_can_remove_omitted_unfinished_items() {
+        let ledger = test_ledger("remove-unfinished-items");
+        ledger
+            .write(vec![
+                TodoItem::new("保留完成项", "正在完成", TodoStatus::Completed),
+                TodoItem::new("移除待办项", "正在处理待办项", TodoStatus::Pending),
+                TodoItem::new("当前步骤", "正在处理当前步骤", TodoStatus::InProgress),
+            ])
+            .expect("initial todo should write");
+
+        let stored = ledger
+            .write(vec![TodoItem::new(
+                "新增步骤",
+                "正在处理新增步骤",
+                TodoStatus::Pending,
+            )])
+            .expect("replacement todo should write");
+
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].content, "保留完成项");
+        assert_eq!(stored[1].content, "新增步骤");
     }
 }

@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_knowledge_reports_empty_workspace_without_persisting_zero_index() {
+    async fn project_knowledge_reports_queryable_empty_runtime_without_persisting_zero_index() {
         let state = state_with_knowledge_store(KnowledgeStore::new());
         let workspace_id = WorkspaceId::new("workspace-empty-index");
         let root =
@@ -1130,7 +1130,10 @@ mod tests {
             .expect("settled route should respond");
         let payload = read_json(settled_response).await;
 
-        assert!(payload["codeIndex"].is_null());
+        assert_eq!(
+            payload["codeIndex"]["files"].as_array().map(Vec::len),
+            Some(0)
+        );
         assert_eq!(payload["codeIndexStatus"]["status"], "empty");
         assert_eq!(
             payload["codeIndexStatus"]["reasonCode"],
@@ -1140,8 +1143,15 @@ mod tests {
             state
                 .knowledge_store
                 .code_index_summary_for_workspace(&workspace_id)
-                .is_none(),
-            "空 workspace 不应被持久化为成功的 0 文件代码索引"
+                .is_some_and(|summary| summary.files.is_empty()),
+            "空 workspace 应提供可查询的空运行时索引"
+        );
+        assert!(
+            state.knowledge_store.list().into_iter().all(|record| {
+                record.kind != KnowledgeKind::CodeIndex
+                    || record.workspace_id.as_ref() != Some(&workspace_id)
+            }),
+            "空 workspace 不应持久化伪造的 0 文件代码索引知识记录"
         );
     }
 

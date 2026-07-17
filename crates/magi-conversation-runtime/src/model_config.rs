@@ -21,6 +21,8 @@ use magi_settings_store::DEPRECATED_MODEL_CONFIG_FIELDS;
 use magi_usage_authority::{LlmConfig, ReasoningEffort, UrlMode};
 use serde_json::Value;
 
+pub const DEFAULT_ORCHESTRATOR_REASONING_EFFORT: &str = "medium";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelUrlMode {
     Standard,
@@ -322,8 +324,28 @@ pub fn resolve_orchestrator_model_config(
         let override_section = settings_store.get_session_section(session_id, "orchestrator");
         merge_orchestrator_session_override(&mut config, &override_section);
     }
+    ensure_orchestrator_reasoning_effort(&mut config);
     NormalizedModelConfig::from_settings_value(&config)
         .map_err(|error| format!("orchestrator 模型配置无效：{error}"))
+}
+
+pub fn ensure_orchestrator_reasoning_effort(config: &mut serde_json::Value) {
+    if !config.is_object() {
+        *config = serde_json::json!({});
+    }
+    let serde_json::Value::Object(config) = config else {
+        return;
+    };
+    let is_valid = config
+        .get("reasoningEffort")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| matches!(value.trim(), "low" | "medium" | "high" | "xhigh"));
+    if !is_valid {
+        config.insert(
+            "reasoningEffort".to_string(),
+            serde_json::Value::String(DEFAULT_ORCHESTRATOR_REASONING_EFFORT.to_string()),
+        );
+    }
 }
 
 pub fn strip_orchestrator_session_owned_fields(base: &mut serde_json::Value) {
@@ -336,8 +358,8 @@ pub fn strip_orchestrator_session_owned_fields(base: &mut serde_json::Value) {
 /// 把会话级覆盖（仅 `model` / `reasoningEffort`）叠加到全局 orchestrator base 上。
 ///
 /// 设计约束：会话覆盖**只能**改主模型与思考强度，绝不携带 baseUrl / apiKey，
-/// 避免会话级配置悄悄替换连接凭据。`reasoningEffort` 为 JSON `null` 时表示
-/// 「默认·不指定」，会清空 base 上的思考强度。
+/// 避免会话级配置悄悄替换连接凭据。`reasoningEffort` 为 JSON `null` 时恢复为
+/// 产品默认的中等推理强度，运行期不允许出现空强度。
 pub fn merge_orchestrator_session_override(
     base: &mut serde_json::Value,
     override_section: &serde_json::Value,
@@ -372,7 +394,10 @@ pub fn merge_orchestrator_session_override(
                 );
             }
             Some(serde_json::Value::Null) => {
-                base_map.remove("reasoningEffort");
+                base_map.insert(
+                    "reasoningEffort".to_string(),
+                    serde_json::Value::String(DEFAULT_ORCHESTRATOR_REASONING_EFFORT.to_string()),
+                );
             }
             _ => {}
         }

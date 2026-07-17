@@ -552,21 +552,81 @@ await withGoldenViteServer(async (server) => {
   }
 
   binding.setAgentBindingContext({
+    workspaceId: 'workspace-stats-golden',
+    workspacePath: '/tmp/workspace-stats-golden',
+    sessionId: 'session-stats-golden',
+  });
+  const statsFetchBefore = globalThis.fetch;
+  const statsRequestUrls = [];
+  globalThis.fetch = async (input) => {
+    const url = typeof input === 'string' ? input : input.url;
+    statsRequestUrls.push(url);
+    return new Response(JSON.stringify({
+      version: 1,
+      updatedAt: 1,
+      totals: {
+        llmCallCount: 0,
+        assignmentCount: 0,
+        turnCount: 0,
+        totalTokens: 0,
+        netInputTokens: 0,
+        netOutputTokens: 0,
+        successCount: 0,
+        failureCount: 0,
+      },
+      items: [],
+      models: [],
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  try {
+    await agentApi.getAgentExecutionStats();
+    const statsUrl = new URL(statsRequestUrls[0]);
+    assert.equal(statsUrl.pathname, '/api/settings/stats');
+    assert.equal(statsUrl.searchParams.has('sessionId'), false);
+  } finally {
+    if (statsFetchBefore === undefined) {
+      delete globalThis.fetch;
+    } else {
+      globalThis.fetch = statsFetchBefore;
+    }
+  }
+
+  binding.setAgentBindingContext({
     workspaceId: '',
     workspacePath: '',
     sessionId: '',
   });
   const fetchBeforeEmptyStats = globalThis.fetch;
   let emptyStatsRequestCount = 0;
-  globalThis.fetch = async () => {
+  globalThis.fetch = async (input) => {
     emptyStatsRequestCount += 1;
-    throw new Error('empty workspace stats must not reach transport');
+    const url = typeof input === 'string' ? input : input.url;
+    assert.equal(new URL(url).pathname, '/api/settings/stats');
+    return new Response(JSON.stringify({
+      version: 0,
+      updatedAt: 0,
+      totals: {
+        llmCallCount: 0,
+        assignmentCount: 0,
+        turnCount: 0,
+        totalTokens: 0,
+        netInputTokens: 0,
+        netOutputTokens: 0,
+        successCount: 0,
+        failureCount: 0,
+      },
+      items: [],
+      models: [],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
   };
   try {
     const emptyStats = await agentApi.getAgentExecutionStats();
-    assert.equal(emptyStatsRequestCount, 0);
-    assert.equal(emptyStats.workspaceId, '');
+    assert.equal(emptyStatsRequestCount, 1);
     assert.deepEqual(emptyStats.items, []);
+    assert.deepEqual(emptyStats.models, []);
     assert.deepEqual(emptyStats.totals, {
       llmCallCount: 0,
       assignmentCount: 0,

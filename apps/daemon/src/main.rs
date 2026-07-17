@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_target(false)
         .compact()
         .init();
+    magi_process::initialize_user_process_environment();
 
     let host = read_env("MAGI_HOST").unwrap_or_else(|| DEFAULT_HOST.to_string());
     let port = read_port()?;
@@ -84,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = daemon.start().await?;
     runtime_state_manager.write_runtime_state(pid, Some(&host), handle.bound_addr().port());
     runtime_state_manager.write_pid(pid);
-    let result = handle.wait().await;
+    let result = handle.wait_for_shutdown_signal().await;
 
     runtime_state_manager.remove_runtime_state();
     runtime_state_manager.remove_pid();

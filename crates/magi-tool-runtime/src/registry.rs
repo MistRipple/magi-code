@@ -149,6 +149,7 @@ impl ToolRegistry {
     }
 
     pub fn register_default_builtins(&mut self) {
+        magi_process::initialize_user_process_environment();
         for name in BuiltinToolName::ALL {
             self.register_builtin(Arc::new(NormalizedBuiltinTool::new(
                 name,
@@ -238,8 +239,12 @@ impl ToolRegistry {
         self.execute_with_policy_for_surface(input, context, policy, false)
     }
 
-    pub fn cancel_active_shell_execs(&self, query: &ToolExecutionContextQuery) -> usize {
-        builtin::cancel_active_shell_execs(query)
+    pub fn cancel_active_processes(&self, query: &ToolExecutionContextQuery) -> usize {
+        builtin::cancel_active_processes(query)
+    }
+
+    pub fn cancel_all_active_processes() -> usize {
+        builtin::cancel_all_active_processes()
     }
 
     #[cfg(test)]

@@ -66,9 +66,19 @@ globalThis.fetch = async (url) => {
           status: 'completed',
         },
         {
+          content: '检查代理面板',
+          activeForm: '正在检查代理面板',
+          status: 'completed',
+        },
+        {
+          content: '检查变更面板',
+          activeForm: '正在检查变更面板',
+          status: 'completed',
+        },
+        {
           content: '验证任务清单抽屉',
           activeForm: '正在验证任务清单抽屉',
-          status: 'in_progress',
+          status: 'completed',
         },
       ],
     });
@@ -91,9 +101,16 @@ await withGoldenViteServer(async (server) => {
   assert.equal(state.error, null);
   assert.equal(state.response?.goal?.status, 'complete');
   assert.equal(state.response?.goal?.objective, '验证 Goal store 刷新');
-  assert.equal(state.response?.todoItems?.length, 2);
-  assert.equal(state.response?.todoItems?.[0]?.status, 'completed');
-  assert.equal(state.response?.todoItems?.[1]?.activeForm, '正在验证任务清单抽屉');
+  assert.equal(state.response?.todoItems?.length, 4);
+  assert.deepEqual(
+    state.response?.todoItems?.map((item) => item.content),
+    ['梳理目标模式', '检查代理面板', '检查变更面板', '验证任务清单抽屉'],
+    'goal store must expose the complete authoritative todo collection',
+  );
+  assert.ok(
+    state.response?.todoItems?.every((item) => item.status === 'completed'),
+    'completed todo history must remain visible as a complete collection',
+  );
 
   const emptyWorkspaceState = goalStore.getGoalState(SESSION_ID, 'workspace-goal-store-other');
   assert.equal(

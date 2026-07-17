@@ -965,7 +965,7 @@ fn stream_session_turn_round(
         );
     };
     let call_id = format!("session-turn-{round}-{}", UtcMillis::now().0);
-    let response = match client.invoke_streaming_with_retry_events(
+    let response = match client.invoke_streaming_with_cancellation(
         ModelInvocationRequest {
             provider: BUSINESS_MODEL_PROVIDER.to_string(),
             prompt: prompt.to_string(),
@@ -975,9 +975,21 @@ fn stream_session_turn_round(
         },
         &on_delta,
         &on_retry,
+        &|| !request_turn_is_writable(session_store, request),
     ) {
         Ok(response) => response,
         Err(error) => {
+            if !request_turn_is_writable(session_store, request) {
+                return Ok(SessionTurnRoundOutput {
+                    final_content: None,
+                    final_item_id: None,
+                    timeline_entry_id: None,
+                    encountered_tool_calls: false,
+                    tool_call_names: Vec::new(),
+                    activated_skill_id: None,
+                    interrupted: true,
+                });
+            }
             let raw_error = error.to_string();
             let classification = classify_model_invocation_error(&raw_error);
             publish_model_usage_record(
@@ -1372,6 +1384,42 @@ mod tests {
 
     struct RetryEventModelBridgeClient;
 
+    struct CancellingModelBridgeClient {
+        store: Arc<SessionStore>,
+        session_id: SessionId,
+    }
+
+    impl ModelBridgeClient for CancellingModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            panic!("session turn should use cancellable streaming invocation")
+        }
+
+        fn invoke_streaming(
+            &self,
+            _request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            panic!("session turn should use cancellable streaming invocation")
+        }
+
+        fn invoke_streaming_with_cancellation(
+            &self,
+            _request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+            _on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+            is_cancelled: &dyn Fn() -> bool,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            self.store
+                .cancel_current_turn(&self.session_id)
+                .expect("turn cancellation should succeed");
+            assert!(is_cancelled());
+            Err(magi_bridge_client::model_invocation_cancelled_error())
+        }
+    }
+
     impl ModelBridgeClient for RetryEventModelBridgeClient {
         fn invoke(
             &self,
@@ -1446,6 +1494,88 @@ mod tests {
             });
             self.invoke(request)
         }
+    }
+
+    #[test]
+    fn session_turn_cancellation_interrupts_model_invocation() {
+        let session_id = SessionId::new("session-model-cancellation");
+        let turn_id = "turn-model-cancellation".to_string();
+        let store = Arc::new(SessionStore::new());
+        store
+            .create_session(session_id.clone(), "model cancellation")
+            .expect("session should be creatable");
+        let (_mission_id, orchestrator_thread_id) =
+            store.ensure_session_mission(&session_id, ts(900), || {
+                magi_core::MissionId::new("mission-model-cancellation")
+            });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: turn_id.clone(),
+                    turn_seq: 1,
+                    accepted_at: ts(1_000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("停止测试".to_string()),
+                    items: vec![session_turn_item(
+                        "user_message",
+                        "completed",
+                        None,
+                        Some("停止测试".to_string()),
+                        Some("user-model-cancellation".to_string()),
+                        orchestrator_thread_id,
+                    )],
+                },
+            )
+            .expect("current turn should be stored");
+        let registry = ConversationRegistry::new();
+        registry
+            .begin_session_turn_input(session_id.clone(), turn_id.clone())
+            .expect("turn input should begin");
+        let client = CancellingModelBridgeClient {
+            store: store.clone(),
+            session_id: session_id.clone(),
+        };
+        let todo_ledger = magi_todo_ledger::TodoLedger::new(store.clone(), session_id.clone());
+        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
+            client: &client,
+            event_bus: &InMemoryEventBus::new(16),
+            session_store: store.as_ref(),
+            conversation_registry: &registry,
+            todo_ledger: &todo_ledger,
+            settings_store: None,
+            safety_gate: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            snapshot_manager: None,
+            request: SessionTurnExecutionRequest {
+                session_id,
+                turn_id,
+                workspace_id: None,
+                prompt: "停止测试".to_string(),
+                images: Vec::new(),
+                context_references: Vec::new(),
+                use_tools: false,
+                access_profile: AccessProfile::Restricted,
+                skill_name: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+                forced_tool_name: None,
+                required_tool_chain: Vec::new(),
+                goal_turn_mode: SessionGoalTurnMode::None,
+                workspace_root_path: None,
+            },
+            prompt: "停止测试".to_string(),
+            knowledge_context_prompt: None,
+            tools: None,
+            persist_session_state: None,
+        })
+        .expect("cancelled model invocation should resolve as interrupted turn");
+        assert!(output.interrupted);
     }
 
     struct FailingModelBridgeClient {
@@ -1806,7 +1936,7 @@ mod tests {
             .expect("current turn should be stored");
         let todo_ledger = magi_todo_ledger::TodoLedger::new(store.clone(), session_id.clone());
         todo_ledger
-            .replace(vec![magi_core::TodoItem::new(
+            .write(vec![magi_core::TodoItem::new(
                 "继续处理当前步骤",
                 "正在处理当前步骤",
                 magi_core::TodoStatus::InProgress,
@@ -1914,7 +2044,7 @@ mod tests {
         let event_bus = InMemoryEventBus::new(16);
         let todo_ledger = magi_todo_ledger::TodoLedger::new(store.clone(), session_id.clone());
         todo_ledger
-            .replace(vec![magi_core::TodoItem::new(
+            .write(vec![magi_core::TodoItem::new(
                 "继续处理当前步骤",
                 "正在处理当前步骤",
                 magi_core::TodoStatus::InProgress,

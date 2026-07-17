@@ -6,6 +6,7 @@ import { withGoldenViteServer } from './golden-vite.mjs';
 const appSource = fs.readFileSync(path.resolve('src/App.svelte'), 'utf8');
 const promptSource = fs.readFileSync(path.resolve('src/components/DesktopUpdatePrompt.svelte'), 'utf8');
 const settingsSource = fs.readFileSync(path.resolve('src/components/SettingsPanel.svelte'), 'utf8');
+const inputSource = fs.readFileSync(path.resolve('src/components/InputArea.svelte'), 'utf8');
 assert.match(appSource, /DesktopUpdatePrompt/, 'desktop startup must mount the update prompt');
 assert.match(
   settingsSource,
@@ -42,6 +43,12 @@ assert.match(
   /promptState === 'error'[\s\S]*?onclick=\{\(\) => void installUpdate\(\)\}/,
   'installation failures must retry installation instead of repeating update discovery',
 );
+assert.match(settingsSource, /desktop-update-progress/, 'settings must render an update progress bar');
+assert.match(promptSource, /desktop-update-progress/, 'startup update prompt must render an update progress bar');
+assert.match(settingsSource, /aria-valuenow/, 'settings progress must expose accessible numeric progress');
+assert.match(promptSource, /desktop-update-progress__fill--indeterminate/, 'startup prompt must support unknown content length');
+assert.match(inputSource, /refreshPickerModels/, 'main model picker must expose an explicit refresh action');
+assert.match(inputSource, /input\.mainModelPicker\.refresh/, 'refresh action must have a localized accessible label');
 
 await withGoldenViteServer(async (server) => {
   const updater = await server.ssrLoadModule('/src/lib/desktop-updater.ts');

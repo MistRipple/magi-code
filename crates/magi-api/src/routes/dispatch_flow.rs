@@ -151,6 +151,7 @@ async fn execute_dispatch_submission(
             &session_id,
             config,
         )?;
+        super::settings::require_orchestrator_session_model(state, &session_id)?;
     }
     state
         .session_store
@@ -273,7 +274,7 @@ fn fail_accepted_task_submission(state: &ApiState, accepted: &DispatchSubmission
     if let Some(task_store) = state.task_store()
         && task_store.get_task(&accepted.root_task_id).is_some()
     {
-        let _ = task_store.set_output_refs(
+        task_store.set_output_refs(
             &accepted.root_task_id,
             vec!["任务执行启动失败，可直接重试。".to_string()],
         );

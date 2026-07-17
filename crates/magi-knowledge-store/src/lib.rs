@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use local_search_engine::{LocalSearchEngine, SearchEngineConfig, SearchOptions, SearchResult};
 pub use local_search_engine::{SearchEngineStats, WorkspaceCodeIndexHealth};
@@ -37,6 +38,15 @@ pub use source_model::{
 pub use state::KnowledgeState;
 
 const PROJECT_CODE_INDEX_ID: &str = "project-code-index";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkspaceIndexEnsureResult {
+    Ready,
+    Failed {
+        reason_code: Option<code_scanner::CodeIndexScanReasonCode>,
+    },
+    TimedOut,
+}
 
 pub fn business_text_similarity(left: &str, right: &str) -> f32 {
     let left_terms = normalization::tokenize_business_text(left)
@@ -222,7 +232,19 @@ impl KnowledgeStore {
 
         let outcome = code_scanner::scan_workspace(&root);
         let Some(summary) = outcome.summary.as_ref() else {
-            self.delete_code_index_for_workspace(workspace_id);
+            let _ = self.delete(&workspace_project_code_index_id(workspace_id));
+            self.clear_workspace_index_runtime(workspace_id);
+            if outcome.status == code_scanner::CodeIndexScanStatus::Empty {
+                index_persistence::IndexPersistence::new(&root.to_string_lossy()).invalidate();
+                let mut engine =
+                    LocalSearchEngine::new(&root.to_string_lossy(), SearchEngineConfig::default());
+                engine.build_index(&[], UtcMillis::now().0);
+                self.search_engines
+                    .write()
+                    .expect("knowledge store search engines write lock poisoned")
+                    .insert(workspace_id.clone(), Arc::new(RwLock::new(engine)));
+                self.spawn_watcher(workspace_id, &root);
+            }
             self.record_workspace_index_outcome(workspace_id, outcome.clone());
             return outcome;
         };
@@ -466,6 +488,68 @@ impl KnowledgeStore {
             .map(|engine| {
                 let engine = engine.read().expect("search engine read lock poisoned");
                 engine.is_ready() && engine.get_stats().total_documents > 0
+            })
+            .unwrap_or(false)
+    }
+
+    /// 保证指定工作区具有可查询的运行时索引。
+    ///
+    /// API 注册和 daemon 恢复可以继续异步构建；真正调用语义检索时，由工具入口通过
+    /// 此方法等待正在进行的构建，或为尚未激活的恢复工作区按需完成一次构建。
+    /// 空工作区也会保留一个可查询的空索引和 watcher，不再被误报为“引擎未就绪”。
+    pub fn ensure_workspace_index_available(
+        &self,
+        workspace_id: &WorkspaceId,
+        workspace_root: &Path,
+        timeout: Duration,
+    ) -> WorkspaceIndexEnsureResult {
+        if self.workspace_index_available(workspace_id) {
+            return WorkspaceIndexEnsureResult::Ready;
+        }
+
+        if self.begin_workspace_index_build(workspace_id) {
+            let outcome = self.build_workspace_index(workspace_id, workspace_root);
+            let cancelled = self.finish_workspace_index_build(workspace_id);
+            if !cancelled && self.workspace_index_available(workspace_id) {
+                return WorkspaceIndexEnsureResult::Ready;
+            }
+            return WorkspaceIndexEnsureResult::Failed {
+                reason_code: outcome.reason_code,
+            };
+        }
+
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.workspace_index_available(workspace_id) {
+                return WorkspaceIndexEnsureResult::Ready;
+            }
+            if !self.workspace_index_building(workspace_id) {
+                return match self.workspace_index_outcome(workspace_id) {
+                    Some(outcome)
+                        if outcome.status == code_scanner::CodeIndexScanStatus::Failed =>
+                    {
+                        WorkspaceIndexEnsureResult::Failed {
+                            reason_code: outcome.reason_code,
+                        }
+                    }
+                    _ => WorkspaceIndexEnsureResult::Failed { reason_code: None },
+                };
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        WorkspaceIndexEnsureResult::TimedOut
+    }
+
+    pub fn workspace_index_available(&self, workspace_id: &WorkspaceId) -> bool {
+        self.search_engines
+            .read()
+            .expect("knowledge store search engines read lock poisoned")
+            .get(workspace_id)
+            .map(|engine| {
+                engine
+                    .read()
+                    .expect("search engine read lock poisoned")
+                    .is_ready()
             })
             .unwrap_or(false)
     }

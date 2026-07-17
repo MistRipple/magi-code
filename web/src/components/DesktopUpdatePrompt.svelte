@@ -86,6 +86,20 @@
             ? i18n.t('app.update.progress', { percent: progress.percent })
             : i18n.t('app.update.downloading')}
         </span>
+        <div
+          class="desktop-update-progress"
+          role="progressbar"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow={progress?.percent}
+          aria-label={i18n.t('app.update.installing')}
+        >
+          <span
+            class="desktop-update-progress__fill"
+            class:desktop-update-progress__fill--indeterminate={progress?.percent === undefined}
+            style:width={progress?.percent !== undefined ? `${progress.percent}%` : undefined}
+          ></span>
+        </div>
       {:else if promptState === 'error'}
         <span title={error}>{error || i18n.t('app.update.retryHint')}</span>
       {:else if update?.body}

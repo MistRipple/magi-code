@@ -58,5 +58,5 @@ pub use types::{
     McpManagerServerLifecycleState, McpManagerServerOperationResponse,
     McpManagerServerRegistrationRequest, McpManagerServerSelectionRequest, McpToolCallRequest,
     ModelBridgeClient, ModelInvocationRequest, ModelRetryRuntimeEvent, ModelRetryRuntimePhase,
-    ModelStreamingDelta,
+    ModelStreamingDelta, model_invocation_cancelled_error, model_invocation_error_is_cancelled,
 };

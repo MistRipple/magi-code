@@ -48,25 +48,30 @@ await withGoldenViteServer(async (server) => {
   assert.equal(posted[0].incident.sessionId, 'session-notification-runtime');
 
   store.applyNotificationsSnapshot('session-notification-runtime', {
-    records: [{
-      notificationId: 'incident-runtime-1',
+    records: Array.from({ length: 4 }, (_, index) => ({
+      notificationId: `incident-runtime-${index + 1}`,
       kind: 'incident',
       scope: 'workspace',
-      level: 'error',
-      message: '模型请求失败',
+      level: index === 0 ? 'error' : 'warning',
+      message: index === 0 ? '模型请求失败' : `运行时异常 ${index + 1}`,
       workspaceId: 'workspace-notification-runtime',
-      createdAt: 10,
+      createdAt: 10 + index,
       read: false,
       handled: false,
       resolved: false,
       actionRequired: true,
       countUnread: true,
-      occurrenceCount: 3,
-    }],
+      occurrenceCount: index === 0 ? 3 : 1,
+    })),
   }, 'workspace-notification-runtime');
-  assert.equal(store.getNotifications().length, 1);
-  assert.equal(store.getUnreadNotificationCount(), 1);
+  assert.equal(store.getNotifications().length, 4);
+  assert.equal(store.getUnreadNotificationCount(), 4);
   assert.equal(store.getNotifications()[0].occurrenceCount, 3);
+  assert.deepEqual(
+    store.getNotifications().map((item) => item.id),
+    ['incident-runtime-1', 'incident-runtime-2', 'incident-runtime-3', 'incident-runtime-4'],
+    'notification center must render the complete authoritative collection',
+  );
 
   store.resolveNotification('incident-runtime-1');
   assert.equal(posted[1].type, 'resolveNotification');

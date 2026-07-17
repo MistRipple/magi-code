@@ -178,6 +178,35 @@ fn test_model_identity_key_deterministic() {
 }
 
 #[test]
+fn test_model_identity_is_independent_from_role_binding_revision() {
+    let config = make_llm_config();
+    let first_binding =
+        build_execution_binding_identity("tmpl-1", "engine-1", 1, UsageSourceRole::Worker);
+    let second_binding =
+        build_execution_binding_identity("tmpl-1", "engine-2", 2, UsageSourceRole::Worker);
+    let first = build_model_resolution_identity(&config, &first_binding, None, None);
+    let second = build_model_resolution_identity(&config, &second_binding, None, None);
+
+    assert_eq!(first.model_identity_key, second.model_identity_key);
+    assert_ne!(first.binding_revision, second.binding_revision);
+}
+
+#[test]
+fn test_model_identity_keeps_reasoning_effort_separate() {
+    let mut medium_config = make_llm_config();
+    medium_config.reasoning_effort = Some(ReasoningEffort::Medium);
+    let mut high_config = medium_config.clone();
+    high_config.reasoning_effort = Some(ReasoningEffort::High);
+    let binding =
+        build_execution_binding_identity("tmpl-1", "engine-1", 1, UsageSourceRole::Worker);
+
+    let medium = build_model_resolution_identity(&medium_config, &binding, None, None);
+    let high = build_model_resolution_identity(&high_config, &binding, None, None);
+
+    assert_ne!(medium.model_identity_key, high.model_identity_key);
+}
+
+#[test]
 fn test_append_and_get_session_snapshot() {
     let mut authority = UsageAuthority::new();
     let input = make_call_record_input("sess-1", "call-1", 1000, 500);
@@ -277,6 +306,47 @@ fn test_binding_and_model_snapshots() {
     let model = &snapshot.by_model_identity[0];
     assert_eq!(model.provider, "anthropic");
     assert_eq!(model.totals.llm_call_count, 1);
+}
+
+#[test]
+fn test_switching_model_preserves_each_model_usage_snapshot() {
+    let mut authority = UsageAuthority::new();
+    authority.append_call_record(make_call_record_input("sess-1", "call-1", 1000, 500));
+
+    let mut second = make_call_record_input("sess-1", "call-2", 600, 300);
+    second.model_config.model = "gpt-5.6-luna".to_string();
+    second.model_config.provider = "openai".to_string();
+    second.model_config.base_url = "https://api.openai.com/v1".to_string();
+    authority.append_call_record(second);
+
+    let snapshot = authority.get_session_snapshot("ws-1", "sess-1");
+    assert_eq!(snapshot.by_execution_binding.len(), 2);
+    assert_eq!(
+        snapshot
+            .by_execution_binding
+            .iter()
+            .map(|binding| binding.totals.llm_call_count)
+            .sum::<u64>(),
+        2
+    );
+    assert_eq!(snapshot.by_model_identity.len(), 2);
+
+    let mut models = snapshot
+        .by_model_identity
+        .iter()
+        .map(|model| model.resolved_model.as_str())
+        .collect::<Vec<_>>();
+    models.sort_unstable();
+    assert_eq!(models, vec!["claude-sonnet-4-20250514", "gpt-5.6-luna"]);
+    assert_eq!(
+        snapshot
+            .by_model_identity
+            .iter()
+            .map(|model| model.totals.llm_call_count)
+            .sum::<u64>(),
+        2
+    );
+    assert_eq!(snapshot.totals.total_tokens, 2400);
 }
 
 #[test]

@@ -28,7 +28,10 @@ use crate::{
     task_helpers::{task_can_see_builtin_tool, task_is_coordinator, task_role_id},
     task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher, TaskOutcome, TaskResult},
     tool_surface_state::refresh_live_mcp_tool_definitions,
-    usage_recording::{ModelUsageBinding, model_usage_binding_for_worker_with_settings},
+    usage_recording::{
+        AuxiliaryModelUsageContext, ModelUsageBinding, invoke_auxiliary_model_with_usage,
+        model_usage_binding_for_worker_with_settings,
+    },
 };
 use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest};
 use magi_context_runtime::{
@@ -50,6 +53,7 @@ use magi_orchestrator::{
 use magi_session_store::{SessionStore, TimelineEntryKind, timeline_entry_visible_text};
 use magi_settings_store::SettingsStore;
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
+use magi_usage_authority::UsagePhase;
 use magi_workspace::WorkspaceStore;
 use std::{path::PathBuf, sync::Arc};
 
@@ -528,7 +532,11 @@ impl LlmTaskDispatcher {
                     &workspace_id,
                     &outcome,
                 );
-                self.extract_and_persist_session_memory(execution_settings, &session_id);
+                self.extract_and_persist_session_memory(
+                    execution_settings,
+                    &session_id,
+                    &workspace_id,
+                );
             }
             return;
         }
@@ -584,7 +592,15 @@ impl LlmTaskDispatcher {
             );
             return;
         };
-        let learnings = match extract_learnings_via_auxiliary(client, &extraction_text) {
+        let learnings = match extract_learnings_via_auxiliary(
+            client,
+            self.event_bus.as_ref(),
+            self.session_store.as_ref(),
+            settings_store,
+            session_id,
+            workspace_id,
+            &extraction_text,
+        ) {
             Ok(Some(learnings)) => learnings,
             Ok(None) => {
                 self.publish_learning_extraction_diagnostic(
@@ -669,6 +685,7 @@ impl LlmTaskDispatcher {
         &self,
         settings_store: Option<&Arc<SettingsStore>>,
         session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
     ) {
         let Some(client) =
             resolve_target_for_role(settings_store, None, RoleTarget::Auxiliary, None)
@@ -728,7 +745,15 @@ impl LlmTaskDispatcher {
             return;
         }
 
-        let Some(slices) = extract_session_memory_via_auxiliary(client, &excerpt_text) else {
+        let Some(slices) = extract_session_memory_via_auxiliary(
+            client,
+            self.event_bus.as_ref(),
+            self.session_store.as_ref(),
+            settings_store,
+            session_id,
+            workspace_id,
+            &excerpt_text,
+        ) else {
             return;
         };
         if slices.is_empty() {
@@ -1846,6 +1871,11 @@ struct SessionMemorySlice {
 ///   由上层发布诊断事件；不做任何降级到 marker 路径的回退。
 fn extract_learnings_via_auxiliary(
     client: Arc<dyn ModelBridgeClient>,
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    settings_store: Option<&Arc<SettingsStore>>,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
     text: &str,
 ) -> Result<Option<Vec<LearningCandidate>>, LearningExtractionFailure> {
     let prompt = build_knowledge_extraction_prompt(text);
@@ -1856,7 +1886,24 @@ fn extract_learnings_via_auxiliary(
         tools: None,
         tool_choice: None,
     };
-    let response = match client.invoke(request) {
+    let call_id = format!(
+        "auxiliary-knowledge-extraction-{}-{}",
+        session_id,
+        UtcMillis::now().0
+    );
+    let response = match invoke_auxiliary_model_with_usage(
+        client,
+        request,
+        AuxiliaryModelUsageContext {
+            event_bus,
+            session_store,
+            settings_store,
+            session_id,
+            workspace_id,
+            call_id,
+            phase: UsagePhase::Integration,
+        },
+    ) {
         Ok(resp) if resp.ok => resp,
         Ok(resp) => {
             tracing::debug!(payload = %resp.payload, "辅助模型 ok=false，跳过知识抽取");
@@ -1954,6 +2001,11 @@ fn is_pure_tool_sequence(content: &str) -> bool {
 /// 已配置（外层使用 `resolve_target_for_role(.., RoleTarget::Auxiliary)` 短路）。
 fn extract_session_memory_via_auxiliary(
     client: Arc<dyn ModelBridgeClient>,
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    settings_store: Option<&Arc<SettingsStore>>,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
     text: &str,
 ) -> Option<Vec<SessionMemorySlice>> {
     let prompt = build_session_memory_prompt(text);
@@ -1964,7 +2016,24 @@ fn extract_session_memory_via_auxiliary(
         tools: None,
         tool_choice: None,
     };
-    let response = match client.invoke(request) {
+    let call_id = format!(
+        "auxiliary-session-memory-{}-{}",
+        session_id,
+        UtcMillis::now().0
+    );
+    let response = match invoke_auxiliary_model_with_usage(
+        client,
+        request,
+        AuxiliaryModelUsageContext {
+            event_bus,
+            session_store,
+            settings_store,
+            session_id,
+            workspace_id,
+            call_id,
+            phase: UsagePhase::Integration,
+        },
+    ) {
         Ok(resp) if resp.ok => resp,
         Ok(resp) => {
             tracing::debug!(payload = %resp.payload, "辅助模型 ok=false，跳过会话记忆抽取");
@@ -2130,7 +2199,9 @@ async fn record_dispatch_join_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_config::merge_orchestrator_session_override;
+    use crate::model_config::{
+        merge_orchestrator_session_override, resolve_orchestrator_model_config,
+    };
     use crate::task_runner_bridge::TaskResultReceiver;
     use magi_core::{MissionId, Task, TaskPolicy, TaskRuntimePayload, TaskTier};
 
@@ -3265,8 +3336,28 @@ mod tests {
 
     #[test]
     fn auxiliary_learning_extraction_exposes_model_invocation_failure() {
+        let event_bus = InMemoryEventBus::new(8);
+        let session_store = SessionStore::new();
+        let settings_store = Arc::new(SettingsStore::new());
+        settings_store
+            .set_section(
+                "auxiliary",
+                serde_json::json!({
+                    "baseUrl": "https://example.test",
+                    "apiKey": "secret-auxiliary-test-key",
+                    "model": "auxiliary-test-model"
+                }),
+            )
+            .expect("auxiliary config should save");
+        let session_id = SessionId::new("session-learning-extraction-failure");
+        let workspace_id = Some(WorkspaceId::new("workspace-learning-extraction-failure"));
         let result = extract_learnings_via_auxiliary(
             Arc::new(FailingAuxiliaryClient),
+            &event_bus,
+            &session_store,
+            Some(&settings_store),
+            &session_id,
+            &workspace_id,
             "这是一段用于验证辅助模型失败诊断的会话内容",
         );
 
@@ -3274,9 +3365,19 @@ mod tests {
             result,
             Err(LearningExtractionFailure::InvocationFailed)
         ));
+        let usage_event = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "model.usage.recorded")
+            .expect("auxiliary failure should be recorded");
+        assert_eq!(usage_event.payload["executionBinding"]["role"], "auxiliary");
+        assert_eq!(
+            usage_event.payload["modelConfig"]["model"],
+            "auxiliary-test-model"
+        );
 
         let dispatcher = dispatcher_with_default_tool_surface();
-        let session_id = SessionId::new("session-learning-extraction-failure");
         let workspace_id = WorkspaceId::new("workspace-learning-extraction-failure");
         dispatcher.publish_learning_extraction_diagnostic(
             &session_id,
@@ -3525,8 +3626,8 @@ mod tests {
     }
 
     #[test]
-    fn merge_orchestrator_session_override_null_effort_clears_global() {
-        // reasoningEffort 显式为 null 表示「默认·不指定」，清空全局思考强度。
+    fn merge_orchestrator_session_override_null_effort_restores_medium_default() {
+        // reasoningEffort 显式为 null 时恢复产品默认值，运行期不允许出现空强度。
         let mut base = serde_json::json!({
             "baseUrl": "https://api.example.com/v1",
             "apiKey": "sk-orch",
@@ -3537,9 +3638,45 @@ mod tests {
             &mut base,
             &serde_json::json!({ "reasoningEffort": serde_json::Value::Null }),
         );
-        assert!(
-            base.get("reasoningEffort").is_none(),
-            "null 覆盖必须清空全局 reasoningEffort"
+        assert_eq!(
+            base.get("reasoningEffort")
+                .and_then(serde_json::Value::as_str),
+            Some("medium"),
+            "null 覆盖必须恢复中等 reasoningEffort"
+        );
+    }
+
+    #[test]
+    fn resolve_orchestrator_model_config_defaults_reasoning_effort_to_medium() {
+        use magi_settings_store::SettingsStore;
+
+        let store = SettingsStore::new();
+        store
+            .set_section(
+                "orchestrator",
+                serde_json::json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-orch",
+                    "urlMode": "standard",
+                }),
+            )
+            .unwrap();
+        let session_id = SessionId::new("session-default-reasoning-effort");
+        store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                serde_json::json!({ "model": "session-model" }),
+            )
+            .unwrap();
+
+        let config = resolve_orchestrator_model_config(&store, Some(&session_id))
+            .expect("主线模型配置应完成默认值归一化");
+        assert_eq!(
+            config
+                .to_usage_llm_config()
+                .and_then(|config| config.reasoning_effort),
+            Some(magi_usage_authority::ReasoningEffort::Medium),
         );
     }
 

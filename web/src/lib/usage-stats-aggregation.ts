@@ -22,6 +22,7 @@ export interface AggregatedUsageStats {
   totalOutputTokens: number;
   totalTokens: number;
   resolvedModel?: string;
+  resolvedModels: string[];
 }
 
 export function aggregateUsageStatsForDisplay(
@@ -36,7 +37,7 @@ export function aggregateUsageStatsForDisplay(
     if (normalizedKey === 'auxiliary') {
       return item.role === 'auxiliary';
     }
-    return item.role === 'worker' && (item.engineId === normalizedKey || item.templateId === normalizedKey);
+    return item.role === 'worker' && item.templateId === normalizedKey;
   });
 
   if (matched.length === 0) {
@@ -50,7 +51,19 @@ export function aggregateUsageStatsForDisplay(
   const totalInputTokens = matched.reduce((sum, item) => sum + item.netInputTokens, 0);
   const totalOutputTokens = matched.reduce((sum, item) => sum + item.netOutputTokens, 0);
   const totalTokens = totalInputTokens + totalOutputTokens;
-  const resolvedModels = Array.from(new Set(matched.map((item) => item.resolvedModel).filter((value): value is string => typeof value === 'string' && value.trim().length > 0)));
+  const resolvedModelsByKey = new Map<string, string>();
+  for (const item of [...matched].sort((left, right) => (
+    right.totalTokens - left.totalTokens
+    || (left.resolvedModel || '').localeCompare(right.resolvedModel || '')
+  ))) {
+    const model = item.resolvedModel?.trim();
+    if (!model) continue;
+    const key = model.toLocaleLowerCase();
+    if (!resolvedModelsByKey.has(key)) {
+      resolvedModelsByKey.set(key, model);
+    }
+  }
+  const resolvedModels = Array.from(resolvedModelsByKey.values());
 
   return {
     totalExecutions,
@@ -62,5 +75,6 @@ export function aggregateUsageStatsForDisplay(
     totalOutputTokens,
     totalTokens,
     resolvedModel: resolvedModels.length === 1 ? resolvedModels[0] : undefined,
+    resolvedModels,
   };
 }

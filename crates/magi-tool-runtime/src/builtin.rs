@@ -6,7 +6,7 @@ use crate::{
 };
 use base64::Engine as _;
 use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, UtcMillis};
-use magi_process::std_command;
+use magi_process::{ManagedChild, spawn_managed, std_command};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -14,7 +14,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ExitStatus, Stdio},
+    process::{ExitStatus, Stdio},
     sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -22,9 +22,6 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
@@ -42,6 +39,7 @@ const SEARCH_TEXT_PUBLIC_ERROR: &str = "文本搜索暂不可用，请检查路�
 const DIFF_PREVIEW_PUBLIC_ERROR: &str = "差异预览源暂不可读取，请检查路径或权限";
 const SHELL_EXEC_PUBLIC_ERROR: &str = "shell 命令暂不可执行，请检查运行环境";
 const PROCESS_LAUNCH_PUBLIC_ERROR: &str = "后台进程暂不可启动，请检查运行环境";
+const PROCESS_KILL_PUBLIC_ERROR: &str = "后台进程暂不可停止，请稍后重试";
 const PROCESS_WRITE_PUBLIC_ERROR: &str = "后台进程暂不可写入，请稍后重试";
 const PROCESS_INSPECT_PUBLIC_ERROR: &str = "进程信息暂不可读取，请稍后重试";
 const WEB_SEARCH_PUBLIC_ERROR: &str = "网络搜索暂不可用，请稍后重试";
@@ -56,10 +54,8 @@ const PROTECTED_DELETE_PUBLIC_ERROR: &str = "该路径受保护，不能删除";
 #[derive(Clone)]
 struct ActiveShellExec {
     execution_id: u64,
-    session_id: Option<String>,
-    workspace_id: Option<String>,
-    task_id: Option<String>,
-    child: Arc<Mutex<Child>>,
+    scope: ProcessExecutionScope,
+    child: Arc<Mutex<ManagedChild>>,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -92,12 +88,19 @@ struct ManagedProcess {
     terminal_id: u64,
     command: String,
     cwd: String,
-    session_id: Option<String>,
-    workspace_id: Option<String>,
-    child: Child,
+    scope: ProcessExecutionScope,
+    child: ManagedChild,
     stdout: Arc<Mutex<Vec<u8>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
     started_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProcessExecutionScope {
+    worker_id: Option<String>,
+    task_id: Option<String>,
+    session_id: Option<String>,
+    workspace_id: Option<String>,
 }
 
 static NEXT_TERMINAL_ID: AtomicU64 = AtomicU64::new(1);
@@ -600,11 +603,21 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
             "当前工作区目录不可访问，请重新选择工作区",
         );
     }
-    let shell = request
+    let configured_shell = request
         .as_ref()
         .and_then(|object| field_string(object, &["shell"]))
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(default_shell_binary);
+        .filter(|value| !value.trim().is_empty());
+    let shell = match resolve_shell_command_spec(configured_shell) {
+        Ok(shell) => shell,
+        Err(error) => {
+            return builtin_runtime_error(
+                "shell_exec",
+                SHELL_EXEC_PUBLIC_ERROR,
+                "解析 Shell 启动配置失败",
+                error,
+            );
+        }
+    };
     let timeout_ms = request
         .as_ref()
         .and_then(|object| field_usize(object, &["timeout_ms", "timeoutMs", "timeout"]))
@@ -615,10 +628,11 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     {
         return payload;
     }
-    let missing_executables = crate::policy::shell_command_required_executables(&command, &shell)
-        .into_iter()
-        .filter(|executable| magi_process::resolve_executable(executable).is_none())
-        .collect::<Vec<_>>();
+    let missing_executables =
+        crate::policy::shell_command_required_executables(&command, &shell.program)
+            .into_iter()
+            .filter(|executable| magi_process::resolve_executable(executable).is_none())
+            .collect::<Vec<_>>();
     if !missing_executables.is_empty() {
         return serde_json::json!({
             "tool": "shell_exec",
@@ -924,13 +938,12 @@ fn is_git_worktree(path: &Path) -> bool {
 }
 
 fn execute_shell_command_with_timeout(
-    shell: &str,
+    shell: &ShellCommandSpec,
     command: &str,
     cwd: &Path,
     timeout_ms: u64,
     context: &ToolExecutionContext,
 ) -> Result<ShellExecOutput, String> {
-    let shell = parse_shell_command_spec(shell)?;
     let mut command_builder = std_command(&shell.program);
     command_builder
         .args(&shell.arguments)
@@ -938,14 +951,10 @@ fn execute_shell_command_with_timeout(
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        command_builder.process_group(0);
-    }
-    let mut child = command_builder.spawn().map_err(|error| error.to_string())?;
+    let mut child = spawn_managed(&mut command_builder).map_err(|error| error.to_string())?;
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let stdout = child.take_stdout();
+    let stderr = child.take_stderr();
     let child = Arc::new(Mutex::new(child));
     let (execution_id, cancellation_requested) = register_active_shell_exec(context, &child);
     let stdout_reader = thread::spawn(move || read_child_pipe(stdout));
@@ -1007,21 +1016,13 @@ fn execute_shell_command_with_timeout(
 
 fn register_active_shell_exec(
     context: &ToolExecutionContext,
-    child: &Arc<Mutex<Child>>,
+    child: &Arc<Mutex<ManagedChild>>,
 ) -> (u64, Arc<AtomicBool>) {
     let execution_id = SHELL_EXECUTION_COUNTER.fetch_add(1, Ordering::SeqCst);
     let cancelled = Arc::new(AtomicBool::new(false));
     let process = ActiveShellExec {
         execution_id,
-        session_id: context
-            .session_id
-            .as_ref()
-            .map(|id| id.as_str().to_string()),
-        workspace_id: context
-            .workspace_id
-            .as_ref()
-            .map(|id| id.as_str().to_string()),
-        task_id: context.task_id.as_ref().map(|id| id.as_str().to_string()),
+        scope: ProcessExecutionScope::from_context(context),
         child: Arc::clone(child),
         cancelled: Arc::clone(&cancelled),
     };
@@ -1046,41 +1047,56 @@ fn active_shell_exec_is_registered(execution_id: u64) -> bool {
         .contains_key(&execution_id)
 }
 
-fn active_shell_matches_query(
-    process: &ActiveShellExec,
-    query: &ToolExecutionContextQuery,
-) -> bool {
-    let has_scope =
-        query.session_id.is_some() || query.workspace_id.is_some() || query.task_id.is_some();
-    if !has_scope {
-        return false;
+impl ProcessExecutionScope {
+    fn from_context(context: &ToolExecutionContext) -> Self {
+        Self {
+            worker_id: context.worker_id.as_ref().map(ToString::to_string),
+            task_id: context.task_id.as_ref().map(ToString::to_string),
+            session_id: context.session_id.as_ref().map(ToString::to_string),
+            workspace_id: context.workspace_id.as_ref().map(ToString::to_string),
+        }
     }
-    if let Some(session_id) = query.session_id.as_ref()
-        && process.session_id.as_deref() != Some(session_id.as_str())
-    {
-        return false;
+
+    fn matches_query(&self, query: &ToolExecutionContextQuery) -> bool {
+        let has_scope = query.worker_id.is_some()
+            || query.task_id.is_some()
+            || query.session_id.is_some()
+            || query.workspace_id.is_some();
+        if !has_scope {
+            return false;
+        }
+        if let Some(worker_id) = query.worker_id.as_ref()
+            && self.worker_id.as_deref() != Some(worker_id.as_str())
+        {
+            return false;
+        }
+        if let Some(task_id) = query.task_id.as_ref()
+            && self.task_id.as_deref() != Some(task_id.as_str())
+        {
+            return false;
+        }
+        if let Some(session_id) = query.session_id.as_ref()
+            && self.session_id.as_deref() != Some(session_id.as_str())
+        {
+            return false;
+        }
+        if let Some(workspace_id) = query.workspace_id.as_ref()
+            && self.workspace_id.as_deref() != Some(workspace_id.as_str())
+        {
+            return false;
+        }
+        true
     }
-    if let Some(workspace_id) = query.workspace_id.as_ref()
-        && process.workspace_id.as_deref() != Some(workspace_id.as_str())
-    {
-        return false;
-    }
-    if let Some(task_id) = query.task_id.as_ref()
-        && process.task_id.as_deref() != Some(task_id.as_str())
-    {
-        return false;
-    }
-    true
 }
 
-pub(crate) fn cancel_active_shell_execs(query: &ToolExecutionContextQuery) -> usize {
-    let processes = {
+pub(crate) fn cancel_active_processes(query: &ToolExecutionContextQuery) -> usize {
+    let shell_processes = {
         let mut table = ACTIVE_SHELL_EXECUTIONS
             .lock()
             .expect("active shell execution lock poisoned");
         let execution_ids = table
             .values()
-            .filter(|process| active_shell_matches_query(process, query))
+            .filter(|process| process.scope.matches_query(query))
             .map(|process| process.execution_id)
             .collect::<Vec<_>>();
         execution_ids
@@ -1092,39 +1108,75 @@ pub(crate) fn cancel_active_shell_execs(query: &ToolExecutionContextQuery) -> us
             })
             .collect::<Vec<_>>()
     };
-    for process in &processes {
+    let managed_processes = take_managed_processes(|process| process.scope.matches_query(query));
+    let cancelled_count = shell_processes.len() + managed_processes.len();
+    for process in &shell_processes {
         let _ = terminate_shell_child(&process.child);
     }
-    processes.len()
-}
-
-fn terminate_shell_child(child: &Arc<Mutex<Child>>) -> Option<ExitStatus> {
-    let mut child = child.lock().expect("shell child lock poisoned");
-    terminate_process_group(&mut child);
-    child.wait().ok()
-}
-
-fn terminate_process_group(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        let process_group = format!("-{}", child.id());
-        let _ = std_command("kill")
-            .arg("-TERM")
-            .arg("--")
-            .arg(&process_group)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        thread::sleep(Duration::from_millis(50));
-        let _ = std_command("kill")
-            .arg("-KILL")
-            .arg("--")
-            .arg(&process_group)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    for mut process in managed_processes {
+        if let Err(error) = process.child.terminate() {
+            tracing::warn!(
+                terminal_id = process.terminal_id,
+                %error,
+                "取消工具执行时终止后台进程树失败"
+            );
+        }
     }
-    let _ = child.kill();
+    cancelled_count
+}
+
+pub(crate) fn cancel_all_active_processes() -> usize {
+    let shell_processes = {
+        let mut table = ACTIVE_SHELL_EXECUTIONS
+            .lock()
+            .expect("active shell execution lock poisoned");
+        table
+            .drain()
+            .map(|(_, process)| {
+                process.cancelled.store(true, Ordering::SeqCst);
+                process
+            })
+            .collect::<Vec<_>>()
+    };
+    let managed_processes = take_managed_processes(|_| true);
+    let cancelled_count = shell_processes.len() + managed_processes.len();
+    for process in &shell_processes {
+        let _ = terminate_shell_child(&process.child);
+    }
+    for mut process in managed_processes {
+        if let Err(error) = process.child.terminate() {
+            tracing::warn!(
+                terminal_id = process.terminal_id,
+                %error,
+                "服务关闭时终止后台进程树失败"
+            );
+        }
+    }
+    cancelled_count
+}
+
+fn take_managed_processes(predicate: impl Fn(&ManagedProcess) -> bool) -> Vec<ManagedProcess> {
+    let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
+    let terminal_ids = table
+        .values()
+        .filter(|process| predicate(process))
+        .map(|process| process.terminal_id)
+        .collect::<Vec<_>>();
+    terminal_ids
+        .into_iter()
+        .filter_map(|terminal_id| table.remove(&terminal_id))
+        .collect()
+}
+
+fn terminate_shell_child(child: &Arc<Mutex<ManagedChild>>) -> Option<ExitStatus> {
+    let mut child = child.lock().expect("shell child lock poisoned");
+    match child.terminate() {
+        Ok(status) => Some(status),
+        Err(error) => {
+            tracing::warn!(%error, "终止同步 Shell 进程树失败");
+            None
+        }
+    }
 }
 
 pub(crate) fn read_child_pipe<T: Read>(pipe: Option<T>) -> ShellPipeOutput {
@@ -1192,13 +1244,12 @@ fn execute_process_launch_with_surface(
             }
         },
     };
-    let shell = request
+    let configured_shell = request
         .as_ref()
         .and_then(|object| field_string(object, &["shell"]))
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(default_shell_binary);
+        .filter(|value| !value.trim().is_empty());
 
-    let shell = match parse_shell_command_spec(&shell) {
+    let shell = match resolve_shell_command_spec(configured_shell) {
         Ok(shell) => shell,
         Err(error) => {
             return builtin_runtime_error(
@@ -1214,15 +1265,15 @@ fn execute_process_launch_with_surface(
         }
     };
 
-    let mut child = match std_command(&shell.program)
+    let mut command_builder = std_command(&shell.program);
+    command_builder
         .args(&shell.arguments)
         .arg(&command)
         .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    let mut child = match spawn_managed(&mut command_builder) {
         Ok(child) => child,
         Err(error) => {
             let public_message = if surface_tool == "shell_exec" {
@@ -1236,15 +1287,14 @@ fn execute_process_launch_with_surface(
 
     let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
     let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
-    spawn_managed_process_reader(child.stdout.take(), Arc::clone(&stdout_buffer));
-    spawn_managed_process_reader(child.stderr.take(), Arc::clone(&stderr_buffer));
+    spawn_managed_process_reader(child.take_stdout(), Arc::clone(&stdout_buffer));
+    spawn_managed_process_reader(child.take_stderr(), Arc::clone(&stderr_buffer));
     let terminal_id = NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
     let process = ManagedProcess {
         terminal_id,
         command: command.clone(),
         cwd: cwd.display().to_string(),
-        session_id: context.session_id.as_ref().map(ToString::to_string),
-        workspace_id: context.workspace_id.as_ref().map(ToString::to_string),
+        scope: ProcessExecutionScope::from_context(context),
         child,
         stdout: stdout_buffer,
         stderr: stderr_buffer,
@@ -1370,7 +1420,7 @@ fn execute_process_write_with_surface(
     if !process_belongs_to_context(process, context) {
         return builtin_error(surface_tool, "进程不属于当前 session/workspace");
     }
-    let Some(stdin) = process.child.stdin.as_mut() else {
+    let Some(stdin) = process.child.stdin_mut() else {
         return builtin_error(surface_tool, format!("进程 #{terminal_id} 不接受输入"));
     };
     if let Err(error) = stdin.write_all(content.as_bytes()) {
@@ -1415,16 +1465,27 @@ fn execute_process_kill_with_surface(
     if let Some(error) = require_process_context(surface_tool, context) {
         return error;
     }
-    let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
-    let Some(process) = table.get_mut(&(terminal_id as u64)) else {
-        return builtin_error(surface_tool, format!("进程不存在: {terminal_id}"));
+    let process = {
+        let mut table = PROCESS_TABLE.lock().expect("process table lock poisoned");
+        let Some(process) = table.get(&(terminal_id as u64)) else {
+            return builtin_error(surface_tool, format!("进程不存在: {terminal_id}"));
+        };
+        if !process_belongs_to_context(process, context) {
+            return builtin_error(surface_tool, "进程不属于当前 session/workspace");
+        }
+        table
+            .remove(&(terminal_id as u64))
+            .expect("checked process should remain in table")
     };
-    if !process_belongs_to_context(process, context) {
-        return builtin_error(surface_tool, "进程不属于当前 session/workspace");
+    let mut process = process;
+    if let Err(error) = process.child.terminate() {
+        return builtin_runtime_error(
+            surface_tool,
+            PROCESS_KILL_PUBLIC_ERROR,
+            "停止后台进程树失败",
+            error,
+        );
     }
-    let _ = process.child.kill();
-    let _ = process.child.wait();
-    table.remove(&(terminal_id as u64));
     let mut payload = serde_json::json!({
         "tool": surface_tool,
         "status": "succeeded",
@@ -1467,8 +1528,10 @@ fn execute_process_list_with_surface(
             "command": process.command,
             "cwd": process.cwd,
             "running": running,
-            "session_id": process.session_id,
-            "workspace_id": process.workspace_id,
+            "session_id": process.scope.session_id.as_deref(),
+            "workspace_id": process.scope.workspace_id.as_deref(),
+            "task_id": process.scope.task_id.as_deref(),
+            "worker_id": process.scope.worker_id.as_deref(),
             "started_at": process.started_at_ms,
         }));
     }
@@ -1511,17 +1574,17 @@ fn spawn_managed_process_reader<T: Read + Send + 'static>(
 }
 
 fn process_belongs_to_context(process: &ManagedProcess, context: &ToolExecutionContext) -> bool {
-    if let Some(session_id) = process.session_id.as_deref()
+    if let Some(session_id) = process.scope.session_id.as_deref()
         && context.session_id.as_ref().map(|id| id.as_str()) != Some(session_id)
     {
         return false;
     }
-    if let Some(workspace_id) = process.workspace_id.as_deref()
+    if let Some(workspace_id) = process.scope.workspace_id.as_deref()
         && context.workspace_id.as_ref().map(|id| id.as_str()) != Some(workspace_id)
     {
         return false;
     }
-    process.session_id.is_some() || process.workspace_id.is_some()
+    process.scope.session_id.is_some() || process.scope.workspace_id.is_some()
 }
 
 fn require_process_context(tool: &str, context: &ToolExecutionContext) -> Option<String> {
@@ -1821,11 +1884,22 @@ fn execute_orchestration_only(name: BuiltinToolName, _input: &str) -> String {
     .to_string()
 }
 
-fn default_shell_binary() -> String {
-    if cfg!(windows) {
-        "cmd".to_string()
-    } else {
-        magi_process::user_shell().to_string_lossy().to_string()
+fn resolve_shell_command_spec(
+    configured_shell: Option<String>,
+) -> Result<ShellCommandSpec, String> {
+    match configured_shell {
+        Some(shell) => parse_shell_command_spec(&shell),
+        None => {
+            let program = magi_process::user_shell().to_string_lossy().to_string();
+            Ok(default_shell_command_spec(program))
+        }
+    }
+}
+
+fn default_shell_command_spec(program: String) -> ShellCommandSpec {
+    ShellCommandSpec {
+        arguments: vec![shell_arg(&program).to_string()],
+        program,
     }
 }
 
@@ -1834,12 +1908,31 @@ fn parse_shell_command_spec(shell: &str) -> Result<ShellCommandSpec, String> {
     let Some(program) = tokens.first().cloned() else {
         return Err("Shell 程序不能为空".to_string());
     };
-    let arguments = if tokens.len() == 1 {
-        vec![shell_arg(&program).to_string()]
-    } else {
-        tokens.into_iter().skip(1).collect()
-    };
+    let mut arguments = tokens.into_iter().skip(1).collect::<Vec<_>>();
+    if !has_shell_command_argument(&program, &arguments) {
+        arguments.push(shell_arg(&program).to_string());
+    }
     Ok(ShellCommandSpec { program, arguments })
+}
+
+fn has_shell_command_argument(program: &str, arguments: &[String]) -> bool {
+    let executable = shell_executable_name(program);
+    if executable == "cmd" || executable == "cmd.exe" {
+        return arguments
+            .iter()
+            .any(|argument| argument.eq_ignore_ascii_case("/c"));
+    }
+    if executable.contains("powershell") || executable == "pwsh" || executable == "pwsh.exe" {
+        return arguments.iter().any(|argument| {
+            argument.eq_ignore_ascii_case("-command") || argument.eq_ignore_ascii_case("-c")
+        });
+    }
+    arguments.iter().any(|argument| {
+        argument == "-c"
+            || argument
+                .strip_prefix('-')
+                .is_some_and(|flags| flags.contains('c'))
+    })
 }
 
 fn tokenize_shell_command_spec(shell: &str) -> Result<Vec<String>, String> {
@@ -1871,11 +1964,7 @@ fn tokenize_shell_command_spec(shell: &str) -> Result<Vec<String>, String> {
 }
 
 fn shell_arg(shell: &str) -> &'static str {
-    let executable = shell
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(shell)
-        .to_ascii_lowercase();
+    let executable = shell_executable_name(shell);
     if executable.contains("powershell") || executable == "pwsh" || executable == "pwsh.exe" {
         "-Command"
     } else if executable == "cmd" || executable == "cmd.exe" {
@@ -1883,6 +1972,14 @@ fn shell_arg(shell: &str) -> &'static str {
     } else {
         "-c"
     }
+}
+
+fn shell_executable_name(shell: &str) -> String {
+    shell
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(shell)
+        .to_ascii_lowercase()
 }
 
 fn should_skip_directory(path: &Path, include_hidden: bool) -> bool {
@@ -3840,6 +3937,38 @@ mod tests {
             ShellCommandSpec {
                 program: r#"C:\Program Files\PowerShell\7\pwsh.exe"#.to_string(),
                 arguments: vec!["-Command".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_shell_command_spec("cmd.exe /Q").expect("cmd shell spec"),
+            ShellCommandSpec {
+                program: "cmd.exe".to_string(),
+                arguments: vec!["/Q".to_string(), "/C".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_shell_command_spec("pwsh -NoProfile").expect("PowerShell spec"),
+            ShellCommandSpec {
+                program: "pwsh".to_string(),
+                arguments: vec!["-NoProfile".to_string(), "-Command".to_string()],
+            }
+        );
+        assert_eq!(
+            parse_shell_command_spec("bash -l").expect("POSIX shell spec"),
+            ShellCommandSpec {
+                program: "bash".to_string(),
+                arguments: vec!["-l".to_string(), "-c".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn default_shell_command_spec_preserves_native_program_paths_with_spaces() {
+        assert_eq!(
+            default_shell_command_spec(r#"C:\Program Files\Command Processor\cmd.exe"#.to_string()),
+            ShellCommandSpec {
+                program: r#"C:\Program Files\Command Processor\cmd.exe"#.to_string(),
+                arguments: vec!["/C".to_string()],
             }
         );
     }

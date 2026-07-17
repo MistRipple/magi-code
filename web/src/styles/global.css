@@ -264,6 +264,41 @@
   --z-modal-secondary: 1500;
 }
 
+.desktop-update-progress {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--border) 65%, transparent);
+}
+
+.desktop-update-progress--settings {
+  width: 72px;
+  flex: 0 0 72px;
+}
+
+.desktop-update-progress__fill {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--primary, #2563eb);
+  transition: width 180ms ease-out;
+}
+
+.desktop-update-progress__fill--indeterminate {
+  width: 42%;
+  animation: desktop-update-progress-indeterminate 1.1s ease-in-out infinite;
+}
+
+@keyframes desktop-update-progress-indeterminate {
+  0% { transform: translateX(-125%); }
+  50% { transform: translateX(120%); }
+  100% { transform: translateX(245%); }
+}
+
 /* ==========================================
    浅色主题覆盖 - 表面颜色使用黑色透明度
    ========================================== */

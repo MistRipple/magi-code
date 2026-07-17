@@ -14,14 +14,15 @@ use crate::{
     WorkerExecutorRequest, WorkerStage,
 };
 use magi_core::{TaskResultKind, TerminationReason, UtcMillis, VerificationStatus};
-use magi_process::std_command;
+use magi_process::{spawn_managed, std_command};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    io::Write,
+    io::{Read, Write},
     path::PathBuf,
     process::Stdio,
     sync::{Arc, RwLock},
+    thread,
 };
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -414,12 +415,30 @@ impl LocalProcessWorkerExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = command.spawn().map_err(|error| {
+        let mut child = spawn_managed(&mut command).map_err(|error| {
             WorkerExecutorFailure::transport(format!("spawn local worker executor failed: {error}"))
         })?;
-        let mut stdin = child.stdin.take().ok_or_else(|| {
+        let mut stdin = child.take_stdin().ok_or_else(|| {
             WorkerExecutorFailure::transport("local worker executor stdin unavailable")
         })?;
+        let stdout = child.take_stdout().ok_or_else(|| {
+            WorkerExecutorFailure::transport("local worker executor stdout unavailable")
+        })?;
+        let stderr = child.take_stderr().ok_or_else(|| {
+            WorkerExecutorFailure::transport("local worker executor stderr unavailable")
+        })?;
+        let stdout_reader = thread::spawn(move || {
+            let mut stdout = stdout;
+            let mut bytes = Vec::new();
+            let result = stdout.read_to_end(&mut bytes);
+            (result, bytes)
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut stderr = stderr;
+            let mut bytes = Vec::new();
+            let result = stderr.read_to_end(&mut bytes);
+            (result, bytes)
+        });
         let request_json = serde_json::to_vec(request).map_err(|error| {
             WorkerExecutorFailure::protocol(format!(
                 "serialize local worker request failed: {error}"
@@ -430,23 +449,36 @@ impl LocalProcessWorkerExecutor {
         })?;
         drop(stdin);
 
-        let output = child.wait_with_output().map_err(|error| {
+        let status = child.wait().map_err(|error| {
             WorkerExecutorFailure::transport(format!("wait local worker executor failed: {error}"))
         })?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let (stdout_result, stdout) = stdout_reader.join().map_err(|_| {
+            WorkerExecutorFailure::transport("local worker executor stdout reader panicked")
+        })?;
+        stdout_result.map_err(|error| {
+            WorkerExecutorFailure::transport(format!(
+                "read local worker executor stdout failed: {error}"
+            ))
+        })?;
+        let (stderr_result, stderr) = stderr_reader.join().map_err(|_| {
+            WorkerExecutorFailure::transport("local worker executor stderr reader panicked")
+        })?;
+        stderr_result.map_err(|error| {
+            WorkerExecutorFailure::transport(format!(
+                "read local worker executor stderr failed: {error}"
+            ))
+        })?;
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
             return Err(WorkerExecutorFailure::transport(if stderr.is_empty() {
-                format!("local worker executor exited with status {}", output.status)
+                format!("local worker executor exited with status {status}")
             } else {
-                format!(
-                    "local worker executor exited with status {}: {stderr}",
-                    output.status
-                )
+                format!("local worker executor exited with status {status}: {stderr}")
             }));
         }
 
-        let response: LocalProcessProtocolResponse = serde_json::from_slice(&output.stdout)
-            .map_err(|error| {
+        let response: LocalProcessProtocolResponse =
+            serde_json::from_slice(&stdout).map_err(|error| {
                 WorkerExecutorFailure::protocol(format!(
                     "decode local worker response failed: {error}"
                 ))

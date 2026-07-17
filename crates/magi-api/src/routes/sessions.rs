@@ -1549,7 +1549,7 @@ fn apply_turn_orchestrator_session_override(
         return Ok(());
     };
     super::settings::save_orchestrator_session_override_for_session(state, session_id, config)?;
-    Ok(())
+    super::settings::require_orchestrator_session_model(state, session_id)
 }
 
 fn spawn_regular_session_turn_execution(
@@ -3251,15 +3251,16 @@ async fn close_session(
 }
 
 fn cancel_active_session_turn_for_lifecycle(state: &ApiState, session_id: &SessionId) -> bool {
+    let cancelled_tool_process_count =
+        state.cancel_active_tool_executions(Some(session_id), None, None);
     let current_turn = state
         .session_store
         .runtime_sidecar(session_id)
         .and_then(|sidecar| sidecar.current_turn);
     let Some(current_turn) = current_turn.filter(|turn| turn_status_is_interruptible(&turn.status))
     else {
-        return false;
+        return cancelled_tool_process_count > 0;
     };
-    state.cancel_active_tool_executions(Some(session_id), None, None);
     let _ = state.session_store.cancel_current_turn(session_id);
     state
         .conversation_registry
@@ -3724,6 +3725,16 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
+    fn long_running_shell_command() -> &'static str {
+        "sleep 5"
+    }
+
+    #[cfg(windows)]
+    fn long_running_shell_command() -> &'static str {
+        "ping 127.0.0.1 -n 6 >NUL"
+    }
+
     fn register_workspace(state: &ApiState, workspace_id: &str, prefix: &str) -> WorkspaceId {
         let root = unique_temp_dir(prefix);
         let workspace_id = WorkspaceId::new(workspace_id);
@@ -3885,7 +3896,7 @@ mod tests {
         let todo_ledger =
             magi_todo_ledger::TodoLedger::new(state.session_store.clone(), session_id.clone());
         todo_ledger
-            .replace(vec![magi_core::TodoItem::new(
+            .write(vec![magi_core::TodoItem::new(
                 "执行当前步骤",
                 "正在执行当前步骤",
                 magi_core::TodoStatus::InProgress,
@@ -4612,7 +4623,6 @@ mod tests {
         assert_eq!(body["workspaceId"], workspace_id.as_str());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn session_interrupt_cancels_shell_by_session_even_without_workspace_context() {
         let event_bus = Arc::new(InMemoryEventBus::new(32));
@@ -4666,7 +4676,7 @@ mod tests {
                     ToolCallId::new("tool-call-interrupt-shell-session-scope"),
                     BuiltinToolName::ShellExec.as_str(),
                     serde_json::json!({
-                        "command": "sleep 5",
+                        "command": long_running_shell_command(),
                         "timeout_ms": 10_000
                     })
                     .to_string(),
@@ -4777,7 +4787,7 @@ mod tests {
         let todo_ledger =
             magi_todo_ledger::TodoLedger::new(state.session_store.clone(), session_id.clone());
         todo_ledger
-            .replace(vec![magi_core::TodoItem::new(
+            .write(vec![magi_core::TodoItem::new(
                 "生成长内容",
                 "正在生成长内容",
                 magi_core::TodoStatus::InProgress,
@@ -4873,7 +4883,7 @@ mod tests {
         let todo_ledger =
             magi_todo_ledger::TodoLedger::new(state.session_store.clone(), session_id.clone());
         todo_ledger
-            .replace(vec![magi_core::TodoItem::new(
+            .write(vec![magi_core::TodoItem::new(
                 "执行当前步骤",
                 "正在执行当前步骤",
                 magi_core::TodoStatus::InProgress,
@@ -4913,6 +4923,93 @@ mod tests {
             magi_core::TodoStatus::Pending
         );
         assert!(crate::routes::begin_session_turn(&state, &session_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn close_session_stops_background_process_without_active_turn() {
+        let event_bus = Arc::new(InMemoryEventBus::new(32));
+        let governance = Arc::new(GovernanceService::default());
+        let mut tool_registry = ToolRegistry::new(governance.clone(), event_bus.clone());
+        tool_registry.register_default_builtins();
+        let runner_registry = tool_registry.clone();
+        let state = ApiState::new(
+            "magi-test",
+            event_bus,
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            governance,
+        )
+        .with_tool_registry(tool_registry);
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-close-background-process",
+            "close-background-process",
+        );
+        let session_id = SessionId::new("session-close-background-process");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "关闭后台进程会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        let context = ToolExecutionContext {
+            session_id: Some(session_id.clone()),
+            workspace_id: Some(workspace_id.clone()),
+            working_directory: Some(unique_temp_dir("close-background-process-cwd")),
+            access_profile: AccessProfile::FullAccess,
+            ..ToolExecutionContext::default()
+        };
+        let launch = runner_registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("tool-call-close-background-process"),
+                BuiltinToolName::ShellExec.as_str(),
+                serde_json::json!({
+                    "command": long_running_shell_command(),
+                    "background": true
+                })
+                .to_string(),
+            ),
+            context.clone(),
+            &ToolExecutionPolicy {
+                access_profile: AccessProfile::FullAccess,
+                ..ToolExecutionPolicy::default()
+            },
+        );
+        assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
+
+        let (status, body) = post_json(
+            state,
+            "/session/close",
+            serde_json::json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        let list = runner_registry.execute_with_policy(
+            ToolExecutionInput::for_builtin_invocation(
+                ToolCallId::new("tool-call-list-after-close"),
+                BuiltinToolName::ShellExec.as_str(),
+                serde_json::json!({ "action": "list" }).to_string(),
+            ),
+            context,
+            &ToolExecutionPolicy {
+                access_profile: AccessProfile::FullAccess,
+                ..ToolExecutionPolicy::default()
+            },
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&list.payload).expect("process list json");
+        assert!(
+            payload["processes"]
+                .as_array()
+                .expect("processes")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

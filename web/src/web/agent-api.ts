@@ -304,6 +304,7 @@ export interface AgentExecutionStatsItem {
   provider?: string;
   declaredModelSpec?: string;
   resolvedModel?: string;
+  modelIdentityKey?: string;
   llmCallCount: number;
   assignmentCount: number;
   successCount: number;
@@ -313,10 +314,17 @@ export interface AgentExecutionStatsItem {
   netOutputTokens: number;
 }
 
+export interface AgentExecutionModelStatsItem {
+  modelIdentityKey: string;
+  provider: string;
+  declaredModelSpec: string;
+  resolvedModel: string;
+  baseUrlFingerprint: string;
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | null;
+  totals: AgentExecutionStatsPayload['totals'];
+}
+
 export interface AgentExecutionStatsPayload {
-  scope: 'session' | 'workspace';
-  workspaceId: string;
-  sessionId?: string | null;
   version: number;
   lastAppliedLedgerSeq?: number;
   updatedAt: number;
@@ -331,6 +339,7 @@ export interface AgentExecutionStatsPayload {
     failureCount: number;
   };
   items: AgentExecutionStatsItem[];
+  models: AgentExecutionModelStatsItem[];
 }
 
 // 通知中心直接复用 Rust incident 契约，前端不再维护旧会话通知镜像类型。
@@ -1450,39 +1459,24 @@ export async function getAgentStatus(): Promise<Record<string, unknown>> {
 }
 
 export async function resetAgentExecutionStats(): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>(
-    '/api/settings/stats/reset',
-    {},
-    'reset execution stats',
-  );
+  try {
+    const response = await getTransport().request(agentUrl('/api/settings/stats/reset'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    return await parseAgentJson<Record<string, unknown>>(response, 'reset execution stats');
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error(i18n.t('bridge.agentUnreachable'));
+    }
+    throw error;
+  }
 }
 
 export async function getAgentExecutionStats(): Promise<AgentExecutionStatsPayload> {
   try {
-    const binding = resolveBindingWithOverride();
-    if (!binding.workspaceId && !binding.workspacePath) {
-      return {
-        scope: 'workspace',
-        workspaceId: '',
-        sessionId: null,
-        version: 0,
-        lastAppliedLedgerSeq: 0,
-        updatedAt: 0,
-        totals: {
-          llmCallCount: 0,
-          assignmentCount: 0,
-          turnCount: 0,
-          totalTokens: 0,
-          netInputTokens: 0,
-          netOutputTokens: 0,
-          successCount: 0,
-          failureCount: 0,
-        },
-        items: [],
-      };
-    }
-    const query = buildWorkspaceBoundQuery({});
-    const response = await getTransport().request(agentUrl('/api/settings/stats/session', query));
+    const response = await getTransport().request(agentUrl('/api/settings/stats'));
     return await parseAgentJson<AgentExecutionStatsPayload>(response, 'load execution stats');
   } catch (error) {
     if (error instanceof TypeError) {

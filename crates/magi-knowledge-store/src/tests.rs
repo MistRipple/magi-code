@@ -841,7 +841,7 @@ fn workspace_code_search_cache_respects_search_options() {
 }
 
 #[test]
-fn workspace_index_rebuild_clears_runtime_when_workspace_has_no_indexable_files() {
+fn workspace_index_rebuild_keeps_queryable_empty_runtime_when_workspace_has_no_indexable_files() {
     use crate::local_search_engine::SearchOptions;
     use std::fs;
 
@@ -878,13 +878,13 @@ fn workspace_index_rebuild_clears_runtime_when_workspace_has_no_indexable_files(
     assert!(
         store
             .search_workspace_code(&workspace_id, "authenticate", SearchOptions::default())
-            .is_none()
+            .is_some_and(|results| results.is_empty())
     );
     assert!(
         store
             .code_index_summary_for_workspace(&workspace_id)
-            .is_none(),
-        "空 workspace 不应保留旧的代码索引摘要"
+            .is_some_and(|summary| summary.files.is_empty()),
+        "空 workspace 应保留空摘要，不能复活旧文件"
     );
 
     let _ = fs::remove_dir_all(&base);

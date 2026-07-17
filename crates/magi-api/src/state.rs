@@ -1106,7 +1106,7 @@ impl ApiState {
         let Some(registry) = &self.tool_registry else {
             return 0;
         };
-        registry.cancel_active_shell_execs(&ToolExecutionContextQuery {
+        registry.cancel_active_processes(&ToolExecutionContextQuery {
             session_id: session_id.cloned(),
             workspace_id: workspace_id.cloned(),
             task_id: task_id.cloned(),

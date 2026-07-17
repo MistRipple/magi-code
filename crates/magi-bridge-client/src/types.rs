@@ -408,6 +408,17 @@ pub trait BridgeTransport: Send + Sync {
 pub trait ModelBridgeClient: Send + Sync {
     fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError>;
 
+    fn invoke_with_cancellation(
+        &self,
+        request: ModelInvocationRequest,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<BridgeResponse, BridgeClientError> {
+        if is_cancelled() {
+            return Err(model_invocation_cancelled_error());
+        }
+        self.invoke(request)
+    }
+
     /// 流式调用 LLM,每次收到内容或 thinking 增量时调用 `on_delta` 回调并传入已累积快照。
     /// 实现方必须显式声明流式行为:真流式实现接收 SSE 增量,非流式实现必须返回错误而非静默降级。
     fn invoke_streaming(
@@ -424,6 +435,37 @@ pub trait ModelBridgeClient: Send + Sync {
     ) -> Result<BridgeResponse, BridgeClientError> {
         self.invoke_streaming(request, on_delta)
     }
+
+    fn invoke_streaming_with_cancellation(
+        &self,
+        request: ModelInvocationRequest,
+        on_delta: &dyn Fn(&ModelStreamingDelta),
+        on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<BridgeResponse, BridgeClientError> {
+        if is_cancelled() {
+            return Err(model_invocation_cancelled_error());
+        }
+        self.invoke_streaming_with_retry_events(request, on_delta, on_retry)
+    }
+}
+
+pub fn model_invocation_cancelled_error() -> BridgeClientError {
+    BridgeClientError::CallFailed {
+        layer: BridgeErrorLayer::Transport,
+        code: Some(-32800),
+        message: "model invocation cancelled".to_string(),
+    }
+}
+
+pub fn model_invocation_error_is_cancelled(error: &BridgeClientError) -> bool {
+    matches!(
+        error,
+        BridgeClientError::CallFailed {
+            code: Some(-32800),
+            ..
+        }
+    )
 }
 
 pub trait McpBridgeClient: Send + Sync {

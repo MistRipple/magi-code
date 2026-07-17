@@ -10,15 +10,15 @@ use crate::protocol::{
 use crate::types::{
     BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelBridgeClient, ModelInvocationRequest,
     ModelRetryRuntimeEvent, ModelRetryRuntimePhase, ModelStreamingDelta,
+    model_invocation_cancelled_error, model_invocation_error_is_cancelled,
 };
 use magi_usage_authority::ReasoningEffort;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::env;
-use std::io::Read as IoRead;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, SystemTime};
 
 const OPENAI_BASE_URL_ENV: &str = "MAGI_OPENAI_COMPAT_BASE_URL";
@@ -28,6 +28,7 @@ const MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 16;
 const MODEL_PROVIDER_MAX_RETRIES: usize = 5;
 const MODEL_PROVIDER_RETRY_DELAYS_SECONDS: [u64; MODEL_PROVIDER_MAX_RETRIES] = [10, 15, 30, 45, 60];
 const MODEL_PROVIDER_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+const MODEL_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpModelBridgeProtocol {
@@ -48,6 +49,7 @@ pub struct HttpModelBridgeClient {
     reasoning_effort: Option<ReasoningEffort>,
 }
 
+#[derive(Clone)]
 struct HttpModelRequest {
     url: String,
     body: serde_json::Value,
@@ -211,6 +213,7 @@ impl HttpModelBridgeClient {
         request: ModelInvocationRequest,
         on_delta: &dyn Fn(&ModelStreamingDelta),
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+        is_cancelled: &dyn Fn() -> bool,
     ) -> Result<BridgeResponse, BridgeClientError> {
         if request.prompt.trim().is_empty() && request.messages.is_none() {
             return Err(BridgeClientError::CallFailed {
@@ -224,12 +227,11 @@ impl HttpModelBridgeClient {
 
         let (status, response_body, _retry_after) = execute_streaming_http_post_with_retries(
             self.provider_request_key(),
-            http_request.url,
-            http_request.body,
-            http_request.headers,
+            http_request,
             self.provider_family(),
             on_delta,
             on_retry,
+            is_cancelled,
         )?;
 
         if !(200..300).contains(&status) {
@@ -267,6 +269,16 @@ struct ModelProviderPermit {
 
 impl ModelProviderGate {
     fn acquire(&self, key: &str) -> ModelProviderPermit {
+        let cancellation = AtomicBool::new(false);
+        self.acquire_cancellable(key, &cancellation)
+            .expect("non-cancellable provider permit acquisition cannot be cancelled")
+    }
+
+    fn acquire_cancellable(
+        &self,
+        key: &str,
+        cancellation: &AtomicBool,
+    ) -> Option<ModelProviderPermit> {
         let slot = {
             let mut slots = self
                 .slots
@@ -288,15 +300,22 @@ impl ModelProviderGate {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         while *in_flight >= MODEL_PROVIDER_MAX_IN_FLIGHT {
-            in_flight = slot
+            if cancellation.load(Ordering::SeqCst) {
+                return None;
+            }
+            let (guard, _) = slot
                 .available
-                .wait(in_flight)
+                .wait_timeout(in_flight, MODEL_CANCELLATION_POLL_INTERVAL)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            in_flight = guard;
+        }
+        if cancellation.load(Ordering::SeqCst) {
+            return None;
         }
         *in_flight += 1;
         drop(in_flight);
 
-        ModelProviderPermit { slot }
+        Some(ModelProviderPermit { slot })
     }
 }
 
@@ -353,6 +372,9 @@ fn retryable_http_status(status: u16) -> bool {
 }
 
 fn retryable_bridge_error(error: &BridgeClientError) -> bool {
+    if model_invocation_error_is_cancelled(error) {
+        return false;
+    }
     matches!(
         error,
         BridgeClientError::CallFailed {
@@ -371,6 +393,65 @@ fn sleep_retry_delay(delay: Duration) {
     std::thread::sleep(delay);
     #[cfg(test)]
     let _ = delay;
+}
+
+fn sleep_retry_delay_cancellable(delay: Duration, is_cancelled: &dyn Fn() -> bool) -> bool {
+    #[cfg(test)]
+    {
+        let _ = delay;
+        !is_cancelled()
+    }
+
+    #[cfg(not(test))]
+    {
+        let deadline = std::time::Instant::now() + delay;
+        loop {
+            if is_cancelled() {
+                return false;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return true;
+            }
+            std::thread::sleep(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(MODEL_CANCELLATION_POLL_INTERVAL),
+            );
+        }
+    }
+}
+
+type HttpPostResult = Result<(u16, String, Option<Duration>), BridgeClientError>;
+
+fn receive_cancellable_http_result(
+    rx: mpsc::Receiver<HttpPostResult>,
+    cancellation_tx: tokio::sync::oneshot::Sender<()>,
+    cancellation: &AtomicBool,
+    is_cancelled: &dyn Fn() -> bool,
+    disconnected_message: &'static str,
+) -> HttpPostResult {
+    let mut cancellation_tx = Some(cancellation_tx);
+    loop {
+        if is_cancelled() {
+            cancellation.store(true, Ordering::SeqCst);
+            if let Some(tx) = cancellation_tx.take() {
+                let _ = tx.send(());
+            }
+            return Err(model_invocation_cancelled_error());
+        }
+        match rx.recv_timeout(MODEL_CANCELLATION_POLL_INTERVAL) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Transport,
+                    code: Some(-32005),
+                    message: disconnected_message.to_string(),
+                });
+            }
+        }
+    }
 }
 
 /// Execute a blocking HTTP POST on a dedicated thread so we never conflict
@@ -437,6 +518,136 @@ fn execute_http_post(
         code: Some(-32005),
         message: "HTTP request thread panicked".to_string(),
     })?
+}
+
+fn execute_cancellable_http_post(
+    provider_key: String,
+    url: String,
+    body: serde_json::Value,
+    headers: Vec<(String, String)>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> HttpPostResult {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = cancellation.clone();
+    let (cancellation_tx, cancellation_rx) = tokio::sync::oneshot::channel();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = match model_provider_gate()
+            .acquire_cancellable(&provider_key, worker_cancellation.as_ref())
+        {
+            Some(_permit) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Transport,
+                    code: Some(-32005),
+                    message: format!("HTTP runtime build failed: {error}"),
+                })
+                .and_then(|runtime| {
+                    runtime.block_on(async_http_post_io(url, body, headers, cancellation_rx))
+                }),
+            None => Err(model_invocation_cancelled_error()),
+        };
+        let _ = tx.send(result);
+    });
+
+    receive_cancellable_http_result(
+        rx,
+        cancellation_tx,
+        cancellation.as_ref(),
+        is_cancelled,
+        "HTTP request thread terminated unexpectedly",
+    )
+}
+
+async fn async_http_post_io(
+    url: String,
+    body: serde_json::Value,
+    headers: Vec<(String, String)>,
+    mut cancellation_rx: tokio::sync::oneshot::Receiver<()>,
+) -> HttpPostResult {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Transport,
+            code: Some(-32005),
+            message: format!("HTTP client build failed: {error}"),
+        })?;
+    let mut request = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .json(&body);
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let response = tokio::select! {
+        _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
+        result = request.send() => result,
+    }
+    .map_err(|error| BridgeClientError::CallFailed {
+        layer: BridgeErrorLayer::Transport,
+        code: Some(-32005),
+        message: format!("provider transport failed: {error}"),
+    })?;
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_retry_after(value, SystemTime::now()));
+    let response_body = tokio::select! {
+        _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
+        result = response.text() => result,
+    }
+    .map_err(|error| BridgeClientError::CallFailed {
+        layer: BridgeErrorLayer::Transport,
+        code: Some(-32005),
+        message: format!("reading response body failed: {error}"),
+    })?;
+    Ok((status, response_body, retry_after))
+}
+
+fn execute_cancellable_http_post_with_retries(
+    provider_key: String,
+    url: String,
+    body: serde_json::Value,
+    headers: Vec<(String, String)>,
+    is_cancelled: &dyn Fn() -> bool,
+) -> HttpPostResult {
+    let mut retries = 0usize;
+    loop {
+        let result = execute_cancellable_http_post(
+            provider_key.clone(),
+            url.clone(),
+            body.clone(),
+            headers.clone(),
+            is_cancelled,
+        );
+        match result {
+            Ok((status, _response_body, retry_after))
+                if retryable_http_status(status) && retries < MODEL_PROVIDER_MAX_RETRIES =>
+            {
+                retries += 1;
+                let delay = retry_after.unwrap_or_else(|| retry_delay(retries, &provider_key));
+                if !sleep_retry_delay_cancellable(delay, is_cancelled) {
+                    return Err(model_invocation_cancelled_error());
+                }
+            }
+            Err(error)
+                if retryable_bridge_error(&error) && retries < MODEL_PROVIDER_MAX_RETRIES =>
+            {
+                retries += 1;
+                if !sleep_retry_delay_cancellable(retry_delay(retries, &provider_key), is_cancelled)
+                {
+                    return Err(model_invocation_cancelled_error());
+                }
+            }
+            other => return other,
+        }
+    }
 }
 
 fn execute_http_post_with_retries(
@@ -570,54 +781,82 @@ fn apply_provider_stream_event(
 
 /// 执行流式 HTTP POST，通过 SSE 逐块读取 LLM 响应。
 ///
-/// HTTP I/O 在独立线程完成（与 `execute_http_post` 一致），避免在 tokio
-/// 异步运行时中创建 `reqwest::blocking::Client` 导致 panic。
-/// 增量快照通过 channel 发回调用线程，由 `on_chunk` 回调处理。
+/// HTTP I/O 在独立线程内运行异步 reqwest，请求发送、响应体读取和 provider
+/// 并发槽等待都监听同一取消信号。会话或任务被中断后，连接会被主动释放，
+/// 而不是只停止 UI 写回后继续占用上游连接。
 fn execute_streaming_http_post(
     provider_key: String,
-    url: String,
-    body: serde_json::Value,
-    headers: Vec<(String, String)>,
+    request: HttpModelRequest,
     provider_family: ProviderFamily,
     on_chunk: &dyn Fn(&ModelStreamingDelta),
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
-    let (tx, rx) = std::sync::mpsc::channel::<StreamMessage>();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = cancellation.clone();
+    let (cancellation_tx, cancellation_rx) = tokio::sync::oneshot::channel();
+    let (tx, rx) = mpsc::channel::<StreamMessage>();
 
     std::thread::spawn(move || {
-        let _permit = model_provider_gate().acquire(&provider_key);
-        let result = streaming_http_io(url, body, headers, provider_family, &tx);
-        // 无论成功失败，都通过 Done 发送最终结果
+        let HttpModelRequest { url, body, headers } = request;
+        let result = match model_provider_gate()
+            .acquire_cancellable(&provider_key, worker_cancellation.as_ref())
+        {
+            Some(_permit) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Transport,
+                    code: Some(-32005),
+                    message: format!("streaming HTTP runtime build failed: {error}"),
+                })
+                .and_then(|runtime| {
+                    runtime.block_on(streaming_http_io(
+                        url,
+                        body,
+                        headers,
+                        provider_family,
+                        &tx,
+                        cancellation_rx,
+                    ))
+                }),
+            None => Err(model_invocation_cancelled_error()),
+        };
         let _ = tx.send(StreamMessage::Done(result));
     });
 
-    // 在调用线程上处理增量和最终结果
-    for msg in rx {
-        match msg {
-            StreamMessage::Chunk(delta) => {
+    let mut cancellation_tx = Some(cancellation_tx);
+    loop {
+        if is_cancelled() {
+            cancellation.store(true, Ordering::SeqCst);
+            if let Some(tx) = cancellation_tx.take() {
+                let _ = tx.send(());
+            }
+            return Err(model_invocation_cancelled_error());
+        }
+        match rx.recv_timeout(MODEL_CANCELLATION_POLL_INTERVAL) {
+            Ok(StreamMessage::Chunk(delta)) => {
                 on_chunk(&delta);
             }
-            StreamMessage::Done(result) => {
-                return result;
+            Ok(StreamMessage::Done(result)) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Transport,
+                    code: Some(-32005),
+                    message: "streaming HTTP request thread terminated unexpectedly".to_string(),
+                });
             }
         }
     }
-
-    // channel 意外关闭（线程 panic）
-    Err(BridgeClientError::CallFailed {
-        layer: BridgeErrorLayer::Transport,
-        code: Some(-32005),
-        message: "streaming HTTP request thread terminated unexpectedly".to_string(),
-    })
 }
 
 fn execute_streaming_http_post_with_retries(
     provider_key: String,
-    url: String,
-    body: serde_json::Value,
-    headers: Vec<(String, String)>,
+    request: HttpModelRequest,
     provider_family: ProviderFamily,
     on_chunk: &dyn Fn(&ModelStreamingDelta),
     on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
     let mut retries = 0usize;
     loop {
@@ -630,11 +869,10 @@ fn execute_streaming_http_post_with_retries(
         };
         let result = execute_streaming_http_post(
             provider_key.clone(),
-            url.clone(),
-            body.clone(),
-            headers.clone(),
+            request.clone(),
             provider_family,
             &guarded_chunk,
+            is_cancelled,
         );
         let can_retry =
             !emitted_delta.load(Ordering::SeqCst) && retries < MODEL_PROVIDER_MAX_RETRIES;
@@ -650,7 +888,9 @@ fn execute_streaming_http_post_with_retries(
                     max_attempts: MODEL_PROVIDER_MAX_RETRIES,
                     delay_ms: Some(delay.as_millis() as u64),
                 });
-                sleep_retry_delay(delay);
+                if !sleep_retry_delay_cancellable(delay, is_cancelled) {
+                    return Err(model_invocation_cancelled_error());
+                }
                 on_retry(&ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::AttemptStarted,
                     attempt: retries,
@@ -668,7 +908,9 @@ fn execute_streaming_http_post_with_retries(
                     max_attempts: MODEL_PROVIDER_MAX_RETRIES,
                     delay_ms: Some(delay.as_millis() as u64),
                 });
-                sleep_before_retry(&provider_key, retries);
+                if !sleep_retry_delay_cancellable(delay, is_cancelled) {
+                    return Err(model_invocation_cancelled_error());
+                }
                 on_retry(&ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::AttemptStarted,
                     attempt: retries,
@@ -693,18 +935,19 @@ fn execute_streaming_http_post_with_retries(
 }
 
 /// 独立线程内执行的流式 HTTP I/O 逻辑。
-fn streaming_http_io(
+async fn streaming_http_io(
     url: String,
     body: serde_json::Value,
     headers: Vec<(String, String)>,
     provider_family: ProviderFamily,
-    tx: &std::sync::mpsc::Sender<StreamMessage>,
+    tx: &mpsc::Sender<StreamMessage>,
+    mut cancellation_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
         // 流式场景下 timeout 用于检测 LLM 长时间无输出（卡死），
         // 设 5 分钟：正常思考时间足够，真正无响应时能及时报错。
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout(Duration::from_secs(300))
         .build()
         .map_err(|error| BridgeClientError::CallFailed {
             layer: BridgeErrorLayer::Transport,
@@ -722,13 +965,15 @@ fn streaming_http_io(
         req_builder = req_builder.header(name.as_str(), value.as_str());
     }
 
-    let mut response = req_builder
-        .send()
-        .map_err(|error| BridgeClientError::CallFailed {
-            layer: BridgeErrorLayer::Transport,
-            code: Some(-32005),
-            message: format!("provider transport failed: {error}"),
-        })?;
+    let mut response = tokio::select! {
+        _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
+        result = req_builder.send() => result,
+    }
+    .map_err(|error| BridgeClientError::CallFailed {
+        layer: BridgeErrorLayer::Transport,
+        code: Some(-32005),
+        message: format!("provider transport failed: {error}"),
+    })?;
 
     let status = response.status().as_u16();
     let retry_after = response
@@ -739,20 +984,21 @@ fn streaming_http_io(
 
     // 非 2xx 状态码时直接读取完整响应体
     if !(200..300).contains(&status) {
-        let response_body = response
-            .text()
-            .map_err(|error| BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::Transport,
-                code: Some(-32005),
-                message: format!("reading error response body failed: {error}"),
-            })?;
+        let response_body = tokio::select! {
+            _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
+            result = response.text() => result,
+        }
+        .map_err(|error| BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Transport,
+            code: Some(-32005),
+            message: format!("reading error response body failed: {error}"),
+        })?;
         return Ok((status, response_body, retry_after));
     }
 
     // 流式读取 SSE 事件
     let mut sse_parser = SseLineParser::new();
     let mut accumulator = StreamAccumulator::new();
-    let mut chunk_buf = [0u8; 4096];
     // 用于累积跨 read 调用的不完整 UTF-8 字节，防止多字节字符（如中文 3 字节）
     // 被 4096 buffer 边界切割后 lossy 替换为 U+FFFD 导致数据损坏。
     let mut utf8_remainder: Vec<u8> = Vec::new();
@@ -763,21 +1009,21 @@ fn streaming_http_io(
     let mut raw_response = String::new();
 
     'stream_read: loop {
-        let bytes_read =
-            response
-                .read(&mut chunk_buf)
-                .map_err(|error| BridgeClientError::CallFailed {
-                    layer: BridgeErrorLayer::Transport,
-                    code: Some(-32005),
-                    message: format!("reading stream chunk failed: {error}"),
-                })?;
-
-        if bytes_read == 0 {
-            break;
+        let chunk = tokio::select! {
+            _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
+            result = response.chunk() => result,
         }
+        .map_err(|error| BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Transport,
+            code: Some(-32005),
+            message: format!("reading stream chunk failed: {error}"),
+        })?;
+        let Some(chunk) = chunk else {
+            break;
+        };
 
         // 将 remainder 与新读取的字节合并后做安全的 UTF-8 解码
-        utf8_remainder.extend_from_slice(&chunk_buf[..bytes_read]);
+        utf8_remainder.extend_from_slice(&chunk);
         let (valid_str, consumed) = decode_utf8_safe(&utf8_remainder);
         if consumed > 0 {
             utf8_remainder.drain(..consumed);
@@ -885,12 +1131,39 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         Ok(BridgeResponse { ok: true, payload })
     }
 
+    fn invoke_with_cancellation(
+        &self,
+        request: ModelInvocationRequest,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<BridgeResponse, BridgeClientError> {
+        if request.prompt.trim().is_empty() && request.messages.is_none() {
+            return Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                code: Some(-32002),
+                message: "empty prompt".to_string(),
+            });
+        }
+        let http_request = self.build_http_request(&request, false)?;
+        let (status, response_body, _retry_after) = execute_cancellable_http_post_with_retries(
+            self.provider_request_key(),
+            http_request.url,
+            http_request.body,
+            http_request.headers,
+            is_cancelled,
+        )?;
+        if !(200..300).contains(&status) {
+            return Err(provider_http_status_error(status, &response_body));
+        }
+        let payload = self.parse_success_payload(&response_body)?;
+        Ok(BridgeResponse { ok: true, payload })
+    }
+
     fn invoke_streaming(
         &self,
         request: ModelInvocationRequest,
         on_delta: &dyn Fn(&ModelStreamingDelta),
     ) -> Result<BridgeResponse, BridgeClientError> {
-        self.invoke_streaming_observed(request, on_delta, &|_| {})
+        self.invoke_streaming_observed(request, on_delta, &|_| {}, &|| false)
     }
 
     fn invoke_streaming_with_retry_events(
@@ -899,7 +1172,17 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         on_delta: &dyn Fn(&ModelStreamingDelta),
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
     ) -> Result<BridgeResponse, BridgeClientError> {
-        self.invoke_streaming_observed(request, on_delta, on_retry)
+        self.invoke_streaming_observed(request, on_delta, on_retry, &|| false)
+    }
+
+    fn invoke_streaming_with_cancellation(
+        &self,
+        request: ModelInvocationRequest,
+        on_delta: &dyn Fn(&ModelStreamingDelta),
+        on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<BridgeResponse, BridgeClientError> {
+        self.invoke_streaming_observed(request, on_delta, on_retry, is_cancelled)
     }
 }
 
@@ -1459,7 +1742,7 @@ fn provider_http_status_error(status: u16, response_body: &str) -> BridgeClientE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -2116,6 +2399,61 @@ mod tests {
         }
     }
 
+    fn spawn_cancellation_server(streaming: bool) -> (String, mpsc::Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock server should bind");
+        let address = listener.local_addr().expect("address should exist");
+        let (disconnected_tx, disconnected_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("mock server should accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("timeout should set");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut chunk).expect("request should read");
+                assert!(read > 0, "request should not close before headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut chunk).expect("request body should read");
+                assert!(read > 0, "request should not close before body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            if streaming {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"started\"}}]}\n\n",
+                    )
+                    .expect("stream headers should write");
+                stream.flush().expect("stream should flush");
+            }
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => {
+                        let _ = disconnected_tx.send(());
+                        break;
+                    }
+                    Ok(_) => {}
+                }
+            }
+        });
+        (format!("http://{address}/v1"), disconnected_rx)
+    }
+
     fn status_reason(status: u16) -> &'static str {
         match status {
             200 => "OK",
@@ -2177,6 +2515,76 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "hello");
         assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn cancellable_non_streaming_request_releases_connection() {
+        let (address, disconnected) = spawn_cancellation_server(false);
+        let client = HttpModelBridgeClient::new(
+            address,
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation_signal = cancelled.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancellation_signal.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let error = client
+            .invoke_with_cancellation(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|| cancelled.load(Ordering::SeqCst),
+            )
+            .expect_err("cancelled request should fail as cancelled");
+        assert!(model_invocation_error_is_cancelled(&error));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        disconnected
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled request should close provider connection");
+    }
+
+    #[test]
+    fn cancellable_streaming_request_releases_connection() {
+        let (address, disconnected) = spawn_cancellation_server(true);
+        let client = HttpModelBridgeClient::new(
+            address,
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation_signal = cancelled.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancellation_signal.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let error = client
+            .invoke_streaming_with_cancellation(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|_| {},
+                &|_| {},
+                &|| cancelled.load(Ordering::SeqCst),
+            )
+            .expect_err("cancelled stream should fail as cancelled");
+        assert!(model_invocation_error_is_cancelled(&error));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        disconnected
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled stream should close provider connection");
     }
 
     #[test]

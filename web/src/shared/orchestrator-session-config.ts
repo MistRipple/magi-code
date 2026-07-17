@@ -19,6 +19,24 @@ export function resolveOrchestratorReasoningEffort(
     ?? DEFAULT_ORCHESTRATOR_REASONING_EFFORT;
 }
 
+export function resolveOrchestratorModel(
+  sessionConfig: Record<string, unknown> | null | undefined,
+  effectiveConfig: Record<string, unknown> | null | undefined,
+  availableModels: readonly string[],
+): string {
+  const candidates = [
+    sessionConfig?.model,
+    effectiveConfig?.model,
+    ...availableModels,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  return '';
+}
+
 export function withOrchestratorReasoningEffort(
   currentConfig: Record<string, unknown>,
   reasoningEffort: OrchestratorReasoningEffort,

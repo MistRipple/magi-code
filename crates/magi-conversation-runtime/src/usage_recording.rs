@@ -5,6 +5,9 @@
 use crate::model_config::{
     NormalizedModelConfig, configured_role_engine_model_config, resolve_orchestrator_model_config,
 };
+use magi_bridge_client::{
+    BridgeClientError, BridgeResponse, ModelBridgeClient, ModelInvocationRequest,
+};
 use magi_core::{EventId, MissionId, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_mission_metrics::{MissionMetricsStore, TurnUsage};
@@ -35,6 +38,78 @@ pub struct ModelUsageRecordInput<'a> {
     pub status: UsageCallStatus,
     pub assignment_id: Option<String>,
     pub error_code: Option<String>,
+}
+
+pub struct AuxiliaryModelUsageContext<'a> {
+    pub event_bus: &'a InMemoryEventBus,
+    pub session_store: &'a SessionStore,
+    pub settings_store: Option<&'a Arc<SettingsStore>>,
+    pub session_id: &'a SessionId,
+    pub workspace_id: &'a Option<WorkspaceId>,
+    pub call_id: String,
+    pub phase: UsagePhase,
+}
+
+pub fn auxiliary_model_usage_binding(phase: UsagePhase) -> ModelUsageBinding {
+    ModelUsageBinding {
+        template_id: "auxiliary".to_string(),
+        engine_id: "auxiliary".to_string(),
+        binding_revision: 0,
+        role: UsageSourceRole::Auxiliary,
+        phase,
+    }
+}
+
+/// 调用辅助模型并把这次调用写入统一用量账本。
+pub fn invoke_auxiliary_model_with_usage(
+    client: Arc<dyn ModelBridgeClient>,
+    request: ModelInvocationRequest,
+    context: AuxiliaryModelUsageContext<'_>,
+) -> Result<BridgeResponse, BridgeClientError> {
+    let binding = auxiliary_model_usage_binding(context.phase);
+    match client.invoke(request) {
+        Ok(response) => {
+            let payload = response.parse_chat_payload();
+            publish_model_usage_record(
+                context.event_bus,
+                context.session_store,
+                context.settings_store,
+                ModelUsageRecordInput {
+                    session_id: context.session_id,
+                    workspace_id: context.workspace_id,
+                    binding: &binding,
+                    call_id: context.call_id,
+                    usage: payload.usage.as_ref(),
+                    status: if response.ok {
+                        UsageCallStatus::Success
+                    } else {
+                        UsageCallStatus::Failed
+                    },
+                    assignment_id: None,
+                    error_code: (!response.ok).then(|| "auxiliary_model_rejected".to_string()),
+                },
+            );
+            Ok(response)
+        }
+        Err(error) => {
+            publish_model_usage_record(
+                context.event_bus,
+                context.session_store,
+                context.settings_store,
+                ModelUsageRecordInput {
+                    session_id: context.session_id,
+                    workspace_id: context.workspace_id,
+                    binding: &binding,
+                    call_id: context.call_id,
+                    usage: None,
+                    status: UsageCallStatus::Failed,
+                    assignment_id: None,
+                    error_code: Some("auxiliary_model_invocation_failed".to_string()),
+                },
+            );
+            Err(error)
+        }
+    }
 }
 
 pub fn session_turn_model_usage_binding(use_tools: bool) -> ModelUsageBinding {
@@ -106,7 +181,7 @@ pub fn publish_model_usage_record(
     } = input;
     let usage = match usage_tokens_from_payload(usage) {
         Some(usage) => usage,
-        None if !matches!(status, UsageCallStatus::Success) => UsageTokenInput {
+        None => UsageTokenInput {
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: Some(0),
@@ -114,7 +189,6 @@ pub fn publish_model_usage_record(
             cache_write_tokens: None,
             cache_read_included_in_input: false,
         },
-        None => return,
     };
     let Some(model_config) = usage_model_config_for_binding(settings_store, binding, session_id)
     else {
@@ -262,34 +336,47 @@ fn usage_model_config_for_binding(
     session_id: &SessionId,
 ) -> Option<LlmConfig> {
     let store = settings_store?;
-    if matches!(binding.role, UsageSourceRole::Worker) {
-        if let Ok(Some(role_model)) =
-            configured_role_engine_model_config(store, &binding.template_id)
-        {
-            return role_model.config.to_usage_llm_config();
+    match binding.role {
+        UsageSourceRole::Worker => {
+            if let Ok(Some(role_model)) =
+                configured_role_engine_model_config(store, &binding.template_id)
+            {
+                return role_model.config.to_usage_llm_config();
+            }
+            let workers = store.get_section("workers");
+            if let Some(config) = workers
+                .get(&binding.engine_id)
+                .or_else(|| workers.get(&binding.template_id))
+                .and_then(
+                    |value| match NormalizedModelConfig::from_settings_value(value) {
+                        Ok(config) => Some(config),
+                        Err(error) => {
+                            tracing::warn!(
+                                role = %binding.template_id,
+                                engine = %binding.engine_id,
+                                error = %error,
+                                "worker 模型配置无效，跳过用量身份归因"
+                            );
+                            None
+                        }
+                    },
+                )
+                .and_then(|config| config.to_usage_llm_config())
+            {
+                return Some(config);
+            }
         }
-        let workers = store.get_section("workers");
-        if let Some(config) = workers
-            .get(&binding.engine_id)
-            .or_else(|| workers.get(&binding.template_id))
-            .and_then(
-                |value| match NormalizedModelConfig::from_settings_value(value) {
-                    Ok(config) => Some(config),
-                    Err(error) => {
-                        tracing::warn!(
-                            role = %binding.template_id,
-                            engine = %binding.engine_id,
-                            error = %error,
-                            "worker 模型配置无效，跳过用量身份归因"
-                        );
-                        None
-                    }
-                },
-            )
-            .and_then(|config| config.to_usage_llm_config())
-        {
-            return Some(config);
+        UsageSourceRole::Auxiliary => {
+            let config = store.get_section("auxiliary");
+            match NormalizedModelConfig::from_settings_value(&config) {
+                Ok(config) => return config.to_usage_llm_config(),
+                Err(error) => {
+                    tracing::warn!(error = %error, "auxiliary 模型配置无效，跳过用量身份归因");
+                    return None;
+                }
+            }
         }
+        UsageSourceRole::Orchestrator => {}
     }
     match resolve_orchestrator_model_config(store, Some(session_id)) {
         Ok(config) => config.to_usage_llm_config(),
@@ -608,6 +695,150 @@ mod tests {
                 .to_string()
                 .contains("secret-success-call-key")
         );
+    }
+
+    struct SuccessfulAuxiliaryClient;
+
+    impl ModelBridgeClient for SuccessfulAuxiliaryClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Ok(BridgeResponse {
+                ok: true,
+                payload: json!({
+                    "content": "辅助模型已完成",
+                    "usage": {
+                        "prompt_tokens": 17,
+                        "completion_tokens": 9,
+                        "total_tokens": 26
+                    }
+                })
+                .to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            self.invoke(request)
+        }
+    }
+
+    #[test]
+    fn invoke_auxiliary_model_with_usage_records_success_and_auxiliary_config() {
+        let event_bus = InMemoryEventBus::new(8);
+        let session_store = SessionStore::new();
+        let settings_store = Arc::new(SettingsStore::new());
+        settings_store
+            .set_section(
+                "auxiliary",
+                json!({
+                    "baseUrl": "https://auxiliary.example.test/v1",
+                    "provider": "openai-compatible",
+                    "apiKey": "secret-auxiliary-success-key",
+                    "model": "auxiliary-success-model"
+                }),
+            )
+            .unwrap();
+        let session_id = SessionId::new("session-auxiliary-success");
+        let workspace_id = Some(WorkspaceId::new("workspace-auxiliary-success"));
+
+        let response = invoke_auxiliary_model_with_usage(
+            Arc::new(SuccessfulAuxiliaryClient),
+            ModelInvocationRequest {
+                provider: "openai-compatible".to_string(),
+                prompt: "测试辅助模型用量记录".to_string(),
+                messages: None,
+                tools: None,
+                tool_choice: None,
+            },
+            AuxiliaryModelUsageContext {
+                event_bus: &event_bus,
+                session_store: &session_store,
+                settings_store: Some(&settings_store),
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                call_id: "auxiliary-success-call".to_string(),
+                phase: UsagePhase::Integration,
+            },
+        )
+        .expect("辅助模型成功调用不应失败");
+
+        assert!(response.ok);
+        let event = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "model.usage.recorded")
+            .expect("辅助模型成功调用必须写入用量账本");
+        assert_eq!(event.payload["status"], json!("success"));
+        assert_eq!(
+            event.payload["executionBinding"]["role"],
+            json!("auxiliary")
+        );
+        assert_eq!(
+            event.payload["modelConfig"]["model"],
+            json!("auxiliary-success-model")
+        );
+        assert_eq!(event.payload["usage"]["inputTokens"], json!(17));
+        assert_eq!(event.payload["usage"]["outputTokens"], json!(9));
+        assert_eq!(event.payload["usage"]["totalTokens"], json!(26));
+        assert!(
+            !event
+                .payload
+                .to_string()
+                .contains("secret-auxiliary-success-key")
+        );
+    }
+
+    #[test]
+    fn publish_model_usage_record_keeps_successful_call_without_token_usage() {
+        let event_bus = InMemoryEventBus::new(8);
+        let session_store = SessionStore::new();
+        let settings_store = Arc::new(SettingsStore::new());
+        let session_id = SessionId::new("session-success-without-usage");
+        settings_store
+            .set_section(
+                "auxiliary",
+                json!({
+                    "baseUrl": "https://example.test",
+                    "provider": "openai-compatible",
+                    "model": "auxiliary-no-usage-model"
+                }),
+            )
+            .unwrap();
+        let binding = auxiliary_model_usage_binding(UsagePhase::Planning);
+        let workspace_id = Some(WorkspaceId::new("workspace-success-without-usage"));
+
+        publish_model_usage_record(
+            &event_bus,
+            &session_store,
+            Some(&settings_store),
+            ModelUsageRecordInput {
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                binding: &binding,
+                call_id: "call-success-without-usage".to_string(),
+                usage: None,
+                status: UsageCallStatus::Success,
+                assignment_id: None,
+                error_code: None,
+            },
+        );
+
+        let event = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "model.usage.recorded")
+            .expect("没有 token 的成功调用也必须保留调用统计");
+        assert_eq!(event.payload["status"], json!("success"));
+        assert_eq!(event.payload["usage"]["inputTokens"], json!(0));
+        assert_eq!(event.payload["usage"]["outputTokens"], json!(0));
+        assert_eq!(event.payload["usage"]["totalTokens"], json!(0));
     }
 
     #[test]

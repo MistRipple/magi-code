@@ -270,6 +270,7 @@ fn start_daemon(app: AppHandle, state_root: PathBuf, web_dist_root: PathBuf) {
 }
 
 fn main() {
+    magi_process::initialize_user_process_environment();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())

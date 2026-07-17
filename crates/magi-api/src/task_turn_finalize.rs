@@ -152,7 +152,7 @@ mod tests {
         let todo_ledger =
             magi_todo_ledger::TodoLedger::new(session_store.clone(), session_id.clone());
         todo_ledger
-            .replace(vec![magi_core::TodoItem::new(
+            .write(vec![magi_core::TodoItem::new(
                 "执行当前步骤",
                 "正在执行当前步骤",
                 magi_core::TodoStatus::InProgress,

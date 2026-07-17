@@ -8,10 +8,9 @@ use magi_bridge_client::{
     ImageGenerationRequest as BridgeImageGenerationRequest, ModelBridgeClient,
     ModelInvocationRequest,
 };
-use magi_core::{AccessProfile, SessionId, UtcMillis};
-use magi_usage_authority::{
-    SessionSummary, UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals,
-};
+use magi_core::{AccessProfile, EventId, SessionId, UtcMillis};
+use magi_event_bus::{EventContext, EventEnvelope};
+use magi_usage_authority::{UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -22,8 +21,9 @@ use super::session_scope;
 use crate::{
     errors::{ApiError, settings_persistence_error},
     model_config::{
-        NormalizedModelConfig, merge_orchestrator_session_override,
-        reject_deprecated_model_config_fields, strip_orchestrator_session_owned_fields,
+        DEFAULT_ORCHESTRATOR_REASONING_EFFORT, NormalizedModelConfig,
+        merge_orchestrator_session_override, reject_deprecated_model_config_fields,
+        resolve_orchestrator_model_config, strip_orchestrator_session_owned_fields,
     },
     scope_binding::without_scope_binding_fields,
     state::ApiState,
@@ -90,7 +90,10 @@ pub(super) fn orchestrator_session_override_request(
     if config.contains_key("reasoningEffort") {
         match config.get("reasoningEffort") {
             Some(Value::Null) => {
-                override_config.insert("reasoningEffort".to_string(), Value::Null);
+                override_config.insert(
+                    "reasoningEffort".to_string(),
+                    Value::String(DEFAULT_ORCHESTRATOR_REASONING_EFFORT.to_string()),
+                );
             }
             Some(Value::String(value)) => {
                 let value = value.trim();
@@ -139,11 +142,57 @@ pub(super) fn save_orchestrator_session_override_for_session(
     for (key, value) in override_fields {
         next_fields.insert(key.clone(), value.clone());
     }
+    let reasoning_effort_is_valid = next_fields
+        .get("reasoningEffort")
+        .and_then(Value::as_str)
+        .is_some_and(|value| matches!(value.trim(), "low" | "medium" | "high" | "xhigh"));
+    if !reasoning_effort_is_valid {
+        next_fields.insert(
+            "reasoningEffort".to_string(),
+            Value::String(DEFAULT_ORCHESTRATOR_REASONING_EFFORT.to_string()),
+        );
+    }
     state
         .settings_store
         .set_session_section(session_id, "orchestrator", next_config.clone())
         .map_err(settings_persistence_error)?;
+    let workspace_id = state
+        .session_store
+        .session(session_id)
+        .and_then(|session| state.session_workspace_id(&session));
+    state.event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-session-configuration-updated-{}-{}",
+                session_id,
+                UtcMillis::now().0
+            )),
+            "session.configuration.updated",
+            json!({
+                "sessionId": session_id.to_string(),
+                "workspaceId": workspace_id.as_ref().map(ToString::to_string),
+                "orchestratorSessionConfig": next_config.clone(),
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id,
+            session_id: Some(session_id.clone()),
+            ..EventContext::default()
+        }),
+    );
     Ok(Some(next_config))
+}
+
+pub(super) fn require_orchestrator_session_model(
+    state: &ApiState,
+    session_id: &SessionId,
+) -> Result<(), ApiError> {
+    let config = resolve_orchestrator_model_config(&state.settings_store, Some(session_id))
+        .map_err(ApiError::InvalidInput)?;
+    config
+        .require_model()
+        .map(|_| ())
+        .map_err(|_| ApiError::InvalidInput("主线模型尚未选择，请刷新模型列表后重试".to_string()))
 }
 
 fn parse_optional_query_string(query: &HashMap<String, String>, key: &str) -> Option<String> {
@@ -434,7 +483,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/registry/agents/upsert", post(upsert_agent))
         .route("/settings/registry/agents/remove", post(remove_agent))
         .route("/settings/models/fetch", post(fetch_models))
-        .route("/settings/stats/session", get(session_stats))
+        .route("/settings/stats", get(execution_stats))
         .route("/settings/stats/reset", post(reset_stats))
 }
 
@@ -1358,48 +1407,19 @@ async fn fetch_models(
     })))
 }
 
-async fn session_stats(
+async fn execution_stats(
     State(state): State<ApiState>,
-    Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    reject_deprecated_scope_query_fields(&query)?;
-    let workspace_id = session_scope::require_registered_workspace_binding(
-        &state,
-        parse_optional_query_string(&query, "workspaceId").as_deref(),
-        parse_optional_query_string(&query, "workspacePath").as_deref(),
-    )?
-    .workspace_id
-    .to_string();
-    let session_id = parse_optional_query_string(&query, "sessionId");
     let mut authority = usage_authority_from_model_usage_ledger(&state);
-    if let Some(session_id) = session_id.as_deref() {
-        let snapshot = authority.get_session_snapshot(&workspace_id, session_id);
-        Ok(Json(serde_json::json!({
-            "scope": "session",
-            "workspaceId": snapshot.workspace_id,
-            "sessionId": snapshot.session_id,
-            "version": snapshot.version,
-            "lastAppliedLedgerSeq": snapshot.last_applied_ledger_seq,
-            "updatedAt": snapshot.updated_at,
-            "totals": usage_totals_json(&snapshot.totals),
-            "items": snapshot.by_execution_binding.into_iter().map(usage_binding_item_json).collect::<Vec<_>>(),
-            "models": snapshot.by_model_identity.into_iter().map(usage_model_item_json).collect::<Vec<_>>(),
-        })))
-    } else {
-        let snapshot = authority.get_workspace_snapshot(&workspace_id);
-        Ok(Json(serde_json::json!({
-            "scope": "workspace",
-            "workspaceId": snapshot.workspace_id,
-            "sessionId": serde_json::Value::Null,
-            "version": snapshot.version,
-            "lastAppliedLedgerSeq": snapshot.version,
-            "updatedAt": snapshot.updated_at,
-            "totals": usage_totals_json(&snapshot.totals),
-            "items": snapshot.by_execution_binding.into_iter().map(usage_binding_item_json).collect::<Vec<_>>(),
-            "models": snapshot.by_model_identity.into_iter().map(usage_model_item_json).collect::<Vec<_>>(),
-            "sessions": snapshot.by_session.into_iter().map(usage_session_summary_json).collect::<Vec<_>>(),
-        })))
-    }
+    let snapshot = authority.get_workspace_snapshot("all");
+    Ok(Json(serde_json::json!({
+        "version": snapshot.version,
+        "lastAppliedLedgerSeq": snapshot.version,
+        "updatedAt": snapshot.updated_at,
+        "totals": usage_totals_json(&snapshot.totals),
+        "items": snapshot.by_execution_binding.into_iter().map(usage_binding_item_json).collect::<Vec<_>>(),
+        "models": snapshot.by_model_identity.into_iter().map(usage_model_item_json).collect::<Vec<_>>(),
+    })))
 }
 
 fn usage_authority_from_model_usage_ledger(state: &ApiState) -> UsageAuthority {
@@ -1422,6 +1442,7 @@ fn usage_authority_from_model_usage_ledger(state: &ApiState) -> UsageAuthority {
         if input.timestamp.is_none() {
             input.timestamp = Some(entry.occurred_at.0);
         }
+        input.workspace_id = "all".to_string();
         authority.append_call_record(input);
     }
     authority
@@ -1475,63 +1496,14 @@ fn usage_model_item_json(model: UsageModelSnapshot) -> serde_json::Value {
     })
 }
 
-fn usage_session_summary_json(summary: SessionSummary) -> serde_json::Value {
-    serde_json::json!({
-        "sessionId": summary.session_id,
-        "version": summary.version,
-        "updatedAt": summary.updated_at,
-        "totals": usage_totals_json(&summary.totals),
-    })
-}
-
 async fn reset_stats(
     State(state): State<ApiState>,
-    Json(request): Json<serde_json::Value>,
+    Json(_request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    reject_deprecated_scope_body_fields(&request)?;
-    let workspace_id_value = request
-        .get("workspaceId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let workspace_path_value = request
-        .get("workspacePath")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let workspace_id = session_scope::require_registered_workspace_binding(
-        &state,
-        workspace_id_value,
-        workspace_path_value,
-    )?
-    .workspace_id
-    .to_string();
-    let session_id = request
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
     let mut snapshot = state.event_bus.audit_usage_ledger_snapshot();
-    snapshot.usage_entries.retain(|entry| {
-        if entry.event_type != "model.usage.recorded" {
-            return true;
-        }
-        let same_workspace = entry
-            .context
-            .workspace_id
-            .as_ref()
-            .map(ToString::to_string)
-            .is_some_and(|value| value == workspace_id);
-        let same_session = session_id.is_none_or(|session_id| {
-            entry
-                .context
-                .session_id
-                .as_ref()
-                .map(ToString::to_string)
-                .is_some_and(|value| value == session_id)
-        });
-        !(same_workspace && same_session)
-    });
+    snapshot
+        .usage_entries
+        .retain(|entry| entry.event_type != "model.usage.recorded");
     state.event_bus.import_audit_usage_ledger_snapshot(snapshot);
     state
         .event_bus
@@ -2362,23 +2334,6 @@ mod tests {
         .await;
         assert_deprecated_scope_field_error(access_profile_result, "access_profile");
 
-        let stats_result = session_stats(
-            State(test_state()),
-            Query(HashMap::from([(
-                "workspace_id".to_string(),
-                "workspace-old".to_string(),
-            )])),
-        )
-        .await;
-        assert_deprecated_scope_field_error(stats_result, "workspace_id");
-
-        let reset_result = reset_stats(
-            State(test_state()),
-            Json(json!({ "workspace_path": "/tmp/old" })),
-        )
-        .await;
-        assert_deprecated_scope_field_error(reset_result, "workspace_path");
-
         let session_save_result = save_orchestrator_session_config(
             State(test_state()),
             Json(json!({ "session_id": "session-old" })),
@@ -3140,6 +3095,25 @@ mod tests {
             response["effectiveOrchestratorConfig"]["model"],
             json!("session-main-model")
         );
+        let configuration_event = state
+            .event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "session.configuration.updated")
+            .expect("会话模型配置变更必须广播给其他窗口");
+        assert_eq!(configuration_event.session_id.as_ref(), Some(&session_id));
+        assert_eq!(
+            configuration_event
+                .workspace_id
+                .as_ref()
+                .map(ToString::to_string),
+            Some("workspace-session-model".to_string())
+        );
+        assert_eq!(
+            configuration_event.payload["orchestratorSessionConfig"]["model"],
+            json!("session-main-model")
+        );
     }
 
     #[tokio::test]
@@ -3195,6 +3169,49 @@ mod tests {
             response["effectiveOrchestratorConfig"]["reasoningEffort"],
             json!("high")
         );
+    }
+
+    #[test]
+    fn first_session_model_defaults_reasoning_effort_to_medium() {
+        let state = test_state();
+        let session_id = SessionId::new("session-model-default-effort");
+
+        let saved = save_orchestrator_session_override_for_session(
+            &state,
+            &session_id,
+            &json!({ "model": "first-model" }),
+        )
+        .expect("首次模型选择应保存")
+        .expect("首次模型选择应生成会话覆盖");
+
+        assert_eq!(saved["model"], json!("first-model"));
+        assert_eq!(saved["reasoningEffort"], json!("medium"));
+        require_orchestrator_session_model(&state, &session_id)
+            .expect("默认模型和中等推理强度应形成可执行配置");
+    }
+
+    #[test]
+    fn session_model_validation_rejects_missing_model() {
+        let state = test_state();
+        let session_id = SessionId::new("session-model-missing");
+        state
+            .settings_store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-global",
+                    "urlMode": "standard"
+                }),
+            )
+            .unwrap();
+
+        match require_orchestrator_session_model(&state, &session_id) {
+            Err(ApiError::InvalidInput(message)) => {
+                assert_eq!(message, "主线模型尚未选择，请刷新模型列表后重试");
+            }
+            other => panic!("缺少主线模型必须被拒绝，实际结果：{other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3355,24 +3372,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_stats_returns_frontend_stats_contract() {
+    async fn execution_stats_returns_frontend_stats_contract() {
         let state = test_state();
-        let _workspace_root = register_test_workspace(&state, "workspace-stats");
-        let payload = session_stats(
-            State(state),
-            Query(HashMap::from([
-                ("workspaceId".to_string(), "workspace-stats".to_string()),
-                ("sessionId".to_string(), "session-stats".to_string()),
-            ])),
-        )
-        .await
-        .expect("session stats should build")
-        .0;
+        let payload = execution_stats(State(state))
+            .await
+            .expect("global stats should build")
+            .0;
 
-        assert_eq!(payload["scope"], serde_json::json!("session"));
-        assert_eq!(payload["workspaceId"], serde_json::json!("workspace-stats"));
-        assert_eq!(payload["sessionId"], serde_json::json!("session-stats"));
         assert!(payload["items"].is_array());
+        assert!(payload["models"].is_array());
+        assert!(payload.get("workspaceId").is_none());
+        assert!(payload.get("sessions").is_none());
+        assert!(payload.get("scope").is_none());
+        assert!(payload.get("sessionId").is_none());
         assert!(payload["totals"].is_object());
         assert!(payload["updatedAt"].is_number());
         assert!(payload["version"].is_number());
@@ -3380,7 +3392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_stats_uses_model_usage_ledger_as_authority() {
+    async fn execution_stats_uses_model_usage_ledger_as_authority() {
         let state = test_state();
         let _workspace_root = register_test_workspace(&state, "workspace-stats");
         let usage_payload = model_usage_payload(
@@ -3405,16 +3417,10 @@ mod tests {
             }),
         );
 
-        let payload = session_stats(
-            State(state.clone()),
-            Query(HashMap::from([
-                ("workspaceId".to_string(), "workspace-stats".to_string()),
-                ("sessionId".to_string(), "session-stats".to_string()),
-            ])),
-        )
-        .await
-        .expect("session stats should build")
-        .0;
+        let payload = execution_stats(State(state.clone()))
+            .await
+            .expect("global stats should build")
+            .0;
 
         assert_eq!(payload["totals"]["netInputTokens"], serde_json::json!(12));
         assert_eq!(payload["totals"]["netOutputTokens"], serde_json::json!(5));
@@ -3438,70 +3444,177 @@ mod tests {
         assert!(payload["items"][0].get("cacheReadTokens").is_none());
         assert!(payload["items"][0].get("cacheWriteTokens").is_none());
 
-        let _ = reset_stats(
-            State(state.clone()),
-            Json(serde_json::json!({
-                "workspaceId": "workspace-stats",
-                "sessionId": "session-stats"
-            })),
-        )
-        .await
-        .expect("reset stats");
-        let payload = session_stats(
-            State(state),
-            Query(HashMap::from([
-                ("workspaceId".to_string(), "workspace-stats".to_string()),
-                ("sessionId".to_string(), "session-stats".to_string()),
-            ])),
-        )
-        .await
-        .expect("session stats should build after reset")
-        .0;
+        let _ = reset_stats(State(state.clone()), Json(serde_json::json!({})))
+            .await
+            .expect("reset stats");
+        let payload = execution_stats(State(state))
+            .await
+            .expect("global stats should build after reset")
+            .0;
         assert_eq!(payload["totals"]["totalTokens"], serde_json::json!(0));
         assert_eq!(payload["items"].as_array().unwrap().len(), 0);
+        assert_eq!(payload["models"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
-    async fn session_stats_requires_registered_workspace_scope() {
-        let result = session_stats(
-            State(test_state()),
-            Query(HashMap::from([(
-                "sessionId".to_string(),
-                "session-stats".to_string(),
-            )])),
-        )
-        .await;
-
-        match result {
-            Err(ApiError::InvalidInput(message)) => {
-                assert_eq!(message, "workspaceId 不能为空");
-            }
-            other => panic!("unexpected session stats result: {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn reset_stats_requires_registered_workspace_scope() {
-        let result = reset_stats(
-            State(test_state()),
-            Json(serde_json::json!({
-                "sessionId": "session-stats"
-            })),
-        )
-        .await;
-
-        match result {
-            Err(ApiError::InvalidInput(message)) => {
-                assert_eq!(message, "workspaceId 不能为空");
-            }
-            other => panic!("unexpected reset stats result: {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn reset_stats_only_removes_usage_with_matching_workspace_context() {
+    async fn execution_stats_keeps_models_separate_after_main_model_switch() {
         let state = test_state();
-        let _workspace_root = register_test_workspace(&state, "workspace-stats");
+        let _workspace_root = register_test_workspace(&state, "workspace-model-switch");
+        let first = model_usage_payload(
+            "usage-model-a",
+            "workspace-model-switch",
+            "session-model-switch",
+            "call-a",
+            101,
+            12,
+            5,
+        );
+        let mut second = model_usage_payload(
+            "usage-model-b",
+            "workspace-model-switch",
+            "session-model-switch",
+            "call-b",
+            102,
+            20,
+            8,
+        );
+        second["modelConfig"]["model"] = json!("gpt-5.6-luna");
+
+        for (event_id, payload) in [("usage-model-a", first), ("usage-model-b", second)] {
+            state.event_bus.publish(
+                EventEnvelope::usage(EventId::new(event_id), "model.usage.recorded", payload)
+                    .with_context(EventContext {
+                        workspace_id: Some(WorkspaceId::new("workspace-model-switch")),
+                        session_id: Some(SessionId::new("session-model-switch")),
+                        ..EventContext::default()
+                    }),
+            );
+        }
+
+        let payload = execution_stats(State(state))
+            .await
+            .expect("global stats should keep switched models")
+            .0;
+
+        assert_eq!(payload["items"].as_array().map(Vec::len), Some(2));
+        assert_eq!(payload["models"].as_array().map(Vec::len), Some(2));
+        assert_eq!(payload["totals"]["netInputTokens"], json!(32));
+        assert_eq!(payload["totals"]["netOutputTokens"], json!(13));
+
+        let mut models = payload["models"]
+            .as_array()
+            .expect("models should be returned")
+            .iter()
+            .filter_map(|item| item["resolvedModel"].as_str())
+            .collect::<Vec<_>>();
+        models.sort_unstable();
+        assert_eq!(models, vec!["gpt-4.1", "gpt-5.6-luna"]);
+    }
+
+    #[tokio::test]
+    async fn execution_stats_exposes_model_and_role_dimensions() {
+        let state = test_state();
+        let _workspace_root = register_test_workspace(&state, "workspace-stats-dimensions");
+        let first = model_usage_payload(
+            "usage-session-a",
+            "workspace-stats-dimensions",
+            "session-a",
+            "call-a",
+            101,
+            12,
+            5,
+        );
+        let mut second = model_usage_payload(
+            "usage-session-b",
+            "workspace-stats-dimensions",
+            "session-b",
+            "call-b",
+            102,
+            20,
+            8,
+        );
+        second["modelConfig"]["model"] = json!("gpt-5.6-luna");
+
+        for (event_id, session_id, payload) in [
+            ("usage-session-a", "session-a", first),
+            ("usage-session-b", "session-b", second),
+        ] {
+            state.event_bus.publish(
+                EventEnvelope::usage(EventId::new(event_id), "model.usage.recorded", payload)
+                    .with_context(EventContext {
+                        workspace_id: Some(WorkspaceId::new("workspace-stats-dimensions")),
+                        session_id: Some(SessionId::new(session_id)),
+                        ..EventContext::default()
+                    }),
+            );
+        }
+
+        let payload = execution_stats(State(state))
+            .await
+            .expect("global stats should expose model and role dimensions")
+            .0;
+
+        assert!(payload.get("sessions").is_none());
+        assert_eq!(payload["models"].as_array().map(Vec::len), Some(2));
+        assert_eq!(payload["items"].as_array().map(Vec::len), Some(2));
+        assert_eq!(payload["totals"]["llmCallCount"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn execution_stats_does_not_require_workspace_binding() {
+        let payload = execution_stats(State(test_state()))
+            .await
+            .expect("global stats should not require workspace binding")
+            .0;
+
+        assert_eq!(payload["totals"]["totalTokens"], json!(0));
+        assert_eq!(payload["items"].as_array().map(Vec::len), Some(0));
+        assert_eq!(payload["models"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[tokio::test]
+    async fn execution_stats_aggregates_usage_across_workspaces() {
+        let state = test_state();
+        for (event_id, workspace_id, session_id, input_tokens, output_tokens) in [
+            ("usage-workspace-a", "workspace-a", "session-a", 12, 5),
+            ("usage-workspace-b", "workspace-b", "session-b", 30, 7),
+        ] {
+            state.event_bus.publish(
+                EventEnvelope::usage(
+                    EventId::new(event_id),
+                    "model.usage.recorded",
+                    model_usage_payload(
+                        event_id,
+                        workspace_id,
+                        session_id,
+                        event_id,
+                        101,
+                        input_tokens,
+                        output_tokens,
+                    ),
+                )
+                .with_context(EventContext {
+                    workspace_id: Some(WorkspaceId::new(workspace_id)),
+                    session_id: Some(SessionId::new(session_id)),
+                    ..EventContext::default()
+                }),
+            );
+        }
+
+        let payload = execution_stats(State(state))
+            .await
+            .expect("global stats should aggregate all workspaces")
+            .0;
+
+        assert_eq!(payload["totals"]["llmCallCount"], json!(2));
+        assert_eq!(payload["totals"]["netInputTokens"], json!(42));
+        assert_eq!(payload["totals"]["netOutputTokens"], json!(12));
+        assert_eq!(payload["totals"]["totalTokens"], json!(54));
+    }
+
+    #[tokio::test]
+    async fn reset_stats_removes_all_recorded_model_usage() {
+        let state = test_state();
         for (event_id, context, input_tokens, output_tokens, call_id, timestamp) in [
             (
                 "usage-scoped",
@@ -3541,50 +3654,34 @@ mod tests {
                 .with_context(context),
             );
         }
+        state.event_bus.publish(EventEnvelope::usage(
+            EventId::new("usage-other"),
+            "tool.usage.recorded",
+            json!({ "tool": "file_read" }),
+        ));
 
-        let before_reset = session_stats(
-            State(state.clone()),
-            Query(HashMap::from([
-                ("workspaceId".to_string(), "workspace-stats".to_string()),
-                ("sessionId".to_string(), "session-stats".to_string()),
-            ])),
-        )
-        .await
-        .expect("session stats should build before reset")
-        .0;
+        let before_reset = execution_stats(State(state.clone()))
+            .await
+            .expect("global stats should build before reset")
+            .0;
         assert_eq!(before_reset["totals"]["totalTokens"], serde_json::json!(54));
 
-        let _ = reset_stats(
-            State(state.clone()),
-            Json(serde_json::json!({
-                "workspaceId": "workspace-stats",
-                "sessionId": "session-stats"
-            })),
-        )
-        .await
-        .expect("reset stats should succeed");
+        let _ = reset_stats(State(state.clone()), Json(serde_json::json!({})))
+            .await
+            .expect("reset stats should succeed");
 
-        let after_reset = session_stats(
-            State(state.clone()),
-            Query(HashMap::from([
-                ("workspaceId".to_string(), "workspace-stats".to_string()),
-                ("sessionId".to_string(), "session-stats".to_string()),
-            ])),
-        )
-        .await
-        .expect("session stats should build after reset")
-        .0;
-        assert_eq!(after_reset["totals"]["totalTokens"], serde_json::json!(37));
+        let after_reset = execution_stats(State(state.clone()))
+            .await
+            .expect("global stats should build after reset")
+            .0;
+        assert_eq!(after_reset["totals"]["totalTokens"], serde_json::json!(0));
 
         let ledger_snapshot = state.event_bus.audit_usage_ledger_snapshot();
         assert_eq!(ledger_snapshot.usage_entries.len(), 1);
-        assert_eq!(ledger_snapshot.usage_entries[0].event_id, "usage-unscoped");
-        assert!(
-            ledger_snapshot.usage_entries[0]
-                .context
-                .workspace_id
-                .is_none(),
-            "reset must not treat missing event context as matching the current workspace"
+        assert_eq!(ledger_snapshot.usage_entries[0].event_id, "usage-other");
+        assert_eq!(
+            ledger_snapshot.usage_entries[0].event_type,
+            "tool.usage.recorded"
         );
     }
 

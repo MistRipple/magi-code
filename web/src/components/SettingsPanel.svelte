@@ -249,6 +249,22 @@ import {
                 {/if}
               </span>
             </button>
+            {#if updateState === 'installing'}
+              <div
+                class="desktop-update-progress desktop-update-progress--settings"
+                role="progressbar"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow={updateProgress?.percent}
+                aria-label={i18n.t('settings.update.installing')}
+              >
+                <span
+                  class="desktop-update-progress__fill"
+                  class:desktop-update-progress__fill--indeterminate={updateProgress?.percent === undefined}
+                  style:width={updateProgress?.percent !== undefined ? `${updateProgress.percent}%` : undefined}
+                ></span>
+              </div>
+            {/if}
           {/if}
           <div class="locale-selector">
             <button
@@ -284,7 +300,7 @@ import {
       <div class="settings-tab-content scroll-content" onscroll={() => { store.closeAllModelDropdowns(); }}>
       {#if store.activeTab === 'stats'}
         <!-- 统计 Tab -->
-        <SettingsStatsTab totalInputTokens={store.totalInputTokens} totalOutputTokens={store.totalOutputTokens} totalTokens={store.totalTokens} isRefreshing={store.isRefreshing} refreshConnections={store.refreshConnections} showResetConfirmDialog={store.showResetConfirmDialog} modelStatuses={store.modelStatuses} statsDisplayKeys={store.statsDisplayKeys} getWorkerStats={store.getWorkerStats} getStatusClass={store.getStatusClass} getWorkerDisplayName={store.getWorkerDisplayName} statusTexts={store.statusTexts}
+        <SettingsStatsTab totalInputTokens={store.totalInputTokens} totalOutputTokens={store.totalOutputTokens} totalTokens={store.totalTokens} isRefreshing={store.isRefreshing} refreshConnections={store.refreshConnections} showResetConfirmDialog={store.showResetConfirmDialog} modelStatuses={store.modelStatuses} bindingUsageStats={store.executionStats} modelUsageStats={store.executionModelStats} statsDisplayKeys={store.statsDisplayKeys} getWorkerStats={store.getWorkerStats} getStatsRoleModelStatus={store.getStatsRoleModelStatus} getStatusClass={store.getStatusClass} getWorkerDisplayName={store.getWorkerDisplayName} statusTexts={store.statusTexts}
         />
       {:else if store.activeTab === 'model'}
         <!-- 模型配置 Tab -->
@@ -549,7 +565,7 @@ import {
     onClose={store.cancelResetStats}
     title={i18n.t('settings.resetConfirm.title')}
   >
-    <p style="margin: 0; color: var(--foreground);">{i18n.t('settings.resetConfirm.message')}</p>
+    <p style="margin: 0; color: var(--foreground);">{i18n.t('settings.resetConfirm.workspaceMessage')}</p>
     <p style="margin: var(--space-2) 0 0; color: var(--foreground-muted); font-size: var(--text-sm);">{i18n.t('settings.resetConfirm.irreversible')}</p>
     {#snippet footer()}
       <button class="settings-btn secondary" onclick={store.cancelResetStats}>{i18n.t('settings.resetConfirm.cancel')}</button>

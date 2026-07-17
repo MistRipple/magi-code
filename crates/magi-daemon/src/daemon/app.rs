@@ -9,7 +9,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, get_service},
 };
-use magi_process::{std_command, tokio_command};
+use magi_process::{AsyncManagedChild, spawn_managed_tokio, std_command, tokio_command};
 use std::{
     env,
     net::SocketAddr,
@@ -19,7 +19,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::net::TcpListener;
-use tokio::process::Child;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
 use tower_http::{
@@ -70,10 +69,77 @@ impl DaemonHandle {
         Ok(())
     }
 
-    pub async fn wait(self) -> Result<(), DaemonError> {
-        self.server_task
+    pub async fn wait(mut self) -> Result<(), DaemonError> {
+        let result = (&mut self.server_task).await.map_err(|error| {
+            DaemonError::internal(format!("daemon server task failed: {error}"))
+        })?;
+        if !*self.shutdown_tx.borrow() {
+            self.runtime
+                .prepare_graceful_shutdown("daemon server task exited")?;
+        }
+        result
+    }
+
+    pub async fn wait_for_shutdown_signal(mut self) -> Result<(), DaemonError> {
+        tokio::select! {
+            result = &mut self.server_task => {
+                let result = result.map_err(|error| {
+                    DaemonError::internal(format!("daemon server task failed: {error}"))
+                })?;
+                if !*self.shutdown_tx.borrow() {
+                    self.runtime.prepare_graceful_shutdown("daemon server task exited")?;
+                }
+                result
+            }
+            signal = wait_for_process_shutdown_signal() => {
+                let reason = signal?;
+                self.shutdown(reason)?;
+                (&mut self.server_task).await.map_err(|error| {
+                    DaemonError::internal(format!("daemon server task failed: {error}"))
+                })?
+            }
+        }
+    }
+}
+
+impl Drop for DaemonHandle {
+    fn drop(&mut self) {
+        if !*self.shutdown_tx.borrow() {
+            let _ = self
+                .runtime
+                .prepare_graceful_shutdown("daemon handle dropped");
+            self.shutdown_tx.send_replace(true);
+        }
+        if !self.server_task.is_finished() {
+            self.server_task.abort();
+        }
+    }
+}
+
+async fn wait_for_process_shutdown_signal() -> Result<&'static str, DaemonError> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate())
+            .map_err(|error| DaemonError::internal(format!("注册 SIGTERM 监听失败: {error}")))?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.map_err(|error| {
+                    DaemonError::internal(format!("监听 Ctrl-C 失败: {error}"))
+                })?;
+                Ok("process interrupt signal")
+            }
+            _ = terminate.recv() => Ok("process terminate signal"),
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        tokio::signal::ctrl_c()
             .await
-            .map_err(|error| DaemonError::internal(format!("daemon server task failed: {error}")))?
+            .map_err(|error| DaemonError::internal(format!("监听 Ctrl-C 失败: {error}")))?;
+        Ok("process interrupt signal")
     }
 }
 
@@ -169,7 +235,7 @@ struct WebDevServerInner {
     web_root: PathBuf,
     host: String,
     port: u16,
-    child: Mutex<Option<Child>>,
+    child: Mutex<Option<AsyncManagedChild>>,
     recover_lock: AsyncMutex<()>,
 }
 
@@ -180,7 +246,7 @@ impl WebDevServer {
         web_root: PathBuf,
         host: String,
         port: u16,
-        child: Option<Child>,
+        child: Option<AsyncManagedChild>,
     ) -> Self {
         Self {
             inner: Arc::new(WebDevServerInner {
@@ -240,7 +306,7 @@ impl WebDevServer {
         )
         .await
         {
-            let _ = child.start_kill();
+            let _ = child.terminate().await;
             return Err(error);
         }
         self.store_owned_child(child)?;
@@ -266,23 +332,21 @@ impl WebDevServer {
                 }
                 Ok(None) => {
                     warn!("Vite 前端热加载服务未通过健康检查，准备重新启动");
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    let _ = child.terminate().await;
                 }
                 Err(error) => {
                     warn!(
                         error = %error,
                         "检查 Vite 前端热加载服务状态失败，准备重新启动"
                     );
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    let _ = child.terminate().await;
                 }
             }
         }
         Ok(())
     }
 
-    fn store_owned_child(&self, new_child: Child) -> Result<(), String> {
+    fn store_owned_child(&self, new_child: AsyncManagedChild) -> Result<(), String> {
         let mut child = self
             .inner
             .child
@@ -298,7 +362,7 @@ impl Drop for WebDevServerInner {
         if let Ok(child) = self.child.get_mut()
             && let Some(child) = child.as_mut()
         {
-            let _ = child.start_kill();
+            let _ = child.start_terminate();
         }
     }
 }
@@ -350,7 +414,7 @@ async fn resolve_frontend_mode(config: &DaemonConfig) -> Result<FrontendMode, Da
     if let Err(error) =
         wait_for_spawned_web_dev_server(&origin, &agent_origin, &web_root, &mut child).await
     {
-        let _ = child.start_kill();
+        let _ = child.terminate().await;
         return Err(DaemonError::internal(error));
     }
 
@@ -454,7 +518,7 @@ fn browser_open_command(url: &str) -> StdCommand {
 
     #[cfg(target_os = "windows")]
     {
-        let mut command = std_command("cmd");
+        let mut command = std_command(magi_process::user_shell());
         command.args(["/C", "start", "", url]);
         command
     }
@@ -646,7 +710,7 @@ async fn wait_for_spawned_web_dev_server(
     origin: &str,
     agent_origin: &str,
     web_root: &Path,
-    child: &mut Child,
+    child: &mut AsyncManagedChild,
 ) -> Result<(), String> {
     let started_at = Instant::now();
     while started_at.elapsed() < WEB_DEV_READY_TIMEOUT {
@@ -677,8 +741,9 @@ fn spawn_web_dev_server(
     port: u16,
     agent_origin: &str,
     web_root: &Path,
-) -> Result<Child, String> {
-    tokio_command("npm")
+) -> Result<AsyncManagedChild, String> {
+    let mut command = tokio_command("npm");
+    command
         .arg("--prefix")
         .arg(web_root)
         .arg("run")
@@ -696,8 +761,8 @@ fn spawn_web_dev_server(
         .env("MAGI_VITE_OPEN", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
+        .stderr(Stdio::inherit());
+    spawn_managed_tokio(&mut command)
         .map_err(|error| format!("启动 Vite 前端热加载服务失败: {error}"))
 }
 

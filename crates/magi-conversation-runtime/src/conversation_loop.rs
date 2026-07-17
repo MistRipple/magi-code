@@ -1045,9 +1045,13 @@ fn run_conversation_loop_inner(
                 &completed_required_tool_names,
             ),
         };
+        let invocation_cancelled = || !task_lease_is_current(task_store, task_id, lease_id);
 
         let response = if streaming_entry_id.is_some() {
             let on_delta = |delta: &ModelStreamingDelta| {
+                if invocation_cancelled() {
+                    return;
+                }
                 publish_task_thinking_delta(
                     turn_writeback_context,
                     &thinking_item_id,
@@ -1078,13 +1082,22 @@ fn run_conversation_loop_inner(
                 );
             };
 
-            match client.invoke_streaming_with_retry_events(
+            match client.invoke_streaming_with_cancellation(
                 invocation_request,
                 &on_delta,
                 &on_retry,
+                &invocation_cancelled,
             ) {
                 Ok(response) => response,
                 Err(error) => {
+                    if invocation_cancelled() {
+                        return (
+                            TaskOutcome::Failed {
+                                error: "任务已中断".to_string(),
+                            },
+                            context_summary,
+                        );
+                    }
                     let raw_error_message = error.to_string();
                     let classification = classify_model_invocation_error(&raw_error_message);
                     let error_message = classification.public_message.to_string();
@@ -1120,9 +1133,17 @@ fn run_conversation_loop_inner(
                 }
             }
         } else {
-            match client.invoke(invocation_request) {
+            match client.invoke_with_cancellation(invocation_request, &invocation_cancelled) {
                 Ok(response) => response,
                 Err(error) => {
+                    if invocation_cancelled() {
+                        return (
+                            TaskOutcome::Failed {
+                                error: "任务已中断".to_string(),
+                            },
+                            context_summary,
+                        );
+                    }
                     let raw_error_message = error.to_string();
                     let classification = classify_model_invocation_error(&raw_error_message);
                     let error_message = classification.public_message.to_string();

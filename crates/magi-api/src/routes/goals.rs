@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_goal_route_exposes_goal_todo_ledger_snapshot() {
+    async fn current_goal_route_preserves_completed_todo_history_after_reduced_write() {
         let event_bus = Arc::new(InMemoryEventBus::new(32));
         let session_store = Arc::new(SessionStore::default());
         let dispatcher = test_dispatcher(Arc::clone(&event_bus), Arc::clone(&session_store));
@@ -444,16 +444,23 @@ mod tests {
                 None,
             )
             .expect("goal should be creatable");
-        state
-            .session_store
-            .replace_todo_items(
-                &session_id,
-                vec![
-                    TodoItem::new("梳理目标", "正在梳理目标", TodoStatus::Completed),
-                    TodoItem::new("验证抽屉展示", "正在验证抽屉展示", TodoStatus::InProgress),
-                ],
-            )
-            .expect("todo list should persist");
+        let todo_ledger =
+            magi_todo_ledger::TodoLedger::new(Arc::clone(&session_store), session_id.clone());
+        todo_ledger
+            .write(vec![
+                TodoItem::new("读取项目文档", "正在读取项目文档", TodoStatus::Completed),
+                TodoItem::new("扫描代码缺口", "正在扫描代码缺口", TodoStatus::Completed),
+                TodoItem::new("检查测试风险", "正在检查测试风险", TodoStatus::Completed),
+                TodoItem::new("汇总分析", "正在汇总分析", TodoStatus::InProgress),
+            ])
+            .expect("initial todo list should persist");
+        todo_ledger
+            .write(vec![TodoItem::new(
+                "汇总分析",
+                "正在汇总分析",
+                TodoStatus::Completed,
+            )])
+            .expect("reduced final todo snapshot should persist");
 
         let app = Router::new().merge(routes()).with_state(state.clone());
         let response = app
@@ -475,21 +482,18 @@ mod tests {
             payload["goal"]["objective"].as_str(),
             Some("完成目标任务清单展示")
         );
-        assert_eq!(
-            payload["todoItems"][0]["content"].as_str(),
-            Some("梳理目标")
-        );
-        assert_eq!(
-            payload["todoItems"][0]["status"].as_str(),
-            Some("completed")
-        );
-        assert_eq!(
-            payload["todoItems"][1]["activeForm"].as_str(),
-            Some("正在验证抽屉展示")
-        );
-        assert_eq!(
-            payload["todoItems"][1]["status"].as_str(),
-            Some("in_progress")
+        let todo_items = payload["todoItems"]
+            .as_array()
+            .expect("todoItems should be array");
+        assert_eq!(todo_items.len(), 4);
+        assert_eq!(todo_items[0]["content"].as_str(), Some("读取项目文档"));
+        assert_eq!(todo_items[1]["content"].as_str(), Some("扫描代码缺口"));
+        assert_eq!(todo_items[2]["content"].as_str(), Some("检查测试风险"));
+        assert_eq!(todo_items[3]["content"].as_str(), Some("汇总分析"));
+        assert!(
+            todo_items
+                .iter()
+                .all(|item| item["status"].as_str() == Some("completed"))
         );
     }
 

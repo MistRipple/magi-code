@@ -6,14 +6,13 @@
 //! 3. 生成一次性访问 token
 //! 4. 解析隧道公网 URL
 
-use magi_process::tokio_command;
+use magi_process::{AsyncManagedChild, spawn_managed_tokio, tokio_command};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Child;
 use tokio::sync::Mutex;
 
 const TUNNEL_ERROR_DEPENDENCY_UNAVAILABLE: &str = "tunnel_dependency_unavailable";
@@ -105,7 +104,7 @@ impl Default for TunnelState {
 
 struct TunnelInner {
     state: TunnelState,
-    child: Option<Child>,
+    child: Option<AsyncManagedChild>,
     local_port: u16,
     binding: RemoteAccessBinding,
 }
@@ -211,16 +210,16 @@ impl TunnelManager {
         let port = inner.local_port;
 
         // 启动子进程
-        let result = tokio_command(&bin_path)
+        let mut command = tokio_command(&bin_path);
+        command
             .args(["tunnel", "--url", &format!("http://127.0.0.1:{port}")])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn();
+            .stderr(Stdio::piped());
+        let result = spawn_managed_tokio(&mut command);
 
         match result {
             Ok(mut child) => {
-                let stderr = child.stderr.take();
+                let stderr = child.take_stderr();
                 inner.child = Some(child);
 
                 // 在后台任务中解析公网 URL，并持续监听 cloudflared 是否提前退出。
@@ -280,7 +279,7 @@ impl TunnelManager {
     pub async fn stop(&self) -> TunnelState {
         let mut inner = self.inner.lock().await;
         if let Some(ref mut child) = inner.child {
-            let _ = child.kill().await;
+            let _ = child.terminate().await;
         }
         inner.child = None;
         inner.state = TunnelState::default();

@@ -38,6 +38,7 @@ fn upsert_binding_snapshot(
             && item.engine_id == input.engine_id
             && item.binding_revision == input.binding_revision
             && item.role == input.role
+            && item.model_identity_key == input.model_identity_key
     }) {
         next[pos] = input;
     } else {
@@ -125,6 +126,7 @@ pub fn rebuild_session_snapshot_from_events(
                 && item.engine_id == exec_binding.engine_id
                 && item.binding_revision == exec_binding.binding_revision
                 && item.role == exec_binding.role
+                && item.model_identity_key.as_deref() == Some(model_id.model_identity_key.as_str())
         });
         let mut binding_totals = apply_delta(
             binding_existing
@@ -134,7 +136,15 @@ pub fn rebuild_session_snapshot_from_events(
             event.status,
         );
         if let Some(aid) = &event.assignment_id {
-            let key = format!("{}:{}", exec_binding.template_id, aid);
+            let key = format!(
+                "{}:{}:{}:{:?}:{}:{}",
+                exec_binding.template_id,
+                exec_binding.engine_id,
+                exec_binding.binding_revision,
+                exec_binding.role,
+                model_id.model_identity_key,
+                aid
+            );
             if seen_binding_assignments.insert(key) {
                 binding_totals.assignment_count += 1;
             }
@@ -205,8 +215,12 @@ pub fn rebuild_workspace_snapshot_from_sessions(
 
         for binding in &session.by_execution_binding {
             let key = format!(
-                "{}:{}:{}:{:?}",
-                binding.template_id, binding.engine_id, binding.binding_revision, binding.role
+                "{}:{}:{}:{:?}:{}",
+                binding.template_id,
+                binding.engine_id,
+                binding.binding_revision,
+                binding.role,
+                binding.model_identity_key.as_deref().unwrap_or("")
             );
             binding_map
                 .entry(key)

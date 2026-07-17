@@ -1,6 +1,8 @@
 use sha2::{Digest, Sha256};
 
-use crate::types::{ExecutionBindingIdentity, LlmConfig, ModelResolutionIdentity, UrlMode};
+use crate::types::{
+    ExecutionBindingIdentity, LlmConfig, ModelResolutionIdentity, ReasoningEffort, UrlMode,
+};
 
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -67,13 +69,20 @@ pub fn build_model_resolution_identity(
         UrlMode::Proxy => "proxy",
         UrlMode::Default => "default",
     };
+    let reasoning_effort_str = match model_config.reasoning_effort {
+        Some(ReasoningEffort::Low) => "low",
+        Some(ReasoningEffort::Medium) => "medium",
+        Some(ReasoningEffort::High) => "high",
+        Some(ReasoningEffort::Xhigh) => "xhigh",
+        None => "default",
+    };
     let identity_parts = [
         model_config.provider.as_str(),
         &canonical_base_url,
         url_mode_str,
         account_fingerprint.as_deref().unwrap_or(""),
         &resolved,
-        &execution_binding.binding_revision.to_string(),
+        reasoning_effort_str,
     ];
     let model_identity_key = sha256_hex(&identity_parts.join("|"));
 

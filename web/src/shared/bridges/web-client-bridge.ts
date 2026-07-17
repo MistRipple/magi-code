@@ -1472,6 +1472,11 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
 
+  if (eventType === 'session.configuration.updated') {
+    refreshSettingsBootstrapForCurrentWorkspace('session_configuration_updated');
+    return;
+  }
+
   if ((eventType === 'session.turn.accepted' || eventType === 'session.turn.task.accepted') && event.payload) {
     const acceptedSessionId = trimBridgeString(event.payload.session_id)
       || trimBridgeString(event.payload.sessionId)

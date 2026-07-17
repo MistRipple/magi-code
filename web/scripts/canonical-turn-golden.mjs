@@ -1929,6 +1929,28 @@ function assertBootstrapCarriesPendingChanges(contract) {
         additions: 1,
         deletions: 0,
       },
+      {
+        filePath: 'modified.ts',
+        snapshotId: 'session:session-bootstrap-pending:modified.ts',
+        type: 'modify',
+        additions: 4,
+        deletions: 2,
+      },
+      {
+        filePath: 'renamed.rs',
+        oldPath: 'old.rs',
+        snapshotId: 'session:session-bootstrap-pending:renamed.rs',
+        type: 'rename',
+        additions: 0,
+        deletions: 0,
+      },
+      {
+        filePath: 'deleted.md',
+        snapshotId: 'session:session-bootstrap-pending:deleted.md',
+        type: 'delete',
+        additions: 0,
+        deletions: 8,
+      },
     ],
   }, {
     workspaceId: 'workspace-bootstrap-pending',
@@ -1936,8 +1958,8 @@ function assertBootstrapCarriesPendingChanges(contract) {
   });
   assert.deepEqual(
     camelCaseBootstrap.state.pendingChanges?.map((change) => change.filePath),
-    ['created.txt'],
-    'bootstrap should expose camelCase pendingChanges through AppState',
+    ['created.txt', 'modified.ts', 'renamed.rs', 'deleted.md'],
+    'bootstrap should expose the complete camelCase pendingChanges collection through AppState',
   );
   assert.equal(camelCaseBootstrap.state.pendingChangesStateVersion, 7200);
 

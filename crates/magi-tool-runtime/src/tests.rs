@@ -30,6 +30,16 @@ fn unique_temp_dir(name: &str) -> PathBuf {
     path
 }
 
+#[cfg(unix)]
+fn long_running_shell_command() -> &'static str {
+    "sleep 5"
+}
+
+#[cfg(windows)]
+fn long_running_shell_command() -> &'static str {
+    "ping 127.0.0.1 -n 6 >NUL"
+}
+
 fn all_builtin_tools() -> [BuiltinToolName; BuiltinToolName::ALL.len()] {
     BuiltinToolName::ALL
 }
@@ -1154,7 +1164,6 @@ fn shell_exec_records_non_git_filesystem_changed_paths() {
     assert!(changed_paths.contains(&"remove-me.txt"));
 }
 
-#[cfg(unix)]
 #[test]
 fn shell_exec_cancel_active_session_kills_running_command() {
     let registry = make_registry();
@@ -1175,7 +1184,7 @@ fn shell_exec_cancel_active_session_kills_running_command() {
                 tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
                 input: serde_json::json!({
-                    "command": "sleep 2",
+                    "command": long_running_shell_command(),
                     "timeout_ms": 5000
                 })
                 .to_string(),
@@ -1189,7 +1198,7 @@ fn shell_exec_cancel_active_session_kills_running_command() {
 
     std::thread::sleep(Duration::from_millis(100));
     let cancel_started = Instant::now();
-    let cancelled = registry.cancel_active_shell_execs(&ToolExecutionContextQuery {
+    let cancelled = registry.cancel_active_processes(&ToolExecutionContextQuery {
         session_id: context.session_id.clone(),
         workspace_id: context.workspace_id.clone(),
         task_id: None,
@@ -1208,7 +1217,6 @@ fn shell_exec_cancel_active_session_kills_running_command() {
     assert_eq!(payload["cancelled"], true);
 }
 
-#[cfg(unix)]
 #[test]
 fn shell_exec_cancel_active_scope_requires_matching_workspace() {
     let registry = make_registry();
@@ -1229,7 +1237,7 @@ fn shell_exec_cancel_active_scope_requires_matching_workspace() {
                 tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
                 tool_kind: ToolKind::Builtin,
                 input: serde_json::json!({
-                    "command": "sleep 2",
+                    "command": long_running_shell_command(),
                     "timeout_ms": 5000
                 })
                 .to_string(),
@@ -1242,16 +1250,15 @@ fn shell_exec_cancel_active_scope_requires_matching_workspace() {
     });
 
     std::thread::sleep(Duration::from_millis(150));
-    let wrong_workspace_cancelled =
-        registry.cancel_active_shell_execs(&ToolExecutionContextQuery {
-            session_id: context.session_id.clone(),
-            workspace_id: Some(WorkspaceId::new("workspace-shell-cancel-other")),
-            task_id: context.task_id.clone(),
-            worker_id: None,
-        });
+    let wrong_workspace_cancelled = registry.cancel_active_processes(&ToolExecutionContextQuery {
+        session_id: context.session_id.clone(),
+        workspace_id: Some(WorkspaceId::new("workspace-shell-cancel-other")),
+        task_id: context.task_id.clone(),
+        worker_id: None,
+    });
     assert_eq!(wrong_workspace_cancelled, 0);
 
-    let cancelled = registry.cancel_active_shell_execs(&ToolExecutionContextQuery {
+    let cancelled = registry.cancel_active_processes(&ToolExecutionContextQuery {
         session_id: context.session_id.clone(),
         workspace_id: context.workspace_id.clone(),
         task_id: context.task_id.clone(),
@@ -1261,6 +1268,64 @@ fn shell_exec_cancel_active_scope_requires_matching_workspace() {
 
     let output = runner.join().expect("shell execution thread should join");
     assert_eq!(output.status, ExecutionResultStatus::Cancelled);
+}
+
+#[test]
+fn session_cancellation_stops_background_processes_in_the_same_scope() {
+    let registry = make_registry();
+    let context = ToolExecutionContext {
+        worker_id: Some(WorkerId::new("worker-background-cancel")),
+        task_id: Some(TaskId::new("task-background-cancel")),
+        session_id: Some(SessionId::new("session-background-cancel")),
+        workspace_id: Some(WorkspaceId::new("workspace-background-cancel")),
+        access_profile: magi_core::AccessProfile::Restricted,
+        working_directory: None,
+    };
+    let launch = registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-background-cancel"),
+            tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({
+                "command": long_running_shell_command(),
+                "background": true
+            })
+            .to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        context.clone(),
+        &full_access_policy(),
+    );
+    assert_eq!(launch.status, ExecutionResultStatus::Succeeded);
+
+    let cancelled = registry.cancel_active_processes(&ToolExecutionContextQuery {
+        worker_id: None,
+        task_id: context.task_id.clone(),
+        session_id: context.session_id.clone(),
+        workspace_id: context.workspace_id.clone(),
+    });
+
+    assert_eq!(cancelled, 1);
+    let list = registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-background-list-after-cancel"),
+            tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({ "action": "list" }).to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        context,
+        &full_access_policy(),
+    );
+    let payload: Value = serde_json::from_str(&list.payload).expect("process list json");
+    assert!(
+        payload["processes"]
+            .as_array()
+            .expect("processes")
+            .is_empty()
+    );
 }
 
 #[test]

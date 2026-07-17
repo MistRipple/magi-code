@@ -4,6 +4,7 @@
 //! `.map_err(ApiError::InvalidInput)` 桥接。
 
 pub(crate) use magi_conversation_runtime::model_config::{
-    NormalizedModelConfig, merge_orchestrator_session_override,
-    reject_deprecated_model_config_fields, strip_orchestrator_session_owned_fields,
+    DEFAULT_ORCHESTRATOR_REASONING_EFFORT, NormalizedModelConfig,
+    merge_orchestrator_session_override, reject_deprecated_model_config_fields,
+    resolve_orchestrator_model_config, strip_orchestrator_session_owned_fields,
 };
