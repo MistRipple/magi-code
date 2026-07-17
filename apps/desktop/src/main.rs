@@ -102,25 +102,6 @@ fn parse_desktop_web_url(value: &str) -> Result<tauri::Url, String> {
     Ok(url)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn desktop_web_url_is_versioned_to_avoid_stale_entry_html() {
-        let url = parse_desktop_web_url("http://127.0.0.1:38123/web.html")
-            .expect("desktop web URL should parse");
-
-        assert_eq!(
-            url.as_str(),
-            concat!(
-                "http://127.0.0.1:38123/web.html?desktopVersion=",
-                env!("CARGO_PKG_VERSION")
-            )
-        );
-    }
-}
-
 fn create_startup_error_window(app: &AppHandle) {
     if let Err(error) = create_main_window(app, WebviewUrl::App("index.html".into())) {
         eprintln!("创建 Magi 启动错误窗口失败: {error}");
@@ -334,4 +315,23 @@ fn main() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_web_url_is_versioned_to_avoid_stale_entry_html() {
+        let url = parse_desktop_web_url("http://127.0.0.1:38123/web.html")
+            .expect("desktop web URL should parse");
+
+        assert_eq!(
+            url.as_str(),
+            concat!(
+                "http://127.0.0.1:38123/web.html?desktopVersion=",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
 }
