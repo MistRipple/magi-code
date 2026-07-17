@@ -2412,7 +2412,12 @@ mod tests {
             let mut chunk = [0_u8; 4096];
             let header_end = loop {
                 let read = match stream.read(&mut chunk) {
-                    Ok(0) | Err(_) => {
+                    Ok(0) => {
+                        let _ = disconnected_tx.send(());
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+                    Err(_) => {
                         let _ = disconnected_tx.send(());
                         return;
                     }
@@ -2435,7 +2440,12 @@ mod tests {
                 .unwrap_or(0);
             while request.len() < header_end + content_length {
                 let read = match stream.read(&mut chunk) {
-                    Ok(0) | Err(_) => {
+                    Ok(0) => {
+                        let _ = disconnected_tx.send(());
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+                    Err(_) => {
                         let _ = disconnected_tx.send(());
                         return;
                     }
@@ -2453,7 +2463,12 @@ mod tests {
             }
             loop {
                 match stream.read(&mut chunk) {
-                    Ok(0) | Err(_) => {
+                    Ok(0) => {
+                        let _ = disconnected_tx.send(());
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
+                    Err(_) => {
                         let _ = disconnected_tx.send(());
                         break;
                     }
@@ -2557,7 +2572,7 @@ mod tests {
         assert!(model_invocation_error_is_cancelled(&error));
         assert!(started.elapsed() < Duration::from_secs(2));
         disconnected
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(5))
             .expect("cancelled request should close provider connection");
     }
 
@@ -2593,7 +2608,7 @@ mod tests {
         assert!(model_invocation_error_is_cancelled(&error));
         assert!(started.elapsed() < Duration::from_secs(2));
         disconnected
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(5))
             .expect("cancelled stream should close provider connection");
     }
 
