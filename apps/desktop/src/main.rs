@@ -93,6 +93,34 @@ fn create_main_window(app: &AppHandle, url: WebviewUrl) -> tauri::Result<()> {
     Ok(())
 }
 
+fn parse_desktop_web_url(value: &str) -> Result<tauri::Url, String> {
+    let mut url = value
+        .parse::<tauri::Url>()
+        .map_err(|error| format!("Magi Web 地址非法: {error}"))?;
+    url.query_pairs_mut()
+        .append_pair("desktopVersion", env!("CARGO_PKG_VERSION"));
+    Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_web_url_is_versioned_to_avoid_stale_entry_html() {
+        let url = parse_desktop_web_url("http://127.0.0.1:38123/web.html")
+            .expect("desktop web URL should parse");
+
+        assert_eq!(
+            url.as_str(),
+            concat!(
+                "http://127.0.0.1:38123/web.html?desktopVersion=",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+}
+
 fn create_startup_error_window(app: &AppHandle) {
     if let Err(error) = create_main_window(app, WebviewUrl::App("index.html".into())) {
         eprintln!("创建 Magi 启动错误窗口失败: {error}");
@@ -226,7 +254,7 @@ fn start_daemon(app: AppHandle, state_root: PathBuf, web_dist_root: PathBuf) {
         *runtime.daemon.lock().expect("desktop daemon lock poisoned") = Some(handle);
         runtime.lifecycle.mark_ready();
 
-        match web_url.parse() {
+        match parse_desktop_web_url(&web_url) {
             Ok(url) => {
                 if let Err(error) = create_main_window(&app, WebviewUrl::External(url)) {
                     eprintln!("创建 Magi 主窗口失败: {error}");
@@ -234,7 +262,7 @@ fn start_daemon(app: AppHandle, state_root: PathBuf, web_dist_root: PathBuf) {
                 }
             }
             Err(error) => {
-                eprintln!("Magi Web 地址非法: {error}");
+                eprintln!("{error}");
                 request_exit(app);
             }
         }

@@ -7,7 +7,7 @@ use axum::{
     body::Body,
     http::{StatusCode, Uri, header},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::get,
+    routing::{get, get_service},
 };
 use magi_process::{std_command, tokio_command};
 use std::{
@@ -22,7 +22,10 @@ use tokio::net::TcpListener;
 use tokio::process::Child;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::{
+    services::{ServeDir, ServeFile},
+    set_header::SetResponseHeaderLayer,
+};
 use tracing::{info, warn};
 
 const WEB_DEV_ENABLED_ENV: &str = "MAGI_WEB_DEV";
@@ -401,9 +404,14 @@ fn build_application_router(api_router: Router, frontend: &FrontendMode) -> Rout
 
     let mut app = Router::new()
         .route("/", get(|| async { Redirect::temporary("/web.html") }))
-        .route_service(
+        .route(
             "/web.html",
-            ServeFile::new(static_assets.web_html_path.clone()),
+            get_service(ServeFile::new(static_assets.web_html_path.clone())).layer(
+                SetResponseHeaderLayer::overriding(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+                ),
+            ),
         )
         .merge(api_router);
 
@@ -828,6 +836,8 @@ fn packaged_web_dist_candidates_for_executable_dir(executable_dir: &Path) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Request;
+    use tower::ServiceExt;
 
     #[test]
     fn dev_html_uses_daemon_origin_for_vite_modules() {
@@ -877,6 +887,37 @@ mod tests {
         assert_eq!(
             resolve_web_dist_root(config.web_dist_root.as_deref()),
             Some(explicit_root)
+        );
+    }
+
+    #[tokio::test]
+    async fn static_web_entry_is_never_served_from_stale_cache() {
+        let temp = tempfile::tempdir().expect("temporary web dist should be created");
+        let assets_dir = temp.path().join("assets");
+        std::fs::create_dir_all(&assets_dir).expect("assets directory should exist");
+        let web_html_path = temp.path().join("web.html");
+        std::fs::write(&web_html_path, "<div id=\"app\"></div>")
+            .expect("web entry should be written");
+        let frontend = FrontendMode::Static(Some(StaticWebAssets {
+            web_dist_root: temp.path().to_path_buf(),
+            web_html_path,
+            assets_dir,
+        }));
+        let response = build_application_router(Router::new(), &frontend)
+            .oneshot(
+                Request::builder()
+                    .uri("/web.html")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("static web entry should respond");
+
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&header::HeaderValue::from_static(
+                "no-store, no-cache, must-revalidate"
+            ))
         );
     }
 }
