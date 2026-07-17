@@ -2411,8 +2411,13 @@ mod tests {
             let mut request = Vec::new();
             let mut chunk = [0_u8; 4096];
             let header_end = loop {
-                let read = stream.read(&mut chunk).expect("request should read");
-                assert!(read > 0, "request should not close before headers");
+                let read = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => {
+                        let _ = disconnected_tx.send(());
+                        return;
+                    }
+                    Ok(read) => read,
+                };
                 request.extend_from_slice(&chunk[..read]);
                 if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
                     break pos + 4;
@@ -2429,8 +2434,13 @@ mod tests {
                 })
                 .unwrap_or(0);
             while request.len() < header_end + content_length {
-                let read = stream.read(&mut chunk).expect("request body should read");
-                assert!(read > 0, "request should not close before body");
+                let read = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => {
+                        let _ = disconnected_tx.send(());
+                        return;
+                    }
+                    Ok(read) => read,
+                };
                 request.extend_from_slice(&chunk[..read]);
             }
             if streaming {
