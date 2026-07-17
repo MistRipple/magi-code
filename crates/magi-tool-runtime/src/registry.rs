@@ -275,9 +275,7 @@ impl ToolRegistry {
             return output;
         }
         let access_mode = self.resolve_access_mode(&input);
-        if let Some(output) =
-            self.enforce_access_profile_policy(&input, &context, policy, access_mode)
-        {
+        if let Some(output) = self.enforce_access_profile_policy(&input, &context, policy) {
             self.record_invocation(&input, &context, &output);
             return output;
         }

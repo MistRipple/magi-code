@@ -328,6 +328,56 @@ fn search_text_supports_json_input() {
 }
 
 #[test]
+fn search_text_supports_cross_platform_regex_queries() {
+    let root = unique_temp_dir("magi-tool-search-regex");
+    fs::write(
+        root.join("runtime.rs"),
+        "fn compress_context() {}\nfn truncate_output() {}\n",
+    )
+    .expect("write runtime.rs");
+    let registry = make_registry();
+
+    let output = exec_tool(
+        &registry,
+        BuiltinToolName::SearchText,
+        &serde_json::json!({
+            "root": root.to_string_lossy(),
+            "query": "compress|truncate",
+            "query_mode": "regex",
+            "case_sensitive": true,
+        })
+        .to_string(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert_eq!(payload["query_mode"], "regex");
+    assert_eq!(payload["returned_matches"], 2);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn search_text_rejects_invalid_regex_without_exposing_engine_details() {
+    let registry = make_registry();
+    let output = exec_tool(
+        &registry,
+        BuiltinToolName::SearchText,
+        &serde_json::json!({
+            "query": "(",
+            "query_mode": "regex",
+        })
+        .to_string(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert_eq!(payload["error_code"], "search_text_invalid_regex");
+    assert_eq!(payload["error"], "正则表达式无效，请检查 query");
+    assert!(!output.payload.contains("unclosed"));
+}
+
+#[test]
 fn shell_exec_runs_and_reports_failure_semantics() {
     let governance = Arc::new(GovernanceService::default());
     let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
@@ -429,6 +479,70 @@ fn shell_exec_spawn_failure_uses_public_error_message() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn shell_exec_reports_missing_executable_in_compound_command() {
+    let registry = make_registry();
+    let missing = "magi-command-that-does-not-exist";
+    let output = registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-shell-command-not-found"),
+            tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({
+                "command": format!("printf before; {missing}"),
+                "access_mode": "read_only",
+            })
+            .to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        ToolExecutionContext::default(),
+        &full_access_policy(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert_eq!(payload["error_code"], "shell_exec_command_not_found");
+    assert!(
+        payload["missing_executables"]
+            .as_array()
+            .is_some_and(|commands| commands.iter().any(|command| command == missing))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_exec_detects_missing_pipeline_dependency_even_when_stderr_is_suppressed() {
+    let registry = make_registry();
+    let missing = "magi-missing-pipeline-command";
+    let output = registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-shell-missing-pipeline-command"),
+            tool_name: BuiltinToolName::ShellExec.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({
+                "command": format!("{missing} 2>/dev/null | head -5; printf done"),
+                "access_mode": "read_only",
+            })
+            .to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        ToolExecutionContext::default(),
+        &full_access_policy(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert_eq!(payload["error_code"], "shell_exec_command_not_found");
+    assert!(
+        payload["missing_executables"]
+            .as_array()
+            .is_some_and(|commands| commands.iter().any(|command| command == missing))
+    );
+}
+
 #[test]
 fn shell_exec_accepts_shell_program_with_arguments() {
     let registry = make_registry();
@@ -513,7 +627,7 @@ fn shell_exec_reports_unavailable_workspace_before_starting_shell() {
 }
 
 #[test]
-fn shell_exec_rejects_read_only_mode_with_write_redirection() {
+fn shell_exec_reclassifies_read_only_mode_with_write_redirection() {
     let governance = Arc::new(GovernanceService::default());
     let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
     let mut tool_registry = ToolRegistry::new(governance, event_bus);
@@ -541,11 +655,11 @@ fn shell_exec_rejects_read_only_mode_with_write_redirection() {
         &ToolExecutionPolicy::default(),
     );
 
-    assert_eq!(output.status, ExecutionResultStatus::Rejected);
+    assert_eq!(output.status, ExecutionResultStatus::NeedsApproval);
     assert!(!target.exists(), "read_only shell 不应执行写入重定向");
     let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
     assert_eq!(payload["tool"], "shell_exec");
-    assert_eq!(payload["status"], "rejected");
+    assert_eq!(payload["status"], "needs_approval");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -3093,6 +3207,125 @@ fn registry_allows_restricted_read_only_shell() {
     assert_eq!(payload["stdout"], "hello");
 }
 
+#[test]
+fn registry_reclassifies_misdeclared_shell_without_blocking_full_access() {
+    let root = unique_temp_dir("magi-tool-full-access-shell-reclassification");
+    let target = root.join("created.txt");
+    let registry = make_registry();
+
+    let output = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tc-full-access-shell-reclassification"),
+            BuiltinToolName::ShellExec.as_str(),
+            serde_json::json!({
+                "command": "touch created.txt",
+                "access_mode": "read_only"
+            })
+            .to_string(),
+        ),
+        ToolExecutionContext {
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        },
+        &full_access_policy(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    assert!(target.exists());
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert_eq!(payload["access_mode"], "maybe_write");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn registry_requires_approval_for_misdeclared_shell_in_restricted_access() {
+    let root = unique_temp_dir("magi-tool-restricted-shell-reclassification");
+    let target = root.join("blocked.txt");
+    let registry = make_registry();
+
+    let output = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tc-restricted-shell-reclassification"),
+            BuiltinToolName::ShellExec.as_str(),
+            serde_json::json!({
+                "command": "touch blocked.txt",
+                "access_mode": "read_only"
+            })
+            .to_string(),
+        ),
+        ToolExecutionContext {
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        },
+        &ToolExecutionPolicy::default(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::NeedsApproval);
+    assert!(!target.exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn registry_rejects_process_side_effects_in_read_only_access() {
+    let registry = make_registry();
+
+    let output = registry.execute_internal_builtin_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tc-read-only-process-launch"),
+            BuiltinToolName::ProcessLaunch.as_str(),
+            serde_json::json!({ "command": "printf blocked" }).to_string(),
+        ),
+        ToolExecutionContext::default(),
+        &ToolExecutionPolicy {
+            access_profile: magi_core::AccessProfile::ReadOnly,
+            ..ToolExecutionPolicy::default()
+        },
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Rejected);
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert_eq!(payload["access_profile"], "read_only");
+}
+
+#[test]
+fn registry_rejects_background_shell_declared_read_only_in_read_only_access() {
+    let root = unique_temp_dir("magi-tool-read-only-background-shell");
+    let target = root.join("must-not-exist.txt");
+    let registry = make_registry();
+
+    let output = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tc-read-only-background-shell"),
+            BuiltinToolName::ShellExec.as_str(),
+            serde_json::json!({
+                "command": "touch must-not-exist.txt",
+                "access_mode": "read_only",
+                "background": true
+            })
+            .to_string(),
+        ),
+        ToolExecutionContext {
+            session_id: Some(magi_core::SessionId::new("session-read-only-background")),
+            workspace_id: Some(magi_core::WorkspaceId::new(
+                "workspace-read-only-background",
+            )),
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        },
+        &ToolExecutionPolicy {
+            access_profile: magi_core::AccessProfile::ReadOnly,
+            ..ToolExecutionPolicy::default()
+        },
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Rejected);
+    assert!(!target.exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn exec_tool(registry: &ToolRegistry, tool: BuiltinToolName, input: &str) -> ToolExecutionOutput {
     exec_tool_with_context_and_policy(
         registry,
@@ -4059,8 +4292,31 @@ fn read_only_access_profile_only_blocks_external_side_effect_operations() {
         BuiltinToolName::FileWrite,
         BuiltinToolName::FileRemove,
         BuiltinToolName::MemoryWrite,
+        BuiltinToolName::ProcessLaunch,
+        BuiltinToolName::ProcessWrite,
+        BuiltinToolName::ProcessKill,
     ] {
         assert!(external.is_access_profile_write_operation());
+    }
+}
+
+#[test]
+fn permission_engine_read_only_tool_axis_matches_builtin_side_effect_classification() {
+    let engine = builtin_permission_engine();
+    let policy = magi_permissions::PermissionPolicy::default();
+
+    for tool in BuiltinToolName::ALL {
+        let request = magi_permissions::PermissionRequest::ToolInvocation {
+            tool_name: tool.as_str(),
+            is_write_tool: tool.is_access_profile_write_operation(),
+        };
+        let decision = engine.decide(&request, &policy, magi_core::AccessProfile::ReadOnly);
+
+        assert_eq!(
+            decision.is_deny(),
+            tool.is_access_profile_write_operation(),
+            "只读权限工具分类与内置工具副作用分类不一致: {tool:?}"
+        );
     }
 }
 
@@ -5065,6 +5321,10 @@ fn search_text_schema_requires_query_and_keeps_root_optional() {
         .expect("query description");
     assert!(query_description.contains("必填"));
     assert!(query_description.contains("非空"));
+    assert_eq!(
+        schema["properties"]["query_mode"]["enum"],
+        serde_json::json!(["literal", "regex"])
+    );
 }
 
 #[test]
@@ -5073,6 +5333,7 @@ fn shell_schema_forbids_inventing_test_runner_arguments() {
 
     assert!(description.contains("package.json"));
     assert!(description.contains("禁止臆造"));
+    assert!(description.contains("禁止调用 rg"));
 }
 
 #[test]
@@ -5545,6 +5806,90 @@ fn search_semantic_uses_workspace_local_index() {
             && r["path"].as_str().is_some_and(|p| p.contains("auth.rs"))),
         "本地索引应命中 auth.rs，实际: {results:?}"
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_semantic_lazily_builds_missing_workspace_index() {
+    let root = unique_temp_dir("magi-tool-search-lazy-index");
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("src/security.rs"),
+        "pub fn require_bearer_token(value: &str) -> bool { !value.is_empty() }\n",
+    )
+    .expect("write security.rs");
+
+    let store = std::sync::Arc::new(magi_knowledge_store::KnowledgeStore::new());
+    let workspace_id = WorkspaceId::new("workspace-search-lazy-index");
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let mut tool_registry =
+        ToolRegistry::new(governance, event_bus).with_knowledge_store(store.clone());
+    tool_registry.register_default_builtins();
+
+    let output = tool_registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-search-lazy-index"),
+            tool_name: BuiltinToolName::SearchSemantic.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({ "query": "bearer token" }).to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        ToolExecutionContext {
+            workspace_id: Some(workspace_id.clone()),
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        },
+        &ToolExecutionPolicy::default(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    assert!(store.workspace_index_ready(&workspace_id));
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert!(payload["results"].as_array().is_some_and(|results| {
+        results
+            .iter()
+            .any(|result| result["path"] == "src/security.rs")
+    }));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_semantic_returns_empty_success_for_empty_workspace() {
+    let root = unique_temp_dir("magi-tool-search-empty-index");
+    let store = std::sync::Arc::new(magi_knowledge_store::KnowledgeStore::new());
+    let workspace_id = WorkspaceId::new("workspace-search-empty-index");
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let mut tool_registry =
+        ToolRegistry::new(governance, event_bus).with_knowledge_store(store.clone());
+    tool_registry.register_default_builtins();
+
+    let output = tool_registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-search-empty-index"),
+            tool_name: BuiltinToolName::SearchSemantic.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({ "query": "anything" }).to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        ToolExecutionContext {
+            workspace_id: Some(workspace_id.clone()),
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        },
+        &ToolExecutionPolicy::default(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    assert!(store.workspace_index_available(&workspace_id));
+    assert!(!store.workspace_index_ready(&workspace_id));
+    let payload: Value = serde_json::from_str(&output.payload).expect("payload json");
+    assert_eq!(payload["returned_matches"], 0);
 
     let _ = fs::remove_dir_all(&root);
 }

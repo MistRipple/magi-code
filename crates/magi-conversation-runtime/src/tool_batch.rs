@@ -71,6 +71,7 @@ const AGENT_WAIT_DEFAULT_TIMEOUT_MS: u64 = 300_000;
 const AGENT_WAIT_MIN_TIMEOUT_MS: u64 = 1_000;
 const AGENT_WAIT_MAX_TIMEOUT_MS: u64 = 1_800_000;
 const TOOL_VISIBILITY_REJECTED_PUBLIC_ERROR: &str = "该工具在当前任务角色或阶段下不可用";
+const TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR: &str = "该工具受当前任务角色或策略限制";
 const TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR: &str =
     "受限访问已拦截该操作，请切换为完全访问权限后重试";
 
@@ -577,7 +578,7 @@ fn execute_coordinator_tool(
             ));
             let child_policy_snapshot =
                 agent_spawn_child_policy_snapshot(task.policy_snapshot.as_ref());
-            let child_access_profile = child_policy_snapshot.access_profile;
+            let child_access_profile = child_policy_snapshot.effective_access_profile();
             let child_dependency_ids = agent_spawn_child_dependency_ids(task);
             let child_input_refs = agent_spawn_child_input_refs(task);
             let child = magi_core::Task {
@@ -1011,7 +1012,7 @@ fn enqueue_agent_assignment_message(
     let access_profile = child
         .policy_snapshot
         .as_ref()
-        .map(|policy| policy.access_profile)
+        .map(magi_core::TaskPolicy::effective_access_profile)
         .unwrap_or_default()
         .as_str();
     let child_conversation =
@@ -1536,7 +1537,7 @@ fn execute_task_tool_call(
     let access_profile = task
         .policy_snapshot
         .as_ref()
-        .map(|policy| policy.access_profile)
+        .map(magi_core::TaskPolicy::effective_access_profile)
         .unwrap_or_default();
     if let Some((tool_skill_name, binding_id)) =
         parse_skill_custom_tool_name(&tool_call.function.name)
@@ -1654,7 +1655,7 @@ fn task_tool_preflight_decision(
     let access_profile = task
         .policy_snapshot
         .as_ref()
-        .map(|policy| policy.access_profile)
+        .map(magi_core::TaskPolicy::effective_access_profile)
         .unwrap_or_default();
     let safety_gate_decision = safety_gate.and_then(|gate| {
         safety_gate_tool_decision(gate, access_profile, requested_tool_name, arguments)
@@ -1726,6 +1727,7 @@ pub(crate) fn access_profile_tool_decision(
         arguments,
         workspace_root_path,
     } = input;
+    let effective_access_profile = access_profile.constrained_by_command_mode(command_mode);
     let canonical_tool_name = canonical_builtin_tool_name(requested_tool_name)
         .unwrap_or_else(|| requested_tool_name.trim().to_string());
     // PermissionEngine 比对工具名是按字面比对，因此把 policy 中的别名先 canonical 化。
@@ -1743,7 +1745,7 @@ pub(crate) fn access_profile_tool_decision(
             })
             .collect(),
         allowed_paths: effective_tool_policy_allowed_paths(
-            access_profile,
+            effective_access_profile,
             allowed_paths,
             workspace_root_path.map(|path| path.as_path()),
         ),
@@ -1766,8 +1768,8 @@ pub(crate) fn access_profile_tool_decision(
         &mut pending_decision,
         permission_decision_payload(
             &canonical_tool_name,
-            engine.decide(&tool_request, &canonical_policy, access_profile),
-            access_profile,
+            engine.decide(&tool_request, &canonical_policy, effective_access_profile),
+            effective_access_profile,
         ),
     ) {
         return Some(decision);
@@ -1781,8 +1783,8 @@ pub(crate) fn access_profile_tool_decision(
             &mut pending_decision,
             permission_decision_payload(
                 &canonical_tool_name,
-                engine.decide(&shell_request, &canonical_policy, access_profile),
-                access_profile,
+                engine.decide(&shell_request, &canonical_policy, effective_access_profile),
+                effective_access_profile,
             ),
         ) {
             return Some(decision);
@@ -1796,7 +1798,7 @@ pub(crate) fn access_profile_tool_decision(
         &canonical_tool_name,
         arguments,
         workspace_root_path.map(|path| path.as_path()),
-        access_profile,
+        effective_access_profile,
     ) {
         if path_request.kind == magi_permissions::PathAccessKind::Write
             && normalized_read_only_paths
@@ -1807,7 +1809,7 @@ pub(crate) fn access_profile_tool_decision(
                 &canonical_tool_name,
                 ExecutionResultStatus::Rejected,
                 "上下文引用只允许读取".to_string(),
-                Some(access_profile),
+                Some(effective_access_profile),
             ));
         }
         let path_request = magi_permissions::PermissionRequest::PathAccess {
@@ -1818,8 +1820,8 @@ pub(crate) fn access_profile_tool_decision(
             &mut pending_decision,
             permission_decision_payload(
                 &canonical_tool_name,
-                engine.decide(&path_request, &canonical_policy, access_profile),
-                access_profile,
+                engine.decide(&path_request, &canonical_policy, effective_access_profile),
+                effective_access_profile,
             ),
         ) {
             return Some(decision);
@@ -1895,7 +1897,14 @@ fn task_policy_decision_payload(
             "tool_policy_needs_approval",
             TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR,
         ),
-        ExecutionResultStatus::Rejected => ("tool_policy_rejected", "该工具在当前访问模式下不可用"),
+        ExecutionResultStatus::Rejected => (
+            "tool_policy_rejected",
+            if access_profile == Some(magi_core::AccessProfile::FullAccess) {
+                TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR
+            } else {
+                "该工具在当前访问模式下不可用"
+            },
+        ),
         _ => ("tool_policy_failed", "该工具暂不可用"),
     };
     tracing::warn!(
@@ -2596,6 +2605,131 @@ mod tests {
     }
 
     #[test]
+    fn read_only_agent_policy_allows_compound_repository_inspection_with_remote_query() {
+        let mut task = test_task(
+            "task-read-only-shell-repository-inspection",
+            "task-read-only-shell-repository-inspection",
+            None,
+        );
+        task.policy_snapshot = Some(agent_spawn_child_policy_snapshot(Some(
+            &read_only_agent_spawn_policy(),
+        )));
+        let arguments = serde_json::json!({
+            "access_mode": "read_only",
+            "command": "ls -la && if [ -f README.md ]; then echo README; else echo NO_README; fi; if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then git remote -v 2>/dev/null | head -5; git log --oneline -5 2>/dev/null; else echo NOT_GIT_WORKTREE; fi"
+        })
+        .to_string();
+
+        let decision =
+            task_policy_tool_decision(&task, BuiltinToolName::ShellExec.as_str(), &arguments);
+
+        assert!(decision.is_none(), "只读仓库探查不应在对话预检层被拒绝");
+    }
+
+    #[test]
+    fn full_access_policy_allows_search_patterns_named_after_write_commands() {
+        let mut task = test_task(
+            "task-full-access-shell-search-pattern",
+            "task-full-access-shell-search-pattern",
+            None,
+        );
+        let mut policy = default_agent_spawn_policy();
+        policy.access_profile = magi_core::AccessProfile::FullAccess;
+        policy.command_mode = "full".to_string();
+        task.policy_snapshot = Some(policy);
+        let arguments = serde_json::json!({
+            "access_mode": "read_only",
+            "command": "grep -rn \"compress\\|truncate\" crates/magi-context-runtime crates/magi-conversation-runtime --include='*.rs' 2>/dev/null | head -40"
+        })
+        .to_string();
+
+        let decision =
+            task_policy_tool_decision(&task, BuiltinToolName::ShellExec.as_str(), &arguments);
+
+        assert!(
+            decision.is_none(),
+            "检索参数中的写命令名称不应被误判为实际写操作"
+        );
+    }
+
+    #[test]
+    fn full_access_policy_reclassifies_misdeclared_shell_without_rejecting_it() {
+        let mut task = test_task(
+            "task-full-access-shell-reclassification",
+            "task-full-access-shell-reclassification",
+            None,
+        );
+        let mut policy = default_agent_spawn_policy();
+        policy.access_profile = magi_core::AccessProfile::FullAccess;
+        policy.command_mode = "full".to_string();
+        task.policy_snapshot = Some(policy);
+
+        let decision = task_policy_tool_decision(
+            &task,
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"touch created.txt","access_mode":"read_only"}"#,
+        );
+
+        assert!(
+            decision.is_none(),
+            "完全访问不应因模型错误声明 read_only 而拒绝 shell"
+        );
+    }
+
+    #[test]
+    fn full_access_task_constraint_is_not_reported_as_access_mode_failure() {
+        let mut task = test_task(
+            "task-full-access-explicit-tool-denial",
+            "task-full-access-explicit-tool-denial",
+            None,
+        );
+        let mut policy = default_agent_spawn_policy();
+        policy.access_profile = magi_core::AccessProfile::FullAccess;
+        policy
+            .denied_tools
+            .push(BuiltinToolName::FileRead.as_str().to_string());
+        task.policy_snapshot = Some(policy);
+
+        let decision = task_policy_tool_decision(
+            &task,
+            BuiltinToolName::FileRead.as_str(),
+            r#"{"path":"README.md"}"#,
+        )
+        .expect("explicit task constraint should reject the tool");
+        let payload: serde_json::Value =
+            serde_json::from_str(&decision.payload).expect("decision should be json");
+
+        assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+        assert_eq!(
+            payload["error"].as_str(),
+            Some(TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR)
+        );
+        assert_ne!(
+            payload["error"].as_str(),
+            Some("该工具在当前访问模式下不可用")
+        );
+    }
+
+    #[test]
+    fn restricted_policy_reclassifies_misdeclared_shell_as_needs_approval() {
+        let mut task = test_task(
+            "task-restricted-shell-reclassification",
+            "task-restricted-shell-reclassification",
+            None,
+        );
+        task.policy_snapshot = Some(default_agent_spawn_policy());
+
+        let decision = task_policy_tool_decision(
+            &task,
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"touch blocked.txt","access_mode":"read_only"}"#,
+        )
+        .expect("受限访问应把错误只读声明升级为审批，而不是直接拒绝");
+
+        assert_eq!(decision.status, ExecutionResultStatus::NeedsApproval);
+    }
+
+    #[test]
     fn restricted_policy_marks_write_shell_as_needs_approval() {
         let mut task = test_task(
             "task-human-approval-shell",
@@ -2937,6 +3071,41 @@ mod tests {
     }
 
     #[test]
+    fn read_only_command_mode_constrains_full_access_preflight_scope() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path().to_path_buf();
+        let outside_path = workspace_root
+            .parent()
+            .expect("workspace should have parent")
+            .join("magi-command-mode-outside-target.txt");
+        let mut task = test_task(
+            "task-command-mode-read-only-scope",
+            "task-command-mode-read-only-scope",
+            None,
+        );
+        let mut policy = default_agent_spawn_policy();
+        policy.access_profile = magi_core::AccessProfile::FullAccess;
+        policy.command_mode = "read_only".to_string();
+        task.policy_snapshot = Some(policy);
+
+        let decision = task_policy_tool_decision_with_workspace_root(
+            &task,
+            BuiltinToolName::FileRead.as_str(),
+            &serde_json::json!({
+                "path": outside_path.display().to_string()
+            })
+            .to_string(),
+            Some(&workspace_root),
+        )
+        .expect("read_only command mode should keep reads inside workspace scope");
+        let payload: serde_json::Value =
+            serde_json::from_str(&decision.payload).expect("decision should be json");
+
+        assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+        assert_eq!(payload["access_profile"].as_str(), Some("read_only"));
+    }
+
+    #[test]
     fn task_policy_allowed_paths_are_resolved_against_workspace_root() {
         let workspace = tempdir().expect("workspace tempdir");
         let workspace_root = workspace.path().to_path_buf();
@@ -3048,6 +3217,37 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn task_preflight_uses_effective_read_only_command_mode_for_safety_gate() {
+        let mut task = test_task(
+            "task-effective-read-only-safety",
+            "task-effective-read-only-safety",
+            None,
+        );
+        let mut policy = default_agent_spawn_policy();
+        policy.access_profile = magi_core::AccessProfile::FullAccess;
+        policy.command_mode = "read_only".to_string();
+        task.policy_snapshot = Some(policy);
+        let gate = magi_safety_gate::SafetyGate::new(vec![magi_safety_gate::SafetyRule::new(
+            "deploy-prod",
+            magi_safety_gate::SafetyCategory::Custom,
+        )]);
+
+        let decision = task_tool_preflight_decision(
+            &task,
+            Some(&gate),
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"printf deploy-prod","access_mode":"read_only"}"#,
+            None,
+        )
+        .expect("effective read-only mode should not skip restricted safety rules");
+        let payload: serde_json::Value =
+            serde_json::from_str(&decision.payload).expect("decision should be json");
+
+        assert_eq!(decision.status, ExecutionResultStatus::Rejected);
+        assert_eq!(payload["error_code"].as_str(), Some("tool_safety_rejected"));
     }
 
     #[test]

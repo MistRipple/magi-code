@@ -464,9 +464,32 @@ fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
         .as_ref()
         .and_then(|object| field_bool(object, &["include_hidden"]))
         .unwrap_or(false);
+    let query_mode = request
+        .as_ref()
+        .and_then(|object| field_string(object, &["query_mode"]))
+        .unwrap_or_else(|| "literal".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    let matcher = match SearchTextMatcher::new(&query, &query_mode, case_sensitive) {
+        Ok(matcher) => matcher,
+        Err(SearchTextMatcherError::UnsupportedMode) => {
+            return builtin_error_with_code(
+                "search_text",
+                "search_text_invalid_query_mode",
+                "query_mode 只支持 literal 或 regex",
+            );
+        }
+        Err(SearchTextMatcherError::InvalidRegex) => {
+            return builtin_error_with_code(
+                "search_text",
+                "search_text_invalid_regex",
+                "正则表达式无效，请检查 query",
+            );
+        }
+    };
 
     let (matches, scanned_files, truncated) =
-        match search_text_matches(&root, &query, case_sensitive, include_hidden, limit) {
+        match search_text_matches(&root, &matcher, include_hidden, limit) {
             Ok(result) => result,
             Err(error) => {
                 return builtin_filesystem_error(
@@ -485,6 +508,7 @@ fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "root": root.display().to_string(),
         "query": query,
+        "query_mode": query_mode,
         "case_sensitive": case_sensitive,
         "limit": limit,
         "scanned_files": scanned_files,
@@ -527,21 +551,31 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
             Some("background"),
         );
     }
-    let access_mode = request
+    let requested_access_mode = request
         .as_ref()
         .and_then(|object| {
             field_string(object, &["access_mode"])
                 .and_then(|value| BuiltinToolAccessMode::from_str(&value))
         })
         .unwrap_or(BuiltinToolAccessMode::MaybeWrite);
-    if access_mode == BuiltinToolAccessMode::ReadOnly
-        && !magi_permissions::PermissionEngine::shell_arguments_request_read_only(input)
+    let read_only_declaration_is_valid =
+        magi_permissions::PermissionEngine::shell_arguments_request_read_only(input);
+    if requested_access_mode == BuiltinToolAccessMode::ReadOnly
+        && !read_only_declaration_is_valid
+        && context.access_profile != magi_core::AccessProfile::FullAccess
     {
         return builtin_rejected(
             "shell_exec",
             "shell_exec 声明 access_mode=read_only 时，命令不能包含写入迹象",
         );
     }
+    let access_mode = if requested_access_mode == BuiltinToolAccessMode::ReadOnly
+        && !read_only_declaration_is_valid
+    {
+        BuiltinToolAccessMode::MaybeWrite
+    } else {
+        requested_access_mode
+    };
     let cwd_input = request
         .as_ref()
         .and_then(|object| field_string(object, &["cwd"]));
@@ -581,6 +615,24 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     {
         return payload;
     }
+    let missing_executables = crate::policy::shell_command_required_executables(&command, &shell)
+        .into_iter()
+        .filter(|executable| magi_process::resolve_executable(executable).is_none())
+        .collect::<Vec<_>>();
+    if !missing_executables.is_empty() {
+        return serde_json::json!({
+            "tool": "shell_exec",
+            "status": "failed",
+            "error_code": "shell_exec_command_not_found",
+            "error": format!("当前执行环境找不到命令：{}", missing_executables.join(", ")),
+            "command": command,
+            "cwd": cwd.display().to_string(),
+            "access_mode": access_mode.as_str(),
+            "missing_executables": missing_executables,
+            "summary": "命令依赖不可用",
+        })
+        .to_string();
+    }
 
     let output =
         match execute_shell_command_with_timeout(&shell, &command, &cwd, timeout_ms, context) {
@@ -611,8 +663,20 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let exit_code = output.status.as_ref().and_then(ExitStatus::code);
+    let missing_executable = shell_missing_executable(exit_code, &stderr);
+    let summary = if output.timed_out {
+        format!("命令执行超时({timeout_ms}ms): {command}")
+    } else if output.cancelled {
+        format!("命令已取消: {command}")
+    } else if succeeded {
+        format!("命令执行成功: {command}")
+    } else if let Some(executable) = missing_executable.as_deref() {
+        format!("命令依赖不可用（{executable}）: {command}")
+    } else {
+        format!("命令执行失败(退出码 {:?}): {command}", exit_code)
+    };
 
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "tool": "shell_exec",
         "status": status,
         "command": command,
@@ -626,17 +690,67 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
         "stderr": stderr,
         "stdout_truncated": output.stdout_truncated,
         "stderr_truncated": output.stderr_truncated,
-        "summary": if output.timed_out {
-            format!("命令执行超时({timeout_ms}ms): {command}")
-        } else if output.cancelled {
-            format!("命令已取消: {command}")
-        } else if succeeded {
-            format!("命令执行成功: {}", command)
-        } else {
-            format!("命令执行失败(退出码 {:?}): {}", exit_code, command)
-        }
-    })
-    .to_string()
+        "summary": summary,
+    });
+    if let Some(executable) = missing_executable {
+        payload["error_code"] =
+            serde_json::Value::String("shell_exec_command_not_found".to_string());
+        payload["error"] =
+            serde_json::Value::String(format!("当前执行环境找不到命令：{executable}"));
+        payload["missing_executable"] = serde_json::Value::String(executable);
+    }
+    payload.to_string()
+}
+
+fn shell_missing_executable(exit_code: Option<i32>, stderr: &str) -> Option<String> {
+    if !matches!(exit_code, Some(127 | 9009))
+        && !stderr.contains("command not found")
+        && !stderr.contains("not recognized as an internal or external command")
+        && !stderr.contains("is not recognized as the name of a cmdlet")
+    {
+        return None;
+    }
+    stderr.lines().rev().find_map(executable_from_shell_error)
+}
+
+fn executable_from_shell_error(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if let Some((_, executable)) = trimmed.rsplit_once("command not found:") {
+        return normalized_executable_name(executable);
+    }
+    if let Some((prefix, _)) = trimmed.rsplit_once(": command not found") {
+        return normalized_executable_name(prefix.rsplit(':').next().unwrap_or(prefix));
+    }
+    if let Some((prefix, _)) = trimmed.rsplit_once(": not found") {
+        return normalized_executable_name(prefix.rsplit(':').next().unwrap_or(prefix));
+    }
+    if trimmed.contains("not recognized as an internal or external command") {
+        return trimmed
+            .split('\'')
+            .nth(1)
+            .and_then(normalized_executable_name);
+    }
+    if trimmed.contains("is not recognized as the name of a cmdlet") {
+        return trimmed
+            .split('\'')
+            .nth(1)
+            .and_then(normalized_executable_name);
+    }
+    None
+}
+
+fn normalized_executable_name(value: &str) -> Option<String> {
+    let candidate = value.trim().trim_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '\'' | '"' | '`')
+    });
+    if candidate.is_empty()
+        || !candidate
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._+-/\\".contains(character))
+    {
+        return None;
+    }
+    Some(candidate.to_string())
 }
 
 fn execute_shell_exec_background_action(
@@ -1711,7 +1825,7 @@ fn default_shell_binary() -> String {
     if cfg!(windows) {
         "cmd".to_string()
     } else {
-        "sh".to_string()
+        magi_process::user_shell().to_string_lossy().to_string()
     }
 }
 
@@ -1767,7 +1881,7 @@ fn shell_arg(shell: &str) -> &'static str {
     } else if executable == "cmd" || executable == "cmd.exe" {
         "/C"
     } else {
-        "-lc"
+        "-c"
     }
 }
 
@@ -1788,21 +1902,66 @@ struct SearchTextFilesystemError {
     source: std::io::Error,
 }
 
+enum SearchTextMatcher {
+    Literal { query: String, case_sensitive: bool },
+    Regex(regex::Regex),
+}
+
+enum SearchTextMatcherError {
+    UnsupportedMode,
+    InvalidRegex,
+}
+
+impl SearchTextMatcher {
+    fn new(
+        query: &str,
+        query_mode: &str,
+        case_sensitive: bool,
+    ) -> Result<Self, SearchTextMatcherError> {
+        match query_mode {
+            "literal" => Ok(Self::Literal {
+                query: if case_sensitive {
+                    query.to_string()
+                } else {
+                    query.to_lowercase()
+                },
+                case_sensitive,
+            }),
+            "regex" => regex::RegexBuilder::new(query)
+                .case_insensitive(!case_sensitive)
+                .build()
+                .map(Self::Regex)
+                .map_err(|_| SearchTextMatcherError::InvalidRegex),
+            _ => Err(SearchTextMatcherError::UnsupportedMode),
+        }
+    }
+
+    fn find(&self, line: &str) -> Option<usize> {
+        match self {
+            Self::Literal {
+                query,
+                case_sensitive,
+            } => {
+                if *case_sensitive {
+                    line.find(query)
+                } else {
+                    line.to_lowercase().find(query)
+                }
+            }
+            Self::Regex(regex) => regex.find(line).map(|matched| matched.start()),
+        }
+    }
+}
+
 fn search_text_matches(
     root: &Path,
-    query: &str,
-    case_sensitive: bool,
+    matcher: &SearchTextMatcher,
     include_hidden: bool,
     limit: usize,
 ) -> Result<(Vec<Value>, usize, bool), SearchTextFilesystemError> {
     let mut stack = vec![root.to_path_buf()];
     let mut matches = Vec::new();
     let mut scanned_files = 0usize;
-    let normalized_query = if case_sensitive {
-        query.to_string()
-    } else {
-        query.to_lowercase()
-    };
 
     while let Some(path) = stack.pop() {
         if matches.len() >= limit {
@@ -1858,12 +2017,7 @@ fn search_text_matches(
             if matches.len() >= limit {
                 break;
             }
-            let haystack = if case_sensitive {
-                line.to_string()
-            } else {
-                line.to_lowercase()
-            };
-            if let Some(column) = haystack.find(&normalized_query) {
+            if let Some(column) = matcher.find(line) {
                 matches.push(serde_json::json!({
                     "path": path.display().to_string(),
                     "line": line_number + 1,
@@ -3399,6 +3553,45 @@ fn execute_search_semantic(
     let Some(workspace_id) = context.workspace_id.as_ref() else {
         return builtin_error("search_semantic", "缺少 workspace 上下文，无法查询代码索引");
     };
+    let Some(workspace_root) = context.working_directory.as_deref() else {
+        return builtin_error("search_semantic", "缺少工作区路径，无法初始化代码索引");
+    };
+    match store.ensure_workspace_index_available(
+        workspace_id,
+        workspace_root,
+        Duration::from_secs(15),
+    ) {
+        magi_knowledge_store::WorkspaceIndexEnsureResult::Ready => {}
+        magi_knowledge_store::WorkspaceIndexEnsureResult::TimedOut => {
+            return builtin_error_with_code(
+                "search_semantic",
+                "search_semantic_index_building",
+                "代码索引正在构建，请稍后重试",
+            );
+        }
+        magi_knowledge_store::WorkspaceIndexEnsureResult::Failed { reason_code } => {
+            let error = match reason_code {
+                Some(magi_knowledge_store::code_scanner::CodeIndexScanReasonCode::WorkspaceMissing) => {
+                    "工作区目录不存在，无法构建代码索引"
+                }
+                Some(
+                    magi_knowledge_store::code_scanner::CodeIndexScanReasonCode::WorkspaceNotDirectory,
+                ) => "工作区路径不是目录，无法构建代码索引",
+                Some(
+                    magi_knowledge_store::code_scanner::CodeIndexScanReasonCode::WorkspaceUnreadable,
+                ) => "工作区目录不可读取，无法构建代码索引",
+                Some(
+                    magi_knowledge_store::code_scanner::CodeIndexScanReasonCode::NoIndexableFiles,
+                ) => "工作区中没有可索引文件",
+                None => "代码索引构建失败",
+            };
+            return builtin_error_with_code(
+                "search_semantic",
+                "search_semantic_index_failed",
+                error,
+            );
+        }
+    }
     let Some(engine_results) = store.search_workspace_code(
         workspace_id,
         &query,
@@ -3409,7 +3602,11 @@ fn execute_search_semantic(
             prefer_recent_edits,
         },
     ) else {
-        return builtin_error("search_semantic", "代码索引引擎未就绪");
+        return builtin_error_with_code(
+            "search_semantic",
+            "search_semantic_index_invalid_state",
+            "代码索引状态异常，请重新构建索引",
+        );
     };
 
     let results: Vec<Value> = engine_results
@@ -3625,7 +3822,7 @@ mod tests {
             "-Command"
         );
         assert_eq!(shell_arg("pwsh"), "-Command");
-        assert_eq!(shell_arg("/bin/zsh"), "-lc");
+        assert_eq!(shell_arg("/bin/zsh"), "-c");
     }
 
     #[test]

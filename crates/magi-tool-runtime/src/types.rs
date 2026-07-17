@@ -117,11 +117,8 @@ impl ToolExecutionPolicy {
     }
 
     pub fn effective_access_profile(&self) -> magi_core::AccessProfile {
-        if self.command_mode.eq_ignore_ascii_case("read_only") {
-            magi_core::AccessProfile::ReadOnly
-        } else {
-            self.access_profile
-        }
+        self.access_profile
+            .constrained_by_command_mode(&self.command_mode)
     }
 }
 

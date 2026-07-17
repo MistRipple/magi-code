@@ -127,9 +127,18 @@ impl ToolRegistry {
         };
         let default_access_mode = tool_name.default_access_mode();
         if default_access_mode == BuiltinToolAccessMode::MaybeWrite {
-            return self
+            let requested_access_mode = self
                 .parse_requested_access_mode(&input.input)
                 .unwrap_or(default_access_mode);
+            if tool_name == crate::BuiltinToolName::ShellExec
+                && requested_access_mode == BuiltinToolAccessMode::ReadOnly
+                && !magi_permissions::PermissionEngine::shell_arguments_request_read_only(
+                    &input.input,
+                )
+            {
+                return BuiltinToolAccessMode::MaybeWrite;
+            }
+            return requested_access_mode;
         }
         default_access_mode
     }
@@ -146,7 +155,6 @@ impl ToolRegistry {
         input: &ToolExecutionInput,
         context: &ToolExecutionContext,
         policy: &ToolExecutionPolicy,
-        access_mode: BuiltinToolAccessMode,
     ) -> Option<ToolExecutionOutput> {
         let policy = normalize_execution_policy(policy);
         let effective_access_profile = policy.effective_access_profile();
@@ -179,11 +187,8 @@ impl ToolRegistry {
         };
         let mut pending_output = None;
 
-        let tool_is_writeful = if input.tool_name == crate::BuiltinToolName::ShellExec.as_str() {
-            false
-        } else {
-            access_mode.is_writeful()
-        };
+        let tool_is_writeful = crate::BuiltinToolName::from_name(input.tool_name.trim())
+            .is_some_and(|tool| tool.is_access_profile_write_operation());
         let tool_decision = engine.decide(
             &magi_permissions::PermissionRequest::ToolInvocation {
                 tool_name: &input.tool_name,
@@ -784,6 +789,89 @@ fn shell_exec_command_path_accesses(
     paths
 }
 
+pub(crate) fn shell_command_required_executables(command: &str, shell: &str) -> Vec<String> {
+    let dialect = ShellDialect::from_shell(shell);
+    let tokens = shell_command_tokens(command, dialect);
+    let segments = shell_command_segments(&tokens);
+    let mut declared_functions = std::collections::HashSet::new();
+    for segment in &segments {
+        let words = shell_segment_words(segment);
+        if let Some(function) = shell_declared_function(&words) {
+            declared_functions.insert(function.to_string());
+        }
+    }
+
+    let mut executables = Vec::new();
+    let mut deferred_block_depth = 0usize;
+    for segment in segments {
+        let words = shell_segment_words(segment);
+        let was_in_deferred_block = deferred_block_depth > 0;
+        let closes_deferred_block = shell_segment_closes_deferred_block(&words, dialect);
+        if closes_deferred_block {
+            deferred_block_depth = deferred_block_depth.saturating_sub(1);
+        }
+        let opens_deferred_block = shell_segment_opens_deferred_block(&words, dialect);
+        if opens_deferred_block {
+            deferred_block_depth += 1;
+        }
+        if words.is_empty()
+            || was_in_deferred_block
+            || opens_deferred_block
+            || closes_deferred_block
+            || shell_segment_is_declaration(&words)
+            || shell_segment_is_command_probe(&words)
+            || shell_segment_is_cmd_conditional(&words, dialect)
+        {
+            continue;
+        }
+        let Some(command_index) = shell_command_word_index(&words) else {
+            continue;
+        };
+        let command = words[command_index];
+        let basename = shell_command_basename(command);
+        if command.contains('$')
+            || declared_functions.contains(basename)
+            || shell_word_is_builtin_or_keyword(basename)
+        {
+            continue;
+        }
+        if !executables.iter().any(|existing| existing == command) {
+            executables.push(command.to_string());
+        }
+    }
+    executables
+}
+
+fn shell_segment_opens_deferred_block(words: &[&str], dialect: ShellDialect) -> bool {
+    if dialect == ShellDialect::Cmd {
+        return false;
+    }
+    shell_declared_function(words).is_some()
+        || words.first().is_some_and(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "if" | "for" | "while" | "until" | "case" | "select" | "foreach"
+            )
+        })
+}
+
+fn shell_segment_closes_deferred_block(words: &[&str], dialect: ShellDialect) -> bool {
+    dialect != ShellDialect::Cmd
+        && words.iter().any(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "fi" | "done" | "esac" | "}"
+            )
+        })
+}
+
+fn shell_segment_is_cmd_conditional(words: &[&str], dialect: ShellDialect) -> bool {
+    dialect == ShellDialect::Cmd
+        && words
+            .first()
+            .is_some_and(|word| matches!(word.to_ascii_lowercase().as_str(), "if" | "for"))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ShellToken {
     Word(String),
@@ -845,6 +933,20 @@ fn shell_command_tokens(command: &str, dialect: ShellDialect) -> Vec<ShellToken>
         }
         if matches!(ch, '\'' | '"') {
             quote = Some(ch);
+            continue;
+        }
+        if ch == '\n' {
+            push_shell_word(&mut tokens, &mut word);
+            tokens.push(ShellToken::Operator(";".to_string()));
+            continue;
+        }
+        if dialect != ShellDialect::Cmd && ch == '#' && word.is_empty() {
+            for comment_character in chars.by_ref() {
+                if comment_character == '\n' {
+                    tokens.push(ShellToken::Operator(";".to_string()));
+                    break;
+                }
+            }
             continue;
         }
         if ch.is_whitespace() {
@@ -939,6 +1041,113 @@ fn shell_command_segments(tokens: &[ShellToken]) -> Vec<&[ShellToken]> {
     segments
 }
 
+fn shell_segment_words(segment: &[ShellToken]) -> Vec<&str> {
+    segment
+        .iter()
+        .filter_map(|token| match token {
+            ShellToken::Word(word) => Some(word.as_str()),
+            ShellToken::Operator(_) => None,
+        })
+        .collect()
+}
+
+fn shell_declared_function<'a>(words: &'a [&str]) -> Option<&'a str> {
+    if let Some(name) = words.first().and_then(|word| word.strip_suffix("()"))
+        && !name.is_empty()
+    {
+        return Some(name);
+    }
+    (words.first() == Some(&"function"))
+        .then(|| words.get(1).copied())
+        .flatten()
+        .map(|name| name.trim_end_matches("()"))
+        .filter(|name| !name.is_empty())
+}
+
+fn shell_segment_is_declaration(words: &[&str]) -> bool {
+    shell_declared_function(words).is_some()
+        || words.first().is_some_and(|word| {
+            matches!(
+                *word,
+                "for" | "while" | "until" | "case" | "select" | "function"
+            )
+        })
+}
+
+fn shell_segment_is_command_probe(words: &[&str]) -> bool {
+    let mut index = 0usize;
+    while words
+        .get(index)
+        .is_some_and(|word| matches!(*word, "if" | "then" | "do" | "else" | "elif" | "time"))
+    {
+        index += 1;
+    }
+    matches!(
+        &words[index..],
+        ["command", "-v" | "-V", ..] | ["type" | "which" | "where", ..]
+    )
+}
+
+fn shell_word_is_builtin_or_keyword(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        ":" | "!"
+            | "{"
+            | "}"
+            | "["
+            | "]"
+            | "[["
+            | "]]"
+            | "alias"
+            | "break"
+            | "case"
+            | "cd"
+            | "continue"
+            | "do"
+            | "done"
+            | "elif"
+            | "else"
+            | "esac"
+            | "echo"
+            | "eval"
+            | "exec"
+            | "exit"
+            | "export"
+            | "false"
+            | "fi"
+            | "for"
+            | "foreach"
+            | "function"
+            | "get-command"
+            | "if"
+            | "in"
+            | "local"
+            | "popd"
+            | "printf"
+            | "pushd"
+            | "pwd"
+            | "read"
+            | "readonly"
+            | "return"
+            | "set"
+            | "shift"
+            | "source"
+            | "select"
+            | "test"
+            | "then"
+            | "true"
+            | "typeset"
+            | "ulimit"
+            | "umask"
+            | "unalias"
+            | "unset"
+            | "until"
+            | "wait"
+            | "while"
+            | "."
+    )
+}
+
 fn shell_segment_path_accesses(
     segment: &[ShellToken],
     workspace_root_path: Option<&Path>,
@@ -1018,7 +1227,19 @@ fn shell_command_word_index(words: &[&str]) -> Option<usize> {
     let mut index = 0usize;
     while index < words.len() {
         let word = words[index];
-        if matches!(word, "env" | "command" | "builtin" | "exec" | "sudo") {
+        if matches!(
+            word,
+            "if" | "then"
+                | "do"
+                | "else"
+                | "elif"
+                | "time"
+                | "env"
+                | "command"
+                | "builtin"
+                | "exec"
+                | "sudo"
+        ) {
             index += 1;
             continue;
         }
@@ -1198,9 +1419,37 @@ fn normalize_path_for_lock(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod shell_path_parser_tests {
     use super::{
-        ShellDialect, ShellToken, shell_command_basename, shell_command_tokens,
-        shell_word_looks_like_path,
+        ShellDialect, ShellToken, shell_command_basename, shell_command_required_executables,
+        shell_command_tokens, shell_word_looks_like_path,
     };
+
+    #[test]
+    fn shell_dependency_scan_handles_comments_pipelines_and_command_probes() {
+        let command = "# inspect security\ncommand -v optional-tool >/dev/null 2>&1\nrg -n auth crates 2>/dev/null | head -20\nnode -e 'console.log(1)'";
+
+        assert_eq!(
+            shell_command_required_executables(command, "/bin/zsh"),
+            vec!["rg".to_string(), "head".to_string(), "node".to_string()]
+        );
+    }
+
+    #[test]
+    fn shell_dependency_scan_skips_conditional_fallback_branches() {
+        let command = "rg --version\nif command -v optional-search >/dev/null 2>&1; then\n  optional-search -n auth crates\nelse\n  optional-fallback -R auth crates\nfi\nnode --version";
+
+        assert_eq!(
+            shell_command_required_executables(command, "/bin/zsh"),
+            vec!["rg".to_string(), "node".to_string()]
+        );
+    }
+
+    #[test]
+    fn shell_dependency_scan_ignores_posix_group_delimiters() {
+        assert_eq!(
+            shell_command_required_executables("{\nrg --version\n}\n", "/bin/zsh"),
+            vec!["rg".to_string()]
+        );
+    }
 
     #[test]
     fn cmd_tokenizer_preserves_windows_backslashes() {

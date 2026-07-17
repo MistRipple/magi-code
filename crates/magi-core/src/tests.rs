@@ -98,6 +98,22 @@ fn access_profile_parses_wire_values() {
 }
 
 #[test]
+fn access_profile_applies_read_only_task_constraint_consistently() {
+    assert_eq!(
+        AccessProfile::FullAccess.constrained_by_command_mode("read_only"),
+        AccessProfile::ReadOnly
+    );
+    assert_eq!(
+        AccessProfile::FullAccess.constrained_by_command_mode("full"),
+        AccessProfile::FullAccess
+    );
+    assert_eq!(
+        AccessProfile::Restricted.constrained_by_command_mode(""),
+        AccessProfile::Restricted
+    );
+}
+
+#[test]
 fn task_serialization_roundtrip() {
     let task = Task {
         task_id: TaskId::new("task-1"),

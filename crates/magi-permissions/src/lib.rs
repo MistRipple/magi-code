@@ -233,15 +233,9 @@ impl PermissionEngine {
         if !Self::shell_arguments_have_permission_relevant_operation(arguments_json) {
             return Decision::Allow;
         }
-        let declares_read_only = Self::shell_arguments_declare_read_only(arguments_json);
         let is_read_only = Self::shell_arguments_request_read_only(arguments_json);
-        if declares_read_only && !is_read_only {
-            return Decision::Deny {
-                reason: "shell_exec 声明为只读时，命令不能包含写入迹象".to_string(),
-            };
-        }
-        if (access_profile == AccessProfile::ReadOnly || policy.is_read_only_command_mode())
-            && !is_read_only
+        if !is_read_only
+            && (access_profile == AccessProfile::ReadOnly || policy.is_read_only_command_mode())
         {
             return Decision::Deny {
                 reason:
@@ -273,6 +267,14 @@ impl PermissionEngine {
         let has_terminal_id = json_has_any(&object, &["terminal_id", "terminalId", "id"]);
         let has_command = json_string(&object, &["command", "script", "line"])
             .is_some_and(|value| !value.trim().is_empty());
+
+        if object
+            .get("background")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return false;
+        }
 
         match action.as_deref() {
             None if has_terminal_id && !has_command => return true,
@@ -330,19 +332,6 @@ impl PermissionEngine {
         }
     }
 
-    fn shell_arguments_declare_read_only(arguments_json: &str) -> bool {
-        serde_json::from_str::<serde_json::Value>(arguments_json)
-            .ok()
-            .and_then(|value| value.as_object().cloned())
-            .and_then(|object| json_string(&object, &["access_mode", "write_mode", "intent"]))
-            .is_some_and(|mode| {
-                matches!(
-                    mode.trim().to_ascii_lowercase().as_str(),
-                    "read" | "read_only" | "readonly"
-                )
-            })
-    }
-
     /// caller 直接拿 list 用于 dedup 逻辑。
     pub fn read_only_tool_names(&self) -> Vec<&'static str> {
         self.read_only_tools.iter().copied().collect()
@@ -372,6 +361,16 @@ enum ShellDialect {
     PowerShell,
 }
 
+impl ShellDialect {
+    fn escape_char(self) -> char {
+        match self {
+            Self::Posix => '\\',
+            Self::Cmd => '^',
+            Self::PowerShell => '`',
+        }
+    }
+}
+
 fn shell_dialect(shell: &str) -> ShellDialect {
     let shell = shell.trim().to_ascii_lowercase();
     if shell.contains("powershell") || shell.ends_with("pwsh") || shell.ends_with("pwsh.exe") {
@@ -384,13 +383,18 @@ fn shell_dialect(shell: &str) -> ShellDialect {
 }
 
 fn shell_command_has_write_indicator(command: &str, dialect: ShellDialect) -> bool {
-    let tokens = shell_command_tokens(command);
+    shell_command_has_write_indicator_with_depth(command, dialect, 0)
+}
+
+fn shell_command_has_write_indicator_with_depth(
+    command: &str,
+    dialect: ShellDialect,
+    depth: usize,
+) -> bool {
     shell_command_has_unsafe_unquoted_output_redirection(command, dialect)
-        || tokens
-            .iter()
-            .any(|token| shell_token_is_write_indicator(token, dialect))
-        || shell_tokens_include_download_output_write(&tokens)
-        || shell_command_includes_mutating_git(command)
+        || shell_command_includes_write_command(command, dialect, depth)
+        || shell_command_includes_download_output_write(command, dialect)
+        || shell_command_includes_mutating_git(command, dialect)
 }
 
 fn shell_command_has_unsafe_unquoted_output_redirection(
@@ -484,19 +488,58 @@ fn redirection_target_is_null_device(target: &str, dialect: ShellDialect) -> boo
     }
 }
 
-fn shell_command_tokens(command: &str) -> Vec<String> {
-    command
-        .split(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')'))
-        .filter_map(|part| {
-            let token = part
-                .trim_matches(|ch: char| {
-                    matches!(ch, '"' | '\'' | '`' | '[' | ']' | '{' | '}' | ',')
-                })
-                .trim()
-                .to_ascii_lowercase();
-            (!token.is_empty()).then_some(token)
-        })
-        .collect()
+fn shell_command_tokens(command: &str, dialect: ShellDialect) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for character in command.chars() {
+        if escaped {
+            token.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == dialect.escape_char() && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                quote = None;
+            } else {
+                token.push(character);
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"')
+            || (character == '`' && dialect != ShellDialect::PowerShell)
+        {
+            quote = Some(character);
+            continue;
+        }
+        if character.is_whitespace() || matches!(character, ';' | '|' | '&' | '(' | ')') {
+            push_shell_command_token(&mut tokens, &mut token);
+            continue;
+        }
+        token.push(character);
+    }
+    if escaped {
+        token.push(dialect.escape_char());
+    }
+    push_shell_command_token(&mut tokens, &mut token);
+    tokens
+}
+
+fn push_shell_command_token(tokens: &mut Vec<String>, token: &mut String) {
+    let normalized = token
+        .trim_matches(|character: char| matches!(character, '[' | ']' | '{' | '}' | ','))
+        .trim()
+        .to_ascii_lowercase();
+    if !normalized.is_empty() {
+        tokens.push(normalized);
+    }
+    token.clear();
 }
 
 fn shell_token_is_write_indicator(token: &str, dialect: ShellDialect) -> bool {
@@ -540,15 +583,178 @@ fn shell_token_is_write_indicator(token: &str, dialect: ShellDialect) -> bool {
         }
 }
 
-fn shell_tokens_include_download_output_write(tokens: &[String]) -> bool {
-    tokens
-        .iter()
-        .enumerate()
-        .any(|(index, token)| match token.as_str() {
-            "curl" => curl_tokens_write_output(&tokens[index + 1..]),
-            "wget" => wget_tokens_write_output(&tokens[index + 1..]),
-            _ => false,
+fn shell_command_includes_write_command(
+    command: &str,
+    dialect: ShellDialect,
+    depth: usize,
+) -> bool {
+    shell_command_segments(command).into_iter().any(|segment| {
+        let tokens = shell_command_tokens(&segment, dialect);
+        let Some(command_index) = shell_command_token_index(&tokens) else {
+            return false;
+        };
+        shell_invocation_has_write_indicator(&tokens[command_index..], dialect, depth)
+    })
+}
+
+fn shell_invocation_has_write_indicator(
+    tokens: &[String],
+    dialect: ShellDialect,
+    depth: usize,
+) -> bool {
+    let Some(command) = tokens.first().map(|token| shell_command_basename(token)) else {
+        return false;
+    };
+    let arguments = &tokens[1..];
+    if shell_token_is_write_indicator(command, dialect) {
+        return true;
+    }
+    match command {
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" => {
+            shell_inline_script(arguments, &["-c", "--command"]).is_some_and(|script| {
+                depth >= 4
+                    || shell_command_has_write_indicator_with_depth(
+                        script,
+                        ShellDialect::Posix,
+                        depth + 1,
+                    )
+            })
+        }
+        "cmd" | "cmd.exe" => shell_inline_script(arguments, &["/c", "/k"]).is_some_and(|script| {
+            depth >= 4
+                || shell_command_has_write_indicator_with_depth(
+                    script,
+                    ShellDialect::Cmd,
+                    depth + 1,
+                )
+        }),
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => {
+            if arguments.iter().any(|argument| {
+                matches!(
+                    argument.as_str(),
+                    "-encodedcommand" | "-enc" | "-file" | "-f"
+                )
+            }) {
+                return true;
+            }
+            shell_inline_script(arguments, &["-command", "-c"]).is_some_and(|script| {
+                depth >= 4
+                    || shell_command_has_write_indicator_with_depth(
+                        script,
+                        ShellDialect::PowerShell,
+                        depth + 1,
+                    )
+            })
+        }
+        "xargs" => xargs_invocation_has_write_indicator(arguments, dialect, depth),
+        "find" => arguments.iter().any(|argument| {
+            matches!(
+                argument.as_str(),
+                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
+            )
+        }),
+        "sed" => arguments.iter().any(|argument| {
+            argument == "-i" || argument.starts_with("-i") || argument.starts_with("--in-place")
+        }),
+        "perl" => arguments.iter().any(|argument| {
+            argument == "-i"
+                || argument.starts_with("-i")
+                || matches!(argument.as_str(), "-e" | "-E")
+        }),
+        "node" | "node.exe" | "python" | "python3" | "python.exe" | "py" | "ruby" | "ruby.exe" => {
+            !command_invocation_is_information_only(arguments)
+        }
+        "cargo" | "cargo.exe" => cargo_invocation_has_write_indicator(arguments),
+        "make" | "gmake" | "ninja" | "cmake" | "rustc" | "gcc" | "clang" | "cl" | "cl.exe" => {
+            !command_invocation_is_information_only(arguments)
+        }
+        _ => false,
+    }
+}
+
+fn shell_inline_script<'a>(arguments: &'a [String], flags: &[&str]) -> Option<&'a str> {
+    arguments.iter().enumerate().find_map(|(index, argument)| {
+        flags
+            .iter()
+            .any(|flag| argument.eq_ignore_ascii_case(flag))
+            .then(|| arguments.get(index + 1).map(String::as_str))
+            .flatten()
+    })
+}
+
+fn xargs_invocation_has_write_indicator(
+    arguments: &[String],
+    dialect: ShellDialect,
+    depth: usize,
+) -> bool {
+    let mut index = 0usize;
+    while index < arguments.len() {
+        let argument = arguments[index].as_str();
+        if matches!(
+            argument,
+            "-a" | "--arg-file"
+                | "-e"
+                | "-E"
+                | "-i"
+                | "-I"
+                | "-l"
+                | "-L"
+                | "-n"
+                | "--max-args"
+                | "-p"
+                | "-P"
+                | "--max-procs"
+                | "-s"
+                | "--max-chars"
+        ) {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return shell_invocation_has_write_indicator(&arguments[index..], dialect, depth + 1);
+    }
+    false
+}
+
+fn command_invocation_is_information_only(arguments: &[String]) -> bool {
+    arguments.is_empty()
+        || arguments.iter().any(|argument| {
+            matches!(
+                argument.as_str(),
+                "--version" | "-v" | "-V" | "--help" | "-h" | "/?"
+            )
         })
+}
+
+fn cargo_invocation_has_write_indicator(arguments: &[String]) -> bool {
+    let Some(subcommand) = arguments
+        .iter()
+        .map(String::as_str)
+        .find(|argument| !argument.starts_with('-'))
+    else {
+        return false;
+    };
+    !matches!(
+        subcommand,
+        "help" | "locate-project" | "metadata" | "pkgid" | "search" | "tree" | "version"
+    )
+}
+
+fn shell_command_includes_download_output_write(command: &str, dialect: ShellDialect) -> bool {
+    shell_command_segments(command).into_iter().any(|segment| {
+        let tokens = shell_command_tokens(&segment, dialect);
+        let Some(command_index) = shell_command_token_index(&tokens) else {
+            return false;
+        };
+        match shell_command_basename(&tokens[command_index]) {
+            "curl" => curl_tokens_write_output(&tokens[command_index + 1..]),
+            "wget" => wget_tokens_write_output(&tokens[command_index + 1..]),
+            _ => false,
+        }
+    })
 }
 
 fn curl_tokens_write_output(tokens: &[String]) -> bool {
@@ -627,18 +833,21 @@ fn wget_tokens_write_output(tokens: &[String]) -> bool {
     !has_stdout_output && !has_spider
 }
 
-fn shell_command_includes_mutating_git(command: &str) -> bool {
+fn shell_command_includes_mutating_git(command: &str, dialect: ShellDialect) -> bool {
     shell_command_segments(command).into_iter().any(|segment| {
-        let tokens = shell_command_tokens(&segment);
+        let tokens = shell_command_tokens(&segment, dialect);
         let Some(command_index) = shell_command_token_index(&tokens) else {
             return false;
         };
-        if tokens[command_index] != "git" {
+        if shell_command_basename(&tokens[command_index]) != "git" {
             return false;
         }
-        git_subcommand_after(&tokens[command_index + 1..])
-            .is_some_and(|subcommand| !git_subcommand_is_read_only(subcommand))
+        !git_invocation_is_read_only(&tokens[command_index + 1..])
     })
+}
+
+fn shell_command_basename(command: &str) -> &str {
+    command.rsplit(['/', '\\']).next().unwrap_or(command)
 }
 
 fn shell_command_segments(command: &str) -> Vec<String> {
@@ -699,7 +908,7 @@ fn shell_command_token_index(tokens: &[String]) -> Option<usize> {
     None
 }
 
-fn git_subcommand_after(tokens: &[String]) -> Option<&str> {
+fn git_subcommand_and_arguments(tokens: &[String]) -> Option<(&str, &[String])> {
     let mut index = 0usize;
     while index < tokens.len() {
         match tokens[index].as_str() {
@@ -708,14 +917,17 @@ fn git_subcommand_after(tokens: &[String]) -> Option<&str> {
                 index += 1
             }
             token if token.starts_with('-') => index += 1,
-            token => return Some(token),
+            token => return Some((token, &tokens[index + 1..])),
         }
     }
     None
 }
 
-fn git_subcommand_is_read_only(subcommand: &str) -> bool {
-    matches!(
+fn git_invocation_is_read_only(tokens: &[String]) -> bool {
+    let Some((subcommand, arguments)) = git_subcommand_and_arguments(tokens) else {
+        return true;
+    };
+    if matches!(
         subcommand,
         "status"
             | "diff"
@@ -727,7 +939,72 @@ fn git_subcommand_is_read_only(subcommand: &str) -> bool {
             | "describe"
             | "merge-base"
             | "name-rev"
-    )
+            | "rev-list"
+            | "shortlog"
+            | "reflog"
+            | "ls-tree"
+            | "cat-file"
+            | "for-each-ref"
+            | "check-ignore"
+            | "count-objects"
+    ) {
+        return true;
+    }
+    match subcommand {
+        "remote" => git_remote_invocation_is_read_only(arguments),
+        "worktree" => arguments.first().is_some_and(|argument| argument == "list"),
+        "stash" => arguments
+            .first()
+            .is_some_and(|argument| matches!(argument.as_str(), "list" | "show")),
+        "submodule" => arguments
+            .first()
+            .is_some_and(|argument| matches!(argument.as_str(), "status" | "summary")),
+        "config" => git_config_invocation_is_read_only(arguments),
+        _ => false,
+    }
+}
+
+fn git_remote_invocation_is_read_only(arguments: &[String]) -> bool {
+    let first_meaningful = arguments.iter().map(String::as_str).find(|argument| {
+        !matches!(*argument, "-v" | "--verbose") && !shell_token_is_redirection(argument)
+    });
+    match first_meaningful {
+        None => true,
+        Some("get-url" | "show") => true,
+        Some(_) => false,
+    }
+}
+
+fn shell_token_is_redirection(token: &str) -> bool {
+    token
+        .trim_start_matches(|character: char| character.is_ascii_digit())
+        .starts_with(['>', '<'])
+}
+
+fn git_config_invocation_is_read_only(arguments: &[String]) -> bool {
+    arguments.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--get"
+                | "--get-all"
+                | "--get-regexp"
+                | "--get-urlmatch"
+                | "--list"
+                | "-l"
+                | "--show-origin"
+                | "--show-scope"
+        )
+    }) && !arguments.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--add"
+                | "--replace-all"
+                | "--unset"
+                | "--unset-all"
+                | "--rename-section"
+                | "--remove-section"
+        )
+    })
 }
 
 fn path_is_within(target: &Path, root: &Path) -> bool {
@@ -910,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_read_only_declaration_does_not_hide_redirection_write() {
+    fn shell_read_only_declaration_is_reclassified_by_product_access_profile() {
         let engine = engine_with_test_tools();
         let policy = policy_empty();
         let args = r#"{"command":"printf hi > out.txt","access_mode":"read_only"}"#;
@@ -924,9 +1201,28 @@ mod tests {
                 .decide(&req, &policy, AccessProfile::ReadOnly)
                 .is_deny()
         );
+        assert!(matches!(
+            engine.decide(&req, &policy, AccessProfile::Restricted),
+            Decision::NeedsApproval { .. }
+        ));
+        assert_eq!(
+            engine.decide(&req, &policy, AccessProfile::FullAccess),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn read_only_command_policy_still_rejects_misdeclared_write_shell_in_full_access() {
+        let engine = engine_with_test_tools();
+        let policy = policy_read_only();
+        let args = r#"{"command":"printf hi > out.txt","access_mode":"read_only"}"#;
+        let req = PermissionRequest::ShellCommand {
+            arguments_json: args,
+        };
+
         assert!(
             engine
-                .decide(&req, &policy, AccessProfile::Restricted)
+                .decide(&req, &policy, AccessProfile::FullAccess)
                 .is_deny()
         );
     }
@@ -1002,6 +1298,37 @@ mod tests {
     }
 
     #[test]
+    fn shell_read_only_rejects_indirect_and_ambiguous_side_effect_commands() {
+        for (shell, command) in [
+            ("/bin/zsh", "bash -c 'touch nested.txt'"),
+            ("/bin/zsh", "printf nested | xargs touch"),
+            ("/bin/zsh", "find . -name '*.tmp' -delete"),
+            ("/bin/zsh", "sed -i.bak 's/a/b/' file.txt"),
+            (
+                "/bin/zsh",
+                "node -e 'require(\"fs\").writeFileSync(\"out\", \"x\")'",
+            ),
+            ("/bin/zsh", "cargo test"),
+            ("cmd.exe", "cmd /C del nested.txt"),
+            (
+                "powershell.exe",
+                "powershell -Command Set-Content nested.txt value",
+            ),
+        ] {
+            let args = serde_json::json!({
+                "shell": shell,
+                "command": command,
+                "access_mode": "read_only"
+            })
+            .to_string();
+            assert!(
+                !PermissionEngine::shell_arguments_request_read_only(&args),
+                "indirect or ambiguous side effect must not stay read-only: {shell}: {command}"
+            );
+        }
+    }
+
+    #[test]
     fn shell_missing_command_is_left_to_tool_validation() {
         let engine = engine_with_test_tools();
         let policy = policy_empty();
@@ -1020,6 +1347,92 @@ mod tests {
         let args = r#"{"command":"touch out.txt","access_mode":"read_only"}"#;
 
         assert!(!PermissionEngine::shell_arguments_request_read_only(args));
+    }
+
+    #[test]
+    fn shell_background_execution_is_never_classified_as_read_only() {
+        let args = r#"{"command":"printf background","access_mode":"read_only","background":true}"#;
+
+        assert!(!PermissionEngine::shell_arguments_request_read_only(args));
+        assert!(matches!(
+            engine_with_test_tools().decide(
+                &PermissionRequest::ShellCommand {
+                    arguments_json: args,
+                },
+                &PermissionPolicy::default(),
+                AccessProfile::Restricted,
+            ),
+            Decision::NeedsApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn shell_permission_matrix_keeps_product_modes_stable() {
+        let engine = engine_with_test_tools();
+        let unrestricted_policy = PermissionPolicy::default();
+        let read_only_policy = policy_read_only();
+        let cases = [
+            (
+                "declared read",
+                r#"{"command":"printf hello","access_mode":"read_only"}"#,
+                true,
+            ),
+            (
+                "misdeclared write command",
+                r#"{"command":"touch output.txt","access_mode":"read_only"}"#,
+                false,
+            ),
+            (
+                "misdeclared redirection",
+                r#"{"command":"printf hello > output.txt","access_mode":"read_only"}"#,
+                false,
+            ),
+            (
+                "background process",
+                r#"{"command":"printf hello","access_mode":"read_only","background":true}"#,
+                false,
+            ),
+            (
+                "declared write",
+                r#"{"command":"printf hello","access_mode":"maybe_write"}"#,
+                false,
+            ),
+        ];
+
+        for (label, arguments, classified_read_only) in cases {
+            assert_eq!(
+                PermissionEngine::shell_arguments_request_read_only(arguments),
+                classified_read_only,
+                "shell classification mismatch: {label}"
+            );
+            let request = PermissionRequest::ShellCommand {
+                arguments_json: arguments,
+            };
+            assert_eq!(
+                engine.decide(&request, &unrestricted_policy, AccessProfile::FullAccess),
+                Decision::Allow,
+                "full access must not be downgraded by shell declaration: {label}"
+            );
+            let restricted =
+                engine.decide(&request, &unrestricted_policy, AccessProfile::Restricted);
+            assert_eq!(
+                matches!(restricted, Decision::Allow),
+                classified_read_only,
+                "restricted classification mismatch: {label}"
+            );
+            let read_only = engine.decide(&request, &unrestricted_policy, AccessProfile::ReadOnly);
+            assert_eq!(
+                matches!(read_only, Decision::Allow),
+                classified_read_only,
+                "read-only profile mismatch: {label}"
+            );
+            let constrained = engine.decide(&request, &read_only_policy, AccessProfile::FullAccess);
+            assert_eq!(
+                matches!(constrained, Decision::Allow),
+                classified_read_only,
+                "task read-only constraint mismatch: {label}"
+            );
+        }
     }
 
     #[test]
@@ -1084,11 +1497,72 @@ mod tests {
     fn shell_read_only_allows_compound_repository_inspection() {
         let args = serde_json::json!({
             "access_mode": "read_only",
-            "command": "cd /Users/xie/code/magi && {\n  echo \"=== ROOT LISTING ===\";\n  ls -la;\n  echo;\n  echo \"=== GIT STATE ===\";\n  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n    git rev-parse --is-inside-work-tree;\n    git status --short | head -50;\n    echo \"--- recent commits ---\";\n    git log --oneline -15 2>/dev/null || echo \"(no commits)\";\n  else\n    echo \"NOT_GIT_WORKTREE\";\n  fi\n  echo;\n  echo \"=== FILE COUNT BY TYPE (top-level dirs only) ===\";\n  for d in */; do printf \"%s \" \"$d\"; find \"$d\" -type f 2>/dev/null | wc -l; done | head -40;\n} 2>&1 | head -200"
+            "command": "cd /Users/xie/code/magi && {\n  echo \"=== ROOT LISTING ===\";\n  ls -la;\n  echo;\n  echo \"=== GIT STATE ===\";\n  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n    git rev-parse --is-inside-work-tree;\n    git remote -v 2>/dev/null | head -5;\n    git status --short | head -50;\n    echo \"--- recent commits ---\";\n    git log --oneline -15 2>/dev/null || echo \"(no commits)\";\n  else\n    echo \"NOT_GIT_WORKTREE\";\n  fi\n  echo;\n  echo \"=== FILE COUNT BY TYPE (top-level dirs only) ===\";\n  for d in */; do printf \"%s \" \"$d\"; find \"$d\" -type f 2>/dev/null | wc -l; done | head -40;\n} 2>&1 | head -200"
         })
         .to_string();
 
         assert!(PermissionEngine::shell_arguments_request_read_only(&args));
+    }
+
+    #[test]
+    fn shell_read_only_ignores_write_command_names_inside_search_patterns() {
+        let args = serde_json::json!({
+            "access_mode": "read_only",
+            "command": "grep -rn \"Router::\\|layer(\\|middleware\\|DefaultBodyLimit\\|Cors\\|serve\\|bind\\|0.0.0.0\\|127.0.0.1\\|tunnel_token\\|sessions.json\\|write_all\\|atomic\" crates/magi-api crates/magi-daemon apps --include='*.rs' 2>/dev/null | head -80; echo '==='; grep -rn \"max_tokens\\|temperature\\|context_window\\|token_limit\\|compress\\|truncate\" crates/magi-context-runtime crates/magi-conversation-runtime --include='*.rs' 2>/dev/null | head -40; echo '==='; wc -c .magi/sessions.json 2>/dev/null; ls -la .magi/snapshots 2>/dev/null | head"
+        })
+        .to_string();
+
+        assert!(PermissionEngine::shell_arguments_request_read_only(&args));
+        assert_eq!(
+            engine_with_test_tools().decide(
+                &PermissionRequest::ShellCommand {
+                    arguments_json: &args,
+                },
+                &PermissionPolicy::default(),
+                AccessProfile::FullAccess,
+            ),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn shell_read_only_distinguishes_remote_queries_from_remote_mutations() {
+        for command in [
+            "git remote",
+            "git remote -v",
+            "git remote get-url origin",
+            "git remote show origin",
+        ] {
+            let args = serde_json::json!({
+                "access_mode": "read_only",
+                "command": command,
+            })
+            .to_string();
+            assert!(
+                PermissionEngine::shell_arguments_request_read_only(&args),
+                "remote query should remain read-only: {command}"
+            );
+        }
+
+        for command in [
+            "git remote add origin https://example.test/repo.git",
+            "git remote -v add origin https://example.test/repo.git",
+            "git remote remove origin",
+            "git remote rename origin upstream",
+            "git remote set-url origin https://example.test/repo.git",
+            "git remote prune origin",
+            "git remote update",
+        ] {
+            let args = serde_json::json!({
+                "access_mode": "read_only",
+                "command": command,
+            })
+            .to_string();
+            assert!(
+                !PermissionEngine::shell_arguments_request_read_only(&args),
+                "remote mutation must not be classified as read-only: {command}"
+            );
+        }
     }
 
     #[test]

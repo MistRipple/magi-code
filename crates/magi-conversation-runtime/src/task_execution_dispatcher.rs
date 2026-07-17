@@ -1012,10 +1012,7 @@ fn tool_surface_access_profile(
     let Some(policy) = task.and_then(|task| task.policy_snapshot.as_ref()) else {
         return access_profile;
     };
-    if policy.command_mode.eq_ignore_ascii_case("read_only") {
-        return AccessProfile::ReadOnly;
-    }
-    policy.access_profile
+    policy.effective_access_profile()
 }
 
 fn builtin_tool_visible_in_access_profile(
@@ -1566,7 +1563,7 @@ impl LlmTaskDispatcher {
             let access_profile = task
                 .policy_snapshot
                 .as_ref()
-                .map(|policy| policy.access_profile)
+                .map(magi_core::TaskPolicy::effective_access_profile)
                 .unwrap_or_default();
             let tool_defs =
                 self.build_tool_definitions(Some(task), skill_name.as_deref(), access_profile);
@@ -2299,7 +2296,7 @@ mod tests {
         let todo_ledger =
             magi_todo_ledger::TodoLedger::new(dispatcher.session_store.clone(), session_id.clone());
         todo_ledger
-            .replace(vec![magi_core::TodoItem::new(
+            .write(vec![magi_core::TodoItem::new(
                 "执行当前步骤",
                 "正在执行当前步骤",
                 magi_core::TodoStatus::InProgress,

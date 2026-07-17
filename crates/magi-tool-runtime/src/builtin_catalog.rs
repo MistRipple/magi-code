@@ -238,7 +238,11 @@ impl BuiltinToolName {
     /// Goal、Todo 与 agent_spawn 属于会话内部协调状态，必须在只读模式下保持可用，
     /// 否则只读分析无法使用目标推进、任务清单和只读子代理。
     pub fn is_access_profile_write_operation(&self) -> bool {
-        self.mutates_workspace_files() || matches!(self, Self::MemoryWrite)
+        self.mutates_workspace_files()
+            || matches!(
+                self,
+                Self::MemoryWrite | Self::ProcessLaunch | Self::ProcessWrite | Self::ProcessKill
+            )
     }
 
     fn mutates_workspace_files(&self) -> bool {
@@ -460,7 +464,7 @@ impl BuiltinToolName {
             Self::FileCopy => "把文件或目录复制到新位置",
             Self::FileMove => "移动或重命名文件 / 目录",
             Self::SearchText => {
-                "在当前工作区或指定目录下按非空文本模式搜索（grep 风格）。query 必填且不得为空；不知道搜索关键词时禁止调用。"
+                "在当前工作区或指定目录下跨文件搜索文本。默认按字面量匹配；多关键词、分组或模式搜索使用 query_mode=regex。该能力跨 macOS、Windows、Linux 一致，文本检索禁止改用 shell_exec 调用 rg/grep。query 必填且不得为空。"
             }
             Self::SearchSemantic => "本地混合代码检索：联合词法、符号和依赖关系定位相关代码",
             Self::ShellExec => {
@@ -476,7 +480,8 @@ impl BuiltinToolName {
                 - 读文件内容 → file_read（更安全、有大小保护）\n\
                 - 写文件内容 → file_write（避免引号转义陷阱）\n\
                 - 改文件局部 → file_patch（避免 Shell 转义问题）\n\
-                - 找文件路径 → 优先 search_text，避免依赖平台专属命令\n\
+                - 查找文本或文件路径 → 必须使用 search_text / search_semantic；禁止调用 rg，避免依赖用户系统是否安装\n\
+                - 读取 package.json、Cargo.toml 等清单 → 使用 file_read，不要仅为解析清单依赖 node/python\n\
                 - 不要直接调用 process_launch / process_read / process_write / process_kill / process_list；它们是 shell_exec 的内部后台能力\n\n\
                 # 反例\n\
                 - ❌ 用平台专属 Shell 命令仅为读取或修改文件 → 跨平台不稳定且失去专用工具保护\n\
@@ -582,7 +587,7 @@ impl BuiltinToolName {
                 - `timed_out=true`：说明至少一个代理仍未完成；可以继续做不依赖该代理的工作，或稍后再次等待"
             }
             Self::TodoWrite => {
-                "用给定列表整体替换当前会话的 TodoLedger（沿用 claude-code TodoWrite 语义）。用于把长任务拆分成步骤并跟踪进度；ledger 快照会自动注入到后续 Turn。每次调用整体覆盖。\n\n\
+                "提交当前会话的 TodoLedger 快照，用于把长任务拆分成步骤并跟踪进度；ledger 会自动注入后续 Turn。非空更新按 content 更新同名步骤，遗漏的已完成步骤会保留，遗漏的未完成步骤会移除；传入空数组才会清空整个清单。\n\n\
                 # 何时用\n\
                 - 任务 ≥ 3 个非平凡步骤，且步骤之间有先后关系或可能被打断\n\
                 - 跨多轮对话推进、需要让用户随时看到进度\n\
@@ -704,7 +709,8 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "root": { "type": "string", "description": "可选搜索根目录；默认当前工作区" },
-                    "query": { "type": "string", "minLength": 1, "description": "必填、非空的文本搜索模式" },
+                    "query": { "type": "string", "minLength": 1, "description": "必填、非空的搜索文本或正则表达式" },
+                    "query_mode": { "type": "string", "enum": ["literal", "regex"], "description": "匹配模式：literal 为字面量（默认），regex 为跨平台正则表达式" },
                     "limit": { "type": "integer", "description": "最大结果数" },
                     "case_sensitive": { "type": "boolean", "description": "是否区分大小写" },
                     "include_hidden": { "type": "boolean", "description": "是否包含隐藏文件与目录" }
@@ -731,7 +737,7 @@ impl BuiltinToolName {
                 "properties": {
                     "command": { "type": "string", "description": "要执行的当前平台原生 shell 命令；必须遵循工作区上下文声明的 Shell 方言" },
                     "cwd": { "type": "string", "description": "工作区相对路径或当前平台原生绝对路径；默认当前工作区" },
-                    "shell": { "type": "string", "description": "可选 Shell 程序或程序加启动参数；默认 Windows 使用 cmd.exe /C，Linux/macOS 使用 sh -lc" },
+                    "shell": { "type": "string", "description": "可选 Shell 程序或程序加启动参数；默认 Windows 使用 cmd.exe /C，Linux/macOS 使用用户 Shell -c，并继承 Magi 统一初始化的用户执行环境" },
                     "timeout_ms": { "type": "integer", "description": "执行超时（毫秒）" },
                     "action": {
                         "type": "string",
@@ -1025,7 +1031,7 @@ impl BuiltinToolName {
                 "properties": {
                     "todos": {
                         "type": "array",
-                        "description": "新的完整 todo 列表。每次调用整表覆盖当前账本。",
+                        "description": "当前 todo 快照。应尽量提交全部步骤；非空更新会保留遗漏的已完成步骤，空数组明确清空清单。",
                         "items": {
                             "type": "object",
                             "properties": {

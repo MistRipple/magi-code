@@ -1003,7 +1003,7 @@ fn run_conversation_loop_inner(
         if let Some(registry) = tool_registry {
             let policy = task.policy_snapshot.as_ref();
             let access_profile = policy
-                .map(|policy| policy.access_profile)
+                .map(magi_core::TaskPolicy::effective_access_profile)
                 .unwrap_or_default();
             let allowed_tools = policy
                 .filter(|policy| !policy.allowed_tools.is_empty())
@@ -1451,7 +1451,7 @@ fn run_conversation_loop_inner(
             let access_profile = task
                 .policy_snapshot
                 .as_ref()
-                .map(|policy| policy.access_profile)
+                .map(magi_core::TaskPolicy::effective_access_profile)
                 .unwrap_or_default();
             active_tools = activate_skill_tool_definitions(
                 active_tools,
@@ -4706,7 +4706,7 @@ mod tests {
             .expect("project memory entry should save");
         let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
         todo_ledger
-            .replace(vec![magi_todo_ledger::TodoItem::new(
+            .write(vec![magi_todo_ledger::TodoItem::new(
                 "继续旧任务 OLD_REFERENCE_RESULT",
                 "正在继续旧任务",
                 magi_todo_ledger::TodoStatus::Pending,

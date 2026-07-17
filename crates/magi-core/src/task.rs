@@ -361,6 +361,14 @@ impl AccessProfile {
             Self::FullAccess => "full_access",
         }
     }
+
+    pub fn constrained_by_command_mode(self, command_mode: &str) -> Self {
+        if command_mode.eq_ignore_ascii_case("read_only") {
+            Self::ReadOnly
+        } else {
+            self
+        }
+    }
 }
 
 impl std::str::FromStr for AccessProfile {
@@ -397,6 +405,13 @@ pub struct TaskPolicy {
     pub task_tier: TaskTier,
     pub background_allowed: bool,
     pub escalation_conditions: Vec<String>,
+}
+
+impl TaskPolicy {
+    pub fn effective_access_profile(&self) -> AccessProfile {
+        self.access_profile
+            .constrained_by_command_mode(&self.command_mode)
+    }
 }
 
 /// 任务系统 L11：变体负载。
