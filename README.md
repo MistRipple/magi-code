@@ -2,17 +2,17 @@
 
 **你的本地 AI 工程团队。**
 
-一个本地优先、可自托管的 AI 工程工作空间：由一个主线代理统筹目标，多个专业代理并行工作，在统一的工具、知识和权限边界内持续完成复杂的软件任务。
+一个本地优先、可自托管的 AI 工程工作空间：由主线代理统筹目标，多个专业代理按职责协作，在统一的工具、知识和权限边界内持续完成复杂的软件任务。
 
 **Your local AI engineering team.**
 
-A local-first, self-hostable AI engineering workspace where one main agent coordinates the goal, specialized agents work in parallel, and every tool, knowledge source, and permission boundary stays observable and controllable.
+A local-first, self-hostable AI engineering workspace where one main agent coordinates the work, specialized agents collaborate by responsibility, and every tool, knowledge source, and permission boundary remains observable and controllable.
+
+![Magi mainline task overview](docs/images/readme/mainline-task-overview.jpg)
+
+> **Turn a single request into a durable, observable, and reviewable engineering workflow.**
 
 [中文](#中文) · [English](#english) · [架构图](docs/architecture.html) · [GitHub](https://github.com/MistRipple/magi-code)
-
-> Magi 借鉴了 Codex 在 Goal、子代理和工具交互上的优秀体验，但产品定位不同：Magi 面向希望自托管、多模型编排、多端访问和可视化工程治理的用户。
->
-> Magi takes inspiration from Codex's Goal, subagent, and tool workflows, while serving a different audience: users who want self-hosting, multi-model orchestration, multi-client access, and visible engineering governance.
 
 ## 中文
 
@@ -36,9 +36,9 @@ Magi 把这条链路组织成一个可持续运行的工程工作流：
 主线等待、汇总、验证并继续推进目标
 ~~~
 
-Magi 的重点不是把聊天窗口做得更复杂，而是让 AI 真正像一支可以观察、配置和管理的工程团队一样工作。
+Magi 的核心不是增加一个更复杂的聊天窗口，而是把目标、代理、工具、知识、变更和验证组织成一条可以长期运行、持续恢复、全程复核的工程链路。
 
-### 核心产品能力
+### 核心能力
 
 #### 一条主线，多个专业代理
 
@@ -67,7 +67,7 @@ Magi 支持按职责配置模型：
 - 图片模型：负责图片生成。
 - 角色模型：为执行、探索、架构、测试、评审等代理分别绑定模型。
 
-Magi 支持标准的 OpenAI 兼容接口格式和 Anthropic Messages 接口格式。CPA、其他本地网关或远程服务都只是可以接入的服务端实现，不是 Magi 自定义的接口协议，也不存在“CPA 格式接口”。图片生成使用 OpenAI 兼容的 Images API。
+Magi 支持标准的 OpenAI 兼容接口格式和 Anthropic Messages 接口格式；图片生成使用 OpenAI 兼容的 Images API。
 
 #### 统一工具运行时
 
@@ -117,36 +117,80 @@ Magi 不把运行细节藏在黑盒里。用户可以直接看到：
 - 右侧文件、代理和知识内容面板。
 - 系统异常告警，而不是把普通保存、切换和发送消息都变成通知噪声。
 
+### 产品实录
+
+下面的界面截图均来自本地 Chrome 浏览器中的 Magi 真实运行场景，使用 `magi` 工作空间和脱敏演示数据，以完整浏览器窗口采集，当前素材分辨率约为 `1913 × 1212–1263`。主流程截图保留完整工作区、对话区域和输入区；它们展示的是产品实际可操作的工作流，而不是静态概念图。
+
+#### 从目标到结果
+
+主线把目标、执行状态、最终结论和下一次输入放在同一界面中；用户不需要在多个页面之间拼接任务进度。
+
+![Magi 主线任务总览](docs/images/readme/mainline-task-overview.jpg)
+
+#### 从分工到执行
+
+一次任务可以在输入区指定角色和职责，让主线把复杂工作拆成多个相互独立、可验证的工作包。
+
+![Magi 多代理任务编排入口](docs/images/readme/multi-agent-task-entry.jpg)
+
+![Magi 多代理对话与代理结果](docs/images/readme/multi-agent-conversation.jpg)
+
+![Magi 主线执行状态与任务清单](docs/images/readme/mainline-multi-agent.jpg)
+
+#### 从模型到角色
+
+主模型、辅助模型、图片模型和专业代理模型分别管理，模型选择服务于职责，而不是把整个任务锁定在一个引擎上。
+
+![Magi 模型配置](docs/images/readme/model-configuration.jpg)
+
+![Magi 专业代理模型绑定](docs/images/readme/agent-role-model-bindings.jpg)
+
+#### 从工具到知识
+
+工具、MCP、Skills、ADR、FAQ 和工程经验都在工作区内可见，并且只有相关知识才会按需参与任务上下文。
+
+![Magi 工具、MCP 与 Skills 状态](docs/images/readme/tools-mcp-skills.jpg)
+
+![Magi ADR 知识记录](docs/images/readme/knowledge-adr.jpg)
+
+![Magi FAQ 与按需知识说明](docs/images/readme/knowledge-system-complete.jpg)
+
+![Magi FAQ 知识记录](docs/images/readme/knowledge-faq.jpg)
+
+![Magi 工程经验沉淀](docs/images/readme/knowledge-experience.jpg)
+
+#### 从变更到交付
+
+文件归属、增删行数、Diff、工具输出和任务清单保持在同一条可回看的执行记录中，用户可以在确认前复核、批准或还原变更。
+
+![Magi 变更审查](docs/images/readme/changes-review.jpg)
+
+![Magi 文件 Diff 预览](docs/images/readme/file-diff-preview.jpg)
+
+#### 图片与用量
+
+图片模型生成的素材直接写入工作区；统计面板帮助判断模型分工和实际成本。
+
+![Magi 图片生成与预览](docs/images/readme/image-generation.jpg)
+
+![Magi 模型与角色用量统计](docs/images/readme/model-usage-stats.jpg)
+
+![Magi 偏好配置](docs/images/readme/preferences.jpg)
+
+这组截图对应 Magi 的核心产品路径：**提出目标 → 组织分工 → 执行验证 → 复核变更 → 沉淀知识**。
+
 ### 为什么选择 Magi
 
-如果你只是需要一个代码问答窗口，Magi 可能不是必要选择。如果你需要的是一套可以长期运行的软件工程工作台，Magi 的价值在于把以下能力放在同一个可控运行时中：
+Magi 适合需要长期运行、可复核、可自主管理的软件工程工作流。它把模型能力变成了一套可配置、可观察、可恢复的本地工程系统：
 
-- 自己选择模型、服务端和供应商，不被单一模型锁定。
-- 通过 UI 管理不同角色的模型绑定，而不是只维护一份全局模型配置。
-- 让多个代理并行工作，同时保留每个代理的独立结果和运行轨迹。
-- 让 Goal、任务、知识、变更和工具调用围绕同一个工作区协同。
-- 让桌面、浏览器和移动设备共享同一套本地服务状态。
-- 在局域网或公网隧道场景下继续访问正在运行的工程任务。
-
-### Magi 与 Codex Desktop 的定位差异
-
-这不是“谁更强”的简单排名，而是两种产品取向的区别。Codex 是 OpenAI 的一体化编码代理产品；Magi 是可自托管、可接入多种模型服务的工程协作运行时。以下对比基于当前公开能力，具体能力会随产品版本变化。
-
-| 维度 | Magi | Codex Desktop |
-| --- | --- | --- |
-| 产品定位 | 本地优先的多代理工程工作空间 | OpenAI Codex 一体化编码代理产品 |
-| 代理模型配置 | 在 UI 中分别配置主模型、辅助模型、图片模型和角色模型 | 支持模型选择，也支持通过自定义代理配置模型和推理强度 |
-| 模型接口 | OpenAI 兼容格式、Anthropic Messages 格式 | 以 Codex/OpenAI 模型体验为核心，也支持配置兼容模型供应商 |
-| 服务部署 | 用户自己的 daemon，可运行桌面、浏览器、局域网和公网隧道 | 官方桌面、CLI、IDE 与云端产品体系 |
-| 代理组织 | 内置执行、探索、架构、测试、评审角色；同一角色可运行多个实例 | 内置代理并支持自定义代理与并行子代理工作流 |
-| 长任务 | Goal、任务清单、暂停/恢复/编辑/清除、代理结果和运行诊断统一展示 | 支持 Goal、子代理和长任务工作流 |
-| 项目知识 | 独立代码索引、ADR、FAQ、经验记录和知识面板 | 依托项目、对话上下文、Skills、Memory 和工具体系 |
-| 工具治理 | 内置工具、MCP、Skills、访问模式和执行记录集中到一个运行时 | Sandbox、审批、MCP、Skills 和插件体系 |
-| 数据与状态 | 工作区、会话、知识和模型配置由用户本地环境管理 | 取决于 Codex 使用方式、账户和连接的服务 |
-
-Magi 的差异化不在于声称 Codex 没有子代理或模型配置，而在于：将多模型角色编排、项目知识、工具治理和多端服务合并为一个用户可管理的本地产品。
-
-相关参考：[Codex Manual](https://developers.openai.com/codex/codex-manual.md)。
+- **模型选择自由**：按主线、辅助、图片和专业角色分别配置模型、供应商与网关。
+- **多代理协作有边界**：执行、探索、架构、测试和评审职责清晰，主线统一管理派发、等待和汇总。
+- **工程状态完整可见**：Goal、任务清单、代理状态、工具调用、文件变更和验证结果沿同一条链路呈现。
+- **知识能够持续积累**：代码索引、ADR、FAQ 和经验记录围绕工作区沉淀，并在需要时参与后续任务。
+- **工具治理统一**：文件、Shell、搜索、MCP、Skills 和图片生成遵循统一的工作区、访问模式与权限边界。
+- **运行时属于用户**：工作区、会话、模型配置和知识数据保存在本地 Magi 环境中，支持自托管和离线管理。
+- **多端共享同一状态**：桌面、浏览器、局域网设备和公网隧道连接同一个 daemon，不需要重复配置或同步任务。
+- **适合真实交付**：支持暂停、恢复、停止、失败诊断、变更审查和发布前验证，而不是只返回一段答案。
 
 ### 适用场景
 
@@ -285,7 +329,7 @@ Magi separates model responsibilities instead of forcing the whole product throu
 - Image model for image generation.
 - Role models for executor, explorer, architect, tester, reviewer, and other agents.
 
-Magi supports the standard OpenAI-compatible API format and the Anthropic Messages API format. CPA, a local gateway, or a remote service is an upstream implementation that can be connected to Magi; CPA is not a Magi protocol and there is no separate “CPA format API”. Image generation uses the OpenAI-compatible Images API.
+Magi supports the standard OpenAI-compatible API format and the Anthropic Messages API format. Image generation uses the OpenAI-compatible Images API.
 
 #### One governed tool runtime
 
@@ -307,36 +351,36 @@ Magi targets Windows, Linux, and macOS while retaining Web, LAN, and optional pu
 
 Magi keeps the important runtime state visible: streaming output from the mainline and each subagent, agent lifecycle, tool cards, file previews, changes, Goal progress, task status, context usage, knowledge access, and runtime diagnostics.
 
-### Why Magi
+### Product evidence
 
-Magi is designed for users who need a durable engineering workbench, not only a code-answer window:
+These are full-window captures from the local Chrome browser using the `magi` workspace and sanitized demonstration data.
 
-- Choose models, providers, and gateways by responsibility.
-- Configure role-specific engines from the UI.
-- Run multiple specialists in parallel while keeping each result inspectable.
-- Keep Goals, tasks, knowledge, changes, and tools around one workspace.
-- Share the same local runtime across desktop, browser, and mobile access.
-- Continue viewing a running engineering task over LAN or a public tunnel.
+![Magi mainline task overview](docs/images/readme/mainline-task-overview.jpg)
 
-### Magi compared with Codex Desktop
+![Magi multi-agent conversation](docs/images/readme/multi-agent-conversation.jpg)
 
-This is a product-positioning comparison, not a claim that one product wins every workflow. Codex is OpenAI's integrated coding-agent product. Magi is a self-hostable orchestration runtime that can connect to different model services. Capabilities may change as both products evolve.
+![Magi model configuration](docs/images/readme/model-configuration.jpg)
 
-| Dimension | Magi | Codex Desktop |
-| --- | --- | --- |
-| Product focus | Local-first multi-agent engineering workspace | Integrated OpenAI Codex coding-agent product |
-| Agent model setup | UI-based bindings for main, auxiliary, image, and role models | Model picker plus custom-agent configuration for model and reasoning settings |
-| Model protocols | OpenAI-compatible and Anthropic Messages formats | Centered on the Codex/OpenAI model experience, with compatible provider configuration available |
-| Deployment | User-owned daemon serving desktop, browser, LAN, and public tunnel clients | Official desktop, CLI, IDE, and cloud product surfaces |
-| Agent organization | Built-in executor, explorer, architect, tester, and reviewer roles; multiple instances per role | Built-in agents plus custom agents and parallel subagent workflows |
-| Long-running work | Goal, task ledger, pause/resume/edit/clear, agent results, and runtime diagnostics in one UI | Goal, subagent, and long-running task workflows |
-| Project knowledge | Dedicated code index, ADR, FAQ, learning records, and knowledge panel | Projects, conversation context, Skills, Memory, and tool ecosystem |
-| Tool governance | Built-in tools, MCP, Skills, access profiles, and execution records in one runtime | Sandbox, approvals, MCP, Skills, and plugin ecosystem |
-| State ownership | Workspace, session, knowledge, and model state stay in the user's local environment | Depends on the local, cloud, and account surface being used |
+![Magi tools, MCP, and Skills](docs/images/readme/tools-mcp-skills.jpg)
 
-Magi's differentiation is not claiming that Codex lacks subagents or model configuration. It is the combination of multi-provider role orchestration, project knowledge, visible tool governance, and a user-managed multi-client daemon.
+![Magi knowledge overview](docs/images/readme/knowledge-system-complete.jpg)
 
-See the [Codex Manual](https://developers.openai.com/codex/codex-manual.md) for the current public Codex documentation.
+![Magi change review](docs/images/readme/changes-review.jpg)
+
+![Magi image generation](docs/images/readme/image-generation.jpg)
+
+### Why teams use Magi
+
+Magi is built for software work that must remain understandable and recoverable over time:
+
+- **Bring your own model stack** with independent connections for orchestration, support, image generation, and specialist roles.
+- **Coordinate bounded specialists** with explicit responsibilities, controlled fan-out, and one mainline responsible for synthesis.
+- **Keep the full execution trail visible**, from the original goal to task progress, tool calls, file changes, validation, and final evidence.
+- **Turn project knowledge into a working asset** through code indexing, ADRs, FAQs, and continuously accumulated engineering experience.
+- **Apply one governance model everywhere** across files, Shell, search, MCP, Skills, image generation, permissions, and access profiles.
+- **Own the runtime and its data** with a local daemon, self-hosted deployment, and user-managed workspace and session state.
+- **Continue from any client** because desktop, browser, LAN, and tunnel access share the same authoritative runtime.
+- **Support real delivery workflows** with cancellation, recovery, failure diagnostics, change review, and release verification.
 
 ### Use cases
 
