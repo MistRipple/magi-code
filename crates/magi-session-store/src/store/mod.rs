@@ -8,11 +8,10 @@ mod tests;
 use crate::lifecycle::SessionLifecycleObserver;
 use crate::models::{
     NotificationRecord, NotificationScope, SessionDurableState, SessionExecutionSidecarStoreState,
-    SessionRecord, SessionSidecarFlushReason, SessionStoreState, TimelineEntry, TimelineEntryKind,
+    SessionPlan, SessionRecord, SessionSidecarFlushReason, SessionStoreState, TimelineEntry,
+    TimelineEntryKind,
 };
-use magi_core::{
-    DomainError, DomainResult, SessionId, SessionLifecycleStatus, TodoItem, UtcMillis,
-};
+use magi_core::{DomainError, DomainResult, SessionId, SessionLifecycleStatus, UtcMillis};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// orchestrator 主线 thread 的稳定 role 标识。
@@ -357,9 +356,7 @@ impl SessionStore {
             .canonical_turns
             .retain(|turn| &turn.session_id != session_id);
         state.goals.retain(|goal| &goal.session_id != session_id);
-        state
-            .todo_lists
-            .retain(|todo_list| &todo_list.session_id != session_id);
+        state.plans.retain(|plan| &plan.session_id != session_id);
         state
             .thread_registry
             .retain(|thread| &thread.session_id != session_id);
@@ -387,11 +384,12 @@ impl SessionStore {
         Ok(())
     }
 
-    pub fn replace_todo_items(
+    pub fn upsert_plan(
         &self,
         session_id: &SessionId,
-        items: Vec<TodoItem>,
-    ) -> DomainResult<Vec<TodoItem>> {
+        mut plan: SessionPlan,
+        expected_revision: Option<u64>,
+    ) -> DomainResult<SessionPlan> {
         let mut state = self
             .state
             .write()
@@ -403,24 +401,39 @@ impl SessionStore {
         {
             return Err(DomainError::NotFound { entity: "session" });
         }
-        let now = UtcMillis::now();
-        if items.is_empty() {
-            state
-                .todo_lists
-                .retain(|todo_list| &todo_list.session_id != session_id);
-        } else if let Some(todo_list) = state
-            .todo_lists
-            .iter_mut()
-            .find(|todo_list| &todo_list.session_id == session_id)
-        {
-            todo_list.items = items.clone();
-            todo_list.updated_at = now;
-        } else {
-            state.todo_lists.push(crate::models::SessionTodoList {
-                session_id: session_id.clone(),
-                items: items.clone(),
-                updated_at: now,
+        if &plan.session_id != session_id {
+            return Err(DomainError::Validation {
+                message: "计划 session_id 与写入作用域不一致".to_string(),
             });
+        }
+        let now = UtcMillis::now();
+        if let Some(current) = state
+            .plans
+            .iter_mut()
+            .find(|candidate| &candidate.session_id == session_id)
+        {
+            if let Some(expected_revision) = expected_revision
+                && current.revision != expected_revision
+            {
+                return Err(DomainError::InvalidState {
+                    message: format!(
+                        "计划版本冲突：期望 revision={}，当前 revision={}",
+                        expected_revision, current.revision
+                    ),
+                });
+            }
+            plan.revision = current.revision.saturating_add(1);
+            plan.updated_at = now;
+            *current = plan.clone();
+        } else {
+            if expected_revision.is_some_and(|revision| revision != 0) {
+                return Err(DomainError::InvalidState {
+                    message: "计划不存在，expectedRevision 必须为 0 或省略".to_string(),
+                });
+            }
+            plan.revision = 1;
+            plan.updated_at = now;
+            state.plans.push(plan.clone());
         }
         if let Some(session) = state
             .sessions
@@ -429,18 +442,59 @@ impl SessionStore {
         {
             session.updated_at = now;
         }
-        Ok(items)
+        drop(state);
+        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdatePlan);
+        Ok(plan)
     }
 
-    pub fn todo_items(&self, session_id: &SessionId) -> Vec<TodoItem> {
+    pub fn clear_plan(
+        &self,
+        session_id: &SessionId,
+        expected_revision: Option<u64>,
+    ) -> DomainResult<bool> {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if !state
+            .sessions
+            .iter()
+            .any(|session| &session.session_id == session_id)
+        {
+            return Err(DomainError::NotFound { entity: "session" });
+        }
+        if let Some(expected_revision) = expected_revision
+            && let Some(current) = state
+                .plans
+                .iter()
+                .find(|plan| &plan.session_id == session_id)
+            && current.revision != expected_revision
+        {
+            return Err(DomainError::InvalidState {
+                message: format!(
+                    "计划版本冲突：期望 revision={}，当前 revision={}",
+                    expected_revision, current.revision
+                ),
+            });
+        }
+        let before = state.plans.len();
+        state.plans.retain(|plan| &plan.session_id != session_id);
+        let changed = state.plans.len() != before;
+        drop(state);
+        if changed {
+            self.mark_sidecar_dirty(SessionSidecarFlushReason::ClearPlan);
+        }
+        Ok(changed)
+    }
+
+    pub fn plan(&self, session_id: &SessionId) -> Option<SessionPlan> {
         self.state
             .read()
             .expect("session state read lock poisoned")
-            .todo_lists
+            .plans
             .iter()
-            .find(|todo_list| &todo_list.session_id == session_id)
-            .map(|todo_list| todo_list.items.clone())
-            .unwrap_or_default()
+            .find(|plan| &plan.session_id == session_id)
+            .cloned()
     }
 
     pub fn append_timeline_entry(

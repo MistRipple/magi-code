@@ -801,7 +801,7 @@ fn append_session_tool_call_items_batch(
         source_thread_id,
         persist_session_state,
     } = context;
-    let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+    let plan_store = crate::test_plan_store("test-todo-ledger");
     let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
     append_session_tool_call_items_batch_with_context(
         SessionToolCallBatchContext {
@@ -812,7 +812,7 @@ fn append_session_tool_call_items_batch(
             skill_dispatch_runtime,
             skill_name,
             safety_gate,
-            todo_ledger: &todo_ledger,
+            plan_store: &plan_store,
             mission_id: &mission_id,
             session_id,
             workspace_id,
@@ -838,7 +838,7 @@ pub struct SessionToolCallBatchContext<'a> {
     pub skill_dispatch_runtime: Option<&'a SkillDispatchRuntime>,
     pub skill_name: Option<&'a str>,
     pub safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
-    pub todo_ledger: &'a magi_todo_ledger::TodoLedger,
+    pub plan_store: &'a magi_plan::PlanStore,
     pub mission_id: &'a magi_core::MissionId,
     pub session_id: &'a SessionId,
     pub workspace_id: &'a Option<WorkspaceId>,
@@ -865,7 +865,7 @@ pub fn append_session_tool_call_items_batch_with_context(
         skill_dispatch_runtime,
         skill_name,
         safety_gate,
-        todo_ledger,
+        plan_store,
         mission_id,
         session_id,
         workspace_id,
@@ -918,7 +918,7 @@ pub fn append_session_tool_call_items_batch_with_context(
             skill_dispatch_runtime,
             skill_name,
             safety_gate,
-            todo_ledger,
+            plan_store,
             mission_id,
             session_id,
             workspace_id,
@@ -1044,7 +1044,7 @@ struct SessionToolExecutionContext<'a> {
     skill_dispatch_runtime: Option<&'a SkillDispatchRuntime>,
     skill_name: Option<&'a str>,
     safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
-    todo_ledger: &'a magi_todo_ledger::TodoLedger,
+    plan_store: &'a magi_plan::PlanStore,
     mission_id: &'a magi_core::MissionId,
     session_id: &'a SessionId,
     workspace_id: &'a Option<WorkspaceId>,
@@ -1208,7 +1208,7 @@ fn execute_session_turn_tool_call(
         workspace_root_path,
         access_profile,
     } = context;
-    let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+    let plan_store = crate::test_plan_store("test-todo-ledger");
     let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
     execute_session_turn_tool_call_scoped(
         SessionToolExecutionContext {
@@ -1219,7 +1219,7 @@ fn execute_session_turn_tool_call(
             skill_dispatch_runtime,
             skill_name,
             safety_gate,
-            todo_ledger: &todo_ledger,
+            plan_store: &plan_store,
             mission_id: &mission_id,
             session_id,
             workspace_id,
@@ -1243,7 +1243,7 @@ fn execute_session_turn_tool_call_scoped(
         skill_dispatch_runtime,
         skill_name,
         safety_gate,
-        todo_ledger,
+        plan_store,
         mission_id,
         session_id,
         workspace_id,
@@ -1283,11 +1283,11 @@ fn execute_session_turn_tool_call_scoped(
 
     if matches!(
         BuiltinToolName::from_name(tool_call.function.name.as_str()),
-        Some(BuiltinToolName::TodoWrite)
+        Some(BuiltinToolName::UpdatePlan)
     ) {
-        return magi_todo_ledger::execute_session_todo_write_tool(
+        return magi_plan::execute_session_update_plan_tool(
             event_bus,
-            todo_ledger,
+            plan_store,
             session_id,
             workspace_id.as_ref(),
             mission_id,
@@ -3189,7 +3189,7 @@ mod tests {
     }
 
     #[test]
-    fn session_turn_todo_write_uses_shared_ledger_and_only_reports_success() {
+    fn session_turn_update_plan_uses_shared_ledger_and_only_reports_success() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(32);
         let session_id = SessionId::new("session-mainline-todo-write");
@@ -3219,13 +3219,13 @@ mod tests {
                 },
             )
             .expect("turn should be creatable");
-        let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-todo-ledger");
         let mut messages = Vec::new();
         let valid_call = ChatToolCall {
             id: "tool-call-mainline-todo-valid".to_string(),
             kind: "function".to_string(),
             function: ChatToolFunction {
-                name: BuiltinToolName::TodoWrite.as_str().to_string(),
+                name: BuiltinToolName::UpdatePlan.as_str().to_string(),
                 arguments: serde_json::json!({
                     "todos": [
                         {"content": "完成第一项", "activeForm": "正在完成第一项", "status": "completed"},
@@ -3245,7 +3245,7 @@ mod tests {
                 skill_dispatch_runtime: None,
                 skill_name: None,
                 safety_gate: None,
-                todo_ledger: &todo_ledger,
+                plan_store: &plan_store,
                 mission_id: &mission_id,
                 session_id: &session_id,
                 workspace_id: &workspace_id,
@@ -3263,14 +3263,14 @@ mod tests {
         );
 
         assert!(valid_outcome.completed);
-        assert_eq!(valid_outcome.succeeded_tool_names, vec!["todo_write"]);
-        assert_eq!(todo_ledger.snapshot().len(), 2);
+        assert_eq!(valid_outcome.succeeded_tool_names, vec!["update_plan"]);
+        assert_eq!(plan_store.snapshot().len(), 2);
 
         let invalid_call = ChatToolCall {
             id: "tool-call-mainline-todo-invalid".to_string(),
             kind: "function".to_string(),
             function: ChatToolFunction {
-                name: BuiltinToolName::TodoWrite.as_str().to_string(),
+                name: BuiltinToolName::UpdatePlan.as_str().to_string(),
                 arguments: serde_json::json!({
                     "todos": [
                         {"content": "错误状态", "activeForm": "正在写入错误状态", "status": "unknown"}
@@ -3288,7 +3288,7 @@ mod tests {
                 skill_dispatch_runtime: None,
                 skill_name: None,
                 safety_gate: None,
-                todo_ledger: &todo_ledger,
+                plan_store: &plan_store,
                 mission_id: &mission_id,
                 session_id: &session_id,
                 workspace_id: &workspace_id,
@@ -3307,7 +3307,7 @@ mod tests {
 
         assert!(invalid_outcome.completed);
         assert!(invalid_outcome.succeeded_tool_names.is_empty());
-        assert_eq!(todo_ledger.snapshot().len(), 2);
+        assert_eq!(plan_store.snapshot().len(), 2);
     }
 
     #[test]
@@ -3355,7 +3355,7 @@ mod tests {
             Arc::new(GovernanceService::default()),
             Arc::new(InMemoryEventBus::new(8)),
         );
-        let todo_ledger = crate::test_todo_ledger("skill-activation-ledger");
+        let plan_store = crate::test_plan_store("skill-activation-ledger");
         let mut messages = Vec::new();
         let call = ChatToolCall {
             id: "tool-call-skill-activation".to_string(),
@@ -3375,7 +3375,7 @@ mod tests {
                 skill_dispatch_runtime: None,
                 skill_name: None,
                 safety_gate: None,
-                todo_ledger: &todo_ledger,
+                plan_store: &plan_store,
                 mission_id: &mission_id,
                 session_id: &session_id,
                 workspace_id: &None,

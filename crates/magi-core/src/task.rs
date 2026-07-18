@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{MissionId, TaskId};
+use crate::ids::{MissionId, PlanItemId, TaskId};
 use crate::value_objects::UtcMillis;
 
 /// 任务系统 L11：任务运行变体。
@@ -26,44 +26,74 @@ pub enum TaskStatus {
     Killed,
 }
 
-/// 会话目标推进清单的状态。Todo 是 session 内的执行锚点，随会话持久化，
-/// 不承担独立项目管理生命周期。
+/// 用户可见计划项状态。顶层计划同一时刻只能有一个进行项；并行执行由
+/// ActiveExecutionChain 表达，不通过多个顶层进行项模拟。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TodoStatus {
+pub enum PlanItemStatus {
     #[default]
     Pending,
     InProgress,
     Completed,
+    Blocked,
+    Canceled,
 }
 
-impl TodoStatus {
+impl PlanItemStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::InProgress => "in_progress",
             Self::Completed => "completed",
+            Self::Blocked => "blocked",
+            Self::Canceled => "canceled",
         }
+    }
+
+    pub fn can_transition_to(self, next: Self) -> bool {
+        self == next
+            || matches!(
+                (self, next),
+                (Self::Pending, Self::InProgress | Self::Canceled)
+                    | (
+                        Self::InProgress,
+                        Self::Completed | Self::Blocked | Self::Canceled
+                    )
+                    | (Self::Blocked, Self::InProgress | Self::Canceled)
+            )
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TodoItem {
-    pub content: String,
-    pub active_form: String,
-    pub status: TodoStatus,
+/// 计划级状态用于表达暂停与终止，避免停止会话后仍把步骤显示为进行中。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanState {
+    #[default]
+    Active,
+    Paused,
+    Completed,
+    Canceled,
 }
 
-impl TodoItem {
-    pub fn new(
-        content: impl Into<String>,
-        active_form: impl Into<String>,
-        status: TodoStatus,
-    ) -> Self {
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanItem {
+    #[serde(default = "empty_plan_item_id")]
+    pub item_id: PlanItemId,
+    #[serde(alias = "content")]
+    pub title: String,
+    pub status: PlanItemStatus,
+}
+
+fn empty_plan_item_id() -> PlanItemId {
+    PlanItemId::new("")
+}
+
+impl PlanItem {
+    pub fn new(item_id: PlanItemId, title: impl Into<String>, status: PlanItemStatus) -> Self {
         Self {
-            content: content.into(),
-            active_form: active_form.into(),
+            item_id,
+            title: title.into(),
             status,
         }
     }
@@ -433,6 +463,10 @@ pub struct TaskExecutorBinding {
     pub parallelism_group: Option<String>,
     pub exclusive_scope: Option<String>,
     pub active_skill_id: Option<String>,
+    #[serde(default)]
+    pub canonical_task_name: Option<String>,
+    #[serde(default)]
+    pub plan_item_id: Option<PlanItemId>,
 }
 
 impl TaskExecutorBinding {
@@ -458,6 +492,16 @@ impl TaskExecutorBinding {
         self
     }
 
+    pub fn with_canonical_task_name(mut self, task_name: impl Into<String>) -> Self {
+        self.canonical_task_name = normalized_string(task_name.into());
+        self
+    }
+
+    pub fn with_plan_item_id(mut self, plan_item_id: Option<PlanItemId>) -> Self {
+        self.plan_item_id = plan_item_id;
+        self
+    }
+
     fn target_role(&self) -> Option<&str> {
         normalized_str_ref(self.target_role.as_deref())
     }
@@ -472,6 +516,10 @@ impl TaskExecutorBinding {
 
     fn active_skill_id(&self) -> Option<&str> {
         normalized_str_ref(self.active_skill_id.as_deref())
+    }
+
+    fn canonical_task_name(&self) -> Option<&str> {
+        normalized_str_ref(self.canonical_task_name.as_deref())
     }
 }
 // --- Task
@@ -527,6 +575,19 @@ impl Task {
         self.executor_binding
             .as_ref()
             .and_then(TaskExecutorBinding::active_skill_id)
+    }
+
+
+    pub fn canonical_task_name(&self) -> Option<&str> {
+        self.executor_binding
+            .as_ref()
+            .and_then(TaskExecutorBinding::canonical_task_name)
+    }
+
+    pub fn plan_item_id(&self) -> Option<&PlanItemId> {
+        self.executor_binding
+            .as_ref()
+            .and_then(|binding| binding.plan_item_id.as_ref())
     }
 }
 

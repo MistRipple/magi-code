@@ -1011,7 +1011,7 @@ fn is_session_goal_tool(tool: BuiltinToolName) -> bool {
         BuiltinToolName::GetGoal
             | BuiltinToolName::CreateGoal
             | BuiltinToolName::UpdateGoal
-            | BuiltinToolName::TodoWrite
+            | BuiltinToolName::UpdatePlan
     )
 }
 
@@ -1022,7 +1022,7 @@ fn session_turn_can_execute_builtin_tool(tool: BuiltinToolName) -> bool {
             BuiltinToolName::GetGoal
                 | BuiltinToolName::CreateGoal
                 | BuiltinToolName::UpdateGoal
-                | BuiltinToolName::TodoWrite
+                | BuiltinToolName::UpdatePlan
         )
 }
 
@@ -1441,10 +1441,8 @@ impl LlmTaskDispatcher {
         &self,
         request: SessionTurnExecutionRequest,
     ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
-        let todo_ledger = magi_todo_ledger::TodoLedger::new(
-            self.session_store.clone(),
-            request.session_id.clone(),
-        );
+        let plan_store =
+            magi_plan::PlanStore::new(self.session_store.clone(), request.session_id.clone());
         let execution_settings_snapshot = self.execution_settings_snapshot();
         let execution_settings =
             self.execution_settings_or_live(execution_settings_snapshot.as_ref());
@@ -1456,11 +1454,11 @@ impl LlmTaskDispatcher {
         ) {
             Ok(client) => client,
             Err(_) => {
-                if let Err(todo_error) = todo_ledger.pause_in_progress() {
+                if let Err(todo_error) = plan_store.pause() {
                     tracing::warn!(
                         session_id = %request.session_id,
                         error = %todo_error,
-                        "模型配置解析失败后暂停 TodoLedger 进行项失败"
+                        "模型配置解析失败后暂停 PlanStore 进行项失败"
                     );
                 }
                 return Err(SessionTurnExecutionError {
@@ -1515,7 +1513,7 @@ impl LlmTaskDispatcher {
             event_bus: self.event_bus.as_ref(),
             session_store: self.session_store.as_ref(),
             conversation_registry: self.conversation_registry.as_ref(),
-            todo_ledger: &todo_ledger,
+            plan_store: &plan_store,
             settings_store: execution_settings,
             safety_gate: safety_gate.as_ref(),
             tool_registry: self.tool_registry.as_ref(),
@@ -1602,8 +1600,7 @@ impl LlmTaskDispatcher {
         };
 
         let safety_gate = self.build_safety_gate(execution_settings);
-        let todo_ledger =
-            magi_todo_ledger::TodoLedger::new(self.session_store.clone(), session_id.clone());
+        let plan_store = magi_plan::PlanStore::new(self.session_store.clone(), session_id.clone());
         let project_memory = workspace_root_path.as_ref().and_then(|path| {
             let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
             match self.project_memory_registry.get_or_open(&workspace_root) {
@@ -1650,7 +1647,7 @@ impl LlmTaskDispatcher {
             agent_role_registry: self.agent_role_registry.as_ref(),
             spawn_graph: self.spawn_graph.as_ref(),
             safety_gate: safety_gate.as_ref(),
-            todo_ledger: &todo_ledger,
+            plan_store: &plan_store,
             project_memory: project_memory.as_deref(),
             mission_metrics: mission_metrics.as_ref(),
             task,
@@ -2364,9 +2361,9 @@ mod tests {
                 },
             )
             .expect("current turn should persist");
-        let todo_ledger =
-            magi_todo_ledger::TodoLedger::new(dispatcher.session_store.clone(), session_id.clone());
-        todo_ledger
+        let plan_store =
+            magi_plan::PlanStore::new(dispatcher.session_store.clone(), session_id.clone());
+        plan_store
             .write(vec![magi_core::TodoItem::new(
                 "执行当前步骤",
                 "正在执行当前步骤",
@@ -2390,12 +2387,13 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: crate::session_turn_execution::SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         });
 
         assert!(result.is_err());
         assert_eq!(
-            todo_ledger.snapshot()[0].status,
+            plan_store.snapshot()[0].status,
             magi_core::TodoStatus::Pending
         );
     }
@@ -2465,7 +2463,7 @@ mod tests {
             notifications: vec![],
             canonical_turns: vec![],
             goals: vec![],
-            todo_lists: vec![],
+            plans: vec![],
             thread_registry: vec![],
             execution_sidecar_store: magi_session_store::SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
@@ -2815,7 +2813,7 @@ mod tests {
         assert!(names.iter().any(|name| name == "shell_exec"));
         assert!(names.iter().any(|name| name == "agent_spawn"));
         assert!(names.iter().any(|name| name == "agent_wait"));
-        for internal in ["get_goal", "create_goal", "update_goal", "todo_write"] {
+        for internal in ["get_goal", "create_goal", "update_goal", "update_plan"] {
             assert!(
                 names.iter().any(|name| name == internal),
                 "只读访问只限制外部副作用，不能屏蔽内部协调工具 {internal}: {names:?}"
@@ -2888,7 +2886,7 @@ mod tests {
         assert!(!names.iter().any(|name| name == "file_write"));
         assert!(!names.iter().any(|name| name == "apply_patch"));
         assert!(!names.iter().any(|name| name == "memory_write"));
-        for internal in ["get_goal", "create_goal", "update_goal", "todo_write"] {
+        for internal in ["get_goal", "create_goal", "update_goal", "update_plan"] {
             assert!(
                 names.iter().any(|name| name == internal),
                 "只读主会话仍应能维护内部目标与任务清单 {internal}: {names:?}"
@@ -2906,7 +2904,7 @@ mod tests {
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
 
-        for expected in ["get_goal", "create_goal", "update_goal", "todo_write"] {
+        for expected in ["get_goal", "create_goal", "update_goal", "update_plan"] {
             assert!(
                 names.iter().any(|name| name == expected),
                 "session 主线必须暴露可执行的内部工具 {expected}: {names:?}"
@@ -2934,7 +2932,7 @@ mod tests {
         .map(|definition| definition.function.name)
         .collect::<Vec<_>>();
         assert!(!continuation_names.iter().any(|name| name == "create_goal"));
-        for expected in ["get_goal", "update_goal", "todo_write"] {
+        for expected in ["get_goal", "update_goal", "update_plan"] {
             assert!(continuation_names.iter().any(|name| name == expected));
         }
 
@@ -3052,7 +3050,7 @@ mod tests {
             .map(|definition| definition.function.name)
             .collect::<Vec<_>>();
 
-        for expected in ["get_goal", "create_goal", "update_goal", "todo_write"] {
+        for expected in ["get_goal", "create_goal", "update_goal", "update_plan"] {
             assert!(
                 names.iter().any(|name| name == expected),
                 "Goal + Skill 联合引用必须保留目标生命周期工具 {expected}: {names:?}"

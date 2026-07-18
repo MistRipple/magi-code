@@ -311,11 +311,6 @@
 <!-- 系统通知消息：居中显示（必须有实际文本内容才渲染） -->
 {#if isNotice && message.content && message.content.trim()}
   <div class="system-notice {noticeType}" data-message-id={message.id} data-turn-id={messageTurnId || undefined}>
-    <div class="message-actions">
-      <button type="button" class="message-action" onclick={() => void copyMessage()} title={i18n.t('messageItem.copyTitle')}>
-        <Icon name={copied ? 'check' : 'copy'} size={14} />
-      </button>
-    </div>
     <span class="notice-icon" style="color: {noticeColors[noticeType] || noticeColors.info}">
       <Icon name={noticeIcons[noticeType] || 'info'} size={14} />
     </span>
@@ -327,16 +322,20 @@
 <!-- 用户消息：简洁显示 -->
 {:else if isUser}
   <div class="message-item user" class:sending={sendingAnimation} class:supplementary={isSupplementary} data-message-id={message.id} data-turn-id={messageTurnId || undefined} data-source="user">
-    <div class="message-actions">
-      {#if canEdit}
-        <button type="button" class="message-action" onclick={() => onEdit?.()} title={i18n.t('messageItem.editTitle')}>
-          <Icon name="edit" size={14} />
-        </button>
-      {/if}
-      <button type="button" class="message-action" onclick={() => void copyMessage()} title={i18n.t('messageItem.copyTitle')}>
-        <Icon name={copied ? 'check' : 'copy'} size={14} />
-      </button>
-    </div>
+    {#if canEdit || copyableText.trim()}
+      <div class="user-message-actions">
+        {#if canEdit}
+          <button type="button" class="message-action" onclick={() => onEdit?.()} title={i18n.t('messageItem.editTitle')}>
+            <Icon name="edit" size={14} />
+          </button>
+        {/if}
+        {#if copyableText.trim()}
+          <button type="button" class="message-action" onclick={() => void copyMessage()} title={i18n.t('messageItem.copyTitle')}>
+            <Icon name={copied ? 'check' : 'copy'} size={14} />
+          </button>
+        {/if}
+      </div>
+    {/if}
     {#if messageContextReferences.length > 0}
       <div class="user-context-references">
         {#each messageContextReferences as reference (`${message.id}-${reference.kind}-${reference.path}`)}
@@ -397,13 +396,6 @@
     data-placeholder-state={isPlaceholder ? placeholderState : undefined}
     style={agentColorStyle}
   >
-    {#if copyableText.trim()}
-      <div class="message-actions">
-        <button type="button" class="message-action" onclick={() => void copyMessage()} title={i18n.t('messageItem.copyTitle')}>
-          <Icon name={copied ? 'check' : 'copy'} size={14} />
-        </button>
-      </div>
-    {/if}
     <!-- 非主角色：来源标识固定渲染，占位/有内容共用同一节点，避免首 token 漂移 -->
     {#if !isNativeSource}
       <div class="inline-source-tag">
@@ -581,6 +573,34 @@
     justify-content: flex-end;
   }
 
+  .user-message-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 2px;
+    margin-bottom: 2px;
+  }
+
+  .message-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+  }
+
+  .message-action:hover,
+  .message-action:focus-visible {
+    background: var(--background-hover);
+    color: var(--foreground);
+  }
+
   /* ===== 补充指令标签 ===== */
   .supplementary-tag {
     font-size: 10px;
@@ -605,65 +625,6 @@
     flex-shrink: 0;
     height: auto;
     overflow: visible;
-  }
-
-  .message-actions {
-    position: absolute;
-    top: 0;
-    right: var(--space-3);
-    display: flex;
-    align-items: center;
-    gap: 2px;
-    padding: 2px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: color-mix(in srgb, var(--background) 94%, transparent);
-    box-shadow: var(--shadow-sm);
-    opacity: 0;
-    pointer-events: none;
-    transform: translateY(-45%);
-    transition: opacity 120ms ease;
-    z-index: 2;
-  }
-
-  .message-item:hover > .message-actions,
-  .message-item:focus-within > .message-actions,
-  .system-notice:hover > .message-actions,
-  .system-notice:focus-within > .message-actions {
-    opacity: 1;
-    pointer-events: auto;
-  }
-
-  .message-action {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 30px;
-    height: 30px;
-    padding: 0;
-    border: 0;
-    border-radius: 4px;
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-  }
-
-  .message-action:hover,
-  .message-action:focus-visible {
-    background: var(--background-hover);
-    color: var(--foreground);
-  }
-
-  @media (hover: none), (pointer: coarse) {
-    .message-actions {
-      opacity: 1;
-      pointer-events: auto;
-    }
-
-    .message-action {
-      width: 36px;
-      height: 36px;
-    }
   }
 
   .message-item.assistant.plain-shell {

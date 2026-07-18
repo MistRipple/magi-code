@@ -4,8 +4,7 @@ use axum::{
     routing::{get, post},
 };
 use magi_core::{DomainError, GoalId, SessionId};
-use magi_core::{TodoItem, TodoStatus};
-use magi_session_store::{GoalStatus, SessionGoal};
+use magi_session_store::{GoalStatus, SessionGoal, SessionPlan};
 use serde::{Deserialize, Serialize};
 
 use super::session_scope::{SessionWorkspaceScope, require_session_workspace_scope};
@@ -18,7 +17,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/goals/current/pause", post(pause_current_goal))
         .route("/goals/current/resume", post(resume_current_goal))
         .route("/goals/current/clear", post(clear_current_goal))
-        .route("/goals/current/todos/clear", post(clear_current_todos))
+        .route("/goals/current/plan/clear", post(clear_current_plan))
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,15 +36,7 @@ struct CurrentGoalResponseDto {
     workspace_id: String,
     workspace_path: String,
     goal: Option<SessionGoal>,
-    todo_items: Vec<GoalTodoItemDto>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GoalTodoItemDto {
-    content: String,
-    active_form: String,
-    status: String,
+    plan: Option<SessionPlan>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,38 +83,13 @@ async fn get_current_goal(
 
 fn current_goal_response(state: &ApiState, scope: SessionWorkspaceScope) -> CurrentGoalResponseDto {
     let goal = state.session_store.current_visible_goal(&scope.session_id);
-    let todo_items = current_goal_todo_items(state, &scope.session_id);
+    let plan = state.session_store.plan(&scope.session_id);
     CurrentGoalResponseDto {
         session_id: scope.session_id.to_string(),
         workspace_id: scope.workspace_id.to_string(),
         workspace_path: scope.workspace_path,
         goal,
-        todo_items,
-    }
-}
-
-fn current_goal_todo_items(state: &ApiState, session_id: &SessionId) -> Vec<GoalTodoItemDto> {
-    state
-        .session_store
-        .todo_items(session_id)
-        .into_iter()
-        .map(todo_item_to_goal_dto)
-        .collect()
-}
-
-fn todo_item_to_goal_dto(item: TodoItem) -> GoalTodoItemDto {
-    GoalTodoItemDto {
-        content: item.content,
-        active_form: item.active_form,
-        status: todo_status_label(item.status).to_string(),
-    }
-}
-
-fn todo_status_label(status: TodoStatus) -> &'static str {
-    match status {
-        TodoStatus::Pending => "pending",
-        TodoStatus::InProgress => "in_progress",
-        TodoStatus::Completed => "completed",
+        plan,
     }
 }
 
@@ -187,13 +153,13 @@ async fn clear_current_goal(
         .map_err(map_goal_domain_error)?;
     state
         .session_store
-        .replace_todo_items(&scope.session_id, Vec::new())
+        .clear_plan(&scope.session_id, None)
         .map_err(map_goal_domain_error)?;
     state.persist_session_state_checkpoint("goal_cleared")?;
     Ok(Json(goal_mutation_response(scope, None)))
 }
 
-async fn clear_current_todos(
+async fn clear_current_plan(
     State(state): State<ApiState>,
     Json(request): Json<GoalActionRequest>,
 ) -> Result<Json<CurrentGoalResponseDto>, ApiError> {
@@ -202,13 +168,13 @@ async fn clear_current_todos(
         request.session_id.as_deref(),
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
-        "清除当前任务清单",
+        "清除当前计划",
     )?;
     state
         .session_store
-        .replace_todo_items(&scope.session_id, Vec::new())
+        .clear_plan(&scope.session_id, None)
         .map_err(map_goal_domain_error)?;
-    state.persist_session_state_checkpoint("goal_todos_cleared")?;
+    state.persist_session_state_checkpoint("session_plan_cleared")?;
     Ok(Json(current_goal_response(&state, scope)))
 }
 
@@ -444,9 +410,8 @@ mod tests {
                 None,
             )
             .expect("goal should be creatable");
-        let todo_ledger =
-            magi_todo_ledger::TodoLedger::new(Arc::clone(&session_store), session_id.clone());
-        todo_ledger
+        let plan_store = magi_plan::PlanStore::new(Arc::clone(&session_store), session_id.clone());
+        plan_store
             .write(vec![
                 TodoItem::new("读取项目文档", "正在读取项目文档", TodoStatus::Completed),
                 TodoItem::new("扫描代码缺口", "正在扫描代码缺口", TodoStatus::Completed),
@@ -454,7 +419,7 @@ mod tests {
                 TodoItem::new("汇总分析", "正在汇总分析", TodoStatus::InProgress),
             ])
             .expect("initial todo list should persist");
-        todo_ledger
+        plan_store
             .write(vec![TodoItem::new(
                 "汇总分析",
                 "正在汇总分析",

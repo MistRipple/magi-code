@@ -1198,7 +1198,7 @@ mod tests {
             canonical_turns: Vec::new(),
             notifications: Vec::new(),
             goals: Vec::new(),
-            todo_lists: Vec::new(),
+            plans: Vec::new(),
         };
         let sidecar_state = SessionExecutionSidecarStoreState {
             runtime_sidecars: vec![SessionRuntimeSidecar {

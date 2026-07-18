@@ -90,9 +90,9 @@ pub struct ConversationLoopRequest<'a> {
     /// 启用任何危险模式规则（既无内置也无用户自定义），此时拦截器走 pass-through。
     /// 在 execute_task_tool_call 中工具调用执行前做语义判定。
     pub safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
-    /// 任务系统 — L13：当前 session 的 TodoLedger。模型通过 `todo_write`
+    /// 任务系统 — L13：当前 session 的 PlanStore。模型通过 `update_plan`
     /// 工具往里写分解 + 进度；本 Turn 起始时把快照渲染成 system prompt 注入。
-    pub todo_ledger: &'a magi_todo_ledger::TodoLedger,
+    pub plan_store: &'a magi_plan::PlanStore,
     /// 任务系统 — L14：当前 workspace 的 ProjectMemory。`None` 表示当前 task
     /// 不绑定 workspace（极少数 orchestration-only 场景），此时不注入 prompt、
     /// 也不允许 `memory_write` 工具调用成功。
@@ -768,7 +768,7 @@ fn run_conversation_loop_inner(
         agent_role_registry,
         spawn_graph,
         safety_gate,
-        todo_ledger,
+        plan_store,
         project_memory,
         mission_metrics,
         task,
@@ -809,7 +809,7 @@ fn run_conversation_loop_inner(
     //     S10  ProjectMemory 索引
     //
     //   Tier C · DYNAMIC     —— 每轮都可能变化
-    //     S9   TodoLedger 快照
+    //     S9   PlanStore 快照
     //     Mailbox 待处理消息
     //     Thread 历史 (append-only — 前缀稳定，append 不破前缀缓存)
     //     本轮 user 输入 (S2-S8 由 assemble_prompt 预拼装)
@@ -893,12 +893,12 @@ fn run_conversation_loop_inner(
         }
     }
     // -------- Tier C · DYNAMIC --------
-    // [CACHE: DYNAMIC] S9 · TodoLedger 快照。
-    // 本 session 模型在之前轮次写过 todo_write 时，这里把当前列表渲染进 system prompt，
-    // 让本轮 Turn 起点自动看到分解 + 进度。每轮 todo_write 后变化。
-    if let Some(rendered) = todo_ledger.render_for_prompt() {
+    // [CACHE: DYNAMIC] S9 · UserPlan 快照。
+    // 本 session 模型在之前轮次写过 update_plan 时，这里把当前列表渲染进 system prompt，
+    // 让本轮 Turn 起点自动看到分解 + 进度。每轮 update_plan 后变化。
+    if let Some(rendered) = plan_store.render_for_prompt() {
         messages.push(system_prompt_fragment_message(
-            PromptFragmentKind::TodoLedger,
+            PromptFragmentKind::UserPlan,
             rendered,
         ));
     }
@@ -1398,7 +1398,7 @@ fn run_conversation_loop_inner(
             conversation_registry,
             spawn_graph,
             safety_gate,
-            todo_ledger,
+            plan_store,
             project_memory,
             task,
             session_id,
@@ -3805,7 +3805,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-todo-ledger"),
             project_memory: None,
             mission_metrics: None,
             task,
@@ -3873,7 +3873,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-todo-ledger"),
             project_memory: None,
             mission_metrics: None,
             task: &task,
@@ -3961,7 +3961,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-todo-ledger"),
             project_memory: None,
             mission_metrics: None,
             task: &task,
@@ -4469,7 +4469,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-todo-ledger"),
             project_memory: None,
             mission_metrics: None,
             task: &task,
@@ -4556,7 +4556,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-todo-ledger"),
             project_memory: None,
             mission_metrics: None,
             task: &task,
@@ -4727,12 +4727,12 @@ mod tests {
                 body: "旧内容".to_string(),
             })
             .expect("project memory entry should save");
-        let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
-        todo_ledger
-            .write(vec![magi_todo_ledger::TodoItem::new(
+        let plan_store = crate::test_plan_store("test-todo-ledger");
+        plan_store
+            .write(vec![magi_plan::TodoItem::new(
                 "继续旧任务 OLD_REFERENCE_RESULT",
                 "正在继续旧任务",
-                magi_todo_ledger::TodoStatus::Pending,
+                magi_plan::TodoStatus::Pending,
             )])
             .expect("todo fixture should write");
 
@@ -4756,7 +4756,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &todo_ledger,
+            plan_store: &plan_store,
             project_memory: Some(&project_memory),
             mission_metrics: None,
             task: &task,
@@ -4795,7 +4795,7 @@ mod tests {
         };
 
         let project_memory_index = content_at("旧偏好要求输出 OLD_REFERENCE_RESULT");
-        let todo_index = content_at("当前 TodoLedger");
+        let todo_index = content_at("当前用户可见计划");
         let history_index = content_at("历史要求：输出 OLD_REFERENCE_RESULT");
         let thread_boundary_index = content_at("必须以当前任务为准");
         let priority_index = content_at("上下文优先级（本轮必须遵守）");
@@ -5053,7 +5053,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-todo-ledger"),
             project_memory: None,
             mission_metrics: None,
             task: &task,
@@ -5230,7 +5230,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-todo-ledger"),
             project_memory: None,
             mission_metrics: None,
             task: &task,
@@ -5407,7 +5407,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-todo-ledger"),
             project_memory: None,
             mission_metrics: None,
             task: &task,

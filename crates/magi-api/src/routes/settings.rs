@@ -2155,7 +2155,7 @@ mod tests {
                 "update_goal",
                 "agent_spawn",
                 "agent_wait",
-                "todo_write",
+                "update_plan",
                 "memory_write",
             ],
             "bootstrap must expose one canonical public builtin surface in a stable order"

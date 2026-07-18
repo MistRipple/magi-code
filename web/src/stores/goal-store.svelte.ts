@@ -1,4 +1,4 @@
-import type { CurrentGoalResponseDto } from '../shared/rust-backend-types';
+import type { CurrentGoalResponseDto, SessionPlanDto } from '../shared/rust-backend-types';
 import { RustDaemonClient } from '../shared/rust-daemon-client';
 import { resolveAgentBaseUrl } from '../web/agent-api';
 
@@ -105,6 +105,25 @@ export function applyCurrentGoalResponse(response: CurrentGoalResponseDto): void
     loading: false,
     error: null,
   });
+}
+
+export function applySessionPlanSnapshot(
+  sessionId: string,
+  workspaceId: string,
+  plan: SessionPlanDto | null,
+): boolean {
+  const key = goalScopeKey(workspaceId, sessionId);
+  const current = key ? goalStates[key] : null;
+  if (!key || !current?.response) return false;
+  writeGoalState(key, {
+    response: {
+      ...current.response,
+      plan,
+    },
+    loading: false,
+    error: null,
+  });
+  return true;
 }
 
 export async function refreshCurrentGoal(

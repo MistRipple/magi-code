@@ -20,7 +20,7 @@ pub(crate) fn is_orchestration_builtin_tool(tool: BuiltinToolName) -> bool {
     matches!(
         tool,
         BuiltinToolName::AgentSpawn
-            | BuiltinToolName::TodoWrite
+            | BuiltinToolName::UpdatePlan
             | BuiltinToolName::MemoryWrite
             | BuiltinToolName::AgentWait
     )
@@ -59,7 +59,7 @@ pub(crate) fn task_can_see_builtin_tool(
     if is_goal_builtin_tool(tool) {
         return task.is_none() || task_is_coordinator(task, registry);
     }
-    if matches!(tool, BuiltinToolName::TodoWrite) && task.is_none() {
+    if matches!(tool, BuiltinToolName::UpdatePlan) && task.is_none() {
         return true;
     }
     if is_orchestration_builtin_tool(tool) {

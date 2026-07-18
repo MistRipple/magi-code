@@ -5,19 +5,33 @@
     type FilePreviewScope,
     type FilePreviewScopeReader,
   } from '../lib/file-reference';
+  import { MARKDOWN_IMAGE_CONTEXT, type MarkdownImageContext } from '../lib/markdown-image';
   import { preprocessMarkdown, splitStreamingMarkdown } from '../lib/markdown-utils';
   import MarkdownRenderer from './MarkdownRenderer.svelte';
 
-  // Props — 对外接口保持不变
+  // Props — 保持既有调用方式兼容，并为文件预览补充图片基准路径。
   interface Props {
     content: string;
     isStreaming?: boolean;
     filePreviewScope?: FilePreviewScope;
+    baseFilePath?: string;
   }
-  let { content, isStreaming = false, filePreviewScope = undefined }: Props = $props();
+  let {
+    content,
+    isStreaming = false,
+    filePreviewScope = undefined,
+    baseFilePath = undefined,
+  }: Props = $props();
 
   const readFilePreviewScope: FilePreviewScopeReader = () => filePreviewScope;
   setContext(FILE_PREVIEW_SCOPE_CONTEXT, readFilePreviewScope);
+  const markdownImageContext: MarkdownImageContext = {
+    get baseFilePath() {
+      return baseFilePath;
+    },
+    readFilePreviewScope,
+  };
+  setContext(MARKDOWN_IMAGE_CONTEXT, markdownImageContext);
 
   const markdownParts = $derived.by(() => {
     const source = content || '';

@@ -85,6 +85,7 @@ pub struct SessionTurnExecutionRequest {
     pub forced_tool_name: Option<String>,
     pub required_tool_chain: Vec<String>,
     pub goal_turn_mode: SessionGoalTurnMode,
+    pub product_locale: String,
     pub workspace_root_path: Option<String>,
 }
 
@@ -285,6 +286,13 @@ fn build_session_turn_messages(
     } else {
         Vec::new()
     };
+    messages.push(system_prompt_fragment_message(
+        PromptFragmentKind::CurrentTurnPriority,
+        format!(
+            "计划语言规则：用户明确指定的语言优先，其次当前用户消息的主要语言，再次产品 locale={}，最后默认 zh-CN。调用 update_plan 时必须将最终选择写入 language，计划创建后不得切换。",
+            request.product_locale
+        ),
+    ));
     if let Some(reference_prompt) =
         crate::context_reference::session_context_references_prompt(&request.context_references)
     {
@@ -335,7 +343,7 @@ pub struct SessionTurnExecutionRuntime<'a> {
     pub event_bus: &'a InMemoryEventBus,
     pub session_store: &'a SessionStore,
     pub conversation_registry: &'a ConversationRegistry,
-    pub todo_ledger: &'a magi_todo_ledger::TodoLedger,
+    pub plan_store: &'a magi_plan::PlanStore,
     pub settings_store: Option<&'a Arc<SettingsStore>>,
     pub safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
     pub tool_registry: Option<&'a ToolRegistry>,
@@ -353,16 +361,16 @@ pub struct SessionTurnExecutionRuntime<'a> {
 pub fn run_session_turn_execution(
     runtime: SessionTurnExecutionRuntime<'_>,
 ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
-    let todo_ledger = runtime.todo_ledger;
+    let plan_store = runtime.plan_store;
     let session_id = runtime.request.session_id.clone();
     let result = run_session_turn_execution_inner(runtime);
     if result.is_err()
-        && let Err(todo_error) = todo_ledger.pause_in_progress()
+        && let Err(todo_error) = plan_store.pause()
     {
         tracing::warn!(
             session_id = %session_id,
             error = %todo_error,
-            "对话轮次失败后暂停 TodoLedger 进行项失败"
+            "对话轮次失败后暂停 PlanStore 进行项失败"
         );
     }
     result
@@ -376,7 +384,7 @@ fn run_session_turn_execution_inner(
         event_bus,
         session_store,
         conversation_registry,
-        todo_ledger,
+        plan_store,
         settings_store,
         safety_gate,
         tool_registry,
@@ -440,7 +448,7 @@ fn run_session_turn_execution_inner(
                 client,
                 event_bus,
                 session_store,
-                todo_ledger,
+                plan_store,
                 settings_store,
                 safety_gate,
                 snapshot_manager,
@@ -503,7 +511,7 @@ fn run_session_turn_execution_inner(
             && let Some(runtime) = skill_runtime
         {
             let preserved_goal_tools = if request.goal_turn_mode.is_goal_driven() {
-                ["get_goal", "create_goal", "update_goal", "todo_write"].as_slice()
+                ["get_goal", "create_goal", "update_goal", "update_plan"].as_slice()
             } else {
                 [].as_slice()
             };
@@ -714,7 +722,7 @@ struct SessionTurnRoundRuntime<'a> {
     client: &'a dyn ModelBridgeClient,
     event_bus: &'a InMemoryEventBus,
     session_store: &'a SessionStore,
-    todo_ledger: &'a magi_todo_ledger::TodoLedger,
+    plan_store: &'a magi_plan::PlanStore,
     settings_store: Option<&'a Arc<SettingsStore>>,
     safety_gate: Option<&'a magi_safety_gate::SafetyGate>,
     snapshot_manager: Option<&'a Arc<SnapshotManager>>,
@@ -811,7 +819,7 @@ fn stream_session_turn_round(
         client,
         event_bus,
         session_store,
-        todo_ledger,
+        plan_store,
         settings_store,
         safety_gate,
         snapshot_manager,
@@ -1195,7 +1203,7 @@ fn stream_session_turn_round(
                 skill_dispatch_runtime,
                 skill_name,
                 safety_gate,
-                todo_ledger,
+                plan_store,
                 mission_id: orchestrator_mission_id,
                 session_id: &request.session_id,
                 workspace_id: &request.workspace_id,
@@ -1538,13 +1546,13 @@ mod tests {
             store: store.clone(),
             session_id: session_id.clone(),
         };
-        let todo_ledger = magi_todo_ledger::TodoLedger::new(store.clone(), session_id.clone());
+        let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
         let output = run_session_turn_execution(SessionTurnExecutionRuntime {
             client: &client,
             event_bus: &InMemoryEventBus::new(16),
             session_store: store.as_ref(),
             conversation_registry: &registry,
-            todo_ledger: &todo_ledger,
+            plan_store: &plan_store,
             settings_store: None,
             safety_gate: None,
             tool_registry: None,
@@ -1568,6 +1576,7 @@ mod tests {
                 forced_tool_name: None,
                 required_tool_chain: Vec::new(),
                 goal_turn_mode: SessionGoalTurnMode::None,
+                product_locale: "zh-CN".to_string(),
                 workspace_root_path: None,
             },
             prompt: "停止测试".to_string(),
@@ -1736,6 +1745,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
 
@@ -1744,7 +1754,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &store,
             conversation_registry: registry.as_ref(),
-            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-todo-ledger"),
             settings_store: None,
             safety_gate: None,
             tool_registry: None,
@@ -1818,6 +1828,7 @@ mod tests {
             forced_tool_name: Some("diagram_render".to_string()),
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
         let tools = vec![ChatToolDefinition {
@@ -1861,6 +1872,7 @@ mod tests {
                 "file_read".to_string(),
             ],
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
         let tools = ["shell_exec", "file_write", "file_read"]
@@ -1935,8 +1947,8 @@ mod tests {
                 },
             )
             .expect("current turn should be stored");
-        let todo_ledger = magi_todo_ledger::TodoLedger::new(store.clone(), session_id.clone());
-        todo_ledger
+        let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
+        plan_store
             .write(vec![magi_core::TodoItem::new(
                 "继续处理当前步骤",
                 "正在处理当前步骤",
@@ -1957,7 +1969,7 @@ mod tests {
             event_bus: &InMemoryEventBus::new(16),
             session_store: store.as_ref(),
             conversation_registry: &ConversationRegistry::new(),
-            todo_ledger: &todo_ledger,
+            plan_store: &plan_store,
             settings_store: None,
             safety_gate: None,
             tool_registry: None,
@@ -1981,6 +1993,7 @@ mod tests {
                 forced_tool_name: None,
                 required_tool_chain: Vec::new(),
                 goal_turn_mode: SessionGoalTurnMode::None,
+                product_locale: "zh-CN".to_string(),
                 workspace_root_path: None,
             },
             prompt: "继续处理".to_string(),
@@ -1997,7 +2010,7 @@ mod tests {
             })
         ));
         assert_eq!(
-            todo_ledger.snapshot()[0].status,
+            plan_store.snapshot()[0].status,
             magi_core::TodoStatus::Pending
         );
     }
@@ -2043,8 +2056,8 @@ mod tests {
             .to_string(),
         };
         let event_bus = InMemoryEventBus::new(16);
-        let todo_ledger = magi_todo_ledger::TodoLedger::new(store.clone(), session_id.clone());
-        todo_ledger
+        let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
+        plan_store
             .write(vec![magi_core::TodoItem::new(
                 "继续处理当前步骤",
                 "正在处理当前步骤",
@@ -2067,6 +2080,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
 
@@ -2075,7 +2089,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: store.as_ref(),
             conversation_registry: &ConversationRegistry::new(),
-            todo_ledger: &todo_ledger,
+            plan_store: &plan_store,
             settings_store: None,
             safety_gate: None,
             tool_registry: None,
@@ -2108,7 +2122,7 @@ mod tests {
                 && item.content.as_deref() == Some(error.public_message.as_str())
         }));
         assert_eq!(
-            todo_ledger.snapshot()[0].status,
+            plan_store.snapshot()[0].status,
             magi_core::TodoStatus::Pending
         );
     }
@@ -2168,6 +2182,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
 
@@ -2176,7 +2191,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &store,
             conversation_registry: &ConversationRegistry::new(),
-            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-todo-ledger"),
             settings_store: None,
             safety_gate: None,
             tool_registry: None,
@@ -2272,6 +2287,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
 
@@ -2280,7 +2296,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &store,
             conversation_registry: &ConversationRegistry::new(),
-            todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-todo-ledger"),
             settings_store: None,
             safety_gate: None,
             tool_registry: None,
@@ -2375,6 +2391,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
         let usage_binding = session_turn_model_usage_binding(false);
@@ -2391,7 +2408,7 @@ mod tests {
                 client: &client,
                 event_bus: &event_bus,
                 session_store: &store,
-                todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+                plan_store: &crate::test_plan_store("test-todo-ledger"),
                 settings_store: None,
                 safety_gate: None,
                 request: &request,
@@ -2498,6 +2515,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
         let usage_binding = session_turn_model_usage_binding(false);
@@ -2514,7 +2532,7 @@ mod tests {
                 client: &RetryEventModelBridgeClient,
                 event_bus: &event_bus,
                 session_store: &store,
-                todo_ledger: &crate::test_todo_ledger("test-todo-ledger"),
+                plan_store: &crate::test_plan_store("test-todo-ledger"),
                 settings_store: None,
                 safety_gate: None,
                 request: &request,
@@ -2653,7 +2671,7 @@ mod tests {
             }],
             notifications: Vec::new(),
             goals: Vec::new(),
-            todo_lists: Vec::new(),
+            plans: Vec::new(),
             execution_sidecar_store: Default::default(),
             thread_registry: vec![ExecutionThread {
                 thread_id: magi_core::ThreadId::new("thread-test-orchestrator"),
@@ -2701,6 +2719,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
         let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
@@ -2781,7 +2800,7 @@ mod tests {
             }],
             notifications: Vec::new(),
             goals: Vec::new(),
-            todo_lists: Vec::new(),
+            plans: Vec::new(),
             execution_sidecar_store: Default::default(),
             thread_registry: vec![ExecutionThread {
                 thread_id,
@@ -2826,6 +2845,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
 
@@ -2926,7 +2946,7 @@ mod tests {
             canonical_turns,
             notifications: Vec::new(),
             goals: Vec::new(),
-            todo_lists: Vec::new(),
+            plans: Vec::new(),
             execution_sidecar_store: Default::default(),
             thread_registry: vec![ExecutionThread {
                 thread_id: thread_id.clone(),
@@ -2971,6 +2991,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
 
@@ -3021,6 +3042,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
@@ -3072,6 +3094,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
@@ -3114,6 +3137,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
@@ -3189,6 +3213,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
 
@@ -3239,6 +3264,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
@@ -3309,6 +3335,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
 
@@ -3445,6 +3472,7 @@ mod tests {
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
             goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
 

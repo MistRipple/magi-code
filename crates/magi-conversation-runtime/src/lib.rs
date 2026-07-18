@@ -72,11 +72,11 @@ pub use tool_batch::execute_task_tool_call_batch;
 pub use turn::{Turn, TurnState, TurnTransitionError};
 
 #[cfg(test)]
-pub(crate) fn test_todo_ledger(name: &str) -> magi_todo_ledger::TodoLedger {
+pub(crate) fn test_plan_store(name: &str) -> magi_plan::PlanStore {
     let store = std::sync::Arc::new(magi_session_store::SessionStore::new());
     let session_id = magi_core::SessionId::new(name);
     store
         .create_session(session_id.clone(), name)
         .expect("test todo session should create");
-    magi_todo_ledger::TodoLedger::new(store, session_id)
+    magi_plan::PlanStore::new(store, session_id)
 }

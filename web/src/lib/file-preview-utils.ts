@@ -84,6 +84,11 @@ export function isMarkdownFile(path: string): boolean {
   return ext === 'md' || ext === 'markdown';
 }
 
+export function isHtmlFile(path: string): boolean {
+  const ext = getFileExtension(path);
+  return ext === 'html' || ext === 'htm';
+}
+
 export function isKnownBinaryFile(path: string): boolean {
   return BINARY_EXTENSIONS.has(getFileExtension(path));
 }

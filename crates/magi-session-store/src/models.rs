@@ -1,7 +1,7 @@
 use magi_core::{
     AccessProfile, DomainError, DomainResult, ExecutionOwnership, GoalId, LeaseId, MissionId,
-    SessionId, SessionLifecycleStatus, TaskId, ThreadId, TodoItem, UtcMillis, WorkerId,
-    WorkspaceId,
+    PlanId, PlanItem, PlanState, SessionId, SessionLifecycleStatus, TaskId, ThreadId, UtcMillis,
+    WorkerId, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -582,6 +582,8 @@ pub enum SessionSidecarFlushReason {
     AttachRecoveryRef,
     ClearExecutionOwnership,
     ArchiveActiveExecutionChain,
+    UpdatePlan,
+    ClearPlan,
     DeleteSession,
 }
 
@@ -823,10 +825,34 @@ pub struct SessionGoal {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SessionTodoList {
+pub struct SessionPlan {
+    #[serde(default = "empty_plan_id")]
+    pub plan_id: PlanId,
     pub session_id: SessionId,
-    pub items: Vec<TodoItem>,
+    #[serde(default = "default_plan_revision")]
+    pub revision: u64,
+    #[serde(default = "default_plan_language")]
+    pub language: String,
+    #[serde(default)]
+    pub state: PlanState,
+    pub items: Vec<PlanItem>,
+    #[serde(default)]
+    pub task_bindings: HashMap<TaskId, magi_core::PlanItemId>,
+    #[serde(default)]
+    pub task_statuses: HashMap<TaskId, magi_core::TaskStatus>,
     pub updated_at: UtcMillis,
+}
+
+fn empty_plan_id() -> PlanId {
+    PlanId::new("")
+}
+
+fn default_plan_revision() -> u64 {
+    1
+}
+
+fn default_plan_language() -> String {
+    "zh-CN".to_string()
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -839,8 +865,8 @@ pub struct SessionStoreState {
     pub notifications: Vec<NotificationRecord>,
     #[serde(default)]
     pub goals: Vec<SessionGoal>,
-    #[serde(default)]
-    pub todo_lists: Vec<SessionTodoList>,
+    #[serde(default, alias = "todo_lists")]
+    pub plans: Vec<SessionPlan>,
     #[serde(default, flatten)]
     pub execution_sidecar_store: SessionExecutionSidecarStoreState,
     /// P6 Thread 原语注册表：按 session 聚合 `ExecutionThread`。orchestrator thread
@@ -859,8 +885,8 @@ pub struct SessionDurableState {
     pub notifications: Vec<NotificationRecord>,
     #[serde(default)]
     pub goals: Vec<SessionGoal>,
-    #[serde(default)]
-    pub todo_lists: Vec<SessionTodoList>,
+    #[serde(default, alias = "todo_lists")]
+    pub plans: Vec<SessionPlan>,
 }
 
 impl SessionDurableState {
@@ -871,7 +897,7 @@ impl SessionDurableState {
             && self.canonical_turns.is_empty()
             && self.notifications.is_empty()
             && self.goals.is_empty()
-            && self.todo_lists.is_empty()
+            && self.plans.is_empty()
     }
 
     pub fn append_state(&mut self, other: SessionDurableState) {
@@ -887,7 +913,7 @@ impl SessionDurableState {
         self.canonical_turns.extend(other.canonical_turns);
         self.notifications.extend(other.notifications);
         self.goals.extend(other.goals);
-        self.todo_lists.extend(other.todo_lists);
+        self.plans.extend(other.plans);
     }
 
     pub fn partition_by_workspace(
@@ -929,7 +955,7 @@ impl SessionDurableState {
                     canonical_turns: Vec::new(),
                     notifications: Vec::new(),
                     goals: Vec::new(),
-                    todo_lists: Vec::new(),
+                    plans: Vec::new(),
                 },
             );
         }
@@ -944,7 +970,7 @@ impl SessionDurableState {
             canonical_turns: Vec::new(),
             notifications: Vec::new(),
             goals: Vec::new(),
-            todo_lists: Vec::new(),
+            plans: Vec::new(),
         };
 
         for entry in &self.timeline {
@@ -1032,18 +1058,18 @@ impl SessionDurableState {
             }
         }
 
-        for todo_list in &self.todo_lists {
-            if global_session_ids.contains(&todo_list.session_id) {
-                global_state.todo_lists.push(todo_list.clone());
+        for plan in &self.plans {
+            if global_session_ids.contains(&plan.session_id) {
+                global_state.plans.push(plan.clone());
                 continue;
             }
             for (workspace_id, session_ids) in &workspace_session_ids {
-                if session_ids.contains(&todo_list.session_id) {
+                if session_ids.contains(&plan.session_id) {
                     workspace_states
                         .get_mut(workspace_id)
                         .expect("workspace durable state should exist")
-                        .todo_lists
-                        .push(todo_list.clone());
+                        .plans
+                        .push(plan.clone());
                     break;
                 }
             }
@@ -1103,6 +1129,8 @@ impl SessionStoreState {
         for notification in &mut notifications {
             notification.normalize_incident();
         }
+        let mut plans = durable_state.plans;
+        normalize_session_plans(&mut plans);
         Self {
             current_session_id: durable_state.current_session_id,
             sessions: durable_state.sessions,
@@ -1110,7 +1138,7 @@ impl SessionStoreState {
             canonical_turns,
             notifications,
             goals: durable_state.goals,
-            todo_lists: durable_state.todo_lists,
+            plans,
             execution_sidecar_store,
             thread_registry: Vec::new(),
         }
@@ -1124,7 +1152,27 @@ impl SessionStoreState {
             canonical_turns: self.canonical_turns.clone(),
             notifications: self.notifications.clone(),
             goals: self.goals.clone(),
-            todo_lists: self.todo_lists.clone(),
+            plans: self.plans.clone(),
+        }
+    }
+}
+
+fn normalize_session_plans(plans: &mut [SessionPlan]) {
+    for plan in plans {
+        if plan.plan_id.as_str().trim().is_empty() {
+            plan.plan_id = PlanId::new(format!("plan-{}", plan.session_id));
+        }
+        if plan.revision == 0 {
+            plan.revision = 1;
+        }
+        if plan.language.trim().is_empty() {
+            plan.language = default_plan_language();
+        }
+        for (index, item) in plan.items.iter_mut().enumerate() {
+            if item.item_id.as_str().trim().is_empty() {
+                item.item_id =
+                    magi_core::PlanItemId::new(format!("{}-item-{}", plan.plan_id, index + 1));
+            }
         }
     }
 }

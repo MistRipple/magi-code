@@ -10,9 +10,9 @@ pub use models::{
     CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus,
     CanonicalTurnVisibility, CanonicalWorkerRef, ExecutionThread, ExecutionThreadStatus,
     GoalStatus, NotificationRecord, NotificationScope, SessionDurableState,
-    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionGoal,
+    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionGoal, SessionPlan,
     SessionProjectionInput, SessionRecord, SessionRuntimeSidecar, SessionRuntimeSidecarExport,
-    SessionSidecarFlushMetadata, SessionSidecarFlushReason, SessionStoreState, SessionTodoList,
+    SessionSidecarFlushMetadata, SessionSidecarFlushReason, SessionStoreState,
     ThreadChatImageSource, ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
     ThreadVisibility, TimelineEntry, TimelineEntryKind, timeline_entry_visible_text,
 };

@@ -3,6 +3,7 @@ mod agent_runs;
 mod changes_files_tunnel;
 mod conversation_bridge;
 mod dispatch_flow;
+mod file_site;
 mod goals;
 mod knowledge;
 mod mcp_skills_repos;
@@ -105,6 +106,7 @@ pub fn build_router(state: ApiState) -> Router {
         .merge(settings::routes())
         .merge(mcp_skills_repos::routes())
         .merge(changes_files_tunnel::routes())
+        .merge(file_site::routes())
         .merge(agent_run_actions::routes())
         .merge(agent_runs::routes())
         .merge(tools::routes())
@@ -139,6 +141,12 @@ async fn enforce_public_tunnel_auth(
     if !is_public_tunnel_request(request.headers())
         || !is_protected_remote_path(request.uri().path())
     {
+        return next.run(request).await;
+    }
+
+    // 静态站点资源使用工作区受限的派生令牌，由资源处理器统一校验。
+    // 这里不能再要求全局 tunnel_token，否则 HTML 的相对 CSS/JS/图片请求无法加载。
+    if request.uri().path().starts_with("/api/files/site/") {
         return next.run(request).await;
     }
 

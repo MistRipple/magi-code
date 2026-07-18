@@ -84,7 +84,7 @@ impl StateRepository {
             merged.canonical_turns.extend(ws_state.canonical_turns);
             merged.notifications.extend(ws_state.notifications);
             merged.goals.extend(ws_state.goals);
-            merged.todo_lists.extend(ws_state.todo_lists);
+            merged.plans.extend(ws_state.plans);
             if merged.current_session_id.is_none() {
                 merged.current_session_id = ws_state.current_session_id;
             }
@@ -517,7 +517,7 @@ mod tests {
                     now,
                 )],
                 goals: vec![],
-                todo_lists: vec![],
+                plans: vec![],
             })
             .expect("invalid global session state should save");
 
@@ -570,7 +570,7 @@ mod tests {
                 canonical_turns: vec![],
                 notifications: vec![],
                 goals: vec![],
-                todo_lists: vec![],
+                plans: vec![],
             })
             .expect("invalid global session state should save");
 
@@ -634,7 +634,7 @@ mod tests {
                 canonical_turns: vec![],
                 notifications: vec![],
                 goals: vec![],
-                todo_lists: vec![],
+                plans: vec![],
             })
             .expect("global session durable state should save");
 
@@ -664,7 +664,7 @@ mod tests {
                     canonical_turns: vec![],
                     notifications: vec![],
                     goals: vec![],
-                    todo_lists: vec![],
+                    plans: vec![],
                 },
             )
             .expect("workspace session durable state should save");
@@ -716,7 +716,7 @@ mod tests {
                 canonical_turns: vec![],
                 notifications: vec![],
                 goals: vec![],
-                todo_lists: vec![],
+                plans: vec![],
             })
             .expect("global session durable state should save");
 

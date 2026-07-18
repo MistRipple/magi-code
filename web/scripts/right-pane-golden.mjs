@@ -1,10 +1,29 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { withGoldenViteServer } from './golden-vite.mjs';
 
 globalThis.$state = (value) => value;
 
 await withGoldenViteServer(async (server) => {
   const rightPane = await server.ssrLoadModule('/src/stores/right-pane.svelte.ts');
+  const filePreview = await server.ssrLoadModule('/src/lib/file-preview-utils.ts');
+
+  assert.equal(filePreview.isHtmlFile('design/index.html'), true);
+  assert.equal(filePreview.isHtmlFile('design/index.HTM'), true);
+  assert.equal(filePreview.isHtmlFile('design/index.ts'), false);
+
+  const rightPaneSource = await readFile(
+    new URL('../src/web/RightPane.svelte', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    rightPaneSource,
+    /sandbox="allow-scripts allow-forms allow-modals"/,
+    'HTML preview must stay in a sandbox without allow-same-origin',
+  );
+  assert.match(rightPaneSource, /agentNavigationUrl\('\/api\/files\/site-open'/);
+  assert.match(rightPaneSource, /htmlPreviewRevisions/);
+  assert.match(rightPaneSource, /openHtmlInBrowser/);
 
   rightPane.activateRightPaneSession('workspace-active', 'session-active');
   rightPane.openCodeTab('session-stale', 'README.md', {

@@ -54,10 +54,10 @@ pub enum BuiltinToolName {
     AgentSpawn,
     /// 等待一个或多个已派发代理进入终态，并把代理最终答复返回给主线。
     AgentWait,
-    // ── In-session 思维锚点（任务系统 L13）──
-    /// 写入本 session 的 TodoLedger。整体替换列表语义（参考 claude-code 的 TodoWrite）。
+    // ── 用户可见计划（任务系统 L13）──
+    /// 更新本 session 的用户可见计划。真实执行任务由 ActiveExecutionChain 负责。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
-    TodoWrite,
+    UpdatePlan,
     // ── 跨 session 项目记忆（任务系统 L14）──
     /// 写入或删除当前 workspace 的 ProjectMemory entry。物理存储在
     /// `~/.magi/projects/{slug}/memory/`，跨 conversation 自动加载到 system prompt。
@@ -103,7 +103,7 @@ impl BuiltinToolName {
         Self::UpdateGoal,
         Self::AgentSpawn,
         Self::AgentWait,
-        Self::TodoWrite,
+        Self::UpdatePlan,
         Self::MemoryWrite,
     ];
 
@@ -140,7 +140,7 @@ impl BuiltinToolName {
             Self::UpdateGoal => "update_goal",
             Self::AgentSpawn => "agent_spawn",
             Self::AgentWait => "agent_wait",
-            Self::TodoWrite => "todo_write",
+            Self::UpdatePlan => "update_plan",
             Self::MemoryWrite => "memory_write",
         }
     }
@@ -171,7 +171,7 @@ impl BuiltinToolName {
             Self::ToolCatalog => "tooling",
             Self::GetGoal | Self::CreateGoal | Self::UpdateGoal => "session_goal",
             Self::AgentSpawn | Self::AgentWait => "agent_coordination",
-            Self::TodoWrite => "session_state",
+            Self::UpdatePlan => "session_state",
             Self::MemoryWrite => "project_memory",
         }
     }
@@ -209,7 +209,7 @@ impl BuiltinToolName {
             "update_goal" => Some(Self::UpdateGoal),
             "agent_spawn" => Some(Self::AgentSpawn),
             "agent_wait" => Some(Self::AgentWait),
-            "todo_write" => Some(Self::TodoWrite),
+            "update_plan" => Some(Self::UpdatePlan),
             "memory_write" => Some(Self::MemoryWrite),
             _ => None,
         }
@@ -229,7 +229,7 @@ impl BuiltinToolName {
                 | Self::AgentSpawn
                 | Self::CreateGoal
                 | Self::UpdateGoal
-                | Self::TodoWrite
+                | Self::UpdatePlan
                 | Self::MemoryWrite
         )
     }
@@ -289,7 +289,7 @@ impl BuiltinToolName {
             | Self::AgentSpawn
             | Self::CreateGoal
             | Self::UpdateGoal
-            | Self::TodoWrite
+            | Self::UpdatePlan
             | Self::MemoryWrite => RestrictedWriteProfilePolicy::AutoAllowed,
             _ => return None,
         };
@@ -324,7 +324,7 @@ impl BuiltinToolName {
                 | Self::GetGoal
                 | Self::CreateGoal
                 | Self::UpdateGoal
-                | Self::TodoWrite
+                | Self::UpdatePlan
                 | Self::MemoryWrite
         )
     }
@@ -353,7 +353,7 @@ impl BuiltinToolName {
             | Self::CreateGoal
             | Self::UpdateGoal
             | Self::AgentWait
-            | Self::TodoWrite
+            | Self::UpdatePlan
             | Self::MemoryWrite => RiskLevel::Low,
             Self::FileWrite
             | Self::FilePatch
@@ -586,21 +586,22 @@ impl BuiltinToolName {
                 - `results[].child_status=failed/killed`：判断是否可改派或由主线接管，不要自动把单个代理失败当作整体失败\n\
                 - `timed_out=true`：说明至少一个代理仍未完成；可以继续做不依赖该代理的工作，或稍后再次等待"
             }
-            Self::TodoWrite => {
-                "提交当前会话的 TodoLedger 快照，用于把长任务拆分成步骤并跟踪进度；ledger 会自动注入后续 Turn。非空更新按 content 更新同名步骤，遗漏的已完成步骤会保留，遗漏的未完成步骤会移除；传入空数组才会清空整个清单。\n\n\
+            Self::UpdatePlan => {
+                "更新当前会话的用户可见计划。计划只表达顶层执行阶段；真实主线、代理和工具执行由执行链负责。首次创建时可省略 planId、itemId，并使用 expectedRevision=0；后续更新必须沿用工具返回的 planId、revision、itemId 和 language。\n\n\
                 # 何时用\n\
-                - 任务 ≥ 3 个非平凡步骤，且步骤之间有先后关系或可能被打断\n\
-                - 跨多轮对话推进、需要让用户随时看到进度\n\
-                - 任务边界用户给得模糊，需要先拆解再让用户对齐\n\n\
+                - 非平凡、多阶段、有依赖或需要多次工具调用的任务\n\
+                - 跨多轮推进、用户明确要求计划或目标模式\n\
+                - 多代理任务：顶层计划保持单一进行项，子代理并行状态由执行链展示\n\n\
                 # 何时不用\n\
                 - 单步任务（改一个文件、回答一个问题、跑一条命令）\n\
                 - 纯查询 / 纯解释类对话（不会产出多步动作）\n\
-                - 任务步骤太琐碎（每步 < 5 秒）→ todo 噪音超过价值\n\n\
-                # 反例\n\
-                - ❌ 「读一个文件」也建 todo → ledger 污染、降低后续 todo 信号价值\n\
-                - ❌ 把『思考过程』当 todo（「想想 X」「分析 Y」）→ todo 应只记录可观察可验收的动作\n\
-                - ✅ 实现一个跨多文件的功能：拆「读现状 / 改 A / 改 B / 跑测试 / commit」5 步\n\
-                - ✅ 起步先写 todo 与用户对齐，确认后再开始执行"
+                - 不要把思考过程、读取单个文件等琐碎动作写成计划\n\n\
+                # 状态纪律\n\
+                - 同时最多一个 in_progress\n\
+                - pending 禁止直接 completed，必须先进入 in_progress\n\
+                - 完成当前步骤后再推进下一步，禁止结束前批量补状态\n\
+                - 范围变化时先更新计划再继续\n\
+                - 计划语言优先遵循用户明确要求，其次当前消息语言，再次产品 locale"
             }
             Self::MemoryWrite => {
                 "对当前工作区的 ProjectMemory 条目进行写入或删除。Memory 文件存于 ~/.magi/projects/<slug>/memory/，每次新会话开始时自动加载到系统提示。使用 action: save 进行 upsert（覆盖同 file_stem 的文件），action: delete 删除条目。Memory 类别：user / feedback / project / reference。"
@@ -997,6 +998,8 @@ impl BuiltinToolName {
             Self::AgentSpawn => serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "task_name": { "type": "string", "description": "稳定的机器任务名，只允许小写字母、数字和下划线；同一父任务下必须唯一。" },
+                    "plan_item_id": { "type": "string", "description": "可选：绑定 update_plan 返回的顶层 itemId。绑定后代理状态会自动同步该计划项。" },
                     "role": { "type": "string", "description": "已注册的代理角色 id，如 architect / executor / explorer / reviewer / tester。不要传 coordinator，主线协调身份由当前主模型承接。若用户明确指定 role，必须原样使用，不得替换成你认为更接近的角色。" },
                     "display_name": { "type": "string", "description": "本次派发的代理实例展示名（3-30 个字符），用于前端代理卡片标题。若用户明确给出 display_name 或指定代理名称，必须原样使用；不得自行改写、缩短、泛化或把两个指定代理合并。否则要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
                     "goal": { "type": "string", "description": "子任务的具体目标；角色级 system prompt 会与该目标合并使用" },
@@ -1009,7 +1012,7 @@ impl BuiltinToolName {
                     "working_dir": { "type": "string", "description": "可选的绝对工作目录；默认沿用父任务的 workspace 根目录" },
                     "parallelism_group": { "type": "string", "description": "可选的并行组名；同一 SpawnGraph 分支下相同组名的子 agent 互斥执行" }
                 },
-                "required": ["role", "display_name", "goal"]
+                "required": ["task_name", "role", "display_name", "goal"]
             }),
             Self::AgentWait => serde_json::json!({
                 "type": "object",
@@ -1026,34 +1029,32 @@ impl BuiltinToolName {
                 },
                 "required": ["task_ids"]
             }),
-            Self::TodoWrite => serde_json::json!({
+            Self::UpdatePlan => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "todos": {
+                    "planId": { "type": "string", "description": "更新现有计划时必须传入工具上次返回的 planId；首次创建可省略。" },
+                    "expectedRevision": { "type": "integer", "minimum": 0, "description": "乐观并发版本。首次创建传 0；后续必须传入工具上次返回的 revision。" },
+                    "language": { "type": "string", "description": "计划语言的 BCP-47 标识。用户明确要求优先，其次当前消息主要语言，再次产品 locale，默认 zh-CN。计划创建后不得切换。" },
+                    "explanation": { "type": "string", "description": "可选：说明本次拆分、排序或范围变化原因。" },
+                    "plan": {
                         "type": "array",
-                        "description": "当前 todo 快照。应尽量提交全部步骤；非空更新会保留遗漏的已完成步骤，空数组明确清空清单。",
+                        "description": "完整的用户可见顶层计划快照。默认 3-7 项，最多 12 项。",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "content": {
-                                    "type": "string",
-                                    "description": "祈使句描述的步骤，例如 'Run tests'"
-                                },
-                                "activeForm": {
-                                    "type": "string",
-                                    "description": "in_progress 状态下展示的进行时形式，例如 'Running tests'"
-                                },
+                                "itemId": { "type": "string", "description": "稳定计划项 ID。首次创建可省略由后端生成；后续更新必须原样传回。" },
+                                "step": { "type": "string", "description": "简短、可执行、可验证的步骤标题，使用计划 language。" },
                                 "status": {
                                     "type": "string",
-                                    "enum": ["pending", "in_progress", "completed"],
+                                    "enum": ["pending", "in_progress", "completed", "blocked", "canceled"],
                                     "description": "步骤状态。同时只允许有一个步骤处于 in_progress。"
                                 }
                             },
-                            "required": ["content", "activeForm", "status"]
+                            "required": ["step", "status"]
                         }
                     }
                 },
-                "required": ["todos"]
+                "required": ["expectedRevision", "language", "plan"]
             }),
             Self::MemoryWrite => serde_json::json!({
                 "type": "object",

@@ -94,8 +94,29 @@ assert.match(
 );
 assert.match(
   messageItemSource,
-  /@media \(hover: none\), \(pointer: coarse\) \{[\s\S]*?\.message-actions \{[\s\S]*?opacity: 1;[\s\S]*?pointer-events: auto;/,
-  '移动端消息操作必须固定显示，不能依赖悬停',
+  /\{:else if isUser\}[\s\S]*?messageItem\.copyTitle/,
+  '复制入口必须只存在于用户消息分支',
+);
+assert.equal(
+  (messageItemSource.match(/messageItem\.copyTitle/g) || []).length,
+  1,
+  '系统通知和助手消息不得显示复制入口',
+);
+assert.match(
+  messageItemSource,
+  /\.user-message-actions\s*\{[\s\S]*?display:\s*flex;[\s\S]*?justify-content:\s*flex-end;[\s\S]*?margin-bottom:/,
+  '用户消息操作区必须在气泡上方正常占位，并与气泡右边缘对齐',
+);
+const messageActionsStyle = messageItemSource.match(/\.user-message-actions\s*\{([\s\S]*?)\n  \}/)?.[1] || '';
+assert.doesNotMatch(
+  messageActionsStyle,
+  /position:\s*absolute|top:|right:|border:\s*1px|box-shadow:|transform:|opacity:|pointer-events:/,
+  '消息操作区不得绝对定位覆盖气泡，也不得渲染为悬浮窗',
+);
+assert.doesNotMatch(
+  messageItemSource,
+  /\.message-item:hover\s*>\s*\.message-actions|\.system-notice:hover\s*>\s*\.message-actions/,
+  '消息操作区不得通过消息悬停状态控制显示',
 );
 assert.match(
   bridgeSource,

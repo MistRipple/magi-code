@@ -6,7 +6,8 @@
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import type {
-    GoalTodoItemDto,
+    PlanItemDto,
+    SessionPlanDto,
     SessionGoalDto,
   } from '../shared/rust-backend-types';
   import type { IconName } from '../lib/icons';
@@ -25,11 +26,11 @@
 
   let goalRequestScope = '';
   let goalDrawerExpanded = $state(false);
-  let todoDrawerExpanded = $state(true);
+  let planDrawerExpanded = $state(true);
   let isEditingGoal = $state(false);
   let goalObjectiveDraft = $state('');
   let goalActionLoading = $state<'save' | 'pause' | 'resume' | 'clear' | null>(null);
-  let todoClearLoading = $state(false);
+  let planClearLoading = $state(false);
 
   $effect(() => {
     ensureGoalState(currentSessionId, currentWorkspaceId, currentWorkspacePathValue());
@@ -37,8 +38,9 @@
 
   const goalState = $derived(getGoalState(currentSessionId, currentWorkspaceId));
   const currentGoal = $derived<SessionGoalDto | null>(goalState.response?.goal ?? null);
-  const currentGoalTodos = $derived<GoalTodoItemDto[]>(
-    Array.isArray(goalState.response?.todoItems) ? goalState.response.todoItems : []
+  const currentPlan = $derived<SessionPlanDto | null>(goalState.response?.plan ?? null);
+  const currentPlanItems = $derived<PlanItemDto[]>(
+    Array.isArray(currentPlan?.items) ? currentPlan.items : []
   );
 
   $effect(() => {
@@ -57,17 +59,14 @@
     }
     goalRequestScope = scope;
     ensureGoalState(sessionId, workspaceId, workspacePath);
-    const refresh = () => void refreshCurrentGoal(sessionId, workspaceId, workspacePath);
-    refresh();
-    const timer = setInterval(refresh, 3000);
-    return () => clearInterval(timer);
+    void refreshCurrentGoal(sessionId, workspaceId, workspacePath);
   });
 
-  const hasGoalTodos = $derived(currentGoalTodos.length > 0);
-  const todoSummary = $derived.by(() => buildGoalTodoSummary(currentGoalTodos));
-  const todoProgressPercent = $derived.by(() => {
-    if (todoSummary.total <= 0) return 0;
-    return Math.min(100, Math.max(0, Math.round((todoSummary.completed / todoSummary.total) * 100)));
+  const hasCurrentPlan = $derived(currentPlanItems.length > 0);
+  const planSummary = $derived.by(() => buildPlanSummary(currentPlanItems));
+  const planProgressPercent = $derived.by(() => {
+    if (planSummary.total <= 0) return 0;
+    return Math.min(100, Math.max(0, Math.round((planSummary.completed / planSummary.total) * 100)));
   });
   function createClient(): RustDaemonClient {
     return new RustDaemonClient(resolveAgentBaseUrl());
@@ -108,41 +107,41 @@
     return workspaceId ? `${workspaceId}\u0000${sessionId}` : `session:${sessionId}`;
   }
 
-  function buildGoalTodoSummary(items: GoalTodoItemDto[]) {
+  function buildPlanSummary(items: PlanItemDto[]) {
     return {
       total: items.length,
       completed: items.filter((item) => item.status === 'completed').length,
       running: items.filter((item) => item.status === 'in_progress').length,
       pending: items.filter((item) => item.status === 'pending').length,
+      blocked: items.filter((item) => item.status === 'blocked').length,
+      canceled: items.filter((item) => item.status === 'canceled').length,
     };
   }
 
-  function goalTodoStatusLabel(status: GoalTodoItemDto['status']): string {
+  function planItemStatusLabel(status: PlanItemDto['status']): string {
     switch (status) {
-      case 'completed': return i18n.t('goalPanel.todo.status.completed');
-      case 'in_progress': return i18n.t('goalPanel.todo.status.inProgress');
-      case 'pending': return i18n.t('goalPanel.todo.status.pending');
+      case 'completed': return i18n.t('goalPanel.plan.status.completed');
+      case 'in_progress': return i18n.t('goalPanel.plan.status.inProgress');
+      case 'pending': return i18n.t('goalPanel.plan.status.pending');
+      case 'blocked': return i18n.t('goalPanel.plan.status.blocked');
+      case 'canceled': return i18n.t('goalPanel.plan.status.canceled');
       default: return status;
     }
   }
 
-  function goalTodoStatusIcon(status: GoalTodoItemDto['status']): IconName {
+  function planItemStatusIcon(status: PlanItemDto['status']): IconName {
     switch (status) {
       case 'completed': return 'check-circle';
       case 'in_progress': return 'loader';
       case 'pending': return 'circle';
+      case 'blocked': return 'alert-triangle';
+      case 'canceled': return 'x-circle';
       default: return 'circle';
     }
   }
 
-  function goalTodoMeta(todo: GoalTodoItemDto): string {
-    if (todo.status !== 'in_progress') {
-      return goalTodoStatusLabel(todo.status);
-    }
-    const activeForm = todo.activeForm.trim();
-    return activeForm && activeForm !== todo.content.trim()
-      ? activeForm
-      : goalTodoStatusLabel(todo.status);
+  function planItemMeta(item: PlanItemDto): string {
+    return planItemStatusLabel(item.status);
   }
 
   function goalStatusLabel(status: string): string {
@@ -309,7 +308,7 @@
         workspaceId: response.workspaceId,
         workspacePath: response.workspacePath,
         goal: null,
-        todoItems: [],
+        plan: null,
       });
       isEditingGoal = false;
       addToast('info', i18n.t('goalPanel.action.goalCleared'));
@@ -319,77 +318,77 @@
     });
   }
 
-  async function clearTodos(): Promise<void> {
-    if (!hasGoalTodos || todoClearLoading) return;
-    todoClearLoading = true;
+  async function clearPlan(): Promise<void> {
+    if (!hasCurrentPlan || planClearLoading) return;
+    planClearLoading = true;
     try {
-      const response = await createClient().clearCurrentGoalTodos(goalActionRequest());
+      const response = await createClient().clearCurrentPlan(goalActionRequest());
       applyCurrentGoalResponse(response);
-      todoDrawerExpanded = false;
+      planDrawerExpanded = false;
     } catch (err) {
-      console.warn('[GoalRunDrawers] todo clear failed:', err);
-      addToast('error', i18n.t('goalPanel.action.todoClearFailed'));
+      console.warn('[GoalRunDrawers] plan clear failed:', err);
+      addToast('error', i18n.t('goalPanel.action.planClearFailed'));
     } finally {
-      todoClearLoading = false;
+      planClearLoading = false;
     }
   }
 
 </script>
 
-{#if currentGoal || hasGoalTodos}
+{#if currentGoal || hasCurrentPlan}
 <div class="goal-run-drawers">
-  {#if hasGoalTodos}
-    <section class="run-drawer todo-panel" data-testid="todo-card" aria-label={i18n.t('goalPanel.todo.title')}>
+  {#if hasCurrentPlan}
+    <section class="run-drawer plan-panel" data-testid="plan-card" aria-label={i18n.t('goalPanel.plan.title')}>
       <div class="run-drawer-header">
         <button
           type="button"
           class="run-drawer-toggle"
-          aria-expanded={todoDrawerExpanded}
-          onclick={() => todoDrawerExpanded = !todoDrawerExpanded}
+          aria-expanded={planDrawerExpanded}
+          onclick={() => planDrawerExpanded = !planDrawerExpanded}
         >
-          <span class="drawer-leading-icon drawer-leading-icon--todo"><Icon name="list" size={14} /></span>
-          <span class="run-drawer-title">{i18n.t('goalPanel.todo.title')}</span>
+          <span class="drawer-leading-icon drawer-leading-icon--plan"><Icon name="list" size={14} /></span>
+          <span class="run-drawer-title">{i18n.t('goalPanel.plan.title')}</span>
           <span class="run-progress-count">
             {i18n.t('goalPanel.progress.completedCount', {
-              completed: todoSummary.completed,
-              total: todoSummary.total,
+              completed: planSummary.completed,
+              total: planSummary.total,
             })}
           </span>
-          {#if todoSummary.running > 0}
-            <span class="todo-running">{i18n.t('goalPanel.todo.runningCount', { count: todoSummary.running })}</span>
+          {#if planSummary.running > 0}
+            <span class="plan-running">{i18n.t('goalPanel.plan.runningCount', { count: planSummary.running })}</span>
           {/if}
-          <Icon name="chevron-right" size={13} class={todoDrawerExpanded ? 'drawer-chevron drawer-chevron--open' : 'drawer-chevron'} />
+          <Icon name="chevron-right" size={13} class={planDrawerExpanded ? 'drawer-chevron drawer-chevron--open' : 'drawer-chevron'} />
         </button>
-        {#if todoSummary.total > 0 && todoSummary.completed === todoSummary.total}
+        {#if planSummary.total > 0 && planSummary.completed === planSummary.total}
           <div class="goal-actions">
             <button
               type="button"
               class="icon-action icon-action--danger"
-              disabled={todoClearLoading}
-              onclick={clearTodos}
-              title={i18n.t('goalPanel.action.clearTodoTitle')}
-              aria-label={i18n.t('goalPanel.action.clearTodoTitle')}
+              disabled={planClearLoading}
+              onclick={clearPlan}
+              title={i18n.t('goalPanel.action.clearPlanTitle')}
+              aria-label={i18n.t('goalPanel.action.clearPlanTitle')}
             >
-              <Icon name={todoClearLoading ? 'loader' : 'trash'} size={13} class={todoClearLoading ? 'spinning' : ''} />
+              <Icon name={planClearLoading ? 'loader' : 'trash'} size={13} class={planClearLoading ? 'spinning' : ''} />
             </button>
           </div>
         {/if}
       </div>
 
-      {#if todoDrawerExpanded}
-        <div class="run-progress-bar todo-progress-bar" aria-hidden="true">
-          <span style="width: {todoProgressPercent}%"></span>
+      {#if planDrawerExpanded}
+        <div class="run-progress-bar plan-progress-bar" aria-hidden="true">
+          <span style="width: {planProgressPercent}%"></span>
         </div>
-        <div class="run-list todo-list" role="list">
-          {#each currentGoalTodos as todo, index (`${index}:${todo.content}`)}
-            {@const todoIcon = goalTodoStatusIcon(todo.status)}
-            <div class="run-row run-row--todo run-row--{todo.status}" role="listitem">
-              <span class="run-row-icon status-icon--{todo.status}" aria-label={goalTodoStatusLabel(todo.status)}>
-                <Icon name={todoIcon} size={15} class={todo.status === 'in_progress' ? 'spinning' : ''} />
+        <div class="run-list plan-list" role="list">
+          {#each currentPlanItems as item (item.itemId)}
+            {@const planIcon = planItemStatusIcon(item.status)}
+            <div class="run-row run-row--plan run-row--{item.status}" role="listitem">
+              <span class="run-row-icon status-icon--{item.status}" aria-label={planItemStatusLabel(item.status)}>
+                <Icon name={planIcon} size={15} class={item.status === 'in_progress' ? 'spinning' : ''} />
               </span>
               <span class="run-row-main">
-                <span class="run-row-title">{todo.content}</span>
-                <span class="run-row-meta">{goalTodoMeta(todo)}</span>
+                <span class="run-row-title">{item.title}</span>
+                <span class="run-row-meta">{planItemMeta(item)}</span>
               </span>
             </div>
           {/each}
@@ -573,7 +572,7 @@
     --goal-tone: var(--success);
   }
 
-  .todo-panel {
+  .plan-panel {
     order: 1;
   }
 
@@ -633,7 +632,7 @@
     color: inherit;
   }
 
-  .drawer-leading-icon--todo {
+  .drawer-leading-icon--plan {
     background: color-mix(in srgb, var(--success) 10%, transparent);
     color: color-mix(in srgb, var(--success) 82%, var(--foreground));
   }
@@ -872,7 +871,7 @@
     white-space: nowrap;
   }
 
-  .todo-running {
+  .plan-running {
     flex: 0 0 auto;
     color: var(--primary);
     font-size: var(--text-2xs);
@@ -896,7 +895,7 @@
     transition: width var(--transition-normal);
   }
 
-  .todo-progress-bar span {
+  .plan-progress-bar span {
     background: var(--success);
   }
 
@@ -907,7 +906,7 @@
     min-width: 0;
   }
 
-  .todo-list {
+  .plan-list {
     max-height: min(32vh, 280px);
     overflow-y: auto;
     overscroll-behavior: contain;
@@ -926,7 +925,7 @@
     color: var(--foreground);
   }
 
-  .run-row--todo {
+  .run-row--plan {
     grid-template-columns: 24px minmax(0, 1fr);
   }
 
@@ -999,7 +998,7 @@
     }
 
     .run-progress-count,
-    .todo-running,
+    .plan-running,
     .goal-meta {
       display: none;
     }

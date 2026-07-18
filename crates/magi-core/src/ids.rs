@@ -44,6 +44,8 @@ define_id!(WorkerId);
 define_id!(ToolCallId);
 define_id!(EventId);
 define_id!(GoalId);
+define_id!(PlanId);
+define_id!(PlanItemId);
 define_id!(TaskId);
 define_id!(LeaseId);
 // P6 Thread 原语（Y 方案）：同 mission + 同 role 持续存在的执行 thread。

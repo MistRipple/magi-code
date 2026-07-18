@@ -326,6 +326,7 @@ async fn restart_task(
         workspace_path: Some(scope.workspace_path.clone()),
         text: Some(restart_text),
         skill_name: restart_active_skill_id(&root_task),
+        locale: None,
         goal_mode: false,
         images: Vec::new(),
         context_references: Vec::new(),

@@ -575,10 +575,10 @@ export class RustDaemonClient {
     return this.postJson<GoalMutationResponseDto>('/api/goals/current/clear', request);
   }
 
-  public async clearCurrentGoalTodos(
+  public async clearCurrentPlan(
     request: GoalActionRequestDto,
   ): Promise<CurrentGoalResponseDto> {
-    return this.postJson<CurrentGoalResponseDto>('/api/goals/current/todos/clear', request);
+    return this.postJson<CurrentGoalResponseDto>('/api/goals/current/plan/clear', request);
   }
 
   public async getAgentRunProjection(

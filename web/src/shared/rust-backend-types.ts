@@ -1388,12 +1388,25 @@ export interface SessionGoalDto {
   updatedAt: number;
 }
 
-export type GoalTodoStatus = 'pending' | 'in_progress' | 'completed';
+export type PlanItemStatus = 'pending' | 'in_progress' | 'completed' | 'blocked' | 'canceled';
+export type PlanState = 'active' | 'paused' | 'completed' | 'canceled';
 
-export interface GoalTodoItemDto {
-  content: string;
-  activeForm: string;
-  status: GoalTodoStatus;
+export interface PlanItemDto {
+  itemId: string;
+  title: string;
+  status: PlanItemStatus;
+}
+
+export interface SessionPlanDto {
+  planId: string;
+  sessionId: string;
+  revision: number;
+  language: string;
+  state: PlanState;
+  items: PlanItemDto[];
+  taskBindings: Record<string, string>;
+  taskStatuses: Record<string, 'pending' | 'running' | 'completed' | 'failed' | 'killed'>;
+  updatedAt: number;
 }
 
 export interface CurrentGoalResponseDto {
@@ -1401,7 +1414,7 @@ export interface CurrentGoalResponseDto {
   workspaceId: string;
   workspacePath: string;
   goal?: SessionGoalDto | null;
-  todoItems: GoalTodoItemDto[];
+  plan?: SessionPlanDto | null;
 }
 
 export interface GoalActionRequestDto {

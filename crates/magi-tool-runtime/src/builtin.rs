@@ -174,7 +174,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
             | BuiltinToolName::UpdateGoal => execute_orchestration_only(self.name, input),
             BuiltinToolName::AgentSpawn
             | BuiltinToolName::AgentWait
-            | BuiltinToolName::TodoWrite
+            | BuiltinToolName::UpdatePlan
             | BuiltinToolName::MemoryWrite => execute_orchestration_only(self.name, input),
         }
     }

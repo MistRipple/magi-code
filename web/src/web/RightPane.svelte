@@ -7,11 +7,13 @@
   import AgentTabContent from '../components/tabs/AgentTabContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
+    isHtmlFile,
     isKnownBinaryFile,
     isMarkdownFile,
     isWordFile,
     isImageFile,
   } from '../lib/file-preview-utils';
+  import { vscode } from '../lib/vscode-bridge';
   import {
     rightPaneState,
     getRightPaneState,
@@ -25,6 +27,7 @@
   import {
     getAgentChangeDiff,
     getAgentFilePreview,
+    agentNavigationUrl,
     agentUrl,
     buildFilePreviewQuery,
   } from './agent-api';
@@ -62,6 +65,10 @@
   let fetchingDiffFlags = $state<Record<string, boolean>>({});
   /** filepath → diff 拉取出错时的错误信息 */
   let fetchDiffErrors = $state<Record<string, string>>({});
+  /** 每个文档 Tab 独立保存预览/源码模式，避免切换 Tab 时相互污染。 */
+  let documentModes = $state<Record<string, 'rendered' | 'raw'>>({});
+  /** HTML iframe 刷新序号，仅重载当前 Tab。 */
+  let htmlPreviewRevisions = $state<Record<string, number>>({});
 
   // 工作区内容变更（如切分支）后，清空已拉取的文件内容缓存，触发 $effect 按新分支重新拉取。
   onMount(() => {
@@ -132,6 +139,8 @@
     fetchedDiffs = pruneRecord(fetchedDiffs, retainedKeys);
     fetchDiffErrors = pruneRecord(fetchDiffErrors, retainedKeys);
     fetchingDiffFlags = pruneRecord(fetchingDiffFlags, retainedKeys);
+    documentModes = pruneRecord(documentModes, retainedKeys);
+    htmlPreviewRevisions = pruneRecord(htmlPreviewRevisions, retainedKeys);
   });
 
   /**
@@ -262,6 +271,8 @@
   // ============ 文件类型派生 ============
   const displayPath = $derived(getDisplayPath(activeDisplayFilePath, workspaceRoot));
   const markdownFile = $derived(isMarkdownFile(activeDisplayFilePath));
+  const htmlFile = $derived(isHtmlFile(activeDisplayFilePath));
+  const documentFile = $derived(markdownFile || htmlFile);
   const wordFile = $derived(isWordFile(activeDisplayFilePath));
   const imageFile = $derived(activeDisplayFilePath ? isImageFile(activeDisplayFilePath) : false);
   // 图片虽属二进制，但走专门的 <img> 预览分支，故从 binaryFile（元信息兜底）排除。
@@ -349,8 +360,36 @@
     (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
   }
 
-  // ============ Markdown 渲染/源码切换 ============
-  let markdownMode = $state<'rendered' | 'raw'>('rendered');
+  // ============ Markdown / HTML 预览与源码切换 ============
+  const documentMode = $derived.by<'rendered' | 'raw'>(() => {
+    if (!activeContentCacheKey) return 'rendered';
+    return documentModes[activeContentCacheKey] ?? 'rendered';
+  });
+  function setDocumentMode(mode: 'rendered' | 'raw'): void {
+    if (!activeContentCacheKey) return;
+    documentModes = { ...documentModes, [activeContentCacheKey]: mode };
+  }
+
+  const htmlPreviewUrl = $derived.by(() => {
+    if (!htmlFile || !activeFilePreviewQuery) return '';
+    const url = new URL(agentNavigationUrl('/api/files/site-open', activeFilePreviewQuery));
+    const revision = activeContentCacheKey ? (htmlPreviewRevisions[activeContentCacheKey] ?? 0) : 0;
+    url.searchParams.set('_previewRevision', String(revision));
+    return url.toString();
+  });
+
+  function refreshHtmlPreview(): void {
+    if (!activeContentCacheKey) return;
+    htmlPreviewRevisions = {
+      ...htmlPreviewRevisions,
+      [activeContentCacheKey]: (htmlPreviewRevisions[activeContentCacheKey] ?? 0) + 1,
+    };
+  }
+
+  function openHtmlInBrowser(): void {
+    if (!htmlPreviewUrl) return;
+    vscode.postMessage({ type: 'openLink', url: htmlPreviewUrl });
+  }
   const rawPreviewContent = $derived(previewContent ?? '');
   const truncatedContent = $derived(
     rawPreviewContent.length > 500_000 ? rawPreviewContent.slice(0, 100_000) : rawPreviewContent,
@@ -376,7 +415,11 @@
   const codeMode = $derived(
     !previewLoading && !previewError && !wordFile && !binaryFile
       && !largeTextFile && !symlinkFile && !specialFile
-      && (hasDiff || (hasContent && (!markdownFile || markdownMode === 'raw'))),
+      && (hasDiff || (hasContent && (!documentFile || documentMode === 'raw'))),
+  );
+  const htmlPreviewMode = $derived(
+    htmlFile && documentMode === 'rendered' && !previewLoading && !previewError
+      && !hasDiff && !wordFile && !binaryFile && !largeTextFile && !symlinkFile && !specialFile,
   );
 
   // ============ Tab 视觉 ============
@@ -582,31 +625,54 @@
     </div>
   </header>
 
-  <!-- 当前 code tab 的副标题：路径 + Markdown 渲染/源码切换 -->
+  <!-- 当前 code tab 的副标题：路径 + 文档预览操作 -->
   {#if activeTab && activeTab.kind === 'code'}
     <div class="right-pane-subbar">
       <div class="right-pane-path" title={activeDisplayFilePath}>{displayPath}</div>
-      {#if markdownFile && !hasDiff && !previewLoading && !previewError && !wordFile && !binaryFile && !largeTextFile && !symlinkFile && !specialFile && hasContent}
-        <div class="right-pane-markdown-modes" role="tablist" aria-label={i18n.t('web.filePreviewTitle')}>
-          <button
-            type="button"
-            class="right-pane-markdown-mode"
-            class:active={markdownMode === 'rendered'}
-            onclick={() => markdownMode = 'rendered'}
-          >{i18n.t('web.filePreviewRendered')}</button>
-          <button
-            type="button"
-            class="right-pane-markdown-mode"
-            class:active={markdownMode === 'raw'}
-            onclick={() => markdownMode = 'raw'}
-          >{i18n.t('web.filePreviewRaw')}</button>
+      {#if documentFile && !hasDiff && !previewLoading && !previewError && !wordFile && !binaryFile && !largeTextFile && !symlinkFile && !specialFile && (htmlFile || hasContent)}
+        <div class="right-pane-document-actions">
+          <div class="right-pane-document-modes" role="tablist" aria-label={i18n.t('web.filePreviewTitle')}>
+            <button
+              type="button"
+              class="right-pane-document-mode"
+              class:active={documentMode === 'rendered'}
+              onclick={() => setDocumentMode('rendered')}
+            >{i18n.t('web.filePreviewRendered')}</button>
+            <button
+              type="button"
+              class="right-pane-document-mode"
+              class:active={documentMode === 'raw'}
+              onclick={() => setDocumentMode('raw')}
+            >{i18n.t('web.filePreviewRaw')}</button>
+          </div>
+          {#if htmlFile}
+            <span class="right-pane-document-action-divider" aria-hidden="true"></span>
+            <button
+              type="button"
+              class="right-pane-document-icon-action"
+              onclick={refreshHtmlPreview}
+              title={i18n.t('web.filePreviewRefresh')}
+              aria-label={i18n.t('web.filePreviewRefresh')}
+            ><Icon name="refresh" size={13} /></button>
+            <button
+              type="button"
+              class="right-pane-document-icon-action"
+              onclick={openHtmlInBrowser}
+              title={i18n.t('web.filePreviewOpenBrowser')}
+              aria-label={i18n.t('web.filePreviewOpenBrowser')}
+            ><Icon name="external-link" size={13} /></button>
+          {/if}
         </div>
       {/if}
     </div>
   {/if}
 
   <!-- Body：按 activeTab 路由 -->
-  <div class="right-pane-body" class:right-pane-body--code={codeMode}>
+  <div
+    class="right-pane-body"
+    class:right-pane-body--code={codeMode}
+    class:right-pane-body--html={htmlPreviewMode}
+  >
     {#if !activeTab}
       <div class="right-pane-state">
         <Icon name="sidebar-toggle" size={22} />
@@ -705,15 +771,30 @@
       <div class="right-pane-diff" aria-label={displayPath}>
         <DiffCodeBlock diff={diffCode} ariaLabel={displayPath} fill={true} />
       </div>
+    {:else if htmlPreviewMode}
+      <iframe
+        class="right-pane-html-preview"
+        src={htmlPreviewUrl}
+        title={displayPath}
+        sandbox="allow-scripts allow-forms allow-modals"
+      ></iframe>
     {:else if !hasContent}
       <div class="right-pane-state">{i18n.t('edits.preview.empty')}</div>
     {:else}
       {#if isLargeFile}
         <div class="right-pane-notice">{i18n.t('web.filePreviewLargeFile')}</div>
       {/if}
-      {#if markdownFile && markdownMode === 'rendered'}
+      {#if markdownFile && documentMode === 'rendered'}
         <div class="right-pane-markdown">
-          <MarkdownContent content={truncatedContent} />
+          <MarkdownContent
+            content={truncatedContent}
+            baseFilePath={activeFilePath}
+            filePreviewScope={{
+              workspaceId: activeCodePayload?.workspaceId,
+              workspacePath: activeCodePayload?.workspacePath || workspaceRoot,
+              sessionId: activeCodePayload?.sessionId,
+            }}
+          />
         </div>
       {:else}
         <div class="right-pane-source" aria-label={displayPath}>
@@ -883,7 +964,7 @@
     opacity: 1;
   }
 
-  /* ============ 副标题（路径 + Markdown 切换） ============ */
+  /* ============ 副标题（路径 + 文档预览操作） ============ */
   .right-pane-subbar {
     display: flex;
     align-items: center;
@@ -905,13 +986,15 @@
     font-family: var(--font-mono);
   }
 
-  .right-pane-markdown-modes {
+  .right-pane-document-actions,
+  .right-pane-document-modes {
     display: inline-flex;
+    align-items: center;
     gap: 2px;
     flex-shrink: 0;
   }
 
-  .right-pane-markdown-mode {
+  .right-pane-document-mode {
     padding: 3px 10px;
     border: none;
     border-radius: var(--radius-full);
@@ -922,8 +1005,35 @@
     transition: background var(--transition-fast), color var(--transition-fast);
   }
 
-  .right-pane-markdown-mode:hover,
-  .right-pane-markdown-mode.active {
+  .right-pane-document-mode:hover,
+  .right-pane-document-mode.active {
+    background: color-mix(in srgb, var(--surface-selected) 72%, transparent);
+    color: var(--foreground);
+  }
+
+  .right-pane-document-action-divider {
+    width: 1px;
+    height: 14px;
+    margin: 0 4px;
+    background: var(--border);
+  }
+
+  .right-pane-document-icon-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+
+  .right-pane-document-icon-action:hover {
     background: color-mix(in srgb, var(--surface-selected) 72%, transparent);
     color: var(--foreground);
   }
@@ -941,6 +1051,20 @@
     flex-direction: column;
     overflow: hidden;
     padding: 0;
+  }
+
+  .right-pane-body--html {
+    overflow: hidden;
+    padding: 0;
+    background: #fff;
+  }
+
+  .right-pane-html-preview {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: #fff;
   }
 
   .right-pane-source {

@@ -41,6 +41,8 @@ pub struct SessionTurnRequestDto {
     pub text: Option<String>,
     pub skill_name: Option<String>,
     #[serde(default)]
+    pub locale: Option<String>,
+    #[serde(default)]
     pub goal_mode: bool,
     #[serde(default)]
     pub images: Vec<SessionTurnImageDto>,
@@ -66,6 +68,21 @@ pub struct SessionTurnRequestDto {
 }
 
 impl SessionTurnRequestDto {
+    pub fn product_locale(&self) -> String {
+        self.locale
+            .as_deref()
+            .map(str::trim)
+            .filter(|locale| !locale.is_empty())
+            .filter(|locale| {
+                locale.len() <= 35
+                    && locale.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || character == '-'
+                    })
+            })
+            .unwrap_or("zh-CN")
+            .to_string()
+    }
+
     pub fn validate_context_references(&mut self) -> Result<Vec<SessionContextReference>, String> {
         const MAX_CONTEXT_REFERENCES: usize = 20;
         if self.context_references.len() > MAX_CONTEXT_REFERENCES {
@@ -402,6 +419,7 @@ mod tests {
             workspace_path: None,
             text: Some("请分析项目".to_string()),
             skill_name: None,
+            locale: None,
             goal_mode: false,
             images: Vec::new(),
             context_references: Vec::new(),

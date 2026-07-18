@@ -54,19 +54,19 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
             .and_then(|task_store| task_store.get_task(root_task_id))
             .is_some_and(|task| task.status == magi_core::TaskStatus::Completed);
         if runner_status != "completed" && !root_completed {
-            let todo_ledger =
-                magi_todo_ledger::TodoLedger::new(state.session_store.clone(), session_id.clone());
-            match todo_ledger.pause_in_progress() {
-                Ok(true) => {
+            let plan_store =
+                magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
+            match plan_store.pause() {
+                Ok(Some(_)) => {
                     if let Err(error) =
-                        state.persist_session_state_checkpoint("session_task_turn_todo_paused")
+                        state.persist_session_state_checkpoint("session_task_turn_plan_paused")
                     {
-                        tracing::warn!(?error, "任务失败后 TodoLedger 暂停状态持久化失败");
+                        tracing::warn!(?error, "任务失败后 PlanStore 暂停状态持久化失败");
                     }
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!(session_id = %session_id, %error, "任务失败后暂停 TodoLedger 进行项失败");
+                    tracing::warn!(session_id = %session_id, %error, "任务失败后暂停 PlanStore 进行项失败");
                 }
             }
         }
@@ -149,9 +149,8 @@ mod tests {
                 },
             )
             .expect("active chain should persist");
-        let todo_ledger =
-            magi_todo_ledger::TodoLedger::new(session_store.clone(), session_id.clone());
-        todo_ledger
+        let plan_store = magi_plan::PlanStore::new(session_store.clone(), session_id.clone());
+        plan_store
             .write(vec![magi_core::TodoItem::new(
                 "执行当前步骤",
                 "正在执行当前步骤",
@@ -199,7 +198,7 @@ mod tests {
             "error",
         ));
         assert_eq!(
-            todo_ledger.snapshot()[0].status,
+            plan_store.snapshot()[0].status,
             magi_core::TodoStatus::Pending
         );
     }

@@ -2340,6 +2340,7 @@ dependencies = [
  "magi-memory-store",
  "magi-mission-metrics",
  "magi-orchestrator",
+ "magi-plan",
  "magi-process",
  "magi-safety-gate",
  "magi-session-store",
@@ -2347,7 +2348,6 @@ dependencies = [
  "magi-skill-runtime",
  "magi-snapshot",
  "magi-spawn-graph",
- "magi-todo-ledger",
  "magi-tool-runtime",
  "magi-usage-authority",
  "magi-worker-runtime",
@@ -2411,6 +2411,7 @@ dependencies = [
  "magi-mission-metrics",
  "magi-orchestrator",
  "magi-permissions",
+ "magi-plan",
  "magi-project-memory",
  "magi-safety-gate",
  "magi-session-store",
@@ -2418,7 +2419,6 @@ dependencies = [
  "magi-skill-runtime",
  "magi-snapshot",
  "magi-spawn-graph",
- "magi-todo-ledger",
  "magi-tool-runtime",
  "magi-usage-authority",
  "magi-worker-runtime",
@@ -2458,6 +2458,7 @@ dependencies = [
  "magi-knowledge-store",
  "magi-memory-store",
  "magi-orchestrator",
+ "magi-plan",
  "magi-process",
  "magi-session-store",
  "magi-settings-store",
@@ -2598,6 +2599,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "magi-plan"
+version = "3.0.9"
+dependencies = [
+ "magi-core",
+ "magi-event-bus",
+ "magi-session-store",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "magi-process"
 version = "3.0.9"
 dependencies = [
@@ -2690,18 +2703,6 @@ name = "magi-spawn-graph"
 version = "3.0.9"
 dependencies = [
  "magi-core",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "magi-todo-ledger"
-version = "3.0.9"
-dependencies = [
- "magi-core",
- "magi-event-bus",
- "magi-session-store",
- "serde",
- "serde_json",
  "thiserror 2.0.18",
 ]
 

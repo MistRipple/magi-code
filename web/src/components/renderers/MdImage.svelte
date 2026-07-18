@@ -3,16 +3,32 @@
   接收 @humanspeak/svelte-markdown 传入的 href + title + text props
 -->
 <script lang="ts">
+  import { getContext } from 'svelte';
+  import { agentUrl, buildFilePreviewQuery } from '../../web/agent-api';
+  import {
+    MARKDOWN_IMAGE_CONTEXT,
+    markdownImageScope,
+    resolveMarkdownImageFilePath,
+    type MarkdownImageContext,
+  } from '../../lib/markdown-image';
+
   interface Props {
     href?: string;
     title?: string;
     text?: string;
   }
   const { href = '', title = undefined, text = '' }: Props = $props();
+  const imageContext = getContext<MarkdownImageContext | undefined>(MARKDOWN_IMAGE_CONTEXT);
+  const imageSource = $derived.by(() => {
+    const localPath = resolveMarkdownImageFilePath(href, imageContext?.baseFilePath);
+    if (!localPath) return href;
+    const scope = markdownImageScope(imageContext?.readFilePreviewScope);
+    return agentUrl('/api/files/raw', buildFilePreviewQuery(localPath, scope));
+  });
 </script>
 
 <img
-  src={href}
+  src={imageSource}
   alt={text}
   {title}
   loading="lazy"
@@ -26,4 +42,3 @@
     border-radius: var(--radius-sm);
   }
 </style>
-

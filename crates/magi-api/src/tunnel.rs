@@ -107,6 +107,7 @@ struct TunnelInner {
     child: Option<AsyncManagedChild>,
     local_port: u16,
     binding: RemoteAccessBinding,
+    site_preview_secret: String,
 }
 
 #[derive(Clone)]
@@ -116,12 +117,14 @@ pub struct TunnelManager {
 
 impl TunnelManager {
     pub fn new(local_port: u16) -> Self {
+        let site_preview_secret = generate_token().expect("初始化文件预览服务需要系统安全随机源");
         Self {
             inner: Arc::new(Mutex::new(TunnelInner {
                 state: TunnelState::default(),
                 child: None,
                 local_port,
                 binding: RemoteAccessBinding::default(),
+                site_preview_secret,
             })),
         }
     }
@@ -142,6 +145,27 @@ impl TunnelManager {
         candidate.is_some_and(|candidate| constant_time_eq(expected, candidate))
     }
 
+    pub async fn site_preview_token(&self, workspace_id: &str) -> String {
+        let inner = self.inner.lock().await;
+        derive_site_preview_token(
+            inner
+                .state
+                .token
+                .as_deref()
+                .unwrap_or(&inner.site_preview_secret),
+            workspace_id,
+        )
+    }
+
+    pub async fn authorize_site_preview_request(
+        &self,
+        workspace_id: &str,
+        candidate: &str,
+    ) -> bool {
+        let expected = self.site_preview_token(workspace_id).await;
+        constant_time_eq(&expected, candidate)
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_token_for_test(local_port: u16, token: &str) -> Self {
         let state = TunnelState {
@@ -154,6 +178,7 @@ impl TunnelManager {
                 child: None,
                 local_port,
                 binding: RemoteAccessBinding::default(),
+                site_preview_secret: "test-site-preview-secret".to_string(),
             })),
         }
     }
@@ -452,6 +477,15 @@ fn generate_token() -> Result<String, getrandom::Error> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+fn derive_site_preview_token(secret: &str, workspace_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"magi-site-preview:v1\0");
+    hasher.update(secret.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(workspace_id.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn constant_time_eq(left: &str, right: &str) -> bool {
     if left.len() != right.len() {
         return false;
@@ -488,6 +522,26 @@ mod tests {
         assert!(!manager.authorize_public_request(Some("wrong-token")).await);
         assert!(!manager.authorize_public_request(None).await);
         assert!(manager.authorize_public_request(Some("secret-token")).await);
+    }
+
+    #[tokio::test]
+    async fn site_preview_tokens_are_scoped_to_workspace_and_current_tunnel_token() {
+        let manager = TunnelManager::new_with_token_for_test(38123, "secret-token");
+        let workspace_a = manager.site_preview_token("workspace-a").await;
+        let workspace_b = manager.site_preview_token("workspace-b").await;
+
+        assert_ne!(workspace_a, workspace_b);
+        assert!(
+            manager
+                .authorize_site_preview_request("workspace-a", &workspace_a)
+                .await
+        );
+        assert!(
+            !manager
+                .authorize_site_preview_request("workspace-b", &workspace_a)
+                .await
+        );
+        assert_eq!(workspace_a.len(), 64);
     }
 
     #[test]

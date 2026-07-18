@@ -4292,7 +4292,7 @@ fn is_write_operation_identifies_correct_tools() {
         BuiltinToolName::AgentSpawn,
         BuiltinToolName::CreateGoal,
         BuiltinToolName::UpdateGoal,
-        BuiltinToolName::TodoWrite,
+        BuiltinToolName::UpdatePlan,
         BuiltinToolName::MemoryWrite,
     ];
     let non_write = [
@@ -4345,7 +4345,7 @@ fn read_only_access_profile_only_blocks_external_side_effect_operations() {
         BuiltinToolName::AgentSpawn,
         BuiltinToolName::CreateGoal,
         BuiltinToolName::UpdateGoal,
-        BuiltinToolName::TodoWrite,
+        BuiltinToolName::UpdatePlan,
     ] {
         assert!(internal.is_write_operation());
         assert!(
@@ -5073,7 +5073,7 @@ fn public_builtin_specs_exclude_shell_internal_process_tools() {
             "update_goal",
             "agent_spawn",
             "agent_wait",
-            "todo_write",
+            "update_plan",
             "memory_write",
         ],
         "public builtin specs must remain the single canonical tool surface"
@@ -5788,7 +5788,7 @@ fn builtin_access_mode_reports_write_tools_correctly() {
         Some(BuiltinToolAccessMode::ExplicitWrite)
     );
     assert_eq!(
-        registry.builtin_access_mode(BuiltinToolName::TodoWrite.as_str()),
+        registry.builtin_access_mode(BuiltinToolName::UpdatePlan.as_str()),
         Some(BuiltinToolAccessMode::ExplicitWrite)
     );
     assert_eq!(

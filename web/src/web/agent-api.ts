@@ -748,6 +748,18 @@ export function agentUrl(pathname: string, query?: string): string {
   return q ? `${base}${pathname}?${q}` : `${base}${pathname}`;
 }
 
+/** 构造可直接交给 iframe / 新窗口导航的 URL，并显式携带公网传输凭据。 */
+export function agentNavigationUrl(pathname: string, query?: string): string {
+  const url = new URL(agentUrl(pathname, query));
+  if (typeof window !== 'undefined') {
+    const tunnelToken = new URL(window.location.href).searchParams.get('tunnel_token')?.trim();
+    if (tunnelToken && !url.searchParams.has('tunnel_token')) {
+      url.searchParams.set('tunnel_token', tunnelToken);
+    }
+  }
+  return url.toString();
+}
+
 export function isWebAgentMode(): boolean {
   if (typeof window === 'undefined') {
     return false;
@@ -1279,6 +1291,7 @@ export async function submitSessionTurn(
   payload: {
     text?: string | null;
     skillName?: string | null;
+    locale?: string;
     goalMode?: boolean;
     images: AgentSessionTurnImagePayload[];
     contextReferences?: Array<{
@@ -1312,6 +1325,7 @@ export async function submitSessionTurn(
         workspacePath: binding.workspacePath || null,
         text: payload.text ?? null,
         skillName: payload.skillName ?? null,
+        locale: payload.locale ?? i18n.locale,
         goalMode: payload.goalMode === true,
         accessProfile: payload.accessProfile ?? null,
         requestId: payload.requestId ?? null,

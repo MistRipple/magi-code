@@ -203,7 +203,7 @@ pub fn execute_task_tool_call_batch(
     conversation_registry: &ConversationRegistry,
     spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
     safety_gate: Option<&magi_safety_gate::SafetyGate>,
-    todo_ledger: &magi_todo_ledger::TodoLedger,
+    plan_store: &magi_plan::PlanStore,
     project_memory: Option<&magi_project_memory::ProjectMemoryStore>,
     task: &magi_core::Task,
     session_id: &SessionId,
@@ -272,7 +272,7 @@ pub fn execute_task_tool_call_batch(
                                 conversation_registry,
                                 spawn_graph,
                                 safety_gate,
-                                todo_ledger,
+                                plan_store,
                                 project_memory,
                                 task,
                                 session_id,
@@ -332,7 +332,7 @@ pub fn execute_task_tool_call_batch(
                                                 conversation_registry,
                                                 spawn_graph,
                                                 safety_gate,
-                                                todo_ledger,
+                                                plan_store,
                                                 project_memory,
                                                 task,
                                                 session_id,
@@ -406,6 +406,7 @@ struct CoordinatorToolContext<'a> {
     execution_registry: &'a TaskExecutionRegistry,
     conversation_registry: &'a ConversationRegistry,
     spawn_graph: &'a Mutex<magi_spawn_graph::SpawnGraph>,
+    plan_store: &'a magi_plan::PlanStore,
     task: &'a magi_core::Task,
     session_id: &'a SessionId,
     workspace_id: &'a Option<WorkspaceId>,
@@ -424,6 +425,7 @@ fn execute_coordinator_tool(
         execution_registry,
         conversation_registry,
         spawn_graph,
+        plan_store,
         task,
         session_id,
         workspace_id,
@@ -464,6 +466,61 @@ fn execute_coordinator_tool(
 
     match tool {
         magi_tool_runtime::BuiltinToolName::AgentSpawn => {
+            let task_name = parsed
+                .get("task_name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !valid_agent_task_name(&task_name) {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "failed",
+                        "error": "agent_spawn task_name 只允许小写字母、数字和下划线，长度必须为 1-48",
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            }
+            let parent_canonical_name = task.canonical_task_name().unwrap_or("/root");
+            let canonical_task_name = format!(
+                "{}/{}",
+                parent_canonical_name.trim_end_matches('/'),
+                task_name
+            );
+            if task_store.get_children(&task.task_id).iter().any(|child| {
+                child.canonical_task_name() == Some(canonical_task_name.as_str())
+            }) {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "failed",
+                        "error": format!("同一父任务下 task_name 已存在: {task_name}"),
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            }
+            let plan_item_id = parsed
+                .get("plan_item_id")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(magi_core::PlanItemId::new);
+            if let Some(plan_item_id) = plan_item_id.as_ref()
+                && !plan_store.has_item(plan_item_id)
+            {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "failed",
+                        "error": format!("agent_spawn plan_item_id 不存在: {plan_item_id}"),
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            }
             let spawnable_role_ids = agent_role_registry.spawnable_agent_role_ids();
             let requested_role = parsed
                 .get("role")
@@ -594,12 +651,15 @@ fn execute_coordinator_tool(
                 required_children: Vec::new(),
                 policy_snapshot: Some(child_policy_snapshot),
                 executor_binding: Some(
-                    TaskExecutorBinding::for_role(&role).with_parallelism_group(
-                        parsed
-                            .get("parallelism_group")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string),
-                    ),
+                    TaskExecutorBinding::for_role(&role)
+                        .with_parallelism_group(
+                            parsed
+                                .get("parallelism_group")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string),
+                        )
+                        .with_canonical_task_name(canonical_task_name.clone())
+                        .with_plan_item_id(plan_item_id.clone()),
                 ),
                 knowledge_refs: Vec::new(),
                 workspace_scope: task.workspace_scope.clone(),
@@ -666,11 +726,44 @@ fn execute_coordinator_tool(
                     );
                 }
             };
+            if let Some(plan_item_id) = plan_item_id.clone() {
+                match plan_store.bind_task(child_id.clone(), plan_item_id) {
+                    Ok(plan) => magi_plan::publish_plan_event(
+                        event_bus,
+                        "session.plan.updated",
+                        &plan,
+                        workspace_id.as_ref(),
+                        Some(&child_id),
+                        Some(&task.mission_id),
+                    ),
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            child_task_id = %child_id,
+                            canonical_task_name,
+                            "agent_spawn 计划绑定失败"
+                        );
+                        let _ = task_store.update_status(&child_id, TaskStatus::Killed);
+                        return (
+                            serde_json::json!({
+                                "tool": tool.as_str(),
+                                "status": "failed",
+                                "error_code": "agent_spawn_plan_binding_failed",
+                                "error": "代理已创建但计划绑定失败，运行已终止",
+                            })
+                            .to_string(),
+                            ExecutionResultStatus::Failed,
+                        );
+                    }
+                }
+            }
             publish_event(
                 "task.coordinator.agent_spawn",
                 serde_json::json!({
                     "parent_task_id": task.task_id.to_string(),
                     "child_task_id": child_id.to_string(),
+                    "canonical_task_name": canonical_task_name,
+                    "plan_item_id": plan_item_id.as_ref().map(ToString::to_string),
                     "role": role,
                     "access_profile": child_access_profile.as_str(),
                     "goal": goal,
@@ -694,6 +787,8 @@ fn execute_coordinator_tool(
                     "tool": tool.as_str(),
                     "status": "started",
                     "child_task_id": child_id.to_string(),
+                    "canonical_task_name": canonical_task_name,
+                    "plan_item_id": plan_item_id.as_ref().map(ToString::to_string),
                     "role": role,
                     "access_profile": child_access_profile.as_str(),
                     "title": child.title,
@@ -725,6 +820,15 @@ fn execute_coordinator_tool(
         }
         _ => unreachable!("execute_coordinator_tool 只接收协调器代理工具变体"),
     }
+}
+
+fn valid_agent_task_name(task_name: &str) -> bool {
+    (1..=48).contains(&task_name.len())
+        && task_name.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || character == '_'
+        })
 }
 
 pub(crate) fn execute_goal_tool(
@@ -1398,7 +1502,7 @@ fn execute_task_tool_call(
     conversation_registry: &ConversationRegistry,
     spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
     safety_gate: Option<&magi_safety_gate::SafetyGate>,
-    todo_ledger: &magi_todo_ledger::TodoLedger,
+    plan_store: &magi_plan::PlanStore,
     project_memory: Option<&magi_project_memory::ProjectMemoryStore>,
     task: &magi_core::Task,
     session_id: &SessionId,
@@ -1409,7 +1513,7 @@ fn execute_task_tool_call(
 ) -> (String, ExecutionResultStatus) {
     // S7-E：协调器工具（agent_spawn）由 orchestration 层拦截，
     // 不进 BuiltinTool::execute —— 它需要 task_store / spawn_graph / event_bus 等上下文。
-    // S9：TodoWrite 同样在此层拦截，因为它要操作 session 维度的 TodoLedger。
+    // S9：UpdatePlan 同样在此层拦截，因为它要操作 session 维度的 PlanStore。
     // S10：MemoryWrite 同样在此层拦截，因为它要操作 workspace 维度的 ProjectMemoryStore。
     if let Some(canonical) =
         magi_tool_runtime::BuiltinToolName::from_name(tool_call.function.name.as_str())
@@ -1468,6 +1572,7 @@ fn execute_task_tool_call(
                     execution_registry,
                     conversation_registry,
                     spawn_graph,
+                    plan_store,
                     task,
                     session_id,
                     workspace_id,
@@ -1476,14 +1581,14 @@ fn execute_task_tool_call(
                 tool_call,
             );
         }
-        if matches!(canonical, magi_tool_runtime::BuiltinToolName::TodoWrite) {
-            return magi_todo_ledger::execute_todo_write_tool(
+        if matches!(canonical, magi_tool_runtime::BuiltinToolName::UpdatePlan) {
+            return magi_plan::execute_update_plan_tool(
                 event_bus,
-                todo_ledger,
+                plan_store,
                 session_id,
                 workspace_id.as_ref(),
-                &task.task_id,
-                &task.mission_id,
+                Some(&task.task_id),
+                Some(&task.mission_id),
                 &tool_call.function.arguments,
             );
         }
@@ -2295,7 +2400,7 @@ mod tests {
             BuiltinToolName::AgentSpawn,
             BuiltinToolName::CreateGoal,
             BuiltinToolName::UpdateGoal,
-            BuiltinToolName::TodoWrite,
+            BuiltinToolName::UpdatePlan,
         ] {
             assert!(
                 task_policy_tool_decision(&task, tool.as_str(), "{}").is_none(),
@@ -2343,7 +2448,7 @@ mod tests {
     }
 
     #[test]
-    fn task_runtime_allows_todo_write_in_read_only_mode() {
+    fn task_runtime_allows_update_plan_in_read_only_mode() {
         let event_bus = InMemoryEventBus::new(16);
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let task_store = TaskStore::new();
@@ -2351,7 +2456,7 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-todo-ledger");
         let session_id = SessionId::new("session-read-only-state-tool");
         let workspace_id = Some(WorkspaceId::new("workspace-read-only-state-tool"));
         session_store
@@ -2369,7 +2474,7 @@ mod tests {
             id: "tool-call-read-only-todo-write".to_string(),
             kind: "function".to_string(),
             function: ChatToolFunction {
-                name: BuiltinToolName::TodoWrite.as_str().to_string(),
+                name: BuiltinToolName::UpdatePlan.as_str().to_string(),
                 arguments: serde_json::json!({
                     "todos": [
                         {
@@ -2396,7 +2501,7 @@ mod tests {
             &conversation_registry,
             &spawn_graph,
             None,
-            &todo_ledger,
+            &plan_store,
             None,
             &task,
             &session_id,
@@ -2410,7 +2515,7 @@ mod tests {
         assert_eq!(status, ExecutionResultStatus::Succeeded);
         assert_eq!(parsed["status"].as_str(), Some("succeeded"));
         assert!(
-            !todo_ledger.is_empty(),
+            !plan_store.is_empty(),
             "只读访问不能阻止会话内部任务清单更新"
         );
     }
@@ -2424,7 +2529,7 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-todo-ledger");
         let session_id = SessionId::new("session-goal-tool-state");
         let workspace_id = Some(WorkspaceId::new("workspace-goal-tool-state"));
         session_store
@@ -2458,7 +2563,7 @@ mod tests {
                 &conversation_registry,
                 &spawn_graph,
                 None,
-                &todo_ledger,
+                &plan_store,
                 None,
                 &task,
                 &session_id,
@@ -3367,7 +3472,7 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-todo-ledger");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let mut tool_registry = ToolRegistry::new(
             Arc::new(magi_governance::GovernanceService::default()),
@@ -3405,7 +3510,7 @@ mod tests {
             &conversation_registry,
             &spawn_graph,
             None,
-            &todo_ledger,
+            &plan_store,
             None,
             &task,
             &session_id,
@@ -3437,7 +3542,7 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-todo-ledger");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let mut tool_registry = ToolRegistry::new(
             Arc::new(magi_governance::GovernanceService::default()),
@@ -3472,7 +3577,7 @@ mod tests {
             &conversation_registry,
             &spawn_graph,
             None,
-            &todo_ledger,
+            &plan_store,
             None,
             &task,
             &session_id,
@@ -3510,7 +3615,7 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-todo-ledger");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let mut tool_registry = ToolRegistry::new(
             Arc::new(magi_governance::GovernanceService::default()),
@@ -3548,7 +3653,7 @@ mod tests {
             &conversation_registry,
             &spawn_graph,
             None,
-            &todo_ledger,
+            &plan_store,
             None,
             &task,
             &session_id,
@@ -3602,7 +3707,7 @@ mod tests {
             &conversation_registry,
             &spawn_graph,
             None,
-            &todo_ledger,
+            &plan_store,
             None,
             &task,
             &session_id,
@@ -3650,7 +3755,7 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-todo-ledger");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let mut tool_registry = ToolRegistry::new(
             Arc::new(magi_governance::GovernanceService::default()),
@@ -3712,7 +3817,7 @@ mod tests {
             &conversation_registry,
             &spawn_graph,
             None,
-            &todo_ledger,
+            &plan_store,
             None,
             &task,
             &session_id,
@@ -4244,7 +4349,7 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let todo_ledger = crate::test_todo_ledger("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-todo-ledger");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let session_id = SessionId::new("session-tool-scope");
         let workspace_id = Some(WorkspaceId::new("workspace-tool-scope"));
@@ -4263,7 +4368,7 @@ mod tests {
             &conversation_registry,
             &spawn_graph,
             None,
-            &todo_ledger,
+            &plan_store,
             None,
             &worker,
             &session_id,

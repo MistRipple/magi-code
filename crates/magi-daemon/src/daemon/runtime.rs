@@ -1181,6 +1181,12 @@ impl DaemonRuntime {
                 let receiver = runner_result_receiver.clone();
                 restored.set_status_change_callback(Box::new(
                     move |task_id, old_status, new_status, task: magi_core::Task| {
+                        sync_task_plan_status(
+                            eb.as_ref(),
+                            session_store.as_ref(),
+                            &task,
+                            new_status,
+                        );
                         settle_task_execution_threads(session_store.as_ref(), task_id, new_status);
                         publish_task_status_changed_event(
                             eb.as_ref(),
@@ -1216,6 +1222,12 @@ impl DaemonRuntime {
                 let session_store = session_store_for_task_status.clone();
                 Arc::new(TaskStore::with_status_change_callback(Box::new(
                     move |task_id, old_status, new_status, task: magi_core::Task| {
+                        sync_task_plan_status(
+                            event_bus_for_task_store.as_ref(),
+                            session_store.as_ref(),
+                            &task,
+                            new_status,
+                        );
                         settle_task_execution_threads(session_store.as_ref(), task_id, new_status);
                         publish_task_status_changed_event(
                             event_bus_for_task_store.as_ref(),
@@ -1890,6 +1902,42 @@ fn publish_task_status_changed_event(
         ..EventContext::default()
     });
     let _ = event_bus.publish(event);
+}
+
+fn sync_task_plan_status(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    task: &magi_core::Task,
+    status: TaskStatus,
+) {
+    if task.plan_item_id().is_none() {
+        return;
+    }
+    let Some((session_id, workspace_id)) = task_status_event_scope(session_store, task) else {
+        tracing::warn!(
+            task_id = %task.task_id,
+            canonical_task_name = task.canonical_task_name().unwrap_or(""),
+            "计划绑定任务状态变化时无法解析 session 作用域"
+        );
+        return;
+    };
+    let plan_store = magi_plan::PlanStore::from_store(session_store, session_id);
+    match plan_store.sync_task_status(&task.task_id, status) {
+        Ok(Some(plan)) => magi_plan::publish_plan_event(
+            event_bus,
+            "session.plan.updated",
+            &plan,
+            workspace_id.as_ref(),
+            Some(&task.task_id),
+            Some(&task.mission_id),
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::error!(
+            task_id = %task.task_id,
+            error = %error,
+            "同步代理任务状态到用户计划失败"
+        ),
+    }
 }
 
 fn task_status_event_scope(

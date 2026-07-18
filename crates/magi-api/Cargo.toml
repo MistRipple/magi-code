@@ -29,7 +29,7 @@ magi-process = { path = "../magi-process" }
 magi-session-store = { path = "../magi-session-store" }
 magi-settings-store = { path = "../magi-settings-store" }
 magi-snapshot = { path = "../magi-snapshot" }
-magi-todo-ledger = { path = "../magi-todo-ledger" }
+magi-plan = { path = "../magi-plan" }
 magi-tool-runtime = { path = "../magi-tool-runtime" }
 magi-usage-authority = { path = "../magi-usage-authority" }
 magi-workspace = { path = "../magi-workspace" }

@@ -1,5 +1,5 @@
 [package]
-name = "magi-todo-ledger"
+name = "magi-plan"
 version.workspace = true
 edition.workspace = true
 

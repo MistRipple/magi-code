@@ -125,7 +125,11 @@ import {
   clearAgentRunProjection,
   setAgentRunBridgeConnected,
 } from '../../stores/agent-run-store.svelte';
-import { refreshCurrentGoal } from '../../stores/goal-store.svelte';
+import {
+  applySessionPlanSnapshot,
+  refreshCurrentGoal,
+} from '../../stores/goal-store.svelte';
+import type { SessionPlanDto } from '../rust-backend-types';
 import { turnStoreState } from '../../stores/turn-store.svelte';
 import { sanitizeSvgContent } from '../svg-sanitizer';
 import {
@@ -1502,6 +1506,23 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
   if (eventType === 'session.configuration.updated') {
     refreshSettingsBootstrapForCurrentWorkspace('session_configuration_updated');
+    return;
+  }
+
+  if (eventType === 'session.plan.updated' && event.payload) {
+    const sessionId = rustEventSessionId(event) || currentSessionId;
+    const workspaceId = rustEventWorkspaceId(event) || currentWorkspaceId;
+    const plan = event.payload.plan;
+    if (sessionId && plan && typeof plan === 'object' && !Array.isArray(plan)) {
+      const applied = applySessionPlanSnapshot(
+        sessionId,
+        workspaceId,
+        plan as unknown as SessionPlanDto,
+      );
+      if (!applied) {
+        void refreshCurrentGoal(sessionId, workspaceId, currentWorkspacePath);
+      }
+    }
     return;
   }
 
@@ -3289,6 +3310,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     const turnResult = await submitSessionTurn({
       text,
       skillName,
+      locale: i18n.locale,
       goalMode: input.goalMode === true,
       images,
       contextReferences,
