@@ -127,11 +127,15 @@ pub enum CanonicalTurnStatus {
     Blocked,
     Failed,
     Cancelled,
+    Superseded,
 }
 
 impl CanonicalTurnStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Superseded
+        )
     }
 
     pub fn allows_transition_to(self, next: Self) -> bool {
@@ -151,7 +155,8 @@ impl CanonicalTurnStatus {
                 next,
                 Self::Running | Self::Completed | Self::Failed | Self::Cancelled
             ),
-            Self::Completed | Self::Failed | Self::Cancelled => false,
+            Self::Cancelled => matches!(next, Self::Superseded),
+            Self::Completed | Self::Failed | Self::Superseded => false,
         }
     }
 }
@@ -211,6 +216,7 @@ pub enum CanonicalTurnEventKind {
     TurnStarted,
     TurnItemUpsert,
     TurnCompleted,
+    TurnSuperseded,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

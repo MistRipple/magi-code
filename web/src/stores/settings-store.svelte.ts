@@ -77,6 +77,7 @@ import { normalizeToolRuntimeStatus } from "../shared/tool-catalog";
 import {
   convertMcpFormDraft,
   createMcpFormDraft,
+  hydrateMcpFormDraft,
   normalizeMcpServerDraft,
   type McpFormDraft,
   type McpKeyValueRow,
@@ -1954,12 +1955,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
       return;
     }
     const [name, config] = entries[0];
-    const normalized = normalizeMcpServerDraft(name, config);
-    if (!normalized.ok) {
-      mcpDialogError = getMcpDraftErrorMessage(normalized.error, name);
+    const hydrated = hydrateMcpFormDraft(name, config);
+    if (!hydrated.ok) {
+      mcpDialogError = getMcpDraftErrorMessage(hydrated.error, name);
       return;
     }
-    mcpFormDraft = createMcpFormDraft(name, normalized.server);
+    mcpFormDraft = hydrated.draft;
     mcpDialogMode = "form";
   }
 

@@ -19,7 +19,7 @@ use magi_orchestrator::{
 };
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-    ActiveExecutionTurn, ActiveExecutionTurnItem, SessionStore, TimelineEntryKind,
+    ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurn, SessionStore, TimelineEntryKind,
 };
 use magi_spawn_graph::SpawnGraph;
 
@@ -56,10 +56,12 @@ pub struct DispatchSubmissionRequest {
     pub task_tier: TaskTier,
     pub access_profile: AccessProfile,
     pub skill_name: Option<String>,
+    pub goal_mode: bool,
     pub target_role: Option<String>,
     pub request_id: Option<String>,
     pub user_message_id: Option<String>,
     pub placeholder_message_id: Option<String>,
+    pub replace_turn_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +74,7 @@ pub struct DispatchSubmissionAccepted {
     pub action_task_id: TaskId,
     pub user_message_item_id: String,
     pub runner_started: bool,
+    pub superseded_turn: Option<CanonicalTurn>,
 }
 
 pub struct DispatchSubmissionRuntime<'a> {
@@ -109,7 +112,13 @@ pub enum DispatchSubmissionAcceptError {
 impl DispatchSubmissionAcceptError {
     pub fn from_store_error(error: DomainError) -> Self {
         match error {
-            DomainError::InvalidState { message } if message.contains("active current_turn") => {
+            DomainError::InvalidState { message }
+                if message.contains("active current_turn")
+                    || message.contains("最近轮次")
+                    || message.contains("最后一轮")
+                    || message.contains("不是已停止")
+                    || message.contains("不是用户主动停止") =>
+            {
                 Self::Conflict { message }
             }
             other => Self::Internal {
@@ -430,6 +439,22 @@ pub fn run_dispatch_submission(
                 metadata.extend(session_context_references_metadata(
                     &request.context_references,
                 ));
+                if let Some(replace_turn_id) = request.replace_turn_id.as_ref() {
+                    metadata.insert(
+                        "replacesTurnId".to_string(),
+                        serde_json::Value::String(replace_turn_id.clone()),
+                    );
+                }
+                if let Some(skill_name) = request.skill_name.as_deref() {
+                    metadata.insert(
+                        "skillName".to_string(),
+                        serde_json::Value::String(skill_name.to_string()),
+                    );
+                }
+                metadata.insert(
+                    "goalMode".to_string(),
+                    serde_json::Value::Bool(request.goal_mode),
+                );
                 metadata
             },
             timeline_entry_id: Some(entry_id.to_string()),
@@ -475,18 +500,54 @@ pub fn accept_dispatch_submission(
     graph: DispatchSubmissionGraph,
 ) -> Result<DispatchSubmissionAccepted, DispatchSubmissionAcceptError> {
     if let Some(active_execution_chain) = graph.active_execution_chain.clone() {
-        let accept_result = session_store.accept_active_execution_chain_with_timeline_entry(
-            request.session_id.clone(),
-            request.entry_id.clone(),
-            TimelineEntryKind::UserMessage,
-            request.timeline_message.clone(),
-            request.accepted_at,
-            active_execution_chain,
-        );
-        if let Err(error) = accept_result {
-            cleanup_rejected_dispatch(task_store, execution_registry, &graph);
-            return Err(DispatchSubmissionAcceptError::from_store_error(error));
-        }
+        let accept_result = if let Some(replace_turn_id) = request.replace_turn_id.as_deref() {
+            session_store
+                .replace_current_turn_with_active_execution_chain_and_timeline_entry(
+                    request.session_id.clone(),
+                    replace_turn_id,
+                    request.entry_id.clone(),
+                    TimelineEntryKind::UserMessage,
+                    request.timeline_message.clone(),
+                    request.accepted_at,
+                    active_execution_chain,
+                )
+                .map(|(_, _, superseded_turn)| Some(superseded_turn))
+        } else {
+            session_store
+                .accept_active_execution_chain_with_timeline_entry(
+                    request.session_id.clone(),
+                    request.entry_id.clone(),
+                    TimelineEntryKind::UserMessage,
+                    request.timeline_message.clone(),
+                    request.accepted_at,
+                    active_execution_chain,
+                )
+                .map(|_| None)
+        };
+        let superseded_turn = match accept_result {
+            Ok(superseded_turn) => superseded_turn,
+            Err(error) => {
+                cleanup_rejected_dispatch(task_store, execution_registry, &graph);
+                return Err(DispatchSubmissionAcceptError::from_store_error(error));
+            }
+        };
+
+        let user_message_item_id = request
+            .user_message_id
+            .clone()
+            .unwrap_or_else(|| format!("turn-item-user-{}", request.accepted_at.0));
+
+        return Ok(DispatchSubmissionAccepted {
+            session_id: request.session_id,
+            entry_id: request.entry_id,
+            accepted_at: request.accepted_at,
+            created_session: request.created_session,
+            root_task_id: graph.root_task_id,
+            action_task_id: graph.action_task_id,
+            user_message_item_id,
+            runner_started: false,
+            superseded_turn,
+        });
     }
 
     let user_message_item_id = request
@@ -503,6 +564,7 @@ pub fn accept_dispatch_submission(
         action_task_id: graph.action_task_id,
         user_message_item_id,
         runner_started: false,
+        superseded_turn: None,
     })
 }
 
@@ -564,10 +626,12 @@ mod tests {
             task_tier: TaskTier::ExecutionChain,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
+            goal_mode: false,
             target_role: Some("executor".to_string()),
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
+            replace_turn_id: None,
         };
         let runtime = DispatchSubmissionRuntime {
             session_store: &session_store,
@@ -641,10 +705,12 @@ mod tests {
             task_tier: TaskTier::ExecutionChain,
             access_profile: AccessProfile::FullAccess,
             skill_name: None,
+            goal_mode: false,
             target_role: Some("executor".to_string()),
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
+            replace_turn_id: None,
         };
         let runtime = DispatchSubmissionRuntime {
             session_store: &session_store,
@@ -719,10 +785,12 @@ mod tests {
             task_tier: TaskTier::ExecutionChain,
             access_profile: AccessProfile::FullAccess,
             skill_name: Some("stellarlinkco/myclaude/skills/browser".to_string()),
+            goal_mode: false,
             target_role: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
+            replace_turn_id: None,
         };
         let runtime = DispatchSubmissionRuntime {
             session_store: &session_store,
@@ -784,10 +852,12 @@ mod tests {
             task_tier: TaskTier::ExecutionChain,
             access_profile: AccessProfile::Restricted,
             skill_name: Some("code-review".to_string()),
+            goal_mode: false,
             target_role: Some("reviewer".to_string()),
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
+            replace_turn_id: None,
         };
         let runtime = DispatchSubmissionRuntime {
             session_store: &session_store,
@@ -855,10 +925,12 @@ mod tests {
             task_tier: TaskTier::ExecutionChain,
             access_profile: AccessProfile::Restricted,
             skill_name: None,
+            goal_mode: false,
             target_role: None,
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
+            replace_turn_id: None,
         };
         let workspace_root = std::path::PathBuf::from("/tmp/workspace");
         let runtime = DispatchSubmissionRuntime {

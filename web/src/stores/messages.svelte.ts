@@ -70,6 +70,17 @@ interface NotificationOperationScope {
   sessionId?: string;
 }
 
+export interface TurnEditingDraft {
+  sessionId: string;
+  turnId: string;
+  messageId: string;
+  text: string;
+  images: NonNullable<Message['images']>;
+  contextReferences: NonNullable<Message['contextReferences']>;
+  skillName: string | null;
+  goalMode: boolean;
+}
+
 // ============ 状态定义 ============
 // 🔧 修复：使用对象属性模式确保跨模块响应式正常工作
 // Svelte 5 官方推荐：导出对象并修改其属性，而非重新赋值独立变量
@@ -106,6 +117,7 @@ export const messagesState = $state({
     isLoadingBefore: false,
   },
   queuedMessages: [] as QueuedMessage[],
+  editingTurn: null as TurnEditingDraft | null,
   notificationCenter: {
     isLoading: false,
     operation: null,
@@ -757,18 +769,30 @@ function shouldReplaceOrchestratorRuntimeState(
 }
 
 export function applyAuthoritativeProcessingState(input: AppState['processingState']): void {
+  const previousPendingRequestIds = messagesState.pendingRequests;
+  const previousThinkingStartAt = messagesState.thinkingStartAt;
+  const localPendingRequestIds = new Set(
+    [...previousPendingRequestIds].filter((requestId) => requestBindings.has(requestId)),
+  );
   const snapshot = normalizeProcessingStateSnapshot(input);
   if (!snapshot) {
-    // 后端明确没有活跃处理态：权威 idle 必须收敛本地乐观 pending。
-    // 活跃轮次期间的旧 idle 快照由 bootstrap 的 preserveLocalProcessing 调用方拦截。
+    // 后端 idle 只负责收敛后端处理态。本地已经建立请求绑定、但尚未进入 canonical
+    // reducer 的提交仍由请求生命周期负责，不能被历史事件回放或提交前 bootstrap 清除。
     messagesState.backendProcessing = false;
-    messagesState.pendingRequests = new Set();
-    messagesState.activeMessageIds = new Set();
-    messagesState.thinkingStartAt = null;
+    messagesState.pendingRequests = localPendingRequestIds;
+    if (localPendingRequestIds.size === 0) {
+      messagesState.activeMessageIds = new Set();
+      messagesState.thinkingStartAt = null;
+    } else if (!messagesState.thinkingStartAt) {
+      messagesState.thinkingStartAt = Date.now();
+    }
     updateProcessingState();
     return;
   }
-  const pendingRequestIds = new Set(snapshot.pendingRequestIds);
+  const pendingRequestIds = new Set([
+    ...snapshot.pendingRequestIds,
+    ...localPendingRequestIds,
+  ]);
   // 防回抬保护：如果在 forced idle 冷却期内，拒绝后端权威状态覆盖
   const lastForcedIdleAt = messagesState.lastForcedIdleAt;
   if (
@@ -782,7 +806,7 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
     }
     return;
   }
-  const activeMessageIds = snapshot.isProcessing
+  const activeMessageIds = snapshot.isProcessing || localPendingRequestIds.size > 0
     ? messagesState.activeMessageIds
     : new Set<string>();
   // 单一事实源：后端权威 isProcessing + 本地乐观 pendingRequests。
@@ -797,9 +821,11 @@ export function applyAuthoritativeProcessingState(input: AppState['processingSta
     setProcessingActor(snapshot.source, snapshot.agent || undefined);
   }
   if (nextIsProcessing) {
-    messagesState.thinkingStartAt = snapshot.startedAt
-      || messagesState.thinkingStartAt
-      || Date.now();
+    const preservesActiveLocalRequest = [...previousPendingRequestIds]
+      .some((requestId) => pendingRequestIds.has(requestId));
+    messagesState.thinkingStartAt = preservesActiveLocalRequest && previousThinkingStartAt
+      ? previousThinkingStartAt
+      : snapshot.startedAt || previousThinkingStartAt || Date.now();
   } else {
     messagesState.thinkingStartAt = null;
   }
@@ -1241,6 +1267,7 @@ export function setCurrentSessionId(id: string | null) {
   }
   messagesState.currentSessionId = nextSessionId;
   if (hasChanged) {
+    messagesState.editingTurn = null;
     messagesState.sessionHistory = {
       workspaceId: messagesState.currentWorkspaceId,
       sessionId: nextSessionId,
@@ -1471,6 +1498,35 @@ export function addPendingRequest(id: string, options?: { resetAntiLiftBack?: bo
     messagesState.pendingRequests = next;
     updateProcessingState();
   }
+}
+
+export function beginLocalTurnSubmission(input: {
+  requestId: string;
+  placeholderMessageId: string;
+  startedAt: number;
+  source?: string;
+  agent?: string;
+}): void {
+  const requestId = input.requestId.trim();
+  const placeholderMessageId = input.placeholderMessageId.trim();
+  if (!requestId || !placeholderMessageId) {
+    throw new Error('本地轮次提交缺少 requestId 或 placeholderMessageId');
+  }
+
+  messagesState.lastForcedIdleAt = null;
+  messagesState.pendingRequests = new Set([...messagesState.pendingRequests, requestId]);
+  messagesState.activeMessageIds = new Set([
+    ...messagesState.activeMessageIds,
+    placeholderMessageId,
+  ]);
+  messagesState.processingActor = {
+    source: (input.source || 'orchestrator') as ProcessingActor['source'],
+    agent: (input.agent || input.source || 'orchestrator') as ProcessingActor['agent'],
+  };
+  messagesState.thinkingStartAt = Number.isFinite(input.startedAt) && input.startedAt > 0
+    ? input.startedAt
+    : Date.now();
+  messagesState.isProcessing = true;
 }
 
 export function clearPendingRequest(id: string) {
@@ -1810,6 +1866,37 @@ export function getTimelineProjectionMessageById(messageId: string): Message | u
   return matched?.message;
 }
 
+export function beginTurnEditing(draft: TurnEditingDraft): void {
+  const sessionId = normalizeSessionId(draft.sessionId);
+  const turnId = draft.turnId.trim();
+  const messageId = draft.messageId.trim();
+  if (!sessionId || !turnId || !messageId || sessionId !== normalizeSessionId(messagesState.currentSessionId)) {
+    return;
+  }
+  messagesState.editingTurn = {
+    sessionId,
+    turnId,
+    messageId,
+    text: draft.text,
+    images: draft.images.map((image) => ({ ...image })),
+    contextReferences: draft.contextReferences.map((reference) => ({ ...reference })),
+    skillName: draft.skillName?.trim() || null,
+    goalMode: draft.goalMode === true,
+  };
+}
+
+export function cancelTurnEditing(): void {
+  messagesState.editingTurn = null;
+}
+
+export function completeTurnEditing(replacedTurnId: string): void {
+  const normalizedTurnId = replacedTurnId.trim();
+  if (!normalizedTurnId || messagesState.editingTurn?.turnId !== normalizedTurnId) {
+    return;
+  }
+  messagesState.editingTurn = null;
+}
+
 // 清空所有消息（用于会话切换/新建）
 export function clearAllMessages(options: {
   persist?: boolean;
@@ -1832,6 +1919,7 @@ export function clearAllMessages(options: {
     isLoadingBefore: false,
   };
   messagesState.queuedMessages = [];
+  messagesState.editingTurn = null;
   messagesState.messageJump = {
     messageId: null,
     nonce: messagesState.messageJump.nonce,

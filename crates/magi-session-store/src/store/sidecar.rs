@@ -16,6 +16,14 @@ use magi_tool_runtime::BuiltinToolName;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
+const TURN_INTERRUPTION_SOURCE_METADATA_KEY: &str = "interruptionSource";
+const TURN_INTERRUPTION_SOURCE_USER: &str = "user";
+const TURN_INTERRUPTED_AT_METADATA_KEY: &str = "interruptedAt";
+const TURN_REPLACES_TURN_ID_METADATA_KEY: &str = "replacesTurnId";
+const TURN_SUPERSEDED_AT_METADATA_KEY: &str = "supersededAt";
+const TURN_SUPERSEDED_REASON_METADATA_KEY: &str = "supersededReason";
+const TURN_SUPERSEDED_BY_TURN_ID_METADATA_KEY: &str = "supersededByTurnId";
+
 fn inherit_current_turn_aliases(turn: &ActiveExecutionTurn, item: &mut ActiveExecutionTurnItem) {
     let Some(alias_source) = turn.items.iter().find(|existing| {
         existing.request_id.is_some()
@@ -48,6 +56,7 @@ fn current_turn_status_is_terminal(status: &str) -> bool {
             | "cancelled"
             | "canceled"
             | "killed"
+            | "superseded"
     )
 }
 
@@ -86,6 +95,7 @@ fn canonical_current_turn_status(status: &str) -> DomainResult<CanonicalTurnStat
         "blocked" => Ok(CanonicalTurnStatus::Blocked),
         "failed" | "error" => Ok(CanonicalTurnStatus::Failed),
         "cancelled" | "canceled" | "killed" => Ok(CanonicalTurnStatus::Cancelled),
+        "superseded" => Ok(CanonicalTurnStatus::Superseded),
         _ => Err(DomainError::InvalidState {
             message: format!("unknown current turn status: {status}"),
         }),
@@ -107,6 +117,7 @@ fn canonical_current_turn_item_status(status: &str) -> DomainResult<CanonicalTur
         CanonicalTurnStatus::Blocked => CanonicalTurnItemStatus::Blocked,
         CanonicalTurnStatus::Failed => CanonicalTurnItemStatus::Failed,
         CanonicalTurnStatus::Cancelled => CanonicalTurnItemStatus::Cancelled,
+        CanonicalTurnStatus::Superseded => CanonicalTurnItemStatus::Cancelled,
     })
 }
 
@@ -118,6 +129,7 @@ fn terminal_item_status_for_canonical_turn_status(
         CanonicalTurnStatus::Blocked => Some(CanonicalTurnItemStatus::Blocked),
         CanonicalTurnStatus::Failed => Some(CanonicalTurnItemStatus::Failed),
         CanonicalTurnStatus::Cancelled => Some(CanonicalTurnItemStatus::Cancelled),
+        CanonicalTurnStatus::Superseded => Some(CanonicalTurnItemStatus::Cancelled),
         CanonicalTurnStatus::Pending | CanonicalTurnStatus::Running => None,
     }
 }
@@ -303,6 +315,19 @@ fn current_turn_to_canonical_turn(
         .iter()
         .map(|item| current_turn_item_to_canonical_item(session_id, turn, item))
         .collect::<DomainResult<Vec<_>>>()?;
+    let metadata = turn
+        .items
+        .iter()
+        .find(|item| item.kind == "user_message")
+        .and_then(|item| item.metadata.get(TURN_REPLACES_TURN_ID_METADATA_KEY))
+        .cloned()
+        .map(|replaces_turn_id| {
+            HashMap::from([(
+                TURN_REPLACES_TURN_ID_METADATA_KEY.to_string(),
+                replaces_turn_id,
+            )])
+        })
+        .unwrap_or_default();
     let mut canonical_turn = CanonicalTurn {
         session_id: session_id.clone(),
         turn_id: turn.turn_id.clone(),
@@ -315,7 +340,7 @@ fn current_turn_to_canonical_turn(
             .map(|completed_at| completed_at.0.saturating_sub(turn.accepted_at.0)),
         usage: None,
         items,
-        metadata: HashMap::new(),
+        metadata,
     };
     canonical_turn.normalize();
     Ok(canonical_turn)
@@ -377,6 +402,95 @@ fn replace_canonical_turn_in_state(
             .then_with(|| left.turn_id.cmp(&right.turn_id))
     });
     Ok(())
+}
+
+fn user_message_item(turn: &ActiveExecutionTurn) -> Option<&ActiveExecutionTurnItem> {
+    turn.items.iter().find(|item| item.kind == "user_message")
+}
+
+fn validate_turn_replacement_target(
+    state: &SessionStoreState,
+    session_id: &SessionId,
+    replace_turn_id: &str,
+) -> DomainResult<usize> {
+    let current_turn = state
+        .execution_sidecar_store
+        .runtime_sidecars
+        .iter()
+        .find(|sidecar| sidecar.session_id == *session_id)
+        .and_then(|sidecar| sidecar.current_turn.as_ref())
+        .ok_or(DomainError::InvalidState {
+            message: format!("session {session_id} 没有可编辑的最近轮次"),
+        })?;
+    if current_turn.turn_id != replace_turn_id {
+        return Err(DomainError::InvalidState {
+            message: format!(
+                "session {session_id} 最近轮次已变化: {} != {replace_turn_id}",
+                current_turn.turn_id
+            ),
+        });
+    }
+    if canonical_current_turn_status(&current_turn.status)? != CanonicalTurnStatus::Cancelled {
+        return Err(DomainError::InvalidState {
+            message: format!("turn {replace_turn_id} 不是已停止轮次"),
+        });
+    }
+    let interrupted_by_user = user_message_item(current_turn)
+        .and_then(|item| item.metadata.get(TURN_INTERRUPTION_SOURCE_METADATA_KEY))
+        .and_then(Value::as_str)
+        .is_some_and(|source| source == TURN_INTERRUPTION_SOURCE_USER);
+    if !interrupted_by_user {
+        return Err(DomainError::InvalidState {
+            message: format!("turn {replace_turn_id} 不是用户主动停止的轮次"),
+        });
+    }
+
+    let latest_turn_index = state
+        .canonical_turns
+        .iter()
+        .enumerate()
+        .filter(|(_, turn)| turn.session_id == *session_id)
+        .max_by(|(_, left), (_, right)| {
+            left.turn_seq
+                .cmp(&right.turn_seq)
+                .then_with(|| left.turn_id.cmp(&right.turn_id))
+        })
+        .map(|(index, _)| index)
+        .ok_or(DomainError::InvalidState {
+            message: format!("session {session_id} 缺少 canonical 轮次"),
+        })?;
+    let latest_turn = &state.canonical_turns[latest_turn_index];
+    if latest_turn.turn_id != replace_turn_id {
+        return Err(DomainError::InvalidState {
+            message: format!("turn {replace_turn_id} 已不是 session {session_id} 的最后一轮"),
+        });
+    }
+    if latest_turn.status != CanonicalTurnStatus::Cancelled {
+        return Err(DomainError::InvalidState {
+            message: format!("canonical turn {replace_turn_id} 不是已停止状态"),
+        });
+    }
+    Ok(latest_turn_index)
+}
+
+fn supersede_canonical_turn(
+    turn: &mut CanonicalTurn,
+    replacement_turn_id: &str,
+    superseded_at: UtcMillis,
+) {
+    turn.status = CanonicalTurnStatus::Superseded;
+    turn.metadata.insert(
+        TURN_SUPERSEDED_REASON_METADATA_KEY.to_string(),
+        Value::String("user_edit".to_string()),
+    );
+    turn.metadata.insert(
+        TURN_SUPERSEDED_AT_METADATA_KEY.to_string(),
+        Value::from(superseded_at.0),
+    );
+    turn.metadata.insert(
+        TURN_SUPERSEDED_BY_TURN_ID_METADATA_KEY.to_string(),
+        Value::String(replacement_turn_id.to_string()),
+    );
 }
 
 fn durable_terminal_turn_should_win(
@@ -1139,6 +1253,94 @@ impl SessionStore {
         Ok((entry_id, updated))
     }
 
+    pub fn replace_current_turn_with_timeline_entry(
+        &self,
+        session_id: SessionId,
+        replace_turn_id: &str,
+        entry_id: impl Into<String>,
+        kind: TimelineEntryKind,
+        message: impl Into<String>,
+        occurred_at: UtcMillis,
+        mut turn: ActiveExecutionTurn,
+    ) -> DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn)> {
+        let entry_id = entry_id.into();
+        let message = message.into();
+        turn.normalize();
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if !state
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+        {
+            return Err(DomainError::NotFound { entity: "session" });
+        }
+        reject_duplicate_timeline_entry(&state.timeline, &entry_id)?;
+        let replaced_turn_index =
+            validate_turn_replacement_target(&state, &session_id, replace_turn_id)?;
+        if state
+            .canonical_turns
+            .iter()
+            .any(|existing| existing.session_id == session_id && existing.turn_id == turn.turn_id)
+        {
+            return Err(DomainError::InvalidState {
+                message: format!("canonical turn {} 已存在", turn.turn_id),
+            });
+        }
+        let incoming_canonical_turn = current_turn_to_canonical_turn(&session_id, &turn)?;
+        let existing = state
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .find(|sidecar| sidecar.session_id == session_id)
+            .cloned()
+            .ok_or(DomainError::NotFound {
+                entity: "session_runtime_sidecar",
+            })?;
+        let updated = SessionRuntimeSidecar {
+            session_id: session_id.clone(),
+            ownership: existing.ownership,
+            recovery_id: existing.recovery_id,
+            current_turn: Some(turn),
+            active_execution_chain: existing.active_execution_chain,
+            status: existing.status,
+            updated_at: UtcMillis::now(),
+        };
+
+        state.timeline.push(TimelineEntry {
+            entry_id: entry_id.clone(),
+            session_id: session_id.clone(),
+            kind,
+            message,
+            occurred_at,
+        });
+        if let Some(session) = state
+            .sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
+        {
+            session.updated_at = occurred_at;
+        }
+        supersede_canonical_turn(
+            &mut state.canonical_turns[replaced_turn_index],
+            &incoming_canonical_turn.turn_id,
+            occurred_at,
+        );
+        let superseded_turn = state.canonical_turns[replaced_turn_index].clone();
+        state.canonical_turns.push(incoming_canonical_turn);
+        state.canonical_turns.sort_by(|left, right| {
+            left.turn_seq
+                .cmp(&right.turn_seq)
+                .then_with(|| left.turn_id.cmp(&right.turn_id))
+        });
+        upsert_runtime_sidecar_in_state(&mut state, updated.clone());
+        drop(state);
+        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertCurrentTurn);
+        Ok((entry_id, updated, superseded_turn))
+    }
+
     pub fn accept_active_execution_chain_with_timeline_entry(
         &self,
         session_id: SessionId,
@@ -1199,6 +1401,94 @@ impl SessionStore {
             updated.ownership.workspace_id.as_ref(),
         );
         Ok((entry_id, updated))
+    }
+
+    pub fn replace_current_turn_with_active_execution_chain_and_timeline_entry(
+        &self,
+        session_id: SessionId,
+        replace_turn_id: &str,
+        entry_id: impl Into<String>,
+        kind: TimelineEntryKind,
+        message: impl Into<String>,
+        occurred_at: UtcMillis,
+        active_execution_chain: ActiveExecutionChain,
+    ) -> DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn)> {
+        let entry_id = entry_id.into();
+        let message = message.into();
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if !state
+            .sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+        {
+            return Err(DomainError::NotFound { entity: "session" });
+        }
+        reject_duplicate_timeline_entry(&state.timeline, &entry_id)?;
+        let replaced_turn_index =
+            validate_turn_replacement_target(&state, &session_id, replace_turn_id)?;
+        let existing = state
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .find(|sidecar| sidecar.session_id == session_id)
+            .cloned();
+        let updated = Self::build_active_execution_chain_sidecar(
+            session_id.clone(),
+            active_execution_chain,
+            existing,
+        )?;
+        let incoming_turn = updated
+            .current_turn
+            .as_ref()
+            .ok_or(DomainError::InvalidState {
+                message: "replacement active execution chain 缺少 current_turn".to_string(),
+            })?;
+        if state.canonical_turns.iter().any(|existing| {
+            existing.session_id == session_id && existing.turn_id == incoming_turn.turn_id
+        }) {
+            return Err(DomainError::InvalidState {
+                message: format!("canonical turn {} 已存在", incoming_turn.turn_id),
+            });
+        }
+        let incoming_canonical_turn = current_turn_to_canonical_turn(&session_id, incoming_turn)?;
+
+        state.timeline.push(TimelineEntry {
+            entry_id: entry_id.clone(),
+            session_id: session_id.clone(),
+            kind,
+            message,
+            occurred_at,
+        });
+        if let Some(session) = state
+            .sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
+        {
+            session.updated_at = occurred_at;
+        }
+        supersede_canonical_turn(
+            &mut state.canonical_turns[replaced_turn_index],
+            &incoming_canonical_turn.turn_id,
+            occurred_at,
+        );
+        let superseded_turn = state.canonical_turns[replaced_turn_index].clone();
+        state.canonical_turns.push(incoming_canonical_turn);
+        state.canonical_turns.sort_by(|left, right| {
+            left.turn_seq
+                .cmp(&right.turn_seq)
+                .then_with(|| left.turn_id.cmp(&right.turn_id))
+        });
+        upsert_runtime_sidecar_in_state(&mut state, updated.clone());
+        drop(state);
+        self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertActiveExecutionChain);
+        self.sync_session_workspace_binding(
+            &updated.session_id,
+            updated.ownership.workspace_id.as_ref(),
+        );
+        Ok((entry_id, updated, superseded_turn))
     }
 
     pub fn ensure_current_turn_acceptance_available(
@@ -1920,6 +2210,21 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
     ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        self.cancel_current_turn_with_source(session_id, false)
+    }
+
+    pub fn interrupt_current_turn_by_user(
+        &self,
+        session_id: &SessionId,
+    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        self.cancel_current_turn_with_source(session_id, true)
+    }
+
+    fn cancel_current_turn_with_source(
+        &self,
+        session_id: &SessionId,
+        interrupted_by_user: bool,
+    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
         let updated = {
             let mut state = self
                 .state
@@ -1941,6 +2246,21 @@ impl SessionStore {
                 };
                 if !current_turn_status_is_terminal(&turn.status) {
                     let now = UtcMillis::now();
+                    if interrupted_by_user
+                        && let Some(user_item) = turn
+                            .items
+                            .iter_mut()
+                            .find(|item| item.kind == "user_message")
+                    {
+                        user_item.metadata.insert(
+                            TURN_INTERRUPTION_SOURCE_METADATA_KEY.to_string(),
+                            Value::String(TURN_INTERRUPTION_SOURCE_USER.to_string()),
+                        );
+                        user_item.metadata.insert(
+                            TURN_INTERRUPTED_AT_METADATA_KEY.to_string(),
+                            Value::from(now.0),
+                        );
+                    }
                     for item in &mut turn.items {
                         if current_turn_item_status_is_active(&item.status) {
                             item.status = "cancelled".to_string();

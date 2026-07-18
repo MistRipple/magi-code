@@ -217,6 +217,7 @@ fn canonical_turn_status(status: &str) -> Option<CanonicalTurnStatus> {
         "blocked" => Some(CanonicalTurnStatus::Blocked),
         "failed" | "error" => Some(CanonicalTurnStatus::Failed),
         "cancelled" | "canceled" | "killed" => Some(CanonicalTurnStatus::Cancelled),
+        "superseded" => Some(CanonicalTurnStatus::Superseded),
         _ => None,
     }
 }
@@ -229,6 +230,7 @@ fn canonical_item_status(status: &str) -> Option<CanonicalTurnItemStatus> {
         CanonicalTurnStatus::Blocked => Some(CanonicalTurnItemStatus::Blocked),
         CanonicalTurnStatus::Failed => Some(CanonicalTurnItemStatus::Failed),
         CanonicalTurnStatus::Cancelled => Some(CanonicalTurnItemStatus::Cancelled),
+        CanonicalTurnStatus::Superseded => Some(CanonicalTurnItemStatus::Cancelled),
     }
 }
 
@@ -240,6 +242,7 @@ fn terminal_item_status_for_turn_status(
         CanonicalTurnStatus::Blocked => Some(CanonicalTurnItemStatus::Blocked),
         CanonicalTurnStatus::Failed => Some(CanonicalTurnItemStatus::Failed),
         CanonicalTurnStatus::Cancelled => Some(CanonicalTurnItemStatus::Cancelled),
+        CanonicalTurnStatus::Superseded => Some(CanonicalTurnItemStatus::Cancelled),
         CanonicalTurnStatus::Pending | CanonicalTurnStatus::Running => None,
     }
 }
@@ -1803,6 +1806,7 @@ mod tests {
 
         fn execute(
             &self,
+            _tool_call_id: &ToolCallId,
             input: &str,
             _context: &ToolExecutionContext,
             _resources: &magi_tool_runtime::ToolRuntimeResources,
@@ -1833,6 +1837,7 @@ mod tests {
 
         fn execute(
             &self,
+            _tool_call_id: &ToolCallId,
             _input: &str,
             _context: &ToolExecutionContext,
             _resources: &magi_tool_runtime::ToolRuntimeResources,
@@ -1862,6 +1867,7 @@ mod tests {
 
         fn execute(
             &self,
+            _tool_call_id: &ToolCallId,
             input: &str,
             context: &ToolExecutionContext,
             _resources: &magi_tool_runtime::ToolRuntimeResources,

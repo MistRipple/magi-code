@@ -635,6 +635,7 @@ export function buildCanonicalTimelineProjection(state: CanonicalTurnReducerStat
     return null;
   }
   const artifacts = collapseArtifactsByStableCard(state.turns
+    .filter((turn) => turn.status !== 'superseded')
     .flatMap((turn) => buildTurnProjectionArtifacts(turn))
     .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact))
     .sort(compareArtifacts));
@@ -704,6 +705,7 @@ export function updateCanonicalTimelineProjection(
   }
   const changed = collapseArtifactsByStableCard(state.turns
     .filter((turn) => changedTurnIdSet.has(turn.turnId))
+    .filter((turn) => turn.status !== 'superseded')
     .flatMap((turn) => buildTurnProjectionArtifacts(turn))
     .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact))
     .map((artifact) => reuseEquivalentArtifact(previousById, artifact)));

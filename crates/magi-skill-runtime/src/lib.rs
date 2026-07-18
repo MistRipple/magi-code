@@ -542,6 +542,7 @@ mod tests {
 
         fn execute(
             &self,
+            _tool_call_id: &ToolCallId,
             input: &str,
             _context: &ToolExecutionContext,
             _resources: &ToolRuntimeResources,
@@ -568,6 +569,7 @@ mod tests {
 
         fn execute(
             &self,
+            _tool_call_id: &ToolCallId,
             _input: &str,
             context: &ToolExecutionContext,
             _resources: &ToolRuntimeResources,

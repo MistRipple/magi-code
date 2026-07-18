@@ -1294,6 +1294,7 @@ export async function submitSessionTurn(
     placeholderMessageId?: string | null;
     steerCurrentTurn?: boolean;
     expectedTurnId?: string | null;
+    replaceTurnId?: string | null;
   },
   bindingOverride?: Partial<AgentBindingContext>,
 ): Promise<AgentSessionTurnResult> {
@@ -1318,6 +1319,7 @@ export async function submitSessionTurn(
         placeholderMessageId: payload.placeholderMessageId ?? null,
         steerCurrentTurn: payload.steerCurrentTurn === true,
         expectedTurnId: payload.expectedTurnId ?? null,
+        replaceTurnId: payload.replaceTurnId ?? null,
         images: payload.images.map((image) => ({
           name: image.name,
           dataUrl: image.dataUrl,

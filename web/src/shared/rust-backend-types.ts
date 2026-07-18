@@ -51,6 +51,8 @@ export interface SessionTurnRequestDto {
   steerCurrentTurn?: boolean;
   /** 调用方观察到的当前活跃 Turn ID。 */
   expectedTurnId?: string | null;
+  /** 编辑并替换最近一条由用户主动停止的消息。 */
+  replaceTurnId?: string | null;
 }
 
 export interface SessionTurnResponseDto {

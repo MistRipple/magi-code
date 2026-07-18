@@ -30,6 +30,18 @@ const inputAreaSource = await readFile(
   new URL('../src/components/InputArea.svelte', import.meta.url),
   'utf8',
 );
+const messageListSource = await readFile(
+  new URL('../src/components/MessageList.svelte', import.meta.url),
+  'utf8',
+);
+const messageItemSource = await readFile(
+  new URL('../src/components/MessageItem.svelte', import.meta.url),
+  'utf8',
+);
+const bridgeSource = await readFile(
+  new URL('../src/shared/bridges/web-client-bridge.ts', import.meta.url),
+  'utf8',
+);
 assert.match(
   inputAreaSource,
   /class="ia-queue-action ia-queue-guide"[\s\S]*?input\.queue\.guide/,
@@ -47,13 +59,48 @@ assert.match(
 );
 assert.match(
   inputAreaSource,
-  /followUpMode:\s*!isDraftSession\s*&&\s*isSending\s*\?\s*'queue'\s*:\s*undefined/,
-  '执行中从输入框发送必须固定进入队列',
+  /followUpMode:\s*!replaceTurnId\s*&&\s*!isDraftSession\s*&&\s*isSending\s*\?\s*'queue'\s*:\s*undefined/,
+  '执行中普通消息必须固定进入队列，编辑重发不能被重新排队',
+);
+assert.match(
+  inputAreaSource,
+  /sendPreparing \? 'loader' : 'send'[\s\S]*?sendPreparing \? 'spinning' : ''/,
+  '发送预处理阶段必须立即把发送图标切换为加载动画',
+);
+assert.match(
+  inputAreaSource,
+  /\.ia-container :global\(\.spinning\) \{ animation: ia-spin 0\.8s linear infinite; \}/,
+  '输入区加载图标必须具有真实旋转动画，不能只切换静态 loader 图标',
 );
 assert.doesNotMatch(
   inputAreaSource,
   /FollowUpMode|followUpMode\s*=|input-followup-mode-button|ia-followup-mode/,
   '输入框不得保留排队与引导切换状态或入口',
+);
+assert.match(
+  messageListSource,
+  /metadata\.turnStatus === 'cancelled'[\s\S]*?metadata\.interruptionSource === 'user'/,
+  '只有最近一条由用户主动停止的消息可以进入编辑模式',
+);
+assert.match(
+  inputAreaSource,
+  /input\.editingPreviousMessage[\s\S]*?input\.cancelEditing/,
+  '编辑模式必须复用底部输入框并提供紧凑取消入口',
+);
+assert.match(
+  inputAreaSource,
+  /replaceTurnId,[\s\S]*?if \(!replaceTurnId\) \{[\s\S]*?clearComposerState\(\)/,
+  '编辑重发必须携带 replaceTurnId，且提交前不能清空输入内容',
+);
+assert.match(
+  messageItemSource,
+  /@media \(hover: none\), \(pointer: coarse\) \{[\s\S]*?\.message-actions \{[\s\S]*?opacity: 1;[\s\S]*?pointer-events: auto;/,
+  '移动端消息操作必须固定显示，不能依赖悬停',
+);
+assert.match(
+  bridgeSource,
+  /messagesState\.editingTurn !== null[\s\S]*?completeTurnEditing\(replaceTurnId\)/,
+  '编辑期间必须暂停队列，并且只在替换请求成功后结束编辑态',
 );
 assert.match(
   inputAreaSource,

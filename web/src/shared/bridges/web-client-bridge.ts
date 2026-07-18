@@ -135,10 +135,11 @@ import {
   allocateTurnOrderSeq,
   addPendingRequest,
   adoptAcceptedSessionIdForLocalTurn,
+  beginLocalTurnSubmission,
   clearRequestBinding,
   clearPendingRequest,
+  completeTurnEditing,
   createRequestBinding,
-  markMessageActive,
   setCurrentSessionId,
   setQueuedMessages,
   removeQueuedMessage,
@@ -1291,6 +1292,33 @@ function emitAcceptedCanonicalTurnFromResult(result: {
   }
 }
 
+function emitLocalSupersededCanonicalTurn(turnId: string, occurredAt: number): void {
+  const normalizedTurnId = trimBridgeString(turnId);
+  const existing = turnStoreState.reducer.turns.find((turn) => turn.turnId === normalizedTurnId);
+  if (!existing || existing.status === 'superseded') {
+    return;
+  }
+  emitSessionTurnCanonicalEvent({
+    schemaVersion: CANONICAL_TURN_SCHEMA_VERSION,
+    eventId: `local-turn-superseded-${normalizedTurnId}-${occurredAt}`,
+    eventSeq: 0,
+    kind: 'turn_superseded',
+    sessionId: existing.sessionId,
+    turnId: existing.turnId,
+    turnSeq: existing.turnSeq,
+    occurredAt,
+    turn: {
+      ...existing,
+      status: 'superseded',
+      metadata: {
+        ...(existing.metadata || {}),
+        supersededReason: 'user_edit',
+        supersededAt: occurredAt,
+      },
+    },
+  });
+}
+
 function handleSessionTurnItemEvent(event: RustEventEnvelope): boolean {
   const canonicalEvent = parseCanonicalTurnEventPayload(event.payload, {
     eventId: trimBridgeString(event.event_id),
@@ -1506,6 +1534,14 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     });
     if (canonicalEvent) {
       emitSessionTurnCanonicalEvent(canonicalEvent);
+      const editingTurn = messagesState.editingTurn;
+      if (
+        editingTurn
+        && editingTurn.sessionId === canonicalEvent.sessionId
+        && editingTurn.turnId !== canonicalEvent.turnId
+      ) {
+        completeTurnEditing(editingTurn.turnId);
+      }
     }
     if (acceptedCreatedSession === true) {
       scheduleWorkspaceSessionSummaryRefresh('created_session_accepted');
@@ -1516,6 +1552,23 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     if (handleSessionTurnItemEvent(event)) {
       return;
     }
+  }
+
+  if (eventType === 'session.turn.superseded') {
+    const canonicalEvent = parseCanonicalTurnEventPayload(event.payload, {
+      eventId: trimBridgeString(event.event_id),
+      eventSeq: typeof event.sequence === 'number' && Number.isFinite(event.sequence)
+        ? Math.floor(event.sequence)
+        : 0,
+      occurredAt: typeof event.occurred_at === 'number' && Number.isFinite(event.occurred_at)
+        ? Math.floor(event.occurred_at)
+        : Date.now(),
+    });
+    if (canonicalEvent) {
+      emitSessionTurnCanonicalEvent(canonicalEvent);
+      completeTurnEditing(canonicalEvent.turnId);
+    }
+    return;
   }
 
   if (eventType === 'session.action.accepted' && event.payload) {
@@ -2866,6 +2919,7 @@ interface ExecuteTaskInput {
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
   followUpMode?: 'queue' | 'guide';
+  replaceTurnId?: string | null;
   images: Array<{
     name: string;
     dataUrl: string;
@@ -2884,7 +2938,8 @@ function bridgeRuntimeIsBusy(): boolean {
       || messagesState.backendProcessing
       || messagesState.sessionHydrating
       || messagesState.pendingRequests.size > 0
-      || messagesState.activeMessageIds.size > 0,
+      || messagesState.activeMessageIds.size > 0
+      || messagesState.editingTurn !== null,
   );
 }
 
@@ -3078,6 +3133,18 @@ function restoreQueuedTurnToFront(queued: QueuedMessage): void {
   setQueuedMessages([queued, ...messagesState.queuedMessages]);
 }
 
+function scheduleLocalTurnProjection(work: () => boolean): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    setTimeout(() => {
+      try {
+        resolve(work());
+      } catch (error) {
+        reject(error);
+      }
+    }, 0);
+  });
+}
+
 async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   const text = typeof input.text === 'string' ? input.text : null;
   const normalizedText = text?.trim() || '';
@@ -3087,6 +3154,14 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   const targetSessionId = hasBridgeField(input, 'sessionId')
     ? trimBridgeString(input.sessionId)
     : (targetWorkspaceScope.hasWorkspaceOverride ? '' : currentSessionId);
+  const replaceTurnId = trimBridgeString(input.replaceTurnId);
+  if (replaceTurnId && !targetSessionId) {
+    emitBridgeErrorToast(
+      i18n.t('bridge.action.sendMessage'),
+      new Error(i18n.t('input.editingSessionUnavailable')),
+    );
+    return false;
+  }
   const skillName = typeof input.skillName === 'string' && input.skillName.trim()
     ? input.skillName.trim()
     : null;
@@ -3168,19 +3243,21 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     createdAt: requestCreatedAt,
   });
 
-  emitDataMessage('processingStateChanged', {
-    isProcessing: true,
-    source: 'orchestrator',
-    agent: 'orchestrator',
-    startedAt: requestCreatedAt,
-    pendingRequestIds: [requestId],
-  });
-  addPendingRequest(requestId, { resetAntiLiftBack: true });
-  markMessageActive(placeholderMessageId);
+  // 新会话绑定会重置 session 级执行态，因此必须先完成本地会话切换，
+  // 再写入本次请求的乐观 processing；反过来会把刚写入的 pending 清掉。
   if (usesLocalOptimisticSession) {
     setCurrentSessionId(optimisticSessionId);
   }
-  emitLocalPendingCanonicalTurn({
+  beginLocalTurnSubmission({
+    requestId,
+    placeholderMessageId,
+    startedAt: requestCreatedAt,
+    source: 'orchestrator',
+    agent: 'orchestrator',
+  });
+  // 提交生命周期与消息投影分层：processing 是轻量状态事务，canonical 投影在下一任务执行。
+  // 这样输入事件可立即结束，浏览器先绘制按钮和等待态，网络预连接也可同时推进。
+  const localProjectionPromise = scheduleLocalTurnProjection(() => emitLocalPendingCanonicalTurn({
     sessionId: optimisticSessionId,
     requestId,
     userMessageId,
@@ -3190,7 +3267,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     contextReferences,
     turnSeq: turnOrderSeq,
     createdAt: requestCreatedAt,
-  });
+  }));
 
   try {
     if (
@@ -3208,6 +3285,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       }
       console.warn('[web-client-bridge] 发送前事件流预连接失败，继续提交本次消息:', preflightError);
     }
+    await localProjectionPromise;
     const turnResult = await submitSessionTurn({
       text,
       skillName,
@@ -3219,6 +3297,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       requestId,
       userMessageId,
       placeholderMessageId,
+      replaceTurnId: replaceTurnId || null,
     }, {
       workspaceId: targetWorkspaceId,
       workspacePath: targetWorkspacePath,
@@ -3234,7 +3313,13 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     if (resolvedSessionId) {
       persistWorkspaceBinding(targetWorkspaceId, targetWorkspacePath, resolvedSessionId);
     }
+    if (replaceTurnId) {
+      emitLocalSupersededCanonicalTurn(replaceTurnId, turnResult.acceptedAt);
+    }
     emitAcceptedCanonicalTurnFromResult(turnResult);
+    if (replaceTurnId) {
+      completeTurnEditing(replaceTurnId);
+    }
 
     const canonicalUserMessageId = turnResult.userMessageItemId || userMessageId;
     const canonicalTurnSeq = typeof turnResult.acceptedAt === 'number' && Number.isFinite(turnResult.acceptedAt)
@@ -3277,6 +3362,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     });
     return true;
   } catch (error) {
+    await localProjectionPromise;
     clearActiveTurnInFlight();
     clearCurrentInterruptTaskId();
     console.error('[web-client-bridge] 执行任务失败:', error);
@@ -4384,6 +4470,7 @@ export function createWebClientBridge(): ClientBridge {
               followUpMode: message.followUpMode === 'queue' || message.followUpMode === 'guide'
                 ? message.followUpMode
                 : undefined,
+              replaceTurnId: typeof message.replaceTurnId === 'string' ? message.replaceTurnId : null,
               images: Array.isArray(message.images)
                 ? message.images as Array<{ name: string; dataUrl: string }>
                 : [],

@@ -142,6 +142,36 @@ assert.match(
   '轮次导航必须接入主线消息列表的 canonical turn 数据与真实滚动容器',
 );
 assert.match(
+  messageListSource,
+  /showPreTurnProcessingIndicator[\s\S]*?messagesState\.isProcessing[\s\S]*?currentRuntimeRenderItem === null/,
+  '消息已提交但 canonical 占位项尚未投影时，主线必须立即显示独立等待动画',
+);
+assert.match(
+  messageListSource,
+  /activeThreadRequestId[\s\S]*?messagesState\.pendingRequests[\s\S]*?findRenderItemByRequestId\(activeThreadRequestId\)/,
+  '连续轮次必须以当前 pending requestId 定位运行卡片，不能复用上一轮残留流式状态',
+);
+assert.match(
+  messageListSource,
+  /runtimeTurnIdentity[\s\S]*?turnIdentity !== stableRuntimeTurnIdentity[\s\S]*?stableStreamingStartAt = 0/,
+  '计时器必须在 requestId 或 turnId 变化时立即重置，不能沿用上一轮计时状态',
+);
+assert.match(
+  messageListSource,
+  /displayContext === 'thread' && activeThreadRequestId[\s\S]*?stableStreamingStartAt = nextStartAt/,
+  '当前本地 requestId 的计时起点必须跟随当前轮次状态，不能被历史事件回放锁定到旧时间',
+);
+assert.match(
+  messageListSource,
+  /runtimeLayoutSignature[\s\S]*?const _runtimeSig = runtimeLayoutSignature[\s\S]*?scrollPanelToBottom\(\)/,
+  '独立等待动画插入时必须触发自动滚动，避免动画已经渲染但停留在可视区域下方',
+);
+assert.match(
+  messageListSource,
+  /return hasTaskRuntime \? \(activeRenderItems\[activeRenderItems\.length - 1\] \|\| null\) : null/,
+  '主线提交等待动画不得错误挂到上一轮已完成消息上',
+);
+assert.match(
   railSource,
   /\.turn-navigation-capsule\s*\{[\s\S]*?right:\s*20px;[\s\S]*?bottom:\s*64px;/,
   '手机端轮次入口必须改为右下角悬浮控件，并避开回到底部按钮',

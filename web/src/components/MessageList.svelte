@@ -10,6 +10,7 @@
   import { tick, onDestroy } from 'svelte';
   import {
     clearMessageJump,
+    beginTurnEditing,
     messagesState,
     setSessionHistoryState,
     updatePanelScrollState,
@@ -101,6 +102,46 @@
   );
 
   const safeRenderMessages = $derived.by(() => activeRenderItems.map((item) => item.message));
+  const latestUserMessageId = $derived.by(() => {
+    if (displayContext !== 'thread') return '';
+    for (let index = activeRenderItems.length - 1; index >= 0; index -= 1) {
+      const message = activeRenderItems[index]?.message;
+      if (message?.type === 'user_input') {
+        return message.id;
+      }
+    }
+    return '';
+  });
+
+  function canEditUserMessage(message: Message): boolean {
+    if (
+      displayContext !== 'thread'
+      || message.id !== latestUserMessageId
+      || messagesState.isProcessing
+      || messagesState.backendProcessing
+    ) {
+      return false;
+    }
+    const metadata = message.metadata || {};
+    return metadata.turnStatus === 'cancelled'
+      && metadata.interruptionSource === 'user'
+      && typeof metadata.turnId === 'string'
+      && metadata.turnId.trim().length > 0;
+  }
+
+  function editUserMessage(message: Message): void {
+    if (!canEditUserMessage(message) || !currentSessionId) return;
+    beginTurnEditing({
+      sessionId: currentSessionId,
+      turnId: String(message.metadata?.turnId || '').trim(),
+      messageId: message.id,
+      text: message.content || '',
+      images: Array.isArray(message.images) ? message.images : [],
+      contextReferences: Array.isArray(message.contextReferences) ? message.contextReferences : [],
+      skillName: typeof message.metadata?.skillName === 'string' ? message.metadata.skillName : null,
+      goalMode: message.metadata?.goalMode === true,
+    });
+  }
 
   function resolveMessageRenderRevision(message: Message): string {
     const metadata = (message.metadata && typeof message.metadata === 'object')
@@ -138,6 +179,19 @@
     return null;
   });
 
+  const activeThreadRequestId = $derived.by(() => {
+    if (displayContext !== 'thread') {
+      return '';
+    }
+    let requestId = '';
+    for (const pendingRequestId of messagesState.pendingRequests) {
+      if (typeof pendingRequestId === 'string' && pendingRequestId.trim()) {
+        requestId = pendingRequestId.trim();
+      }
+    }
+    return requestId;
+  });
+
   function messageMetadataString(message: Message, key: string): string {
     const value = message.metadata?.[key];
     return typeof value === 'string' ? value.trim() : '';
@@ -147,14 +201,32 @@
     return status === 'pending' || status === 'running';
   }
 
-  const currentRuntimeRenderItem = $derived.by(() => {
-    if (currentStreamingRenderItem) {
-      return currentStreamingRenderItem;
+  function findRenderItemByRequestId(requestId: string): TimelineRenderItem | null {
+    if (!requestId) {
+      return null;
     }
+    for (let i = activeRenderItems.length - 1; i >= 0; i -= 1) {
+      const item = activeRenderItems[i];
+      if (messageMetadataString(item.message, 'requestId') === requestId) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  const currentRuntimeRenderItem = $derived.by(() => {
     const hasThreadRuntime = displayContext === 'thread' && messagesState.isProcessing;
     const hasTaskRuntime = displayContext === 'task' && runtimeActive;
     if (!hasThreadRuntime && !hasTaskRuntime) {
       return null;
+    }
+    // 本地主线提交以 requestId 作为当前轮次身份。新轮次占位项尚未投影时必须返回 null，
+    // 不能继续复用上一轮残留的 isStreaming 卡片，否则状态和计时会延迟切换。
+    if (hasThreadRuntime && activeThreadRequestId) {
+      return findRenderItemByRequestId(activeThreadRequestId);
+    }
+    if (currentStreamingRenderItem) {
+      return currentStreamingRenderItem;
     }
     for (let i = activeRenderItems.length - 1; i >= 0; i -= 1) {
       const item = activeRenderItems[i];
@@ -162,7 +234,30 @@
         return item;
       }
     }
-    return activeRenderItems[activeRenderItems.length - 1] || null;
+    // 主线刚提交、canonical 占位 turn 尚未投影时，等待动画应独立显示在列表底部，
+    // 不能错误挂到上一轮已完成消息上。代理详情仍可使用最后一项承载外部运行态。
+    return hasTaskRuntime ? (activeRenderItems[activeRenderItems.length - 1] || null) : null;
+  });
+
+  const showPreTurnProcessingIndicator = $derived.by(() => (
+    displayContext === 'thread'
+    && messagesState.isProcessing
+    && currentRuntimeRenderItem === null
+  ));
+
+  const runtimeTurnIdentity = $derived.by(() => {
+    if (displayContext === 'thread' && activeThreadRequestId) {
+      return `request:${activeThreadRequestId}`;
+    }
+    const runtimeMessage = currentRuntimeRenderItem?.message;
+    if (runtimeMessage) {
+      const turnId = messageMetadataString(runtimeMessage, 'turnId');
+      return turnId ? `turn:${turnId}` : `message:${runtimeMessage.id}`;
+    }
+    if (displayContext === 'task' && runtimeActive) {
+      return `task:${taskId || ''}:${normalizedRuntimeStartedAt}`;
+    }
+    return '';
   });
 
   // 计时器代表「整个 turn 还在跑」，锚到该 turn 内 displayOrder 最大的非 user_input render item，
@@ -193,12 +288,6 @@
 
   const resolvedStreamingStartAt = $derived.by(() => {
     const message = currentRuntimeRenderItem?.message || null;
-    if (!message) {
-      return 0;
-    }
-    if (displayContext === 'task' && normalizedRuntimeStartedAt > 0) {
-      return normalizedRuntimeStartedAt;
-    }
     const processingStartAt = displayContext === 'thread' ? messagesState.thinkingStartAt : 0;
     if (
       typeof processingStartAt === 'number'
@@ -206,6 +295,12 @@
       && processingStartAt > 0
     ) {
       return processingStartAt;
+    }
+    if (!message) {
+      return 0;
+    }
+    if (displayContext === 'task' && normalizedRuntimeStartedAt > 0) {
+      return normalizedRuntimeStartedAt;
     }
     const timestamp = message.timestamp;
     if (typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0) {
@@ -216,14 +311,20 @@
 
   let stableStreamingStartAt = $state(0);
   let stableStreamingPanelKey = $state('');
+  let stableRuntimeTurnIdentity = $state('');
 
   $effect(() => {
     const panelKey = runtimePanelKey || '';
-    if (panelKey !== stableStreamingPanelKey) {
+    const turnIdentity = runtimeTurnIdentity;
+    if (
+      panelKey !== stableStreamingPanelKey
+      || turnIdentity !== stableRuntimeTurnIdentity
+    ) {
       stableStreamingPanelKey = panelKey;
+      stableRuntimeTurnIdentity = turnIdentity;
       stableStreamingStartAt = 0;
     }
-    if (!currentRuntimeRenderItem) {
+    if (!currentRuntimeRenderItem && !showPreTurnProcessingIndicator) {
       stableStreamingStartAt = 0;
       return;
     }
@@ -231,7 +332,9 @@
     if (!(typeof nextStartAt === 'number' && Number.isFinite(nextStartAt) && nextStartAt > 0)) {
       return;
     }
-    if (stableStreamingStartAt === 0 || nextStartAt < stableStreamingStartAt) {
+    if (displayContext === 'thread' && activeThreadRequestId) {
+      stableStreamingStartAt = nextStartAt;
+    } else if (stableStreamingStartAt === 0 || nextStartAt < stableStreamingStartAt) {
       stableStreamingStartAt = nextStartAt;
     }
   });
@@ -239,14 +342,19 @@
   const timerStartTime = $derived.by(() => stableStreamingStartAt);
 
   const shouldRunTimer = $derived.by(() => {
-    return timerStartTime > 0 && Boolean(currentRuntimeRenderItem);
+    return timerStartTime > 0 && (Boolean(currentRuntimeRenderItem) || showPreTurnProcessingIndicator);
   });
 
   const showStandaloneStreamingIndicator = $derived.by(() => (
     shouldRunTimer
-    && streamingIndicatorRenderKey === null
-    && activeRenderItems.length > 0
+    && (showPreTurnProcessingIndicator || (
+      streamingIndicatorRenderKey === null
+      && activeRenderItems.length > 0
+    ))
   ));
+  const runtimeLayoutSignature = $derived(
+    `${runtimeTurnIdentity}:${showStandaloneStreamingIndicator ? 'standalone' : streamingIndicatorRenderKey || ''}`
+  );
 
   let elapsedSeconds = $state(0);
   let timerInterval: ReturnType<typeof setInterval> | null = null;
@@ -278,7 +386,7 @@
   const emptyIcon = $derived((emptyState?.icon || 'chat') as import('../lib/icons').IconName);
   const emptyTitle = $derived(emptyState?.title || i18n.t('messageList.empty.title'));
   const emptyHint = $derived(emptyState?.hint || i18n.t('messageList.empty.hint'));
-  const showSuggestions = $derived(displayContext === 'thread' && !emptyState);
+  const showSuggestions = $derived(displayContext === 'thread' && !emptyState && !messagesState.isProcessing);
   const suggestionItems = $derived([
     i18n.t('messageList.suggestions.s1'),
     i18n.t('messageList.suggestions.s2'),
@@ -467,8 +575,10 @@
     const active = isActive;
     const _len = safeRenderMessages.length;
     const _sig = renderContentSignature;
+    const _runtimeSig = runtimeLayoutSignature;
     void _len;
     void _sig;
+    void _runtimeSig;
     if (!active || !shouldAutoScroll || !containerRef) return;
     tick().then(() => {
       if (!containerRef || !isActive || !shouldAutoScroll) return;
@@ -695,16 +805,18 @@
           }}
           showStreamingIndicator={item.key === streamingIndicatorRenderKey}
           streamingElapsedSeconds={item.key === streamingIndicatorRenderKey ? elapsedSeconds : 0}
+          canEdit={canEditUserMessage(item.message)}
+          onEdit={() => editUserMessage(item.message)}
         />
       {/each}
-      {#if showStandaloneStreamingIndicator}
-        <div class="streaming-indicator-standalone" aria-label={i18n.t('runtimeState.status.running')}>
-          <span class="streaming-dot"></span>
-          <span class="streaming-dot"></span>
-          <span class="streaming-dot"></span>
-          <span class="streaming-elapsed-time">{formatElapsed(elapsedSeconds)}</span>
-        </div>
-      {/if}
+    {/if}
+    {#if showStandaloneStreamingIndicator}
+      <div class="streaming-indicator-standalone" aria-label={i18n.t('runtimeState.status.running')}>
+        <span class="streaming-dot"></span>
+        <span class="streaming-dot"></span>
+        <span class="streaming-dot"></span>
+        <span class="streaming-elapsed-time">{formatElapsed(elapsedSeconds)}</span>
+      </div>
     {/if}
   </div>
 

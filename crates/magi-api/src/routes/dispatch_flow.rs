@@ -179,10 +179,12 @@ async fn execute_dispatch_submission(
         task_tier,
         access_profile: request.requested_access_profile(),
         skill_name,
+        goal_mode: request.goal_mode,
         target_role,
         request_id: request.request_id(),
         user_message_id: request.user_message_id(),
         placeholder_message_id: request.placeholder_message_id(),
+        replace_turn_id: request.replace_turn_id(),
     };
     let accepted = submit_dispatch_submission(state, dispatch)?;
     if let Err(error) = state.persist_session_state_checkpoint("session_task_turn_accepted") {
@@ -197,6 +199,15 @@ async fn execute_dispatch_submission(
         accepted_at,
         &message,
     );
+    if let Some(superseded_turn) = accepted.superseded_turn.as_ref() {
+        super::publish_superseded_turn_event(
+            state,
+            &session_id,
+            workspace_id.as_ref(),
+            accepted_at,
+            superseded_turn,
+        );
+    }
     let event_id = publish_session_turn_task_accepted_event(state, request, &accepted)?;
     if created_session {
         crate::session_title::spawn_new_session_title_refinement(

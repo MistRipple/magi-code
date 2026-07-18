@@ -1011,6 +1011,57 @@ await withGoldenViteServer(async (server) => {
     'terminal bootstrap refresh must finish applying before tunnel reconciliation starts',
   );
 
+  const canonicalTurnsBeforeLaterRound = structuredClone(turnStore.turnStoreState.reducer.turns);
+  const laterRoundAccepted = deferred();
+  sessionTurnInterceptors.push(() => laterRoundAccepted.promise);
+  bridge.postMessage({
+    type: 'executeTask',
+    text: '后续轮次也必须立刻出现发送反馈。',
+    requestId: 'request-later-round-immediate-feedback',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+  });
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    '已有会话的后续轮次必须在提交事件返回前进入 processing 状态',
+  );
+  assert.equal(
+    findArtifactByRequestId(
+      messagesStore.messagesState.canonicalTimelineProjection,
+      'request-later-round-immediate-feedback',
+    ),
+    undefined,
+    '后续轮次也必须先绘制轻量等待状态，再执行本地 canonical 投影',
+  );
+  await waitFor(
+    () => Boolean(findArtifactByRequestId(
+      messagesStore.messagesState.canonicalTimelineProjection,
+      'request-later-round-immediate-feedback',
+    )),
+    '后续轮次必须在下一次 UI 绘制后补齐本地 pending turn',
+  );
+  laterRoundAccepted.resolve(jsonResponse({
+    sessionId: SESSION_ID,
+    entryId: 'timeline-later-round-immediate-feedback',
+    eventId: 'event-later-round-immediate-feedback',
+    acceptedAt: ACCEPTED_AT + 2250,
+    createdSession: false,
+    route: 'chat',
+    userMessageItemId: 'user-later-round-immediate-feedback',
+    canonicalSchemaVersion: null,
+    canonicalEventKind: null,
+    canonicalTurn: null,
+    canonicalItem: null,
+  }));
+  await waitFor(
+    () => capturedTurnBodies.some((body) => body.requestId === 'request-later-round-immediate-feedback'),
+    '后续轮次必须正常提交到后端',
+  );
+  turnStore.replaceCanonicalSessionTurns(SESSION_ID, canonicalTurnsBeforeLaterRound);
+  messagesStore.settleAuthoritativeIdleState();
+
   const localUrlBeforeTunnelSync = window.location.href;
   const workspaceSessionRequestsBeforeTunnelSync = workspaceSessionsRequestCount;
   const bootstrapRequestsBeforeTunnelSync = bootstrapRequestCount;
@@ -1500,6 +1551,19 @@ await withGoldenViteServer(async (server) => {
     workspacePath: WORKSPACE_PATH,
     sessionId: '',
   });
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    '提交事件返回前必须先进入本地 processing 状态，让按钮与等待动画立即响应',
+  );
+  assert.equal(
+    findArtifactByRequestId(
+      messagesStore.messagesState.canonicalTimelineProjection,
+      'request-first-turn-immediate-feedback',
+    ),
+    undefined,
+    '首帧反馈必须先于可能较重的 canonical 本地投影',
+  );
   await waitFor(
     () => capturedTurnBodies.some((body) => body.requestId === 'request-first-turn-immediate-feedback'),
     'first turn submit must reach backend',

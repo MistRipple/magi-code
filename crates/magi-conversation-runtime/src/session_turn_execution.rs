@@ -248,6 +248,7 @@ fn build_session_turn_messages(
                     turn.turn_id != request.turn_id
                         && turn.accepted_at.0 < accepted_at.0
                         && turn.status != magi_session_store::CanonicalTurnStatus::Cancelled
+                        && turn.status != magi_session_store::CanonicalTurnStatus::Superseded
                 })
                 .flat_map(|turn| turn.items.into_iter())
                 .filter_map(|item| {

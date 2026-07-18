@@ -111,6 +111,16 @@ async fn submit_session_turn(
             .map(Json);
     }
     let decision = decide_session_turn_with_task_planner(&state, &request)?;
+    if request.replace_turn_id().is_some()
+        && matches!(
+            decision.route,
+            SessionTurnRouteDto::Continue | SessionTurnRouteDto::Steer
+        )
+    {
+        return Err(ApiError::InvalidInput(
+            "编辑上一条消息必须开始新的对话轮次".to_string(),
+        ));
+    }
     if matches!(
         decision.route,
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute | SessionTurnRouteDto::Task
@@ -124,6 +134,9 @@ async fn submit_session_turn(
             .ensure_current_turn_acceptance_available(&session_id)
         {
             Ok(()) => {}
+            Err(error) if request.replace_turn_id().is_some() => {
+                return Err(map_turn_replacement_error(&state, &session_id, error));
+            }
             Err(error) if domain_error_is_active_current_turn(&error) => {
                 return Ok(Json(enqueue_session_turn_response(
                     EnqueueSessionTurnInput {
@@ -477,6 +490,16 @@ fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), Ap
         && request.context_references.is_empty()
     {
         return Err(ApiError::InvalidInput("会话输入不能为空".to_string()));
+    }
+    if request.replace_turn_id().is_some() && request.requested_session_id().is_none() {
+        return Err(ApiError::InvalidInput(
+            "编辑上一条消息需要明确的 sessionId".to_string(),
+        ));
+    }
+    if request.replace_turn_id().is_some() && request.steer_current_turn {
+        return Err(ApiError::InvalidInput(
+            "编辑上一条消息不能同时作为当前轮次引导".to_string(),
+        ));
     }
     Ok(())
 }
@@ -1334,6 +1357,7 @@ async fn submit_regular_session_turn(
     let request_id = request.request_id();
     let user_message_id = request.user_message_id();
     let requested_placeholder_message_id = request.placeholder_message_id();
+    let replace_turn_id = request.replace_turn_id();
     // P7：所有 turn item 必须携带 source_thread_id，由 ensure_session_mission 提供 orchestrator thread。
     let (_mission_id, orchestrator_thread_id) =
         state
@@ -1360,6 +1384,27 @@ async fn submit_regular_session_turn(
             &context_references,
         ),
     );
+    if let Some(replace_turn_id) = replace_turn_id.as_ref() {
+        user_message_metadata.insert(
+            "replacesTurnId".to_string(),
+            serde_json::Value::String(replace_turn_id.clone()),
+        );
+    }
+    if let Some(skill_name) = request
+        .skill_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        user_message_metadata.insert(
+            "skillName".to_string(),
+            serde_json::Value::String(skill_name.to_string()),
+        );
+    }
+    user_message_metadata.insert(
+        "goalMode".to_string(),
+        serde_json::Value::Bool(request.goal_mode),
+    );
     let (user_message_item_id, user_message_item) =
         build_user_message_turn_item(UserMessageTurnItemInput {
             accepted_at,
@@ -1383,15 +1428,37 @@ async fn submit_regular_session_turn(
         items: vec![user_message_item],
     };
     turn.normalize();
-    let (entry_id, _) = match state.session_store.accept_current_turn_with_timeline_entry(
-        session_id.clone(),
-        entry_id,
-        TimelineEntryKind::UserMessage,
-        message.clone(),
-        accepted_at,
-        turn,
-    ) {
+    let accept_result = if let Some(replace_turn_id) = replace_turn_id.as_deref() {
+        state
+            .session_store
+            .replace_current_turn_with_timeline_entry(
+                session_id.clone(),
+                replace_turn_id,
+                entry_id,
+                TimelineEntryKind::UserMessage,
+                message.clone(),
+                accepted_at,
+                turn,
+            )
+            .map(|(entry_id, sidecar, superseded_turn)| (entry_id, sidecar, Some(superseded_turn)))
+    } else {
+        state
+            .session_store
+            .accept_current_turn_with_timeline_entry(
+                session_id.clone(),
+                entry_id,
+                TimelineEntryKind::UserMessage,
+                message.clone(),
+                accepted_at,
+                turn,
+            )
+            .map(|(entry_id, sidecar)| (entry_id, sidecar, None))
+    };
+    let (entry_id, _, superseded_turn) = match accept_result {
         Ok(accepted) => accepted,
+        Err(error) if replace_turn_id.is_some() => {
+            return Err(map_turn_replacement_error(&state, &session_id, error));
+        }
         Err(error) if domain_error_is_active_current_turn(&error) => {
             return Ok(enqueue_session_turn_response(EnqueueSessionTurnInput {
                 state: &state,
@@ -1448,6 +1515,15 @@ async fn submit_regular_session_turn(
         accepted_at,
         &message,
     );
+    if let Some(superseded_turn) = superseded_turn.as_ref() {
+        super::publish_superseded_turn_event(
+            &state,
+            &session_id,
+            workspace_id.as_ref(),
+            accepted_at,
+            superseded_turn,
+        );
+    }
     let accepted_canonical_turn = state
         .session_store
         .canonical_turns_for_session(&session_id)
@@ -2672,6 +2748,7 @@ fn turn_status_is_interruptible(status: &str) -> bool {
             | "error"
             | "cancelled"
             | "canceled"
+            | "superseded"
     )
 }
 
@@ -2688,6 +2765,24 @@ fn map_current_turn_accept_error(context: &str, error: DomainError) -> ApiError 
             ApiError::conflict(context, &message)
         }
         other => ApiError::internal_assembly(context, other),
+    }
+}
+
+fn map_turn_replacement_error(
+    state: &ApiState,
+    session_id: &SessionId,
+    error: DomainError,
+) -> ApiError {
+    match error {
+        DomainError::InvalidState { .. } => ApiError::turn_conflict(
+            "turn_not_latest",
+            state
+                .session_store
+                .runtime_sidecar(session_id)
+                .and_then(|sidecar| sidecar.current_turn.map(|turn| turn.turn_id)),
+            "最近一条消息已发生变化，请基于最新会话重新编辑",
+        ),
+        other => ApiError::internal_assembly("替换最近一条消息失败", other),
     }
 }
 
@@ -2878,7 +2973,7 @@ async fn interrupt_session_turn(
     if interrupted {
         let cancelled_item_id = state
             .session_store
-            .cancel_current_turn(&session_id)
+            .interrupt_current_turn_by_user(&session_id)
             .map_err(|error| ApiError::internal_assembly("中断 session turn 失败", error))?
             .and_then(|sidecar| sidecar.current_turn)
             .and_then(|turn| turn.items.last().map(|item| item.item_id.clone()));
@@ -3120,6 +3215,7 @@ fn finalize_continue_session(
             action_task_id: accepted.action_task_id.clone(),
             user_message_item_id: format!("turn-item-user-{}", continued_at.0),
             runner_started: accepted.runner_started,
+            superseded_turn: None,
         },
     );
 
@@ -4220,6 +4316,7 @@ mod tests {
             placeholder_message_id: None,
             steer_current_turn: false,
             expected_turn_id: None,
+            replace_turn_id: None,
         }
     }
 
@@ -4751,30 +4848,60 @@ mod tests {
                     status: "running".to_string(),
                     completed_at: None,
                     user_message: Some("请生成一段长内容".to_string()),
-                    items: vec![ActiveExecutionTurnItem {
-                        item_id: "assistant-interrupt-canonical".to_string(),
-                        item_seq: 1,
-                        kind: "assistant_stream".to_string(),
-                        status: "running".to_string(),
-                        source: "orchestrator".to_string(),
-                        title: Some("生成回复".to_string()),
-                        content: Some("生成中".to_string()),
-                        task_id: None,
-                        worker_id: None,
-                        role_id: None,
-                        tool_call_id: None,
-                        tool_name: None,
-                        tool_status: None,
-                        tool_arguments: None,
-                        tool_result: None,
-                        tool_error: None,
-                        request_id: Some("request-interrupt-canonical".to_string()),
-                        user_message_id: Some("user-interrupt-canonical".to_string()),
-                        placeholder_message_id: Some("assistant-interrupt-canonical".to_string()),
-                        metadata: Default::default(),
-                        timeline_entry_id: None,
-                        source_thread_id: orchestrator_thread_id,
-                    }],
+                    items: vec![
+                        ActiveExecutionTurnItem {
+                            item_id: "user-interrupt-canonical".to_string(),
+                            item_seq: 1,
+                            kind: "user_message".to_string(),
+                            status: "completed".to_string(),
+                            source: "user".to_string(),
+                            title: None,
+                            content: Some("请生成一段长内容".to_string()),
+                            task_id: None,
+                            worker_id: None,
+                            role_id: None,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_status: None,
+                            tool_arguments: None,
+                            tool_result: None,
+                            tool_error: None,
+                            request_id: Some("request-interrupt-canonical".to_string()),
+                            user_message_id: Some("user-interrupt-canonical".to_string()),
+                            placeholder_message_id: Some(
+                                "assistant-interrupt-canonical".to_string(),
+                            ),
+                            metadata: Default::default(),
+                            timeline_entry_id: None,
+                            source_thread_id: orchestrator_thread_id.clone(),
+                        },
+                        ActiveExecutionTurnItem {
+                            item_id: "assistant-interrupt-canonical".to_string(),
+                            item_seq: 2,
+                            kind: "assistant_stream".to_string(),
+                            status: "running".to_string(),
+                            source: "orchestrator".to_string(),
+                            title: Some("生成回复".to_string()),
+                            content: Some("生成中".to_string()),
+                            task_id: None,
+                            worker_id: None,
+                            role_id: None,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_status: None,
+                            tool_arguments: None,
+                            tool_result: None,
+                            tool_error: None,
+                            request_id: Some("request-interrupt-canonical".to_string()),
+                            user_message_id: Some("user-interrupt-canonical".to_string()),
+                            placeholder_message_id: Some(
+                                "assistant-interrupt-canonical".to_string(),
+                            ),
+                            metadata: Default::default(),
+                            timeline_entry_id: None,
+                            source_thread_id: orchestrator_thread_id,
+                        },
+                    ],
                 },
             )
             .expect("current turn should persist");
@@ -4828,6 +4955,10 @@ mod tests {
         assert_eq!(
             interrupted_event.payload["canonical_turn"]["status"],
             "cancelled"
+        );
+        assert_eq!(
+            interrupted_event.payload["canonical_turn"]["items"][0]["metadata"]["interruptionSource"],
+            "user"
         );
         assert_eq!(
             interrupted_event.payload["canonical_item"]["itemId"],
@@ -5771,6 +5902,7 @@ mod tests {
                 placeholder_message_id: Some("assistant-canonical-first-frame".to_string()),
                 steer_current_turn: false,
                 expected_turn_id: None,
+                replace_turn_id: None,
             },
             Vec::new(),
             workspace_id,
@@ -5854,6 +5986,7 @@ mod tests {
                 placeholder_message_id: Some("assistant-draft-orchestrator-model".to_string()),
                 steer_current_turn: false,
                 expected_turn_id: None,
+                replace_turn_id: None,
             },
             Vec::new(),
             workspace_id,
@@ -5894,6 +6027,7 @@ mod tests {
             placeholder_message_id: Some("assistant-image-turn".to_string()),
             steer_current_turn: false,
             expected_turn_id: None,
+            replace_turn_id: None,
         };
         let images = request.parsed_images().expect("image should parse");
         let response = submit_regular_session_turn(
@@ -6010,6 +6144,7 @@ mod tests {
                 placeholder_message_id: Some("assistant-queued-turn".to_string()),
                 steer_current_turn: false,
                 expected_turn_id: None,
+                replace_turn_id: None,
             },
             Vec::new(),
             workspace_id.clone(),
@@ -6139,6 +6274,7 @@ mod tests {
                 placeholder_message_id: Some("assistant-queue-a".to_string()),
                 steer_current_turn: false,
                 expected_turn_id: None,
+                replace_turn_id: None,
             },
             Vec::new(),
             workspace_a.clone(),
@@ -6165,6 +6301,7 @@ mod tests {
                 placeholder_message_id: Some("assistant-queue-b".to_string()),
                 steer_current_turn: false,
                 expected_turn_id: None,
+                replace_turn_id: None,
             },
             Vec::new(),
             workspace_b.clone(),
@@ -6455,6 +6592,7 @@ mod tests {
             placeholder_message_id: Some("assistant-simple-chat".to_string()),
             steer_current_turn: false,
             expected_turn_id: None,
+            replace_turn_id: None,
         };
         let accepted_at = UtcMillis(1_700_000_000_000);
         let response = submit_regular_session_turn(
@@ -6516,6 +6654,7 @@ mod tests {
             placeholder_message_id: Some("assistant-simple-execute".to_string()),
             steer_current_turn: false,
             expected_turn_id: None,
+            replace_turn_id: None,
         };
         let accepted_at = UtcMillis(1_700_000_001_000);
         let mut decision = classifier_chat_decision();

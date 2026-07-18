@@ -2097,6 +2097,7 @@ mod tests {
 
         fn execute(
             &self,
+            _tool_call_id: &ToolCallId,
             input: &str,
             context: &ToolExecutionContext,
             _resources: &magi_tool_runtime::ToolRuntimeResources,
@@ -2139,6 +2140,7 @@ mod tests {
 
         fn execute(
             &self,
+            _tool_call_id: &ToolCallId,
             _input: &str,
             _context: &ToolExecutionContext,
             _resources: &magi_tool_runtime::ToolRuntimeResources,

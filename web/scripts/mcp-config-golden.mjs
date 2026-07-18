@@ -38,6 +38,44 @@ await withGoldenViteServer(async (server) => {
     'missingCommand',
   );
 
+  assert.deepEqual(
+    mcpConfig.hydrateMcpFormDraft('mcp-server', {
+      type: 'stdio',
+      command: '',
+      args: [],
+      env: {},
+      enabled: true,
+    }),
+    {
+      ok: true,
+      draft: {
+        name: 'mcp-server',
+        type: 'stdio',
+        enabled: true,
+        command: '',
+        args: [],
+        env: [],
+        url: '',
+        headers: [],
+        requestTimeoutSeconds: '',
+      },
+    },
+    'Mode switching must preserve an incomplete stdio draft without requiring command',
+  );
+  assert.deepEqual(
+    mcpConfig.hydrateMcpFormDraft('remote', {
+      type: 'streamable-http',
+      url: '',
+      headers: {},
+    }).ok,
+    true,
+    'Mode switching must preserve an incomplete HTTP draft without requiring url',
+  );
+  assert.equal(
+    mcpConfig.hydrateMcpFormDraft('remote', { type: 'streamable-http', headers: [] }).error,
+    'headersMustBeObject',
+  );
+
   const httpForm = mcpConfig.createMcpFormDraft('web-search-prime', {
     type: 'http',
     url: 'https://example.test/mcp',

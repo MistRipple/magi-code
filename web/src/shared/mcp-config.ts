@@ -27,6 +27,10 @@ export type McpFormDraftConversionResult =
   | { ok: true; name: string; config: Record<string, unknown> }
   | { ok: false; error: McpFormDraftConversionError };
 
+export type McpFormDraftHydrationResult =
+  | { ok: true; draft: McpFormDraft }
+  | { ok: false; error: McpFormDraftConversionError | McpServerDraftError };
+
 export type NormalizedMcpServerDraft = {
   id: string;
   name: string;
@@ -77,6 +81,53 @@ export function createMcpFormDraft(
     requestTimeoutSeconds: typeof timeout === 'number' && Number.isFinite(timeout)
       ? String(timeout / 1000)
       : '',
+  };
+}
+
+/**
+ * 将 JSON 配置切回表单草稿时只校验表单能否表达该结构。
+ * command、url 等必填项留到保存阶段校验，避免模式切换阻断尚未完成的配置。
+ */
+export function hydrateMcpFormDraft(
+  name: string,
+  rawConfig: Record<string, unknown>,
+): McpFormDraftHydrationResult {
+  if (!name.trim()) {
+    return { ok: false, error: 'missingName' };
+  }
+
+  const transport = resolveMcpTransport(
+    stringValue(rawConfig.type).toLowerCase(),
+    stringValue(rawConfig.url),
+  );
+  if (!transport) {
+    return { ok: false, error: 'unsupportedType' };
+  }
+
+  if (
+    rawConfig.args !== undefined
+    && (!Array.isArray(rawConfig.args) || rawConfig.args.some((value) => typeof value !== 'string'))
+  ) {
+    return { ok: false, error: 'argsMustBeArray' };
+  }
+  if (rawConfig.env !== undefined && !isStringRecord(rawConfig.env)) {
+    return { ok: false, error: 'envMustBeObject' };
+  }
+  if (rawConfig.headers !== undefined && !isStringRecord(rawConfig.headers)) {
+    return { ok: false, error: 'headersMustBeObject' };
+  }
+
+  const timeout = rawConfig.requestTimeoutMs;
+  if (
+    timeout !== undefined
+    && (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout < 1_000 || timeout > 300_000)
+  ) {
+    return { ok: false, error: 'invalidTimeout' };
+  }
+
+  return {
+    ok: true,
+    draft: createMcpFormDraft(name.trim(), { ...rawConfig, type: transport }),
   };
 }
 

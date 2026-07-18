@@ -375,6 +375,19 @@ export function reduceCanonicalTurnEvent(
   const existingIndex = findCanonicalTurnIndex(turns, event);
   const existing = existingIndex >= 0 ? turns[existingIndex] : undefined;
 
+  if (existing?.status === 'superseded') {
+    const nextEventSeq = event.eventSeq > 0
+      ? Math.max(state.lastAppliedEventSeq, event.eventSeq)
+      : state.lastAppliedEventSeq;
+    return nextEventSeq === state.lastAppliedEventSeq
+      ? { state, changed: false }
+      : {
+          state: { ...state, lastAppliedEventSeq: nextEventSeq },
+          changed: false,
+          cursorAdvanced: true,
+        };
+  }
+
   if (!targetTurn) {
     if (!event.item) {
       return { state, changed: false, error: `canonical turn event ${event.eventId} missing turn and item` };

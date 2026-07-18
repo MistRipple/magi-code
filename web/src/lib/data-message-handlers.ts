@@ -58,7 +58,6 @@ import {
 import { buildEmptyWorkspaceAppState } from '../shared/bridges/empty-workspace-state';
 import { settingsBootstrapMatchesCurrentWorkspace } from '../web/agent-api';
 import type { CanonicalTurn, CanonicalTurnEvent } from '../shared/protocol/canonical-turn';
-import { isCanonicalTerminalStatus } from '../shared/protocol/canonical-turn';
 import { deriveProcessingStateFromCanonicalTurns } from '../shared/protocol/canonical-processing';
 import {
   applyCanonicalTurnEvent,
@@ -561,11 +560,20 @@ export function handleUnifiedData(standard: StandardMessage) {
     case 'processingStateChanged': {
       const isProcessing = payload.isProcessing as boolean | undefined;
       const transitionKind = payload.transitionKind as 'derived' | 'forced' | undefined;
+      const reason = typeof payload.reason === 'string' ? payload.reason.trim() : '';
       // 当前只接受强制 idle 终态信号。
       // processing=true 统一由本地 pending request 或后端 authoritative snapshot 驱动，
       // 这里不再保留兜底抬升路径，避免处理态出现双真相源。
       if (isProcessing === false && transitionKind === 'forced') {
-        clearProcessingState();
+        // 同一 workspace 的 SSE 重放会包含当前 session 的历史终态。新请求已经建立
+        // 本地绑定、但 canonical started 尚未投影时，历史 forced idle 不得终止新轮次。
+        // 用户主动中断是唯一允许越过本地绑定直接收敛的显式操作。
+        const isExplicitUserInterrupt = reason.startsWith('user_') && reason.includes('interrupt');
+        const shouldPreserveBoundSubmission = hasBoundLocalPendingRequest()
+          && !isExplicitUserInterrupt;
+        if (!shouldPreserveBoundSubmission) {
+          clearProcessingState();
+        }
       }
       const source = payload.source as string | undefined;
       const agent = payload.agent as string | undefined;
@@ -869,6 +877,12 @@ function hasPendingLocalRequest(): boolean {
   return messagesState.pendingRequests.size > 0;
 }
 
+function hasBoundLocalPendingRequest(): boolean {
+  return listRequestBindings().some((binding) => (
+    messagesState.pendingRequests.has(binding.requestId)
+  ));
+}
+
 function canonicalTurnsForSession(sessionId: string, turns: unknown): CanonicalTurn[] {
   if (!Array.isArray(turns)) {
     return [];
@@ -925,13 +939,13 @@ function handleSessionTurnCanonicalEventUpdated(message: ClientBridgeMessage) {
     return;
   }
   if (projection && setCanonicalTimelineProjection(projection)) {
-    if (canonicalEvent.turn) {
-      const processingState = deriveProcessingStateFromCanonicalTurns([canonicalEvent.turn], sessionId);
-      applyAuthoritativeProcessingState(processingState);
-      if (!processingState && isCanonicalTerminalStatus(canonicalEvent.turn.status)) {
-        clearProcessingState();
-      }
-    }
+    // processing 是会话级状态，必须从 reducer 中该会话的完整 turn 集合推导。
+    // 事件流重连会回放历史 turn；若只看当前单条历史终态事件，会错误清除刚提交的新轮次。
+    const processingState = deriveProcessingStateFromCanonicalTurns(
+      turnStoreState.reducer.turns,
+      sessionId,
+    );
+    applyAuthoritativeProcessingState(processingState);
     reconcileRequestBindingsFromAuthoritativeThread(sessionId);
   }
 }
@@ -1051,7 +1065,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       const preserveLocalTurnDuringStaleIdle = hadLiveTurnBeforeSnapshot
         && hadPendingLocalRequestBeforeSnapshot
         && authoritativeSnapshotIsIdle
-        && canonicalSessionTurns.length === 0;
+        && (canonicalSessionTurns.length === 0 || hasBoundLocalPendingRequest());
 
       handleStateUpdate({
         ...message,
@@ -1087,7 +1101,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       if (
         authoritativeSnapshotIsIdle
         && shouldApplyCanonicalSnapshot
-        && !preserveLocalTurnDuringStaleIdle
+        && !hasPendingLocalRequest()
       ) {
         settleAuthoritativeIdleState();
       }

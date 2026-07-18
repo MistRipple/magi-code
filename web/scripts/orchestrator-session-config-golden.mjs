@@ -66,8 +66,8 @@ await withGoldenViteServer(async (server) => {
 const inputAreaSource = await readFile(new URL('../src/components/InputArea.svelte', import.meta.url), 'utf8');
 assert.match(
   inputAreaSource,
-  /const orchestratorSessionConfig = await resolveTurnOrchestratorSessionConfigPayload\(\);[\s\S]*?if \(!orchestratorSessionConfig\) \{[\s\S]*?return;/,
-  '回车发送必须等待默认模型加载完成，模型仍不可用时不得提交空配置',
+  /const orchestratorSessionConfig = resolveTurnOrchestratorSessionConfigPayload\(\);[\s\S]*?if \(!orchestratorSessionConfig\) \{[\s\S]*?return;/,
+  '回车发送必须同步读取当前模型快照，模型不可用时不得提交空配置',
 );
 assert.match(
   inputAreaSource,
@@ -76,8 +76,8 @@ assert.match(
 );
 assert.match(
   inputAreaSource,
-  /if \(!model && !pickerLoadedOnce\) \{[\s\S]*?await loadPickerModels\(\);/,
-  '模型列表已经失败时不得在每次发送时自动重复请求',
+  /if \(!pickerLoadedOnce && !pickerLoading\) \{[\s\S]*?void loadPickerModels\(\);/,
+  '模型快照不可用时必须打开选择器并后台加载模型，不得阻塞发送交互',
 );
 assert.match(
   inputAreaSource,

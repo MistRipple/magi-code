@@ -23,6 +23,8 @@ use axum::{
     routing::get,
 };
 use magi_core::{SessionId, UtcMillis, WorkspaceId};
+use magi_event_bus::{EventContext, EventEnvelope};
+use magi_session_store::{CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -40,6 +42,36 @@ fn monotonic_accepted_at() -> UtcMillis {
 pub(super) fn new_session_id() -> SessionId {
     let nonce = SESSION_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
     SessionId::new(format!("session-{}-{}", UtcMillis::now().0, nonce))
+}
+
+pub(super) fn publish_superseded_turn_event(
+    state: &ApiState,
+    session_id: &SessionId,
+    workspace_id: Option<&WorkspaceId>,
+    occurred_at: UtcMillis,
+    turn: &CanonicalTurn,
+) {
+    state.event_bus.publish(
+        EventEnvelope::domain(
+            magi_core::EventId::new(format!(
+                "event-session-turn-superseded-{}-{}",
+                turn.turn_id, occurred_at.0
+            )),
+            "session.turn.superseded",
+            serde_json::json!({
+                "session_id": session_id,
+                "workspace_id": workspace_id,
+                "canonical_schema_version": CANONICAL_TURN_SCHEMA_VERSION,
+                "canonical_event_kind": "turn_superseded",
+                "canonical_turn": turn,
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(session_id.clone()),
+            workspace_id: workspace_id.cloned(),
+            ..EventContext::default()
+        }),
+    );
 }
 
 use crate::{

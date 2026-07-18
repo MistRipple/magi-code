@@ -90,8 +90,10 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsEmpty(dataHandlers, messagesStore);
   assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, messagesStore);
   assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(dataHandlers, messagesStore);
+  assertHistoricalTerminalReplayDoesNotClearCurrentTurn(dataHandlers, messagesStore);
   assertTerminalLateUpsertIsIgnored(reducer, projection);
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
+  assertSupersededTurnDisappearsAndRejectsLateEvents(reducer, projection);
   assertFailedAssistantTextUsesPlainMessageShell(reducer, projection);
   assertSplitToolStartedAndResultCollapseIntoOneCard(reducer, projection);
   assertCancelledToolShowsTurnResponseDuration(reducer, projection);
@@ -109,7 +111,10 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertBootstrapFiltersForeignWorkspaceSessions(contract);
   assertBootstrapExplicitWorkspaceWinsOverForeignCurrentSession(contract);
   assertMessagesStoreClearsLocalPendingFromAuthoritativeIdle(messagesStore);
+  assertHistoricalIdlePreservesBoundLocalSubmission(messagesStore);
+  assertHistoricalForcedIdlePreservesBoundLocalSubmission(dataHandlers, messagesStore);
   assertSessionSwitchClearsExecutionState(messagesStore);
+  assertLocalTurnSubmissionStartsAtomically(messagesStore);
   assertCanonicalTurnModelRejectsSnakeCase(canonicalProtocol);
   assertCanonicalStreamPayloadParsesWithoutSnapshots(canonicalProtocol);
   assertCanonicalStreamDeltaUpdatesOneItem(reducer, projection);
@@ -117,6 +122,71 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertBootstrapSeedsCanonicalEventWatermark(reducer);
   assertUnknownCanonicalBlockHasNoTextFallback(blockRegistry);
   assertMarkdownUrlSanitizerKeepsOnlyValidFileLinks(markdownUrl);
+}
+
+function assertSupersededTurnDisappearsAndRejectsLateEvents(reducer, projection) {
+  const c = baseCase('superseded-turn', 'session-golden-superseded', 'turn-golden-superseded', 11_500);
+  const cancelledTurn = turn(c, 'cancelled', [
+    user(c, 1, '需要修改的消息'),
+    assistantText(c, 2, 'assistant-cancelled', '未完成响应', 'cancelled'),
+  ]);
+  let state = reducer.replaceCanonicalTurns(c.sessionId, [cancelledTurn]);
+  assert.equal(
+    projection.buildCanonicalTimelineProjection(state).artifacts.length,
+    2,
+    'cancelled turn remains visible before the user submits an edit',
+  );
+
+  const superseded = reducer.reduceCanonicalTurnEvent(state, event(c, 2, 'turn_superseded', {
+    turn: {
+      ...cancelledTurn,
+      status: 'superseded',
+      metadata: { supersededReason: 'user_edit' },
+    },
+  }));
+  assert.equal(superseded.error, undefined);
+  assert.equal(superseded.changed, true);
+  state = superseded.state;
+  assert.equal(
+    projection.buildCanonicalTimelineProjection(state).artifacts.length,
+    0,
+    'superseded turn must be removed from the normal timeline projection',
+  );
+
+  const lateCancelled = reducer.reduceCanonicalTurnEvent(state, event(c, 3, 'turn_completed', {
+    turn: cancelledTurn,
+  }));
+  assert.equal(lateCancelled.error, undefined);
+  assert.equal(lateCancelled.changed, false, 'late events from a superseded turn must be ignored');
+  assert.equal(lateCancelled.state.turns[0].status, 'superseded');
+}
+
+function assertLocalTurnSubmissionStartsAtomically(messagesStore) {
+  messagesStore.messagesState.currentWorkspaceId = 'workspace-local-submit';
+  messagesStore.messagesState.currentWorkspacePath = '/tmp/workspace-local-submit';
+  messagesStore.setCurrentSessionId('session-local-submit');
+  messagesStore.clearAllMessages({
+    persist: false,
+    resetTimelineView: true,
+    resetPanelState: true,
+    skipAntiLiftBack: true,
+  });
+  messagesStore.beginLocalTurnSubmission({
+    requestId: 'request-local-submit',
+    placeholderMessageId: 'assistant-local-submit',
+    startedAt: 25_000,
+    source: 'orchestrator',
+    agent: 'orchestrator',
+  });
+
+  assert.equal(messagesStore.messagesState.isProcessing, true);
+  assert.equal(messagesStore.messagesState.thinkingStartAt, 25_000);
+  assert.equal(messagesStore.messagesState.pendingRequests.has('request-local-submit'), true);
+  assert.equal(messagesStore.messagesState.activeMessageIds.has('assistant-local-submit'), true);
+  assert.equal(messagesStore.messagesState.processingActor.source, 'orchestrator');
+
+  messagesStore.settleAuthoritativeIdleState();
+  messagesStore.setCurrentSessionId(null);
 }
 
 function assertMarkdownUrlSanitizerKeepsOnlyValidFileLinks(markdownUrl) {
@@ -1542,6 +1612,145 @@ function assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(data
   messagesStore.setCurrentSessionId(null);
 }
 
+function assertHistoricalTerminalReplayDoesNotClearCurrentTurn(dataHandlers, messagesStore) {
+  const sessionId = 'session-golden-historical-replay';
+  const historical = baseCase(
+    'historical-replay-old-turn',
+    sessionId,
+    'turn-golden-historical-old',
+    12000,
+  );
+  const current = baseCase(
+    'historical-replay-current-turn',
+    sessionId,
+    'turn-golden-historical-current',
+    12100,
+  );
+  const historicalMetadata = { requestId: 'request-historical-old' };
+  const currentMetadata = { requestId: 'request-historical-current' };
+  const historicalUser = user(historical, 1, '历史轮次。');
+  historicalUser.metadata = historicalMetadata;
+  const historicalRunningAssistant = assistantPlaceholderText(
+    historical,
+    2,
+    'assistant-historical-old',
+    'running',
+  );
+  historicalRunningAssistant.metadata = historicalMetadata;
+  const historicalCompletedAssistant = assistantText(
+    historical,
+    2,
+    'assistant-historical-old',
+    '历史轮次完成。',
+    'completed',
+  );
+  historicalCompletedAssistant.metadata = historicalMetadata;
+  const currentUser = user(current, 1, '当前轮次。');
+  currentUser.metadata = currentMetadata;
+  const currentRunningAssistant = assistantPlaceholderText(
+    current,
+    2,
+    'assistant-historical-current',
+    'running',
+  );
+  currentRunningAssistant.metadata = currentMetadata;
+  const currentCompletedAssistant = assistantText(
+    current,
+    2,
+    'assistant-historical-current',
+    '当前轮次完成。',
+    'completed',
+  );
+  currentCompletedAssistant.metadata = currentMetadata;
+
+  messagesStore.messagesState.currentWorkspaceId = 'workspace-golden-historical-replay';
+  messagesStore.messagesState.currentWorkspacePath = '/tmp/workspace-golden-historical-replay';
+  messagesStore.setCurrentSessionId(sessionId);
+  messagesStore.clearAllMessages({
+    persist: false,
+    resetTimelineView: true,
+    resetPanelState: true,
+    skipAntiLiftBack: true,
+  });
+  const localStartedAt = 12_150;
+  messagesStore.beginLocalTurnSubmission({
+    requestId: currentMetadata.requestId,
+    placeholderMessageId: 'assistant-historical-current',
+    startedAt: localStartedAt,
+    source: 'orchestrator',
+    agent: 'orchestrator',
+  });
+
+  const dispatchCanonicalEvent = (id, canonicalEvent) => {
+    dataHandlers.handleUnifiedData({
+      id,
+      category: 'data',
+      type: 'system',
+      source: 'orchestrator',
+      agent: 'orchestrator',
+      lifecycle: 'completed',
+      blocks: [],
+      timestamp: canonicalEvent.occurredAt,
+      updatedAt: canonicalEvent.occurredAt,
+      data: {
+        dataType: 'sessionTurnCanonicalEventUpdated',
+        payload: { sessionId, canonicalEvent },
+      },
+    });
+  };
+
+  dispatchCanonicalEvent('golden-current-running', event(current, 10, 'turn_item_upsert', {
+    turn: turn(current, 'running', [currentUser, currentRunningAssistant]),
+    item: currentRunningAssistant,
+  }));
+  dispatchCanonicalEvent('golden-historical-running', event(historical, 11, 'turn_item_upsert', {
+    turn: turn(historical, 'running', [historicalUser, historicalRunningAssistant]),
+    item: historicalRunningAssistant,
+  }));
+  dispatchCanonicalEvent('golden-historical-terminal', event(historical, 12, 'turn_completed', {
+    turn: turn(historical, 'completed', [historicalUser, historicalCompletedAssistant], {
+      completedAt: historical.turnSeq + 100,
+      responseDurationMs: 100,
+    }),
+    item: historicalCompletedAssistant,
+  }));
+
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    '历史终态事件回放时，当前运行轮次必须继续保持 processing',
+  );
+  assert.equal(
+    messagesStore.messagesState.pendingRequests.has(currentMetadata.requestId),
+    true,
+    '历史终态事件不得清除当前轮次 requestId',
+  );
+  assert.equal(
+    messagesStore.messagesState.pendingRequests.has(historicalMetadata.requestId),
+    false,
+    '历史轮次完成后必须从会话级 pending 集合移除',
+  );
+  assert.equal(
+    messagesStore.messagesState.thinkingStartAt,
+    localStartedAt,
+    '历史事件回放不得覆盖当前本地轮次的计时起点',
+  );
+
+  dispatchCanonicalEvent('golden-current-terminal', event(current, 13, 'turn_completed', {
+    turn: turn(current, 'completed', [currentUser, currentCompletedAssistant], {
+      completedAt: current.turnSeq + 100,
+      responseDurationMs: 100,
+    }),
+    item: currentCompletedAssistant,
+  }));
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    false,
+    '当前轮次终态到达后才允许会话处理态收敛',
+  );
+  messagesStore.setCurrentSessionId(null);
+}
+
 function resetMessagesStoreForGoldenProcessing(messagesStore) {
   messagesStore.messagesState.currentWorkspaceId = 'workspace-golden-processing';
   messagesStore.setCurrentSessionId('session-golden-processing');
@@ -1608,6 +1817,128 @@ function assertMessagesStoreClearsLocalPendingFromAuthoritativeIdle(messagesStor
     'clearing a request binding must also clear its pending request',
   );
 
+  messagesStore.setCurrentSessionId(null);
+}
+
+function assertHistoricalIdlePreservesBoundLocalSubmission(messagesStore) {
+  resetMessagesStoreForGoldenProcessing(messagesStore);
+
+  const requestId = 'request-bound-local-submission';
+  const startedAt = 11_000;
+  messagesStore.createRequestBinding({
+    requestId,
+    userMessageId: 'user-bound-local-submission',
+    placeholderMessageId: 'assistant-bound-local-submission',
+    createdAt: startedAt,
+  });
+  messagesStore.beginLocalTurnSubmission({
+    requestId,
+    placeholderMessageId: 'assistant-bound-local-submission',
+    startedAt,
+    source: 'orchestrator',
+    agent: 'orchestrator',
+  });
+
+  messagesStore.applyAuthoritativeProcessingState(null);
+  assert.equal(
+    messagesStore.messagesState.pendingRequests.has(requestId),
+    true,
+    'historical idle must not clear a locally bound submission before canonical acceptance',
+  );
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    'historical idle must keep the locally bound submission in processing state',
+  );
+  assert.equal(
+    messagesStore.messagesState.thinkingStartAt,
+    startedAt,
+    'historical idle must preserve the local submission timer origin',
+  );
+
+  messagesStore.clearRequestBinding(requestId);
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    false,
+    'request lifecycle completion must still settle the preserved local submission',
+  );
+  messagesStore.setCurrentSessionId(null);
+}
+
+function assertHistoricalForcedIdlePreservesBoundLocalSubmission(dataHandlers, messagesStore) {
+  resetMessagesStoreForGoldenProcessing(messagesStore);
+
+  const requestId = 'request-bound-forced-idle';
+  messagesStore.createRequestBinding({
+    requestId,
+    userMessageId: 'user-bound-forced-idle',
+    placeholderMessageId: 'assistant-bound-forced-idle',
+    createdAt: 12_000,
+  });
+  messagesStore.beginLocalTurnSubmission({
+    requestId,
+    placeholderMessageId: 'assistant-bound-forced-idle',
+    startedAt: 12_000,
+    source: 'orchestrator',
+    agent: 'orchestrator',
+  });
+
+  dataHandlers.handleUnifiedData({
+    id: 'historical-forced-idle-during-bound-submission',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: 12_001,
+    updatedAt: 12_001,
+    data: {
+      dataType: 'processingStateChanged',
+      payload: {
+        isProcessing: false,
+        transitionKind: 'forced',
+        reason: 'session_turn_completed',
+      },
+    },
+  });
+
+  assert.equal(
+    messagesStore.messagesState.pendingRequests.has(requestId),
+    true,
+    'historical forced idle must not clear a locally bound submission',
+  );
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    'historical forced idle must keep the locally bound submission active',
+  );
+
+  dataHandlers.handleUnifiedData({
+    id: 'user-interrupt-forced-idle-during-bound-submission',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: 12_002,
+    updatedAt: 12_002,
+    data: {
+      dataType: 'processingStateChanged',
+      payload: {
+        isProcessing: false,
+        transitionKind: 'forced',
+        reason: 'user_session_interrupt_requested',
+      },
+    },
+  });
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    false,
+    'explicit user interrupt must still settle a locally bound submission',
+  );
+  messagesStore.clearAllRequestBindings();
   messagesStore.setCurrentSessionId(null);
 }
 

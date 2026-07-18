@@ -339,6 +339,7 @@ async fn restart_task(
         placeholder_message_id: None,
         steer_current_turn: false,
         expected_turn_id: None,
+        replace_turn_id: None,
     };
     let task_tier = root_task
         .policy_snapshot

@@ -3,6 +3,7 @@
   import { vscode } from '../lib/vscode-bridge';
   import {
     addToast,
+    cancelTurnEditing,
     getActiveInteractionType,
     getQueuedMessages,
     messagesState,
@@ -262,6 +263,9 @@
   let isComposing = $state(false);
   let pendingCaretOffset = $state<number | null>(null);
   const sendButtonTitle = $derived.by(() => {
+    if (sendPreparing) {
+      return i18n.t('input.sending');
+    }
     if (isSending) {
       return i18n.t('input.followUp.queueTitle');
     }
@@ -358,6 +362,43 @@
     contextPickerOpen = false;
     clearEnhanceSnapshot();
     closeSlashMenu();
+  }
+
+  let loadedEditingTurnId = '';
+  const editingTurn = $derived(messagesState.editingTurn);
+
+  $effect(() => {
+    const draft = editingTurn;
+    if (!draft) {
+      if (loadedEditingTurnId) {
+        loadedEditingTurnId = '';
+        clearComposerState();
+      }
+      return;
+    }
+    if (draft.turnId === loadedEditingTurnId) return;
+    loadedEditingTurnId = draft.turnId;
+    clearEnhanceSnapshot();
+    inputValue = draft.text;
+    pendingCaretOffset = draft.text.length;
+    selectedImages = draft.images.map((image) => ({
+      id: generateId(),
+      dataUrl: image.dataUrl,
+      name: image.name || i18n.t('input.pastedImage', { index: 1 }),
+    }));
+    selectedContextReferences = draft.contextReferences.map((reference) => ({
+      id: `${reference.kind}:${reference.pathRef || reference.path}`,
+      ...reference,
+    }));
+    selectedGoalMode = draft.goalMode;
+    selectedSkill = draft.skillName
+      ? (availableSkills.find((skill) => skill.skillId === draft.skillName) || null)
+      : null;
+    queueMicrotask(focusEditor);
+  });
+
+  function cancelMessageEditing(): void {
+    cancelTurnEditing();
   }
 
   let imageReadWaiters: Array<() => void> = [];
@@ -1025,12 +1066,15 @@
         return;
       }
 
-      const orchestratorSessionConfig = await resolveTurnOrchestratorSessionConfigPayload();
+      const orchestratorSessionConfig = resolveTurnOrchestratorSessionConfigPayload();
       if (!orchestratorSessionConfig) {
         return;
       }
 
       const requestId = generateId();
+      const replaceTurnId = editingTurn?.sessionId === messagesState.currentSessionId
+        ? editingTurn.turnId
+        : null;
       vscode.postMessage({
         type: 'executeTask',
         text: submissionText,
@@ -1042,14 +1086,17 @@
         goalMode: selectedGoalMode,
         accessProfile: selectedAccessProfile,
         orchestratorSessionConfig,
-        followUpMode: !isDraftSession && isSending ? 'queue' : undefined,
+        followUpMode: !replaceTurnId && !isDraftSession && isSending ? 'queue' : undefined,
+        replaceTurnId,
         images: selectedImages.map((img) => ({
           name: img.name,
           dataUrl: img.dataUrl,
         })),
         contextReferences: toSessionContextReferencePayload(selectedContextReferences),
       });
-      clearComposerState();
+      if (!replaceTurnId) {
+        clearComposerState();
+      }
     } finally {
       sendPreparing = false;
     }
@@ -1308,14 +1355,13 @@
     );
   }
 
-  async function resolveTurnOrchestratorSessionConfigPayload(): Promise<Record<string, unknown> | null> {
-    let model = readOrchestratorModel();
-    if (!model && !pickerLoadedOnce) {
-      await loadPickerModels();
-      model = readOrchestratorModel();
-    }
+  function resolveTurnOrchestratorSessionConfigPayload(): Record<string, unknown> | null {
+    const model = readOrchestratorModel();
     if (!model) {
       pickerOpen = true;
+      if (!pickerLoadedOnce && !pickerLoading) {
+        void loadPickerModels();
+      }
       addToast('warning', i18n.t('input.mainModelRequired'));
       return null;
     }
@@ -1830,6 +1876,13 @@
     <!-- 拖动调整大小 -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="ia-resize" onmousedown={startResize}></div>
+
+    {#if editingTurn}
+      <div class="ia-editing-bar" role="status">
+        <span>{i18n.t('input.editingPreviousMessage')}</span>
+        <button type="button" onclick={cancelMessageEditing}>{i18n.t('input.cancelEditing')}</button>
+      </div>
+    {/if}
 
     <!-- 快捷引用保持结构化状态，不把 /goal 或 Skill 名称注入用户正文。 -->
     {#if selectedContextReferences.length > 0 || selectedGoalMode || selectedSkill}
@@ -2377,7 +2430,7 @@
               disabled={sendDisabled}
               title={sendButtonTitle}
             >
-              <Icon name="send" size={14} />
+              <Icon name={sendPreparing ? 'loader' : 'send'} size={14} class={sendPreparing ? 'spinning' : ''} />
             </button>
           {/if}
           <button
@@ -2398,7 +2451,7 @@
             disabled={sendDisabled}
             title={sendButtonTitle}
           >
-            <Icon name="send" size={14} />
+            <Icon name={sendPreparing ? 'loader' : 'send'} size={14} class={sendPreparing ? 'spinning' : ''} />
           </button>
           {:else}
           <!-- 无内容 + 空闲：显示禁用的发送按钮 -->
@@ -2468,6 +2521,34 @@
   .ia-wrapper:focus-within {
     border-color: var(--primary);
     box-shadow: 0 0 0 3px var(--primary-muted);
+  }
+
+  .ia-editing-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    min-height: 30px;
+    padding: 4px var(--space-3);
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--foreground-secondary);
+    font-size: var(--text-xs);
+  }
+
+  .ia-editing-bar button {
+    flex: 0 0 auto;
+    padding: 3px 6px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--primary);
+    font-size: inherit;
+    cursor: pointer;
+  }
+
+  .ia-editing-bar button:hover,
+  .ia-editing-bar button:focus-visible {
+    background: var(--primary-muted);
   }
 
   /* 拖拽调整：视觉 2px 指示器，交互区域 10px */
@@ -2598,6 +2679,8 @@
   .ia-send.ready:hover { background: var(--primary-hover); transform: scale(1.08); }
   .ia-send:disabled { opacity: 0.35; cursor: not-allowed; }
   .ia-send.stop { background: var(--error); color: white; animation: ia-pulse 1.2s ease-in-out infinite; }
+  .ia-container :global(.spinning) { animation: ia-spin 0.8s linear infinite; }
+  @keyframes ia-spin { to { transform: rotate(360deg); } }
   @keyframes ia-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.65; } }
 
   .ia-enhance {

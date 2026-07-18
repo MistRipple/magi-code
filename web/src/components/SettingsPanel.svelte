@@ -359,7 +359,9 @@ import {
         <h3>{store.mcpDialogIsEdit ? i18n.t('settings.mcp.editTitle') : i18n.t('settings.mcp.addTitle')}</h3>
         <span>{i18n.t('settings.mcp.editorDesc')}</span>
       </div>
-      <button class="modal-close" onclick={store.closeMCPDialog}>×</button>
+      <button class="modal-close" type="button" onclick={store.closeMCPDialog} aria-label={i18n.t('settings.closeSettings')} title={i18n.t('settings.closeSettings')}>
+        <Icon name="close" size={18} />
+      </button>
     {/snippet}
     <div class="mcp-editor">
       <div class="mcp-mode-switch" role="tablist" aria-label={i18n.t('settings.mcp.addMode')}>
@@ -572,11 +574,11 @@ import {
       {/if}
     </div>
     {#snippet footer()}
-      <button class="apple-action-btn secondary" onclick={store.closeMCPDialog}>{i18n.t('settings.dialog.cancel')}</button>
+      <button class="settings-btn secondary" onclick={store.closeMCPDialog}>{i18n.t('settings.dialog.cancel')}</button>
       <button
-        class="apple-action-btn"
-        class:is-saving={store.saveStatus.mcp === 'saving'}
-        class:is-saved={store.saveStatus.mcp === 'saved'}
+        class="settings-btn"
+        class:saving={store.saveStatus.mcp === 'saving'}
+        class:saved={store.saveStatus.mcp === 'saved'}
         onclick={store.saveMCPServer}
         disabled={store.saveStatus.mcp === 'saving'}
       >
@@ -985,28 +987,63 @@ import {
     color: var(--foreground-muted);
     font-size: var(--text-xs);
     font-weight: var(--font-normal);
+    line-height: 1.45;
   }
   .mcp-editor {
     display: flex;
     flex-direction: column;
-    gap: var(--space-4);
+    gap: var(--space-3);
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 2px;
   }
-  .mcp-mode-switch,
+  .mcp-mode-switch {
+    display: flex;
+    align-items: center;
+    gap: var(--space-5);
+    width: 100%;
+    border-bottom: 1px solid var(--border);
+  }
+  .mcp-mode-switch button {
+    position: relative;
+    min-height: 36px;
+    padding: 0 1px;
+    border: 0;
+    background: transparent;
+    color: var(--foreground-muted);
+    font: inherit;
+    font-size: var(--text-sm);
+    font-weight: var(--font-medium);
+    cursor: pointer;
+    transition: color var(--transition-fast);
+  }
+  .mcp-mode-switch button::after {
+    content: '';
+    position: absolute;
+    right: 0;
+    bottom: -1px;
+    left: 0;
+    height: 2px;
+    border-radius: 2px 2px 0 0;
+    background: transparent;
+  }
+  .mcp-mode-switch button:hover { color: var(--foreground); }
+  .mcp-mode-switch button.active { color: var(--foreground); }
+  .mcp-mode-switch button.active::after { background: var(--primary); }
   .mcp-transport-switch {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    padding: 3px;
+    min-height: 34px;
+    padding: 2px;
     border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-sm);
     background: var(--surface-2);
   }
-  .mcp-mode-switch { width: min(280px, 100%); }
-  .mcp-mode-switch button,
   .mcp-transport-switch button {
     min-width: 0;
-    min-height: 30px;
+    min-height: 28px;
     border: 0;
-    border-radius: calc(var(--radius-md) - 2px);
+    border-radius: calc(var(--radius-sm) - 2px);
     background: transparent;
     color: var(--foreground-muted);
     font: inherit;
@@ -1015,25 +1052,40 @@ import {
     cursor: pointer;
     transition: color var(--transition-fast), background var(--transition-fast), box-shadow var(--transition-fast);
   }
-  .mcp-mode-switch button:hover,
   .mcp-transport-switch button:hover { color: var(--foreground); }
-  .mcp-mode-switch button.active,
   .mcp-transport-switch button.active {
     background: var(--surface-1);
     color: var(--foreground);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
   }
   .mcp-form {
     display: flex;
     flex-direction: column;
-    gap: var(--space-4);
+    gap: var(--space-3);
   }
   .mcp-form-grid {
     display: grid;
     grid-template-columns: minmax(0, 1.15fr) minmax(220px, 0.85fr);
-    gap: var(--space-4);
+    gap: var(--space-3);
   }
   .mcp-form-grid .form-field { margin-bottom: 0; }
+  .mcp-form .form-field input[type="text"],
+  .mcp-json-editor textarea {
+    border-color: var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-1);
+    box-shadow: none;
+  }
+  .mcp-form .form-field input[type="text"] {
+    height: 34px;
+    padding: 6px 10px;
+  }
+  .mcp-form .form-field input[type="text"]:focus,
+  .mcp-json-editor textarea:focus {
+    border-color: var(--primary);
+    background: var(--surface-1);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 14%, transparent);
+  }
   .mcp-field-label {
     display: block;
     margin-bottom: var(--space-2);
@@ -1045,7 +1097,10 @@ import {
     display: flex;
     align-items: center;
     gap: var(--space-5);
-    padding: 2px 0;
+    min-height: 36px;
+    padding: var(--space-2) 0;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
   }
   .mcp-timeout-field,
   .mcp-enabled-field {
@@ -1109,9 +1164,8 @@ import {
   .mcp-form-section {
     display: flex;
     flex-direction: column;
-    gap: var(--space-4);
-    padding-top: var(--space-4);
-    border-top: 1px solid var(--border);
+    gap: var(--space-3);
+    padding-top: var(--space-1);
   }
   .mcp-section-heading > div {
     display: flex;
@@ -1143,15 +1197,15 @@ import {
     gap: 5px;
     min-height: 26px;
     padding: 0 8px;
-    border: 1px solid var(--border);
+    border: 0;
     border-radius: var(--radius-sm);
     background: transparent;
-    color: var(--foreground-muted);
+    color: var(--primary);
     font: inherit;
     font-size: var(--text-xs);
     cursor: pointer;
   }
-  .mcp-list-heading button:hover { color: var(--foreground); background: var(--surface-2); }
+  .mcp-list-heading button:hover { color: var(--primary-hover); background: var(--surface-2); }
   .mcp-row-list { display: flex; flex-direction: column; gap: 6px; }
   .mcp-value-row,
   .mcp-key-value-row {
@@ -1198,9 +1252,11 @@ import {
   }
   .mcp-remove-row:hover { color: var(--error); background: color-mix(in srgb, var(--error) 8%, transparent); }
   .mcp-empty-row {
-    padding: 8px 10px;
-    border: 1px dashed var(--border);
+    min-height: 32px;
+    padding: 7px 10px;
+    border: 1px solid var(--border);
     border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--surface-2) 62%, transparent);
     color: var(--foreground-muted);
     font-size: var(--text-xs);
   }
@@ -1243,7 +1299,6 @@ import {
       border-left: 0;
     }
     .mcp-enabled-field span { white-space: normal; }
-    .mcp-mode-switch { width: 100%; }
     .mcp-key-value-row { grid-template-columns: minmax(0, 1fr) 30px; }
     .mcp-key-value-row input:nth-child(2) { grid-column: 1 / 2; }
     .mcp-key-value-row .mcp-remove-row { grid-column: 2; grid-row: 1 / 3; align-self: center; }

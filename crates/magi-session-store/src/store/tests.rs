@@ -621,6 +621,94 @@ fn accept_current_turn_with_timeline_entry_rejects_running_turn_without_timeline
 }
 
 #[test]
+fn replacing_latest_user_interrupted_turn_is_atomic_and_rejects_stale_retry() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-replace-user-interrupted-turn");
+    store
+        .create_session(session_id.clone(), "Replace user interrupted turn")
+        .expect("session should be creatable");
+
+    let mut original_turn = test_turn("turn-original", "running", 10);
+    original_turn.items = vec![test_turn_item("user-original", "原始消息")];
+    store
+        .accept_current_turn_with_timeline_entry(
+            session_id.clone(),
+            "timeline-original",
+            TimelineEntryKind::UserMessage,
+            "原始消息",
+            UtcMillis(10),
+            original_turn,
+        )
+        .expect("original turn should be accepted");
+    store
+        .interrupt_current_turn_by_user(&session_id)
+        .expect("user interruption should succeed");
+
+    let mut replacement_turn = test_turn("turn-replacement", "running", 20);
+    let mut replacement_user_item = test_turn_item("user-replacement", "修改后的消息");
+    replacement_user_item
+        .metadata
+        .insert("replacesTurnId".to_string(), json!("turn-original"));
+    replacement_turn.items = vec![replacement_user_item];
+    let (_, sidecar, superseded_turn) = store
+        .replace_current_turn_with_timeline_entry(
+            session_id.clone(),
+            "turn-original",
+            "timeline-replacement",
+            TimelineEntryKind::UserMessage,
+            "修改后的消息",
+            UtcMillis(20),
+            replacement_turn,
+        )
+        .expect("latest user-interrupted turn should be replaceable");
+
+    assert_eq!(superseded_turn.status, CanonicalTurnStatus::Superseded);
+    assert_eq!(
+        superseded_turn
+            .metadata
+            .get("supersededReason")
+            .and_then(serde_json::Value::as_str),
+        Some("user_edit")
+    );
+    assert_eq!(
+        sidecar.current_turn.map(|turn| turn.turn_id),
+        Some("turn-replacement".to_string())
+    );
+    let turns = store.canonical_turns_for_session(&session_id);
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0].status, CanonicalTurnStatus::Superseded);
+    assert_eq!(turns[1].status, CanonicalTurnStatus::Running);
+    assert_eq!(
+        turns[1]
+            .metadata
+            .get("replacesTurnId")
+            .and_then(serde_json::Value::as_str),
+        Some("turn-original")
+    );
+
+    let stale_result = store.replace_current_turn_with_timeline_entry(
+        session_id.clone(),
+        "turn-original",
+        "timeline-stale-replacement",
+        TimelineEntryKind::UserMessage,
+        "过期编辑",
+        UtcMillis(30),
+        test_turn("turn-stale-replacement", "running", 30),
+    );
+    assert!(matches!(
+        stale_result,
+        Err(magi_core::DomainError::InvalidState { .. })
+    ));
+    assert!(
+        !store
+            .timeline_for_session(&session_id)
+            .iter()
+            .any(|entry| entry.entry_id == "timeline-stale-replacement"),
+        "竞争失败不能留下新的 timeline 记录"
+    );
+}
+
+#[test]
 fn accept_active_execution_chain_with_timeline_entry_writes_timeline_and_turn_atomically() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-atomic-task-accept");

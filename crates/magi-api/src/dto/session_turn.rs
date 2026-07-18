@@ -60,6 +60,9 @@ pub struct SessionTurnRequestDto {
     /// 引导必须绑定调用方观察到的当前 Turn，防止完成边界后的迟到输入串入下一轮。
     #[serde(default)]
     pub expected_turn_id: Option<String>,
+    /// 编辑最近一条用户消息时，必须携带被替换的 canonical Turn ID。
+    #[serde(default)]
+    pub replace_turn_id: Option<String>,
 }
 
 impl SessionTurnRequestDto {
@@ -214,6 +217,10 @@ impl SessionTurnRequestDto {
 
     pub fn expected_turn_id(&self) -> Option<String> {
         trimmed_non_empty(self.expected_turn_id.as_deref())
+    }
+
+    pub fn replace_turn_id(&self) -> Option<String> {
+        trimmed_non_empty(self.replace_turn_id.as_deref())
     }
 
     pub fn timeline_message(&self, trimmed_text: Option<&str>) -> String {
@@ -405,6 +412,7 @@ mod tests {
             placeholder_message_id: None,
             steer_current_turn: false,
             expected_turn_id: None,
+            replace_turn_id: None,
         };
 
         assert_eq!(
