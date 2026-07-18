@@ -128,6 +128,35 @@ export type AgentSettingsBootstrapSnapshot = SettingsBootstrapPayload;
 export interface AgentToolCatalogDiagnosticsSnapshot {
   builtinTools: SettingsBuiltinTool[];
   capabilityDependencies: SettingsCapabilityDependency[];
+  commandEnvironment: {
+    source: string;
+    pathAvailable: boolean;
+    commands: Array<{ name: string; available: boolean; path: string | null }>;
+  };
+}
+
+function normalizeCommandEnvironment(value: unknown): AgentToolCatalogDiagnosticsSnapshot['commandEnvironment'] {
+  const record = value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const commands = Array.isArray(record.commands)
+    ? record.commands.flatMap((entry) => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+        const item = entry as Record<string, unknown>;
+        const name = typeof item.name === 'string' ? item.name.trim() : '';
+        if (!name) return [];
+        return [{
+          name,
+          available: item.available === true,
+          path: typeof item.path === 'string' && item.path.trim() ? item.path : null,
+        }];
+      })
+    : [];
+  return {
+    source: typeof record.source === 'string' && record.source.trim() ? record.source : 'unknown',
+    pathAvailable: record.pathAvailable === true,
+    commands,
+  };
 }
 
 function normalizeSettingsSectionConfig(value: unknown): Record<string, unknown> {
@@ -299,7 +328,7 @@ export interface AgentExecutionStatsItem {
   templateId: string;
   engineId: string;
   bindingRevision: number;
-  role: 'worker' | 'orchestrator' | 'auxiliary';
+  role: 'worker' | 'orchestrator' | 'auxiliary' | 'image_generation';
   displayName: string;
   provider?: string;
   declaredModelSpec?: string;
@@ -1420,7 +1449,7 @@ export async function getAgentSettingsBootstrap(
 }
 
 export async function loadAgentToolCatalogDiagnostics(
-  options: { accessProfile?: AccessProfile | null } = {},
+  options: { accessProfile?: AccessProfile | null; refreshEnvironment?: boolean } = {},
 ): Promise<AgentToolCatalogDiagnosticsSnapshot> {
   try {
     const query = buildBoundQuery({
@@ -1428,6 +1457,7 @@ export async function loadAgentToolCatalogDiagnostics(
       includeMcpServers: 'true',
       includeAgentRoles: 'true',
       accessProfile: normalizeAccessProfile(options.accessProfile ?? readStoredAccessProfile()),
+      ...(options.refreshEnvironment ? { refreshEnvironment: 'true' } : {}),
     });
     const response = await getTransport().request(agentUrl('/api/tools/catalog', query));
     const payload = await parseAgentJson<Record<string, unknown>>(response, 'load tool catalog diagnostics');
@@ -1444,6 +1474,7 @@ export async function loadAgentToolCatalogDiagnostics(
     return {
       builtinTools: normalizeBuiltinTools(rawBuiltinTools),
       capabilityDependencies: normalizeCapabilityDependencies(payload.runtimeDependencies),
+      commandEnvironment: normalizeCommandEnvironment(payload.commandEnvironment),
     };
   } catch (error) {
     if (error instanceof TypeError) {

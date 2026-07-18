@@ -10,7 +10,11 @@ use magi_bridge_client::{
 };
 use magi_core::{AccessProfile, EventId, SessionId, UtcMillis};
 use magi_event_bus::{EventContext, EventEnvelope};
-use magi_usage_authority::{UsageAuthority, UsageCallRecordInput, UsageModelSnapshot, UsageTotals};
+use magi_usage_authority::{
+    ExecutionBindingIdentity, LlmConfig, UrlMode, UsageAuthority, UsageCallIdentity,
+    UsageCallRecordInput, UsageCallStatus, UsageModelSnapshot, UsagePhase, UsageSourceRole,
+    UsageTokenInput, UsageTotals,
+};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -1425,11 +1429,24 @@ async fn execution_stats(
 fn usage_authority_from_model_usage_ledger(state: &ApiState) -> UsageAuthority {
     let ledger = state.event_bus.audit_usage_ledger_snapshot();
     let mut authority = UsageAuthority::new();
-    for entry in ledger.usage_entries {
+    let mut recorded_image_call_ids = HashSet::new();
+    for entry in &ledger.usage_entries {
         if entry.event_type != "model.usage.recorded" {
             continue;
         }
-        let Ok(mut input) = serde_json::from_value::<UsageCallRecordInput>(entry.payload) else {
+        if let Ok(input) = serde_json::from_value::<UsageCallRecordInput>(entry.payload.clone())
+            && input.execution_binding.role == UsageSourceRole::ImageGeneration
+        {
+            recorded_image_call_ids.insert(input.call_identity.call_id);
+        }
+    }
+
+    for entry in &ledger.usage_entries {
+        if entry.event_type != "model.usage.recorded" {
+            continue;
+        }
+        let Ok(mut input) = serde_json::from_value::<UsageCallRecordInput>(entry.payload.clone())
+        else {
             tracing::warn!(
                 event_id = entry.event_id,
                 "模型用量账本条目无法解析，已跳过"
@@ -1437,7 +1454,7 @@ fn usage_authority_from_model_usage_ledger(state: &ApiState) -> UsageAuthority {
             continue;
         };
         if input.event_id.is_none() {
-            input.event_id = Some(entry.event_id);
+            input.event_id = Some(entry.event_id.clone());
         }
         if input.timestamp.is_none() {
             input.timestamp = Some(entry.occurred_at.0);
@@ -1445,7 +1462,99 @@ fn usage_authority_from_model_usage_ledger(state: &ApiState) -> UsageAuthority {
         input.workspace_id = "all".to_string();
         authority.append_call_record(input);
     }
+
+    for entry in &ledger.usage_entries {
+        let payload = &entry.payload;
+        let is_image_tool = entry.event_type == "tool.usage.recorded"
+            && payload
+                .get("tool_name")
+                .or_else(|| payload.get("toolName"))
+                .and_then(Value::as_str)
+                == Some("image_generate");
+        let succeeded = payload
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| {
+                status.eq_ignore_ascii_case("succeeded") || status.eq_ignore_ascii_case("success")
+            });
+        if !is_image_tool || !succeeded {
+            continue;
+        }
+        let Some(call_id) = payload
+            .get("tool_call_id")
+            .or_else(|| payload.get("toolCallId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if recorded_image_call_ids.contains(call_id) {
+            continue;
+        }
+        let Some(session_id) = payload
+            .get("session_id")
+            .or_else(|| payload.get("sessionId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        authority.append_call_record(legacy_image_usage_record(
+            call_id,
+            session_id,
+            entry.occurred_at.0,
+        ));
+    }
     authority
+}
+
+fn legacy_image_usage_record(
+    call_id: &str,
+    session_id: &str,
+    timestamp: u64,
+) -> UsageCallRecordInput {
+    UsageCallRecordInput {
+        workspace_id: "all".to_string(),
+        session_id: session_id.to_string(),
+        turn_id: None,
+        dispatch_wave_id: None,
+        assignment_id: None,
+        event_id: Some(format!("legacy-image-model-usage:{call_id}")),
+        timestamp: Some(timestamp),
+        execution_binding: ExecutionBindingIdentity {
+            template_id: "imageGeneration".to_string(),
+            engine_id: "imageGeneration".to_string(),
+            binding_revision: 0,
+            role: UsageSourceRole::ImageGeneration,
+        },
+        model_config: LlmConfig {
+            provider: "legacy".to_string(),
+            model: "__legacy_image_generation__".to_string(),
+            base_url: "https://legacy-image-usage.invalid".to_string(),
+            api_key: None,
+            account_fingerprint: None,
+            url_mode: UrlMode::Full,
+            reasoning_effort: None,
+        },
+        call_identity: UsageCallIdentity {
+            call_id: call_id.to_string(),
+            parent_call_id: None,
+            source: UsageSourceRole::ImageGeneration,
+            phase: UsagePhase::Execution,
+        },
+        usage: UsageTokenInput {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: Some(0),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cache_read_included_in_input: false,
+        },
+        status: UsageCallStatus::Success,
+        error_code: None,
+    }
 }
 
 fn usage_binding_item_json(
@@ -3454,6 +3563,117 @@ mod tests {
         assert_eq!(payload["totals"]["totalTokens"], serde_json::json!(0));
         assert_eq!(payload["items"].as_array().unwrap().len(), 0);
         assert_eq!(payload["models"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn execution_stats_counts_image_calls_without_fabricating_tokens() {
+        let state = test_state();
+        let mut usage_payload = model_usage_payload(
+            "usage-image-1",
+            "workspace-image-stats",
+            "session-image-stats",
+            "image-call-1",
+            101,
+            0,
+            0,
+        );
+        usage_payload["executionBinding"] = json!({
+            "templateId": "imageGeneration",
+            "engineId": "imageGeneration",
+            "bindingRevision": 0,
+            "role": "image_generation"
+        });
+        usage_payload["modelConfig"]["model"] = json!("gpt-image-test");
+        usage_payload["callIdentity"]["source"] = json!("image_generation");
+        usage_payload["callIdentity"]["phase"] = json!("execution");
+        usage_payload["usage"] = json!({
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "totalTokens": 0
+        });
+        state.event_bus.publish(
+            EventEnvelope::usage(
+                EventId::new("usage-image-1"),
+                "model.usage.recorded",
+                usage_payload,
+            )
+            .with_context(EventContext {
+                workspace_id: Some(WorkspaceId::new("workspace-image-stats")),
+                session_id: Some(SessionId::new("session-image-stats")),
+                ..EventContext::default()
+            }),
+        );
+        state.event_bus.publish(
+            EventEnvelope::usage(
+                EventId::new("tool-usage-image-1"),
+                "tool.usage.recorded",
+                json!({
+                    "tool_name": "image_generate",
+                    "tool_call_id": "image-call-1",
+                    "session_id": "session-image-stats",
+                    "workspace_id": "workspace-image-stats",
+                    "status": "Succeeded"
+                }),
+            )
+            .with_context(EventContext {
+                workspace_id: Some(WorkspaceId::new("workspace-image-stats")),
+                session_id: Some(SessionId::new("session-image-stats")),
+                ..EventContext::default()
+            }),
+        );
+
+        let payload = execution_stats(State(state))
+            .await
+            .expect("image stats should build")
+            .0;
+
+        assert_eq!(payload["totals"]["llmCallCount"], json!(1));
+        assert_eq!(payload["totals"]["totalTokens"], json!(0));
+        assert_eq!(payload["items"][0]["role"], json!("image_generation"));
+        assert_eq!(payload["items"][0]["templateId"], json!("imageGeneration"));
+        assert_eq!(payload["items"][0]["llmCallCount"], json!(1));
+        assert_eq!(
+            payload["models"][0]["resolvedModel"],
+            json!("gpt-image-test")
+        );
+        assert_eq!(payload["models"][0]["totals"]["llmCallCount"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn execution_stats_keeps_legacy_successful_image_calls_without_model_attribution() {
+        let state = test_state();
+        state.event_bus.publish(
+            EventEnvelope::usage(
+                EventId::new("tool-usage-image-legacy"),
+                "tool.usage.recorded",
+                json!({
+                    "tool_name": "image_generate",
+                    "tool_call_id": "legacy-image-call",
+                    "session_id": "session-image-legacy",
+                    "workspace_id": "workspace-image-legacy",
+                    "status": "Succeeded"
+                }),
+            )
+            .with_context(EventContext {
+                workspace_id: Some(WorkspaceId::new("workspace-image-legacy")),
+                session_id: Some(SessionId::new("session-image-legacy")),
+                ..EventContext::default()
+            }),
+        );
+
+        let payload = execution_stats(State(state))
+            .await
+            .expect("legacy image stats should build")
+            .0;
+
+        assert_eq!(payload["totals"]["llmCallCount"], json!(1));
+        assert_eq!(payload["totals"]["totalTokens"], json!(0));
+        assert_eq!(payload["items"][0]["role"], json!("image_generation"));
+        assert_eq!(payload["items"][0]["llmCallCount"], json!(1));
+        assert_eq!(
+            payload["models"][0]["resolvedModel"],
+            json!("__legacy_image_generation__")
+        );
     }
 
     #[tokio::test]

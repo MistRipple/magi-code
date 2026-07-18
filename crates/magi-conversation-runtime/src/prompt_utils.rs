@@ -173,9 +173,11 @@ pub fn workspace_context_system_prompt_for_platform(root_path: &str, platform: &
         "原生路径使用正斜杠 `/`，绝对路径从 `/` 开始"
     };
     let shell_contract = if is_windows {
-        "默认 Shell 使用系统 `COMSPEC` 指向的 `cmd.exe /C`，运行时已经把工作目录设置为当前工作区。命令必须使用 cmd.exe 语法；不要在命令里再次拼接工作区绝对路径。丢弃输出使用 `NUL`。Git worktree 探测可使用 `git rev-parse --is-inside-work-tree >NUL 2>&1 && echo GIT_WORKTREE || echo NOT_GIT_WORKTREE`，确保非 Git 目录也以成功状态结束。不要生成 `/dev/null`、`if ...; then`、`find`、`cat`、`sed` 等 Unix 专属语法。"
+        "默认 Shell 使用 Windows `COMSPEC` 指向的 `cmd.exe /C`，运行时已经把工作目录设置为当前工作区。命令必须使用 Windows cmd.exe 语法；不要在命令里再次拼接工作区绝对路径。丢弃输出使用 `NUL`。Git worktree 探测可使用 `git rev-parse --is-inside-work-tree >NUL 2>&1 && echo GIT_WORKTREE || echo NOT_GIT_WORKTREE`，确保非 Git 目录也以成功状态结束。若明确选择 PowerShell，改用 PowerShell 原生命令和 `-Command`，不要混用 POSIX 语法。不要生成 `/dev/null`、`if ...; then`、`find`、`cat`、`sed` 等 Unix 专属语法。"
+    } else if platform.eq_ignore_ascii_case("macos") {
+        "默认 Shell 使用 macOS 当前用户 Shell 的 `-c` 模式，通常是 zsh；运行时已经把工作目录设置为当前工作区，并继承 Magi 初始化的用户终端环境。命令必须使用 macOS/POSIX Shell 语法；不要在命令里再次拼接工作区绝对路径。丢弃输出使用 `/dev/null`。Git worktree 探测可使用 `if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo GIT_WORKTREE; else echo NOT_GIT_WORKTREE; fi`，确保非 Git 目录也以成功状态结束。不要生成 `NUL`、PowerShell 或 cmd.exe 专属语法。"
     } else {
-        "默认 Shell 是当前用户 Shell 的 `-c` 模式，运行时已经把工作目录设置为当前工作区，并继承 Magi 初始化的用户终端环境。命令必须使用 POSIX shell 语法；不要在命令里再次拼接工作区绝对路径。丢弃输出使用 `/dev/null`。Git worktree 探测可使用 `if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo GIT_WORKTREE; else echo NOT_GIT_WORKTREE; fi`，确保非 Git 目录也以成功状态结束。"
+        "默认 Shell 使用 Linux 当前用户 Shell 的 `-c` 模式；运行时已经把工作目录设置为当前工作区，并继承 Magi 初始化的用户终端环境。命令必须使用 Linux/POSIX Shell 语法；不要在命令里再次拼接工作区绝对路径。丢弃输出使用 `/dev/null`。Git worktree 探测可使用 `if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo GIT_WORKTREE; else echo NOT_GIT_WORKTREE; fi`，确保非 Git 目录也以成功状态结束。不要生成 `NUL`、PowerShell 或 cmd.exe 专属语法。"
     };
 
     TPL_WORKSPACE_CONTEXT
@@ -278,6 +280,17 @@ mod tests {
         assert!(prompt.contains("`-c`"));
         assert!(prompt.contains("/dev/null"));
         assert!(prompt.contains("正斜杠"));
+        assert!(!prompt.contains("cmd.exe /C"));
+    }
+
+    #[test]
+    fn workspace_context_prompt_describes_macos_native_shell_and_paths() {
+        let prompt = workspace_context_system_prompt_for_platform("/Users/demo/project", "macos");
+
+        assert!(prompt.contains("macOS"));
+        assert!(prompt.contains("通常是 zsh"));
+        assert!(prompt.contains("/dev/null"));
+        assert!(prompt.contains("不要生成 `NUL`"));
         assert!(!prompt.contains("cmd.exe /C"));
     }
 

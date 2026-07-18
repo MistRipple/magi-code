@@ -24,6 +24,7 @@ pub struct GeneratedImage {
     pub bytes: Vec<u8>,
     pub media_type: String,
     pub revised_prompt: Option<String>,
+    pub usage: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -211,10 +212,15 @@ fn parse_image_generation_response(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
+    let usage = payload
+        .get("usage")
+        .filter(|value| value.is_object())
+        .cloned();
     Ok(GeneratedImage {
         bytes,
         media_type: media_type.to_string(),
         revised_prompt,
+        usage,
     })
 }
 

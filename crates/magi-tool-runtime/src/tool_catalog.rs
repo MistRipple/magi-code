@@ -904,7 +904,7 @@ mod tests {
     #[test]
     fn image_generation_tool_health_tracks_live_model_configuration() {
         let executor: crate::ImageGenerationExecutor =
-            Arc::new(|_| panic!("catalog health must not invoke image generation"));
+            Arc::new(|_, _| panic!("catalog health must not invoke image generation"));
         let not_configured = ToolRuntimeResources {
             image_generation_executor: Some(Arc::clone(&executor)),
             image_generation_readiness_provider: Some(Arc::new(|| false)),

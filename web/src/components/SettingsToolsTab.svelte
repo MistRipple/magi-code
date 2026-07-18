@@ -19,6 +19,8 @@
     builtinTools,
     builtinToolsLoading,
     capabilityDependencies,
+    commandEnvironment,
+    commandEnvironmentLoading,
     skills,
     openMCPDialog,
     toggleMCPExpand,
@@ -27,6 +29,7 @@
     deleteMCPServer,
     refreshMCPTools,
     refreshBuiltinToolCatalog,
+    refreshCommandEnvironment,
     openSkillLibraryDialog,
     openRepoDialog,
     deleteSkill
@@ -66,6 +69,12 @@
       readyCount?: number | null;
       toolCount?: number | null;
     }>;
+    commandEnvironment: {
+      source: string;
+      pathAvailable: boolean;
+      commands: Array<{ name: string; available: boolean; path: string | null }>;
+    } | null;
+    commandEnvironmentLoading: boolean;
     skills: any[];
     openMCPDialog: (server: any) => void;
     toggleMCPExpand: (sid: string) => void;
@@ -74,6 +83,7 @@
     deleteMCPServer: (sid: string) => void;
     refreshMCPTools: (sid: string) => void;
     refreshBuiltinToolCatalog: () => void | Promise<void>;
+    refreshCommandEnvironment: () => void | Promise<void>;
     openSkillLibraryDialog: () => void;
     openRepoDialog: () => void;
     deleteSkill: (skill: any) => void;
@@ -484,19 +494,12 @@
       : status;
   }
 
-  function getMCPStatusSummary(server: any): string {
-    const status = getMCPHealthLabel(server);
-    return server.error
-      ? i18n.t('settings.tools.runtimeStatusWithDetail', {
-        status,
-        detail: i18n.t('settings.tools.mcpConnectionIssue'),
-      })
-      : i18n.t('settings.tools.runtimeStatus', { status });
-  }
-
   let builtinExpanded = $state(false);
   const builtinReadyCount = $derived(
     (builtinTools as Array<{ runtimeStatus: string }>).filter((t) => t.runtimeStatus === 'ready').length,
+  );
+  const commandEnvironmentAvailableCount = $derived(
+    commandEnvironment?.commands.filter((command: { available: boolean }) => command.available).length ?? 0,
   );
 
   function toggleBuiltinExpanded() {
@@ -643,6 +646,55 @@
           {/if}
         </div>
 
+        <!-- 命令环境 -->
+        <div class="settings-section tools-section command-environment-section">
+          <div class="command-environment-panel">
+            <div class="command-environment-header">
+              <div class="header-title-group">
+                <div class="settings-section-title">{i18n.t('settings.tools.commandEnvironment')}</div>
+                {#if commandEnvironment}
+                  <span class="builtin-count-tag">
+                    {i18n.t('settings.tools.commandEnvironmentCount', {
+                      available: commandEnvironmentAvailableCount,
+                      total: commandEnvironment.commands.length,
+                    })}
+                  </span>
+                {/if}
+              </div>
+              <button
+                type="button"
+                class="btn-icon btn-icon--sm"
+                class:refreshing={commandEnvironmentLoading}
+                title={i18n.t('settings.tools.refreshCommandEnvironment')}
+                aria-label={i18n.t('settings.tools.refreshCommandEnvironment')}
+                onclick={() => refreshCommandEnvironment()}
+                disabled={commandEnvironmentLoading}
+              >
+                <Icon name="refresh" size={12} />
+              </button>
+            </div>
+            {#if commandEnvironment}
+              <div class="command-environment-list">
+                {#each commandEnvironment.commands as command (command.name)}
+                  <span
+                    class:command-available={command.available}
+                    class:command-unavailable={!command.available}
+                    class="command-environment-command"
+                    title={command.path ?? i18n.t('settings.tools.commandUnavailable')}
+                  >
+                    <span class="command-environment-dot"></span>
+                    {command.name}
+                  </span>
+                {/each}
+              </div>
+            {:else}
+              <div class="command-environment-empty">
+                {i18n.t('settings.tools.commandEnvironmentHint')}
+              </div>
+            {/if}
+          </div>
+        </div>
+
         <!-- MCP 工具 -->
         <div class="settings-section tools-section">
           <div class="settings-section-header" style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px;">
@@ -671,55 +723,58 @@
                 <p class="empty-state-hint">{i18n.t('settings.tools.noMcpServerHint')}</p>
               </div>
             {:else}
-              <div class="apple-grid">
+              <div class="mcp-server-list">
               {#each mcpServers as server (server.id)}
-                <div class="apple-tile mcp-server-item" class:expanded={mcpExpandedServer === server.id} style="position: relative;">
-                  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-                  <div class="tile-row tile-header" role="button" tabindex="0" onclick={() => toggleMCPExpand(server.id)} onkeydown={(e) => e.key === 'Enter' && toggleMCPExpand(server.id)} style="cursor: pointer;">
-                    <div class="brand-group">
-                      <div class="avatar-squircle" style="background: rgba(var(--primary-rgb, 0, 122, 255), 0.15); color: var(--primary);">
+                <div class="mcp-server-item" class:expanded={mcpExpandedServer === server.id}>
+                  <div class="mcp-server-row">
+                    <button
+                      type="button"
+                      class="mcp-server-primary"
+                      onclick={() => toggleMCPExpand(server.id)}
+                      aria-expanded={mcpExpandedServer === server.id}
+                    >
+                      <span class="avatar-squircle mcp-server-avatar">
                         <Icon name="plug" size={13} />
-                      </div>
-                      <div class="identity-stack">
-                        <span class="main-label" title={server.name}>{server.name}</span>
-                        <span style="font-size: 10px; color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px;">{getMCPServerSubtitle(server)}</span>
-                      </div>
-                    </div>
-                    <div class="header-action" style="display: flex; align-items: center; gap: 6px;">
-                      <span
-                        class="apple-indicator"
-                        class:success={server.health === 'connected'}
-                        class:warning={server.health === 'degraded' || (server.enabled !== false && server.health === 'disconnected' && !server.error)}
-                        class:disabled={server.health === 'disabled' || server.enabled === false}
-                        class:error={server.enabled !== false && (Boolean(server.error) || !server.health)}
-                        title={getMCPStatusTitle(server)}
-                      ></span>
-                      <span class="mcp-expand-icon" class:expanded={mcpExpandedServer === server.id} style="margin-left: 4px;">
-                        <Icon name="chevronDown" size={14} />
                       </span>
-                    </div>
-                  </div>
-                  
-                  <div class="tile-row tile-body" style="height: 32px; display: flex; align-items: flex-start; margin-top: 4px;">
-                    <p class="apple-summary" title={getMCPStatusTitle(server)} style="margin: 0; font-size: 11px; color: {server.error ? 'var(--error)' : 'var(--foreground-muted)'}; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;">
-                      {getMCPStatusSummary(server)}
-                    </p>
-                  </div>
-
-                  <div class="tile-row tile-footer" style="margin-top: auto;">
-                    <div class="footer-left">
+                      <span class="mcp-server-identity">
+                        <span class="mcp-server-name" title={server.name}>{server.name}</span>
+                        <span class="mcp-server-subtitle" title={getMCPStatusTitle(server)}>{getMCPServerSubtitle(server)}</span>
+                      </span>
+                    </button>
+                    <div class="mcp-server-actions">
+                      <span
+                        class="mcp-server-health"
+                        title={getMCPStatusTitle(server)}
+                      >
+                        <span
+                          class="apple-indicator"
+                          class:success={server.health === 'connected'}
+                          class:warning={server.health === 'degraded' || (server.enabled !== false && server.health === 'disconnected' && !server.error)}
+                          class:disabled={server.health === 'disabled' || server.enabled === false}
+                          class:error={server.enabled !== false && (Boolean(server.error) || !server.health)}
+                        ></span>
+                      </span>
                       <Toggle
                         checked={server.enabled}
                         title={server.enabled ? i18n.t('settings.tools.clickToDisable') : i18n.t('settings.tools.clickToEnable')}
                         onchange={() => toggleMCPServer(server.id, server.enabled)}
                       />
-                    </div>
-                    <div class="footer-right" style="display: flex; gap: 4px;">
-                      <button class="btn-icon btn-icon--sm" title={i18n.t('settings.tools.edit')} onclick={(e) => { e.stopPropagation(); openMCPDialog(server); }}>
-                        <Icon name="edit" size={14} />
+                      <button class="btn-icon btn-icon--sm" title={i18n.t('settings.tools.edit')} onclick={() => openMCPDialog(server)}>
+                        <Icon name="edit" size={13} />
                       </button>
-                      <button class="btn-icon btn-icon--sm btn-icon--danger" title={i18n.t('settings.tools.delete')} onclick={(e) => { e.stopPropagation(); deleteMCPServer(server.id); }}>
-                        <Icon name="trash" size={14} />
+                      <button class="btn-icon btn-icon--sm btn-icon--danger" title={i18n.t('settings.tools.delete')} onclick={() => deleteMCPServer(server.id)}>
+                        <Icon name="trash" size={13} />
+                      </button>
+                      <button
+                        type="button"
+                        class="btn-icon btn-icon--sm mcp-expand-button"
+                        title={i18n.t('settings.tools.toolList')}
+                        onclick={() => toggleMCPExpand(server.id)}
+                        aria-expanded={mcpExpandedServer === server.id}
+                      >
+                        <span class="mcp-expand-icon" class:expanded={mcpExpandedServer === server.id}>
+                          <Icon name="chevronDown" size={14} />
+                        </span>
                       </button>
                     </div>
                   </div>
@@ -727,20 +782,30 @@
                   {#if mcpExpandedServer === server.id}
                     <div class="mcp-tools-popover">
                       <div class="mcp-tools-header">
-                        <span>{i18n.t('settings.tools.toolList')} {mcpServerTools[server.id]?.length ? `(${mcpServerTools[server.id].length})` : ''}</span>
+                        <div class="mcp-tools-heading">
+                          <span>{i18n.t('settings.tools.toolList')}</span>
+                          {#if mcpServerTools[server.id]?.length}
+                            <span class="mcp-tools-count">{mcpServerTools[server.id].length}</span>
+                          {/if}
+                        </div>
                         <button class="btn-icon btn-icon--sm" class:refreshing={mcpRefreshingServers.has(server.id)} title={i18n.t('settings.tools.refreshTools')}
                           onclick={() => refreshMCPTools(server.id)} disabled={mcpRefreshingServers.has(server.id)}>
                           <Icon name="refresh" size={12} />
                         </button>
                       </div>
-                      <div class="mcp-tools-list" style="display: flex; flex-direction: column; gap: 6px;">
+                      <div class="mcp-tools-list">
                         {#if mcpRefreshingServers.has(server.id)}
-                          <div class="mcp-tools-empty" style="font-size: 11px; padding: 12px; text-align: center;">{i18n.t('settings.tools.loading')}</div>
+                          <div class="mcp-tools-empty">{i18n.t('settings.tools.loading')}</div>
                         {:else if mcpServerTools[server.id] && mcpServerTools[server.id].length > 0}
                           {#each mcpServerTools[server.id] as tool}
-                            <div class="mcp-tool-item" style="background: rgba(var(--foreground-rgb), 0.04); border-radius: 6px; padding: 6px 8px;">
-                              <div class="mcp-tool-row" style="display: flex; justify-content: space-between; align-items: center;">
-                                <div class="mcp-tool-name" title={tool.description ? `${tool.name}\n${tool.description}` : tool.name} style="font-size: 11px; font-weight: 500;">{tool.name}</div>
+                            <div class="mcp-tool-item">
+                              <div class="mcp-tool-row">
+                                <div class="mcp-tool-identity">
+                                  <div class="mcp-tool-name" title={tool.name}>{tool.name}</div>
+                                  {#if tool.description}
+                                    <div class="mcp-tool-description" title={tool.description}>{tool.description}</div>
+                                  {/if}
+                                </div>
                                 {#if tool.description}
                                   <button
                                     class="mcp-tool-desc-btn"
@@ -749,7 +814,6 @@
                                     onmouseleave={scheduleClose}
                                     onfocus={(e) => openDesc(tool.description, e as unknown as MouseEvent)}
                                     onblur={scheduleClose}
-                                    style="transform: scale(0.8);"
                                   >
                                     <Icon name="info" size={12} />
                                   </button>
@@ -758,7 +822,7 @@
                             </div>
                           {/each}
                         {:else}
-                          <div class="mcp-tools-empty" style="font-size: 11px; padding: 12px; text-align: center;">{i18n.t('settings.tools.noToolsHint')}</div>
+                          <div class="mcp-tools-empty">{i18n.t('settings.tools.noToolsHint')}</div>
                         {/if}
                       </div>
                     </div>
@@ -923,7 +987,12 @@
   }
 
   .builtin-section {
-    margin-bottom: 16px;
+    padding-bottom: 12px;
+  }
+
+  .command-environment-section {
+    padding-top: 12px;
+    padding-bottom: 12px;
   }
 
   .builtin-summary {
@@ -1057,6 +1126,64 @@
 
   .builtin-expand-icon.expanded {
     transform: rotate(180deg);
+  }
+
+  .command-environment-panel {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(var(--foreground-rgb), 0.025);
+  }
+
+  .command-environment-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .command-environment-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    margin-top: 8px;
+  }
+
+  .command-environment-command {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--foreground-muted);
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 10px;
+  }
+
+  .command-environment-command.command-available {
+    color: var(--success, #2f855a);
+  }
+
+  .command-environment-command.command-unavailable {
+    color: var(--foreground-subtle);
+  }
+
+  .command-environment-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+
+  .command-environment-command.command-unavailable .command-environment-dot {
+    background: transparent;
+    box-shadow: inset 0 0 0 1px currentColor;
+  }
+
+  .command-environment-empty {
+    margin-top: 8px;
+    color: var(--foreground-subtle);
+    font-size: 10px;
   }
 
   @container tools-tab (max-width: 760px) {
@@ -1215,32 +1342,191 @@
 
   .mcp-tools-popover {
     position: absolute;
-    top: calc(100% + 8px);
-    left: 0;
-    width: 100%;
+    top: calc(100% + 5px);
+    right: 8px;
+    left: 34px;
     background: var(--background);
     border: 1px solid var(--border);
-    border-radius: 12px;
-    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35), 0 1px 2px rgba(0, 0, 0, 0.08);
+    border-radius: 9px;
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.2), 0 1px 3px rgba(0, 0, 0, 0.08);
     z-index: var(--z-popover);
-    padding: 12px;
-    max-height: 250px;
-    overflow-y: auto;
+    padding: 0;
     box-sizing: border-box;
     display: flex;
     flex-direction: column;
+    animation: mcp-tools-popover-in 0.14s ease-out;
+  }
+
+  .mcp-tools-popover::before {
+    position: absolute;
+    top: -5px;
+    right: 10px;
+    width: 8px;
+    height: 8px;
+    border-top: 1px solid var(--border);
+    border-left: 1px solid var(--border);
+    background: var(--background);
+    content: '';
+    transform: rotate(45deg);
+  }
+
+  @keyframes mcp-tools-popover-in {
+    from {
+      opacity: 0;
+      transform: translateY(-3px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .mcp-server-list {
+    width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(var(--foreground-rgb), 0.025);
+  }
+
+  .mcp-server-item {
+    position: relative;
+    z-index: 1;
+  }
+
+  .mcp-server-item + .mcp-server-item {
+    border-top: 1px solid var(--border);
+  }
+
+  .mcp-server-item.expanded {
+    z-index: 100;
+  }
+
+  .mcp-server-row {
+    display: flex;
+    align-items: center;
+    min-height: 54px;
+    padding: 7px 8px 7px 10px;
+    transition: background 0.15s ease;
+  }
+
+  .mcp-server-item:first-child .mcp-server-row {
+    border-radius: 9px 9px 0 0;
+  }
+
+  .mcp-server-item:last-child .mcp-server-row {
+    border-radius: 0 0 9px 9px;
+  }
+
+  .mcp-server-item:only-child .mcp-server-row {
+    border-radius: 9px;
+  }
+
+  .mcp-server-row:hover {
+    background: rgba(var(--foreground-rgb), 0.045);
+  }
+
+  .mcp-server-primary {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+  }
+
+  .mcp-server-primary:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--primary) 58%, transparent);
+    outline-offset: 3px;
+    border-radius: 6px;
+  }
+
+  .mcp-server-avatar {
+    flex: 0 0 auto;
+    background: rgba(var(--primary-rgb, 0, 122, 255), 0.13);
+    color: var(--primary);
+  }
+
+  .mcp-server-identity {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .mcp-server-name {
+    overflow: hidden;
+    color: var(--foreground);
+    font-size: 13px;
+    font-weight: 650;
+    line-height: 1.3;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mcp-server-subtitle {
+    overflow: hidden;
+    color: var(--foreground-muted);
+    font-size: 10px;
+    line-height: 1.3;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mcp-server-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 0 0 auto;
+    margin-left: 12px;
+  }
+
+  .mcp-server-health {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 28px;
+  }
+
+  .mcp-expand-button {
+    margin-left: 1px;
   }
 
   .mcp-tools-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--foreground-muted);
-    margin-bottom: 12px;
-    padding-bottom: 8px;
+    min-height: 36px;
+    padding: 5px 8px 5px 11px;
     border-bottom: 1px solid var(--border);
+  }
+
+  .mcp-tools-heading {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    color: var(--foreground);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .mcp-tools-count {
+    min-width: 18px;
+    padding: 1px 5px;
+    border-radius: 999px;
+    background: rgba(var(--foreground-rgb), 0.07);
+    color: var(--foreground-muted);
+    font-size: 9px;
+    font-weight: 600;
+    line-height: 16px;
+    text-align: center;
   }
 
   /* Apply consistent tile classes */
@@ -1285,13 +1571,6 @@
     z-index: 100;
   }
 
-  .brand-group {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    min-width: 0;
-  }
-
   .avatar-squircle {
     width: 24px;
     height: 24px;
@@ -1299,34 +1578,6 @@
     display: flex;
     align-items: center;
     justify-content: center;
-  }
-
-  .identity-stack {
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    min-width: 0;
-  }
-
-  .main-label {
-    font-size: 13.5px;
-    font-weight: 600;
-    color: var(--foreground);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .tile-row {
-    display: flex;
-    align-items: center;
-    width: 100%;
-  }
-
-  .tile-header {
-    justify-content: space-between;
-    height: 24px;
-    flex-shrink: 0;
   }
 
   .mcp-expand-icon {
@@ -1340,20 +1591,93 @@
     transform: rotate(180deg);
   }
 
-  .mcp-tools-list { display: flex; flex-direction: column; gap: var(--space-2); }
+  @container tools-tab (max-width: 640px) {
+    .mcp-server-row {
+      min-height: 52px;
+      padding-left: 8px;
+      padding-right: 6px;
+    }
+
+    .mcp-server-actions {
+      gap: 2px;
+      margin-left: 8px;
+    }
+
+    .mcp-server-health {
+      width: 14px;
+    }
+
+    .mcp-server-avatar {
+      width: 22px;
+      height: 22px;
+    }
+
+    .mcp-tools-popover {
+      right: 5px;
+      left: 5px;
+    }
+  }
+
+  .mcp-tools-list {
+    display: flex;
+    flex-direction: column;
+    max-height: min(280px, 42vh);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 5px;
+  }
 
   /* MCP 工具项样式 */
   .mcp-tool-item {
     position: relative;
-    padding: var(--space-2) var(--space-3);
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    transition: all var(--transition-fast);
+    padding: 7px 8px;
+    border-radius: 6px;
+    transition: background var(--transition-fast);
   }
-  .mcp-tool-item:hover { border-color: var(--primary-muted); background: var(--surface-hover); }
-  .mcp-tool-row { display: flex; align-items: center; gap: var(--space-2); }
-  .mcp-tool-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mcp-tool-item:hover {
+    background: rgba(var(--foreground-rgb), 0.045);
+  }
+  .mcp-tool-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .mcp-tool-identity {
+    flex: 1;
+    min-width: 0;
+  }
+  .mcp-tool-name {
+    overflow: hidden;
+    color: var(--foreground);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.35;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .mcp-tool-description {
+    display: -webkit-box;
+    overflow: hidden;
+    margin-top: 2px;
+    color: var(--foreground-muted);
+    font-size: 9.5px;
+    line-height: 1.35;
+    line-clamp: 1;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 1;
+  }
+  .mcp-tools-empty {
+    padding: 14px 10px;
+    color: var(--foreground-muted);
+    font-size: 10px;
+    text-align: center;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .mcp-tools-popover {
+      animation: none;
+    }
+  }
 
   /* MCP 工具描述浮层气泡：fixed 定位，已在脚本中按视口边界 clamp */
   .mcp-tool-desc-popover {
@@ -1389,14 +1713,16 @@
     color: var(--foreground-muted);
     transition: all var(--transition-fast);
     flex-shrink: 0;
+    opacity: 0.62;
+    transform: scale(0.9);
   }
-  .mcp-tool-desc-btn:hover {
+  .mcp-tool-desc-btn:hover,
+  .mcp-tool-desc-btn:focus-visible {
     background: var(--surface-hover);
     border-color: var(--primary);
     color: var(--foreground);
+    opacity: 1;
   }
-
-  .mcp-tools-empty { font-size: var(--text-sm); color: var(--foreground-muted); text-align: center; padding: var(--space-4); }
 
   /* Skill 卡片内部 */
   .skill-item { min-height: auto; height: auto; align-self: start; }

@@ -30,6 +30,7 @@ magi-skill-runtime = { path = "../magi-skill-runtime" }
 magi-snapshot = { path = "../magi-snapshot" }
 magi-spawn-graph = { path = "../magi-spawn-graph" }
 magi-tool-runtime = { path = "../magi-tool-runtime" }
+magi-usage-authority = { path = "../magi-usage-authority" }
 magi-worker-runtime = { path = "../magi-worker-runtime" }
 magi-workspace = { path = "../magi-workspace" }
 

@@ -1,7 +1,7 @@
 export interface UsageStatsItemLike {
   templateId: string;
   engineId: string;
-  role: 'worker' | 'orchestrator' | 'auxiliary';
+  role: 'worker' | 'orchestrator' | 'auxiliary' | 'image_generation';
   llmCallCount: number;
   assignmentCount: number;
   successCount: number;
@@ -36,6 +36,9 @@ export function aggregateUsageStatsForDisplay(
     }
     if (normalizedKey === 'auxiliary') {
       return item.role === 'auxiliary';
+    }
+    if (normalizedKey === 'imageGeneration') {
+      return item.role === 'image_generation';
     }
     return item.role === 'worker' && item.templateId === normalizedKey;
   });

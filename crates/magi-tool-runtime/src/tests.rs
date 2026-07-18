@@ -6479,10 +6479,25 @@ fn image_generate_writes_provider_bytes_to_workspace_without_persisting_base64()
     let root = unique_temp_dir("magi-tool-image-generate");
     let governance = Arc::new(GovernanceService::default());
     let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
-    let executor: ImageGenerationExecutor = Arc::new(|request| {
+    let executor: ImageGenerationExecutor = Arc::new(|request, execution_context| {
         assert_eq!(request.prompt, "生成一个蓝色方块");
         assert_eq!(request.size, "1024x1024");
         assert_eq!(request.quality.as_deref(), Some("high"));
+        assert_eq!(
+            execution_context
+                .session_id
+                .as_ref()
+                .map(ToString::to_string),
+            Some("session-image-generate".to_string())
+        );
+        assert_eq!(
+            execution_context
+                .workspace_id
+                .as_ref()
+                .map(ToString::to_string),
+            Some("workspace-image-generate".to_string())
+        );
+        assert_eq!(execution_context.call_id, "tool-call-image-generate");
         Ok(GeneratedImageData {
             bytes: b"\x89PNG\r\n\x1a\n".to_vec(),
             media_type: "image/png".to_string(),
@@ -6506,6 +6521,8 @@ fn image_generate_writes_provider_bytes_to_workspace_without_persisting_base64()
             .to_string(),
         ),
         ToolExecutionContext {
+            session_id: Some(magi_core::SessionId::new("session-image-generate")),
+            workspace_id: Some(magi_core::WorkspaceId::new("workspace-image-generate")),
             working_directory: Some(root.clone()),
             access_profile: magi_core::AccessProfile::FullAccess,
             ..ToolExecutionContext::default()
@@ -6538,7 +6555,7 @@ fn image_generate_is_unavailable_in_read_only_access_profile() {
     let governance = Arc::new(GovernanceService::default());
     let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
     let executor: ImageGenerationExecutor =
-        Arc::new(|_| panic!("read-only policy must reject before provider invocation"));
+        Arc::new(|_, _| panic!("read-only policy must reject before provider invocation"));
     let mut registry = ToolRegistry::new(governance, event_bus)
         .with_image_generation_runtime(executor, Arc::new(|| true));
     registry.register_default_builtins();
@@ -6569,7 +6586,7 @@ fn image_generate_rejects_unconfigured_runtime_before_provider_call() {
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let executor: ImageGenerationExecutor = {
         let provider_calls = Arc::clone(&provider_calls);
-        Arc::new(move |_| {
+        Arc::new(move |_, _| {
             provider_calls.fetch_add(1, Ordering::SeqCst);
             panic!("unconfigured image runtime must not call provider")
         })
@@ -6615,7 +6632,7 @@ fn image_generate_rejects_workspace_escape_before_calling_provider() {
     let outside = unique_temp_dir("magi-tool-image-generate-outside").join("escaped.png");
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let calls = Arc::clone(&provider_calls);
-    let executor: ImageGenerationExecutor = Arc::new(move |_| {
+    let executor: ImageGenerationExecutor = Arc::new(move |_, _| {
         calls.fetch_add(1, Ordering::SeqCst);
         Ok(GeneratedImageData {
             bytes: b"\x89PNG\r\n\x1a\n".to_vec(),
@@ -6665,7 +6682,7 @@ fn image_generate_rejects_workspace_escape_before_calling_provider() {
 fn image_generate_normalizes_extension_and_avoids_overwriting_existing_image() {
     let root = unique_temp_dir("magi-tool-image-generate-extension");
     fs::write(root.join("poster.png"), b"keep-existing-png").expect("seed existing png");
-    let executor: ImageGenerationExecutor = Arc::new(|_| {
+    let executor: ImageGenerationExecutor = Arc::new(|_, _| {
         Ok(GeneratedImageData {
             bytes: vec![0xff, 0xd8, 0xff, 0xd9],
             media_type: "image/jpeg".to_string(),

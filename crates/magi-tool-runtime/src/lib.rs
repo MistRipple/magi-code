@@ -27,10 +27,11 @@ pub use types::{
     AgentRoleCatalogEntry, AgentRoleCatalogProvider, BuiltinTool, ExternalMcpServerCatalogEntry,
     ExternalMcpToolCatalogEntry, ExternalMcpToolExecutor, ExternalToolCatalogEntry,
     ExternalToolCatalogProvider, ExternalToolCatalogSnapshot, GeneratedImageData,
-    ImageGenerationExecutor, ImageGenerationReadinessProvider, ImageGenerationRequest,
-    RuntimeCapabilityDependencyEntry, RuntimeCapabilityDependencyProvider, ToolExecutionContext,
-    ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput, ToolExecutionPolicy,
-    ToolExecutionSummary, ToolInvocationRecord, ToolRuntimeResources, WriteProtectionScope,
+    ImageGenerationExecutionContext, ImageGenerationExecutor, ImageGenerationReadinessProvider,
+    ImageGenerationRequest, RuntimeCapabilityDependencyEntry, RuntimeCapabilityDependencyProvider,
+    ToolExecutionContext, ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput,
+    ToolExecutionPolicy, ToolExecutionSummary, ToolInvocationRecord, ToolRuntimeResources,
+    WriteProtectionScope,
 };
 
 #[cfg(test)]

@@ -1,7 +1,9 @@
 use crate::{
-    BuiltinToolAccessMode, GeneratedImageData, ImageGenerationRequest, ToolExecutionContext,
-    ToolRuntimeResources, canonicalize_tool_permission_path,
+    BuiltinToolAccessMode, GeneratedImageData, ImageGenerationExecutionContext,
+    ImageGenerationRequest, ToolExecutionContext, ToolRuntimeResources,
+    canonicalize_tool_permission_path,
 };
+use magi_core::ToolCallId;
 use serde_json::Value;
 use std::{
     fs::{self, OpenOptions},
@@ -17,6 +19,7 @@ const PUBLIC_WRITE_ERROR: &str = "生成图片暂不可保存，请检查工作�
 const MAX_OUTPUT_NAME_ATTEMPTS: u32 = 10_000;
 
 pub(crate) fn execute_image_generate(
+    tool_call_id: &ToolCallId,
     input: &str,
     context: &ToolExecutionContext,
     resources: &ToolRuntimeResources,
@@ -53,11 +56,18 @@ pub(crate) fn execute_image_generate(
             }
         };
 
-    let generated = match executor(ImageGenerationRequest {
-        prompt: request.prompt.clone(),
-        size: request.size.clone(),
-        quality: request.quality.clone(),
-    }) {
+    let generated = match executor(
+        ImageGenerationRequest {
+            prompt: request.prompt.clone(),
+            size: request.size.clone(),
+            quality: request.quality.clone(),
+        },
+        ImageGenerationExecutionContext {
+            session_id: context.session_id.clone(),
+            workspace_id: context.workspace_id.clone(),
+            call_id: tool_call_id.to_string(),
+        },
+    ) {
         Ok(generated) => generated,
         Err(error) => {
             tracing::warn!(error = %error, "image generation provider request failed");

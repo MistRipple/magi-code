@@ -26,6 +26,10 @@ use magi_conversation_runtime::{
     },
     task_execution_dispatcher::{LlmTaskDispatcher, LlmTaskDispatcherDependencies},
     task_runner_bridge::{EventBasedResultReceiver, TaskOutcome, TaskResult},
+    usage_recording::{
+        ModelUsageRecordInput, image_generation_model_usage_binding,
+        publish_model_usage_record_with_config,
+    },
 };
 use magi_core::{EventId, ExecutionOwnership, LeaseId, SessionId, TaskStatus, UtcMillis};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
@@ -44,6 +48,7 @@ use magi_tool_runtime::{
     ImageGenerationExecutor, ImageGenerationReadinessProvider, ToolRegistry,
     external_mcp_model_tool_name,
 };
+use magi_usage_authority::UsageCallStatus;
 use magi_worker_runtime::WorkerRuntime;
 use magi_workspace::WorkspaceStore;
 use std::{
@@ -1013,20 +1018,63 @@ impl DaemonRuntime {
             build_runtime_capability_dependency_provider(true);
         let image_generation_executor: ImageGenerationExecutor = {
             let settings_store = Arc::clone(&settings_store);
-            Arc::new(move |request| {
+            let event_bus = Arc::clone(&self.event_bus);
+            let session_store = Arc::clone(&self.session_store);
+            Arc::new(move |request, execution_context| {
                 let config = settings_store.get_section("imageGeneration");
                 let normalized = NormalizedModelConfig::from_settings_value(&config)
                     .map_err(|error| format!("图片生成模型配置无效: {error}"))?;
+                let usage_model_config = normalized
+                    .to_usage_llm_config()
+                    .ok_or_else(|| "图片生成模型配置缺少用量身份字段".to_string())?;
                 let client = normalized
                     .to_http_image_generation_client()
                     .map_err(|error| format!("图片生成模型配置无效: {error}"))?;
-                let generated = client
-                    .generate(BridgeImageGenerationRequest {
-                        prompt: request.prompt,
-                        size: request.size,
-                        quality: request.quality,
-                    })
-                    .map_err(|error| error.to_string())?;
+                let binding = image_generation_model_usage_binding();
+                let provider_result = client.generate(BridgeImageGenerationRequest {
+                    prompt: request.prompt,
+                    size: request.size,
+                    quality: request.quality,
+                });
+                let publish_usage =
+                    |usage: Option<&serde_json::Value>,
+                     status: UsageCallStatus,
+                     error_code: Option<String>| {
+                        let Some(session_id) = execution_context.session_id.as_ref() else {
+                            warn!(call_id = %execution_context.call_id, "图片模型调用缺少会话标识，无法记录统计");
+                            return;
+                        };
+                        publish_model_usage_record_with_config(
+                            &event_bus,
+                            &session_store,
+                            Some(&settings_store),
+                            ModelUsageRecordInput {
+                                session_id,
+                                workspace_id: &execution_context.workspace_id,
+                                binding: &binding,
+                                call_id: execution_context.call_id.clone(),
+                                usage,
+                                status,
+                                assignment_id: None,
+                                error_code,
+                            },
+                            usage_model_config.clone(),
+                        );
+                    };
+                let generated = match provider_result {
+                    Ok(generated) => {
+                        publish_usage(generated.usage.as_ref(), UsageCallStatus::Success, None);
+                        generated
+                    }
+                    Err(error) => {
+                        publish_usage(
+                            None,
+                            UsageCallStatus::Failed,
+                            Some("image_generation_provider_failed".to_string()),
+                        );
+                        return Err(error.to_string());
+                    }
+                };
                 Ok(GeneratedImageData {
                     bytes: generated.bytes,
                     media_type: generated.media_type,

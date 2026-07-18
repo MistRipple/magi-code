@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus},
     sync::{
-        Mutex, OnceLock,
+        Mutex, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -35,7 +35,7 @@ const LOGIN_ENVIRONMENT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const LOGIN_ENVIRONMENT_MAX_BYTES: u64 = 1024 * 1024;
 
-static PROCESS_ENVIRONMENT: OnceLock<ProcessEnvironment> = OnceLock::new();
+static PROCESS_ENVIRONMENT: OnceLock<RwLock<ProcessEnvironment>> = OnceLock::new();
 static NEXT_MANAGED_PROCESS_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_MANAGED_PROCESSES: OnceLock<Mutex<BTreeMap<u64, ManagedProcessTerminator>>> =
     OnceLock::new();
@@ -91,7 +91,8 @@ pub fn resolve_executable(program: impl AsRef<OsStr>) -> Option<PathBuf> {
         return executable_file(program).then(|| program.to_path_buf());
     }
 
-    let path = process_environment()
+    let environment = process_environment_snapshot();
+    let path = environment
         .overrides
         .get(OsStr::new("PATH"))
         .cloned()
@@ -127,14 +128,44 @@ struct ProcessEnvironment {
 /// `.bashrc` 等用户终端配置中的 PATH 也能进入 Desktop；Windows 使用系统传入的
 /// 用户/机器环境。所有后续同步和异步子进程都复用同一份快照。
 pub fn initialize_user_process_environment() -> ProcessEnvironmentSummary {
-    let environment = process_environment();
-    ProcessEnvironmentSummary {
-        source: environment.source,
-        path: environment
-            .overrides
-            .get(OsStr::new("PATH"))
-            .cloned()
-            .or_else(|| std::env::var_os("PATH")),
+    process_environment_summary(false)
+}
+
+/// 重新读取登录 Shell 环境并刷新共享命令环境快照。
+///
+/// 该操作只更新 Magi 后续子进程使用的环境，不会执行任何用户命令，也不会安装或升级
+/// 外部程序。用户在 Magi 运行期间安装命令、修改 Shell 配置或调整 PATH 后，应通过此
+/// 入口让后续会话立即看到新环境。
+pub fn refresh_user_process_environment() -> ProcessEnvironmentSummary {
+    process_environment_summary(true)
+}
+
+/// 返回当前平台常见的开发命令名称，用于诊断面板展示；实际执行前仍会按命令逐项预检。
+pub fn common_command_names() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &[
+            "cmd",
+            "powershell",
+            "pwsh",
+            "git",
+            "cargo",
+            "rustc",
+            "node",
+            "npm",
+            "pnpm",
+            "python",
+            "python3",
+            "rg",
+            "grep",
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        &[
+            "sh", "bash", "zsh", "fish", "git", "cargo", "rustc", "node", "npm", "pnpm", "python",
+            "python3", "rg", "grep",
+        ]
     }
 }
 
@@ -636,25 +667,99 @@ impl Drop for WindowsJobHandle {
     }
 }
 
-fn process_environment() -> &'static ProcessEnvironment {
-    PROCESS_ENVIRONMENT.get_or_init(resolve_process_environment)
+fn process_environment_lock() -> &'static RwLock<ProcessEnvironment> {
+    PROCESS_ENVIRONMENT.get_or_init(|| RwLock::new(resolve_process_environment()))
+}
+
+fn process_environment_snapshot() -> ProcessEnvironment {
+    process_environment_lock()
+        .read()
+        .expect("Magi process environment lock poisoned")
+        .clone()
+}
+
+fn process_environment_summary(refresh: bool) -> ProcessEnvironmentSummary {
+    let lock = process_environment_lock();
+    if refresh {
+        let mut environment = lock
+            .write()
+            .expect("Magi process environment lock poisoned");
+        *environment = resolve_process_environment();
+    }
+    let environment = lock.read().expect("Magi process environment lock poisoned");
+    ProcessEnvironmentSummary {
+        source: environment.source,
+        path: environment
+            .overrides
+            .get(OsStr::new("PATH"))
+            .cloned()
+            .or_else(|| std::env::var_os("PATH")),
+    }
 }
 
 fn resolve_process_environment() -> ProcessEnvironment {
     #[cfg(unix)]
     {
         let inherited = std::env::vars_os().collect::<BTreeMap<_, _>>();
-        if let Some(login_environment) = capture_login_shell_environment() {
-            return ProcessEnvironment {
-                overrides: environment_overrides(&inherited, login_environment),
-                source: "login_shell",
-            };
-        }
+        let (mut runtime_environment, source) = match capture_login_shell_environment() {
+            Some(environment) => (environment, "login_shell"),
+            None => (inherited.clone(), "inherited"),
+        };
+        augment_standard_unix_path(&mut runtime_environment, &inherited);
+        return ProcessEnvironment {
+            overrides: environment_overrides(&inherited, runtime_environment),
+            source,
+        };
     }
 
+    #[cfg(not(unix))]
     ProcessEnvironment {
         overrides: BTreeMap::new(),
         source: "inherited",
+    }
+}
+
+#[cfg(unix)]
+fn augment_standard_unix_path(
+    environment: &mut BTreeMap<OsString, OsString>,
+    inherited: &BTreeMap<OsString, OsString>,
+) {
+    let Some(current_path) = environment
+        .get(OsStr::new("PATH"))
+        .cloned()
+        .or_else(|| inherited.get(OsStr::new("PATH")).cloned())
+    else {
+        return;
+    };
+
+    let mut paths = std::env::split_paths(&current_path).collect::<Vec<_>>();
+    let mut standard_paths = vec![
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/opt/homebrew/sbin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/local/sbin"),
+    ];
+    if let Some(home) = environment
+        .get(OsStr::new("HOME"))
+        .cloned()
+        .or_else(|| inherited.get(OsStr::new("HOME")).cloned())
+    {
+        let home = PathBuf::from(home);
+        standard_paths.extend([
+            home.join(".cargo/bin"),
+            home.join(".local/bin"),
+            home.join(".volta/bin"),
+            home.join("Library/pnpm"),
+            home.join(".npm-global/bin"),
+        ]);
+    }
+    for path in standard_paths {
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
+    if let Ok(updated_path) = std::env::join_paths(paths) {
+        environment.insert(OsString::from("PATH"), updated_path);
     }
 }
 
@@ -682,7 +787,8 @@ fn login_environment_variable_is_stable(key: &OsStr) -> bool {
 }
 
 fn apply_process_environment(command: &mut Command) {
-    command.envs(process_environment().overrides.iter());
+    let environment = process_environment_snapshot();
+    command.envs(environment.overrides.iter());
 }
 
 #[cfg(unix)]
@@ -848,6 +954,21 @@ mod tests {
         assert!(summary.path.is_some());
     }
 
+    #[test]
+    fn common_command_catalog_uses_platform_native_shell_names() {
+        let commands = super::common_command_names();
+
+        assert!(commands.contains(&"git"));
+        assert!(commands.contains(&"rg"));
+        if cfg!(windows) {
+            assert!(commands.contains(&"cmd"));
+            assert!(!commands.contains(&"zsh"));
+        } else {
+            assert!(commands.contains(&"sh"));
+            assert!(!commands.contains(&"cmd"));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn child_shell_receives_the_initialized_path_without_login_reset() {
@@ -943,6 +1064,26 @@ mod tests {
             overrides.get(&OsString::from("VOLTA_HOME")),
             Some(&OsString::from("/Users/test/.volta"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standard_unix_tool_paths_are_added_without_replacing_user_path() {
+        let inherited = BTreeMap::from([
+            (OsString::from("PATH"), OsString::from("/usr/bin")),
+            (OsString::from("HOME"), OsString::from("/Users/test")),
+        ]);
+        let mut environment = inherited.clone();
+
+        super::augment_standard_unix_path(&mut environment, &inherited);
+
+        let path = environment
+            .get(&OsString::from("PATH"))
+            .expect("PATH should remain available")
+            .to_string_lossy();
+        assert!(path.contains("/usr/bin"));
+        assert!(path.contains("/opt/homebrew/bin"));
+        assert!(path.contains("/Users/test/.cargo/bin"));
     }
 
     #[cfg(unix)]

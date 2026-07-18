@@ -202,4 +202,35 @@ assert.equal(roleStats?.totalExecutions, 2, '角色换引擎后必须继续聚�
 assert.equal(roleStats?.totalTokens, 43, '共享引擎的其他角色不能混入当前角色统计');
 assert.deepEqual(roleStats?.resolvedModels.sort(), ['model-a', 'model-b']);
 
+const imageStats = aggregateUsageStatsForDisplay([
+  {
+    templateId: 'imageGeneration',
+    engineId: 'imageGeneration',
+    role: 'image_generation',
+    llmCallCount: 3,
+    assignmentCount: 0,
+    successCount: 2,
+    failureCount: 1,
+    totalTokens: 0,
+    netInputTokens: 0,
+    netOutputTokens: 0,
+    resolvedModel: 'gpt-image-test',
+  },
+], 'imageGeneration');
+assert.equal(imageStats?.totalExecutions, 3, '图片模型必须按生成调用次数统计');
+assert.equal(imageStats?.successCount, 2, '图片模型成功与失败调用必须进入统一统计');
+assert.equal(imageStats?.totalTokens, 0, '图片接口未返回 usage 时不能伪造 Token');
+assert.deepEqual(imageStats?.resolvedModels, ['gpt-image-test']);
+
+assert.match(
+  settingsStatsTabSource,
+  /binding\.role === ['"]image_generation['"][\s\S]*?return ['"]imageGeneration['"]/,
+  '图片模型账本角色必须映射到产品角色标识',
+);
+assert.match(
+  settingsStatsTabSource,
+  /settings\.stats\.imageUsageMetricHint/,
+  '图片接口未返回 usage 时必须解释调用次数与 Token 的统计口径',
+);
+
 console.log('settings store golden tests passed');

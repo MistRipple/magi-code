@@ -5,7 +5,7 @@ use crate::{
     view_image::execute_view_image,
 };
 use base64::Engine as _;
-use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, UtcMillis};
+use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, ToolCallId, UtcMillis};
 use magi_process::{ManagedChild, spawn_managed, std_command};
 use serde_json::Value;
 use std::{
@@ -135,6 +135,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
 
     fn execute(
         &self,
+        tool_call_id: &ToolCallId,
         input: &str,
         context: &ToolExecutionContext,
         resources: &ToolRuntimeResources,
@@ -142,7 +143,9 @@ impl BuiltinTool for NormalizedBuiltinTool {
         match self.name {
             BuiltinToolName::FileRead => execute_file_read(input, context),
             BuiltinToolName::ViewImage => execute_view_image(input, context),
-            BuiltinToolName::ImageGenerate => execute_image_generate(input, context, resources),
+            BuiltinToolName::ImageGenerate => {
+                execute_image_generate(tool_call_id, input, context, resources)
+            }
             BuiltinToolName::FileWrite => execute_file_write(input, context),
             BuiltinToolName::FilePatch => execute_file_patch(input, context),
             BuiltinToolName::ApplyPatch => execute_apply_patch(input, context),
@@ -628,22 +631,45 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
     {
         return payload;
     }
-    let missing_executables =
-        crate::policy::shell_command_required_executables(&command, &shell.program)
-            .into_iter()
-            .filter(|executable| magi_process::resolve_executable(executable).is_none())
-            .collect::<Vec<_>>();
+    let required_executables =
+        crate::policy::shell_command_required_executables(&command, &shell.program);
+    let mut missing_executables = required_executables
+        .iter()
+        .filter(|executable| magi_process::resolve_executable(executable).is_none())
+        .cloned()
+        .collect::<Vec<_>>();
     if !missing_executables.is_empty() {
+        // 用户可能在 Magi 运行期间安装了命令或修改了 Shell PATH；刷新只重建环境快照，
+        // 不会执行原命令，因此不会把一次失败变成隐式重复执行。
+        magi_process::refresh_user_process_environment();
+        missing_executables = required_executables
+            .iter()
+            .filter(|executable| magi_process::resolve_executable(executable).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+    }
+    if !missing_executables.is_empty() {
+        let guidance = missing_executable_guidance(&missing_executables);
+        let error = match guidance {
+            Some(guidance) => format!(
+                "当前执行环境找不到命令：{}。{}",
+                missing_executables.join(", "),
+                guidance
+            ),
+            None => format!("当前执行环境找不到命令：{}", missing_executables.join(", ")),
+        };
+        let summary = guidance.unwrap_or("命令依赖不可用");
         return serde_json::json!({
             "tool": "shell_exec",
             "status": "failed",
             "error_code": "shell_exec_command_not_found",
-            "error": format!("当前执行环境找不到命令：{}", missing_executables.join(", ")),
+            "error": error,
             "command": command,
             "cwd": cwd.display().to_string(),
             "access_mode": access_mode.as_str(),
             "missing_executables": missing_executables,
-            "summary": "命令依赖不可用",
+            "suggested_tool": guidance.map(|_| "search_text"),
+            "summary": summary,
         })
         .to_string();
     }
@@ -714,6 +740,17 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
         payload["missing_executable"] = serde_json::Value::String(executable);
     }
     payload.to_string()
+}
+
+fn missing_executable_guidance(missing_executables: &[String]) -> Option<&'static str> {
+    if missing_executables.iter().any(|executable| {
+        executable.eq_ignore_ascii_case("rg") || executable.eq_ignore_ascii_case("grep")
+    }) {
+        return Some(
+            "文本搜索请改用 search_text 或 search_semantic；Magi 不假设用户系统已安装 rg/grep。若用户明确要求该命令，请先用 command -v 确认可用性。",
+        );
+    }
+    None
 }
 
 fn shell_missing_executable(exit_code: Option<i32>, stderr: &str) -> Option<String> {
@@ -3920,6 +3957,13 @@ mod tests {
         );
         assert_eq!(shell_arg("pwsh"), "-Command");
         assert_eq!(shell_arg("/bin/zsh"), "-c");
+    }
+
+    #[test]
+    fn missing_text_search_command_provides_native_tool_guidance() {
+        let guidance = missing_executable_guidance(&["rg".to_string()]);
+
+        assert!(guidance.is_some_and(|value| value.contains("search_text")));
     }
 
     #[test]

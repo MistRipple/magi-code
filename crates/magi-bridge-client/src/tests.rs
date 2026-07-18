@@ -912,6 +912,11 @@ fn image_generation_client_builds_standard_openai_request_and_parses_base64_resu
     let result = HttpImageGenerationClient::parse_response_for_test(
         &serde_json::json!({
             "created": 123,
+            "usage": {
+                "input_tokens": 18,
+                "output_tokens": 32,
+                "total_tokens": 50
+            },
             "data": [{
                 "b64_json": "iVBORw0KGgo=",
                 "revised_prompt": "一个蓝色方块"
@@ -923,6 +928,13 @@ fn image_generation_client_builds_standard_openai_request_and_parses_base64_resu
     assert_eq!(result.bytes, b"\x89PNG\r\n\x1a\n");
     assert_eq!(result.media_type, "image/png");
     assert_eq!(result.revised_prompt.as_deref(), Some("一个蓝色方块"));
+    assert_eq!(
+        result
+            .usage
+            .as_ref()
+            .and_then(|usage| usage["total_tokens"].as_u64()),
+        Some(50)
+    );
 }
 
 #[test]
@@ -1001,6 +1013,7 @@ fn image_generation_client_performs_real_http_request() {
     assert_eq!(generated.media_type, "image/png");
     assert_eq!(generated.bytes, b"\x89PNG\r\n\x1a\n");
     assert_eq!(generated.revised_prompt.as_deref(), Some("a blue square"));
+    assert!(generated.usage.is_none());
 }
 
 #[test]

@@ -35,17 +35,45 @@ struct ToolCatalogQuery {
     workspace_path: Option<String>,
     #[serde(default)]
     access_profile: Option<String>,
+    #[serde(default)]
+    refresh_environment: bool,
 }
 
 async fn get_tool_catalog(
     State(state): State<ApiState>,
     Query(query): Query<ToolCatalogQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let environment = if query.refresh_environment {
+        magi_process::refresh_user_process_environment()
+    } else {
+        magi_process::initialize_user_process_environment()
+    };
     let context = query.tool_context(&state)?;
     let input = query.catalog_input();
-    Ok(Json(
-        state.public_tool_catalog_json(&input.to_string(), &context)?,
-    ))
+    let mut catalog = state.public_tool_catalog_json(&input.to_string(), &context)?;
+    catalog["commandEnvironment"] = command_environment_json(environment);
+    Ok(Json(catalog))
+}
+
+fn command_environment_json(
+    environment: magi_process::ProcessEnvironmentSummary,
+) -> serde_json::Value {
+    let commands = magi_process::common_command_names()
+        .iter()
+        .map(|name| {
+            let path = magi_process::resolve_executable(name);
+            serde_json::json!({
+                "name": name,
+                "available": path.is_some(),
+                "path": path.map(|value| value.display().to_string()),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "source": environment.source,
+        "pathAvailable": environment.path.is_some(),
+        "commands": commands,
+    })
 }
 
 impl ToolCatalogQuery {
@@ -191,6 +219,27 @@ mod tests {
                 .iter()
                 .any(|tool| tool["name"] == "tool_catalog")
         );
+        assert!(body["commandEnvironment"]["commands"].is_array());
+    }
+
+    #[tokio::test]
+    async fn tools_catalog_route_can_refresh_command_environment() {
+        let app = Router::new()
+            .merge(routes())
+            .with_state(test_state_with_tool_registry());
+
+        let (status, body) = get_json(app, "/tools/catalog?refreshEnvironment=true").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body["commandEnvironment"]["pathAvailable"]
+                .as_bool()
+                .is_some()
+        );
+        assert!(matches!(
+            body["commandEnvironment"]["source"].as_str(),
+            Some("login_shell" | "inherited")
+        ));
     }
 
     #[tokio::test]

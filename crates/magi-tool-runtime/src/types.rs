@@ -182,7 +182,13 @@ pub type AgentRoleCatalogProvider =
 pub type RuntimeCapabilityDependencyProvider =
     Arc<dyn Fn() -> Vec<RuntimeCapabilityDependencyEntry> + Send + Sync + 'static>;
 pub type ImageGenerationExecutor = Arc<
-    dyn Fn(ImageGenerationRequest) -> Result<GeneratedImageData, String> + Send + Sync + 'static,
+    dyn Fn(
+            ImageGenerationRequest,
+            ImageGenerationExecutionContext,
+        ) -> Result<GeneratedImageData, String>
+        + Send
+        + Sync
+        + 'static,
 >;
 pub type ImageGenerationReadinessProvider = Arc<dyn Fn() -> bool + Send + Sync + 'static>;
 
@@ -191,6 +197,13 @@ pub struct ImageGenerationRequest {
     pub prompt: String,
     pub size: String,
     pub quality: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImageGenerationExecutionContext {
+    pub session_id: Option<SessionId>,
+    pub workspace_id: Option<WorkspaceId>,
+    pub call_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -336,6 +349,7 @@ pub trait BuiltinTool: Send + Sync {
     fn name(&self) -> &'static str;
     fn execute(
         &self,
+        tool_call_id: &ToolCallId,
         input: &str,
         context: &ToolExecutionContext,
         resources: &ToolRuntimeResources,

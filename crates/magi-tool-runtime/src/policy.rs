@@ -831,7 +831,7 @@ pub(crate) fn shell_command_required_executables(command: &str, shell: &str) -> 
         let basename = shell_command_basename(command);
         if command.contains('$')
             || declared_functions.contains(basename)
-            || shell_word_is_builtin_or_keyword(basename)
+            || shell_word_is_builtin_or_keyword(basename, dialect)
         {
             continue;
         }
@@ -1088,9 +1088,91 @@ fn shell_segment_is_command_probe(words: &[&str]) -> bool {
     )
 }
 
-fn shell_word_is_builtin_or_keyword(word: &str) -> bool {
+fn shell_word_is_builtin_or_keyword(word: &str, dialect: ShellDialect) -> bool {
+    let normalized = word.to_ascii_lowercase();
+    if dialect == ShellDialect::PowerShell
+        && (normalized.contains('-')
+            || matches!(
+                normalized.as_str(),
+                "%" | "?"
+                    | "cat"
+                    | "cd"
+                    | "cp"
+                    | "dir"
+                    | "echo"
+                    | "gc"
+                    | "gci"
+                    | "gi"
+                    | "gl"
+                    | "ls"
+                    | "measure"
+                    | "mi"
+                    | "mount"
+                    | "mv"
+                    | "ni"
+                    | "pwd"
+                    | "ri"
+                    | "rm"
+                    | "rmdir"
+                    | "sc"
+                    | "select"
+                    | "set-location"
+                    | "sleep"
+                    | "sort"
+                    | "tee"
+                    | "type"
+                    | "where"
+                    | "write"
+            ))
+    {
+        return true;
+    }
+    if dialect == ShellDialect::Cmd
+        && matches!(
+            normalized.as_str(),
+            "assoc"
+                | "call"
+                | "cd"
+                | "chcp"
+                | "cls"
+                | "color"
+                | "copy"
+                | "del"
+                | "dir"
+                | "echo"
+                | "erase"
+                | "exit"
+                | "for"
+                | "ftype"
+                | "goto"
+                | "if"
+                | "md"
+                | "mkdir"
+                | "move"
+                | "path"
+                | "pause"
+                | "popd"
+                | "prompt"
+                | "pushd"
+                | "rd"
+                | "ren"
+                | "rename"
+                | "rmdir"
+                | "set"
+                | "setlocal"
+                | "shift"
+                | "start"
+                | "title"
+                | "type"
+                | "ver"
+                | "verify"
+                | "vol"
+        )
+    {
+        return true;
+    }
     matches!(
-        word.to_ascii_lowercase().as_str(),
+        normalized.as_str(),
         ":" | "!"
             | "{"
             | "}"
@@ -1448,6 +1530,28 @@ mod shell_path_parser_tests {
         assert_eq!(
             shell_command_required_executables("{\nrg --version\n}\n", "/bin/zsh"),
             vec!["rg".to_string()]
+        );
+    }
+
+    #[test]
+    fn shell_dependency_scan_understands_windows_cmd_builtins() {
+        assert_eq!(
+            shell_command_required_executables(
+                "dir /B && type package.json && git status",
+                "cmd.exe"
+            ),
+            vec!["git".to_string()]
+        );
+    }
+
+    #[test]
+    fn shell_dependency_scan_understands_powershell_cmdlets() {
+        assert_eq!(
+            shell_command_required_executables(
+                "Get-ChildItem -Force | Where-Object Name -like '*.rs'; Write-Output ok; node --version",
+                "pwsh"
+            ),
+            vec!["node".to_string()]
         );
     }
 

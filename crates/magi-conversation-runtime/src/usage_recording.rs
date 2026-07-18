@@ -60,6 +60,16 @@ pub fn auxiliary_model_usage_binding(phase: UsagePhase) -> ModelUsageBinding {
     }
 }
 
+pub fn image_generation_model_usage_binding() -> ModelUsageBinding {
+    ModelUsageBinding {
+        template_id: "imageGeneration".to_string(),
+        engine_id: "imageGeneration".to_string(),
+        binding_revision: 0,
+        role: UsageSourceRole::ImageGeneration,
+        phase: UsagePhase::Execution,
+    }
+}
+
 /// 调用辅助模型并把这次调用写入统一用量账本。
 pub fn invoke_auxiliary_model_with_usage(
     client: Arc<dyn ModelBridgeClient>,
@@ -169,6 +179,32 @@ pub fn publish_model_usage_record(
     settings_store: Option<&Arc<SettingsStore>>,
     input: ModelUsageRecordInput<'_>,
 ) {
+    publish_model_usage_record_internal(event_bus, session_store, settings_store, input, None);
+}
+
+pub fn publish_model_usage_record_with_config(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    settings_store: Option<&Arc<SettingsStore>>,
+    input: ModelUsageRecordInput<'_>,
+    model_config: LlmConfig,
+) {
+    publish_model_usage_record_internal(
+        event_bus,
+        session_store,
+        settings_store,
+        input,
+        Some(model_config),
+    );
+}
+
+fn publish_model_usage_record_internal(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    settings_store: Option<&Arc<SettingsStore>>,
+    input: ModelUsageRecordInput<'_>,
+    explicit_model_config: Option<LlmConfig>,
+) {
     let ModelUsageRecordInput {
         session_id,
         workspace_id,
@@ -190,7 +226,8 @@ pub fn publish_model_usage_record(
             cache_read_included_in_input: false,
         },
     };
-    let Some(model_config) = usage_model_config_for_binding(settings_store, binding, session_id)
+    let Some(model_config) = explicit_model_config
+        .or_else(|| usage_model_config_for_binding(settings_store, binding, session_id))
     else {
         tracing::warn!(
             template_id = binding.template_id,
@@ -372,6 +409,16 @@ fn usage_model_config_for_binding(
                 Ok(config) => return config.to_usage_llm_config(),
                 Err(error) => {
                     tracing::warn!(error = %error, "auxiliary 模型配置无效，跳过用量身份归因");
+                    return None;
+                }
+            }
+        }
+        UsageSourceRole::ImageGeneration => {
+            let config = store.get_section("imageGeneration");
+            match NormalizedModelConfig::from_settings_value(&config) {
+                Ok(config) => return config.to_usage_llm_config(),
+                Err(error) => {
+                    tracing::warn!(error = %error, "图片模型配置无效，跳过用量身份归因");
                     return None;
                 }
             }
@@ -839,6 +886,69 @@ mod tests {
         assert_eq!(event.payload["usage"]["inputTokens"], json!(0));
         assert_eq!(event.payload["usage"]["outputTokens"], json!(0));
         assert_eq!(event.payload["usage"]["totalTokens"], json!(0));
+    }
+
+    #[test]
+    fn image_generation_usage_records_calls_and_optional_provider_tokens() {
+        let event_bus = InMemoryEventBus::new(8);
+        let session_store = SessionStore::new();
+        let settings_store = Arc::new(SettingsStore::new());
+        let session_id = SessionId::new("session-image-usage");
+        settings_store
+            .set_section(
+                "imageGeneration",
+                json!({
+                    "baseUrl": "https://images.example.test/v1",
+                    "apiKey": "secret-image-key",
+                    "model": "gpt-image-test"
+                }),
+            )
+            .unwrap();
+        let binding = image_generation_model_usage_binding();
+        let workspace_id = Some(WorkspaceId::new("workspace-image-usage"));
+        let provider_usage = json!({
+            "input_tokens": 18,
+            "output_tokens": 32,
+            "total_tokens": 50
+        });
+
+        publish_model_usage_record(
+            &event_bus,
+            &session_store,
+            Some(&settings_store),
+            ModelUsageRecordInput {
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                binding: &binding,
+                call_id: "image-call-1".to_string(),
+                usage: Some(&provider_usage),
+                status: UsageCallStatus::Success,
+                assignment_id: None,
+                error_code: None,
+            },
+        );
+
+        let event = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "model.usage.recorded")
+            .expect("图片模型调用必须进入统一模型用量账本");
+        assert_eq!(
+            event.payload["executionBinding"]["role"],
+            json!("image_generation")
+        );
+        assert_eq!(
+            event.payload["executionBinding"]["templateId"],
+            json!("imageGeneration")
+        );
+        assert_eq!(
+            event.payload["modelConfig"]["model"],
+            json!("gpt-image-test")
+        );
+        assert_eq!(event.payload["usage"]["inputTokens"], json!(18));
+        assert_eq!(event.payload["usage"]["outputTokens"], json!(32));
+        assert_eq!(event.payload["usage"]["totalTokens"], json!(50));
     }
 
     #[test]

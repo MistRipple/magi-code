@@ -332,7 +332,12 @@ impl ToolRegistry {
                         }
                     };
                     let before_changes = capture_tool_workspace_snapshot(&input, &context);
-                    let payload = tool.execute(&input.input, &context, &self.runtime_resources);
+                    let payload = tool.execute(
+                        &input.tool_call_id,
+                        &input.input,
+                        &context,
+                        &self.runtime_resources,
+                    );
                     let payload =
                         append_workspace_changed_paths(payload, before_changes.as_ref(), &context);
                     drop(write_guard);

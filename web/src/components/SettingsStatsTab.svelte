@@ -43,6 +43,7 @@
   }>();
 
   type Perspective = 'role' | 'engine';
+  const LEGACY_IMAGE_MODEL = '__legacy_image_generation__';
   let perspective = $state<Perspective>('engine');
   let selectedKey = $state<string | null>(null);
 
@@ -65,6 +66,12 @@
     return getWorkerDisplayName(worker);
   }
 
+  function modelDisplayLabel(model: string): string {
+    return model === LEGACY_IMAGE_MODEL
+      ? i18n.t('settings.stats.legacyImageModel')
+      : model;
+  }
+
   function formatList(items: string[]): string {
     return new Intl.ListFormat(i18n.locale, { style: 'short', type: 'conjunction' }).format(items);
   }
@@ -76,12 +83,12 @@
     }
     const resolvedModels = Array.isArray(stats?.resolvedModels) ? stats.resolvedModels : [];
     if (resolvedModels.length === 1) {
-      return i18n.t('settings.stats.usedModel', { model: resolvedModels[0] });
+      return i18n.t('settings.stats.usedModel', { model: modelDisplayLabel(resolvedModels[0]) });
     }
     if (resolvedModels.length > 1) {
       return i18n.t('settings.stats.usedModels', {
         count: resolvedModels.length,
-        models: resolvedModels.join(' · '),
+        models: resolvedModels.map(modelDisplayLabel).join(' · '),
       });
     }
     return i18n.t('settings.stats.unknownModel');
@@ -103,6 +110,7 @@
     calls: number;
     successCount: number;
     successRate: number | null;
+    tokenOptional: boolean;
   }
 
   const roleAtoms = $derived<RoleAtom[]>(
@@ -128,6 +136,7 @@
         calls,
         successCount,
         successRate: stats?.successRate ?? null,
+        tokenOptional: worker === 'imageGeneration',
       };
     })
   );
@@ -140,6 +149,7 @@
     const statusKeys: string[] = Array.from(new Set(bindings.map((binding: AgentExecutionStatsItem) => {
       if (binding.role === 'orchestrator') return 'orchestrator';
       if (binding.role === 'auxiliary') return 'auxiliary';
+      if (binding.role === 'image_generation') return 'imageGeneration';
       return binding.engineId || 'orchestrator';
     })));
     const statuses = statusKeys
@@ -191,6 +201,7 @@
     identityKeys: string[];
     connectionCount: number;
     sourceLabels: string[];
+    tokenOptional: boolean;
   }
 
   interface ModelBucket {
@@ -235,22 +246,21 @@
               const sourceOrder = (binding: AgentExecutionStatsItem) => {
                 if (binding.role === 'orchestrator') return 0;
                 if (binding.role === 'auxiliary') return 1;
+                if (binding.role === 'image_generation') return 2;
                 const roleIndex = statsDisplayKeys.indexOf(binding.templateId);
-                return roleIndex >= 0 ? roleIndex + 2 : Number.MAX_SAFE_INTEGER;
+                return roleIndex >= 0 ? roleIndex + 3 : Number.MAX_SAFE_INTEGER;
               };
               return sourceOrder(left) - sourceOrder(right)
                 || left.templateId.localeCompare(right.templateId);
             });
         const sourceLabels: string[] = Array.from(new Set<string>(
-          sourceBindings.map((binding: AgentExecutionStatsItem) => (
-            workerLabel(binding.role === 'worker' ? binding.templateId : binding.role)
-          )),
+          sourceBindings.map((binding: AgentExecutionStatsItem) => workerLabel(bindingRoleKey(binding))),
         ));
         return {
           key,
           rowKind: 'engine',
           resolvedModel: bucket.resolvedModel,
-          label: bucket.resolvedModel,
+          label: modelDisplayLabel(bucket.resolvedModel),
           subLabel: sourceLabels.length > 0
             ? i18n.t('settings.stats.modelUsedBy', { roles: formatList(sourceLabels) })
             : i18n.t('settings.stats.recordedUsage'),
@@ -264,10 +274,15 @@
           identityKeys: bucket.identityKeys,
           connectionCount: bucket.identityKeys.length,
           sourceLabels,
+          tokenOptional: sourceBindings.some(
+            (binding: AgentExecutionStatsItem) => binding.role === 'image_generation',
+          ),
           ...resolveModelRuntimeStatus(bucket.identityKeys),
         };
       })
-      .sort((a: EngineRow, b: EngineRow) => b.totalTokens - a.totalTokens);
+      .sort((a: EngineRow, b: EngineRow) => (
+        b.totalTokens - a.totalTokens || b.calls - a.calls
+      ));
   });
 
   // ============ 视角统一行 shape，下游只看 rows ============
@@ -286,6 +301,7 @@
     statusKey: string;
     errorMsg: string | null;
     isCore: boolean;
+    tokenOptional: boolean;
     // 仅在某个视角下使用：
     roleAtom?: RoleAtom;
     engineRow?: EngineRow;
@@ -308,6 +324,7 @@
           statusKey: er.statusKey,
           errorMsg: er.errorMsg,
           isCore: er.isCore,
+          tokenOptional: er.tokenOptional,
           engineRow: er,
         }))
       : roleAtoms.map((atom: RoleAtom): DisplayRow => ({
@@ -324,7 +341,8 @@
           statusClass: atom.statusClass,
           statusKey: atom.statusKey,
           errorMsg: atom.errorMsg,
-          isCore: atom.worker === 'orchestrator' || atom.worker === 'auxiliary',
+          isCore: atom.worker === 'orchestrator' || atom.worker === 'auxiliary' || atom.worker === 'imageGeneration',
+          tokenOptional: atom.tokenOptional,
           roleAtom: atom,
         }))
   );
@@ -338,7 +356,7 @@
     }
     const exists = list.some((r) => r.key === selectedKey);
     if (!exists) {
-      const sorted = [...list].sort((a, b) => b.totalTokens - a.totalTokens);
+      const sorted = [...list].sort((a, b) => b.totalTokens - a.totalTokens || b.calls - a.calls);
       selectedKey = sorted[0].key;
     }
   });
@@ -363,18 +381,21 @@
     calls: number;
     successCount: number;
     successRate: number | null;
+    tokenOptional: boolean;
   }
 
   function bindingRoleKey(binding: AgentExecutionStatsItem): string {
     if (binding.role === 'orchestrator') return 'orchestrator';
     if (binding.role === 'auxiliary') return 'auxiliary';
+    if (binding.role === 'image_generation') return 'imageGeneration';
     return binding.templateId.trim();
   }
 
   function bindingModelLabel(binding: AgentExecutionStatsItem): string {
-    return binding.resolvedModel?.trim()
+    const model = binding.resolvedModel?.trim()
       || binding.declaredModelSpec?.trim()
       || i18n.t('settings.stats.unknownModel');
+    return modelDisplayLabel(model);
   }
 
   function aggregateUsageBreakdown(
@@ -396,6 +417,7 @@
         calls: 0,
         successCount: 0,
         successRate: null,
+        tokenOptional: false,
       };
       bucket.totalIn += binding.netInputTokens;
       bucket.totalOut += binding.netOutputTokens;
@@ -403,10 +425,12 @@
       bucket.calls += binding.llmCallCount;
       bucket.successCount += binding.successCount;
       bucket.successRate = bucket.calls > 0 ? bucket.successCount / bucket.calls : null;
+      bucket.tokenOptional ||= binding.role === 'image_generation';
       buckets.set(key, bucket);
     }
     return Array.from(buckets.values()).sort((left, right) => (
       right.totalTokens - left.totalTokens
+      || right.calls - left.calls
       || left.label.localeCompare(right.label)
     ));
   }
@@ -415,7 +439,7 @@
   const errorRoles = $derived(roleAtoms.filter((a) => a.isError));
   const topEngine = $derived(
     engineRows.length
-      ? [...engineRows].sort((a, b) => b.totalTokens - a.totalTokens)[0]
+      ? [...engineRows].sort((a, b) => b.totalTokens - a.totalTokens || b.calls - a.calls)[0]
       : null
   );
   const topShare = $derived(
@@ -462,46 +486,38 @@
     selectedRow ? Math.max(selectedRow.totalIn, selectedRow.totalOut, 1) : 1
   );
 
+  const selectedTokenUnavailable = $derived(
+    Boolean(selectedRow && selectedRow.calls > 0 && selectedRow.totalTokens === 0 && selectedRow.tokenOptional)
+  );
+
+  function formatUsageTokens(tokens: number, calls: number, tokenOptional: boolean): string {
+    if (calls > 0 && tokens === 0 && tokenOptional) {
+      return i18n.t('settings.stats.tokenNotReported');
+    }
+    return formatTokens(tokens);
+  }
+
 </script>
 
 <div class="stats-tab-inner scroll-proxy">
   <div class="stats-scroll-panel">
-    <!-- 顶部全局动作行（刷新 / 重置）-->
-    <div class="actions-row">
-      <div class="action-buttons">
-        <button
-          class="ghost-action"
-          class:saving={isRefreshing}
-          onclick={refreshConnections}
-          disabled={isRefreshing}
-          title={isRefreshing ? i18n.t('settings.stats.checking') : i18n.t('settings.stats.check')}
-        >
-          <Icon name="refresh" size={12} />
-          <span>{isRefreshing ? i18n.t('settings.stats.checking') : i18n.t('settings.stats.check')}</span>
-        </button>
-        <button
-          class="ghost-action danger"
-          onclick={showResetConfirmDialog}
-          title={i18n.t('settings.stats.resetWorkspace')}
-        >
-          <Icon name="trash" size={11} />
-          <span>{i18n.t('settings.stats.resetWorkspace')}</span>
-        </button>
-      </div>
-    </div>
-
-    <!-- Insight Strip · 3 个洞察单元 -->
+    <!-- Insight Strip · 3 个洞察单元 + 全局动作 -->
     <div class="insight-strip">
       <div class="insight-cell">
         <span class="insight-kicker">{i18n.t('settings.stats.insightTopEngineKicker')}</span>
-        {#if topEngine && topEngine.totalTokens > 0}
+        {#if topEngine && topEngine.calls > 0}
           <span class="insight-headline">{topEngine.label}</span>
           <span class="insight-meta">
-            {i18n.t('settings.stats.insightTopEngineMeta', {
-              pct: formatPct(topShare),
-              calls: topEngine.calls,
-              success: formatPct(topEngine.successRate),
-            })}
+            {topEngine.totalTokens > 0
+              ? i18n.t('settings.stats.insightTopEngineMeta', {
+                  pct: formatPct(topShare),
+                  calls: topEngine.calls,
+                  success: formatPct(topEngine.successRate),
+                })
+              : i18n.t('settings.stats.insightTopEngineCallsMeta', {
+                  calls: topEngine.calls,
+                  success: formatPct(topEngine.successRate),
+                })}
           </span>
         {:else}
           <span class="insight-headline">{i18n.t('settings.stats.insightNoData')}</span>
@@ -521,6 +537,26 @@
       </div>
 
       <div class="insight-cell" class:warn={showWarnCell}>
+        <div class="insight-actions">
+          <button
+            class="ghost-action"
+            class:saving={isRefreshing}
+            onclick={refreshConnections}
+            disabled={isRefreshing}
+            aria-label={isRefreshing ? i18n.t('settings.stats.checking') : i18n.t('settings.stats.check')}
+            title={isRefreshing ? i18n.t('settings.stats.checking') : i18n.t('settings.stats.check')}
+          >
+            <Icon name="refresh" size={14} />
+          </button>
+          <button
+            class="ghost-action danger"
+            onclick={showResetConfirmDialog}
+            aria-label={i18n.t('settings.stats.resetWorkspace')}
+            title={i18n.t('settings.stats.resetWorkspace')}
+          >
+            <Icon name="trash" size={13} />
+          </button>
+        </div>
         {#if errorRoles.length > 0}
           <span class="insight-kicker">{i18n.t('settings.stats.insightWarnKicker')}</span>
           <span class="insight-headline">{errorRoles[0].label}</span>
@@ -609,7 +645,7 @@
                 class:warn={row.successRate != null && row.successRate >= 0.7 && row.successRate < 0.95}
                 class:danger={row.successRate != null && row.successRate < 0.7}
               >{formatPct(row.successRate)}</div>
-              <div class="row-metric num">{formatTokens(row.totalTokens)}</div>
+              <div class="row-metric num">{formatUsageTokens(row.totalTokens, row.calls, row.tokenOptional)}</div>
             </div>
           {/each}
         </div>
@@ -639,7 +675,7 @@
 
           <div class="slice-kpi">
             <div class="kpi-block">
-              <span class="kpi-value">{formatTokens(selectedRow.totalTokens)}</span>
+              <span class="kpi-value">{formatUsageTokens(selectedRow.totalTokens, selectedRow.calls, selectedRow.tokenOptional)}</span>
               <span class="kpi-label">{i18n.t('settings.stats.kpiToken')}</span>
             </div>
             <div class="kpi-block">
@@ -680,7 +716,7 @@
                     </div>
                     <span class="breakdown-metric num">{breakdown.calls || '--'}</span>
                     <span class="breakdown-metric num">{formatPct(breakdown.successRate)}</span>
-                    <span class="breakdown-metric num">{formatTokens(breakdown.totalTokens)}</span>
+                    <span class="breakdown-metric num">{formatUsageTokens(breakdown.totalTokens, breakdown.calls, breakdown.tokenOptional)}</span>
                   </div>
                 {/each}
               </div>
@@ -694,26 +730,30 @@
               <span>{i18n.t('settings.stats.sectionIO')}</span>
               <span class="small-note">{i18n.t('settings.stats.sectionMonthly')}</span>
             </div>
-            <div class="bar-list">
-              <div class="bar-item">
-                <span class="bar-label">{i18n.t('settings.stats.barInputLabel')}</span>
-                <div class="bar-track">
-                  <div class="bar-fill" style="width: {(selectedRow.totalIn / barMaxIO) * 100}%"></div>
+            {#if selectedTokenUnavailable}
+              <div class="token-usage-note">{i18n.t('settings.stats.imageUsageMetricHint')}</div>
+            {:else}
+              <div class="bar-list">
+                <div class="bar-item">
+                  <span class="bar-label">{i18n.t('settings.stats.barInputLabel')}</span>
+                  <div class="bar-track">
+                    <div class="bar-fill" style="width: {(selectedRow.totalIn / barMaxIO) * 100}%"></div>
+                  </div>
+                  <span class="bar-meta">
+                    <span class="strong">{formatTokens(selectedRow.totalIn)}</span>
+                  </span>
                 </div>
-                <span class="bar-meta">
-                  <span class="strong">{formatTokens(selectedRow.totalIn)}</span>
-                </span>
-              </div>
-              <div class="bar-item muted">
-                <span class="bar-label">{i18n.t('settings.stats.barOutputLabel')}</span>
-                <div class="bar-track">
-                  <div class="bar-fill" style="width: {(selectedRow.totalOut / barMaxIO) * 100}%"></div>
+                <div class="bar-item muted">
+                  <span class="bar-label">{i18n.t('settings.stats.barOutputLabel')}</span>
+                  <div class="bar-track">
+                    <div class="bar-fill" style="width: {(selectedRow.totalOut / barMaxIO) * 100}%"></div>
+                  </div>
+                  <span class="bar-meta">
+                    <span class="strong">{formatTokens(selectedRow.totalOut)}</span>
+                  </span>
                 </div>
-                <span class="bar-meta">
-                  <span class="strong">{formatTokens(selectedRow.totalOut)}</span>
-                </span>
               </div>
-            </div>
+            {/if}
           </div>
 
           {#if selectedRow.errorMsg}
@@ -789,41 +829,31 @@
   }
   .stats-scroll-panel::-webkit-scrollbar { width: 0; }
 
-  /* ---------- Action Row ---------- */
-  .actions-row {
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 8px;
-  }
-  .action-buttons {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-  }
+  /* ---------- Overview Actions ---------- */
   .ghost-action {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
-    padding: 5px 10px;
-    font-size: 11px;
-    font-weight: 500;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    padding: 0;
     color: var(--ind-foreground-secondary);
-    background: var(--ind-bg-card);
-    border: 1px solid var(--ind-border-card);
-    border-radius: 7px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
     cursor: pointer;
     transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
   }
   .ghost-action:hover:not(:disabled) {
     color: var(--ind-foreground);
-    border-color: var(--ind-border-card-strong);
-    background: var(--ind-bg-card-elevated);
+    border-color: var(--ind-border-separator);
+    background: color-mix(in srgb, var(--ind-foreground) 5%, transparent);
   }
   .ghost-action:disabled { opacity: 0.55; cursor: default; }
   .ghost-action.saving :global(svg) { animation: stats-spin 1s linear infinite; }
-  .ghost-action.danger { color: var(--error, #ff3b30); }
+  .ghost-action.danger { color: var(--ind-foreground-muted); }
   .ghost-action.danger:hover {
+    color: var(--error, #ff3b30);
     background: color-mix(in srgb, var(--error, #ff3b30) 8%, transparent);
     border-color: color-mix(in srgb, var(--error, #ff3b30) 30%, var(--ind-border-card));
   }
@@ -832,38 +862,54 @@
   /* ---------- Insight Strip ---------- */
   .insight-strip {
     display: grid;
-    grid-template-columns: 1.2fr 1fr 1fr;
+    grid-template-columns: minmax(220px, 1.35fr) minmax(140px, 0.8fr) minmax(250px, 1.15fr);
     gap: 0;
     background: var(--ind-bg-card);
     border: 1px solid var(--ind-border-card);
-    border-radius: var(--ind-radius-card);
-    box-shadow: var(--ind-shadow-sm);
+    border-radius: 8px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.025);
     overflow: hidden;
   }
   .insight-cell {
-    padding: 12px 18px;
+    padding: 11px 16px 12px;
     border-right: 1px solid var(--ind-border-separator);
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    justify-content: center;
+    gap: 3px;
     min-width: 0;
   }
-  .insight-cell:last-child { border-right: none; }
+  .insight-actions {
+    position: absolute;
+    top: 7px;
+    right: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+  }
   .insight-kicker {
-    font-size: 9.5px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 10px;
     font-weight: 600;
     color: var(--ind-foreground-muted);
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
+    letter-spacing: 0;
   }
   .insight-headline {
-    font-size: 13px;
+    font-size: 14px;
     font-weight: 600;
     color: var(--ind-foreground);
-    letter-spacing: -0.01em;
+    letter-spacing: 0;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .insight-cell:nth-child(2) .insight-headline {
+    font-size: 16px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
   }
   .insight-meta {
     font-size: 10.5px;
@@ -871,6 +917,24 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .insight-cell:nth-child(3) .insight-kicker::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+    flex: 0 0 6px;
+    border-radius: 50%;
+    background: #30a46c;
+    box-shadow: 0 0 0 3px color-mix(in srgb, #30a46c 13%, transparent);
+  }
+  .insight-cell:nth-child(3) {
+    position: relative;
+    padding-right: 78px;
+    border-right: none;
+  }
+  .insight-cell.warn:nth-child(3) .insight-kicker::before {
+    background: var(--error, #ff3b30);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--error, #ff3b30) 13%, transparent);
   }
   .insight-cell.warn .insight-headline { color: var(--error, #ff3b30); }
 
@@ -1172,6 +1236,15 @@
     flex-direction: column;
     gap: 8px;
   }
+  .token-usage-note {
+    padding: 9px 10px;
+    border: 1px solid var(--ind-border-separator);
+    border-radius: 7px;
+    background: color-mix(in srgb, var(--ind-foreground) 2.5%, transparent);
+    color: var(--ind-foreground-muted);
+    font-size: 10.5px;
+    line-height: 1.45;
+  }
   .bar-item {
     display: grid;
     grid-template-columns: 88px minmax(0, 1fr) 96px;
@@ -1307,21 +1380,29 @@
 
   /* ---------- Container-driven Responsive ---------- */
   @container stats-tab (max-width: 760px) {
-    .action-buttons { width: 100%; }
-    .ghost-action {
-      flex: 1;
-      justify-content: center;
-    }
     .insight-strip {
-      grid-template-columns: 1fr;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
-    .insight-cell {
+    .insight-cell:nth-child(2) { border-right: none; }
+    .insight-cell:nth-child(3) {
+      grid-column: 1 / -1;
       border-right: none;
-      border-bottom: 1px solid var(--ind-border-separator);
+      border-top: 1px solid var(--ind-border-separator);
     }
-    .insight-cell:last-child { border-bottom: none; }
     .stats-split {
       grid-template-columns: 1fr;
+    }
+  }
+
+  @container stats-tab (max-width: 520px) {
+    .insight-strip { grid-template-columns: 1fr; }
+    .insight-cell,
+    .insight-cell:nth-child(2),
+    .insight-cell:nth-child(3) {
+      grid-column: auto;
+      border-right: none;
+      border-top: none;
+      border-bottom: none;
     }
   }
 </style>

@@ -180,6 +180,18 @@ export interface CapabilityDependencyItem {
   toolCount?: number | null;
 }
 
+export interface CommandEnvironmentItem {
+  name: string;
+  available: boolean;
+  path: string | null;
+}
+
+export interface CommandEnvironmentSnapshot {
+  source: string;
+  pathAvailable: boolean;
+  commands: CommandEnvironmentItem[];
+}
+
 function notifySettingsSuccess(message: string): void {
   showFeedback("success", message, { source: "settings-panel" });
 }
@@ -642,6 +654,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
   let builtinTools = $state<BuiltinToolItem[]>([]);
   let builtinToolsLoading = $state(false);
   let capabilityDependencies = $state<CapabilityDependencyItem[]>([]);
+  let commandEnvironment = $state<CommandEnvironmentSnapshot | null>(null);
+  let commandEnvironmentLoading = $state(false);
 
   // 仓库管理
   let repositories = $state<Repository[]>([]);
@@ -2717,6 +2731,38 @@ function createSettingsStore(props: { onClose?: () => void }) {
     }
   }
 
+  async function refreshCommandEnvironment(): Promise<void> {
+    if (commandEnvironmentLoading) {
+      return;
+    }
+    commandEnvironmentLoading = true;
+    try {
+      const snapshot = await loadAgentToolCatalogDiagnostics({ refreshEnvironment: true });
+      commandEnvironment = snapshot.commandEnvironment;
+      notifySettingsSuccess(i18n.t("settings.toast.commandEnvironmentRefreshed"));
+    } catch (error) {
+      console.error("[SettingsPanel] 刷新命令环境失败:", error);
+      notifySettingsError(i18n.t("settings.toast.action.refreshCommandEnvironment"), error);
+    } finally {
+      commandEnvironmentLoading = false;
+    }
+  }
+
+  async function hydrateCommandEnvironment(): Promise<void> {
+    if (commandEnvironment || commandEnvironmentLoading) {
+      return;
+    }
+    commandEnvironmentLoading = true;
+    try {
+      const snapshot = await loadAgentToolCatalogDiagnostics();
+      commandEnvironment = snapshot.commandEnvironment;
+    } catch (error) {
+      console.warn("[SettingsPanel] 加载命令环境诊断失败:", error);
+    } finally {
+      commandEnvironmentLoading = false;
+    }
+  }
+
   function applySkillsConfig(config: any): void {
     const skillList: SkillItem[] = [];
     if (Array.isArray(config?.customTools)) {
@@ -2946,6 +2992,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       }
       if (v === "tools") {
         ensureToolsBootstrapHydrated();
+        void hydrateCommandEnvironment();
       }
     },
     get roleTemplates() {
@@ -3096,6 +3143,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     get capabilityDependencies() {
       return capabilityDependencies;
     },
+    get commandEnvironment() {
+      return commandEnvironment;
+    },
+    get commandEnvironmentLoading() {
+      return commandEnvironmentLoading;
+    },
     get repositories() {
       return repositories;
     },
@@ -3223,6 +3276,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     toggleMCPExpand,
     refreshMCPTools,
     refreshBuiltinToolCatalog,
+    refreshCommandEnvironment,
     getMCPHealthLabel,
     openRepoDialog,
     closeRepoDialog,
