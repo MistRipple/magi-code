@@ -103,6 +103,9 @@ fn normalize_instruction_skill_entries(entries: &mut Vec<Value>) {
         {
             object.insert("name".to_string(), Value::String(skill_id));
         }
+        if object.get("enabled").and_then(Value::as_bool).is_none() {
+            object.insert("enabled".to_string(), Value::Bool(true));
+        }
         true
     });
 }
@@ -267,6 +270,9 @@ fn build_skill_registry_from_config(config: &Map<String, Value>) -> SkillRegistr
         .and_then(|value| value.as_array())
     {
         for skill_val in skills {
+            if skill_val.get("enabled").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
             if let Some(skill_id) = skill_val.get("skillId").and_then(|v| v.as_str())
                 && let Some(skill_dir) = instruction_skill_directory_path(skill_val)
             {
@@ -501,6 +507,10 @@ mod tests {
     fn load_skills_into_registry_skips_unavailable_instruction_skills() {
         let valid_dir =
             make_local_skill_dir("valid-skill", "# 可用 Skill\n\n请输出 available-skill。\n");
+        let disabled_dir = make_local_skill_dir(
+            "disabled-skill",
+            "# 禁用 Skill\n\n请输出 disabled-skill。\n",
+        );
         let empty_dir = unique_test_dir("empty-skill");
         std::fs::create_dir_all(&empty_dir).expect("empty skill dir should be created");
         std::fs::write(empty_dir.join("SKILL.md"), "   \n")
@@ -517,6 +527,12 @@ mod tests {
                             "skillId": "valid-skill",
                             "name": "valid-skill",
                             "directoryPath": valid_dir.to_string_lossy().to_string()
+                        },
+                        {
+                            "skillId": "disabled-skill",
+                            "name": "disabled-skill",
+                            "directoryPath": disabled_dir.to_string_lossy().to_string(),
+                            "enabled": false
                         },
                         {
                             "skillId": "empty-skill",
@@ -537,6 +553,7 @@ mod tests {
         let plan = registry.build_tool_runtime_plan(&SkillSelection {
             skill_ids: vec![
                 "valid-skill".to_string(),
+                "disabled-skill".to_string(),
                 "empty-skill".to_string(),
                 "missing-skill".to_string(),
             ],
@@ -545,8 +562,10 @@ mod tests {
 
         assert_eq!(plan.prompt_injections.len(), 1);
         assert!(plan.prompt_injections[0].body.contains("available-skill"));
+        assert!(!plan.prompt_injections[0].body.contains("disabled-skill"));
 
         std::fs::remove_dir_all(&valid_dir).expect("valid temp skill dir should be removed");
+        std::fs::remove_dir_all(&disabled_dir).expect("disabled temp skill dir should be removed");
         std::fs::remove_dir_all(&empty_dir).expect("empty temp skill dir should be removed");
     }
 

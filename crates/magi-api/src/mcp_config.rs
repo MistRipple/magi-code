@@ -3,7 +3,6 @@ use magi_bridge_client::{HttpMcpServerConfig, McpServerConfig, McpServerConnecti
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
-pub(crate) const REDACTED_MCP_ENV_VALUE: &str = "********";
 const MCP_TRANSPORT_STDIO: &str = "stdio";
 const MCP_TRANSPORT_STREAMABLE_HTTP: &str = "streamable-http";
 
@@ -106,20 +105,6 @@ pub(crate) fn normalize_mcp_server_request_entry(request: &Value) -> Result<Valu
         }
     }
     Ok(normalized)
-}
-
-pub(crate) fn redact_mcp_server_public_entry(entry: Value) -> Value {
-    let mut entry = entry;
-    for field in ["env", "headers"] {
-        redact_string_map_values(&mut entry, field);
-    }
-    entry
-}
-
-pub(crate) fn preserve_redacted_mcp_secret_values(entry: &mut Value, existing: Option<&Value>) {
-    for field in ["env", "headers"] {
-        preserve_redacted_string_map_values(entry, existing, field);
-    }
 }
 
 pub fn mcp_server_entry_enabled(entry: &Value) -> bool {
@@ -279,35 +264,6 @@ fn string_map_from_object(value: Option<&Value>) -> BTreeMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn redact_string_map_values(entry: &mut Value, field: &str) {
-    if let Some(values) = entry.get_mut(field).and_then(Value::as_object_mut) {
-        for value in values.values_mut() {
-            if value.as_str().is_some() {
-                *value = serde_json::json!(REDACTED_MCP_ENV_VALUE);
-            }
-        }
-    }
-}
-
-fn preserve_redacted_string_map_values(entry: &mut Value, existing: Option<&Value>, field: &str) {
-    let Some(existing_values) = existing
-        .and_then(|value| value.get(field))
-        .and_then(Value::as_object)
-    else {
-        return;
-    };
-    let Some(next_values) = entry.get_mut(field).and_then(Value::as_object_mut) else {
-        return;
-    };
-    for (key, value) in next_values.iter_mut() {
-        if value.as_str() == Some(REDACTED_MCP_ENV_VALUE)
-            && let Some(existing_value) = existing_values.get(key).and_then(Value::as_str)
-        {
-            *value = serde_json::json!(existing_value);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -501,67 +457,5 @@ mod tests {
         );
         assert!(!config.headers.contains_key("IGNORED"));
         assert_eq!(config.request_timeout, Duration::from_millis(45_000));
-    }
-
-    #[test]
-    fn public_entry_redacts_env_values_but_keeps_keys() {
-        let public = redact_mcp_server_public_entry(serde_json::json!({
-            "id": "server",
-            "env": {
-                "TOKEN": "secret",
-                "COUNT": 1
-            }
-        }));
-
-        assert_eq!(
-            public["env"]["TOKEN"],
-            serde_json::json!(REDACTED_MCP_ENV_VALUE)
-        );
-        assert_eq!(public["env"]["COUNT"], serde_json::json!(1));
-    }
-
-    #[test]
-    fn public_entry_redacts_http_header_values_but_keeps_keys() {
-        let public = redact_mcp_server_public_entry(serde_json::json!({
-            "id": "server",
-            "type": "streamable-http",
-            "url": "https://example.test/mcp",
-            "headers": {
-                "Authorization": "Bearer secret",
-                "X-API-Key": "secret-key"
-            }
-        }));
-
-        assert_eq!(
-            public["headers"]["Authorization"],
-            serde_json::json!(REDACTED_MCP_ENV_VALUE)
-        );
-        assert_eq!(
-            public["headers"]["X-API-Key"],
-            serde_json::json!(REDACTED_MCP_ENV_VALUE)
-        );
-    }
-
-    #[test]
-    fn redacted_env_values_preserve_existing_secret_on_update() {
-        let existing = serde_json::json!({
-            "id": "server",
-            "env": {
-                "TOKEN": "secret",
-                "OTHER": "old"
-            }
-        });
-        let mut next = serde_json::json!({
-            "id": "server",
-            "env": {
-                "TOKEN": REDACTED_MCP_ENV_VALUE,
-                "OTHER": "new"
-            }
-        });
-
-        preserve_redacted_mcp_secret_values(&mut next, Some(&existing));
-
-        assert_eq!(next["env"]["TOKEN"], serde_json::json!("secret"));
-        assert_eq!(next["env"]["OTHER"], serde_json::json!("new"));
     }
 }

@@ -1870,6 +1870,14 @@ export async function saveAgentSkillsConfig(config: Record<string, unknown>): Pr
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/config/save', config, 'save skills config');
 }
 
+export async function toggleAgentSkill(skillId: string, enabled: boolean): Promise<Record<string, unknown>> {
+  return await postWorkspaceBoundJson<Record<string, unknown>>(
+    '/api/settings/skills/toggle',
+    { skillId, enabled },
+    'toggle skill',
+  );
+}
+
 export async function saveAgentSafeguardConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/safeguard/save', config, 'save safeguard config');
 }
@@ -1890,6 +1898,14 @@ export async function updateAgentSkill(skillId: string): Promise<Record<string, 
 
 export async function updateAllAgentSkills(): Promise<Record<string, unknown>> {
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/update-all', {}, 'update all skills');
+}
+
+export async function checkAgentSkillUpdates(): Promise<Record<string, unknown>> {
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/check-updates', {}, 'check skill updates');
+}
+
+export async function rollbackAgentSkill(skillId: string): Promise<Record<string, unknown>> {
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/skills/rollback', { skillId }, 'rollback skill');
 }
 
 export interface AgentPendingChangesPayload {

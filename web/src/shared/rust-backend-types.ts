@@ -1108,6 +1108,7 @@ export interface RepositoryRefreshResponseDto {
 export interface SkillsLibraryResponseDto {
   skills: unknown;
   failedRepositoryCount?: number;
+  updateAvailableCount?: number;
 }
 
 export interface SkillInstallResponseDto {
@@ -1119,7 +1120,13 @@ export interface SkillsConfigSaveResponseDto {
 }
 
 export interface SkillUpdateResponseDto {
-  updated: boolean;
+  updated?: boolean;
+  checked?: boolean;
+  rolledBack?: boolean;
+  enabled?: boolean;
+  skillId?: string;
+  skills?: unknown;
+  updateAvailableCount?: number;
 }
 
 export interface AddedResponseDto {

@@ -4,8 +4,10 @@ use axum::{
     routing::{get, post},
 };
 use magi_bridge_client::{McpServerClient, McpToolInfo};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -14,8 +16,7 @@ use crate::{
     mcp_config::{
         build_mcp_config_from_entry, mcp_server_entry_enabled, mcp_server_entry_id,
         normalize_mcp_server_request_entry as normalize_mcp_server_entry,
-        normalize_mcp_server_snapshot_entry, preserve_redacted_mcp_secret_values,
-        redact_mcp_server_public_entry,
+        normalize_mcp_server_snapshot_entry,
     },
     scope_binding::strip_scope_binding_fields_from_map,
     skill_loader,
@@ -28,6 +29,7 @@ const MCP_DISCONNECTED_HEALTH: &str = "disconnected";
 const SKILL_REPOSITORY_PUBLIC_ERROR: &str = "Skill 仓库暂不可读取";
 const SKILL_CACHE_PUBLIC_ERROR: &str = "Skill 缓存不可保存，请检查本地权限";
 const SKILL_REPOSITORY_URL_PUBLIC_ERROR: &str = "仅支持标准 GitHub HTTPS 仓库地址";
+const SKILL_UPDATE_CHECK_TTL_MS: u64 = 6 * 60 * 60 * 1000;
 static SKILL_REPOSITORY_SYNC_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 async fn list_mcp_tools(client: Arc<McpServerClient>) -> Result<Vec<McpToolInfo>, String> {
@@ -64,10 +66,13 @@ pub fn routes() -> Router<ApiState> {
             post(scan_local_skill_directory),
         )
         .route("/settings/skills/config/save", post(save_skills_config))
+        .route("/settings/skills/toggle", post(toggle_skill))
         .route("/settings/skills/custom-tool/add", post(add_custom_tool))
         .route("/settings/skills/remove", post(remove_installed_skill))
+        .route("/settings/skills/check-updates", post(check_skill_updates))
         .route("/settings/skills/update", post(update_skill))
         .route("/settings/skills/update-all", post(update_all_skills))
+        .route("/settings/skills/rollback", post(rollback_skill))
 }
 
 fn load_skills_config_object(state: &ApiState) -> serde_json::Map<String, serde_json::Value> {
@@ -155,7 +160,7 @@ fn build_local_instruction_skill_entry(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::InvalidInput("本地 Skill 名称不可用".to_string()))?;
-    let metadata = read_local_skill_metadata(dir);
+    let metadata = read_skill_directory_metadata(dir)?;
     let description = read_local_skill_description(dir);
     Ok(serde_json::json!({
         "name": skill_name,
@@ -168,6 +173,9 @@ fn build_local_instruction_skill_entry(
         "fileCount": metadata.file_count,
         "lastRefreshed": epoch_ms_now(),
         "lastModified": metadata.last_modified_epoch_ms,
+        "loadedContentHash": metadata.content_hash,
+        "installedAt": epoch_ms_now(),
+        "updatedAt": epoch_ms_now(),
     }))
 }
 
@@ -326,9 +334,11 @@ fn epoch_ms_now() -> u64 {
         .as_millis() as u64
 }
 
-struct LocalSkillMetadata {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SkillDirectoryMetadata {
     file_count: usize,
     last_modified_epoch_ms: Option<u64>,
+    content_hash: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -362,6 +372,10 @@ struct RepositorySkill {
     skill_id: String,
     name: String,
     description: String,
+    author: Option<String>,
+    version: Option<String>,
+    category: Option<String>,
+    content_hash: String,
     relative_path: PathBuf,
 }
 
@@ -490,11 +504,16 @@ fn collect_repository_skills(
             .and_then(|value| value.to_str())
             .unwrap_or(&repository.name)
             .to_string();
+        let metadata = read_skill_directory_metadata(current_dir)?;
         skills.push(RepositorySkill {
             skill_id: repository.skill_id(&relative_path)?,
             name: read_skill_frontmatter_value(current_dir, "name").unwrap_or(fallback_name),
             description: read_skill_frontmatter_value(current_dir, "description")
                 .unwrap_or_else(|| read_local_skill_description(current_dir)),
+            author: read_skill_frontmatter_value(current_dir, "author"),
+            version: read_skill_frontmatter_value(current_dir, "version"),
+            category: read_skill_frontmatter_value(current_dir, "category"),
+            content_hash: metadata.content_hash,
             relative_path,
         });
         return Ok(());
@@ -554,8 +573,98 @@ fn copy_repository_skill_directory(source: &Path, target: &Path) -> Result<(), A
         std::fs::remove_dir_all(&staging)
             .map_err(|error| skill_cache_error("清理 Skill 临时目录失败", &staging, error))?;
     }
-    copy_directory_tree(source, &staging)?;
+    if let Err(error) = copy_directory_tree(source, &staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
     replace_directory_atomically(&staging, target, "替换 Skill 缓存失败")
+}
+
+fn update_repository_skill_directory(
+    source: &Path,
+    target: &Path,
+    backup: &Path,
+) -> Result<(), ApiError> {
+    if !source.is_dir() || !source.join("SKILL.md").is_file() {
+        return Err(ApiError::InvalidInput(
+            "该 Skill 已不在仓库中，请刷新 Skill 库".to_string(),
+        ));
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| ApiError::InvalidInput(SKILL_CACHE_PUBLIC_ERROR.to_string()))?;
+    let staging = parent.join(format!(
+        ".{}.updating-{}-{}",
+        target
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("skill"),
+        std::process::id(),
+        epoch_ms_now()
+    ));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .map_err(|error| skill_cache_error("清理 Skill 更新临时目录失败", &staging, error))?;
+    }
+    if let Err(error) = copy_directory_tree(source, &staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+
+    if let Some(backup_parent) = backup.parent() {
+        std::fs::create_dir_all(backup_parent)
+            .map_err(|error| skill_cache_error("创建 Skill 备份目录失败", backup_parent, error))?;
+    }
+    if backup.exists() {
+        std::fs::remove_dir_all(backup)
+            .map_err(|error| skill_cache_error("清理旧 Skill 备份失败", backup, error))?;
+    }
+    if target.exists() {
+        std::fs::rename(target, backup)
+            .map_err(|error| skill_cache_error("备份当前 Skill 失败", target, error))?;
+    }
+    if let Err(error) = std::fs::rename(&staging, target) {
+        if backup.exists() {
+            let _ = std::fs::rename(backup, target);
+        }
+        return Err(skill_cache_error("替换 Skill 缓存失败", target, error));
+    }
+    Ok(())
+}
+
+fn rollback_repository_skill_directory(target: &Path, backup: &Path) -> Result<(), ApiError> {
+    if !backup.is_dir() {
+        return Err(ApiError::InvalidInput(
+            "该 Skill 没有可回滚版本".to_string(),
+        ));
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| ApiError::InvalidInput(SKILL_CACHE_PUBLIC_ERROR.to_string()))?;
+    let current = parent.join(format!(
+        ".{}.rollback-{}-{}",
+        target
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("skill"),
+        std::process::id(),
+        epoch_ms_now()
+    ));
+    if target.exists() {
+        std::fs::rename(target, &current)
+            .map_err(|error| skill_cache_error("准备 Skill 回滚失败", target, error))?;
+    }
+    if let Err(error) = std::fs::rename(backup, target) {
+        if current.exists() {
+            let _ = std::fs::rename(&current, target);
+        }
+        return Err(skill_cache_error("恢复 Skill 备份失败", target, error));
+    }
+    if current.exists() {
+        std::fs::rename(&current, backup)
+            .map_err(|error| skill_cache_error("保留 Skill 回滚版本失败", backup, error))?;
+    }
+    Ok(())
 }
 
 fn copy_directory_tree(source: &Path, target: &Path) -> Result<(), ApiError> {
@@ -620,37 +729,96 @@ fn replace_directory_atomically(
     Ok(())
 }
 
-fn read_local_skill_metadata(dir: &std::path::Path) -> LocalSkillMetadata {
-    let mut file_count = 0usize;
+fn read_skill_directory_metadata(dir: &Path) -> Result<SkillDirectoryMetadata, ApiError> {
+    if !dir.is_dir() {
+        return Err(ApiError::InvalidInput(
+            "技能源不可用，请重新导入该 Skill".to_string(),
+        ));
+    }
+
+    let mut files = Vec::new();
+    collect_skill_directory_files(dir, dir, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut hasher = Sha256::new();
     let mut latest_modified: Option<std::time::SystemTime> = None;
+    for (relative_path, absolute_path, modified) in &files {
+        let relative = relative_path_to_slash_string(relative_path)?;
+        hasher.update((relative.len() as u64).to_le_bytes());
+        hasher.update(relative.as_bytes());
 
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if meta.is_file() {
-                file_count += 1;
+        let mut file = std::fs::File::open(absolute_path)
+            .map_err(|error| skill_cache_error("读取 Skill 文件失败", absolute_path, error))?;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|error| skill_cache_error("读取 Skill 文件失败", absolute_path, error))?;
+            if read == 0 {
+                break;
             }
-            if let Ok(modified) = meta.modified() {
-                latest_modified = Some(
-                    latest_modified
-                        .map_or(modified, |prev: std::time::SystemTime| prev.max(modified)),
-                );
-            }
+            hasher.update(&buffer[..read]);
         }
+        latest_modified =
+            Some(latest_modified.map_or(*modified, |previous| previous.max(*modified)));
     }
 
-    let last_modified_epoch_ms = latest_modified.and_then(|t| {
-        t.duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_millis() as u64)
-    });
+    Ok(SkillDirectoryMetadata {
+        file_count: files.len(),
+        last_modified_epoch_ms: latest_modified.and_then(|time| {
+            time.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_millis() as u64)
+        }),
+        content_hash: format!("{:x}", hasher.finalize()),
+    })
+}
 
-    LocalSkillMetadata {
-        file_count,
-        last_modified_epoch_ms,
+fn collect_skill_directory_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<(PathBuf, PathBuf, std::time::SystemTime)>,
+) -> Result<(), ApiError> {
+    let mut entries = std::fs::read_dir(current)
+        .map_err(|error| skill_cache_error("读取 Skill 目录失败", current, error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| skill_cache_error("读取 Skill 目录失败", current, error))?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| skill_cache_error("读取 Skill 文件类型失败", &path, error))?;
+        if file_type.is_symlink() {
+            return Err(ApiError::InvalidInput(
+                "Skill 包含不支持的符号链接".to_string(),
+            ));
+        }
+        if file_type.is_dir() {
+            collect_skill_directory_files(root, &path, files)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|error| skill_cache_error("读取 Skill 文件元数据失败", &path, error))?;
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| ApiError::InvalidInput("Skill 目录结构无效".to_string()))?
+            .to_path_buf();
+        files.push((
+            relative,
+            path,
+            metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+        ));
     }
+    Ok(())
 }
 
 fn normalize_repository_entry(
@@ -729,7 +897,6 @@ fn upsert_named_object_array_entry(
 fn canonical_mcp_servers(state: &ApiState) -> Vec<serde_json::Value> {
     stored_mcp_servers(state)
         .into_iter()
-        .map(redact_mcp_server_public_entry)
         .map(|mut entry| {
             let enabled = mcp_server_entry_enabled(&entry);
             let server_id = mcp_server_entry_id(&entry).map(str::to_string);
@@ -796,14 +963,12 @@ async fn update_mcp_server(
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let requested_server_id = mcp_server_entry_id(&request).map(str::to_string);
-    let mut normalized = normalize_mcp_server_entry(&request)?;
+    let normalized = normalize_mcp_server_entry(&request)?;
     let server_id = requested_server_id
         .or_else(|| mcp_server_entry_id(&normalized).map(str::to_string))
         .unwrap_or_default()
         .trim()
         .to_string();
-    let existing = stored_mcp_server_entry(&state, &server_id);
-    preserve_redacted_mcp_secret_values(&mut normalized, existing.as_ref());
     state
         .settings_store
         .upsert_array_entry("mcpServers", "id", &normalized)
@@ -1057,6 +1222,14 @@ fn installed_skill_cache_root(state: &ApiState) -> Result<PathBuf, ApiError> {
         .ok_or_else(|| ApiError::InvalidInput(SKILL_CACHE_PUBLIC_ERROR.to_string()))
 }
 
+fn installed_skill_backup_root(state: &ApiState) -> Result<PathBuf, ApiError> {
+    state
+        .runtime_persistence()
+        .and_then(|persistence| persistence.state_root())
+        .map(|root| root.join("skills_backups"))
+        .ok_or_else(|| ApiError::InvalidInput(SKILL_CACHE_PUBLIC_ERROR.to_string()))
+}
+
 fn installed_skill_cache_key(skill_id: &str) -> Result<String, ApiError> {
     if skill_id.trim().is_empty() {
         return Err(ApiError::InvalidInput("skillId 无效".to_string()));
@@ -1130,12 +1303,32 @@ async fn ensure_cached_github_repository(
     Ok((repository, target))
 }
 
+async fn cached_repository_commit(repository_root: &Path) -> Option<String> {
+    let output = magi_process::tokio_command("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(["rev-parse", "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!commit.is_empty()).then_some(commit)
+}
+
 fn repository_skill_public_entry(
     skill: RepositorySkill,
     repository_id: &str,
     repository_url: &str,
     installed: bool,
+    available_commit: Option<&str>,
+    last_checked_at: Option<u64>,
 ) -> serde_json::Value {
+    let available_version = skill.version.clone();
+    let available_content_hash = skill.content_hash.clone();
     serde_json::json!({
         "name": skill.name,
         "skillId": skill.skill_id,
@@ -1146,6 +1339,92 @@ fn repository_skill_public_entry(
         "repositoryName": repository_url,
         "repositoryPath": relative_path_to_slash_string(&skill.relative_path).unwrap_or_default(),
         "installed": installed,
+        "author": skill.author,
+        "version": skill.version,
+        "category": skill.category,
+        "availableVersion": available_version,
+        "availableContentHash": available_content_hash,
+        "availableCommit": available_commit,
+        "lastCheckedAt": last_checked_at,
+        "sourceStatus": "available",
+        "updateStatus": if installed { "up_to_date" } else { "not_installed" },
+        "updateAvailable": false,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct CachedRepositorySnapshot {
+    root: PathBuf,
+    skills: Vec<RepositorySkill>,
+    commit: Option<String>,
+    checked_at: u64,
+}
+
+fn repository_update_check_is_stale(entry: &serde_json::Value, now: u64) -> bool {
+    entry
+        .get("lastCheckedAt")
+        .and_then(serde_json::Value::as_u64)
+        .is_none_or(|last_checked| now.saturating_sub(last_checked) >= SKILL_UPDATE_CHECK_TTL_MS)
+}
+
+async fn load_repository_snapshot(
+    state: &ApiState,
+    entry: &serde_json::Value,
+    force_refresh: bool,
+) -> Result<CachedRepositorySnapshot, ApiError> {
+    let repository_url = entry
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("仓库 URL 不能为空".to_string()))?;
+    let repository_id = entry
+        .get("repositoryId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(repository_url);
+    let now = epoch_ms_now();
+    let previous_checked_at = entry
+        .get("lastCheckedAt")
+        .and_then(serde_json::Value::as_u64);
+    let checked_at = if force_refresh || previous_checked_at.is_none() {
+        now
+    } else {
+        previous_checked_at.unwrap_or(now)
+    };
+    let (repository, root) =
+        ensure_cached_github_repository(state, repository_url, force_refresh).await?;
+    let skills = scan_cached_repository_skills(&root, &repository)?;
+    let commit = cached_repository_commit(&root).await;
+
+    let mut updated = entry.as_object().cloned().unwrap_or_default();
+    updated.insert("repositoryId".to_string(), serde_json::json!(repository_id));
+    updated.insert(
+        "url".to_string(),
+        serde_json::json!(repository.canonical_url.clone()),
+    );
+    updated.insert("skillCount".to_string(), serde_json::json!(skills.len()));
+    updated.insert("lastCheckedAt".to_string(), serde_json::json!(checked_at));
+    if force_refresh || previous_checked_at.is_none() {
+        updated.insert("lastRefreshed".to_string(), serde_json::json!(checked_at));
+    }
+    updated.insert("syncStatus".to_string(), serde_json::json!("ready"));
+    if let Some(commit) = &commit {
+        updated.insert("commit".to_string(), serde_json::json!(commit));
+    }
+    state
+        .settings_store
+        .upsert_array_entry(
+            "repositories",
+            "repositoryId",
+            &serde_json::Value::Object(updated),
+        )
+        .map_err(settings_persistence_error)?;
+
+    Ok(CachedRepositorySnapshot {
+        root,
+        skills,
+        commit,
+        checked_at,
     })
 }
 
@@ -1332,52 +1611,172 @@ async fn refresh_repository(
         return Err(ApiError::not_found("仓库不存在", repo_id));
     };
 
-    let repository_url = repos[pos]
-        .get("url")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| ApiError::InvalidInput("仓库 URL 不能为空".to_string()))?;
-    let (repository, repository_root) =
-        ensure_cached_github_repository(&state, repository_url, true).await?;
-    let skill_count = scan_cached_repository_skills(&repository_root, &repository)?.len();
-
-    let mut updated_repos = repos;
-    let mut entry = updated_repos[pos].as_object().cloned().unwrap_or_default();
-    entry.insert(
-        "lastRefreshed".to_string(),
-        serde_json::json!(epoch_ms_now()),
-    );
-    entry.insert("skillCount".to_string(), serde_json::json!(skill_count));
-    updated_repos[pos] = serde_json::Value::Object(entry);
-    state
-        .settings_store
-        .set_section("repositories", serde_json::Value::Array(updated_repos))
-        .map_err(settings_persistence_error)?;
+    let snapshot = load_repository_snapshot(&state, &repos[pos], true).await?;
 
     Ok(Json(serde_json::json!({
         "refreshed": true,
-        "skillCount": skill_count,
+        "skillCount": snapshot.skills.len(),
+        "commit": snapshot.commit,
+        "lastCheckedAt": snapshot.checked_at,
     })))
 }
 
 // ─── Skills ─────────────────────────────────────────────────────────────────
 
-async fn list_skills(State(state): State<ApiState>) -> Json<serde_json::Value> {
-    let installed_skills = load_instruction_skills(&state);
+#[derive(Clone, Debug)]
+struct AvailableRepositorySkill {
+    skill: RepositorySkill,
+    repository_root: PathBuf,
+    repository_id: String,
+    repository_url: String,
+    commit: Option<String>,
+    checked_at: u64,
+}
+
+fn installed_skill_public_entry(
+    state: &ApiState,
+    skill: serde_json::Value,
+    available: Option<&AvailableRepositorySkill>,
+) -> serde_json::Value {
+    let mut entry = skill.as_object().cloned().unwrap_or_default();
+    entry.remove("directoryPath");
+    entry.remove("directoryPathRef");
+    entry.insert("installed".to_string(), serde_json::json!(true));
+    let enabled = entry.get("enabled").and_then(serde_json::Value::as_bool) != Some(false);
+    entry.insert("enabled".to_string(), serde_json::json!(enabled));
+
+    let source = entry
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("local")
+        .to_string();
+    let directory = skill_loader::instruction_skill_directory_path(&skill);
+    let metadata = directory
+        .as_deref()
+        .filter(|path| path.is_dir())
+        .and_then(|path| read_skill_directory_metadata(path).ok());
+    let current_hash = metadata
+        .as_ref()
+        .map(|metadata| metadata.content_hash.clone());
+    let loaded_hash = entry
+        .get("loadedContentHash")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            entry
+                .get("installedContentHash")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(ToOwned::to_owned);
+
+    if let Some(metadata) = &metadata {
+        entry.insert(
+            "fileCount".to_string(),
+            serde_json::json!(metadata.file_count),
+        );
+        entry.insert(
+            "lastModified".to_string(),
+            serde_json::json!(metadata.last_modified_epoch_ms),
+        );
+        entry.insert(
+            "currentContentHash".to_string(),
+            serde_json::json!(metadata.content_hash),
+        );
+        entry.insert("sourceStatus".to_string(), serde_json::json!("available"));
+    } else {
+        entry.insert("sourceStatus".to_string(), serde_json::json!("missing"));
+        entry.insert(
+            "updateStatus".to_string(),
+            serde_json::json!("source_missing"),
+        );
+        entry.insert("updateAvailable".to_string(), serde_json::json!(false));
+        return serde_json::Value::Object(entry);
+    }
+
+    if source == "repository" {
+        let skill_id = instruction_skill_id(&skill).unwrap_or_default();
+        let backup_available = installed_skill_backup_root(state)
+            .ok()
+            .and_then(|root| {
+                installed_skill_cache_key(&skill_id)
+                    .ok()
+                    .map(|key| root.join(key))
+            })
+            .is_some_and(|path| path.is_dir());
+        entry.insert(
+            "rollbackAvailable".to_string(),
+            serde_json::json!(backup_available),
+        );
+
+        let installed_hash = entry
+            .get("installedContentHash")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| loaded_hash.clone());
+        if current_hash != installed_hash {
+            entry.insert(
+                "updateStatus".to_string(),
+                serde_json::json!("local_modified"),
+            );
+            entry.insert("updateAvailable".to_string(), serde_json::json!(false));
+        } else if let Some(available) = available {
+            let update_available =
+                installed_hash.as_deref() != Some(available.skill.content_hash.as_str());
+            entry.insert(
+                "availableContentHash".to_string(),
+                serde_json::json!(available.skill.content_hash.clone()),
+            );
+            entry.insert(
+                "availableVersion".to_string(),
+                serde_json::json!(available.skill.version.clone()),
+            );
+            entry.insert(
+                "availableCommit".to_string(),
+                serde_json::json!(available.commit.clone()),
+            );
+            entry.insert(
+                "lastCheckedAt".to_string(),
+                serde_json::json!(available.checked_at),
+            );
+            entry.insert(
+                "updateStatus".to_string(),
+                serde_json::json!(if update_available {
+                    "update_available"
+                } else {
+                    "up_to_date"
+                }),
+            );
+            entry.insert(
+                "updateAvailable".to_string(),
+                serde_json::json!(update_available),
+            );
+        } else {
+            entry.insert("sourceStatus".to_string(), serde_json::json!("removed"));
+            entry.insert(
+                "updateStatus".to_string(),
+                serde_json::json!("source_removed"),
+            );
+            entry.insert("updateAvailable".to_string(), serde_json::json!(false));
+        }
+    } else {
+        let changed = current_hash != loaded_hash;
+        entry.insert(
+            "updateStatus".to_string(),
+            serde_json::json!(if changed {
+                "local_changed"
+            } else {
+                "up_to_date"
+            }),
+        );
+        entry.insert("updateAvailable".to_string(), serde_json::json!(changed));
+    }
+    serde_json::Value::Object(entry)
+}
+
+async fn build_skill_library(state: &ApiState, refresh_stale: bool) -> serde_json::Value {
+    let installed_skills = load_instruction_skills(state);
     let installed_skill_ids: std::collections::HashSet<String> = installed_skills
         .iter()
-        .filter(|skill| skill_loader::instruction_skill_source_available(skill))
         .filter_map(instruction_skill_id)
-        .collect();
-    let mut all_skills: Vec<serde_json::Value> = installed_skills
-        .into_iter()
-        .filter(skill_loader::instruction_skill_source_available)
-        .map(|skill| {
-            let mut entry = skill.as_object().cloned().unwrap_or_default();
-            entry.remove("directoryPath");
-            entry.remove("directoryPathRef");
-            entry.insert("installed".to_string(), serde_json::json!(true));
-            serde_json::Value::Object(entry)
-        })
         .collect();
     let repos = state
         .settings_store
@@ -1386,6 +1785,7 @@ async fn list_skills(State(state): State<ApiState>) -> Json<serde_json::Value> {
         .cloned()
         .unwrap_or_default();
     let mut failed_repo_count = 0usize;
+    let mut available_skills = HashMap::<String, AvailableRepositorySkill>::new();
     for repo in &repos {
         let repo_url = repo.get("url").and_then(|v| v.as_str()).unwrap_or_default();
         let repo_id = repo
@@ -1395,28 +1795,35 @@ async fn list_skills(State(state): State<ApiState>) -> Json<serde_json::Value> {
         if repo_url.is_empty() {
             continue;
         }
-        match ensure_cached_github_repository(&state, repo_url, false).await {
-            Ok((repository, repository_root)) => {
-                match scan_cached_repository_skills(&repository_root, &repository) {
-                    Ok(remote_skills) => {
-                        for skill in remote_skills {
-                            let installed = installed_skill_ids.contains(&skill.skill_id);
-                            if !installed {
-                                all_skills.push(repository_skill_public_entry(
-                                    skill, repo_id, repo_url, false,
-                                ));
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            repository_id = %repo_id,
-                            url = %repo_url,
-                            error = ?error,
-                            "Skill repository scan failed"
-                        );
-                        failed_repo_count += 1;
-                    }
+        let should_refresh =
+            refresh_stale && repository_update_check_is_stale(repo, epoch_ms_now());
+        let snapshot = match load_repository_snapshot(state, repo, should_refresh).await {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) if should_refresh => {
+                tracing::warn!(
+                    repository_id = %repo_id,
+                    url = %repo_url,
+                    error = ?error,
+                    "Skill repository refresh failed; using existing cache"
+                );
+                load_repository_snapshot(state, repo, false).await
+            }
+            Err(error) => Err(error),
+        };
+        match snapshot {
+            Ok(snapshot) => {
+                for skill in snapshot.skills {
+                    available_skills.insert(
+                        skill.skill_id.clone(),
+                        AvailableRepositorySkill {
+                            skill,
+                            repository_root: snapshot.root.clone(),
+                            repository_id: repo_id.to_string(),
+                            repository_url: repo_url.to_string(),
+                            commit: snapshot.commit.clone(),
+                            checked_at: snapshot.checked_at,
+                        },
+                    );
                 }
             }
             Err(error) => {
@@ -1430,10 +1837,67 @@ async fn list_skills(State(state): State<ApiState>) -> Json<serde_json::Value> {
             }
         }
     }
-    Json(serde_json::json!({
+
+    let mut all_skills = installed_skills
+        .into_iter()
+        .map(|skill| {
+            let available =
+                instruction_skill_id(&skill).and_then(|skill_id| available_skills.get(&skill_id));
+            installed_skill_public_entry(state, skill, available)
+        })
+        .collect::<Vec<_>>();
+    for available in available_skills.into_values() {
+        if installed_skill_ids.contains(&available.skill.skill_id) {
+            continue;
+        }
+        all_skills.push(repository_skill_public_entry(
+            available.skill,
+            &available.repository_id,
+            &available.repository_url,
+            false,
+            available.commit.as_deref(),
+            Some(available.checked_at),
+        ));
+    }
+    all_skills.sort_by(|left, right| {
+        let left_installed = left
+            .get("installed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let right_installed = right
+            .get("installed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        right_installed.cmp(&left_installed).then_with(|| {
+            left.get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .cmp(
+                    right
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                )
+        })
+    });
+    let update_available_count = all_skills
+        .iter()
+        .filter(|skill| {
+            skill
+                .get("updateAvailable")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        })
+        .count();
+    serde_json::json!({
         "skills": all_skills,
         "failedRepositoryCount": failed_repo_count,
-    }))
+        "updateAvailableCount": update_available_count,
+    })
+}
+
+async fn list_skills(State(state): State<ApiState>) -> Json<serde_json::Value> {
+    Json(build_skill_library(&state, true).await)
 }
 
 async fn install_skill(
@@ -1448,6 +1912,7 @@ async fn install_skill(
         .to_string();
     let (repository, repository_root, skill, repository_id) =
         find_repository_skill(&state, &skill_id).await?;
+    let repository_commit = cached_repository_commit(&repository_root).await;
     let source_dir = repository_root.join(&skill.relative_path);
     let cache_root = installed_skill_cache_root(&state)?;
     let target_dir = cache_root.join(installed_skill_cache_key(&skill_id)?);
@@ -1478,6 +1943,26 @@ async fn install_skill(
         "repositoryPath".to_string(),
         serde_json::json!(relative_path_to_slash_string(&skill.relative_path)?),
     );
+    object.insert(
+        "installedContentHash".to_string(),
+        serde_json::json!(skill.content_hash.clone()),
+    );
+    object.insert(
+        "loadedContentHash".to_string(),
+        serde_json::json!(skill.content_hash),
+    );
+    object.insert(
+        "installedCommit".to_string(),
+        serde_json::json!(repository_commit),
+    );
+    object.insert("version".to_string(), serde_json::json!(skill.version));
+    object.insert("author".to_string(), serde_json::json!(skill.author));
+    object.insert("category".to_string(), serde_json::json!(skill.category));
+    object.insert(
+        "lastCheckedAt".to_string(),
+        serde_json::json!(epoch_ms_now()),
+    );
+    object.insert("updatedAt".to_string(), serde_json::json!(epoch_ms_now()));
 
     let mut instruction_skills = load_instruction_skills(&state);
     upsert_named_object_array_entry(&mut instruction_skills, normalized, &["skillId"]);
@@ -1551,6 +2036,39 @@ async fn save_skills_config(
         .ok_or_else(|| ApiError::InvalidInput("skillsConfig 必须是对象".to_string()))?;
     persist_skills_config_object(&state, config)?;
     Ok(Json(serde_json::json!({ "saved": true })))
+}
+
+async fn toggle_skill(
+    State(state): State<ApiState>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let skill_id = request
+        .get("skillId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("skillId 不能为空".to_string()))?;
+    let enabled = request
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| ApiError::InvalidInput("enabled 必须是布尔值".to_string()))?;
+
+    let mut instruction_skills = load_instruction_skills(&state);
+    let skill = instruction_skills
+        .iter_mut()
+        .find(|item| instruction_skill_matches(item, skill_id))
+        .ok_or_else(|| ApiError::not_found("技能未安装", skill_id))?;
+    let object = skill
+        .as_object_mut()
+        .ok_or_else(|| ApiError::InvalidInput("Skill 配置无效".to_string()))?;
+    object.insert("enabled".to_string(), serde_json::json!(enabled));
+    persist_instruction_skills(&state, instruction_skills)?;
+
+    Ok(Json(serde_json::json!({
+        "updated": true,
+        "skillId": skill_id,
+        "enabled": enabled,
+    })))
 }
 
 async fn add_custom_tool(
@@ -1660,6 +2178,21 @@ async fn remove_installed_skill(
                 std::fs::remove_dir_all(&directory)
                     .map_err(|error| skill_cache_error("删除 Skill 缓存失败", &directory, error))?;
             }
+            if removed_skill
+                .as_ref()
+                .and_then(|skill| skill.get("source"))
+                .and_then(|value| value.as_str())
+                == Some("repository")
+                && let Ok(backup_root) = installed_skill_backup_root(&state)
+                && let Ok(cache_key) = installed_skill_cache_key(&removed_skill_id)
+            {
+                let backup = backup_root.join(cache_key);
+                if backup.exists() {
+                    std::fs::remove_dir_all(&backup).map_err(|error| {
+                        skill_cache_error("删除 Skill 备份失败", &backup, error)
+                    })?;
+                }
+            }
             Ok(Json(serde_json::json!({
                 "removed": true,
                 "source": "instruction",
@@ -1672,84 +2205,417 @@ async fn remove_installed_skill(
     }
 }
 
+fn reload_local_skill_entry(skill: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+    let path = skill_loader::instruction_skill_directory_path(skill)
+        .filter(|path| path.is_dir())
+        .ok_or_else(|| ApiError::InvalidInput("技能源不可用，请重新导入该 Skill".to_string()))?;
+    let metadata = read_skill_directory_metadata(&path)?;
+    let mut entry = skill.as_object().cloned().unwrap_or_default();
+    entry.insert(
+        "fileCount".to_string(),
+        serde_json::json!(metadata.file_count),
+    );
+    entry.insert(
+        "lastModified".to_string(),
+        serde_json::json!(metadata.last_modified_epoch_ms),
+    );
+    entry.insert(
+        "loadedContentHash".to_string(),
+        serde_json::json!(metadata.content_hash),
+    );
+    entry.insert(
+        "lastRefreshed".to_string(),
+        serde_json::json!(epoch_ms_now()),
+    );
+    entry.insert("updatedAt".to_string(), serde_json::json!(epoch_ms_now()));
+    Ok(serde_json::Value::Object(entry))
+}
+
+async fn refresh_available_repository_skill(
+    state: &ApiState,
+    installed: &serde_json::Value,
+) -> Result<AvailableRepositorySkill, ApiError> {
+    let skill_id = instruction_skill_id(installed)
+        .ok_or_else(|| ApiError::InvalidInput("skillId 不能为空".to_string()))?;
+    let repository_url = installed
+        .get("repositoryUrl")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("Skill 仓库来源不可用".to_string()))?;
+    let repository_id = installed
+        .get("repositoryId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(repository_url);
+    let repository_entry = state
+        .settings_store
+        .get_section("repositories")
+        .as_array()
+        .and_then(|repositories| {
+            repositories.iter().find(|repository| {
+                repository
+                    .get("repositoryId")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| value == repository_id)
+            })
+        })
+        .cloned()
+        .ok_or_else(|| ApiError::InvalidInput("Skill 来源仓库未配置".to_string()))?;
+    let snapshot = load_repository_snapshot(state, &repository_entry, true).await?;
+    let skill = snapshot
+        .skills
+        .iter()
+        .find(|candidate| candidate.skill_id == skill_id)
+        .cloned()
+        .ok_or_else(|| ApiError::InvalidInput("该 Skill 已从来源仓库移除".to_string()))?;
+    Ok(AvailableRepositorySkill {
+        skill,
+        repository_root: snapshot.root,
+        repository_id: repository_id.to_string(),
+        repository_url: repository_url.to_string(),
+        commit: snapshot.commit,
+        checked_at: snapshot.checked_at,
+    })
+}
+
+fn apply_repository_skill_update(
+    state: &ApiState,
+    installed: &serde_json::Value,
+    available: &AvailableRepositorySkill,
+) -> Result<(serde_json::Value, bool), ApiError> {
+    let skill_id = instruction_skill_id(installed)
+        .ok_or_else(|| ApiError::InvalidInput("skillId 不能为空".to_string()))?;
+    let target = skill_loader::instruction_skill_directory_path(installed)
+        .ok_or_else(|| ApiError::InvalidInput("Skill 安装目录不可用".to_string()))?;
+    let source = available
+        .repository_root
+        .join(&available.skill.relative_path);
+    let backup = installed_skill_backup_root(state)?.join(installed_skill_cache_key(&skill_id)?);
+    let installed_hash = installed
+        .get("installedContentHash")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            installed
+                .get("loadedContentHash")
+                .and_then(serde_json::Value::as_str)
+        });
+    let current_hash = target
+        .is_dir()
+        .then(|| read_skill_directory_metadata(&target))
+        .transpose()?
+        .map(|metadata| metadata.content_hash);
+    if installed_hash == Some(available.skill.content_hash.as_str())
+        && current_hash.as_deref() == installed_hash
+    {
+        let mut unchanged = installed.as_object().cloned().unwrap_or_default();
+        unchanged.insert(
+            "lastCheckedAt".to_string(),
+            serde_json::json!(available.checked_at),
+        );
+        return Ok((serde_json::Value::Object(unchanged), false));
+    }
+
+    update_repository_skill_directory(&source, &target, &backup)?;
+    let metadata = read_skill_directory_metadata(&target)?;
+    let mut entry = installed.as_object().cloned().unwrap_or_default();
+    for (source_key, backup_key) in [
+        ("installedContentHash", "backupContentHash"),
+        ("installedCommit", "backupCommit"),
+        ("version", "backupVersion"),
+        ("name", "backupName"),
+        ("description", "backupDescription"),
+        ("author", "backupAuthor"),
+        ("category", "backupCategory"),
+        ("updatedAt", "backupUpdatedAt"),
+    ] {
+        if let Some(value) = entry.get(source_key).cloned() {
+            entry.insert(backup_key.to_string(), value);
+        }
+    }
+    entry.insert("name".to_string(), serde_json::json!(available.skill.name));
+    entry.insert(
+        "description".to_string(),
+        serde_json::json!(available.skill.description),
+    );
+    entry.insert(
+        "author".to_string(),
+        serde_json::json!(available.skill.author),
+    );
+    entry.insert(
+        "version".to_string(),
+        serde_json::json!(available.skill.version),
+    );
+    entry.insert(
+        "category".to_string(),
+        serde_json::json!(available.skill.category),
+    );
+    entry.insert(
+        "installedContentHash".to_string(),
+        serde_json::json!(available.skill.content_hash),
+    );
+    entry.insert(
+        "loadedContentHash".to_string(),
+        serde_json::json!(metadata.content_hash),
+    );
+    entry.insert(
+        "installedCommit".to_string(),
+        serde_json::json!(available.commit),
+    );
+    entry.insert(
+        "fileCount".to_string(),
+        serde_json::json!(metadata.file_count),
+    );
+    entry.insert(
+        "lastModified".to_string(),
+        serde_json::json!(metadata.last_modified_epoch_ms),
+    );
+    entry.insert(
+        "lastCheckedAt".to_string(),
+        serde_json::json!(available.checked_at),
+    );
+    entry.insert(
+        "lastRefreshed".to_string(),
+        serde_json::json!(epoch_ms_now()),
+    );
+    entry.insert("updatedAt".to_string(), serde_json::json!(epoch_ms_now()));
+    Ok((serde_json::Value::Object(entry), true))
+}
+
+async fn check_skill_updates(
+    State(state): State<ApiState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let repositories = state
+        .settings_store
+        .get_section("repositories")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut refreshed_count = 0usize;
+    let mut failed = Vec::new();
+    for repository in repositories {
+        let repository_id = repository
+            .get("repositoryId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        match load_repository_snapshot(&state, &repository, true).await {
+            Ok(_) => refreshed_count += 1,
+            Err(error) => failed.push(serde_json::json!({
+                "repositoryId": repository_id,
+                "message": error.message(),
+            })),
+        }
+    }
+    let library = build_skill_library(&state, false).await;
+    Ok(Json(serde_json::json!({
+        "checked": true,
+        "refreshedRepositoryCount": refreshed_count,
+        "failedRepositories": failed,
+        "updateAvailableCount": library["updateAvailableCount"],
+        "skills": library["skills"],
+    })))
+}
+
 async fn update_skill(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let skill_id = request
         .get("skillId")
-        .and_then(|v| v.as_str())
+        .and_then(|value| value.as_str())
         .map(str::trim)
-        .filter(|v| !v.is_empty())
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::InvalidInput("skillId 不能为空".to_string()))?;
-
     let mut instruction_skills = load_instruction_skills(&state);
     let position = instruction_skills
         .iter()
-        .position(|item| instruction_skill_matches(item, skill_id));
-
-    let Some(pos) = position else {
-        return Err(ApiError::not_found("技能未安装", skill_id));
+        .position(|item| instruction_skill_matches(item, skill_id))
+        .ok_or_else(|| ApiError::not_found("技能未安装", skill_id))?;
+    let installed = instruction_skills[position].clone();
+    let source = installed
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("local");
+    let (updated_entry, changed, action) = if source == "repository" {
+        let available = refresh_available_repository_skill(&state, &installed).await?;
+        let (entry, changed) = apply_repository_skill_update(&state, &installed, &available)?;
+        (entry, changed, "updated")
+    } else {
+        (reload_local_skill_entry(&installed)?, true, "reloaded")
     };
-
-    let skill = &instruction_skills[pos];
-    if let Some(path) = skill_loader::instruction_skill_directory_path(skill) {
-        if !path.is_dir() {
-            return Err(ApiError::InvalidInput(
-                "技能源不可用，请重新导入该 Skill".to_string(),
-            ));
-        }
-        let mut updated_entry = skill.as_object().cloned().unwrap_or_default();
-        let meta = read_local_skill_metadata(&path);
-        updated_entry.insert("fileCount".to_string(), serde_json::json!(meta.file_count));
-        updated_entry.insert(
-            "lastRefreshed".to_string(),
-            serde_json::json!(epoch_ms_now()),
-        );
-        if let Some(ts) = meta.last_modified_epoch_ms {
-            updated_entry.insert("lastModified".to_string(), serde_json::json!(ts));
-        }
-        instruction_skills[pos] = serde_json::Value::Object(updated_entry);
-        persist_instruction_skills(&state, instruction_skills)?;
-    }
-
-    Ok(Json(serde_json::json!({ "updated": true })))
+    instruction_skills[position] = updated_entry;
+    persist_instruction_skills(&state, instruction_skills)?;
+    Ok(Json(serde_json::json!({
+        "updated": true,
+        "changed": changed,
+        "action": action,
+        "skillId": skill_id,
+    })))
 }
 
 async fn update_all_skills(
     State(state): State<ApiState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let repositories = state
+        .settings_store
+        .get_section("repositories")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut available_skills = HashMap::<String, AvailableRepositorySkill>::new();
+    let mut failures = Vec::new();
+    for repository in repositories {
+        let repository_id = repository
+            .get("repositoryId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        match load_repository_snapshot(&state, &repository, true).await {
+            Ok(snapshot) => {
+                let repository_url = repository
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                for skill in snapshot.skills {
+                    available_skills.insert(
+                        skill.skill_id.clone(),
+                        AvailableRepositorySkill {
+                            skill,
+                            repository_root: snapshot.root.clone(),
+                            repository_id: repository_id.clone(),
+                            repository_url: repository_url.clone(),
+                            commit: snapshot.commit.clone(),
+                            checked_at: snapshot.checked_at,
+                        },
+                    );
+                }
+            }
+            Err(error) => failures.push(serde_json::json!({
+                "repositoryId": repository_id,
+                "message": error.message(),
+            })),
+        }
+    }
+
     let mut instruction_skills = load_instruction_skills(&state);
-    let mut updated_count = 0u32;
-
-    for skill in instruction_skills.iter_mut() {
-        let Some(path) = skill_loader::instruction_skill_directory_path(skill) else {
-            continue;
+    let mut updated_count = 0usize;
+    let mut reloaded_count = 0usize;
+    let mut unchanged_count = 0usize;
+    for installed in &mut instruction_skills {
+        let skill_id = instruction_skill_id(installed).unwrap_or_default();
+        let source = installed
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("local");
+        let result = if source == "repository" {
+            available_skills
+                .get(&skill_id)
+                .ok_or_else(|| ApiError::InvalidInput("该 Skill 已从来源仓库移除".to_string()))
+                .and_then(|available| apply_repository_skill_update(&state, installed, available))
+                .map(|(entry, changed)| {
+                    if changed {
+                        updated_count += 1;
+                    } else {
+                        unchanged_count += 1;
+                    }
+                    entry
+                })
+        } else {
+            reload_local_skill_entry(installed).map(|entry| {
+                reloaded_count += 1;
+                entry
+            })
         };
-        if !path.is_dir() {
-            continue;
+        match result {
+            Ok(entry) => *installed = entry,
+            Err(error) => failures.push(serde_json::json!({
+                "skillId": skill_id,
+                "message": error.message(),
+            })),
         }
-        let mut entry = skill.as_object().cloned().unwrap_or_default();
-        let meta = read_local_skill_metadata(&path);
-        entry.insert("fileCount".to_string(), serde_json::json!(meta.file_count));
-        entry.insert(
-            "lastRefreshed".to_string(),
-            serde_json::json!(epoch_ms_now()),
-        );
-        if let Some(ts) = meta.last_modified_epoch_ms {
-            entry.insert("lastModified".to_string(), serde_json::json!(ts));
-        }
-        *skill = serde_json::Value::Object(entry);
-        updated_count += 1;
     }
-
-    if updated_count > 0 {
-        persist_instruction_skills(&state, instruction_skills)?;
-    }
-
+    persist_instruction_skills(&state, instruction_skills)?;
     Ok(Json(serde_json::json!({
         "updated": true,
-        "count": updated_count,
+        "updatedCount": updated_count,
+        "reloadedCount": reloaded_count,
+        "unchangedCount": unchanged_count,
+        "failures": failures,
+    })))
+}
+
+async fn rollback_skill(
+    State(state): State<ApiState>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let skill_id = request
+        .get("skillId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("skillId 不能为空".to_string()))?;
+    let mut instruction_skills = load_instruction_skills(&state);
+    let position = instruction_skills
+        .iter()
+        .position(|item| instruction_skill_matches(item, skill_id))
+        .ok_or_else(|| ApiError::not_found("技能未安装", skill_id))?;
+    let installed = instruction_skills[position].clone();
+    if installed.get("source").and_then(serde_json::Value::as_str) != Some("repository") {
+        return Err(ApiError::InvalidInput(
+            "本地 Skill 不支持版本回滚".to_string(),
+        ));
+    }
+    let target = skill_loader::instruction_skill_directory_path(&installed)
+        .ok_or_else(|| ApiError::InvalidInput("Skill 安装目录不可用".to_string()))?;
+    let backup = installed_skill_backup_root(&state)?.join(installed_skill_cache_key(skill_id)?);
+    rollback_repository_skill_directory(&target, &backup)?;
+    let metadata = read_skill_directory_metadata(&target)?;
+    let mut entry = installed.as_object().cloned().unwrap_or_default();
+    for (current_key, backup_key) in [
+        ("installedContentHash", "backupContentHash"),
+        ("installedCommit", "backupCommit"),
+        ("version", "backupVersion"),
+        ("name", "backupName"),
+        ("description", "backupDescription"),
+        ("author", "backupAuthor"),
+        ("category", "backupCategory"),
+        ("updatedAt", "backupUpdatedAt"),
+    ] {
+        let current = entry.get(current_key).cloned();
+        let backup_value = entry.get(backup_key).cloned();
+        if let Some(value) = backup_value {
+            entry.insert(current_key.to_string(), value);
+        } else {
+            entry.remove(current_key);
+        }
+        if let Some(value) = current {
+            entry.insert(backup_key.to_string(), value);
+        } else {
+            entry.remove(backup_key);
+        }
+    }
+    entry.insert(
+        "loadedContentHash".to_string(),
+        serde_json::json!(metadata.content_hash),
+    );
+    entry.insert(
+        "fileCount".to_string(),
+        serde_json::json!(metadata.file_count),
+    );
+    entry.insert(
+        "lastModified".to_string(),
+        serde_json::json!(metadata.last_modified_epoch_ms),
+    );
+    entry.insert(
+        "lastRefreshed".to_string(),
+        serde_json::json!(epoch_ms_now()),
+    );
+    instruction_skills[position] = serde_json::Value::Object(entry);
+    persist_instruction_skills(&state, instruction_skills)?;
+    Ok(Json(serde_json::json!({
+        "rolledBack": true,
+        "skillId": skill_id,
     })))
 }
 
@@ -1855,6 +2721,30 @@ mod tests {
     }
 
     #[test]
+    fn skill_directory_hash_tracks_nested_content_changes() {
+        let dir = tempfile::tempdir().expect("temp skill dir should create");
+        std::fs::create_dir_all(dir.path().join("scripts"))
+            .expect("nested directory should create");
+        std::fs::write(dir.path().join("SKILL.md"), "# demo\n")
+            .expect("skill markdown should write");
+        std::fs::write(dir.path().join("scripts/run.sh"), "echo one\n")
+            .expect("nested script should write");
+
+        let first =
+            read_skill_directory_metadata(dir.path()).expect("skill metadata should be readable");
+        let repeated =
+            read_skill_directory_metadata(dir.path()).expect("skill metadata should be stable");
+        assert_eq!(first.content_hash, repeated.content_hash);
+        assert_eq!(first.file_count, 2);
+
+        std::fs::write(dir.path().join("scripts/run.sh"), "echo two\n")
+            .expect("nested script should update");
+        let changed = read_skill_directory_metadata(dir.path())
+            .expect("updated skill metadata should be readable");
+        assert_ne!(first.content_hash, changed.content_hash);
+    }
+
+    #[test]
     fn local_skill_request_accepts_host_path_ref() {
         let dir = tempfile::tempdir().expect("temp skill dir should create");
         let path_ref = magi_core::HostPath::from_path(dir.path().to_path_buf())
@@ -1891,7 +2781,7 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).expect("skill directory should create");
         std::fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: omo\ndescription: 多代理编排\n---\n\n# OmO\n",
+            "---\nname: omo\ndescription: 多代理编排\nauthor: Magi\nversion: 2.1.0\ncategory: orchestration\n---\n\n# OmO\n",
         )
         .expect("skill markdown should write");
 
@@ -1904,6 +2794,10 @@ mod tests {
         assert_eq!(skills[0].skill_id, "stellarlinkco/myclaude/skills/omo");
         assert_eq!(skills[0].name, "omo");
         assert_eq!(skills[0].description, "多代理编排");
+        assert_eq!(skills[0].author.as_deref(), Some("Magi"));
+        assert_eq!(skills[0].version.as_deref(), Some("2.1.0"));
+        assert_eq!(skills[0].category.as_deref(), Some("orchestration"));
+        assert!(!skills[0].content_hash.is_empty());
         assert_eq!(skills[0].relative_path, PathBuf::from("skills/omo"));
     }
 
@@ -1958,7 +2852,8 @@ mod tests {
                 "repositories",
                 serde_json::json!([{
                     "repositoryId": "https://github.com/stellarlinkco/myclaude",
-                    "url": "https://github.com/stellarlinkco/myclaude"
+                    "url": "https://github.com/stellarlinkco/myclaude",
+                    "lastCheckedAt": epoch_ms_now()
                 }]),
             )
             .unwrap();
@@ -2014,6 +2909,118 @@ mod tests {
         assert_eq!(
             installed_library["skills"][0]["repositoryName"],
             serde_json::json!("https://github.com/stellarlinkco/myclaude")
+        );
+        assert_eq!(
+            installed_library["skills"][0]["updateStatus"],
+            serde_json::json!("up_to_date")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_skill_update_reloads_changed_content_hash() {
+        let dir = tempfile::tempdir().expect("temp skill dir should create");
+        std::fs::write(dir.path().join("SKILL.md"), "# demo\n\nfirst\n")
+            .expect("skill markdown should write");
+        let entry = build_local_instruction_skill_entry(dir.path())
+            .expect("local skill entry should build");
+        let original_hash = entry["loadedContentHash"]
+            .as_str()
+            .expect("loaded hash should exist")
+            .to_string();
+        std::fs::write(dir.path().join("SKILL.md"), "# demo\n\nsecond\n")
+            .expect("skill markdown should update");
+
+        let state = test_state();
+        state
+            .settings_store
+            .set_section(
+                "skillsConfig",
+                serde_json::json!({ "instructionSkills": [entry] }),
+            )
+            .unwrap();
+        let response = post_json(
+            Router::new().merge(routes()).with_state(state.clone()),
+            "/settings/skills/update",
+            serde_json::json!({ "skillId": dir.path().file_name().unwrap().to_string_lossy() }),
+        )
+        .await;
+        assert_eq!(response["action"], serde_json::json!("reloaded"));
+
+        let stored = state.settings_store.get_section("skillsConfig");
+        let loaded_hash = stored["instructionSkills"][0]["loadedContentHash"]
+            .as_str()
+            .expect("updated loaded hash should exist");
+        assert_ne!(loaded_hash, original_hash);
+        let current =
+            read_skill_directory_metadata(dir.path()).expect("current skill metadata should read");
+        assert_eq!(loaded_hash, current.content_hash);
+    }
+
+    #[test]
+    fn repository_skill_update_keeps_previous_version_for_rollback() {
+        let state_root = tempfile::tempdir().expect("state root should create");
+        let state = test_state_with_persistence(state_root.path());
+        let skill_id = "owner/repo/skills/demo";
+        let target = installed_skill_cache_root(&state)
+            .unwrap()
+            .join(installed_skill_cache_key(skill_id).unwrap());
+        let source = state_root.path().join("repository/skills/demo");
+        std::fs::create_dir_all(&target).expect("target should create");
+        std::fs::create_dir_all(&source).expect("source should create");
+        std::fs::write(target.join("SKILL.md"), "# demo\n\nversion one\n")
+            .expect("old skill should write");
+        std::fs::write(source.join("SKILL.md"), "# demo\n\nversion two\n")
+            .expect("new skill should write");
+        let available_metadata = read_skill_directory_metadata(&source).unwrap();
+        let available = AvailableRepositorySkill {
+            skill: RepositorySkill {
+                skill_id: skill_id.to_string(),
+                name: "demo".to_string(),
+                description: "demo".to_string(),
+                author: None,
+                version: Some("2.0.0".to_string()),
+                category: None,
+                content_hash: available_metadata.content_hash,
+                relative_path: PathBuf::from("skills/demo"),
+            },
+            repository_root: state_root.path().join("repository"),
+            repository_id: "repo".to_string(),
+            repository_url: "https://github.com/owner/repo".to_string(),
+            commit: Some("new-commit".to_string()),
+            checked_at: epoch_ms_now(),
+        };
+        let installed = serde_json::json!({
+            "skillId": skill_id,
+            "source": "repository",
+            "directoryPath": target.to_string_lossy(),
+            "installedContentHash": read_skill_directory_metadata(&target).unwrap().content_hash,
+            "installedCommit": "old-commit",
+            "version": "1.0.0",
+        });
+
+        let (_, changed) = apply_repository_skill_update(&state, &installed, &available)
+            .expect("repository skill should update");
+        assert!(changed);
+        assert!(
+            std::fs::read_to_string(target.join("SKILL.md"))
+                .unwrap()
+                .contains("version two")
+        );
+        let backup = installed_skill_backup_root(&state)
+            .unwrap()
+            .join(installed_skill_cache_key(skill_id).unwrap());
+        assert!(
+            std::fs::read_to_string(backup.join("SKILL.md"))
+                .unwrap()
+                .contains("version one")
+        );
+
+        rollback_repository_skill_directory(&target, &backup)
+            .expect("repository skill should roll back");
+        assert!(
+            std::fs::read_to_string(target.join("SKILL.md"))
+                .unwrap()
+                .contains("version one")
         );
     }
 
@@ -2078,7 +3085,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_server_list_redacts_env_values() {
+    async fn mcp_server_list_exposes_env_values_for_editing() {
         let state = test_state();
         state
             .settings_store
@@ -2102,12 +3109,12 @@ mod tests {
 
         assert_eq!(
             body["servers"][0]["env"]["TOKEN"],
-            serde_json::json!(crate::mcp_config::REDACTED_MCP_ENV_VALUE)
+            serde_json::json!("secret-token")
         );
     }
 
     #[tokio::test]
-    async fn mcp_server_update_preserves_redacted_env_values() {
+    async fn mcp_server_update_replaces_explicit_env_values() {
         let state = test_state();
         state
             .settings_store
@@ -2135,7 +3142,7 @@ mod tests {
                 "name": "server-preserve-env",
                 "command": "node",
                 "env": {
-                    "TOKEN": crate::mcp_config::REDACTED_MCP_ENV_VALUE,
+                    "TOKEN": "new-secret-token",
                     "MODE": "new"
                 },
                 "enabled": false
@@ -2146,13 +3153,16 @@ mod tests {
         assert_eq!(body["updated"], true);
         let stored = stored_mcp_server_entry(&state, "server-preserve-env")
             .expect("updated server should remain stored");
-        assert_eq!(stored["env"]["TOKEN"], serde_json::json!("secret-token"));
+        assert_eq!(
+            stored["env"]["TOKEN"],
+            serde_json::json!("new-secret-token")
+        );
         assert_eq!(stored["env"]["MODE"], serde_json::json!("new"));
         assert_eq!(stored["enabled"], serde_json::json!(false));
     }
 
     #[tokio::test]
-    async fn mcp_http_server_save_and_update_preserve_header_secrets() {
+    async fn mcp_http_server_save_list_and_update_keep_header_values_visible() {
         let state = test_state();
         let app = Router::new().merge(routes()).with_state(state.clone());
         let added = post_json(
@@ -2183,7 +3193,7 @@ mod tests {
         );
         assert_eq!(
             public["servers"][0]["headers"]["Authorization"],
-            serde_json::json!(crate::mcp_config::REDACTED_MCP_ENV_VALUE)
+            serde_json::json!("Bearer secret")
         );
 
         let updated = post_json(
@@ -2195,7 +3205,7 @@ mod tests {
                 "type": "streamable-http",
                 "url": "https://example.test/mcp-v2",
                 "headers": {
-                    "Authorization": crate::mcp_config::REDACTED_MCP_ENV_VALUE
+                    "Authorization": "Bearer replacement"
                 },
                 "enabled": false
             }),
@@ -2210,7 +3220,7 @@ mod tests {
         );
         assert_eq!(
             stored["headers"]["Authorization"],
-            serde_json::json!("Bearer secret")
+            serde_json::json!("Bearer replacement")
         );
         assert!(stored.get("command").is_none());
     }
@@ -2576,6 +3586,59 @@ done
     }
 
     #[tokio::test]
+    async fn installed_skill_can_be_disabled_and_reenabled() {
+        let skill_dir = tempfile::tempdir().expect("skill directory should create");
+        std::fs::write(skill_dir.path().join("SKILL.md"), "# Toggle Skill\n")
+            .expect("skill markdown should write");
+        let state = test_state();
+        state
+            .settings_store
+            .set_section(
+                "skillsConfig",
+                serde_json::json!({
+                    "instructionSkills": [{
+                        "skillId": "toggle-skill",
+                        "name": "Toggle Skill",
+                        "directoryPath": skill_dir.path().to_string_lossy().to_string(),
+                        "enabled": true
+                    }]
+                }),
+            )
+            .unwrap();
+
+        let disabled = post_json(
+            Router::new().merge(routes()).with_state(state.clone()),
+            "/settings/skills/toggle",
+            serde_json::json!({ "skillId": "toggle-skill", "enabled": false }),
+        )
+        .await;
+        assert_eq!(disabled["enabled"], serde_json::json!(false));
+        assert_eq!(
+            state.settings_store.get_section("skillsConfig")["instructionSkills"][0]["enabled"],
+            serde_json::json!(false)
+        );
+
+        let library = get_json(
+            Router::new().merge(routes()).with_state(state.clone()),
+            "/settings/skills/library",
+        )
+        .await;
+        assert_eq!(library["skills"][0]["enabled"], serde_json::json!(false));
+
+        let enabled = post_json(
+            Router::new().merge(routes()).with_state(state.clone()),
+            "/settings/skills/toggle",
+            serde_json::json!({ "skillId": "toggle-skill", "enabled": true }),
+        )
+        .await;
+        assert_eq!(enabled["enabled"], serde_json::json!(true));
+        assert_eq!(
+            state.settings_store.get_section("skillsConfig")["instructionSkills"][0]["enabled"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[tokio::test]
     async fn skills_config_save_rejects_config_data_wrappers() {
         for wrapper in ["config", "data"] {
             let state = test_state();
@@ -2608,7 +3671,7 @@ done
     }
 
     #[tokio::test]
-    async fn skill_library_filters_unavailable_local_instruction_skills() {
+    async fn skill_library_reports_unavailable_local_instruction_skills() {
         let state = test_state();
         let valid_dir = tempfile::tempdir().expect("temp skill dir should create");
         std::fs::write(
@@ -2644,10 +3707,19 @@ done
             .as_array()
             .expect("skills should be an array");
 
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0]["skillId"], serde_json::json!("valid-skill"));
-        assert_eq!(skills[0]["installed"], serde_json::json!(true));
-        assert!(skills[0].get("directoryPath").is_none());
+        assert_eq!(skills.len(), 2);
+        let valid = skills
+            .iter()
+            .find(|skill| skill["skillId"] == serde_json::json!("valid-skill"))
+            .expect("valid skill should remain visible");
+        assert_eq!(valid["installed"], serde_json::json!(true));
+        assert!(valid.get("directoryPath").is_none());
+        let missing = skills
+            .iter()
+            .find(|skill| skill["skillId"] == serde_json::json!("missing-skill"))
+            .expect("missing skill should remain manageable");
+        assert_eq!(missing["sourceStatus"], serde_json::json!("missing"));
+        assert_eq!(missing["updateStatus"], serde_json::json!("source_missing"));
     }
 
     #[tokio::test]

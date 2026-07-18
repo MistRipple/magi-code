@@ -22,6 +22,10 @@
     commandEnvironment,
     commandEnvironmentLoading,
     skills,
+    skillUpdateAvailableCount,
+    skillUpdatesChecking,
+    skillUpdatingIds,
+    skillTogglingIds,
     openMCPDialog,
     toggleMCPExpand,
     getMCPHealthLabel,
@@ -32,6 +36,11 @@
     refreshCommandEnvironment,
     openSkillLibraryDialog,
     openRepoDialog,
+    checkSkillUpdates,
+    updateSkill,
+    toggleSkill,
+    updateAllSkills,
+    rollbackSkill,
     deleteSkill
   } = $props<{
     mcpServers: any[];
@@ -76,6 +85,10 @@
     } | null;
     commandEnvironmentLoading: boolean;
     skills: any[];
+    skillUpdateAvailableCount: number;
+    skillUpdatesChecking: boolean;
+    skillUpdatingIds: Set<string>;
+    skillTogglingIds: Set<string>;
     openMCPDialog: (server: any) => void;
     toggleMCPExpand: (sid: string) => void;
     getMCPHealthLabel: (server: any) => string;
@@ -86,8 +99,52 @@
     refreshCommandEnvironment: () => void | Promise<void>;
     openSkillLibraryDialog: () => void;
     openRepoDialog: () => void;
+    checkSkillUpdates: () => void | Promise<void>;
+    updateSkill: (skillId: string) => void | Promise<void>;
+    toggleSkill: (skillId: string, enabled: boolean) => void | Promise<void>;
+    updateAllSkills: () => void | Promise<void>;
+    rollbackSkill: (skillId: string) => void | Promise<void>;
     deleteSkill: (skill: any) => void;
   }>();
+
+  function getSkillSourceLabel(skill: any): string {
+    if (skill.origin === 'repository') return i18n.t('settings.tools.skillSourceRepository');
+    if (skill.origin === 'local') return i18n.t('settings.tools.skillSourceLocal');
+    return i18n.t('settings.tools.custom');
+  }
+
+  function getSkillStatusLabel(skill: any): string {
+    switch (skill.updateStatus) {
+      case 'update_available':
+        return i18n.t('settings.tools.skillStatusUpdateAvailable');
+      case 'local_changed':
+        return i18n.t('settings.tools.skillStatusLocalChanged');
+      case 'local_modified':
+        return i18n.t('settings.tools.skillStatusLocalModified');
+      case 'source_missing':
+        return i18n.t('settings.tools.skillStatusSourceMissing');
+      case 'source_removed':
+        return i18n.t('settings.tools.skillStatusSourceRemoved');
+      default:
+        return i18n.t('settings.tools.skillStatusCurrent');
+    }
+  }
+
+  function getSkillStatusClass(skill: any): string {
+    if (skill.updateStatus === 'update_available' || skill.updateStatus === 'local_changed') return 'warning';
+    if (skill.updateStatus === 'source_missing' || skill.updateStatus === 'source_removed') return 'error';
+    if (skill.updateStatus === 'local_modified') return 'modified';
+    return 'success';
+  }
+
+  function formatSkillCheckedAt(value: number): string {
+    return new Intl.DateTimeFormat(i18n.locale, {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(new Date(value));
+  }
 
   function builtinToolI18nKey(name: string): string {
     const suffix = name
@@ -842,6 +899,16 @@
               <div class="settings-section-desc">{i18n.t('settings.tools.skillsDesc')}</div>
             </div>
             <div class="settings-section-actions">
+              <button class="apple-action-btn secondary" onclick={() => checkSkillUpdates()} disabled={skillUpdatesChecking}>
+                <Icon name="refresh" size={14} />
+                <span>{skillUpdatesChecking ? i18n.t('settings.tools.checkingSkillUpdates') : i18n.t('settings.tools.checkSkillUpdates')}</span>
+              </button>
+              {#if skillUpdateAvailableCount > 0}
+                <button class="apple-action-btn" onclick={() => updateAllSkills()} disabled={skillUpdatesChecking}>
+                  <Icon name="download" size={14} />
+                  <span>{i18n.t('settings.tools.updateAllSkills', { count: skillUpdateAvailableCount })}</span>
+                </button>
+              {/if}
               <button class="apple-action-btn" onclick={() => openSkillLibraryDialog()}>
                 <Icon name="plus" size={14} />
                 <span>{i18n.t('settings.tools.installSkill')}</span>
@@ -860,28 +927,60 @@
                 <p class="empty-state-hint">{i18n.t('settings.tools.noSkillsHint')}</p>
               </div>
             {:else}
-              <div class="apple-grid">
+              <div class="skill-list">
               {#each skills as skill}
-                <div class="apple-tile skill-item">
-                  <div class="skill-head">
-                    <div class="skill-brand">
-                      <div class="skill-avatar">
-                        <Icon name="tools" size={12} />
-                      </div>
-                      <div class="skill-name-box">
-                        <span class="skill-name">{skill.name}</span>
-                        <span class="skill-source-tag">{skill.source === 'custom' ? i18n.t('settings.tools.custom') : i18n.t('settings.tools.skillSourceInstalled')}</span>
-                      </div>
-                    </div>
-                    <button class="skill-delete-btn" title={i18n.t('settings.tools.delete')} onclick={() => deleteSkill(skill)}>
-                      <Icon name="trash" size={12} />
-                    </button>
+                <div class="skill-row" class:disabled={skill.source !== 'custom' && skill.enabled === false}>
+                  <div class="skill-avatar">
+                    <Icon name={skill.origin === 'local' ? 'folder' : 'tools'} size={13} />
                   </div>
-                  {#if skill.description}
-                    <div class="skill-body">
-                      <p class="skill-desc" title={skill.description}>{skill.description}</p>
+                  <div class="skill-main">
+                    <div class="skill-title-line">
+                      <span class="skill-name" title={skill.name}>{skill.name}</span>
+                      <span class="skill-source-tag">{getSkillSourceLabel(skill)}</span>
+                      {#if skill.source !== 'custom' && skill.enabled === false}
+                        <span class="skill-status-tag disabled">{i18n.t('settings.tools.disabledLabel')}</span>
+                      {:else if skill.source !== 'custom'}
+                        <span class="skill-status-tag {getSkillStatusClass(skill)}">{getSkillStatusLabel(skill)}</span>
+                      {/if}
                     </div>
-                  {/if}
+                    <p class="skill-desc" title={skill.description}>{skill.description || i18n.t('settings.tools.skillNoDescription')}</p>
+                    {#if skill.source !== 'custom'}
+                      <div class="skill-meta">
+                        {#if skill.version}<span>{i18n.t('settings.tools.skillVersion', { version: skill.version })}</span>{/if}
+                        {#if skill.repositoryName}<span title={skill.repositoryName}>{skill.repositoryName}</span>{/if}
+                        <span>{skill.lastCheckedAt
+                          ? i18n.t('settings.tools.skillCheckedAt', { time: formatSkillCheckedAt(skill.lastCheckedAt) })
+                          : i18n.t('settings.tools.skillNeverChecked')}</span>
+                      </div>
+                    {/if}
+                  </div>
+                  <div class="skill-row-actions">
+                    {#if skill.source !== 'custom'}
+                      <Toggle
+                        checked={skill.enabled !== false}
+                        disabled={skillTogglingIds.has(skill.skillId)}
+                        title={skill.enabled !== false ? i18n.t('settings.tools.clickToDisable') : i18n.t('settings.tools.clickToEnable')}
+                        onchange={(enabled) => toggleSkill(skill.skillId, enabled)}
+                      />
+                    {/if}
+                    {#if skill.source !== 'custom' && (skill.updateAvailable || skill.updateStatus === 'local_modified')}
+                      <button class="skill-action-btn primary" onclick={() => updateSkill(skill.skillId)} disabled={skillUpdatingIds.has(skill.skillId)}>
+                        <Icon name="refresh" size={13} />
+                        <span>{skill.origin === 'local' ? i18n.t('settings.tools.reloadSkill') : i18n.t('settings.tools.updateSkill')}</span>
+                      </button>
+                    {/if}
+                    {#if skill.rollbackAvailable}
+                      <button class="skill-action-btn" onclick={() => rollbackSkill(skill.skillId)} disabled={skillUpdatingIds.has(skill.skillId)} title={i18n.t('settings.tools.rollbackSkill')}>
+                        <Icon name="refresh" size={13} />
+                      </button>
+                    {/if}
+                    <button class="skill-action-btn danger" title={i18n.t('settings.tools.delete')} onclick={() => deleteSkill(skill)}>
+                      <Icon name="trash" size={13} />
+                    </button>
+                    {#if skillUpdatingIds.has(skill.skillId)}
+                      <span class="skill-row-progress"><Icon name="refresh" size={13} /></span>
+                    {/if}
+                  </div>
                 </div>
               {/each}
               </div>
@@ -1725,18 +1824,78 @@
   }
 
   /* Skill 卡片内部 */
-  .skill-item { min-height: auto; height: auto; align-self: start; }
-  .skill-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-  .skill-brand { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
-  .skill-avatar { width: 22px; height: 22px; border-radius: 6px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; background: rgba(var(--success-rgb, 52, 199, 89), 0.12); color: var(--success); }
-  .skill-name-box { display: flex; align-items: center; gap: 6px; min-width: 0; }
-  .skill-name { font-size: 13px; font-weight: 650; color: var(--foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; letter-spacing: -0.01em; }
-  .skill-source-tag { font-size: 8px; font-weight: 600; padding: 1px 5px; border-radius: 5px; background: transparent; border: 1px solid rgba(var(--foreground-rgb), 0.12); color: var(--foreground-muted); letter-spacing: 0.04em; white-space: nowrap; flex-shrink: 0; }
-  .skill-delete-btn { width: 24px; height: 24px; border-radius: 6px; border: none; background: transparent; color: var(--foreground-muted); cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; opacity: 0; transition: opacity 0.18s ease, color 0.18s ease, background 0.18s ease; }
-  .skill-item:hover .skill-delete-btn { opacity: 1; }
-  .skill-delete-btn:hover { color: var(--error); background: rgba(var(--error-rgb, 255, 59, 48), 0.1); }
-  .skill-body { margin-top: 2px; }
-  .skill-desc { margin: 0; font-size: 11px; color: var(--foreground-muted); line-height: 1.45; display: -webkit-box; line-clamp: 2; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .skill-list {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: color-mix(in srgb, var(--surface-1) 94%, transparent);
+  }
+  .skill-row {
+    display: grid;
+    grid-template-columns: 30px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 10px;
+    min-height: 64px;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .skill-row:last-child { border-bottom: 0; }
+  .skill-row:hover { background: rgba(var(--foreground-rgb), 0.025); }
+  .skill-row.disabled .skill-avatar {
+    background: var(--surface-3);
+    color: var(--foreground-subtle);
+  }
+  .skill-row.disabled .skill-desc,
+  .skill-row.disabled .skill-meta { opacity: 0.72; }
+  .skill-avatar { width: 28px; height: 28px; border-radius: 7px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; background: rgba(var(--success-rgb, 52, 199, 89), 0.1); color: var(--success); }
+  .skill-main { min-width: 0; }
+  .skill-title-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .skill-name { max-width: 42%; font-size: 13px; font-weight: 650; color: var(--foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .skill-source-tag, .skill-status-tag { font-size: 9px; line-height: 16px; padding: 0 6px; border-radius: 4px; white-space: nowrap; flex-shrink: 0; }
+  .skill-source-tag { border: 1px solid var(--border); color: var(--foreground-muted); }
+  .skill-status-tag.success { color: var(--success); background: rgba(var(--success-rgb, 52, 199, 89), 0.1); }
+  .skill-status-tag.warning { color: var(--warning); background: rgba(var(--warning-rgb, 255, 149, 0), 0.11); }
+  .skill-status-tag.modified { color: var(--primary); background: rgba(var(--primary-rgb, 0, 122, 255), 0.1); }
+  .skill-status-tag.error { color: var(--error); background: rgba(var(--error-rgb, 255, 59, 48), 0.1); }
+  .skill-status-tag.disabled { color: var(--foreground-muted); background: var(--surface-3); }
+  .skill-desc { margin: 3px 0 0; font-size: 11px; color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .skill-meta { display: flex; gap: 10px; margin-top: 3px; min-width: 0; font-size: 10px; color: var(--foreground-subtle); }
+  .skill-meta span { min-width: 0; max-width: 38%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .skill-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; }
+  .skill-action-btn { min-width: 28px; height: 28px; padding: 0 8px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--foreground-muted); font: inherit; font-size: 11px; cursor: pointer; }
+  .skill-action-btn:hover { color: var(--foreground); background: rgba(var(--foreground-rgb), 0.05); }
+  .skill-action-btn.primary { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 35%, var(--border)); }
+  .skill-action-btn.danger:hover { color: var(--error); background: rgba(var(--error-rgb, 255, 59, 48), 0.08); }
+  .skill-action-btn:disabled { opacity: 0.45; cursor: wait; }
+  .skill-row-progress { display: inline-flex; color: var(--primary); animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  @container tools-tab (max-width: 640px) {
+    .settings-section-header {
+      align-items: flex-start !important;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .settings-section-actions {
+      display: flex;
+      flex-wrap: wrap;
+      width: 100%;
+    }
+    .skill-row {
+      grid-template-columns: 28px minmax(0, 1fr);
+      align-items: start;
+      padding: 10px;
+    }
+    .skill-row-actions {
+      grid-column: 2;
+      justify-content: flex-start;
+    }
+    .skill-name { max-width: 55%; }
+    .skill-meta { flex-wrap: wrap; gap: 3px 8px; }
+    .skill-meta span { max-width: 100%; }
+  }
 
   /* 空状态 */
   

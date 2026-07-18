@@ -13,6 +13,7 @@ import {
   type AgentSettingsBootstrapSnapshot,
   addAgentMcpServer,
   addAgentRepository,
+  checkAgentSkillUpdates,
   connectAgentMcpServer,
   deleteAgentMcpServer,
   deleteAgentRepository,
@@ -29,10 +30,12 @@ import {
   loadAgentToolCatalogDiagnostics,
   loadAgentSkillLibrary,
   refreshAgentMcpTools,
+  refreshAgentRepository,
   removeAgentInstalledSkill,
   removeAgentRegistryEngine,
   scanAgentLocalSkillDirectory,
   resetAgentExecutionStats,
+  rollbackAgentSkill,
   settingsBootstrapMatchesCurrentWorkspace,
   saveAgentAuxiliaryConfig,
   saveAgentImageGenerationConfig,
@@ -45,7 +48,10 @@ import {
   testAgentImageGenerationConnection,
   testAgentOrchestratorConnection,
   testAgentWorkerConnection,
+  toggleAgentSkill,
   updateAgentMcpServer,
+  updateAgentSkill,
+  updateAllAgentSkills,
   upsertAgentRegistryBinding,
   upsertAgentRegistryEngine,
 } from "../web/agent-api";
@@ -68,7 +74,14 @@ import {
   resolveModelListFetchBlockReason,
 } from "../shared/model-governance";
 import { normalizeToolRuntimeStatus } from "../shared/tool-catalog";
-import { normalizeMcpServerDraft } from "../shared/mcp-config";
+import {
+  convertMcpFormDraft,
+  createMcpFormDraft,
+  normalizeMcpServerDraft,
+  type McpFormDraft,
+  type McpKeyValueRow,
+  type NormalizedMcpServerDraft,
+} from "../shared/mcp-config";
 
 export type UrlMode = "standard" | "full";
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
@@ -146,6 +159,16 @@ export interface SkillItem {
   name: string;
   description: string;
   source: "custom" | "instruction";
+  origin?: "custom" | "local" | "repository";
+  repositoryName?: string;
+  version?: string;
+  availableVersion?: string;
+  updateStatus?: string;
+  sourceStatus?: string;
+  updateAvailable?: boolean;
+  rollbackAvailable?: boolean;
+  lastCheckedAt?: number;
+  enabled: boolean;
 }
 
 export interface BuiltinToolItem {
@@ -215,7 +238,10 @@ export interface Repository {
   url: string;
   name?: string;
   skillCount?: number;
-  lastUpdated?: string;
+  lastUpdated?: number;
+  lastCheckedAt?: number;
+  commit?: string;
+  syncStatus?: string;
 }
 
 export interface LibrarySkill {
@@ -231,6 +257,15 @@ export interface LibrarySkill {
   installed?: boolean;
   icon?: string;
   localSkillId?: string;
+  source?: "local" | "repository";
+  installedVersion?: string;
+  availableVersion?: string;
+  updateStatus?: string;
+  sourceStatus?: string;
+  updateAvailable?: boolean;
+  rollbackAvailable?: boolean;
+  lastCheckedAt?: number;
+  enabled?: boolean;
 }
 
 function createSettingsStore(props: { onClose?: () => void }) {
@@ -663,6 +698,11 @@ function createSettingsStore(props: { onClose?: () => void }) {
   // Skill 库
   let librarySkills = $state<LibrarySkill[]>([]);
   let skillSearchQuery = $state("");
+  let skillUpdateAvailableCount = $state(0);
+  let skillUpdatesChecking = $state(false);
+  let skillUpdatingIds = $state<Set<string>>(new Set());
+  let skillTogglingIds = $state<Set<string>>(new Set());
+  let repositoryRefreshingIds = $state<Set<string>>(new Set());
 
   // 对话框状态
   let showInputDialog = $state(false);
@@ -673,8 +713,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
   // MCP 对话框
   let showMCPDialogState = $state(false);
   let mcpDialogIsEdit = $state(false);
+  let mcpDialogMode = $state<"form" | "json">("form");
   let mcpDialogJson = $state("");
   let mcpDialogError = $state("");
+  let mcpFormDraft = $state<McpFormDraft>(createMcpFormDraft());
 
   // 仓库管理对话框
   let showRepoDialogState = $state(false);
@@ -1785,152 +1827,221 @@ function createSettingsStore(props: { onClose?: () => void }) {
   // MCP 服务器操作函数
   // ============================================
 
+  function getMcpServerConfig(server: MCPServer): Record<string, unknown> {
+    const config: Record<string, unknown> = {
+      type: server.type,
+      enabled: server.enabled,
+    };
+    if (server.type === "streamable-http") {
+      config.url = server.url || "";
+      config.headers = server.headers || {};
+    } else {
+      config.command = server.command || "";
+      config.args = server.args || [];
+      config.env = server.env || {};
+    }
+    if (server.requestTimeoutMs) {
+      config.requestTimeoutMs = server.requestTimeoutMs;
+    }
+    return config;
+  }
+
+  function serializeMcpServerDocument(name: string, config: Record<string, unknown>): string {
+    return JSON.stringify({ mcpServers: { [name]: config } }, null, 2);
+  }
+
+  function getMcpDraftErrorMessage(error: string, name = mcpFormDraft.name.trim() || "MCP"): string {
+    const errorKeys: Record<string, string> = {
+      missingName: "settings.mcp.missingName",
+      invalidTimeout: "settings.mcp.invalidTimeout",
+      emptyKey: "settings.mcp.emptyKey",
+      duplicateKey: "settings.mcp.duplicateKey",
+      unsupportedType: "settings.mcp.unsupportedType",
+      missingCommand: "settings.mcp.missingCommand",
+      argsMustBeArray: "settings.mcp.argsMustBeArray",
+      envMustBeObject: "settings.mcp.envMustBeObject",
+      missingUrl: "settings.mcp.missingUrl",
+      invalidUrl: "settings.mcp.invalidUrl",
+      headersMustBeObject: "settings.mcp.headersMustBeObject",
+    };
+    return i18n.t(errorKeys[error] || "settings.mcp.invalidServerConfig", { name });
+  }
+
+  function parseMcpJsonServers(): Array<[string, Record<string, unknown>]> | null {
+    const jsonText = mcpDialogJson.trim();
+    if (!jsonText) {
+      mcpDialogError = i18n.t("settings.mcp.emptyJson");
+      return null;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(jsonText);
+    } catch {
+      mcpDialogError = i18n.t("settings.mcp.jsonError");
+      return null;
+    }
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      mcpDialogError = i18n.t("settings.mcp.jsonMustBeObject");
+      return null;
+    }
+
+    const servers = (parsed as Record<string, unknown>).mcpServers;
+    if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
+      mcpDialogError = i18n.t("settings.mcp.missingMcpServers");
+      return null;
+    }
+
+    const entries = Object.entries(servers);
+    if (entries.length === 0) {
+      mcpDialogError = i18n.t("settings.mcp.mcpServersEmpty");
+      return null;
+    }
+    if (entries.length > 1 && mcpDialogIsEdit) {
+      mcpDialogError = i18n.t("settings.mcp.editOnlyOneServer");
+      return null;
+    }
+    for (const [name, config] of entries) {
+      if (!config || typeof config !== "object" || Array.isArray(config)) {
+        mcpDialogError = i18n.t("settings.mcp.invalidServerConfig", { name });
+        return null;
+      }
+    }
+    return entries as Array<[string, Record<string, unknown>]>;
+  }
+
   function openMCPDialog(server: MCPServer | null = null) {
     currentEditingMCPServer = server;
     mcpDialogIsEdit = server !== null;
-
-    let defaultJSON: string;
-    if (server) {
-      // 编辑模式：从实际数据序列化，去掉内部状态字段
-      const cfg: Record<string, any> = {};
-      if (server.type === "streamable-http") {
-        cfg.type = "streamable-http";
-        if (server.url) cfg.url = server.url;
-        if (server.headers && Object.keys(server.headers).length > 0) {
-          cfg.headers = server.headers;
-        }
-      } else {
-        cfg.command = server.command || "";
-        if (server.args && server.args.length > 0) cfg.args = server.args;
-        if (server.env && Object.keys(server.env).length > 0) {
-          cfg.env = server.env;
-        }
-      }
-      if (server.requestTimeoutMs) cfg.requestTimeoutMs = server.requestTimeoutMs;
-      defaultJSON = JSON.stringify(
-        { mcpServers: { [server.name]: cfg } },
-        null,
-        2,
-      );
-    } else {
-      // 新增模式：默认 stdio 示例模板
-      defaultJSON = `{
-  "mcpServers": {
-    "mcp-server": {
-      "command": "npx",
-      "args": [
-        "@modelcontextprotocol/server-filesystem",
-        "/path/to/allowed/files"
-      ],
-      "env": {}
-    }
-  }
-}`;
-    }
-    mcpDialogJson = defaultJSON;
+    mcpDialogMode = "form";
+    mcpDialogError = "";
+    const name = server?.name || "mcp-server";
+    const config = server ? getMcpServerConfig(server) : { type: "stdio", enabled: true };
+    mcpFormDraft = createMcpFormDraft(name, config);
+    mcpDialogJson = serializeMcpServerDocument(name, config);
     showMCPDialogState = true;
   }
 
   function closeMCPDialog() {
     showMCPDialogState = false;
     currentEditingMCPServer = null;
+    mcpDialogMode = "form";
     mcpDialogJson = "";
+    mcpDialogError = "";
+    mcpFormDraft = createMcpFormDraft();
+  }
+
+  function setMcpDialogMode(mode: "form" | "json") {
+    if (mode === mcpDialogMode) return;
+    mcpDialogError = "";
+
+    if (mode === "json") {
+      const converted = convertMcpFormDraft(mcpFormDraft);
+      if (!converted.ok) {
+        mcpDialogError = getMcpDraftErrorMessage(converted.error);
+        return;
+      }
+      mcpDialogJson = serializeMcpServerDocument(converted.name, converted.config);
+      mcpDialogMode = "json";
+      return;
+    }
+
+    const entries = parseMcpJsonServers();
+    if (!entries) return;
+    if (entries.length !== 1) {
+      mcpDialogError = i18n.t("settings.mcp.formOnlyOneServer");
+      return;
+    }
+    const [name, config] = entries[0];
+    const normalized = normalizeMcpServerDraft(name, config);
+    if (!normalized.ok) {
+      mcpDialogError = getMcpDraftErrorMessage(normalized.error, name);
+      return;
+    }
+    mcpFormDraft = createMcpFormDraft(name, normalized.server);
+    mcpDialogMode = "form";
+  }
+
+  function updateMcpFormField<K extends keyof McpFormDraft>(field: K, value: McpFormDraft[K]) {
+    mcpFormDraft[field] = value;
+    mcpDialogError = "";
+  }
+
+  function addMcpFormArg() {
+    mcpFormDraft.args.push("");
+    mcpDialogError = "";
+  }
+
+  function updateMcpFormArg(index: number, value: string) {
+    mcpFormDraft.args[index] = value;
+    mcpDialogError = "";
+  }
+
+  function removeMcpFormArg(index: number) {
+    mcpFormDraft.args.splice(index, 1);
+    mcpDialogError = "";
+  }
+
+  function addMcpFormKeyValue(kind: "env" | "headers") {
+    mcpFormDraft[kind].push({ key: "", value: "" });
+    mcpDialogError = "";
+  }
+
+  function updateMcpFormKeyValue(
+    kind: "env" | "headers",
+    index: number,
+    field: keyof McpKeyValueRow,
+    value: string,
+  ) {
+    mcpFormDraft[kind][index][field] = value;
+    mcpDialogError = "";
+  }
+
+  function removeMcpFormKeyValue(kind: "env" | "headers", index: number) {
+    mcpFormDraft[kind].splice(index, 1);
     mcpDialogError = "";
   }
 
   async function saveMCPServer() {
     mcpDialogError = "";
-    const jsonText = mcpDialogJson.trim();
-    if (!jsonText) {
-      mcpDialogError = i18n.t("settings.mcp.emptyJson");
-      return;
+    let entries: Array<[string, Record<string, unknown>]>;
+    if (mcpDialogMode === "form") {
+      const converted = convertMcpFormDraft(mcpFormDraft);
+      if (!converted.ok) {
+        mcpDialogError = getMcpDraftErrorMessage(converted.error);
+        return;
+      }
+      entries = [[converted.name, converted.config]];
+    } else {
+      const parsedEntries = parseMcpJsonServers();
+      if (!parsedEntries) return;
+      entries = parsedEntries;
     }
 
-    let parsed: any;
-    try {
-      parsed = JSON.parse(jsonText);
-    } catch {
-      mcpDialogError = i18n.t("settings.mcp.jsonError");
-      return;
+    const normalizedServers: NormalizedMcpServerDraft[] = [];
+    for (const [name, config] of entries) {
+      const normalized = normalizeMcpServerDraft(name, config);
+      if (!normalized.ok) {
+        mcpDialogError = getMcpDraftErrorMessage(normalized.error, name);
+        return;
+      }
+      normalizedServers.push(normalized.server);
     }
 
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      mcpDialogError = i18n.t("settings.mcp.jsonMustBeObject");
-      return;
-    }
-
-    const servers = parsed.mcpServers;
-    if (!servers || typeof servers !== "object" || Array.isArray(servers)) {
-      mcpDialogError = i18n.t("settings.mcp.missingMcpServers");
-      return;
-    }
-
-    const serverNames = Object.keys(servers);
-    if (serverNames.length === 0) {
-      mcpDialogError = i18n.t("settings.mcp.mcpServersEmpty");
-      return;
-    }
-
-    if (serverNames.length > 1 && mcpDialogIsEdit) {
-      mcpDialogError = i18n.t("settings.mcp.editOnlyOneServer");
-      return;
-    }
-
-    // 设置保存中状态
     saveStatus.mcp = "saving";
     saveStatus = { ...saveStatus };
-
-    const saveServer = async (
-      name: string,
-      cfg: any,
-      isUpdate: boolean,
-    ): Promise<boolean> => {
-      if (!cfg || typeof cfg !== "object") {
-        mcpDialogError = i18n.t("settings.mcp.invalidServerConfig", { name });
-        return false;
-      }
-
-      const normalized = normalizeMcpServerDraft(name, cfg);
-      if (!normalized.ok) {
-        const errorKeys = {
-          unsupportedType: "settings.mcp.unsupportedType",
-          missingCommand: "settings.mcp.missingCommand",
-          argsMustBeArray: "settings.mcp.argsMustBeArray",
-          envMustBeObject: "settings.mcp.envMustBeObject",
-          missingUrl: "settings.mcp.missingUrl",
-          invalidUrl: "settings.mcp.invalidUrl",
-          headersMustBeObject: "settings.mcp.headersMustBeObject",
-        } as const;
-        mcpDialogError = i18n.t(errorKeys[normalized.error], { name });
-        return false;
-      }
-
-      const serverData = normalized.server;
-
-      if (isUpdate && currentEditingMCPServer) {
+    try {
+      if (mcpDialogIsEdit && currentEditingMCPServer) {
         await updateAgentMcpServer(currentEditingMCPServer.id, {
-          ...serverData,
+          ...normalizedServers[0],
           id: currentEditingMCPServer.id,
         });
       } else {
-        await addAgentMcpServer(serverData);
+        for (const serverData of normalizedServers) {
+          await addAgentMcpServer(serverData);
+        }
       }
-
-      return true;
-    };
-
-    let savedCount = 0;
-    if (mcpDialogIsEdit && currentEditingMCPServer) {
-      const name = serverNames[0];
-      if (await saveServer(name, servers[name], true)) savedCount += 1;
-    } else {
-      for (const name of serverNames) {
-        if (await saveServer(name, servers[name], false)) savedCount += 1;
-      }
-    }
-
-    if (savedCount > 0) {
-      // 保存成功后刷新 MCP 列表
       try {
         const payload = await fetchCurrentSettingsBootstrap();
         if (payload) {
@@ -1944,10 +2055,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
       notifySettingsSuccess(i18n.t("settings.toast.mcpConfigSaved"));
       resetSaveStatus("mcp");
       closeMCPDialog();
-    } else {
-      // 保存失败
+    } catch (error) {
       saveStatus.mcp = "idle";
       saveStatus = { ...saveStatus };
+      notifySettingsError(
+        i18n.t(mcpDialogIsEdit ? "settings.toast.action.updateMcpServer" : "settings.toast.action.addMcpServer"),
+        error,
+      );
     }
   }
 
@@ -2122,6 +2236,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
         if (payload) {
           applyRepositoriesPayload(payload.repositories);
         }
+        await hydrateSkillInventory();
         notifySettingsSuccess(i18n.t("settings.toast.repositoryAdded"));
       }
     } catch (e) {
@@ -2142,6 +2257,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           if (payload) {
             applyRepositoriesPayload(payload.repositories);
           }
+          await hydrateSkillInventory();
           notifySettingsSuccess(i18n.t("settings.toast.repositoryDeleted"));
         } catch (e) {
           console.error("[SettingsPanel] 删除仓库失败:", e);
@@ -2155,6 +2271,80 @@ function createSettingsStore(props: { onClose?: () => void }) {
   // Skill 库操作函数
   // ============================================
 
+  function normalizeLibrarySkill(raw: any): LibrarySkill {
+    const source = raw?.source === "repository" ? "repository" : "local";
+    return {
+      name: raw?.name || raw?.skillId || "",
+      fullName: raw?.fullName || raw?.skillId || raw?.name || "",
+      description: raw?.description || "",
+      author: raw?.author || "",
+      version: raw?.version || "",
+      category: raw?.category || "",
+      skillType: raw?.skillType || "instruction",
+      repositoryId: raw?.repositoryId || (source === "local" ? "__installed_local__" : undefined),
+      repositoryName: raw?.repositoryName || (source === "local" ? i18n.t("settings.skillLibrary.localDirectory") : undefined),
+      installed: raw?.installed === true,
+      icon: raw?.icon,
+      localSkillId: raw?.localSkillId,
+      source,
+      installedVersion: raw?.version || "",
+      availableVersion: raw?.availableVersion || "",
+      updateStatus: raw?.updateStatus || "",
+      sourceStatus: raw?.sourceStatus || "",
+      updateAvailable: raw?.updateAvailable === true,
+      rollbackAvailable: raw?.rollbackAvailable === true,
+      lastCheckedAt: typeof raw?.lastCheckedAt === "number" ? raw.lastCheckedAt : undefined,
+      enabled: raw?.enabled !== false,
+    };
+  }
+
+  function applySkillLibraryPayload(payload: any, preserveLocalScan = false): void {
+    const localScanEntries = preserveLocalScan
+      ? librarySkills.filter((skill) => skill.repositoryId === "__local__")
+      : [];
+    librarySkills = [
+      ...ensureArray<any>(payload?.skills).map(normalizeLibrarySkill),
+      ...localScanEntries,
+    ];
+    skillLibraryFailedRepositoryCount =
+      typeof payload?.failedRepositoryCount === "number" && Number.isFinite(payload.failedRepositoryCount)
+        ? payload.failedRepositoryCount
+        : 0;
+    skillUpdateAvailableCount =
+      typeof payload?.updateAvailableCount === "number" && Number.isFinite(payload.updateAvailableCount)
+        ? payload.updateAvailableCount
+        : librarySkills.filter((skill) => skill.updateAvailable).length;
+
+    const customTools = skills.filter((skill) => skill.source === "custom");
+    const installedSkills: SkillItem[] = librarySkills
+      .filter((skill) => skill.installed && skill.repositoryId !== "__local__")
+      .map((skill) => ({
+        skillId: skill.fullName,
+        name: skill.name,
+        description: skill.description || "",
+        source: "instruction",
+        origin: skill.source || "local",
+        repositoryName: skill.repositoryName,
+        version: skill.installedVersion,
+        availableVersion: skill.availableVersion,
+        updateStatus: skill.updateStatus,
+        sourceStatus: skill.sourceStatus,
+        updateAvailable: skill.updateAvailable,
+        rollbackAvailable: skill.rollbackAvailable,
+        lastCheckedAt: skill.lastCheckedAt,
+        enabled: skill.enabled !== false,
+      }));
+    skills = [...customTools, ...installedSkills];
+  }
+
+  async function hydrateSkillInventory(): Promise<void> {
+    try {
+      applySkillLibraryPayload(await loadAgentSkillLibrary());
+    } catch (error) {
+      console.warn("[SettingsPanel] 加载 Skill 状态失败:", error);
+    }
+  }
+
   async function openSkillLibraryDialog() {
     showSkillLibraryDialogState = true;
     skillSearchQuery = "";
@@ -2163,24 +2353,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     localSkillInstallError = "";
     try {
       const payload = await loadAgentSkillLibrary();
-      const skillsList = ensureArray<any>(payload.skills);
-      librarySkills = skillsList.map((s: any) => ({
-        name: s.name,
-        fullName: s.fullName || s.name,
-        description: s.description || "",
-        author: s.author,
-        version: s.version,
-        category: s.category,
-        skillType: s.skillType,
-        repositoryId: s.repositoryId,
-        repositoryName: s.repositoryName,
-        installed: s.installed || false,
-        icon: s.icon,
-      }));
-      skillLibraryFailedRepositoryCount =
-        typeof payload.failedRepositoryCount === "number" && Number.isFinite(payload.failedRepositoryCount)
-          ? payload.failedRepositoryCount
-          : 0;
+      applySkillLibraryPayload(payload);
     } catch (e) {
       console.error("[SettingsPanel] 加载 Skill 库失败:", e);
       notifySettingsError(i18n.t("settings.toast.action.loadSkillLibrary"), e);
@@ -2196,6 +2369,120 @@ function createSettingsStore(props: { onClose?: () => void }) {
     skillLibraryFailedRepositoryCount = 0;
     localSkillInstallError = "";
     localSkillScanRootPath = "";
+  }
+
+  async function refreshRepository(repositoryId: string): Promise<void> {
+    if (repositoryRefreshingIds.has(repositoryId)) return;
+    repositoryRefreshingIds.add(repositoryId);
+    repositoryRefreshingIds = new Set(repositoryRefreshingIds);
+    try {
+      await refreshAgentRepository(repositoryId);
+      const payload = await fetchCurrentSettingsBootstrap();
+      if (payload) applyFreshSettingsBootstrapPayload(payload);
+      await hydrateSkillInventory();
+      notifySettingsSuccess(i18n.t("settings.toast.repositoryRefreshed"));
+    } catch (error) {
+      notifySettingsError(i18n.t("settings.toast.action.refreshRepository"), error);
+    } finally {
+      repositoryRefreshingIds.delete(repositoryId);
+      repositoryRefreshingIds = new Set(repositoryRefreshingIds);
+    }
+  }
+
+  async function checkSkillUpdates(): Promise<void> {
+    if (skillUpdatesChecking) return;
+    skillUpdatesChecking = true;
+    try {
+      const payload = await checkAgentSkillUpdates();
+      const bootstrap = await fetchCurrentSettingsBootstrap();
+      if (bootstrap) applyFreshSettingsBootstrapPayload(bootstrap);
+      applySkillLibraryPayload(payload, showSkillLibraryDialogState);
+      notifySettingsSuccess(i18n.t("settings.toast.skillUpdatesChecked", {
+        count: skillUpdateAvailableCount,
+      }));
+    } catch (error) {
+      notifySettingsError(i18n.t("settings.toast.action.checkSkillUpdates"), error);
+    } finally {
+      skillUpdatesChecking = false;
+    }
+  }
+
+  async function updateSkill(skillId: string): Promise<void> {
+    if (skillUpdatingIds.has(skillId)) return;
+    skillUpdatingIds.add(skillId);
+    skillUpdatingIds = new Set(skillUpdatingIds);
+    try {
+      await updateAgentSkill(skillId);
+      const bootstrap = await fetchCurrentSettingsBootstrap();
+      if (bootstrap) applyFreshSettingsBootstrapPayload(bootstrap);
+      await hydrateSkillInventory();
+      notifySettingsSuccess(i18n.t("settings.toast.skillUpdated"));
+    } catch (error) {
+      notifySettingsError(i18n.t("settings.toast.action.updateSkill"), error);
+    } finally {
+      skillUpdatingIds.delete(skillId);
+      skillUpdatingIds = new Set(skillUpdatingIds);
+    }
+  }
+
+  async function toggleSkill(skillId: string, enabled: boolean): Promise<void> {
+    if (skillTogglingIds.has(skillId)) return;
+    const current = skills.find((skill) => skill.skillId === skillId);
+    if (!current || current.source !== "instruction") return;
+    const previousEnabled = current.enabled;
+
+    skillTogglingIds.add(skillId);
+    skillTogglingIds = new Set(skillTogglingIds);
+    skills = skills.map((skill) => skill.skillId === skillId ? { ...skill, enabled } : skill);
+    try {
+      await toggleAgentSkill(skillId, enabled);
+      await hydrateSkillInventory();
+      notifySettingsSuccess(i18n.t(enabled
+        ? "settings.toast.skillEnabled"
+        : "settings.toast.skillDisabled"));
+    } catch (error) {
+      skills = skills.map((skill) => skill.skillId === skillId
+        ? { ...skill, enabled: previousEnabled }
+        : skill);
+      notifySettingsError(i18n.t("settings.toast.action.toggleSkill"), error);
+    } finally {
+      skillTogglingIds.delete(skillId);
+      skillTogglingIds = new Set(skillTogglingIds);
+    }
+  }
+
+  async function updateAllSkills(): Promise<void> {
+    if (skillUpdatesChecking) return;
+    skillUpdatesChecking = true;
+    try {
+      await updateAllAgentSkills();
+      const bootstrap = await fetchCurrentSettingsBootstrap();
+      if (bootstrap) applyFreshSettingsBootstrapPayload(bootstrap);
+      await hydrateSkillInventory();
+      notifySettingsSuccess(i18n.t("settings.toast.allSkillsUpdated"));
+    } catch (error) {
+      notifySettingsError(i18n.t("settings.toast.action.updateAllSkills"), error);
+    } finally {
+      skillUpdatesChecking = false;
+    }
+  }
+
+  async function rollbackSkill(skillId: string): Promise<void> {
+    if (skillUpdatingIds.has(skillId)) return;
+    skillUpdatingIds.add(skillId);
+    skillUpdatingIds = new Set(skillUpdatingIds);
+    try {
+      await rollbackAgentSkill(skillId);
+      const bootstrap = await fetchCurrentSettingsBootstrap();
+      if (bootstrap) applyFreshSettingsBootstrapPayload(bootstrap);
+      await hydrateSkillInventory();
+      notifySettingsSuccess(i18n.t("settings.toast.skillRolledBack"));
+    } catch (error) {
+      notifySettingsError(i18n.t("settings.toast.action.rollbackSkill"), error);
+    } finally {
+      skillUpdatingIds.delete(skillId);
+      skillUpdatingIds = new Set(skillUpdatingIds);
+    }
   }
 
   async function installSkill(skillFullName: string) {
@@ -2224,13 +2511,11 @@ function createSettingsStore(props: { onClose?: () => void }) {
         installingSkills.delete(skillFullName);
         installingSkills = new Set(installingSkills);
         if ((result as any)?.success !== false) {
-          librarySkills = librarySkills.map((s) =>
-            s.fullName === skillFullName ? { ...s, installed: true } : s
-          );
           const bootstrapPayload = await fetchCurrentSettingsBootstrap();
           if (bootstrapPayload) {
             applyFreshSettingsBootstrapPayload(bootstrapPayload);
           }
+          await hydrateSkillInventory();
           notifySettingsSuccess(i18n.t("settings.toast.localSkillInstalled"));
         }
       } else {
@@ -2239,30 +2524,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
         installingSkills.delete(skillFullName);
         installingSkills = new Set(installingSkills);
         if ((result as any)?.success !== false) {
-          const libPayload = await loadAgentSkillLibrary();
-          const skillsList = ensureArray<any>(libPayload.skills);
-          skillLibraryFailedRepositoryCount =
-            typeof libPayload.failedRepositoryCount === "number" && Number.isFinite(libPayload.failedRepositoryCount)
-              ? libPayload.failedRepositoryCount
-              : 0;
-          // 刷新远程列表时保留当前本地扫描结果。
-          const localEntries = librarySkills.filter((s) => s.repositoryId === "__local__");
-          librarySkills = [
-            ...skillsList.map((s: any) => ({
-              name: s.name,
-              fullName: s.fullName || s.name,
-              description: s.description || "",
-              author: s.author,
-              version: s.version,
-              category: s.category,
-              skillType: s.skillType,
-              repositoryId: s.repositoryId,
-              repositoryName: s.repositoryName,
-              installed: s.installed || false,
-              icon: s.icon,
-            })),
-            ...localEntries,
-          ];
+          applySkillLibraryPayload(await loadAgentSkillLibrary(), true);
           const bootstrapPayload = await fetchCurrentSettingsBootstrap();
           if (bootstrapPayload) {
             applyFreshSettingsBootstrapPayload(bootstrapPayload);
@@ -2401,6 +2663,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           if (payload) {
             applyFreshSettingsBootstrapPayload(payload);
           }
+          await hydrateSkillInventory();
           notifySettingsSuccess(successText);
         } catch (e) {
           console.error(`[SettingsPanel] ${errorText}失败:`, e);
@@ -2776,6 +3039,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
           skillId: name,
           description: typeof tool.description === "string" ? tool.description : "",
           source: "custom",
+          origin: "custom",
+          enabled: true,
         });
       }
     }
@@ -2793,6 +3058,11 @@ function createSettingsStore(props: { onClose?: () => void }) {
           name,
           description: typeof skill.description === "string" ? skill.description : "",
           source: "instruction",
+          origin: skill.source === "repository" ? "repository" : "local",
+          repositoryName: typeof skill.repositoryName === "string" ? skill.repositoryName : undefined,
+          version: typeof skill.version === "string" ? skill.version : undefined,
+          lastCheckedAt: typeof skill.lastCheckedAt === "number" ? skill.lastCheckedAt : undefined,
+          enabled: skill.enabled !== false,
         });
       }
     }
@@ -2806,7 +3076,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
       url: repository.url,
       name: repository.name || repository.url,
       skillCount: repository.skillCount || 0,
-      lastUpdated: repository.lastUpdated,
+      lastUpdated: typeof repository.lastRefreshed === "number"
+        ? repository.lastRefreshed
+        : (typeof repository.lastUpdated === "number" ? repository.lastUpdated : undefined),
+      lastCheckedAt: typeof repository.lastCheckedAt === "number" ? repository.lastCheckedAt : undefined,
+      commit: typeof repository.commit === "string" ? repository.commit : undefined,
+      syncStatus: typeof repository.syncStatus === "string" ? repository.syncStatus : undefined,
     }));
     repoAddLoading = false;
     repositoriesLoading = false;
@@ -2959,7 +3234,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     });
 
     // 初始化请求数据
-    requestSettingsBootstrap();
+    void requestSettingsBootstrap().then(() => hydrateSkillInventory());
     loadExecutionStats()
       .catch((e) => {
         console.error("[SettingsPanel] 获取执行统计失败:", e);
@@ -2993,6 +3268,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       if (v === "tools") {
         ensureToolsBootstrapHydrated();
         void hydrateCommandEnvironment();
+        void hydrateSkillInventory();
       }
     },
     get roleTemplates() {
@@ -3134,6 +3410,18 @@ function createSettingsStore(props: { onClose?: () => void }) {
     get skills() {
       return skills;
     },
+    get skillUpdateAvailableCount() {
+      return skillUpdateAvailableCount;
+    },
+    get skillUpdatesChecking() {
+      return skillUpdatesChecking;
+    },
+    get skillUpdatingIds() {
+      return skillUpdatingIds;
+    },
+    get skillTogglingIds() {
+      return skillTogglingIds;
+    },
     get builtinTools() {
       return builtinTools;
     },
@@ -3176,6 +3464,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
     get mcpDialogIsEdit() {
       return mcpDialogIsEdit;
     },
+    get mcpDialogMode() {
+      return mcpDialogMode;
+    },
     get mcpDialogJson() {
       return mcpDialogJson;
     },
@@ -3187,6 +3478,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     set mcpDialogError(v) {
       mcpDialogError = v;
+    },
+    get mcpFormDraft() {
+      return mcpFormDraft;
     },
     get showRepoDialogState() {
       return showRepoDialogState;
@@ -3202,6 +3496,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     get repositoriesLoading() {
       return repositoriesLoading;
+    },
+    get repositoryRefreshingIds() {
+      return repositoryRefreshingIds;
     },
     get showSkillLibraryDialogState() {
       return showSkillLibraryDialogState;
@@ -3270,6 +3567,14 @@ function createSettingsStore(props: { onClose?: () => void }) {
     cancelInputDialog,
     openMCPDialog,
     closeMCPDialog,
+    setMcpDialogMode,
+    updateMcpFormField,
+    addMcpFormArg,
+    updateMcpFormArg,
+    removeMcpFormArg,
+    addMcpFormKeyValue,
+    updateMcpFormKeyValue,
+    removeMcpFormKeyValue,
     saveMCPServer,
     deleteMCPServer,
     toggleMCPServer,
@@ -3282,12 +3587,18 @@ function createSettingsStore(props: { onClose?: () => void }) {
     closeRepoDialog,
     addRepository,
     deleteRepository,
+    refreshRepository,
     openSkillLibraryDialog,
     closeSkillLibraryDialog,
     installSkill,
     installLocalSkill,
     handleLocalSkillFolderSelected,
     cancelLocalSkillFolderPicker,
+    checkSkillUpdates,
+    updateSkill,
+    toggleSkill,
+    updateAllSkills,
+    rollbackSkill,
     deleteSkill,
     toggleSafeguardRule,
     updateSafeguardRuleAction,

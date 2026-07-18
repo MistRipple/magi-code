@@ -8,6 +8,7 @@ import SettingsModelTab from './SettingsModelTab.svelte';
 import SettingsToolsTab from './SettingsToolsTab.svelte';
 import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
+import Toggle from './Toggle.svelte';
 import { i18n } from '../stores/i18n.svelte';
 import {
     updateAgentRuntimeSetting,
@@ -319,7 +320,7 @@ import {
         />
       {:else if store.activeTab === 'tools'}
         <!-- 工具 Tab -->
-        <SettingsToolsTab mcpServersHydrated={store.mcpServersHydrated} mcpServersLoading={store.mcpServersLoading} mcpServers={store.mcpServers} mcpExpandedServer={store.mcpExpandedServer} mcpServerTools={store.mcpServerTools} mcpRefreshingServers={store.mcpRefreshingServers} builtinTools={store.builtinTools} builtinToolsLoading={store.builtinToolsLoading} capabilityDependencies={store.capabilityDependencies} commandEnvironment={store.commandEnvironment} commandEnvironmentLoading={store.commandEnvironmentLoading} skills={store.skills} openMCPDialog={store.openMCPDialog} toggleMCPExpand={store.toggleMCPExpand} getMCPHealthLabel={store.getMCPHealthLabel} toggleMCPServer={store.toggleMCPServer} deleteMCPServer={store.deleteMCPServer} refreshMCPTools={store.refreshMCPTools} refreshBuiltinToolCatalog={store.refreshBuiltinToolCatalog} refreshCommandEnvironment={store.refreshCommandEnvironment} openSkillLibraryDialog={store.openSkillLibraryDialog} openRepoDialog={store.openRepoDialog} deleteSkill={store.deleteSkill}
+        <SettingsToolsTab mcpServersHydrated={store.mcpServersHydrated} mcpServersLoading={store.mcpServersLoading} mcpServers={store.mcpServers} mcpExpandedServer={store.mcpExpandedServer} mcpServerTools={store.mcpServerTools} mcpRefreshingServers={store.mcpRefreshingServers} builtinTools={store.builtinTools} builtinToolsLoading={store.builtinToolsLoading} capabilityDependencies={store.capabilityDependencies} commandEnvironment={store.commandEnvironment} commandEnvironmentLoading={store.commandEnvironmentLoading} skills={store.skills} skillUpdateAvailableCount={store.skillUpdateAvailableCount} skillUpdatesChecking={store.skillUpdatesChecking} skillUpdatingIds={store.skillUpdatingIds} skillTogglingIds={store.skillTogglingIds} openMCPDialog={store.openMCPDialog} toggleMCPExpand={store.toggleMCPExpand} getMCPHealthLabel={store.getMCPHealthLabel} toggleMCPServer={store.toggleMCPServer} deleteMCPServer={store.deleteMCPServer} refreshMCPTools={store.refreshMCPTools} refreshBuiltinToolCatalog={store.refreshBuiltinToolCatalog} refreshCommandEnvironment={store.refreshCommandEnvironment} openSkillLibraryDialog={store.openSkillLibraryDialog} openRepoDialog={store.openRepoDialog} checkSkillUpdates={store.checkSkillUpdates} updateSkill={store.updateSkill} toggleSkill={store.toggleSkill} updateAllSkills={store.updateAllSkills} rollbackSkill={store.rollbackSkill} deleteSkill={store.deleteSkill}
         />
       {/if}
     </div>
@@ -349,18 +350,225 @@ import {
 <!-- MCP 对话框 -->
 {#if store.showMCPDialogState}
   <Modal
+    size="lg"
     closeOnEscape={true}
     onClose={store.closeMCPDialog}
   >
     {#snippet header()}
-      <h3>{store.mcpDialogIsEdit ? i18n.t('settings.mcp.editTitle') : i18n.t('settings.mcp.addTitle')}</h3>
+      <div class="mcp-editor-title">
+        <h3>{store.mcpDialogIsEdit ? i18n.t('settings.mcp.editTitle') : i18n.t('settings.mcp.addTitle')}</h3>
+        <span>{i18n.t('settings.mcp.editorDesc')}</span>
+      </div>
       <button class="modal-close" onclick={store.closeMCPDialog}>×</button>
     {/snippet}
-    <div class="form-field">
-      <label for="mcp-json">{i18n.t('settings.mcp.jsonLabel')}</label>
-      <textarea id="mcp-json" rows="12" placeholder={i18n.t('settings.mcp.jsonPlaceholder')} bind:value={store.mcpDialogJson} oninput={() => store.mcpDialogError = ''}></textarea>
+    <div class="mcp-editor">
+      <div class="mcp-mode-switch" role="tablist" aria-label={i18n.t('settings.mcp.addMode')}>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={store.mcpDialogMode === 'form'}
+          class:active={store.mcpDialogMode === 'form'}
+          onclick={() => store.setMcpDialogMode('form')}
+        >
+          {i18n.t('settings.mcp.formMode')}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={store.mcpDialogMode === 'json'}
+          class:active={store.mcpDialogMode === 'json'}
+          onclick={() => store.setMcpDialogMode('json')}
+        >
+          {i18n.t('settings.mcp.jsonMode')}
+        </button>
+      </div>
+
+      {#if store.mcpDialogMode === 'form'}
+        <div class="mcp-form">
+          <div class="mcp-form-grid">
+            <div class="form-field">
+              <label for="mcp-name">{i18n.t('settings.mcp.nameLabel')}</label>
+              <input
+                id="mcp-name"
+                type="text"
+                value={store.mcpFormDraft.name}
+                placeholder={i18n.t('settings.mcp.namePlaceholder')}
+                oninput={(event) => store.updateMcpFormField('name', event.currentTarget.value)}
+              >
+            </div>
+            <div class="form-field">
+              <span class="mcp-field-label">{i18n.t('settings.mcp.transportLabel')}</span>
+              <div class="mcp-transport-switch">
+                <button
+                  type="button"
+                  class:active={store.mcpFormDraft.type === 'stdio'}
+                  onclick={() => store.updateMcpFormField('type', 'stdio')}
+                >{i18n.t('settings.mcp.transportStdio')}</button>
+                <button
+                  type="button"
+                  class:active={store.mcpFormDraft.type === 'streamable-http'}
+                  onclick={() => store.updateMcpFormField('type', 'streamable-http')}
+                >{i18n.t('settings.mcp.transportHttp')}</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="mcp-form-options">
+            <div class="mcp-timeout-field">
+              <label for="mcp-timeout">{i18n.t('settings.mcp.timeoutLabel')}</label>
+              <div class="mcp-input-suffix">
+                <input
+                  id="mcp-timeout"
+                  type="number"
+                  min="1"
+                  max="300"
+                  step="1"
+                  value={store.mcpFormDraft.requestTimeoutSeconds}
+                  placeholder="30"
+                  oninput={(event) => store.updateMcpFormField('requestTimeoutSeconds', event.currentTarget.value)}
+                >
+                <span>{i18n.t('settings.mcp.seconds')}</span>
+              </div>
+            </div>
+            <div class="mcp-enabled-field">
+              <div>
+                <strong>{i18n.t('settings.mcp.enabledLabel')}</strong>
+                <span>{i18n.t('settings.mcp.enabledHint')}</span>
+              </div>
+              <Toggle
+                checked={store.mcpFormDraft.enabled}
+                onchange={(checked) => store.updateMcpFormField('enabled', checked)}
+              />
+            </div>
+          </div>
+
+          {#if store.mcpFormDraft.type === 'stdio'}
+            <section class="mcp-form-section">
+              <div class="mcp-section-heading">
+                <div>
+                  <strong>{i18n.t('settings.mcp.stdioSection')}</strong>
+                  <span>{i18n.t('settings.mcp.stdioSectionDesc')}</span>
+                </div>
+              </div>
+              <div class="form-field">
+                <label for="mcp-command">{i18n.t('settings.mcp.commandLabel')}</label>
+                <input
+                  id="mcp-command"
+                  type="text"
+                  value={store.mcpFormDraft.command}
+                  placeholder={i18n.t('settings.mcp.commandPlaceholder')}
+                  oninput={(event) => store.updateMcpFormField('command', event.currentTarget.value)}
+                >
+              </div>
+              <div class="mcp-list-field">
+                <div class="mcp-list-heading">
+                  <span>{i18n.t('settings.mcp.argsLabel')}</span>
+                  <button type="button" onclick={store.addMcpFormArg}>
+                    <Icon name="plus" size={13} />
+                    {i18n.t('settings.mcp.addArg')}
+                  </button>
+                </div>
+                {#if store.mcpFormDraft.args.length === 0}
+                  <div class="mcp-empty-row">{i18n.t('settings.mcp.noArgs')}</div>
+                {:else}
+                  <div class="mcp-row-list">
+                    {#each store.mcpFormDraft.args as arg, index}
+                      <div class="mcp-value-row">
+                        <input
+                          type="text"
+                          value={arg}
+                          aria-label={i18n.t('settings.mcp.argIndex', { index: index + 1 })}
+                          placeholder={i18n.t('settings.mcp.argPlaceholder')}
+                          oninput={(event) => store.updateMcpFormArg(index, event.currentTarget.value)}
+                        >
+                        <button type="button" class="mcp-remove-row" title={i18n.t('settings.mcp.removeRow')} onclick={() => store.removeMcpFormArg(index)}>
+                          <Icon name="close" size={14} />
+                        </button>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+              <div class="mcp-list-field">
+                <div class="mcp-list-heading">
+                  <span>{i18n.t('settings.mcp.envLabel')}</span>
+                  <button type="button" onclick={() => store.addMcpFormKeyValue('env')}>
+                    <Icon name="plus" size={13} />
+                    {i18n.t('settings.mcp.addVariable')}
+                  </button>
+                </div>
+                {#if store.mcpFormDraft.env.length === 0}
+                  <div class="mcp-empty-row">{i18n.t('settings.mcp.noEnv')}</div>
+                {:else}
+                  <div class="mcp-row-list">
+                    {#each store.mcpFormDraft.env as row, index}
+                      <div class="mcp-key-value-row">
+                        <input type="text" value={row.key} placeholder={i18n.t('settings.mcp.keyPlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('env', index, 'key', event.currentTarget.value)}>
+                        <input type="text" value={row.value} placeholder={i18n.t('settings.mcp.valuePlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('env', index, 'value', event.currentTarget.value)}>
+                        <button type="button" class="mcp-remove-row" title={i18n.t('settings.mcp.removeRow')} onclick={() => store.removeMcpFormKeyValue('env', index)}>
+                          <Icon name="close" size={14} />
+                        </button>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            </section>
+          {:else}
+            <section class="mcp-form-section">
+              <div class="mcp-section-heading">
+                <div>
+                  <strong>{i18n.t('settings.mcp.httpSection')}</strong>
+                  <span>{i18n.t('settings.mcp.httpSectionDesc')}</span>
+                </div>
+              </div>
+              <div class="form-field">
+                <label for="mcp-url">{i18n.t('settings.mcp.urlLabel')}</label>
+                <input
+                  id="mcp-url"
+                  type="text"
+                  value={store.mcpFormDraft.url}
+                  placeholder="https://example.com/mcp"
+                  oninput={(event) => store.updateMcpFormField('url', event.currentTarget.value)}
+                >
+              </div>
+              <div class="mcp-list-field">
+                <div class="mcp-list-heading">
+                  <span>{i18n.t('settings.mcp.headersLabel')}</span>
+                  <button type="button" onclick={() => store.addMcpFormKeyValue('headers')}>
+                    <Icon name="plus" size={13} />
+                    {i18n.t('settings.mcp.addHeader')}
+                  </button>
+                </div>
+                {#if store.mcpFormDraft.headers.length === 0}
+                  <div class="mcp-empty-row">{i18n.t('settings.mcp.noHeaders')}</div>
+                {:else}
+                  <div class="mcp-row-list">
+                    {#each store.mcpFormDraft.headers as row, index}
+                      <div class="mcp-key-value-row">
+                        <input type="text" value={row.key} placeholder={i18n.t('settings.mcp.headerKeyPlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('headers', index, 'key', event.currentTarget.value)}>
+                        <input type="text" value={row.value} placeholder={i18n.t('settings.mcp.headerValuePlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('headers', index, 'value', event.currentTarget.value)}>
+                        <button type="button" class="mcp-remove-row" title={i18n.t('settings.mcp.removeRow')} onclick={() => store.removeMcpFormKeyValue('headers', index)}>
+                          <Icon name="close" size={14} />
+                        </button>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            </section>
+          {/if}
+        </div>
+      {:else}
+        <div class="mcp-json-editor form-field">
+          <label for="mcp-json">{i18n.t('settings.mcp.jsonLabel')}</label>
+          <textarea id="mcp-json" rows="16" spellcheck="false" placeholder={i18n.t('settings.mcp.jsonPlaceholder')} bind:value={store.mcpDialogJson} oninput={() => store.mcpDialogError = ''}></textarea>
+          <div class="mcp-json-help">{i18n.t('settings.mcp.jsonHelp')}</div>
+        </div>
+      {/if}
+
       {#if store.mcpDialogError}
-        <div class="form-error">{store.mcpDialogError}</div>
+        <div class="form-error mcp-form-error" role="alert">{store.mcpDialogError}</div>
       {/if}
     </div>
     {#snippet footer()}
@@ -407,7 +615,13 @@ import {
         <span>{store.repoAddLoading ? i18n.t('settings.repo.adding') : i18n.t('settings.repo.add')}</span>
       </button>
     </div>
-    <div class="repo-list-title">{i18n.t('settings.repo.addedRepos')}</div>
+    <div class="repo-list-heading">
+      <div class="repo-list-title">{i18n.t('settings.repo.addedRepos')}</div>
+      <button class="apple-action-btn secondary" onclick={store.checkSkillUpdates} disabled={store.skillUpdatesChecking || store.repositories.length === 0}>
+        <Icon name="refresh" size={13} />
+        <span>{i18n.t('settings.repo.refreshAll')}</span>
+      </button>
+    </div>
     <div class="repo-manage-list">
       {#if store.repositoriesLoading}
         <div class="loading-state">
@@ -422,11 +636,16 @@ import {
             <div class="repo-info">
               <div class="repo-name">{repo.name || repo.url}</div>
               <div class="repo-url">{repo.url}</div>
-              {#if repo.skillCount}
-                <div class="repo-meta">{i18n.t('settings.repo.skillCount', { count: repo.skillCount })}</div>
-              {/if}
+              <div class="repo-meta">
+                <span>{i18n.t('settings.repo.skillCount', { count: repo.skillCount || 0 })}</span>
+                {#if repo.commit}<span title={repo.commit}>{repo.commit.slice(0, 8)}</span>{/if}
+                <span class:repo-ready={repo.syncStatus === 'ready'}>{repo.syncStatus === 'ready' ? i18n.t('settings.repo.ready') : i18n.t('settings.repo.notSynced')}</span>
+              </div>
             </div>
             <div class="repo-actions">
+              <button class="btn-icon btn-icon--sm" title={i18n.t('settings.repo.refresh')} onclick={() => store.refreshRepository(repo.id)} disabled={store.repositoryRefreshingIds.has(repo.id)}>
+                <Icon name="refresh" size={14} />
+              </button>
               <button class="btn-icon btn-icon--sm" title={i18n.t('settings.tools.delete')} onclick={() => store.deleteRepository(repo.id)}>
                 <Icon name="close" size={14} />
               </button>
@@ -455,6 +674,10 @@ import {
     <div class="skill-library-search">
       <div class="skill-library-search-row form-field" style="margin-bottom: 0;">
         <input type="text" placeholder={i18n.t('settings.skillLibrary.searchPlaceholder')} bind:value={store.skillSearchQuery}>
+        <button class="apple-action-btn secondary" onclick={store.checkSkillUpdates} disabled={store.skillUpdatesChecking}>
+          <Icon name="refresh" size={14} />
+          {i18n.t('settings.skillLibrary.checkUpdates')}
+        </button>
         <button class="apple-action-btn secondary" onclick={store.installLocalSkill} disabled={store.localSkillInstalling}>
           {#if store.localSkillInstalling}
             <Icon name="refresh" size={14} />
@@ -500,7 +723,14 @@ import {
                   <Icon name="tools" size={14} />
                 </div>
                 <div class="skill-library-info">
-                  <div class="skill-library-name">{skill.name}</div>
+                  <div class="skill-library-name-line">
+                    <div class="skill-library-name">{skill.name}</div>
+                    {#if skill.installed}
+                      <span class="skill-library-status" class:is-update={skill.updateAvailable}>
+                        {skill.updateAvailable ? i18n.t('settings.skillLibrary.updateAvailable') : i18n.t('settings.skillLibrary.installed')}
+                      </span>
+                    {/if}
+                  </div>
                   <div class="skill-library-desc" title={skill.description || ''}>{skill.description || ''}</div>
                   {#if skill.author || skill.version || skill.category}
                     <div class="skill-library-meta">
@@ -513,14 +743,16 @@ import {
                 <div class="skill-library-actions">
                   <button
                     class="settings-btn secondary"
-                    class:primary={!skill.installed && !store.installingSkills.has(skill.fullName)}
-                    class:is-saving={store.installingSkills.has(skill.fullName)}
-                    onclick={() => store.installSkill(skill.fullName)}
-                    disabled={skill.installed || store.installingSkills.has(skill.fullName)}
+                    class:primary={(!skill.installed || skill.updateAvailable) && !store.installingSkills.has(skill.fullName) && !store.skillUpdatingIds.has(skill.fullName)}
+                    class:is-saving={store.installingSkills.has(skill.fullName) || store.skillUpdatingIds.has(skill.fullName)}
+                    onclick={() => skill.installed ? store.updateSkill(skill.fullName) : store.installSkill(skill.fullName)}
+                    disabled={(skill.installed && !skill.updateAvailable) || store.installingSkills.has(skill.fullName) || store.skillUpdatingIds.has(skill.fullName)}
                   >
-                    {#if store.installingSkills.has(skill.fullName)}
+                    {#if store.installingSkills.has(skill.fullName) || store.skillUpdatingIds.has(skill.fullName)}
                       <Icon name="refresh" size={14} />
                       {i18n.t('settings.skillLibrary.installing')}
+                    {:else if skill.installed && skill.updateAvailable}
+                      {skill.source === 'local' ? i18n.t('settings.tools.reloadSkill') : i18n.t('settings.tools.updateSkill')}
                     {:else if skill.installed}
                       {i18n.t('settings.skillLibrary.installed')}
                     {:else}
@@ -742,43 +974,314 @@ import {
 
   .form-error { font-size: 11px; color: var(--error); margin-top: 8px; line-height: 1.5; }
 
+  .mcp-editor-title {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+  .mcp-editor-title h3 { margin: 0; }
+  .mcp-editor-title span {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--font-normal);
+  }
+  .mcp-editor {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+  .mcp-mode-switch,
+  .mcp-transport-switch {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 3px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface-2);
+  }
+  .mcp-mode-switch { width: min(280px, 100%); }
+  .mcp-mode-switch button,
+  .mcp-transport-switch button {
+    min-width: 0;
+    min-height: 30px;
+    border: 0;
+    border-radius: calc(var(--radius-md) - 2px);
+    background: transparent;
+    color: var(--foreground-muted);
+    font: inherit;
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+    cursor: pointer;
+    transition: color var(--transition-fast), background var(--transition-fast), box-shadow var(--transition-fast);
+  }
+  .mcp-mode-switch button:hover,
+  .mcp-transport-switch button:hover { color: var(--foreground); }
+  .mcp-mode-switch button.active,
+  .mcp-transport-switch button.active {
+    background: var(--surface-1);
+    color: var(--foreground);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+  }
+  .mcp-form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+  .mcp-form-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(220px, 0.85fr);
+    gap: var(--space-4);
+  }
+  .mcp-form-grid .form-field { margin-bottom: 0; }
+  .mcp-field-label {
+    display: block;
+    margin-bottom: var(--space-2);
+    color: var(--foreground);
+    font-size: var(--text-sm);
+    font-weight: var(--font-medium);
+  }
+  .mcp-form-options {
+    display: flex;
+    align-items: center;
+    gap: var(--space-5);
+    padding: 2px 0;
+  }
+  .mcp-timeout-field,
+  .mcp-enabled-field {
+    min-height: 32px;
+    box-sizing: border-box;
+  }
+  .mcp-timeout-field {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-shrink: 0;
+  }
+  .mcp-timeout-field label {
+    display: inline-block;
+    margin: 0;
+    color: var(--foreground);
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+    white-space: nowrap;
+  }
+  .mcp-input-suffix {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .mcp-input-suffix input {
+    width: 64px;
+    min-width: 0;
+    height: 28px;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-1);
+    color: var(--foreground);
+    font: inherit;
+    font-size: var(--text-xs);
+    box-sizing: border-box;
+  }
+  .mcp-input-suffix span { color: var(--foreground-muted); font-size: var(--text-xs); }
+  .mcp-enabled-field {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: var(--space-3);
+    min-width: 0;
+    padding-left: var(--space-5);
+    border-left: 1px solid var(--border);
+  }
+  .mcp-enabled-field > div {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+  .mcp-enabled-field strong { color: var(--foreground); font-size: var(--text-xs); }
+  .mcp-enabled-field span {
+    color: var(--foreground-muted);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  .mcp-form-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    padding-top: var(--space-4);
+    border-top: 1px solid var(--border);
+  }
+  .mcp-section-heading > div {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .mcp-section-heading strong { color: var(--foreground); font-size: var(--text-sm); }
+  .mcp-section-heading span { color: var(--foreground-muted); font-size: var(--text-xs); }
+  .mcp-form-section .form-field { margin-bottom: 0; }
+  .mcp-list-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .mcp-list-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+  .mcp-list-heading > span {
+    color: var(--foreground);
+    font-size: var(--text-sm);
+    font-weight: var(--font-medium);
+  }
+  .mcp-list-heading button {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-height: 26px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground-muted);
+    font: inherit;
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+  .mcp-list-heading button:hover { color: var(--foreground); background: var(--surface-2); }
+  .mcp-row-list { display: flex; flex-direction: column; gap: 6px; }
+  .mcp-value-row,
+  .mcp-key-value-row {
+    display: grid;
+    gap: 6px;
+    align-items: center;
+  }
+  .mcp-value-row { grid-template-columns: minmax(0, 1fr) 30px; }
+  .mcp-key-value-row { grid-template-columns: minmax(120px, 0.8fr) minmax(0, 1.2fr) 30px; }
+  .mcp-value-row input,
+  .mcp-key-value-row input {
+    min-width: 0;
+    width: 100%;
+    height: 32px;
+    padding: 6px 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-1);
+    color: var(--foreground);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    box-sizing: border-box;
+  }
+  .mcp-value-row input:focus,
+  .mcp-key-value-row input:focus,
+  .mcp-input-suffix input:focus {
+    outline: none;
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 15%, transparent);
+  }
+  .mcp-remove-row {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+  }
+  .mcp-remove-row:hover { color: var(--error); background: color-mix(in srgb, var(--error) 8%, transparent); }
+  .mcp-empty-row {
+    padding: 8px 10px;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+  }
+  .mcp-json-editor { margin-bottom: 0; }
+  .mcp-json-editor textarea {
+    min-height: 320px;
+    resize: vertical;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    line-height: 1.55;
+    tab-size: 2;
+  }
+  .mcp-json-help {
+    margin-top: var(--space-2);
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    line-height: 1.5;
+  }
+  .mcp-form-error {
+    margin-top: 0;
+    padding: 8px 10px;
+    border: 1px solid color-mix(in srgb, var(--error) 35%, var(--border));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--error) 7%, transparent);
+  }
+
+  @media (max-width: 640px) {
+    .mcp-form-grid { grid-template-columns: 1fr; }
+    .mcp-form-options {
+      align-items: stretch;
+      flex-direction: column;
+      gap: var(--space-2);
+    }
+    .mcp-timeout-field,
+    .mcp-enabled-field { width: 100%; }
+    .mcp-enabled-field {
+      justify-content: space-between;
+      padding: var(--space-2) 0 0;
+      border-top: 1px solid var(--border);
+      border-left: 0;
+    }
+    .mcp-enabled-field span { white-space: normal; }
+    .mcp-mode-switch { width: 100%; }
+    .mcp-key-value-row { grid-template-columns: minmax(0, 1fr) 30px; }
+    .mcp-key-value-row input:nth-child(2) { grid-column: 1 / 2; }
+    .mcp-key-value-row .mcp-remove-row { grid-column: 2; grid-row: 1 / 3; align-self: center; }
+    .mcp-json-editor textarea { min-height: 260px; }
+  }
+
   /* 仓库管理 */
   .repo-add-form { display: flex; gap: 10px; align-items: flex-end; }
   .repo-add-form .form-field { flex: 1; margin-bottom: 0; }
-  .repo-list-title { font-size: 13px; font-weight: 600; color: var(--foreground); margin-bottom: 12px; }
-  .repo-manage-list { display: flex; flex-direction: column; gap: 8px; }
+  .repo-list-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+  .repo-list-title { font-size: 13px; font-weight: 600; color: var(--foreground); }
+  .repo-manage-list { display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; }
   .repo-item {
     display: grid;
     grid-template-columns: 1fr auto;
     align-items: center;
     gap: 12px;
-    padding: 12px 16px;
-    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 0.85);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
-    border: 1px solid rgba(var(--foreground-rgb), 0.3); 
-    box-shadow: 
-      inset 0 0 0 1px rgba(255, 255, 255, 0.1),
-      0 2px 8px rgba(0,0,0,0.1); 
-    border-radius: 12px;
-    transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
+    padding: 10px 12px;
+    background: color-mix(in srgb, var(--surface-1) 94%, transparent);
+    border-bottom: 1px solid var(--border);
+    transition: background 0.15s ease;
   }
+  .repo-item:last-child { border-bottom: 0; }
   .repo-item:hover {
-    border-color: rgba(var(--primary-rgb, 0, 122, 255), 0.6);
-    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 1);
-    box-shadow: 0 8px 20px rgba(0,0,0,0.12);
+    background: rgba(var(--foreground-rgb), 0.035);
   }
   .repo-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow: hidden; }
   .repo-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); }
   .repo-url { font-size: var(--text-xs); color: var(--foreground-muted); font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .repo-meta { font-size: var(--text-xs); color: var(--foreground-muted); }
+  .repo-meta { display: flex; gap: 10px; margin-top: 5px; font-size: var(--text-xs); color: var(--foreground-muted); }
+  .repo-ready { color: var(--success); }
   .repo-actions { display: flex; gap: var(--space-2); flex-shrink: 0; }
 
   /* Skill 库 */
   .skill-library-search { margin-bottom: 24px; flex-shrink: 0; }
   .skill-library-search-row {
     display: grid;
-    grid-template-columns: 1fr auto;
+    grid-template-columns: minmax(0, 1fr) auto auto;
     gap: 12px;
     align-items: center;
   }
@@ -819,23 +1322,17 @@ import {
     grid-template-columns: auto 1fr auto;
     align-items: flex-start;
     gap: 12px;
-    padding: 12px 16px;
-    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 0.85);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
-    border: 1px solid rgba(var(--foreground-rgb), 0.3); 
-    box-shadow: 
-      inset 0 0 0 1px rgba(255, 255, 255, 0.1),
-      0 2px 8px rgba(0,0,0,0.1); 
-    border-radius: 12px;
-    margin-bottom: 8px;
-    transition: all 0.2s cubic-bezier(0.25, 0.8, 0.25, 1);
+    padding: 10px 12px;
+    background: color-mix(in srgb, var(--surface-1) 94%, transparent);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 6px;
+    transition: background 0.15s ease, border-color 0.15s ease;
   }
   .skill-library-item:last-child { margin-bottom: 0; }
   .skill-library-item:hover {
-    border-color: rgba(var(--primary-rgb, 0, 122, 255), 0.6);
-    background: rgba(var(--vscode-editor-background-rgb, 255, 255, 255), 1);
-    box-shadow: 0 8px 20px rgba(0,0,0,0.12);
+    border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+    background: rgba(var(--foreground-rgb), 0.03);
   }
   .skill-library-icon {
     width: 36px;
@@ -849,7 +1346,10 @@ import {
     flex-shrink: 0;
   }
   .skill-library-info { min-width: 0; overflow: hidden; }
+  .skill-library-name-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .skill-library-name { font-size: var(--text-sm); font-weight: var(--font-medium); color: var(--foreground); }
+  .skill-library-status { padding: 1px 6px; border-radius: 4px; background: rgba(var(--success-rgb, 52, 199, 89), 0.1); color: var(--success); font-size: 10px; white-space: nowrap; }
+  .skill-library-status.is-update { background: rgba(var(--warning-rgb, 255, 149, 0), 0.11); color: var(--warning); }
   .skill-library-desc { font-size: var(--text-xs); color: var(--foreground-muted); margin-top: 4px; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; cursor: help; line-height: 1.5; }
   .skill-library-meta { display: flex; gap: var(--space-3); margin-top: var(--space-2); flex-wrap: wrap; }
   .skill-library-meta-item { font-size: var(--text-xs); color: var(--foreground-muted); }
@@ -860,6 +1360,19 @@ import {
       align-items: stretch;
       justify-content: stretch;
       background: var(--overlay-heavy);
+    }
+
+    .skill-library-search-row {
+      grid-template-columns: 1fr 1fr;
+    }
+
+    .skill-library-search-row input {
+      grid-column: 1 / -1;
+    }
+
+    .repo-add-form {
+      align-items: stretch;
+      flex-direction: column;
     }
 
   }

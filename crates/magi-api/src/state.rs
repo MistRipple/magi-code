@@ -9,7 +9,6 @@ use crate::dto::{
 use crate::errors::ApiError;
 use crate::mcp_config::{
     build_mcp_config_from_entry, mcp_server_entry_enabled, normalize_mcp_server_snapshot_entry,
-    redact_mcp_server_public_entry,
 };
 use crate::routes::settings::{
     builtin_role_templates, load_registry_engines, registered_role_template_ids,
@@ -2110,19 +2109,7 @@ fn array_section(snapshot: &HashMap<String, serde_json::Value>, key: &str) -> se
 }
 
 fn public_mcp_servers_section(snapshot: &HashMap<String, serde_json::Value>) -> serde_json::Value {
-    snapshot
-        .get("mcpServers")
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            serde_json::Value::Array(
-                items
-                    .iter()
-                    .cloned()
-                    .map(redact_mcp_server_public_entry)
-                    .collect(),
-            )
-        })
-        .unwrap_or_else(|| serde_json::json!([]))
+    array_section(snapshot, "mcpServers")
 }
 
 fn runtime_settings_from_snapshot(

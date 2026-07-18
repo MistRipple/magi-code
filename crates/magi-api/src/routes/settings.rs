@@ -2855,7 +2855,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_bootstrap_redacts_mcp_env_values() {
+    async fn settings_bootstrap_exposes_mcp_env_values_for_editing() {
         let state = test_state();
         state
             .settings_store
@@ -2884,7 +2884,7 @@ mod tests {
 
         assert_eq!(
             bootstrap["mcpServers"][0]["env"]["TOKEN"],
-            json!(crate::mcp_config::REDACTED_MCP_ENV_VALUE)
+            json!("secret-token")
         );
         for key in ["workspaceId", "workspacePath", "sessionId"] {
             assert!(

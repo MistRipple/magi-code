@@ -1,5 +1,32 @@
 export type McpTransport = 'stdio' | 'streamable-http';
 
+export type McpKeyValueRow = {
+  key: string;
+  value: string;
+};
+
+export type McpFormDraft = {
+  name: string;
+  type: McpTransport;
+  enabled: boolean;
+  command: string;
+  args: string[];
+  env: McpKeyValueRow[];
+  url: string;
+  headers: McpKeyValueRow[];
+  requestTimeoutSeconds: string;
+};
+
+export type McpFormDraftConversionError =
+  | 'missingName'
+  | 'invalidTimeout'
+  | 'emptyKey'
+  | 'duplicateKey';
+
+export type McpFormDraftConversionResult =
+  | { ok: true; name: string; config: Record<string, unknown> }
+  | { ok: false; error: McpFormDraftConversionError };
+
 export type NormalizedMcpServerDraft = {
   id: string;
   name: string;
@@ -25,6 +52,85 @@ export type McpServerDraftError =
 export type McpServerDraftResult =
   | { ok: true; server: NormalizedMcpServerDraft }
   | { ok: false; error: McpServerDraftError };
+
+export function createMcpFormDraft(
+  name = 'mcp-server',
+  rawConfig: Record<string, unknown> = {},
+): McpFormDraft {
+  const type = resolveMcpTransport(
+    stringValue(rawConfig.type).toLowerCase(),
+    stringValue(rawConfig.url),
+  ) ?? 'stdio';
+  const timeout = rawConfig.requestTimeoutMs;
+
+  return {
+    name,
+    type,
+    enabled: rawConfig.enabled !== false,
+    command: stringValue(rawConfig.command),
+    args: Array.isArray(rawConfig.args)
+      ? rawConfig.args.filter((value): value is string => typeof value === 'string')
+      : [],
+    env: recordToRows(rawConfig.env),
+    url: stringValue(rawConfig.url),
+    headers: recordToRows(rawConfig.headers),
+    requestTimeoutSeconds: typeof timeout === 'number' && Number.isFinite(timeout)
+      ? String(timeout / 1000)
+      : '',
+  };
+}
+
+export function convertMcpFormDraft(
+  draft: McpFormDraft,
+): McpFormDraftConversionResult {
+  const name = draft.name.trim();
+  if (!name) {
+    return { ok: false, error: 'missingName' };
+  }
+
+  const timeoutText = draft.requestTimeoutSeconds.trim();
+  let requestTimeoutMs: number | undefined;
+  if (timeoutText) {
+    const timeoutSeconds = Number(timeoutText);
+    if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 300) {
+      return { ok: false, error: 'invalidTimeout' };
+    }
+    requestTimeoutMs = Math.round(timeoutSeconds * 1000);
+  }
+
+  const rows = draft.type === 'streamable-http' ? draft.headers : draft.env;
+  const rowResult = rowsToRecord(rows);
+  if (!rowResult.ok) {
+    return rowResult;
+  }
+
+  if (draft.type === 'streamable-http') {
+    return {
+      ok: true,
+      name,
+      config: {
+        type: 'streamable-http',
+        url: draft.url.trim(),
+        headers: rowResult.value,
+        enabled: draft.enabled,
+        ...(requestTimeoutMs === undefined ? {} : { requestTimeoutMs }),
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    name,
+    config: {
+      type: 'stdio',
+      command: draft.command.trim(),
+      args: [...draft.args],
+      env: rowResult.value,
+      enabled: draft.enabled,
+      ...(requestTimeoutMs === undefined ? {} : { requestTimeoutMs }),
+    },
+  };
+}
 
 export function normalizeMcpServerDraft(
   name: string,
@@ -107,6 +213,33 @@ function resolveMcpTransport(rawType: string, url: string): McpTransport | null 
 
 function stringValue(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function recordToRows(value: unknown): McpKeyValueRow[] {
+  if (!isStringRecord(value)) {
+    return [];
+  }
+  return Object.entries(value).map(([key, rowValue]) => ({ key, value: rowValue }));
+}
+
+function rowsToRecord(
+  rows: McpKeyValueRow[],
+): { ok: true; value: Record<string, string> } | { ok: false; error: 'emptyKey' | 'duplicateKey' } {
+  const result: Record<string, string> = {};
+  for (const row of rows) {
+    const key = row.key.trim();
+    if (!key && !row.value) {
+      continue;
+    }
+    if (!key) {
+      return { ok: false, error: 'emptyKey' };
+    }
+    if (Object.prototype.hasOwnProperty.call(result, key)) {
+      return { ok: false, error: 'duplicateKey' };
+    }
+    result[key] = row.value;
+  }
+  return { ok: true, value: result };
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {

@@ -14,9 +14,29 @@ const settingsPanelSource = await readFile(
   new URL('../src/components/SettingsPanel.svelte', import.meta.url),
   'utf8',
 );
+const settingsToolsTabSource = await readFile(
+  new URL('../src/components/SettingsToolsTab.svelte', import.meta.url),
+  'utf8',
+);
 const usageAggregationSource = await readFile(
   new URL('../src/lib/usage-stats-aggregation.ts', import.meta.url),
   'utf8',
+);
+
+assert.match(
+  settingsStoreSource,
+  /async function toggleSkill\(skillId: string, enabled: boolean\)[\s\S]*?await toggleAgentSkill\(skillId, enabled\)[\s\S]*?await hydrateSkillInventory\(\)/,
+  'Skill 启停必须写入后端并重新读取权威 Skill 清单',
+);
+assert.match(
+  settingsToolsTabSource,
+  /checked=\{skill\.enabled !== false\}[\s\S]*?onchange=\{\(enabled\) => toggleSkill\(skill\.skillId, enabled\)\}/,
+  '已安装的 instruction Skill 必须提供受控启停开关',
+);
+assert.match(
+  settingsToolsTabSource,
+  /skill\.lastCheckedAt[\s\S]*?settings\.tools\.skillCheckedAt[\s\S]*?: i18n\.t\('settings\.tools\.skillNeverChecked'\)/,
+  'Skill 从未检查时必须直接显示“尚未检查”，不能拼接成“检查于 尚未检查”',
 );
 
 assert.match(

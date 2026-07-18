@@ -424,6 +424,10 @@ export class RustDaemonClient {
     return this.postJson<SkillsConfigSaveResponseDto>('/api/settings/skills/config/save', config);
   }
 
+  public async toggleSkill(skill: unknown): Promise<SkillUpdateResponseDto> {
+    return this.postJson<SkillUpdateResponseDto>('/api/settings/skills/toggle', skill);
+  }
+
   public async addCustomTool(tool: unknown): Promise<AddedResponseDto> {
     return this.postJson<AddedResponseDto>('/api/settings/skills/custom-tool/add', tool);
   }
@@ -434,6 +438,14 @@ export class RustDaemonClient {
 
   public async updateAllSkills(): Promise<SkillUpdateResponseDto> {
     return this.postJson<SkillUpdateResponseDto>('/api/settings/skills/update-all', {});
+  }
+
+  public async checkSkillUpdates(): Promise<SkillUpdateResponseDto> {
+    return this.postJson<SkillUpdateResponseDto>('/api/settings/skills/check-updates', {});
+  }
+
+  public async rollbackSkill(skill: unknown): Promise<SkillUpdateResponseDto> {
+    return this.postJson<SkillUpdateResponseDto>('/api/settings/skills/rollback', skill);
   }
 
   // ─── Changes / Files / Tunnel ─────────────────────────────────────
