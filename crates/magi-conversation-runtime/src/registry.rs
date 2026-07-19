@@ -1,10 +1,11 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use magi_core::{SessionId, TaskId};
 
 use crate::conversation::Conversation;
-use crate::mailbox::UserSignal;
+use crate::mailbox::{RuntimeSignal, UserSignal};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum ConversationKey {
@@ -22,6 +23,8 @@ enum ConversationKey {
 pub struct ConversationRegistry {
     inner: Mutex<HashMap<ConversationKey, Arc<Mutex<Conversation>>>>,
     session_turn_inputs: Mutex<HashMap<SessionId, SessionTurnInputState>>,
+    task_signal_channels: Mutex<HashMap<(SessionId, TaskId), VecDeque<RuntimeSignal>>>,
+    task_signal_ready: Condvar,
 }
 
 #[derive(Debug)]
@@ -66,6 +69,18 @@ impl std::error::Error for SessionTurnInputError {}
 pub enum SessionTurnInputBoundary {
     Pending(Vec<UserSignal>),
     Closed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskSignalBoundary {
+    Pending(Vec<RuntimeSignal>),
+    Closed,
+}
+
+#[derive(Debug)]
+pub enum TaskSignalCommitError<E> {
+    ChannelClosed,
+    Commit(E),
 }
 
 #[derive(Debug)]
@@ -260,6 +275,129 @@ impl ConversationRegistry {
         }
     }
 
+    /// 注册任务级运行时信号通道。agent_spawn 可在子任务 runner 启动前调用，因此
+    /// 已排队信号会保留；run_conversation_loop 再次注册不会清空队列。
+    pub fn open_task_signal_channel(&self, session_id: &SessionId, task_id: &TaskId) {
+        self.task_signal_channels
+            .lock()
+            .expect("task signal channel mutex poisoned")
+            .entry((session_id.clone(), task_id.clone()))
+            .or_default();
+    }
+
+    /// 向已注册且尚未关闭的任务通道投递运行时信号。该入口不获取 Conversation
+    /// mutex，因此可以在目标代理正执行模型或工具轮次时立即送达。
+    pub fn enqueue_task_signal(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        signal: RuntimeSignal,
+    ) -> Result<(), String> {
+        self.enqueue_task_signal_with(session_id, task_id, || {
+            Ok::<_, std::convert::Infallible>(((), signal))
+        })
+        .map_err(|error| match error {
+            TaskSignalCommitError::ChannelClosed => {
+                format!("任务 {task_id} 的运行时信号通道未打开或已关闭")
+            }
+            TaskSignalCommitError::Commit(never) => match never {},
+        })
+    }
+
+    /// 在持有目标任务信号边界锁时提交上下文包 revision，再把与该 revision 对应的
+    /// 信号加入 FIFO，保证持久化和运行中投递不会出现一边成功、一边失败。
+    pub fn enqueue_task_signal_with<T, E, F>(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        commit: F,
+    ) -> Result<T, TaskSignalCommitError<E>>
+    where
+        F: FnOnce() -> Result<(T, RuntimeSignal), E>,
+    {
+        let mut channels = self
+            .task_signal_channels
+            .lock()
+            .expect("task signal channel mutex poisoned");
+        let channel = channels
+            .get_mut(&(session_id.clone(), task_id.clone()))
+            .ok_or(TaskSignalCommitError::ChannelClosed)?;
+        let (committed, signal) = commit().map_err(TaskSignalCommitError::Commit)?;
+        channel.push_back(signal);
+        self.task_signal_ready.notify_all();
+        Ok(committed)
+    }
+
+    pub fn drain_task_signals(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> Vec<RuntimeSignal> {
+        self.task_signal_channels
+            .lock()
+            .expect("task signal channel mutex poisoned")
+            .get_mut(&(session_id.clone(), task_id.clone()))
+            .map(|channel| channel.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn wait_for_task_signals(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        timeout: Duration,
+    ) -> Vec<RuntimeSignal> {
+        let key = (session_id.clone(), task_id.clone());
+        let channels = self
+            .task_signal_channels
+            .lock()
+            .expect("task signal channel mutex poisoned");
+        if !channels.contains_key(&key) {
+            return Vec::new();
+        }
+        let (mut channels, _) = self
+            .task_signal_ready
+            .wait_timeout_while(channels, timeout, |channels| {
+                channels.get(&key).is_some_and(VecDeque::is_empty)
+            })
+            .expect("task signal channel wait poisoned");
+        channels
+            .get_mut(&key)
+            .map(|channel| channel.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// 模型准备结束任务 Turn 时原子读取待处理信号；没有信号时关闭通道，保证迟到
+    /// agent_send/context_request 明确失败，不会写入已完成任务。
+    pub fn take_task_signals_or_close(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> TaskSignalBoundary {
+        let mut channels = self
+            .task_signal_channels
+            .lock()
+            .expect("task signal channel mutex poisoned");
+        let key = (session_id.clone(), task_id.clone());
+        let Some(channel) = channels.get_mut(&key) else {
+            return TaskSignalBoundary::Closed;
+        };
+        if channel.is_empty() {
+            channels.remove(&key);
+            TaskSignalBoundary::Closed
+        } else {
+            TaskSignalBoundary::Pending(channel.drain(..).collect())
+        }
+    }
+
+    pub fn close_task_signal_channel(&self, session_id: &SessionId, task_id: &TaskId) -> bool {
+        self.task_signal_channels
+            .lock()
+            .expect("task signal channel mutex poisoned")
+            .remove(&(session_id.clone(), task_id.clone()))
+            .is_some()
+    }
+
     /// 删除 session 主对话及其全部 task 对话。会话删除后这些内存态不能继续存活，
     /// 否则 Mailbox 与 Turn 状态会成为无法再访问的孤儿。
     pub fn remove_session(&self, session_id: &SessionId) -> usize {
@@ -280,6 +418,10 @@ impl ConversationRegistry {
             .lock()
             .expect("session turn input mutex poisoned")
             .remove(session_id);
+        self.task_signal_channels
+            .lock()
+            .expect("task signal channel mutex poisoned")
+            .retain(|(candidate, _), _| candidate != session_id);
         removed
     }
 }
@@ -430,6 +572,51 @@ mod tests {
             ),
             Err(SessionTurnInputError::NoActiveTurn),
             "completion boundary must reject late steer instead of leaking it into the next turn"
+        );
+    }
+
+    #[test]
+    fn task_signal_channel_accepts_runtime_input_without_conversation_lock() {
+        let registry = ConversationRegistry::new();
+        let session_id = SessionId::new("session-task-signal");
+        let task_id = TaskId::new("task-signal");
+        registry.open_task_signal_channel(&session_id, &task_id);
+        registry
+            .enqueue_task_signal(
+                &session_id,
+                &task_id,
+                RuntimeSignal {
+                    author: crate::MailboxAuthor::Parent("task-parent".to_string()),
+                    kind: crate::MailboxKind::Message,
+                    trigger_turn: true,
+                    payload: serde_json::json!({"message": "补充事实"}),
+                    enqueued_at: UtcMillis(10),
+                },
+            )
+            .expect("打开的任务通道应接受信号");
+
+        let drained = registry.drain_task_signals(&session_id, &task_id);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].payload["message"], "补充事实");
+        assert_eq!(
+            registry.take_task_signals_or_close(&session_id, &task_id),
+            TaskSignalBoundary::Closed
+        );
+        assert!(
+            registry
+                .enqueue_task_signal(
+                    &session_id,
+                    &task_id,
+                    RuntimeSignal {
+                        author: crate::MailboxAuthor::System,
+                        kind: crate::MailboxKind::Message,
+                        trigger_turn: true,
+                        payload: serde_json::json!({}),
+                        enqueued_at: UtcMillis(11),
+                    },
+                )
+                .is_err(),
+            "任务结束边界后必须拒绝迟到信号"
         );
     }
 }

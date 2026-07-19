@@ -94,6 +94,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertTerminalLateUpsertIsIgnored(reducer, projection);
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
   assertSupersededTurnDisappearsAndRejectsLateEvents(reducer, projection);
+  assertModelContextFallbackProjectsAsWarningNotice(reducer, projection);
   assertFailedAssistantTextUsesPlainMessageShell(reducer, projection);
   assertSplitToolStartedAndResultCollapseIntoOneCard(reducer, projection);
   assertCancelledToolShowsTurnResponseDuration(reducer, projection);
@@ -122,6 +123,38 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertBootstrapSeedsCanonicalEventWatermark(reducer);
   assertUnknownCanonicalBlockHasNoTextFallback(blockRegistry);
   assertMarkdownUrlSanitizerKeepsOnlyValidFileLinks(markdownUrl);
+}
+
+function assertModelContextFallbackProjectsAsWarningNotice(reducer, projection) {
+  const c = baseCase(
+    'model-context-fallback-notice',
+    'session-golden-model-context-fallback',
+    'turn-golden-model-context-fallback',
+    11_700,
+  );
+  const notice = item(c, 2, 'model-context-fallback', 'system_notice', 'completed', {
+    content: '目标模型无法容纳当前对话，已切换回原模型并继续处理本轮请求。',
+    metadata: {
+      noticeKind: 'model_context_fallback',
+      noticeType: 'warning',
+    },
+  });
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'completed', [user(c, 1, '继续处理。'), notice]),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  const artifact = findArtifactByTurnItemId(projectionValue, 'model-context-fallback');
+  assert.ok(artifact, 'model context fallback notice should remain visible in the timeline');
+  assert.equal(
+    artifact.message.type,
+    'system-notice',
+    'model context fallback must use the lightweight system notice presentation',
+  );
+  assert.equal(
+    artifact.message.noticeType,
+    'warning',
+    'model context fallback must preserve its warning severity',
+  );
 }
 
 function assertSupersededTurnDisappearsAndRejectsLateEvents(reducer, projection) {

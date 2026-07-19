@@ -62,6 +62,7 @@ export interface SettingsBootstrapPayload {
   effectiveOrchestratorConfig?: Record<string, unknown>;
   auxiliaryConfig: Record<string, unknown>;
   imageGenerationConfig: Record<string, unknown>;
+  modelContextWindows: Record<string, number>;
   userRulesConfig: Record<string, unknown>;
   skillsConfig: Record<string, unknown>;
   safeguardConfig: Record<string, unknown>;

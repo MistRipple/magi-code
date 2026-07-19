@@ -200,6 +200,9 @@ fn event_matches_workspace(
     let Some(requested_workspace_id) = requested_workspace_id else {
         return true;
     };
+    if event_is_user_global(event) {
+        return true;
+    }
     if event.workspace_id.as_ref() == Some(requested_workspace_id) {
         return true;
     }
@@ -216,6 +219,10 @@ fn event_matches_workspace(
         .is_some_and(|session| {
             session.workspace_id.as_deref() == Some(requested_workspace_id.as_str())
         })
+}
+
+fn event_is_user_global(event: &EventEnvelope) -> bool {
+    matches!(event.event_type.as_str(), "model.context_window.updated")
 }
 
 fn event_payload_workspace_matches(
@@ -403,6 +410,29 @@ mod tests {
         );
 
         assert!(event_matches_workspace(&state, &event, None));
+    }
+
+    #[test]
+    fn event_workspace_filter_broadcasts_user_global_model_context_updates() {
+        let state = test_state();
+        let event = EventEnvelope::domain(
+            EventId::new("event-global-model-context-window"),
+            "model.context_window.updated",
+            json!({
+                "model": "gpt-5.6",
+                "contextWindowTokens": 1_000_000,
+            }),
+        );
+
+        assert!(event_matches_workspace(
+            &state,
+            &event,
+            Some(&workspace_id("workspace-a"))
+        ));
+        assert!(event_matches_session(
+            &event,
+            Some(&SessionId::new("session-a"))
+        ));
     }
 
     #[test]

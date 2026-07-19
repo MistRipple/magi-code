@@ -146,6 +146,12 @@ impl NormalizedModelConfig {
             .ok_or_else(|| "模型配置缺少 model".to_string())
     }
 
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        let model = model.into();
+        self.model = (!model.trim().is_empty()).then(|| model.trim().to_string());
+        self
+    }
+
     pub fn inferred_protocol(&self) -> HttpModelBridgeProtocol {
         self.inferred_protocol_for_model(self.model.as_deref())
     }

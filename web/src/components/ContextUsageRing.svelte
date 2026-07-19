@@ -6,8 +6,10 @@
     resolveRingView,
     type ContextRingTone,
   } from '../lib/context-usage-ring';
+  import Icon from './Icon.svelte';
 
   interface Props {
+    model?: string;
     usageRatio?: number | null;
     tokenUsed?: number | null;
     remainingTokens?: number | null;
@@ -17,9 +19,11 @@
     originalTokenEstimate?: number | null;
     compactedTokenEstimate?: number | null;
     measurement?: 'estimated' | 'authoritative' | null;
+    onSaveContextWindow?: (contextWindowTokens: number) => Promise<void> | void;
   }
 
   let {
+    model = '',
     usageRatio = null,
     tokenUsed = null,
     remainingTokens = null,
@@ -29,6 +33,7 @@
     originalTokenEstimate = null,
     compactedTokenEstimate = null,
     measurement = null,
+    onSaveContextWindow,
   }: Props = $props();
 
   // 上下文窗口占用率圆环：只负责统计详情，不承载模型切换行为。
@@ -51,6 +56,53 @@
 
   let rootEl = $state<HTMLSpanElement | null>(null);
   let pinned = $state(false);
+  let editing = $state(false);
+  let draftWindowValue = $state('');
+  let draftWindowUnit = $state<'K' | 'M'>('K');
+  let saving = $state(false);
+  let saveError = $state('');
+
+  function beginEditing() {
+    const tokens = tokenLimit ?? 256_000;
+    if (tokens >= 1_000_000 && tokens % 1_000_000 === 0) {
+      draftWindowValue = String(tokens / 1_000_000);
+      draftWindowUnit = 'M';
+    } else {
+      draftWindowValue = String(tokens / 1_000);
+      draftWindowUnit = 'K';
+    }
+    saveError = '';
+    editing = true;
+  }
+
+  function cancelEditing() {
+    editing = false;
+    saveError = '';
+  }
+
+  async function saveContextWindow() {
+    if (!onSaveContextWindow || saving) return;
+    const numericValue = Number(draftWindowValue);
+    const multiplier = draftWindowUnit === 'M' ? 1_000_000 : 1_000;
+    const tokens = Math.round(numericValue * multiplier);
+    if (!Number.isFinite(tokens) || tokens < 16_000 || tokens > 10_000_000) {
+      saveError = i18n.t('input.contextRing.invalidWindow');
+      return;
+    }
+    saving = true;
+    saveError = '';
+    try {
+      await onSaveContextWindow(tokens);
+      editing = false;
+    } catch (error) {
+      console.warn('[ContextUsageRing] 保存模型上下文窗口失败:', error);
+      saveError = error instanceof Error && error.message.trim()
+        ? error.message
+        : i18n.t('input.contextRing.saveFailed');
+    } finally {
+      saving = false;
+    }
+  }
 
   function toggleDetails(event: MouseEvent) {
     event.stopPropagation();
@@ -59,7 +111,11 @@
 
   function handleKeydown(event: KeyboardEvent) {
     if (event.key === 'Escape') {
-      pinned = false;
+      if (editing) {
+        cancelEditing();
+      } else {
+        pinned = false;
+      }
     }
   }
 
@@ -122,6 +178,11 @@
       <span>{i18n.t('input.contextRing.label')}</span>
       <strong>{view.labelText}</strong>
     </div>
+    {#if model}
+      <div class="context-popover-model" title={model}>
+        {i18n.t('input.contextRing.model', { model })}
+      </div>
+    {/if}
     {#if view.hasData}
       <div class="context-popover-list">
         {#each detailItems as item (item.key)}
@@ -130,6 +191,60 @@
       </div>
     {:else}
       <div class="context-popover-empty">{i18n.t('input.contextRing.empty')}</div>
+    {/if}
+    {#if onSaveContextWindow && model}
+      <div class="context-window-editor">
+        {#if editing}
+          <div class="context-window-input-row">
+            <input
+              type="number"
+              min={draftWindowUnit === 'M' ? 0.016 : 16}
+              max={draftWindowUnit === 'M' ? 10 : 10000}
+              step={draftWindowUnit === 'M' ? 0.1 : 1}
+              bind:value={draftWindowValue}
+              disabled={saving}
+              aria-label={i18n.t('input.contextRing.edit')}
+              onkeydown={(event) => {
+                if (event.key === 'Enter') void saveContextWindow();
+              }}
+            />
+            <select
+              bind:value={draftWindowUnit}
+              disabled={saving}
+              aria-label={i18n.t('input.contextRing.windowUnit')}
+            >
+              <option value="K">K</option>
+              <option value="M">M</option>
+            </select>
+            <button
+              type="button"
+              class="context-window-icon-button"
+              disabled={saving}
+              title={i18n.t('input.contextRing.save')}
+              aria-label={i18n.t('input.contextRing.save')}
+              onclick={() => void saveContextWindow()}
+            ><Icon name={saving ? 'loader' : 'check'} size={13} class={saving ? 'spinning' : ''} /></button>
+            <button
+              type="button"
+              class="context-window-icon-button"
+              disabled={saving}
+              title={i18n.t('input.contextRing.cancel')}
+              aria-label={i18n.t('input.contextRing.cancel')}
+              onclick={cancelEditing}
+            ><Icon name="x" size={13} /></button>
+          </div>
+          {#if saveError}<span class="context-window-error">{saveError}</span>{/if}
+        {:else}
+          <button
+            type="button"
+            class="context-window-edit-button"
+            onclick={beginEditing}
+          >
+            <Icon name="edit" size={12} />
+            <span>{i18n.t('input.contextRing.edit')}</span>
+          </button>
+        {/if}
+      </div>
     {/if}
   </div>
 </span>
@@ -210,7 +325,7 @@
     flex-direction: column;
     gap: 8px;
     width: max-content;
-    max-width: min(220px, calc(100vw - 24px));
+    max-width: min(260px, calc(100vw - 24px));
     padding: 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
@@ -260,6 +375,98 @@
 
   .context-popover-empty {
     color: var(--foreground-muted);
+  }
+
+  .context-popover-model {
+    max-width: 238px;
+    overflow: hidden;
+    color: var(--foreground-muted);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .context-window-editor {
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
+
+  .context-window-edit-button,
+  .context-window-icon-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    background: transparent;
+    color: var(--foreground-muted);
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .context-window-edit-button {
+    gap: 5px;
+    padding: 2px 0;
+  }
+
+  .context-window-edit-button:hover,
+  .context-window-icon-button:hover:not(:disabled) {
+    color: var(--foreground);
+  }
+
+  .context-window-input-row {
+    display: grid;
+    grid-template-columns: minmax(72px, 1fr) 44px 24px 24px;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .context-window-input-row input,
+  .context-window-input-row select {
+    min-width: 0;
+    height: 28px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-1);
+    color: var(--foreground);
+    font: inherit;
+  }
+
+  .context-window-input-row input {
+    padding: 0 7px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .context-window-input-row select {
+    padding: 0 4px;
+  }
+
+  .context-window-icon-button {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border-radius: var(--radius-sm);
+  }
+
+  .context-window-icon-button:hover:not(:disabled) {
+    background: var(--surface-hover);
+  }
+
+  .context-window-icon-button:disabled {
+    cursor: default;
+    opacity: 0.55;
+  }
+
+  .context-window-error {
+    display: block;
+    margin-top: 5px;
+    color: var(--error);
+  }
+
+  :global(.spinning) {
+    animation: context-window-spin 0.9s linear infinite;
+  }
+
+  @keyframes context-window-spin {
+    to { transform: rotate(360deg); }
   }
 
   .tone-notice .ring-fill { stroke: var(--warning, #d6a700); }

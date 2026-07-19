@@ -20,9 +20,13 @@ pub(crate) fn is_orchestration_builtin_tool(tool: BuiltinToolName) -> bool {
     matches!(
         tool,
         BuiltinToolName::AgentSpawn
+            | BuiltinToolName::AgentSend
             | BuiltinToolName::UpdatePlan
             | BuiltinToolName::MemoryWrite
             | BuiltinToolName::AgentWait
+            | BuiltinToolName::ContextSearch
+            | BuiltinToolName::ContextRead
+            | BuiltinToolName::ContextRequest
     )
 }
 
@@ -82,6 +86,14 @@ pub(crate) fn task_can_see_builtin_tool(
     }
     if matches!(tool, BuiltinToolName::UpdatePlan) && task.is_none() {
         return true;
+    }
+    if matches!(
+        tool,
+        BuiltinToolName::ContextSearch
+            | BuiltinToolName::ContextRead
+            | BuiltinToolName::ContextRequest
+    ) {
+        return task.is_some() && !task_is_coordinator(task, registry);
     }
     if is_orchestration_builtin_tool(tool) {
         return task_is_coordinator(task, registry);

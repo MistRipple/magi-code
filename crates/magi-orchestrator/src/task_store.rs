@@ -1,6 +1,7 @@
 use magi_core::{
-    AccessProfile, AgentRunProjection, DomainError, DomainResult, LeaseId, MissionId,
-    ProgressSummary, Task, TaskId, TaskKind, TaskPolicy, TaskStatus, TaskTier, UtcMillis, WorkerId,
+    AccessProfile, AgentContextAccessRecord, AgentContextPackage, AgentContextSupplement,
+    AgentRunProjection, DomainError, DomainResult, LeaseId, MissionId, ProgressSummary, Task,
+    TaskId, TaskKind, TaskPolicy, TaskRuntimePayload, TaskStatus, TaskTier, UtcMillis, WorkerId,
 };
 use magi_worker_runtime::WorkerRuntimeDurableSnapshot;
 use serde::{Deserialize, Serialize};
@@ -176,6 +177,12 @@ impl TaskStore {
             .status_change_version
             .lock()
             .expect("status_change_version lock poisoned")
+    }
+
+    /// 唤醒等待任务运行态变化的协调器。用于非状态字段但会改变编排决策的事件，
+    /// 例如子代理发起上下文请求。
+    pub fn notify_runtime_change(&self) {
+        self.notify_status_change();
     }
 
     pub fn wait_for_status_change_since(&self, observed_version: u64, timeout: Duration) -> u64 {
@@ -360,6 +367,79 @@ impl TaskStore {
         task.input_refs.push(input_ref);
         task.updated_at = UtcMillis::now();
         Ok(())
+    }
+
+    /// 为子代理写入唯一的结构化上下文包。该操作覆盖旧包但保留已有访问审计，适用于
+    /// 创建阶段的原子注册与显式重建；普通运行期补充必须使用
+    /// `append_agent_context_supplement` 递增 revision。
+    pub fn set_agent_context_package(
+        &self,
+        task_id: &TaskId,
+        package: AgentContextPackage,
+    ) -> DomainResult<()> {
+        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        let accesses = match &mut task.runtime_payload {
+            TaskRuntimePayload::AgentContext { accesses, .. } => std::mem::take(accesses),
+            TaskRuntimePayload::None => Vec::new(),
+        };
+        task.runtime_payload = TaskRuntimePayload::AgentContext {
+            package: Box::new(package),
+            accesses,
+        };
+        task.updated_at = UtcMillis::now();
+        drop(tasks);
+        self.notify_status_change();
+        self.fire_checkpoint();
+        Ok(())
+    }
+
+    pub fn append_agent_context_access(
+        &self,
+        task_id: &TaskId,
+        record: AgentContextAccessRecord,
+    ) -> DomainResult<()> {
+        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        let TaskRuntimePayload::AgentContext { accesses, .. } = &mut task.runtime_payload else {
+            return Err(DomainError::InvalidState {
+                message: format!("任务 {task_id} 没有 agent context package"),
+            });
+        };
+        accesses.push(record);
+        task.updated_at = UtcMillis::now();
+        drop(tasks);
+        self.fire_checkpoint();
+        Ok(())
+    }
+
+    /// 把主线补充写回目标代理的权威上下文包并递增 revision。
+    pub fn append_agent_context_supplement(
+        &self,
+        task_id: &TaskId,
+        supplement: AgentContextSupplement,
+    ) -> DomainResult<AgentContextPackage> {
+        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        let TaskRuntimePayload::AgentContext { package, .. } = &mut task.runtime_payload else {
+            return Err(DomainError::InvalidState {
+                message: format!("任务 {task_id} 没有 agent context package"),
+            });
+        };
+        package.revision = package.revision.saturating_add(1);
+        package.updated_at = supplement.created_at;
+        package.supplements.push(supplement);
+        task.updated_at = package.updated_at;
+        let package = package.as_ref().clone();
+        drop(tasks);
+        self.fire_checkpoint();
+        Ok(package)
     }
 
     pub fn append_required_child(

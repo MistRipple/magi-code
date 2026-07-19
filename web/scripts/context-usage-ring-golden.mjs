@@ -59,6 +59,21 @@ assert.match(
   /\.ia-context-ring\.estimating \.ring-fill[\s\S]*?animation:\s*context-ring-estimating/,
   '运行中估算必须通过圆环动画表达，不能伪装成静态权威值',
 );
+assert.match(
+  ringComponentSource,
+  /onSaveContextWindow[\s\S]*?context-window-editor[\s\S]*?saveContextWindow/,
+  '上下文圆环详情必须承载当前模型窗口的紧凑编辑与保存流程',
+);
+assert.match(
+  inputAreaSource,
+  /modelContextWindows[\s\S]*?saveCurrentModelContextWindow[\s\S]*?onSaveContextWindow=\{saveCurrentModelContextWindow\}/,
+  '输入区必须按当前模型读取全局窗口配置并接入保存回调',
+);
+assert.match(
+  bridgeSource,
+  /eventType === 'model\.context_window\.updated'[\s\S]*?refreshSettingsBootstrapForCurrentWorkspace/,
+  '模型窗口保存事件必须触发所有打开窗口刷新设置快照',
+);
 assert.doesNotMatch(
   inputAreaSource,
   /\.ia-context-ring \.ring-label/,

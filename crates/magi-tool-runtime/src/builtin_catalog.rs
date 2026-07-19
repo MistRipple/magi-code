@@ -65,8 +65,16 @@ pub enum BuiltinToolName {
     /// 派发新的代理执行子任务。该工具只创建代理并投递初始任务消息；
     /// 后续由 agent_wait 收集代理终态结果。
     AgentSpawn,
+    /// 主线向运行中的子代理发送结构化上下文补充。
+    AgentSend,
     /// 等待一个或多个已派发代理进入终态，并把代理最终答复返回给主线。
     AgentWait,
+    /// 子代理检索当前会话与同一执行链中可读取的上下文引用。
+    ContextSearch,
+    /// 子代理按引用 ID 读取上下文正文。
+    ContextRead,
+    /// 子代理向父任务请求缺失上下文。
+    ContextRequest,
     // ── 用户可见计划（任务系统 L13）──
     /// 更新本 session 的用户可见计划。真实执行任务由 ActiveExecutionChain 负责。
     /// 由 orchestration 层拦截，不进入 ToolRegistry。
@@ -84,7 +92,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 49] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -127,7 +135,11 @@ impl BuiltinToolName {
         Self::CreateGoal,
         Self::UpdateGoal,
         Self::AgentSpawn,
+        Self::AgentSend,
         Self::AgentWait,
+        Self::ContextSearch,
+        Self::ContextRead,
+        Self::ContextRequest,
         Self::UpdatePlan,
         Self::MemoryWrite,
     ];
@@ -176,7 +188,11 @@ impl BuiltinToolName {
             Self::CreateGoal => "create_goal",
             Self::UpdateGoal => "update_goal",
             Self::AgentSpawn => "agent_spawn",
+            Self::AgentSend => "agent_send",
             Self::AgentWait => "agent_wait",
+            Self::ContextSearch => "context_search",
+            Self::ContextRead => "context_read",
+            Self::ContextRequest => "context_request",
             Self::UpdatePlan => "update_plan",
             Self::MemoryWrite => "memory_write",
         }
@@ -219,7 +235,12 @@ impl BuiltinToolName {
             | Self::GitWorktreeCreate
             | Self::GitWorktreeRemove => "git",
             Self::GetGoal | Self::CreateGoal | Self::UpdateGoal => "session_goal",
-            Self::AgentSpawn | Self::AgentWait => "agent_coordination",
+            Self::AgentSpawn
+            | Self::AgentSend
+            | Self::AgentWait
+            | Self::ContextSearch
+            | Self::ContextRead
+            | Self::ContextRequest => "agent_coordination",
             Self::UpdatePlan => "session_state",
             Self::MemoryWrite => "project_memory",
         }
@@ -269,7 +290,11 @@ impl BuiltinToolName {
             "create_goal" => Some(Self::CreateGoal),
             "update_goal" => Some(Self::UpdateGoal),
             "agent_spawn" => Some(Self::AgentSpawn),
+            "agent_send" => Some(Self::AgentSend),
             "agent_wait" => Some(Self::AgentWait),
+            "context_search" => Some(Self::ContextSearch),
+            "context_read" => Some(Self::ContextRead),
+            "context_request" => Some(Self::ContextRequest),
             "update_plan" => Some(Self::UpdatePlan),
             "memory_write" => Some(Self::MemoryWrite),
             _ => None,
@@ -296,6 +321,8 @@ impl BuiltinToolName {
                 | Self::GitWorktreeCreate
                 | Self::GitWorktreeRemove
                 | Self::AgentSpawn
+                | Self::AgentSend
+                | Self::ContextRequest
                 | Self::CreateGoal
                 | Self::UpdateGoal
                 | Self::UpdatePlan
@@ -375,6 +402,8 @@ impl BuiltinToolName {
             | Self::GitWorktreeCreate
             | Self::GitWorktreeRemove
             | Self::AgentSpawn
+            | Self::AgentSend
+            | Self::ContextRequest
             | Self::CreateGoal
             | Self::UpdateGoal
             | Self::UpdatePlan
@@ -408,7 +437,11 @@ impl BuiltinToolName {
                 | Self::ProcessKill
                 | Self::ProcessList
                 | Self::AgentSpawn
+                | Self::AgentSend
                 | Self::AgentWait
+                | Self::ContextSearch
+                | Self::ContextRead
+                | Self::ContextRequest
                 | Self::GetGoal
                 | Self::CreateGoal
                 | Self::UpdateGoal
@@ -444,7 +477,11 @@ impl BuiltinToolName {
             | Self::GetGoal
             | Self::CreateGoal
             | Self::UpdateGoal
+            | Self::AgentSend
             | Self::AgentWait
+            | Self::ContextSearch
+            | Self::ContextRead
+            | Self::ContextRequest
             | Self::UpdatePlan
             | Self::MemoryWrite => RiskLevel::Low,
             Self::FileWrite
@@ -682,7 +719,7 @@ impl BuiltinToolName {
                 "更新当前会话 Goal 的终态。模型只能把目标标记为 complete 或 blocked；pause、budget_limited、usage_limited 由用户或系统控制，不能由模型伪造。"
             }
             Self::AgentSpawn => {
-                "向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若返回 status=degraded，表示代理当前不可用，父代理必须改派其他可用角色或由主线继续完成，不能直接停止任务。\n\n\
+                "向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。必须同时提供结构化 context_package；子代理不会自动继承主对话近期记录。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若运行中需要补充上下文，使用 agent_send。\n\n\
                 # 何时用\n\
                 - 任务可拆出 1 个或多个明确边界的子工作单元，且子单元能独立完成（有清晰输入、输出、验收）\n\
                 - 需要专家视角（reviewer 做代码审查、explorer 做根因定位、tester 做验证）\n\
@@ -723,6 +760,9 @@ impl BuiltinToolName {
                 - 返回 `status=degraded` 时代表代理不可用但主线必须继续：改派其他合适角色，或由主线基于已有上下文直接推进\n\
                 - 返回 `status=failed` 时先判断是否可补救；能补救就重派或改派，只有真实阻断时才向用户说明失败"
             }
+            Self::AgentSend => {
+                "向当前执行链中自己创建且仍在运行的子代理发送补充上下文。消息与引用会写入目标代理的 AgentContextPackage，revision 原子递增，并在目标代理下一次模型轮次前送达。"
+            }
             Self::AgentWait => {
                 "等待一个或多个已派发代理进入终态，并把代理最终答复作为结构化结果返回给主线。用于收集 agent_spawn 创建的代理结果；不要用轮询式重复调用，只有当下一步依赖代理结果时才调用。\n\n\
                 # 参数\n\
@@ -732,6 +772,15 @@ impl BuiltinToolName {
                 - `results[].child_status=completed`：读取 `results[].result.final_text` 并对照 `assignment.goal` 汇总\n\
                 - `results[].child_status=failed/killed`：判断是否可改派或由主线接管，不要自动把单个代理失败当作整体失败\n\
                 - `timed_out=true`：说明至少一个代理仍未完成；可以继续做不依赖该代理的工作，或稍后再次等待"
+            }
+            Self::ContextSearch => {
+                "按需检索当前 session 的用户/助手可见消息、同一执行链任务输出与证据，以及当前 AgentContextPackage 引用。只返回引用、预览与 token 估算；需要正文时继续调用 context_read。"
+            }
+            Self::ContextRead => {
+                "读取 context_search 或 AgentContextPackage 返回的引用正文。引用必须属于当前 session、workspace 与同一 root task；单次最多读取 8 条。"
+            }
+            Self::ContextRequest => {
+                "当 AgentContextPackage 和 context_search/context_read 都不足以完成任务时，向父任务发送明确的上下文请求。父任务可通过 agent_send 回复；不要用它替代已有引用读取。"
             }
             Self::UpdatePlan => {
                 "更新当前会话的用户可见计划。计划只表达顶层执行阶段；真实主线、代理和工具执行由执行链负责。首次创建时可省略 planId、itemId，并使用 expectedRevision=0；后续更新必须沿用工具返回的 planId、revision、itemId 和 language。\n\n\
@@ -1290,11 +1339,55 @@ impl BuiltinToolName {
                         "enum": ["work_package", "action", "validation", "repair"],
                         "description": "新建子任务的类型。省略时默认 action。"
                     },
-                    "context": { "type": "string", "description": "可选的上下文摘要，传递给子 agent（单一字符串）。" },
+                    "context_package": {
+                        "type": "object",
+                        "description": "子代理启动时唯一的结构化上下文包；禁止传旧 context 字符串。",
+                        "properties": {
+                            "summary": { "type": "string", "minLength": 1, "description": "当前子任务所需的最小背景摘要，不复制主对话全文。" },
+                            "constraints": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "必须遵守的边界和禁止事项。" },
+                            "expected_output": { "type": "string", "minLength": 1, "description": "子代理最终必须交付的结果形态和验收标准。" },
+                            "references": {
+                                "type": "array",
+                                "description": "可按需读取的结构化引用；正文不在启动 prompt 中自动展开。",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": { "type": "string", "enum": ["conversation_turn", "task_output", "task_evidence", "file", "knowledge", "other"] },
+                                        "title": { "type": "string", "minLength": 1 },
+                                        "source_ref": { "type": "string", "minLength": 1 },
+                                        "preview": { "type": "string" }
+                                    },
+                                    "required": ["kind", "title", "source_ref", "preview"]
+                                }
+                            }
+                        },
+                        "required": ["summary", "constraints", "expected_output", "references"]
+                    },
                     "working_dir": { "type": "string", "description": "可选的绝对工作目录；默认沿用父任务的 workspace 根目录" },
                     "parallelism_group": { "type": "string", "description": "可选的并行组名；同一 SpawnGraph 分支下相同组名的子 agent 互斥执行" }
                 },
-                "required": ["task_name", "role", "display_name", "goal"]
+                "required": ["task_name", "role", "display_name", "goal", "context_package"]
+            }),
+            Self::AgentSend => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "minLength": 1, "description": "agent_spawn 返回的 child_task_id" },
+                    "message": { "type": "string", "minLength": 1, "description": "需要补充给目标代理的直接上下文或决策" },
+                    "references": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string", "enum": ["conversation_turn", "task_output", "task_evidence", "file", "knowledge", "other"] },
+                                "title": { "type": "string", "minLength": 1 },
+                                "source_ref": { "type": "string", "minLength": 1 },
+                                "preview": { "type": "string" }
+                            },
+                            "required": ["kind", "title", "source_ref", "preview"]
+                        }
+                    }
+                },
+                "required": ["task_id", "message"]
             }),
             Self::AgentWait => serde_json::json!({
                 "type": "object",
@@ -1310,6 +1403,29 @@ impl BuiltinToolName {
                     }
                 },
                 "required": ["task_ids"]
+            }),
+            Self::ContextSearch => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "minLength": 1, "description": "要查找的事实、决策、术语或输出" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "最大结果数，默认 8" }
+                },
+                "required": ["query"]
+            }),
+            Self::ContextRead => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "reference_ids": { "type": "array", "minItems": 1, "maxItems": 8, "items": { "type": "string", "minLength": 1 } }
+                },
+                "required": ["reference_ids"]
+            }),
+            Self::ContextRequest => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "request": { "type": "string", "minLength": 1, "description": "缺失的具体上下文以及它为何阻塞当前子任务" },
+                    "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 1800000, "description": "等待父任务回复的最长时间，默认 300000" }
+                },
+                "required": ["request"]
             }),
             Self::UpdatePlan => serde_json::json!({
                 "type": "object",

@@ -187,7 +187,9 @@ function resolveMessageType(item: CanonicalTurnItem): Message['type'] {
     return 'tool_call';
   }
   if (item.kind === 'system_notice') {
-    return isAgentTaskSidechainItem(item) || item.metadata?.noticeKind === 'context_compaction'
+    return isAgentTaskSidechainItem(item)
+      || item.metadata?.noticeKind === 'context_compaction'
+      || item.metadata?.noticeKind === 'model_context_fallback'
       ? 'system-notice'
       : 'text';
   }

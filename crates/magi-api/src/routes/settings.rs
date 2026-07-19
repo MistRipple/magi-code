@@ -8,6 +8,7 @@ use magi_bridge_client::{
     ImageGenerationRequest as BridgeImageGenerationRequest, ModelBridgeClient,
     ModelInvocationRequest,
 };
+use magi_conversation_runtime::model_context_window::set_model_context_window;
 use magi_core::{AccessProfile, EventId, SessionId, UtcMillis};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_usage_authority::{
@@ -143,8 +144,46 @@ pub(super) fn save_orchestrator_session_override_for_session(
     let next_fields = next_config
         .as_object_mut()
         .expect("session orchestrator config should be object");
+    let current_model = next_fields
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let existing_previous_model = next_fields
+        .get("previousModel")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let switch_was_pending = next_fields
+        .get("modelSwitchPending")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     for (key, value) in override_fields {
         next_fields.insert(key.clone(), value.clone());
+    }
+    let next_model = next_fields
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if current_model != next_model {
+        let verified_model = if switch_was_pending {
+            existing_previous_model
+        } else {
+            current_model
+        };
+        if let (Some(verified_model), Some(next_model)) = (verified_model, next_model) {
+            if verified_model == next_model {
+                next_fields.remove("previousModel");
+                next_fields.remove("modelSwitchPending");
+            } else {
+                next_fields.insert("previousModel".to_string(), Value::String(verified_model));
+                next_fields.insert("modelSwitchPending".to_string(), Value::Bool(true));
+            }
+        }
     }
     let reasoning_effort_is_valid = next_fields
         .get("reasoningEffort")
@@ -459,6 +498,10 @@ pub fn routes() -> Router<ApiState> {
         .route(
             "/settings/orchestrator/session/save",
             post(save_orchestrator_session_config),
+        )
+        .route(
+            "/settings/model-context-window/save",
+            post(save_model_context_window),
         )
         .route(
             "/settings/orchestrator/test",
@@ -1074,6 +1117,44 @@ async fn save_orchestrator_session_config(
         "workspaceId": scope.workspace_id.to_string(),
         "orchestratorSessionConfig": override_config,
         "effectiveOrchestratorConfig": effective_config,
+    })))
+}
+
+async fn save_model_context_window(
+    State(state): State<ApiState>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("模型名称不能为空".to_string()))?;
+    let context_window_tokens = request
+        .get("contextWindowTokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ApiError::InvalidInput("上下文窗口必须是整数".to_string()))?;
+    let entries = set_model_context_window(&state.settings_store, model, context_window_tokens)
+        .map_err(ApiError::InvalidInput)?;
+    let updated_at = UtcMillis::now();
+    let _ = state.event_bus.publish(EventEnvelope::domain(
+        EventId::new(format!(
+            "event-model-context-window-updated-{}",
+            updated_at.0
+        )),
+        "model.context_window.updated",
+        json!({
+            "model": model,
+            "contextWindowTokens": context_window_tokens,
+            "modelContextWindows": entries,
+            "updatedAt": updated_at.0,
+        }),
+    ));
+    Ok(Json(json!({
+        "saved": true,
+        "model": model,
+        "contextWindowTokens": context_window_tokens,
+        "modelContextWindows": entries,
     })))
 }
 
@@ -2163,7 +2244,11 @@ mod tests {
             "create_goal",
             "update_goal",
             "agent_spawn",
+            "agent_send",
             "agent_wait",
+            "context_search",
+            "context_read",
+            "context_request",
             "update_plan",
             "memory_write",
         ];
@@ -3308,6 +3393,80 @@ mod tests {
         assert_eq!(
             response["effectiveOrchestratorConfig"]["reasoningEffort"],
             json!("high")
+        );
+        assert_eq!(saved["previousModel"], json!("model-before"));
+        assert_eq!(saved["modelSwitchPending"], json!(true));
+    }
+
+    #[test]
+    fn pending_model_switch_keeps_last_verified_model_across_reselection() {
+        let state = test_state();
+        let session_id = SessionId::new("session-model-pending-reselection");
+        state
+            .settings_store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                json!({ "model": "verified-model", "reasoningEffort": "medium" }),
+            )
+            .unwrap();
+
+        let first = save_orchestrator_session_override_for_session(
+            &state,
+            &session_id,
+            &json!({ "model": "candidate-a" }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first["previousModel"], json!("verified-model"));
+        assert_eq!(first["modelSwitchPending"], json!(true));
+
+        let second = save_orchestrator_session_override_for_session(
+            &state,
+            &session_id,
+            &json!({ "model": "candidate-b" }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(second["previousModel"], json!("verified-model"));
+
+        let restored = save_orchestrator_session_override_for_session(
+            &state,
+            &session_id,
+            &json!({ "model": "verified-model" }),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(restored.get("previousModel").is_none());
+        assert!(restored.get("modelSwitchPending").is_none());
+    }
+
+    #[tokio::test]
+    async fn model_context_window_save_is_global_and_broadcast() {
+        let state = test_state();
+        let response = save_model_context_window(
+            State(state.clone()),
+            Json(json!({
+                "model": " GPT-5.6 ",
+                "contextWindowTokens": 1_000_000
+            })),
+        )
+        .await
+        .expect("model context window should save")
+        .0;
+
+        assert_eq!(response["modelContextWindows"]["gpt-5.6"], json!(1_000_000));
+        assert_eq!(
+            state.settings_store.get_section("modelContextWindows")["gpt-5.6"],
+            json!(1_000_000)
+        );
+        assert!(
+            state
+                .event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .any(|event| event.event_type == "model.context_window.updated")
         );
     }
 

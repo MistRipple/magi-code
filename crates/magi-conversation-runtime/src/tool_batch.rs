@@ -20,15 +20,19 @@ use magi_bridge_client::{
     tool_concurrency::{ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs},
 };
 use magi_core::{
-    AccessProfile, EventId, ExecutionResultStatus, GoalId, SessionId,
-    TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, TaskExecutorBinding, TaskId, TaskKind, TaskPolicy,
-    TaskStatus, TaskTier, ToolCallId, UtcMillis, WorkspaceId, public_task_output_refs,
+    AccessProfile, AgentContextAccessOperation, AgentContextAccessRecord, AgentContextPackage,
+    AgentContextReference, AgentContextReferenceKind, AgentContextSupplement, EventId,
+    ExecutionResultStatus, GoalId, SessionId, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT,
+    TaskExecutorBinding, TaskId, TaskKind, TaskPolicy, TaskRuntimePayload, TaskStatus, TaskTier,
+    ToolCallId, UtcMillis, WorkspaceId, estimate_text_tokens, public_task_output_refs,
     task_output_ref_is_internal_runtime_failure,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::GoalStatus;
-use magi_session_store::{ExecutionThread, SessionStore};
+use magi_session_store::{
+    ExecutionThread, SessionStore, TimelineEntryKind, timeline_entry_visible_text,
+};
 use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
 use magi_tool_runtime::{
     BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
@@ -63,8 +67,12 @@ const MIN_CREATE_GOAL_TOKEN_BUDGET: u64 = 16_000;
 static AGENT_SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
 const AGENT_SPAWN_SUMMARY_MAX_CHARS: usize = 1200;
 const AGENT_SPAWN_FINAL_TEXT_MAX_CHARS: usize = 6000;
-const AGENT_SPAWN_PARENT_CONTEXT_MAX_CHARS: usize = 600;
-const AGENT_SPAWN_INHERITED_INPUT_REF_MAX: usize = 16;
+const AGENT_CONTEXT_SUMMARY_MAX_CHARS: usize = 4_000;
+const AGENT_CONTEXT_EXPECTED_OUTPUT_MAX_CHARS: usize = 2_000;
+const AGENT_CONTEXT_CONSTRAINT_MAX_CHARS: usize = 600;
+const AGENT_CONTEXT_PREVIEW_MAX_CHARS: usize = 600;
+const AGENT_CONTEXT_REFERENCE_LIMIT: usize = 16;
+const AGENT_CONTEXT_ACCESS_LIMIT: usize = 8;
 const AGENT_UNAVAILABLE_PUBLIC_TEXT: &str = "代理当前不可用，主线需要改派或接管。";
 const AGENT_SPAWN_STARTED_INSTRUCTION: &str = "代理已异步启动。若后续结论依赖该代理结果，必须调用 agent_wait，并传入 task_ids=[child_task_id] 收集终态结果；不要在未等待必要代理结果时直接给最终答复。";
 const AGENT_WAIT_DEFAULT_TIMEOUT_MS: u64 = 300_000;
@@ -598,15 +606,18 @@ fn execute_coordinator_tool(
                     ExecutionResultStatus::Failed,
                 );
             }
-            let context = parsed
-                .get("context")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let child_goal = match context {
-                Some(context) if context != goal => format!("{goal}\n\n上下文：{context}"),
-                _ => goal.clone(),
-            };
+            if parsed.get("context").is_some() {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "failed",
+                        "error_code": "legacy_context_rejected",
+                        "error": "agent_spawn 不再接受 context 字符串，请使用结构化 context_package",
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            }
             let task_kind = parsed
                 .get("task_kind")
                 .and_then(|v| v.as_str())
@@ -631,11 +642,31 @@ fn execute_coordinator_tool(
                 now.0,
                 seq
             ));
+            let context_package =
+                match parse_agent_context_package(&parsed, &task.task_id, now, seq) {
+                    Ok(package) => package,
+                    Err(error) => {
+                        return (
+                            serde_json::json!({
+                                "tool": tool.as_str(),
+                                "status": "failed",
+                                "error_code": "invalid_context_package",
+                                "error": error,
+                            })
+                            .to_string(),
+                            ExecutionResultStatus::Failed,
+                        );
+                    }
+                };
             let child_policy_snapshot =
                 agent_spawn_child_policy_snapshot(task.policy_snapshot.as_ref());
             let child_access_profile = child_policy_snapshot.effective_access_profile();
             let child_dependency_ids = agent_spawn_child_dependency_ids(task);
-            let child_input_refs = agent_spawn_child_input_refs(task);
+            let child_input_refs = context_package
+                .references
+                .iter()
+                .map(|reference| reference.source_ref.clone())
+                .collect();
             let child = magi_core::Task {
                 task_id: child_id.clone(),
                 mission_id: task.mission_id.clone(),
@@ -643,7 +674,7 @@ fn execute_coordinator_tool(
                 parent_task_id: Some(task.task_id.clone()),
                 kind: task_kind,
                 title: display_name,
-                goal: child_goal,
+                goal: goal.clone(),
                 status: TaskStatus::Pending,
                 dependency_ids: child_dependency_ids,
                 required_children: Vec::new(),
@@ -666,7 +697,10 @@ fn execute_coordinator_tool(
                 output_refs: Vec::new(),
                 evidence_refs: Vec::new(),
                 retry_count: 0,
-                runtime_payload: magi_core::TaskRuntimePayload::default(),
+                runtime_payload: TaskRuntimePayload::AgentContext {
+                    package: Box::new(context_package.clone()),
+                    accesses: Vec::new(),
+                },
                 created_at: now,
                 updated_at: now,
             };
@@ -724,6 +758,7 @@ fn execute_coordinator_tool(
                     );
                 }
             };
+            conversation_registry.open_task_signal_channel(session_id, &child_id);
             if let Some(plan_item_id) = plan_item_id.clone() {
                 match plan_store.bind_task(child_id.clone(), plan_item_id) {
                     Ok(plan) => magi_plan::publish_plan_event(
@@ -765,6 +800,8 @@ fn execute_coordinator_tool(
                     "role": role,
                     "access_profile": child_access_profile.as_str(),
                     "goal": goal,
+                    "context_package_id": context_package.package_id,
+                    "context_revision": context_package.revision,
                     "task_kind": format!("{:?}", task_kind),
                     "worker_id": registered_execution.worker_id.to_string(),
                     "thread_id": registered_execution.thread_id.to_string(),
@@ -795,6 +832,8 @@ fn execute_coordinator_tool(
                         "goal": child.goal,
                         "role": role,
                         "access_profile": child_access_profile.as_str(),
+                        "context_package_id": context_package.package_id,
+                        "context_revision": context_package.revision,
                     },
                     "worker_id": registered_execution.worker_id.to_string(),
                     "thread_id": registered_execution.thread_id.to_string(),
@@ -807,15 +846,28 @@ fn execute_coordinator_tool(
         }
         magi_tool_runtime::BuiltinToolName::AgentWait => {
             let session_threads = session_store.thread_registry_snapshot(session_id);
-            execute_agent_wait(
-                task_store,
-                spawn_graph,
+            execute_agent_wait_with_runtime(
+                AgentWaitRuntime {
+                    task_store,
+                    spawn_graph,
+                    conversation_registry,
+                    session_id,
+                    session_threads: &session_threads,
+                },
                 task,
-                &session_threads,
                 tool,
                 &parsed,
             )
         }
+        magi_tool_runtime::BuiltinToolName::AgentSend => execute_agent_send(
+            task_store,
+            conversation_registry,
+            task,
+            session_id,
+            tool,
+            &parsed,
+            &publish_event,
+        ),
         _ => unreachable!("execute_coordinator_tool 只接收协调器代理工具变体"),
     }
 }
@@ -825,6 +877,638 @@ fn valid_agent_task_name(task_name: &str) -> bool {
         && task_name.chars().all(|character| {
             character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
         })
+}
+
+fn execute_agent_send(
+    task_store: &TaskStore,
+    conversation_registry: &ConversationRegistry,
+    parent_task: &magi_core::Task,
+    session_id: &SessionId,
+    tool: BuiltinToolName,
+    parsed: &serde_json::Value,
+    publish_event: &impl Fn(&str, serde_json::Value),
+) -> (String, ExecutionResultStatus) {
+    let target_task_id = TaskId::new(
+        parsed
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim(),
+    );
+    let message = match required_bounded_context_text(
+        parsed.get("message"),
+        "agent_send.message",
+        AGENT_CONTEXT_SUMMARY_MAX_CHARS,
+    ) {
+        Ok(message) => message,
+        Err(error) => return context_tool_failure(tool, "invalid_arguments", error),
+    };
+    let Some(target_task) = task_store.get_task(&target_task_id) else {
+        return context_tool_failure(tool, "target_not_found", "目标代理任务不存在");
+    };
+    if target_task.root_task_id != parent_task.root_task_id
+        || target_task.mission_id != parent_task.mission_id
+        || target_task.task_id == parent_task.task_id
+    {
+        return context_tool_failure(tool, "target_out_of_scope", "目标代理不属于当前执行链");
+    }
+    if !matches!(
+        target_task.status,
+        TaskStatus::Pending | TaskStatus::Running
+    ) {
+        return context_tool_failure(
+            tool,
+            "target_terminal",
+            "目标代理已进入终态，不能继续发送上下文",
+        );
+    }
+    let now = UtcMillis::now();
+    let sequence = AGENT_SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let references =
+        match parse_agent_context_references(parsed.get("references"), now, sequence, "agent_send")
+        {
+            Ok(references) => references,
+            Err(error) => return context_tool_failure(tool, "invalid_references", error),
+        };
+    let estimated_tokens = estimate_text_tokens(&message)
+        + references
+            .iter()
+            .map(|reference| reference.estimated_tokens)
+            .sum::<usize>();
+    let supplement = AgentContextSupplement {
+        supplement_id: format!("ctxsupp-{}-{}-{sequence}", target_task_id.as_str(), now.0),
+        author_task_id: parent_task.task_id.clone(),
+        message: message.clone(),
+        references: references.clone(),
+        estimated_tokens,
+        created_at: now,
+    };
+    let access = AgentContextAccessRecord {
+        record_id: format!(
+            "ctxaccess-send-{}-{}-{sequence}",
+            target_task_id.as_str(),
+            now.0
+        ),
+        operation: AgentContextAccessOperation::Send,
+        query: Some(message.clone()),
+        reference_ids: references
+            .iter()
+            .map(|reference| reference.reference_id.clone())
+            .collect(),
+        estimated_tokens,
+        occurred_at: now,
+    };
+    let commit =
+        conversation_registry.enqueue_task_signal_with(session_id, &target_task_id, || {
+            let package =
+                task_store.append_agent_context_supplement(&target_task_id, supplement.clone())?;
+            task_store.append_agent_context_access(&target_task_id, access.clone())?;
+            let signal = RuntimeSignal {
+                author: MailboxAuthor::Parent(parent_task.task_id.to_string()),
+                kind: MailboxKind::Message,
+                trigger_turn: true,
+                payload: serde_json::json!({
+                    "type": "agent_context_supplement",
+                    "package_id": package.package_id,
+                    "revision": package.revision,
+                    "supplement": supplement,
+                }),
+                enqueued_at: now,
+            };
+            Ok::<_, magi_core::DomainError>((package, signal))
+        });
+    let package = match commit {
+        Ok(package) => package,
+        Err(crate::TaskSignalCommitError::ChannelClosed) => {
+            return context_tool_failure(
+                tool,
+                "target_not_running",
+                "目标代理尚未启动或已结束，无法接收运行中上下文",
+            );
+        }
+        Err(crate::TaskSignalCommitError::Commit(error)) => {
+            return context_tool_failure(tool, "context_persist_failed", error.to_string());
+        }
+    };
+    publish_event(
+        "task.coordinator.agent_send",
+        serde_json::json!({
+            "parent_task_id": parent_task.task_id,
+            "child_task_id": target_task_id,
+            "package_id": package.package_id,
+            "revision": package.revision,
+            "estimated_tokens": estimated_tokens,
+        }),
+    );
+    (
+        serde_json::json!({
+            "tool": tool.as_str(),
+            "status": "sent",
+            "task_id": target_task_id,
+            "package_id": package.package_id,
+            "revision": package.revision,
+            "estimated_tokens": estimated_tokens,
+        })
+        .to_string(),
+        ExecutionResultStatus::Succeeded,
+    )
+}
+
+fn context_tool_failure(
+    tool: BuiltinToolName,
+    error_code: &str,
+    error: impl ToString,
+) -> (String, ExecutionResultStatus) {
+    (
+        serde_json::json!({
+            "tool": tool.as_str(),
+            "status": "failed",
+            "error_code": error_code,
+            "error": error.to_string(),
+        })
+        .to_string(),
+        ExecutionResultStatus::Failed,
+    )
+}
+
+#[derive(Clone)]
+struct ResolvedAgentContext {
+    reference_id: String,
+    kind: AgentContextReferenceKind,
+    title: String,
+    content: String,
+}
+
+fn execute_agent_context_tool(
+    task_store: &TaskStore,
+    session_store: &SessionStore,
+    conversation_registry: &ConversationRegistry,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    tool: BuiltinToolName,
+    arguments: &str,
+) -> (String, ExecutionResultStatus) {
+    let parsed = match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(parsed) => parsed,
+        Err(error) => return context_tool_failure(tool, "invalid_arguments", error),
+    };
+    match tool {
+        BuiltinToolName::ContextSearch => {
+            execute_context_search(task_store, session_store, task, session_id, tool, &parsed)
+        }
+        BuiltinToolName::ContextRead => {
+            execute_context_read(task_store, session_store, task, session_id, tool, &parsed)
+        }
+        BuiltinToolName::ContextRequest => execute_context_request(
+            task_store,
+            conversation_registry,
+            task,
+            session_id,
+            tool,
+            &parsed,
+        ),
+        _ => unreachable!("execute_agent_context_tool 只接收上下文工具"),
+    }
+}
+
+fn execute_context_search(
+    task_store: &TaskStore,
+    session_store: &SessionStore,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    tool: BuiltinToolName,
+    parsed: &serde_json::Value,
+) -> (String, ExecutionResultStatus) {
+    let query =
+        match required_bounded_context_text(parsed.get("query"), "context_search.query", 1_000) {
+            Ok(query) => query,
+            Err(error) => return context_tool_failure(tool, "invalid_query", error),
+        };
+    let limit = parsed
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(8)
+        .clamp(1, 20) as usize;
+    let mut candidates = collect_context_candidates(task_store, session_store, task, session_id);
+    candidates.retain(|candidate| context_candidate_matches(&query, candidate));
+    candidates.sort_by(|left, right| {
+        context_candidate_score(&query, right)
+            .cmp(&context_candidate_score(&query, left))
+            .then_with(|| left.reference_id.cmp(&right.reference_id))
+    });
+    candidates.truncate(limit);
+    let estimated_tokens = candidates
+        .iter()
+        .map(|candidate| estimate_text_tokens(&candidate.content))
+        .sum();
+    let reference_ids = candidates
+        .iter()
+        .map(|candidate| candidate.reference_id.clone())
+        .collect::<Vec<_>>();
+    if let Err(error) = record_agent_context_access(
+        task_store,
+        task,
+        AgentContextAccessOperation::Search,
+        Some(query.clone()),
+        reference_ids,
+        estimated_tokens,
+    ) {
+        return context_tool_failure(tool, "context_audit_failed", error);
+    }
+    let results = candidates
+        .into_iter()
+        .map(|candidate| {
+            serde_json::json!({
+                "reference_id": candidate.reference_id,
+                "kind": candidate.kind,
+                "title": candidate.title,
+                "preview": compact_context_preview(&candidate.content),
+                "estimated_tokens": estimate_text_tokens(&candidate.content),
+            })
+        })
+        .collect::<Vec<_>>();
+    (
+        serde_json::json!({
+            "tool": tool.as_str(),
+            "status": "ok",
+            "query": query,
+            "results": results,
+            "estimated_tokens": estimated_tokens,
+        })
+        .to_string(),
+        ExecutionResultStatus::Succeeded,
+    )
+}
+
+fn execute_context_read(
+    task_store: &TaskStore,
+    session_store: &SessionStore,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    tool: BuiltinToolName,
+    parsed: &serde_json::Value,
+) -> (String, ExecutionResultStatus) {
+    let Some(reference_values) = parsed
+        .get("reference_ids")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return context_tool_failure(
+            tool,
+            "invalid_references",
+            "context_read.reference_ids 必须是非空数组",
+        );
+    };
+    if reference_values.is_empty() || reference_values.len() > AGENT_CONTEXT_ACCESS_LIMIT {
+        return context_tool_failure(
+            tool,
+            "invalid_references",
+            format!("context_read 单次必须读取 1-{AGENT_CONTEXT_ACCESS_LIMIT} 条引用"),
+        );
+    }
+    let mut requested_ids = Vec::with_capacity(reference_values.len());
+    for value in reference_values {
+        let Some(reference_id) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return context_tool_failure(
+                tool,
+                "invalid_references",
+                "reference_ids 只能包含非空字符串",
+            );
+        };
+        if !requested_ids
+            .iter()
+            .any(|existing| existing == reference_id)
+        {
+            requested_ids.push(reference_id.to_string());
+        }
+    }
+    let candidates = collect_context_candidates(task_store, session_store, task, session_id);
+    let mut results = Vec::with_capacity(requested_ids.len());
+    for reference_id in &requested_ids {
+        let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| &candidate.reference_id == reference_id)
+        else {
+            return context_tool_failure(
+                tool,
+                "reference_out_of_scope",
+                format!("引用 {reference_id} 不属于当前 session 或执行链"),
+            );
+        };
+        results.push(candidate.clone());
+    }
+    let estimated_tokens = results
+        .iter()
+        .map(|candidate| estimate_text_tokens(&candidate.content))
+        .sum();
+    if let Err(error) = record_agent_context_access(
+        task_store,
+        task,
+        AgentContextAccessOperation::Read,
+        None,
+        requested_ids.clone(),
+        estimated_tokens,
+    ) {
+        return context_tool_failure(tool, "context_audit_failed", error);
+    }
+    (
+        serde_json::json!({
+            "tool": tool.as_str(),
+            "status": "ok",
+            "results": results.into_iter().map(|candidate| serde_json::json!({
+                "reference_id": candidate.reference_id,
+                "kind": candidate.kind,
+                "title": candidate.title,
+                "content": candidate.content,
+                "estimated_tokens": estimate_text_tokens(&candidate.content),
+            })).collect::<Vec<_>>(),
+            "estimated_tokens": estimated_tokens,
+        })
+        .to_string(),
+        ExecutionResultStatus::Succeeded,
+    )
+}
+
+fn execute_context_request(
+    task_store: &TaskStore,
+    conversation_registry: &ConversationRegistry,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    tool: BuiltinToolName,
+    parsed: &serde_json::Value,
+) -> (String, ExecutionResultStatus) {
+    let request = match required_bounded_context_text(
+        parsed.get("request"),
+        "context_request.request",
+        AGENT_CONTEXT_SUMMARY_MAX_CHARS,
+    ) {
+        Ok(request) => request,
+        Err(error) => return context_tool_failure(tool, "invalid_request", error),
+    };
+    let Some(package) = task.agent_context_package() else {
+        return context_tool_failure(
+            tool,
+            "context_package_missing",
+            "当前任务没有 AgentContextPackage",
+        );
+    };
+    let parent_task_id = package.parent_task_id.clone();
+    let Some(parent_task) = task_store.get_task(&parent_task_id) else {
+        return context_tool_failure(tool, "parent_not_found", "父任务不存在");
+    };
+    if parent_task.root_task_id != task.root_task_id
+        || parent_task.mission_id != task.mission_id
+        || !matches!(
+            parent_task.status,
+            TaskStatus::Pending | TaskStatus::Running
+        )
+    {
+        return context_tool_failure(tool, "parent_not_running", "父任务不在当前活跃执行链中");
+    }
+    let now = UtcMillis::now();
+    let sequence = AGENT_SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let estimated_tokens = estimate_text_tokens(&request);
+    let access = AgentContextAccessRecord {
+        record_id: format!(
+            "ctxaccess-request-{}-{}-{sequence}",
+            task.task_id.as_str(),
+            now.0
+        ),
+        operation: AgentContextAccessOperation::Request,
+        query: Some(request.clone()),
+        reference_ids: Vec::new(),
+        estimated_tokens,
+        occurred_at: now,
+    };
+    let commit =
+        conversation_registry.enqueue_task_signal_with(session_id, &parent_task_id, || {
+            task_store.append_agent_context_access(&task.task_id, access.clone())?;
+            Ok::<_, magi_core::DomainError>((
+                (),
+                RuntimeSignal {
+                    author: MailboxAuthor::Child(task.task_id.to_string()),
+                    kind: MailboxKind::Message,
+                    trigger_turn: true,
+                    payload: serde_json::json!({
+                        "type": "agent_context_request",
+                        "child_task_id": task.task_id,
+                        "package_id": package.package_id,
+                        "revision": package.revision,
+                        "request": request,
+                    }),
+                    enqueued_at: now,
+                },
+            ))
+        });
+    match commit {
+        Ok(()) => {
+            task_store.notify_runtime_change();
+            let timeout_ms = parsed
+                .get("timeout_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(AGENT_WAIT_DEFAULT_TIMEOUT_MS)
+                .clamp(AGENT_WAIT_MIN_TIMEOUT_MS, AGENT_WAIT_MAX_TIMEOUT_MS);
+            let started_at = std::time::Instant::now();
+            loop {
+                let elapsed_ms =
+                    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed_ms >= timeout_ms {
+                    return (
+                        serde_json::json!({
+                            "tool": tool.as_str(),
+                            "status": "timeout",
+                            "parent_task_id": parent_task_id,
+                            "estimated_tokens": estimated_tokens,
+                            "instruction": "父任务尚未回复。只在现有证据足以完成目标时继续；否则在最终答复中明确说明缺失上下文。",
+                        })
+                        .to_string(),
+                        ExecutionResultStatus::Succeeded,
+                    );
+                }
+                if task_store.get_task(&task.task_id).is_some_and(|current| {
+                    matches!(current.status, TaskStatus::Failed | TaskStatus::Killed)
+                }) {
+                    return context_tool_failure(
+                        tool,
+                        "task_interrupted",
+                        "等待上下文回复时任务已中断",
+                    );
+                }
+                let wait_ms = (timeout_ms - elapsed_ms).min(250);
+                let responses = conversation_registry.wait_for_task_signals(
+                    session_id,
+                    &task.task_id,
+                    std::time::Duration::from_millis(wait_ms),
+                );
+                if !responses.is_empty() {
+                    return (
+                        serde_json::json!({
+                            "tool": tool.as_str(),
+                            "status": "resolved",
+                            "parent_task_id": parent_task_id,
+                            "responses": responses,
+                            "estimated_tokens": estimated_tokens,
+                            "instruction": "父任务已回复。请把 responses 中的 agent_context_supplement 作为当前任务补充事实继续执行。",
+                        })
+                        .to_string(),
+                        ExecutionResultStatus::Succeeded,
+                    );
+                }
+            }
+        }
+        Err(crate::TaskSignalCommitError::ChannelClosed) => context_tool_failure(
+            tool,
+            "parent_channel_closed",
+            "父任务当前无法接收上下文请求",
+        ),
+        Err(crate::TaskSignalCommitError::Commit(error)) => {
+            context_tool_failure(tool, "context_audit_failed", error)
+        }
+    }
+}
+
+fn collect_context_candidates(
+    task_store: &TaskStore,
+    session_store: &SessionStore,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+) -> Vec<ResolvedAgentContext> {
+    let mut candidates = session_store
+        .timeline_for_session(session_id)
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry.kind,
+                TimelineEntryKind::UserMessage | TimelineEntryKind::AssistantMessage
+            )
+        })
+        .filter_map(|entry| {
+            let content = timeline_entry_visible_text(&entry.message)?;
+            let title = match entry.kind {
+                TimelineEntryKind::UserMessage => "用户消息",
+                TimelineEntryKind::AssistantMessage => "助手消息",
+                _ => return None,
+            };
+            Some(ResolvedAgentContext {
+                reference_id: format!("turn:{}", entry.entry_id),
+                kind: AgentContextReferenceKind::ConversationTurn,
+                title: title.to_string(),
+                content,
+            })
+        })
+        .collect::<Vec<_>>();
+    for candidate_task in task_store.all_tasks().into_iter().filter(|candidate| {
+        candidate.root_task_id == task.root_task_id && candidate.mission_id == task.mission_id
+    }) {
+        for (index, content) in candidate_task.output_refs.iter().enumerate() {
+            candidates.push(ResolvedAgentContext {
+                reference_id: format!("task:{}:output:{index}", candidate_task.task_id.as_str()),
+                kind: AgentContextReferenceKind::TaskOutput,
+                title: format!("{} · 输出 {}", candidate_task.title, index + 1),
+                content: content.clone(),
+            });
+        }
+        for (index, content) in candidate_task.evidence_refs.iter().enumerate() {
+            candidates.push(ResolvedAgentContext {
+                reference_id: format!("task:{}:evidence:{index}", candidate_task.task_id.as_str()),
+                kind: AgentContextReferenceKind::TaskEvidence,
+                title: format!("{} · 证据 {}", candidate_task.title, index + 1),
+                content: content.clone(),
+            });
+        }
+    }
+    if let Some(package) = task.agent_context_package() {
+        for reference in package.references.iter().chain(
+            package
+                .supplements
+                .iter()
+                .flat_map(|supplement| supplement.references.iter()),
+        ) {
+            let content = resolve_package_reference_content(&candidates, reference)
+                .unwrap_or_else(|| reference.preview.clone());
+            candidates.push(ResolvedAgentContext {
+                reference_id: reference.reference_id.clone(),
+                kind: reference.kind,
+                title: reference.title.clone(),
+                content,
+            });
+        }
+        for supplement in &package.supplements {
+            candidates.push(ResolvedAgentContext {
+                reference_id: supplement.supplement_id.clone(),
+                kind: AgentContextReferenceKind::Other,
+                title: "主线补充上下文".to_string(),
+                content: supplement.message.clone(),
+            });
+        }
+    }
+    candidates
+}
+
+fn resolve_package_reference_content(
+    candidates: &[ResolvedAgentContext],
+    reference: &AgentContextReference,
+) -> Option<String> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.reference_id == reference.source_ref)
+        .map(|candidate| candidate.content.clone())
+}
+
+fn context_candidate_matches(query: &str, candidate: &ResolvedAgentContext) -> bool {
+    context_candidate_score(query, candidate) > 0
+}
+
+fn context_candidate_score(query: &str, candidate: &ResolvedAgentContext) -> usize {
+    let query = query.to_lowercase();
+    let haystack = format!("{} {}", candidate.title, candidate.content).to_lowercase();
+    if haystack.contains(&query) {
+        return 100 + query.chars().count();
+    }
+    query
+        .split(|character: char| character.is_whitespace() || character.is_ascii_punctuation())
+        .filter(|term| !term.is_empty())
+        .filter(|term| haystack.contains(term))
+        .map(str::len)
+        .sum()
+}
+
+fn compact_context_preview(content: &str) -> String {
+    let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= AGENT_CONTEXT_PREVIEW_MAX_CHARS {
+        compact
+    } else {
+        compact
+            .chars()
+            .take(AGENT_CONTEXT_PREVIEW_MAX_CHARS)
+            .collect()
+    }
+}
+
+fn record_agent_context_access(
+    task_store: &TaskStore,
+    task: &magi_core::Task,
+    operation: AgentContextAccessOperation,
+    query: Option<String>,
+    reference_ids: Vec<String>,
+    estimated_tokens: usize,
+) -> Result<(), magi_core::DomainError> {
+    let now = UtcMillis::now();
+    let sequence = AGENT_SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
+    task_store.append_agent_context_access(
+        &task.task_id,
+        AgentContextAccessRecord {
+            record_id: format!("ctxaccess-{}-{}-{sequence}", task.task_id.as_str(), now.0),
+            operation,
+            query,
+            reference_ids,
+            estimated_tokens,
+            occurred_at: now,
+        },
+    )
 }
 
 fn child_canonical_task_name(parent_name: &str, task_name: &str) -> String {
@@ -1049,46 +1733,159 @@ fn agent_spawn_child_dependency_ids(parent: &magi_core::Task) -> Vec<TaskId> {
     parent.dependency_ids.clone()
 }
 
-fn agent_spawn_child_input_refs(parent: &magi_core::Task) -> Vec<String> {
-    let mut refs = Vec::new();
-    push_agent_spawn_input_ref(
-        &mut refs,
-        format!(
-            "父任务事实：id={} title={} goal={}",
-            parent.task_id,
-            compact_agent_spawn_context_ref(&parent.title),
-            compact_agent_spawn_context_ref(&parent.goal)
+fn parse_agent_context_package(
+    parsed: &serde_json::Value,
+    parent_task_id: &TaskId,
+    now: UtcMillis,
+    sequence: u64,
+) -> Result<AgentContextPackage, String> {
+    let value = parsed
+        .get("context_package")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "agent_spawn 缺少结构化 context_package".to_string())?;
+    let summary = required_bounded_context_text(
+        value.get("summary"),
+        "context_package.summary",
+        AGENT_CONTEXT_SUMMARY_MAX_CHARS,
+    )?;
+    let expected_output = required_bounded_context_text(
+        value.get("expected_output"),
+        "context_package.expected_output",
+        AGENT_CONTEXT_EXPECTED_OUTPUT_MAX_CHARS,
+    )?;
+    let constraints = value
+        .get("constraints")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "context_package.constraints 必须是数组".to_string())?
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            required_bounded_context_text(
+                Some(item),
+                &format!("context_package.constraints[{index}]"),
+                AGENT_CONTEXT_CONSTRAINT_MAX_CHARS,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let references_value = value
+        .get("references")
+        .ok_or_else(|| "context_package.references 必须是数组".to_string())?;
+    let references =
+        parse_agent_context_references(Some(references_value), now, sequence, "spawn")?;
+    Ok(AgentContextPackage {
+        package_id: format!(
+            "agent-context-{}-{}-{sequence}",
+            parent_task_id.as_str(),
+            now.0
         ),
-    );
-    for input_ref in &parent.input_refs {
-        push_agent_spawn_input_ref(&mut refs, input_ref.clone());
-    }
-    for evidence_ref in &parent.evidence_refs {
-        push_agent_spawn_input_ref(&mut refs, format!("父任务证据：{evidence_ref}"));
-    }
-    refs
+        revision: 1,
+        parent_task_id: parent_task_id.clone(),
+        summary,
+        constraints,
+        expected_output,
+        references,
+        supplements: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    })
 }
 
-fn push_agent_spawn_input_ref(refs: &mut Vec<String>, value: String) {
-    if refs.len() >= AGENT_SPAWN_INHERITED_INPUT_REF_MAX {
-        return;
+fn parse_agent_context_references(
+    value: Option<&serde_json::Value>,
+    now: UtcMillis,
+    sequence: u64,
+    scope: &str,
+) -> Result<Vec<AgentContextReference>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("{scope}.references 必须是数组"))?;
+    if values.len() > AGENT_CONTEXT_REFERENCE_LIMIT {
+        return Err(format!(
+            "{scope}.references 最多允许 {AGENT_CONTEXT_REFERENCE_LIMIT} 条"
+        ));
     }
-    let compact = compact_agent_spawn_context_ref(&value);
-    if compact.is_empty() || refs.iter().any(|existing| existing == &compact) {
-        return;
-    }
-    refs.push(compact);
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let object = value
+                .as_object()
+                .ok_or_else(|| format!("{scope}.references[{index}] 必须是对象"))?;
+            let kind = parse_agent_context_reference_kind(
+                object
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+            )?;
+            let title = required_bounded_context_text(
+                object.get("title"),
+                &format!("{scope}.references[{index}].title"),
+                200,
+            )?;
+            let source_ref = required_bounded_context_text(
+                object.get("source_ref"),
+                &format!("{scope}.references[{index}].source_ref"),
+                1_000,
+            )?;
+            let preview = bounded_context_text(
+                object.get("preview"),
+                &format!("{scope}.references[{index}].preview"),
+                AGENT_CONTEXT_PREVIEW_MAX_CHARS,
+            )?;
+            Ok(AgentContextReference {
+                reference_id: format!("ctxref-{scope}-{}-{sequence}-{index}", now.0),
+                kind,
+                title,
+                source_ref,
+                estimated_tokens: estimate_text_tokens(&preview),
+                preview,
+            })
+        })
+        .collect()
 }
 
-fn compact_agent_spawn_context_ref(value: &str) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= AGENT_SPAWN_PARENT_CONTEXT_MAX_CHARS {
-        return compact;
+fn parse_agent_context_reference_kind(value: &str) -> Result<AgentContextReferenceKind, String> {
+    match value.trim() {
+        "conversation_turn" => Ok(AgentContextReferenceKind::ConversationTurn),
+        "task_output" => Ok(AgentContextReferenceKind::TaskOutput),
+        "task_evidence" => Ok(AgentContextReferenceKind::TaskEvidence),
+        "file" => Ok(AgentContextReferenceKind::File),
+        "knowledge" => Ok(AgentContextReferenceKind::Knowledge),
+        "other" => Ok(AgentContextReferenceKind::Other),
+        _ => Err(format!("未知上下文引用类型: {value}")),
     }
-    compact
-        .chars()
-        .take(AGENT_SPAWN_PARENT_CONTEXT_MAX_CHARS)
-        .collect::<String>()
+}
+
+fn required_bounded_context_text(
+    value: Option<&serde_json::Value>,
+    field: &str,
+    max_chars: usize,
+) -> Result<String, String> {
+    let text = bounded_context_text(value, field, max_chars)?;
+    if text.is_empty() {
+        Err(format!("{field} 不能为空"))
+    } else {
+        Ok(text)
+    }
+}
+
+fn bounded_context_text(
+    value: Option<&serde_json::Value>,
+    field: &str,
+    max_chars: usize,
+) -> Result<String, String> {
+    let text = value
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{field} 必须是字符串"))?
+        .trim()
+        .to_string();
+    if text.chars().count() > max_chars {
+        return Err(format!("{field} 最多允许 {max_chars} 个字符"));
+    }
+    Ok(text)
 }
 
 fn default_agent_spawn_policy() -> TaskPolicy {
@@ -1143,20 +1940,34 @@ fn enqueue_agent_assignment_message(
                 "role": role,
                 "access_profile": access_profile,
                 "dependency_ids": child.dependency_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                "input_refs": &child.input_refs,
+                "context_package_id": child.agent_context_package().map(|package| package.package_id.as_str()),
+                "context_revision": child.agent_context_package().map(|package| package.revision),
             }),
             enqueued_at: now,
         });
 }
 
-fn execute_agent_wait(
-    task_store: &TaskStore,
-    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
+struct AgentWaitRuntime<'a> {
+    task_store: &'a TaskStore,
+    spawn_graph: &'a Mutex<magi_spawn_graph::SpawnGraph>,
+    conversation_registry: &'a ConversationRegistry,
+    session_id: &'a SessionId,
+    session_threads: &'a [ExecutionThread],
+}
+
+fn execute_agent_wait_with_runtime(
+    runtime: AgentWaitRuntime<'_>,
     parent_task: &magi_core::Task,
-    session_threads: &[ExecutionThread],
     tool: magi_tool_runtime::BuiltinToolName,
     parsed: &serde_json::Value,
 ) -> (String, ExecutionResultStatus) {
+    let AgentWaitRuntime {
+        task_store,
+        spawn_graph,
+        conversation_registry,
+        session_id,
+        session_threads,
+    } = runtime;
     let task_ids = parse_agent_wait_task_ids(parsed);
     if task_ids.is_empty() {
         return (
@@ -1188,6 +1999,27 @@ fn execute_agent_wait(
     let started_at = std::time::Instant::now();
     let mut observed_status_version = task_store.status_change_version();
     loop {
+        let runtime_signals =
+            conversation_registry.drain_task_signals(session_id, &parent_task.task_id);
+        if !runtime_signals.is_empty() {
+            return (
+                serde_json::json!({
+                    "tool": tool.as_str(),
+                    "status": "attention_required",
+                    "timed_out": false,
+                    "pending_task_ids": task_ids.iter().filter_map(|task_id| {
+                        task_store.get_task(task_id).and_then(|task| {
+                            matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+                                .then(|| task_id.to_string())
+                        })
+                    }).collect::<Vec<_>>(),
+                    "runtime_signals": runtime_signals,
+                    "instruction": "代理等待期间收到运行时消息。若为 agent_context_request，请先读取 child_task_id 和 request，使用 agent_send 回复对应代理，再继续 agent_wait。",
+                })
+                .to_string(),
+                ExecutionResultStatus::Succeeded,
+            );
+        }
         let mut results = Vec::with_capacity(task_ids.len());
         let mut pending_task_ids = Vec::new();
         let requested_task_ids = task_ids.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -1253,6 +2085,32 @@ fn execute_agent_wait(
             std::time::Duration::from_millis(timeout_ms - elapsed_ms),
         );
     }
+}
+
+#[cfg(test)]
+fn execute_agent_wait(
+    task_store: &TaskStore,
+    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
+    parent_task: &magi_core::Task,
+    session_threads: &[ExecutionThread],
+    tool: magi_tool_runtime::BuiltinToolName,
+    parsed: &serde_json::Value,
+) -> (String, ExecutionResultStatus) {
+    let registry = ConversationRegistry::new();
+    let session_id = SessionId::new("session-agent-wait-test");
+    registry.open_task_signal_channel(&session_id, &parent_task.task_id);
+    execute_agent_wait_with_runtime(
+        AgentWaitRuntime {
+            task_store,
+            spawn_graph,
+            conversation_registry: &registry,
+            session_id: &session_id,
+            session_threads,
+        },
+        parent_task,
+        tool,
+        parsed,
+    )
 }
 
 fn agent_wait_task_is_direct_child(
@@ -1567,6 +2425,7 @@ fn execute_task_tool_call(
         if matches!(
             canonical,
             magi_tool_runtime::BuiltinToolName::AgentSpawn
+                | magi_tool_runtime::BuiltinToolName::AgentSend
                 | magi_tool_runtime::BuiltinToolName::AgentWait
         ) {
             return execute_coordinator_tool(
@@ -1585,6 +2444,22 @@ fn execute_task_tool_call(
                 },
                 canonical,
                 tool_call,
+            );
+        }
+        if matches!(
+            canonical,
+            magi_tool_runtime::BuiltinToolName::ContextSearch
+                | magi_tool_runtime::BuiltinToolName::ContextRead
+                | magi_tool_runtime::BuiltinToolName::ContextRequest
+        ) {
+            return execute_agent_context_tool(
+                task_store,
+                session_store,
+                conversation_registry,
+                task,
+                session_id,
+                canonical,
+                &tool_call.function.arguments,
             );
         }
         if matches!(canonical, magi_tool_runtime::BuiltinToolName::UpdatePlan) {
@@ -2328,41 +3203,33 @@ mod tests {
     }
 
     #[test]
-    fn agent_spawn_child_context_inherits_parent_task_facts() {
-        let mut parent = test_task("task-agent-context-parent", "task-agent-context-root", None);
-        parent.title = "修复会话同步".to_string();
-        parent.goal = "必须检查 sessionId 和 workspaceId 是否匹配".to_string();
-        parent.input_refs = vec![
-            "用户要求：不要跨 workspace 读取 session".to_string(),
-            "用户要求：不要跨 workspace 读取 session".to_string(),
-        ];
-        parent.evidence_refs = vec!["证据：bootstrap 只接受后端 session".to_string()];
-        parent.dependency_ids = vec![TaskId::new("task-parent-dependency")];
+    fn agent_spawn_context_package_is_structured_and_does_not_inherit_parent_refs() {
+        let parent = test_task("task-agent-context-parent", "task-agent-context-root", None);
+        let parsed = serde_json::json!({
+            "context_package": {
+                "summary": "修复会话同步",
+                "constraints": ["不得跨 workspace 读取 session"],
+                "expected_output": "给出根因和测试结果",
+                "references": [{
+                    "kind": "task_evidence",
+                    "title": "bootstrap 证据",
+                    "source_ref": "task:task-agent-context-parent:evidence:0",
+                    "preview": "bootstrap 只接受后端 session"
+                }]
+            }
+        });
 
-        let input_refs = agent_spawn_child_input_refs(&parent);
-        let dependency_ids = agent_spawn_child_dependency_ids(&parent);
+        let package = parse_agent_context_package(&parsed, &parent.task_id, UtcMillis(100), 7)
+            .expect("结构化上下文包应解析成功");
 
-        assert_eq!(dependency_ids, vec![TaskId::new("task-parent-dependency")]);
-        assert!(
-            input_refs.iter().any(|value| value.contains("父任务事实")
-                && value.contains("task-agent-context-parent")
-                && value.contains("sessionId")),
-            "子代理 input_refs 必须包含父任务标题/目标事实，实际: {input_refs:?}"
-        );
+        assert_eq!(package.parent_task_id, parent.task_id);
+        assert_eq!(package.revision, 1);
+        assert_eq!(package.references.len(), 1);
         assert_eq!(
-            input_refs
-                .iter()
-                .filter(|value| value.contains("不要跨 workspace 读取 session"))
-                .count(),
-            1,
-            "重复父 input_refs 只能继承一次"
+            package.references[0].source_ref,
+            "task:task-agent-context-parent:evidence:0"
         );
-        assert!(
-            input_refs
-                .iter()
-                .any(|value| value.contains("父任务证据：证据：bootstrap")),
-            "父任务 evidence_refs 应作为子代理输入参考继承"
-        );
+        assert!(package.render_for_prompt().contains("context_read"));
     }
 
     #[test]
@@ -4322,7 +5189,21 @@ mod tests {
         child.title = "目录探索".to_string();
         child.goal = "列出目录并汇报".to_string();
         child.dependency_ids = vec![TaskId::new("task-agent-assignment-dependency")];
-        child.input_refs = vec!["父任务要求：只读检查目录".to_string()];
+        child.runtime_payload = TaskRuntimePayload::AgentContext {
+            package: Box::new(AgentContextPackage {
+                package_id: "agent-context-assignment".to_string(),
+                revision: 1,
+                parent_task_id: parent.task_id.clone(),
+                summary: "只读检查目录".to_string(),
+                constraints: vec!["不得修改文件".to_string()],
+                expected_output: "返回目录清单".to_string(),
+                references: Vec::new(),
+                supplements: Vec::new(),
+                created_at: UtcMillis(42),
+                updated_at: UtcMillis(42),
+            }),
+            accesses: Vec::new(),
+        };
 
         enqueue_agent_assignment_message(
             &registry,
@@ -4352,12 +5233,255 @@ mod tests {
                     serde_json::json!(["task-agent-assignment-dependency"])
                 );
                 assert_eq!(
-                    signal.payload["input_refs"],
-                    serde_json::json!(["父任务要求：只读检查目录"])
+                    signal.payload["context_package_id"],
+                    "agent-context-assignment"
                 );
+                assert_eq!(signal.payload["context_revision"], 1);
             }
             other => panic!("expected runtime assignment message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn context_search_and_read_are_scoped_and_audited() {
+        let task_store = TaskStore::new();
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new("session-context-gateway");
+        session_store
+            .create_session(session_id.clone(), "上下文网关")
+            .expect("session should create");
+        session_store.append_timeline_entry(
+            session_id.clone(),
+            TimelineEntryKind::UserMessage,
+            "登录流程必须校验 workspaceId",
+        );
+        let mut task = test_task(
+            "task-context-worker",
+            "task-context-root",
+            Some(TaskId::new("task-context-root")),
+        );
+        task.runtime_payload = TaskRuntimePayload::AgentContext {
+            package: Box::new(AgentContextPackage {
+                package_id: "agent-context-gateway".to_string(),
+                revision: 1,
+                parent_task_id: TaskId::new("task-context-root"),
+                summary: "检查登录流程".to_string(),
+                constraints: Vec::new(),
+                expected_output: "返回检查结果".to_string(),
+                references: Vec::new(),
+                supplements: Vec::new(),
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+            }),
+            accesses: Vec::new(),
+        };
+        task_store.insert_task(task.clone());
+
+        let (search_payload, search_status) = execute_context_search(
+            &task_store,
+            &session_store,
+            &task,
+            &session_id,
+            BuiltinToolName::ContextSearch,
+            &serde_json::json!({"query": "workspaceId"}),
+        );
+        assert_eq!(search_status, ExecutionResultStatus::Succeeded);
+        let search: serde_json::Value = serde_json::from_str(&search_payload).unwrap();
+        let reference_id = search["results"][0]["reference_id"]
+            .as_str()
+            .expect("search should return a scoped turn reference")
+            .to_string();
+
+        let (read_payload, read_status) = execute_context_read(
+            &task_store,
+            &session_store,
+            &task,
+            &session_id,
+            BuiltinToolName::ContextRead,
+            &serde_json::json!({"reference_ids": [reference_id]}),
+        );
+        assert_eq!(read_status, ExecutionResultStatus::Succeeded);
+        assert!(read_payload.contains("登录流程必须校验 workspaceId"));
+        let stored = task_store.get_task(&task.task_id).unwrap();
+        assert_eq!(stored.agent_context_accesses().len(), 2);
+        assert_eq!(
+            stored.agent_context_accesses()[0].operation,
+            AgentContextAccessOperation::Search
+        );
+        assert_eq!(
+            stored.agent_context_accesses()[1].operation,
+            AgentContextAccessOperation::Read
+        );
+    }
+
+    #[test]
+    fn agent_send_updates_package_revision_and_reaches_running_child() {
+        let task_store = TaskStore::new();
+        let registry = ConversationRegistry::new();
+        let session_id = SessionId::new("session-agent-send");
+        let parent = coordinator_task(test_task(
+            "task-agent-send-parent",
+            "task-agent-send-parent",
+            None,
+        ));
+        let mut child = test_task(
+            "task-agent-send-child",
+            "task-agent-send-parent",
+            Some(parent.task_id.clone()),
+        );
+        child.runtime_payload = TaskRuntimePayload::AgentContext {
+            package: Box::new(AgentContextPackage {
+                package_id: "agent-context-send".to_string(),
+                revision: 1,
+                parent_task_id: parent.task_id.clone(),
+                summary: "初始任务".to_string(),
+                constraints: Vec::new(),
+                expected_output: "完成检查".to_string(),
+                references: Vec::new(),
+                supplements: Vec::new(),
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+            }),
+            accesses: Vec::new(),
+        };
+        task_store.insert_task(parent.clone());
+        task_store.insert_task(child.clone());
+        registry.open_task_signal_channel(&session_id, &child.task_id);
+
+        let (payload, status) = execute_agent_send(
+            &task_store,
+            &registry,
+            &parent,
+            &session_id,
+            BuiltinToolName::AgentSend,
+            &serde_json::json!({
+                "task_id": child.task_id,
+                "message": "补充：只检查当前分支"
+            }),
+            &|_, _| {},
+        );
+        assert_eq!(status, ExecutionResultStatus::Succeeded, "{payload}");
+        let stored = task_store.get_task(&child.task_id).unwrap();
+        let package = stored.agent_context_package().unwrap();
+        assert_eq!(package.revision, 2);
+        assert_eq!(package.supplements.len(), 1);
+        assert_eq!(stored.agent_context_accesses().len(), 1);
+        let signals = registry.drain_task_signals(&session_id, &child.task_id);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].payload["revision"], 2);
+    }
+
+    #[test]
+    fn context_request_reaches_parent_task_channel() {
+        let task_store = TaskStore::new();
+        let registry = ConversationRegistry::new();
+        let session_id = SessionId::new("session-context-request");
+        let parent = coordinator_task(test_task(
+            "task-context-request-parent",
+            "task-context-request-parent",
+            None,
+        ));
+        let mut child = test_task(
+            "task-context-request-child",
+            "task-context-request-parent",
+            Some(parent.task_id.clone()),
+        );
+        child.runtime_payload = TaskRuntimePayload::AgentContext {
+            package: Box::new(AgentContextPackage {
+                package_id: "agent-context-request".to_string(),
+                revision: 1,
+                parent_task_id: parent.task_id.clone(),
+                summary: "检查配置".to_string(),
+                constraints: Vec::new(),
+                expected_output: "完成检查".to_string(),
+                references: Vec::new(),
+                supplements: Vec::new(),
+                created_at: UtcMillis(1),
+                updated_at: UtcMillis(1),
+            }),
+            accesses: Vec::new(),
+        };
+        task_store.insert_task(parent.clone());
+        task_store.insert_task(child.clone());
+        registry.open_task_signal_channel(&session_id, &parent.task_id);
+        registry.open_task_signal_channel(&session_id, &child.task_id);
+
+        std::thread::scope(|scope| {
+            let request_handle = scope.spawn(|| {
+                execute_context_request(
+                    &task_store,
+                    &registry,
+                    &child,
+                    &session_id,
+                    BuiltinToolName::ContextRequest,
+                    &serde_json::json!({
+                        "request": "请提供模型配置来源",
+                        "timeout_ms": 5000,
+                    }),
+                )
+            });
+            let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+            let (wait_payload, wait_status) = execute_agent_wait_with_runtime(
+                AgentWaitRuntime {
+                    task_store: &task_store,
+                    spawn_graph: &spawn_graph,
+                    conversation_registry: &registry,
+                    session_id: &session_id,
+                    session_threads: &[],
+                },
+                &parent,
+                BuiltinToolName::AgentWait,
+                &serde_json::json!({
+                    "task_ids": [child.task_id],
+                    "timeout_ms": 5000,
+                }),
+            );
+            assert_eq!(wait_status, ExecutionResultStatus::Succeeded);
+            let wait: serde_json::Value = serde_json::from_str(&wait_payload).unwrap();
+            assert_eq!(wait["status"], "attention_required");
+            assert_eq!(
+                wait["runtime_signals"][0]["payload"]["type"],
+                "agent_context_request"
+            );
+
+            let (send_payload, send_status) = execute_agent_send(
+                &task_store,
+                &registry,
+                &parent,
+                &session_id,
+                BuiltinToolName::AgentSend,
+                &serde_json::json!({
+                    "task_id": child.task_id,
+                    "message": "模型配置来自当前 session 的 orchestrator 设置",
+                }),
+                &|_, _| {},
+            );
+            assert_eq!(
+                send_status,
+                ExecutionResultStatus::Succeeded,
+                "{send_payload}"
+            );
+            let (request_payload, request_status) = request_handle.join().unwrap();
+            assert_eq!(
+                request_status,
+                ExecutionResultStatus::Succeeded,
+                "{request_payload}"
+            );
+            let request: serde_json::Value = serde_json::from_str(&request_payload).unwrap();
+            assert_eq!(request["status"], "resolved");
+            assert_eq!(
+                request["responses"][0]["payload"]["type"],
+                "agent_context_supplement"
+            );
+        });
+        assert_eq!(
+            task_store
+                .get_task(&child.task_id)
+                .unwrap()
+                .agent_context_accesses()[0]
+                .operation,
+            AgentContextAccessOperation::Request
+        );
     }
 
     #[test]

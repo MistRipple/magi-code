@@ -30,11 +30,12 @@ pub use status::{
     VerificationStatus, WorkerLifecycleStatus, WorkspaceLifecycleStatus,
 };
 pub use task::{
-    AccessProfile, AgentRunProjection, PlanItem, PlanItemStatus, PlanState, ProgressSummary,
-    TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, Task, TaskExecutorBinding, TaskKind, TaskPolicy,
-    TaskRuntimePayload, TaskStatus, TaskTier, public_task_output_refs,
-    task_output_ref_is_internal_runtime_failure, text_prohibits_agent_spawn,
-    text_requires_agent_spawn,
+    AccessProfile, AgentContextAccessOperation, AgentContextAccessRecord, AgentContextPackage,
+    AgentContextReference, AgentContextReferenceKind, AgentContextSupplement, AgentRunProjection,
+    PlanItem, PlanItemStatus, PlanState, ProgressSummary, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, Task,
+    TaskExecutorBinding, TaskKind, TaskPolicy, TaskRuntimePayload, TaskStatus, TaskTier,
+    public_task_output_refs, task_output_ref_is_internal_runtime_failure,
+    text_prohibits_agent_spawn, text_requires_agent_spawn,
 };
 pub use token_estimate::estimate_text_tokens;
 pub use value_objects::{AbsolutePath, UtcMillis, WorkspaceRootPath, WorktreeRootPath};

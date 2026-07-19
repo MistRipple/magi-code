@@ -100,6 +100,10 @@ impl BootstrapDto {
             state.task_store(),
             &state.ledger_usage_observations(),
         );
+        crate::dto::apply_configured_model_context_windows(
+            &mut dto.runtime_read_model,
+            &state.settings_store,
+        );
         if let Some(current_session) = dto.current_session.as_ref() {
             let pending_projection =
                 crate::change_projection::collect_session_pending_changes_with_state(

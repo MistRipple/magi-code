@@ -1333,6 +1333,62 @@ export interface TaskPolicyDto {
   escalation_conditions: string[];
 }
 
+export type AgentContextReferenceKind =
+  | 'conversation_turn'
+  | 'task_output'
+  | 'task_evidence'
+  | 'file'
+  | 'knowledge'
+  | 'other';
+
+export interface AgentContextReferenceDto {
+  referenceId: string;
+  kind: AgentContextReferenceKind;
+  title: string;
+  sourceRef: string;
+  preview: string;
+  estimatedTokens: number;
+}
+
+export interface AgentContextSupplementDto {
+  supplementId: string;
+  authorTaskId: string;
+  message: string;
+  references: AgentContextReferenceDto[];
+  estimatedTokens: number;
+  createdAt: number;
+}
+
+export interface AgentContextPackageDto {
+  packageId: string;
+  revision: number;
+  parentTaskId: string;
+  summary: string;
+  constraints: string[];
+  expectedOutput: string;
+  references: AgentContextReferenceDto[];
+  supplements: AgentContextSupplementDto[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface AgentContextAccessRecordDto {
+  recordId: string;
+  operation: 'search' | 'read' | 'send' | 'request';
+  query?: string | null;
+  referenceIds: string[];
+  estimatedTokens: number;
+  occurredAt: number;
+}
+
+export type TaskRuntimePayloadDto =
+  | { kind: 'none' }
+  | {
+      kind: 'agent_context';
+      package: AgentContextPackageDto;
+      accesses: AgentContextAccessRecordDto[];
+    };
+
 export interface TaskDto {
   sessionId?: string;
   workspaceId?: string;
@@ -1356,6 +1412,7 @@ export interface TaskDto {
   output_refs: string[];
   evidence_refs: string[];
   retry_count: number;
+  runtime_payload: TaskRuntimePayloadDto;
   created_at: number;
   updated_at: number;
 }

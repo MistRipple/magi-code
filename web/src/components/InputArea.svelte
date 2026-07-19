@@ -18,6 +18,7 @@
     fetchAgentModelList,
     getAgentSettingsBootstrap,
     resolveAgentBaseUrl,
+    saveAgentModelContextWindow,
     saveAgentOrchestratorSessionConfig,
     fetchWorkspaceBranches,
     checkoutWorkspaceBranch,
@@ -221,6 +222,48 @@
   const contextBudgetState = $derived.by(() => (
     messagesState.orchestratorRuntimeState?.runtimeSnapshot?.budgetState ?? null
   ));
+  const configuredContextWindow = $derived.by(() => {
+    const model = currentPickerModel.trim().toLowerCase();
+    if (!model) return null;
+    const snapshot = messagesState.settingsBootstrapSnapshot;
+    if (!settingsBootstrapMatchesCurrentWorkspace(snapshot)) return null;
+    const value = snapshot?.modelContextWindows?.[model];
+    return typeof value === 'number' && Number.isFinite(value) && value > 0
+      ? Math.floor(value)
+      : null;
+  });
+  const contextBudgetView = $derived.by(() => {
+    const budget = contextBudgetState;
+    const model = currentPickerModel.trim().toLowerCase();
+    const budgetModel = budget?.resolvedModel?.trim().toLowerCase() || '';
+    const runtimeWindow = !budgetModel || budgetModel === model
+      ? budget?.tokenLimit ?? null
+      : null;
+    const tokenLimit = configuredContextWindow ?? runtimeWindow;
+    if (!budget || tokenLimit == null || tokenLimit <= 0) {
+      return {
+        ...(budget ?? {}),
+        tokenLimit,
+      };
+    }
+    const tokenUsed = Math.max(0, Math.floor(budget.tokenUsed ?? 0));
+    const usageRatio = Math.min(1, tokenUsed / tokenLimit);
+    const warningLevel: 'normal' | 'notice' | 'warning' | 'danger' = usageRatio >= 0.9
+      ? 'danger'
+      : usageRatio >= 0.8
+        ? 'warning'
+        : usageRatio >= 0.6
+          ? 'notice'
+          : 'normal';
+    return {
+      ...budget,
+      tokenUsed,
+      tokenLimit,
+      remainingTokens: Math.max(0, tokenLimit - tokenUsed),
+      usageRatio,
+      warningLevel,
+    };
+  });
   const currentAccessProfileOption = $derived.by(() => (
     accessProfileOptions.find((option) => option.value === selectedAccessProfile)
     ?? accessProfileOptions[1]
@@ -1663,6 +1706,22 @@
     }
   }
 
+  async function saveCurrentModelContextWindow(contextWindowTokens: number): Promise<void> {
+    const model = currentPickerModel.trim();
+    if (!model) {
+      throw new Error(i18n.t('input.contextRing.modelRequired'));
+    }
+    const saved = await saveAgentModelContextWindow(model, contextWindowTokens);
+    const snapshot = messagesState.settingsBootstrapSnapshot;
+    if (snapshot && settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
+      messagesState.settingsBootstrapSnapshot = {
+        ...snapshot,
+        modelContextWindows: objectRecord(saved.modelContextWindows) as Record<string, number>,
+      } as AgentSettingsBootstrapSnapshot;
+    }
+    addToast('success', i18n.t('input.contextRing.saved', { model }));
+  }
+
   // 初次拉取分支状态：决定左下角分支入口是否显示，以及当前分支文案。
   function applyBranchResult(result: WorkspaceBranchesResult) {
     branchIsRepo = result.isRepo;
@@ -2780,15 +2839,17 @@
           </div>
           <span class="ia-toolbar-divider" aria-hidden="true"></span>
           <ContextUsageRing
-            usageRatio={contextBudgetState?.usageRatio ?? null}
-            tokenUsed={contextBudgetState?.tokenUsed ?? null}
-            remainingTokens={contextBudgetState?.remainingTokens ?? null}
-            tokenLimit={contextBudgetState?.tokenLimit ?? null}
-            warningLevel={contextBudgetState?.warningLevel ?? null}
-            lastCompactionReason={contextBudgetState?.lastCompactionReason ?? null}
-            originalTokenEstimate={contextBudgetState?.originalTokenEstimate ?? null}
-            compactedTokenEstimate={contextBudgetState?.compactedTokenEstimate ?? null}
-            measurement={contextBudgetState?.measurement ?? null}
+            model={currentPickerModel}
+            usageRatio={contextBudgetView?.usageRatio ?? null}
+            tokenUsed={contextBudgetView?.tokenUsed ?? null}
+            remainingTokens={contextBudgetView?.remainingTokens ?? null}
+            tokenLimit={contextBudgetView?.tokenLimit ?? null}
+            warningLevel={contextBudgetView?.warningLevel ?? null}
+            lastCompactionReason={contextBudgetView?.lastCompactionReason ?? null}
+            originalTokenEstimate={contextBudgetView?.originalTokenEstimate ?? null}
+            compactedTokenEstimate={contextBudgetView?.compactedTokenEstimate ?? null}
+            measurement={contextBudgetView?.measurement ?? null}
+            onSaveContextWindow={saveCurrentModelContextWindow}
           />
         </div>
         <div class="ia-submit-controls">

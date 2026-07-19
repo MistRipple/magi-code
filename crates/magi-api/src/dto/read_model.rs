@@ -7,6 +7,7 @@ use magi_event_bus::{
 };
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecarExport};
+use magi_settings_store::SettingsStore;
 use magi_usage_authority::{evaluate_context_budget, resolve_context_window};
 use magi_workspace::{RecoveryStatus, WorkspaceRecoverySidecarExport};
 use std::collections::{BTreeMap, HashMap};
@@ -102,6 +103,33 @@ fn merge_session_budgets(runtime_read_model: &mut RuntimeReadModelInput) {
         };
         let resolved_model = observation.resolved_model.as_deref().unwrap_or("");
         let context_window = resolve_context_window(resolved_model);
+        let budget =
+            evaluate_context_budget(observation.context_window_tokens as i64, context_window);
+        session.budget = Some(SessionRuntimeBudgetEntry {
+            token_used: budget.tokens_used.max(0) as u64,
+            remaining_tokens: budget.remaining_tokens.max(0) as u64,
+            token_limit: budget.context_window.max(0) as u64,
+            percent_remaining: budget.percent_remaining,
+            usage_ratio: budget.usage_ratio,
+            warning_level: budget.warning_level.as_str().to_string(),
+        });
+    }
+}
+
+pub fn apply_configured_model_context_windows(
+    runtime_read_model: &mut RuntimeReadModelInput,
+    settings_store: &SettingsStore,
+) {
+    for session in &mut runtime_read_model.details.sessions {
+        let Some(observation) = session.usage_observation.as_ref() else {
+            continue;
+        };
+        let resolved_model = observation.resolved_model.as_deref().unwrap_or("");
+        let context_window =
+            magi_conversation_runtime::model_context_window::resolve_model_context_window(
+                Some(settings_store),
+                resolved_model,
+            ) as i64;
         let budget =
             evaluate_context_budget(observation.context_window_tokens as i64, context_window);
         session.budget = Some(SessionRuntimeBudgetEntry {

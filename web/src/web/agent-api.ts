@@ -285,6 +285,11 @@ function normalizeSettingsBootstrapPayload(
     effectiveOrchestratorConfig: normalizeSettingsSectionConfig(payload.effectiveOrchestratorConfig),
     auxiliaryConfig: normalizeSettingsSectionConfig(payload.auxiliaryConfig),
     imageGenerationConfig: normalizeSettingsSectionConfig(payload.imageGenerationConfig),
+    modelContextWindows: Object.fromEntries(
+      Object.entries(normalizeSettingsSectionConfig(payload.modelContextWindows))
+        .filter(([, value]) => typeof value === 'number' && Number.isFinite(value) && value > 0)
+        .map(([model, value]) => [model, Math.floor(value as number)]),
+    ),
     userRulesConfig: normalizeSettingsSectionConfig(payload.userRulesConfig),
     skillsConfig: normalizeSettingsSectionConfig(payload.skillsConfig),
     safeguardConfig: normalizeSettingsSectionConfig(payload.safeguardConfig),
@@ -1794,6 +1799,17 @@ export async function saveAgentOrchestratorSessionConfig(
     { config },
     'save session orchestrator config',
     bindingOverride,
+  );
+}
+
+export async function saveAgentModelContextWindow(
+  model: string,
+  contextWindowTokens: number,
+): Promise<Record<string, unknown>> {
+  return await postWorkspaceBoundJson<Record<string, unknown>>(
+    '/api/settings/model-context-window/save',
+    { model, contextWindowTokens },
+    'save model context window',
   );
 }
 

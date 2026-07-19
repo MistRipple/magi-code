@@ -17,9 +17,9 @@ use crate::tool_surface_state::{
 };
 use crate::{
     ConversationRegistry, MailboxAuthor, MailboxItem, MailboxKind, RoundOutcome,
-    TaskTurnVisibility, TurnDriver, apply_task_final_visibility, apply_task_turn_visibility,
-    apply_task_worker_detail_visibility, canonical_tool_call_name, compact_validation_failure,
-    deterministic_task_final_content, execute_task_tool_call_batch,
+    TaskSignalBoundary, TaskTurnVisibility, TurnDriver, apply_task_final_visibility,
+    apply_task_turn_visibility, apply_task_worker_detail_visibility, canonical_tool_call_name,
+    compact_validation_failure, deterministic_task_final_content, execute_task_tool_call_batch,
     forced_task_tool_choice_for_round, record_completed_required_tools,
     required_tool_chain_is_complete, required_tool_chain_recovery_prompt, task_required_tool_chain,
     task_tool_failure_reason, task_turn_visibility, tool_call_round_limit,
@@ -283,9 +283,28 @@ pub(crate) fn latest_session_usage_observation(
 fn thread_history_compaction_decision(
     history: &[ThreadChatMessage],
     usage_observation: Option<&SessionRuntimeUsageObservation>,
+    context_window_override: Option<u64>,
 ) -> Option<ThreadHistoryCompactionDecision> {
     let estimated_tokens = estimate_thread_history_tokens(history);
     if estimated_tokens <= THREAD_HISTORY_COMPACT_TARGET_TOKENS {
+        return None;
+    }
+
+    if let Some(context_window) = context_window_override {
+        let threshold_tokens = context_window.saturating_mul(AUTO_COMPACT_PERCENT as u64) / 100;
+        let pressure_tokens = usage_observation
+            .map(|observation| observation.context_window_tokens)
+            .unwrap_or_default()
+            .max(estimated_tokens as u64);
+        if pressure_tokens >= threshold_tokens.max(1) {
+            return Some(ThreadHistoryCompactionDecision::ContextWindowPressure {
+                tokens_used: pressure_tokens,
+                token_limit: context_window,
+                threshold_tokens: threshold_tokens.max(1),
+                resolved_model: usage_observation
+                    .and_then(|observation| observation.resolved_model.clone()),
+            });
+        }
         return None;
     }
 
@@ -541,6 +560,7 @@ pub(crate) fn prepare_thread_history(
     thread_id: &ThreadId,
     fallback_history: Vec<ThreadChatMessage>,
     phase: &'static str,
+    context_window_override: Option<u64>,
 ) -> PreparedThreadHistory {
     let mut history = session_store.thread_message_history(thread_id);
     if history.is_empty() && !fallback_history.is_empty() {
@@ -550,8 +570,11 @@ pub(crate) fn prepare_thread_history(
     let original_count = history.len();
     let original_tokens = estimate_thread_history_tokens(&history);
     let usage_observation = latest_session_usage_observation(event_bus, session_id);
-    let Some(decision) = thread_history_compaction_decision(&history, usage_observation.as_ref())
-    else {
+    let Some(decision) = thread_history_compaction_decision(
+        &history,
+        usage_observation.as_ref(),
+        context_window_override,
+    ) else {
         tracing::debug!(
             thread_id = %thread_id,
             session_id = %session_id,
@@ -695,12 +718,15 @@ pub fn run_conversation_loop(
     // 任务系统 切入：经由 ConversationRegistry 拿到本 session 的 Conversation，
     // 用 advance_turn 驱动 Turn 状态机；模型 IO + 工具 IO 段折叠到 driver 内部一次性执行。
     let registry = request.conversation_registry;
+    registry.open_task_signal_channel(request.session_id, request.task_id);
+    let session_id = request.session_id.clone();
+    let task_id = request.task_id.clone();
     let conv_handle = registry.conversation_for_task(request.session_id, request.task_id);
     let driver = ConversationTurnDriver::new(request);
     let mut conversation = conv_handle
         .lock()
         .expect("Conversation mutex poisoned in conversation_loop");
-    match conversation.advance_turn(driver) {
+    let outcome = match conversation.advance_turn(driver) {
         Ok(outcome) => outcome,
         Err(err) => {
             tracing::error!(?err, "conversation_loop advance_turn 失败");
@@ -711,7 +737,9 @@ pub fn run_conversation_loop(
                 None,
             )
         }
-    }
+    };
+    registry.close_task_signal_channel(&session_id, &task_id);
+    outcome
 }
 
 /// 任务系统 — 把一次完整的 LLM IO + 工具 IO 段封装成 TurnDriver round。
@@ -958,6 +986,7 @@ fn run_conversation_loop_inner(
         thread_id,
         Vec::new(),
         "pre_turn",
+        None,
     )
     .messages;
     if !thread_history_snapshot.is_empty() {
@@ -1038,6 +1067,10 @@ fn run_conversation_loop_inner(
 
     let tool_call_round_limit = tool_call_round_limit(&required_tool_chain);
     for round in 0..tool_call_round_limit {
+        append_task_runtime_signals(
+            &mut messages,
+            conversation_registry.drain_task_signals(session_id, task_id),
+        );
         if let Some(registry) = tool_registry {
             let policy = task.policy_snapshot.as_ref();
             let access_profile = policy
@@ -1394,7 +1427,20 @@ fn run_conversation_loop_inner(
                 });
                 continue;
             }
-            break;
+            match conversation_registry.take_task_signals_or_close(session_id, task_id) {
+                TaskSignalBoundary::Pending(signals) => {
+                    messages.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: assistant_history_content.clone(),
+                        images: Vec::new(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                    append_task_runtime_signals(&mut messages, signals);
+                    continue;
+                }
+                TaskSignalBoundary::Closed => break,
+            }
         }
 
         if let Some(recovery_prompt) = agent_spawn_requirement_recovery_prompt(
@@ -1722,6 +1768,7 @@ fn run_conversation_loop_inner(
         thread_id,
         Vec::new(),
         "post_turn",
+        None,
     );
 
     (
@@ -1761,6 +1808,25 @@ fn render_mailbox_items_for_prompt(items: &[MailboxItem]) -> Option<String> {
         }
     }
     Some(rendered)
+}
+
+fn append_task_runtime_signals(
+    messages: &mut Vec<ChatMessage>,
+    signals: Vec<crate::RuntimeSignal>,
+) {
+    if signals.is_empty() {
+        return;
+    }
+    let items = signals
+        .into_iter()
+        .map(MailboxItem::runtime)
+        .collect::<Vec<_>>();
+    if let Some(rendered) = render_mailbox_items_for_prompt(&items) {
+        messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::Mailbox,
+            rendered,
+        ));
+    }
 }
 
 fn validate_task_content_requirements(
@@ -2817,7 +2883,7 @@ mod tests {
             observed_at: Some(UtcMillis(1)),
             ..SessionRuntimeUsageObservation::default()
         };
-        assert!(thread_history_compaction_decision(&history, Some(&low_usage)).is_none());
+        assert!(thread_history_compaction_decision(&history, Some(&low_usage), None).is_none());
 
         let high_usage = SessionRuntimeUsageObservation {
             context_window_tokens: 245_000,
@@ -2825,7 +2891,7 @@ mod tests {
             observed_at: Some(UtcMillis(2)),
             ..SessionRuntimeUsageObservation::default()
         };
-        let decision = thread_history_compaction_decision(&history, Some(&high_usage))
+        let decision = thread_history_compaction_decision(&history, Some(&high_usage), None)
             .expect("high context usage should trigger compaction");
         match decision {
             ThreadHistoryCompactionDecision::ContextWindowPressure {
@@ -2846,10 +2912,10 @@ mod tests {
     #[test]
     fn thread_history_compaction_uses_estimated_prefill_only_without_usage() {
         let normal_history = repeated_thread_history(40, 1_000);
-        assert!(thread_history_compaction_decision(&normal_history, None).is_none());
+        assert!(thread_history_compaction_decision(&normal_history, None, None).is_none());
 
         let huge_history = repeated_thread_history(1_000, 1_000);
-        let decision = thread_history_compaction_decision(&huge_history, None)
+        let decision = thread_history_compaction_decision(&huge_history, None, None)
             .expect("huge cold-start history should trigger estimated prefill compaction");
         match decision {
             ThreadHistoryCompactionDecision::EstimatedPrefill {
@@ -2873,9 +2939,12 @@ mod tests {
             ..SessionRuntimeUsageObservation::default()
         };
 
-        let decision =
-            thread_history_compaction_decision(&huge_history, Some(&low_usage_after_compaction))
-                .expect("完整历史仍超过窗口水位时必须继续压缩，不能因上轮压缩后用量降低而反弹");
+        let decision = thread_history_compaction_decision(
+            &huge_history,
+            Some(&low_usage_after_compaction),
+            None,
+        )
+        .expect("完整历史仍超过窗口水位时必须继续压缩，不能因上轮压缩后用量降低而反弹");
 
         assert!(matches!(
             decision,
@@ -2906,6 +2975,7 @@ mod tests {
             &thread_id,
             fallback_history.clone(),
             "pre_turn",
+            None,
         );
         assert!(first.compaction.is_some());
         assert_eq!(
@@ -2928,6 +2998,7 @@ mod tests {
             &thread_id,
             fallback_history,
             "pre_turn",
+            None,
         );
         assert!(second.compaction.is_none());
         assert_eq!(second.messages.len(), first.messages.len());

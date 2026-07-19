@@ -375,7 +375,10 @@ fn canonicalize_session_orchestrator_section(value: &mut Value) -> bool {
     };
     let mut changed = false;
     object.retain(|key, _| {
-        let keep = matches!(key.as_str(), "model" | "reasoningEffort");
+        let keep = matches!(
+            key.as_str(),
+            "model" | "reasoningEffort" | "previousModel" | "modelSwitchPending"
+        );
         if !keep {
             changed = true;
         }

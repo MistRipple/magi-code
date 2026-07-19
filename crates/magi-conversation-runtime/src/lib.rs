@@ -15,6 +15,7 @@ mod driver;
 pub mod execution_chain_recovery;
 mod mailbox;
 pub mod model_config;
+pub mod model_context_window;
 mod model_error;
 pub mod prompt_utils;
 mod registry;
@@ -45,7 +46,7 @@ pub use driver::{RoundOutcome, TurnDriver};
 pub use mailbox::{MailboxAuthor, MailboxItem, MailboxKind, RuntimeSignal, UserSignal};
 pub use registry::{
     ConversationRegistry, SessionTurnInputBoundary, SessionTurnInputCommitError,
-    SessionTurnInputError,
+    SessionTurnInputError, TaskSignalBoundary, TaskSignalCommitError,
 };
 pub use skill_apply_tool::{
     SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime, skill_apply_tool_definition,

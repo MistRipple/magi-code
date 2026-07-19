@@ -5,6 +5,7 @@
 use crate::model_config::{
     NormalizedModelConfig, configured_role_engine_model_config, resolve_orchestrator_model_config,
 };
+use crate::model_context_window::resolve_model_context_window;
 use magi_bridge_client::{
     BridgeClientError, BridgeResponse, ModelBridgeClient, ModelInvocationRequest,
 };
@@ -17,7 +18,7 @@ use magi_settings_store::SettingsStore;
 use magi_usage_authority::{
     ExecutionBindingIdentity, LlmConfig, UsageCallIdentity, UsageCallRecordInput, UsageCallStatus,
     UsagePhase, UsageSourceRole, UsageTokenInput, evaluate_context_budget,
-    prepare_llm_config_for_persistence, resolve_context_window,
+    prepare_llm_config_for_persistence,
 };
 use std::sync::Arc;
 
@@ -202,6 +203,7 @@ pub fn publish_model_usage_record_with_config(
 #[allow(clippy::too_many_arguments)]
 pub fn publish_context_usage_update(
     event_bus: &InMemoryEventBus,
+    settings_store: Option<&SettingsStore>,
     session_id: &SessionId,
     workspace_id: &Option<WorkspaceId>,
     turn_id: Option<&str>,
@@ -211,7 +213,7 @@ pub fn publish_context_usage_update(
     phase: &str,
     accuracy: &str,
 ) {
-    let context_window = resolve_context_window(resolved_model);
+    let context_window = resolve_model_context_window(settings_store, resolved_model) as i64;
     let budget = evaluate_context_budget(token_used as i64, context_window);
     let updated_at = UtcMillis::now();
     let payload = serde_json::json!({
@@ -359,6 +361,7 @@ fn publish_model_usage_record_internal(
     if publishes_authoritative_context {
         publish_context_usage_update(
             event_bus,
+            settings_store.map(Arc::as_ref),
             session_id,
             &Some(workspace_id.clone()),
             input.turn_id.as_deref(),

@@ -3,6 +3,145 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{MissionId, PlanItemId, TaskId};
 use crate::value_objects::UtcMillis;
 
+/// 子代理上下文引用类型。引用只描述来源，不隐式展开正文；需要正文时必须通过
+/// `context_read` 显式读取。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentContextReferenceKind {
+    ConversationTurn,
+    TaskOutput,
+    TaskEvidence,
+    File,
+    Knowledge,
+    Other,
+}
+
+/// 子代理上下文包中的一条结构化引用。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentContextReference {
+    pub reference_id: String,
+    pub kind: AgentContextReferenceKind,
+    pub title: String,
+    pub source_ref: String,
+    pub preview: String,
+    #[serde(default)]
+    pub estimated_tokens: usize,
+}
+
+/// 主线在代理运行期间发送的上下文补充。补充进入同一个上下文包并递增 revision，
+/// 不建立第二套临时消息事实源。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentContextSupplement {
+    pub supplement_id: String,
+    pub author_task_id: TaskId,
+    pub message: String,
+    #[serde(default)]
+    pub references: Vec<AgentContextReference>,
+    #[serde(default)]
+    pub estimated_tokens: usize,
+    pub created_at: UtcMillis,
+}
+
+/// 子代理唯一的启动上下文合同。它只包含当前子任务需要的摘要、约束、交付定义和
+/// 显式引用；主会话近期记录不再自动复制到子代理 prompt。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentContextPackage {
+    pub package_id: String,
+    pub revision: u64,
+    pub parent_task_id: TaskId,
+    pub summary: String,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    pub expected_output: String,
+    #[serde(default)]
+    pub references: Vec<AgentContextReference>,
+    #[serde(default)]
+    pub supplements: Vec<AgentContextSupplement>,
+    pub created_at: UtcMillis,
+    pub updated_at: UtcMillis,
+}
+
+impl AgentContextPackage {
+    pub fn render_for_prompt(&self) -> String {
+        let constraints = if self.constraints.is_empty() {
+            "- 无额外约束".to_string()
+        } else {
+            self.constraints
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let references = if self.references.is_empty() {
+            "- 无；需要主会话或同一执行链信息时使用 context_search/context_read".to_string()
+        } else {
+            self.references
+                .iter()
+                .map(|item| {
+                    format!(
+                        "- [{}] {} ({:?}, 约 {} tokens): {}",
+                        item.reference_id,
+                        item.title,
+                        item.kind,
+                        item.estimated_tokens,
+                        item.preview
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let supplements = if self.supplements.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n补充上下文：\n{}",
+                self.supplements
+                    .iter()
+                    .map(|item| format!("- [{}] {}", item.supplement_id, item.message))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        format!(
+            "[agent-context-package]\npackage_id: {}\nrevision: {}\nparent_task_id: {}\n任务摘要：{}\n交付要求：{}\n约束：\n{}\n可按需读取的引用：\n{}{}\n\n上下文使用规则：引用预览仅用于判断相关性；需要正文时必须调用 context_read。不得假定拥有主对话完整历史。",
+            self.package_id,
+            self.revision,
+            self.parent_task_id,
+            self.summary,
+            self.expected_output,
+            constraints,
+            references,
+            supplements,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentContextAccessOperation {
+    Search,
+    Read,
+    Send,
+    Request,
+}
+
+/// 上下文访问审计记录。只记录来源标识和 token 估算，不复制隐藏 prompt 或思考内容。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentContextAccessRecord {
+    pub record_id: String,
+    pub operation: AgentContextAccessOperation,
+    pub query: Option<String>,
+    #[serde(default)]
+    pub reference_ids: Vec<String>,
+    #[serde(default)]
+    pub estimated_tokens: usize,
+    pub occurred_at: UtcMillis,
+}
+
 /// 任务系统 L11：任务运行变体。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -450,6 +589,11 @@ impl TaskPolicy {
 pub enum TaskRuntimePayload {
     #[default]
     None,
+    AgentContext {
+        package: Box<AgentContextPackage>,
+        #[serde(default)]
+        accesses: Vec<AgentContextAccessRecord>,
+    },
 }
 
 /// 任务执行器绑定合同。
@@ -553,6 +697,20 @@ pub struct Task {
 }
 
 impl Task {
+    pub fn agent_context_package(&self) -> Option<&AgentContextPackage> {
+        match &self.runtime_payload {
+            TaskRuntimePayload::AgentContext { package, .. } => Some(package.as_ref()),
+            TaskRuntimePayload::None => None,
+        }
+    }
+
+    pub fn agent_context_accesses(&self) -> &[AgentContextAccessRecord] {
+        match &self.runtime_payload {
+            TaskRuntimePayload::AgentContext { accesses, .. } => accesses,
+            TaskRuntimePayload::None => &[],
+        }
+    }
+
     pub fn executor_binding_target_role(&self) -> Option<&str> {
         self.executor_binding
             .as_ref()

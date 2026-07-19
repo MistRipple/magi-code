@@ -1286,14 +1286,16 @@ impl ApiState {
     }
 
     pub fn runtime_read_model_dto(&self) -> RuntimeReadModelDto {
-        runtime_read_model_dto_with_usage(
+        let mut dto = runtime_read_model_dto_with_usage(
             self.event_bus.runtime_read_model_input(),
             &self.session_store.execution_sidecar_exports(),
             &self.workspace_registry.recovery_sidecar_exports(),
             self.audit_usage_ledger_dto(),
             self.task_store(),
             &self.ledger_usage_observations(),
-        )
+        );
+        crate::dto::apply_configured_model_context_windows(&mut dto, &self.settings_store);
+        dto
     }
 
     /// 从已恢复的审计/用量账本回放每会话最近一次用量观测值。
@@ -1371,6 +1373,7 @@ impl ApiState {
             "orchestratorConfig": object_section(&snapshot, "orchestrator"),
             "auxiliaryConfig": object_section(&snapshot, "auxiliary"),
             "imageGenerationConfig": object_section(&snapshot, "imageGeneration"),
+            "modelContextWindows": object_section(&snapshot, "modelContextWindows"),
             "userRulesConfig": object_section(&snapshot, "userRulesConfig"),
             "skillsConfig": skills_config,
             "safeguardConfig": object_section(&snapshot, "safeguardConfig"),

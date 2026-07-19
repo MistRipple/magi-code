@@ -4,6 +4,7 @@
 //! `.map_err(|msg| ApiError::model_invocation_failed("执行 session turn 失败", msg))`
 //! 等方式桥接到 `ApiError` 枚举。
 
+use crate::model_context_window::{resolve_model_context_window, set_model_context_window};
 use crate::{
     ConversationRegistry, SessionTurnInputBoundary, UserSignal,
     conversation_loop::{
@@ -12,8 +13,8 @@ use crate::{
     },
     model_config::resolve_orchestrator_model_config,
     model_error::{
-        classify_model_invocation_error, provider_empty_assistant_response_error,
-        public_model_image_invocation_error_message,
+        classify_model_invocation_error, extract_model_context_limit,
+        provider_empty_assistant_response_error, public_model_image_invocation_error_message,
     },
     prompt_utils::{
         PromptFragmentKind, current_turn_context_priority_prompt,
@@ -39,8 +40,8 @@ use magi_bridge_client::{
     ChatMessage, ChatToolChoice, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest,
     ModelStreamingDelta,
 };
-use magi_core::{AccessProfile, SessionId, UtcMillis, WorkspaceId, estimate_text_tokens};
-use magi_event_bus::InMemoryEventBus;
+use magi_core::{AccessProfile, EventId, SessionId, UtcMillis, WorkspaceId, estimate_text_tokens};
+use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_session_store::{CanonicalTurnItemKind, SessionStore, ThreadChatMessage};
 use magi_settings_store::SettingsStore;
 use magi_snapshot::SnapshotManager;
@@ -414,6 +415,209 @@ fn append_context_compaction_notice(
     }
 }
 
+fn apply_reported_context_limit(
+    event_bus: &InMemoryEventBus,
+    execution_settings_store: Option<&Arc<SettingsStore>>,
+    live_settings_store: &Arc<SettingsStore>,
+    model: &str,
+    context_limit: u64,
+) -> bool {
+    let entries = match set_model_context_window(live_settings_store.as_ref(), model, context_limit)
+    {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                model,
+                context_limit,
+                %error,
+                "保存上游返回的模型上下文窗口失败"
+            );
+            return false;
+        }
+    };
+    if let Some(store) = execution_settings_store {
+        let _ = set_model_context_window(store.as_ref(), model, context_limit);
+    }
+    let updated_at = UtcMillis::now();
+    let _ = event_bus.publish(EventEnvelope::domain(
+        EventId::new(format!(
+            "event-model-context-window-updated-{}",
+            updated_at.0
+        )),
+        "model.context_window.updated",
+        serde_json::json!({
+            "model": model,
+            "contextWindowTokens": context_limit,
+            "modelContextWindows": entries,
+            "source": "provider_error",
+            "updatedAt": updated_at.0,
+        }),
+    ));
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rebuild_messages_for_context_window(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    request: &SessionTurnExecutionRequest,
+    thread_id: &magi_core::ThreadId,
+    prompt: &str,
+    knowledge_context_prompt: Option<&str>,
+    context_window: u64,
+    messages: &mut Vec<ChatMessage>,
+    persist_session_state: Option<&SessionStatePersistCallback>,
+) {
+    let prepared = prepare_thread_history(
+        event_bus,
+        session_store,
+        &request.session_id,
+        &request.workspace_id,
+        thread_id,
+        Vec::new(),
+        "model_switch_recovery",
+        Some(context_window),
+    );
+    if let Some(compaction) = prepared.compaction.as_ref() {
+        append_context_compaction_notice(
+            event_bus,
+            session_store,
+            request,
+            thread_id,
+            compaction,
+            persist_session_state,
+        );
+    }
+    let mut history = prepared.messages;
+    if history
+        .last()
+        .is_some_and(|message| message.role == "user" && message.content.as_deref() == Some(prompt))
+    {
+        history.pop();
+    }
+    *messages = build_session_turn_messages(
+        session_store,
+        request,
+        prompt,
+        knowledge_context_prompt,
+        &history,
+    );
+}
+
+fn activate_previous_model_fallback(
+    event_bus: &InMemoryEventBus,
+    execution_settings_store: Option<&Arc<SettingsStore>>,
+    session_store: &SessionStore,
+    request: &SessionTurnExecutionRequest,
+    thread_id: &magi_core::ThreadId,
+    recovery: &SessionModelSwitchRecoveryRuntime,
+    provider_limit_was_applied: bool,
+    persist_session_state: Option<&SessionStatePersistCallback>,
+) -> bool {
+    let mut section = recovery
+        .live_settings_store
+        .get_session_section(&request.session_id, "orchestrator");
+    let Some(fields) = section.as_object_mut() else {
+        return false;
+    };
+    fields.insert(
+        "model".to_string(),
+        serde_json::Value::String(recovery.previous_model.clone()),
+    );
+    fields.remove("previousModel");
+    fields.remove("modelSwitchPending");
+    if let Err(error) = recovery.live_settings_store.set_session_section(
+        &request.session_id,
+        "orchestrator",
+        section.clone(),
+    ) {
+        tracing::warn!(
+            session_id = %request.session_id,
+            %error,
+            "恢复上一个主模型配置失败"
+        );
+        return false;
+    }
+    if let Some(store) = execution_settings_store {
+        let _ = store.set_session_section(&request.session_id, "orchestrator", section.clone());
+    }
+
+    let notice = if request.product_locale == "en-US" {
+        if provider_limit_was_applied {
+            format!(
+                "{} still could not accommodate the current conversation within the context limit reported by the service. Switched back to {} and continued this turn.",
+                recovery.target_model, recovery.previous_model
+            )
+        } else {
+            format!(
+                "{} could not accommodate the current conversation and the service did not report a usable context limit. Switched back to {} and continued this turn.",
+                recovery.target_model, recovery.previous_model
+            )
+        }
+    } else if provider_limit_was_applied {
+        format!(
+            "目标模型 {} 在服务返回的上下文上限内仍无法容纳当前对话。已切换回 {} 并继续处理本轮请求。",
+            recovery.target_model, recovery.previous_model
+        )
+    } else {
+        format!(
+            "目标模型 {} 无法容纳当前对话，且服务未提供可用的上下文上限。已切换回 {} 并继续处理本轮请求。",
+            recovery.target_model, recovery.previous_model
+        )
+    };
+    let mut item = session_turn_item(
+        "assistant_phase",
+        "completed",
+        Some(notice.clone()),
+        Some(notice),
+        Some(format!(
+            "turn-item-model-context-fallback-{}",
+            UtcMillis::now().0
+        )),
+        thread_id.clone(),
+    );
+    item.metadata.insert(
+        "noticeKind".to_string(),
+        serde_json::Value::String("model_context_fallback".to_string()),
+    );
+    item.metadata.insert(
+        "noticeType".to_string(),
+        serde_json::Value::String("warning".to_string()),
+    );
+    if let Some(published) = append_session_turn_item(session_store, &request.session_id, item) {
+        persist_session_state_checkpoint(persist_session_state, "model_context_fallback_notice");
+        publish_session_turn_item_event(
+            event_bus,
+            &request.session_id,
+            &request.workspace_id,
+            &published,
+        );
+    }
+
+    let updated_at = UtcMillis::now();
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-session-configuration-updated-{}-{}",
+                request.session_id, updated_at.0
+            )),
+            "session.configuration.updated",
+            serde_json::json!({
+                "sessionId": request.session_id.to_string(),
+                "workspaceId": request.workspace_id.as_ref().map(ToString::to_string),
+                "orchestratorSessionConfig": section,
+                "reason": "model_context_fallback",
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: request.workspace_id.clone(),
+            session_id: Some(request.session_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+    true
+}
+
 pub struct SessionTurnExecutionRuntime<'a> {
     pub client: &'a dyn ModelBridgeClient,
     pub event_bus: &'a InMemoryEventBus,
@@ -432,6 +636,15 @@ pub struct SessionTurnExecutionRuntime<'a> {
     pub knowledge_context_prompt: Option<String>,
     pub tools: Option<Vec<ChatToolDefinition>>,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
+    pub live_settings_store: Option<Arc<SettingsStore>>,
+    pub model_switch_recovery: Option<SessionModelSwitchRecoveryRuntime>,
+}
+
+pub struct SessionModelSwitchRecoveryRuntime {
+    pub target_model: String,
+    pub previous_model: String,
+    pub fallback_client: Arc<dyn ModelBridgeClient>,
+    pub live_settings_store: Arc<SettingsStore>,
 }
 
 pub fn run_session_turn_execution(
@@ -484,6 +697,8 @@ fn run_session_turn_execution_inner(
         knowledge_context_prompt,
         tools,
         persist_session_state,
+        live_settings_store,
+        model_switch_recovery,
     } = runtime;
 
     if !request_turn_is_writable(session_store, &request) {
@@ -498,6 +713,13 @@ fn run_session_turn_execution_inner(
     let orchestrator_mission_id = orchestrator_thread.mission_id;
 
     let fallback_history = canonical_session_turn_history(session_store, &request);
+    let resolved_context_model = settings_store
+        .and_then(|store| resolve_orchestrator_model_config(store, Some(&request.session_id)).ok())
+        .and_then(|config| config.to_usage_llm_config())
+        .map(|config| config.model)
+        .unwrap_or_default();
+    let configured_context_window =
+        resolve_model_context_window(settings_store.map(Arc::as_ref), &resolved_context_model);
     let prepared_history = prepare_thread_history(
         event_bus,
         session_store,
@@ -506,6 +728,7 @@ fn run_session_turn_execution_inner(
         &orchestrator_thread_id,
         fallback_history,
         "pre_turn",
+        Some(configured_context_window),
     );
     if let Some(compaction) = prepared_history.compaction.as_ref() {
         append_context_compaction_notice(
@@ -540,6 +763,9 @@ fn run_session_turn_execution_inner(
     let mut active_tools = tools.unwrap_or_default();
     let mut completed_required_tool_names: Vec<String> = Vec::new();
     let usage_binding = session_turn_model_usage_binding(request.use_tools);
+    let mut active_client = client;
+    let mut corrected_context_limit = false;
+    let mut fallback_activated = false;
 
     let mut round_limit = tool_call_round_limit(&request.required_tool_chain);
     let mut round = 0usize;
@@ -560,7 +786,7 @@ fn run_session_turn_execution_inner(
         let round_tools = (!active_tools.is_empty()).then_some(active_tools.clone());
         let streamed_content = match stream_session_turn_round(
             SessionTurnRoundRuntime {
-                client,
+                client: active_client,
                 event_bus,
                 session_store,
                 plan_store,
@@ -587,6 +813,67 @@ fn run_session_turn_execution_inner(
             Err(error) => {
                 if !request_turn_is_writable(session_store, &request) {
                     return Ok(SessionTurnExecutionOutput::interrupted());
+                }
+                let classification = classify_model_invocation_error(&error);
+                if classification.code == "model_context_limit" && round == 0 {
+                    if !corrected_context_limit
+                        && let Some(context_limit) = extract_model_context_limit(&error)
+                        && let Some(live_settings_store) = live_settings_store.as_ref()
+                        && apply_reported_context_limit(
+                            event_bus,
+                            settings_store,
+                            live_settings_store,
+                            &resolved_context_model,
+                            context_limit,
+                        )
+                    {
+                        corrected_context_limit = true;
+                        rebuild_messages_for_context_window(
+                            event_bus,
+                            session_store,
+                            &request,
+                            &orchestrator_thread_id,
+                            &prompt,
+                            knowledge_context_prompt.as_deref(),
+                            context_limit,
+                            &mut messages,
+                            persist_session_state,
+                        );
+                        continue;
+                    }
+
+                    if let Some(recovery) = model_switch_recovery.as_ref()
+                        && !fallback_activated
+                        && activate_previous_model_fallback(
+                            event_bus,
+                            settings_store,
+                            session_store,
+                            &request,
+                            &orchestrator_thread_id,
+                            recovery,
+                            corrected_context_limit,
+                            persist_session_state,
+                        )
+                    {
+                        let previous_context_window = resolve_model_context_window(
+                            Some(recovery.live_settings_store.as_ref()),
+                            &recovery.previous_model,
+                        );
+                        rebuild_messages_for_context_window(
+                            event_bus,
+                            session_store,
+                            &request,
+                            &orchestrator_thread_id,
+                            &prompt,
+                            knowledge_context_prompt.as_deref(),
+                            previous_context_window,
+                            &mut messages,
+                            persist_session_state,
+                        );
+                        active_client = recovery.fallback_client.as_ref();
+                        fallback_activated = true;
+                        continue;
+                    }
                 }
                 let execution_error = session_turn_model_error(&request, &error);
                 append_session_turn_error_item(
@@ -1001,6 +1288,7 @@ fn stream_session_turn_round(
         .saturating_add(estimate_tool_definition_tokens(tools.as_deref()));
     publish_context_usage_update(
         event_bus,
+        settings_store.map(Arc::as_ref),
         &request.session_id,
         &request.workspace_id,
         Some(&request.turn_id),
@@ -1029,6 +1317,7 @@ fn stream_session_turn_round(
         {
             publish_context_usage_update(
                 event_bus,
+                settings_store.map(Arc::as_ref),
                 &request.session_id,
                 &request.workspace_id,
                 Some(&request.turn_id),
@@ -1754,6 +2043,8 @@ mod tests {
             knowledge_context_prompt: None,
             tools: None,
             persist_session_state: None,
+            live_settings_store: None,
+            model_switch_recovery: None,
         })
         .expect("cancelled model invocation should resolve as interrupted turn");
         assert!(output.interrupted);
@@ -1938,6 +2229,8 @@ mod tests {
             knowledge_context_prompt: None,
             tools: None,
             persist_session_state: None,
+            live_settings_store: None,
+            model_switch_recovery: None,
         })
         .expect("steered turn should complete");
 
@@ -2177,6 +2470,8 @@ mod tests {
             knowledge_context_prompt: None,
             tools: None,
             persist_session_state: None,
+            live_settings_store: None,
+            model_switch_recovery: None,
         });
 
         assert!(matches!(
@@ -2284,6 +2579,8 @@ mod tests {
             knowledge_context_prompt: None,
             tools: None,
             persist_session_state: None,
+            live_settings_store: None,
+            model_switch_recovery: None,
         }) {
             Ok(_) => panic!("empty provider response should fail"),
             Err(error) => error,
@@ -2385,6 +2682,8 @@ mod tests {
             knowledge_context_prompt: None,
             tools: None,
             persist_session_state: None,
+            live_settings_store: None,
+            model_switch_recovery: None,
         }) {
             Ok(_) => panic!("incomplete stream should fail the turn"),
             Err(error) => error,
@@ -2490,6 +2789,8 @@ mod tests {
             knowledge_context_prompt: None,
             tools: None,
             persist_session_state: None,
+            live_settings_store: None,
+            model_switch_recovery: None,
         }) {
             Ok(_) => panic!("image provider empty stream should fail"),
             Err(error) => error,
@@ -3736,6 +4037,253 @@ mod tests {
                 .recent_events
                 .iter()
                 .any(|event| event.event_type == "session.turn.item")
+        );
+    }
+
+    #[test]
+    fn provider_context_limit_updates_live_and_execution_settings() {
+        let live = Arc::new(SettingsStore::new());
+        let execution = Arc::new(live.execution_snapshot());
+        let event_bus = InMemoryEventBus::new(16);
+
+        assert!(apply_reported_context_limit(
+            &event_bus,
+            Some(&execution),
+            &live,
+            "candidate-model",
+            262_144,
+        ));
+        assert_eq!(
+            resolve_model_context_window(Some(live.as_ref()), "candidate-model"),
+            262_144
+        );
+        assert_eq!(
+            resolve_model_context_window(Some(execution.as_ref()), "candidate-model"),
+            262_144
+        );
+        assert!(
+            event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .any(|event| event.event_type == "model.context_window.updated")
+        );
+    }
+
+    #[test]
+    fn context_fallback_restores_previous_model_and_writes_notice() {
+        let session_id = SessionId::new("session-context-fallback");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "context fallback")
+            .unwrap();
+        let (_mission_id, thread_id) = store.ensure_session_mission(&session_id, ts(1), || {
+            magi_core::MissionId::new("mission-context-fallback")
+        });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-context-fallback".to_string(),
+                    turn_seq: 1,
+                    accepted_at: ts(2),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("继续".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .unwrap();
+        let live = Arc::new(SettingsStore::new());
+        live.set_session_section(
+            &session_id,
+            "orchestrator",
+            serde_json::json!({
+                "model": "candidate-model",
+                "reasoningEffort": "high",
+                "previousModel": "verified-model",
+                "modelSwitchPending": true
+            }),
+        )
+        .unwrap();
+        let execution = Arc::new(live.execution_snapshot());
+        let recovery = SessionModelSwitchRecoveryRuntime {
+            target_model: "candidate-model".to_string(),
+            previous_model: "verified-model".to_string(),
+            fallback_client: Arc::new(StreamingTextModelBridgeClient {
+                delta_content: "完成".to_string(),
+                payload: serde_json::json!({ "content": "完成", "finish_reason": "stop" })
+                    .to_string(),
+            }),
+            live_settings_store: live.clone(),
+        };
+        let event_bus = InMemoryEventBus::new(32);
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: "turn-context-fallback".to_string(),
+            workspace_id: None,
+            prompt: "继续".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: false,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
+            workspace_root_path: None,
+        };
+
+        assert!(activate_previous_model_fallback(
+            &event_bus,
+            Some(&execution),
+            &store,
+            &request,
+            &thread_id,
+            &recovery,
+            false,
+            None,
+        ));
+        let restored = live.get_session_section(&session_id, "orchestrator");
+        assert_eq!(restored["model"], serde_json::json!("verified-model"));
+        assert!(restored.get("previousModel").is_none());
+        assert!(restored.get("modelSwitchPending").is_none());
+        let turn = store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .unwrap();
+        assert!(turn.items.iter().any(|item| {
+            item.metadata.get("noticeKind") == Some(&serde_json::json!("model_context_fallback"))
+        }));
+    }
+
+    #[test]
+    fn context_limit_without_reported_window_retries_current_turn_on_previous_model() {
+        let session_id = SessionId::new("session-context-fallback-turn");
+        let turn_id = "turn-context-fallback-turn".to_string();
+        let store = Arc::new(SessionStore::new());
+        store
+            .create_session(session_id.clone(), "context fallback turn")
+            .unwrap();
+        let (_mission_id, thread_id) = store.ensure_session_mission(&session_id, ts(1), || {
+            magi_core::MissionId::new("mission-context-fallback-turn")
+        });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: turn_id.clone(),
+                    turn_seq: 1,
+                    accepted_at: ts(2),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("继续处理".to_string()),
+                    items: vec![session_turn_item(
+                        "user_message",
+                        "completed",
+                        None,
+                        Some("继续处理".to_string()),
+                        Some("user-context-fallback-turn".to_string()),
+                        thread_id,
+                    )],
+                },
+            )
+            .unwrap();
+        let registry = ConversationRegistry::new();
+        registry
+            .begin_session_turn_input(session_id.clone(), turn_id.clone())
+            .unwrap();
+        let live = Arc::new(SettingsStore::new());
+        live.set_session_section(
+            &session_id,
+            "orchestrator",
+            serde_json::json!({
+                "model": "candidate-model",
+                "reasoningEffort": "medium",
+                "previousModel": "verified-model",
+                "modelSwitchPending": true
+            }),
+        )
+        .unwrap();
+        let execution = Arc::new(live.execution_snapshot());
+        let target_client = FailingModelBridgeClient {
+            message: "http_status=400 body=context length exceeded".to_string(),
+        };
+        let event_bus = InMemoryEventBus::new(64);
+        let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
+        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
+            client: &target_client,
+            event_bus: &event_bus,
+            session_store: store.as_ref(),
+            conversation_registry: &registry,
+            plan_store: &plan_store,
+            settings_store: Some(&execution),
+            safety_gate: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            snapshot_manager: None,
+            request: SessionTurnExecutionRequest {
+                session_id: session_id.clone(),
+                turn_id,
+                workspace_id: None,
+                prompt: "继续处理".to_string(),
+                images: Vec::new(),
+                context_references: Vec::new(),
+                use_tools: false,
+                access_profile: AccessProfile::Restricted,
+                skill_name: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+                forced_tool_name: None,
+                required_tool_chain: Vec::new(),
+                goal_turn_mode: SessionGoalTurnMode::None,
+                product_locale: "zh-CN".to_string(),
+                workspace_root_path: None,
+            },
+            prompt: "继续处理".to_string(),
+            knowledge_context_prompt: None,
+            tools: None,
+            persist_session_state: None,
+            live_settings_store: Some(live.clone()),
+            model_switch_recovery: Some(SessionModelSwitchRecoveryRuntime {
+                target_model: "candidate-model".to_string(),
+                previous_model: "verified-model".to_string(),
+                fallback_client: Arc::new(StreamingTextModelBridgeClient {
+                    delta_content: "已继续处理".to_string(),
+                    payload: serde_json::json!({
+                        "content": "已继续处理",
+                        "finish_reason": "stop"
+                    })
+                    .to_string(),
+                }),
+                live_settings_store: live.clone(),
+            }),
+        })
+        .expect("previous model should continue the current turn");
+
+        assert_eq!(output.final_content, "已继续处理");
+        assert_eq!(
+            live.get_session_section(&session_id, "orchestrator")["model"],
+            serde_json::json!("verified-model")
+        );
+        let turn = store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .unwrap();
+        assert!(turn.items.iter().any(|item| {
+            item.metadata.get("noticeKind") == Some(&serde_json::json!("model_context_fallback"))
+        }));
+        assert!(
+            turn.items
+                .iter()
+                .any(|item| item.content.as_deref() == Some("已继续处理"))
         );
     }
 

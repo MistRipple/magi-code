@@ -1604,6 +1604,11 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
 
+  if (eventType === 'model.context_window.updated') {
+    refreshSettingsBootstrapForCurrentWorkspace('model_context_window_updated');
+    return;
+  }
+
   if (eventType === 'workspace.git.context.changed') {
     window.dispatchEvent(new CustomEvent('magi:workspaceContentChanged', {
       detail: {

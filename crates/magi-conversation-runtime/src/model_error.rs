@@ -96,6 +96,60 @@ pub(crate) fn classify_model_invocation_error(
     }
 }
 
+pub(crate) fn extract_model_context_limit(raw_error: &str) -> Option<u64> {
+    let normalized = raw_error.to_ascii_lowercase().replace([',', '_'], "");
+    const MARKERS: &[&str] = &[
+        "maximum context length is ",
+        "maximum context length: ",
+        "maximum allowed input tokens is ",
+        "maximum allowed input is ",
+        "max context length is ",
+        "maxcontextlength\":",
+        "context window is ",
+        "context window: ",
+        "token limit is ",
+        "token limit: ",
+    ];
+    for marker in MARKERS {
+        if let Some(index) = normalized.find(marker)
+            && let Some(limit) = first_unsigned_integer(&normalized[index + marker.len()..])
+            && (crate::model_context_window::MIN_MODEL_CONTEXT_WINDOW
+                ..=crate::model_context_window::MAX_MODEL_CONTEXT_WINDOW)
+                .contains(&limit)
+        {
+            return Some(limit);
+        }
+    }
+
+    for (index, _) in normalized.match_indices('>') {
+        let suffix = &normalized[index + 1..];
+        let Some(limit) = first_unsigned_integer(suffix) else {
+            continue;
+        };
+        let qualifier = suffix
+            .find(|character: char| !character.is_ascii_digit() && !character.is_whitespace())
+            .map(|end| &suffix[..suffix.len().min(end.saturating_add(32))])
+            .unwrap_or(suffix);
+        if qualifier.contains("maximum")
+            && (crate::model_context_window::MIN_MODEL_CONTEXT_WINDOW
+                ..=crate::model_context_window::MAX_MODEL_CONTEXT_WINDOW)
+                .contains(&limit)
+        {
+            return Some(limit);
+        }
+    }
+    None
+}
+
+fn first_unsigned_integer(value: &str) -> Option<u64> {
+    let start = value.find(|character: char| character.is_ascii_digit())?;
+    let digits = value[start..]
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
+
 #[cfg(test)]
 pub(crate) fn public_model_invocation_error_message(raw_error: &str) -> String {
     classify_model_invocation_error(raw_error)
@@ -237,6 +291,25 @@ mod tests {
             ),
             "模型响应超时，可直接继续重试。"
         );
+    }
+
+    #[test]
+    fn model_context_limit_extraction_covers_common_provider_messages() {
+        assert_eq!(
+            extract_model_context_limit(
+                "maximum context length is 262144 tokens, however you requested 620000"
+            ),
+            Some(262_144)
+        );
+        assert_eq!(
+            extract_model_context_limit("prompt is too long: 620000 > 262144 maximum"),
+            Some(262_144)
+        );
+        assert_eq!(
+            extract_model_context_limit("body={\"max_context_length\":200000}"),
+            Some(200_000)
+        );
+        assert_eq!(extract_model_context_limit("context length exceeded"), None);
     }
 
     #[test]

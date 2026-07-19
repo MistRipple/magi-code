@@ -187,7 +187,11 @@ impl BuiltinTool for NormalizedBuiltinTool {
             | BuiltinToolName::CreateGoal
             | BuiltinToolName::UpdateGoal => execute_orchestration_only(self.name, input),
             BuiltinToolName::AgentSpawn
+            | BuiltinToolName::AgentSend
             | BuiltinToolName::AgentWait
+            | BuiltinToolName::ContextSearch
+            | BuiltinToolName::ContextRead
+            | BuiltinToolName::ContextRequest
             | BuiltinToolName::UpdatePlan
             | BuiltinToolName::MemoryWrite => execute_orchestration_only(self.name, input),
         }
