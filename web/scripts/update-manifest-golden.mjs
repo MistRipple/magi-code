@@ -50,6 +50,10 @@ assert.doesNotMatch(
 assert.match(releaseWorkflow, /\.AppImage\.sig/, 'Linux updater validation must use the signed AppImage');
 assert.match(releaseWorkflow, /\.exe\.sig/, 'Windows updater validation must use the signed NSIS installer');
 assert.match(releaseWorkflow, /runner: macos-15/, 'release builds must pin the macOS runner image');
+assert.match(releaseWorkflow, /platform: macos-intel[\s\S]*runner: macos-13/, 'release builds must include the Intel macOS runner');
+assert.match(releaseWorkflow, /macos_assets\[@\]\}.*-eq 2/, 'release validation must require both macOS installers');
+assert.match(releaseWorkflow, /update_assets\[@\]\}.*-eq 4/, 'release validation must require both macOS updater archives');
+assert.match(releaseWorkflow, /macOS Apple Silicon[\s\S]*macOS Intel/, 'release notes must distinguish both macOS architectures');
 assert.doesNotMatch(releaseWorkflow, /macos-latest/, 'release builds must not drift with macos-latest');
 assert.match(releaseWorkflow, /actions\/checkout@v7/g, 'release workflow must use the Node 24 checkout action');
 assert.match(releaseWorkflow, /actions\/setup-node@v7/g, 'release workflow must use the Node 24 setup-node action');
@@ -96,6 +100,11 @@ const manifest = createUpdateManifest({
       signature: 'signed-macos',
     },
     {
+      target: 'darwin-x86_64-app',
+      filename: 'Magi_3.0.5_darwin-x86_64-app.tar.gz',
+      signature: 'signed-macos-intel',
+    },
+    {
       target: 'linux-x86_64-appimage',
       filename: 'Magi_3.0.5_linux-x86_64-appimage.tar.gz',
       signature: 'signed-linux',
@@ -110,6 +119,7 @@ assert.equal(
   'https://github.com/MistRipple/magi-code/releases/download/v3.0.5/Magi_3.0.5_darwin-aarch64-app.tar.gz',
 );
 assert.equal(manifest.platforms['darwin-aarch64-app'].signature, 'signed-macos');
+assert.equal(manifest.platforms['darwin-x86_64-app'].signature, 'signed-macos-intel');
 assert.equal(manifest.platforms['linux-x86_64-appimage'].signature, 'signed-linux');
 
 assert.throws(
@@ -133,6 +143,7 @@ const cliFixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'magi-update-manifes
 try {
   const fixtureAssets = [
     'Magi_3.0.5_darwin-aarch64-app.tar.gz',
+    'Magi_3.0.5_darwin-x86_64-app.tar.gz',
     'Magi_3.0.5_linux-x86_64-appimage.AppImage',
     'Magi_3.0.5_windows-x86_64-nsis.exe',
   ];

@@ -85,6 +85,9 @@ jobs:
           - platform: macos
             runner: macos-15
             bundles: app,dmg
+          - platform: macos-intel
+            runner: macos-13
+            bundles: app,dmg
           - platform: linux
             runner: ubuntu-22.04
             bundles: appimage,deb
@@ -177,7 +180,7 @@ jobs:
         run: |
           set -euo pipefail
           case "${{ matrix.platform }}" in
-            macos)
+            macos|macos-intel)
               shopt -s nullglob
               assets=(target/release/bundle/dmg/*.dmg)
               test "${#assets[@]}" -eq 1
@@ -250,7 +253,7 @@ jobs:
               ;;
           esac
           case "${{ matrix.platform }}" in
-            macos)
+            macos|macos-intel)
               updater=(target/release/bundle/macos/*.app.tar.gz)
               signatures=(target/release/bundle/macos/*.app.tar.gz.sig)
               target="darwin-${host_arch}-app"
@@ -283,7 +286,11 @@ jobs:
           cp "${signatures[0]}" "dist/package-assets/$updater_name.sig"
           for file in "${install[@]}"; do
             test -s "$file"
-            cp "$file" dist/package-assets/
+            destination="$(basename "$file")"
+            if [[ "${{ matrix.platform }}" == "macos" || "${{ matrix.platform }}" == "macos-intel" ]]; then
+              destination="Magi_${version}_${host_arch}.dmg"
+            fi
+            cp "$file" "dist/package-assets/$destination"
           done
           ls -lh dist/package-assets
 
@@ -305,7 +312,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 收集三平台安装包
+      - name: 收集桌面安装包
         uses: actions/download-artifact@v8
         with:
           pattern: magi-bundle-*
@@ -324,7 +331,9 @@ jobs:
           while IFS= read -r file; do linux_debs+=("$file"); done < <(find dist/release-assets -type f -name '*.deb' -print)
           while IFS= read -r file; do windows_installers+=("$file"); done < <(find dist/release-assets -type f -name '*.exe' -print)
 
-          test "${#macos_assets[@]}" -ge 1
+          test "${#macos_assets[@]}" -eq 2
+          test "$(find dist/release-assets -maxdepth 1 -type f -name 'Magi_*_aarch64.dmg' | wc -l | tr -d ' ')" -eq 1
+          test "$(find dist/release-assets -maxdepth 1 -type f -name 'Magi_*_x86_64.dmg' | wc -l | tr -d ' ')" -eq 1
           test "${#linux_appimages[@]}" -eq 1
           test "${#linux_debs[@]}" -eq 1
           test "${#windows_installers[@]}" -eq 1
@@ -332,7 +341,7 @@ jobs:
           update_signatures=()
           while IFS= read -r file; do update_assets+=("$file"); done < <(find dist/release-assets -maxdepth 1 -type f \( -name 'Magi_*_darwin-*.tar.gz' -o -name 'Magi_*_linux-*.AppImage' -o -name 'Magi_*_windows-*.exe' \) -print)
           while IFS= read -r file; do update_signatures+=("$file"); done < <(find dist/release-assets -maxdepth 1 -type f \( -name 'Magi_*_*.tar.gz.sig' -o -name 'Magi_*_*.AppImage.sig' -o -name 'Magi_*_*.exe.sig' \) -print)
-          test "${#update_assets[@]}" -eq 3
+          test "${#update_assets[@]}" -eq 4
           test "${#update_assets[@]}" -eq "${#update_signatures[@]}"
           for file in "${macos_assets[@]}" "${linux_appimages[@]}" "${linux_debs[@]}" "${windows_installers[@]}" "${update_assets[@]}" "${update_signatures[@]}"; do
             test -s "$file"
@@ -358,7 +367,8 @@ jobs:
             exit 1
           }
 
-          macos_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.dmg' -print -quit)")"
+          macos_arm64_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name 'Magi_*_aarch64.dmg' -print -quit)")"
+          macos_intel_asset="$(basename "$(find dist/release-assets -maxdepth 1 -name 'Magi_*_x86_64.dmg' -print -quit)")"
           linux_appimage="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.AppImage' -print -quit)")"
           linux_deb="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.deb' -print -quit)")"
           windows_installer="$(basename "$(find dist/release-assets -maxdepth 1 -name '*.exe' -print -quit)")"
@@ -372,7 +382,8 @@ jobs:
             echo
             echo "## 下载"
             echo
-            echo "- macOS：\`$macos_asset\`"
+            echo "- macOS Apple Silicon：\`$macos_arm64_asset\`"
+            echo "- macOS Intel：\`$macos_intel_asset\`"
             echo "- Linux AppImage：\`$linux_appimage\`"
             echo "- Linux Deb：\`$linux_deb\`"
             echo "- Windows NSIS：\`$windows_installer\`"

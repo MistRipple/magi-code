@@ -35,7 +35,7 @@ npm --prefix web run build
 cargo run -p magi-desktop
 ```
 
-三平台发布统一由 Tauri 生成 macOS DMG、Linux AppImage/Deb 与 Windows NSIS 安装器，旧手工包装脚本已移除。
+发布统一由 Tauri 生成 macOS Apple Silicon/Intel DMG、Linux AppImage/Deb 与 Windows NSIS 安装器，旧手工包装脚本已移除。
 
 ## 目标与代理运行设计
 

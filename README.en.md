@@ -125,7 +125,7 @@ npm --prefix web run build
 cargo run -p magi-desktop
 ~~~
 
-The Tauri 2 desktop host targets macOS DMG, Linux AppImage/Deb, and Windows NSIS. Pushing a version-matching `v*` tag triggers GitHub Actions to build the installers, signed updater archives, and a Release containing `latest.json`. Installed desktop builds check for updates at startup and periodically while running. Updates download and verify in the background, then wait for the user to choose **Restart now** or **Restart later** instead of interrupting active work. Before installation, Magi persists its state and stops the local service gracefully. Runtime data under `~/.magi` stays outside the application bundle and is preserved across updates.
+The Tauri 2 desktop host targets macOS DMG for both Apple Silicon and Intel, Linux AppImage/Deb, and Windows NSIS. Pushing a version-matching `v*` tag triggers GitHub Actions to build the installers, signed updater archives, and a Release containing `latest.json`. Installed desktop builds check for updates at startup and periodically while running. Updates download and verify in the background, then wait for the user to choose **Restart now** or **Restart later** instead of interrupting active work. Before installation, Magi persists its state and stops the local service gracefully. Runtime data under `~/.magi` stays outside the application bundle and is preserved across updates.
 
 Release builds require the `TAURI_SIGNING_PRIVATE_KEY` GitHub Repository Secret and may use `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The private key is used only by GitHub Actions and is never committed or bundled; the public key is stored in `apps/desktop/tauri.conf.json` for client-side verification.
 

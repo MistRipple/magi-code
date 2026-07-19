@@ -225,7 +225,7 @@ cargo run -p magi-desktop
 
 桌面端基于 Tauri 2，目标平台包括：
 
-- macOS DMG
+- macOS DMG（Apple Silicon 与 Intel）
 - Linux AppImage 与 Deb
 - Windows NSIS 安装器
 
