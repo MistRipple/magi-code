@@ -19,7 +19,8 @@ use magi_orchestrator::{
 };
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-    ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurn, SessionStore, TimelineEntryKind,
+    ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurn, SessionStore, TimelineEntryInput,
+    TimelineEntryKind,
 };
 use magi_spawn_graph::SpawnGraph;
 
@@ -505,10 +506,12 @@ pub fn accept_dispatch_submission(
                 .replace_current_turn_with_active_execution_chain_and_timeline_entry(
                     request.session_id.clone(),
                     replace_turn_id,
-                    request.entry_id.clone(),
-                    TimelineEntryKind::UserMessage,
-                    request.timeline_message.clone(),
-                    request.accepted_at,
+                    TimelineEntryInput::new(
+                        request.entry_id.clone(),
+                        TimelineEntryKind::UserMessage,
+                        request.timeline_message.clone(),
+                        request.accepted_at,
+                    ),
                     active_execution_chain,
                 )
                 .map(|(_, _, superseded_turn)| Some(superseded_turn))
@@ -516,10 +519,12 @@ pub fn accept_dispatch_submission(
             session_store
                 .accept_active_execution_chain_with_timeline_entry(
                     request.session_id.clone(),
-                    request.entry_id.clone(),
-                    TimelineEntryKind::UserMessage,
-                    request.timeline_message.clone(),
-                    request.accepted_at,
+                    TimelineEntryInput::new(
+                        request.entry_id.clone(),
+                        TimelineEntryKind::UserMessage,
+                        request.timeline_message.clone(),
+                        request.accepted_at,
+                    ),
                     active_execution_chain,
                 )
                 .map(|_| None)

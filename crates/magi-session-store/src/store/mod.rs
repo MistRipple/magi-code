@@ -40,6 +40,30 @@ pub struct SessionStore {
     lifecycle_observer: Arc<RwLock<Option<Arc<dyn SessionLifecycleObserver>>>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct TimelineEntryInput {
+    pub entry_id: String,
+    pub kind: TimelineEntryKind,
+    pub message: String,
+    pub occurred_at: UtcMillis,
+}
+
+impl TimelineEntryInput {
+    pub fn new(
+        entry_id: impl Into<String>,
+        kind: TimelineEntryKind,
+        message: impl Into<String>,
+        occurred_at: UtcMillis,
+    ) -> Self {
+        Self {
+            entry_id: entry_id.into(),
+            kind,
+            message: message.into(),
+            occurred_at,
+        }
+    }
+}
+
 impl std::fmt::Debug for SessionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionStore")

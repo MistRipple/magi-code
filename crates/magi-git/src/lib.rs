@@ -469,9 +469,8 @@ impl WorkspaceGitOperationCoordinator {
         let active_session_ids = state
             .active_executions
             .iter()
-            .filter_map(|(active_session_id, active_repository)| {
-                same_path(active_repository, &repository_key).then(|| active_session_id.clone())
-            })
+            .filter(|(_, active_repository)| same_path(active_repository, &repository_key))
+            .map(|(active_session_id, _)| active_session_id.clone())
             .collect::<Vec<_>>();
         if !active_session_ids.is_empty() {
             return Err(GitCoordinationError::ExecutionActive {
@@ -503,9 +502,8 @@ impl WorkspaceGitOperationCoordinator {
         let active_session_ids = state
             .active_executions
             .iter()
-            .filter_map(|(session_id, active_repository)| {
-                same_path(active_repository, &repository_key).then(|| session_id.clone())
-            })
+            .filter(|(_, active_repository)| same_path(active_repository, &repository_key))
+            .map(|(session_id, _)| session_id.clone())
             .collect::<Vec<_>>();
         if !active_session_ids.is_empty() {
             return Err(GitCoordinationError::ExecutionActive {
@@ -621,7 +619,7 @@ pub enum GitError {
     },
     #[error("Git 上下文已变化，调用方必须刷新后重试")]
     StaleContext {
-        expected: GitPrecondition,
+        expected: Box<GitPrecondition>,
         actual_branch: Option<String>,
         actual_head: Option<String>,
         actual_worktree_path: PathBuf,
@@ -1409,7 +1407,7 @@ fn enforce_precondition(
         return Ok(());
     }
     Err(GitError::StaleContext {
-        expected: expected.clone(),
+        expected: Box::new(expected.clone()),
         actual_branch: actual.branch.clone(),
         actual_head: actual.head.clone(),
         actual_worktree_path: actual.worktree_path.clone(),

@@ -2522,9 +2522,8 @@ async fn update_all_skills(
                     entry
                 })
         } else {
-            reload_local_skill_entry(installed).map(|entry| {
+            reload_local_skill_entry(installed).inspect(|_| {
                 reloaded_count += 1;
-                entry
             })
         };
         match result {

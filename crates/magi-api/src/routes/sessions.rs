@@ -20,7 +20,7 @@ use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn,
     GoalStatus, NotificationRecord, NotificationScope, SessionGoal, SessionRecord,
-    TimelineEntryKind,
+    TimelineEntryInput, TimelineEntryKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1441,10 +1441,12 @@ async fn submit_regular_session_turn(
             .replace_current_turn_with_timeline_entry(
                 session_id.clone(),
                 replace_turn_id,
-                entry_id,
-                TimelineEntryKind::UserMessage,
-                message.clone(),
-                accepted_at,
+                TimelineEntryInput::new(
+                    entry_id,
+                    TimelineEntryKind::UserMessage,
+                    message.clone(),
+                    accepted_at,
+                ),
                 turn,
             )
             .map(|(entry_id, sidecar, superseded_turn)| (entry_id, sidecar, Some(superseded_turn)))
@@ -1453,10 +1455,12 @@ async fn submit_regular_session_turn(
             .session_store
             .accept_current_turn_with_timeline_entry(
                 session_id.clone(),
-                entry_id,
-                TimelineEntryKind::UserMessage,
-                message.clone(),
-                accepted_at,
+                TimelineEntryInput::new(
+                    entry_id,
+                    TimelineEntryKind::UserMessage,
+                    message.clone(),
+                    accepted_at,
+                ),
                 turn,
             )
             .map(|(entry_id, sidecar)| (entry_id, sidecar, None))
@@ -2127,10 +2131,12 @@ async fn submit_goal_continuation_turn(
         .session_store
         .accept_current_turn_with_timeline_entry(
             session_id.clone(),
-            entry_id,
-            TimelineEntryKind::NotificationPublished,
-            format!("目标自动推进: {}", goal.objective),
-            accepted_at,
+            TimelineEntryInput::new(
+                entry_id,
+                TimelineEntryKind::NotificationPublished,
+                format!("目标自动推进: {}", goal.objective),
+                accepted_at,
+            ),
             turn,
         )
         .map_err(|error| {
@@ -2920,10 +2926,12 @@ fn write_continue_user_message(
             .session_store
             .append_current_turn_item_with_timeline_entry(
                 &accepted.session_id,
-                entry_id.clone(),
-                TimelineEntryKind::UserMessage,
-                prompt_text,
-                continued_at,
+                TimelineEntryInput::new(
+                    entry_id.clone(),
+                    TimelineEntryKind::UserMessage,
+                    prompt_text,
+                    continued_at,
+                ),
                 user_message_item,
             )
             .map_err(|error| ApiError::internal_assembly("写入 continue 用户消息失败", error))?;
@@ -2948,10 +2956,12 @@ fn write_continue_user_message(
             .session_store
             .accept_current_turn_with_timeline_entry(
                 accepted.session_id.clone(),
-                entry_id.clone(),
-                TimelineEntryKind::UserMessage,
-                prompt_text,
-                continued_at,
+                TimelineEntryInput::new(
+                    entry_id.clone(),
+                    TimelineEntryKind::UserMessage,
+                    prompt_text,
+                    continued_at,
+                ),
                 turn,
             )
             .map_err(|error| ApiError::internal_assembly("写入 continue 用户消息失败", error))?;

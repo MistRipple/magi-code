@@ -646,10 +646,12 @@ fn accept_current_turn_with_timeline_entry_rejects_running_turn_without_timeline
 
     let result = store.accept_current_turn_with_timeline_entry(
         session_id.clone(),
-        "timeline-rejected-chat",
-        TimelineEntryKind::UserMessage,
-        "不应写入的用户消息",
-        UtcMillis(2),
+        TimelineEntryInput::new(
+            "timeline-rejected-chat",
+            TimelineEntryKind::UserMessage,
+            "不应写入的用户消息",
+            UtcMillis(2),
+        ),
         test_turn("turn-next", "running", 2),
     );
 
@@ -686,10 +688,12 @@ fn replacing_latest_user_interrupted_turn_is_atomic_and_rejects_stale_retry() {
     store
         .accept_current_turn_with_timeline_entry(
             session_id.clone(),
-            "timeline-original",
-            TimelineEntryKind::UserMessage,
-            "原始消息",
-            UtcMillis(10),
+            TimelineEntryInput::new(
+                "timeline-original",
+                TimelineEntryKind::UserMessage,
+                "原始消息",
+                UtcMillis(10),
+            ),
             original_turn,
         )
         .expect("original turn should be accepted");
@@ -707,10 +711,12 @@ fn replacing_latest_user_interrupted_turn_is_atomic_and_rejects_stale_retry() {
         .replace_current_turn_with_timeline_entry(
             session_id.clone(),
             "turn-original",
-            "timeline-replacement",
-            TimelineEntryKind::UserMessage,
-            "修改后的消息",
-            UtcMillis(20),
+            TimelineEntryInput::new(
+                "timeline-replacement",
+                TimelineEntryKind::UserMessage,
+                "修改后的消息",
+                UtcMillis(20),
+            ),
             replacement_turn,
         )
         .expect("latest user-interrupted turn should be replaceable");
@@ -742,10 +748,12 @@ fn replacing_latest_user_interrupted_turn_is_atomic_and_rejects_stale_retry() {
     let stale_result = store.replace_current_turn_with_timeline_entry(
         session_id.clone(),
         "turn-original",
-        "timeline-stale-replacement",
-        TimelineEntryKind::UserMessage,
-        "过期编辑",
-        UtcMillis(30),
+        TimelineEntryInput::new(
+            "timeline-stale-replacement",
+            TimelineEntryKind::UserMessage,
+            "过期编辑",
+            UtcMillis(30),
+        ),
         test_turn("turn-stale-replacement", "running", 30),
     );
     assert!(matches!(
@@ -777,10 +785,12 @@ fn accept_active_execution_chain_with_timeline_entry_writes_timeline_and_turn_at
     let (entry_id, sidecar) = store
         .accept_active_execution_chain_with_timeline_entry(
             session_id.clone(),
-            "timeline-atomic-task-accept",
-            TimelineEntryKind::UserMessage,
-            "任务用户消息",
-            UtcMillis(3),
+            TimelineEntryInput::new(
+                "timeline-atomic-task-accept",
+                TimelineEntryKind::UserMessage,
+                "任务用户消息",
+                UtcMillis(3),
+            ),
             chain,
         )
         .expect("task chain should be accepted");
@@ -824,10 +834,12 @@ fn accept_active_execution_chain_rejects_running_turn_without_timeline_write() {
 
     let result = store.accept_active_execution_chain_with_timeline_entry(
         session_id.clone(),
-        "timeline-rejected-task",
-        TimelineEntryKind::UserMessage,
-        "不应写入的任务消息",
-        UtcMillis(4),
+        TimelineEntryInput::new(
+            "timeline-rejected-task",
+            TimelineEntryKind::UserMessage,
+            "不应写入的任务消息",
+            UtcMillis(4),
+        ),
         chain,
     );
 
@@ -896,10 +908,12 @@ fn append_current_turn_item_with_timeline_entry_writes_item_and_timeline_atomica
     let updated = store
         .append_current_turn_item_with_timeline_entry(
             &session_id,
-            "timeline-append-item",
-            TimelineEntryKind::UserMessage,
-            "继续用户消息",
-            UtcMillis(2),
+            TimelineEntryInput::new(
+                "timeline-append-item",
+                TimelineEntryKind::UserMessage,
+                "继续用户消息",
+                UtcMillis(2),
+            ),
             test_turn_item("turn-item-continue-user", "继续用户消息"),
         )
         .expect("append should succeed")
@@ -1497,10 +1511,12 @@ fn append_current_turn_item_with_timeline_entry_does_not_write_timeline_without_
     let updated = store
         .append_current_turn_item_with_timeline_entry(
             &session_id,
-            "timeline-no-turn",
-            TimelineEntryKind::UserMessage,
-            "不应写入的继续消息",
-            UtcMillis(2),
+            TimelineEntryInput::new(
+                "timeline-no-turn",
+                TimelineEntryKind::UserMessage,
+                "不应写入的继续消息",
+                UtcMillis(2),
+            ),
             test_turn_item("turn-item-no-turn", "不应写入的继续消息"),
         )
         .expect("missing current turn is a non-mutating no-op");

@@ -261,7 +261,7 @@ impl PlanStore {
 }
 
 fn aggregate_task_statuses(statuses: &[TaskStatus]) -> PlanItemStatus {
-    if statuses.iter().any(|status| *status == TaskStatus::Failed) {
+    if statuses.contains(&TaskStatus::Failed) {
         return PlanItemStatus::Blocked;
     }
     if !statuses.is_empty()

@@ -247,6 +247,17 @@ pub(crate) struct PreparedThreadHistory {
     pub compaction: Option<ContextCompactionRecord>,
 }
 
+pub(crate) struct PrepareThreadHistoryInput<'a> {
+    pub event_bus: &'a InMemoryEventBus,
+    pub session_store: &'a SessionStore,
+    pub session_id: &'a SessionId,
+    pub workspace_id: &'a Option<WorkspaceId>,
+    pub thread_id: &'a ThreadId,
+    pub fallback_history: Vec<ThreadChatMessage>,
+    pub phase: &'static str,
+    pub context_window_override: Option<u64>,
+}
+
 #[derive(Clone, Debug)]
 enum ThreadHistoryCompactionDecision {
     ContextWindowPressure {
@@ -553,15 +564,18 @@ fn compact_thread_history_if_needed(
 }
 
 pub(crate) fn prepare_thread_history(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    session_id: &SessionId,
-    workspace_id: &Option<WorkspaceId>,
-    thread_id: &ThreadId,
-    fallback_history: Vec<ThreadChatMessage>,
-    phase: &'static str,
-    context_window_override: Option<u64>,
+    input: PrepareThreadHistoryInput<'_>,
 ) -> PreparedThreadHistory {
+    let PrepareThreadHistoryInput {
+        event_bus,
+        session_store,
+        session_id,
+        workspace_id,
+        thread_id,
+        fallback_history,
+        phase,
+        context_window_override,
+    } = input;
     let mut history = session_store.thread_message_history(thread_id);
     if history.is_empty() && !fallback_history.is_empty() {
         history = fallback_history;
@@ -978,16 +992,16 @@ fn run_conversation_loop_inner(
     // P6b：只读取当前 thread 内部已经持久化的运行时输入 / 恢复记录。worker thread
     // 为单 task 独占，因此这里不能出现同 role 的历史 task 对话。历史超出水位线时
     // 直接替换为「摘要 + 最近完整消息」，下一轮不再读到旧结构。
-    let thread_history_snapshot = prepare_thread_history(
+    let thread_history_snapshot = prepare_thread_history(PrepareThreadHistoryInput {
         event_bus,
         session_store,
         session_id,
         workspace_id,
         thread_id,
-        Vec::new(),
-        "pre_turn",
-        None,
-    )
+        fallback_history: Vec::new(),
+        phase: "pre_turn",
+        context_window_override: None,
+    })
     .messages;
     if !thread_history_snapshot.is_empty() {
         for history_msg in &thread_history_snapshot {
@@ -1760,16 +1774,16 @@ fn run_conversation_loop_inner(
         tool_call_id: None,
     });
     session_store.append_thread_messages(thread_id, turn_messages, UtcMillis::now());
-    let _ = prepare_thread_history(
+    let _ = prepare_thread_history(PrepareThreadHistoryInput {
         event_bus,
         session_store,
         session_id,
         workspace_id,
         thread_id,
-        Vec::new(),
-        "post_turn",
-        None,
-    );
+        fallback_history: Vec::new(),
+        phase: "post_turn",
+        context_window_override: None,
+    });
 
     (
         TaskOutcome::Completed {
@@ -2967,16 +2981,16 @@ mod tests {
         let workspace_id = Some(WorkspaceId::new("workspace-context-compaction"));
         let fallback_history = repeated_thread_history(1_000, 1_000);
 
-        let first = prepare_thread_history(
-            &event_bus,
-            &session_store,
-            &session_id,
-            &workspace_id,
-            &thread_id,
-            fallback_history.clone(),
-            "pre_turn",
-            None,
-        );
+        let first = prepare_thread_history(PrepareThreadHistoryInput {
+            event_bus: &event_bus,
+            session_store: &session_store,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            thread_id: &thread_id,
+            fallback_history: fallback_history.clone(),
+            phase: "pre_turn",
+            context_window_override: None,
+        });
         assert!(first.compaction.is_some());
         assert_eq!(
             session_store.thread_message_history(&thread_id).len(),
@@ -2990,16 +3004,16 @@ mod tests {
                 .any(|event| event.event_type == "session.context.compacted")
         );
 
-        let second = prepare_thread_history(
-            &event_bus,
-            &session_store,
-            &session_id,
-            &workspace_id,
-            &thread_id,
+        let second = prepare_thread_history(PrepareThreadHistoryInput {
+            event_bus: &event_bus,
+            session_store: &session_store,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            thread_id: &thread_id,
             fallback_history,
-            "pre_turn",
-            None,
-        );
+            phase: "pre_turn",
+            context_window_override: None,
+        });
         assert!(second.compaction.is_none());
         assert_eq!(second.messages.len(), first.messages.len());
     }

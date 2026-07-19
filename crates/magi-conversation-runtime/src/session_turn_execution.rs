@@ -8,7 +8,7 @@ use crate::model_context_window::{resolve_model_context_window, set_model_contex
 use crate::{
     ConversationRegistry, SessionTurnInputBoundary, UserSignal,
     conversation_loop::{
-        ContextCompactionRecord, chat_message_to_thread_chat_message,
+        ContextCompactionRecord, PrepareThreadHistoryInput, chat_message_to_thread_chat_message,
         estimate_chat_messages_tokens, prepare_thread_history, thread_chat_message_to_chat_message,
     },
     model_config::resolve_orchestrator_model_config,
@@ -456,28 +456,40 @@ fn apply_reported_context_limit(
     true
 }
 
-#[allow(clippy::too_many_arguments)]
-fn rebuild_messages_for_context_window(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    request: &SessionTurnExecutionRequest,
-    thread_id: &magi_core::ThreadId,
-    prompt: &str,
-    knowledge_context_prompt: Option<&str>,
+struct RebuildMessagesForContextWindowInput<'a> {
+    event_bus: &'a InMemoryEventBus,
+    session_store: &'a SessionStore,
+    request: &'a SessionTurnExecutionRequest,
+    thread_id: &'a magi_core::ThreadId,
+    prompt: &'a str,
+    knowledge_context_prompt: Option<&'a str>,
     context_window: u64,
-    messages: &mut Vec<ChatMessage>,
-    persist_session_state: Option<&SessionStatePersistCallback>,
-) {
-    let prepared = prepare_thread_history(
+    messages: &'a mut Vec<ChatMessage>,
+    persist_session_state: Option<&'a SessionStatePersistCallback>,
+}
+
+fn rebuild_messages_for_context_window(input: RebuildMessagesForContextWindowInput<'_>) {
+    let RebuildMessagesForContextWindowInput {
         event_bus,
         session_store,
-        &request.session_id,
-        &request.workspace_id,
+        request,
         thread_id,
-        Vec::new(),
-        "model_switch_recovery",
-        Some(context_window),
-    );
+        prompt,
+        knowledge_context_prompt,
+        context_window,
+        messages,
+        persist_session_state,
+    } = input;
+    let prepared = prepare_thread_history(PrepareThreadHistoryInput {
+        event_bus,
+        session_store,
+        session_id: &request.session_id,
+        workspace_id: &request.workspace_id,
+        thread_id,
+        fallback_history: Vec::new(),
+        phase: "model_switch_recovery",
+        context_window_override: Some(context_window),
+    });
     if let Some(compaction) = prepared.compaction.as_ref() {
         append_context_compaction_notice(
             event_bus,
@@ -504,16 +516,28 @@ fn rebuild_messages_for_context_window(
     );
 }
 
-fn activate_previous_model_fallback(
-    event_bus: &InMemoryEventBus,
-    execution_settings_store: Option<&Arc<SettingsStore>>,
-    session_store: &SessionStore,
-    request: &SessionTurnExecutionRequest,
-    thread_id: &magi_core::ThreadId,
-    recovery: &SessionModelSwitchRecoveryRuntime,
+struct PreviousModelFallbackInput<'a> {
+    event_bus: &'a InMemoryEventBus,
+    execution_settings_store: Option<&'a Arc<SettingsStore>>,
+    session_store: &'a SessionStore,
+    request: &'a SessionTurnExecutionRequest,
+    thread_id: &'a magi_core::ThreadId,
+    recovery: &'a SessionModelSwitchRecoveryRuntime,
     provider_limit_was_applied: bool,
-    persist_session_state: Option<&SessionStatePersistCallback>,
-) -> bool {
+    persist_session_state: Option<&'a SessionStatePersistCallback>,
+}
+
+fn activate_previous_model_fallback(input: PreviousModelFallbackInput<'_>) -> bool {
+    let PreviousModelFallbackInput {
+        event_bus,
+        execution_settings_store,
+        session_store,
+        request,
+        thread_id,
+        recovery,
+        provider_limit_was_applied,
+        persist_session_state,
+    } = input;
     let mut section = recovery
         .live_settings_store
         .get_session_section(&request.session_id, "orchestrator");
@@ -720,16 +744,16 @@ fn run_session_turn_execution_inner(
         .unwrap_or_default();
     let configured_context_window =
         resolve_model_context_window(settings_store.map(Arc::as_ref), &resolved_context_model);
-    let prepared_history = prepare_thread_history(
+    let prepared_history = prepare_thread_history(PrepareThreadHistoryInput {
         event_bus,
         session_store,
-        &request.session_id,
-        &request.workspace_id,
-        &orchestrator_thread_id,
+        session_id: &request.session_id,
+        workspace_id: &request.workspace_id,
+        thread_id: &orchestrator_thread_id,
         fallback_history,
-        "pre_turn",
-        Some(configured_context_window),
-    );
+        phase: "pre_turn",
+        context_window_override: Some(configured_context_window),
+    });
     if let Some(compaction) = prepared_history.compaction.as_ref() {
         append_context_compaction_notice(
             event_bus,
@@ -828,48 +852,48 @@ fn run_session_turn_execution_inner(
                         )
                     {
                         corrected_context_limit = true;
-                        rebuild_messages_for_context_window(
+                        rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
                             event_bus,
                             session_store,
-                            &request,
-                            &orchestrator_thread_id,
-                            &prompt,
-                            knowledge_context_prompt.as_deref(),
-                            context_limit,
-                            &mut messages,
+                            request: &request,
+                            thread_id: &orchestrator_thread_id,
+                            prompt: &prompt,
+                            knowledge_context_prompt: knowledge_context_prompt.as_deref(),
+                            context_window: context_limit,
+                            messages: &mut messages,
                             persist_session_state,
-                        );
+                        });
                         continue;
                     }
 
                     if let Some(recovery) = model_switch_recovery.as_ref()
                         && !fallback_activated
-                        && activate_previous_model_fallback(
+                        && activate_previous_model_fallback(PreviousModelFallbackInput {
                             event_bus,
-                            settings_store,
+                            execution_settings_store: settings_store,
                             session_store,
-                            &request,
-                            &orchestrator_thread_id,
+                            request: &request,
+                            thread_id: &orchestrator_thread_id,
                             recovery,
-                            corrected_context_limit,
+                            provider_limit_was_applied: corrected_context_limit,
                             persist_session_state,
-                        )
+                        })
                     {
                         let previous_context_window = resolve_model_context_window(
                             Some(recovery.live_settings_store.as_ref()),
                             &recovery.previous_model,
                         );
-                        rebuild_messages_for_context_window(
+                        rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
                             event_bus,
                             session_store,
-                            &request,
-                            &orchestrator_thread_id,
-                            &prompt,
-                            knowledge_context_prompt.as_deref(),
-                            previous_context_window,
-                            &mut messages,
+                            request: &request,
+                            thread_id: &orchestrator_thread_id,
+                            prompt: &prompt,
+                            knowledge_context_prompt: knowledge_context_prompt.as_deref(),
+                            context_window: previous_context_window,
+                            messages: &mut messages,
                             persist_session_state,
-                        );
+                        });
                         active_client = recovery.fallback_client.as_ref();
                         fallback_activated = true;
                         continue;
@@ -4139,14 +4163,16 @@ mod tests {
         };
 
         assert!(activate_previous_model_fallback(
-            &event_bus,
-            Some(&execution),
-            &store,
-            &request,
-            &thread_id,
-            &recovery,
-            false,
-            None,
+            PreviousModelFallbackInput {
+                event_bus: &event_bus,
+                execution_settings_store: Some(&execution),
+                session_store: &store,
+                request: &request,
+                thread_id: &thread_id,
+                recovery: &recovery,
+                provider_limit_was_applied: false,
+                persist_session_state: None,
+            }
         ));
         let restored = live.get_session_section(&session_id, "orchestrator");
         assert_eq!(restored["model"], serde_json::json!("verified-model"));

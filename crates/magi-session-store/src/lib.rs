@@ -16,4 +16,4 @@ pub use models::{
     ThreadChatImageSource, ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
     ThreadVisibility, TimelineEntry, TimelineEntryKind, timeline_entry_visible_text,
 };
-pub use store::{ORCHESTRATOR_ROLE_ID, SessionStore};
+pub use store::{ORCHESTRATOR_ROLE_ID, SessionStore, TimelineEntryInput};

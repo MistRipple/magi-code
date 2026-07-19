@@ -1,12 +1,11 @@
-use super::ORCHESTRATOR_ROLE_ID;
-use super::SessionStore;
+use super::{ORCHESTRATOR_ROLE_ID, SessionStore, TimelineEntryInput};
 use crate::models::{
     ActiveExecutionBranchSnapshotUpdate, ActiveExecutionChain, ActiveExecutionTurn,
     ActiveExecutionTurnItem, CanonicalToolCall, CanonicalTurn, CanonicalTurnItem,
     CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus, CanonicalTurnVisibility,
     CanonicalWorkerRef, ExecutionThread, ExecutionThreadStatus, SessionExecutionSidecarStatus,
     SessionExecutionSidecarStoreState, SessionRuntimeSidecar, SessionSidecarFlushReason,
-    SessionStoreState, ThreadChatMessage, ThreadVisibility, TimelineEntry, TimelineEntryKind,
+    SessionStoreState, ThreadChatMessage, ThreadVisibility, TimelineEntry,
 };
 use magi_core::{
     DomainError, DomainResult, ExecutionOwnership, MissionId, RecoveryResumeInput, SessionId,
@@ -1167,13 +1166,15 @@ impl SessionStore {
     pub fn accept_current_turn_with_timeline_entry(
         &self,
         session_id: SessionId,
-        entry_id: impl Into<String>,
-        kind: TimelineEntryKind,
-        message: impl Into<String>,
-        occurred_at: UtcMillis,
+        timeline_entry: TimelineEntryInput,
         mut turn: ActiveExecutionTurn,
     ) -> DomainResult<(String, SessionRuntimeSidecar)> {
-        let entry_id = entry_id.into();
+        let TimelineEntryInput {
+            entry_id,
+            kind,
+            message,
+            occurred_at,
+        } = timeline_entry;
         turn.normalize();
         let mut state = self
             .state
@@ -1205,7 +1206,7 @@ impl SessionStore {
             entry_id: entry_id.clone(),
             session_id: session_id.clone(),
             kind,
-            message: message.into(),
+            message,
             occurred_at,
         });
         if let Some(session) = state
@@ -1257,14 +1258,15 @@ impl SessionStore {
         &self,
         session_id: SessionId,
         replace_turn_id: &str,
-        entry_id: impl Into<String>,
-        kind: TimelineEntryKind,
-        message: impl Into<String>,
-        occurred_at: UtcMillis,
+        timeline_entry: TimelineEntryInput,
         mut turn: ActiveExecutionTurn,
     ) -> DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn)> {
-        let entry_id = entry_id.into();
-        let message = message.into();
+        let TimelineEntryInput {
+            entry_id,
+            kind,
+            message,
+            occurred_at,
+        } = timeline_entry;
         turn.normalize();
         let mut state = self
             .state
@@ -1344,13 +1346,15 @@ impl SessionStore {
     pub fn accept_active_execution_chain_with_timeline_entry(
         &self,
         session_id: SessionId,
-        entry_id: impl Into<String>,
-        kind: TimelineEntryKind,
-        message: impl Into<String>,
-        occurred_at: UtcMillis,
+        timeline_entry: TimelineEntryInput,
         active_execution_chain: ActiveExecutionChain,
     ) -> DomainResult<(String, SessionRuntimeSidecar)> {
-        let entry_id = entry_id.into();
+        let TimelineEntryInput {
+            entry_id,
+            kind,
+            message,
+            occurred_at,
+        } = timeline_entry;
         let mut state = self
             .state
             .write()
@@ -1379,7 +1383,7 @@ impl SessionStore {
             entry_id: entry_id.clone(),
             session_id: session_id.clone(),
             kind,
-            message: message.into(),
+            message,
             occurred_at,
         });
         if let Some(session) = state
@@ -1407,14 +1411,15 @@ impl SessionStore {
         &self,
         session_id: SessionId,
         replace_turn_id: &str,
-        entry_id: impl Into<String>,
-        kind: TimelineEntryKind,
-        message: impl Into<String>,
-        occurred_at: UtcMillis,
+        timeline_entry: TimelineEntryInput,
         active_execution_chain: ActiveExecutionChain,
     ) -> DomainResult<(String, SessionRuntimeSidecar, CanonicalTurn)> {
-        let entry_id = entry_id.into();
-        let message = message.into();
+        let TimelineEntryInput {
+            entry_id,
+            kind,
+            message,
+            occurred_at,
+        } = timeline_entry;
         let mut state = self
             .state
             .write()
@@ -1913,14 +1918,15 @@ impl SessionStore {
     pub fn append_current_turn_item_with_timeline_entry(
         &self,
         session_id: &SessionId,
-        entry_id: impl Into<String>,
-        kind: TimelineEntryKind,
-        message: impl Into<String>,
-        occurred_at: UtcMillis,
+        timeline_entry: TimelineEntryInput,
         item: ActiveExecutionTurnItem,
     ) -> DomainResult<Option<SessionRuntimeSidecar>> {
-        let entry_id = entry_id.into();
-        let message = message.into();
+        let TimelineEntryInput {
+            entry_id,
+            kind,
+            message,
+            occurred_at,
+        } = timeline_entry;
         let updated = {
             let mut state = self
                 .state
