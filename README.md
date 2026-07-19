@@ -229,7 +229,7 @@ cargo run -p magi-desktop
 - Linux AppImage 与 Deb
 - Windows NSIS 安装器
 
-推送与版本号一致的 `v*` 标签后，GitHub Actions 会构建三平台安装包、签名 updater 归档并创建 Release。已安装的桌面端启动后会自动检查 `latest.json`；用户确认后，应用会下载、校验签名、安装新版本并自动重启。更新只替换应用本体，`~/.magi` 中的模型配置、会话、工作区、任务和知识库不会被打包或覆盖。
+推送与版本号一致的 `v*` 标签后，GitHub Actions 会构建三平台安装包、签名 updater 归档并创建 Release。已安装的桌面端会在启动时和运行期间定期检查 `latest.json`；用户可以在后台下载并校验更新，下载完成后自行选择“立即重启”或“稍后重启”，应用不会在下载结束时打断当前工作。重启安装前会先持久化状态并优雅停止本地服务。更新只替换应用本体，`~/.magi` 中的模型配置、会话、工作区、任务和知识库不会被打包或覆盖。
 
 发布更新需要在 GitHub Repository Secrets 中配置 `TAURI_SIGNING_PRIVATE_KEY`，可选配置 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。私钥只供 GitHub Actions 使用，不应写入仓库或桌面包；更新公钥只保存在 `apps/desktop/tauri.conf.json` 中。
 

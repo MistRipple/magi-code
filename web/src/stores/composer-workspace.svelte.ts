@@ -10,7 +10,12 @@ export const composerWorkspaceState = $state({
   workspaces: [] as ComposerWorkspaceOption[],
   recentWorkspaceId: '',
   draftWorkspaceId: '',
+  hasUnsavedInput: false,
 });
+
+export function setComposerHasUnsavedInput(value: boolean): void {
+  composerWorkspaceState.hasUnsavedInput = value;
+}
 
 function normalizeWorkspaceId(value: string | null | undefined): string {
   return typeof value === 'string' ? value.trim() : '';

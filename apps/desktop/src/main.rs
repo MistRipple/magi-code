@@ -149,6 +149,26 @@ async fn shutdown_desktop_runtime(
     lifecycle.mark_stopped();
 }
 
+#[tauri::command]
+async fn prepare_update_restart(app: AppHandle) -> Result<(), String> {
+    let (daemon, lifecycle, state_root) = {
+        let runtime = app.state::<DesktopRuntime>();
+        (
+            runtime.daemon.clone(),
+            runtime.lifecycle.clone(),
+            runtime.state_root.clone(),
+        )
+    };
+    match lifecycle.request_exit() {
+        DesktopAction::BeginExit => {
+            shutdown_desktop_runtime(daemon, lifecycle, state_root, "desktop update restart").await;
+            Ok(())
+        }
+        DesktopAction::Ignore if lifecycle.state() == DesktopState::Stopped => Ok(()),
+        _ => Err("Magi 当前无法进入更新重启状态，请稍后重试".to_string()),
+    }
+}
+
 fn install_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let open_item = MenuItemBuilder::with_id(OPEN_MENU_ID, "打开 Magi").build(app)?;
     let separator = PredefinedMenuItem::separator(app)?;
@@ -255,6 +275,7 @@ fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![prepare_update_restart])
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let runtime = app.state::<DesktopRuntime>();
             if runtime.lifecycle.request_show() == DesktopAction::ShowWindow {

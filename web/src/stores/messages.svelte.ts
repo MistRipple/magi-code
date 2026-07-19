@@ -857,6 +857,11 @@ export function getQueuedMessages() {
   return messagesState.queuedMessages;
 }
 
+export function hasQueuedMessagesAcrossSessions(): boolean {
+  return messagesState.queuedMessages.length > 0
+    || Object.values(sessionQueuedMessagesByScope).some((messages) => messages.length > 0);
+}
+
 export function getToasts() {
   return toasts;
 }

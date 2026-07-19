@@ -1,6 +1,5 @@
 <script lang="ts">
 import '../styles/settings.css';
-import { onMount } from 'svelte';
 import SettingsStatsTab from './SettingsStatsTab.svelte';
 import SettingsRulesTab from './SettingsRulesTab.svelte';
 import SettingsAgentsTab from './SettingsAgentsTab.svelte';
@@ -15,13 +14,13 @@ import {
   } from '../web/agent-api';
 import WebFolderPicker from '../web/WebFolderPicker.svelte';
 import { getAgentColor } from '../lib/agent-colors';
+import { isDesktopRuntime } from '../lib/desktop-updater';
 import {
-  checkDesktopUpdate,
-  getDesktopAppVersion,
-  isDesktopRuntime,
-  type DesktopUpdateInfo,
-  type DesktopUpdateProgress,
-} from '../lib/desktop-updater';
+  desktopUpdaterState,
+  checkForDesktopUpdate,
+  downloadDesktopUpdate,
+  showDesktopUpdatePrompt,
+} from '../stores/desktop-updater.svelte';
 
   import { useSettingsStore } from '../stores/settings-store.svelte';
   
@@ -36,78 +35,23 @@ import {
   });
 
   const desktopRuntime = isDesktopRuntime();
-  type UpdateState = 'idle' | 'checking' | 'latest' | 'available' | 'installing' | 'error';
-  let updateState = $state<UpdateState>('idle');
-  let updateInfo = $state<DesktopUpdateInfo | null>(null);
-  let updateProgress = $state<DesktopUpdateProgress | null>(null);
-  let updateError = $state('');
-  let currentVersion = $state('');
-
-  async function loadDesktopVersion(): Promise<void> {
-    try {
-      currentVersion = (await getDesktopAppVersion()) || '';
-    } catch {
-      currentVersion = '';
-    }
-  }
-
-  async function checkForDesktopUpdate(): Promise<void> {
-    if (!desktopRuntime || updateState === 'checking' || updateState === 'installing') {
-      return;
-    }
-    if (updateInfo) {
-      await updateInfo.close().catch(() => undefined);
-      updateInfo = null;
-    }
-    updateState = 'checking';
-    updateProgress = null;
-    updateError = '';
-    try {
-      updateInfo = await checkDesktopUpdate();
-      updateState = updateInfo ? 'available' : 'latest';
-    } catch (error) {
-      updateState = 'error';
-      updateError = error instanceof Error ? error.message : String(error);
-    }
-  }
-
-  async function installDesktopUpdate(): Promise<void> {
-    if (!updateInfo || updateState !== 'available') {
-      await checkForDesktopUpdate();
-      return;
-    }
-    updateState = 'installing';
-    updateProgress = null;
-    updateError = '';
-    try {
-      await updateInfo.install((progress) => {
-        updateProgress = progress;
-      });
-    } catch (error) {
-      updateState = 'error';
-      updateError = error instanceof Error ? error.message : String(error);
-    }
-  }
 
   function updateAction(): void {
-    if (updateState === 'available') {
-      void installDesktopUpdate();
-      return;
+    if (desktopUpdaterState.phase === 'available') {
+      void downloadDesktopUpdate();
+    } else if (desktopUpdaterState.phase === 'ready') {
+      showDesktopUpdatePrompt();
+      onClose?.();
+    } else if (
+      desktopUpdaterState.phase === 'error'
+      && desktopUpdaterState.errorStage !== 'check'
+    ) {
+      showDesktopUpdatePrompt();
+      onClose?.();
+    } else {
+      void checkForDesktopUpdate('manual');
     }
-    void checkForDesktopUpdate();
   }
-
-  onMount(() => {
-    if (desktopRuntime) {
-      void loadDesktopVersion();
-      void checkForDesktopUpdate();
-    }
-    return () => {
-      if (updateInfo) {
-        void updateInfo.close();
-      }
-    };
-  });
 </script>
 
 
@@ -216,53 +160,57 @@ import {
         </div>
         <div class="header-actions">
           {#if desktopRuntime}
-            {#if currentVersion}
-              <span class="current-version-label" title={`${i18n.t('settings.update.currentVersion')} v${currentVersion}`}>
+            {#if desktopUpdaterState.currentVersion}
+              <span class="current-version-label" title={`${i18n.t('settings.update.currentVersion')} v${desktopUpdaterState.currentVersion}`}>
                 <span class="current-version-label__prefix">{i18n.t('settings.update.currentVersion')}</span>
-                <span>v{currentVersion}</span>
+                <span>v{desktopUpdaterState.currentVersion}</span>
               </span>
             {/if}
             <button
               type="button"
               class="update-check-btn"
-              class:update-check-btn--available={updateState === 'available'}
-              class:update-check-btn--error={updateState === 'error'}
+              class:update-check-btn--available={desktopUpdaterState.phase === 'available' || desktopUpdaterState.phase === 'ready'}
+              class:update-check-btn--error={desktopUpdaterState.phase === 'error'}
               onclick={updateAction}
-              disabled={updateState === 'checking' || updateState === 'installing'}
-              title={updateState === 'error' ? updateError : (updateInfo?.body || i18n.t('settings.update.checkTitle'))}
+              disabled={desktopUpdaterState.phase === 'checking' || desktopUpdaterState.phase === 'downloading' || desktopUpdaterState.phase === 'installing'}
+              title={desktopUpdaterState.phase === 'error' ? desktopUpdaterState.error : (desktopUpdaterState.update?.body || i18n.t('settings.update.checkTitle'))}
             >
-              <Icon name={updateState === 'available' ? 'download' : 'refresh'} size={13} />
+              <Icon name={desktopUpdaterState.phase === 'available' ? 'download' : 'refresh'} size={13} />
               <span>
-                {#if updateState === 'checking'}
+                {#if desktopUpdaterState.phase === 'checking'}
                   {i18n.t('settings.update.checking')}
-                {:else if updateState === 'latest'}
+                {:else if desktopUpdaterState.phase === 'latest'}
                   {i18n.t('settings.update.latest')}
-                {:else if updateState === 'available'}
-                  {i18n.t('settings.update.available', { version: updateInfo?.version || '' })}
-                {:else if updateState === 'installing'}
-                  {updateProgress?.percent !== undefined
-                    ? i18n.t('settings.update.installingProgress', { percent: updateProgress.percent })
-                    : i18n.t('settings.update.installing')}
-                {:else if updateState === 'error'}
+                {:else if desktopUpdaterState.phase === 'available'}
+                  {i18n.t('settings.update.available', { version: desktopUpdaterState.update?.version || '' })}
+                {:else if desktopUpdaterState.phase === 'downloading'}
+                  {desktopUpdaterState.progress?.percent !== undefined
+                    ? i18n.t('settings.update.downloadingProgress', { percent: desktopUpdaterState.progress.percent })
+                    : i18n.t('settings.update.downloading')}
+                {:else if desktopUpdaterState.phase === 'ready'}
+                  {i18n.t('settings.update.ready')}
+                {:else if desktopUpdaterState.phase === 'installing'}
+                  {i18n.t('settings.update.restarting')}
+                {:else if desktopUpdaterState.phase === 'error'}
                   {i18n.t('settings.update.retry')}
                 {:else}
                   {i18n.t('settings.update.check')}
                 {/if}
               </span>
             </button>
-            {#if updateState === 'installing'}
+            {#if desktopUpdaterState.phase === 'downloading'}
               <div
                 class="desktop-update-progress desktop-update-progress--settings"
                 role="progressbar"
                 aria-valuemin="0"
                 aria-valuemax="100"
-                aria-valuenow={updateProgress?.percent}
-                aria-label={i18n.t('settings.update.installing')}
+                aria-valuenow={desktopUpdaterState.progress?.percent}
+                aria-label={i18n.t('settings.update.downloading')}
               >
                 <span
                   class="desktop-update-progress__fill"
-                  class:desktop-update-progress__fill--indeterminate={updateProgress?.percent === undefined}
-                  style:width={updateProgress?.percent !== undefined ? `${updateProgress.percent}%` : undefined}
+                  class:desktop-update-progress__fill--indeterminate={desktopUpdaterState.progress?.percent === undefined}
+                  style:width={desktopUpdaterState.progress?.percent !== undefined ? `${desktopUpdaterState.progress.percent}%` : undefined}
                 ></span>
               </div>
             {/if}

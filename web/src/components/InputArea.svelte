@@ -44,6 +44,7 @@
     composerWorkspaceState,
     resolveComposerWorkspace,
     selectComposerDraftWorkspace,
+    setComposerHasUnsavedInput,
     type ComposerWorkspaceOption,
   } from '../stores/composer-workspace.svelte';
   import { openWorkspaceFolderPicker } from '../stores/workspace-onboarding.svelte';
@@ -366,6 +367,18 @@
 
   let loadedEditingTurnId = '';
   const editingTurn = $derived(messagesState.editingTurn);
+
+  $effect(() => {
+    setComposerHasUnsavedInput(
+      inputValue.trim().length > 0
+      || selectedImages.length > 0
+      || pendingImageReadCount > 0
+      || selectedContextReferences.length > 0
+      || selectedGoalMode
+      || selectedSkill !== null
+      || editingTurn !== null,
+    );
+  });
 
   $effect(() => {
     const draft = editingTurn;
@@ -942,6 +955,7 @@
     document.addEventListener('pointerdown', handlePickerOutsidePointerDown, true);
     return () => {
       window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
+      setComposerHasUnsavedInput(false);
       window.removeEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
       window.removeEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
       window.removeEventListener('storage', handleStoredAccessProfileChange);

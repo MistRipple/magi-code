@@ -1,86 +1,96 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Icon from './Icon.svelte';
+  import Modal from './Modal.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
-    checkDesktopUpdate,
-    isDesktopRuntime,
-    type DesktopUpdateInfo,
-    type DesktopUpdateProgress,
-  } from '../lib/desktop-updater';
+    hasQueuedMessagesAcrossSessions,
+    messagesState,
+  } from '../stores/messages.svelte';
+  import { composerWorkspaceState } from '../stores/composer-workspace.svelte';
+  import {
+    desktopUpdaterState,
+    dismissDesktopUpdatePrompt,
+    downloadDesktopUpdate,
+    restartWithDesktopUpdate,
+    retryDesktopUpdate,
+    startDesktopUpdater,
+  } from '../stores/desktop-updater.svelte';
 
-  type PromptState = 'idle' | 'checking' | 'available' | 'installing' | 'error';
+  let restartConfirmationOpen = $state(false);
 
-  let promptState = $state<PromptState>('idle');
-  let update = $state<DesktopUpdateInfo | null>(null);
-  let progress = $state<DesktopUpdateProgress | null>(null);
-  let error = $state('');
+  const update = $derived(desktopUpdaterState.update);
+  const phase = $derived(desktopUpdaterState.phase);
+  const progress = $derived(desktopUpdaterState.progress);
+  const error = $derived(desktopUpdaterState.error);
+  const hasProtectedWork = $derived(
+    messagesState.isProcessing
+    || messagesState.pendingRequests.size > 0
+    || hasQueuedMessagesAcrossSessions()
+    || messagesState.editingTurn !== null
+    || composerWorkspaceState.hasUnsavedInput
+    || messagesState.sessions.some((session) => (
+      session.isRunning === true || (session.runningTaskCount ?? 0) > 0
+    )),
+  );
+  const promptVisible = $derived(
+    !desktopUpdaterState.promptDismissed
+    && (
+      (update !== null && ['available', 'downloading', 'ready', 'installing'].includes(phase))
+      || (phase === 'error' && desktopUpdaterState.errorStage !== 'check')
+    ),
+  );
 
-  async function checkForUpdate(): Promise<void> {
-    if (!isDesktopRuntime() || promptState === 'checking' || promptState === 'installing') {
+  function requestRestart(): void {
+    if (hasProtectedWork) {
+      restartConfirmationOpen = true;
       return;
     }
-    promptState = 'checking';
-    error = '';
-    try {
-      update = await checkDesktopUpdate();
-      promptState = update ? 'available' : 'idle';
-    } catch {
-      promptState = 'idle';
-      error = '';
-    }
+    void restartWithDesktopUpdate();
   }
 
-  async function installUpdate(): Promise<void> {
-    if (!update || promptState !== 'available') {
-      return;
-    }
-    promptState = 'installing';
-    progress = null;
-    error = '';
-    try {
-      await update.install((nextProgress: DesktopUpdateProgress) => {
-        progress = nextProgress;
-      });
-    } catch (reason) {
-      promptState = 'error';
-      error = reason instanceof Error ? reason.message : String(reason);
-    }
+  function confirmRestart(): void {
+    restartConfirmationOpen = false;
+    void restartWithDesktopUpdate();
   }
 
-  async function dismiss(): Promise<void> {
-    await update?.close().catch(() => undefined);
-    update = null;
-    progress = null;
-    error = '';
-    promptState = 'idle';
+  function deferUpdate(): void {
+    restartConfirmationOpen = false;
+    dismissDesktopUpdatePrompt();
   }
 
-  onMount(() => {
-    const timer = setTimeout(() => void checkForUpdate(), 1200);
-    return () => {
-      clearTimeout(timer);
-      void update?.close();
-    };
-  });
+  onMount(startDesktopUpdater);
 </script>
 
-{#if update || promptState === 'error'}
-  <aside class="desktop-update-prompt" aria-live="polite">
-    <div class="prompt-icon" class:error={promptState === 'error'}>
-      <Icon name={promptState === 'error' ? 'warning' : promptState === 'installing' ? 'download' : 'sparkles'} size={17} />
+{#if promptVisible}
+  <aside class="desktop-update-prompt" aria-live="polite" data-update-phase={phase}>
+    <div class="prompt-icon" class:error={phase === 'error'} class:ready={phase === 'ready'}>
+      <Icon
+        name={phase === 'error'
+          ? 'warning'
+          : phase === 'downloading'
+            ? 'download'
+            : phase === 'ready' || phase === 'installing'
+              ? 'refresh'
+              : 'sparkles'}
+        size={17}
+      />
     </div>
     <div class="prompt-content">
       <strong>
-        {#if promptState === 'installing'}
-          {i18n.t('app.update.installing')}
-        {:else if promptState === 'error'}
+        {#if phase === 'downloading'}
+          {i18n.t('app.update.downloadingTitle')}
+        {:else if phase === 'ready'}
+          {i18n.t('app.update.readyTitle', { version: update?.version || '' })}
+        {:else if phase === 'installing'}
+          {i18n.t('app.update.restarting')}
+        {:else if phase === 'error'}
           {i18n.t('app.update.failed')}
         {:else}
           {i18n.t('app.update.title', { version: update?.version || '' })}
         {/if}
       </strong>
-      {#if promptState === 'installing'}
+      {#if phase === 'downloading'}
         <span>
           {progress?.percent !== undefined
             ? i18n.t('app.update.progress', { percent: progress.percent })
@@ -92,7 +102,7 @@
           aria-valuemin="0"
           aria-valuemax="100"
           aria-valuenow={progress?.percent}
-          aria-label={i18n.t('app.update.installing')}
+          aria-label={i18n.t('app.update.downloadingTitle')}
         >
           <span
             class="desktop-update-progress__fill"
@@ -100,28 +110,74 @@
             style:width={progress?.percent !== undefined ? `${progress.percent}%` : undefined}
           ></span>
         </div>
-      {:else if promptState === 'error'}
+      {:else if phase === 'ready'}
+        <span>{i18n.t('app.update.readyHint')}</span>
+      {:else if phase === 'installing'}
+        <span>{i18n.t('app.update.restartingHint')}</span>
+      {:else if phase === 'error'}
         <span title={error}>{error || i18n.t('app.update.retryHint')}</span>
       {:else if update?.body}
         <span>{update.body}</span>
+      {:else}
+        <span>{i18n.t('app.update.availableHint')}</span>
       {/if}
     </div>
-    {#if promptState === 'available'}
-      <button type="button" class="primary-action" onclick={() => void installUpdate()}>
-        {i18n.t('app.update.install')}
-      </button>
-      <button type="button" class="secondary-action" onclick={() => void dismiss()}>
-        {i18n.t('app.update.later')}
-      </button>
-    {:else if promptState === 'error'}
-      <button type="button" class="primary-action" onclick={() => void installUpdate()}>
-        {i18n.t('app.update.retry')}
-      </button>
-      <button type="button" class="icon-action" onclick={() => void dismiss()} title={i18n.t('app.update.close')} aria-label={i18n.t('app.update.close')}>
-        <Icon name="close" size={14} />
-      </button>
+
+    {#if phase === 'available'}
+      <div class="prompt-actions">
+        <button type="button" class="primary-action" onclick={() => void downloadDesktopUpdate()}>
+          {i18n.t('app.update.download')}
+        </button>
+        <button type="button" class="secondary-action" onclick={deferUpdate}>
+          {i18n.t('app.update.later')}
+        </button>
+      </div>
+    {:else if phase === 'ready'}
+      <div class="prompt-actions">
+        <button type="button" class="primary-action" onclick={requestRestart}>
+          {i18n.t('app.update.restartNow')}
+        </button>
+        <button type="button" class="secondary-action" onclick={deferUpdate}>
+          {i18n.t('app.update.restartLater')}
+        </button>
+      </div>
+    {:else if phase === 'error'}
+      <div class="prompt-actions">
+        <button type="button" class="primary-action" onclick={() => void retryDesktopUpdate()}>
+          {i18n.t('app.update.retry')}
+        </button>
+        <button
+          type="button"
+          class="icon-action"
+          onclick={deferUpdate}
+          title={i18n.t('app.update.close')}
+          aria-label={i18n.t('app.update.close')}
+        >
+          <Icon name="close" size={14} />
+        </button>
+      </div>
     {/if}
   </aside>
+{/if}
+
+{#if restartConfirmationOpen}
+  <Modal
+    size="sm"
+    title={i18n.t('app.update.restartConfirmTitle')}
+    closeOnEscape={true}
+    closeOnBackdrop={false}
+    onClose={() => (restartConfirmationOpen = false)}
+  >
+    <p class="restart-confirmation-text">{i18n.t('app.update.restartConfirmActiveWork')}</p>
+    {#snippet footer()}
+      <button type="button" class="modal-secondary" onclick={() => (restartConfirmationOpen = false)}>
+        {i18n.t('app.update.restartLater')}
+      </button>
+      <button type="button" class="modal-primary" onclick={confirmRestart}>
+        {i18n.t('app.update.restartAnyway')}
+      </button>
+    {/snippet}
+  </Modal>
 {/if}
 
 <style>
@@ -134,6 +190,7 @@
     align-items: center;
     gap: 10px;
     width: min(520px, calc(100vw - 32px));
+    min-height: 52px;
     padding: 10px 12px;
     border: 1px solid var(--border-strong, var(--border));
     border-radius: 8px;
@@ -150,6 +207,11 @@
     color: var(--accent);
     border-radius: 6px;
     background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+
+  .prompt-icon.ready {
+    color: var(--success);
+    background: color-mix(in srgb, var(--success) 12%, transparent);
   }
 
   .prompt-icon.error {
@@ -183,6 +245,13 @@
     font-size: 11px;
   }
 
+  .prompt-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+  }
+
   button {
     flex: 0 0 auto;
     border: 0;
@@ -194,17 +263,21 @@
   }
 
   .primary-action,
-  .secondary-action {
+  .secondary-action,
+  .modal-primary,
+  .modal-secondary {
     padding: 5px 8px;
   }
 
-  .primary-action {
-    color: var(--background);
+  .primary-action,
+  .modal-primary {
+    color: var(--primary-foreground, var(--background));
     background: var(--accent);
   }
 
   .secondary-action,
-  .icon-action {
+  .icon-action,
+  .modal-secondary {
     color: var(--foreground-muted);
     background: var(--surface-hover);
   }
@@ -217,15 +290,26 @@
     padding: 0;
   }
 
+  .restart-confirmation-text {
+    margin: 0;
+    color: var(--foreground-muted);
+    font-size: 13px;
+    line-height: 1.55;
+  }
+
   @media (max-width: 680px) {
     .desktop-update-prompt {
       top: 46px;
       right: 8px;
+      align-items: flex-start;
+      flex-wrap: wrap;
       width: calc(100vw - 16px);
     }
 
-    .secondary-action {
-      display: none;
+    .prompt-actions {
+      width: 100%;
+      justify-content: flex-end;
+      padding-left: 38px;
     }
   }
 </style>
