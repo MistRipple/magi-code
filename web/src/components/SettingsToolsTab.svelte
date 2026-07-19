@@ -52,6 +52,7 @@
     builtinToolsLoading: boolean;
     builtinTools: Array<{
       name: string;
+      category: string;
       riskLevel: string;
       approvalRequirement: string;
       effectiveApprovalPolicy: string;
@@ -166,6 +167,33 @@
     return i18n.locale === 'zh-CN'
       ? i18n.t('settings.tools.builtin.unknown')
       : formatBuiltinToolFallbackLabel(name);
+  }
+
+  function getBuiltinCategoryLabel(category: string): string {
+    const suffix = category
+      .split('_')
+      .filter(Boolean)
+      .map((part, index) => index === 0 ? part : part.charAt(0).toUpperCase() + part.slice(1))
+      .join('');
+    const key = suffix ? `settings.tools.builtinCategory.${suffix}` : '';
+    const translated = key ? i18n.t(key) : '';
+    return translated && translated !== key
+      ? translated
+      : getBuiltinToolFallbackLabel(category);
+  }
+
+  function getBuiltinCategoryIcon(category: string): IconName {
+    switch (category) {
+      case 'filesystem': return 'folder';
+      case 'code_navigation': return 'code';
+      case 'process': return 'terminal';
+      case 'web': return 'globe';
+      case 'knowledge': return 'database';
+      case 'git': return 'git-branch';
+      case 'session_goal': return 'target';
+      case 'tooling': return 'settings';
+      default: return 'tools';
+    }
   }
 
   function getBuiltinToolAccessLabel(accessMode: string): string {
@@ -552,8 +580,22 @@
   }
 
   let builtinExpanded = $state(false);
+  const builtinToolGroups = $derived.by(() => {
+    const groups = new Map<string, typeof builtinTools>();
+    for (const tool of builtinTools) {
+      const category = tool.category || 'uncategorized';
+      const items = groups.get(category) ?? [];
+      items.push(tool);
+      groups.set(category, items);
+    }
+    return Array.from(groups, ([category, tools]) => ({
+      category,
+      tools,
+      readyCount: tools.filter((tool: (typeof builtinTools)[number]) => tool.runtimeStatus === 'ready').length,
+    }));
+  });
   const builtinReadyCount = $derived(
-    (builtinTools as Array<{ runtimeStatus: string }>).filter((t) => t.runtimeStatus === 'ready').length,
+    builtinToolGroups.filter((group) => group.readyCount === group.tools.length).length,
   );
   const commandEnvironmentAvailableCount = $derived(
     commandEnvironment?.commands.filter((command: { available: boolean }) => command.available).length ?? 0,
@@ -622,7 +664,7 @@
               <div class="builtin-summary-main">
                 <div class="header-title-group">
                   <div class="settings-section-title">{i18n.t('settings.tools.builtinTools')}</div>
-                  <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { ready: builtinReadyCount, total: builtinTools.length })}</span>
+                  <span class="builtin-count-tag">{i18n.t('settings.tools.builtinCount', { ready: builtinReadyCount, total: builtinToolGroups.length })}</span>
                 </div>
                 {#if capabilityDependencies.length > 0}
                   <div
@@ -669,33 +711,55 @@
                   <p>{i18n.t('settings.tools.noBuiltinTools')}</p>
                 </div>
               {:else}
-                <div class="builtin-tool-list">
-                  {#each builtinTools as tool (tool.name)}
-                    <div class="builtin-tool-row">
-                      <div class="avatar-squircle builtin-tool-avatar" style="background: rgba(var(--primary-rgb, 0, 122, 255), 0.12); color: var(--primary);">
-                        <Icon name={tool.name.includes('process') || tool.name.includes('shell') ? 'terminal' : 'tools'} size={13} />
+                <div class="builtin-category-list">
+                  {#each builtinToolGroups as group (group.category)}
+                    <details class="builtin-category-group">
+                      <summary class="builtin-category-summary">
+                        <div class="avatar-squircle builtin-tool-avatar" style="background: rgba(var(--primary-rgb, 0, 122, 255), 0.12); color: var(--primary);">
+                          <Icon name={getBuiltinCategoryIcon(group.category)} size={13} />
+                        </div>
+                        <div class="builtin-tool-identity">
+                          <span class="builtin-tool-name">{getBuiltinCategoryLabel(group.category)}</span>
+                          <span class="tool-code">{i18n.t('settings.tools.builtinCategoryActionCount', { count: group.tools.length })}</span>
+                        </div>
+                        <div class="builtin-tool-badges">
+                          <span class="tool-runtime-status">
+                            {i18n.t('settings.tools.builtinCategoryReadyCount', { ready: group.readyCount, total: group.tools.length })}
+                          </span>
+                          <span class={`apple-indicator ${group.readyCount === group.tools.length ? 'success' : group.readyCount > 0 ? 'warning' : 'error'}`}></span>
+                          <Icon name="chevronDown" size={12} />
+                        </div>
+                      </summary>
+                      <div class="builtin-tool-list">
+                        {#each group.tools as tool (tool.name)}
+                          <div class="builtin-tool-row">
+                            <div class="avatar-squircle builtin-tool-avatar" style="background: rgba(var(--primary-rgb, 0, 122, 255), 0.12); color: var(--primary);">
+                              <Icon name={getBuiltinCategoryIcon(group.category)} size={13} />
+                            </div>
+                            <div class="builtin-tool-identity">
+                              <span
+                                class="builtin-tool-name"
+                                title={`${getBuiltinToolLabel(tool.name)} · ${tool.name}`}
+                              >
+                                {getBuiltinToolLabel(tool.name)}
+                              </span>
+                              <span class="tool-code" title={getBuiltinToolScopeLabel(tool)}>{getBuiltinToolScopeLabel(tool)}</span>
+                            </div>
+                            <div class="builtin-tool-badges">
+                              <span class="tool-badge">{getBuiltinToolAccessLabel(tool.accessMode)}</span>
+                              <span class="tool-badge" class:tool-badge--risk={tool.riskLevel.toLowerCase() === 'high'}>{getBuiltinToolRiskLabel(tool.riskLevel)}</span>
+                              <span class="tool-runtime-status">
+                                {getBuiltinToolDisplayStatusLabel(tool)}
+                              </span>
+                              <span
+                                class={`apple-indicator ${getBuiltinToolDisplayStatusClass(tool)}`}
+                                title={getBuiltinToolRuntimeTitle(tool)}
+                              ></span>
+                            </div>
+                          </div>
+                        {/each}
                       </div>
-                      <div class="builtin-tool-identity">
-                        <span
-                          class="builtin-tool-name"
-                          title={`${getBuiltinToolLabel(tool.name)} · ${tool.name}`}
-                        >
-                          {getBuiltinToolLabel(tool.name)}
-                        </span>
-                        <span class="tool-code" title={getBuiltinToolScopeLabel(tool)}>{getBuiltinToolScopeLabel(tool)}</span>
-                      </div>
-                      <div class="builtin-tool-badges">
-                        <span class="tool-badge">{getBuiltinToolAccessLabel(tool.accessMode)}</span>
-                        <span class="tool-badge" class:tool-badge--risk={tool.riskLevel.toLowerCase() === 'high'}>{getBuiltinToolRiskLabel(tool.riskLevel)}</span>
-                        <span class="tool-runtime-status">
-                          {getBuiltinToolDisplayStatusLabel(tool)}
-                        </span>
-                        <span
-                          class={`apple-indicator ${getBuiltinToolDisplayStatusClass(tool)}`}
-                          title={getBuiltinToolRuntimeTitle(tool)}
-                        ></span>
-                      </div>
-                    </div>
+                    </details>
                   {/each}
                 </div>
               {/if}
@@ -1048,25 +1112,20 @@
 
   .tools-fixed-panel--builtin {
     flex: 0 0 auto;
-    max-height: 318px;
-    overflow-y: auto;
-    overflow-x: hidden;
-    padding-right: 2px;
-    overscroll-behavior: contain;
-    scrollbar-width: thin;
-    scrollbar-color: var(--scrollbar-thumb) transparent;
+    overflow: visible;
+    padding-right: 0;
   }
 
-  .tools-fixed-panel--builtin::-webkit-scrollbar {
+  .builtin-category-list::-webkit-scrollbar {
     width: 10px;
   }
 
-  .tools-fixed-panel--builtin::-webkit-scrollbar-track {
+  .builtin-category-list::-webkit-scrollbar-track {
     background: color-mix(in srgb, var(--surface-2) 58%, transparent);
     border-radius: 999px;
   }
 
-  .tools-fixed-panel--builtin::-webkit-scrollbar-thumb {
+  .builtin-category-list::-webkit-scrollbar-thumb {
     background: var(--scrollbar-thumb);
     border-radius: 999px;
     border: 2px solid color-mix(in srgb, var(--surface-1) 88%, transparent);
@@ -1102,7 +1161,7 @@
     padding: 0;
     background: rgba(var(--foreground-rgb), 0.025);
     border: 1px solid var(--border);
-    border-radius: 10px;
+    border-radius: 8px;
     transition: background 0.15s ease, border-color 0.15s ease;
   }
 
@@ -1127,9 +1186,9 @@
   }
 
   .builtin-summary-toggle:focus-visible {
-    outline: 2px solid color-mix(in srgb, var(--primary) 58%, transparent);
-    outline-offset: -3px;
-    border-radius: 10px;
+    outline: 1px solid color-mix(in srgb, var(--primary) 62%, transparent);
+    outline-offset: -2px;
+    border-radius: 8px;
   }
 
   .builtin-summary-main {
@@ -1326,10 +1385,75 @@
     }
   }
 
-  .builtin-tool-list {
+  .builtin-category-list {
+    display: flex;
+    flex-direction: column;
+    max-height: 348px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-color: var(--scrollbar-thumb) transparent;
+    scrollbar-width: thin;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--surface-1) 94%, transparent);
+  }
+
+  .builtin-category-group {
+    min-width: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+  }
+
+  .builtin-category-group + .builtin-category-group {
+    border-top: 1px solid var(--border);
+  }
+
+  .builtin-category-summary {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 6px;
+    grid-template-columns: 28px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 9px;
+    min-height: 52px;
+    padding: 7px 10px;
+    cursor: pointer;
+    list-style: none;
+    transition: background 0.15s ease;
+  }
+
+  .builtin-category-summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .builtin-category-summary:hover,
+  .builtin-category-group[open] > .builtin-category-summary {
+    background: rgba(var(--foreground-rgb), 0.04);
+  }
+
+  .builtin-category-summary:focus-visible {
+    outline: 1px solid color-mix(in srgb, var(--primary) 58%, transparent);
+    outline-offset: -2px;
+  }
+
+  .builtin-category-summary > .builtin-tool-badges > :global(svg) {
+    transition: transform 0.16s ease;
+  }
+
+  .builtin-category-group[open] > .builtin-category-summary > .builtin-tool-badges > :global(svg) {
+    transform: rotate(180deg);
+  }
+
+  .builtin-category-group > .builtin-tool-list {
+    padding: 3px 10px 5px 45px;
+    border-top: 1px solid var(--border);
+    background: color-mix(in srgb, var(--surface-2) 68%, transparent);
+    animation: builtin-tool-list-in 0.14s ease-out;
+  }
+
+  .builtin-tool-list {
+    display: flex;
+    flex-direction: column;
   }
 
   .builtin-tool-panel {
@@ -1338,15 +1462,33 @@
 
   .builtin-tool-row {
     display: grid;
-    grid-template-columns: 26px minmax(0, 1fr) auto;
+    grid-template-columns: 24px minmax(0, 1fr) auto;
     align-items: center;
-    gap: 7px;
+    gap: 8px;
     min-width: 0;
-    min-height: 46px;
-    padding: 5px 8px;
-    border: 1px solid var(--border);
-    border-radius: 10px;
+    min-height: 44px;
+    padding: 5px 4px;
+    border: 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+    border-radius: 0;
+    background: transparent;
+    transition: background 0.15s ease;
+  }
+
+  .builtin-tool-row:last-child {
+    border-bottom: 0;
+  }
+
+  .builtin-tool-row:hover {
     background: rgba(var(--foreground-rgb), 0.035);
+  }
+
+  .builtin-tool-list .builtin-tool-avatar {
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    color: var(--foreground-muted) !important;
+    background: rgba(var(--foreground-rgb), 0.055) !important;
   }
 
   .builtin-tool-avatar {
@@ -1395,7 +1537,7 @@
 
   .tool-badge {
     padding: 1px 5px;
-    border-radius: 999px;
+    border-radius: 4px;
     background: rgba(var(--foreground-rgb), 0.06);
     color: var(--foreground-muted);
     font-size: 10px;
@@ -1414,21 +1556,30 @@
     white-space: nowrap;
   }
 
-  @container tools-tab (max-width: 1120px) {
-    .builtin-tool-list {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+  @keyframes builtin-tool-list-in {
+    from {
+      opacity: 0;
+      transform: translateY(-2px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
     }
   }
 
-  @container tools-tab (max-width: 680px) {
-    .builtin-tool-list {
-      grid-template-columns: minmax(0, 1fr);
+  @media (prefers-reduced-motion: reduce) {
+    .builtin-category-group > .builtin-tool-list {
+      animation: none;
     }
   }
 
   @container tools-tab (max-width: 560px) {
+    .builtin-category-group > .builtin-tool-list {
+      padding-left: 12px;
+    }
+
     .builtin-tool-row {
-      grid-template-columns: 26px minmax(0, 1fr);
+      grid-template-columns: 24px minmax(0, 1fr);
       min-height: 56px;
     }
 

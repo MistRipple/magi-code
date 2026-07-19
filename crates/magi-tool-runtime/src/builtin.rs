@@ -169,6 +169,20 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input, context, resources),
             BuiltinToolName::CodeSymbols => execute_code_symbols(input, context, resources),
             BuiltinToolName::ToolCatalog => execute_tool_catalog(input, context, resources),
+            BuiltinToolName::GitStatus
+            | BuiltinToolName::GitBranchList
+            | BuiltinToolName::GitBranchCreate
+            | BuiltinToolName::GitBranchSwitch
+            | BuiltinToolName::GitPull
+            | BuiltinToolName::GitPush
+            | BuiltinToolName::GitMergePreview
+            | BuiltinToolName::GitMerge
+            | BuiltinToolName::GitBranchDelete
+            | BuiltinToolName::GitWorktreeList
+            | BuiltinToolName::GitWorktreeCreate
+            | BuiltinToolName::GitWorktreeRemove => {
+                execute_git_tool(self.name, input, context, resources)
+            }
             BuiltinToolName::GetGoal
             | BuiltinToolName::CreateGoal
             | BuiltinToolName::UpdateGoal => execute_orchestration_only(self.name, input),
@@ -186,6 +200,24 @@ impl BuiltinTool for NormalizedBuiltinTool {
             approval_requirement: self.approval_requirement,
         }
     }
+}
+
+fn execute_git_tool(
+    tool: BuiltinToolName,
+    input: &str,
+    context: &ToolExecutionContext,
+    resources: &ToolRuntimeResources,
+) -> String {
+    let Some(executor) = resources.git_tool_executor.as_ref() else {
+        return serde_json::json!({
+            "tool": tool.as_str(),
+            "status": "failed",
+            "error_code": "git_runtime_unavailable",
+            "error": "结构化 Git 运行时不可用",
+        })
+        .to_string();
+    };
+    executor(tool.as_str(), input, context).0
 }
 
 pub(crate) fn infer_execution_status(payload: &str) -> ExecutionResultStatus {

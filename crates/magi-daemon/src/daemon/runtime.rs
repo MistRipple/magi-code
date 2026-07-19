@@ -1091,6 +1091,26 @@ impl DaemonRuntime {
                     .is_ok()
             })
         };
+        let runtime_persistence = Arc::new(RuntimeStatePersistence::new(
+            self.state_root.join("sessions.json"),
+            self.state_root.join("workspaces.json"),
+            self.state_root.join("knowledge.json"),
+        ));
+        let git_service = Arc::new(magi_git::GitService::new());
+        let session_code_contexts = magi_git::SessionCodeContextRegistry::default();
+        let workspace_git_coordinator = magi_git::WorkspaceGitOperationCoordinator::default();
+        let git_tool_executor = magi_api::git_tool_runtime::build_git_tool_executor(
+            magi_api::git_tool_runtime::GitToolRuntimeDependencies {
+                git_service: git_service.clone(),
+                session_code_contexts: session_code_contexts.clone(),
+                workspace_git_coordinator: workspace_git_coordinator.clone(),
+                event_bus: self.event_bus.clone(),
+                knowledge_store: self.knowledge_store.clone(),
+                snapshot_manager: snapshot_manager.clone(),
+                runtime_persistence: runtime_persistence.clone(),
+                managed_worktree_root: self.state_root.join("worktrees"),
+            },
+        );
         let mut tool_registry = ToolRegistry::new(self.governance.clone(), self.event_bus.clone())
             .with_knowledge_store(self.knowledge_store.clone())
             .with_external_tool_catalog_provider(external_tool_catalog_provider)
@@ -1100,6 +1120,7 @@ impl DaemonRuntime {
                 image_generation_executor,
                 image_generation_readiness_provider,
             )
+            .with_git_tool_executor(git_tool_executor)
             .with_runtime_capability_dependency_provider(runtime_capability_dependency_provider);
         tool_registry.register_default_builtins();
 
@@ -1340,14 +1361,15 @@ impl DaemonRuntime {
         .with_skill_dispatch_runtime(Arc::new(skill_runtime.clone()))
         .with_mcp_connections(mcp_connections)
         .with_tool_registry(tool_registry_for_dispatcher.clone())
+        .with_git_context_runtime(
+            git_service,
+            session_code_contexts,
+            workspace_git_coordinator,
+        )
         .with_spawn_graph(spawn_graph)
         .with_agent_role_registry(agent_role_registry)
         .with_tunnel_port(self.local_port)
-        .with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
-            self.state_root.join("sessions.json"),
-            self.state_root.join("workspaces.json"),
-            self.state_root.join("knowledge.json"),
-        )))
+        .with_runtime_persistence(runtime_persistence)
         .with_session_state_checkpoint_persist(session_state_checkpoint_persist)
         .with_bridge_probe_transport(BridgeServerKind::Model, model_transport)
         .with_bridge_probe_transport(BridgeServerKind::Mcp, mcp_transport)

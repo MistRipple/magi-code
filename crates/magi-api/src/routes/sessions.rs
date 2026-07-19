@@ -1347,12 +1347,19 @@ async fn submit_regular_session_turn(
         .session_store
         .set_active_goal_access_profile(&session_id, request.requested_access_profile())
         .map_err(|error| ApiError::internal_assembly("更新 active goal 访问模式失败", error))?;
-    let workspace_root_path = state
-        .workspace_root_path(&workspace_id)
-        .map(|path| path.display().to_string());
     state
         .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
         .await?;
+    let session_code_context = state
+        .ensure_session_code_context(&session_id, &workspace_id)
+        .await?;
+    let workspace_root_path = session_code_context
+        .map(|context| context.execution_root.display().to_string())
+        .or_else(|| {
+            state
+                .workspace_root_path(&workspace_id)
+                .map(|path| path.display().to_string())
+        });
     let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let request_id = request.request_id();
     let user_message_id = request.user_message_id();
@@ -1472,6 +1479,7 @@ async fn submit_regular_session_turn(
             }));
         }
         Err(error) => {
+            state.release_session_git_execution_lease(&session_id);
             return Err(map_current_turn_accept_error(
                 "接受 session turn 失败",
                 error,
@@ -1479,6 +1487,7 @@ async fn submit_regular_session_turn(
         }
     };
     if let Err(error) = state.persist_session_state_checkpoint("session_turn_accepted") {
+        state.release_session_git_execution_lease(&session_id);
         state
             .conversation_registry
             .close_session_turn_input(&session_id, &turn_id);
@@ -1496,6 +1505,7 @@ async fn submit_regular_session_turn(
         .conversation_registry
         .begin_session_turn_input(session_id.clone(), turn_id.clone())
         .map_err(|error| {
+            state.release_session_git_execution_lease(&session_id);
             publish_regular_session_turn_early_failed(
                 &state,
                 &session_id,
@@ -1952,6 +1962,7 @@ pub(crate) fn schedule_next_queued_regular_session_turn(
     session_id: SessionId,
     workspace_id: Option<WorkspaceId>,
 ) {
+    state.release_session_git_execution_lease(&session_id);
     tokio::spawn(async move {
         if !state
             .session_store
@@ -3346,6 +3357,7 @@ async fn close_session(
             .unbind_session_after_lifecycle_lock(&session_id)
             .await;
     }
+    state.release_session_git_execution_lease(&session_id);
     state.persist_session_durable_state_for_api()?;
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         Some(workspace_id.as_str()),

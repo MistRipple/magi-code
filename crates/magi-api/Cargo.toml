@@ -22,6 +22,7 @@ magi-mission-metrics = { path = "../magi-mission-metrics" }
 magi-conversation-runtime = { path = "../magi-conversation-runtime" }
 magi-event-bus = { path = "../magi-event-bus" }
 magi-governance = { path = "../magi-governance" }
+magi-git = { path = "../magi-git" }
 magi-knowledge-store = { path = "../magi-knowledge-store" }
 magi-memory-store = { path = "../magi-memory-store" }
 magi-orchestrator = { path = "../magi-orchestrator" }

@@ -1631,7 +1631,7 @@ mod tests {
     use magi_session_store::{SessionRecord, SessionStore};
     use magi_snapshot::SnapshotManager;
     use magi_tool_runtime::{
-        ExternalMcpServerCatalogEntry, ExternalToolCatalogSnapshot, ToolRegistry,
+        BuiltinToolName, ExternalMcpServerCatalogEntry, ExternalToolCatalogSnapshot, ToolRegistry,
     };
     use magi_workspace::WorkspaceStore;
     use std::sync::Arc;
@@ -2121,44 +2121,75 @@ mod tests {
         let builtin_tools = bootstrap["builtinTools"]
             .as_array()
             .expect("builtin tools should be an array");
-        assert_eq!(builtin_tools.len(), 28);
         let builtin_names: Vec<_> = builtin_tools
             .iter()
             .map(|tool| tool["name"].as_str().expect("tool name"))
             .collect();
+        let expected_builtin_names = vec![
+            "file_read",
+            "view_image",
+            "file_write",
+            "file_patch",
+            "apply_patch",
+            "file_remove",
+            "file_mkdir",
+            "file_copy",
+            "file_move",
+            "search_text",
+            "search_semantic",
+            "shell_exec",
+            "process_inspect",
+            "diff_preview",
+            "web_search",
+            "web_fetch",
+            "diagram_render",
+            "image_generate",
+            "knowledge_query",
+            "code_symbols",
+            "tool_catalog",
+            "git_status",
+            "git_branch_list",
+            "git_branch_create",
+            "git_branch_switch",
+            "git_pull",
+            "git_push",
+            "git_merge_preview",
+            "git_merge",
+            "git_branch_delete",
+            "git_worktree_list",
+            "git_worktree_create",
+            "git_worktree_remove",
+            "get_goal",
+            "create_goal",
+            "update_goal",
+            "agent_spawn",
+            "agent_wait",
+            "update_plan",
+            "memory_write",
+        ];
         assert_eq!(
-            builtin_names,
-            vec![
-                "file_read",
-                "view_image",
-                "file_write",
-                "file_patch",
-                "apply_patch",
-                "file_remove",
-                "file_mkdir",
-                "file_copy",
-                "file_move",
-                "search_text",
-                "search_semantic",
-                "shell_exec",
-                "process_inspect",
-                "diff_preview",
-                "web_search",
-                "web_fetch",
-                "diagram_render",
-                "image_generate",
-                "knowledge_query",
-                "code_symbols",
-                "tool_catalog",
-                "get_goal",
-                "create_goal",
-                "update_goal",
-                "agent_spawn",
-                "agent_wait",
-                "update_plan",
-                "memory_write",
-            ],
+            builtin_names, expected_builtin_names,
             "bootstrap must expose one canonical public builtin surface in a stable order"
+        );
+        let builtin_categories = builtin_tools
+            .iter()
+            .map(|tool| tool["category"].as_str().expect("tool category"))
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_category_count = BuiltinToolName::ALL
+            .iter()
+            .filter(|tool| tool.is_public_tool_surface())
+            .map(BuiltinToolName::category)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert_eq!(builtin_categories.len(), expected_category_count);
+        assert!(
+            builtin_tools
+                .iter()
+                .filter(|tool| tool["name"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("git_")))
+                .all(|tool| tool["category"] == serde_json::json!("git")),
+            "all Git actions must belong to one Git capability category"
         );
         assert!(
             builtin_tools

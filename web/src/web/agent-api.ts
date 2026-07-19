@@ -208,6 +208,9 @@ function normalizeBuiltinTools(value: unknown): SettingsBuiltinTool[] {
     if (!name) continue;
     tools.push({
       name,
+      category: typeof record.category === 'string' && record.category.trim()
+        ? record.category.trim()
+        : 'uncategorized',
       riskLevel: typeof record.riskLevel === 'string' ? record.riskLevel : '',
       approvalRequirement: typeof record.approvalRequirement === 'string' ? record.approvalRequirement : '',
       effectiveApprovalPolicy: typeof record.effectiveApprovalPolicy === 'string' ? record.effectiveApprovalPolicy : 'none',

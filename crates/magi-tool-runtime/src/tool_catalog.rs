@@ -2,6 +2,7 @@ use crate::{
     AgentRoleCatalogEntry, BuiltinToolAccessMode, BuiltinToolName, ExternalToolCatalogEntry,
     ExternalToolCatalogSnapshot, ToolExecutionContext, ToolRuntimeResources,
 };
+use std::collections::BTreeSet;
 
 pub(crate) fn execute_tool_catalog(
     input: &str,
@@ -69,8 +70,9 @@ pub(crate) fn build_tool_catalog_value(
         .unwrap_or(true);
 
     let mut tools = Vec::new();
-    let mut public_count = 0usize;
-    let mut internal_count = 0usize;
+    let mut builtin_categories = BTreeSet::new();
+    let mut public_categories = BTreeSet::new();
+    let mut internal_categories = BTreeSet::new();
     let mut schema_warning_count = 0usize;
     let agent_roles = resources
         .agent_role_catalog_provider
@@ -87,10 +89,11 @@ pub(crate) fn build_tool_catalog_value(
 
     for tool in BuiltinToolName::ALL {
         let is_public = tool.is_public_tool_surface();
+        builtin_categories.insert(tool.category());
         if is_public {
-            public_count += 1;
+            public_categories.insert(tool.category());
         } else {
-            internal_count += 1;
+            internal_categories.insert(tool.category());
         }
         if !is_public && !include_internal {
             continue;
@@ -182,6 +185,9 @@ pub(crate) fn build_tool_catalog_value(
     };
     let agent_role_count = agent_roles.len();
     let spawnable_agent_role_count = agent_roles.iter().filter(|role| role.spawnable).count();
+    let builtin_total = builtin_categories.len();
+    let public_count = public_categories.len();
+    let internal_count = internal_categories.len();
     let external_catalog_status =
         if include_external && resources.external_tool_catalog_provider.is_some() {
             "available"
@@ -214,7 +220,7 @@ pub(crate) fn build_tool_catalog_value(
             runtime_warning_count,
         }),
         "total": tools.len() + skill_tool_count + external_mcp_tools.len(),
-        "builtin_total": BuiltinToolName::ALL.len(),
+        "builtin_total": builtin_total,
         "public_count": public_count,
         "internal_count": internal_count,
         "schema_warning_count": schema_warning_count,
@@ -278,7 +284,7 @@ fn tool_catalog_summary(input: ToolCatalogSummaryInput) -> String {
         runtime_warning_count,
     } = input;
     let mut summary = format!(
-        "工具目录已更新：{public_count} 个内置工具、{instruction_skill_count} 个 Skill、{skill_tool_count} 个自定义工具、MCP 启用服务 {connected_mcp_server_count}/{enabled_mcp_server_count} 可用、子代理 {spawnable_agent_role_count}/{agent_role_count} 可派发"
+        "工具目录已更新：{public_count} 类内置能力、{instruction_skill_count} 个 Skill、{skill_tool_count} 个自定义工具、MCP 启用服务 {connected_mcp_server_count}/{enabled_mcp_server_count} 可用、子代理 {spawnable_agent_role_count}/{agent_role_count} 可派发"
     );
     let warning_count = schema_warning_count + runtime_warning_count;
     if warning_count > 0 {
@@ -794,7 +800,11 @@ mod tests {
         );
         assert_eq!(
             payload["builtin_total"].as_u64().expect("builtin_total"),
-            BuiltinToolName::ALL.len() as u64
+            BuiltinToolName::ALL
+                .iter()
+                .map(BuiltinToolName::category)
+                .collect::<BTreeSet<_>>()
+                .len() as u64
         );
         assert_eq!(payload["external_catalog_status"], "unavailable");
         let names = payload["tools"]

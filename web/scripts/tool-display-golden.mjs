@@ -48,6 +48,9 @@ const zhCN = JSON.parse(await readFile(new URL('../src/i18n/zh-CN.json', import.
 const enUS = JSON.parse(await readFile(new URL('../src/i18n/en-US.json', import.meta.url), 'utf8'));
 const requiredBuiltinToolLabels = {
   imageGenerate: ['生成图片', 'Image Generation'],
+  gitStatus: ['Git 状态', 'Git Status'],
+  gitBranchCreate: ['创建分支', 'Create Branch'],
+  gitWorktreeCreate: ['创建工作树', 'Create Worktree'],
   getGoal: ['查看目标', 'Get Goal'],
   createGoal: ['创建目标', 'Create Goal'],
   updateGoal: ['更新目标', 'Update Goal'],
@@ -65,17 +68,32 @@ const settingsToolsSource = await readFile(
 );
 assert.match(
   settingsToolsSource,
+  /builtinToolGroups[\s\S]*?new Map<string, typeof builtinTools>[\s\S]*?tool\.category[\s\S]*?class="builtin-category-group"/,
+  'built-in capability statistics and top-level rows must group concrete actions by category',
+);
+assert.match(
+  settingsToolsSource,
+  /builtinReadyCount[\s\S]*?builtinToolGroups\.filter[\s\S]*?total: builtinToolGroups\.length/,
+  'built-in readiness statistics must count capability categories instead of concrete actions',
+);
+assert.match(
+  settingsToolsSource,
   /class="builtin-tool-identity"[\s\S]*?class="builtin-tool-badges"/,
   'built-in tool cards must keep identity and status in separate stable columns',
 );
 assert.match(
   settingsToolsSource,
-  /\.builtin-tool-list\s*\{[\s\S]*?gap:\s*6px;[\s\S]*?\.builtin-tool-row\s*\{[\s\S]*?display:\s*grid;[\s\S]*?grid-template-columns:\s*26px minmax\(0, 1fr\) auto;[\s\S]*?min-height:\s*46px;[\s\S]*?padding:\s*5px 8px;/,
-  'wide built-in tool cards must use a compact icon, identity, and status grid',
+  /\.builtin-category-list\s*\{[\s\S]*?display:\s*flex;[\s\S]*?max-height:\s*348px;[\s\S]*?overflow-y:\s*auto;[\s\S]*?border:\s*1px solid var\(--border\);[\s\S]*?\.builtin-category-group \+ \.builtin-category-group\s*\{[\s\S]*?border-top:\s*1px solid var\(--border\);/,
+  'built-in capability categories must use one compact list with separators instead of nested cards',
 );
 assert.match(
   settingsToolsSource,
-  /@container tools-tab \(max-width:\s*560px\)[\s\S]*?\.builtin-tool-row\s*\{[\s\S]*?grid-template-columns:\s*26px minmax\(0, 1fr\);[\s\S]*?\.builtin-tool-badges\s*\{[\s\S]*?grid-column:\s*2;/,
+  /\.builtin-category-group > \.builtin-tool-list\s*\{[\s\S]*?padding:\s*3px 10px 5px 45px;[\s\S]*?\.builtin-tool-list\s*\{[\s\S]*?display:\s*flex;[\s\S]*?flex-direction:\s*column;[\s\S]*?\.builtin-tool-row\s*\{[\s\S]*?grid-template-columns:\s*24px minmax\(0, 1fr\) auto;[\s\S]*?border-bottom:/,
+  'expanded built-in actions must render as an indented dense sub-list aligned with MCP and Skill rows',
+);
+assert.match(
+  settingsToolsSource,
+  /@container tools-tab \(max-width:\s*560px\)[\s\S]*?\.builtin-category-group > \.builtin-tool-list\s*\{[\s\S]*?padding-left:\s*12px;[\s\S]*?\.builtin-tool-row\s*\{[\s\S]*?grid-template-columns:\s*24px minmax\(0, 1fr\);[\s\S]*?\.builtin-tool-badges\s*\{[\s\S]*?grid-column:\s*2;/,
   'only genuinely narrow layouts should move status badges below the tool identity',
 );
 assert.match(

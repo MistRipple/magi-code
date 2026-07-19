@@ -26,7 +26,7 @@ pub use types::external_mcp_model_tool_name;
 pub use types::{
     AgentRoleCatalogEntry, AgentRoleCatalogProvider, BuiltinTool, ExternalMcpServerCatalogEntry,
     ExternalMcpToolCatalogEntry, ExternalMcpToolExecutor, ExternalToolCatalogEntry,
-    ExternalToolCatalogProvider, ExternalToolCatalogSnapshot, GeneratedImageData,
+    ExternalToolCatalogProvider, ExternalToolCatalogSnapshot, GeneratedImageData, GitToolExecutor,
     ImageGenerationExecutionContext, ImageGenerationExecutor, ImageGenerationReadinessProvider,
     ImageGenerationRequest, RuntimeCapabilityDependencyEntry, RuntimeCapabilityDependencyProvider,
     ToolExecutionContext, ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput,

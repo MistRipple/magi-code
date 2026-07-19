@@ -208,7 +208,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["tool"], "tool_catalog");
         assert_eq!(body["status"], "succeeded");
-        assert_eq!(body["builtinTotal"], BuiltinToolName::ALL.len());
+        let builtin_category_count = BuiltinToolName::ALL
+            .iter()
+            .map(BuiltinToolName::category)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert_eq!(body["builtinTotal"], builtin_category_count);
         assert_eq!(body["externalCatalogStatus"], "unavailable");
         assert_eq!(body["agentRoleCatalogStatus"], "unavailable");
         assert!(body["runtimeDependencies"][1].get("workspaceId").is_none());

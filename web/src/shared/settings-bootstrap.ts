@@ -17,6 +17,7 @@ export type SettingsWorkerStatusMap = SettingsWorkerStatusSnapshot;
 
 export interface SettingsBuiltinTool {
   name: string;
+  category: string;
   riskLevel?: string;
   approvalRequirement?: string;
   effectiveApprovalPolicy?: string;

@@ -1,9 +1,10 @@
 use crate::{
     AgentRoleCatalogProvider, BuiltinTool, BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec,
     ExternalMcpToolExecutor, ExternalToolCatalogProvider, ExternalToolCatalogSnapshot,
-    ImageGenerationExecutor, ImageGenerationReadinessProvider, RuntimeCapabilityDependencyProvider,
-    ToolExecutionContext, ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput,
-    ToolExecutionPolicy, ToolExecutionSummary, ToolInvocationRecord, ToolRuntimeResources,
+    GitToolExecutor, ImageGenerationExecutor, ImageGenerationReadinessProvider,
+    RuntimeCapabilityDependencyProvider, ToolExecutionContext, ToolExecutionContextQuery,
+    ToolExecutionInput, ToolExecutionOutput, ToolExecutionPolicy, ToolExecutionSummary,
+    ToolInvocationRecord, ToolRuntimeResources,
     builtin::{self, NormalizedBuiltinTool, infer_execution_status},
     is_public_builtin_tool_surface,
     policy::WriteProtectionClaim,
@@ -141,6 +142,11 @@ impl ToolRegistry {
     ) -> Self {
         self.runtime_resources.image_generation_executor = Some(executor);
         self.runtime_resources.image_generation_readiness_provider = Some(readiness_provider);
+        self
+    }
+
+    pub fn with_git_tool_executor(mut self, executor: GitToolExecutor) -> Self {
+        self.runtime_resources.git_tool_executor = Some(executor);
         self
     }
 

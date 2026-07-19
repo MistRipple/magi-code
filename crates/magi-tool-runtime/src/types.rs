@@ -191,6 +191,14 @@ pub type ImageGenerationExecutor = Arc<
         + 'static,
 >;
 pub type ImageGenerationReadinessProvider = Arc<dyn Fn() -> bool + Send + Sync + 'static>;
+/// 主对话 Git 工具执行器。业务层负责 session/workspace 绑定、Git context、CAS 与 lease；
+/// 工具运行时只负责把模型调用路由到同一结构化 Git 应用服务。
+pub type GitToolExecutor = Arc<
+    dyn Fn(&str, &str, &ToolExecutionContext) -> (String, ExecutionResultStatus)
+        + Send
+        + Sync
+        + 'static,
+>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageGenerationRequest {
@@ -343,6 +351,7 @@ pub struct ToolRuntimeResources {
     pub runtime_capability_dependency_provider: Option<RuntimeCapabilityDependencyProvider>,
     pub image_generation_executor: Option<ImageGenerationExecutor>,
     pub image_generation_readiness_provider: Option<ImageGenerationReadinessProvider>,
+    pub git_tool_executor: Option<GitToolExecutor>,
 }
 
 pub trait BuiltinTool: Send + Sync {

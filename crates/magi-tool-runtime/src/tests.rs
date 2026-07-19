@@ -3194,6 +3194,55 @@ fn full_access_policy() -> ToolExecutionPolicy {
 }
 
 #[test]
+fn structured_git_builtins_delegate_through_runtime_resource() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_executor = calls.clone();
+    let registry = make_registry().with_git_tool_executor(Arc::new(move |tool, input, context| {
+        calls_for_executor.fetch_add(1, Ordering::SeqCst);
+        (
+            serde_json::json!({
+                "tool": tool,
+                "status": "succeeded",
+                "input": input,
+                "sessionId": context.session_id,
+            })
+            .to_string(),
+            ExecutionResultStatus::Succeeded,
+        )
+    }));
+    let context = ToolExecutionContext {
+        session_id: Some(SessionId::new("session-git-builtin")),
+        workspace_id: Some(WorkspaceId::new("workspace-git-builtin")),
+        access_profile: magi_core::AccessProfile::FullAccess,
+        working_directory: Some(PathBuf::from("/tmp/git-builtin")),
+        ..ToolExecutionContext::default()
+    };
+
+    let status = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("git-status-call"),
+            BuiltinToolName::GitStatus.as_str(),
+            "{}",
+        ),
+        context.clone(),
+        &full_access_policy(),
+    );
+    assert_eq!(status.status, ExecutionResultStatus::Succeeded);
+
+    let switched = registry.execute_with_policy(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("git-switch-call"),
+            BuiltinToolName::GitBranchSwitch.as_str(),
+            r#"{"branch":"feature"}"#,
+        ),
+        context,
+        &full_access_policy(),
+    );
+    assert_eq!(switched.status, ExecutionResultStatus::Succeeded);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn registry_enforces_read_only_profile_for_write_tools() {
     let root = unique_temp_dir("magi-tool-read-only-profile");
     let registry = make_registry();
@@ -5068,6 +5117,18 @@ fn public_builtin_specs_exclude_shell_internal_process_tools() {
             "knowledge_query",
             "code_symbols",
             "tool_catalog",
+            "git_status",
+            "git_branch_list",
+            "git_branch_create",
+            "git_branch_switch",
+            "git_pull",
+            "git_push",
+            "git_merge_preview",
+            "git_merge",
+            "git_branch_delete",
+            "git_worktree_list",
+            "git_worktree_create",
+            "git_worktree_remove",
             "get_goal",
             "create_goal",
             "update_goal",

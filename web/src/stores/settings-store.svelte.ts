@@ -174,6 +174,7 @@ export interface SkillItem {
 
 export interface BuiltinToolItem {
   name: string;
+  category: string;
   riskLevel: string;
   approvalRequirement: string;
   effectiveApprovalPolicy: string;
@@ -2916,6 +2917,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
           .filter((warning) => warning === "schema_warning");
         return {
           name,
+          category: typeof tool.category === "string" && tool.category.trim()
+            ? tool.category.trim()
+            : "uncategorized",
           riskLevel: typeof tool.riskLevel === "string" ? tool.riskLevel : "",
           approvalRequirement: typeof tool.approvalRequirement === "string" ? tool.approvalRequirement : "",
           effectiveApprovalPolicy: typeof tool.effectiveApprovalPolicy === "string" ? tool.effectiveApprovalPolicy : "none",

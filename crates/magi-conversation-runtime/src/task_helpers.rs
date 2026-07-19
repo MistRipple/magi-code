@@ -33,6 +33,24 @@ pub(crate) fn is_goal_builtin_tool(tool: BuiltinToolName) -> bool {
     )
 }
 
+pub(crate) fn is_git_builtin_tool(tool: BuiltinToolName) -> bool {
+    matches!(
+        tool,
+        BuiltinToolName::GitStatus
+            | BuiltinToolName::GitBranchList
+            | BuiltinToolName::GitBranchCreate
+            | BuiltinToolName::GitBranchSwitch
+            | BuiltinToolName::GitPull
+            | BuiltinToolName::GitPush
+            | BuiltinToolName::GitMergePreview
+            | BuiltinToolName::GitMerge
+            | BuiltinToolName::GitBranchDelete
+            | BuiltinToolName::GitWorktreeList
+            | BuiltinToolName::GitWorktreeCreate
+            | BuiltinToolName::GitWorktreeRemove
+    )
+}
+
 pub(crate) fn task_role_id(task: Option<&Task>) -> Option<&str> {
     let task = task?;
     task.executor_binding_target_role()
@@ -57,6 +75,9 @@ pub(crate) fn task_can_see_builtin_tool(
     tool: BuiltinToolName,
 ) -> bool {
     if is_goal_builtin_tool(tool) {
+        return task.is_none() || task_is_coordinator(task, registry);
+    }
+    if is_git_builtin_tool(tool) {
         return task.is_none() || task_is_coordinator(task, registry);
     }
     if matches!(tool, BuiltinToolName::UpdatePlan) && task.is_none() {

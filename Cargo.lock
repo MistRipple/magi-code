@@ -2335,6 +2335,7 @@ dependencies = [
  "magi-conversation-runtime",
  "magi-core",
  "magi-event-bus",
+ "magi-git",
  "magi-governance",
  "magi-knowledge-store",
  "magi-memory-store",
@@ -2405,6 +2406,7 @@ dependencies = [
  "magi-context-runtime",
  "magi-core",
  "magi-event-bus",
+ "magi-git",
  "magi-governance",
  "magi-knowledge-store",
  "magi-memory-store",
@@ -2412,6 +2414,7 @@ dependencies = [
  "magi-orchestrator",
  "magi-permissions",
  "magi-plan",
+ "magi-process",
  "magi-project-memory",
  "magi-safety-gate",
  "magi-session-store",
@@ -2454,6 +2457,7 @@ dependencies = [
  "magi-conversation-runtime",
  "magi-core",
  "magi-event-bus",
+ "magi-git",
  "magi-governance",
  "magi-knowledge-store",
  "magi-memory-store",
@@ -2517,6 +2521,17 @@ dependencies = [
  "magi-core",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "magi-git"
+version = "3.0.9"
+dependencies = [
+ "magi-process",
+ "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]

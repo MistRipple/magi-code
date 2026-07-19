@@ -10,6 +10,7 @@ members = [
   "crates/magi-session-store",
   "crates/magi-workspace",
   "crates/magi-governance",
+  "crates/magi-git",
   "crates/magi-event-bus",
   "crates/magi-tool-runtime",
   "crates/magi-orchestrator",

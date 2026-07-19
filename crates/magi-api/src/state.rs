@@ -718,6 +718,12 @@ pub struct ApiState {
     pub event_bus: Arc<InMemoryEventBus>,
     pub session_store: Arc<SessionStore>,
     pub workspace_registry: Arc<WorkspaceStore>,
+    /// Git branch/worktree 的唯一结构化执行服务。repository mutex 在所有 session 间共享。
+    pub git_service: Arc<magi_git::GitService>,
+    /// 主对话 session 与代码/Git 上下文的正交绑定，不承载 conversation fork 或任务分支。
+    pub session_code_contexts: magi_git::SessionCodeContextRegistry,
+    /// turn/worker 与 Git mutation 的 workspace 级 lease 协调器，消除“检查后立即竞态”。
+    pub workspace_git_coordinator: magi_git::WorkspaceGitOperationCoordinator,
     pub governance: Arc<GovernanceService>,
     pub knowledge_store: Arc<KnowledgeStore>,
     pub settings_store: Arc<SettingsStore>,
@@ -804,7 +810,7 @@ impl RuntimeStatePersistence {
         self.save_json(&self.workspace_path, &store.durable_state())
     }
 
-    fn save_knowledge_store(&self, store: &KnowledgeStore) -> Result<(), ApiError> {
+    pub(crate) fn save_knowledge_store(&self, store: &KnowledgeStore) -> Result<(), ApiError> {
         self.save_json(&self.knowledge_path, &store.export_state())
     }
 }
@@ -907,6 +913,9 @@ impl ApiState {
             event_bus,
             session_store,
             workspace_registry,
+            git_service: Arc::new(magi_git::GitService::new()),
+            session_code_contexts: magi_git::SessionCodeContextRegistry::default(),
+            workspace_git_coordinator: magi_git::WorkspaceGitOperationCoordinator::default(),
             governance,
             knowledge_store: Arc::new(KnowledgeStore::new()),
             settings_store: Arc::new(SettingsStore::new()),
@@ -1080,6 +1089,18 @@ impl ApiState {
 
     pub fn with_tool_registry(mut self, tool_registry: ToolRegistry) -> Self {
         self.tool_registry = Some(tool_registry);
+        self
+    }
+
+    pub fn with_git_context_runtime(
+        mut self,
+        git_service: Arc<magi_git::GitService>,
+        session_code_contexts: magi_git::SessionCodeContextRegistry,
+        workspace_git_coordinator: magi_git::WorkspaceGitOperationCoordinator,
+    ) -> Self {
+        self.git_service = git_service;
+        self.session_code_contexts = session_code_contexts;
+        self.workspace_git_coordinator = workspace_git_coordinator;
         self
     }
 
@@ -1414,6 +1435,7 @@ impl ApiState {
             .map(|tool| {
                 serde_json::json!({
                     "name": tool.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                    "category": tool.get("category").cloned().unwrap_or(serde_json::Value::String("uncategorized".to_string())),
                     "riskLevel": tool.get("risk_level").cloned().unwrap_or(serde_json::Value::String("low".to_string())),
                     "approvalRequirement": tool.get("approval_requirement").cloned().unwrap_or(serde_json::Value::String("none".to_string())),
                     "effectiveApprovalPolicy": tool.get("effective_approval_policy").cloned().unwrap_or(serde_json::Value::String("none".to_string())),
@@ -1524,8 +1546,42 @@ impl ApiState {
     }
 
     pub fn with_runtime_persistence(mut self, persistence: Arc<RuntimeStatePersistence>) -> Self {
+        if let Some(state_root) = persistence.state_root() {
+            let path = state_root.join("session-git-contexts.json");
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    match serde_json::from_slice::<Vec<magi_git::SessionCodeContext>>(&bytes) {
+                        Ok(contexts) => self.session_code_contexts.replace_all(contexts),
+                        Err(error) => tracing::warn!(
+                            path = %path.display(),
+                            error = %error,
+                            "忽略无法解析的 session Git context 持久化状态"
+                        ),
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "忽略无法读取的 session Git context 持久化状态"
+                ),
+            }
+        }
         self.runtime_persistence = Some(persistence);
         self
+    }
+
+    pub fn persist_session_git_contexts(&self) -> Result<(), ApiError> {
+        let Some(persistence) = &self.runtime_persistence else {
+            return Ok(());
+        };
+        let Some(state_root) = persistence.state_root() else {
+            return Ok(());
+        };
+        persistence.save_json(
+            &state_root.join("session-git-contexts.json"),
+            &self.session_code_contexts.all(),
+        )
     }
 
     pub fn with_session_state_checkpoint_persist(
@@ -1540,7 +1596,139 @@ impl ApiState {
         if let Some(persist) = &self.session_state_checkpoint_persist {
             persist(checkpoint)?;
         }
-        self.persist_session_durable_state()
+        self.persist_session_durable_state()?;
+        self.persist_session_git_contexts()
+    }
+
+    /// 每轮执行前重新观测 session 绑定的 Git branch/HEAD/worktree。
+    ///
+    /// 首轮按当前状态建立基线；后续若外部终端或其他进程改变 branch/HEAD，则保留原期望
+    /// 基线并拒绝启动本轮，避免主模型在无感知的代码版本上继续执行。
+    pub async fn ensure_session_code_context(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+    ) -> Result<Option<magi_git::SessionCodeContext>, ApiError> {
+        let Some(workspace_id) = workspace_id else {
+            return Ok(None);
+        };
+        let workspace_root = self
+            .workspace_root_path(&Some(workspace_id.clone()))
+            .ok_or_else(|| ApiError::not_found("workspace 不存在", workspace_id.as_str()))?;
+        let session_key = session_id.as_str();
+        let existing_context = self.session_code_contexts.get(session_key);
+        if let Some(existing_context) = existing_context.as_ref() {
+            self.workspace_git_coordinator
+                .begin_execution(session_key, &existing_context.git.git_common_dir)
+                .map_err(|error| ApiError::Conflict(error.to_string()))?;
+        }
+        let observation = match self.git_service.observe(&workspace_root).await {
+            Ok(observation) => observation,
+            Err(magi_git::GitError::NotRepository { .. }) => {
+                self.release_session_git_execution_lease(session_id);
+                return Ok(None);
+            }
+            Err(error) => {
+                self.release_session_git_execution_lease(session_id);
+                return Err(ApiError::InternalAssemblyError(format!(
+                    "每轮执行前校验 Git context 失败: {error}"
+                )));
+            }
+        };
+        let context = if existing_context.is_some() {
+            self.session_code_contexts.observe(
+                session_key,
+                workspace_id.as_str(),
+                vec![workspace_root],
+                &observation,
+            )
+        } else {
+            self.session_code_contexts.accept(
+                session_key,
+                workspace_id.as_str(),
+                vec![workspace_root],
+                &observation,
+            )
+        };
+        if context.has_external_drift() {
+            self.release_session_git_execution_lease(session_id);
+            self.persist_session_git_contexts()?;
+            return Err(ApiError::Conflict(format!(
+                "Git context 已被外部修改：期望 branch={:?} HEAD={:?}，实际 branch={:?} HEAD={:?}。请刷新状态并明确接受或切回原基线后重试",
+                context.git.desired_ref,
+                context.git.base_head,
+                context.git.observed_branch,
+                context.git.observed_head
+            )));
+        }
+        if !context.git.dirty.conflicted_paths.is_empty() {
+            self.release_session_git_execution_lease(session_id);
+            self.persist_session_git_contexts()?;
+            return Err(ApiError::Conflict(format!(
+                "当前 workspace 存在未解决的 Git merge conflict，必须先解决或 abort 后再执行新一轮：{}",
+                context.git.dirty.conflicted_paths.join(", ")
+            )));
+        }
+        if existing_context.is_none()
+            && let Err(error) = self
+                .workspace_git_coordinator
+                .begin_execution(session_key, &context.git.git_common_dir)
+        {
+            return Err(ApiError::Conflict(error.to_string()));
+        }
+        if let Err(error) = self.persist_session_git_contexts() {
+            self.release_session_git_execution_lease(session_id);
+            return Err(error);
+        }
+        Ok(Some(context))
+    }
+
+    pub fn release_session_git_execution_lease(&self, session_id: &SessionId) {
+        self.workspace_git_coordinator
+            .end_execution(session_id.as_str());
+    }
+
+    /// 删除 session 时只回收干净的 agent worktree；任何未提交改动都保留目录与 context，
+    /// 禁止用 `--force` 静默丢失代理产物。
+    async fn cleanup_session_git_resources(&self, session_id: &SessionId) {
+        self.release_session_git_execution_lease(session_id);
+        let Some(context) = self.session_code_contexts.get(session_id.as_str()) else {
+            return;
+        };
+        let mut cleanup_failed = false;
+        for agent in &context.agent_worktrees {
+            if !agent.path.exists() {
+                continue;
+            }
+            if let Err(error) = self
+                .git_service
+                .worktree_remove(
+                    &context.git.worktree_path,
+                    magi_git::WorktreeRemoveOptions {
+                        path: agent.path.clone(),
+                        force: false,
+                        confirm_force: false,
+                        precondition: context.precondition(),
+                    },
+                )
+                .await
+            {
+                cleanup_failed = true;
+                tracing::warn!(
+                    session_id = %session_id,
+                    task_id = %agent.task_id,
+                    worktree_path = %agent.path.display(),
+                    %error,
+                    "session 删除时保留无法安全回收的 agent worktree"
+                );
+            }
+        }
+        if !cleanup_failed {
+            self.session_code_contexts.remove(session_id.as_str());
+        }
+        if let Err(error) = self.persist_session_git_contexts() {
+            tracing::warn!(session_id = %session_id, ?error, "持久化 session Git 资源清理失败");
+        }
     }
 
     pub fn persist_session_durable_state(&self) -> Result<(), ApiError> {
@@ -1625,6 +1813,7 @@ impl ApiState {
         self.persist_session_durable_state()?;
         self.persist_workspace_durable_state()?;
         self.persist_knowledge_state()?;
+        self.persist_session_git_contexts()?;
         Ok(())
     }
 
@@ -1741,6 +1930,7 @@ impl ApiState {
                 .unbind_session_after_lifecycle_lock(session_id)
                 .await;
         }
+        self.cleanup_session_git_resources(session_id).await;
         self.settings_store
             .remove_session(session_id)
             .map_err(crate::errors::settings_persistence_error)?;
@@ -2255,6 +2445,100 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    fn git_fixture(path: &Path, args: &[&str]) {
+        let output = magi_process::std_command("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .expect("git fixture command should start");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cleanup_preserves_inactive_dirty_agent_worktree_context() {
+        let fixture = tempfile::tempdir().expect("fixture root");
+        let repository = fixture.path().join("repo");
+        std::fs::create_dir_all(&repository).expect("repo directory");
+        git_fixture(&repository, &["init", "-b", "main"]);
+        git_fixture(&repository, &["config", "user.name", "Magi Test"]);
+        git_fixture(&repository, &["config", "user.email", "magi@example.test"]);
+        std::fs::write(repository.join("README.md"), "base\n").expect("fixture file");
+        git_fixture(&repository, &["add", "README.md"]);
+        git_fixture(&repository, &["commit", "-m", "base"]);
+
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let session_id = SessionId::new("session-dirty-agent-cleanup");
+        let observation = state
+            .git_service
+            .observe(&repository)
+            .await
+            .expect("observe repository");
+        let context = state.session_code_contexts.accept(
+            session_id.as_str(),
+            "workspace-dirty-agent-cleanup",
+            vec![repository.clone()],
+            &observation,
+        );
+        let worktree_path = fixture.path().join("agent-worktree");
+        let created = state
+            .git_service
+            .worktree_create(
+                &repository,
+                magi_git::WorktreeCreateOptions {
+                    path: worktree_path.clone(),
+                    base: observation.head.clone().expect("base head"),
+                    branch: Some("magi/agent/dirty-cleanup".to_string()),
+                    create_branch: true,
+                    detached: false,
+                    precondition: context.precondition(),
+                },
+            )
+            .await
+            .expect("create agent worktree");
+        state
+            .session_code_contexts
+            .register_agent_worktree(
+                session_id.as_str(),
+                magi_git::AgentWorktreeContext {
+                    task_id: "task-dirty-agent-cleanup".to_string(),
+                    worker_id: "worker-dirty-agent-cleanup".to_string(),
+                    path: created.path,
+                    mode: magi_git::AgentWorktreeMode::Writable,
+                    base_head: observation.head.expect("base head"),
+                    branch: created.branch,
+                    active: true,
+                },
+            )
+            .expect("register agent worktree");
+        std::fs::write(worktree_path.join("uncommitted.txt"), "preserve me\n")
+            .expect("dirty agent output");
+        state
+            .session_code_contexts
+            .release_agent_worktree(session_id.as_str(), "task-dirty-agent-cleanup")
+            .expect("release agent worktree");
+
+        state.cleanup_session_git_resources(&session_id).await;
+
+        assert!(worktree_path.join("uncommitted.txt").is_file());
+        let retained = state
+            .session_code_contexts
+            .get(session_id.as_str())
+            .expect("dirty worktree context must remain recoverable");
+        assert!(!retained.agent_worktrees[0].active);
+    }
+
     fn task_with_status(task_id: &str, status: TaskStatus) -> Task {
         let now = UtcMillis::now();
         Task {
@@ -2697,6 +2981,63 @@ mod tests {
         assert_eq!(tools[0]["runtimeStatus"], serde_json::json!("ready"));
         assert_eq!(tools[1]["runtimeStatus"], serde_json::json!("unknown"));
         assert_eq!(tools[2]["runtimeStatus"], serde_json::json!("unknown"));
+    }
+
+    #[test]
+    fn session_git_context_round_trips_through_runtime_persistence() {
+        let root = tempfile::tempdir().expect("state root");
+        let persistence = || {
+            Arc::new(RuntimeStatePersistence::new(
+                root.path().join("sessions.json"),
+                root.path().join("workspaces.json"),
+                root.path().join("knowledge.json"),
+            ))
+        };
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_runtime_persistence(persistence());
+        state.session_code_contexts.accept(
+            "session-git-persist",
+            "workspace-git-persist",
+            vec![PathBuf::from("/repo")],
+            &magi_git::GitObservation {
+                repository_root: PathBuf::from("/repo"),
+                git_common_dir: PathBuf::from("/repo/.git"),
+                worktree_path: PathBuf::from("/repo"),
+                worktree_git_dir: PathBuf::from("/repo/.git"),
+                branch: Some("main".to_string()),
+                head: Some("abc123".to_string()),
+                upstream: Some("origin/main".to_string()),
+                origin_url: Some("https://example.test/repo.git".to_string()),
+                ahead: 0,
+                behind: 0,
+                dirty: magi_git::GitDirtySummary::default(),
+            },
+        );
+        state
+            .persist_session_git_contexts()
+            .expect("persist Git context");
+
+        let reloaded = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_runtime_persistence(persistence());
+        let context = reloaded
+            .session_code_contexts
+            .get("session-git-persist")
+            .expect("reloaded Git context");
+        assert_eq!(context.git.desired_ref.as_deref(), Some("main"));
+        assert_eq!(context.git.base_head.as_deref(), Some("abc123"));
+        assert_eq!(context.context_revision, 1);
     }
 
     #[tokio::test]

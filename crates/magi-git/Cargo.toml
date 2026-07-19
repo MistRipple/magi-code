@@ -1,0 +1,13 @@
+[package]
+name = "magi-git"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+magi-process = { path = "../magi-process" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -41,6 +41,19 @@ pub enum BuiltinToolName {
     // ── 工具目录 / 健康诊断 ──
     /// 列出当前内置工具目录、访问模式、风险等级与 schema 健康状态。
     ToolCatalog,
+    // ── 主对话 Git context ──
+    GitStatus,
+    GitBranchList,
+    GitBranchCreate,
+    GitBranchSwitch,
+    GitPull,
+    GitPush,
+    GitMergePreview,
+    GitMerge,
+    GitBranchDelete,
+    GitWorktreeList,
+    GitWorktreeCreate,
+    GitWorktreeRemove,
     // ── Goal 目标模式（会话级一等产品实体）──
     /// 读取当前会话的目标状态、预算与记账信息。
     GetGoal,
@@ -71,7 +84,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 45] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -98,6 +111,18 @@ impl BuiltinToolName {
         Self::KnowledgeQuery,
         Self::CodeSymbols,
         Self::ToolCatalog,
+        Self::GitStatus,
+        Self::GitBranchList,
+        Self::GitBranchCreate,
+        Self::GitBranchSwitch,
+        Self::GitPull,
+        Self::GitPush,
+        Self::GitMergePreview,
+        Self::GitMerge,
+        Self::GitBranchDelete,
+        Self::GitWorktreeList,
+        Self::GitWorktreeCreate,
+        Self::GitWorktreeRemove,
         Self::GetGoal,
         Self::CreateGoal,
         Self::UpdateGoal,
@@ -135,6 +160,18 @@ impl BuiltinToolName {
             Self::KnowledgeQuery => "knowledge_query",
             Self::CodeSymbols => "code_symbols",
             Self::ToolCatalog => "tool_catalog",
+            Self::GitStatus => "git_status",
+            Self::GitBranchList => "git_branch_list",
+            Self::GitBranchCreate => "git_branch_create",
+            Self::GitBranchSwitch => "git_branch_switch",
+            Self::GitPull => "git_pull",
+            Self::GitPush => "git_push",
+            Self::GitMergePreview => "git_merge_preview",
+            Self::GitMerge => "git_merge",
+            Self::GitBranchDelete => "git_branch_delete",
+            Self::GitWorktreeList => "git_worktree_list",
+            Self::GitWorktreeCreate => "git_worktree_create",
+            Self::GitWorktreeRemove => "git_worktree_remove",
             Self::GetGoal => "get_goal",
             Self::CreateGoal => "create_goal",
             Self::UpdateGoal => "update_goal",
@@ -169,6 +206,18 @@ impl BuiltinToolName {
             Self::DiagramRender | Self::ImageGenerate => "visualization",
             Self::KnowledgeQuery => "knowledge",
             Self::ToolCatalog => "tooling",
+            Self::GitStatus
+            | Self::GitBranchList
+            | Self::GitBranchCreate
+            | Self::GitBranchSwitch
+            | Self::GitPull
+            | Self::GitPush
+            | Self::GitMergePreview
+            | Self::GitMerge
+            | Self::GitBranchDelete
+            | Self::GitWorktreeList
+            | Self::GitWorktreeCreate
+            | Self::GitWorktreeRemove => "git",
             Self::GetGoal | Self::CreateGoal | Self::UpdateGoal => "session_goal",
             Self::AgentSpawn | Self::AgentWait => "agent_coordination",
             Self::UpdatePlan => "session_state",
@@ -204,6 +253,18 @@ impl BuiltinToolName {
             "knowledge_query" => Some(Self::KnowledgeQuery),
             "code_symbols" => Some(Self::CodeSymbols),
             "tool_catalog" => Some(Self::ToolCatalog),
+            "git_status" => Some(Self::GitStatus),
+            "git_branch_list" => Some(Self::GitBranchList),
+            "git_branch_create" => Some(Self::GitBranchCreate),
+            "git_branch_switch" => Some(Self::GitBranchSwitch),
+            "git_pull" => Some(Self::GitPull),
+            "git_push" => Some(Self::GitPush),
+            "git_merge_preview" => Some(Self::GitMergePreview),
+            "git_merge" => Some(Self::GitMerge),
+            "git_branch_delete" => Some(Self::GitBranchDelete),
+            "git_worktree_list" => Some(Self::GitWorktreeList),
+            "git_worktree_create" => Some(Self::GitWorktreeCreate),
+            "git_worktree_remove" => Some(Self::GitWorktreeRemove),
             "get_goal" => Some(Self::GetGoal),
             "create_goal" => Some(Self::CreateGoal),
             "update_goal" => Some(Self::UpdateGoal),
@@ -226,6 +287,14 @@ impl BuiltinToolName {
                 | Self::FileCopy
                 | Self::FileMove
                 | Self::ImageGenerate
+                | Self::GitBranchCreate
+                | Self::GitBranchSwitch
+                | Self::GitPull
+                | Self::GitPush
+                | Self::GitMerge
+                | Self::GitBranchDelete
+                | Self::GitWorktreeCreate
+                | Self::GitWorktreeRemove
                 | Self::AgentSpawn
                 | Self::CreateGoal
                 | Self::UpdateGoal
@@ -241,7 +310,11 @@ impl BuiltinToolName {
         self.mutates_workspace_files()
             || matches!(
                 self,
-                Self::MemoryWrite | Self::ProcessLaunch | Self::ProcessWrite | Self::ProcessKill
+                Self::MemoryWrite
+                    | Self::ProcessLaunch
+                    | Self::ProcessWrite
+                    | Self::ProcessKill
+                    | Self::GitPush
             )
     }
 
@@ -256,6 +329,13 @@ impl BuiltinToolName {
                 | Self::FileCopy
                 | Self::FileMove
                 | Self::ImageGenerate
+                | Self::GitBranchCreate
+                | Self::GitBranchSwitch
+                | Self::GitPull
+                | Self::GitMerge
+                | Self::GitBranchDelete
+                | Self::GitWorktreeCreate
+                | Self::GitWorktreeRemove
         )
     }
 
@@ -286,6 +366,14 @@ impl BuiltinToolName {
             | Self::FileCopy
             | Self::FileMove
             | Self::ImageGenerate
+            | Self::GitBranchCreate
+            | Self::GitBranchSwitch
+            | Self::GitPull
+            | Self::GitPush
+            | Self::GitMerge
+            | Self::GitBranchDelete
+            | Self::GitWorktreeCreate
+            | Self::GitWorktreeRemove
             | Self::AgentSpawn
             | Self::CreateGoal
             | Self::UpdateGoal
@@ -349,6 +437,10 @@ impl BuiltinToolName {
             | Self::KnowledgeQuery
             | Self::CodeSymbols
             | Self::ToolCatalog
+            | Self::GitStatus
+            | Self::GitBranchList
+            | Self::GitMergePreview
+            | Self::GitWorktreeList
             | Self::GetGoal
             | Self::CreateGoal
             | Self::UpdateGoal
@@ -361,18 +453,36 @@ impl BuiltinToolName {
             | Self::FileCopy
             | Self::FileMove
             | Self::ImageGenerate
+            | Self::GitBranchCreate
+            | Self::GitBranchSwitch
+            | Self::GitWorktreeCreate
             | Self::ProcessWrite
             | Self::AgentSpawn => RiskLevel::Medium,
-            Self::FileRemove | Self::ShellExec | Self::ProcessLaunch => RiskLevel::High,
+            Self::FileRemove
+            | Self::ShellExec
+            | Self::ProcessLaunch
+            | Self::GitPull
+            | Self::GitPush
+            | Self::GitMerge
+            | Self::GitBranchDelete
+            | Self::GitWorktreeRemove => RiskLevel::High,
             Self::ProcessKill | Self::ProcessInspect => RiskLevel::Medium,
         }
     }
 
     pub fn default_approval_requirement(&self) -> ApprovalRequirement {
         match self {
-            Self::FileRemove | Self::ShellExec | Self::ProcessLaunch => {
-                ApprovalRequirement::Required
-            }
+            Self::FileRemove
+            | Self::ShellExec
+            | Self::ProcessLaunch
+            | Self::GitBranchCreate
+            | Self::GitBranchSwitch
+            | Self::GitPull
+            | Self::GitPush
+            | Self::GitMerge
+            | Self::GitBranchDelete
+            | Self::GitWorktreeCreate
+            | Self::GitWorktreeRemove => ApprovalRequirement::Required,
             _ => ApprovalRequirement::None,
         }
     }
@@ -470,7 +580,7 @@ impl BuiltinToolName {
             Self::ShellExec => {
                 "执行一条 shell 命令并返回 stdout / stderr。\n\n\
                 # 何时用\n\
-                - 没有专用工具能完成的任务：构建（cargo build / npm run）、运行测试、git 操作、查 PID\n\
+                - 没有专用工具能完成的任务：构建（cargo build / npm run）、运行测试、查 PID\n\
                 - 一次性 ad-hoc 命令（解压、统计行数、查磁盘占用）\n\
                 - 启动后台命令时设置 background=true；后续用同一个 shell_exec 传 action=read/write/kill/list 和 terminal_id 管理\n\n\
                 # 命令准确性\n\
@@ -482,6 +592,7 @@ impl BuiltinToolName {
                 - 改文件局部 → file_patch（避免 Shell 转义问题）\n\
                 - 查找文本或文件路径 → 必须使用 search_text / search_semantic；禁止调用 rg，避免依赖用户系统是否安装\n\
                 - 读取 package.json、Cargo.toml 等清单 → 使用 file_read，不要仅为解析清单依赖 node/python\n\
+                - Git 状态、分支、拉取、推送、合并、删除和 worktree 生命周期 → 使用 git_status / git_branch_* / git_pull / git_push / git_merge* / git_worktree_*，不要调用 git shell 命令绕过 session context、CAS 与 lease\n\
                 - 不要直接调用 process_launch / process_read / process_write / process_kill / process_list；它们是 shell_exec 的内部后台能力\n\n\
                 # 反例\n\
                 - ❌ 用平台专属 Shell 命令仅为读取或修改文件 → 跨平台不稳定且失去专用工具保护\n\
@@ -524,6 +635,42 @@ impl BuiltinToolName {
                 # 说明\n\
                 - 内置工具读取 BuiltinToolName::ALL 单一注册源\n\
                 - 外接工具只读取 daemon 注入的 skill/MCP 运行时快照，不扫描文件系统"
+            }
+            Self::GitStatus => {
+                "读取当前主对话绑定的 repository、worktree、branch、HEAD、upstream、ahead/behind、dirty 与 conflict 状态。该工具只观察，不接受外部 Git 漂移为新基线。"
+            }
+            Self::GitBranchList => {
+                "列出当前 repository 的本地分支，可选包含远程跟踪分支，并返回当前分支、HEAD 和各分支被哪个 worktree 占用。"
+            }
+            Self::GitBranchCreate => {
+                "创建 Git 分支，默认创建后立即切换。工作区 dirty、session Git context 漂移或预期 branch/HEAD 不匹配时拒绝。"
+            }
+            Self::GitBranchSwitch => {
+                "切换到已存在的本地 Git 分支。工作区 dirty、目标被其他 worktree 占用或 session Git context 漂移时拒绝。"
+            }
+            Self::GitPull => {
+                "从远程拉取当前分支。默认使用 upstream 和 fast-forward-only；当前分支没有 upstream 时必须提供 remote，可按需指定远程 branch 或允许普通 merge。"
+            }
+            Self::GitPush => {
+                "把本地分支推送到已配置 remote。默认使用当前分支及其 upstream；新分支可提供 remote 并设置 upstream。强制推送仅允许 --force-with-lease，且必须明确二次确认。"
+            }
+            Self::GitMergePreview => {
+                "在不修改仓库的前提下预览合并：返回 target HEAD、merge-base、是否可 fast-forward、传入 commit 数和变更路径。"
+            }
+            Self::GitMerge => {
+                "把目标分支或 commit 合并到当前分支。必须先调用 git_merge_preview，并且只有用户明确确认后才允许传 confirm=true；冲突以 conflictedPaths 结构化返回。"
+            }
+            Self::GitBranchDelete => {
+                "删除本地或远程 Git 分支。当前分支和被 worktree 占用的分支禁止删除；force 与远程删除分别要求显式二次确认。"
+            }
+            Self::GitWorktreeList => {
+                "列出当前 repository 的全部 Git worktree，包括 path、HEAD、branch、detached、locked 与 prunable 状态。"
+            }
+            Self::GitWorktreeCreate => {
+                "在 Magi 管理目录创建独立 Git worktree。read_only 模式从 base HEAD 创建 detached worktree；writable 模式创建唯一临时分支。"
+            }
+            Self::GitWorktreeRemove => {
+                "移除由 Magi 管理的 Git worktree。不能删除当前 worktree；dirty worktree 的强制移除必须由用户明确二次确认。"
             }
             Self::GetGoal => {
                 "读取当前会话的 Goal 状态、预算和累计用量。用于长目标推进前确认当前目标是否仍 active，或在继续执行前判断是否已 complete / blocked / budget_limited。"
@@ -957,6 +1104,141 @@ impl BuiltinToolName {
                     "include_agent_roles": { "type": "boolean", "description": "是否包含可通过 agent_spawn 派发的代理角色健康摘要，默认 true" }
                 },
                 "required": []
+            }),
+            Self::GitStatus => serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+            Self::GitBranchList => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "includeRemote": { "type": "boolean", "description": "是否包含 refs/remotes，默认 false" }
+                },
+                "required": []
+            }),
+            Self::GitBranchCreate => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "branch": { "type": "string", "minLength": 1 },
+                    "startPoint": { "type": "string", "description": "可选起点，默认当前 HEAD" },
+                    "switch": { "type": "boolean", "description": "创建后自动切换，默认 true" },
+                    "expectedContextRevision": { "type": "integer", "minimum": 0 },
+                    "expectedBranch": { "type": ["string", "null"] },
+                    "expectedHead": { "type": ["string", "null"] },
+                    "expectedWorktreePath": { "type": "string" }
+                },
+                "required": ["branch"]
+            }),
+            Self::GitBranchSwitch => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "branch": { "type": "string", "minLength": 1 },
+                    "expectedContextRevision": { "type": "integer", "minimum": 0 },
+                    "expectedBranch": { "type": ["string", "null"] },
+                    "expectedHead": { "type": ["string", "null"] },
+                    "expectedWorktreePath": { "type": "string" }
+                },
+                "required": ["branch"]
+            }),
+            Self::GitPull => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "remote": { "type": "string", "description": "可选 remote；默认使用当前分支 upstream" },
+                    "branch": { "type": "string", "description": "可选远程分支；默认使用 upstream 分支或当前分支名" },
+                    "ffOnly": { "type": "boolean", "description": "只允许 fast-forward，默认 true" },
+                    "expectedContextRevision": { "type": "integer", "minimum": 0 },
+                    "expectedBranch": { "type": ["string", "null"] },
+                    "expectedHead": { "type": ["string", "null"] },
+                    "expectedWorktreePath": { "type": "string" }
+                },
+                "required": []
+            }),
+            Self::GitPush => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "remote": { "type": "string", "description": "可选 remote；默认使用分支 upstream" },
+                    "branch": { "type": "string", "description": "可选本地分支；默认当前分支" },
+                    "setUpstream": { "type": "boolean", "description": "推送后设置 upstream，默认 false" },
+                    "forceWithLease": { "type": "boolean", "description": "使用 --force-with-lease，默认 false" },
+                    "confirmForce": { "type": "boolean", "description": "forceWithLease=true 时必须明确传 true" },
+                    "expectedContextRevision": { "type": "integer", "minimum": 0 },
+                    "expectedBranch": { "type": ["string", "null"] },
+                    "expectedHead": { "type": ["string", "null"] },
+                    "expectedWorktreePath": { "type": "string" }
+                },
+                "required": []
+            }),
+            Self::GitMergePreview => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "minLength": 1 },
+                    "expectedContextRevision": { "type": "integer", "minimum": 0 },
+                    "expectedBranch": { "type": ["string", "null"] },
+                    "expectedHead": { "type": ["string", "null"] },
+                    "expectedWorktreePath": { "type": "string" }
+                },
+                "required": ["target"]
+            }),
+            Self::GitMerge => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "minLength": 1 },
+                    "ffOnly": { "type": "boolean", "default": false },
+                    "confirm": { "type": "boolean", "description": "用户确认 merge preview 后必须显式传 true" },
+                    "expectedContextRevision": { "type": "integer", "minimum": 0 },
+                    "expectedBranch": { "type": ["string", "null"] },
+                    "expectedHead": { "type": ["string", "null"] },
+                    "expectedWorktreePath": { "type": "string" }
+                },
+                "required": ["target", "confirm"]
+            }),
+            Self::GitBranchDelete => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "branch": { "type": "string", "minLength": 1 },
+                    "remote": { "type": "string", "description": "提供后删除 remote/branch；省略时删除本地分支" },
+                    "force": { "type": "boolean", "default": false },
+                    "confirmForce": { "type": "boolean", "description": "force=true 时必须由用户二次确认" },
+                    "confirmRemote": { "type": "boolean", "description": "删除远程分支时必须由用户二次确认" },
+                    "expectedContextRevision": { "type": "integer", "minimum": 0 },
+                    "expectedBranch": { "type": ["string", "null"] },
+                    "expectedHead": { "type": ["string", "null"] },
+                    "expectedWorktreePath": { "type": "string" }
+                },
+                "required": ["branch"]
+            }),
+            Self::GitWorktreeList => serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+            Self::GitWorktreeCreate => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mode": { "type": "string", "enum": ["read_only", "writable"] },
+                    "base": { "type": "string", "description": "可选 branch/commit，默认 session base HEAD" },
+                    "branch": { "type": "string", "description": "writable 模式可指定新分支名" },
+                    "allocationKey": { "type": "string", "description": "用于管理目录名的稳定标识" },
+                    "expectedContextRevision": { "type": "integer", "minimum": 0 },
+                    "expectedBranch": { "type": ["string", "null"] },
+                    "expectedHead": { "type": ["string", "null"] },
+                    "expectedWorktreePath": { "type": "string" }
+                },
+                "required": ["mode"]
+            }),
+            Self::GitWorktreeRemove => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "由 git_worktree_list 返回的 Magi 管理 worktree 绝对路径" },
+                    "force": { "type": "boolean", "default": false },
+                    "confirmForce": { "type": "boolean", "description": "force=true 时必须由用户二次确认" },
+                    "expectedContextRevision": { "type": "integer", "minimum": 0 },
+                    "expectedBranch": { "type": ["string", "null"] },
+                    "expectedHead": { "type": ["string", "null"] },
+                    "expectedWorktreePath": { "type": "string" }
+                },
+                "required": ["path"]
             }),
             Self::GetGoal => serde_json::json!({
                 "type": "object",

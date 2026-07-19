@@ -3,6 +3,7 @@
 mod change_projection;
 mod dto;
 mod errors;
+pub mod git_tool_runtime;
 mod host_paths;
 pub mod mcp_config;
 mod model_config;
