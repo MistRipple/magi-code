@@ -2418,9 +2418,12 @@ mod tests {
         }
     }
 
-    fn spawn_cancellation_server(streaming: bool) -> (String, mpsc::Receiver<()>) {
+    fn spawn_cancellation_server(
+        streaming: bool,
+    ) -> (String, mpsc::Receiver<()>, mpsc::Receiver<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock server should bind");
         let address = listener.local_addr().expect("address should exist");
+        let (request_ready_tx, request_ready_rx) = mpsc::channel();
         let (disconnected_tx, disconnected_rx) = mpsc::channel();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("mock server should accept");
@@ -2480,6 +2483,7 @@ mod tests {
                     .expect("stream headers should write");
                 stream.flush().expect("stream should flush");
             }
+            let _ = request_ready_tx.send(());
             loop {
                 match stream.read(&mut chunk) {
                     Ok(0) => {
@@ -2495,7 +2499,11 @@ mod tests {
                 }
             }
         });
-        (format!("http://{address}/v1"), disconnected_rx)
+        (
+            format!("http://{address}/v1"),
+            request_ready_rx,
+            disconnected_rx,
+        )
     }
 
     fn status_reason(status: u16) -> &'static str {
@@ -2563,7 +2571,7 @@ mod tests {
 
     #[test]
     fn cancellable_non_streaming_request_releases_connection() {
-        let (address, disconnected) = spawn_cancellation_server(false);
+        let (address, request_ready, disconnected) = spawn_cancellation_server(false);
         let client = HttpModelBridgeClient::new(
             address,
             Some("sk-test-key".to_string()),
@@ -2571,11 +2579,15 @@ mod tests {
         );
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancellation_signal = cancelled.clone();
+        let (cancellation_started_tx, cancellation_started_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
+            request_ready
+                .recv_timeout(Duration::from_secs(5))
+                .expect("request should reach provider before cancellation");
+            let cancellation_started = std::time::Instant::now();
             cancellation_signal.store(true, Ordering::SeqCst);
+            let _ = cancellation_started_tx.send(cancellation_started);
         });
-        let started = std::time::Instant::now();
         let error = client
             .invoke_with_cancellation(
                 ModelInvocationRequest {
@@ -2589,7 +2601,10 @@ mod tests {
             )
             .expect_err("cancelled request should fail as cancelled");
         assert!(model_invocation_error_is_cancelled(&error));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        let cancellation_started = cancellation_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancellation should start after provider receives request");
+        assert!(cancellation_started.elapsed() < Duration::from_secs(2));
         disconnected
             .recv_timeout(Duration::from_secs(5))
             .expect("cancelled request should close provider connection");
@@ -2597,7 +2612,7 @@ mod tests {
 
     #[test]
     fn cancellable_streaming_request_releases_connection() {
-        let (address, disconnected) = spawn_cancellation_server(true);
+        let (address, request_ready, disconnected) = spawn_cancellation_server(true);
         let client = HttpModelBridgeClient::new(
             address,
             Some("sk-test-key".to_string()),
@@ -2605,11 +2620,15 @@ mod tests {
         );
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancellation_signal = cancelled.clone();
+        let (cancellation_started_tx, cancellation_started_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
+            request_ready
+                .recv_timeout(Duration::from_secs(5))
+                .expect("stream should reach provider before cancellation");
+            let cancellation_started = std::time::Instant::now();
             cancellation_signal.store(true, Ordering::SeqCst);
+            let _ = cancellation_started_tx.send(cancellation_started);
         });
-        let started = std::time::Instant::now();
         let error = client
             .invoke_streaming_with_cancellation(
                 ModelInvocationRequest {
@@ -2625,7 +2644,10 @@ mod tests {
             )
             .expect_err("cancelled stream should fail as cancelled");
         assert!(model_invocation_error_is_cancelled(&error));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        let cancellation_started = cancellation_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stream cancellation should start after provider receives request");
+        assert!(cancellation_started.elapsed() < Duration::from_secs(2));
         disconnected
             .recv_timeout(Duration::from_secs(5))
             .expect("cancelled stream should close provider connection");
