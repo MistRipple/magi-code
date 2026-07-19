@@ -432,16 +432,23 @@ fn receive_cancellable_http_result(
     disconnected_message: &'static str,
 ) -> HttpPostResult {
     let mut cancellation_tx = Some(cancellation_tx);
+    let mut cancellation_requested = false;
     loop {
-        if is_cancelled() {
+        if !cancellation_requested && is_cancelled() {
             cancellation.store(true, Ordering::SeqCst);
             if let Some(tx) = cancellation_tx.take() {
                 let _ = tx.send(());
             }
-            return Err(model_invocation_cancelled_error());
+            cancellation_requested = true;
         }
         match rx.recv_timeout(MODEL_CANCELLATION_POLL_INTERVAL) {
-            Ok(result) => return result,
+            Ok(result) => {
+                return if cancellation_requested {
+                    Err(model_invocation_cancelled_error())
+                } else {
+                    result
+                };
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(BridgeClientError::CallFailed {
@@ -825,19 +832,27 @@ fn execute_streaming_http_post(
     });
 
     let mut cancellation_tx = Some(cancellation_tx);
+    let mut cancellation_requested = false;
     loop {
-        if is_cancelled() {
+        if !cancellation_requested && is_cancelled() {
             cancellation.store(true, Ordering::SeqCst);
             if let Some(tx) = cancellation_tx.take() {
                 let _ = tx.send(());
             }
-            return Err(model_invocation_cancelled_error());
+            cancellation_requested = true;
         }
         match rx.recv_timeout(MODEL_CANCELLATION_POLL_INTERVAL) {
-            Ok(StreamMessage::Chunk(delta)) => {
+            Ok(StreamMessage::Chunk(delta)) if !cancellation_requested => {
                 on_chunk(&delta);
             }
-            Ok(StreamMessage::Done(result)) => return result,
+            Ok(StreamMessage::Chunk(_)) => {}
+            Ok(StreamMessage::Done(result)) => {
+                return if cancellation_requested {
+                    Err(model_invocation_cancelled_error())
+                } else {
+                    result
+                };
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(BridgeClientError::CallFailed {
