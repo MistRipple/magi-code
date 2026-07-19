@@ -1421,6 +1421,11 @@ impl DaemonRuntime {
                 .with_context_runtime(context_runtime_for_dispatcher)
                 .with_context_budget(context_budget.clone())
                 .with_workspace_registry(state.workspace_registry.clone())
+                .with_git_context_runtime(
+                    state.git_service.clone(),
+                    state.session_code_contexts.clone(),
+                )
+                .with_workspace_git_coordinator(state.workspace_git_coordinator.clone())
                 .with_tool_registry(tool_registry_for_dispatcher)
                 .with_skill_runtime(app_skill_runtime)
                 .with_snapshot_manager(state.snapshot_manager.clone()),
@@ -1947,7 +1952,7 @@ fn sync_task_plan_status(
     match plan_store.sync_task_status(&task.task_id, status) {
         Ok(Some(plan)) => magi_plan::publish_plan_event(
             event_bus,
-            "session.plan.updated",
+            magi_plan::plan_event_type(&plan),
             &plan,
             workspace_id.as_ref(),
             Some(&task.task_id),

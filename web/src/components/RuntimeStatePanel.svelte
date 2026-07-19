@@ -710,7 +710,7 @@
     const awaitingApprovalTaskCount = item.awaitingApprovalTaskCount || 0;
     const reviewRequiredTaskCount = item.reviewRequiredTaskCount || 0;
     const summary: string[] = [
-      i18n.t('runtimeDiagnostics.todoStats', {
+      i18n.t('runtimeDiagnostics.taskStats', {
         completed: completedTaskCount,
         total: totalTaskCount,
         running: runningTaskCount,

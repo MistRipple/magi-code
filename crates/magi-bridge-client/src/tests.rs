@@ -479,14 +479,14 @@ fn decision_engine_loopback_reason_failed_on_empty_text() {
 // ============================================================================
 
 #[test]
-fn round_policy_continue_prompt_no_todos() {
+fn round_policy_continue_prompt_without_required_tasks() {
     let snap = test_snapshot(0);
     let prompt = crate::round_policy::build_continue_prompt(&snap);
     assert!(prompt.contains("没有结构化的必需任务"));
 }
 
 #[test]
-fn round_policy_continue_prompt_with_todos() {
+fn round_policy_continue_prompt_with_required_tasks() {
     let mut snap = test_snapshot(5);
     snap.progress_vector.terminal_required_tasks = 2;
     let prompt = crate::round_policy::build_continue_prompt(&snap);

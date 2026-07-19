@@ -21,10 +21,22 @@
     saveAgentOrchestratorSessionConfig,
     fetchWorkspaceBranches,
     checkoutWorkspaceBranch,
+    createWorkspaceBranch,
+    acceptWorkspaceGitContext,
+    previewWorkspaceMerge,
+    mergeWorkspaceBranch,
+    deleteWorkspaceBranch,
+    fetchWorkspaceWorktrees,
+    createWorkspaceWorktree,
+    removeWorkspaceWorktree,
     resolveAgentPath,
     type ResolvedAgentPath,
     type AgentSettingsBootstrapSnapshot,
     type WorkspaceVcsStatus,
+    type WorkspaceBranchesResult,
+    type GitBranch,
+    type GitMergePreview,
+    type GitWorktree,
     settingsBootstrapMatchesCurrentWorkspace,
   } from '../web/agent-api';
   import Icon from './Icon.svelte';
@@ -175,10 +187,25 @@
   let branchLoading = $state(false);
   let branchSwitching = $state<string | null>(null);
   let branches = $state<string[]>([]);
+  let remoteBranches = $state<string[]>([]);
+  let structuredBranches = $state<GitBranch[]>([]);
   let currentBranch = $state<string | null>(null);
   let branchError = $state<string | null>(null);
   let branchIsRepo = $state(false);
   let branchStatus = $state<WorkspaceVcsStatus | null>(null);
+  let branchContextRevision = $state<number | null>(null);
+  let branchHead = $state<string | null>(null);
+  let branchWorktreePath = $state<string | null>(null);
+  let branchContextDrift = $state(false);
+  let branchCreateName = $state('');
+  let branchCreating = $state(false);
+  let branchAcceptingContext = $state(false);
+  let branchOperation = $state<string | null>(null);
+  let worktrees = $state<GitWorktree[]>([]);
+  let worktreesLoading = $state(false);
+  let worktreeMode = $state<'readOnly' | 'writable'>('readOnly');
+  let worktreeBranch = $state('');
+  let worktreeCreating = $state(false);
   let branchRequestSeq = 0;
   let settingsBootstrapRefreshKey = '';
   let settingsBootstrapRefreshSeq = 0;
@@ -844,11 +871,12 @@
     return workspace.rootPathRef?.trim() || workspace.rootPath.trim();
   }
 
-  function workspaceBinding(workspace: ComposerWorkspaceOption | null): { workspaceId?: string; workspacePath?: string } {
+  function workspaceBinding(workspace: ComposerWorkspaceOption | null): { workspaceId?: string; workspacePath?: string; sessionId?: string } {
     if (!workspace) return {};
     return {
       workspaceId: workspace.workspaceId,
       workspacePath: workspaceBindingPath(workspace),
+      sessionId: isDraftSession ? '' : (currentSessionId?.trim() || ''),
     };
   }
 
@@ -948,17 +976,23 @@
           console.warn('[InputArea] 跨窗口同步访问模式后刷新设置快照失败:', error);
         });
     }
+    function handleWorkspaceContentChanged() {
+      void refreshBranchState();
+      void loadWorktrees();
+    }
     window.addEventListener('magi:fillComposer', handleFillComposer as EventListener);
     window.addEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
     window.addEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
     window.addEventListener('storage', handleStoredAccessProfileChange);
+    window.addEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
     document.addEventListener('pointerdown', handlePickerOutsidePointerDown, true);
     return () => {
-      window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
       setComposerHasUnsavedInput(false);
+      window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
       window.removeEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
       window.removeEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
       window.removeEventListener('storage', handleStoredAccessProfileChange);
+      window.removeEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
       document.removeEventListener('pointerdown', handlePickerOutsidePointerDown, true);
     };
   });
@@ -975,6 +1009,10 @@
       branchIsRepo = false;
       branchLoading = false;
       branchError = null;
+      branchContextRevision = null;
+      branchHead = null;
+      branchWorktreePath = null;
+      branchContextDrift = false;
       return;
     }
     branchLoading = false;
@@ -1626,11 +1664,17 @@
   }
 
   // 初次拉取分支状态：决定左下角分支入口是否显示，以及当前分支文案。
-  function applyBranchResult(result: { isRepo: boolean; currentBranch: string | null; branches: string[]; status: WorkspaceVcsStatus | null }) {
+  function applyBranchResult(result: WorkspaceBranchesResult) {
     branchIsRepo = result.isRepo;
     currentBranch = result.currentBranch;
     branches = result.branches;
+    remoteBranches = result.remoteBranches ?? [];
+    structuredBranches = result.structuredBranches ?? [];
     branchStatus = result.status;
+    branchContextRevision = result.sessionContext?.contextRevision ?? null;
+    branchHead = result.observation?.head ?? null;
+    branchWorktreePath = result.observation?.worktreePath ?? null;
+    branchContextDrift = result.contextDrift === true;
   }
 
   function branchStatusItems(status: WorkspaceVcsStatus | null): string[] {
@@ -1687,6 +1731,7 @@
     if (!branchLoading) {
       await loadBranches();
     }
+    await loadWorktrees();
   }
 
   async function loadBranches() {
@@ -1728,12 +1773,20 @@
     const requestWorkspace = composerWorkspace;
     const requestWorkspaceKey = workspaceKey(requestWorkspace);
     try {
-      const result = await checkoutWorkspaceBranch(target, workspaceBinding(requestWorkspace));
+      const result = await checkoutWorkspaceBranch(target, {
+        contextRevision: branchContextRevision ?? undefined,
+        branch: currentBranch,
+        head: branchHead,
+        worktreePath: branchWorktreePath,
+      }, workspaceBinding(requestWorkspace));
       if (workspaceKey(composerWorkspace) !== requestWorkspaceKey) {
         return;
       }
       if (result.ok) {
-        currentBranch = result.currentBranch ?? target;
+        currentBranch = result.observation?.branch ?? target;
+        branchContextRevision = result.sessionContext?.contextRevision ?? branchContextRevision;
+        branchHead = result.observation?.head ?? branchHead;
+        branchWorktreePath = result.observation?.worktreePath ?? branchWorktreePath;
         addToast('success', i18n.t('input.branch.switched', { branch: currentBranch }));
         branchPickerOpen = false;
         // 切换后工作区改动行数可能变化（如非冲突改动跟随切换），重新拉取以刷新计数。
@@ -1744,8 +1797,8 @@
         }));
       } else {
         console.warn('[InputArea] 切换工作区分支被拒绝:', result.error);
-        branchError = i18n.t('input.branch.switchFailed');
-        addToast('error', i18n.t('input.branch.switchFailed'));
+        branchError = result.error?.message || i18n.t('input.branch.switchFailed');
+        addToast('error', branchError);
       }
     } catch (error) {
       console.warn('[InputArea] 切换工作区分支失败:', error);
@@ -1753,6 +1806,302 @@
       addToast('error', i18n.t('input.branch.switchFailed'));
     } finally {
       branchSwitching = null;
+    }
+  }
+
+  async function createAndSwitchBranch() {
+    const branch = branchCreateName.trim();
+    if (!branch || branchCreating || branchSwitching !== null) return;
+    if (sessionInputLocked || isInteractionBlocking || branchStatus?.hasUncommitted) return;
+    branchCreating = true;
+    branchError = null;
+    const requestWorkspace = composerWorkspace;
+    const requestWorkspaceKey = workspaceKey(requestWorkspace);
+    try {
+      const result = await createWorkspaceBranch(branch, {
+        contextRevision: branchContextRevision ?? undefined,
+        branch: currentBranch,
+        head: branchHead,
+        worktreePath: branchWorktreePath,
+      }, workspaceBinding(requestWorkspace));
+      if (workspaceKey(composerWorkspace) !== requestWorkspaceKey) return;
+      if (!result.ok) {
+        branchError = result.error?.message || i18n.t('input.branch.createFailed');
+        addToast('error', branchError);
+        return;
+      }
+      currentBranch = result.observation?.branch ?? branch;
+      branchContextRevision = result.sessionContext?.contextRevision ?? branchContextRevision;
+      branchHead = result.observation?.head ?? branchHead;
+      branchWorktreePath = result.observation?.worktreePath ?? branchWorktreePath;
+      branchCreateName = '';
+      branchPickerOpen = false;
+      addToast('success', i18n.t('input.branch.switched', { branch: currentBranch }));
+      void refreshBranchState();
+      window.dispatchEvent(new CustomEvent('magi:workspaceContentChanged', {
+        detail: { reason: 'branchCreated', branch: currentBranch },
+      }));
+    } catch (error) {
+      console.warn('[InputArea] 创建工作区分支失败:', error);
+      branchError = i18n.t('input.branch.createFailed');
+      addToast('error', branchError);
+    } finally {
+      branchCreating = false;
+    }
+  }
+
+  async function acceptCurrentGitContext() {
+    if (branchAcceptingContext || sessionInputLocked || isInteractionBlocking) return;
+    branchAcceptingContext = true;
+    branchError = null;
+    const requestWorkspace = composerWorkspace;
+    const requestWorkspaceKey = workspaceKey(requestWorkspace);
+    try {
+      const result = await acceptWorkspaceGitContext(
+        branchContextRevision,
+        workspaceBinding(requestWorkspace),
+      );
+      if (workspaceKey(composerWorkspace) !== requestWorkspaceKey) return;
+      if (!result.ok) {
+        branchError = result.error?.message || i18n.t('input.branch.acceptContextFailed');
+        addToast('error', branchError);
+        return;
+      }
+      currentBranch = result.observation?.branch ?? currentBranch;
+      branchHead = result.observation?.head ?? branchHead;
+      branchWorktreePath = result.observation?.worktreePath ?? branchWorktreePath;
+      branchContextRevision = result.sessionContext?.contextRevision ?? branchContextRevision;
+      branchContextDrift = false;
+      addToast('success', i18n.t('input.branch.contextAccepted'));
+      void refreshBranchState();
+      window.dispatchEvent(new CustomEvent('magi:workspaceContentChanged', {
+        detail: { reason: 'gitContextAccepted', branch: currentBranch },
+      }));
+    } catch (error) {
+      console.warn('[InputArea] 接受 Git context 失败:', error);
+      branchError = i18n.t('input.branch.acceptContextFailed');
+      addToast('error', branchError);
+    } finally {
+      branchAcceptingContext = false;
+    }
+  }
+
+  function currentGitExpected() {
+    return {
+      contextRevision: branchContextRevision ?? undefined,
+      branch: currentBranch,
+      head: branchHead,
+      worktreePath: branchWorktreePath,
+    };
+  }
+
+  function notifyGitContentChanged(reason: string) {
+    void refreshBranchState();
+    void loadWorktrees();
+    window.dispatchEvent(new CustomEvent('magi:workspaceContentChanged', {
+      detail: { reason, branch: currentBranch },
+    }));
+  }
+
+  async function previewAndMergeBranch(target: string) {
+    if (branchOperation || sessionInputLocked || isInteractionBlocking || branchStatus?.hasUncommitted || branchContextDrift) return;
+    branchOperation = `merge:${target}`;
+    branchError = null;
+    const requestWorkspace = composerWorkspace;
+    try {
+      const previewResult = await previewWorkspaceMerge(
+        target,
+        currentGitExpected(),
+        workspaceBinding(requestWorkspace),
+      );
+      if (!previewResult.ok) {
+        branchError = previewResult.error?.message || i18n.t('input.branch.mergePreviewFailed');
+        return;
+      }
+      const preview = previewResult.data as GitMergePreview;
+      if (preview.alreadyUpToDate) {
+        addToast('success', i18n.t('input.branch.alreadyUpToDate'));
+        return;
+      }
+      const changedPreview = preview.changedPaths.slice(0, 8).join('\n');
+      const confirmed = window.confirm(i18n.t('input.branch.mergeConfirm', {
+        branch: target,
+        commits: preview.incomingCommitCount,
+        files: preview.changedPaths.length,
+        paths: changedPreview || '—',
+      }));
+      if (!confirmed) return;
+      const result = await mergeWorkspaceBranch(
+        target,
+        false,
+        currentGitExpected(),
+        workspaceBinding(requestWorkspace),
+      );
+      if (!result.ok) {
+        const conflicts = result.error?.conflictedPaths?.join(', ');
+        branchError = conflicts
+          ? i18n.t('input.branch.mergeConflict', { paths: conflicts })
+          : result.error?.message || i18n.t('input.branch.mergeFailed');
+        addToast('error', branchError);
+        return;
+      }
+      currentBranch = result.observation?.branch ?? currentBranch;
+      branchHead = result.observation?.head ?? branchHead;
+      branchContextRevision = result.sessionContext?.contextRevision ?? branchContextRevision;
+      addToast('success', i18n.t('input.branch.merged', { branch: target }));
+      notifyGitContentChanged('branchMerged');
+    } catch (error) {
+      console.warn('[InputArea] 合并分支失败:', error);
+      branchError = i18n.t('input.branch.mergeFailed');
+    } finally {
+      branchOperation = null;
+    }
+  }
+
+  async function deleteLocalBranch(branch: string, force = false) {
+    if (branchOperation || sessionInputLocked || isInteractionBlocking || branch === currentBranch || branchContextDrift) return;
+    const confirmed = window.confirm(i18n.t(
+      force ? 'input.branch.forceDeleteConfirm' : 'input.branch.deleteConfirm',
+      { branch },
+    ));
+    if (!confirmed) return;
+    branchOperation = `delete:${branch}`;
+    branchError = null;
+    try {
+      const result = await deleteWorkspaceBranch(
+        branch,
+        { force, confirmForce: force },
+        currentGitExpected(),
+        workspaceBinding(composerWorkspace),
+      );
+      if (!result.ok) {
+        branchError = result.error?.message || i18n.t('input.branch.deleteFailed');
+        if (!force && result.error?.kind === 'git_command_failed') {
+          branchOperation = null;
+          await deleteLocalBranch(branch, true);
+        }
+        return;
+      }
+      addToast('success', i18n.t('input.branch.deleted', { branch }));
+      notifyGitContentChanged('branchDeleted');
+    } catch (error) {
+      console.warn('[InputArea] 删除本地分支失败:', error);
+      branchError = i18n.t('input.branch.deleteFailed');
+    } finally {
+      branchOperation = null;
+    }
+  }
+
+  async function deleteRemoteBranch(fullName: string) {
+    if (branchOperation || sessionInputLocked || isInteractionBlocking || branchContextDrift) return;
+    const separator = fullName.indexOf('/');
+    if (separator <= 0 || separator === fullName.length - 1) return;
+    const remote = fullName.slice(0, separator);
+    const branch = fullName.slice(separator + 1);
+    if (!window.confirm(i18n.t('input.branch.remoteDeleteConfirm', { branch: fullName }))) return;
+    branchOperation = `remote-delete:${fullName}`;
+    branchError = null;
+    try {
+      const result = await deleteWorkspaceBranch(
+        branch,
+        { remote, confirmRemote: true },
+        currentGitExpected(),
+        workspaceBinding(composerWorkspace),
+      );
+      if (!result.ok) {
+        branchError = result.error?.message || i18n.t('input.branch.deleteFailed');
+        return;
+      }
+      addToast('success', i18n.t('input.branch.deleted', { branch: fullName }));
+      notifyGitContentChanged('remoteBranchDeleted');
+    } catch (error) {
+      console.warn('[InputArea] 删除远程分支失败:', error);
+      branchError = i18n.t('input.branch.deleteFailed');
+    } finally {
+      branchOperation = null;
+    }
+  }
+
+  async function loadWorktrees() {
+    if (!branchIsRepo || worktreesLoading) return;
+    worktreesLoading = true;
+    try {
+      const result = await fetchWorkspaceWorktrees(workspaceBinding(composerWorkspace));
+      if (!result.ok) {
+        branchError = result.error?.message || i18n.t('input.branch.worktreeLoadFailed');
+        return;
+      }
+      worktrees = Array.isArray(result.data) ? result.data as GitWorktree[] : [];
+    } catch (error) {
+      console.warn('[InputArea] 读取 worktree 失败:', error);
+      branchError = i18n.t('input.branch.worktreeLoadFailed');
+    } finally {
+      worktreesLoading = false;
+    }
+  }
+
+  async function createManagedWorktree() {
+    if (worktreeCreating || sessionInputLocked || isInteractionBlocking || branchContextDrift) return;
+    worktreeCreating = true;
+    branchError = null;
+    try {
+      const result = await createWorkspaceWorktree(
+        worktreeMode,
+        {
+          ...(worktreeMode === 'writable' && worktreeBranch.trim()
+            ? { branch: worktreeBranch.trim() }
+            : {}),
+          allocationKey: currentSessionId || 'manual',
+        },
+        currentGitExpected(),
+        workspaceBinding(composerWorkspace),
+      );
+      if (!result.ok) {
+        branchError = result.error?.message || i18n.t('input.branch.worktreeCreateFailed');
+        return;
+      }
+      worktreeBranch = '';
+      addToast('success', i18n.t('input.branch.worktreeCreated'));
+      await loadWorktrees();
+    } catch (error) {
+      console.warn('[InputArea] 创建 worktree 失败:', error);
+      branchError = i18n.t('input.branch.worktreeCreateFailed');
+    } finally {
+      worktreeCreating = false;
+    }
+  }
+
+  async function removeManagedWorktree(path: string, force = false) {
+    if (branchOperation || sessionInputLocked || isInteractionBlocking || path === branchWorktreePath) return;
+    const confirmed = window.confirm(i18n.t(
+      force ? 'input.branch.worktreeForceRemoveConfirm' : 'input.branch.worktreeRemoveConfirm',
+      { path },
+    ));
+    if (!confirmed) return;
+    branchOperation = `worktree-remove:${path}`;
+    branchError = null;
+    try {
+      const result = await removeWorkspaceWorktree(
+        path,
+        { force, confirmForce: force },
+        currentGitExpected(),
+        workspaceBinding(composerWorkspace),
+      );
+      if (!result.ok) {
+        branchError = result.error?.message || i18n.t('input.branch.worktreeRemoveFailed');
+        if (!force && result.error?.kind === 'git_command_failed') {
+          branchOperation = null;
+          await removeManagedWorktree(path, true);
+        }
+        return;
+      }
+      addToast('success', i18n.t('input.branch.worktreeRemoved'));
+      await loadWorktrees();
+    } catch (error) {
+      console.warn('[InputArea] 移除 worktree 失败:', error);
+      branchError = i18n.t('input.branch.worktreeRemoveFailed');
+    } finally {
+      branchOperation = null;
     }
   }
 
@@ -2160,7 +2509,7 @@
               class="ia-branch-btn"
               class:active={branchPickerOpen}
               onclick={toggleBranchPicker}
-              disabled={branchSwitching !== null || sessionInputLocked || isInteractionBlocking}
+              disabled={branchSwitching !== null}
               title={branchStatusTitle()}
               aria-expanded={branchPickerOpen}
             >
@@ -2216,6 +2565,39 @@
                     {/if}
                   </div>
                 {/if}
+                {#if branchContextDrift}
+                  <div class="ia-picker-status ia-picker-status-error">
+                    {i18n.t('input.branch.contextDrift')}
+                    <button
+                      type="button"
+                      class="ia-picker-retry"
+                      disabled={branchAcceptingContext || sessionInputLocked || isInteractionBlocking}
+                      onclick={() => void acceptCurrentGitContext()}
+                    >{branchAcceptingContext ? i18n.t('input.branch.acceptingContext') : i18n.t('input.branch.acceptContext')}</button>
+                  </div>
+                {/if}
+                <div class="ia-branch-create-row">
+                  <input
+                    class="ia-branch-create-input"
+                    value={branchCreateName}
+                    placeholder={i18n.t('input.branch.createPlaceholder')}
+                    aria-label={i18n.t('input.branch.createPlaceholder')}
+                    disabled={branchCreating || branchSwitching !== null || sessionInputLocked || isInteractionBlocking || branchStatus?.hasUncommitted || branchContextDrift}
+                    oninput={(event) => (branchCreateName = event.currentTarget.value)}
+                    onkeydown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        void createAndSwitchBranch();
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    class="ia-branch-create-button"
+                    disabled={!branchCreateName.trim() || branchCreating || branchSwitching !== null || sessionInputLocked || isInteractionBlocking || branchStatus?.hasUncommitted || branchContextDrift}
+                    onclick={() => void createAndSwitchBranch()}
+                  >{branchCreating ? i18n.t('input.branch.creating') : i18n.t('input.branch.create')}</button>
+                </div>
                 {#if branchLoading}
                   <div class="ia-picker-status">{i18n.t('input.branch.loading')}</div>
                 {:else if branchError}
@@ -2232,20 +2614,113 @@
                 {:else}
                   <div class="ia-picker-list">
                     {#each branches as branch (branch)}
-                      <button
-                        type="button"
-                        class="ia-picker-item"
-                        class:selected={currentBranch === branch}
-                        onclick={() => void selectBranch(branch)}
-                        disabled={branchSwitching !== null}
-                      >
-                        <span class="ia-picker-item-label">{branch}</span>
-                        {#if branchSwitching === branch}
-                          <span class="ia-picker-item-desc">{i18n.t('input.branch.switching')}</span>
-                        {:else if currentBranch === branch}
-                          <span class="ia-picker-item-desc">{i18n.t('input.branch.current')}</span>
+                      <div class="ia-branch-manage-row">
+                        <button
+                          type="button"
+                          class="ia-picker-item ia-branch-switch-item"
+                          class:selected={currentBranch === branch}
+                          onclick={() => void selectBranch(branch)}
+                          disabled={branchSwitching !== null || branchOperation !== null || sessionInputLocked || isInteractionBlocking || branchStatus?.hasUncommitted || branchContextDrift}
+                        >
+                          <span class="ia-picker-item-label">{branch}</span>
+                          {#if branchSwitching === branch}
+                            <span class="ia-picker-item-desc">{i18n.t('input.branch.switching')}</span>
+                          {:else if currentBranch === branch}
+                            <span class="ia-picker-item-desc">{i18n.t('input.branch.current')}</span>
+                          {:else if structuredBranches.find((entry) => entry.name === branch)?.worktreePath}
+                            <span class="ia-picker-item-desc">{i18n.t('input.branch.inWorktree')}</span>
+                          {/if}
+                        </button>
+                        {#if currentBranch !== branch}
+                          <div class="ia-branch-row-actions">
+                            <button
+                              type="button"
+                              class="ia-branch-action"
+                              disabled={branchOperation !== null || sessionInputLocked || isInteractionBlocking || branchStatus?.hasUncommitted || branchContextDrift}
+                              onclick={() => void previewAndMergeBranch(branch)}
+                            >{branchOperation === `merge:${branch}` ? i18n.t('input.branch.merging') : i18n.t('input.branch.merge')}</button>
+                            <button
+                              type="button"
+                              class="ia-branch-action ia-branch-action-danger"
+                              disabled={branchOperation !== null || sessionInputLocked || isInteractionBlocking || branchContextDrift || !!structuredBranches.find((entry) => entry.name === branch)?.worktreePath}
+                              onclick={() => void deleteLocalBranch(branch)}
+                            >{i18n.t('input.branch.delete')}</button>
+                          </div>
                         {/if}
-                      </button>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+                {#if remoteBranches.length > 0}
+                  <div class="ia-picker-divider"></div>
+                  <div class="ia-picker-section-title">{i18n.t('input.branch.remoteTitle')}</div>
+                  <div class="ia-picker-list">
+                    {#each remoteBranches as branch (branch)}
+                      <div class="ia-branch-manage-row">
+                        <span class="ia-picker-item ia-branch-switch-item">
+                          <span class="ia-picker-item-label">{branch}</span>
+                        </span>
+                        <div class="ia-branch-row-actions">
+                          <button
+                            type="button"
+                            class="ia-branch-action ia-branch-action-danger"
+                            disabled={branchOperation !== null || sessionInputLocked || isInteractionBlocking || branchContextDrift}
+                            onclick={() => void deleteRemoteBranch(branch)}
+                          >{i18n.t('input.branch.deleteRemote')}</button>
+                        </div>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+                <div class="ia-picker-divider"></div>
+                <div class="ia-picker-section-title">{i18n.t('input.branch.worktreeTitle')}</div>
+                <div class="ia-worktree-create-row">
+                  <select bind:value={worktreeMode} disabled={worktreeCreating || sessionInputLocked || isInteractionBlocking || branchContextDrift}>
+                    <option value="readOnly">{i18n.t('input.branch.worktreeReadOnly')}</option>
+                    <option value="writable">{i18n.t('input.branch.worktreeWritable')}</option>
+                  </select>
+                  {#if worktreeMode === 'writable'}
+                    <input
+                      value={worktreeBranch}
+                      placeholder={i18n.t('input.branch.worktreeBranchPlaceholder')}
+                      oninput={(event) => (worktreeBranch = event.currentTarget.value)}
+                      disabled={worktreeCreating || sessionInputLocked || isInteractionBlocking || branchContextDrift}
+                    />
+                  {/if}
+                  <button
+                    type="button"
+                    class="ia-branch-create-button"
+                    onclick={() => void createManagedWorktree()}
+                    disabled={worktreeCreating || sessionInputLocked || isInteractionBlocking || branchContextDrift}
+                  >{worktreeCreating ? i18n.t('input.branch.creating') : i18n.t('input.branch.worktreeCreate')}</button>
+                </div>
+                {#if worktreesLoading}
+                  <div class="ia-picker-status">{i18n.t('input.branch.loading')}</div>
+                {:else if worktrees.length === 0}
+                  <div class="ia-picker-status">{i18n.t('input.branch.worktreeEmpty')}</div>
+                {:else}
+                  <div class="ia-picker-list">
+                    {#each worktrees as worktree (worktree.path)}
+                      <div class="ia-branch-manage-row ia-worktree-row">
+                        <span class="ia-picker-item ia-branch-switch-item">
+                          <span class="ia-picker-item-label">{worktree.branch || i18n.t('input.branch.detached')}</span>
+                          <span class="ia-picker-item-desc" title={worktree.path}>{worktree.path}</span>
+                        </span>
+                        {#if worktree.path !== branchWorktreePath && worktree.managed}
+                          <div class="ia-branch-row-actions">
+                            <button
+                              type="button"
+                              class="ia-branch-action ia-branch-action-danger"
+                              disabled={branchOperation !== null || sessionInputLocked || isInteractionBlocking}
+                              onclick={() => void removeManagedWorktree(worktree.path)}
+                            >{i18n.t('input.branch.worktreeRemove')}</button>
+                          </div>
+                        {:else if worktree.path === branchWorktreePath}
+                          <span class="ia-picker-item-desc">{i18n.t('input.branch.currentWorktree')}</span>
+                        {:else}
+                          <span class="ia-picker-item-desc">{i18n.t('input.branch.externalWorktree')}</span>
+                        {/if}
+                      </div>
                     {/each}
                   </div>
                 {/if}
@@ -2313,6 +2788,7 @@
             lastCompactionReason={contextBudgetState?.lastCompactionReason ?? null}
             originalTokenEstimate={contextBudgetState?.originalTokenEstimate ?? null}
             compactedTokenEstimate={contextBudgetState?.compactedTokenEstimate ?? null}
+            measurement={contextBudgetState?.measurement ?? null}
           />
         </div>
         <div class="ia-submit-controls">
@@ -2945,6 +3421,8 @@
   .ia-branch-popover {
     right: auto;
     left: 0;
+    width: min(520px, calc(100vw - 24px));
+    max-height: min(620px, calc(100vh - 120px));
   }
   .ia-branch-status-panel {
     margin: 4px 0 8px;
@@ -2985,6 +3463,102 @@
     font-size: 11px;
     font-weight: 650;
     font-variant-numeric: tabular-nums;
+  }
+  .ia-branch-create-row {
+    display: flex;
+    gap: 6px;
+    margin: 0 0 8px;
+  }
+  .ia-branch-create-input {
+    min-width: 0;
+    flex: 1;
+    padding: 6px 8px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--foreground);
+    font-size: 11px;
+    outline: none;
+  }
+  .ia-branch-create-input:focus {
+    border-color: color-mix(in srgb, var(--accent) 65%, var(--border));
+  }
+  .ia-branch-create-button {
+    padding: 6px 9px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--accent) 16%, var(--surface));
+    color: var(--foreground);
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .ia-branch-create-button:disabled,
+  .ia-branch-create-input:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+  .ia-picker-section-title {
+    padding: 4px 6px 2px;
+    color: var(--foreground-muted);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .ia-branch-manage-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+  .ia-branch-switch-item {
+    flex: 1;
+    min-width: 0;
+  }
+  .ia-branch-row-actions {
+    display: flex;
+    gap: 4px;
+    flex: 0 0 auto;
+  }
+  .ia-branch-action {
+    padding: 3px 7px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-xs);
+    background: transparent;
+    color: var(--foreground-muted);
+    font-size: 10px;
+    cursor: pointer;
+  }
+  .ia-branch-action:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--primary) 45%, var(--border-subtle));
+    color: var(--primary);
+  }
+  .ia-branch-action-danger:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--danger, #f85149) 55%, var(--border-subtle));
+    color: var(--danger, #f85149);
+  }
+  .ia-branch-action:disabled { opacity: 0.4; cursor: not-allowed; }
+  .ia-worktree-create-row {
+    display: flex;
+    gap: 6px;
+    padding: 6px 0;
+  }
+  .ia-worktree-create-row select,
+  .ia-worktree-create-row input {
+    min-width: 0;
+    padding: 5px 7px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    color: var(--foreground);
+    font-size: 11px;
+  }
+  .ia-worktree-create-row input { flex: 1; }
+  .ia-worktree-row .ia-picker-item-desc {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 270px;
   }
   .ia-picker-popover {
     position: absolute;

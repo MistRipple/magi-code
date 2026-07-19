@@ -577,7 +577,6 @@ impl Task {
             .and_then(TaskExecutorBinding::active_skill_id)
     }
 
-
     pub fn canonical_task_name(&self) -> Option<&str> {
         self.executor_binding
             .as_ref()

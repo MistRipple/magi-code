@@ -60,12 +60,15 @@ export function resolveModelApiProtocol(
   const baseUrl = trimmedConfigString(config?.baseUrl)
     .replace(/\/+$/, '')
     .toLowerCase();
+  const usesAnthropicEndpoint = baseUrl.endsWith('/anthropic') || baseUrl.endsWith('/messages');
   if (urlMode === 'full') {
-    return baseUrl.endsWith('/v1/messages') ? 'anthropic_messages' : 'openai_chat';
+    return usesAnthropicEndpoint ? 'anthropic_messages' : 'openai_chat';
   }
 
   const model = trimmedConfigString(config?.model).toLowerCase();
-  return model.includes('claude') ? 'anthropic_messages' : 'openai_chat';
+  return usesAnthropicEndpoint || model.includes('claude')
+    ? 'anthropic_messages'
+    : 'openai_chat';
 }
 
 /**

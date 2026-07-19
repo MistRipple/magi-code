@@ -1,5 +1,5 @@
 <script lang="ts">
-  import hljs from 'highlight.js';
+  import { highlightCode } from '../../lib/code-highlighter';
 
   interface Props {
     diff?: string | null;
@@ -20,14 +20,22 @@
       .replace(/'/g, '&#039;');
   }
 
-  const highlightedDiffCode = $derived.by(() => {
-    if (!diffCode) return '';
-    if (!hljs.getLanguage('diff')) return escapeHtml(diffCode);
-    try {
-      return hljs.highlight(diffCode, { language: 'diff' }).value;
-    } catch {
-      return escapeHtml(diffCode);
-    }
+  let highlightedDiffCode = $state('');
+
+  $effect(() => {
+    const source = diffCode;
+    highlightedDiffCode = escapeHtml(source);
+    if (!source) return;
+
+    let cancelled = false;
+    void highlightCode(source, 'diff').then((result) => {
+      if (!cancelled && result !== null) highlightedDiffCode = result;
+    }).catch((error) => {
+      console.warn('[DiffCodeBlock] 高亮失败:', error);
+    });
+    return () => {
+      cancelled = true;
+    };
   });
 </script>
 

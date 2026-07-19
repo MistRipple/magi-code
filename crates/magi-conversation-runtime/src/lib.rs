@@ -77,6 +77,6 @@ pub(crate) fn test_plan_store(name: &str) -> magi_plan::PlanStore {
     let session_id = magi_core::SessionId::new(name);
     store
         .create_session(session_id.clone(), name)
-        .expect("test todo session should create");
+        .expect("test plan session should create");
     magi_plan::PlanStore::new(store, session_id)
 }

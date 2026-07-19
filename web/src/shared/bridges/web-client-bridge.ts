@@ -147,10 +147,11 @@ import {
   setCurrentSessionId,
   setQueuedMessages,
   removeQueuedMessage,
+  setOrchestratorRuntimeState,
   updateRequestBinding,
 } from '../../stores/messages.svelte';
 import { resolveModelListFetchBlockReason } from '../model-governance';
-import type { QueuedMessage } from '../../types/message';
+import type { OrchestratorRuntimeSnapshot, QueuedMessage } from '../../types/message';
 import { canGuideQueuedMessage, queuedMessageText } from '../../lib/queued-message-guidance';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
@@ -1443,6 +1444,144 @@ const TURN_TERMINAL_EVENTS = new Set([
   'session.turn.queue_failed',
 ]);
 
+function readFiniteEventNumber(
+  payload: Record<string, unknown>,
+  snakeKey: string,
+  camelKey: string,
+): number | undefined {
+  const value = payload[snakeKey] ?? payload[camelKey];
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
+  const payload = event.payload;
+  if (!payload) return;
+  const tokenUsed = readFiniteEventNumber(payload, 'token_used', 'tokenUsed');
+  const tokenLimit = readFiniteEventNumber(payload, 'token_limit', 'tokenLimit');
+  const remainingTokens = readFiniteEventNumber(payload, 'remaining_tokens', 'remainingTokens');
+  const usageRatio = readFiniteEventNumber(payload, 'usage_ratio', 'usageRatio');
+  if (tokenUsed === undefined || tokenLimit === undefined || tokenLimit <= 0) return;
+
+  const updatedAt = readFiniteEventNumber(payload, 'updated_at', 'updatedAt')
+    ?? (typeof event.occurred_at === 'number' ? event.occurred_at : Date.now());
+  const measurement = trimBridgeString(payload.accuracy) === 'authoritative'
+    ? 'authoritative'
+    : 'estimated';
+  const current = messagesState.orchestratorRuntimeState;
+  const currentBudget = current?.runtimeSnapshot?.budgetState;
+  const currentUpdatedAt = currentBudget?.updatedAt ?? 0;
+  const currentMeasurementRank = currentBudget?.measurement === 'authoritative' ? 1 : 0;
+  const nextMeasurementRank = measurement === 'authoritative' ? 1 : 0;
+  if (
+    currentUpdatedAt > updatedAt
+    || (currentUpdatedAt === updatedAt && currentMeasurementRank > nextMeasurementRank)
+  ) {
+    return;
+  }
+
+  const warningLevelValue = trimBridgeString(payload.warning_level ?? payload.warningLevel);
+  const warningLevel = (
+    warningLevelValue === 'normal'
+    || warningLevelValue === 'notice'
+    || warningLevelValue === 'warning'
+    || warningLevelValue === 'danger'
+  ) ? warningLevelValue : undefined;
+  const budgetState: NonNullable<OrchestratorRuntimeSnapshot['budgetState']> = {
+    ...currentBudget,
+    tokenUsed: Math.max(0, Math.floor(tokenUsed)),
+    tokenLimit: Math.max(0, Math.floor(tokenLimit)),
+    remainingTokens: Math.max(
+      0,
+      Math.floor(remainingTokens ?? Math.max(0, tokenLimit - tokenUsed)),
+    ),
+    usageRatio: Math.min(1, Math.max(0, usageRatio ?? tokenUsed / tokenLimit)),
+    ...(warningLevel ? { warningLevel } : {}),
+    measurement,
+    phase: trimBridgeString(payload.phase) || undefined,
+    updatedAt: Math.floor(updatedAt),
+    turnId: trimBridgeString(payload.turn_id ?? payload.turnId) || undefined,
+    callId: trimBridgeString(payload.call_id ?? payload.callId) || undefined,
+    resolvedModel: trimBridgeString(payload.resolved_model ?? payload.resolvedModel) || undefined,
+  };
+  const eventAt = Math.max(
+    Math.floor(updatedAt),
+    typeof event.occurred_at === 'number' ? Math.floor(event.occurred_at) : 0,
+  );
+  setOrchestratorRuntimeState({
+    ...(current ?? {
+      status: 'running',
+      phase: budgetState.phase || 'modeling',
+      errors: [],
+      statusChangedAt: eventAt,
+      lastEventAt: eventAt,
+      assignments: [],
+    }),
+    sessionId: rustEventSessionId(event) || currentSessionId || current?.sessionId,
+    lastEventAt: Math.max(current?.lastEventAt ?? 0, eventAt),
+    runtimeSnapshot: {
+      ...(current?.runtimeSnapshot ?? {}),
+      budgetState,
+    },
+  });
+}
+
+function applyContextCompactionRuntimeEvent(event: RustEventEnvelope): void {
+  const payload = event.payload;
+  if (!payload) return;
+  const compactedTokenEstimate = readFiniteEventNumber(
+    payload,
+    'compacted_token_estimate',
+    'compactedTokenEstimate',
+  );
+  const tokenLimit = readFiniteEventNumber(payload, 'token_limit', 'tokenLimit')
+    ?? messagesState.orchestratorRuntimeState?.runtimeSnapshot?.budgetState?.tokenLimit;
+  if (compactedTokenEstimate === undefined || tokenLimit === undefined) return;
+  applyContextBudgetRuntimeEvent({
+    ...event,
+    payload: {
+      ...payload,
+      token_used: compactedTokenEstimate,
+      token_limit: tokenLimit,
+      remaining_tokens: Math.max(0, tokenLimit - compactedTokenEstimate),
+      usage_ratio: tokenLimit > 0 ? compactedTokenEstimate / tokenLimit : 0,
+      phase: 'compacted',
+      accuracy: 'estimated',
+      updated_at: readFiniteEventNumber(payload, 'compacted_at', 'compactedAt')
+        ?? event.occurred_at,
+    },
+  });
+  const state = messagesState.orchestratorRuntimeState;
+  const budget = state?.runtimeSnapshot?.budgetState;
+  if (!state || !budget) return;
+  setOrchestratorRuntimeState({
+    ...state,
+    runtimeSnapshot: {
+      ...(state.runtimeSnapshot ?? {}),
+      budgetState: {
+        ...budget,
+        lastCompactionAt: readFiniteEventNumber(payload, 'compacted_at', 'compactedAt'),
+        lastCompactionReason: trimBridgeString(payload.reason) || undefined,
+        originalTokenEstimate: readFiniteEventNumber(
+          payload,
+          'original_token_estimate',
+          'originalTokenEstimate',
+        ),
+        compactedTokenEstimate,
+        originalMessageCount: readFiniteEventNumber(
+          payload,
+          'original_message_count',
+          'originalMessageCount',
+        ),
+        compactedMessageCount: readFiniteEventNumber(
+          payload,
+          'compacted_message_count',
+          'compactedMessageCount',
+        ),
+      },
+    },
+  });
+}
+
 function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   const eventType = trimBridgeString(event.event_type);
 
@@ -1465,10 +1604,30 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
 
+  if (eventType === 'workspace.git.context.changed') {
+    window.dispatchEvent(new CustomEvent('magi:workspaceContentChanged', {
+      detail: {
+        reason: 'gitContextChanged',
+        branch: trimBridgeString(event.payload?.branch),
+        head: trimBridgeString(event.payload?.head),
+      },
+    }));
+  }
+
   if (!shouldApplyCurrentSessionRustEvent(event)) {
     if (shouldRefreshExternalWorkspaceSessionSummary(eventType, event)) {
       scheduleWorkspaceSessionSummaryRefresh(`external_${eventType.replaceAll('.', '_')}`);
     }
+    return;
+  }
+
+  if (eventType === 'session.context.usage.updated') {
+    applyContextBudgetRuntimeEvent(event);
+    return;
+  }
+
+  if (eventType === 'session.context.compacted') {
+    applyContextCompactionRuntimeEvent(event);
     return;
   }
 
@@ -1509,11 +1668,35 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
 
-  if (eventType === 'session.plan.updated' && event.payload) {
+  if (
+    (
+      eventType === 'session.plan.updated'
+      || eventType === 'session.plan.paused'
+      || eventType === 'session.plan.completed'
+      || eventType === 'session.plan.cleared'
+    )
+    && event.payload
+  ) {
     const sessionId = rustEventSessionId(event) || currentSessionId;
     const workspaceId = rustEventWorkspaceId(event) || currentWorkspaceId;
     const plan = event.payload.plan;
-    if (sessionId && plan && typeof plan === 'object' && !Array.isArray(plan)) {
+    if (sessionId && eventType === 'session.plan.cleared') {
+      const eventPlanId = trimBridgeString(event.payload.plan_id)
+        || trimBridgeString(event.payload.planId);
+      const eventRevision = typeof event.payload.revision === 'number'
+        ? event.payload.revision
+        : null;
+      const applied = applySessionPlanSnapshot(
+        sessionId,
+        workspaceId,
+        null,
+        eventPlanId,
+        eventRevision,
+      );
+      if (!applied) {
+        void refreshCurrentGoal(sessionId, workspaceId, currentWorkspacePath);
+      }
+    } else if (sessionId && plan && typeof plan === 'object' && !Array.isArray(plan)) {
       const applied = applySessionPlanSnapshot(
         sessionId,
         workspaceId,

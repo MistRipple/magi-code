@@ -12,7 +12,7 @@
 //! ```json
 //! "system": [
 //!   {"type": "text", "text": "STATIC 段（角色 / 工具 / 防御）", "cache_control": {"type": "ephemeral"}},
-//!   {"type": "text", "text": "DYNAMIC 段（Plan / TodoLedger / Mailbox）"}
+//!   {"type": "text", "text": "DYNAMIC 段（SessionPlan / ExecutionChain / Mailbox）"}
 //! ]
 //! ```
 //!

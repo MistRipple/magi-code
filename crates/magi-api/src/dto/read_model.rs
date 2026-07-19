@@ -2054,6 +2054,7 @@ mod tests {
                 context_window_tokens: 136_000,
                 resolved_model: Some("gpt-5-codex".to_string()),
                 observed_at: Some(UtcMillis(1)),
+                ..SessionRuntimeUsageObservation::default()
             }),
             ..SessionRuntimeSummaryEntry::default()
         });
@@ -2120,6 +2121,7 @@ mod tests {
                 context_window_tokens: 136_000,
                 resolved_model: Some("gpt-5-codex".to_string()),
                 observed_at: Some(UtcMillis(2)),
+                ..SessionRuntimeUsageObservation::default()
             }),
             ..SessionRuntimeSummaryEntry::default()
         });
@@ -2131,6 +2133,7 @@ mod tests {
                 context_window_tokens: 68_000,
                 resolved_model: Some("gpt-5-codex".to_string()),
                 observed_at: Some(UtcMillis(1)),
+                ..SessionRuntimeUsageObservation::default()
             },
         );
         // 账本里这条更旧/更小,不应覆盖 session-live 的实时观测。
@@ -2140,6 +2143,7 @@ mod tests {
                 context_window_tokens: 1_000,
                 resolved_model: Some("gpt-5-codex".to_string()),
                 observed_at: Some(UtcMillis(1)),
+                ..SessionRuntimeUsageObservation::default()
             },
         );
 

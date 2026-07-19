@@ -27,6 +27,7 @@ pub fn finalize_background_session_task_turn_if_root_completed(
         Some(persist_session_state.as_ref()),
     );
     if finalized {
+        state.release_session_git_execution_lease(session_id);
         schedule_next_queued_session_turn(state, session_id);
     }
     finalized
@@ -49,6 +50,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         Some(persist_session_state.as_ref()),
     );
     if finalized {
+        state.release_session_git_execution_lease(session_id);
         let root_completed = state
             .task_store()
             .and_then(|task_store| task_store.get_task(root_task_id))
@@ -57,16 +59,29 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
             let plan_store =
                 magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
             match plan_store.pause() {
-                Ok(Some(_)) => {
+                Ok(Some(plan)) => {
+                    let workspace_id = state
+                        .session_store
+                        .session(session_id)
+                        .and_then(|session| session.workspace_id)
+                        .map(magi_core::WorkspaceId::new);
+                    magi_plan::publish_plan_event(
+                        &state.event_bus,
+                        magi_plan::plan_event_type(&plan),
+                        &plan,
+                        workspace_id.as_ref(),
+                        Some(root_task_id),
+                        None,
+                    );
                     if let Err(error) =
                         state.persist_session_state_checkpoint("session_task_turn_plan_paused")
                     {
-                        tracing::warn!(?error, "任务失败后 PlanStore 暂停状态持久化失败");
+                        tracing::warn!(?error, "任务失败后计划暂停状态持久化失败");
                     }
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!(session_id = %session_id, %error, "任务失败后暂停 PlanStore 进行项失败");
+                    tracing::warn!(session_id = %session_id, %error, "任务失败后暂停计划失败");
                 }
             }
         }
@@ -108,14 +123,14 @@ mod tests {
     use magi_workspace::WorkspaceStore;
 
     #[tokio::test]
-    async fn failed_task_terminalization_pauses_session_todo() {
+    async fn failed_task_terminalization_pauses_session_plan() {
         let session_store = Arc::new(SessionStore::new());
-        let session_id = SessionId::new("session-failed-task-todo-pause");
-        let root_task_id = TaskId::new("task-failed-task-todo-pause");
-        let mission_id = MissionId::new("mission-failed-task-todo-pause");
+        let session_id = SessionId::new("session-failed-task-plan-pause");
+        let root_task_id = TaskId::new("task-failed-task-plan-pause");
+        let mission_id = MissionId::new("mission-failed-task-plan-pause");
         let now = UtcMillis::now();
         session_store
-            .create_session(session_id.clone(), "failed task todo pause")
+            .create_session(session_id.clone(), "failed task plan pause")
             .expect("session should create");
         session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
         session_store
@@ -125,7 +140,7 @@ mod tests {
                     session_id: session_id.clone(),
                     mission_id: mission_id.clone(),
                     root_task_id: root_task_id.clone(),
-                    execution_chain_ref: "chain-failed-task-todo-pause".to_string(),
+                    execution_chain_ref: "chain-failed-task-plan-pause".to_string(),
                     workspace_id: None,
                     active_branch_task_ids: vec![root_task_id.clone()],
                     active_worker_bindings: Vec::new(),
@@ -133,12 +148,12 @@ mod tests {
                     recovery_ref: None,
                     dispatch_context: ActiveExecutionDispatchContext {
                         accepted_at: now,
-                        entry_id: "entry-failed-task-todo-pause".to_string(),
+                        entry_id: "entry-failed-task-plan-pause".to_string(),
                         trimmed_text: Some("执行失败任务".to_string()),
                         skill_name: None,
                     },
                     current_turn: Some(ActiveExecutionTurn {
-                        turn_id: "turn-failed-task-todo-pause".to_string(),
+                        turn_id: "turn-failed-task-plan-pause".to_string(),
                         turn_seq: now.0,
                         accepted_at: now,
                         status: "running".to_string(),
@@ -151,12 +166,18 @@ mod tests {
             .expect("active chain should persist");
         let plan_store = magi_plan::PlanStore::new(session_store.clone(), session_id.clone());
         plan_store
-            .write(vec![magi_core::TodoItem::new(
-                "执行当前步骤",
-                "正在执行当前步骤",
-                magi_core::TodoStatus::InProgress,
-            )])
-            .expect("todo should persist");
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("execute-current-step".to_string()),
+                    step: "执行当前步骤".to_string(),
+                    status: magi_core::PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should persist");
         let task_store = Arc::new(TaskStore::new());
         task_store.insert_task(Task {
             task_id: root_task_id.clone(),
@@ -165,7 +186,7 @@ mod tests {
             parent_task_id: None,
             kind: TaskKind::LocalAgent,
             title: "失败任务".to_string(),
-            goal: "验证失败后 Todo 收敛".to_string(),
+            goal: "验证失败后计划收敛".to_string(),
             status: TaskStatus::Failed,
             dependency_ids: Vec::new(),
             required_children: Vec::new(),
@@ -197,9 +218,8 @@ mod tests {
             &root_task_id,
             "error",
         ));
-        assert_eq!(
-            plan_store.snapshot()[0].status,
-            magi_core::TodoStatus::Pending
-        );
+        let plan = plan_store.snapshot().expect("plan should remain visible");
+        assert_eq!(plan.state, magi_core::PlanState::Paused);
+        assert_eq!(plan.items[0].status, magi_core::PlanItemStatus::InProgress);
     }
 }

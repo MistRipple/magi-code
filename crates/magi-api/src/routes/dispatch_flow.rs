@@ -160,6 +160,9 @@ async fn execute_dispatch_submission(
     state
         .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
         .await?;
+    state
+        .ensure_session_code_context(&session_id, &workspace_id)
+        .await?;
     let user_timeline_entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let action_task_title = format_action_task_title(&mission_title);
 
@@ -186,7 +189,13 @@ async fn execute_dispatch_submission(
         placeholder_message_id: request.placeholder_message_id(),
         replace_turn_id: request.replace_turn_id(),
     };
-    let accepted = submit_dispatch_submission(state, dispatch)?;
+    let accepted = match submit_dispatch_submission(state, dispatch) {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            state.release_session_git_execution_lease(&session_id);
+            return Err(error);
+        }
+    };
     if let Err(error) = state.persist_session_state_checkpoint("session_task_turn_accepted") {
         fail_accepted_task_submission(state, &accepted);
         return Err(error);

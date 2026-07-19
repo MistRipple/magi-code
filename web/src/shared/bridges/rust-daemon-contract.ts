@@ -191,8 +191,19 @@ interface RustSessionRuntimeSummary {
   active_branches?: RustSessionRuntimeBranchSummary[];
   current_turn?: RustSessionRuntimeTurnSummary | null;
   turn_items?: RustSessionRuntimeTurnItemSummary[];
+  usage_observation?: RustSessionRuntimeUsageObservation | null;
   budget?: RustSessionRuntimeBudget | null;
   context_compaction?: RustSessionRuntimeContextCompaction | null;
+}
+
+interface RustSessionRuntimeUsageObservation {
+  context_window_tokens?: number;
+  resolved_model?: string | null;
+  observed_at?: number | null;
+  measurement?: string | null;
+  phase?: string | null;
+  turn_id?: string | null;
+  call_id?: string | null;
 }
 
 interface RustSessionRuntimeBudget {
@@ -531,9 +542,26 @@ function normalizeSessionRuntimeEntries(
         : [],
       current_turn: normalizeRuntimeTurnSummary(entry.current_turn),
       turn_items: normalizeRuntimeTurnItems(entry.turn_items),
+      usage_observation: normalizeRuntimeUsageObservation(entry.usage_observation),
       budget: normalizeRuntimeBudget(entry.budget),
       context_compaction: normalizeRuntimeContextCompaction(entry.context_compaction),
     }));
+}
+
+function normalizeRuntimeUsageObservation(raw: unknown): RustSessionRuntimeUsageObservation | undefined {
+  const record = normalizeObjectRecord(raw);
+  if (!record) return undefined;
+  return {
+    context_window_tokens: typeof record.context_window_tokens === 'number'
+      ? Math.floor(record.context_window_tokens)
+      : undefined,
+    resolved_model: normalizeString(record.resolved_model) || undefined,
+    observed_at: typeof record.observed_at === 'number' ? Math.floor(record.observed_at) : undefined,
+    measurement: normalizeString(record.measurement) || undefined,
+    phase: normalizeString(record.phase) || undefined,
+    turn_id: normalizeString(record.turn_id) || undefined,
+    call_id: normalizeString(record.call_id) || undefined,
+  };
 }
 
 function normalizeRuntimeContextCompaction(raw: unknown): RustSessionRuntimeContextCompaction | undefined {
@@ -1507,6 +1535,11 @@ function buildRuntimeSnapshot(
     return null;
   }
   const compaction = activeSession?.context_compaction;
+  const usageObservation = activeSession?.usage_observation;
+  const measurement = usageObservation?.measurement === 'estimated'
+    || usageObservation?.measurement === 'authoritative'
+    ? usageObservation.measurement
+    : undefined;
   return {
     budgetState: {
       tokenUsed: budget.token_used,
@@ -1520,6 +1553,16 @@ function buildRuntimeSnapshot(
       compactedTokenEstimate: compaction?.compacted_token_estimate ?? undefined,
       originalMessageCount: compaction?.original_message_count ?? undefined,
       compactedMessageCount: compaction?.compacted_message_count ?? undefined,
+      ...(measurement ? { measurement } : {}),
+      ...(usageObservation?.phase ? { phase: usageObservation.phase } : {}),
+      ...(usageObservation?.observed_at != null
+        ? { updatedAt: usageObservation.observed_at }
+        : {}),
+      ...(usageObservation?.turn_id ? { turnId: usageObservation.turn_id } : {}),
+      ...(usageObservation?.call_id ? { callId: usageObservation.call_id } : {}),
+      ...(usageObservation?.resolved_model
+        ? { resolvedModel: usageObservation.resolved_model }
+        : {}),
     },
   };
 }

@@ -7,9 +7,10 @@
 use crate::{
     ConversationRegistry, SessionTurnInputBoundary, UserSignal,
     conversation_loop::{
-        compact_history_for_prompt, latest_session_usage_observation,
-        thread_chat_message_to_chat_message,
+        ContextCompactionRecord, chat_message_to_thread_chat_message,
+        estimate_chat_messages_tokens, prepare_thread_history, thread_chat_message_to_chat_message,
     },
+    model_config::resolve_orchestrator_model_config,
     model_error::{
         classify_model_invocation_error, provider_empty_assistant_response_error,
         public_model_image_invocation_error_message,
@@ -30,15 +31,15 @@ use crate::{
     },
     tool_surface_state::{activate_skill_tool_definitions, refresh_live_mcp_tool_definitions},
     usage_recording::{
-        ModelUsageBinding, account_active_goal_turn, publish_model_usage_record,
-        session_turn_model_usage_binding,
+        ModelUsageBinding, account_active_goal_turn, publish_context_usage_update,
+        publish_model_usage_record, session_turn_model_usage_binding,
     },
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolChoice, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest,
     ModelStreamingDelta,
 };
-use magi_core::{AccessProfile, SessionId, UtcMillis, WorkspaceId};
+use magi_core::{AccessProfile, SessionId, UtcMillis, WorkspaceId, estimate_text_tokens};
 use magi_event_bus::InMemoryEventBus;
 use magi_session_store::{CanonicalTurnItemKind, SessionStore, ThreadChatMessage};
 use magi_settings_store::SettingsStore;
@@ -222,13 +223,10 @@ fn request_turn_is_writable(
         })
 }
 
-fn build_session_turn_messages(
-    event_bus: Option<&InMemoryEventBus>,
+fn canonical_session_turn_history(
     session_store: &SessionStore,
     request: &SessionTurnExecutionRequest,
-    prompt: &str,
-    knowledge_context_prompt: Option<&str>,
-) -> Vec<ChatMessage> {
+) -> Vec<ThreadChatMessage> {
     let current_turn = session_store
         .runtime_sidecar(&request.session_id)
         .and_then(|sidecar| sidecar.current_turn)
@@ -239,7 +237,7 @@ fn build_session_turn_messages(
     let orchestrator_thread_id = session_store
         .orchestrator_thread_for_session(&request.session_id)
         .map(|thread| thread.thread_id);
-    let mut history = accepted_at
+    accepted_at
         .zip(orchestrator_thread_id.as_ref())
         .map(|(accepted_at, orchestrator_thread_id)| {
             session_store
@@ -277,22 +275,31 @@ fn build_session_turn_messages(
                 })
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
-    let usage_observation = event_bus
-        .and_then(|event_bus| latest_session_usage_observation(event_bus, &request.session_id));
-    history = compact_history_for_prompt(history, usage_observation.as_ref());
+        .unwrap_or_default()
+}
+
+fn build_session_turn_messages(
+    session_store: &SessionStore,
+    request: &SessionTurnExecutionRequest,
+    prompt: &str,
+    knowledge_context_prompt: Option<&str>,
+    history: &[ThreadChatMessage],
+) -> Vec<ChatMessage> {
     let mut messages = if request.use_tools {
         workspace_context_messages(request)
     } else {
         Vec::new()
     };
-    messages.push(system_prompt_fragment_message(
-        PromptFragmentKind::CurrentTurnPriority,
-        format!(
-            "计划语言规则：用户明确指定的语言优先，其次当前用户消息的主要语言，再次产品 locale={}，最后默认 zh-CN。调用 update_plan 时必须将最终选择写入 language，计划创建后不得切换。",
-            request.product_locale
-        ),
-    ));
+    if request.goal_turn_mode.is_goal_driven() || session_store.plan(&request.session_id).is_some()
+    {
+        messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::CurrentTurnPriority,
+            format!(
+                "计划语言规则：用户明确指定的语言优先，其次当前用户消息的主要语言，再次产品 locale={}，最后默认 zh-CN。调用 update_plan 时必须将最终选择写入 language，计划创建后不得切换。",
+                request.product_locale
+            ),
+        ));
+    }
     if let Some(reference_prompt) =
         crate::context_reference::session_context_references_prompt(&request.context_references)
     {
@@ -338,6 +345,75 @@ fn workspace_context_messages(request: &SessionTurnExecutionRequest) -> Vec<Chat
     )]
 }
 
+fn estimate_tool_definition_tokens(tools: Option<&[ChatToolDefinition]>) -> usize {
+    tools
+        .and_then(|definitions| serde_json::to_string(definitions).ok())
+        .map(|serialized| estimate_text_tokens(&serialized))
+        .unwrap_or(0)
+}
+
+fn append_context_compaction_notice(
+    event_bus: &InMemoryEventBus,
+    session_store: &SessionStore,
+    request: &SessionTurnExecutionRequest,
+    thread_id: &magi_core::ThreadId,
+    record: &ContextCompactionRecord,
+    persist_session_state: Option<&SessionStatePersistCallback>,
+) {
+    let mut item = session_turn_item(
+        "assistant_phase",
+        "completed",
+        Some("Context compacted".to_string()),
+        Some("Context compacted".to_string()),
+        Some(format!(
+            "turn-item-context-compaction-{}",
+            record.compacted_at.0
+        )),
+        thread_id.clone(),
+    );
+    item.metadata.insert(
+        "noticeKind".to_string(),
+        serde_json::Value::String("context_compaction".to_string()),
+    );
+    item.metadata.insert(
+        "noticeType".to_string(),
+        serde_json::Value::String("info".to_string()),
+    );
+    item.metadata.insert(
+        "reason".to_string(),
+        serde_json::Value::String(record.reason.to_string()),
+    );
+    item.metadata.insert(
+        "originalMessageCount".to_string(),
+        serde_json::json!(record.original_message_count),
+    );
+    item.metadata.insert(
+        "compactedMessageCount".to_string(),
+        serde_json::json!(record.compacted_message_count),
+    );
+    item.metadata.insert(
+        "originalTokenEstimate".to_string(),
+        serde_json::json!(record.original_token_estimate),
+    );
+    item.metadata.insert(
+        "compactedTokenEstimate".to_string(),
+        serde_json::json!(record.compacted_token_estimate),
+    );
+    item.metadata.insert(
+        "compactedAt".to_string(),
+        serde_json::json!(record.compacted_at.0),
+    );
+    if let Some(published) = append_session_turn_item(session_store, &request.session_id, item) {
+        persist_session_state_checkpoint(persist_session_state, "context_compaction_notice");
+        publish_session_turn_item_event(
+            event_bus,
+            &request.session_id,
+            &request.workspace_id,
+            &published,
+        );
+    }
+}
+
 pub struct SessionTurnExecutionRuntime<'a> {
     pub client: &'a dyn ModelBridgeClient,
     pub event_bus: &'a InMemoryEventBus,
@@ -363,15 +439,26 @@ pub fn run_session_turn_execution(
 ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
     let plan_store = runtime.plan_store;
     let session_id = runtime.request.session_id.clone();
+    let workspace_id = runtime.request.workspace_id.clone();
+    let event_bus = runtime.event_bus;
     let result = run_session_turn_execution_inner(runtime);
-    if result.is_err()
-        && let Err(todo_error) = plan_store.pause()
-    {
-        tracing::warn!(
-            session_id = %session_id,
-            error = %todo_error,
-            "对话轮次失败后暂停 PlanStore 进行项失败"
-        );
+    if result.is_err() {
+        match plan_store.pause() {
+            Ok(Some(plan)) => magi_plan::publish_plan_event(
+                event_bus,
+                magi_plan::plan_event_type(&plan),
+                &plan,
+                workspace_id.as_ref(),
+                None,
+                None,
+            ),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                session_id = %session_id,
+                %error,
+                "对话轮次失败后暂停计划失败"
+            ),
+        }
     }
     result
 }
@@ -410,13 +497,41 @@ fn run_session_turn_execution_inner(
     let orchestrator_thread_id = orchestrator_thread.thread_id;
     let orchestrator_mission_id = orchestrator_thread.mission_id;
 
+    let fallback_history = canonical_session_turn_history(session_store, &request);
+    let prepared_history = prepare_thread_history(
+        event_bus,
+        session_store,
+        &request.session_id,
+        &request.workspace_id,
+        &orchestrator_thread_id,
+        fallback_history,
+        "pre_turn",
+    );
+    if let Some(compaction) = prepared_history.compaction.as_ref() {
+        append_context_compaction_notice(
+            event_bus,
+            session_store,
+            &request,
+            &orchestrator_thread_id,
+            compaction,
+            persist_session_state,
+        );
+    }
     let mut messages = build_session_turn_messages(
-        Some(event_bus),
         session_store,
         &request,
         &prompt,
         knowledge_context_prompt.as_deref(),
+        &prepared_history.messages,
     );
+    if let Some(current_user_message) = messages.last() {
+        session_store.append_thread_messages(
+            &orchestrator_thread_id,
+            vec![chat_message_to_thread_chat_message(current_user_message)],
+            UtcMillis::now(),
+        );
+        persist_session_state_checkpoint(persist_session_state, "session_turn_thread_user");
+    }
     let mut final_content: Option<String> = None;
     let mut final_item_id: Option<String> = None;
     let mut main_timeline_entry_id: Option<String> = None;
@@ -645,6 +760,18 @@ fn run_session_turn_execution_inner(
         &orchestrator_thread_id,
         persist_session_state,
     );
+    session_store.append_thread_messages(
+        &orchestrator_thread_id,
+        vec![ThreadChatMessage {
+            role: "assistant".to_string(),
+            content: Some(final_content.clone()),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }],
+        UtcMillis::now(),
+    );
+    persist_session_state_checkpoint(persist_session_state, "session_turn_thread_assistant");
 
     Ok(SessionTurnExecutionOutput::completed(final_content))
 }
@@ -864,10 +991,55 @@ fn stream_session_turn_round(
     let stream_publish_gate = std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
     let thinking_publish_gate = std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
     let writeback_aborted = std::cell::Cell::new(false);
+    let call_id = format!("session-turn-{round}-{}", UtcMillis::now().0);
+    let resolved_model = settings_store
+        .and_then(|store| resolve_orchestrator_model_config(store, Some(&request.session_id)).ok())
+        .and_then(|config| config.to_usage_llm_config())
+        .map(|config| config.model)
+        .unwrap_or_default();
+    let prefill_tokens = estimate_chat_messages_tokens(messages)
+        .saturating_add(estimate_tool_definition_tokens(tools.as_deref()));
+    publish_context_usage_update(
+        event_bus,
+        &request.session_id,
+        &request.workspace_id,
+        Some(&request.turn_id),
+        &call_id,
+        &resolved_model,
+        prefill_tokens as u64,
+        "prefill",
+        "estimated",
+    );
+    let last_context_usage_emit_at = std::cell::Cell::new(0_u64);
+    let last_context_usage_tokens = std::cell::Cell::new(prefill_tokens as u64);
     let on_delta = |delta: &ModelStreamingDelta| {
         if !request_turn_is_writable(session_store, request) {
             writeback_aborted.set(true);
             return;
+        }
+        let estimated_output_tokens = estimate_text_tokens(&delta.content)
+            .saturating_add(estimate_text_tokens(&delta.thinking));
+        let estimated_context_tokens =
+            (prefill_tokens as u64).saturating_add(estimated_output_tokens as u64);
+        let now = UtcMillis::now().0;
+        let previous_tokens = last_context_usage_tokens.get();
+        if last_context_usage_emit_at.get() == 0
+            || now.saturating_sub(last_context_usage_emit_at.get()) >= 300
+            || estimated_context_tokens.saturating_sub(previous_tokens) >= 128
+        {
+            publish_context_usage_update(
+                event_bus,
+                &request.session_id,
+                &request.workspace_id,
+                Some(&request.turn_id),
+                &call_id,
+                &resolved_model,
+                estimated_context_tokens,
+                "streaming",
+                "estimated",
+            );
+            last_context_usage_emit_at.set(now);
+            last_context_usage_tokens.set(estimated_context_tokens);
         }
         let accumulated_thinking = delta.thinking.as_str();
         if accumulated_thinking.len() > last_thinking_len.get() {
@@ -973,7 +1145,6 @@ fn stream_session_turn_round(
             retry_event,
         );
     };
-    let call_id = format!("session-turn-{round}-{}", UtcMillis::now().0);
     let response = match client.invoke_streaming_with_cancellation(
         ModelInvocationRequest {
             provider: BUSINESS_MODEL_PROVIDER.to_string(),
@@ -1754,7 +1925,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &store,
             conversation_registry: registry.as_ref(),
-            plan_store: &crate::test_plan_store("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-plan"),
             settings_store: None,
             safety_gate: None,
             tool_registry: None,
@@ -1927,7 +2098,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_invalid_state_pauses_in_progress_todo() {
+    fn runtime_invalid_state_pauses_active_plan() {
         let session_id = SessionId::new("session-runtime-invalid-state");
         let store = Arc::new(SessionStore::new());
         store
@@ -1949,12 +2120,18 @@ mod tests {
             .expect("current turn should be stored");
         let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
         plan_store
-            .write(vec![magi_core::TodoItem::new(
-                "继续处理当前步骤",
-                "正在处理当前步骤",
-                magi_core::TodoStatus::InProgress,
-            )])
-            .expect("todo should write");
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("continue-current-step".to_string()),
+                    step: "继续处理当前步骤".to_string(),
+                    status: magi_core::PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should write");
         let client = StreamingTextModelBridgeClient {
             delta_content: "不会执行".to_string(),
             payload: serde_json::json!({
@@ -2009,10 +2186,9 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(
-            plan_store.snapshot()[0].status,
-            magi_core::TodoStatus::Pending
-        );
+        let plan = plan_store.snapshot().expect("plan should remain visible");
+        assert_eq!(plan.state, magi_core::PlanState::Paused);
+        assert_eq!(plan.items[0].status, magi_core::PlanItemStatus::InProgress);
     }
 
     #[test]
@@ -2058,12 +2234,18 @@ mod tests {
         let event_bus = InMemoryEventBus::new(16);
         let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
         plan_store
-            .write(vec![magi_core::TodoItem::new(
-                "继续处理当前步骤",
-                "正在处理当前步骤",
-                magi_core::TodoStatus::InProgress,
-            )])
-            .expect("todo should write");
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("continue-current-step".to_string()),
+                    step: "继续处理当前步骤".to_string(),
+                    status: magi_core::PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should write");
         let request = SessionTurnExecutionRequest {
             session_id: session_id.clone(),
             turn_id: "turn-empty-response-layer".to_string(),
@@ -2121,10 +2303,9 @@ mod tests {
             item.kind == "assistant_error"
                 && item.content.as_deref() == Some(error.public_message.as_str())
         }));
-        assert_eq!(
-            plan_store.snapshot()[0].status,
-            magi_core::TodoStatus::Pending
-        );
+        let plan = plan_store.snapshot().expect("plan should remain visible");
+        assert_eq!(plan.state, magi_core::PlanState::Paused);
+        assert_eq!(plan.items[0].status, magi_core::PlanItemStatus::InProgress);
     }
 
     #[test]
@@ -2191,7 +2372,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &store,
             conversation_registry: &ConversationRegistry::new(),
-            plan_store: &crate::test_plan_store("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-plan"),
             settings_store: None,
             safety_gate: None,
             tool_registry: None,
@@ -2296,7 +2477,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &store,
             conversation_registry: &ConversationRegistry::new(),
-            plan_store: &crate::test_plan_store("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-plan"),
             settings_store: None,
             safety_gate: None,
             tool_registry: None,
@@ -2408,7 +2589,7 @@ mod tests {
                 client: &client,
                 event_bus: &event_bus,
                 session_store: &store,
-                plan_store: &crate::test_plan_store("test-todo-ledger"),
+                plan_store: &crate::test_plan_store("test-plan"),
                 settings_store: None,
                 safety_gate: None,
                 request: &request,
@@ -2532,7 +2713,7 @@ mod tests {
                 client: &RetryEventModelBridgeClient,
                 event_bus: &event_bus,
                 session_store: &store,
-                plan_store: &crate::test_plan_store("test-todo-ledger"),
+                plan_store: &crate::test_plan_store("test-plan"),
                 settings_store: None,
                 safety_gate: None,
                 request: &request,
@@ -2722,7 +2903,9 @@ mod tests {
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
-        let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
+        let history = canonical_session_turn_history(&store, &request);
+        let messages =
+            build_session_turn_messages(&store, &request, &request.prompt, None, &history);
 
         assert_eq!(
             messages
@@ -2849,7 +3032,9 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
+        let history = canonical_session_turn_history(&store, &request);
+        let messages =
+            build_session_turn_messages(&store, &request, &request.prompt, None, &history);
         let contents = messages
             .iter()
             .filter_map(|message| message.content.as_deref())
@@ -2995,7 +3180,9 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
+        let history = canonical_session_turn_history(&store, &request);
+        let messages =
+            build_session_turn_messages(&store, &request, &request.prompt, None, &history);
 
         assert!(messages.iter().any(|message| {
             message
@@ -3046,7 +3233,9 @@ mod tests {
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
-        let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
+        let history = canonical_session_turn_history(&store, &request);
+        let messages =
+            build_session_turn_messages(&store, &request, &request.prompt, None, &history);
 
         assert_eq!(messages[0].role, "system");
         let context = messages[0].content.as_deref().unwrap_or_default();
@@ -3098,7 +3287,9 @@ mod tests {
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
-        let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
+        let history = canonical_session_turn_history(&store, &request);
+        let messages =
+            build_session_turn_messages(&store, &request, &request.prompt, None, &history);
         let reference_context = messages
             .iter()
             .filter_map(|message| message.content.as_deref())
@@ -3142,11 +3333,11 @@ mod tests {
         };
 
         let messages = build_session_turn_messages(
-            None,
             &store,
             &request,
             &request.prompt,
             Some("[reference:knowledge:adr] 单一事实源\n只读投影来自事件事实。"),
+            &canonical_session_turn_history(&store, &request),
         );
 
         let knowledge = messages
@@ -3217,7 +3408,9 @@ mod tests {
             workspace_root_path: None,
         };
 
-        let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
+        let history = canonical_session_turn_history(&store, &request);
+        let messages =
+            build_session_turn_messages(&store, &request, &request.prompt, None, &history);
         let current_user_message = messages.last().expect("current user message");
 
         assert_eq!(current_user_message.role, "user");
@@ -3268,7 +3461,9 @@ mod tests {
             workspace_root_path: Some("/tmp/current-project".to_string()),
         };
 
-        let messages = build_session_turn_messages(None, &store, &request, &request.prompt, None);
+        let history = canonical_session_turn_history(&store, &request);
+        let messages =
+            build_session_turn_messages(&store, &request, &request.prompt, None, &history);
 
         assert_eq!(
             messages
@@ -3291,6 +3486,25 @@ mod tests {
                 .contains("/tmp/current-project")
         );
         assert_eq!(messages[1].content.as_deref(), Some("解释一下当前状态"));
+
+        let goal_request = SessionTurnExecutionRequest {
+            goal_turn_mode: SessionGoalTurnMode::Start,
+            ..request
+        };
+        let goal_history = canonical_session_turn_history(&store, &goal_request);
+        let goal_messages = build_session_turn_messages(
+            &store,
+            &goal_request,
+            &goal_request.prompt,
+            None,
+            &goal_history,
+        );
+        assert!(
+            goal_messages[0].content.as_deref().is_some_and(|content| {
+                content.contains("计划语言规则") && content.contains("locale=zh-CN")
+            }),
+            "目标模式才应注入计划语言规则"
+        );
     }
 
     #[test]
@@ -3427,6 +3641,101 @@ mod tests {
                 .iter()
                 .all(|entry| !entry.message.contains("最终答案来自工具后轮次。")),
             "完成态不能再反向写 completed snapshot 作为正文事实源"
+        );
+    }
+
+    #[test]
+    fn context_compaction_notice_is_persisted_as_renderable_system_item() {
+        let session_id = SessionId::new("session-context-compaction-notice");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "context compaction notice")
+            .expect("session should be creatable");
+        let (_, thread_id) = store.ensure_session_mission(&session_id, ts(1_000), || {
+            magi_core::MissionId::new("mission-context-compaction-notice")
+        });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-context-compaction-notice".to_string(),
+                    turn_seq: 1,
+                    accepted_at: ts(1_000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("继续对话".to_string()),
+                    items: vec![session_turn_item(
+                        "user_message",
+                        "completed",
+                        None,
+                        Some("继续对话".to_string()),
+                        Some("user-context-compaction-notice".to_string()),
+                        thread_id.clone(),
+                    )],
+                },
+            )
+            .expect("current turn should be stored");
+        let event_bus = InMemoryEventBus::new(16);
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: "turn-context-compaction-notice".to_string(),
+            workspace_id: Some(WorkspaceId::new("workspace-context-compaction-notice")),
+            prompt: "继续对话".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: false,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
+            workspace_root_path: None,
+        };
+        append_context_compaction_notice(
+            &event_bus,
+            &store,
+            &request,
+            &thread_id,
+            &ContextCompactionRecord {
+                reason: "context_window_pressure",
+                original_message_count: 42,
+                compacted_message_count: 9,
+                original_token_estimate: 180_000,
+                compacted_token_estimate: 36_000,
+                compacted_at: ts(1_001),
+            },
+            None,
+        );
+
+        let turn = store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| turn.turn_id == request.turn_id)
+            .expect("canonical turn should exist");
+        let notice = turn
+            .items
+            .iter()
+            .find(|item| item.kind == CanonicalTurnItemKind::SystemNotice)
+            .expect("context compaction notice should exist");
+        assert!(notice.visibility.renderable);
+        assert_eq!(
+            notice.metadata.get("noticeKind"),
+            Some(&serde_json::json!("context_compaction"))
+        );
+        assert_eq!(
+            notice.metadata.get("compactedTokenEstimate"),
+            Some(&serde_json::json!(36_000))
+        );
+        assert!(
+            event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .any(|event| event.event_type == "session.turn.item")
         );
     }
 

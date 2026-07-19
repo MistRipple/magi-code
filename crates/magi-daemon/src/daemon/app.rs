@@ -480,7 +480,15 @@ fn build_application_router(api_router: Router, frontend: &FrontendMode) -> Rout
         .merge(api_router);
 
     if static_assets.assets_dir.is_dir() {
-        app = app.nest_service("/assets", ServeDir::new(static_assets.assets_dir.clone()));
+        app = app.nest_service(
+            "/assets",
+            get_service(ServeDir::new(static_assets.assets_dir.clone())).layer(
+                SetResponseHeaderLayer::overriding(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static("public, max-age=31536000, immutable"),
+                ),
+            ),
+        );
     } else {
         warn!(
             path = %static_assets.assets_dir.display(),

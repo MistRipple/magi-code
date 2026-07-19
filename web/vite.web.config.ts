@@ -94,14 +94,10 @@ export default defineConfig(({ mode }) => {
           entryFileNames: 'assets/[name]-[hash].js',
           chunkFileNames: 'assets/[name]-[hash].js',
           assetFileNames: 'assets/[name]-[hash].[ext]',
-          manualChunks: {
-            mermaid: ['mermaid'],
-            highlight: ['highlight.js'],
-          },
         },
       },
-      sourcemap: 'inline',
-      minify: false,
+      sourcemap: false,
+      minify: 'esbuild',
     },
     server: {
       host: devHost,

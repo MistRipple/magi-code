@@ -547,6 +547,33 @@ function modelRetryRuntimeEnvelope(phase, sequence = 3) {
   };
 }
 
+function contextUsageEnvelope() {
+  return {
+    event_id: 'event-session-context-usage-streaming',
+    event_type: 'session.context.usage.updated',
+    category: 'domain',
+    occurred_at: ACCEPTED_AT + 2,
+    sequence: 3,
+    workspace_id: WORKSPACE_ID,
+    session_id: SESSION_ID,
+    payload: {
+      session_id: SESSION_ID,
+      workspace_id: WORKSPACE_ID,
+      turn_id: TURN_ID,
+      call_id: 'call-context-streaming',
+      resolved_model: 'gpt-5.6',
+      phase: 'streaming',
+      accuracy: 'estimated',
+      token_used: 24_000,
+      remaining_tokens: 248_000,
+      token_limit: 272_000,
+      usage_ratio: 24_000 / 272_000,
+      warning_level: 'normal',
+      updated_at: ACCEPTED_AT + 2,
+    },
+  };
+}
+
 function completedEnvelope() {
   const canonicalTurn = completedCanonicalTurn();
   const canonicalItem = completedCanonicalAssistantItem();
@@ -689,6 +716,25 @@ await withGoldenViteServer(async (server) => {
   await waitFor(
     () => messagesStore.messagesState.currentSessionId === SESSION_ID,
     'workspace-only page must adopt live accepted session',
+  );
+
+  recoveredStream.onmessage?.({ data: JSON.stringify(contextUsageEnvelope()) });
+  assert.deepEqual(
+    messagesStore.messagesState.orchestratorRuntimeState?.runtimeSnapshot?.budgetState,
+    {
+      tokenUsed: 24_000,
+      tokenLimit: 272_000,
+      remainingTokens: 248_000,
+      usageRatio: 24_000 / 272_000,
+      warningLevel: 'normal',
+      measurement: 'estimated',
+      phase: 'streaming',
+      updatedAt: ACCEPTED_AT + 2,
+      turnId: TURN_ID,
+      callId: 'call-context-streaming',
+      resolvedModel: 'gpt-5.6',
+    },
+    '运行中上下文用量必须通过 SSE 立即进入当前会话 runtime state',
   );
 
   recoveredStream.onmessage?.({ data: JSON.stringify(modelRetryRuntimeEnvelope('scheduled')) });

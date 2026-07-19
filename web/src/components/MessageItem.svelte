@@ -286,6 +286,20 @@
     warning: 'var(--warning)',
     info: 'var(--info)',
   };
+  function compactTokenLabel(value: unknown): string {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return '--';
+    if (value < 1000) return `${Math.max(0, Math.floor(value))}`;
+    return `${(value / 1000).toFixed(1)}k`;
+  }
+  const noticeText = $derived.by(() => {
+    if (message.metadata?.noticeKind === 'context_compaction') {
+      return i18n.t('messageItem.contextCompaction', {
+        before: compactTokenLabel(message.metadata.originalTokenEstimate),
+        after: compactTokenLabel(message.metadata.compactedTokenEstimate),
+      });
+    }
+    return message.content;
+  });
 
   const messageImages = $derived(message.images || []);
   const messageContextReferences = $derived(message.contextReferences || []);
@@ -309,13 +323,13 @@
 </script>
 
 <!-- 系统通知消息：居中显示（必须有实际文本内容才渲染） -->
-{#if isNotice && message.content && message.content.trim()}
+{#if isNotice && noticeText && noticeText.trim()}
   <div class="system-notice {noticeType}" data-message-id={message.id} data-turn-id={messageTurnId || undefined}>
     <span class="notice-icon" style="color: {noticeColors[noticeType] || noticeColors.info}">
       <Icon name={noticeIcons[noticeType] || 'info'} size={14} />
     </span>
     <span class="notice-text">
-      <ErrorDetailPopover text={message.content} maxInlineChars={96} />
+      <ErrorDetailPopover text={noticeText} maxInlineChars={96} />
     </span>
     <span class="notice-time">{formatTime(message.timestamp)}</span>
   </div>

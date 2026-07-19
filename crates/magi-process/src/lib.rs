@@ -706,10 +706,10 @@ fn resolve_process_environment() -> ProcessEnvironment {
             None => (inherited.clone(), "inherited"),
         };
         augment_standard_unix_path(&mut runtime_environment, &inherited);
-        return ProcessEnvironment {
+        ProcessEnvironment {
             overrides: environment_overrides(&inherited, runtime_environment),
             source,
-        };
+        }
     }
 
     #[cfg(not(unix))]

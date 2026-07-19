@@ -16,7 +16,8 @@ use magi_session_store::SessionStore;
 use magi_settings_store::SettingsStore;
 use magi_usage_authority::{
     ExecutionBindingIdentity, LlmConfig, UsageCallIdentity, UsageCallRecordInput, UsageCallStatus,
-    UsagePhase, UsageSourceRole, UsageTokenInput, prepare_llm_config_for_persistence,
+    UsagePhase, UsageSourceRole, UsageTokenInput, evaluate_context_budget,
+    prepare_llm_config_for_persistence, resolve_context_window,
 };
 use std::sync::Arc;
 
@@ -198,6 +199,53 @@ pub fn publish_model_usage_record_with_config(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn publish_context_usage_update(
+    event_bus: &InMemoryEventBus,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    turn_id: Option<&str>,
+    call_id: &str,
+    resolved_model: &str,
+    token_used: u64,
+    phase: &str,
+    accuracy: &str,
+) {
+    let context_window = resolve_context_window(resolved_model);
+    let budget = evaluate_context_budget(token_used as i64, context_window);
+    let updated_at = UtcMillis::now();
+    let payload = serde_json::json!({
+        "session_id": session_id.to_string(),
+        "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+        "turn_id": turn_id,
+        "call_id": call_id,
+        "resolved_model": resolved_model,
+        "phase": phase,
+        "accuracy": accuracy,
+        "token_used": budget.tokens_used.max(0) as u64,
+        "remaining_tokens": budget.remaining_tokens.max(0) as u64,
+        "token_limit": budget.context_window.max(0) as u64,
+        "usage_ratio": budget.usage_ratio,
+        "warning_level": budget.warning_level.as_str(),
+        "updated_at": updated_at.0,
+    });
+    let _ = event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "session-context-usage-{call_id}-{phase}-{token_used}-{}",
+                updated_at.0,
+            )),
+            "session.context.usage.updated",
+            payload,
+        )
+        .with_context(EventContext {
+            workspace_id: workspace_id.clone(),
+            session_id: Some(session_id.clone()),
+            ..EventContext::default()
+        }),
+    );
+}
+
 fn publish_model_usage_record_internal(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
@@ -236,6 +284,13 @@ fn publish_model_usage_record_internal(
         );
         return;
     };
+    let authoritative_context_tokens = usage
+        .total_tokens
+        .unwrap_or_else(|| usage.input_tokens.saturating_add(usage.output_tokens));
+    let resolved_model = model_config.model.clone();
+    let publishes_authoritative_context = binding.role == UsageSourceRole::Orchestrator
+        && status == UsageCallStatus::Success
+        && authoritative_context_tokens > 0;
     let Some(workspace_id) = workspace_id.as_ref() else {
         tracing::warn!(
             session_id = %session_id,
@@ -301,6 +356,19 @@ fn publish_model_usage_record_internal(
             ..EventContext::default()
         }),
     );
+    if publishes_authoritative_context {
+        publish_context_usage_update(
+            event_bus,
+            session_id,
+            &Some(workspace_id.clone()),
+            input.turn_id.as_deref(),
+            &input.call_identity.call_id,
+            &resolved_model,
+            authoritative_context_tokens,
+            "completed",
+            "authoritative",
+        );
+    }
 }
 
 pub fn account_active_goal_turn(
@@ -709,38 +777,41 @@ mod tests {
         );
 
         let snapshot = event_bus.snapshot();
-        assert_eq!(snapshot.recent_events.len(), 1);
-        assert_eq!(snapshot.recent_events[0].event_type, "model.usage.recorded");
+        assert_eq!(snapshot.recent_events.len(), 2);
+        let usage_event = snapshot
+            .recent_events
+            .iter()
+            .find(|event| event.event_type == "model.usage.recorded")
+            .expect("usage event should exist");
+        let context_event = snapshot
+            .recent_events
+            .iter()
+            .find(|event| event.event_type == "session.context.usage.updated")
+            .expect("authoritative context event should exist");
+        assert_eq!(usage_event.category, magi_event_bus::EventCategory::Usage);
+        assert_eq!(usage_event.workspace_id.as_ref(), workspace_id.as_ref());
+        assert_eq!(usage_event.payload["workspaceId"], json!("workspace-1"));
         assert_eq!(
-            snapshot.recent_events[0].category,
-            magi_event_bus::EventCategory::Usage
-        );
-        assert_eq!(
-            snapshot.recent_events[0].workspace_id.as_ref(),
-            workspace_id.as_ref()
-        );
-        assert_eq!(
-            snapshot.recent_events[0].payload["workspaceId"],
-            json!("workspace-1")
-        );
-        assert_eq!(
-            snapshot.recent_events[0].payload["modelConfig"]["model"],
+            usage_event.payload["modelConfig"]["model"],
             json!("gpt-session-test")
         );
         assert_eq!(
-            snapshot.recent_events[0].payload["modelConfig"]["reasoningEffort"],
+            usage_event.payload["modelConfig"]["reasoningEffort"],
             json!("high")
         );
+        assert!(usage_event.payload["modelConfig"].get("apiKey").is_none());
         assert!(
-            snapshot.recent_events[0].payload["modelConfig"]
-                .get("apiKey")
-                .is_none()
-        );
-        assert!(
-            !snapshot.recent_events[0]
+            !usage_event
                 .payload
                 .to_string()
                 .contains("secret-success-call-key")
+        );
+        assert_eq!(context_event.payload["accuracy"], json!("authoritative"));
+        assert_eq!(context_event.payload["phase"], json!("completed"));
+        assert_eq!(context_event.payload["token_used"], json!(10));
+        assert_eq!(
+            context_event.payload["resolved_model"],
+            json!("gpt-session-test")
         );
     }
 

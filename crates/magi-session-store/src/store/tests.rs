@@ -3,15 +3,16 @@ use crate::models::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurnStatus, ExecutionThread,
     ExecutionThreadStatus, GoalStatus, NotificationRecord, NotificationScope, SessionDurableState,
-    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionSidecarFlushReason,
-    SessionStoreState,
+    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionPlan,
+    SessionSidecarFlushReason, SessionStoreState,
 };
 use magi_core::{
-    AccessProfile, ExecutionOwnership, MissionId, RecoveryResumeInput, SessionId,
-    TaskExecutionTarget, TaskId, ThreadId, TodoItem, TodoStatus, UtcMillis, WorkerId, WorkspaceId,
+    AccessProfile, ExecutionOwnership, MissionId, PlanId, PlanItem, PlanItemId, PlanItemStatus,
+    PlanState, RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId, ThreadId, UtcMillis,
+    WorkerId, WorkspaceId,
 };
 use serde_json::json;
-use std::{thread, time::Duration};
+use std::{collections::HashMap, thread, time::Duration};
 
 fn test_turn(turn_id: &str, status: &str, accepted_at: u64) -> ActiveExecutionTurn {
     ActiveExecutionTurn {
@@ -188,34 +189,86 @@ fn goal_store_rejects_second_unfinished_goal_for_same_session() {
 }
 
 #[test]
-fn todo_list_is_session_scoped_and_survives_durable_restore() {
+fn plan_is_session_scoped_and_survives_durable_restore() {
     let store = SessionStore::new();
-    let session_a = SessionId::new("session-todo-a");
-    let session_b = SessionId::new("session-todo-b");
+    let session_a = SessionId::new("session-plan-a");
+    let session_b = SessionId::new("session-plan-b");
     store
-        .create_session(session_a.clone(), "todo a")
+        .create_session(session_a.clone(), "plan a")
         .expect("session a should create");
     store
-        .create_session(session_b.clone(), "todo b")
+        .create_session(session_b.clone(), "plan b")
         .expect("session b should create");
     store
-        .replace_todo_items(
+        .upsert_plan(
             &session_a,
-            vec![TodoItem::new(
-                "验证持久化",
-                "正在验证持久化",
-                TodoStatus::InProgress,
-            )],
+            SessionPlan {
+                plan_id: PlanId::new("plan-persistence"),
+                session_id: session_a.clone(),
+                revision: 1,
+                language: "zh-CN".to_string(),
+                state: PlanState::Active,
+                items: vec![PlanItem::new(
+                    PlanItemId::new("verify-persistence"),
+                    "验证持久化",
+                    PlanItemStatus::InProgress,
+                )],
+                task_bindings: HashMap::new(),
+                task_statuses: HashMap::new(),
+                updated_at: UtcMillis::now(),
+            },
+            Some(0),
         )
-        .expect("todo list should write");
+        .expect("plan should write");
 
     let restored = SessionStore::from_persisted_parts(
         store.durable_state(),
         SessionExecutionSidecarStoreState::default(),
     );
-    assert_eq!(restored.todo_items(&session_a).len(), 1);
-    assert_eq!(restored.todo_items(&session_a)[0].content, "验证持久化");
-    assert!(restored.todo_items(&session_b).is_empty());
+    let restored_plan = restored.plan(&session_a).expect("plan should restore");
+    assert_eq!(restored_plan.items.len(), 1);
+    assert_eq!(restored_plan.items[0].title, "验证持久化");
+    assert!(restored.plan(&session_b).is_none());
+}
+
+#[test]
+fn legacy_todo_list_payload_migrates_once_to_stable_session_plan() {
+    let source = SessionStore::new();
+    let session_id = SessionId::new("session-legacy-plan-migration");
+    source
+        .create_session(session_id.clone(), "legacy plan migration")
+        .expect("session should create");
+    let mut payload =
+        serde_json::to_value(source.durable_state()).expect("durable state should serialize");
+    let object = payload
+        .as_object_mut()
+        .expect("durable state should be object");
+    object.remove("plans");
+    object.insert(
+        "todo_lists".to_string(),
+        serde_json::json!([{
+            "sessionId": session_id,
+            "items": [{
+                "content": "迁移旧任务清单",
+                "activeForm": "正在迁移旧任务清单",
+                "status": "in_progress"
+            }],
+            "updatedAt": 42
+        }]),
+    );
+    let durable: SessionDurableState =
+        serde_json::from_value(payload).expect("legacy payload should deserialize");
+    let restored =
+        SessionStore::from_persisted_parts(durable, SessionExecutionSidecarStoreState::default());
+    let plan = restored
+        .plan(&session_id)
+        .expect("legacy plan should migrate");
+    assert!(!plan.plan_id.as_str().is_empty());
+    assert_eq!(plan.language, "zh-CN");
+    assert_eq!(plan.items.len(), 1);
+    assert!(!plan.items[0].item_id.as_str().is_empty());
+    assert_eq!(plan.items[0].title, "迁移旧任务清单");
+    assert_eq!(plan.items[0].status, PlanItemStatus::InProgress);
 }
 
 #[test]

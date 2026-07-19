@@ -109,7 +109,7 @@
     'tool_catalog': 'toolCall.displayName.toolCatalog',
     'agent_spawn': 'toolCall.displayName.agentSpawn',
     'agent_wait': 'toolCall.displayName.agentWait',
-    'todo_write': 'toolCall.displayName.todoWrite',
+    'update_plan': 'toolCall.displayName.updatePlan',
     'memory_write': 'toolCall.displayName.memoryWrite',
   };
 
@@ -244,7 +244,7 @@
       'tool_catalog': 'tool',
       'agent_spawn': 'bot',
       'agent_wait': 'hourglass',
-      'todo_write': 'list',
+      'update_plan': 'list',
       'memory_write': 'database',
     };
 

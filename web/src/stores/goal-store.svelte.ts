@@ -111,10 +111,26 @@ export function applySessionPlanSnapshot(
   sessionId: string,
   workspaceId: string,
   plan: SessionPlanDto | null,
+  eventPlanId?: string | null,
+  eventRevision?: number | null,
 ): boolean {
   const key = goalScopeKey(workspaceId, sessionId);
   const current = key ? goalStates[key] : null;
   if (!key || !current?.response) return false;
+  const currentPlan = current.response.plan ?? null;
+  const incomingPlanId = normalizeKey(plan?.planId ?? eventPlanId);
+  const incomingRevision = plan?.revision ?? eventRevision ?? null;
+  if (currentPlan && incomingPlanId && currentPlan.planId !== incomingPlanId) {
+    if (plan === null) return true;
+    return false;
+  } else if (
+    currentPlan
+    && typeof incomingRevision === 'number'
+    && Number.isFinite(incomingRevision)
+    && incomingRevision < currentPlan.revision
+  ) {
+    return true;
+  }
   writeGoalState(key, {
     response: {
       ...current.response,

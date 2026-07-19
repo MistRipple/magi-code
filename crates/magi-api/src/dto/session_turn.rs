@@ -75,9 +75,9 @@ impl SessionTurnRequestDto {
             .filter(|locale| !locale.is_empty())
             .filter(|locale| {
                 locale.len() <= 35
-                    && locale.chars().all(|character| {
-                        character.is_ascii_alphanumeric() || character == '-'
-                    })
+                    && locale
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '-')
             })
             .unwrap_or("zh-CN")
             .to_string()

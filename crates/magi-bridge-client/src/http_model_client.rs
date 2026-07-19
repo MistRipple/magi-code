@@ -2258,6 +2258,10 @@ mod tests {
             build_anthropic_messages_url_for_test("https://api.anthropic.com/v1/messages").unwrap(),
             "https://api.anthropic.com/v1/messages"
         );
+        assert_eq!(
+            build_anthropic_messages_url_for_test("https://api.deepseek.com/anthropic").unwrap(),
+            "https://api.deepseek.com/anthropic/v1/messages"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -55,7 +55,7 @@ use magi_settings_store::SettingsStore;
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
 use magi_usage_authority::UsagePhase;
 use magi_workspace::WorkspaceStore;
-use std::{path::PathBuf, sync::Arc};
+use std::{future::Future, path::PathBuf, sync::Arc};
 
 #[derive(Clone)]
 pub struct ExecutionPipeline {
@@ -129,6 +129,10 @@ pub struct LlmTaskDispatcher {
     /// 在测试和最小依赖场景下仍可工作；生产环境 daemon 必须显式注入以保持单一事实源。
     context_budget: Option<ContextBudget>,
     workspace_registry: Option<Arc<WorkspaceStore>>,
+    git_service: Option<Arc<magi_git::GitService>>,
+    session_code_contexts: Option<magi_git::SessionCodeContextRegistry>,
+    workspace_git_coordinator: Option<magi_git::WorkspaceGitOperationCoordinator>,
+    agent_worktree_root: PathBuf,
     tool_registry: Option<ToolRegistry>,
     skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
@@ -315,6 +319,10 @@ impl LlmTaskDispatcher {
             context_runtime: None,
             context_budget: None,
             workspace_registry: None,
+            git_service: None,
+            session_code_contexts: None,
+            workspace_git_coordinator: None,
+            agent_worktree_root: mission_state_root.join("worktrees"),
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -326,7 +334,7 @@ impl LlmTaskDispatcher {
                 magi_project_memory::ProjectMemoryRegistry::with_home(mission_state_root.clone()),
             ),
             mission_metrics_registry: Arc::new(MissionMetricsRegistry::with_home(
-                mission_state_root,
+                mission_state_root.clone(),
             )),
         }
     }
@@ -376,6 +384,24 @@ impl LlmTaskDispatcher {
 
     pub fn with_workspace_registry(mut self, registry: Arc<WorkspaceStore>) -> Self {
         self.workspace_registry = Some(registry);
+        self
+    }
+
+    pub fn with_git_context_runtime(
+        mut self,
+        git_service: Arc<magi_git::GitService>,
+        session_code_contexts: magi_git::SessionCodeContextRegistry,
+    ) -> Self {
+        self.git_service = Some(git_service);
+        self.session_code_contexts = Some(session_code_contexts);
+        self
+    }
+
+    pub fn with_workspace_git_coordinator(
+        mut self,
+        coordinator: magi_git::WorkspaceGitOperationCoordinator,
+    ) -> Self {
+        self.workspace_git_coordinator = Some(coordinator);
         self
     }
 
@@ -523,6 +549,7 @@ impl LlmTaskDispatcher {
             writebacks.apply(&self.pipeline.memory_store);
             self.publish_execution_overview(task, &session_id, &workspace_id, context_summary);
             self.push_result(task_id, lease_id, outcome.clone());
+            self.finalize_agent_worktree(task, &session_id, &workspace_id, is_sidechain);
             if should_extract_knowledge {
                 let execution_settings =
                     self.execution_settings_or_live(execution_settings_snapshot.as_ref());
@@ -541,6 +568,7 @@ impl LlmTaskDispatcher {
             return;
         }
         self.push_result(task_id, lease_id, outcome);
+        self.finalize_agent_worktree(task, &session_id, &workspace_id, is_sidechain);
     }
 
     fn extract_and_persist_knowledge(
@@ -1030,6 +1058,44 @@ fn task_streaming_entry_id(task: &magi_core::Task) -> String {
     format!("timeline-streaming-{}", task.task_id)
 }
 
+fn sanitize_git_path_component(value: &str) -> String {
+    let value = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let value = value.trim_matches('-');
+    if value.is_empty() {
+        "allocation".to_string()
+    } else {
+        value.chars().take(80).collect()
+    }
+}
+
+fn block_on_git<F>(future: F) -> F::Output
+where
+    F: Future + Send,
+    F::Output: Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("agent Git runtime should build")
+                    .block_on(future)
+            })
+            .join()
+            .expect("agent Git runtime thread should not panic")
+    })
+}
+
 fn tool_surface_access_profile(
     task: Option<&magi_core::Task>,
     access_profile: AccessProfile,
@@ -1048,7 +1114,18 @@ fn builtin_tool_visible_in_access_profile(
 }
 
 impl LlmTaskDispatcher {
-    fn resolve_workspace_root_path(&self, workspace_id: &Option<WorkspaceId>) -> Option<PathBuf> {
+    fn resolve_workspace_root_path(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+    ) -> Option<PathBuf> {
+        if let Some(context) = self
+            .session_code_contexts
+            .as_ref()
+            .and_then(|registry| registry.get(session_id.as_str()))
+        {
+            return Some(context.execution_root);
+        }
         let workspace_id = workspace_id.as_ref()?;
         self.workspace_registry
             .as_ref()?
@@ -1056,6 +1133,265 @@ impl LlmTaskDispatcher {
             .into_iter()
             .find(|workspace| workspace.workspace_id == *workspace_id)
             .map(|workspace| workspace.native_root_path())
+    }
+
+    /// 子代理永不直接复用主会话 live worktree：只读任务拿 detached worktree，
+    /// 可写任务拿继承 session base_head 的唯一临时 branch + 独立 worktree。
+    fn resolve_task_execution_root(
+        &self,
+        task: &magi_core::Task,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        is_sidechain: bool,
+        worker_id: Option<&WorkerId>,
+    ) -> Result<Option<PathBuf>, String> {
+        let main_root = self.resolve_workspace_root_path(session_id, workspace_id);
+        let context = self
+            .session_code_contexts
+            .as_ref()
+            .and_then(|registry| registry.get(session_id.as_str()));
+        if let Some(context) = context.as_ref()
+            && let Some(coordinator) = self.workspace_git_coordinator.as_ref()
+        {
+            coordinator
+                .begin_execution(session_id.as_str(), &context.git.git_common_dir)
+                .map_err(|error| error.to_string())?;
+        }
+        if !is_sidechain {
+            return Ok(main_root);
+        }
+        let Some(registry) = self.session_code_contexts.as_ref() else {
+            return Ok(main_root);
+        };
+        let Some(context) = context else {
+            // 非 Git workspace 没有 SessionGitContext，只能沿用普通 workspace 语义。
+            return Ok(main_root);
+        };
+        if let Some(existing) = context
+            .agent_worktrees
+            .iter()
+            .find(|worktree| worktree.task_id == task.task_id.as_str() && worktree.active)
+            && existing.path.is_dir()
+        {
+            return Ok(Some(existing.path.clone()));
+        }
+        if context.has_external_drift() {
+            return Err(format!(
+                "session Git context 已漂移，拒绝为子代理 {} 分配 worktree",
+                task.task_id
+            ));
+        }
+        let Some(base_head) = context.git.base_head.clone() else {
+            return Err("当前 Git session 没有 base HEAD，无法隔离子代理".to_string());
+        };
+        let git_service = self
+            .git_service
+            .as_ref()
+            .ok_or_else(|| "Git service 未注入，无法隔离子代理".to_string())?;
+        let workspace_key = workspace_id
+            .as_ref()
+            .map(|value| sanitize_git_path_component(value.as_str()))
+            .unwrap_or_else(|| "workspace".to_string());
+        let session_key = sanitize_git_path_component(session_id.as_str());
+        let task_key = sanitize_git_path_component(task.task_id.as_str());
+        let allocation_nonce = UtcMillis::now().0;
+        let path = self
+            .agent_worktree_root
+            .join(workspace_key)
+            .join(session_key)
+            .join(format!("{task_key}-{allocation_nonce}"));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("创建 agent worktree 父目录失败: {error}"))?;
+        }
+        let access_profile = task
+            .policy_snapshot
+            .as_ref()
+            .map(magi_core::TaskPolicy::effective_access_profile)
+            .unwrap_or_default();
+        let mode = if access_profile == AccessProfile::ReadOnly {
+            magi_git::AgentWorktreeMode::ReadOnly
+        } else {
+            magi_git::AgentWorktreeMode::Writable
+        };
+        let branch = (mode == magi_git::AgentWorktreeMode::Writable)
+            .then(|| format!("magi/agent/{task_key}-{allocation_nonce}"));
+        let created = block_on_git(git_service.worktree_create(
+            &context.git.worktree_path,
+            magi_git::WorktreeCreateOptions {
+                path: path.clone(),
+                base: base_head.clone(),
+                branch: branch.clone(),
+                create_branch: branch.is_some(),
+                detached: branch.is_none(),
+                precondition: context.precondition(),
+            },
+        ))
+        .map_err(|error| format!("创建 agent 隔离 worktree 失败: {error}"))?;
+        registry
+            .register_agent_worktree(
+                session_id.as_str(),
+                magi_git::AgentWorktreeContext {
+                    task_id: task.task_id.to_string(),
+                    worker_id: worker_id.map(ToString::to_string).unwrap_or_default(),
+                    path: created.path.clone(),
+                    mode,
+                    base_head,
+                    branch: created.branch.clone(),
+                    active: true,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        if let Some(persist) = self.session_state_persist_callback.as_deref() {
+            persist("agent_worktree_allocated");
+        }
+        self.event_bus.publish(
+            EventEnvelope::domain(
+                EventId::new(format!(
+                    "agent-worktree-allocated-{}-{}",
+                    task.task_id, allocation_nonce
+                )),
+                "agent.git.worktree.allocated",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "workspace_id": workspace_id,
+                    "task_id": task.task_id,
+                    "worker_id": worker_id,
+                    "mode": mode,
+                    "base_head": context.git.base_head,
+                    "branch": created.branch,
+                    "worktree_path": created.path,
+                }),
+            )
+            .with_context(EventContext {
+                session_id: Some(session_id.clone()),
+                workspace_id: workspace_id.clone(),
+                mission_id: Some(task.mission_id.clone()),
+                task_id: Some(task.task_id.clone()),
+                ..EventContext::default()
+            }),
+        );
+        Ok(Some(path))
+    }
+
+    /// 子代理模型调用结束后立即结束 worktree 的 active 生命周期。
+    ///
+    /// 干净的 detached/writable worktree 都安全移除；writable 对应的 branch 保留，
+    /// 供主对话审阅和 merge。存在未提交改动或安全移除失败时保留目录与分配记录，
+    /// 但标记为 inactive，避免后续任务误认为仍由 worker 占用。绝不使用 force。
+    fn finalize_agent_worktree(
+        &self,
+        task: &magi_core::Task,
+        session_id: &SessionId,
+        workspace_id: &Option<WorkspaceId>,
+        is_sidechain: bool,
+    ) {
+        if !is_sidechain {
+            return;
+        }
+        let (Some(registry), Some(git_service)) = (
+            self.session_code_contexts.as_ref(),
+            self.git_service.as_ref(),
+        ) else {
+            return;
+        };
+        let Some(context) = registry.get(session_id.as_str()) else {
+            return;
+        };
+        let Some(allocation) = context
+            .agent_worktrees
+            .iter()
+            .find(|worktree| worktree.task_id == task.task_id.as_str() && worktree.active)
+            .cloned()
+        else {
+            return;
+        };
+
+        let (cleanup_status, retained, cleanup_error) = if !allocation.path.exists() {
+            ("already_missing", false, None)
+        } else {
+            match block_on_git(git_service.observe(&allocation.path)) {
+                Ok(observation) if observation.dirty.has_uncommitted => (
+                    "retained_dirty",
+                    true,
+                    Some(format!(
+                        "子代理 worktree 含未提交改动：staged={} unstaged={} untracked={} conflicted={}",
+                        observation.dirty.staged,
+                        observation.dirty.unstaged,
+                        observation.dirty.untracked,
+                        observation.dirty.conflicted_paths.len()
+                    )),
+                ),
+                Ok(_) => match block_on_git(git_service.worktree_remove(
+                    &context.git.worktree_path,
+                    magi_git::WorktreeRemoveOptions {
+                        path: allocation.path.clone(),
+                        force: false,
+                        confirm_force: false,
+                        precondition: context.precondition(),
+                    },
+                )) {
+                    Ok(_) => ("removed", false, None),
+                    Err(error) => ("retained_cleanup_failed", true, Some(error.to_string())),
+                },
+                Err(error) => ("retained_observation_failed", true, Some(error.to_string())),
+            }
+        };
+
+        if let Err(error) =
+            registry.release_agent_worktree(session_id.as_str(), task.task_id.as_str())
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                task_id = %task.task_id,
+                %error,
+                "结束 agent worktree 生命周期失败"
+            );
+            return;
+        }
+        if let Some(persist) = self.session_state_persist_callback.as_deref() {
+            persist("agent_worktree_released");
+        }
+        if retained {
+            tracing::warn!(
+                session_id = %session_id,
+                task_id = %task.task_id,
+                worktree_path = %allocation.path.display(),
+                cleanup_status,
+                cleanup_error = cleanup_error.as_deref().unwrap_or_default(),
+                "子代理 worktree 已结束执行但保留目录"
+            );
+        }
+        self.event_bus.publish(
+            EventEnvelope::domain(
+                EventId::new(format!(
+                    "agent-worktree-released-{}-{}",
+                    task.task_id,
+                    UtcMillis::now().0
+                )),
+                "agent.git.worktree.released",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "workspace_id": workspace_id,
+                    "task_id": task.task_id,
+                    "worker_id": allocation.worker_id,
+                    "mode": allocation.mode,
+                    "base_head": allocation.base_head,
+                    "branch": allocation.branch,
+                    "worktree_path": allocation.path,
+                    "cleanup_status": cleanup_status,
+                    "retained": retained,
+                    "cleanup_error": cleanup_error,
+                }),
+            )
+            .with_context(EventContext {
+                session_id: Some(session_id.clone()),
+                workspace_id: workspace_id.clone(),
+                mission_id: Some(task.mission_id.clone()),
+                task_id: Some(task.task_id.clone()),
+                ..EventContext::default()
+            }),
+        );
     }
 
     fn task_fact_context_parts(&self, task: &magi_core::Task) -> Vec<String> {
@@ -1454,12 +1790,21 @@ impl LlmTaskDispatcher {
         ) {
             Ok(client) => client,
             Err(_) => {
-                if let Err(todo_error) = plan_store.pause() {
-                    tracing::warn!(
+                match plan_store.pause() {
+                    Ok(Some(plan)) => magi_plan::publish_plan_event(
+                        &self.event_bus,
+                        magi_plan::plan_event_type(&plan),
+                        &plan,
+                        request.workspace_id.as_ref(),
+                        None,
+                        None,
+                    ),
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(
                         session_id = %request.session_id,
-                        error = %todo_error,
-                        "模型配置解析失败后暂停 PlanStore 进行项失败"
-                    );
+                        %error,
+                        "模型配置解析失败后暂停计划失败"
+                    ),
                 }
                 return Err(SessionTurnExecutionError {
                 reason:
@@ -1580,7 +1925,26 @@ impl LlmTaskDispatcher {
         let (prompt, context_summary) =
             self.assemble_prompt(execution_settings, task, session_id, workspace_id);
         let prompt = self.apply_skill_prompt_injections(prompt, skill_name.as_deref());
-        let workspace_root_path = self.resolve_workspace_root_path(workspace_id);
+        let workspace_identity_root_path =
+            self.resolve_workspace_root_path(session_id, workspace_id);
+        let workspace_root_path = match self.resolve_task_execution_root(
+            task,
+            session_id,
+            workspace_id,
+            is_sidechain,
+            worker_id,
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::error!(
+                    task_id = %task.task_id,
+                    session_id = %session_id,
+                    %error,
+                    "拒绝在未隔离的 Git workspace 中启动子代理"
+                );
+                return (TaskOutcome::Failed { error }, None);
+            }
+        };
 
         let tools = if use_tools {
             let access_profile = task
@@ -1601,7 +1965,7 @@ impl LlmTaskDispatcher {
 
         let safety_gate = self.build_safety_gate(execution_settings);
         let plan_store = magi_plan::PlanStore::new(self.session_store.clone(), session_id.clone());
-        let project_memory = workspace_root_path.as_ref().and_then(|path| {
+        let project_memory = workspace_identity_root_path.as_ref().and_then(|path| {
             let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
             match self.project_memory_registry.get_or_open(&workspace_root) {
                 Ok(store) => Some(store),
@@ -1611,7 +1975,7 @@ impl LlmTaskDispatcher {
                 }
             }
         });
-        let mission_metrics = if let Some(path) = workspace_root_path.as_ref() {
+        let mission_metrics = if let Some(path) = workspace_identity_root_path.as_ref() {
             let workspace_root = magi_core::WorkspaceRootPath::new(path.to_string_lossy());
             match self.mission_metrics_registry.get_or_open(&workspace_root) {
                 Ok(store) => Some(store),
@@ -1628,7 +1992,7 @@ impl LlmTaskDispatcher {
             None
         };
         let snapshot_session = self.snapshot_manager.as_ref().and_then(|manager| {
-            workspace_root_path
+            workspace_identity_root_path
                 .as_ref()
                 .and_then(|root| manager.get_session_for_workspace(session_id.as_str(), root))
         });
@@ -2309,8 +2673,174 @@ mod tests {
         .with_tool_registry(tool_registry)
     }
 
+    fn git_fixture(path: &std::path::Path, args: &[&str]) {
+        let output = magi_process::std_command("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .expect("git fixture command should start");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
-    fn session_turn_model_configuration_failure_pauses_todo() {
+    fn sidechain_inherits_session_base_in_independent_worktree() {
+        let fixture = tempfile::tempdir().expect("fixture root");
+        let repository = fixture.path().join("repo");
+        std::fs::create_dir_all(&repository).expect("repo directory");
+        git_fixture(&repository, &["init", "-b", "main"]);
+        git_fixture(&repository, &["config", "user.name", "Magi Test"]);
+        git_fixture(&repository, &["config", "user.email", "magi@example.test"]);
+        std::fs::write(repository.join("README.md"), "base\n").expect("fixture file");
+        git_fixture(&repository, &["add", "README.md"]);
+        git_fixture(&repository, &["commit", "-m", "base"]);
+
+        let git_service = Arc::new(magi_git::GitService::new());
+        let observation = block_on_git(git_service.observe(&repository)).expect("observe repo");
+        let contexts = magi_git::SessionCodeContextRegistry::default();
+        contexts.accept(
+            "session-git-agent",
+            "workspace-git-agent",
+            vec![repository.clone()],
+            &observation,
+        );
+        let mut dispatcher = dispatcher_with_default_tool_surface()
+            .with_git_context_runtime(git_service, contexts.clone());
+        dispatcher.agent_worktree_root = fixture.path().join("agent-worktrees");
+        let task = task_with_role("executor", TaskTier::ExecutionChain);
+        let execution_root = dispatcher
+            .resolve_task_execution_root(
+                &task,
+                &SessionId::new("session-git-agent"),
+                &Some(WorkspaceId::new("workspace-git-agent")),
+                true,
+                Some(&WorkerId::new("worker-git-agent")),
+            )
+            .expect("agent root")
+            .expect("agent path");
+
+        assert_ne!(execution_root, repository);
+        let agent_head = magi_process::std_command("git")
+            .arg("-C")
+            .arg(&execution_root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("agent head");
+        assert!(agent_head.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&agent_head.stdout).trim(),
+            observation.head.as_deref().expect("base head")
+        );
+        let context = contexts.get("session-git-agent").expect("session context");
+        assert_eq!(context.agent_worktrees.len(), 1);
+        assert_eq!(
+            context.agent_worktrees[0].base_head,
+            observation.head.expect("head")
+        );
+        assert_eq!(
+            context.agent_worktrees[0].mode,
+            magi_git::AgentWorktreeMode::Writable
+        );
+        let agent_branch = context.agent_worktrees[0]
+            .branch
+            .clone()
+            .expect("writable agent branch");
+
+        dispatcher.finalize_agent_worktree(
+            &task,
+            &SessionId::new("session-git-agent"),
+            &Some(WorkspaceId::new("workspace-git-agent")),
+            true,
+        );
+
+        assert!(
+            !execution_root.exists(),
+            "clean agent worktree should be removed"
+        );
+        let context = contexts.get("session-git-agent").expect("released context");
+        assert!(!context.agent_worktrees[0].active);
+        assert!(
+            !context
+                .runtime_workspace_roots
+                .iter()
+                .any(|root| root == &execution_root)
+        );
+        git_fixture(
+            &repository,
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{agent_branch}"),
+            ],
+        );
+    }
+
+    #[test]
+    fn dirty_sidechain_worktree_is_retained_but_released_from_active_roots() {
+        let fixture = tempfile::tempdir().expect("fixture root");
+        let repository = fixture.path().join("repo");
+        std::fs::create_dir_all(&repository).expect("repo directory");
+        git_fixture(&repository, &["init", "-b", "main"]);
+        git_fixture(&repository, &["config", "user.name", "Magi Test"]);
+        git_fixture(&repository, &["config", "user.email", "magi@example.test"]);
+        std::fs::write(repository.join("README.md"), "base\n").expect("fixture file");
+        git_fixture(&repository, &["add", "README.md"]);
+        git_fixture(&repository, &["commit", "-m", "base"]);
+
+        let git_service = Arc::new(magi_git::GitService::new());
+        let observation = block_on_git(git_service.observe(&repository)).expect("observe repo");
+        let contexts = magi_git::SessionCodeContextRegistry::default();
+        contexts.accept(
+            "session-git-agent-dirty",
+            "workspace-git-agent-dirty",
+            vec![repository.clone()],
+            &observation,
+        );
+        let mut dispatcher = dispatcher_with_default_tool_surface()
+            .with_git_context_runtime(git_service, contexts.clone());
+        dispatcher.agent_worktree_root = fixture.path().join("agent-worktrees");
+        let task = task_with_role("executor", TaskTier::ExecutionChain);
+        let execution_root = dispatcher
+            .resolve_task_execution_root(
+                &task,
+                &SessionId::new("session-git-agent-dirty"),
+                &Some(WorkspaceId::new("workspace-git-agent-dirty")),
+                true,
+                Some(&WorkerId::new("worker-git-agent-dirty")),
+            )
+            .expect("agent root")
+            .expect("agent path");
+        std::fs::write(execution_root.join("uncommitted.txt"), "agent output\n")
+            .expect("dirty agent output");
+
+        dispatcher.finalize_agent_worktree(
+            &task,
+            &SessionId::new("session-git-agent-dirty"),
+            &Some(WorkspaceId::new("workspace-git-agent-dirty")),
+            true,
+        );
+
+        assert!(execution_root.exists(), "dirty worktree must be retained");
+        assert!(execution_root.join("uncommitted.txt").is_file());
+        let context = contexts
+            .get("session-git-agent-dirty")
+            .expect("released dirty context");
+        assert!(!context.agent_worktrees[0].active);
+        assert!(
+            !context
+                .runtime_workspace_roots
+                .iter()
+                .any(|root| root == &execution_root)
+        );
+    }
+
+    #[test]
+    fn session_turn_model_configuration_failure_pauses_plan() {
         let dispatcher = dispatcher_with_default_tool_surface();
         let session_id = SessionId::new("session-model-config-failure");
         let accepted_at = UtcMillis(2_000);
@@ -2364,12 +2894,18 @@ mod tests {
         let plan_store =
             magi_plan::PlanStore::new(dispatcher.session_store.clone(), session_id.clone());
         plan_store
-            .write(vec![magi_core::TodoItem::new(
-                "执行当前步骤",
-                "正在执行当前步骤",
-                magi_core::TodoStatus::InProgress,
-            )])
-            .expect("todo should persist");
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("execute-current-step".to_string()),
+                    step: "执行当前步骤".to_string(),
+                    status: magi_core::PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should persist");
 
         let result = dispatcher.execute_session_turn(SessionTurnExecutionRequest {
             session_id,
@@ -2392,10 +2928,9 @@ mod tests {
         });
 
         assert!(result.is_err());
-        assert_eq!(
-            plan_store.snapshot()[0].status,
-            magi_core::TodoStatus::Pending
-        );
+        let plan = plan_store.snapshot().expect("plan should remain visible");
+        assert_eq!(plan.state, magi_core::PlanState::Paused);
+        assert_eq!(plan.items[0].status, magi_core::PlanItemStatus::InProgress);
     }
 
     #[tokio::test]
@@ -2743,6 +3278,21 @@ mod tests {
             None,
             Some(&registry),
             BuiltinToolName::UpdateGoal
+        ));
+        assert!(task_can_see_builtin_tool(
+            None,
+            Some(&registry),
+            BuiltinToolName::GitBranchSwitch
+        ));
+        assert!(task_can_see_builtin_tool(
+            Some(&coordinator_task),
+            Some(&registry),
+            BuiltinToolName::GitMerge
+        ));
+        assert!(!task_can_see_builtin_tool(
+            Some(&worker_task),
+            Some(&registry),
+            BuiltinToolName::GitBranchSwitch
         ));
     }
 

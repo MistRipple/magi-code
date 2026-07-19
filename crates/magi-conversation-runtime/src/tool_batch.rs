@@ -484,14 +484,12 @@ fn execute_coordinator_tool(
                 );
             }
             let parent_canonical_name = task.canonical_task_name().unwrap_or("/root");
-            let canonical_task_name = format!(
-                "{}/{}",
-                parent_canonical_name.trim_end_matches('/'),
-                task_name
-            );
-            if task_store.get_children(&task.task_id).iter().any(|child| {
-                child.canonical_task_name() == Some(canonical_task_name.as_str())
-            }) {
+            let canonical_task_name = child_canonical_task_name(parent_canonical_name, &task_name);
+            if task_store
+                .get_children(&task.task_id)
+                .iter()
+                .any(|child| child.canonical_task_name() == Some(canonical_task_name.as_str()))
+            {
                 return (
                     serde_json::json!({
                         "tool": tool.as_str(),
@@ -730,7 +728,7 @@ fn execute_coordinator_tool(
                 match plan_store.bind_task(child_id.clone(), plan_item_id) {
                     Ok(plan) => magi_plan::publish_plan_event(
                         event_bus,
-                        "session.plan.updated",
+                        magi_plan::plan_event_type(&plan),
                         &plan,
                         workspace_id.as_ref(),
                         Some(&child_id),
@@ -825,10 +823,18 @@ fn execute_coordinator_tool(
 fn valid_agent_task_name(task_name: &str) -> bool {
     (1..=48).contains(&task_name.len())
         && task_name.chars().all(|character| {
-            character.is_ascii_lowercase()
-                || character.is_ascii_digit()
-                || character == '_'
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
         })
+}
+
+fn child_canonical_task_name(parent_name: &str, task_name: &str) -> String {
+    let parent_name = parent_name.trim().trim_end_matches('/');
+    let parent_name = if parent_name.is_empty() {
+        "/root"
+    } else {
+        parent_name
+    };
+    format!("{parent_name}/{task_name}")
 }
 
 pub(crate) fn execute_goal_tool(
@@ -2456,12 +2462,12 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let plan_store = crate::test_plan_store("test-todo-ledger");
         let session_id = SessionId::new("session-read-only-state-tool");
         let workspace_id = Some(WorkspaceId::new("workspace-read-only-state-tool"));
         session_store
             .create_session(session_id.clone(), "read only internal state")
             .expect("session should exist");
+        let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
         let mut task = coordinator_task(test_task(
             "task-read-only-state-tool",
             "task-read-only-state-tool",
@@ -2471,16 +2477,18 @@ mod tests {
         policy.access_profile = magi_core::AccessProfile::ReadOnly;
         task.policy_snapshot = Some(policy);
         let tool_call = ChatToolCall {
-            id: "tool-call-read-only-todo-write".to_string(),
+            id: "tool-call-read-only-plan-update".to_string(),
             kind: "function".to_string(),
             function: ChatToolFunction {
                 name: BuiltinToolName::UpdatePlan.as_str().to_string(),
                 arguments: serde_json::json!({
-                    "todos": [
+                    "expectedRevision": 0,
+                    "language": "zh-CN",
+                    "plan": [
                         {
-                            "content": "保持只读任务进度可见",
-                            "activeForm": "正在保持只读任务进度可见",
-                            "status": "pending"
+                            "itemId": "read-only-analysis",
+                            "step": "保持只读任务进度可见",
+                            "status": "in_progress"
                         }
                     ]
                 })
@@ -2510,14 +2518,11 @@ mod tests {
             None,
             &tool_call,
         );
-        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("todo payload json");
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("plan payload json");
 
         assert_eq!(status, ExecutionResultStatus::Succeeded);
         assert_eq!(parsed["status"].as_str(), Some("succeeded"));
-        assert!(
-            !plan_store.is_empty(),
-            "只读访问不能阻止会话内部任务清单更新"
-        );
+        assert!(!plan_store.is_empty(), "只读访问不能阻止会话内部计划更新");
     }
 
     #[test]
@@ -2529,7 +2534,7 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let plan_store = crate::test_plan_store("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-plan");
         let session_id = SessionId::new("session-goal-tool-state");
         let workspace_id = Some(WorkspaceId::new("workspace-goal-tool-state"));
         session_store
@@ -3472,7 +3477,7 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let plan_store = crate::test_plan_store("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-plan");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let mut tool_registry = ToolRegistry::new(
             Arc::new(magi_governance::GovernanceService::default()),
@@ -3542,7 +3547,7 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let plan_store = crate::test_plan_store("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-plan");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let mut tool_registry = ToolRegistry::new(
             Arc::new(magi_governance::GovernanceService::default()),
@@ -3615,7 +3620,7 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let plan_store = crate::test_plan_store("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-plan");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let mut tool_registry = ToolRegistry::new(
             Arc::new(magi_governance::GovernanceService::default()),
@@ -3755,7 +3760,7 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let plan_store = crate::test_plan_store("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-plan");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let mut tool_registry = ToolRegistry::new(
             Arc::new(magi_governance::GovernanceService::default()),
@@ -4012,6 +4017,20 @@ mod tests {
         assert!(
             !AGENT_SPAWN_STARTED_INSTRUCTION.contains("传入 child_task_id 收集"),
             "agent_spawn 回执不能把返回字段误写成 agent_wait 输入字段"
+        );
+    }
+
+    #[test]
+    fn agent_spawn_uses_stable_hierarchical_task_names() {
+        assert!(valid_agent_task_name("windows_validation"));
+        assert!(!valid_agent_task_name("Windows Validation"));
+        assert_eq!(
+            child_canonical_task_name("/root", "windows_validation"),
+            "/root/windows_validation"
+        );
+        assert_eq!(
+            child_canonical_task_name("/root/windows_validation", "path_test"),
+            "/root/windows_validation/path_test"
         );
     }
 
@@ -4349,7 +4368,7 @@ mod tests {
         let execution_registry = TaskExecutionRegistry::default();
         let conversation_registry = ConversationRegistry::new();
         let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
-        let plan_store = crate::test_plan_store("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-plan");
         let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
         let session_id = SessionId::new("session-tool-scope");
         let workspace_id = Some(WorkspaceId::new("workspace-tool-scope"));

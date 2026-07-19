@@ -151,10 +151,13 @@ async fn clear_current_goal(
             GoalStatus::Cleared,
         )
         .map_err(map_goal_domain_error)?;
-    state
-        .session_store
-        .clear_plan(&scope.session_id, None)
-        .map_err(map_goal_domain_error)?;
+    let plan_store =
+        magi_plan::PlanStore::new(state.session_store.clone(), scope.session_id.clone());
+    let cleared_plan = plan_store.snapshot();
+    plan_store.clear(None).map_err(map_plan_error)?;
+    if let Some(plan) = cleared_plan.as_ref() {
+        magi_plan::publish_plan_cleared_event(&state.event_bus, plan, Some(&scope.workspace_id));
+    }
     state.persist_session_state_checkpoint("goal_cleared")?;
     Ok(Json(goal_mutation_response(scope, None)))
 }
@@ -170,10 +173,13 @@ async fn clear_current_plan(
         request.workspace_path.as_deref(),
         "清除当前计划",
     )?;
-    state
-        .session_store
-        .clear_plan(&scope.session_id, None)
-        .map_err(map_goal_domain_error)?;
+    let plan_store =
+        magi_plan::PlanStore::new(state.session_store.clone(), scope.session_id.clone());
+    let cleared_plan = plan_store.snapshot();
+    plan_store.clear(None).map_err(map_plan_error)?;
+    if let Some(plan) = cleared_plan.as_ref() {
+        magi_plan::publish_plan_cleared_event(&state.event_bus, plan, Some(&scope.workspace_id));
+    }
     state.persist_session_state_checkpoint("session_plan_cleared")?;
     Ok(Json(current_goal_response(&state, scope)))
 }
@@ -200,6 +206,24 @@ async fn mutate_current_goal_status(
             status,
         )
         .map_err(map_goal_domain_error)?;
+    let plan_store =
+        magi_plan::PlanStore::new(state.session_store.clone(), scope.session_id.clone());
+    let plan = match status {
+        GoalStatus::Paused => plan_store.pause(),
+        GoalStatus::Active => plan_store.resume(),
+        _ => Ok(plan_store.snapshot()),
+    }
+    .map_err(map_plan_error)?;
+    if let Some(plan) = plan.as_ref() {
+        magi_plan::publish_plan_event(
+            &state.event_bus,
+            magi_plan::plan_event_type(plan),
+            plan,
+            Some(&scope.workspace_id),
+            None,
+            None,
+        );
+    }
     state.persist_session_state_checkpoint(checkpoint)?;
     Ok(Json(goal_mutation_response(scope, Some(goal))))
 }
@@ -236,66 +260,23 @@ fn map_goal_domain_error(error: DomainError) -> ApiError {
     }
 }
 
+fn map_plan_error(error: magi_plan::PlanUpdateError) -> ApiError {
+    ApiError::InvalidInput(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header::CONTENT_TYPE};
-    use magi_conversation_runtime::{
-        ConversationRegistry,
-        task_execution_dispatcher::{
-            ExecutionPipeline, LlmTaskDispatcher, LlmTaskDispatcherDependencies,
-        },
-        task_execution_registry::TaskExecutionRegistry,
-        task_runner_bridge::EventBasedResultReceiver,
-    };
+    use magi_core::PlanItemStatus;
     use magi_core::{AbsolutePath, SessionId, ThreadId, WorkspaceId};
-    use magi_core::{TodoItem, TodoStatus};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
-    use magi_memory_store::MemoryStore;
-    use magi_orchestrator::OrchestratorService;
     use magi_session_store::SessionStore;
-    use magi_tool_runtime::ToolRegistry;
     use magi_workspace::WorkspaceStore;
     use std::sync::Arc;
     use tower::ServiceExt;
-
-    fn test_dispatcher(
-        event_bus: Arc<InMemoryEventBus>,
-        session_store: Arc<SessionStore>,
-    ) -> Arc<LlmTaskDispatcher> {
-        let governance = Arc::new(GovernanceService::default());
-        let mut tool_registry = ToolRegistry::new(governance, Arc::clone(&event_bus));
-        tool_registry.register_default_builtins();
-        let orchestrator = OrchestratorService::new(Arc::clone(&event_bus));
-        let skill_runtime = magi_skill_runtime::SkillDispatchRuntime::new(
-            tool_registry.clone(),
-            magi_bridge_client::BridgeDispatchRuntime::new(),
-        );
-        let execution_runtime = orchestrator.execution_runtime(
-            magi_worker_runtime::WorkerRuntime::new(Arc::clone(&event_bus)),
-            tool_registry,
-            skill_runtime,
-        );
-        Arc::new(LlmTaskDispatcher::new(
-            event_bus,
-            ExecutionPipeline {
-                orchestrator,
-                execution_runtime,
-                memory_store: MemoryStore::new(),
-            },
-            LlmTaskDispatcherDependencies {
-                session_store,
-                execution_registry: TaskExecutionRegistry::default(),
-                result_receiver: Arc::new(EventBasedResultReceiver::new()),
-                spawn_graph: Arc::new(std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new())),
-                conversation_registry: Arc::new(ConversationRegistry::new()),
-                agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
-            },
-            std::env::temp_dir().join("magi-goal-route-dispatcher"),
-        ))
-    }
 
     #[tokio::test]
     async fn current_goal_route_reads_session_goal_without_task_projection() {
@@ -360,30 +341,22 @@ mod tests {
         );
         assert_eq!(payload["goal"]["objective"].as_str(), Some("完成 Goal API"));
         assert_eq!(payload["goal"]["status"].as_str(), Some("active"));
-        assert_eq!(
-            payload["todoItems"]
-                .as_array()
-                .expect("todoItems should be array")
-                .len(),
-            0
-        );
+        assert!(payload["plan"].is_null());
     }
 
     #[tokio::test]
-    async fn current_goal_route_preserves_completed_todo_history_after_reduced_write() {
+    async fn current_goal_route_returns_stable_revisioned_plan() {
         let event_bus = Arc::new(InMemoryEventBus::new(32));
         let session_store = Arc::new(SessionStore::default());
-        let dispatcher = test_dispatcher(Arc::clone(&event_bus), Arc::clone(&session_store));
         let state = ApiState::new(
             "magi-test",
             event_bus,
             Arc::clone(&session_store),
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
-        )
-        .with_session_turn_dispatcher(Arc::clone(&dispatcher));
-        let workspace_id = WorkspaceId::new("workspace-goal-todo-route");
-        let workspace_path = std::env::temp_dir().join("magi-goal-todo-route");
+        );
+        let workspace_id = WorkspaceId::new("workspace-goal-plan-route");
+        let workspace_path = std::env::temp_dir().join("magi-goal-plan-route");
         state
             .workspace_registry
             .register(
@@ -391,12 +364,12 @@ mod tests {
                 AbsolutePath::new(workspace_path.display().to_string()),
             )
             .expect("workspace should register");
-        let session_id = SessionId::new("session-goal-todo-route");
+        let session_id = SessionId::new("session-goal-plan-route");
         state
             .session_store
             .create_session_for_workspace(
                 session_id.clone(),
-                "goal todo route",
+                "goal plan route",
                 Some(workspace_id.to_string()),
             )
             .expect("session should be creatable");
@@ -404,28 +377,53 @@ mod tests {
             .session_store
             .create_goal(
                 session_id.clone(),
-                ThreadId::new("thread-goal-todo-route"),
-                "完成目标任务清单展示",
+                ThreadId::new("thread-goal-plan-route"),
+                "完成稳定计划展示",
                 magi_core::AccessProfile::Restricted,
                 None,
             )
             .expect("goal should be creatable");
         let plan_store = magi_plan::PlanStore::new(Arc::clone(&session_store), session_id.clone());
-        plan_store
-            .write(vec![
-                TodoItem::new("读取项目文档", "正在读取项目文档", TodoStatus::Completed),
-                TodoItem::new("扫描代码缺口", "正在扫描代码缺口", TodoStatus::Completed),
-                TodoItem::new("检查测试风险", "正在检查测试风险", TodoStatus::Completed),
-                TodoItem::new("汇总分析", "正在汇总分析", TodoStatus::InProgress),
-            ])
-            .expect("initial todo list should persist");
-        plan_store
-            .write(vec![TodoItem::new(
-                "汇总分析",
-                "正在汇总分析",
-                TodoStatus::Completed,
-            )])
-            .expect("reduced final todo snapshot should persist");
+        let created = plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![
+                    magi_plan::UpdatePlanItemInput {
+                        item_id: Some("inspect".to_string()),
+                        step: "检查现状".to_string(),
+                        status: PlanItemStatus::InProgress,
+                    },
+                    magi_plan::UpdatePlanItemInput {
+                        item_id: Some("verify".to_string()),
+                        step: "验证结果".to_string(),
+                        status: PlanItemStatus::Pending,
+                    },
+                ],
+            })
+            .expect("plan should create");
+        let updated = plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: Some(created.plan_id.to_string()),
+                expected_revision: Some(created.revision),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![
+                    magi_plan::UpdatePlanItemInput {
+                        item_id: Some("inspect".to_string()),
+                        step: "检查现状".to_string(),
+                        status: PlanItemStatus::Completed,
+                    },
+                    magi_plan::UpdatePlanItemInput {
+                        item_id: Some("verify".to_string()),
+                        step: "验证结果".to_string(),
+                        status: PlanItemStatus::InProgress,
+                    },
+                ],
+            })
+            .expect("plan should update");
 
         let app = Router::new().merge(routes()).with_state(state.clone());
         let response = app
@@ -444,22 +442,16 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let payload = response_json(response).await;
         assert_eq!(
-            payload["goal"]["objective"].as_str(),
-            Some("完成目标任务清单展示")
+            payload["plan"]["planId"].as_str(),
+            Some(updated.plan_id.as_str())
         );
-        let todo_items = payload["todoItems"]
-            .as_array()
-            .expect("todoItems should be array");
-        assert_eq!(todo_items.len(), 4);
-        assert_eq!(todo_items[0]["content"].as_str(), Some("读取项目文档"));
-        assert_eq!(todo_items[1]["content"].as_str(), Some("扫描代码缺口"));
-        assert_eq!(todo_items[2]["content"].as_str(), Some("检查测试风险"));
-        assert_eq!(todo_items[3]["content"].as_str(), Some("汇总分析"));
-        assert!(
-            todo_items
-                .iter()
-                .all(|item| item["status"].as_str() == Some("completed"))
-        );
+        assert_eq!(payload["plan"]["revision"].as_u64(), Some(updated.revision));
+        let items = payload["plan"]["items"].as_array().expect("plan items");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["itemId"].as_str(), Some("inspect"));
+        assert_eq!(items[0]["status"].as_str(), Some("completed"));
+        assert_eq!(items[1]["itemId"].as_str(), Some("verify"));
+        assert_eq!(items[1]["status"].as_str(), Some("in_progress"));
     }
 
     #[tokio::test]
@@ -499,6 +491,20 @@ mod tests {
                 Some(4096),
             )
             .expect("goal should be creatable");
+        let plan_store = magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
+        plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("execute".to_string()),
+                    step: "执行当前目标".to_string(),
+                    status: PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should be creatable");
 
         let app = Router::new().merge(routes()).with_state(state.clone());
         let scope_body = serde_json::json!({
@@ -528,6 +534,21 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let payload = response_json(response).await;
         assert_eq!(payload["goal"]["status"].as_str(), Some("paused"));
+        assert_eq!(
+            plan_store.snapshot().expect("plan should exist").state,
+            magi_core::PlanState::Paused
+        );
+        assert!(
+            state
+                .event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .any(|event| {
+                    event.event_type == "session.plan.paused"
+                        && event.payload["session_id"].as_str() == Some(session_id.as_str())
+                })
+        );
 
         let response = app
             .clone()
@@ -537,6 +558,21 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let payload = response_json(response).await;
         assert_eq!(payload["goal"]["status"].as_str(), Some("active"));
+        assert_eq!(
+            plan_store.snapshot().expect("plan should exist").state,
+            magi_core::PlanState::Active
+        );
+        assert!(
+            state
+                .event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .any(|event| {
+                    event.event_type == "session.plan.updated"
+                        && event.payload["session_id"].as_str() == Some(session_id.as_str())
+                })
+        );
 
         let active_goal = state
             .session_store
@@ -562,18 +598,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let payload = response_json(response).await;
         assert_eq!(payload["goal"]["status"].as_str(), Some("complete"));
-        state
-            .session_store
-            .replace_todo_items(
-                &session_id,
-                vec![TodoItem::new(
-                    "完成后待关闭的任务",
-                    "正在关闭任务",
-                    TodoStatus::Completed,
-                )],
-            )
-            .expect("todo list should write before clear");
-
         let response = app
             .clone()
             .oneshot(json_post("/goals/current/clear", scope_body))
@@ -582,7 +606,19 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let payload = response_json(response).await;
         assert!(payload["goal"].is_null());
-        assert!(state.session_store.todo_items(&session_id).is_empty());
+        assert!(state.session_store.plan(&session_id).is_none());
+        assert!(
+            state
+                .event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .any(|event| {
+                    event.event_type == "session.plan.cleared"
+                        && event.payload["session_id"].as_str() == Some(session_id.as_str())
+                        && event.payload["plan"].is_null()
+                })
+        );
 
         let response = app
             .oneshot(
@@ -599,11 +635,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let payload = response_json(response).await;
         assert!(payload["goal"].is_null());
-        assert_eq!(payload["todoItems"].as_array().map(Vec::len), Some(0));
+        assert!(payload["plan"].is_null());
     }
 
     #[tokio::test]
-    async fn completed_todo_list_can_be_cleared_without_removing_goal() {
+    async fn completed_plan_can_be_cleared_without_removing_goal() {
         let state = ApiState::new(
             "magi-test",
             Arc::new(InMemoryEventBus::new(32)),
@@ -611,8 +647,8 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         );
-        let workspace_id = WorkspaceId::new("workspace-goal-todo-clear");
-        let workspace_path = std::env::temp_dir().join("magi-goal-todo-clear");
+        let workspace_id = WorkspaceId::new("workspace-goal-plan-clear");
+        let workspace_path = std::env::temp_dir().join("magi-goal-plan-clear");
         state
             .workspace_registry
             .register(
@@ -620,12 +656,12 @@ mod tests {
                 AbsolutePath::new(workspace_path.display().to_string()),
             )
             .expect("workspace should register");
-        let session_id = SessionId::new("session-goal-todo-clear");
+        let session_id = SessionId::new("session-goal-plan-clear");
         state
             .session_store
             .create_session_for_workspace(
                 session_id.clone(),
-                "goal todo clear",
+                "goal plan clear",
                 Some(workspace_id.to_string()),
             )
             .expect("session should be creatable");
@@ -633,8 +669,8 @@ mod tests {
             .session_store
             .create_goal(
                 session_id.clone(),
-                ThreadId::new("thread-goal-todo-clear"),
-                "保留目标，仅关闭任务清单",
+                ThreadId::new("thread-goal-plan-clear"),
+                "保留目标，仅清除计划",
                 magi_core::AccessProfile::Restricted,
                 None,
             )
@@ -643,29 +679,45 @@ mod tests {
             .session_store
             .set_goal_status(&session_id, &goal.goal_id, GoalStatus::Complete)
             .expect("goal should complete");
-        state
-            .session_store
-            .replace_todo_items(
-                &session_id,
-                vec![TodoItem::new(
-                    "已完成任务",
-                    "正在完成任务",
-                    TodoStatus::Completed,
-                )],
-            )
-            .expect("todo list should write");
+        let plan_store = magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
+        let created = plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("done".to_string()),
+                    step: "已完成任务".to_string(),
+                    status: PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should create");
+        plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: Some(created.plan_id.to_string()),
+                expected_revision: Some(created.revision),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("done".to_string()),
+                    step: "已完成任务".to_string(),
+                    status: PlanItemStatus::Completed,
+                }],
+            })
+            .expect("plan should complete");
 
         let app = Router::new().merge(routes()).with_state(state.clone());
         let response = app
             .oneshot(json_post(
-                "/goals/current/todos/clear",
+                "/goals/current/plan/clear",
                 serde_json::json!({
                     "sessionId": session_id.to_string(),
                     "workspaceId": workspace_id.to_string(),
                 }),
             ))
             .await
-            .expect("todo clear should complete");
+            .expect("plan clear should complete");
 
         assert_eq!(response.status(), StatusCode::OK);
         let payload = response_json(response).await;
@@ -674,8 +726,8 @@ mod tests {
             Some(goal.goal_id.as_str())
         );
         assert_eq!(payload["goal"]["status"].as_str(), Some("complete"));
-        assert_eq!(payload["todoItems"].as_array().map(Vec::len), Some(0));
-        assert!(state.session_store.todo_items(&session_id).is_empty());
+        assert!(payload["plan"].is_null());
+        assert!(state.session_store.plan(&session_id).is_none());
     }
 
     fn json_post(path: &str, body: serde_json::Value) -> Request<Body> {

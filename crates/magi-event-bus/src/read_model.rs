@@ -336,6 +336,12 @@ pub struct SessionRuntimeUsageObservation {
     pub resolved_model: Option<String>,
     /// 观测对应的事件时间戳。
     pub observed_at: Option<UtcMillis>,
+    /// `estimated` 表示运行中估算，`authoritative` 表示 provider 最终 usage。
+    pub measurement: Option<String>,
+    /// 观测所处阶段：prefill / streaming / completed。
+    pub phase: Option<String>,
+    pub turn_id: Option<String>,
+    pub call_id: Option<String>,
 }
 
 /// 会话上下文预算快照,由 `magi-api` 装配 DTO 时填充。
@@ -2304,6 +2310,50 @@ fn infer_worker_stage(event: &EventEnvelope) -> Option<String> {
 /// （`status == "success"`）的当前请求上下文窗口 token 与解析模型名，
 /// 窗口大小的推断交由 magi-api 装配层完成。
 fn usage_observation_from_event(event: &EventEnvelope) -> Option<SessionRuntimeUsageObservation> {
+    if event.event_type == "session.context.usage.updated" {
+        let context_window_tokens = event
+            .payload
+            .get("token_used")
+            .and_then(serde_json::Value::as_u64)?;
+        if context_window_tokens == 0 {
+            return None;
+        }
+        return Some(SessionRuntimeUsageObservation {
+            context_window_tokens,
+            resolved_model: event
+                .payload
+                .get("resolved_model")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string),
+            observed_at: event
+                .payload
+                .get("updated_at")
+                .and_then(serde_json::Value::as_u64)
+                .map(UtcMillis)
+                .or(Some(event.occurred_at)),
+            measurement: event
+                .payload
+                .get("accuracy")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            phase: event
+                .payload
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            turn_id: event
+                .payload
+                .get("turn_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            call_id: event
+                .payload
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        });
+    }
     usage_observation_from_payload(&event.event_type, &event.payload)
 }
 
@@ -2425,6 +2475,17 @@ fn usage_observation_from_payload(
         context_window_tokens,
         resolved_model,
         observed_at,
+        measurement: Some("authoritative".to_string()),
+        phase: Some("completed".to_string()),
+        turn_id: payload
+            .get("turnId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        call_id: payload
+            .get("callIdentity")
+            .and_then(|identity| identity.get("callId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -3093,6 +3154,40 @@ mod tests {
         assert_eq!(observation.observed_at, Some(UtcMillis(1_700_000_000_000)));
         // event-bus 不计算窗口/告警,budget 留给 magi-api 装配。
         assert!(session.budget.is_none());
+    }
+
+    #[test]
+    fn live_context_usage_event_updates_session_observation_before_turn_completion() {
+        let mut context_event = EventEnvelope::domain(
+            EventId::new("event-live-context-usage"),
+            "session.context.usage.updated",
+            json!({
+                "token_used": 24_000,
+                "resolved_model": "gpt-5-codex",
+                "accuracy": "estimated",
+                "phase": "streaming",
+                "updated_at": 1_700_000_000_100_u64
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(SessionId::new("session-live-context")),
+            ..EventContext::default()
+        });
+        context_event.sequence = 1;
+
+        let read_model = RuntimeReadModelInput::from_events(&[context_event]);
+        let observation = read_model
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-live-context")
+            .and_then(|entry| entry.usage_observation.as_ref())
+            .expect("live context observation should exist");
+        assert_eq!(observation.context_window_tokens, 24_000);
+        assert_eq!(observation.resolved_model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(observation.observed_at, Some(UtcMillis(1_700_000_000_100)));
+        assert_eq!(observation.measurement.as_deref(), Some("estimated"));
+        assert_eq!(observation.phase.as_deref(), Some("streaming"));
     }
 
     #[test]

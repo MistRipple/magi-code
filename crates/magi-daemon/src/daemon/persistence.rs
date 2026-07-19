@@ -369,11 +369,15 @@ fn stale_backup_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::{SessionId, SessionLifecycleStatus, TodoItem, TodoStatus, UtcMillis};
+    use magi_core::{
+        PlanId, PlanItem, PlanItemId, PlanItemStatus, PlanState, SessionId, SessionLifecycleStatus,
+        UtcMillis,
+    };
     use magi_session_store::{
-        NotificationRecord, NotificationScope, SessionDurableState, SessionRecord, SessionTodoList,
+        NotificationRecord, NotificationScope, SessionDurableState, SessionPlan, SessionRecord,
         TimelineEntry, TimelineEntryKind,
     };
+    use std::collections::HashMap;
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -448,13 +452,19 @@ mod tests {
                 now,
             )],
             goals: vec![],
-            todo_lists: vec![SessionTodoList {
+            plans: vec![SessionPlan {
+                plan_id: PlanId::new("plan-persisted"),
                 session_id: session_id.clone(),
-                items: vec![TodoItem::new(
+                revision: 1,
+                language: "zh-CN".to_string(),
+                state: PlanState::Active,
+                items: vec![PlanItem::new(
+                    PlanItemId::new("restore-plan"),
                     "恢复目标任务清单",
-                    "正在恢复目标任务清单",
-                    TodoStatus::InProgress,
+                    PlanItemStatus::InProgress,
                 )],
+                task_bindings: HashMap::new(),
+                task_statuses: HashMap::new(),
                 updated_at: now,
             }],
         };
@@ -472,8 +482,8 @@ mod tests {
         assert_eq!(merged.sessions.len(), 1);
         assert_eq!(merged.timeline.len(), 1);
         assert_eq!(merged.notifications.len(), 1);
-        assert_eq!(merged.todo_lists.len(), 1);
-        assert_eq!(merged.todo_lists[0].items[0].content, "恢复目标任务清单");
+        assert_eq!(merged.plans.len(), 1);
+        assert_eq!(merged.plans[0].items[0].title, "恢复目标任务清单");
         assert_eq!(merged.current_session_id, Some(session_id));
 
         let _ = fs::remove_dir_all(state_root);

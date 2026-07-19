@@ -13,6 +13,7 @@ export interface ContextRingInput {
   lastCompactionReason?: string | null;
   originalTokenEstimate?: number | null;
   compactedTokenEstimate?: number | null;
+  measurement?: 'estimated' | 'authoritative' | null;
 }
 
 export interface ContextRingGeometry {
@@ -31,7 +32,7 @@ export interface ContextRingView {
 }
 
 export interface ContextRingDetailItem {
-  key: 'usage' | 'remaining' | 'limit' | 'compaction';
+  key: 'usage' | 'remaining' | 'limit' | 'compaction' | 'measurement';
   text: string;
 }
 
@@ -143,6 +144,9 @@ export function buildRingDetailItems(input: ContextRingInput, t: Translate): Con
     },
     { key: 'limit', text: t('input.contextRing.limit', { value: formatRingTokens(input.tokenLimit) }) },
   ];
+  if (input.measurement === 'estimated') {
+    items.unshift({ key: 'measurement', text: t('input.contextRing.estimated') });
+  }
   if (
     input.lastCompactionReason
     || (input.originalTokenEstimate != null && Number.isFinite(input.originalTokenEstimate))

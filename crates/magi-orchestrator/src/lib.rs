@@ -4,8 +4,6 @@ pub mod auto_learning;
 mod execution_overview;
 mod execution_runtime;
 mod execution_writeback;
-#[cfg(test)]
-pub(crate) mod plan_ledger;
 pub mod risk_policy;
 pub mod task_store;
 pub mod task_worker_catalog;

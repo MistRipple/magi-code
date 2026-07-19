@@ -224,6 +224,59 @@ await withGoldenViteServer(async (server) => {
     }
   }
 
+  const originalGitFetch = globalThis.fetch;
+  try {
+    const gitRequests = [];
+    globalThis.fetch = async (url, init) => {
+      gitRequests.push({
+        path: new URL(String(url)).pathname,
+        body: JSON.parse(String(init?.body ?? '{}')),
+      });
+      return new Response(JSON.stringify({ ok: true, data: [], observation: null }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    const expected = {
+      contextRevision: 7,
+      branch: 'main',
+      head: 'abc123',
+      worktreePath: '/tmp/workspace-query-golden',
+    };
+    await agentApi.fetchWorkspaceBranches();
+    await agentApi.previewWorkspaceMerge('feature', expected);
+    await agentApi.mergeWorkspaceBranch('feature', false, expected);
+    await agentApi.deleteWorkspaceBranch('obsolete', { force: true, confirmForce: true }, expected);
+    await agentApi.fetchWorkspaceWorktrees();
+    await agentApi.createWorkspaceWorktree('writable', { branch: 'agent/result' }, expected);
+    await agentApi.removeWorkspaceWorktree('/tmp/worktree', { force: true, confirmForce: true }, expected);
+
+    assert.deepEqual(
+      gitRequests.map((request) => request.path),
+      [
+        '/api/workspace/vcs/branches',
+        '/api/workspace/vcs/merge/preview',
+        '/api/workspace/vcs/merge',
+        '/api/workspace/vcs/branch/delete',
+        '/api/workspace/vcs/worktree/list',
+        '/api/workspace/vcs/worktree/create',
+        '/api/workspace/vcs/worktree/remove',
+      ],
+      'Git UI helpers must use only the structured workspace VCS endpoints',
+    );
+    assert.equal(gitRequests[0].body.includeRemote, true);
+    assert.equal(gitRequests[2].body.confirm, true);
+    assert.equal(gitRequests[3].body.confirmForce, true);
+    assert.equal(gitRequests[5].body.expectedContextRevision, 7);
+    assert.equal(gitRequests[6].body.expectedHead, 'abc123');
+  } finally {
+    if (originalGitFetch === undefined) {
+      delete globalThis.fetch;
+    } else {
+      globalThis.fetch = originalGitFetch;
+    }
+  }
+
   const originalWindow = globalThis.window;
   try {
     globalThis.window = {

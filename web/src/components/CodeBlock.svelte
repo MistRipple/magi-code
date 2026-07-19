@@ -1,8 +1,8 @@
 <script lang="ts">
   import { getContext } from 'svelte';
-  import hljs from 'highlight.js';
   import DiagramRenderer from './DiagramRenderer.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { highlightCode } from '../lib/code-highlighter';
   import { parseCodeBlockDiagramPayload } from '../lib/diagram-payload';
   import {
     dispatchFilePreviewEvent,
@@ -80,32 +80,29 @@
     // 只有非折叠状态才处理内容
     if (collapsed) return;
 
-    if (isStreaming) {
-      // 流式期间：只转义，不高亮。保证内容绝对可见且流畅。
-      highlightedHtml = safeEscape(trimmedCode);
-    } else {
-      const codeToHighlight = trimmedCode;
+    const codeToHighlight = trimmedCode;
+    highlightedHtml = safeEscape(codeToHighlight);
 
-      // 超长代码块跳过高亮，避免主线程阻塞
-      if (codeToHighlight.length > 50000) {
-        highlightedHtml = safeEscape(codeToHighlight);
-        return;
-      }
-      // 使用 setTimeout 宏任务，避免阻塞主线程（虽然 hljs 是同步的）
-      const timer = setTimeout(() => {
-        try {
-          if (language && hljs.getLanguage(language)) {
-            highlightedHtml = hljs.highlight(codeToHighlight, { language }).value;
-          } else {
-            highlightedHtml = safeEscape(codeToHighlight);
-          }
-        } catch (e) {
-          console.warn('[CodeBlock] 高亮失败:', e);
-          highlightedHtml = safeEscape(codeToHighlight);
-        }
-      }, 0);
-      return () => clearTimeout(timer);
+    if (isStreaming || diagramPayload) {
+      // 流式期间：只转义，不高亮。保证内容绝对可见且流畅。
+      return;
     }
+
+    // 超长代码块跳过高亮，避免主线程阻塞
+    if (codeToHighlight.length > 50000 || !language.trim()) return;
+
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      void highlightCode(codeToHighlight, language).then((result) => {
+        if (!cancelled && result !== null) highlightedHtml = result;
+      }).catch((error) => {
+        console.warn('[CodeBlock] 高亮失败:', error);
+      });
+    }, 0);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   });
 
   function toggle() {

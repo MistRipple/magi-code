@@ -16,6 +16,7 @@
     lastCompactionReason?: string | null;
     originalTokenEstimate?: number | null;
     compactedTokenEstimate?: number | null;
+    measurement?: 'estimated' | 'authoritative' | null;
   }
 
   let {
@@ -27,6 +28,7 @@
     lastCompactionReason = null,
     originalTokenEstimate = null,
     compactedTokenEstimate = null,
+    measurement = null,
   }: Props = $props();
 
   // 上下文窗口占用率圆环：只负责统计详情，不承载模型切换行为。
@@ -39,6 +41,7 @@
     lastCompactionReason,
     originalTokenEstimate,
     compactedTokenEstimate,
+    measurement,
   });
 
   const view = $derived(resolveRingView(input));
@@ -81,6 +84,7 @@
   <button
     type="button"
     class="ia-context-ring tone-{view.tone}"
+    class:estimating={measurement === 'estimated'}
     data-testid="context-usage-ring"
     onclick={toggleDetails}
     onkeydown={handleKeydown}
@@ -180,6 +184,21 @@
   .ring-fill {
     stroke: var(--primary);
     transition: stroke-dashoffset var(--transition-fast);
+  }
+
+  .ia-context-ring.estimating .ring-fill {
+    animation: context-ring-estimating 1.4s ease-in-out infinite;
+  }
+
+  @keyframes context-ring-estimating {
+    0%, 100% { opacity: 0.55; }
+    50% { opacity: 1; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .ia-context-ring.estimating .ring-fill {
+      animation: none;
+    }
   }
 
   .ia-context-popover {

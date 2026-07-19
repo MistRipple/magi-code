@@ -1202,14 +1202,14 @@ fn explicit_builtin_tool_intent(tool_name: &str) -> String {
 }
 
 fn goal_mode_tool_intent(request: &SessionTurnRequestDto) -> String {
-    let todo_required = goal_mode_requires_update_plan(request);
-    let todo_contract = if todo_required {
+    let plan_required = goal_mode_requires_update_plan(request);
+    let plan_contract = if plan_required {
         "用户显式要求任务清单或 update_plan：最终答复前必须调用 update_plan 写入与用户要求一致的任务状态；不要只创建 goal 后直接最终回复。"
     } else {
         "如果目标需要三步以上或跨轮推进，最终答复前必须先用 update_plan 建立简洁任务清单。"
     };
     format!(
-        "用户请求目标模式。必须按主线 Goal 工具推进：先调用 get_goal；若当前会话没有未完成目标，再调用 create_goal 创建完整目标；create_goal 的 token_budget 必须显式传值，用户原文未明确给出 token 预算时传 null，只有用户明确给出预算数值时才传对应整数，禁止自行臆造 1000、4096、16000 等预算。{todo_contract} 目标模式仍是主线对话，不要升级成旧任务 Tab 或普通 Execute 路由。"
+        "用户请求目标模式。必须按主线 Goal 工具推进：先调用 get_goal；若当前会话没有未完成目标，再调用 create_goal 创建完整目标；create_goal 的 token_budget 必须显式传值，用户原文未明确给出 token 预算时传 null，只有用户明确给出预算数值时才传对应整数，禁止自行臆造 1000、4096、16000 等预算。{plan_contract} 目标模式仍是主线对话，不要升级成旧任务 Tab 或普通 Execute 路由。"
     )
 }
 
@@ -1486,6 +1486,11 @@ async fn submit_regular_session_turn(
             ));
         }
     };
+    if superseded_turn.is_some() {
+        // 最近一轮被编辑替换后，内部模型历史必须失效并从 canonical turns 重建。
+        // 对话展示历史仍完整保留，下一次执行只会重新生成模型上下文快照。
+        invalidate_orchestrator_thread_history(&state, &session_id, accepted_at);
+    }
     if let Err(error) = state.persist_session_state_checkpoint("session_turn_accepted") {
         state.release_session_git_execution_lease(&session_id);
         state
@@ -1639,6 +1644,22 @@ fn apply_turn_orchestrator_session_override(
     super::settings::require_orchestrator_session_model(state, session_id)
 }
 
+fn invalidate_orchestrator_thread_history(
+    state: &ApiState,
+    session_id: &SessionId,
+    now: UtcMillis,
+) {
+    let Some(thread) = state
+        .session_store
+        .orchestrator_thread_for_session(session_id)
+    else {
+        return;
+    };
+    state
+        .session_store
+        .replace_thread_messages(&thread.thread_id, Vec::new(), now);
+}
+
 fn spawn_regular_session_turn_execution(
     state: ApiState,
     execution_request: SessionTurnExecutionRequest,
@@ -1755,12 +1776,21 @@ async fn observe_regular_session_turn_execution(
             );
             let plan_store =
                 magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
-            if let Err(todo_error) = plan_store.pause() {
-                tracing::warn!(
+            match plan_store.pause() {
+                Ok(Some(plan)) => magi_plan::publish_plan_event(
+                    &state.event_bus,
+                    magi_plan::plan_event_type(&plan),
+                    &plan,
+                    workspace_id.as_ref(),
+                    None,
+                    None,
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
                     session_id = %session_id,
-                    error = %todo_error,
-                    "普通对话执行线程异常后暂停 PlanStore 进行项失败"
-                );
+                    %error,
+                    "普通对话执行线程异常后暂停计划失败"
+                ),
             }
             let public_message = "对话执行线程异常退出，可直接继续重试。";
             if let Some(orchestrator_thread) = state
@@ -1788,6 +1818,7 @@ async fn observe_regular_session_turn_execution(
                     .session_store
                     .update_current_turn_status(&session_id, "failed");
             }
+            invalidate_orchestrator_thread_history(&state, &session_id, UtcMillis::now());
             record_active_goal_turn_failure(&state, &session_id);
             let _ = state.persist_session_durable_state();
             let event_id = EventId::new(format!("event-session-turn-failed-{}", accepted_at.0));
@@ -1835,6 +1866,7 @@ fn finalize_regular_session_turn_execution(
     match outcome {
         Ok(output) => {
             if output.interrupted {
+                invalidate_orchestrator_thread_history(&state, &session_id, UtcMillis::now());
                 finalize_regular_session_conversation_turn_if_current(
                     &state,
                     &session_id,
@@ -1912,6 +1944,7 @@ fn finalize_regular_session_turn_execution(
             let _ = state
                 .session_store
                 .update_current_turn_status(&session_id, "failed");
+            invalidate_orchestrator_thread_history(&state, &session_id, UtcMillis::now());
             record_active_goal_turn_failure(&state, &session_id);
             let _ = state.persist_session_durable_state();
             let event_id = EventId::new(format!("event-session-turn-failed-{}", accepted_at.0));
@@ -3024,8 +3057,19 @@ async fn interrupt_session_turn(
             );
         }
         let plan_store = magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
-        if let Err(error) = plan_store.pause() {
-            tracing::warn!(session_id = %session_id, %error, "中断对话后暂停 PlanStore 进行项失败");
+        match plan_store.pause() {
+            Ok(Some(plan)) => magi_plan::publish_plan_event(
+                &state.event_bus,
+                magi_plan::plan_event_type(&plan),
+                &plan,
+                workspace_id.as_ref(),
+                None,
+                None,
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(session_id = %session_id, %error, "中断对话后暂停计划失败")
+            }
         }
     }
 
@@ -3387,8 +3431,22 @@ fn cancel_active_session_turn_for_lifecycle(state: &ApiState, session_id: &Sessi
         false,
     );
     let plan_store = magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
-    if let Err(error) = plan_store.pause() {
-        tracing::warn!(session_id = %session_id, %error, "关闭会话后暂停 PlanStore 进行项失败");
+    let workspace_id = state
+        .session_store
+        .session(session_id)
+        .and_then(|session| session.workspace_id)
+        .map(magi_core::WorkspaceId::new);
+    match plan_store.pause() {
+        Ok(Some(plan)) => magi_plan::publish_plan_event(
+            &state.event_bus,
+            magi_plan::plan_event_type(&plan),
+            &plan,
+            workspace_id.as_ref(),
+            None,
+            None,
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(session_id = %session_id, %error, "关闭会话后暂停计划失败"),
     }
     true
 }
@@ -3829,6 +3887,29 @@ mod tests {
         )
     }
 
+    fn seed_active_plan(
+        session_store: &Arc<SessionStore>,
+        session_id: &SessionId,
+        item_id: &str,
+        step: &str,
+    ) -> magi_plan::PlanStore {
+        let plan_store = magi_plan::PlanStore::new(Arc::clone(session_store), session_id.clone());
+        plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some(item_id.to_string()),
+                    step: step.to_string(),
+                    status: magi_core::PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should persist");
+        plan_store
+    }
+
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "{prefix}-{}-{}",
@@ -3972,7 +4053,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn regular_session_turn_panic_releases_turn_and_pauses_todo() {
+    async fn regular_session_turn_panic_releases_turn_and_pauses_plan() {
         let state = test_state();
         let session_id = SessionId::new("session-regular-turn-panic");
         let workspace_id = WorkspaceId::new("workspace-regular-turn-panic");
@@ -4007,14 +4088,12 @@ mod tests {
             .expect("turn input should begin");
         crate::routes::begin_session_turn(&state, &session_id)
             .expect("conversation turn should begin");
-        let plan_store = magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
-        plan_store
-            .write(vec![magi_core::TodoItem::new(
-                "执行当前步骤",
-                "正在执行当前步骤",
-                magi_core::TodoStatus::InProgress,
-            )])
-            .expect("todo should persist");
+        let plan_store = seed_active_plan(
+            &state.session_store,
+            &session_id,
+            "execute-current-step",
+            "执行当前步骤",
+        );
 
         let join = tokio::task::spawn_blocking(
             || -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
@@ -4042,10 +4121,9 @@ mod tests {
             .and_then(|sidecar| sidecar.current_turn)
             .expect("failed turn should remain visible");
         assert_eq!(current_turn.status, "failed");
-        assert_eq!(
-            plan_store.snapshot()[0].status,
-            magi_core::TodoStatus::Pending
-        );
+        let plan = plan_store.snapshot().expect("plan should remain visible");
+        assert_eq!(plan.state, magi_core::PlanState::Paused);
+        assert_eq!(plan.items[0].status, magi_core::PlanItemStatus::InProgress);
         assert!(crate::routes::begin_session_turn(&state, &session_id).is_ok());
         let failed_event = state
             .event_bus
@@ -4929,14 +5007,12 @@ mod tests {
             .expect("turn input should begin");
         crate::routes::begin_session_turn(&state, &session_id)
             .expect("conversation turn should begin");
-        let plan_store = magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
-        plan_store
-            .write(vec![magi_core::TodoItem::new(
-                "生成长内容",
-                "正在生成长内容",
-                magi_core::TodoStatus::InProgress,
-            )])
-            .expect("todo should persist");
+        let plan_store = seed_active_plan(
+            &state.session_store,
+            &session_id,
+            "generate-long-content",
+            "生成长内容",
+        );
 
         let (status, body) = post_json(
             state.clone(),
@@ -4985,10 +5061,9 @@ mod tests {
             interrupted_event.payload["canonical_item"]["status"],
             "cancelled"
         );
-        assert_eq!(
-            plan_store.snapshot()[0].status,
-            magi_core::TodoStatus::Pending
-        );
+        let plan = plan_store.snapshot().expect("plan should remain visible");
+        assert_eq!(plan.state, magi_core::PlanState::Paused);
+        assert_eq!(plan.items[0].status, magi_core::PlanItemStatus::InProgress);
         assert!(crate::routes::begin_session_turn(&state, &session_id).is_ok());
     }
 
@@ -5028,14 +5103,12 @@ mod tests {
             .expect("turn input should begin");
         crate::routes::begin_session_turn(&state, &session_id)
             .expect("conversation turn should begin");
-        let plan_store = magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
-        plan_store
-            .write(vec![magi_core::TodoItem::new(
-                "执行当前步骤",
-                "正在执行当前步骤",
-                magi_core::TodoStatus::InProgress,
-            )])
-            .expect("todo should persist");
+        let plan_store = seed_active_plan(
+            &state.session_store,
+            &session_id,
+            "execute-current-step",
+            "执行当前步骤",
+        );
 
         let (status, body) = post_json(
             state.clone(),
@@ -5065,10 +5138,9 @@ mod tests {
                 .status,
             "cancelled"
         );
-        assert_eq!(
-            plan_store.snapshot()[0].status,
-            magi_core::TodoStatus::Pending
-        );
+        let plan = plan_store.snapshot().expect("plan should remain visible");
+        assert_eq!(plan.state, magi_core::PlanState::Paused);
+        assert_eq!(plan.items[0].status, magi_core::PlanItemStatus::InProgress);
         assert!(crate::routes::begin_session_turn(&state, &session_id).is_ok());
     }
 

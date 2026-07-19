@@ -10,11 +10,34 @@ const inputAreaSource = await readFile(
   new URL('../src/components/InputArea.svelte', import.meta.url),
   'utf8',
 );
+const bridgeSource = await readFile(
+  new URL('../src/shared/bridges/web-client-bridge.ts', import.meta.url),
+  'utf8',
+);
+const messageItemSource = await readFile(
+  new URL('../src/components/MessageItem.svelte', import.meta.url),
+  'utf8',
+);
 
 assert.doesNotMatch(
   ringComponentSource,
   /class=["']ring-label["']/,
   '输入栏上下文控件不得常驻显示百分比文字',
+);
+assert.match(
+  bridgeSource,
+  /eventType === 'session\.context\.usage\.updated'[\s\S]*?applyContextBudgetRuntimeEvent\(event\)/,
+  'SSE 必须即时投射运行中上下文预算事件',
+);
+assert.match(
+  messageItemSource,
+  /noticeKind === 'context_compaction'[\s\S]*?messageItem\.contextCompaction/,
+  'canonical 压缩条目必须渲染为本地化的轻量时间线通知',
+);
+assert.match(
+  bridgeSource,
+  /eventType === 'session\.context\.compacted'[\s\S]*?applyContextCompactionRuntimeEvent\(event\)/,
+  'SSE 必须即时投射压缩后的上下文预算',
 );
 assert.match(
   ringComponentSource,
@@ -30,6 +53,11 @@ assert.match(
   ringComponentSource,
   /\.ia-context-popover\.visible\s*\{/,
   '点击后的 visible 状态必须继续负责展示完整上下文信息',
+);
+assert.match(
+  ringComponentSource,
+  /\.ia-context-ring\.estimating \.ring-fill[\s\S]*?animation:\s*context-ring-estimating/,
+  '运行中估算必须通过圆环动画表达，不能伪装成静态权威值',
 );
 assert.doesNotMatch(
   inputAreaSource,
@@ -49,6 +77,7 @@ await withGoldenViteServer(async (server) => {
       'input.contextRing.usage': `已用 ${params?.value}`,
       'input.contextRing.remaining': `剩余 ${params?.value}`,
       'input.contextRing.limit': `窗口 ${params?.value}`,
+      'input.contextRing.estimated': '响应中，当前为实时估算',
       'input.contextRing.compaction': `最近压缩 ${params?.reason} ${params?.before}->${params?.after}`,
       'input.contextRing.compactionReason.contextWindowPressure': '窗口压力',
       'input.contextRing.compactionReason.estimatedPrefill': '预填估算',
@@ -359,7 +388,23 @@ await withGoldenViteServer(async (server) => {
     );
   }
 
-  // 场景 12：知识能力的五种决策必须完整投影到当前会话诊断，且不泄漏知识正文。
+  // 场景 12：运行中预算明确标记为估算值。
+  {
+    const input = {
+      usageRatio: 0.2,
+      tokenUsed: 20_000,
+      remainingTokens: 80_000,
+      tokenLimit: 100_000,
+      measurement: 'estimated',
+    };
+    assert.deepEqual(
+      ring.buildRingDetailItems(input, t)[0],
+      { key: 'measurement', text: '响应中，当前为实时估算' },
+    );
+    assert.match(ring.buildRingTooltip(input, t), /实时估算/);
+  }
+
+  // 场景 13：知识能力的五种决策必须完整投影到当前会话诊断，且不泄漏知识正文。
   {
     const decisions = [
       'not_needed',

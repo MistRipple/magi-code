@@ -19,6 +19,7 @@ magi-project-memory = { path = "../magi-project-memory" }
 magi-memory-store = { path = "../magi-memory-store" }
 magi-mission-metrics = { path = "../magi-mission-metrics" }
 magi-governance = { path = "../magi-governance" }
+magi-git = { path = "../magi-git" }
 magi-skill-runtime = { path = "../magi-skill-runtime" }
 magi-permissions = { path = "../magi-permissions" }
 magi-session-store = { path = "../magi-session-store" }
@@ -34,4 +35,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+magi-process = { path = "../magi-process" }
 tempfile = "3"

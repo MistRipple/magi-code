@@ -48,7 +48,7 @@ const CRATE_META = {
   'magi-skill-runtime': ['exec', '技能运行时'],
   'magi-snapshot': ['base', 'workspace 文件变更账本'],
   'magi-spawn-graph': ['exec', 'L5 SpawnGraph：父子 agent spawn 拓扑'],
-  'magi-todo-ledger': ['mission', 'TodoLedger：session 范围任务清单'],
+  'magi-plan': ['mission', 'SessionPlan：用户可见计划协议与执行任务绑定'],
   'magi-tool-runtime': ['exec', '工具执行运行时'],
   'magi-usage-authority': ['bus', 'token 计费、上下文窗口、模型身份、用量账本'],
   'magi-worker-runtime': ['exec', 'worker 执行运行时'],
@@ -94,8 +94,8 @@ const BUSINESS_FLOW = [
   {
     id: 'closure',
     title: '目标、状态与恢复闭环',
-    desc: 'Session Goal、TodoLedger、ExecutionChain、snapshot、event bus 和项目记忆共同支撑持续推进、恢复、审计与下一轮上下文。',
-    crates: ['magi-session-store', 'magi-todo-ledger', 'magi-conversation-runtime', 'magi-snapshot', 'magi-event-bus', 'magi-project-memory', 'magi-mission-metrics'],
+    desc: 'Session Goal、SessionPlan、ExecutionChain、snapshot、event bus 和项目记忆共同支撑持续推进、恢复、审计与下一轮上下文。',
+    crates: ['magi-session-store', 'magi-plan', 'magi-conversation-runtime', 'magi-snapshot', 'magi-event-bus', 'magi-project-memory', 'magi-mission-metrics'],
     risk: 'Goal、任务清单和执行链必须各自保持单一权威状态，禁止恢复旧 Mission 治理双轨。',
   },
 ];

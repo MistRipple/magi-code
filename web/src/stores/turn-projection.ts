@@ -187,7 +187,9 @@ function resolveMessageType(item: CanonicalTurnItem): Message['type'] {
     return 'tool_call';
   }
   if (item.kind === 'system_notice') {
-    return isAgentTaskSidechainItem(item) ? 'system-notice' : 'text';
+    return isAgentTaskSidechainItem(item) || item.metadata?.noticeKind === 'context_compaction'
+      ? 'system-notice'
+      : 'text';
   }
   if (item.kind === 'assistant_text') {
     return 'text';
@@ -209,6 +211,15 @@ function resolveItemContent(item: CanonicalTurnItem): string {
     return item.title || item.tool?.name || '';
   }
   return item.title || '';
+}
+
+function resolveItemTimestamp(item: CanonicalTurnItem): number {
+  const compactedAt = item.metadata?.noticeKind === 'context_compaction'
+    ? item.metadata.compactedAt
+    : undefined;
+  return typeof compactedAt === 'number' && Number.isFinite(compactedAt)
+    ? Math.floor(compactedAt)
+    : item.createdAt;
 }
 
 function normalizeMessageImagesFromMetadata(
@@ -338,6 +349,13 @@ function buildMessage(
   const contextReferences = item.kind === 'user_message'
     ? normalizeMessageContextReferencesFromMetadata(item.metadata)
     : undefined;
+  const noticeType = item.metadata?.noticeType;
+  const normalizedNoticeType = noticeType === 'success'
+    || noticeType === 'error'
+    || noticeType === 'warning'
+    || noticeType === 'info'
+    ? noticeType
+    : undefined;
   return {
     id: artifactId,
     role: resolveMessageRole(item),
@@ -346,11 +364,12 @@ function buildMessage(
     ...(blocks ? { blocks } : {}),
     ...(images ? { images } : {}),
     ...(contextReferences ? { contextReferences } : {}),
-    timestamp: item.createdAt,
+    timestamp: resolveItemTimestamp(item),
     updatedAt: item.updatedAt,
     isStreaming,
     isComplete: !isStreaming,
     type: resolveMessageType(item),
+    ...(normalizedNoticeType ? { noticeType: normalizedNoticeType } : {}),
     metadata: {
       ...messageMetadataWithoutTransportImages(item.metadata),
       turnId: item.turnId,
@@ -523,7 +542,7 @@ function buildArtifact(
     anchorEventSeq: 0,
     latestEventSeq: 0,
     cardStreamSeq: item.itemSeq,
-    timestamp: item.createdAt,
+    timestamp: resolveItemTimestamp(item),
     cardId: artifactId,
     taskId: sidechainTaskId,
     messageIds: [artifactId, item.itemId],

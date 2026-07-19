@@ -1,11 +1,11 @@
 <script lang="ts">
-  import hljs from 'highlight.js';
   import { onMount } from 'svelte';
   import Icon from '../components/Icon.svelte';
   import MarkdownContent from '../components/MarkdownContent.svelte';
   import DiffCodeBlock from '../components/blocks/DiffCodeBlock.svelte';
   import AgentTabContent from '../components/tabs/AgentTabContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { highlightCode } from '../lib/code-highlighter';
   import {
     isHtmlFile,
     isKnownBinaryFile,
@@ -396,20 +396,26 @@
   );
   const isLargeFile = $derived(rawPreviewContent.length > 500_000);
   /**
-   * source 视图行高亮：对整段内容做一次 hljs.highlight（保持跨行 token），
+   * source 视图行高亮：对整段内容做一次高亮（保持跨行 token），
    * 然后按 '\n' 切片，避免逐行高亮丢失多行 token 上下文。
    */
-  const sourceLines = $derived.by<string[]>(() => {
-    const lines = truncatedContent.split('\n');
-    if (lines.length === 0) return [];
+  let sourceLines = $state<string[]>([]);
+  $effect(() => {
+    const source = truncatedContent;
     const lang = fileLanguage;
-    const useHljs = lang && hljs.getLanguage(lang);
-    if (!useHljs) return lines.map(escapeHtml);
-    try {
-      return hljs.highlight(truncatedContent, { language: lang }).value.split('\n');
-    } catch {
-      return lines.map(escapeHtml);
-    }
+    const lines = source.split('\n');
+    sourceLines = lines.map(escapeHtml);
+    if (!source || !lang) return;
+
+    let cancelled = false;
+    void highlightCode(source, lang).then((result) => {
+      if (!cancelled && result !== null) sourceLines = result.split('\n');
+    }).catch((error) => {
+      console.warn('[RightPane] 源码高亮失败:', error);
+    });
+    return () => {
+      cancelled = true;
+    };
   });
   const hasContent = $derived(rawPreviewContent.length > 0);
   const codeMode = $derived(

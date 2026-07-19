@@ -19,7 +19,11 @@ pub fn submit_dispatch_submission(
     let task_store = state
         .task_store()
         .ok_or_else(|| ApiError::internal_assembly("构建任务派发运行时", "task_store 未配置"))?;
-    let workspace_root_path = state.workspace_root_path(&request.workspace_id);
+    let workspace_root_path = state
+        .session_code_contexts
+        .get(request.session_id.as_str())
+        .map(|context| context.execution_root)
+        .or_else(|| state.workspace_root_path(&request.workspace_id));
     let runtime = DispatchSubmissionRuntime {
         session_store: &state.session_store,
         task_store,

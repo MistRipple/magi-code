@@ -3,8 +3,8 @@
 //! 错误返回值使用 `Result<_, String>`，由上层调用方桥接到自己的错误类型。
 //!
 //! 协议判定的**唯一事实源**是归一化模型配置：
-//! - `urlMode = standard|proxy`：按模型名识别协议；Claude 家族走 Anthropic Messages，
-//!   其他模型走 OpenAI 兼容 Chat Completions。
+//! - `urlMode = standard|proxy`：显式的 `/anthropic` 路径前缀优先识别为
+//!   Anthropic Messages；其余地址再按模型名识别协议。
 //! - `urlMode = full`：用户已经填写完整端点，按端点路径识别协议；`/v1/messages`
 //!   走 Anthropic Messages，其他走 OpenAI Chat Completions。
 //!
@@ -152,10 +152,9 @@ impl NormalizedModelConfig {
 
     /// 推断 HTTP 协议族。
     ///
-    /// standard/proxy 是产品默认的网关根地址形态，同一个 baseUrl 下可同时承载
-    /// OpenAI 兼容模型和 Anthropic Messages 模型，因此用模型家族做确定性识别。
-    /// full 模式表示用户填写的是完整端点，必须优先尊重路径本身，避免把
-    /// OpenAI 兼容代理中的 Claude 模型误路由到错误端点。
+    /// 显式 `/anthropic` 前缀或 `/messages` 端点优先决定 Anthropic 协议；
+    /// 普通 standard/proxy 网关根地址再按模型家族识别。full 模式必须尊重
+    /// 完整端点路径，避免把 OpenAI 兼容代理中的 Claude 模型误路由。
     fn inferred_protocol_for_model(&self, model: Option<&str>) -> HttpModelBridgeProtocol {
         let normalized = self
             .base_url
@@ -165,13 +164,16 @@ impl NormalizedModelConfig {
 
         match self.url_mode {
             ModelUrlMode::Full => {
-                if normalized.ends_with("/v1/messages") {
+                if is_anthropic_endpoint(&normalized) {
                     HttpModelBridgeProtocol::AnthropicMessages
                 } else {
                     HttpModelBridgeProtocol::ChatCompletions
                 }
             }
             ModelUrlMode::Standard | ModelUrlMode::Proxy => match model {
+                _ if is_anthropic_endpoint(&normalized) => {
+                    HttpModelBridgeProtocol::AnthropicMessages
+                }
                 Some(model) if is_anthropic_model_name(model) => {
                     HttpModelBridgeProtocol::AnthropicMessages
                 }
@@ -488,6 +490,10 @@ fn is_anthropic_model_name(model: &str) -> bool {
     model.to_ascii_lowercase().contains("claude")
 }
 
+fn is_anthropic_endpoint(normalized_base_url: &str) -> bool {
+    normalized_base_url.ends_with("/anthropic") || normalized_base_url.ends_with("/messages")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +539,21 @@ mod tests {
             "baseUrl": "https://gateway.example.com",
             "apiKey": "sk-test",
             "model": "kiro-claude-sonnet-4-6",
+            "urlMode": "standard"
+        }));
+        assert_eq!(
+            config.inferred_protocol(),
+            HttpModelBridgeProtocol::AnthropicMessages
+        );
+        assert_eq!(config.provider(), "anthropic");
+    }
+
+    #[test]
+    fn standard_mode_anthropic_prefix_overrides_non_claude_model_name() {
+        let config = model_config(json!({
+            "baseUrl": "https://api.deepseek.com/anthropic",
+            "apiKey": "sk-test",
+            "model": "deepseek-chat",
             "urlMode": "standard"
         }));
         assert_eq!(

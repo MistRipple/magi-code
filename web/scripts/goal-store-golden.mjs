@@ -59,28 +59,22 @@ globalThis.fetch = async (url) => {
         createdAt: 1780000000000,
         updatedAt: 1780000003000,
       },
-      todoItems: [
-        {
-          content: '梳理目标模式',
-          activeForm: '正在梳理目标模式',
-          status: 'completed',
-        },
-        {
-          content: '检查代理面板',
-          activeForm: '正在检查代理面板',
-          status: 'completed',
-        },
-        {
-          content: '检查变更面板',
-          activeForm: '正在检查变更面板',
-          status: 'completed',
-        },
-        {
-          content: '验证任务清单抽屉',
-          activeForm: '正在验证任务清单抽屉',
-          status: 'completed',
-        },
-      ],
+      plan: {
+        planId: 'plan-store-golden',
+        sessionId: SESSION_ID,
+        revision: 4,
+        language: 'zh-CN',
+        state: 'completed',
+        items: [
+          { itemId: 'inspect-goal', title: '梳理目标模式', status: 'completed' },
+          { itemId: 'inspect-agent', title: '检查代理面板', status: 'completed' },
+          { itemId: 'inspect-change', title: '检查变更面板', status: 'completed' },
+          { itemId: 'verify-plan', title: '验证执行计划抽屉', status: 'completed' },
+        ],
+        taskBindings: {},
+        taskStatuses: {},
+        updatedAt: 1780000003000,
+      },
     });
   }
   return new Response('not found', { status: 404 });
@@ -101,15 +95,58 @@ await withGoldenViteServer(async (server) => {
   assert.equal(state.error, null);
   assert.equal(state.response?.goal?.status, 'complete');
   assert.equal(state.response?.goal?.objective, '验证 Goal store 刷新');
-  assert.equal(state.response?.todoItems?.length, 4);
+  assert.equal(state.response?.plan?.items.length, 4);
   assert.deepEqual(
-    state.response?.todoItems?.map((item) => item.content),
-    ['梳理目标模式', '检查代理面板', '检查变更面板', '验证任务清单抽屉'],
-    'goal store must expose the complete authoritative todo collection',
+    state.response?.plan?.items.map((item) => item.title),
+    ['梳理目标模式', '检查代理面板', '检查变更面板', '验证执行计划抽屉'],
+    'goal store must expose the complete authoritative plan',
   );
   assert.ok(
-    state.response?.todoItems?.every((item) => item.status === 'completed'),
-    'completed todo history must remain visible as a complete collection',
+    state.response?.plan?.items.every((item) => item.status === 'completed'),
+    'completed plan history must remain visible as a complete collection',
+  );
+  assert.equal(
+    goalStore.applySessionPlanSnapshot(SESSION_ID, WORKSPACE_ID, {
+      ...state.response.plan,
+      revision: 3,
+      state: 'active',
+    }),
+    true,
+  );
+  assert.equal(
+    goalStore.getGoalState(SESSION_ID, WORKSPACE_ID).response?.plan?.revision,
+    4,
+    'stale plan events must not overwrite a newer revision',
+  );
+  assert.equal(
+    goalStore.applySessionPlanSnapshot(
+      SESSION_ID,
+      WORKSPACE_ID,
+      null,
+      'another-plan',
+      9,
+    ),
+    true,
+  );
+  assert.equal(
+    goalStore.getGoalState(SESSION_ID, WORKSPACE_ID).response?.plan?.planId,
+    'plan-store-golden',
+    'clear events from another plan must not remove the current plan',
+  );
+  assert.equal(
+    goalStore.applySessionPlanSnapshot(SESSION_ID, WORKSPACE_ID, {
+      ...state.response.plan,
+      planId: 'stale-plan',
+      revision: 99,
+      updatedAt: 1780000001000,
+    }),
+    false,
+    'events from another plan must trigger an authoritative refresh',
+  );
+  assert.equal(
+    goalStore.getGoalState(SESSION_ID, WORKSPACE_ID).response?.plan?.planId,
+    'plan-store-golden',
+    'events from another plan must not overwrite the current plan',
   );
 
   const emptyWorkspaceState = goalStore.getGoalState(SESSION_ID, 'workspace-goal-store-other');

@@ -1,6 +1,17 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { aggregateUsageStatsForDisplay } from '../src/lib/usage-stats-aggregation.ts';
+import { resolveModelApiProtocol } from '../src/shared/model-governance.ts';
+
+assert.equal(
+  resolveModelApiProtocol({
+    baseUrl: 'https://api.deepseek.com/anthropic',
+    urlMode: 'standard',
+    model: 'deepseek-chat',
+  }),
+  'anthropic_messages',
+  '显式 /anthropic 路径必须优先使用 Anthropic Messages，不能被模型名误判为 OpenAI Chat',
+);
 
 const settingsStoreSource = await readFile(
   new URL('../src/stores/settings-store.svelte.ts', import.meta.url),

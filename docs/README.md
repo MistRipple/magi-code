@@ -41,7 +41,7 @@ cargo run -p magi-desktop
 
 - 简单事走会话流和工具证据，不生成额外抽屉
 - 多步骤工作进入目标模式，目标抽屉承载目标内容、状态与操作
-- 任务清单来自真实 `TodoLedger`，只在存在任务项时展示
+- 执行计划来自会话级 `SessionPlan`，通过稳定 ID、revision 与真实执行任务绑定，只在存在计划项时展示
 - 代理协作保留内部 root task 作为编排锚点，用户主视图通过代理运行抽屉展示实际代理任务
 - 跨轮、可恢复、高风险工作以 Mission / Checkpoint / Validation 等运行事实承载
 

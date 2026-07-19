@@ -166,7 +166,7 @@ pub(crate) fn thread_chat_message_to_chat_message(message: &ThreadChatMessage) -
 
 /// P6b：把本轮新产生的 bridge-client 消息（含 system prompt 之外的所有条目）
 /// 压缩为 thread 持久化格式。系统提示 / 工作区提示等重复上下文不再次写入。
-fn chat_message_to_thread_chat_message(message: &ChatMessage) -> ThreadChatMessage {
+pub(crate) fn chat_message_to_thread_chat_message(message: &ChatMessage) -> ThreadChatMessage {
     ThreadChatMessage {
         role: message.role.clone(),
         content: message.content.clone(),
@@ -220,8 +220,31 @@ fn estimate_thread_message_tokens(message: &ThreadChatMessage) -> usize {
     total
 }
 
-fn estimate_thread_history_tokens(history: &[ThreadChatMessage]) -> usize {
+pub(crate) fn estimate_thread_history_tokens(history: &[ThreadChatMessage]) -> usize {
     history.iter().map(estimate_thread_message_tokens).sum()
+}
+
+pub(crate) fn estimate_chat_messages_tokens(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(chat_message_to_thread_chat_message)
+        .map(|message| estimate_thread_message_tokens(&message))
+        .sum()
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ContextCompactionRecord {
+    pub reason: &'static str,
+    pub original_message_count: usize,
+    pub compacted_message_count: usize,
+    pub original_token_estimate: usize,
+    pub compacted_token_estimate: usize,
+    pub compacted_at: UtcMillis,
+}
+
+pub(crate) struct PreparedThreadHistory {
+    pub messages: Vec<ThreadChatMessage>,
+    pub compaction: Option<ContextCompactionRecord>,
 }
 
 #[derive(Clone, Debug)]
@@ -510,24 +533,20 @@ fn compact_thread_history_if_needed(
     Some(compacted)
 }
 
-pub(crate) fn compact_history_for_prompt(
-    history: Vec<ThreadChatMessage>,
-    usage_observation: Option<&SessionRuntimeUsageObservation>,
-) -> Vec<ThreadChatMessage> {
-    let Some(decision) = thread_history_compaction_decision(&history, usage_observation) else {
-        return history;
-    };
-    compact_thread_history_if_needed(&history, &decision).unwrap_or(history)
-}
-
-fn compact_and_replace_thread_history(
+pub(crate) fn prepare_thread_history(
     event_bus: &InMemoryEventBus,
     session_store: &SessionStore,
     session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
     thread_id: &ThreadId,
-    history: Vec<ThreadChatMessage>,
+    fallback_history: Vec<ThreadChatMessage>,
     phase: &'static str,
-) -> Vec<ThreadChatMessage> {
+) -> PreparedThreadHistory {
+    let mut history = session_store.thread_message_history(thread_id);
+    if history.is_empty() && !fallback_history.is_empty() {
+        history = fallback_history;
+        session_store.replace_thread_messages(thread_id, history.clone(), UtcMillis::now());
+    }
     let original_count = history.len();
     let original_tokens = estimate_thread_history_tokens(&history);
     let usage_observation = latest_session_usage_observation(event_bus, session_id);
@@ -544,10 +563,16 @@ fn compact_and_replace_thread_history(
                 .map(|observation| observation.context_window_tokens),
             "thread 历史未达到上下文压缩阈值"
         );
-        return history;
+        return PreparedThreadHistory {
+            messages: history,
+            compaction: None,
+        };
     };
     let Some(compacted) = compact_thread_history_if_needed(&history, &decision) else {
-        return history;
+        return PreparedThreadHistory {
+            messages: history,
+            compaction: None,
+        };
     };
     let compacted_count = compacted.len();
     let compacted_tokens = estimate_thread_history_tokens(&compacted);
@@ -646,11 +671,22 @@ fn compact_and_replace_thread_history(
             context_payload,
         )
         .with_context(EventContext {
+            workspace_id: workspace_id.clone(),
             session_id: Some(session_id.clone()),
             ..EventContext::default()
         }),
     );
-    compacted
+    PreparedThreadHistory {
+        messages: compacted,
+        compaction: Some(ContextCompactionRecord {
+            reason: decision.reason_label(),
+            original_message_count: original_count,
+            compacted_message_count: compacted_count,
+            original_token_estimate: original_tokens,
+            compacted_token_estimate: compacted_tokens,
+            compacted_at,
+        }),
+    }
 }
 
 pub fn run_conversation_loop(
@@ -914,14 +950,16 @@ fn run_conversation_loop_inner(
     // P6b：只读取当前 thread 内部已经持久化的运行时输入 / 恢复记录。worker thread
     // 为单 task 独占，因此这里不能出现同 role 的历史 task 对话。历史超出水位线时
     // 直接替换为「摘要 + 最近完整消息」，下一轮不再读到旧结构。
-    let thread_history_snapshot = compact_and_replace_thread_history(
+    let thread_history_snapshot = prepare_thread_history(
         event_bus,
         session_store,
         session_id,
+        workspace_id,
         thread_id,
-        session_store.thread_message_history(thread_id),
+        Vec::new(),
         "pre_turn",
-    );
+    )
+    .messages;
     if !thread_history_snapshot.is_empty() {
         for history_msg in &thread_history_snapshot {
             messages.push(thread_chat_message_to_chat_message(history_msg));
@@ -1676,12 +1714,13 @@ fn run_conversation_loop_inner(
         tool_call_id: None,
     });
     session_store.append_thread_messages(thread_id, turn_messages, UtcMillis::now());
-    let _ = compact_and_replace_thread_history(
+    let _ = prepare_thread_history(
         event_bus,
         session_store,
         session_id,
+        workspace_id,
         thread_id,
-        session_store.thread_message_history(thread_id),
+        Vec::new(),
         "post_turn",
     );
 
@@ -2776,6 +2815,7 @@ mod tests {
             context_window_tokens: 20_000,
             resolved_model: Some("gpt-5-codex".to_string()),
             observed_at: Some(UtcMillis(1)),
+            ..SessionRuntimeUsageObservation::default()
         };
         assert!(thread_history_compaction_decision(&history, Some(&low_usage)).is_none());
 
@@ -2783,6 +2823,7 @@ mod tests {
             context_window_tokens: 245_000,
             resolved_model: Some("gpt-5-codex".to_string()),
             observed_at: Some(UtcMillis(2)),
+            ..SessionRuntimeUsageObservation::default()
         };
         let decision = thread_history_compaction_decision(&history, Some(&high_usage))
             .expect("high context usage should trigger compaction");
@@ -2829,6 +2870,7 @@ mod tests {
             context_window_tokens: 20_000,
             resolved_model: Some("gpt-5-codex".to_string()),
             observed_at: Some(UtcMillis(3)),
+            ..SessionRuntimeUsageObservation::default()
         };
 
         let decision =
@@ -2839,6 +2881,56 @@ mod tests {
             decision,
             ThreadHistoryCompactionDecision::EstimatedPrefill { .. }
         ));
+    }
+
+    #[test]
+    fn prepare_thread_history_persists_compaction_and_reuses_internal_snapshot() {
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new("session-context-compaction-persistence");
+        session_store
+            .create_session(session_id.clone(), "context compaction persistence")
+            .expect("session should be created");
+        let (_, thread_id) =
+            session_store.ensure_session_mission(&session_id, UtcMillis(1), || {
+                MissionId::new("mission-context-compaction-persistence")
+            });
+        let event_bus = InMemoryEventBus::new(32);
+        let workspace_id = Some(WorkspaceId::new("workspace-context-compaction"));
+        let fallback_history = repeated_thread_history(1_000, 1_000);
+
+        let first = prepare_thread_history(
+            &event_bus,
+            &session_store,
+            &session_id,
+            &workspace_id,
+            &thread_id,
+            fallback_history.clone(),
+            "pre_turn",
+        );
+        assert!(first.compaction.is_some());
+        assert_eq!(
+            session_store.thread_message_history(&thread_id).len(),
+            first.messages.len()
+        );
+        assert!(
+            event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .any(|event| event.event_type == "session.context.compacted")
+        );
+
+        let second = prepare_thread_history(
+            &event_bus,
+            &session_store,
+            &session_id,
+            &workspace_id,
+            &thread_id,
+            fallback_history,
+            "pre_turn",
+        );
+        assert!(second.compaction.is_none());
+        assert_eq!(second.messages.len(), first.messages.len());
     }
 
     impl ModelBridgeClient for TaskToolBatchModelBridgeClient {
@@ -3805,7 +3897,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            plan_store: &crate::test_plan_store("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
             mission_metrics: None,
             task,
@@ -3873,7 +3965,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            plan_store: &crate::test_plan_store("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
             mission_metrics: None,
             task: &task,
@@ -3961,7 +4053,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            plan_store: &crate::test_plan_store("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
             mission_metrics: None,
             task: &task,
@@ -4469,7 +4561,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            plan_store: &crate::test_plan_store("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
             mission_metrics: None,
             task: &task,
@@ -4556,7 +4648,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            plan_store: &crate::test_plan_store("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
             mission_metrics: None,
             task: &task,
@@ -4727,14 +4819,20 @@ mod tests {
                 body: "旧内容".to_string(),
             })
             .expect("project memory entry should save");
-        let plan_store = crate::test_plan_store("test-todo-ledger");
+        let plan_store = crate::test_plan_store("test-plan");
         plan_store
-            .write(vec![magi_plan::TodoItem::new(
-                "继续旧任务 OLD_REFERENCE_RESULT",
-                "正在继续旧任务",
-                magi_plan::TodoStatus::Pending,
-            )])
-            .expect("todo fixture should write");
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("continue-old-task".to_string()),
+                    step: "继续旧任务 OLD_REFERENCE_RESULT".to_string(),
+                    status: magi_core::PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan fixture should write");
 
         let client = CapturingPromptModelBridgeClient::new("CURRENT_TASK_RESULT");
         let prompt =
@@ -4795,14 +4893,14 @@ mod tests {
         };
 
         let project_memory_index = content_at("旧偏好要求输出 OLD_REFERENCE_RESULT");
-        let todo_index = content_at("当前用户可见计划");
+        let plan_index = content_at("当前用户可见计划");
         let history_index = content_at("历史要求：输出 OLD_REFERENCE_RESULT");
         let thread_boundary_index = content_at("必须以当前任务为准");
         let priority_index = content_at("上下文优先级（本轮必须遵守）");
         let current_prompt_index = content_at(&prompt);
 
         assert!(project_memory_index < priority_index);
-        assert!(todo_index < priority_index);
+        assert!(plan_index < priority_index);
         assert!(history_index < thread_boundary_index);
         assert!(thread_boundary_index < priority_index);
         assert!(priority_index < current_prompt_index);
@@ -4815,11 +4913,11 @@ mod tests {
                 .contains("不能覆盖本轮用户指令")
         );
         assert!(
-            messages[todo_index]
+            messages[plan_index]
                 .content
                 .as_deref()
                 .unwrap_or_default()
-                .contains("不能覆盖本轮用户输入")
+                .contains("不能覆盖当前用户指令")
         );
         assert!(
             messages[priority_index]
@@ -5053,7 +5151,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            plan_store: &crate::test_plan_store("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
             mission_metrics: None,
             task: &task,
@@ -5230,7 +5328,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            plan_store: &crate::test_plan_store("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
             mission_metrics: None,
             task: &task,
@@ -5407,7 +5505,7 @@ mod tests {
             agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
             spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
             safety_gate: None,
-            plan_store: &crate::test_plan_store("test-todo-ledger"),
+            plan_store: &crate::test_plan_store("test-plan"),
             project_memory: None,
             mission_metrics: None,
             task: &task,

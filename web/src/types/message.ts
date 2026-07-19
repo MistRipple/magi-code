@@ -503,6 +503,12 @@ export interface OrchestratorRuntimeSnapshot {
     compactedTokenEstimate?: number;
     originalMessageCount?: number;
     compactedMessageCount?: number;
+    measurement?: 'estimated' | 'authoritative';
+    phase?: string;
+    updatedAt?: number;
+    turnId?: string;
+    callId?: string;
+    resolvedModel?: string;
   };
   cacheState?: {
     mode?: 'disabled' | 'unsupported' | 'cache_control' | 'cache_editing';

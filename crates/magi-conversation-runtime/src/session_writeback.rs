@@ -801,7 +801,7 @@ fn append_session_tool_call_items_batch(
         source_thread_id,
         persist_session_state,
     } = context;
-    let plan_store = crate::test_plan_store("test-todo-ledger");
+    let plan_store = crate::test_plan_store("test-plan");
     let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
     append_session_tool_call_items_batch_with_context(
         SessionToolCallBatchContext {
@@ -1208,7 +1208,7 @@ fn execute_session_turn_tool_call(
         workspace_root_path,
         access_profile,
     } = context;
-    let plan_store = crate::test_plan_store("test-todo-ledger");
+    let plan_store = crate::test_plan_store("test-plan");
     let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
     execute_session_turn_tool_call_scoped(
         SessionToolExecutionContext {
@@ -3189,47 +3189,49 @@ mod tests {
     }
 
     #[test]
-    fn session_turn_update_plan_uses_shared_ledger_and_only_reports_success() {
+    fn session_turn_update_plan_uses_session_plan_and_only_reports_success() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(32);
-        let session_id = SessionId::new("session-mainline-todo-write");
-        let workspace_id = Some(WorkspaceId::new("workspace-mainline-todo-write"));
+        let session_id = SessionId::new("session-mainline-plan-update");
+        let workspace_id = Some(WorkspaceId::new("workspace-mainline-plan-update"));
         session_store
             .create_session_for_workspace(
                 session_id.clone(),
-                "mainline todo write",
+                "mainline plan update",
                 workspace_id.as_ref().map(ToString::to_string),
             )
             .expect("session should be creatable");
         let (mission_id, thread_id) =
             session_store.ensure_session_mission(&session_id, UtcMillis::now(), || {
-                MissionId::new("mission-mainline-todo-write")
+                MissionId::new("mission-mainline-plan-update")
             });
         session_store
             .upsert_current_turn(
                 session_id.clone(),
                 ActiveExecutionTurn {
-                    turn_id: "turn-mainline-todo-write".to_string(),
+                    turn_id: "turn-mainline-plan-update".to_string(),
                     turn_seq: 1,
                     accepted_at: UtcMillis::now(),
                     status: "running".to_string(),
-                    user_message: Some("写入任务清单".to_string()),
+                    user_message: Some("更新执行计划".to_string()),
                     items: Vec::new(),
                     completed_at: None,
                 },
             )
             .expect("turn should be creatable");
-        let plan_store = crate::test_plan_store("test-todo-ledger");
+        let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
         let mut messages = Vec::new();
         let valid_call = ChatToolCall {
-            id: "tool-call-mainline-todo-valid".to_string(),
+            id: "tool-call-mainline-plan-valid".to_string(),
             kind: "function".to_string(),
             function: ChatToolFunction {
                 name: BuiltinToolName::UpdatePlan.as_str().to_string(),
                 arguments: serde_json::json!({
-                    "todos": [
-                        {"content": "完成第一项", "activeForm": "正在完成第一项", "status": "completed"},
-                        {"content": "推进第二项", "activeForm": "正在推进第二项", "status": "in_progress"}
+                    "expectedRevision": 0,
+                    "language": "zh-CN",
+                    "plan": [
+                        {"itemId": "first", "step": "推进第一项", "status": "in_progress"},
+                        {"itemId": "second", "step": "验证第二项", "status": "pending"}
                     ]
                 })
                 .to_string(),
@@ -3264,16 +3266,26 @@ mod tests {
 
         assert!(valid_outcome.completed);
         assert_eq!(valid_outcome.succeeded_tool_names, vec!["update_plan"]);
-        assert_eq!(plan_store.snapshot().len(), 2);
+        assert_eq!(
+            plan_store
+                .snapshot()
+                .expect("plan should exist")
+                .items
+                .len(),
+            2
+        );
 
         let invalid_call = ChatToolCall {
-            id: "tool-call-mainline-todo-invalid".to_string(),
+            id: "tool-call-mainline-plan-invalid".to_string(),
             kind: "function".to_string(),
             function: ChatToolFunction {
                 name: BuiltinToolName::UpdatePlan.as_str().to_string(),
                 arguments: serde_json::json!({
-                    "todos": [
-                        {"content": "错误状态", "activeForm": "正在写入错误状态", "status": "unknown"}
+                    "planId": plan_store.snapshot().expect("plan should exist").plan_id,
+                    "expectedRevision": plan_store.snapshot().expect("plan should exist").revision,
+                    "language": "zh-CN",
+                    "plan": [
+                        {"itemId": "first", "step": "错误状态", "status": "unknown"}
                     ]
                 })
                 .to_string(),
@@ -3307,7 +3319,14 @@ mod tests {
 
         assert!(invalid_outcome.completed);
         assert!(invalid_outcome.succeeded_tool_names.is_empty());
-        assert_eq!(plan_store.snapshot().len(), 2);
+        assert_eq!(
+            plan_store
+                .snapshot()
+                .expect("plan should remain")
+                .items
+                .len(),
+            2
+        );
     }
 
     #[test]

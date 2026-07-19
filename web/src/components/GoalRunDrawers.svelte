@@ -63,6 +63,7 @@
   });
 
   const hasCurrentPlan = $derived(currentPlanItems.length > 0);
+  const currentPlanPaused = $derived(currentPlan?.state === 'paused');
   const planSummary = $derived.by(() => buildPlanSummary(currentPlanItems));
   const planProgressPercent = $derived.by(() => {
     if (planSummary.total <= 0) return 0;
@@ -130,6 +131,7 @@
   }
 
   function planItemStatusIcon(status: PlanItemDto['status']): IconName {
+    if (status === 'in_progress' && currentPlanPaused) return 'pause';
     switch (status) {
       case 'completed': return 'check-circle';
       case 'in_progress': return 'loader';
@@ -354,7 +356,9 @@
               total: planSummary.total,
             })}
           </span>
-          {#if planSummary.running > 0}
+          {#if currentPlanPaused}
+            <span class="plan-running">{i18n.t('goalPanel.plan.state.paused')}</span>
+          {:else if planSummary.running > 0}
             <span class="plan-running">{i18n.t('goalPanel.plan.runningCount', { count: planSummary.running })}</span>
           {/if}
           <Icon name="chevron-right" size={13} class={planDrawerExpanded ? 'drawer-chevron drawer-chevron--open' : 'drawer-chevron'} />
@@ -384,7 +388,7 @@
             {@const planIcon = planItemStatusIcon(item.status)}
             <div class="run-row run-row--plan run-row--{item.status}" role="listitem">
               <span class="run-row-icon status-icon--{item.status}" aria-label={planItemStatusLabel(item.status)}>
-                <Icon name={planIcon} size={15} class={item.status === 'in_progress' ? 'spinning' : ''} />
+                <Icon name={planIcon} size={15} class={item.status === 'in_progress' && !currentPlanPaused ? 'spinning' : ''} />
               </span>
               <span class="run-row-main">
                 <span class="run-row-title">{item.title}</span>

@@ -304,8 +304,8 @@ impl BuiltinToolName {
     }
 
     /// 用户访问模式只约束工作区、进程、网络外接能力和持久项目记忆等外部副作用。
-    /// Goal、Todo 与 agent_spawn 属于会话内部协调状态，必须在只读模式下保持可用，
-    /// 否则只读分析无法使用目标推进、任务清单和只读子代理。
+    /// Goal、Plan 与 agent_spawn 属于会话内部协调状态，必须在只读模式下保持可用，
+    /// 否则只读分析无法使用目标推进、执行计划和只读子代理。
     pub fn is_access_profile_write_operation(&self) -> bool {
         self.mutates_workspace_files()
             || matches!(

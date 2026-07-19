@@ -1544,7 +1544,68 @@ export interface WorkspaceBranchesResult {
   isRepo: boolean;
   currentBranch: string | null;
   branches: string[];
+  remoteBranches: string[];
+  structuredBranches: GitBranch[];
   status: WorkspaceVcsStatus | null;
+  observation?: GitObservation | null;
+  sessionContext?: SessionCodeContext | null;
+  contextDrift?: boolean;
+}
+
+export interface GitBranch {
+  name: string;
+  fullRef: string;
+  isRemote: boolean;
+  isCurrent: boolean;
+  head: string | null;
+  upstream: string | null;
+  worktreePath: string | null;
+}
+
+export interface GitWorktree {
+  path: string;
+  head: string | null;
+  branch: string | null;
+  bare: boolean;
+  detached: boolean;
+  locked: boolean;
+  prunable: boolean;
+  managed: boolean;
+}
+
+export interface GitMergePreview {
+  target: string;
+  targetHead: string;
+  mergeBase: string | null;
+  fastForward: boolean;
+  alreadyUpToDate: boolean;
+  incomingCommitCount: number;
+  changedPaths: string[];
+}
+
+export interface GitObservation {
+  repositoryRoot: string;
+  gitCommonDir: string;
+  worktreePath: string;
+  worktreeGitDir: string;
+  branch: string | null;
+  head: string | null;
+  upstream?: string | null;
+}
+
+export interface SessionCodeContext {
+  sessionId: string;
+  workspaceId: string;
+  executionRoot: string;
+  runtimeWorkspaceRoots: string[];
+  contextRevision: number;
+  git: {
+    desiredRef: string | null;
+    baseHead: string | null;
+    observedBranch: string | null;
+    observedHead: string | null;
+    worktreePath: string;
+  };
 }
 
 export interface WorkspaceVcsStatus {
@@ -1565,20 +1626,142 @@ export interface WorkspaceVcsStatus {
 export async function fetchWorkspaceBranches(
   bindingOverride?: Partial<AgentBindingContext>,
 ): Promise<WorkspaceBranchesResult> {
-  return await postWorkspaceBoundJson<WorkspaceBranchesResult>('/api/workspace/vcs/branches', {}, 'fetch workspace branches', bindingOverride);
+  return await postBoundJson<WorkspaceBranchesResult>('/api/workspace/vcs/branches', { includeRemote: true }, 'fetch workspace branches', bindingOverride);
 }
 
-export interface CheckoutBranchResult {
-  ok: boolean;
-  currentBranch: string | null;
-  error?: string;
+interface GitExpectedContext {
+  contextRevision?: number;
+  branch?: string | null;
+  head?: string | null;
+  worktreePath?: string | null;
+}
+
+function gitExpectedPayload(expected?: GitExpectedContext): Record<string, unknown> {
+  return {
+    ...(typeof expected?.contextRevision === 'number' ? { expectedContextRevision: expected.contextRevision } : {}),
+    ...(expected?.branch ? { expectedBranch: expected.branch } : {}),
+    ...(expected?.head ? { expectedHead: expected.head } : {}),
+    ...(expected?.worktreePath ? { expectedWorktreePath: expected.worktreePath } : {}),
+  };
 }
 
 export async function checkoutWorkspaceBranch(
   branch: string,
+  expected?: GitExpectedContext,
   bindingOverride?: Partial<AgentBindingContext>,
-): Promise<CheckoutBranchResult> {
-  return await postWorkspaceBoundJson<CheckoutBranchResult>('/api/workspace/vcs/checkout', { branch }, 'checkout workspace branch', bindingOverride);
+): Promise<GitOperationResult> {
+  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/branch/switch', {
+    branch,
+    ...gitExpectedPayload(expected),
+  }, 'switch workspace branch', bindingOverride);
+}
+
+export interface GitOperationResult {
+  ok: boolean;
+  observation?: GitObservation | null;
+  sessionContext?: SessionCodeContext | null;
+  data?: unknown;
+  error?: {
+    kind: string;
+    message: string;
+    actualBranch?: string | null;
+    actualHead?: string | null;
+    actualWorktreePath?: string | null;
+    conflictedPaths?: string[];
+  };
+}
+
+export async function createWorkspaceBranch(
+  branch: string,
+  expected?: GitExpectedContext,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<GitOperationResult> {
+  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/branch/create', {
+    branch,
+    switch: true,
+    ...gitExpectedPayload(expected),
+  }, 'create workspace branch', bindingOverride);
+}
+
+export async function previewWorkspaceMerge(
+  target: string,
+  expected?: GitExpectedContext,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<GitOperationResult> {
+  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/merge/preview', {
+    target,
+    ...gitExpectedPayload(expected),
+  }, 'preview workspace merge', bindingOverride);
+}
+
+export async function mergeWorkspaceBranch(
+  target: string,
+  ffOnly: boolean,
+  expected?: GitExpectedContext,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<GitOperationResult> {
+  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/merge', {
+    target,
+    ffOnly,
+    confirm: true,
+    ...gitExpectedPayload(expected),
+  }, 'merge workspace branch', bindingOverride);
+}
+
+export async function deleteWorkspaceBranch(
+  branch: string,
+  options: { remote?: string; force?: boolean; confirmForce?: boolean; confirmRemote?: boolean },
+  expected?: GitExpectedContext,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<GitOperationResult> {
+  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/branch/delete', {
+    branch,
+    ...options,
+    ...gitExpectedPayload(expected),
+  }, 'delete workspace branch', bindingOverride);
+}
+
+export async function fetchWorkspaceWorktrees(
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<GitOperationResult> {
+  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/worktree/list', {}, 'list workspace worktrees', bindingOverride);
+}
+
+export async function createWorkspaceWorktree(
+  mode: 'readOnly' | 'writable',
+  options: { base?: string; branch?: string; allocationKey?: string },
+  expected?: GitExpectedContext,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<GitOperationResult> {
+  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/worktree/create', {
+    mode,
+    ...options,
+    ...gitExpectedPayload(expected),
+  }, 'create workspace worktree', bindingOverride);
+}
+
+export async function removeWorkspaceWorktree(
+  path: string,
+  options: { force?: boolean; confirmForce?: boolean },
+  expected?: GitExpectedContext,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<GitOperationResult> {
+  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/worktree/remove', {
+    path,
+    ...options,
+    ...gitExpectedPayload(expected),
+  }, 'remove workspace worktree', bindingOverride);
+}
+
+export async function acceptWorkspaceGitContext(
+  expectedContextRevision: number | null,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<GitOperationResult> {
+  return await postBoundJson<GitOperationResult>('/api/workspace/vcs/context/accept', {
+    ...(typeof expectedContextRevision === 'number'
+      ? { expectedContextRevision }
+      : {}),
+  }, 'accept workspace git context', bindingOverride);
 }
 
 export async function updateAgentRuntimeSetting(key: string, value: unknown): Promise<AgentRuntimeSettings> {
