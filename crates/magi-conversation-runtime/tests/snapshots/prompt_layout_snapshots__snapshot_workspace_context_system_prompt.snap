@@ -5,7 +5,7 @@ expression: prompt
 ---
 当前工作区根目录是 `/workspace/demo`。当前运行平台是 `Linux`，原生路径使用正斜杠 `/`，绝对路径从 `/` 开始。文件工具必须优先传工作区相对路径；Shell 和文件工具的运行时工作目录已经设置为该工作区，不要在首次调用时复制、转义或重新拼接工作区绝对路径。如确需绝对路径，必须保持当前平台的原生格式，不得把 Windows 盘符路径改写成 Unix 路径，也不得反向改写。工具未显式传 cwd/root/path 的相对路径均按该工作区根目录理解。
 
-默认 Shell 使用 Linux 当前用户 Shell 的 `-c` 模式；运行时已经把工作目录设置为当前工作区，并继承 Magi 初始化的用户终端环境。命令必须使用 Linux/POSIX Shell 语法；不要在命令里再次拼接工作区绝对路径。丢弃输出使用 `/dev/null`。Git worktree 探测可使用 `if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo GIT_WORKTREE; else echo NOT_GIT_WORKTREE; fi`，确保非 Git 目录也以成功状态结束。不要生成 `NUL`、PowerShell 或 cmd.exe 专属语法。
+默认 Shell 使用 Linux 当前用户 Shell 的 `-c` 模式；运行时已经把工作目录设置为当前工作区，并继承 Magi 初始化的用户终端环境。命令必须使用 Linux/POSIX Shell 语法；不要在命令里再次拼接工作区绝对路径。丢弃输出使用 `/dev/null`。Git worktree 探测可使用 `if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo GIT_WORKTREE; else echo NOT_GIT_WORKTREE; fi`，确保非 Git 目录也以成功状态结束。不要生成 Windows 或 PowerShell 专属语法。
 
 跨文件搜索文本或查找文件路径时，必须优先调用 `search_text` / `search_semantic`；不要在 `shell_exec` 中假设 `rg` 或 `grep` 存在，因为桌面端和用户自行启动的 daemon 不保证安装这些外部命令。只有用户明确要求执行某个搜索命令，且已通过 `command -v` 确认命令可用时，才可以使用 `shell_exec` 调用它。
 

@@ -198,22 +198,6 @@ import {
                 {/if}
               </span>
             </button>
-            {#if desktopUpdaterState.phase === 'downloading'}
-              <div
-                class="desktop-update-progress desktop-update-progress--settings"
-                role="progressbar"
-                aria-valuemin="0"
-                aria-valuemax="100"
-                aria-valuenow={desktopUpdaterState.progress?.percent}
-                aria-label={i18n.t('settings.update.downloading')}
-              >
-                <span
-                  class="desktop-update-progress__fill"
-                  class:desktop-update-progress__fill--indeterminate={desktopUpdaterState.progress?.percent === undefined}
-                  style:width={desktopUpdaterState.progress?.percent !== undefined ? `${desktopUpdaterState.progress.percent}%` : undefined}
-                ></span>
-              </div>
-            {/if}
           {/if}
           <div class="locale-selector">
             <button

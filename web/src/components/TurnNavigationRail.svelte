@@ -6,6 +6,7 @@
     isTurnNavigationNeighbor,
     type TurnNavigationItem,
   } from '../lib/turn-navigation';
+  import { formatTraceableTime } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
 
   interface Props {
@@ -283,7 +284,12 @@
           style={`top: ${markerPositions[focusedItem.turnId] ?? 8}px;`}
         >
           <div class="turn-navigation-preview-kicker">
-            {i18n.t('messageList.turnNavigation.round', { index: focusedItem.index })} · {statusLabel(focusedItem.status)}
+            <span>{i18n.t('messageList.turnNavigation.round', { index: focusedItem.index })} · {statusLabel(focusedItem.status)}</span>
+            {#if focusedItem.sentAt !== undefined}
+              <span class="turn-navigation-preview-time">
+                {i18n.t('messageList.turnNavigation.sentAt', { time: formatTraceableTime(focusedItem.sentAt) })}
+              </span>
+            {/if}
           </div>
           <div class="turn-navigation-preview-summary">{focusedItem.summary}</div>
         </div>
@@ -454,9 +460,19 @@
   }
 
   .turn-navigation-preview-kicker {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
     margin-bottom: var(--space-2);
     color: var(--foreground-muted);
     font-size: var(--text-xs);
+  }
+
+  .turn-navigation-preview-time {
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   .turn-navigation-preview-summary {

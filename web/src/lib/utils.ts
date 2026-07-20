@@ -25,14 +25,25 @@ export function generateId(): string {
 }
 
 /**
- * 格式化时间戳
+ * 格式化用于消息溯源的本地时间：当天只显示时分，跨天显示完整日期与时分。
  */
-export function formatTime(timestamp: number): string {
+export function formatTraceableTime(
+  timestamp: number,
+  referenceTimestamp = Date.now(),
+): string {
+  if (!Number.isFinite(timestamp)) return '--';
   const date = new Date(timestamp);
-  return date.toLocaleTimeString('zh-CN', {
-    hour: '2-digit',
-    minute: '2-digit',
-  });
+  const referenceDate = new Date(referenceTimestamp);
+  if (Number.isNaN(date.getTime()) || Number.isNaN(referenceDate.getTime())) return '--';
+
+  const pad2 = (value: number) => String(value).padStart(2, '0');
+  const time = `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+  const isSameDay = date.getFullYear() === referenceDate.getFullYear()
+    && date.getMonth() === referenceDate.getMonth()
+    && date.getDate() === referenceDate.getDate();
+  if (isSameDay) return time;
+
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${time}`;
 }
 
 /**

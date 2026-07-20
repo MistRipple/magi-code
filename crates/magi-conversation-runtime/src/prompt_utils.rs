@@ -176,9 +176,9 @@ pub fn workspace_context_system_prompt_for_platform(root_path: &str, platform: &
     let shell_contract = if is_windows {
         "默认 Shell 使用 Windows PowerShell 的 `-Command` 模式，运行时已经把工作目录设置为当前工作区。命令必须使用 PowerShell 原生语法；不要在命令里再次拼接工作区绝对路径。丢弃输出使用 `$null`。Git worktree 探测可使用 `if (git rev-parse --is-inside-work-tree > $null 2>&1) { 'GIT_WORKTREE' } else { 'NOT_GIT_WORKTREE' }`，确保非 Git 目录也以成功状态结束。不要混用其他 Shell 方言或 Unix 专属语法；文件操作优先使用 `Get-ChildItem`、`Get-Content`、`Select-String` 等 PowerShell 命令。"
     } else if platform.eq_ignore_ascii_case("macos") {
-        "默认 Shell 使用 macOS 当前用户 Shell 的 `-c` 模式，通常是 zsh；运行时已经把工作目录设置为当前工作区，并继承 Magi 初始化的用户终端环境。命令必须使用 macOS/POSIX Shell 语法；不要在命令里再次拼接工作区绝对路径。丢弃输出使用 `/dev/null`。Git worktree 探测可使用 `if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo GIT_WORKTREE; else echo NOT_GIT_WORKTREE; fi`，确保非 Git 目录也以成功状态结束。不要生成 `NUL`、PowerShell 或 cmd.exe 专属语法。"
+        "默认 Shell 使用 macOS 当前用户 Shell 的 `-c` 模式，通常是 zsh；运行时已经把工作目录设置为当前工作区，并继承 Magi 初始化的用户终端环境。命令必须使用 macOS/POSIX Shell 语法；不要在命令里再次拼接工作区绝对路径。丢弃输出使用 `/dev/null`。Git worktree 探测可使用 `if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo GIT_WORKTREE; else echo NOT_GIT_WORKTREE; fi`，确保非 Git 目录也以成功状态结束。不要生成 Windows 或 PowerShell 专属语法。"
     } else {
-        "默认 Shell 使用 Linux 当前用户 Shell 的 `-c` 模式；运行时已经把工作目录设置为当前工作区，并继承 Magi 初始化的用户终端环境。命令必须使用 Linux/POSIX Shell 语法；不要在命令里再次拼接工作区绝对路径。丢弃输出使用 `/dev/null`。Git worktree 探测可使用 `if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo GIT_WORKTREE; else echo NOT_GIT_WORKTREE; fi`，确保非 Git 目录也以成功状态结束。不要生成 `NUL`、PowerShell 或 cmd.exe 专属语法。"
+        "默认 Shell 使用 Linux 当前用户 Shell 的 `-c` 模式；运行时已经把工作目录设置为当前工作区，并继承 Magi 初始化的用户终端环境。命令必须使用 Linux/POSIX Shell 语法；不要在命令里再次拼接工作区绝对路径。丢弃输出使用 `/dev/null`。Git worktree 探测可使用 `if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo GIT_WORKTREE; else echo NOT_GIT_WORKTREE; fi`，确保非 Git 目录也以成功状态结束。不要生成 Windows 或 PowerShell 专属语法。"
     };
 
     TPL_WORKSPACE_CONTEXT
@@ -268,7 +268,6 @@ mod tests {
         assert!(prompt.contains("-Command"));
         assert!(prompt.contains("$null"));
         assert!(prompt.contains("反斜杠"));
-        assert!(!prompt.contains("cmd.exe"));
         assert!(!prompt.contains("git -C"));
         assert!(!prompt.contains("只能出现在 if 条件中"));
     }
@@ -283,7 +282,7 @@ mod tests {
         assert!(prompt.contains("`-c`"));
         assert!(prompt.contains("/dev/null"));
         assert!(prompt.contains("正斜杠"));
-        assert!(!prompt.contains("cmd.exe /C"));
+        assert!(!prompt.contains("$null"));
     }
 
     #[test]
@@ -293,8 +292,7 @@ mod tests {
         assert!(prompt.contains("macOS"));
         assert!(prompt.contains("通常是 zsh"));
         assert!(prompt.contains("/dev/null"));
-        assert!(prompt.contains("不要生成 `NUL`"));
-        assert!(!prompt.contains("cmd.exe /C"));
+        assert!(!prompt.contains("$null"));
     }
 
     #[test]

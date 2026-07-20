@@ -55,3 +55,32 @@ fn explicit_exit_is_single_and_terminal() {
     assert_eq!(lifecycle.mark_stopped(), DesktopAction::ExitProcess);
     assert_eq!(lifecycle.state(), DesktopState::Stopped);
 }
+
+#[test]
+fn update_restart_has_a_separate_lifecycle_transition() {
+    let lifecycle = DesktopLifecycle::new();
+    lifecycle.mark_ready();
+
+    assert_eq!(lifecycle.request_update_restart(), DesktopAction::BeginExit);
+    assert_eq!(lifecycle.state(), DesktopState::Restarting);
+    assert_eq!(lifecycle.request_update_restart(), DesktopAction::Ignore);
+    assert_eq!(lifecycle.request_window_close(), DesktopAction::Ignore);
+    assert_eq!(lifecycle.mark_stopped(), DesktopAction::ExitProcess);
+    assert_eq!(lifecycle.state(), DesktopState::Stopped);
+}
+
+#[test]
+fn update_restart_forces_daemon_stop_before_install() {
+    assert!(DESKTOP_MAIN_SOURCE.contains("DESKTOP_SHUTDOWN_TIMEOUT"));
+    assert!(DESKTOP_MAIN_SOURCE.contains("fn force_shutdown_desktop_runtime"));
+    assert!(DESKTOP_MAIN_SOURCE.contains("request_update_restart()"));
+    assert!(DESKTOP_MAIN_SOURCE.contains("DesktopState::ShuttingDown | DesktopState::Restarting"));
+
+    let update_command = DESKTOP_MAIN_SOURCE
+        .split("fn prepare_update_restart(app: AppHandle)")
+        .nth(1)
+        .and_then(|source| source.split("fn install_tray").next())
+        .expect("update restart command should exist");
+    assert!(update_command.contains("force_shutdown_desktop_runtime"));
+    assert!(!update_command.contains("\n            shutdown_desktop_runtime("));
+}

@@ -1963,11 +1963,8 @@ fn resolve_shell_command_spec(
     match configured_shell {
         Some(shell) => {
             let spec = parse_shell_command_spec(&shell)?;
-            if cfg!(windows) && is_cmd_shell(&spec.program) {
-                return Err(
-                    "Windows 不再支持 cmd.exe；请使用 PowerShell（powershell.exe 或 pwsh）"
-                        .to_string(),
-                );
+            if cfg!(windows) && !is_powershell_shell(&spec.program) {
+                return Err("Windows 仅支持 PowerShell（powershell.exe 或 pwsh）".to_string());
             }
             Ok(spec)
         }
@@ -2005,11 +2002,6 @@ fn parse_shell_command_spec(shell: &str) -> Result<ShellCommandSpec, String> {
 }
 
 fn has_shell_command_argument(program: &str, arguments: &[String]) -> bool {
-    if is_cmd_shell(program) {
-        return arguments
-            .iter()
-            .any(|argument| argument.eq_ignore_ascii_case("/c"));
-    }
     if is_powershell_shell(program) {
         return arguments.iter().any(|argument| {
             argument.eq_ignore_ascii_case("-command") || argument.eq_ignore_ascii_case("-c")
@@ -2021,10 +2013,6 @@ fn has_shell_command_argument(program: &str, arguments: &[String]) -> bool {
                 .strip_prefix('-')
                 .is_some_and(|flags| flags.contains('c'))
     })
-}
-
-fn is_cmd_shell(program: &str) -> bool {
-    matches!(shell_executable_name(program).as_str(), "cmd" | "cmd.exe")
 }
 
 fn is_powershell_shell(program: &str) -> bool {
@@ -2063,8 +2051,6 @@ fn tokenize_shell_command_spec(shell: &str) -> Result<Vec<String>, String> {
 fn shell_arg(shell: &str) -> &'static str {
     if is_powershell_shell(shell) {
         "-Command"
-    } else if is_cmd_shell(shell) {
-        "/C"
     } else {
         "-c"
     }
@@ -4009,7 +3995,6 @@ mod tests {
 
     #[test]
     fn shell_argument_matches_selected_shell_dialect() {
-        assert_eq!(shell_arg("cmd.exe"), "/C");
         assert_eq!(
             shell_arg(r#"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"#),
             "-Command"
@@ -4040,13 +4025,6 @@ mod tests {
             ShellCommandSpec {
                 program: r#"C:\Program Files\PowerShell\7\pwsh.exe"#.to_string(),
                 arguments: vec!["-Command".to_string()],
-            }
-        );
-        assert_eq!(
-            parse_shell_command_spec("cmd.exe /Q").expect("cmd shell spec"),
-            ShellCommandSpec {
-                program: "cmd.exe".to_string(),
-                arguments: vec!["/Q".to_string(), "/C".to_string()],
             }
         );
         assert_eq!(
@@ -4101,7 +4079,7 @@ mod tests {
                 ],
             }
         );
-        assert!(resolve_shell_command_spec(Some("cmd.exe".to_string())).is_err());
+        assert!(resolve_shell_command_spec(Some("sh.exe".to_string())).is_err());
     }
 
     #[test]

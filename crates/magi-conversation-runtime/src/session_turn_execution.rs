@@ -1804,11 +1804,7 @@ fn stream_session_turn_round(
                 .map(PathBuf::from)
                 .and_then(|root| mgr.get_session_for_workspace(request.session_id.as_str(), &root))
         });
-        let execution_group_id = session_store
-            .execution_ownership(&request.session_id)
-            .and_then(|ownership| ownership.mission_id)
-            .map(|mid| mid.to_string())
-            .unwrap_or_else(|| format!("session:{}", request.session_id));
+        let execution_group_id = format!("turn:{}", request.turn_id);
         let tool_batch = append_session_tool_call_items_batch_with_context(
             crate::session_writeback::SessionToolCallBatchContext {
                 session_store,

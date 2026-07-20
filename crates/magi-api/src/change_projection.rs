@@ -131,20 +131,17 @@ pub(crate) fn resolve_session_change_scope(
     let mission_id = ownership
         .as_ref()
         .and_then(|ownership| ownership.mission_id.clone());
-    let execution_group_id = mission_id
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| session_execution_group_id(session_id));
-    if let Some(requested_execution_group_id) = execution_group_id_override
+    let execution_group_id = execution_group_id_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        && requested_execution_group_id != execution_group_id
-    {
-        return Err(ApiError::InvalidInput(format!(
-            "执行分组 {} 不属于当前会话 {}",
-            requested_execution_group_id, session_id
-        )));
-    }
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            mission_id
+                .as_ref()
+                .map(ToString::to_string)
+                .or_else(|| Some(session_execution_group_id(session_id)))
+        })
+        .expect("session execution group must always have a fallback");
 
     let workspace_root = resolve_workspace_root(state, &bound_workspace_id)?;
     let contributors = state
@@ -313,6 +310,10 @@ pub(crate) fn collect_session_pending_changes_with_state(
 }
 
 fn convert_pending(scope: &SessionChangeScope, change: PendingChange) -> PendingChangeDto {
+    let execution_group_id = change
+        .execution_group_id
+        .clone()
+        .unwrap_or_else(|| scope.execution_group_id.clone());
     let absolute_path = scope.workspace_root.join(&change.path);
     let preview_can_open_workspace_file = matches!(
         change.change_kind,
@@ -329,7 +330,7 @@ fn convert_pending(scope: &SessionChangeScope, change: PendingChange) -> Pending
         workspace_id: scope.workspace_id.as_str().to_string(),
         workspace_path: scope.workspace_root.to_string_lossy().to_string(),
         file_path: change.path.clone(),
-        snapshot_id: format!("{}:{}", scope.execution_group_id, change.path),
+        snapshot_id: format!("{}:{}", execution_group_id, change.path),
         updated_at: UtcMillis(change.timestamp_ms),
         r#type,
         additions,
@@ -355,7 +356,7 @@ fn convert_pending(scope: &SessionChangeScope, change: PendingChange) -> Pending
         tool_call_id: change.tool_call_id,
         worker_id: change.worker_id,
         contributors: scope.contributors.clone(),
-        execution_group_id: scope.execution_group_id.clone(),
+        execution_group_id,
     }
 }
 

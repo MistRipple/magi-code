@@ -5525,7 +5525,6 @@ fn shell_schema_describes_platform_native_dialect() {
     assert!(command.contains("PowerShell"));
     assert!(shell.contains("Windows"));
     assert!(shell.contains("PowerShell"));
-    assert!(!shell.contains("cmd.exe /C"));
     assert!(shell.contains("Linux"));
     assert!(access_mode.contains("NUL"));
     assert!(access_mode.contains("/dev/null"));

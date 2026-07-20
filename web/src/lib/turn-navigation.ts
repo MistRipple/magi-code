@@ -13,6 +13,7 @@ export interface TurnNavigationMessage {
   turnStatus: TurnNavigationStatus;
   type: string;
   content: string;
+  timestamp: number;
 }
 
 export interface TurnNavigationItem {
@@ -23,6 +24,7 @@ export interface TurnNavigationItem {
   messageIds: string[];
   anchorMessageId: string;
   summary: string;
+  sentAt?: number;
 }
 
 export interface TurnNavigationRailLayout {
@@ -64,6 +66,11 @@ export function buildTurnNavigationItems(
   for (const message of messages) {
     const existing = itemsByTurnId.get(message.turnId);
     const content = normalizeSummary(message.content);
+    const sentAt = message.type === 'user_input'
+      && Number.isFinite(message.timestamp)
+      && message.timestamp >= 0
+      ? Math.floor(message.timestamp)
+      : undefined;
     if (!existing) {
       itemsByTurnId.set(message.turnId, {
         turnId: message.turnId,
@@ -73,6 +80,7 @@ export function buildTurnNavigationItems(
         anchorMessageId: message.id,
         summary: message.type === 'user_input' ? content : '',
         fallbackSummary: content,
+        ...(sentAt !== undefined ? { sentAt } : {}),
       });
       continue;
     }
@@ -81,6 +89,9 @@ export function buildTurnNavigationItems(
     existing.status = message.turnStatus;
     if (!existing.summary && message.type === 'user_input' && content) {
       existing.summary = content;
+    }
+    if (existing.sentAt === undefined && sentAt !== undefined) {
+      existing.sentAt = sentAt;
     }
     if (!existing.fallbackSummary && content) {
       existing.fallbackSummary = content;

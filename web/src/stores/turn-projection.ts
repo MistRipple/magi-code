@@ -344,6 +344,12 @@ function buildMessage(
   const responseDurationMs = canShowTurnResponseDuration(presentation, item)
     ? turn.responseDurationMs
     : undefined;
+  const responseCompletedAt = responseDurationMs !== undefined
+    && typeof turn.completedAt === 'number'
+    && Number.isFinite(turn.completedAt)
+    && turn.completedAt >= 0
+    ? turn.completedAt
+    : undefined;
   const presentationSeq = requirePresentationSeq(presentation, item);
   const images = item.kind === 'user_message'
     ? normalizeMessageImagesFromMetadata(item.metadata)
@@ -405,6 +411,7 @@ function buildMessage(
         item.tool?.error?.length ?? 0,
       ].join(':'),
       ...(responseDurationMs !== undefined ? { responseDurationMs } : {}),
+      ...(responseCompletedAt !== undefined ? { responseCompletedAt } : {}),
       canonical: true,
     },
   };

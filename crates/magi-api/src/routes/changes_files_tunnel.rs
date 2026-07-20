@@ -18,6 +18,8 @@ use magi_conversation_runtime::usage_recording::{
 };
 use magi_core::UtcMillis;
 use magi_snapshot::SnapshotSession;
+#[cfg(test)]
+use magi_snapshot::{ToolHook, ToolHookCtx};
 
 use super::session_scope::{
     parse_session_id, require_registered_workspace_binding,
@@ -516,30 +518,30 @@ async fn revert_execution_group_changes(
         &session_id,
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
-        Some(request.execution_group_id.as_str()),
+        None,
     )?;
-    if scope.execution_group_id != request.execution_group_id {
+    let snapshot = require_snapshot_session(&state, &scope).await?;
+    if !snapshot
+        .has_execution_group(&request.execution_group_id)
+        .map_err(|e| ApiError::internal_assembly("检查执行分组失败", e))?
+    {
         return Err(ApiError::InvalidInput(format!(
             "执行分组 {} 不属于当前会话 {}",
             request.execution_group_id, scope.session_id
         )));
     }
-    let snapshot = require_snapshot_session(&state, &scope).await?;
     let pending = snapshot
         .pending_changes()
         .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
     let paths: Vec<String> = pending
         .iter()
-        .filter(|c| {
-            c.execution_group_id
-                .as_deref()
-                .map(|id| id == request.execution_group_id)
-                .unwrap_or(false)
+        .filter(|change| {
+            change.execution_group_id.as_deref() == Some(request.execution_group_id.as_str())
         })
-        .map(|c| c.path.clone())
+        .map(|change| change.path.clone())
         .collect();
     snapshot
-        .revert(&paths)
+        .revert_execution_group(&request.execution_group_id)
         .map_err(|e| ApiError::internal_assembly("revert 执行分组失败", e))?;
 
     Ok(Json(serde_json::json!({
@@ -2244,8 +2246,15 @@ mod tests {
         )
         .await;
         fs::create_dir_all(root.join("tmp")).expect("tmp dir should create");
+        let ctx = ToolHookCtx {
+            tool_call_id: "call-route-revert-all".into(),
+            worker_id: None,
+            execution_group_id: Some("route-revert-all".into()),
+            declared_paths: vec![PathBuf::from("tmp/added.txt")],
+        };
+        snap.before_tool(&ctx);
         fs::write(root.join("tmp/added.txt"), "new file\n").expect("added file should write");
-        snap.reconcile().expect("reconcile should succeed");
+        snap.after_tool(&ctx);
 
         let before_projection = collect_session_pending_changes_with_state(
             &state,
@@ -2294,8 +2303,15 @@ mod tests {
             None,
         )
         .await;
+        let ctx = ToolHookCtx {
+            tool_call_id: "call-route-revert-single".into(),
+            worker_id: None,
+            execution_group_id: Some("route-revert-single".into()),
+            declared_paths: vec![PathBuf::from("alpha.txt")],
+        };
+        snap.before_tool(&ctx);
         fs::write(root.join("alpha.txt"), "modified\n").expect("alpha modify");
-        snap.reconcile().expect("reconcile should succeed");
+        snap.after_tool(&ctx);
 
         let response = routes()
             .with_state(state)

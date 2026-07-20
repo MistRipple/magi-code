@@ -223,10 +223,10 @@ await withGoldenViteServer(async (server) => {
   const navigation = await server.ssrLoadModule('/src/lib/turn-navigation.ts');
 
   const items = navigation.buildTurnNavigationItems([
-    { id: 'assistant-1', turnId: 'turn-1', turnSeq: 1, turnStatus: 'running', type: 'text', content: '正在分析' },
-    { id: 'user-1', turnId: 'turn-1', turnSeq: 1, turnStatus: 'running', type: 'user_input', content: '先分析 Windows 路径问题。' },
-    { id: 'user-2', turnId: 'turn-2', turnSeq: 2, turnStatus: 'completed', type: 'user_input', content: '修复完成了吗？' },
-    { id: 'assistant-2', turnId: 'turn-2', turnSeq: 2, turnStatus: 'completed', type: 'text', content: '已完成修复。' },
+    { id: 'assistant-1', turnId: 'turn-1', turnSeq: 1, turnStatus: 'running', type: 'text', content: '正在分析', timestamp: 1_000 },
+    { id: 'user-1', turnId: 'turn-1', turnSeq: 1, turnStatus: 'running', type: 'user_input', content: '先分析 Windows 路径问题。', timestamp: 1_100 },
+    { id: 'user-2', turnId: 'turn-2', turnSeq: 2, turnStatus: 'completed', type: 'user_input', content: '修复完成了吗？', timestamp: 2_000 },
+    { id: 'assistant-2', turnId: 'turn-2', turnSeq: 2, turnStatus: 'completed', type: 'text', content: '已完成修复。', timestamp: 2_100 },
   ]);
 
   assert.deepEqual(items, [
@@ -238,6 +238,7 @@ await withGoldenViteServer(async (server) => {
       messageIds: ['assistant-1', 'user-1'],
       anchorMessageId: 'assistant-1',
       summary: '先分析 Windows 路径问题。',
+      sentAt: 1_100,
     },
     {
       turnId: 'turn-2',
@@ -247,6 +248,7 @@ await withGoldenViteServer(async (server) => {
       messageIds: ['user-2', 'assistant-2'],
       anchorMessageId: 'user-2',
       summary: '修复完成了吗？',
+      sentAt: 2_000,
     },
   ]);
 

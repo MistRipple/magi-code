@@ -806,11 +806,11 @@ pub(crate) fn shell_command_required_executables(command: &str, shell: &str) -> 
     for segment in segments {
         let words = shell_segment_words(segment);
         let was_in_deferred_block = deferred_block_depth > 0;
-        let closes_deferred_block = shell_segment_closes_deferred_block(&words, dialect);
+        let closes_deferred_block = shell_segment_closes_deferred_block(&words);
         if closes_deferred_block {
             deferred_block_depth = deferred_block_depth.saturating_sub(1);
         }
-        let opens_deferred_block = shell_segment_opens_deferred_block(&words, dialect);
+        let opens_deferred_block = shell_segment_opens_deferred_block(&words);
         if opens_deferred_block {
             deferred_block_depth += 1;
         }
@@ -820,7 +820,6 @@ pub(crate) fn shell_command_required_executables(command: &str, shell: &str) -> 
             || closes_deferred_block
             || shell_segment_is_declaration(&words)
             || shell_segment_is_command_probe(&words)
-            || shell_segment_is_cmd_conditional(&words, dialect)
         {
             continue;
         }
@@ -842,10 +841,7 @@ pub(crate) fn shell_command_required_executables(command: &str, shell: &str) -> 
     executables
 }
 
-fn shell_segment_opens_deferred_block(words: &[&str], dialect: ShellDialect) -> bool {
-    if dialect == ShellDialect::Cmd {
-        return false;
-    }
+fn shell_segment_opens_deferred_block(words: &[&str]) -> bool {
     shell_declared_function(words).is_some()
         || words.first().is_some_and(|word| {
             matches!(
@@ -855,21 +851,13 @@ fn shell_segment_opens_deferred_block(words: &[&str], dialect: ShellDialect) -> 
         })
 }
 
-fn shell_segment_closes_deferred_block(words: &[&str], dialect: ShellDialect) -> bool {
-    dialect != ShellDialect::Cmd
-        && words.iter().any(|word| {
-            matches!(
-                word.to_ascii_lowercase().as_str(),
-                "fi" | "done" | "esac" | "}"
-            )
-        })
-}
-
-fn shell_segment_is_cmd_conditional(words: &[&str], dialect: ShellDialect) -> bool {
-    dialect == ShellDialect::Cmd
-        && words
-            .first()
-            .is_some_and(|word| matches!(word.to_ascii_lowercase().as_str(), "if" | "for"))
+fn shell_segment_closes_deferred_block(words: &[&str]) -> bool {
+    words.iter().any(|word| {
+        matches!(
+            word.to_ascii_lowercase().as_str(),
+            "fi" | "done" | "esac" | "}"
+        )
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -881,18 +869,17 @@ enum ShellToken {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShellDialect {
     Posix,
-    Cmd,
     PowerShell,
 }
 
 impl ShellDialect {
     fn from_shell(shell: &str) -> Self {
         let shell = shell.trim().to_ascii_lowercase();
-        if shell.contains("powershell") || shell.ends_with("pwsh") || shell.ends_with("pwsh.exe") {
-            Self::PowerShell
-        } else if shell.contains("cmd") {
-            Self::Cmd
-        } else if shell.is_empty() && cfg!(windows) {
+        if shell.contains("powershell")
+            || shell.ends_with("pwsh")
+            || shell.ends_with("pwsh.exe")
+            || (shell.is_empty() && cfg!(windows))
+        {
             Self::PowerShell
         } else {
             Self::Posix
@@ -902,7 +889,6 @@ impl ShellDialect {
     fn escape_char(self) -> char {
         match self {
             Self::Posix => '\\',
-            Self::Cmd => '^',
             Self::PowerShell => '`',
         }
     }
@@ -942,7 +928,7 @@ fn shell_command_tokens(command: &str, dialect: ShellDialect) -> Vec<ShellToken>
             tokens.push(ShellToken::Operator(";".to_string()));
             continue;
         }
-        if dialect != ShellDialect::Cmd && ch == '#' && word.is_empty() {
+        if ch == '#' && word.is_empty() {
             for comment_character in chars.by_ref() {
                 if comment_character == '\n' {
                     tokens.push(ShellToken::Operator(";".to_string()));
@@ -1126,50 +1112,6 @@ fn shell_word_is_builtin_or_keyword(word: &str, dialect: ShellDialect) -> bool {
                     | "where"
                     | "write"
             ))
-    {
-        return true;
-    }
-    if dialect == ShellDialect::Cmd
-        && matches!(
-            normalized.as_str(),
-            "assoc"
-                | "call"
-                | "cd"
-                | "chcp"
-                | "cls"
-                | "color"
-                | "copy"
-                | "del"
-                | "dir"
-                | "echo"
-                | "erase"
-                | "exit"
-                | "for"
-                | "ftype"
-                | "goto"
-                | "if"
-                | "md"
-                | "mkdir"
-                | "move"
-                | "path"
-                | "pause"
-                | "popd"
-                | "prompt"
-                | "pushd"
-                | "rd"
-                | "ren"
-                | "rename"
-                | "rmdir"
-                | "set"
-                | "setlocal"
-                | "shift"
-                | "start"
-                | "title"
-                | "type"
-                | "ver"
-                | "verify"
-                | "vol"
-        )
     {
         return true;
     }
@@ -1502,10 +1444,7 @@ fn normalize_path_for_lock(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod shell_path_parser_tests {
-    use super::{
-        ShellDialect, ShellToken, shell_command_basename, shell_command_required_executables,
-        shell_command_tokens, shell_word_looks_like_path,
-    };
+    use super::{shell_command_required_executables, shell_word_looks_like_path};
 
     #[test]
     fn shell_dependency_scan_handles_comments_pipelines_and_command_probes() {
@@ -1536,17 +1475,6 @@ mod shell_path_parser_tests {
     }
 
     #[test]
-    fn shell_dependency_scan_understands_windows_cmd_builtins() {
-        assert_eq!(
-            shell_command_required_executables(
-                "dir /B && type package.json && git status",
-                "cmd.exe"
-            ),
-            vec!["git".to_string()]
-        );
-    }
-
-    #[test]
     fn shell_dependency_scan_understands_powershell_cmdlets() {
         assert_eq!(
             shell_command_required_executables(
@@ -1558,22 +1486,7 @@ mod shell_path_parser_tests {
     }
 
     #[test]
-    fn cmd_tokenizer_preserves_windows_backslashes() {
-        assert_eq!(
-            shell_command_tokens(r#"type "C:\Users\demo\file.txt""#, ShellDialect::Cmd),
-            vec![
-                ShellToken::Word("type".to_string()),
-                ShellToken::Word(r#"C:\Users\demo\file.txt"#.to_string()),
-            ]
-        );
-    }
-
-    #[test]
     fn windows_paths_are_recognized_by_shell_policy() {
-        assert_eq!(
-            shell_command_basename(r#"C:\Windows\System32\cmd.exe"#),
-            "cmd.exe"
-        );
         assert!(shell_word_looks_like_path(r#"C:\Users\demo\file.txt"#));
         assert!(shell_word_looks_like_path(r#"\\server\share\folder"#));
     }

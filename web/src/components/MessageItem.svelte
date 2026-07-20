@@ -12,7 +12,11 @@
   import { i18n } from '../stores/i18n.svelte';
   import { retryRuntimeState } from '../stores/messages.svelte';
   import { getAgentColor } from '../lib/agent-colors';
-  import { formatDuration, formatElapsed as formatElapsedMmSs } from '../lib/utils';
+  import {
+    formatDuration,
+    formatElapsed as formatElapsedMmSs,
+    formatTraceableTime,
+  } from '../lib/utils';
   import { isRuntimeInternalTool } from '../shared/tool-visibility';
 
   // Props
@@ -174,15 +178,6 @@
     return `${message.id}:${id}`;
   }
 
-  // 格式化时间戳
-  function formatTime(timestamp: number): string {
-    const date = new Date(timestamp);
-    return date.toLocaleTimeString(i18n.locale, {
-      hour: '2-digit',
-      minute: '2-digit'
-    });
-  }
-
   function formatElapsed(seconds: number): string {
     return formatElapsedMmSs(seconds);
   }
@@ -263,6 +258,12 @@
       ? value
       : null;
   });
+  const responseCompletedAt = $derived.by(() => {
+    const value = message.metadata?.responseCompletedAt;
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0
+      ? value
+      : null;
+  });
   const showResponseDuration = $derived.by(() => (
     displayContext === 'thread'
     && !isStreaming
@@ -331,7 +332,7 @@
     <span class="notice-text">
       <ErrorDetailPopover text={noticeText} maxInlineChars={96} />
     </span>
-    <span class="notice-time">{formatTime(message.timestamp)}</span>
+    <span class="notice-time">{formatTraceableTime(message.timestamp)}</span>
   </div>
 <!-- 用户消息：简洁显示 -->
 {:else if isUser}
@@ -375,17 +376,19 @@
     </div>
     <div class="user-time">
       {#if isSupplementary}<span class="supplementary-tag">{i18n.t('messageItem.supplementaryTag')}</span>{/if}
-      <span class="user-timestamp">{formatTime(message.timestamp)}</span>
-      {#if canEdit}
-        <button type="button" class="message-action" onclick={() => onEdit?.()} title={i18n.t('messageItem.editTitle')}>
-          <Icon name="edit" size={14} />
-        </button>
-      {/if}
-      {#if copyableText.trim()}
-        <button type="button" class="message-action" onclick={() => void copyMessage()} title={i18n.t('messageItem.copyTitle')}>
-          <Icon name={copied ? 'check' : 'copy'} size={14} />
-        </button>
-      {/if}
+      <span class="user-timestamp">{formatTraceableTime(message.timestamp)}</span>
+      <div class="user-actions">
+        {#if canEdit}
+          <button type="button" class="message-action" onclick={() => onEdit?.()} title={i18n.t('messageItem.editTitle')}>
+            <Icon name="edit" size={14} />
+          </button>
+        {/if}
+        {#if copyableText.trim()}
+          <button type="button" class="message-action" onclick={() => void copyMessage()} title={i18n.t('messageItem.copyTitle')}>
+            <Icon name={copied ? 'check' : 'copy'} size={14} />
+          </button>
+        {/if}
+      </div>
     </div>
   </div>
 <!-- 助手消息：单一纯流式渲染路径，收到什么立即展示，不做模式切换 -->
@@ -448,6 +451,9 @@
           <div class="message-runtime-footer completed" class:has-content={hasVisibleContent}>
             <span class="message-runtime-text">
               {i18n.t('messageItem.responseDurationLabel')} {formatDurationMs(responseDurationMs ?? 0)}
+              {#if responseCompletedAt !== null}
+                · {formatTraceableTime(responseCompletedAt)}
+              {/if}
             </span>
           </div>
         {/if}
@@ -574,17 +580,49 @@
   }
 
   .user-time {
+    align-self: flex-end;
+    width: auto;
+    height: 22px;
+    flex: 0 0 22px;
     font-size: var(--text-xs);
     color: var(--foreground-muted);
     margin-top: var(--space-1);
     display: flex;
     align-items: center;
-    gap: var(--space-1);
     justify-content: flex-end;
+    gap: 10px;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateY(-3px);
+    transition:
+      opacity 140ms ease,
+      transform 140ms ease,
+      visibility 0s linear 140ms;
+  }
+
+  .message-item.user:hover .user-time,
+  .message-item.user:focus-within .user-time {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateY(0);
+    transition-delay: 0s;
+  }
+
+  .user-actions {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    width: auto;
+    flex: 0 0 auto;
+    gap: 10px;
   }
 
   .user-timestamp {
+    flex: 0 0 auto;
     line-height: 22px;
+    white-space: nowrap;
   }
 
   .message-action {
@@ -593,6 +631,7 @@
     justify-content: center;
     width: 22px;
     height: 22px;
+    margin-inline: -4px;
     padding: 0;
     border: 0;
     border-radius: 4px;

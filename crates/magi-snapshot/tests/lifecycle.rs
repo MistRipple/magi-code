@@ -276,8 +276,15 @@ async fn revert_rename_restores_old_path_and_removes_new_path() {
         .await
         .unwrap();
 
+    let ctx = ToolHookCtx {
+        tool_call_id: "call-rename-revert".into(),
+        worker_id: None,
+        execution_group_id: Some("rename-revert".into()),
+        declared_paths: vec![PathBuf::from("old.txt"), PathBuf::from("new.txt")],
+    };
+    session.before_tool(&ctx);
     fs::rename(root.join("old.txt"), root.join("new.txt")).unwrap();
-    session.reconcile().unwrap();
+    session.after_tool(&ctx);
     assert_eq!(session.pending_changes().unwrap().len(), 1);
 
     // 仅传入新路径应同时删除 new.txt 并恢复 old.txt。
@@ -322,8 +329,15 @@ async fn revert_restores_baseline_content() {
     let mgr = SnapshotManager::new();
     let session = mgr.start_session("s6".into(), root.clone()).await.unwrap();
 
+    let ctx = ToolHookCtx {
+        tool_call_id: "call-revert-baseline".into(),
+        worker_id: None,
+        execution_group_id: Some("revert-baseline".into()),
+        declared_paths: vec![PathBuf::from("y.txt")],
+    };
+    session.before_tool(&ctx);
     fs::write(root.join("y.txt"), "edited").unwrap();
-    session.reconcile().unwrap();
+    session.after_tool(&ctx);
     assert_eq!(session.pending_changes().unwrap().len(), 1);
 
     session.revert(&["y.txt".into()]).unwrap();
@@ -340,8 +354,15 @@ async fn revert_added_file_removes_it() {
     let mgr = SnapshotManager::new();
     let session = mgr.start_session("s7".into(), root.clone()).await.unwrap();
 
+    let ctx = ToolHookCtx {
+        tool_call_id: "call-revert-added".into(),
+        worker_id: None,
+        execution_group_id: Some("revert-added".into()),
+        declared_paths: vec![PathBuf::from("brand_new.txt")],
+    };
+    session.before_tool(&ctx);
     fs::write(root.join("brand_new.txt"), "added").unwrap();
-    session.reconcile().unwrap();
+    session.after_tool(&ctx);
     assert_eq!(session.pending_changes().unwrap().len(), 1);
 
     session.revert(&["brand_new.txt".into()]).unwrap();
@@ -432,6 +453,86 @@ async fn tool_hook_attribution_is_recorded() {
     assert_eq!(z.source, SourceKind::Tool);
     assert_eq!(z.tool_call_id.as_deref(), Some("call-42"));
     assert_eq!(z.worker_id.as_deref(), Some("w-7"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revert_execution_group_restores_state_before_that_group_only() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("round.txt"), "v0").unwrap();
+
+    let mgr = SnapshotManager::new();
+    let session = mgr
+        .start_session("s-revert-round-history".into(), root.clone())
+        .await
+        .unwrap();
+
+    let first = ToolHookCtx {
+        tool_call_id: "call-round-a".into(),
+        worker_id: None,
+        execution_group_id: Some("round-a".into()),
+        declared_paths: vec![PathBuf::from("round.txt")],
+    };
+    session.before_tool(&first);
+    fs::write(root.join("round.txt"), "v1").unwrap();
+    session.after_tool(&first);
+
+    let second = ToolHookCtx {
+        tool_call_id: "call-round-b".into(),
+        worker_id: None,
+        execution_group_id: Some("round-b".into()),
+        declared_paths: vec![PathBuf::from("round.txt")],
+    };
+    session.before_tool(&second);
+    fs::write(root.join("round.txt"), "v2").unwrap();
+    session.after_tool(&second);
+
+    let pending_before_revert = session.pending_changes().unwrap();
+    assert_eq!(
+        pending_before_revert[0].execution_group_id.as_deref(),
+        Some("round-b")
+    );
+    assert_eq!(session.revert_execution_group("round-b").unwrap(), 1);
+    assert_eq!(fs::read_to_string(root.join("round.txt")).unwrap(), "v1");
+    let pending_after_revert = session.pending_changes().unwrap();
+    assert_eq!(
+        pending_after_revert[0].execution_group_id.as_deref(),
+        Some("round-a")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revert_execution_group_rejects_later_external_change() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("round.txt"), "v0").unwrap();
+
+    let mgr = SnapshotManager::new();
+    let session = mgr
+        .start_session("s-revert-round-conflict".into(), root.clone())
+        .await
+        .unwrap();
+    let group = ToolHookCtx {
+        tool_call_id: "call-round-conflict".into(),
+        worker_id: None,
+        execution_group_id: Some("round-conflict".into()),
+        declared_paths: vec![PathBuf::from("round.txt")],
+    };
+    session.before_tool(&group);
+    fs::write(root.join("round.txt"), "v1").unwrap();
+    session.after_tool(&group);
+
+    fs::write(root.join("round.txt"), "external").unwrap();
+    session.reconcile().unwrap();
+
+    let error = session
+        .revert_execution_group("round-conflict")
+        .expect_err("a later external change must not be overwritten");
+    assert!(error.to_string().contains("changed after completion"));
+    assert_eq!(
+        fs::read_to_string(root.join("round.txt")).unwrap(),
+        "external"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -719,8 +820,15 @@ async fn restarted_shared_blob_survives_until_every_session_releases_it() {
         .unwrap();
 
     restarted.drop_session("s-shared-a").await.unwrap();
+    let ctx = ToolHookCtx {
+        tool_call_id: "call-shared-revert".into(),
+        worker_id: None,
+        execution_group_id: Some("shared-revert".into()),
+        declared_paths: vec![PathBuf::from("shared.txt")],
+    };
+    session_b.before_tool(&ctx);
     fs::write(root.join("shared.txt"), "changed by remaining session").unwrap();
-    session_b.reconcile().unwrap();
+    session_b.after_tool(&ctx);
     session_b.revert(&["shared.txt".into()]).unwrap();
 
     assert_eq!(

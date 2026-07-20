@@ -6,6 +6,7 @@ pub enum DesktopState {
     ReadyVisible,
     ReadyHidden,
     ShuttingDown,
+    Restarting,
     Stopped,
 }
 
@@ -65,9 +66,20 @@ impl DesktopLifecycle {
         })
     }
 
+    pub fn request_update_restart(&self) -> DesktopAction {
+        self.transition(|state| match state {
+            DesktopState::Starting | DesktopState::ReadyVisible | DesktopState::ReadyHidden => {
+                (DesktopState::Restarting, DesktopAction::BeginExit)
+            }
+            _ => (state, DesktopAction::Ignore),
+        })
+    }
+
     pub fn mark_stopped(&self) -> DesktopAction {
         self.transition(|state| match state {
-            DesktopState::ShuttingDown => (DesktopState::Stopped, DesktopAction::ExitProcess),
+            DesktopState::ShuttingDown | DesktopState::Restarting => {
+                (DesktopState::Stopped, DesktopAction::ExitProcess)
+            }
             _ => (state, DesktopAction::Ignore),
         })
     }

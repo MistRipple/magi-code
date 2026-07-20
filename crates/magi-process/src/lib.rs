@@ -977,11 +977,10 @@ mod tests {
         assert!(commands.contains(&"rg"));
         if cfg!(windows) {
             assert!(commands.contains(&"powershell"));
-            assert!(!commands.contains(&"cmd"));
             assert!(!commands.contains(&"zsh"));
         } else {
             assert!(commands.contains(&"sh"));
-            assert!(!commands.contains(&"cmd"));
+            assert!(!commands.contains(&"powershell"));
         }
     }
 

@@ -357,7 +357,6 @@ fn json_has_any(object: &serde_json::Map<String, serde_json::Value>, keys: &[&st
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShellDialect {
     Posix,
-    Cmd,
     PowerShell,
 }
 
@@ -365,7 +364,6 @@ impl ShellDialect {
     fn escape_char(self) -> char {
         match self {
             Self::Posix => '\\',
-            Self::Cmd => '^',
             Self::PowerShell => '`',
         }
     }
@@ -373,11 +371,11 @@ impl ShellDialect {
 
 fn shell_dialect(shell: &str) -> ShellDialect {
     let shell = shell.trim().to_ascii_lowercase();
-    if shell.contains("powershell") || shell.ends_with("pwsh") || shell.ends_with("pwsh.exe") {
-        ShellDialect::PowerShell
-    } else if shell.contains("cmd") {
-        ShellDialect::Cmd
-    } else if shell.is_empty() && cfg!(windows) {
+    if shell.contains("powershell")
+        || shell.ends_with("pwsh")
+        || shell.ends_with("pwsh.exe")
+        || (shell.is_empty() && cfg!(windows))
+    {
         ShellDialect::PowerShell
     } else {
         ShellDialect::Posix
@@ -483,10 +481,7 @@ fn redirection_target_is_null_device(target: &str, dialect: ShellDialect) -> boo
     let trimmed = target.trim_matches(|ch| matches!(ch, '"' | '\''));
     match dialect {
         ShellDialect::Posix => trimmed == "/dev/null",
-        ShellDialect::Cmd => trimmed.eq_ignore_ascii_case("NUL"),
-        ShellDialect::PowerShell => {
-            trimmed.eq_ignore_ascii_case("NUL") || trimmed.eq_ignore_ascii_case("$null")
-        }
+        ShellDialect::PowerShell => trimmed.eq_ignore_ascii_case("$null"),
     }
 }
 
@@ -566,10 +561,6 @@ fn shell_token_is_write_indicator(token: &str, dialect: ShellDialect) -> bool {
     common
         || match dialect {
             ShellDialect::Posix => false,
-            ShellDialect::Cmd => matches!(
-                token,
-                "del" | "erase" | "copy" | "xcopy" | "robocopy" | "move" | "ren" | "rename"
-            ),
             ShellDialect::PowerShell => matches!(
                 token,
                 "remove-item"
@@ -622,14 +613,6 @@ fn shell_invocation_has_write_indicator(
                     )
             })
         }
-        "cmd" | "cmd.exe" => shell_inline_script(arguments, &["/c", "/k"]).is_some_and(|script| {
-            depth >= 4
-                || shell_command_has_write_indicator_with_depth(
-                    script,
-                    ShellDialect::Cmd,
-                    depth + 1,
-                )
-        }),
         "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => {
             if arguments.iter().any(|argument| {
                 matches!(
@@ -1250,38 +1233,15 @@ mod tests {
     }
 
     #[test]
-    fn shell_read_only_declaration_allows_windows_null_device() {
-        let args =
-            r#"{"shell":"cmd.exe","command":"git status >NUL 2>&1","access_mode":"read_only"}"#;
+    fn shell_read_only_declaration_allows_powershell_null_output() {
+        let args = r#"{"shell":"powershell.exe","command":"git status > $null 2>&1","access_mode":"read_only"}"#;
         assert!(PermissionEngine::shell_arguments_request_read_only(args));
-    }
-
-    #[test]
-    fn shell_read_only_declaration_rejects_cmd_write_commands() {
-        for command in [
-            "del notes.txt",
-            "copy source.txt target.txt",
-            "move source.txt target.txt",
-            "mkdir output",
-        ] {
-            let args = serde_json::json!({
-                "shell": "cmd.exe",
-                "command": command,
-                "access_mode": "read_only"
-            })
-            .to_string();
-            assert!(
-                !PermissionEngine::shell_arguments_request_read_only(&args),
-                "cmd write command must be rejected: {command}"
-            );
-        }
     }
 
     #[test]
     fn shell_read_only_declaration_rejects_powershell_write_commands() {
         for command in [
             "Remove-Item notes.txt",
-            "Set-Content notes.txt value",
             "Copy-Item source.txt target.txt",
             "Move-Item source.txt target.txt",
             "New-Item output -ItemType Directory",
@@ -1311,7 +1271,6 @@ mod tests {
                 "node -e 'require(\"fs\").writeFileSync(\"out\", \"x\")'",
             ),
             ("/bin/zsh", "cargo test"),
-            ("cmd.exe", "cmd /C del nested.txt"),
             (
                 "powershell.exe",
                 "powershell -Command Set-Content nested.txt value",

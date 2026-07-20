@@ -228,6 +228,13 @@ impl SnapshotSession {
         for meta in current.values() {
             self.retain_meta_blob(meta);
         }
+        if let Ok(events) = self.events.read_all() {
+            for event in events {
+                if let Some(meta) = event.before.as_ref() {
+                    self.retain_meta_blob(meta);
+                }
+            }
+        }
     }
 
     pub(crate) fn release_runtime_blob_ownership(&self) -> SnapshotResult<()> {
@@ -240,6 +247,11 @@ impl SnapshotSession {
         let current = self.current.read().expect("current poisoned");
         for meta in current.values() {
             self.release_meta_blob(meta)?;
+        }
+        for event in self.events.read_all()? {
+            if let Some(meta) = event.before.as_ref() {
+                self.release_meta_blob(meta)?;
+            }
         }
         Ok(())
     }
@@ -321,8 +333,15 @@ impl SnapshotSession {
             after: Some(meta.clone()),
         };
 
+        if let Some(previous) = event.before.as_ref() {
+            self.retain_meta_blob(previous);
+        }
+
         if let Err(error) = self.events.append(&event) {
             self.release_meta_blob(&meta)?;
+            if let Some(previous) = event.before.as_ref() {
+                self.release_meta_blob(previous)?;
+            }
             return Err(error);
         }
         let replaced = self
@@ -367,7 +386,15 @@ impl SnapshotSession {
             before,
             after: None,
         };
-        self.events.append(&event)?;
+        if let Some(previous) = event.before.as_ref() {
+            self.retain_meta_blob(previous);
+        }
+        if let Err(error) = self.events.append(&event) {
+            if let Some(previous) = event.before.as_ref() {
+                self.release_meta_blob(previous)?;
+            }
+            return Err(error);
+        }
         let removed = self.current.write().expect("current poisoned").remove(&rel);
         if let Some(previous) = removed.as_ref() {
             self.release_meta_blob(previous)?;
@@ -521,12 +548,13 @@ impl SnapshotSession {
         let size = primary_meta.size;
         let mime = primary_meta.mime.clone();
         let error = primary_meta.error.clone();
-        let revertible = match change_kind {
-            ChangeKind::Added => true,
-            ChangeKind::Modified | ChangeKind::Deleted | ChangeKind::Renamed => {
-                base.is_some_and(meta_can_restore)
-            }
-        };
+        let revertible = source == SourceKind::Tool
+            && match change_kind {
+                ChangeKind::Added => true,
+                ChangeKind::Modified | ChangeKind::Deleted | ChangeKind::Renamed => {
+                    base.is_some_and(meta_can_restore)
+                }
+            };
         let symlink_target = primary_meta.symlink.as_ref().map(|s| s.target.clone());
 
         let mut original_content: Option<String> = None;
@@ -710,6 +738,184 @@ impl SnapshotSession {
             }
         }
         Ok(applied)
+    }
+
+    /// 将一个执行轮次恢复到该轮次首次触碰每个文件之前的状态。
+    ///
+    /// 与 `revert` 恢复 session baseline 不同，这里从 append-only ChangeLog
+    /// 找到目标 execution group 的首个 before 快照，因此同一文件跨多个未批准轮次
+    /// 修改时，不会把前一轮的修改一并抹掉。恢复前还会校验文件仍处于该轮次的最后
+    /// after 状态；如果之后被用户或其他执行链改过，则拒绝覆盖并要求重新确认。
+    pub fn revert_execution_group(&self, execution_group_id: &str) -> SnapshotResult<usize> {
+        let execution_group_id = execution_group_id.trim();
+        if execution_group_id.is_empty() {
+            return Err(SnapshotError::Internal(
+                "execution group id cannot be empty".to_string(),
+            ));
+        }
+
+        self.reconcile()?;
+        let current = self.current.read().expect("current poisoned").clone();
+        let events = self.events.read_all()?;
+        let target_paths = events
+            .iter()
+            .filter(|event| event.execution_group_id.as_deref() == Some(execution_group_id))
+            .filter_map(|event| {
+                event
+                    .after
+                    .as_ref()
+                    .map(|meta| meta.path.clone())
+                    .or_else(|| event.before.as_ref().map(|meta| meta.path.clone()))
+            })
+            .collect::<std::collections::HashSet<_>>();
+        if target_paths.is_empty() {
+            return Ok(0);
+        }
+
+        let mut first_before = HashMap::<String, Option<FileMeta>>::new();
+        let mut latest_after = HashMap::<String, Option<FileMeta>>::new();
+        for event in &events {
+            if event.execution_group_id.as_deref() != Some(execution_group_id) {
+                continue;
+            }
+            let Some(path) = event
+                .after
+                .as_ref()
+                .map(|meta| meta.path.clone())
+                .or_else(|| event.before.as_ref().map(|meta| meta.path.clone()))
+            else {
+                continue;
+            };
+            if !target_paths.contains(&path) {
+                continue;
+            }
+            first_before
+                .entry(path.clone())
+                .or_insert(event.before.clone());
+            latest_after.insert(path, event.after.clone());
+        }
+
+        let mut targets = Vec::with_capacity(target_paths.len());
+        for path in target_paths {
+            let Some(before) = first_before.remove(&path) else {
+                return Err(SnapshotError::Internal(format!(
+                    "execution group {execution_group_id} has no baseline event for {path}"
+                )));
+            };
+            let expected = latest_after.remove(&path).unwrap_or(None);
+            let actual = current.get(&path);
+            let matches_expected = match (actual, expected.as_ref()) {
+                (None, None) => true,
+                (Some(actual), Some(expected)) => meta_unchanged(actual, expected),
+                _ => false,
+            };
+            if !matches_expected {
+                return Err(SnapshotError::Internal(format!(
+                    "execution group {execution_group_id} changed after completion: {path}"
+                )));
+            }
+            if before.as_ref().is_some_and(|meta| !meta_can_restore(meta)) {
+                return Err(SnapshotError::Internal(format!(
+                    "execution group {execution_group_id} baseline content unavailable for {path}"
+                )));
+            }
+            let restored_execution_group_id = events
+                .iter()
+                .rev()
+                .find(|event| {
+                    if event.execution_group_id.as_deref() == Some(execution_group_id) {
+                        return false;
+                    }
+                    let event_path = event
+                        .after
+                        .as_ref()
+                        .map(|meta| meta.path.as_str())
+                        .or_else(|| event.before.as_ref().map(|meta| meta.path.as_str()));
+                    if event_path != Some(path.as_str()) {
+                        return false;
+                    }
+                    match (&before, &event.after) {
+                        (None, None) => true,
+                        (Some(expected), Some(actual)) => meta_unchanged(expected, actual),
+                        _ => false,
+                    }
+                })
+                .and_then(|event| event.execution_group_id.clone());
+            targets.push((path, before, restored_execution_group_id));
+        }
+        targets.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut applied = 0usize;
+        for (path, before, restored_execution_group_id) in targets {
+            let abs = self.workspace_root.join(&path);
+            match before.as_ref() {
+                Some(meta) => match meta.content_kind {
+                    ContentKind::Text | ContentKind::Binary => {
+                        let hash = meta.blob_hash.as_ref().ok_or_else(|| {
+                            SnapshotError::Internal(format!(
+                                "group baseline blob missing for {path}"
+                            ))
+                        })?;
+                        let bytes = self
+                            .blobs
+                            .get(hash, matches!(meta.content_kind, ContentKind::Text))?;
+                        if let Some(parent) = abs.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|e| SnapshotError::io(parent, e))?;
+                        }
+                        std::fs::write(&abs, &bytes).map_err(|e| SnapshotError::io(&abs, e))?;
+                    }
+                    ContentKind::Symlink => {
+                        let target = meta.symlink.as_ref().ok_or_else(|| {
+                            SnapshotError::Internal(format!(
+                                "group baseline symlink target missing for {path}"
+                            ))
+                        })?;
+                        if let Some(parent) = abs.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|e| SnapshotError::io(parent, e))?;
+                        }
+                        if std::fs::symlink_metadata(&abs).is_ok() {
+                            remove_file_or_symlink(&abs).map_err(|e| SnapshotError::io(&abs, e))?;
+                        }
+                        restore_symlink(&target.target, target.target_kind, &abs)
+                            .map_err(|e| SnapshotError::io(&abs, e))?;
+                    }
+                    ContentKind::LargeText | ContentKind::Special => unreachable!(),
+                },
+                None => {
+                    if std::fs::symlink_metadata(&abs).is_ok() {
+                        remove_file_or_symlink(&abs).map_err(|e| SnapshotError::io(&abs, e))?;
+                    }
+                }
+            }
+            let ctx = ToolHookCtx {
+                tool_call_id: format!("undo:{execution_group_id}"),
+                worker_id: None,
+                execution_group_id: restored_execution_group_id,
+                declared_paths: vec![PathBuf::from(&path)],
+            };
+            if std::fs::symlink_metadata(&abs).is_ok() {
+                self.record_upsert(&abs, SourceKind::Tool, Some(ctx))?;
+            } else {
+                self.record_removal(&abs, SourceKind::Tool, Some(ctx))?;
+            }
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
+    /// 判断执行分组是否属于当前 session 的变更账本。
+    pub fn has_execution_group(&self, execution_group_id: &str) -> SnapshotResult<bool> {
+        let execution_group_id = execution_group_id.trim();
+        if execution_group_id.is_empty() {
+            return Ok(false);
+        }
+        Ok(self
+            .events
+            .read_all()?
+            .iter()
+            .any(|event| event.execution_group_id.as_deref() == Some(execution_group_id)))
     }
 
     /// 如果 `paths` 命中了某个 rename 对的一端（新路径或旧路径），把另一端也纳入。

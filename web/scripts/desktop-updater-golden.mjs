@@ -8,8 +8,6 @@ const promptSource = fs.readFileSync(path.resolve('src/components/DesktopUpdateP
 const settingsSource = fs.readFileSync(path.resolve('src/components/SettingsPanel.svelte'), 'utf8');
 const updaterSource = fs.readFileSync(path.resolve('src/lib/desktop-updater.ts'), 'utf8');
 const updaterStoreSource = fs.readFileSync(path.resolve('src/stores/desktop-updater.svelte.ts'), 'utf8');
-const inputSource = fs.readFileSync(path.resolve('src/components/InputArea.svelte'), 'utf8');
-const messagesStoreSource = fs.readFileSync(path.resolve('src/stores/messages.svelte.ts'), 'utf8');
 const desktopMainSource = fs.readFileSync(path.resolve('../apps/desktop/src/main.rs'), 'utf8');
 
 assert.match(appSource, /DesktopUpdatePrompt/, 'desktop startup must mount the update prompt');
@@ -75,13 +73,13 @@ assert.doesNotMatch(
 assert.match(
   updaterSource,
   /await invoke\('prepare_update_restart'\)/,
-  'installation must ask the desktop host to stop the daemon gracefully',
+  'installation must ask the desktop host to force-stop the daemon',
 );
 assert.match(updaterSource, /await relaunch\(\)/, 'installed updates must relaunch the desktop host');
 assert.match(
   desktopMainSource,
-  /async fn prepare_update_restart[\s\S]*shutdown_desktop_runtime/,
-  'desktop host must expose a graceful update restart boundary',
+  /fn prepare_update_restart[\s\S]*force_shutdown_desktop_runtime/,
+  'desktop host must expose a forceful update restart boundary',
 );
 assert.match(
   desktopMainSource,
@@ -94,29 +92,38 @@ assert.match(promptSource, /app\.update\.restartNow/, 'ready prompt must offer i
 assert.match(promptSource, /app\.update\.restartLater/, 'ready prompt must offer deferred restart');
 assert.match(
   promptSource,
-  /hasProtectedWork[\s\S]*restartConfirmationOpen = true/,
-  'active sessions and unsent drafts must be protected by a restart confirmation',
+  /function requestRestart\(\): void \{[\s\S]*restartWithDesktopUpdate\(\)/,
+  'immediate restart must directly invoke the installed update',
 );
 assert.match(
   promptSource,
-  /hasQueuedMessagesAcrossSessions\(\)/,
-  'restart protection must include queued messages outside the visible session',
+  /dismissDesktopUpdatePrompt\(\)/,
+  'restart later must only dismiss the prompt and keep the downloaded update staged',
 );
+assert.doesNotMatch(
+  promptSource,
+  /hasProtectedWork|restartConfirmationOpen|restartConfirmActiveWork/,
+  'immediate restart must not insert a second confirmation flow',
+);
+const downloadFunctionSource = updaterStoreSource.match(
+  /export async function downloadDesktopUpdate[\s\S]*?(?=\nexport async function restartWithDesktopUpdate)/,
+)?.[0] ?? '';
 assert.match(
-  messagesStoreSource,
-  /export function hasQueuedMessagesAcrossSessions[\s\S]*sessionQueuedMessagesByScope/,
-  'queued-message protection must inspect every retained session scope',
+  downloadFunctionSource,
+  /await update\.download\([\s\S]*desktopUpdaterState\.phase = 'ready'/,
+  'download completion must settle into ready before any restart action',
 );
-assert.match(inputSource, /setComposerHasUnsavedInput/, 'composer drafts must participate in restart protection');
-assert.match(
-  inputSource,
-  /setComposerHasUnsavedInput\([\s\S]*pendingImageReadCount > 0[\s\S]*selectedGoalMode[\s\S]*selectedSkill !== null/,
-  'restart protection must include pending images and unsent composer modes',
+assert.doesNotMatch(
+  downloadFunctionSource,
+  /installAndRestart|relaunch|update\.install/,
+  'download completion must never install or restart automatically',
 );
-assert.match(settingsSource, /desktop-update-progress/, 'settings must render an update progress bar');
-assert.match(promptSource, /desktop-update-progress/, 'global prompt must render an update progress bar');
-assert.match(settingsSource, /aria-valuenow/, 'settings progress must expose accessible numeric progress');
-assert.match(promptSource, /desktop-update-progress__fill--indeterminate/, 'update progress must support unknown content length');
+assert.doesNotMatch(settingsSource, /desktop-update-progress/, 'settings must not render a download progress bar');
+assert.doesNotMatch(promptSource, /desktop-update-progress/, 'global prompt must not render a download progress bar');
+assert.match(settingsSource, /downloadingProgress/, 'settings update control must show the trusted download percentage');
+assert.match(promptSource, /update-download-percent/, 'global prompt must show the trusted download percentage');
+assert.match(promptSource, /app\.update\.progressUnknown/, 'global prompt must explain when the file size is unavailable');
+assert.doesNotMatch(promptSource, /role="progressbar"/, 'global prompt must not expose a misleading progress bar');
 
 await withGoldenViteServer(async (server) => {
   const updater = await server.ssrLoadModule('/src/lib/desktop-updater.ts');

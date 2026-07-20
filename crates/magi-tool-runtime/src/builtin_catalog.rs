@@ -934,7 +934,7 @@ impl BuiltinToolName {
                 "properties": {
                     "command": { "type": "string", "description": "要执行的当前平台原生 Shell 命令：Windows 使用 PowerShell 语法（如 Get-ChildItem、Get-Content），macOS 默认使用 zsh/POSIX 语法（如 ls -la、cat file），Linux 默认使用当前用户 Shell/POSIX 语法（如 find . -type f）；必须遵循工作区上下文声明的 Shell 方言，不得混用平台语法" },
                     "cwd": { "type": "string", "description": "工作区相对路径或当前平台原生绝对路径；默认当前工作区" },
-                    "shell": { "type": "string", "description": "可选 Shell 程序或程序加启动参数；默认 Windows 使用 PowerShell -NoLogo -NoProfile -NonInteractive -Command，macOS 使用 zsh -c，Linux 使用当前用户 Shell -c，并继承 Magi 统一初始化的用户执行环境；Windows 不支持 cmd.exe" },
+                    "shell": { "type": "string", "description": "可选 Shell 程序或程序加启动参数；默认 Windows 使用 PowerShell -NoLogo -NoProfile -NonInteractive -Command，macOS 使用 zsh -c，Linux 使用当前用户 Shell -c，并继承 Magi 统一初始化的用户执行环境；Windows 仅支持 PowerShell" },
                     "timeout_ms": { "type": "integer", "description": "执行超时（毫秒）" },
                     "action": {
                         "type": "string",

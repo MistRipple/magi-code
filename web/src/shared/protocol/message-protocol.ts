@@ -323,6 +323,7 @@ export interface MessageMetadata {
   phase?: string;
   duration?: number;
   responseDurationMs?: number;
+  responseCompletedAt?: number;
   error?: string;
   recoverable?: boolean;
   questionId?: string;

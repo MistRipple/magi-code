@@ -143,6 +143,8 @@
   }
   function revertChange(edit: Edit) {
     if (changeMutationPending || edit.revertible !== true) return;
+    const confirmed = window.confirm(i18n.t('edits.confirm.revertChange', { file: edit.filePath }));
+    if (!confirmed) return;
     vscode.postMessage({ type: 'revertChange', filePath: edit.filePath, ...editScope(edit) });
   }
 
@@ -152,10 +154,14 @@
   }
   function revertAllChanges() {
     if (changeMutationPending || edits.length === 0 || !allEditsRevertible) return;
+    const confirmed = window.confirm(i18n.t('edits.confirm.revertAll', { count: edits.length }));
+    if (!confirmed) return;
     vscode.postMessage({ type: 'revertAllChanges', ...editScope(currentRoundEdits[0] ?? earlierPendingEdits[0]) });
   }
   function revertCurrentRound() {
     if (changeMutationPending || !latestExecutionGroupId || !currentRoundRevertible) return;
+    const confirmed = window.confirm(i18n.t('edits.confirm.revertRound', { count: currentRoundEdits.length }));
+    if (!confirmed) return;
     vscode.postMessage({
       type: 'revertExecutionGroup',
       executionGroupId: latestExecutionGroupId,
@@ -409,7 +415,7 @@
     </div>
   {:else}
     <div class="edits-main">
-      {#if edits.length >= 2}
+      {#if edits.length > 0}
         <div class="edits-toolbar">
           <button
             type="button"

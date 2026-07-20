@@ -82,6 +82,7 @@
         turnStatus,
         type: item.message.type || '',
         content: item.message.content || '',
+        timestamp: item.message.timestamp,
       });
     }
     return buildTurnNavigationItems(navigationMessages);

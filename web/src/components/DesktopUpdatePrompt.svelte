@@ -1,65 +1,37 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import Icon from './Icon.svelte';
-  import Modal from './Modal.svelte';
-  import { i18n } from '../stores/i18n.svelte';
-  import {
-    hasQueuedMessagesAcrossSessions,
-    messagesState,
-  } from '../stores/messages.svelte';
-  import { composerWorkspaceState } from '../stores/composer-workspace.svelte';
-  import {
-    desktopUpdaterState,
-    dismissDesktopUpdatePrompt,
-    downloadDesktopUpdate,
-    restartWithDesktopUpdate,
-    retryDesktopUpdate,
-    startDesktopUpdater,
-  } from '../stores/desktop-updater.svelte';
+import { onMount } from 'svelte';
+import Icon from './Icon.svelte';
+import { i18n } from '../stores/i18n.svelte';
+import {
+  desktopUpdaterState,
+  dismissDesktopUpdatePrompt,
+  downloadDesktopUpdate,
+  restartWithDesktopUpdate,
+  retryDesktopUpdate,
+  startDesktopUpdater,
+} from '../stores/desktop-updater.svelte';
 
-  let restartConfirmationOpen = $state(false);
+const update = $derived(desktopUpdaterState.update);
+const phase = $derived(desktopUpdaterState.phase);
+const progress = $derived(desktopUpdaterState.progress);
+const error = $derived(desktopUpdaterState.error);
+const promptVisible = $derived(
+  !desktopUpdaterState.promptDismissed
+  && (
+    (update !== null && ['available', 'downloading', 'ready', 'installing'].includes(phase))
+    || (phase === 'error' && desktopUpdaterState.errorStage !== 'check')
+  ),
+);
 
-  const update = $derived(desktopUpdaterState.update);
-  const phase = $derived(desktopUpdaterState.phase);
-  const progress = $derived(desktopUpdaterState.progress);
-  const error = $derived(desktopUpdaterState.error);
-  const hasProtectedWork = $derived(
-    messagesState.isProcessing
-    || messagesState.pendingRequests.size > 0
-    || hasQueuedMessagesAcrossSessions()
-    || messagesState.editingTurn !== null
-    || composerWorkspaceState.hasUnsavedInput
-    || messagesState.sessions.some((session) => (
-      session.isRunning === true || (session.runningTaskCount ?? 0) > 0
-    )),
-  );
-  const promptVisible = $derived(
-    !desktopUpdaterState.promptDismissed
-    && (
-      (update !== null && ['available', 'downloading', 'ready', 'installing'].includes(phase))
-      || (phase === 'error' && desktopUpdaterState.errorStage !== 'check')
-    ),
-  );
+function requestRestart(): void {
+  void restartWithDesktopUpdate();
+}
 
-  function requestRestart(): void {
-    if (hasProtectedWork) {
-      restartConfirmationOpen = true;
-      return;
-    }
-    void restartWithDesktopUpdate();
-  }
+function deferUpdate(): void {
+  dismissDesktopUpdatePrompt();
+}
 
-  function confirmRestart(): void {
-    restartConfirmationOpen = false;
-    void restartWithDesktopUpdate();
-  }
-
-  function deferUpdate(): void {
-    restartConfirmationOpen = false;
-    dismissDesktopUpdatePrompt();
-  }
-
-  onMount(startDesktopUpdater);
+onMount(startDesktopUpdater);
 </script>
 
 {#if promptVisible}
@@ -91,25 +63,14 @@
         {/if}
       </strong>
       {#if phase === 'downloading'}
-        <span>
-          {progress?.percent !== undefined
-            ? i18n.t('app.update.progress', { percent: progress.percent })
-            : i18n.t('app.update.downloading')}
+        <span class="update-download-status" aria-live="polite">
+          {#if progress?.percent !== undefined}
+            <strong class="update-download-percent">{progress.percent}%</strong>
+            <span>{i18n.t('app.update.downloading')}</span>
+          {:else}
+            {i18n.t('app.update.progressUnknown')}
+          {/if}
         </span>
-        <div
-          class="desktop-update-progress"
-          role="progressbar"
-          aria-valuemin="0"
-          aria-valuemax="100"
-          aria-valuenow={progress?.percent}
-          aria-label={i18n.t('app.update.downloadingTitle')}
-        >
-          <span
-            class="desktop-update-progress__fill"
-            class:desktop-update-progress__fill--indeterminate={progress?.percent === undefined}
-            style:width={progress?.percent !== undefined ? `${progress.percent}%` : undefined}
-          ></span>
-        </div>
       {:else if phase === 'ready'}
         <span>{i18n.t('app.update.readyHint')}</span>
       {:else if phase === 'installing'}
@@ -157,27 +118,7 @@
         </button>
       </div>
     {/if}
-  </aside>
-{/if}
-
-{#if restartConfirmationOpen}
-  <Modal
-    size="sm"
-    title={i18n.t('app.update.restartConfirmTitle')}
-    closeOnEscape={true}
-    closeOnBackdrop={false}
-    onClose={() => (restartConfirmationOpen = false)}
-  >
-    <p class="restart-confirmation-text">{i18n.t('app.update.restartConfirmActiveWork')}</p>
-    {#snippet footer()}
-      <button type="button" class="modal-secondary" onclick={() => (restartConfirmationOpen = false)}>
-        {i18n.t('app.update.restartLater')}
-      </button>
-      <button type="button" class="modal-primary" onclick={confirmRestart}>
-        {i18n.t('app.update.restartAnyway')}
-      </button>
-    {/snippet}
-  </Modal>
+</aside>
 {/if}
 
 <style>
@@ -245,6 +186,17 @@
     font-size: 11px;
   }
 
+  .update-download-status {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+  }
+
+  .update-download-percent {
+    color: var(--foreground);
+    font-variant-numeric: tabular-nums;
+  }
+
   .prompt-actions {
     display: flex;
     align-items: center;
@@ -263,21 +215,17 @@
   }
 
   .primary-action,
-  .secondary-action,
-  .modal-primary,
-  .modal-secondary {
+  .secondary-action {
     padding: 5px 8px;
   }
 
-  .primary-action,
-  .modal-primary {
+  .primary-action {
     color: var(--primary-foreground, var(--background));
     background: var(--accent);
   }
 
   .secondary-action,
-  .icon-action,
-  .modal-secondary {
+  .icon-action {
     color: var(--foreground-muted);
     background: var(--surface-hover);
   }
@@ -288,13 +236,6 @@
     width: 24px;
     height: 24px;
     padding: 0;
-  }
-
-  .restart-confirmation-text {
-    margin: 0;
-    color: var(--foreground-muted);
-    font-size: 13px;
-    line-height: 1.55;
   }
 
   @media (max-width: 680px) {

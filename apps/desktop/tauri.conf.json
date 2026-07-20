@@ -1,7 +1,7 @@
 {
   "productName": "Magi",
   "mainBinaryName": "Magi",
-  "version": "3.0.13",
+  "version": "3.0.14",
   "identifier": "com.mistripple.magi",
   "build": {
     "frontendDist": "bootstrap"

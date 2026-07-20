@@ -8,6 +8,7 @@ use std::{
     path::PathBuf,
     process,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use magi_daemon::{Daemon, DaemonConfig, DaemonHandle};
@@ -25,6 +26,7 @@ const QUIT_MENU_ID: &str = "quit-magi";
 const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 38123;
 const DEFAULT_SERVICE_NAME: &str = "magi-rust-backend";
+const DESKTOP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct DesktopRuntime {
     lifecycle: Arc<DesktopLifecycle>,
@@ -138,8 +140,13 @@ async fn shutdown_desktop_runtime(
         if let Err(error) = handle.shutdown(reason) {
             eprintln!("请求 Magi daemon 优雅关闭失败: {error}");
         }
-        if let Err(error) = handle.wait().await {
-            eprintln!("等待 Magi daemon 关闭失败: {error}");
+        match tokio::time::timeout(DESKTOP_SHUTDOWN_TIMEOUT, handle.wait()).await {
+            Ok(Err(error)) => eprintln!("等待 Magi daemon 关闭失败: {error}"),
+            Err(_) => eprintln!(
+                "等待 Magi daemon 关闭超过 {} 秒，继续退出桌面进程",
+                DESKTOP_SHUTDOWN_TIMEOUT.as_secs()
+            ),
+            Ok(Ok(())) => {}
         }
     }
 
@@ -149,8 +156,22 @@ async fn shutdown_desktop_runtime(
     lifecycle.mark_stopped();
 }
 
+fn force_shutdown_desktop_runtime(
+    daemon: Arc<Mutex<Option<DaemonHandle>>>,
+    lifecycle: Arc<DesktopLifecycle>,
+    state_root: PathBuf,
+) {
+    // 更新安装前不能等待活动请求结束；释放句柄会立即中止 daemon 服务任务和受管进程。
+    drop(daemon.lock().expect("desktop daemon lock poisoned").take());
+
+    let runtime_state = RuntimeStateManager::new(state_root.join("runtime"));
+    runtime_state.remove_runtime_state();
+    runtime_state.remove_pid();
+    lifecycle.mark_stopped();
+}
+
 #[tauri::command]
-async fn prepare_update_restart(app: AppHandle) -> Result<(), String> {
+fn prepare_update_restart(app: AppHandle) -> Result<(), String> {
     let (daemon, lifecycle, state_root) = {
         let runtime = app.state::<DesktopRuntime>();
         (
@@ -159,9 +180,9 @@ async fn prepare_update_restart(app: AppHandle) -> Result<(), String> {
             runtime.state_root.clone(),
         )
     };
-    match lifecycle.request_exit() {
+    match lifecycle.request_update_restart() {
         DesktopAction::BeginExit => {
-            shutdown_desktop_runtime(daemon, lifecycle, state_root, "desktop update restart").await;
+            force_shutdown_desktop_runtime(daemon, lifecycle, state_root);
             Ok(())
         }
         DesktopAction::Ignore if lifecycle.state() == DesktopState::Stopped => Ok(()),
@@ -242,10 +263,9 @@ fn start_daemon(app: AppHandle, state_root: PathBuf, web_dist_root: PathBuf) {
         let runtime = app.state::<DesktopRuntime>();
         if matches!(
             runtime.lifecycle.state(),
-            DesktopState::ShuttingDown | DesktopState::Stopped
+            DesktopState::ShuttingDown | DesktopState::Restarting | DesktopState::Stopped
         ) {
-            let _ = handle.shutdown("desktop exited during startup");
-            let _ = handle.wait().await;
+            drop(handle);
             runtime_state.remove_runtime_state();
             runtime_state.remove_pid();
             runtime.lifecycle.mark_stopped();
@@ -315,14 +335,20 @@ fn main() {
     app.run(|app, event| match event {
         RunEvent::ExitRequested { api, .. } => {
             let runtime = app.state::<DesktopRuntime>();
-            if runtime.lifecycle.state() != DesktopState::Stopped {
+            if !matches!(
+                runtime.lifecycle.state(),
+                DesktopState::Restarting | DesktopState::Stopped
+            ) {
                 api.prevent_exit();
                 request_exit(app.clone());
             }
         }
         RunEvent::Exit => {
             let runtime = app.state::<DesktopRuntime>();
-            if runtime.lifecycle.state() == DesktopState::Stopped {
+            if matches!(
+                runtime.lifecycle.state(),
+                DesktopState::Restarting | DesktopState::Stopped
+            ) {
                 return;
             }
 
