@@ -558,7 +558,10 @@ fn shell_exec_accepts_shell_program_with_arguments() {
     let registry = make_registry();
     let workspace = unique_temp_dir("magi-shell-prefix-workspace");
     let (shell, command) = if cfg!(windows) {
-        ("cmd.exe /C", "echo shell-prefix-ok")
+        (
+            "powershell.exe -NoLogo -NoProfile -NonInteractive",
+            "Write-Output shell-prefix-ok",
+        )
     } else {
         ("sh -lc", "printf shell-prefix-ok")
     };
@@ -5519,7 +5522,10 @@ fn shell_schema_describes_platform_native_dialect() {
         .expect("access mode description");
 
     assert!(command.contains("当前平台"));
+    assert!(command.contains("PowerShell"));
     assert!(shell.contains("Windows"));
+    assert!(shell.contains("PowerShell"));
+    assert!(!shell.contains("cmd.exe /C"));
     assert!(shell.contains("Linux"));
     assert!(access_mode.contains("NUL"));
     assert!(access_mode.contains("/dev/null"));

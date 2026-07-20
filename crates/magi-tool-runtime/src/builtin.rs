@@ -1961,7 +1961,16 @@ fn resolve_shell_command_spec(
     configured_shell: Option<String>,
 ) -> Result<ShellCommandSpec, String> {
     match configured_shell {
-        Some(shell) => parse_shell_command_spec(&shell),
+        Some(shell) => {
+            let spec = parse_shell_command_spec(&shell)?;
+            if cfg!(windows) && is_cmd_shell(&spec.program) {
+                return Err(
+                    "Windows 不再支持 cmd.exe；请使用 PowerShell（powershell.exe 或 pwsh）"
+                        .to_string(),
+                );
+            }
+            Ok(spec)
+        }
         None => {
             let program = magi_process::user_shell().to_string_lossy().to_string();
             Ok(default_shell_command_spec(program))
@@ -1970,10 +1979,17 @@ fn resolve_shell_command_spec(
 }
 
 fn default_shell_command_spec(program: String) -> ShellCommandSpec {
-    ShellCommandSpec {
-        arguments: vec![shell_arg(&program).to_string()],
-        program,
-    }
+    let arguments = if cfg!(windows) && is_powershell_shell(&program) {
+        vec![
+            "-NoLogo".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+        ]
+    } else {
+        vec![shell_arg(&program).to_string()]
+    };
+    ShellCommandSpec { arguments, program }
 }
 
 fn parse_shell_command_spec(shell: &str) -> Result<ShellCommandSpec, String> {
@@ -1989,13 +2005,12 @@ fn parse_shell_command_spec(shell: &str) -> Result<ShellCommandSpec, String> {
 }
 
 fn has_shell_command_argument(program: &str, arguments: &[String]) -> bool {
-    let executable = shell_executable_name(program);
-    if executable == "cmd" || executable == "cmd.exe" {
+    if is_cmd_shell(program) {
         return arguments
             .iter()
             .any(|argument| argument.eq_ignore_ascii_case("/c"));
     }
-    if executable.contains("powershell") || executable == "pwsh" || executable == "pwsh.exe" {
+    if is_powershell_shell(program) {
         return arguments.iter().any(|argument| {
             argument.eq_ignore_ascii_case("-command") || argument.eq_ignore_ascii_case("-c")
         });
@@ -2006,6 +2021,15 @@ fn has_shell_command_argument(program: &str, arguments: &[String]) -> bool {
                 .strip_prefix('-')
                 .is_some_and(|flags| flags.contains('c'))
     })
+}
+
+fn is_cmd_shell(program: &str) -> bool {
+    matches!(shell_executable_name(program).as_str(), "cmd" | "cmd.exe")
+}
+
+fn is_powershell_shell(program: &str) -> bool {
+    let executable = shell_executable_name(program);
+    executable.contains("powershell") || matches!(executable.as_str(), "pwsh" | "pwsh.exe")
 }
 
 fn tokenize_shell_command_spec(shell: &str) -> Result<Vec<String>, String> {
@@ -2037,10 +2061,9 @@ fn tokenize_shell_command_spec(shell: &str) -> Result<Vec<String>, String> {
 }
 
 fn shell_arg(shell: &str) -> &'static str {
-    let executable = shell_executable_name(shell);
-    if executable.contains("powershell") || executable == "pwsh" || executable == "pwsh.exe" {
+    if is_powershell_shell(shell) {
         "-Command"
-    } else if executable == "cmd" || executable == "cmd.exe" {
+    } else if is_cmd_shell(shell) {
         "/C"
     } else {
         "-c"
@@ -4044,13 +4067,41 @@ mod tests {
 
     #[test]
     fn default_shell_command_spec_preserves_native_program_paths_with_spaces() {
+        let arguments = if cfg!(windows) {
+            vec![
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+            ]
+        } else {
+            vec!["-Command".to_string()]
+        };
         assert_eq!(
-            default_shell_command_spec(r#"C:\Program Files\Command Processor\cmd.exe"#.to_string()),
+            default_shell_command_spec(r#"C:\Program Files\PowerShell\7\pwsh.exe"#.to_string()),
             ShellCommandSpec {
-                program: r#"C:\Program Files\Command Processor\cmd.exe"#.to_string(),
-                arguments: vec!["/C".to_string()],
+                program: r#"C:\Program Files\PowerShell\7\pwsh.exe"#.to_string(),
+                arguments,
             }
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_shell_uses_profile_free_powershell() {
+        assert_eq!(
+            default_shell_command_spec("powershell.exe".to_string()),
+            ShellCommandSpec {
+                program: "powershell.exe".to_string(),
+                arguments: vec![
+                    "-NoLogo".to_string(),
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                ],
+            }
+        );
+        assert!(resolve_shell_command_spec(Some("cmd.exe".to_string())).is_err());
     }
 
     #[test]

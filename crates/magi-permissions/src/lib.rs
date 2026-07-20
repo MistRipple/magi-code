@@ -375,8 +375,10 @@ fn shell_dialect(shell: &str) -> ShellDialect {
     let shell = shell.trim().to_ascii_lowercase();
     if shell.contains("powershell") || shell.ends_with("pwsh") || shell.ends_with("pwsh.exe") {
         ShellDialect::PowerShell
-    } else if shell.contains("cmd") || (shell.is_empty() && cfg!(windows)) {
+    } else if shell.contains("cmd") {
         ShellDialect::Cmd
+    } else if shell.is_empty() && cfg!(windows) {
+        ShellDialect::PowerShell
     } else {
         ShellDialect::Posix
     }

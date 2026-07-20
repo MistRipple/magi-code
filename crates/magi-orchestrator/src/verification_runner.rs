@@ -301,12 +301,12 @@ impl VerificationRunner {
         let timeout = Duration::from_millis(self.config.timeout_ms);
 
         let shell = if cfg!(target_os = "windows") {
-            "cmd"
+            "powershell.exe"
         } else {
             "sh"
         };
         let flag = if cfg!(target_os = "windows") {
-            "/C"
+            "-Command"
         } else {
             "-c"
         };

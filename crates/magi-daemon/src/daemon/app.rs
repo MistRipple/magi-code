@@ -526,8 +526,8 @@ fn browser_open_command(url: &str) -> StdCommand {
 
     #[cfg(target_os = "windows")]
     {
-        let mut command = std_command(magi_process::user_shell());
-        command.args(["/C", "start", "", url]);
+        let mut command = std_command("explorer.exe");
+        command.arg(url);
         command
     }
 

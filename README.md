@@ -292,6 +292,10 @@ npm --prefix web run build
 
 Magi 核心代码采用 [MIT License](LICENSE) 开源授权。
 
+### 友情链接
+
+- [Linux.do](https://linux.do)
+
 ---
 
 **Magi 的诞生离不开早期支持者的帮助。**

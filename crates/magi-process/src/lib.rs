@@ -80,9 +80,7 @@ pub fn user_shell() -> OsString {
 
 #[cfg(windows)]
 pub fn user_shell() -> OsString {
-    std::env::var_os("COMSPEC")
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(default_user_shell)
+    default_user_shell()
 }
 
 pub fn resolve_executable(program: impl AsRef<OsStr>) -> Option<PathBuf> {
@@ -145,7 +143,6 @@ pub fn common_command_names() -> &'static [&'static str] {
     #[cfg(windows)]
     {
         &[
-            "cmd",
             "powershell",
             "pwsh",
             "git",
@@ -873,7 +870,7 @@ fn default_user_shell() -> OsString {
 
 #[cfg(windows)]
 fn default_user_shell() -> OsString {
-    OsString::from("cmd.exe")
+    OsString::from("powershell.exe")
 }
 
 #[cfg(unix)]
@@ -925,7 +922,13 @@ mod tests {
 
     #[cfg(windows)]
     fn configure_long_running_std_command(command: &mut std::process::Command) {
-        command.args(["/C", "ping 127.0.0.1 -n 6 >NUL"]);
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 5",
+        ]);
     }
 
     #[cfg(unix)]
@@ -935,7 +938,13 @@ mod tests {
 
     #[cfg(windows)]
     fn configure_long_running_tokio_command(command: &mut tokio::process::Command) {
-        command.args(["/C", "ping 127.0.0.1 -n 6 >NUL"]);
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 5",
+        ]);
     }
 
     #[test]
@@ -954,6 +963,12 @@ mod tests {
         assert!(summary.path.is_some());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_user_shell_is_powershell() {
+        assert_eq!(super::user_shell(), OsString::from("powershell.exe"));
+    }
+
     #[test]
     fn common_command_catalog_uses_platform_native_shell_names() {
         let commands = super::common_command_names();
@@ -961,7 +976,8 @@ mod tests {
         assert!(commands.contains(&"git"));
         assert!(commands.contains(&"rg"));
         if cfg!(windows) {
-            assert!(commands.contains(&"cmd"));
+            assert!(commands.contains(&"powershell"));
+            assert!(!commands.contains(&"cmd"));
             assert!(!commands.contains(&"zsh"));
         } else {
             assert!(commands.contains(&"sh"));
@@ -1105,22 +1121,34 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn std_factory_runs_windows_console_commands() {
-        let status = std_command("cmd")
-            .args(["/C", "exit", "0"])
+    fn std_factory_runs_windows_powershell_commands() {
+        let status = std_command("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "exit 0",
+            ])
             .status()
-            .expect("cmd should start through the shared process factory");
+            .expect("PowerShell should start through the shared process factory");
         assert!(status.success());
     }
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn tokio_factory_runs_windows_console_commands() {
-        let status = tokio_command("cmd")
-            .args(["/C", "exit", "0"])
+    async fn tokio_factory_runs_windows_powershell_commands() {
+        let status = tokio_command("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "exit 0",
+            ])
             .status()
             .await
-            .expect("cmd should start through the shared async process factory");
+            .expect("PowerShell should start through the shared async process factory");
         assert!(status.success());
     }
 

@@ -890,8 +890,10 @@ impl ShellDialect {
         let shell = shell.trim().to_ascii_lowercase();
         if shell.contains("powershell") || shell.ends_with("pwsh") || shell.ends_with("pwsh.exe") {
             Self::PowerShell
-        } else if shell.contains("cmd") || (shell.is_empty() && cfg!(windows)) {
+        } else if shell.contains("cmd") {
             Self::Cmd
+        } else if shell.is_empty() && cfg!(windows) {
+            Self::PowerShell
         } else {
             Self::Posix
         }
