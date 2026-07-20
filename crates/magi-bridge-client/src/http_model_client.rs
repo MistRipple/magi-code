@@ -26,7 +26,10 @@ const OPENAI_API_KEY_ENV: &str = "MAGI_OPENAI_COMPAT_API_KEY";
 const OPENAI_MODEL_ENV: &str = "MAGI_OPENAI_COMPAT_MODEL";
 const MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 16;
 const MODEL_PROVIDER_MAX_RETRIES: usize = 5;
+const MODEL_PROVIDER_EMPTY_STREAM_RETRIES: usize = 2;
 const MODEL_PROVIDER_RETRY_DELAYS_SECONDS: [u64; MODEL_PROVIDER_MAX_RETRIES] = [10, 15, 30, 45, 60];
+const MODEL_PROVIDER_EMPTY_STREAM_RETRY_DELAYS_MILLIS: [u64; MODEL_PROVIDER_EMPTY_STREAM_RETRIES] =
+    [1_000, 3_000];
 const MODEL_PROVIDER_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MODEL_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -375,6 +378,15 @@ fn retry_delay(attempt: usize, _provider_key: &str) -> Duration {
     Duration::from_secs(MODEL_PROVIDER_RETRY_DELAYS_SECONDS[index])
 }
 
+fn empty_stream_retry_delay(attempt: usize) -> Duration {
+    let index = attempt.saturating_sub(1).min(
+        MODEL_PROVIDER_EMPTY_STREAM_RETRY_DELAYS_MILLIS
+            .len()
+            .saturating_sub(1),
+    );
+    Duration::from_millis(MODEL_PROVIDER_EMPTY_STREAM_RETRY_DELAYS_MILLIS[index])
+}
+
 fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     let value = value.trim();
     if value.is_empty() {
@@ -407,6 +419,17 @@ fn retryable_bridge_error(error: &BridgeClientError) -> bool {
             layer: BridgeErrorLayer::Transport,
             ..
         }
+    )
+}
+
+fn retryable_empty_stream_error(error: &BridgeClientError) -> bool {
+    matches!(
+        error,
+        BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::RemoteBusiness,
+            code: Some(-32007),
+            message,
+        } if message.contains("empty stream response")
     )
 }
 
@@ -917,6 +940,7 @@ fn execute_streaming_http_post_with_retries(
         );
         let can_retry =
             !emitted_delta.load(Ordering::SeqCst) && retries < MODEL_PROVIDER_MAX_RETRIES;
+        let can_retry_empty_stream = retries < MODEL_PROVIDER_EMPTY_STREAM_RETRIES;
         match result {
             Ok((status, _response_body, retry_after))
                 if can_retry && retryable_http_status(status) =>
@@ -940,13 +964,26 @@ fn execute_streaming_http_post_with_retries(
                 });
                 continue;
             }
-            Err(error) if can_retry && retryable_bridge_error(&error) => {
+            Err(error)
+                if (can_retry && retryable_bridge_error(&error))
+                    || (can_retry_empty_stream && retryable_empty_stream_error(&error)) =>
+            {
                 retries += 1;
-                let delay = retry_delay(retries, &provider_key);
+                let is_empty_stream = retryable_empty_stream_error(&error);
+                let delay = if is_empty_stream {
+                    empty_stream_retry_delay(retries)
+                } else {
+                    retry_delay(retries, &provider_key)
+                };
+                let max_attempts = if is_empty_stream {
+                    MODEL_PROVIDER_EMPTY_STREAM_RETRIES
+                } else {
+                    MODEL_PROVIDER_MAX_RETRIES
+                };
                 on_retry(&ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::Scheduled,
                     attempt: retries,
-                    max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+                    max_attempts,
                     delay_ms: Some(delay.as_millis() as u64),
                 });
                 if !sleep_retry_delay_cancellable(delay, is_cancelled) {
@@ -955,17 +992,23 @@ fn execute_streaming_http_post_with_retries(
                 on_retry(&ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::AttemptStarted,
                     attempt: retries,
-                    max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+                    max_attempts,
                     delay_ms: None,
                 });
                 continue;
             }
             other => {
                 if retries > 0 {
+                    let max_attempts = other
+                        .as_ref()
+                        .err()
+                        .filter(|error| retryable_empty_stream_error(error))
+                        .map(|_| MODEL_PROVIDER_EMPTY_STREAM_RETRIES)
+                        .unwrap_or(MODEL_PROVIDER_MAX_RETRIES);
                     on_retry(&ModelRetryRuntimeEvent {
                         phase: ModelRetryRuntimePhase::Settled,
                         attempt: retries,
-                        max_attempts: MODEL_PROVIDER_MAX_RETRIES,
+                        max_attempts,
                         delay_ms: None,
                     });
                 }
@@ -3294,6 +3337,60 @@ mod tests {
                 .to_string()
                 .contains("empty_stream: upstream stream closed before first payload")
         );
+    }
+
+    #[test]
+    fn streaming_retries_terminal_empty_response_before_returning_failure() {
+        let server = spawn_mock_server_sequence(vec![
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: concat!(
+                    "data: {\"choices\":[{\"delta\":{}}]}\n\n",
+                    "data: [DONE]\n\n",
+                )
+                .to_string(),
+            },
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n",
+                    "data: [DONE]\n\n",
+                )
+                .to_string(),
+            },
+        ]);
+        let client = HttpModelBridgeClient::new(
+            server.address.clone(),
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+        let deltas = std::cell::RefCell::new(Vec::new());
+
+        let response = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|delta| deltas.borrow_mut().push(delta.content.clone()),
+            )
+            .expect("terminal empty response should reconnect before failing");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&response.payload).expect("payload should be json");
+        assert_eq!(payload["content"], "recovered");
+        assert_eq!(deltas.into_inner(), vec!["recovered".to_string()]);
+        for _ in 0..2 {
+            server
+                .request_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("mock server should receive the initial and retry requests");
+        }
     }
 
     #[test]

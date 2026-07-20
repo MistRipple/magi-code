@@ -26,7 +26,10 @@ use crate::{
     validation_result_rejects_delivery,
 };
 use crate::{
-    model_error::{classify_model_invocation_error, provider_empty_assistant_response_error},
+    model_error::{
+        MODEL_EMPTY_RESPONSE_RECOVERY_PROMPT, classify_model_invocation_error,
+        provider_empty_assistant_response_error,
+    },
     prompt_utils::{
         PromptFragmentKind, current_turn_context_priority_prompt,
         normalize_model_stream_preview_content, normalize_model_visible_content,
@@ -1046,6 +1049,7 @@ fn run_conversation_loop_inner(
     let mut completed_required_tool_names: Vec<String> = Vec::new();
     let mut last_stream_item_id: Option<String> = None;
     let mut had_tool_calls = false;
+    let mut empty_response_recovery_attempts = 0usize;
     let turn_visibility = task_turn_visibility(
         task,
         is_sidechain,
@@ -1435,6 +1439,17 @@ fn run_conversation_loop_inner(
                 messages.push(ChatMessage {
                     role: "user".to_string(),
                     content: Some(recovery_prompt),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+                continue;
+            }
+            if !has_actionable_output && empty_response_recovery_attempts < 1 {
+                empty_response_recovery_attempts += 1;
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(MODEL_EMPTY_RESPONSE_RECOVERY_PROMPT.to_string()),
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
@@ -2124,16 +2139,15 @@ fn agent_spawn_requirement_recovery_prompt(
     tool_call_records: &[serde_json::Value],
     proposed_tool_calls: &[ChatToolCall],
 ) -> Option<String> {
-    if !agent_spawn_required_by_task(task) {
-        return None;
-    }
+    let policy = agent_spawn_required_by_task(task)?;
     if !agent_spawn_requirement_is_policy_reachable(task) {
         return None;
     }
-    if !task_store.get_children(&task.task_id).is_empty() {
+    let child_count = task_store.get_children(&task.task_id).len();
+    if child_count >= usize::from(policy.minimum_agent_count) {
         return None;
     }
-    if agent_spawn_was_attempted(tool_call_records) {
+    if agent_spawn_has_explicit_degraded_fallback(tool_call_records) {
         return None;
     }
     if !proposed_tool_calls.is_empty()
@@ -2144,10 +2158,10 @@ fn agent_spawn_requirement_recovery_prompt(
         return None;
     }
 
-    Some(
-        "用户已经明确要求启动或派发代理。本轮必须调用 agent_spawn 履行代理契约；不要把主线 shell_exec、file_read 或直接总结冒充为代理执行结果。若需要多个代理，应在同一轮发起多次 agent_spawn 并为每个代理写清 display_name、role 与 goal。子代理自动继承当前主线访问模式。"
-            .to_string(),
-    )
+    Some(format!(
+        "当前任务的团队合同要求至少创建 {} 个真实代理，但目前只有 {} 个成功创建。请继续调用 agent_spawn 补足代理契约缺口；不要把失败或降级的 agent_spawn 尝试当作已完成。每个代理都要有独立 display_name、role、goal 和结构化 context_package，子代理自动继承当前主线访问模式。",
+        policy.minimum_agent_count, child_count
+    ))
 }
 
 fn append_unexecuted_tool_recovery_messages(
@@ -2194,20 +2208,36 @@ fn agent_spawn_requirement_is_policy_reachable(task: &Task) -> bool {
             .any(|tool| canonical_tool_call_name(tool) == "agent_spawn")
 }
 
-fn agent_spawn_required_by_task(task: &Task) -> bool {
+fn agent_spawn_required_by_task(task: &Task) -> Option<magi_core::AgentDelegationPolicy> {
     if task.parent_task_id.is_some() {
-        return false;
+        return None;
     }
-    magi_core::text_requires_agent_spawn(&format!("{} {}", task.title, task.goal))
+    task.delegation_policy().cloned().or_else(|| {
+        let policy = magi_core::agent_delegation_policy(&task.goal);
+        policy.mode.requires_team().then_some(policy)
+    })
 }
 
-fn agent_spawn_was_attempted(tool_call_records: &[serde_json::Value]) -> bool {
+fn agent_spawn_has_explicit_degraded_fallback(tool_call_records: &[serde_json::Value]) -> bool {
     tool_call_records.iter().any(|record| {
-        record
-            .get("toolCall")
-            .and_then(|tool_call| tool_call.get("name"))
+        let Some(tool_call) = record.get("toolCall") else {
+            return false;
+        };
+        if tool_call
+            .get("name")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|name| canonical_tool_call_name(name) == "agent_spawn")
+            .is_none_or(|name| canonical_tool_call_name(name) != "agent_spawn")
+        {
+            return false;
+        }
+        let Some(result) = tool_call.get("result").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(result) else {
+            return false;
+        };
+        payload.get("status").and_then(serde_json::Value::as_str) == Some("degraded")
+            || payload.get("fallback_mode").is_some()
     })
 }
 
@@ -4562,6 +4592,27 @@ mod tests {
                 }).to_string()
             }
         });
+        let failed_spawn_record = serde_json::json!({
+            "type": "tool_call",
+            "toolCall": {
+                "name": "agent_spawn",
+                "result": serde_json::json!({
+                    "tool": "agent_spawn",
+                    "status": "failed",
+                    "error_code": "invalid_context_package"
+                }).to_string()
+            }
+        });
+        assert!(
+            agent_spawn_requirement_recovery_prompt(
+                &task,
+                &task_store,
+                &[failed_spawn_record],
+                &[],
+            )
+            .is_some(),
+            "失败的 agent_spawn 不能绕过代理契约，必须允许重试或改派"
+        );
         assert!(
             agent_spawn_requirement_recovery_prompt(
                 &task,

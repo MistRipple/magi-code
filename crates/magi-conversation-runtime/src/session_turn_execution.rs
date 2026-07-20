@@ -13,8 +13,9 @@ use crate::{
     },
     model_config::resolve_orchestrator_model_config,
     model_error::{
-        classify_model_invocation_error, extract_model_context_limit,
-        provider_empty_assistant_response_error, public_model_image_invocation_error_message,
+        MODEL_EMPTY_RESPONSE_RECOVERY_PROMPT, classify_model_invocation_error,
+        extract_model_context_limit, provider_empty_assistant_response_error,
+        public_model_image_invocation_error_message,
     },
     prompt_utils::{
         PromptFragmentKind, current_turn_context_priority_prompt,
@@ -868,6 +869,7 @@ fn run_session_turn_execution_inner(
     let mut active_client = client;
     let mut corrected_context_limit = false;
     let mut fallback_activated = false;
+    let mut empty_response_recovery_attempts = 0usize;
 
     let mut round_limit = tool_call_round_limit(&required_tool_chain);
     let mut round = 0usize;
@@ -1099,6 +1101,37 @@ fn run_session_turn_execution_inner(
             final_content = Some(content);
             break;
         }
+        if streamed_content.content_recovery_needed {
+            if !required_tool_chain_is_complete(
+                &required_tool_chain,
+                &completed_required_tool_names,
+            ) {
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(required_tool_chain_recovery_prompt(
+                        &required_tool_chain,
+                        &completed_required_tool_names,
+                    )),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            } else if empty_response_recovery_attempts < 1 {
+                empty_response_recovery_attempts += 1;
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(MODEL_EMPTY_RESPONSE_RECOVERY_PROMPT.to_string()),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
+            round_limit = round_limit
+                .max(round.saturating_add(2))
+                .min(MAX_TOOL_CALL_ROUNDS);
+            round = round.saturating_add(1);
+            continue;
+        }
         let steers =
             conversation_registry.drain_session_turn_steers(&request.session_id, &request.turn_id);
         if append_session_turn_steers_to_messages(&mut messages, steers) {
@@ -1262,6 +1295,7 @@ struct SessionTurnRoundOutput {
     encountered_tool_calls: bool,
     tool_call_names: Vec<String>,
     activated_skill_id: Option<String>,
+    content_recovery_needed: bool,
     interrupted: bool,
 }
 
@@ -1572,6 +1606,7 @@ fn stream_session_turn_round(
                     encountered_tool_calls: false,
                     tool_call_names: Vec::new(),
                     activated_skill_id: None,
+                    content_recovery_needed: false,
                     interrupted: true,
                 });
             }
@@ -1638,6 +1673,7 @@ fn stream_session_turn_round(
             encountered_tool_calls: false,
             tool_call_names: Vec::new(),
             activated_skill_id: None,
+            content_recovery_needed: false,
             interrupted: true,
         });
     }
@@ -1659,6 +1695,7 @@ fn stream_session_turn_round(
                 encountered_tool_calls: false,
                 tool_call_names: Vec::new(),
                 activated_skill_id: None,
+                content_recovery_needed: false,
                 interrupted: true,
             });
         }
@@ -1706,6 +1743,7 @@ fn stream_session_turn_round(
                 encountered_tool_calls: false,
                 tool_call_names: Vec::new(),
                 activated_skill_id: None,
+                content_recovery_needed: false,
                 interrupted: true,
             });
         }
@@ -1748,6 +1786,7 @@ fn stream_session_turn_round(
                 encountered_tool_calls: false,
                 tool_call_names: Vec::new(),
                 activated_skill_id: None,
+                content_recovery_needed: false,
                 interrupted: true,
             });
         }
@@ -1803,6 +1842,7 @@ fn stream_session_turn_round(
                 encountered_tool_calls: false,
                 tool_call_names: Vec::new(),
                 activated_skill_id: None,
+                content_recovery_needed: false,
                 interrupted: true,
             });
         }
@@ -1813,6 +1853,7 @@ fn stream_session_turn_round(
             encountered_tool_calls: true,
             tool_call_names: tool_batch.succeeded_tool_names,
             activated_skill_id: tool_batch.activated_skill_id,
+            content_recovery_needed: false,
             interrupted: false,
         });
     }
@@ -1828,6 +1869,7 @@ fn stream_session_turn_round(
     let final_item_id = final_content
         .as_ref()
         .and_then(|_| completed_stream_content.map(|_| stream_item_id));
+    let content_recovery_needed = final_content.is_none();
 
     Ok(SessionTurnRoundOutput {
         final_content,
@@ -1836,6 +1878,7 @@ fn stream_session_turn_round(
         encountered_tool_calls: false,
         tool_call_names: Vec::new(),
         activated_skill_id: None,
+        content_recovery_needed,
         interrupted: false,
     })
 }

@@ -336,20 +336,6 @@
 <!-- 用户消息：简洁显示 -->
 {:else if isUser}
   <div class="message-item user" class:sending={sendingAnimation} class:supplementary={isSupplementary} data-message-id={message.id} data-turn-id={messageTurnId || undefined} data-source="user">
-    {#if canEdit || copyableText.trim()}
-      <div class="user-message-actions">
-        {#if canEdit}
-          <button type="button" class="message-action" onclick={() => onEdit?.()} title={i18n.t('messageItem.editTitle')}>
-            <Icon name="edit" size={14} />
-          </button>
-        {/if}
-        {#if copyableText.trim()}
-          <button type="button" class="message-action" onclick={() => void copyMessage()} title={i18n.t('messageItem.copyTitle')}>
-            <Icon name={copied ? 'check' : 'copy'} size={14} />
-          </button>
-        {/if}
-      </div>
-    {/if}
     {#if messageContextReferences.length > 0}
       <div class="user-context-references">
         {#each messageContextReferences as reference (`${message.id}-${reference.kind}-${reference.path}`)}
@@ -389,7 +375,17 @@
     </div>
     <div class="user-time">
       {#if isSupplementary}<span class="supplementary-tag">{i18n.t('messageItem.supplementaryTag')}</span>{/if}
-      {formatTime(message.timestamp)}
+      <span class="user-timestamp">{formatTime(message.timestamp)}</span>
+      {#if canEdit}
+        <button type="button" class="message-action" onclick={() => onEdit?.()} title={i18n.t('messageItem.editTitle')}>
+          <Icon name="edit" size={14} />
+        </button>
+      {/if}
+      {#if copyableText.trim()}
+        <button type="button" class="message-action" onclick={() => void copyMessage()} title={i18n.t('messageItem.copyTitle')}>
+          <Icon name={copied ? 'check' : 'copy'} size={14} />
+        </button>
+      {/if}
     </div>
   </div>
 <!-- 助手消息：单一纯流式渲染路径，收到什么立即展示，不做模式切换 -->
@@ -583,24 +579,20 @@
     margin-top: var(--space-1);
     display: flex;
     align-items: center;
-    gap: var(--space-2);
+    gap: var(--space-1);
     justify-content: flex-end;
   }
 
-  .user-message-actions {
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 2px;
-    margin-bottom: 2px;
+  .user-timestamp {
+    line-height: 22px;
   }
 
   .message-action {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 30px;
-    height: 30px;
+    width: 22px;
+    height: 22px;
     padding: 0;
     border: 0;
     border-radius: 4px;

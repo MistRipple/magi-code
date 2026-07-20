@@ -219,8 +219,15 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         context_references,
         workspace_root_path,
     } = input;
+    let delegation_policy = magi_core::agent_delegation_policy(&goal);
     let executor_binding = TaskExecutorBinding::for_role(target_role)
         .with_active_skill_id(active_skill_id.map(str::to_string));
+    let executor_binding = if delegation_policy.mode != magi_core::AgentDelegationMode::ExplicitOnly
+    {
+        executor_binding.with_delegation_policy(delegation_policy)
+    } else {
+        executor_binding
+    };
 
     magi_core::Task {
         task_id: task_id.clone(),

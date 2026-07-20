@@ -178,7 +178,7 @@ npm --prefix web run build
 - Issues: [Report an issue](https://github.com/MistRipple/magi-code/issues)
 - Releases: [Download releases](https://github.com/MistRipple/magi-code/releases)
 
-The core Magi code is licensed under the [GNU GPL v3](LICENSE). Commercial licensing is available for closed-source integrations; contact the author for details.
+The core Magi code is licensed under the [MIT License](LICENSE).
 
 ---
 
@@ -226,12 +226,4 @@ Feature suggestions, bug reports, and business inquiries are welcome.
 > [!NOTE]
 > **Left**: personal WeChat for business inquiries and feedback | **Right**: Magi test group QR code
 
-Magi uses **dual licensing**:
-
-1. **Open-source license**: the core code is available under the [GNU GPL v3](LICENSE). You may use, modify, and distribute it for free; distributed derivative software must remain open source under the GPL.
-2. **Commercial license**: teams that need to integrate Magi into a closed-source commercial product can contact the author for a separate commercial license.
-
-For commercial licensing or other questions:
-
-- **WeChat**: MistRipple
-- **GitHub**: [MistRipple](https://github.com/MistRipple)
+Magi is released under the [MIT License](LICENSE). You may use, modify, and distribute it as permitted by the license terms.

@@ -566,16 +566,22 @@ fn local_session_turn_intent_decision(
     request: &SessionTurnRequestDto,
     has_recoverable_chain: bool,
 ) -> SessionTurnIntentDecision {
+    let task_text = request
+        .trimmed_text()
+        .unwrap_or_else(|| request.timeline_message(None));
     let requests_goal_mode = session_turn_requests_explicit_goal_mode(request);
     let requests_explicit_task_or_agent =
         session_turn_requests_explicit_task_or_agent_mode(request);
-    let requests_simple_execution = session_turn_requests_simple_execution_by_local_rules(request)
-        || session_turn_requested_public_builtin_tools(request).is_some();
+    let requests_automatic_team = magi_core::text_requires_automatic_agent_team(&task_text);
+    let requests_simple_execution = !requests_automatic_team
+        && (session_turn_requests_simple_execution_by_local_rules(request)
+            || session_turn_requested_public_builtin_tools(request).is_some());
     let route = if has_recoverable_chain && session_turn_requests_continue_existing_task(request) {
         SessionTurnRouteDto::Continue
     } else if requests_goal_mode && !requests_explicit_task_or_agent {
         SessionTurnRouteDto::Chat
     } else if requests_explicit_task_or_agent
+        || requests_automatic_team
         || (session_turn_requests_task_by_local_rules(request) && !requests_simple_execution)
     {
         SessionTurnRouteDto::Task
@@ -585,11 +591,12 @@ fn local_session_turn_intent_decision(
         SessionTurnRouteDto::Chat
     };
     let task_tier = TaskTier::ExecutionChain;
-    let task_text = request
-        .trimmed_text()
-        .unwrap_or_else(|| request.timeline_message(None));
     let task_evidence = if matches!(route, SessionTurnRouteDto::Task) {
-        vec!["本地路由判定需要结构化任务执行".to_string()]
+        if requests_automatic_team {
+            vec!["本地任务分解判定需要团队并行执行".to_string()]
+        } else {
+            vec!["本地路由判定需要结构化任务执行".to_string()]
+        }
     } else {
         Vec::new()
     };
@@ -606,7 +613,13 @@ fn local_session_turn_intent_decision(
         reason_code: Some(
             match route {
                 SessionTurnRouteDto::Continue => "continue_requested",
-                SessionTurnRouteDto::Task => "explicit_task_request",
+                SessionTurnRouteDto::Task => {
+                    if requests_automatic_team {
+                        "automatic_team_required"
+                    } else {
+                        "explicit_task_request"
+                    }
+                }
                 SessionTurnRouteDto::Execute => "tool_request",
                 SessionTurnRouteDto::Chat | SessionTurnRouteDto::Steer => {
                     if requests_goal_mode {
@@ -621,7 +634,13 @@ fn local_session_turn_intent_decision(
         route_reason: Some(
             match route {
                 SessionTurnRouteDto::Continue => "用户要求继续且存在可恢复链",
-                SessionTurnRouteDto::Task => "用户请求需要结构化任务执行",
+                SessionTurnRouteDto::Task => {
+                    if requests_automatic_team {
+                        "任务包含多个独立工作面，自动启用团队并行执行"
+                    } else {
+                        "用户请求需要结构化任务执行"
+                    }
+                }
                 SessionTurnRouteDto::Execute => "用户请求需要工具执行但不需要代理运行记录",
                 SessionTurnRouteDto::Chat | SessionTurnRouteDto::Steer => {
                     if requests_goal_mode {
@@ -704,13 +723,17 @@ fn normalize_session_turn_decision(
             Some("用户明确要求生成图片，必须调用 image_generate 并展示真实生成结果。".to_string());
         decision.task_evidence.clear();
     }
-    let requests_direct_execution = session_turn_requests_simple_execution_by_local_rules(request)
-        || session_turn_requested_public_builtin_tools(request).is_some()
-        || (request
-            .trimmed_text()
-            .as_deref()
-            .is_some_and(magi_core::text_prohibits_agent_spawn)
-            && session_turn_requests_execute_by_local_rules(request));
+    let requests_direct_execution = request
+        .trimmed_text()
+        .as_deref()
+        .is_none_or(|text| !magi_core::text_requires_automatic_agent_team(text))
+        && (session_turn_requests_simple_execution_by_local_rules(request)
+            || session_turn_requested_public_builtin_tools(request).is_some()
+            || (request
+                .trimmed_text()
+                .as_deref()
+                .is_some_and(magi_core::text_prohibits_agent_spawn)
+                && session_turn_requests_execute_by_local_rules(request)));
     if matches!(decision.route, SessionTurnRouteDto::Task)
         && !session_turn_requests_explicit_task_or_agent_mode(request)
         && requests_direct_execution
@@ -841,6 +864,9 @@ fn session_turn_requests_simple_execution_by_local_rules(request: &SessionTurnRe
         return false;
     };
     let normalized = text.to_ascii_lowercase();
+    if magi_core::text_requires_automatic_agent_team(&normalized) {
+        return false;
+    }
     if session_turn_requests_explicit_task_or_agent_mode(request)
         || session_turn_has_structured_task_scope(&normalized)
     {
@@ -1253,6 +1279,7 @@ fn session_turn_task_route_has_creation_evidence(decision: &SessionTurnIntentDec
     if !matches!(
         reason_code,
         "explicit_task_request"
+            | "automatic_team_required"
             | "multi_step_task"
             | "implementation_or_fix"
             | "requires_structured_execution"
@@ -5668,6 +5695,25 @@ mod tests {
         assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
         assert!(decision.execution_goal.is_some());
         assert!(!decision.task_evidence.is_empty());
+    }
+
+    #[test]
+    fn automatic_team_task_exposes_team_route_reason() {
+        let state = test_state();
+        let request = session_turn_request("修复登录流程问题，并运行测试验证回归结果");
+
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("automatic team task should route locally");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert_eq!(
+            decision.reason_code.as_deref(),
+            Some("automatic_team_required")
+        );
+        assert_eq!(
+            decision.route_reason.as_deref(),
+            Some("任务包含多个独立工作面，自动启用团队并行执行")
+        );
     }
 
     #[test]

@@ -1445,7 +1445,16 @@ impl LlmTaskDispatcher {
         }
         let registry = Some(self.agent_role_registry.as_ref());
         if task_is_coordinator(Some(task), registry) {
-            return Some(root_multi_agent_mode_prompt());
+            let mut prompt = root_multi_agent_mode_prompt();
+            let policy = task.delegation_policy().cloned().or_else(|| {
+                let policy = magi_core::agent_delegation_policy(&task.goal);
+                policy.mode.requires_team().then_some(policy)
+            });
+            if let Some(policy) = policy.filter(|policy| policy.mode.requires_team()) {
+                prompt.push_str("\n\n");
+                prompt.push_str(&policy.render_for_prompt());
+            }
+            return Some(prompt);
         }
         Some(subagent_multi_agent_mode_prompt())
     }
@@ -3465,6 +3474,20 @@ mod tests {
             coordinator_prompt.contains("用户明确要求 subagent")
                 && coordinator_prompt.contains("必须通过 agent_spawn 创建真实代理"),
             "明确 subagent 请求必须被约束为真实 agent_spawn"
+        );
+
+        let mut automatic_task = task_with_role("coordinator", TaskTier::ExecutionChain);
+        automatic_task.goal = "修复登录问题，并运行测试验证回归结果。".to_string();
+        automatic_task.executor_binding = Some(
+            magi_core::TaskExecutorBinding::for_role("coordinator")
+                .with_delegation_policy(magi_core::agent_delegation_policy(&automatic_task.goal)),
+        );
+        let (automatic_prompt, _) =
+            dispatcher.assemble_prompt(None, &automatic_task, &session_id, &workspace_id);
+        assert!(
+            automatic_prompt.contains("[team-orchestration-contract]")
+                && automatic_prompt.contains("minimum_agent_count: 2"),
+            "自动组队任务必须向协调器注入结构化团队合同: {automatic_prompt}"
         );
 
         let worker_task = task_with_role("executor", TaskTier::ExecutionChain);

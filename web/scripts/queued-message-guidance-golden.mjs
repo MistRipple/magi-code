@@ -104,14 +104,13 @@ assert.equal(
 );
 assert.match(
   messageItemSource,
-  /\.user-message-actions\s*\{[\s\S]*?display:\s*flex;[\s\S]*?justify-content:\s*flex-end;[\s\S]*?margin-bottom:/,
-  '用户消息操作区必须在气泡上方正常占位，并与气泡右边缘对齐',
+  /<div class="user-time">[\s\S]*?user-timestamp[\s\S]*?messageItem\.editTitle[\s\S]*?messageItem\.copyTitle/,
+  '用户消息底部必须按时间、编辑、复制的顺序展示操作',
 );
-const messageActionsStyle = messageItemSource.match(/\.user-message-actions\s*\{([\s\S]*?)\n  \}/)?.[1] || '';
 assert.doesNotMatch(
-  messageActionsStyle,
-  /position:\s*absolute|top:|right:|border:\s*1px|box-shadow:|transform:|opacity:|pointer-events:/,
-  '消息操作区不得绝对定位覆盖气泡，也不得渲染为悬浮窗',
+  messageItemSource,
+  /\.user-message-actions\s*\{/,
+  '用户消息不得保留气泡上方的独立操作区',
 );
 assert.doesNotMatch(
   messageItemSource,

@@ -238,6 +238,277 @@ impl PlanItem {
     }
 }
 
+/// 团队编排模式。
+///
+/// 该模式是任务运行时合同，不是提示词关键词开关：`explicit_only` 表示只有用户
+/// 明确要求时才组队，`automatic` 表示当前任务已经被本地规则判定为需要并行分工，
+/// `required` 表示用户明确要求组队，`disabled` 表示用户明确禁止组队。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDelegationMode {
+    Disabled,
+    #[default]
+    ExplicitOnly,
+    Automatic,
+    Required,
+}
+
+impl AgentDelegationMode {
+    pub fn requires_team(self) -> bool {
+        matches!(self, Self::Automatic | Self::Required)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::ExplicitOnly => "explicit_only",
+            Self::Automatic => "automatic",
+            Self::Required => "required",
+        }
+    }
+}
+
+/// 主线协调器的团队执行合同。
+///
+/// 只在根任务上保存；子任务通过 `agent_spawn` 的角色和 context package 自己描述
+/// 执行边界。这样任务是否需要组队、最少人数和并行要求可以被恢复、审计和校验，
+/// 不再依赖模型是否碰巧理解了一段提示词。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentDelegationPolicy {
+    pub mode: AgentDelegationMode,
+    #[serde(default = "default_minimum_agent_count")]
+    pub minimum_agent_count: u8,
+    #[serde(default)]
+    pub parallel: bool,
+    #[serde(default)]
+    pub recommended_roles: Vec<String>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+impl Default for AgentDelegationPolicy {
+    fn default() -> Self {
+        Self {
+            mode: AgentDelegationMode::ExplicitOnly,
+            minimum_agent_count: default_minimum_agent_count(),
+            parallel: false,
+            recommended_roles: Vec::new(),
+            reason: String::new(),
+        }
+    }
+}
+
+const fn default_minimum_agent_count() -> u8 {
+    2
+}
+
+impl AgentDelegationPolicy {
+    pub fn explicit_required(text: &str) -> Self {
+        Self {
+            mode: AgentDelegationMode::Required,
+            minimum_agent_count: requested_agent_count(text),
+            parallel: true,
+            recommended_roles: recommended_agent_roles(text),
+            reason: "用户明确要求代理、团队或并行协作".to_string(),
+        }
+    }
+
+    pub fn automatic(text: &str) -> Self {
+        Self {
+            mode: AgentDelegationMode::Automatic,
+            minimum_agent_count: 2,
+            parallel: true,
+            recommended_roles: recommended_agent_roles(text),
+            reason: "任务包含多个可独立推进的工作面，自动启用团队协作".to_string(),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            mode: AgentDelegationMode::Disabled,
+            reason: "用户明确要求主线直接处理".to_string(),
+            ..Self::default()
+        }
+    }
+
+    pub fn render_for_prompt(&self) -> String {
+        let roles = if self.recommended_roles.is_empty() {
+            "由协调器根据子任务选择可用角色".to_string()
+        } else {
+            self.recommended_roles.join("、")
+        };
+        format!(
+            "[team-orchestration-contract]\nmode: {}\nminimum_agent_count: {}\nparallel: {}\nrecommended_roles: {}\nreason: {}\n执行合同：{}；至少创建 {} 个真实代理，边界清晰的子任务应在同一轮并行派发；全部代理必须通过 agent_wait 收集，并在最终答复中吸收结果。",
+            self.mode.as_str(),
+            self.minimum_agent_count,
+            self.parallel,
+            roles,
+            self.reason,
+            if self.mode == AgentDelegationMode::Required {
+                "用户明确要求组队，禁止由主线单独完成"
+            } else {
+                "当前任务自动判定需要组队，除非工具不可用或安全策略阻止"
+            },
+            self.minimum_agent_count,
+        )
+    }
+}
+
+/// 根据用户输入返回一次任务的团队编排合同。
+pub fn agent_delegation_policy(text: &str) -> AgentDelegationPolicy {
+    if text_prohibits_agent_spawn(text) {
+        return AgentDelegationPolicy::disabled();
+    }
+    if text_requires_agent_spawn(text) {
+        return AgentDelegationPolicy::explicit_required(text);
+    }
+    if text_requires_automatic_agent_team(text) {
+        return AgentDelegationPolicy::automatic(text);
+    }
+    AgentDelegationPolicy::default()
+}
+
+/// 判断任务是否应在没有用户显式要求时自动开启团队。
+///
+/// 只对同时具备多个工作领域和拆分信号的执行请求生效，避免把普通问答、小范围
+/// 单文件修改或单条工具调用误判成团队任务。用户的“不要组队”永远优先。
+pub fn text_requires_automatic_agent_team(text: &str) -> bool {
+    if text_prohibits_agent_spawn(text) || text_requires_agent_spawn(text) {
+        return false;
+    }
+    let normalized = text.to_ascii_lowercase();
+    let work_domain_count = [
+        &[
+            "分析", "检查", "审查", "定位", "探索", "analy", "inspect", "review",
+        ][..],
+        &[
+            "实现",
+            "修复",
+            "重构",
+            "修改",
+            "开发",
+            "implement",
+            "fix",
+            "refactor",
+        ][..],
+        &["测试", "验证", "回归", "test", "verify", "validate"][..],
+        &["文档", "说明", "readme", "document"][..],
+        &["构建", "发布", "打包", "build", "release", "package"][..],
+    ]
+    .iter()
+    .filter(|domain| {
+        domain.iter().any(|marker| {
+            normalized
+                .match_indices(marker)
+                .any(|(index, _)| !prefix_negates_action(&normalized, index))
+        })
+    })
+    .count();
+    if work_domain_count < 2 {
+        return false;
+    }
+
+    let decomposition_signal = [
+        "并且",
+        "并",
+        "同时",
+        "然后",
+        "以及",
+        "分别",
+        "一边",
+        "分成",
+        "拆分",
+        "逐项",
+        "端到端",
+        "全面",
+        "完整",
+        "系统性",
+        "全量",
+        "跨模块",
+        "and",
+        "then",
+        "also",
+        "separately",
+        "end-to-end",
+    ]
+    .iter()
+    .filter(|marker| normalized.contains(*marker))
+    .count();
+    let structured_signal = normalized
+        .chars()
+        .filter(|character| matches!(character, ';' | '；' | '\n' | '。' | '！' | '!'))
+        .count()
+        >= 2
+        || normalized.contains("1.")
+        || normalized.contains("1、")
+        || normalized.contains("- ")
+        || normalized.chars().count() >= 100;
+    decomposition_signal > 0 || structured_signal
+}
+
+fn requested_agent_count(text: &str) -> u8 {
+    let normalized = text.to_ascii_lowercase();
+    for (marker, count) in [
+        ("五个", 5),
+        ("四个", 4),
+        ("三个", 3),
+        ("两个", 2),
+        ("5个", 5),
+        ("4个", 4),
+        ("3个", 3),
+        ("2个", 2),
+    ] {
+        if normalized.contains(marker) {
+            return count;
+        }
+    }
+    2
+}
+
+fn recommended_agent_roles(text: &str) -> Vec<String> {
+    let normalized = text.to_ascii_lowercase();
+    let mut roles = Vec::new();
+    if [
+        "分析", "检查", "审查", "定位", "探索", "analy", "inspect", "review",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        roles.push("explorer".to_string());
+    }
+    if [
+        "实现",
+        "修复",
+        "重构",
+        "修改",
+        "开发",
+        "implement",
+        "fix",
+        "refactor",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        roles.push("executor".to_string());
+    }
+    if ["测试", "验证", "回归", "test", "verify", "validate"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        roles.push("tester".to_string());
+    }
+    if ["审计", "review", "审查"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+        && !roles.iter().any(|role| role == "explorer")
+    {
+        roles.push("reviewer".to_string());
+    }
+    roles.truncate(3);
+    roles
+}
+
 /// 判断用户文本是否明确要求主线创建子代理。
 ///
 /// 只接受未被否定词修饰的代理模式、代理工具或派发动作。这样“不要创建子代理”不会
@@ -258,6 +529,11 @@ pub fn text_requires_agent_spawn(text: &str) -> bool {
         "多代理模式",
         "多agent模式",
         "multiagent模式",
+        "团队模式",
+        "团队协作",
+        "代理模式",
+        "并行协作",
+        "多角色处理",
         "subagentmode",
         "multiagentmode",
         "使用多个代理",
@@ -305,11 +581,39 @@ pub fn text_prohibits_agent_spawn(text: &str) -> bool {
         return false;
     }
     let lowered = text.to_ascii_lowercase();
+    for marker in [
+        "团队模式",
+        "团队协作",
+        "多代理",
+        "多agent",
+        "multi-agent",
+        "代理模式",
+        "子代理",
+        "subagent",
+    ] {
+        if lowered
+            .match_indices(marker)
+            .any(|(index, _)| prefix_negates_action(&lowered, index))
+        {
+            return true;
+        }
+    }
     for verb in [
         "启动", "派发", "分派", "分配", "调用", "创建", "拉起", "开启", "使用",
     ] {
-        if negated_action_targets_agent(&lowered, verb, &["子代理", "代理", "agent", "subagent"])
-        {
+        if negated_action_targets_agent(
+            &lowered,
+            verb,
+            &[
+                "子代理",
+                "代理",
+                "团队",
+                "多代理",
+                "agent",
+                "subagent",
+                "team",
+            ],
+        ) {
             return true;
         }
     }
@@ -327,8 +631,32 @@ pub fn text_prohibits_agent_spawn(text: &str) -> bool {
 
 fn contains_non_negated_marker(text: &str, marker: &str) -> bool {
     text.match_indices(marker).any(|(index, _)| {
-        !prefix_negates_action(text, index) && !prefix_frames_action_as_discussion(text, index)
+        !prefix_negates_action(text, index)
+            && !prefix_frames_action_as_discussion(text, index)
+            && !suffix_frames_marker_as_discussion(text, index, marker)
     })
+}
+
+fn suffix_frames_marker_as_discussion(text: &str, marker_index: usize, marker: &str) -> bool {
+    let suffix = text[marker_index + marker.len()..]
+        .chars()
+        .take(20)
+        .collect::<String>();
+    [
+        "是什么",
+        "怎么",
+        "如何",
+        "是否",
+        "什么时候",
+        "为什么",
+        "what",
+        "how",
+        "whether",
+        "when",
+        "why",
+    ]
+    .iter()
+    .any(|framing| suffix.contains(framing))
 }
 
 fn action_targets_agent(text: &str, verb: &str, targets: &[&str]) -> bool {
@@ -608,6 +936,8 @@ pub struct TaskExecutorBinding {
     pub exclusive_scope: Option<String>,
     pub active_skill_id: Option<String>,
     #[serde(default)]
+    pub delegation_policy: Option<AgentDelegationPolicy>,
+    #[serde(default)]
     pub canonical_task_name: Option<String>,
     #[serde(default)]
     pub plan_item_id: Option<PlanItemId>,
@@ -633,6 +963,11 @@ impl TaskExecutorBinding {
 
     pub fn with_active_skill_id(mut self, skill_id: Option<String>) -> Self {
         self.active_skill_id = normalized_optional_string(skill_id);
+        self
+    }
+
+    pub fn with_delegation_policy(mut self, policy: AgentDelegationPolicy) -> Self {
+        self.delegation_policy = Some(policy);
         self
     }
 
@@ -745,6 +1080,12 @@ impl Task {
         self.executor_binding
             .as_ref()
             .and_then(|binding| binding.plan_item_id.as_ref())
+    }
+
+    pub fn delegation_policy(&self) -> Option<&AgentDelegationPolicy> {
+        self.executor_binding
+            .as_ref()
+            .and_then(|binding| binding.delegation_policy.as_ref())
     }
 }
 
@@ -871,5 +1212,30 @@ mod tests {
         assert!(!text_requires_agent_spawn(
             "how to use agents effectively in a coding task?"
         ));
+        assert_eq!(
+            agent_delegation_policy("请说明主模型和代理的职责边界，以及什么时候应该使用代理。")
+                .mode,
+            AgentDelegationMode::ExplicitOnly
+        );
+    }
+
+    #[test]
+    fn agent_delegation_policy_distinguishes_explicit_automatic_and_disabled() {
+        assert_eq!(
+            agent_delegation_policy("检查 /tmp 顶层结构并汇总，不要修改文件。").mode,
+            AgentDelegationMode::ExplicitOnly
+        );
+        assert_eq!(
+            agent_delegation_policy("修复登录问题，并运行测试验证回归结果。").mode,
+            AgentDelegationMode::Automatic
+        );
+        assert_eq!(
+            agent_delegation_policy("请使用团队模式，分别由 explorer 和 tester 处理。").mode,
+            AgentDelegationMode::Required
+        );
+        assert_eq!(
+            agent_delegation_policy("只由主线处理，不要启用团队模式。").mode,
+            AgentDelegationMode::Disabled
+        );
     }
 }
