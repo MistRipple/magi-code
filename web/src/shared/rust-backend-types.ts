@@ -1276,6 +1276,7 @@ export interface EnhancePromptRequestDto extends Record<string, unknown> {
   prompt: string;
   skillName?: string | null;
   skillDescription?: string | null;
+  locale?: string | null;
 }
 
 export interface MessagesResponseDto {

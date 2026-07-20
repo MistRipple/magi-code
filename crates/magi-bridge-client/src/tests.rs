@@ -938,6 +938,146 @@ fn image_generation_client_builds_standard_openai_request_and_parses_base64_resu
 }
 
 #[test]
+fn image_generation_client_maps_grok_dimensions_to_xai_request_fields() {
+    let client = HttpImageGenerationClient::new(
+        "https://api.x.ai/v1".to_string(),
+        Some("xai-image-test".to_string()),
+        "grok-imagine-image-quality".to_string(),
+        ImageGenerationUrlMode::Standard,
+    );
+    let request = ImageGenerationRequest {
+        prompt: "A cinematic mountain landscape".to_string(),
+        size: "1536x1024".to_string(),
+        quality: Some("high".to_string()),
+    };
+
+    let built = client
+        .build_request_for_test(&request)
+        .expect("xAI image request should build");
+    assert_eq!(built.url, "https://api.x.ai/v1/images/generations");
+    assert_eq!(built.body["model"], "grok-imagine-image-quality");
+    assert_eq!(built.body["prompt"], "A cinematic mountain landscape");
+    assert_eq!(built.body["n"], 1);
+    assert_eq!(built.body["response_format"], "b64_json");
+    assert_eq!(built.body["aspect_ratio"], "3:2");
+    assert_eq!(built.body["resolution"], "2k");
+    assert!(built.body.get("size").is_none());
+    assert!(built.body.get("quality").is_none());
+}
+
+#[test]
+fn image_generation_client_downloads_url_response_without_forwarding_api_key() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("image URL mock server should bind");
+    let address = listener
+        .local_addr()
+        .expect("image URL mock server address should be available");
+    let server = thread::spawn(move || {
+        let (mut generation_stream, _) = listener
+            .accept()
+            .expect("image URL mock server should accept generation request");
+        let mut generation_request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let header_end = loop {
+            let read = generation_stream
+                .read(&mut buffer)
+                .expect("generation request should be readable");
+            assert!(read > 0, "generation request ended before headers");
+            generation_request.extend_from_slice(&buffer[..read]);
+            if let Some(position) = generation_request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+            {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&generation_request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length:")
+                    .or_else(|| line.strip_prefix("content-length:"))
+            })
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .expect("generation request should include content length");
+        while generation_request.len() < header_end + content_length {
+            let read = generation_stream
+                .read(&mut buffer)
+                .expect("generation request body should be readable");
+            assert!(read > 0, "generation request ended before body");
+            generation_request.extend_from_slice(&buffer[..read]);
+        }
+        let response_body = serde_json::json!({
+            "data": [{
+                "url": format!("http://{address}/generated.png"),
+                "revised_prompt": "a downloaded blue square"
+            }]
+        })
+        .to_string();
+        write!(
+            generation_stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body,
+        )
+        .expect("generation response should be writable");
+        drop(generation_stream);
+
+        let (mut image_stream, _) = listener
+            .accept()
+            .expect("image URL mock server should accept image download");
+        let mut image_request = Vec::new();
+        loop {
+            let read = image_stream
+                .read(&mut buffer)
+                .expect("image download request should be readable");
+            assert!(read > 0, "image download request ended before headers");
+            image_request.extend_from_slice(&buffer[..read]);
+            if image_request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let image_headers = String::from_utf8_lossy(&image_request);
+        assert!(image_headers.starts_with("GET /generated.png HTTP/1.1"));
+        assert!(
+            !image_headers
+                .to_ascii_lowercase()
+                .contains("authorization:")
+        );
+        let image_bytes = b"\x89PNG\r\n\x1a\n";
+        write!(
+            image_stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            image_bytes.len(),
+        )
+        .expect("image response headers should be writable");
+        image_stream
+            .write_all(image_bytes)
+            .expect("image response body should be writable");
+    });
+
+    let client = HttpImageGenerationClient::new(
+        format!("http://{address}/v1"),
+        Some("secret-image-key".to_string()),
+        "grok-imagine-image".to_string(),
+        ImageGenerationUrlMode::Standard,
+    );
+    let generated = client
+        .generate(ImageGenerationRequest {
+            prompt: "draw a blue square".to_string(),
+            size: "1024x1024".to_string(),
+            quality: None,
+        })
+        .expect("URL image response should be downloaded");
+    server.join().expect("image URL mock server should finish");
+    assert_eq!(generated.media_type, "image/png");
+    assert_eq!(generated.bytes, b"\x89PNG\r\n\x1a\n");
+    assert_eq!(
+        generated.revised_prompt.as_deref(),
+        Some("a downloaded blue square")
+    );
+}
+
+#[test]
 fn image_generation_client_performs_real_http_request() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("image mock server should bind");
     let address = listener

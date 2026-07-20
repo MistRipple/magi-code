@@ -898,6 +898,7 @@ async function postJsonWithBinding<T>(
   action: string,
   bindingOverride?: Partial<AgentBindingContext>,
   includeSession = true,
+  signal?: AbortSignal,
 ): Promise<T> {
   try {
     const binding = resolveBindingWithOverride(bindingOverride);
@@ -909,6 +910,7 @@ async function postJsonWithBinding<T>(
     const response = await getTransport().request(agentUrl(pathname), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal,
       body: JSON.stringify({
         ...bindingPayload,
         ...payload,
@@ -928,8 +930,9 @@ async function postBoundJson<T>(
   payload: Record<string, unknown>,
   action: string,
   bindingOverride?: Partial<AgentBindingContext>,
+  signal?: AbortSignal,
 ): Promise<T> {
-  return await postJsonWithBinding<T>(pathname, payload, action, bindingOverride, true);
+  return await postJsonWithBinding<T>(pathname, payload, action, bindingOverride, true, signal);
 }
 
 export async function listAgentWorkspaces(): Promise<AgentWorkspaceSummary[]> {
@@ -1541,8 +1544,17 @@ export async function getAgentExecutionStats(): Promise<AgentExecutionStatsPaylo
   }
 }
 
-export async function enhanceAgentPrompt(request: EnhancePromptRequestDto): Promise<{ enhancedPrompt: string; error?: string }> {
-  return await postBoundJson<{ enhancedPrompt: string; error?: string }>('/api/prompt/enhance', request, 'enhance prompt');
+export async function enhanceAgentPrompt(
+  request: EnhancePromptRequestDto,
+  signal?: AbortSignal,
+): Promise<{ enhancedPrompt: string; error?: string }> {
+  return await postBoundJson<{ enhancedPrompt: string; error?: string }>(
+    '/api/prompt/enhance',
+    request,
+    'enhance prompt',
+    undefined,
+    signal,
+  );
 }
 
 export interface WorkspaceBranchesResult {

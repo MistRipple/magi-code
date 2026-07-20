@@ -187,6 +187,7 @@
   "input.enhance.restored": "已还原为优化前文本",
   "input.enhance.success": "提示词已优化",
   "input.enhance.empty": "模型未返回有效内容",
+  "input.enhance.tooLong": "优化结果过长，最多支持 {max} 个字符",
   "input.enhance.failed": "优化失败，请稍后重试",
   "input.stopFailed": "停止失败，请稍后重试",
   "input.modelListLoadFailed": "模型列表加载失败，请稍后重试",

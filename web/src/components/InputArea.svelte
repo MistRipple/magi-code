@@ -168,6 +168,8 @@
   let enhanceLoading = $state(false);
   let enhanceOriginalPrompt = $state<string | null>(null);
   let enhanceResultPrompt = $state<string | null>(null);
+  let enhanceAbortController: AbortController | null = null;
+  let enhanceRequestSeq = 0;
 
   // 主线模型 picker：弹窗状态 + 模型列表惰性拉取。
   // 选中后只写当前会话 orchestrator 覆盖段；全局配置仍是新会话默认值和连接凭据来源。
@@ -301,6 +303,7 @@
     }
     if (nextScopeKey === composerReferenceScopeKey) return;
     composerReferenceScopeKey = nextScopeKey;
+    invalidateEnhanceState();
     selectedGoalMode = false;
     selectedSkill = null;
     selectedContextReferences = [];
@@ -431,7 +434,7 @@
     selectedSkill = null;
     addMenuOpen = false;
     contextPickerOpen = false;
-    clearEnhanceSnapshot();
+    invalidateEnhanceState();
     closeSlashMenu();
   }
 
@@ -461,7 +464,7 @@
     }
     if (draft.turnId === loadedEditingTurnId) return;
     loadedEditingTurnId = draft.turnId;
-    clearEnhanceSnapshot();
+    invalidateEnhanceState();
     inputValue = draft.text;
     pendingCaretOffset = draft.text.length;
     selectedImages = draft.images.map((image) => ({
@@ -752,6 +755,7 @@
       selectedSkill = command.skill;
     }
     if (inputTextareaEl && slashTriggerStart !== null) {
+      invalidateEnhanceState();
       const cursor = getEditorCaretOffset();
       const value = readEditorText();
       const before = value.slice(0, slashTriggerStart);
@@ -873,6 +877,7 @@
   function handleComposerInput() {
     if (isComposing) return;
     if (!inputTextareaEl) return;
+    invalidateEnhanceState();
     const text = readEditorText();
     inputValue = text;
     // 原生 input 事件内立即替换 contenteditable 的文本节点会把光标重置到开头。
@@ -979,7 +984,7 @@
     function handleFillComposer(event: Event) {
       const text = (event as CustomEvent<{ text?: string }>).detail?.text;
       if (typeof text !== 'string' || !text.trim()) return;
-      clearEnhanceSnapshot();
+      invalidateEnhanceState();
       pendingCaretOffset = text.length;
       inputValue = text;
       queueMicrotask(focusEditor);
@@ -1198,6 +1203,7 @@
   }
 
   function insertNewlineAtCursor() {
+    invalidateEnhanceState();
     if (!inputTextareaEl) {
       inputValue += '\n';
       return;
@@ -1326,7 +1332,7 @@
     if (!target) return;
     const text = (target.text ?? target.content ?? '').toString();
     removeQueuedMessage(normalizedId);
-    clearEnhanceSnapshot();
+    invalidateEnhanceState();
     pendingCaretOffset = text.length;
     inputValue = text;
     queueMicrotask(focusEditor);
@@ -1375,6 +1381,7 @@
     const text = event.clipboardData?.getData('text/plain');
     if (typeof text !== 'string' || text.length === 0) return;
     event.preventDefault();
+    invalidateEnhanceState();
     if (!inputTextareaEl) {
       pendingCaretOffset = (inputValue.length + text.length);
       inputValue = inputValue + text;
@@ -1510,9 +1517,6 @@
 
   function getAuxiliaryConfigSnapshot(): Record<string, unknown> | null {
     const snapshot = messagesState.settingsBootstrapSnapshot;
-    if (!settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
-      return null;
-    }
     const auxiliaryConfig = snapshot?.auxiliaryConfig;
     if (!auxiliaryConfig || typeof auxiliaryConfig !== 'object' || Array.isArray(auxiliaryConfig)) {
       return null;
@@ -1525,14 +1529,20 @@
       return false;
     }
     const baseUrl = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : '';
-    const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : '';
     const model = typeof config.model === 'string' ? config.model.trim() : '';
-    return Boolean(baseUrl && apiKey && model);
+    return Boolean(baseUrl && model);
   }
 
   function clearEnhanceSnapshot() {
     enhanceOriginalPrompt = null;
     enhanceResultPrompt = null;
+  }
+
+  function invalidateEnhanceState() {
+    enhanceRequestSeq += 1;
+    enhanceAbortController?.abort();
+    enhanceAbortController = null;
+    clearEnhanceSnapshot();
   }
 
   function applyLocalOrchestratorSessionConfig(
@@ -2164,59 +2174,35 @@
     }
   }
 
-  // 设计原则：只做一次确定性还原；任何解析失败都退回原文，避免吞掉用户实际想要的内容。
-  function unwrapEnhancedPromptPayload(raw: string): string {
-    let text = raw.trim();
-    if (!text) return text;
-    const fenceMatch = text.match(/^```(?:json|markdown|md|text)?\s*\n?([\s\S]*?)\n?```$/i);
-    if (fenceMatch) {
-      text = fenceMatch[1].trim();
-    }
-    if ((text.startsWith('{') && text.endsWith('}')) || (text.startsWith('[') && text.endsWith(']'))) {
-      try {
-        const parsed = JSON.parse(text);
-        const candidate = extractEnhancedContent(parsed);
-        if (candidate) text = candidate;
-      } catch { /* 解析失败保持原样 */ }
-    }
-    return text.trim();
-  }
-
-  function extractEnhancedContent(value: unknown): string | null {
-    if (typeof value === 'string') return value;
-    if (!value || typeof value !== 'object') return null;
-    const obj = value as Record<string, unknown>;
-    const keys = ['enhancedPrompt', 'enhanced_prompt', 'content', 'text', 'prompt', 'result', 'output'];
-    for (const key of keys) {
-      const inner = obj[key];
-      if (typeof inner === 'string' && inner.trim()) return inner;
-      if (inner && typeof inner === 'object') {
-        const nested = extractEnhancedContent(inner);
-        if (nested) return nested;
-      }
-    }
-    return null;
-  }
-
   // Prompt enhance：调用后端模型重写当前 textarea 文本
   // 这里固定走辅助模型，不占用主线模型配额；如果存在选中的技能上下文，一并传给后端增强。
   async function enhancePromptHandler() {
     const draft = resolveComposerRawContent();
     const normalizedDraft = draft.trim();
     if (enhanceLoading || !normalizedDraft || !auxiliaryEnhanceReady) return;
+    const requestSeq = ++enhanceRequestSeq;
+    const requestScopeKey = currentComposerReferenceScopeKey();
+    const abortController = new AbortController();
+    enhanceAbortController = abortController;
     enhanceLoading = true;
     try {
       const result = await enhanceAgentPrompt({
         prompt: normalizedDraft,
         skillName: selectedSkill?.skillId?.trim() || null,
         skillDescription: selectedSkill?.description?.trim() || null,
-      });
-      const next = unwrapEnhancedPromptPayload(result?.enhancedPrompt ?? '');
+        locale: i18n.locale,
+      }, abortController.signal);
+      if (requestSeq !== enhanceRequestSeq || requestScopeKey !== currentComposerReferenceScopeKey()) return;
+      const next = result?.enhancedPrompt?.trim() || '';
       if (!next) {
         if (result?.error) {
           console.warn('[InputArea] 提示词优化返回错误:', result.error);
         }
         addToast('warning', i18n.t('input.enhance.empty'));
+        return;
+      }
+      if (next.length > MAX_INPUT_CHARS) {
+        addToast('warning', i18n.t('input.enhance.tooLong', { max: MAX_INPUT_CHARS }));
         return;
       }
       enhanceOriginalPrompt = draft;
@@ -2226,9 +2212,11 @@
       queueMicrotask(focusEditor);
       addToast('success', i18n.t('input.enhance.success'));
     } catch (error) {
+      if (abortController.signal.aborted || requestSeq !== enhanceRequestSeq) return;
       console.warn('[InputArea] 提示词优化失败:', error);
       addToast('error', i18n.t('input.enhance.failed'));
     } finally {
+      if (enhanceAbortController === abortController) enhanceAbortController = null;
       enhanceLoading = false;
     }
   }

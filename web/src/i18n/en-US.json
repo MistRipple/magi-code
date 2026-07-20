@@ -187,6 +187,7 @@
   "input.enhance.restored": "Restored to the pre-enhance text",
   "input.enhance.success": "Prompt enhanced",
   "input.enhance.empty": "Model returned no usable content",
+  "input.enhance.tooLong": "The enhanced prompt is too long. Keep it within {max} characters",
   "input.enhance.failed": "Enhance failed. Please retry later",
   "input.stopFailed": "Stop failed. Please retry later",
   "input.modelListLoadFailed": "Failed to load model list. Please retry later",

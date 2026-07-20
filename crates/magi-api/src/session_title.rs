@@ -196,7 +196,7 @@ fn refine_new_session_title_inner(
                     event_bus: usage_context.event_bus,
                     session_store: session_store.as_ref(),
                     settings_store: Some(usage_context.settings_store),
-                    session_id: &session_id,
+                    session_id: Some(&session_id),
                     workspace_id: &workspace_binding,
                     call_id,
                     phase: UsagePhase::Integration,

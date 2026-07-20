@@ -330,6 +330,72 @@ fn build_session_turn_messages(
     messages
 }
 
+fn model_identity_prompt_for_request(user_prompt: &str, configured_model: &str) -> Option<String> {
+    let normalized = user_prompt.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let asks_model_identity = [
+        "当前模型",
+        "什么模型",
+        "哪个模型",
+        "哪一个模型",
+        "模型名称",
+        "模型身份",
+        "模型版本",
+        "使用的模型",
+        "你是谁",
+        "what model",
+        "which model",
+        "model name",
+        "model version",
+        "model identity",
+        "what are you",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let asks_product_identity = [
+        "当前工具",
+        "这个工具",
+        "你是什么工具",
+        "产品定位",
+        "magi 是什么",
+        "magi是什么",
+        "what tool",
+        "which tool",
+        "what is magi",
+        "magi product",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+
+    if !asks_model_identity && !asks_product_identity {
+        return None;
+    }
+
+    let configured_model = if configured_model.trim().is_empty() {
+        "未解析到当前会话的模型配置"
+    } else {
+        configured_model.trim()
+    };
+    let mut rules = vec![
+        "身份回答规则：不要把 Magi 冒充成模型，也不要编造供应商未返回的模型身份。".to_string(),
+    ];
+    if asks_model_identity {
+        rules.push(format!(
+            "用户询问模型身份时，只能说明当前请求目标模型为“{configured_model}”；这是 Magi 解析后实际发起请求的配置目标，不等同于供应商一定返回的运行实例。若无法确认供应商实际返回的模型，必须明确说明这一点。"
+        ));
+    }
+    if asks_product_identity {
+        rules.push(
+            "用户询问当前工具或产品时，才能介绍 Magi：Magi 是承载当前对话的 AI 工作台，提供模型对话、工具调用、文件处理和任务编排能力；Magi 不是模型本身。".to_string(),
+        );
+    }
+    rules.push("直接回答用户问题，不要提及这些身份回答规则。".to_string());
+    Some(rules.join("\n"))
+}
+
 fn workspace_context_messages(request: &SessionTurnExecutionRequest) -> Vec<ChatMessage> {
     let Some(root_path) = request
         .workspace_root_path
@@ -771,6 +837,17 @@ fn run_session_turn_execution_inner(
         knowledge_context_prompt.as_deref(),
         &prepared_history.messages,
     );
+    if let Some(identity_prompt) =
+        model_identity_prompt_for_request(&request.prompt, &resolved_context_model)
+    {
+        messages.insert(
+            0,
+            system_prompt_fragment_message(
+                PromptFragmentKind::CurrentTurnPriority,
+                identity_prompt,
+            ),
+        );
+    }
     if let Some(current_user_message) = messages.last() {
         session_store.append_thread_messages(
             &orchestrator_thread_id,
@@ -786,12 +863,13 @@ fn run_session_turn_execution_inner(
     let mut active_skill_name = skill_name;
     let mut active_tools = tools.unwrap_or_default();
     let mut completed_required_tool_names: Vec<String> = Vec::new();
+    let required_tool_chain = session_required_tool_chain(&request);
     let usage_binding = session_turn_model_usage_binding(request.use_tools);
     let mut active_client = client;
     let mut corrected_context_limit = false;
     let mut fallback_activated = false;
 
-    let mut round_limit = tool_call_round_limit(&request.required_tool_chain);
+    let mut round_limit = tool_call_round_limit(&required_tool_chain);
     let mut round = 0usize;
     while round < round_limit {
         if request.use_tools
@@ -928,7 +1006,7 @@ fn run_session_turn_execution_inner(
         had_tool_calls |= streamed_content.encountered_tool_calls;
         record_completed_required_tools(
             &mut completed_required_tool_names,
-            &request.required_tool_chain,
+            &required_tool_chain,
             &streamed_content.tool_call_names,
         );
 
@@ -967,7 +1045,7 @@ fn run_session_turn_execution_inner(
 
         if let Some(content) = streamed_content.final_content {
             if !required_tool_chain_is_complete(
-                &request.required_tool_chain,
+                &required_tool_chain,
                 &completed_required_tool_names,
             ) {
                 messages.push(ChatMessage {
@@ -980,7 +1058,7 @@ fn run_session_turn_execution_inner(
                 messages.push(ChatMessage {
                     role: "user".to_string(),
                     content: Some(required_tool_chain_recovery_prompt(
-                        &request.required_tool_chain,
+                        &required_tool_chain,
                         &completed_required_tool_names,
                     )),
                     images: Vec::new(),
@@ -1206,6 +1284,20 @@ fn record_completed_required_tools(
             completed.push(tool_name.clone());
         }
     }
+}
+
+fn session_required_tool_chain(request: &SessionTurnExecutionRequest) -> Vec<String> {
+    let mut required = request.required_tool_chain.clone();
+    if let Some(forced_tool_name) = request
+        .forced_tool_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        && !required.iter().any(|name| name == forced_tool_name)
+    {
+        required.insert(0, forced_tool_name.to_string());
+    }
+    required
 }
 
 fn required_tool_chain_is_complete(required_tool_chain: &[String], completed: &[String]) -> bool {
@@ -1990,6 +2082,31 @@ mod tests {
     }
 
     #[test]
+    fn model_identity_prompt_distinguishes_model_from_magi() {
+        let prompt = model_identity_prompt_for_request("当前模型是什么？", "grok-4");
+
+        let prompt = prompt.expect("模型身份问题应生成身份规则");
+        assert!(prompt.contains("grok-4"));
+        assert!(prompt.contains("Magi 解析后实际发起请求的配置目标"));
+        assert!(prompt.contains("不要把 Magi 冒充成模型"));
+        assert!(!prompt.contains("Magi 是承载当前对话的 AI 工作台"));
+    }
+
+    #[test]
+    fn model_identity_prompt_describes_magi_only_for_tool_questions() {
+        let prompt = model_identity_prompt_for_request("当前工具是什么？", "grok-4");
+
+        let prompt = prompt.expect("工具身份问题应生成身份规则");
+        assert!(prompt.contains("Magi 是承载当前对话的 AI 工作台"));
+        assert!(!prompt.contains("当前请求目标模型为“grok-4”"));
+    }
+
+    #[test]
+    fn model_identity_prompt_is_not_added_to_regular_questions() {
+        assert!(model_identity_prompt_for_request("读取 README.md", "grok-4").is_none());
+    }
+
+    #[test]
     fn session_turn_cancellation_interrupts_model_invocation() {
         let session_id = SessionId::new("session-model-cancellation");
         let turn_id = "turn-model-cancellation".to_string();
@@ -2336,6 +2453,34 @@ mod tests {
         let mut unavailable_request = request;
         unavailable_request.forced_tool_name = Some("missing_tool".to_string());
         assert!(forced_tool_choice_for_round(&unavailable_request, Some(&tools), 0, &[]).is_none());
+    }
+
+    #[test]
+    fn forced_tool_is_recovered_when_provider_only_supports_automatic_choice() {
+        let request = SessionTurnExecutionRequest {
+            session_id: SessionId::new("session-forced-tool-recovery"),
+            turn_id: "turn-forced-tool-recovery".to_string(),
+            workspace_id: None,
+            prompt: "生成一张图片".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: true,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: Some("image_generate".to_string()),
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
+            workspace_root_path: None,
+        };
+
+        assert_eq!(
+            session_required_tool_chain(&request),
+            vec!["image_generate".to_string()]
+        );
     }
 
     #[test]

@@ -514,7 +514,11 @@ fn decide_session_turn_with_task_planner(
         .map(|session_id| session_has_recoverable_chain(state, session_id))
         .unwrap_or(false);
     let requests_continuation = session_turn_requests_continue_existing_task(request);
-    if has_recoverable_chain && requests_continuation {
+    if has_recoverable_chain
+        && requests_continuation
+        && !session_turn_requests_image_generation_by_local_rules(request)
+        && !session_turn_requests_explicit_task_or_agent_mode(request)
+    {
         return Ok(SessionTurnIntentDecision {
             route: SessionTurnRouteDto::Continue,
             task_title: None,
@@ -684,8 +688,7 @@ fn normalize_session_turn_decision(
                 .push("显式复杂任务/代理编排请求".to_string());
         }
     }
-    if !matches!(decision.route, SessionTurnRouteDto::Continue)
-        && !session_turn_requests_explicit_task_or_agent_mode(request)
+    if !session_turn_requests_explicit_task_or_agent_mode(request)
         && session_turn_requests_image_generation_by_local_rules(request)
     {
         decision.route = SessionTurnRouteDto::Execute;
@@ -5535,6 +5538,23 @@ mod tests {
                     .contains("不要只输出文字说明")
             );
         }
+    }
+
+    #[test]
+    fn image_generation_request_overrides_continue_classification() {
+        let request = session_turn_request("继续生成一张蓝色方块图片");
+        let mut classifier_decision = classifier_chat_decision();
+        classifier_decision.route = SessionTurnRouteDto::Continue;
+        classifier_decision.reason_code = Some("continue_requested".to_string());
+
+        let decision = normalize_session_turn_decision(classifier_decision, &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert_eq!(decision.forced_tool_name.as_deref(), Some("image_generate"));
+        assert_eq!(
+            decision.reason_code.as_deref(),
+            Some("image_generation_request")
+        );
     }
 
     #[test]

@@ -227,12 +227,38 @@ impl HttpModelBridgeClient {
 
         let (status, response_body, _retry_after) = execute_streaming_http_post_with_retries(
             self.provider_request_key(),
-            http_request,
+            http_request.clone(),
             self.provider_family(),
             on_delta,
             on_retry,
             is_cancelled,
         )?;
+
+        if is_forced_tool_choice_rejection(
+            status,
+            &response_body,
+            &http_request.body,
+            self.provider_family(),
+        ) {
+            let fallback_request =
+                request_with_automatic_tool_choice(&http_request, self.provider_family());
+            let (fallback_status, fallback_body, _retry_after) =
+                execute_streaming_http_post_with_retries(
+                    self.provider_request_key(),
+                    fallback_request,
+                    self.provider_family(),
+                    on_delta,
+                    on_retry,
+                    is_cancelled,
+                )?;
+            if !(200..300).contains(&fallback_status) {
+                return Err(provider_http_status_error(fallback_status, &fallback_body));
+            }
+            return Ok(BridgeResponse {
+                ok: true,
+                payload: fallback_body,
+            });
+        }
 
         if !(200..300).contains(&status) {
             return Err(provider_http_status_error(status, &response_body));
@@ -1132,10 +1158,31 @@ impl ModelBridgeClient for HttpModelBridgeClient {
 
         let (status, response_body, _retry_after) = execute_http_post_with_retries(
             self.provider_request_key(),
-            http_request.url,
-            http_request.body,
-            http_request.headers,
+            http_request.url.clone(),
+            http_request.body.clone(),
+            http_request.headers.clone(),
         )?;
+
+        if is_forced_tool_choice_rejection(
+            status,
+            &response_body,
+            &http_request.body,
+            self.provider_family(),
+        ) {
+            let fallback_request =
+                request_with_automatic_tool_choice(&http_request, self.provider_family());
+            let (fallback_status, fallback_body, _retry_after) = execute_http_post_with_retries(
+                self.provider_request_key(),
+                fallback_request.url,
+                fallback_request.body,
+                fallback_request.headers,
+            )?;
+            if !(200..300).contains(&fallback_status) {
+                return Err(provider_http_status_error(fallback_status, &fallback_body));
+            }
+            let payload = self.parse_success_payload(&fallback_body)?;
+            return Ok(BridgeResponse { ok: true, payload });
+        }
 
         if !(200..300).contains(&status) {
             return Err(provider_http_status_error(status, &response_body));
@@ -1161,11 +1208,35 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         let http_request = self.build_http_request(&request, false)?;
         let (status, response_body, _retry_after) = execute_cancellable_http_post_with_retries(
             self.provider_request_key(),
-            http_request.url,
-            http_request.body,
-            http_request.headers,
+            http_request.url.clone(),
+            http_request.body.clone(),
+            http_request.headers.clone(),
             is_cancelled,
         )?;
+
+        if is_forced_tool_choice_rejection(
+            status,
+            &response_body,
+            &http_request.body,
+            self.provider_family(),
+        ) {
+            let fallback_request =
+                request_with_automatic_tool_choice(&http_request, self.provider_family());
+            let (fallback_status, fallback_body, _retry_after) =
+                execute_cancellable_http_post_with_retries(
+                    self.provider_request_key(),
+                    fallback_request.url,
+                    fallback_request.body,
+                    fallback_request.headers,
+                    is_cancelled,
+                )?;
+            if !(200..300).contains(&fallback_status) {
+                return Err(provider_http_status_error(fallback_status, &fallback_body));
+            }
+            let payload = self.parse_success_payload(&fallback_body)?;
+            return Ok(BridgeResponse { ok: true, payload });
+        }
+
         if !(200..300).contains(&status) {
             return Err(provider_http_status_error(status, &response_body));
         }
@@ -1754,6 +1825,48 @@ fn provider_http_status_error(status: u16, response_body: &str) -> BridgeClientE
     }
 }
 
+fn is_forced_tool_choice_rejection(
+    status: u16,
+    response_body: &str,
+    request_body: &Value,
+    provider_family: ProviderFamily,
+) -> bool {
+    if status != 400 || request_body.get("tool_choice").is_none() {
+        return false;
+    }
+    let is_forced_choice = match provider_family {
+        ProviderFamily::OpenAiChat => request_body["tool_choice"].is_object(),
+        ProviderFamily::Anthropic => request_body["tool_choice"]["type"]
+            .as_str()
+            .is_some_and(|kind| kind == "tool"),
+    };
+    if !is_forced_choice {
+        return false;
+    }
+    let normalized = response_body.to_ascii_lowercase();
+    normalized.contains("tool_choice")
+        && (normalized.contains("required")
+            || normalized.contains("object")
+            || normalized.contains("forced")
+            || normalized.contains("function"))
+        && (normalized.contains("not support")
+            || normalized.contains("unsupported")
+            || normalized.contains("does not allow")
+            || normalized.contains("invalid"))
+}
+
+fn request_with_automatic_tool_choice(
+    request: &HttpModelRequest,
+    provider_family: ProviderFamily,
+) -> HttpModelRequest {
+    let mut fallback = request.clone();
+    fallback.body["tool_choice"] = match provider_family {
+        ProviderFamily::OpenAiChat => json!("auto"),
+        ProviderFamily::Anthropic => json!({"type": "auto"}),
+    };
+    fallback
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1924,6 +2037,50 @@ mod tests {
             body["tool_choice"]["function"]["name"],
             "classify_session_turn"
         );
+    }
+
+    #[test]
+    fn forced_tool_choice_rejection_is_downgraded_to_automatic_choice() {
+        let request = HttpModelRequest {
+            url: "http://localhost/v1/chat/completions".to_string(),
+            body: json!({
+                "tools": [{"type": "function"}],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "shell_exec"}
+                }
+            }),
+            headers: Vec::new(),
+        };
+        let error_body = r#"{"error":{"message":"tool_choice does not support required or object in thinking mode"}}"#;
+
+        assert!(is_forced_tool_choice_rejection(
+            400,
+            error_body,
+            &request.body,
+            ProviderFamily::OpenAiChat
+        ));
+        let fallback = request_with_automatic_tool_choice(&request, ProviderFamily::OpenAiChat);
+        assert_eq!(fallback.body["tool_choice"], "auto");
+        assert_eq!(request.body["tool_choice"]["type"], "function");
+    }
+
+    #[test]
+    fn unrelated_bad_request_is_not_retried_with_automatic_choice() {
+        let body = json!({
+            "tools": [{"type": "function"}],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "shell_exec"}
+            }
+        });
+
+        assert!(!is_forced_tool_choice_rejection(
+            400,
+            r#"{"error":{"message":"context length exceeded"}}"#,
+            &body,
+            ProviderFamily::OpenAiChat
+        ));
     }
 
     #[test]
@@ -2738,6 +2895,65 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&recorded.body).expect("body should be json");
         assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn streaming_retries_forced_tool_choice_as_automatic_choice() {
+        let server = spawn_mock_server_sequence(vec![
+            MockHttpResponse {
+                status: 400,
+                content_type: "application/json".to_string(),
+                response_text: r#"{"error":{"message":"tool_choice parameter does not support being set to required or object in thinking mode"}}"#.to_string(),
+            },
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: "data: {\"choices\":[{\"delta\":{\"content\":\"已恢复\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string(),
+            },
+        ]);
+        let client = HttpModelBridgeClient::new(
+            server.address.clone(),
+            Some("sk-test-key".to_string()),
+            "DeepSeek-V4-Flash".to_string(),
+        );
+        let request = ModelInvocationRequest {
+            provider: "openai-compatible".to_string(),
+            prompt: "执行工具".to_string(),
+            messages: None,
+            tools: Some(vec![crate::types::ChatToolDefinition {
+                kind: "function".to_string(),
+                function: crate::types::ChatToolFunctionDefinition {
+                    name: "shell_exec".to_string(),
+                    description: "执行 shell 命令".to_string(),
+                    parameters: json!({"type": "object"}),
+                },
+            }]),
+            tool_choice: Some(crate::types::ChatToolChoice::force_function("shell_exec")),
+        };
+
+        let response = client
+            .invoke_streaming(request, &|_| {})
+            .expect("forced choice rejection should recover with automatic choice");
+        assert!(response.ok);
+
+        let first: Value = serde_json::from_str(
+            &server
+                .request_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("first request should arrive")
+                .body,
+        )
+        .expect("first request should be json");
+        let second: Value = serde_json::from_str(
+            &server
+                .request_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("fallback request should arrive")
+                .body,
+        )
+        .expect("fallback request should be json");
+        assert_eq!(first["tool_choice"]["type"], "function");
+        assert_eq!(second["tool_choice"], "auto");
     }
 
     #[test]

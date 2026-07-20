@@ -46,7 +46,8 @@ pub struct AuxiliaryModelUsageContext<'a> {
     pub event_bus: &'a InMemoryEventBus,
     pub session_store: &'a SessionStore,
     pub settings_store: Option<&'a Arc<SettingsStore>>,
-    pub session_id: &'a SessionId,
+    /// 草稿态的辅助调用还没有会话；此时调用仍需执行，但不写入会话用量账本。
+    pub session_id: Option<&'a SessionId>,
     pub workspace_id: &'a Option<WorkspaceId>,
     pub call_id: String,
     pub phase: UsagePhase,
@@ -82,43 +83,47 @@ pub fn invoke_auxiliary_model_with_usage(
     match client.invoke(request) {
         Ok(response) => {
             let payload = response.parse_chat_payload();
-            publish_model_usage_record(
-                context.event_bus,
-                context.session_store,
-                context.settings_store,
-                ModelUsageRecordInput {
-                    session_id: context.session_id,
-                    workspace_id: context.workspace_id,
-                    binding: &binding,
-                    call_id: context.call_id,
-                    usage: payload.usage.as_ref(),
-                    status: if response.ok {
-                        UsageCallStatus::Success
-                    } else {
-                        UsageCallStatus::Failed
+            if let Some(session_id) = context.session_id {
+                publish_model_usage_record(
+                    context.event_bus,
+                    context.session_store,
+                    context.settings_store,
+                    ModelUsageRecordInput {
+                        session_id,
+                        workspace_id: context.workspace_id,
+                        binding: &binding,
+                        call_id: context.call_id.clone(),
+                        usage: payload.usage.as_ref(),
+                        status: if response.ok {
+                            UsageCallStatus::Success
+                        } else {
+                            UsageCallStatus::Failed
+                        },
+                        assignment_id: None,
+                        error_code: (!response.ok).then(|| "auxiliary_model_rejected".to_string()),
                     },
-                    assignment_id: None,
-                    error_code: (!response.ok).then(|| "auxiliary_model_rejected".to_string()),
-                },
-            );
+                );
+            }
             Ok(response)
         }
         Err(error) => {
-            publish_model_usage_record(
-                context.event_bus,
-                context.session_store,
-                context.settings_store,
-                ModelUsageRecordInput {
-                    session_id: context.session_id,
-                    workspace_id: context.workspace_id,
-                    binding: &binding,
-                    call_id: context.call_id,
-                    usage: None,
-                    status: UsageCallStatus::Failed,
-                    assignment_id: None,
-                    error_code: Some("auxiliary_model_invocation_failed".to_string()),
-                },
-            );
+            if let Some(session_id) = context.session_id {
+                publish_model_usage_record(
+                    context.event_bus,
+                    context.session_store,
+                    context.settings_store,
+                    ModelUsageRecordInput {
+                        session_id,
+                        workspace_id: context.workspace_id,
+                        binding: &binding,
+                        call_id: context.call_id,
+                        usage: None,
+                        status: UsageCallStatus::Failed,
+                        assignment_id: None,
+                        error_code: Some("auxiliary_model_invocation_failed".to_string()),
+                    },
+                );
+            }
             Err(error)
         }
     }
@@ -880,7 +885,7 @@ mod tests {
                 event_bus: &event_bus,
                 session_store: &session_store,
                 settings_store: Some(&settings_store),
-                session_id: &session_id,
+                session_id: Some(&session_id),
                 workspace_id: &workspace_id,
                 call_id: "auxiliary-success-call".to_string(),
                 phase: UsagePhase::Integration,
