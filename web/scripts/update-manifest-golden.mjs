@@ -50,7 +50,7 @@ assert.doesNotMatch(
 assert.match(releaseWorkflow, /\.AppImage\.sig/, 'Linux updater validation must use the signed AppImage');
 assert.match(releaseWorkflow, /\.exe\.sig/, 'Windows updater validation must use the signed NSIS installer');
 assert.match(releaseWorkflow, /runner: macos-15/, 'release builds must pin the macOS runner image');
-assert.match(releaseWorkflow, /platform: macos-intel[\s\S]*runner: macos-13/, 'release builds must include the Intel macOS runner');
+assert.match(releaseWorkflow, /platform: macos-intel[\s\S]*runner: macos-15-intel/, 'release builds must include the Intel macOS runner');
 assert.match(releaseWorkflow, /macos_assets\[@\]\}.*-eq 2/, 'release validation must require both macOS installers');
 assert.match(releaseWorkflow, /update_assets\[@\]\}.*-eq 4/, 'release validation must require both macOS updater archives');
 assert.match(releaseWorkflow, /macOS Apple Silicon[\s\S]*macOS Intel/, 'release notes must distinguish both macOS architectures');

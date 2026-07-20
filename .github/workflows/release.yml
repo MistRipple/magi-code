@@ -86,7 +86,7 @@ jobs:
             runner: macos-15
             bundles: app,dmg
           - platform: macos-intel
-            runner: macos-13
+            runner: macos-15-intel
             bundles: app,dmg
           - platform: linux
             runner: ubuntu-22.04
