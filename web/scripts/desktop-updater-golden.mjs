@@ -63,8 +63,8 @@ assert.match(
   'automatic discovery failures must stay silent',
 );
 
-assert.match(updaterSource, /await update\.download\(/, 'update download must be a separate step');
-assert.match(updaterSource, /await update\.install\(\)/, 'restart action must install the downloaded update');
+assert.match(updaterSource, /stage_desktop_update/, 'update download must be a separate step');
+assert.match(updaterSource, /install_staged_desktop_update/, 'restart action must install the persisted update');
 assert.doesNotMatch(
   updaterSource,
   /downloadAndInstall/,
@@ -83,8 +83,23 @@ assert.match(
 );
 assert.match(
   desktopMainSource,
-  /invoke_handler\(tauri::generate_handler!\[prepare_update_restart\]\)/,
-  'desktop host must register the update restart command',
+  /fn get_staged_desktop_update[\s\S]*read_staged_update/,
+  'desktop host must restore a staged update after an application restart',
+);
+assert.match(
+  desktopMainSource,
+  /fn stage_desktop_update[\s\S]*write_staged_update/,
+  'desktop host must persist the verified update package',
+);
+assert.match(
+  desktopMainSource,
+  /fn install_staged_desktop_update[\s\S]*update[\s\S]*\.install\(bytes\)/,
+  'desktop host must install the persisted update package',
+);
+assert.match(
+  desktopMainSource,
+  /invoke_handler\(tauri::generate_handler!\[[\s\S]*get_staged_desktop_update[\s\S]*stage_desktop_update[\s\S]*install_staged_desktop_update/,
+  'desktop host must register the complete staged update command set',
 );
 
 assert.match(promptSource, /phase === 'ready'/, 'download completion must enter a visible ready state');
@@ -94,6 +109,11 @@ assert.match(
   promptSource,
   /function requestRestart\(\): void \{[\s\S]*restartWithDesktopUpdate\(\)/,
   'immediate restart must directly invoke the installed update',
+);
+assert.match(
+  settingsSource,
+  /desktopUpdaterState\.phase === 'ready'[\s\S]*restartWithDesktopUpdate\(\)/,
+  'clicking the ready update action in settings must install and restart immediately',
 );
 assert.match(
   promptSource,

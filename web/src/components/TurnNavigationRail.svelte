@@ -311,7 +311,14 @@
               <span class="turn-navigation-menu-index">{String(item.index).padStart(2, '0')}</span>
               <span class="turn-navigation-menu-copy">
                 <strong>{item.summary}</strong>
-                <span>{statusLabel(item.status)}</span>
+                <span class="turn-navigation-menu-meta">
+                  <span>{statusLabel(item.status)}</span>
+                  {#if item.sentAt !== undefined}
+                    <span class="turn-navigation-menu-time">
+                      {formatTraceableTime(item.sentAt)}
+                    </span>
+                  {/if}
+                </span>
               </span>
             </button>
           {/each}
@@ -568,8 +575,7 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .turn-navigation-menu-copy strong,
-  .turn-navigation-menu-copy span {
+  .turn-navigation-menu-copy > strong {
     display: block;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -580,10 +586,26 @@
     font-size: var(--text-sm);
   }
 
-  .turn-navigation-menu-copy span {
+  .turn-navigation-menu-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     margin-top: 2px;
+    overflow: hidden;
     color: var(--foreground-muted);
     font-size: var(--text-xs);
+  }
+
+  .turn-navigation-menu-meta > span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .turn-navigation-menu-time {
+    flex: 0 0 auto;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   @container message-list (min-width: 640px) {

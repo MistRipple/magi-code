@@ -19,6 +19,7 @@ import {
   desktopUpdaterState,
   checkForDesktopUpdate,
   downloadDesktopUpdate,
+  restartWithDesktopUpdate,
   showDesktopUpdatePrompt,
 } from '../stores/desktop-updater.svelte';
 
@@ -40,7 +41,7 @@ import {
     if (desktopUpdaterState.phase === 'available') {
       void downloadDesktopUpdate();
     } else if (desktopUpdaterState.phase === 'ready') {
-      showDesktopUpdatePrompt();
+      void restartWithDesktopUpdate();
       onClose?.();
     } else if (
       desktopUpdaterState.phase === 'error'

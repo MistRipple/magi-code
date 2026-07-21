@@ -20,6 +20,7 @@ tauri = { version = "2.11.5", features = ["tray-icon"] }
 tauri-plugin-process = "2.3.1"
 tauri-plugin-single-instance = "2.4.2"
 tauri-plugin-updater = "2.10.1"
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 

@@ -14,6 +14,13 @@ export type DesktopUpdateInfo = {
   close: () => Promise<void>;
 };
 
+type StagedDesktopUpdate = Pick<DesktopUpdateInfo, 'currentVersion' | 'version' | 'date' | 'body'>;
+
+type DesktopUpdateDownloadEvent =
+  | { event: 'Started'; data: { contentLength?: number } }
+  | { event: 'Progress'; data: { chunkLength: number } }
+  | { event: 'Finished' };
+
 export const DESKTOP_UPDATE_INITIAL_CHECK_DELAY_MS = 1_200;
 export const DESKTOP_UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1_000;
 export const DESKTOP_UPDATE_RETRY_INTERVAL_MS = 15 * 60 * 1_000;
@@ -54,9 +61,42 @@ export function formatUpdateProgress(downloadedBytes: number, contentLength?: nu
   };
 }
 
+async function installStagedUpdateAndRestart(): Promise<void> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  const { relaunch } = await import('@tauri-apps/plugin-process');
+  let runtimePrepared = false;
+  try {
+    await invoke('prepare_update_restart');
+    runtimePrepared = true;
+    await invoke('install_staged_desktop_update');
+    await relaunch();
+  } catch (error) {
+    // daemon 已经停止后若安装失败，保留已下载包并重启当前版本恢复可用状态。
+    if (runtimePrepared) {
+      await relaunch().catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+function createStagedDesktopUpdate(update: StagedDesktopUpdate): DesktopUpdateInfo {
+  return {
+    ...update,
+    download: async () => undefined,
+    installAndRestart: installStagedUpdateAndRestart,
+    close: async () => undefined,
+  };
+}
+
 export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
   if (!isDesktopRuntime()) {
     return null;
+  }
+
+  const { invoke } = await import('@tauri-apps/api/core');
+  const stagedUpdate = await invoke<StagedDesktopUpdate | null>('get_staged_desktop_update');
+  if (stagedUpdate) {
+    return createStagedDesktopUpdate(stagedUpdate);
   }
 
   const { check } = await import('@tauri-apps/plugin-updater');
@@ -71,9 +111,11 @@ export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
     date: update.date,
     body: update.body,
     download: async (onProgress) => {
+      const { Channel } = await import('@tauri-apps/api/core');
       let downloadedBytes = 0;
       let contentLength: number | undefined;
-      await update.download((event) => {
+      const channel = new Channel<DesktopUpdateDownloadEvent>();
+      channel.onmessage = (event) => {
         if (event.event === 'Started') {
           downloadedBytes = 0;
           contentLength = event.data.contentLength;
@@ -84,25 +126,10 @@ export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
         } else {
           onProgress?.(formatUpdateProgress(downloadedBytes, contentLength ?? downloadedBytes));
         }
-      });
+      };
+      await invoke('stage_desktop_update', { version: update.version, onEvent: channel });
     },
-    installAndRestart: async () => {
-      const { invoke } = await import('@tauri-apps/api/core');
-      const { relaunch } = await import('@tauri-apps/plugin-process');
-      let runtimePrepared = false;
-      try {
-        await invoke('prepare_update_restart');
-        runtimePrepared = true;
-        await update.install();
-        await relaunch();
-      } catch (error) {
-        // daemon 已经优雅停止后若安装失败，必须重启当前版本恢复可用状态。
-        if (runtimePrepared) {
-          await relaunch().catch(() => undefined);
-        }
-        throw error;
-      }
-    },
+    installAndRestart: installStagedUpdateAndRestart,
     close: () => update.close(),
   };
 }

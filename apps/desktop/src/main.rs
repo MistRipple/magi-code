@@ -4,7 +4,7 @@
 )]
 
 use std::{
-    env,
+    env, fs,
     path::PathBuf,
     process,
     sync::{Arc, Mutex},
@@ -14,11 +14,14 @@ use std::{
 use magi_daemon::{Daemon, DaemonConfig, DaemonHandle};
 use magi_desktop::lifecycle::{DesktopAction, DesktopLifecycle, DesktopState};
 use magi_runtime_state::RuntimeStateManager;
+use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    ipc::Channel,
     menu::{Menu, MenuItemBuilder, PredefinedMenuItem},
     tray::TrayIconBuilder,
 };
+use tauri_plugin_updater::UpdaterExt;
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const OPEN_MENU_ID: &str = "open-magi";
@@ -27,11 +30,40 @@ const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 38123;
 const DEFAULT_SERVICE_NAME: &str = "magi-rust-backend";
 const DESKTOP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const DESKTOP_UPDATE_DIRECTORY: &str = "updates";
+const STAGED_UPDATE_BYTES_FILE: &str = "pending-update.bin";
+const STAGED_UPDATE_METADATA_FILE: &str = "pending-update.json";
 
 struct DesktopRuntime {
     lifecycle: Arc<DesktopLifecycle>,
     daemon: Arc<Mutex<Option<DaemonHandle>>>,
     state_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StagedDesktopUpdate {
+    current_version: String,
+    version: String,
+    date: Option<String>,
+    body: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "event", content = "data")]
+enum DesktopUpdateDownloadEvent {
+    #[serde(rename = "Started")]
+    Started {
+        #[serde(rename = "contentLength")]
+        content_length: Option<u64>,
+    },
+    #[serde(rename = "Progress")]
+    Progress {
+        #[serde(rename = "chunkLength")]
+        chunk_length: usize,
+    },
+    #[serde(rename = "Finished")]
+    Finished,
 }
 
 impl DesktopRuntime {
@@ -48,6 +80,93 @@ fn default_state_root() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".magi")
+}
+
+fn staged_update_paths(state_root: &PathBuf) -> (PathBuf, PathBuf) {
+    let directory = state_root.join(DESKTOP_UPDATE_DIRECTORY);
+    (
+        directory.join(STAGED_UPDATE_BYTES_FILE),
+        directory.join(STAGED_UPDATE_METADATA_FILE),
+    )
+}
+
+fn remove_staged_update(state_root: &PathBuf) {
+    let (bytes_path, metadata_path) = staged_update_paths(state_root);
+    let _ = fs::remove_file(bytes_path);
+    let _ = fs::remove_file(metadata_path);
+}
+
+fn read_staged_update(state_root: &PathBuf) -> Result<Option<StagedDesktopUpdate>, String> {
+    let (bytes_path, metadata_path) = staged_update_paths(state_root);
+    let metadata = match fs::read(&metadata_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            remove_staged_update(state_root);
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("读取更新元数据失败: {error}")),
+    };
+
+    if !bytes_path.is_file() {
+        remove_staged_update(state_root);
+        return Ok(None);
+    }
+
+    let update = match serde_json::from_slice::<StagedDesktopUpdate>(&metadata) {
+        Ok(update) => update,
+        Err(_) => {
+            remove_staged_update(state_root);
+            return Ok(None);
+        }
+    };
+    if update.current_version != env!("CARGO_PKG_VERSION")
+        || update.version == update.current_version
+    {
+        remove_staged_update(state_root);
+        return Ok(None);
+    }
+    if fs::metadata(&bytes_path)
+        .map(|metadata| metadata.len() == 0)
+        .unwrap_or(true)
+    {
+        remove_staged_update(state_root);
+        return Ok(None);
+    }
+    Ok(Some(update))
+}
+
+fn write_staged_update(
+    state_root: &PathBuf,
+    update: &StagedDesktopUpdate,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let directory = state_root.join(DESKTOP_UPDATE_DIRECTORY);
+    fs::create_dir_all(&directory).map_err(|error| format!("创建更新目录失败: {error}"))?;
+    let (bytes_path, metadata_path) = staged_update_paths(state_root);
+    let bytes_temp_path = bytes_path.with_extension("bin.tmp");
+    let metadata_temp_path = metadata_path.with_extension("json.tmp");
+    remove_staged_update(state_root);
+    let _ = fs::remove_file(&bytes_temp_path);
+    let _ = fs::remove_file(&metadata_temp_path);
+
+    fs::write(&bytes_temp_path, bytes).map_err(|error| format!("保存更新包失败: {error}"))?;
+    let metadata_bytes =
+        serde_json::to_vec(update).map_err(|error| format!("序列化更新元数据失败: {error}"))?;
+    if let Err(error) = fs::write(&metadata_temp_path, metadata_bytes) {
+        let _ = fs::remove_file(&bytes_temp_path);
+        return Err(format!("保存更新元数据失败: {error}"));
+    }
+    if let Err(error) = fs::rename(&bytes_temp_path, &bytes_path) {
+        let _ = fs::remove_file(&bytes_temp_path);
+        let _ = fs::remove_file(&metadata_temp_path);
+        return Err(format!("提交更新包失败: {error}"));
+    }
+    if let Err(error) = fs::rename(&metadata_temp_path, &metadata_path) {
+        let _ = fs::remove_file(&metadata_temp_path);
+        remove_staged_update(state_root);
+        return Err(format!("提交更新元数据失败: {error}"));
+    }
+    Ok(())
 }
 
 fn resolve_web_dist_root(app: &tauri::App) -> tauri::Result<PathBuf> {
@@ -190,6 +309,91 @@ fn prepare_update_restart(app: AppHandle) -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+async fn get_staged_desktop_update(app: AppHandle) -> Result<Option<StagedDesktopUpdate>, String> {
+    let state_root = app.state::<DesktopRuntime>().state_root.clone();
+    read_staged_update(&state_root)
+}
+
+#[tauri::command]
+async fn stage_desktop_update(
+    app: AppHandle,
+    version: String,
+    on_event: Channel<DesktopUpdateDownloadEvent>,
+) -> Result<StagedDesktopUpdate, String> {
+    let state_root = app.state::<DesktopRuntime>().state_root.clone();
+    let updater = app
+        .updater()
+        .map_err(|error| format!("创建更新器失败: {error}"))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|error| format!("检查更新失败: {error}"))?
+        .ok_or_else(|| "远端更新已不可用，请重新检查更新".to_string())?;
+
+    if update.version != version {
+        return Err(format!(
+            "更新版本已变化：请求 v{version}，当前可用版本为 v{}",
+            update.version
+        ));
+    }
+
+    let staged = StagedDesktopUpdate {
+        current_version: update.current_version.clone(),
+        version: update.version.clone(),
+        date: update.date.map(|date| date.to_string()),
+        body: update.body.clone(),
+    };
+    let mut first_chunk = true;
+    let bytes = update
+        .download(
+            |chunk_length, content_length| {
+                if first_chunk {
+                    first_chunk = false;
+                    let _ = on_event.send(DesktopUpdateDownloadEvent::Started { content_length });
+                }
+                let _ = on_event.send(DesktopUpdateDownloadEvent::Progress { chunk_length });
+            },
+            || {
+                let _ = on_event.send(DesktopUpdateDownloadEvent::Finished);
+            },
+        )
+        .await
+        .map_err(|error| format!("下载更新失败: {error}"))?;
+
+    write_staged_update(&state_root, &staged, &bytes)?;
+    Ok(staged)
+}
+
+#[tauri::command]
+async fn install_staged_desktop_update(app: AppHandle) -> Result<(), String> {
+    let state_root = app.state::<DesktopRuntime>().state_root.clone();
+    let staged = read_staged_update(&state_root)?
+        .ok_or_else(|| "没有找到已下载的更新包，请重新下载".to_string())?;
+    let (bytes_path, _) = staged_update_paths(&state_root);
+    let bytes = fs::read(&bytes_path).map_err(|error| format!("读取已下载更新包失败: {error}"))?;
+
+    let update = app
+        .updater()
+        .map_err(|error| format!("创建更新器失败: {error}"))?
+        .check()
+        .await
+        .map_err(|error| format!("校验更新状态失败: {error}"))?
+        .ok_or_else(|| "远端更新已不可用，无法安装已下载的更新".to_string())?;
+    if update.version != staged.version {
+        return Err(format!(
+            "已下载版本 v{} 与当前可用版本 v{} 不一致，请重新下载",
+            staged.version, update.version
+        ));
+    }
+
+    update
+        .install(bytes)
+        .map_err(|error| format!("安装更新失败: {error}"))?;
+    remove_staged_update(&state_root);
+    Ok(())
+}
+
 fn install_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let open_item = MenuItemBuilder::with_id(OPEN_MENU_ID, "打开 Magi").build(app)?;
     let separator = PredefinedMenuItem::separator(app)?;
@@ -295,7 +499,12 @@ fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![prepare_update_restart])
+        .invoke_handler(tauri::generate_handler![
+            prepare_update_restart,
+            get_staged_desktop_update,
+            stage_desktop_update,
+            install_staged_desktop_update,
+        ])
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let runtime = app.state::<DesktopRuntime>();
             if runtime.lifecycle.request_show() == DesktopAction::ShowWindow {

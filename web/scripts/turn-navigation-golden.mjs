@@ -67,6 +67,16 @@ assert.match(
 );
 assert.match(
   railSource,
+  /turn-navigation-menu-time[\s\S]*formatTraceableTime\(item\.sentAt\)/,
+  '窄屏右下角轮次卡片必须展示每一轮的发送时间',
+);
+assert.match(
+  railSource,
+  /\.turn-navigation-menu-meta\s*\{[\s\S]*?gap:\s*8px;[\s\S]*?font-variant-numeric:\s*tabular-nums;/,
+  '窄屏轮次卡片的状态和发送时间必须保持紧凑且可读的布局',
+);
+assert.match(
+  railSource,
   /selectedTurnId\s*=\s*item\.turnId/,
   '点击轮次后必须保留独立选中状态，不能被滚动定位覆盖',
 );
