@@ -227,29 +227,86 @@ impl HttpModelBridgeClient {
         }
 
         let http_request = self.build_http_request(&request, true)?;
+        let provider_family = self.provider_family();
+        let forced_tool_choice_request =
+            is_forced_tool_choice_request(&http_request.body, provider_family);
+        let first_attempt_deltas = std::cell::RefCell::new(Vec::new());
 
-        let (status, response_body, _retry_after) = execute_streaming_http_post_with_retries(
+        let first_result = execute_streaming_http_post_with_retries(
             self.provider_request_key(),
             http_request.clone(),
-            self.provider_family(),
-            on_delta,
+            provider_family,
+            &|delta| {
+                if forced_tool_choice_request {
+                    first_attempt_deltas.borrow_mut().push(delta.clone());
+                } else {
+                    on_delta(delta);
+                }
+            },
             on_retry,
             is_cancelled,
-        )?;
+        );
+
+        let (status, response_body, _retry_after) = match first_result {
+            Ok(result) => {
+                for delta in first_attempt_deltas.borrow_mut().drain(..) {
+                    on_delta(&delta);
+                }
+                result
+            }
+            Err(error)
+                if is_forced_tool_choice_rejection_error(
+                    &error,
+                    &http_request.body,
+                    provider_family,
+                ) =>
+            {
+                // 某些兼容端点会先输出少量 thinking / 正文，随后才通过 SSE error
+                // 事件拒绝强制工具选择。首轮增量必须暂存，避免自动选择重试后把
+                // 两次模型输出拼接到同一条消息里。
+                first_attempt_deltas.borrow_mut().clear();
+                let fallback_request =
+                    request_with_automatic_tool_choice(&http_request, provider_family);
+                let fallback_result = execute_streaming_http_post_with_retries(
+                    self.provider_request_key(),
+                    fallback_request,
+                    provider_family,
+                    on_delta,
+                    on_retry,
+                    is_cancelled,
+                )?;
+                let (fallback_status, fallback_body, _retry_after) = fallback_result;
+                if !(200..300).contains(&fallback_status) {
+                    return Err(provider_http_status_error(fallback_status, &fallback_body));
+                }
+                return Ok(BridgeResponse {
+                    ok: true,
+                    payload: fallback_body,
+                });
+            }
+            Err(error) => {
+                // 非工具选择类失败仍保留已经收到的部分输出，维持现有的流式体验，
+                // 再把原始错误交给上层做统一分类。
+                for delta in first_attempt_deltas.borrow_mut().drain(..) {
+                    on_delta(&delta);
+                }
+                return Err(error);
+            }
+        };
 
         if is_forced_tool_choice_rejection(
             status,
             &response_body,
             &http_request.body,
-            self.provider_family(),
+            provider_family,
         ) {
             let fallback_request =
-                request_with_automatic_tool_choice(&http_request, self.provider_family());
+                request_with_automatic_tool_choice(&http_request, provider_family);
             let (fallback_status, fallback_body, _retry_after) =
                 execute_streaming_http_post_with_retries(
                     self.provider_request_key(),
                     fallback_request,
-                    self.provider_family(),
+                    provider_family,
                     on_delta,
                     on_retry,
                     is_cancelled,
@@ -1874,28 +1931,47 @@ fn is_forced_tool_choice_rejection(
     request_body: &Value,
     provider_family: ProviderFamily,
 ) -> bool {
-    if status != 400 || request_body.get("tool_choice").is_none() {
-        return false;
-    }
-    let is_forced_choice = match provider_family {
+    status == 400
+        && is_forced_tool_choice_request(request_body, provider_family)
+        && is_forced_tool_choice_rejection_message(response_body)
+}
+
+fn is_forced_tool_choice_rejection_error(
+    error: &BridgeClientError,
+    request_body: &Value,
+    provider_family: ProviderFamily,
+) -> bool {
+    is_forced_tool_choice_request(request_body, provider_family)
+        && is_forced_tool_choice_rejection_message(&error.to_string())
+}
+
+fn is_forced_tool_choice_request(request_body: &Value, provider_family: ProviderFamily) -> bool {
+    match provider_family {
         ProviderFamily::OpenAiChat => request_body["tool_choice"].is_object(),
         ProviderFamily::Anthropic => request_body["tool_choice"]["type"]
             .as_str()
             .is_some_and(|kind| kind == "tool"),
-    };
-    if !is_forced_choice {
-        return false;
     }
-    let normalized = response_body.to_ascii_lowercase();
-    normalized.contains("tool_choice")
-        && (normalized.contains("required")
-            || normalized.contains("object")
-            || normalized.contains("forced")
-            || normalized.contains("function"))
-        && (normalized.contains("not support")
-            || normalized.contains("unsupported")
-            || normalized.contains("does not allow")
-            || normalized.contains("invalid"))
+}
+
+fn is_forced_tool_choice_rejection_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase().replace('_', " ");
+    let mentions_forced_choice = normalized.contains("tool choice")
+        || normalized.contains("tool selection")
+        || normalized.contains("function calling");
+    let rejection = normalized.contains("not support")
+        || normalized.contains("unsupported")
+        || normalized.contains("does not allow")
+        || normalized.contains("not available")
+        || normalized.contains("invalid")
+        || normalized.contains("rejected")
+        || normalized.contains("only supports")
+        || normalized.contains("supports only")
+        || normalized.contains("cannot")
+        || normalized.contains("can't")
+        || normalized.contains("must be")
+        || normalized.contains("must use");
+    mentions_forced_choice && rejection
 }
 
 fn request_with_automatic_tool_choice(
@@ -2957,7 +3033,7 @@ mod tests {
         let client = HttpModelBridgeClient::new(
             server.address.clone(),
             Some("sk-test-key".to_string()),
-            "DeepSeek-V4-Flash".to_string(),
+            "gpt-5-turbo".to_string(),
         );
         let request = ModelInvocationRequest {
             provider: "openai-compatible".to_string(),
@@ -2997,6 +3073,152 @@ mod tests {
         .expect("fallback request should be json");
         assert_eq!(first["tool_choice"]["type"], "function");
         assert_eq!(second["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn streaming_retries_forced_tool_choice_when_provider_rejects_after_delta() {
+        let server = spawn_mock_server_sequence(vec![
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"首轮半截\"}}]}\n\n",
+                    "data: {\"error\":{\"message\":\"tool_choice is not supported in thinking mode\"}}\n\n",
+                )
+                .to_string(),
+            },
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: "data: {\"choices\":[{\"delta\":{\"content\":\"自动恢复\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string(),
+            },
+        ]);
+        let client = HttpModelBridgeClient::new(
+            server.address.clone(),
+            Some("sk-test-key".to_string()),
+            "gpt-5-turbo".to_string(),
+        );
+        let deltas = std::cell::RefCell::new(Vec::new());
+        let request = ModelInvocationRequest {
+            provider: "openai-compatible".to_string(),
+            prompt: "执行工具".to_string(),
+            messages: None,
+            tools: Some(vec![crate::types::ChatToolDefinition {
+                kind: "function".to_string(),
+                function: crate::types::ChatToolFunctionDefinition {
+                    name: "shell_exec".to_string(),
+                    description: "执行 shell 命令".to_string(),
+                    parameters: json!({"type": "object"}),
+                },
+            }]),
+            tool_choice: Some(crate::types::ChatToolChoice::force_function("shell_exec")),
+        };
+
+        let response = client
+            .invoke_streaming(request, &|delta| {
+                deltas.borrow_mut().push(delta.content.clone())
+            })
+            .expect("stream rejection after a partial delta should recover");
+        assert!(response.ok);
+        assert_eq!(deltas.into_inner(), vec!["自动恢复".to_string()]);
+
+        let first: Value = serde_json::from_str(
+            &server
+                .request_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("first request should arrive")
+                .body,
+        )
+        .expect("first request should be json");
+        let second: Value = serde_json::from_str(
+            &server
+                .request_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("fallback request should arrive")
+                .body,
+        )
+        .expect("fallback request should be json");
+        assert_eq!(first["tool_choice"]["type"], "function");
+        assert_eq!(second["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn anthropic_streaming_retries_forced_tool_choice_after_error_event() {
+        let server = spawn_mock_server_sequence(vec![
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: concat!(
+                    "event: content_block_delta\n",
+                    "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"首轮半截\"}}\n\n",
+                    "event: error\n",
+                    "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"tool_choice type tool is not supported\"}}\n\n",
+                )
+                .to_string(),
+            },
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: concat!(
+                    "event: content_block_delta\n",
+                    "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"自动恢复\"}}\n\n",
+                    "event: message_delta\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                )
+                .to_string(),
+            },
+        ]);
+        let client = HttpModelBridgeClient::new_with_protocol(
+            server.address.clone(),
+            Some("sk-ant-test".to_string()),
+            "claude-sonnet-test".to_string(),
+            HttpModelBridgeProtocol::AnthropicMessages,
+            None,
+        );
+        let deltas = std::cell::RefCell::new(Vec::new());
+        let request = ModelInvocationRequest {
+            provider: "anthropic".to_string(),
+            prompt: "执行工具".to_string(),
+            messages: None,
+            tools: Some(vec![crate::types::ChatToolDefinition {
+                kind: "function".to_string(),
+                function: crate::types::ChatToolFunctionDefinition {
+                    name: "shell_exec".to_string(),
+                    description: "执行 shell 命令".to_string(),
+                    parameters: json!({"type": "object"}),
+                },
+            }]),
+            tool_choice: Some(crate::types::ChatToolChoice::force_function("shell_exec")),
+        };
+
+        let response = client
+            .invoke_streaming(request, &|delta| {
+                deltas.borrow_mut().push(delta.content.clone())
+            })
+            .expect("Anthropic stream rejection should recover");
+        assert!(response.ok);
+        assert_eq!(deltas.into_inner(), vec!["自动恢复".to_string()]);
+
+        let first: Value = serde_json::from_str(
+            &server
+                .request_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("first request should arrive")
+                .body,
+        )
+        .expect("first request should be json");
+        let second: Value = serde_json::from_str(
+            &server
+                .request_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("fallback request should arrive")
+                .body,
+        )
+        .expect("fallback request should be json");
+        assert_eq!(first["tool_choice"]["type"], "tool");
+        assert_eq!(second["tool_choice"]["type"], "auto");
     }
 
     #[test]
