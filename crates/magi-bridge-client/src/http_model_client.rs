@@ -32,6 +32,7 @@ const MODEL_PROVIDER_EMPTY_STREAM_RETRY_DELAYS_MILLIS: [u64; MODEL_PROVIDER_EMPT
     [1_000, 3_000];
 const MODEL_PROVIDER_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MODEL_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MODEL_PROVIDER_TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpModelBridgeProtocol {
@@ -949,11 +950,29 @@ fn execute_streaming_http_post(
             cancellation_requested = true;
         }
         match rx.recv_timeout(MODEL_CANCELLATION_POLL_INTERVAL) {
-            Ok(StreamMessage::Chunk(delta)) if !cancellation_requested => {
-                emitted_delta = true;
-                on_chunk(&delta);
+            Ok(StreamMessage::Chunk(mut delta)) => {
+                let mut completed_result = None;
+                while let Ok(message) = rx.try_recv() {
+                    match message {
+                        StreamMessage::Chunk(next_delta) => delta = next_delta,
+                        StreamMessage::Done(result) => {
+                            completed_result = Some(result);
+                            break;
+                        }
+                    }
+                }
+                if !cancellation_requested {
+                    emitted_delta = true;
+                    on_chunk(&delta);
+                }
+                if let Some(result) = completed_result {
+                    return if cancellation_requested {
+                        Err(model_invocation_cancelled_error())
+                    } else {
+                        result
+                    };
+                }
             }
-            Ok(StreamMessage::Chunk(_)) => {}
             Ok(StreamMessage::Done(result)) => {
                 return if cancellation_requested {
                     Err(model_invocation_cancelled_error())
@@ -1154,12 +1173,21 @@ async fn streaming_http_io(
     let mut last_thinking_delta_len = 0usize;
     let mut saw_sse_event = false;
     let mut saw_protocol_terminal = false;
+    let mut terminal_drain_deadline = None;
     let mut raw_response = String::new();
 
     'stream_read: loop {
-        let chunk_result = tokio::select! {
-            _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
-            result = response.chunk() => result,
+        let chunk_result = if let Some(deadline) = terminal_drain_deadline {
+            tokio::select! {
+                _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
+                _ = tokio::time::sleep_until(deadline) => break,
+                result = response.chunk() => result,
+            }
+        } else {
+            tokio::select! {
+                _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
+                result = response.chunk() => result,
+            }
         };
         let chunk = match chunk_result {
             Ok(chunk) => chunk,
@@ -1206,6 +1234,10 @@ async fn streaming_http_io(
                 saw_protocol_terminal = true;
                 break 'stream_read;
             }
+        }
+        if accumulator.saw_terminal() && terminal_drain_deadline.is_none() {
+            terminal_drain_deadline =
+                Some(tokio::time::Instant::now() + MODEL_PROVIDER_TERMINAL_DRAIN_TIMEOUT);
         }
     }
 
@@ -2011,7 +2043,7 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn from_env_returns_none_when_base_url_not_set() {
@@ -2987,7 +3019,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_emits_delta_for_each_sse_event_in_one_http_read() {
+    fn streaming_preserves_latest_delta_when_one_http_read_contains_multiple_events() {
         let server = spawn_mock_server_with_response_text(
             200,
             "text/event-stream",
@@ -3020,10 +3052,11 @@ mod tests {
             .expect("streaming invoke should succeed against mock server");
 
         assert!(response.ok);
-        assert_eq!(
-            deltas.into_inner(),
-            vec!["Hel".to_string(), "Hello".to_string()],
-            "同一次 HTTP read 中的多个 SSE event 必须逐事件发布，不能被 4096 字节 buffer 合批"
+        let deltas = deltas.into_inner();
+        assert_eq!(deltas.last().map(String::as_str), Some("Hello"));
+        assert!(
+            (1..=2).contains(&deltas.len()),
+            "累计快照允许合并中间态，但必须保留最终完整内容"
         );
 
         let recorded = server
@@ -3033,6 +3066,54 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&recorded.body).expect("body should be json");
         assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn streaming_coalesces_backlogged_cumulative_snapshots_before_completion() {
+        let mut response_text = String::new();
+        for _ in 0..200 {
+            response_text.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"字\"}}]}\n\n");
+        }
+        response_text.push_str(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let server = spawn_mock_server_with_response_text(200, "text/event-stream", response_text);
+        let client = HttpModelBridgeClient::new(
+            server.address.clone(),
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+        let callback_count = std::cell::Cell::new(0usize);
+        let latest_content = std::cell::RefCell::new(String::new());
+        let started_at = Instant::now();
+
+        let response = client
+            .invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|delta| {
+                    callback_count.set(callback_count.get() + 1);
+                    *latest_content.borrow_mut() = delta.content.clone();
+                    std::thread::sleep(Duration::from_millis(10));
+                },
+            )
+            .expect("backlogged stream should complete");
+
+        assert!(response.ok);
+        assert_eq!(latest_content.borrow().chars().count(), 200);
+        assert!(
+            callback_count.get() < 20,
+            "累计快照积压时不得逐条回放全部中间态"
+        );
+        assert!(
+            started_at.elapsed() < Duration::from_millis(500),
+            "业务写回速度不得把已完成的上游流拖成逐字播放"
+        );
     }
 
     #[test]
@@ -3523,6 +3604,111 @@ mod tests {
             .recv_timeout(Duration::from_millis(500))
             .expect("[DONE] 后必须立即完成，不能等 socket close");
         assert!(response.expect("streaming invoke should succeed").ok);
+
+        client_handle
+            .join()
+            .expect("client streaming thread should not panic");
+        server_handle
+            .join()
+            .expect("mock stream server should not panic");
+    }
+
+    #[test]
+    fn streaming_returns_after_finish_reason_drain_without_waiting_for_socket_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock stream server should bind");
+        let address = listener.local_addr().expect("address should exist");
+        let (request_sender, request_receiver) = mpsc::channel();
+        let server_handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("mock stream server should accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout should set");
+
+            let mut buffer = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut chunk).expect("should read request");
+                assert!(read > 0, "should receive request bytes");
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let header_text =
+                String::from_utf8(buffer[..header_end].to_vec()).expect("headers should be utf-8");
+            let content_length = header_text
+                .split("\r\n")
+                .filter_map(|line| line.split_once(':'))
+                .find_map(|(name, value)| {
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            while buffer.len() < header_end + content_length {
+                let read = stream.read(&mut chunk).expect("should read request body");
+                assert!(read > 0, "should receive request body");
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            let _ = request_sender.send(());
+
+            stream
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "content-type: text/event-stream\r\n",
+                        "connection: keep-alive\r\n",
+                        "\r\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"完整回复\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    )
+                    .as_bytes(),
+                )
+                .expect("should write terminal stream events");
+            stream.flush().expect("should flush terminal stream events");
+            std::thread::sleep(Duration::from_millis(50));
+            stream
+                .write_all(
+                    b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\n",
+                )
+                .expect("should write delayed usage event");
+            stream.flush().expect("should flush delayed usage event");
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let client = HttpModelBridgeClient::new(
+            format!("http://{address}/v1"),
+            Some("sk-test-key".to_string()),
+            "gpt-4.1-mini".to_string(),
+        );
+        let (result_sender, result_receiver) = mpsc::channel();
+        let client_handle = std::thread::spawn(move || {
+            let result = client.invoke_streaming(
+                ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "hello".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                &|_| {},
+            );
+            let _ = result_sender.send(result);
+        });
+
+        request_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("mock server should receive request");
+        let response = result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("finish_reason 后必须在排空窗口内完成，不能等待 socket close")
+            .expect("streaming invoke should succeed");
+        let payload: serde_json::Value =
+            serde_json::from_str(&response.payload).expect("payload should be json");
+        assert_eq!(payload["content"], "完整回复");
+        assert_eq!(payload["finish_reason"], "stop");
+        assert_eq!(payload["usage"]["prompt_tokens"], 5);
+        assert_eq!(payload["usage"]["completion_tokens"], 3);
 
         client_handle
             .join()

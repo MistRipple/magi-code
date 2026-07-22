@@ -2569,8 +2569,8 @@
 
   .session-running-dot {
     position: relative;
-    width: 12px;
-    height: 12px;
+    width: 14px;
+    height: 14px;
     border-radius: var(--radius-full);
     background: transparent;
     opacity: 0;
@@ -2598,13 +2598,18 @@
     height: 6px;
     background: var(--info);
     box-shadow: 0 0 8px color-mix(in srgb, var(--info) 58%, transparent);
+    z-index: 1;
+    animation: session-running-core-breath 1.8s ease-in-out infinite;
   }
 
   .session-running-dot.running::after {
     width: 6px;
     height: 6px;
-    border: 1px solid color-mix(in srgb, var(--info) 52%, transparent);
-    animation: session-running-breath 1.65s ease-out infinite;
+    background: color-mix(in srgb, var(--info) 32%, transparent);
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--info) 52%, transparent),
+      0 0 8px color-mix(in srgb, var(--info) 46%, transparent);
+    animation: session-running-breath 1.8s cubic-bezier(0.2, 0.55, 0.35, 1) infinite;
   }
 
   .session-running-dot.unread::before {
@@ -2616,24 +2621,31 @@
 
   @keyframes session-running-breath {
     0% {
-      opacity: 0.85;
-      transform: translate(-50%, -50%) scale(0.75);
+      opacity: 0.78;
+      transform: translate(-50%, -50%) scale(0.7);
     }
-    70% {
+    48% {
+      opacity: 0.34;
+      transform: translate(-50%, -50%) scale(1.8);
+    }
+    82% {
       opacity: 0;
-      transform: translate(-50%, -50%) scale(2.15);
+      transform: translate(-50%, -50%) scale(2.8);
     }
     100% {
       opacity: 0;
-      transform: translate(-50%, -50%) scale(2.15);
+      transform: translate(-50%, -50%) scale(2.8);
     }
   }
 
-  @media (prefers-reduced-motion: reduce) {
-    .session-running-dot.running::after {
-      animation: none;
-      opacity: 0.32;
-      transform: translate(-50%, -50%) scale(1.65);
+  @keyframes session-running-core-breath {
+    0%, 100% {
+      opacity: 0.72;
+      box-shadow: 0 0 4px color-mix(in srgb, var(--info) 38%, transparent);
+    }
+    50% {
+      opacity: 1;
+      box-shadow: 0 0 10px color-mix(in srgb, var(--info) 78%, transparent);
     }
   }
 

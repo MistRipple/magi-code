@@ -98,6 +98,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertSingleThinkingProjectsAsGroup(reducer, projection);
   assertAdjacentThinkingProjectsAsOneGroup(reducer, projection);
   assertThinkingGroupRespectsVisibleAndOwnerBoundaries(reducer, projection);
+  assertThinkingGroupUsesTaskLocalTimeline(reducer, projection, timelineRenderItems);
   assertThinkingGroupKeepsStableIdentityDuringIncrementalAppend(reducer, projection);
   assertThinkingGroupAggregatesFailureState(reducer, projection);
   assertFailedAssistantTextUsesPlainMessageShell(reducer, projection);
@@ -230,6 +231,37 @@ function assertThinkingGroupRespectsVisibleAndOwnerBoundaries(reducer, projectio
     thinkingArtifacts.map((artifact) => artifact.message.blocks?.[0]?.thinking?.segments.length),
     [1, 1, 1, 1],
     'boundary-separated thinking segments must remain independent groups',
+  );
+}
+
+function assertThinkingGroupUsesTaskLocalTimeline(reducer, projection, timelineRenderItems) {
+  const c = baseCase('thinking-group-task-local', 'session-golden-thinking-task-local', 'turn-golden-thinking-task-local', 11_735);
+  const taskFirst = thinking(c, 1, 'thinking-task-first', '代理先检查入口。', 'completed', {
+    sourceThreadId: 'thread-task-local',
+    worker: { taskId: 'task-local', workerId: 'worker-local', roleId: 'reviewer' },
+  });
+  const rootThinking = thinking(c, 2, 'thinking-root-between', '主线继续处理。', 'completed');
+  const taskSecond = thinking(c, 3, 'thinking-task-second', '代理再检查状态。', 'completed', {
+    sourceThreadId: 'thread-task-local',
+    worker: { taskId: 'task-local', workerId: 'worker-local', roleId: 'reviewer' },
+  });
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'completed', [taskFirst, rootThinking, taskSecond]),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  const taskItems = timelineRenderItems.buildTimelineRenderItems(projectionValue, 'task', 'task-local');
+  const taskThinking = taskItems.filter((entry) => entry.message.type === 'thinking');
+  assert.equal(taskThinking.length, 1, '代理详情应在过滤后的 task 时间线中继续聚合 thinking');
+  assert.deepEqual(
+    taskThinking[0].message.blocks?.[0]?.thinking?.segments.map((segment) => segment.segmentId),
+    [taskFirst.itemId, taskSecond.itemId],
+    'task-local ThinkingGroup must ignore interleaved mainline artifacts',
+  );
+  const threadItems = timelineRenderItems.buildTimelineRenderItems(projectionValue, 'thread');
+  assert.equal(
+    threadItems.filter((entry) => entry.message.type === 'thinking').length,
+    1,
+    'mainline must keep only its own ThinkingGroup lane',
   );
 }
 

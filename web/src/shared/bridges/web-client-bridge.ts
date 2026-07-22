@@ -87,6 +87,7 @@ import {
 import type {
   AgentKnowledgeItemPatch,
   AgentKnowledgeItemPayload,
+  AgentWorkspaceSessionsSnapshot,
 } from '../../web/agent-api';
 import type { ClientBridge, ClientBridgeMessage, SupportedLocale } from './client-bridge';
 import {
@@ -869,6 +870,7 @@ function syncTunnelRuntimeForSilentEventStream(reason: string, error: Error): vo
       forceFresh: true,
       forceEventStreamReconnect: false,
       refreshSettingsBootstrapOnBindingChange: false,
+      workspaceSessionSnapshot: snapshot,
     });
   })().catch((syncError) => {
     scheduleRecovery(reason, syncError || error, true);
@@ -1418,7 +1420,21 @@ function scheduleWorkspaceSessionSummaryRefresh(reason: string): void {
   }
   workspaceSessionSummaryRefreshTimer = setTimeout(() => {
     workspaceSessionSummaryRefreshTimer = null;
-    void fetchBootstrap({ forceFresh: true }).catch((error) => {
+    const binding = resolveWorkspaceQuery();
+    if (!binding.workspaceId) {
+      return;
+    }
+    void getWorkspaceSessions(
+      binding.workspaceId,
+      binding.sessionId,
+      binding.workspacePath,
+    ).then((snapshot) => {
+      const currentBinding = resolveWorkspaceQuery();
+      if (currentBinding.workspaceId !== binding.workspaceId) {
+        return;
+      }
+      emitDataMessage('sessionsUpdated', { sessions: snapshot.sessions });
+    }).catch((error) => {
       reportExpectedRecoveryFailure(
         i18n.t('bridge.action.syncMessages'),
         `[web-client-bridge] 外部会话事件后刷新会话列表失败(${reason}):`,
@@ -2472,6 +2488,31 @@ function normalizeBootstrapResponse(
   });
 }
 
+function applyWorkspaceSessionSnapshotToBootstrap(
+  payload: BootstrapPayload,
+  snapshot: AgentWorkspaceSessionsSnapshot,
+): BootstrapPayload {
+  if (snapshot.workspace.workspaceId !== payload.workspace.workspaceId) {
+    throw new Error('会话列表快照与 bootstrap 工作区不一致');
+  }
+  const currentSession = payload.sessionId
+    ? snapshot.sessions.find((session) => session.id === payload.sessionId)
+    : undefined;
+  if (payload.sessionId && !currentSession) {
+    throw new Error(`bootstrap 当前会话不在工作区会话列表中: ${payload.sessionId}`);
+  }
+  return {
+    ...payload,
+    sessions: snapshot.sessions,
+    state: {
+      ...payload.state,
+      sessions: snapshot.sessions,
+      currentSession,
+      currentSessionId: payload.sessionId,
+    },
+  };
+}
+
 async function restoreBridgeState(reason: string, force = false): Promise<void> {
   const recoveryBindingKey = bootstrapBindingKey(resolveWorkspaceQuery());
   if (recoveryInFlight && !force && recoveryInFlightBindingKey === recoveryBindingKey) {
@@ -2711,6 +2752,7 @@ async function fetchBootstrap(
     forceEventStreamReconnect?: boolean;
     forceFresh?: boolean;
     refreshSettingsBootstrapOnBindingChange?: boolean;
+    workspaceSessionSnapshot?: AgentWorkspaceSessionsSnapshot;
   } = {},
 ): Promise<void> {
   const requestBinding = resolveWorkspaceQuery();
@@ -2781,7 +2823,7 @@ async function fetchBootstrap(
       );
     }
     const rawPayload = await response.json();
-    const payload = normalizeBootstrapResponse(rawPayload, {
+    let payload = normalizeBootstrapResponse(rawPayload, {
       workspaceId: effectiveBinding.workspaceId,
       workspacePath: effectiveBinding.workspacePath,
       sessionId: effectiveBinding.sessionId,
@@ -2789,7 +2831,21 @@ async function fetchBootstrap(
     if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
       return;
     }
-    await dispatchBootstrap(payload, { ...options, rawPayload });
+    const workspaceSessionSnapshot = options.workspaceSessionSnapshot
+      ?? await getWorkspaceSessions(
+        payload.workspace.workspaceId,
+        payload.sessionId,
+        payload.workspace.rootPath,
+      );
+    if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
+      return;
+    }
+    payload = applyWorkspaceSessionSnapshotToBootstrap(payload, workspaceSessionSnapshot);
+    await dispatchBootstrap(payload, {
+      forceEventStreamReconnect: options.forceEventStreamReconnect,
+      refreshSettingsBootstrapOnBindingChange: options.refreshSettingsBootstrapOnBindingChange,
+      rawPayload,
+    });
   };
   let requestPromise: Promise<void>;
   requestPromise = doFetch().finally(() => {

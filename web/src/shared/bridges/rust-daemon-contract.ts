@@ -26,6 +26,8 @@ export type BootstrapPayload = SessionBootstrapSnapshot & {
   };
   canonicalTurns?: CanonicalTurn[];
   eventStreamNextSequence?: number;
+  sessions: Session[];
+  state: AppState;
   workspace: {
     workspaceId: string;
     name: string;

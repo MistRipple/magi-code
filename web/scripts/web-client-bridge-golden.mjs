@@ -26,6 +26,7 @@ let switchSessionRequestCount = 0;
 let bootstrapRequestCount = 0;
 let workspaceSessionsRequestCount = 0;
 let workspaceSessionIsRunning = false;
+let workspaceSessionsPayloadOverride = null;
 
 class MemoryStorage {
   constructor() {
@@ -380,6 +381,34 @@ function installFetchStub() {
     }
     if (parsed.pathname === '/api/workspaces/sessions') {
       workspaceSessionsRequestCount += 1;
+      if (workspaceSessionsPayloadOverride) {
+        return jsonResponse(workspaceSessionsPayloadOverride);
+      }
+      const requestedWorkspaceId = parsed.searchParams.get('workspaceId') || '';
+      if (requestedWorkspaceId && requestedWorkspaceId !== WORKSPACE_ID) {
+        const requestedSessionId = parsed.searchParams.get('sessionId') || '';
+        const requestedWorkspacePath = parsed.searchParams.get('workspacePath') || '';
+        const sessions = requestedSessionId
+          ? [{
+              sessionId: requestedSessionId,
+              title: requestedSessionId,
+              createdAt: ACCEPTED_AT,
+              updatedAt: ACCEPTED_AT,
+              messageCount: 0,
+              workspaceId: requestedWorkspaceId,
+              isRunning: false,
+              runningTaskCount: 0,
+            }]
+          : [];
+        return jsonResponse({
+          workspace: {
+            workspaceId: requestedWorkspaceId,
+            rootPath: requestedWorkspacePath,
+          },
+          sessionId: requestedSessionId,
+          sessions,
+        });
+      }
       const payload = bootstrapPayload();
       return jsonResponse({
         workspace: payload.workspace,
@@ -1363,6 +1392,48 @@ await withGoldenViteServer(async (server) => {
     undefined,
     'pendingChanges must not derive workspace path from legacy snake_case fields',
   );
+
+  const backgroundSessionId = 'session-bridge-background-running';
+  const backgroundSession = {
+    sessionId: backgroundSessionId,
+    title: '后台运行会话',
+    createdAt: ACCEPTED_AT - 1000,
+    updatedAt: ACCEPTED_AT + 4000,
+    messageCount: 2,
+    workspaceId: WORKSPACE_ID,
+  };
+  const foregroundBootstrap = scopedBootstrapPayloadWithPendingChange(
+    WORKSPACE_ID,
+    WORKSPACE_PATH,
+    SESSION_ID,
+    '前台查看会话',
+  );
+  foregroundBootstrap.sessions = [backgroundSession, ...foregroundBootstrap.sessions];
+  foregroundBootstrap.state.sessions = foregroundBootstrap.sessions;
+  workspaceSessionsPayloadOverride = {
+    workspace: foregroundBootstrap.workspace,
+    sessionId: SESSION_ID,
+    sessions: [
+      { ...backgroundSession, isRunning: true, runningTaskCount: 1 },
+      { ...foregroundBootstrap.sessions[1], isRunning: false, runningTaskCount: 0 },
+    ],
+  };
+  bootstrapInterceptors.push(() => jsonResponse(foregroundBootstrap));
+  bridge.postMessage({
+    type: 'switchSession',
+    sessionId: SESSION_ID,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+  });
+  await waitFor(
+    () => messagesStore.messagesState.sessions.some((session) => (
+      session.id === backgroundSessionId
+      && session.isRunning === true
+      && session.runningTaskCount === 1
+    )),
+    'switchSession bootstrap must preserve the authoritative running state of background sessions',
+  );
+  workspaceSessionsPayloadOverride = null;
 
   const editsBeforeLiveRefresh = structuredClone(messagesStore.messagesState.edits);
   const currentChangesVersion = messagesStore.messagesState.appState?.pendingChangesStateVersion ?? 0;

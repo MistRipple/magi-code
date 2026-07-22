@@ -775,24 +775,43 @@ function mergeThinkingArtifacts(
   };
 }
 
+function timelineLaneKey(artifact: TimelineProjectionArtifact): string {
+  const metadata = artifact.message.metadata || {};
+  return [
+    normalizeMetadataIdentity(metadata.turnId),
+    normalizeMetadataIdentity(metadata.sourceThreadId),
+    normalizeMetadataIdentity(metadata.taskId),
+    normalizeMetadataIdentity(metadata.workerId),
+    normalizeMetadataIdentity(metadata.roleId),
+    normalizeMetadataIdentity(artifact.message.source),
+  ].join('\u0000');
+}
+
 function groupAdjacentThinkingArtifacts(
   artifacts: TimelineProjectionArtifact[],
 ): TimelineProjectionArtifact[] {
   const grouped: TimelineProjectionArtifact[] = [];
+  const latestThinkingByLane = new Map<string, TimelineProjectionArtifact>();
   for (const artifact of artifacts) {
-    const previous = grouped[grouped.length - 1];
-    if (
-      previous
-      && thinkingBlock(previous)
-      && thinkingBlock(artifact)
-      && hasSameThinkingOwner(previous, artifact)
-    ) {
-      grouped[grouped.length - 1] = mergeThinkingArtifacts(previous, artifact);
+    const laneKey = timelineLaneKey(artifact);
+    const previous = latestThinkingByLane.get(laneKey);
+    if (thinkingBlock(artifact) && previous && hasSameThinkingOwner(previous, artifact)) {
+      const merged = mergeThinkingArtifacts(previous, artifact);
+      const previousIndex = grouped.indexOf(previous);
+      if (previousIndex < 0) {
+        throw new Error('turn-projection: ThinkingGroup lane state lost its visible artifact');
+      }
+      grouped[previousIndex] = merged;
+      latestThinkingByLane.set(laneKey, merged);
+    } else if (thinkingBlock(artifact)) {
+      grouped.push(artifact);
+      latestThinkingByLane.set(laneKey, artifact);
     } else {
       grouped.push(artifact);
+      latestThinkingByLane.delete(laneKey);
     }
   }
-  return grouped;
+  return grouped.sort(compareArtifacts);
 }
 
 function projectStableArtifacts(

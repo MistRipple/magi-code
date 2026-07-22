@@ -181,6 +181,26 @@ assert.match(
   '未读完成状态必须使用绿色常亮灯',
 );
 assert.match(
+  shellSource,
+  /\.session-running-dot\.running::before[\s\S]*?animation: session-running-core-breath/,
+  '运行状态必须让蓝色核心灯持续执行呼吸动画',
+);
+assert.match(
+  shellSource,
+  /\.session-running-dot\.running::after[\s\S]*?background: color-mix\(in srgb, var\(--info\) 32%, transparent\)[\s\S]*?animation: session-running-breath/,
+  '运行状态必须使用可见的蓝色扩散光晕',
+);
+assert.match(
+  shellSource,
+  /@keyframes session-running-breath[\s\S]*?scale\(2\.8\)/,
+  '运行状态的扩散光晕必须具有足够的扩散范围',
+);
+assert.doesNotMatch(
+  shellSource,
+  /prefers-reduced-motion[\s\S]*?session-running-dot\.running/,
+  '运行状态指示灯不能因系统动画偏好而失去状态动画',
+);
+assert.match(
   bridgeSource,
   /EXTERNAL_SESSION_SUMMARY_EVENTS = new Set\(\[[\s\S]*?'session\.viewed'/,
   '其他会话的已查看事件必须触发会话列表同步',
@@ -189,6 +209,16 @@ assert.match(
   bridgeSource,
   /shouldRefreshCurrentWorkspaceSessionSummary[\s\S]*?eventType === 'session\.viewed'/,
   '当前会话的已查看事件也必须触发跨客户端状态同步',
+);
+assert.match(
+  bridgeSource,
+  /function scheduleWorkspaceSessionSummaryRefresh[\s\S]*?getWorkspaceSessions\([\s\S]*?emitDataMessage\('sessionsUpdated'/,
+  '会话状态事件必须通过专用会话列表接口同步运行态和未读完成态',
+);
+assert.match(
+  bridgeSource,
+  /function applyWorkspaceSessionSnapshotToBootstrap[\s\S]*?sessions: snapshot\.sessions[\s\S]*?currentSessionId: payload\.sessionId/,
+  'bootstrap 必须在提交 UI 前合并权威会话运行态，避免切换时清空后台呼吸灯',
 );
 
 console.log('workspace onboarding golden passed');
