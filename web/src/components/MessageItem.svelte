@@ -121,8 +121,8 @@
       if (block.type === 'file_change') return true;
       if (block.type === 'plan') return true;
       if (block.type === 'thinking') {
-        const thinkingText = block.thinking?.content || block.content || '';
-        if (thinkingText.trim().length > 0) return true;
+        if (block.thinking?.segments.some((segment) => segment.content.trim().length > 0)) return true;
+        if (block.thinking?.isStreaming) return true;
       }
       if (block.type === 'text' && block.content && block.content.trim().length > 0) return true;
     }
@@ -196,7 +196,12 @@
     const blockText = safeBlocks
       .map((block) => {
         if (typeof block.content === 'string' && block.content.trim()) return block.content;
-        if (block.type === 'thinking' && block.thinking?.content?.trim()) return block.thinking.content;
+        if (block.type === 'thinking' && block.thinking) {
+          return block.thinking.segments
+            .map((segment) => segment.content.trim())
+            .filter(Boolean)
+            .join('\n\n');
+        }
         if (block.type === 'tool_call' && block.toolCall?.name) {
           return `${block.toolCall.name}${block.toolCall.arguments ? `\n${JSON.stringify(block.toolCall.arguments, null, 2)}` : ''}`;
         }

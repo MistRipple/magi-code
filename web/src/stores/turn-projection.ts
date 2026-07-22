@@ -4,6 +4,8 @@ import type {
   Message,
   MessageImage,
   SessionTimelineProjection,
+  ThinkingSegment,
+  ThinkingSegmentStatus,
   TimelineProjectionArtifact,
   TimelineProjectionRenderEntry,
 } from '../types/message';
@@ -132,7 +134,34 @@ function buildToolBlock(tool: CanonicalToolCall, status: CanonicalTurnItemStatus
   };
 }
 
-function buildMessageBlocks(item: CanonicalTurnItem, content: string): ContentBlock[] | undefined {
+function buildMessageBlocks(
+  item: CanonicalTurnItem,
+  content: string,
+  artifactId: string,
+): ContentBlock[] | undefined {
+  if (item.kind === 'assistant_thinking') {
+    const blockId = `thinking:${item.itemId}`;
+    return [{
+      id: blockId,
+      type: 'thinking',
+      content: '',
+      thinking: {
+        groupId: artifactId,
+        segments: [{
+          segmentId: item.itemId,
+          messageId: artifactId,
+          content,
+          status: item.status,
+          createdAt: item.createdAt,
+          updatedAt: item.updatedAt,
+        }],
+        status: item.status,
+        isStreaming: !isCanonicalTerminalStatus(item.status),
+        startedAt: item.createdAt,
+        updatedAt: item.updatedAt,
+      },
+    }];
+  }
   if (item.blocks && item.blocks.length > 0) {
     return mapStandardBlocks(item.blocks as StandardContentBlock[]);
   }
@@ -149,19 +178,6 @@ function buildMessageBlocks(item: CanonicalTurnItem, content: string): ContentBl
       return fileChangeBlocks;
     }
     return [buildToolBlock(item.tool, item.status)];
-  }
-  if (item.kind === 'assistant_thinking') {
-    const blockId = `thinking:${item.itemId}`;
-    return [{
-      id: blockId,
-      type: 'thinking',
-      content,
-      thinking: {
-        content,
-        isComplete: isCanonicalTerminalStatus(item.status),
-        blockId,
-      },
-    }];
   }
   return undefined;
 }
@@ -332,7 +348,7 @@ function buildMessage(
   const workerId = isAgentTaskSidechain ? normalizeCanonicalWorkerId(item) : undefined;
   const roleId = isAgentTaskSidechain ? normalizeCanonicalRoleId(item) : undefined;
   const taskId = normalizeCanonicalTaskId(item);
-  const blocks = buildMessageBlocks(item, content);
+  const blocks = buildMessageBlocks(item, content, artifactId);
   // 流式态对 assistant 的 text 与 thinking 都成立：
   //   - assistant_text：边推 token 边渲染正文；
   //   - assistant_thinking：边推 thinking delta 边在卡片头亮起"思考中..."。
@@ -368,7 +384,7 @@ function buildMessage(
     id: artifactId,
     role: resolveMessageRole(item),
     source: resolveMessageSource(item),
-    content,
+    content: item.kind === 'assistant_thinking' ? '' : content,
     ...(blocks ? { blocks } : {}),
     ...(images ? { images } : {}),
     ...(contextReferences ? { contextReferences } : {}),
@@ -650,6 +666,141 @@ function collapseArtifactsByStableCard(
   return Array.from(artifactByCollapseKey.values()).sort(compareArtifacts);
 }
 
+function normalizeMetadataIdentity(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function thinkingBlock(artifact: TimelineProjectionArtifact): ContentBlock | null {
+  if (artifact.message.type !== 'thinking') {
+    return null;
+  }
+  const block = artifact.message.blocks?.find((candidate) => candidate.type === 'thinking');
+  return block?.thinking ? block : null;
+}
+
+function hasSameThinkingOwner(
+  left: TimelineProjectionArtifact,
+  right: TimelineProjectionArtifact,
+): boolean {
+  const leftMetadata = left.message.metadata || {};
+  const rightMetadata = right.message.metadata || {};
+  return normalizeMetadataIdentity(leftMetadata.turnId) === normalizeMetadataIdentity(rightMetadata.turnId)
+    && normalizeMetadataIdentity(leftMetadata.sourceThreadId) === normalizeMetadataIdentity(rightMetadata.sourceThreadId)
+    && normalizeMetadataIdentity(leftMetadata.taskId) === normalizeMetadataIdentity(rightMetadata.taskId)
+    && normalizeMetadataIdentity(leftMetadata.workerId) === normalizeMetadataIdentity(rightMetadata.workerId)
+    && normalizeMetadataIdentity(leftMetadata.roleId) === normalizeMetadataIdentity(rightMetadata.roleId)
+    && normalizeMetadataIdentity(left.message.source) === normalizeMetadataIdentity(right.message.source);
+}
+
+function aggregateThinkingStatus(segments: ThinkingSegment[]): ThinkingSegmentStatus {
+  if (segments.some((segment) => segment.status === 'failed')) return 'failed';
+  if (segments.some((segment) => segment.status === 'blocked')) return 'blocked';
+  if (segments.some((segment) => segment.status === 'cancelled')) return 'cancelled';
+  if (segments.some((segment) => segment.status === 'running')) return 'running';
+  if (segments.some((segment) => segment.status === 'pending')) return 'pending';
+  return 'completed';
+}
+
+function mergeThinkingArtifacts(
+  first: TimelineProjectionArtifact,
+  latest: TimelineProjectionArtifact,
+): TimelineProjectionArtifact {
+  const firstBlock = thinkingBlock(first);
+  const latestBlock = thinkingBlock(latest);
+  if (!firstBlock?.thinking || !latestBlock?.thinking) {
+    throw new Error('turn-projection: ThinkingGroup artifact 缺少结构化 thinking block');
+  }
+  const segments = [...firstBlock.thinking.segments, ...latestBlock.thinking.segments];
+  const status = aggregateThinkingStatus(segments);
+  const isStreaming = status === 'pending' || status === 'running';
+  const firstMetadata = first.message.metadata || {};
+  const latestMetadata = latest.message.metadata || {};
+  const startedAt = segments.reduce<number | undefined>((earliest, segment) => {
+    if (typeof segment.createdAt !== 'number') return earliest;
+    return earliest === undefined ? segment.createdAt : Math.min(earliest, segment.createdAt);
+  }, undefined);
+  const updatedAt = segments.reduce<number | undefined>((latestTimestamp, segment) => {
+    if (typeof segment.updatedAt !== 'number') return latestTimestamp;
+    return latestTimestamp === undefined ? segment.updatedAt : Math.max(latestTimestamp, segment.updatedAt);
+  }, undefined);
+  const groupBlock: ContentBlock = {
+    id: firstBlock.id,
+    type: 'thinking',
+    content: '',
+    thinking: {
+      groupId: firstBlock.thinking.groupId,
+      segments,
+      status,
+      isStreaming,
+      ...(startedAt !== undefined ? { startedAt } : {}),
+      ...(updatedAt !== undefined ? { updatedAt } : {}),
+    },
+  };
+
+  return {
+    ...latest,
+    artifactId: first.artifactId,
+    displayOrder: first.displayOrder,
+    artifactVersion: Math.max(first.artifactVersion ?? 0, latest.artifactVersion ?? 0),
+    anchorEventSeq: Math.min(first.anchorEventSeq, latest.anchorEventSeq),
+    latestEventSeq: Math.max(first.latestEventSeq, latest.latestEventSeq),
+    cardStreamSeq: Math.min(first.cardStreamSeq, latest.cardStreamSeq),
+    timestamp: Math.min(first.timestamp, latest.timestamp),
+    cardId: first.cardId,
+    taskId: first.taskId,
+    messageIds: mergeMessageIds(first.messageIds, latest.messageIds),
+    message: {
+      ...latest.message,
+      id: first.message.id,
+      content: '',
+      blocks: [groupBlock],
+      timestamp: first.message.timestamp,
+      updatedAt: updatedAt ?? latest.message.updatedAt,
+      isStreaming,
+      isComplete: status === 'completed',
+      metadata: {
+        ...latestMetadata,
+        turnItemId: firstMetadata.turnItemId,
+        turnItemStatus: status,
+        itemSeq: firstMetadata.itemSeq,
+        canonicalItemSeq: firstMetadata.canonicalItemSeq,
+        blockSeq: firstMetadata.blockSeq,
+        cardStreamSeq: firstMetadata.cardStreamSeq,
+        thinkingSegmentIds: segments.map((segment) => segment.segmentId),
+        renderRevision: segments
+          .map((segment) => `${segment.segmentId}:${segment.status}:${segment.updatedAt ?? 0}:${segment.content.length}`)
+          .join('|'),
+      },
+    },
+  };
+}
+
+function groupAdjacentThinkingArtifacts(
+  artifacts: TimelineProjectionArtifact[],
+): TimelineProjectionArtifact[] {
+  const grouped: TimelineProjectionArtifact[] = [];
+  for (const artifact of artifacts) {
+    const previous = grouped[grouped.length - 1];
+    if (
+      previous
+      && thinkingBlock(previous)
+      && thinkingBlock(artifact)
+      && hasSameThinkingOwner(previous, artifact)
+    ) {
+      grouped[grouped.length - 1] = mergeThinkingArtifacts(previous, artifact);
+    } else {
+      grouped.push(artifact);
+    }
+  }
+  return grouped;
+}
+
+function projectStableArtifacts(
+  artifacts: TimelineProjectionArtifact[],
+): TimelineProjectionArtifact[] {
+  return groupAdjacentThinkingArtifacts(collapseArtifactsByStableCard(artifacts));
+}
+
 function renderEntry(artifact: TimelineProjectionArtifact): TimelineProjectionRenderEntry {
   return {
     entryId: artifact.artifactId,
@@ -662,7 +813,7 @@ export function buildCanonicalTimelineProjection(state: CanonicalTurnReducerStat
   if (!sessionId) {
     return null;
   }
-  const artifacts = collapseArtifactsByStableCard(state.turns
+  const artifacts = projectStableArtifacts(state.turns
     .filter((turn) => turn.status !== 'superseded')
     .flatMap((turn) => buildTurnProjectionArtifacts(turn))
     .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact))
@@ -731,12 +882,12 @@ export function updateCanonicalTimelineProjection(
       retained.push(artifact);
     }
   }
-  const changed = collapseArtifactsByStableCard(state.turns
+  const changed = projectStableArtifacts(state.turns
     .filter((turn) => changedTurnIdSet.has(turn.turnId))
     .filter((turn) => turn.status !== 'superseded')
     .flatMap((turn) => buildTurnProjectionArtifacts(turn))
-    .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact))
-    .map((artifact) => reuseEquivalentArtifact(previousById, artifact)));
+    .filter((artifact): artifact is TimelineProjectionArtifact => Boolean(artifact)))
+    .map((artifact) => reuseEquivalentArtifact(previousById, artifact));
   const artifacts = mergeSortedArtifacts(retained, changed);
   return {
     schemaVersion: 'session-timeline-projection.v2',

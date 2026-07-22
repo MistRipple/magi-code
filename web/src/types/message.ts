@@ -363,12 +363,26 @@ export interface TerminalSessionBlock {
   updatedAt: number;
 }
 
-// 思考块
-export interface ThinkingBlock {
+export type ThinkingSegmentStatus = 'pending' | 'running' | 'completed' | 'blocked' | 'failed' | 'cancelled';
+
+export interface ThinkingSegment {
+  segmentId: string;
+  messageId: string;
   content: string;
-  isComplete: boolean;
   summary?: string;
-  blockId?: string;
+  status: ThinkingSegmentStatus;
+  createdAt?: number;
+  updatedAt?: number;
+}
+
+// 思考块是时间线投影后的唯一渲染模型；单段思考同样使用 group 结构。
+export interface ThinkingBlock {
+  groupId: string;
+  segments: ThinkingSegment[];
+  status: ThinkingSegmentStatus;
+  isStreaming: boolean;
+  startedAt?: number;
+  updatedAt?: number;
 }
 
 // 消息内容块

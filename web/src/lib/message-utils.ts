@@ -126,16 +126,23 @@ export function mapStandardBlocks(blocks: StandardContentBlock[]): ContentBlock[
       }
       case 'thinking': {
         const blockId = requireBlockId(block, 'thinking');
+        const status = block.isComplete === false ? 'running' : 'completed';
         const thinking: ThinkingBlock = {
-          content: typeof block.content === 'string' ? block.content : '',
-          isComplete: typeof block.isComplete === 'boolean' ? block.isComplete : true,
-          summary: typeof block.summary === 'string' ? block.summary : undefined,
-          blockId,
+          groupId: `thinking-group:${blockId}`,
+          segments: [{
+            segmentId: blockId,
+            messageId: blockId,
+            content: typeof block.content === 'string' ? block.content : '',
+            summary: typeof block.summary === 'string' ? block.summary : undefined,
+            status,
+          }],
+          status,
+          isStreaming: status === 'running',
         };
         return {
           id: blockId,
           type: 'thinking',
-          content: typeof block.content === 'string' ? block.content : '',
+          content: '',
           thinking,
         };
       }

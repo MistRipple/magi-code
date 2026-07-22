@@ -5,20 +5,20 @@
 
   interface Props {
     block: ContentBlock;
-    isStreaming?: boolean;
     filePreviewScope?: FilePreviewScope;
   }
 
-  let { block, isStreaming = false, filePreviewScope = undefined }: Props = $props();
+  let { block, filePreviewScope = undefined }: Props = $props();
 
-  const thinkingContent = $derived(block.thinking?.content || block.content || '');
-
-  const isComplete = $derived(block.thinking?.isComplete ?? !isStreaming);
-  const shouldShowStreamingState = $derived(isStreaming && !isComplete);
+  const group = $derived.by(() => {
+    if (!block.thinking) {
+      throw new Error(`[ThinkingBlockRenderer] block ${block.id} 缺少 ThinkingGroup`);
+    }
+    return block.thinking;
+  });
 </script>
 
 <ThinkingBlock
-  content={thinkingContent}
-  isStreaming={shouldShowStreamingState}
+  {group}
   {filePreviewScope}
 />

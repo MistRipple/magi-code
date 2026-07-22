@@ -1,20 +1,19 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import type { FilePreviewScope } from '../lib/file-reference';
+  import type { ThinkingBlock as ThinkingGroup, ThinkingSegment } from '../types/message';
   import Icon from './Icon.svelte';
   import MarkdownContent from './MarkdownContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
 
   interface Props {
-    content: string;
-    isStreaming?: boolean;
+    group: ThinkingGroup;
     initialExpanded?: boolean;
     filePreviewScope?: FilePreviewScope;
   }
 
   let {
-    content,
-    isStreaming = false,
+    group,
     initialExpanded,
     filePreviewScope = undefined,
   }: Props = $props();
@@ -22,13 +21,19 @@
   // 折叠状态只由初始配置决定；流式输出期间也允许用户手动展开/折叠
   let collapsed = $state(untrack(() => !(initialExpanded ?? false)));
 
-  const thinkingContent = $derived((content ?? '').trim());
-
-  const title = $derived(
-    isStreaming
+  const title = $derived.by(() => {
+    if (group.status === 'failed') return i18n.t('thinkingBlock.failedTitle');
+    if (group.status === 'blocked' || group.status === 'cancelled') {
+      return i18n.t('thinkingBlock.interruptedTitle');
+    }
+    return group.isStreaming
       ? i18n.t('thinkingBlock.streamingTitle')
-      : i18n.t('thinkingBlock.completedTitle'),
-  );
+      : i18n.t('thinkingBlock.completedTitle');
+  });
+
+  function isSegmentStreaming(segment: ThinkingSegment): boolean {
+    return segment.status === 'pending' || segment.status === 'running';
+  }
 
   function toggle() {
     collapsed = !collapsed;
@@ -38,7 +43,11 @@
 <div
   class="thinking-block"
   class:collapsed
-  class:streaming={isStreaming}
+  class:streaming={group.isStreaming}
+  class:failed={group.status === 'failed'}
+  class:interrupted={group.status === 'blocked' || group.status === 'cancelled'}
+  data-thinking-group-id={group.groupId}
+  data-thinking-segment-count={group.segments.length}
 >
   <button class="thinking-header" onclick={toggle}>
     <span class="chevron">
@@ -54,9 +63,19 @@
 
   {#if !collapsed}
     <div class="thinking-content">
-      <div class="thinking-body">
-        <MarkdownContent content={thinkingContent} {isStreaming} {filePreviewScope} />
-      </div>
+      {#each group.segments as segment (segment.segmentId)}
+        <div class="thinking-segment" data-thinking-segment-id={segment.segmentId}>
+          {#if segment.content.trim()}
+            <div class="thinking-body">
+              <MarkdownContent
+                content={segment.content.trim()}
+                isStreaming={isSegmentStreaming(segment)}
+                {filePreviewScope}
+              />
+            </div>
+          {/if}
+        </div>
+      {/each}
     </div>
   {/if}
 </div>
@@ -73,6 +92,14 @@
   .thinking-block.streaming {
     border-color: #a855f7;
     box-shadow: 0 0 0 1px rgba(168, 85, 247, 0.2);
+  }
+
+  .thinking-block.failed {
+    border-color: color-mix(in srgb, var(--error) 55%, var(--border));
+  }
+
+  .thinking-block.interrupted {
+    border-color: color-mix(in srgb, var(--warning) 55%, var(--border));
   }
 
   /* header 高度/padding/字号/accent 条/chevron 等共享规范见 styles/tool-card.css；
@@ -95,10 +122,17 @@
   }
 
   .thinking-content {
-    padding: var(--space-3);
     border-top: 1px solid var(--border);
     background: rgba(139, 92, 246, 0.02);
     animation: expandContent 0.2s ease-out;
+  }
+
+  .thinking-segment {
+    padding: var(--space-3);
+  }
+
+  .thinking-segment + .thinking-segment {
+    border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
   }
 
   @keyframes expandContent {

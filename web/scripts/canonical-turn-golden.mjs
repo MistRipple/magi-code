@@ -95,6 +95,11 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
   assertSupersededTurnDisappearsAndRejectsLateEvents(reducer, projection);
   assertModelContextFallbackProjectsAsWarningNotice(reducer, projection);
+  assertSingleThinkingProjectsAsGroup(reducer, projection);
+  assertAdjacentThinkingProjectsAsOneGroup(reducer, projection);
+  assertThinkingGroupRespectsVisibleAndOwnerBoundaries(reducer, projection);
+  assertThinkingGroupKeepsStableIdentityDuringIncrementalAppend(reducer, projection);
+  assertThinkingGroupAggregatesFailureState(reducer, projection);
   assertFailedAssistantTextUsesPlainMessageShell(reducer, projection);
   assertSplitToolStartedAndResultCollapseIntoOneCard(reducer, projection);
   assertCancelledToolShowsTurnResponseDuration(reducer, projection);
@@ -158,6 +163,111 @@ function assertModelContextFallbackProjectsAsWarningNotice(reducer, projection) 
     'warning',
     'model context fallback must preserve its warning severity',
   );
+}
+
+function assertSingleThinkingProjectsAsGroup(reducer, projection) {
+  const c = baseCase('single-thinking-group', 'session-golden-thinking-single', 'turn-golden-thinking-single', 11_710);
+  const segment = thinking(c, 1, 'thinking-single', '先确认当前结构。', 'completed');
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'completed', [segment])]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  assert.equal(projectionValue.artifacts.length, 1, 'single thinking segment should create one artifact');
+  const artifact = projectionValue.artifacts[0];
+  const block = artifact.message.blocks?.find((candidate) => candidate.type === 'thinking');
+  assert.equal(block?.thinking?.groupId, artifact.artifactId, 'single segment must use the same ThinkingGroup model');
+  assert.deepEqual(
+    block?.thinking?.segments.map((candidate) => candidate.segmentId),
+    [segment.itemId],
+    'single segment group must retain its raw segment identity',
+  );
+  assert.equal(block?.content, '', 'thinking group must not concatenate markdown into block.content');
+  assert.equal(artifact.message.content, '', 'thinking group must not use message.content as a second render path');
+}
+
+function assertAdjacentThinkingProjectsAsOneGroup(reducer, projection) {
+  const c = baseCase('adjacent-thinking-group', 'session-golden-thinking-adjacent', 'turn-golden-thinking-adjacent', 11_720);
+  const first = thinking(c, 1, 'thinking-first', '检查入口。', 'completed');
+  const hiddenTool = tool(c, 2, 'hidden-tool', 'hidden-call', 'pwd', 'completed', { stdout: '/tmp' });
+  hiddenTool.visibility = { renderable: false };
+  const second = thinking(c, 3, 'thinking-second', '检查状态流。', 'running');
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'running', [first, hiddenTool, second]),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  assert.equal(projectionValue.artifacts.length, 1, 'hidden internal items must not split a visible thinking group');
+  const artifact = projectionValue.artifacts[0];
+  const group = artifact.message.blocks?.[0]?.thinking;
+  assert.equal(artifact.artifactId, `turn:${c.turnId}:${first.itemId}`, 'group identity must be anchored to the first segment');
+  assert.deepEqual(
+    group?.segments.map((segment) => [segment.segmentId, segment.content]),
+    [[first.itemId, first.content], [second.itemId, second.content]],
+    'adjacent visible thinking segments must remain structured and ordered',
+  );
+  assert.equal(group?.status, 'running', 'any running segment must keep the group running');
+  assert.equal(artifact.message.isStreaming, true, 'running group must expose streaming state once');
+  assert.ok(artifact.messageIds.includes(second.itemId), 'group messageIds must retain every raw segment id');
+}
+
+function assertThinkingGroupRespectsVisibleAndOwnerBoundaries(reducer, projection) {
+  const c = baseCase('thinking-group-boundaries', 'session-golden-thinking-boundaries', 'turn-golden-thinking-boundaries', 11_730);
+  const first = thinking(c, 1, 'thinking-before-tool', '工具前思考。', 'completed');
+  const visibleTool = tool(c, 2, 'visible-tool', 'visible-call', 'pwd', 'completed', { stdout: '/tmp' });
+  const second = thinking(c, 3, 'thinking-after-tool', '工具后思考。', 'completed');
+  const workerA = thinking(c, 4, 'thinking-worker-a', '代理 A 思考。', 'completed', {
+    sourceThreadId: 'thread-worker-a',
+    worker: { taskId: 'task-a', workerId: 'worker-a', roleId: 'reviewer' },
+  });
+  const workerB = thinking(c, 5, 'thinking-worker-b', '代理 B 思考。', 'completed', {
+    sourceThreadId: 'thread-worker-b',
+    worker: { taskId: 'task-b', workerId: 'worker-b', roleId: 'reviewer' },
+  });
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'completed', [first, visibleTool, second, workerA, workerB]),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  const thinkingArtifacts = projectionValue.artifacts.filter((artifact) => artifact.message.type === 'thinking');
+  assert.equal(thinkingArtifacts.length, 4, 'visible cards and owner changes must split ThinkingGroup artifacts');
+  assert.deepEqual(
+    thinkingArtifacts.map((artifact) => artifact.message.blocks?.[0]?.thinking?.segments.length),
+    [1, 1, 1, 1],
+    'boundary-separated thinking segments must remain independent groups',
+  );
+}
+
+function assertThinkingGroupKeepsStableIdentityDuringIncrementalAppend(reducer, projection) {
+  const c = baseCase('thinking-group-incremental', 'session-golden-thinking-incremental', 'turn-golden-thinking-incremental', 11_740);
+  const first = thinking(c, 1, 'thinking-incremental-first', '第一段。', 'completed');
+  const initialState = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'running', [first])]);
+  const initialProjection = projection.buildCanonicalTimelineProjection(initialState);
+  const second = thinking(c, 2, 'thinking-incremental-second', '第二段。', 'running');
+  const nextState = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'running', [first, second])]);
+  const nextProjection = projection.updateCanonicalTimelineProjection(
+    initialProjection,
+    nextState,
+    [c.turnId],
+  );
+  assert.equal(nextProjection.artifacts.length, 1, 'incremental append must extend the existing group');
+  assert.equal(
+    nextProjection.artifacts[0].artifactId,
+    initialProjection.artifacts[0].artifactId,
+    'incremental append must keep the first segment artifact id stable',
+  );
+  assert.equal(
+    nextProjection.artifacts[0].message.blocks?.[0]?.thinking?.segments.length,
+    2,
+    'incremental append must add a structured segment to the existing group',
+  );
+}
+
+function assertThinkingGroupAggregatesFailureState(reducer, projection) {
+  const c = baseCase('thinking-group-failure', 'session-golden-thinking-failure', 'turn-golden-thinking-failure', 11_750);
+  const first = thinking(c, 1, 'thinking-success', '已完成的部分。', 'completed');
+  const failed = thinking(c, 2, 'thinking-failed', '失败的部分。', 'failed');
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'failed', [first, failed])]);
+  const artifact = projection.buildCanonicalTimelineProjection(state).artifacts[0];
+  const group = artifact.message.blocks?.[0]?.thinking;
+  assert.equal(group?.status, 'failed', 'failed segment must make the group failed');
+  assert.equal(group?.isStreaming, false, 'failed group must stop streaming');
+  assert.equal(artifact.message.isComplete, false, 'failed group must not be reported as completed');
 }
 
 function assertSupersededTurnDisappearsAndRejectsLateEvents(reducer, projection) {
@@ -2853,6 +2963,14 @@ function phase(c, itemSeq, content, status) {
 
 function assistantText(c, itemSeq, itemId, content, status) {
   return item(c, itemSeq, itemId, 'assistant_text', status, { content, title: '最终回复' });
+}
+
+function thinking(c, itemSeq, itemId, content, status, fields = {}) {
+  return item(c, itemSeq, itemId, 'assistant_thinking', status, {
+    content,
+    title: '思考',
+    ...fields,
+  });
 }
 
 function assistantPlaceholderText(c, itemSeq, itemId, status) {

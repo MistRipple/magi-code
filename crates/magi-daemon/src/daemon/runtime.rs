@@ -637,6 +637,25 @@ impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
                 .to_string(),
             });
         }
+        if request
+            .tool_choice
+            .as_ref()
+            .is_some_and(|choice| choice.function.name == "agent_spawn")
+        {
+            return Ok(magi_bridge_client::BridgeResponse {
+                ok: true,
+                payload: static_test_agent_spawn_payload(&request),
+            });
+        }
+        if let Some(payload) = static_test_agent_wait_payload(&request) {
+            return Ok(magi_bridge_client::BridgeResponse { ok: true, payload });
+        }
+        if let Some(result) = static_test_agent_wait_result(&request) {
+            return Ok(magi_bridge_client::BridgeResponse {
+                ok: true,
+                payload: format!("已吸收测试代理结果：{result}"),
+            });
+        }
         Ok(magi_bridge_client::BridgeResponse {
             ok: true,
             payload: format!("loopback-model::{}", request.prompt.trim()),
@@ -650,6 +669,131 @@ impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
     ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
         self.invoke(request)
     }
+}
+
+#[cfg(test)]
+fn static_test_agent_spawn_payload(request: &magi_bridge_client::ModelInvocationRequest) -> String {
+    let spawn_count = request
+        .messages
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|message| message.tool_calls.iter())
+        .filter(|call| call.function.name == "agent_spawn")
+        .count();
+    let (task_name, display_name, role, goal) = if spawn_count == 0 {
+        (
+            "test_executor",
+            "测试执行代理",
+            "executor",
+            "执行测试任务并返回完成结果",
+        )
+    } else {
+        (
+            "test_validator",
+            "测试验证代理",
+            "tester",
+            "验证测试任务并返回检查结果",
+        )
+    };
+    let arguments = serde_json::json!({
+        "task_name": task_name,
+        "display_name": display_name,
+        "role": role,
+        "goal": goal,
+        "context_package": {
+            "summary": "daemon 测试协调任务",
+            "constraints": ["仅用于测试运行时协调链路"],
+            "expected_output": "返回任务已完成",
+            "references": [],
+        },
+    });
+    serde_json::json!({
+        "content": null,
+        "finish_reason": "tool_calls",
+        "tool_calls": [{
+            "id": format!("call-test-agent-spawn-{}", spawn_count + 1),
+            "type": "function",
+            "function": {
+                "name": "agent_spawn",
+                "arguments": arguments.to_string(),
+            }
+        }]
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+fn static_test_agent_wait_payload(
+    request: &magi_bridge_client::ModelInvocationRequest,
+) -> Option<String> {
+    let messages = request.messages.as_deref()?;
+    let spawn_count = messages
+        .iter()
+        .flat_map(|message| message.tool_calls.iter())
+        .filter(|call| call.function.name == "agent_spawn")
+        .count();
+    let already_waited = messages
+        .iter()
+        .flat_map(|message| message.tool_calls.iter())
+        .any(|call| call.function.name == "agent_wait");
+    if spawn_count < 2 || already_waited {
+        return None;
+    }
+    let task_ids = messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| message.content.as_deref())
+        .filter_map(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+        .filter_map(|payload| {
+            payload
+                .get("child_task_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    if task_ids.len() < 2 {
+        return None;
+    }
+    let arguments = serde_json::json!({
+        "task_ids": task_ids,
+        "timeout_ms": 60_000,
+    });
+    Some(
+        serde_json::json!({
+            "content": null,
+            "finish_reason": "tool_calls",
+            "tool_calls": [{
+                "id": "call-test-agent-wait",
+                "type": "function",
+                "function": {
+                    "name": "agent_wait",
+                    "arguments": arguments.to_string(),
+                }
+            }]
+        })
+        .to_string(),
+    )
+}
+
+#[cfg(test)]
+fn static_test_agent_wait_result(
+    request: &magi_bridge_client::ModelInvocationRequest,
+) -> Option<&str> {
+    let messages = request.messages.as_deref()?;
+    let wait_call_ids = messages
+        .iter()
+        .flat_map(|message| message.tool_calls.iter())
+        .filter(|call| call.function.name == "agent_wait")
+        .map(|call| call.id.as_str())
+        .collect::<HashSet<_>>();
+    messages.iter().rev().find_map(|message| {
+        let tool_call_id = message.tool_call_id.as_deref()?;
+        wait_call_ids
+            .contains(tool_call_id)
+            .then(|| message.content.as_deref())
+            .flatten()
+    })
 }
 
 #[cfg(test)]

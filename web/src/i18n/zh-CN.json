@@ -1228,6 +1228,8 @@
   "activeAgentCenter.status.degraded": "需关注",
   "thinkingBlock.streamingTitle": "思考中...",
   "thinkingBlock.completedTitle": "思考已完成",
+  "thinkingBlock.failedTitle": "思考失败",
+  "thinkingBlock.interruptedTitle": "思考已中止",
   "toast.extractedAdrs": "自动提取了 {count} 条架构决策记录",
   "toast.extractedFaqs": "自动提取了 {count} 条常见问题",
   "toast.extractedLearnings": "自动沉淀了 {count} 条经验记录",

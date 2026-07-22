@@ -266,15 +266,22 @@ export function sanitizeMessageBlocks(blocks: unknown, errorPrefix = '[MessagePa
 
     // 后端 thinking block 使用扁平 content/summary/blockId，前端期望嵌套 thinking 对象。
     if (type === 'thinking' && !sanitized.thinking) {
+      const status = sanitized.isComplete === false ? 'running' : 'completed';
       return {
         id: blockId,
         type: 'thinking' as const,
-        content,
+        content: '',
         thinking: {
-          content,
-          isComplete: typeof sanitized.isComplete === 'boolean' ? sanitized.isComplete : true,
-          summary: typeof sanitized.summary === 'string' ? sanitized.summary : undefined,
-          blockId,
+          groupId: `thinking-group:${blockId}`,
+          segments: [{
+            segmentId: blockId,
+            messageId: blockId,
+            content,
+            summary: typeof sanitized.summary === 'string' ? sanitized.summary : undefined,
+            status,
+          }],
+          status,
+          isStreaming: status === 'running',
         },
       } as ContentBlock;
     }

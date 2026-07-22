@@ -1228,6 +1228,8 @@
   "activeAgentCenter.status.degraded": "Needs attention",
   "thinkingBlock.streamingTitle": "Thinking...",
   "thinkingBlock.completedTitle": "Thinking done",
+  "thinkingBlock.failedTitle": "Thinking failed",
+  "thinkingBlock.interruptedTitle": "Thinking interrupted",
   "toast.extractedAdrs": "Automatically extracted {count} architecture decision records",
   "toast.extractedFaqs": "Automatically extracted {count} FAQs",
   "toast.extractedLearnings": "Automatically captured {count} learning records",
