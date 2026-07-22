@@ -30,7 +30,6 @@ export const desktopUpdaterState = $state({
   currentVersion: '',
   lastCheckedAt: 0,
   lastCheckAttemptAt: 0,
-  promptDismissed: false,
 });
 
 let started = false;
@@ -90,7 +89,6 @@ export async function checkForDesktopUpdate(
       await closeCurrentUpdate();
       desktopUpdaterState.update = nextUpdate;
       desktopUpdaterState.phase = nextUpdate ? 'available' : 'latest';
-      desktopUpdaterState.promptDismissed = false;
     } catch (error) {
       if (source === 'automatic') {
         desktopUpdaterState.phase = previousPhase === 'latest' ? 'latest' : 'idle';
@@ -117,7 +115,6 @@ export async function downloadDesktopUpdate(): Promise<void> {
   desktopUpdaterState.progress = null;
   desktopUpdaterState.error = '';
   desktopUpdaterState.errorStage = null;
-  desktopUpdaterState.promptDismissed = false;
   try {
     await update.download((progress) => {
       desktopUpdaterState.progress = progress;
@@ -141,7 +138,6 @@ export async function restartWithDesktopUpdate(): Promise<void> {
   desktopUpdaterState.phase = 'installing';
   desktopUpdaterState.error = '';
   desktopUpdaterState.errorStage = null;
-  desktopUpdaterState.promptDismissed = false;
   try {
     await update.installAndRestart();
   } catch (error) {
@@ -149,14 +145,6 @@ export async function restartWithDesktopUpdate(): Promise<void> {
     desktopUpdaterState.error = errorMessage(error);
     desktopUpdaterState.errorStage = 'install';
   }
-}
-
-export function dismissDesktopUpdatePrompt(): void {
-  desktopUpdaterState.promptDismissed = true;
-}
-
-export function showDesktopUpdatePrompt(): void {
-  desktopUpdaterState.promptDismissed = false;
 }
 
 export async function retryDesktopUpdate(): Promise<void> {

@@ -1854,6 +1854,13 @@ async fn observe_regular_session_turn_execution(
             }
             invalidate_orchestrator_thread_history(&state, &session_id, UtcMillis::now());
             record_active_goal_turn_failure(&state, &session_id);
+            record_session_runtime_incident(
+                &state,
+                &session_id,
+                workspace_id.as_ref(),
+                "session_turn_execution_panicked",
+                public_message,
+            );
             let _ = state.persist_session_durable_state();
             let event_id = EventId::new(format!("event-session-turn-failed-{}", accepted_at.0));
             let _ = state.event_bus.publish(
@@ -1980,6 +1987,13 @@ fn finalize_regular_session_turn_execution(
                 .update_current_turn_status(&session_id, "failed");
             invalidate_orchestrator_thread_history(&state, &session_id, UtcMillis::now());
             record_active_goal_turn_failure(&state, &session_id);
+            record_session_runtime_incident(
+                &state,
+                &session_id,
+                workspace_id.as_ref(),
+                &error.diagnostic_code,
+                &error.public_message,
+            );
             let _ = state.persist_session_durable_state();
             let event_id = EventId::new(format!("event-session-turn-failed-{}", accepted_at.0));
             let _ = state.event_bus.publish(
@@ -2124,6 +2138,46 @@ async fn schedule_goal_continuation_turn_if_idle(
     if let Err(error) = submit_goal_continuation_turn(state, session_id, workspace_id, goal).await {
         tracing::warn!("goal continuation turn submit failed: {error:?}");
     }
+}
+
+/// 用户显式恢复目标时提交一轮真实的续跑任务。
+///
+/// 继续操作只会在续跑 Turn 已被接收后返回成功；这里先检查执行器、普通消息队列
+/// 与当前 Turn 槽位，拒绝任何无法立即开始的恢复请求。
+pub(crate) fn ensure_goal_continuation_start_available(
+    state: &ApiState,
+    session_id: &SessionId,
+    workspace_id: &WorkspaceId,
+) -> Result<(), ApiError> {
+    if state.session_turn_dispatcher().is_none() {
+        return Err(ApiError::conflict(
+            "恢复目标失败，当前会话执行器不可用",
+            session_id.as_str(),
+        ));
+    }
+    if state.queued_regular_session_turn_count(session_id, Some(workspace_id)) > 0 {
+        return Err(ApiError::conflict(
+            "恢复目标失败，当前会话仍有待执行消息",
+            session_id.as_str(),
+        ));
+    }
+    state
+        .session_store
+        .ensure_current_turn_acceptance_available(session_id)
+        .map_err(|error| map_current_turn_accept_error("恢复目标失败，当前会话仍在执行", error))
+}
+
+pub(crate) async fn resume_active_goal_continuation_turn(
+    state: ApiState,
+    session_id: SessionId,
+    workspace_id: WorkspaceId,
+) -> Result<(), ApiError> {
+    ensure_goal_continuation_start_available(&state, &session_id, &workspace_id)?;
+    let goal = state
+        .session_store
+        .active_goal(&session_id)
+        .ok_or_else(|| ApiError::InvalidInput("当前目标未处于可继续状态".to_string()))?;
+    submit_goal_continuation_turn(state, session_id, Some(workspace_id), goal).await
 }
 
 async fn submit_goal_continuation_turn(
@@ -2403,6 +2457,13 @@ fn publish_regular_session_turn_early_failed(
     let _ = state
         .session_store
         .update_current_turn_status(session_id, "failed");
+    record_session_runtime_incident(
+        state,
+        session_id,
+        workspace_id.as_ref(),
+        reason.code(),
+        reason.public_message(),
+    );
     let _ = state.persist_session_durable_state();
     let event_id = EventId::new(format!("event-session-turn-failed-{}", accepted_at.0));
     let _ = state.event_bus.publish(
@@ -2419,6 +2480,62 @@ fn publish_regular_session_turn_early_failed(
             ..EventContext::default()
         }),
     );
+}
+
+/// 将会话运行终态写入通知中心，确保模型失败时即使用户没有停留在当前页面，
+/// 也能在通知中心看到可追溯的错误记录。
+fn record_session_runtime_incident(
+    state: &ApiState,
+    session_id: &SessionId,
+    workspace_id: Option<&WorkspaceId>,
+    diagnostic_code: &str,
+    public_message: &str,
+) {
+    let workspace_id = workspace_id.cloned().or_else(|| {
+        state
+            .session_store
+            .session(session_id)
+            .and_then(|session| session_workspace_id(state, &session))
+    });
+    let Some(workspace_id) = workspace_id else {
+        tracing::warn!(
+            session_id = %session_id,
+            diagnostic_code,
+            "运行错误通知缺少 workspace 归属，跳过写入通知中心"
+        );
+        return;
+    };
+
+    let created_at = UtcMillis::now();
+    let notification = NotificationRecord {
+        notification_id: format!(
+            "notification-runtime-error-{}-{diagnostic_code}",
+            created_at.0
+        ),
+        scope: NotificationScope::Session,
+        workspace_id: Some(workspace_id.to_string()),
+        session_id: Some(session_id.clone()),
+        kind: "incident".to_string(),
+        level: Some("error".to_string()),
+        title: Some("运行错误".to_string()),
+        message: public_message.to_string(),
+        source: Some("magi-runtime".to_string()),
+        created_at,
+        handled: false,
+        action_required: true,
+        count_unread: true,
+        fingerprint: format!("runtime-error:{diagnostic_code}"),
+        occurrence_count: 1,
+        resolved: false,
+    };
+    if let Err(error) = state.session_store.append_incident_record(notification) {
+        tracing::warn!(
+            session_id = %session_id,
+            diagnostic_code,
+            %error,
+            "运行错误通知写入通知中心失败"
+        );
+    }
 }
 
 fn session_turn_terminal_canonical_turn(
@@ -4280,12 +4397,21 @@ mod tests {
     #[tokio::test]
     async fn failed_regular_turn_releases_conversation_slot_after_canonical_failure() {
         let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-failed-regular-turn-release",
+            "failed turn",
+        );
         let session_id = SessionId::new("session-failed-regular-turn-release");
         let turn_id = "turn-failed-regular-turn-release".to_string();
         let accepted_at = UtcMillis(1777000000270);
         state
             .session_store
-            .create_session(session_id.clone(), "failed regular turn release")
+            .create_session_for_workspace(
+                session_id.clone(),
+                "failed regular turn release",
+                Some(workspace_id.to_string()),
+            )
             .expect("session should create");
         state
             .session_store
@@ -4308,7 +4434,7 @@ mod tests {
         finalize_regular_session_turn_execution(
             state.clone(),
             session_id.clone(),
-            None,
+            Some(workspace_id.clone()),
             turn_id,
             accepted_at,
             SessionTurnRouteDto::Chat,
@@ -4329,6 +4455,18 @@ mod tests {
                 .iter()
                 .any(|event| event.event_type == "session.turn.failed")
         );
+        let notifications = state
+            .session_store
+            .notifications_for_context(workspace_id.as_str(), Some(&session_id));
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].level.as_deref(), Some("error"));
+        assert_eq!(notifications[0].title.as_deref(), Some("运行错误"));
+        assert_eq!(notifications[0].source.as_deref(), Some("magi-runtime"));
+        assert_eq!(
+            notifications[0].fingerprint,
+            "runtime-error:model_request_failed"
+        );
+        assert!(!notifications[0].handled);
     }
 
     #[test]
@@ -4405,6 +4543,14 @@ mod tests {
             "turn-early-failure"
         );
         assert_eq!(failed_event.payload["canonical_turn"]["status"], "failed");
+        let notifications = state
+            .session_store
+            .notifications_for_context(workspace_id.as_str(), Some(&session_id));
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications[0].fingerprint,
+            "runtime-error:session_turn_dispatcher_unavailable"
+        );
     }
 
     async fn post_json(

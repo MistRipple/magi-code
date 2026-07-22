@@ -11,6 +11,7 @@ use crate::types::{
     ChangeEvent, ChangeKind, ContentKind, FileMeta, PendingChange, SourceKind, SymlinkTargetKind,
 };
 use crate::watcher::{DebouncedEvent, DebouncedKind, FsWatcher};
+use similar::TextDiff;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -1157,48 +1158,15 @@ fn now_ns_xor() -> u128 {
 /// 约束：输出必须符合 unified diff 标准——文件头 `--- a/path` / `+++ b/path`
 /// 之后必须有 `@@ -a,b +c,d @@` hunk header，否则前端按标准格式解析时会丢弃所有 +/- 行。
 ///
-/// 实现说明：当前用"按行索引一一对齐"的简化算法（非最优 LCS），
-/// 整个文件作为单一 hunk 输出。语义最优性可在后续单独优化（引入 similar crate 等），
-/// 此处目标是保证**格式合法**——hunk header 必须存在，行数必须与 body 一致。
+/// 实现使用 `similar` 的行级 diff，保留少量上下文并输出多个标准 hunk。
+/// 不能按行索引一一对齐：文件中间插入一行后，后续所有行都会被误报为修改，
+/// 造成变更统计接近整文件大小。
 fn unified_diff_text(path: &str, old: &str, new: &str) -> String {
-    let old_lines: Vec<&str> = old.lines().collect();
-    let new_lines: Vec<&str> = new.lines().collect();
-
-    let mut body: Vec<String> = Vec::with_capacity(old_lines.len() + new_lines.len());
-    let max_len = old_lines.len().max(new_lines.len());
-    for i in 0..max_len {
-        match (old_lines.get(i), new_lines.get(i)) {
-            (Some(o), Some(n)) if o == n => body.push(format!(" {o}")),
-            (Some(o), Some(n)) => {
-                body.push(format!("-{o}"));
-                body.push(format!("+{n}"));
-            }
-            (Some(o), None) => body.push(format!("-{o}")),
-            (None, Some(n)) => body.push(format!("+{n}")),
-            (None, None) => {}
-        }
-    }
-
-    // hunk header：unified diff 标准要求行数为 0 时起始行也为 0
-    let (old_start, old_count) = if old_lines.is_empty() {
-        (0, 0)
-    } else {
-        (1, old_lines.len())
-    };
-    let (new_start, new_count) = if new_lines.is_empty() {
-        (0, 0)
-    } else {
-        (1, new_lines.len())
-    };
-
-    let mut output: Vec<String> = Vec::with_capacity(body.len() + 3);
-    output.push(format!("--- a/{path}"));
-    output.push(format!("+++ b/{path}"));
-    output.push(format!(
-        "@@ -{old_start},{old_count} +{new_start},{new_count} @@"
-    ));
-    output.extend(body);
-    output.join("\n")
+    TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string()
 }
 
 fn remove_file_or_symlink(path: &Path) -> std::io::Result<()> {
@@ -1306,5 +1274,24 @@ mod unified_diff_text_tests {
         assert!(out.contains(" a"));
         assert!(out.contains("-b"));
         assert!(out.contains("+c"));
+    }
+
+    #[test]
+    fn inserting_a_line_does_not_mark_the_rest_of_file_as_changed() {
+        let old = "one\ntwo\nthree\nfour\nfive\n";
+        let new = "one\ninserted\ntwo\nthree\nfour\nfive\n";
+        let out = unified_diff_text("foo.txt", old, new);
+
+        let additions = out
+            .lines()
+            .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+            .count();
+        let deletions = out
+            .lines()
+            .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+            .count();
+        assert_eq!(additions, 1, "unexpected additions in:\n{out}");
+        assert_eq!(deletions, 0, "unexpected deletions in:\n{out}");
+        assert!(out.contains("+inserted"));
     }
 }

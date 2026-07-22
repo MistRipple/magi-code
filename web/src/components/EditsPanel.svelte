@@ -41,6 +41,16 @@
   );
 
   const hasGroups = $derived(earlierPendingEdits.length > 0 && currentRoundEdits.length > 0);
+  const displayedCurrentEdits = $derived(
+    currentRoundEdits.length > 0 ? currentRoundEdits : edits
+  );
+  const currentRoundTotals = $derived.by(() => displayedCurrentEdits.reduce(
+    (totals, edit) => ({
+      additions: totals.additions + Math.max(0, edit.additions ?? 0),
+      deletions: totals.deletions + Math.max(0, edit.deletions ?? 0),
+    }),
+    { additions: 0, deletions: 0 },
+  ));
   const allEditsRevertible = $derived(edits.every((edit) => edit.revertible === true));
   const currentRoundRevertible = $derived(
     currentRoundEdits.length > 0 && currentRoundEdits.every((edit) => edit.revertible === true)
@@ -276,6 +286,8 @@
       ...scope,
       diff,
       isChangeDiff: Boolean(diff),
+      originalContent: detail.originalContent ?? null,
+      currentContent: detail.previewContent ?? null,
       content: diff
         ? null
         : (
@@ -455,10 +467,21 @@
       {/if}
 
       <div class="group-section">
-        {#if hasGroups || currentRoundEdits.length > 0}
+        {#if displayedCurrentEdits.length > 0}
           <div class="group-header current-round">
             <span class="group-label">{i18n.t('edits.group.currentRound')}</span>
-            <span class="group-count">{i18n.t('edits.group.currentRoundCount', { count: currentRoundEdits.length })}</span>
+            <span class="group-count">{i18n.t('edits.group.currentRoundCount', { count: displayedCurrentEdits.length })}</span>
+            <span
+              class="group-diff-summary"
+              aria-label={i18n.t('edits.group.currentRoundSummary', {
+                count: displayedCurrentEdits.length,
+                additions: currentRoundTotals.additions,
+                deletions: currentRoundTotals.deletions,
+              })}
+            >
+              <span class="stat-add">+{currentRoundTotals.additions}</span>
+              <span class="stat-del">-{currentRoundTotals.deletions}</span>
+            </span>
             {#if currentRoundEdits.length > 0 && latestExecutionGroupId}
               <button
                 type="button"
@@ -473,13 +496,7 @@
             {/if}
           </div>
           <div class="file-list">
-            {#each currentRoundEdits as edit (getEditKey(edit))}
-              {@render fileRow(edit)}
-            {/each}
-          </div>
-        {:else}
-          <div class="file-list">
-            {#each edits as edit (getEditKey(edit))}
+            {#each displayedCurrentEdits as edit (getEditKey(edit))}
               {@render fileRow(edit)}
             {/each}
           </div>
@@ -670,6 +687,16 @@
     color: var(--foreground-muted);
     font-size: var(--text-2xs);
     opacity: 0.72;
+  }
+
+  .group-diff-summary {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs);
+    font-variant-numeric: tabular-nums;
+    font-weight: var(--font-semibold);
   }
 
   .file-list {

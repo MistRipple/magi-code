@@ -27,8 +27,8 @@ use crate::{
 };
 use crate::{
     model_error::{
-        MODEL_EMPTY_RESPONSE_RECOVERY_PROMPT, classify_model_invocation_error,
-        provider_empty_assistant_response_error,
+        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, classify_model_invocation_error,
+        model_empty_response_recovery_prompt, provider_empty_assistant_response_error,
     },
     prompt_utils::{
         PromptFragmentKind, current_turn_context_priority_prompt,
@@ -1445,11 +1445,13 @@ fn run_conversation_loop_inner(
                 });
                 continue;
             }
-            if !has_actionable_output && empty_response_recovery_attempts < 1 {
+            if !has_actionable_output
+                && empty_response_recovery_attempts < MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS
+            {
                 empty_response_recovery_attempts += 1;
                 messages.push(ChatMessage {
                     role: "user".to_string(),
-                    content: Some(MODEL_EMPTY_RESPONSE_RECOVERY_PROMPT.to_string()),
+                    content: Some(model_empty_response_recovery_prompt(had_tool_calls).to_string()),
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,

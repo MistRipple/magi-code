@@ -46,6 +46,11 @@ await withGoldenViteServer(async (server) => {
   assert.equal(posted[0].incident.scope, 'workspace');
   assert.equal(posted[0].incident.workspaceId, 'workspace-notification-runtime');
   assert.equal(posted[0].incident.sessionId, 'session-notification-runtime');
+  assert.equal(
+    store.getToasts().length,
+    1,
+    '持久化到通知中心的 incident 不得额外触发右下角 toast',
+  );
 
   store.applyNotificationsSnapshot('session-notification-runtime', {
     records: Array.from({ length: 4 }, (_, index) => ({

@@ -13,9 +13,9 @@ use crate::{
     },
     model_config::resolve_orchestrator_model_config,
     model_error::{
-        MODEL_EMPTY_RESPONSE_RECOVERY_PROMPT, classify_model_invocation_error,
-        extract_model_context_limit, provider_empty_assistant_response_error,
-        public_model_image_invocation_error_message,
+        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, classify_model_invocation_error,
+        extract_model_context_limit, model_empty_response_recovery_prompt,
+        provider_empty_assistant_response_error, public_model_image_invocation_error_message,
     },
     prompt_utils::{
         PromptFragmentKind, current_turn_context_priority_prompt,
@@ -1116,15 +1116,18 @@ fn run_session_turn_execution_inner(
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
-            } else if empty_response_recovery_attempts < 1 {
+            } else if empty_response_recovery_attempts < MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS
+            {
                 empty_response_recovery_attempts += 1;
                 messages.push(ChatMessage {
                     role: "user".to_string(),
-                    content: Some(MODEL_EMPTY_RESPONSE_RECOVERY_PROMPT.to_string()),
+                    content: Some(model_empty_response_recovery_prompt(had_tool_calls).to_string()),
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
+            } else {
+                break;
             }
             round_limit = round_limit
                 .max(round.saturating_add(2))
@@ -2006,6 +2009,10 @@ mod tests {
         payload: String,
     }
 
+    struct CountingEmptyModelBridgeClient {
+        calls: AtomicUsize,
+    }
+
     struct RetryEventModelBridgeClient;
 
     struct CancellingModelBridgeClient {
@@ -2116,6 +2123,31 @@ mod tests {
                 content: self.delta_content.clone(),
                 thinking: String::new(),
             });
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for CountingEmptyModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "content": null,
+                    "finish_reason": "stop"
+                })
+                .to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
             self.invoke(request)
         }
     }
@@ -2726,13 +2758,8 @@ mod tests {
                 },
             )
             .expect("current turn should be stored");
-        let client = StreamingTextModelBridgeClient {
-            delta_content: String::new(),
-            payload: serde_json::json!({
-                "content": null,
-                "finish_reason": "stop"
-            })
-            .to_string(),
+        let client = CountingEmptyModelBridgeClient {
+            calls: AtomicUsize::new(0),
         };
         let event_bus = InMemoryEventBus::new(16);
         let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
@@ -2798,6 +2825,11 @@ mod tests {
         assert_eq!(
             error.public_message,
             "模型本轮未返回有效内容，可直接继续重试。"
+        );
+        assert_eq!(
+            client.calls.load(Ordering::SeqCst),
+            MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS + 1,
+            "空响应必须先执行每轮带恢复提示的自动重试，再进入失败终态"
         );
         let turn = store
             .runtime_sidecar(&session_id)

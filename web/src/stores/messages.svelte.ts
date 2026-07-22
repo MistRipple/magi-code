@@ -144,6 +144,7 @@ export const messagesState = $state({
   changeMutationStatus: null as ChangeMutationStatus | null,
   orchestratorRuntimeState: null as OrchestratorRuntimeState | null,
   settingsBootstrapSnapshot: null as SettingsBootstrapSnapshot | null,
+  draftOrchestratorSessionConfig: {} as Record<string, unknown>,
   settingsRegistrySnapshot: null as SettingsRegistrySnapshot | null,
 
   // 滚动状态（动态 key，初始只保留 thread）
@@ -969,6 +970,8 @@ export function getState() {
     get changeMutationStatus() { return messagesState.changeMutationStatus; },
     get settingsBootstrapSnapshot() { return messagesState.settingsBootstrapSnapshot; },
     set settingsBootstrapSnapshot(v) { messagesState.settingsBootstrapSnapshot = v; },
+    get draftOrchestratorSessionConfig() { return messagesState.draftOrchestratorSessionConfig; },
+    set draftOrchestratorSessionConfig(v) { messagesState.draftOrchestratorSessionConfig = v; },
     get settingsRegistrySnapshot() { return messagesState.settingsRegistrySnapshot; },
     set settingsRegistrySnapshot(v) { messagesState.settingsRegistrySnapshot = v; },
     get scrollPositions() { return messagesState.scrollPositions; },

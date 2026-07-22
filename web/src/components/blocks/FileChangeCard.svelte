@@ -98,6 +98,7 @@
       workspaceId,
       workspacePath,
       diff: change?.diff ?? null,
+      isChangeDiff: Boolean(change?.diff),
       contentKind: change?.contentKind,
       size: change?.size,
       mime: change?.mime,

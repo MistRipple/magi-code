@@ -69,6 +69,19 @@
     if (planSummary.total <= 0) return 0;
     return Math.min(100, Math.max(0, Math.round((planSummary.completed / planSummary.total) * 100)));
   });
+  const planFinished = $derived(
+    planSummary.total > 0
+    && (planSummary.completed === planSummary.total || currentGoal?.status === 'complete'),
+  );
+  let planWasFinished = false;
+
+  $effect(() => {
+    if (planFinished && !planWasFinished) {
+      planDrawerExpanded = false;
+    }
+    planWasFinished = planFinished;
+  });
+
   function createClient(): RustDaemonClient {
     return new RustDaemonClient(resolveAgentBaseUrl());
   }
@@ -361,7 +374,7 @@
           {:else if planSummary.running > 0}
             <span class="plan-running">{i18n.t('goalPanel.plan.runningCount', { count: planSummary.running })}</span>
           {/if}
-          <Icon name="chevron-right" size={13} class={planDrawerExpanded ? 'drawer-chevron drawer-chevron--open' : 'drawer-chevron'} />
+          <Icon name={planDrawerExpanded ? 'chevron-down' : 'chevron-right'} size={13} class="drawer-chevron" />
         </button>
         {#if planSummary.total > 0 && planSummary.completed === planSummary.total}
           <div class="goal-actions">
@@ -420,7 +433,7 @@
             <span class="goal-objective">{currentGoal.objective}</span>
           </span>
           <span class="goal-meta">{goalTimeLabel(currentGoal.timeUsedSeconds)}</span>
-          <Icon name="chevron-right" size={13} class={goalDrawerExpanded ? 'drawer-chevron drawer-chevron--open' : 'drawer-chevron'} />
+          <Icon name={goalDrawerExpanded ? 'chevron-down' : 'chevron-right'} size={13} class="drawer-chevron" />
         </button>
         <div class="goal-actions">
           {#if goalCanEdit(currentGoal)}
@@ -674,19 +687,14 @@
     white-space: nowrap;
   }
 
-  .drawer-chevron {
+  :global(.drawer-chevron) {
     margin-left: auto;
-    transform: rotate(0deg);
     opacity: 0.55;
-    transition: transform var(--transition-fast), opacity var(--transition-fast);
+    transition: opacity var(--transition-fast);
   }
 
-  .run-drawer-toggle:hover .drawer-chevron {
+  .run-drawer-toggle:hover :global(.drawer-chevron) {
     opacity: 0.85;
-  }
-
-  .drawer-chevron--open {
-    transform: rotate(90deg);
   }
 
   .goal-objective {

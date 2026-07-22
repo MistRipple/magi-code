@@ -13,7 +13,7 @@ export interface IncidentPolicy {
   persistToCenter: true;
   countUnread: true;
   actionRequired: true;
-  displayMode: 'toast';
+  displayMode: 'silent';
   scope: IncidentScope;
 }
 
@@ -79,7 +79,7 @@ export function resolveIncidentPolicy(
     persistToCenter: true,
     countUnread: true,
     actionRequired: true,
-    displayMode: 'toast',
+    displayMode: 'silent',
     scope: options.scope,
   };
 }

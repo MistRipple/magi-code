@@ -14,14 +14,6 @@ import {
   } from '../web/agent-api';
 import WebFolderPicker from '../web/WebFolderPicker.svelte';
 import { getAgentColor } from '../lib/agent-colors';
-import { isDesktopRuntime } from '../lib/desktop-updater';
-import {
-  desktopUpdaterState,
-  checkForDesktopUpdate,
-  downloadDesktopUpdate,
-  restartWithDesktopUpdate,
-  showDesktopUpdatePrompt,
-} from '../stores/desktop-updater.svelte';
 
   import { useSettingsStore } from '../stores/settings-store.svelte';
   
@@ -35,24 +27,6 @@ import {
     onClose: () => onClose?.(),
   });
 
-  const desktopRuntime = isDesktopRuntime();
-
-  function updateAction(): void {
-    if (desktopUpdaterState.phase === 'available') {
-      void downloadDesktopUpdate();
-    } else if (desktopUpdaterState.phase === 'ready') {
-      void restartWithDesktopUpdate();
-      onClose?.();
-    } else if (
-      desktopUpdaterState.phase === 'error'
-      && desktopUpdaterState.errorStage !== 'check'
-    ) {
-      showDesktopUpdatePrompt();
-      onClose?.();
-    } else {
-      void checkForDesktopUpdate('manual');
-    }
-  }
 </script>
 
 
@@ -160,46 +134,6 @@ import {
           {/if}
         </div>
         <div class="header-actions">
-          {#if desktopRuntime}
-            {#if desktopUpdaterState.currentVersion}
-              <span class="current-version-label" title={`${i18n.t('settings.update.currentVersion')} v${desktopUpdaterState.currentVersion}`}>
-                <span class="current-version-label__prefix">{i18n.t('settings.update.currentVersion')}</span>
-                <span>v{desktopUpdaterState.currentVersion}</span>
-              </span>
-            {/if}
-            <button
-              type="button"
-              class="update-check-btn"
-              class:update-check-btn--available={desktopUpdaterState.phase === 'available' || desktopUpdaterState.phase === 'ready'}
-              class:update-check-btn--error={desktopUpdaterState.phase === 'error'}
-              onclick={updateAction}
-              disabled={desktopUpdaterState.phase === 'checking' || desktopUpdaterState.phase === 'downloading' || desktopUpdaterState.phase === 'installing'}
-              title={desktopUpdaterState.phase === 'error' ? desktopUpdaterState.error : (desktopUpdaterState.update?.body || i18n.t('settings.update.checkTitle'))}
-            >
-              <Icon name={desktopUpdaterState.phase === 'available' ? 'download' : 'refresh'} size={13} />
-              <span>
-                {#if desktopUpdaterState.phase === 'checking'}
-                  {i18n.t('settings.update.checking')}
-                {:else if desktopUpdaterState.phase === 'latest'}
-                  {i18n.t('settings.update.latest')}
-                {:else if desktopUpdaterState.phase === 'available'}
-                  {i18n.t('settings.update.available', { version: desktopUpdaterState.update?.version || '' })}
-                {:else if desktopUpdaterState.phase === 'downloading'}
-                  {desktopUpdaterState.progress?.percent !== undefined
-                    ? i18n.t('settings.update.downloadingProgress', { percent: desktopUpdaterState.progress.percent })
-                    : i18n.t('settings.update.downloading')}
-                {:else if desktopUpdaterState.phase === 'ready'}
-                  {i18n.t('settings.update.ready')}
-                {:else if desktopUpdaterState.phase === 'installing'}
-                  {i18n.t('settings.update.restarting')}
-                {:else if desktopUpdaterState.phase === 'error'}
-                  {i18n.t('settings.update.retry')}
-                {:else}
-                  {i18n.t('settings.update.check')}
-                {/if}
-              </span>
-            </button>
-          {/if}
           <div class="locale-selector">
             <button
               class="locale-btn"
@@ -780,55 +714,6 @@ import {
     border-radius: var(--radius-md);
     overflow: hidden;
     margin-left: auto;
-  }
-
-  .update-check-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    min-height: 28px;
-    padding: 0 9px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    color: var(--foreground-muted);
-    background: transparent;
-    font: inherit;
-    font-size: var(--text-xs);
-    cursor: pointer;
-    white-space: nowrap;
-    transition: color var(--transition-fast), background var(--transition-fast), border-color var(--transition-fast);
-  }
-
-  .current-version-label {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 4px;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-
-  .update-check-btn:hover:not(:disabled) {
-    color: var(--foreground);
-    background: var(--surface-3);
-    border-color: var(--primary-muted);
-  }
-
-  .update-check-btn:disabled {
-    cursor: wait;
-    opacity: 0.72;
-  }
-
-  .update-check-btn--available {
-    color: var(--primary);
-    border-color: color-mix(in srgb, var(--primary) 42%, var(--border));
-    background: color-mix(in srgb, var(--primary) 10%, transparent);
-  }
-
-  .update-check-btn--error {
-    color: var(--error);
-    border-color: color-mix(in srgb, var(--error) 36%, var(--border));
   }
 
   .locale-btn {
@@ -1545,10 +1430,6 @@ import {
     .header-actions .locale-selector .locale-btn {
       padding: 4px 8px;
       font-size: 12px;
-    }
-
-    .current-version-label__prefix {
-      display: none;
     }
 
   }

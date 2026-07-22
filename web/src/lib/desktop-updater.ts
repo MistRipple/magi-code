@@ -24,6 +24,8 @@ type DesktopUpdateDownloadEvent =
 export const DESKTOP_UPDATE_INITIAL_CHECK_DELAY_MS = 1_200;
 export const DESKTOP_UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1_000;
 export const DESKTOP_UPDATE_RETRY_INTERVAL_MS = 15 * 60 * 1_000;
+// GitHub Release 刚发布时，latest.json 可能还处于资产同步窗口；检查失败时只做有限重试，避免把短暂错误直接暴露给用户。
+export const DESKTOP_UPDATE_CHECK_RETRY_DELAYS_MS = [0, 1_000, 3_000] as const;
 
 export function isDesktopUpdateCheckDue(
   lastCheckedAt: number,
@@ -59,6 +61,13 @@ export function formatUpdateProgress(downloadedBytes: number, contentLength?: nu
     contentLength: total,
     percent: total ? Math.min(100, Math.round((downloaded / total) * 100)) : undefined,
   };
+}
+
+function waitForDesktopUpdateCheckRetry(delayMs: number): Promise<void> {
+  if (delayMs <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => window.setTimeout(resolve, delayMs));
 }
 
 async function installStagedUpdateAndRestart(): Promise<void> {
@@ -100,7 +109,22 @@ export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
   }
 
   const { check } = await import('@tauri-apps/plugin-updater');
-  const update = await check();
+  let update: Awaited<ReturnType<typeof check>> | null = null;
+  let checkCompleted = false;
+  let lastCheckError: unknown;
+  for (const delayMs of DESKTOP_UPDATE_CHECK_RETRY_DELAYS_MS) {
+    await waitForDesktopUpdateCheckRetry(delayMs);
+    try {
+      update = await check();
+      checkCompleted = true;
+      break;
+    } catch (error) {
+      lastCheckError = error;
+    }
+  }
+  if (!checkCompleted) {
+    throw lastCheckError ?? new Error('桌面端更新检查失败');
+  }
   if (!update) {
     return null;
   }

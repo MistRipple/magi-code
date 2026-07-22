@@ -1002,11 +1002,20 @@
       if (workspacePickerOpen && !(target instanceof Element && target.closest('.ia-workspace-wrap'))) {
         workspacePickerOpen = false;
       }
+      if (branchPickerOpen && !(target instanceof Element && target.closest('.ia-branch-wrap'))) {
+        branchPickerOpen = false;
+      }
       if (accessProfilePickerOpen && !(target instanceof Element && target.closest('.ia-access-wrap'))) {
         accessProfilePickerOpen = false;
       }
       if (addMenuOpen && !(target instanceof Element && target.closest('.ia-add-wrap'))) {
         addMenuOpen = false;
+      }
+      if (pickerOpen && !(target instanceof Element && target.closest('.ia-model-wrap'))) {
+        pickerOpen = false;
+      }
+      if (slashMenuOpen && !(target instanceof Element && target.closest('.ia-textarea, .ia-slash-popover'))) {
+        closeSlashMenu();
       }
     }
     function handleStoredAccessProfileChange(event: StorageEvent) {
@@ -1090,6 +1099,14 @@
     if (!pickerLoadedOnce && !pickerLoading) {
       void loadPickerModels();
     }
+  });
+
+  // 新建会话草稿继承上一个会话的主模型配置；真正绑定到会话后由后端配置快照接管。
+  $effect(() => {
+    if (!isDraftSession) return;
+    draftOrchestratorSessionConfig = {
+      ...messagesState.draftOrchestratorSessionConfig,
+    };
   });
 
   // 新建会话/切换会话后，URL 与 session store 会先变更，settings bootstrap 可能仍是
@@ -2550,7 +2567,7 @@
           {/if}
         </div>
         {#if branchIsRepo}
-          <div class="ia-picker-wrap">
+            <div class="ia-picker-wrap ia-branch-wrap">
             <button
               type="button"
               class="ia-branch-btn"

@@ -30,6 +30,10 @@ export interface CodeTabPayload {
   sessionId?: string;
   /** 可选：unified diff 文本；存在时优先走 diff 视图 */
   diff?: string | null;
+  /** 差异基线全文；只保留在内存中，用于展开未变更区段。 */
+  originalContent?: string | null;
+  /** 差异当前全文；只保留在内存中，用于展开未变更区段。 */
+  currentContent?: string | null;
   /** 该 tab 来自变更记录；刷新恢复时用权威 changes/diff 接口重取 diff，不持久化大文本 */
   isChangeDiff?: boolean;
   /** 可选：单文件源码；不存在时 RightPane 异步拉取 */
@@ -500,6 +504,8 @@ export function openCodeTab(
     label?: string;
     displayPath?: string;
     diff?: string | null;
+    originalContent?: string | null;
+    currentContent?: string | null;
     isChangeDiff?: boolean;
     content?: string | null;
     language?: string | null;
@@ -544,6 +550,12 @@ export function openCodeTab(
       workspacePath: options?.workspacePath,
       sessionId: normalizedSession || undefined,
       diff: options?.diff ?? null,
+      ...(Object.prototype.hasOwnProperty.call(options ?? {}, 'originalContent')
+        ? { originalContent: options?.originalContent ?? null }
+        : {}),
+      ...(Object.prototype.hasOwnProperty.call(options ?? {}, 'currentContent')
+        ? { currentContent: options?.currentContent ?? null }
+        : {}),
       isChangeDiff: options?.isChangeDiff,
       content: options?.content ?? null,
       language: options?.language ?? null,
