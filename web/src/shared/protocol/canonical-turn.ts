@@ -108,6 +108,11 @@ const CANONICAL_TURN_ITEM_KINDS: CanonicalTurnItemKind[] = [
 ];
 const CANONICAL_TURN_EVENT_KINDS: CanonicalTurnEventKind[] = ['turn_started', 'turn_item_upsert', 'turn_completed', 'turn_superseded'];
 const PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE = '模型请求未完成，可直接继续重试。';
+/**
+ * 标记已被公开错误文案替换的流式内容。后续原始增量不能再与替换后的长度对齐，
+ * reducer 需等待服务端的 reset 或终态快照，避免继续暴露内部 provider 文本。
+ */
+export const PUBLIC_MODEL_FAILURE_SANITIZED_METADATA_KEY = 'publicModelFailureSanitized';
 const INTERNAL_MODEL_FAILURE_MARKERS = [
   '桥接调用失败[RemoteBusiness]',
   'provider response invalid',
@@ -141,8 +146,12 @@ function readRawString(record: Record<string, unknown>, ...keys: string[]): stri
   return undefined;
 }
 
-function publicCanonicalContent(content: string): string {
-  return INTERNAL_MODEL_FAILURE_MARKERS.some((marker) => content.includes(marker))
+function containsInternalModelFailureMarker(content: string): boolean {
+  return INTERNAL_MODEL_FAILURE_MARKERS.some((marker) => content.includes(marker));
+}
+
+export function publicCanonicalContent(content: string): string {
+  return containsInternalModelFailureMarker(content)
     ? PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE
     : content;
 }
@@ -323,14 +332,19 @@ export function normalizeCanonicalTurnItem(value: unknown): CanonicalTurnItem | 
     return undefined;
   }
   const title = readString(record, 'title') || undefined;
-  const content = typeof record.content === 'string'
-    ? publicCanonicalContent(record.content)
-    : undefined;
+  const rawContent = typeof record.content === 'string' ? record.content : undefined;
+  const content = rawContent === undefined ? undefined : publicCanonicalContent(rawContent);
   const blocks = normalizeCanonicalBlocks(record.blocks);
   if (blocks === null) {
     return undefined;
   }
-  const metadata = readRecord(record.metadata) || undefined;
+  const rawMetadata = readRecord(record.metadata);
+  const metadata = rawContent !== undefined && containsInternalModelFailureMarker(rawContent)
+    ? {
+      ...(rawMetadata || {}),
+      [PUBLIC_MODEL_FAILURE_SANITIZED_METADATA_KEY]: true,
+    }
+    : rawMetadata || undefined;
   return {
     sessionId,
     turnId,

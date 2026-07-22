@@ -939,6 +939,7 @@ fn execute_streaming_http_post(
 
     let mut cancellation_tx = Some(cancellation_tx);
     let mut cancellation_requested = false;
+    let mut emitted_delta = false;
     loop {
         if !cancellation_requested && is_cancelled() {
             cancellation.store(true, Ordering::SeqCst);
@@ -949,6 +950,7 @@ fn execute_streaming_http_post(
         }
         match rx.recv_timeout(MODEL_CANCELLATION_POLL_INTERVAL) {
             Ok(StreamMessage::Chunk(delta)) if !cancellation_requested => {
+                emitted_delta = true;
                 on_chunk(&delta);
             }
             Ok(StreamMessage::Chunk(_)) => {}
@@ -964,7 +966,12 @@ fn execute_streaming_http_post(
                 return Err(BridgeClientError::CallFailed {
                     layer: BridgeErrorLayer::Transport,
                     code: Some(-32005),
-                    message: "streaming HTTP request thread terminated unexpectedly".to_string(),
+                    message: if emitted_delta {
+                        "provider stream interrupted: streaming HTTP request thread terminated unexpectedly"
+                            .to_string()
+                    } else {
+                        "streaming HTTP request thread terminated unexpectedly".to_string()
+                    },
                 });
             }
         }
@@ -1150,15 +1157,27 @@ async fn streaming_http_io(
     let mut raw_response = String::new();
 
     'stream_read: loop {
-        let chunk = tokio::select! {
+        let chunk_result = tokio::select! {
             _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
             result = response.chunk() => result,
-        }
-        .map_err(|error| BridgeClientError::CallFailed {
-            layer: BridgeErrorLayer::Transport,
-            code: Some(-32005),
-            message: format!("reading stream chunk failed: {error}"),
-        })?;
+        };
+        let chunk = match chunk_result {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return Err(BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Transport,
+                    code: Some(-32005),
+                    // 已收到 SSE 后发生读取错误，和缺少终止事件属于同一种
+                    // “响应已部分交付但无法确认完整性”的语义。统一归一化后，
+                    // 上层可以保留片段并续写；未收到事件时仍走传输层原请求重试。
+                    message: if saw_sse_event {
+                        format!("provider stream interrupted: reading stream chunk failed: {error}")
+                    } else {
+                        format!("reading stream chunk failed: {error}")
+                    },
+                });
+            }
+        };
         let Some(chunk) = chunk else {
             break;
         };

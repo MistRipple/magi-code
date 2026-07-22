@@ -57,7 +57,8 @@ pub const ROOT_MULTI_AGENT_MODE_RULE: &str = "\
 3. 当前任务合同为 automatic 或 required 时，必须至少创建合同指定数量的真实代理；automatic 不是建议，而是已经完成任务拆分判定后的执行约束。只有工具不可用、安全策略阻止或容量不足时，才能记录真实原因并由主线接管缺口。\n\
 4. 每个代理角色同一时刻最多运行 5 个活跃实例，不设置会话级代理总数上限；agent_spawn 达到角色上限时先 agent_wait 收集该角色已运行代理，再继续创建同角色实例。\n\
 5. 多个互相独立的代理任务应在同一轮发起多次 agent_spawn 启动；需要结果时再用 agent_wait 汇总。所有已创建代理都必须等待到终态并在最终答复中明确吸收结果。\n\
-6. root coordinator 保留主线推进职责：只把边界清晰、可并行、需要专项视角或独立复核的工作交给代理。代理运行中需要补充事实时使用 agent_send，不要等待下一次 Turn 或重启代理。";
+6. 本轮请求若收到 `agent_spawn`、`agent_send`、`agent_wait` 的 tools 定义，这些工具就是当前模型可直接调用的代理工具。工具目录中的 `runtime_internal=true` 只表示调用要由任务编排运行时接管，不表示模型不可调用；不要因为该字段拒绝调用，也不要把普通会话或 worker 任务中未注入这些工具的情况套用到当前 root coordinator。调用 `agent_spawn` 时，`context_package` 必须直接传 JSON 对象，不能把对象再次编码成字符串。\n\
+7. root coordinator 保留主线推进职责：只把边界清晰、可并行、需要专项视角或独立复核的工作交给代理。代理运行中需要补充事实时使用 agent_send，不要等待下一次 Turn 或重启代理。";
 
 pub const SUBAGENT_MULTI_AGENT_MODE_RULE: &str = "\
 子代理模式（worker 必须遵守）：\n\

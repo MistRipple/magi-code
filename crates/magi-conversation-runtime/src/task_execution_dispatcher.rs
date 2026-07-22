@@ -3475,6 +3475,11 @@ mod tests {
                 && coordinator_prompt.contains("必须通过 agent_spawn 创建真实代理"),
             "明确 subagent 请求必须被约束为真实 agent_spawn"
         );
+        assert!(
+            coordinator_prompt.contains("runtime_internal=true")
+                && coordinator_prompt.contains("这些工具就是当前模型可直接调用的代理工具"),
+            "root coordinator 必须明确知道 runtime_internal 不等于模型不可调用"
+        );
 
         let mut automatic_task = task_with_role("coordinator", TaskTier::ExecutionChain);
         automatic_task.goal = "修复登录问题，并运行测试验证回归结果。".to_string();
@@ -3543,6 +3548,30 @@ mod tests {
                 names.iter().any(|name| name == internal),
                 "只读访问只限制外部副作用，不能屏蔽内部协调工具 {internal}: {names:?}"
             );
+        }
+    }
+
+    #[test]
+    fn coordinator_model_tool_surface_contains_agent_contracts() {
+        let dispatcher = dispatcher_with_default_tool_surface();
+        let task = task_with_role("coordinator", TaskTier::ExecutionChain);
+        let definitions = dispatcher.build_tool_definitions(
+            Some(&task),
+            None,
+            magi_core::AccessProfile::Restricted,
+        );
+
+        for name in ["agent_spawn", "agent_send", "agent_wait"] {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.function.name == name)
+                .unwrap_or_else(|| panic!("coordinator model request must contain {name}"));
+            assert_eq!(definition.kind, "function");
+            assert!(
+                definition.function.description.contains("模型") || name != "agent_spawn",
+                "{name} definition must be model-facing"
+            );
+            assert_eq!(definition.function.parameters["type"], "object");
         }
     }
 

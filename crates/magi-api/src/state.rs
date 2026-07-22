@@ -1445,6 +1445,7 @@ impl ApiState {
                     "accessProfileBehavior": tool.get("access_profile_behavior").cloned().unwrap_or(serde_json::Value::String("restricted_allowed".to_string())),
                     "accessMode": tool.get("access_mode").cloned().unwrap_or(serde_json::Value::String("read_only".to_string())),
                     "policyScope": tool.get("policy_scope").cloned().unwrap_or(serde_json::Value::String("fixed".to_string())),
+                    "modelCallScope": tool.get("model_call_scope").cloned().unwrap_or(serde_json::Value::String("session_or_task".to_string())),
                     "inputSensitivePolicy": tool.get("input_sensitive_policy").cloned().unwrap_or(serde_json::Value::Bool(false)),
                     "policySummary": tool.get("policy_summary").cloned().unwrap_or(serde_json::Value::String("使用工具默认风险策略".to_string())),
                     "runtimeInternal": tool.get("runtime_internal").cloned().unwrap_or(serde_json::Value::Bool(false)),
@@ -2126,6 +2127,7 @@ fn normalize_public_tool_catalog_item_json(raw: &serde_json::Value) -> serde_jso
         "category": raw.get("category").cloned().unwrap_or(serde_json::Value::Null),
         "public": raw.get("public").cloned().unwrap_or(serde_json::Value::Bool(false)),
         "runtimeInternal": raw.get("runtime_internal").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "modelCallScope": raw.get("model_call_scope").cloned().unwrap_or(serde_json::Value::String("session_or_task".to_string())),
         "accessMode": raw.get("access_mode").cloned().unwrap_or(serde_json::Value::String("read_only".to_string())),
         "policyScope": raw.get("policy_scope").cloned().unwrap_or(serde_json::Value::String("fixed".to_string())),
         "inputSensitivePolicy": raw.get("input_sensitive_policy").cloned().unwrap_or(serde_json::Value::Bool(false)),
@@ -3602,6 +3604,7 @@ mod tests {
                 "category": "builtin",
                 "public": true,
                 "runtime_internal": false,
+                "model_call_scope": "session_or_task",
                 "access_mode": "explicit_write",
                 "policy_scope": "input_sensitive",
                 "input_sensitive_policy": true,
@@ -3673,6 +3676,7 @@ mod tests {
         );
         assert_eq!(public["runtimeDependencies"][0]["enabledToolCount"], 2);
         assert_eq!(public["tools"][0]["effectiveApprovalPolicy"], "none");
+        assert_eq!(public["tools"][0]["modelCallScope"], "session_or_task");
         assert_eq!(
             public["tools"][0]["parametersSchema"]["properties"]["old_string"]["type"],
             "string"

@@ -105,12 +105,17 @@ pub(crate) fn build_tool_catalog_value(
         let runtime_status = runtime_health.tool_status(tool);
         runtime_warning_count += runtime_status.warnings.len();
         let policy_view = tool_catalog_policy_view(tool, access_profile);
+        let model_call_scope = model_call_scope(tool);
 
         let mut item = serde_json::json!({
             "name": tool.as_str(),
             "category": tool.category(),
             "public": is_public,
             "runtime_internal": tool.is_runtime_internal_tool_call(),
+            // runtime_internal 描述的是实现入口，不等于模型不可调用。尤其是
+            // agent_spawn / agent_wait：模型通过任务编排层调用，不能落到普通
+            // BuiltinTool::execute。把可调用范围单独输出，避免模型把两者混为一谈。
+            "model_call_scope": model_call_scope,
             "access_mode": access_mode_for_tool(tool).as_str(),
             "policy_scope": policy_view.policy_scope,
             "input_sensitive_policy": policy_view.input_sensitive_policy,
@@ -604,6 +609,28 @@ fn access_mode_for_tool(tool: BuiltinToolName) -> BuiltinToolAccessMode {
     tool.default_access_mode()
 }
 
+fn model_call_scope(tool: BuiltinToolName) -> &'static str {
+    match tool {
+        BuiltinToolName::AgentSpawn | BuiltinToolName::AgentSend | BuiltinToolName::AgentWait => {
+            "coordinator_task_only"
+        }
+        BuiltinToolName::ContextSearch
+        | BuiltinToolName::ContextRead
+        | BuiltinToolName::ContextRequest => "worker_task_only",
+        BuiltinToolName::GetGoal | BuiltinToolName::CreateGoal | BuiltinToolName::UpdateGoal => {
+            "session_mainline_or_coordinator_task"
+        }
+        BuiltinToolName::UpdatePlan => "session_mainline_or_task",
+        BuiltinToolName::MemoryWrite => "coordinator_task_only",
+        BuiltinToolName::ProcessLaunch
+        | BuiltinToolName::ProcessRead
+        | BuiltinToolName::ProcessWrite
+        | BuiltinToolName::ProcessKill
+        | BuiltinToolName::ProcessList => "runtime_only_use_shell_exec",
+        _ => "session_or_task",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ToolCatalogPolicyView {
     policy_scope: &'static str,
@@ -875,6 +902,12 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "agent_spawn")
             .expect("agent_spawn should be listed");
+        assert_eq!(agent_spawn["public"], true);
+        assert_eq!(agent_spawn["runtime_internal"], true);
+        assert_eq!(
+            agent_spawn["model_call_scope"], "coordinator_task_only",
+            "runtime_internal 不能覆盖 agent_spawn 的模型可调用范围"
+        );
         assert_eq!(agent_spawn["runtime_status"], "unavailable");
         assert_eq!(
             agent_spawn["runtime_warnings"],
@@ -1541,6 +1574,9 @@ mod tests {
         assert_eq!(payload["agent_role_count"], 2);
         assert_eq!(payload["spawnable_agent_role_count"], 1);
         assert_eq!(agent_spawn["runtime_status"], "ready");
+        assert_eq!(agent_spawn["public"], true);
+        assert_eq!(agent_spawn["runtime_internal"], true);
+        assert_eq!(agent_spawn["model_call_scope"], "coordinator_task_only");
         assert_eq!(agent_wait["runtime_status"], "ready");
         assert_eq!(payload["runtime_dependencies"][2]["status"], "ready");
         assert_eq!(payload["agent_roles"][0]["role_id"], "coordinator");

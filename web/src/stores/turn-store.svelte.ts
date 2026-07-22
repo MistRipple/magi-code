@@ -68,6 +68,13 @@ export function applyCanonicalTurnEvent(event: CanonicalTurnEvent): SessionTimel
     console.error('[canonical-turn-store] 拒绝 canonical turn event:', result.error);
     return null;
   }
+  if (result.recoveryRequired) {
+    // 增量发生基线缺口时，当前内容不能被错误拼接。状态仍已推进，随后由调用方
+    // 拉取权威快照补齐；这属于可恢复的同步问题，不应污染浏览器错误日志。
+    turnStoreState.reducer = result.state;
+    turnStoreState.lastError = 'canonical stream baseline requires recovery';
+    return null;
+  }
   if (!result.changed) {
     if (result.cursorAdvanced) {
       turnStoreState.reducer = result.state;

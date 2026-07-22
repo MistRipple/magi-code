@@ -870,11 +870,17 @@ function buildAssignmentsFromRuntime(
       continue;
     }
     const assignmentTasks = tasksByAssignment.get(assignmentId) || [];
+    const declaredTaskIds = normalizeStringArray(assignment.task_ids);
+    // 模型调用 lease 也会写入 assignments 读模型，但它不代表 agent_spawn 创建的任务。
+    // 只有能关联到实际 task 的 assignment 才能进入“代理数量”统计。
+    if (assignmentTasks.length === 0 && declaredTaskIds.length === 0) {
+      continue;
+    }
     const assignmentTaskStatuses = assignmentTasks.map((task) => normalizeSubTaskStatus(
       normalizeString(task.current_status),
       typeof task.failed_dispatch_count === 'number' ? task.failed_dispatch_count : 0,
     ));
-    const taskTotal = assignmentTasks.length || normalizeStringArray(assignment.task_ids).length;
+    const taskTotal = assignmentTasks.length || declaredTaskIds.length;
     const completedTaskCount = assignmentTasks.length > 0
       ? assignmentTaskStatuses.filter((status) => status === 'completed' || status === 'skipped').length
       : normalizeNumber(assignment.completed_task_count, 0);
@@ -950,6 +956,11 @@ function buildBranchTaskTrackingSummaries(
 
   const summaries: OrchestrationRuntimeAssignmentSummary[] = [];
   for (const [index, branch] of branches.entries()) {
+    // primary branch 是主线 coordinator，不是 agent_spawn 创建的子代理。
+    // 运行状态摘要中的“代理数量”只能统计用户实际派发的子代理，避免把主线混入。
+    if (branch.is_primary) {
+      continue;
+    }
     const taskId = normalizeString(branch.task_id);
     if (!taskId) {
       continue;

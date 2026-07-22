@@ -13,9 +13,11 @@ use crate::{
     },
     model_config::resolve_orchestrator_model_config,
     model_error::{
-        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, classify_model_invocation_error,
+        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS,
+        MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, classify_model_invocation_error,
         extract_model_context_limit, model_empty_response_recovery_prompt,
-        provider_empty_assistant_response_error, public_model_image_invocation_error_message,
+        model_stream_interruption_recovery_prompt, provider_empty_assistant_response_error,
+        public_model_image_invocation_error_message,
     },
     prompt_utils::{
         PromptFragmentKind, current_turn_context_priority_prompt,
@@ -870,6 +872,7 @@ fn run_session_turn_execution_inner(
     let mut corrected_context_limit = false;
     let mut fallback_activated = false;
     let mut empty_response_recovery_attempts = 0usize;
+    let mut stream_interruption_recovery_attempts = 0usize;
 
     let mut round_limit = tool_call_round_limit(&required_tool_chain);
     let mut round = 0usize;
@@ -903,6 +906,7 @@ fn run_session_turn_execution_inner(
                 tools: round_tools,
                 messages: &mut messages,
                 completed_required_tool_names: &completed_required_tool_names,
+                stream_interruption_recovery_attempts,
                 round,
                 orchestrator_thread_id: &orchestrator_thread_id,
                 orchestrator_mission_id: &orchestrator_mission_id,
@@ -914,7 +918,15 @@ fn run_session_turn_execution_inner(
             active_skill_name.as_deref(),
         ) {
             Ok(output) => output,
-            Err(error) => {
+            Err(SessionTurnRoundError::StreamInterruptedRecovered) => {
+                stream_interruption_recovery_attempts += 1;
+                round_limit = round_limit
+                    .max(round.saturating_add(2))
+                    .min(MAX_TOOL_CALL_ROUNDS);
+                round = round.saturating_add(1);
+                continue;
+            }
+            Err(SessionTurnRoundError::Failed(error)) => {
                 if !request_turn_is_writable(session_store, &request) {
                     return Ok(SessionTurnExecutionOutput::interrupted());
                 }
@@ -1284,6 +1296,7 @@ struct SessionTurnRoundRuntime<'a> {
     tools: Option<Vec<ChatToolDefinition>>,
     messages: &'a mut Vec<ChatMessage>,
     completed_required_tool_names: &'a [String],
+    stream_interruption_recovery_attempts: usize,
     round: usize,
     /// session 主线 thread：该 turn 内所有 session_turn_item 的 source_thread_id。
     orchestrator_thread_id: &'a magi_core::ThreadId,
@@ -1300,6 +1313,13 @@ struct SessionTurnRoundOutput {
     activated_skill_id: Option<String>,
     content_recovery_needed: bool,
     interrupted: bool,
+}
+
+/// 单轮流式调用的失败语义。流中断已被完整保存并可继续时，不应直接收口整个会话。
+#[derive(Debug)]
+enum SessionTurnRoundError {
+    Failed(String),
+    StreamInterruptedRecovered,
 }
 
 fn record_completed_required_tools(
@@ -1381,7 +1401,7 @@ fn stream_session_turn_round(
     skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
     skill_dispatch_runtime: Option<&magi_skill_runtime::SkillDispatchRuntime>,
     skill_name: Option<&str>,
-) -> Result<SessionTurnRoundOutput, String> {
+) -> Result<SessionTurnRoundOutput, SessionTurnRoundError> {
     let SessionTurnRoundRuntime {
         client,
         event_bus,
@@ -1396,6 +1416,7 @@ fn stream_session_turn_round(
         tools,
         messages,
         completed_required_tool_names,
+        stream_interruption_recovery_attempts,
         round,
         orchestrator_thread_id,
         orchestrator_mission_id,
@@ -1587,14 +1608,16 @@ fn stream_session_turn_round(
             retry_event,
         );
     };
+    let invocation_request = ModelInvocationRequest {
+        provider: BUSINESS_MODEL_PROVIDER.to_string(),
+        prompt: prompt.to_string(),
+        messages: Some(messages.clone()),
+        tools: tools.clone(),
+        tool_choice,
+    };
+    let non_stream_fallback_template = invocation_request.clone();
     let response = match client.invoke_streaming_with_cancellation(
-        ModelInvocationRequest {
-            provider: BUSINESS_MODEL_PROVIDER.to_string(),
-            prompt: prompt.to_string(),
-            messages: Some(messages.clone()),
-            tools: tools.clone(),
-            tool_choice,
-        },
+        invocation_request,
         &on_delta,
         &on_retry,
         &|| !request_turn_is_writable(session_store, request),
@@ -1623,14 +1646,143 @@ fn stream_session_turn_round(
                     session_id: &request.session_id,
                     workspace_id: &request.workspace_id,
                     binding: usage_binding,
-                    call_id,
+                    call_id: call_id.clone(),
                     usage: None,
                     status: UsageCallStatus::Failed,
                     assignment_id: None,
                     error_code: Some(classification.code.to_string()),
                 },
             );
-            return Err(raw_error);
+            if classification.code != "model_stream_interrupted" {
+                return Err(SessionTurnRoundError::Failed(raw_error));
+            }
+
+            let partial_visible_content = streamed_visible_content.borrow().trim().to_string();
+            let partial_thinking = streamed_thinking.borrow().trim().to_string();
+            if !partial_thinking.is_empty() {
+                let mut thinking_item = session_turn_item(
+                    "assistant_thinking",
+                    "completed",
+                    Some("模型思考".to_string()),
+                    Some(partial_thinking),
+                    Some(thinking_item_id.clone()),
+                    orchestrator_thread_id.clone(),
+                );
+                apply_request_aliases(&mut thinking_item, request);
+                apply_goal_turn_intermediate_visibility(&mut thinking_item, request);
+                if let Some(published) =
+                    upsert_session_turn_item(session_store, &request.session_id, thinking_item)
+                {
+                    persist_session_state_checkpoint(
+                        persist_session_state,
+                        "session_turn_stream_interrupted_thinking",
+                    );
+                    publish_session_turn_item_event(
+                        event_bus,
+                        &request.session_id,
+                        &request.workspace_id,
+                        &published,
+                    );
+                }
+            }
+            if !partial_visible_content.is_empty() {
+                let mut stream_item = session_turn_item(
+                    "assistant_stream",
+                    "completed",
+                    Some("生成回复".to_string()),
+                    Some(partial_visible_content.clone()),
+                    Some(stream_item_id.clone()),
+                    orchestrator_thread_id.clone(),
+                );
+                apply_request_aliases(&mut stream_item, request);
+                apply_goal_turn_intermediate_visibility(&mut stream_item, request);
+                if let Some(published) =
+                    upsert_session_turn_item(session_store, &request.session_id, stream_item)
+                {
+                    persist_session_state_checkpoint(
+                        persist_session_state,
+                        "session_turn_stream_interrupted_content",
+                    );
+                    publish_session_turn_item_event(
+                        event_bus,
+                        &request.session_id,
+                        &request.workspace_id,
+                        &published,
+                    );
+                }
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(partial_visible_content.clone()),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(
+                    model_stream_interruption_recovery_prompt(!partial_visible_content.is_empty())
+                        .to_string(),
+                ),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            });
+            if stream_interruption_recovery_attempts
+                < MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS
+            {
+                tracing::warn!(
+                    session_id = %request.session_id,
+                    round,
+                    attempt = stream_interruption_recovery_attempts + 1,
+                    max_attempts = MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS,
+                    preserved_visible_chars = partial_visible_content.len(),
+                    ?error,
+                    "模型流中断，保留片段后继续会话"
+                );
+                return Err(SessionTurnRoundError::StreamInterruptedRecovered);
+            }
+
+            let mut fallback_request = non_stream_fallback_template;
+            fallback_request.messages = Some(messages.clone());
+            tracing::warn!(
+                session_id = %request.session_id,
+                round,
+                preserved_visible_chars = partial_visible_content.len(),
+                "流式恢复已耗尽，降级为非流式完成请求"
+            );
+            match client.invoke_with_cancellation(fallback_request, &|| {
+                !request_turn_is_writable(session_store, request)
+            }) {
+                Ok(response) => response,
+                Err(fallback_error) => {
+                    let fallback_raw_error = fallback_error.to_string();
+                    let fallback_classification =
+                        classify_model_invocation_error(&fallback_raw_error);
+                    publish_model_usage_record(
+                        event_bus,
+                        session_store,
+                        settings_store,
+                        crate::usage_recording::ModelUsageRecordInput {
+                            session_id: &request.session_id,
+                            workspace_id: &request.workspace_id,
+                            binding: usage_binding,
+                            call_id: format!("{call_id}-non-stream-fallback"),
+                            usage: None,
+                            status: UsageCallStatus::Failed,
+                            assignment_id: None,
+                            error_code: Some(fallback_classification.code.to_string()),
+                        },
+                    );
+                    tracing::error!(
+                        session_id = %request.session_id,
+                        round,
+                        ?fallback_error,
+                        "非流式降级请求失败"
+                    );
+                    return Err(SessionTurnRoundError::Failed(fallback_raw_error));
+                }
+            }
         }
     };
     let parsed = response.parse_chat_payload();
@@ -1998,7 +2150,10 @@ mod tests {
         TimelineEntry, TimelineEntryKind,
     };
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn ts(value: u64) -> UtcMillis {
         UtcMillis(value)
@@ -2292,6 +2447,12 @@ mod tests {
         message: String,
     }
 
+    struct InterruptedThenRecoveredSessionModelBridgeClient {
+        streaming_calls: AtomicUsize,
+        non_stream_calls: AtomicUsize,
+        fallback_messages: Mutex<Vec<ChatMessage>>,
+    }
+
     struct SteeringModelBridgeClient {
         registry: Arc<ConversationRegistry>,
         session_id: SessionId,
@@ -2483,6 +2644,48 @@ mod tests {
                 thinking: String::new(),
             });
             self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for InterruptedThenRecoveredSessionModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            self.non_stream_calls.fetch_add(1, Ordering::SeqCst);
+            *self
+                .fallback_messages
+                .lock()
+                .expect("fallback messages mutex poisoned") = request.messages.unwrap_or_default();
+            Ok(BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "content": "已通过非流式降级完成。",
+                    "finish_reason": "stop"
+                })
+                .to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            _request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            let attempt = self.streaming_calls.fetch_add(1, Ordering::SeqCst);
+            on_delta(&ModelStreamingDelta {
+                content: if attempt == 0 {
+                    "已保留的半截回复".to_string()
+                } else {
+                    "，后续流仍然中断".to_string()
+                },
+                thinking: String::new(),
+            });
+            Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::Transport,
+                code: Some(-32005),
+                message: "provider stream interrupted: missing terminal SSE event".to_string(),
+            })
         }
     }
 
@@ -2846,7 +3049,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_stream_failure_marks_turn_failed_instead_of_completed() {
+    fn partial_stream_failure_preserves_output_before_terminal_fallback_failure() {
         let session_id = SessionId::new("session-partial-stream-failure");
         let store = SessionStore::new();
         store
@@ -2944,12 +3147,125 @@ mod tests {
                 && item.content.as_deref() == Some(error.public_message.as_str())
         }));
         assert!(
-            !turn
-                .items
-                .iter()
-                .any(|item| item.kind == "assistant_stream" && item.status == "completed"),
-            "半截流失败后不能把 assistant_stream 结算为 completed"
+            turn.items.iter().any(|item| {
+                item.kind == "assistant_stream"
+                    && item.status == "completed"
+                    && item.content.as_deref() == Some("这是一段半截输出")
+            }),
+            "流中断时必须保留已经展示给用户的内容"
         );
+    }
+
+    #[test]
+    fn session_turn_recovers_after_repeated_partial_stream_interruptions() {
+        let session_id = SessionId::new("session-stream-recovery");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "stream recovery")
+            .expect("session should be creatable");
+        let (_mission_id, orchestrator_thread_id) =
+            store.ensure_session_mission(&session_id, ts(1_500), || {
+                magi_core::MissionId::new("mission-stream-recovery")
+            });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-stream-recovery".to_string(),
+                    turn_seq: 1,
+                    accepted_at: ts(1_500),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("请输出完整回复".to_string()),
+                    items: vec![session_turn_item(
+                        "user_message",
+                        "completed",
+                        None,
+                        Some("请输出完整回复".to_string()),
+                        Some("user-stream-recovery".to_string()),
+                        orchestrator_thread_id,
+                    )],
+                },
+            )
+            .expect("current turn should be stored");
+        let client = InterruptedThenRecoveredSessionModelBridgeClient {
+            streaming_calls: AtomicUsize::new(0),
+            non_stream_calls: AtomicUsize::new(0),
+            fallback_messages: Mutex::new(Vec::new()),
+        };
+        let event_bus = InMemoryEventBus::new(32);
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: "turn-stream-recovery".to_string(),
+            workspace_id: None,
+            prompt: "请输出完整回复".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: false,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
+            workspace_root_path: None,
+        };
+
+        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &store,
+            conversation_registry: &ConversationRegistry::new(),
+            plan_store: &crate::test_plan_store("test-plan"),
+            settings_store: None,
+            safety_gate: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            snapshot_manager: None,
+            request,
+            prompt: "请输出完整回复".to_string(),
+            knowledge_context_prompt: None,
+            tools: None,
+            persist_session_state: None,
+            live_settings_store: None,
+            model_switch_recovery: None,
+        })
+        .expect("流中断应由非流式降级完成");
+
+        assert_eq!(output.final_content, "已通过非流式降级完成。");
+        assert_eq!(
+            client.streaming_calls.load(Ordering::SeqCst),
+            MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS + 1
+        );
+        assert_eq!(client.non_stream_calls.load(Ordering::SeqCst), 1);
+        let fallback_messages = client
+            .fallback_messages
+            .lock()
+            .expect("fallback messages mutex poisoned");
+        assert_eq!(
+            fallback_messages
+                .iter()
+                .filter(|message| {
+                    message.role == "user"
+                        && message
+                            .content
+                            .as_deref()
+                            .is_some_and(|content| content.contains("已保留此前可见内容"))
+                })
+                .count(),
+            MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS + 1
+        );
+        let turn = store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("completed turn should remain visible");
+        assert_eq!(turn.status, "completed");
+        assert!(turn.items.iter().all(|item| item.kind != "assistant_error"));
     }
 
     #[test]
@@ -3139,6 +3455,7 @@ mod tests {
                 tools: None,
                 messages: &mut messages,
                 completed_required_tool_names: &[],
+                stream_interruption_recovery_attempts: 0,
                 snapshot_manager: None,
                 round: 0,
                 orchestrator_thread_id: &orchestrator_thread_id,
@@ -3263,6 +3580,7 @@ mod tests {
                 tools: None,
                 messages: &mut messages,
                 completed_required_tool_names: &[],
+                stream_interruption_recovery_attempts: 0,
                 snapshot_manager: None,
                 round: 0,
                 orchestrator_thread_id: &orchestrator_thread_id,

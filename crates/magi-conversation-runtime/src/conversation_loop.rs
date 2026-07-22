@@ -27,8 +27,10 @@ use crate::{
 };
 use crate::{
     model_error::{
-        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, classify_model_invocation_error,
-        model_empty_response_recovery_prompt, provider_empty_assistant_response_error,
+        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS,
+        MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, classify_model_invocation_error,
+        model_empty_response_recovery_prompt, model_stream_interruption_recovery_prompt,
+        provider_empty_assistant_response_error,
     },
     prompt_utils::{
         PromptFragmentKind, current_turn_context_priority_prompt,
@@ -42,8 +44,8 @@ use crate::{
     },
 };
 use magi_bridge_client::{
-    ChatMessage, ChatToolCall, ChatToolDefinition, LOOPBACK_MODEL_PROVIDER, ModelBridgeClient,
-    ModelInvocationRequest, ModelStreamingDelta,
+    ChatMessage, ChatToolCall, ChatToolChoice, ChatToolDefinition, LOOPBACK_MODEL_PROVIDER,
+    ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta,
 };
 use magi_core::{
     EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskId, TaskStatus, ThreadId,
@@ -1050,6 +1052,8 @@ fn run_conversation_loop_inner(
     let mut last_stream_item_id: Option<String> = None;
     let mut had_tool_calls = false;
     let mut empty_response_recovery_attempts = 0usize;
+    let mut stream_interruption_recovery_attempts = 0usize;
+    let mut stream_interruption_non_stream_fallback_attempted = false;
     let turn_visibility = task_turn_visibility(
         task,
         is_sidechain,
@@ -1084,7 +1088,7 @@ fn run_conversation_loop_inner(
     }
 
     let tool_call_round_limit = tool_call_round_limit(&required_tool_chain);
-    for round in 0..tool_call_round_limit {
+    'conversation_round: for round in 0..tool_call_round_limit {
         append_task_runtime_signals(
             &mut messages,
             conversation_registry.drain_task_signals(session_id, task_id),
@@ -1123,17 +1127,37 @@ fn run_conversation_loop_inner(
         let thinking_publish_gate =
             std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
         let round_started_at = UtcMillis::now();
+        let agent_spawn_required = agent_spawn_required_by_task(task).is_some_and(|policy| {
+            agent_spawn_requirement_is_policy_reachable(task)
+                && task_store.get_children(&task.task_id).len()
+                    < usize::from(policy.minimum_agent_count)
+        });
+        let forced_agent_spawn = agent_spawn_required
+            .then(|| {
+                round_tools.as_ref().and_then(|definitions| {
+                    definitions
+                        .iter()
+                        .any(|definition| definition.function.name == "agent_spawn")
+                        .then(|| ChatToolChoice::force_function("agent_spawn"))
+                })
+            })
+            .flatten();
         let invocation_request = ModelInvocationRequest {
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: prompt.clone(),
             messages: Some(messages.clone()),
             tools: round_tools.clone(),
-            tool_choice: forced_task_tool_choice_for_round(
-                &required_tool_chain,
-                round_tools.as_ref(),
-                &completed_required_tool_names,
-            ),
+            // DeepSeek 等兼容模型会忽略纯文本的代理契约提示。只要尚未满足
+            // 子代理最小数量，就在每一轮强制其返回 agent_spawn function call。
+            tool_choice: forced_agent_spawn.or_else(|| {
+                forced_task_tool_choice_for_round(
+                    &required_tool_chain,
+                    round_tools.as_ref(),
+                    &completed_required_tool_names,
+                )
+            }),
         };
+        let non_stream_fallback_template = invocation_request.clone();
         let invocation_cancelled = || !task_lease_is_current(task_store, task_id, lease_id);
 
         let response = if streaming_entry_id.is_some() {
@@ -1171,54 +1195,178 @@ fn run_conversation_loop_inner(
                 );
             };
 
-            match client.invoke_streaming_with_cancellation(
-                invocation_request,
-                &on_delta,
-                &on_retry,
-                &invocation_cancelled,
-            ) {
-                Ok(response) => response,
-                Err(error) => {
-                    if invocation_cancelled() {
+            'streaming_invocation: {
+                match client.invoke_streaming_with_cancellation(
+                    invocation_request,
+                    &on_delta,
+                    &on_retry,
+                    &invocation_cancelled,
+                ) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if invocation_cancelled() {
+                            return (
+                                TaskOutcome::Failed {
+                                    error: "任务已中断".to_string(),
+                                },
+                                context_summary,
+                            );
+                        }
+                        let raw_error_message = error.to_string();
+                        let classification = classify_model_invocation_error(&raw_error_message);
+                        let error_message = classification.public_message.to_string();
+                        publish_model_usage_record(
+                            event_bus,
+                            session_store,
+                            settings_store,
+                            crate::usage_recording::ModelUsageRecordInput {
+                                session_id,
+                                workspace_id,
+                                binding: usage_binding,
+                                call_id: format!("task-{}-{}-{round}", task_id, lease_id),
+                                usage: None,
+                                status: UsageCallStatus::Failed,
+                                assignment_id: Some(lease_id.to_string()),
+                                error_code: Some(classification.code.to_string()),
+                            },
+                        );
+                        let partial_visible_content =
+                            streamed_visible_content.borrow().trim().to_string();
+                        let partial_thinking = streamed_thinking.borrow().trim().to_string();
+                        if classification.code == "model_stream_interrupted"
+                            && (stream_interruption_recovery_attempts
+                                < MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS
+                                || !stream_interruption_non_stream_fallback_attempted)
+                        {
+                            if !partial_thinking.is_empty() {
+                                upsert_task_thinking_turn_item(
+                                    turn_writeback_context,
+                                    &thinking_item_id,
+                                    "completed",
+                                    &partial_thinking,
+                                    None,
+                                    &thinking_publish_gate,
+                                );
+                            }
+                            if !partial_visible_content.is_empty() {
+                                upsert_task_stream_turn_item(
+                                    turn_writeback_context,
+                                    &stream_item_id,
+                                    "completed",
+                                    &partial_visible_content,
+                                    None,
+                                    &stream_publish_gate,
+                                );
+                                messages.push(ChatMessage {
+                                    role: "assistant".to_string(),
+                                    content: Some(partial_visible_content.clone()),
+                                    images: Vec::new(),
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                });
+                            }
+                            let recovery_prompt = model_stream_interruption_recovery_prompt(
+                                !partial_visible_content.is_empty(),
+                            );
+                            messages.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: Some(recovery_prompt.to_string()),
+                                images: Vec::new(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                            });
+                            if stream_interruption_recovery_attempts
+                                < MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS
+                            {
+                                stream_interruption_recovery_attempts += 1;
+                                tracing::warn!(
+                                    task_id = %task.task_id,
+                                    round = round,
+                                    attempt = stream_interruption_recovery_attempts,
+                                    max_attempts = MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS,
+                                    preserved_visible_chars = partial_visible_content.len(),
+                                    ?error,
+                                    "子代理模型流中断，保留片段后继续执行"
+                                );
+                                continue 'conversation_round;
+                            }
+
+                            stream_interruption_non_stream_fallback_attempted = true;
+                            let mut fallback_request = non_stream_fallback_template;
+                            fallback_request.messages = Some(messages.clone());
+                            tracing::warn!(
+                                task_id = %task.task_id,
+                                round = round,
+                                preserved_visible_chars = partial_visible_content.len(),
+                                "子代理流式恢复已耗尽，降级为非流式完成请求"
+                            );
+                            match client
+                                .invoke_with_cancellation(fallback_request, &invocation_cancelled)
+                            {
+                                Ok(response) => break 'streaming_invocation response,
+                                Err(fallback_error) => {
+                                    let fallback_classification = classify_model_invocation_error(
+                                        &fallback_error.to_string(),
+                                    );
+                                    let fallback_message =
+                                        fallback_classification.public_message.to_string();
+                                    publish_model_usage_record(
+                                        event_bus,
+                                        session_store,
+                                        settings_store,
+                                        crate::usage_recording::ModelUsageRecordInput {
+                                            session_id,
+                                            workspace_id,
+                                            binding: usage_binding,
+                                            call_id: format!(
+                                                "task-{}-{}-{round}-non-stream-fallback",
+                                                task_id, lease_id
+                                            ),
+                                            usage: None,
+                                            status: UsageCallStatus::Failed,
+                                            assignment_id: Some(lease_id.to_string()),
+                                            error_code: Some(
+                                                fallback_classification.code.to_string(),
+                                            ),
+                                        },
+                                    );
+                                    tracing::error!(
+                                        task_id = %task.task_id,
+                                        round = round,
+                                        ?fallback_error,
+                                        "子代理非流式降级请求失败"
+                                    );
+                                    if task_lease_is_current(task_store, task_id, lease_id) {
+                                        append_task_error_turn_item(
+                                            turn_writeback_context,
+                                            &fallback_message,
+                                            streaming_entry_id.or(last_stream_item_id.as_deref()),
+                                        );
+                                    }
+                                    return (
+                                        TaskOutcome::Failed {
+                                            error: fallback_message,
+                                        },
+                                        context_summary,
+                                    );
+                                }
+                            }
+                        }
+                        tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM streaming invocation failed");
+                        if task_lease_is_current(task_store, task_id, lease_id) {
+                            append_task_error_turn_item(
+                                turn_writeback_context,
+                                &error_message,
+                                streaming_entry_id.or(last_stream_item_id.as_deref()),
+                            );
+                        }
                         return (
                             TaskOutcome::Failed {
-                                error: "任务已中断".to_string(),
+                                error: error_message,
                             },
                             context_summary,
                         );
                     }
-                    let raw_error_message = error.to_string();
-                    let classification = classify_model_invocation_error(&raw_error_message);
-                    let error_message = classification.public_message.to_string();
-                    publish_model_usage_record(
-                        event_bus,
-                        session_store,
-                        settings_store,
-                        crate::usage_recording::ModelUsageRecordInput {
-                            session_id,
-                            workspace_id,
-                            binding: usage_binding,
-                            call_id: format!("task-{}-{}-{round}", task_id, lease_id),
-                            usage: None,
-                            status: UsageCallStatus::Failed,
-                            assignment_id: Some(lease_id.to_string()),
-                            error_code: Some(classification.code.to_string()),
-                        },
-                    );
-                    tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM streaming invocation failed");
-                    if task_lease_is_current(task_store, task_id, lease_id) {
-                        append_task_error_turn_item(
-                            turn_writeback_context,
-                            &error_message,
-                            streaming_entry_id.or(last_stream_item_id.as_deref()),
-                        );
-                    }
-                    return (
-                        TaskOutcome::Failed {
-                            error: error_message,
-                        },
-                        context_summary,
-                    );
                 }
             }
         } else {
@@ -2878,6 +3026,11 @@ mod tests {
     }
 
     struct FailingTaskModelBridgeClient;
+    struct InterruptedThenRecoveredTaskModelBridgeClient {
+        invoke_count: AtomicUsize,
+        non_stream_fallback_count: AtomicUsize,
+        recovery_messages: Mutex<Vec<ChatMessage>>,
+    }
     struct StaticTaskFinalModelBridgeClient {
         content: &'static str,
     }
@@ -3219,6 +3372,54 @@ mod tests {
             _on_delta: &dyn Fn(&ModelStreamingDelta),
         ) -> Result<BridgeResponse, BridgeClientError> {
             self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for InterruptedThenRecoveredTaskModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            self.non_stream_fallback_count
+                .fetch_add(1, Ordering::SeqCst);
+            *self
+                .recovery_messages
+                .lock()
+                .expect("recovery messages mutex poisoned") = request.messages.unwrap_or_default();
+            Ok(BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "content": "半截子代理回复，已由非流式降级完成。",
+                    "finish_reason": "stop"
+                })
+                .to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            let attempt = self.invoke_count.fetch_add(1, Ordering::SeqCst);
+            let (content, thinking) = if attempt == 0 {
+                ("半截子代理回复", "子代理正在分析")
+            } else {
+                ("，第二次中断前的续写", "子代理继续分析")
+            };
+            on_delta(&ModelStreamingDelta {
+                content: content.to_string(),
+                thinking: thinking.to_string(),
+            });
+            *self
+                .recovery_messages
+                .lock()
+                .expect("recovery messages mutex poisoned") = request.messages.unwrap_or_default();
+            Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::Transport,
+                code: Some(-32005),
+                message: "provider stream interrupted: missing terminal SSE event".to_string(),
+            })
         }
     }
 
@@ -5389,6 +5590,163 @@ mod tests {
             terminal_error_event.payload["current_turn"]["response_duration_ms"].is_number(),
             "terminal error event must carry backend duration for live UI"
         );
+    }
+
+    #[test]
+    fn conversation_loop_recovers_subagent_after_partial_stream_interruption() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(64);
+        let session_id = SessionId::new("session-subagent-stream-recovery");
+        let workspace_id = Some(WorkspaceId::new("workspace-subagent-stream-recovery"));
+        let task_id = TaskId::new("task-subagent-stream-recovery");
+        let worker_id = WorkerId::new("worker-subagent-stream-recovery");
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "subagent stream recovery session",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-subagent-stream-recovery".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("验证子代理流式恢复".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be creatable");
+
+        let task_store = TaskStore::new();
+        let mut task = make_task_loop_test_task(task_id.as_str());
+        task.parent_task_id = Some(TaskId::new("task-subagent-stream-recovery-root"));
+        task_store.insert_task(task.clone());
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "executor",
+                60_000,
+            )
+            .expect("lease should be granted");
+        let now = UtcMillis::now();
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
+        let worker_thread_id = ThreadId::new("thread-subagent-stream-recovery");
+        session_store.register_thread(ExecutionThread {
+            thread_id: worker_thread_id.clone(),
+            session_id: session_id.clone(),
+            mission_id: task.mission_id.clone(),
+            role_id: "executor".to_string(),
+            worker_instance_id: worker_id.clone(),
+            status: ExecutionThreadStatus::Active,
+            created_at: now,
+            last_used_at: now,
+            handled_task_ids: vec![task.task_id.clone()],
+            message_history: Vec::new(),
+        });
+        let client = InterruptedThenRecoveredTaskModelBridgeClient {
+            invoke_count: AtomicUsize::new(0),
+            non_stream_fallback_count: AtomicUsize::new(0),
+            recovery_messages: Mutex::new(Vec::new()),
+        };
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
+            conversation_registry: &ConversationRegistry::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
+            plan_store: &crate::test_plan_store("test-plan"),
+            project_memory: None,
+            mission_metrics: None,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "请执行子代理任务".to_string(),
+            images: Vec::new(),
+            tools: None,
+            usage_binding: &usage_binding,
+            streaming_entry_id: Some("timeline-subagent-stream-recovery"),
+            is_sidechain: true,
+            worker_id: Some(&worker_id),
+            thread_id: &worker_thread_id,
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
+            persist_session_state: None,
+        });
+
+        assert!(matches!(outcome, TaskOutcome::Completed { .. }));
+        assert_eq!(
+            client.invoke_count.load(Ordering::SeqCst),
+            MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS + 1
+        );
+        assert_eq!(
+            client.non_stream_fallback_count.load(Ordering::SeqCst),
+            1,
+            "连续流中断耗尽后必须恰好降级一次非流式请求"
+        );
+        let recovery_messages = client
+            .recovery_messages
+            .lock()
+            .expect("recovery messages mutex poisoned");
+        assert!(recovery_messages.iter().any(|message| {
+            message.role == "assistant"
+                && message.content.as_deref() == Some("，第二次中断前的续写")
+        }));
+        assert_eq!(
+            recovery_messages
+                .iter()
+                .filter(|message| {
+                    message.role == "user"
+                        && message
+                            .content
+                            .as_deref()
+                            .is_some_and(|content| content.contains("已保留此前可见内容"))
+                })
+                .count(),
+            MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS + 1
+        );
+
+        let turn = session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("turn should exist");
+        assert!(turn.items.iter().any(|item| {
+            item.kind == "assistant_stream"
+                && item.status == "completed"
+                && item.content.as_deref() == Some("半截子代理回复")
+                && item.source_thread_id == worker_thread_id
+        }));
+        assert!(turn.items.iter().any(|item| {
+            item.kind == "assistant_stream"
+                && item.status == "completed"
+                && item.content.as_deref() == Some("，第二次中断前的续写")
+                && item.source_thread_id == worker_thread_id
+        }));
+        assert!(turn.items.iter().all(|item| item.kind != "assistant_error"));
+        assert_ne!(orchestrator_thread_id, worker_thread_id);
     }
 
     #[test]

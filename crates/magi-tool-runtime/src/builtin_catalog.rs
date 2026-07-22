@@ -671,6 +671,8 @@ impl BuiltinToolName {
                 - 已知道具体工具且要完成任务 → 直接调用对应工具\n\n\
                 # 说明\n\
                 - 内置工具读取 BuiltinToolName::ALL 单一注册源\n\
+                - `runtime_internal=true` 只表示必须由对应运行时路由执行，不表示模型不可调用；请以每项 `model_call_scope` 和当前请求实际收到的 tools 定义为准\n\
+                - `model_call_scope=coordinator_task_only` 的 agent_spawn / agent_send / agent_wait 只能由任务执行链中的 root coordinator 调用，普通会话和 goal 主线不会收到这些工具\n\
                 - 外接工具只读取 daemon 注入的 skill/MCP 运行时快照，不扫描文件系统"
             }
             Self::GitStatus => {
@@ -719,7 +721,7 @@ impl BuiltinToolName {
                 "更新当前会话 Goal 的终态。模型只能把目标标记为 complete 或 blocked；pause、budget_limited、usage_limited 由用户或系统控制，不能由模型伪造。"
             }
             Self::AgentSpawn => {
-                "向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。必须同时提供结构化 context_package；子代理不会自动继承主对话近期记录。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若运行中需要补充上下文，使用 agent_send。\n\n\
+                "【模型可直接调用，但仅限任务执行链中的 root coordinator】向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。必须同时提供结构化 context_package；它必须是 function arguments 内的 JSON 对象，不能把对象二次编码成字符串。子代理不会自动继承主对话近期记录。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若运行中需要补充上下文，使用 agent_send。\n\n\
                 # 何时用\n\
                 - 任务可拆出 1 个或多个明确边界的子工作单元，且子单元能独立完成（有清晰输入、输出、验收）\n\
                 - 需要专家视角（reviewer 做代码审查、explorer 做根因定位、tester 做验证）\n\

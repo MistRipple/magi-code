@@ -1739,10 +1739,24 @@ fn parse_agent_context_package(
     now: UtcMillis,
     sequence: u64,
 ) -> Result<AgentContextPackage, String> {
-    let value = parsed
-        .get("context_package")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| "agent_spawn 缺少结构化 context_package".to_string())?;
+    // 部分 OpenAI-compatible 模型会把嵌套 object 二次序列化为 JSON 字符串。
+    // 这里统一在 tool 参数边界还原一次，后续仍只接受同一份结构化合同，避免
+    // DeepSeek 等模型因合法内容的表示差异被错误拒绝。
+    let context_package = match parsed.get("context_package") {
+        Some(serde_json::Value::Object(_)) => parsed
+            .get("context_package")
+            .cloned()
+            .expect("context_package object should remain present"),
+        Some(serde_json::Value::String(encoded)) => {
+            serde_json::from_str(encoded).map_err(|_| {
+                "agent_spawn 的 context_package 必须是对象或可解析为对象的 JSON 字符串".to_string()
+            })?
+        }
+        _ => return Err("agent_spawn 缺少结构化 context_package".to_string()),
+    };
+    let value = context_package
+        .as_object()
+        .ok_or_else(|| "agent_spawn 的 context_package 必须是结构化对象".to_string())?;
     let summary = required_bounded_context_text(
         value.get("summary"),
         "context_package.summary",
@@ -1767,11 +1781,10 @@ fn parse_agent_context_package(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let references_value = value
-        .get("references")
-        .ok_or_else(|| "context_package.references 必须是数组".to_string())?;
+    // 空引用列表不承载额外事实，兼容模型省略该字段时等同于 []。
+    // 显式传入非数组值仍由解析器拒绝，避免放宽结构校验。
     let references =
-        parse_agent_context_references(Some(references_value), now, sequence, "spawn")?;
+        parse_agent_context_references(value.get("references"), now, sequence, "spawn")?;
     Ok(AgentContextPackage {
         package_id: format!(
             "agent-context-{}-{}-{sequence}",
@@ -3230,6 +3243,34 @@ mod tests {
             "task:task-agent-context-parent:evidence:0"
         );
         assert!(package.render_for_prompt().contains("context_read"));
+    }
+
+    #[test]
+    fn agent_spawn_context_package_accepts_model_json_string_encoding() {
+        let parent = test_task(
+            "task-agent-context-string-parent",
+            "task-agent-context-string-root",
+            None,
+        );
+        let package = serde_json::json!({
+            "summary": "检查配置文件",
+            "constraints": ["只读，不修改文件"],
+            "expected_output": "明确报告文件是否存在",
+            "references": []
+        });
+        let parsed = serde_json::json!({
+            "context_package": serde_json::to_string(&package)
+                .expect("context package JSON should serialize")
+        });
+
+        let parsed_package =
+            parse_agent_context_package(&parsed, &parent.task_id, UtcMillis(101), 8).expect(
+                "JSON-string encoded model argument should restore to a structured package",
+            );
+
+        assert_eq!(parsed_package.summary, "检查配置文件");
+        assert_eq!(parsed_package.constraints, vec!["只读，不修改文件"]);
+        assert_eq!(parsed_package.references.len(), 0);
     }
 
     #[test]

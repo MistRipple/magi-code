@@ -106,6 +106,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertParallelAgentSpawnUsesTaskIdTabs(reducer, projection, timelineRenderItems);
   assertAgentTerminalOutputExtractsFinalText(agentOutput);
   assertBootstrapProcessingStateFromRunningCanonicalTurn(contract);
+  assertBootstrapCountsOnlySpawnedAgents(contract);
   assertBootstrapProcessingStateIgnoresForeignSessionRunningTurn(contract);
   assertBootstrapProcessingStateIgnoresTerminalCanonicalTurn(contract);
   assertBootstrapCarriesPendingChanges(contract);
@@ -119,6 +120,8 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertCanonicalTurnModelRejectsSnakeCase(canonicalProtocol);
   assertCanonicalStreamPayloadParsesWithoutSnapshots(canonicalProtocol);
   assertCanonicalStreamDeltaUpdatesOneItem(reducer, projection);
+  assertCanonicalStreamKeepsSanitizedFailureStable(reducer, canonicalProtocol);
+  assertCanonicalStreamGapRequestsRecovery(reducer);
   assertCanonicalBlocksProjectToFirstClassCards(reducer, projection);
   assertBootstrapSeedsCanonicalEventWatermark(reducer);
   assertUnknownCanonicalBlockHasNoTextFallback(blockRegistry);
@@ -438,6 +441,83 @@ function assertCanonicalStreamDeltaUpdatesOneItem(reducer, projection) {
   }));
   assert.equal(overlapped.error, undefined, 'bootstrap-covered delta prefix should reconcile without recovery');
   assert.equal(overlapped.state.turns[0].items[1].content, '你好呀');
+}
+
+function assertCanonicalStreamKeepsSanitizedFailureStable(reducer, canonicalProtocol) {
+  const c = baseCase('sanitized-stream-failure', 'session-golden-sanitized-stream', 'turn-golden-sanitized-stream', 12_500);
+  const rawFailure = 'provider response invalid: upstream rejected the request';
+  const assistantItem = canonicalProtocol.normalizeCanonicalTurnItem({
+    sessionId: c.sessionId,
+    turnId: c.turnId,
+    turnSeq: c.turnSeq,
+    itemId: 'assistant-stream',
+    itemSeq: 1,
+    kind: 'assistant_text',
+    createdAt: c.turnSeq,
+    updatedAt: c.turnSeq,
+    status: 'running',
+    itemVersion: 1,
+    content: rawFailure,
+    sourceThreadId: `thread-orchestrator-${c.sessionId}`,
+    visibility: { renderable: true },
+  });
+  assert.ok(assistantItem, 'internal provider failure item must parse');
+  assert.equal(assistantItem.content, '模型请求未完成，可直接继续重试。');
+  assert.equal(assistantItem.metadata?.publicModelFailureSanitized, true);
+
+  let state = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'running', [assistantItem])]);
+  const skippedRawDelta = reducer.reduceCanonicalTurnEvent(state, event(c, 2, 'turn_item_upsert', {
+    stream: {
+      itemId: assistantItem.itemId,
+      itemVersion: 2,
+      itemStatus: 'running',
+      baseContentLength: Array.from(rawFailure).length,
+      delta: ' retrying',
+      contentLength: Array.from(`${rawFailure} retrying`).length,
+      reset: false,
+    },
+  }));
+  assert.equal(skippedRawDelta.error, undefined, 'sanitized failure must not be treated as a stream gap');
+  assert.equal(skippedRawDelta.state.turns[0].items[0].content, '模型请求未完成，可直接继续重试。');
+  assert.equal(skippedRawDelta.state.turns[0].items[0].itemVersion, 2);
+
+  state = skippedRawDelta.state;
+  const resumed = reducer.reduceCanonicalTurnEvent(state, event(c, 3, 'turn_item_upsert', {
+    stream: {
+      itemId: assistantItem.itemId,
+      itemVersion: 3,
+      itemStatus: 'running',
+      baseContentLength: Array.from(`${rawFailure} retrying`).length,
+      delta: '已恢复输出',
+      contentLength: 5,
+      reset: true,
+    },
+  }));
+  assert.equal(resumed.error, undefined, 'stream reset must resume normal output after a sanitized failure');
+  assert.equal(resumed.state.turns[0].items[0].content, '已恢复输出');
+  assert.equal(resumed.state.turns[0].items[0].metadata?.publicModelFailureSanitized, undefined);
+}
+
+function assertCanonicalStreamGapRequestsRecovery(reducer) {
+  const c = baseCase('stream-gap-recovery', 'session-golden-stream-gap', 'turn-golden-stream-gap', 12_750);
+  const assistantItem = assistantText(c, 1, 'assistant-stream', '当前内容', 'running');
+  assistantItem.itemVersion = 1;
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'running', [assistantItem])]);
+  const gapped = reducer.reduceCanonicalTurnEvent(state, event(c, 2, 'turn_item_upsert', {
+    stream: {
+      itemId: assistantItem.itemId,
+      itemVersion: 2,
+      itemStatus: 'running',
+      baseContentLength: 8,
+      delta: '缺失后的增量',
+      contentLength: 13,
+      reset: false,
+    },
+  }));
+  assert.equal(gapped.error, undefined, 'stream baseline gap must be recoverable rather than reported as a reducer error');
+  assert.equal(gapped.recoveryRequired, true, 'stream baseline gap must request an authoritative snapshot');
+  assert.equal(gapped.state.turns[0].items[0].content, '当前内容', 'gapped delta must not be guessed or appended');
+  assert.equal(gapped.state.turns[0].items[0].itemVersion, 2, 'gapped event version must be consumed before recovery');
 }
 
 function assertCanonicalBlocksProjectToFirstClassCards(reducer, projection) {
@@ -2168,6 +2248,75 @@ function assertBootstrapProcessingStateFromRunningCanonicalTurn(contract) {
     bootstrap.state.processingState?.pendingRequestIds,
     ['request-bootstrap-running'],
     'bootstrap should recover only the root request and ignore same-turn guide request ids',
+  );
+}
+
+function assertBootstrapCountsOnlySpawnedAgents(contract) {
+  const c = baseCase(
+    'bootstrap-agent-count',
+    'session-bootstrap-agent-count',
+    'turn-bootstrap-agent-count',
+    7_200,
+  );
+  const rootTaskId = 'task-bootstrap-agent-root';
+  const firstChildTaskId = 'task-bootstrap-agent-child-one';
+  const secondChildTaskId = 'task-bootstrap-agent-child-two';
+  const bootstrap = contract.normalizeRustBootstrapPayload({
+    generatedAt: 7_300,
+    currentSession: {
+      sessionId: c.sessionId,
+      title: '代理计数',
+      createdAt: 7_200,
+      updatedAt: 7_300,
+      messageCount: 1,
+    },
+    sessions: [{
+      sessionId: c.sessionId,
+      title: '代理计数',
+      createdAt: 7_200,
+      updatedAt: 7_300,
+      messageCount: 1,
+    }],
+    runtimeReadModel: {
+      details: {
+        assignments: [
+          {
+            assignment_id: 'lease-model-call',
+            mission_id: null,
+            task_ids: [],
+            current_status: null,
+          },
+        ],
+        sessions: [{
+          session_id: c.sessionId,
+          root_task_id: rootTaskId,
+          root_task_status: 'running',
+          active_branches: [
+            { task_id: rootTaskId, worker_id: 'coordinator', status: 'running', is_primary: true },
+            { task_id: firstChildTaskId, worker_id: 'explorer-one', status: 'running', is_primary: false },
+            { task_id: secondChildTaskId, worker_id: 'explorer-two', status: 'completed', is_primary: false },
+          ],
+        }],
+        tasks: [
+          { task_id: rootTaskId, title: '主线任务', current_status: 'running' },
+          { task_id: firstChildTaskId, title: '文档探索', current_status: 'running' },
+          { task_id: secondChildTaskId, title: '配置检查', current_status: 'completed' },
+        ],
+      },
+    },
+  }, { sessionId: c.sessionId });
+
+  const assignments = bootstrap.orchestratorRuntimeState?.assignments ?? [];
+  assert.deepEqual(
+    assignments.map((assignment) => assignment.assignmentId),
+    [firstChildTaskId, secondChildTaskId],
+    'runtime agent count must exclude the primary coordinator branch',
+  );
+  assert.equal(assignments.length, 2, 'two spawned agents must render as two agents');
+  assert.equal(
+    assignments.some((assignment) => assignment.assignmentId === 'lease-model-call'),
+    false,
+    'model call lease must not be counted as a spawned agent',
   );
 }
 
