@@ -114,6 +114,12 @@ function handleWorkspaceSessionDetached(
   payload: Record<string, unknown>,
   sessions: Session[],
 ): void {
+  const draftConfig = payload.orchestratorSessionConfig;
+  const nextDraftConfig = draftConfig
+    && typeof draftConfig === 'object'
+    && !Array.isArray(draftConfig)
+    ? draftConfig as Record<string, unknown>
+    : {};
   batchWebviewStatePersistence(() => {
     messagesState.sessionHydrating = false;
     const hasPendingLocalTurn = messagesState.pendingRequests.size > 0;
@@ -141,6 +147,7 @@ function handleWorkspaceSessionDetached(
       clearCanonicalSessionTurns();
     }
     setOrchestratorRuntimeState(null);
+    messagesState.draftOrchestratorSessionConfig = { ...nextDraftConfig };
     setAppState({
       ...buildEmptyWorkspaceAppState(Date.now()),
       currentSessionId: '',
@@ -1020,6 +1027,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       messagesState.currentWorkspacePath = workspacePath;
       updateSessions(sessions);
       setCurrentSessionId(null);
+      messagesState.draftOrchestratorSessionConfig = {};
       clearStaleSettingsBootstrapSnapshot();
       setSessionHistoryState(null, { workspaceId });
       setAppState({
@@ -1049,6 +1057,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   if (isSameSession) {
     batchWebviewStatePersistence(() => {
       messagesState.sessionHydrating = false;
+      messagesState.draftOrchestratorSessionConfig = {};
       const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
       const sessions = ensureArray(snapshot.sessions) as Session[];
       messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
@@ -1112,6 +1121,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   // 跨 session 切换：完整重建
   batchWebviewStatePersistence(() => {
     messagesState.sessionHydrating = false;
+    messagesState.draftOrchestratorSessionConfig = {};
     // skipAntiLiftBack: 跨 session 切换后紧接着 applyAuthoritativeProcessingState
     // 恢复新会话的权威状态，不能让防回抬保护阻断新会话的 processing 写入
     clearAllMessages({

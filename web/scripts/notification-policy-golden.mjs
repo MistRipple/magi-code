@@ -25,7 +25,7 @@ await withGoldenViteServer(async (server) => {
     persistToCenter: true,
     countUnread: true,
     actionRequired: true,
-    displayMode: 'toast',
+    displayMode: 'silent',
     scope: 'workspace',
   });
 

@@ -48,3 +48,19 @@ export function withOrchestratorReasoningEffort(
     reasoningEffort,
   };
 }
+
+/**
+ * 提取新建会话需要继承的会话级主模型配置。
+ * 只复制模型和思考强度，不携带连接地址、密钥等全局配置。
+ */
+export function copyOrchestratorSessionConfig(
+  sessionConfig: Record<string, unknown> | null | undefined,
+  effectiveConfig: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const model = resolveOrchestratorModel(sessionConfig, effectiveConfig, []);
+  const reasoningEffort = resolveOrchestratorReasoningEffort(sessionConfig, effectiveConfig);
+  return {
+    ...(model ? { model } : {}),
+    reasoningEffort,
+  };
+}

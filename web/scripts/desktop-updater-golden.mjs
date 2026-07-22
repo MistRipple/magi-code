@@ -4,30 +4,27 @@ import path from 'node:path';
 import { withGoldenViteServer } from './golden-vite.mjs';
 
 const appSource = fs.readFileSync(path.resolve('src/App.svelte'), 'utf8');
-const promptSource = fs.readFileSync(path.resolve('src/components/DesktopUpdatePrompt.svelte'), 'utf8');
+const statusSource = fs.readFileSync(path.resolve('src/components/DesktopUpdateStatus.svelte'), 'utf8');
 const settingsSource = fs.readFileSync(path.resolve('src/components/SettingsPanel.svelte'), 'utf8');
+const headerSource = fs.readFileSync(path.resolve('src/components/Header.svelte'), 'utf8');
 const updaterSource = fs.readFileSync(path.resolve('src/lib/desktop-updater.ts'), 'utf8');
 const updaterStoreSource = fs.readFileSync(path.resolve('src/stores/desktop-updater.svelte.ts'), 'utf8');
 const desktopMainSource = fs.readFileSync(path.resolve('../apps/desktop/src/main.rs'), 'utf8');
 
-assert.match(appSource, /DesktopUpdatePrompt/, 'desktop startup must mount the update prompt');
-assert.match(
-  settingsSource,
-  /desktopUpdaterState/,
-  'desktop settings and the global prompt must share one updater state machine',
-);
+assert.doesNotMatch(appSource, /DesktopUpdatePrompt/, 'desktop updater must not mount a separate popup card');
+assert.match(statusSource, /desktopUpdaterState/, 'desktop header update status must use the shared updater state machine');
 assert.doesNotMatch(
   settingsSource,
-  /checkDesktopUpdate/,
-  'settings must not create a second native updater resource',
+  /desktopUpdaterState|checkForDesktopUpdate|downloadDesktopUpdate|restartWithDesktopUpdate/,
+  'settings must not own a second update control now that the header is the single update entry',
 );
-const currentVersionPosition = settingsSource.indexOf('current-version-label');
-const updateButtonPosition = settingsSource.indexOf('update-check-btn');
-assert.ok(currentVersionPosition >= 0, 'desktop settings must render the current version label');
-assert.ok(
-  currentVersionPosition < updateButtonPosition,
-  'the current version label must appear before the update button',
-);
+assert.match(statusSource, /currentVersion/, 'desktop header must show the current application version');
+assert.match(statusSource, /startDesktopUpdater/, 'desktop header must own the single updater lifecycle');
+assert.match(statusSource, /downloadDesktopUpdate/, 'desktop header must expose download action');
+assert.match(statusSource, /restartWithDesktopUpdate/, 'desktop header must expose restart action');
+assert.match(headerSource, /DesktopUpdateStatus/, 'desktop header must mount the update status control');
+assert.doesNotMatch(statusSource, /header-update-popover|toggleOpen|role="dialog"/, 'desktop header update actions must not open a popup');
+assert.match(statusSource, /header-update-action--\$\{actionTone\}/, 'each updater phase must use a dedicated action color');
 
 assert.match(
   updaterStoreSource,
@@ -43,6 +40,11 @@ assert.match(
   updaterStoreSource,
   /lastCheckAttemptAt[\s\S]*DESKTOP_UPDATE_RETRY_INTERVAL_MS/,
   'failed automatic checks must use a bounded retry interval',
+);
+assert.match(
+  updaterSource,
+  /DESKTOP_UPDATE_CHECK_RETRY_DELAYS_MS[\s\S]*await check\(\)/,
+  'native update checks must retry transient release or network failures before surfacing an error',
 );
 assert.match(
   updaterStoreSource,
@@ -102,28 +104,10 @@ assert.match(
   'desktop host must register the complete staged update command set',
 );
 
-assert.match(promptSource, /phase === 'ready'/, 'download completion must enter a visible ready state');
-assert.match(promptSource, /app\.update\.restartNow/, 'ready prompt must offer immediate restart');
-assert.match(promptSource, /app\.update\.restartLater/, 'ready prompt must offer deferred restart');
 assert.match(
-  promptSource,
-  /function requestRestart\(\): void \{[\s\S]*restartWithDesktopUpdate\(\)/,
-  'immediate restart must directly invoke the installed update',
-);
-assert.match(
-  settingsSource,
-  /desktopUpdaterState\.phase === 'ready'[\s\S]*restartWithDesktopUpdate\(\)/,
-  'clicking the ready update action in settings must install and restart immediately',
-);
-assert.match(
-  promptSource,
-  /dismissDesktopUpdatePrompt\(\)/,
-  'restart later must only dismiss the prompt and keep the downloaded update staged',
-);
-assert.doesNotMatch(
-  promptSource,
-  /hasProtectedWork|restartConfirmationOpen|restartConfirmActiveWork/,
-  'immediate restart must not insert a second confirmation flow',
+  statusSource,
+  /phase === 'ready'[\s\S]*restartWithDesktopUpdate\(\)/,
+  'clicking the ready update action in the header must install and restart immediately',
 );
 const downloadFunctionSource = updaterStoreSource.match(
   /export async function downloadDesktopUpdate[\s\S]*?(?=\nexport async function restartWithDesktopUpdate)/,
@@ -139,11 +123,7 @@ assert.doesNotMatch(
   'download completion must never install or restart automatically',
 );
 assert.doesNotMatch(settingsSource, /desktop-update-progress/, 'settings must not render a download progress bar');
-assert.doesNotMatch(promptSource, /desktop-update-progress/, 'global prompt must not render a download progress bar');
-assert.match(settingsSource, /downloadingProgress/, 'settings update control must show the trusted download percentage');
-assert.match(promptSource, /update-download-percent/, 'global prompt must show the trusted download percentage');
-assert.match(promptSource, /app\.update\.progressUnknown/, 'global prompt must explain when the file size is unavailable');
-assert.doesNotMatch(promptSource, /role="progressbar"/, 'global prompt must not expose a misleading progress bar');
+assert.match(statusSource, /progress\?\.percent/, 'header update control must show the trusted download percentage');
 
 await withGoldenViteServer(async (server) => {
   const updater = await server.ssrLoadModule('/src/lib/desktop-updater.ts');

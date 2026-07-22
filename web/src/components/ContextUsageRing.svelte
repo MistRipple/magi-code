@@ -178,11 +178,6 @@
       <span>{i18n.t('input.contextRing.label')}</span>
       <strong>{view.labelText}</strong>
     </div>
-    {#if model}
-      <div class="context-popover-model" title={model}>
-        {i18n.t('input.contextRing.model', { model })}
-      </div>
-    {/if}
     {#if view.hasData}
       <div class="context-popover-list">
         {#each detailItems as item (item.key)}
@@ -375,14 +370,6 @@
 
   .context-popover-empty {
     color: var(--foreground-muted);
-  }
-
-  .context-popover-model {
-    max-width: 238px;
-    overflow: hidden;
-    color: var(--foreground-muted);
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
   .context-window-editor {

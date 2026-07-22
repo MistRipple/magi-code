@@ -19,6 +19,7 @@
   let railRef: HTMLDivElement | null = $state(null);
   let markerListRef: HTMLDivElement | null = $state(null);
   let previewRef: HTMLDivElement | null = $state(null);
+  let capsuleRef: HTMLDivElement | null = $state(null);
   let markerPositions = $state<Record<string, number>>({});
   let markerStrengths = $state<Record<string, number>>({});
   let activeTurnId = $state('');
@@ -203,6 +204,24 @@
   });
 
   $effect(() => {
+    if (!menuOpen || !capsuleRef) return;
+    const handleOutsidePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && capsuleRef?.contains(target)) return;
+      menuOpen = false;
+    };
+    const handleKeydown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') menuOpen = false;
+    };
+    document.addEventListener('pointerdown', handleOutsidePointerDown, true);
+    document.addEventListener('keydown', handleKeydown);
+    return () => {
+      document.removeEventListener('pointerdown', handleOutsidePointerDown, true);
+      document.removeEventListener('keydown', handleKeydown);
+    };
+  });
+
+  $effect(() => {
     if (!activeTurnId && items.length > 0) activeTurnId = items[items.length - 1]?.turnId || '';
     if (activeTurnId && !items.some((item) => item.turnId === activeTurnId)) {
       activeTurnId = items[items.length - 1]?.turnId || '';
@@ -296,7 +315,7 @@
       {/if}
     </div>
 
-    <div class="turn-navigation-capsule" class:open={menuOpen}>
+    <div class="turn-navigation-capsule" class:open={menuOpen} bind:this={capsuleRef}>
       {#if menuOpen}
         <div class="turn-navigation-menu" role="menu">
           <div class="turn-navigation-menu-title">{i18n.t('messageList.turnNavigation.menuTitle')}</div>

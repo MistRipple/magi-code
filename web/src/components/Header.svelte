@@ -7,6 +7,7 @@
   import Icon from './Icon.svelte';
   import NotificationCenter from './NotificationCenter.svelte';
   import LanAccessPanel from './LanAccessPanel.svelte';
+  import DesktopUpdateStatus from './DesktopUpdateStatus.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { getWebSidebarContext } from '../web/sidebar-context';
   import {
@@ -120,6 +121,7 @@
 
   <!-- 右侧操作按钮 -->
   <div class="header-actions">
+    <DesktopUpdateStatus />
     <button class="btn-icon header-action-btn" onclick={newSession} title={newSessionTitle} disabled={newSessionDisabled}>
       <Icon name="plus" size={14} />
     </button>

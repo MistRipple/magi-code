@@ -153,6 +153,7 @@ import {
 import { resolveModelListFetchBlockReason } from '../model-governance';
 import type { OrchestratorRuntimeSnapshot, QueuedMessage } from '../../types/message';
 import { canGuideQueuedMessage, queuedMessageText } from '../../lib/queued-message-guidance';
+import { copyOrchestratorSessionConfig } from '../orchestrator-session-config';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
 const pendingBridgeMessages: ClientBridgeMessage[] = [];
@@ -2374,11 +2375,31 @@ function dispatchWorkspaceSessionDetached(
   workspacePath: string,
   dataType: 'workspaceDraftStarted' | 'workspaceSessionCleared',
 ): void {
+  const normalizedWorkspaceId = workspaceId.trim();
+  const normalizedWorkspacePath = workspacePath.trim();
+  const isAlreadyBoundToDraft = dataType === 'workspaceDraftStarted'
+    && !currentSessionId
+    && currentWorkspaceId === normalizedWorkspaceId
+    && currentWorkspacePath === normalizedWorkspacePath;
+  // 草稿被再次打开时，沿用第一次进入草稿时保存的来源会话配置。
+  // 不能从当前草稿的全局 bootstrap 重新取值，否则会在用户放弃草稿后
+  // 回退到模型列表默认项，导致下一次新建失去原会话配置参考。
+  const carriedSessionConfig = dataType === 'workspaceDraftStarted'
+    ? (isAlreadyBoundToDraft && Object.keys(messagesState.draftOrchestratorSessionConfig).length > 0
+      ? { ...messagesState.draftOrchestratorSessionConfig }
+      : cachedSettingsBootstrap
+        ? copyOrchestratorSessionConfig(
+          cachedSettingsBootstrap.orchestratorSessionConfig,
+          cachedSettingsBootstrap.effectiveOrchestratorConfig,
+        )
+        : {})
+    : {};
   closeEventStream();
-  const settingsBindingChanged = clearWorkspaceSessionBinding(workspaceId, workspacePath);
+  const settingsBindingChanged = clearWorkspaceSessionBinding(normalizedWorkspaceId, normalizedWorkspacePath);
   emitDataMessage(dataType, {
-    workspaceId: workspaceId.trim(),
-    workspacePath: workspacePath.trim(),
+    workspaceId: normalizedWorkspaceId,
+    workspacePath: normalizedWorkspacePath,
+    orchestratorSessionConfig: carriedSessionConfig,
   });
   if (settingsBindingChanged) {
     refreshSettingsBootstrapForCurrentWorkspace('workspace_session_cleared');

@@ -13,6 +13,7 @@ notify.workspace = true
 sha2.workspace = true
 zstd.workspace = true
 ignore.workspace = true
+similar.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

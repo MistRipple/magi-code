@@ -45,11 +45,6 @@ export function reportIncident(
 ): boolean {
   const policy = resolveIncidentPolicy({ scope: options.scope });
   const level = options.level || 'error';
-  addToast(level, message, options.title, {
-    source: options.source,
-    actionRequired: options.actionRequired ?? policy.actionRequired,
-    duration: options.duration,
-  });
 
   try {
     const incident = buildIncidentRequest(

@@ -59,8 +59,13 @@
   let fetchingFlags = $state<Record<string, boolean>>({});
   /** filepath → 拉取出错时的错误信息 */
   let fetchErrors = $state<Record<string, string>>({});
-  /** filepath → 异步加载的变更 diff（用于刷新恢复后的变更 tab） */
-  let fetchedDiffs = $state<Record<string, string>>({});
+  interface FetchedDiffDetail {
+    diff: string;
+    originalContent: string | null;
+    currentContent: string | null;
+  }
+  /** filepath → 异步加载的完整变更详情（diff + 两侧全文）。 */
+  let fetchedDiffDetails = $state<Record<string, FetchedDiffDetail>>({});
   /** filepath → diff loading 标记 */
   let fetchingDiffFlags = $state<Record<string, boolean>>({});
   /** filepath → diff 拉取出错时的错误信息 */
@@ -76,7 +81,7 @@
       fetchedContents = {};
       fetchErrors = {};
       fetchingFlags = {};
-      fetchedDiffs = {};
+      fetchedDiffDetails = {};
       fetchDiffErrors = {};
       fetchingDiffFlags = {};
     };
@@ -112,6 +117,11 @@
   const activeContentKind = $derived(activeCodePayload?.contentKind ?? 'text');
   const explicitContent = $derived(activeCodePayload?.content ?? null);
   const explicitDiff = $derived(activeCodePayload?.diff ?? null);
+  const hasExplicitDiffContents = $derived(Boolean(
+    activeCodePayload
+      && Object.prototype.hasOwnProperty.call(activeCodePayload, 'originalContent')
+      && Object.prototype.hasOwnProperty.call(activeCodePayload, 'currentContent')
+  ));
   const activeWantsDiff = $derived(Boolean(
     activeCodePayload?.isChangeDiff
       && (activeContentKind === 'text' || activeContentKind === 'large_text')
@@ -136,7 +146,7 @@
     fetchedContents = pruneRecord(fetchedContents, retainedKeys);
     fetchErrors = pruneRecord(fetchErrors, retainedKeys);
     fetchingFlags = pruneRecord(fetchingFlags, retainedKeys);
-    fetchedDiffs = pruneRecord(fetchedDiffs, retainedKeys);
+    fetchedDiffDetails = pruneRecord(fetchedDiffDetails, retainedKeys);
     fetchDiffErrors = pruneRecord(fetchDiffErrors, retainedKeys);
     fetchingDiffFlags = pruneRecord(fetchingDiffFlags, retainedKeys);
     documentModes = pruneRecord(documentModes, retainedKeys);
@@ -180,15 +190,15 @@
     })();
   });
 
-  // 刷新恢复后的变更 tab 不持久化大 diff；这里只保留轻量意图，然后按权威接口重取。
+  // 变更全文不持久化；缺少两侧全文时按权威接口补齐，以支持展开未变更区段。
   $effect(() => {
     const filepath = activeFilePath;
     const cacheKey = activeContentCacheKey;
     if (!filepath) return;
     if (!cacheKey) return;
     if (!activeWantsDiff) return;
-    if (typeof explicitDiff === 'string' && explicitDiff.trim().length > 0) return;
-    if (typeof fetchedDiffs[cacheKey] === 'string') return;
+    if (hasExplicitDiffContents) return;
+    if (fetchedDiffDetails[cacheKey]) return;
     if (typeof fetchDiffErrors[cacheKey] === 'string' && fetchDiffErrors[cacheKey].length > 0) return;
     if (fetchingDiffFlags[cacheKey]) return;
 
@@ -201,7 +211,14 @@
           workspaceId: activeCodePayload?.workspaceId,
           workspacePath: activeCodePayload?.workspacePath,
         });
-        fetchedDiffs = { ...fetchedDiffs, [cacheKey]: payload.diff || '' };
+        fetchedDiffDetails = {
+          ...fetchedDiffDetails,
+          [cacheKey]: {
+            diff: payload.diff || '',
+            originalContent: typeof payload.originalContent === 'string' ? payload.originalContent : null,
+            currentContent: typeof payload.currentContent === 'string' ? payload.currentContent : null,
+          },
+        };
       } catch (error) {
         console.warn('[RightPane] change diff load failed:', error);
         fetchDiffErrors = { ...fetchDiffErrors, [cacheKey]: i18n.t('web.filePreviewError') };
@@ -261,10 +278,20 @@
     if (typeof explicitDiff === 'string' && explicitDiff.trim().length > 0) {
       return explicitDiff.trimEnd();
     }
-    if (activeWantsDiff && activeContentCacheKey && typeof fetchedDiffs[activeContentCacheKey] === 'string') {
-      return fetchedDiffs[activeContentCacheKey].trimEnd();
+    if (activeWantsDiff && activeContentCacheKey && fetchedDiffDetails[activeContentCacheKey]) {
+      return fetchedDiffDetails[activeContentCacheKey].diff.trimEnd();
     }
     return '';
+  });
+  const diffOriginalContent = $derived.by<string | null>(() => {
+    if (hasExplicitDiffContents) return activeCodePayload?.originalContent ?? null;
+    if (!activeContentCacheKey) return null;
+    return fetchedDiffDetails[activeContentCacheKey]?.originalContent ?? null;
+  });
+  const diffCurrentContent = $derived.by<string | null>(() => {
+    if (hasExplicitDiffContents) return activeCodePayload?.currentContent ?? null;
+    if (!activeContentCacheKey) return null;
+    return fetchedDiffDetails[activeContentCacheKey]?.currentContent ?? null;
   });
   const hasDiff = $derived(diffCode.trim().length > 0);
 
@@ -775,7 +802,14 @@
       </div>
     {:else if hasDiff}
       <div class="right-pane-diff" aria-label={displayPath}>
-        <DiffCodeBlock diff={diffCode} ariaLabel={displayPath} fill={true} />
+        <DiffCodeBlock
+          diff={diffCode}
+          originalContent={diffOriginalContent}
+          currentContent={diffCurrentContent}
+          ariaLabel={displayPath}
+          language={fileLanguage}
+          fill={true}
+        />
       </div>
     {:else if htmlPreviewMode}
       <iframe
