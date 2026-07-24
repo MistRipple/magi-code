@@ -24,8 +24,8 @@ use crate::{
     compact_validation_failure, deterministic_task_final_content, execute_task_tool_call_batch,
     forced_task_tool_choice_for_round, record_completed_required_tools,
     required_tool_chain_is_complete, required_tool_chain_recovery_prompt,
-    required_tool_definitions_for_round, task_required_tool_chain, task_tool_failure_reason,
-    task_turn_visibility, tool_call_round_limit, validation_result_rejects_delivery,
+    required_tool_definitions_for_round, task_required_tool_chain, task_turn_visibility,
+    tool_call_round_limit, validation_result_rejects_delivery,
 };
 use crate::{
     model_error::{
@@ -1050,7 +1050,6 @@ fn run_conversation_loop_inner(
     let mut active_tools = tools.unwrap_or_default();
     let mut tool_call_records: Vec<serde_json::Value> = Vec::new();
     let mut tool_execution_ledger = ToolExecutionLedger::for_task_goal(&task.goal);
-    let mut unresolved_tool_failures: Vec<(String, String)> = Vec::new();
     let required_tool_chain = task_required_tool_chain(task, Some(agent_role_registry));
     let mut completed_required_tool_names: Vec<String> = Vec::new();
     let mut last_stream_item_id: Option<String> = None;
@@ -1694,38 +1693,18 @@ fn run_conversation_loop_inner(
                 tool_status,
             );
             let canonical_tool_name = canonical_tool_call_name(&tool_call.function.name);
-            if !tool_result_execution_was_skipped(&result) {
-                if !matches!(tool_status, ExecutionResultStatus::Succeeded)
-                    && !tool_result_is_recoverable_failure(&result)
-                {
-                    let failure_summary = format!(
-                        "{}: {}",
-                        tool_call.function.name,
-                        summarize_tool_result(&result)
-                    );
-                    if let Some((_, existing_summary)) = unresolved_tool_failures
-                        .iter_mut()
-                        .find(|(tool_name, _)| tool_name == &canonical_tool_name)
-                    {
-                        *existing_summary = failure_summary;
-                    } else {
-                        unresolved_tool_failures
-                            .push((canonical_tool_name.clone(), failure_summary));
-                    }
-                }
-                if matches!(tool_status, ExecutionResultStatus::Succeeded) {
-                    unresolved_tool_failures
-                        .retain(|(tool_name, _)| tool_name != &canonical_tool_name);
-                    if let Some(failure) = validate_task_content_requirements(
-                        task,
-                        &canonical_tool_name,
-                        tool_call,
-                        &result,
-                    ) {
-                        content_requirement_failures.push(failure);
-                    } else {
-                        completed_tool_names_this_round.push(canonical_tool_name);
-                    }
+            if !tool_result_execution_was_skipped(&result)
+                && matches!(tool_status, ExecutionResultStatus::Succeeded)
+            {
+                if let Some(failure) = validate_task_content_requirements(
+                    task,
+                    &canonical_tool_name,
+                    tool_call,
+                    &result,
+                ) {
+                    content_requirement_failures.push(failure);
+                } else {
+                    completed_tool_names_this_round.push(canonical_tool_name);
                 }
             }
             tool_call_records.push(tool_call_record(tool_call, &result));
@@ -1874,24 +1853,6 @@ fn run_conversation_loop_inner(
         return (
             TaskOutcome::Failed {
                 error: "任务执行已被中断，丢弃晚到模型结果".to_string(),
-            },
-            context_summary,
-        );
-    }
-
-    let failed_tool_summaries = unresolved_tool_failures
-        .iter()
-        .map(|(_, summary)| summary.clone())
-        .collect::<Vec<_>>();
-    if let Some(failure_reason) = task_tool_failure_reason(task.kind, &failed_tool_summaries) {
-        append_task_error_turn_item(
-            turn_writeback_context,
-            &failure_reason,
-            streaming_entry_id.or(last_stream_item_id.as_deref()),
-        );
-        return (
-            TaskOutcome::Failed {
-                error: failure_reason,
             },
             context_summary,
         );
@@ -2375,32 +2336,6 @@ fn tool_result_content_field(tool_result: &str) -> Option<String> {
                 .get("content")
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned)
-        })
-}
-
-fn tool_result_is_recoverable_failure(result: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(result)
-        .ok()
-        .is_some_and(|value| {
-            let error_code = value
-                .get("error_code")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if matches!(
-                error_code,
-                "agent_spawn_capacity_exceeded" | "file_read_not_found"
-            ) {
-                return true;
-            }
-            value.get("tool").and_then(serde_json::Value::as_str) == Some("agent_spawn")
-                && value
-                    .get("failure_stage")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("input_validation")
-                && value
-                    .get("instruction")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|instruction| !instruction.trim().is_empty())
         })
 }
 
@@ -3575,7 +3510,7 @@ mod tests {
                 })
             } else {
                 serde_json::json!({
-                    "content": "FLOW_SHOULD_NOT_COMPLETE",
+                    "content": "工具失败后已完成可交付总结。",
                     "finish_reason": "stop"
                 })
             };
@@ -3592,7 +3527,7 @@ mod tests {
         ) -> Result<BridgeResponse, BridgeClientError> {
             if self.invoke_count.load(Ordering::SeqCst) > 0 {
                 on_delta(&ModelStreamingDelta {
-                    content: "FLOW_SHOULD_NOT_COMPLETE".to_string(),
+                    content: "工具失败后已完成可交付总结。".to_string(),
                     thinking: String::new(),
                 });
             }
@@ -4602,7 +4537,7 @@ mod tests {
     }
 
     #[test]
-    fn action_task_failed_tool_prevents_completed_final() {
+    fn optional_tool_failure_does_not_prevent_completed_final() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(64);
         let session_id = SessionId::new("session-task-failed-tool-final");
@@ -4672,11 +4607,14 @@ mod tests {
         });
 
         match outcome {
-            TaskOutcome::Failed { error } => {
-                assert!(error.contains("工具执行失败"));
-                assert!(error.contains("missing_builtin_tool"));
+            TaskOutcome::Completed { output_refs } => {
+                assert!(
+                    output_refs
+                        .first()
+                        .is_some_and(|content| content.contains("工具失败后已完成可交付总结"))
+                );
             }
-            other => panic!("failed tool must fail action task, got {other:?}"),
+            other => panic!("optional tool failure must not fail a completed task, got {other:?}"),
         }
     }
 
@@ -4771,39 +4709,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_spawn_capacity_signal_is_recoverable_coordination_feedback() {
-        let capacity_signal = serde_json::json!({
-            "tool": "agent_spawn",
-            "status": "rejected",
-            "error_code": "agent_spawn_capacity_exceeded",
-            "error": "当前会话已达到多代理并发上限",
-            "instruction": "请先用 agent_wait 收集已启动代理结果",
-        })
-        .to_string();
-        let safety_rejection = serde_json::json!({
-            "tool": "shell_exec",
-            "status": "rejected",
-            "error_code": "tool_safety_rejected",
-            "error": "该操作已被安全防护阻止",
-        })
-        .to_string();
-        let invalid_spawn_input = serde_json::json!({
-            "tool": "agent_spawn",
-            "status": "failed",
-            "error_code": "invalid_context_package",
-            "failure_stage": "input_validation",
-            "error": "spawn.references[0].title 必须是字符串",
-            "instruction": "请按 Schema 修正引用字段后重试。",
-        })
-        .to_string();
-
-        assert!(tool_result_is_recoverable_failure(&capacity_signal));
-        assert!(tool_result_is_recoverable_failure(&invalid_spawn_input));
-        assert!(!tool_result_is_recoverable_failure(&safety_rejection));
-        assert!(!tool_result_is_recoverable_failure("not json"));
-    }
-
-    #[test]
     fn skipped_tool_budget_result_does_not_change_task_execution_state() {
         let skipped = serde_json::json!({
             "tool": "web_search",
@@ -4816,19 +4721,6 @@ mod tests {
         assert!(!tool_result_execution_was_skipped(
             r#"{"tool":"web_search","status":"succeeded","execution":"reused"}"#
         ));
-    }
-
-    #[test]
-    fn missing_file_probe_does_not_poison_task_completion() {
-        let missing_file = serde_json::json!({
-            "tool": "file_read",
-            "status": "failed",
-            "error_code": "file_read_not_found",
-            "error": "目标路径不存在，请检查路径",
-        })
-        .to_string();
-
-        assert!(tool_result_is_recoverable_failure(&missing_file));
     }
 
     #[test]

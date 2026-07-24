@@ -218,28 +218,6 @@ pub fn apply_task_final_visibility(
     let _ = task_store;
 }
 
-pub fn task_tool_failure_reason(
-    task_kind: TaskKind,
-    failed_tool_summaries: &[String],
-) -> Option<String> {
-    let _ = task_kind;
-    if failed_tool_summaries.is_empty() {
-        return None;
-    }
-    let compact = failed_tool_summaries
-        .iter()
-        .take(3)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("; ");
-    let suffix = if failed_tool_summaries.len() > 3 {
-        format!("；另有 {} 个工具失败", failed_tool_summaries.len() - 3)
-    } else {
-        String::new()
-    };
-    Some(format!("工具执行失败，任务不能标记完成：{compact}{suffix}"))
-}
-
 pub fn validation_result_rejects_delivery(content: &str) -> bool {
     let leading = content.trim_start().chars().take(240).collect::<String>();
     let lower = leading.to_ascii_lowercase();
