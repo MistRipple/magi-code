@@ -1094,7 +1094,10 @@ fn run_conversation_loop_inner(
 
     let tool_call_round_limit = tool_call_round_limit(&required_tool_chain);
     let mut pre_output_invocation_recovery_attempts = vec![0usize; tool_call_round_limit];
-    'conversation_round: for round in 0..tool_call_round_limit {
+    'conversation_round: for (round, recovery_attempts) in pre_output_invocation_recovery_attempts
+        .iter_mut()
+        .enumerate()
+    {
         append_task_runtime_signals(
             &mut messages,
             conversation_registry.drain_task_signals(session_id, task_id),
@@ -1236,14 +1239,13 @@ fn run_conversation_loop_inner(
                         if partial_visible_content.is_empty()
                             && partial_thinking.is_empty()
                             && classification.retryable_before_output
-                            && pre_output_invocation_recovery_attempts[round]
-                                < MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS
+                            && *recovery_attempts < MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS
                         {
-                            pre_output_invocation_recovery_attempts[round] += 1;
+                            *recovery_attempts += 1;
                             tracing::warn!(
                                 task_id = %task.task_id,
                                 round = round,
-                                attempt = pre_output_invocation_recovery_attempts[round],
+                                attempt = *recovery_attempts,
                                 max_attempts = MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
                                 error_code = classification.code,
                                 "模型未交付内容即发生暂态调用故障，重新执行同一轮请求"
@@ -1422,14 +1424,13 @@ fn run_conversation_loop_inner(
                         },
                     );
                     if classification.retryable_before_output
-                        && pre_output_invocation_recovery_attempts[round]
-                            < MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS
+                        && *recovery_attempts < MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS
                     {
-                        pre_output_invocation_recovery_attempts[round] += 1;
+                        *recovery_attempts += 1;
                         tracing::warn!(
                             task_id = %task.task_id,
                             round = round,
-                            attempt = pre_output_invocation_recovery_attempts[round],
+                            attempt = *recovery_attempts,
                             max_attempts = MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
                             error_code = classification.code,
                             "模型未交付内容即发生暂态调用故障，重新执行同一轮请求"

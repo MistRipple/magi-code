@@ -12,6 +12,10 @@
   "permissions": [
     "core:default",
     "process:default",
-    "updater:default"
+    "updater:default",
+    "allow-prepare-update-restart",
+    "allow-get-staged-desktop-update",
+    "allow-stage-desktop-update",
+    "allow-install-staged-desktop-update"
   ]
 }
