@@ -371,13 +371,13 @@ mod tests {
         task_execution_dispatcher::{
             ExecutionPipeline, LlmTaskDispatcher, LlmTaskDispatcherDependencies,
         },
-        task_runner_bridge::EventBasedResultReceiver,
+        task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher},
     };
     use magi_core::PlanItemStatus;
     use magi_core::{AbsolutePath, SessionId, ThreadId, WorkspaceId};
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
-    use magi_orchestrator::OrchestratorService;
+    use magi_orchestrator::{OrchestratorService, task_store::TaskStore};
     use magi_session_store::SessionStore;
     use magi_tool_runtime::ToolRegistry;
     use magi_worker_runtime::WorkerRuntime;
@@ -419,13 +419,15 @@ mod tests {
         let session_store = Arc::new(SessionStore::default());
         let workspace_store = Arc::new(WorkspaceStore::default());
         let governance = Arc::new(GovernanceService::default());
+        let task_store = Arc::new(TaskStore::new());
         let state = ApiState::new(
             "magi-test",
             Arc::clone(&event_bus),
             Arc::clone(&session_store),
             Arc::clone(&workspace_store),
             Arc::clone(&governance),
-        );
+        )
+        .with_task_store(Arc::clone(&task_store));
         let mut tool_registry = ToolRegistry::new(governance, Arc::clone(&event_bus));
         tool_registry.register_default_builtins();
         let orchestrator = OrchestratorService::new(Arc::clone(&event_bus));
@@ -433,32 +435,49 @@ mod tests {
             tool_registry.clone(),
             magi_bridge_client::BridgeDispatchRuntime::new(),
         );
-        let execution_runtime = orchestrator.execution_runtime(
-            WorkerRuntime::new(Arc::clone(&event_bus)),
-            tool_registry.clone(),
-            skill_dispatch_runtime,
+        let execution_runtime = orchestrator
+            .execution_runtime(
+                WorkerRuntime::new(Arc::clone(&event_bus)),
+                tool_registry.clone(),
+                skill_dispatch_runtime,
+            )
+            .with_task_store(Arc::clone(&task_store));
+        let result_receiver = Arc::new(EventBasedResultReceiver::new());
+        let dispatcher = Arc::new(
+            LlmTaskDispatcher::new(
+                event_bus,
+                ExecutionPipeline {
+                    orchestrator,
+                    execution_runtime,
+                    memory_store: magi_memory_store::MemoryStore::new(),
+                },
+                LlmTaskDispatcherDependencies {
+                    session_store: Arc::clone(&session_store),
+                    execution_registry: state.task_execution_registry().clone(),
+                    result_receiver: Arc::clone(&result_receiver),
+                    spawn_graph: Arc::clone(&state.spawn_graph),
+                    conversation_registry: Arc::clone(&state.conversation_registry),
+                    agent_role_registry: Arc::clone(&state.agent_role_registry),
+                },
+                std::env::temp_dir().join("magi-goal-resume-dispatcher"),
+            )
+            .with_model_bridge_client(Arc::new(RecordingFailingModelClient { calls }))
+            .with_workspace_registry(workspace_store)
+            .with_tool_registry(tool_registry),
         );
-        let dispatcher = LlmTaskDispatcher::new(
-            event_bus,
-            ExecutionPipeline {
-                orchestrator,
-                execution_runtime,
-                memory_store: magi_memory_store::MemoryStore::new(),
-            },
-            LlmTaskDispatcherDependencies {
-                session_store,
-                execution_registry: state.task_execution_registry().clone(),
-                result_receiver: Arc::new(EventBasedResultReceiver::new()),
-                spawn_graph: Arc::clone(&state.spawn_graph),
-                conversation_registry: Arc::clone(&state.conversation_registry),
-                agent_role_registry: Arc::clone(&state.agent_role_registry),
-            },
-            std::env::temp_dir().join("magi-goal-resume-dispatcher"),
+        let state_for_workers = state.clone();
+        let runner_dispatcher: Arc<dyn TaskDispatcher> = dispatcher.clone();
+        let runner_manager = crate::state::RunnerManager::with_dispatcher_and_worker_catalog(
+            task_store,
+            session_store,
+            Arc::new(move || state_for_workers.task_worker_catalog()),
+            runner_dispatcher,
+            result_receiver,
         )
-        .with_model_bridge_client(Arc::new(RecordingFailingModelClient { calls }))
-        .with_workspace_registry(workspace_store)
-        .with_tool_registry(tool_registry);
-        state.with_session_turn_dispatcher(Arc::new(dispatcher))
+        .with_agent_role_registry(Arc::clone(&state.agent_role_registry));
+        state
+            .with_runner_manager(runner_manager)
+            .with_session_turn_dispatcher(dispatcher)
     }
 
     #[tokio::test]
@@ -858,6 +877,7 @@ mod tests {
         let state = state_with_recording_goal_dispatcher(Arc::clone(&model_calls));
         let workspace_id = WorkspaceId::new("workspace-goal-real-resume");
         let workspace_path = std::env::temp_dir().join("magi-goal-real-resume");
+        std::fs::create_dir_all(&workspace_path).expect("workspace directory should create");
         state
             .workspace_registry
             .register(
@@ -942,8 +962,9 @@ mod tests {
                 .recent_events
                 .iter()
                 .any(|event| {
-                    event.event_type == "session.turn.accepted"
+                    event.event_type == "session.turn.task.accepted"
                         && event.payload["session_id"].as_str() == Some(session_id.as_str())
+                        && event.payload["goal_continuation"] == true
                 }),
             "恢复后必须发布 Turn 已接受事件"
         );

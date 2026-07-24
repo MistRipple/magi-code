@@ -791,7 +791,7 @@ fn static_test_agent_wait_result(
         let tool_call_id = message.tool_call_id.as_deref()?;
         wait_call_ids
             .contains(tool_call_id)
-            .then(|| message.content.as_deref())
+            .then_some(message.content.as_deref())
             .flatten()
     })
 }

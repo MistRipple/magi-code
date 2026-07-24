@@ -350,6 +350,7 @@ mod tests {
                 }),
                 required: Some(vec!["command".to_string()]),
             },
+            origin: crate::types::ChatToolOrigin::Builtin,
         }];
 
         let serialized = serialize_tool_definitions(&tools);

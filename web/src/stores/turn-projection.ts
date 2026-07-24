@@ -63,6 +63,30 @@ function normalizeCanonicalTaskId(item: CanonicalTurnItem): string | undefined {
   return taskId || undefined;
 }
 
+function modelResponseRound(item: CanonicalTurnItem): number | null {
+  const value = item.metadata?.modelRound;
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+function modelResponseLane(item: CanonicalTurnItem): string {
+  return [
+    item.sourceThreadId,
+    normalizeCanonicalTaskId(item) || '',
+    normalizeCanonicalWorkerId(item) || '',
+    normalizeCanonicalRoleId(item) || '',
+  ].join('\u0000');
+}
+
+function modelResponseGroupKey(item: CanonicalTurnItem): string | null {
+  if (item.kind !== 'assistant_thinking' && item.kind !== 'assistant_text') {
+    return null;
+  }
+  const round = modelResponseRound(item);
+  return round === null ? null : `${modelResponseLane(item)}\u0000${round}`;
+}
+
 function isAgentTaskSidechainItem(item: CanonicalTurnItem): boolean {
   // Sidechain 归属只由执行实例事实决定：代理 item 会携带 roleId/workerId；
   // root agent item 可能也携带 taskId，但不应因此被移出主线。
@@ -470,30 +494,24 @@ function requirePresentationSeq(presentation: TurnPresentation, item: CanonicalT
  * **根因背景**：后端存储里的 `item_seq` 由 `upsert_current_turn_item` 按
  * `max(items.item_seq)+1` 分配——这是「首次 upsert 到达顺序」，不是「协议语义顺序」。
  * 对 Anthropic（thinking_delta → text_delta），到达顺序天然等于协议顺序；
- * 但对部分 OpenAI 兼容 provider（DeepSeek、Qwen 某些版本），`reasoning_content`
- * 不增量流式推送，整段在最终消息里给出，runtime 只能在 post-streaming 阶段
- * 才补上 thinking item，拿到比 text item 更大的 `item_seq`——此时若把
- * `item_seq` 当展示序直接乘 1000，thinking 卡片就排到回答卡片之后。
+ * 但部分 OpenAI 兼容 provider 会在正文之后才补齐 `reasoning_content`。runtime
+ * 为同一次模型调用的思考与正文写入 `metadata.modelRound`，作为唯一关联事实。
  *
  * **真正的根因**是「`item_seq` 同时承担存储分配序与展示顺序」这一 conflation。
- * 修复方式：在 projection 层用 kind 语义重排，剥离两者：
+ * 修复方式：在 projection 层按显式模型轮次重排，剥离两者：
  *   - 存储层 `item_seq` 仍然是单调到达序（保留审计、status 不变性）；
- *   - 展示序由本函数按协议语义重新计算——同一 round 内 `thinking` 永远先于
- *     `text`，`tool_call` / `user_message` 等作为 round
- *     边界保持原位（它们的 `item_seq` 已经能正确反映 round 顺序）。
+ *   - 展示序只在同一 `modelRound` 内将 `thinking` 排到 `text` 前；新模型轮次或
+ *     非模型输出都会立即封口，不能把后续思考并入已输出正文之前的卡片。
  *
- * 算法：按 `item_seq` 升序遍历 turn.items；
- *   - 累积 `assistant_thinking` / `assistant_text` 到 round buffer；
- *   - 碰到其它 kind 视为 round 边界——先 flush（thinking 排前、text 排后）
- *     再追加边界 item 自身；
- *   - 遍历结束后 flush 末尾残留 buffer。
+ * 算法：按 `item_seq` 升序遍历 turn.items；只累积带相同 `modelRound` 的模型输出，
+ * 然后输出 thinking、再输出 text。没有明确关联键的历史记录按审计顺序展示，不猜测
+ * 跨项归属。
  *
  * 同时一次性沿 orderedItems 反向扫描预计算 responseDurationAnchorItemId，
  * 避免后续每次询问 anchor 都重新 sort + filter；也彻底脱离 itemSeq——
  * 锚点选择只依赖呈现序，不存在 fallback 路径。
  *
- * 单一 round 内同 kind 多 item 间保持原 `item_seq` 顺序，确保增量 thinking /
- * 多段 text 的稳定性。
+ * 单一模型轮次内同 kind 多 item 保持原 `item_seq` 顺序，确保增量稳定性。
  */
 function buildTurnPresentation(turn: CanonicalTurn): TurnPresentation {
   const sorted = turn.items
@@ -503,24 +521,32 @@ function buildTurnPresentation(turn: CanonicalTurn): TurnPresentation {
     );
 
   const ordered: CanonicalTurnItem[] = [];
-  let thinkingBuffer: CanonicalTurnItem[] = [];
-  let textBuffer: CanonicalTurnItem[] = [];
+  let responseGroupKey: string | null = null;
+  let responseBuffer: CanonicalTurnItem[] = [];
 
   const flush = (): void => {
-    ordered.push(...thinkingBuffer, ...textBuffer);
-    thinkingBuffer = [];
-    textBuffer = [];
+    if (responseBuffer.length > 0) {
+      ordered.push(
+        ...responseBuffer.filter((item) => item.kind === 'assistant_thinking'),
+        ...responseBuffer.filter((item) => item.kind === 'assistant_text'),
+      );
+    }
+    responseGroupKey = null;
+    responseBuffer = [];
   };
 
   for (const item of sorted) {
-    if (item.kind === 'assistant_thinking') {
-      thinkingBuffer.push(item);
-    } else if (item.kind === 'assistant_text') {
-      textBuffer.push(item);
-    } else {
+    const nextGroupKey = modelResponseGroupKey(item);
+    if (!nextGroupKey) {
       flush();
       ordered.push(item);
+      continue;
     }
+    if (responseGroupKey !== nextGroupKey) {
+      flush();
+      responseGroupKey = nextGroupKey;
+    }
+    responseBuffer.push(item);
   }
   flush();
 
@@ -684,7 +710,21 @@ function hasSameThinkingOwner(
 ): boolean {
   const leftMetadata = left.message.metadata || {};
   const rightMetadata = right.message.metadata || {};
-  return normalizeMetadataIdentity(leftMetadata.turnId) === normalizeMetadataIdentity(rightMetadata.turnId)
+  const leftModelRound = typeof leftMetadata.modelRound === 'number'
+    && Number.isSafeInteger(leftMetadata.modelRound)
+    && leftMetadata.modelRound >= 0
+    ? leftMetadata.modelRound
+    : null;
+  const rightModelRound = typeof rightMetadata.modelRound === 'number'
+    && Number.isSafeInteger(rightMetadata.modelRound)
+    && rightMetadata.modelRound >= 0
+    ? rightMetadata.modelRound
+    : null;
+  const sameResponseRound = leftModelRound !== null || rightModelRound !== null
+    ? leftModelRound !== null && leftModelRound === rightModelRound
+    : true;
+  return sameResponseRound
+    && normalizeMetadataIdentity(leftMetadata.turnId) === normalizeMetadataIdentity(rightMetadata.turnId)
     && normalizeMetadataIdentity(leftMetadata.sourceThreadId) === normalizeMetadataIdentity(rightMetadata.sourceThreadId)
     && normalizeMetadataIdentity(leftMetadata.taskId) === normalizeMetadataIdentity(rightMetadata.taskId)
     && normalizeMetadataIdentity(leftMetadata.workerId) === normalizeMetadataIdentity(rightMetadata.workerId)

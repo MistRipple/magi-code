@@ -1,4 +1,4 @@
-use magi_bridge_client::{ChatToolDefinition, ChatToolFunctionDefinition};
+use magi_bridge_client::{ChatToolDefinition, ChatToolFunctionDefinition, ChatToolOrigin};
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry, is_internal_builtin_tool_surface};
 
 fn public_builtin_tool_definition(name: &str) -> Option<ChatToolDefinition> {
@@ -14,6 +14,7 @@ fn public_builtin_tool_definition(name: &str) -> Option<ChatToolDefinition> {
             description: tool_name.description().to_string(),
             parameters: tool_name.parameters_schema(),
         },
+        origin: ChatToolOrigin::Builtin,
     })
 }
 

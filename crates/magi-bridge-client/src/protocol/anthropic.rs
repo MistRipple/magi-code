@@ -7,7 +7,7 @@ use super::utils::{
     serialize_anthropic_tool_definitions,
 };
 use crate::cache_boundary::split_at_cache_boundary;
-use crate::llm_types::{LlmMessageParams, ToolCall};
+use crate::llm_types::{LlmMessageParams, ToolCall, ToolChoice};
 use magi_usage_authority::ReasoningEffort;
 
 /// Anthropic Extended Thinking 默认预算（tokens）。
@@ -124,7 +124,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         {
             body["tools"] = json!(serialize_anthropic_tool_definitions(tools));
             if let Some(ref tc) = params.tool_choice {
-                body["tool_choice"] = serde_json::to_value(tc).unwrap_or(json!({"type": "auto"}));
+                body["tool_choice"] = translate_tool_choice_for_anthropic(tc);
             }
         }
         if let Some(stream) = params.stream {
@@ -215,6 +215,26 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
 
     fn max_output_tokens_field(&self) -> &str {
         "max_tokens"
+    }
+}
+
+/// 将运行时统一的工具选择语义翻译为 Anthropic Messages 协议。
+///
+/// `required` 在 OpenAI Chat 中表示“至少调用一个工具”；Anthropic 对应 `any`。
+/// 该转换保持在协议适配器内，使上层只表达能力语义而不携带提供方分支。
+fn translate_tool_choice_for_anthropic(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Simple(kind) if kind == "required" => json!({"type": "any"}),
+        ToolChoice::Simple(kind) if kind == "auto" => json!({"type": "auto"}),
+        ToolChoice::Simple(kind) if kind == "none" => json!({"type": "auto"}),
+        ToolChoice::Simple(kind) => json!({"type": kind}),
+        ToolChoice::Typed {
+            kind,
+            name: Some(name),
+        } => {
+            json!({"type": kind, "name": name})
+        }
+        ToolChoice::Typed { kind, name: None } => json!({"type": kind}),
     }
 }
 

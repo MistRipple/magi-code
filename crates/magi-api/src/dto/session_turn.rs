@@ -68,6 +68,7 @@ pub struct SessionTurnRequestDto {
 }
 
 impl SessionTurnRequestDto {
+    #[cfg(test)]
     pub fn product_locale(&self) -> String {
         self.locale
             .as_deref()

@@ -75,6 +75,22 @@ impl ToolRegistry {
             .unwrap_or_default()
     }
 
+    /// 返回可由任务执行账本复用成功结果的工具。
+    ///
+    /// 内置工具的分类由 `BuiltinToolName` 统一维护；外部 MCP 工具只能以其
+    /// 声明的 `read_only` 元数据加入，未知或可能写入的工具一律不复用。
+    pub fn is_idempotent_read_tool(&self, tool_name: &str) -> bool {
+        if BuiltinToolName::from_name(tool_name)
+            .is_some_and(|tool| tool.is_idempotent_read_operation())
+        {
+            return true;
+        }
+        self.external_tool_catalog_snapshot()
+            .mcp_tools
+            .iter()
+            .any(|tool| tool.model_tool_name == tool_name && tool.read_only)
+    }
+
     pub fn execute_external_mcp_tool(
         &self,
         model_tool_name: &str,

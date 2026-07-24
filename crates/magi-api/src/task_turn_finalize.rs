@@ -55,6 +55,11 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
             .task_store()
             .and_then(|task_store| task_store.get_task(root_task_id))
             .is_some_and(|task| task.status == magi_core::TaskStatus::Completed);
+        if root_completed {
+            crate::routes::sessions::record_active_goal_turn_success(state, session_id);
+        } else {
+            crate::routes::sessions::record_active_goal_turn_failure(state, session_id);
+        }
         if runner_status != "completed" && !root_completed {
             let plan_store =
                 magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());

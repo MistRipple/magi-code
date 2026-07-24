@@ -31,12 +31,10 @@ pub use status::{
 };
 pub use task::{
     AccessProfile, AgentContextAccessOperation, AgentContextAccessRecord, AgentContextPackage,
-    AgentContextReference, AgentContextReferenceKind, AgentContextSupplement, AgentDelegationMode,
-    AgentDelegationPolicy, AgentRunProjection, PlanItem, PlanItemStatus, PlanState,
-    ProgressSummary, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, Task, TaskExecutorBinding, TaskKind,
-    TaskPolicy, TaskRuntimePayload, TaskStatus, TaskTier, agent_delegation_policy,
+    AgentContextReference, AgentContextReferenceKind, AgentContextSupplement, AgentRunProjection,
+    PlanItem, PlanItemStatus, PlanState, ProgressSummary, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, Task,
+    TaskExecutorBinding, TaskKind, TaskPolicy, TaskRuntimePayload, TaskStatus, TaskTier,
     public_task_output_refs, task_output_ref_is_internal_runtime_failure,
-    text_prohibits_agent_spawn, text_requires_agent_spawn, text_requires_automatic_agent_team,
 };
 pub use token_estimate::estimate_text_tokens;
 pub use value_objects::{AbsolutePath, UtcMillis, WorkspaceRootPath, WorktreeRootPath};

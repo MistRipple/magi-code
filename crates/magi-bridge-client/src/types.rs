@@ -92,6 +92,26 @@ pub struct ChatToolDefinition {
     #[serde(rename = "type")]
     pub kind: String,
     pub function: ChatToolFunctionDefinition,
+    /// 工具所属的运行时域。该字段只在 Magi 的模型协议边界使用，不会透传给上游。
+    ///
+    /// 上游保留字或原生能力与本地工具冲突时，必须依据来源生成 wire name；不能
+    /// 通过维护一份名称白名单猜测工具身份。
+    #[serde(default)]
+    pub origin: ChatToolOrigin,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatToolOrigin {
+    /// Magi 内置工具与 Magi 自身的协调能力。
+    Builtin,
+    /// 外部 MCP server 暴露的工具。
+    ExternalMcp,
+    /// Skill 安装或激活后提供的自定义工具。
+    Skill,
+    /// 旧会话或第三方 bridge 生成的未分类工具；不参与 provider 专属改名。
+    #[default]
+    Unspecified,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

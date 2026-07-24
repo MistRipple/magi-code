@@ -1,12 +1,14 @@
 use crate::session_writeback::{
     SessionStatePersistCallback, SessionTurnStreamPublishGate, SessionTurnStreamUpdate,
-    append_session_turn_item_with_task_store, persist_session_state_checkpoint,
-    publish_current_session_turn_item_event, publish_model_retry_runtime_event,
-    publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
-    session_turn_stream_update, upsert_session_turn_item_with_task_store,
+    append_session_turn_item_with_task_store, apply_model_response_round,
+    persist_session_state_checkpoint, publish_current_session_turn_item_event,
+    publish_model_retry_runtime_event, publish_session_turn_item_event,
+    publish_session_turn_item_stream_event, session_turn_item, session_turn_stream_update,
+    upsert_session_turn_item_with_task_store,
 };
 use crate::task_execution_registry::TaskExecutionRegistry;
 use crate::task_runner_bridge::TaskOutcome;
+use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
     infer_tool_call_status, model_visible_tool_result, summarize_tool_result,
     tool_execution_status_label, turn_item_status_for_tool_result,
@@ -21,13 +23,13 @@ use crate::{
     apply_task_turn_visibility, apply_task_worker_detail_visibility, canonical_tool_call_name,
     compact_validation_failure, deterministic_task_final_content, execute_task_tool_call_batch,
     forced_task_tool_choice_for_round, record_completed_required_tools,
-    required_tool_chain_is_complete, required_tool_chain_recovery_prompt, task_required_tool_chain,
-    task_tool_failure_reason, task_turn_visibility, tool_call_round_limit,
-    validation_result_rejects_delivery,
+    required_tool_chain_is_complete, required_tool_chain_recovery_prompt,
+    required_tool_definitions_for_round, task_required_tool_chain, task_tool_failure_reason,
+    task_turn_visibility, tool_call_round_limit, validation_result_rejects_delivery,
 };
 use crate::{
     model_error::{
-        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS,
+        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
         MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, classify_model_invocation_error,
         model_empty_response_recovery_prompt, model_stream_interruption_recovery_prompt,
         provider_empty_assistant_response_error,
@@ -44,8 +46,8 @@ use crate::{
     },
 };
 use magi_bridge_client::{
-    ChatMessage, ChatToolCall, ChatToolChoice, ChatToolDefinition, LOOPBACK_MODEL_PROVIDER,
-    ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta,
+    ChatMessage, ChatToolCall, ChatToolDefinition, LOOPBACK_MODEL_PROVIDER, ModelBridgeClient,
+    ModelInvocationRequest, ModelStreamingDelta,
 };
 use magi_core::{
     EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskId, TaskStatus, ThreadId,
@@ -1043,9 +1045,11 @@ fn run_conversation_loop_inner(
     );
 
     let mut final_content = String::new();
+    let mut final_model_round: Option<usize> = None;
     let mut active_skill_name = skill_name;
     let mut active_tools = tools.unwrap_or_default();
     let mut tool_call_records: Vec<serde_json::Value> = Vec::new();
+    let mut tool_execution_ledger = ToolExecutionLedger::for_task_goal(&task.goal);
     let mut unresolved_tool_failures: Vec<(String, String)> = Vec::new();
     let required_tool_chain = task_required_tool_chain(task, Some(agent_role_registry));
     let mut completed_required_tool_names: Vec<String> = Vec::new();
@@ -1078,6 +1082,7 @@ fn run_conversation_loop_inner(
             &final_content,
             None,
             streaming_entry_id,
+            None,
         );
         return (
             TaskOutcome::Completed {
@@ -1088,6 +1093,7 @@ fn run_conversation_loop_inner(
     }
 
     let tool_call_round_limit = tool_call_round_limit(&required_tool_chain);
+    let mut pre_output_invocation_recovery_attempts = vec![0usize; tool_call_round_limit];
     'conversation_round: for round in 0..tool_call_round_limit {
         append_task_runtime_signals(
             &mut messages,
@@ -1114,7 +1120,6 @@ fn run_conversation_loop_inner(
                 denied_tools,
             );
         }
-        let round_tools = (!active_tools.is_empty()).then_some(active_tools.clone());
         let thinking_item_id = format!("turn-item-assistant-thinking-{task_id}-{round}");
         let stream_item_id = task_stream_item_id(task_id, round, streaming_entry_id);
         last_stream_item_id = Some(stream_item_id.clone());
@@ -1127,36 +1132,27 @@ fn run_conversation_loop_inner(
         let thinking_publish_gate =
             std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
         let round_started_at = UtcMillis::now();
-        let agent_spawn_required = agent_spawn_required_by_task(task).is_some_and(|policy| {
-            agent_spawn_requirement_is_policy_reachable(task)
-                && task_store.get_children(&task.task_id).len()
-                    < usize::from(policy.minimum_agent_count)
-        });
-        let forced_agent_spawn = agent_spawn_required
-            .then(|| {
-                round_tools.as_ref().and_then(|definitions| {
-                    definitions
-                        .iter()
-                        .any(|definition| definition.function.name == "agent_spawn")
-                        .then(|| ChatToolChoice::force_function("agent_spawn"))
-                })
-            })
-            .flatten();
+        // 协作工具面由 root coordinator 身份、访问策略与运行时容量统一决定。
+        // 不得根据用户文本缩减工具集，也不得强制某一轮调用 agent_spawn；否则模型
+        // 无法在分析、实施、等待之间自主选择正确的协作步骤。
+        let round_tool_definitions = required_tool_definitions_for_round(
+            &active_tools,
+            &required_tool_chain,
+            &completed_required_tool_names,
+        );
+        let round_tools = (!round_tool_definitions.is_empty()).then_some(round_tool_definitions);
         let invocation_request = ModelInvocationRequest {
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: prompt.clone(),
             messages: Some(messages.clone()),
             tools: round_tools.clone(),
-            // DeepSeek 等兼容模型会忽略纯文本的代理契约提示。只要尚未满足
-            // 子代理最小数量，就在每一轮强制其返回 agent_spawn function call。
-            tool_choice: forced_agent_spawn.or_else(|| {
-                forced_task_tool_choice_for_round(
-                    &required_tool_chain,
-                    round_tools.as_ref(),
-                    &completed_required_tool_names,
-                )
-            }),
+            tool_choice: forced_task_tool_choice_for_round(
+                &required_tool_chain,
+                round_tools.as_ref(),
+                &completed_required_tool_names,
+            ),
         };
+        let invocation_request_template = invocation_request.clone();
         let non_stream_fallback_template = invocation_request.clone();
         let invocation_cancelled = || !task_lease_is_current(task_store, task_id, lease_id);
 
@@ -1168,6 +1164,7 @@ fn run_conversation_loop_inner(
                 publish_task_thinking_delta(
                     turn_writeback_context,
                     &thinking_item_id,
+                    round,
                     &last_thinking_len,
                     &streamed_thinking,
                     &thinking_publish_gate,
@@ -1175,12 +1172,15 @@ fn run_conversation_loop_inner(
                 );
                 publish_task_content_delta(
                     turn_writeback_context,
-                    &stream_item_id,
-                    &last_content_len,
-                    &streamed_content,
-                    &streamed_visible_content,
-                    &stream_publish_gate,
-                    &delta.content,
+                    TaskContentDelta {
+                        item_id: &stream_item_id,
+                        model_round: round,
+                        last_sent_len: &last_content_len,
+                        streamed_content: &streamed_content,
+                        streamed_visible_content: &streamed_visible_content,
+                        publish_gate: &stream_publish_gate,
+                        accumulated_content: &delta.content,
+                    },
                 );
             };
 
@@ -1197,7 +1197,7 @@ fn run_conversation_loop_inner(
 
             'streaming_invocation: {
                 match client.invoke_streaming_with_cancellation(
-                    invocation_request,
+                    invocation_request_template.clone(),
                     &on_delta,
                     &on_retry,
                     &invocation_cancelled,
@@ -1233,6 +1233,23 @@ fn run_conversation_loop_inner(
                         let partial_visible_content =
                             streamed_visible_content.borrow().trim().to_string();
                         let partial_thinking = streamed_thinking.borrow().trim().to_string();
+                        if partial_visible_content.is_empty()
+                            && partial_thinking.is_empty()
+                            && classification.retryable_before_output
+                            && pre_output_invocation_recovery_attempts[round]
+                                < MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS
+                        {
+                            pre_output_invocation_recovery_attempts[round] += 1;
+                            tracing::warn!(
+                                task_id = %task.task_id,
+                                round = round,
+                                attempt = pre_output_invocation_recovery_attempts[round],
+                                max_attempts = MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
+                                error_code = classification.code,
+                                "模型未交付内容即发生暂态调用故障，重新执行同一轮请求"
+                            );
+                            continue 'conversation_round;
+                        }
                         if classification.code == "model_stream_interrupted"
                             && (stream_interruption_recovery_attempts
                                 < MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS
@@ -1242,6 +1259,7 @@ fn run_conversation_loop_inner(
                                 upsert_task_thinking_turn_item(
                                     turn_writeback_context,
                                     &thinking_item_id,
+                                    round,
                                     "completed",
                                     &partial_thinking,
                                     None,
@@ -1252,6 +1270,7 @@ fn run_conversation_loop_inner(
                                 upsert_task_stream_turn_item(
                                     turn_writeback_context,
                                     &stream_item_id,
+                                    round,
                                     "completed",
                                     &partial_visible_content,
                                     None,
@@ -1370,7 +1389,10 @@ fn run_conversation_loop_inner(
                 }
             }
         } else {
-            match client.invoke_with_cancellation(invocation_request, &invocation_cancelled) {
+            match client.invoke_with_cancellation(
+                invocation_request_template.clone(),
+                &invocation_cancelled,
+            ) {
                 Ok(response) => response,
                 Err(error) => {
                     if invocation_cancelled() {
@@ -1399,6 +1421,21 @@ fn run_conversation_loop_inner(
                             error_code: Some(classification.code.to_string()),
                         },
                     );
+                    if classification.retryable_before_output
+                        && pre_output_invocation_recovery_attempts[round]
+                            < MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS
+                    {
+                        pre_output_invocation_recovery_attempts[round] += 1;
+                        tracing::warn!(
+                            task_id = %task.task_id,
+                            round = round,
+                            attempt = pre_output_invocation_recovery_attempts[round],
+                            max_attempts = MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
+                            error_code = classification.code,
+                            "模型未交付内容即发生暂态调用故障，重新执行同一轮请求"
+                        );
+                        continue 'conversation_round;
+                    }
                     tracing::error!(task_id = %task.task_id, round = round, ?error, "LLM invocation failed");
                     if task_lease_is_current(task_store, task_id, lease_id) {
                         append_task_error_turn_item(
@@ -1434,6 +1471,7 @@ fn run_conversation_loop_inner(
             upsert_task_thinking_turn_item(
                 turn_writeback_context,
                 &thinking_item_id,
+                round,
                 "completed",
                 &thinking,
                 None,
@@ -1456,6 +1494,7 @@ fn run_conversation_loop_inner(
             upsert_task_stream_turn_item(
                 turn_writeback_context,
                 &stream_item_id,
+                round,
                 "completed",
                 completed_stream_content,
                 None,
@@ -1504,8 +1543,10 @@ fn run_conversation_loop_inner(
         let assistant_history_content = parsed.content.clone();
         if !round_has_tool_calls && let Some(ref content) = parsed.content {
             final_content = content.clone();
+            final_model_round = Some(round);
         } else if !round_has_tool_calls && !streamed_content.trim().is_empty() {
             final_content = streamed_content.clone();
+            final_model_round = Some(round);
         }
         if round_has_tool_calls {
             had_tool_calls = true;
@@ -1529,25 +1570,6 @@ fn run_conversation_loop_inner(
                         &required_tool_chain,
                         &completed_required_tool_names,
                     )),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                });
-                continue;
-            }
-            if let Some(recovery_prompt) =
-                agent_spawn_requirement_recovery_prompt(task, task_store, &tool_call_records, &[])
-            {
-                messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: assistant_history_content.clone(),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                });
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(recovery_prompt),
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
@@ -1622,20 +1644,6 @@ fn run_conversation_loop_inner(
             }
         }
 
-        if let Some(recovery_prompt) = agent_spawn_requirement_recovery_prompt(
-            task,
-            task_store,
-            &tool_call_records,
-            &parsed.tool_calls,
-        ) {
-            append_unexecuted_tool_recovery_messages(
-                &mut messages,
-                assistant_history_content.clone(),
-                recovery_prompt,
-            );
-            continue;
-        }
-
         messages.push(ChatMessage {
             role: "assistant".to_string(),
             content: assistant_history_content.clone(),
@@ -1669,6 +1677,7 @@ fn run_conversation_loop_inner(
             workspace_root_path.as_ref(),
             turn_visibility.worker_id(),
             &parsed.tool_calls,
+            &mut tool_execution_ledger,
             snapshot_session.clone(),
             execution_group_id.clone(),
         );
@@ -1684,34 +1693,38 @@ fn run_conversation_loop_inner(
                 tool_status,
             );
             let canonical_tool_name = canonical_tool_call_name(&tool_call.function.name);
-            if !matches!(tool_status, ExecutionResultStatus::Succeeded)
-                && !tool_result_is_recoverable_failure(&result)
-            {
-                let failure_summary = format!(
-                    "{}: {}",
-                    tool_call.function.name,
-                    summarize_tool_result(&result)
-                );
-                if let Some((_, existing_summary)) = unresolved_tool_failures
-                    .iter_mut()
-                    .find(|(tool_name, _)| tool_name == &canonical_tool_name)
+            if !tool_result_execution_was_skipped(&result) {
+                if !matches!(tool_status, ExecutionResultStatus::Succeeded)
+                    && !tool_result_is_recoverable_failure(&result)
                 {
-                    *existing_summary = failure_summary;
-                } else {
-                    unresolved_tool_failures.push((canonical_tool_name.clone(), failure_summary));
+                    let failure_summary = format!(
+                        "{}: {}",
+                        tool_call.function.name,
+                        summarize_tool_result(&result)
+                    );
+                    if let Some((_, existing_summary)) = unresolved_tool_failures
+                        .iter_mut()
+                        .find(|(tool_name, _)| tool_name == &canonical_tool_name)
+                    {
+                        *existing_summary = failure_summary;
+                    } else {
+                        unresolved_tool_failures
+                            .push((canonical_tool_name.clone(), failure_summary));
+                    }
                 }
-            }
-            if matches!(tool_status, ExecutionResultStatus::Succeeded) {
-                unresolved_tool_failures.retain(|(tool_name, _)| tool_name != &canonical_tool_name);
-                if let Some(failure) = validate_task_content_requirements(
-                    task,
-                    &canonical_tool_name,
-                    tool_call,
-                    &result,
-                ) {
-                    content_requirement_failures.push(failure);
-                } else {
-                    completed_tool_names_this_round.push(canonical_tool_name);
+                if matches!(tool_status, ExecutionResultStatus::Succeeded) {
+                    unresolved_tool_failures
+                        .retain(|(tool_name, _)| tool_name != &canonical_tool_name);
+                    if let Some(failure) = validate_task_content_requirements(
+                        task,
+                        &canonical_tool_name,
+                        tool_call,
+                        &result,
+                    ) {
+                        content_requirement_failures.push(failure);
+                    } else {
+                        completed_tool_names_this_round.push(canonical_tool_name);
+                    }
                 }
             }
             tool_call_records.push(tool_call_record(tool_call, &result));
@@ -1812,22 +1825,6 @@ fn run_conversation_loop_inner(
     }
 
     if let Some(recovery_prompt) =
-        agent_spawn_requirement_recovery_prompt(task, task_store, &tool_call_records, &[])
-    {
-        append_task_error_turn_item(
-            turn_writeback_context,
-            &recovery_prompt,
-            streaming_entry_id.or(last_stream_item_id.as_deref()),
-        );
-        return (
-            TaskOutcome::Failed {
-                error: recovery_prompt,
-            },
-            context_summary,
-        );
-    }
-
-    if let Some(recovery_prompt) =
         agent_coordination_recovery_prompt(task, task_store, &tool_call_records)
     {
         append_task_error_turn_item(
@@ -1919,6 +1916,7 @@ fn run_conversation_loop_inner(
         &final_content,
         last_stream_item_id.as_deref().or(streaming_entry_id),
         streaming_entry_id,
+        final_model_round,
     );
 
     // P6b：把本轮 LLM 对话追写进当前 thread 的审计 / 恢复记录。
@@ -2283,114 +2281,6 @@ fn non_empty_owned(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn agent_spawn_requirement_recovery_prompt(
-    task: &Task,
-    task_store: &TaskStore,
-    tool_call_records: &[serde_json::Value],
-    proposed_tool_calls: &[ChatToolCall],
-) -> Option<String> {
-    let policy = agent_spawn_required_by_task(task)?;
-    if !agent_spawn_requirement_is_policy_reachable(task) {
-        return None;
-    }
-    let child_count = task_store.get_children(&task.task_id).len();
-    if child_count >= usize::from(policy.minimum_agent_count) {
-        return None;
-    }
-    if agent_spawn_has_explicit_degraded_fallback(tool_call_records) {
-        return None;
-    }
-    if !proposed_tool_calls.is_empty()
-        && proposed_tool_calls
-            .iter()
-            .all(|tool_call| canonical_tool_call_name(&tool_call.function.name) == "agent_spawn")
-    {
-        return None;
-    }
-
-    Some(format!(
-        "当前任务的团队合同要求至少创建 {} 个真实代理，但目前只有 {} 个成功创建。请继续调用 agent_spawn 补足代理契约缺口；不要把失败或降级的 agent_spawn 尝试当作已完成。每个代理都要有独立 display_name、role、goal 和结构化 context_package，子代理自动继承当前主线访问模式。",
-        policy.minimum_agent_count, child_count
-    ))
-}
-
-fn append_unexecuted_tool_recovery_messages(
-    messages: &mut Vec<ChatMessage>,
-    assistant_content: Option<String>,
-    recovery_prompt: String,
-) {
-    // 这条分支明确拒绝执行模型上一轮提出的工具调用。未执行的 function call
-    // 不能进入下一轮历史，否则 OpenAI/Responses 兼容服务会要求不存在的 tool output。
-    messages.push(ChatMessage {
-        role: "assistant".to_string(),
-        content: assistant_content,
-        images: Vec::new(),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-    });
-    messages.push(ChatMessage {
-        role: "user".to_string(),
-        content: Some(recovery_prompt),
-        images: Vec::new(),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-    });
-}
-
-fn agent_spawn_requirement_is_policy_reachable(task: &Task) -> bool {
-    let Some(policy) = task.policy_snapshot.as_ref() else {
-        return true;
-    };
-    if policy.command_mode.eq_ignore_ascii_case("no_tools") {
-        return false;
-    }
-    if policy
-        .denied_tools
-        .iter()
-        .any(|tool| canonical_tool_call_name(tool) == "agent_spawn")
-    {
-        return false;
-    }
-    policy.allowed_tools.is_empty()
-        || policy
-            .allowed_tools
-            .iter()
-            .any(|tool| canonical_tool_call_name(tool) == "agent_spawn")
-}
-
-fn agent_spawn_required_by_task(task: &Task) -> Option<magi_core::AgentDelegationPolicy> {
-    if task.parent_task_id.is_some() {
-        return None;
-    }
-    task.delegation_policy().cloned().or_else(|| {
-        let policy = magi_core::agent_delegation_policy(&task.goal);
-        policy.mode.requires_team().then_some(policy)
-    })
-}
-
-fn agent_spawn_has_explicit_degraded_fallback(tool_call_records: &[serde_json::Value]) -> bool {
-    tool_call_records.iter().any(|record| {
-        let Some(tool_call) = record.get("toolCall") else {
-            return false;
-        };
-        if tool_call
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|name| canonical_tool_call_name(name) != "agent_spawn")
-        {
-            return false;
-        }
-        let Some(result) = tool_call.get("result").and_then(serde_json::Value::as_str) else {
-            return false;
-        };
-        let Ok(payload) = serde_json::from_str::<serde_json::Value>(result) else {
-            return false;
-        };
-        payload.get("status").and_then(serde_json::Value::as_str) == Some("degraded")
-            || payload.get("fallback_mode").is_some()
-    })
-}
-
 fn collected_agent_wait_child_ids(tool_call_records: &[serde_json::Value]) -> BTreeSet<String> {
     let mut collected = BTreeSet::new();
     for record in tool_call_records {
@@ -2504,6 +2394,18 @@ fn tool_result_is_recoverable_failure(result: &str) -> bool {
         })
 }
 
+fn tool_result_execution_was_skipped(result: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(result)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("execution")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .is_some_and(|execution| execution == "skipped")
+}
+
 fn task_has_validation_gate(task: &Task) -> bool {
     task.policy_snapshot
         .as_ref()
@@ -2582,6 +2484,7 @@ fn publish_task_llm_started(
 fn publish_task_thinking_delta(
     context: TaskTurnWritebackContext<'_>,
     item_id: &str,
+    model_round: usize,
     last_sent_len: &std::cell::Cell<usize>,
     streamed_thinking: &std::cell::RefCell<String>,
     publish_gate: &std::cell::RefCell<SessionTurnStreamPublishGate>,
@@ -2611,6 +2514,7 @@ fn publish_task_thinking_delta(
     upsert_task_thinking_turn_item(
         context,
         item_id,
+        model_round,
         "running",
         trimmed,
         stream_update.as_ref(),
@@ -2621,6 +2525,7 @@ fn publish_task_thinking_delta(
 fn upsert_task_thinking_turn_item(
     context: TaskTurnWritebackContext<'_>,
     item_id: &str,
+    model_round: usize,
     status: &str,
     thinking: &str,
     stream_update: Option<&SessionTurnStreamUpdate>,
@@ -2638,6 +2543,7 @@ fn upsert_task_thinking_turn_item(
         Some(item_id.to_string()),
         context.turn_visibility.thread_id().clone(),
     );
+    apply_model_response_round(&mut item, model_round);
     apply_task_worker_detail_visibility(&mut item, context.task, context.turn_visibility);
     if let Some(published) = upsert_session_turn_item_with_task_store(
         context.session_store,
@@ -2665,15 +2571,26 @@ fn upsert_task_thinking_turn_item(
     }
 }
 
-fn publish_task_content_delta(
-    context: TaskTurnWritebackContext<'_>,
-    item_id: &str,
-    last_sent_len: &std::cell::Cell<usize>,
-    streamed_content: &std::cell::RefCell<String>,
-    streamed_visible_content: &std::cell::RefCell<String>,
-    publish_gate: &std::cell::RefCell<SessionTurnStreamPublishGate>,
-    accumulated_content: &str,
-) {
+struct TaskContentDelta<'a> {
+    item_id: &'a str,
+    model_round: usize,
+    last_sent_len: &'a std::cell::Cell<usize>,
+    streamed_content: &'a std::cell::RefCell<String>,
+    streamed_visible_content: &'a std::cell::RefCell<String>,
+    publish_gate: &'a std::cell::RefCell<SessionTurnStreamPublishGate>,
+    accumulated_content: &'a str,
+}
+
+fn publish_task_content_delta(context: TaskTurnWritebackContext<'_>, input: TaskContentDelta<'_>) {
+    let TaskContentDelta {
+        item_id,
+        model_round,
+        last_sent_len,
+        streamed_content,
+        streamed_visible_content,
+        publish_gate,
+        accumulated_content,
+    } = input;
     if accumulated_content.len() <= last_sent_len.get() {
         return;
     }
@@ -2703,6 +2620,7 @@ fn publish_task_content_delta(
     upsert_task_stream_turn_item(
         context,
         item_id,
+        model_round,
         "running",
         &visible_content,
         stream_update.as_ref(),
@@ -2713,6 +2631,7 @@ fn publish_task_content_delta(
 fn upsert_task_stream_turn_item(
     context: TaskTurnWritebackContext<'_>,
     item_id: &str,
+    model_round: usize,
     status: &str,
     content: &str,
     stream_update: Option<&SessionTurnStreamUpdate>,
@@ -2730,6 +2649,7 @@ fn upsert_task_stream_turn_item(
         Some(item_id.to_string()),
         context.turn_visibility.thread_id().clone(),
     );
+    apply_model_response_round(&mut item, model_round);
     apply_task_worker_detail_visibility(&mut item, context.task, context.turn_visibility);
     if let Some(published) = upsert_session_turn_item_with_task_store(
         context.session_store,
@@ -2850,6 +2770,7 @@ fn append_task_final_turn_item(
     final_content: &str,
     final_item_id: Option<&str>,
     timeline_entry_id: Option<&str>,
+    model_round: Option<usize>,
 ) {
     let has_requested_final_item_id = final_item_id.is_some();
     let mut final_item = session_turn_item(
@@ -2860,6 +2781,9 @@ fn append_task_final_turn_item(
         final_item_id.map(str::to_string),
         context.turn_visibility.thread_id().clone(),
     );
+    if let Some(model_round) = model_round {
+        apply_model_response_round(&mut final_item, model_round);
+    }
     apply_task_final_visibility(
         &mut final_item,
         context.task_store,
@@ -3024,8 +2948,15 @@ mod tests {
     struct TaskToolContentThenFinalModelBridgeClient {
         invoke_count: AtomicUsize,
     }
+    struct DuplicateReadToolModelBridgeClient {
+        invoke_count: AtomicUsize,
+        file_path: String,
+    }
 
     struct FailingTaskModelBridgeClient;
+    struct EmptyStreamThenRecoveredTaskModelBridgeClient {
+        invoke_count: AtomicUsize,
+    }
     struct InterruptedThenRecoveredTaskModelBridgeClient {
         invoke_count: AtomicUsize,
         non_stream_fallback_count: AtomicUsize,
@@ -3282,6 +3213,47 @@ mod tests {
         }
     }
 
+    impl ModelBridgeClient for DuplicateReadToolModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            let index = self.invoke_count.fetch_add(1, Ordering::SeqCst);
+            let payload = match index {
+                0 | 1 => serde_json::json!({
+                    "content": null,
+                    "finish_reason": "tool_calls",
+                    "tool_calls": [{
+                        "id": format!("duplicate-file-read-{index}"),
+                        "type": "function",
+                        "function": {
+                            "name": "file_read",
+                            "arguments": serde_json::json!({
+                                "path": self.file_path,
+                            }).to_string(),
+                        }
+                    }]
+                }),
+                _ => serde_json::json!({
+                    "content": "读取结果已确认。",
+                    "finish_reason": "stop",
+                }),
+            };
+            Ok(BridgeResponse {
+                ok: true,
+                payload: payload.to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            self.invoke(request)
+        }
+    }
+
     impl ModelBridgeClient for TaskToolContentThenFinalModelBridgeClient {
         fn invoke(
             &self,
@@ -3371,6 +3343,42 @@ mod tests {
             request: ModelInvocationRequest,
             _on_delta: &dyn Fn(&ModelStreamingDelta),
         ) -> Result<BridgeResponse, BridgeClientError> {
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for EmptyStreamThenRecoveredTaskModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Ok(BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "content": "子代理在暂态空响应后完成。",
+                    "finish_reason": "stop"
+                })
+                .to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            let attempt = self.invoke_count.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Err(BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::RemoteBusiness,
+                    code: Some(-32007),
+                    message: "provider response invalid: empty stream response".to_string(),
+                });
+            }
+            on_delta(&ModelStreamingDelta {
+                content: "子代理在暂态空响应后完成。".to_string(),
+                thinking: String::new(),
+            });
             self.invoke(request)
         }
     }
@@ -4574,284 +4582,13 @@ mod tests {
     }
 
     #[test]
-    fn explicit_agent_request_blocks_final_until_agent_spawn_is_attempted() {
-        let mut task = make_task_loop_test_task("task-agent-spawn-required-final");
-        task.goal = "只读验证：请启动两个只读代理并行工作，一个 explorer 检查目录结构，一个 reviewer 检查配置风险。两个代理都必须完成后再汇总。"
-            .to_string();
+    fn explicit_agent_requests_do_not_force_a_single_tool_round() {
+        let mut task = make_task_loop_test_task("task-agent-request-no-forced-spawn");
+        task.goal = "请用多个代理检查当前项目结构并汇总。".to_string();
 
-        let outcome = run_static_task_final(&task, "我直接在主线完成检查。");
+        let outcome = run_static_task_final(&task, "主线已完成当前范围内的结构检查。");
 
-        match outcome {
-            TaskOutcome::Failed { error } => {
-                assert!(error.contains("agent_spawn"));
-                assert!(error.contains("代理契约"));
-            }
-            other => panic!("明确要求代理时不能直接 final，got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn explicit_subagent_mode_blocks_final_until_agent_spawn_is_attempted() {
-        let mut task = make_task_loop_test_task("task-subagent-mode-required-final");
-        task.goal = "使用 subagent 模式检查当前项目结构和配置风险，代理完成后再汇总。".to_string();
-
-        let outcome = run_static_task_final(&task, "我直接在主线完成检查。");
-
-        match outcome {
-            TaskOutcome::Failed { error } => {
-                assert!(error.contains("agent_spawn"));
-                assert!(error.contains("代理契约"));
-            }
-            other => panic!("subagent 模式不能被主线 final 冒充，got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn mixed_chinese_english_agent_mode_blocks_final_until_agent_spawn_is_attempted() {
-        let mut task = make_task_loop_test_task("task-mixed-agent-mode-required-final");
-        task.goal = "使用子 agent 模式检查当前项目结构和配置风险，代理完成后再汇总。".to_string();
-
-        let outcome = run_static_task_final(&task, "我直接在主线完成检查。");
-
-        match outcome {
-            TaskOutcome::Failed { error } => {
-                assert!(error.contains("agent_spawn"));
-                assert!(error.contains("代理契约"));
-            }
-            other => panic!("子 agent 模式不能被主线 final 冒充，got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn explicit_agent_request_still_requires_agent_spawn_in_read_only_mode() {
-        let mut task = make_task_loop_test_task("task-agent-spawn-read-only-reachable");
-        task.goal = "只读验证：请启动 explorer 代理检查目录结构。".to_string();
-        task.policy_snapshot = Some(magi_core::TaskPolicy {
-            autonomy_level: "Autonomous".to_string(),
-            access_profile: magi_core::AccessProfile::ReadOnly,
-            allowed_tools: Vec::new(),
-            denied_tools: Vec::new(),
-            allowed_paths: Vec::new(),
-            denied_paths: Vec::new(),
-            read_only_paths: Vec::new(),
-            network_mode: "full".to_string(),
-            command_mode: "read_only".to_string(),
-            retry_limit: 1,
-            validation_profile: Some("required".to_string()),
-            checkpoint_mode: "task_or_phase".to_string(),
-            task_tier: TaskTier::ExecutionChain,
-            background_allowed: true,
-            escalation_conditions: Vec::new(),
-        });
-
-        let outcome =
-            run_static_task_final(&task, "当前只读访问模式不启动代理；我在主线完成只读分析。");
-
-        match outcome {
-            TaskOutcome::Failed { error } => {
-                assert!(error.contains("agent_spawn"));
-                assert!(error.contains("代理契约"));
-            }
-            other => panic!("只读模式仍应保护真实子代理契约，got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn explicit_agent_request_respects_agent_spawn_tool_filters() {
-        let task_store = TaskStore::new();
-        let mut task = make_task_loop_test_task("task-agent-spawn-filtered");
-        task.goal = "请启动 explorer 代理检查目录结构。".to_string();
-        let mut policy = magi_core::TaskPolicy {
-            autonomy_level: "Autonomous".to_string(),
-            access_profile: magi_core::AccessProfile::Restricted,
-            allowed_tools: Vec::new(),
-            denied_tools: Vec::new(),
-            allowed_paths: Vec::new(),
-            denied_paths: Vec::new(),
-            read_only_paths: Vec::new(),
-            network_mode: "full".to_string(),
-            command_mode: "full".to_string(),
-            retry_limit: 1,
-            validation_profile: Some("required".to_string()),
-            checkpoint_mode: "task_or_phase".to_string(),
-            task_tier: TaskTier::ExecutionChain,
-            background_allowed: true,
-            escalation_conditions: Vec::new(),
-        };
-        task.policy_snapshot = Some(policy.clone());
-        assert!(
-            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[]).is_some(),
-            "agent_spawn 可达时仍应保护明确代理契约"
-        );
-
-        policy.denied_tools = vec!["agent_spawn".to_string()];
-        task.policy_snapshot = Some(policy.clone());
-        assert!(
-            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[]).is_none(),
-            "策略显式拒绝 agent_spawn 时不能继续强制模型调用"
-        );
-
-        policy.denied_tools.clear();
-        policy.allowed_tools = vec!["file_read".to_string()];
-        task.policy_snapshot = Some(policy.clone());
-        assert!(
-            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[]).is_none(),
-            "allowed_tools 白名单不含 agent_spawn 时不能继续强制模型调用"
-        );
-
-        policy.allowed_tools = vec!["agent_spawn".to_string()];
-        task.policy_snapshot = Some(policy);
-        assert!(
-            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[]).is_some(),
-            "agent_spawn canonical name 进入白名单时应视为可达"
-        );
-    }
-
-    #[test]
-    fn mainline_agent_concept_discussion_does_not_force_agent_spawn() {
-        let mut task = make_task_loop_test_task("task-agent-concept-no-spawn");
-        task.goal = "请说明主模型和代理的职责边界，以及什么时候应该使用代理。".to_string();
-
-        let outcome = run_static_task_final(&task, "主线可以直接推进关键路径，代理用于并行协作。");
-
-        match outcome {
-            TaskOutcome::Completed { .. } => {}
-            other => panic!("讨论代理使用方式不应强制 agent_spawn，got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn explicit_agent_request_rejects_mainline_tool_substitution() {
-        let task_store = TaskStore::new();
-        let mut task = make_task_loop_test_task("task-agent-spawn-required-tools");
-        task.goal = "请启动 explorer 代理检查 /tmp，只读执行，代理完成后再汇总。".to_string();
-        task_store.insert_task(task.clone());
-        let shell_call = ChatToolCall {
-            id: "call-shell".to_string(),
-            kind: "function".to_string(),
-            function: magi_bridge_client::ChatToolFunction {
-                name: "shell_exec".to_string(),
-                arguments: serde_json::json!({
-                    "command": "ls /tmp",
-                    "access_mode": "read_only"
-                })
-                .to_string(),
-            },
-        };
-        let spawn_call = ChatToolCall {
-            id: "call-agent-spawn".to_string(),
-            kind: "function".to_string(),
-            function: magi_bridge_client::ChatToolFunction {
-                name: "agent_spawn".to_string(),
-                arguments: serde_json::json!({
-                    "role": "explorer",
-                    "display_name": "目录观察代理",
-                    "goal": "检查 /tmp 顶层结构"
-                })
-                .to_string(),
-            },
-        };
-
-        assert!(
-            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[shell_call])
-                .is_some(),
-            "明确要求代理时，主线工具不能冒充代理契约"
-        );
-        assert!(
-            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[spawn_call])
-                .is_none(),
-            "同一轮真正发起 agent_spawn 时允许进入工具执行"
-        );
-
-        let mut recovery_messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: Some(task.goal.clone()),
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }];
-        append_unexecuted_tool_recovery_messages(
-            &mut recovery_messages,
-            Some("我先直接读取目录。".to_string()),
-            "必须创建真实子代理。".to_string(),
-        );
-        assert_eq!(recovery_messages.len(), 3);
-        assert_eq!(recovery_messages[1].role, "assistant");
-        assert!(recovery_messages[1].tool_calls.is_empty());
-        assert_eq!(
-            recovery_messages[2].content.as_deref(),
-            Some("必须创建真实子代理。")
-        );
-
-        let attempted_spawn_record = serde_json::json!({
-            "type": "tool_call",
-            "toolCall": {
-                "name": "agent_spawn",
-                "result": serde_json::json!({
-                    "tool": "agent_spawn",
-                    "status": "degraded",
-                    "fallback_mode": "mainline_or_reassign",
-                    "instruction": "改派其他代理或由主线接管"
-                }).to_string()
-            }
-        });
-        let failed_spawn_record = serde_json::json!({
-            "type": "tool_call",
-            "toolCall": {
-                "name": "agent_spawn",
-                "result": serde_json::json!({
-                    "tool": "agent_spawn",
-                    "status": "failed",
-                    "error_code": "invalid_context_package"
-                }).to_string()
-            }
-        });
-        assert!(
-            agent_spawn_requirement_recovery_prompt(
-                &task,
-                &task_store,
-                &[failed_spawn_record],
-                &[],
-            )
-            .is_some(),
-            "失败的 agent_spawn 不能绕过代理契约，必须允许重试或改派"
-        );
-        assert!(
-            agent_spawn_requirement_recovery_prompt(
-                &task,
-                &task_store,
-                &[attempted_spawn_record],
-                &[],
-            )
-            .is_none(),
-            "agent_spawn 已尝试但不可用时，后续允许模型按工具结果改派或主线接管"
-        );
-    }
-
-    #[test]
-    fn ordinary_task_does_not_require_agent_spawn() {
-        let task_store = TaskStore::new();
-        let mut task = make_task_loop_test_task("task-no-agent-spawn-required");
-        task.goal = "检查 /tmp 顶层结构并汇总，不要修改文件。".to_string();
-        task_store.insert_task(task.clone());
-
-        assert!(
-            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[]).is_none(),
-            "普通任务不应被代理硬约束误伤"
-        );
-    }
-
-    #[test]
-    fn explicit_no_subagent_instruction_does_not_force_agent_spawn() {
-        let task_store = TaskStore::new();
-        let mut task = make_task_loop_test_task("task-explicit-no-subagent");
-        task.goal = "请执行 sleep 2 后只回复标记，不要创建子代理，不要修改文件。".to_string();
-        task_store.insert_task(task.clone());
-
-        assert!(
-            agent_spawn_requirement_recovery_prompt(&task, &task_store, &[], &[]).is_none(),
-            "否定的子代理指令不能反向变成 agent_spawn 强约束"
-        );
+        assert!(matches!(outcome, TaskOutcome::Completed { .. }));
     }
 
     #[test]
@@ -5044,6 +4781,21 @@ mod tests {
         assert!(tool_result_is_recoverable_failure(&capacity_signal));
         assert!(!tool_result_is_recoverable_failure(&safety_rejection));
         assert!(!tool_result_is_recoverable_failure("not json"));
+    }
+
+    #[test]
+    fn skipped_tool_budget_result_does_not_change_task_execution_state() {
+        let skipped = serde_json::json!({
+            "tool": "web_search",
+            "status": "succeeded",
+            "execution": "skipped",
+            "reason": "tool_call_budget_exhausted",
+        })
+        .to_string();
+        assert!(tool_result_execution_was_skipped(&skipped));
+        assert!(!tool_result_execution_was_skipped(
+            r#"{"tool":"web_search","status":"succeeded","execution":"reused"}"#
+        ));
     }
 
     #[test]
@@ -5409,6 +5161,7 @@ mod tests {
             "primary action 已完成",
             Some("timeline-streaming-task-action-final-root-running"),
             Some("timeline-streaming-task-action-final-root-running"),
+            None,
         );
 
         let current_turn = session_store
@@ -5590,6 +5343,132 @@ mod tests {
             terminal_error_event.payload["current_turn"]["response_duration_ms"].is_number(),
             "terminal error event must carry backend duration for live UI"
         );
+    }
+
+    #[test]
+    fn conversation_loop_retries_subagent_after_empty_stream_before_output() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(64);
+        let session_id = SessionId::new("session-subagent-empty-stream-recovery");
+        let workspace_id = Some(WorkspaceId::new("workspace-subagent-empty-stream-recovery"));
+        let task_id = TaskId::new("task-subagent-empty-stream-recovery");
+        let worker_id = WorkerId::new("worker-subagent-empty-stream-recovery");
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "subagent empty stream recovery session",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-subagent-empty-stream-recovery".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("验证子代理空流恢复".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be creatable");
+
+        let task_store = TaskStore::new();
+        let mut task = make_task_loop_test_task(task_id.as_str());
+        task.parent_task_id = Some(TaskId::new("task-subagent-empty-stream-root"));
+        task_store.insert_task(task.clone());
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "executor",
+                60_000,
+            )
+            .expect("lease should be granted");
+        let now = UtcMillis::now();
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
+        let worker_thread_id = ThreadId::new("thread-subagent-empty-stream-recovery");
+        session_store.register_thread(ExecutionThread {
+            thread_id: worker_thread_id.clone(),
+            session_id: session_id.clone(),
+            mission_id: task.mission_id.clone(),
+            role_id: "executor".to_string(),
+            worker_instance_id: worker_id.clone(),
+            status: ExecutionThreadStatus::Active,
+            created_at: now,
+            last_used_at: now,
+            handled_task_ids: vec![task.task_id.clone()],
+            message_history: Vec::new(),
+        });
+        let client = EmptyStreamThenRecoveredTaskModelBridgeClient {
+            invoke_count: AtomicUsize::new(0),
+        };
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
+            conversation_registry: &ConversationRegistry::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
+            plan_store: &crate::test_plan_store("test-plan"),
+            project_memory: None,
+            mission_metrics: None,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "请执行子代理任务".to_string(),
+            images: Vec::new(),
+            tools: None,
+            usage_binding: &usage_binding,
+            streaming_entry_id: Some("timeline-subagent-empty-stream-recovery"),
+            is_sidechain: true,
+            worker_id: Some(&worker_id),
+            thread_id: &worker_thread_id,
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
+            persist_session_state: None,
+        });
+
+        assert!(matches!(outcome, TaskOutcome::Completed { .. }));
+        assert_eq!(
+            client.invoke_count.load(Ordering::SeqCst),
+            2,
+            "空流且未交付内容时必须重试同一轮请求"
+        );
+        let turn = session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("turn should exist");
+        assert!(turn.items.iter().any(|item| {
+            item.kind == "assistant_final"
+                && item.status == "completed"
+                && item.content.as_deref() == Some("子代理在暂态空响应后完成。")
+                && item.source_thread_id == worker_thread_id
+        }));
+        assert!(turn.items.iter().all(|item| item.kind != "assistant_error"));
+        assert!(turn.items.iter().all(|item| {
+            item.source_thread_id == worker_thread_id
+                || item.source_thread_id == orchestrator_thread_id
+        }));
     }
 
     #[test]
@@ -6115,5 +5994,164 @@ mod tests {
                     == serde_json::Value::String(worker_id.to_string())),
             "工具运行时事件也必须沿用同一个 worker 归属"
         );
+    }
+
+    fn assert_duplicate_read_calls_are_reused_in_conversation_loop(is_sidechain: bool) {
+        let dir = tempfile::tempdir().expect("workspace tempdir");
+        let file_path = dir.path().join("fixture.txt");
+        std::fs::write(&file_path, "Magi duplicate tool fixture").expect("fixture write");
+        let suffix = if is_sidechain {
+            "sidechain"
+        } else {
+            "mainline"
+        };
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(64);
+        let task_store = TaskStore::new();
+        let mut task = make_task_loop_test_task(&format!("task-duplicate-read-{suffix}"));
+        task.goal = "读取 fixture.txt 并确认结果。".to_string();
+        task_store.insert_task(task.clone());
+        let session_id = SessionId::new(format!("session-duplicate-read-{suffix}"));
+        let workspace_id = Some(WorkspaceId::new(format!(
+            "workspace-duplicate-read-{suffix}"
+        )));
+        session_store
+            .create_session(session_id.clone(), "duplicate read fixture")
+            .expect("session should be creatable");
+        let now = UtcMillis::now();
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || task.mission_id.clone());
+        let worker_id = WorkerId::new(format!("worker-duplicate-read-{suffix}"));
+        let thread_id = if is_sidechain {
+            let thread = ExecutionThread {
+                thread_id: ThreadId::new(format!("thread-duplicate-read-{suffix}")),
+                session_id: session_id.clone(),
+                mission_id: task.mission_id.clone(),
+                role_id: "executor".to_string(),
+                worker_instance_id: worker_id.clone(),
+                status: ExecutionThreadStatus::Active,
+                created_at: now,
+                last_used_at: now,
+                handled_task_ids: vec![task.task_id.clone()],
+                message_history: Vec::new(),
+            };
+            let thread_id = thread.thread_id.clone();
+            session_store.register_thread(thread);
+            thread_id
+        } else {
+            orchestrator_thread_id
+        };
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: format!("turn-duplicate-read-{suffix}"),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    status: "running".to_string(),
+                    user_message: Some("读取 fixture".to_string()),
+                    items: Vec::new(),
+                    completed_at: None,
+                },
+            )
+            .expect("turn should be creatable");
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "executor",
+                60_000,
+            )
+            .expect("lease should be granted");
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_default_builtins();
+        let client = DuplicateReadToolModelBridgeClient {
+            invoke_count: AtomicUsize::new(0),
+            file_path: file_path.to_string_lossy().to_string(),
+        };
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+        let execution_registry = TaskExecutionRegistry::default();
+        let conversation_registry = ConversationRegistry::new();
+        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let spawn_graph = std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let plan_store = crate::test_plan_store(&format!("plan-duplicate-read-{suffix}"));
+
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: Some(&tool_registry),
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            conversation_registry: &conversation_registry,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            safety_gate: None,
+            plan_store: &plan_store,
+            project_memory: None,
+            mission_metrics: None,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "读取 fixture".to_string(),
+            images: Vec::new(),
+            tools: None,
+            usage_binding: &usage_binding,
+            streaming_entry_id: None,
+            is_sidechain,
+            worker_id: Some(&worker_id),
+            thread_id: &thread_id,
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: Some(dir.path().to_path_buf()),
+            snapshot_session: None,
+            execution_group_id: None,
+            persist_session_state: None,
+        });
+
+        assert!(matches!(outcome, TaskOutcome::Completed { .. }));
+        let events = event_bus.snapshot().recent_events;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "tool.call.started")
+                .count(),
+            1,
+            "{suffix} 重复的 file_read 只能真实执行一次"
+        );
+        let turn = session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("turn should remain observable");
+        let results = turn
+            .items
+            .iter()
+            .filter(|item| item.kind == "tool_call_result")
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2, "两个模型请求都必须保留审计记录");
+        let reused_payload: serde_json::Value = serde_json::from_str(
+            results[1]
+                .tool_result
+                .as_deref()
+                .expect("duplicate call must have a result"),
+        )
+        .expect("duplicate result should be structured json");
+        assert_eq!(reused_payload["execution"], "reused");
+    }
+
+    #[test]
+    fn conversation_loop_reuses_duplicate_read_calls_for_mainline_and_sidechain() {
+        assert_duplicate_read_calls_are_reused_in_conversation_loop(false);
+        assert_duplicate_read_calls_are_reused_in_conversation_loop(true);
     }
 }

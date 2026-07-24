@@ -5,7 +5,7 @@
 
 use std::{
     env, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
     sync::{Arc, Mutex},
     time::Duration,
@@ -82,7 +82,7 @@ fn default_state_root() -> PathBuf {
         .join(".magi")
 }
 
-fn staged_update_paths(state_root: &PathBuf) -> (PathBuf, PathBuf) {
+fn staged_update_paths(state_root: &Path) -> (PathBuf, PathBuf) {
     let directory = state_root.join(DESKTOP_UPDATE_DIRECTORY);
     (
         directory.join(STAGED_UPDATE_BYTES_FILE),
@@ -90,13 +90,13 @@ fn staged_update_paths(state_root: &PathBuf) -> (PathBuf, PathBuf) {
     )
 }
 
-fn remove_staged_update(state_root: &PathBuf) {
+fn remove_staged_update(state_root: &Path) {
     let (bytes_path, metadata_path) = staged_update_paths(state_root);
     let _ = fs::remove_file(bytes_path);
     let _ = fs::remove_file(metadata_path);
 }
 
-fn read_staged_update(state_root: &PathBuf) -> Result<Option<StagedDesktopUpdate>, String> {
+fn read_staged_update(state_root: &Path) -> Result<Option<StagedDesktopUpdate>, String> {
     let (bytes_path, metadata_path) = staged_update_paths(state_root);
     let metadata = match fs::read(&metadata_path) {
         Ok(metadata) => metadata,
@@ -136,7 +136,7 @@ fn read_staged_update(state_root: &PathBuf) -> Result<Option<StagedDesktopUpdate
 }
 
 fn write_staged_update(
-    state_root: &PathBuf,
+    state_root: &Path,
     update: &StagedDesktopUpdate,
     bytes: &[u8],
 ) -> Result<(), String> {

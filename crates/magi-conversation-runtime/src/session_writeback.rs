@@ -40,6 +40,17 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, thread};
 
 pub type SessionStatePersistCallback = dyn Fn(&str) + Send + Sync;
 
+/// 同一模型调用轮次的思考与正文必须共享这个稳定关联键。
+/// 呈现层据此只在同一轮内重排思考与正文，不能把后续轮次错误并入前一段思考。
+pub const MODEL_RESPONSE_ROUND_METADATA_KEY: &str = "modelRound";
+
+pub fn apply_model_response_round(item: &mut ActiveExecutionTurnItem, round: usize) {
+    item.metadata.insert(
+        MODEL_RESPONSE_ROUND_METADATA_KEY.to_string(),
+        Value::from(round as u64),
+    );
+}
+
 pub fn persist_session_state_checkpoint(
     callback: Option<&SessionStatePersistCallback>,
     checkpoint: &'static str,

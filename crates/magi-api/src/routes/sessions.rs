@@ -3,19 +3,24 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
+#[cfg(test)]
 use magi_conversation_runtime::session_turn_execution::{
     SessionGoalTurnMode, SessionTurnExecutionError, SessionTurnExecutionOutput,
     SessionTurnExecutionRequest, SessionTurnFailureReason,
 };
+use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
+#[cfg(test)]
 use magi_conversation_runtime::session_writeback::{
-    SessionTurnErrorInput, append_session_turn_error_item, publish_current_session_turn_item_event,
+    SessionTurnErrorInput, append_session_turn_error_item,
 };
 use magi_conversation_runtime::{
     SessionTurnInputCommitError, SessionTurnInputError, UserSignal, public_builtin_tool_references,
     tool_reference_position,
 };
-use magi_core::{AccessProfile, SessionLifecycleStatus, TaskStatus};
+#[cfg(test)]
+use magi_core::AccessProfile;
 use magi_core::{DomainError, EventId, SessionId, TaskTier, UtcMillis, WorkerId, WorkspaceId};
+use magi_core::{SessionLifecycleStatus, TaskStatus};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn,
@@ -160,48 +165,17 @@ async fn submit_session_turn(
         }
     }
     match decision.route {
-        SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute => {
-            submit_regular_session_turn(state, request, images, workspace_id, accepted_at, decision)
-                .await
-                .map(Json)
-        }
-        SessionTurnRouteDto::Task => {
-            let (accepted, event_id) = super::accept_session_task_submission(
-                &state,
-                &request,
+        SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute | SessionTurnRouteDto::Task => {
+            submit_root_coordinator_session_turn(
+                state,
+                request,
                 images,
-                workspace_id.clone(),
-                decision.task_title.clone(),
-                decision.execution_goal.clone(),
-                decision.task_tier,
+                workspace_id,
+                accepted_at,
+                decision,
             )
-            .await?;
-            super::finalize_session_task_dispatch(state.clone(), accepted.clone()).await;
-            let execution_chain_ref = state
-                .session_store
-                .runtime_sidecar(&accepted.session_id)
-                .and_then(|sidecar| sidecar.ownership.execution_chain_ref);
-            let (accepted_canonical_turn, accepted_canonical_item) =
-                super::dispatch_accepted_canonical_event(&state, &accepted);
-            Ok(Json(
-                SessionTurnResponseDto::new(SessionTurnResponseInput {
-                    session_id: accepted.session_id,
-                    entry_id: accepted.entry_id,
-                    event_id,
-                    accepted_at: accepted.accepted_at,
-                    created_session: accepted.created_session,
-                    route: SessionTurnRouteDto::Task,
-                    root_task_id: Some(accepted.root_task_id),
-                    action_task_id: Some(accepted.action_task_id),
-                    execution_chain_ref,
-                    user_message_item_id: Some(accepted.user_message_item_id),
-                })
-                .with_canonical_event(
-                    "turn_started",
-                    accepted_canonical_turn,
-                    accepted_canonical_item,
-                ),
-            ))
+            .await
+            .map(Json)
         }
         SessionTurnRouteDto::Steer => {
             unreachable!("steer route should be handled before classifier")
@@ -572,16 +546,17 @@ fn local_session_turn_intent_decision(
     let requests_goal_mode = session_turn_requests_explicit_goal_mode(request);
     let requests_explicit_task_or_agent =
         session_turn_requests_explicit_task_or_agent_mode(request);
-    let requests_automatic_team = magi_core::text_requires_automatic_agent_team(&task_text);
-    let requests_simple_execution = !requests_automatic_team
-        && (session_turn_requests_simple_execution_by_local_rules(request)
-            || session_turn_requested_public_builtin_tools(request).is_some());
+    let requests_proactive_collaboration =
+        !session_turn_explicitly_rejects_collaboration(&task_text.to_ascii_lowercase())
+            && session_turn_has_structured_task_scope(&task_text.to_ascii_lowercase());
+    let requests_simple_execution = session_turn_requests_simple_execution_by_local_rules(request)
+        || session_turn_requested_public_builtin_tools(request).is_some();
     let route = if has_recoverable_chain && session_turn_requests_continue_existing_task(request) {
         SessionTurnRouteDto::Continue
     } else if requests_goal_mode && !requests_explicit_task_or_agent {
         SessionTurnRouteDto::Chat
     } else if requests_explicit_task_or_agent
-        || requests_automatic_team
+        || requests_proactive_collaboration
         || (session_turn_requests_task_by_local_rules(request) && !requests_simple_execution)
     {
         SessionTurnRouteDto::Task
@@ -592,11 +567,11 @@ fn local_session_turn_intent_decision(
     };
     let task_tier = TaskTier::ExecutionChain;
     let task_evidence = if matches!(route, SessionTurnRouteDto::Task) {
-        if requests_automatic_team {
-            vec!["本地任务分解判定需要团队并行执行".to_string()]
+        vec![if requests_proactive_collaboration {
+            "任务具有可独立推进的多个工作面，交由 root coordinator 评估协作".to_string()
         } else {
-            vec!["本地路由判定需要结构化任务执行".to_string()]
-        }
+            "本地路由判定需要结构化任务执行".to_string()
+        }]
     } else {
         Vec::new()
     };
@@ -614,10 +589,10 @@ fn local_session_turn_intent_decision(
             match route {
                 SessionTurnRouteDto::Continue => "continue_requested",
                 SessionTurnRouteDto::Task => {
-                    if requests_automatic_team {
-                        "automatic_team_required"
+                    if requests_proactive_collaboration {
+                        "proactive_collaboration_candidate"
                     } else {
-                        "explicit_task_request"
+                        "structured_task_request"
                     }
                 }
                 SessionTurnRouteDto::Execute => "tool_request",
@@ -635,8 +610,8 @@ fn local_session_turn_intent_decision(
             match route {
                 SessionTurnRouteDto::Continue => "用户要求继续且存在可恢复链",
                 SessionTurnRouteDto::Task => {
-                    if requests_automatic_team {
-                        "任务包含多个独立工作面，自动启用团队并行执行"
+                    if requests_proactive_collaboration {
+                        "任务具有多个可独立推进的工作面，由 root coordinator 评估是否组队"
                     } else {
                         "用户请求需要结构化任务执行"
                     }
@@ -681,7 +656,27 @@ fn normalize_session_turn_decision(
             Some("用户请求目标模式，由主线会话使用 Goal 工具持续推进。".to_string());
         decision.task_evidence.clear();
     }
-    if !matches!(decision.route, SessionTurnRouteDto::Continue)
+    let rejects_collaboration = request
+        .trimmed_text()
+        .as_deref()
+        .map(|text| session_turn_explicitly_rejects_collaboration(&text.to_ascii_lowercase()))
+        .unwrap_or(false);
+    if matches!(decision.route, SessionTurnRouteDto::Task) && rejects_collaboration {
+        let task_text = request
+            .trimmed_text()
+            .unwrap_or_else(|| request.timeline_message(None));
+        decision.route = SessionTurnRouteDto::Execute;
+        decision.task_title = None;
+        decision.execution_goal = None;
+        decision.task_tier = TaskTier::ExecutionChain;
+        decision.tool_intent = Some(task_text);
+        decision.forced_tool_name = None;
+        decision.required_tool_chain.clear();
+        decision.confidence = decision.confidence.max(0.95);
+        decision.reason_code = Some("tool_request".to_string());
+        decision.route_reason = Some("用户明确要求主线直接执行，不创建协作运行记录。".to_string());
+        decision.task_evidence.clear();
+    } else if !matches!(decision.route, SessionTurnRouteDto::Continue)
         && session_turn_requests_explicit_task_or_agent_mode(request)
     {
         let task_text = request
@@ -696,7 +691,12 @@ fn normalize_session_turn_decision(
         decision.execution_goal = Some(task_text.clone());
         decision.tool_intent = None;
         decision.forced_tool_name = None;
-        decision.required_tool_chain.clear();
+        decision.required_tool_chain =
+            if session_turn_requests_explicit_agent_collaboration(request) {
+                vec!["agent_spawn".to_string()]
+            } else {
+                Vec::new()
+            };
         decision.confidence = decision.confidence.max(0.95);
         decision.reason_code = Some("explicit_task_request".to_string());
         decision.route_reason =
@@ -723,17 +723,8 @@ fn normalize_session_turn_decision(
             Some("用户明确要求生成图片，必须调用 image_generate 并展示真实生成结果。".to_string());
         decision.task_evidence.clear();
     }
-    let requests_direct_execution = request
-        .trimmed_text()
-        .as_deref()
-        .is_none_or(|text| !magi_core::text_requires_automatic_agent_team(text))
-        && (session_turn_requests_simple_execution_by_local_rules(request)
-            || session_turn_requested_public_builtin_tools(request).is_some()
-            || (request
-                .trimmed_text()
-                .as_deref()
-                .is_some_and(magi_core::text_prohibits_agent_spawn)
-                && session_turn_requests_execute_by_local_rules(request)));
+    let requests_direct_execution = session_turn_requests_simple_execution_by_local_rules(request)
+        || session_turn_requested_public_builtin_tools(request).is_some();
     if matches!(decision.route, SessionTurnRouteDto::Task)
         && !session_turn_requests_explicit_task_or_agent_mode(request)
         && requests_direct_execution
@@ -856,7 +847,6 @@ fn session_turn_requests_task_by_local_rules(request: &SessionTurnRequestDto) ->
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
-        || magi_core::text_requires_agent_spawn(&normalized)
 }
 
 fn session_turn_requests_simple_execution_by_local_rules(request: &SessionTurnRequestDto) -> bool {
@@ -864,9 +854,6 @@ fn session_turn_requests_simple_execution_by_local_rules(request: &SessionTurnRe
         return false;
     };
     let normalized = text.to_ascii_lowercase();
-    if magi_core::text_requires_automatic_agent_team(&normalized) {
-        return false;
-    }
     if session_turn_requests_explicit_task_or_agent_mode(request)
         || session_turn_has_structured_task_scope(&normalized)
     {
@@ -1179,6 +1166,9 @@ fn session_turn_requests_explicit_task_or_agent_mode(request: &SessionTurnReques
         return false;
     };
     let normalized = text.to_ascii_lowercase();
+    if session_turn_explicitly_rejects_collaboration(&normalized) {
+        return false;
+    }
     normalized.contains("复杂任务模式")
         || normalized.contains("复杂任务")
         || normalized.contains("深度任务")
@@ -1187,7 +1177,80 @@ fn session_turn_requests_explicit_task_or_agent_mode(request: &SessionTurnReques
         || normalized.contains("任务模式完成")
         || normalized.contains("以任务模式")
         || normalized.contains("子任务")
-        || magi_core::text_requires_agent_spawn(&normalized)
+        || normalized.contains("团队模式")
+        || normalized.contains("团队协作")
+        || normalized.contains("多代理")
+        || normalized.contains("多 agent")
+        || normalized.contains("multi-agent")
+        || normalized.contains("multi agent")
+        || normalized.contains("subagent")
+        || normalized.contains("子 agent")
+        || normalized.contains("子代理")
+        || normalized.contains("分派代理")
+        || normalized.contains("派发代理")
+        || normalized.contains("创建代理")
+        || normalized.contains("agent_spawn")
+}
+
+/// 用户明确要求真实代理协作时，入口将其固化为 root coordinator 的结构化首步。
+/// 这不是从模型文本猜测工具，也不会影响自动协作任务；后者仍由 coordinator 基于
+/// 完整工具面自行判断。这里仅保证用户已经明确提出的产品动作不会被弱工具模型忽略。
+fn session_turn_requests_explicit_agent_collaboration(request: &SessionTurnRequestDto) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    let normalized = text.to_ascii_lowercase();
+    !session_turn_explicitly_rejects_collaboration(&normalized)
+        && [
+            "多代理",
+            "多 agent",
+            "multi-agent",
+            "multi agent",
+            "agent",
+            "subagent",
+            "代理",
+            "子 agent",
+            "子代理",
+            "分派代理",
+            "派发代理",
+            "创建代理",
+            "agent_spawn",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+/// 这里只决定 session 是否需要创建 root task，绝不影响 root coordinator 的工具面。
+/// 工具可见性始终由执行角色、访问策略和运行时容量决定；用户明确要求单线执行时，
+/// 仅避免把普通工具操作误路由成协作任务。
+fn session_turn_explicitly_rejects_collaboration(normalized: &str) -> bool {
+    let rejects_collaboration = [
+        "不要创建",
+        "不创建",
+        "不要使用",
+        "不使用",
+        "无需创建",
+        "无需使用",
+        "不启用",
+        "do not create",
+        "do not use",
+        "don't create",
+        "don't use",
+        "without using",
+    ]
+    .iter()
+    .any(|prefix| normalized.contains(prefix));
+    rejects_collaboration
+        && [
+            "子代理",
+            "subagent",
+            "agent",
+            "多代理",
+            "multi-agent",
+            "团队",
+        ]
+        .iter()
+        .any(|term| normalized.contains(term))
 }
 
 enum RequestedBuiltinTools {
@@ -1280,6 +1343,8 @@ fn session_turn_task_route_has_creation_evidence(decision: &SessionTurnIntentDec
         reason_code,
         "explicit_task_request"
             | "automatic_team_required"
+            | "proactive_collaboration_candidate"
+            | "structured_task_request"
             | "multi_step_task"
             | "implementation_or_fix"
             | "requires_structured_execution"
@@ -1355,6 +1420,7 @@ fn build_user_message_turn_item(
     )
 }
 
+#[cfg(test)]
 async fn submit_regular_session_turn(
     state: ApiState,
     request: SessionTurnRequestDto,
@@ -1666,6 +1732,7 @@ async fn submit_regular_session_turn(
     ))
 }
 
+#[cfg(test)]
 fn apply_turn_orchestrator_session_override(
     state: &ApiState,
     request: &SessionTurnRequestDto,
@@ -1678,6 +1745,95 @@ fn apply_turn_orchestrator_session_override(
     super::settings::require_orchestrator_session_model(state, session_id)
 }
 
+/// 所有可执行的主线 Turn 都创建内部 root coordinator task。
+///
+/// 前端仍按原始 route 呈现普通对话或直接执行；运行时不再存在 session runner 与
+/// task runner 两套工具实现。只有被 `agent_spawn` 创建的 worker 会失去协作工具面。
+async fn submit_root_coordinator_session_turn(
+    state: ApiState,
+    request: SessionTurnRequestDto,
+    images: Vec<magi_conversation_runtime::session_images::SessionTurnImage>,
+    workspace_id: WorkspaceId,
+    accepted_at: UtcMillis,
+    decision: SessionTurnIntentDecision,
+) -> Result<SessionTurnResponseDto, ApiError> {
+    let route = decision.route;
+    let user_text = request
+        .trimmed_text()
+        .unwrap_or_else(|| request.timeline_message(None));
+    let goal_mode = decision.reason_code.as_deref() == Some("goal_mode_request");
+    let execution_goal = if goal_mode {
+        format!(
+            "{}\n\n用户原始输入：{}",
+            goal_mode_tool_intent(&request),
+            user_text
+        )
+    } else if let Some(intent) = decision
+        .tool_intent
+        .as_deref()
+        .map(str::trim)
+        .filter(|intent| !intent.is_empty())
+    {
+        format!("{intent}\n\n用户原始输入：{user_text}")
+    } else {
+        decision.execution_goal.clone().unwrap_or(user_text.clone())
+    };
+    let mut required_tool_chain = decision.required_tool_chain.clone();
+    if goal_mode && !required_tool_chain.iter().any(|tool| tool == "get_goal") {
+        required_tool_chain.insert(0, "get_goal".to_string());
+    }
+    if let Some(forced_tool_name) = decision.forced_tool_name.as_deref()
+        && !required_tool_chain
+            .iter()
+            .any(|tool| tool == forced_tool_name)
+    {
+        required_tool_chain.insert(0, forced_tool_name.to_string());
+    }
+
+    let (accepted, event_id) = super::accept_session_task_submission_at(
+        &state,
+        &request,
+        super::SessionTaskSubmissionInput {
+            images,
+            workspace_id,
+            task_title: decision
+                .task_title
+                .clone()
+                .or_else(|| Some(request.mission_title(Some(&user_text)))),
+            execution_goal: Some(execution_goal),
+            task_tier: decision.task_tier,
+            accepted_at,
+            required_tool_chain,
+        },
+    )
+    .await?;
+    super::finalize_session_task_dispatch(state.clone(), accepted.clone()).await;
+    let execution_chain_ref = state
+        .session_store
+        .runtime_sidecar(&accepted.session_id)
+        .and_then(|sidecar| sidecar.ownership.execution_chain_ref);
+    let (accepted_canonical_turn, accepted_canonical_item) =
+        super::dispatch_accepted_canonical_event(&state, &accepted);
+    Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
+        session_id: accepted.session_id,
+        entry_id: accepted.entry_id,
+        event_id,
+        accepted_at: accepted.accepted_at,
+        created_session: accepted.created_session,
+        route,
+        root_task_id: Some(accepted.root_task_id),
+        action_task_id: Some(accepted.action_task_id),
+        execution_chain_ref,
+        user_message_item_id: accepted.user_message_item_id,
+    })
+    .with_canonical_event(
+        "turn_started",
+        accepted_canonical_turn,
+        accepted_canonical_item,
+    ))
+}
+
+#[cfg(test)]
 fn invalidate_orchestrator_thread_history(
     state: &ApiState,
     session_id: &SessionId,
@@ -1694,6 +1850,7 @@ fn invalidate_orchestrator_thread_history(
         .replace_thread_messages(&thread.thread_id, Vec::new(), now);
 }
 
+#[cfg(test)]
 fn spawn_regular_session_turn_execution(
     state: ApiState,
     execution_request: SessionTurnExecutionRequest,
@@ -1769,6 +1926,7 @@ fn spawn_regular_session_turn_execution(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn observe_regular_session_turn_execution(
     join: tokio::task::JoinHandle<Result<SessionTurnExecutionOutput, SessionTurnExecutionError>>,
     state: ApiState,
@@ -1891,6 +2049,7 @@ async fn observe_regular_session_turn_execution(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn finalize_regular_session_turn_execution(
     state: ApiState,
     session_id: SessionId,
@@ -2021,6 +2180,7 @@ fn finalize_regular_session_turn_execution(
     }
 }
 
+#[cfg(test)]
 fn finalize_regular_session_conversation_turn_if_current(
     state: &ApiState,
     session_id: &SessionId,
@@ -2064,7 +2224,7 @@ pub(crate) fn schedule_next_queued_regular_session_turn(
     });
 }
 
-fn record_active_goal_turn_success(state: &ApiState, session_id: &SessionId) {
+pub(crate) fn record_active_goal_turn_success(state: &ApiState, session_id: &SessionId) {
     let Some(goal) = state.session_store.active_goal(session_id) else {
         return;
     };
@@ -2081,7 +2241,7 @@ fn record_active_goal_turn_success(state: &ApiState, session_id: &SessionId) {
     }
 }
 
-fn record_active_goal_turn_failure(state: &ApiState, session_id: &SessionId) {
+pub(crate) fn record_active_goal_turn_failure(state: &ApiState, session_id: &SessionId) {
     let Some(goal) = state.session_store.active_goal(session_id) else {
         return;
     };
@@ -2187,122 +2347,21 @@ async fn submit_goal_continuation_turn(
     goal: SessionGoal,
 ) -> Result<(), ApiError> {
     let accepted_at = super::monotonic_accepted_at();
-    let workspace_root_path = state
-        .workspace_root_path(&workspace_id)
-        .map(|path| path.display().to_string());
-    let (_mission_id, _orchestrator_thread_id) =
-        state
-            .session_store
-            .ensure_session_mission(&session_id, accepted_at, || {
-                magi_core::MissionId::new(format!("mission-session-goal-{}", accepted_at.0))
-            });
-    let entry_id = format!(
-        "timeline-goal-continuation-{}-{}",
-        session_id, accepted_at.0
-    );
-    let turn_id = format!("turn-goal-continuation-{}", accepted_at.0);
-    let mut turn = ActiveExecutionTurn {
-        turn_id: turn_id.clone(),
-        turn_seq: accepted_at.0,
+    let accepted = super::accept_goal_continuation_task_submission(
+        &state,
+        session_id,
+        workspace_id,
+        &goal,
+        goal_continuation_prompt(&goal),
         accepted_at,
-        completed_at: None,
-        status: "running".to_string(),
-        user_message: None,
-        items: Vec::new(),
-    };
-    turn.normalize();
-    state
-        .session_store
-        .accept_current_turn_with_timeline_entry(
-            session_id.clone(),
-            TimelineEntryInput::new(
-                entry_id,
-                TimelineEntryKind::NotificationPublished,
-                format!("目标自动推进: {}", goal.objective),
-                accepted_at,
-            ),
-            turn,
-        )
-        .map_err(|error| {
-            map_current_turn_accept_error("接受 goal continuation turn 失败", error)
-        })?;
-    if let Err(error) = state.persist_session_state_checkpoint("goal_continuation_turn_accepted") {
-        state
-            .conversation_registry
-            .close_session_turn_input(&session_id, &turn_id);
-        publish_regular_session_turn_early_failed(
-            &state,
-            &session_id,
-            workspace_id.clone(),
-            accepted_at,
-            SessionTurnRouteDto::Chat,
-            SessionTurnFailedReason::Execution(SessionTurnFailureReason::RuntimeInvalidState),
-        );
-        return Err(error);
-    }
-    state
-        .conversation_registry
-        .begin_session_turn_input(session_id.clone(), turn_id.clone())
-        .map_err(|error| {
-            publish_regular_session_turn_early_failed(
-                &state,
-                &session_id,
-                workspace_id.clone(),
-                accepted_at,
-                SessionTurnRouteDto::Chat,
-                SessionTurnFailedReason::Execution(SessionTurnFailureReason::RuntimeInvalidState),
-            );
-            ApiError::internal_assembly("开启目标续跑 Turn 引导通道失败", error)
-        })?;
-    let accepted_canonical_turn = state
-        .session_store
-        .canonical_turns_for_session(&session_id)
-        .into_iter()
-        .find(|turn| turn.turn_id == turn_id);
-    publish_regular_session_turn_accepted_event(RegularSessionTurnAcceptedEventInput {
-        state: &state,
-        session_id: &session_id,
-        workspace_id: workspace_id.as_ref(),
-        accepted_at,
-        created_session: false,
-        route: SessionTurnRouteDto::Chat,
-        canonical_turn: accepted_canonical_turn.as_ref(),
-        canonical_item_id: None,
-    });
-    let product_locale = state
-        .settings_runtime_json()
-        .get("locale")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("zh-CN")
-        .to_string();
-    spawn_regular_session_turn_execution(
-        state,
-        SessionTurnExecutionRequest {
-            session_id,
-            turn_id,
-            workspace_id,
-            prompt: goal_continuation_prompt(&goal),
-            images: Vec::new(),
-            context_references: Vec::new(),
-            use_tools: true,
-            access_profile: goal_continuation_access_profile(&goal),
-            skill_name: None,
-            request_id: None,
-            user_message_id: None,
-            placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: vec!["get_goal".to_string()],
-            goal_turn_mode: SessionGoalTurnMode::Continuation,
-            product_locale,
-            workspace_root_path,
-        },
-        accepted_at,
-        SessionTurnRouteDto::Chat,
-        false,
-    );
+    )
+    .await?;
+    super::dispatch_flow::publish_goal_continuation_task_accepted_event(&state, &accepted);
+    super::finalize_session_task_dispatch(state, accepted).await;
     Ok(())
 }
 
+#[cfg(test)]
 fn goal_continuation_access_profile(goal: &SessionGoal) -> AccessProfile {
     goal.access_profile
 }
@@ -2350,19 +2409,8 @@ async fn drain_next_queued_regular_session_turn(
         task_evidence: Vec::new(),
     };
     let submit_result = match queued.route {
-        SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute => {
-            submit_regular_session_turn(
-                state.clone(),
-                queued.request,
-                queued.images,
-                queued.requested_workspace_id,
-                queued.accepted_at,
-                decision,
-            )
-            .await
-        }
-        SessionTurnRouteDto::Task => {
-            submit_queued_task_session_turn(
+        SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute | SessionTurnRouteDto::Task => {
+            submit_root_coordinator_session_turn(
                 state.clone(),
                 queued.request,
                 queued.images,
@@ -2399,53 +2447,7 @@ async fn drain_next_queued_regular_session_turn(
     }
 }
 
-async fn submit_queued_task_session_turn(
-    state: ApiState,
-    request: SessionTurnRequestDto,
-    images: Vec<magi_conversation_runtime::session_images::SessionTurnImage>,
-    requested_workspace_id: WorkspaceId,
-    accepted_at: UtcMillis,
-    decision: SessionTurnIntentDecision,
-) -> Result<SessionTurnResponseDto, ApiError> {
-    let (accepted, event_id) = super::accept_session_task_submission_at(
-        &state,
-        &request,
-        super::SessionTaskSubmissionInput {
-            images,
-            workspace_id: requested_workspace_id,
-            task_title: decision.task_title.clone(),
-            execution_goal: decision.execution_goal.clone(),
-            task_tier: decision.task_tier,
-            accepted_at,
-        },
-    )
-    .await?;
-    super::finalize_session_task_dispatch(state.clone(), accepted.clone()).await;
-    let execution_chain_ref = state
-        .session_store
-        .runtime_sidecar(&accepted.session_id)
-        .and_then(|sidecar| sidecar.ownership.execution_chain_ref);
-    let (accepted_canonical_turn, accepted_canonical_item) =
-        super::dispatch_accepted_canonical_event(&state, &accepted);
-    Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
-        session_id: accepted.session_id,
-        entry_id: accepted.entry_id,
-        event_id,
-        accepted_at: accepted.accepted_at,
-        created_session: accepted.created_session,
-        route: SessionTurnRouteDto::Task,
-        root_task_id: Some(accepted.root_task_id),
-        action_task_id: Some(accepted.action_task_id),
-        execution_chain_ref,
-        user_message_item_id: Some(accepted.user_message_item_id),
-    })
-    .with_canonical_event(
-        "turn_started",
-        accepted_canonical_turn,
-        accepted_canonical_item,
-    ))
-}
-
+#[cfg(test)]
 fn publish_regular_session_turn_early_failed(
     state: &ApiState,
     session_id: &SessionId,
@@ -2484,6 +2486,7 @@ fn publish_regular_session_turn_early_failed(
 
 /// 将会话运行终态写入通知中心，确保模型失败时即使用户没有停留在当前页面，
 /// 也能在通知中心看到可追溯的错误记录。
+#[cfg(test)]
 fn record_session_runtime_incident(
     state: &ApiState,
     session_id: &SessionId,
@@ -2593,6 +2596,7 @@ fn append_terminal_canonical_payload(
     }
 }
 
+#[cfg(test)]
 fn session_turn_completed_event_payload(
     state: &ApiState,
     session_id: &SessionId,
@@ -2610,12 +2614,14 @@ fn session_turn_completed_event_payload(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 enum SessionTurnFailedReason {
     DispatcherUnavailable,
     ActiveTurnConflict,
     Execution(SessionTurnFailureReason),
 }
 
+#[cfg(test)]
 impl SessionTurnFailedReason {
     fn code(self) -> &'static str {
         match self {
@@ -2638,6 +2644,7 @@ impl SessionTurnFailedReason {
     }
 }
 
+#[cfg(test)]
 fn session_turn_failed_event_payload_with_diagnostic(
     session_id: &SessionId,
     route: SessionTurnRouteDto,
@@ -2656,6 +2663,7 @@ fn session_turn_failed_event_payload_with_diagnostic(
     })
 }
 
+#[cfg(test)]
 fn session_turn_failed_event_payload_with_canonical(
     state: &ApiState,
     session_id: &SessionId,
@@ -2676,6 +2684,7 @@ fn session_turn_failed_event_payload_with_canonical(
     payload
 }
 
+#[cfg(test)]
 struct RegularSessionTurnAcceptedEventInput<'a> {
     state: &'a ApiState,
     session_id: &'a SessionId,
@@ -2687,6 +2696,7 @@ struct RegularSessionTurnAcceptedEventInput<'a> {
     canonical_item_id: Option<&'a str>,
 }
 
+#[cfg(test)]
 fn publish_regular_session_turn_accepted_event(
     input: RegularSessionTurnAcceptedEventInput<'_>,
 ) -> EventId {
@@ -3206,12 +3216,7 @@ async fn interrupt_session_turn(
             state
                 .conversation_registry
                 .close_session_turn_input(&session_id, turn_id);
-            finalize_regular_session_conversation_turn_if_current(
-                &state,
-                &session_id,
-                turn_id,
-                false,
-            );
+            let _ = super::finalize_session_turn(&state, &session_id, false);
         }
         let plan_store = magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
         match plan_store.pause() {
@@ -3432,7 +3437,7 @@ fn finalize_continue_session(
             created_session: false,
             root_task_id: accepted.root_task_id.clone(),
             action_task_id: accepted.action_task_id.clone(),
-            user_message_item_id: format!("turn-item-user-{}", continued_at.0),
+            user_message_item_id: Some(format!("turn-item-user-{}", continued_at.0)),
             runner_started: accepted.runner_started,
             superseded_turn: None,
         },
@@ -3581,12 +3586,7 @@ fn cancel_active_session_turn_for_lifecycle(state: &ApiState, session_id: &Sessi
     state
         .conversation_registry
         .close_session_turn_input(session_id, &current_turn.turn_id);
-    finalize_regular_session_conversation_turn_if_current(
-        state,
-        session_id,
-        &current_turn.turn_id,
-        false,
-    );
+    let _ = super::finalize_session_turn(state, session_id, false);
     let plan_store = magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
     let workspace_id = state
         .session_store
@@ -4042,6 +4042,7 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         )
+        .with_task_store(Arc::new(TaskStore::new()))
     }
 
     fn seed_active_plan(
@@ -5844,7 +5845,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_team_task_exposes_team_route_reason() {
+    fn proactive_collaboration_task_exposes_root_evaluation_reason() {
         let state = test_state();
         let request = session_turn_request("修复登录流程问题，并运行测试验证回归结果");
 
@@ -5854,11 +5855,11 @@ mod tests {
         assert!(matches!(decision.route, SessionTurnRouteDto::Task));
         assert_eq!(
             decision.reason_code.as_deref(),
-            Some("automatic_team_required")
+            Some("proactive_collaboration_candidate")
         );
         assert_eq!(
             decision.route_reason.as_deref(),
-            Some("任务包含多个独立工作面，自动启用团队并行执行")
+            Some("任务具有多个可独立推进的工作面，由 root coordinator 评估是否组队")
         );
     }
 
@@ -5871,7 +5872,7 @@ mod tests {
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Task));
         assert!(decision.forced_tool_name.is_none());
-        assert!(decision.required_tool_chain.is_empty());
+        assert_eq!(decision.required_tool_chain, vec!["agent_spawn"]);
         assert_eq!(
             decision.reason_code.as_deref(),
             Some("explicit_task_request")
@@ -5940,7 +5941,7 @@ mod tests {
         assert!(matches!(decision.route, SessionTurnRouteDto::Task));
         assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
         assert!(decision.forced_tool_name.is_none());
-        assert!(decision.required_tool_chain.is_empty());
+        assert_eq!(decision.required_tool_chain, vec!["agent_spawn"]);
         assert_eq!(
             decision.reason_code.as_deref(),
             Some("explicit_task_request")
@@ -5954,6 +5955,25 @@ mod tests {
 
         assert!(matches!(decision.route, SessionTurnRouteDto::Task));
         assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
+        assert_eq!(decision.required_tool_chain, vec!["agent_spawn"]);
+    }
+
+    #[test]
+    fn multi_agent_test_request_uses_execution_chain() {
+        let request = session_turn_request("进行一个多代理测试");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
+        assert_eq!(
+            decision.reason_code.as_deref(),
+            Some("explicit_task_request")
+        );
+        assert_eq!(
+            decision.execution_goal.as_deref(),
+            Some("进行一个多代理测试")
+        );
+        assert_eq!(decision.required_tool_chain, vec!["agent_spawn"]);
     }
 
     #[test]
@@ -5996,6 +6016,7 @@ mod tests {
                 "subagent 模式入口必须创建代理运行记录: {text}"
             );
             assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
+            assert_eq!(decision.required_tool_chain, vec!["agent_spawn"]);
             assert_eq!(
                 decision.reason_code.as_deref(),
                 Some("explicit_task_request")

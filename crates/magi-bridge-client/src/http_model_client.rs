@@ -5,7 +5,7 @@ use crate::llm_types::{
 use crate::protocol::streaming::{SseLineParser, StreamAccumulator, parse_stream_event};
 use crate::protocol::{
     AdaptedResponse, AnthropicMessagesAdapter, OpenAiChatCompletionsAdapter, ProviderAdapter,
-    ProviderFamily,
+    ProviderFamily, ProviderToolNameCodec,
 };
 use crate::types::{
     BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelBridgeClient, ModelInvocationRequest,
@@ -34,6 +34,26 @@ const MODEL_PROVIDER_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MODEL_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MODEL_PROVIDER_TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// 同一上游连接对强制工具选择的真实协议能力。
+///
+/// 这不是模型型号白名单：能力由实际响应学习，并以协议、规范化端点和模型组成的
+/// 连接指纹隔离。API Key 不参与指纹，也不会被记录。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForcedToolChoiceCapability {
+    Unknown,
+    /// 提供方接受指定函数的强制选择。
+    Exact,
+    /// 提供方拒绝指定函数，但接受“本轮必须调用某个工具”。
+    /// 当前 required-tool round 只暴露一个工具，因此该语义仍严格等价于指定函数。
+    Required,
+    /// 提供方没有可用的强制工具选择语义，只能由模型自主选择。
+    AutoOnly,
+}
+
+static FORCED_TOOL_CHOICE_CAPABILITIES: OnceLock<
+    Mutex<HashMap<String, ForcedToolChoiceCapability>>,
+> = OnceLock::new();
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpModelBridgeProtocol {
     ChatCompletions,
@@ -58,6 +78,7 @@ struct HttpModelRequest {
     url: String,
     body: serde_json::Value,
     headers: Vec<(String, String)>,
+    tool_name_codec: ProviderToolNameCodec,
 }
 
 #[cfg(test)]
@@ -146,7 +167,23 @@ impl HttpModelBridgeClient {
         stream: bool,
     ) -> Result<HttpModelRequest, BridgeClientError> {
         let mut headers = self.request_headers();
-        let params = llm_message_params_from_invocation(request, stream, self.reasoning_effort);
+        let mut params = llm_message_params_from_invocation(request, stream, self.reasoning_effort);
+        if matches!(params.tool_choice, Some(ToolChoice::Typed { .. })) {
+            match self.forced_tool_choice_capability() {
+                ForcedToolChoiceCapability::Required => {
+                    params.tool_choice = Some(ToolChoice::Simple("required".to_string()));
+                }
+                ForcedToolChoiceCapability::AutoOnly => {
+                    params.tool_choice = Some(ToolChoice::Typed {
+                        kind: "auto".to_string(),
+                        name: None,
+                    });
+                }
+                ForcedToolChoiceCapability::Unknown | ForcedToolChoiceCapability::Exact => {}
+            }
+        }
+        let tool_name_codec = ProviderToolNameCodec::for_params(&params);
+        tool_name_codec.encode_request_params(&mut params);
         let mut adapted = match self.protocol {
             HttpModelBridgeProtocol::ChatCompletions => OpenAiChatCompletionsAdapter
                 .build_request(&params, &self.model)
@@ -176,6 +213,7 @@ impl HttpModelBridgeClient {
             url,
             body: adapted.body,
             headers,
+            tool_name_codec,
         })
     }
 
@@ -212,6 +250,14 @@ impl HttpModelBridgeClient {
         )
     }
 
+    fn forced_tool_choice_capability(&self) -> ForcedToolChoiceCapability {
+        forced_tool_choice_capability(&self.provider_request_key())
+    }
+
+    fn mark_forced_tool_choice_capability(&self, capability: ForcedToolChoiceCapability) {
+        record_forced_tool_choice_capability(self.provider_request_key(), capability);
+    }
+
     fn invoke_streaming_observed(
         &self,
         request: ModelInvocationRequest,
@@ -229,106 +275,96 @@ impl HttpModelBridgeClient {
 
         let http_request = self.build_http_request(&request, true)?;
         let provider_family = self.provider_family();
-        let forced_tool_choice_request =
-            is_forced_tool_choice_request(&http_request.body, provider_family);
-        let first_attempt_deltas = std::cell::RefCell::new(Vec::new());
+        let mut current_request = http_request;
+        let mut fallback_capability = None;
+        loop {
+            let enforced = is_forced_tool_choice_request(&current_request.body, provider_family);
+            let buffered_deltas = std::cell::RefCell::new(Vec::new());
+            let result = execute_streaming_http_post_with_retries(
+                self.provider_request_key(),
+                current_request.clone(),
+                provider_family,
+                current_request.tool_name_codec.clone(),
+                &|delta| {
+                    if enforced {
+                        buffered_deltas.borrow_mut().push(delta.clone());
+                    } else {
+                        on_delta(delta);
+                    }
+                },
+                on_retry,
+                is_cancelled,
+            );
 
-        let first_result = execute_streaming_http_post_with_retries(
-            self.provider_request_key(),
-            http_request.clone(),
-            provider_family,
-            &|delta| {
-                if forced_tool_choice_request {
-                    first_attempt_deltas.borrow_mut().push(delta.clone());
-                } else {
-                    on_delta(delta);
+            match result {
+                Ok((status, response_body, _retry_after))
+                    if is_forced_tool_choice_rejection(
+                        status,
+                        &response_body,
+                        &current_request.body,
+                        provider_family,
+                    ) =>
+                {
+                    let Some((capability, next_request)) =
+                        request_with_next_tool_choice_enforcement(
+                            &current_request,
+                            provider_family,
+                        )
+                    else {
+                        return Err(provider_http_status_error(status, &response_body));
+                    };
+                    fallback_capability = Some(capability);
+                    current_request = next_request;
                 }
-            },
-            on_retry,
-            is_cancelled,
-        );
-
-        let (status, response_body, _retry_after) = match first_result {
-            Ok(result) => {
-                for delta in first_attempt_deltas.borrow_mut().drain(..) {
-                    on_delta(&delta);
+                Err(error)
+                    if is_forced_tool_choice_rejection_error(
+                        &error,
+                        &current_request.body,
+                        provider_family,
+                    ) =>
+                {
+                    let Some((capability, next_request)) =
+                        request_with_next_tool_choice_enforcement(
+                            &current_request,
+                            provider_family,
+                        )
+                    else {
+                        return Err(error);
+                    };
+                    fallback_capability = Some(capability);
+                    current_request = next_request;
                 }
-                result
-            }
-            Err(error)
-                if is_forced_tool_choice_rejection_error(
-                    &error,
-                    &http_request.body,
-                    provider_family,
-                ) =>
-            {
-                // 某些兼容端点会先输出少量 thinking / 正文，随后才通过 SSE error
-                // 事件拒绝强制工具选择。首轮增量必须暂存，避免自动选择重试后把
-                // 两次模型输出拼接到同一条消息里。
-                first_attempt_deltas.borrow_mut().clear();
-                let fallback_request =
-                    request_with_automatic_tool_choice(&http_request, provider_family);
-                let fallback_result = execute_streaming_http_post_with_retries(
-                    self.provider_request_key(),
-                    fallback_request,
-                    provider_family,
-                    on_delta,
-                    on_retry,
-                    is_cancelled,
-                )?;
-                let (fallback_status, fallback_body, _retry_after) = fallback_result;
-                if !(200..300).contains(&fallback_status) {
-                    return Err(provider_http_status_error(fallback_status, &fallback_body));
+                Ok((status, response_body, _retry_after)) => {
+                    if !(200..300).contains(&status) {
+                        for delta in buffered_deltas.into_inner() {
+                            on_delta(&delta);
+                        }
+                        return Err(provider_http_status_error(status, &response_body));
+                    }
+                    for delta in buffered_deltas.into_inner() {
+                        on_delta(&delta);
+                    }
+                    if let Some(capability) = fallback_capability.or_else(|| {
+                        capability_from_accepted_tool_choice_request(
+                            &current_request,
+                            provider_family,
+                        )
+                    }) {
+                        self.mark_forced_tool_choice_capability(capability);
+                    }
+                    return Ok(BridgeResponse {
+                        ok: true,
+                        payload: response_body,
+                    });
                 }
-                return Ok(BridgeResponse {
-                    ok: true,
-                    payload: fallback_body,
-                });
-            }
-            Err(error) => {
-                // 非工具选择类失败仍保留已经收到的部分输出，维持现有的流式体验，
-                // 再把原始错误交给上层做统一分类。
-                for delta in first_attempt_deltas.borrow_mut().drain(..) {
-                    on_delta(&delta);
+                Err(error) => {
+                    for delta in buffered_deltas.into_inner() {
+                        on_delta(&delta);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
-        };
-
-        if is_forced_tool_choice_rejection(
-            status,
-            &response_body,
-            &http_request.body,
-            provider_family,
-        ) {
-            let fallback_request =
-                request_with_automatic_tool_choice(&http_request, provider_family);
-            let (fallback_status, fallback_body, _retry_after) =
-                execute_streaming_http_post_with_retries(
-                    self.provider_request_key(),
-                    fallback_request,
-                    provider_family,
-                    on_delta,
-                    on_retry,
-                    is_cancelled,
-                )?;
-            if !(200..300).contains(&fallback_status) {
-                return Err(provider_http_status_error(fallback_status, &fallback_body));
-            }
-            return Ok(BridgeResponse {
-                ok: true,
-                payload: fallback_body,
-            });
         }
-
-        if !(200..300).contains(&status) {
-            return Err(provider_http_status_error(status, &response_body));
-        }
-
-        Ok(BridgeResponse {
-            ok: true,
-            payload: response_body,
-        })
     }
 }
 
@@ -427,6 +463,27 @@ fn model_provider_gate() -> &'static ModelProviderGate {
 
 fn normalize_provider_base_url(base_url: &str) -> String {
     base_url.trim().trim_end_matches('/').to_string()
+}
+
+fn forced_tool_choice_capability(provider_key: &str) -> ForcedToolChoiceCapability {
+    FORCED_TOOL_CHOICE_CAPABILITIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("forced tool choice capability registry lock poisoned")
+        .get(provider_key)
+        .copied()
+        .unwrap_or(ForcedToolChoiceCapability::Unknown)
+}
+
+fn record_forced_tool_choice_capability(
+    provider_key: String,
+    capability: ForcedToolChoiceCapability,
+) {
+    FORCED_TOOL_CHOICE_CAPABILITIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("forced tool choice capability registry lock poisoned")
+        .insert(provider_key, capability);
 }
 
 fn retry_delay(attempt: usize, _provider_key: &str) -> Duration {
@@ -530,6 +587,16 @@ fn sleep_retry_delay_cancellable(delay: Duration, is_cancelled: &dyn Fn() -> boo
 }
 
 type HttpPostResult = Result<(u16, String, Option<Duration>), BridgeClientError>;
+type ToolChoiceFallbackHttpResult = Result<
+    (
+        HttpModelRequest,
+        u16,
+        String,
+        Option<Duration>,
+        Option<ForcedToolChoiceCapability>,
+    ),
+    BridgeClientError,
+>;
 
 fn receive_cancellable_http_result(
     rx: mpsc::Receiver<HttpPostResult>,
@@ -851,6 +918,7 @@ fn provider_stream_event_error(
 
 fn apply_provider_stream_event(
     provider_family: ProviderFamily,
+    tool_name_codec: ProviderToolNameCodec,
     event: &crate::protocol::streaming::SseEvent,
     accumulator: &mut StreamAccumulator,
     last_content_delta_len: &mut usize,
@@ -867,7 +935,8 @@ fn apply_provider_stream_event(
         return Ok(true);
     }
 
-    let llm_chunks = parse_stream_event(provider_family, event);
+    let mut llm_chunks = parse_stream_event(provider_family, event);
+    tool_name_codec.decode_stream_chunks(&mut llm_chunks);
     accumulator.apply_all(&llm_chunks);
     let accumulated_content = accumulator.accumulated_content();
     let accumulated_thinking = accumulator.accumulated_thinking();
@@ -902,6 +971,7 @@ fn execute_streaming_http_post(
     provider_key: String,
     request: HttpModelRequest,
     provider_family: ProviderFamily,
+    tool_name_codec: ProviderToolNameCodec,
     on_chunk: &dyn Fn(&ModelStreamingDelta),
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
@@ -911,7 +981,9 @@ fn execute_streaming_http_post(
     let (tx, rx) = mpsc::channel::<StreamMessage>();
 
     std::thread::spawn(move || {
-        let HttpModelRequest { url, body, headers } = request;
+        let HttpModelRequest {
+            url, body, headers, ..
+        } = request;
         let result = match model_provider_gate()
             .acquire_cancellable(&provider_key, worker_cancellation.as_ref())
         {
@@ -929,6 +1001,7 @@ fn execute_streaming_http_post(
                         body,
                         headers,
                         provider_family,
+                        tool_name_codec,
                         &tx,
                         cancellation_rx,
                     ))
@@ -1001,6 +1074,7 @@ fn execute_streaming_http_post_with_retries(
     provider_key: String,
     request: HttpModelRequest,
     provider_family: ProviderFamily,
+    tool_name_codec: ProviderToolNameCodec,
     on_chunk: &dyn Fn(&ModelStreamingDelta),
     on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
     is_cancelled: &dyn Fn() -> bool,
@@ -1018,6 +1092,7 @@ fn execute_streaming_http_post_with_retries(
             provider_key.clone(),
             request.clone(),
             provider_family,
+            tool_name_codec.clone(),
             &guarded_chunk,
             is_cancelled,
         );
@@ -1107,6 +1182,7 @@ async fn streaming_http_io(
     body: serde_json::Value,
     headers: Vec<(String, String)>,
     provider_family: ProviderFamily,
+    tool_name_codec: ProviderToolNameCodec,
     tx: &mpsc::Sender<StreamMessage>,
     mut cancellation_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
@@ -1225,6 +1301,7 @@ async fn streaming_http_io(
             saw_sse_event = true;
             if apply_provider_stream_event(
                 provider_family,
+                tool_name_codec.clone(),
                 &sse_event,
                 &mut accumulator,
                 &mut last_content_delta_len,
@@ -1246,6 +1323,7 @@ async fn streaming_http_io(
             saw_sse_event = true;
             if apply_provider_stream_event(
                 provider_family,
+                tool_name_codec.clone(),
                 &sse_event,
                 &mut accumulator,
                 &mut last_content_delta_len,
@@ -1276,7 +1354,7 @@ async fn streaming_http_io(
 
     // 直接将 StreamAccumulator 转换为 BridgeResponse payload，
     // 跳过自构造 OpenAI JSON → 再反序列化的冗余链路。
-    let adapted = accumulator.finalize();
+    let adapted = tool_name_codec.decode_adapted_response(accumulator.finalize());
     if adapted.content.trim().is_empty()
         && adapted
             .thinking
@@ -1307,39 +1385,28 @@ impl ModelBridgeClient for HttpModelBridgeClient {
 
         let http_request = self.build_http_request(&request, false)?;
 
-        let (status, response_body, _retry_after) = execute_http_post_with_retries(
-            self.provider_request_key(),
-            http_request.url.clone(),
-            http_request.body.clone(),
-            http_request.headers.clone(),
-        )?;
-
-        if is_forced_tool_choice_rejection(
-            status,
-            &response_body,
-            &http_request.body,
-            self.provider_family(),
-        ) {
-            let fallback_request =
-                request_with_automatic_tool_choice(&http_request, self.provider_family());
-            let (fallback_status, fallback_body, _retry_after) = execute_http_post_with_retries(
-                self.provider_request_key(),
-                fallback_request.url,
-                fallback_request.body,
-                fallback_request.headers,
-            )?;
-            if !(200..300).contains(&fallback_status) {
-                return Err(provider_http_status_error(fallback_status, &fallback_body));
-            }
-            let payload = self.parse_success_payload(&fallback_body)?;
-            return Ok(BridgeResponse { ok: true, payload });
-        }
+        let (accepted_request, status, response_body, _retry_after, fallback_capability) =
+            execute_with_tool_choice_fallback(http_request, self.provider_family(), |request| {
+                execute_http_post_with_retries(
+                    self.provider_request_key(),
+                    request.url,
+                    request.body,
+                    request.headers,
+                )
+            })?;
 
         if !(200..300).contains(&status) {
             return Err(provider_http_status_error(status, &response_body));
         }
 
-        let payload = self.parse_success_payload(&response_body)?;
+        if let Some(capability) = fallback_capability.or_else(|| {
+            capability_from_accepted_tool_choice_request(&accepted_request, self.provider_family())
+        }) {
+            self.mark_forced_tool_choice_capability(capability);
+        }
+
+        let payload =
+            self.parse_success_payload(&response_body, &accepted_request.tool_name_codec)?;
 
         Ok(BridgeResponse { ok: true, payload })
     }
@@ -1357,41 +1424,27 @@ impl ModelBridgeClient for HttpModelBridgeClient {
             });
         }
         let http_request = self.build_http_request(&request, false)?;
-        let (status, response_body, _retry_after) = execute_cancellable_http_post_with_retries(
-            self.provider_request_key(),
-            http_request.url.clone(),
-            http_request.body.clone(),
-            http_request.headers.clone(),
-            is_cancelled,
-        )?;
-
-        if is_forced_tool_choice_rejection(
-            status,
-            &response_body,
-            &http_request.body,
-            self.provider_family(),
-        ) {
-            let fallback_request =
-                request_with_automatic_tool_choice(&http_request, self.provider_family());
-            let (fallback_status, fallback_body, _retry_after) =
+        let (accepted_request, status, response_body, _retry_after, fallback_capability) =
+            execute_with_tool_choice_fallback(http_request, self.provider_family(), |request| {
                 execute_cancellable_http_post_with_retries(
                     self.provider_request_key(),
-                    fallback_request.url,
-                    fallback_request.body,
-                    fallback_request.headers,
+                    request.url,
+                    request.body,
+                    request.headers,
                     is_cancelled,
-                )?;
-            if !(200..300).contains(&fallback_status) {
-                return Err(provider_http_status_error(fallback_status, &fallback_body));
-            }
-            let payload = self.parse_success_payload(&fallback_body)?;
-            return Ok(BridgeResponse { ok: true, payload });
-        }
+                )
+            })?;
 
         if !(200..300).contains(&status) {
             return Err(provider_http_status_error(status, &response_body));
         }
-        let payload = self.parse_success_payload(&response_body)?;
+        if let Some(capability) = fallback_capability.or_else(|| {
+            capability_from_accepted_tool_choice_request(&accepted_request, self.provider_family())
+        }) {
+            self.mark_forced_tool_choice_capability(capability);
+        }
+        let payload =
+            self.parse_success_payload(&response_body, &accepted_request.tool_name_codec)?;
         Ok(BridgeResponse { ok: true, payload })
     }
 
@@ -1424,7 +1477,11 @@ impl ModelBridgeClient for HttpModelBridgeClient {
 }
 
 impl HttpModelBridgeClient {
-    fn parse_success_payload(&self, response_body: &str) -> Result<String, BridgeClientError> {
+    fn parse_success_payload(
+        &self,
+        response_body: &str,
+        tool_name_codec: &ProviderToolNameCodec,
+    ) -> Result<String, BridgeClientError> {
         if let Some(message) = provider_error_message(response_body) {
             return Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::RemoteBusiness,
@@ -1445,13 +1502,12 @@ impl HttpModelBridgeClient {
                         }
                     })?;
 
-                select_openai_bridge_payload(envelope.choices, envelope.usage).map_err(|reason| {
-                    BridgeClientError::CallFailed {
+                select_openai_bridge_payload(envelope.choices, envelope.usage, tool_name_codec)
+                    .map_err(|reason| BridgeClientError::CallFailed {
                         layer: BridgeErrorLayer::RemoteBusiness,
                         code: Some(-32007),
                         message: format!("provider response invalid: {reason}"),
-                    }
-                })
+                    })
             }
             HttpModelBridgeProtocol::AnthropicMessages => {
                 let adapted = AnthropicMessagesAdapter
@@ -1461,7 +1517,9 @@ impl HttpModelBridgeClient {
                         code: Some(-32007),
                         message: format!("provider response invalid: {reason}"),
                     })?;
-                Ok(adapted_response_to_bridge_payload(&adapted))
+                Ok(adapted_response_to_bridge_payload(
+                    &tool_name_codec.decode_adapted_response(adapted),
+                ))
             }
         }
     }
@@ -1591,6 +1649,7 @@ impl OpenAiCompatibleSuccessPayload {
 fn select_openai_bridge_payload(
     choices: Vec<OpenAiCompatibleChatChoice>,
     usage: Option<OpenAiCompatibleUsage>,
+    tool_name_codec: &ProviderToolNameCodec,
 ) -> Result<String, String> {
     if choices.is_empty() {
         return Err("missing choices[0]".to_string());
@@ -1598,7 +1657,11 @@ fn select_openai_bridge_payload(
 
     let mut invalid_choices = Vec::new();
     for (index, choice) in choices.into_iter().enumerate() {
-        match choice.into_payload(usage.clone()).into_bridge_payload() {
+        let mut payload = choice.into_payload(usage.clone());
+        for tool_call in &mut payload.tool_calls {
+            tool_call.function.name = tool_name_codec.decode_name(&tool_call.function.name);
+        }
+        match payload.into_bridge_payload() {
             Ok(payload) => return Ok(payload),
             Err(reason) => invalid_choices.push(format!("choices[{index}]: {reason}")),
         }
@@ -1847,6 +1910,7 @@ fn tool_definition_from_chat_tool(tool: &crate::types::ChatToolDefinition) -> To
                         .collect::<Vec<_>>()
                 }),
         },
+        origin: tool.origin,
     }
 }
 
@@ -1997,11 +2061,49 @@ fn is_forced_tool_choice_rejection_error(
 }
 
 fn is_forced_tool_choice_request(request_body: &Value, provider_family: ProviderFamily) -> bool {
+    !matches!(
+        tool_choice_enforcement(request_body, provider_family),
+        ToolChoiceEnforcement::Automatic
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolChoiceEnforcement {
+    Exact,
+    Required,
+    Automatic,
+}
+
+fn tool_choice_enforcement(
+    request_body: &Value,
+    provider_family: ProviderFamily,
+) -> ToolChoiceEnforcement {
     match provider_family {
-        ProviderFamily::OpenAiChat => request_body["tool_choice"].is_object(),
-        ProviderFamily::Anthropic => request_body["tool_choice"]["type"]
-            .as_str()
-            .is_some_and(|kind| kind == "tool"),
+        ProviderFamily::OpenAiChat if request_body["tool_choice"].is_object() => {
+            ToolChoiceEnforcement::Exact
+        }
+        ProviderFamily::OpenAiChat
+            if request_body["tool_choice"]
+                .as_str()
+                .is_some_and(|choice| choice == "required") =>
+        {
+            ToolChoiceEnforcement::Required
+        }
+        ProviderFamily::Anthropic
+            if request_body["tool_choice"]["type"]
+                .as_str()
+                .is_some_and(|kind| kind == "tool") =>
+        {
+            ToolChoiceEnforcement::Exact
+        }
+        ProviderFamily::Anthropic
+            if request_body["tool_choice"]["type"]
+                .as_str()
+                .is_some_and(|kind| kind == "any") =>
+        {
+            ToolChoiceEnforcement::Required
+        }
+        _ => ToolChoiceEnforcement::Automatic,
     }
 }
 
@@ -2025,16 +2127,90 @@ fn is_forced_tool_choice_rejection_message(message: &str) -> bool {
     mentions_forced_choice && rejection
 }
 
-fn request_with_automatic_tool_choice(
+fn request_with_next_tool_choice_enforcement(
     request: &HttpModelRequest,
     provider_family: ProviderFamily,
-) -> HttpModelRequest {
+) -> Option<(ForcedToolChoiceCapability, HttpModelRequest)> {
     let mut fallback = request.clone();
-    fallback.body["tool_choice"] = match provider_family {
-        ProviderFamily::OpenAiChat => json!("auto"),
-        ProviderFamily::Anthropic => json!({"type": "auto"}),
-    };
-    fallback
+    match tool_choice_enforcement(&request.body, provider_family) {
+        ToolChoiceEnforcement::Exact => {
+            fallback.body["tool_choice"] = match provider_family {
+                ProviderFamily::OpenAiChat => json!("required"),
+                ProviderFamily::Anthropic => json!({"type": "any"}),
+            };
+            Some((ForcedToolChoiceCapability::Required, fallback))
+        }
+        ToolChoiceEnforcement::Required => {
+            fallback.body["tool_choice"] = match provider_family {
+                ProviderFamily::OpenAiChat => json!("auto"),
+                ProviderFamily::Anthropic => json!({"type": "auto"}),
+            };
+            Some((ForcedToolChoiceCapability::AutoOnly, fallback))
+        }
+        ToolChoiceEnforcement::Automatic => None,
+    }
+}
+
+fn execute_with_tool_choice_fallback<F>(
+    initial_request: HttpModelRequest,
+    provider_family: ProviderFamily,
+    mut execute: F,
+) -> ToolChoiceFallbackHttpResult
+where
+    F: FnMut(HttpModelRequest) -> HttpPostResult,
+{
+    let mut request = initial_request;
+    let mut fallback_capability = None;
+    loop {
+        match execute(request.clone()) {
+            Ok((status, body, retry_after))
+                if is_forced_tool_choice_rejection(
+                    status,
+                    &body,
+                    &request.body,
+                    provider_family,
+                ) =>
+            {
+                let Some((capability, next_request)) =
+                    request_with_next_tool_choice_enforcement(&request, provider_family)
+                else {
+                    return Ok((request, status, body, retry_after, fallback_capability));
+                };
+                fallback_capability = Some(capability);
+                request = next_request;
+            }
+            Ok(result) => return Ok((request, result.0, result.1, result.2, fallback_capability)),
+            Err(error)
+                if is_forced_tool_choice_rejection_error(
+                    &error,
+                    &request.body,
+                    provider_family,
+                ) =>
+            {
+                let Some((capability, next_request)) =
+                    request_with_next_tool_choice_enforcement(&request, provider_family)
+                else {
+                    return Err(error);
+                };
+                fallback_capability = Some(capability);
+                request = next_request;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn capability_from_accepted_tool_choice_request(
+    request: &HttpModelRequest,
+    provider_family: ProviderFamily,
+) -> Option<ForcedToolChoiceCapability> {
+    match tool_choice_enforcement(&request.body, provider_family) {
+        ToolChoiceEnforcement::Exact => Some(ForcedToolChoiceCapability::Exact),
+        ToolChoiceEnforcement::Required => Some(ForcedToolChoiceCapability::Required),
+        // 普通自动选择请求不能证明提供方不支持强制语义，不能污染后续需要工具的
+        // 同连接调用；只有从 required 明确降级后的请求才会写入 AutoOnly。
+        ToolChoiceEnforcement::Automatic => None,
+    }
 }
 
 #[cfg(test)]
@@ -2196,6 +2372,7 @@ mod tests {
                         "required": ["route"]
                     }),
                 },
+                origin: crate::types::ChatToolOrigin::Builtin,
             }]),
             tool_choice: Some(crate::types::ChatToolChoice::force_function(
                 "classify_session_turn",
@@ -2203,14 +2380,243 @@ mod tests {
         });
 
         assert_eq!(body["tool_choice"]["type"], "function");
-        assert_eq!(
-            body["tool_choice"]["function"]["name"],
-            "classify_session_turn"
+        assert!(
+            body["tool_choice"]["function"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("magi_builtin_classify_session_turn_"))
         );
     }
 
     #[test]
-    fn forced_tool_choice_rejection_is_downgraded_to_automatic_choice() {
+    fn request_uses_wire_safe_names_for_every_tool_source() {
+        let client = HttpModelBridgeClient::new(
+            "https://api.example.com/v1".to_string(),
+            Some("test-key".to_string()),
+            "any-openai-compatible-model".to_string(),
+        );
+        let body = client.build_request_body(&ModelInvocationRequest {
+            provider: "openai".to_string(),
+            prompt: "搜索最新消息".to_string(),
+            messages: Some(vec![crate::types::ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                images: Vec::new(),
+                tool_calls: vec![crate::types::ChatToolCall {
+                    id: "call-search-1".to_string(),
+                    kind: "function".to_string(),
+                    function: crate::types::ChatToolFunction {
+                        name: "web_search".to_string(),
+                        arguments: r#"{"query":"OpenAI"}"#.to_string(),
+                    },
+                }],
+                tool_call_id: None,
+            }]),
+            tools: Some(vec![
+                crate::types::ChatToolDefinition {
+                    kind: "function".to_string(),
+                    function: crate::types::ChatToolFunctionDefinition {
+                        name: "web_search".to_string(),
+                        description: "搜索网页".to_string(),
+                        parameters: serde_json::json!({
+                            "type": "object",
+                            "properties": { "query": { "type": "string" } },
+                            "required": ["query"]
+                        }),
+                    },
+                    origin: crate::types::ChatToolOrigin::Builtin,
+                },
+                crate::types::ChatToolDefinition {
+                    kind: "function".to_string(),
+                    function: crate::types::ChatToolFunctionDefinition {
+                        name: "shell_exec".to_string(),
+                        description: "执行命令".to_string(),
+                        parameters: serde_json::json!({
+                            "type": "object",
+                            "properties": { "command": { "type": "string" } },
+                            "required": ["command"]
+                        }),
+                    },
+                    origin: crate::types::ChatToolOrigin::Builtin,
+                },
+                crate::types::ChatToolDefinition {
+                    kind: "function".to_string(),
+                    function: crate::types::ChatToolFunctionDefinition {
+                        name: "mcp__repo__inspect".to_string(),
+                        description: "检查仓库".to_string(),
+                        parameters: serde_json::json!({
+                            "type": "object",
+                            "properties": {}
+                        }),
+                    },
+                    origin: crate::types::ChatToolOrigin::ExternalMcp,
+                },
+                crate::types::ChatToolDefinition {
+                    kind: "function".to_string(),
+                    function: crate::types::ChatToolFunctionDefinition {
+                        name: "skill__review__inspect".to_string(),
+                        description: "执行审查技能".to_string(),
+                        parameters: serde_json::json!({
+                            "type": "object",
+                            "properties": {}
+                        }),
+                    },
+                    origin: crate::types::ChatToolOrigin::Skill,
+                },
+            ]),
+            tool_choice: Some(crate::types::ChatToolChoice::force_function("web_search")),
+        });
+
+        for tool in body["tools"].as_array().expect("tools must be an array") {
+            assert!(
+                tool["function"]["name"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("magi_"))
+            );
+        }
+        assert!(
+            body["tools"][0]["function"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("magi_builtin_web_search_"))
+        );
+        assert!(
+            body["tools"][2]["function"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("magi_mcp_mcp_repo_inspect_"))
+        );
+        assert!(
+            body["tools"][3]["function"]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("magi_skill_skill_review_inspect_"))
+        );
+        assert!(body["tools"][0].get("origin").is_none());
+        assert!(body["tools"][2].get("origin").is_none());
+        assert!(body["tools"][3].get("origin").is_none());
+        assert_eq!(
+            body["tool_choice"]["function"]["name"],
+            body["tools"][0]["function"]["name"]
+        );
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["function"]["name"],
+            body["tools"][0]["function"]["name"]
+        );
+    }
+
+    #[test]
+    fn response_restores_canonical_tool_name_from_current_surface() {
+        let client = HttpModelBridgeClient::new(
+            "https://api.example.com/v1".to_string(),
+            Some("test-key".to_string()),
+            "any-openai-compatible-model".to_string(),
+        );
+        let invocation = ModelInvocationRequest {
+            provider: "openai".to_string(),
+            prompt: "search".to_string(),
+            messages: None,
+            tools: Some(vec![crate::types::ChatToolDefinition {
+                kind: "function".to_string(),
+                function: crate::types::ChatToolFunctionDefinition {
+                    name: "web_search".to_string(),
+                    description: "search".to_string(),
+                    parameters: serde_json::json!({ "type": "object" }),
+                },
+                origin: crate::types::ChatToolOrigin::Builtin,
+            }]),
+            tool_choice: Some(crate::types::ChatToolChoice::force_function("web_search")),
+        };
+        let http_request = client
+            .build_http_request(&invocation, false)
+            .expect("request should build");
+        let wire_name = http_request.tool_name_codec.encode_name("web_search");
+        let canonical = client
+            .parse_success_payload(
+                &serde_json::json!({
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "tool_calls": [{
+                                "id": "call-search-1",
+                                "type": "function",
+                                "function": {
+                                    "name": wire_name,
+                                    "arguments": "{\"query\":\"OpenAI\"}"
+                                }
+                            }]
+                        }
+                    }]
+                })
+                .to_string(),
+                &http_request.tool_name_codec,
+            )
+            .expect("provider response should be bridgeable");
+        let value: serde_json::Value = serde_json::from_str(&canonical).expect("canonical payload");
+        assert_eq!(value["tool_calls"][0]["function"]["name"], "web_search");
+    }
+
+    #[test]
+    fn streaming_tool_calls_restore_canonical_tool_name() {
+        let tool_definition = crate::types::ChatToolDefinition {
+            kind: "function".to_string(),
+            function: crate::types::ChatToolFunctionDefinition {
+                name: "web_search".to_string(),
+                description: "搜索网页".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "query": { "type": "string" } },
+                    "required": ["query"]
+                }),
+            },
+            origin: crate::types::ChatToolOrigin::Builtin,
+        };
+        let invocation = ModelInvocationRequest {
+            provider: "openai-compatible".to_string(),
+            prompt: "搜索 Magi".to_string(),
+            messages: None,
+            tools: Some(vec![tool_definition.clone()]),
+            tool_choice: Some(crate::types::ChatToolChoice::force_function("web_search")),
+        };
+        let codec_client = HttpModelBridgeClient::new(
+            "http://127.0.0.1:1".to_string(),
+            Some("test-key".to_string()),
+            "any-openai-compatible-model".to_string(),
+        );
+        let wire_name = codec_client
+            .build_http_request(&invocation, true)
+            .expect("request should build")
+            .tool_name_codec
+            .encode_name("web_search");
+        let server = spawn_mock_server_with_response_text(
+            200,
+            "text/event-stream",
+            format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-search-1\",\"type\":\"function\",\"function\":{{\"name\":\"{wire_name}\",\"arguments\":\"{{\\\"query\\\":\\\"Magi\\\"}}\"}}}}]}},\"finish_reason\":null}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+            ),
+        );
+        let client = HttpModelBridgeClient::new(
+            server.address,
+            Some("test-key".to_string()),
+            "any-openai-compatible-model".to_string(),
+        );
+
+        let response = client
+            .invoke_streaming(invocation, &|_| {})
+            .expect("streaming response should be bridgeable");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&response.payload).expect("payload should be json");
+        assert_eq!(payload["tool_calls"][0]["function"]["name"], "web_search");
+
+        let recorded = server
+            .request_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mock server should receive request");
+        let body: serde_json::Value =
+            serde_json::from_str(&recorded.body).expect("request body should be json");
+        assert_eq!(body["tools"][0]["function"]["name"], wire_name);
+        assert_eq!(body["tool_choice"]["function"]["name"], wire_name);
+    }
+
+    #[test]
+    fn forced_tool_choice_rejection_retries_with_required_choice() {
         let request = HttpModelRequest {
             url: "http://localhost/v1/chat/completions".to_string(),
             body: json!({
@@ -2221,6 +2627,19 @@ mod tests {
                 }
             }),
             headers: Vec::new(),
+            tool_name_codec: ProviderToolNameCodec::for_params(
+                &llm_message_params_from_invocation(
+                    &ModelInvocationRequest {
+                        provider: "test".to_string(),
+                        prompt: "test".to_string(),
+                        messages: None,
+                        tools: None,
+                        tool_choice: None,
+                    },
+                    false,
+                    None,
+                ),
+            ),
         };
         let error_body = r#"{"error":{"message":"tool_choice does not support required or object in thinking mode"}}"#;
 
@@ -2230,9 +2649,43 @@ mod tests {
             &request.body,
             ProviderFamily::OpenAiChat
         ));
-        let fallback = request_with_automatic_tool_choice(&request, ProviderFamily::OpenAiChat);
-        assert_eq!(fallback.body["tool_choice"], "auto");
+        let (capability, fallback) =
+            request_with_next_tool_choice_enforcement(&request, ProviderFamily::OpenAiChat)
+                .expect("exact choice must have a required fallback");
+        assert_eq!(capability, ForcedToolChoiceCapability::Required);
+        assert_eq!(fallback.body["tool_choice"], "required");
         assert_eq!(request.body["tool_choice"]["type"], "function");
+    }
+
+    #[test]
+    fn required_choice_rejection_retries_with_automatic_choice() {
+        let request = HttpModelRequest {
+            url: "http://localhost/v1/chat/completions".to_string(),
+            body: json!({
+                "tools": [{"type": "function"}],
+                "tool_choice": "required"
+            }),
+            headers: Vec::new(),
+            tool_name_codec: ProviderToolNameCodec::for_params(
+                &llm_message_params_from_invocation(
+                    &ModelInvocationRequest {
+                        provider: "test".to_string(),
+                        prompt: "test".to_string(),
+                        messages: None,
+                        tools: None,
+                        tool_choice: None,
+                    },
+                    false,
+                    None,
+                ),
+            ),
+        };
+
+        let (capability, fallback) =
+            request_with_next_tool_choice_enforcement(&request, ProviderFamily::OpenAiChat)
+                .expect("required choice must have an automatic fallback");
+        assert_eq!(capability, ForcedToolChoiceCapability::AutoOnly);
+        assert_eq!(fallback.body["tool_choice"], "auto");
     }
 
     #[test]
@@ -2295,6 +2748,7 @@ mod tests {
                         "required": ["cmd"]
                     }),
                 },
+                origin: crate::types::ChatToolOrigin::Builtin,
             }]),
             tool_choice: Some(crate::types::ChatToolChoice::force_function("shell_exec")),
         });
@@ -2303,10 +2757,14 @@ mod tests {
         assert_eq!(body["system"], "系统约束");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "你好");
-        assert_eq!(body["tools"][0]["name"], "shell_exec");
+        assert!(
+            body["tools"][0]["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("magi_builtin_shell_exec_"))
+        );
         assert_eq!(body["tools"][0]["input_schema"]["required"][0], "cmd");
         assert_eq!(body["tool_choice"]["type"], "tool");
-        assert_eq!(body["tool_choice"]["name"], "shell_exec");
+        assert_eq!(body["tool_choice"]["name"], body["tools"][0]["name"]);
         assert_eq!(body["stream"], false);
     }
 
@@ -3117,7 +3575,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_retries_forced_tool_choice_as_automatic_choice() {
+    fn streaming_retries_forced_tool_choice_as_required_choice() {
         let server = spawn_mock_server_sequence(vec![
             MockHttpResponse {
                 status: 400,
@@ -3129,11 +3587,16 @@ mod tests {
                 content_type: "text/event-stream".to_string(),
                 response_text: "data: {\"choices\":[{\"delta\":{\"content\":\"已恢复\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string(),
             },
+            MockHttpResponse {
+                status: 200,
+                content_type: "text/event-stream".to_string(),
+                response_text: "data: {\"choices\":[{\"delta\":{\"content\":\"已学习\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_string(),
+            },
         ]);
         let client = HttpModelBridgeClient::new(
             server.address.clone(),
             Some("sk-test-key".to_string()),
-            "gpt-5-turbo".to_string(),
+            "gateway-model-v2026".to_string(),
         );
         let request = ModelInvocationRequest {
             provider: "openai-compatible".to_string(),
@@ -3146,14 +3609,19 @@ mod tests {
                     description: "执行 shell 命令".to_string(),
                     parameters: json!({"type": "object"}),
                 },
+                origin: crate::types::ChatToolOrigin::Builtin,
             }]),
             tool_choice: Some(crate::types::ChatToolChoice::force_function("shell_exec")),
         };
 
         let response = client
-            .invoke_streaming(request, &|_| {})
-            .expect("forced choice rejection should recover with automatic choice");
+            .invoke_streaming(request.clone(), &|_| {})
+            .expect("forced choice rejection should recover with required choice");
         assert!(response.ok);
+        let learned_response = client
+            .invoke_streaming(request, &|_| {})
+            .expect("learned required-only capability should keep working");
+        assert!(learned_response.ok);
 
         let first: Value = serde_json::from_str(
             &server
@@ -3172,7 +3640,16 @@ mod tests {
         )
         .expect("fallback request should be json");
         assert_eq!(first["tool_choice"]["type"], "function");
-        assert_eq!(second["tool_choice"], "auto");
+        assert_eq!(second["tool_choice"], "required");
+        let third: Value = serde_json::from_str(
+            &server
+                .request_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("learned request should arrive")
+                .body,
+        )
+        .expect("learned request should be json");
+        assert_eq!(third["tool_choice"], "required");
     }
 
     #[test]
@@ -3210,6 +3687,7 @@ mod tests {
                     description: "执行 shell 命令".to_string(),
                     parameters: json!({"type": "object"}),
                 },
+                origin: crate::types::ChatToolOrigin::Builtin,
             }]),
             tool_choice: Some(crate::types::ChatToolChoice::force_function("shell_exec")),
         };
@@ -3239,7 +3717,7 @@ mod tests {
         )
         .expect("fallback request should be json");
         assert_eq!(first["tool_choice"]["type"], "function");
-        assert_eq!(second["tool_choice"], "auto");
+        assert_eq!(second["tool_choice"], "required");
     }
 
     #[test]
@@ -3289,6 +3767,7 @@ mod tests {
                     description: "执行 shell 命令".to_string(),
                     parameters: json!({"type": "object"}),
                 },
+                origin: crate::types::ChatToolOrigin::Builtin,
             }]),
             tool_choice: Some(crate::types::ChatToolChoice::force_function("shell_exec")),
         };
@@ -3318,7 +3797,7 @@ mod tests {
         )
         .expect("fallback request should be json");
         assert_eq!(first["tool_choice"]["type"], "tool");
-        assert_eq!(second["tool_choice"]["type"], "auto");
+        assert_eq!(second["tool_choice"]["type"], "any");
     }
 
     #[test]

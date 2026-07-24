@@ -49,12 +49,7 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
             && !tools.is_empty()
         {
             body["tools"] = json!(serialize_tool_definitions(tools));
-            let capability = resolve_capability_profile(model);
-            body["tool_choice"] = if capability.supports_forced_tool_choice {
-                translate_tool_choice_for_openai(params.tool_choice.as_ref())
-            } else {
-                json!("auto")
-            };
+            body["tool_choice"] = translate_tool_choice_for_openai(params.tool_choice.as_ref());
         }
         if let Some(stream) = params.stream {
             body["stream"] = json!(stream);
@@ -282,6 +277,7 @@ mod tests {
                 properties: json!({}),
                 required: None,
             },
+            origin: crate::types::ChatToolOrigin::Builtin,
         }]);
         params.tool_choice = Some(ToolChoice::Typed {
             kind: "tool".to_string(),
@@ -292,32 +288,6 @@ mod tests {
             .expect("build");
         assert_eq!(adapted.body["tool_choice"]["type"], "function");
         assert_eq!(adapted.body["tool_choice"]["function"]["name"], "classify");
-    }
-
-    #[test]
-    fn deepseek_v4_uses_automatic_tool_choice_in_thinking_mode() {
-        let mut params = base_params(vec![LlmMessage {
-            role: "user".to_string(),
-            content: LlmMessageContent::Text("执行工具".to_string()),
-        }]);
-        params.tools = Some(vec![crate::llm_types::ToolDefinition {
-            name: "shell_exec".to_string(),
-            description: "执行命令".to_string(),
-            input_schema: crate::llm_types::ToolInputSchema {
-                kind: "object".to_string(),
-                properties: json!({}),
-                required: None,
-            },
-        }]);
-        params.tool_choice = Some(ToolChoice::Typed {
-            kind: "tool".to_string(),
-            name: Some("shell_exec".to_string()),
-        });
-
-        let adapted = OpenAiChatCompletionsAdapter
-            .build_request(&params, "DeepSeek-V4-Flash")
-            .expect("build");
-        assert_eq!(adapted.body["tool_choice"], "auto");
     }
 
     #[test]

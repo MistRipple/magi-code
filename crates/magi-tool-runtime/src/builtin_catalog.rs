@@ -330,6 +330,34 @@ impl BuiltinToolName {
         )
     }
 
+    /// 是否可在同一任务内按规范化参数复用成功结果。
+    ///
+    /// 该分类服务于运行时执行账本，和访问权限、风险等级不同：只有不会改变
+    /// 外部状态，且重复读取不会产生新的产品语义的内置工具才可以复用。Shell、
+    /// 进程查询以及所有协调、写入工具都不能依赖这个分类。
+    pub fn is_idempotent_read_operation(&self) -> bool {
+        matches!(
+            self,
+            Self::FileRead
+                | Self::ViewImage
+                | Self::SearchText
+                | Self::SearchSemantic
+                | Self::DiffPreview
+                | Self::WebSearch
+                | Self::WebFetch
+                | Self::KnowledgeQuery
+                | Self::CodeSymbols
+                | Self::ToolCatalog
+                | Self::GitStatus
+                | Self::GitBranchList
+                | Self::GitMergePreview
+                | Self::GitWorktreeList
+                | Self::GetGoal
+                | Self::ContextSearch
+                | Self::ContextRead
+        )
+    }
+
     /// 用户访问模式只约束工作区、进程、网络外接能力和持久项目记忆等外部副作用。
     /// Goal、Plan 与 agent_spawn 属于会话内部协调状态，必须在只读模式下保持可用，
     /// 否则只读分析无法使用目标推进、执行计划和只读子代理。

@@ -1,4 +1,6 @@
-use magi_bridge_client::{ChatToolCall, ChatToolDefinition, ChatToolFunctionDefinition};
+use magi_bridge_client::{
+    ChatToolCall, ChatToolDefinition, ChatToolFunctionDefinition, ChatToolOrigin,
+};
 use magi_core::{AccessProfile, ApprovalRequirement, ExecutionResultStatus, RiskLevel, ToolCallId};
 use magi_skill_runtime::{
     CustomToolBinding, SkillDispatchInput, SkillDispatchResult, SkillDispatchRuntime,
@@ -129,6 +131,7 @@ fn build_skill_custom_tool_definition(
                 "required": ["payload"]
             }),
         },
+        origin: ChatToolOrigin::Skill,
     }
 }
 

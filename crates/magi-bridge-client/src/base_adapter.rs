@@ -8,8 +8,8 @@ use crate::tool_concurrency::{
     ToolBatchKind, ToolConcurrencyInput, partition_tool_calls_with_inputs,
 };
 use crate::types::{
-    BridgeClientError, ChatMessage, ChatToolCall, ChatToolFunction, ModelBridgeClient,
-    ModelInvocationRequest,
+    BridgeClientError, ChatMessage, ChatToolCall, ChatToolFunction, ChatToolOrigin,
+    ModelBridgeClient, ModelInvocationRequest,
 };
 
 #[derive(Clone, Debug)]
@@ -253,6 +253,7 @@ impl BaseAdapter {
                                 "required": t.input_schema.required,
                             }),
                         },
+                        origin: ChatToolOrigin::Unspecified,
                     })
                     .collect()
             }),

@@ -1,4 +1,6 @@
-use magi_bridge_client::{BridgeBindingKind, ChatToolDefinition, ChatToolFunctionDefinition};
+use magi_bridge_client::{
+    BridgeBindingKind, ChatToolDefinition, ChatToolFunctionDefinition, ChatToolOrigin,
+};
 use magi_core::ExecutionResultStatus;
 use magi_skill_runtime::{SkillIdResolution, SkillRuntime};
 
@@ -57,6 +59,7 @@ pub fn skill_apply_tool_definition(skill_runtime: &SkillRuntime) -> ChatToolDefi
                 "required": ["skill_name"]
             }),
         },
+        origin: ChatToolOrigin::Builtin,
     }
 }
 

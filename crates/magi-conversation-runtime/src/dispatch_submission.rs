@@ -40,6 +40,29 @@ pub struct DispatchSubmissionGraph {
     pub active_execution_chain: Option<ActiveExecutionChain>,
 }
 
+/// Root coordinator Turn 的来源。
+///
+/// 用户输入和 Goal 自动续跑都使用同一条 ExecutionChain；区别只体现在持久化的
+/// 时间线及 canonical item，可见性不能再由另一套 session runner 决定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchTurnOrigin {
+    User,
+    GoalContinuation,
+}
+
+impl DispatchTurnOrigin {
+    fn timeline_kind(self) -> TimelineEntryKind {
+        match self {
+            Self::User => TimelineEntryKind::UserMessage,
+            Self::GoalContinuation => TimelineEntryKind::NotificationPublished,
+        }
+    }
+
+    fn creates_user_message_item(self) -> bool {
+        matches!(self, Self::User)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DispatchSubmissionRequest {
     pub accepted_at: UtcMillis,
@@ -63,6 +86,8 @@ pub struct DispatchSubmissionRequest {
     pub user_message_id: Option<String>,
     pub placeholder_message_id: Option<String>,
     pub replace_turn_id: Option<String>,
+    pub required_tool_chain: Vec<String>,
+    pub turn_origin: DispatchTurnOrigin,
 }
 
 #[derive(Clone, Debug)]
@@ -73,7 +98,7 @@ pub struct DispatchSubmissionAccepted {
     pub created_session: bool,
     pub root_task_id: TaskId,
     pub action_task_id: TaskId,
-    pub user_message_item_id: String,
+    pub user_message_item_id: Option<String>,
     pub runner_started: bool,
     pub superseded_turn: Option<CanonicalTurn>,
 }
@@ -203,6 +228,7 @@ struct DispatchTaskInput<'a> {
     access_profile: AccessProfile,
     context_references: &'a [SessionContextReference],
     workspace_root_path: Option<&'a Path>,
+    required_tool_chain: Vec<String>,
 }
 
 fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
@@ -218,16 +244,11 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         access_profile,
         context_references,
         workspace_root_path,
+        required_tool_chain,
     } = input;
-    let delegation_policy = magi_core::agent_delegation_policy(&goal);
     let executor_binding = TaskExecutorBinding::for_role(target_role)
-        .with_active_skill_id(active_skill_id.map(str::to_string));
-    let executor_binding = if delegation_policy.mode != magi_core::AgentDelegationMode::ExplicitOnly
-    {
-        executor_binding.with_delegation_policy(delegation_policy)
-    } else {
-        executor_binding
-    };
+        .with_active_skill_id(active_skill_id.map(str::to_string))
+        .with_required_tool_chain(required_tool_chain);
 
     magi_core::Task {
         task_id: task_id.clone(),
@@ -325,6 +346,7 @@ pub fn run_dispatch_submission(
         access_profile: request.access_profile,
         context_references: &request.context_references,
         workspace_root_path: runtime.workspace_root_path,
+        required_tool_chain: request.required_tool_chain.clone(),
     });
     runtime.task_store.insert_task(task);
     let event =
@@ -411,63 +433,77 @@ pub fn run_dispatch_submission(
     let request_id = request.request_id.clone();
     let user_message_id = request.user_message_id.clone();
     let placeholder_message_id = request.placeholder_message_id.clone();
-    let user_message_item_id = user_message_id
-        .clone()
-        .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0));
+    let user_message_item_id = request.turn_origin.creates_user_message_item().then(|| {
+        user_message_id
+            .clone()
+            .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0))
+    });
     let mut current_turn = ActiveExecutionTurn {
-        turn_id: format!("turn-session-action-{}", accepted_at.0),
+        turn_id: match request.turn_origin {
+            DispatchTurnOrigin::User => format!("turn-session-action-{}", accepted_at.0),
+            DispatchTurnOrigin::GoalContinuation => {
+                format!("turn-goal-continuation-{}-{}", session_id, accepted_at.0)
+            }
+        },
         turn_seq: accepted_at.0,
         accepted_at,
         status: "accepted".to_string(),
         completed_at: None,
-        user_message: Some(request.timeline_message.clone()),
-        items: vec![ActiveExecutionTurnItem {
-            item_id: user_message_item_id,
-            item_seq: 1,
-            kind: "user_message".to_string(),
-            status: "completed".to_string(),
-            source: "user".to_string(),
-            title: None,
-            content: Some(request.timeline_message.clone()),
-            task_id: Some(act_task_id.clone()),
-            worker_id: None,
-            role_id: None,
-            tool_call_id: None,
-            tool_name: None,
-            tool_status: None,
-            tool_arguments: None,
-            tool_result: None,
-            tool_error: None,
-            request_id: request_id.clone(),
-            user_message_id: user_message_id.clone(),
-            placeholder_message_id: placeholder_message_id.clone(),
-            metadata: {
-                let mut metadata =
-                    crate::session_images::session_turn_images_metadata(&request.images);
-                metadata.extend(session_context_references_metadata(
-                    &request.context_references,
-                ));
-                if let Some(replace_turn_id) = request.replace_turn_id.as_ref() {
+        user_message: request
+            .turn_origin
+            .creates_user_message_item()
+            .then(|| request.timeline_message.clone()),
+        items: user_message_item_id
+            .clone()
+            .into_iter()
+            .map(|item_id| ActiveExecutionTurnItem {
+                item_id,
+                item_seq: 1,
+                kind: "user_message".to_string(),
+                status: "completed".to_string(),
+                source: "user".to_string(),
+                title: None,
+                content: Some(request.timeline_message.clone()),
+                task_id: Some(act_task_id.clone()),
+                worker_id: None,
+                role_id: None,
+                tool_call_id: None,
+                tool_name: None,
+                tool_status: None,
+                tool_arguments: None,
+                tool_result: None,
+                tool_error: None,
+                request_id: request_id.clone(),
+                user_message_id: user_message_id.clone(),
+                placeholder_message_id: placeholder_message_id.clone(),
+                metadata: {
+                    let mut metadata =
+                        crate::session_images::session_turn_images_metadata(&request.images);
+                    metadata.extend(session_context_references_metadata(
+                        &request.context_references,
+                    ));
+                    if let Some(replace_turn_id) = request.replace_turn_id.as_ref() {
+                        metadata.insert(
+                            "replacesTurnId".to_string(),
+                            serde_json::Value::String(replace_turn_id.clone()),
+                        );
+                    }
+                    if let Some(skill_name) = request.skill_name.as_deref() {
+                        metadata.insert(
+                            "skillName".to_string(),
+                            serde_json::Value::String(skill_name.to_string()),
+                        );
+                    }
                     metadata.insert(
-                        "replacesTurnId".to_string(),
-                        serde_json::Value::String(replace_turn_id.clone()),
+                        "goalMode".to_string(),
+                        serde_json::Value::Bool(request.goal_mode),
                     );
-                }
-                if let Some(skill_name) = request.skill_name.as_deref() {
-                    metadata.insert(
-                        "skillName".to_string(),
-                        serde_json::Value::String(skill_name.to_string()),
-                    );
-                }
-                metadata.insert(
-                    "goalMode".to_string(),
-                    serde_json::Value::Bool(request.goal_mode),
-                );
-                metadata
-            },
-            timeline_entry_id: Some(entry_id.to_string()),
-            source_thread_id: orchestrator_thread_id.clone(),
-        }],
+                    metadata
+                },
+                timeline_entry_id: Some(entry_id.to_string()),
+                source_thread_id: orchestrator_thread_id.clone(),
+            })
+            .collect(),
     };
     current_turn.normalize();
     Ok(DispatchSubmissionGraph {
@@ -515,7 +551,7 @@ pub fn accept_dispatch_submission(
                     replace_turn_id,
                     TimelineEntryInput::new(
                         request.entry_id.clone(),
-                        TimelineEntryKind::UserMessage,
+                        request.turn_origin.timeline_kind(),
                         request.timeline_message.clone(),
                         request.accepted_at,
                     ),
@@ -528,7 +564,7 @@ pub fn accept_dispatch_submission(
                     request.session_id.clone(),
                     TimelineEntryInput::new(
                         request.entry_id.clone(),
-                        TimelineEntryKind::UserMessage,
+                        request.turn_origin.timeline_kind(),
                         request.timeline_message.clone(),
                         request.accepted_at,
                     ),
@@ -544,10 +580,12 @@ pub fn accept_dispatch_submission(
             }
         };
 
-        let user_message_item_id = request
-            .user_message_id
-            .clone()
-            .unwrap_or_else(|| format!("turn-item-user-{}", request.accepted_at.0));
+        let user_message_item_id = request.turn_origin.creates_user_message_item().then(|| {
+            request
+                .user_message_id
+                .clone()
+                .unwrap_or_else(|| format!("turn-item-user-{}", request.accepted_at.0))
+        });
 
         return Ok(DispatchSubmissionAccepted {
             session_id: request.session_id,
@@ -562,10 +600,12 @@ pub fn accept_dispatch_submission(
         });
     }
 
-    let user_message_item_id = request
-        .user_message_id
-        .clone()
-        .unwrap_or_else(|| format!("turn-item-user-{}", request.accepted_at.0));
+    let user_message_item_id = request.turn_origin.creates_user_message_item().then(|| {
+        request
+            .user_message_id
+            .clone()
+            .unwrap_or_else(|| format!("turn-item-user-{}", request.accepted_at.0))
+    });
 
     Ok(DispatchSubmissionAccepted {
         session_id: request.session_id,
@@ -644,6 +684,8 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             replace_turn_id: None,
+            required_tool_chain: Vec::new(),
+            turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
             session_store: &session_store,
@@ -723,6 +765,8 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             replace_turn_id: None,
+            required_tool_chain: Vec::new(),
+            turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
             session_store: &session_store,
@@ -803,6 +847,8 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             replace_turn_id: None,
+            required_tool_chain: Vec::new(),
+            turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
             session_store: &session_store,
@@ -870,6 +916,8 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             replace_turn_id: None,
+            required_tool_chain: Vec::new(),
+            turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
             session_store: &session_store,
@@ -943,6 +991,8 @@ mod tests {
             user_message_id: None,
             placeholder_message_id: None,
             replace_turn_id: None,
+            required_tool_chain: Vec::new(),
+            turn_origin: DispatchTurnOrigin::User,
         };
         let workspace_root = std::path::PathBuf::from("/tmp/workspace");
         let runtime = DispatchSubmissionRuntime {
@@ -989,5 +1039,71 @@ mod tests {
             .and_then(|turn| turn.items.first())
             .expect("canonical user item should exist");
         assert!(user_item.metadata.contains_key("contextReferences"));
+    }
+
+    #[test]
+    fn goal_continuation_uses_root_execution_chain_without_faking_user_message() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-goal-continuation-dispatch");
+        session_store
+            .create_session(session_id.clone(), "goal continuation dispatch")
+            .expect("session should be creatable");
+        let request = DispatchSubmissionRequest {
+            accepted_at: UtcMillis(5_000),
+            session_id,
+            workspace_id: Some(WorkspaceId::new("workspace-goal-continuation-dispatch")),
+            entry_id: "timeline-goal-continuation-dispatch".to_string(),
+            timeline_message: "目标自动推进: 完成验收".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            created_session: false,
+            mission_title: "目标自动推进".to_string(),
+            task_title: "执行: 目标自动推进".to_string(),
+            trimmed_text: None,
+            execution_goal: Some("先读取当前目标，再继续推进".to_string()),
+            task_tier: TaskTier::ExecutionChain,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            goal_mode: true,
+            target_role: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            replace_turn_id: None,
+            required_tool_chain: vec!["get_goal".to_string()],
+            turn_origin: DispatchTurnOrigin::GoalContinuation,
+        };
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: None,
+        };
+
+        let graph = run_dispatch_submission(&runtime, &request).expect("dispatch should build");
+        let chain = graph
+            .active_execution_chain
+            .expect("execution chain should exist");
+        let turn = chain.current_turn.expect("continuation turn should exist");
+        assert!(turn.user_message.is_none());
+        assert!(turn.items.is_empty());
+        let root_task = task_store
+            .get_task(&graph.root_task_id)
+            .expect("root task should exist");
+        assert_eq!(
+            root_task.executor_binding_target_role(),
+            Some("coordinator")
+        );
+        assert_eq!(root_task.required_tool_chain(), ["get_goal"]);
     }
 }

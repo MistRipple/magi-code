@@ -10,6 +10,14 @@ const messageListSource = await readFile(
   new URL('../src/components/MessageList.svelte', import.meta.url),
   'utf8',
 );
+const messageItemSource = await readFile(
+  new URL('../src/components/MessageItem.svelte', import.meta.url),
+  'utf8',
+);
+const runtimeIndicatorSource = await readFile(
+  new URL('../src/components/TurnRuntimeIndicator.svelte', import.meta.url),
+  'utf8',
+);
 const globalStyleSource = await readFile(
   new URL('../src/styles/global.css', import.meta.url),
   'utf8',
@@ -153,8 +161,48 @@ assert.match(
 );
 assert.match(
   messageListSource,
-  /showPreTurnProcessingIndicator[\s\S]*?messagesState\.isProcessing[\s\S]*?currentRuntimeRenderItem === null/,
-  '消息已提交但 canonical 占位项尚未投影时，主线必须立即显示独立等待动画',
+  /awaitingCurrentTurnProjection[\s\S]*?messagesState\.isProcessing[\s\S]*?currentRuntimeRenderItem === null/,
+  '消息已提交但 canonical 占位项尚未投影时，主线必须立即进入统一运行态',
+);
+assert.match(
+  messageListSource,
+  /type TimelineRenderEntry[\s\S]*?\| \{ kind: 'runtime'; key: string \}/,
+  '运行指示器必须作为时间线条目建模，不能依附到某一条消息卡片',
+);
+assert.match(
+  messageListSource,
+  /timelineRenderEntries[\s\S]*?entries\.splice\(runtimeIndicatorInsertionIndex, 0,[\s\S]*?kind: 'runtime'/,
+  '统一运行态必须插入当前轮次末尾，覆盖占位、思考、工具和正文流式阶段',
+);
+assert.match(
+  messageListSource,
+  /runtimeIndicatorKey[\s\S]*?`runtime-indicator:\$\{runtimeTurnIdentity\}`/,
+  '运行指示器必须按当前轮次稳定 keyed，投影更新不能重挂载并重置计时',
+);
+assert.match(
+  messageListSource,
+  /runtimeMessageRequestId[\s\S]*?activeThreadRequestId \|\| runtimeMessageRequestId/,
+  'pending 状态收敛后仍必须从运行中消息保留同一 requestId，避免首个流式事件重置计时',
+);
+assert.match(
+  messageListSource,
+  /<TurnRuntimeIndicator elapsedSeconds=\{elapsedSeconds\} \/>/,
+  '主线必须只渲染统一运行指示器组件',
+);
+assert.doesNotMatch(
+  messageListSource,
+  /streaming-indicator-standalone|showStandaloneStreamingIndicator|streamingIndicatorRenderKey/,
+  '不得保留独立等待节点或消息卡片底部的双轨运行态实现',
+);
+assert.doesNotMatch(
+  messageItemSource,
+  /showStreamingIndicator|streamingElapsedSeconds|streaming-indicator-bottom/,
+  '消息卡片不得继续持有运行指示器槽位，避免阶段切换时重复展示',
+);
+assert.match(
+  runtimeIndicatorSource,
+  /formatElapsed[\s\S]*?turn-runtime-dot[\s\S]*?turn-runtime-elapsed-time/,
+  '统一运行指示器必须始终同时展示跳动动画和计时',
 );
 assert.match(
   messageListSource,

@@ -7,6 +7,9 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: ToolInputSchema,
+    /// 工具身份来源仅供 Magi 的协议边界生成 wire name，绝不透传给上游。
+    #[serde(default, skip_serializing)]
+    pub origin: crate::types::ChatToolOrigin,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

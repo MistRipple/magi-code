@@ -10,7 +10,9 @@
 //! Turn 生命周期是 session 级 Conversation 的硬不变式：同一 Conversation 不允许
 //! 并发 Turn。task/worker 执行使用 task 级 Conversation，不再占用 session 级槽位。
 
-use magi_conversation_runtime::{BeginTurnError, TurnAdvanceError, TurnState, UserSignal};
+#[cfg(test)]
+use magi_conversation_runtime::BeginTurnError;
+use magi_conversation_runtime::{TurnAdvanceError, TurnState, UserSignal};
 use magi_core::{SessionId, UtcMillis};
 
 use crate::dto::SessionTurnRequestDto;
@@ -42,6 +44,7 @@ pub(super) fn ingest_user_input_to_conversation(
 }
 
 /// 在外层执行入口处开启 Turn。若发现已有未结束 Turn，调用方必须停止本次执行。
+#[cfg(test)]
 pub(super) fn begin_session_turn(
     state: &ApiState,
     session_id: &SessionId,

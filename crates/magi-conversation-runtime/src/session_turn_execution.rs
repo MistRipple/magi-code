@@ -13,7 +13,7 @@ use crate::{
     },
     model_config::resolve_orchestrator_model_config,
     model_error::{
-        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS,
+        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
         MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, classify_model_invocation_error,
         extract_model_context_limit, model_empty_response_recovery_prompt,
         model_stream_interruption_recovery_prompt, provider_empty_assistant_response_error,
@@ -28,7 +28,7 @@ use crate::{
     session_writeback::{
         SessionStatePersistCallback, SessionTurnStreamPublishGate,
         append_session_tool_call_items_batch_with_context, append_session_turn_error_item,
-        append_session_turn_item, persist_session_state_checkpoint,
+        append_session_turn_item, apply_model_response_round, persist_session_state_checkpoint,
         publish_current_session_turn_item_event, publish_model_retry_runtime_event,
         publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
         session_turn_stream_update, upsert_session_turn_item,
@@ -417,7 +417,18 @@ fn workspace_context_messages(request: &SessionTurnExecutionRequest) -> Vec<Chat
 
 fn estimate_tool_definition_tokens(tools: Option<&[ChatToolDefinition]>) -> usize {
     tools
-        .and_then(|definitions| serde_json::to_string(definitions).ok())
+        .and_then(|definitions| {
+            let model_visible_definitions = definitions
+                .iter()
+                .map(|definition| {
+                    serde_json::json!({
+                        "type": definition.kind,
+                        "function": definition.function,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string(&model_visible_definitions).ok()
+        })
         .map(|serialized| estimate_text_tokens(&serialized))
         .unwrap_or(0)
 }
@@ -861,6 +872,7 @@ fn run_session_turn_execution_inner(
     }
     let mut final_content: Option<String> = None;
     let mut final_item_id: Option<String> = None;
+    let mut final_model_round: Option<usize> = None;
     let mut main_timeline_entry_id: Option<String> = None;
     let mut had_tool_calls = false;
     let mut active_skill_name = skill_name;
@@ -872,6 +884,7 @@ fn run_session_turn_execution_inner(
     let mut corrected_context_limit = false;
     let mut fallback_activated = false;
     let mut empty_response_recovery_attempts = 0usize;
+    let mut pre_output_invocation_recovery_attempts = 0usize;
     let mut stream_interruption_recovery_attempts = 0usize;
 
     let mut round_limit = tool_call_round_limit(&required_tool_chain);
@@ -906,6 +919,7 @@ fn run_session_turn_execution_inner(
                 tools: round_tools,
                 messages: &mut messages,
                 completed_required_tool_names: &completed_required_tool_names,
+                pre_output_invocation_recovery_attempts,
                 stream_interruption_recovery_attempts,
                 round,
                 orchestrator_thread_id: &orchestrator_thread_id,
@@ -920,6 +934,14 @@ fn run_session_turn_execution_inner(
             Ok(output) => output,
             Err(SessionTurnRoundError::StreamInterruptedRecovered) => {
                 stream_interruption_recovery_attempts += 1;
+                round_limit = round_limit
+                    .max(round.saturating_add(2))
+                    .min(MAX_TOOL_CALL_ROUNDS);
+                round = round.saturating_add(1);
+                continue;
+            }
+            Err(SessionTurnRoundError::PreOutputInvocationRecovered) => {
+                pre_output_invocation_recovery_attempts += 1;
                 round_limit = round_limit
                     .max(round.saturating_add(2))
                     .min(MAX_TOOL_CALL_ROUNDS);
@@ -1110,6 +1132,7 @@ fn run_session_turn_execution_inner(
                 SessionTurnInputBoundary::Closed => {}
             }
             final_item_id = streamed_content.final_item_id;
+            final_model_round = Some(round);
             final_content = Some(content);
             break;
         }
@@ -1193,6 +1216,7 @@ fn run_session_turn_execution_inner(
             content: &final_content,
             item_id: final_item_id.as_deref(),
             timeline_entry_id: main_timeline_entry_id.as_deref(),
+            model_round: final_model_round,
         },
         &orchestrator_thread_id,
         persist_session_state,
@@ -1296,6 +1320,7 @@ struct SessionTurnRoundRuntime<'a> {
     tools: Option<Vec<ChatToolDefinition>>,
     messages: &'a mut Vec<ChatMessage>,
     completed_required_tool_names: &'a [String],
+    pre_output_invocation_recovery_attempts: usize,
     stream_interruption_recovery_attempts: usize,
     round: usize,
     /// session 主线 thread：该 turn 内所有 session_turn_item 的 source_thread_id。
@@ -1315,10 +1340,11 @@ struct SessionTurnRoundOutput {
     interrupted: bool,
 }
 
-/// 单轮流式调用的失败语义。流中断已被完整保存并可继续时，不应直接收口整个会话。
+/// 单轮流式调用的失败语义。仅在未交付可见内容时才能重放请求；已交付片段时必须续写。
 #[derive(Debug)]
 enum SessionTurnRoundError {
     Failed(String),
+    PreOutputInvocationRecovered,
     StreamInterruptedRecovered,
 }
 
@@ -1416,6 +1442,7 @@ fn stream_session_turn_round(
         tools,
         messages,
         completed_required_tool_names,
+        pre_output_invocation_recovery_attempts,
         stream_interruption_recovery_attempts,
         round,
         orchestrator_thread_id,
@@ -1525,6 +1552,7 @@ fn stream_session_turn_round(
                 orchestrator_thread_id.clone(),
             );
             apply_request_aliases(&mut item, request);
+            apply_model_response_round(&mut item, round);
             if let Some(published) =
                 upsert_session_turn_item(session_store, &request.session_id, item)
                 && let Some(stream_update) = stream_update.as_ref()
@@ -1577,6 +1605,7 @@ fn stream_session_turn_round(
             orchestrator_thread_id.clone(),
         );
         apply_request_aliases(&mut item, request);
+        apply_model_response_round(&mut item, round);
         if let Some(published) = upsert_session_turn_item(session_store, &request.session_id, item)
             && let Some(stream_update) = stream_update.as_ref()
         {
@@ -1653,12 +1682,27 @@ fn stream_session_turn_round(
                     error_code: Some(classification.code.to_string()),
                 },
             );
+            let partial_visible_content = streamed_visible_content.borrow().trim().to_string();
+            let partial_thinking = streamed_thinking.borrow().trim().to_string();
+            if partial_visible_content.is_empty()
+                && partial_thinking.is_empty()
+                && classification.retryable_before_output
+                && pre_output_invocation_recovery_attempts < MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS
+            {
+                tracing::warn!(
+                    session_id = %request.session_id,
+                    round,
+                    attempt = pre_output_invocation_recovery_attempts + 1,
+                    max_attempts = MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
+                    error_code = classification.code,
+                    "模型未交付内容即发生暂态调用故障，重新执行同一轮请求"
+                );
+                return Err(SessionTurnRoundError::PreOutputInvocationRecovered);
+            }
             if classification.code != "model_stream_interrupted" {
                 return Err(SessionTurnRoundError::Failed(raw_error));
             }
 
-            let partial_visible_content = streamed_visible_content.borrow().trim().to_string();
-            let partial_thinking = streamed_thinking.borrow().trim().to_string();
             if !partial_thinking.is_empty() {
                 let mut thinking_item = session_turn_item(
                     "assistant_thinking",
@@ -1669,6 +1713,7 @@ fn stream_session_turn_round(
                     orchestrator_thread_id.clone(),
                 );
                 apply_request_aliases(&mut thinking_item, request);
+                apply_model_response_round(&mut thinking_item, round);
                 apply_goal_turn_intermediate_visibility(&mut thinking_item, request);
                 if let Some(published) =
                     upsert_session_turn_item(session_store, &request.session_id, thinking_item)
@@ -1695,6 +1740,7 @@ fn stream_session_turn_round(
                     orchestrator_thread_id.clone(),
                 );
                 apply_request_aliases(&mut stream_item, request);
+                apply_model_response_round(&mut stream_item, round);
                 apply_goal_turn_intermediate_visibility(&mut stream_item, request);
                 if let Some(published) =
                     upsert_session_turn_item(session_store, &request.session_id, stream_item)
@@ -1863,6 +1909,7 @@ fn stream_session_turn_round(
             orchestrator_thread_id.clone(),
         );
         apply_request_aliases(&mut thinking_item, request);
+        apply_model_response_round(&mut thinking_item, round);
         apply_goal_turn_intermediate_visibility(&mut thinking_item, request);
         if let Some(published) =
             upsert_session_turn_item(session_store, &request.session_id, thinking_item)
@@ -1911,6 +1958,7 @@ fn stream_session_turn_round(
             orchestrator_thread_id.clone(),
         );
         apply_request_aliases(&mut stream_item, request);
+        apply_model_response_round(&mut stream_item, round);
         apply_goal_turn_intermediate_visibility(&mut stream_item, request);
         if let Some(published) =
             upsert_session_turn_item(session_store, &request.session_id, stream_item)
@@ -2064,6 +2112,7 @@ struct FinalItemInput<'a> {
     content: &'a str,
     item_id: Option<&'a str>,
     timeline_entry_id: Option<&'a str>,
+    model_round: Option<usize>,
 }
 
 fn append_final_item(
@@ -2078,6 +2127,7 @@ fn append_final_item(
         content: final_content,
         item_id: final_item_id,
         timeline_entry_id,
+        model_round,
     } = input;
     let has_requested_final_item_id = final_item_id.is_some();
     let mut final_item = session_turn_item(
@@ -2092,6 +2142,9 @@ fn append_final_item(
         final_item.timeline_entry_id = Some(timeline_entry_id.to_string());
     }
     apply_request_aliases(&mut final_item, request);
+    if let Some(model_round) = model_round {
+        apply_model_response_round(&mut final_item, model_round);
+    }
     if request.goal_turn_mode.is_goal_driven()
         && session_store.active_goal(&request.session_id).is_some()
     {
@@ -2166,6 +2219,10 @@ mod tests {
 
     struct CountingEmptyModelBridgeClient {
         calls: AtomicUsize,
+    }
+
+    struct EmptyStreamThenRecoveredSessionModelBridgeClient {
+        streaming_calls: AtomicUsize,
     }
 
     struct RetryEventModelBridgeClient;
@@ -2303,6 +2360,42 @@ mod tests {
             request: ModelInvocationRequest,
             _on_delta: &dyn Fn(&ModelStreamingDelta),
         ) -> Result<BridgeResponse, BridgeClientError> {
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for EmptyStreamThenRecoveredSessionModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            Ok(BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "content": "主线在暂态空流后完成。",
+                    "finish_reason": "stop"
+                })
+                .to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            let attempt = self.streaming_calls.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Err(BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::RemoteBusiness,
+                    code: Some(-32007),
+                    message: "provider response invalid: empty stream response".to_string(),
+                });
+            }
+            on_delta(&ModelStreamingDelta {
+                content: "主线在暂态空流后完成。".to_string(),
+                thinking: String::new(),
+            });
             self.invoke(request)
         }
     }
@@ -2717,6 +2810,7 @@ mod tests {
                 description: "render diagram".to_string(),
                 parameters: serde_json::json!({ "type": "object" }),
             },
+            origin: magi_bridge_client::ChatToolOrigin::Builtin,
         }];
 
         let choice = forced_tool_choice_for_round(&request, Some(&tools), 0, &[])
@@ -2791,6 +2885,7 @@ mod tests {
                     description: format!("{name} tool"),
                     parameters: serde_json::json!({ "type": "object" }),
                 },
+                origin: magi_bridge_client::ChatToolOrigin::Builtin,
             })
             .collect::<Vec<_>>();
 
@@ -3046,6 +3141,100 @@ mod tests {
         let plan = plan_store.snapshot().expect("plan should remain visible");
         assert_eq!(plan.state, magi_core::PlanState::Paused);
         assert_eq!(plan.items[0].status, magi_core::PlanItemStatus::InProgress);
+    }
+
+    #[test]
+    fn session_turn_retries_empty_stream_before_output() {
+        let session_id = SessionId::new("session-empty-stream-recovery");
+        let store = Arc::new(SessionStore::new());
+        store
+            .create_session(session_id.clone(), "empty stream recovery")
+            .expect("session should be creatable");
+        let (_mission_id, orchestrator_thread_id) =
+            store.ensure_session_mission(&session_id, ts(1_100), || {
+                magi_core::MissionId::new("mission-empty-stream-recovery")
+            });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-empty-stream-recovery".to_string(),
+                    turn_seq: 1,
+                    accepted_at: ts(1_200),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("请回复一句话".to_string()),
+                    items: vec![session_turn_item(
+                        "user_message",
+                        "completed",
+                        None,
+                        Some("请回复一句话".to_string()),
+                        Some("user-empty-stream-recovery".to_string()),
+                        orchestrator_thread_id,
+                    )],
+                },
+            )
+            .expect("turn should be stored");
+        let client = EmptyStreamThenRecoveredSessionModelBridgeClient {
+            streaming_calls: AtomicUsize::new(0),
+        };
+        let event_bus = InMemoryEventBus::new(16);
+        let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: "turn-empty-stream-recovery".to_string(),
+            workspace_id: None,
+            prompt: "请回复一句话".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: false,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
+            workspace_root_path: None,
+        };
+
+        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: store.as_ref(),
+            conversation_registry: &ConversationRegistry::new(),
+            plan_store: &plan_store,
+            settings_store: None,
+            safety_gate: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            snapshot_manager: None,
+            request,
+            prompt: "请回复一句话".to_string(),
+            knowledge_context_prompt: None,
+            tools: None,
+            persist_session_state: None,
+            live_settings_store: None,
+            model_switch_recovery: None,
+        })
+        .expect("empty stream before output should be retried");
+
+        assert_eq!(output.final_content, "主线在暂态空流后完成。");
+        assert_eq!(
+            client.streaming_calls.load(Ordering::SeqCst),
+            2,
+            "主线应在未交付内容的空流后重试一次"
+        );
+        let turn = store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("completed turn should remain visible");
+        assert_eq!(turn.status, "completed");
+        assert!(turn.items.iter().all(|item| item.kind != "assistant_error"));
     }
 
     #[test]
@@ -3455,6 +3644,7 @@ mod tests {
                 tools: None,
                 messages: &mut messages,
                 completed_required_tool_names: &[],
+                pre_output_invocation_recovery_attempts: 0,
                 stream_interruption_recovery_attempts: 0,
                 snapshot_manager: None,
                 round: 0,
@@ -3502,6 +3692,11 @@ mod tests {
             CanonicalTurnItemStatus::Completed
         );
         assert_eq!(assistant_items[0].content.as_deref(), Some("你好"));
+        assert_eq!(
+            assistant_items[0].metadata.get("modelRound"),
+            Some(&serde_json::Value::from(0_u64)),
+            "流式正文必须携带模型轮次，供前端将下一轮 thinking 与本轮正文分隔"
+        );
     }
 
     #[test]
@@ -3580,6 +3775,7 @@ mod tests {
                 tools: None,
                 messages: &mut messages,
                 completed_required_tool_names: &[],
+                pre_output_invocation_recovery_attempts: 0,
                 stream_interruption_recovery_attempts: 0,
                 snapshot_manager: None,
                 round: 0,
@@ -4442,6 +4638,7 @@ mod tests {
                 content: "最终答案来自工具后轮次。",
                 item_id: Some("turn-item-assistant-stream-post-tool"),
                 timeline_entry_id: Some("turn-item-assistant-stream-main"),
+                model_round: Some(1),
             },
             &orchestrator_thread_id,
             None,
@@ -4472,6 +4669,11 @@ mod tests {
             post_tool_item.content.as_deref(),
             Some("最终答案来自工具后轮次。")
         );
+        assert_eq!(
+            post_tool_item.metadata.get("modelRound"),
+            Some(&serde_json::Value::from(1_u64)),
+            "最终正文必须保留所属模型轮次，供前端按轮次分隔 thinking"
+        );
         let canonical_turn = store
             .canonical_turns_for_session(&session_id)
             .into_iter()
@@ -4482,6 +4684,11 @@ mod tests {
             .iter()
             .find(|item| item.item_id == "turn-item-assistant-stream-post-tool")
             .expect("post-tool canonical assistant item should remain stored");
+        assert_eq!(
+            canonical_post_tool_item.metadata.get("modelRound"),
+            Some(&serde_json::Value::from(1_u64)),
+            "模型轮次必须进入 canonical 事件，不能只停留在运行时 sidecar"
+        );
         assert_eq!(
             canonical_post_tool_item.kind,
             CanonicalTurnItemKind::AssistantText
@@ -4901,6 +5108,7 @@ mod tests {
                 content: "最终回复",
                 item_id: None,
                 timeline_entry_id: None,
+                model_round: None,
             },
             &orchestrator_thread_id,
             None,

@@ -52,12 +52,6 @@ pub struct ModelCapabilityProfile {
     /// 命中此项的模型（GPT-5 / o3 / o4 系列）才会把
     /// `LlmMessageParams::reasoning_effort` 注入到 OpenAI 兼容请求体。
     pub supports_openai_reasoning_effort: bool,
-    /// 是否支持 OpenAI Chat Completions 的强制工具选择对象。
-    ///
-    /// 部分带思考模式的模型只接受 `tool_choice: "auto"`，即使声明了工具也会
-    /// 拒绝 `{"type":"function", ...}`。这类模型必须由适配器直接降级到自动选择，
-    /// 避免把一个已知会失败的请求发给服务端。
-    pub supports_forced_tool_choice: bool,
     /// 默认 thinking budget tokens（仅在 [`ThinkingKind::BudgetTokens`]
     /// 形态下被读取）。`0` 表示无显式默认，由适配器使用其内置 fallback。
     pub default_budget_tokens: u32,
@@ -94,7 +88,6 @@ pub const UNKNOWN_MODEL_DEFAULT: ModelCapabilityProfile = ModelCapabilityProfile
     thinking_kind: ThinkingKind::None,
     supports_thinking_display: false,
     supports_openai_reasoning_effort: false,
-    supports_forced_tool_choice: true,
     default_budget_tokens: 0,
     beta_headers: &[],
 };
@@ -110,7 +103,6 @@ const PROFILE_CLAUDE_ADAPTIVE: ModelCapabilityProfile = ModelCapabilityProfile {
     thinking_kind: ThinkingKind::Effort,
     supports_thinking_display: true,
     supports_openai_reasoning_effort: false,
-    supports_forced_tool_choice: true,
     default_budget_tokens: 0,
     beta_headers: &[("anthropic-beta", "task-budgets-2026-03-13")],
 };
@@ -120,7 +112,6 @@ const PROFILE_CLAUDE_BUDGET_TOKENS: ModelCapabilityProfile = ModelCapabilityProf
     thinking_kind: ThinkingKind::BudgetTokens,
     supports_thinking_display: false,
     supports_openai_reasoning_effort: false,
-    supports_forced_tool_choice: true,
     default_budget_tokens: 4096,
     beta_headers: &[],
 };
@@ -132,17 +123,6 @@ const PROFILE_OPENAI_REASONING: ModelCapabilityProfile = ModelCapabilityProfile 
     thinking_kind: ThinkingKind::None,
     supports_thinking_display: false,
     supports_openai_reasoning_effort: true,
-    supports_forced_tool_choice: true,
-    default_budget_tokens: 0,
-    beta_headers: &[],
-};
-
-/// DeepSeek V4 的思考模式只接受自动工具选择，不接受 OpenAI 的强制工具对象。
-const PROFILE_DEEPSEEK_V4: ModelCapabilityProfile = ModelCapabilityProfile {
-    thinking_kind: ThinkingKind::None,
-    supports_thinking_display: false,
-    supports_openai_reasoning_effort: false,
-    supports_forced_tool_choice: false,
     default_budget_tokens: 0,
     beta_headers: &[],
 };
@@ -200,12 +180,6 @@ const CAPABILITY_ENTRIES: &[CapabilityEntry] = &[
     CapabilityEntry {
         prefix: "gpt-5",
         profile: PROFILE_OPENAI_REASONING,
-    },
-    // DeepSeek V4 thinking mode rejects tool_choice=function/object；工具本身仍可用，
-    // 只需让模型在 auto 模式下决定是否调用。
-    CapabilityEntry {
-        prefix: "deepseek-v4",
-        profile: PROFILE_DEEPSEEK_V4,
     },
     CapabilityEntry {
         prefix: "o4-",
@@ -340,19 +314,6 @@ mod tests {
         let profile = resolve_capability_profile("gpt-5-turbo");
         assert_eq!(profile.thinking_kind, ThinkingKind::None);
         assert!(profile.supports_openai_reasoning_effort);
-        assert!(profile.supports_forced_tool_choice);
-    }
-
-    #[test]
-    fn deepseek_v4_disables_forced_tool_choice_case_insensitively() {
-        for model in [
-            "DeepSeek-V4-Flash",
-            "deepseek-v4-flash",
-            "DEEPSEEK-V4-FLASH",
-        ] {
-            let profile = resolve_capability_profile(model);
-            assert!(!profile.supports_forced_tool_choice, "model {model}");
-        }
     }
 
     #[test]

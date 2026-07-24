@@ -16,6 +16,10 @@ pub(crate) const PUBLIC_MODEL_EMPTY_RESPONSE_MESSAGE: &str =
 /// 传输层已经在未收到任何增量时完成自身重试；这里处理的是已经向用户输出过
 /// 片段后缺少终止 SSE 的场景。该场景不能重放同一个请求，只能让模型基于片段续写。
 pub(crate) const MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS: usize = 5;
+/// 上游已经完成连接级重试后，任务运行时只在尚未向用户交付任何内容时额外重试一次。
+/// 这层监督用于覆盖代理网关返回空流等无法在 HTTP 状态码层判断的暂态故障；一旦有
+/// 可见片段，必须走续写恢复，不能重放请求。
+pub(crate) const MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS: usize = 1;
 pub(crate) const MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS: usize = 3;
 pub(crate) const MODEL_EMPTY_RESPONSE_RECOVERY_PROMPT: &str = "上一轮模型没有返回用户可见正文或可执行工具调用。请不要只输出 thinking：现在直接输出完整的用户可见答复；如果确实需要工具，请直接调用工具；如果无法完成，请直接说明原因。";
 pub(crate) const MODEL_EMPTY_RESPONSE_AFTER_TOOLS_RECOVERY_PROMPT: &str = "前面的工具调用已经完成，工具结果已在上下文中。请不要只输出 thinking，也不要重复已完成的工具调用；现在直接基于现有结果输出完整的用户可见答复。仅在确有缺失信息时调用新的必要工具。";
@@ -28,6 +32,7 @@ pub(crate) const PUBLIC_MODEL_INVALID_IMAGE_INPUT_MESSAGE: &str =
 pub(crate) struct ModelInvocationErrorClassification {
     pub code: &'static str,
     pub public_message: &'static str,
+    pub retryable_before_output: bool,
 }
 
 pub(crate) fn classify_model_invocation_error(
@@ -38,6 +43,7 @@ pub(crate) fn classify_model_invocation_error(
         return ModelInvocationErrorClassification {
             code: "model_context_limit",
             public_message: PUBLIC_MODEL_CONTEXT_LIMIT_MESSAGE,
+            retryable_before_output: false,
         };
     }
     if contains_http_status(&normalized, 401)
@@ -51,6 +57,7 @@ pub(crate) fn classify_model_invocation_error(
         return ModelInvocationErrorClassification {
             code: "model_auth_failed",
             public_message: PUBLIC_MODEL_AUTH_FAILURE_MESSAGE,
+            retryable_before_output: false,
         };
     }
     if contains_http_status(&normalized, 429)
@@ -60,6 +67,7 @@ pub(crate) fn classify_model_invocation_error(
         return ModelInvocationErrorClassification {
             code: "model_rate_limited",
             public_message: PUBLIC_MODEL_RATE_LIMIT_MESSAGE,
+            retryable_before_output: false,
         };
     }
     if contains_http_status(&normalized, 404)
@@ -70,35 +78,55 @@ pub(crate) fn classify_model_invocation_error(
         return ModelInvocationErrorClassification {
             code: "model_not_found",
             public_message: PUBLIC_MODEL_NOT_FOUND_MESSAGE,
+            retryable_before_output: false,
         };
     }
     if contains_tool_unsupported_error(&normalized) {
         return ModelInvocationErrorClassification {
             code: "model_tools_unsupported",
             public_message: PUBLIC_MODEL_TOOL_UNSUPPORTED_MESSAGE,
+            retryable_before_output: false,
         };
     }
     if contains_http_status(&normalized, 400) {
         return ModelInvocationErrorClassification {
             code: "model_invalid_request",
             public_message: PUBLIC_MODEL_INVALID_REQUEST_MESSAGE,
+            retryable_before_output: false,
         };
     }
     if contains_stream_interruption_error(&normalized) {
         return ModelInvocationErrorClassification {
             code: "model_stream_interrupted",
             public_message: PUBLIC_MODEL_STREAM_INTERRUPTED_MESSAGE,
+            retryable_before_output: false,
         };
     }
     if contains_timeout_error(&normalized) {
         return ModelInvocationErrorClassification {
             code: "model_timeout",
             public_message: PUBLIC_MODEL_TIMEOUT_MESSAGE,
+            retryable_before_output: true,
+        };
+    }
+    if contains_empty_response_error(&normalized) {
+        return ModelInvocationErrorClassification {
+            code: "model_empty_response",
+            public_message: PUBLIC_MODEL_EMPTY_RESPONSE_MESSAGE,
+            retryable_before_output: true,
+        };
+    }
+    if contains_retryable_transport_error(&normalized) {
+        return ModelInvocationErrorClassification {
+            code: "model_invocation_failed",
+            public_message: PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE,
+            retryable_before_output: true,
         };
     }
     ModelInvocationErrorClassification {
         code: "model_invocation_failed",
         public_message: PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE,
+        retryable_before_output: false,
     }
 }
 
@@ -205,6 +233,29 @@ fn contains_timeout_error(error: &str) -> bool {
     error.contains("timed out") || error.contains("timeout") || error.contains("deadline exceeded")
 }
 
+fn contains_empty_response_error(error: &str) -> bool {
+    error.contains("empty stream response")
+        || error.contains("empty response")
+        || error.contains("expected event stream")
+}
+
+fn contains_retryable_transport_error(error: &str) -> bool {
+    error.contains("桥接调用失败[transport]")
+        || error.contains("provider transport failed")
+        || error.contains("connection reset")
+        || error.contains("connection aborted")
+        || error.contains("connection closed")
+        || error.contains("failed to connect")
+        || error.contains("dns error")
+        || contains_http_status(error, 408)
+        || contains_http_status(error, 409)
+        || contains_http_status(error, 500)
+        || contains_http_status(error, 502)
+        || contains_http_status(error, 503)
+        || contains_http_status(error, 504)
+        || contains_http_status(error, 529)
+}
+
 pub(crate) fn public_model_image_invocation_error_message(raw_error: &str) -> String {
     let normalized = raw_error.to_ascii_lowercase();
     if normalized.contains("does not represent a valid image")
@@ -259,9 +310,10 @@ mod tests {
             public_model_invocation_error_message(
                 "桥接调用失败[RemoteBusiness]: provider response invalid: empty stream response"
             ),
-            PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE
+            PUBLIC_MODEL_EMPTY_RESPONSE_MESSAGE
         );
         assert_eq!(MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, 3);
+        assert_eq!(MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS, 1);
         assert_eq!(MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, 5);
         assert!(model_empty_response_recovery_prompt(false).contains("用户可见答复"));
         assert!(model_empty_response_recovery_prompt(true).contains("工具调用已经完成"));
@@ -327,6 +379,26 @@ mod tests {
             ),
             "模型响应超时，可直接继续重试。"
         );
+    }
+
+    #[test]
+    fn model_invocation_errors_mark_only_pre_output_transient_failures_retryable() {
+        let empty_stream = classify_model_invocation_error(
+            "桥接调用失败[RemoteBusiness]: provider response invalid: empty stream response",
+        );
+        assert_eq!(empty_stream.code, "model_empty_response");
+        assert!(empty_stream.retryable_before_output);
+
+        let transport = classify_model_invocation_error(
+            "桥接调用失败[Transport]: provider transport failed: connection reset by peer",
+        );
+        assert_eq!(transport.code, "model_invocation_failed");
+        assert!(transport.retryable_before_output);
+
+        let invalid_request = classify_model_invocation_error(
+            "桥接调用失败[RemoteBusiness]: provider rejected request (http_status=400)",
+        );
+        assert!(!invalid_request.retryable_before_output);
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub mod task_runner;
 pub mod task_runner_bridge;
 pub mod tool_batch;
 mod tool_declared_paths;
+mod tool_execution_ledger;
 pub mod tool_result_utils;
 mod tool_surface_state;
 mod turn;
@@ -65,11 +66,11 @@ pub use task_helpers::{
     forced_task_tool_choice_for_round, is_execution_tool_validation, is_planning_no_tool_action,
     is_planning_text_validation, is_tool_reference_boundary, public_builtin_tool_references,
     record_completed_required_tools, required_tool_chain_is_complete,
-    required_tool_chain_recovery_prompt, task_required_tool_chain, task_tool_failure_reason,
-    task_turn_visibility, tool_call_round_limit, tool_reference_position,
-    validation_result_rejects_delivery,
+    required_tool_chain_recovery_prompt, required_tool_definitions_for_round,
+    task_required_tool_chain, task_tool_failure_reason, task_turn_visibility,
+    tool_call_round_limit, tool_reference_position, validation_result_rejects_delivery,
 };
-pub use tool_batch::execute_task_tool_call_batch;
+pub(crate) use tool_batch::execute_task_tool_call_batch;
 pub use turn::{Turn, TurnState, TurnTransitionError};
 
 #[cfg(test)]

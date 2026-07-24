@@ -6074,6 +6074,43 @@ fn external_mcp_tool_surface_and_execution_share_one_registry_snapshot() {
 }
 
 #[test]
+fn idempotent_read_tool_classification_uses_builtin_and_mcp_metadata() {
+    let registry = ToolRegistry::new(
+        Arc::new(GovernanceService::default()),
+        Arc::new(magi_event_bus::InMemoryEventBus::new(16)),
+    )
+    .with_external_tool_catalog_provider(Arc::new(|| ExternalToolCatalogSnapshot {
+        mcp_tools: vec![
+            ExternalMcpToolCatalogEntry {
+                server_id: "repo-tools".to_string(),
+                server_name: "Repository Tools".to_string(),
+                model_tool_name: "mcp__repo_tools__inspect".to_string(),
+                tool_name: "inspect".to_string(),
+                description: "Inspect repository".to_string(),
+                read_only: true,
+                input_schema: serde_json::json!({ "type": "object" }),
+            },
+            ExternalMcpToolCatalogEntry {
+                server_id: "repo-tools".to_string(),
+                server_name: "Repository Tools".to_string(),
+                model_tool_name: "mcp__repo_tools__apply".to_string(),
+                tool_name: "apply".to_string(),
+                description: "Apply repository change".to_string(),
+                read_only: false,
+                input_schema: serde_json::json!({ "type": "object" }),
+            },
+        ],
+        ..ExternalToolCatalogSnapshot::default()
+    }));
+
+    assert!(registry.is_idempotent_read_tool(BuiltinToolName::WebSearch.as_str()));
+    assert!(!registry.is_idempotent_read_tool(BuiltinToolName::ShellExec.as_str()));
+    assert!(registry.is_idempotent_read_tool("mcp__repo_tools__inspect"));
+    assert!(!registry.is_idempotent_read_tool("mcp__repo_tools__apply"));
+    assert!(!registry.is_idempotent_read_tool("unknown_tool"));
+}
+
+#[test]
 fn external_mcp_tool_is_blocked_before_executor_in_read_only_profile() {
     let governance = Arc::new(GovernanceService::default());
     let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));

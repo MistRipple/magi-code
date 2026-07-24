@@ -14,7 +14,6 @@
   import { getAgentColor } from '../lib/agent-colors';
   import {
     formatDuration,
-    formatElapsed as formatElapsedMmSs,
     formatTraceableTime,
   } from '../lib/utils';
   import { isRuntimeInternalTool } from '../shared/tool-visibility';
@@ -25,10 +24,6 @@
     readOnly?: boolean;
     /** 显示上下文：thread=主对话区, task=代理详情 */
     displayContext?: 'thread' | 'task';
-    /** 是否允许渲染底部流式三点（仅最后一条流式消息启用） */
-    showStreamingIndicator?: boolean;
-    /** 当前面板流式计时（秒） */
-    streamingElapsedSeconds?: number;
     /** 文件预览必须跟随当前消息所属 workspace/session，不能从右栏当前状态猜测 */
     filePreviewScope?: FilePreviewScope;
     canEdit?: boolean;
@@ -38,8 +33,6 @@
     message,
     readOnly = false,
     displayContext = 'thread',
-    showStreamingIndicator = true,
-    streamingElapsedSeconds = 0,
     filePreviewScope = undefined,
     canEdit = false,
     onEdit = undefined,
@@ -176,10 +169,6 @@
       throw new Error(`[MessageItem] block 缺少 id: message=${message.id} type=${block.type}`);
     }
     return `${message.id}:${id}`;
-  }
-
-  function formatElapsed(seconds: number): string {
-    return formatElapsedMmSs(seconds);
   }
 
   function formatDurationMs(durationMs: number): string {
@@ -468,17 +457,6 @@
         {/if}
       {/if}
 
-      <!-- 底部计时器槽位：父级 MessageList 把 showStreamingIndicator 锚到当前 turn 内
-           displayOrder 最大的非 user_input render item，使指示器始终落在 turn 最末尾卡片的底部；
-           不再叠加 isStreaming 判断，避免锚点 message 自身已完成时指示器消失。 -->
-      {#if showStreamingIndicator}
-        <div class="streaming-indicator-bottom">
-          <span class="streaming-dot"></span>
-          <span class="streaming-dot"></span>
-          <span class="streaming-dot"></span>
-          <span class="streaming-elapsed-time">{formatElapsed(streamingElapsedSeconds)}</span>
-        </div>
-      {/if}
     </div>
   </div>
 {/if}
@@ -705,7 +683,7 @@
     opacity: 0.7;
   }
 
-  /* 流式消息卡片：高度完全由内容与动画驱动，避免占位感 */
+  /* 流式消息卡片：高度完全由内容驱动，避免占位感 */
   .message-item.assistant.streaming {
     min-height: 0;
   }
@@ -719,7 +697,6 @@
     padding-bottom: var(--space-2);
   }
 
-  /* 底部运行态区域在 streaming 与完成态之间复用同一容器，避免完成瞬间高度跳变。 */
   .message-runtime-footer.has-content {
     margin-top: var(--space-3);
     padding-top: var(--space-2);
@@ -830,8 +807,6 @@
     margin-top: 0;
   }
 
-  /* 流式消息底部加载指示器：始终位于消息内容末尾，使整 turn 末尾卡片的底部承载计时器 */
-  .streaming-indicator-bottom,
   .message-runtime-footer {
     display: flex;
     align-items: center;
@@ -839,40 +814,10 @@
     padding: var(--space-2) 0;
   }
 
-  .streaming-indicator-bottom {
-    margin-top: var(--space-2);
-    padding: var(--space-1) 0;
-  }
-
   .message-runtime-footer {
     min-height: calc(var(--text-xs) * 1.4 + var(--space-2));
     margin-top: 0;
     padding: var(--space-1) 0;
-  }
-
-  .streaming-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--foreground-muted);
-    opacity: 0.72;
-    animation: streamingBounce 1.4s ease-in-out infinite;
-  }
-
-  .streaming-dot:nth-child(2) {
-    animation-delay: 0.2s;
-  }
-
-  .streaming-dot:nth-child(3) {
-    animation-delay: 0.4s;
-  }
-
-  .streaming-elapsed-time {
-    margin-left: 4px;
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-    font-family: var(--font-mono);
-    font-variant-numeric: tabular-nums;
   }
 
   .message-runtime-text {
@@ -882,18 +827,7 @@
     font-variant-numeric: tabular-nums;
   }
 
-  @keyframes streamingBounce {
-    0%, 80%, 100% {
-      opacity: 0.45;
-      transform: translateY(0);
-    }
-    40% {
-      opacity: 1;
-      transform: translateY(-3px);
-    }
-  }
-
-  /* ===== 占位消息样式：只保留裸态流式指示器，不给整条消息套卡片 ===== */
+  /* ===== 占位消息样式：不渲染额外卡片壳 ===== */
   .message-item.assistant.placeholder {
     border-left: none;
   }

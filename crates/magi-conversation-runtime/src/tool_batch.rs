@@ -43,6 +43,7 @@ use magi_tool_runtime::{
 use crate::builtin_tool_schema::internal_builtin_tool_rejection_payload;
 use crate::skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime};
 use crate::task_execution_registry::SpawnedChildExecutionError;
+use crate::tool_execution_ledger::{ToolCallExecutionDecision, ToolExecutionLedger};
 use crate::{
     ConversationRegistry, MailboxAuthor, MailboxKind, RuntimeSignal,
     task_execution_registry::{SpawnedChildExecutionRequest, TaskExecutionRegistry},
@@ -198,7 +199,160 @@ struct ChildAgentOutput {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn execute_task_tool_call_batch(
+pub(crate) fn execute_task_tool_call_batch(
+    event_bus: &InMemoryEventBus,
+    tool_registry: Option<&ToolRegistry>,
+    agent_role_registry: &magi_agent_role::AgentRoleRegistry,
+    skill_runtime: Option<&magi_skill_runtime::SkillRuntime>,
+    skill_dispatch_runtime: Option<&magi_skill_runtime::SkillDispatchRuntime>,
+    skill_name: Option<&str>,
+    task_store: &TaskStore,
+    session_store: &SessionStore,
+    execution_registry: &TaskExecutionRegistry,
+    conversation_registry: &ConversationRegistry,
+    spawn_graph: &Mutex<magi_spawn_graph::SpawnGraph>,
+    safety_gate: Option<&magi_safety_gate::SafetyGate>,
+    plan_store: &magi_plan::PlanStore,
+    project_memory: Option<&magi_project_memory::ProjectMemoryStore>,
+    task: &magi_core::Task,
+    session_id: &SessionId,
+    workspace_id: &Option<WorkspaceId>,
+    workspace_root_path: Option<&PathBuf>,
+    worker_id: Option<&magi_core::WorkerId>,
+    tool_calls: &[ChatToolCall],
+    tool_execution_ledger: &mut ToolExecutionLedger,
+    snapshot_session: Option<Arc<SnapshotSession>>,
+    execution_group_id: Option<String>,
+) -> Vec<(String, ExecutionResultStatus)> {
+    let decisions = tool_execution_ledger.plan(tool_calls, tool_registry);
+    let execution_indices = decisions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, decision)| {
+            matches!(decision, ToolCallExecutionDecision::Execute { .. }).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let execution_calls = execution_indices
+        .iter()
+        .map(|index| tool_calls[*index].clone())
+        .collect::<Vec<_>>();
+    let executed_results = execute_task_tool_call_batch_unchecked(
+        event_bus,
+        tool_registry,
+        agent_role_registry,
+        skill_runtime,
+        skill_dispatch_runtime,
+        skill_name,
+        task_store,
+        session_store,
+        execution_registry,
+        conversation_registry,
+        spawn_graph,
+        safety_gate,
+        plan_store,
+        project_memory,
+        task,
+        session_id,
+        workspace_id,
+        workspace_root_path,
+        worker_id,
+        &execution_calls,
+        snapshot_session.clone(),
+        execution_group_id.clone(),
+    );
+    let mut results = vec![None; tool_calls.len()];
+    for (execution_index, result) in execution_indices.iter().zip(executed_results) {
+        let ToolCallExecutionDecision::Execute { fingerprint } = &decisions[*execution_index]
+        else {
+            unreachable!("only execute decisions are dispatched");
+        };
+        tool_execution_ledger.record_execution(
+            &tool_calls[*execution_index],
+            fingerprint.as_ref(),
+            &result,
+        );
+        results[*execution_index] = Some(result);
+    }
+
+    let mut fallback_indices = Vec::new();
+    for (index, decision) in decisions.iter().enumerate() {
+        match decision {
+            ToolCallExecutionDecision::Reuse { result }
+            | ToolCallExecutionDecision::BudgetExhausted { result } => {
+                results[index] = Some((result.clone(), ExecutionResultStatus::Succeeded));
+            }
+            ToolCallExecutionDecision::ReuseAfterExecution {
+                source_index,
+                fingerprint,
+            } => {
+                let Some(source_result) = results[*source_index].as_ref() else {
+                    unreachable!("duplicate source must execute before its reuse decision");
+                };
+                if let Some(reused) = tool_execution_ledger.reuse_after_execution(
+                    &tool_calls[index],
+                    fingerprint,
+                    source_result,
+                ) {
+                    results[index] = Some(reused);
+                } else {
+                    fallback_indices.push(index);
+                }
+            }
+            ToolCallExecutionDecision::Execute { .. } => {}
+        }
+    }
+
+    if !fallback_indices.is_empty() {
+        let fallback_calls = fallback_indices
+            .iter()
+            .map(|index| tool_calls[*index].clone())
+            .collect::<Vec<_>>();
+        let fallback_results = execute_task_tool_call_batch_unchecked(
+            event_bus,
+            tool_registry,
+            agent_role_registry,
+            skill_runtime,
+            skill_dispatch_runtime,
+            skill_name,
+            task_store,
+            session_store,
+            execution_registry,
+            conversation_registry,
+            spawn_graph,
+            safety_gate,
+            plan_store,
+            project_memory,
+            task,
+            session_id,
+            workspace_id,
+            workspace_root_path,
+            worker_id,
+            &fallback_calls,
+            snapshot_session,
+            execution_group_id,
+        );
+        for (index, result) in fallback_indices.into_iter().zip(fallback_results) {
+            let ToolCallExecutionDecision::ReuseAfterExecution { fingerprint, .. } =
+                &decisions[index]
+            else {
+                unreachable!("only failed duplicate calls are retried");
+            };
+            tool_execution_ledger.record_execution(&tool_calls[index], Some(fingerprint), &result);
+            results[index] = Some(result);
+        }
+    }
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result.unwrap_or_else(|| tool_execution_failed_result(&tool_calls[index].function.name))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_task_tool_call_batch_unchecked(
     event_bus: &InMemoryEventBus,
     tool_registry: Option<&ToolRegistry>,
     agent_role_registry: &magi_agent_role::AgentRoleRegistry,
@@ -3039,7 +3193,10 @@ mod tests {
     use super::*;
     use magi_bridge_client::ChatToolFunction;
     use magi_core::{MissionId, Task, TaskRuntimePayload};
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use tempfile::tempdir;
 
     fn test_task(task_id: &str, root_task_id: &str, parent_task_id: Option<TaskId>) -> Task {
@@ -3081,6 +3238,11 @@ mod tests {
 
     struct PanicBuiltinTool {
         name: &'static str,
+    }
+
+    struct CountingBuiltinTool {
+        name: &'static str,
+        executions: Arc<AtomicUsize>,
     }
 
     impl SnapshotReconcileProbeTool {
@@ -3154,6 +3316,260 @@ mod tests {
                 approval_requirement: magi_core::ApprovalRequirement::None,
             }
         }
+    }
+
+    impl magi_tool_runtime::BuiltinTool for CountingBuiltinTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn execute(
+            &self,
+            _tool_call_id: &ToolCallId,
+            input: &str,
+            _context: &ToolExecutionContext,
+            _resources: &magi_tool_runtime::ToolRuntimeResources,
+        ) -> String {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            serde_json::json!({
+                "tool": self.name,
+                "status": "succeeded",
+                "input": serde_json::from_str::<serde_json::Value>(input).unwrap_or_default(),
+            })
+            .to_string()
+        }
+
+        fn spec(&self) -> magi_tool_runtime::BuiltinToolSpec {
+            magi_tool_runtime::BuiltinToolSpec {
+                name: self.name.to_string(),
+                risk_level: magi_core::RiskLevel::Low,
+                approval_requirement: magi_core::ApprovalRequirement::None,
+            }
+        }
+    }
+
+    #[test]
+    fn idempotent_read_tools_execute_once_and_reuse_results_across_model_rounds() {
+        let event_bus = InMemoryEventBus::new(16);
+        let task_store = TaskStore::new();
+        let session_store = SessionStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let conversation_registry = ConversationRegistry::new();
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let plan_store = crate::test_plan_store("test-idempotent-tool-reuse");
+        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(magi_governance::GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_builtin(Arc::new(CountingBuiltinTool {
+            name: BuiltinToolName::WebSearch.as_str(),
+            executions: executions.clone(),
+        }));
+        let task = test_task(
+            "task-idempotent-tool-reuse",
+            "task-idempotent-tool-reuse",
+            None,
+        );
+        let session_id = SessionId::new("session-idempotent-tool-reuse");
+        let workspace_id = Some(WorkspaceId::new("workspace-idempotent-tool-reuse"));
+        let mut ledger = ToolExecutionLedger::default();
+        let first_round_calls = vec![
+            ChatToolCall {
+                id: "call-web-search-1".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: BuiltinToolName::WebSearch.as_str().to_string(),
+                    arguments: r#"{"query":"Magi","locale":"zh-CN"}"#.to_string(),
+                },
+            },
+            ChatToolCall {
+                id: "call-web-search-2".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: BuiltinToolName::WebSearch.as_str().to_string(),
+                    arguments: r#"{"locale":"zh-CN","query":"Magi"}"#.to_string(),
+                },
+            },
+        ];
+
+        let first_results = execute_task_tool_call_batch(
+            &event_bus,
+            Some(&tool_registry),
+            &agent_role_registry,
+            None,
+            None,
+            None,
+            &task_store,
+            &session_store,
+            &execution_registry,
+            &conversation_registry,
+            &spawn_graph,
+            None,
+            &plan_store,
+            None,
+            &task,
+            &session_id,
+            &workspace_id,
+            None,
+            None,
+            &first_round_calls,
+            &mut ledger,
+            None,
+            None,
+        );
+
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert!(
+            first_results
+                .iter()
+                .all(|(_, status)| *status == ExecutionResultStatus::Succeeded)
+        );
+        let reused: serde_json::Value =
+            serde_json::from_str(&first_results[1].0).expect("reused result should be json");
+        assert_eq!(reused["execution"], "reused");
+
+        let second_round_call = ChatToolCall {
+            id: "call-web-search-3".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: BuiltinToolName::WebSearch.as_str().to_string(),
+                arguments: r#"{"query":"Magi","locale":"zh-CN"}"#.to_string(),
+            },
+        };
+        let second_results = execute_task_tool_call_batch(
+            &event_bus,
+            Some(&tool_registry),
+            &agent_role_registry,
+            None,
+            None,
+            None,
+            &task_store,
+            &session_store,
+            &execution_registry,
+            &conversation_registry,
+            &spawn_graph,
+            None,
+            &plan_store,
+            None,
+            &task,
+            &session_id,
+            &workspace_id,
+            None,
+            None,
+            &[second_round_call],
+            &mut ledger,
+            None,
+            None,
+        );
+
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        let reused: serde_json::Value =
+            serde_json::from_str(&second_results[0].0).expect("reused result should be json");
+        assert_eq!(reused["execution"], "reused");
+    }
+
+    #[test]
+    fn explicit_single_tool_budget_prevents_different_read_calls() {
+        let event_bus = InMemoryEventBus::new(16);
+        let task_store = TaskStore::new();
+        let session_store = SessionStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let conversation_registry = ConversationRegistry::new();
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let plan_store = crate::test_plan_store("test-explicit-tool-budget");
+        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(magi_governance::GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_builtin(Arc::new(CountingBuiltinTool {
+            name: BuiltinToolName::WebSearch.as_str(),
+            executions: executions.clone(),
+        }));
+        let task = test_task(
+            "task-explicit-tool-budget",
+            "task-explicit-tool-budget",
+            None,
+        );
+        let session_id = SessionId::new("session-explicit-tool-budget");
+        let workspace_id = Some(WorkspaceId::new("workspace-explicit-tool-budget"));
+        let mut ledger = ToolExecutionLedger::for_task_goal("请只调用一次 web_search。");
+
+        let first_results = execute_task_tool_call_batch(
+            &event_bus,
+            Some(&tool_registry),
+            &agent_role_registry,
+            None,
+            None,
+            None,
+            &task_store,
+            &session_store,
+            &execution_registry,
+            &conversation_registry,
+            &spawn_graph,
+            None,
+            &plan_store,
+            None,
+            &task,
+            &session_id,
+            &workspace_id,
+            None,
+            None,
+            &[ChatToolCall {
+                id: "call-web-search-budget-1".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: BuiltinToolName::WebSearch.as_str().to_string(),
+                    arguments: r#"{"query":"Magi"}"#.to_string(),
+                },
+            }],
+            &mut ledger,
+            None,
+            None,
+        );
+        assert_eq!(first_results[0].1, ExecutionResultStatus::Succeeded);
+
+        let second_results = execute_task_tool_call_batch(
+            &event_bus,
+            Some(&tool_registry),
+            &agent_role_registry,
+            None,
+            None,
+            None,
+            &task_store,
+            &session_store,
+            &execution_registry,
+            &conversation_registry,
+            &spawn_graph,
+            None,
+            &plan_store,
+            None,
+            &task,
+            &session_id,
+            &workspace_id,
+            None,
+            None,
+            &[ChatToolCall {
+                id: "call-web-search-budget-2".to_string(),
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: BuiltinToolName::WebSearch.as_str().to_string(),
+                    arguments: r#"{"query":"Grok"}"#.to_string(),
+                },
+            }],
+            &mut ledger,
+            None,
+            None,
+        );
+
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        let skipped: serde_json::Value =
+            serde_json::from_str(&second_results[0].0).expect("budget result should be json");
+        assert_eq!(skipped["execution"], "skipped");
+        assert_eq!(skipped["reason"], "tool_call_budget_exhausted");
     }
 
     fn read_only_agent_spawn_policy() -> TaskPolicy {
@@ -4431,6 +4847,7 @@ mod tests {
             Some(&dir.path().to_path_buf()),
             None,
             &[tool_call],
+            &mut ToolExecutionLedger::default(),
             None,
             None,
         );
@@ -4498,6 +4915,7 @@ mod tests {
             None,
             None,
             &[tool_call],
+            &mut ToolExecutionLedger::default(),
             None,
             None,
         );
@@ -4574,6 +4992,7 @@ mod tests {
             Some(&workspace_root),
             Some(&worker_id),
             &[tool_call],
+            &mut ToolExecutionLedger::default(),
             Some(snapshot.clone()),
             Some(task.mission_id.to_string()),
         );
@@ -4628,6 +5047,7 @@ mod tests {
             Some(&workspace_root),
             None,
             &[mainline_tool_call],
+            &mut ToolExecutionLedger::default(),
             Some(snapshot.clone()),
             Some(task.mission_id.to_string()),
         );
@@ -4738,6 +5158,7 @@ mod tests {
             Some(&workspace_root),
             Some(&worker_id),
             &tool_calls,
+            &mut ToolExecutionLedger::default(),
             Some(snapshot.clone()),
             Some(task.mission_id.to_string()),
         );
@@ -5567,6 +5988,7 @@ mod tests {
                     arguments: "{}".to_string(),
                 },
             }],
+            &mut ToolExecutionLedger::default(),
             None,
             None,
         );

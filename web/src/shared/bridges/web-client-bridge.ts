@@ -216,6 +216,7 @@ let eventStreamTunnelSyncInFlight: Promise<void> | null = null;
 let eventStreamTunnelSyncBindingKey = '';
 let initialWindowBindingHydrated = false;
 let workspaceSessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let terminalTaskRuntimeRefreshTimer: number | null = null;
 const inFlightChangeMutationScopes = new Set<string>();
 
 function invalidateBootstrapRequests(): void {
@@ -756,6 +757,23 @@ function refreshBootstrapAfterTerminalTurn(reason: string): void {
     reportExpectedRecoveryFailure(i18n.t('bridge.action.syncTurnState'), '[web-client-bridge] turn 终态后 bootstrap 同步失败:', error);
     scheduleRecovery(reason, error, true);
   });
+}
+
+function scheduleTerminalTaskRuntimeRefresh(): void {
+  if (terminalTaskRuntimeRefreshTimer !== null) {
+    window.clearTimeout(terminalTaskRuntimeRefreshTimer);
+  }
+  terminalTaskRuntimeRefreshTimer = window.setTimeout(() => {
+    terminalTaskRuntimeRefreshTimer = null;
+    void fetchBootstrap({ forceFresh: true }).catch((error) => {
+      reportExpectedRecoveryFailure(
+        i18n.t('bridge.action.syncTurnState'),
+        '[web-client-bridge] 任务终态后 bootstrap 同步失败:',
+        error,
+      );
+      scheduleRecovery('terminal_task_status_refresh', error, true);
+    });
+  }, 180);
 }
 
 function emitRecoveringState(reason: string, error?: unknown): void {
@@ -1873,6 +1891,10 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     } as ClientBridgeMessage);
 
     if (eventType === 'task.status.changed' && event.payload) {
+      const taskStatus = event.payload.new_status ?? event.payload.newStatus ?? event.payload.status;
+      if (isTerminalRuntimeTaskStatus(taskStatus)) {
+        scheduleTerminalTaskRuntimeRefresh();
+      }
       emitDataMessage('taskStatusChanged', {
         taskId: event.payload.task_id ?? event.payload.taskId ?? '',
         rootTaskId: event.payload.root_task_id ?? event.payload.rootTaskId ?? '',

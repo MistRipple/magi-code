@@ -12,8 +12,8 @@ use crate::{
     errors::ApiError,
     state::ApiState,
     task_dispatch::{
-        DispatchSubmissionAccepted, DispatchSubmissionRequest, drive_dispatch_submission,
-        submit_dispatch_submission,
+        DispatchSubmissionAccepted, DispatchSubmissionRequest, DispatchTurnOrigin,
+        drive_dispatch_submission, submit_dispatch_submission,
     },
 };
 use magi_conversation_runtime::session_images::SessionTurnImage;
@@ -22,6 +22,7 @@ use magi_conversation_runtime::session_writeback::{
 };
 use magi_session_store::{
     CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind,
+    SessionGoal,
 };
 
 pub(super) async fn accept_session_task_submission(
@@ -43,6 +44,7 @@ pub(super) async fn accept_session_task_submission(
             execution_goal,
             task_tier,
             accepted_at: monotonic_accepted_at(),
+            required_tool_chain: Vec::new(),
         },
     )
     .await
@@ -55,6 +57,7 @@ pub(super) struct SessionTaskSubmissionInput {
     pub execution_goal: Option<String>,
     pub task_tier: TaskTier,
     pub accepted_at: UtcMillis,
+    pub required_tool_chain: Vec<String>,
 }
 
 pub(super) async fn accept_session_task_submission_at(
@@ -69,6 +72,7 @@ pub(super) async fn accept_session_task_submission_at(
         execution_goal,
         task_tier,
         accepted_at,
+        required_tool_chain,
     } = input;
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_message(trimmed_text.as_deref());
@@ -99,9 +103,66 @@ pub(super) async fn accept_session_task_submission_at(
             images,
             request,
             accepted_at,
+            required_tool_chain,
         },
     )
     .await
+}
+
+/// Goal 自动续跑同样提交 root coordinator task，但不伪造用户消息。
+///
+/// 它和普通主线 Turn 共用 DispatchSubmission / Runner / ConversationLoop；仅以
+/// `DispatchTurnOrigin::GoalContinuation` 让 canonical 时间线写入系统通知，并保证
+/// 当前 Turn 不出现虚假的 user_message。
+pub(super) async fn accept_goal_continuation_task_submission(
+    state: &ApiState,
+    session_id: SessionId,
+    workspace_id: Option<WorkspaceId>,
+    goal: &SessionGoal,
+    execution_goal: String,
+    accepted_at: UtcMillis,
+) -> Result<DispatchSubmissionAccepted, ApiError> {
+    state
+        .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
+        .await?;
+    state
+        .ensure_session_code_context(&session_id, &workspace_id)
+        .await?;
+    let entry_id = format!(
+        "timeline-goal-continuation-{}-{}",
+        session_id, accepted_at.0
+    );
+    let dispatch = DispatchSubmissionRequest {
+        accepted_at,
+        session_id: session_id.clone(),
+        workspace_id,
+        entry_id,
+        timeline_message: format!("目标自动推进: {}", goal.objective),
+        images: Vec::new(),
+        context_references: Vec::new(),
+        created_session: false,
+        mission_title: "目标自动推进".to_string(),
+        task_title: "执行: 目标自动推进".to_string(),
+        trimmed_text: None,
+        execution_goal: Some(execution_goal),
+        task_tier: TaskTier::ExecutionChain,
+        access_profile: goal.access_profile,
+        skill_name: None,
+        goal_mode: true,
+        target_role: None,
+        request_id: None,
+        user_message_id: None,
+        placeholder_message_id: None,
+        replace_turn_id: None,
+        required_tool_chain: vec!["get_goal".to_string()],
+        turn_origin: DispatchTurnOrigin::GoalContinuation,
+    };
+    let accepted = submit_dispatch_submission(state, dispatch)?;
+    if let Err(error) = state.persist_session_state_checkpoint("goal_continuation_task_accepted") {
+        fail_accepted_task_submission(state, &accepted);
+        return Err(error);
+    }
+    Ok(accepted)
 }
 
 struct ExecuteDispatchSubmissionInput<'a> {
@@ -117,6 +178,7 @@ struct ExecuteDispatchSubmissionInput<'a> {
     images: Vec<SessionTurnImage>,
     request: &'a SessionTurnRequestDto,
     accepted_at: UtcMillis,
+    required_tool_chain: Vec<String>,
 }
 
 async fn execute_dispatch_submission(
@@ -136,6 +198,7 @@ async fn execute_dispatch_submission(
         images,
         request,
         accepted_at,
+        required_tool_chain,
     } = input;
     let placeholder_title = crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
     let (session_id, created_session, workspace_id) = resolve_dispatch_session(
@@ -188,6 +251,8 @@ async fn execute_dispatch_submission(
         user_message_id: request.user_message_id(),
         placeholder_message_id: request.placeholder_message_id(),
         replace_turn_id: request.replace_turn_id(),
+        required_tool_chain,
+        turn_origin: DispatchTurnOrigin::User,
     };
     let accepted = match submit_dispatch_submission(state, dispatch) {
         Ok(accepted) => accepted,
@@ -256,9 +321,12 @@ pub(super) fn dispatch_accepted_canonical_event(
     let canonical_item = canonical_turn
         .as_ref()
         .and_then(|turn| {
-            turn.items
-                .iter()
-                .find(|item| item.item_id == accepted.user_message_item_id)
+            turn.items.iter().find(|item| {
+                accepted
+                    .user_message_item_id
+                    .as_ref()
+                    .is_some_and(|item_id| item.item_id == *item_id)
+            })
         })
         .or_else(|| {
             canonical_turn.as_ref().and_then(|turn| {
@@ -269,6 +337,53 @@ pub(super) fn dispatch_accepted_canonical_event(
         })
         .cloned();
     (canonical_turn, canonical_item)
+}
+
+pub(super) fn publish_goal_continuation_task_accepted_event(
+    state: &ApiState,
+    accepted: &DispatchSubmissionAccepted,
+) -> EventId {
+    let workspace_id = state
+        .session_store
+        .execution_ownership(&accepted.session_id)
+        .and_then(|ownership| ownership.workspace_id);
+    let (canonical_turn, canonical_item) = dispatch_accepted_canonical_event(state, accepted);
+    let event_id = EventId::new(format!(
+        "event-session-turn-task-{}",
+        accepted.accepted_at.0
+    ));
+    let event = EventEnvelope::domain(
+        event_id.clone(),
+        "session.turn.task.accepted",
+        json!({
+            "session_id": accepted.session_id,
+            "entry_id": accepted.entry_id,
+            "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+            "text": serde_json::Value::Null,
+            "skill_name": serde_json::Value::Null,
+            "request_id": serde_json::Value::Null,
+            "user_message_id": serde_json::Value::Null,
+            "placeholder_message_id": serde_json::Value::Null,
+            "image_count": 0,
+            "created_session": false,
+            "route": "task",
+            "goal_continuation": true,
+            "root_task_id": accepted.root_task_id.to_string(),
+            "action_task_id": accepted.action_task_id.to_string(),
+            "runner_started": accepted.runner_started,
+            "canonical_schema_version": CANONICAL_TURN_SCHEMA_VERSION,
+            "canonical_event_kind": "turn_started",
+            "canonical_turn": canonical_turn,
+            "canonical_item": canonical_item,
+        }),
+    )
+    .with_context(EventContext {
+        session_id: Some(accepted.session_id.clone()),
+        workspace_id,
+        ..EventContext::default()
+    });
+    state.event_bus.publish(event);
+    event_id
 }
 
 pub(super) async fn finalize_session_task_dispatch(
@@ -326,7 +441,7 @@ fn fail_accepted_task_submission(state: &ApiState, accepted: &DispatchSubmission
                 workspace_id: &workspace_id,
                 task_id: Some(&accepted.root_task_id),
                 request_id: None,
-                user_message_id: Some(&accepted.user_message_item_id),
+                user_message_id: accepted.user_message_item_id.as_deref(),
                 placeholder_message_id: None,
                 error_text: "任务执行启动失败，可直接重试。",
                 streaming_entry_id: None,

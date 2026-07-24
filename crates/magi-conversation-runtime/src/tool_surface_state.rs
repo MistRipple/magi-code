@@ -1,7 +1,7 @@
 use crate::{
     SKILL_APPLY_TOOL_NAME, build_skill_custom_tool_definitions, parse_skill_custom_tool_name,
 };
-use magi_bridge_client::{ChatToolDefinition, ChatToolFunctionDefinition};
+use magi_bridge_client::{ChatToolDefinition, ChatToolFunctionDefinition, ChatToolOrigin};
 use magi_core::{AccessProfile, ExecutionResultStatus};
 use magi_skill_runtime::{SkillRuntime, SkillSelection};
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
@@ -123,6 +123,7 @@ pub(crate) fn refresh_live_mcp_tool_definitions(
                 },
                 parameters,
             },
+            origin: ChatToolOrigin::ExternalMcp,
         });
     }
     definitions
@@ -158,6 +159,7 @@ mod tests {
                     description: String::new(),
                     parameters: serde_json::json!({ "type": "object" }),
                 },
+                origin: ChatToolOrigin::Builtin,
             },
             ChatToolDefinition {
                 kind: "function".to_string(),
@@ -166,6 +168,7 @@ mod tests {
                     description: String::new(),
                     parameters: serde_json::json!({ "type": "object" }),
                 },
+                origin: ChatToolOrigin::Builtin,
             },
             ChatToolDefinition {
                 kind: "function".to_string(),
@@ -174,6 +177,7 @@ mod tests {
                     description: String::new(),
                     parameters: serde_json::json!({ "type": "object" }),
                 },
+                origin: ChatToolOrigin::Builtin,
             },
         ];
 
@@ -216,6 +220,7 @@ mod tests {
                     description: String::new(),
                     parameters: serde_json::json!({ "type": "object" }),
                 },
+                origin: ChatToolOrigin::Builtin,
             },
             ChatToolDefinition {
                 kind: "function".to_string(),
@@ -224,6 +229,7 @@ mod tests {
                     description: String::new(),
                     parameters: serde_json::json!({ "type": "object" }),
                 },
+                origin: ChatToolOrigin::Builtin,
             },
             ChatToolDefinition {
                 kind: "function".to_string(),
@@ -232,6 +238,7 @@ mod tests {
                     description: String::new(),
                     parameters: serde_json::json!({ "type": "object" }),
                 },
+                origin: ChatToolOrigin::ExternalMcp,
             },
         ];
 

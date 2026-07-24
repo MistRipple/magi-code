@@ -7,7 +7,7 @@ use magi_conversation_runtime::dispatch_submission::{
     ensure_dispatch_submission_acceptance_available, run_dispatch_submission,
 };
 pub(crate) use magi_conversation_runtime::dispatch_submission::{
-    DispatchSubmissionAccepted, DispatchSubmissionRequest,
+    DispatchSubmissionAccepted, DispatchSubmissionRequest, DispatchTurnOrigin,
 };
 
 pub fn submit_dispatch_submission(

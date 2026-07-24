@@ -96,7 +96,8 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertSupersededTurnDisappearsAndRejectsLateEvents(reducer, projection);
   assertModelContextFallbackProjectsAsWarningNotice(reducer, projection);
   assertSingleThinkingProjectsAsGroup(reducer, projection);
-  assertAdjacentThinkingProjectsAsOneGroup(reducer, projection);
+  assertContinuousThinkingProjectsAsOneGroup(reducer, projection);
+  assertModelRoundsKeepThinkingGroupsSeparate(reducer, projection);
   assertThinkingGroupRespectsVisibleAndOwnerBoundaries(reducer, projection);
   assertThinkingGroupUsesTaskLocalTimeline(reducer, projection, timelineRenderItems);
   assertThinkingGroupKeepsStableIdentityDuringIncrementalAppend(reducer, projection);
@@ -184,17 +185,15 @@ function assertSingleThinkingProjectsAsGroup(reducer, projection) {
   assert.equal(artifact.message.content, '', 'thinking group must not use message.content as a second render path');
 }
 
-function assertAdjacentThinkingProjectsAsOneGroup(reducer, projection) {
+function assertContinuousThinkingProjectsAsOneGroup(reducer, projection) {
   const c = baseCase('adjacent-thinking-group', 'session-golden-thinking-adjacent', 'turn-golden-thinking-adjacent', 11_720);
   const first = thinking(c, 1, 'thinking-first', '检查入口。', 'completed');
-  const hiddenTool = tool(c, 2, 'hidden-tool', 'hidden-call', 'pwd', 'completed', { stdout: '/tmp' });
-  hiddenTool.visibility = { renderable: false };
-  const second = thinking(c, 3, 'thinking-second', '检查状态流。', 'running');
+  const second = thinking(c, 2, 'thinking-second', '检查状态流。', 'running');
   const state = reducer.replaceCanonicalTurns(c.sessionId, [
-    turn(c, 'running', [first, hiddenTool, second]),
+    turn(c, 'running', [first, second]),
   ]);
   const projectionValue = projection.buildCanonicalTimelineProjection(state);
-  assert.equal(projectionValue.artifacts.length, 1, 'hidden internal items must not split a visible thinking group');
+  assert.equal(projectionValue.artifacts.length, 1, '连续 thinking 必须投影为一个思考组');
   const artifact = projectionValue.artifacts[0];
   const group = artifact.message.blocks?.[0]?.thinking;
   assert.equal(artifact.artifactId, `turn:${c.turnId}:${first.itemId}`, 'group identity must be anchored to the first segment');
@@ -206,6 +205,43 @@ function assertAdjacentThinkingProjectsAsOneGroup(reducer, projection) {
   assert.equal(group?.status, 'running', 'any running segment must keep the group running');
   assert.equal(artifact.message.isStreaming, true, 'running group must expose streaming state once');
   assert.ok(artifact.messageIds.includes(second.itemId), 'group messageIds must retain every raw segment id');
+}
+
+function assertModelRoundsKeepThinkingGroupsSeparate(reducer, projection) {
+  const c = baseCase('thinking-round-boundary', 'session-golden-thinking-round-boundary', 'turn-golden-thinking-round-boundary', 11_725);
+  const firstText = assistantText(c, 1, 'text-round-0', '第一轮正常输出。', 'completed', {
+    metadata: { modelRound: 0 },
+  });
+  const firstThinking = thinking(c, 2, 'thinking-round-0', '第一轮补齐思考。', 'completed', {
+    metadata: { modelRound: 0 },
+  });
+  const secondText = assistantText(c, 3, 'text-round-1', '第二轮正常输出。', 'running', {
+    metadata: { modelRound: 1 },
+  });
+  const secondThinking = thinking(c, 4, 'thinking-round-1', '第二轮新的思考。', 'running', {
+    metadata: { modelRound: 1 },
+  });
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'running', [firstText, firstThinking, secondText, secondThinking]),
+  ]);
+  const projectionValue = projection.buildCanonicalTimelineProjection(state);
+  assert.deepEqual(
+    projectionValue.artifacts.map((artifact) => artifact.message.metadata?.turnItemId),
+    [firstThinking.itemId, firstText.itemId, secondThinking.itemId, secondText.itemId],
+    '同一模型轮次允许思考前置，但后续模型轮次必须保留在前一轮正文之后',
+  );
+  const thinkingArtifacts = projectionValue.artifacts.filter((artifact) => artifact.message.type === 'thinking');
+  assert.equal(thinkingArtifacts.length, 2, '新的模型轮次必须创建新的 thinking 面板');
+  assert.equal(
+    thinkingArtifacts[0].message.blocks?.[0]?.thinking?.status,
+    'completed',
+    '前一轮 thinking 完成后不得被后一轮运行态重新打开',
+  );
+  assert.equal(
+    thinkingArtifacts[1].message.blocks?.[0]?.thinking?.status,
+    'running',
+    '当前模型轮次的 thinking 必须保留运行态',
+  );
 }
 
 function assertThinkingGroupRespectsVisibleAndOwnerBoundaries(reducer, projection) {
@@ -2993,8 +3029,12 @@ function phase(c, itemSeq, content, status) {
   });
 }
 
-function assistantText(c, itemSeq, itemId, content, status) {
-  return item(c, itemSeq, itemId, 'assistant_text', status, { content, title: '最终回复' });
+function assistantText(c, itemSeq, itemId, content, status, fields = {}) {
+  return item(c, itemSeq, itemId, 'assistant_text', status, {
+    content,
+    title: '最终回复',
+    ...fields,
+  });
 }
 
 function thinking(c, itemSeq, itemId, content, status, fields = {}) {

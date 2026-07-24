@@ -482,6 +482,15 @@ pub fn task_required_tool_chain(
     if task.kind != TaskKind::LocalAgent {
         return Vec::new();
     }
+    let declared = task
+        .required_tool_chain()
+        .iter()
+        .map(|name| canonical_tool_call_name(name))
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    if !declared.is_empty() {
+        return declared;
+    }
     if task.executor_binding_target_role() == Some("coordinator")
         || task_is_coordinator(Some(task), registry)
     {
@@ -706,6 +715,37 @@ pub fn forced_task_tool_choice_for_round(
     tool_is_available.then(|| ChatToolChoice::force_function(forced_tool_name))
 }
 
+/// 结构化必经动作在完成前只暴露当前一步的工具定义。
+///
+/// `tool_choice` 只是协议层提示：部分上游只支持 `auto`，无法表达强制调用。
+/// 因此运行时必须把已确认的产品动作收敛为单一工具面，确保同一执行契约在不同
+/// 模型协议下都成立；动作完成后立即恢复完整工具面，不影响 coordinator 的自主编排。
+pub fn required_tool_definitions_for_round(
+    tools: &[ChatToolDefinition],
+    required_tool_chain: &[String],
+    completed_required_tool_names: &[String],
+) -> Vec<ChatToolDefinition> {
+    let Some(required_tool_name) = required_tool_chain.iter().find(|tool_name| {
+        !completed_required_tool_names
+            .iter()
+            .any(|completed| completed == *tool_name)
+    }) else {
+        return tools.to_vec();
+    };
+
+    let constrained_tools = tools
+        .iter()
+        .filter(|tool| tool.function.name == *required_tool_name)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if constrained_tools.is_empty() {
+        tools.to_vec()
+    } else {
+        constrained_tools
+    }
+}
+
 pub fn record_completed_required_tools(
     completed: &mut Vec<String>,
     required_tool_chain: &[String],
@@ -772,4 +812,50 @@ pub fn canonical_tool_call_name(tool_name: &str) -> String {
     BuiltinToolName::from_name(tool_name.trim())
         .map(|tool| tool.as_str().to_string())
         .unwrap_or_else(|| tool_name.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_bridge_client::{ChatToolFunctionDefinition, ChatToolOrigin};
+
+    fn tool(name: &str) -> ChatToolDefinition {
+        ChatToolDefinition {
+            kind: "function".to_string(),
+            function: ChatToolFunctionDefinition {
+                name: name.to_string(),
+                description: name.to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            origin: ChatToolOrigin::Builtin,
+        }
+    }
+
+    #[test]
+    fn required_tool_surface_exposes_only_current_contract_step() {
+        let tools = vec![tool("file_read"), tool("agent_spawn"), tool("agent_wait")];
+        let required = vec!["agent_spawn".to_string(), "agent_wait".to_string()];
+
+        let first = required_tool_definitions_for_round(&tools, &required, &[]);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].function.name, "agent_spawn");
+
+        let second =
+            required_tool_definitions_for_round(&tools, &required, &["agent_spawn".to_string()]);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].function.name, "agent_wait");
+
+        let restored = required_tool_definitions_for_round(&tools, &required, &required);
+        assert_eq!(restored.len(), tools.len());
+    }
+
+    #[test]
+    fn missing_required_tool_does_not_hide_available_diagnostics_surface() {
+        let tools = vec![tool("file_read")];
+        let visible =
+            required_tool_definitions_for_round(&tools, &["agent_spawn".to_string()], &[]);
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].function.name, "file_read");
+    }
 }
