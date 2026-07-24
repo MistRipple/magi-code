@@ -7,6 +7,8 @@ pub(crate) const PUBLIC_MODEL_CONTEXT_LIMIT_MESSAGE: &str =
     "当前对话已超过模型上下文长度，请压缩上下文或开启新会话。";
 pub(crate) const PUBLIC_MODEL_INVALID_REQUEST_MESSAGE: &str =
     "模型拒绝了当前请求，请检查该模型是否支持当前工具和请求格式。";
+pub(crate) const PUBLIC_MODEL_REGION_UNAVAILABLE_MESSAGE: &str =
+    "当前模型服务不支持此网络区域，请更换可用的服务节点或模型后重试。";
 pub(crate) const PUBLIC_MODEL_TOOL_UNSUPPORTED_MESSAGE: &str =
     "当前模型拒绝了工具调用请求，请更换支持工具调用的模型或关闭工具后重试。";
 pub(crate) const PUBLIC_MODEL_STREAM_INTERRUPTED_MESSAGE: &str = "模型响应流中断，可直接继续重试。";
@@ -43,6 +45,13 @@ pub(crate) fn classify_model_invocation_error(
         return ModelInvocationErrorClassification {
             code: "model_context_limit",
             public_message: PUBLIC_MODEL_CONTEXT_LIMIT_MESSAGE,
+            retryable_before_output: false,
+        };
+    }
+    if contains_region_restriction_error(&normalized) {
+        return ModelInvocationErrorClassification {
+            code: "model_region_unavailable",
+            public_message: PUBLIC_MODEL_REGION_UNAVAILABLE_MESSAGE,
             retryable_before_output: false,
         };
     }
@@ -213,6 +222,15 @@ fn contains_context_limit_error(error: &str) -> bool {
         || error.contains("token limit")
 }
 
+fn contains_region_restriction_error(error: &str) -> bool {
+    error.contains("location is not supported")
+        || error.contains("user location is not supported")
+        || error.contains("country is not supported")
+        || error.contains("region is not supported")
+        || error.contains("unsupported region")
+        || error.contains("not available in your country")
+}
+
 fn contains_tool_unsupported_error(error: &str) -> bool {
     (error.contains("tool") || error.contains("function call"))
         && (error.contains("not support")
@@ -349,6 +367,12 @@ mod tests {
 
     #[test]
     fn model_invocation_errors_distinguish_request_shape_stream_and_timeout_failures() {
+        assert_eq!(
+            public_model_invocation_error_message(
+                "http_status=400 body={\"error\":{\"message\":\"User location is not supported for the API use.\"}}"
+            ),
+            PUBLIC_MODEL_REGION_UNAVAILABLE_MESSAGE
+        );
         assert_eq!(
             public_model_invocation_error_message(
                 "http_status=400 body={\"error\":{\"message\":\"This model does not support tools\"}}"
