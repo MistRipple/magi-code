@@ -33,8 +33,14 @@ await withGoldenViteServer(async (server) => {
   notifications.showFeedback('info', '消息已发送', { source: 'bridge-runtime' });
   assert.equal(store.getToasts().length, 0, 'routine conversation feedback must stay silent');
 
+  notifications.showFeedback('success', '当前已是最新版本', {
+    source: 'desktop-update',
+    presentation: 'toast',
+  });
+  assert.equal(store.getToasts().length, 1, '用户主动触发的更新结果必须可见');
+
   notifications.showFeedback('warning', '上下文即将达到上限', { source: 'model-runtime' });
-  assert.equal(store.getToasts().length, 1, 'warnings must remain visible');
+  assert.equal(store.getToasts().length, 2, 'warnings must remain visible');
 
   assert.equal(notifications.reportIncident('模型请求失败', {
     scope: 'workspace',
@@ -48,7 +54,7 @@ await withGoldenViteServer(async (server) => {
   assert.equal(posted[0].incident.sessionId, 'session-notification-runtime');
   assert.equal(
     store.getToasts().length,
-    1,
+    2,
     '持久化到通知中心的 incident 不得额外触发右下角 toast',
   );
 

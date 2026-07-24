@@ -12,6 +12,7 @@
   import type { StandardizedToolResult, ToolPolicyPayload } from '../types/message';
   import { i18n } from '../stores/i18n.svelte';
   import { getCurrentSessionId, messagesState } from '../stores/messages.svelte';
+  import { reportIncident } from '../lib/notifications';
   import { diagramSummary, parseToolDiagramPayload } from '../lib/diagram-payload';
   import { openAgentTab } from '../stores/right-pane.svelte';
   import { getAgentRunState } from '../stores/agent-run-store.svelte';
@@ -30,6 +31,7 @@
     ACCESS_MODE_APPROVAL_ERROR_CODES,
     isAccessModeApprovalErrorPayload,
     isStructuredToolErrorPayload,
+    parseToolPayloadRecord,
     publicToolPayloadMessage,
     toolPayloadErrorCode,
     toolPayloadStatus,
@@ -82,6 +84,7 @@
   let userToggled = $state(false);
   let copySuccess = $state(false);
   let lastLoggedErrorSignature = $state('');
+  let lastReportedAgentSpawnFailureSignature = $state('');
 
   const TOOL_DISPLAY_NAME_KEYS: Record<string, string> = {
     'tool_result': 'toolCall.displayName.default',
@@ -304,10 +307,14 @@
     role: string;
     /** 代理 TaskId，作为 RightPane tab 去重 key；未就绪时为 undefined */
     childTaskId: string | undefined;
-    /** 代理终态结果字符串（succeeded / degraded / failed / killed），未终态为 undefined */
-    outcome: 'succeeded' | 'degraded' | 'failed' | 'killed' | undefined;
+    /** 代理创建或运行终态，未终态为 undefined */
+    outcome: 'succeeded' | 'degraded' | 'rejected' | 'failed' | 'killed' | undefined;
     /** 失败原因摘要，若有 */
     error: string | undefined;
+    errorCode: string | undefined;
+    failureStage: string | undefined;
+    instruction: string | undefined;
+    diagnosticRef: string | undefined;
   }
 
   const agentSpawnDisplay = $derived.by((): AgentSpawnDisplay | null => {
@@ -319,22 +326,7 @@
     const inputRole = typeof inputObj.role === 'string' ? inputObj.role.trim() : '';
 
     // output 可能是 JSON 字符串（tool_batch 返回 .to_string()）或已被解析为 object。
-    let parsedOutput: Record<string, unknown> | null = null;
-    if (output && typeof output === 'object' && !Array.isArray(output)) {
-      parsedOutput = output as Record<string, unknown>;
-    } else if (typeof output === 'string') {
-      const trimmed = output.trim();
-      if (trimmed.startsWith('{')) {
-        try {
-          const parsed = JSON.parse(trimmed);
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            parsedOutput = parsed as Record<string, unknown>;
-          }
-        } catch {
-          // 流式过程中可能拿到不完整 JSON，忽略
-        }
-      }
-    }
+    const parsedOutput = parseToolPayloadRecord(output);
 
     const outputTitle = typeof parsedOutput?.title === 'string' ? (parsedOutput.title as string).trim() : '';
     const outputRole = typeof parsedOutput?.role === 'string' ? (parsedOutput.role as string).trim() : '';
@@ -343,9 +335,18 @@
       : '';
     const outputStatus = typeof parsedOutput?.status === 'string' ? parsedOutput.status : '';
     const outputError = typeof parsedOutput?.error === 'string' ? (parsedOutput.error as string) : '';
+    const outputInstruction = typeof parsedOutput?.instruction === 'string'
+      ? (parsedOutput.instruction as string).trim()
+      : '';
+    const outputFailureStage = typeof parsedOutput?.failure_stage === 'string'
+      ? (parsedOutput.failure_stage as string).trim()
+      : '';
+    const outputDiagnosticRef = typeof parsedOutput?.diagnostic_ref === 'string'
+      ? (parsedOutput.diagnostic_ref as string).trim()
+      : '';
 
     const outcome: AgentSpawnDisplay['outcome'] =
-      outputStatus === 'succeeded' || outputStatus === 'degraded' || outputStatus === 'failed' || outputStatus === 'killed'
+      outputStatus === 'succeeded' || outputStatus === 'degraded' || outputStatus === 'rejected' || outputStatus === 'failed' || outputStatus === 'killed'
         ? outputStatus
         : undefined;
 
@@ -355,6 +356,10 @@
       childTaskId: outputChildId || undefined,
       outcome,
       error: outputError || undefined,
+      errorCode: toolPayloadErrorCode(parsedOutput) || undefined,
+      failureStage: outputFailureStage || undefined,
+      instruction: outputInstruction || undefined,
+      diagnosticRef: outputDiagnosticRef || undefined,
     };
   });
 
@@ -384,7 +389,7 @@
     if (projectionStatus === 'running') return 'running';
     if (projectionStatus === 'failed' || projectionStatus === 'killed') return 'error';
     if (projectionStatus === 'completed') return 'success';
-    if (agentSpawnDisplay?.outcome === 'failed' || agentSpawnDisplay?.outcome === 'killed') return 'error';
+    if (agentSpawnDisplay?.outcome === 'rejected' || agentSpawnDisplay?.outcome === 'failed' || agentSpawnDisplay?.outcome === 'killed') return 'error';
     if (agentSpawnDisplay?.outcome === 'succeeded' || agentSpawnDisplay?.outcome === 'degraded') return 'success';
     return status;
   });
@@ -392,10 +397,44 @@
   const agentSpawnStatusInfo = $derived(visualStatusInfo(agentSpawnVisualStatus));
   const agentSpawnFailed = $derived(
     agentSpawnVisualStatus === 'error'
+    || agentSpawnDisplay?.outcome === 'rejected'
     || agentSpawnDisplay?.outcome === 'failed'
     || agentSpawnDisplay?.outcome === 'killed'
   );
   const agentSpawnRunning = $derived(agentSpawnVisualStatus === 'running' || agentSpawnVisualStatus === 'pending');
+  const agentSpawnCreationFailed = $derived(agentSpawnFailed && !agentSpawnDisplay?.childTaskId);
+
+  function agentSpawnFailureStageLabel(stage: string | undefined): string {
+    if (stage === 'input_validation') return i18n.t('toolCall.agentSpawn.stageInputValidation');
+    if (stage === 'registration') return i18n.t('toolCall.agentSpawn.stageRegistration');
+    if (stage === 'plan_binding') return i18n.t('toolCall.agentSpawn.stagePlanBinding');
+    return stage || '';
+  }
+
+  $effect(() => {
+    const display = agentSpawnDisplay;
+    if (!isAgentSpawn || !agentSpawnCreationFailed || !display?.error || !display.errorCode) {
+      return;
+    }
+    const signature = `${id || display.diagnosticRef || display.title}:${display.errorCode}:${display.error}`;
+    if (signature === lastReportedAgentSpawnFailureSignature) {
+      return;
+    }
+    lastReportedAgentSpawnFailureSignature = signature;
+    const failureStage = agentSpawnFailureStageLabel(display.failureStage);
+    const diagnostics = [
+      display.error,
+      `${i18n.t('toolCall.agentSpawn.failureCode')}${display.errorCode}`,
+      failureStage ? `${i18n.t('toolCall.agentSpawn.failureStage')}${failureStage}` : '',
+    ].filter(Boolean).join('；');
+    reportIncident(diagnostics, {
+      scope: 'session',
+      source: 'agent-spawn',
+      title: i18n.t('toolCall.agentSpawn.creationFailed'),
+      fingerprint: `agent-spawn:${id || display.diagnosticRef || display.errorCode}`,
+      notificationId: `agent-spawn:${id || display.diagnosticRef || display.errorCode}`,
+    });
+  });
 
   function openAgentSpawnTab(display: AgentSpawnDisplay | null): void {
     if (!display || !display.childTaskId) return;
@@ -920,7 +959,30 @@
         {/if}
       </span>
       {#if agentSpawnFailed}
-        <span class="agent-spawn-error">{i18n.t('toolCall.agentSpawn.failed')}</span>
+        <span class="agent-spawn-error">
+          {agentSpawnCreationFailed
+            ? i18n.t('toolCall.agentSpawn.creationFailed')
+            : i18n.t('toolCall.agentSpawn.runtimeFailed')}
+          {#if display.error}
+            ：{display.error}
+          {/if}
+        </span>
+        {#if display.errorCode || display.failureStage}
+          <span class="agent-spawn-diagnostic">
+            {#if display.errorCode}
+              {i18n.t('toolCall.agentSpawn.failureCode')}{display.errorCode}
+            {/if}
+            {#if display.errorCode && display.failureStage}
+              ·
+            {/if}
+            {#if display.failureStage}
+              {i18n.t('toolCall.agentSpawn.failureStage')}{agentSpawnFailureStageLabel(display.failureStage)}
+            {/if}
+          </span>
+        {/if}
+        {#if display.instruction}
+          <span class="agent-spawn-instruction">{i18n.t('toolCall.agentSpawn.failureInstruction')}{display.instruction}</span>
+        {/if}
       {/if}
     </span>
     <span class="agent-spawn-meta">
@@ -938,6 +1000,8 @@
         </span>
       {:else if agentSpawnRunning}
         <span class="agent-spawn-cta agent-spawn-cta-pending">{i18n.t('toolCall.agentSpawn.dispatching')}</span>
+      {:else if agentSpawnCreationFailed}
+        <span class="agent-spawn-cta agent-spawn-cta-failed">{i18n.t('toolCall.agentSpawn.notCreated')}</span>
       {/if}
     </span>
   </button>
@@ -1551,6 +1615,18 @@
     min-width: 0;
   }
 
+  .agent-spawn-diagnostic,
+  .agent-spawn-instruction {
+    font-size: var(--text-xs);
+    line-height: 1.45;
+    color: var(--foreground-muted);
+    overflow-wrap: anywhere;
+  }
+
+  .agent-spawn-instruction {
+    color: var(--foreground-secondary);
+  }
+
   .agent-spawn-meta {
     display: flex;
     align-items: center;
@@ -1573,5 +1649,9 @@
 
   .agent-spawn-cta-pending {
     font-style: italic;
+  }
+
+  .agent-spawn-cta-failed {
+    color: var(--error);
   }
 </style>

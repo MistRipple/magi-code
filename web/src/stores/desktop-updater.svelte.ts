@@ -20,6 +20,7 @@ export type DesktopUpdaterPhase =
   | 'error';
 
 export type DesktopUpdaterErrorStage = 'check' | 'download' | 'install' | null;
+export type DesktopUpdateCheckResult = 'latest' | 'available' | 'error' | 'ignored';
 
 export const desktopUpdaterState = $state({
   phase: 'idle' as DesktopUpdaterPhase,
@@ -35,7 +36,10 @@ export const desktopUpdaterState = $state({
 let started = false;
 let initialCheckTimer: number | null = null;
 let intervalTimer: number | null = null;
-let checkPromise: Promise<void> | null = null;
+let latestResultTimer: number | null = null;
+let checkPromise: Promise<DesktopUpdateCheckResult> | null = null;
+const MANUAL_UPDATE_CHECK_FEEDBACK_MS = 1_000;
+const MANUAL_LATEST_RESULT_DURATION_MS = 5_000;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -63,21 +67,45 @@ async function loadDesktopVersion(): Promise<void> {
   }
 }
 
+function clearLatestResultTimer(): void {
+  if (latestResultTimer !== null) {
+    window.clearTimeout(latestResultTimer);
+    latestResultTimer = null;
+  }
+}
+
+function settleLatestDesktopUpdateCheck(source: 'automatic' | 'manual'): void {
+  clearLatestResultTimer();
+  if (source === 'automatic') {
+    desktopUpdaterState.phase = 'idle';
+    return;
+  }
+
+  desktopUpdaterState.phase = 'latest';
+  latestResultTimer = window.setTimeout(() => {
+    if (desktopUpdaterState.phase === 'latest') {
+      desktopUpdaterState.phase = 'idle';
+    }
+    latestResultTimer = null;
+  }, MANUAL_LATEST_RESULT_DURATION_MS);
+}
+
 export async function checkForDesktopUpdate(
   source: 'automatic' | 'manual' = 'manual',
-): Promise<void> {
-  if (!isDesktopRuntime()) return;
+): Promise<DesktopUpdateCheckResult> {
+  if (!isDesktopRuntime()) return 'ignored';
   if (checkPromise) return checkPromise;
   if (
     desktopUpdaterState.phase === 'downloading'
     || desktopUpdaterState.phase === 'ready'
     || desktopUpdaterState.phase === 'installing'
   ) {
-    return;
+    return 'ignored';
   }
 
   const previousPhase = desktopUpdaterState.phase;
   checkPromise = (async () => {
+    const checkingStartedAt = Date.now();
     desktopUpdaterState.lastCheckAttemptAt = Date.now();
     desktopUpdaterState.phase = 'checking';
     desktopUpdaterState.progress = null;
@@ -85,10 +113,22 @@ export async function checkForDesktopUpdate(
     desktopUpdaterState.errorStage = null;
     try {
       const nextUpdate = await checkDesktopUpdate();
+      if (source === 'manual') {
+        const remainingFeedbackMs = MANUAL_UPDATE_CHECK_FEEDBACK_MS - (Date.now() - checkingStartedAt);
+        if (remainingFeedbackMs > 0) {
+          await new Promise<void>((resolve) => window.setTimeout(resolve, remainingFeedbackMs));
+        }
+      }
       desktopUpdaterState.lastCheckedAt = Date.now();
       await closeCurrentUpdate();
       desktopUpdaterState.update = nextUpdate;
-      desktopUpdaterState.phase = nextUpdate ? 'available' : 'latest';
+      if (nextUpdate) {
+        clearLatestResultTimer();
+        desktopUpdaterState.phase = 'available';
+        return 'available';
+      }
+      settleLatestDesktopUpdateCheck(source);
+      return 'latest';
     } catch (error) {
       if (source === 'automatic') {
         desktopUpdaterState.phase = previousPhase === 'latest' ? 'latest' : 'idle';
@@ -99,6 +139,7 @@ export async function checkForDesktopUpdate(
         desktopUpdaterState.error = errorMessage(error);
         desktopUpdaterState.errorStage = 'check';
       }
+      return 'error';
     }
   })().finally(() => {
     checkPromise = null;
@@ -147,19 +188,19 @@ export async function restartWithDesktopUpdate(): Promise<void> {
   }
 }
 
-export async function retryDesktopUpdate(): Promise<void> {
+export async function retryDesktopUpdate(): Promise<DesktopUpdateCheckResult> {
   if (desktopUpdaterState.errorStage === 'check') {
-    await checkForDesktopUpdate('manual');
-    return;
+    return checkForDesktopUpdate('manual');
   }
   if (desktopUpdaterState.errorStage === 'download') {
     await downloadDesktopUpdate();
-    return;
+    return 'ignored';
   }
   if (desktopUpdaterState.errorStage === 'install') {
     desktopUpdaterState.phase = 'ready';
     await restartWithDesktopUpdate();
   }
+  return 'ignored';
 }
 
 function checkAutomaticallyIfDue(ignoreRetryDelay = false): void {
@@ -209,6 +250,7 @@ export function startDesktopUpdater(): () => void {
     if (intervalTimer !== null) window.clearInterval(intervalTimer);
     initialCheckTimer = null;
     intervalTimer = null;
+    clearLatestResultTimer();
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     window.removeEventListener('online', handleOnline);
     void closeCurrentUpdate();

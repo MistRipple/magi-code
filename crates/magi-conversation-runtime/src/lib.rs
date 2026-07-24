@@ -12,6 +12,7 @@ mod conversation;
 pub mod conversation_loop;
 pub mod dispatch_submission;
 mod driver;
+pub mod execution_admission;
 pub mod execution_chain_recovery;
 mod mailbox;
 pub mod model_config;

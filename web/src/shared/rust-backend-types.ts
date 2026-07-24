@@ -760,6 +760,39 @@ export interface RuntimeReadModelDto {
   recovery: RecoveryReadModelDto;
 }
 
+export interface ExecutionAdmissionLimitsDto {
+  max_active_tasks: number;
+  max_active_tasks_per_session: number;
+  max_active_tasks_per_role: number;
+  min_available_memory_bytes: number;
+}
+
+export interface ExecutionResourceSnapshotDto {
+  system_cpu_usage_basis_points: number;
+  process_cpu_usage_basis_points?: number | null;
+  total_memory_bytes?: number | null;
+  available_memory_bytes?: number | null;
+  process_memory_bytes?: number | null;
+}
+
+export interface QueuedExecutionAdmissionDto {
+  task_id: string;
+  session_id?: string | null;
+  role: string;
+  reason: string;
+  queued_at: number;
+}
+
+export interface ExecutionAdmissionSnapshotDto {
+  limits: ExecutionAdmissionLimitsDto;
+  available_parallelism: number;
+  resources: ExecutionResourceSnapshotDto;
+  active_task_count: number;
+  queued_task_count: number;
+  active_task_ids: string[];
+  queued: QueuedExecutionAdmissionDto[];
+}
+
 export interface AuditUsageLedgerDto {
   schema_version: string;
   next_sequence: number;
@@ -1510,7 +1543,12 @@ export interface AgentProjectionDto {
   workerId?: string | null;
   threadId?: string | null;
   executionChainRef?: string | null;
+  /** 子代理任务被接受执行的权威起点。 */
   startedAt: number;
+  /** 子代理进入终态的权威时刻；运行中为空。 */
+  completedAt?: number | null;
+  /** 子代理生命周期总耗时；运行中为空。 */
+  responseDurationMs?: number | null;
   updatedAt: number;
   result?: AgentProjectionResultDto | null;
 }

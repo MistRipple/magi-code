@@ -49,6 +49,19 @@ struct StagedDesktopUpdate {
     body: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopUpdateInstallability {
+    installable: bool,
+    reason: Option<DesktopUpdateInstallabilityReason>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum DesktopUpdateInstallabilityReason {
+    DiskImage,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "event", content = "data")]
 enum DesktopUpdateDownloadEvent {
@@ -80,6 +93,43 @@ fn default_state_root() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".magi")
+}
+
+fn desktop_update_installability(executable_path: &Path) -> DesktopUpdateInstallability {
+    #[cfg(target_os = "macos")]
+    if executable_path.starts_with("/Volumes") {
+        return DesktopUpdateInstallability {
+            installable: false,
+            reason: Some(DesktopUpdateInstallabilityReason::DiskImage),
+        };
+    }
+
+    DesktopUpdateInstallability {
+        installable: true,
+        reason: None,
+    }
+}
+
+fn desktop_update_installability_for_current_process() -> Result<DesktopUpdateInstallability, String>
+{
+    let executable_path =
+        env::current_exe().map_err(|error| format!("读取桌面应用路径失败: {error}"))?;
+    Ok(desktop_update_installability(&executable_path))
+}
+
+fn require_desktop_update_installability() -> Result<(), String> {
+    let installability = desktop_update_installability_for_current_process()?;
+    if installability.installable {
+        return Ok(());
+    }
+
+    match installability.reason {
+        Some(DesktopUpdateInstallabilityReason::DiskImage) => Err(
+            "Magi 当前正在磁盘映像中运行。请先将 Magi 拖入“应用程序”文件夹，从应用程序重新打开后再安装更新"
+                .to_string(),
+        ),
+        None => Err("当前 Magi 安装位置无法完成在线更新".to_string()),
+    }
 }
 
 fn staged_update_paths(state_root: &Path) -> (PathBuf, PathBuf) {
@@ -291,6 +341,7 @@ fn force_shutdown_desktop_runtime(
 
 #[tauri::command]
 fn prepare_update_restart(app: AppHandle) -> Result<(), String> {
+    require_desktop_update_installability()?;
     let (daemon, lifecycle, state_root) = {
         let runtime = app.state::<DesktopRuntime>();
         (
@@ -316,11 +367,17 @@ async fn get_staged_desktop_update(app: AppHandle) -> Result<Option<StagedDeskto
 }
 
 #[tauri::command]
+fn get_desktop_update_installability() -> Result<DesktopUpdateInstallability, String> {
+    desktop_update_installability_for_current_process()
+}
+
+#[tauri::command]
 async fn stage_desktop_update(
     app: AppHandle,
     version: String,
     on_event: Channel<DesktopUpdateDownloadEvent>,
 ) -> Result<StagedDesktopUpdate, String> {
+    require_desktop_update_installability()?;
     let state_root = app.state::<DesktopRuntime>().state_root.clone();
     let updater = app
         .updater()
@@ -367,6 +424,7 @@ async fn stage_desktop_update(
 
 #[tauri::command]
 async fn install_staged_desktop_update(app: AppHandle) -> Result<(), String> {
+    require_desktop_update_installability()?;
     let state_root = app.state::<DesktopRuntime>().state_root.clone();
     let staged = read_staged_update(&state_root)?
         .ok_or_else(|| "没有找到已下载的更新包，请重新下载".to_string())?;
@@ -502,6 +560,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             prepare_update_restart,
             get_staged_desktop_update,
+            get_desktop_update_installability,
             stage_desktop_update,
             install_staged_desktop_update,
         ])
@@ -589,5 +648,35 @@ mod tests {
                 env!("CARGO_PKG_VERSION")
             )
         );
+    }
+
+    #[test]
+    fn desktop_update_rejects_macos_disk_image_execution() {
+        let installability =
+            desktop_update_installability(Path::new("/Volumes/Magi/Magi.app/Contents/MacOS/Magi"));
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!installability.installable);
+            assert!(matches!(
+                installability.reason,
+                Some(DesktopUpdateInstallabilityReason::DiskImage)
+            ));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(installability.installable);
+            assert!(installability.reason.is_none());
+        }
+    }
+
+    #[test]
+    fn desktop_update_accepts_application_execution() {
+        let installability =
+            desktop_update_installability(Path::new("/Applications/Magi.app/Contents/MacOS/Magi"));
+
+        assert!(installability.installable);
+        assert!(installability.reason.is_none());
     }
 }

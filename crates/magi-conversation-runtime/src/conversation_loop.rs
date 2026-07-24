@@ -2381,17 +2381,26 @@ fn tool_result_content_field(tool_result: &str) -> Option<String> {
 fn tool_result_is_recoverable_failure(result: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(result)
         .ok()
-        .and_then(|value| {
-            value
+        .is_some_and(|value| {
+            let error_code = value
                 .get("error_code")
                 .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .is_some_and(|code| {
-            matches!(
-                code.as_str(),
+                .unwrap_or_default();
+            if matches!(
+                error_code,
                 "agent_spawn_capacity_exceeded" | "file_read_not_found"
-            )
+            ) {
+                return true;
+            }
+            value.get("tool").and_then(serde_json::Value::as_str) == Some("agent_spawn")
+                && value
+                    .get("failure_stage")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("input_validation")
+                && value
+                    .get("instruction")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|instruction| !instruction.trim().is_empty())
         })
 }
 
@@ -4778,8 +4787,18 @@ mod tests {
             "error": "该操作已被安全防护阻止",
         })
         .to_string();
+        let invalid_spawn_input = serde_json::json!({
+            "tool": "agent_spawn",
+            "status": "failed",
+            "error_code": "invalid_context_package",
+            "failure_stage": "input_validation",
+            "error": "spawn.references[0].title 必须是字符串",
+            "instruction": "请按 Schema 修正引用字段后重试。",
+        })
+        .to_string();
 
         assert!(tool_result_is_recoverable_failure(&capacity_signal));
+        assert!(tool_result_is_recoverable_failure(&invalid_spawn_input));
         assert!(!tool_result_is_recoverable_failure(&safety_rejection));
         assert!(!tool_result_is_recoverable_failure("not json"));
     }

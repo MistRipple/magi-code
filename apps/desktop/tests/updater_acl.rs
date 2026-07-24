@@ -6,9 +6,10 @@ const BUILD_SOURCE: &str = include_str!("../build.rs");
 const CAPABILITY_SOURCE: &str = include_str!("../capabilities/default.json");
 const DESKTOP_MAIN_SOURCE: &str = include_str!("../src/main.rs");
 
-const UPDATE_COMMANDS: [&str; 4] = [
+const UPDATE_COMMANDS: [&str; 5] = [
     "prepare_update_restart",
     "get_staged_desktop_update",
+    "get_desktop_update_installability",
     "stage_desktop_update",
     "install_staged_desktop_update",
 ];

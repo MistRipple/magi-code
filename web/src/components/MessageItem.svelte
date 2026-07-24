@@ -8,12 +8,12 @@
   import Icon from './Icon.svelte';
   import RetryRuntimeIndicator from './RetryRuntimeIndicator.svelte';
   import ErrorDetailPopover from './ErrorDetailPopover.svelte';
+  import TurnRuntimeSummary from './TurnRuntimeSummary.svelte';
   import { onDestroy } from 'svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { retryRuntimeState } from '../stores/messages.svelte';
   import { getAgentColor } from '../lib/agent-colors';
   import {
-    formatDuration,
     formatTraceableTime,
   } from '../lib/utils';
   import { isRuntimeInternalTool } from '../shared/tool-visibility';
@@ -169,14 +169,6 @@
       throw new Error(`[MessageItem] block 缺少 id: message=${message.id} type=${block.type}`);
     }
     return `${message.id}:${id}`;
-  }
-
-  function formatDurationMs(durationMs: number): string {
-    const normalizedMs = Math.max(0, durationMs);
-    if (normalizedMs > 0 && normalizedMs < 1000) {
-      return '<1s';
-    }
-    return formatDuration(normalizedMs);
   }
 
   const copyableText = $derived.by(() => {
@@ -442,14 +434,11 @@
         {/if}
 
         {#if showResponseDuration}
-          <div class="message-runtime-footer completed" class:has-content={hasVisibleContent}>
-            <span class="message-runtime-text">
-              {i18n.t('messageItem.responseDurationLabel')} {formatDurationMs(responseDurationMs ?? 0)}
-              {#if responseCompletedAt !== null}
-                · {formatTraceableTime(responseCompletedAt)}
-              {/if}
-            </span>
-          </div>
+          <TurnRuntimeSummary
+            durationMs={responseDurationMs ?? 0}
+            completedAt={responseCompletedAt}
+            hasContent={hasVisibleContent}
+          />
         {/if}
 
         {#if retryRuntime}
@@ -697,11 +686,6 @@
     padding-bottom: var(--space-2);
   }
 
-  .message-runtime-footer.has-content {
-    margin-top: var(--space-3);
-    padding-top: var(--space-2);
-  }
-
   .interaction-inline {
     display: flex;
     align-items: center;
@@ -805,26 +789,6 @@
   /* 消除流式渲染时首个 block（thinking/tool_call）的顶部 margin 产生的空白 */
   .message-content > :global(:first-child) {
     margin-top: 0;
-  }
-
-  .message-runtime-footer {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: var(--space-2) 0;
-  }
-
-  .message-runtime-footer {
-    min-height: calc(var(--text-xs) * 1.4 + var(--space-2));
-    margin-top: 0;
-    padding: var(--space-1) 0;
-  }
-
-  .message-runtime-text {
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    line-height: 1.4;
-    font-variant-numeric: tabular-nums;
   }
 
   /* ===== 占位消息样式：不渲染额外卡片壳 ===== */

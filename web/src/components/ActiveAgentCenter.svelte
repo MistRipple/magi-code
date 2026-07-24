@@ -47,7 +47,6 @@
   let pinnedRootTaskId = $state('');
   let dismissedRootTaskId = $state('');
   let activeScopeKey = '';
-  let lastAutoOpenedRootTaskId = '';
   let centerRoot: HTMLDivElement | undefined = $state();
 
   const enabledAgents = $derived(getEnabledAgents());
@@ -76,10 +75,6 @@
 
   function storageKey(scopeKey: string): string {
     return `${STORAGE_PREFIX}:${scopeKey}`;
-  }
-
-  function pinnedProjectionRootId(): string {
-    return pinnedProjection?.root_task.task_id?.trim() ?? '';
   }
 
   function readPersistedState(scopeKey: string): PersistedAgentCenterState {
@@ -152,20 +147,6 @@
       dismissedRootTaskId = '';
     }
     persistState(scopeKey);
-  });
-
-  $effect(() => {
-    const rootTaskId = visible ? pinnedProjectionRootId() : '';
-    if (!rootTaskId) {
-      expanded = false;
-      lastAutoOpenedRootTaskId = '';
-      return;
-    }
-    if (rootTaskId !== lastAutoOpenedRootTaskId) {
-      lastAutoOpenedRootTaskId = rootTaskId;
-      completedExpanded = false;
-      expanded = !mobile;
-    }
   });
 
   onMount(() => {

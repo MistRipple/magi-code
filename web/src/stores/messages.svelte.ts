@@ -527,6 +527,7 @@ export interface ToastOptions {
   source?: string;
   actionRequired?: boolean;
   duration?: number;
+  forceVisible?: boolean;
 }
 
 interface ToastRecord {
@@ -1709,7 +1710,7 @@ function replaceNotificationContextList(
 const MAX_VISIBLE_TOASTS = 5;
 
 export function addToast(type: string, message: string, title?: string, options?: ToastOptions) {
-  if (!shouldDisplayToast(type)) {
+  if (!options?.forceVisible && !shouldDisplayToast(type)) {
     return;
   }
   const id = `toast_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;

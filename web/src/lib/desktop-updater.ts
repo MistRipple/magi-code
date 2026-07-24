@@ -4,11 +4,17 @@ export type DesktopUpdateProgress = {
   percent?: number;
 };
 
+export type DesktopUpdateInstallability = {
+  installable: boolean;
+  reason?: 'disk-image';
+};
+
 export type DesktopUpdateInfo = {
   currentVersion: string;
   version: string;
   date?: string;
   body?: string;
+  installability: DesktopUpdateInstallability;
   download: (onProgress?: (progress: DesktopUpdateProgress) => void) => Promise<void>;
   installAndRestart: () => Promise<void>;
   close: () => Promise<void>;
@@ -88,9 +94,13 @@ async function installStagedUpdateAndRestart(): Promise<void> {
   }
 }
 
-function createStagedDesktopUpdate(update: StagedDesktopUpdate): DesktopUpdateInfo {
+function createStagedDesktopUpdate(
+  update: StagedDesktopUpdate,
+  installability: DesktopUpdateInstallability,
+): DesktopUpdateInfo {
   return {
     ...update,
+    installability,
     download: async () => undefined,
     installAndRestart: installStagedUpdateAndRestart,
     close: async () => undefined,
@@ -103,9 +113,10 @@ export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
   }
 
   const { invoke } = await import('@tauri-apps/api/core');
+  const installability = await invoke<DesktopUpdateInstallability>('get_desktop_update_installability');
   const stagedUpdate = await invoke<StagedDesktopUpdate | null>('get_staged_desktop_update');
   if (stagedUpdate) {
-    return createStagedDesktopUpdate(stagedUpdate);
+    return createStagedDesktopUpdate(stagedUpdate, installability);
   }
 
   const { check } = await import('@tauri-apps/plugin-updater');
@@ -134,6 +145,7 @@ export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
     version: update.version,
     date: update.date,
     body: update.body,
+    installability,
     download: async (onProgress) => {
       const { Channel } = await import('@tauri-apps/api/core');
       let downloadedBytes = 0;

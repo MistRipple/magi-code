@@ -574,6 +574,51 @@ struct CoordinatorToolContext<'a> {
     workspace_id: &'a Option<WorkspaceId>,
 }
 
+/// `agent_spawn` 在创建前失败时仍要返回可被模型、前端和通知中心共同消费的诊断合同。
+///
+/// 这里不携带底层错误链或配置内容；完整原因仅写入 tracing。`diagnostic_ref` 用于把
+/// 用户可见结果关联回本次工具调用，而不是伪造一个不存在的子代理任务。
+fn agent_spawn_failure_payload(
+    tool_call: &ChatToolCall,
+    status: &str,
+    error_code: &str,
+    failure_stage: &str,
+    error: impl Into<String>,
+    instruction: impl Into<String>,
+) -> String {
+    agent_spawn_failure_payload_for_child(
+        tool_call,
+        status,
+        error_code,
+        failure_stage,
+        error,
+        instruction,
+        None,
+    )
+}
+
+fn agent_spawn_failure_payload_for_child(
+    tool_call: &ChatToolCall,
+    status: &str,
+    error_code: &str,
+    failure_stage: &str,
+    error: impl Into<String>,
+    instruction: impl Into<String>,
+    child_task_id: Option<&TaskId>,
+) -> String {
+    serde_json::json!({
+        "tool": BuiltinToolName::AgentSpawn.as_str(),
+        "status": status,
+        "error_code": error_code,
+        "failure_stage": failure_stage,
+        "error": error.into(),
+        "instruction": instruction.into(),
+        "diagnostic_ref": format!("tool_call:{}", tool_call.id),
+        "child_task_id": child_task_id.map(ToString::to_string),
+    })
+    .to_string()
+}
+
 fn execute_coordinator_tool(
     context: CoordinatorToolContext<'_>,
     tool: magi_tool_runtime::BuiltinToolName,
@@ -596,6 +641,19 @@ fn execute_coordinator_tool(
         Ok(value) => value,
         Err(err) => {
             tracing::warn!(error = %err, tool = tool.as_str(), "coordinator tool arguments parse failed");
+            if tool == BuiltinToolName::AgentSpawn {
+                return (
+                    agent_spawn_failure_payload(
+                        tool_call,
+                        "failed",
+                        "invalid_arguments",
+                        "input_validation",
+                        "代理派发参数不是有效的 JSON 对象",
+                        "请使用 agent_spawn 的完整 JSON Schema 重新提交参数；不要把嵌套对象编码成普通文本。",
+                    ),
+                    ExecutionResultStatus::Failed,
+                );
+            }
             return (
                 serde_json::json!({
                     "tool": tool.as_str(),
@@ -636,12 +694,14 @@ fn execute_coordinator_tool(
                 .to_string();
             if !valid_agent_task_name(&task_name) {
                 return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": "agent_spawn task_name 只允许小写字母、数字和下划线，长度必须为 1-48",
-                    })
-                    .to_string(),
+                    agent_spawn_failure_payload(
+                        tool_call,
+                        "failed",
+                        "invalid_task_name",
+                        "input_validation",
+                        "agent_spawn task_name 只允许小写字母、数字和下划线，长度必须为 1-48",
+                        "请生成一个唯一的小写 task_name 后重新调用 agent_spawn。",
+                    ),
                     ExecutionResultStatus::Failed,
                 );
             }
@@ -653,12 +713,14 @@ fn execute_coordinator_tool(
                 .any(|child| child.canonical_task_name() == Some(canonical_task_name.as_str()))
             {
                 return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": format!("同一父任务下 task_name 已存在: {task_name}"),
-                    })
-                    .to_string(),
+                    agent_spawn_failure_payload(
+                        tool_call,
+                        "failed",
+                        "duplicate_task_name",
+                        "input_validation",
+                        format!("同一父任务下 task_name 已存在: {task_name}"),
+                        "请生成一个未使用的 task_name 后重新调用 agent_spawn。",
+                    ),
                     ExecutionResultStatus::Failed,
                 );
             }
@@ -672,12 +734,14 @@ fn execute_coordinator_tool(
                 && !plan_store.has_item(plan_item_id)
             {
                 return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": format!("agent_spawn plan_item_id 不存在: {plan_item_id}"),
-                    })
-                    .to_string(),
+                    agent_spawn_failure_payload(
+                        tool_call,
+                        "failed",
+                        "plan_item_not_found",
+                        "input_validation",
+                        format!("agent_spawn plan_item_id 不存在: {plan_item_id}"),
+                        "请使用当前 update_plan 返回的顶层计划项 ID，或省略 plan_item_id 后重新派发。",
+                    ),
                     ExecutionResultStatus::Failed,
                 );
             }
@@ -696,12 +760,14 @@ fn execute_coordinator_tool(
                 .to_string();
             if requested_role.is_empty() || requested_goal.is_empty() {
                 return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": "agent_spawn 缺少必需字段 role 或 goal",
-                    })
-                    .to_string(),
+                    agent_spawn_failure_payload(
+                        tool_call,
+                        "failed",
+                        "missing_required_fields",
+                        "input_validation",
+                        "agent_spawn 缺少必需字段 role 或 goal",
+                        "请补齐 role 和 goal，并保持其为非空字符串后重新调用 agent_spawn。",
+                    ),
                     ExecutionResultStatus::Failed,
                 );
             }
@@ -721,54 +787,58 @@ fn execute_coordinator_tool(
             let display_name_chars = display_name.chars().count();
             if display_name.is_empty() {
                 return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": "agent_spawn 缺少必需字段 display_name",
-                    })
-                    .to_string(),
+                    agent_spawn_failure_payload(
+                        tool_call,
+                        "failed",
+                        "missing_display_name",
+                        "input_validation",
+                        "agent_spawn 缺少必需字段 display_name",
+                        "请提供 3-30 个字符的 display_name 后重新调用 agent_spawn。",
+                    ),
                     ExecutionResultStatus::Failed,
                 );
             }
             if !agent_role_registry.is_spawnable_agent_role(&role) {
                 let role_hint = spawnable_role_ids.join(" / ");
                 return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "degraded",
-                        "fallback_mode": "mainline_or_reassign",
-                        "role": role,
-                        "available_roles": spawnable_role_ids,
-                        "error_code": "agent_role_not_spawnable",
-                        "error": "该 role 不是可派发代理角色。coordinator 是主线编排身份，不能通过 agent_spawn 派发。",
-                        "instruction": format!("请改派 {role_hint} 等可用专业代理；如果无需继续派发，则由主线基于已有上下文直接推进并给出结果。"),
-                    })
-                    .to_string(),
+                    agent_spawn_failure_payload(
+                        tool_call,
+                        "degraded",
+                        "agent_role_not_spawnable",
+                        "input_validation",
+                        "该 role 不是可派发代理角色。coordinator 是主线编排身份，不能通过 agent_spawn 派发。",
+                        format!(
+                            "请改派 {role_hint} 等可用专业代理；如果无需继续派发，则由主线基于已有上下文直接推进并给出结果。"
+                        ),
+                    ),
                     ExecutionResultStatus::Succeeded,
                 );
             }
             if !(3..=30).contains(&display_name_chars) {
                 return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error": format!(
+                    agent_spawn_failure_payload(
+                        tool_call,
+                        "failed",
+                        "invalid_display_name",
+                        "input_validation",
+                        format!(
                             "agent_spawn display_name 长度必须在 3-30 个字符之间，实际 {display_name_chars}",
                         ),
-                    })
-                    .to_string(),
+                        "请提供长度为 3-30 个字符的 display_name 后重新调用 agent_spawn。",
+                    ),
                     ExecutionResultStatus::Failed,
                 );
             }
             if parsed.get("context").is_some() {
                 return (
-                    serde_json::json!({
-                        "tool": tool.as_str(),
-                        "status": "failed",
-                        "error_code": "legacy_context_rejected",
-                        "error": "agent_spawn 不再接受 context 字符串，请使用结构化 context_package",
-                    })
-                    .to_string(),
+                    agent_spawn_failure_payload(
+                        tool_call,
+                        "failed",
+                        "legacy_context_rejected",
+                        "input_validation",
+                        "agent_spawn 不再接受 context 字符串，请使用结构化 context_package",
+                        "请移除 context，并按 Schema 传入 context_package 对象后重新调用 agent_spawn。",
+                    ),
                     ExecutionResultStatus::Failed,
                 );
             }
@@ -796,22 +866,27 @@ fn execute_coordinator_tool(
                 now.0,
                 seq
             ));
-            let context_package =
-                match parse_agent_context_package(&parsed, &task.task_id, now, seq) {
-                    Ok(package) => package,
-                    Err(error) => {
-                        return (
-                            serde_json::json!({
-                                "tool": tool.as_str(),
-                                "status": "failed",
-                                "error_code": "invalid_context_package",
-                                "error": error,
-                            })
-                            .to_string(),
-                            ExecutionResultStatus::Failed,
-                        );
-                    }
-                };
+            let context_package = match parse_agent_context_package(
+                &parsed,
+                &task.task_id,
+                now,
+                seq,
+            ) {
+                Ok(package) => package,
+                Err(error) => {
+                    return (
+                        agent_spawn_failure_payload(
+                            tool_call,
+                            "failed",
+                            "invalid_context_package",
+                            "input_validation",
+                            error,
+                            "请按 agent_spawn Schema 重新提供 context_package：summary、expected_output、constraints 必须为规定类型；references 中每条引用的 kind、source_ref 必须为字符串，若提供 title 也必须为字符串。",
+                        ),
+                        ExecutionResultStatus::Failed,
+                    );
+                }
+            };
             let child_policy_snapshot =
                 agent_spawn_child_policy_snapshot(task.policy_snapshot.as_ref());
             let child_access_profile = child_policy_snapshot.effective_access_profile();
@@ -885,29 +960,28 @@ fn execute_coordinator_tool(
                     } = error
                     {
                         return (
-                            serde_json::json!({
-                                "tool": tool.as_str(),
-                                "status": "rejected",
-                                "error_code": "agent_spawn_capacity_exceeded",
-                                "capacity_scope": "role",
-                                "role": role,
-                                "active_role_agent_count": active,
-                                "max_active_agents_per_role": limit,
-                                "error": format!("角色 {role} 已达到代理实例上限：最多 {limit} 个活跃实例，当前 {active} 个"),
-                                "instruction": "请先用 agent_wait 收集该角色已启动代理的结果；有实例退出活跃状态后再继续创建同角色代理。其他角色不受该角色容量占用影响。",
-                            })
-                            .to_string(),
+                            agent_spawn_failure_payload(
+                                tool_call,
+                                "rejected",
+                                "agent_spawn_capacity_exceeded",
+                                "registration",
+                                format!(
+                                    "角色 {role} 已达到代理实例上限：最多 {limit} 个活跃实例，当前 {active} 个"
+                                ),
+                                "请先用 agent_wait 收集该角色已启动代理的结果；有实例退出活跃状态后再继续创建同角色代理。其他角色不受该角色容量占用影响。",
+                            ),
                             ExecutionResultStatus::Rejected,
                         );
                     }
                     return (
-                        serde_json::json!({
-                            "tool": tool.as_str(),
-                            "status": "failed",
-                            "error_code": "agent_spawn_registration_failed",
-                            "error": "代理启动失败，请由主线继续或改派其他角色",
-                        })
-                        .to_string(),
+                        agent_spawn_failure_payload(
+                            tool_call,
+                            "failed",
+                            "agent_spawn_registration_failed",
+                            "registration",
+                            "代理启动失败，请由主线继续或改派其他角色",
+                            "请根据当前任务继续推进，或改派其他可用角色；如需排查，请使用本次诊断引用定位工具调用。",
+                        ),
                         ExecutionResultStatus::Failed,
                     );
                 }
@@ -932,13 +1006,15 @@ fn execute_coordinator_tool(
                         );
                         let _ = task_store.update_status(&child_id, TaskStatus::Killed);
                         return (
-                            serde_json::json!({
-                                "tool": tool.as_str(),
-                                "status": "failed",
-                                "error_code": "agent_spawn_plan_binding_failed",
-                                "error": "代理已创建但计划绑定失败，运行已终止",
-                            })
-                            .to_string(),
+                            agent_spawn_failure_payload_for_child(
+                                tool_call,
+                                "failed",
+                                "agent_spawn_plan_binding_failed",
+                                "plan_binding",
+                                "代理已创建但计划绑定失败，运行已终止",
+                                "请修正或省略 plan_item_id 后重新派发；本次创建的代理已终止，可打开详情查看其执行记录。",
+                                Some(&child_id),
+                            ),
                             ExecutionResultStatus::Failed,
                         );
                     }
@@ -1987,21 +2063,24 @@ fn parse_agent_context_references(
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(""),
             )?;
-            let title = required_bounded_context_text(
-                object.get("title"),
-                &format!("{scope}.references[{index}].title"),
-                200,
-            )?;
             let source_ref = required_bounded_context_text(
                 object.get("source_ref"),
                 &format!("{scope}.references[{index}].source_ref"),
                 1_000,
             )?;
-            let preview = bounded_context_text(
+            let title = optional_bounded_context_text(
+                object.get("title"),
+                &format!("{scope}.references[{index}].title"),
+                200,
+            )?
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| default_agent_context_reference_title(&source_ref));
+            let preview = optional_bounded_context_text(
                 object.get("preview"),
                 &format!("{scope}.references[{index}].preview"),
                 AGENT_CONTEXT_PREVIEW_MAX_CHARS,
-            )?;
+            )?
+            .unwrap_or_default();
             Ok(AgentContextReference {
                 reference_id: format!("ctxref-{scope}-{}-{sequence}-{index}", now.0),
                 kind,
@@ -2037,6 +2116,25 @@ fn required_bounded_context_text(
     } else {
         Ok(text)
     }
+}
+
+fn optional_bounded_context_text(
+    value: Option<&serde_json::Value>,
+    field: &str,
+    max_chars: usize,
+) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    bounded_context_text(Some(value), field, max_chars).map(Some)
+}
+
+fn default_agent_context_reference_title(source_ref: &str) -> String {
+    let mut title = source_ref.trim().chars().take(200).collect::<String>();
+    if source_ref.trim().chars().count() > 200 {
+        title.push('…');
+    }
+    title
 }
 
 fn bounded_context_text(
@@ -3687,6 +3785,88 @@ mod tests {
         assert_eq!(parsed_package.summary, "检查配置文件");
         assert_eq!(parsed_package.constraints, vec!["只读，不修改文件"]);
         assert_eq!(parsed_package.references.len(), 0);
+    }
+
+    #[test]
+    fn agent_spawn_context_package_rejects_non_string_reference_title() {
+        let parent = test_task(
+            "task-agent-context-invalid-reference-parent",
+            "task-agent-context-invalid-reference-root",
+            None,
+        );
+        let parsed = serde_json::json!({
+            "context_package": {
+                "summary": "检查派发参数",
+                "constraints": ["只读"],
+                "expected_output": "返回校验结论",
+                "references": [{
+                    "kind": "file",
+                    "title": { "label": "Cargo.toml" },
+                    "source_ref": "path:Cargo.toml"
+                }]
+            }
+        });
+
+        let error = parse_agent_context_package(&parsed, &parent.task_id, UtcMillis(102), 9)
+            .expect_err("引用 title 不是字符串时必须拒绝创建代理");
+
+        assert_eq!(error, "spawn.references[0].title 必须是字符串");
+    }
+
+    #[test]
+    fn agent_spawn_context_package_derives_missing_reference_title_from_source() {
+        let parent = test_task(
+            "task-agent-context-derived-title-parent",
+            "task-agent-context-derived-title-root",
+            None,
+        );
+        let parsed = serde_json::json!({
+            "context_package": {
+                "summary": "检查派发参数",
+                "constraints": ["只读"],
+                "expected_output": "返回校验结论",
+                "references": [{
+                    "kind": "file",
+                    "source_ref": "path:Cargo.toml"
+                }]
+            }
+        });
+
+        let package = parse_agent_context_package(&parsed, &parent.task_id, UtcMillis(103), 10)
+            .expect("缺少可选展示标题时应从 source_ref 派生");
+
+        assert_eq!(package.references[0].title, "path:Cargo.toml");
+    }
+
+    #[test]
+    fn agent_spawn_failure_contract_preserves_safe_diagnosis() {
+        let tool_call = ChatToolCall {
+            id: "call-agent-spawn-invalid-context".to_string(),
+            kind: "function".to_string(),
+            function: magi_bridge_client::ChatToolFunction {
+                name: "agent_spawn".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+
+        let payload: serde_json::Value = serde_json::from_str(&agent_spawn_failure_payload(
+            &tool_call,
+            "failed",
+            "invalid_context_package",
+            "input_validation",
+            "spawn.references[0].title 必须是字符串",
+            "请按 Schema 修正引用字段后重试。",
+        ))
+        .expect("failure payload should be JSON");
+
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error_code"], "invalid_context_package");
+        assert_eq!(payload["failure_stage"], "input_validation");
+        assert_eq!(
+            payload["diagnostic_ref"],
+            "tool_call:call-agent-spawn-invalid-context"
+        );
+        assert_eq!(payload["child_task_id"], serde_json::Value::Null);
     }
 
     #[test]

@@ -13,11 +13,43 @@ export interface ActiveAgentSummary {
   triggerCount: number;
 }
 
-function isAgentRuntimeActive(agent: AgentProjectionDto): boolean {
+export function isAgentRuntimeActive(agent: AgentProjectionDto): boolean {
   return agent.status === 'pending'
     || agent.status === 'running'
     || agent.lifecycle === 'queued'
     || agent.lifecycle === 'running';
+}
+
+export interface AgentRuntimeTiming {
+  active: boolean;
+  startedAt: number;
+  completedAt: number;
+  durationMs: number;
+}
+
+/**
+ * 代理投影的 `updatedAt` 在终态由任务状态迁移写入，因此它是子代理完成时刻的权威值。
+ * 运行中则只提供起点，具体计时由展示层使用同一时钟持续刷新。
+ */
+export function agentRuntimeTiming(agent: AgentProjectionDto, nowMs: number): AgentRuntimeTiming {
+  const startedAt = Number.isFinite(agent.startedAt) ? Math.max(0, agent.startedAt) : 0;
+  const active = isAgentRuntimeActive(agent);
+  const completedAt = !active
+    && typeof agent.completedAt === 'number'
+    && Number.isFinite(agent.completedAt)
+    ? Math.max(startedAt, agent.completedAt)
+    : 0;
+  const durationMs = !active
+    && typeof agent.responseDurationMs === 'number'
+    && Number.isFinite(agent.responseDurationMs)
+    ? Math.max(0, Math.floor(agent.responseDurationMs))
+    : (active ? Math.max(0, nowMs - startedAt) : 0);
+  return {
+    active,
+    startedAt,
+    completedAt,
+    durationMs,
+  };
 }
 
 function requiresAttention(agent: AgentProjectionDto): boolean {
@@ -71,17 +103,7 @@ export function buildActiveAgentSummary(groups: ActiveAgentGroups): ActiveAgentS
 }
 
 export function agentDurationSeconds(agent: AgentProjectionDto, nowMs: number): number {
-  const startedAt = Number.isFinite(agent.startedAt) ? Math.max(0, agent.startedAt) : 0;
-  if (startedAt <= 0) {
-    return 0;
-  }
-  const terminalUpdatedAt = Number.isFinite(agent.updatedAt)
-    ? Math.max(startedAt, agent.updatedAt)
-    : startedAt;
-  const endAt = isAgentRuntimeActive(agent)
-    ? Math.max(startedAt, nowMs)
-    : terminalUpdatedAt;
-  return Math.max(0, Math.floor((endAt - startedAt) / 1000));
+  return Math.floor(agentRuntimeTiming(agent, nowMs).durationMs / 1000);
 }
 
 export function formatAgentDuration(totalSeconds: number): string {

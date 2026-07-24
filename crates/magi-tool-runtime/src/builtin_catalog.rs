@@ -1371,14 +1371,14 @@ impl BuiltinToolName {
                     },
                     "context_package": {
                         "type": "object",
-                        "description": "子代理启动时唯一的结构化上下文包；禁止传旧 context 字符串。",
+                        "description": "子代理启动时唯一的结构化上下文包；禁止传旧 context 字符串。所有文本字段必须直接传 JSON string，不能传对象、数组或 Markdown 键值对；references 可以传空数组。",
                         "properties": {
                             "summary": { "type": "string", "minLength": 1, "description": "当前子任务所需的最小背景摘要，不复制主对话全文。" },
                             "constraints": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "必须遵守的边界和禁止事项。" },
                             "expected_output": { "type": "string", "minLength": 1, "description": "子代理最终必须交付的结果形态和验收标准。" },
                             "references": {
                                 "type": "array",
-                                "description": "可按需读取的结构化引用；正文不在启动 prompt 中自动展开。",
+                                "description": "可按需读取的结构化引用；正文不在启动 prompt 中自动展开。每项的 kind 和 source_ref 必须是直接的 JSON string；title 是可选展示名，省略时系统使用 source_ref 作为标题。若提供 title，它也必须是直接的 JSON string；例如 {\"kind\":\"file\",\"source_ref\":\"path:Cargo.toml\",\"title\":\"配置文件\"}。",
                                 "items": {
                                     "type": "object",
                                     "properties": {
@@ -1387,7 +1387,7 @@ impl BuiltinToolName {
                                         "source_ref": { "type": "string", "minLength": 1 },
                                         "preview": { "type": "string" }
                                     },
-                                    "required": ["kind", "title", "source_ref", "preview"]
+                                    "required": ["kind", "source_ref"]
                                 }
                             }
                         },
@@ -1767,5 +1767,26 @@ mod tests {
 
         assert!(!properties.contains_key("access_mode"));
         assert!(!required.iter().any(|value| value == "access_mode"));
+    }
+
+    #[test]
+    fn agent_spawn_reference_contract_keeps_title_optional_but_typed() {
+        let schema = BuiltinToolName::AgentSpawn.parameters_schema();
+        let reference =
+            &schema["properties"]["context_package"]["properties"]["references"]["items"];
+        let properties = reference["properties"]
+            .as_object()
+            .expect("reference properties should be an object");
+        let required = reference["required"]
+            .as_array()
+            .expect("reference required should be an array");
+
+        for field in ["kind", "source_ref"] {
+            assert_eq!(properties[field]["type"], "string");
+            assert!(required.iter().any(|value| value == field));
+        }
+        assert_eq!(properties["title"]["type"], "string");
+        assert!(!required.iter().any(|value| value == "title"));
+        assert!(!required.iter().any(|value| value == "preview"));
     }
 }

@@ -121,6 +121,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/health", get(health))
         .route("/bootstrap", get(bootstrap))
         .route("/runtime/read-model", get(runtime_read_model))
+        .route("/runtime/execution-admission", get(execution_admission))
         .route("/ledger", get(ledger))
         .route("/bridges/services", get(bridge_services))
         .route("/bridges/preflight", get(bridge_preflight))
@@ -183,6 +184,7 @@ fn is_public_tunnel_request(headers: &HeaderMap) -> bool {
 fn is_protected_remote_path(path: &str) -> bool {
     path == "/bootstrap"
         || path == "/runtime/read-model"
+        || path == "/runtime/execution-admission"
         || path == "/ledger"
         || path == "/events"
         || path.starts_with("/bridges/")
@@ -320,6 +322,12 @@ fn trimmed_query_param(value: Option<&str>) -> Option<&str> {
 
 async fn runtime_read_model(State(state): State<ApiState>) -> Json<RuntimeReadModelDto> {
     Json(state.runtime_read_model_dto())
+}
+
+async fn execution_admission(
+    State(state): State<ApiState>,
+) -> Json<Option<magi_conversation_runtime::execution_admission::ExecutionAdmissionSnapshot>> {
+    Json(state.execution_admission_snapshot())
 }
 
 async fn ledger(State(state): State<ApiState>) -> Json<AuditUsageLedgerDto> {
@@ -480,6 +488,16 @@ mod tests {
             .await
             .expect("router should respond");
         assert_eq!(local_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn execution_admission_route_reports_uninitialized_runtime_explicitly() {
+        let app = build_router(test_state());
+
+        let (status, body) = get_json(app, "/runtime/execution-admission").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::Value::Null);
     }
 
     #[tokio::test]

@@ -32,6 +32,7 @@ magi-workspace = { path = "../magi-workspace" }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+sysinfo.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

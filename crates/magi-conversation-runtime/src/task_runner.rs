@@ -3,12 +3,13 @@
 //! 本模块只维护任务执行事实：pending/running/terminal 状态推进、
 //! worker 匹配、租约、结果回收。
 
+use crate::execution_admission::ExecutionAdmissionController;
 use crate::task_runner_bridge::{
     RunCycleOutcome, TaskDispatchGate, TaskDispatchGateDecision, TaskDispatcher, TaskOutcome,
     TaskResultReceiver,
 };
 use magi_agent_role::AgentRoleRegistry;
-use magi_core::{Task, TaskId, TaskStatus};
+use magi_core::{SessionId, Task, TaskId, TaskStatus};
 use magi_event_bus::InMemoryEventBus;
 use magi_orchestrator::{
     task_store::TaskStore,
@@ -30,6 +31,8 @@ pub struct TaskRunner {
     dispatcher: Arc<dyn TaskDispatcher>,
     result_receiver: Arc<dyn TaskResultReceiver>,
     dispatch_gate: Option<Arc<TaskDispatchGate>>,
+    execution_admission: Arc<ExecutionAdmissionController>,
+    session_id: Option<SessionId>,
     event_bus: Option<Arc<InMemoryEventBus>>,
     checkpoint_signal: AtomicBool,
     agent_role_registry: AgentRoleRegistry,
@@ -48,6 +51,8 @@ impl TaskRunner {
             dispatcher,
             result_receiver,
             dispatch_gate: None,
+            execution_admission: Arc::new(ExecutionAdmissionController::default()),
+            session_id: None,
             event_bus: None,
             checkpoint_signal: AtomicBool::new(false),
             agent_role_registry: AgentRoleRegistry::load_default(),
@@ -66,6 +71,16 @@ impl TaskRunner {
 
     pub fn with_dispatch_gate(mut self, gate: Arc<TaskDispatchGate>) -> Self {
         self.dispatch_gate = Some(gate);
+        self
+    }
+
+    pub fn with_execution_admission(
+        mut self,
+        execution_admission: Arc<ExecutionAdmissionController>,
+        session_id: Option<SessionId>,
+    ) -> Self {
+        self.execution_admission = execution_admission;
+        self.session_id = session_id;
         self
     }
 
@@ -112,6 +127,7 @@ impl TaskRunner {
 
         let mut dispatched = 0usize;
         let mut unmatched = Vec::new();
+        let mut admission_blocked = Vec::new();
         for task in runnable {
             if let Some(gate) = &self.dispatch_gate {
                 match gate(&task) {
@@ -134,6 +150,17 @@ impl TaskRunner {
                 unmatched.push(task.task_id.clone());
                 continue;
             };
+            let admission_permit = match self.execution_admission.acquire(
+                task.task_id.clone(),
+                self.session_id.clone(),
+                worker.role.clone(),
+            ) {
+                Ok(permit) => permit,
+                Err(blocked) => {
+                    admission_blocked.push((task.task_id.clone(), blocked.reason));
+                    continue;
+                }
+            };
             let Some(lease) = self.store.grant_lease(
                 &task.task_id,
                 root_task_id,
@@ -141,6 +168,7 @@ impl TaskRunner {
                 &worker.role,
                 DEFAULT_LEASE_DURATION_MS,
             ) else {
+                drop(admission_permit);
                 continue;
             };
             if let Err(error) = self
@@ -153,7 +181,10 @@ impl TaskRunner {
                     task.task_id
                 ));
             }
-            if let Err(error) = self.dispatcher.dispatch(&task, &worker, &lease) {
+            if let Err(error) = self
+                .dispatcher
+                .dispatch(&task, &worker, &lease, admission_permit)
+            {
                 self.store.revoke_lease(&task.task_id, &lease.lease_id);
                 let _ = self.store.update_status(&task.task_id, TaskStatus::Failed);
                 self.set_checkpoint_signal();
@@ -164,6 +195,11 @@ impl TaskRunner {
 
         if dispatched > 0 {
             RunCycleOutcome::Continue
+        } else if let Some((task_id, reason)) = admission_blocked.into_iter().next() {
+            RunCycleOutcome::Blocked {
+                task_ids: vec![task_id],
+                reason,
+            }
         } else {
             RunCycleOutcome::Stalled(unmatched)
         }
@@ -241,6 +277,7 @@ impl TaskRunner {
             task.status,
             TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
         ) {
+            self.execution_admission.remove_queued_task(task_id);
             return Ok(());
         }
         if let Some(lease) = self.store.get_active_lease(task_id) {
@@ -249,6 +286,7 @@ impl TaskRunner {
         self.store
             .update_status(task_id, TaskStatus::Killed)
             .map_err(|error| format!("终止任务 {task_id} 失败: {error}"))?;
+        self.execution_admission.remove_queued_task(task_id);
         self.set_checkpoint_signal();
         Ok(())
     }
@@ -421,8 +459,12 @@ enum TerminalState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task_runner_bridge::{EventBasedResultReceiver, TaskResult};
+    use crate::{
+        execution_admission::{ExecutionAdmissionLimits, ExecutionAdmissionPermit},
+        task_runner_bridge::{EventBasedResultReceiver, TaskResult},
+    };
     use magi_core::{MissionId, TaskKind, TaskRuntimePayload, UtcMillis, WorkerId};
+    use std::sync::Mutex;
 
     struct RejectingDispatcher;
 
@@ -432,8 +474,38 @@ mod tests {
             _task: &Task,
             _worker: &WorkerInfo,
             _lease: &magi_orchestrator::task_store::TaskLease,
+            _admission_permit: crate::execution_admission::ExecutionAdmissionPermit,
         ) -> Result<(), String> {
             Err("test dispatcher should not run".to_string())
+        }
+    }
+
+    struct HoldingDispatcher {
+        permits: Mutex<Vec<ExecutionAdmissionPermit>>,
+    }
+
+    impl HoldingDispatcher {
+        fn release_all(&self) {
+            self.permits
+                .lock()
+                .expect("held permits lock should not poison")
+                .clear();
+        }
+    }
+
+    impl TaskDispatcher for HoldingDispatcher {
+        fn dispatch(
+            &self,
+            _task: &Task,
+            _worker: &WorkerInfo,
+            _lease: &magi_orchestrator::task_store::TaskLease,
+            admission_permit: ExecutionAdmissionPermit,
+        ) -> Result<(), String> {
+            self.permits
+                .lock()
+                .expect("held permits lock should not poison")
+                .push(admission_permit);
+            Ok(())
         }
     }
 
@@ -555,5 +627,82 @@ mod tests {
                 .lease_id,
             current_lease.lease_id
         );
+    }
+
+    #[test]
+    fn shared_execution_admission_blocks_other_runners_until_the_running_task_finishes() {
+        let store = Arc::new(TaskStore::new());
+        let first_root = test_task("task-admission-first", "task-admission-first", None);
+        let second_root = test_task("task-admission-second", "task-admission-second", None);
+        store.insert_task(first_root.clone());
+        store.insert_task(second_root.clone());
+        let worker = WorkerInfo {
+            worker_id: WorkerId::new("worker-admission-executor"),
+            role: "executor".to_string(),
+            supported_kinds: vec![TaskKind::LocalAgent],
+            parallelism_limit: None,
+            system_prompt_template: None,
+        };
+        let controller = Arc::new(
+            crate::execution_admission::ExecutionAdmissionController::new(
+                ExecutionAdmissionLimits {
+                    max_active_tasks: 1,
+                    max_active_tasks_per_session: 1,
+                    max_active_tasks_per_role: 1,
+                    min_available_memory_bytes: 0,
+                },
+            ),
+        );
+        let dispatcher = Arc::new(HoldingDispatcher {
+            permits: Mutex::new(Vec::new()),
+        });
+        let first_runner = TaskRunner::with_dispatcher(
+            Arc::clone(&store),
+            vec![worker.clone()],
+            dispatcher.clone(),
+            Arc::new(EventBasedResultReceiver::new()),
+        )
+        .with_execution_admission(
+            Arc::clone(&controller),
+            Some(SessionId::new("session-admission-first")),
+        );
+        let second_runner = TaskRunner::with_dispatcher(
+            Arc::clone(&store),
+            vec![worker],
+            dispatcher.clone(),
+            Arc::new(EventBasedResultReceiver::new()),
+        )
+        .with_execution_admission(
+            Arc::clone(&controller),
+            Some(SessionId::new("session-admission-second")),
+        );
+
+        assert_eq!(
+            first_runner.run_cycle(&first_root.task_id),
+            RunCycleOutcome::Continue
+        );
+        let blocked = second_runner.run_cycle(&second_root.task_id);
+        assert!(matches!(
+            blocked,
+            RunCycleOutcome::Blocked { ref task_ids, ref reason }
+                if task_ids == &vec![second_root.task_id.clone()]
+                    && reason.contains("全局执行容量已满")
+        ));
+        assert_eq!(
+            store
+                .get_task(&second_root.task_id)
+                .expect("queued task should exist")
+                .status,
+            TaskStatus::Pending
+        );
+        assert!(store.get_active_lease(&second_root.task_id).is_none());
+        assert_eq!(controller.snapshot().queued_task_count, 1);
+
+        dispatcher.release_all();
+        assert_eq!(
+            second_runner.run_cycle(&second_root.task_id),
+            RunCycleOutcome::Continue
+        );
+        assert_eq!(controller.snapshot().active_task_count, 1);
     }
 }

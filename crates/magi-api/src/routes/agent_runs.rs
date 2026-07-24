@@ -81,7 +81,12 @@ struct AgentProjectionDto {
     worker_id: Option<String>,
     thread_id: Option<String>,
     execution_chain_ref: Option<String>,
+    /// 子代理任务被调度接受的权威起点；不从前端消息时间戳推断。
     started_at: magi_core::UtcMillis,
+    /// 子代理进入终态的权威时刻；运行中保持为空。
+    completed_at: Option<magi_core::UtcMillis>,
+    /// 从任务起点到终态的固定耗时；运行中保持为空。
+    response_duration_ms: Option<u64>,
     updated_at: magi_core::UtcMillis,
     result: Option<AgentProjectionResultDto>,
 }
@@ -271,6 +276,10 @@ fn agent_projection_from_task(
             ..AgentModelBinding::default()
         });
     let (status, lifecycle) = agent_runtime_status(task);
+    let completed_at = matches!(task.status, TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed)
+        .then_some(task.updated_at);
+    let response_duration_ms = completed_at
+        .map(|completed_at| completed_at.0.saturating_sub(task.created_at.0));
     AgentProjectionDto {
         agent_run_id: task.task_id.to_string(),
         parent_task_id: task
@@ -304,9 +313,9 @@ fn agent_projection_from_task(
             .map(|thread| thread.thread_id.to_string())
             .or_else(|| branch.map(|branch| branch.thread_id.to_string())),
         execution_chain_ref: execution_chain_ref.map(ToString::to_string),
-        started_at: thread
-            .map(|thread| thread.created_at)
-            .unwrap_or(task.created_at),
+        started_at: task.created_at,
+        completed_at,
+        response_duration_ms,
         updated_at: thread
             .map(|thread| thread.last_used_at)
             .unwrap_or(task.updated_at),
@@ -913,6 +922,9 @@ mod tests {
         assert_eq!(agent.model.as_deref(), Some("gpt-reviewer"));
         assert_eq!(agent.model_source, "engine");
         assert_eq!(agent.lifecycle, "completed");
+        assert_eq!(agent.started_at, UtcMillis(10));
+        assert_eq!(agent.completed_at, Some(UtcMillis(20)));
+        assert_eq!(agent.response_duration_ms, Some(10));
         assert_eq!(agent.access_profile, "read_only");
         assert_eq!(agent.parallelism_group.as_deref(), Some("review-wave"));
         assert_eq!(agent.worker_id.as_deref(), Some("worker-agent-child"));
@@ -979,6 +991,8 @@ mod tests {
             thread_id: Some("thread-response".to_string()),
             execution_chain_ref: Some("chain-response".to_string()),
             started_at: UtcMillis(1),
+            completed_at: None,
+            response_duration_ms: None,
             updated_at: UtcMillis(2),
             result: None,
         }];
@@ -1005,6 +1019,8 @@ mod tests {
             Some("inherited_orchestrator")
         );
         assert_eq!(value["agents"][0]["accessProfile"], "read_only");
+        assert!(value["agents"][0]["completedAt"].is_null());
+        assert!(value["agents"][0]["responseDurationMs"].is_null());
         assert!(value["agents"][0].get("accessMode").is_none());
     }
 

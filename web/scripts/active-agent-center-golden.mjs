@@ -95,13 +95,28 @@ await withGoldenViteServer(async (server) => {
       lifecycle: 'completed',
       startedAt: 1_000,
       updatedAt: 9_900,
+      completedAt: 9_900,
+      responseDurationMs: 8_900,
     }), 20_000),
     8,
-    '终态代理必须固定使用 updatedAt 与 startedAt 的实际耗时',
+    '终态代理必须固定使用后端投影的完成时间与总耗时',
   );
   assert.equal(center.formatAgentDuration(8), '8s');
   assert.equal(center.formatAgentDuration(68), '1m 08s');
   assert.equal(center.formatAgentDuration(3_728), '1h 02m');
+
+  assert.deepEqual(
+    center.agentRuntimeTiming(agent({
+      status: 'completed',
+      lifecycle: 'completed',
+      startedAt: 1_000,
+      updatedAt: 9_900,
+      completedAt: 9_900,
+      responseDurationMs: 8_900,
+    }), 20_000),
+    { active: false, startedAt: 1_000, completedAt: 9_900, durationMs: 8_900 },
+    '终态代理必须提供完成时刻与毫秒级总耗时，供右侧详情与主线复用同一展示组件',
+  );
 
   assert.equal(
     center.shouldPinAgentProjection('root-new', 2, 'root-old'),
@@ -147,10 +162,39 @@ assert.match(
   /openAgentTab\(/,
   '点击代理必须复用右侧面板的增量代理 Tab',
 );
+
+const agentTabContentSource = await readFile(
+  new URL('../src/components/tabs/AgentTabContent.svelte', import.meta.url),
+  'utf8',
+);
+const messageListSource = await readFile(
+  new URL('../src/components/MessageList.svelte', import.meta.url),
+  'utf8',
+);
+assert.match(
+  agentTabContentSource,
+  /runtimeCompletedAt=\{agentRuntimeCompletedAt\}[\s\S]*runtimeDurationMs=\{agentRuntimeDurationMs\}/,
+  '代理详情必须把完成时刻与总耗时传给统一消息时间线',
+);
+assert.match(
+  messageListSource,
+  /displayContext === 'task'[\s\S]*normalizedRuntimeStartedAt[\s\S]*hasRuntimeToTrack[\s\S]*runtimeActive/,
+  '任务详情即使尚未产出消息，也必须从任务开始时刻持续显示计时器',
+);
+assert.match(
+  messageListSource,
+  /shouldShowRuntimeSummary[\s\S]*normalizedRuntimeCompletedAt[\s\S]*normalizedRuntimeDurationMs[\s\S]*TurnRuntimeSummary/,
+  '任务详情必须在终态渲染与主线一致的总耗时和结束时间',
+);
 assert.match(
   activeAgentCenterSource,
   /localStorage/,
   '代理中心必须按会话持久化固定 rootTaskId 与清空标记',
+);
+assert.doesNotMatch(
+  activeAgentCenterSource,
+  /expanded\s*=\s*!mobile/,
+  '恢复已有代理任务时，悬浮面板必须保持收起，只保留入口按钮供用户主动展开',
 );
 assert.match(
   activeAgentCenterSource,

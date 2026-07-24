@@ -13,6 +13,7 @@ export interface FeedbackOptions {
   title?: string;
   source?: string;
   duration?: number;
+  presentation?: 'default' | 'toast';
 }
 
 export interface ReportIncidentOptions extends FeedbackOptions {
@@ -29,13 +30,15 @@ export function showFeedback(
   options: FeedbackOptions = {},
 ): void {
   const policy = resolveFeedbackPolicy(level);
-  if (policy.displayMode === 'silent') {
+  const forceVisible = options.presentation === 'toast';
+  if (!forceVisible && policy.displayMode === 'silent') {
     return;
   }
   addToast(level, message, options.title, {
     source: options.source,
     actionRequired: policy.actionRequired,
     duration: options.duration,
+    forceVisible,
   });
 }
 

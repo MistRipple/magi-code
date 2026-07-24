@@ -15,6 +15,7 @@
     "updater:default",
     "allow-prepare-update-restart",
     "allow-get-staged-desktop-update",
+    "allow-get-desktop-update-installability",
     "allow-stage-desktop-update",
     "allow-install-staged-desktop-update"
   ]

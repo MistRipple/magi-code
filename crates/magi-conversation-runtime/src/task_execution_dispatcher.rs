@@ -6,6 +6,7 @@ use crate::{
     ConversationRegistry, SKILL_APPLY_TOOL_NAME, active_skill_tool_execution_policy,
     build_skill_custom_tool_definitions,
     conversation_loop::{self, ConversationLoopRequest},
+    execution_admission::ExecutionAdmissionPermit,
     model_config::{
         NormalizedModelConfig, configured_role_engine_model_config,
         resolve_orchestrator_model_config,
@@ -2625,6 +2626,7 @@ impl TaskDispatcher for LlmTaskDispatcher {
         task: &magi_core::Task,
         worker: &WorkerInfo,
         lease: &magi_orchestrator::task_store::TaskLease,
+        admission_permit: ExecutionAdmissionPermit,
     ) -> Result<(), String> {
         let dispatcher = self.clone();
         let task = task.clone();
@@ -2636,6 +2638,7 @@ impl TaskDispatcher for LlmTaskDispatcher {
             let lease_id = lease.lease_id.clone();
             let join_observer = self.clone();
             let join = handle.spawn_blocking(move || {
+                let _admission_permit = admission_permit;
                 if let Err(err) = dispatcher.dispatch_inner(&task, &worker, &lease) {
                     tracing::error!("dispatch_inner failed: {}", err);
                     dispatcher.push_result(
@@ -2653,6 +2656,7 @@ impl TaskDispatcher for LlmTaskDispatcher {
             Ok(())
         } else {
             // 不在 tokio 运行时中（例如同步测试环境），直接同步执行。
+            let _admission_permit = admission_permit;
             self.dispatch_inner(&task, &worker, &lease)
         }
     }

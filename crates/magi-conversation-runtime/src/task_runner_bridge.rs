@@ -3,6 +3,7 @@
 //! WorkerInfo 仍由 magi_orchestrator::task_worker_catalog 提供；本模块持有调度 trait、
 //! 结果接收器、event-based dispatcher 与 WorkerRuntime dispatcher。
 
+use crate::execution_admission::ExecutionAdmissionPermit;
 use magi_core::{LeaseId, Task, TaskId};
 use magi_orchestrator::task_store::TaskLease;
 use magi_orchestrator::task_worker_catalog::WorkerInfo;
@@ -42,7 +43,13 @@ pub type TaskDispatchGate = dyn Fn(&Task) -> Result<TaskDispatchGateDecision, St
 /// are responsible for triggering the actual execution pipeline.  The Runner
 /// calls `dispatch` after granting a lease and marking the task as Running.
 pub trait TaskDispatcher: Send + Sync {
-    fn dispatch(&self, task: &Task, worker: &WorkerInfo, lease: &TaskLease) -> Result<(), String>;
+    fn dispatch(
+        &self,
+        task: &Task,
+        worker: &WorkerInfo,
+        lease: &TaskLease,
+        admission_permit: ExecutionAdmissionPermit,
+    ) -> Result<(), String>;
 }
 // --- Result receiver trait
 

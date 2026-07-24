@@ -22,6 +22,7 @@ use magi_bridge_client::{
 };
 use magi_conversation_runtime::{
     ConversationRegistry,
+    execution_admission::{ExecutionAdmissionController, ExecutionAdmissionSnapshot},
     session_images::SessionTurnImage,
     task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
     task_execution_registry::TaskExecutionRegistry,
@@ -128,6 +129,7 @@ pub struct RunnerManager {
     agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
     dispatcher: Option<Arc<dyn TaskDispatcher>>,
     dispatch_gate: Option<Arc<TaskDispatchGate>>,
+    execution_admission: Arc<ExecutionAdmissionController>,
     /// Shared result receiver that collects task completion/failure results
     /// pushed from the TaskStore's status-change callback.
     result_receiver: Arc<EventBasedResultReceiver>,
@@ -160,6 +162,7 @@ impl RunnerManager {
             agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
             dispatcher: Some(dispatcher),
             dispatch_gate: None,
+            execution_admission: Arc::new(ExecutionAdmissionController::default()),
             result_receiver,
             checkpoint_path: None,
             session_runner_index: Arc::new(Mutex::new(HashMap::new())),
@@ -184,7 +187,19 @@ impl RunnerManager {
         self
     }
 
-    fn build_task_runner(&self) -> TaskRunner {
+    pub fn with_execution_admission(
+        mut self,
+        execution_admission: Arc<ExecutionAdmissionController>,
+    ) -> Self {
+        self.execution_admission = execution_admission;
+        self
+    }
+
+    pub fn execution_admission_snapshot(&self) -> ExecutionAdmissionSnapshot {
+        self.execution_admission.snapshot()
+    }
+
+    fn build_task_runner(&self, session_id: Option<SessionId>) -> TaskRunner {
         let workers = self.resolved_workers();
         let dispatcher = self
             .dispatcher
@@ -197,6 +212,7 @@ impl RunnerManager {
             Arc::clone(&self.result_receiver) as Arc<dyn TaskResultReceiver>,
         );
         runner = runner.with_agent_role_registry((*self.agent_role_registry).clone());
+        runner = runner.with_execution_admission(Arc::clone(&self.execution_admission), session_id);
         if let Some(gate) = &self.dispatch_gate {
             runner = runner.with_dispatch_gate(Arc::clone(gate));
         }
@@ -277,7 +293,7 @@ impl RunnerManager {
         });
 
         let observer_session_id = session_id.clone();
-        let task_runner = self.build_task_runner();
+        let task_runner = self.build_task_runner(session_id.clone());
         let root_id = tid;
         let bg_handle = Arc::clone(&handle);
         let bg_active = Arc::clone(&handle.active);
@@ -603,6 +619,7 @@ impl RunnerManager {
             let _restart_guard = self.lock_for_restart(root_task_id).await;
             self.quiesce_for_restart(root_task_id).await;
         }
+        self.execution_admission.remove_queued_session(session_id);
         root_task_ids.len()
     }
 
@@ -636,7 +653,7 @@ impl RunnerManager {
         self.task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
-        let task_runner = self.build_task_runner();
+        let task_runner = self.build_task_runner(None);
         Ok(task_runner.run_cycle(&tid))
     }
 
@@ -645,7 +662,7 @@ impl RunnerManager {
         self.task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
-        self.build_task_runner().kill_tree(&tid)?;
+        self.build_task_runner(None).kill_tree(&tid)?;
         self.set_runner_status_if_present(root_task_id, "killed");
         Ok(())
     }
@@ -656,7 +673,7 @@ impl RunnerManager {
             .task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", task_id))?;
-        self.build_task_runner().kill_task(&tid)?;
+        self.build_task_runner(None).kill_task(&tid)?;
         self.set_runner_status_if_present(task.root_task_id.as_str(), "killed");
         Ok(())
     }
@@ -666,7 +683,7 @@ impl RunnerManager {
         self.task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
-        self.build_task_runner().resume_task(&tid)
+        self.build_task_runner(None).resume_task(&tid)
     }
 
     fn set_runner_status_if_present(&self, root_task_id: &str, status: &str) {
@@ -1296,6 +1313,14 @@ impl ApiState {
         );
         crate::dto::apply_configured_model_context_windows(&mut dto, &self.settings_store);
         dto
+    }
+
+    /// 当前 daemon 的执行准入状态。未装配任务 Runner 的最小化 API 状态不会伪造
+    /// 运行指标，调用方应将 `None` 视为执行运行时尚未初始化。
+    pub fn execution_admission_snapshot(&self) -> Option<ExecutionAdmissionSnapshot> {
+        self.runner_manager
+            .as_ref()
+            .map(RunnerManager::execution_admission_snapshot)
     }
 
     /// 从已恢复的审计/用量账本回放每会话最近一次用量观测值。
@@ -2582,6 +2607,7 @@ mod tests {
             _task: &Task,
             worker: &WorkerInfo,
             _lease: &TaskLease,
+            _admission_permit: magi_conversation_runtime::execution_admission::ExecutionAdmissionPermit,
         ) -> Result<(), String> {
             *self
                 .observed_role
@@ -2599,6 +2625,7 @@ mod tests {
             _task: &Task,
             _worker: &WorkerInfo,
             _lease: &TaskLease,
+            _admission_permit: magi_conversation_runtime::execution_admission::ExecutionAdmissionPermit,
         ) -> Result<(), String> {
             panic!("模拟 Runner 派发 panic");
         }
@@ -2657,7 +2684,7 @@ mod tests {
             ("auditor".to_string(), test_agent_role("auditor")),
         ]))));
 
-        let outcome = manager.build_task_runner().run_cycle(&root_task_id);
+        let outcome = manager.build_task_runner(None).run_cycle(&root_task_id);
 
         assert_eq!(outcome, RunCycleOutcome::Continue);
         assert_eq!(

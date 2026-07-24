@@ -9,6 +9,7 @@
   import { agentTerminalOutput, type AgentTerminalOutput } from '../../lib/agent-output';
   import { buildTimelineRenderItems } from '../../lib/timeline-render-items';
   import { getTaskDisplayGoal, getTaskDisplayText, getTaskDisplayTitle } from '../../lib/task-labels';
+  import { agentRuntimeTiming } from '../../lib/active-agent-center';
   import { messagesState } from '../../stores/messages.svelte';
   import { getAgentRunState } from '../../stores/agent-run-store.svelte';
   import { i18n } from '../../stores/i18n.svelte';
@@ -122,6 +123,18 @@
     return typeof createdAt === 'number' && Number.isFinite(createdAt) && createdAt > 0
       ? createdAt
       : assignmentTimestamp();
+  });
+
+  const agentRuntimeTimingState = $derived.by(() => (
+    agentProjection ? agentRuntimeTiming(agentProjection, Date.now()) : null
+  ));
+  const agentRuntimeCompletedAt = $derived.by(() => {
+    const timing = agentRuntimeTimingState;
+    return timing && !timing.active ? timing.completedAt : 0;
+  });
+  const agentRuntimeDurationMs = $derived.by(() => {
+    const timing = agentRuntimeTimingState;
+    return timing && !timing.active ? timing.durationMs : 0;
   });
 
   const contextRuntime = $derived.by(() => {
@@ -376,6 +389,8 @@
     displayContext="task"
     runtimeActive={agentRuntimeActive}
     runtimeStartedAt={agentRuntimeStartedAt}
+    runtimeCompletedAt={agentRuntimeCompletedAt}
+    runtimeDurationMs={agentRuntimeDurationMs}
     emptyState={{
       icon: 'clock',
       title: i18n.t('agentTab.empty.title'),

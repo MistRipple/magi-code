@@ -58,6 +58,7 @@ ignore = "0.4"
 insta = "1.41"
 dunce = "1.0.5"
 similar = "2.7.0"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 
 [profile.dev]
 # 开发态只保留行号级调试信息，避免频繁 cargo run/check 后 target 目录快速膨胀。

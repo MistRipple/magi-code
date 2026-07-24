@@ -2,6 +2,7 @@ fn main() {
     let app_manifest = tauri_build::AppManifest::new().commands(&[
         "prepare_update_restart",
         "get_staged_desktop_update",
+        "get_desktop_update_installability",
         "stage_desktop_update",
         "install_staged_desktop_update",
     ]);

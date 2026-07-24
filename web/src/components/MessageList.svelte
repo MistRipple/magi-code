@@ -6,6 +6,7 @@
   } from '../types/message';
   import MessageItem from './MessageItem.svelte';
   import TurnRuntimeIndicator from './TurnRuntimeIndicator.svelte';
+  import TurnRuntimeSummary from './TurnRuntimeSummary.svelte';
   import TurnNavigationRail from './TurnNavigationRail.svelte';
   import Icon from './Icon.svelte';
   import { tick, onDestroy } from 'svelte';
@@ -45,6 +46,10 @@
     runtimeActive?: boolean;
     /** 外部任务运行起点：右侧代理 tab 用 task.created_at 计时 */
     runtimeStartedAt?: number;
+    /** 外部任务终态时间：右侧代理 tab 与主线统一展示完成时间 */
+    runtimeCompletedAt?: number;
+    /** 外部任务总耗时：右侧代理 tab 与主线统一展示总耗时 */
+    runtimeDurationMs?: number;
   }
   let {
     taskId,
@@ -55,6 +60,8 @@
     isActive = true,
     runtimeActive = false,
     runtimeStartedAt = 0,
+    runtimeCompletedAt = 0,
+    runtimeDurationMs = 0,
   }: Props = $props();
 
   const safeRenderItems = $derived(
@@ -66,7 +73,8 @@
 
   type TimelineRenderEntry =
     | { kind: 'message'; key: string; item: TimelineRenderItem }
-    | { kind: 'runtime'; key: string };
+    | { kind: 'runtime'; key: string }
+    | { kind: 'runtime-summary'; key: string };
 
   const turnNavigationItems = $derived.by(() => {
     if (displayContext !== 'thread') return [];
@@ -104,6 +112,16 @@
     typeof runtimeStartedAt === 'number' && Number.isFinite(runtimeStartedAt)
       ? Math.max(0, Math.floor(runtimeStartedAt))
       : 0
+  );
+  const normalizedRuntimeCompletedAt = $derived(
+    typeof runtimeCompletedAt === 'number' && Number.isFinite(runtimeCompletedAt)
+      ? Math.max(0, Math.floor(runtimeCompletedAt))
+      : 0,
+  );
+  const normalizedRuntimeDurationMs = $derived(
+    typeof runtimeDurationMs === 'number' && Number.isFinite(runtimeDurationMs)
+      ? Math.max(0, Math.floor(runtimeDurationMs))
+      : 0,
   );
 
   const safeRenderMessages = $derived.by(() => activeRenderItems.map((item) => item.message));
@@ -278,11 +296,11 @@
     ) {
       return processingStartAt;
     }
-    if (!message) {
-      return 0;
-    }
     if (displayContext === 'task' && normalizedRuntimeStartedAt > 0) {
       return normalizedRuntimeStartedAt;
+    }
+    if (!message) {
+      return 0;
     }
     const timestamp = message.timestamp;
     if (typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0) {
@@ -306,7 +324,10 @@
       stableRuntimeTurnIdentity = turnIdentity;
       stableStreamingStartAt = 0;
     }
-    if (!currentRuntimeRenderItem && !awaitingCurrentTurnProjection) {
+    const hasRuntimeToTrack = displayContext === 'task'
+      ? runtimeActive
+      : Boolean(currentRuntimeRenderItem) || awaitingCurrentTurnProjection;
+    if (!hasRuntimeToTrack) {
       stableStreamingStartAt = 0;
       return;
     }
@@ -324,8 +345,18 @@
   const timerStartTime = $derived.by(() => stableStreamingStartAt);
 
   const shouldRunTimer = $derived.by(() => {
+    if (displayContext === 'task') {
+      return runtimeActive && timerStartTime > 0;
+    }
     return timerStartTime > 0 && (Boolean(currentRuntimeRenderItem) || awaitingCurrentTurnProjection);
   });
+
+  const shouldShowRuntimeSummary = $derived(
+    displayContext === 'task'
+      && !runtimeActive
+      && normalizedRuntimeCompletedAt > 0
+      && normalizedRuntimeDurationMs >= 0,
+  );
 
   const runtimeIndicatorKey = $derived(
     runtimeTurnIdentity ? `runtime-indicator:${runtimeTurnIdentity}` : ''
@@ -352,6 +383,12 @@
       item,
     }));
     if (!shouldRunTimer || !runtimeIndicatorKey) {
+      if (shouldShowRuntimeSummary) {
+        entries.push({
+          kind: 'runtime-summary',
+          key: `runtime-summary:${taskId || ''}:${normalizedRuntimeCompletedAt}:${normalizedRuntimeDurationMs}`,
+        });
+      }
       return entries;
     }
     entries.splice(runtimeIndicatorInsertionIndex, 0, {
@@ -816,7 +853,14 @@
             onEdit={() => editUserMessage(entry.item.message)}
           />
         {:else}
-          <TurnRuntimeIndicator elapsedSeconds={elapsedSeconds} />
+          {#if entry.kind === 'runtime'}
+            <TurnRuntimeIndicator elapsedSeconds={elapsedSeconds} />
+          {:else}
+            <TurnRuntimeSummary
+              durationMs={normalizedRuntimeDurationMs}
+              completedAt={normalizedRuntimeCompletedAt}
+            />
+          {/if}
         {/if}
       {/each}
     {/if}
