@@ -94,6 +94,7 @@ function createHostProxyTransport(hostApi: HostApi): AgentTransport {
     resolve: (response: Response) => void;
     reject: (error: Error) => void;
     timeoutId: number | null;
+    cleanupAbort: (() => void) | null;
   }>();
 
   // 统一 window message 监听：处理 API 代理响应 + SSE 事件
@@ -112,6 +113,7 @@ function createHostProxyTransport(hostApi: HostApi): AgentTransport {
             if (pending.timeoutId !== null) {
               window.clearTimeout(pending.timeoutId);
             }
+            pending.cleanupAbort?.();
             const headers = new Headers(msg.headers || {});
             pending.resolve(new Response(msg.body ?? '', { status: msg.status, headers }));
           }
@@ -153,15 +155,35 @@ function createHostProxyTransport(hostApi: HostApi): AgentTransport {
         }
       }
       return new Promise<Response>((resolve, reject) => {
+        const abortRequest = () => {
+          const pending = pendingRequests.get(requestId);
+          if (!pending) return;
+          pendingRequests.delete(requestId);
+          if (pending.timeoutId !== null) {
+            window.clearTimeout(pending.timeoutId);
+          }
+          pending.cleanupAbort?.();
+          pending.reject(new DOMException('The operation was aborted', 'AbortError'));
+        };
         const timeoutId = window.setTimeout(() => {
           const pending = pendingRequests.get(requestId);
           if (!pending) {
             return;
           }
           pendingRequests.delete(requestId);
+          pending.cleanupAbort?.();
           pending.reject(new Error('agent proxy request timeout'));
         }, HOST_PROXY_REQUEST_TIMEOUT_MS);
-        pendingRequests.set(requestId, { resolve, reject, timeoutId });
+        const signal = init?.signal;
+        const cleanupAbort = signal
+          ? () => signal.removeEventListener('abort', abortRequest)
+          : null;
+        pendingRequests.set(requestId, { resolve, reject, timeoutId, cleanupAbort });
+        if (signal?.aborted) {
+          abortRequest();
+          return;
+        }
+        signal?.addEventListener('abort', abortRequest, { once: true });
         hostApi.postMessage({
           type: 'agentApiProxy',
           requestId,

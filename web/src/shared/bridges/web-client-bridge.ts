@@ -43,7 +43,6 @@ import {
   getWorkspaceSessions,
   continueAgentSession,
   interruptAgentSession,
-  interruptAgentTask,
   installAgentLocalSkill,
   installAgentSkill,
   listAgentWorkspaces,
@@ -3705,10 +3704,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
 
 async function interruptTask(): Promise<void> {
   const trigger = 'user_interrupt';
-  const taskId = currentInterruptTaskId;
   const sessionId = currentSessionId.trim();
-  clearActiveTurnInFlight();
-  if (!taskId && !sessionId) {
+  if (!sessionId) {
     emitForcedProcessingIdle('user_interrupt_missing_session', { trigger });
     emitBridgeErrorToast(
       i18n.t('bridge.action.stopTask'),
@@ -3716,24 +3713,14 @@ async function interruptTask(): Promise<void> {
     );
     return;
   }
-  const idleReason = taskId ? 'user_interrupt_requested' : 'user_session_interrupt_requested';
-  // 中断请求已进入后端权威链路，前端先收敛到 idle，避免停止按钮卡死。
-  emitForcedProcessingIdle(idleReason, { trigger, taskId, sessionId });
   try {
-    if (taskId) {
-      await interruptAgentTask({ taskId });
-    } else {
-      await interruptAgentSession(sessionId);
-    }
+    await interruptAgentSession(sessionId);
+    clearActiveTurnInFlight();
+    emitForcedProcessingIdle('user_interrupt_confirmed', { trigger, sessionId });
   } catch (error) {
-    console.error('[web-client-bridge] 中断执行失败（已执行前端强制停止）:', error);
+    console.error('[web-client-bridge] 中断执行失败:', error);
     emitBridgeErrorToast(i18n.t('bridge.action.stopTask'), error);
-    emitForcedProcessingIdle('user_interrupt_failed', {
-      trigger,
-      taskId,
-      sessionId,
-      error: normalizeErrorMessage(error),
-    });
+    scheduleRecovery('user_interrupt_failed', error, true);
   }
 }
 

@@ -1422,12 +1422,6 @@ export async function submitSessionTurn(
   }
 }
 
-export async function interruptAgentTask(
-  payload: { taskId: string },
-): Promise<Record<string, unknown>> {
-  return await postBoundJson<Record<string, unknown>>('/api/agent-runs/interrupt', payload, 'interrupt agent run');
-}
-
 export async function interruptAgentSession(
   sessionId: string,
 ): Promise<Record<string, unknown>> {
@@ -1435,11 +1429,19 @@ export async function interruptAgentSession(
   if (!normalizedSessionId) {
     throw new AgentApiError(400, 'sessionId 不能为空', 'interrupt session turn');
   }
-  return await postBoundJson<Record<string, unknown>>(
-    '/api/session/interrupt',
-    { sessionId: normalizedSessionId },
-    'interrupt session turn',
-  );
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort('interrupt_request_timeout'), 10_000);
+  try {
+    return await postBoundJson<Record<string, unknown>>(
+      '/api/session/interrupt',
+      { sessionId: normalizedSessionId },
+      'interrupt session turn',
+      undefined,
+      controller.signal,
+    );
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 export async function continueAgentSession(

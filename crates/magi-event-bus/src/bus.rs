@@ -66,7 +66,6 @@ impl InMemoryEventBus {
         ) {
             self.mark_audit_usage_ledger_dirty();
         }
-        self.refresh_audit_usage_ledger_persistence_if_configured();
         // Event retention and ledger updates are already committed above. The absence of a
         // live stream subscriber should not make the bus fail closed for normal API writes.
         let _ = self.sender.send(event);
@@ -208,7 +207,6 @@ impl InMemoryEventBus {
         }
         self.clear_audit_usage_ledger_error();
         self.mark_audit_usage_ledger_dirty();
-        self.refresh_audit_usage_ledger_persistence_if_configured();
     }
 
     pub fn set_audit_usage_ledger_persistence(&self, path: impl Into<PathBuf>) {
@@ -274,10 +272,6 @@ impl InMemoryEventBus {
                 Err(error)
             }
         }
-    }
-
-    fn refresh_audit_usage_ledger_persistence_if_configured(&self) {
-        let _ = self.persist_audit_usage_ledger_if_configured();
     }
 
     fn clear_audit_usage_ledger_error(&self) {
@@ -415,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn 发布审计用量事件时会自动刷新账本落盘() {
+    fn 发布审计用量事件只标记待刷新并由显式刷新统一落盘() {
         let bus = InMemoryEventBus::new(8);
         let _receiver = bus.subscribe();
         let base = std::env::temp_dir().join(format!(
@@ -429,6 +423,11 @@ mod tests {
         bus.set_audit_usage_ledger_persistence(path.clone());
         bus.publish(event(EventCategory::Audit, "ledger.audit.recorded", 1));
         bus.publish(event(EventCategory::Usage, "ledger.usage.recorded", 2));
+
+        assert!(!path.exists());
+        assert!(bus.runtime_ledger_summary().pending_flush);
+        bus.refresh_audit_usage_ledger_persistence()
+            .expect("refresh ledger");
 
         let restored = AuditUsageLedgerSnapshot::load_from_path(&path).expect("restore ledger");
         let status = bus.audit_usage_ledger_status();
@@ -484,6 +483,7 @@ mod tests {
 
         bus.set_audit_usage_ledger_persistence(path);
         bus.publish(event(EventCategory::Audit, "ledger.audit.recorded", 1));
+        assert!(bus.refresh_audit_usage_ledger_persistence().is_err());
 
         let status = bus.audit_usage_ledger_status();
         let runtime_ledger = bus.runtime_ledger_summary();
@@ -582,6 +582,7 @@ mod tests {
 
         bus.set_audit_usage_ledger_persistence(path);
         bus.publish(event(EventCategory::Usage, "ledger.usage.recorded", 1));
+        assert!(bus.refresh_audit_usage_ledger_persistence().is_err());
 
         let status = bus.audit_usage_ledger_status();
         let runtime_ledger = bus.runtime_ledger_summary();

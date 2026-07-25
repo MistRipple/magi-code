@@ -9,15 +9,17 @@ use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_session_store::{SessionSidecarFlushMetadata, SessionStore};
 use magi_workspace::{WorkspaceRecoveryFlushMetadata, WorkspaceStore};
 use std::sync::{Arc, Mutex};
-use tokio::time::{self, Duration};
+use tokio::time::{self, Duration, MissedTickBehavior};
 use tracing::{info, warn};
 
 const RUNTIME_MAINTENANCE_INTERVAL_MILLIS: u64 = 500;
+const STANDARD_LEDGER_FLUSH_INTERVAL_MILLIS: u64 = 5_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeMaintenancePolicy {
     pub(crate) profile: DaemonMaintenancePolicyProfile,
     pub(crate) tick_interval: Duration,
+    pub(crate) ledger_flush_interval: Duration,
     pub(crate) sidecar_flush_enabled: bool,
     pub(crate) ledger_refresh_enabled: bool,
     pub(crate) eager_flush_dirty_sidecars: bool,
@@ -33,6 +35,7 @@ impl RuntimeMaintenancePolicy {
             DaemonMaintenancePolicyProfile::Standard => Self {
                 profile,
                 tick_interval: Duration::from_millis(RUNTIME_MAINTENANCE_INTERVAL_MILLIS),
+                ledger_flush_interval: Duration::from_millis(STANDARD_LEDGER_FLUSH_INTERVAL_MILLIS),
                 sidecar_flush_enabled: true,
                 ledger_refresh_enabled: true,
                 eager_flush_dirty_sidecars: false,
@@ -44,6 +47,7 @@ impl RuntimeMaintenancePolicy {
             DaemonMaintenancePolicyProfile::AggressiveFlush => Self {
                 profile,
                 tick_interval: Duration::from_millis(150),
+                ledger_flush_interval: Duration::from_secs(1),
                 sidecar_flush_enabled: true,
                 ledger_refresh_enabled: true,
                 eager_flush_dirty_sidecars: true,
@@ -55,6 +59,7 @@ impl RuntimeMaintenancePolicy {
             DaemonMaintenancePolicyProfile::PreCutoverDrain => Self {
                 profile,
                 tick_interval: Duration::from_millis(100),
+                ledger_flush_interval: Duration::from_millis(250),
                 sidecar_flush_enabled: true,
                 ledger_refresh_enabled: true,
                 eager_flush_dirty_sidecars: true,
@@ -210,10 +215,12 @@ impl RuntimeMaintenance {
 
     pub(crate) async fn run_loop(self) {
         let mut interval = time::interval(self.config.policy.tick_interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            match self.run_once() {
-                Ok(report) => {
+            let maintenance = self.clone();
+            match tokio::task::spawn_blocking(move || maintenance.run_once()).await {
+                Ok(Ok(report)) => {
                     if report.runtime_status.maintenance_mode
                         == DaemonMaintenanceMode::ShutdownComplete
                     {
@@ -221,9 +228,10 @@ impl RuntimeMaintenance {
                         break;
                     }
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     warn!(error = %error, "影子运行时维护 tick 执行失败");
                 }
+                Err(error) => warn!(error = %error, "影子运行时维护 worker 异常退出"),
             }
         }
     }
@@ -234,7 +242,7 @@ impl RuntimeMaintenance {
         let force_sidecar_flush = self.force_sidecar_flush(&state_before);
         let force_ledger_refresh = self.force_ledger_refresh(&state_before);
         let sidecar_report = self.flush_sidecars_if_due(now, force_sidecar_flush)?;
-        let ledger_report = self.refresh_ledger_if_needed(force_ledger_refresh)?;
+        let ledger_report = self.refresh_ledger_if_needed(now, force_ledger_refresh)?;
         let state_after =
             self.next_state_after_tick(now, &state_before, &sidecar_report, &ledger_report);
         let runtime_status = self.runtime_status_from_snapshot(&state_after);
@@ -363,6 +371,7 @@ impl RuntimeMaintenance {
 
     fn refresh_ledger_if_needed(
         &self,
+        now: UtcMillis,
         force_refresh: bool,
     ) -> Result<RuntimeMaintenanceStepReport, DaemonError> {
         if !self.config.policy.ledger_refresh_enabled {
@@ -373,7 +382,13 @@ impl RuntimeMaintenance {
             });
         }
         let runtime_ledger = self.event_bus.runtime_ledger_summary();
-        let should_refresh = runtime_ledger.pending_flush
+        let dirty_flush_due = runtime_ledger.pending_flush
+            && ledger_flush_due(
+                runtime_ledger.last_persisted_at,
+                now,
+                self.config.policy.ledger_flush_interval,
+            );
+        let should_refresh = dirty_flush_due
             || (self.config.policy.refresh_ledger_when_unhealthy
                 && (!runtime_ledger.is_persist_healthy
                     || runtime_ledger.last_persist_error.is_some()))
@@ -502,6 +517,17 @@ impl RuntimeMaintenance {
         state.last_tick_at = Some(report.tick_at);
         state.last_report = Some(report);
     }
+}
+
+fn ledger_flush_due(
+    last_persisted_at: Option<UtcMillis>,
+    now: UtcMillis,
+    flush_interval: Duration,
+) -> bool {
+    let Some(last_persisted_at) = last_persisted_at else {
+        return true;
+    };
+    now.0.saturating_sub(last_persisted_at.0) >= flush_interval.as_millis() as u64
 }
 
 pub(crate) fn session_sidecar_flush_due(

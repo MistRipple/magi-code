@@ -1,12 +1,56 @@
 use crate::blob_store::BlobStore;
 use crate::error::{SnapshotError, SnapshotResult};
+use crate::scan::SnapshotPathFilter;
 use crate::session::SnapshotSession;
+use crate::watcher::{DebouncedEvent, FsWatcher};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock as StdRwLock};
-use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock, broadcast, mpsc};
+
+const WORKSPACE_WATCH_EVENT_CAPACITY: usize = 2_048;
+
+struct WorkspaceWatcher {
+    _watcher: FsWatcher,
+    events: broadcast::Sender<DebouncedEvent>,
+    forwarder: tokio::task::JoinHandle<()>,
+}
+
+impl WorkspaceWatcher {
+    fn start(workspace_root: &Path, respect_gitignore: bool) -> SnapshotResult<Self> {
+        let path_filter = SnapshotPathFilter::new(workspace_root, respect_gitignore);
+        let (raw_tx, mut raw_rx) = mpsc::unbounded_channel();
+        let watcher = FsWatcher::start(
+            workspace_root,
+            Arc::new(path_filter.excluded_prefixes()),
+            raw_tx,
+        )?;
+        let (events, _) = broadcast::channel(WORKSPACE_WATCH_EVENT_CAPACITY);
+        let forward_events = events.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(event) = raw_rx.recv().await {
+                let _ = forward_events.send(event);
+            }
+        });
+        Ok(Self {
+            _watcher: watcher,
+            events,
+            forwarder,
+        })
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<DebouncedEvent> {
+        self.events.subscribe()
+    }
+}
+
+impl Drop for WorkspaceWatcher {
+    fn drop(&mut self) {
+        self.forwarder.abort();
+    }
+}
 
 /// 顶层管理：跨 session 共享 BlobStore，按 session_id 维持 SnapshotSession 实例。
 /// session_id 在 session-store 内是全局唯一键；这里额外校验 workspace_root，
@@ -19,6 +63,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 /// 便于 sync 投影（bootstrap、HTTP 同步处理器）按需取出 SnapshotSession。
 pub struct SnapshotManager {
     blob_stores: AsyncRwLock<HashMap<PathBuf, Arc<BlobStore>>>,
+    workspace_watchers: StdRwLock<HashMap<PathBuf, Arc<WorkspaceWatcher>>>,
     sessions: StdRwLock<HashMap<String, Arc<SnapshotSession>>>,
     start_lock: AsyncMutex<()>,
 }
@@ -27,6 +72,7 @@ impl SnapshotManager {
     pub fn new() -> Self {
         Self {
             blob_stores: AsyncRwLock::new(HashMap::new()),
+            workspace_watchers: StdRwLock::new(HashMap::new()),
             sessions: StdRwLock::new(HashMap::new()),
             start_lock: AsyncMutex::new(()),
         }
@@ -102,12 +148,16 @@ impl SnapshotManager {
         };
 
         let respect_gitignore = workspace_root.join(".git").is_dir();
+        let watcher_events = self
+            .workspace_watcher(&workspace_root, respect_gitignore)?
+            .subscribe();
         let session = SnapshotSession::start(
             session_id.clone(),
             workspace_root,
             blobs,
             snapshots_root,
             respect_gitignore,
+            watcher_events,
         )
         .await?;
 
@@ -116,6 +166,28 @@ impl SnapshotManager {
             .expect("snapshot sessions registry poisoned")
             .insert(session_id, session.clone());
         Ok(session)
+    }
+
+    fn workspace_watcher(
+        &self,
+        workspace_root: &Path,
+        respect_gitignore: bool,
+    ) -> SnapshotResult<Arc<WorkspaceWatcher>> {
+        if let Some(watcher) = self
+            .workspace_watchers
+            .read()
+            .expect("workspace watchers registry poisoned")
+            .get(workspace_root)
+            .cloned()
+        {
+            return Ok(watcher);
+        }
+        let watcher = Arc::new(WorkspaceWatcher::start(workspace_root, respect_gitignore)?);
+        self.workspace_watchers
+            .write()
+            .expect("workspace watchers registry poisoned")
+            .insert(workspace_root.to_path_buf(), watcher.clone());
+        Ok(watcher)
     }
 
     pub fn get_session(&self, session_id: &str) -> Option<Arc<SnapshotSession>> {
@@ -315,6 +387,37 @@ mod tests {
                 .expect("pending changes")
                 .is_empty(),
             "新 branch 当前文件树必须成为新 baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_in_same_workspace_share_one_recursive_watcher() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("shared.txt"), "base\n").expect("fixture");
+        let manager = SnapshotManager::new();
+
+        manager
+            .start_session(
+                "session-shared-watcher-a".to_string(),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("start first snapshot");
+        manager
+            .start_session(
+                "session-shared-watcher-b".to_string(),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("start second snapshot");
+
+        assert_eq!(
+            manager
+                .workspace_watchers
+                .read()
+                .expect("workspace watchers should lock")
+                .len(),
+            1
         );
     }
 }

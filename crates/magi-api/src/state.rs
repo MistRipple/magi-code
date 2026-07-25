@@ -293,7 +293,7 @@ impl RunnerManager {
         });
 
         let observer_session_id = session_id.clone();
-        let task_runner = self.build_task_runner(session_id.clone());
+        let task_runner = Arc::new(self.build_task_runner(session_id.clone()));
         let root_id = tid;
         let bg_handle = Arc::clone(&handle);
         let bg_active = Arc::clone(&handle.active);
@@ -311,11 +311,17 @@ impl RunnerManager {
                     break;
                 }
 
-                let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    task_runner.run_cycle(&root_id)
-                })) {
-                    Ok(outcome) => outcome,
-                    Err(panic_payload) => {
+                let cycle_runner = Arc::clone(&task_runner);
+                let cycle_root_id = root_id.clone();
+                let outcome = match tokio::task::spawn_blocking(move || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cycle_runner.run_cycle(&cycle_root_id)
+                    }))
+                })
+                .await
+                {
+                    Ok(Ok(outcome)) => outcome,
+                    Ok(Err(panic_payload)) => {
                         let panic_message =
                             if let Some(message) = panic_payload.downcast_ref::<&str>() {
                                 (*message).to_string()
@@ -340,6 +346,9 @@ impl RunnerManager {
                             );
                         }
                         RunCycleOutcome::Error(public_message.to_string())
+                    }
+                    Err(error) => {
+                        RunCycleOutcome::Error(format!("任务 Runner 阻塞执行线程异常退出: {error}"))
                     }
                 };
                 let cycle = bg_handle.cycle_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -569,15 +578,38 @@ impl RunnerManager {
 
     /// Signal a runner to stop.
     pub fn stop(&self, root_task_id: &str) -> Result<(), RunnerStopError> {
-        let runners = self.runners.lock().expect("runners lock should hold");
-        let handle = runners.get(root_task_id).ok_or(RunnerStopError::NotFound)?;
+        let handle = self
+            .runners
+            .lock()
+            .expect("runners lock should hold")
+            .get(root_task_id)
+            .cloned()
+            .ok_or(RunnerStopError::NotFound)?;
         if !handle.active.load(Ordering::Relaxed) {
             return Err(RunnerStopError::NotRunning);
         }
+        self.signal_runner_stop(&handle);
+        Ok(())
+    }
+
+    fn signal_stop_if_present(&self, root_task_id: &str) -> bool {
+        let handle = self
+            .runners
+            .lock()
+            .expect("runners lock should hold")
+            .get(root_task_id)
+            .cloned();
+        let Some(handle) = handle else {
+            return false;
+        };
+        self.signal_runner_stop(&handle);
+        true
+    }
+
+    fn signal_runner_stop(&self, handle: &RunnerHandle) {
         handle.cancel.store(true, Ordering::Relaxed);
         let mut status = handle.status.lock().expect("status lock should hold");
         *status = "killed".to_string();
-        Ok(())
     }
 
     /// Bind a session to a root task so that when the session closes the
@@ -662,6 +694,7 @@ impl RunnerManager {
         self.task_store
             .get_task(&tid)
             .ok_or_else(|| format!("任务不存在: {}", root_task_id))?;
+        self.signal_stop_if_present(root_task_id);
         self.build_task_runner(None).kill_tree(&tid)?;
         self.set_runner_status_if_present(root_task_id, "killed");
         Ok(())
@@ -2693,6 +2726,56 @@ mod tests {
                 .expect("observed role lock should not poison")
                 .as_deref(),
             Some("auditor")
+        );
+    }
+
+    #[test]
+    fn kill_tree_signals_active_runner_before_updating_task_tree() {
+        let store = Arc::new(TaskStore::new());
+        let mut root_task = task_with_status("task-runner-interrupt", TaskStatus::Running);
+        root_task.root_task_id = root_task.task_id.clone();
+        store.insert_task(root_task);
+        let manager = RunnerManager::with_dispatcher_and_worker_catalog(
+            store.clone(),
+            Arc::new(SessionStore::new()),
+            Arc::new(Vec::new),
+            Arc::new(RecordingDispatcher {
+                observed_role: Arc::new(Mutex::new(None)),
+            }),
+            Arc::new(EventBasedResultReceiver::new()),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicBool::new(true));
+        manager.runners.lock().expect("runners should lock").insert(
+            "task-runner-interrupt".to_string(),
+            Arc::new(RunnerHandle {
+                cancel: cancel.clone(),
+                active,
+                cycle_count: Arc::new(AtomicU64::new(1)),
+                status: Arc::new(Mutex::new("running".to_string())),
+                last_error: Arc::new(Mutex::new(None)),
+                join_handle: Mutex::new(None),
+            }),
+        );
+
+        manager
+            .kill_tree("task-runner-interrupt")
+            .expect("kill tree should succeed");
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(
+            manager
+                .status("task-runner-interrupt")
+                .expect("runner status should remain observable")
+                .status,
+            "killed"
+        );
+        assert_eq!(
+            store
+                .get_task(&TaskId::new("task-runner-interrupt"))
+                .expect("root task should remain")
+                .status,
+            TaskStatus::Killed
         );
     }
 

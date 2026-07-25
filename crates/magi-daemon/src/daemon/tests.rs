@@ -1529,6 +1529,7 @@ fn runtime_maintenance_policy_can_skip_disabled_actions() {
             policy: RuntimeMaintenancePolicy {
                 profile: DaemonMaintenancePolicyProfile::Standard,
                 tick_interval: Duration::from_millis(1),
+                ledger_flush_interval: Duration::from_millis(1),
                 sidecar_flush_enabled: false,
                 ledger_refresh_enabled: false,
                 eager_flush_dirty_sidecars: false,

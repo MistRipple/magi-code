@@ -68,7 +68,6 @@ import type {
   SkillsConfigSaveResponseDto,
   SkillsLibraryResponseDto,
   SkillUpdateResponseDto,
-  TaskInterruptResponseDto,
   AgentRunProjectionDto,
   UpdatedResponseDto,
   VersionHandshakeDto,
@@ -138,12 +137,6 @@ export class RustDaemonClient {
     request: SessionInterruptRequestDto,
   ): Promise<SessionInterruptResponseDto> {
     return this.postJson<SessionInterruptResponseDto>('/api/session/interrupt', request);
-  }
-
-  public async interruptAgentRun(
-    request: unknown,
-  ): Promise<TaskInterruptResponseDto> {
-    return this.postJson<TaskInterruptResponseDto>('/api/agent-runs/interrupt', request);
   }
 
   // ─── Session management ───────────────────────────────────────────

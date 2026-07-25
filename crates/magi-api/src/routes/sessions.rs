@@ -3226,6 +3226,15 @@ async fn interrupt_session_turn(
         Vec::new()
     };
 
+    if interrupted
+        && let Some(chain) = state.session_store.active_execution_chain(&session_id)
+        && let Some(manager) = state.runner_manager()
+    {
+        manager
+            .kill_tree(chain.root_task_id.as_str())
+            .map_err(|error| ApiError::internal_assembly("中断活动任务树失败", error))?;
+    }
+
     let cancelled_tool_process_count = if interrupted {
         state.cancel_active_tool_executions(Some(&session_id), None, None)
     } else {

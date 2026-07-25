@@ -11,13 +11,11 @@
   } from '../stores/messages.svelte';
   import { canGuideQueuedMessage } from '../lib/queued-message-guidance';
   import type { QueuedMessage } from '../types/message';
-  import { getAgentRunState, refreshAgentRunProjection } from '../stores/agent-run-store.svelte';
-  import { RustDaemonClient } from '../shared/rust-daemon-client';
+  import { getAgentRunState } from '../stores/agent-run-store.svelte';
   import {
     enhanceAgentPrompt,
     fetchAgentModelList,
     getAgentSettingsBootstrap,
-    resolveAgentBaseUrl,
     saveAgentModelContextWindow,
     saveAgentOrchestratorSessionConfig,
     fetchWorkspaceBranches,
@@ -1290,27 +1288,6 @@
     if (stopLoading) return;
     stopLoading = true;
     try {
-      if (shouldInterruptAgentRunFromComposer) {
-        const projection = agentRunState.projection;
-        const sessionId = currentSessionId?.trim();
-        const rootTaskId = projection?.root_task.task_id ?? agentRunState.rootTaskId;
-        if (sessionId && rootTaskId) {
-          const client = new RustDaemonClient(resolveAgentBaseUrl());
-          await client.interruptAgentRun({
-            taskId: rootTaskId,
-            sessionId,
-            workspaceId: currentWorkspaceId?.trim() || undefined,
-            workspacePath: currentWorkspacePath?.trim() || undefined,
-          });
-          await refreshAgentRunProjection(
-            sessionId,
-            currentWorkspaceId?.trim() || undefined,
-            currentWorkspacePath?.trim() || undefined,
-          );
-          addToast('info', i18n.t('input.stopTaskSaved'));
-        }
-        return;
-      }
       vscode.postMessage({ type: 'interruptTask' });
     } catch (err) {
       console.warn('[InputArea] stop task failed:', err);

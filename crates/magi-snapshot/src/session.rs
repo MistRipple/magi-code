@@ -10,12 +10,12 @@ use crate::tool_hook::{ToolHook, ToolHookCtx};
 use crate::types::{
     ChangeEvent, ChangeKind, ContentKind, FileMeta, PendingChange, SourceKind, SymlinkTargetKind,
 };
-use crate::watcher::{DebouncedEvent, DebouncedKind, FsWatcher};
+use crate::watcher::{DebouncedEvent, DebouncedKind};
 use similar::TextDiff;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 /// 单个 session 的快照账本。线程安全，可被 AppState 共享。
 pub struct SnapshotSession {
@@ -33,7 +33,7 @@ pub struct SnapshotSession {
     /// 当前正在执行中的工具调用。串行执行时 watcher 事件可直接归因；并发执行时仅按声明路径精确归因。
     active_tool_ctxs: RwLock<HashMap<String, ToolHookCtx>>,
     path_filter: SnapshotPathFilter,
-    _watcher: tokio::sync::Mutex<Option<FsWatcher>>,
+    watcher_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl SnapshotSession {
@@ -44,6 +44,7 @@ impl SnapshotSession {
         blobs: Arc<BlobStore>,
         snapshots_root: PathBuf,
         respect_gitignore: bool,
+        mut watcher_events: broadcast::Receiver<DebouncedEvent>,
     ) -> SnapshotResult<Arc<Self>> {
         if !workspace_root.is_absolute() {
             return Err(SnapshotError::InvalidRoot(format!(
@@ -86,7 +87,7 @@ impl SnapshotSession {
             last_event: RwLock::new(HashMap::new()),
             active_tool_ctxs: RwLock::new(HashMap::new()),
             path_filter,
-            _watcher: tokio::sync::Mutex::new(None),
+            watcher_task: tokio::sync::Mutex::new(None),
         });
 
         // baseline 不存在时（首次启动），执行首次扫描并填充。
@@ -104,30 +105,39 @@ impl SnapshotSession {
             session.reconcile()?;
         }
 
-        // 启动 watcher。
-        let (tx, mut rx) = mpsc::unbounded_channel::<DebouncedEvent>();
-        let excluded = Arc::new(session.path_filter.excluded_prefixes());
-        let watcher = FsWatcher::start(&workspace_root, excluded, tx)?;
-        {
-            let mut guard = session._watcher.lock().await;
-            *guard = Some(watcher);
-        }
-
         let weak = Arc::downgrade(&session);
-        tokio::spawn(async move {
-            while let Some(ev) = rx.recv().await {
-                let Some(s) = weak.upgrade() else { break };
-                let _ = s.handle_watcher_event(ev);
+        let watcher_task = tokio::spawn(async move {
+            loop {
+                match watcher_events.recv().await {
+                    Ok(event) => {
+                        let Some(session) = weak.upgrade() else {
+                            break;
+                        };
+                        let _ = tokio::task::spawn_blocking(move || {
+                            session.handle_watcher_event(event)
+                        })
+                        .await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(session) = weak.upgrade() else {
+                            break;
+                        };
+                        let _ = tokio::task::spawn_blocking(move || session.reconcile()).await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
         });
+        *session.watcher_task.lock().await = Some(watcher_task);
 
         Ok(session)
     }
 
     /// 关闭 watcher，停止接收新事件。事件日志与 baseline 保留。
     pub async fn archive(&self) {
-        let mut guard = self._watcher.lock().await;
-        *guard = None;
+        if let Some(task) = self.watcher_task.lock().await.take() {
+            task.abort();
+        }
     }
 
     /// 删除 session：停 watcher、清 baseline/events/refs、释放 blob 引用。
