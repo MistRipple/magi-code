@@ -44,7 +44,7 @@ use crate::{
     errors::ApiError,
     session_continue::{
         SessionContinueAccepted, active_execution_branch_is_continue_recoverable,
-        continue_execution_chain,
+        continue_execution_chain, continue_execution_chain_with_pre_resume,
     },
     state::{ApiState, QueuedRegularSessionTurn},
     task_dispatch::DispatchSubmissionAccepted,
@@ -185,15 +185,19 @@ async fn submit_session_turn(
                 .requested_session_id()
                 .ok_or_else(|| ApiError::InvalidInput("继续会话需要明确的 session".to_string()))?;
             require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
-            // S1：user 信号经 Conversation Mailbox 入栈，下游一律读 signal.* 不再读 request.*
-            let signal = super::ingest_user_input_to_conversation(
-                &state,
-                &session_id,
-                &request,
-                accepted_at,
-            );
+            let (accepted, signal) =
+                continue_execution_chain_with_pre_resume(&state, &session_id, &[], || {
+                    // S1：user 信号与恢复 runner 在同一个 session 临界区内串行提交，
+                    // 下游一律读 signal.*，不再读 request.*。
+                    Ok(super::ingest_user_input_to_conversation(
+                        &state,
+                        &session_id,
+                        &request,
+                        accepted_at,
+                    ))
+                })
+                .await?;
             let prompt_text = signal.text.clone();
-            let accepted = continue_execution_chain(&state, &session_id, &[]).await?;
             let (_, orchestrator_thread_id) =
                 state
                     .session_store
@@ -487,7 +491,45 @@ fn decide_session_turn_with_task_planner(
         .as_ref()
         .map(|session_id| session_has_recoverable_chain(state, session_id))
         .unwrap_or(false);
+    let has_recovery_ready_interruption = requested_session_id.as_ref().is_some_and(|session_id| {
+        state
+            .session_store
+            .has_recovery_ready_interruption(session_id)
+    });
+    let has_claimed_interrupted_recovery =
+        requested_session_id.as_ref().is_some_and(|session_id| {
+            state
+                .session_store
+                .has_claimed_interrupted_recovery(session_id)
+        });
     let requests_continuation = session_turn_requests_continue_existing_task(request);
+    if has_claimed_interrupted_recovery {
+        return Err(ApiError::conflict(
+            "恢复异常中断会话失败",
+            "当前会话的恢复正在启动，请等待本轮恢复完成",
+        ));
+    }
+    if has_recovery_ready_interruption && request.replace_turn_id().is_none() {
+        if !has_recoverable_chain {
+            return Err(ApiError::internal_assembly(
+                "恢复异常中断会话失败",
+                "恢复提示存在，但执行链没有可继续的 branch",
+            ));
+        }
+        return Ok(SessionTurnIntentDecision {
+            route: SessionTurnRouteDto::Continue,
+            task_title: None,
+            execution_goal: None,
+            task_tier: TaskTier::ExecutionChain,
+            tool_intent: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            confidence: 1.0,
+            reason_code: Some("interrupted_recovery_ready".to_string()),
+            route_reason: Some("当前会话存在待接管的异常中断执行链。".to_string()),
+            task_evidence: Vec::new(),
+        });
+    }
     if has_recoverable_chain
         && requests_continuation
         && !session_turn_requests_image_generation_by_local_rules(request)
@@ -2961,6 +3003,7 @@ fn turn_status_is_interruptible(status: &str) -> bool {
             | "success"
             | "failed"
             | "error"
+            | "interrupted"
             | "cancelled"
             | "canceled"
             | "superseded"
@@ -3343,12 +3386,17 @@ async fn continue_session(
         request.requested_workspace_path(),
     )?;
     require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
-    let prompt_text = request
+    let requested_prompt_text = request
         .prompt_text
         .as_deref()
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_string);
+    let interrupted_recovery_requested = state
+        .session_store
+        .has_recovery_ready_interruption(&session_id);
+    let prompt_text = requested_prompt_text
+        .or_else(|| interrupted_recovery_requested.then(|| "继续执行中断的任务".to_string()));
     let request_id = trimmed_non_empty(request.request_id.as_deref()).map(str::to_string);
     let user_message_id = trimmed_non_empty(request.user_message_id.as_deref()).map(str::to_string);
     let placeholder_message_id =
@@ -4699,6 +4747,104 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_recovery_routes_any_next_input_to_continue_without_keyword_matching() {
+        let state = test_state();
+        let session_id = SessionId::new("session-interrupted-recovery-route");
+        let mission_id = MissionId::new("mission-interrupted-recovery-route");
+        let root_task_id = TaskId::new("task-root-interrupted-recovery-route");
+        let branch_task_id = TaskId::new("task-branch-interrupted-recovery-route");
+        let now = UtcMillis::now();
+        state
+            .session_store
+            .create_session(session_id.clone(), "异常中断恢复路由")
+            .expect("session should create");
+
+        let mut root_task = test_root_task(root_task_id.as_str(), mission_id.as_str());
+        root_task.status = TaskStatus::Failed;
+        state
+            .task_store()
+            .expect("task store should exist")
+            .insert_task(root_task);
+        let mut branch_task = test_root_task(branch_task_id.as_str(), mission_id.as_str());
+        branch_task.root_task_id = root_task_id.clone();
+        branch_task.status = TaskStatus::Failed;
+        state
+            .task_store()
+            .expect("task store should exist")
+            .insert_task(branch_task);
+
+        let turn = ActiveExecutionTurn {
+            turn_id: "turn-interrupted-recovery-route".to_string(),
+            turn_seq: now.0,
+            accepted_at: now,
+            status: "running".to_string(),
+            completed_at: None,
+            user_message: Some("原始任务".to_string()),
+            items: Vec::new(),
+        };
+        state
+            .session_store
+            .accept_active_execution_chain_with_timeline_entry(
+                session_id.clone(),
+                TimelineEntryInput::new(
+                    "timeline-interrupted-recovery-route",
+                    TimelineEntryKind::UserMessage,
+                    "原始任务",
+                    now,
+                ),
+                magi_session_store::ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id,
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-interrupted-recovery-route".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![branch_task_id.clone()],
+                    active_worker_bindings: vec![WorkerId::new("worker-interrupted-recovery")],
+                    branches: vec![magi_session_store::ActiveExecutionBranch {
+                        task_id: branch_task_id,
+                        worker_id: WorkerId::new("worker-interrupted-recovery"),
+                        stage: "execute".to_string(),
+                        lease_id: None,
+                        execution_intent_ref: None,
+                        binding_lifecycle: None,
+                        checkpoint_stage: Some("execute".to_string()),
+                        next_step_index: Some(0),
+                        checkpoint_at: Some(now),
+                        resume_mode: Some("resume".to_string()),
+                        resume_token: Some("recovery-route".to_string()),
+                        use_tools: true,
+                        skill_name: None,
+                        is_primary: true,
+                        thread_id: ThreadId::new("thread-interrupted-recovery-route"),
+                    }],
+                    recovery_ref: None,
+                    dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "timeline-interrupted-recovery-route".to_string(),
+                        trimmed_text: Some("原始任务".to_string()),
+                        skill_name: None,
+                    },
+                    current_turn: Some(turn),
+                },
+            )
+            .expect("active execution chain should persist");
+        state
+            .session_store
+            .interrupt_current_turn_by_daemon_restart(&session_id)
+            .expect("daemon restart interruption should persist");
+
+        let mut request = session_turn_request("先补充一个新的约束，再继续处理");
+        request.session_id = Some(session_id.to_string());
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("recovery-ready session should route without keyword matching");
+        assert!(matches!(decision.route, SessionTurnRouteDto::Continue));
+        assert_eq!(
+            decision.reason_code.as_deref(),
+            Some("interrupted_recovery_ready")
+        );
+    }
+
+    #[test]
     fn session_turn_routing_does_not_require_model_bridge_for_plain_message() {
         let state = test_state();
         let request = session_turn_request("你好，解释一下当前状态");
@@ -5473,7 +5619,7 @@ mod tests {
     }
 
     #[test]
-    fn continue_user_message_opens_new_running_turn_after_terminal_turn() {
+    fn continue_user_message_opens_new_running_turn_after_interrupted_turn() {
         let state = test_state();
         let session_id = SessionId::new("session-continue-new-turn");
         let mission_id = MissionId::new("mission-continue-new-turn");
@@ -5489,16 +5635,16 @@ mod tests {
             .upsert_current_turn(
                 session_id.clone(),
                 ActiveExecutionTurn {
-                    turn_id: "turn-old-failed".to_string(),
+                    turn_id: "turn-old-interrupted".to_string(),
                     turn_seq: 1,
                     accepted_at: now,
-                    status: "failed".to_string(),
+                    status: "interrupted".to_string(),
                     completed_at: Some(now),
                     user_message: Some("旧任务".to_string()),
                     items: Vec::new(),
                 },
             )
-            .expect("failed turn should persist");
+            .expect("interrupted turn should persist");
 
         let accepted = SessionContinueAccepted {
             session_id: session_id.clone(),
@@ -5529,7 +5675,7 @@ mod tests {
             .and_then(|sidecar| sidecar.current_turn)
             .expect("current turn should exist");
         assert_eq!(turn.status, "running");
-        assert_ne!(turn.turn_id, "turn-old-failed");
+        assert_ne!(turn.turn_id, "turn-old-interrupted");
         assert_eq!(turn.user_message.as_deref(), Some("继续推进"));
         assert_eq!(turn.items.len(), 1);
         assert_eq!(turn.items[0].task_id.as_ref(), Some(&action_task_id));

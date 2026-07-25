@@ -28,6 +28,7 @@
     filePreviewScope?: FilePreviewScope;
     canEdit?: boolean;
     onEdit?: () => void;
+    onContinueInterrupted?: () => void;
   }
   let {
     message,
@@ -36,14 +37,30 @@
     filePreviewScope = undefined,
     canEdit = false,
     onEdit = undefined,
+    onContinueInterrupted = undefined,
   }: Props = $props();
 
   let copied = $state(false);
+  let interruptedRecoverySubmitting = $state(false);
   let copiedResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function handleInterruptedRecoveryStatus(event: Event): void {
+    const status = (event as CustomEvent<{ status?: unknown }>).detail?.status;
+    if (status === 'failed') {
+      interruptedRecoverySubmitting = false;
+    }
+  }
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('magi:interruptedRecoveryContinueStatus', handleInterruptedRecoveryStatus);
+  }
 
   onDestroy(() => {
     if (copiedResetTimer) {
       clearTimeout(copiedResetTimer);
+    }
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('magi:interruptedRecoveryContinueStatus', handleInterruptedRecoveryStatus);
     }
   });
 
@@ -261,6 +278,19 @@
   // 子任务卡片消息，作为独立消息存在
   // 通知类型和对应的图标/颜色（使用 Message 类型中的 noticeType）
   const noticeType = $derived(message.noticeType || 'info');
+  const noticeKind = $derived(
+    typeof message.metadata?.noticeKind === 'string' ? message.metadata.noticeKind : '',
+  );
+  const recoveryState = $derived(
+    typeof message.metadata?.recoveryState === 'string' ? message.metadata.recoveryState : '',
+  );
+  const isInterruptedRecoveryNotice = $derived(noticeKind === 'session_interrupted');
+  const canContinueInterrupted = $derived(
+    isInterruptedRecoveryNotice
+      && recoveryState === 'ready'
+      && !interruptedRecoverySubmitting
+      && typeof onContinueInterrupted === 'function',
+  );
   const noticeIcons: Record<string, IconName> = {
     success: 'check-circle',
     error: 'x-circle',
@@ -307,18 +337,40 @@
     previewImageUrl = '';
   }
 
+  function continueInterruptedSession(): void {
+    if (!canContinueInterrupted) return;
+    interruptedRecoverySubmitting = true;
+    onContinueInterrupted?.();
+  }
+
 </script>
 
 <!-- 系统通知消息：居中显示（必须有实际文本内容才渲染） -->
 {#if isNotice && noticeText && noticeText.trim()}
-  <div class="system-notice {noticeType}" data-message-id={message.id} data-turn-id={messageTurnId || undefined}>
-    <span class="notice-icon" style="color: {noticeColors[noticeType] || noticeColors.info}">
-      <Icon name={noticeIcons[noticeType] || 'info'} size={14} />
-    </span>
-    <span class="notice-text">
-      <ErrorDetailPopover text={noticeText} maxInlineChars={96} />
-    </span>
-    <span class="notice-time">{formatTraceableTime(message.timestamp)}</span>
+  <div
+    class="system-notice {noticeType}"
+    class:interrupted-recovery={isInterruptedRecoveryNotice}
+    data-message-id={message.id}
+    data-turn-id={messageTurnId || undefined}
+    data-recovery-state={isInterruptedRecoveryNotice ? recoveryState : undefined}
+  >
+    {#if isInterruptedRecoveryNotice}
+      <span class="notice-text">{noticeText}</span>
+      <button
+        type="button"
+        class="interrupted-recovery-link"
+        disabled={!canContinueInterrupted}
+        onclick={continueInterruptedSession}
+      >继续</button>
+    {:else}
+      <span class="notice-icon" style="color: {noticeColors[noticeType] || noticeColors.info}">
+        <Icon name={noticeIcons[noticeType] || 'info'} size={14} />
+      </span>
+      <span class="notice-text">
+        <ErrorDetailPopover text={noticeText} maxInlineChars={96} />
+      </span>
+      <span class="notice-time">{formatTraceableTime(message.timestamp)}</span>
+    {/if}
   </div>
 <!-- 用户消息：简洁显示 -->
 {:else if isUser}
@@ -484,6 +536,33 @@
   .system-notice.success { color: var(--success); }
   .system-notice.warning { color: var(--warning); }
   .system-notice.error { color: var(--error); }
+  .system-notice.interrupted-recovery {
+    justify-content: flex-start;
+    width: auto;
+    max-width: none;
+    margin: 2px var(--space-4);
+    padding: 4px 0;
+  }
+  .interrupted-recovery-link {
+    appearance: none;
+    border: 0;
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    cursor: pointer;
+  }
+  .interrupted-recovery-link:hover:not(:disabled),
+  .interrupted-recovery-link:focus-visible:not(:disabled) {
+    text-decoration-thickness: 2px;
+  }
+  .interrupted-recovery-link:disabled {
+    opacity: 0.5;
+    cursor: default;
+    text-decoration: none;
+  }
   .notice-icon {
     display: flex;
     flex-shrink: 0;

@@ -1695,7 +1695,7 @@ impl DaemonRuntime {
     }
 
     fn fail_interrupted_session_task_chains(&self, task_store: &TaskStore) -> usize {
-        let root_task_ids = self
+        let interrupted_chains = self
             .session_store
             .runtime_sidecars()
             .into_iter()
@@ -1717,12 +1717,14 @@ impl DaemonRuntime {
                             matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
                         })
                     });
-                (turn_is_active || has_in_memory_task).then_some(chain.root_task_id)
+                (turn_is_active || has_in_memory_task)
+                    .then_some((sidecar.session_id, chain.root_task_id))
             })
             .collect::<HashSet<_>>();
 
         let mut failed_count = 0usize;
-        for root_task_id in root_task_ids {
+        let mut interrupted_turn_count = 0usize;
+        for (session_id, root_task_id) in interrupted_chains {
             for task_id in task_store.collect_subtree_ids(&root_task_id) {
                 let Some(task) = task_store.get_task(&task_id) else {
                     continue;
@@ -1735,8 +1737,21 @@ impl DaemonRuntime {
                     failed_count += 1;
                 }
             }
+            match self
+                .session_store
+                .interrupt_current_turn_by_daemon_restart(&session_id)
+            {
+                Ok(Some(_)) => interrupted_turn_count += 1,
+                Ok(None) => {}
+                Err(error) => warn!(
+                    ?error,
+                    %session_id,
+                    %root_task_id,
+                    "收敛 daemon 重启中断轮次失败"
+                ),
+            }
         }
-        failed_count
+        failed_count.saturating_add(interrupted_turn_count)
     }
 
     fn flush_reconciled_runtime_sidecars(&self, warning: &'static str) {

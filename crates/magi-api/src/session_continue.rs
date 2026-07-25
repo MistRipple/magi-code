@@ -20,9 +20,56 @@ use magi_core::{
     WorkerId,
 };
 use magi_orchestrator::ExecutionWritebackPlans;
-use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain};
+use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain, SessionStore};
 use magi_settings_store::SettingsStore;
 use std::sync::Arc;
+
+struct InterruptedRecoveryClaimGuard {
+    session_store: SessionStore,
+    session_id: SessionId,
+    turn_id: Option<String>,
+    committed: bool,
+}
+
+impl InterruptedRecoveryClaimGuard {
+    fn claim(session_store: &SessionStore, session_id: &SessionId) -> Result<Self, ApiError> {
+        let turn_id = session_store
+            .claim_interrupted_recovery(session_id)
+            .map_err(|error| ApiError::conflict("继续会话失败", &error.to_string()))?;
+        Ok(Self {
+            session_store: session_store.clone(),
+            session_id: session_id.clone(),
+            turn_id,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for InterruptedRecoveryClaimGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let Some(turn_id) = self.turn_id.as_deref() else {
+            return;
+        };
+        if let Err(error) = self
+            .session_store
+            .release_interrupted_recovery_claim(&self.session_id, turn_id)
+        {
+            tracing::error!(
+                ?error,
+                session_id = %self.session_id,
+                turn_id,
+                "释放异常中断恢复领取权失败"
+            );
+        }
+    }
+}
 
 // 对 routes/sessions.rs 暴露继续会话所需的 runtime 数据载体与判定函数。
 pub(crate) use magi_conversation_runtime::execution_chain_recovery::{
@@ -86,6 +133,25 @@ pub(crate) async fn continue_execution_chain(
     session_id: &SessionId,
     requested_agent_ids: &[WorkerId],
 ) -> Result<SessionContinueAccepted, ApiError> {
+    let (accepted, ()) =
+        continue_execution_chain_with_pre_resume(state, session_id, requested_agent_ids, || Ok(()))
+            .await?;
+    Ok(accepted)
+}
+
+/// 在持有 session 生命周期锁且领取恢复权后、启动新 runner 前写入本轮用户信号。
+///
+/// 这使“用户输入接管中断任务”和“启动恢复 runner”属于同一个串行临界区，避免双击
+/// 恢复链接或多个窗口同时提交时把第二条输入遗留到错误执行链中。
+pub(crate) async fn continue_execution_chain_with_pre_resume<T, F>(
+    state: &ApiState,
+    session_id: &SessionId,
+    requested_agent_ids: &[WorkerId],
+    prepare_input: F,
+) -> Result<(SessionContinueAccepted, T), ApiError>
+where
+    F: FnOnce() -> Result<T, ApiError>,
+{
     if state.session_store.session(session_id).is_none() {
         return Err(ApiError::session_not_found(session_id.as_str()));
     }
@@ -301,6 +367,9 @@ pub(crate) async fn continue_execution_chain(
         }
     })?;
 
+    let recovery_claim = InterruptedRecoveryClaimGuard::claim(&state.session_store, session_id)?;
+    let prepared_input = prepare_input()?;
+
     // resume 入口幂等地保证 orchestrator thread 存在：
     //  * 已存在 → 直接复用 (同 session 同 mission 同 orchestrator thread 不变量)；
     //  * 不存在 → 用 chain.mission_id spawn 新 thread。
@@ -389,7 +458,7 @@ pub(crate) async fn continue_execution_chain(
         }
     }
 
-    Ok(SessionContinueAccepted {
+    let accepted = SessionContinueAccepted {
         session_id: session_id.clone(),
         mission_id: chain.mission_id,
         root_task_id: chain.root_task_id,
@@ -397,5 +466,7 @@ pub(crate) async fn continue_execution_chain(
         execution_chain_ref: chain.execution_chain_ref,
         resumed_branch_count: branches_to_resume.len(),
         runner_started: true,
-    })
+    };
+    recovery_claim.commit();
+    Ok((accepted, prepared_input))
 }

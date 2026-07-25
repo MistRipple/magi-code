@@ -17,7 +17,13 @@ use std::collections::{HashMap, HashSet};
 
 const TURN_INTERRUPTION_SOURCE_METADATA_KEY: &str = "interruptionSource";
 const TURN_INTERRUPTION_SOURCE_USER: &str = "user";
+const TURN_INTERRUPTION_SOURCE_DAEMON_RESTART: &str = "daemon_restart";
 const TURN_INTERRUPTED_AT_METADATA_KEY: &str = "interruptedAt";
+const INTERRUPTION_NOTICE_KIND: &str = "session_interrupted";
+const INTERRUPTION_NOTICE_TEXT: &str = "当前对话发生异常中断，是否继续？";
+const RECOVERY_STATE_METADATA_KEY: &str = "recoveryState";
+const RECOVERY_STATE_READY: &str = "ready";
+const RECOVERY_STATE_CLAIMED: &str = "claimed";
 const TURN_REPLACES_TURN_ID_METADATA_KEY: &str = "replacesTurnId";
 const TURN_SUPERSEDED_AT_METADATA_KEY: &str = "supersededAt";
 const TURN_SUPERSEDED_REASON_METADATA_KEY: &str = "supersededReason";
@@ -51,6 +57,7 @@ fn current_turn_status_is_terminal(status: &str) -> bool {
             | "success"
             | "failed"
             | "error"
+            | "interrupted"
             | "blocked"
             | "cancelled"
             | "canceled"
@@ -80,6 +87,7 @@ fn terminal_item_status_for_turn_status(status: &str) -> Option<&'static str> {
         "completed" | "complete" | "succeeded" | "success" => Some("completed"),
         "blocked" => Some("blocked"),
         "failed" | "error" => Some("failed"),
+        "interrupted" => Some("cancelled"),
         "cancelled" | "canceled" | "killed" => Some("cancelled"),
         _ => None,
     }
@@ -93,6 +101,7 @@ fn canonical_current_turn_status(status: &str) -> DomainResult<CanonicalTurnStat
         "completed" | "complete" | "succeeded" | "success" => Ok(CanonicalTurnStatus::Completed),
         "blocked" => Ok(CanonicalTurnStatus::Blocked),
         "failed" | "error" => Ok(CanonicalTurnStatus::Failed),
+        "interrupted" => Ok(CanonicalTurnStatus::Interrupted),
         "cancelled" | "canceled" | "killed" => Ok(CanonicalTurnStatus::Cancelled),
         "superseded" => Ok(CanonicalTurnStatus::Superseded),
         _ => Err(DomainError::InvalidState {
@@ -115,6 +124,7 @@ fn canonical_current_turn_item_status(status: &str) -> DomainResult<CanonicalTur
         CanonicalTurnStatus::Completed => CanonicalTurnItemStatus::Completed,
         CanonicalTurnStatus::Blocked => CanonicalTurnItemStatus::Blocked,
         CanonicalTurnStatus::Failed => CanonicalTurnItemStatus::Failed,
+        CanonicalTurnStatus::Interrupted => CanonicalTurnItemStatus::Cancelled,
         CanonicalTurnStatus::Cancelled => CanonicalTurnItemStatus::Cancelled,
         CanonicalTurnStatus::Superseded => CanonicalTurnItemStatus::Cancelled,
     })
@@ -127,6 +137,7 @@ fn terminal_item_status_for_canonical_turn_status(
         CanonicalTurnStatus::Completed => Some(CanonicalTurnItemStatus::Completed),
         CanonicalTurnStatus::Blocked => Some(CanonicalTurnItemStatus::Blocked),
         CanonicalTurnStatus::Failed => Some(CanonicalTurnItemStatus::Failed),
+        CanonicalTurnStatus::Interrupted => Some(CanonicalTurnItemStatus::Cancelled),
         CanonicalTurnStatus::Cancelled => Some(CanonicalTurnItemStatus::Cancelled),
         CanonicalTurnStatus::Superseded => Some(CanonicalTurnItemStatus::Cancelled),
         CanonicalTurnStatus::Pending | CanonicalTurnStatus::Running => None,
@@ -2224,6 +2235,264 @@ impl SessionStore {
         session_id: &SessionId,
     ) -> DomainResult<Option<SessionRuntimeSidecar>> {
         self.cancel_current_turn_with_source(session_id, true)
+    }
+
+    /// 将 daemon 异常退出时遗留的活动轮次收敛为可恢复的明确终态。
+    ///
+    /// 该操作在同一把 session state 写锁内完成轮次终止、活动 item 收敛、恢复提示写入和
+    /// canonical turn 同步，避免重启后出现“任务已停止但 UI 仍显示响应中”的分裂状态。
+    pub fn interrupt_current_turn_by_daemon_restart(
+        &self,
+        session_id: &SessionId,
+    ) -> DomainResult<Option<SessionRuntimeSidecar>> {
+        let updated = {
+            let mut state = self
+                .state
+                .write()
+                .expect("session state write lock poisoned");
+            let updated = {
+                let Some(sidecar) = state
+                    .execution_sidecar_store
+                    .runtime_sidecars
+                    .iter_mut()
+                    .find(|sidecar| &sidecar.session_id == session_id)
+                else {
+                    return Err(DomainError::NotFound {
+                        entity: "session_runtime_sidecar",
+                    });
+                };
+                if sidecar.active_execution_chain.is_none() {
+                    return Err(DomainError::InvalidState {
+                        message: format!("session {session_id} 没有可恢复的执行链"),
+                    });
+                }
+                let Some(turn) = sidecar.current_turn.as_mut() else {
+                    return Ok(None);
+                };
+                if current_turn_status_is_terminal(&turn.status) {
+                    return Ok(None);
+                }
+
+                let now = UtcMillis::now();
+                for item in &mut turn.items {
+                    if current_turn_item_status_is_active(&item.status) {
+                        item.status = "cancelled".to_string();
+                    }
+                    if item
+                        .tool_status
+                        .as_deref()
+                        .is_some_and(current_turn_item_status_is_active)
+                    {
+                        item.tool_status = Some("cancelled".to_string());
+                    }
+                }
+
+                let notice_item_id = format!("turn-item-interruption-{}", turn.turn_id);
+                let source_thread_id = turn
+                    .items
+                    .iter()
+                    .find(|item| item.kind == "user_message")
+                    .or_else(|| turn.items.first())
+                    .map(|item| item.source_thread_id.clone())
+                    .unwrap_or_else(|| ThreadId::new(format!("thread-orchestrator-{session_id}")));
+                let next_item_seq = turn
+                    .items
+                    .iter()
+                    .map(|item| item.item_seq)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                turn.items.push(ActiveExecutionTurnItem {
+                    item_id: notice_item_id,
+                    item_seq: next_item_seq,
+                    kind: "assistant_phase".to_string(),
+                    status: "completed".to_string(),
+                    source: ORCHESTRATOR_ROLE_ID.to_string(),
+                    title: None,
+                    content: Some(INTERRUPTION_NOTICE_TEXT.to_string()),
+                    task_id: None,
+                    worker_id: None,
+                    role_id: None,
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_status: None,
+                    tool_arguments: None,
+                    tool_result: None,
+                    tool_error: None,
+                    request_id: None,
+                    user_message_id: None,
+                    placeholder_message_id: None,
+                    metadata: HashMap::from([
+                        (
+                            "noticeKind".to_string(),
+                            Value::String(INTERRUPTION_NOTICE_KIND.to_string()),
+                        ),
+                        ("noticeType".to_string(), Value::String("error".to_string())),
+                        (
+                            RECOVERY_STATE_METADATA_KEY.to_string(),
+                            Value::String(RECOVERY_STATE_READY.to_string()),
+                        ),
+                        (
+                            TURN_INTERRUPTION_SOURCE_METADATA_KEY.to_string(),
+                            Value::String(TURN_INTERRUPTION_SOURCE_DAEMON_RESTART.to_string()),
+                        ),
+                        (
+                            TURN_INTERRUPTED_AT_METADATA_KEY.to_string(),
+                            Value::from(now.0),
+                        ),
+                    ]),
+                    timeline_entry_id: None,
+                    source_thread_id,
+                });
+                turn.status = "interrupted".to_string();
+                turn.completed_at = Some(now);
+                turn.normalize();
+                if let Some(chain) = sidecar.active_execution_chain.as_mut() {
+                    chain.current_turn = sidecar.current_turn.clone();
+                    chain.normalize();
+                }
+                sidecar.updated_at = now;
+                Some(sidecar.clone())
+            };
+            if let Some(updated) = updated.as_ref()
+                && let Some(turn) = updated.current_turn.as_ref()
+            {
+                upsert_canonical_turn_in_state(&mut state, session_id, turn)?;
+            }
+            updated
+        };
+        if updated.is_some() {
+            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);
+        }
+        Ok(updated)
+    }
+
+    pub fn has_recovery_ready_interruption(&self, session_id: &SessionId) -> bool {
+        self.has_interrupted_recovery_with_state(session_id, RECOVERY_STATE_READY)
+    }
+
+    pub fn has_claimed_interrupted_recovery(&self, session_id: &SessionId) -> bool {
+        self.has_interrupted_recovery_with_state(session_id, RECOVERY_STATE_CLAIMED)
+    }
+
+    fn has_interrupted_recovery_with_state(&self, session_id: &SessionId, state: &str) -> bool {
+        self.runtime_sidecar(session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .filter(|turn| turn.status == "interrupted")
+            .is_some_and(|turn| {
+                turn.items.iter().any(|item| {
+                    item.metadata.get("noticeKind").and_then(Value::as_str)
+                        == Some(INTERRUPTION_NOTICE_KIND)
+                        && item
+                            .metadata
+                            .get(RECOVERY_STATE_METADATA_KEY)
+                            .and_then(Value::as_str)
+                            == Some(state)
+                })
+            })
+    }
+
+    /// 原子领取一次异常中断恢复权。返回被领取的旧 turn id；非异常中断恢复返回 `None`。
+    pub fn claim_interrupted_recovery(
+        &self,
+        session_id: &SessionId,
+    ) -> DomainResult<Option<String>> {
+        self.set_interrupted_recovery_state(
+            session_id,
+            None,
+            RECOVERY_STATE_READY,
+            RECOVERY_STATE_CLAIMED,
+        )
+    }
+
+    /// 恢复启动失败时释放领取权，使用户可再次发起恢复。
+    pub fn release_interrupted_recovery_claim(
+        &self,
+        session_id: &SessionId,
+        turn_id: &str,
+    ) -> DomainResult<Option<String>> {
+        self.set_interrupted_recovery_state(
+            session_id,
+            Some(turn_id),
+            RECOVERY_STATE_CLAIMED,
+            RECOVERY_STATE_READY,
+        )
+    }
+
+    fn set_interrupted_recovery_state(
+        &self,
+        session_id: &SessionId,
+        expected_turn_id: Option<&str>,
+        expected_state: &str,
+        next_state: &str,
+    ) -> DomainResult<Option<String>> {
+        let updated_turn_id = {
+            let mut state = self
+                .state
+                .write()
+                .expect("session state write lock poisoned");
+            let updated = {
+                let Some(sidecar) = state
+                    .execution_sidecar_store
+                    .runtime_sidecars
+                    .iter_mut()
+                    .find(|sidecar| &sidecar.session_id == session_id)
+                else {
+                    return Err(DomainError::NotFound {
+                        entity: "session_runtime_sidecar",
+                    });
+                };
+                let Some(turn) = sidecar.current_turn.as_mut() else {
+                    return Ok(None);
+                };
+                if turn.status != "interrupted" {
+                    return Ok(None);
+                }
+                if expected_turn_id.is_some_and(|expected| expected != turn.turn_id) {
+                    return Ok(None);
+                }
+                let Some(notice) = turn.items.iter_mut().find(|item| {
+                    item.metadata.get("noticeKind").and_then(Value::as_str)
+                        == Some(INTERRUPTION_NOTICE_KIND)
+                }) else {
+                    return Err(DomainError::InvalidState {
+                        message: format!("session {session_id} 的异常中断轮次缺少恢复提示"),
+                    });
+                };
+                let current_state = notice
+                    .metadata
+                    .get(RECOVERY_STATE_METADATA_KEY)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if current_state != expected_state {
+                    return Err(DomainError::InvalidState {
+                        message: format!("异常中断恢复状态已变化: {current_state}"),
+                    });
+                }
+                notice.metadata.insert(
+                    RECOVERY_STATE_METADATA_KEY.to_string(),
+                    Value::String(next_state.to_string()),
+                );
+                let turn_id = turn.turn_id.clone();
+                turn.normalize();
+                if let Some(chain) = sidecar.active_execution_chain.as_mut() {
+                    chain.current_turn = sidecar.current_turn.clone();
+                    chain.normalize();
+                }
+                sidecar.updated_at = UtcMillis::now();
+                Some((turn_id, sidecar.clone()))
+            };
+            if let Some((_, updated)) = updated.as_ref()
+                && let Some(turn) = updated.current_turn.as_ref()
+            {
+                upsert_canonical_turn_in_state(&mut state, session_id, turn)?;
+            }
+            updated.map(|(turn_id, _)| turn_id)
+        };
+        if updated_turn_id.is_some() {
+            self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);
+        }
+        Ok(updated_turn_id)
     }
 
     fn cancel_current_turn_with_source(

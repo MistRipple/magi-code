@@ -94,6 +94,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertTerminalLateUpsertIsIgnored(reducer, projection);
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
   assertSupersededTurnDisappearsAndRejectsLateEvents(reducer, projection);
+  assertInterruptedTurnIsTerminalAndKeepsRecoveryNotice(reducer, projection, canonicalProtocol);
   assertModelContextFallbackProjectsAsWarningNotice(reducer, projection);
   assertSingleThinkingProjectsAsGroup(reducer, projection);
   assertContinuousThinkingProjectsAsOneGroup(reducer, projection);
@@ -373,6 +374,33 @@ function assertSupersededTurnDisappearsAndRejectsLateEvents(reducer, projection)
   assert.equal(lateCancelled.error, undefined);
   assert.equal(lateCancelled.changed, false, 'late events from a superseded turn must be ignored');
   assert.equal(lateCancelled.state.turns[0].status, 'superseded');
+}
+
+function assertInterruptedTurnIsTerminalAndKeepsRecoveryNotice(reducer, projection, canonicalProtocol) {
+  const c = baseCase('interrupted-turn', 'session-golden-interrupted', 'turn-golden-interrupted', 11_620);
+  const interruptedTurn = turn(c, 'interrupted', [
+    user(c, 1, '继续处理未完成的任务'),
+    assistantText(c, 2, 'assistant-interrupted', '已经完成的部分', 'cancelled'),
+    item(c, 3, 'interruption-notice', 'system_notice', 'completed', {
+      content: '当前对话发生异常中断，是否继续？',
+      metadata: {
+        noticeKind: 'session_interrupted',
+        noticeType: 'error',
+        recoveryState: 'ready',
+      },
+    }),
+  ], { completedAt: 11_630, responseDurationMs: 10 });
+  assert.equal(
+    canonicalProtocol.isCanonicalTerminalStatus(interruptedTurn.status),
+    true,
+    'interrupted turn must settle processing instead of remaining active after a daemon restart',
+  );
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [interruptedTurn]);
+  const artifacts = projection.buildCanonicalTimelineProjection(state).artifacts;
+  const notice = artifacts.find((artifact) => artifact.message.metadata?.noticeKind === 'session_interrupted');
+  assert.ok(notice, 'interrupted recovery notice must survive bootstrap projection');
+  assert.equal(notice.message.type, 'system-notice');
+  assert.equal(notice.message.metadata?.recoveryState, 'ready');
 }
 
 function assertLocalTurnSubmissionStartsAtomically(messagesStore) {

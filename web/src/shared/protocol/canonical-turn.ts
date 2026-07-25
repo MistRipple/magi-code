@@ -1,8 +1,8 @@
 export const CANONICAL_TURN_SCHEMA_VERSION = 'canonical-turn.v1' as const;
 
-export type CanonicalTurnStatus = 'pending' | 'running' | 'completed' | 'blocked' | 'failed' | 'cancelled' | 'superseded';
+export type CanonicalTurnStatus = 'pending' | 'running' | 'completed' | 'blocked' | 'failed' | 'interrupted' | 'cancelled' | 'superseded';
 
-export type CanonicalTurnItemStatus = Exclude<CanonicalTurnStatus, 'superseded'>;
+export type CanonicalTurnItemStatus = Exclude<CanonicalTurnStatus, 'interrupted' | 'superseded'>;
 
 export type CanonicalTurnItemKind =
   | 'user_message'
@@ -96,7 +96,7 @@ export interface CanonicalTurnStreamUpdate {
   reset: boolean;
 }
 
-const CANONICAL_TURN_STATUSES: CanonicalTurnStatus[] = ['pending', 'running', 'completed', 'blocked', 'failed', 'cancelled', 'superseded'];
+const CANONICAL_TURN_STATUSES: CanonicalTurnStatus[] = ['pending', 'running', 'completed', 'blocked', 'failed', 'interrupted', 'cancelled', 'superseded'];
 const CANONICAL_TURN_ITEM_STATUSES: CanonicalTurnItemStatus[] = ['pending', 'running', 'completed', 'blocked', 'failed', 'cancelled'];
 const CANONICAL_TURN_ITEM_KINDS: CanonicalTurnItemKind[] = [
   'user_message',
@@ -445,7 +445,12 @@ export function parseCanonicalTurnEventPayload(
 }
 
 export function isCanonicalTerminalStatus(status: CanonicalTurnStatus): boolean {
-  return status === 'completed' || status === 'blocked' || status === 'failed' || status === 'cancelled' || status === 'superseded';
+  return status === 'completed'
+    || status === 'blocked'
+    || status === 'failed'
+    || status === 'interrupted'
+    || status === 'cancelled'
+    || status === 'superseded';
 }
 
 export function canTransitionCanonicalStatus(
@@ -460,10 +465,22 @@ export function canTransitionCanonicalStatus(
       || next === 'completed'
       || next === 'blocked'
       || next === 'failed'
+      || next === 'interrupted'
       || next === 'cancelled';
   }
   if (current === 'running') {
-    return next === 'completed' || next === 'blocked' || next === 'failed' || next === 'cancelled';
+    return next === 'completed'
+      || next === 'blocked'
+      || next === 'failed'
+      || next === 'interrupted'
+      || next === 'cancelled';
+  }
+  if (current === 'blocked') {
+    return next === 'running'
+      || next === 'completed'
+      || next === 'failed'
+      || next === 'interrupted'
+      || next === 'cancelled';
   }
   if (current === 'cancelled') {
     return next === 'superseded';

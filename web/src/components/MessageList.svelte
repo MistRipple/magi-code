@@ -19,6 +19,7 @@
     hasActiveLocalTimelineTurn,
   } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { vscode } from '../lib/vscode-bridge';
   import {
     buildTurnNavigationItems,
     isTurnNavigationStatus,
@@ -70,6 +71,10 @@
   );
 
   const activeRenderItems = $derived(safeRenderItems);
+
+  function continueInterruptedSession(): void {
+    vscode.postMessage({ type: 'continueTask' });
+  }
 
   type TimelineRenderEntry =
     | { kind: 'message'; key: string; item: TimelineRenderItem }
@@ -851,6 +856,7 @@
             }}
             canEdit={canEditUserMessage(entry.item.message)}
             onEdit={() => editUserMessage(entry.item.message)}
+            onContinueInterrupted={continueInterruptedSession}
           />
         {:else}
           {#if entry.kind === 'runtime'}

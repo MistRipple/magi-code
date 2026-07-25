@@ -3755,9 +3755,12 @@ async function continueSessionExecution(): Promise<void> {
   const requestId = `continue-${generateMessageId()}`;
   continueRequestId = requestId;
   addPendingRequest(requestId, { resetAntiLiftBack: true });
+  window.dispatchEvent(new CustomEvent('magi:interruptedRecoveryContinueStatus', {
+    detail: { status: 'pending' },
+  }));
   try {
     await ensureFreshLiveBridge('continue_session_preflight');
-    const result = await continueAgentSession(sessionId);
+    const result = await continueAgentSession(sessionId, '继续执行中断的任务');
     const rootTaskId = trimBridgeString(result.rootTaskId)
       || trimBridgeString(result.root_task_id);
     if (!rootTaskId) {
@@ -3765,6 +3768,9 @@ async function continueSessionExecution(): Promise<void> {
     }
     setCurrentInterruptTaskId(rootTaskId);
     initAgentRunTracking(sessionId, rootTaskId, currentWorkspaceId, currentWorkspacePath);
+    window.dispatchEvent(new CustomEvent('magi:interruptedRecoveryContinueStatus', {
+      detail: { status: 'accepted' },
+    }));
     void ensureEventStream({ forceReconnect: false, waitUntilOpen: false }).catch((error) => {
       console.warn('[web-client-bridge] continueTask 后 SSE 连接确认失败:', error);
     });
@@ -3776,6 +3782,9 @@ async function continueSessionExecution(): Promise<void> {
       sessionId,
       requestId,
     });
+    window.dispatchEvent(new CustomEvent('magi:interruptedRecoveryContinueStatus', {
+      detail: { status: 'failed' },
+    }));
     if (shouldRecoverFromBridgeError(error)) {
       closeEventStream();
       scheduleRecovery('continue_session_failed', error, true);

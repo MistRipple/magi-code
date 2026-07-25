@@ -3147,6 +3147,23 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
     let (restarted_app, restarted_state) =
         restarted_runtime.router_with_state_for_tests("daemon-test".to_string());
 
+    let interrupted_turn = restarted_state
+        .session_store
+        .runtime_sidecar(&session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .expect("restart should retain the interrupted current turn");
+    assert_eq!(
+        interrupted_turn.status, "interrupted",
+        "daemon restart must settle the previous UI turn instead of leaving it running"
+    );
+    assert!(
+        interrupted_turn.items.iter().any(|item| {
+            item.metadata.get("noticeKind").and_then(Value::as_str) == Some("session_interrupted")
+                && item.metadata.get("recoveryState").and_then(Value::as_str) == Some("ready")
+        }),
+        "restart should append a visible recovery notice"
+    );
+
     let before_continue_read_model = get_json(restarted_app.clone(), "/runtime/read-model").await;
     let session_summary = before_continue_read_model["details"]["sessions"]
         .as_array()
@@ -3243,6 +3260,28 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
     assert_eq!(
         continue_body["resumedBranchCount"],
         expected_resumable_branch_count as u64
+    );
+    let resumed_turn = restarted_state
+        .session_store
+        .runtime_sidecar(&session_id)
+        .and_then(|sidecar| sidecar.current_turn)
+        .expect("continue should create a new running turn after interruption");
+    assert_eq!(resumed_turn.status, "running");
+    assert!(
+        restarted_state
+            .session_store
+            .canonical_turns_for_session(&session_id)
+            .iter()
+            .any(|turn| {
+                turn.status == magi_session_store::CanonicalTurnStatus::Interrupted
+                    && turn.items.iter().any(|item| {
+                        item.metadata.get("noticeKind").and_then(Value::as_str)
+                            == Some("session_interrupted")
+                            && item.metadata.get("recoveryState").and_then(Value::as_str)
+                                == Some("claimed")
+                    })
+            }),
+        "successful continue must consume the old recovery link"
     );
 
     let after_continue_read_model = get_json(restarted_app.clone(), "/runtime/read-model").await;

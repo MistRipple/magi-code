@@ -1444,6 +1444,7 @@ export async function interruptAgentSession(
 
 export async function continueAgentSession(
   sessionId: string,
+  promptText?: string,
 ): Promise<Record<string, unknown>> {
   const normalizedSessionId = sessionId.trim();
   if (!normalizedSessionId) {
@@ -1451,7 +1452,10 @@ export async function continueAgentSession(
   }
   return await postBoundJson<Record<string, unknown>>(
     '/api/session/continue',
-    { sessionId: normalizedSessionId },
+    {
+      sessionId: normalizedSessionId,
+      ...(promptText?.trim() ? { promptText: promptText.trim() } : {}),
+    },
     'continue session',
   );
 }

@@ -4,6 +4,7 @@ export type TurnNavigationStatus =
   | 'completed'
   | 'blocked'
   | 'failed'
+  | 'interrupted'
   | 'cancelled';
 
 export interface TurnNavigationMessage {
@@ -47,6 +48,7 @@ const TURN_NAVIGATION_STATUSES = new Set<TurnNavigationStatus>([
   'completed',
   'blocked',
   'failed',
+  'interrupted',
   'cancelled',
 ]);
 

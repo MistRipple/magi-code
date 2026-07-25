@@ -804,6 +804,7 @@ pub fn current_turn_status_is_terminal(status: &str) -> bool {
             | "success"
             | "failed"
             | "error"
+            | "interrupted"
             | "blocked"
             | "cancelled"
             | "canceled"

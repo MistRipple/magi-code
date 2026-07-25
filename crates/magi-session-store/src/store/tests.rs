@@ -1310,6 +1310,91 @@ fn killed_current_turn_status_is_stored_as_cancelled_terminal_turn() {
 }
 
 #[test]
+fn daemon_restart_interruption_is_terminal_recoverable_and_single_claim() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-daemon-restart-interrupted");
+    store
+        .create_session(session_id.clone(), "Daemon Restart Interrupted")
+        .expect("session should be creatable");
+
+    let mut turn = test_turn("turn-daemon-restart-interrupted", "running", 10);
+    let mut user_item = test_turn_item("turn-item-daemon-restart-user", "继续处理任务");
+    user_item.item_seq = 1;
+    let mut assistant_item = test_turn_item("turn-item-daemon-restart-assistant", "处理中");
+    assistant_item.item_seq = 2;
+    assistant_item.kind = "assistant_stream".to_string();
+    assistant_item.status = "running".to_string();
+    assistant_item.source = "orchestrator".to_string();
+    turn.items = vec![user_item, assistant_item];
+    let chain = test_active_chain(&session_id, "daemon-restart-interrupted", Some(turn));
+    store
+        .accept_active_execution_chain_with_timeline_entry(
+            session_id.clone(),
+            TimelineEntryInput::new(
+                "timeline-daemon-restart-interrupted",
+                TimelineEntryKind::UserMessage,
+                "继续处理任务",
+                UtcMillis(10),
+            ),
+            chain,
+        )
+        .expect("active chain should be accepted");
+
+    let interrupted = store
+        .interrupt_current_turn_by_daemon_restart(&session_id)
+        .expect("daemon restart should interrupt current turn")
+        .expect("current turn should exist");
+    let interrupted_turn = interrupted
+        .current_turn
+        .expect("turn should remain durable");
+    assert_eq!(interrupted_turn.status, "interrupted");
+    assert!(interrupted_turn.completed_at.is_some());
+    assert_eq!(interrupted_turn.items[1].status, "cancelled");
+    assert!(store.has_recovery_ready_interruption(&session_id));
+    store
+        .ensure_current_turn_acceptance_available(&session_id)
+        .expect("interrupted turn must not block the next turn");
+
+    let canonical_turn = store
+        .canonical_turns_for_session(&session_id)
+        .into_iter()
+        .find(|turn| turn.turn_id == "turn-daemon-restart-interrupted")
+        .expect("canonical interrupted turn should exist");
+    assert_eq!(canonical_turn.status, CanonicalTurnStatus::Interrupted);
+    assert!(canonical_turn.status.is_terminal());
+    let notice = canonical_turn
+        .items
+        .iter()
+        .find(|item| item.metadata.get("noticeKind") == Some(&json!("session_interrupted")))
+        .expect("interruption notice should be appended");
+    assert_eq!(
+        notice.kind,
+        crate::models::CanonicalTurnItemKind::SystemNotice
+    );
+    assert_eq!(
+        notice.status,
+        crate::models::CanonicalTurnItemStatus::Completed
+    );
+    assert_eq!(notice.metadata.get("recoveryState"), Some(&json!("ready")));
+
+    let claimed_turn_id = store
+        .claim_interrupted_recovery(&session_id)
+        .expect("first recovery claim should succeed")
+        .expect("interrupted recovery should be claimed");
+    assert_eq!(claimed_turn_id, "turn-daemon-restart-interrupted");
+    assert!(!store.has_recovery_ready_interruption(&session_id));
+    assert!(
+        store.claim_interrupted_recovery(&session_id).is_err(),
+        "a second caller must not claim the same interrupted execution"
+    );
+
+    store
+        .release_interrupted_recovery_claim(&session_id, &claimed_turn_id)
+        .expect("failed recovery should release the claim");
+    assert!(store.has_recovery_ready_interruption(&session_id));
+}
+
+#[test]
 fn killed_task_status_item_is_written_as_cancelled_canonical_item() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-killed-task-status-item");

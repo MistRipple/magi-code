@@ -126,6 +126,7 @@ pub enum CanonicalTurnStatus {
     Completed,
     Blocked,
     Failed,
+    Interrupted,
     Cancelled,
     Superseded,
 }
@@ -134,7 +135,7 @@ impl CanonicalTurnStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Completed | Self::Failed | Self::Cancelled | Self::Superseded
+            Self::Completed | Self::Failed | Self::Interrupted | Self::Cancelled | Self::Superseded
         )
     }
 
@@ -145,18 +146,31 @@ impl CanonicalTurnStatus {
         match self {
             Self::Pending => matches!(
                 next,
-                Self::Running | Self::Completed | Self::Blocked | Self::Failed | Self::Cancelled
+                Self::Running
+                    | Self::Completed
+                    | Self::Blocked
+                    | Self::Failed
+                    | Self::Interrupted
+                    | Self::Cancelled
             ),
             Self::Running => matches!(
                 next,
-                Self::Completed | Self::Blocked | Self::Failed | Self::Cancelled
+                Self::Completed
+                    | Self::Blocked
+                    | Self::Failed
+                    | Self::Interrupted
+                    | Self::Cancelled
             ),
             Self::Blocked => matches!(
                 next,
-                Self::Running | Self::Completed | Self::Failed | Self::Cancelled
+                Self::Running
+                    | Self::Completed
+                    | Self::Failed
+                    | Self::Interrupted
+                    | Self::Cancelled
             ),
             Self::Cancelled => matches!(next, Self::Superseded),
-            Self::Completed | Self::Failed | Self::Superseded => false,
+            Self::Completed | Self::Failed | Self::Interrupted | Self::Superseded => false,
         }
     }
 }
