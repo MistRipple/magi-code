@@ -516,7 +516,12 @@ pub fn finalize_background_session_task_turn_if_root_completed(
         return false;
     };
     if current_turn_status_is_terminal(&turn.status) {
-        return current_turn_status_is_completed(&turn.status);
+        let archived =
+            archive_terminal_active_execution_chain(session_store, session_id, root_task_id);
+        if archived {
+            persist_session_state_checkpoint(persist_session_state, "session_task_chain_archived");
+        }
+        return current_turn_status_is_completed(&turn.status) || archived;
     }
     let Some(orchestrator_thread) = session_store.orchestrator_thread_for_session(session_id)
     else {
@@ -571,7 +576,37 @@ pub fn finalize_background_session_task_turn_if_root_completed(
             }),
         );
     }
+    archive_terminal_active_execution_chain(session_store, session_id, root_task_id);
+    persist_session_state_checkpoint(persist_session_state, "session_task_chain_archived");
     true
+}
+
+/// 终态 root 不再占用会话的 active execution chain。
+///
+/// canonical turn、任务树和线程历史仍然保留；这里仅移除“当前正在执行”的所有权，
+/// 防止一个已经完成的任务长期把后续普通对话绑定到过期任务链。
+fn archive_terminal_active_execution_chain(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    root_task_id: &TaskId,
+) -> bool {
+    session_store
+        .runtime_sidecar(session_id)
+        .and_then(|sidecar| sidecar.active_execution_chain)
+        .filter(|chain| chain.root_task_id == *root_task_id)
+        .is_some_and(|_| {
+            session_store
+                .archive_active_execution_chain(session_id, root_task_id)
+                .is_ok()
+        })
+}
+
+fn terminal_chain_requires_archival(root_status: TaskStatus, turn_status: &str) -> bool {
+    matches!(root_status, TaskStatus::Completed | TaskStatus::Killed)
+        || matches!(
+            turn_status.trim().to_ascii_lowercase().as_str(),
+            "cancelled" | "canceled"
+        )
 }
 
 fn update_current_turn_completed_from_root(
@@ -645,11 +680,19 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         return false;
     }
     let workspace_id = active_chain.workspace_id.clone();
-    if sidecar
-        .current_turn
-        .as_ref()
-        .is_some_and(|turn| current_turn_status_is_terminal(&turn.status))
+    if let Some(turn) = sidecar.current_turn.as_ref()
+        && current_turn_status_is_terminal(&turn.status)
     {
+        if terminal_chain_requires_archival(root_task.status, &turn.status) {
+            let archived =
+                archive_terminal_active_execution_chain(session_store, session_id, root_task_id);
+            if archived {
+                persist_session_state_checkpoint(
+                    persist_session_state,
+                    "session_task_chain_archived",
+                );
+            }
+        }
         return true;
     }
     let Some(orchestrator_thread) = session_store.orchestrator_thread_for_session(session_id)
@@ -693,6 +736,11 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         publish_session_turn_item_event(event_bus, session_id, &workspace_id, &published);
     }
 
+    if terminal_chain_requires_archival(root_task.status, turn_status) {
+        archive_terminal_active_execution_chain(session_store, session_id, root_task_id);
+        persist_session_state_checkpoint(persist_session_state, "session_task_chain_archived");
+    }
+
     true
 }
 
@@ -713,10 +761,14 @@ pub fn reconcile_terminal_session_task_turns(
             let root_task = task_store.get_task(&chain.root_task_id)?;
             let runner_status = runner_status_for_terminal_task(root_task.status)?;
             if runner_status == "completed" {
-                if current_turn_status_is_completed(&turn.status) {
+                if current_turn_status_is_completed(&turn.status)
+                    && !terminal_chain_requires_archival(root_task.status, &turn.status)
+                {
                     return None;
                 }
-            } else if current_turn_status_is_terminal(&turn.status) {
+            } else if current_turn_status_is_terminal(&turn.status)
+                && !terminal_chain_requires_archival(root_task.status, &turn.status)
+            {
                 return None;
             }
             Some((
@@ -777,6 +829,10 @@ pub fn runner_status_for_terminal_task(status: TaskStatus) -> Option<&'static st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magi_core::{MissionId, TaskRuntimePayload};
+    use magi_session_store::{
+        ActiveExecutionChain, ActiveExecutionDispatchContext, SessionExecutionSidecarStatus,
+    };
 
     #[test]
     fn latest_root_task_assistant_final_prefers_root_without_worker_binding() {
@@ -829,6 +885,104 @@ mod tests {
         assert_eq!(
             turn_item_status_for_task_status(TaskStatus::Killed),
             "cancelled"
+        );
+    }
+
+    #[test]
+    fn reconcile_archives_cancelled_terminal_chain_without_losing_turn_history() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(16);
+        let task_store = TaskStore::new();
+        let session_id = SessionId::new("session-terminal-chain-archive");
+        let mission_id = MissionId::new("mission-terminal-chain-archive");
+        let root_task_id = TaskId::new("task-terminal-chain-archive");
+        let now = UtcMillis::now();
+
+        session_store
+            .create_session(session_id.clone(), "terminal chain archive")
+            .expect("session should create");
+        session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
+        session_store
+            .upsert_active_execution_chain(
+                session_id.clone(),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-terminal-chain-archive".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![root_task_id.clone()],
+                    active_worker_bindings: Vec::new(),
+                    branches: Vec::new(),
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "entry-terminal-chain-archive".to_string(),
+                        trimmed_text: Some("停止旧任务".to_string()),
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-terminal-chain-archive".to_string(),
+                        turn_seq: now.0,
+                        accepted_at: now,
+                        completed_at: Some(now),
+                        status: "cancelled".to_string(),
+                        user_message: Some("停止旧任务".to_string()),
+                        items: Vec::new(),
+                    }),
+                },
+            )
+            .expect("terminal chain should persist");
+        task_store.insert_task(Task {
+            task_id: root_task_id.clone(),
+            mission_id,
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: TaskKind::LocalAgent,
+            title: "已停止任务".to_string(),
+            goal: "验证旧任务不会继续占用会话".to_string(),
+            status: TaskStatus::Failed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: TaskRuntimePayload::default(),
+            created_at: now,
+            updated_at: now,
+        });
+
+        assert_eq!(
+            reconcile_terminal_session_task_turns(&session_store, &event_bus, Some(&task_store),),
+            1
+        );
+        let sidecar = session_store
+            .runtime_sidecar(&session_id)
+            .expect("sidecar should remain for canonical history");
+        assert!(sidecar.active_execution_chain.is_none());
+        assert_eq!(sidecar.status, SessionExecutionSidecarStatus::Detached);
+        assert_eq!(
+            sidecar
+                .current_turn
+                .as_ref()
+                .map(|turn| turn.status.as_str()),
+            Some("cancelled")
+        );
+        assert!(
+            session_store
+                .ensure_current_turn_acceptance_available(&session_id)
+                .is_ok(),
+            "终态链收口后必须允许会话直接接受下一条普通消息"
+        );
+        assert_eq!(
+            reconcile_terminal_session_task_turns(&session_store, &event_bus, Some(&task_store),),
+            0
         );
     }
 }
