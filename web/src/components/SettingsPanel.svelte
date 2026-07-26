@@ -5,6 +5,7 @@ import SettingsRulesTab from './SettingsRulesTab.svelte';
 import SettingsAgentsTab from './SettingsAgentsTab.svelte';
 import SettingsModelTab from './SettingsModelTab.svelte';
 import SettingsToolsTab from './SettingsToolsTab.svelte';
+import SettingsProjectTab from './SettingsProjectTab.svelte';
 import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
 import Toggle from './Toggle.svelte';
@@ -91,6 +92,16 @@ import { getAgentColor } from '../lib/agent-colors';
           <Icon name="stats" size={16} />
           <span>{i18n.t('settings.zone.usage')}</span>
         </button>
+        <button
+          type="button"
+          class="nav-item"
+          class:active={store.activeTab === 'project'}
+          aria-label={i18n.t('settings.zone.project')}
+          onclick={() => store.activeTab = 'project'}
+        >
+          <Icon name="git-branch" size={16} />
+          <span>{i18n.t('settings.zone.project')}</span>
+        </button>
       </nav>
       <div class="sidebar-footer">
         {#if store.userInfo && store.clientKind === 'vscode'}
@@ -131,6 +142,11 @@ import { getAgentColor } from '../lib/agent-colors';
               <h2>{i18n.t('settings.zone.roles')}</h2>
               <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.zone.rolesDesc')}</span>
             </div>
+          {:else if store.activeTab === 'project'}
+            <div style="display: flex; align-items: baseline; gap: 12px;">
+              <h2>{i18n.t('settings.zone.project')}</h2>
+              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.zone.projectDesc')}</span>
+            </div>
           {/if}
         </div>
         <div class="header-actions">
@@ -166,7 +182,9 @@ import { getAgentColor } from '../lib/agent-colors';
 
       <!-- Tab 内容区域 -->
       <div class="settings-tab-content scroll-content" onscroll={() => { store.closeAllModelDropdowns(); }}>
-      {#if store.activeTab === 'stats'}
+      {#if store.activeTab === 'project'}
+        <SettingsProjectTab />
+      {:else if store.activeTab === 'stats'}
         <!-- 统计 Tab -->
         <SettingsStatsTab totalInputTokens={store.totalInputTokens} totalOutputTokens={store.totalOutputTokens} totalTokens={store.totalTokens} isRefreshing={store.isRefreshing} refreshConnections={store.refreshConnections} showResetConfirmDialog={store.showResetConfirmDialog} modelStatuses={store.modelStatuses} bindingUsageStats={store.executionStats} modelUsageStats={store.executionModelStats} statsDisplayKeys={store.statsDisplayKeys} getWorkerStats={store.getWorkerStats} getStatsRoleModelStatus={store.getStatsRoleModelStatus} getStatusClass={store.getStatusClass} getWorkerDisplayName={store.getWorkerDisplayName} statusTexts={store.statusTexts}
         />
