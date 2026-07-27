@@ -428,6 +428,7 @@ await withGoldenViteServer(async (server) => {
       'matched_not_injected',
       'injected',
     ];
+    const visibleDecisions = decisions.filter((decision) => decision !== 'not_needed');
     const recentEvents = decisions.map((decision, index) => ({
       event_id: `knowledge-event-${index}`,
       event_type: 'knowledge.context.selected',
@@ -539,10 +540,10 @@ await withGoldenViteServer(async (server) => {
     });
 
     const knowledgeAudit = normalized.orchestratorRuntimeState?.opsView?.knowledgeAudit;
-    assert.equal(knowledgeAudit?.eventCount, 6);
+    assert.equal(knowledgeAudit?.eventCount, 5);
     assert.deepEqual(
       knowledgeAudit?.recentEntries?.map((entry) => entry.decision).filter(Boolean),
-      decisions,
+      visibleDecisions,
     );
     const injectedEntry = knowledgeAudit?.recentEntries?.find((entry) => entry.decision === 'injected');
     assert.deepEqual(injectedEntry?.knowledgeIds, ['adr-runtime']);

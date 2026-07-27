@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, RwLock};
 /// 对话"身份锚点。与 worker role 体系正交 —— 这是产品级的主干角色，
 /// 不会被 `DynamicWorkerCatalog` 识别为可派发 worker。
 pub const ORCHESTRATOR_ROLE_ID: &str = "orchestrator";
+const MAX_INCIDENT_NOTIFICATION_RECORDS: usize = 1_000;
 
 #[derive(Clone, Debug, Default)]
 struct SidecarFlushState {
@@ -85,6 +86,26 @@ fn unique_timeline_entry_id(existing: &[TimelineEntry], base: String) -> String 
             return candidate;
         }
         suffix = suffix.saturating_add(1);
+    }
+}
+
+fn prune_incident_notifications(notifications: &mut Vec<NotificationRecord>) {
+    while notifications.len() > MAX_INCIDENT_NOTIFICATION_RECORDS {
+        let removal_index = notifications
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.resolved)
+            .min_by_key(|(_, record)| record.created_at.0)
+            .map(|(index, _)| index)
+            .or_else(|| {
+                notifications
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, record)| record.created_at.0)
+                    .map(|(index, _)| index)
+            })
+            .expect("notification retention requires a non-empty collection");
+        notifications.remove(removal_index);
     }
 }
 
@@ -156,6 +177,7 @@ impl SessionStore {
     ) -> Self {
         let mut state =
             SessionStoreState::from_persisted_parts(durable_state, execution_sidecar_store);
+        prune_incident_notifications(&mut state.notifications);
         sidecar::restore_canonical_turns_from_sidecars(&mut state)
             .expect("persisted sidecar current turn should be canonical-compatible");
         Self::from_state(state)
@@ -661,25 +683,10 @@ impl SessionStore {
             .state
             .write()
             .expect("session state write lock poisoned");
-        if let Some(existing) = state.notifications.iter_mut().find(|existing| {
-            !existing.resolved
-                && existing.fingerprint == notification.fingerprint
-                && existing.scope == notification.scope
-                && existing.workspace_id == notification.workspace_id
-                && existing.session_id == notification.session_id
-        }) {
-            existing.message = notification.message;
-            existing.title = notification.title;
-            existing.level = notification.level;
-            existing.source = notification.source;
-            existing.created_at = notification.created_at;
-            existing.handled = false;
-            existing.count_unread = true;
-            existing.action_required = notification.action_required;
-            existing.occurrence_count = existing.occurrence_count.saturating_add(1);
-            return Ok(());
-        }
+        // 通知中心承担错误日志职责：每次发生都独立留痕，不能按 fingerprint
+        // 覆盖旧记录，否则用户无法追溯当时的直接错误与发生时间。
         state.notifications.push(notification);
+        prune_incident_notifications(&mut state.notifications);
         Ok(())
     }
 

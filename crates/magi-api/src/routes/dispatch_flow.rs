@@ -1,4 +1,6 @@
-use magi_core::{EventId, SessionId, TaskStatus, TaskTier, UtcMillis, WorkspaceId};
+use magi_core::{
+    EventId, SessionId, TaskStatus, TaskTier, UtcMillis, WorkspaceId, public_runtime_excerpt,
+};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::ActiveExecutionTurn;
 use serde_json::json;
@@ -159,7 +161,7 @@ pub(super) async fn accept_goal_continuation_task_submission(
     };
     let accepted = submit_dispatch_submission(state, dispatch)?;
     if let Err(error) = state.persist_session_state_checkpoint("goal_continuation_task_accepted") {
-        fail_accepted_task_submission(state, &accepted);
+        fail_accepted_task_submission(state, &accepted, error.message());
         return Err(error);
     }
     Ok(accepted)
@@ -262,7 +264,7 @@ async fn execute_dispatch_submission(
         }
     };
     if let Err(error) = state.persist_session_state_checkpoint("session_task_turn_accepted") {
-        fail_accepted_task_submission(state, &accepted);
+        fail_accepted_task_submission(state, &accepted, error.message());
         return Err(error);
     }
     ingest_user_input_to_conversation(state, &session_id, request, accepted_at);
@@ -399,20 +401,23 @@ pub(super) async fn finalize_session_task_dispatch(
             ?error,
             "session turn task dispatch failed"
         );
-        fail_accepted_task_submission(&state, &accepted);
+        fail_accepted_task_submission(&state, &accepted, error.message());
         return;
     }
     append_dispatch_assistant_message(&state, &accepted);
 }
 
-fn fail_accepted_task_submission(state: &ApiState, accepted: &DispatchSubmissionAccepted) {
+fn fail_accepted_task_submission(
+    state: &ApiState,
+    accepted: &DispatchSubmissionAccepted,
+    direct_error: &str,
+) {
+    const TIMELINE_MESSAGE: &str = "任务执行启动失败，可直接重试。";
+    let direct_error = public_runtime_excerpt(direct_error, 4096);
     if let Some(task_store) = state.task_store()
         && task_store.get_task(&accepted.root_task_id).is_some()
     {
-        task_store.set_output_refs(
-            &accepted.root_task_id,
-            vec!["任务执行启动失败，可直接重试。".to_string()],
-        );
+        task_store.set_output_refs(&accepted.root_task_id, vec![direct_error]);
         let _ = task_store.update_status(&accepted.root_task_id, TaskStatus::Failed);
         if crate::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
             state,
@@ -443,7 +448,7 @@ fn fail_accepted_task_submission(state: &ApiState, accepted: &DispatchSubmission
                 request_id: None,
                 user_message_id: accepted.user_message_item_id.as_deref(),
                 placeholder_message_id: None,
-                error_text: "任务执行启动失败，可直接重试。",
+                error_text: TIMELINE_MESSAGE,
                 streaming_entry_id: None,
                 source_thread_id: thread.thread_id,
                 persist_session_state: None,
@@ -694,11 +699,17 @@ fn assistant_final_from_turn(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_action_task_title, resolve_dispatch_session};
-    use crate::state::ApiState;
-    use magi_core::{AbsolutePath, SessionId, UtcMillis, WorkspaceId};
+    use super::{
+        fail_accepted_task_submission, format_action_task_title, resolve_dispatch_session,
+    };
+    use crate::{errors::ApiError, state::ApiState, task_dispatch::DispatchSubmissionAccepted};
+    use magi_core::{
+        AbsolutePath, MissionId, SessionId, Task, TaskId, TaskKind, TaskRuntimePayload, TaskStatus,
+        UtcMillis, WorkspaceId,
+    };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
+    use magi_orchestrator::task_store::TaskStore;
     use magi_session_store::{SessionStore, TimelineEntryKind};
     use magi_workspace::WorkspaceStore;
     use std::sync::Arc;
@@ -723,6 +734,69 @@ mod tests {
             format_action_task_title("批量检查 README"),
             "执行: 批量检查 README"
         );
+    }
+
+    #[test]
+    fn accepted_dispatch_failure_persists_sanitized_direct_error_on_task() {
+        let task_store = Arc::new(TaskStore::new());
+        let root_task_id = TaskId::new("task-dispatch-direct-error");
+        let now = UtcMillis::now();
+        task_store.insert_task(Task {
+            task_id: root_task_id.clone(),
+            mission_id: MissionId::new("mission-dispatch-direct-error"),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: TaskKind::LocalAgent,
+            title: "派发失败诊断".to_string(),
+            goal: "保留直接错误".to_string(),
+            status: TaskStatus::Pending,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: TaskRuntimePayload::default(),
+            created_at: now,
+            updated_at: now,
+        });
+        let state = test_state().with_task_store(task_store.clone());
+        let accepted = DispatchSubmissionAccepted {
+            session_id: SessionId::new("session-dispatch-direct-error"),
+            entry_id: "entry-dispatch-direct-error".to_string(),
+            accepted_at: now,
+            created_session: false,
+            root_task_id: root_task_id.clone(),
+            action_task_id: root_task_id.clone(),
+            user_message_item_id: None,
+            runner_started: false,
+            superseded_turn: None,
+        };
+        let error = ApiError::internal_assembly(
+            "驱动任务派发",
+            "provider timeout at /Users/xie/code/private.rs with sk-test-secret-value",
+        );
+
+        fail_accepted_task_submission(&state, &accepted, error.message());
+
+        let failed_task = task_store
+            .get_task(&root_task_id)
+            .expect("failed task should remain available");
+        assert_eq!(failed_task.status, TaskStatus::Failed);
+        assert_eq!(failed_task.output_refs.len(), 1);
+        let direct_error = &failed_task.output_refs[0];
+        assert!(direct_error.contains("驱动任务派发"));
+        assert!(direct_error.contains("provider timeout"));
+        assert!(direct_error.contains("[path]"));
+        assert!(direct_error.contains("sk-[redacted]"));
+        assert!(!direct_error.contains("/Users/xie"));
+        assert!(!direct_error.contains("test-secret-value"));
+        assert!(!direct_error.contains("可直接重试"));
     }
 
     #[test]

@@ -19,7 +19,11 @@
   } from '../lib/desktop-file-drop';
   import type { IconName } from '../lib/icons';
   import { addToast, messagesState, setCurrentSessionId, updateSessions } from '../stores/messages.svelte';
-  import { reportIncident } from '../lib/notifications';
+  import {
+    directIncidentError,
+    incidentErrorDiagnostics,
+    reportIncident,
+  } from '../lib/notifications';
   import {
     resolveSessionActivityIndicator,
     shouldMarkSessionCompletionViewed,
@@ -691,10 +695,14 @@
 
   function notifyWorkbenchError(actionLabel: string, error: unknown): void {
     console.warn(`[WebWorkbenchShell] ${actionLabel} failed:`, error);
-    reportIncident(i18n.t('web.workbenchActionFailed', { action: actionLabel }), {
+    const title = i18n.t('web.workbenchActionFailed', { action: actionLabel });
+    const directError = directIncidentError(error, title);
+    reportIncident(directError, {
       scope: 'workspace',
+      title,
+      ...incidentErrorDiagnostics(error, directError),
+      failureStage: 'web_workbench',
       source: 'web-workbench',
-      fingerprint: `web-workbench:${actionLabel}`,
     });
   }
 

@@ -457,6 +457,7 @@ export class AgentApiError extends Error {
   readonly status: number;
   readonly action: string;
   readonly errorCode?: string;
+  readonly detail?: string;
   readonly conflictKind?: string;
   readonly activeTurnId?: string;
 
@@ -465,6 +466,7 @@ export class AgentApiError extends Error {
     message: string,
     action: string,
     errorCode?: string,
+    detail?: string,
     conflictKind?: string,
     activeTurnId?: string,
   ) {
@@ -473,6 +475,7 @@ export class AgentApiError extends Error {
     this.status = status;
     this.action = action;
     this.errorCode = errorCode;
+    this.detail = detail;
     this.conflictKind = conflictKind;
     this.activeTurnId = activeTurnId;
   }
@@ -655,6 +658,7 @@ async function parseAgentJson<T>(response: Response, action: string): Promise<T>
   if (!response.ok) {
     let backendError: string | null = null;
     let backendErrorCode: string | undefined;
+    let backendDetail: string | undefined;
     let conflictKind: string | undefined;
     let activeTurnId: string | undefined;
     const contentType = response.headers.get('content-type') || '';
@@ -665,6 +669,7 @@ async function parseAgentJson<T>(response: Response, action: string): Promise<T>
           message?: string;
           error_code?: string;
           code?: string;
+          detail?: string;
           conflict_kind?: string;
           active_turn_id?: string;
         };
@@ -679,6 +684,9 @@ async function parseAgentJson<T>(response: Response, action: string): Promise<T>
         if (rawErrorCode) {
           backendErrorCode = rawErrorCode;
         }
+        backendDetail = typeof payload?.detail === 'string' && payload.detail.trim()
+          ? payload.detail.trim()
+          : undefined;
         conflictKind = typeof payload?.conflict_kind === 'string' && payload.conflict_kind.trim()
           ? payload.conflict_kind.trim()
           : undefined;
@@ -694,6 +702,7 @@ async function parseAgentJson<T>(response: Response, action: string): Promise<T>
       backendError || `${action} failed: ${response.status}`,
       action,
       backendErrorCode,
+      backendDetail,
       conflictKind,
       activeTurnId,
     );

@@ -1967,7 +1967,7 @@ fn persisted_parts_round_trip_preserves_sidecars() {
 }
 
 #[test]
-fn incident_notifications_are_aggregated_by_scope_and_audits_are_removed() {
+fn incident_notifications_are_scoped_and_legacy_audits_are_removed() {
     fn incident(
         id: &str,
         scope: NotificationScope,
@@ -1983,6 +1983,11 @@ fn incident_notifications_are_aggregated_by_scope_and_audits_are_removed() {
             level: Some("error".to_string()),
             title: None,
             message: id.to_string(),
+            detail: None,
+            error_code: None,
+            failure_stage: None,
+            task_id: None,
+            request_id: None,
             source: Some("test".to_string()),
             created_at: UtcMillis(10),
             handled: false,
@@ -2066,6 +2071,70 @@ fn incident_notifications_are_aggregated_by_scope_and_audits_are_removed() {
         .expect("resolved incident should remain visible");
     assert!(resolved.resolved);
     assert!(resolved.handled);
+
+    let mut first_occurrence = incident(
+        "failure-occurrence-1",
+        NotificationScope::Session,
+        Some("workspace-a"),
+        Some(session_id.as_str()),
+    );
+    first_occurrence.fingerprint = "same-runtime-failure".to_string();
+    first_occurrence.message = "provider timeout on attempt 1".to_string();
+    let mut second_occurrence = incident(
+        "failure-occurrence-2",
+        NotificationScope::Session,
+        Some("workspace-a"),
+        Some(session_id.as_str()),
+    );
+    second_occurrence.fingerprint = "same-runtime-failure".to_string();
+    second_occurrence.message = "provider timeout on attempt 2".to_string();
+
+    store
+        .append_incident_record(first_occurrence)
+        .expect("first failure occurrence should persist");
+    store
+        .append_incident_record(second_occurrence)
+        .expect("second failure occurrence should persist");
+
+    let occurrences = store
+        .notifications_for_context("workspace-a", Some(&session_id))
+        .into_iter()
+        .filter(|item| item.fingerprint == "same-runtime-failure")
+        .collect::<Vec<_>>();
+    assert_eq!(occurrences.len(), 2);
+    assert_ne!(
+        occurrences[0].notification_id,
+        occurrences[1].notification_id
+    );
+    assert_eq!(occurrences[0].occurrence_count, 1);
+    assert_eq!(occurrences[1].occurrence_count, 1);
+
+    for index in 0..=MAX_INCIDENT_NOTIFICATION_RECORDS {
+        let mut record = incident(
+            &format!("retained-failure-{index}"),
+            NotificationScope::App,
+            None,
+            None,
+        );
+        record.created_at = UtcMillis(100 + index as u64);
+        store
+            .append_incident_record(record)
+            .expect("retained failure should persist");
+    }
+    let retained = store.notifications();
+    assert_eq!(retained.len(), MAX_INCIDENT_NOTIFICATION_RECORDS);
+    assert!(
+        retained
+            .iter()
+            .all(|record| record.notification_id != "session-incident"),
+        "已解决的旧记录应优先被保留策略清理"
+    );
+    assert!(
+        retained
+            .iter()
+            .any(|record| record.notification_id == "retained-failure-1000"),
+        "最新错误记录必须保留"
+    );
 }
 
 #[test]

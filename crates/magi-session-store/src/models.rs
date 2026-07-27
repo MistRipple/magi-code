@@ -734,7 +734,19 @@ pub struct NotificationRecord {
     pub level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// 经字段级脱敏后的直接错误文本。
     pub message: String,
+    /// 可选的附加诊断详情，例如调用栈；不能替代 `message` 中的直接错误。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     pub created_at: UtcMillis,
@@ -743,7 +755,7 @@ pub struct NotificationRecord {
     pub action_required: bool,
     #[serde(default = "default_true")]
     pub count_unread: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub fingerprint: String,
     #[serde(default = "default_notification_occurrence_count")]
     pub occurrence_count: u32,
@@ -759,14 +771,6 @@ impl NotificationRecord {
     pub fn normalize_incident(&mut self) {
         self.kind = "incident".to_string();
         self.occurrence_count = self.occurrence_count.max(1);
-        if self.fingerprint.trim().is_empty() {
-            self.fingerprint = format!(
-                "{}:{}:{}",
-                self.source.as_deref().unwrap_or("system"),
-                self.level.as_deref().unwrap_or("error"),
-                self.message.trim()
-            );
-        }
         match self.scope {
             NotificationScope::App => {
                 self.workspace_id = None;

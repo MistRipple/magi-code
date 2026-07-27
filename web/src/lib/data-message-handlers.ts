@@ -444,7 +444,8 @@ export function handleUnifiedControlMessage(standard: StandardMessage) {
       const reason = typeof reasonRaw === 'string' ? reasonRaw.trim() : '';
       const modelOriginIssue = payload?.modelOriginIssue === true;
       const toastLevel = modelOriginIssue ? 'warning' : 'error';
-      const finalReason = i18n.t('messageHandler.requestRejected');
+      const fallbackReason = i18n.t('messageHandler.requestRejected');
+      const finalReason = reason || fallbackReason;
       if (reason) {
         console.warn('[MessageHandler] 任务请求被拒绝:', reason);
       }
@@ -463,8 +464,10 @@ export function handleUnifiedControlMessage(standard: StandardMessage) {
       reportIncident(finalReason, {
         scope: 'session',
         level: toastLevel,
+        title: fallbackReason,
+        failureStage: 'task_admission',
+        requestId,
         source: modelOriginIssue ? 'model-runtime' : 'task-runtime',
-        fingerprint: modelOriginIssue ? 'model-request-rejected' : 'task-request-rejected',
       });
       break;
     }
@@ -532,7 +535,6 @@ export function handleUnifiedNotify(standard: StandardMessage) {
       source: presentation.source,
       actionRequired: presentation.actionRequired,
       duration: presentation.duration,
-      fingerprint: `${presentation.source}:${content}`,
     });
     return;
   }
@@ -718,13 +720,20 @@ export function handleUnifiedData(standard: StandardMessage) {
       const newStatus = typeof payload.newStatus === 'string' ? payload.newStatus : '';
       const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title.trim() : '';
       const label = title || i18n.t('messageHandler.taskDefaultLabel');
+      const taskId = typeof payload.taskId === 'string' ? payload.taskId.trim() : '';
+      const failureDetail = typeof payload.failureDetail === 'string' ? payload.failureDetail.trim() : '';
+      const failureStage = typeof payload.failureStage === 'string' ? payload.failureStage.trim() : '';
 
-      // 当前只弹出失败态，完成态由目标面板和时间线自然呈现，避免重复通知。
+      // 失败通知承担错误日志职责，必须记录运行时给出的直接错误；没有错误详情时
+      // 使用明确的诊断缺失信息，不能再生成“请查看其他面板”的空泛模板。
       if (newStatus === 'Failed') {
-        reportIncident(i18n.t('messageHandler.taskFailedNotification', { label }), {
+        const directError = failureDetail || i18n.t('notification.missingRuntimeDetail');
+        reportIncident(directError, {
           scope: 'session',
           source: 'task-runtime',
-          fingerprint: `task-failed:${label}`,
+          title: label,
+          failureStage: failureStage || 'task_execution',
+          taskId: taskId || undefined,
         });
       }
       break;
@@ -888,6 +897,37 @@ function hasBoundLocalPendingRequest(): boolean {
   return listRequestBindings().some((binding) => (
     messagesState.pendingRequests.has(binding.requestId)
   ));
+}
+
+function canonicalTurnRequestId(turn: CanonicalTurn): string {
+  const turnRequestId = typeof turn.metadata?.requestId === 'string'
+    ? turn.metadata.requestId.trim()
+    : '';
+  if (turnRequestId) {
+    return turnRequestId;
+  }
+  for (const item of turn.items) {
+    const itemRequestId = typeof item.metadata?.requestId === 'string'
+      ? item.metadata.requestId.trim()
+      : '';
+    if (itemRequestId) {
+      return itemRequestId;
+    }
+  }
+  return '';
+}
+
+function canonicalSnapshotContainsAllBoundPendingRequests(turns: CanonicalTurn[]): boolean {
+  const pendingRequestIds = new Set(
+    listRequestBindings()
+      .map((binding) => binding.requestId)
+      .filter((requestId) => messagesState.pendingRequests.has(requestId)),
+  );
+  if (pendingRequestIds.size === 0) {
+    return false;
+  }
+  const snapshotRequestIds = new Set(turns.map(canonicalTurnRequestId).filter(Boolean));
+  return [...pendingRequestIds].every((requestId) => snapshotRequestIds.has(requestId));
 }
 
 function canonicalTurnsForSession(sessionId: string, turns: unknown): CanonicalTurn[] {
@@ -1071,10 +1111,13 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       const canonicalSessionTurns = canonicalTurnsForSession(sessionId, canonicalTurns);
       const shouldApplyCanonicalSnapshot = canonicalEventWatermark
         >= turnStoreState.reducer.lastAppliedEventSeq;
-      const preserveLocalTurnDuringStaleIdle = hadLiveTurnBeforeSnapshot
+      // bootstrap 的处理态和 canonical turn 可能并非同一时刻落盘。只要快照还没有
+      // 当前绑定的 requestId，就不能用它替换本地轮次，否则无论快照显示 idle 还是
+      // processing，都会把刚发送的用户消息从对话区擦掉。
+      const preserveLocalTurnDuringStaleSnapshot = hadLiveTurnBeforeSnapshot
         && hadPendingLocalRequestBeforeSnapshot
-        && authoritativeSnapshotIsIdle
-        && (canonicalSessionTurns.length === 0 || hasBoundLocalPendingRequest());
+        && hasBoundLocalPendingRequest()
+        && !canonicalSnapshotContainsAllBoundPendingRequests(canonicalSessionTurns);
 
       handleStateUpdate({
         ...message,
@@ -1084,9 +1127,9 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
           currentWorkspaceId: workspaceId,
           sessions,
         },
-      }, { preserveLocalProcessing: preserveLocalTurnDuringStaleIdle });
+      }, { preserveLocalProcessing: preserveLocalTurnDuringStaleSnapshot });
 
-      if (!preserveLocalTurnDuringStaleIdle) {
+      if (!preserveLocalTurnDuringStaleSnapshot) {
         replaceOrchestratorRuntimeState(
           (snapshot.orchestratorRuntimeState as OrchestratorRuntimeState | null | undefined) ?? null,
         );
@@ -1103,7 +1146,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         preserveLoadedWindow: true,
       });
 
-      if (shouldApplyCanonicalSnapshot) {
+      if (shouldApplyCanonicalSnapshot && !preserveLocalTurnDuringStaleSnapshot) {
         applyCanonicalTurnsSnapshot(sessionId, canonicalSessionTurns, canonicalEventWatermark);
         reconcileRequestBindingsFromAuthoritativeThread(sessionId);
       }

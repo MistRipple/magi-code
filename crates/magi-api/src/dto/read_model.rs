@@ -1,4 +1,6 @@
-use magi_core::{TaskId, TaskStatus, public_runtime_summary, public_runtime_text};
+use magi_core::{
+    TaskId, TaskStatus, public_runtime_excerpt, public_runtime_summary, public_runtime_text,
+};
 use magi_event_bus::{
     ExecutionGroupRuntimeSummaryEntry, RecoveryActivityStage, RecoveryDiagnosticSummaryEntry,
     RuntimeLedgerSummary, RuntimeReadModelInput, SessionRuntimeBranchSummaryEntry,
@@ -766,6 +768,15 @@ fn merge_task_store_projection(
         task_entry.title = Some(task.title.clone());
         task_entry.mission_id = Some(mission_id.clone());
         task_entry.current_status = Some(task_status_label(&task.status));
+        task_entry.failure_detail = if task.status == TaskStatus::Failed {
+            task.output_refs
+                .iter()
+                .find(|value| !value.trim().is_empty())
+                .map(|value| public_runtime_excerpt(value, 4096))
+                .filter(|value| !value.is_empty())
+        } else {
+            None
+        };
     }
 }
 
@@ -956,6 +967,7 @@ mod tests {
         let running_task_id = TaskId::new("task-running-projection");
         let pending_task_id = TaskId::new("task-pending-projection");
         let completed_task_id = TaskId::new("task-completed-projection");
+        let failed_task_id = TaskId::new("task-failed-projection");
         let now = UtcMillis::now();
         for (task_id, parent_task_id, status) in [
             (&root_task_id, None, TaskStatus::Running),
@@ -973,6 +985,11 @@ mod tests {
                 &completed_task_id,
                 Some(root_task_id.clone()),
                 TaskStatus::Completed,
+            ),
+            (
+                &failed_task_id,
+                Some(root_task_id.clone()),
+                TaskStatus::Failed,
             ),
         ] {
             task_store.insert_task(magi_core::Task {
@@ -1000,6 +1017,13 @@ mod tests {
                 updated_at: now,
             });
         }
+        task_store.set_output_refs(
+            &failed_task_id,
+            vec![
+                "provider timeout at /Users/xie/code/model.rs with sk-test-secret-value"
+                    .to_string(),
+            ],
+        );
 
         let runtime_read_model = runtime_read_model_dto(
             RuntimeReadModelInput::default(),
@@ -1093,6 +1117,21 @@ mod tests {
                 .flatten(),
             Some("completed")
         );
+        let failed_task = runtime_read_model
+            .details
+            .tasks
+            .iter()
+            .find(|entry| entry.task_id == failed_task_id.to_string())
+            .expect("failed TaskStore entry should be projected");
+        let failure_detail = failed_task
+            .failure_detail
+            .as_deref()
+            .expect("failed TaskStore entry should expose direct error");
+        assert!(failure_detail.contains("provider timeout"));
+        assert!(failure_detail.contains("[path]"));
+        assert!(failure_detail.contains("sk-[redacted]"));
+        assert!(!failure_detail.contains("/Users/xie"));
+        assert!(!failure_detail.contains("test-secret-value"));
     }
 
     #[test]

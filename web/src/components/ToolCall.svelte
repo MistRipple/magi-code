@@ -421,18 +421,12 @@
       return;
     }
     lastReportedAgentSpawnFailureSignature = signature;
-    const failureStage = agentSpawnFailureStageLabel(display.failureStage);
-    const diagnostics = [
-      display.error,
-      `${i18n.t('toolCall.agentSpawn.failureCode')}${display.errorCode}`,
-      failureStage ? `${i18n.t('toolCall.agentSpawn.failureStage')}${failureStage}` : '',
-    ].filter(Boolean).join('；');
-    reportIncident(diagnostics, {
+    reportIncident(display.error, {
       scope: 'session',
       source: 'agent-spawn',
       title: i18n.t('toolCall.agentSpawn.creationFailed'),
-      fingerprint: `agent-spawn:${id || display.diagnosticRef || display.errorCode}`,
-      notificationId: `agent-spawn:${id || display.diagnosticRef || display.errorCode}`,
+      errorCode: display.errorCode,
+      failureStage: display.failureStage,
     });
   });
 

@@ -909,6 +909,11 @@ export type IncidentScopeDto = 'app' | 'workspace' | 'session';
 export interface IncidentNotificationItemDto {
   notificationId: string;
   message: string;
+  detail?: string | null;
+  errorCode?: string | null;
+  failureStage?: string | null;
+  taskId?: string | null;
+  requestId?: string | null;
   kind: 'incident';
   scope: IncidentScopeDto;
   level: string;
@@ -947,14 +952,17 @@ export interface RemoveNotificationRequestDto extends NotificationContextRequest
 }
 
 export interface ReportIncidentRequestDto extends NotificationContextRequestDto {
-  notificationId?: string | null;
   scope: IncidentScopeDto;
   level?: string | null;
   title?: string | null;
   message: string;
+  detail?: string | null;
+  errorCode?: string | null;
+  failureStage?: string | null;
+  taskId?: string | null;
+  requestId?: string | null;
   source?: string | null;
   actionRequired?: boolean | null;
-  fingerprint?: string | null;
 }
 
 export type MarkAllNotificationsReadResponseDto = NotificationsResponseDto;

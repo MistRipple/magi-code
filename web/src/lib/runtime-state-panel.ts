@@ -1,7 +1,7 @@
 export interface RuntimePanelVisibilityInput {
   status?: string | null;
   isProcessing: boolean;
-  assignmentCount: number;
+  attentionAssignmentCount: number;
 }
 
 export interface RuntimeTaskProgressSnapshot {
@@ -19,11 +19,36 @@ export interface RuntimeTaskProgress {
 }
 
 export function shouldShowRuntimePanel(input: RuntimePanelVisibilityInput): boolean {
-  if (input.isProcessing || input.assignmentCount > 0) {
+  const status = input.status?.trim();
+  if (status === 'completed' || status === 'cancelled') {
+    return false;
+  }
+  if (input.isProcessing || input.attentionAssignmentCount > 0) {
     return true;
   }
-  const status = input.status?.trim();
-  return Boolean(status && status !== 'idle');
+  return status === 'running'
+    || status === 'waiting'
+    || status === 'paused'
+    || status === 'blocked'
+    || status === 'failed';
+}
+
+export function runtimeAssignmentNeedsAttention(status: string | undefined): boolean {
+  switch (status?.trim().toLowerCase()) {
+    case 'running':
+    case 'in_progress':
+    case 'pending':
+    case 'waiting':
+    case 'waiting_deps':
+    case 'awaiting_approval':
+    case 'review_required':
+    case 'paused':
+    case 'blocked':
+    case 'failed':
+      return true;
+    default:
+      return false;
+  }
 }
 
 export function shouldShowRuntimePhase(status: string | undefined, phase: string | undefined): boolean {

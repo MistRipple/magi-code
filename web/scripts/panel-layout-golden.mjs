@@ -44,6 +44,27 @@ const enLocaleSource = await readFile(
 );
 
 assert.match(
+  inputAreaSource,
+  /\.ia-picker-popover\.ia-branch-popover\s*\{[\s\S]*?width:\s*min\(320px,\s*calc\(100vw - 24px\)\);/,
+  'Git 分支面板必须保持紧凑宽度，不能为长分支名扩展到宽面板',
+);
+assert.match(
+  inputAreaSource,
+  /\.ia-branch-switch-item \.ia-picker-item-label,[\s\S]*?text-overflow:\s*ellipsis;[\s\S]*?white-space:\s*nowrap;/,
+  '分支名称必须单行省略，不能撑宽或溢出 Git 面板',
+);
+assert.match(
+  inputAreaSource,
+  /class="ia-picker-item-label" title=\{branch\}>\{branch\}<\/span>/,
+  '省略的分支名称必须通过悬浮提示展示完整值',
+);
+assert.match(
+  inputAreaSource,
+  /class="ia-branch-btn"[\s\S]*?title=\{branchStatusTitle\(\)\}/,
+  '当前分支按钮被截断时必须可悬浮查看完整分支名',
+);
+
+assert.match(
   headerSource,
   /\.header-more-menu\s*\{[\s\S]*?background:\s*var\(--dropdown-bg\);/,
   '顶部更多菜单必须使用不透明的下拉菜单背景，不能使用透明表面层',

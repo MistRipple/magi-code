@@ -16,7 +16,7 @@ import {
   addPendingRequest,
   settleProcessingForManualInteraction,
 } from '../stores/messages.svelte';
-import { reportIncident } from './notifications';
+import { directIncidentError, incidentErrorDiagnostics, reportIncident } from './notifications';
 import type { StandardMessage } from '../shared/protocol/message-protocol';
 import { MessageType, MessageCategory } from '../shared/protocol/message-protocol';
 import {
@@ -127,10 +127,6 @@ let eventSeqWorkspaceId = '';
 const processedEventKeys = new Set<string>();
 const processedEventKeyQueue: string[] = [];
 const MAX_TRACKED_EVENT_KEYS = 4000;
-const UNHANDLED_MESSAGE_TOAST_WINDOW_MS = 3000;
-let lastUnhandledMessageErrorSignature = '';
-let lastUnhandledMessageErrorAt = 0;
-
 function resetEventSeqTracking(seed: number = 0, sessionId?: string, workspaceId?: string): void {
   lastAppliedEventSeq = seed > 0 ? Math.floor(seed) : 0;
   eventSeqSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
@@ -300,23 +296,14 @@ function handleUnhandledMessageError(error: unknown, message?: ClientBridgeMessa
   // 统一降级策略：消息处理崩溃后立即收敛前端运行态，避免用户看到“持续执行但无输出”假象。
   settleProcessingForManualInteraction();
 
-  const detail = error instanceof Error ? error.message.trim() : String(error || '').trim();
-  const messageType = typeof message?.type === 'string' && message.type.trim() ? message.type : 'unknown';
-  const signature = `${messageType}:${detail || 'unknown'}`;
-  const now = Date.now();
-  const withinDedupWindow = (
-    signature === lastUnhandledMessageErrorSignature
-    && now - lastUnhandledMessageErrorAt < UNHANDLED_MESSAGE_TOAST_WINDOW_MS
-  );
-  if (withinDedupWindow) {
-    return;
-  }
-  lastUnhandledMessageErrorSignature = signature;
-  lastUnhandledMessageErrorAt = now;
-  reportIncident(i18n.t('messageHandler.syncError'), {
+  const title = i18n.t('messageHandler.syncError');
+  const directError = directIncidentError(error, title);
+  reportIncident(directError, {
     scope: 'app',
+    title,
+    ...incidentErrorDiagnostics(error, directError),
+    failureStage: 'message_sync',
     source: 'message-handler',
-    fingerprint: signature,
   });
 }
 

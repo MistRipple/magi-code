@@ -6,6 +6,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use magi_core::public_runtime_excerpt;
 use serde::Serialize;
 use std::fmt::Display;
 
@@ -146,7 +147,7 @@ impl ApiError {
         }
     }
 
-    fn hides_private_message(&self) -> bool {
+    fn includes_diagnostic_detail(&self) -> bool {
         matches!(
             self,
             ApiError::InvalidRequestBody(_)
@@ -173,18 +174,21 @@ impl IntoResponse for ApiError {
         let error_code = self.error_code();
         let private_message = self.message().to_string();
         let public_message = self.public_message().to_string();
+        let detail = self
+            .includes_diagnostic_detail()
+            .then(|| public_runtime_excerpt(&private_message, 4096));
         let (conflict_kind, active_turn_id) = self.turn_conflict_context();
-        if self.hides_private_message() {
+        if self.includes_diagnostic_detail() {
             tracing::warn!(
                 error_code,
                 error = %private_message,
-                "api runtime detail hidden from response"
+                "api runtime error returned with sanitized diagnostic detail"
             );
         }
         let body = ErrorResponseDto {
             error_code: error_code.to_string(),
             message: public_message,
-            detail: None,
+            detail,
             conflict_kind,
             active_turn_id,
         };
@@ -379,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_error_public_messages_hide_internal_detail() {
+    fn runtime_errors_keep_friendly_summary_and_diagnostic_detail_policy() {
         let internal = ApiError::internal_assembly("创建会话失败", "task_store 未配置");
         let model = ApiError::model_invocation_failed("模型调用失败", "provider transport failed");
         let request_body = ApiError::invalid_request_body("expected value at line 1 column 1");
@@ -394,7 +398,7 @@ mod tests {
             request_body.public_message(),
             "请求内容格式不正确，请检查后重试"
         );
-        assert!(request_body.hides_private_message());
+        assert!(request_body.includes_diagnostic_detail());
     }
 
     #[test]
@@ -434,7 +438,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_body_parse_error_response_hides_parser_detail() {
+    async fn request_body_parse_error_response_keeps_parser_detail() {
         let response =
             ApiError::invalid_request_body("expected value at line 1 column 1").into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -447,10 +451,37 @@ mod tests {
 
         assert_eq!(payload["error_code"], "REQUEST_BODY_INVALID");
         assert_eq!(payload["message"], "请求内容格式不正确，请检查后重试");
-        assert!(payload.get("detail").is_none());
         assert!(
-            !String::from_utf8_lossy(&bytes).contains("line 1 column 1"),
-            "请求体解析器细节不能出现在响应体中"
+            payload["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("line 1 column 1")),
+            "响应必须保留可定位的解析器错误"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_error_detail_redacts_secrets_without_rewriting_cause() {
+        let response = ApiError::model_invocation_failed(
+            "模型调用失败",
+            "provider timeout at /Users/xie/code/model.rs with sk-test-secret-value and Bearer raw-token",
+        )
+        .into_response();
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("error response json");
+        let detail = payload["detail"]
+            .as_str()
+            .expect("runtime detail should exist");
+
+        assert!(detail.contains("provider timeout"));
+        assert!(detail.contains("[path]"));
+        assert!(detail.contains("sk-[redacted]"));
+        assert!(detail.contains("Bearer [redacted]"));
+        assert!(!detail.contains("/Users/xie"));
+        assert!(!detail.contains("test-secret-value"));
+        assert!(!detail.contains("raw-token"));
     }
 }

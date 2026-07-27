@@ -403,8 +403,14 @@ function forwardToVsCodeHost(message: ClientBridgeMessage): boolean {
 }
 
 function normalizeErrorMessage(error: unknown): string | undefined {
-  if (error instanceof Error) {
-    return error.message;
+  if (error && typeof error === 'object') {
+    const candidate = error as { detail?: unknown; message?: unknown };
+    if (typeof candidate.detail === 'string' && candidate.detail.trim()) {
+      return candidate.detail.trim();
+    }
+    if (typeof candidate.message === 'string' && candidate.message.trim()) {
+      return candidate.message.trim();
+    }
   }
   if (typeof error === 'string' && error.trim()) {
     return error.trim();
@@ -1853,8 +1859,13 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     const terminalPublicMessage = trimBridgeString(event.payload?.public_message)
       || trimBridgeString(event.payload?.publicMessage)
       || trimBridgeString(event.payload?.error);
-    if (eventType === 'session.turn.queue_failed' && terminalPublicMessage) {
-      emitBridgeErrorToast(i18n.t('bridge.action.sendMessage'), new Error(terminalPublicMessage));
+    const terminalFailureDetail = trimBridgeString(event.payload?.failure_detail)
+      || trimBridgeString(event.payload?.failureDetail);
+    if (eventType === 'session.turn.queue_failed' && (terminalFailureDetail || terminalPublicMessage)) {
+      emitBridgeErrorToast(
+        i18n.t('bridge.action.sendMessage'),
+        new Error(terminalFailureDetail || terminalPublicMessage),
+      );
     }
     const terminalReason = eventType === 'session.turn.failed'
       ? (terminalErrorCode || 'session_turn_failed_without_reason')
@@ -1913,6 +1924,8 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
         newStatus: event.payload.new_status ?? event.payload.status ?? '',
         oldStatus: event.payload.old_status ?? '',
         kind: event.payload.kind ?? '',
+        failureDetail: event.payload.failure_detail ?? event.payload.failureDetail ?? '',
+        failureStage: event.payload.failure_stage ?? event.payload.failureStage ?? '',
       });
     }
   }
@@ -1935,7 +1948,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
 function emitBridgeErrorToast(
   action: string,
-  _error: unknown,
+  error: unknown,
   options: {
     reportIncident?: boolean;
     actionRequired?: boolean;
@@ -1943,9 +1956,10 @@ function emitBridgeErrorToast(
   } = {},
 ): void {
   const normalizedAction = action.trim() || i18n.t('bridge.toast.defaultAction');
-  const content = i18n.t('bridge.toast.actionFailed', { action: normalizedAction });
+  const friendlyMessage = i18n.t('bridge.toast.actionFailed', { action: normalizedAction });
   const now = Date.now();
   const incident = options.reportIncident !== false;
+  const content = incident ? (normalizeErrorMessage(error) || friendlyMessage) : friendlyMessage;
   const actionRequired = options.actionRequired ?? true;
   const message = createNotifyMessage(
     content,
@@ -2040,15 +2054,9 @@ function logBridgeOperationFailure(
   }
 }
 
-function logKnowledgeOperationFailure(action: string, logLabel: string, error: unknown, detailKey: string): void {
+function logKnowledgeOperationFailure(action: string, logLabel: string, error: unknown): void {
   console.error(logLabel, error);
-  emitBridgeErrorToast(action, new Error(i18n.t(detailKey)));
-}
-
-function knowledgeAddFailureKey(kind: string): string {
-  if (kind === 'adr') return 'knowledge.toast.addAdrFailed';
-  if (kind === 'faq') return 'knowledge.toast.addFaqFailed';
-  return 'knowledge.toast.addLearningFailed';
+  emitBridgeErrorToast(action, error);
 }
 
 function isBridgeRecoveringOrUnavailable(): boolean {
@@ -2220,20 +2228,31 @@ function advanceEventStreamCursorFromEvent(event: RustEventEnvelope): void {
   }
 }
 
-async function readAgentErrorPayload(response: Response): Promise<{ errorCode?: string; message?: string }> {
+async function readAgentErrorPayload(
+  response: Response,
+): Promise<{ errorCode?: string; message?: string; detail?: string }> {
   const contentType = response.headers.get('content-type') || '';
   if (!contentType.includes('application/json')) {
     return {};
   }
   try {
-    const payload = await response.json() as { error_code?: string; code?: string; message?: string; error?: string };
+    const payload = await response.json() as {
+      error_code?: string;
+      code?: string;
+      message?: string;
+      error?: string;
+      detail?: string;
+    };
     const errorCode = typeof payload.error_code === 'string' && payload.error_code.trim()
       ? payload.error_code.trim()
       : (typeof payload.code === 'string' && payload.code.trim() ? payload.code.trim() : undefined);
     const message = typeof payload.message === 'string' && payload.message.trim()
       ? payload.message.trim()
       : (typeof payload.error === 'string' && payload.error.trim() ? payload.error.trim() : undefined);
-    return { errorCode, message };
+    const detail = typeof payload.detail === 'string' && payload.detail.trim()
+      ? payload.detail.trim()
+      : undefined;
+    return { errorCode, message, detail };
   } catch {
     return {};
   }
@@ -2799,7 +2818,7 @@ async function fetchBootstrap(
   const doFetch = async (): Promise<void> => {
     let effectiveBinding = requestBinding;
     let response = await getTransport().request(agentUrl('/bootstrap', buildBootstrapQuery(effectiveBinding)));
-    let errorPayload: { errorCode?: string; message?: string } = {};
+    let errorPayload: { errorCode?: string; message?: string; detail?: string } = {};
     if (!response.ok) {
       errorPayload = await readAgentErrorPayload(response);
     }
@@ -2850,6 +2869,7 @@ async function fetchBootstrap(
         errorPayload.message || `bootstrap failed: ${response.status}`,
         'bootstrap',
         errorPayload.errorCode,
+        errorPayload.detail,
       );
     }
     const rawPayload = await response.json();
@@ -3324,18 +3344,6 @@ async function removeQueuedMessageFromServer(queuedMessageId: string): Promise<v
   }
 }
 
-function scheduleLocalTurnProjection(work: () => boolean): Promise<boolean> {
-  return new Promise((resolve, reject) => {
-    setTimeout(() => {
-      try {
-        resolve(work());
-      } catch (error) {
-        reject(error);
-      }
-    }, 0);
-  });
-}
-
 async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   const text = typeof input.text === 'string' ? input.text : null;
   const normalizedText = text?.trim() || '';
@@ -3413,9 +3421,9 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     source: 'orchestrator',
     agent: 'orchestrator',
   });
-  // 提交生命周期与消息投影分层：processing 是轻量状态事务，canonical 投影在下一任务执行。
-  // 这样输入事件可立即结束，浏览器先绘制按钮和等待态，网络预连接也可同时推进。
-  const localProjectionPromise = scheduleLocalTurnProjection(() => emitLocalPendingCanonicalTurn({
+  // processing 与用户消息必须在同一次提交事务中进入当前会话，禁止出现
+  // “已经计时但消息区为空”的中间状态。后端 accepted 事件仍按 requestId 原位接管该轮次。
+  emitLocalPendingCanonicalTurn({
     sessionId: optimisticSessionId,
     requestId,
     userMessageId,
@@ -3425,7 +3433,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     contextReferences,
     turnSeq: turnOrderSeq,
     createdAt: requestCreatedAt,
-  }));
+  });
 
   try {
     if (
@@ -3443,7 +3451,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       }
       console.warn('[web-client-bridge] 发送前事件流预连接失败，继续提交本次消息:', preflightError);
     }
-    await localProjectionPromise;
     const turnResult = await submitSessionTurn({
       text,
       skillName,
@@ -3531,7 +3538,6 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     });
     return true;
   } catch (error) {
-    await localProjectionPromise;
     clearActiveTurnInFlight();
     clearCurrentInterruptTaskId();
     console.error('[web-client-bridge] 执行任务失败:', error);
@@ -4863,7 +4869,6 @@ export function createWebClientBridge(): ClientBridge {
               i18n.t('settings.toast.action.loadProjectKnowledge'),
               '[web-client-bridge] 项目知识加载失败:',
               error,
-              'knowledge.toast.loadFailed',
             );
           });
           return;
@@ -4879,7 +4884,6 @@ export function createWebClientBridge(): ClientBridge {
                 i18n.t('settings.toast.action.loadProjectKnowledge'),
                 '[web-client-bridge] 项目知识重建失败:',
                 error,
-                'knowledge.toast.loadFailed',
               );
             });
           return;
@@ -4890,7 +4894,6 @@ export function createWebClientBridge(): ClientBridge {
               i18n.t('settings.toast.action.clearProjectKnowledge'),
               '[web-client-bridge] 清空项目知识失败:',
               error,
-              'knowledge.toast.clearFailed',
             );
           });
           return;
@@ -4910,7 +4913,7 @@ export function createWebClientBridge(): ClientBridge {
               await emitKnowledgePayload(scope);
               emitBridgeSuccessToast(i18n.t('bridge.action.addKnowledgeItem'), i18n.t('bridge.detail.knowledgeItemAdded'));
             }).catch((error) => {
-              logKnowledgeOperationFailure(i18n.t('bridge.action.addKnowledgeItem'), '[web-client-bridge] 添加知识条目失败:', error, knowledgeAddFailureKey(kind));
+              logKnowledgeOperationFailure(i18n.t('bridge.action.addKnowledgeItem'), '[web-client-bridge] 添加知识条目失败:', error);
             });
           }
           return;
@@ -4929,7 +4932,7 @@ export function createWebClientBridge(): ClientBridge {
               await emitKnowledgePayload(scope);
               emitBridgeSuccessToast(i18n.t('bridge.action.updateKnowledgeItem'), i18n.t('bridge.detail.knowledgeItemUpdated'));
             }).catch((error) => {
-              logKnowledgeOperationFailure(i18n.t('bridge.action.updateKnowledgeItem'), '[web-client-bridge] 更新知识条目失败:', error, 'knowledge.form.saveFailed');
+              logKnowledgeOperationFailure(i18n.t('bridge.action.updateKnowledgeItem'), '[web-client-bridge] 更新知识条目失败:', error);
             });
           }
           return;
@@ -4942,7 +4945,7 @@ export function createWebClientBridge(): ClientBridge {
               await emitKnowledgePayload(scope);
               emitBridgeSuccessToast(i18n.t('bridge.action.deleteKnowledgeItem'), i18n.t('bridge.detail.knowledgeItemDeleted'));
             }).catch((error) => {
-              logKnowledgeOperationFailure(i18n.t('bridge.action.deleteKnowledgeItem'), '[web-client-bridge] 删除知识条目失败:', error, 'knowledge.toast.deleteFailed');
+              logKnowledgeOperationFailure(i18n.t('bridge.action.deleteKnowledgeItem'), '[web-client-bridge] 删除知识条目失败:', error);
             });
           }
           return;

@@ -1771,11 +1771,74 @@ function assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, me
     resetPanelState: true,
     skipAntiLiftBack: true,
   });
-  messagesStore.addPendingRequest(requestId);
+  const local = baseCase(
+    'stale-idle-local-turn',
+    sessionId,
+    `turn-local-${requestId}`,
+    10_100,
+  );
+  const localMetadata = {
+    requestId,
+    userMessageId: 'user-stale-idle-bootstrap',
+    placeholderMessageId: 'assistant-stale-idle-bootstrap',
+    localOptimistic: true,
+  };
+  const localUser = user(local, 1, '这条本地消息不能被陈旧快照擦除。');
+  localUser.itemId = localMetadata.userMessageId;
+  localUser.metadata = localMetadata;
+  const localAssistant = assistantPlaceholderText(
+    local,
+    2,
+    localMetadata.placeholderMessageId,
+    'running',
+  );
+  localAssistant.metadata = localMetadata;
+  messagesStore.createRequestBinding({
+    requestId,
+    userMessageId: localMetadata.userMessageId,
+    placeholderMessageId: localMetadata.placeholderMessageId,
+    createdAt: local.turnSeq,
+  });
+  messagesStore.beginLocalTurnSubmission({
+    requestId,
+    placeholderMessageId: localMetadata.placeholderMessageId,
+    startedAt: local.turnSeq,
+  });
+  dataHandlers.handleUnifiedData({
+    id: 'golden-stale-idle-local-turn',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: local.turnSeq,
+    updatedAt: local.turnSeq,
+    data: {
+      dataType: 'sessionTurnCanonicalEventUpdated',
+      payload: {
+        sessionId,
+        canonicalEvent: event(local, 0, 'turn_started', {
+          turn: turn(local, 'running', [localUser, localAssistant], {
+            metadata: localMetadata,
+          }),
+          item: localAssistant,
+        }),
+      },
+    },
+  });
   assert.equal(
     messagesStore.messagesState.isProcessing,
     true,
     'stale idle bootstrap repro starts with an active local turn',
+  );
+  assert.equal(
+    findArtifactByTurnItemId(
+      messagesStore.messagesState.canonicalTimelineProjection,
+      localMetadata.userMessageId,
+    )?.message.content,
+    localUser.content,
+    'stale idle bootstrap repro starts with a visible local user message',
   );
 
   dataHandlers.handleUnifiedData({
@@ -1830,6 +1893,96 @@ function assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, me
     messagesStore.messagesState.isProcessing,
     true,
     'stale idle bootstrap without terminal turn must not interrupt the active conversation flow',
+  );
+  assert.equal(
+    findArtifactByTurnItemId(
+      messagesStore.messagesState.canonicalTimelineProjection,
+      localMetadata.userMessageId,
+    )?.message.content,
+    localUser.content,
+    'stale idle bootstrap must not replace the local canonical turn with an empty snapshot',
+  );
+
+  const accepted = baseCase(
+    'authoritative-bootstrap-accepts-local-turn',
+    sessionId,
+    'turn-authoritative-stale-idle-bootstrap',
+    10_200,
+  );
+  const authoritativeMetadata = {
+    requestId,
+    userMessageId: localMetadata.userMessageId,
+    placeholderMessageId: localMetadata.placeholderMessageId,
+  };
+  const acceptedUser = user(accepted, 1, localUser.content);
+  acceptedUser.itemId = localMetadata.userMessageId;
+  acceptedUser.metadata = authoritativeMetadata;
+  const acceptedAssistant = assistantText(
+    accepted,
+    2,
+    localMetadata.placeholderMessageId,
+    '权威快照已接管。',
+    'completed',
+  );
+  acceptedAssistant.metadata = authoritativeMetadata;
+  dataHandlers.handleUnifiedData({
+    id: 'golden-authoritative-bootstrap-accepts-local-turn',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: accepted.turnSeq + 100,
+    updatedAt: accepted.turnSeq + 100,
+    data: {
+      dataType: 'sessionBootstrapLoaded',
+      payload: {
+        sessionId,
+        workspace: {
+          workspaceId,
+          rootPath: workspacePath,
+        },
+        sessions,
+        state: {
+          currentSessionId: sessionId,
+          currentWorkspaceId: workspaceId,
+          currentWorkspacePath: workspacePath,
+          sessions,
+          isProcessing: false,
+          processingState: null,
+          messages: [],
+          edits: [],
+          changedFiles: [],
+          pendingChanges: [],
+          pendingChangesState: null,
+        },
+        canonicalTurns: [turn(accepted, 'completed', [acceptedUser, acceptedAssistant], {
+          completedAt: accepted.turnSeq + 100,
+          responseDurationMs: 100,
+          metadata: authoritativeMetadata,
+        })],
+        notifications: {
+          notifications: [],
+        },
+        orchestratorRuntimeState: null,
+        hasMoreBefore: false,
+        beforeCursor: null,
+      },
+    },
+  });
+  assert.equal(
+    findArtifactByTurnItemId(
+      messagesStore.messagesState.canonicalTimelineProjection,
+      localMetadata.placeholderMessageId,
+    )?.message.content,
+    acceptedAssistant.content,
+    '包含当前 requestId 的权威快照必须正常接管本地轮次',
+  );
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    false,
+    '包含当前 requestId 的权威终态快照必须收敛 processing',
   );
   messagesStore.clearProcessingState({ skipAntiLiftBack: true });
   messagesStore.clearAllRequestBindings();

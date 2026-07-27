@@ -1,6 +1,7 @@
 use crate::{AuditUsageLedgerStatus, EventCategory, EventEnvelope};
 use magi_core::{
-    AssignmentId, MissionId, SessionId, TaskId, UtcMillis, WorkspaceId, public_runtime_summary,
+    AssignmentId, MissionId, SessionId, TaskId, UtcMillis, WorkspaceId, public_runtime_excerpt,
+    public_runtime_summary,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -177,6 +178,8 @@ pub struct TaskRuntimeSummaryEntry {
     pub task_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
     pub mission_id: Option<String>,
     pub assignment_id: Option<String>,
     pub event_count: usize,
@@ -1429,6 +1432,19 @@ impl RuntimeReadModelInput {
                 }
                 task_entry.latest_event_type = Some(event.event_type.clone());
                 if let Some(status) = infer_task_status(event) {
+                    if event.event_type == "task.status.changed" {
+                        task_entry.failure_detail =
+                            if matches!(status.as_str(), "failed" | "blocked") {
+                                event
+                                    .payload
+                                    .get("failure_detail")
+                                    .and_then(|value| value.as_str())
+                                    .map(|value| public_runtime_excerpt(value, 4096))
+                                    .filter(|value| !value.is_empty())
+                            } else {
+                                None
+                            };
+                    }
                     task_entry.current_status = Some(status);
                 }
             }
@@ -3110,6 +3126,42 @@ mod tests {
             .find(|entry| entry.mission_id == "mission-1")
             .expect("mission runtime entry should exist");
         assert_eq!(mission.current_status.as_deref(), Some("succeeded"));
+    }
+
+    #[test]
+    fn failed_task_status_keeps_sanitized_direct_error() {
+        let mut task_failed = crate::task_events::task_status_changed_event(
+            "task-failed-1",
+            "mission-failed-1",
+            "Running",
+            "Failed",
+            "Action",
+        )
+        .with_context(EventContext {
+            mission_id: Some(MissionId::new("mission-failed-1")),
+            task_id: Some(TaskId::new("task-failed-1")),
+            session_id: Some(SessionId::new("session-failed-1")),
+            ..EventContext::default()
+        });
+        task_failed.payload["failure_detail"] =
+            json!("provider timeout at /Users/xie/code/model.rs with sk-test-secret-value");
+
+        let read_model = RuntimeReadModelInput::from_events(&[task_failed]);
+        let task = read_model
+            .details
+            .tasks
+            .iter()
+            .find(|entry| entry.task_id == "task-failed-1")
+            .expect("failed task runtime entry should exist");
+        let failure_detail = task
+            .failure_detail
+            .as_deref()
+            .expect("failed task should preserve direct error");
+        assert!(failure_detail.contains("provider timeout"));
+        assert!(failure_detail.contains("[path]"));
+        assert!(failure_detail.contains("sk-[redacted]"));
+        assert!(!failure_detail.contains("/Users/xie"));
+        assert!(!failure_detail.contains("test-secret-value"));
     }
 
     #[test]

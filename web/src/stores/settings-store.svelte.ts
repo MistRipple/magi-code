@@ -5,7 +5,12 @@ import { MessageCategory } from "../shared/protocol/message-protocol";
 import { ensureArray } from "../lib/utils";
 import { aggregateUsageStatsForDisplay } from "../lib/usage-stats-aggregation";
 import { i18n } from "./i18n.svelte";
-import { reportIncident, showFeedback } from "../lib/notifications";
+import {
+  directIncidentError,
+  incidentErrorDiagnostics,
+  reportIncident,
+  showFeedback,
+} from "../lib/notifications";
 import {
   type AgentExecutionModelStatsItem,
   type AgentExecutionStatsItem,
@@ -227,11 +232,14 @@ function notifySettingsInfo(message: string): void {
 
 function notifySettingsError(actionLabel: string, error: unknown): void {
   console.warn(`[SettingsPanel] ${actionLabel} failed:`, error);
-  const message = i18n.t("settings.toast.actionFailed", { action: actionLabel });
-  reportIncident(message, {
+  const title = i18n.t("settings.toast.actionFailed", { action: actionLabel });
+  const directError = directIncidentError(error, title);
+  reportIncident(directError, {
     scope: "app",
+    title,
+    ...incidentErrorDiagnostics(error, directError),
+    failureStage: "settings_action",
     source: "settings-panel",
-    fingerprint: `settings:${actionLabel}`,
   });
 }
 

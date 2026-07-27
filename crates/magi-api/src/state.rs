@@ -33,6 +33,7 @@ use magi_conversation_runtime::{
 };
 use magi_core::{
     SessionId, SessionLifecycleStatus, TaskId, TaskStatus, TaskTier, UtcMillis, WorkspaceId,
+    public_runtime_excerpt,
 };
 use magi_event_bus::{InMemoryEventBus, latest_usage_observations_from_ledger};
 use magi_governance::GovernanceService;
@@ -332,9 +333,12 @@ impl RunnerManager {
                             panic_message = %panic_message,
                             "任务 Runner 执行线程发生 panic，开始收口任务树"
                         );
-                        let public_message = "任务 Runner 执行线程异常退出，可直接继续重试。";
+                        let direct_error = public_runtime_excerpt(
+                            &format!("任务 Runner 执行线程异常退出: {panic_message}"),
+                            4096,
+                        );
                         if let Err(error) =
-                            task_runner.finalize_unexpected_failure(&root_id, public_message)
+                            task_runner.finalize_unexpected_failure(&root_id, &direct_error)
                         {
                             tracing::error!(
                                 root_task_id = %root_id,
@@ -342,7 +346,7 @@ impl RunnerManager {
                                 "任务 Runner panic 后任务树收口失败"
                             );
                         }
-                        RunCycleOutcome::Error(public_message.to_string())
+                        RunCycleOutcome::Error(direct_error)
                     }
                     Err(error) => {
                         RunCycleOutcome::Error(format!("任务 Runner 阻塞执行线程异常退出: {error}"))
@@ -3323,6 +3327,13 @@ mod tests {
                 .status,
             TaskStatus::Failed
         );
+        let failure_outputs = store
+            .get_task(&TaskId::new(root_task_id))
+            .expect("root task should remain available")
+            .output_refs;
+        assert_eq!(failure_outputs.len(), 1);
+        assert!(failure_outputs[0].contains("任务 Runner 执行线程异常退出"));
+        assert!(failure_outputs[0].contains("模拟 Runner 派发 panic"));
         assert_eq!(
             manager
                 .status(root_task_id)

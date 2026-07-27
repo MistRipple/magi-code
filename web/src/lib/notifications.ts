@@ -19,9 +19,46 @@ export interface FeedbackOptions {
 export interface ReportIncidentOptions extends FeedbackOptions {
   scope: IncidentScope;
   level?: 'warning' | 'error';
-  fingerprint?: string;
   actionRequired?: boolean;
-  notificationId?: string;
+  detail?: string;
+  errorCode?: string;
+  failureStage?: string;
+  taskId?: string;
+  requestId?: string;
+}
+
+export function directIncidentError(error: unknown, fallback: string): string {
+  if (error && typeof error === 'object') {
+    const candidate = error as { detail?: unknown; message?: unknown };
+    const detail = candidate.detail;
+    if (typeof detail === 'string' && detail.trim()) {
+      return detail.trim();
+    }
+    if (typeof candidate.message === 'string' && candidate.message.trim()) {
+      return candidate.message.trim();
+    }
+  }
+  const text = typeof error === 'string' ? error.trim() : '';
+  return text || fallback;
+}
+
+export function incidentErrorDiagnostics(
+  error: unknown,
+  primaryMessage: string,
+): Pick<ReportIncidentOptions, 'detail' | 'errorCode'> {
+  if (!error || typeof error !== 'object') {
+    return {};
+  }
+  const candidate = error as { detail?: unknown; errorCode?: unknown; stack?: unknown };
+  const explicitDetail = typeof candidate.detail === 'string' ? candidate.detail.trim() : '';
+  const stack = typeof candidate.stack === 'string' ? candidate.stack.trim() : '';
+  const detail = explicitDetail && explicitDetail !== primaryMessage
+    ? explicitDetail
+    : (!explicitDetail && stack && stack !== primaryMessage ? stack : undefined);
+  const errorCode = typeof candidate.errorCode === 'string' && candidate.errorCode.trim()
+    ? candidate.errorCode.trim()
+    : undefined;
+  return { detail, errorCode };
 }
 
 export function showFeedback(
@@ -55,11 +92,14 @@ export function reportIncident(
         scope: options.scope,
         level,
         message,
+        detail: options.detail,
+        errorCode: options.errorCode,
+        failureStage: options.failureStage,
+        taskId: options.taskId,
+        requestId: options.requestId,
         title: options.title,
         source: options.source,
-        fingerprint: options.fingerprint,
         actionRequired: options.actionRequired ?? policy.actionRequired,
-        notificationId: options.notificationId,
       },
       {
         workspaceId: messagesState.currentWorkspaceId || undefined,

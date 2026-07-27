@@ -6,7 +6,6 @@ import { deriveHasUnreadCompletion } from '../../lib/session-activity-indicator'
 import type {
   AppState,
   OrchestrationRuntimeAssignmentSummary,
-  OrchestrationRuntimeFailureRootCause,
   OrchestrationRuntimeKnowledgeAuditEntry,
   OrchestrationRuntimeKnowledgeAuditView,
   OrchestrationRuntimeKnowledgeDecision,
@@ -74,6 +73,11 @@ interface RustNotificationRecord {
   level?: string | null;
   title?: string | null;
   message?: string;
+  detail?: string | null;
+  errorCode?: string | null;
+  failureStage?: string | null;
+  taskId?: string | null;
+  requestId?: string | null;
   source?: string | null;
   createdAt?: number;
   handled?: boolean;
@@ -158,6 +162,7 @@ interface RustAssignmentRuntimeSummary {
 interface RustTaskRuntimeSummary {
   task_id?: string;
   title?: string | null;
+  failure_detail?: string | null;
   mission_id?: string | null;
   assignment_id?: string | null;
   latest_event_type?: string | null;
@@ -464,6 +469,7 @@ function normalizeTaskRuntimeEntries(
     .map((entry) => ({
       task_id: normalizeString(entry.task_id) || undefined,
       title: normalizeString(entry.title) || undefined,
+      failure_detail: normalizeString(entry.failure_detail) || undefined,
       mission_id: normalizeString(entry.mission_id) || undefined,
       assignment_id: normalizeString(entry.assignment_id) || undefined,
       latest_event_type: normalizeString(entry.latest_event_type) || undefined,
@@ -1148,8 +1154,7 @@ function deriveRecoverySummary(
   return {
     continuationPolicy: pendingCount > 0 ? 'resumable' : 'none',
     continuationReason: latest.diagnostic_summary || undefined,
-    latestSnapshotId: normalizeString(latest.recovery_id) || undefined,
-    latestSnapshotCreatedAt: normalizeNumber(latest.latest_occurred_at, undefined as unknown as number) || undefined,
+    latestRecoveryAt: normalizeNumber(latest.latest_occurred_at, undefined as unknown as number) || undefined,
     pendingTaskCount: pendingCount,
     completedTaskCount: completedCount,
     runningTaskCount: scopedSummaries.filter(
@@ -1158,10 +1163,7 @@ function deriveRecoverySummary(
   };
 }
 
-/**
- * 从后端 recentEvents 构建前端 OrchestrationRuntimeTimelineEntry[]。
- * 仅筛选与当前 session 相关的事件。
- */
+/** 从 recentEvents 提取用户可据此判断进展或定位问题的关键运行记录。 */
 function deriveRecentTimeline(
   recentEvents: RustEventEnvelope[],
   sessionId: string,
@@ -1169,20 +1171,156 @@ function deriveRecentTimeline(
   if (!Array.isArray(recentEvents) || recentEvents.length === 0) {
     return [];
   }
-  return recentEvents
+  const entries = recentEvents
     .filter((event) => {
       const eventSessionId = normalizeString(event.session_id);
       return Boolean(eventSessionId) && eventSessionId === sessionId;
     })
-    .map((event) => ({
-      eventId: normalizeString(event.event_id) || `evt-${normalizeNumber(event.sequence, 0)}`,
-      seq: normalizeNumber(event.sequence, 0),
-      timestamp: normalizeNumber(event.occurred_at, 0),
-      type: normalizeString(event.event_type) || 'unknown',
-      summary: buildEventSummary(event),
-      diffCount: 0,
-    }))
+    .filter(isProductRuntimeEvent)
+    .map((event) => {
+      const type = normalizeString(event.event_type) || 'unknown';
+      const payload = resolveEventPayload(event);
+      const detail = resolveEventIssueDetail(payload);
+      const status = resolveEventStatus(payload);
+      return {
+        eventId: normalizeString(event.event_id) || `evt-${normalizeNumber(event.sequence, 0)}`,
+        seq: normalizeNumber(event.sequence, 0),
+        timestamp: normalizeNumber(event.occurred_at, 0),
+        type,
+        summary: buildEventSummary(event),
+        kind: resolveRuntimeEventKind(status, detail),
+        source: resolveEventReadableTitle(payload) || formatRuntimeEventLabel(type),
+        detail: detail || undefined,
+        diffCount: 0,
+      } satisfies OrchestrationRuntimeTimelineEntry;
+    })
     .sort((a, b) => a.seq - b.seq);
+
+  const newestFirst = [...entries].reverse();
+  return newestFirst
+    .filter((entry, index, list) => (
+      index === list.findIndex((candidate) => (
+        candidate.type === entry.type
+        && candidate.summary === entry.summary
+        && candidate.detail === entry.detail
+      ))
+    ))
+    .reverse()
+    .slice(-8);
+}
+
+function isProductRuntimeEvent(event: RustEventEnvelope): boolean {
+  const eventType = normalizeString(event.event_type);
+  const payload = resolveEventPayload(event);
+  if (resolveEventIssueDetail(payload)) {
+    return true;
+  }
+  return eventType === 'task.dispatched'
+    || eventType === 'task.running'
+    || eventType === 'task.completed'
+    || eventType === 'task.failed'
+    || eventType === 'task.status.changed'
+    || eventType === 'task.tool.invoked'
+    || eventType === 'tool.call.finished'
+    || eventType === 'tool.invoked'
+    || eventType === 'worker.tool.observed'
+    || eventType === 'worker.reported'
+    || eventType === 'session.turn.tool.invoked'
+    || eventType === 'session.turn.failed'
+    || eventType === 'session.turn.interrupted'
+    || eventType === 'session.turn.queue_failed'
+    || eventType === 'mission.resume.dispatch.created'
+    || eventType === 'governance.decision.applied'
+    || eventType === 'model.retry.runtime';
+}
+
+function resolveEventIssueDetail(payload: Record<string, unknown>): string {
+  const lifecycle = normalizeRecord(payload.lifecycle);
+  const directDetail = normalizeString(payload.failure_detail)
+    || normalizeString(payload.error)
+    || normalizeString(payload.error_message)
+    || normalizeString(lifecycle.failure_detail)
+    || normalizeString(lifecycle.error)
+    || normalizeString(lifecycle.error_message);
+  if (directDetail) {
+    return directDetail;
+  }
+  const status = resolveEventStatus(payload).toLowerCase();
+  if (!['failed', 'failure', 'error', 'rejected', 'blocked'].includes(status)) {
+    return '';
+  }
+  return normalizeString(payload.diagnostic_summary)
+    || normalizeString(payload.failure_reason)
+    || normalizeString(lifecycle.diagnostic_summary)
+    || normalizeString(lifecycle.failure_reason)
+    || resolveStructuredErrorDetail(lifecycle.result_preview)
+    || resolveStructuredErrorDetail(payload.result_preview);
+}
+
+function resolveEventStatus(payload: Record<string, unknown>): string {
+  const lifecycle = normalizeRecord(payload.lifecycle);
+  return normalizeString(payload.current_status)
+    || normalizeString(payload.status)
+    || normalizeString(payload.new_status)
+    || normalizeString(payload.next_status)
+    || normalizeString(lifecycle.status);
+}
+
+function normalizeRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function resolveStructuredErrorDetail(value: unknown): string {
+  const raw = normalizeString(value);
+  if (!raw) {
+    return '';
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    const record = normalizeRecord(parsed);
+    const errorCode = normalizeString(record.error_code) || normalizeString(record.code);
+    const detail = normalizeString(record.error)
+      || normalizeString(record.error_message)
+      || normalizeString(record.failure_detail)
+      || normalizeString(record.detail)
+      || normalizeString(record.message)
+      || raw;
+    return errorCode && detail !== raw ? `${errorCode}: ${detail}` : detail;
+  } catch {
+    return raw;
+  }
+}
+
+function resolveRuntimeEventKind(
+  status: string,
+  detail: string,
+): NonNullable<OrchestrationRuntimeTimelineEntry['kind']> {
+  if (detail) {
+    return 'error';
+  }
+  if (status === 'failed' || status === 'failure' || status === 'error' || status === 'rejected') {
+    return 'error';
+  }
+  if (status === 'needs_approval') {
+    return 'warning';
+  }
+  if (status === 'succeeded' || status === 'success') {
+    return 'success';
+  }
+  switch (normalizeSubTaskStatus(status)) {
+    case 'failed':
+      return 'error';
+    case 'blocked':
+    case 'awaiting_approval':
+    case 'review_required':
+      return 'warning';
+    case 'completed':
+      return 'success';
+    default:
+      return 'progress';
+  }
 }
 
 /** 从 EventEnvelope 构建可读摘要 */
@@ -1196,20 +1334,15 @@ function buildEventSummary(event: RustEventEnvelope): string {
     parts.push(title);
   }
   const status = formatRuntimeStatusLabel(
-    normalizeString(payload.current_status)
-      || normalizeString(payload.status)
-      || normalizeString(payload.next_status)
+    resolveEventStatus(payload)
       || normalizeString(payload.stage)
       || normalizeString(payload.current_stage),
   );
   if (status) {
     parts.push(status);
   }
-  const hasIssueDetail = Boolean(normalizeString(payload.error)
-    || normalizeString(payload.error_message)
-    || normalizeString(payload.failure_reason)
-    || normalizeString(payload.diagnostic_summary));
-  if (hasIssueDetail && !status) {
+  const issueDetail = resolveEventIssueDetail(payload);
+  if (issueDetail && !status) {
     parts.push('需要关注');
   }
   return parts.length > 0 ? `${eventLabel}：${parts.join(' · ')}` : eventLabel;
@@ -1314,24 +1447,6 @@ function formatRuntimeStatusLabel(status: string): string {
   }
 }
 
-/**
- * 从后端 operations.attention 构建 failureRootCause（仅在有失败时）。
- */
-function deriveFailureRootCause(
-  generatedAt: number,
-  failedTaskLabels: string[],
-): OrchestrationRuntimeFailureRootCause | undefined {
-  if (failedTaskLabels.length === 0) {
-    return undefined;
-  }
-  const taskList = failedTaskLabels.slice(0, 4).join('、');
-  const suffix = failedTaskLabels.length > 4 ? `等 ${failedTaskLabels.length} 个任务` : `${failedTaskLabels.length} 个任务`;
-  return {
-    summary: `${suffix}执行失败：${taskList}。请查看任务追踪中的失败项。`,
-    occurredAt: generatedAt,
-  };
-}
-
 function normalizeKnowledgeDecision(value: unknown): OrchestrationRuntimeKnowledgeDecision | null {
   switch (normalizeString(value)) {
     case 'not_needed':
@@ -1420,6 +1535,9 @@ function deriveKnowledgeAudit(
         const candidateCount = Math.max(0, normalizeNumber(payload.candidate_count, 0));
         const insertedCount = Math.max(0, normalizeNumber(payload.inserted_count, 0));
         const failed = status === 'failed';
+        if (!failed && insertedCount === 0) {
+          return null;
+        }
         return {
           timestamp: normalizeNumber(event.occurred_at, 0),
           consumer: 'auxiliary',
@@ -1444,6 +1562,9 @@ function deriveKnowledgeAudit(
       }
       const decision = normalizeKnowledgeDecision(payload.decision);
       if (!decision) {
+        return null;
+      }
+      if (decision === 'not_needed') {
         return null;
       }
       const injectedCount = Math.max(0, normalizeNumber(payload.injected_count, 0));
@@ -1482,23 +1603,16 @@ function deriveOpsView(
   runtimeReadModel: RustRuntimeReadModelDto,
   recentEvents: RustEventEnvelope[],
   sessionId: string,
-  generatedAt: number,
   activeSession: RustSessionRuntimeSummary | undefined,
-  failedTaskLabels: string[],
-  status: OrchestratorRuntimeState['status'],
 ): OrchestrationRuntimeOpsView | null {
   const recovery = deriveRecoverySummary(runtimeReadModel, activeSession, sessionId);
   const recentTimeline = deriveRecentTimeline(recentEvents, sessionId);
-  const failureRootCause = status === 'failed' || status === 'blocked'
-    ? deriveFailureRootCause(generatedAt, failedTaskLabels)
-    : undefined;
   const knowledgeAudit = deriveKnowledgeAudit(runtimeReadModel, recentEvents, sessionId);
   const eventCount = recentTimeline.length;
 
   // 没有任何有意义数据时返回 null，避免空壳
   const hasContent = recentTimeline.length > 0
     || recovery !== undefined
-    || failureRootCause !== undefined
     || knowledgeAudit !== undefined;
   if (!hasContent) {
     return null;
@@ -1514,9 +1628,34 @@ function deriveOpsView(
     recentTimeline,
     recentStateDiffs: [],
     recovery,
-    failureRootCause,
     knowledgeAudit,
   };
+}
+
+function collectRuntimeFailureDetails(
+  taskEntries: RustTaskRuntimeSummary[],
+  recentEvents: RustEventEnvelope[],
+  sessionId: string,
+): string[] {
+  const details = taskEntries
+    .filter((task) => {
+      const status = normalizeSubTaskStatus(normalizeString(task.current_status));
+      return status === 'failed' || status === 'blocked';
+    })
+    .map((task) => normalizeString(task.failure_detail))
+    .filter(Boolean);
+
+  for (const event of recentEvents) {
+    if (normalizeString(event.session_id) !== sessionId) {
+      continue;
+    }
+    const failureDetail = resolveEventIssueDetail(resolveEventPayload(event));
+    if (failureDetail) {
+      details.push(failureDetail);
+    }
+  }
+
+  return details.filter((detail, index) => details.indexOf(detail) === index);
 }
 
 type OrchestratorRuntimeSnapshotState = NonNullable<OrchestratorRuntimeState['runtimeSnapshot']>;
@@ -1591,7 +1730,7 @@ function deriveRuntimeState(
     return null;
   }
 
-  const { activeSession, runningTaskIds, failedTaskIds } = buildSessionTaskStatusSummary(
+  const { activeSession, taskEntries, runningTaskIds, failedTaskIds } = buildSessionTaskStatusSummary(
     runtimeReadModel,
     sessionId,
   );
@@ -1619,33 +1758,20 @@ function deriveRuntimeState(
                 : activeSession
                   ? 'idle'
                   : 'idle';
-  const failedTaskLabels = assignments
-    .filter((assignment) => {
-      const normalizedStatus = normalizeSubTaskStatus(normalizeString(assignment.status));
-      return normalizedStatus === 'failed' || normalizedStatus === 'blocked';
-    })
-    .map((assignment) => normalizeString(assignment.title))
-    .filter((title, index, arr) => title && arr.indexOf(title) === index);
+  const failureDetails = collectRuntimeFailureDetails(taskEntries, recentEvents, sessionId);
 
   const opsView = deriveOpsView(
     runtimeReadModel,
     recentEvents,
     sessionId,
-    generatedAt,
     activeSession,
-    failedTaskLabels,
-    status,
   );
 
   return {
     sessionId: sessionId || undefined,
     status,
-    phase: runningTaskIds.length > 0
-      ? 'execute'
-      : status === 'blocked'
-        ? 'blocked'
-        : 'idle',
-    errors: failedTaskLabels.map((title) => `${title} 执行失败`),
+    phase: runningTaskIds.length > 0 ? 'running' : status,
+    errors: failureDetails,
     statusChangedAt: normalizeNumber(activeSession?.last_update, generatedAt),
     lastEventAt: normalizeNumber(activeSession?.last_update, generatedAt),
     canResume: hasRecoverableChain,
@@ -1656,7 +1782,6 @@ function deriveRuntimeState(
           chainId: activeSession.execution_chain_ref,
           status: activeSession.root_task_status || activeSession.current_status || 'unknown',
           recoverable: hasRecoverableChain && recoverableBranchCount > 0,
-          attempt: 1,
           createdAt: normalizeNumber(activeSession.last_update, generatedAt),
           updatedAt: normalizeNumber(activeSession.last_update, generatedAt),
         }
@@ -1691,6 +1816,11 @@ function normalizeNotifications(
       level: normalizeString(notification.level) || 'error',
       title: normalizeString(notification.title) || undefined,
       message,
+      detail: normalizeString(notification.detail) || undefined,
+      errorCode: normalizeString(notification.errorCode) || undefined,
+      failureStage: normalizeString(notification.failureStage) || undefined,
+      taskId: normalizeString(notification.taskId) || undefined,
+      requestId: normalizeString(notification.requestId) || undefined,
       source: normalizeString(notification.source) || undefined,
       workspaceId: normalizeString(notification.workspaceId) || undefined,
       sessionId: normalizeString(notification.sessionId) || undefined,

@@ -42,16 +42,24 @@ await withGoldenViteServer(async (server) => {
   notifications.showFeedback('warning', '上下文即将达到上限', { source: 'model-runtime' });
   assert.equal(store.getToasts().length, 2, 'warnings must remain visible');
 
-  assert.equal(notifications.reportIncident('模型请求失败', {
+  assert.equal(notifications.reportIncident('provider timeout', {
     scope: 'workspace',
     source: 'model-runtime',
-    fingerprint: 'model-request-failed',
+    title: '模型请求失败',
+    detail: 'provider timeout at model endpoint',
+    errorCode: 'MODEL_INVOCATION_FAILED',
+    failureStage: 'model_request',
+    requestId: 'request-notification-runtime',
   }), true);
   assert.equal(posted.length, 1);
   assert.equal(posted[0].type, 'reportIncident');
   assert.equal(posted[0].incident.scope, 'workspace');
   assert.equal(posted[0].incident.workspaceId, 'workspace-notification-runtime');
   assert.equal(posted[0].incident.sessionId, 'session-notification-runtime');
+  assert.equal(posted[0].incident.detail, 'provider timeout at model endpoint');
+  assert.equal(posted[0].incident.errorCode, 'MODEL_INVOCATION_FAILED');
+  assert.equal(posted[0].incident.failureStage, 'model_request');
+  assert.equal(posted[0].incident.requestId, 'request-notification-runtime');
   assert.equal(
     store.getToasts().length,
     2,

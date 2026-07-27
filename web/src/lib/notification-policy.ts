@@ -27,11 +27,14 @@ export interface IncidentReportInput {
   scope: IncidentScope;
   level: string;
   message: string;
+  detail?: string;
+  errorCode?: string;
+  failureStage?: string;
+  taskId?: string;
+  requestId?: string;
   title?: string;
   source?: string;
-  fingerprint?: string;
   actionRequired?: boolean;
-  notificationId?: string;
 }
 
 export interface IncidentReportRequest extends IncidentReportInput {
@@ -45,6 +48,11 @@ export interface NormalizedIncidentRecord {
   type: string;
   title?: string;
   message: string;
+  detail?: string;
+  errorCode?: string;
+  failureStage?: string;
+  taskId?: string;
+  requestId?: string;
   scope: IncidentScope;
   workspaceId?: string;
   sessionId?: string;
@@ -134,6 +142,11 @@ export function normalizeIncidentRecords(raw: unknown): NormalizedIncidentRecord
       type: optionalString(record.level) || 'error',
       title: optionalString(record.title),
       message,
+      detail: optionalString(record.detail),
+      errorCode: optionalString(record.errorCode),
+      failureStage: optionalString(record.failureStage),
+      taskId: optionalString(record.taskId),
+      requestId: optionalString(record.requestId),
       scope,
       workspaceId: optionalString(record.workspaceId),
       sessionId: optionalString(record.sessionId),

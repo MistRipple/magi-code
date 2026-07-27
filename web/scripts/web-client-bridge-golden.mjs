@@ -870,21 +870,16 @@ await withGoldenViteServer(async (server) => {
     true,
     '已有会话的后续轮次必须在提交事件返回前进入 processing 状态',
   );
+  const laterRoundLocalArtifact = findArtifactByRequestId(
+    messagesStore.messagesState.canonicalTimelineProjection,
+    'request-later-round-immediate-feedback',
+  );
   assert.equal(
-    findArtifactByRequestId(
-      messagesStore.messagesState.canonicalTimelineProjection,
-      'request-later-round-immediate-feedback',
-    ),
-    undefined,
-    '后续轮次也必须先绘制轻量等待状态，再执行本地 canonical 投影',
+    laterRoundLocalArtifact?.message?.type,
+    'user_input',
+    '后续轮次必须在提交事件返回前同步投影本地 pending turn，不能只显示等待动画',
   );
-  await waitFor(
-    () => Boolean(findArtifactByRequestId(
-      messagesStore.messagesState.canonicalTimelineProjection,
-      'request-later-round-immediate-feedback',
-    )),
-    '后续轮次必须在下一次 UI 绘制后补齐本地 pending turn',
-  );
+  assert.equal(laterRoundLocalArtifact?.message?.content, '后续轮次也必须立刻出现发送反馈。');
   laterRoundAccepted.resolve(jsonResponse({
     sessionId: SESSION_ID,
     entryId: 'timeline-later-round-immediate-feedback',
@@ -1478,14 +1473,16 @@ await withGoldenViteServer(async (server) => {
     true,
     '提交事件返回前必须先进入本地 processing 状态，让按钮与等待动画立即响应',
   );
-  assert.equal(
-    findArtifactByRequestId(
-      messagesStore.messagesState.canonicalTimelineProjection,
-      'request-first-turn-immediate-feedback',
-    ),
-    undefined,
-    '首帧反馈必须先于可能较重的 canonical 本地投影',
+  const firstTurnLocalArtifact = findArtifactByRequestId(
+    messagesStore.messagesState.canonicalTimelineProjection,
+    'request-first-turn-immediate-feedback',
   );
+  assert.equal(
+    firstTurnLocalArtifact?.message?.type,
+    'user_input',
+    '首条消息必须与 processing 同步进入 canonical 投影，不能产生空白对话首帧',
+  );
+  assert.equal(firstTurnLocalArtifact?.message?.content, '首条消息必须立刻进入主线。');
   await waitFor(
     () => capturedTurnBodies.some((body) => body.requestId === 'request-first-turn-immediate-feedback'),
     'first turn submit must reach backend',

@@ -970,10 +970,9 @@ mod tests {
             serde_json::json!("请求内容格式不正确，请检查后重试")
         );
         assert!(
-            !raw_body.contains("line")
-                && !raw_body.contains("column")
-                && !raw_body.contains("expected"),
-            "框架 JSON parser 细节不能出现在 API 响应中: {raw_body}"
+            raw_body.contains("EOF while parsing an object")
+                && raw_body.contains("line 1 column 1"),
+            "API 响应必须保留可定位的 JSON 解析原因: {raw_body}"
         );
     }
 

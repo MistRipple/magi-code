@@ -10,6 +10,7 @@ use magi_conversation_runtime::{
 };
 use magi_core::{
     AccessProfile, DomainError, EventId, SessionId, TaskTier, UtcMillis, WorkerId, WorkspaceId,
+    public_runtime_excerpt,
 };
 use magi_core::{SessionLifecycleStatus, TaskStatus};
 use magi_event_bus::{EventContext, EventEnvelope};
@@ -2036,6 +2037,7 @@ async fn drain_next_queued_regular_session_turn(
                     failed_event_accepted_at,
                     failed_event_route,
                     &failed_event_queue_id,
+                    error.message(),
                 );
             }
             true
@@ -2161,6 +2163,7 @@ fn publish_regular_session_turn_queue_failed_event(
     accepted_at: UtcMillis,
     route: SessionTurnRouteDto,
     queue_id: &str,
+    direct_error: &str,
 ) {
     let event_id = EventId::new(format!("event-session-turn-queue-failed-{}", accepted_at.0));
     let event = EventEnvelope::domain(
@@ -2173,6 +2176,7 @@ fn publish_regular_session_turn_queue_failed_event(
             "queue_id": queue_id,
             "error": "queued_session_turn_failed",
             "error_code": "queued_session_turn_failed",
+            "failure_detail": public_runtime_excerpt(direct_error, 4096),
             "public_message": "排队消息暂未执行，内容已保留；服务恢复后发送新消息即可继续。",
         }),
     )
@@ -3083,14 +3087,17 @@ struct ReportIncidentRequest {
     workspace_id: Option<String>,
     #[serde(default)]
     workspace_path: Option<String>,
-    notification_id: Option<String>,
     scope: NotificationScope,
     level: Option<String>,
     title: Option<String>,
     message: String,
+    detail: Option<String>,
+    error_code: Option<String>,
+    failure_stage: Option<String>,
+    task_id: Option<String>,
+    request_id: Option<String>,
     source: Option<String>,
     action_required: Option<bool>,
-    fingerprint: Option<String>,
 }
 
 impl ReportIncidentRequest {
@@ -3104,10 +3111,6 @@ impl ReportIncidentRequest {
 
     fn requested_workspace_path(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_path.as_deref())
-    }
-
-    fn requested_notification_id(&self) -> Option<String> {
-        trimmed_non_empty(self.notification_id.as_deref()).map(str::to_string)
     }
 }
 
@@ -3134,13 +3137,14 @@ async fn report_incident(
     let message = trimmed_non_empty(Some(request.message.as_str()))
         .ok_or_else(|| ApiError::InvalidInput("通知内容不能为空".to_string()))?
         .to_string();
-    let notification_id = request.requested_notification_id().unwrap_or_else(|| {
-        format!(
-            "notification-{}-{}",
-            UtcMillis::now().0,
-            INCIDENT_NOTIFICATION_COUNTER.fetch_add(1, Ordering::Relaxed)
-        )
-    });
+    let message = public_runtime_excerpt(&message, 4096);
+    // 每次异常发生都由服务端生成独立 ID。客户端固定 ID 会让多次错误在前端
+    // 被去重，也会使解决/删除操作无法唯一指向某次发生记录。
+    let notification_id = format!(
+        "notification-{}-{}",
+        UtcMillis::now().0,
+        INCIDENT_NOTIFICATION_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     state
         .session_store
         .append_incident_record(NotificationRecord {
@@ -3157,14 +3161,18 @@ async fn report_incident(
             level: trimmed_non_empty(request.level.as_deref()).map(str::to_string),
             title: trimmed_non_empty(request.title.as_deref()).map(str::to_string),
             message,
+            detail: trimmed_non_empty(request.detail.as_deref())
+                .map(|detail| public_runtime_excerpt(detail, 4096)),
+            error_code: trimmed_non_empty(request.error_code.as_deref()).map(str::to_string),
+            failure_stage: trimmed_non_empty(request.failure_stage.as_deref()).map(str::to_string),
+            task_id: trimmed_non_empty(request.task_id.as_deref()).map(str::to_string),
+            request_id: trimmed_non_empty(request.request_id.as_deref()).map(str::to_string),
             source: trimmed_non_empty(request.source.as_deref()).map(str::to_string),
             created_at: UtcMillis::now(),
             handled: false,
             action_required: request.action_required.unwrap_or(true),
             count_unread: true,
-            fingerprint: trimmed_non_empty(request.fingerprint.as_deref())
-                .map(str::to_string)
-                .unwrap_or_default(),
+            fingerprint: String::new(),
             occurrence_count: 1,
             resolved: false,
         })
@@ -3572,6 +3580,11 @@ mod tests {
                 level: Some("error".to_string()),
                 title: None,
                 message: message.to_string(),
+                detail: None,
+                error_code: None,
+                failure_stage: None,
+                task_id: None,
+                request_id: None,
                 source: Some("test".to_string()),
                 created_at: UtcMillis::now(),
                 handled: false,
@@ -5612,14 +5625,17 @@ mod tests {
             .expect("failed submission must remain at queue head");
         assert_eq!(retained.queue_id, "queue-submit-failure");
         assert_eq!(retained.retry_count, 4);
-        assert!(
-            state
-                .event_bus
-                .snapshot()
-                .recent_events
-                .iter()
-                .any(|event| event.event_type == "session.turn.queue_failed")
-        );
+        let snapshot = state.event_bus.snapshot();
+        let failed_event = snapshot
+            .recent_events
+            .iter()
+            .find(|event| event.event_type == "session.turn.queue_failed")
+            .expect("queue failure event should publish");
+        let failure_detail = failed_event.payload["failure_detail"]
+            .as_str()
+            .expect("queue failure should include direct error");
+        assert!(failure_detail.contains(missing_workspace_id.as_str()));
+        assert!(!failure_detail.contains("服务恢复后"));
     }
 
     #[tokio::test]
@@ -7078,7 +7094,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_incident_persists_scoped_backend_snapshot_and_old_route_is_removed() {
+    async fn report_incident_persists_each_sanitized_failure_with_unique_server_id() {
         let state = test_state();
         register_workspace(&state, "workspace-a", "notification-append-a");
         let session_id = SessionId::new("session-notification-append");
@@ -7102,14 +7118,17 @@ mod tests {
                         serde_json::json!({
                             "workspaceId": "workspace-a",
                             "sessionId": session_id.as_str(),
-                            "notificationId": "notification-model-request-failed",
                             "scope": "session",
                             "level": "error",
                             "title": "模型请求失败",
-                            "message": "模型服务暂时不可用",
+                            "message": "provider timeout at /Users/xie/code/model.rs",
+                            "detail": "request failed with sk-test-secret-value",
+                            "errorCode": "MODEL_TIMEOUT",
+                            "failureStage": "model_invocation",
+                            "taskId": "task-model-request-failed",
+                            "requestId": "request-model-request-failed",
                             "source": "web-action",
-                            "actionRequired": true,
-                            "fingerprint": "model-request-failed",
+                            "actionRequired": true
                         })
                         .to_string(),
                     ))
@@ -7131,14 +7150,29 @@ mod tests {
             .as_array()
             .expect("records should be array");
         assert_eq!(records.len(), 1);
-        assert_eq!(
-            records[0]["notificationId"],
-            "notification-model-request-failed"
-        );
+        let first_notification_id = records[0]["notificationId"]
+            .as_str()
+            .expect("notification id should exist")
+            .to_string();
+        assert!(first_notification_id.starts_with("notification-"));
         assert_eq!(records[0]["kind"], "incident");
         assert_eq!(records[0]["scope"], "session");
         assert_eq!(records[0]["level"], "error");
         assert_eq!(records[0]["title"], "模型请求失败");
+        assert_eq!(records[0]["errorCode"], "MODEL_TIMEOUT");
+        assert_eq!(records[0]["failureStage"], "model_invocation");
+        assert_eq!(records[0]["taskId"], "task-model-request-failed");
+        assert_eq!(records[0]["requestId"], "request-model-request-failed");
+        assert!(
+            records[0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("provider timeout at [path]"))
+        );
+        assert!(
+            records[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("sk-[redacted]"))
+        );
         assert_eq!(records[0]["source"], "web-action");
         assert_eq!(records[0]["read"], false);
         assert_eq!(records[0]["handled"], false);
@@ -7149,12 +7183,49 @@ mod tests {
             .session_store
             .notifications_for_context("workspace-a", Some(&session_id));
         assert_eq!(stored.len(), 1);
-        assert_eq!(
-            stored[0].notification_id,
-            "notification-model-request-failed"
-        );
+        assert_eq!(stored[0].notification_id, first_notification_id);
         assert_eq!(stored[0].kind, "incident");
         assert!(!stored[0].handled);
+
+        let second_response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/notifications/report")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workspaceId": "workspace-a",
+                            "sessionId": session_id.as_str(),
+                            "scope": "session",
+                            "level": "error",
+                            "title": "模型请求失败",
+                            "message": "provider timeout at /Users/xie/code/model.rs",
+                            "source": "web-action"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("second report should respond");
+        let second_body = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(second_response.into_body(), usize::MAX)
+                .await
+                .expect("second response body should read"),
+        )
+        .expect("second response should be json");
+        let second_records = second_body["notifications"]["records"]
+            .as_array()
+            .expect("second records should be array");
+        assert_eq!(second_records.len(), 2);
+        let second_notification_id = second_records
+            .iter()
+            .filter_map(|record| record["notificationId"].as_str())
+            .find(|notification_id| *notification_id != first_notification_id)
+            .expect("second notification id should be unique");
+        assert_ne!(second_notification_id, first_notification_id);
 
         let response = routes()
             .with_state(state)

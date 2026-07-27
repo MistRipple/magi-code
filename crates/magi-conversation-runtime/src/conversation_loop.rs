@@ -46,12 +46,12 @@ use crate::{
     },
 };
 use magi_bridge_client::{
-    ChatMessage, ChatToolCall, ChatToolDefinition, LOOPBACK_MODEL_PROVIDER, ModelBridgeClient,
-    ModelInvocationRequest, ModelStreamingDelta,
+    BridgeClientError, ChatMessage, ChatToolCall, ChatToolDefinition, LOOPBACK_MODEL_PROVIDER,
+    ModelBridgeClient, ModelInvocationRequest, ModelStreamingDelta,
 };
 use magi_core::{
     EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskId, TaskStatus, ThreadId,
-    UtcMillis, WorkspaceId, estimate_text_tokens,
+    UtcMillis, WorkspaceId, estimate_text_tokens, public_runtime_excerpt,
 };
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, SessionRuntimeUsageObservation,
@@ -137,6 +137,19 @@ pub struct ConversationLoopRequest<'a> {
     pub snapshot_session: Option<Arc<magi_snapshot::SnapshotSession>>,
     pub execution_group_id: Option<String>,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
+}
+
+fn direct_runtime_error(error: &BridgeClientError, fallback: &str) -> String {
+    let mut raw_error = error.to_string();
+    if let Some(code) = error.code() {
+        raw_error.push_str(&format!(" (error_code={code})"));
+    }
+    let detail = public_runtime_excerpt(&raw_error, 4096);
+    if detail.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        detail
+    }
 }
 
 /// P6b：把 thread 持久化的消息记录（`ThreadChatMessage`）还原为 bridge-client 的
@@ -1217,6 +1230,7 @@ fn run_conversation_loop_inner(
                         let raw_error_message = error.to_string();
                         let classification = classify_model_invocation_error(&raw_error_message);
                         let error_message = classification.public_message.to_string();
+                        let error_detail = direct_runtime_error(&error, &error_message);
                         publish_model_usage_record(
                             event_bus,
                             session_store,
@@ -1325,11 +1339,13 @@ fn run_conversation_loop_inner(
                             {
                                 Ok(response) => break 'streaming_invocation response,
                                 Err(fallback_error) => {
-                                    let fallback_classification = classify_model_invocation_error(
-                                        &fallback_error.to_string(),
-                                    );
+                                    let fallback_raw_error = fallback_error.to_string();
+                                    let fallback_classification =
+                                        classify_model_invocation_error(&fallback_raw_error);
                                     let fallback_message =
                                         fallback_classification.public_message.to_string();
+                                    let fallback_detail =
+                                        direct_runtime_error(&fallback_error, &fallback_message);
                                     publish_model_usage_record(
                                         event_bus,
                                         session_store,
@@ -1365,7 +1381,7 @@ fn run_conversation_loop_inner(
                                     }
                                     return (
                                         TaskOutcome::Failed {
-                                            error: fallback_message,
+                                            error: fallback_detail,
                                         },
                                         context_summary,
                                     );
@@ -1382,7 +1398,7 @@ fn run_conversation_loop_inner(
                         }
                         return (
                             TaskOutcome::Failed {
-                                error: error_message,
+                                error: error_detail,
                             },
                             context_summary,
                         );
@@ -1407,6 +1423,7 @@ fn run_conversation_loop_inner(
                     let raw_error_message = error.to_string();
                     let classification = classify_model_invocation_error(&raw_error_message);
                     let error_message = classification.public_message.to_string();
+                    let error_detail = direct_runtime_error(&error, &error_message);
                     publish_model_usage_record(
                         event_bus,
                         session_store,
@@ -1446,7 +1463,7 @@ fn run_conversation_loop_inner(
                     }
                     return (
                         TaskOutcome::Failed {
-                            error: error_message,
+                            error: error_detail,
                         },
                         context_summary,
                     );
@@ -5181,10 +5198,9 @@ mod tests {
 
         match outcome {
             TaskOutcome::Failed { error } => {
-                assert_eq!(error, "模型请求未完成，可直接继续重试。");
-                assert!(!error.contains("RemoteBusiness"));
-                assert!(!error.contains("model bridge unavailable"));
-                assert!(!error.contains("LLM invocation failed"));
+                assert!(error.contains("RemoteBusiness"));
+                assert!(error.contains("-32099"));
+                assert!(error.contains("model bridge unavailable"));
             }
             other => panic!("model failure must fail the task loop, got {other:?}"),
         }

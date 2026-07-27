@@ -31,7 +31,9 @@ use magi_conversation_runtime::{
         publish_model_usage_record_with_config,
     },
 };
-use magi_core::{EventId, ExecutionOwnership, LeaseId, SessionId, TaskStatus, UtcMillis};
+use magi_core::{
+    EventId, ExecutionOwnership, LeaseId, SessionId, TaskStatus, UtcMillis, public_runtime_excerpt,
+};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
@@ -2093,6 +2095,14 @@ fn publish_task_status_changed_event(
     let scoped = task_status_event_scope(session_store, task);
     let session_id = scoped.as_ref().map(|(session_id, _)| session_id.clone());
     let workspace_id = scoped.and_then(|(_, workspace_id)| workspace_id);
+    let failure_detail = (new_status == TaskStatus::Failed)
+        .then(|| {
+            task.output_refs
+                .iter()
+                .find(|value| !value.trim().is_empty())
+                .map(|value| public_runtime_excerpt(value, 4096))
+        })
+        .flatten();
     let event = EventEnvelope::domain(
         EventId::new(format!(
             "event-task-status-changed-{}-{}",
@@ -2108,6 +2118,8 @@ fn publish_task_status_changed_event(
             "old_status": format!("{:?}", old_status),
             "new_status": format!("{:?}", new_status),
             "kind": format!("{:?}", task.kind),
+            "failure_stage": (new_status == TaskStatus::Failed).then_some("task_execution"),
+            "failure_detail": failure_detail,
             "session_id": session_id.as_ref().map(ToString::to_string),
             "workspace_id": workspace_id.as_ref().map(ToString::to_string),
         }),
@@ -2516,7 +2528,7 @@ done
     }
 
     #[test]
-    fn task_status_changed_event_uses_active_session_workspace_scope() {
+    fn failed_task_status_event_keeps_scope_and_sanitized_direct_error() {
         let event_bus = magi_event_bus::InMemoryEventBus::new(16);
         let session_store = SessionStore::new();
         let session_id = SessionId::new("session-task-status-scope");
@@ -2587,13 +2599,16 @@ done
             now.0,
         );
         task.mission_id = mission_id;
+        task.output_refs = vec![
+            "provider timeout at /Users/xie/code/model.rs with sk-test-secret-value".to_string(),
+        ];
 
         publish_task_status_changed_event(
             &event_bus,
             &session_store,
             &task_id,
-            TaskStatus::Pending,
             TaskStatus::Running,
+            TaskStatus::Failed,
             &task,
         );
 
@@ -2609,6 +2624,15 @@ done
         assert_eq!(event.payload["workspace_id"], json!(workspace_id.as_str()));
         assert_eq!(event.payload["root_task_id"], json!(task_id.as_str()));
         assert_eq!(event.payload["title"], json!(task.title));
+        assert_eq!(event.payload["failure_stage"], json!("task_execution"));
+        let failure_detail = event.payload["failure_detail"]
+            .as_str()
+            .expect("failed event should include direct error");
+        assert!(failure_detail.contains("provider timeout"));
+        assert!(failure_detail.contains("[path]"));
+        assert!(failure_detail.contains("sk-[redacted]"));
+        assert!(!failure_detail.contains("/Users/xie"));
+        assert!(!failure_detail.contains("test-secret-value"));
     }
 
     #[test]

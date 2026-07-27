@@ -1,4 +1,10 @@
-import { reportIncident, showFeedback, type FeedbackOptions } from './notifications';
+import {
+  directIncidentError,
+  incidentErrorDiagnostics,
+  reportIncident,
+  showFeedback,
+  type FeedbackOptions,
+} from './notifications';
 import type { IncidentScope } from './notification-policy';
 
 export interface ActionFeedbackOptions<T> {
@@ -40,12 +46,14 @@ export async function runActionWithFeedback<T>(
   } catch (error) {
     const errorMessage = `${options.actionLabel}失败`;
     await options.onError?.(errorMessage, error);
-    reportIncident(errorMessage, {
+    const directError = directIncidentError(error, errorMessage);
+    reportIncident(directError, {
       scope: options.incidentScope || 'workspace',
-      title: options.errorTitle,
+      title: options.errorTitle || errorMessage,
+      ...incidentErrorDiagnostics(error, directError),
+      failureStage: 'web_action',
       source: options.errorToast?.source || 'web-action',
       duration: options.errorToast?.duration,
-      fingerprint: `web-action:${options.actionLabel}`,
     });
     return null;
   }

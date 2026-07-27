@@ -11,6 +11,7 @@
     messagesState,
     type Notification,
   } from '../stores/messages.svelte';
+  import { showFeedback } from '../lib/notifications';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
 
@@ -22,6 +23,7 @@
   let { open, onOpenChange }: Props = $props();
   let activeFilter = $state<'all' | 'unresolved' | 'resolved'>('all');
   let wasOpen = $state(false);
+  let expandedNotificationIds = $state<Set<string>>(new Set());
 
   const notifications = $derived.by(() => getNotifications() as Notification[]);
   const unreadCount = $derived.by(() => getUnreadNotificationCount() as number);
@@ -73,7 +75,13 @@
 
   function formatTime(timestamp: number): string {
     const d = new Date(timestamp);
-    return d.toLocaleTimeString(i18n.locale, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    return d.toLocaleString(i18n.locale, {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
   }
 
   function getScopeLabel(scope: Notification['scope']): string {
@@ -86,6 +94,69 @@
       case 'error': return 'close';
       case 'warning': return 'warning';
       default: return 'info';
+    }
+  }
+
+  function hasDiagnosticDetails(notification: Notification): boolean {
+    return Boolean(
+      (notification.detail && notification.detail !== notification.message)
+      || notification.errorCode
+      || notification.failureStage
+      || notification.taskId
+      || notification.requestId
+      || notification.source,
+    );
+  }
+
+  function toggleNotificationDetails(id: string): void {
+    const next = new Set(expandedNotificationIds);
+    if (next.has(id)) {
+      next.delete(id);
+    } else {
+      next.add(id);
+    }
+    expandedNotificationIds = next;
+  }
+
+  function diagnosticText(notification: Notification): string {
+    return [
+      notification.title,
+      notification.message,
+      notification.detail && notification.detail !== notification.message
+        ? notification.detail
+        : undefined,
+      notification.errorCode
+        ? `${i18n.t('notification.errorCode')}: ${notification.errorCode}`
+        : undefined,
+      notification.failureStage
+        ? `${i18n.t('notification.failureStage')}: ${notification.failureStage}`
+        : undefined,
+      notification.taskId
+        ? `${i18n.t('notification.taskId')}: ${notification.taskId}`
+        : undefined,
+      notification.requestId
+        ? `${i18n.t('notification.requestId')}: ${notification.requestId}`
+        : undefined,
+      notification.source
+        ? `${i18n.t('notification.source')}: ${notification.source}`
+        : undefined,
+      `${i18n.t('notification.time')}: ${new Date(notification.timestamp).toISOString()}`,
+    ].filter((value): value is string => Boolean(value)).join('\n');
+  }
+
+  async function copyDiagnostic(notification: Notification): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(diagnosticText(notification));
+      showFeedback('success', i18n.t('notification.copySuccess'), {
+        presentation: 'toast',
+        source: 'notification-center',
+      });
+    } catch (error) {
+      console.warn('[NotificationCenter] 复制诊断信息失败:', error);
+      showFeedback('error', i18n.t('notification.copyFailed'), {
+        presentation: 'toast',
+        source: 'notification-center',
+      });
     }
   }
 </script>
@@ -162,10 +233,55 @@
                   {#if notif.occurrenceCount > 1}
                     <span class="notif-count">{i18n.t('notification.occurrences', { count: notif.occurrenceCount })}</span>
                   {/if}
-                  <span class="notif-time">{formatTime(notif.timestamp)}</span>
+                  <span class="notif-time" title={new Date(notif.timestamp).toISOString()}>
+                    {formatTime(notif.timestamp)}
+                  </span>
                 </div>
+                {#if expandedNotificationIds.has(notif.id)}
+                  <div class="notif-details">
+                    {#if notif.detail && notif.detail !== notif.message}
+                      <pre>{notif.detail}</pre>
+                    {/if}
+                    <dl>
+                      {#if notif.errorCode}
+                        <div><dt>{i18n.t('notification.errorCode')}</dt><dd>{notif.errorCode}</dd></div>
+                      {/if}
+                      {#if notif.failureStage}
+                        <div><dt>{i18n.t('notification.failureStage')}</dt><dd>{notif.failureStage}</dd></div>
+                      {/if}
+                      {#if notif.taskId}
+                        <div><dt>{i18n.t('notification.taskId')}</dt><dd>{notif.taskId}</dd></div>
+                      {/if}
+                      {#if notif.requestId}
+                        <div><dt>{i18n.t('notification.requestId')}</dt><dd>{notif.requestId}</dd></div>
+                      {/if}
+                      {#if notif.source}
+                        <div><dt>{i18n.t('notification.source')}</dt><dd>{notif.source}</dd></div>
+                      {/if}
+                    </dl>
+                  </div>
+                {/if}
               </div>
               <div class="notif-actions">
+                {#if hasDiagnosticDetails(notif)}
+                  <button
+                    class="notif-action"
+                    onclick={() => toggleNotificationDetails(notif.id)}
+                    title={expandedNotificationIds.has(notif.id)
+                      ? i18n.t('notification.collapseDetailsTitle')
+                      : i18n.t('notification.expandDetailsTitle')}
+                    aria-expanded={expandedNotificationIds.has(notif.id)}
+                  >
+                    <Icon name={expandedNotificationIds.has(notif.id) ? 'chevron-down' : 'chevron-right'} size={10} />
+                  </button>
+                {/if}
+                <button
+                  class="notif-action"
+                  onclick={() => copyDiagnostic(notif)}
+                  title={i18n.t('notification.copyTitle')}
+                >
+                  <Icon name="copy" size={10} />
+                </button>
                 {#if !notif.resolved}
                   <button
                     class="notif-action"
@@ -203,7 +319,7 @@
     top: 100%;
     right: 0;
     margin-top: var(--space-2, 4px);
-    width: min(320px, calc(100vw - 24px));
+    width: min(480px, calc(100vw - 24px));
     max-height: min(420px, calc(100vh - 72px));
     background: var(--dropdown-bg);
     border: 1px solid var(--border);
@@ -229,7 +345,7 @@
     font-weight: var(--font-semibold, 600);
     color: var(--foreground-muted);
     text-transform: uppercase;
-    letter-spacing: 0.5px;
+    letter-spacing: 0;
   }
 
   .panel-actions {
@@ -381,11 +497,56 @@
     color: var(--foreground-muted);
     line-height: var(--leading-normal, 1.5);
     word-break: break-word;
+    white-space: pre-wrap;
+  }
+
+  .notif-details {
+    margin-top: var(--space-3, 8px);
+    padding-top: var(--space-3, 8px);
+    border-top: 1px solid var(--border);
+  }
+
+  .notif-details pre {
+    margin: 0 0 var(--space-3, 8px);
+    max-height: 180px;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs, 11px);
+    line-height: 1.5;
+    color: var(--foreground);
+  }
+
+  .notif-details dl {
+    display: grid;
+    gap: 4px;
+    margin: 0;
+  }
+
+  .notif-details dl div {
+    display: grid;
+    grid-template-columns: 82px minmax(0, 1fr);
+    gap: var(--space-2, 6px);
+    font-size: var(--text-xs, 11px);
+    line-height: 1.45;
+  }
+
+  .notif-details dt {
+    color: var(--foreground-muted);
+  }
+
+  .notif-details dd {
+    margin: 0;
+    color: var(--foreground);
+    font-family: var(--font-mono);
+    overflow-wrap: anywhere;
   }
 
   .notif-meta {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: var(--space-2, 4px);
     margin-top: 4px;
   }

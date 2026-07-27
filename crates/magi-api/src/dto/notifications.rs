@@ -7,6 +7,16 @@ use serde::Serialize;
 pub struct IncidentNotificationItemDto {
     pub notification_id: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub kind: &'static str,
     pub scope: NotificationScope,
     pub level: String,
@@ -32,6 +42,11 @@ impl From<NotificationRecord> for IncidentNotificationItemDto {
         Self {
             notification_id: record.notification_id,
             message: record.message,
+            detail: record.detail,
+            error_code: record.error_code,
+            failure_stage: record.failure_stage,
+            task_id: record.task_id,
+            request_id: record.request_id,
             kind: "incident",
             scope: record.scope,
             level: record.level.unwrap_or_else(|| "error".to_string()),

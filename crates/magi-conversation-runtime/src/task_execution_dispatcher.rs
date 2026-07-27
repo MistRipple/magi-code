@@ -42,7 +42,7 @@ use magi_context_runtime::{
 };
 use magi_core::{
     AccessProfile, EventId, ExecutionOwnership, LeaseId, SessionId, TaskId, TaskKind, UtcMillis,
-    WorkerId, WorkspaceId, estimate_text_tokens,
+    WorkerId, WorkspaceId, estimate_text_tokens, public_runtime_excerpt,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_knowledge_store::{KnowledgeKind, KnowledgeRecord, KnowledgeStore};
@@ -2670,11 +2670,12 @@ async fn record_dispatch_join_outcome(
 ) {
     if let Err(error) = join.await {
         tracing::error!(task_id = %task_id, lease_id = %lease_id, ?error, "dispatch spawn_blocking panicked");
+        let direct_error = public_runtime_excerpt(&format!("模型执行线程异常退出: {error}"), 4096);
         dispatcher.push_result(
             &task_id,
             &lease_id,
             TaskOutcome::Failed {
-                error: "模型执行线程异常退出，可直接继续重试。".to_string(),
+                error: direct_error,
             },
         );
     }
@@ -3073,6 +3074,7 @@ mod tests {
         match &results[0].outcome {
             TaskOutcome::Failed { error } => {
                 assert!(error.contains("模型执行线程异常退出"));
+                assert!(error.contains("模拟模型执行线程 panic"));
             }
             TaskOutcome::Completed { .. } => panic!("panic 不得被记录为成功"),
         }

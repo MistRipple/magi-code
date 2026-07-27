@@ -40,7 +40,7 @@ export interface OrchestrationRuntimeChainSummary {
   chainId: string;
   status: ExecutionChainStatus;
   recoverable: boolean;
-  attempt: number;
+  attempt?: number;
   createdAt: number;
   updatedAt: number;
   interruptedReason?: InterruptedReason;
@@ -83,6 +83,9 @@ export interface OrchestrationRuntimeTimelineEntry {
   timestamp: number;
   type: string;
   summary: string;
+  kind?: 'progress' | 'success' | 'warning' | 'error';
+  source?: string;
+  detail?: string;
   diffCount: number;
   trace?: unknown;
 }
@@ -97,17 +100,6 @@ export interface OrchestrationRuntimeStateDiffEntry {
   afterSummary?: string;
 }
 
-export interface OrchestrationRuntimeFailureRootCause {
-  summary: string;
-  eventType?: string;
-  eventId?: string;
-  occurredAt: number;
-  assignmentId?: string;
-  taskId?: string;
-  verificationId?: string;
-  error?: string;
-}
-
 export interface OrchestrationRuntimeRecoverySummary {
   continuationPolicy?: string;
   continuationReason?: string;
@@ -118,8 +110,7 @@ export interface OrchestrationRuntimeRecoverySummary {
   terminationReason?: string;
   acceptanceSummary?: unknown;
   reviewState?: string;
-  latestSnapshotId?: string;
-  latestSnapshotCreatedAt?: number;
+  latestRecoveryAt?: number;
   snapshotStorage?: 'head_commit' | 'ghost_commit';
   snapshotRef?: string;
   snapshotBaseRef?: string;
@@ -158,7 +149,6 @@ export interface OrchestrationRuntimeOpsView {
   plan?: OrchestrationRuntimePlanSummary;
   recentTimeline: OrchestrationRuntimeTimelineEntry[];
   recentStateDiffs: OrchestrationRuntimeStateDiffEntry[];
-  failureRootCause?: OrchestrationRuntimeFailureRootCause;
   recovery?: OrchestrationRuntimeRecoverySummary;
   governance?: OrchestrationRuntimeGovernanceView;
   projectInstructions?: unknown;
@@ -863,6 +853,11 @@ export interface IncidentNotificationRecord {
   level: string;
   title?: string;
   message: string;
+  detail?: string;
+  errorCode?: string;
+  failureStage?: string;
+  taskId?: string;
+  requestId?: string;
   source?: string;
   workspaceId?: string;
   sessionId?: string;

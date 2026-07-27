@@ -2561,7 +2561,9 @@
                       {/if}
                     </div>
                     {#if branchStatus.upstream}
-                      <div class="ia-branch-status-sub">{i18n.t('input.branch.status.upstream', { upstream: branchStatus.upstream })}</div>
+                      <div class="ia-branch-status-sub" title={branchStatus.upstream}>
+                        {i18n.t('input.branch.status.upstream', { upstream: branchStatus.upstream })}
+                      </div>
                     {/if}
                     {#if branchStatusItems(branchStatus).length > 0}
                       <div class="ia-branch-status-grid">
@@ -2635,7 +2637,7 @@
                           onclick={() => void selectBranch(branch)}
                           disabled={branchSwitching !== null || branchOperation !== null || sessionInputLocked || isInteractionBlocking || branchStatus?.hasUncommitted || branchContextDrift}
                         >
-                          <span class="ia-picker-item-label">{branch}</span>
+                          <span class="ia-picker-item-label" title={branch}>{branch}</span>
                           {#if branchSwitching === branch}
                             <span class="ia-picker-item-desc">{i18n.t('input.branch.switching')}</span>
                           {:else if currentBranch === branch}
@@ -2671,7 +2673,7 @@
                     {#each remoteBranches as branch (branch)}
                       <div class="ia-branch-manage-row">
                         <span class="ia-picker-item ia-branch-switch-item">
-                          <span class="ia-picker-item-label">{branch}</span>
+                          <span class="ia-picker-item-label" title={branch}>{branch}</span>
                         </span>
                         <div class="ia-branch-row-actions">
                           <button
@@ -2716,7 +2718,10 @@
                     {#each worktrees as worktree (worktree.path)}
                       <div class="ia-branch-manage-row ia-worktree-row">
                         <span class="ia-picker-item ia-branch-switch-item">
-                          <span class="ia-picker-item-label">{worktree.branch || i18n.t('input.branch.detached')}</span>
+                          <span
+                            class="ia-picker-item-label"
+                            title={worktree.branch || i18n.t('input.branch.detached')}
+                          >{worktree.branch || i18n.t('input.branch.detached')}</span>
                           <span class="ia-picker-item-desc" title={worktree.path}>{worktree.path}</span>
                         </span>
                         {#if worktree.path !== branchWorktreePath && worktree.managed}
@@ -3433,10 +3438,12 @@
   .ia-branch-untracked { color: color-mix(in srgb, var(--warning, #d29922) 92%, white 8%); }
   .ia-branch-sync { color: var(--foreground-muted); }
   /* 分支 picker 位于左下角，popover 锚定到左侧（覆盖模型 picker 的 right:0）。 */
-  .ia-branch-popover {
+  .ia-picker-popover.ia-branch-popover {
+    box-sizing: border-box;
     right: auto;
     left: 0;
-    width: min(520px, calc(100vw - 24px));
+    width: min(320px, calc(100vw - 24px));
+    max-width: calc(100vw - 24px);
     max-height: min(620px, calc(100vh - 120px));
   }
   .ia-branch-status-panel {
@@ -3455,6 +3462,10 @@
     margin-top: 3px;
     font-size: 10px;
     color: var(--foreground-muted);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .ia-branch-status-grid {
     display: flex;
@@ -3521,14 +3532,30 @@
     text-transform: uppercase;
   }
   .ia-branch-manage-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
     gap: 6px;
     min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
   }
-  .ia-branch-switch-item {
-    flex: 1;
+  .ia-picker-item.ia-branch-switch-item {
+    box-sizing: border-box;
+    width: 100%;
     min-width: 0;
+    overflow: hidden;
+  }
+  .ia-branch-switch-item .ia-picker-item-label,
+  .ia-branch-switch-item .ia-picker-item-desc {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    word-break: normal;
   }
   .ia-branch-row-actions {
     display: flex;
@@ -3542,6 +3569,7 @@
     background: transparent;
     color: var(--foreground-muted);
     font-size: 10px;
+    white-space: nowrap;
     cursor: pointer;
   }
   .ia-branch-action:hover:not(:disabled) {
@@ -4421,6 +4449,16 @@
     .ia-picker-popover {
       width: min(280px, calc(100vw - 24px));
       max-height: min(360px, 56vh);
+    }
+
+    .ia-picker-popover.ia-branch-popover {
+      position: fixed;
+      right: auto;
+      bottom: calc(44px + env(safe-area-inset-bottom));
+      left: 12px;
+      width: calc(100vw - 24px);
+      max-width: calc(100vw - 24px);
+      max-height: min(520px, 56vh);
     }
 
     .ia-session-model-popover {
