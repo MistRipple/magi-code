@@ -122,12 +122,22 @@ fn require_session_task_scope(
         workspace_path_value,
         "读取代理运行投影",
     )?;
-    let ownership = state
+    // 投影是只读查询：活跃执行链归档后 ownership.mission_id 会被清空，
+    // 但 session 一生一 mission，orchestrator thread 保留权威 mission。
+    // 这里回退到 thread mission，保证终态任务的投影仍可按会话历史读取。
+    let mission_id = state
         .session_store
-        .execution_ownership(&workspace.session_id);
+        .execution_ownership(&workspace.session_id)
+        .and_then(|ownership| ownership.mission_id)
+        .or_else(|| {
+            state
+                .session_store
+                .orchestrator_thread_for_session(&workspace.session_id)
+                .map(|thread| thread.mission_id)
+        });
     Ok(SessionTaskScope {
         workspace,
-        mission_id: ownership.and_then(|ownership| ownership.mission_id),
+        mission_id,
     })
 }
 
@@ -276,10 +286,13 @@ fn agent_projection_from_task(
             ..AgentModelBinding::default()
         });
     let (status, lifecycle) = agent_runtime_status(task);
-    let completed_at = matches!(task.status, TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed)
-        .then_some(task.updated_at);
-    let response_duration_ms = completed_at
-        .map(|completed_at| completed_at.0.saturating_sub(task.created_at.0));
+    let completed_at = matches!(
+        task.status,
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+    )
+    .then_some(task.updated_at);
+    let response_duration_ms =
+        completed_at.map(|completed_at| completed_at.0.saturating_sub(task.created_at.0));
     AgentProjectionDto {
         agent_run_id: task.task_id.to_string(),
         parent_task_id: task

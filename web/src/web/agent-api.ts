@@ -12,6 +12,7 @@ import type {
   IncidentNotificationItemDto,
   NotificationCenterSnapshotDto,
   NotificationsResponseDto,
+  SessionTurnQueueResponseDto,
   FetchModelsResponseDto,
   EnhancePromptRequestDto,
   SkillsLibraryResponseDto,
@@ -1420,6 +1421,40 @@ export async function submitSessionTurn(
     }
     throw error;
   }
+}
+
+export async function getAgentSessionTurnQueue(
+  sessionId: string,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<SessionTurnQueueResponseDto> {
+  const normalizedSessionId = sessionId.trim();
+  if (!normalizedSessionId) {
+    throw new AgentApiError(400, 'sessionId 不能为空', 'get session turn queue');
+  }
+  const binding = resolveBindingWithOverride(bindingOverride);
+  const query = new URLSearchParams({ sessionId: normalizedSessionId });
+  if (binding.workspaceId) query.set('workspaceId', binding.workspaceId);
+  if (binding.workspacePath) query.set('workspacePath', binding.workspacePath);
+  const response = await getTransport().request(agentUrl('/api/session/queue', query.toString()));
+  return await parseAgentJson<SessionTurnQueueResponseDto>(response, 'get session turn queue');
+}
+
+export async function removeAgentSessionTurnQueueItem(
+  sessionId: string,
+  queueId: string,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<SessionTurnQueueResponseDto> {
+  const normalizedSessionId = sessionId.trim();
+  const normalizedQueueId = queueId.trim();
+  if (!normalizedSessionId || !normalizedQueueId) {
+    throw new AgentApiError(400, 'sessionId 和 queueId 不能为空', 'remove session turn queue item');
+  }
+  return await postBoundJson<SessionTurnQueueResponseDto>(
+    '/api/session/queue/remove',
+    { sessionId: normalizedSessionId, queueId: normalizedQueueId },
+    'remove session turn queue item',
+    bindingOverride,
+  );
 }
 
 export async function interruptAgentSession(

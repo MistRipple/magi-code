@@ -27,6 +27,7 @@ let bootstrapRequestCount = 0;
 let workspaceSessionsRequestCount = 0;
 let workspaceSessionIsRunning = false;
 let workspaceSessionsPayloadOverride = null;
+let queuedTurnPayloads = [];
 
 class MemoryStorage {
   constructor() {
@@ -323,6 +324,20 @@ function installFetchStub() {
         canonicalItem: null,
       });
     }
+    if (parsed.pathname === '/api/session/queue' && init.method !== 'POST') {
+      return jsonResponse({
+        sessionId: parsed.searchParams.get('sessionId') || SESSION_ID,
+        queuedTurns: queuedTurnPayloads,
+      });
+    }
+    if (parsed.pathname === '/api/session/queue/remove') {
+      const body = JSON.parse(String(init.body || '{}'));
+      queuedTurnPayloads = queuedTurnPayloads.filter((turn) => turn.queueId !== body.queueId);
+      return jsonResponse({
+        sessionId: body.sessionId || SESSION_ID,
+        queuedTurns: queuedTurnPayloads,
+      });
+    }
     if (parsed.pathname === '/api/session/switch') {
       switchSessionRequestCount += 1;
       return jsonResponse({
@@ -486,29 +501,6 @@ function completedCanonicalAssistantItem() {
   };
 }
 
-function guidedCanonicalUserItem() {
-  return {
-    sessionId: SESSION_ID,
-    turnId: TURN_ID,
-    turnSeq: ACCEPTED_AT,
-    itemId: 'user-bridge-live-guide',
-    itemSeq: 2,
-    kind: 'user_message',
-    createdAt: ACCEPTED_AT + 500,
-    status: 'completed',
-    updatedAt: ACCEPTED_AT + 500,
-    content: '优先收口，不要继续扩展。',
-    sourceThreadId: `thread-${SESSION_ID}`,
-    visibility: {
-      renderable: true,
-    },
-    metadata: {
-      requestId: 'request-guide-current-turn',
-      userMessageId: 'user-bridge-live-guide',
-    },
-  };
-}
-
 function completedCanonicalTurn() {
   return {
     sessionId: SESSION_ID,
@@ -528,8 +520,8 @@ function completedCanonicalTurn() {
 function acceptedEnvelope() {
   const canonicalItem = acceptedCanonicalUserItem();
   return {
-    event_id: `event-session-turn-accepted-${ACCEPTED_AT}`,
-    event_type: 'session.turn.accepted',
+    event_id: `event-session-turn-task-${ACCEPTED_AT}`,
+    event_type: 'session.turn.task.accepted',
     category: 'domain',
     occurred_at: ACCEPTED_AT,
     sequence: 2,
@@ -809,230 +801,6 @@ await withGoldenViteServer(async (server) => {
     'live accepted session must update the browser binding',
   );
 
-  const pendingRequestIdsBeforeGuide = [...messagesStore.messagesState.pendingRequests];
-  sessionTurnInterceptors.push((_parsed, _init, body) => {
-    const canonicalItem = guidedCanonicalUserItem();
-    return jsonResponse({
-      sessionId: SESSION_ID,
-      entryId: 'timeline-guide-current-turn',
-      eventId: 'event-guide-current-turn',
-      acceptedAt: ACCEPTED_AT + 500,
-      createdSession: false,
-      route: 'steer',
-      userMessageItemId: canonicalItem.itemId,
-      canonicalSchemaVersion: 'canonical-turn.v1',
-      canonicalEventKind: 'turn_item_upsert',
-      canonicalTurn: {
-        sessionId: SESSION_ID,
-        turnId: TURN_ID,
-        turnSeq: ACCEPTED_AT,
-        acceptedAt: ACCEPTED_AT,
-        status: 'running',
-        items: [acceptedCanonicalUserItem(), canonicalItem],
-      },
-      canonicalItem,
-      steeredTurnId: TURN_ID,
-    });
-  });
-  bridge.postMessage({
-    type: 'executeTask',
-    text: '优先收口，不要继续扩展。',
-    requestId: 'request-guide-current-turn',
-    workspaceId: WORKSPACE_ID,
-    workspacePath: WORKSPACE_PATH,
-    sessionId: SESSION_ID,
-    followUpMode: 'guide',
-  });
-  await waitFor(
-    () => capturedTurnBodies.some((body) => body.requestId === 'request-guide-current-turn'),
-    'guide follow-up must submit immediately while the active turn is running',
-  );
-  const guidedTurnBody = capturedTurnBodies.find((body) => body.requestId === 'request-guide-current-turn');
-  assert.equal(guidedTurnBody.steerCurrentTurn, true, 'guide follow-up must use same-turn steer route');
-  assert.equal(guidedTurnBody.expectedTurnId, TURN_ID, 'guide follow-up must bind to the active canonical turn');
-  assert.equal(
-    messagesStore.messagesState.queuedMessages.some((message) => message.requestId === 'request-guide-current-turn'),
-    false,
-    'guide follow-up must not enter the independent turn queue',
-  );
-  assert.deepEqual(
-    [...messagesStore.messagesState.pendingRequests],
-    pendingRequestIdsBeforeGuide,
-    'guide follow-up must not create a second processing request or assistant placeholder',
-  );
-  await waitFor(
-    () => Boolean(findArtifactByTurnItemId(
-      messagesStore.messagesState.canonicalTimelineProjection,
-      'user-bridge-live-guide',
-    )),
-    'accepted guide follow-up must append a user item to the active turn',
-  );
-  assert.equal(
-    messagesStore.messagesState.canonicalTimelineProjection?.artifacts?.some((artifact) => (
-      artifact.message?.role === 'assistant'
-      && artifact.message?.metadata?.requestId === 'request-guide-current-turn'
-    )),
-    false,
-    'guide follow-up must not create an assistant card before the active turn continues',
-  );
-
-  const staleTurnId = 'turn-bridge-live-stale-cache';
-  turnStore.replaceCanonicalSessionTurns(SESSION_ID, [{
-    sessionId: SESSION_ID,
-    turnId: staleTurnId,
-    turnSeq: ACCEPTED_AT,
-    acceptedAt: ACCEPTED_AT,
-    status: 'running',
-    items: [acceptedCanonicalUserItem()].map((item) => ({
-      ...item,
-      turnId: staleTurnId,
-    })),
-  }]);
-  const steerRaceRequestId = 'request-guide-turn-race';
-  const steerRaceStartIndex = capturedTurnBodies.length;
-  sessionTurnInterceptors.push(() => new Response(JSON.stringify({
-    error_code: 'TURN_CONFLICT',
-    message: '当前回复已经切换，请基于最新状态重新发送',
-    conflict_kind: 'expected_turn_mismatch',
-    active_turn_id: TURN_ID,
-  }), {
-    status: 409,
-    headers: { 'content-type': 'application/json' },
-  }));
-  sessionTurnInterceptors.push((_parsed, _init, body) => {
-    const canonicalItem = {
-      ...guidedCanonicalUserItem(),
-      itemId: 'user-guide-turn-race',
-      content: body.text,
-      metadata: {
-        ...guidedCanonicalUserItem().metadata,
-        requestId: body.requestId,
-        userMessageId: body.userMessageId,
-      },
-    };
-    return jsonResponse({
-      sessionId: SESSION_ID,
-      entryId: 'timeline-guide-turn-race',
-      eventId: 'event-guide-turn-race',
-      acceptedAt: ACCEPTED_AT + 550,
-      createdSession: false,
-      route: 'steer',
-      userMessageItemId: canonicalItem.itemId,
-      canonicalSchemaVersion: 'canonical-turn.v1',
-      canonicalEventKind: 'turn_item_upsert',
-      canonicalTurn: {
-        sessionId: SESSION_ID,
-        turnId: TURN_ID,
-        turnSeq: ACCEPTED_AT,
-        acceptedAt: ACCEPTED_AT,
-        status: 'running',
-        items: [acceptedCanonicalUserItem(), canonicalItem],
-      },
-      canonicalItem,
-      steeredTurnId: TURN_ID,
-    });
-  });
-  bridge.postMessage({
-    type: 'executeTask',
-    text: 'Turn ID 竞争时必须自动重试一次。',
-    requestId: steerRaceRequestId,
-    workspaceId: WORKSPACE_ID,
-    workspacePath: WORKSPACE_PATH,
-    sessionId: SESSION_ID,
-    followUpMode: 'guide',
-  });
-  await waitFor(
-    () => capturedTurnBodies.length >= steerRaceStartIndex + 2,
-    'stale steer turn id must retry once with the server-reported active turn id',
-  );
-  const steerRaceBodies = capturedTurnBodies.slice(steerRaceStartIndex, steerRaceStartIndex + 2);
-  assert.deepEqual(
-    steerRaceBodies.map((body) => body.expectedTurnId),
-    [staleTurnId, TURN_ID],
-    'turn steer retry must converge from stale cached turn id to the server active turn id',
-  );
-  assert.deepEqual(
-    steerRaceBodies.map((body) => body.requestId),
-    [steerRaceRequestId, steerRaceRequestId],
-    'turn steer retry must preserve the idempotent request id',
-  );
-  assert.equal(
-    steerRaceBodies[0].userMessageId,
-    steerRaceBodies[1].userMessageId,
-    'turn steer retry must preserve the same user message id',
-  );
-  turnStore.replaceCanonicalSessionTurns(SESSION_ID, [{
-    sessionId: SESSION_ID,
-    turnId: TURN_ID,
-    turnSeq: ACCEPTED_AT,
-    acceptedAt: ACCEPTED_AT,
-    status: 'running',
-    items: [acceptedCanonicalUserItem(), guidedCanonicalUserItem()],
-  }]);
-
-  messagesStore.addPendingRequest('busy-before-queued-to-guide');
-  bridge.postMessage({
-    type: 'executeTask',
-    text: '这条排队消息要转换成当前轮引导。',
-    requestId: 'request-queued-to-guide',
-    workspaceId: WORKSPACE_ID,
-    workspacePath: WORKSPACE_PATH,
-    sessionId: SESSION_ID,
-    followUpMode: 'queue',
-  });
-  await waitFor(
-    () => messagesStore.messagesState.queuedMessages.some((message) => message.id === 'request-queued-to-guide'),
-    'busy follow-up must enter the queue before the user converts it to guidance',
-  );
-  sessionTurnInterceptors.push((_parsed, _init, body) => {
-    const canonicalItem = {
-      ...guidedCanonicalUserItem(),
-      itemId: 'user-queued-to-guide',
-      content: body.text,
-      metadata: {
-        ...guidedCanonicalUserItem().metadata,
-        requestId: body.requestId,
-      },
-    };
-    return jsonResponse({
-      sessionId: SESSION_ID,
-      entryId: 'timeline-queued-to-guide',
-      eventId: 'event-queued-to-guide',
-      acceptedAt: ACCEPTED_AT + 600,
-      createdSession: false,
-      route: 'steer',
-      userMessageItemId: canonicalItem.itemId,
-      canonicalSchemaVersion: 'canonical-turn.v1',
-      canonicalEventKind: 'turn_item_upsert',
-      canonicalTurn: {
-        sessionId: SESSION_ID,
-        turnId: TURN_ID,
-        turnSeq: ACCEPTED_AT,
-        acceptedAt: ACCEPTED_AT,
-        status: 'running',
-        items: [acceptedCanonicalUserItem(), canonicalItem],
-      },
-      canonicalItem,
-      steeredTurnId: TURN_ID,
-    });
-  });
-  bridge.postMessage({
-    type: 'guideQueuedMessage',
-    queuedMessageId: 'request-queued-to-guide',
-  });
-  await waitFor(
-    () => capturedTurnBodies.some((body) => body.requestId === 'request-queued-to-guide'),
-    'queued guidance action must immediately submit the selected message to the active turn',
-  );
-  const queuedGuidanceBody = capturedTurnBodies.find((body) => body.requestId === 'request-queued-to-guide');
-  assert.equal(queuedGuidanceBody.steerCurrentTurn, true);
-  assert.equal(queuedGuidanceBody.expectedTurnId, TURN_ID);
-  await waitFor(
-    () => !messagesStore.messagesState.queuedMessages.some((message) => message.id === 'request-queued-to-guide'),
-    'successfully guided message must leave the independent turn queue',
-  );
-  messagesStore.clearPendingRequest('busy-before-queued-to-guide');
-
   const streamCountBeforeActiveIdleCheck = FakeEventSource.instances.length;
   const originalDateNowForActiveIdleCheck = Date.now;
   try {
@@ -1249,13 +1017,8 @@ await withGoldenViteServer(async (server) => {
     }],
   });
   await waitFor(
-    () => messagesStore.messagesState.queuedMessages.some((message) => message.requestId === 'request-queued-immediate-feedback'),
-    'busy follow-up must enter the queued message list immediately',
-  );
-  messagesStore.clearPendingRequest('busy-before-queued-follow-up');
-  await waitFor(
     () => capturedTurnBodies.some((body) => body.requestId === 'request-queued-immediate-feedback'),
-    'queued follow-up must submit after the active turn is idle',
+    'busy follow-up must submit immediately so the daemon owns the queue',
   );
   const queuedGoalBody = capturedTurnBodies.find((body) => body.requestId === 'request-queued-immediate-feedback');
   assert.equal(
@@ -1283,28 +1046,70 @@ await withGoldenViteServer(async (server) => {
   assert.equal(
     messagesStore.messagesState.isProcessing,
     true,
-    'queued follow-up local pending turn must mark the UI as processing before backend accepted response',
+    'queued follow-up may show a local pending turn only while the daemon response is unresolved',
   );
+  queuedTurnPayloads = [{
+    queueId: 'queued-session-turn-golden',
+    queuePosition: 1,
+    requestId: 'request-queued-immediate-feedback',
+    sessionId: SESSION_ID,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    acceptedAt: ACCEPTED_AT + 2500,
+    content: '排队消息必须在出队提交时立刻进入主线。',
+    text: '排队消息必须在出队提交时立刻进入主线。',
+    skillName: null,
+    goalMode: true,
+    accessProfile: null,
+    images: [],
+    contextReferences: [{
+      kind: 'file',
+      path: '/tmp/reference-queued.md',
+      pathRef: 'mhp1:u:reference-queued',
+      name: 'reference-queued.md',
+    }],
+    retryCount: 0,
+  }];
   queuedTurnAccepted.resolve(jsonResponse({
     sessionId: SESSION_ID,
-    entryId: 'timeline-queued-immediate-feedback',
+    entryId: 'queued-session-turn-golden',
     eventId: 'event-queued-immediate-feedback',
     acceptedAt: ACCEPTED_AT + 2500,
     createdSession: false,
     route: 'chat',
     userMessageItemId: 'user-queued-immediate-feedback',
+    queued: true,
+    queueId: 'queued-session-turn-golden',
+    queuePosition: 1,
     canonicalSchemaVersion: null,
     canonicalEventKind: null,
     canonicalTurn: null,
     canonicalItem: null,
   }));
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  assert.equal(
-    messagesStore.getToasts().length,
-    0,
-    'accepted queued conversation turns must not emit routine success notifications',
+  await waitFor(
+    () => messagesStore.messagesState.queuedMessages.some((message) => (
+      message.id === 'queued-session-turn-golden'
+      && message.requestId === 'request-queued-immediate-feedback'
+    )),
+    'accepted queued turn must be rendered from the daemon queue snapshot',
   );
-  messagesStore.clearPendingRequest('request-queued-immediate-feedback');
+  assert.equal(
+    findArtifactByRequestId(
+      messagesStore.messagesState.canonicalTimelineProjection,
+      'request-queued-immediate-feedback',
+    ),
+    undefined,
+    'daemon-queued turns must not remain as fake running conversation turns',
+  );
+  messagesStore.clearPendingRequest('busy-before-queued-follow-up');
+  bridge.postMessage({
+    type: 'removeQueuedMessage',
+    queuedMessageId: 'queued-session-turn-golden',
+  });
+  await waitFor(
+    () => messagesStore.messagesState.queuedMessages.length === 0,
+    'removing a queued turn must update the daemon queue and then refresh the UI snapshot',
+  );
 
   const streamCountBeforeLagged = FakeEventSource.instances.length;
   const originalWarn = console.warn;

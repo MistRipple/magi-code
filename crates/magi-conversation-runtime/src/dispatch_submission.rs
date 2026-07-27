@@ -138,9 +138,14 @@ pub enum DispatchSubmissionAcceptError {
 impl DispatchSubmissionAcceptError {
     pub fn from_store_error(error: DomainError) -> Self {
         match error {
+            DomainError::CurrentTurnConflict {
+                session_id,
+                active_turn_id,
+            } => Self::Conflict {
+                message: format!("会话 {session_id} 已有活动轮次 {active_turn_id}"),
+            },
             DomainError::InvalidState { message }
-                if message.contains("active current_turn")
-                    || message.contains("最近轮次")
+                if message.contains("最近轮次")
                     || message.contains("最后一轮")
                     || message.contains("不是已停止")
                     || message.contains("不是用户主动停止") =>

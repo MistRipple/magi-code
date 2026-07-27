@@ -338,6 +338,14 @@ pub fn map_recovery_input_error(
         magi_core::DomainError::AlreadyExists { entity } => RecoveryValidationError::Internal {
             message: format!("recovery 输入构建遇到重复实体: {entity}"),
         },
+        magi_core::DomainError::CurrentTurnConflict {
+            session_id,
+            active_turn_id,
+        } => RecoveryValidationError::Internal {
+            message: format!(
+                "recovery 输入构建遇到无关的会话轮次冲突: session={session_id}, turn={active_turn_id}"
+            ),
+        },
     }
 }
 

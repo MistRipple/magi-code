@@ -898,7 +898,6 @@ export interface WebviewPersistedState {
   scrollAnchors?: ScrollAnchors;
   autoScrollEnabled?: AutoScrollConfig;
   sessionViewStateByScope?: Record<string, PersistedSessionViewState>;
-  sessionQueuedMessagesByScope?: Record<string, QueuedMessage[]>;
 }
 
 export interface PersistedSessionViewState {

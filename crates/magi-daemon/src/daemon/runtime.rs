@@ -55,7 +55,7 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock, Weak},
 };
 use tracing::{info, warn};
 
@@ -1519,12 +1519,16 @@ impl DaemonRuntime {
         .with_bridge_probe_transport(BridgeServerKind::Mcp, mcp_transport)
         .with_execution_pipeline(orchestrator, execution_runtime, memory_store);
 
+        state
+            .restore_regular_session_turn_queues()
+            .map_err(|error| {
+                DaemonError::internal(format!("恢复 session turn 排队状态失败: {error:?}"))
+            })?;
         state = state.with_task_store(Arc::clone(&task_store));
         if magi_api::task_turn_finalize::reconcile_terminal_session_task_turns(&state) > 0 {
             let _ = state.persist_session_durable_state();
         }
         let state_for_task_workers = state.clone();
-        let state_for_runner_terminal = state.clone();
         let state_for_knowledge_persist = state.clone();
         let state_for_session_turn_persist = state.clone();
         let knowledge_persist_callback = Arc::new(move || {
@@ -1575,6 +1579,12 @@ impl DaemonRuntime {
                 .with_snapshot_manager(state.snapshot_manager.clone()),
         );
         let session_turn_dispatcher = llm_task_dispatcher.clone();
+        state = state
+            .with_session_turn_dispatcher(session_turn_dispatcher)
+            .with_model_bridge_client(business_model_client);
+        let state_for_runner_terminal = state.clone();
+        let terminal_runner_manager = Arc::new(OnceLock::<Weak<RunnerManager>>::new());
+        let terminal_runner_manager_for_observer = Arc::clone(&terminal_runner_manager);
         let runner_manager = RunnerManager::with_dispatcher_and_worker_catalog(
             Arc::clone(&task_store),
             state.session_store.clone(),
@@ -1588,19 +1598,37 @@ impl DaemonRuntime {
             let Some(session_id) = session_id else {
                 return;
             };
+            let Some(runner_manager) = terminal_runner_manager_for_observer
+                .get()
+                .and_then(Weak::upgrade)
+            else {
+                tracing::error!(
+                    %session_id,
+                    %root_task_id,
+                    "runner 终态回调无法获取活动 runner manager"
+                );
+                return;
+            };
+            let callback_state = state_for_runner_terminal
+                .clone()
+                .with_shared_runner_manager(runner_manager);
             if magi_api::task_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
-                &state_for_runner_terminal,
+                &callback_state,
                 &session_id,
                 &root_task_id,
                 &status,
             ) {
-                let _ = state_for_runner_terminal.persist_session_durable_state();
+                let _ = callback_state.persist_session_durable_state();
             }
         });
-        state = state
-            .with_runner_manager(runner_manager)
-            .with_session_turn_dispatcher(session_turn_dispatcher)
-            .with_model_bridge_client(business_model_client);
+        let runner_manager = Arc::new(runner_manager);
+        if terminal_runner_manager
+            .set(Arc::downgrade(&runner_manager))
+            .is_err()
+        {
+            return Err(DaemonError::internal("重复装配 runner 终态回调状态"));
+        }
+        state = state.with_shared_runner_manager(runner_manager);
 
         if let Some(probe_config) = direct_http_probe_config {
             state = state.with_direct_http_model_probe(probe_config);
@@ -1609,6 +1637,7 @@ impl DaemonRuntime {
         // 把 SnapshotManager 桥接到 session-store 生命周期事件。生产路径必装；
         // 测试可用 ApiState::new 直接构造而不调用此函数，惰性 fallback 仍兜底。
         state.install_snapshot_lifecycle_observer();
+        magi_api::task_turn_finalize::schedule_restored_session_turn_queues(&state);
 
         Ok(state)
     }
@@ -3572,7 +3601,11 @@ done
         .await;
         assert_eq!(status, StatusCode::OK, "unexpected body: {body:?}");
         assert_eq!(body["route"], "chat");
-        assert!(body.get("rootTaskId").is_none());
+        // 统一执行链路后，chat 也通过 root coordinator 派发并返回 rootTaskId。
+        let root_task_id = body["rootTaskId"]
+            .as_str()
+            .expect("chat turn should return root task id")
+            .to_string();
 
         let deadline = Instant::now() + BACKGROUND_TEST_TIMEOUT;
         loop {
@@ -3595,13 +3628,6 @@ done
                         .any(|item| item["kind"] == "assistant_final"),
                     "regular chat turn should produce assistant_final item: {session:?}"
                 );
-                assert!(
-                    read_model["details"]["tasks"]
-                        .as_array()
-                        .expect("tasks should be an array")
-                        .is_empty(),
-                    "regular chat turn must not create agent run projection"
-                );
                 break;
             }
             assert_ne!(
@@ -3613,6 +3639,19 @@ done
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+
+        // 统一链路后 chat 也有 root task，投影接口应能回看已完成的运行。
+        let projection = wait_for_agent_run_projection_completed(
+            app.clone(),
+            &root_task_id,
+            session_id.as_str(),
+            active_workspace_id.as_str(),
+        )
+        .await;
+        assert_eq!(
+            projection["root_task"]["status"], "completed",
+            "chat turn root task should complete: {projection:?}"
+        );
     }
 
     #[tokio::test]

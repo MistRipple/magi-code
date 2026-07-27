@@ -363,30 +363,6 @@ function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
     }));
 }
 
-function normalizePersistedQueuedMessageMap(value: unknown): Record<string, QueuedMessage[]> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {};
-  }
-  const normalized: Record<string, QueuedMessage[]> = {};
-  let count = 0;
-  for (const [rawScopeKey, rawMessages] of Object.entries(value as Record<string, unknown>)) {
-    if (count >= MAX_PERSISTED_ARRAY_LENGTH) {
-      break;
-    }
-    const scopeKey = typeof rawScopeKey === 'string' ? rawScopeKey.trim() : '';
-    if (!scopeKey) {
-      continue;
-    }
-    const queued = normalizeQueuedMessageList(rawMessages);
-    if (queued.length === 0) {
-      continue;
-    }
-    normalized[scopeKey] = queued;
-    count += 1;
-  }
-  return normalized;
-}
-
 function normalizePersistedSessionViewState(
   scopeKey: string,
   value: unknown,
@@ -455,7 +431,6 @@ function resetPanelScrollRuntimeState(): void {
 
 let deferredWebviewStateSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let sessionViewStateByScope = $state<Record<string, PersistedSessionViewState>>({});
-let sessionQueuedMessagesByScope = $state<Record<string, QueuedMessage[]>>({});
 let webviewStateBatchDepth = 0;
 let webviewStateBatchPending = false;
 
@@ -860,8 +835,7 @@ export function getQueuedMessages() {
 }
 
 export function hasQueuedMessagesAcrossSessions(): boolean {
-  return messagesState.queuedMessages.length > 0
-    || Object.values(sessionQueuedMessagesByScope).some((messages) => messages.length > 0);
+  return messagesState.queuedMessages.length > 0;
 }
 
 export function getToasts() {
@@ -1048,13 +1022,6 @@ function getSessionViewState(sessionId: string | null | undefined): PersistedSes
   return sessionViewStateByScope[scopeKey] || null;
 }
 
-function restoreQueuedMessagesForSession(sessionId: string | null | undefined): void {
-  const scopeKey = currentSessionScopeKey(sessionId);
-  messagesState.queuedMessages = scopeKey
-    ? normalizeQueuedMessageList(sessionQueuedMessagesByScope[scopeKey])
-    : [];
-}
-
 function pruneSessionViewStateByKnownSessions(): void {
   const currentWorkspaceId = normalizeWorkspaceId(messagesState.currentWorkspaceId);
   const knownScopeKeys = new Set<string>();
@@ -1080,18 +1047,6 @@ function pruneSessionViewStateByKnownSessions(): void {
     return;
   }
   sessionViewStateByScope = Object.fromEntries(nextEntries);
-  const nextQueuedEntries = Object.entries(sessionQueuedMessagesByScope)
-    .filter(([scopeKey, queuedMessages]) => {
-      if (queuedMessages.length === 0) {
-        return false;
-      }
-      const firstQueued = queuedMessages[0];
-      const queuedWorkspaceId = normalizeWorkspaceId(firstQueued?.workspaceId);
-      return queuedWorkspaceId !== currentWorkspaceId || knownScopeKeys.has(scopeKey);
-    });
-  if (nextQueuedEntries.length !== Object.keys(sessionQueuedMessagesByScope).length) {
-    sessionQueuedMessagesByScope = Object.fromEntries(nextQueuedEntries);
-  }
 }
 
 function applySessionViewState(sessionId: string | null | undefined): boolean {
@@ -1149,7 +1104,6 @@ function saveWebviewState() {
       scrollAnchors: messagesState.scrollAnchors,
       autoScrollEnabled: messagesState.autoScrollEnabled,
       sessionViewStateByScope,
-      sessionQueuedMessagesByScope,
     };
     vscode.setState(state);
   } catch (error) {
@@ -1296,7 +1250,7 @@ export function setCurrentSessionId(id: string | null) {
     if (!restoredSessionView) {
       resetPanelScrollRuntimeState();
     }
-    restoreQueuedMessagesForSession(nextSessionId);
+    messagesState.queuedMessages = [];
   }
   syncNotificationsFromContext(nextSessionId);
   saveWebviewState();
@@ -1382,31 +1336,6 @@ export function updateSessions(newSessions: Session[]) {
 export function setQueuedMessages(newQueuedMessages: QueuedMessage[]) {
   const normalized = normalizeQueuedMessageList(newQueuedMessages);
   messagesState.queuedMessages = normalized;
-  const scopeKey = currentSessionScopeKey();
-  if (scopeKey) {
-    sessionQueuedMessagesByScope = {
-      ...sessionQueuedMessagesByScope,
-      ...(normalized.length > 0 ? { [scopeKey]: normalized } : {}),
-    };
-    if (normalized.length === 0 && sessionQueuedMessagesByScope[scopeKey]) {
-      const { [scopeKey]: _removed, ...rest } = sessionQueuedMessagesByScope;
-      sessionQueuedMessagesByScope = rest;
-    }
-  }
-  saveWebviewState();
-}
-
-export function enqueueQueuedMessage(message: QueuedMessage) {
-  setQueuedMessages([
-    ...messagesState.queuedMessages,
-    message,
-  ]);
-}
-
-export function dequeueQueuedMessage(): QueuedMessage | null {
-  const [next, ...rest] = messagesState.queuedMessages;
-  setQueuedMessages(rest);
-  return next || null;
 }
 
 export function removeQueuedMessage(id: string) {
@@ -2028,13 +1957,11 @@ export function initializeState() {
   clearAllRetryRuntime();
   resetPanelScrollRuntimeState();
   sessionViewStateByScope = {};
-  sessionQueuedMessagesByScope = {};
   const persisted = vscode.getState<WebviewPersistedState>();
   if (persisted) {
     // Tab 状态不持久化，每次打开都默认显示主对话 tab
     messagesState.currentTopTab = 'thread';
     sessionViewStateByScope = normalizePersistedSessionViewStateMap(persisted.sessionViewStateByScope);
-    sessionQueuedMessagesByScope = normalizePersistedQueuedMessageMap(persisted.sessionQueuedMessagesByScope);
     const explicitSessionId = normalizeSessionId(messagesState.currentSessionId);
     const restoredSessionViewState = explicitSessionId
       ? applySessionViewState(explicitSessionId)
@@ -2042,7 +1969,7 @@ export function initializeState() {
     if (explicitSessionId && !restoredSessionViewState) {
       resetPanelScrollRuntimeState();
     }
-    restoreQueuedMessagesForSession(explicitSessionId);
+    messagesState.queuedMessages = [];
     notificationsByContext = {};
     messagesState.orchestratorRuntimeState = null;
     syncNotificationsFromContext(messagesState.currentSessionId);

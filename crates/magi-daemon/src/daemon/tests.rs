@@ -2339,18 +2339,18 @@ async fn session_turn_live_events_reach_multiple_subscribers() {
 
     let first_event = wait_for_event_matching(
         &mut first_receiver,
-        "first subscriber session.turn.accepted",
+        "first subscriber session.turn.task.accepted",
         |event| {
-            event.event_type == "session.turn.accepted"
+            event.event_type == "session.turn.task.accepted"
                 && event_payload_contains_request_id(event, "request-multi-subscriber-live")
         },
     )
     .await;
     let second_event = wait_for_event_matching(
         &mut second_receiver,
-        "second subscriber session.turn.accepted",
+        "second subscriber session.turn.task.accepted",
         |event| {
-            event.event_type == "session.turn.accepted"
+            event.event_type == "session.turn.task.accepted"
                 && event_payload_contains_request_id(event, "request-multi-subscriber-live")
         },
     )
@@ -3632,7 +3632,9 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
     assert!(!second_body["createdSession"].as_bool().unwrap_or(true));
     let second_root_task_id = second_body["rootTaskId"]
         .as_str()
-        .expect("second root task id should serialize as string")
+        .unwrap_or_else(|| {
+            panic!("second root task id should serialize as string, body: {second_body}")
+        })
         .to_string();
     let second_projection = wait_for_agent_run_projection_completed(
         app.clone(),

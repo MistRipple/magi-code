@@ -98,13 +98,21 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
 fn schedule_next_queued_session_turn(state: &ApiState, session_id: &SessionId) {
     let workspace_id = state
         .session_store
-        .execution_ownership(session_id)
-        .and_then(|ownership| ownership.workspace_id);
+        .session(session_id)
+        .and_then(|session| state.session_workspace_id(&session));
     crate::routes::sessions::schedule_next_queued_regular_session_turn(
         state.clone(),
         session_id.clone(),
         workspace_id,
     );
+}
+
+pub fn schedule_restored_session_turn_queues(state: &ApiState) -> usize {
+    let session_ids = state.queued_regular_session_ids();
+    for session_id in &session_ids {
+        schedule_next_queued_session_turn(state, session_id);
+    }
+    session_ids.len()
 }
 
 pub fn reconcile_terminal_session_task_turns(state: &ApiState) -> usize {

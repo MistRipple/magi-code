@@ -8,6 +8,11 @@ pub enum DomainError {
     AlreadyExists { entity: &'static str },
     #[error("非法状态转换: {message}")]
     InvalidState { message: String },
+    #[error("会话 {session_id} 已有活动轮次 {active_turn_id}")]
+    CurrentTurnConflict {
+        session_id: String,
+        active_turn_id: String,
+    },
     #[error("校验失败: {message}")]
     Validation { message: String },
 }

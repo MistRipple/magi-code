@@ -657,7 +657,11 @@ fn accept_current_turn_with_timeline_entry_rejects_running_turn_without_timeline
 
     assert!(matches!(
         result,
-        Err(magi_core::DomainError::InvalidState { .. })
+        Err(magi_core::DomainError::CurrentTurnConflict {
+            session_id: ref conflicted_session_id,
+            active_turn_id: ref conflicted_turn_id,
+        }) if conflicted_session_id == session_id.as_str()
+            && conflicted_turn_id == "turn-running"
     ));
     assert!(
         !store
@@ -845,7 +849,11 @@ fn accept_active_execution_chain_rejects_running_turn_without_timeline_write() {
 
     assert!(matches!(
         result,
-        Err(magi_core::DomainError::InvalidState { .. })
+        Err(magi_core::DomainError::CurrentTurnConflict {
+            session_id: ref conflicted_session_id,
+            active_turn_id: ref conflicted_turn_id,
+        }) if conflicted_session_id == session_id.as_str()
+            && conflicted_turn_id == "turn-running"
     ));
     assert!(
         !store
@@ -883,7 +891,11 @@ fn upsert_active_execution_chain_rejects_different_running_turn() {
 
     assert!(matches!(
         result,
-        Err(magi_core::DomainError::InvalidState { .. })
+        Err(magi_core::DomainError::CurrentTurnConflict {
+            session_id: ref conflicted_session_id,
+            active_turn_id: ref conflicted_turn_id,
+        }) if conflicted_session_id == session_id.as_str()
+            && conflicted_turn_id == "turn-running"
     ));
     assert_eq!(
         store

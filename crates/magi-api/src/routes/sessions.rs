@@ -3,29 +3,20 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-#[cfg(test)]
-use magi_conversation_runtime::session_turn_execution::{
-    SessionGoalTurnMode, SessionTurnExecutionError, SessionTurnExecutionOutput,
-    SessionTurnExecutionRequest, SessionTurnFailureReason,
-};
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
-#[cfg(test)]
-use magi_conversation_runtime::session_writeback::{
-    SessionTurnErrorInput, append_session_turn_error_item,
-};
 use magi_conversation_runtime::{
     SessionTurnInputCommitError, SessionTurnInputError, UserSignal, public_builtin_tool_references,
     tool_reference_position,
 };
-#[cfg(test)]
-use magi_core::AccessProfile;
-use magi_core::{DomainError, EventId, SessionId, TaskTier, UtcMillis, WorkerId, WorkspaceId};
+use magi_core::{
+    AccessProfile, DomainError, EventId, SessionId, TaskTier, UtcMillis, WorkerId, WorkspaceId,
+};
 use magi_core::{SessionLifecycleStatus, TaskStatus};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn,
-    GoalStatus, NotificationRecord, NotificationScope, SessionGoal, SessionRecord,
-    TimelineEntryInput, TimelineEntryKind,
+    CanonicalTurnItemKind, GoalStatus, NotificationRecord, NotificationScope, SessionGoal,
+    SessionRecord, TimelineEntryInput, TimelineEntryKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -54,6 +45,11 @@ use crate::{
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/session/turn", post(submit_session_turn))
+        .route("/session/queue", get(get_session_turn_queue))
+        .route(
+            "/session/queue/remove",
+            post(remove_session_turn_queue_item),
+        )
         .route("/session/interrupt", post(interrupt_session_turn))
         .route("/session/continue", post(continue_session))
         .route("/session/switch", post(switch_session))
@@ -81,6 +77,61 @@ struct DeleteSessionRequest {
     workspace_path: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionTurnQueueScope {
+    session_id: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    workspace_path: Option<String>,
+}
+
+impl SessionTurnQueueScope {
+    fn requested_workspace_id(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_id.as_deref())
+    }
+
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RemoveSessionTurnQueueItemRequest {
+    #[serde(flatten)]
+    scope: SessionTurnQueueScope,
+    queue_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueuedSessionTurnDto {
+    queue_id: String,
+    queue_position: usize,
+    request_id: Option<String>,
+    session_id: String,
+    workspace_id: String,
+    workspace_path: Option<String>,
+    accepted_at: UtcMillis,
+    content: String,
+    text: Option<String>,
+    skill_name: Option<String>,
+    goal_mode: bool,
+    access_profile: Option<AccessProfile>,
+    images: Vec<crate::dto::SessionTurnImageDto>,
+    context_references: Vec<crate::dto::SessionContextReferenceDto>,
+    retry_count: u8,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionTurnQueueResponseDto {
+    session_id: String,
+    queued_turns: Vec<QueuedSessionTurnDto>,
+}
+
 impl DeleteSessionRequest {
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
@@ -89,6 +140,77 @@ impl DeleteSessionRequest {
     fn requested_workspace_path(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_path.as_deref())
     }
+}
+
+fn session_turn_queue_response(
+    state: &ApiState,
+    session_id: &SessionId,
+) -> SessionTurnQueueResponseDto {
+    let queued_turns = state
+        .queued_regular_session_turns(session_id)
+        .into_iter()
+        .enumerate()
+        .map(|(index, queued)| {
+            let text = queued.request.trimmed_text();
+            QueuedSessionTurnDto {
+                queue_id: queued.queue_id,
+                queue_position: index + 1,
+                request_id: queued.request.request_id(),
+                session_id: queued.session_id.to_string(),
+                workspace_id: queued.requested_workspace_id.to_string(),
+                workspace_path: queued.request.workspace_path.clone(),
+                accepted_at: queued.accepted_at,
+                content: queued.request.timeline_message(text.as_deref()),
+                text,
+                skill_name: queued.request.skill_name.clone(),
+                goal_mode: queued.request.goal_mode,
+                access_profile: queued.request.access_profile,
+                images: queued.request.images,
+                context_references: queued.request.context_references,
+                retry_count: queued.retry_count,
+            }
+        })
+        .collect();
+    SessionTurnQueueResponseDto {
+        session_id: session_id.to_string(),
+        queued_turns,
+    }
+}
+
+fn require_session_turn_queue_scope(
+    state: &ApiState,
+    scope: &SessionTurnQueueScope,
+) -> Result<(SessionId, WorkspaceId), ApiError> {
+    let session_id = parse_session_id(Some(&scope.session_id))?;
+    let workspace_id = require_request_workspace_id(
+        state,
+        scope.requested_workspace_id(),
+        scope.requested_workspace_path(),
+    )?;
+    require_session_record_in_workspace(state, &session_id, Some(workspace_id.as_str()))?;
+    Ok((session_id, workspace_id))
+}
+
+async fn get_session_turn_queue(
+    State(state): State<ApiState>,
+    Query(scope): Query<SessionTurnQueueScope>,
+) -> Result<Json<SessionTurnQueueResponseDto>, ApiError> {
+    let (session_id, _) = require_session_turn_queue_scope(&state, &scope)?;
+    Ok(Json(session_turn_queue_response(&state, &session_id)))
+}
+
+async fn remove_session_turn_queue_item(
+    State(state): State<ApiState>,
+    Json(request): Json<RemoveSessionTurnQueueItemRequest>,
+) -> Result<Json<SessionTurnQueueResponseDto>, ApiError> {
+    let (session_id, _) = require_session_turn_queue_scope(&state, &request.scope)?;
+    let queue_id = request.queue_id.trim();
+    if queue_id.is_empty() {
+        return Err(ApiError::InvalidInput("queueId 不能为空".to_string()));
+    }
+    let _session_turn_guard = state.lock_session_turn(&session_id).await;
+    state.remove_regular_session_turn(&session_id, queue_id)?;
+    Ok(Json(session_turn_queue_response(&state, &session_id)))
 }
 
 async fn submit_session_turn(
@@ -126,6 +248,17 @@ async fn submit_session_turn(
             "编辑上一条消息必须开始新的对话轮次".to_string(),
         ));
     }
+    let session_turn_guard = if matches!(
+        decision.route,
+        SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute | SessionTurnRouteDto::Task
+    ) {
+        match request.requested_session_id() {
+            Some(session_id) => Some(state.lock_session_turn(&session_id).await),
+            None => None,
+        }
+    } else {
+        None
+    };
     if matches!(
         decision.route,
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute | SessionTurnRouteDto::Task
@@ -134,6 +267,26 @@ async fn submit_session_turn(
         let session =
             require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
         let session_workspace_id = session_workspace_id(&state, &session);
+        if state.queued_regular_session_turn_count(&session_id) > 0 {
+            let should_schedule = state
+                .session_store
+                .ensure_current_turn_acceptance_available(&session_id)
+                .is_ok();
+            let response = enqueue_session_turn_response(EnqueueSessionTurnInput {
+                state: &state,
+                request,
+                requested_workspace_id: workspace_id,
+                accepted_at,
+                decision,
+                session_id: session_id.clone(),
+                workspace_id: session_workspace_id.clone(),
+            })?;
+            drop(session_turn_guard);
+            if should_schedule {
+                schedule_next_queued_regular_session_turn(state, session_id, session_workspace_id);
+            }
+            return Ok(Json(response));
+        }
         match state
             .session_store
             .ensure_current_turn_acceptance_available(&session_id)
@@ -142,19 +295,32 @@ async fn submit_session_turn(
             Err(error) if request.replace_turn_id().is_some() => {
                 return Err(map_turn_replacement_error(&state, &session_id, error));
             }
-            Err(error) if domain_error_is_active_current_turn(&error) => {
-                return Ok(Json(enqueue_session_turn_response(
-                    EnqueueSessionTurnInput {
+            Err(DomainError::CurrentTurnConflict { .. }) => {
+                // root task 已终态但异步收口尚未落地时，先按需收口再接受新消息，
+                // 与 interrupt 路径的收口逻辑保持一致；否则新消息会排在一个
+                // 实际上已经结束的轮次后面，响应里也拿不到 rootTaskId。
+                let current_turn = state
+                    .session_store
+                    .runtime_sidecar(&session_id)
+                    .and_then(|sidecar| sidecar.current_turn);
+                let reconciled =
+                    finalize_terminal_root_current_turn(&state, &session_id, current_turn.as_ref())
+                        && state
+                            .session_store
+                            .ensure_current_turn_acceptance_available(&session_id)
+                            .is_ok();
+                if !reconciled {
+                    return enqueue_session_turn_response(EnqueueSessionTurnInput {
                         state: &state,
                         request,
-                        images,
                         requested_workspace_id: workspace_id,
                         accepted_at,
                         decision,
                         session_id,
                         workspace_id: session_workspace_id,
-                    },
-                )));
+                    })
+                    .map(Json);
+                }
             }
             Err(error) => {
                 return Err(ApiError::internal_assembly(
@@ -259,7 +425,6 @@ static INCIDENT_NOTIFICATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 struct EnqueueSessionTurnInput<'a> {
     state: &'a ApiState,
     request: SessionTurnRequestDto,
-    images: Vec<magi_conversation_runtime::session_images::SessionTurnImage>,
     requested_workspace_id: WorkspaceId,
     accepted_at: UtcMillis,
     decision: SessionTurnIntentDecision,
@@ -267,11 +432,12 @@ struct EnqueueSessionTurnInput<'a> {
     workspace_id: Option<WorkspaceId>,
 }
 
-fn enqueue_session_turn_response(input: EnqueueSessionTurnInput<'_>) -> SessionTurnResponseDto {
+fn enqueue_session_turn_response(
+    input: EnqueueSessionTurnInput<'_>,
+) -> Result<SessionTurnResponseDto, ApiError> {
     let EnqueueSessionTurnInput {
         state,
-        request,
-        images,
+        mut request,
         requested_workspace_id,
         accepted_at,
         decision,
@@ -279,12 +445,15 @@ fn enqueue_session_turn_response(input: EnqueueSessionTurnInput<'_>) -> SessionT
         workspace_id,
     } = input;
     let queue_id = format!("queued-session-turn-{}-{}", session_id, accepted_at.0);
+    if request.request_id().is_none() {
+        request.request_id = Some(format!("request-{queue_id}"));
+    }
     let user_message_item_id = request
         .user_message_id()
-        .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0));
+        .unwrap_or_else(|| format!("turn-item-user-{queue_id}"));
+    request.user_message_id = Some(user_message_item_id.clone());
     let queue_position = state.enqueue_regular_session_turn(QueuedRegularSessionTurn {
         request,
-        images,
         requested_workspace_id,
         accepted_at,
         route: decision.route,
@@ -297,7 +466,8 @@ fn enqueue_session_turn_response(input: EnqueueSessionTurnInput<'_>) -> SessionT
         session_id: session_id.clone(),
         workspace_id: workspace_id.clone(),
         queue_id: queue_id.clone(),
-    });
+        retry_count: 0,
+    })?;
     let event_id = publish_regular_session_turn_queued_event(
         state,
         &session_id,
@@ -307,7 +477,7 @@ fn enqueue_session_turn_response(input: EnqueueSessionTurnInput<'_>) -> SessionT
         &queue_id,
         queue_position,
     );
-    SessionTurnResponseDto::new(SessionTurnResponseInput {
+    Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
         session_id,
         entry_id: queue_id.clone(),
         event_id,
@@ -319,7 +489,7 @@ fn enqueue_session_turn_response(input: EnqueueSessionTurnInput<'_>) -> SessionT
         execution_chain_ref: None,
         user_message_item_id: Some(user_message_item_id),
     })
-    .with_queued(queue_id, queue_position)
+    .with_queued(queue_id, queue_position))
 }
 
 async fn submit_steer_current_turn(
@@ -1462,331 +1632,6 @@ fn build_user_message_turn_item(
     )
 }
 
-#[cfg(test)]
-async fn submit_regular_session_turn(
-    state: ApiState,
-    request: SessionTurnRequestDto,
-    images: Vec<magi_conversation_runtime::session_images::SessionTurnImage>,
-    requested_workspace_id: WorkspaceId,
-    accepted_at: UtcMillis,
-    decision: SessionTurnIntentDecision,
-) -> Result<SessionTurnResponseDto, ApiError> {
-    let message = request.timeline_message(request.trimmed_text().as_deref());
-    let placeholder_title = crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
-    let (session_id, created_session, workspace_id) = super::resolve_dispatch_session(
-        &state,
-        request.requested_session_id(),
-        Some(requested_workspace_id.clone()),
-        placeholder_title,
-        accepted_at,
-    )?;
-    apply_turn_orchestrator_session_override(&state, &request, &session_id)?;
-    state
-        .session_store
-        .set_active_goal_access_profile(&session_id, request.requested_access_profile())
-        .map_err(|error| ApiError::internal_assembly("更新 active goal 访问模式失败", error))?;
-    state
-        .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
-        .await?;
-    let session_code_context = state
-        .ensure_session_code_context(&session_id, &workspace_id)
-        .await?;
-    let workspace_root_path = session_code_context
-        .map(|context| context.execution_root.display().to_string())
-        .or_else(|| {
-            state
-                .workspace_root_path(&workspace_id)
-                .map(|path| path.display().to_string())
-        });
-    let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
-    let request_id = request.request_id();
-    let user_message_id = request.user_message_id();
-    let requested_placeholder_message_id = request.placeholder_message_id();
-    let replace_turn_id = request.replace_turn_id();
-    // P7：所有 turn item 必须携带 source_thread_id，由 ensure_session_mission 提供 orchestrator thread。
-    let (_mission_id, orchestrator_thread_id) =
-        state
-            .session_store
-            .ensure_session_mission(&session_id, accepted_at, || {
-                magi_core::MissionId::new(format!("mission-session-chat-{}", accepted_at.0))
-            });
-    // P7：placeholder_message_id 不再作为 turn item 在 accept 阶段预占 item_seq。
-    // 历史方案曾把 assistant_stream placeholder 以 item_seq=2 写入 turn.items，
-    // 这样首轮 thinking 走 max(item_seq)+1 后存储顺序变成 text(2) → thinking(3)，
-    // 与 Anthropic 协议输出顺序（thinking → text）倒挂，迫使前端 projection 层做
-    // peer-matching 补丁。现在只把 id 字符串传给 runtime：首个 text delta upsert
-    // 时自然走 max+1，存储顺序天然匹配协议顺序，projection 层也不再需要补偿逻辑。
-    let assistant_placeholder_item_id = requested_placeholder_message_id
-        .clone()
-        .unwrap_or_else(|| format!("turn-item-assistant-stream-{}-0", accepted_at.0));
-    let placeholder_message_id = Some(assistant_placeholder_item_id.clone());
-    // 使用前端传入的 userMessageId 作为 canonical item_id，确保前端乐观节点与后端流式更新使用同一 ID
-    let context_references = request.context_references();
-    let mut user_message_metadata =
-        magi_conversation_runtime::session_images::session_turn_images_metadata(&images);
-    user_message_metadata.extend(
-        magi_conversation_runtime::context_reference::session_context_references_metadata(
-            &context_references,
-        ),
-    );
-    if let Some(replace_turn_id) = replace_turn_id.as_ref() {
-        user_message_metadata.insert(
-            "replacesTurnId".to_string(),
-            serde_json::Value::String(replace_turn_id.clone()),
-        );
-    }
-    if let Some(skill_name) = request
-        .skill_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        user_message_metadata.insert(
-            "skillName".to_string(),
-            serde_json::Value::String(skill_name.to_string()),
-        );
-    }
-    user_message_metadata.insert(
-        "goalMode".to_string(),
-        serde_json::Value::Bool(request.goal_mode),
-    );
-    let (user_message_item_id, user_message_item) =
-        build_user_message_turn_item(UserMessageTurnItemInput {
-            accepted_at,
-            message: &message,
-            entry_id: &entry_id,
-            request_id: request_id.clone(),
-            user_message_id: user_message_id.clone(),
-            placeholder_message_id: placeholder_message_id.clone(),
-            metadata: user_message_metadata,
-            task_id: None,
-            source_thread_id: orchestrator_thread_id.clone(),
-        });
-    let turn_id = format!("turn-session-{}", accepted_at.0);
-    let mut turn = ActiveExecutionTurn {
-        turn_id: turn_id.clone(),
-        turn_seq: accepted_at.0,
-        accepted_at,
-        status: "running".to_string(),
-        completed_at: None,
-        user_message: Some(message.clone()),
-        items: vec![user_message_item],
-    };
-    turn.normalize();
-    let accept_result = if let Some(replace_turn_id) = replace_turn_id.as_deref() {
-        state
-            .session_store
-            .replace_current_turn_with_timeline_entry(
-                session_id.clone(),
-                replace_turn_id,
-                TimelineEntryInput::new(
-                    entry_id,
-                    TimelineEntryKind::UserMessage,
-                    message.clone(),
-                    accepted_at,
-                ),
-                turn,
-            )
-            .map(|(entry_id, sidecar, superseded_turn)| (entry_id, sidecar, Some(superseded_turn)))
-    } else {
-        state
-            .session_store
-            .accept_current_turn_with_timeline_entry(
-                session_id.clone(),
-                TimelineEntryInput::new(
-                    entry_id,
-                    TimelineEntryKind::UserMessage,
-                    message.clone(),
-                    accepted_at,
-                ),
-                turn,
-            )
-            .map(|(entry_id, sidecar)| (entry_id, sidecar, None))
-    };
-    let (entry_id, _, superseded_turn) = match accept_result {
-        Ok(accepted) => accepted,
-        Err(error) if replace_turn_id.is_some() => {
-            return Err(map_turn_replacement_error(&state, &session_id, error));
-        }
-        Err(error) if domain_error_is_active_current_turn(&error) => {
-            return Ok(enqueue_session_turn_response(EnqueueSessionTurnInput {
-                state: &state,
-                request,
-                images,
-                requested_workspace_id,
-                accepted_at,
-                decision,
-                session_id,
-                workspace_id,
-            }));
-        }
-        Err(error) => {
-            state.release_session_git_execution_lease(&session_id);
-            return Err(map_current_turn_accept_error(
-                "接受 session turn 失败",
-                error,
-            ));
-        }
-    };
-    if superseded_turn.is_some() {
-        // 最近一轮被编辑替换后，内部模型历史必须失效并从 canonical turns 重建。
-        // 对话展示历史仍完整保留，下一次执行只会重新生成模型上下文快照。
-        invalidate_orchestrator_thread_history(&state, &session_id, accepted_at);
-    }
-    if let Err(error) = state.persist_session_state_checkpoint("session_turn_accepted") {
-        state.release_session_git_execution_lease(&session_id);
-        state
-            .conversation_registry
-            .close_session_turn_input(&session_id, &turn_id);
-        publish_regular_session_turn_early_failed(
-            &state,
-            &session_id,
-            workspace_id.clone(),
-            accepted_at,
-            decision.route,
-            SessionTurnFailedReason::Execution(SessionTurnFailureReason::RuntimeInvalidState),
-        );
-        return Err(error);
-    }
-    state
-        .conversation_registry
-        .begin_session_turn_input(session_id.clone(), turn_id.clone())
-        .map_err(|error| {
-            state.release_session_git_execution_lease(&session_id);
-            publish_regular_session_turn_early_failed(
-                &state,
-                &session_id,
-                workspace_id.clone(),
-                accepted_at,
-                decision.route,
-                SessionTurnFailedReason::Execution(SessionTurnFailureReason::RuntimeInvalidState),
-            );
-            ApiError::internal_assembly("开启当前 Turn 引导通道失败", error)
-        })?;
-    // S1：user 信号只在 turn 被正式接受后入栈，避免排队/冲突请求污染当前 Conversation。
-    super::ingest_user_input_to_conversation(&state, &session_id, &request, accepted_at);
-    publish_session_user_message_created_event(
-        &state,
-        &session_id,
-        workspace_id.clone(),
-        accepted_at,
-        &message,
-    );
-    if let Some(superseded_turn) = superseded_turn.as_ref() {
-        super::publish_superseded_turn_event(
-            &state,
-            &session_id,
-            workspace_id.as_ref(),
-            accepted_at,
-            superseded_turn,
-        );
-    }
-    let accepted_canonical_turn = state
-        .session_store
-        .canonical_turns_for_session(&session_id)
-        .into_iter()
-        .find(|turn| turn.turn_id == turn_id);
-    let accepted_canonical_item = accepted_canonical_turn
-        .as_ref()
-        .and_then(|turn| {
-            turn.items
-                .iter()
-                .find(|item| item.item_id == user_message_item_id)
-        })
-        .cloned();
-    let event_id =
-        publish_regular_session_turn_accepted_event(RegularSessionTurnAcceptedEventInput {
-            state: &state,
-            session_id: &session_id,
-            workspace_id: workspace_id.as_ref(),
-            accepted_at,
-            created_session,
-            route: decision.route,
-            canonical_turn: accepted_canonical_turn.as_ref(),
-            canonical_item_id: Some(&user_message_item_id),
-        });
-    let prompt = decision
-        .tool_intent
-        .as_deref()
-        .filter(|intent| !intent.trim().is_empty())
-        .map(|intent| format!("{}\n\n用户原始输入：{}", intent.trim(), message))
-        .unwrap_or_else(|| message.clone());
-    spawn_regular_session_turn_execution(
-        state.clone(),
-        SessionTurnExecutionRequest {
-            session_id: session_id.clone(),
-            turn_id,
-            workspace_id: workspace_id.clone(),
-            prompt,
-            images,
-            context_references,
-            // 范式：常规对话 turn 一律是带工具的 agent。读操作由 Restricted profile
-            // 直接放行，写操作走下游 safety gate 拦截，由模型在循环内自行决定是否调用工具。
-            // 这里不再用入口关键词分类（Chat vs Execute）决定能否碰工具：那会把"用户说人话
-            // 却没命中动作词"的请求关进纯文本死区，连读代码都做不到。Task 内部调度/历史治理链仍需
-            // 显式信号升级，不受此处影响。
-            use_tools: true,
-            access_profile: request.requested_access_profile(),
-            skill_name: request.skill_name.clone(),
-            request_id: request_id.clone(),
-            user_message_id: user_message_id.clone(),
-            placeholder_message_id: placeholder_message_id.clone(),
-            forced_tool_name: decision.forced_tool_name.clone(),
-            required_tool_chain: decision.required_tool_chain.clone(),
-            goal_turn_mode: if decision.reason_code.as_deref() == Some("goal_mode_request") {
-                SessionGoalTurnMode::Start
-            } else {
-                SessionGoalTurnMode::None
-            },
-            product_locale: request.product_locale(),
-            workspace_root_path,
-        },
-        accepted_at,
-        decision.route,
-        created_session,
-    );
-
-    if created_session {
-        crate::session_title::spawn_new_session_title_refinement(
-            &state,
-            &session_id,
-            &message,
-            placeholder_title,
-        );
-    }
-
-    Ok(SessionTurnResponseDto::new(SessionTurnResponseInput {
-        session_id,
-        entry_id,
-        event_id,
-        accepted_at,
-        created_session,
-        route: decision.route,
-        root_task_id: None,
-        action_task_id: None,
-        execution_chain_ref: None,
-        user_message_item_id: Some(user_message_item_id),
-    })
-    .with_canonical_event(
-        "turn_started",
-        accepted_canonical_turn,
-        accepted_canonical_item,
-    ))
-}
-
-#[cfg(test)]
-fn apply_turn_orchestrator_session_override(
-    state: &ApiState,
-    request: &SessionTurnRequestDto,
-    session_id: &SessionId,
-) -> Result<(), ApiError> {
-    let Some(config) = request.orchestrator_session_config.as_ref() else {
-        return Ok(());
-    };
-    super::settings::save_orchestrator_session_override_for_session(state, session_id, config)?;
-    super::settings::require_orchestrator_session_model(state, session_id)
-}
-
 /// 所有可执行的主线 Turn 都创建内部 root coordinator task。
 ///
 /// 前端仍按原始 route 呈现普通对话或直接执行；运行时不再存在 session runner 与
@@ -1875,377 +1720,11 @@ async fn submit_root_coordinator_session_turn(
     ))
 }
 
-#[cfg(test)]
-fn invalidate_orchestrator_thread_history(
-    state: &ApiState,
-    session_id: &SessionId,
-    now: UtcMillis,
-) {
-    let Some(thread) = state
-        .session_store
-        .orchestrator_thread_for_session(session_id)
-    else {
-        return;
-    };
-    state
-        .session_store
-        .replace_thread_messages(&thread.thread_id, Vec::new(), now);
-}
-
-#[cfg(test)]
-fn spawn_regular_session_turn_execution(
-    state: ApiState,
-    execution_request: SessionTurnExecutionRequest,
-    accepted_at: UtcMillis,
-    route: SessionTurnRouteDto,
-    created_session: bool,
-) {
-    let session_id = execution_request.session_id.clone();
-    let workspace_id = execution_request.workspace_id.clone();
-    let turn_id = execution_request.turn_id.clone();
-    let dispatcher = match state.session_turn_dispatcher() {
-        Some(dispatcher) => dispatcher.clone(),
-        None => {
-            tracing::error!(
-                session_id = %session_id,
-                "regular session turn background execution failed: dispatcher missing"
-            );
-            publish_regular_session_turn_early_failed(
-                &state,
-                &session_id,
-                workspace_id.clone(),
-                accepted_at,
-                route,
-                SessionTurnFailedReason::DispatcherUnavailable,
-            );
-            state
-                .conversation_registry
-                .close_session_turn_input(&session_id, &turn_id);
-            record_active_goal_turn_failure(&state, &session_id);
-            schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
-            return;
-        }
-    };
-    if let Err(error) = super::begin_session_turn(&state, &session_id) {
-        tracing::error!(
-            session_id = %session_id,
-            error = ?error,
-            "regular session turn background execution rejected: active turn already exists"
-        );
-        publish_regular_session_turn_early_failed(
-            &state,
-            &session_id,
-            workspace_id.clone(),
-            accepted_at,
-            route,
-            SessionTurnFailedReason::ActiveTurnConflict,
-        );
-        state
-            .conversation_registry
-            .close_session_turn_input(&session_id, &turn_id);
-        record_active_goal_turn_failure(&state, &session_id);
-        schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
-        return;
-    }
-    let request_id = execution_request.request_id.clone();
-    let user_message_id = execution_request.user_message_id.clone();
-    let placeholder_message_id = execution_request.placeholder_message_id.clone();
-    let join =
-        tokio::task::spawn_blocking(move || dispatcher.execute_session_turn(execution_request));
-    tokio::spawn(observe_regular_session_turn_execution(
-        join,
-        state,
-        session_id,
-        workspace_id,
-        turn_id,
-        accepted_at,
-        route,
-        created_session,
-        request_id,
-        user_message_id,
-        placeholder_message_id,
-    ));
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-async fn observe_regular_session_turn_execution(
-    join: tokio::task::JoinHandle<Result<SessionTurnExecutionOutput, SessionTurnExecutionError>>,
-    state: ApiState,
-    session_id: SessionId,
-    workspace_id: Option<WorkspaceId>,
-    turn_id: String,
-    accepted_at: UtcMillis,
-    route: SessionTurnRouteDto,
-    created_session: bool,
-    request_id: Option<String>,
-    user_message_id: Option<String>,
-    placeholder_message_id: Option<String>,
-) {
-    match join.await {
-        Ok(outcome) => finalize_regular_session_turn_execution(
-            state,
-            session_id,
-            workspace_id,
-            turn_id,
-            accepted_at,
-            route,
-            created_session,
-            outcome,
-        ),
-        Err(error) => {
-            tracing::error!(
-                session_id = %session_id,
-                ?error,
-                "regular session turn spawn_blocking panicked"
-            );
-            state
-                .conversation_registry
-                .close_session_turn_input(&session_id, &turn_id);
-            finalize_regular_session_conversation_turn_if_current(
-                &state,
-                &session_id,
-                &turn_id,
-                false,
-            );
-            let plan_store =
-                magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
-            match plan_store.pause() {
-                Ok(Some(plan)) => magi_plan::publish_plan_event(
-                    &state.event_bus,
-                    magi_plan::plan_event_type(&plan),
-                    &plan,
-                    workspace_id.as_ref(),
-                    None,
-                    None,
-                ),
-                Ok(None) => {}
-                Err(error) => tracing::warn!(
-                    session_id = %session_id,
-                    %error,
-                    "普通对话执行线程异常后暂停计划失败"
-                ),
-            }
-            let public_message = "对话执行线程异常退出，可直接继续重试。";
-            if let Some(orchestrator_thread) = state
-                .session_store
-                .orchestrator_thread_for_session(&session_id)
-            {
-                append_session_turn_error_item(
-                    &state.event_bus,
-                    &state.session_store,
-                    SessionTurnErrorInput {
-                        session_id: &session_id,
-                        workspace_id: &workspace_id,
-                        task_id: None,
-                        request_id: request_id.as_deref(),
-                        user_message_id: user_message_id.as_deref(),
-                        placeholder_message_id: placeholder_message_id.as_deref(),
-                        error_text: public_message,
-                        streaming_entry_id: None,
-                        source_thread_id: orchestrator_thread.thread_id,
-                        persist_session_state: None,
-                    },
-                );
-            } else {
-                let _ = state
-                    .session_store
-                    .update_current_turn_status(&session_id, "failed");
-            }
-            invalidate_orchestrator_thread_history(&state, &session_id, UtcMillis::now());
-            record_active_goal_turn_failure(&state, &session_id);
-            record_session_runtime_incident(
-                &state,
-                &session_id,
-                workspace_id.as_ref(),
-                "session_turn_execution_panicked",
-                public_message,
-            );
-            let _ = state.persist_session_durable_state();
-            let event_id = EventId::new(format!("event-session-turn-failed-{}", accepted_at.0));
-            let _ = state.event_bus.publish(
-                EventEnvelope::domain(
-                    event_id,
-                    "session.turn.failed",
-                    session_turn_failed_event_payload_with_canonical(
-                        &state,
-                        &session_id,
-                        route,
-                        Some(&turn_id),
-                        SessionTurnFailedReason::Execution(
-                            SessionTurnFailureReason::RuntimeInvalidState,
-                        ),
-                        Some("session_turn_execution_panicked"),
-                        Some(public_message),
-                    ),
-                )
-                .with_context(EventContext {
-                    session_id: Some(session_id.clone()),
-                    workspace_id: workspace_id.clone(),
-                    ..EventContext::default()
-                }),
-            );
-            schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn finalize_regular_session_turn_execution(
-    state: ApiState,
-    session_id: SessionId,
-    workspace_id: Option<WorkspaceId>,
-    turn_id: String,
-    accepted_at: UtcMillis,
-    route: SessionTurnRouteDto,
-    created_session: bool,
-    outcome: Result<SessionTurnExecutionOutput, SessionTurnExecutionError>,
-) {
-    state
-        .conversation_registry
-        .close_session_turn_input(&session_id, &turn_id);
-    match outcome {
-        Ok(output) => {
-            if output.interrupted {
-                invalidate_orchestrator_thread_history(&state, &session_id, UtcMillis::now());
-                finalize_regular_session_conversation_turn_if_current(
-                    &state,
-                    &session_id,
-                    &turn_id,
-                    false,
-                );
-                schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
-                return;
-            }
-            let current_turn_matches = state
-                .session_store
-                .runtime_sidecar(&session_id)
-                .and_then(|sidecar| sidecar.current_turn)
-                .is_some_and(|turn| turn.turn_id == turn_id);
-            if !current_turn_matches {
-                schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
-                return;
-            }
-            finalize_regular_session_conversation_turn_if_current(
-                &state,
-                &session_id,
-                &turn_id,
-                true,
-            );
-            record_active_goal_turn_success(&state, &session_id);
-            if let Err(error) = state.persist_session_durable_state() {
-                tracing::error!(
-                    session_id = %session_id,
-                    ?error,
-                    "regular session turn background persist failed"
-                );
-            }
-            let event_id = EventId::new(format!("event-session-turn-{}", accepted_at.0));
-            state.event_bus.publish(
-                EventEnvelope::domain(
-                    event_id,
-                    "session.turn.completed",
-                    session_turn_completed_event_payload(
-                        &state,
-                        &session_id,
-                        route,
-                        created_session,
-                        Some(&turn_id),
-                    ),
-                )
-                .with_context(EventContext {
-                    session_id: Some(session_id.clone()),
-                    workspace_id: workspace_id.clone(),
-                    ..EventContext::default()
-                }),
-            );
-            schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
-        }
-        Err(error) => {
-            let current_turn_matches = state
-                .session_store
-                .runtime_sidecar(&session_id)
-                .and_then(|sidecar| sidecar.current_turn)
-                .is_some_and(|turn| turn.turn_id == turn_id);
-            if !current_turn_matches {
-                schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
-                return;
-            }
-            finalize_regular_session_conversation_turn_if_current(
-                &state,
-                &session_id,
-                &turn_id,
-                false,
-            );
-            tracing::error!(
-                session_id = %session_id,
-                ?error,
-                "regular session turn background execution failed"
-            );
-            let _ = state
-                .session_store
-                .update_current_turn_status(&session_id, "failed");
-            invalidate_orchestrator_thread_history(&state, &session_id, UtcMillis::now());
-            record_active_goal_turn_failure(&state, &session_id);
-            record_session_runtime_incident(
-                &state,
-                &session_id,
-                workspace_id.as_ref(),
-                &error.diagnostic_code,
-                &error.public_message,
-            );
-            let _ = state.persist_session_durable_state();
-            let event_id = EventId::new(format!("event-session-turn-failed-{}", accepted_at.0));
-            let _ = state.event_bus.publish(
-                EventEnvelope::domain(
-                    event_id,
-                    "session.turn.failed",
-                    session_turn_failed_event_payload_with_canonical(
-                        &state,
-                        &session_id,
-                        route,
-                        Some(&turn_id),
-                        SessionTurnFailedReason::Execution(error.reason),
-                        Some(&error.diagnostic_code),
-                        Some(&error.public_message),
-                    ),
-                )
-                .with_context(EventContext {
-                    session_id: Some(session_id.clone()),
-                    workspace_id: workspace_id.clone(),
-                    ..EventContext::default()
-                }),
-            );
-            schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
-        }
-    }
-}
-
-#[cfg(test)]
-fn finalize_regular_session_conversation_turn_if_current(
-    state: &ApiState,
-    session_id: &SessionId,
-    turn_id: &str,
-    success: bool,
-) -> bool {
-    let owns_current_turn = state
-        .session_store
-        .runtime_sidecar(session_id)
-        .and_then(|sidecar| sidecar.current_turn)
-        .is_some_and(|turn| turn.turn_id == turn_id);
-    if !owns_current_turn {
-        return false;
-    }
-    super::finalize_session_turn(state, session_id, success)
-}
-
 pub(crate) fn schedule_next_queued_regular_session_turn(
     state: ApiState,
     session_id: SessionId,
     workspace_id: Option<WorkspaceId>,
 ) {
-    state.release_session_git_execution_lease(&session_id);
     tokio::spawn(async move {
         if !state
             .session_store
@@ -2327,7 +1806,7 @@ async fn schedule_goal_continuation_turn_if_idle(
     let Some(goal) = state.session_store.active_goal(&session_id) else {
         return;
     };
-    if state.queued_regular_session_turn_count(&session_id, workspace_id.as_ref()) > 0 {
+    if state.queued_regular_session_turn_count(&session_id) > 0 {
         return;
     }
     if state
@@ -2349,7 +1828,7 @@ async fn schedule_goal_continuation_turn_if_idle(
 pub(crate) fn ensure_goal_continuation_start_available(
     state: &ApiState,
     session_id: &SessionId,
-    workspace_id: &WorkspaceId,
+    _workspace_id: &WorkspaceId,
 ) -> Result<(), ApiError> {
     if state.session_turn_dispatcher().is_none() {
         return Err(ApiError::conflict(
@@ -2357,7 +1836,7 @@ pub(crate) fn ensure_goal_continuation_start_available(
             session_id.as_str(),
         ));
     }
-    if state.queued_regular_session_turn_count(session_id, Some(workspace_id)) > 0 {
+    if state.queued_regular_session_turn_count(session_id) > 0 {
         return Err(ApiError::conflict(
             "恢复目标失败，当前会话仍有待执行消息",
             session_id.as_str(),
@@ -2403,11 +1882,6 @@ async fn submit_goal_continuation_turn(
     Ok(())
 }
 
-#[cfg(test)]
-fn goal_continuation_access_profile(goal: &SessionGoal) -> AccessProfile {
-    goal.access_profile
-}
-
 fn goal_continuation_prompt(goal: &SessionGoal) -> String {
     let token_budget = goal
         .token_budget
@@ -2428,10 +1902,41 @@ async fn drain_next_queued_regular_session_turn(
     session_id: SessionId,
     workspace_id: Option<WorkspaceId>,
 ) -> bool {
-    let Some(queued) = state.pop_next_regular_session_turn(&session_id, workspace_id.as_ref())
-    else {
+    let _session_turn_guard = state.lock_session_turn(&session_id).await;
+    if state.queued_regular_session_turn_count(&session_id) == 0 {
+        return false;
+    }
+    let Some(queued) = state.peek_next_regular_session_turn(&session_id) else {
         return false;
     };
+    if state
+        .session_store
+        .canonical_turns_for_session(&session_id)
+        .into_iter()
+        .any(|turn| canonical_turn_matches_queued_regular_turn(&turn, &queued))
+    {
+        if let Err(error) = state.acknowledge_regular_session_turn(&session_id, &queued.queue_id) {
+            tracing::error!(%session_id, queue_id = %queued.queue_id, ?error, "确认已接受排队消息失败");
+            return true;
+        }
+        if state
+            .session_store
+            .ensure_current_turn_acceptance_available(&session_id)
+            .is_ok()
+            && state.queued_regular_session_turn_count(&session_id) > 0
+        {
+            schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
+        }
+        return true;
+    }
+    if state
+        .session_store
+        .ensure_current_turn_acceptance_available(&session_id)
+        .is_err()
+    {
+        return true;
+    }
+    state.release_session_git_execution_lease(&session_id);
     let failed_event_session_id = queued.session_id.clone();
     let failed_event_workspace_id = queued.workspace_id.clone();
     let failed_event_route = queued.route;
@@ -2450,24 +1955,43 @@ async fn drain_next_queued_regular_session_turn(
         route_reason: Some("服务端 session 队列出队".to_string()),
         task_evidence: Vec::new(),
     };
-    let submit_result = match queued.route {
-        SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute | SessionTurnRouteDto::Task => {
-            submit_root_coordinator_session_turn(
-                state.clone(),
-                queued.request,
-                queued.images,
-                queued.requested_workspace_id,
-                queued.accepted_at,
-                decision,
-            )
-            .await
-        }
-        SessionTurnRouteDto::Continue | SessionTurnRouteDto::Steer => Err(
-            ApiError::internal_assembly("执行排队 session turn", "不支持的排队 route"),
-        ),
+    let submit_result = match queued.request.parsed_images() {
+        Ok(images) => match queued.route {
+            SessionTurnRouteDto::Chat
+            | SessionTurnRouteDto::Execute
+            | SessionTurnRouteDto::Task => {
+                submit_root_coordinator_session_turn(
+                    state.clone(),
+                    queued.request,
+                    images,
+                    queued.requested_workspace_id,
+                    queued.accepted_at,
+                    decision,
+                )
+                .await
+            }
+            SessionTurnRouteDto::Continue | SessionTurnRouteDto::Steer => Err(
+                ApiError::internal_assembly("执行排队 session turn", "不支持的排队 route"),
+            ),
+        },
+        Err(error) => Err(ApiError::InvalidInput(format!(
+            "排队消息图片输入无效: {error}"
+        ))),
     };
     match submit_result {
-        Ok(_) => true,
+        Ok(_) => {
+            if let Err(error) = state
+                .acknowledge_regular_session_turn(&failed_event_session_id, &failed_event_queue_id)
+            {
+                tracing::error!(
+                    session_id = %failed_event_session_id,
+                    queue_id = %failed_event_queue_id,
+                    ?error,
+                    "排队消息已接受，但确认队列消费失败"
+                );
+            }
+            true
+        }
         Err(error) => {
             tracing::error!(
                 session_id = %failed_event_session_id,
@@ -2476,111 +2000,72 @@ async fn drain_next_queued_regular_session_turn(
                 error = ?error,
                 "queued regular session turn failed before acceptance"
             );
-            publish_regular_session_turn_queue_failed_event(
-                &state,
-                &failed_event_session_id,
-                failed_event_workspace_id,
-                failed_event_accepted_at,
-                failed_event_route,
-                &failed_event_queue_id,
-            );
+            let retry_count = match state
+                .record_regular_session_turn_retry(&failed_event_session_id, &failed_event_queue_id)
+            {
+                Ok(retry_count) => retry_count,
+                Err(persist_error) => {
+                    tracing::error!(
+                        session_id = %failed_event_session_id,
+                        queue_id = %failed_event_queue_id,
+                        ?persist_error,
+                        "排队消息仍保留，但重试计数持久化失败"
+                    );
+                    return true;
+                }
+            };
+            if retry_count <= 3 {
+                let retry_delay =
+                    std::time::Duration::from_secs(u64::from(retry_count).saturating_mul(2));
+                let retry_state = state.clone();
+                let retry_session_id = session_id.clone();
+                let retry_workspace_id = workspace_id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(retry_delay).await;
+                    schedule_next_queued_regular_session_turn(
+                        retry_state,
+                        retry_session_id,
+                        retry_workspace_id,
+                    );
+                });
+            } else {
+                publish_regular_session_turn_queue_failed_event(
+                    &state,
+                    &failed_event_session_id,
+                    failed_event_workspace_id,
+                    failed_event_accepted_at,
+                    failed_event_route,
+                    &failed_event_queue_id,
+                );
+            }
             true
         }
     }
 }
 
-#[cfg(test)]
-fn publish_regular_session_turn_early_failed(
-    state: &ApiState,
-    session_id: &SessionId,
-    workspace_id: Option<WorkspaceId>,
-    accepted_at: UtcMillis,
-    route: SessionTurnRouteDto,
-    reason: SessionTurnFailedReason,
-) {
-    let _ = state
-        .session_store
-        .update_current_turn_status(session_id, "failed");
-    record_session_runtime_incident(
-        state,
-        session_id,
-        workspace_id.as_ref(),
-        reason.code(),
-        reason.public_message(),
-    );
-    let _ = state.persist_session_durable_state();
-    let event_id = EventId::new(format!("event-session-turn-failed-{}", accepted_at.0));
-    let _ = state.event_bus.publish(
-        EventEnvelope::domain(
-            event_id,
-            "session.turn.failed",
-            session_turn_failed_event_payload_with_canonical(
-                state, session_id, route, None, reason, None, None,
-            ),
-        )
-        .with_context(EventContext {
-            session_id: Some(session_id.clone()),
-            workspace_id,
-            ..EventContext::default()
-        }),
-    );
-}
-
-/// 将会话运行终态写入通知中心，确保模型失败时即使用户没有停留在当前页面，
-/// 也能在通知中心看到可追溯的错误记录。
-#[cfg(test)]
-fn record_session_runtime_incident(
-    state: &ApiState,
-    session_id: &SessionId,
-    workspace_id: Option<&WorkspaceId>,
-    diagnostic_code: &str,
-    public_message: &str,
-) {
-    let workspace_id = workspace_id.cloned().or_else(|| {
-        state
-            .session_store
-            .session(session_id)
-            .and_then(|session| session_workspace_id(state, &session))
-    });
-    let Some(workspace_id) = workspace_id else {
-        tracing::warn!(
-            session_id = %session_id,
-            diagnostic_code,
-            "运行错误通知缺少 workspace 归属，跳过写入通知中心"
-        );
-        return;
+fn canonical_turn_matches_queued_regular_turn(
+    turn: &CanonicalTurn,
+    queued: &QueuedRegularSessionTurn,
+) -> bool {
+    let Some(request_id) = queued.request.request_id() else {
+        return false;
     };
-
-    let created_at = UtcMillis::now();
-    let notification = NotificationRecord {
-        notification_id: format!(
-            "notification-runtime-error-{}-{diagnostic_code}",
-            created_at.0
-        ),
-        scope: NotificationScope::Session,
-        workspace_id: Some(workspace_id.to_string()),
-        session_id: Some(session_id.clone()),
-        kind: "incident".to_string(),
-        level: Some("error".to_string()),
-        title: Some("运行错误".to_string()),
-        message: public_message.to_string(),
-        source: Some("magi-runtime".to_string()),
-        created_at,
-        handled: false,
-        action_required: true,
-        count_unread: true,
-        fingerprint: format!("runtime-error:{diagnostic_code}"),
-        occurrence_count: 1,
-        resolved: false,
+    let Some(user_message_id) = queued.request.user_message_id() else {
+        return false;
     };
-    if let Err(error) = state.session_store.append_incident_record(notification) {
-        tracing::warn!(
-            session_id = %session_id,
-            diagnostic_code,
-            %error,
-            "运行错误通知写入通知中心失败"
-        );
-    }
+    turn.items.iter().any(|item| {
+        item.kind == CanonicalTurnItemKind::UserMessage
+            && item
+                .metadata
+                .get("requestId")
+                .and_then(|value| value.as_str())
+                == Some(request_id.as_str())
+            && item
+                .metadata
+                .get("userMessageId")
+                .and_then(|value| value.as_str())
+                == Some(user_message_id.as_str())
+    })
 }
 
 fn session_turn_terminal_canonical_turn(
@@ -2638,150 +2123,6 @@ fn append_terminal_canonical_payload(
     }
 }
 
-#[cfg(test)]
-fn session_turn_completed_event_payload(
-    state: &ApiState,
-    session_id: &SessionId,
-    route: SessionTurnRouteDto,
-    created_session: bool,
-    turn_id: Option<&str>,
-) -> serde_json::Value {
-    let mut payload = json!({
-        "session_id": session_id.to_string(),
-        "route": route,
-        "created_session": created_session,
-    });
-    append_terminal_canonical_payload(&mut payload, state, session_id, turn_id);
-    payload
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(test)]
-enum SessionTurnFailedReason {
-    DispatcherUnavailable,
-    ActiveTurnConflict,
-    Execution(SessionTurnFailureReason),
-}
-
-#[cfg(test)]
-impl SessionTurnFailedReason {
-    fn code(self) -> &'static str {
-        match self {
-            Self::DispatcherUnavailable => "session_turn_dispatcher_unavailable",
-            Self::ActiveTurnConflict => "session_turn_active_turn_conflict",
-            Self::Execution(reason) => reason.code(),
-        }
-    }
-
-    fn public_message(self) -> &'static str {
-        match self {
-            Self::DispatcherUnavailable | Self::ActiveTurnConflict => {
-                "对话运行状态异常，请重新发送。"
-            }
-            Self::Execution(SessionTurnFailureReason::RuntimeInvalidState) => {
-                "对话运行状态异常，请重新发送。"
-            }
-            Self::Execution(_) => "模型请求未完成，可直接继续重试。",
-        }
-    }
-}
-
-#[cfg(test)]
-fn session_turn_failed_event_payload_with_diagnostic(
-    session_id: &SessionId,
-    route: SessionTurnRouteDto,
-    reason: SessionTurnFailedReason,
-    diagnostic_code: Option<&str>,
-    public_message: Option<&str>,
-) -> serde_json::Value {
-    let error_code = diagnostic_code.unwrap_or_else(|| reason.code());
-    let public_message = public_message.unwrap_or_else(|| reason.public_message());
-    json!({
-        "session_id": session_id.to_string(),
-        "route": route,
-        "error": public_message,
-        "error_code": error_code,
-        "public_message": public_message,
-    })
-}
-
-#[cfg(test)]
-fn session_turn_failed_event_payload_with_canonical(
-    state: &ApiState,
-    session_id: &SessionId,
-    route: SessionTurnRouteDto,
-    turn_id: Option<&str>,
-    reason: SessionTurnFailedReason,
-    diagnostic_code: Option<&str>,
-    public_message: Option<&str>,
-) -> serde_json::Value {
-    let mut payload = session_turn_failed_event_payload_with_diagnostic(
-        session_id,
-        route,
-        reason,
-        diagnostic_code,
-        public_message,
-    );
-    append_terminal_canonical_payload(&mut payload, state, session_id, turn_id);
-    payload
-}
-
-#[cfg(test)]
-struct RegularSessionTurnAcceptedEventInput<'a> {
-    state: &'a ApiState,
-    session_id: &'a SessionId,
-    workspace_id: Option<&'a magi_core::WorkspaceId>,
-    accepted_at: UtcMillis,
-    created_session: bool,
-    route: SessionTurnRouteDto,
-    canonical_turn: Option<&'a CanonicalTurn>,
-    canonical_item_id: Option<&'a str>,
-}
-
-#[cfg(test)]
-fn publish_regular_session_turn_accepted_event(
-    input: RegularSessionTurnAcceptedEventInput<'_>,
-) -> EventId {
-    let RegularSessionTurnAcceptedEventInput {
-        state,
-        session_id,
-        workspace_id,
-        accepted_at,
-        created_session,
-        route,
-        canonical_turn,
-        canonical_item_id,
-    } = input;
-    let event_id = EventId::new(format!("event-session-turn-accepted-{}", accepted_at.0));
-    let canonical_item = canonical_turn
-        .and_then(|turn| {
-            canonical_item_id
-                .and_then(|item_id| turn.items.iter().find(|item| item.item_id == item_id))
-        })
-        .cloned();
-    let event = EventEnvelope::domain(
-        event_id.clone(),
-        "session.turn.accepted",
-        json!({
-            "session_id": session_id.to_string(),
-            "workspace_id": workspace_id.map(ToString::to_string),
-            "created_session": created_session,
-            "route": route,
-            "canonical_schema_version": CANONICAL_TURN_SCHEMA_VERSION,
-            "canonical_event_kind": "turn_started",
-            "canonical_turn": canonical_turn,
-            "canonical_item": canonical_item,
-        }),
-    )
-    .with_context(EventContext {
-        workspace_id: workspace_id.cloned(),
-        session_id: Some(session_id.clone()),
-        ..EventContext::default()
-    });
-    state.event_bus.publish(event);
-    event_id
-}
-
 fn publish_regular_session_turn_queued_event(
     state: &ApiState,
     session_id: &SessionId,
@@ -2832,7 +2173,7 @@ fn publish_regular_session_turn_queue_failed_event(
             "queue_id": queue_id,
             "error": "queued_session_turn_failed",
             "error_code": "queued_session_turn_failed",
-            "public_message": "排队消息执行失败，可直接重试。",
+            "public_message": "排队消息暂未执行，内容已保留；服务恢复后发送新消息即可继续。",
         }),
     )
     .with_context(EventContext {
@@ -2969,6 +2310,7 @@ struct SessionInterruptResponseDto {
     event_id: String,
     requested_at: UtcMillis,
     cancelled_tool_process_count: usize,
+    cleared_queued_turn_count: usize,
     removed_timeline_entry_ids: Vec<String>,
 }
 
@@ -3010,17 +2352,10 @@ fn turn_status_is_interruptible(status: &str) -> bool {
     )
 }
 
-fn domain_error_is_active_current_turn(error: &DomainError) -> bool {
-    matches!(
-        error,
-        DomainError::InvalidState { message } if message.contains("active current_turn")
-    )
-}
-
 fn map_current_turn_accept_error(context: &str, error: DomainError) -> ApiError {
     match error {
-        DomainError::InvalidState { message } if message.contains("active current_turn") => {
-            ApiError::conflict(context, &message)
+        DomainError::CurrentTurnConflict { active_turn_id, .. } => {
+            ApiError::conflict(context, &active_turn_id)
         }
         other => ApiError::internal_assembly(context, other),
     }
@@ -3207,6 +2542,8 @@ async fn interrupt_session_turn(
 ) -> Result<Json<SessionInterruptResponseDto>, ApiError> {
     let session = resolve_interrupt_session_record(&state, &request)?;
     let session_id = session.session_id.clone();
+    let _session_turn_guard = state.lock_session_turn(&session_id).await;
+    let cleared_queued_turn_count = state.clear_all_regular_session_turn_queues(&session_id)?;
     let now = UtcMillis::now();
     let workspace_id = session_workspace_id(&state, &session);
     let current_turn = state
@@ -3215,7 +2552,7 @@ async fn interrupt_session_turn(
         .and_then(|sidecar| sidecar.current_turn);
     let turn_id = current_turn.as_ref().map(|turn| turn.turn_id.clone());
     let terminal_root_finalized =
-        finalize_terminal_root_before_interrupt(&state, &session_id, current_turn.as_ref());
+        finalize_terminal_root_current_turn(&state, &session_id, current_turn.as_ref());
     let interrupted = current_turn
         .as_ref()
         .is_some_and(|turn| turn_status_is_interruptible(&turn.status))
@@ -3295,6 +2632,7 @@ async fn interrupt_session_turn(
         "turn_id": turn_id.clone(),
         "interrupted": interrupted,
         "cancelled_tool_process_count": cancelled_tool_process_count,
+        "cleared_queued_turn_count": cleared_queued_turn_count,
         "requested_at": now.0,
         "removed_timeline_entry_ids": streaming_entry_ids.clone(),
     });
@@ -3324,11 +2662,12 @@ async fn interrupt_session_turn(
         event_id: event_id.to_string(),
         requested_at: now,
         cancelled_tool_process_count,
+        cleared_queued_turn_count,
         removed_timeline_entry_ids: streaming_entry_ids,
     }))
 }
 
-fn finalize_terminal_root_before_interrupt(
+fn finalize_terminal_root_current_turn(
     state: &ApiState,
     session_id: &SessionId,
     current_turn: Option<&ActiveExecutionTurn>,
@@ -3604,6 +2943,7 @@ async fn close_session(
     )?;
     let session_id = SessionId::new(&request.session_id);
     require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
+    let _session_turn_guard = state.lock_session_turn(&session_id).await;
     let manager = state.runner_manager();
     let _session_lifecycle_guard = match manager {
         Some(manager) => Some(manager.lock_session_lifecycle(&session_id).await),
@@ -3614,7 +2954,7 @@ async fn close_session(
         .session_store
         .archive_session(&session_id)
         .map_err(|e| ApiError::internal_assembly("关闭会话失败", e))?;
-    state.clear_all_regular_session_turn_queues(&session_id);
+    state.clear_all_regular_session_turn_queues(&session_id)?;
     if let Some(manager) = manager {
         manager
             .unbind_session_after_lifecycle_lock(&session_id)
@@ -4065,12 +3405,18 @@ fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ApiState, QueuedRegularSessionTurn, RuntimeStatePersistence};
+    use crate::state::{
+        ApiState, QueuedRegularSessionTurn, RunnerManager, RuntimeStatePersistence,
+    };
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use magi_conversation_runtime::task_execution_registry::TaskExecutionPlan;
+    use magi_conversation_runtime::{
+        execution_admission::ExecutionAdmissionPermit,
+        task_execution_registry::TaskExecutionPlan,
+        task_runner_bridge::{EventBasedResultReceiver, TaskDispatcher},
+    };
     use magi_core::{
         AbsolutePath, ExecutionOwnership, ExecutionResultStatus, GoalId, MissionId, Task,
         TaskExecutionTarget, TaskId, TaskKind, TaskRuntimePayload, TaskStatus, ThreadId,
@@ -4078,10 +3424,12 @@ mod tests {
     };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
-    use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
-    use magi_session_store::{
-        CanonicalTurnItemKind, SessionExecutionSidecarStoreState, SessionStore,
+    use magi_orchestrator::{
+        ExecutionWritebackPlans,
+        task_store::{TaskLease, TaskStore},
+        task_worker_catalog::WorkerInfo,
     };
+    use magi_session_store::{SessionExecutionSidecarStoreState, SessionStore};
     use magi_settings_store::SettingsStore;
     use magi_tool_runtime::{
         BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy,
@@ -4100,6 +3448,52 @@ mod tests {
             Arc::new(GovernanceService::default()),
         )
         .with_task_store(Arc::new(TaskStore::new()))
+    }
+
+    struct PendingTaskDispatcher;
+
+    impl TaskDispatcher for PendingTaskDispatcher {
+        fn dispatch(
+            &self,
+            _task: &Task,
+            _worker: &WorkerInfo,
+            _lease: &TaskLease,
+            _admission_permit: ExecutionAdmissionPermit,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn test_state_with_pending_runner() -> ApiState {
+        let event_bus = Arc::new(InMemoryEventBus::new(32));
+        let session_store = Arc::new(SessionStore::default());
+        let workspace_store = Arc::new(WorkspaceStore::default());
+        let governance = Arc::new(GovernanceService::default());
+        let task_store = Arc::new(TaskStore::new());
+        let manager = RunnerManager::with_dispatcher_and_worker_catalog(
+            Arc::clone(&task_store),
+            Arc::clone(&session_store),
+            Arc::new(|| {
+                vec![WorkerInfo {
+                    worker_id: WorkerId::new("worker-pending-test"),
+                    role: "executor".to_string(),
+                    supported_kinds: vec![TaskKind::LocalAgent],
+                    parallelism_limit: None,
+                    system_prompt_template: None,
+                }]
+            }),
+            Arc::new(PendingTaskDispatcher),
+            Arc::new(EventBasedResultReceiver::new()),
+        );
+        ApiState::new(
+            "magi-test",
+            event_bus,
+            session_store,
+            workspace_store,
+            governance,
+        )
+        .with_task_store(task_store)
+        .with_runner_manager(manager)
     }
 
     fn seed_active_plan(
@@ -4220,394 +3614,9 @@ mod tests {
         assert!(prompt.contains("update_goal(status=\"blocked\")"));
         assert!(prompt.contains("目标仍为 active 时不要输出面向用户的最终总结"));
         assert_eq!(
-            goal_continuation_access_profile(&goal),
+            goal.access_profile,
             AccessProfile::FullAccess,
             "Goal 自动续跑必须沿用目标最近一次用户选择的访问模式"
-        );
-    }
-
-    #[test]
-    fn session_turn_failed_event_payload_hides_runtime_error_detail() {
-        let payload = session_turn_failed_event_payload_with_diagnostic(
-            &SessionId::new("session-failed-redaction"),
-            SessionTurnRouteDto::Chat,
-            SessionTurnFailedReason::Execution(SessionTurnFailureReason::ModelStreamInterrupted),
-            None,
-            None,
-        );
-
-        assert_eq!(payload["session_id"], json!("session-failed-redaction"));
-        assert_eq!(payload["error"], json!("模型请求未完成，可直接继续重试。"));
-        assert_eq!(payload["error_code"], json!("model_stream_interrupted"));
-        assert_eq!(
-            payload["public_message"],
-            json!("模型请求未完成，可直接继续重试。")
-        );
-        assert!(
-            !payload
-                .to_string()
-                .contains("/Users/xie/.mcp/server failed: ENOENT")
-        );
-    }
-
-    #[test]
-    fn session_turn_failed_event_payload_preserves_sanitized_diagnostic_classification() {
-        let payload = session_turn_failed_event_payload_with_diagnostic(
-            &SessionId::new("session-failed-diagnostic"),
-            SessionTurnRouteDto::Task,
-            SessionTurnFailedReason::Execution(SessionTurnFailureReason::ModelInvocationFailed),
-            Some("model_tools_unsupported"),
-            Some("当前模型拒绝了工具调用请求，请更换支持工具调用的模型或关闭工具后重试。"),
-        );
-
-        assert_eq!(payload["error_code"], json!("model_tools_unsupported"));
-        assert_eq!(
-            payload["public_message"],
-            json!("当前模型拒绝了工具调用请求，请更换支持工具调用的模型或关闭工具后重试。")
-        );
-    }
-
-    #[tokio::test]
-    async fn regular_session_turn_panic_releases_turn_and_pauses_plan() {
-        let state = test_state();
-        let session_id = SessionId::new("session-regular-turn-panic");
-        let workspace_id = WorkspaceId::new("workspace-regular-turn-panic");
-        let accepted_at = UtcMillis(1777000000250);
-        let turn_id = "turn-regular-turn-panic".to_string();
-        state
-            .session_store
-            .create_session_for_workspace(
-                session_id.clone(),
-                "普通对话执行线程异常",
-                Some(workspace_id.to_string()),
-            )
-            .expect("session should create");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: turn_id.clone(),
-                    turn_seq: accepted_at.0,
-                    accepted_at,
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("触发执行线程异常".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should persist");
-        state
-            .conversation_registry
-            .begin_session_turn_input(session_id.clone(), turn_id.clone())
-            .expect("turn input should begin");
-        crate::routes::begin_session_turn(&state, &session_id)
-            .expect("conversation turn should begin");
-        let plan_store = seed_active_plan(
-            &state.session_store,
-            &session_id,
-            "execute-current-step",
-            "执行当前步骤",
-        );
-
-        let join = tokio::task::spawn_blocking(
-            || -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
-                panic!("模拟普通对话执行线程 panic");
-            },
-        );
-        observe_regular_session_turn_execution(
-            join,
-            state.clone(),
-            session_id.clone(),
-            Some(workspace_id),
-            turn_id,
-            accepted_at,
-            SessionTurnRouteDto::Chat,
-            false,
-            None,
-            None,
-            None,
-        )
-        .await;
-
-        let current_turn = state
-            .session_store
-            .runtime_sidecar(&session_id)
-            .and_then(|sidecar| sidecar.current_turn)
-            .expect("failed turn should remain visible");
-        assert_eq!(current_turn.status, "failed");
-        let plan = plan_store.snapshot().expect("plan should remain visible");
-        assert_eq!(plan.state, magi_core::PlanState::Paused);
-        assert_eq!(plan.items[0].status, magi_core::PlanItemStatus::InProgress);
-        assert!(crate::routes::begin_session_turn(&state, &session_id).is_ok());
-        let failed_event = state
-            .event_bus
-            .snapshot()
-            .recent_events
-            .into_iter()
-            .find(|event| event.event_type == "session.turn.failed")
-            .expect("panic should publish failed event");
-        assert_eq!(
-            failed_event.payload["error_code"],
-            "session_turn_execution_panicked"
-        );
-        assert_eq!(
-            failed_event.payload["public_message"],
-            "对话执行线程异常退出，可直接继续重试。"
-        );
-    }
-
-    #[test]
-    fn stale_regular_turn_cannot_finalize_new_conversation_turn() {
-        let state = test_state();
-        let session_id = SessionId::new("session-stale-regular-turn-finalize");
-        state
-            .session_store
-            .create_session(session_id.clone(), "stale regular turn finalize")
-            .expect("session should create");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-new-owner".to_string(),
-                    turn_seq: 2,
-                    accepted_at: UtcMillis(2),
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("新轮次".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("new current turn should persist");
-        crate::routes::begin_session_turn(&state, &session_id)
-            .expect("new conversation turn should begin");
-
-        assert!(!finalize_regular_session_conversation_turn_if_current(
-            &state,
-            &session_id,
-            "turn-old-owner",
-            false,
-        ));
-        assert!(crate::routes::begin_session_turn(&state, &session_id).is_err());
-        assert!(finalize_regular_session_conversation_turn_if_current(
-            &state,
-            &session_id,
-            "turn-new-owner",
-            false,
-        ));
-        assert!(crate::routes::begin_session_turn(&state, &session_id).is_ok());
-    }
-
-    #[tokio::test]
-    async fn completed_regular_turn_releases_conversation_slot_after_canonical_completion() {
-        let state = test_state();
-        let session_id = SessionId::new("session-completed-regular-turn-release");
-        let turn_id = "turn-completed-regular-turn-release".to_string();
-        let accepted_at = UtcMillis(1777000000260);
-        state
-            .session_store
-            .create_session(session_id.clone(), "completed regular turn release")
-            .expect("session should create");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: turn_id.clone(),
-                    turn_seq: accepted_at.0,
-                    accepted_at,
-                    status: "completed".to_string(),
-                    completed_at: Some(accepted_at),
-                    user_message: Some("完成普通对话".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("completed current turn should persist");
-        crate::routes::begin_session_turn(&state, &session_id)
-            .expect("conversation turn should begin");
-
-        finalize_regular_session_turn_execution(
-            state.clone(),
-            session_id.clone(),
-            None,
-            turn_id,
-            accepted_at,
-            SessionTurnRouteDto::Chat,
-            false,
-            Ok(SessionTurnExecutionOutput {
-                final_content: "完成".to_string(),
-                interrupted: false,
-            }),
-        );
-
-        assert!(crate::routes::begin_session_turn(&state, &session_id).is_ok());
-        assert!(
-            state
-                .event_bus
-                .snapshot()
-                .recent_events
-                .iter()
-                .any(|event| event.event_type == "session.turn.completed")
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_regular_turn_releases_conversation_slot_after_canonical_failure() {
-        let state = test_state();
-        let workspace_id = register_workspace(
-            &state,
-            "workspace-failed-regular-turn-release",
-            "failed turn",
-        );
-        let session_id = SessionId::new("session-failed-regular-turn-release");
-        let turn_id = "turn-failed-regular-turn-release".to_string();
-        let accepted_at = UtcMillis(1777000000270);
-        state
-            .session_store
-            .create_session_for_workspace(
-                session_id.clone(),
-                "failed regular turn release",
-                Some(workspace_id.to_string()),
-            )
-            .expect("session should create");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: turn_id.clone(),
-                    turn_seq: accepted_at.0,
-                    accepted_at,
-                    status: "failed".to_string(),
-                    completed_at: Some(accepted_at),
-                    user_message: Some("失败普通对话".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("failed current turn should persist");
-        crate::routes::begin_session_turn(&state, &session_id)
-            .expect("conversation turn should begin");
-
-        finalize_regular_session_turn_execution(
-            state.clone(),
-            session_id.clone(),
-            Some(workspace_id.clone()),
-            turn_id,
-            accepted_at,
-            SessionTurnRouteDto::Chat,
-            false,
-            Err(SessionTurnExecutionError {
-                reason: SessionTurnFailureReason::ModelInvocationFailed,
-                diagnostic_code: "model_request_failed".to_string(),
-                public_message: "模型请求失败".to_string(),
-            }),
-        );
-
-        assert!(crate::routes::begin_session_turn(&state, &session_id).is_ok());
-        assert!(
-            state
-                .event_bus
-                .snapshot()
-                .recent_events
-                .iter()
-                .any(|event| event.event_type == "session.turn.failed")
-        );
-        let notifications = state
-            .session_store
-            .notifications_for_context(workspace_id.as_str(), Some(&session_id));
-        assert_eq!(notifications.len(), 1);
-        assert_eq!(notifications[0].level.as_deref(), Some("error"));
-        assert_eq!(notifications[0].title.as_deref(), Some("运行错误"));
-        assert_eq!(notifications[0].source.as_deref(), Some("magi-runtime"));
-        assert_eq!(
-            notifications[0].fingerprint,
-            "runtime-error:model_request_failed"
-        );
-        assert!(!notifications[0].handled);
-    }
-
-    #[test]
-    fn early_regular_turn_failure_publishes_terminal_event() {
-        let state = test_state();
-        let workspace_id =
-            register_workspace(&state, "workspace-early-turn-failure", "early-turn-failure");
-        let session_id = SessionId::new("session-early-turn-failure");
-        let accepted_at = UtcMillis(1777000000200);
-        state
-            .session_store
-            .create_session_for_workspace(
-                session_id.clone(),
-                "早期失败事件",
-                Some(workspace_id.to_string()),
-            )
-            .expect("session should create");
-        state
-            .session_store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-early-failure".to_string(),
-                    turn_seq: accepted_at.0,
-                    accepted_at,
-                    status: "running".to_string(),
-                    completed_at: None,
-                    user_message: Some("触发早期失败".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .expect("current turn should persist");
-
-        publish_regular_session_turn_early_failed(
-            &state,
-            &session_id,
-            Some(workspace_id.clone()),
-            accepted_at,
-            SessionTurnRouteDto::Chat,
-            SessionTurnFailedReason::DispatcherUnavailable,
-        );
-
-        let current_turn = state
-            .session_store
-            .runtime_sidecar(&session_id)
-            .and_then(|sidecar| sidecar.current_turn)
-            .expect("current turn should remain for durable terminal display");
-        assert_eq!(current_turn.status, "failed");
-        let failed_event = state
-            .event_bus
-            .snapshot()
-            .recent_events
-            .into_iter()
-            .find(|event| event.event_type == "session.turn.failed")
-            .expect("terminal failed event should be published");
-        assert_eq!(failed_event.session_id.as_ref(), Some(&session_id));
-        assert_eq!(failed_event.workspace_id.as_ref(), Some(&workspace_id));
-        assert_eq!(failed_event.payload["session_id"], session_id.as_str());
-        assert_eq!(failed_event.payload["route"], "chat");
-        assert_eq!(
-            failed_event.payload["error_code"],
-            "session_turn_dispatcher_unavailable"
-        );
-        assert_eq!(
-            failed_event.payload["canonical_schema_version"],
-            CANONICAL_TURN_SCHEMA_VERSION
-        );
-        assert_eq!(
-            failed_event.payload["canonical_event_kind"],
-            "turn_completed"
-        );
-        assert_eq!(
-            failed_event.payload["canonical_turn"]["turnId"],
-            "turn-early-failure"
-        );
-        assert_eq!(failed_event.payload["canonical_turn"]["status"], "failed");
-        let notifications = state
-            .session_store
-            .notifications_for_context(workspace_id.as_str(), Some(&session_id));
-        assert_eq!(notifications.len(), 1);
-        assert_eq!(
-            notifications[0].fingerprint,
-            "runtime-error:session_turn_dispatcher_unavailable"
         );
     }
 
@@ -4657,6 +3666,36 @@ mod tests {
             steer_current_turn: false,
             expected_turn_id: None,
             replace_turn_id: None,
+        }
+    }
+
+    fn queued_regular_turn(
+        session_id: &SessionId,
+        workspace_id: &WorkspaceId,
+        queue_id: &str,
+        accepted_at: UtcMillis,
+    ) -> QueuedRegularSessionTurn {
+        let mut request = session_turn_request(&format!("queued {queue_id}"));
+        request.session_id = Some(session_id.to_string());
+        request.workspace_id = Some(workspace_id.to_string());
+        request.request_id = Some(format!("request-{queue_id}"));
+        request.user_message_id = Some(format!("user-{queue_id}"));
+        request.placeholder_message_id = Some(format!("assistant-{queue_id}"));
+        QueuedRegularSessionTurn {
+            request,
+            requested_workspace_id: workspace_id.clone(),
+            accepted_at,
+            route: SessionTurnRouteDto::Chat,
+            task_title: None,
+            execution_goal: None,
+            task_tier: TaskTier::ExecutionChain,
+            tool_intent: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            session_id: session_id.clone(),
+            workspace_id: Some(workspace_id.clone()),
+            queue_id: queue_id.to_string(),
+            retry_count: 0,
         }
     }
 
@@ -6353,234 +5392,328 @@ mod tests {
         }
     }
 
-    /// §P7：accept 阶段不再为 assistant 预占 turn item，避免 thinking → text
-    /// 在 Anthropic 协议顺序下被错误抢到更小的 `item_seq`，导致 presentationSeq
-    /// 与协议顺序倒挂、流式计时器跳到消息上方。
-    ///
-    /// 新契约：
-    /// - canonical_turn.items 在 accept 时只包含 user_message（不再预先 push 占位）
-    /// - placeholder_message_id 仍透传给下游（用于首帧 upsert 时复用 item_id）
-    /// - canonical_item 指向已接受的 user_message，不再指向尚未创建的 assistant 占位
     #[tokio::test]
-    async fn regular_session_turn_accept_does_not_pre_reserve_assistant_placeholder_item() {
+    async fn concurrent_regular_session_turns_accept_one_and_queue_one() {
+        let state = test_state_with_pending_runner();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-concurrent-turn-acceptance",
+            "concurrent-turn-acceptance",
+        );
+        let session_id = SessionId::new("session-concurrent-turn-acceptance");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "并发接受会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        let first = post_json(
+            state.clone(),
+            "/session/turn",
+            json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+                "text": "并发消息 A",
+                "requestId": "request-concurrent-a",
+                "userMessageId": "user-concurrent-a",
+                "placeholderMessageId": "assistant-concurrent-a"
+            }),
+        );
+        let second = post_json(
+            state.clone(),
+            "/session/turn",
+            json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+                "text": "并发消息 B",
+                "requestId": "request-concurrent-b",
+                "userMessageId": "user-concurrent-b",
+                "placeholderMessageId": "assistant-concurrent-b"
+            }),
+        );
+
+        let ((first_status, first_body), (second_status, second_body)) =
+            tokio::join!(first, second);
+
+        assert_eq!(
+            first_status,
+            StatusCode::OK,
+            "unexpected body: {first_body}"
+        );
+        assert_eq!(
+            second_status,
+            StatusCode::OK,
+            "unexpected body: {second_body}"
+        );
+        assert_eq!(
+            [&first_body, &second_body]
+                .into_iter()
+                .filter(|body| body["queued"] == true)
+                .count(),
+            1,
+            "unexpected responses: first={first_body}, second={second_body}"
+        );
+        assert_eq!(state.queued_regular_session_turn_count(&session_id), 1);
+    }
+
+    #[tokio::test]
+    async fn session_interrupt_clears_all_queued_turns_and_reports_count() {
         let state = test_state();
         let workspace_id = register_workspace(
             &state,
-            "workspace-canonical-first-frame",
-            "canonical-first-frame",
+            "workspace-interrupt-queued-turns",
+            "interrupt-queued-turns",
         );
-        let accepted_at = UtcMillis(1777000000000);
-        let response = submit_regular_session_turn(
+        let session_id = SessionId::new("session-interrupt-queued-turns");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "中断排队会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        for (queue_id, accepted_at) in [("queue-interrupt-a", 101), ("queue-interrupt-b", 102)] {
+            state
+                .enqueue_regular_session_turn(queued_regular_turn(
+                    &session_id,
+                    &workspace_id,
+                    queue_id,
+                    UtcMillis(accepted_at),
+                ))
+                .expect("queued turn should persist");
+        }
+
+        let (status, body) = post_json(
             state.clone(),
-            SessionTurnRequestDto {
-                session_id: None,
-                workspace_id: Some(workspace_id.to_string()),
-                workspace_path: None,
-                text: Some("请只回复一句话".to_string()),
-                skill_name: None,
-                locale: None,
-                goal_mode: false,
-                images: Vec::new(),
-                context_references: Vec::new(),
-                access_profile: None,
-                orchestrator_session_config: None,
-                request_id: Some("request-canonical-first-frame".to_string()),
-                user_message_id: Some("user-canonical-first-frame".to_string()),
-                placeholder_message_id: Some("assistant-canonical-first-frame".to_string()),
-                steer_current_turn: false,
-                expected_turn_id: None,
-                replace_turn_id: None,
-            },
-            Vec::new(),
-            workspace_id,
+            "/session/interrupt",
+            json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["clearedQueuedTurnCount"], 2);
+        assert_eq!(state.queued_regular_session_turn_count(&session_id), 0);
+    }
+
+    #[tokio::test]
+    async fn session_turn_queue_routes_expose_and_remove_persisted_turns() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-session-turn-queue-routes",
+            "session-turn-queue-routes",
+        );
+        let session_id = SessionId::new("session-turn-queue-routes");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "队列路由会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state
+            .enqueue_regular_session_turn(queued_regular_turn(
+                &session_id,
+                &workspace_id,
+                "queue-route-a",
+                UtcMillis(151),
+            ))
+            .expect("queued turn should persist");
+
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/session/queue?workspaceId={}&sessionId={}",
+                        workspace_id, session_id
+                    ))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should read"),
+        )
+        .expect("response should be json");
+        assert_eq!(payload["queuedTurns"][0]["queueId"], "queue-route-a");
+        assert_eq!(payload["queuedTurns"][0]["queuePosition"], 1);
+        assert_eq!(payload["queuedTurns"][0]["text"], "queued queue-route-a");
+
+        let (status, payload) = post_json(
+            state.clone(),
+            "/session/queue/remove",
+            json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+                "queueId": "queue-route-a",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unexpected body: {payload}");
+        assert_eq!(payload["queuedTurns"], json!([]));
+        assert_eq!(state.queued_regular_session_turn_count(&session_id), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_queued_turn_submission_keeps_head_and_increments_retry_count() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-queued-turn-failure",
+            "queued-turn-failure",
+        );
+        let session_id = SessionId::new("session-queued-turn-failure");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "排队失败保留会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        let missing_workspace_id = WorkspaceId::new("workspace-queued-turn-missing");
+        let mut queued = queued_regular_turn(
+            &session_id,
+            &workspace_id,
+            "queue-submit-failure",
+            UtcMillis(201),
+        );
+        queued.requested_workspace_id = missing_workspace_id.clone();
+        queued.request.workspace_id = Some(missing_workspace_id.to_string());
+        queued.retry_count = 3;
+        state
+            .enqueue_regular_session_turn(queued)
+            .expect("queued turn should persist");
+
+        assert!(
+            drain_next_queued_regular_session_turn(
+                state.clone(),
+                session_id.clone(),
+                Some(workspace_id),
+            )
+            .await
+        );
+
+        let retained = state
+            .peek_next_regular_session_turn(&session_id)
+            .expect("failed submission must remain at queue head");
+        assert_eq!(retained.queue_id, "queue-submit-failure");
+        assert_eq!(retained.retry_count, 4);
+        assert!(
+            state
+                .event_bus
+                .snapshot()
+                .recent_events
+                .iter()
+                .any(|event| event.event_type == "session.turn.queue_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_queue_acknowledges_only_matching_canonical_user_identity() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-queue-canonical-recovery",
+            "queue-canonical-recovery",
+        );
+        let session_id = SessionId::new("session-queue-canonical-recovery");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "队列 canonical 恢复会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        let accepted_at = UtcMillis(301);
+        let matching = queued_regular_turn(
+            &session_id,
+            &workspace_id,
+            "queue-canonical-match",
             accepted_at,
-            SessionTurnIntentDecision {
-                route: SessionTurnRouteDto::Chat,
-                task_title: None,
-                execution_goal: None,
-                task_tier: TaskTier::ExecutionChain,
-                tool_intent: None,
-                forced_tool_name: None,
-                required_tool_chain: Vec::new(),
-                confidence: 1.0,
-                reason_code: Some("plain_chat".to_string()),
-                route_reason: Some("test".to_string()),
-                task_evidence: Vec::new(),
-            },
-        )
-        .await
-        .expect("regular turn should be accepted");
-
-        assert_eq!(
-            response.user_message_item_id.as_deref(),
-            Some("user-canonical-first-frame")
         );
-        let accepted_event = state
-            .event_bus
-            .snapshot()
-            .recent_events
-            .into_iter()
-            .find(|event| event.event_id.to_string() == response.event_id)
-            .expect("accepted event should be published");
-        assert_eq!(
-            accepted_event.payload["canonical_event_kind"],
-            "turn_started"
-        );
-        let items = accepted_event.payload["canonical_turn"]["items"]
-            .as_array()
-            .expect("canonical turn items should be present");
-        // accept 阶段 turn 内只有 user_message；assistant item 由首帧 upsert 创建。
-        assert_eq!(items.len(), 1, "accept 阶段不应预占 assistant item");
-        assert_eq!(items[0]["itemId"], "user-canonical-first-frame");
-        assert_eq!(items[0]["kind"], "user_message");
-        // canonical_item 指向已接受的 user_message；assistant item 仍等待首帧创建。
-        assert_eq!(
-            accepted_event.payload["canonical_item"]["itemId"],
-            "user-canonical-first-frame"
-        );
-        assert_eq!(
-            accepted_event.payload["canonical_item"]["kind"],
-            "user_message"
-        );
-    }
-
-    #[tokio::test]
-    async fn regular_session_turn_applies_draft_orchestrator_config_before_execution() {
-        let state = test_state();
-        let workspace_id = register_workspace(
-            &state,
-            "workspace-draft-orchestrator-model",
-            "draft-orchestrator-model",
-        );
-        let response = submit_regular_session_turn(
-            state.clone(),
-            SessionTurnRequestDto {
-                session_id: None,
-                workspace_id: Some(workspace_id.to_string()),
-                workspace_path: None,
-                text: Some("验证草稿会话主模型配置".to_string()),
-                skill_name: None,
-                locale: None,
-                goal_mode: false,
-                images: Vec::new(),
-                context_references: Vec::new(),
-                access_profile: None,
-                orchestrator_session_config: Some(json!({
-                    "model": "gpt-session-draft",
-                    "reasoningEffort": "high",
-                })),
-                request_id: Some("request-draft-orchestrator-model".to_string()),
-                user_message_id: Some("user-draft-orchestrator-model".to_string()),
-                placeholder_message_id: Some("assistant-draft-orchestrator-model".to_string()),
-                steer_current_turn: false,
-                expected_turn_id: None,
-                replace_turn_id: None,
-            },
-            Vec::new(),
-            workspace_id,
-            UtcMillis(1_777_000_010_000),
-            classifier_chat_decision(),
-        )
-        .await
-        .expect("draft turn should accept");
-
-        let session_id = SessionId::new(&response.session_id);
-        let session_config = state
-            .settings_store
-            .get_session_section(&session_id, "orchestrator");
-        assert_eq!(session_config["model"], json!("gpt-session-draft"));
-        assert_eq!(session_config["reasoningEffort"], json!("high"));
-    }
-
-    #[tokio::test]
-    async fn regular_session_turn_accept_persists_user_image_metadata() {
-        let state = test_state();
-        let workspace_id = register_workspace(&state, "workspace-image-turn", "image-turn");
-        let request = SessionTurnRequestDto {
-            session_id: None,
-            workspace_id: Some(workspace_id.to_string()),
-            workspace_path: None,
-            text: Some("识别这张图片".to_string()),
-            skill_name: None,
-            locale: None,
-            goal_mode: false,
-            images: vec![crate::dto::SessionTurnImageDto {
-                name: "paste.png".to_string(),
-                data_url: "data:image/png;base64,AAA".to_string(),
-            }],
-            context_references: Vec::new(),
-            access_profile: None,
-            orchestrator_session_config: None,
-            request_id: Some("request-image-turn".to_string()),
-            user_message_id: Some("user-image-turn".to_string()),
-            placeholder_message_id: Some("assistant-image-turn".to_string()),
-            steer_current_turn: false,
-            expected_turn_id: None,
-            replace_turn_id: None,
-        };
-        let images = request.parsed_images().expect("image should parse");
-        let response = submit_regular_session_turn(
-            state.clone(),
-            request.clone(),
-            images,
-            workspace_id,
-            UtcMillis(1777000000100),
-            SessionTurnIntentDecision {
-                route: SessionTurnRouteDto::Chat,
-                task_title: None,
-                execution_goal: None,
-                task_tier: TaskTier::ExecutionChain,
-                tool_intent: None,
-                forced_tool_name: None,
-                required_tool_chain: Vec::new(),
-                confidence: 1.0,
-                reason_code: Some("plain_chat".to_string()),
-                route_reason: Some("test".to_string()),
-                task_evidence: Vec::new(),
-            },
-        )
-        .await
-        .expect("regular image turn should be accepted");
-
-        let session_id = SessionId::new(response.session_id);
-        let canonical_turn = state
+        let (_, user_item) = build_user_message_turn_item(UserMessageTurnItemInput {
+            accepted_at,
+            message: "已接受的排队消息",
+            entry_id: "entry-canonical-match",
+            request_id: matching.request.request_id(),
+            user_message_id: matching.request.user_message_id(),
+            placeholder_message_id: matching.request.placeholder_message_id(),
+            metadata: Default::default(),
+            task_id: None,
+            source_thread_id: ThreadId::new("thread-canonical-match"),
+        });
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-canonical-match".to_string(),
+                    turn_seq: 1,
+                    accepted_at,
+                    status: "running".to_string(),
+                    completed_at: None,
+                    user_message: Some("已接受的排队消息".to_string()),
+                    items: vec![user_item],
+                },
+            )
+            .expect("canonical turn should persist");
+        state
+            .session_store
+            .update_current_turn_status(&session_id, "completed")
+            .expect("canonical turn should complete");
+        let canonical = state
             .session_store
             .canonical_turns_for_session(&session_id)
             .into_iter()
-            .find(|turn| {
-                turn.items
-                    .iter()
-                    .any(|item| item.item_id == "user-image-turn")
-            })
-            .expect("canonical turn should be present");
-        let user_item = canonical_turn
-            .items
-            .iter()
-            .find(|item| item.item_id == "user-image-turn")
-            .expect("user image item should be present");
-        assert_eq!(
-            user_item.metadata["images"][0]["dataUrl"],
-            "data:image/png;base64,AAA"
+            .next()
+            .expect("canonical turn should exist");
+        let same_timestamp_different_identity = queued_regular_turn(
+            &session_id,
+            &workspace_id,
+            "queue-canonical-different",
+            accepted_at,
         );
-        assert_eq!(user_item.metadata["images"][0]["name"], "paste.png");
-        assert_eq!(
-            response
-                .canonical_item
-                .as_ref()
-                .expect("accepted response should carry user image item")
-                .metadata["images"][0]["dataUrl"],
-            "data:image/png;base64,AAA"
+        assert!(!canonical_turn_matches_queued_regular_turn(
+            &canonical,
+            &same_timestamp_different_identity
+        ));
+        assert!(canonical_turn_matches_queued_regular_turn(
+            &canonical, &matching
+        ));
+        state
+            .enqueue_regular_session_turn(matching)
+            .expect("matching recovery turn should persist");
+
+        assert!(
+            drain_next_queued_regular_session_turn(
+                state.clone(),
+                session_id.clone(),
+                Some(workspace_id),
+            )
+            .await
         );
-        let accepted_event = state
-            .event_bus
-            .snapshot()
-            .recent_events
-            .into_iter()
-            .find(|event| event.event_id.to_string() == response.event_id)
-            .expect("accepted event should be published");
+        assert_eq!(state.queued_regular_session_turn_count(&session_id), 0);
         assert_eq!(
-            accepted_event.payload["canonical_item"]["metadata"]["images"][0]["dataUrl"],
-            "data:image/png;base64,AAA"
+            state
+                .session_store
+                .canonical_turns_for_session(&session_id)
+                .len(),
+            1,
+            "恢复确认不能重复接受 canonical turn"
         );
     }
 
@@ -6614,46 +5747,33 @@ mod tests {
             )
             .expect("current turn should persist");
 
-        let queued_at = UtcMillis(1_777_000_000_300);
-        let response = submit_regular_session_turn(
+        let (status, body) = post_json(
             state.clone(),
-            SessionTurnRequestDto {
-                session_id: Some(session_id.to_string()),
-                workspace_id: Some(workspace_id.to_string()),
-                workspace_path: None,
-                text: Some("第二条应该排队".to_string()),
-                skill_name: None,
-                locale: None,
-                goal_mode: false,
-                images: Vec::new(),
-                context_references: Vec::new(),
-                access_profile: None,
-                orchestrator_session_config: None,
-                request_id: Some("request-queued-turn".to_string()),
-                user_message_id: Some("user-queued-turn".to_string()),
-                placeholder_message_id: Some("assistant-queued-turn".to_string()),
-                steer_current_turn: false,
-                expected_turn_id: None,
-                replace_turn_id: None,
-            },
-            Vec::new(),
-            workspace_id.clone(),
-            queued_at,
-            classifier_chat_decision(),
+            "/session/turn",
+            serde_json::json!({
+                "workspaceId": workspace_id.to_string(),
+                "sessionId": session_id.to_string(),
+                "text": "第二条应该排队",
+                "requestId": "request-queued-turn",
+                "userMessageId": "user-queued-turn",
+                "placeholderMessageId": "assistant-queued-turn"
+            }),
         )
-        .await
-        .expect("busy session should enqueue instead of conflict");
+        .await;
 
-        assert!(response.queued);
-        assert_eq!(response.queue_position, Some(1));
-        assert_eq!(response.session_id, session_id.as_str());
-        assert_eq!(
-            response.user_message_item_id.as_deref(),
-            Some("user-queued-turn")
-        );
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["queued"], true);
+        assert_eq!(body["queuePosition"], 1);
+        assert_eq!(body["sessionId"], session_id.as_str());
+        assert_eq!(body["userMessageItemId"], "user-queued-turn");
         assert!(
-            response.canonical_event_kind.is_none(),
-            "排队响应不应伪造 turn_started"
+            body.get("canonicalEventKind").is_none(),
+            "排队响应不应伪造 turn_started: {body}"
+        );
+        let queued_at = UtcMillis(
+            body["acceptedAt"]
+                .as_u64()
+                .expect("acceptedAt should serialize as integer"),
         );
         let queued_event = state
             .event_bus
@@ -6667,18 +5787,16 @@ mod tests {
         assert_eq!(queued_event.payload["queue_position"], 1);
 
         let queued = state
-            .pop_next_regular_session_turn(&session_id, Some(&workspace_id))
-            .expect("queued turn should be stored by session/workspace key");
+            .peek_next_regular_session_turn(&session_id)
+            .expect("queued turn should be stored by session key");
         assert_eq!(
             queued.queue_id,
-            response.queue_id.as_deref().unwrap_or_default()
+            body["queueId"].as_str().unwrap_or_default()
         );
         assert_eq!(
             queued.request.trimmed_text().as_deref(),
             Some("第二条应该排队")
         );
-        state.enqueue_regular_session_turn(queued);
-
         state
             .session_store
             .update_current_turn_status(&session_id, "completed")
@@ -6708,10 +5826,11 @@ mod tests {
             drained_turn.items[0].kind,
             CanonicalTurnItemKind::UserMessage
         );
+        assert_eq!(state.queued_regular_session_turn_count(&session_id), 0);
     }
 
     #[tokio::test]
-    async fn regular_session_turn_queue_drain_is_scoped_by_session_and_workspace() {
+    async fn regular_session_turn_queue_is_scoped_by_session() {
         let state = test_state();
         let workspace_a = register_workspace(&state, "workspace-queue-scope-a", "queue-scope-a");
         let workspace_b = register_workspace(&state, "workspace-queue-scope-b", "queue-scope-b");
@@ -6746,84 +5865,43 @@ mod tests {
                 .expect("current turn should persist");
         }
 
-        let response_a = submit_regular_session_turn(
+        let (status_a, response_a) = post_json(
             state.clone(),
-            SessionTurnRequestDto {
-                session_id: Some(session_a.to_string()),
-                workspace_id: Some(workspace_a.to_string()),
-                workspace_path: None,
-                text: Some("A 的下一条".to_string()),
-                skill_name: None,
-                locale: None,
-                goal_mode: false,
-                images: Vec::new(),
-                context_references: Vec::new(),
-                access_profile: None,
-                orchestrator_session_config: None,
-                request_id: Some("request-queue-a".to_string()),
-                user_message_id: Some("user-queue-a".to_string()),
-                placeholder_message_id: Some("assistant-queue-a".to_string()),
-                steer_current_turn: false,
-                expected_turn_id: None,
-                replace_turn_id: None,
-            },
-            Vec::new(),
-            workspace_a.clone(),
-            UtcMillis(1_777_000_001_100),
-            classifier_chat_decision(),
+            "/session/turn",
+            serde_json::json!({
+                "workspaceId": workspace_a.to_string(),
+                "sessionId": session_a.to_string(),
+                "text": "A 的下一条",
+                "requestId": "request-queue-a",
+                "userMessageId": "user-queue-a",
+                "placeholderMessageId": "assistant-queue-a"
+            }),
         )
-        .await
-        .expect("session A busy turn should queue");
-        let response_b = submit_regular_session_turn(
+        .await;
+        assert_eq!(status_a, StatusCode::OK, "unexpected body: {response_a}");
+        let (status_b, response_b) = post_json(
             state.clone(),
-            SessionTurnRequestDto {
-                session_id: Some(session_b.to_string()),
-                workspace_id: Some(workspace_b.to_string()),
-                workspace_path: None,
-                text: Some("B 的下一条".to_string()),
-                skill_name: None,
-                locale: None,
-                goal_mode: false,
-                images: Vec::new(),
-                context_references: Vec::new(),
-                access_profile: None,
-                orchestrator_session_config: None,
-                request_id: Some("request-queue-b".to_string()),
-                user_message_id: Some("user-queue-b".to_string()),
-                placeholder_message_id: Some("assistant-queue-b".to_string()),
-                steer_current_turn: false,
-                expected_turn_id: None,
-                replace_turn_id: None,
-            },
-            Vec::new(),
-            workspace_b.clone(),
-            UtcMillis(1_777_000_001_200),
-            classifier_chat_decision(),
+            "/session/turn",
+            serde_json::json!({
+                "workspaceId": workspace_b.to_string(),
+                "sessionId": session_b.to_string(),
+                "text": "B 的下一条",
+                "requestId": "request-queue-b",
+                "userMessageId": "user-queue-b",
+                "placeholderMessageId": "assistant-queue-b"
+            }),
         )
-        .await
-        .expect("session B busy turn should queue");
-        assert!(response_a.queued);
-        assert!(response_b.queued);
+        .await;
+        assert_eq!(status_b, StatusCode::OK, "unexpected body: {response_b}");
+        assert_eq!(response_a["queued"], true);
+        assert_eq!(response_b["queued"], true);
 
         assert!(
-            !drain_next_queued_regular_session_turn(
-                state.clone(),
-                session_a.clone(),
-                Some(workspace_b.clone()),
-            )
-            .await,
-            "错误 workspace 不能取走 session A 的队列"
+            state.peek_next_regular_session_turn(&session_a).is_some(),
+            "session A 的队列应独立存在"
         );
         assert!(
-            state
-                .pop_next_regular_session_turn(&session_a, Some(&workspace_a))
-                .is_some(),
-            "session A 正确 workspace 的队列仍应存在"
-        );
-        assert!(
-            state
-                .pop_next_regular_session_turn(&session_b, Some(&workspace_b))
-                .is_some(),
+            state.peek_next_regular_session_turn(&session_b).is_some(),
             "session B 的队列不应被 session A drain 影响"
         );
     }
@@ -6882,8 +5960,8 @@ mod tests {
             "任务排队响应不应提前发布 turn_started: {body}"
         );
         let queued = state
-            .pop_next_regular_session_turn(&session_id, Some(&workspace_id))
-            .expect("task turn should be queued with the same session/workspace key");
+            .peek_next_regular_session_turn(&session_id)
+            .expect("task turn should be queued with the same session key");
         assert!(matches!(queued.route, SessionTurnRouteDto::Task));
         assert_eq!(
             queued.request.trimmed_text().as_deref(),
@@ -7054,140 +6132,6 @@ mod tests {
         );
     }
 
-    /// §3.1 端到端验收：simple task 路径（chat 路由）
-    ///
-    /// 闸门属性：chat 路由进入 `submit_regular_session_turn` 后，
-    /// - 不在 TaskStore 创建任何 Task；
-    /// - 不在 session sidecar 写入 `execution_chain_ref`；
-    /// - session timeline 仍由现有 canonical turn 测试覆盖 user_message + assistant 占位。
-    ///
-    /// 任何在 chat 路径上私自落入 TaskStore / 绑定 execution chain 的代码改动
-    /// 都会让本测试失败——这是 §3.1 "不创建 TaskGraph、不创建 Mission" 的可观察行为闸门。
-    #[tokio::test]
-    async fn simple_chat_route_does_not_create_task_or_execution_chain() {
-        let task_store = Arc::new(TaskStore::new());
-        let state = test_state().with_task_store(task_store.clone());
-        let workspace_id = register_workspace(&state, "workspace-simple-chat", "simple-chat");
-        let request = SessionTurnRequestDto {
-            session_id: None,
-            workspace_id: Some(workspace_id.to_string()),
-            workspace_path: None,
-            text: Some("解释一下流程图的概念".to_string()),
-            skill_name: None,
-            locale: None,
-            goal_mode: false,
-            images: Vec::new(),
-            context_references: Vec::new(),
-            access_profile: None,
-            orchestrator_session_config: None,
-            request_id: Some("request-simple-chat".to_string()),
-            user_message_id: Some("user-simple-chat".to_string()),
-            placeholder_message_id: Some("assistant-simple-chat".to_string()),
-            steer_current_turn: false,
-            expected_turn_id: None,
-            replace_turn_id: None,
-        };
-        let accepted_at = UtcMillis(1_700_000_000_000);
-        let response = submit_regular_session_turn(
-            state.clone(),
-            request,
-            Vec::new(),
-            workspace_id,
-            accepted_at,
-            classifier_chat_decision(),
-        )
-        .await
-        .expect("chat route should accept");
-
-        assert!(matches!(response.route, SessionTurnRouteDto::Chat));
-        let session_id = SessionId::new(&response.session_id);
-        let orchestrator_thread = state
-            .session_store
-            .orchestrator_thread_for_session(&session_id)
-            .expect("orchestrator thread should be registered");
-        let tasks = task_store.get_tasks_by_mission(&orchestrator_thread.mission_id);
-        assert!(
-            tasks.is_empty(),
-            "chat 路由不应在 TaskStore 中创建任务: {tasks:?}"
-        );
-        let sidecar = state
-            .session_store
-            .runtime_sidecar(&session_id)
-            .expect("sidecar should exist");
-        assert!(
-            sidecar.ownership.execution_chain_ref.is_none(),
-            "chat 路由不应绑定 execution_chain_ref: {:?}",
-            sidecar.ownership.execution_chain_ref,
-        );
-    }
-
-    /// §3.1 端到端验收：simple task 路径（execute 路由强制工具）
-    ///
-    /// 与 chat 路由共用 `submit_regular_session_turn`，因此同样的"不入 TaskStore /
-    /// 不绑定 execution chain"闸门必须成立——execute 路由的语义是"在主线程内调用
-    /// 一次工具"，而不是创建代理运行记录。
-    #[tokio::test]
-    async fn simple_execute_route_does_not_create_task_or_execution_chain() {
-        let task_store = Arc::new(TaskStore::new());
-        let state = test_state().with_task_store(task_store.clone());
-        let workspace_id = register_workspace(&state, "workspace-simple-execute", "simple-execute");
-        let request = SessionTurnRequestDto {
-            session_id: None,
-            workspace_id: Some(workspace_id.to_string()),
-            workspace_path: None,
-            text: Some("请调用 file_mkdir 工具创建目录".to_string()),
-            skill_name: None,
-            locale: None,
-            goal_mode: false,
-            images: Vec::new(),
-            context_references: Vec::new(),
-            access_profile: None,
-            orchestrator_session_config: None,
-            request_id: Some("request-simple-execute".to_string()),
-            user_message_id: Some("user-simple-execute".to_string()),
-            placeholder_message_id: Some("assistant-simple-execute".to_string()),
-            steer_current_turn: false,
-            expected_turn_id: None,
-            replace_turn_id: None,
-        };
-        let accepted_at = UtcMillis(1_700_000_001_000);
-        let mut decision = classifier_chat_decision();
-        decision.route = SessionTurnRouteDto::Execute;
-        decision.forced_tool_name = Some("file_mkdir".to_string());
-        decision.tool_intent = Some("显式调用 file_mkdir".to_string());
-        let response = submit_regular_session_turn(
-            state.clone(),
-            request,
-            Vec::new(),
-            workspace_id,
-            accepted_at,
-            decision,
-        )
-        .await
-        .expect("execute route should accept");
-
-        assert!(matches!(response.route, SessionTurnRouteDto::Execute));
-        let session_id = SessionId::new(&response.session_id);
-        let orchestrator_thread = state
-            .session_store
-            .orchestrator_thread_for_session(&session_id)
-            .expect("orchestrator thread should be registered");
-        let tasks = task_store.get_tasks_by_mission(&orchestrator_thread.mission_id);
-        assert!(
-            tasks.is_empty(),
-            "execute 路由不应在 TaskStore 中创建任务: {tasks:?}"
-        );
-        let sidecar = state
-            .session_store
-            .runtime_sidecar(&session_id)
-            .expect("sidecar should exist");
-        assert!(
-            sidecar.ownership.execution_chain_ref.is_none(),
-            "execute 路由不应绑定 execution_chain_ref: {:?}",
-            sidecar.ownership.execution_chain_ref,
-        );
-    }
-
     #[tokio::test]
     async fn delete_session_returns_workspace_scoped_bootstrap() {
         let state = test_state();
@@ -7353,22 +6297,24 @@ mod tests {
                 json!({"model": "delete-model", "reasoningEffort": "high"}),
             )
             .unwrap();
-        state.enqueue_regular_session_turn(QueuedRegularSessionTurn {
-            request: session_turn_request("排队消息"),
-            images: Vec::new(),
-            requested_workspace_id: workspace_id.clone(),
-            accepted_at: UtcMillis(13),
-            route: SessionTurnRouteDto::Chat,
-            task_title: None,
-            execution_goal: None,
-            task_tier: TaskTier::ExecutionChain,
-            tool_intent: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            session_id: session_id.clone(),
-            workspace_id: None,
-            queue_id: "queue-delete-runtime-resources".to_string(),
-        });
+        state
+            .enqueue_regular_session_turn(QueuedRegularSessionTurn {
+                request: session_turn_request("排队消息"),
+                requested_workspace_id: workspace_id.clone(),
+                accepted_at: UtcMillis(13),
+                route: SessionTurnRouteDto::Chat,
+                task_title: None,
+                execution_goal: None,
+                task_tier: TaskTier::ExecutionChain,
+                tool_intent: None,
+                forced_tool_name: None,
+                required_tool_chain: Vec::new(),
+                session_id: session_id.clone(),
+                workspace_id: None,
+                queue_id: "queue-delete-runtime-resources".to_string(),
+                retry_count: 0,
+            })
+            .expect("queued turn should persist");
 
         let (status, body) = post_json(
             state.clone(),
@@ -7403,10 +6349,7 @@ mod tests {
                 .get_session_section(&session_id, "orchestrator"),
             serde_json::Value::Null
         );
-        assert_eq!(
-            state.queued_regular_session_turn_count(&session_id, None),
-            0
-        );
+        assert_eq!(state.queued_regular_session_turn_count(&session_id), 0);
         assert!(
             state
                 .session_store

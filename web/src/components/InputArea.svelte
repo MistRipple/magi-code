@@ -9,8 +9,6 @@
     messagesState,
     removeQueuedMessage,
   } from '../stores/messages.svelte';
-  import { canGuideQueuedMessage } from '../lib/queued-message-guidance';
-  import type { QueuedMessage } from '../types/message';
   import { getAgentRunState } from '../stores/agent-run-store.svelte';
   import {
     enhanceAgentPrompt,
@@ -59,7 +57,6 @@
     type ComposerWorkspaceOption,
   } from '../stores/composer-workspace.svelte';
   import { openWorkspaceFolderPicker } from '../stores/workspace-onboarding.svelte';
-  import { turnStoreState } from '../stores/turn-store.svelte';
   import { canFetchModelList } from '../shared/model-governance';
   import {
     resolveOrchestratorModel,
@@ -322,11 +319,6 @@
   ));
 
   const isSending = $derived.by(() => messagesState.isProcessing || shouldInterruptAgentRunFromComposer);
-  const canGuideCurrentTurn = $derived.by(() => (
-    Boolean(currentSessionId?.trim())
-    && turnStoreState.reducer.sessionId === currentSessionId?.trim()
-    && turnStoreState.reducer.turns.some((turn) => turn.status === 'running' || turn.status === 'pending')
-  ));
   const activeInteraction = $derived.by(() => getActiveInteractionType());
   const isInteractionBlocking = $derived.by(() => Boolean(activeInteraction));
   const queuedMessages = $derived.by(() => getQueuedMessages());
@@ -1300,20 +1292,8 @@
   function deleteQueuedMessage(queuedMessageId: string) {
     const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
     if (!normalizedId) return;
-    removeQueuedMessage(normalizedId);
-  }
-
-  function canGuideQueued(queued: QueuedMessage): boolean {
-    return canGuideCurrentTurn
-      && queued.sessionId?.trim() === currentSessionId?.trim()
-      && canGuideQueuedMessage(queued);
-  }
-
-  function guideQueuedMessage(queuedMessageId: string): void {
-    const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
-    if (!normalizedId) return;
     vscode.postMessage({
-      type: 'guideQueuedMessage',
+      type: 'removeQueuedMessage',
       queuedMessageId: normalizedId,
     });
   }
@@ -1325,6 +1305,10 @@
     const target = messagesState.queuedMessages.find((message) => message.id === normalizedId);
     if (!target) return;
     const text = (target.text ?? target.content ?? '').toString();
+    vscode.postMessage({
+      type: 'removeQueuedMessage',
+      queuedMessageId: normalizedId,
+    });
     removeQueuedMessage(normalizedId);
     invalidateEnhanceState();
     pendingCaretOffset = text.length;
@@ -2235,22 +2219,10 @@
       </div>
       <div class="ia-queue-list">
         {#each queuedMessages as queued (queued.id)}
-          {@const guideAvailable = canGuideQueued(queued)}
           <div class="ia-queue-item">
             <span class="ia-queue-index" aria-hidden="true"></span>
             <div class="ia-queue-content" title={queued.content}>{queued.content}</div>
             <div class="ia-queue-actions">
-              <button
-                type="button"
-                class="ia-queue-action ia-queue-guide"
-                disabled={!guideAvailable}
-                onclick={() => guideQueuedMessage(queued.id)}
-                title={i18n.t(guideAvailable ? 'input.queue.guideTitle' : 'input.queue.guideUnavailable')}
-                aria-label={i18n.t(guideAvailable ? 'input.queue.guideTitle' : 'input.queue.guideUnavailable')}
-              >
-                <Icon name="corner-down-right" size={14} />
-                <span>{i18n.t('input.queue.guide')}</span>
-              </button>
               <button
                 type="button"
                 class="ia-queue-action"
@@ -4298,19 +4270,6 @@
     color: var(--foreground-muted);
     cursor: pointer;
     transition: color 120ms ease, opacity 120ms ease;
-  }
-
-  .ia-queue-guide {
-    width: auto;
-    gap: 4px;
-    color: color-mix(in srgb, var(--foreground) 72%, transparent);
-    font-size: 12px;
-    white-space: nowrap;
-  }
-
-  .ia-queue-guide:disabled {
-    cursor: not-allowed;
-    opacity: 0.42;
   }
 
   .ia-queue-action:hover {

@@ -1,8 +1,9 @@
 use magi_bridge_client::llm_types::ImageSource;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTurnImage {
     pub name: String,
     pub data_url: String,

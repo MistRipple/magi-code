@@ -23,7 +23,6 @@ use magi_bridge_client::{
 use magi_conversation_runtime::{
     ConversationRegistry,
     execution_admission::{ExecutionAdmissionController, ExecutionAdmissionSnapshot},
-    session_images::SessionTurnImage,
     task_execution_dispatcher::{ExecutionPipeline, LlmTaskDispatcher},
     task_execution_registry::TaskExecutionRegistry,
     task_runner::TaskRunner,
@@ -52,6 +51,7 @@ use magi_tool_runtime::{
     ToolExecutionContextQuery, ToolRegistry,
 };
 use magi_workspace::WorkspaceStore;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -80,25 +80,9 @@ pub struct RunnerHandle {
 type RunnerTerminalObserver = Arc<dyn Fn(TaskId, Option<SessionId>, String) + Send + Sync>;
 pub type SessionStateCheckpointPersist = Arc<dyn Fn(&str) -> Result<(), ApiError> + Send + Sync>;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct SessionTurnQueueKey {
-    session_id: SessionId,
-    workspace_id: Option<WorkspaceId>,
-}
-
-impl SessionTurnQueueKey {
-    fn new(session_id: &SessionId, workspace_id: Option<&WorkspaceId>) -> Self {
-        Self {
-            session_id: session_id.clone(),
-            workspace_id: workspace_id.cloned(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct QueuedRegularSessionTurn {
     pub request: SessionTurnRequestDto,
-    pub images: Vec<SessionTurnImage>,
     pub requested_workspace_id: WorkspaceId,
     pub accepted_at: UtcMillis,
     pub route: SessionTurnRouteDto,
@@ -111,6 +95,19 @@ pub(crate) struct QueuedRegularSessionTurn {
     pub session_id: SessionId,
     pub workspace_id: Option<WorkspaceId>,
     pub queue_id: String,
+    #[serde(default)]
+    pub retry_count: u8,
+}
+
+impl QueuedRegularSessionTurn {
+    fn normalize_identity(&mut self) {
+        if self.request.request_id().is_none() {
+            self.request.request_id = Some(format!("request-{}", self.queue_id));
+        }
+        if self.request.user_message_id().is_none() {
+            self.request.user_message_id = Some(format!("turn-item-user-{}", self.queue_id));
+        }
+    }
 }
 
 pub(crate) fn session_has_user_content(session: &SessionRecord) -> bool {
@@ -786,7 +783,7 @@ pub struct ApiState {
     execution_pipeline: Option<ExecutionPipeline>,
     task_execution_registry: TaskExecutionRegistry,
     task_store: Option<Arc<TaskStore>>,
-    runner_manager: Option<RunnerManager>,
+    runner_manager: Option<Arc<RunnerManager>>,
     session_turn_dispatcher: Option<Arc<LlmTaskDispatcher>>,
     mcp_connections: Arc<RwLock<HashMap<String, Arc<McpServerClient>>>>,
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
@@ -803,8 +800,8 @@ pub struct ApiState {
     /// 任务系统 — L5：父子任务关系图，作为 task_dispatch 中
     /// "parent_task_id 散落查询"的统一上层。同一进程共享。
     pub spawn_graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>,
-    session_turn_queue:
-        Arc<Mutex<HashMap<SessionTurnQueueKey, VecDeque<QueuedRegularSessionTurn>>>>,
+    session_turn_queue: Arc<Mutex<HashMap<SessionId, VecDeque<QueuedRegularSessionTurn>>>>,
+    session_turn_locks: Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -992,6 +989,7 @@ impl ApiState {
             agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
             spawn_graph: Arc::new(Mutex::new(magi_spawn_graph::SpawnGraph::new())),
             session_turn_queue: Arc::new(Mutex::new(HashMap::new())),
+            session_turn_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1352,7 +1350,7 @@ impl ApiState {
     /// 运行指标，调用方应将 `None` 视为执行运行时尚未初始化。
     pub fn execution_admission_snapshot(&self) -> Option<ExecutionAdmissionSnapshot> {
         self.runner_manager
-            .as_ref()
+            .as_deref()
             .map(RunnerManager::execution_admission_snapshot)
     }
 
@@ -1633,6 +1631,57 @@ impl ApiState {
         self
     }
 
+    pub fn restore_regular_session_turn_queues(&self) -> Result<usize, ApiError> {
+        let Some(persistence) = &self.runtime_persistence else {
+            return Ok(0);
+        };
+        let Some(state_root) = persistence.state_root() else {
+            return Ok(0);
+        };
+        let path = state_root.join("session-turn-queue.json");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(ApiError::internal_assembly(
+                    "读取 session turn 排队状态失败",
+                    error,
+                ));
+            }
+        };
+        let turns =
+            serde_json::from_slice::<Vec<QueuedRegularSessionTurn>>(&bytes).map_err(|error| {
+                ApiError::internal_assembly("解析 session turn 排队状态失败", error)
+            })?;
+        let mut queues = HashMap::<SessionId, VecDeque<QueuedRegularSessionTurn>>::new();
+        for mut turn in turns {
+            turn.normalize_identity();
+            let session_is_active = self
+                .session_store
+                .session(&turn.session_id)
+                .is_some_and(|session| session.status == SessionLifecycleStatus::Active);
+            let route_is_queueable = matches!(
+                turn.route,
+                SessionTurnRouteDto::Chat
+                    | SessionTurnRouteDto::Execute
+                    | SessionTurnRouteDto::Task
+            );
+            if session_is_active && route_is_queueable {
+                queues
+                    .entry(turn.session_id.clone())
+                    .or_default()
+                    .push_back(turn);
+            }
+        }
+        let restored_count = queues.values().map(VecDeque::len).sum();
+        self.persist_regular_session_turn_queues(&queues)?;
+        *self
+            .session_turn_queue
+            .lock()
+            .expect("session turn queue lock poisoned") = queues;
+        Ok(restored_count)
+    }
+
     pub fn persist_session_git_contexts(&self) -> Result<(), ApiError> {
         let Some(persistence) = &self.runtime_persistence else {
             return Ok(());
@@ -1901,6 +1950,11 @@ impl ApiState {
     }
 
     pub fn with_runner_manager(mut self, manager: RunnerManager) -> Self {
+        self.runner_manager = Some(Arc::new(manager));
+        self
+    }
+
+    pub fn with_shared_runner_manager(mut self, manager: Arc<RunnerManager>) -> Self {
         self.runner_manager = Some(manager);
         self
     }
@@ -1914,66 +1968,221 @@ impl ApiState {
         self.session_turn_dispatcher.as_ref()
     }
 
-    pub(crate) fn enqueue_regular_session_turn(&self, turn: QueuedRegularSessionTurn) -> usize {
-        let key = SessionTurnQueueKey::new(&turn.session_id, turn.workspace_id.as_ref());
+    pub(crate) async fn lock_session_turn(
+        &self,
+        session_id: &SessionId,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .session_turn_locks
+                .lock()
+                .expect("session turn locks should hold");
+            locks
+                .entry(session_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    fn persist_regular_session_turn_queues(
+        &self,
+        queues: &HashMap<SessionId, VecDeque<QueuedRegularSessionTurn>>,
+    ) -> Result<(), ApiError> {
+        let Some(persistence) = &self.runtime_persistence else {
+            return Ok(());
+        };
+        let Some(state_root) = persistence.state_root() else {
+            return Ok(());
+        };
+        let turns = queues
+            .values()
+            .flat_map(|queue| queue.iter().cloned())
+            .collect::<Vec<_>>();
+        persistence.save_json(&state_root.join("session-turn-queue.json"), &turns)
+    }
+
+    pub(crate) fn enqueue_regular_session_turn(
+        &self,
+        mut turn: QueuedRegularSessionTurn,
+    ) -> Result<usize, ApiError> {
+        turn.normalize_identity();
+        let session_id = turn.session_id.clone();
         let mut queues = self
             .session_turn_queue
             .lock()
             .expect("session turn queue lock poisoned");
-        let queue = queues.entry(key).or_default();
+        let queue = queues.entry(session_id.clone()).or_default();
         queue.push_back(turn);
-        queue.len()
-    }
-
-    pub(crate) fn pop_next_regular_session_turn(
-        &self,
-        session_id: &SessionId,
-        workspace_id: Option<&WorkspaceId>,
-    ) -> Option<QueuedRegularSessionTurn> {
-        let key = SessionTurnQueueKey::new(session_id, workspace_id);
-        let mut queues = self
-            .session_turn_queue
-            .lock()
-            .expect("session turn queue lock poisoned");
-        let queue = queues.get_mut(&key)?;
-        let next = queue.pop_front();
-        if queue.is_empty() {
-            queues.remove(&key);
+        let queue_len = queue.len();
+        if let Err(error) = self.persist_regular_session_turn_queues(&queues) {
+            let queue = queues
+                .get_mut(&session_id)
+                .expect("刚入队的 session 队列必须存在");
+            queue.pop_back();
+            if queue.is_empty() {
+                queues.remove(&session_id);
+            }
+            return Err(error);
         }
-        next
+        Ok(queue_len)
     }
 
-    pub(crate) fn queued_regular_session_turn_count(
+    pub(crate) fn peek_next_regular_session_turn(
         &self,
         session_id: &SessionId,
-        workspace_id: Option<&WorkspaceId>,
-    ) -> usize {
-        let key = SessionTurnQueueKey::new(session_id, workspace_id);
+    ) -> Option<QueuedRegularSessionTurn> {
         self.session_turn_queue
             .lock()
             .expect("session turn queue lock poisoned")
-            .get(&key)
+            .get(session_id)
+            .and_then(|queue| queue.front())
+            .cloned()
+    }
+
+    pub(crate) fn queued_regular_session_turns(
+        &self,
+        session_id: &SessionId,
+    ) -> Vec<QueuedRegularSessionTurn> {
+        self.session_turn_queue
+            .lock()
+            .expect("session turn queue lock poisoned")
+            .get(session_id)
+            .map(|queue| queue.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn remove_regular_session_turn(
+        &self,
+        session_id: &SessionId,
+        queue_id: &str,
+    ) -> Result<bool, ApiError> {
+        let mut queues = self
+            .session_turn_queue
+            .lock()
+            .expect("session turn queue lock poisoned");
+        let Some(queue) = queues.get_mut(session_id) else {
+            return Ok(false);
+        };
+        let Some(position) = queue.iter().position(|turn| turn.queue_id == queue_id) else {
+            return Ok(false);
+        };
+        let removed = queue
+            .remove(position)
+            .expect("已定位的 session turn 队列项必须存在");
+        if queue.is_empty() {
+            queues.remove(session_id);
+        }
+        if let Err(error) = self.persist_regular_session_turn_queues(&queues) {
+            let queue = queues.entry(session_id.clone()).or_default();
+            queue.insert(position.min(queue.len()), removed);
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn acknowledge_regular_session_turn(
+        &self,
+        session_id: &SessionId,
+        queue_id: &str,
+    ) -> Result<(), ApiError> {
+        let mut queues = self
+            .session_turn_queue
+            .lock()
+            .expect("session turn queue lock poisoned");
+        let Some(queue) = queues.get_mut(session_id) else {
+            return Ok(());
+        };
+        if !queue.front().is_some_and(|turn| turn.queue_id == queue_id) {
+            return Err(ApiError::internal_assembly(
+                "确认 session turn 队列消费失败",
+                "队首消息已变化",
+            ));
+        }
+        let acknowledged = queue.pop_front().expect("已确认队首存在");
+        if queue.is_empty() {
+            queues.remove(session_id);
+        }
+        if let Err(error) = self.persist_regular_session_turn_queues(&queues) {
+            queues
+                .entry(session_id.clone())
+                .or_default()
+                .push_front(acknowledged);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_regular_session_turn_retry(
+        &self,
+        session_id: &SessionId,
+        queue_id: &str,
+    ) -> Result<u8, ApiError> {
+        let mut queues = self
+            .session_turn_queue
+            .lock()
+            .expect("session turn queue lock poisoned");
+        let queue = queues.get_mut(session_id).ok_or_else(|| {
+            ApiError::internal_assembly("记录 session turn 重试失败", "session 队列不存在")
+        })?;
+        let turn = queue.front_mut().ok_or_else(|| {
+            ApiError::internal_assembly("记录 session turn 重试失败", "session 队列为空")
+        })?;
+        if turn.queue_id != queue_id {
+            return Err(ApiError::internal_assembly(
+                "记录 session turn 重试失败",
+                "队首消息已变化",
+            ));
+        }
+        let previous_retry_count = turn.retry_count;
+        turn.retry_count = turn.retry_count.saturating_add(1);
+        let retry_count = turn.retry_count;
+        if let Err(error) = self.persist_regular_session_turn_queues(&queues) {
+            queues
+                .get_mut(session_id)
+                .and_then(|queue| queue.front_mut())
+                .expect("重试计数更新期间队首必须存在")
+                .retry_count = previous_retry_count;
+            return Err(error);
+        }
+        Ok(retry_count)
+    }
+
+    pub(crate) fn queued_regular_session_turn_count(&self, session_id: &SessionId) -> usize {
+        self.session_turn_queue
+            .lock()
+            .expect("session turn queue lock poisoned")
+            .get(session_id)
             .map(VecDeque::len)
             .unwrap_or(0)
     }
 
-    /// 删除 session 时清空该 session 的全部队列键。不能只按当前 workspace 键删除，
-    /// 否则历史错误绑定或无 workspace 的排队消息会成为孤儿。
-    pub(crate) fn clear_all_regular_session_turn_queues(&self, session_id: &SessionId) -> usize {
+    pub(crate) fn queued_regular_session_ids(&self) -> Vec<SessionId> {
+        self.session_turn_queue
+            .lock()
+            .expect("session turn queue lock poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn clear_all_regular_session_turn_queues(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<usize, ApiError> {
         let mut queues = self
             .session_turn_queue
             .lock()
             .expect("session turn queue lock poisoned");
-        let mut removed = 0usize;
-        queues.retain(|key, queue| {
-            if &key.session_id == session_id {
-                removed = removed.saturating_add(queue.len());
-                false
-            } else {
-                true
+        let removed = queues.remove(session_id).unwrap_or_default();
+        let removed_count = removed.len();
+        if let Err(error) = self.persist_regular_session_turn_queues(&queues) {
+            if !removed.is_empty() {
+                queues.insert(session_id.clone(), removed);
             }
-        });
-        removed
+            return Err(error);
+        }
+        Ok(removed_count)
     }
 
     /// 会话删除的唯一资源回收入口。先停止并等待后台 runner，再删除所有运行态与
@@ -1982,6 +2191,7 @@ impl ApiState {
         &self,
         session_id: &SessionId,
     ) -> Result<(), ApiError> {
+        let _session_turn_guard = self.lock_session_turn(session_id).await;
         let manager = self.runner_manager();
         let _session_lifecycle_guard = match manager {
             Some(manager) => Some(manager.lock_session_lifecycle(session_id).await),
@@ -1996,7 +2206,7 @@ impl ApiState {
         self.settings_store
             .remove_session(session_id)
             .map_err(crate::errors::settings_persistence_error)?;
-        self.clear_all_regular_session_turn_queues(session_id);
+        self.clear_all_regular_session_turn_queues(session_id)?;
 
         let mut mission_ids = HashSet::new();
         if let Some(thread) = self
@@ -2047,7 +2257,14 @@ impl ApiState {
         self.conversation_registry.remove_session(session_id);
         self.session_store
             .delete_session(session_id)
-            .map_err(|error| ApiError::internal_assembly("删除会话失败", error))
+            .map_err(|error| ApiError::internal_assembly("删除会话失败", error))?;
+        drop(_session_lifecycle_guard);
+        drop(_session_turn_guard);
+        self.session_turn_locks
+            .lock()
+            .expect("session turn locks should hold")
+            .remove(session_id);
+        Ok(())
     }
 
     pub fn with_model_bridge_client(mut self, client: Arc<dyn ModelBridgeClient>) -> Self {
@@ -2086,7 +2303,7 @@ impl ApiState {
     }
 
     pub fn runner_manager(&self) -> Option<&RunnerManager> {
-        self.runner_manager.as_ref()
+        self.runner_manager.as_deref()
     }
 
     pub fn mcp_connections(&self) -> &Arc<RwLock<HashMap<String, Arc<McpServerClient>>>> {
@@ -2521,6 +2738,48 @@ mod tests {
             args,
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn queued_turn_fixture(
+        session_id: &SessionId,
+        workspace_id: &WorkspaceId,
+        queue_id: &str,
+        accepted_at: u64,
+    ) -> QueuedRegularSessionTurn {
+        QueuedRegularSessionTurn {
+            request: SessionTurnRequestDto {
+                session_id: Some(session_id.to_string()),
+                workspace_id: Some(workspace_id.to_string()),
+                workspace_path: None,
+                text: Some(format!("queued {queue_id}")),
+                skill_name: None,
+                locale: None,
+                goal_mode: false,
+                images: Vec::new(),
+                context_references: Vec::new(),
+                access_profile: None,
+                orchestrator_session_config: None,
+                request_id: Some(format!("request-{queue_id}")),
+                user_message_id: Some(format!("user-{queue_id}")),
+                placeholder_message_id: Some(format!("assistant-{queue_id}")),
+                steer_current_turn: false,
+                expected_turn_id: None,
+                replace_turn_id: None,
+            },
+            requested_workspace_id: workspace_id.clone(),
+            accepted_at: UtcMillis(accepted_at),
+            route: SessionTurnRouteDto::Chat,
+            task_title: None,
+            execution_goal: None,
+            task_tier: TaskTier::ExecutionChain,
+            tool_intent: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            session_id: session_id.clone(),
+            workspace_id: Some(workspace_id.clone()),
+            queue_id: queue_id.to_string(),
+            retry_count: 0,
+        }
     }
 
     #[tokio::test]
@@ -3153,6 +3412,157 @@ mod tests {
         assert_eq!(context.git.desired_ref.as_deref(), Some("main"));
         assert_eq!(context.git.base_head.as_deref(), Some("abc123"));
         assert_eq!(context.context_revision, 1);
+    }
+
+    #[test]
+    fn regular_session_turn_queue_round_trips_with_acknowledge_and_retry_state() {
+        let root = tempfile::tempdir().expect("state root");
+        let persistence = || {
+            Arc::new(RuntimeStatePersistence::new(
+                root.path().join("sessions.json"),
+                root.path().join("workspaces.json"),
+                root.path().join("knowledge.json"),
+            ))
+        };
+        let session_store = Arc::new(SessionStore::default());
+        let session_id = SessionId::new("session-turn-queue-persistence");
+        let workspace_id = WorkspaceId::new("workspace-turn-queue-persistence");
+        session_store
+            .create_session(session_id.clone(), "queue persistence")
+            .expect("session should create");
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::clone(&session_store),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_runtime_persistence(persistence());
+        state
+            .enqueue_regular_session_turn(queued_turn_fixture(
+                &session_id,
+                &workspace_id,
+                "queue-first",
+                11,
+            ))
+            .expect("first turn should persist");
+        state
+            .enqueue_regular_session_turn(queued_turn_fixture(
+                &session_id,
+                &workspace_id,
+                "queue-second",
+                12,
+            ))
+            .expect("second turn should persist");
+
+        let restored = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::clone(&session_store),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_runtime_persistence(persistence());
+        assert_eq!(restored.restore_regular_session_turn_queues().unwrap(), 2);
+        assert_eq!(restored.queued_regular_session_turns(&session_id).len(), 2);
+        assert!(
+            restored
+                .remove_regular_session_turn(&session_id, "queue-second")
+                .expect("queued turn removal should persist")
+        );
+        assert_eq!(restored.queued_regular_session_turns(&session_id).len(), 1);
+        restored
+            .enqueue_regular_session_turn(queued_turn_fixture(
+                &session_id,
+                &workspace_id,
+                "queue-second",
+                12,
+            ))
+            .expect("removed turn should be re-enqueued for retry coverage");
+        assert_eq!(
+            restored
+                .peek_next_regular_session_turn(&session_id)
+                .expect("restored queue should have a head")
+                .queue_id,
+            "queue-first"
+        );
+        restored
+            .acknowledge_regular_session_turn(&session_id, "queue-first")
+            .expect("acknowledgement should persist");
+        assert_eq!(
+            restored
+                .record_regular_session_turn_retry(&session_id, "queue-second")
+                .expect("retry should persist"),
+            1
+        );
+
+        let reloaded = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            session_store,
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_runtime_persistence(persistence());
+        assert_eq!(reloaded.restore_regular_session_turn_queues().unwrap(), 1);
+        let remaining = reloaded
+            .peek_next_regular_session_turn(&session_id)
+            .expect("second turn should remain persisted");
+        assert_eq!(remaining.queue_id, "queue-second");
+        assert_eq!(remaining.retry_count, 1);
+    }
+
+    #[test]
+    fn regular_session_turn_queue_restore_removes_archived_session_entries_from_disk() {
+        let root = tempfile::tempdir().expect("state root");
+        let persistence = || {
+            Arc::new(RuntimeStatePersistence::new(
+                root.path().join("sessions.json"),
+                root.path().join("workspaces.json"),
+                root.path().join("knowledge.json"),
+            ))
+        };
+        let session_store = Arc::new(SessionStore::default());
+        let session_id = SessionId::new("session-turn-queue-archived");
+        let workspace_id = WorkspaceId::new("workspace-turn-queue-archived");
+        session_store
+            .create_session(session_id.clone(), "archived queue")
+            .expect("session should create");
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::clone(&session_store),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_runtime_persistence(persistence());
+        state
+            .enqueue_regular_session_turn(queued_turn_fixture(
+                &session_id,
+                &workspace_id,
+                "queue-archived",
+                21,
+            ))
+            .expect("queued turn should persist");
+        session_store
+            .archive_session(&session_id)
+            .expect("session should archive");
+
+        let restored = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            session_store,
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_runtime_persistence(persistence());
+        assert_eq!(restored.restore_regular_session_turn_queues().unwrap(), 0);
+        let persisted: Vec<QueuedRegularSessionTurn> = serde_json::from_slice(
+            &fs::read(root.path().join("session-turn-queue.json"))
+                .expect("cleaned queue file should exist"),
+        )
+        .expect("cleaned queue file should parse");
+        assert!(persisted.is_empty());
     }
 
     #[tokio::test]

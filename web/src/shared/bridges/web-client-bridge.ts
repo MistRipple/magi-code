@@ -40,6 +40,7 @@ import {
   getAgentFilePreview,
   getAgentProjectKnowledge,
   getAgentNotifications,
+  getAgentSessionTurnQueue,
   getWorkspaceSessions,
   continueAgentSession,
   interruptAgentSession,
@@ -52,6 +53,7 @@ import {
   refreshAgentRepository,
   reindexAgentProjectKnowledge,
   removeAgentNotification,
+  removeAgentSessionTurnQueueItem,
   resolveAgentNotification,
   removeAgentInstalledSkill,
   renameAgentSession,
@@ -129,12 +131,10 @@ import {
   applySessionPlanSnapshot,
   refreshCurrentGoal,
 } from '../../stores/goal-store.svelte';
-import type { SessionPlanDto } from '../rust-backend-types';
+import type { QueuedSessionTurnDto, SessionPlanDto } from '../rust-backend-types';
 import { turnStoreState } from '../../stores/turn-store.svelte';
 import { sanitizeSvgContent } from '../svg-sanitizer';
 import {
-  dequeueQueuedMessage,
-  enqueueQueuedMessage,
   messagesState,
   allocateTurnOrderSeq,
   addPendingRequest,
@@ -146,13 +146,11 @@ import {
   createRequestBinding,
   setCurrentSessionId,
   setQueuedMessages,
-  removeQueuedMessage,
   setOrchestratorRuntimeState,
   updateRequestBinding,
 } from '../../stores/messages.svelte';
 import { resolveModelListFetchBlockReason } from '../model-governance';
 import type { OrchestratorRuntimeSnapshot, QueuedMessage } from '../../types/message';
-import { canGuideQueuedMessage, queuedMessageText } from '../../lib/queued-message-guidance';
 import { copyOrchestratorSessionConfig } from '../orchestrator-session-config';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
@@ -165,14 +163,9 @@ let currentSessionId = '';
 let currentInterruptTaskId = '';
 let continueRequestId = '';
 let currentRuntimeEpoch = '';
-const guidingQueuedMessageIds = new Set<string>();
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
 let cachedSettingsBootstrapBindingKey = '';
-const QUEUE_DRAIN_DELAY_MS = 120;
-const QUEUE_DRAIN_BUSY_RETRY_MS = 1000;
-let queueDrainTimer: ReturnType<typeof setTimeout> | null = null;
-let queueDrainActive = false;
 
 function localOptimisticSessionIdForRequest(requestId: string): string {
   const safeRequestId = requestId.replace(/[^A-Za-z0-9_-]/g, '-');
@@ -251,7 +244,6 @@ const EVENT_STREAM_TUNNEL_BUSY_REFRESH_INTERVAL_MS = 2_000;
 const EVENT_STREAM_TUNNEL_IDLE_TIMEOUT_MS = 30_000;
 const EVENT_STREAM_TUNNEL_IDLE_CHECK_INTERVAL_MS = 1_000;
 const EXTERNAL_SESSION_SUMMARY_EVENTS = new Set([
-  'session.turn.accepted',
   'session.turn.task.accepted',
   'session.turn.completed',
   'session.turn.failed',
@@ -748,7 +740,6 @@ function emitForcedProcessingIdle(reason: string, extra?: Record<string, unknown
     timestamp: Date.now(),
     ...(extra || {}),
   });
-  scheduleQueuedTurnDrain('forced_idle');
 }
 
 function refreshBootstrapAfterTerminalTurn(reason: string): void {
@@ -1660,6 +1651,27 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
 
+  if (eventType === 'session.turn.queued') {
+    void syncSessionTurnQueue().catch((error) => {
+      reportExpectedRecoveryFailure(
+        i18n.t('bridge.action.syncMessages'),
+        '[web-client-bridge] 排队事件后同步队列失败:',
+        error,
+      );
+    });
+    return;
+  }
+
+  if (eventType === 'session.turn.task.accepted') {
+    void syncSessionTurnQueue().catch((error) => {
+      reportExpectedRecoveryFailure(
+        i18n.t('bridge.action.syncMessages'),
+        '[web-client-bridge] 排队消息接受后同步队列失败:',
+        error,
+      );
+    });
+  }
+
   if (eventType === 'session.context.usage.updated') {
     applyContextBudgetRuntimeEvent(event);
     return;
@@ -1748,7 +1760,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     return;
   }
 
-  if ((eventType === 'session.turn.accepted' || eventType === 'session.turn.task.accepted') && event.payload) {
+  if (eventType === 'session.turn.task.accepted' && event.payload) {
     const acceptedSessionId = trimBridgeString(event.payload.session_id)
       || trimBridgeString(event.payload.sessionId)
       || trimBridgeString(event.session_id);
@@ -1763,7 +1775,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
         sessionId: acceptedSessionId,
         workspaceId: acceptedWorkspaceId,
         createdSession: acceptedCreatedSession,
-        route: event.payload.route ?? (eventType === 'session.turn.task.accepted' ? 'task' : ''),
+        route: event.payload.route ?? 'task',
       });
     }
     const canonicalEvent = parseCanonicalTurnEventPayload(event.payload, {
@@ -2379,11 +2391,6 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
   });
   clearCurrentInterruptTaskId();
   clearAgentRunProjection();
-  if (queueDrainTimer) {
-    clearTimeout(queueDrainTimer);
-    queueDrainTimer = null;
-  }
-  queueDrainActive = false;
 
   const currentUrl = getCurrentUrl();
   if (!currentUrl) {
@@ -2739,6 +2746,11 @@ async function dispatchBootstrap(
     hasMoreBefore: pageMeta.hasMoreBefore,
     beforeCursor: pageMeta.beforeCursor,
   } as Record<string, unknown>);
+  await syncSessionTurnQueue(
+    payload.sessionId,
+    payload.workspace.workspaceId,
+    payload.workspace.rootPath,
+  );
   void ensureEventStream({
     forceReconnect: options.forceEventStreamReconnect === true,
     waitUntilOpen: false,
@@ -2759,9 +2771,6 @@ async function dispatchBootstrap(
     ).catch((error) => {
       console.warn('[web-client-bridge] Auto-connect agent-run tracking on bootstrap failed (non-critical):', error);
     });
-  }
-  if ((payload.state as { isProcessing?: boolean } | undefined)?.isProcessing !== true) {
-    scheduleQueuedTurnDrain('bootstrap_idle');
   }
   if (settingsBindingChanged && options.refreshSettingsBootstrapOnBindingChange !== false) {
     refreshSettingsBootstrapForCurrentWorkspace('bootstrap_binding_changed');
@@ -3225,7 +3234,7 @@ interface ExecuteTaskInput {
   goalMode?: boolean;
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
-  followUpMode?: 'queue' | 'guide';
+  followUpMode?: 'queue';
   replaceTurnId?: string | null;
   images: Array<{
     name: string;
@@ -3250,194 +3259,69 @@ function bridgeRuntimeIsBusy(): boolean {
   );
 }
 
-function activeCanonicalTurnIdForSession(sessionId: string): string {
-  const normalizedSessionId = trimBridgeString(sessionId);
-  if (!normalizedSessionId || turnStoreState.reducer.sessionId !== normalizedSessionId) {
-    return '';
-  }
-  for (let index = turnStoreState.reducer.turns.length - 1; index >= 0; index -= 1) {
-    const turn = turnStoreState.reducer.turns[index];
-    if (turn && (turn.status === 'running' || turn.status === 'pending')) {
-      return turn.turnId;
-    }
-  }
-  return '';
-}
-
-async function steerActiveSessionTurn(input: {
-  text: string;
-  requestId: string;
-  workspaceId: string;
-  workspacePath: string;
-  sessionId: string;
-  accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
-}): Promise<boolean> {
-  let expectedTurnId = activeCanonicalTurnIdForSession(input.sessionId);
-  if (!expectedTurnId) {
-    throw new Error(i18n.t('input.followUp.activeTurnUnavailable'));
-  }
-  try {
-    await warmLiveBridgeForSubmission('steer_active_turn_preflight');
-  } catch (preflightError) {
-    if (!input.workspaceId) {
-      throw preflightError;
-    }
-    console.warn('[web-client-bridge] 引导发送前事件流预连接失败，继续提交:', preflightError);
-  }
-  const userMessageId = generateMessageId();
-  let retriedAfterTurnMismatch = false;
-  while (true) {
-    try {
-      const turnResult = await submitSessionTurn({
-        text: input.text,
-        images: [],
-        accessProfile: input.accessProfile ?? null,
-        requestId: input.requestId,
-        userMessageId,
-        steerCurrentTurn: true,
-        expectedTurnId,
-      }, {
-        workspaceId: input.workspaceId,
-        workspacePath: input.workspacePath,
-        sessionId: input.sessionId,
-      });
-      if (turnResult.steeredTurnId !== expectedTurnId) {
-        throw new Error(i18n.t('input.followUp.activeTurnUnavailable'));
-      }
-      emitAcceptedCanonicalTurnFromResult(turnResult);
-      return true;
-    } catch (error) {
-      const retryTurnId = error instanceof AgentApiError
-        && error.status === 409
-        && error.errorCode === 'TURN_CONFLICT'
-        && error.conflictKind === 'expected_turn_mismatch'
-        && typeof error.activeTurnId === 'string'
-        && error.activeTurnId !== expectedTurnId
-        && !retriedAfterTurnMismatch
-        ? error.activeTurnId
-        : '';
-      if (!retryTurnId) {
-        throw error;
-      }
-      expectedTurnId = retryTurnId;
-      retriedAfterTurnMismatch = true;
-    }
-  }
-}
-
-async function guideQueuedMessage(queuedMessageId: string): Promise<void> {
-  const normalizedId = queuedMessageId.trim();
-  if (!normalizedId || guidingQueuedMessageIds.has(normalizedId)) return;
-  const queued = messagesState.queuedMessages.find((message) => message.id === normalizedId);
-  if (!queued || !canGuideQueuedMessage(queued)) return;
-
-  const sessionId = trimBridgeString(queued.sessionId) || currentSessionId;
-  if (!sessionId) return;
-  guidingQueuedMessageIds.add(normalizedId);
-  try {
-    await steerActiveSessionTurn({
-      text: queuedMessageText(queued),
-      requestId: queued.requestId || queued.id,
-      workspaceId: trimBridgeString(queued.workspaceId) || currentWorkspaceId,
-      workspacePath: trimBridgeString(queued.workspacePath) || currentWorkspacePath,
-      sessionId,
-      accessProfile: queued.accessProfile ?? null,
-    });
-    removeQueuedMessage(normalizedId);
-  } catch (error) {
-    emitBridgeErrorToast(i18n.t('input.queue.guide'), error);
-  } finally {
-    guidingQueuedMessageIds.delete(normalizedId);
-  }
-}
-
-function enqueueFollowUpTurn(input: ExecuteTaskInput, normalizedText: string): void {
-  const workspaceScope = resolveWorkspaceScopeFromSource(input);
-  const queued: QueuedMessage = {
-    id: input.requestId || generateMessageId(),
-    requestId: input.requestId,
-    content: normalizedText || input.skillName || i18n.t('bridge.detail.followUpMessage'),
-    text: input.text ?? null,
-    workspaceId: workspaceScope.workspaceId,
-    workspacePath: workspaceScope.workspacePath,
-    sessionId: hasBridgeField(input, 'sessionId')
-      ? trimBridgeString(input.sessionId)
-      : (workspaceScope.hasWorkspaceOverride ? '' : currentSessionId),
-    createdAt: Date.now(),
-    skillName: input.skillName ?? null,
-    goalMode: input.goalMode === true,
-    accessProfile: input.accessProfile ?? null,
-    images: input.images,
-    contextReferences: input.contextReferences ?? [],
+function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
+  return {
+    id: turn.queueId,
+    requestId: turn.requestId?.trim() || turn.queueId,
+    content: turn.content,
+    text: turn.text ?? null,
+    workspaceId: turn.workspaceId,
+    workspacePath: turn.workspacePath?.trim() || undefined,
+    sessionId: turn.sessionId,
+    createdAt: turn.acceptedAt,
+    skillName: turn.skillName ?? null,
+    goalMode: turn.goalMode === true,
+    accessProfile: turn.accessProfile ?? null,
+    images: turn.images,
+    contextReferences: turn.contextReferences,
   };
-  enqueueQueuedMessage(queued);
-  scheduleQueuedTurnDrain('enqueue_follow_up', QUEUE_DRAIN_BUSY_RETRY_MS);
 }
 
-function scheduleQueuedTurnDrain(reason: string, delayMs = QUEUE_DRAIN_DELAY_MS): void {
-  if (queueDrainTimer) {
-    clearTimeout(queueDrainTimer);
-  }
-  queueDrainTimer = setTimeout(() => {
-    queueDrainTimer = null;
-    void drainQueuedTurns(reason);
-  }, delayMs);
+function applyServerQueuedTurns(turns: QueuedSessionTurnDto[]): void {
+  setQueuedMessages(turns.map(queuedMessageFromServer));
 }
 
-async function drainQueuedTurns(reason: string): Promise<void> {
-  if (queueDrainActive) {
+async function syncSessionTurnQueue(
+  sessionId = currentSessionId,
+  workspaceId = currentWorkspaceId,
+  workspacePath = currentWorkspacePath,
+): Promise<void> {
+  const normalizedSessionId = trimBridgeString(sessionId);
+  if (!normalizedSessionId) {
+    setQueuedMessages([]);
     return;
   }
-  if (bridgeRuntimeIsBusy()) {
-    if (messagesState.queuedMessages.length > 0) {
-      scheduleQueuedTurnDrain(`${reason}:busy_retry`, QUEUE_DRAIN_BUSY_RETRY_MS);
-    }
+  const snapshot = await getAgentSessionTurnQueue(normalizedSessionId, {
+    workspaceId,
+    workspacePath,
+    sessionId: normalizedSessionId,
+  });
+  if (currentSessionId !== normalizedSessionId) {
     return;
   }
-  const firstQueuedMessage = messagesState.queuedMessages[0];
-  if (firstQueuedMessage && guidingQueuedMessageIds.has(firstQueuedMessage.id)) {
-    scheduleQueuedTurnDrain(`${reason}:guidance_in_flight`, QUEUE_DRAIN_BUSY_RETRY_MS);
-    return;
-  }
-  const next = dequeueQueuedMessage();
-  if (!next) {
-    return;
-  }
-  queueDrainActive = true;
-  let shouldScheduleNextDrain = true;
+  applyServerQueuedTurns(snapshot.queuedTurns);
+}
+
+async function removeQueuedMessageFromServer(queuedMessageId: string): Promise<void> {
+  const normalizedId = queuedMessageId.trim();
+  if (!normalizedId || !currentSessionId) return;
   try {
-    const submitted = await executeTask({
-      text: next.text ?? next.content,
-      requestId: next.requestId || next.id,
-      workspaceId: next.workspaceId,
-      workspacePath: next.workspacePath,
-      sessionId: next.sessionId,
-      skillName: next.skillName ?? null,
-      goalMode: next.goalMode === true,
-      accessProfile: next.accessProfile ?? null,
-      images: next.images ?? [],
-      contextReferences: next.contextReferences ?? [],
-    });
-    if (!submitted) {
-      restoreQueuedTurnToFront(next);
-      shouldScheduleNextDrain = false;
+    const snapshot = await removeAgentSessionTurnQueueItem(
+      currentSessionId,
+      normalizedId,
+      {
+        workspaceId: currentWorkspaceId,
+        workspacePath: currentWorkspacePath,
+        sessionId: currentSessionId,
+      },
+    );
+    if (snapshot.sessionId === currentSessionId) {
+      applyServerQueuedTurns(snapshot.queuedTurns);
     }
-  } finally {
-    queueDrainActive = false;
-    if (shouldScheduleNextDrain && messagesState.queuedMessages.length > 0) {
-      scheduleQueuedTurnDrain('after_queued_turn_submit', QUEUE_DRAIN_BUSY_RETRY_MS);
-    }
+  } catch (error) {
+    emitBridgeErrorToast(i18n.t('input.queue.delete'), error);
+    await syncSessionTurnQueue().catch(() => {});
   }
-}
-
-function restoreQueuedTurnToFront(queued: QueuedMessage): void {
-  const exists = messagesState.queuedMessages.some((message) => (
-    message.id === queued.id || (queued.requestId && message.requestId === queued.requestId)
-  ));
-  if (exists) {
-    return;
-  }
-  setQueuedMessages([queued, ...messagesState.queuedMessages]);
 }
 
 function scheduleLocalTurnProjection(work: () => boolean): Promise<boolean> {
@@ -3501,41 +3385,8 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   if (!normalizedText && !skillName && images.length === 0 && contextReferences.length === 0) {
     return false;
   }
-  if (input.followUpMode === 'guide') {
-    if (!bridgeRuntimeIsBusy() || !targetSessionId) {
-      throw new Error(i18n.t('input.followUp.activeTurnUnavailable'));
-    }
-    if (
-      !normalizedText
-      || skillName
-      || input.goalMode === true
-      || images.length > 0
-      || contextReferences.length > 0
-    ) {
-      throw new Error(i18n.t('input.followUp.guideTextOnly'));
-    }
-    return await steerActiveSessionTurn({
-      text: normalizedText,
-      requestId: input.requestId || generateMessageId(),
-      workspaceId: targetWorkspaceId,
-      workspacePath: targetWorkspacePath,
-      sessionId: targetSessionId,
-      accessProfile: input.accessProfile ?? null,
-    });
-  }
-  if (input.followUpMode === 'queue' && bridgeRuntimeIsBusy() && !queueDrainActive) {
-    enqueueFollowUpTurn(
-      { ...input, skillName, images, contextReferences },
-      normalizedText,
-    );
-    return true;
-  }
-
   const requestId = input.requestId || generateMessageId();
-  const isQueuedDrainSubmission = queueDrainActive && Boolean(input.requestId);
-  const userMessageId = isQueuedDrainSubmission
-    ? `queued-user-${requestId}`
-    : generateMessageId();
+  const userMessageId = generateMessageId();
   const placeholderMessageId = `assistant-placeholder-${requestId}`;
   const turnOrderSeq = allocateTurnOrderSeq();
   const requestCreatedAt = Date.now();
@@ -3621,6 +3472,16 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     if (resolvedSessionId) {
       persistWorkspaceBinding(targetWorkspaceId, targetWorkspacePath, resolvedSessionId);
     }
+    if (turnResult.queued) {
+      clearPendingRequest(requestId);
+      clearRequestBinding(requestId);
+      await fetchBootstrap({ forceFresh: true });
+      emitBridgeSuccessToast(
+        i18n.t('bridge.action.sendMessage'),
+        i18n.t('input.queue.header', { count: turnResult.queuePosition ?? 1 }),
+      );
+      return true;
+    }
     if (replaceTurnId) {
       emitLocalSupersededCanonicalTurn(replaceTurnId, turnResult.acceptedAt);
     }
@@ -3698,7 +3559,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       closeEventStream();
       scheduleRecovery('execute_task_failed', error, true);
     }
-    return !isQueuedDrainSubmission ? false : true;
+    return false;
   }
 }
 
@@ -3714,7 +3575,13 @@ async function interruptTask(): Promise<void> {
     return;
   }
   try {
-    await interruptAgentSession(sessionId);
+    const response = await interruptAgentSession(sessionId);
+    const clearedQueuedTurnCount = typeof response.clearedQueuedTurnCount === 'number'
+      ? response.clearedQueuedTurnCount
+      : 0;
+    if (clearedQueuedTurnCount > 0 || messagesState.queuedMessages.length > 0) {
+      setQueuedMessages([]);
+    }
     clearActiveTurnInFlight();
     emitForcedProcessingIdle('user_interrupt_confirmed', { trigger, sessionId });
   } catch (error) {
@@ -4772,9 +4639,7 @@ export function createWebClientBridge(): ClientBridge {
                 && !Array.isArray(message.orchestratorSessionConfig)
                 ? message.orchestratorSessionConfig as Record<string, unknown>
                 : null,
-              followUpMode: message.followUpMode === 'queue' || message.followUpMode === 'guide'
-                ? message.followUpMode
-                : undefined,
+              followUpMode: message.followUpMode === 'queue' ? 'queue' : undefined,
               replaceTurnId: typeof message.replaceTurnId === 'string' ? message.replaceTurnId : null,
               images: Array.isArray(message.images)
                 ? message.images as Array<{ name: string; dataUrl: string }>
@@ -4790,9 +4655,9 @@ export function createWebClientBridge(): ClientBridge {
             });
           }
           return;
-        case 'guideQueuedMessage':
+        case 'removeQueuedMessage':
           if (typeof message.queuedMessageId === 'string') {
-            void guideQueuedMessage(message.queuedMessageId);
+            void removeQueuedMessageFromServer(message.queuedMessageId);
           }
           return;
         case 'interruptTask':

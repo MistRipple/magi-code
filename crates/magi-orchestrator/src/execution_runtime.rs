@@ -402,6 +402,15 @@ impl OrchestratedExecutionRuntime {
                         message,
                     }
                 }
+                DomainError::CurrentTurnConflict {
+                    session_id,
+                    active_turn_id,
+                } => OrchestratorCommandError::TaskStateViolation {
+                    task_id: report.task_id.clone(),
+                    message: format!(
+                        "session {session_id} already has active turn {active_turn_id}"
+                    ),
+                },
             })?;
         let assignment_id = execution_overview::assignment_id_for_task(
             &self.task_store,

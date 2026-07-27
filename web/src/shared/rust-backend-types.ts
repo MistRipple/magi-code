@@ -76,6 +76,34 @@ export interface SessionTurnResponseDto {
   steeredTurnId?: string | null;
 }
 
+export interface QueuedSessionTurnDto {
+  queueId: string;
+  queuePosition: number;
+  requestId?: string | null;
+  sessionId: string;
+  workspaceId: string;
+  workspacePath?: string | null;
+  acceptedAt: number;
+  content: string;
+  text?: string | null;
+  skillName?: string | null;
+  goalMode: boolean;
+  accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
+  images: SessionTurnImageDto[];
+  contextReferences: Array<{
+    kind: 'file' | 'directory';
+    path: string;
+    pathRef?: string;
+    name: string;
+  }>;
+  retryCount: number;
+}
+
+export interface SessionTurnQueueResponseDto {
+  sessionId: string;
+  queuedTurns: QueuedSessionTurnDto[];
+}
+
 export interface TaskInterruptResponseDto {
   interrupted: boolean;
   sessionId: string;
@@ -124,6 +152,7 @@ export interface SessionInterruptResponseDto {
   turnId?: string | null;
   eventId: string;
   requestedAt: number;
+  clearedQueuedTurnCount: number;
   removedTimelineEntryIds: string[];
 }
 

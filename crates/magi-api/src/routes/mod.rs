@@ -89,8 +89,6 @@ use crate::{
 #[cfg(test)]
 use conversation_bridge::begin_session_turn;
 use conversation_bridge::{finalize_session_turn, ingest_user_input_to_conversation};
-#[cfg(test)]
-use dispatch_flow::resolve_dispatch_session;
 use dispatch_flow::{
     SessionTaskSubmissionInput, accept_goal_continuation_task_submission,
     accept_session_task_submission_at, append_dispatch_assistant_message,

@@ -613,11 +613,9 @@ fn reject_conflicting_active_current_turn(
     if incoming_turn_id == Some(existing_turn.turn_id.as_str()) {
         return Ok(());
     }
-    Err(DomainError::InvalidState {
-        message: format!(
-            "session {} already has active current_turn {}",
-            session_id, existing_turn.turn_id
-        ),
+    Err(DomainError::CurrentTurnConflict {
+        session_id: session_id.to_string(),
+        active_turn_id: existing_turn.turn_id.clone(),
     })
 }
 
