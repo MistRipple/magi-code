@@ -49,12 +49,13 @@ impl StateRepository {
         }
 
         let durable = self.load_session_durable_state()?;
-        let (global_state, workspace_states) = durable.partition_by_workspace();
+        let (mut global_state, workspace_states) = durable.partition_by_workspace();
         let rejected_workspace_session_count: usize = workspace_states
             .values()
             .map(|state| state.sessions.len())
             .sum();
         if rejected_workspace_session_count > 0 {
+            global_state.clear_current_session_if_owned_by_workspace_states(&workspace_states);
             warn!(
                 rejected_workspace_session_count,
                 "清理全局 sessions.json 中错误归属的 workspace 会话；workspace 会话必须只从工作区 .magi/sessions.json 加载"
@@ -291,40 +292,42 @@ impl RuntimeSidecarPersistence {
     }
 
     fn save_session_durable_state(&self) -> Result<(), DaemonError> {
-        let durable = self.session_store.durable_state();
-        let (global_state, mut workspace_states) = durable.partition_by_workspace();
-        for workspace in self.workspace_store.workspaces() {
-            let workspace_id = workspace.workspace_id.to_string();
-            let workspace_state = workspace_states.remove(&workspace_id).unwrap_or_default();
-            self.state_repository.save_workspace_session_state(
-                workspace.native_root_path().as_path(),
-                &workspace_state,
-            )?;
-        }
-
-        let orphan_session_count: usize = workspace_states
-            .values()
-            .map(|state| state.sessions.len())
-            .sum();
-        if orphan_session_count > 0 {
-            warn!(
-                orphan_session_count,
-                "跳过未注册 workspace 的会话持久化；workspace 绑定会话必须写入对应工作区状态"
-            );
-        }
-
-        let global_path = self.state_repository.session_durable_state_path();
-        if global_state.is_empty() {
-            match fs::remove_file(&global_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+        self.session_store.persist_durable_state_with(|durable| {
+            let (mut global_state, mut workspace_states) = durable.partition_by_workspace();
+            for workspace in self.workspace_store.workspaces() {
+                let workspace_id = workspace.workspace_id.to_string();
+                let workspace_state = workspace_states.remove(&workspace_id).unwrap_or_default();
+                self.state_repository.save_workspace_session_state(
+                    workspace.native_root_path().as_path(),
+                    &workspace_state,
+                )?;
             }
-        } else {
-            self.state_repository
-                .save_session_durable_state(&global_state)?;
-        }
-        Ok(())
+
+            let orphan_session_count: usize = workspace_states
+                .values()
+                .map(|state| state.sessions.len())
+                .sum();
+            if orphan_session_count > 0 {
+                global_state.clear_current_session_if_owned_by_workspace_states(&workspace_states);
+                warn!(
+                    orphan_session_count,
+                    "跳过未注册 workspace 的会话持久化；workspace 绑定会话必须写入对应工作区状态"
+                );
+            }
+
+            let global_path = self.state_repository.session_durable_state_path();
+            if global_state.is_empty() {
+                match fs::remove_file(&global_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                self.state_repository
+                    .save_session_durable_state(&global_state)?;
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn flush_runtime_sidecars(&self) -> Result<RuntimeSidecarFlushReport, DaemonError> {

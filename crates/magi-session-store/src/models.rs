@@ -930,6 +930,23 @@ impl SessionDurableState {
         self.plans.extend(other.plans);
     }
 
+    pub fn clear_current_session_if_owned_by_workspace_states(
+        &mut self,
+        workspace_states: &HashMap<String, SessionDurableState>,
+    ) {
+        let Some(current_session_id) = self.current_session_id.as_ref() else {
+            return;
+        };
+        if workspace_states.values().any(|state| {
+            state
+                .sessions
+                .iter()
+                .any(|session| &session.session_id == current_session_id)
+        }) {
+            self.current_session_id = None;
+        }
+    }
+
     pub fn partition_by_workspace(
         &self,
     ) -> (SessionDurableState, HashMap<String, SessionDurableState>) {
@@ -975,10 +992,9 @@ impl SessionDurableState {
         }
 
         let mut global_state = SessionDurableState {
-            current_session_id: self
-                .current_session_id
-                .clone()
-                .filter(|session_id| global_session_ids.contains(session_id)),
+            // 当前打开的会话是 daemon 级唯一导航选择，不属于任一 workspace 的业务历史。
+            // 统一写入全局状态，避免多个 workspace 文件各自携带旧选择并在重启时互相覆盖。
+            current_session_id: self.current_session_id.clone(),
             sessions: global_sessions,
             timeline: Vec::new(),
             canonical_turns: Vec::new(),
@@ -1084,19 +1100,6 @@ impl SessionDurableState {
                         .expect("workspace durable state should exist")
                         .plans
                         .push(plan.clone());
-                    break;
-                }
-            }
-        }
-
-        if let Some(current_session_id) = self.current_session_id.as_ref() {
-            for state in workspace_states.values_mut() {
-                if state
-                    .sessions
-                    .iter()
-                    .any(|session| &session.session_id == current_session_id)
-                {
-                    state.current_session_id = Some(current_session_id.clone());
                     break;
                 }
             }

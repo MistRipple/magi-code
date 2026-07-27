@@ -2555,6 +2555,91 @@ async fn workspace_sessions_and_events_stay_workspace_scoped() {
 }
 
 #[tokio::test]
+async fn restart_restores_last_selected_workspace_session() {
+    let state_root = temp_state_root("e2e-last-selected-session-restart");
+    let second_workspace_root = temp_state_root("e2e-last-selected-session-restart-second");
+    let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root);
+    let runtime = DaemonRuntime::restore_with_test_fixture(&config)
+        .expect("runtime restore should load explicit test fixture");
+    let (app, _state) = runtime.router_with_state_for_tests("daemon-test".to_string());
+
+    let (register_status, register_body) = post_json(
+        app.clone(),
+        "/api/workspaces/register",
+        json!({ "path": second_workspace_root.to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(
+        register_status,
+        StatusCode::OK,
+        "workspace register should succeed: {register_body:?}"
+    );
+    let second_workspace_id = register_body["workspaceId"]
+        .as_str()
+        .expect("second workspace id should serialize as string")
+        .to_string();
+
+    let (turn_status, turn_body) = post_json(
+        app.clone(),
+        "/api/session/turn",
+        json!({
+            "text": "恢复最后打开的会话",
+            "workspaceId": second_workspace_id.clone(),
+            "requestId": "request-last-selected-session",
+            "userMessageId": "user-last-selected-session",
+            "placeholderMessageId": "placeholder-last-selected-session",
+        }),
+    )
+    .await;
+    assert_eq!(
+        turn_status,
+        StatusCode::OK,
+        "session turn should accept: {turn_body:?}"
+    );
+    let selected_session_id = turn_body["sessionId"]
+        .as_str()
+        .expect("selected session id should serialize as string")
+        .to_string();
+
+    let (switch_status, switch_body) = post_json(
+        app.clone(),
+        "/api/session/switch",
+        json!({
+            "workspaceId": second_workspace_id,
+            "sessionId": selected_session_id,
+        }),
+    )
+    .await;
+    assert_eq!(
+        switch_status,
+        StatusCode::OK,
+        "session switch should persist selection: {switch_body:?}"
+    );
+
+    drop(app);
+    drop(runtime);
+
+    let restarted_runtime =
+        DaemonRuntime::restore(&config).expect("restart should recover persisted session state");
+    let (restarted_app, _restarted_state) =
+        restarted_runtime.router_with_state_for_tests("daemon-test".to_string());
+    let bootstrap = get_json(restarted_app, "/bootstrap").await;
+
+    assert_eq!(
+        bootstrap["currentSession"]["sessionId"],
+        selected_session_id
+    );
+    assert!(
+        bootstrap["sessions"]
+            .as_array()
+            .expect("sessions should be an array")
+            .iter()
+            .all(|session| session["workspaceId"] == switch_body["currentSession"]["workspaceId"]),
+        "unscoped bootstrap should restore the selected workspace scope"
+    );
+}
+
+#[tokio::test]
 async fn orchestrator_settings_save_stays_global_when_session_scope_is_supplied() {
     let state_root = temp_state_root("e2e-orchestrator-global-settings");
     let config = DaemonConfig::new("127.0.0.1", 0, "daemon-test", state_root.clone());

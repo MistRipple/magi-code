@@ -1029,6 +1029,12 @@
       sessionsByWorkspace = {};
       loadingWorkspaceIds = {};
       expandedWorkspaceIds = {};
+      // 首次启动时 bootstrap 尚未返回，工作区列表的 isActive 只是工作区管理状态，
+      // 不能抢先作为会话导航真值。否则会发起显式 workspace bootstrap，覆盖 daemon
+      // 已持久化的最后会话选择。首次会话加载统一等待 bootstrap 权威状态。
+      if (!messagesState.bootstrapped) {
+        return;
+      }
       selectedWorkspaceId = resolveBackendWorkspaceSelection(next);
       if (selectedWorkspaceId) {
         expandedWorkspaceIds = { [selectedWorkspaceId]: true };

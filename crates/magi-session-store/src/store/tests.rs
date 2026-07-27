@@ -144,6 +144,174 @@ fn append_timeline_entry_updates_session_timestamp_and_user_message_count() {
 }
 
 #[test]
+fn selecting_current_session_is_durable_without_changing_business_history() {
+    let store = SessionStore::new();
+    let first_session_id = SessionId::new("session-select-first");
+    let second_session_id = SessionId::new("session-select-second");
+    let first = store
+        .create_session(first_session_id.clone(), "First")
+        .expect("first session should create");
+    store
+        .create_session(second_session_id, "Second")
+        .expect("second session should create");
+    let timeline_before =
+        serde_json::to_value(store.timeline()).expect("timeline should serialize");
+
+    let selected = store
+        .select_current_session(&first_session_id)
+        .expect("existing session should be selectable");
+
+    assert_eq!(selected.session_id, first_session_id);
+    assert_eq!(selected.updated_at, first.updated_at);
+    assert_eq!(
+        serde_json::to_value(store.timeline()).expect("timeline should serialize"),
+        timeline_before
+    );
+
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        SessionExecutionSidecarStoreState::default(),
+    );
+    assert_eq!(
+        restored
+            .current_session()
+            .expect("selected session should restore")
+            .session_id,
+        first_session_id
+    );
+}
+
+#[test]
+fn durable_state_persistence_serializes_snapshot_and_write_transactions() {
+    let store = SessionStore::new();
+    let first_session_id = SessionId::new("session-persist-order-first");
+    let second_session_id = SessionId::new("session-persist-order-second");
+    store
+        .create_session(first_session_id.clone(), "First")
+        .expect("first session should create");
+    store
+        .create_session(second_session_id.clone(), "Second")
+        .expect("second session should create");
+
+    let snapshots = Arc::new(Mutex::new(Vec::<SessionId>::new()));
+    let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+    let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+    let first_store = store.clone();
+    let first_snapshots = Arc::clone(&snapshots);
+    let first_persist = thread::spawn(move || {
+        first_store
+            .persist_durable_state_with(|state| {
+                first_entered_tx
+                    .send(())
+                    .expect("first persistence should signal entry");
+                release_first_rx
+                    .recv()
+                    .expect("first persistence should be released");
+                first_snapshots
+                    .lock()
+                    .expect("snapshot order lock should not be poisoned")
+                    .push(
+                        state
+                            .current_session_id
+                            .expect("first snapshot should have current session"),
+                    );
+                Ok::<(), ()>(())
+            })
+            .expect("first persistence should complete");
+    });
+    first_entered_rx
+        .recv()
+        .expect("first persistence should enter callback");
+
+    store
+        .select_current_session(&first_session_id)
+        .expect("first session should become current");
+    let second_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let second_store = store.clone();
+    let second_snapshots = Arc::clone(&snapshots);
+    let second_finished_flag = Arc::clone(&second_finished);
+    let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+    let second_persist = thread::spawn(move || {
+        second_started_tx
+            .send(())
+            .expect("second persistence should signal start");
+        second_store
+            .persist_durable_state_with(|state| {
+                second_snapshots
+                    .lock()
+                    .expect("snapshot order lock should not be poisoned")
+                    .push(
+                        state
+                            .current_session_id
+                            .expect("second snapshot should have current session"),
+                    );
+                Ok::<(), ()>(())
+            })
+            .expect("second persistence should complete");
+        second_finished_flag.store(true, std::sync::atomic::Ordering::Release);
+    });
+    second_started_rx
+        .recv()
+        .expect("second persistence should start");
+    thread::sleep(Duration::from_millis(20));
+    assert!(
+        !second_finished.load(std::sync::atomic::Ordering::Acquire),
+        "second persistence must wait for the first complete transaction"
+    );
+
+    release_first_tx
+        .send(())
+        .expect("first persistence should be releasable");
+    first_persist.join().expect("first persistence should join");
+    second_persist
+        .join()
+        .expect("second persistence should join");
+
+    assert_eq!(
+        *snapshots
+            .lock()
+            .expect("snapshot order lock should not be poisoned"),
+        vec![second_session_id, first_session_id]
+    );
+}
+
+#[test]
+fn durable_partition_keeps_current_workspace_session_selection_global() {
+    let store = SessionStore::new();
+    let workspace_a = WorkspaceId::new("workspace-partition-a");
+    let workspace_c = WorkspaceId::new("workspace-partition-c");
+    let session_a = SessionId::new("session-partition-a");
+    let session_n = SessionId::new("session-partition-n");
+    store
+        .create_session_for_workspace(session_a.clone(), "A 会话", Some(workspace_a.to_string()))
+        .expect("workspace A session should create");
+    store
+        .create_session_for_workspace(session_n.clone(), "N 会话", Some(workspace_c.to_string()))
+        .expect("workspace C session should create");
+    store
+        .select_current_session(&session_n)
+        .expect("workspace C session should become current");
+
+    let (global_state, workspace_states) = store.durable_state().partition_by_workspace();
+
+    assert_eq!(global_state.current_session_id, Some(session_n));
+    assert_eq!(
+        workspace_states
+            .get(workspace_a.as_str())
+            .expect("workspace A state should exist")
+            .current_session_id,
+        None
+    );
+    assert_eq!(
+        workspace_states
+            .get(workspace_c.as_str())
+            .expect("workspace C state should exist")
+            .current_session_id,
+        None
+    );
+}
+
+#[test]
 fn goal_store_rejects_second_unfinished_goal_for_same_session() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-goal-singleton");

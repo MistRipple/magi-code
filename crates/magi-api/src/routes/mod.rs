@@ -296,6 +296,25 @@ fn resolve_bootstrap_scope(
         ));
     }
 
+    if requested_session_id.is_none()
+        && let Some(current_session) = state.session_store.current_session()
+    {
+        let current_workspace_id = state.session_workspace_id(&current_session);
+        let workspace_is_registered = current_workspace_id.as_ref().is_none_or(|workspace_id| {
+            state
+                .workspace_registry
+                .workspaces()
+                .iter()
+                .any(|workspace| workspace.workspace_id == *workspace_id)
+        });
+        if workspace_is_registered {
+            return Ok(BootstrapScope {
+                workspace_id: current_workspace_id.map(|workspace_id| workspace_id.to_string()),
+                session_id: Some(current_session.session_id),
+            });
+        }
+    }
+
     let scope = session_scope::resolve_optional_session_workspace_scope(
         state,
         query.session_id.as_deref(),
@@ -696,6 +715,59 @@ mod tests {
         .expect("session workspace should resolve");
 
         assert_eq!(resolved.workspace_id.as_deref(), Some(workspace_b.as_str()));
+    }
+
+    #[test]
+    fn bootstrap_without_scope_restores_selected_session_workspace() {
+        let state = test_state();
+        let workspace_a = WorkspaceId::new("workspace-bootstrap-current-a");
+        let workspace_c = WorkspaceId::new("workspace-bootstrap-current-c");
+        state
+            .workspace_registry
+            .register(
+                workspace_a.clone(),
+                AbsolutePath::new("/tmp/magi-bootstrap-current-a"),
+            )
+            .expect("workspace A should register");
+        state
+            .workspace_registry
+            .register(
+                workspace_c.clone(),
+                AbsolutePath::new("/tmp/magi-bootstrap-current-c"),
+            )
+            .expect("workspace C should register");
+        let session_a = SessionId::new("session-bootstrap-current-a");
+        let session_n = SessionId::new("session-bootstrap-current-n");
+        state
+            .session_store
+            .create_session_for_workspace(session_a, "A 会话", Some(workspace_a.to_string()))
+            .expect("session A should create");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_n.clone(),
+                "N 会话",
+                Some(workspace_c.to_string()),
+            )
+            .expect("session N should create");
+
+        let resolved = resolve_bootstrap_scope(
+            &state,
+            &BootstrapQuery {
+                workspace_id: None,
+                workspace_path: None,
+                session_id: None,
+            },
+        )
+        .expect("current session scope should resolve");
+
+        assert_eq!(resolved.workspace_id.as_deref(), Some(workspace_c.as_str()));
+        assert_eq!(resolved.session_id, Some(session_n));
+        assert_eq!(
+            state.workspace_registry.active_workspace_id(),
+            Some(workspace_a),
+            "bootstrap recovery must not depend on the first active workspace"
+        );
     }
 
     #[test]

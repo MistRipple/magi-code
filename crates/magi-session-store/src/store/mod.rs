@@ -35,6 +35,7 @@ struct SidecarFlushState {
 #[derive(Clone)]
 pub struct SessionStore {
     state: Arc<RwLock<SessionStoreState>>,
+    durable_persistence_lock: Arc<Mutex<()>>,
     sidecar_flush_state: Arc<RwLock<SidecarFlushState>>,
     sidecar_flush_lock: Arc<Mutex<()>>,
     lifecycle_observer: Arc<RwLock<Option<Arc<dyn SessionLifecycleObserver>>>>,
@@ -126,6 +127,7 @@ impl Default for SessionStore {
     fn default() -> Self {
         Self {
             state: Arc::new(RwLock::new(SessionStoreState::default())),
+            durable_persistence_lock: Arc::new(Mutex::new(())),
             sidecar_flush_state: Arc::new(RwLock::new(SidecarFlushState::default())),
             sidecar_flush_lock: Arc::new(Mutex::new(())),
             lifecycle_observer: Arc::new(RwLock::new(None)),
@@ -141,6 +143,7 @@ impl SessionStore {
     pub fn from_state(state: SessionStoreState) -> Self {
         Self {
             state: Arc::new(RwLock::new(state)),
+            durable_persistence_lock: Arc::new(Mutex::new(())),
             sidecar_flush_state: Arc::new(RwLock::new(SidecarFlushState::default())),
             sidecar_flush_lock: Arc::new(Mutex::new(())),
             lifecycle_observer: Arc::new(RwLock::new(None)),
@@ -156,6 +159,19 @@ impl SessionStore {
         sidecar::restore_canonical_turns_from_sidecars(&mut state)
             .expect("persisted sidecar current turn should be canonical-compatible");
         Self::from_state(state)
+    }
+
+    /// 串行化完整 durable snapshot 持久化事务。快照必须在锁内生成，避免较早请求
+    /// 延迟写入旧快照，覆盖之后已经完成的会话选择或业务状态。
+    pub fn persist_durable_state_with<T, E>(
+        &self,
+        persist: impl FnOnce(SessionDurableState) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let _persistence_guard = self
+            .durable_persistence_lock
+            .lock()
+            .expect("session durable persistence lock poisoned");
+        persist(self.durable_state())
     }
 
     /// 安装 session 生命周期 observer。每个 store 同一时间只挂一个 observer，
@@ -252,6 +268,23 @@ impl SessionStore {
 
     pub fn mark_session_viewed(&self, session_id: &SessionId) -> DomainResult<SessionRecord> {
         self.mark_session_viewed_at(session_id, UtcMillis::now())
+    }
+
+    /// 更新用户当前打开的会话。该操作只改变导航选择，不写 timeline，
+    /// 也不修改会话业务时间，避免浏览行为影响会话排序。
+    pub fn select_current_session(&self, session_id: &SessionId) -> DomainResult<SessionRecord> {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        let session = state
+            .sessions
+            .iter()
+            .find(|session| &session.session_id == session_id)
+            .cloned()
+            .ok_or(DomainError::NotFound { entity: "session" })?;
+        state.current_session_id = Some(session_id.clone());
+        Ok(with_session_message_count(session, &state.timeline))
     }
 
     pub fn mark_session_viewed_at(

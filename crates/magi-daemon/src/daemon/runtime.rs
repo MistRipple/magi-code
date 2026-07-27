@@ -1888,24 +1888,27 @@ impl DaemonRuntime {
         session_store: &Arc<SessionStore>,
         workspace_store: &Arc<WorkspaceStore>,
     ) -> Result<(), DaemonError> {
-        let durable = session_store.durable_state();
-        let (global_state, mut workspace_states) = durable.partition_by_workspace();
-        for workspace in workspace_store.workspaces() {
-            let root = workspace.native_root_path();
-            let ws_id = workspace.workspace_id.to_string();
-            let ws_state = workspace_states.remove(&ws_id).unwrap_or_default();
-            state_repository.save_workspace_session_state(&root, &ws_state)?;
-        }
-        if global_state.is_empty() {
-            let global_path = state_repository.session_durable_state_path();
-            match std::fs::remove_file(global_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+        session_store.persist_durable_state_with(|durable| {
+            let (mut global_state, mut workspace_states) = durable.partition_by_workspace();
+            for workspace in workspace_store.workspaces() {
+                let root = workspace.native_root_path();
+                let ws_id = workspace.workspace_id.to_string();
+                let ws_state = workspace_states.remove(&ws_id).unwrap_or_default();
+                state_repository.save_workspace_session_state(&root, &ws_state)?;
             }
-        } else {
-            state_repository.save_session_durable_state(&global_state)?;
-        }
+            global_state.clear_current_session_if_owned_by_workspace_states(&workspace_states);
+            if global_state.is_empty() {
+                let global_path = state_repository.session_durable_state_path();
+                match std::fs::remove_file(global_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(DaemonError::from(error)),
+                }
+            } else {
+                state_repository.save_session_durable_state(&global_state)?;
+            }
+            Ok(())
+        })?;
         state_repository.save_workspace_durable_state(&workspace_store.durable_state())?;
         runtime_persistence.flush_runtime_sidecars()?;
         Ok(())

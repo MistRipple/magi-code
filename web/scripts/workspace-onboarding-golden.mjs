@@ -220,5 +220,15 @@ assert.match(
   /function applyWorkspaceSessionSnapshotToBootstrap[\s\S]*?sessions: snapshot\.sessions[\s\S]*?currentSessionId: payload\.sessionId/,
   'bootstrap 必须在提交 UI 前合并权威会话运行态，避免切换时清空后台呼吸灯',
 );
+assert.match(
+  shellSource,
+  /async function refreshWorkspaces\(\): Promise<void> \{[\s\S]*?workspaces = next;[\s\S]*?sessionsByWorkspace = \{\};[\s\S]*?if \(!messagesState\.bootstrapped\) \{[\s\S]*?return;[\s\S]*?\}[\s\S]*?selectedWorkspaceId = resolveBackendWorkspaceSelection\(next\)/,
+  '工作区列表先到达时必须等待无作用域 bootstrap 恢复最后会话，不能按 isActive 抢先触发工作区切换',
+);
+assert.match(
+  shellSource,
+  /工作区指针同步 effect[\s\S]*?const authoritativeWorkspaceId = currentBootstrapWorkspaceId\(\);[\s\S]*?selectedWorkspaceId = authoritativeWorkspaceId;[\s\S]*?currentSessionId = bootstrapSessionId \|\| null;[\s\S]*?refreshWorkspaceSessions\([\s\S]*?authoritativeWorkspaceId,[\s\S]*?bootstrapSessionId/,
+  'bootstrap 返回后必须以恢复的工作区和会话作为侧栏加载作用域',
+);
 
 console.log('workspace onboarding golden passed');

@@ -1216,6 +1216,7 @@ impl ApiState {
         let event_snapshot = self.event_bus.snapshot();
         let mut projection = self.session_store.projection_input();
         projection.sessions = self.session_records_for_workspace(Some(ws_id));
+        let stored_current_session_id = projection.current_session_id.clone();
         let selected_session_id = requested_session_id
             .filter(|session_id| {
                 projection
@@ -1224,6 +1225,14 @@ impl ApiState {
                     .any(|session| session.session_id == **session_id)
             })
             .cloned()
+            .or_else(|| {
+                stored_current_session_id.filter(|session_id| {
+                    projection
+                        .sessions
+                        .iter()
+                        .any(|session| session.session_id == *session_id)
+                })
+            })
             .or_else(|| {
                 projection
                     .sessions
@@ -1847,45 +1856,47 @@ impl ApiState {
             return Ok(());
         };
 
-        let durable = self.session_store.durable_state();
-        let (global_state, mut workspace_states) = durable.partition_by_workspace();
-        let workspaces = self.workspace_registry.workspaces();
-        for workspace in &workspaces {
-            let ws_id = workspace.workspace_id.to_string();
-            let ws_state = workspace_states.remove(&ws_id).unwrap_or_default();
-            let magi_dir = workspace.native_root_path().join(".magi");
-            let session_path = magi_dir.join("sessions.json");
-            persistence.save_json(&session_path, &ws_state)?;
-        }
-
-        let orphan_session_count: usize = workspace_states
-            .values()
-            .map(|state| state.sessions.len())
-            .sum();
-        if orphan_session_count > 0 {
-            tracing::warn!(
-                orphan_session_count,
-                "跳过未注册 workspace 的会话持久化；workspace 绑定会话必须写入对应工作区状态"
-            );
-        }
-
-        let Some(state_root) = persistence.state_root() else {
-            return Ok(());
-        };
-        let global_session_path = state_root.join("sessions.json");
-        if global_state.is_empty() {
-            match fs::remove_file(&global_session_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(ApiError::internal_assembly("删除全局会话状态失败", error));
-                }
+        self.session_store.persist_durable_state_with(|durable| {
+            let (mut global_state, mut workspace_states) = durable.partition_by_workspace();
+            let workspaces = self.workspace_registry.workspaces();
+            for workspace in &workspaces {
+                let ws_id = workspace.workspace_id.to_string();
+                let ws_state = workspace_states.remove(&ws_id).unwrap_or_default();
+                let magi_dir = workspace.native_root_path().join(".magi");
+                let session_path = magi_dir.join("sessions.json");
+                persistence.save_json(&session_path, &ws_state)?;
             }
-        } else {
-            persistence.save_json(&global_session_path, &global_state)?;
-        }
 
-        Ok(())
+            let orphan_session_count: usize = workspace_states
+                .values()
+                .map(|state| state.sessions.len())
+                .sum();
+            if orphan_session_count > 0 {
+                global_state.clear_current_session_if_owned_by_workspace_states(&workspace_states);
+                tracing::warn!(
+                    orphan_session_count,
+                    "跳过未注册 workspace 的会话持久化；workspace 绑定会话必须写入对应工作区状态"
+                );
+            }
+
+            let Some(state_root) = persistence.state_root() else {
+                return Ok(());
+            };
+            let global_session_path = state_root.join("sessions.json");
+            if global_state.is_empty() {
+                match fs::remove_file(&global_session_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(ApiError::internal_assembly("删除全局会话状态失败", error));
+                    }
+                }
+            } else {
+                persistence.save_json(&global_session_path, &global_state)?;
+            }
+
+            Ok(())
+        })
     }
 
     pub fn persist_session_durable_state_for_api(&self) -> Result<(), ApiError> {
@@ -4012,6 +4023,71 @@ mod tests {
                 .iter()
                 .all(|entry| entry.session_id == session_a)
         );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_workspace_session_prefers_stored_selection_over_list_order() {
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::default()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let workspace_id = WorkspaceId::new("workspace-bootstrap-stored-selection");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-bootstrap-stored-selection"),
+            )
+            .expect("workspace should register");
+        let selected_session_id = SessionId::new("session-bootstrap-stored-selected");
+        state
+            .session_store
+            .create_session_for_workspace(
+                selected_session_id.clone(),
+                "选择会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("selected session should create");
+        state.session_store.append_timeline_entry(
+            selected_session_id.clone(),
+            magi_session_store::TimelineEntryKind::UserMessage,
+            "选择会话消息",
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        let newer_session_id = SessionId::new("session-bootstrap-stored-newer");
+        state
+            .session_store
+            .create_session_for_workspace(
+                newer_session_id.clone(),
+                "更新会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("newer session should create");
+        state.session_store.append_timeline_entry(
+            newer_session_id.clone(),
+            magi_session_store::TimelineEntryKind::UserMessage,
+            "更新会话消息",
+        );
+        state
+            .session_store
+            .select_current_session(&selected_session_id)
+            .expect("older session should be selected");
+
+        let bootstrap = state
+            .bootstrap_dto_for_workspace_session(Some(workspace_id.as_str()), None)
+            .expect("bootstrap should build");
+
+        assert_eq!(
+            bootstrap
+                .current_session
+                .as_ref()
+                .map(|session| session.session_id.clone()),
+            Some(selected_session_id)
+        );
+        assert_eq!(bootstrap.sessions[0].session_id, newer_session_id);
     }
 
     #[test]

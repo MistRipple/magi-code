@@ -2715,8 +2715,9 @@ async fn switch_session(
     require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     let current_session = state
         .session_store
-        .session(&session_id)
-        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
+        .select_current_session(&session_id)
+        .map_err(|error| ApiError::internal_assembly("切换当前会话失败", error))?;
+    state.persist_session_durable_state_for_api()?;
     Ok(Json(SessionSelectionResponseDto {
         session_id: current_session.session_id.to_string(),
         current_session: Some(current_session),
@@ -6671,7 +6672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn switch_session_is_navigation_only_without_backend_selection_side_effects() {
+    async fn switch_session_persists_navigation_selection_without_business_side_effects() {
         let state = test_state();
         register_workspace(&state, "workspace-a", "session-switch-navigation-only");
         let first_session_id = SessionId::new("session-switch-navigation-first");
@@ -6693,6 +6694,16 @@ mod tests {
             )
             .unwrap();
         let timeline_count = state.session_store.timeline().len();
+        let first_updated_at = state
+            .session_store
+            .session(&first_session_id)
+            .expect("first session should exist")
+            .updated_at;
+        let second_updated_at = state
+            .session_store
+            .session(&second_session_id)
+            .expect("second session should exist")
+            .updated_at;
 
         let (status, body) = post_json(
             state.clone(),
@@ -6712,9 +6723,25 @@ mod tests {
         );
         assert_eq!(
             state.session_store.current_session().unwrap().session_id,
-            second_session_id
+            first_session_id
         );
         assert_eq!(state.session_store.timeline().len(), timeline_count);
+        assert_eq!(
+            state
+                .session_store
+                .session(&first_session_id)
+                .expect("first session should remain")
+                .updated_at,
+            first_updated_at
+        );
+        assert_eq!(
+            state
+                .session_store
+                .session(&second_session_id)
+                .expect("second session should remain")
+                .updated_at,
+            second_updated_at
+        );
     }
 
     #[tokio::test]
