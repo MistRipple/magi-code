@@ -112,6 +112,19 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v7
 
+      - name: 安装 Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装前端依赖
+        run: npm --prefix web ci
+
+      - name: 构建前端生产资源
+        run: npm --prefix web run build
+
       - name: 安装 Rust
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
 

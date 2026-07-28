@@ -22,6 +22,11 @@ assert.match(workflow, /cancel-in-progress:\s*true/, 'stale CI runs must be canc
 assert.match(workflow, /cargo test --workspace --locked/, 'CI must run workspace tests');
 assert.match(workflow, /cargo clippy --workspace --all-targets --locked -- -D warnings/, 'CI must lint every Rust target');
 assert.match(workflow, /cargo test -p magi-desktop --all-targets --locked/, 'CI must test macOS desktop update behavior');
+assert.match(
+  workflow,
+  /macos-desktop:[\s\S]*?npm --prefix web run build[\s\S]*?cargo test -p magi-desktop --all-targets --locked/,
+  'macOS desktop tests must build the bundled frontend resources first',
+);
 assert.doesNotMatch(workflow, /cargo check --workspace --all-targets/, 'Clippy must own the all-target compilation gate');
 assert.doesNotMatch(workflow, /(?:npm|cargo)\s+(?:--prefix web\s+)?audit/, 'dependency audits must not block ordinary CI changes');
 assert.doesNotMatch(
