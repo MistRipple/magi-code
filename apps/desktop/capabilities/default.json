@@ -11,6 +11,13 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "http://*" },
+        { "url": "https://*" }
+      ]
+    },
     "process:default",
     "updater:default",
     "allow-prepare-update-restart",

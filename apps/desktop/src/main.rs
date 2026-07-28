@@ -578,6 +578,7 @@ fn start_daemon(app: AppHandle, state_root: PathBuf, web_dist_root: PathBuf) {
 fn main() {
     magi_process::initialize_user_process_environment();
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
@@ -714,15 +715,15 @@ mod tests {
                 .as_nanos()
         ));
         let staged = StagedDesktopUpdate {
-            current_version: "3.0.23".to_string(),
-            version: "3.0.24".to_string(),
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            version: "3.0.25".to_string(),
             date: None,
             body: None,
         };
         write_staged_update(&state_root, &staged, b"stale update")
             .expect("staged update fixture should be written");
 
-        let result = read_staged_update_for_version(&state_root, "3.0.25")
+        let result = read_staged_update_for_version(&state_root, "3.0.26")
             .expect("staged update reconciliation should succeed");
         assert!(result.is_none());
         let (bytes_path, metadata_path) = staged_update_paths(&state_root);

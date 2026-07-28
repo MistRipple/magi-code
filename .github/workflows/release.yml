@@ -7,6 +7,7 @@ on:
       - "v*"
 
 permissions:
+  actions: read
   contents: write
 
 env:
@@ -15,8 +16,65 @@ env:
   TAURI_CLI_VERSION: "2.11.4"
 
 jobs:
+  verify-ci:
+    name: 校验发布提交
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - name: 等待同一提交通过持续集成
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 1200))
+          missing_attempts=0
+
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            runs="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow ci.yml \
+              --commit "$GITHUB_SHA" \
+              --limit 20 \
+              --json databaseId,status,conclusion,url,headSha)"
+            latest="$(jq -c '.[0] // empty' <<<"$runs")"
+
+            if [ -z "$latest" ]; then
+              missing_attempts=$((missing_attempts + 1))
+              if [ "$missing_attempts" -ge 4 ]; then
+                echo "未找到提交 $GITHUB_SHA 对应的持续集成记录，禁止发布。" >&2
+                echo "请先将该提交推送到 main 并等待持续集成完成。" >&2
+                exit 1
+              fi
+              echo "尚未发现持续集成记录，15 秒后重试（$missing_attempts/4）。"
+              sleep 15
+              continue
+            fi
+
+            status="$(jq -r '.status' <<<"$latest")"
+            conclusion="$(jq -r '.conclusion // ""' <<<"$latest")"
+            run_url="$(jq -r '.url' <<<"$latest")"
+
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "发布门禁通过：$run_url"
+                exit 0
+              fi
+              echo "提交 $GITHUB_SHA 的最新持续集成结果为 $conclusion，禁止发布。" >&2
+              echo "失败记录：$run_url" >&2
+              exit 1
+            fi
+
+            echo "持续集成当前状态为 $status，15 秒后继续检查：$run_url"
+            sleep 15
+          done
+
+          echo "等待提交 $GITHUB_SHA 通过持续集成超时，禁止发布。" >&2
+          exit 1
+
   build-web:
     name: 构建前端资源
+    needs: verify-ci
     runs-on: ubuntu-22.04
     steps:
       - name: 检出代码
@@ -61,11 +119,8 @@ jobs:
       - name: 安装前端依赖
         run: npm --prefix web ci
 
-      - name: 校验并构建前端
-        run: |
-          npm --prefix web run check
-          npm --prefix web test
-          npm --prefix web run build
+      - name: 构建前端生产资源
+        run: npm --prefix web run build
 
       - name: 上传前端资源
         uses: actions/upload-artifact@v7
@@ -158,9 +213,6 @@ jobs:
 
       - name: 安装 Tauri CLI
         run: cargo install tauri-cli --version ${{ env.TAURI_CLI_VERSION }} --locked
-
-      - name: 校验桌面宿主
-        run: cargo test -p magi-desktop --all-targets --locked
 
       - name: 构建桌面安装包
         shell: bash

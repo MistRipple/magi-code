@@ -45,21 +45,6 @@ jobs:
       - name: 前端生产构建
         run: npm --prefix web run build
 
-      - name: 前端生产依赖安全检查
-        shell: bash
-        run: |
-          set -euo pipefail
-          for attempt in 1 2 3; do
-            if npm --prefix web audit --omit=dev; then
-              exit 0
-            fi
-            if [ "$attempt" -eq 3 ]; then
-              echo "前端依赖安全检查连续失败 3 次。" >&2
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
-
       - name: 安装 Rust
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy && rustup default "$RUST_TOOLCHAIN"
 
@@ -83,19 +68,11 @@ jobs:
             patchelf \
             wget
 
-      - name: Rust 编译检查
-        run: cargo check --workspace --all-targets --locked
-
       - name: Rust Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Rust 全量测试
         run: cargo test --workspace --locked
-
-      - name: Rust 依赖安全检查
-        run: |
-          cargo install cargo-audit --version 0.22.2 --locked
-          cargo audit
 
   windows-desktop:
     name: Windows 桌面进程策略
@@ -125,4 +102,27 @@ jobs:
           cargo test -p magi-tool-runtime shell_exec_accepts_shell_program_with_arguments --locked
           cargo test -p magi-tool-runtime builtins_use_context_working_directory_for_relative_inputs --locked
           cargo test -p magi-api path_ref --locked
+          cargo check -p magi-daemon --all-targets --locked
+
+  macos-desktop:
+    name: macOS 桌面与更新策略
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 安装 Rust
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+
+      - name: 缓存 Rust 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-macos-15-rust-1.97
+
+      - name: 验证 macOS 路径、进程与更新策略
+        run: |
+          cargo test -p magi-core --test host_path --locked
+          cargo test -p magi-process --all-targets --locked
+          cargo test -p magi-desktop --all-targets --locked
           cargo check -p magi-daemon --all-targets --locked

@@ -1,0 +1,85 @@
+name: 依赖安全检查
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - web/package-lock.json
+      - .github/workflows/security.yml
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.lock
+      - web/package-lock.json
+      - .github/workflows/security.yml
+  schedule:
+    - cron: "17 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: "1.97.0"
+  CARGO_AUDIT_VERSION: "0.22.2"
+
+jobs:
+  npm-audit:
+    name: 前端生产依赖
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 审计前端生产依赖
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if npm --prefix web audit --omit=dev; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "前端依赖安全检查连续失败 3 次。" >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+
+  cargo-audit:
+    name: Rust 依赖
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 安装 Rust
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+
+      - name: 缓存 cargo-audit
+        id: cargo-audit-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-${{ env.CARGO_AUDIT_VERSION }}
+
+      - name: 安装 cargo-audit
+        if: steps.cargo-audit-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
+
+      - name: 审计 Rust 依赖
+        run: cargo audit

@@ -56,3 +56,33 @@ fn remote_desktop_origin_has_only_the_required_update_command_permissions() {
         "desktop update commands must keep an explicit least-privilege ACL"
     );
 }
+
+#[test]
+fn remote_desktop_origin_can_only_open_web_urls_externally() {
+    let capability: Value =
+        serde_json::from_str(CAPABILITY_SOURCE).expect("desktop capability must be valid JSON");
+    let opener_permission = capability["permissions"]
+        .as_array()
+        .expect("desktop capability must define permissions")
+        .iter()
+        .find(|permission| permission["identifier"] == "opener:allow-open-url")
+        .expect("desktop capability must allow opening external web URLs");
+    let allowed_urls = opener_permission["allow"]
+        .as_array()
+        .expect("opener permission must define URL scopes")
+        .iter()
+        .filter_map(|scope| scope["url"].as_str())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(allowed_urls, BTreeSet::from(["http://*", "https://*"]));
+    assert!(
+        DESKTOP_MAIN_SOURCE.contains(".plugin(tauri_plugin_opener::init())"),
+        "desktop host must register the official Tauri opener plugin"
+    );
+    assert!(
+        !CAPABILITY_SOURCE.contains("opener:default")
+            && !CAPABILITY_SOURCE.contains("opener:allow-open-path")
+            && !CAPABILITY_SOURCE.contains("opener:allow-reveal-item-in-dir"),
+        "desktop external-link capability must not grant filesystem opener permissions"
+    );
+}

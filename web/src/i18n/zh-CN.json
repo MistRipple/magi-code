@@ -1334,6 +1334,7 @@
   "bridge.action.markNotificationsRead": "标记通知已读",
   "bridge.action.clearNotifications": "清空通知",
   "bridge.action.removeNotification": "删除通知",
+  "bridge.action.openExternalLink": "打开外部网页",
   "bridge.action.openFilePreview": "打开文件预览",
   "bridge.action.openDiffPreview": "打开差异预览",
   "bridge.action.approveChange": "批准变更",

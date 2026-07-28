@@ -1334,6 +1334,7 @@
   "bridge.action.markNotificationsRead": "Mark notifications read",
   "bridge.action.clearNotifications": "Clear notifications",
   "bridge.action.removeNotification": "Delete notification",
+  "bridge.action.openExternalLink": "Open external link",
   "bridge.action.openFilePreview": "Open file preview",
   "bridge.action.openDiffPreview": "Open diff preview",
   "bridge.action.approveChange": "Approve change",
