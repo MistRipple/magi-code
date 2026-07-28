@@ -237,8 +237,13 @@ assert.match(
 );
 assert.match(
   desktopMainSource,
-  /fn get_staged_desktop_update[\s\S]*read_staged_update/,
-  'desktop host must restore a staged update after an application restart',
+  /fn get_staged_desktop_update[\s\S]*expected_version[\s\S]*read_staged_update_for_version/,
+  'desktop host must reconcile a staged update with the latest checked version after restart',
+);
+assert.match(
+  updaterSource,
+  /const expectedVersion = update\?\.version[\s\S]*get_staged_desktop_update'[\s\S]*expectedVersion/,
+  'desktop updater must validate a persisted package against the latest remote version before presenting it',
 );
 assert.match(
   desktopMainSource,
@@ -249,6 +254,11 @@ assert.match(
   desktopMainSource,
   /fn install_staged_desktop_update[\s\S]*update[\s\S]*\.install\(bytes\)/,
   'desktop host must install the persisted update package',
+);
+assert.match(
+  desktopMainSource,
+  /if update\.version != staged\.version \{[\s\S]*remove_staged_update\(&state_root\)/,
+  'desktop host must clean an outdated staged package instead of retrying it forever',
 );
 assert.match(
   desktopMainSource,

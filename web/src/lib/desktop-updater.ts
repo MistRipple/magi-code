@@ -114,10 +114,6 @@ export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
 
   const { invoke } = await import('@tauri-apps/api/core');
   const installability = await invoke<DesktopUpdateInstallability>('get_desktop_update_installability');
-  const stagedUpdate = await invoke<StagedDesktopUpdate | null>('get_staged_desktop_update');
-  if (stagedUpdate) {
-    return createStagedDesktopUpdate(stagedUpdate, installability);
-  }
 
   const { check } = await import('@tauri-apps/plugin-updater');
   let update: Awaited<ReturnType<typeof check>> | null = null;
@@ -135,6 +131,14 @@ export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
   }
   if (!checkCompleted) {
     throw lastCheckError ?? new Error('桌面端更新检查失败');
+  }
+
+  const expectedVersion = update?.version ?? (await getDesktopAppVersion()) ?? '';
+  const stagedUpdate = await invoke<StagedDesktopUpdate | null>('get_staged_desktop_update', {
+    expectedVersion,
+  });
+  if (stagedUpdate) {
+    return createStagedDesktopUpdate(stagedUpdate, installability);
   }
   if (!update) {
     return null;

@@ -185,6 +185,21 @@ fn read_staged_update(state_root: &Path) -> Result<Option<StagedDesktopUpdate>, 
     Ok(Some(update))
 }
 
+fn read_staged_update_for_version(
+    state_root: &Path,
+    expected_version: &str,
+) -> Result<Option<StagedDesktopUpdate>, String> {
+    let staged = read_staged_update(state_root)?;
+    if staged
+        .as_ref()
+        .is_some_and(|update| update.version != expected_version)
+    {
+        remove_staged_update(state_root);
+        return Ok(None);
+    }
+    Ok(staged)
+}
+
 fn write_staged_update(
     state_root: &Path,
     update: &StagedDesktopUpdate,
@@ -361,9 +376,12 @@ fn prepare_update_restart(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn get_staged_desktop_update(app: AppHandle) -> Result<Option<StagedDesktopUpdate>, String> {
+async fn get_staged_desktop_update(
+    app: AppHandle,
+    expected_version: String,
+) -> Result<Option<StagedDesktopUpdate>, String> {
     let state_root = app.state::<DesktopRuntime>().state_root.clone();
-    read_staged_update(&state_root)
+    read_staged_update_for_version(&state_root, &expected_version)
 }
 
 #[tauri::command]
@@ -439,9 +457,10 @@ async fn install_staged_desktop_update(app: AppHandle) -> Result<(), String> {
         .map_err(|error| format!("校验更新状态失败: {error}"))?
         .ok_or_else(|| "远端更新已不可用，无法安装已下载的更新".to_string())?;
     if update.version != staged.version {
+        remove_staged_update(&state_root);
         return Err(format!(
-            "已下载版本 v{} 与当前可用版本 v{} 不一致，请重新下载",
-            staged.version, update.version
+            "已下载版本 v{} 已过期，当前可用版本为 v{}，已清理旧更新包，请重新下载",
+            staged.version, update.version,
         ));
     }
 
@@ -678,5 +697,33 @@ mod tests {
 
         assert!(installability.installable);
         assert!(installability.reason.is_none());
+    }
+
+    #[test]
+    fn stale_staged_update_is_removed_before_it_reaches_the_update_ui() {
+        let state_root = env::temp_dir().join(format!(
+            "magi-desktop-updater-{}-{}",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ));
+        let staged = StagedDesktopUpdate {
+            current_version: "3.0.23".to_string(),
+            version: "3.0.24".to_string(),
+            date: None,
+            body: None,
+        };
+        write_staged_update(&state_root, &staged, b"stale update")
+            .expect("staged update fixture should be written");
+
+        let result = read_staged_update_for_version(&state_root, "3.0.25")
+            .expect("staged update reconciliation should succeed");
+        assert!(result.is_none());
+        let (bytes_path, metadata_path) = staged_update_paths(&state_root);
+        assert!(!bytes_path.exists());
+        assert!(!metadata_path.exists());
+        let _ = fs::remove_dir_all(state_root);
     }
 }
