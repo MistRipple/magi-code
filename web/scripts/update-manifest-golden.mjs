@@ -6,6 +6,16 @@ import path from 'node:path';
 import { createUpdateManifest } from './generate-update-manifest.mjs';
 
 const releaseWorkflow = fs.readFileSync(path.resolve('../.github/workflows/release.yml'), 'utf8');
+const webPackage = JSON.parse(fs.readFileSync(path.resolve('package.json'), 'utf8'));
+const currentReleaseNotesPath = path.resolve(`../.github/releases/v${webPackage.version}.md`);
+const currentReleaseNotes = fs.readFileSync(currentReleaseNotesPath, 'utf8').trim();
+
+assert.ok(currentReleaseNotes, `current release notes must not be empty: ${currentReleaseNotesPath}`);
+assert.doesNotMatch(
+  currentReleaseNotes,
+  /\b[0-9a-f]{7,40}\b/i,
+  'current release notes must not expose commit hashes',
+);
 
 assert.doesNotMatch(
   releaseWorkflow,
