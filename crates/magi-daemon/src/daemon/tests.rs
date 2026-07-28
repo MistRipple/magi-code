@@ -3798,3 +3798,37 @@ async fn daemon_handle_starts_serves_and_shuts_down_idempotently() {
         "daemon port should be released after shutdown"
     );
 }
+
+#[tokio::test]
+async fn daemon_handle_force_shutdown_releases_the_listening_port() {
+    let state_root = temp_state_root("daemon-handle-force-shutdown");
+    let daemon = Daemon::new(DaemonConfig::new(
+        "127.0.0.1",
+        0,
+        "daemon-handle-force-shutdown-test",
+        state_root,
+    ));
+
+    let mut handle = daemon.start().await.expect("daemon should start");
+    let health_url = handle.web_url().replace("/web.html", "/health");
+    assert_eq!(
+        reqwest::get(&health_url)
+            .await
+            .expect("health endpoint should be reachable")
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    handle
+        .force_shutdown("desktop runtime recovery timeout")
+        .expect("forced shutdown should record runtime interruption");
+    handle
+        .wait_until_stopped()
+        .await
+        .expect_err("aborted daemon task should report forced termination");
+
+    assert!(
+        reqwest::get(&health_url).await.is_err(),
+        "daemon port should be released after forced shutdown"
+    );
+}

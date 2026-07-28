@@ -24,6 +24,8 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tauri-plugin-opener = "2.5.4"
+netstat2.workspace = true
+sysinfo.workspace = true
 
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }

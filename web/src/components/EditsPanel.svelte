@@ -1,19 +1,18 @@
 <script lang="ts">
   import {
-    applyPendingChangesProjection,
     getCurrentSessionId,
     messagesState,
   } from '../stores/messages.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { ensureArray } from '../lib/utils';
   import { openCodeTab } from '../stores/right-pane.svelte';
+  import { refreshPendingChangesProjection } from '../lib/pending-changes-refresh';
   import type { Edit } from '../types/message';
   import type { IconName } from '../lib/icons';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
     getAgentChangeDiff,
-    getAgentPendingChanges,
     isWebAgentMode,
   } from '../web/agent-api';
 
@@ -122,9 +121,8 @@
       }
       inFlight = true;
       try {
-        const payload = await getAgentPendingChanges({ sessionId, workspaceId, workspacePath });
         if (!disposed) {
-          applyPendingChangesProjection(payload);
+          await refreshPendingChangesProjection({ sessionId, workspaceId, workspacePath });
         }
         errorReported = false;
       } catch (error) {

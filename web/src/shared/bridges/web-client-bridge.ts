@@ -153,6 +153,7 @@ import {
 import { resolveModelListFetchBlockReason } from '../model-governance';
 import type { OrchestratorRuntimeSnapshot, QueuedMessage } from '../../types/message';
 import { copyOrchestratorSessionConfig } from '../orchestrator-session-config';
+import { refreshPendingChangesProjection } from '../../lib/pending-changes-refresh';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
 const pendingBridgeMessages: ClientBridgeMessage[] = [];
@@ -2580,6 +2581,14 @@ async function restoreBridgeState(reason: string, force = false): Promise<void> 
       forceEventStreamReconnect: true,
       refreshSettingsBootstrapOnBindingChange: false,
     });
+    const recoveredBinding = resolveWorkspaceQuery();
+    if (recoveredBinding.sessionId) {
+      try {
+        await refreshPendingChangesProjection(recoveredBinding);
+      } catch (error) {
+        console.warn('[web-client-bridge] 工作区恢复后刷新变更列表失败:', error);
+      }
+    }
     await dispatchSettingsBootstrap(force, 'core');
     clearRecoveryTimer();
     recoveryAttempt = 0;

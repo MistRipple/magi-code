@@ -35,7 +35,7 @@ members = [
 ]
 
 [workspace.package]
-version = "3.0.26"
+version = "3.0.27"
 edition = "2024"
 license = "MIT"
 
@@ -59,6 +59,7 @@ insta = "1.41"
 dunce = "1.0.5"
 similar = "2.7.0"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+netstat2 = "0.11.2"
 
 [profile.dev]
 # 开发态只保留行号级调试信息，避免频繁 cargo run/check 后 target 目录快速膨胀。

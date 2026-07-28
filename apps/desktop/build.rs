@@ -5,6 +5,8 @@ fn main() {
         "get_desktop_update_installability",
         "stage_desktop_update",
         "install_staged_desktop_update",
+        "get_desktop_runtime_recovery",
+        "restart_desktop_runtime",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(app_manifest))
         .expect("failed to build Tauri desktop application");

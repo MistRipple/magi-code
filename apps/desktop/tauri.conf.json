@@ -1,12 +1,13 @@
 {
   "productName": "Magi",
   "mainBinaryName": "Magi",
-  "version": "3.0.26",
+  "version": "3.0.27",
   "identifier": "com.mistripple.magi",
   "build": {
     "frontendDist": "bootstrap"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [],
     "security": {
       "csp": null

@@ -27,6 +27,8 @@ let bootstrapRequestCount = 0;
 let workspaceSessionsRequestCount = 0;
 let workspaceSessionIsRunning = false;
 let workspaceSessionsPayloadOverride = null;
+let pendingChangesRequestCount = 0;
+let pendingChangesPayloadOverride = null;
 let queuedTurnPayloads = [];
 
 class MemoryStorage {
@@ -364,6 +366,23 @@ function installFetchStub() {
         sessionId: SESSION_ID,
         hasMoreBefore: false,
         beforeCursor: null,
+      });
+    }
+    if (parsed.pathname === '/api/changes' && (!init.method || init.method === 'GET')) {
+      pendingChangesRequestCount += 1;
+      const sessionId = parsed.searchParams.get('sessionId') || SESSION_ID;
+      const workspaceId = parsed.searchParams.get('workspaceId') || WORKSPACE_ID;
+      const workspacePath = parsed.searchParams.get('workspacePath') || WORKSPACE_PATH;
+      return jsonResponse({
+        generatedAt: Date.now() + pendingChangesRequestCount,
+        sessionId,
+        workspaceId,
+        workspacePath,
+        pendingChanges: pendingChangesPayloadOverride || [],
+        pendingChangesState: {
+          status: 'ready',
+          pendingCount: pendingChangesPayloadOverride?.length || 0,
+        },
       });
     }
     if (
@@ -1107,6 +1126,17 @@ await withGoldenViteServer(async (server) => {
   );
 
   const streamCountBeforeLagged = FakeEventSource.instances.length;
+  const pendingChangesRequestsBeforeLagged = pendingChangesRequestCount;
+  pendingChangesPayloadOverride = [{
+    sessionId: SESSION_ID,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    filePath: 'recovered-change.ts',
+    type: 'modify',
+    additions: 3,
+    deletions: 1,
+    revertible: true,
+  }];
   const originalWarn = console.warn;
   try {
     console.warn = () => {};
@@ -1144,6 +1174,16 @@ await withGoldenViteServer(async (server) => {
     false,
     'lagged recovery bootstrap must keep processing settled after terminal transcript restore',
   );
+  await waitFor(
+    () => messagesStore.messagesState.edits.some((edit) => edit.filePath === 'recovered-change.ts'),
+    'workspace recovery must refresh pending changes before the edits tab is opened',
+  );
+  assert.equal(
+    pendingChangesRequestCount,
+    pendingChangesRequestsBeforeLagged + 1,
+    'one authoritative changes refresh must accompany a successful workspace recovery',
+  );
+  pendingChangesPayloadOverride = null;
 
   const switchBootstrapRequests = [];
   bootstrapInterceptors.push((parsed) => {

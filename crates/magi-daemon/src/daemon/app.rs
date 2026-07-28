@@ -69,7 +69,20 @@ impl DaemonHandle {
         Ok(())
     }
 
-    pub async fn wait(mut self) -> Result<(), DaemonError> {
+    pub fn force_shutdown(&mut self, reason: impl Into<String>) -> Result<(), DaemonError> {
+        let prepare_result = if !*self.shutdown_tx.borrow() {
+            self.runtime.prepare_graceful_shutdown(reason)
+        } else {
+            Ok(())
+        };
+        self.shutdown_tx.send_replace(true);
+        if !self.server_task.is_finished() {
+            self.server_task.abort();
+        }
+        prepare_result
+    }
+
+    pub async fn wait_until_stopped(&mut self) -> Result<(), DaemonError> {
         let result = (&mut self.server_task).await.map_err(|error| {
             DaemonError::internal(format!("daemon server task failed: {error}"))
         })?;
@@ -78,6 +91,10 @@ impl DaemonHandle {
                 .prepare_graceful_shutdown("daemon server task exited")?;
         }
         result
+    }
+
+    pub async fn wait(mut self) -> Result<(), DaemonError> {
+        self.wait_until_stopped().await
     }
 
     pub async fn wait_for_shutdown_signal(mut self) -> Result<(), DaemonError> {

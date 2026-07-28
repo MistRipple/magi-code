@@ -87,6 +87,7 @@
 
   let loading = $state(true);
   let loadError = $state('');
+  let agentRecovering = $state(false);
   let agentBaseUrl = $state('');
   let workspaces = $state<AgentWorkspaceSummary[]>([]);
   let selectedWorkspaceId = $state('');
@@ -1589,11 +1590,13 @@
       const previousAgentBaseUrl = agentBaseUrl;
       agentBaseUrl = resolveAgentBaseUrl();
       if (detail?.status === 'recovering') {
+        agentRecovering = true;
         if (!workspaces.length && !loading) {
           loadError = i18n.t('web.agentRecovering');
         }
         return;
       }
+      agentRecovering = false;
       const shouldRefreshWorkspaces = !loading && (
         Boolean(loadError)
         || workspaces.length === 0
@@ -1750,6 +1753,11 @@
         </div>
         {#if loading}
           <div class="sidebar-empty">{i18n.t('common.loading')}</div>
+        {:else if agentRecovering}
+          <div class="sidebar-empty sidebar-empty--recovering">
+            <Icon name="loader" size={13} />
+            <span>{i18n.t('web.agentRecovering')}</span>
+          </div>
         {:else if loadError}
           <div class="sidebar-error">
             <div class="sidebar-error-title">{i18n.t('web.workspaceUnavailable')}</div>
@@ -2164,6 +2172,20 @@
   .sidebar-empty {
     color: var(--foreground-muted);
     font-size: var(--text-sm);
+  }
+
+  .sidebar-empty--recovering {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .sidebar-empty--recovering :global(svg) {
+    animation: sidebar-recovery-spin 1s linear infinite;
+  }
+
+  @keyframes sidebar-recovery-spin {
+    to { transform: rotate(360deg); }
   }
 
   .theme-toggle-btn {

@@ -8,6 +8,8 @@
   import SettingsPanel from './components/SettingsPanel.svelte';
   import ToastContainer from './components/ToastContainer.svelte';
   import Icon from './components/Icon.svelte';
+  import DesktopRuntimeRecovery from './components/DesktopRuntimeRecovery.svelte';
+  import { isDesktopRuntime } from './lib/desktop-updater';
   import { setCurrentTopTab, messagesState } from './stores/messages.svelte';
   import { activateRightPaneSession } from './stores/right-pane.svelte';
   import { i18n } from './stores/i18n.svelte';
@@ -31,6 +33,11 @@
   // 启动连接状态：启动数据尚未就绪时显示等待提示
   const isBootstrapping = $derived(!messagesState.bootstrapped);
   let bootstrapConnectionFailed = $state(false);
+  let runtimeRecoveryVisible = $state(false);
+  const desktopRuntime = isDesktopRuntime();
+  const showDesktopRecovery = $derived(
+    desktopRuntime && (bootstrapConnectionFailed || runtimeRecoveryVisible)
+  );
 
   function handleTabChange(tab: TopTabType) {
     setCurrentTopTab(tab);
@@ -45,18 +52,35 @@
   }
 
   onMount(() => {
+    let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearRecoveryTimer = () => {
+      if (recoveryTimer !== null) {
+        clearTimeout(recoveryTimer);
+        recoveryTimer = null;
+      }
+    };
     const handleAgentConnection = (event: Event) => {
       const detail = (event as CustomEvent<AgentConnectionEventDetail>).detail;
       if (detail?.status === 'connected') {
+        clearRecoveryTimer();
         bootstrapConnectionFailed = false;
+        runtimeRecoveryVisible = false;
         return;
       }
       if (!messagesState.bootstrapped) {
         bootstrapConnectionFailed = true;
+        return;
+      }
+      if (desktopRuntime && recoveryTimer === null && !runtimeRecoveryVisible) {
+        recoveryTimer = setTimeout(() => {
+          recoveryTimer = null;
+          runtimeRecoveryVisible = true;
+        }, 3_000);
       }
     };
     window.addEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
     return () => {
+      clearRecoveryTimer();
       window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
     };
   });
@@ -82,20 +106,24 @@
 
   <!-- Tab 内容区域：常驻 ThreadPanel + 按需挂载的其他 top-tab -->
   <div class="tab-content-wrapper">
-    {#if isBootstrapping}
+    {#if isBootstrapping || runtimeRecoveryVisible}
       <!-- 启动连接等待层：启动数据尚未就绪 -->
       <div class="bootstrap-overlay">
-        <div class="bootstrap-content" class:error={bootstrapConnectionFailed}>
-          <div class="bootstrap-spinner" class:static={bootstrapConnectionFailed}>
-            <Icon name={bootstrapConnectionFailed ? 'warning' : 'loader'} size={32} />
+        {#if showDesktopRecovery}
+          <DesktopRuntimeRecovery />
+        {:else}
+          <div class="bootstrap-content" class:error={bootstrapConnectionFailed}>
+            <div class="bootstrap-spinner" class:static={bootstrapConnectionFailed}>
+              <Icon name={bootstrapConnectionFailed ? 'warning' : 'loader'} size={32} />
+            </div>
+            <p class="bootstrap-title">
+              {bootstrapConnectionFailed ? i18n.t('app.bootstrapConnectionFailed') : i18n.t('app.bootstrapConnecting')}
+            </p>
+            <p class="bootstrap-hint">
+              {bootstrapConnectionFailed ? i18n.t('app.bootstrapConnectionHint') : i18n.t('app.bootstrapConnectingHint')}
+            </p>
           </div>
-          <p class="bootstrap-title">
-            {bootstrapConnectionFailed ? i18n.t('app.bootstrapConnectionFailed') : i18n.t('app.bootstrapConnecting')}
-          </p>
-          <p class="bootstrap-hint">
-            {bootstrapConnectionFailed ? i18n.t('app.bootstrapConnectionHint') : i18n.t('app.bootstrapConnectingHint')}
-          </p>
-        </div>
+        {/if}
       </div>
     {/if}
     <div class="top-tab-pane" class:active={currentTopTab === 'thread'}>

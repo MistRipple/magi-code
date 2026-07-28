@@ -75,12 +75,24 @@ jobs:
         run: cargo test --workspace --locked
 
   windows-desktop:
-    name: Windows 桌面进程策略
+    name: Windows 桌面与进程策略
     runs-on: windows-2022
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: 检出代码
         uses: actions/checkout@v7
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建前端生产资源
+        run: |
+          npm --prefix web ci
+          npm --prefix web run build
 
       - name: 安装 Rust
         run: rustup toolchain install "$env:RUST_TOOLCHAIN" --profile minimal && rustup default "$env:RUST_TOOLCHAIN"
@@ -102,6 +114,7 @@ jobs:
           cargo test -p magi-tool-runtime shell_exec_accepts_shell_program_with_arguments --locked
           cargo test -p magi-tool-runtime builtins_use_context_working_directory_for_relative_inputs --locked
           cargo test -p magi-api path_ref --locked
+          cargo test -p magi-desktop --all-targets --locked
           cargo check -p magi-daemon --all-targets --locked
 
   macos-desktop:

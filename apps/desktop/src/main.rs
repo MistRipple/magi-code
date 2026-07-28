@@ -4,7 +4,7 @@
 )]
 
 use std::{
-    env, fs,
+    env, fs, io,
     path::{Path, PathBuf},
     process,
     sync::{Arc, Mutex},
@@ -13,6 +13,10 @@ use std::{
 
 use magi_daemon::{Daemon, DaemonConfig, DaemonHandle};
 use magi_desktop::lifecycle::{DesktopAction, DesktopLifecycle, DesktopState};
+use magi_desktop::runtime_recovery::{
+    ExpectedPortOccupant, PortOccupant, diagnose_port, magi_health_available,
+    terminate_port_occupants, wait_for_port_release,
+};
 use magi_runtime_state::RuntimeStateManager;
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -22,6 +26,7 @@ use tauri::{
     tray::TrayIconBuilder,
 };
 use tauri_plugin_updater::UpdaterExt;
+use tokio::sync::Mutex as AsyncMutex;
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const OPEN_MENU_ID: &str = "open-magi";
@@ -30,14 +35,49 @@ const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 38123;
 const DEFAULT_SERVICE_NAME: &str = "magi-rust-backend";
 const DESKTOP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const DESKTOP_PORT_RELEASE_TIMEOUT: Duration = Duration::from_secs(4);
 const DESKTOP_UPDATE_DIRECTORY: &str = "updates";
 const STAGED_UPDATE_BYTES_FILE: &str = "pending-update.bin";
 const STAGED_UPDATE_METADATA_FILE: &str = "pending-update.json";
+const DESKTOP_ROUTE_QUERY_KEYS: [&str; 3] = ["workspaceId", "workspacePath", "sessionId"];
 
 struct DesktopRuntime {
     lifecycle: Arc<DesktopLifecycle>,
     daemon: Arc<Mutex<Option<DaemonHandle>>>,
     state_root: PathBuf,
+    web_dist_root: PathBuf,
+    recovery: Arc<Mutex<DesktopRuntimeRecovery>>,
+    restart_lock: AsyncMutex<()>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum DesktopRecoveryStatus {
+    Starting,
+    Ready,
+    Restarting,
+    PortOccupied,
+    Unavailable,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopRuntimeRecovery {
+    status: DesktopRecoveryStatus,
+    port: u16,
+    technical_detail: Option<String>,
+    occupants: Vec<PortOccupant>,
+    can_restart: bool,
+    requires_confirmation: bool,
+    web_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RestartDesktopRuntimeRequest {
+    expected_occupants: Vec<ExpectedPortOccupant>,
+    confirm_external_processes: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -81,11 +121,64 @@ enum DesktopUpdateDownloadEvent {
 }
 
 impl DesktopRuntime {
-    fn new(state_root: PathBuf) -> Self {
+    fn new(state_root: PathBuf, web_dist_root: PathBuf) -> Self {
         Self {
             lifecycle: Arc::new(DesktopLifecycle::new()),
             daemon: Arc::new(Mutex::new(None)),
             state_root,
+            web_dist_root,
+            recovery: Arc::new(Mutex::new(DesktopRuntimeRecovery::starting(DEFAULT_PORT))),
+            restart_lock: AsyncMutex::new(()),
+        }
+    }
+}
+
+impl DesktopRuntimeRecovery {
+    fn starting(port: u16) -> Self {
+        Self {
+            status: DesktopRecoveryStatus::Starting,
+            port,
+            technical_detail: None,
+            occupants: Vec::new(),
+            can_restart: false,
+            requires_confirmation: false,
+            web_url: None,
+        }
+    }
+
+    fn ready(port: u16, web_url: String) -> Self {
+        Self {
+            status: DesktopRecoveryStatus::Ready,
+            port,
+            technical_detail: None,
+            occupants: Vec::new(),
+            can_restart: false,
+            requires_confirmation: false,
+            web_url: Some(web_url),
+        }
+    }
+
+    fn restarting(port: u16) -> Self {
+        Self {
+            status: DesktopRecoveryStatus::Restarting,
+            port,
+            technical_detail: None,
+            occupants: Vec::new(),
+            can_restart: false,
+            requires_confirmation: false,
+            web_url: None,
+        }
+    }
+
+    fn failed(port: u16, detail: impl Into<String>) -> Self {
+        Self {
+            status: DesktopRecoveryStatus::Failed,
+            port,
+            technical_detail: Some(detail.into()),
+            occupants: Vec::new(),
+            can_restart: false,
+            requires_confirmation: false,
+            web_url: None,
         }
     }
 }
@@ -283,18 +376,105 @@ fn create_main_window(app: &AppHandle, url: WebviewUrl) -> tauri::Result<()> {
     Ok(())
 }
 
-fn parse_desktop_web_url(value: &str) -> Result<tauri::Url, String> {
+fn parse_desktop_web_url(
+    value: &str,
+    current_url: Option<&tauri::Url>,
+) -> Result<tauri::Url, String> {
     let mut url = value
         .parse::<tauri::Url>()
         .map_err(|error| format!("Magi Web 地址非法: {error}"))?;
-    url.query_pairs_mut()
-        .append_pair("desktopVersion", env!("CARGO_PKG_VERSION"));
+    let route_binding = current_url
+        .into_iter()
+        .flat_map(|current| current.query_pairs())
+        .filter(|(key, _)| DESKTOP_ROUTE_QUERY_KEYS.contains(&key.as_ref()))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    let mut query = url.query_pairs_mut();
+    query.append_pair("desktopVersion", env!("CARGO_PKG_VERSION"));
+    query.extend_pairs(route_binding);
+    drop(query);
     Ok(url)
 }
 
 fn create_startup_error_window(app: &AppHandle) {
+    if app.get_webview_window(MAIN_WINDOW_LABEL).is_some() {
+        show_main_window(app);
+        return;
+    }
     if let Err(error) = create_main_window(app, WebviewUrl::App("index.html".into())) {
         eprintln!("创建 Magi 启动错误窗口失败: {error}");
+    }
+}
+
+fn navigate_main_window(app: &AppHandle, web_url: &str) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let current_url = window
+            .url()
+            .map_err(|error| format!("读取当前工作台地址失败: {error}"))?;
+        let url = parse_desktop_web_url(web_url, Some(&current_url))?;
+        window
+            .navigate(url)
+            .map_err(|error| format!("打开 Magi 工作台失败: {error}"))?;
+        show_main_window(app);
+        return Ok(());
+    }
+    let url = parse_desktop_web_url(web_url, None)?;
+    create_main_window(app, WebviewUrl::External(url))
+        .map_err(|error| format!("创建 Magi 主窗口失败: {error}"))
+}
+
+fn set_desktop_recovery(runtime: &DesktopRuntime, recovery: DesktopRuntimeRecovery) {
+    *runtime
+        .recovery
+        .lock()
+        .expect("desktop recovery lock poisoned") = recovery;
+}
+
+fn recovery_from_port_diagnosis(
+    port: u16,
+    state_root: &Path,
+    fallback_detail: Option<String>,
+) -> DesktopRuntimeRecovery {
+    if magi_health_available(port) {
+        let mut recovery =
+            DesktopRuntimeRecovery::ready(port, format!("http://127.0.0.1:{port}/web.html"));
+        if let Ok(diagnosis) = diagnose_port(port, state_root) {
+            recovery.can_restart = !diagnosis.occupants.is_empty();
+            recovery.requires_confirmation =
+                diagnosis.occupants.iter().any(|occupant| !occupant.is_magi);
+            recovery.occupants = diagnosis.occupants;
+        }
+        return recovery;
+    }
+    match diagnose_port(port, state_root) {
+        Ok(diagnosis) if diagnosis.listener_detected => {
+            let requires_confirmation =
+                diagnosis.occupants.iter().any(|occupant| !occupant.is_magi);
+            DesktopRuntimeRecovery {
+                status: DesktopRecoveryStatus::PortOccupied,
+                port,
+                technical_detail: fallback_detail,
+                can_restart: !diagnosis.occupants.is_empty(),
+                requires_confirmation,
+                occupants: diagnosis.occupants,
+                web_url: None,
+            }
+        }
+        Ok(_) => DesktopRuntimeRecovery {
+            status: DesktopRecoveryStatus::Unavailable,
+            port,
+            technical_detail: fallback_detail,
+            occupants: Vec::new(),
+            can_restart: true,
+            requires_confirmation: false,
+            web_url: None,
+        },
+        Err(error) => DesktopRuntimeRecovery::failed(
+            port,
+            fallback_detail
+                .map(|detail| format!("{detail}\n{error}"))
+                .unwrap_or(error),
+        ),
     }
 }
 
@@ -349,8 +529,12 @@ fn force_shutdown_desktop_runtime(
     lifecycle: Arc<DesktopLifecycle>,
     state_root: PathBuf,
 ) {
-    // 更新安装前不能等待活动请求结束；释放句柄会立即中止 daemon 服务任务和受管进程。
-    drop(daemon.lock().expect("desktop daemon lock poisoned").take());
+    // 更新安装前不能等待活动请求结束；先记录中断状态，再立即中止 daemon 服务任务。
+    if let Some(mut handle) = daemon.lock().expect("desktop daemon lock poisoned").take()
+        && let Err(error) = handle.force_shutdown("desktop update restart")
+    {
+        eprintln!("更新重启前记录 daemon 中断状态失败: {error}");
+    }
 
     let runtime_state = RuntimeStateManager::new(state_root.join("runtime"));
     runtime_state.remove_runtime_state();
@@ -475,6 +659,166 @@ async fn install_staged_desktop_update(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn get_desktop_runtime_recovery(app: AppHandle) -> Result<DesktopRuntimeRecovery, String> {
+    let runtime = app.state::<DesktopRuntime>();
+    let current = runtime
+        .recovery
+        .lock()
+        .expect("desktop recovery lock poisoned")
+        .clone();
+    if matches!(
+        current.status,
+        DesktopRecoveryStatus::Starting | DesktopRecoveryStatus::Restarting
+    ) || (current.status == DesktopRecoveryStatus::Failed && !current.can_restart)
+    {
+        return Ok(current);
+    }
+    let port = read_port()?;
+    let state_root = runtime.state_root.clone();
+    let fallback_detail = current.technical_detail;
+    let recovery = tauri::async_runtime::spawn_blocking(move || {
+        recovery_from_port_diagnosis(port, &state_root, fallback_detail)
+    })
+    .await
+    .map_err(|error| format!("等待桌面运行时诊断失败: {error}"))?;
+    set_desktop_recovery(&runtime, recovery.clone());
+    Ok(recovery)
+}
+
+async fn stop_current_daemon_for_recovery(runtime: &DesktopRuntime) -> Result<(), String> {
+    let handle = runtime
+        .daemon
+        .lock()
+        .expect("desktop daemon lock poisoned")
+        .take();
+    if let Some(mut handle) = handle {
+        let shutdown_error = handle
+            .shutdown("desktop runtime recovery")
+            .err()
+            .map(|error| error.to_string());
+        match tokio::time::timeout(DESKTOP_SHUTDOWN_TIMEOUT, handle.wait_until_stopped()).await {
+            Ok(Ok(())) => {
+                if let Some(error) = shutdown_error {
+                    eprintln!("daemon 停止请求曾返回错误，但服务已经退出: {error}");
+                }
+            }
+            Ok(Err(error)) => {
+                let detail = shutdown_error
+                    .map(|shutdown| format!("{error}; 停止请求错误: {shutdown}"))
+                    .unwrap_or_else(|| error.to_string());
+                eprintln!("当前 Magi daemon 已异常退出，继续恢复运行环境: {detail}");
+            }
+            Err(_) => {
+                let shutdown_detail = shutdown_error
+                    .map(|error| format!("，停止请求错误: {error}"))
+                    .unwrap_or_default();
+                if let Err(error) =
+                    handle.force_shutdown("desktop runtime recovery graceful shutdown timeout")
+                {
+                    eprintln!("强制中止 daemon 前记录运行中断失败: {error}");
+                }
+                eprintln!(
+                    "当前 Magi daemon 在 {} 秒内未停止，已强制中止并继续恢复运行环境{shutdown_detail}",
+                    DESKTOP_SHUTDOWN_TIMEOUT.as_secs()
+                );
+            }
+        }
+        let runtime_state = RuntimeStateManager::new(runtime.state_root.join("runtime"));
+        runtime_state.remove_runtime_state();
+        runtime_state.remove_pid();
+    }
+    Ok(())
+}
+
+async fn launch_desktop_daemon(
+    app: &AppHandle,
+    port: u16,
+) -> Result<String, magi_daemon::DaemonError> {
+    let runtime = app.state::<DesktopRuntime>();
+    let host = read_env("MAGI_HOST").unwrap_or_else(|| DEFAULT_HOST.to_string());
+    let service_name =
+        read_env("MAGI_SERVICE_NAME").unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string());
+    let config = DaemonConfig::new(host.clone(), port, service_name, &runtime.state_root)
+        .with_web_dist_root(runtime.web_dist_root.clone())
+        .with_open_browser(false);
+    let handle = Daemon::new(config).start().await?;
+    let web_url = handle.web_url().to_string();
+    let bound_addr = handle.bound_addr();
+    let runtime_state = RuntimeStateManager::new(runtime.state_root.join("runtime"));
+    runtime_state.write_runtime_state(process::id(), Some(&host), bound_addr.port());
+    runtime_state.write_pid(process::id());
+    *runtime.daemon.lock().expect("desktop daemon lock poisoned") = Some(handle);
+    set_desktop_recovery(
+        &runtime,
+        DesktopRuntimeRecovery::ready(bound_addr.port(), web_url.clone()),
+    );
+    Ok(web_url)
+}
+
+#[tauri::command]
+async fn restart_desktop_runtime(
+    app: AppHandle,
+    request: RestartDesktopRuntimeRequest,
+) -> Result<DesktopRuntimeRecovery, String> {
+    let runtime = app.state::<DesktopRuntime>();
+    let _restart_guard = runtime.restart_lock.lock().await;
+    let port = read_port()?;
+    set_desktop_recovery(&runtime, DesktopRuntimeRecovery::restarting(port));
+    if let Err(error) = stop_current_daemon_for_recovery(&runtime).await {
+        let recovery = recovery_from_port_diagnosis(port, &runtime.state_root, Some(error.clone()));
+        set_desktop_recovery(&runtime, recovery);
+        return Err(error);
+    }
+
+    let state_root = runtime.state_root.clone();
+    let expected_occupants = request.expected_occupants;
+    let confirm_external_processes = request.confirm_external_processes;
+    let cleanup_result = tauri::async_runtime::spawn_blocking(move || {
+        let diagnosis = diagnose_port(port, &state_root)?;
+        if diagnosis.listener_detected {
+            terminate_port_occupants(
+                port,
+                &state_root,
+                &expected_occupants,
+                confirm_external_processes,
+            )?;
+        }
+        wait_for_port_release(port, &state_root, DESKTOP_PORT_RELEASE_TIMEOUT)
+    })
+    .await
+    .map_err(|error| format!("等待端口清理任务失败: {error}"))?;
+
+    if let Err(error) = cleanup_result {
+        let recovery = recovery_from_port_diagnosis(port, &runtime.state_root, Some(error.clone()));
+        set_desktop_recovery(&runtime, recovery);
+        return Err(error);
+    }
+
+    let web_url = match launch_desktop_daemon(&app, port).await {
+        Ok(web_url) => web_url,
+        Err(error) => {
+            let detail = format!("Magi daemon 重启失败: {error}");
+            let recovery = match &error {
+                magi_daemon::DaemonError::Io(source)
+                    if source.kind() == io::ErrorKind::AddrInUse =>
+                {
+                    recovery_from_port_diagnosis(port, &runtime.state_root, Some(detail.clone()))
+                }
+                _ => DesktopRuntimeRecovery::failed(port, detail.clone()),
+            };
+            set_desktop_recovery(&runtime, recovery);
+            return Err(detail);
+        }
+    };
+    navigate_main_window(&app, &web_url)?;
+    Ok(runtime
+        .recovery
+        .lock()
+        .expect("desktop recovery lock poisoned")
+        .clone())
+}
+
 fn install_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let open_item = MenuItemBuilder::with_id(OPEN_MENU_ID, "打开 Magi").build(app)?;
     let separator = PredefinedMenuItem::separator(app)?;
@@ -505,8 +849,13 @@ fn install_tray(app: &mut tauri::App) -> tauri::Result<()> {
 fn start_daemon(app: AppHandle, state_root: PathBuf, web_dist_root: PathBuf) {
     tauri::async_runtime::spawn(async move {
         if !web_dist_root.join("web.html").is_file() {
-            eprintln!("Magi 桌面包缺少内置 Web 入口: {}", web_dist_root.display());
+            let detail = format!("Magi 桌面包缺少内置 Web 入口: {}", web_dist_root.display());
+            eprintln!("{detail}");
             let runtime = app.state::<DesktopRuntime>();
+            set_desktop_recovery(
+                &runtime,
+                DesktopRuntimeRecovery::failed(DEFAULT_PORT, detail),
+            );
             runtime.lifecycle.mark_ready();
             create_startup_error_window(&app);
             return;
@@ -517,60 +866,59 @@ fn start_daemon(app: AppHandle, state_root: PathBuf, web_dist_root: PathBuf) {
             Err(error) => {
                 eprintln!("{error}");
                 let runtime = app.state::<DesktopRuntime>();
+                set_desktop_recovery(
+                    &runtime,
+                    DesktopRuntimeRecovery::failed(DEFAULT_PORT, error),
+                );
                 runtime.lifecycle.mark_ready();
                 create_startup_error_window(&app);
                 return;
             }
         };
-        let host = read_env("MAGI_HOST").unwrap_or_else(|| DEFAULT_HOST.to_string());
-        let service_name =
-            read_env("MAGI_SERVICE_NAME").unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string());
-        let config = DaemonConfig::new(host.clone(), port, service_name, &state_root)
-            .with_web_dist_root(web_dist_root)
-            .with_open_browser(false);
-
-        let handle = match Daemon::new(config).start().await {
-            Ok(handle) => handle,
+        let web_url = match launch_desktop_daemon(&app, port).await {
+            Ok(web_url) => web_url,
             Err(error) => {
-                eprintln!("Magi daemon 启动失败: {error}");
+                let detail = format!("Magi daemon 启动失败: {error}");
+                eprintln!("{detail}");
                 let runtime = app.state::<DesktopRuntime>();
+                let recovery = match &error {
+                    magi_daemon::DaemonError::Io(source)
+                        if source.kind() == io::ErrorKind::AddrInUse =>
+                    {
+                        recovery_from_port_diagnosis(port, &state_root, Some(detail.clone()))
+                    }
+                    _ => DesktopRuntimeRecovery::failed(port, detail),
+                };
+                set_desktop_recovery(&runtime, recovery);
                 runtime.lifecycle.mark_ready();
                 create_startup_error_window(&app);
                 return;
             }
         };
-        let web_url = handle.web_url().to_string();
-        let bound_addr = handle.bound_addr();
-        let runtime_state = RuntimeStateManager::new(state_root.join("runtime"));
-        runtime_state.write_runtime_state(process::id(), Some(&host), bound_addr.port());
-        runtime_state.write_pid(process::id());
 
         let runtime = app.state::<DesktopRuntime>();
         if matches!(
             runtime.lifecycle.state(),
             DesktopState::ShuttingDown | DesktopState::Restarting | DesktopState::Stopped
         ) {
-            drop(handle);
+            drop(
+                runtime
+                    .daemon
+                    .lock()
+                    .expect("desktop daemon lock poisoned")
+                    .take(),
+            );
+            let runtime_state = RuntimeStateManager::new(state_root.join("runtime"));
             runtime_state.remove_runtime_state();
             runtime_state.remove_pid();
             runtime.lifecycle.mark_stopped();
             app.exit(0);
             return;
         }
-        *runtime.daemon.lock().expect("desktop daemon lock poisoned") = Some(handle);
         runtime.lifecycle.mark_ready();
-
-        match parse_desktop_web_url(&web_url) {
-            Ok(url) => {
-                if let Err(error) = create_main_window(&app, WebviewUrl::External(url)) {
-                    eprintln!("创建 Magi 主窗口失败: {error}");
-                    request_exit(app);
-                }
-            }
-            Err(error) => {
-                eprintln!("{error}");
-                request_exit(app);
-            }
+        if let Err(error) = navigate_main_window(&app, &web_url) {
+            eprintln!("{error}");
+            request_exit(app);
         }
     });
 }
@@ -587,6 +935,8 @@ fn main() {
             get_desktop_update_installability,
             stage_desktop_update,
             install_staged_desktop_update,
+            get_desktop_runtime_recovery,
+            restart_desktop_runtime,
         ])
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let runtime = app.state::<DesktopRuntime>();
@@ -598,10 +948,12 @@ fn main() {
             let state_root = read_env("MAGI_STATE_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_state_root);
-            app.manage(DesktopRuntime::new(state_root.clone()));
-            install_tray(app)?;
-
             let web_dist_root = resolve_web_dist_root(app)?;
+            app.manage(DesktopRuntime::new(
+                state_root.clone(),
+                web_dist_root.clone(),
+            ));
+            install_tray(app)?;
             start_daemon(app.handle().clone(), state_root, web_dist_root);
             Ok(())
         })
@@ -662,7 +1014,7 @@ mod tests {
 
     #[test]
     fn desktop_web_url_is_versioned_to_avoid_stale_entry_html() {
-        let url = parse_desktop_web_url("http://127.0.0.1:38123/web.html")
+        let url = parse_desktop_web_url("http://127.0.0.1:38123/web.html", None)
             .expect("desktop web URL should parse");
 
         assert_eq!(
@@ -672,6 +1024,33 @@ mod tests {
                 env!("CARGO_PKG_VERSION")
             )
         );
+    }
+
+    #[test]
+    fn desktop_runtime_recovery_preserves_the_active_workspace_and_session() {
+        let current_url = "http://127.0.0.1:38123/web.html?workspaceId=workspace-c&workspacePath=encoded-path&sessionId=session-n&agentBaseUrl=http%3A%2F%2Fexample.com"
+            .parse::<tauri::Url>()
+            .expect("current desktop URL should parse");
+        let recovered =
+            parse_desktop_web_url("http://127.0.0.1:38123/web.html", Some(&current_url))
+                .expect("recovered desktop URL should parse");
+
+        let query = recovered
+            .query_pairs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            query.get("workspaceId").map(|value| value.as_ref()),
+            Some("workspace-c")
+        );
+        assert_eq!(
+            query.get("workspacePath").map(|value| value.as_ref()),
+            Some("encoded-path")
+        );
+        assert_eq!(
+            query.get("sessionId").map(|value| value.as_ref()),
+            Some("session-n")
+        );
+        assert!(!query.contains_key("agentBaseUrl"));
     }
 
     #[test]

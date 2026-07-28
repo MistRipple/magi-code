@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use sysinfo::{Pid, ProcessesToUpdate, System};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 38123;
@@ -229,17 +230,10 @@ pub fn is_process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    #[cfg(unix)]
-    {
-        magi_process::std_command("kill")
-            .args(["-0", &pid.to_string()])
-            .output()
-            .is_ok_and(|o| o.status.success())
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    system.process(pid).is_some()
 }
 
 fn now_millis() -> u64 {

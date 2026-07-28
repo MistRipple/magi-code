@@ -287,6 +287,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bindgen"
+version = "0.72.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+dependencies = [
+ "bitflags 2.11.1",
+ "cexpr",
+ "clang-sys",
+ "itertools",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -500,6 +520,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d43a04d8753f35258c91f8ec639f792891f748a1edbd759cf1dcea3382ad83c"
 
 [[package]]
+name = "cexpr"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
+dependencies = [
+ "nom",
+]
+
+[[package]]
 name = "cfb"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -536,6 +565,17 @@ dependencies = [
  "num-traits",
  "serde",
  "windows-link 0.2.1",
+]
+
+[[package]]
+name = "clang-sys"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
+dependencies = [
+ "glob",
+ "libc",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -957,6 +997,12 @@ name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
+
+[[package]]
+name = "either"
+version = "1.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 
 [[package]]
 name = "embed-resource"
@@ -2056,6 +2102,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "itertools"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2265,7 +2320,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e9ec52138abedcc58dc17a7c6c0c00a2bdb4f3427c7f63fa97fd0d859155caf"
 dependencies = [
  "gtk-sys",
- "libloading",
+ "libloading 0.7.4",
  "once_cell",
 ]
 
@@ -2292,6 +2347,16 @@ checksum = "b67380fd3b2fbe7527a606e18729d21c6f3951633d0500574c4dc22d2d638b9f"
 dependencies = [
  "cfg-if",
  "winapi",
+]
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -2332,7 +2397,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "magi-agent-role"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "dirs",
  "magi-core",
@@ -2343,7 +2408,7 @@ dependencies = [
 
 [[package]]
 name = "magi-api"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "axum",
  "dirs",
@@ -2387,7 +2452,7 @@ dependencies = [
 
 [[package]]
 name = "magi-bridge-client"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "base64 0.22.1",
  "httpdate",
@@ -2405,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "magi-context-runtime"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-core",
  "magi-knowledge-store",
@@ -2417,7 +2482,7 @@ dependencies = [
 
 [[package]]
 name = "magi-conversation-runtime"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "insta",
  "magi-agent-role",
@@ -2455,7 +2520,7 @@ dependencies = [
 
 [[package]]
 name = "magi-core"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "base64 0.22.1",
  "dunce",
@@ -2467,7 +2532,7 @@ dependencies = [
 
 [[package]]
 name = "magi-daemon"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "axum",
  "magi-agent-role",
@@ -2506,7 +2571,7 @@ dependencies = [
 
 [[package]]
 name = "magi-daemon-app"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "dirs",
  "magi-daemon",
@@ -2519,14 +2584,16 @@ dependencies = [
 
 [[package]]
 name = "magi-desktop"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "dirs",
  "magi-daemon",
  "magi-process",
  "magi-runtime-state",
+ "netstat2",
  "serde",
  "serde_json",
+ "sysinfo",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
@@ -2538,7 +2605,7 @@ dependencies = [
 
 [[package]]
 name = "magi-event-bus"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-core",
  "serde",
@@ -2549,7 +2616,7 @@ dependencies = [
 
 [[package]]
 name = "magi-git"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-process",
  "serde",
@@ -2560,7 +2627,7 @@ dependencies = [
 
 [[package]]
 name = "magi-governance"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-core",
  "serde",
@@ -2568,7 +2635,7 @@ dependencies = [
 
 [[package]]
 name = "magi-knowledge-store"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "flate2",
  "magi-core",
@@ -2588,7 +2655,7 @@ dependencies = [
 
 [[package]]
 name = "magi-memory-store"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-core",
  "serde",
@@ -2596,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "magi-mission-metrics"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-core",
  "serde",
@@ -2606,7 +2673,7 @@ dependencies = [
 
 [[package]]
 name = "magi-orchestrator"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-agent-role",
  "magi-bridge-client",
@@ -2628,7 +2695,7 @@ dependencies = [
 
 [[package]]
 name = "magi-permissions"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-core",
  "serde",
@@ -2637,7 +2704,7 @@ dependencies = [
 
 [[package]]
 name = "magi-plan"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-core",
  "magi-event-bus",
@@ -2649,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "magi-process"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "libc",
  "tokio",
@@ -2658,7 +2725,7 @@ dependencies = [
 
 [[package]]
 name = "magi-project-memory"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-core",
  "magi-event-bus",
@@ -2671,16 +2738,16 @@ dependencies = [
 
 [[package]]
 name = "magi-runtime-state"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
- "magi-process",
  "serde",
  "serde_json",
+ "sysinfo",
 ]
 
 [[package]]
 name = "magi-safety-gate"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "serde",
  "serde_json",
@@ -2688,7 +2755,7 @@ dependencies = [
 
 [[package]]
 name = "magi-session-store"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-core",
  "magi-tool-runtime",
@@ -2698,7 +2765,7 @@ dependencies = [
 
 [[package]]
 name = "magi-settings-store"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-core",
  "serde_json",
@@ -2707,7 +2774,7 @@ dependencies = [
 
 [[package]]
 name = "magi-skill-runtime"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-bridge-client",
  "magi-core",
@@ -2721,7 +2788,7 @@ dependencies = [
 
 [[package]]
 name = "magi-snapshot"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "ignore",
  "notify",
@@ -2738,7 +2805,7 @@ dependencies = [
 
 [[package]]
 name = "magi-spawn-graph"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-core",
  "thiserror 2.0.18",
@@ -2746,7 +2813,7 @@ dependencies = [
 
 [[package]]
 name = "magi-tool-runtime"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -2767,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "magi-usage-authority"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-core",
  "serde",
@@ -2777,7 +2844,7 @@ dependencies = [
 
 [[package]]
 name = "magi-worker-runtime"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-bridge-client",
  "magi-core",
@@ -2792,7 +2859,7 @@ dependencies = [
 
 [[package]]
 name = "magi-workspace"
-version = "3.0.26"
+version = "3.0.27"
 dependencies = [
  "magi-core",
  "serde",
@@ -2855,6 +2922,12 @@ dependencies = [
  "mime",
  "unicase",
 ]
+
+[[package]]
+name = "minimal-lexical"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "minisign-verify"
@@ -2947,10 +3020,87 @@ dependencies = [
 ]
 
 [[package]]
+name = "netlink-packet-core"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72724faf704479d67b388da142b186f916188505e7e0b26719019c525882eda4"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "netlink-packet-utils",
+]
+
+[[package]]
+name = "netlink-packet-sock-diag"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a495cb1de50560a7cd12fdcf023db70eec00e340df81be31cedbbfd4aadd6b76"
+dependencies = [
+ "anyhow",
+ "bitflags 1.3.2",
+ "byteorder",
+ "libc",
+ "netlink-packet-core",
+ "netlink-packet-utils",
+ "smallvec",
+]
+
+[[package]]
+name = "netlink-packet-utils"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ede8a08c71ad5a95cdd0e4e52facd37190977039a4704eb82a283f713747d34"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "paste",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "netlink-sys"
+version = "0.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd6c30ed10fa69cc491d491b85cc971f6bdeb8e7367b7cde2ee6cc878d583fae"
+dependencies = [
+ "bytes",
+ "libc",
+ "log",
+]
+
+[[package]]
+name = "netstat2"
+version = "0.11.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "496f264d3ead4870d6b366deb9d20597592d64aac2a907f3e7d07c2325ba4663"
+dependencies = [
+ "bindgen",
+ "bitflags 2.11.1",
+ "byteorder",
+ "netlink-packet-core",
+ "netlink-packet-sock-diag",
+ "netlink-packet-utils",
+ "netlink-sys",
+ "num-derive",
+ "num-traits",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "nom"
+version = "7.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
+dependencies = [
+ "memchr",
+ "minimal-lexical",
+]
 
 [[package]]
 name = "notify"
@@ -3002,6 +3152,17 @@ name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
+
+[[package]]
+name = "num-derive"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "876a53fff98e03a936a674b29568b0e605f06b29372c2489ff4de23f1949743d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
 
 [[package]]
 name = "num-traits"
@@ -3396,6 +3557,12 @@ dependencies = [
  "smallvec",
  "windows-link 0.2.1",
 ]
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "percent-encoding"
@@ -4453,6 +4620,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
 dependencies = [
  "proc-macro2",
+ "quote",
  "unicode-ident",
 ]
 
