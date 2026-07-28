@@ -59,6 +59,7 @@ struct DesktopUpdateInstallability {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum DesktopUpdateInstallabilityReason {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     DiskImage,
 }
 
@@ -103,6 +104,9 @@ fn desktop_update_installability(executable_path: &Path) -> DesktopUpdateInstall
             reason: Some(DesktopUpdateInstallabilityReason::DiskImage),
         };
     }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = executable_path;
 
     DesktopUpdateInstallability {
         installable: true,
