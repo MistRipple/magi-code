@@ -430,19 +430,25 @@ async fn accept_git_context(
         Ok(observation) => observation,
         Err(error) => return Ok(Json(GitOperationResponse::rejected(error))),
     };
+    if let Err(error) = state
+        .snapshot_manager
+        .rebase_session(session_id.to_string(), scope.path.clone())
+        .await
+    {
+        return Ok(Json(GitOperationResponse::rejected_kind(
+            "snapshot_baseline_rebuild_failed",
+            format!("接受 Git context 前重建变更基线失败: {error}"),
+        )));
+    }
     let session_context =
         observe_session_context(&state, &scope, Some(session_id), &observation, true)?;
     publish_git_context_changed(&state, &scope, Some(session_id), &observation);
-    super::knowledge::schedule_workspace_code_index(
-        state.clone(),
-        scope.workspace_id.clone(),
-        scope.path.clone(),
-    );
+    state.schedule_workspace_code_index(scope.workspace_id.clone(), scope.path.clone());
     Ok(Json(GitOperationResponse {
         ok: true,
         observation: Some(observation),
         session_context,
-        data: None,
+        data: Some(serde_json::json!({ "snapshotBaselineStatus": "refreshed" })),
         error: None,
     }))
 }
@@ -955,11 +961,7 @@ async fn finish_observation_mutation(
                 None
             };
             publish_git_context_changed(state, scope, request.session_id.as_deref(), &observation);
-            super::knowledge::schedule_workspace_code_index(
-                state.clone(),
-                scope.workspace_id.clone(),
-                scope.path.clone(),
-            );
+            state.schedule_workspace_code_index(scope.workspace_id.clone(), scope.path.clone());
             Ok(Json(GitOperationResponse {
                 ok: true,
                 observation: Some(observation),
@@ -1367,6 +1369,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn next_turn_adopts_external_fast_forward_on_the_same_branch() {
+        let (repository, state, workspace_id, session_id) = git_api_fixture();
+        let session_id = SessionId::new(session_id);
+        let workspace_id = WorkspaceId::new(workspace_id);
+        state
+            .ensure_snapshot_session(&session_id, repository.path())
+            .await
+            .expect("initial snapshot baseline");
+        let baseline = state
+            .ensure_session_code_context(&session_id, &Some(workspace_id.clone()))
+            .await
+            .expect("initial Git context")
+            .expect("repository context");
+        let baseline_head = baseline.git.base_head.expect("baseline HEAD");
+
+        fs::write(repository.path().join("external.txt"), "external change\n")
+            .expect("external fixture");
+        git(repository.path(), &["add", "external.txt"]);
+        git(
+            repository.path(),
+            &["commit", "-m", "external fast-forward"],
+        );
+        let advanced_head = state
+            .git_service
+            .observe(repository.path())
+            .await
+            .expect("advanced observation")
+            .head
+            .expect("advanced HEAD");
+        assert_ne!(advanced_head, baseline_head);
+
+        let adopted = state
+            .ensure_session_code_context(&session_id, &Some(workspace_id))
+            .await
+            .expect("same-branch fast-forward must not block the next turn")
+            .expect("repository context");
+
+        assert_eq!(adopted.git.desired_ref.as_deref(), Some("main"));
+        assert_eq!(
+            adopted.git.base_head.as_deref(),
+            Some(advanced_head.as_str())
+        );
+        assert_eq!(
+            adopted.git.observed_head.as_deref(),
+            Some(advanced_head.as_str())
+        );
+        assert!(adopted.context_revision > baseline.context_revision);
+        assert!(!adopted.has_external_drift());
+        assert!(
+            state
+                .snapshot_session(&session_id, repository.path())
+                .expect("fast-forward snapshot baseline")
+                .pending_changes()
+                .expect("pending changes")
+                .is_empty(),
+            "外部快进提交必须成为新的变更面板基线"
+        );
+        let event = state
+            .event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "workspace.git.context.changed")
+            .expect("fast-forward refresh event");
+        assert_eq!(event.payload["change_kind"], "fast_forward_adopted");
+        assert_eq!(event.payload["previous_head"], baseline_head);
+        assert_eq!(event.payload["head"], advanced_head);
+        state.release_session_git_execution_lease(&session_id);
+    }
+
+    #[tokio::test]
+    async fn next_turn_rejects_external_head_rewind() {
+        let (repository, state, workspace_id, session_id) = git_api_fixture();
+        fs::write(repository.path().join("second.txt"), "second commit\n").expect("second fixture");
+        git(repository.path(), &["add", "second.txt"]);
+        git(repository.path(), &["commit", "-m", "second"]);
+
+        let session_id = SessionId::new(session_id);
+        let workspace_id = WorkspaceId::new(workspace_id);
+        let baseline = state
+            .ensure_session_code_context(&session_id, &Some(workspace_id.clone()))
+            .await
+            .expect("initial Git context")
+            .expect("repository context");
+        let baseline_head = baseline.git.base_head.expect("baseline HEAD");
+        git(repository.path(), &["reset", "--hard", "HEAD~1"]);
+
+        let error = state
+            .ensure_session_code_context(&session_id, &Some(workspace_id))
+            .await
+            .expect_err("HEAD rewind must require explicit acceptance");
+        assert!(matches!(
+            error,
+            ApiError::Conflict(message)
+                if message.contains("高风险变化") && message.contains(&baseline_head)
+        ));
+    }
+
+    #[tokio::test]
+    async fn next_turn_rejects_external_history_rewrite() {
+        let (repository, state, workspace_id, session_id) = git_api_fixture();
+        fs::write(
+            repository.path().join("second.txt"),
+            "original second commit\n",
+        )
+        .expect("second fixture");
+        git(repository.path(), &["add", "second.txt"]);
+        git(repository.path(), &["commit", "-m", "original second"]);
+
+        let session_id = SessionId::new(session_id);
+        let workspace_id = WorkspaceId::new(workspace_id);
+        let baseline = state
+            .ensure_session_code_context(&session_id, &Some(workspace_id.clone()))
+            .await
+            .expect("initial Git context")
+            .expect("repository context");
+        let baseline_head = baseline.git.base_head.expect("baseline HEAD");
+
+        git(repository.path(), &["reset", "--hard", "HEAD~1"]);
+        fs::write(
+            repository.path().join("replacement.txt"),
+            "replacement commit\n",
+        )
+        .expect("replacement fixture");
+        git(repository.path(), &["add", "replacement.txt"]);
+        git(repository.path(), &["commit", "-m", "replacement second"]);
+
+        let error = state
+            .ensure_session_code_context(&session_id, &Some(workspace_id))
+            .await
+            .expect_err("rewritten history must require explicit acceptance");
+        assert!(matches!(
+            error,
+            ApiError::Conflict(message)
+                if message.contains("高风险变化") && message.contains(&baseline_head)
+        ));
+    }
+
+    #[tokio::test]
+    async fn next_turn_rejects_external_branch_switch() {
+        let (repository, state, workspace_id, session_id) = git_api_fixture();
+        let session_id = SessionId::new(session_id);
+        let workspace_id = WorkspaceId::new(workspace_id);
+        state
+            .ensure_session_code_context(&session_id, &Some(workspace_id.clone()))
+            .await
+            .expect("initial Git context")
+            .expect("repository context");
+        git(repository.path(), &["switch", "-c", "external/branch"]);
+
+        let error = state
+            .ensure_session_code_context(&session_id, &Some(workspace_id))
+            .await
+            .expect_err("branch switch must require explicit acceptance");
+        assert!(matches!(
+            error,
+            ApiError::Conflict(message)
+                if message.contains("高风险变化") && message.contains("external/branch")
+        ));
+    }
+
+    #[tokio::test]
     async fn merge_conflict_refreshes_context_and_blocks_next_turn() {
         let (repository, state, workspace_id, session_id) = git_api_fixture();
         git(repository.path(), &["switch", "-c", "feature/conflict"]);
@@ -1482,7 +1646,7 @@ mod tests {
         .await;
         assert_eq!(drift["contextDrift"], true);
         let accepted = post_json(
-            state,
+            state.clone(),
             "/workspace/vcs/context/accept",
             serde_json::json!({
                 "workspacePath": workspace_path,
@@ -1492,9 +1656,18 @@ mod tests {
         )
         .await;
         assert_eq!(accepted["ok"], true, "{accepted}");
+        assert_eq!(accepted["data"]["snapshotBaselineStatus"], "refreshed");
         assert_eq!(
             accepted["sessionContext"]["git"]["baseHead"],
             accepted["observation"]["head"]
+        );
+        assert!(
+            state
+                .snapshot_session(&SessionId::new(session_id), repository.path())
+                .expect("accepted snapshot baseline")
+                .pending_changes()
+                .expect("pending changes")
+                .is_empty()
         );
     }
 

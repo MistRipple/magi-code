@@ -13,14 +13,19 @@ use magi_conversation_runtime::{
         apply_chain_recovery_if_needed, release_resumed_branch_path,
         sync_branch_checkpoint_to_worker_runtime,
     },
+    session_images::SessionTurnImage,
     task_execution_registry::TaskExecutionPlan,
 };
 use magi_core::{
     ExecutionOwnership, SessionId, SessionLifecycleStatus, TaskExecutionTarget, TaskStatus,
-    WorkerId,
+    ThreadId, UtcMillis, WorkerId,
 };
 use magi_orchestrator::ExecutionWritebackPlans;
-use magi_session_store::{ActiveExecutionBranch, ActiveExecutionChain, SessionStore};
+use magi_session_store::{
+    ActiveExecutionBranch, ActiveExecutionChain, CanonicalTurn, CanonicalTurnItemKind,
+    ExecutionThread, ExecutionThreadStatus, SessionStore, ThreadChatImageSource, ThreadChatMessage,
+    ThreadChatToolCall, ThreadChatToolFunction,
+};
 use magi_settings_store::SettingsStore;
 use std::sync::Arc;
 
@@ -67,6 +72,35 @@ impl Drop for InterruptedRecoveryClaimGuard {
                 turn_id,
                 "释放异常中断恢复领取权失败"
             );
+        }
+    }
+}
+
+struct SessionGitExecutionLeaseGuard<'a> {
+    state: &'a ApiState,
+    session_id: &'a SessionId,
+    committed: bool,
+}
+
+impl<'a> SessionGitExecutionLeaseGuard<'a> {
+    fn new(state: &'a ApiState, session_id: &'a SessionId) -> Self {
+        Self {
+            state,
+            session_id,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SessionGitExecutionLeaseGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.state
+                .release_session_git_execution_lease(self.session_id);
         }
     }
 }
@@ -128,15 +162,229 @@ fn rebuild_dispatch_plan_for_branch(
     }
 }
 
-pub(crate) async fn continue_execution_chain(
+fn canonical_value_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        _ => value.to_string(),
+    }
+}
+
+fn rebuild_thread_history_from_canonical(
+    turns: &[CanonicalTurn],
+    thread_id: &ThreadId,
+) -> Vec<ThreadChatMessage> {
+    let mut history = Vec::new();
+    for item in turns
+        .iter()
+        .flat_map(|turn| turn.items.iter())
+        .filter(|item| &item.source_thread_id == thread_id)
+    {
+        match item.kind {
+            CanonicalTurnItemKind::UserMessage => {
+                if item
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| !content.trim().is_empty())
+                {
+                    history.push(ThreadChatMessage {
+                        role: "user".to_string(),
+                        content: item.content.clone(),
+                        images: Vec::new(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                }
+            }
+            CanonicalTurnItemKind::AssistantText => {
+                if item
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| !content.trim().is_empty())
+                {
+                    history.push(ThreadChatMessage {
+                        role: "assistant".to_string(),
+                        content: item.content.clone(),
+                        images: Vec::new(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                }
+            }
+            CanonicalTurnItemKind::ToolCall => {
+                let Some(tool) = item.tool.as_ref() else {
+                    continue;
+                };
+                let arguments = tool
+                    .arguments
+                    .as_ref()
+                    .map(canonical_value_text)
+                    .unwrap_or_else(|| "{}".to_string());
+                history.push(ThreadChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    images: Vec::new(),
+                    tool_calls: vec![ThreadChatToolCall {
+                        id: tool.call_id.clone(),
+                        kind: "function".to_string(),
+                        function: ThreadChatToolFunction {
+                            name: tool.name.clone(),
+                            arguments,
+                        },
+                    }],
+                    tool_call_id: None,
+                });
+                let result = tool
+                    .result
+                    .as_ref()
+                    .map(canonical_value_text)
+                    .or_else(|| {
+                        tool.error.as_ref().map(|error| {
+                            serde_json::json!({
+                                "tool": tool.name,
+                                "status": "failed",
+                                "error": error,
+                            })
+                            .to_string()
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        serde_json::json!({
+                            "tool": tool.name,
+                            "status": "interrupted",
+                            "reason": "legacy_thread_history_rebuilt_without_result",
+                        })
+                        .to_string()
+                    });
+                history.push(ThreadChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(result),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(tool.call_id.clone()),
+                });
+            }
+            CanonicalTurnItemKind::AssistantThinking
+            | CanonicalTurnItemKind::TaskStatus
+            | CanonicalTurnItemKind::SystemNotice => {}
+        }
+    }
+    history
+}
+
+pub(crate) fn restore_missing_resumed_branch_threads(
     state: &ApiState,
     session_id: &SessionId,
-    requested_agent_ids: &[WorkerId],
-) -> Result<SessionContinueAccepted, ApiError> {
-    let (accepted, ()) =
-        continue_execution_chain_with_pre_resume(state, session_id, requested_agent_ids, || Ok(()))
-            .await?;
-    Ok(accepted)
+    chain: &ActiveExecutionChain,
+    branches: &[ActiveExecutionBranch],
+) -> Result<usize, ApiError> {
+    let registered_threads = state.session_store.thread_registry_snapshot(session_id);
+    let missing_branches = branches
+        .iter()
+        .filter(|branch| {
+            !registered_threads
+                .iter()
+                .any(|thread| thread.thread_id == branch.thread_id)
+        })
+        .collect::<Vec<_>>();
+    if missing_branches.is_empty() {
+        return Ok(0);
+    }
+
+    let task_store = state
+        .task_store()
+        .ok_or_else(|| ApiError::internal_assembly("继续会话失败", "task_store 未配置"))?;
+    let canonical_turns = state.session_store.canonical_turns_for_session(session_id);
+    for branch in &missing_branches {
+        let task = task_store.get_task(&branch.task_id).ok_or_else(|| {
+            ApiError::not_found("恢复 branch 任务不存在", branch.task_id.as_str())
+        })?;
+        if task.mission_id != chain.mission_id || task.root_task_id != chain.root_task_id {
+            return Err(ApiError::internal_assembly(
+                "继续会话失败",
+                format!("恢复 branch 不属于当前执行链: {}", branch.task_id),
+            ));
+        }
+        let created_at = canonical_turns
+            .iter()
+            .flat_map(|turn| turn.items.iter())
+            .filter(|item| item.source_thread_id == branch.thread_id)
+            .map(|item| item.created_at)
+            .min_by_key(|time| time.0)
+            .unwrap_or(chain.dispatch_context.accepted_at);
+        state.session_store.register_thread(ExecutionThread {
+            thread_id: branch.thread_id.clone(),
+            session_id: session_id.clone(),
+            mission_id: chain.mission_id.clone(),
+            role_id: task
+                .executor_binding_target_role()
+                .unwrap_or("coordinator")
+                .to_string(),
+            worker_instance_id: branch.worker_id.clone(),
+            status: ExecutionThreadStatus::Active,
+            created_at,
+            last_used_at: UtcMillis::now(),
+            handled_task_ids: vec![branch.task_id.clone()],
+            message_history: rebuild_thread_history_from_canonical(
+                &canonical_turns,
+                &branch.thread_id,
+            ),
+        });
+    }
+    state.persist_session_state_checkpoint("session_continue_thread_rebuild")?;
+    Ok(missing_branches.len())
+}
+
+pub(crate) fn persist_resumed_branch_user_input(
+    state: &ApiState,
+    session_id: &SessionId,
+    branches: &[ActiveExecutionBranch],
+    prompt_text: Option<&str>,
+    images: &[SessionTurnImage],
+    accepted_at: UtcMillis,
+) -> Result<(), ApiError> {
+    if prompt_text.is_none() && images.is_empty() {
+        return Ok(());
+    }
+
+    let mut thread_ids = Vec::new();
+    for branch in branches {
+        if !thread_ids.contains(&branch.thread_id) {
+            thread_ids.push(branch.thread_id.clone());
+        }
+    }
+    let registered_threads = state.session_store.thread_registry_snapshot(session_id);
+    if let Some(missing_thread_id) = thread_ids.iter().find(|thread_id| {
+        !registered_threads
+            .iter()
+            .any(|thread| thread.thread_id == **thread_id)
+    }) {
+        return Err(ApiError::internal_assembly(
+            "继续会话失败",
+            format!("恢复分支 thread 不存在: {missing_thread_id}"),
+        ));
+    }
+
+    let message = ThreadChatMessage {
+        role: "user".to_string(),
+        content: prompt_text.map(str::to_string),
+        images: images
+            .iter()
+            .map(|image| ThreadChatImageSource {
+                kind: image.source.kind.clone(),
+                media_type: image.source.media_type.clone(),
+                data: image.source.data.clone(),
+            })
+            .collect(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    };
+    for thread_id in thread_ids {
+        state
+            .session_store
+            .append_thread_messages(&thread_id, vec![message.clone()], accepted_at);
+    }
+    state.persist_session_state_checkpoint("session_continue_task_input")?;
+    Ok(())
 }
 
 /// 在持有 session 生命周期锁且领取恢复权后、启动新 runner 前写入本轮用户信号。
@@ -150,7 +398,7 @@ pub(crate) async fn continue_execution_chain_with_pre_resume<T, F>(
     prepare_input: F,
 ) -> Result<(SessionContinueAccepted, T), ApiError>
 where
-    F: FnOnce() -> Result<T, ApiError>,
+    F: FnOnce(&[ActiveExecutionBranch]) -> Result<T, ApiError>,
 {
     if state.session_store.session(session_id).is_none() {
         return Err(ApiError::session_not_found(session_id.as_str()));
@@ -284,6 +532,17 @@ where
         ));
     }
 
+    let workspace_id = state
+        .session_workspace_id(&session)
+        .or_else(|| chain.workspace_id.clone());
+    state
+        .ensure_snapshot_session_for_workspace_id(session_id, &workspace_id)
+        .await?;
+    state
+        .ensure_session_code_context(session_id, &workspace_id)
+        .await?;
+    let git_execution_lease = SessionGitExecutionLeaseGuard::new(state, session_id);
+
     let _restart_guard = manager.lock_for_restart(chain.root_task_id.as_str()).await;
     manager
         .quiesce_for_restart(chain.root_task_id.as_str())
@@ -368,7 +627,8 @@ where
     })?;
 
     let recovery_claim = InterruptedRecoveryClaimGuard::claim(&state.session_store, session_id)?;
-    let prepared_input = prepare_input()?;
+    restore_missing_resumed_branch_threads(state, session_id, &chain, &branches_to_resume)?;
+    let prepared_input = prepare_input(&branches_to_resume)?;
 
     // resume 入口幂等地保证 orchestrator thread 存在：
     //  * 已存在 → 直接复用 (同 session 同 mission 同 orchestrator thread 不变量)；
@@ -468,5 +728,6 @@ where
         runner_started: true,
     };
     recovery_claim.commit();
+    git_execution_lease.commit();
     Ok((accepted, prepared_input))
 }

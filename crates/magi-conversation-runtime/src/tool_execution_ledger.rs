@@ -8,14 +8,17 @@ use std::collections::BTreeMap;
 
 use magi_bridge_client::ChatToolCall;
 use magi_core::ExecutionResultStatus;
+use magi_session_store::ThreadChatMessage;
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
 use serde_json::Value;
 
-use crate::canonical_tool_call_name;
+use crate::{canonical_tool_call_name, tool_result_utils::infer_tool_call_status};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ToolExecutionLedger {
     successful_idempotent_calls: BTreeMap<ToolCallFingerprint, String>,
+    successful_recovered_side_effect_calls: BTreeMap<ToolCallFingerprint, String>,
+    interrupted_non_idempotent_calls: BTreeMap<ToolCallFingerprint, String>,
     executed_call_counts: BTreeMap<String, usize>,
     explicit_call_budgets: BTreeMap<String, usize>,
 }
@@ -41,6 +44,23 @@ pub(crate) enum ToolCallExecutionDecision {
     BudgetExhausted {
         result: String,
     },
+    RecoveryBlocked {
+        result: String,
+    },
+}
+
+impl ToolCallExecutionDecision {
+    pub(crate) fn immediate_result(&self) -> Option<(String, ExecutionResultStatus)> {
+        match self {
+            Self::Reuse { result } | Self::BudgetExhausted { result } => {
+                Some((result.clone(), ExecutionResultStatus::Succeeded))
+            }
+            Self::RecoveryBlocked { result } => {
+                Some((result.clone(), ExecutionResultStatus::Failed))
+            }
+            Self::Execute { .. } | Self::ReuseAfterExecution { .. } => None,
+        }
+    }
 }
 
 impl ToolExecutionLedger {
@@ -49,6 +69,93 @@ impl ToolExecutionLedger {
             explicit_call_budgets: explicit_single_call_budgets(goal),
             ..Self::default()
         }
+    }
+
+    /// 从当前 task thread 的持久化消息恢复执行账本。
+    ///
+    /// 工具调用先于实际执行写入 thread，成功结果随后写入。因此恢复时：已有成功
+    /// 结果的调用直接复用；没有结果的非只读调用必须先检查实际状态，不能自动重放。
+    pub(crate) fn from_thread_history(
+        goal: &str,
+        history: &[ThreadChatMessage],
+        tool_registry: Option<&ToolRegistry>,
+    ) -> Self {
+        let mut ledger = Self::for_task_goal(goal);
+        let mut calls = BTreeMap::<String, ChatToolCall>::new();
+        let mut results = BTreeMap::<String, String>::new();
+
+        for message in history {
+            if message.role == "assistant" {
+                for call in &message.tool_calls {
+                    calls.insert(
+                        call.id.clone(),
+                        ChatToolCall {
+                            id: call.id.clone(),
+                            kind: call.kind.clone(),
+                            function: magi_bridge_client::ChatToolFunction {
+                                name: call.function.name.clone(),
+                                arguments: call.function.arguments.clone(),
+                            },
+                        },
+                    );
+                }
+            }
+            if message.role == "tool"
+                && let (Some(call_id), Some(result)) =
+                    (message.tool_call_id.as_deref(), message.content.as_deref())
+            {
+                results.insert(call_id.to_string(), result.to_string());
+            }
+        }
+
+        for (call_id, tool_call) in calls {
+            let canonical_name = canonical_tool_call_name(&tool_call.function.name);
+            let result = results.get(&call_id);
+            if result.is_some_and(|result| tool_result_is_interrupted_not_started(result)) {
+                continue;
+            }
+            *ledger
+                .executed_call_counts
+                .entry(canonical_name.clone())
+                .or_default() += 1;
+
+            let Some(result) = result else {
+                if !is_idempotent_read_tool(&canonical_name, tool_registry)
+                    && let Some(fingerprint) = tool_call_fingerprint(&tool_call, &canonical_name)
+                {
+                    ledger
+                        .interrupted_non_idempotent_calls
+                        .insert(fingerprint, interrupted_call_result(&canonical_name));
+                }
+                continue;
+            };
+
+            if tool_result_is_interrupted(result) {
+                if tool_result_is_interrupted_unknown(result)
+                    && !is_idempotent_read_tool(&canonical_name, tool_registry)
+                    && let Some(fingerprint) = tool_call_fingerprint(&tool_call, &canonical_name)
+                {
+                    ledger
+                        .interrupted_non_idempotent_calls
+                        .insert(fingerprint, interrupted_call_result(&canonical_name));
+                }
+            } else if infer_tool_call_status(result) == "success" {
+                if let Some(fingerprint) =
+                    idempotent_fingerprint(&tool_call, &canonical_name, tool_registry)
+                {
+                    ledger
+                        .successful_idempotent_calls
+                        .insert(fingerprint, result.clone());
+                } else if let Some(fingerprint) = tool_call_fingerprint(&tool_call, &canonical_name)
+                {
+                    ledger
+                        .successful_recovered_side_effect_calls
+                        .insert(fingerprint, result.clone());
+                }
+            }
+        }
+
+        ledger
     }
 
     /// 为一个模型响应生成执行决策。相同只读调用在同一响应内只允许一个
@@ -78,6 +185,29 @@ impl ToolExecutionLedger {
                             "duplicate_idempotent_call",
                             "本轮已复用相同只读工具的成功结果，未再次执行。",
                         ),
+                    };
+                }
+
+                if let Some(fingerprint) = tool_call_fingerprint(tool_call, &canonical_name)
+                    && let Some(result) = self
+                        .successful_recovered_side_effect_calls
+                        .get(&fingerprint)
+                {
+                    return ToolCallExecutionDecision::Reuse {
+                        result: reused_result(
+                            &canonical_name,
+                            result,
+                            "completed_before_recovery",
+                            "相同外部操作已在中断前成功完成，本次恢复直接继承原结果，未重复执行。",
+                        ),
+                    };
+                }
+
+                if let Some(fingerprint) = tool_call_fingerprint(tool_call, &canonical_name)
+                    && let Some(result) = self.interrupted_non_idempotent_calls.get(&fingerprint)
+                {
+                    return ToolCallExecutionDecision::RecoveryBlocked {
+                        result: result.clone(),
                     };
                 }
 
@@ -159,6 +289,13 @@ fn idempotent_fingerprint(
     if !is_idempotent_read_tool(canonical_name, tool_registry) {
         return None;
     }
+    tool_call_fingerprint(tool_call, canonical_name)
+}
+
+fn tool_call_fingerprint(
+    tool_call: &ChatToolCall,
+    canonical_name: &str,
+) -> Option<ToolCallFingerprint> {
     let arguments = serde_json::from_str::<Value>(&tool_call.function.arguments).ok()?;
     Some(ToolCallFingerprint {
         tool_name: canonical_name.to_string(),
@@ -253,10 +390,45 @@ fn budget_exhausted_result(tool_name: &str, limit: usize) -> String {
     .to_string()
 }
 
+fn interrupted_call_result(tool_name: &str) -> String {
+    serde_json::json!({
+        "tool": tool_name,
+        "status": "interrupted",
+        "execution": "blocked",
+        "reason": "interrupted_tool_outcome_unknown",
+        "message": "上次执行在结果持久化前中断，无法确认该非只读操作是否已生效。请先检查当前状态，再决定是否使用不同参数重新执行；系统不会自动重放同一调用。",
+    })
+    .to_string()
+}
+
+fn tool_result_is_interrupted_unknown(result: &str) -> bool {
+    tool_result_has_interrupted_execution(result, "unknown")
+}
+
+fn tool_result_is_interrupted_not_started(result: &str) -> bool {
+    tool_result_has_interrupted_execution(result, "not_started")
+}
+
+fn tool_result_has_interrupted_execution(result: &str, execution: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(result) else {
+        return false;
+    };
+    value.get("status").and_then(Value::as_str) == Some("interrupted")
+        && value.get("execution").and_then(Value::as_str) == Some(execution)
+}
+
+fn tool_result_is_interrupted(result: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(result) else {
+        return false;
+    };
+    value.get("status").and_then(Value::as_str) == Some("interrupted")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use magi_bridge_client::ChatToolFunction;
+    use magi_session_store::{ThreadChatToolCall, ThreadChatToolFunction};
 
     fn call(id: &str, name: &str, arguments: &str) -> ChatToolCall {
         ChatToolCall {
@@ -366,5 +538,132 @@ mod tests {
                 .iter()
                 .all(|decision| matches!(decision, ToolCallExecutionDecision::Execute { .. }))
         );
+    }
+
+    #[test]
+    fn restores_successful_read_call_from_persisted_thread_history() {
+        let history = vec![
+            ThreadChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                images: Vec::new(),
+                tool_calls: vec![ThreadChatToolCall {
+                    id: "call-read".to_string(),
+                    kind: "function".to_string(),
+                    function: ThreadChatToolFunction {
+                        name: "web_search".to_string(),
+                        arguments: r#"{"query":"Rust"}"#.to_string(),
+                    },
+                }],
+                tool_call_id: None,
+            },
+            ThreadChatMessage {
+                role: "tool".to_string(),
+                content: Some(
+                    r#"{"tool":"web_search","status":"succeeded","results":["Rust"]}"#.to_string(),
+                ),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call-read".to_string()),
+            },
+        ];
+
+        let ledger = ToolExecutionLedger::from_thread_history("搜索 Rust", &history, None);
+        assert!(matches!(
+            ledger.plan(
+                &[call("call-repeat", "web_search", r#"{"query":"Rust"}"#)],
+                None
+            )[0],
+            ToolCallExecutionDecision::Reuse { .. }
+        ));
+    }
+
+    #[test]
+    fn blocks_replaying_unknown_write_call_after_interruption() {
+        let history = vec![ThreadChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            images: Vec::new(),
+            tool_calls: vec![ThreadChatToolCall {
+                id: "call-write".to_string(),
+                kind: "function".to_string(),
+                function: ThreadChatToolFunction {
+                    name: "file_write".to_string(),
+                    arguments: r#"{"path":"a.txt","content":"x"}"#.to_string(),
+                },
+            }],
+            tool_call_id: None,
+        }];
+
+        let ledger = ToolExecutionLedger::from_thread_history("写入文件", &history, None);
+        let decision = ledger
+            .plan(
+                &[call(
+                    "call-write-repeat",
+                    "file_write",
+                    r#"{"path":"a.txt","content":"x"}"#,
+                )],
+                None,
+            )
+            .remove(0);
+        assert!(matches!(
+            decision,
+            ToolCallExecutionDecision::RecoveryBlocked { .. }
+        ));
+        assert_eq!(
+            decision
+                .immediate_result()
+                .expect("blocked decision should resolve immediately")
+                .1,
+            ExecutionResultStatus::Failed
+        );
+    }
+
+    #[test]
+    fn reuses_successful_write_call_restored_from_thread_history() {
+        let history = vec![
+            ThreadChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                images: Vec::new(),
+                tool_calls: vec![ThreadChatToolCall {
+                    id: "call-write".to_string(),
+                    kind: "function".to_string(),
+                    function: ThreadChatToolFunction {
+                        name: "file_write".to_string(),
+                        arguments: r#"{"path":"a.txt","content":"x"}"#.to_string(),
+                    },
+                }],
+                tool_call_id: None,
+            },
+            ThreadChatMessage {
+                role: "tool".to_string(),
+                content: Some(
+                    r#"{"tool":"file_write","status":"succeeded","changed_paths":["a.txt"]}"#
+                        .to_string(),
+                ),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call-write".to_string()),
+            },
+        ];
+
+        let ledger = ToolExecutionLedger::from_thread_history("写入文件", &history, None);
+        let decision = ledger
+            .plan(
+                &[call(
+                    "call-write-repeat",
+                    "file_write",
+                    r#"{"path":"a.txt","content":"x"}"#,
+                )],
+                None,
+            )
+            .remove(0);
+        let ToolCallExecutionDecision::Reuse { result } = decision else {
+            panic!("恢复后相同写操作必须复用已完成结果");
+        };
+        let payload: Value = serde_json::from_str(&result).expect("reuse result should be json");
+        assert_eq!(payload["execution"], "reused");
+        assert_eq!(payload["reason"], "completed_before_recovery");
     }
 }

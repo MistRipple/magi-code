@@ -5,6 +5,80 @@ await withGoldenViteServer(async (server) => {
   const display = await server.ssrLoadModule('/src/lib/tool-call-display.ts');
   const fileChange = await server.ssrLoadModule('/src/lib/canonical-tool-file-change.ts');
   const terminal = await server.ssrLoadModule('/src/lib/terminal-utils.ts');
+  const toolCallFailure = await server.ssrLoadModule('/src/lib/tool-call-failure.ts');
+
+  assert.deepEqual(
+    toolCallFailure.parseToolCallFailureDiagnostic({
+      schemaVersion: 'tool-call-failure.v1',
+      code: 'tool_arguments_invalid',
+      summary: '模型连续提交无效的 shell_exec 工具参数；工具未执行，本轮已停止。',
+      detail: '缺少必填参数 command',
+      stage: 'tool_call_validation',
+      toolName: 'shell_exec',
+      reasonCode: 'tool_arguments_missing_required',
+      missingFields: ['command'],
+      argumentsPreview: '{}',
+      retryAttempts: 1,
+    }),
+    {
+      schemaVersion: 'tool-call-failure.v1',
+      code: 'tool_arguments_invalid',
+      summary: '模型连续提交无效的 shell_exec 工具参数；工具未执行，本轮已停止。',
+      detail: '缺少必填参数 command',
+      stage: 'tool_call_validation',
+      toolName: 'shell_exec',
+      reasonCode: 'tool_arguments_missing_required',
+      missingFields: ['command'],
+      argumentsPreview: '{}',
+      retryAttempts: 1,
+    },
+    '重复无效工具调用必须保留真实工具名、缺失字段和参数摘要',
+  );
+
+  const { render } = await server.ssrLoadModule('svelte/server');
+  const failureCard = await server.ssrLoadModule('/src/components/ModelFailureCard.svelte');
+  const invalidToolMarkup = render(failureCard.default, {
+    props: {
+      failure: toolCallFailure.parseToolCallFailureDiagnostic({
+        schemaVersion: 'tool-call-failure.v1',
+        code: 'tool_arguments_invalid',
+        summary: '模型连续提交无效的 shell_exec 工具参数；工具未执行，本轮已停止。',
+        detail: '工具：shell_exec\n直接原因：缺少必填参数 command\n收到的参数：{}',
+        stage: 'tool_call_validation',
+        toolName: 'shell_exec',
+        reasonCode: 'tool_arguments_missing_required',
+        missingFields: ['command'],
+        argumentsPreview: '{}',
+        retryAttempts: 1,
+      }),
+    },
+  }).body;
+  assert.match(invalidToolMarkup, /工具调用格式错误/);
+  assert.match(invalidToolMarkup, /shell_exec/);
+  assert.match(invalidToolMarkup, /缺少必填参数 command/);
+  assert.match(invalidToolMarkup, /tool_arguments_invalid/);
+
+  const unavailableToolMarkup = render(failureCard.default, {
+    props: {
+      failure: toolCallFailure.parseToolCallFailureDiagnostic({
+        schemaVersion: 'tool-call-failure.v1',
+        code: 'tool_not_available',
+        summary: '模型连续调用本轮未提供的 shell_exec 工具；工具未执行，本轮已停止。',
+        detail: '工具：shell_exec\n直接原因：当前运行环境未提供工具 shell_exec。',
+        stage: 'tool_call_validation',
+        toolName: 'shell_exec',
+        reasonCode: 'tool_not_available',
+        missingFields: [],
+        argumentsPreview: '{"command":"pwd"}',
+        retryAttempts: 1,
+      }),
+    },
+  }).body;
+  assert.match(unavailableToolMarkup, /工具不可用/);
+  assert.match(unavailableToolMarkup, /校验工具可用性/);
+  assert.match(unavailableToolMarkup, /重新选择可用工具/);
+  assert.match(unavailableToolMarkup, /tool_not_available/);
+  assert.doesNotMatch(unavailableToolMarkup, /工具调用格式错误/);
 
   assert.equal(
     terminal.resolveTerminalArgumentId({ command: 'npm test', action: 'run', terminal_id: 0 }),
@@ -35,7 +109,6 @@ await withGoldenViteServer(async (server) => {
     '失败的 shell_exec 必须展示结构化公开错误，不能退回通用提示',
   );
 
-  const { render } = await server.ssrLoadModule('svelte/server');
   const terminalCard = await server.ssrLoadModule('/src/components/TerminalSessionCard.svelte');
   const failedTerminalMarkup = render(terminalCard.default, {
     props: {

@@ -321,6 +321,7 @@ mod tests {
                 notifications: Vec::new(),
                 goals: Vec::new(),
                 plans: Vec::new(),
+                thread_registry: Vec::new(),
             },
             SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![SessionRuntimeSidecar {

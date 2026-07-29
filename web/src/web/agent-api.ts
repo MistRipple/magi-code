@@ -80,14 +80,6 @@ export interface AgentSessionSummary {
   preview?: string;
 }
 
-export interface AgentBootstrapSnapshot {
-  workspace: AgentWorkspaceSummary;
-  sessionId: string;
-  session: AgentSessionSummary;
-  notifications?: AgentNotificationsPayload;
-  sessions: AgentSessionSummary[];
-}
-
 export interface AgentWorkspaceSessionsSnapshot {
   workspace: AgentWorkspaceSummary;
   sessionId: string;
@@ -1202,8 +1194,8 @@ async function postWorkspaceBoundJson<T>(
 export async function deleteAgentSession(
   sessionId: string,
   bindingOverride?: Partial<AgentBindingContext>,
-): Promise<AgentBootstrapSnapshot> {
-  return await postBoundJson<AgentBootstrapSnapshot>(
+): Promise<unknown> {
+  return await postBoundJson<unknown>(
     '/api/session/delete',
     { sessionId },
     'delete session',
@@ -1227,8 +1219,8 @@ export async function renameAgentSession(
   sessionId: string,
   name: string,
   bindingOverride?: Partial<AgentBindingContext>,
-): Promise<AgentBootstrapSnapshot> {
-  return await postBoundJson<AgentBootstrapSnapshot>(
+): Promise<unknown> {
+  return await postBoundJson<unknown>(
     '/api/session/rename',
     { sessionId, name },
     'rename session',
@@ -1239,8 +1231,8 @@ export async function renameAgentSession(
 export async function closeAgentSession(
   sessionId: string,
   bindingOverride?: Partial<AgentBindingContext>,
-): Promise<AgentBootstrapSnapshot> {
-  return await postBoundJson<AgentBootstrapSnapshot>(
+): Promise<unknown> {
+  return await postBoundJson<unknown>(
     '/api/session/close',
     { sessionId },
     'close session',
@@ -1486,24 +1478,6 @@ export async function interruptAgentSession(
   } finally {
     window.clearTimeout(timeout);
   }
-}
-
-export async function continueAgentSession(
-  sessionId: string,
-  promptText?: string,
-): Promise<Record<string, unknown>> {
-  const normalizedSessionId = sessionId.trim();
-  if (!normalizedSessionId) {
-    throw new AgentApiError(400, 'sessionId 不能为空', 'continue session');
-  }
-  return await postBoundJson<Record<string, unknown>>(
-    '/api/session/continue',
-    {
-      sessionId: normalizedSessionId,
-      ...(promptText?.trim() ? { promptText: promptText.trim() } : {}),
-    },
-    'continue session',
-  );
 }
 
 export async function getAgentSettingsBootstrap(

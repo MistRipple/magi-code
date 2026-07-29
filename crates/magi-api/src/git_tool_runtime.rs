@@ -172,27 +172,69 @@ fn resolve_binding(
     }
     let observation = block_on(deps.git_service.observe(&existing.execution_root))
         .map_err(|error| git_error("git_status", error))?;
-    let context = deps.session_code_contexts.observe(
+    let runtime_workspace_roots = existing.runtime_workspace_roots.clone();
+    let mut context = deps.session_code_contexts.observe(
         &session_id,
         &workspace_id,
-        existing.runtime_workspace_roots,
+        runtime_workspace_roots.clone(),
         &observation,
     );
-    if let Err(message) = persist_contexts(deps) {
-        return Err(failed("git", "git_context_persist_failed", message));
-    }
     if context.has_external_drift() {
-        return Err(rejected(
-            "git",
-            "stale_git_context",
-            format!(
-                "Git context 已漂移：期望 branch={:?} HEAD={:?}，实际 branch={:?} HEAD={:?}",
-                context.git.desired_ref,
-                context.git.base_head,
-                context.git.observed_branch,
-                context.git.observed_head
-            ),
-        ));
+        let is_fast_forward = match block_on(
+            deps.git_service
+                .is_session_context_fast_forward(&existing, &observation),
+        ) {
+            Ok(is_fast_forward) => is_fast_forward,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    previous_head = ?existing.git.base_head,
+                    current_head = ?observation.head,
+                    ?error,
+                    "结构化 Git 工具判断 session 快进失败，保持显式确认"
+                );
+                false
+            }
+        };
+        if !is_fast_forward {
+            if let Err(message) = persist_contexts(deps) {
+                return Err(failed("git", "git_context_persist_failed", message));
+            }
+            return Err(rejected(
+                "git",
+                "stale_git_context",
+                format!(
+                    "Git context 发生高风险变化：期望 branch={:?} HEAD={:?}，实际 branch={:?} HEAD={:?}",
+                    context.git.desired_ref,
+                    context.git.base_head,
+                    context.git.observed_branch,
+                    context.git.observed_head
+                ),
+            ));
+        }
+        if let Err(error) = block_on(
+            deps.snapshot_manager
+                .rebase_session(session_id.clone(), observation.worktree_path.clone()),
+        ) {
+            return Err(failed(
+                "git",
+                "snapshot_baseline_rebuild_failed",
+                format!("Git 快进后重建变更基线失败: {error}"),
+            ));
+        }
+        context = deps.session_code_contexts.accept(
+            &session_id,
+            &workspace_id,
+            runtime_workspace_roots,
+            &observation,
+        );
+        if let Err(message) = persist_contexts(deps) {
+            return Err(failed("git", "git_context_persist_failed", message));
+        }
+        publish_context_changed(deps, &session_id, &workspace_id, &context, &observation);
+        schedule_code_index_refresh(deps, &workspace_id, &observation.worktree_path);
+    } else if let Err(message) = persist_contexts(deps) {
+        return Err(failed("git", "git_context_persist_failed", message));
     }
     let precondition = explicit_precondition(arguments).unwrap_or_else(|| context.precondition());
     Ok(GitToolBinding {
@@ -844,6 +886,33 @@ mod tests {
             serde_json::from_str::<Value>(&status_payload).expect("status json")["result"]["observation"]
                 ["branch"],
             "main"
+        );
+
+        fs::write(repository.join("external.txt"), "external fast-forward\n")
+            .expect("external fixture");
+        git(&repository, &["add", "external.txt"]);
+        git(&repository, &["commit", "-m", "external fast-forward"]);
+        let advanced_head = git(&repository, &["rev-parse", "HEAD"]);
+        let (advanced_payload, advanced_status) = executor("git_status", "{}", &context);
+        assert_eq!(
+            advanced_status,
+            ExecutionResultStatus::Succeeded,
+            "{advanced_payload}"
+        );
+        let advanced_payload =
+            serde_json::from_str::<Value>(&advanced_payload).expect("advanced status json");
+        assert_eq!(
+            advanced_payload["result"]["sessionContext"]["git"]["baseHead"],
+            advanced_head
+        );
+        assert!(
+            snapshot_manager
+                .get_session("session-git-tool")
+                .expect("fast-forward snapshot session")
+                .pending_changes()
+                .expect("pending changes")
+                .is_empty(),
+            "shell 提交后调用结构化 Git 工具必须同步推进变更基线"
         );
 
         let (create_payload, create_status) = executor(

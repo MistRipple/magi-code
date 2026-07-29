@@ -69,7 +69,7 @@ impl SessionStore {
     }
 
     /// 汇总 session 历史与当前运行态引用过的全部 TaskId。canonical turn 是持久化事实，
-    /// 因此 daemon 重启后即使进程内 thread registry 已清空，删除会话仍能定位任务树。
+    /// 因此删除会话时不依赖 thread registry 的完整性也能定位任务树。
     pub fn execution_task_ids_for_session(&self, session_id: &SessionId) -> Vec<magi_core::TaskId> {
         let state = self.state.read().expect("session state read lock poisoned");
         let mut task_ids = HashSet::new();

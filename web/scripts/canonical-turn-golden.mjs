@@ -128,7 +128,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertCanonicalTurnModelRejectsSnakeCase(canonicalProtocol);
   assertCanonicalStreamPayloadParsesWithoutSnapshots(canonicalProtocol);
   assertCanonicalStreamDeltaUpdatesOneItem(reducer, projection);
-  assertCanonicalStreamKeepsSanitizedFailureStable(reducer, canonicalProtocol);
+  assertCanonicalModelFailurePreservesServerDiagnostic(canonicalProtocol);
   assertCanonicalStreamGapRequestsRecovery(reducer);
   assertCanonicalBlocksProjectToFirstClassCards(reducer, projection);
   assertBootstrapSeedsCanonicalEventWatermark(reducer);
@@ -649,9 +649,10 @@ function assertCanonicalStreamDeltaUpdatesOneItem(reducer, projection) {
   assert.equal(overlapped.state.turns[0].items[1].content, '你好呀');
 }
 
-function assertCanonicalStreamKeepsSanitizedFailureStable(reducer, canonicalProtocol) {
-  const c = baseCase('sanitized-stream-failure', 'session-golden-sanitized-stream', 'turn-golden-sanitized-stream', 12_500);
-  const rawFailure = 'provider response invalid: upstream rejected the request';
+function assertCanonicalModelFailurePreservesServerDiagnostic(canonicalProtocol) {
+  const c = baseCase('model-failure-diagnostic', 'session-golden-model-failure', 'turn-golden-model-failure', 12_500);
+  const summary = '模型服务请求失败。';
+  const detail = 'provider response invalid: upstream rejected the request';
   const assistantItem = canonicalProtocol.normalizeCanonicalTurnItem({
     sessionId: c.sessionId,
     turnId: c.turnId,
@@ -661,47 +662,28 @@ function assertCanonicalStreamKeepsSanitizedFailureStable(reducer, canonicalProt
     kind: 'assistant_text',
     createdAt: c.turnSeq,
     updatedAt: c.turnSeq,
-    status: 'running',
+    status: 'failed',
     itemVersion: 1,
-    content: rawFailure,
+    content: summary,
     sourceThreadId: `thread-orchestrator-${c.sessionId}`,
     visibility: { renderable: true },
+    metadata: {
+      modelFailure: {
+        schemaVersion: 'model-failure.v1',
+        code: 'model_invocation_failed',
+        summary,
+        detail,
+        stage: 'request_dispatch',
+        retryable: true,
+        retryAttempts: 1,
+      },
+    },
   });
-  assert.ok(assistantItem, 'internal provider failure item must parse');
-  assert.equal(assistantItem.content, '模型请求未完成，可直接继续重试。');
-  assert.equal(assistantItem.metadata?.publicModelFailureSanitized, true);
-
-  let state = reducer.replaceCanonicalTurns(c.sessionId, [turn(c, 'running', [assistantItem])]);
-  const skippedRawDelta = reducer.reduceCanonicalTurnEvent(state, event(c, 2, 'turn_item_upsert', {
-    stream: {
-      itemId: assistantItem.itemId,
-      itemVersion: 2,
-      itemStatus: 'running',
-      baseContentLength: Array.from(rawFailure).length,
-      delta: ' retrying',
-      contentLength: Array.from(`${rawFailure} retrying`).length,
-      reset: false,
-    },
-  }));
-  assert.equal(skippedRawDelta.error, undefined, 'sanitized failure must not be treated as a stream gap');
-  assert.equal(skippedRawDelta.state.turns[0].items[0].content, '模型请求未完成，可直接继续重试。');
-  assert.equal(skippedRawDelta.state.turns[0].items[0].itemVersion, 2);
-
-  state = skippedRawDelta.state;
-  const resumed = reducer.reduceCanonicalTurnEvent(state, event(c, 3, 'turn_item_upsert', {
-    stream: {
-      itemId: assistantItem.itemId,
-      itemVersion: 3,
-      itemStatus: 'running',
-      baseContentLength: Array.from(`${rawFailure} retrying`).length,
-      delta: '已恢复输出',
-      contentLength: 5,
-      reset: true,
-    },
-  }));
-  assert.equal(resumed.error, undefined, 'stream reset must resume normal output after a sanitized failure');
-  assert.equal(resumed.state.turns[0].items[0].content, '已恢复输出');
-  assert.equal(resumed.state.turns[0].items[0].metadata?.publicModelFailureSanitized, undefined);
+  assert.ok(assistantItem, 'structured model failure item must parse');
+  assert.equal(assistantItem.content, summary);
+  assert.equal(assistantItem.metadata?.modelFailure?.detail, detail);
+  assert.equal(assistantItem.metadata?.modelFailure?.code, 'model_invocation_failed');
+  assert.equal(assistantItem.metadata?.modelFailure?.retryAttempts, 1);
 }
 
 function assertCanonicalStreamGapRequestsRecovery(reducer) {

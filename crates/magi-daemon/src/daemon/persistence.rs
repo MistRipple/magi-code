@@ -80,15 +80,7 @@ impl StateRepository {
         let mut merged = self.load_global_session_state()?;
         for (_, root_path) in workspace_roots {
             let ws_state = self.load_workspace_session_state(root_path)?;
-            merged.sessions.extend(ws_state.sessions);
-            merged.timeline.extend(ws_state.timeline);
-            merged.canonical_turns.extend(ws_state.canonical_turns);
-            merged.notifications.extend(ws_state.notifications);
-            merged.goals.extend(ws_state.goals);
-            merged.plans.extend(ws_state.plans);
-            if merged.current_session_id.is_none() {
-                merged.current_session_id = ws_state.current_session_id;
-            }
+            merged.append_state(ws_state);
         }
         Ok(merged)
     }
@@ -373,12 +365,13 @@ fn stale_backup_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use magi_core::{
-        PlanId, PlanItem, PlanItemId, PlanItemStatus, PlanState, SessionId, SessionLifecycleStatus,
-        UtcMillis,
+        MissionId, PlanId, PlanItem, PlanItemId, PlanItemStatus, PlanState, SessionId,
+        SessionLifecycleStatus, TaskId, ThreadId, UtcMillis, WorkerId,
     };
     use magi_session_store::{
-        NotificationRecord, NotificationScope, SessionDurableState, SessionPlan, SessionRecord,
-        TimelineEntry, TimelineEntryKind,
+        ExecutionThread, ExecutionThreadStatus, NotificationRecord, NotificationScope,
+        SessionDurableState, SessionPlan, SessionRecord, ThreadChatMessage, TimelineEntry,
+        TimelineEntryKind,
     };
     use std::collections::HashMap;
 
@@ -425,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn load_sessions_from_workspaces_merges_timeline_and_notifications() {
+    fn load_sessions_from_workspaces_merges_history_and_thread_registry() {
         let state_root = unique_temp_dir("magi-persistence-state");
         let workspace_root = unique_temp_dir("magi-persistence-workspace");
         let repository = StateRepository::new(state_root.clone());
@@ -475,6 +468,24 @@ mod tests {
                 task_statuses: HashMap::new(),
                 updated_at: now,
             }],
+            thread_registry: vec![ExecutionThread {
+                thread_id: ThreadId::new("thread-persisted"),
+                session_id: session_id.clone(),
+                mission_id: MissionId::new("mission-persisted"),
+                role_id: "executor".to_string(),
+                worker_instance_id: WorkerId::new("worker-persisted"),
+                status: ExecutionThreadStatus::Active,
+                created_at: now,
+                last_used_at: now,
+                handled_task_ids: vec![TaskId::new("task-persisted")],
+                message_history: vec![ThreadChatMessage {
+                    role: "tool".to_string(),
+                    content: Some("exit code 1: persisted tool error".to_string()),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some("call-persisted".to_string()),
+                }],
+            }],
         };
         repository
             .save_workspace_session_state(&workspace_root, &workspace_state)
@@ -492,6 +503,17 @@ mod tests {
         assert_eq!(merged.notifications.len(), 1);
         assert_eq!(merged.plans.len(), 1);
         assert_eq!(merged.plans[0].items[0].title, "恢复目标任务清单");
+        assert_eq!(merged.thread_registry.len(), 1);
+        assert_eq!(
+            merged.thread_registry[0].thread_id.as_str(),
+            "thread-persisted"
+        );
+        assert_eq!(
+            merged.thread_registry[0].message_history[0]
+                .content
+                .as_deref(),
+            Some("exit code 1: persisted tool error")
+        );
         assert_eq!(merged.current_session_id, Some(session_id));
 
         let _ = fs::remove_dir_all(state_root);
@@ -536,6 +558,7 @@ mod tests {
                 )],
                 goals: vec![],
                 plans: vec![],
+                thread_registry: vec![],
             })
             .expect("invalid global session state should save");
 
@@ -589,6 +612,7 @@ mod tests {
                 notifications: vec![],
                 goals: vec![],
                 plans: vec![],
+                thread_registry: vec![],
             })
             .expect("invalid global session state should save");
 
@@ -653,6 +677,7 @@ mod tests {
                 notifications: vec![],
                 goals: vec![],
                 plans: vec![],
+                thread_registry: vec![],
             })
             .expect("global session durable state should save");
 
@@ -683,6 +708,7 @@ mod tests {
                     notifications: vec![],
                     goals: vec![],
                     plans: vec![],
+                    thread_registry: vec![],
                 },
             )
             .expect("workspace session durable state should save");
@@ -735,6 +761,7 @@ mod tests {
                 notifications: vec![],
                 goals: vec![],
                 plans: vec![],
+                thread_registry: vec![],
             })
             .expect("global session durable state should save");
 

@@ -377,7 +377,7 @@ fn ensure_workspace_code_index(
         return Ok(WorkspaceCodeIndexLoadState::Ready(outcome));
     }
 
-    schedule_workspace_code_index(state.clone(), workspace_id.clone(), workspace_root);
+    state.schedule_workspace_code_index(workspace_id.clone(), workspace_root);
     Ok(WorkspaceCodeIndexLoadState::Indexing)
 }
 
@@ -406,63 +406,6 @@ fn code_index_status_json(
     })
 }
 
-pub(crate) fn schedule_workspace_code_index(
-    state: ApiState,
-    workspace_id: WorkspaceId,
-    workspace_root: PathBuf,
-) -> bool {
-    if !state
-        .knowledge_store
-        .begin_workspace_index_build(&workspace_id)
-    {
-        return false;
-    }
-
-    tokio::spawn(async move {
-        let build_state = state.clone();
-        let build_workspace_id = workspace_id.clone();
-        let build_result = tokio::task::spawn_blocking(move || {
-            build_state
-                .knowledge_store
-                .build_workspace_index(&build_workspace_id, &workspace_root)
-        })
-        .await;
-        let cancelled_before_persist = state
-            .knowledge_store
-            .workspace_index_build_cancelled(&workspace_id);
-        match build_result {
-            Ok(_) => {
-                if !cancelled_before_persist && let Err(error) = state.persist_knowledge_state() {
-                    tracing::warn!(
-                        workspace_id = %workspace_id,
-                        error = ?error,
-                        "后台代码索引持久化失败"
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    workspace_id = %workspace_id,
-                    error = %error,
-                    "后台代码索引构建任务失败"
-                );
-            }
-        }
-        if state
-            .knowledge_store
-            .finish_workspace_index_build(&workspace_id)
-            && let Err(error) = state.persist_knowledge_state()
-        {
-            tracing::warn!(
-                workspace_id = %workspace_id,
-                error = ?error,
-                "已取消的后台代码索引清理结果持久化失败"
-            );
-        }
-    });
-    true
-}
-
 async fn reindex_knowledge(
     State(state): State<ApiState>,
     Json(request): Json<KnowledgeWorkspaceRequest>,
@@ -473,7 +416,7 @@ async fn reindex_knowledge(
         request.workspace_path.as_deref(),
     )?;
     let scheduled =
-        schedule_workspace_code_index(state, workspace_id.clone(), PathBuf::from(&workspace_path));
+        state.schedule_workspace_code_index(workspace_id.clone(), PathBuf::from(&workspace_path));
     Ok(Json(serde_json::json!({
         "accepted": scheduled,
         "workspaceId": workspace_id.as_str(),

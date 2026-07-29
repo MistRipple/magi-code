@@ -855,6 +855,11 @@ await withGoldenViteServer(async (server) => {
     () => messagesStore.messagesState.isProcessing === false,
     'terminal session turn event with canonical payload must settle processing without waiting for recovery',
   );
+  assert.equal(
+    messagesStore.messagesState.orchestratorRuntimeState?.status,
+    'completed',
+    'terminal canonical event must settle the runtime panel without waiting for a later bootstrap',
+  );
   const terminalArtifact = findArtifactByTurnItemId(
     messagesStore.messagesState.canonicalTimelineProjection,
     'assistant-bridge-live-terminal',
@@ -871,6 +876,11 @@ await withGoldenViteServer(async (server) => {
   await waitFor(
     () => currentSessionSummary(messagesStore)?.updatedAt === summaryUpdatedAt,
     'terminal bootstrap refresh must finish applying before tunnel reconciliation starts',
+  );
+  assert.equal(
+    messagesStore.messagesState.orchestratorRuntimeState?.status,
+    'completed',
+    'a stale terminal bootstrap must not lift the runtime panel back to running',
   );
 
   const canonicalTurnsBeforeLaterRound = structuredClone(turnStore.turnStoreState.reducer.turns);
@@ -1562,6 +1572,62 @@ await withGoldenViteServer(async (server) => {
     'first turn accepted response must replace the local-only session binding with the real session',
   );
   messagesStore.clearPendingRequest('request-first-turn-immediate-feedback');
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const continueTurnAccepted = deferred();
+  const continueBootstrapRequestCount = bootstrapRequestCount;
+  const continueWorkspaceSessionsRequestCount = workspaceSessionsRequestCount;
+  const continueCapturedTurnCount = capturedTurnBodies.length;
+  sessionTurnInterceptors.push(() => continueTurnAccepted.promise);
+  bridge.postMessage({ type: 'continueTask' });
+  await waitFor(
+    () => capturedTurnBodies.length === continueCapturedTurnCount + 1,
+    'continueTask must submit through the canonical session turn endpoint',
+  );
+  const continueTurnBody = capturedTurnBodies.at(-1);
+  assert.equal(continueTurnBody.text, '继续');
+  assert.equal(continueTurnBody.sessionId, SESSION_ID);
+  assert.equal(
+    bootstrapRequestCount,
+    continueBootstrapRequestCount,
+    'continueTask must not refresh the full bootstrap before submission',
+  );
+  assert.equal(
+    workspaceSessionsRequestCount,
+    continueWorkspaceSessionsRequestCount,
+    'continueTask must not refresh the workspace session list before submission',
+  );
+  const continueLocalArtifact = findArtifactByRequestId(
+    messagesStore.messagesState.canonicalTimelineProjection,
+    continueTurnBody.requestId,
+  );
+  assert.equal(
+    continueLocalArtifact?.message?.content,
+    '继续',
+    'continueTask must render the user input immediately while the backend resumes the runner',
+  );
+  continueTurnAccepted.resolve(jsonResponse({
+    sessionId: SESSION_ID,
+    entryId: 'timeline-continue-no-refresh',
+    eventId: 'event-continue-no-refresh',
+    acceptedAt: ACCEPTED_AT + 2700,
+    createdSession: false,
+    route: 'continue',
+    rootTaskId: 'task-continue-no-refresh',
+    actionTaskId: 'task-continue-no-refresh',
+    userMessageItemId: 'user-continue-no-refresh',
+    canonicalSchemaVersion: null,
+    canonicalEventKind: null,
+    canonicalTurn: null,
+    canonicalItem: null,
+  }));
+  await waitFor(
+    () => messagesStore.messagesState.pendingRequests.has(continueTurnBody.requestId),
+    'continueTask accepted response must keep the request tracked until terminal runtime output arrives',
+  );
+  assert.equal(bootstrapRequestCount, continueBootstrapRequestCount);
+  assert.equal(workspaceSessionsRequestCount, continueWorkspaceSessionsRequestCount);
+  messagesStore.clearPendingRequest(continueTurnBody.requestId);
 
   const originalRaceWarn = console.warn;
   try {

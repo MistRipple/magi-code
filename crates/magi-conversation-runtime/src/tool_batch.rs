@@ -276,11 +276,11 @@ pub(crate) fn execute_task_tool_call_batch(
 
     let mut fallback_indices = Vec::new();
     for (index, decision) in decisions.iter().enumerate() {
+        if let Some(result) = decision.immediate_result() {
+            results[index] = Some(result);
+            continue;
+        }
         match decision {
-            ToolCallExecutionDecision::Reuse { result }
-            | ToolCallExecutionDecision::BudgetExhausted { result } => {
-                results[index] = Some((result.clone(), ExecutionResultStatus::Succeeded));
-            }
             ToolCallExecutionDecision::ReuseAfterExecution {
                 source_index,
                 fingerprint,
@@ -299,6 +299,11 @@ pub(crate) fn execute_task_tool_call_batch(
                 }
             }
             ToolCallExecutionDecision::Execute { .. } => {}
+            ToolCallExecutionDecision::Reuse { .. }
+            | ToolCallExecutionDecision::BudgetExhausted { .. }
+            | ToolCallExecutionDecision::RecoveryBlocked { .. } => {
+                unreachable!("immediate decisions are handled before deferred execution")
+            }
         }
     }
 

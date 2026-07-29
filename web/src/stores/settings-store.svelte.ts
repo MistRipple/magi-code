@@ -153,6 +153,7 @@ export interface MCPServer {
   connected?: boolean;
   health?: "connected" | "degraded" | "disconnected" | "disabled";
   error?: string;
+  errorDetail?: string;
   toolCount?: number;
   reconnectAttempts?: number;
   lastCheckedAt?: number;
@@ -2177,6 +2178,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
       && resultHealth !== "disabled"
       && typeof result?.error === "string"
       && result.error.trim().length > 0;
+    const errorDetail = typeof result?.errorDetail === "string"
+      ? result.errorDetail.trim()
+      : "";
+    const lastCheckedAt = Number.isFinite(result?.lastCheckedAt)
+      ? Number(result.lastCheckedAt)
+      : Date.now();
     mcpServerTools = { ...mcpServerTools, [serverId]: unavailable ? [] : tools };
     mcpServers = mcpServers.map((server) => {
       if (server.id !== serverId) return server;
@@ -2187,7 +2194,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
           connected: false,
           health: disabled ? "disabled" : "disconnected",
           error: !disabled && connectionFailed ? "connection_issue" : undefined,
+          errorDetail: !disabled && errorDetail ? errorDetail : undefined,
           toolCount: 0,
+          lastCheckedAt,
         };
       }
       return {
@@ -2195,7 +2204,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
         connected: true,
         health: "connected",
         error: undefined,
+        errorDetail: undefined,
         toolCount: tools.length,
+        lastCheckedAt,
       };
     });
     return !unavailable;
@@ -2849,6 +2860,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
           enabled && typeof s.error === "string" && s.error.trim()
             ? "connection_issue"
             : undefined,
+        errorDetail:
+          enabled && typeof s.errorDetail === "string" && s.errorDetail.trim()
+            ? s.errorDetail.trim()
+            : undefined,
         toolCount: Number.isFinite(s.toolCount) ? Number(s.toolCount) : 0,
         reconnectAttempts: Number.isFinite(s.reconnectAttempts)
           ? Number(s.reconnectAttempts)
@@ -2870,7 +2885,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
   async function connectEnabledMcpServers(): Promise<void> {
     const targets = mcpServers.filter((server) =>
       server.enabled !== false
-      && server.connected !== true
       && !mcpConnectingServers.has(server.id)
     );
     if (targets.length === 0) return;
@@ -2883,25 +2897,36 @@ function createSettingsStore(props: { onClose?: () => void }) {
       try {
         const result = await connectAgentMcpServer(server.id);
         const connected = result.connected === true;
+        const errorDetail = typeof result.errorDetail === "string"
+          ? result.errorDetail.trim()
+          : "";
+        const lastCheckedAt = Number.isFinite(result.lastCheckedAt)
+          ? Number(result.lastCheckedAt)
+          : Date.now();
         mcpServers = mcpServers.map((current) => current.id === server.id
           ? {
               ...current,
               connected,
               health: connected ? "connected" : "disconnected",
               error: connected ? undefined : "connection_issue",
+              errorDetail: connected || !errorDetail ? undefined : errorDetail,
               toolCount: Number.isFinite(result.toolCount)
                 ? Number(result.toolCount)
                 : current.toolCount,
+              lastCheckedAt,
             }
           : current);
       } catch (error) {
         console.error(`[SettingsPanel] 自动连接 MCP 服务器 ${server.id} 失败:`, error);
+        const errorDetail = error instanceof Error ? error.message.trim() : String(error);
         mcpServers = mcpServers.map((current) => current.id === server.id
           ? {
               ...current,
               connected: false,
               health: "disconnected",
               error: "connection_issue",
+              errorDetail: errorDetail || undefined,
+              lastCheckedAt: Date.now(),
             }
           : current);
       } finally {

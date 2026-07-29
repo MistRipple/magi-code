@@ -682,6 +682,8 @@ pub struct SessionTurnErrorInput<'a> {
     pub user_message_id: Option<&'a str>,
     pub placeholder_message_id: Option<&'a str>,
     pub error_text: &'a str,
+    pub model_failure: Option<&'a crate::model_error::ModelFailureDiagnostic>,
+    pub tool_call_failure: Option<Value>,
     pub streaming_entry_id: Option<&'a str>,
     pub source_thread_id: ThreadId,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
@@ -700,6 +702,8 @@ pub fn append_session_turn_error_item(
         user_message_id,
         placeholder_message_id,
         error_text,
+        model_failure,
+        tool_call_failure,
         streaming_entry_id: _,
         source_thread_id,
         persist_session_state,
@@ -719,6 +723,17 @@ pub fn append_session_turn_error_item(
     error_item.request_id = request_id.map(str::to_string);
     error_item.user_message_id = user_message_id.map(str::to_string);
     error_item.placeholder_message_id = placeholder_message_id.map(str::to_string);
+    if let Some(model_failure) = model_failure {
+        error_item.metadata.insert(
+            "modelFailure".to_string(),
+            serde_json::to_value(model_failure).expect("model failure diagnostic must serialize"),
+        );
+    }
+    if let Some(tool_call_failure) = tool_call_failure {
+        error_item
+            .metadata
+            .insert("toolCallFailure".to_string(), tool_call_failure);
+    }
     let _ = append_session_turn_item(session_store, session_id, error_item);
     let _ = session_store.update_current_turn_status(session_id, "failed");
     persist_session_state_checkpoint(persist_session_state, "session_turn_failed");

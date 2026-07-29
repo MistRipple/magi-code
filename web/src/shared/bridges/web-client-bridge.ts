@@ -42,7 +42,6 @@ import {
   getAgentNotifications,
   getAgentSessionTurnQueue,
   getWorkspaceSessions,
-  continueAgentSession,
   interruptAgentSession,
   installAgentLocalSkill,
   installAgentSkill,
@@ -138,7 +137,6 @@ import { sanitizeSvgContent } from '../svg-sanitizer';
 import {
   messagesState,
   allocateTurnOrderSeq,
-  addPendingRequest,
   adoptAcceptedSessionIdForLocalTurn,
   beginLocalTurnSubmission,
   clearRequestBinding,
@@ -3143,42 +3141,6 @@ async function closeSession(sessionId: string, scope: BridgeRequestScope = {}): 
   emitBridgeSuccessToast(i18n.t('bridge.action.closeSession'), i18n.t('bridge.detail.sessionClosed'));
 }
 
-async function ensureFreshLiveBridge(reason: string): Promise<void> {
-  hydrateCanonicalWorkspaceBinding();
-  const hasWorkspaceBinding = Boolean(currentWorkspaceId || currentWorkspacePath);
-  const hasBinding = Boolean(hasWorkspaceBinding || currentSessionId);
-  if (!hasBinding) {
-    await restoreBridgeState(reason, true);
-    return;
-  }
-  if (hasWorkspaceBinding && !currentSessionId) {
-    const expectedKey = eventStreamBindingKey();
-    await ensureEventStream({
-      forceReconnect: activeEventStreamKey !== expectedKey,
-      waitUntilOpen: true,
-    });
-    return;
-  }
-  if (
-    bridgeRecovering
-    || recoveryInFlight
-    || !activeSseConnection
-    || activeEventStreamState !== 'open'
-  ) {
-    await restoreBridgeState(reason, true);
-    return;
-  }
-  // 检查当前 SSE 连接的 key 是否与预期 workspace 绑定匹配。
-  // 事件流按 workspace 订阅，session 展示由前端本地按 sessionId 分发，
-  // 避免切换当前会话时重连 SSE 并抢占其他会话的实时输出。
-  const expectedKey = eventStreamBindingKey();
-  const needsReconnect = activeEventStreamKey !== expectedKey;
-  await ensureEventStream({
-    forceReconnect: needsReconnect,
-    waitUntilOpen: true,
-  });
-}
-
 // 发送消息不能被弱网络下的 SSE 握手阻塞；HTTP 提交先行，事件流在后台追上。
 async function warmLiveBridgeForSubmission(reason: string): Promise<void> {
   hydrateCanonicalWorkspaceBinding();
@@ -3551,7 +3513,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     clearActiveTurnInFlight();
     clearCurrentInterruptTaskId();
     console.error('[web-client-bridge] 执行任务失败:', error);
-    const errorText = i18n.t('bridge.detail.messageSendFailed');
+    const errorText = normalizeErrorMessage(error) || i18n.t('bridge.detail.messageSendFailed');
     emitLocalPendingCanonicalTurnFailed({
       sessionId: optimisticSessionId,
       requestId,
@@ -3624,42 +3586,27 @@ async function continueSessionExecution(): Promise<void> {
   }
   const requestId = `continue-${generateMessageId()}`;
   continueRequestId = requestId;
-  addPendingRequest(requestId, { resetAntiLiftBack: true });
   window.dispatchEvent(new CustomEvent('magi:interruptedRecoveryContinueStatus', {
     detail: { status: 'pending' },
   }));
-  try {
-    await ensureFreshLiveBridge('continue_session_preflight');
-    const result = await continueAgentSession(sessionId, '继续执行中断的任务');
-    const rootTaskId = trimBridgeString(result.rootTaskId)
-      || trimBridgeString(result.root_task_id);
-    if (!rootTaskId) {
-      throw new Error('继续会话响应缺少 rootTaskId');
-    }
-    setCurrentInterruptTaskId(rootTaskId);
-    initAgentRunTracking(sessionId, rootTaskId, currentWorkspaceId, currentWorkspacePath);
+  const accepted = await executeTask({
+    text: '继续',
+    workspaceId: currentWorkspaceId,
+    workspacePath: currentWorkspacePath,
+    sessionId,
+    requestId,
+    images: [],
+    contextReferences: [],
+  });
+  if (accepted) {
     window.dispatchEvent(new CustomEvent('magi:interruptedRecoveryContinueStatus', {
       detail: { status: 'accepted' },
     }));
-    void ensureEventStream({ forceReconnect: false, waitUntilOpen: false }).catch((error) => {
-      console.warn('[web-client-bridge] continueTask 后 SSE 连接确认失败:', error);
-    });
-  } catch (error) {
-    console.error('[web-client-bridge] 继续会话失败:', error);
-    emitBridgeErrorToast(i18n.t('bridge.action.continueSession'), error);
-    emitForcedProcessingIdle('continue_session_failed', {
-      error: normalizeErrorMessage(error),
-      sessionId,
-      requestId,
-    });
-    window.dispatchEvent(new CustomEvent('magi:interruptedRecoveryContinueStatus', {
-      detail: { status: 'failed' },
-    }));
-    if (shouldRecoverFromBridgeError(error)) {
-      closeEventStream();
-      scheduleRecovery('continue_session_failed', error, true);
-    }
+    return;
   }
+  window.dispatchEvent(new CustomEvent('magi:interruptedRecoveryContinueStatus', {
+    detail: { status: 'failed' },
+  }));
 }
 
 function escapePreviewHtml(content: string): string {

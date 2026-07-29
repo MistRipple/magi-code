@@ -4,7 +4,8 @@ use crate::models::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurnStatus, ExecutionThread,
     ExecutionThreadStatus, GoalStatus, NotificationRecord, NotificationScope, SessionDurableState,
     SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionPlan,
-    SessionSidecarFlushReason, SessionStoreState,
+    SessionSidecarFlushReason, SessionStoreState, ThreadChatMessage, ThreadChatToolCall,
+    ThreadChatToolFunction,
 };
 use magi_core::{
     AccessProfile, ExecutionOwnership, MissionId, PlanId, PlanItem, PlanItemId, PlanItemStatus,
@@ -179,6 +180,62 @@ fn selecting_current_session_is_durable_without_changing_business_history() {
             .session_id,
         first_session_id
     );
+}
+
+#[test]
+fn rename_session_validates_title_and_skips_noop_history() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-rename-validation");
+    let created = store
+        .create_session(session_id.clone(), "原始名称")
+        .expect("session should create");
+
+    let renamed = store
+        .rename_session(&session_id, "  新名称  ")
+        .expect("valid title should rename");
+    assert_eq!(renamed.title, "新名称");
+    assert_eq!(
+        store
+            .timeline()
+            .iter()
+            .filter(|entry| matches!(&entry.kind, TimelineEntryKind::SessionRenamed))
+            .count(),
+        1
+    );
+
+    let unchanged = store
+        .rename_session(&session_id, "新名称")
+        .expect("same title should be a successful noop");
+    assert_eq!(unchanged.updated_at, renamed.updated_at);
+    assert_eq!(
+        store
+            .timeline()
+            .iter()
+            .filter(|entry| matches!(&entry.kind, TimelineEntryKind::SessionRenamed))
+            .count(),
+        1,
+        "相同标题不能重复写入审计记录"
+    );
+
+    for invalid_title in [
+        "".to_string(),
+        "\n".to_string(),
+        "包含\n换行".to_string(),
+        std::iter::repeat_n('字', SESSION_TITLE_MAX_CHARS + 1).collect(),
+    ] {
+        assert!(matches!(
+            store.rename_session(&session_id, invalid_title),
+            Err(DomainError::Validation { .. })
+        ));
+    }
+    assert_eq!(
+        store
+            .session(&session_id)
+            .expect("session should remain")
+            .title,
+        "新名称"
+    );
+    assert!(created.updated_at.0 <= renamed.updated_at.0);
 }
 
 #[test]
@@ -3169,6 +3226,152 @@ fn sample_thread(
         handled_task_ids: Vec::new(),
         message_history: Vec::new(),
     }
+}
+
+#[test]
+fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-thread-round-trip");
+    let mission_id = MissionId::new("mission-thread-round-trip");
+    let thread_id = ThreadId::new("thread-worker-round-trip");
+    let task_id = TaskId::new("task-thread-round-trip");
+    store
+        .create_session_for_workspace(
+            session_id.clone(),
+            "Thread Round Trip",
+            Some("workspace-round-trip".to_string()),
+        )
+        .expect("session should be creatable");
+
+    let mut thread = sample_thread(
+        thread_id.as_str(),
+        &session_id,
+        &mission_id,
+        "executor",
+        UtcMillis(1_000),
+        ExecutionThreadStatus::Active,
+    );
+    thread.handled_task_ids.push(task_id.clone());
+    store.register_thread(thread);
+    store.append_thread_messages(
+        &thread_id,
+        vec![
+            ThreadChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                images: Vec::new(),
+                tool_calls: vec![ThreadChatToolCall {
+                    id: "call-shell-round-trip".to_string(),
+                    kind: "function".to_string(),
+                    function: ThreadChatToolFunction {
+                        name: "shell_exec".to_string(),
+                        arguments: r#"{"command":"cargo test"}"#.to_string(),
+                    },
+                }],
+                tool_call_id: None,
+            },
+            ThreadChatMessage {
+                role: "tool".to_string(),
+                content: Some("exit code 1: compilation failed".to_string()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call-shell-round-trip".to_string()),
+            },
+            ThreadChatMessage {
+                role: "user".to_string(),
+                content: Some("继续".to_string()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+        ],
+        UtcMillis(2_000),
+    );
+
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        SessionExecutionSidecarStoreState::default(),
+    );
+    let restored_threads = restored.thread_registry_snapshot(&session_id);
+    assert_eq!(restored_threads.len(), 1);
+    assert_eq!(restored_threads[0].thread_id, thread_id);
+    assert_eq!(restored_threads[0].mission_id, mission_id);
+    assert_eq!(restored_threads[0].handled_task_ids, vec![task_id]);
+    assert_eq!(restored_threads[0].status, ExecutionThreadStatus::Active);
+
+    let history = restored.thread_message_history(&restored_threads[0].thread_id);
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0].role, "assistant");
+    assert_eq!(history[0].tool_calls[0].function.name, "shell_exec");
+    assert_eq!(
+        history[1].content.as_deref(),
+        Some("exit code 1: compilation failed")
+    );
+    assert_eq!(history[2].content.as_deref(), Some("继续"));
+}
+
+#[test]
+fn thread_registry_partition_follows_session_workspace_ownership() {
+    let store = SessionStore::new();
+    let global_session_id = SessionId::new("session-thread-global");
+    let workspace_a_session_id = SessionId::new("session-thread-workspace-a");
+    let workspace_b_session_id = SessionId::new("session-thread-workspace-b");
+    let mission_id = MissionId::new("mission-thread-partition");
+    store
+        .create_session(global_session_id.clone(), "Global Session")
+        .expect("global session should be creatable");
+    store
+        .create_session_for_workspace(
+            workspace_a_session_id.clone(),
+            "Workspace A Session",
+            Some("workspace-a".to_string()),
+        )
+        .expect("workspace A session should be creatable");
+    store
+        .create_session_for_workspace(
+            workspace_b_session_id.clone(),
+            "Workspace B Session",
+            Some("workspace-b".to_string()),
+        )
+        .expect("workspace B session should be creatable");
+
+    for (thread_id, session_id) in [
+        ("thread-global", &global_session_id),
+        ("thread-workspace-a", &workspace_a_session_id),
+        ("thread-workspace-b", &workspace_b_session_id),
+    ] {
+        store.register_thread(sample_thread(
+            thread_id,
+            session_id,
+            &mission_id,
+            "executor",
+            UtcMillis(1_000),
+            ExecutionThreadStatus::Idle,
+        ));
+    }
+
+    let (global_state, workspace_states) = store.durable_state().partition_by_workspace();
+    assert_eq!(global_state.thread_registry.len(), 1);
+    assert_eq!(
+        global_state.thread_registry[0].session_id,
+        global_session_id
+    );
+    let workspace_a_state = workspace_states
+        .get("workspace-a")
+        .expect("workspace A durable state should exist");
+    assert_eq!(workspace_a_state.thread_registry.len(), 1);
+    assert_eq!(
+        workspace_a_state.thread_registry[0].session_id,
+        workspace_a_session_id
+    );
+    let workspace_b_state = workspace_states
+        .get("workspace-b")
+        .expect("workspace B durable state should exist");
+    assert_eq!(workspace_b_state.thread_registry.len(), 1);
+    assert_eq!(
+        workspace_b_state.thread_registry[0].session_id,
+        workspace_b_session_id
+    );
 }
 
 #[test]

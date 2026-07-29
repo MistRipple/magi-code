@@ -5,13 +5,14 @@ use magi_process::{ManagedChild, spawn_managed, std_command};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     env,
+    error::Error as StdError,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::Stdio,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError},
     },
@@ -22,7 +23,11 @@ const MCP_SERVER_COMMAND_ENV: &str = "MAGI_MCP_SERVER_COMMAND";
 const MCP_SERVER_ARGS_ENV: &str = "MAGI_MCP_SERVER_ARGS";
 const MCP_SERVER_WORKING_DIR_ENV: &str = "MAGI_MCP_SERVER_WORKING_DIR";
 const DEFAULT_MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const STREAMABLE_HTTP_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const PREFERRED_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] =
+    &[PREFERRED_MCP_PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
+const MCP_STDERR_MAX_LINES: usize = 20;
+const MCP_STDERR_MAX_LINE_CHARS: usize = 1_000;
 
 /// Configuration for connecting to a real MCP server via stdio transport.
 #[derive(Clone, Debug)]
@@ -124,6 +129,7 @@ struct McpConnection {
     child: ManagedChild,
     responses: Receiver<Result<Value, String>>,
     writer: std::process::ChildStdin,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl std::fmt::Debug for StdioMcpBridgeClient {
@@ -226,14 +232,16 @@ impl StdioMcpBridgeClient {
                 self.config.command
             ))
         })?;
-        if let Some(stderr) = child.take_stderr() {
-            spawn_mcp_stderr_drain(stderr);
-        }
+        let stderr_tail = child
+            .take_stderr()
+            .map(spawn_mcp_stderr_reader)
+            .unwrap_or_else(|| Arc::new(Mutex::new(VecDeque::new())));
 
         let mut conn = McpConnection {
             child,
             responses: spawn_mcp_stdout_reader(stdout),
             writer: stdin,
+            stderr_tail,
         };
 
         // Step 1: Send initialize request
@@ -243,7 +251,7 @@ impl StdioMcpBridgeClient {
             "id": init_id,
             "method": "initialize",
             "params": {
-                "protocolVersion": STREAMABLE_HTTP_MCP_PROTOCOL_VERSION,
+                "protocolVersion": PREFERRED_MCP_PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": {
                     "name": "magi-bridge-client",
@@ -252,16 +260,27 @@ impl StdioMcpBridgeClient {
             }
         });
 
-        send_json(&mut conn.writer, &init_request)?;
+        if let Err(error) = send_json(&mut conn.writer, &init_request) {
+            let error = enrich_mcp_process_error(&mut conn, error);
+            terminate_mcp_connection(&mut conn);
+            return Err(error);
+        }
         let init_response =
             match receive_json_response(&conn.responses, self.config.request_timeout) {
                 Ok(response) => response,
                 Err(error) => {
+                    let error = enrich_mcp_process_error(&mut conn, error);
                     terminate_mcp_connection(&mut conn);
                     return Err(error);
                 }
             };
         if let Err(error) = validate_jsonrpc_response(&init_response, init_id) {
+            let error = enrich_mcp_process_error(&mut conn, error);
+            terminate_mcp_connection(&mut conn);
+            return Err(error);
+        }
+        if let Err(error) = negotiate_mcp_protocol_version(&init_response, "stdio") {
+            let error = enrich_mcp_process_error(&mut conn, error);
             terminate_mcp_connection(&mut conn);
             return Err(error);
         }
@@ -272,7 +291,11 @@ impl StdioMcpBridgeClient {
             "method": "notifications/initialized",
             "params": {}
         });
-        send_json(&mut conn.writer, &initialized_notification)?;
+        if let Err(error) = send_json(&mut conn.writer, &initialized_notification) {
+            let error = enrich_mcp_process_error(&mut conn, error);
+            terminate_mcp_connection(&mut conn);
+            return Err(error);
+        }
 
         *connection_guard = Some(conn);
         self.initialized.store(true, Ordering::Relaxed);
@@ -287,9 +310,9 @@ impl StdioMcpBridgeClient {
             .lock()
             .map_err(|_| mcp_transport_error("connection mutex poisoned".to_string()))?;
 
-        let conn = connection_guard
-            .as_mut()
-            .ok_or_else(|| mcp_transport_error("MCP server not connected".to_string()))?;
+        if connection_guard.is_none() {
+            return Err(mcp_transport_error("MCP server not connected".to_string()));
+        }
 
         let request_id = self.next_request_id();
         let request = json!({
@@ -299,34 +322,77 @@ impl StdioMcpBridgeClient {
             "params": params
         });
 
-        send_json(&mut conn.writer, &request)?;
-        let response = match receive_json_response(&conn.responses, self.config.request_timeout) {
+        let send_result = send_json(
+            &mut connection_guard
+                .as_mut()
+                .expect("MCP connection checked above")
+                .writer,
+            &request,
+        );
+        if let Err(error) = send_result {
+            let mut failed = connection_guard
+                .take()
+                .expect("failed MCP connection should remain present");
+            let error = enrich_mcp_process_error(&mut failed, error);
+            terminate_mcp_connection(&mut failed);
+            self.initialized.store(false, Ordering::Relaxed);
+            return Err(error);
+        }
+        let response = match receive_json_response(
+            &connection_guard
+                .as_ref()
+                .expect("MCP connection checked above")
+                .responses,
+            self.config.request_timeout,
+        ) {
             Ok(response) => response,
             Err(error) => {
                 if let Some(mut failed) = connection_guard.take() {
+                    let error = enrich_mcp_process_error(&mut failed, error);
                     terminate_mcp_connection(&mut failed);
+                    self.initialized.store(false, Ordering::Relaxed);
+                    return Err(error);
                 }
                 self.initialized.store(false, Ordering::Relaxed);
                 return Err(error);
             }
         };
         if let Err(error) = validate_jsonrpc_response(&response, request_id) {
+            if error.layer() == Some(BridgeErrorLayer::RemoteBusiness) {
+                return Err(error);
+            }
             if let Some(mut failed) = connection_guard.take() {
+                let error = enrich_mcp_process_error(&mut failed, error);
                 terminate_mcp_connection(&mut failed);
+                self.initialized.store(false, Ordering::Relaxed);
+                return Err(error);
             }
             self.initialized.store(false, Ordering::Relaxed);
             return Err(error);
         }
 
-        // Extract result
-        response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| BridgeClientError::CallFailed {
+        if let Some(result) = response.get("result").cloned() {
+            return Ok(result);
+        }
+
+        let error = BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Protocol,
+            code: None,
+            message: "MCP response missing 'result' field".to_string(),
+        };
+        if let Some(mut failed) = connection_guard.take() {
+            let error = enrich_mcp_process_error(&mut failed, error);
+            terminate_mcp_connection(&mut failed);
+            self.initialized.store(false, Ordering::Relaxed);
+            Err(error)
+        } else {
+            self.initialized.store(false, Ordering::Relaxed);
+            Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::Protocol,
                 code: None,
                 message: "MCP response missing 'result' field".to_string(),
             })
+        }
     }
 }
 
@@ -368,9 +434,108 @@ struct HttpMcpConnectionState {
     protocol_version: Option<String>,
 }
 
+struct HttpMcpWorkerRequest {
+    body: Value,
+    session_id: Option<String>,
+    protocol_version: Option<String>,
+    expected_response_id: Option<u64>,
+    response: mpsc::SyncSender<Result<McpHttpResponse, BridgeClientError>>,
+}
+
+struct HttpMcpTransport {
+    sender: Option<mpsc::Sender<HttpMcpWorkerRequest>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    startup_error: Option<String>,
+}
+
+impl HttpMcpTransport {
+    fn new(config: HttpMcpServerConfig) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("magi-mcp-http".to_string())
+            .spawn(move || run_http_mcp_worker(config, receiver));
+        match worker {
+            Ok(worker) => Self {
+                sender: Some(sender),
+                worker: Some(worker),
+                startup_error: None,
+            },
+            Err(error) => Self {
+                sender: None,
+                worker: None,
+                startup_error: Some(format!("start HTTP MCP worker failed: {error}")),
+            },
+        }
+    }
+
+    fn execute(
+        &self,
+        body: Value,
+        session_id: Option<String>,
+        protocol_version: Option<String>,
+        expected_response_id: Option<u64>,
+    ) -> Result<McpHttpResponse, BridgeClientError> {
+        if let Some(error) = &self.startup_error {
+            return Err(mcp_transport_error(error.clone()));
+        }
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| mcp_transport_error("HTTP MCP worker is unavailable".to_string()))?;
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        sender
+            .send(HttpMcpWorkerRequest {
+                body,
+                session_id,
+                protocol_version,
+                expected_response_id,
+                response: response_sender,
+            })
+            .map_err(|_| {
+                mcp_transport_error("HTTP MCP worker terminated unexpectedly".to_string())
+            })?;
+        response_receiver.recv().map_err(|_| {
+            mcp_transport_error(
+                "HTTP MCP worker terminated before returning a response".to_string(),
+            )
+        })?
+    }
+}
+
+impl Drop for HttpMcpTransport {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_http_mcp_worker(config: HttpMcpServerConfig, receiver: Receiver<HttpMcpWorkerRequest>) {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(config.request_timeout.min(Duration::from_secs(10)))
+        .timeout(config.request_timeout)
+        .build()
+        .map_err(|error| format!("build HTTP MCP client failed: {error}"));
+    while let Ok(request) = receiver.recv() {
+        let result = match &client {
+            Ok(client) => execute_mcp_http_post_with_client(
+                client,
+                &config,
+                request.body,
+                request.session_id,
+                request.protocol_version,
+                request.expected_response_id,
+            ),
+            Err(error) => Err(mcp_transport_error(error.clone())),
+        };
+        let _ = request.response.send(result);
+    }
+}
+
 /// Streamable HTTP 传输的 MCP 客户端。
 pub struct StreamableHttpMcpBridgeClient {
-    config: HttpMcpServerConfig,
+    http_transport: HttpMcpTransport,
     state: Mutex<HttpMcpConnectionState>,
     next_id: AtomicU64,
 }
@@ -391,7 +556,7 @@ impl std::fmt::Debug for StreamableHttpMcpBridgeClient {
 impl StreamableHttpMcpBridgeClient {
     pub fn new(config: HttpMcpServerConfig) -> Self {
         Self {
-            config,
+            http_transport: HttpMcpTransport::new(config),
             state: Mutex::new(HttpMcpConnectionState::default()),
             next_id: AtomicU64::new(1),
         }
@@ -428,7 +593,7 @@ impl StreamableHttpMcpBridgeClient {
             "id": request_id,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": PREFERRED_MCP_PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": {
                     "name": "magi-bridge-client",
@@ -437,23 +602,10 @@ impl StreamableHttpMcpBridgeClient {
             }
         });
         let response =
-            execute_mcp_http_post(self.config.clone(), request, None, None, Some(request_id))?;
+            execute_mcp_http_post(&self.http_transport, request, None, None, Some(request_id))?;
         let response_value = decode_mcp_http_response(&response, request_id)?;
         validate_jsonrpc_response(&response_value, request_id)?;
-        let result = response_value
-            .get("result")
-            .ok_or_else(|| BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::Protocol,
-                code: None,
-                message: "MCP initialize response missing 'result' field".to_string(),
-            })?;
-        let protocol_version = result
-            .get("protocolVersion")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("2024-11-05")
-            .to_string();
+        let protocol_version = negotiate_mcp_protocol_version(&response_value, "HTTP")?;
         let session_id = response.session_id;
 
         let notification = json!({
@@ -462,7 +614,7 @@ impl StreamableHttpMcpBridgeClient {
             "params": {}
         });
         let notification_response = execute_mcp_http_post(
-            self.config.clone(),
+            &self.http_transport,
             notification,
             session_id.clone(),
             Some(protocol_version.clone()),
@@ -483,54 +635,69 @@ impl StreamableHttpMcpBridgeClient {
             .map_err(|_| mcp_transport_error("HTTP MCP state mutex poisoned".to_string()))?;
         self.ensure_initialized(&mut state)?;
 
-        let request_id = self.next_request_id();
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-            "params": params
-        });
-        let response = execute_mcp_http_post(
-            self.config.clone(),
-            request,
-            state.session_id.clone(),
-            state.protocol_version.clone(),
-            Some(request_id),
-        );
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                reset_http_mcp_state(&mut state);
-                return Err(error);
-            }
-        };
-        let response_value = match decode_mcp_http_response(&response, request_id) {
-            Ok(value) => value,
-            Err(error) => {
-                reset_http_mcp_state(&mut state);
-                return Err(error);
-            }
-        };
-        if let Err(error) = validate_jsonrpc_response(&response_value, request_id) {
-            if matches!(
-                error,
-                BridgeClientError::CallFailed {
-                    layer: BridgeErrorLayer::Protocol | BridgeErrorLayer::Transport,
-                    ..
+        for attempt in 0..=1 {
+            let request_id = self.next_request_id();
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params.clone()
+            });
+            let request_had_session = state.session_id.is_some();
+            let response = execute_mcp_http_post(
+                &self.http_transport,
+                request,
+                state.session_id.clone(),
+                state.protocol_version.clone(),
+                Some(request_id),
+            );
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    reset_http_mcp_state(&mut state);
+                    return Err(error);
                 }
-            ) {
+            };
+
+            if attempt == 0 && request_had_session && response.status == 404 {
                 reset_http_mcp_state(&mut state);
+                self.ensure_initialized(&mut state)?;
+                continue;
             }
-            return Err(error);
+
+            let response_value = match decode_mcp_http_response(&response, request_id) {
+                Ok(value) => value,
+                Err(error) => {
+                    reset_http_mcp_state(&mut state);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = validate_jsonrpc_response(&response_value, request_id) {
+                if matches!(
+                    error,
+                    BridgeClientError::CallFailed {
+                        layer: BridgeErrorLayer::Protocol | BridgeErrorLayer::Transport,
+                        ..
+                    } | BridgeClientError::HttpStatusFailed {
+                        layer: BridgeErrorLayer::Protocol | BridgeErrorLayer::Transport,
+                        ..
+                    }
+                ) {
+                    reset_http_mcp_state(&mut state);
+                }
+                return Err(error);
+            }
+            return response_value.get("result").cloned().ok_or_else(|| {
+                reset_http_mcp_state(&mut state);
+                BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Protocol,
+                    code: None,
+                    message: "MCP response missing 'result' field".to_string(),
+                }
+            });
         }
-        response_value
-            .get("result")
-            .cloned()
-            .ok_or_else(|| BridgeClientError::CallFailed {
-                layer: BridgeErrorLayer::Protocol,
-                code: None,
-                message: "MCP response missing 'result' field".to_string(),
-            })
+
+        unreachable!("HTTP MCP session recovery has a fixed attempt limit")
     }
 }
 
@@ -604,124 +771,136 @@ struct McpHttpResponse {
     status: u16,
     content_type: Option<String>,
     session_id: Option<String>,
+    www_authenticate: Option<String>,
     body: String,
 }
 
 fn execute_mcp_http_post(
-    config: HttpMcpServerConfig,
+    transport: &HttpMcpTransport,
     body: Value,
     session_id: Option<String>,
     protocol_version: Option<String>,
     expected_response_id: Option<u64>,
 ) -> Result<McpHttpResponse, BridgeClientError> {
-    std::thread::spawn(move || {
-        let client = reqwest::blocking::Client::builder()
-            .connect_timeout(config.request_timeout.min(Duration::from_secs(10)))
-            .timeout(config.request_timeout)
-            .build()
-            .map_err(|error| {
-                mcp_transport_error(format!("build HTTP MCP client failed: {error}"))
-            })?;
-        let mut headers = reqwest::header::HeaderMap::new();
-        for (name, value) in config.headers {
-            let name =
-                reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
-                    BridgeClientError::CallFailed {
-                        layer: BridgeErrorLayer::Protocol,
-                        code: None,
-                        message: format!("invalid HTTP MCP header name: {error}"),
-                    }
-                })?;
-            let value = reqwest::header::HeaderValue::from_str(&value).map_err(|error| {
+    transport.execute(body, session_id, protocol_version, expected_response_id)
+}
+
+fn execute_mcp_http_post_with_client(
+    client: &reqwest::blocking::Client,
+    config: &HttpMcpServerConfig,
+    body: Value,
+    session_id: Option<String>,
+    protocol_version: Option<String>,
+    expected_response_id: Option<u64>,
+) -> Result<McpHttpResponse, BridgeClientError> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in &config.headers {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+            BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::Protocol,
+                code: None,
+                message: format!("invalid HTTP MCP header name: {error}"),
+            }
+        })?;
+        let value = reqwest::header::HeaderValue::from_str(value).map_err(|error| {
+            BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::Protocol,
+                code: None,
+                message: format!("invalid HTTP MCP header value: {error}"),
+            }
+        })?;
+        headers.insert(name, value);
+    }
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static("application/json, text/event-stream"),
+    );
+    if let Some(session_id) = session_id {
+        headers.insert(
+            reqwest::header::HeaderName::from_static("mcp-session-id"),
+            reqwest::header::HeaderValue::from_str(&session_id).map_err(|error| {
                 BridgeClientError::CallFailed {
                     layer: BridgeErrorLayer::Protocol,
                     code: None,
-                    message: format!("invalid HTTP MCP header value: {error}"),
+                    message: format!("invalid MCP session id: {error}"),
                 }
-            })?;
-            headers.insert(name, value);
-        }
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            reqwest::header::HeaderValue::from_static("application/json"),
+            })?,
         );
+    }
+    if let Some(protocol_version) = protocol_version {
         headers.insert(
-            reqwest::header::ACCEPT,
-            reqwest::header::HeaderValue::from_static("application/json, text/event-stream"),
+            reqwest::header::HeaderName::from_static("mcp-protocol-version"),
+            reqwest::header::HeaderValue::from_str(&protocol_version).map_err(|error| {
+                BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Protocol,
+                    code: None,
+                    message: format!("invalid MCP protocol version: {error}"),
+                }
+            })?,
         );
-        if let Some(session_id) = session_id {
-            headers.insert(
-                reqwest::header::HeaderName::from_static("mcp-session-id"),
-                reqwest::header::HeaderValue::from_str(&session_id).map_err(|error| {
-                    BridgeClientError::CallFailed {
-                        layer: BridgeErrorLayer::Protocol,
-                        code: None,
-                        message: format!("invalid MCP session id: {error}"),
-                    }
-                })?,
-            );
-        }
-        if let Some(protocol_version) = protocol_version {
-            headers.insert(
-                reqwest::header::HeaderName::from_static("mcp-protocol-version"),
-                reqwest::header::HeaderValue::from_str(&protocol_version).map_err(|error| {
-                    BridgeClientError::CallFailed {
-                        layer: BridgeErrorLayer::Protocol,
-                        code: None,
-                        message: format!("invalid MCP protocol version: {error}"),
-                    }
-                })?,
-            );
-        }
+    }
 
-        let response = client
-            .post(&config.url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .map_err(|error| mcp_transport_error(format!("HTTP MCP request failed: {error}")))?;
-        let status = response.status().as_u16();
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let session_id = response
-            .headers()
-            .get("mcp-session-id")
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let is_event_stream = content_type.as_deref().is_some_and(|content_type| {
-            content_type
-                .to_ascii_lowercase()
-                .contains("text/event-stream")
-        });
-        let body = if !(200..300).contains(&status) {
-            response.text().map_err(|error| {
-                mcp_transport_error(format!("read HTTP MCP response failed: {error}"))
-            })?
-        } else {
-            match expected_response_id {
-                None => String::new(),
-                Some(expected_response_id) if is_event_stream => {
-                    read_matching_mcp_sse_response(response, expected_response_id)?
-                }
-                Some(_) => response.text().map_err(|error| {
-                    mcp_transport_error(format!("read HTTP MCP response failed: {error}"))
-                })?,
+    let response = client
+        .post(&config.url)
+        .headers(headers)
+        .json(&body)
+        .send()
+        .map_err(|error| {
+            let endpoint = public_http_mcp_endpoint(&config.url);
+            let detail = describe_http_mcp_error(&error, &config.url, &endpoint);
+            mcp_transport_error(format!("HTTP MCP request failed for {endpoint}: {detail}"))
+        })?;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let session_id = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let www_authenticate = response
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let is_event_stream = content_type.as_deref().is_some_and(|content_type| {
+        content_type
+            .to_ascii_lowercase()
+            .contains("text/event-stream")
+    });
+    let body = if !(200..300).contains(&status) {
+        response.text().map_err(|error| {
+            mcp_transport_error(format!("read HTTP MCP response failed: {error}"))
+        })?
+    } else {
+        match expected_response_id {
+            None => String::new(),
+            Some(expected_response_id) if is_event_stream => {
+                read_matching_mcp_sse_response(response, expected_response_id)?
             }
-        };
-        Ok(McpHttpResponse {
-            status,
-            content_type,
-            session_id,
-            body,
-        })
+            Some(_) => response.text().map_err(|error| {
+                mcp_transport_error(format!("read HTTP MCP response failed: {error}"))
+            })?,
+        }
+    };
+    Ok(McpHttpResponse {
+        status,
+        content_type,
+        session_id,
+        www_authenticate,
+        body,
     })
-    .join()
-    .map_err(|_| mcp_transport_error("HTTP MCP request thread panicked".to_string()))?
 }
 
 fn read_matching_mcp_sse_response(
@@ -771,16 +950,54 @@ fn ensure_mcp_http_success(response: &McpHttpResponse) -> Result<(), BridgeClien
     if (200..300).contains(&response.status) {
         return Ok(());
     }
-    let detail = response.body.chars().take(500).collect::<String>();
-    Err(mcp_transport_error(format!(
-        "HTTP MCP server returned status {}{}",
-        response.status,
-        if detail.trim().is_empty() {
-            String::new()
-        } else {
-            format!(": {detail}")
+    let detail = response.body.chars().take(2_000).collect::<String>();
+    Err(BridgeClientError::HttpStatusFailed {
+        layer: BridgeErrorLayer::Transport,
+        code: None,
+        http_status: response.status,
+        message: format!(
+            "HTTP MCP server returned status {}{}{}",
+            response.status,
+            if detail.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            },
+            response
+                .www_authenticate
+                .as_deref()
+                .map(|value| format!("; WWW-Authenticate: {value}"))
+                .unwrap_or_default()
+        ),
+    })
+}
+
+fn public_http_mcp_endpoint(raw_url: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw_url) else {
+        return "<configured HTTP MCP endpoint>".to_string();
+    };
+    url.set_query(None);
+    url.set_fragment(None);
+    if url.set_username("").is_err() || url.set_password(None).is_err() {
+        return "<configured HTTP MCP endpoint>".to_string();
+    }
+    url.to_string()
+}
+
+fn describe_http_mcp_error(error: &reqwest::Error, raw_url: &str, endpoint: &str) -> String {
+    let mut details = Vec::new();
+    let mut current: Option<&dyn StdError> = Some(error);
+    while let Some(cause) = current {
+        let detail = cause.to_string().replace(raw_url, endpoint);
+        if !detail.is_empty() && details.last() != Some(&detail) {
+            details.push(detail);
         }
-    )))
+        if details.len() == 6 {
+            break;
+        }
+        current = cause.source();
+    }
+    details.join(": ")
 }
 
 fn decode_mcp_http_response(
@@ -792,7 +1009,11 @@ fn decode_mcp_http_response(
         return Err(BridgeClientError::CallFailed {
             layer: BridgeErrorLayer::Protocol,
             code: None,
-            message: "HTTP MCP response body is empty".to_string(),
+            message: format!(
+                "HTTP MCP response body is empty; status={}; content-type={}",
+                response.status,
+                response.content_type.as_deref().unwrap_or("<missing>")
+            ),
         });
     }
     let is_event_stream = response
@@ -808,10 +1029,13 @@ fn decode_mcp_http_response(
     if is_event_stream {
         return decode_mcp_sse_response(&response.body, expected_id);
     }
-    serde_json::from_str(&response.body).map_err(|error| BridgeClientError::CallFailed {
-        layer: BridgeErrorLayer::Protocol,
-        code: None,
-        message: format!("decode HTTP MCP JSON response failed: {error}"),
+    serde_json::from_str(&response.body).map_err(|error| {
+        let preview = response.body.chars().take(500).collect::<String>();
+        BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Protocol,
+            code: None,
+            message: format!("decode HTTP MCP JSON response failed: {error}; response={preview}"),
+        }
     })
 }
 
@@ -980,6 +1204,61 @@ fn terminate_mcp_connection(connection: &mut McpConnection) {
     let _ = connection.child.terminate();
 }
 
+fn enrich_mcp_process_error(
+    connection: &mut McpConnection,
+    error: BridgeClientError,
+) -> BridgeClientError {
+    let process_status = connection
+        .child
+        .try_wait()
+        .ok()
+        .flatten()
+        .map(|status| status.to_string());
+    let stderr = connection
+        .stderr_tail
+        .lock()
+        .ok()
+        .map(|lines| lines.iter().cloned().collect::<String>())
+        .unwrap_or_default();
+    let stderr = stderr.trim();
+    if process_status.is_none() && stderr.is_empty() {
+        return error;
+    }
+
+    let mut context = String::new();
+    if let Some(status) = process_status {
+        context.push_str(&format!("; process exited with {status}"));
+    }
+    if !stderr.is_empty() {
+        context.push_str("; stderr: ");
+        context.push_str(stderr);
+    }
+
+    match error {
+        BridgeClientError::CallFailed {
+            layer,
+            code,
+            message,
+        } => BridgeClientError::CallFailed {
+            layer,
+            code,
+            message: format!("{message}{context}"),
+        },
+        BridgeClientError::HttpStatusFailed {
+            layer,
+            code,
+            http_status,
+            message,
+        } => BridgeClientError::HttpStatusFailed {
+            layer,
+            code,
+            http_status,
+            message: format!("{message}{context}"),
+        },
+        other => other,
+    }
+}
+
 fn validate_jsonrpc_response(response: &Value, expected_id: u64) -> Result<(), BridgeClientError> {
     if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Err(BridgeClientError::CallFailed {
@@ -1017,16 +1296,57 @@ fn validate_jsonrpc_response(response: &Value, expected_id: u64) -> Result<(), B
             .and_then(Value::as_str)
             .unwrap_or("unknown error")
             .to_string();
-        let _data = error.get("data").cloned();
+        let data = error
+            .get("data")
+            .map(Value::to_string)
+            .filter(|value| value != "null")
+            .map(|value| value.chars().take(2_000).collect::<String>());
 
         return Err(BridgeClientError::CallFailed {
             layer: BridgeErrorLayer::RemoteBusiness,
             code: Some(code),
-            message: format!("MCP server error [{code}]: {message}"),
+            message: format!(
+                "MCP server error [{code}]: {message}{}",
+                data.map(|value| format!("; data={value}"))
+                    .unwrap_or_default()
+            ),
         });
     }
 
     Ok(())
+}
+
+fn negotiate_mcp_protocol_version(
+    initialize_response: &Value,
+    transport: &str,
+) -> Result<String, BridgeClientError> {
+    let protocol_version = initialize_response
+        .get("result")
+        .ok_or_else(|| BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Protocol,
+            code: None,
+            message: format!("{transport} MCP initialize response is missing result"),
+        })?
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::Protocol,
+            code: None,
+            message: format!("{transport} MCP initialize response is missing protocolVersion"),
+        })?;
+    if SUPPORTED_MCP_PROTOCOL_VERSIONS.contains(&protocol_version) {
+        return Ok(protocol_version.to_string());
+    }
+    Err(BridgeClientError::CallFailed {
+        layer: BridgeErrorLayer::Protocol,
+        code: None,
+        message: format!(
+            "{transport} MCP server negotiated unsupported protocol version {protocol_version}; supported={}",
+            SUPPORTED_MCP_PROTOCOL_VERSIONS.join(", ")
+        ),
+    })
 }
 
 fn extract_text_content(content: &Value) -> String {
@@ -1061,9 +1381,11 @@ fn mcp_transport_error(message: String) -> BridgeClientError {
     }
 }
 
-fn spawn_mcp_stderr_drain(stderr: std::process::ChildStderr) {
+fn spawn_mcp_stderr_reader(stderr: std::process::ChildStderr) -> Arc<Mutex<VecDeque<String>>> {
+    let tail = Arc::new(Mutex::new(VecDeque::new()));
+    let writer = tail.clone();
     let _ = std::thread::Builder::new()
-        .name("magi-mcp-stderr-drain".to_string())
+        .name("magi-mcp-stderr-reader".to_string())
         .spawn(move || {
             let mut reader = BufReader::new(stderr);
             let mut line = String::new();
@@ -1071,10 +1393,22 @@ fn spawn_mcp_stderr_drain(stderr: std::process::ChildStderr) {
                 line.clear();
                 match reader.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {}
+                    Ok(_) => {
+                        let normalized = line
+                            .chars()
+                            .take(MCP_STDERR_MAX_LINE_CHARS)
+                            .collect::<String>();
+                        if let Ok(mut lines) = writer.lock() {
+                            lines.push_back(normalized);
+                            while lines.len() > MCP_STDERR_MAX_LINES {
+                                lines.pop_front();
+                            }
+                        }
+                    }
                 }
             }
         });
+    tail
 }
 
 fn read_non_empty_env(key: &str) -> Option<String> {
@@ -1189,6 +1523,51 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn negotiated_mcp_protocol_version_accepts_supported_versions() {
+        for protocol_version in SUPPORTED_MCP_PROTOCOL_VERSIONS {
+            let response = json!({
+                "result": { "protocolVersion": protocol_version }
+            });
+            assert_eq!(
+                negotiate_mcp_protocol_version(&response, "HTTP")
+                    .expect("supported protocol version should be accepted"),
+                *protocol_version
+            );
+        }
+    }
+
+    #[test]
+    fn http_mcp_error_keeps_status_body_and_authentication_challenge() {
+        let response = McpHttpResponse {
+            status: 401,
+            content_type: Some("application/json".to_string()),
+            session_id: None,
+            www_authenticate: Some("Bearer resource_metadata=\"/oauth\"".to_string()),
+            body: "invalid access token".to_string(),
+        };
+
+        let error = ensure_mcp_http_success(&response)
+            .expect_err("HTTP authentication failure should remain visible");
+        let detail = error.to_string();
+        assert!(detail.contains("401"), "detail was: {detail}");
+        assert!(
+            detail.contains("invalid access token"),
+            "detail was: {detail}"
+        );
+        assert!(detail.contains("WWW-Authenticate"), "detail was: {detail}");
+    }
+
+    #[tokio::test]
+    async fn streamable_http_mcp_client_can_be_created_inside_tokio_runtime() {
+        let client = StreamableHttpMcpBridgeClient::new(HttpMcpServerConfig {
+            url: "http://127.0.0.1:1/mcp".to_string(),
+            headers: BTreeMap::new(),
+            request_timeout: Duration::from_secs(1),
+        });
+        drop(client);
     }
 
     #[test]
@@ -1330,6 +1709,32 @@ done
     }
 
     #[test]
+    fn stdio_mcp_client_surfaces_process_stderr_on_startup_failure() {
+        let script = r#"
+printf 'fatal: missing MCP_TOKEN\n' >&2
+sleep 0.1
+exit 17
+"#;
+        let config = McpServerConfig::new("sh", vec!["-c".to_string(), script.to_string()])
+            .with_request_timeout(Duration::from_secs(1));
+        let client = StdioMcpBridgeClient::new(config);
+
+        let error = client
+            .list_tools()
+            .expect_err("failed MCP process should expose its stderr");
+        match error {
+            BridgeClientError::CallFailed { layer, message, .. } => {
+                assert_eq!(layer, BridgeErrorLayer::Transport);
+                assert!(
+                    message.contains("missing MCP_TOKEN"),
+                    "message was: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn stdio_mcp_client_rejects_invalid_tool_arguments_before_dispatch() {
         let config = McpServerConfig::new("sh", vec!["-c".to_string(), "exit 99".to_string()]);
         let client = StdioMcpBridgeClient::new(config);
@@ -1426,7 +1831,7 @@ done
                             "jsonrpc": "2.0",
                             "id": body["id"],
                             "result": {
-                                "protocolVersion": "2024-11-05",
+                                "protocolVersion": PREFERRED_MCP_PROTOCOL_VERSION,
                                 "capabilities": { "tools": {} },
                                 "serverInfo": { "name": "mock-http-mcp", "version": "1.0.0" }
                             }
@@ -1499,6 +1904,10 @@ done
         let requests = requests.lock().expect("captured requests should lock");
         assert_eq!(requests.len(), 4);
         assert_eq!(requests[0].1["method"], json!("initialize"));
+        assert_eq!(
+            requests[0].1["params"]["protocolVersion"],
+            json!(PREFERRED_MCP_PROTOCOL_VERSION)
+        );
         assert_eq!(requests[1].1["method"], json!("notifications/initialized"));
         assert_eq!(requests[2].1["method"], json!("tools/list"));
         assert_eq!(requests[3].1["method"], json!("tools/call"));
@@ -1514,7 +1923,7 @@ done
                 );
                 assert_eq!(
                     headers.get("mcp-protocol-version").map(String::as_str),
-                    Some("2024-11-05")
+                    Some(PREFERRED_MCP_PROTOCOL_VERSION)
                 );
             }
         }
@@ -1582,6 +1991,98 @@ done
             started.elapsed()
         );
         server.join().expect("mock server should stop");
+    }
+
+    #[test]
+    fn streamable_http_mcp_client_reinitializes_expired_session_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock listener should have address");
+        let requests = Arc::new(Mutex::new(Vec::<(BTreeMap<String, String>, Value)>::new()));
+        let captured = requests.clone();
+
+        let server = thread::spawn(move || {
+            for index in 0..6 {
+                let (mut stream, _) = listener.accept().expect("mock server should accept");
+                let (headers, body) = read_http_json_request(&mut stream);
+                captured
+                    .lock()
+                    .expect("captured request lock should succeed")
+                    .push((headers, body.clone()));
+
+                match index {
+                    0 | 3 => {
+                        let session_id = if index == 0 {
+                            "session-old"
+                        } else {
+                            "session-new"
+                        };
+                        write_http_response(
+                            &mut stream,
+                            "200 OK",
+                            &[
+                                ("Content-Type", "application/json"),
+                                ("Mcp-Session-Id", session_id),
+                            ],
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": body["id"],
+                                "result": {
+                                    "protocolVersion": PREFERRED_MCP_PROTOCOL_VERSION,
+                                    "capabilities": { "tools": {} },
+                                    "serverInfo": { "name": "mock", "version": "1.0.0" }
+                                }
+                            })
+                            .to_string(),
+                        );
+                    }
+                    1 | 4 => write_http_response(&mut stream, "202 Accepted", &[], ""),
+                    2 => write_http_response(
+                        &mut stream,
+                        "404 Not Found",
+                        &[("Content-Type", "application/json")],
+                        "session expired",
+                    ),
+                    5 => write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        &[("Content-Type", "application/json")],
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": { "tools": [{ "name": "recovered.tool" }] }
+                        })
+                        .to_string(),
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+        });
+
+        let client = StreamableHttpMcpBridgeClient::new(HttpMcpServerConfig {
+            url: format!("http://{address}/mcp"),
+            headers: BTreeMap::new(),
+            request_timeout: Duration::from_secs(2),
+        });
+        let tools = client
+            .list_tools()
+            .expect("expired session should be rebuilt during the same request");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "recovered.tool");
+
+        server.join().expect("mock server should stop");
+        let requests = requests.lock().expect("captured requests should lock");
+        assert_eq!(requests.len(), 6);
+        assert_eq!(
+            requests[2].0.get("mcp-session-id").map(String::as_str),
+            Some("session-old")
+        );
+        assert!(!requests[3].0.contains_key("mcp-session-id"));
+        assert_eq!(
+            requests[5].0.get("mcp-session-id").map(String::as_str),
+            Some("session-new")
+        );
     }
 
     fn read_http_json_request(stream: &mut TcpStream) -> (BTreeMap<String, String>, Value) {

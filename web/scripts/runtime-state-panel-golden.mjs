@@ -14,8 +14,13 @@ assert.doesNotMatch(
 );
 assert.match(
   runtimePanelSource,
-  /runtimeDiagnostics\.keyRecords[\s\S]*?item\.detail[\s\S]*?runtime-diagnostics__failure-entry--inline/,
+  /runtimeDiagnostics\.keyRecords[\s\S]*?runtime-diagnostics__record-kind[\s\S]*?item\.detail[\s\S]*?runtime-diagnostics__record-detail/,
   '关键运行记录必须在同一层直接展示工具或步骤的真实错误正文',
+);
+assert.doesNotMatch(
+  runtimePanelSource,
+  /runtimeDiagnostics\.failureTitle|failureDetails|runtime-diagnostics__block--failure|runtime-diagnostics__failure-entry/,
+  '失败原因不得在关键运行记录之外重复展示，也不得为错误正文增加内嵌强调层',
 );
 
 await withGoldenViteServer(async (server) => {
@@ -51,6 +56,11 @@ await withGoldenViteServer(async (server) => {
     panel.shouldShowRuntimePanel({ status: 'cancelled', isProcessing: false, attentionAssignmentCount: 0 }),
     false,
     'cancelled sessions must not keep reserving homepage space',
+  );
+  assert.equal(
+    panel.shouldShowRuntimePanel({ status: 'failed', isProcessing: false, attentionAssignmentCount: 0 }),
+    true,
+    'failed sessions must keep their runtime diagnostics available',
   );
 
   assert.equal(panel.runtimeAssignmentNeedsAttention('running'), true);
@@ -178,17 +188,181 @@ await withGoldenViteServer(async (server) => {
   assert.deepEqual(normalized.orchestratorRuntimeState?.errors, [failureDetail, `cargo_check_failed: ${toolErrorDetail}`]);
   assert.deepEqual(
     normalized.orchestratorRuntimeState?.opsView?.recentTimeline.map((entry) => entry.type),
-    ['task.status.changed', 'tool.call.finished'],
-    '关键运行记录必须过滤知识空事件和 session.turn.item 等内部噪音',
+    ['tool.call.finished', 'task.status.changed'],
+    '关键运行记录必须过滤内部噪音并按最新事件优先排列',
   );
-  assert.equal(normalized.orchestratorRuntimeState?.opsView?.recentTimeline[1]?.kind, 'error');
-  assert.equal(normalized.orchestratorRuntimeState?.opsView?.recentTimeline[1]?.source, 'cargo check');
+  assert.equal(normalized.orchestratorRuntimeState?.opsView?.recentTimeline[0]?.kind, 'error');
+  assert.equal(normalized.orchestratorRuntimeState?.opsView?.recentTimeline[0]?.source, 'cargo check');
   assert.equal(
-    normalized.orchestratorRuntimeState?.opsView?.recentTimeline[1]?.detail,
+    normalized.orchestratorRuntimeState?.opsView?.recentTimeline[0]?.detail,
     `cargo_check_failed: ${toolErrorDetail}`,
+  );
+  assert.equal(
+    normalized.orchestratorRuntimeState?.opsView?.recentTimeline
+      .filter((entry) => entry.detail === failureDetail).length,
+    1,
+    '任务快照与运行事件中的同一错误只能展示一次',
   );
   assert.equal(normalized.orchestratorRuntimeState?.opsView?.failureRootCause, undefined);
   assert.equal(normalized.orchestratorRuntimeState?.opsView?.knowledgeAudit, undefined);
+
+  const interrupted = rustContract.normalizeRustBootstrapPayload({
+    generatedAt: 1_700_000_001_000,
+    currentSession: {
+      sessionId: 'session-runtime-interrupted',
+      workspaceId: 'workspace-runtime',
+      title: '中断场景',
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_001_000,
+    },
+    sessions: [{
+      sessionId: 'session-runtime-interrupted',
+      workspaceId: 'workspace-runtime',
+      title: '中断场景',
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_001_000,
+    }],
+    workspaces: [{
+      workspaceId: 'workspace-runtime',
+      rootPath: '/workspace/runtime',
+    }],
+    runtimeReadModel: {
+      details: {
+        sessions: [{
+          session_id: 'session-runtime-interrupted',
+          current_status: 'bound',
+          root_task_id: 'task-runtime-interrupted',
+          root_task_status: 'failed',
+          mission_id: 'mission-runtime-interrupted',
+          last_update: 1_700_000_001_000,
+        }],
+        tasks: [{
+          task_id: 'task-runtime-interrupted',
+          mission_id: 'mission-runtime-interrupted',
+          current_status: 'failed',
+        }],
+      },
+    },
+    canonicalTurns: [{
+      sessionId: 'session-runtime-interrupted',
+      turnId: 'turn-runtime-interrupted',
+      turnSeq: 1,
+      acceptedAt: 1_700_000_000_000,
+      completedAt: 1_700_000_001_000,
+      status: 'interrupted',
+      items: [{
+        sessionId: 'session-runtime-interrupted',
+        turnId: 'turn-runtime-interrupted',
+        turnSeq: 1,
+        itemId: 'item-runtime-interrupted',
+        itemSeq: 1,
+        kind: 'system_notice',
+        createdAt: 1_700_000_000_000,
+        updatedAt: 1_700_000_001_000,
+        status: 'completed',
+        content: '当前对话发生异常中断，是否继续？',
+        sourceThreadId: 'thread-runtime-interrupted',
+        visibility: { renderable: true },
+        metadata: {
+          noticeKind: 'session_interrupted',
+          interruptionSource: 'daemon_restart',
+        },
+      }],
+    }],
+    recentEvents: [],
+  }, {
+    workspaceId: 'workspace-runtime',
+    workspacePath: '/workspace/runtime',
+    sessionId: 'session-runtime-interrupted',
+  });
+  assert.equal(interrupted.orchestratorRuntimeState?.status, 'failed');
+  assert.deepEqual(
+    interrupted.orchestratorRuntimeState?.opsView?.recentTimeline.map((entry) => ({
+      type: entry.type,
+      detail: entry.detail,
+    })),
+    [{
+      type: 'session.turn.interrupted',
+      detail: 'interruptionSource: daemon_restart',
+    }],
+    'daemon 重启后必须从持久化会话项恢复中断原因，不能留下可点击但内容为空的面板',
+  );
+
+  const resumed = rustContract.normalizeRustBootstrapPayload({
+    generatedAt: 1_700_000_003_000,
+    currentSession: {
+      sessionId: 'session-runtime-resumed',
+      workspaceId: 'workspace-runtime',
+      title: '续跑成功场景',
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_003_000,
+    },
+    sessions: [{
+      sessionId: 'session-runtime-resumed',
+      workspaceId: 'workspace-runtime',
+      title: '续跑成功场景',
+      createdAt: 1_700_000_000_000,
+      updatedAt: 1_700_000_003_000,
+    }],
+    workspaces: [{
+      workspaceId: 'workspace-runtime',
+      rootPath: '/workspace/runtime',
+    }],
+    runtimeReadModel: {
+      details: {
+        sessions: [{
+          session_id: 'session-runtime-resumed',
+          current_status: 'detached',
+          root_task_id: null,
+          root_task_status: null,
+          mission_id: null,
+          last_update: 1_700_000_003_000,
+        }],
+        tasks: [{
+          task_id: 'task-runtime-original-failure',
+          mission_id: 'mission-runtime-original-failure',
+          current_status: 'failed',
+          failure_detail: '原轮次中断',
+        }],
+      },
+    },
+    canonicalTurns: [{
+      sessionId: 'session-runtime-resumed',
+      turnId: 'turn-runtime-original-failure',
+      turnSeq: 1,
+      acceptedAt: 1_700_000_000_000,
+      completedAt: 1_700_000_001_000,
+      status: 'interrupted',
+      items: [],
+    }, {
+      sessionId: 'session-runtime-resumed',
+      turnId: 'turn-runtime-resumed',
+      turnSeq: 2,
+      acceptedAt: 1_700_000_002_000,
+      completedAt: 1_700_000_003_000,
+      status: 'completed',
+      items: [],
+    }],
+    recentEvents: [],
+  }, {
+    workspaceId: 'workspace-runtime',
+    workspacePath: '/workspace/runtime',
+    sessionId: 'session-runtime-resumed',
+  });
+  assert.equal(
+    resumed.orchestratorRuntimeState?.status,
+    'completed',
+    '续跑完成后必须以最新轮次为当前状态，历史失败只能保留在运行记录中',
+  );
+  assert.equal(
+    panel.shouldShowRuntimePanel({
+      status: resumed.orchestratorRuntimeState?.status,
+      isProcessing: false,
+      attentionAssignmentCount: 0,
+    }),
+    false,
+    '续跑成功后不得继续展示历史失败状态面板',
+  );
 
   console.log('runtime state panel golden passed');
 });

@@ -9,6 +9,7 @@
   import RetryRuntimeIndicator from './RetryRuntimeIndicator.svelte';
   import ErrorDetailPopover from './ErrorDetailPopover.svelte';
   import TurnRuntimeSummary from './TurnRuntimeSummary.svelte';
+  import ModelFailureCard from './ModelFailureCard.svelte';
   import { onDestroy } from 'svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { retryRuntimeState } from '../stores/messages.svelte';
@@ -17,6 +18,8 @@
     formatTraceableTime,
   } from '../lib/utils';
   import { isRuntimeInternalTool } from '../shared/tool-visibility';
+  import { parseModelFailureDiagnostic } from '../lib/model-failure';
+  import { parseToolCallFailureDiagnostic } from '../lib/tool-call-failure';
 
   // Props
   interface Props {
@@ -250,6 +253,12 @@
     const value = message.metadata?.turnItemKind;
     return typeof value === 'string' ? value.trim() : '';
   });
+  const modelFailure = $derived.by(() => (
+    parseModelFailureDiagnostic(message.metadata?.modelFailure)
+  ));
+  const toolCallFailure = $derived.by(() => (
+    parseToolCallFailureDiagnostic(message.metadata?.toolCallFailure)
+  ));
   const workerBadgeLabel = $derived.by(() => (
     turnItemKind.startsWith('worker_') && laneTitle
       ? laneTitle
@@ -463,7 +472,11 @@
           </div>
         {/if}
 
-        {#if shouldCollapseSystemSection && safeBlocks.length === 0 && message.content}
+        {#if toolCallFailure}
+          <ModelFailureCard failure={toolCallFailure} />
+        {:else if modelFailure}
+          <ModelFailureCard failure={modelFailure} />
+        {:else if shouldCollapseSystemSection && safeBlocks.length === 0 && message.content}
           <details class="system-section-fold" data-system-section-type={systemSectionType || undefined}>
             <summary class="system-section-summary">
               <span class="system-section-badge">{i18n.t('messageItem.systemSectionBadge')}</span>
@@ -537,13 +550,18 @@
   .system-notice.warning { color: var(--warning); }
   .system-notice.error { color: var(--error); }
   .system-notice.interrupted-recovery {
+    align-items: baseline;
     justify-content: flex-start;
     width: auto;
     max-width: none;
     margin: 2px var(--space-4);
     padding: 4px 0;
   }
+  .system-notice.interrupted-recovery .notice-text {
+    flex: 0 1 auto;
+  }
   .interrupted-recovery-link {
+    flex: 0 0 auto;
     appearance: none;
     border: 0;
     padding: 0;

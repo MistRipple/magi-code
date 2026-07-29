@@ -1,4 +1,7 @@
-pub(crate) const PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE: &str = "模型请求未完成，可直接继续重试。";
+use magi_core::public_runtime_excerpt;
+use serde::Serialize;
+
+pub(crate) const PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE: &str = "模型服务请求失败。";
 pub(crate) const PUBLIC_MODEL_AUTH_FAILURE_MESSAGE: &str =
     "模型认证失败，请检查 API Key 或访问权限。";
 pub(crate) const PUBLIC_MODEL_RATE_LIMIT_MESSAGE: &str = "模型服务当前受到限流，请稍后重试。";
@@ -11,10 +14,10 @@ pub(crate) const PUBLIC_MODEL_REGION_UNAVAILABLE_MESSAGE: &str =
     "当前模型服务不支持此网络区域，请更换可用的服务节点或模型后重试。";
 pub(crate) const PUBLIC_MODEL_TOOL_UNSUPPORTED_MESSAGE: &str =
     "当前模型拒绝了工具调用请求，请更换支持工具调用的模型或关闭工具后重试。";
-pub(crate) const PUBLIC_MODEL_STREAM_INTERRUPTED_MESSAGE: &str = "模型响应流中断，可直接继续重试。";
-pub(crate) const PUBLIC_MODEL_TIMEOUT_MESSAGE: &str = "模型响应超时，可直接继续重试。";
+pub(crate) const PUBLIC_MODEL_STREAM_INTERRUPTED_MESSAGE: &str = "模型响应流在完成前中断。";
+pub(crate) const PUBLIC_MODEL_TIMEOUT_MESSAGE: &str = "模型服务在响应完成前超时。";
 pub(crate) const PUBLIC_MODEL_EMPTY_RESPONSE_MESSAGE: &str =
-    "模型本轮未返回有效内容，可直接继续重试。";
+    "模型服务返回了空响应，未生成正文或可执行工具调用。";
 /// 传输层已经在未收到任何增量时完成自身重试；这里处理的是已经向用户输出过
 /// 片段后缺少终止 SSE 的场景。该场景不能重放同一个请求，只能让模型基于片段续写。
 pub(crate) const MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS: usize = 5;
@@ -29,6 +32,117 @@ pub(crate) const PUBLIC_MODEL_IMAGE_INVOCATION_FAILURE_MESSAGE: &str =
     "当前模型暂不支持图片输入，请更换支持图片的模型后重试。";
 pub(crate) const PUBLIC_MODEL_INVALID_IMAGE_INPUT_MESSAGE: &str =
     "图片输入无效，请重新选择图片后重试。";
+
+pub const MODEL_FAILURE_SCHEMA_VERSION: &str = "model-failure.v1";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelFailureDiagnostic {
+    pub schema_version: String,
+    pub code: String,
+    pub summary: String,
+    pub detail: String,
+    pub stage: String,
+    pub retryable: bool,
+    pub retry_attempts: usize,
+}
+
+impl ModelFailureDiagnostic {
+    pub(crate) fn from_invocation(
+        classification: ModelInvocationErrorClassification,
+        raw_detail: &str,
+        stage: &str,
+        retry_attempts: usize,
+    ) -> Self {
+        let detail = public_runtime_excerpt(raw_detail, 4096);
+        Self {
+            schema_version: MODEL_FAILURE_SCHEMA_VERSION.to_string(),
+            code: classification.code.to_string(),
+            summary: classification.public_message.to_string(),
+            detail: if detail.trim().is_empty() {
+                "模型服务未返回可供诊断的错误详情。".to_string()
+            } else {
+                detail
+            },
+            stage: stage.to_string(),
+            retryable: model_failure_is_user_retryable(classification.code),
+            retry_attempts,
+        }
+    }
+
+    pub(crate) fn empty_response(after_tool_calls: bool, retry_attempts: usize) -> Self {
+        let detail = if after_tool_calls {
+            format!(
+                "工具调用已完成，但模型请求在连续 {} 次自动恢复后仍未返回用户可见正文或新的可执行工具调用。",
+                retry_attempts
+            )
+        } else {
+            format!(
+                "模型请求成功结束，但连续 {} 次自动恢复后仍未返回用户可见正文或可执行工具调用。",
+                retry_attempts
+            )
+        };
+        Self {
+            schema_version: MODEL_FAILURE_SCHEMA_VERSION.to_string(),
+            code: if after_tool_calls {
+                "model_empty_response_after_tools".to_string()
+            } else {
+                "model_empty_response".to_string()
+            },
+            summary: PUBLIC_MODEL_EMPTY_RESPONSE_MESSAGE.to_string(),
+            detail,
+            stage: "response_validation".to_string(),
+            retryable: true,
+            retry_attempts,
+        }
+    }
+
+    pub(crate) fn configuration_unavailable() -> Self {
+        Self {
+            schema_version: MODEL_FAILURE_SCHEMA_VERSION.to_string(),
+            code: "model_configuration_unavailable".to_string(),
+            summary: "当前会话没有可用的模型配置。".to_string(),
+            detail: "未能从当前设置解析可用的模型客户端。".to_string(),
+            stage: "model_configuration".to_string(),
+            retryable: false,
+            retry_attempts: 0,
+        }
+    }
+
+    pub(crate) fn image_failure(raw_detail: &str, summary: String, retry_attempts: usize) -> Self {
+        let detail = public_runtime_excerpt(raw_detail, 4096);
+        let invalid_input = summary == PUBLIC_MODEL_INVALID_IMAGE_INPUT_MESSAGE;
+        Self {
+            schema_version: MODEL_FAILURE_SCHEMA_VERSION.to_string(),
+            code: if invalid_input {
+                "model_invalid_image_input".to_string()
+            } else {
+                "model_image_invocation_failed".to_string()
+            },
+            summary,
+            detail: if detail.trim().is_empty() {
+                "模型服务未返回可供诊断的图片请求错误详情。".to_string()
+            } else {
+                detail
+            },
+            stage: "request_dispatch".to_string(),
+            retryable: !invalid_input,
+            retry_attempts,
+        }
+    }
+}
+
+fn model_failure_is_user_retryable(code: &str) -> bool {
+    !matches!(
+        code,
+        "model_auth_failed"
+            | "model_context_limit"
+            | "model_invalid_request"
+            | "model_not_found"
+            | "model_region_unavailable"
+            | "model_tools_unsupported"
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModelInvocationErrorClassification {
@@ -288,10 +402,6 @@ pub(crate) fn public_model_image_invocation_error_message(raw_error: &str) -> St
     PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE.to_string()
 }
 
-pub(crate) fn provider_empty_assistant_response_error(_after_tool_calls: bool) -> String {
-    PUBLIC_MODEL_EMPTY_RESPONSE_MESSAGE.to_string()
-}
-
 pub(crate) fn model_empty_response_recovery_prompt(after_tool_calls: bool) -> &'static str {
     if after_tool_calls {
         MODEL_EMPTY_RESPONSE_AFTER_TOOLS_RECOVERY_PROMPT
@@ -317,11 +427,11 @@ mod tests {
     #[test]
     fn model_invocation_errors_use_public_message() {
         assert_eq!(
-            provider_empty_assistant_response_error(false),
+            ModelFailureDiagnostic::empty_response(false, 3).summary,
             PUBLIC_MODEL_EMPTY_RESPONSE_MESSAGE
         );
         assert_eq!(
-            provider_empty_assistant_response_error(true),
+            ModelFailureDiagnostic::empty_response(true, 3).summary,
             PUBLIC_MODEL_EMPTY_RESPONSE_MESSAGE
         );
         assert_eq!(
@@ -389,19 +499,19 @@ mod tests {
             public_model_invocation_error_message(
                 "provider stream interrupted: missing terminal SSE event"
             ),
-            "模型响应流中断，可直接继续重试。"
+            "模型响应流在完成前中断。"
         );
         assert_eq!(
             public_model_invocation_error_message(
                 "provider stream interrupted: reading stream chunk failed: connection reset"
             ),
-            "模型响应流中断，可直接继续重试。"
+            "模型响应流在完成前中断。"
         );
         assert_eq!(
             public_model_invocation_error_message(
                 "provider transport failed: operation timed out after 300 seconds"
             ),
-            "模型响应超时，可直接继续重试。"
+            "模型服务在响应完成前超时。"
         );
     }
 
@@ -423,6 +533,30 @@ mod tests {
             "桥接调用失败[RemoteBusiness]: provider rejected request (http_status=400)",
         );
         assert!(!invalid_request.retryable_before_output);
+    }
+
+    #[test]
+    fn model_failure_diagnostic_preserves_core_error_after_redaction() {
+        let raw_error = "provider response invalid: empty stream response; Authorization: Bearer secret-token; config=/Users/xie/.magi/settings.json";
+        let diagnostic = ModelFailureDiagnostic::from_invocation(
+            classify_model_invocation_error(raw_error),
+            raw_error,
+            "response_validation",
+            1,
+        );
+
+        assert_eq!(diagnostic.code, "model_empty_response");
+        assert_eq!(diagnostic.retry_attempts, 1);
+        assert!(diagnostic.detail.contains("provider response invalid"));
+        assert!(diagnostic.detail.contains("empty stream response"));
+        assert!(diagnostic.detail.contains("[redacted]"));
+        assert!(diagnostic.detail.contains("[path]"));
+        assert!(!diagnostic.detail.contains("secret-token"));
+        assert!(!diagnostic.detail.contains("/Users/xie"));
+        assert_eq!(
+            serde_json::to_value(&diagnostic).expect("diagnostic should serialize")["schemaVersion"],
+            MODEL_FAILURE_SCHEMA_VERSION
+        );
     }
 
     #[test]

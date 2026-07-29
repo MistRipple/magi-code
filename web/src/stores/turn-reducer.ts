@@ -5,8 +5,6 @@ import type {
 } from '../shared/protocol/canonical-turn';
 import {
   isCanonicalTerminalStatus,
-  publicCanonicalContent,
-  PUBLIC_MODEL_FAILURE_SANITIZED_METADATA_KEY,
   validateCanonicalTurnItemUpdate,
   validateCanonicalTurnUpdate,
 } from '../shared/protocol/canonical-turn';
@@ -94,23 +92,6 @@ function canonicalTurnRequestId(turn: CanonicalTurn | undefined): string {
 
 function canonicalItemRequestId(item: CanonicalTurnItem | undefined): string {
   return item ? readMetadataString(item.metadata, 'requestId') : '';
-}
-
-function itemContentWasSanitized(item: CanonicalTurnItem): boolean {
-  return item.metadata?.[PUBLIC_MODEL_FAILURE_SANITIZED_METADATA_KEY] === true;
-}
-
-function itemMetadataAfterStreamContent(
-  item: CanonicalTurnItem,
-  contentWasSanitized: boolean,
-): Record<string, unknown> | undefined {
-  const metadata = { ...(item.metadata || {}) };
-  if (contentWasSanitized) {
-    metadata[PUBLIC_MODEL_FAILURE_SANITIZED_METADATA_KEY] = true;
-  } else {
-    delete metadata[PUBLIC_MODEL_FAILURE_SANITIZED_METADATA_KEY];
-  }
-  return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
 
 function isLocalOptimisticTurn(turn: CanonicalTurn | undefined): boolean {
@@ -298,31 +279,6 @@ function applyCanonicalStreamUpdate(
   if (statusError) {
     return { state, changed: false, error: statusError };
   }
-  // 首帧中的内部模型失败文本会被协议层替换成公开文案；其后的增量仍以原始
-  // 文本长度计数，不能再直接拼接。保留公开文案并消费该增量，直到服务端发来
-  // reset 或终态快照，既不泄漏内部错误也不会把事件流误判为断裂。
-  if (itemContentWasSanitized(item) && !stream.reset) {
-    const nextItems = [...turn.items];
-    nextItems[itemIndex] = {
-      ...item,
-      status: stream.itemStatus,
-      itemVersion: stream.itemVersion,
-      updatedAt: event.occurredAt,
-    };
-    const nextTurns = [...state.turns];
-    nextTurns[turnIndex] = { ...turn, items: nextItems };
-    return {
-      state: {
-        sessionId: state.sessionId || event.sessionId,
-        turns: nextTurns,
-        lastAppliedEventSeq: event.eventSeq > 0
-          ? Math.max(state.lastAppliedEventSeq, event.eventSeq)
-          : state.lastAppliedEventSeq,
-      },
-      changed: true,
-      changedTurnIds: [turn.turnId],
-    };
-  }
   const currentContent = item.content || '';
   const currentChars = Array.from(currentContent);
   const deltaChars = Array.from(stream.delta);
@@ -367,11 +323,9 @@ function applyCanonicalStreamUpdate(
     }
     rawContent = `${currentContent}${deltaChars.slice(overlapLength).join('')}`;
   }
-  const content = publicCanonicalContent(rawContent);
-  const contentWasSanitized = content !== rawContent;
+  const content = rawContent;
   const reconciledLength = Array.from(content).length;
-  if (!contentWasSanitized
-    && ((stream.reset && reconciledLength !== stream.contentLength) || reconciledLength < stream.contentLength)) {
+  if ((stream.reset && reconciledLength !== stream.contentLength) || reconciledLength < stream.contentLength) {
     return {
       state,
       changed: false,
@@ -385,7 +339,6 @@ function applyCanonicalStreamUpdate(
       status: stream.itemStatus,
       itemVersion: stream.itemVersion,
       updatedAt: event.occurredAt,
-      metadata: itemMetadataAfterStreamContent(item, contentWasSanitized),
   };
   const nextTurns = [...state.turns];
   nextTurns[turnIndex] = { ...turn, items: nextItems };

@@ -103,11 +103,7 @@ async fn register_workspace(
     // 已注册过的 workspace：复用已有记录，仍异步刷新索引。
     if let Some(workspace) = registered_workspace_for_path(&state, &canonical_path) {
         let workspace_id = workspace.workspace_id.clone();
-        super::knowledge::schedule_workspace_code_index(
-            state.clone(),
-            workspace_id,
-            canonical_path.clone(),
-        );
+        state.schedule_workspace_code_index(workspace_id, canonical_path.clone());
         return Ok(Json(serde_json::json!({
             "workspaceId": workspace.workspace_id.to_string(),
             "registered": false,
@@ -126,11 +122,7 @@ async fn register_workspace(
             // 并发竞态：另一个请求先注册了同一路径。
             if let Some(workspace) = registered_workspace_for_path(&state, &canonical_path) {
                 let wid = workspace.workspace_id.clone();
-                super::knowledge::schedule_workspace_code_index(
-                    state.clone(),
-                    wid,
-                    canonical_path.clone(),
-                );
+                state.schedule_workspace_code_index(wid, canonical_path.clone());
                 return Ok(Json(serde_json::json!({
                     "workspaceId": workspace.workspace_id.to_string(),
                     "registered": false,
@@ -143,11 +135,7 @@ async fn register_workspace(
 
     // 先持久化 workspace 注册状态（快），索引放到后台不阻塞响应。
     state.persist_workspace_durable_state_for_api()?;
-    super::knowledge::schedule_workspace_code_index(
-        state.clone(),
-        workspace_id.clone(),
-        canonical_path.clone(),
-    );
+    state.schedule_workspace_code_index(workspace_id.clone(), canonical_path.clone());
     Ok(Json(serde_json::json!({
         "workspaceId": workspace_id.to_string(),
         "registered": true
@@ -1199,6 +1187,7 @@ mod tests {
             notifications: Vec::new(),
             goals: Vec::new(),
             plans: Vec::new(),
+            thread_registry: Vec::new(),
         };
         let sidecar_state = SessionExecutionSidecarStoreState {
             runtime_sidecars: vec![SessionRuntimeSidecar {

@@ -951,10 +951,14 @@ async fn add_mcp_server(
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let normalized = normalize_mcp_server_entry(&request)?;
+    let server_id = mcp_server_entry_id(&normalized)
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::InvalidInput("serverId 不能为空".to_string()))?;
     state
         .settings_store
         .upsert_array_entry("mcpServers", "id", &normalized)
         .map_err(settings_persistence_error)?;
+    remove_mcp_connection(&state, &server_id);
     Ok(Json(serde_json::json!({ "added": true })))
 }
 
@@ -973,9 +977,7 @@ async fn update_mcp_server(
         .settings_store
         .upsert_array_entry("mcpServers", "id", &normalized)
         .map_err(settings_persistence_error)?;
-    if !mcp_server_entry_enabled(&normalized) {
-        remove_mcp_connection(&state, &server_id);
-    }
+    remove_mcp_connection(&state, &server_id);
     Ok(Json(serde_json::json!({ "updated": true })))
 }
 
@@ -1013,14 +1015,20 @@ fn remove_mcp_connection(state: &ApiState, server_id: &str) {
     pool.remove(server_id);
 }
 
-fn mcp_tools_unavailable_response(server_id: &str) -> Json<serde_json::Value> {
+fn public_mcp_error_detail(error: &str) -> String {
+    magi_core::public_runtime_excerpt(error, 4_000)
+}
+
+fn mcp_tools_unavailable_response(server_id: &str, error_detail: &str) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "tools": [],
         "connected": false,
         "health": MCP_DISCONNECTED_HEALTH,
         "error": MCP_CONNECTION_FAILED_MARKER,
+        "errorDetail": public_mcp_error_detail(error_detail),
         "serverId": server_id,
         "toolCount": 0,
+        "lastCheckedAt": epoch_ms_now(),
     }))
 }
 
@@ -1031,6 +1039,7 @@ fn mcp_tools_disabled_response(server_id: &str) -> Json<serde_json::Value> {
         "health": MCP_DISABLED_HEALTH,
         "serverId": server_id,
         "toolCount": 0,
+        "lastCheckedAt": epoch_ms_now(),
     }))
 }
 
@@ -1090,21 +1099,25 @@ async fn connect_mcp_server(
         return Ok(mcp_tools_disabled_response(&server_id));
     }
 
-    let (_, tools) = connect_configured_mcp_server(&state, &server_id)
-        .await
-        .map_err(|err| {
+    let tools = match connect_configured_mcp_server(&state, &server_id).await {
+        Ok((_, tools)) => tools,
+        Err(error) => {
             tracing::warn!(
                 server_id = %server_id,
-                error = ?err,
+                error = %error,
                 "MCP server connect failed"
             );
-            ApiError::InvalidInput("MCP server 连接失败".to_string())
-        })?;
+            remove_mcp_connection(&state, &server_id);
+            return Ok(mcp_tools_unavailable_response(&server_id, &error));
+        }
+    };
 
     Ok(Json(serde_json::json!({
         "connected": true,
+        "health": "connected",
         "serverId": server_id,
         "toolCount": tools.len(),
+        "lastCheckedAt": epoch_ms_now(),
     })))
 }
 
@@ -1156,14 +1169,18 @@ async fn get_mcp_tools(
                 "MCP tools fetch failed"
             );
             remove_mcp_connection(&state, server_id);
-            return Ok(mcp_tools_unavailable_response(server_id));
+            return Ok(mcp_tools_unavailable_response(server_id, &err));
         }
     };
 
+    let tool_count = tools.len();
     Ok(Json(serde_json::json!({
         "tools": tools,
         "connected": true,
+        "health": "connected",
         "serverId": server_id,
+        "toolCount": tool_count,
+        "lastCheckedAt": epoch_ms_now(),
     })))
 }
 
@@ -1193,14 +1210,18 @@ async fn refresh_mcp_tools(
                 "MCP tools refresh failed"
             );
             remove_mcp_connection(&state, server_id);
-            return Ok(mcp_tools_unavailable_response(server_id));
+            return Ok(mcp_tools_unavailable_response(server_id, &err));
         }
     };
 
+    let tool_count = tools.len();
     Ok(Json(serde_json::json!({
         "tools": tools,
         "connected": true,
+        "health": "connected",
         "serverId": server_id,
+        "toolCount": tool_count,
+        "lastCheckedAt": epoch_ms_now(),
     })))
 }
 
@@ -3194,6 +3215,16 @@ mod tests {
             public["servers"][0]["headers"]["Authorization"],
             serde_json::json!("Bearer secret")
         );
+        state
+            .mcp_connections()
+            .write()
+            .expect("mcp connections should lock")
+            .insert(
+                "http-server".to_string(),
+                Arc::new(McpServerClient::from_stdio(
+                    magi_bridge_client::McpServerConfig::new("unused", Vec::new()),
+                )),
+            );
 
         let updated = post_json(
             Router::new().merge(routes()).with_state(state.clone()),
@@ -3211,6 +3242,14 @@ mod tests {
         )
         .await;
         assert_eq!(updated["updated"], true);
+        assert!(
+            !state
+                .mcp_connections()
+                .read()
+                .expect("mcp connections should lock")
+                .contains_key("http-server"),
+            "updating MCP connection settings must invalidate the previous client"
+        );
         let stored = stored_mcp_server_entry(&state, "http-server")
             .expect("HTTP MCP server should remain stored");
         assert_eq!(
@@ -3912,9 +3951,31 @@ done
             assert_eq!(body["connected"], false);
             assert_eq!(body["health"], "disconnected");
             assert_eq!(body["error"], MCP_CONNECTION_FAILED_MARKER);
+            assert!(
+                body["errorDetail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.contains("配置不存在")),
+                "unexpected body: {body}"
+            );
             assert_eq!(body["toolCount"], 0);
+            assert!(body["lastCheckedAt"].as_u64().is_some());
             assert_eq!(body["tools"].as_array().map(Vec::len), Some(0));
         }
+    }
+
+    #[test]
+    fn mcp_error_detail_keeps_cause_and_redacts_credentials() {
+        let detail = public_mcp_error_detail(
+            "HTTP MCP request failed: connection refused; Authorization: Bearer private-token; sk-secret-token",
+        );
+        assert!(
+            detail.contains("connection refused"),
+            "detail was: {detail}"
+        );
+        assert!(detail.contains("Bearer [redacted]"), "detail was: {detail}");
+        assert!(detail.contains("sk-[redacted]"), "detail was: {detail}");
+        assert!(!detail.contains("private-token"), "detail was: {detail}");
+        assert!(!detail.contains("secret-token"), "detail was: {detail}");
     }
 
     #[tokio::test]

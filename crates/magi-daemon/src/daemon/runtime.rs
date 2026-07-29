@@ -10,8 +10,8 @@ use magi_api::{
     mcp_config::{build_mcp_config_from_entry, mcp_server_entry_enabled, mcp_server_entry_id},
 };
 use magi_bridge_client::{
-    BridgeBindingKind, BridgeClientError, BridgeDispatchRuntime, BridgeResponse, BridgeServerKind,
-    BridgeTransport, HttpModelBridgeClient, HttpModelBridgeProtocol,
+    BridgeBindingKind, BridgeClientError, BridgeDispatchRuntime, BridgeErrorLayer, BridgeResponse,
+    BridgeServerKind, BridgeTransport, HttpModelBridgeClient, HttpModelBridgeProtocol,
     ImageGenerationRequest as BridgeImageGenerationRequest, JsonRpcMcpBridgeClient,
     JsonRpcStdioTransport, McpBridgeClient, McpServerClient, McpToolCallRequest,
     StdioMcpBridgeClient,
@@ -187,15 +187,23 @@ fn build_external_mcp_tool_executor(
                     magi_core::ExecutionResultStatus::Failed
                 },
             ),
-            Err(error) => (
-                serde_json::json!({
-                    "tool": external_mcp_model_tool_name(server_id, tool_name),
-                    "status": "failed",
-                    "error": error.to_string(),
-                })
-                .to_string(),
-                magi_core::ExecutionResultStatus::Failed,
-            ),
+            Err(error) => {
+                if mcp_error_invalidates_connection(&error) {
+                    mcp_connections
+                        .write()
+                        .expect("mcp connections write lock poisoned")
+                        .remove(server_id);
+                }
+                (
+                    serde_json::json!({
+                        "tool": external_mcp_model_tool_name(server_id, tool_name),
+                        "status": "failed",
+                        "error": error.to_string(),
+                    })
+                    .to_string(),
+                    magi_core::ExecutionResultStatus::Failed,
+                )
+            }
         }
     })
 }
@@ -297,6 +305,12 @@ fn external_mcp_server_catalog_snapshot(
         mcp_client_for_settings_entry(entry, mcp_connections)
             .and_then(|client| client.list_tools().map_err(|error| error.to_string()))
     });
+    if live_tools.as_ref().is_some_and(Result::is_err) {
+        mcp_connections
+            .write()
+            .expect("mcp connections write lock poisoned")
+            .remove(&server_id);
+    }
     let connected = enabled && live_tools.as_ref().is_some_and(Result::is_ok);
     let tool_count = live_tools
         .as_ref()
@@ -377,10 +391,12 @@ fn mcp_client_for_settings_entry(
     let config = build_mcp_config_from_entry(entry)
         .ok_or_else(|| format!("MCP server {server_id} config is incomplete"))?;
     let client = Arc::new(McpServerClient::new(config));
-    mcp_connections
+    let client = mcp_connections
         .write()
         .expect("mcp connections write lock poisoned")
-        .insert(server_id, client.clone());
+        .entry(server_id)
+        .or_insert(client)
+        .clone();
     Ok(client)
 }
 
@@ -447,7 +463,17 @@ impl McpBridgeClient for SettingsBackedMcpBridgeClient {
             .map(str::to_string)
             .unwrap_or_else(|| target.to_string());
         let client = self.client_for_entry(&server_id, &entry)?;
-        client.call_tool(request)
+        let response = client.call_tool(request);
+        if response
+            .as_ref()
+            .is_err_and(mcp_error_invalidates_connection)
+        {
+            self.mcp_connections
+                .write()
+                .expect("mcp connections write lock poisoned")
+                .remove(&server_id);
+        }
+        response
     }
 }
 
@@ -468,6 +494,13 @@ fn mcp_config_unavailable_error(message: String) -> BridgeClientError {
     BridgeClientError::MissingClient {
         bridge_kind: BridgeBindingKind::Mcp,
     }
+}
+
+fn mcp_error_invalidates_connection(error: &BridgeClientError) -> bool {
+    matches!(
+        error.layer(),
+        Some(BridgeErrorLayer::Transport | BridgeErrorLayer::Protocol)
+    )
 }
 
 fn read_json_string(value: &serde_json::Value, fields: &[&str]) -> Option<String> {

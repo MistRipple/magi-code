@@ -842,6 +842,33 @@ mod tests {
     }
 
     #[test]
+    fn accumulator_marks_tool_call_without_arguments_as_invalid() {
+        let mut acc = StreamAccumulator::new();
+        acc.apply(&LlmStreamChunk {
+            kind: LlmStreamChunkType::ToolCallStart,
+            content: None,
+            tool_call: Some(PartialToolCall {
+                id: Some("call-empty".to_string()),
+                name: Some("shell_exec".to_string()),
+                arguments: None,
+                index: None,
+            }),
+            thinking: None,
+            usage: None,
+            stop_reason: None,
+        });
+
+        let result = acc.finalize();
+
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].raw_arguments.as_deref(), Some(""));
+        assert_eq!(
+            result.tool_calls[0].argument_parse_error.as_deref(),
+            Some("tool arguments are empty")
+        );
+    }
+
+    #[test]
     fn accumulator_preserves_openai_arguments_on_tool_call_start() {
         let mut parser = SseLineParser::new();
         let mut acc = StreamAccumulator::new();

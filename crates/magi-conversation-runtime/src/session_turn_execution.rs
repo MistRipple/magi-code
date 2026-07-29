@@ -14,9 +14,9 @@ use crate::{
     model_config::resolve_orchestrator_model_config,
     model_error::{
         MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
-        MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, classify_model_invocation_error,
-        extract_model_context_limit, model_empty_response_recovery_prompt,
-        model_stream_interruption_recovery_prompt, provider_empty_assistant_response_error,
+        MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, ModelFailureDiagnostic,
+        classify_model_invocation_error, extract_model_context_limit,
+        model_empty_response_recovery_prompt, model_stream_interruption_recovery_prompt,
         public_model_image_invocation_error_message,
     },
     prompt_utils::{
@@ -32,6 +32,10 @@ use crate::{
         publish_current_session_turn_item_event, publish_model_retry_runtime_event,
         publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
         session_turn_stream_update, upsert_session_turn_item,
+    },
+    tool_call_validation::{
+        ToolCallFailureDiagnostic, ToolCallValidationIssue, ToolCallValidationTracker,
+        invalid_tool_result_message, validate_tool_call_batch,
     },
     tool_surface_state::{activate_skill_tool_definitions, refresh_live_mcp_tool_definitions},
     usage_recording::{
@@ -122,6 +126,7 @@ pub enum SessionTurnFailureReason {
     ModelEmptyResponse,
     ModelEmptyResponseAfterTools,
     ModelImageInvocationFailed,
+    ToolCallProtocolFailed,
     RuntimeInvalidState,
 }
 
@@ -133,6 +138,7 @@ impl SessionTurnFailureReason {
             Self::ModelEmptyResponse => "model_empty_response",
             Self::ModelEmptyResponseAfterTools => "model_empty_response_after_tools",
             Self::ModelImageInvocationFailed => "model_image_invocation_failed",
+            Self::ToolCallProtocolFailed => "tool_arguments_invalid",
             Self::RuntimeInvalidState => "session_turn_runtime_invalid_state",
         }
     }
@@ -143,6 +149,8 @@ pub struct SessionTurnExecutionError {
     pub reason: SessionTurnFailureReason,
     pub diagnostic_code: String,
     pub public_message: String,
+    pub model_failure: Option<ModelFailureDiagnostic>,
+    pub(crate) tool_call_failure: Option<ToolCallFailureDiagnostic>,
 }
 
 impl SessionTurnExecutionError {
@@ -151,18 +159,31 @@ impl SessionTurnExecutionError {
             reason,
             diagnostic_code: reason.code().to_string(),
             public_message: public_message.into(),
+            model_failure: None,
+            tool_call_failure: None,
         }
     }
 
-    fn with_diagnostic_code(
+    pub(crate) fn from_model_failure(
         reason: SessionTurnFailureReason,
-        diagnostic_code: impl Into<String>,
-        public_message: impl Into<String>,
+        model_failure: ModelFailureDiagnostic,
     ) -> Self {
         Self {
             reason,
-            diagnostic_code: diagnostic_code.into(),
-            public_message: public_message.into(),
+            diagnostic_code: model_failure.code.clone(),
+            public_message: model_failure.summary.clone(),
+            model_failure: Some(model_failure),
+            tool_call_failure: None,
+        }
+    }
+
+    fn from_tool_call_failure(tool_call_failure: ToolCallFailureDiagnostic) -> Self {
+        Self {
+            reason: SessionTurnFailureReason::ToolCallProtocolFailed,
+            diagnostic_code: tool_call_failure.code.clone(),
+            public_message: tool_call_failure.summary.clone(),
+            model_failure: None,
+            tool_call_failure: Some(tool_call_failure),
         }
     }
 
@@ -886,6 +907,7 @@ fn run_session_turn_execution_inner(
     let mut empty_response_recovery_attempts = 0usize;
     let mut pre_output_invocation_recovery_attempts = 0usize;
     let mut stream_interruption_recovery_attempts = 0usize;
+    let mut tool_call_validation_tracker = ToolCallValidationTracker::default();
 
     let mut round_limit = tool_call_round_limit(&required_tool_chain);
     let mut round = 0usize;
@@ -903,7 +925,8 @@ fn run_session_turn_execution_inner(
                 &[],
             );
         }
-        let round_tools = (!active_tools.is_empty()).then_some(active_tools.clone());
+        let round_tools =
+            (request.use_tools && !active_tools.is_empty()).then_some(active_tools.clone());
         let streamed_content = match stream_session_turn_round(
             SessionTurnRoundRuntime {
                 client: active_client,
@@ -948,7 +971,10 @@ fn run_session_turn_execution_inner(
                 round = round.saturating_add(1);
                 continue;
             }
-            Err(SessionTurnRoundError::Failed(error)) => {
+            Err(SessionTurnRoundError::Failed {
+                error,
+                non_stream_fallback_attempted,
+            }) => {
                 if !request_turn_is_writable(session_store, &request) {
                     return Ok(SessionTurnExecutionOutput::interrupted());
                 }
@@ -1013,7 +1039,10 @@ fn run_session_turn_execution_inner(
                         continue;
                     }
                 }
-                let execution_error = session_turn_model_error(&request, &error);
+                let retry_attempts = pre_output_invocation_recovery_attempts
+                    + stream_interruption_recovery_attempts
+                    + usize::from(non_stream_fallback_attempted);
+                let execution_error = session_turn_model_error(&request, &error, retry_attempts);
                 append_session_turn_error_item(
                     event_bus,
                     session_store,
@@ -1025,6 +1054,13 @@ fn run_session_turn_execution_inner(
                         user_message_id: request.user_message_id.as_deref(),
                         placeholder_message_id: request.placeholder_message_id.as_deref(),
                         error_text: &execution_error.public_message,
+                        model_failure: execution_error.model_failure.as_ref(),
+                        tool_call_failure: execution_error.tool_call_failure.as_ref().map(
+                            |failure| {
+                                serde_json::to_value(failure)
+                                    .expect("tool call failure diagnostic must serialize")
+                            },
+                        ),
                         streaming_entry_id: main_timeline_entry_id.as_deref(),
                         source_thread_id: orchestrator_thread_id.clone(),
                         persist_session_state,
@@ -1035,6 +1071,53 @@ fn run_session_turn_execution_inner(
         };
         if streamed_content.interrupted || !request_turn_is_writable(session_store, &request) {
             return Ok(SessionTurnExecutionOutput::interrupted());
+        }
+        let repeated_tool_call_failure = if streamed_content.invalid_tool_calls.is_empty() {
+            None
+        } else {
+            let attempts = tool_call_validation_tracker.record_round();
+            if attempts >= 2 {
+                streamed_content.invalid_tool_calls.first().map(|issue| {
+                    ToolCallFailureDiagnostic::repeated(issue, attempts.saturating_sub(1))
+                })
+            } else {
+                for issue in &streamed_content.invalid_tool_calls {
+                    tracing::warn!(
+                        session_id = %request.session_id,
+                        round,
+                        tool = %issue.tool_name,
+                        reason_code = %issue.reason_code,
+                        "模型提交了无效工具调用，已拒绝执行并请求模型修正"
+                    );
+                }
+                None
+            }
+        };
+        if let Some(tool_call_failure) = repeated_tool_call_failure {
+            let execution_error =
+                SessionTurnExecutionError::from_tool_call_failure(tool_call_failure);
+            append_session_turn_error_item(
+                event_bus,
+                session_store,
+                crate::session_writeback::SessionTurnErrorInput {
+                    session_id: &request.session_id,
+                    workspace_id: &request.workspace_id,
+                    task_id: None,
+                    request_id: request.request_id.as_deref(),
+                    user_message_id: request.user_message_id.as_deref(),
+                    placeholder_message_id: request.placeholder_message_id.as_deref(),
+                    error_text: &execution_error.public_message,
+                    model_failure: None,
+                    tool_call_failure: execution_error.tool_call_failure.as_ref().map(|failure| {
+                        serde_json::to_value(failure)
+                            .expect("tool call failure diagnostic must serialize")
+                    }),
+                    streaming_entry_id: main_timeline_entry_id.as_deref(),
+                    source_thread_id: orchestrator_thread_id.clone(),
+                    persist_session_state,
+                },
+            );
+            return Err(execution_error);
         }
         if main_timeline_entry_id.is_none() {
             main_timeline_entry_id = streamed_content.timeline_entry_id.clone();
@@ -1198,6 +1281,11 @@ fn run_session_turn_execution_inner(
                 user_message_id: request.user_message_id.as_deref(),
                 placeholder_message_id: request.placeholder_message_id.as_deref(),
                 error_text: &failure.public_message,
+                model_failure: failure.model_failure.as_ref(),
+                tool_call_failure: failure.tool_call_failure.as_ref().map(|failure| {
+                    serde_json::to_value(failure)
+                        .expect("tool call failure diagnostic must serialize")
+                }),
                 streaming_entry_id: main_timeline_entry_id.as_deref(),
                 source_thread_id: orchestrator_thread_id.clone(),
                 persist_session_state,
@@ -1265,11 +1353,13 @@ fn append_session_turn_steers_to_messages(
 fn session_turn_model_error(
     request: &SessionTurnExecutionRequest,
     error: &str,
+    retry_attempts: usize,
 ) -> SessionTurnExecutionError {
     if !request.images.is_empty() {
-        return SessionTurnExecutionError::new(
+        let summary = public_model_image_invocation_error_message(error);
+        return SessionTurnExecutionError::from_model_failure(
             SessionTurnFailureReason::ModelImageInvocationFailed,
-            public_model_image_invocation_error_message(error),
+            ModelFailureDiagnostic::image_failure(error, summary, retry_attempts),
         );
     }
     let classification = classify_model_invocation_error(error);
@@ -1278,10 +1368,16 @@ fn session_turn_model_error(
     } else {
         SessionTurnFailureReason::ModelInvocationFailed
     };
-    SessionTurnExecutionError::with_diagnostic_code(
+    let stage = if classification.code == "model_stream_interrupted" {
+        "response_stream"
+    } else if classification.code == "model_empty_response" {
+        "response_validation"
+    } else {
+        "request_dispatch"
+    };
+    SessionTurnExecutionError::from_model_failure(
         reason,
-        classification.code,
-        classification.public_message,
+        ModelFailureDiagnostic::from_invocation(classification, error, stage, retry_attempts),
     )
 }
 
@@ -1290,9 +1386,14 @@ fn session_turn_empty_response_error(
     after_tool_calls: bool,
 ) -> SessionTurnExecutionError {
     if !request.images.is_empty() {
-        return SessionTurnExecutionError::new(
+        let summary = public_model_image_invocation_error_message("empty stream response");
+        return SessionTurnExecutionError::from_model_failure(
             SessionTurnFailureReason::ModelImageInvocationFailed,
-            public_model_image_invocation_error_message("empty stream response"),
+            ModelFailureDiagnostic::image_failure(
+                "模型请求成功结束，但未返回可见的图片分析结果。",
+                summary,
+                MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS,
+            ),
         );
     }
     let reason = if after_tool_calls {
@@ -1300,9 +1401,12 @@ fn session_turn_empty_response_error(
     } else {
         SessionTurnFailureReason::ModelEmptyResponse
     };
-    SessionTurnExecutionError::new(
+    SessionTurnExecutionError::from_model_failure(
         reason,
-        provider_empty_assistant_response_error(after_tool_calls),
+        ModelFailureDiagnostic::empty_response(
+            after_tool_calls,
+            MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS,
+        ),
     )
 }
 
@@ -1337,13 +1441,17 @@ struct SessionTurnRoundOutput {
     tool_call_names: Vec<String>,
     activated_skill_id: Option<String>,
     content_recovery_needed: bool,
+    invalid_tool_calls: Vec<ToolCallValidationIssue>,
     interrupted: bool,
 }
 
 /// 单轮流式调用的失败语义。仅在未交付可见内容时才能重放请求；已交付片段时必须续写。
 #[derive(Debug)]
 enum SessionTurnRoundError {
-    Failed(String),
+    Failed {
+        error: String,
+        non_stream_fallback_attempted: bool,
+    },
     PreOutputInvocationRecovered,
     StreamInterruptedRecovered,
 }
@@ -1662,6 +1770,7 @@ fn stream_session_turn_round(
                     tool_call_names: Vec::new(),
                     activated_skill_id: None,
                     content_recovery_needed: false,
+                    invalid_tool_calls: Vec::new(),
                     interrupted: true,
                 });
             }
@@ -1700,7 +1809,10 @@ fn stream_session_turn_round(
                 return Err(SessionTurnRoundError::PreOutputInvocationRecovered);
             }
             if classification.code != "model_stream_interrupted" {
-                return Err(SessionTurnRoundError::Failed(raw_error));
+                return Err(SessionTurnRoundError::Failed {
+                    error: raw_error,
+                    non_stream_fallback_attempted: false,
+                });
             }
 
             if !partial_thinking.is_empty() {
@@ -1826,17 +1938,22 @@ fn stream_session_turn_round(
                         ?fallback_error,
                         "非流式降级请求失败"
                     );
-                    return Err(SessionTurnRoundError::Failed(fallback_raw_error));
+                    return Err(SessionTurnRoundError::Failed {
+                        error: fallback_raw_error,
+                        non_stream_fallback_attempted: true,
+                    });
                 }
             }
         }
     };
     let parsed = response.parse_chat_payload();
+    let tool_validation =
+        validate_tool_call_batch(&parsed.tool_calls, tools.as_deref().unwrap_or_default());
     let has_actionable_output = parsed
         .content
         .as_deref()
         .is_some_and(|content| !content.trim().is_empty())
-        || !parsed.tool_calls.is_empty();
+        || !tool_validation.valid_calls.is_empty();
     publish_model_usage_record(
         event_bus,
         session_store,
@@ -1853,7 +1970,16 @@ fn stream_session_turn_round(
                 UsageCallStatus::Failed
             },
             assignment_id: None,
-            error_code: (!has_actionable_output).then(|| "model_empty_response".to_string()),
+            error_code: if !tool_validation.invalid_calls.is_empty()
+                && tool_validation.valid_calls.is_empty()
+            {
+                tool_validation
+                    .invalid_calls
+                    .first()
+                    .map(|invalid| invalid.issue.code.clone())
+            } else {
+                (!has_actionable_output).then(|| "model_empty_response".to_string())
+            },
         },
     );
     account_active_goal_turn(
@@ -1875,6 +2001,7 @@ fn stream_session_turn_round(
             tool_call_names: Vec::new(),
             activated_skill_id: None,
             content_recovery_needed: false,
+            invalid_tool_calls: Vec::new(),
             interrupted: true,
         });
     }
@@ -1897,6 +2024,7 @@ fn stream_session_turn_round(
                 tool_call_names: Vec::new(),
                 activated_skill_id: None,
                 content_recovery_needed: false,
+                invalid_tool_calls: Vec::new(),
                 interrupted: true,
             });
         }
@@ -1946,6 +2074,7 @@ fn stream_session_turn_round(
                 tool_call_names: Vec::new(),
                 activated_skill_id: None,
                 content_recovery_needed: false,
+                invalid_tool_calls: Vec::new(),
                 interrupted: true,
             });
         }
@@ -1980,7 +2109,7 @@ fn stream_session_turn_round(
     // 不再预占 placeholder（只在首个 text delta 时按 max+1 自然分配 item_seq），无 item
     // 需要 retire——空回复直接在 canonical turn 里留白即可。
 
-    if request.use_tools && !parsed.tool_calls.is_empty() {
+    if !parsed.tool_calls.is_empty() {
         if !request_turn_is_writable(session_store, request) {
             return Ok(SessionTurnRoundOutput {
                 final_content: None,
@@ -1990,6 +2119,7 @@ fn stream_session_turn_round(
                 tool_call_names: Vec::new(),
                 activated_skill_id: None,
                 content_recovery_needed: false,
+                invalid_tool_calls: Vec::new(),
                 interrupted: true,
             });
         }
@@ -2000,6 +2130,11 @@ fn stream_session_turn_round(
             tool_calls: parsed.tool_calls.clone(),
             tool_call_id: None,
         });
+        let invalid_tool_calls = tool_validation.invalid_calls;
+        for invalid in &invalid_tool_calls {
+            messages.push(invalid_tool_result_message(invalid));
+        }
+        let valid_tool_calls = tool_validation.valid_calls;
         let snapshot_session = snapshot_manager.and_then(|mgr| {
             request
                 .workspace_root_path
@@ -2008,31 +2143,33 @@ fn stream_session_turn_round(
                 .and_then(|root| mgr.get_session_for_workspace(request.session_id.as_str(), &root))
         });
         let execution_group_id = format!("turn:{}", request.turn_id);
-        let tool_batch = append_session_tool_call_items_batch_with_context(
-            crate::session_writeback::SessionToolCallBatchContext {
-                session_store,
-                event_bus,
-                tool_registry,
-                skill_runtime,
-                skill_dispatch_runtime,
-                skill_name,
-                safety_gate,
-                plan_store,
-                mission_id: orchestrator_mission_id,
-                session_id: &request.session_id,
-                workspace_id: &request.workspace_id,
-                workspace_root_path: request.workspace_root_path.as_deref().map(PathBuf::from),
-                context_references: &request.context_references,
-                access_profile: request.access_profile,
-                snapshot_session,
-                execution_group_id: Some(execution_group_id),
-                source_thread_id: orchestrator_thread_id,
-                persist_session_state,
-            },
-            &parsed.tool_calls,
-            messages,
-            || request_turn_is_writable(session_store, request),
-        );
+        let tool_batch = (!valid_tool_calls.is_empty()).then(|| {
+            append_session_tool_call_items_batch_with_context(
+                crate::session_writeback::SessionToolCallBatchContext {
+                    session_store,
+                    event_bus,
+                    tool_registry,
+                    skill_runtime,
+                    skill_dispatch_runtime,
+                    skill_name,
+                    safety_gate,
+                    plan_store,
+                    mission_id: orchestrator_mission_id,
+                    session_id: &request.session_id,
+                    workspace_id: &request.workspace_id,
+                    workspace_root_path: request.workspace_root_path.as_deref().map(PathBuf::from),
+                    context_references: &request.context_references,
+                    access_profile: request.access_profile,
+                    snapshot_session,
+                    execution_group_id: Some(execution_group_id),
+                    source_thread_id: orchestrator_thread_id,
+                    persist_session_state,
+                },
+                &valid_tool_calls,
+                messages,
+                || request_turn_is_writable(session_store, request),
+            )
+        });
         if !request_turn_is_writable(session_store, request) {
             return Ok(SessionTurnRoundOutput {
                 final_content: None,
@@ -2042,6 +2179,7 @@ fn stream_session_turn_round(
                 tool_call_names: Vec::new(),
                 activated_skill_id: None,
                 content_recovery_needed: false,
+                invalid_tool_calls: Vec::new(),
                 interrupted: true,
             });
         }
@@ -2049,10 +2187,17 @@ fn stream_session_turn_round(
             final_content: None,
             final_item_id: None,
             timeline_entry_id: timeline_entry_id.clone(),
-            encountered_tool_calls: true,
-            tool_call_names: tool_batch.succeeded_tool_names,
-            activated_skill_id: tool_batch.activated_skill_id,
+            encountered_tool_calls: !valid_tool_calls.is_empty(),
+            tool_call_names: tool_batch
+                .as_ref()
+                .map(|batch| batch.succeeded_tool_names.clone())
+                .unwrap_or_default(),
+            activated_skill_id: tool_batch.and_then(|batch| batch.activated_skill_id),
             content_recovery_needed: false,
+            invalid_tool_calls: invalid_tool_calls
+                .into_iter()
+                .map(|invalid| invalid.issue)
+                .collect(),
             interrupted: false,
         });
     }
@@ -2078,6 +2223,7 @@ fn stream_session_turn_round(
         tool_call_names: Vec::new(),
         activated_skill_id: None,
         content_recovery_needed,
+        invalid_tool_calls: Vec::new(),
         interrupted: false,
     })
 }
@@ -2227,6 +2373,11 @@ mod tests {
 
     struct RetryEventModelBridgeClient;
 
+    struct RepeatedInvalidShellModelBridgeClient {
+        calls: AtomicUsize,
+        requests: Mutex<Vec<ModelInvocationRequest>>,
+    }
+
     struct CancellingModelBridgeClient {
         store: Arc<SessionStore>,
         session_id: SessionId,
@@ -2350,6 +2501,48 @@ mod tests {
                 payload: serde_json::json!({
                     "content": null,
                     "finish_reason": "stop"
+                })
+                .to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for RepeatedInvalidShellModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<BridgeResponse, BridgeClientError> {
+            let call_number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.requests
+                .lock()
+                .expect("requests mutex poisoned")
+                .push(request);
+            let arguments = if call_number == 1 {
+                "{}"
+            } else {
+                r#"{"command":" "}"#
+            };
+            Ok(BridgeResponse {
+                ok: true,
+                payload: serde_json::json!({
+                    "content": null,
+                    "finish_reason": "tool_calls",
+                    "tool_calls": [{
+                        "id": format!("call-invalid-shell-{call_number}"),
+                        "type": "function",
+                        "function": {
+                            "name": "shell_exec",
+                            "arguments": arguments
+                        }
+                    }]
                 })
                 .to_string(),
             })
@@ -3122,7 +3315,7 @@ mod tests {
         assert_eq!(error.reason, SessionTurnFailureReason::ModelEmptyResponse);
         assert_eq!(
             error.public_message,
-            "模型本轮未返回有效内容，可直接继续重试。"
+            "模型服务返回了空响应，未生成正文或可执行工具调用。"
         );
         assert_eq!(
             client.calls.load(Ordering::SeqCst),
@@ -3134,13 +3327,172 @@ mod tests {
             .and_then(|sidecar| sidecar.current_turn)
             .expect("failed turn should remain visible");
         assert_eq!(turn.status, "failed");
-        assert!(turn.items.iter().any(|item| {
-            item.kind == "assistant_error"
-                && item.content.as_deref() == Some(error.public_message.as_str())
-        }));
+        let error_item = turn
+            .items
+            .iter()
+            .find(|item| item.kind == "assistant_error")
+            .expect("empty response should append an assistant error");
+        assert_eq!(
+            error_item.content.as_deref(),
+            Some(error.public_message.as_str())
+        );
+        assert_eq!(
+            error_item.metadata["modelFailure"]["code"],
+            "model_empty_response"
+        );
+        assert_eq!(
+            error_item.metadata["modelFailure"]["retryAttempts"],
+            MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS
+        );
+        assert!(
+            error_item.metadata["modelFailure"]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("仍未返回用户可见正文"))
+        );
         let plan = plan_store.snapshot().expect("plan should remain visible");
         assert_eq!(plan.state, magi_core::PlanState::Paused);
         assert_eq!(plan.items[0].status, magi_core::PlanItemStatus::InProgress);
+    }
+
+    #[test]
+    fn repeated_invalid_shell_call_stops_without_creating_tool_cards() {
+        let session_id = SessionId::new("session-invalid-shell-call");
+        let store = Arc::new(SessionStore::new());
+        store
+            .create_session(session_id.clone(), "invalid shell call")
+            .expect("session should be creatable");
+        let (_mission_id, orchestrator_thread_id) =
+            store.ensure_session_mission(&session_id, ts(910), || {
+                magi_core::MissionId::new("mission-invalid-shell-call")
+            });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-invalid-shell-call".to_string(),
+                    turn_seq: 1,
+                    accepted_at: ts(1_000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("检查项目".to_string()),
+                    items: vec![session_turn_item(
+                        "user_message",
+                        "completed",
+                        None,
+                        Some("检查项目".to_string()),
+                        Some("user-invalid-shell-call".to_string()),
+                        orchestrator_thread_id,
+                    )],
+                },
+            )
+            .expect("current turn should be stored");
+        let client = RepeatedInvalidShellModelBridgeClient {
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        };
+        let event_bus = InMemoryEventBus::new(16);
+        let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: "turn-invalid-shell-call".to_string(),
+            workspace_id: None,
+            prompt: "检查项目".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: true,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
+            workspace_root_path: None,
+        };
+        let tools = vec![ChatToolDefinition {
+            kind: "function".to_string(),
+            function: magi_bridge_client::ChatToolFunctionDefinition {
+                name: "shell_exec".to_string(),
+                description: "执行 Shell 命令".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": []
+                }),
+            },
+            origin: magi_bridge_client::ChatToolOrigin::Builtin,
+        }];
+
+        let error = match run_session_turn_execution(SessionTurnExecutionRuntime {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: store.as_ref(),
+            conversation_registry: &ConversationRegistry::new(),
+            plan_store: &plan_store,
+            settings_store: None,
+            safety_gate: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            snapshot_manager: None,
+            request,
+            prompt: "检查项目".to_string(),
+            knowledge_context_prompt: None,
+            tools: Some(tools),
+            persist_session_state: None,
+            live_settings_store: None,
+            model_switch_recovery: None,
+        }) {
+            Ok(_) => panic!("repeated invalid shell call should fail the turn"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.reason,
+            SessionTurnFailureReason::ToolCallProtocolFailed
+        );
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+        let requests = client.requests.lock().expect("requests mutex poisoned");
+        let second_messages = requests[1]
+            .messages
+            .as_ref()
+            .expect("messages should exist");
+        assert!(second_messages.iter().any(|message| {
+            message.role == "tool"
+                && message.content.as_deref().is_some_and(|content| {
+                    content.contains("tool-call-validation.v1") && content.contains("command")
+                })
+        }));
+        let turn = store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .expect("failed turn should remain visible");
+        assert_eq!(turn.status, "failed");
+        assert!(
+            turn.items.iter().all(|item| {
+                item.kind != "tool_call_started" && item.kind != "tool_call_result"
+            })
+        );
+        let error_item = turn
+            .items
+            .iter()
+            .find(|item| item.kind == "assistant_error")
+            .expect("tool call validation failure should be visible");
+        assert_eq!(
+            error_item.metadata["toolCallFailure"]["code"],
+            "tool_arguments_invalid"
+        );
+        assert_eq!(
+            error_item.metadata["toolCallFailure"]["toolName"],
+            "shell_exec"
+        );
+        assert_eq!(
+            error_item.metadata["toolCallFailure"]["argumentsPreview"],
+            r#"{"command":" "}"#
+        );
     }
 
     #[test]
@@ -3325,16 +3677,30 @@ mod tests {
             error.reason,
             SessionTurnFailureReason::ModelStreamInterrupted
         );
-        assert_eq!(error.public_message, "模型响应流中断，可直接继续重试。");
+        assert_eq!(error.public_message, "模型响应流在完成前中断。");
         let turn = store
             .runtime_sidecar(&session_id)
             .and_then(|sidecar| sidecar.current_turn)
             .expect("failed turn should remain visible");
         assert_eq!(turn.status, "failed");
-        assert!(turn.items.iter().any(|item| {
-            item.kind == "assistant_error"
-                && item.content.as_deref() == Some(error.public_message.as_str())
-        }));
+        let error_item = turn
+            .items
+            .iter()
+            .find(|item| item.kind == "assistant_error")
+            .expect("stream failure should append an assistant error");
+        assert_eq!(
+            error_item.content.as_deref(),
+            Some(error.public_message.as_str())
+        );
+        assert_eq!(
+            error_item.metadata["modelFailure"]["code"],
+            "model_stream_interrupted"
+        );
+        assert!(
+            error_item.metadata["modelFailure"]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("missing terminal SSE event"))
+        );
         assert!(
             turn.items.iter().any(|item| {
                 item.kind == "assistant_stream"

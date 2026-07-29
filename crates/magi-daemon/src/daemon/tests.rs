@@ -21,8 +21,9 @@ use magi_core::{
 use magi_event_bus::{EventEnvelope, InMemoryEventBus, RuntimeLedgerSummary};
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-    ActiveExecutionTurn, ActiveExecutionTurnItem, SessionExecutionSidecarStatus,
-    SessionSidecarFlushMetadata, SessionSidecarFlushReason, SessionStore,
+    ActiveExecutionTurn, ActiveExecutionTurnItem, ExecutionThread, ExecutionThreadStatus,
+    SessionExecutionSidecarStatus, SessionSidecarFlushMetadata, SessionSidecarFlushReason,
+    SessionStore,
 };
 use magi_worker_runtime::{
     WorkerBranchCheckpointState, WorkerExecutionBindingLifecycle, WorkerRuntime, WorkerStage,
@@ -3133,6 +3134,20 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         is_primary: false,
         thread_id: ThreadId::new("thread-restart-branch-completed"),
     });
+    for branch in &chain.branches {
+        state.session_store.register_thread(ExecutionThread {
+            thread_id: branch.thread_id.clone(),
+            session_id: session_id.clone(),
+            mission_id: mission_id.clone(),
+            role_id: "coordinator".to_string(),
+            worker_instance_id: branch.worker_id.clone(),
+            status: ExecutionThreadStatus::Active,
+            created_at: now,
+            last_used_at: now,
+            handled_task_ids: vec![branch.task_id.clone()],
+            message_history: Vec::new(),
+        });
+    }
     chain.active_branch_task_ids = chain
         .branches
         .iter()

@@ -36,7 +36,7 @@ use crate::{
     errors::ApiError,
     session_continue::{
         SessionContinueAccepted, active_execution_branch_is_continue_recoverable,
-        continue_execution_chain, continue_execution_chain_with_pre_resume,
+        continue_execution_chain_with_pre_resume, persist_resumed_branch_user_input,
     },
     state::{ApiState, QueuedRegularSessionTurn},
     task_dispatch::DispatchSubmissionAccepted,
@@ -353,15 +353,24 @@ async fn submit_session_turn(
                 .ok_or_else(|| ApiError::InvalidInput("继续会话需要明确的 session".to_string()))?;
             require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
             let (accepted, signal) =
-                continue_execution_chain_with_pre_resume(&state, &session_id, &[], || {
+                continue_execution_chain_with_pre_resume(&state, &session_id, &[], |branches| {
                     // S1：user 信号与恢复 runner 在同一个 session 临界区内串行提交，
                     // 下游一律读 signal.*，不再读 request.*。
-                    Ok(super::ingest_user_input_to_conversation(
+                    let signal = super::ingest_user_input_to_conversation(
                         &state,
                         &session_id,
                         &request,
                         accepted_at,
-                    ))
+                    );
+                    persist_resumed_branch_user_input(
+                        &state,
+                        &session_id,
+                        branches,
+                        signal.text.as_deref(),
+                        &images,
+                        accepted_at,
+                    )?;
+                    Ok(signal)
                 })
                 .await?;
             let prompt_text = signal.text.clone();
@@ -382,9 +391,6 @@ async fn submit_session_turn(
                     placeholder_message_id: signal.placeholder_message_id,
                     orchestrator_thread_id,
                 })?;
-            state
-                .ensure_snapshot_session_for_workspace_id(&session_id, &Some(workspace_id))
-                .await?;
             finalize_continue_session(state.clone(), accepted.clone(), accepted_at);
             state.persist_runtime_durable_state_for_api()?;
             let event_id = publish_session_turn_continue_event(&state, &accepted, accepted_at)?;
@@ -2762,7 +2768,22 @@ async fn continue_session(
         .map(WorkerId::new)
         .collect::<Vec<_>>();
     let continued_at = UtcMillis::now();
-    let accepted = continue_execution_chain(&state, &session_id, &requested_agent_ids).await?;
+    let (accepted, ()) = continue_execution_chain_with_pre_resume(
+        &state,
+        &session_id,
+        &requested_agent_ids,
+        |branches| {
+            persist_resumed_branch_user_input(
+                &state,
+                &session_id,
+                branches,
+                prompt_text.as_deref(),
+                &[],
+                continued_at,
+            )
+        },
+    )
+    .await?;
     let (_, orchestrator_thread_id) =
         state
             .session_store
@@ -2905,15 +2926,27 @@ async fn rename_session(
         request.requested_workspace_path(),
     )?;
     let session_id = SessionId::new(&request.session_id);
-    require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
-    state
+    let current =
+        require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
+    let renamed = state
         .session_store
         .rename_session(&session_id, &request.name)
-        .map_err(|e| ApiError::internal_assembly("重命名会话失败", e))?;
-    state.persist_session_durable_state_for_api()?;
+        .map_err(|error| match error {
+            DomainError::Validation { message } => ApiError::InvalidInput(message),
+            other => ApiError::internal_assembly("重命名会话失败", other),
+        })?;
+    if current.title != renamed.title {
+        state.persist_session_durable_state_for_api()?;
+        crate::session_title::publish_session_title_updated(
+            &state,
+            &session_id,
+            Some(workspace_id.clone()),
+            &renamed.title,
+        );
+    }
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         Some(workspace_id.as_str()),
-        Some(&session_id),
+        None,
     )?))
 }
 
@@ -3414,6 +3447,7 @@ fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_continue::restore_missing_resumed_branch_threads;
     use crate::state::{
         ApiState, QueuedRegularSessionTurn, RunnerManager, RuntimeStatePersistence,
     };
@@ -3438,7 +3472,10 @@ mod tests {
         task_store::{TaskLease, TaskStore},
         task_worker_catalog::WorkerInfo,
     };
-    use magi_session_store::{SessionExecutionSidecarStoreState, SessionStore};
+    use magi_session_store::{
+        ActiveExecutionBranch, ExecutionThread, ExecutionThreadStatus,
+        SessionExecutionSidecarStoreState, SessionStore,
+    };
     use magi_settings_store::SettingsStore;
     use magi_tool_runtime::{
         BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy,
@@ -3559,6 +3596,44 @@ mod tests {
             )
             .expect("workspace should register");
         workspace_id
+    }
+
+    fn git(path: &std::path::Path, args: &[&str]) {
+        let output = magi_process::std_command("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .expect("git fixture command should start");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn register_git_workspace(
+        state: &ApiState,
+        workspace_id: &str,
+        prefix: &str,
+    ) -> (WorkspaceId, std::path::PathBuf) {
+        let root = unique_temp_dir(prefix);
+        git(&root, &["init", "-b", "main"]);
+        git(&root, &["config", "user.name", "Magi Test"]);
+        git(&root, &["config", "user.email", "magi@example.test"]);
+        fs::write(root.join("README.md"), "base\n").expect("Git fixture file");
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-m", "base"]);
+        let workspace_id = WorkspaceId::new(workspace_id);
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new(root.display().to_string()),
+            )
+            .expect("Git workspace should register");
+        (workspace_id, root)
     }
 
     fn append_test_incident(
@@ -3903,6 +3978,201 @@ mod tests {
         assert_eq!(
             decision.reason_code.as_deref(),
             Some("interrupted_recovery_ready")
+        );
+    }
+
+    #[test]
+    fn continue_input_is_persisted_to_every_resumed_branch_thread() {
+        let state = test_state();
+        let session_id = SessionId::new("session-resume-input");
+        let mission_id = MissionId::new("mission-resume-input");
+        let now = UtcMillis::now();
+        state
+            .session_store
+            .create_session(session_id.clone(), "恢复输入持久化")
+            .expect("session should create");
+
+        let branches = ["primary", "child"]
+            .into_iter()
+            .map(|suffix| {
+                let task_id = TaskId::new(format!("task-{suffix}"));
+                let worker_id = WorkerId::new(format!("worker-{suffix}"));
+                let thread_id = ThreadId::new(format!("thread-{suffix}"));
+                state.session_store.register_thread(ExecutionThread {
+                    thread_id: thread_id.clone(),
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    role_id: "executor".to_string(),
+                    worker_instance_id: worker_id.clone(),
+                    status: ExecutionThreadStatus::Active,
+                    created_at: now,
+                    last_used_at: now,
+                    handled_task_ids: vec![task_id.clone()],
+                    message_history: Vec::new(),
+                });
+                ActiveExecutionBranch {
+                    task_id,
+                    worker_id,
+                    stage: "execute".to_string(),
+                    lease_id: None,
+                    execution_intent_ref: None,
+                    binding_lifecycle: None,
+                    checkpoint_stage: Some("execute".to_string()),
+                    next_step_index: Some(0),
+                    checkpoint_at: Some(now),
+                    resume_mode: Some("resume".to_string()),
+                    resume_token: Some(format!("resume-{suffix}")),
+                    use_tools: true,
+                    skill_name: None,
+                    is_primary: suffix == "primary",
+                    thread_id,
+                }
+            })
+            .collect::<Vec<_>>();
+        let image = magi_conversation_runtime::session_images::SessionTurnImage::from_data_url(
+            "context.png",
+            "data:image/png;base64,AAA",
+        )
+        .expect("image should parse");
+
+        persist_resumed_branch_user_input(
+            &state,
+            &session_id,
+            &branches,
+            Some("继续，但先遵守新增约束"),
+            &[image],
+            now,
+        )
+        .expect("continue input should persist");
+
+        for branch in branches {
+            let history = state
+                .session_store
+                .thread_message_history(&branch.thread_id);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].role, "user");
+            assert_eq!(
+                history[0].content.as_deref(),
+                Some("继续，但先遵守新增约束")
+            );
+            assert_eq!(history[0].images.len(), 1);
+        }
+    }
+
+    #[test]
+    fn continue_rebuilds_missing_legacy_thread_with_tool_history() {
+        let state = test_state();
+        let session_id = SessionId::new("session-legacy-continue-thread");
+        let mission_id = MissionId::new("mission-legacy-continue-thread");
+        let task_id = TaskId::new("task-legacy-continue-thread");
+        let worker_id = WorkerId::new("worker-legacy-continue-thread");
+        let thread_id = ThreadId::new("thread-legacy-continue-thread");
+        let now = UtcMillis(4_000);
+        state
+            .session_store
+            .create_session(session_id.clone(), "旧会话 thread 恢复")
+            .expect("session should create");
+        let mut task = test_root_task(task_id.as_str(), mission_id.as_str());
+        task.status = TaskStatus::Failed;
+        state
+            .task_store()
+            .expect("task store should exist")
+            .insert_task(task);
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-legacy-continue-thread".to_string(),
+                    turn_seq: now.0,
+                    accepted_at: now,
+                    status: "interrupted".to_string(),
+                    completed_at: Some(UtcMillis(now.0 + 1)),
+                    user_message: Some("检查项目".to_string()),
+                    items: vec![ActiveExecutionTurnItem {
+                        item_id: "tool-legacy-continue-thread".to_string(),
+                        item_seq: 1,
+                        kind: "tool_call_result".to_string(),
+                        status: "completed".to_string(),
+                        source: "tool".to_string(),
+                        title: Some("file_read".to_string()),
+                        content: Some("读取完成".to_string()),
+                        task_id: Some(task_id.clone()),
+                        worker_id: Some(worker_id.clone()),
+                        role_id: Some("coordinator".to_string()),
+                        tool_call_id: Some("call-legacy-read".to_string()),
+                        tool_name: Some("file_read".to_string()),
+                        tool_status: Some("completed".to_string()),
+                        tool_arguments: Some(r#"{"path":"README.md"}"#.to_string()),
+                        tool_result: Some(
+                            r##"{"status":"succeeded","content":"# Magi"}"##.to_string(),
+                        ),
+                        tool_error: None,
+                        request_id: None,
+                        user_message_id: None,
+                        placeholder_message_id: None,
+                        metadata: Default::default(),
+                        timeline_entry_id: None,
+                        source_thread_id: thread_id.clone(),
+                    }],
+                },
+            )
+            .expect("canonical turn should persist");
+        let branch = ActiveExecutionBranch {
+            task_id: task_id.clone(),
+            worker_id: worker_id.clone(),
+            stage: "execute".to_string(),
+            lease_id: None,
+            execution_intent_ref: None,
+            binding_lifecycle: None,
+            checkpoint_stage: Some("execute".to_string()),
+            next_step_index: Some(0),
+            checkpoint_at: Some(now),
+            resume_mode: Some("stage-restart".to_string()),
+            resume_token: None,
+            use_tools: true,
+            skill_name: None,
+            is_primary: true,
+            thread_id: thread_id.clone(),
+        };
+        let chain = magi_session_store::ActiveExecutionChain {
+            session_id: session_id.clone(),
+            mission_id,
+            root_task_id: task_id.clone(),
+            execution_chain_ref: "chain-legacy-continue-thread".to_string(),
+            workspace_id: None,
+            active_branch_task_ids: vec![task_id],
+            active_worker_bindings: vec![worker_id],
+            branches: vec![branch.clone()],
+            recovery_ref: None,
+            dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
+                accepted_at: now,
+                entry_id: "timeline-legacy-continue-thread".to_string(),
+                trimmed_text: Some("检查项目".to_string()),
+                skill_name: None,
+            },
+            current_turn: None,
+        };
+
+        assert_eq!(
+            restore_missing_resumed_branch_threads(&state, &session_id, &chain, &[branch])
+                .expect("missing thread should rebuild"),
+            1
+        );
+        let threads = state.session_store.thread_registry_snapshot(&session_id);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].thread_id, thread_id);
+        assert_eq!(threads[0].message_history.len(), 2);
+        assert_eq!(threads[0].message_history[0].role, "assistant");
+        assert_eq!(threads[0].message_history[0].tool_calls.len(), 1);
+        assert_eq!(
+            threads[0].message_history[0].tool_calls[0].function.name,
+            "file_read"
+        );
+        assert_eq!(threads[0].message_history[1].role, "tool");
+        assert_eq!(
+            threads[0].message_history[1].tool_call_id.as_deref(),
+            Some("call-legacy-read")
         );
     }
 
@@ -4678,6 +4948,147 @@ mod tests {
                 .contains("不属于 workspace"),
             "unexpected body: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn continue_session_checks_git_context_before_restarting_runner() {
+        let state = test_state_with_pending_runner();
+        let (workspace_id, workspace_root) = register_git_workspace(
+            &state,
+            "workspace-continue-git-context",
+            "continue-git-context",
+        );
+        let session_id = SessionId::new("session-continue-git-context");
+        let mission_id = MissionId::new("mission-continue-git-context");
+        let root_task_id = TaskId::new("task-root-continue-git-context");
+        let branch_task_id = TaskId::new("task-branch-continue-git-context");
+        let worker_id = WorkerId::new("worker-pending-test");
+        let now = UtcMillis::now();
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "继续前校验 Git context",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+
+        let mut root_task = test_root_task(root_task_id.as_str(), mission_id.as_str());
+        root_task.status = TaskStatus::Running;
+        let mut branch_task = test_root_task(branch_task_id.as_str(), mission_id.as_str());
+        branch_task.root_task_id = root_task_id.clone();
+        branch_task.parent_task_id = Some(root_task_id.clone());
+        branch_task.status = TaskStatus::Failed;
+        let task_store = state.task_store().expect("task store should exist");
+        task_store.insert_task(root_task);
+        task_store.insert_task(branch_task);
+
+        state
+            .session_store
+            .accept_active_execution_chain_with_timeline_entry(
+                session_id.clone(),
+                TimelineEntryInput::new(
+                    "timeline-continue-git-context",
+                    TimelineEntryKind::UserMessage,
+                    "继续测试",
+                    now,
+                ),
+                magi_session_store::ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-continue-git-context".to_string(),
+                    workspace_id: Some(workspace_id.clone()),
+                    active_branch_task_ids: vec![branch_task_id.clone()],
+                    active_worker_bindings: vec![worker_id.clone()],
+                    branches: vec![ActiveExecutionBranch {
+                        task_id: branch_task_id,
+                        worker_id,
+                        stage: "execute".to_string(),
+                        lease_id: None,
+                        execution_intent_ref: None,
+                        binding_lifecycle: None,
+                        checkpoint_stage: Some("execute".to_string()),
+                        next_step_index: Some(0),
+                        checkpoint_at: Some(now),
+                        resume_mode: Some("resume".to_string()),
+                        resume_token: Some("continue-git-context".to_string()),
+                        use_tools: true,
+                        skill_name: None,
+                        is_primary: true,
+                        thread_id: ThreadId::new("thread-continue-git-context"),
+                    }],
+                    recovery_ref: None,
+                    dispatch_context: magi_session_store::ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "timeline-continue-git-context".to_string(),
+                        trimmed_text: Some("继续测试".to_string()),
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-continue-git-context".to_string(),
+                        turn_seq: now.0,
+                        accepted_at: now,
+                        status: "running".to_string(),
+                        completed_at: None,
+                        user_message: Some("继续测试".to_string()),
+                        items: Vec::new(),
+                    }),
+                },
+            )
+            .expect("active execution chain should persist");
+        state
+            .session_store
+            .interrupt_current_turn_by_daemon_restart(&session_id)
+            .expect("interrupted turn should persist");
+        state
+            .ensure_snapshot_session(&session_id, &workspace_root)
+            .await
+            .expect("snapshot baseline");
+        state
+            .ensure_session_code_context(&session_id, &Some(workspace_id.clone()))
+            .await
+            .expect("initial Git context");
+        state.release_session_git_execution_lease(&session_id);
+        git(&workspace_root, &["switch", "-c", "external/branch"]);
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/continue",
+            serde_json::json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Git context 发生高风险变化")),
+            "unexpected body: {body}"
+        );
+        assert_eq!(
+            task_store
+                .get_task(&root_task_id)
+                .expect("root task")
+                .status,
+            TaskStatus::Running,
+            "Git 校验失败时不能重启或改写原执行链"
+        );
+        let observation = state
+            .git_service
+            .observe(&workspace_root)
+            .await
+            .expect("Git observation");
+        assert!(
+            !state
+                .workspace_git_coordinator
+                .session_holds_execution(&session_id.to_string(), &observation.git_common_dir),
+            "继续前 Git 校验失败必须释放执行租约"
+        );
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[test]
@@ -5470,6 +5881,93 @@ mod tests {
             "unexpected responses: first={first_body}, second={second_body}"
         );
         assert_eq!(state.queued_regular_session_turn_count(&session_id), 1);
+    }
+
+    #[tokio::test]
+    async fn regular_session_turn_adopts_same_branch_git_fast_forward() {
+        let state = test_state_with_pending_runner();
+        let (workspace_id, workspace_root) = register_git_workspace(
+            &state,
+            "workspace-turn-git-fast-forward",
+            "turn-git-fast-forward",
+        );
+        let session_id = SessionId::new("session-turn-git-fast-forward");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "Git 快进后的下一轮",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state
+            .ensure_snapshot_session(&session_id, &workspace_root)
+            .await
+            .expect("snapshot baseline");
+        state
+            .ensure_session_code_context(&session_id, &Some(workspace_id.clone()))
+            .await
+            .expect("initial Git context");
+        state.release_session_git_execution_lease(&session_id);
+
+        fs::write(
+            workspace_root.join("external.txt"),
+            "external fast-forward\n",
+        )
+        .expect("external fixture");
+        git(&workspace_root, &["add", "external.txt"]);
+        git(&workspace_root, &["commit", "-m", "external fast-forward"]);
+        let advanced_head = state
+            .git_service
+            .observe(&workspace_root)
+            .await
+            .expect("advanced Git observation")
+            .head
+            .expect("advanced HEAD");
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/turn",
+            serde_json::json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+                "text": "继续检查当前项目",
+                "requestId": "request-turn-git-fast-forward",
+                "userMessageId": "user-turn-git-fast-forward",
+                "placeholderMessageId": "assistant-turn-git-fast-forward"
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["canonicalEventKind"], "turn_started");
+        let context = state
+            .session_code_contexts
+            .get(session_id.as_str())
+            .expect("adopted Git context");
+        assert_eq!(
+            context.git.base_head.as_deref(),
+            Some(advanced_head.as_str())
+        );
+        assert!(!context.has_external_drift());
+        assert!(
+            state
+                .snapshot_session(&session_id, &workspace_root)
+                .expect("rebased snapshot")
+                .pending_changes()
+                .expect("pending changes")
+                .is_empty()
+        );
+
+        if let Some(root_task_id) = body["rootTaskId"].as_str() {
+            state
+                .runner_manager()
+                .expect("runner manager")
+                .quiesce_for_restart(root_task_id)
+                .await;
+        }
+        state.release_session_git_execution_lease(&session_id);
+        let _ = fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
@@ -6560,6 +7058,158 @@ mod tests {
                 .expect("session should remain")
                 .title,
             "原始名称"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_session_updates_title_without_switching_current_session() {
+        let state = test_state();
+        let workspace_id = register_workspace(&state, "workspace-rename", "rename-session");
+        let renamed_session_id = SessionId::new("session-to-rename");
+        let current_session_id = SessionId::new("session-current");
+        state
+            .session_store
+            .create_session_for_workspace(
+                renamed_session_id.clone(),
+                "原始名称",
+                Some(workspace_id.to_string()),
+            )
+            .expect("renamed session should create");
+        state
+            .session_store
+            .create_session_for_workspace(
+                current_session_id.clone(),
+                "当前会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("current session should create");
+        for session_id in [&renamed_session_id, &current_session_id] {
+            state.session_store.append_timeline_entry(
+                session_id.clone(),
+                TimelineEntryKind::UserMessage,
+                "用于验证可见会话重命名",
+            );
+        }
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/rename",
+            serde_json::json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": renamed_session_id.as_str(),
+                "name": "  新名称  ",
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(
+            body["currentSession"]["sessionId"],
+            current_session_id.as_str()
+        );
+        assert_eq!(
+            state
+                .session_store
+                .session(&renamed_session_id)
+                .expect("renamed session should remain")
+                .title,
+            "新名称"
+        );
+        assert!(body["sessions"].as_array().is_some_and(|sessions| {
+            sessions.iter().any(|session| {
+                session["sessionId"] == renamed_session_id.as_str() && session["title"] == "新名称"
+            })
+        }));
+        let title_events = state
+            .event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .filter(|event| event.event_type == "session.title.updated")
+            .collect::<Vec<_>>();
+        assert_eq!(title_events.len(), 1);
+        assert_eq!(
+            title_events[0].payload["session_id"],
+            renamed_session_id.as_str()
+        );
+        assert_eq!(
+            title_events[0].payload["workspace_id"],
+            workspace_id.as_str()
+        );
+        assert_eq!(title_events[0].payload["title"], "新名称");
+
+        let (status, _) = post_json(
+            state.clone(),
+            "/session/rename",
+            serde_json::json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": renamed_session_id.as_str(),
+                "name": "新名称",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            state
+                .event_bus
+                .snapshot()
+                .recent_events
+                .into_iter()
+                .filter(|event| event.event_type == "session.title.updated")
+                .count(),
+            1,
+            "相同名称不能重复发布标题更新事件"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_session_rejects_invalid_names_as_input_errors() {
+        let state = test_state();
+        let workspace_id = register_workspace(&state, "workspace-rename-invalid", "rename-invalid");
+        let session_id = SessionId::new("session-rename-invalid");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "原始名称",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        let invalid_names = [
+            "   ".to_string(),
+            "包含\n换行".to_string(),
+            std::iter::repeat_n('字', magi_session_store::SESSION_TITLE_MAX_CHARS + 1).collect(),
+        ];
+
+        for name in invalid_names {
+            let (status, body) = post_json(
+                state.clone(),
+                "/session/rename",
+                serde_json::json!({
+                    "workspaceId": workspace_id.as_str(),
+                    "sessionId": session_id.as_str(),
+                    "name": name,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+            assert_eq!(body["error_code"], "INPUT_INVALID");
+        }
+        assert_eq!(
+            state
+                .session_store
+                .session(&session_id)
+                .expect("session should remain")
+                .title,
+            "原始名称"
+        );
+        assert!(
+            state
+                .event_bus
+                .snapshot()
+                .recent_events
+                .into_iter()
+                .all(|event| event.event_type != "session.title.updated")
         );
     }
 

@@ -35,7 +35,9 @@ use magi_core::{
     SessionId, SessionLifecycleStatus, TaskId, TaskStatus, TaskTier, UtcMillis, WorkspaceId,
     public_runtime_excerpt,
 };
-use magi_event_bus::{InMemoryEventBus, latest_usage_observations_from_ledger};
+use magi_event_bus::{
+    EventContext, EventEnvelope, InMemoryEventBus, latest_usage_observations_from_ledger,
+};
 use magi_governance::GovernanceService;
 use magi_knowledge_store::KnowledgeStore;
 use magi_memory_store::MemoryStore;
@@ -1726,8 +1728,8 @@ impl ApiState {
 
     /// 每轮执行前重新观测 session 绑定的 Git branch/HEAD/worktree。
     ///
-    /// 首轮按当前状态建立基线；后续若外部终端或其他进程改变 branch/HEAD，则保留原期望
-    /// 基线并拒绝启动本轮，避免主模型在无感知的代码版本上继续执行。
+    /// 同仓库、同 worktree、同分支的线性快进会自动成为新基线，保证提交、拉取或其他
+    /// 正常协作操作不会中断后续对话。分支切换、HEAD 回退或历史改写仍需用户明确接受。
     pub async fn ensure_session_code_context(
         &self,
         session_id: &SessionId,
@@ -1759,7 +1761,7 @@ impl ApiState {
                 )));
             }
         };
-        let context = if existing_context.is_some() {
+        let mut context = if existing_context.is_some() {
             self.session_code_contexts.observe(
                 session_key,
                 workspace_id.as_str(),
@@ -1774,11 +1776,51 @@ impl ApiState {
                 &observation,
             )
         };
+        let mut adopted_fast_forward_from = None;
+        if context.has_external_drift()
+            && let Some(existing_context) = existing_context.as_ref()
+            && match self
+                .git_service
+                .is_session_context_fast_forward(existing_context, &observation)
+                .await
+            {
+                Ok(is_fast_forward) => is_fast_forward,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %existing_context.session_id,
+                        previous_head = ?existing_context.git.base_head,
+                        current_head = ?observation.head,
+                        ?error,
+                        "判断 session Git context 是否安全快进失败，保持显式确认"
+                    );
+                    false
+                }
+            }
+        {
+            if let Err(error) = self
+                .snapshot_manager
+                .rebase_session(session_id.to_string(), observation.worktree_path.clone())
+                .await
+            {
+                self.release_session_git_execution_lease(session_id);
+                return Err(ApiError::internal_assembly(
+                    "Git 快进后重建变更基线失败",
+                    error,
+                ));
+            }
+            context = self.session_code_contexts.accept(
+                session_key,
+                workspace_id.as_str(),
+                context.runtime_workspace_roots.clone(),
+                &observation,
+            );
+            adopted_fast_forward_from = existing_context.git.base_head.clone();
+        }
         if context.has_external_drift() {
             self.release_session_git_execution_lease(session_id);
             self.persist_session_git_contexts()?;
             return Err(ApiError::Conflict(format!(
-                "Git context 已被外部修改：期望 branch={:?} HEAD={:?}，实际 branch={:?} HEAD={:?}。请刷新状态并明确接受或切回原基线后重试",
+                "Git context 发生高风险变化：期望 branch={:?} HEAD={:?}，实际 branch={:?} HEAD={:?}。分支切换、HEAD 回退或历史改写需要明确接受新基线，或切回原基线后重试",
                 context.git.desired_ref,
                 context.git.base_head,
                 context.git.observed_branch,
@@ -1804,7 +1846,55 @@ impl ApiState {
             self.release_session_git_execution_lease(session_id);
             return Err(error);
         }
+        if let Some(previous_head) = adopted_fast_forward_from {
+            self.publish_session_git_fast_forward(
+                session_id,
+                workspace_id,
+                &context,
+                &previous_head,
+            );
+            self.schedule_workspace_code_index(
+                workspace_id.clone(),
+                observation.worktree_path.clone(),
+            );
+        }
         Ok(Some(context))
+    }
+
+    fn publish_session_git_fast_forward(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &WorkspaceId,
+        context: &magi_git::SessionCodeContext,
+        previous_head: &str,
+    ) {
+        let now = UtcMillis::now();
+        self.event_bus.publish(
+            EventEnvelope::domain(
+                magi_core::EventId::new(format!(
+                    "workspace-git-context-changed-{workspace_id}-{}",
+                    now.0
+                )),
+                "workspace.git.context.changed",
+                serde_json::json!({
+                    "workspace_id": workspace_id,
+                    "session_id": session_id,
+                    "repository_root": context.git.repository_root,
+                    "worktree_path": context.git.worktree_path,
+                    "branch": context.git.observed_branch,
+                    "head": context.git.observed_head,
+                    "previous_head": previous_head,
+                    "context_revision": context.context_revision,
+                    "change_kind": "fast_forward_adopted",
+                    "refresh_scopes": ["file_tree", "code_index", "knowledge", "context_cache"]
+                }),
+            )
+            .with_context(EventContext {
+                session_id: Some(session_id.clone()),
+                workspace_id: Some(workspace_id.clone()),
+                ..EventContext::default()
+            }),
+        );
     }
 
     pub fn release_session_git_execution_lease(&self, session_id: &SessionId) {
@@ -1927,6 +2017,65 @@ impl ApiState {
             return Ok(());
         };
         persistence.save_knowledge_store(&self.knowledge_store)
+    }
+
+    pub(crate) fn schedule_workspace_code_index(
+        &self,
+        workspace_id: WorkspaceId,
+        workspace_root: PathBuf,
+    ) -> bool {
+        if !self
+            .knowledge_store
+            .begin_workspace_index_build(&workspace_id)
+        {
+            return false;
+        }
+
+        let state = self.clone();
+        tokio::spawn(async move {
+            let build_state = state.clone();
+            let build_workspace_id = workspace_id.clone();
+            let build_result = tokio::task::spawn_blocking(move || {
+                build_state
+                    .knowledge_store
+                    .build_workspace_index(&build_workspace_id, &workspace_root)
+            })
+            .await;
+            let cancelled_before_persist = state
+                .knowledge_store
+                .workspace_index_build_cancelled(&workspace_id);
+            match build_result {
+                Ok(_) => {
+                    if !cancelled_before_persist && let Err(error) = state.persist_knowledge_state()
+                    {
+                        tracing::warn!(
+                            workspace_id = %workspace_id,
+                            error = ?error,
+                            "后台代码索引持久化失败"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        workspace_id = %workspace_id,
+                        error = %error,
+                        "后台代码索引构建任务失败"
+                    );
+                }
+            }
+            if state
+                .knowledge_store
+                .finish_workspace_index_build(&workspace_id)
+                && let Err(error) = state.persist_knowledge_state()
+            {
+                tracing::warn!(
+                    workspace_id = %workspace_id,
+                    error = ?error,
+                    "已取消的后台代码索引清理结果持久化失败"
+                );
+            }
+        });
+        true
     }
 
     pub fn persist_knowledge_state_for_api(&self) -> Result<(), ApiError> {

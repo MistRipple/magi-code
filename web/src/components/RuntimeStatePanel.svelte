@@ -58,14 +58,6 @@
       document.removeEventListener('keydown', handleKeydown);
     };
   });
-  const failureDetails = $derived.by(() => {
-    const values = [runtimeState?.failureReason, ...(runtimeState?.errors || [])];
-    return values
-      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-      .map((item) => item.trim())
-      .filter((item, index, arr) => arr.indexOf(item) === index);
-  });
-
   const opsView = $derived.by(() => runtimeState?.opsView || null);
   const executionGroupSummary = $derived.by(() => opsView?.executionGroup || null);
   const planSummary = $derived.by(() => opsView?.plan || null);
@@ -724,17 +716,6 @@
         </div>
       {/if}
 
-      {#if (runtimeState?.status === 'failed' || runtimeState?.status === 'blocked') && failureDetails.length > 0}
-        <div class="runtime-diagnostics__block runtime-diagnostics__block--failure">
-          <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.failureTitle')}</div>
-          <div class="runtime-diagnostics__failure-list">
-            {#each failureDetails as item}
-              <pre class="runtime-diagnostics__failure-entry">{item}</pre>
-            {/each}
-          </div>
-        </div>
-      {/if}
-
       {#if runtimeState?.runtimeSnapshot && visibleMetrics}
         {@const snap = runtimeState.runtimeSnapshot}
         <div class="metrics-grid">
@@ -870,17 +851,14 @@
               class="runtime-diagnostics__ops-item runtime-diagnostics__ops-item--{item.kind || 'progress'}"
             >
               <div class="runtime-diagnostics__ops-title-row">
-                <span class="runtime-diagnostics__ops-title">{formatTimelineSummary(item)}</span>
-                <span class="runtime-diagnostics__ops-time">{formatTimestamp(item.timestamp)}</span>
-              </div>
-              <div class="runtime-diagnostics__ops-sub">
                 <span class="runtime-diagnostics__record-kind">
                   {formatRuntimeRecordKind(item.kind)}
                 </span>
-                <span>{formatTimelineTypeLabel(item.type)}</span>
+                <span class="runtime-diagnostics__ops-title">{formatTimelineSummary(item)}</span>
+                <span class="runtime-diagnostics__ops-time">{formatTimestamp(item.timestamp)}</span>
               </div>
               {#if item.detail}
-                <pre class="runtime-diagnostics__failure-entry runtime-diagnostics__failure-entry--inline">{item.detail}</pre>
+                <pre class="runtime-diagnostics__record-detail">{item.detail}</pre>
               {/if}
             </div>
           {/each}
@@ -1180,39 +1158,20 @@
     background: transparent;
   }
 
-  .runtime-diagnostics__block--failure {
-    margin: 0;
-    padding: 9px 0;
-  }
-
-  .runtime-diagnostics__block--failure > .runtime-diagnostics__label {
-    color: var(--vscode-editorError-foreground, var(--error));
-    font-weight: 600;
-    opacity: 1;
-  }
-
   .runtime-diagnostics__label {
     font-size: 11px;
     opacity: 0.8;
     margin-bottom: 2px;
   }
 
-  .runtime-diagnostics__failure-list {
-    margin: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-
-  .runtime-diagnostics__failure-entry {
-    margin: 0;
-    padding: 2px 0 2px 10px;
-    border-left: 2px solid var(--vscode-inputValidation-errorBorder, var(--error));
-    border-radius: 0;
+  .runtime-diagnostics__record-detail {
+    margin: 3px 0 0;
+    padding: 0;
+    border: 0;
     background: transparent;
     color: var(--vscode-foreground, var(--foreground));
     font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
-    font-size: 12px;
+    font-size: 11px;
     line-height: 1.5;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
@@ -1314,6 +1273,7 @@
   .runtime-diagnostics__record-kind {
     flex: 0 0 auto;
     font-weight: 600;
+    font-size: 11px;
   }
 
   .runtime-diagnostics__ops-item--success .runtime-diagnostics__record-kind {
@@ -1326,11 +1286,6 @@
 
   .runtime-diagnostics__ops-item--error .runtime-diagnostics__record-kind {
     color: var(--vscode-editorError-foreground, var(--error));
-  }
-
-  .runtime-diagnostics__failure-entry--inline {
-    margin-top: 2px;
-    font-size: 11px;
   }
 
   @media (max-width: 640px) {

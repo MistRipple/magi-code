@@ -574,6 +574,9 @@
 
   function getMCPStatusTitle(server: any): string {
     const status = getMCPHealthLabel(server);
+    if (typeof server?.errorDetail === 'string' && server.errorDetail.trim()) {
+      return `${status}\n${server.errorDetail.trim()}`;
+    }
     return server.error
       ? `${status}\n${i18n.t('settings.tools.mcpConnectionIssue')}`
       : status;
@@ -915,6 +918,12 @@
                         </button>
                       </div>
                       <div class="mcp-tools-list">
+                        {#if server.errorDetail}
+                          <div class="mcp-connection-diagnostic" role="alert">
+                            <span>{i18n.t('settings.tools.mcpConnectionDetail')}</span>
+                            <code>{server.errorDetail}</code>
+                          </div>
+                        {/if}
                         {#if mcpRefreshingServers.has(server.id)}
                           <div class="mcp-tools-empty">{i18n.t('settings.tools.loading')}</div>
                         {:else if mcpServerTools[server.id] && mcpServerTools[server.id].length > 0}
@@ -1875,6 +1884,31 @@
     overflow-y: auto;
     overscroll-behavior: contain;
     padding: 5px;
+  }
+
+  .mcp-connection-diagnostic {
+    padding: 8px;
+    border-bottom: 1px solid color-mix(in srgb, var(--error, #d33) 24%, transparent);
+    color: var(--error, #d33);
+    font-size: 10px;
+    line-height: 1.45;
+  }
+
+  .mcp-connection-diagnostic span {
+    display: block;
+    margin-bottom: 4px;
+    font-weight: 600;
+  }
+
+  .mcp-connection-diagnostic code {
+    display: block;
+    max-height: 120px;
+    overflow: auto;
+    color: var(--foreground);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
   }
 
   /* MCP 工具项样式 */

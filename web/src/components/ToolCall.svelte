@@ -753,8 +753,11 @@
       'file_path_required',
       'file_path_outside_workspace',
       'tool_rejected',
+      'tool_arguments_invalid',
       'command rejected',
       'argument parse failed',
+      '缺少 shell 命令',
+      'missing shell command',
       'path is required',
       'old_str_1 is required',
       'old_str and new_str are identical',
@@ -827,6 +830,7 @@
   );
   const publicErrorMessage = $derived(
     publicPayloadErrorMessage
+    || (errorDiagnosis?.category === 'model_input' ? errorForDiagnosis : '')
     || errorDiagnosis?.message
     || i18n.t('toolCall.errorDiagnosis.runtime.message')
   );

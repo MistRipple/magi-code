@@ -939,6 +939,46 @@ function canonicalTurnsForSession(sessionId: string, turns: unknown): CanonicalT
     .sort((left, right) => left.turnSeq - right.turnSeq || left.turnId.localeCompare(right.turnId));
 }
 
+function reconcileRuntimeStateFromCanonicalTurns(sessionId: string): void {
+  const latestTurn = canonicalTurnsForSession(sessionId, turnStoreState.reducer.turns).at(-1);
+  if (!latestTurn) {
+    return;
+  }
+  const status: OrchestratorRuntimeState['status'] = latestTurn.status === 'pending'
+    || latestTurn.status === 'running'
+    ? 'running'
+    : latestTurn.status === 'completed'
+      ? 'completed'
+      : latestTurn.status === 'blocked'
+        ? 'blocked'
+        : latestTurn.status === 'failed' || latestTurn.status === 'interrupted'
+          ? 'failed'
+          : latestTurn.status === 'cancelled' || latestTurn.status === 'superseded'
+            ? 'cancelled'
+            : 'idle';
+  const statusChangedAt = Math.max(
+    latestTurn.acceptedAt,
+    latestTurn.completedAt ?? 0,
+    ...latestTurn.items.map((item) => item.updatedAt),
+  );
+  const current = messagesState.orchestratorRuntimeState;
+  replaceOrchestratorRuntimeState({
+    ...(current ?? {
+      errors: [],
+      assignments: [],
+      lastEventAt: statusChangedAt,
+    }),
+    sessionId,
+    status,
+    phase: status,
+    statusChangedAt,
+    lastEventAt: Math.max(current?.lastEventAt ?? 0, statusChangedAt),
+    ...(status === 'running'
+      ? { endedAt: undefined }
+      : { endedAt: latestTurn.completedAt ?? statusChangedAt }),
+  });
+}
+
 function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): void {
   const currentSessionId = getState().currentSessionId || '';
   if (!sessionId || !currentSessionId || currentSessionId !== sessionId) {
@@ -993,6 +1033,7 @@ function handleSessionTurnCanonicalEventUpdated(message: ClientBridgeMessage) {
       sessionId,
     );
     applyAuthoritativeProcessingState(processingState);
+    reconcileRuntimeStateFromCanonicalTurns(sessionId);
     reconcileRequestBindingsFromAuthoritativeThread(sessionId);
   }
 }
@@ -1129,7 +1170,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         },
       }, { preserveLocalProcessing: preserveLocalTurnDuringStaleSnapshot });
 
-      if (!preserveLocalTurnDuringStaleSnapshot) {
+      if (!preserveLocalTurnDuringStaleSnapshot && shouldApplyCanonicalSnapshot) {
         replaceOrchestratorRuntimeState(
           (snapshot.orchestratorRuntimeState as OrchestratorRuntimeState | null | undefined) ?? null,
         );
@@ -1148,6 +1189,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
 
       if (shouldApplyCanonicalSnapshot && !preserveLocalTurnDuringStaleSnapshot) {
         applyCanonicalTurnsSnapshot(sessionId, canonicalSessionTurns, canonicalEventWatermark);
+        reconcileRuntimeStateFromCanonicalTurns(sessionId);
         reconcileRequestBindingsFromAuthoritativeThread(sessionId);
       }
       if (

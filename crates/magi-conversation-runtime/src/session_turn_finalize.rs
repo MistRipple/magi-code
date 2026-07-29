@@ -5,6 +5,7 @@
 
 use magi_core::{
     EventId, SessionId, Task, TaskId, TaskKind, TaskStatus, ThreadId, UtcMillis, WorkspaceId,
+    public_runtime_excerpt,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::task_store::TaskStore;
@@ -19,6 +20,7 @@ use crate::session_writeback::{
 const TASK_CONTEXT_MAX_CHARS: usize = 4000;
 const TASK_CONTEXT_MAX_REFS: usize = 8;
 const ROOT_COMPLETION_SUMMARY_MAX_CHARS: usize = 2400;
+const TASK_FAILURE_DETAIL_MAX_CHARS: usize = 4096;
 
 pub fn turn_item_status_for_task_status(status: TaskStatus) -> &'static str {
     match status {
@@ -592,7 +594,9 @@ fn archive_terminal_active_execution_chain(
 ) -> bool {
     session_store
         .runtime_sidecar(session_id)
+        .filter(|sidecar| sidecar.recovery_id.is_none())
         .and_then(|sidecar| sidecar.active_execution_chain)
+        .filter(|chain| chain.recovery_ref.is_none())
         .filter(|chain| chain.root_task_id == *root_task_id)
         .is_some_and(|_| {
             session_store
@@ -607,6 +611,42 @@ fn terminal_chain_requires_archival(root_status: TaskStatus, turn_status: &str) 
             turn_status.trim().to_ascii_lowercase().as_str(),
             "cancelled" | "canceled"
         )
+}
+
+fn task_failure_output(task: &Task) -> Option<String> {
+    task.output_refs.iter().find_map(|output| {
+        let detail = public_runtime_excerpt(output, TASK_FAILURE_DETAIL_MAX_CHARS);
+        (!detail.trim().is_empty()).then_some(detail)
+    })
+}
+
+fn task_failure_detail(task_store: &TaskStore, root_task: &Task) -> Option<String> {
+    if let Some(detail) = task_failure_output(root_task) {
+        return Some(detail);
+    }
+
+    let mut failed_descendants = task_store
+        .get_tasks_by_mission(&root_task.mission_id)
+        .into_iter()
+        .filter(|task| task.root_task_id == root_task.task_id)
+        .filter(|task| task.task_id != root_task.task_id)
+        .filter(|task| task.status == TaskStatus::Failed)
+        .collect::<Vec<_>>();
+    failed_descendants.sort_by_key(|task| task.updated_at.0);
+    failed_descendants
+        .into_iter()
+        .rev()
+        .find_map(|task| task_failure_output(&task))
+}
+
+fn task_failure_message(task_store: &TaskStore, root_task: &Task) -> String {
+    match task_failure_detail(task_store, root_task) {
+        Some(detail) => format!("任务执行失败：{detail}"),
+        None => format!(
+            "任务执行失败，但运行时未记录直接错误信息。失败阶段：task_execution；任务：{}。",
+            root_task.task_id
+        ),
+    }
 }
 
 fn update_current_turn_completed_from_root(
@@ -660,13 +700,27 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     let Some(root_task) = task_store.get_task(root_task_id) else {
         return false;
     };
-    let (turn_status, message) = match root_task.status {
-        TaskStatus::Failed => ("failed", "任务执行失败，未生成最终回复。"),
-        TaskStatus::Killed => ("cancelled", "任务执行已终止。"),
-        _ if runner_status == "error" => ("failed", "任务执行异常，未生成最终回复。"),
-        _ if runner_status == "stopped" || runner_status == "killed" => {
-            ("cancelled", "任务执行已终止。")
-        }
+    let (turn_status, title, message) = match root_task.status {
+        TaskStatus::Failed => (
+            "failed",
+            "任务执行失败",
+            task_failure_message(task_store, &root_task),
+        ),
+        TaskStatus::Killed => (
+            "cancelled",
+            "任务执行已终止",
+            "任务执行已终止。".to_string(),
+        ),
+        _ if runner_status == "error" => (
+            "failed",
+            "任务执行失败",
+            task_failure_message(task_store, &root_task),
+        ),
+        _ if runner_status == "stopped" || runner_status == "killed" => (
+            "cancelled",
+            "任务执行已终止",
+            "任务执行已终止。".to_string(),
+        ),
         _ => return false,
     };
 
@@ -720,8 +774,8 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     let mut error_item = session_turn_item(
         "assistant_error",
         turn_status,
-        Some("任务执行未完成".to_string()),
-        Some(message.to_string()),
+        Some(title.to_string()),
+        Some(message),
         Some(item_id.clone()),
         orchestrator_thread.thread_id.clone(),
     );
@@ -835,6 +889,40 @@ mod tests {
         ActiveExecutionChain, ActiveExecutionDispatchContext, SessionExecutionSidecarStatus,
     };
 
+    fn failed_task(
+        task_id: &str,
+        mission_id: &MissionId,
+        root_task_id: &TaskId,
+        parent_task_id: Option<TaskId>,
+        output_refs: Vec<String>,
+    ) -> Task {
+        let now = UtcMillis::now();
+        Task {
+            task_id: TaskId::new(task_id),
+            mission_id: mission_id.clone(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id,
+            kind: TaskKind::LocalAgent,
+            title: "失败任务".to_string(),
+            goal: "验证直接错误信息".to_string(),
+            status: TaskStatus::Failed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs,
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: TaskRuntimePayload::default(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     #[test]
     fn latest_root_task_assistant_final_prefers_root_without_worker_binding() {
         let root_task_id = TaskId::new("task-root");
@@ -887,6 +975,80 @@ mod tests {
             turn_item_status_for_task_status(TaskStatus::Killed),
             "cancelled"
         );
+    }
+
+    #[test]
+    fn task_failure_message_exposes_redacted_root_error() {
+        let task_store = TaskStore::new();
+        let mission_id = MissionId::new("mission-direct-failure");
+        let root_task_id = TaskId::new("task-direct-failure");
+        let root_task = failed_task(
+            root_task_id.as_str(),
+            &mission_id,
+            &root_task_id,
+            None,
+            vec![
+                "provider timeout at /Users/xie/private/model.json; Authorization: Bearer secret-token"
+                    .to_string(),
+            ],
+        );
+
+        let message = task_failure_message(&task_store, &root_task);
+
+        assert!(message.contains("provider timeout"));
+        assert!(message.contains("[path]"));
+        assert!(message.contains("[redacted]"));
+        assert!(!message.contains("/Users/xie"));
+        assert!(!message.contains("secret-token"));
+        assert!(!message.contains("目标面板"));
+        assert!(!message.contains("右侧代理"));
+    }
+
+    #[test]
+    fn task_failure_message_uses_failed_descendant_detail() {
+        let task_store = TaskStore::new();
+        let mission_id = MissionId::new("mission-child-failure");
+        let root_task_id = TaskId::new("task-child-failure-root");
+        let root_task = failed_task(
+            root_task_id.as_str(),
+            &mission_id,
+            &root_task_id,
+            None,
+            Vec::new(),
+        );
+        task_store.insert_task(failed_task(
+            "task-child-failure-worker",
+            &mission_id,
+            &root_task_id,
+            Some(root_task_id.clone()),
+            vec!["工具 file_write 执行失败：permission denied".to_string()],
+        ));
+
+        let message = task_failure_message(&task_store, &root_task);
+
+        assert!(message.contains("file_write"));
+        assert!(message.contains("permission denied"));
+    }
+
+    #[test]
+    fn task_failure_message_states_when_runtime_detail_is_missing() {
+        let task_store = TaskStore::new();
+        let mission_id = MissionId::new("mission-missing-failure");
+        let root_task_id = TaskId::new("task-missing-failure");
+        let root_task = failed_task(
+            root_task_id.as_str(),
+            &mission_id,
+            &root_task_id,
+            None,
+            Vec::new(),
+        );
+
+        let message = task_failure_message(&task_store, &root_task);
+
+        assert!(message.contains("运行时未记录直接错误信息"));
+        assert!(message.contains(root_task_id.as_str()));
+        assert!(!message.contains("目标面板"));
+        assert!(!message.contains("右侧代理"));
     }
 
     #[test]

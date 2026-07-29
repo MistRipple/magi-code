@@ -673,6 +673,34 @@ impl GitService {
         observe_unlocked(path).await
     }
 
+    /// 判断当前观测是否只是 session 原 Git 基线在同一工作树、同一分支上的线性快进。
+    /// 分支切换、工作树变化、HEAD 回退和历史改写均返回 `false`。
+    pub async fn is_session_context_fast_forward(
+        &self,
+        context: &SessionCodeContext,
+        observation: &GitObservation,
+    ) -> Result<bool, GitError> {
+        if !same_path(&context.git.repository_root, &observation.repository_root)
+            || !same_path(&context.git.git_common_dir, &observation.git_common_dir)
+            || !same_path(&context.git.worktree_path, &observation.worktree_path)
+            || !same_path(&context.execution_root, &observation.worktree_path)
+            || context.git.desired_ref.is_none()
+            || context.git.desired_ref != observation.branch
+        {
+            return Ok(false);
+        }
+        let (Some(previous_head), Some(current_head)) = (
+            context.git.base_head.as_deref(),
+            observation.head.as_deref(),
+        ) else {
+            return Ok(false);
+        };
+        if previous_head == current_head {
+            return Ok(false);
+        }
+        is_ancestor(&observation.worktree_path, previous_head, current_head).await
+    }
+
     pub async fn branch_list(
         &self,
         path: &Path,
@@ -2217,6 +2245,12 @@ mod tests {
             .observe(repo.path())
             .await
             .expect("external observe");
+        assert!(
+            service
+                .is_session_context_fast_forward(&bound, &external)
+                .await
+                .expect("classify fast-forward")
+        );
         let drifted = registry.observe("session-1", "workspace-1", vec![], &external);
         assert!(drifted.has_external_drift());
         assert_eq!(drifted.git.base_head, initial.head);
@@ -2225,6 +2259,15 @@ mod tests {
         let accepted = registry.accept("session-1", "workspace-1", vec![], &external);
         assert!(!accepted.has_external_drift());
         assert!(accepted.context_revision > bound.context_revision);
+
+        git(repo.path(), &["switch", "-c", "external/branch"]);
+        let switched = service.observe(repo.path()).await.expect("branch observe");
+        assert!(
+            !service
+                .is_session_context_fast_forward(&accepted, &switched)
+                .await
+                .expect("classify branch switch")
+        );
     }
 
     #[test]

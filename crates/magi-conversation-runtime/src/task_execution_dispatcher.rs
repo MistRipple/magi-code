@@ -1924,6 +1924,10 @@ impl LlmTaskDispatcher {
                 diagnostic_code: "model_configuration_unavailable".to_string(),
                 public_message: crate::model_error::PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE
                     .to_string(),
+                model_failure: Some(
+                    crate::model_error::ModelFailureDiagnostic::configuration_unavailable(),
+                ),
+                tool_call_failure: None,
                 });
             }
         };

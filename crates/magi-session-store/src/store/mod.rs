@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, RwLock};
 /// 对话"身份锚点。与 worker role 体系正交 —— 这是产品级的主干角色，
 /// 不会被 `DynamicWorkerCatalog` 识别为可派发 worker。
 pub const ORCHESTRATOR_ROLE_ID: &str = "orchestrator";
+pub const SESSION_TITLE_MAX_CHARS: usize = 40;
 const MAX_INCIDENT_NOTIFICATION_RECORDS: usize = 1_000;
 
 #[derive(Clone, Debug, Default)]
@@ -31,6 +32,26 @@ struct SidecarFlushState {
     last_dirty_reason: Option<SessionSidecarFlushReason>,
     last_flush_at: Option<UtcMillis>,
     next_flush_hint: Option<UtcMillis>,
+}
+
+fn normalize_session_title(title: String) -> DomainResult<String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(DomainError::Validation {
+            message: "会话名称不能为空".to_string(),
+        });
+    }
+    if title.chars().any(char::is_control) {
+        return Err(DomainError::Validation {
+            message: "会话名称不能包含换行或控制字符".to_string(),
+        });
+    }
+    if title.chars().count() > SESSION_TITLE_MAX_CHARS {
+        return Err(DomainError::Validation {
+            message: format!("会话名称不能超过 {SESSION_TITLE_MAX_CHARS} 个字符"),
+        });
+    }
+    Ok(title.to_string())
 }
 
 #[derive(Clone)]
@@ -351,16 +372,19 @@ impl SessionStore {
         session_id: &SessionId,
         title: impl Into<String>,
     ) -> DomainResult<SessionRecord> {
+        let new_title = normalize_session_title(title.into())?;
         let mut state = self
             .state
             .write()
             .expect("session state write lock poisoned");
-        let new_title = title.into();
         let session = state
             .sessions
             .iter_mut()
             .find(|session| &session.session_id == session_id)
             .ok_or(DomainError::NotFound { entity: "session" })?;
+        if session.title == new_title {
+            return Ok(session.clone());
+        }
         session.title = new_title.clone();
         session.updated_at = UtcMillis::now();
         let updated = session.clone();

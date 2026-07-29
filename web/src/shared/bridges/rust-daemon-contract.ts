@@ -1,8 +1,10 @@
 import type { SessionBootstrapSnapshot } from '../session-bootstrap';
-import type { CanonicalTurn } from '../protocol/canonical-turn';
+import type { CanonicalTurn, CanonicalTurnItem } from '../protocol/canonical-turn';
 import { normalizeCanonicalTurn } from '../protocol/canonical-turn';
 import { deriveProcessingStateFromCanonicalTurns } from '../protocol/canonical-processing';
 import { deriveHasUnreadCompletion } from '../../lib/session-activity-indicator';
+import { parseModelFailureDiagnostic } from '../../lib/model-failure';
+import { parseToolCallFailureDiagnostic } from '../../lib/tool-call-failure';
 import type {
   AppState,
   OrchestrationRuntimeAssignmentSummary,
@@ -1166,12 +1168,12 @@ function deriveRecoverySummary(
 /** 从 recentEvents 提取用户可据此判断进展或定位问题的关键运行记录。 */
 function deriveRecentTimeline(
   recentEvents: RustEventEnvelope[],
+  canonicalTurns: CanonicalTurn[],
+  taskEntries: RustTaskRuntimeSummary[],
+  activeSession: RustSessionRuntimeSummary | undefined,
   sessionId: string,
 ): OrchestrationRuntimeTimelineEntry[] {
-  if (!Array.isArray(recentEvents) || recentEvents.length === 0) {
-    return [];
-  }
-  const entries = recentEvents
+  const eventEntries = recentEvents
     .filter((event) => {
       const eventSessionId = normalizeString(event.session_id);
       return Boolean(eventSessionId) && eventSessionId === sessionId;
@@ -1193,20 +1195,162 @@ function deriveRecentTimeline(
         detail: detail || undefined,
         diffCount: 0,
       } satisfies OrchestrationRuntimeTimelineEntry;
-    })
-    .sort((a, b) => a.seq - b.seq);
+    });
 
-  const newestFirst = [...entries].reverse();
-  return newestFirst
-    .filter((entry, index, list) => (
-      index === list.findIndex((candidate) => (
-        candidate.type === entry.type
-        && candidate.summary === entry.summary
-        && candidate.detail === entry.detail
-      ))
-    ))
-    .reverse()
-    .slice(-8);
+  const entries = [
+    ...eventEntries,
+    ...deriveCanonicalFailureTimeline(canonicalTurns, sessionId),
+    ...deriveTaskFailureTimeline(taskEntries, activeSession),
+  ].sort(compareTimelineLatestFirst);
+
+  const seen = new Set<string>();
+  return entries
+    .filter((entry) => {
+      const key = runtimeTimelineDedupKey(entry);
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 8);
+}
+
+function deriveCanonicalFailureTimeline(
+  canonicalTurns: CanonicalTurn[],
+  sessionId: string,
+): OrchestrationRuntimeTimelineEntry[] {
+  const entries: OrchestrationRuntimeTimelineEntry[] = [];
+  for (const turn of canonicalTurns) {
+    if (turn.sessionId !== sessionId) {
+      continue;
+    }
+    for (const item of turn.items) {
+      const entry = canonicalFailureTimelineEntry(turn, item);
+      if (entry) {
+        entries.push(entry);
+      }
+    }
+  }
+  return entries;
+}
+
+function canonicalFailureTimelineEntry(
+  turn: CanonicalTurn,
+  item: CanonicalTurnItem,
+): OrchestrationRuntimeTimelineEntry | null {
+  const modelFailure = parseModelFailureDiagnostic(item.metadata?.modelFailure);
+  const toolFailure = parseToolCallFailureDiagnostic(item.metadata?.toolCallFailure);
+  const timestamp = Math.max(item.updatedAt, turn.completedAt ?? 0, item.createdAt);
+  if (toolFailure) {
+    return {
+      eventId: `canonical-${item.itemId}`,
+      seq: item.itemSeq,
+      timestamp,
+      type: 'session.turn.failed',
+      summary: `${toolFailure.toolName}：${toolFailure.summary}`,
+      kind: 'error',
+      source: toolFailure.toolName,
+      detail: runtimeDetailWithCode(toolFailure.code, toolFailure.detail),
+      diffCount: 0,
+    };
+  }
+  if (modelFailure) {
+    return {
+      eventId: `canonical-${item.itemId}`,
+      seq: item.itemSeq,
+      timestamp,
+      type: 'session.turn.failed',
+      summary: `模型响应失败：${modelFailure.summary}`,
+      kind: 'error',
+      source: '模型服务',
+      detail: runtimeDetailWithCode(modelFailure.code, modelFailure.detail),
+      diffCount: 0,
+    };
+  }
+
+  const metadata = normalizeRecord(item.metadata);
+  if (normalizeString(metadata.noticeKind) !== 'session_interrupted') {
+    return null;
+  }
+  const interruptionSource = normalizeString(metadata.interruptionSource);
+  const detail = normalizeString(metadata.failureDetail)
+    || normalizeString(metadata.errorDetail)
+    || normalizeString(metadata.error)
+    || (interruptionSource ? `interruptionSource: ${interruptionSource}` : '');
+  if (!detail) {
+    return null;
+  }
+  return {
+    eventId: `canonical-${item.itemId}`,
+    seq: item.itemSeq,
+    timestamp,
+    type: 'session.turn.interrupted',
+    summary: '本轮执行异常中断',
+    kind: 'error',
+    source: '会话运行环境',
+    detail,
+    diffCount: 0,
+  };
+}
+
+function deriveTaskFailureTimeline(
+  taskEntries: RustTaskRuntimeSummary[],
+  activeSession: RustSessionRuntimeSummary | undefined,
+): OrchestrationRuntimeTimelineEntry[] {
+  const timestamp = normalizeNumber(activeSession?.last_update, 0);
+  return taskEntries.flatMap((task): OrchestrationRuntimeTimelineEntry[] => {
+    const status = normalizeSubTaskStatus(normalizeString(task.current_status));
+    const detail = normalizeString(task.failure_detail);
+    if ((status !== 'failed' && status !== 'blocked') || !detail) {
+      return [];
+    }
+    const taskId = normalizeString(task.task_id);
+    const title = normalizeString(task.title) || '任务';
+    return [{
+      eventId: `task-failure-${taskId || title}`,
+      seq: 0,
+      timestamp,
+      type: status === 'blocked' ? 'task.status.changed' : 'task.failed',
+      summary: `${title}：${status === 'blocked' ? '已阻塞' : '执行失败'}`,
+      kind: status === 'blocked' ? 'warning' : 'error',
+      source: title,
+      detail,
+      diffCount: 0,
+    }];
+  });
+}
+
+function runtimeDetailWithCode(code: string, detail: string): string {
+  return detail.toLowerCase().startsWith(`${code.toLowerCase()}:`)
+    ? detail
+    : `${code}: ${detail}`;
+}
+
+function compareTimelineLatestFirst(
+  left: OrchestrationRuntimeTimelineEntry,
+  right: OrchestrationRuntimeTimelineEntry,
+): number {
+  return right.timestamp - left.timestamp
+    || right.seq - left.seq
+    || right.eventId.localeCompare(left.eventId);
+}
+
+function runtimeTimelineDedupKey(entry: OrchestrationRuntimeTimelineEntry): string {
+  const detail = normalizeTimelineDetailKey(entry.detail);
+  if (detail) {
+    return `detail:${detail}`;
+  }
+  return [entry.kind || 'progress', entry.type, entry.summary]
+    .map((value) => normalizeString(value).toLowerCase().replace(/\s+/g, ' '))
+    .join('|');
+}
+
+function normalizeTimelineDetailKey(value: string | undefined): string {
+  return normalizeString(value)
+    .replace(/^[a-z][a-z0-9_.-]{2,80}:\s+/i, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
 }
 
 function isProductRuntimeEvent(event: RustEventEnvelope): boolean {
@@ -1602,11 +1746,19 @@ function deriveKnowledgeAudit(
 function deriveOpsView(
   runtimeReadModel: RustRuntimeReadModelDto,
   recentEvents: RustEventEnvelope[],
+  canonicalTurns: CanonicalTurn[],
   sessionId: string,
   activeSession: RustSessionRuntimeSummary | undefined,
+  taskEntries: RustTaskRuntimeSummary[],
 ): OrchestrationRuntimeOpsView | null {
   const recovery = deriveRecoverySummary(runtimeReadModel, activeSession, sessionId);
-  const recentTimeline = deriveRecentTimeline(recentEvents, sessionId);
+  const recentTimeline = deriveRecentTimeline(
+    recentEvents,
+    canonicalTurns,
+    taskEntries,
+    activeSession,
+    sessionId,
+  );
   const knowledgeAudit = deriveKnowledgeAudit(runtimeReadModel, recentEvents, sessionId);
   const eventCount = recentTimeline.length;
 
@@ -1723,6 +1875,7 @@ function deriveRuntimeState(
   runtimeReadModel: RustRuntimeReadModelDto | undefined,
   assignments: OrchestrationRuntimeAssignmentSummary[],
   recentEvents: RustEventEnvelope[],
+  canonicalTurns: CanonicalTurn[],
   sessionId: string,
   generatedAt: number,
 ): OrchestratorRuntimeState | null {
@@ -1741,7 +1894,7 @@ function deriveRuntimeState(
   const recoverableBranchCount = typeof activeSession?.recoverable_branch_count === 'number'
     ? activeSession.recoverable_branch_count
     : 0;
-  const status = runningTaskIds.length > 0
+  const taskStatus = runningTaskIds.length > 0
     ? 'running'
     : rootTaskStatus === 'running'
       ? 'running'
@@ -1758,22 +1911,55 @@ function deriveRuntimeState(
                 : activeSession
                   ? 'idle'
                   : 'idle';
+  const latestTurn = canonicalTurns
+    .filter((turn) => turn.sessionId === sessionId)
+    .reduce<CanonicalTurn | null>((latest, turn) => {
+      if (!latest || turn.turnSeq > latest.turnSeq) {
+        return turn;
+      }
+      if (turn.turnSeq === latest.turnSeq && turn.acceptedAt > latest.acceptedAt) {
+        return turn;
+      }
+      return latest;
+    }, null);
+  const status: OrchestratorRuntimeState['status'] = latestTurn
+    ? latestTurn.status === 'pending' || latestTurn.status === 'running'
+      ? 'running'
+      : latestTurn.status === 'completed'
+        ? 'completed'
+        : latestTurn.status === 'blocked'
+          ? 'blocked'
+          : latestTurn.status === 'failed' || latestTurn.status === 'interrupted'
+            ? 'failed'
+            : latestTurn.status === 'cancelled' || latestTurn.status === 'superseded'
+              ? 'cancelled'
+              : taskStatus
+    : taskStatus;
+  const latestTurnAt = latestTurn
+    ? Math.max(
+      latestTurn.acceptedAt,
+      latestTurn.completedAt ?? 0,
+      ...latestTurn.items.map((item) => item.updatedAt),
+    )
+    : 0;
   const failureDetails = collectRuntimeFailureDetails(taskEntries, recentEvents, sessionId);
 
   const opsView = deriveOpsView(
     runtimeReadModel,
     recentEvents,
+    canonicalTurns,
     sessionId,
     activeSession,
+    taskEntries,
   );
 
   return {
     sessionId: sessionId || undefined,
     status,
-    phase: runningTaskIds.length > 0 ? 'running' : status,
+    phase: status,
     errors: failureDetails,
-    statusChangedAt: normalizeNumber(activeSession?.last_update, generatedAt),
-    lastEventAt: normalizeNumber(activeSession?.last_update, generatedAt),
+    statusChangedAt: Math.max(normalizeNumber(activeSession?.last_update, generatedAt), latestTurnAt),
+    lastEventAt: Math.max(normalizeNumber(activeSession?.last_update, generatedAt), latestTurnAt),
     canResume: hasRecoverableChain,
     runtimeReason: activeSession?.latest_event_type || undefined,
     assignments,
@@ -1924,6 +2110,7 @@ export function normalizeRustBootstrapPayload(
       payload.runtimeReadModel,
       assignments,
       normalizedEvents,
+      canonicalTurns,
       currentSession?.id || '',
       generatedAt,
     ),

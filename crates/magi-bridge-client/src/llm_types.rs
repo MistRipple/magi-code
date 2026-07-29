@@ -43,7 +43,10 @@ impl ToolCall {
 
 pub fn parse_tool_arguments(raw_arguments: &str) -> (Value, Option<String>) {
     if raw_arguments.trim().is_empty() {
-        return (serde_json::json!({}), None);
+        return (
+            Value::String(raw_arguments.to_string()),
+            Some("tool arguments are empty".to_string()),
+        );
     }
 
     match serde_json::from_str::<Value>(raw_arguments) {
@@ -268,6 +271,14 @@ mod tests {
 
         assert_eq!(arguments, Value::String(raw.to_string()));
         assert!(parse_error.is_some());
+    }
+
+    #[test]
+    fn parse_tool_arguments_rejects_empty_input() {
+        let (arguments, parse_error) = parse_tool_arguments("  ");
+
+        assert_eq!(arguments, Value::String("  ".to_string()));
+        assert_eq!(parse_error.as_deref(), Some("tool arguments are empty"));
     }
 
     #[test]

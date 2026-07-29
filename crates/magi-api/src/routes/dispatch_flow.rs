@@ -449,6 +449,8 @@ fn fail_accepted_task_submission(
                 user_message_id: accepted.user_message_item_id.as_deref(),
                 placeholder_message_id: None,
                 error_text: TIMELINE_MESSAGE,
+                model_failure: None,
+                tool_call_failure: None,
                 streaming_entry_id: None,
                 source_thread_id: thread.thread_id,
                 persist_session_state: None,

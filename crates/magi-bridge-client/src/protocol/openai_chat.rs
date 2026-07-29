@@ -303,4 +303,17 @@ mod tests {
         assert_eq!(adapted.body["stream"], true);
         assert_eq!(adapted.body["stream_options"]["include_usage"], true);
     }
+
+    #[test]
+    fn missing_tool_arguments_are_preserved_as_invalid_input() {
+        let calls = parse_openai_tool_calls(&json!([{
+            "id": "call-empty",
+            "type": "function",
+            "function": {"name": "shell_exec"}
+        }]));
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].raw_arguments.as_deref(), Some("null"));
+        assert_eq!(calls[0].arguments, Value::Null);
+    }
 }

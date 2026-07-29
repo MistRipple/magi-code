@@ -17,7 +17,7 @@ use magi_conversation_runtime::session_turn_execution::BUSINESS_MODEL_PROVIDER;
 use magi_conversation_runtime::usage_recording::{
     AuxiliaryModelUsageContext, invoke_auxiliary_model_with_usage,
 };
-use magi_core::{EventId, SessionId, UtcMillis};
+use magi_core::{EventId, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::SessionStore;
 use magi_settings_store::SettingsStore;
@@ -28,7 +28,6 @@ use crate::state::ApiState;
 
 pub(crate) const NEW_SESSION_PLACEHOLDER_TITLE: &str = "新会话";
 /// 辅助模型返回内容若超过该字符数则视为越权输出（多半是直接把整段消息回吐），直接丢弃。
-const TITLE_MAX_CHARS: usize = 40;
 
 struct SessionTitleUsageContext<'a> {
     event_bus: &'a magi_event_bus::InMemoryEventBus,
@@ -120,6 +119,16 @@ pub(crate) fn refine_new_session_title_and_publish(
             "辅助模型会话标题持久化失败"
         );
     }
+    publish_session_title_updated(state, session_id, workspace_id, &title);
+    true
+}
+
+pub(crate) fn publish_session_title_updated(
+    state: &ApiState,
+    session_id: &SessionId,
+    workspace_id: Option<WorkspaceId>,
+    title: &str,
+) {
     let event_id = EventId::new(format!(
         "event-session-title-updated-{}-{}",
         session_id,
@@ -140,7 +149,6 @@ pub(crate) fn refine_new_session_title_and_publish(
         ..EventContext::default()
     });
     state.event_bus.publish(event);
-    true
 }
 
 /// 同步执行一次会话标题精修。
@@ -311,7 +319,7 @@ fn normalize_title(raw: &str) -> Option<String> {
     if title.is_empty() {
         return None;
     }
-    if title.chars().count() > TITLE_MAX_CHARS {
+    if title.chars().count() > magi_session_store::SESSION_TITLE_MAX_CHARS {
         return None;
     }
     Some(title)
@@ -397,7 +405,8 @@ mod tests {
     #[test]
     fn normalize_title_rejects_empty_and_oversize() {
         assert!(normalize_title("   ").is_none());
-        let too_long: String = std::iter::repeat_n('字', TITLE_MAX_CHARS + 1).collect();
+        let too_long: String =
+            std::iter::repeat_n('字', magi_session_store::SESSION_TITLE_MAX_CHARS + 1).collect();
         assert!(normalize_title(&too_long).is_none());
     }
 

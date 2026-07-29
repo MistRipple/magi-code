@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import App from '../App.svelte';
   import { setWebSidebarContext } from './sidebar-context';
   import Icon from '../components/Icon.svelte';
@@ -29,6 +29,7 @@
     shouldMarkSessionCompletionViewed,
   } from '../lib/session-activity-indicator';
   import { getClientBridge } from '../shared/bridges/bridge-runtime';
+  import { normalizeRustBootstrapPayload } from '../shared/bridges/rust-daemon-contract';
   import { i18n } from '../stores/i18n.svelte';
   import type { EditContentKind, Session } from '../types/message';
   import RightPane from './RightPane.svelte';
@@ -48,6 +49,7 @@
     markAgentSessionViewed,
     registerAgentWorkspace,
     removeAgentWorkspace,
+    renameAgentSession,
     resolveAgentBaseUrl,
     type AgentConnectionEventDetail,
     type AgentWorkspaceSummary,
@@ -106,6 +108,11 @@
   let workspaceDialogError = $state('');
   let showDeleteSessionDialog = $state(false);
   let pendingDeleteSession = $state<{ workspace: AgentWorkspaceSummary; session: Session } | null>(null);
+  let editingSession = $state<{ workspaceId: string; sessionId: string } | null>(null);
+  let sessionRenameDraft = $state('');
+  let sessionRenameError = $state('');
+  let renamingSessionId = $state<string | null>(null);
+  let sessionRenameInput = $state<HTMLInputElement | null>(null);
   let webThemePreference = $state<WebThemePreference>('system');
   let webThemeMode = $state<WebThemeMode>('dark');
   let sidebarMode = $state<'projects' | 'files'>(readInitialSidebarMode());
@@ -139,6 +146,7 @@
   const MIN_PREVIEW_PANEL_WIDTH = 320;
   const DEFAULT_PREVIEW_PANEL_WIDTH = 320;
   const MAX_PREVIEW_PANEL_WIDTH = 900;
+  const SESSION_NAME_MAX_CHARS = 40;
 
   const selectedWorkspace = $derived(
     workspaces.find((workspace) => workspace.workspaceId === selectedWorkspaceId) ?? null
@@ -1349,6 +1357,119 @@
     }
   }
 
+  function isEditingSession(workspaceId: string, sessionId: string): boolean {
+    return editingSession?.workspaceId === workspaceId
+      && editingSession.sessionId === sessionId;
+  }
+
+  async function beginSessionRename(
+    workspace: AgentWorkspaceSummary,
+    session: Session,
+  ): Promise<void> {
+    if (renamingSessionId || pendingSessionSwitchId) {
+      return;
+    }
+    editingSession = {
+      workspaceId: workspace.workspaceId,
+      sessionId: session.id,
+    };
+    sessionRenameDraft = session.name || '';
+    sessionRenameError = '';
+    await tick();
+    sessionRenameInput?.focus();
+    sessionRenameInput?.select();
+  }
+
+  function cancelSessionRename(): void {
+    if (renamingSessionId) {
+      return;
+    }
+    editingSession = null;
+    sessionRenameDraft = '';
+    sessionRenameError = '';
+    sessionRenameInput = null;
+  }
+
+  function validateSessionName(name: string): string {
+    if (!name) {
+      return i18n.t('web.sessionNameRequired');
+    }
+    if (/\p{Cc}/u.test(name)) {
+      return i18n.t('web.sessionNameInvalidCharacters');
+    }
+    if (Array.from(name).length > SESSION_NAME_MAX_CHARS) {
+      return i18n.t('web.sessionNameTooLong', { max: SESSION_NAME_MAX_CHARS });
+    }
+    return '';
+  }
+
+  async function saveSessionRename(
+    workspace: AgentWorkspaceSummary,
+    session: Session,
+  ): Promise<void> {
+    if (!isEditingSession(workspace.workspaceId, session.id) || renamingSessionId) {
+      return;
+    }
+    const normalizedName = sessionRenameDraft.trim();
+    const validationError = validateSessionName(normalizedName);
+    if (validationError) {
+      sessionRenameError = validationError;
+      sessionRenameInput?.focus();
+      return;
+    }
+    if (normalizedName === (session.name || '').trim()) {
+      cancelSessionRename();
+      return;
+    }
+
+    sessionRenameError = '';
+    renamingSessionId = session.id;
+    try {
+      const snapshot = await runActionWithFeedback(
+        () => renameAgentSession(session.id, normalizedName, {
+          workspaceId: workspace.workspaceId,
+          workspacePath: workspaceBindingPath(workspace),
+        }),
+        {
+          actionLabel: i18n.t('web.action.renameSession'),
+          successMessage: i18n.t('web.sessionRenamed', { name: normalizedName }),
+        },
+      );
+      if (!snapshot) {
+        return;
+      }
+      const normalizedSnapshot = normalizeRustBootstrapPayload(snapshot, {
+        workspaceId: workspace.workspaceId,
+        workspacePath: workspaceBindingPath(workspace),
+      });
+      const authoritativeWorkspaceId = normalizedSnapshot.workspace.workspaceId?.trim()
+        || workspace.workspaceId;
+      sessionsByWorkspace = {
+        ...sessionsByWorkspace,
+        [authoritativeWorkspaceId]: normalizedSnapshot.sessions,
+      };
+      if (currentBootstrapWorkspaceId() === authoritativeWorkspaceId) {
+        updateSessions(normalizedSnapshot.sessions);
+      }
+      editingSession = null;
+      sessionRenameDraft = '';
+      sessionRenameInput = null;
+    } finally {
+      renamingSessionId = null;
+    }
+  }
+
+  function handleSessionRenameBlur(
+    workspace: AgentWorkspaceSummary,
+    session: Session,
+  ): void {
+    setTimeout(() => {
+      if (isEditingSession(workspace.workspaceId, session.id)) {
+        void saveSessionRename(workspace, session);
+      }
+    }, 0);
+  }
+
   function openDeleteSessionDialog(workspace: AgentWorkspaceSummary, session: Session): void {
     pendingDeleteSession = { workspace, session };
     showDeleteSessionDialog = true;
@@ -1829,41 +1950,106 @@
                             isRunning: sessionRunning,
                             hasUnreadCompletion: session.hasUnreadCompletion === true,
                           })}
-                          <div class="session-row" class:active={session.id === currentSessionId && workspace.workspaceId === selectedWorkspaceId}>
-                            <button
-                              type="button"
-                              class="session-item"
-                              class:active={session.id === currentSessionId && workspace.workspaceId === selectedWorkspaceId}
-                              class:pending={session.id === pendingSessionSwitchId && workspace.workspaceId === pendingSessionSwitchWorkspaceId}
-                              data-session-id={session.id}
-                              disabled={pendingSessionSwitchId !== null}
-                              title={session.name || i18n.t('header.unnamedSession')}
-                              onclick={() => switchSession(workspace, session.id)}
-                            >
-                              <span
-                                class="session-running-dot"
-                                class:running={sessionIndicator === 'running'}
-                                class:unread={sessionIndicator === 'unread'}
-                                aria-hidden="true"
-                              ></span>
-                              <span class="session-name">{session.name || i18n.t('header.unnamedSession')}</span>
-                              <span class="session-meta">
-                                <span class="session-msg-count" title={i18n.t('header.messageCount', { count: session.messageCount ?? 0 })}>{session.messageCount ?? 0}</span>
-                                <span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt)}</span>
-                              </span>
-                            </button>
-                            <button
-                              type="button"
-                              class="session-delete-btn"
-                              title={i18n.t('header.deleteSession')}
-                              aria-label={i18n.t('header.deleteSession')}
-                              onclick={(event) => {
-                                event.stopPropagation();
-                                openDeleteSessionDialog(workspace, session);
-                              }}
-                            >
-                              <Icon name="delete" size={12} />
-                            </button>
+                          <div class="session-row" class:active={session.id === currentSessionId && workspace.workspaceId === selectedWorkspaceId} class:editing={isEditingSession(workspace.workspaceId, session.id)}>
+                            {#if isEditingSession(workspace.workspaceId, session.id)}
+                              <div class="session-rename-editor">
+                                <div class="session-rename-controls">
+                                  <input
+                                    bind:this={sessionRenameInput}
+                                    bind:value={sessionRenameDraft}
+                                    class:invalid={Boolean(sessionRenameError)}
+                                    class="session-rename-input"
+                                    maxlength={SESSION_NAME_MAX_CHARS}
+                                    aria-label={i18n.t('header.renameSession')}
+                                    aria-invalid={Boolean(sessionRenameError)}
+                                    disabled={renamingSessionId === session.id}
+                                    oninput={() => { sessionRenameError = ''; }}
+                                    onkeydown={(event) => {
+                                      if (event.key === 'Enter') {
+                                        event.preventDefault();
+                                        void saveSessionRename(workspace, session);
+                                      } else if (event.key === 'Escape') {
+                                        event.preventDefault();
+                                        cancelSessionRename();
+                                      }
+                                    }}
+                                    onblur={() => handleSessionRenameBlur(workspace, session)}
+                                  />
+                                  <button
+                                    type="button"
+                                    class="session-rename-action session-rename-save"
+                                    title={i18n.t('header.saveSessionName')}
+                                    aria-label={i18n.t('header.saveSessionName')}
+                                    disabled={renamingSessionId === session.id}
+                                    onclick={() => void saveSessionRename(workspace, session)}
+                                  >
+                                    <Icon name="check" size={12} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    class="session-rename-action"
+                                    title={i18n.t('header.cancelSessionRename')}
+                                    aria-label={i18n.t('header.cancelSessionRename')}
+                                    disabled={renamingSessionId === session.id}
+                                    onclick={cancelSessionRename}
+                                  >
+                                    <Icon name="x" size={12} />
+                                  </button>
+                                </div>
+                                {#if sessionRenameError}
+                                  <span class="session-rename-error">{sessionRenameError}</span>
+                                {/if}
+                              </div>
+                            {:else}
+                              <button
+                                type="button"
+                                class="session-item"
+                                class:active={session.id === currentSessionId && workspace.workspaceId === selectedWorkspaceId}
+                                class:pending={session.id === pendingSessionSwitchId && workspace.workspaceId === pendingSessionSwitchWorkspaceId}
+                                data-session-id={session.id}
+                                disabled={pendingSessionSwitchId !== null}
+                                title={session.name || i18n.t('header.unnamedSession')}
+                                onclick={() => switchSession(workspace, session.id)}
+                              >
+                                <span
+                                  class="session-running-dot"
+                                  class:running={sessionIndicator === 'running'}
+                                  class:unread={sessionIndicator === 'unread'}
+                                  aria-hidden="true"
+                                ></span>
+                                <span class="session-name">{session.name || i18n.t('header.unnamedSession')}</span>
+                                <span class="session-meta">
+                                  <span class="session-msg-count" title={i18n.t('header.messageCount', { count: session.messageCount ?? 0 })}>{session.messageCount ?? 0}</span>
+                                  <span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt)}</span>
+                                </span>
+                              </button>
+                              <div class="session-actions">
+                                <button
+                                  type="button"
+                                  class="session-action-btn session-rename-btn"
+                                  title={i18n.t('header.renameSession')}
+                                  aria-label={i18n.t('header.renameSession')}
+                                  onclick={(event) => {
+                                    event.stopPropagation();
+                                    void beginSessionRename(workspace, session);
+                                  }}
+                                >
+                                  <Icon name="pencil" size={12} />
+                                </button>
+                                <button
+                                  type="button"
+                                  class="session-action-btn session-delete-btn"
+                                  title={i18n.t('header.deleteSession')}
+                                  aria-label={i18n.t('header.deleteSession')}
+                                  onclick={(event) => {
+                                    event.stopPropagation();
+                                    openDeleteSessionDialog(workspace, session);
+                                  }}
+                                >
+                                  <Icon name="delete" size={12} />
+                                </button>
+                              </div>
+                            {/if}
                           </div>
                         {/each}
                       </div>
@@ -2565,8 +2751,8 @@
     background: color-mix(in srgb, var(--surface-selected) 78%, transparent);
   }
 
-  .session-row:hover .session-delete-btn,
-  .session-row:focus-within .session-delete-btn {
+  .session-row:hover .session-actions,
+  .session-row:focus-within .session-actions {
     opacity: 1;
     pointer-events: auto;
   }
@@ -2727,11 +2913,23 @@
     transition: opacity var(--transition-fast);
   }
 
-  .session-delete-btn {
+  .session-actions {
     position: absolute;
     top: 50%;
     right: 6px;
     transform: translateY(-50%);
+    display: inline-flex;
+    align-items: center;
+    gap: 1px;
+    padding-left: 12px;
+    background: linear-gradient(90deg, transparent, var(--surface-hover) 28%);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--transition-fast);
+  }
+
+  .session-action-btn,
+  .session-rename-action {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -2742,15 +2940,69 @@
     background: transparent;
     color: var(--foreground-muted);
     cursor: pointer;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
+    transition: background var(--transition-fast), color var(--transition-fast);
     flex-shrink: 0;
+  }
+
+  .session-rename-btn:hover,
+  .session-rename-save:hover {
+    color: var(--info);
+    background: color-mix(in srgb, var(--info) 12%, transparent);
   }
 
   .session-delete-btn:hover {
     color: var(--error);
     background: color-mix(in srgb, var(--error) 12%, transparent);
+  }
+
+  .session-rename-editor {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    flex-direction: column;
+    gap: 3px;
+    padding: 4px 6px;
+  }
+
+  .session-rename-controls {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    gap: 2px;
+  }
+
+  .session-rename-input {
+    flex: 1;
+    min-width: 0;
+    height: 24px;
+    padding: 0 6px;
+    border: 1px solid var(--border-focus);
+    border-radius: var(--radius-sm);
+    outline: none;
+    background: var(--surface);
+    color: var(--foreground);
+    font: inherit;
+  }
+
+  .session-rename-input:focus {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--border-focus) 24%, transparent);
+  }
+
+  .session-rename-input.invalid {
+    border-color: var(--error);
+  }
+
+  .session-rename-error {
+    padding-left: 1px;
+    color: var(--error);
+    font-size: 10px;
+    line-height: 1.25;
+  }
+
+  .session-rename-action:disabled,
+  .session-rename-input:disabled {
+    cursor: wait;
+    opacity: 0.55;
   }
 
   .sidebar-empty--nested {

@@ -905,6 +905,8 @@ pub struct SessionDurableState {
     pub goals: Vec<SessionGoal>,
     #[serde(default, alias = "todo_lists")]
     pub plans: Vec<SessionPlan>,
+    #[serde(default)]
+    pub thread_registry: Vec<ExecutionThread>,
 }
 
 impl SessionDurableState {
@@ -916,6 +918,7 @@ impl SessionDurableState {
             && self.notifications.is_empty()
             && self.goals.is_empty()
             && self.plans.is_empty()
+            && self.thread_registry.is_empty()
     }
 
     pub fn append_state(&mut self, other: SessionDurableState) {
@@ -932,6 +935,7 @@ impl SessionDurableState {
         self.notifications.extend(other.notifications);
         self.goals.extend(other.goals);
         self.plans.extend(other.plans);
+        self.thread_registry.extend(other.thread_registry);
     }
 
     pub fn clear_current_session_if_owned_by_workspace_states(
@@ -991,6 +995,7 @@ impl SessionDurableState {
                     notifications: Vec::new(),
                     goals: Vec::new(),
                     plans: Vec::new(),
+                    thread_registry: Vec::new(),
                 },
             );
         }
@@ -1005,6 +1010,7 @@ impl SessionDurableState {
             notifications: Vec::new(),
             goals: Vec::new(),
             plans: Vec::new(),
+            thread_registry: Vec::new(),
         };
 
         for entry in &self.timeline {
@@ -1109,6 +1115,23 @@ impl SessionDurableState {
             }
         }
 
+        for thread in &self.thread_registry {
+            if global_session_ids.contains(&thread.session_id) {
+                global_state.thread_registry.push(thread.clone());
+                continue;
+            }
+            for (workspace_id, session_ids) in &workspace_session_ids {
+                if session_ids.contains(&thread.session_id) {
+                    workspace_states
+                        .get_mut(workspace_id)
+                        .expect("workspace durable state should exist")
+                        .thread_registry
+                        .push(thread.clone());
+                    break;
+                }
+            }
+        }
+
         (global_state, workspace_states)
     }
 }
@@ -1161,7 +1184,7 @@ impl SessionStoreState {
             goals: durable_state.goals,
             plans,
             execution_sidecar_store,
-            thread_registry: Vec::new(),
+            thread_registry: durable_state.thread_registry,
         }
     }
 
@@ -1174,6 +1197,7 @@ impl SessionStoreState {
             notifications: self.notifications.clone(),
             goals: self.goals.clone(),
             plans: self.plans.clone(),
+            thread_registry: self.thread_registry.clone(),
         }
     }
 }
