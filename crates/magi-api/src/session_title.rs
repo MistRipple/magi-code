@@ -27,7 +27,6 @@ use serde_json::json;
 use crate::state::ApiState;
 
 pub(crate) const NEW_SESSION_PLACEHOLDER_TITLE: &str = "新会话";
-/// 辅助模型返回内容若超过该字符数则视为越权输出（多半是直接把整段消息回吐），直接丢弃。
 
 struct SessionTitleUsageContext<'a> {
     event_bus: &'a magi_event_bus::InMemoryEventBus,

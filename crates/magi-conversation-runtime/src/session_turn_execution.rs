@@ -149,8 +149,8 @@ pub struct SessionTurnExecutionError {
     pub reason: SessionTurnFailureReason,
     pub diagnostic_code: String,
     pub public_message: String,
-    pub model_failure: Option<ModelFailureDiagnostic>,
-    pub(crate) tool_call_failure: Option<ToolCallFailureDiagnostic>,
+    pub model_failure: Option<Box<ModelFailureDiagnostic>>,
+    pub(crate) tool_call_failure: Option<Box<ToolCallFailureDiagnostic>>,
 }
 
 impl SessionTurnExecutionError {
@@ -172,7 +172,7 @@ impl SessionTurnExecutionError {
             reason,
             diagnostic_code: model_failure.code.clone(),
             public_message: model_failure.summary.clone(),
-            model_failure: Some(model_failure),
+            model_failure: Some(Box::new(model_failure)),
             tool_call_failure: None,
         }
     }
@@ -183,7 +183,7 @@ impl SessionTurnExecutionError {
             diagnostic_code: tool_call_failure.code.clone(),
             public_message: tool_call_failure.summary.clone(),
             model_failure: None,
-            tool_call_failure: Some(tool_call_failure),
+            tool_call_failure: Some(Box::new(tool_call_failure)),
         }
     }
 
@@ -1054,7 +1054,7 @@ fn run_session_turn_execution_inner(
                         user_message_id: request.user_message_id.as_deref(),
                         placeholder_message_id: request.placeholder_message_id.as_deref(),
                         error_text: &execution_error.public_message,
-                        model_failure: execution_error.model_failure.as_ref(),
+                        model_failure: execution_error.model_failure.as_deref(),
                         tool_call_failure: execution_error.tool_call_failure.as_ref().map(
                             |failure| {
                                 serde_json::to_value(failure)
@@ -1281,7 +1281,7 @@ fn run_session_turn_execution_inner(
                 user_message_id: request.user_message_id.as_deref(),
                 placeholder_message_id: request.placeholder_message_id.as_deref(),
                 error_text: &failure.public_message,
-                model_failure: failure.model_failure.as_ref(),
+                model_failure: failure.model_failure.as_deref(),
                 tool_call_failure: failure.tool_call_failure.as_ref().map(|failure| {
                     serde_json::to_value(failure)
                         .expect("tool call failure diagnostic must serialize")

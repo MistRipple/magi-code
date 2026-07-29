@@ -1159,19 +1159,14 @@ fn run_conversation_loop_inner(
     .messages;
     let resumed_task = !thread_history_snapshot.is_empty()
         && task_is_resuming_existing_thread(session_store, session_id, task_id, thread_id);
-    let inserted_interrupted_tool_results = resumed_task
-        .then(|| {
-            insert_interrupted_tool_result_messages(
-                &mut thread_history_snapshot,
-                &started_tool_call_ids_for_task_thread(
-                    session_store,
-                    session_id,
-                    task_id,
-                    thread_id,
-                ),
-            )
-        })
-        .unwrap_or_default();
+    let inserted_interrupted_tool_results = if resumed_task {
+        insert_interrupted_tool_result_messages(
+            &mut thread_history_snapshot,
+            &started_tool_call_ids_for_task_thread(session_store, session_id, task_id, thread_id),
+        )
+    } else {
+        0
+    };
     if inserted_interrupted_tool_results > 0 {
         session_store.replace_thread_messages(
             thread_id,

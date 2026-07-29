@@ -125,7 +125,7 @@ pub(crate) fn validate_tool_call_batch(
             Ok(()) => batch.valid_calls.push(call.clone()),
             Err(issue) => batch.invalid_calls.push(InvalidToolCall {
                 call: call.clone(),
-                issue,
+                issue: *issue,
             }),
         }
     }
@@ -145,49 +145,49 @@ pub(crate) fn invalid_tool_result_message(invalid: &InvalidToolCall) -> ChatMess
 fn validate_tool_call(
     call: &ChatToolCall,
     definitions: &[ChatToolDefinition],
-) -> Result<(), ToolCallValidationIssue> {
+) -> Result<(), Box<ToolCallValidationIssue>> {
     let definition = definitions
         .iter()
         .find(|definition| definition.function.name == call.function.name);
     if definition.is_none() {
-        return Err(validation_issue(
+        return Err(Box::new(validation_issue(
             call,
             "tool_not_available",
             format!("当前运行环境未提供工具 {}。", call.function.name),
             Vec::new(),
             None,
-        ));
+        )));
     }
     let expected_input_schema = definition.map(|definition| definition.function.parameters.clone());
 
     let raw_arguments = call.function.arguments.trim();
     if raw_arguments.is_empty() {
-        return Err(validation_issue(
+        return Err(Box::new(validation_issue(
             call,
             "tool_arguments_empty",
             "工具调用没有提供参数。".to_string(),
             required_fields_for_empty_call(&call.function.name, expected_input_schema.as_ref()),
             expected_input_schema,
-        ));
+        )));
     }
 
     let arguments = serde_json::from_str::<Value>(raw_arguments).map_err(|error| {
-        validation_issue(
+        Box::new(validation_issue(
             call,
             "tool_arguments_invalid_json",
             format!("工具参数不是有效 JSON：{error}"),
             Vec::new(),
             expected_input_schema.clone(),
-        )
+        ))
     })?;
     let object = arguments.as_object().ok_or_else(|| {
-        validation_issue(
+        Box::new(validation_issue(
             call,
             "tool_arguments_not_object",
             "工具参数必须是 JSON 对象。".to_string(),
             Vec::new(),
             expected_input_schema.clone(),
-        )
+        ))
     })?;
 
     let mut missing_fields = expected_input_schema
@@ -198,13 +198,13 @@ fn validate_tool_call(
     missing_fields.sort();
     missing_fields.dedup();
     if !missing_fields.is_empty() {
-        return Err(validation_issue(
+        return Err(Box::new(validation_issue(
             call,
             "tool_arguments_missing_required",
             format!("缺少必填参数：{}。", missing_fields.join(", ")),
             missing_fields,
             expected_input_schema,
-        ));
+        )));
     }
 
     Ok(())

@@ -1919,15 +1919,14 @@ impl LlmTaskDispatcher {
                     ),
                 }
                 return Err(SessionTurnExecutionError {
-                reason:
-                    crate::session_turn_execution::SessionTurnFailureReason::ModelInvocationFailed,
-                diagnostic_code: "model_configuration_unavailable".to_string(),
-                public_message: crate::model_error::PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE
-                    .to_string(),
-                model_failure: Some(
-                    crate::model_error::ModelFailureDiagnostic::configuration_unavailable(),
-                ),
-                tool_call_failure: None,
+                    reason: crate::session_turn_execution::SessionTurnFailureReason::ModelInvocationFailed,
+                    diagnostic_code: "model_configuration_unavailable".to_string(),
+                    public_message: crate::model_error::PUBLIC_MODEL_INVOCATION_FAILURE_MESSAGE
+                        .to_string(),
+                    model_failure: Some(Box::new(
+                        crate::model_error::ModelFailureDiagnostic::configuration_unavailable(),
+                    )),
+                    tool_call_failure: None,
                 });
             }
         };
