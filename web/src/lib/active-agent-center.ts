@@ -1,4 +1,7 @@
-import type { AgentProjectionDto } from '../shared/rust-backend-types';
+import type {
+  AgentProjectionDto,
+  AgentRunOutcome,
+} from '../shared/rust-backend-types';
 
 export interface ActiveAgentGroups {
   running: AgentProjectionDto[];
@@ -84,10 +87,21 @@ export function groupActiveAgents(
   return groups;
 }
 
-export function shouldShowActiveAgentCenter(groups: ActiveAgentGroups): boolean {
+function outcomeRequiresAgentCenter(outcome: AgentRunOutcome | null | undefined): boolean {
+  return outcome === 'degraded'
+    || outcome === 'recoverable'
+    || outcome === 'failed'
+    || outcome === 'killed';
+}
+
+export function shouldShowActiveAgentCenter(
+  groups: ActiveAgentGroups,
+  outcome?: AgentRunOutcome | null,
+): boolean {
   return groups.running.length > 0
     || groups.attention.length > 0
-    || groups.completed.length > 0;
+    || groups.completed.length > 0
+    || outcomeRequiresAgentCenter(outcome);
 }
 
 export function buildActiveAgentSummary(groups: ActiveAgentGroups): ActiveAgentSummary {
@@ -123,9 +137,10 @@ export function shouldPinAgentProjection(
   rootTaskId: string,
   agentCount: number,
   dismissedRootTaskId: string,
+  outcome?: AgentRunOutcome | null,
 ): boolean {
   const normalizedRootTaskId = rootTaskId.trim();
   return normalizedRootTaskId.length > 0
-    && agentCount > 0
+    && (agentCount > 0 || outcomeRequiresAgentCenter(outcome))
     && normalizedRootTaskId !== dismissedRootTaskId.trim();
 }

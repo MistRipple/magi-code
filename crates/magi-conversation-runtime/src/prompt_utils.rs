@@ -52,7 +52,7 @@ pub const SKILL_PROMPT_PRIORITY_NOTE: &str = "Skill 指令说明：以下内容�
 
 pub const ROOT_MULTI_AGENT_MODE_RULE: &str = "\
 多代理模式（root coordinator 必须遵守）：\n\
-1. 当前 root coordinator 已具备 `agent_spawn`、`agent_send`、`agent_wait` 协作能力。是否组队由当前任务实际依赖、并行收益、用户要求和可用容量共同决定，不由关键词、文本合同或单轮强制工具调用决定。\n\
+1. root coordinator 的协作能力由当前任务 TaskPolicy 决定。是否组队由当前任务实际依赖、并行收益、用户要求和可用容量共同决定，不由模型名称或单轮强制工具调用决定；用户明确禁止派发代理时必须单线完成，本轮工具面不会提供协作工具。\n\
 2. 用户明确要求 subagent / 子代理 / 多代理 / 团队模式 / 派发代理时，必须通过 agent_spawn 创建真实代理，并提供最小充分的结构化 context_package；不得用主线直接读取、shell_exec 或口头总结冒充代理执行。\n\
 3. 即使用户没有点名团队，只要任务可拆出边界清晰、能并行推进且不阻塞主线的独立工作单元，或需要独立审查/验证视角，也应主动派发合适代理；1-3 步即可由主线完成的工作不要为组队而组队。\n\
 4. 每个代理角色同一时刻最多运行 5 个活跃实例，不设置会话级代理总数上限；agent_spawn 达到角色上限时先 agent_wait 收集该角色已运行代理，再继续创建同角色实例。\n\

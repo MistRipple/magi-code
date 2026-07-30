@@ -12,7 +12,8 @@
   import { i18n } from '../stores/i18n.svelte';
   import {
     resolveRuntimeTaskProgress,
-    runtimeAssignmentNeedsAttention,
+    resolveRuntimePanelStatus,
+    runtimeAssignmentIsActive,
     shouldShowRuntimeBudget,
     shouldShowRuntimePanel,
     shouldShowRuntimePhase,
@@ -36,7 +37,13 @@
     processingStartedAt = null,
   }: Props = $props();
   let isPanelExpanded = $state(false);
+  let expandedRecordIds = $state<Set<string>>(new Set());
   let panelRef: HTMLElement | undefined = $state();
+
+  function closePanel(): void {
+    isPanelExpanded = false;
+    expandedRecordIds = new Set();
+  }
 
   // 展开后按 popover 行为闭合：点击面板外部或按 ESC 即收起。
   $effect(() => {
@@ -51,11 +58,11 @@
       if (panelRef && panelRef.contains(target)) {
         return;
       }
-      isPanelExpanded = false;
+      closePanel();
     }
     function handleKeydown(event: KeyboardEvent): void {
       if (event.key === 'Escape') {
-        isPanelExpanded = false;
+        closePanel();
       }
     }
     document.addEventListener('mousedown', handleOutsideMouseDown, true);
@@ -78,6 +85,16 @@
       currentTurnStartedAt: conversationStartedAt,
     }).filter((item) => Boolean(formatTimelineSummary(item)))
   ));
+
+  $effect(() => {
+    const visibleRecordIds = new Set(recentTimeline.map((item) => item.eventId));
+    const retainedRecordIds = new Set(
+      [...expandedRecordIds].filter((eventId) => visibleRecordIds.has(eventId)),
+    );
+    if (retainedRecordIds.size !== expandedRecordIds.size) {
+      expandedRecordIds = retainedRecordIds;
+    }
+  });
   const assignmentSummaries = $derived.by(() => Array.isArray(runtimeState?.assignments) ? runtimeState.assignments : []);
   const activeWorkerSummary = $derived.by(() => {
     const names = assignmentSummaries
@@ -209,45 +226,20 @@
   });
 
   const canonicalProcessingActive = $derived.by(() => {
-    if (!isProcessing) {
-      return false;
-    }
-    const status = runtimeState?.status;
-    return !status
-      || status === 'idle'
-      || status === 'completed'
-      || status === 'failed'
-      || status === 'cancelled';
+    return resolveRuntimePanelStatus({
+      status: runtimeState?.status,
+      isProcessing,
+    }) === 'running' && runtimeState?.status !== 'running';
   });
 
-  const canonicalFailureActive = $derived(
-    !canonicalProcessingActive
-    && conversationRecords.some((item) => item.kind === 'error'),
-  );
-  const canonicalInterruptionActive = $derived(
-    !canonicalProcessingActive
-    && conversationRecords.some((item) => (
-      item.type === 'session.turn.interrupted' && item.kind === 'warning'
-    )),
-  );
-
-  const effectiveStatus = $derived.by(() => (
-    canonicalProcessingActive
-      ? 'running'
-      : canonicalFailureActive
-        ? 'failed'
-        : canonicalInterruptionActive
-          ? 'paused'
-          : runtimeState?.status
-  ));
+  const effectiveStatus = $derived(resolveRuntimePanelStatus({
+    status: runtimeState?.status,
+    isProcessing,
+  }));
   const effectivePhase = $derived.by(() => (
     canonicalProcessingActive
       ? 'running'
-      : canonicalFailureActive
-        ? 'failed'
-        : canonicalInterruptionActive
-          ? 'paused'
-          : runtimeState?.phase
+      : runtimeState?.phase
   ));
   const effectiveLastEventAt = $derived.by(() => (
     canonicalProcessingActive
@@ -320,11 +312,17 @@
   const panelVisible = $derived(shouldShowRuntimePanel({
     status: effectiveStatus,
     isProcessing: canonicalProcessingActive,
-    attentionAssignmentCount: assignmentSummaries.filter((item) => (
-      runtimeAssignmentNeedsAttention(item.status)
+    activeAssignmentCount: assignmentSummaries.filter((item) => (
+      runtimeAssignmentIsActive(item.status)
     )).length,
   }));
   const phaseVisible = $derived(shouldShowRuntimePhase(effectiveStatus, effectivePhase));
+
+  $effect(() => {
+    if (!panelVisible && isPanelExpanded) {
+      closePanel();
+    }
+  });
 
   function formatTimestamp(timestamp: number): string {
     if (!Number.isFinite(timestamp)) return '--';
@@ -612,27 +610,32 @@
   }
 
   function formatTimelineSummary(
-    item: Pick<OrchestrationRuntimeTimelineEntry, 'type' | 'summary' | 'source'>,
+    item: Pick<OrchestrationRuntimeTimelineEntry, 'type' | 'summary' | 'source' | 'detail'>,
   ): string {
     const toolName = item.source ? resolveToolDisplayName(item.source, i18n) : '';
     switch (item.type) {
       case 'session.turn.processing':
         return i18n.t('runtimeDiagnostics.record.processing');
       case 'session.tool.running':
-        return i18n.t('runtimeDiagnostics.record.toolRunning', { tool: toolName });
+        return appendRuntimeRecordSummary(
+          i18n.t('runtimeDiagnostics.record.toolRunning', { tool: toolName }),
+          item.summary === item.source ? '' : sanitizeRuntimeDisplayText(item.summary),
+        );
       case 'session.tool.succeeded':
-        return i18n.t('runtimeDiagnostics.record.toolSucceeded', { tool: toolName });
+        return appendRuntimeRecordSummary(
+          i18n.t('runtimeDiagnostics.record.toolSucceeded', { tool: toolName }),
+          item.summary === item.source ? '' : sanitizeRuntimeDisplayText(item.summary),
+        );
       case 'session.tool.failed': {
-        const reason = item.summary === item.source
-          ? ''
-          : formatHumanizedRuntimeText(item.summary);
+        const reason = formatRuntimeRecordPreview(item.detail)
+          || (item.summary === item.source ? '' : sanitizeRuntimeDisplayText(item.summary));
         return reason
           ? i18n.t('runtimeDiagnostics.record.toolFailedWithReason', { tool: toolName, reason })
           : i18n.t('runtimeDiagnostics.record.toolFailed', { tool: toolName });
       }
       case 'session.model.failed':
         return i18n.t('runtimeDiagnostics.record.modelFailed', {
-          reason: sanitizeRuntimeDisplayText(item.summary),
+          reason: formatRuntimeRecordPreview(item.detail) || sanitizeRuntimeDisplayText(item.summary),
         });
       case 'session.turn.interrupted':
         return i18n.t('runtimeDiagnostics.record.interrupted');
@@ -650,6 +653,36 @@
       return rest ? `${typeLabel}：${rest}` : typeLabel;
     }
     return cleanedSummary;
+  }
+
+  function appendRuntimeRecordSummary(label: string, summary: string): string {
+    return summary ? `${label} · ${summary}` : label;
+  }
+
+  function formatRuntimeRecordPreview(value: unknown): string {
+    const preview = typeof value === 'string'
+      ? value.replace(/\s+/g, ' ').trim()
+      : '';
+    if (!preview) return '';
+    return preview.length > 220 ? `${preview.slice(0, 220).trimEnd()}…` : preview;
+  }
+
+  function hasRuntimeRecordDetail(item: OrchestrationRuntimeTimelineEntry): boolean {
+    return typeof item.detail === 'string' && item.detail.trim().length > 0;
+  }
+
+  function isRuntimeRecordExpanded(eventId: string): boolean {
+    return expandedRecordIds.has(eventId);
+  }
+
+  function toggleRuntimeRecord(eventId: string): void {
+    const next = new Set(expandedRecordIds);
+    if (next.has(eventId)) {
+      next.delete(eventId);
+    } else {
+      next.add(eventId);
+    }
+    expandedRecordIds = next;
   }
 
   function resolveRuntimeRecordKind(
@@ -742,7 +775,12 @@
   }
 
   function togglePanel(): void {
-    isPanelExpanded = !isPanelExpanded;
+    if (isPanelExpanded) {
+      closePanel();
+      return;
+    }
+    expandedRecordIds = new Set();
+    isPanelExpanded = true;
   }
 </script>
 
@@ -922,18 +960,31 @@
       <div class="runtime-diagnostics__block runtime-diagnostics__block--records">
         <div class="runtime-diagnostics__label">{i18n.t('runtimeDiagnostics.keyRecords')}</div>
         <div class="runtime-diagnostics__ops-list">
-          {#each recentTimeline as item}
+          {#each recentTimeline as item (item.eventId)}
+            {@const hasDetail = hasRuntimeRecordDetail(item)}
+            {@const recordExpanded = hasDetail && isRuntimeRecordExpanded(item.eventId)}
             <div
               class="runtime-diagnostics__ops-item runtime-diagnostics__ops-item--{resolveRuntimeRecordKind(item)}"
             >
-              <div class="runtime-diagnostics__ops-title-row">
+              <button
+                type="button"
+                class="runtime-diagnostics__ops-title-row runtime-diagnostics__record-toggle"
+                class:runtime-diagnostics__record-toggle--expandable={hasDetail}
+                aria-expanded={hasDetail ? recordExpanded : undefined}
+                disabled={!hasDetail}
+                title={formatTimelineSummary(item)}
+                onclick={() => toggleRuntimeRecord(item.eventId)}
+              >
+                <span class="runtime-diagnostics__record-chevron" class:runtime-diagnostics__record-chevron--hidden={!hasDetail}>
+                  <Icon name={recordExpanded ? 'chevron-down' : 'chevron-right'} size={11} />
+                </span>
                 <span class="runtime-diagnostics__record-kind">
                   {formatRuntimeRecordKind(item)}
                 </span>
                 <span class="runtime-diagnostics__ops-title">{formatTimelineSummary(item)}</span>
                 <span class="runtime-diagnostics__ops-time">{formatTimestamp(item.timestamp)}</span>
-              </div>
-              {#if item.detail}
+              </button>
+              {#if recordExpanded}
                 <pre class="runtime-diagnostics__record-detail">{item.detail}</pre>
               {/if}
             </div>
@@ -1241,10 +1292,11 @@
   }
 
   .runtime-diagnostics__record-detail {
-    margin: 3px 0 0;
-    padding: 0;
+    margin: 3px 0 0 19px;
+    padding: 7px 9px;
     border: 0;
-    background: transparent;
+    border-left: 1px solid var(--border-subtle);
+    background: color-mix(in srgb, var(--vscode-editor-background, var(--surface-1)) 68%, transparent);
     color: var(--vscode-foreground, var(--foreground));
     font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
     font-size: 11px;
@@ -1303,6 +1355,43 @@
     gap: 8px;
   }
 
+  .runtime-diagnostics__record-toggle {
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: default;
+  }
+
+  .runtime-diagnostics__record-toggle:disabled {
+    opacity: 1;
+  }
+
+  .runtime-diagnostics__record-toggle--expandable {
+    cursor: pointer;
+  }
+
+  .runtime-diagnostics__record-toggle--expandable:hover .runtime-diagnostics__ops-title {
+    color: var(--vscode-textLink-foreground, var(--accent));
+  }
+
+  .runtime-diagnostics__record-chevron {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 11px;
+    height: 17px;
+    opacity: 0.72;
+  }
+
+  .runtime-diagnostics__record-chevron--hidden {
+    visibility: hidden;
+  }
+
   .runtime-diagnostics__ops-title {
     font-size: 12px;
     font-weight: 500;
@@ -1310,6 +1399,13 @@
     min-width: 0;
     overflow-wrap: anywhere;
     word-break: break-word;
+  }
+
+  .runtime-diagnostics__record-toggle .runtime-diagnostics__ops-title {
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .runtime-diagnostics__ops-time {

@@ -169,11 +169,38 @@ await withGoldenViteServer(async (server) => {
   );
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(
+    goalStore.applySessionPlanSnapshot(SLOW_SESSION_ID, WORKSPACE_ID, {
+      ...state.response.plan,
+      sessionId: SLOW_SESSION_ID,
+      revision: 7,
+      state: 'active',
+      items: [
+        { itemId: 'implement', title: '完成实现', status: 'in_progress' },
+        { itemId: 'verify', title: '完成验证', status: 'pending' },
+      ],
+    }),
+    false,
+    'plan events arriving before the initial snapshot must be buffered',
+  );
+  goalStore.applySessionPlanSnapshot(SLOW_SESSION_ID, WORKSPACE_ID, {
+    ...state.response.plan,
+    sessionId: SLOW_SESSION_ID,
+    revision: 6,
+    state: 'active',
+  });
+  assert.equal(
     fetches.filter((url) => url.searchParams.get('sessionId') === SLOW_SESSION_ID).length,
     1,
     'overlapping goal refreshes must share one in-flight request',
   );
   releaseSlowGoalRequest();
   await Promise.all([firstSlowRefresh, secondSlowRefresh]);
+  const recoveredSlowState = goalStore.getGoalState(SLOW_SESSION_ID, WORKSPACE_ID);
+  assert.equal(
+    recoveredSlowState.response?.plan?.revision,
+    7,
+    'the newest buffered plan event must win after the initial request completes',
+  );
+  assert.equal(recoveredSlowState.response?.plan?.items[0]?.status, 'in_progress');
   console.log('goal store golden passed');
 });

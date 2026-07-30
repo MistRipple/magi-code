@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import AccessProfileSwitchAction from './AccessProfileSwitchAction.svelte';
   import {
@@ -23,9 +22,8 @@
   }
 
   let { toolCall, status = 'running' }: Props = $props();
-  let collapsed = $state(untrack(() => !(status === 'running' || status === 'pending')));
-  let lastStatusClass = $state(untrack(() => status));
-  let userToggled = $state(false);
+  // Shell 与其他工具使用同一折叠契约，运行状态变化不干预用户手动选择。
+  let collapsed = $state(true);
 
   function parseJson(content?: string): Record<string, unknown> | null {
     const parsed = parseLeadingJson(content);
@@ -92,7 +90,6 @@
       return;
     }
     collapsed = !collapsed;
-    userToggled = true;
   }
 
   const parsedResult = $derived(parseJson(toolCall?.result));
@@ -299,23 +296,6 @@
   const displayPhaseLabel = $derived(displayPhase ? terminalPhaseLabel(displayPhase) : '');
 
   const showStatusPulse = $derived(statusClass === 'running' || statusClass === 'pending');
-  const isActiveStatus = $derived(statusClass === 'running' || statusClass === 'pending');
-
-  $effect(() => {
-    if (statusClass === lastStatusClass) {
-      return;
-    }
-    lastStatusClass = statusClass;
-    if (isActiveStatus) {
-      if (!userToggled) {
-        collapsed = false;
-      }
-      return;
-    }
-    if (!userToggled) {
-      collapsed = true;
-    }
-  });
   const toolNameLabel = $derived(i18n.t('toolCall.displayName.shell'));
   const titleText = $derived(
     typeof terminalId === 'number'
@@ -323,6 +303,28 @@
       : toolNameLabel
   );
   const toolSummary = $derived(displayCommand?.trim() || '');
+  const headerSummary = $derived.by(() => {
+    const summary = toolSummary || titleText;
+    if (statusClass !== 'error') {
+      return summary;
+    }
+    const failure = normalizeDisplayText(publicErrorText || errorText);
+    return [summary, failure].filter(Boolean).join(' · ');
+  });
+  const durationMs = $derived.by(() => {
+    if (typeof toolCall?.durationMs === 'number' && Number.isFinite(toolCall.durationMs)) {
+      return Math.max(0, toolCall.durationMs);
+    }
+    if (
+      typeof toolCall?.startTime === 'number'
+      && typeof toolCall?.endTime === 'number'
+      && Number.isFinite(toolCall.startTime)
+      && Number.isFinite(toolCall.endTime)
+    ) {
+      return Math.max(0, toolCall.endTime - toolCall.startTime);
+    }
+    return null;
+  });
 
   const isExpandable = $derived(Boolean(
     displayCommand
@@ -381,20 +383,24 @@
     data-terminal-id={typeof terminalId === 'number' ? String(terminalId) : undefined}
   >
     {#if canToggle}
-      <button class="tool-header" onclick={toggle}>
+      <button class="tool-header" onclick={toggle} aria-expanded={!collapsed}>
         <span class="chevron">
           <Icon name="chevron-right" size={12} />
         </span>
         <span class="tool-icon"><Icon name="terminal" size={14} /></span>
         <span class="tool-title">
           <span class="tool-name">{toolNameLabel}</span>
-          <span class="tool-summary" title={toolSummary || titleText}>{toolSummary || titleText}</span>
+          <span class="tool-summary" title={headerSummary}>{headerSummary}</span>
         </span>
-        <span class="tool-status status-{statusClass}">
+        <span class="tool-status status-{statusClass}" title={displayStatusLabel} aria-label={displayStatusLabel}>
           {#if showStatusPulse}
             <span class="status-dot pulsing"></span>
           {:else}
             <span class="status-dot"></span>
+          {/if}
+          <span class="tool-status-label">{displayStatusLabel}</span>
+          {#if durationMs !== null}
+            <span class="tool-duration">{(durationMs / 1000).toFixed(2)}s</span>
           {/if}
         </span>
       </button>
@@ -403,13 +409,17 @@
         <span class="tool-icon"><Icon name="terminal" size={14} /></span>
         <span class="tool-title">
           <span class="tool-name">{toolNameLabel}</span>
-          <span class="tool-summary" title={toolSummary || titleText}>{toolSummary || titleText}</span>
+          <span class="tool-summary" title={headerSummary}>{headerSummary}</span>
         </span>
-        <span class="tool-status status-{statusClass}">
+        <span class="tool-status status-{statusClass}" title={displayStatusLabel} aria-label={displayStatusLabel}>
           {#if showStatusPulse}
             <span class="status-dot pulsing"></span>
           {:else}
             <span class="status-dot"></span>
+          {/if}
+          <span class="tool-status-label">{displayStatusLabel}</span>
+          {#if durationMs !== null}
+            <span class="tool-duration">{(durationMs / 1000).toFixed(2)}s</span>
           {/if}
         </span>
       </div>
@@ -557,7 +567,20 @@
   .tool-status {
     display: flex;
     align-items: center;
+    gap: 5px;
     flex-shrink: 0;
+  }
+
+  .tool-status-label,
+  .tool-duration {
+    color: currentColor;
+    font-size: 10px;
+    white-space: nowrap;
+  }
+
+  .tool-duration {
+    color: var(--foreground-muted);
+    font-variant-numeric: tabular-nums;
   }
 
   .status-dot {

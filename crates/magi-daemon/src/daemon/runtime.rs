@@ -2178,9 +2178,6 @@ fn sync_task_plan_status(
     task: &magi_core::Task,
     status: TaskStatus,
 ) {
-    if task.plan_item_id().is_none() {
-        return;
-    }
     let Some((session_id, workspace_id)) = task_status_event_scope(session_store, task) else {
         tracing::warn!(
             task_id = %task.task_id,
@@ -2190,7 +2187,12 @@ fn sync_task_plan_status(
         return;
     };
     let plan_store = magi_plan::PlanStore::from_store(session_store, session_id);
-    match plan_store.sync_task_status(&task.task_id, status) {
+    let authority = if task.parent_task_id.is_none() {
+        magi_plan::PlanTaskAuthority::PhaseOwner
+    } else {
+        magi_plan::PlanTaskAuthority::Supporting
+    };
+    match plan_store.sync_task_status_with_authority(&task.task_id, status, authority) {
         Ok(Some(plan)) => magi_plan::publish_plan_event(
             event_bus,
             magi_plan::plan_event_type(&plan),

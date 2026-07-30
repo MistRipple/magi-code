@@ -751,6 +751,30 @@ fn agent_run_projection_preserves_all_completed_children_after_later_status_upda
 }
 
 #[test]
+fn agent_run_projection_keeps_root_running_when_child_agent_fails() {
+    let task_store = TaskStore::new();
+    let mission_id = MissionId::new("mission-agent-projection-child-failure");
+    let failed_child_id = TaskId::new("task-agent-projection-failed-child");
+    let root_task_id = seed_action_tasks(
+        &task_store,
+        &mission_id,
+        "主线接管失败代理",
+        &[(failed_child_id.clone(), "失败代理", TaskStatus::Failed)],
+    );
+
+    let projection = task_store
+        .build_agent_run_projection(&root_task_id)
+        .expect("projection should exist");
+
+    assert_eq!(projection.aggregate_status, TaskStatus::Running);
+    assert_eq!(projection.runner_status, "running");
+    assert_eq!(projection.failed_tasks, vec![failed_child_id]);
+    assert_eq!(projection.progress_summary.settled_tasks, 1);
+    assert!(projection.display_status.contains("主线仍在执行"));
+    assert!(projection.display_status.contains("接管 1 项失败子任务"));
+}
+
+#[test]
 fn execution_runtime_can_run_dispatch_through_worker_loop() {
     let event_bus = Arc::new(InMemoryEventBus::new(32));
     let service = OrchestratorService::new(Arc::clone(&event_bus));

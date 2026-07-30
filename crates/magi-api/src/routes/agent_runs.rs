@@ -11,6 +11,7 @@ use magi_session_store::{ActiveExecutionChain, ExecutionThread, ORCHESTRATOR_ROL
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+use super::agent_run_actions::{AgentRunActionKind, available_agent_run_actions};
 use super::session_scope::{
     SessionWorkspaceScope, parse_session_id, require_session_workspace_scope,
 };
@@ -70,6 +71,7 @@ struct AgentProjectionDto {
     display_name: String,
     goal: String,
     role: String,
+    capability_ids: Vec<String>,
     engine_id: Option<String>,
     model: Option<String>,
     model_source: String,
@@ -89,6 +91,16 @@ struct AgentProjectionDto {
     response_duration_ms: Option<u64>,
     updated_at: magi_core::UtcMillis,
     result: Option<AgentProjectionResultDto>,
+    failure_message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRunFailureSummaryDto {
+    root_failed: bool,
+    failed_agent_count: usize,
+    message: Option<String>,
+    requires_user_action: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,6 +112,9 @@ struct AgentRunProjectionResponseDto {
     workspace_id: String,
     workspace_path: String,
     agents: Vec<AgentProjectionDto>,
+    outcome: String,
+    available_actions: Vec<AgentRunActionKind>,
+    failure_summary: Option<AgentRunFailureSummaryDto>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -304,6 +319,7 @@ fn agent_projection_from_task(
         display_name: task.title.clone(),
         goal: task.goal.clone(),
         role,
+        capability_ids: task.executor_binding_capability_ids().to_vec(),
         engine_id: model_binding.engine_id,
         model: model_binding.model,
         model_source: model_binding.model_source,
@@ -333,6 +349,9 @@ fn agent_projection_from_task(
             .map(|thread| thread.last_used_at)
             .unwrap_or(task.updated_at),
         result: agent_projection_result(task, thread),
+        failure_message: (task.status == TaskStatus::Failed)
+            .then(|| task.output_refs.first().cloned())
+            .flatten(),
     }
 }
 
@@ -586,13 +605,64 @@ fn agent_run_projection_response(
     scope: &SessionTaskScope,
     agents: Vec<AgentProjectionDto>,
 ) -> AgentRunProjectionResponseDto {
+    let outcome = agent_run_outcome(&projection);
+    let available_actions = available_agent_run_actions(
+        projection.root_task.status,
+        projection.has_recoverable_chain,
+    );
+    let failure_summary = agent_run_failure_summary(&projection);
     AgentRunProjectionResponseDto {
         projection,
         session_id: scope.workspace.session_id.to_string(),
         workspace_id: scope.workspace.workspace_id.to_string(),
         workspace_path: scope.workspace.workspace_path.clone(),
         agents,
+        outcome,
+        available_actions,
+        failure_summary,
     }
+}
+
+fn agent_run_outcome(projection: &AgentRunProjection) -> String {
+    match projection.root_task.status {
+        TaskStatus::Pending | TaskStatus::Running => "active",
+        TaskStatus::Completed if !projection.failed_tasks.is_empty() => "degraded",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed if projection.has_recoverable_chain => "recoverable",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Killed => "killed",
+    }
+    .to_string()
+}
+
+fn agent_run_failure_summary(projection: &AgentRunProjection) -> Option<AgentRunFailureSummaryDto> {
+    let root_failed = projection.root_task.status == TaskStatus::Failed;
+    let failed_agent_count = projection
+        .tasks
+        .iter()
+        .filter(|task| task.parent_task_id.is_some() && task.status == TaskStatus::Failed)
+        .count();
+    if !root_failed && failed_agent_count == 0 {
+        return None;
+    }
+    let message = projection
+        .root_task
+        .output_refs
+        .first()
+        .cloned()
+        .or_else(|| {
+            projection
+                .tasks
+                .iter()
+                .find(|task| task.parent_task_id.is_some() && task.status == TaskStatus::Failed)
+                .and_then(|task| task.output_refs.first().cloned())
+        });
+    Some(AgentRunFailureSummaryDto {
+        root_failed,
+        failed_agent_count,
+        message,
+        requires_user_action: root_failed && !projection.has_recoverable_chain,
+    })
 }
 
 fn apply_recoverable_chain_summary(
@@ -766,6 +836,63 @@ mod tests {
         assert_eq!(
             public_projection.tasks[0].output_refs,
             vec!["测试失败：断言不匹配".to_string()]
+        );
+    }
+
+    #[test]
+    fn failed_run_exposes_authoritative_recovery_actions() {
+        let mission_id = MissionId::new("mission-run-actions");
+        let mut root = test_task("task-run-actions-root", &mission_id);
+        root.status = TaskStatus::Failed;
+        root.output_refs = vec!["模型配置不可用".to_string()];
+        let mut projection = AgentRunProjection {
+            root_task: root.clone(),
+            tasks: vec![root],
+            running_tasks: Vec::new(),
+            pending_tasks: Vec::new(),
+            completed_tasks: Vec::new(),
+            failed_tasks: vec![TaskId::new("task-run-actions-root")],
+            killed_tasks: Vec::new(),
+            progress_summary: Default::default(),
+            aggregate_status: TaskStatus::Failed,
+            display_status: "失败".to_string(),
+            execution_mode: "execution_chain".to_string(),
+            runner_status: "error".to_string(),
+            has_recoverable_chain: false,
+            recoverable_branch_count: 0,
+        };
+
+        assert_eq!(agent_run_outcome(&projection), "failed");
+        assert_eq!(
+            available_agent_run_actions(
+                projection.root_task.status,
+                projection.has_recoverable_chain,
+            ),
+            vec![AgentRunActionKind::Restart, AgentRunActionKind::Archive]
+        );
+        let failure = agent_run_failure_summary(&projection).expect("failure should exist");
+        assert!(failure.root_failed);
+        assert!(failure.requires_user_action);
+        assert_eq!(failure.message.as_deref(), Some("模型配置不可用"));
+
+        projection.has_recoverable_chain = true;
+        projection.recoverable_branch_count = 1;
+        assert_eq!(agent_run_outcome(&projection), "recoverable");
+        assert_eq!(
+            available_agent_run_actions(
+                projection.root_task.status,
+                projection.has_recoverable_chain,
+            ),
+            vec![
+                AgentRunActionKind::Continue,
+                AgentRunActionKind::Restart,
+                AgentRunActionKind::Archive,
+            ]
+        );
+        assert!(
+            !agent_run_failure_summary(&projection)
+                .expect("failure should exist")
+                .requires_user_action
         );
     }
 
@@ -993,6 +1120,7 @@ mod tests {
             display_name: "响应代理".to_string(),
             goal: "验证响应 DTO".to_string(),
             role: "reviewer".to_string(),
+            capability_ids: vec!["quality_engineering".to_string()],
             engine_id: None,
             model: None,
             model_source: "inherited_orchestrator".to_string(),
@@ -1009,6 +1137,7 @@ mod tests {
             response_duration_ms: None,
             updated_at: UtcMillis(2),
             result: None,
+            failure_message: None,
         }];
 
         let value = serde_json::to_value(agent_run_projection_response(projection, &scope, agents))
@@ -1033,6 +1162,10 @@ mod tests {
             Some("inherited_orchestrator")
         );
         assert_eq!(value["agents"][0]["accessProfile"], "read_only");
+        assert_eq!(
+            value["agents"][0]["capabilityIds"],
+            serde_json::json!(["quality_engineering"])
+        );
         assert!(value["agents"][0]["completedAt"].is_null());
         assert!(value["agents"][0]["responseDurationMs"].is_null());
         assert!(value["agents"][0].get("accessMode").is_none());

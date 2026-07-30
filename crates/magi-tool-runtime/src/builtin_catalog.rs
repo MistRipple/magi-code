@@ -749,7 +749,7 @@ impl BuiltinToolName {
                 "更新当前会话 Goal 的终态。模型只能把目标标记为 complete 或 blocked；pause、budget_limited、usage_limited 由用户或系统控制，不能由模型伪造。"
             }
             Self::AgentSpawn => {
-                "【模型可直接调用，但仅限任务执行链中的 root coordinator】向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。必须同时提供结构化 context_package；它必须是 function arguments 内的 JSON 对象，不能把对象二次编码成字符串。子代理不会自动继承主对话近期记录。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若运行中需要补充上下文，使用 agent_send。\n\n\
+                "【模型可直接调用，但仅限任务执行链中的 root coordinator】向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。必须明确提供角色本次激活的 capabilities，并同时提供结构化 context_package；它必须是 function arguments 内的 JSON 对象，不能把对象二次编码成字符串。子代理不会自动继承主对话近期记录。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若运行中需要补充上下文，使用 agent_send。\n\n\
                 # 何时用\n\
                 - 任务可拆出 1 个或多个明确边界的子工作单元，且子单元能独立完成（有清晰输入、输出、验收）\n\
                 - 需要专家视角（reviewer 做代码审查、explorer 做根因定位、tester 做验证）\n\
@@ -759,6 +759,11 @@ impl BuiltinToolName {
                 - 主线可以直接分析、读写文件、运行命令和验证；不要把 1-3 步即可完成的任务强行派发代理\n\
                 - 代理适合处理边界清晰、可并行、不阻塞主线下一步的专项任务\n\
                 - 代理运行中，主线应继续推进不重叠工作；不要空等，也不要重复做已经委派的同一件事\n\n\
+                # 专业能力\n\
+                - capabilities 必填且至少一项，运行时只注入目标角色拥有且本次显式激活的专业能力\n\
+                - 可用 id：general_engineering / product_design / frontend / backend / desktop / mobile / database / security / devops / data_engineering / ai_model_integration / quality_engineering / performance\n\
+                - 能识别专业领域时必须选择对应能力；跨领域任务可以同时激活多项\n\
+                - general_engineering 只用于确实无法归类的通用工程工作，不能替代明确的专业能力\n\n\
                 # 并发上限\n\
                 - 每个代理角色同一时刻最多运行 5 个活跃实例；不设置会话级代理总数下限或额外总人数上限\n\
                 - 不同角色容量彼此独立；达到角色上限时返回 role、active_role_agent_count 与 max_active_agents_per_role\n\
@@ -1362,6 +1367,16 @@ impl BuiltinToolName {
                     "task_name": { "type": "string", "description": "稳定的机器任务名，只允许小写字母、数字和下划线；同一父任务下必须唯一。" },
                     "plan_item_id": { "type": "string", "description": "可选：绑定 update_plan 返回的顶层 itemId。绑定后代理状态会自动同步该计划项。" },
                     "role": { "type": "string", "description": "已注册的代理角色 id，如 architect / executor / explorer / reviewer / tester。不要传 coordinator，主线协调身份由当前主模型承接。若用户明确指定 role，必须原样使用，不得替换成你认为更接近的角色。" },
+                    "capabilities": {
+                        "type": "array",
+                        "minItems": 1,
+                        "uniqueItems": true,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1
+                        },
+                        "description": "本次任务从目标角色拥有的专业能力中激活的能力 id。能够识别领域时必须选择对应能力；跨领域可多选；general_engineering 仅用于无法明确归类的通用任务。"
+                    },
                     "display_name": { "type": "string", "description": "本次派发的代理实例展示名（3-30 个字符），用于前端代理卡片标题。若用户明确给出 display_name 或指定代理名称，必须原样使用；不得自行改写、缩短、泛化或把两个指定代理合并。否则要求高度概括本次具体职责，例如『登录流程审查员』『支付迁移设计师』『冒烟测试执行人』；不要写成纯角色名（如『executor』）或冗长目标重复。" },
                     "goal": { "type": "string", "description": "子任务的具体目标；角色级 system prompt 会与该目标合并使用" },
                     "task_kind": {
@@ -1396,7 +1411,7 @@ impl BuiltinToolName {
                     "working_dir": { "type": "string", "description": "可选的绝对工作目录；默认沿用父任务的 workspace 根目录" },
                     "parallelism_group": { "type": "string", "description": "可选的并行组名；同一 SpawnGraph 分支下相同组名的子 agent 互斥执行" }
                 },
-                "required": ["task_name", "role", "display_name", "goal", "context_package"]
+                "required": ["task_name", "role", "capabilities", "display_name", "goal", "context_package"]
             }),
             Self::AgentSend => serde_json::json!({
                 "type": "object",
@@ -1460,7 +1475,7 @@ impl BuiltinToolName {
             Self::UpdatePlan => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "planId": { "type": "string", "description": "更新现有计划时必须传入工具上次返回的 planId；首次创建可省略。" },
+                    "planId": { "type": "string", "minLength": 1, "description": "更新现有计划时必须传入工具上次返回的 planId；首次创建必须省略，不要传空字符串。" },
                     "expectedRevision": { "type": "integer", "minimum": 0, "description": "乐观并发版本。首次创建传 0；后续必须传入工具上次返回的 revision。" },
                     "language": { "type": "string", "description": "计划语言的 BCP-47 标识。用户明确要求优先，其次当前消息主要语言，再次产品 locale，默认 zh-CN。计划创建后不得切换。" },
                     "explanation": { "type": "string", "description": "可选：说明本次拆分、排序或范围变化原因。" },
@@ -1470,7 +1485,7 @@ impl BuiltinToolName {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "itemId": { "type": "string", "description": "稳定计划项 ID。首次创建可省略由后端生成；后续更新必须原样传回。" },
+                                "itemId": { "type": "string", "minLength": 1, "description": "稳定计划项 ID。首次创建必须省略，不要传空字符串；后续更新必须原样传回。" },
                                 "step": { "type": "string", "description": "简短、可执行、可验证的步骤标题，使用计划 language。" },
                                 "status": {
                                     "type": "string",

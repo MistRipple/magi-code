@@ -1,5 +1,32 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { withGoldenViteServer } from './golden-vite.mjs';
+
+const toolCallSource = await readFile(
+  new URL('../src/components/ToolCall.svelte', import.meta.url),
+  'utf8',
+);
+const terminalCardSource = await readFile(
+  new URL('../src/components/TerminalSessionCard.svelte', import.meta.url),
+  'utf8',
+);
+
+for (const [component, source] of [
+  ['ToolCall', toolCallSource],
+  ['TerminalSessionCard', terminalCardSource],
+]) {
+  assert.match(source, /let collapsed = \$state\(true\);/, `${component} 必须默认折叠`);
+  assert.doesNotMatch(
+    source,
+    /collapsed = false/,
+    `${component} 不得在运行中、完成或失败状态下自动展开`,
+  );
+  assert.match(
+    source,
+    /aria-expanded=\{!collapsed\}/,
+    `${component} 的展开按钮必须暴露真实可访问状态`,
+  );
+}
 
 await withGoldenViteServer(async (server) => {
   const display = await server.ssrLoadModule('/src/lib/tool-call-display.ts');
@@ -112,7 +139,7 @@ await withGoldenViteServer(async (server) => {
   const terminalCard = await server.ssrLoadModule('/src/components/TerminalSessionCard.svelte');
   const failedTerminalMarkup = render(terminalCard.default, {
     props: {
-      status: 'running',
+      status: 'error',
       toolCall: {
         id: 'shell-failure',
         name: 'shell_exec',
@@ -133,8 +160,14 @@ await withGoldenViteServer(async (server) => {
     },
   }).body;
   assert.doesNotMatch(failedTerminalMarkup, /终端会话 #0|data-terminal-id="0"/);
-  assert.match(failedTerminalMarkup, /npm ERR! Unknown option --runInBand/);
+  assert.match(failedTerminalMarkup, /class="tool-call terminal-call [^"]*collapsed"/);
+  assert.match(failedTerminalMarkup, /npm test -- --runInBand/);
   assert.match(failedTerminalMarkup, /测试命令参数无效/);
+  assert.doesNotMatch(
+    failedTerminalMarkup,
+    /npm ERR! Unknown option --runInBand/,
+    'Shell 详细输出必须在用户展开前保持隐藏',
+  );
   assert.doesNotMatch(failedTerminalMarkup, /占用状态[^<]*否/);
 
   assert.deepEqual(

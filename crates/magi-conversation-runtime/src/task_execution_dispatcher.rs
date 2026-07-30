@@ -950,24 +950,33 @@ impl LlmTaskDispatcher {
         );
         let active_skill_allowed_tools = (!active_skill_policy.source_skill_ids.is_empty())
             .then_some(active_skill_policy.allowed_tool_names.as_slice());
-        let mut definitions = public_builtin_tool_definitions(&registry)
-            .into_iter()
-            .filter(|definition| {
-                BuiltinToolName::from_name(definition.function.name.as_str()).is_some_and(|tool| {
-                    task_can_see_builtin_tool(task, Some(self.agent_role_registry.as_ref()), tool)
-                        && (task.is_some() || session_turn_can_execute_builtin_tool(tool))
-                        && builtin_tool_visible_in_access_profile(tool, tool_surface_access_profile)
+        let mut definitions =
+            public_builtin_tool_definitions(&registry, self.agent_role_registry.as_ref())
+                .into_iter()
+                .filter(|definition| {
+                    BuiltinToolName::from_name(definition.function.name.as_str()).is_some_and(
+                        |tool| {
+                            task_can_see_builtin_tool(
+                                task,
+                                Some(self.agent_role_registry.as_ref()),
+                                tool,
+                            ) && (task.is_some() || session_turn_can_execute_builtin_tool(tool))
+                                && builtin_tool_visible_in_access_profile(
+                                    tool,
+                                    tool_surface_access_profile,
+                                )
+                        },
+                    )
                 })
-            })
-            .filter(|definition| {
-                active_skill_allowed_tools.is_none_or(|allowed_tools| {
-                    allowed_tools
-                        .iter()
-                        .any(|tool_name| tool_name == &definition.function.name)
+                .filter(|definition| {
+                    active_skill_allowed_tools.is_none_or(|allowed_tools| {
+                        allowed_tools
+                            .iter()
+                            .any(|tool_name| tool_name == &definition.function.name)
+                    })
                 })
-            })
-            .filter(|definition| definition.function.name != SKILL_APPLY_TOOL_NAME)
-            .collect::<Vec<_>>();
+                .filter(|definition| definition.function.name != SKILL_APPLY_TOOL_NAME)
+                .collect::<Vec<_>>();
         if self.skill_runtime.is_some() && skill_name.is_none() {
             definitions.push(skill_apply_tool_definition(
                 self.skill_runtime
@@ -1012,16 +1021,17 @@ impl LlmTaskDispatcher {
         if goal_turn_mode.is_goal_driven()
             && let Some(registry) = self.tool_registry.as_ref()
         {
-            for definition in public_builtin_tool_definitions(registry)
-                .into_iter()
-                .filter(|definition| {
-                    BuiltinToolName::from_name(definition.function.name.as_str()).is_some_and(
-                        |tool| {
-                            is_session_goal_tool(tool)
-                                && builtin_tool_visible_in_access_profile(tool, access_profile)
-                        },
-                    )
-                })
+            for definition in
+                public_builtin_tool_definitions(registry, self.agent_role_registry.as_ref())
+                    .into_iter()
+                    .filter(|definition| {
+                        BuiltinToolName::from_name(definition.function.name.as_str()).is_some_and(
+                            |tool| {
+                                is_session_goal_tool(tool)
+                                    && builtin_tool_visible_in_access_profile(tool, access_profile)
+                            },
+                        )
+                    })
             {
                 if definitions
                     .iter()
@@ -2234,7 +2244,27 @@ impl LlmTaskDispatcher {
                     worker_id,
                     worker_role: worker.role.clone(),
                     thread_id,
-                    system_prompt: worker.system_prompt_template.clone(),
+                    system_prompt: match worker.system_prompt_template.as_deref() {
+                        Some(role_prompt) => Some(
+                            self.agent_role_registry
+                                .compose_system_prompt(
+                                    &worker.role,
+                                    role_prompt,
+                                    task.executor_binding_capability_ids(),
+                                )
+                                .map_err(|error| {
+                                    format!("组合代理角色与专业能力提示词失败: {error}")
+                                })?,
+                        ),
+                        None if !task.executor_binding_capability_ids().is_empty() => {
+                            return Err(format!(
+                                "代理角色 {} 缺少基础提示词，无法激活专业能力: {}",
+                                worker.role,
+                                task.executor_binding_capability_ids().join(", ")
+                            ));
+                        }
+                        None => None,
+                    },
                     execution_settings_snapshot,
                 });
             }

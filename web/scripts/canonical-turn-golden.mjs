@@ -90,6 +90,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsEmpty(dataHandlers, messagesStore);
   assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, messagesStore);
   assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(dataHandlers, messagesStore);
+  assertTerminalCanonicalTurnWithoutAssistantSettlesBoundRequest(dataHandlers, messagesStore);
   assertHistoricalTerminalReplayDoesNotClearCurrentTurn(dataHandlers, messagesStore);
   assertTerminalLateUpsertIsIgnored(reducer, projection);
   assertTerminalLateTurnStartedIsIgnored(reducer, projection);
@@ -2062,6 +2063,96 @@ function assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(data
     messagesStore.messagesState.pendingRequests.size,
     0,
     'terminal canonical event must clear pending request ids',
+  );
+  messagesStore.setCurrentSessionId(null);
+}
+
+function assertTerminalCanonicalTurnWithoutAssistantSettlesBoundRequest(dataHandlers, messagesStore) {
+  const c = baseCase(
+    'terminal-tool-only-processing-settle',
+    'session-golden-terminal-tool-only',
+    'turn-golden-terminal-tool-only',
+    11950,
+  );
+  const requestMetadata = {
+    requestId: 'request-terminal-tool-only',
+    userMessageId: 'user-terminal-tool-only',
+    placeholderMessageId: 'assistant-terminal-tool-only',
+  };
+  const userItem = user(c, 1, '请执行工具并验证终态。');
+  userItem.itemId = requestMetadata.userMessageId;
+  userItem.metadata = requestMetadata;
+  const failedTool = tool(
+    c,
+    2,
+    'tool-terminal-tool-only',
+    'call-terminal-tool-only',
+    'missing-command',
+    'failed',
+    { status: 'failed', error: 'command not found' },
+  );
+  failedTool.metadata = requestMetadata;
+
+  messagesStore.messagesState.currentWorkspaceId = 'workspace-golden-terminal-tool-only';
+  messagesStore.messagesState.currentWorkspacePath = '/tmp/workspace-golden-terminal-tool-only';
+  messagesStore.setCurrentSessionId(c.sessionId);
+  messagesStore.clearAllMessages({
+    persist: false,
+    resetTimelineView: true,
+    resetPanelState: true,
+    skipAntiLiftBack: true,
+  });
+  messagesStore.createRequestBinding({
+    ...requestMetadata,
+    createdAt: c.turnSeq,
+  });
+  messagesStore.beginLocalTurnSubmission({
+    requestId: requestMetadata.requestId,
+    placeholderMessageId: requestMetadata.placeholderMessageId,
+    startedAt: c.turnSeq,
+    source: 'orchestrator',
+    agent: 'orchestrator',
+  });
+
+  dataHandlers.handleUnifiedData({
+    id: 'golden-terminal-tool-only-event',
+    category: 'data',
+    type: 'system',
+    source: 'orchestrator',
+    agent: 'orchestrator',
+    lifecycle: 'completed',
+    blocks: [],
+    timestamp: c.turnSeq + 1,
+    updatedAt: c.turnSeq + 1,
+    data: {
+      dataType: 'sessionTurnCanonicalEventUpdated',
+      payload: {
+        sessionId: c.sessionId,
+        canonicalEvent: event(c, 1, 'turn_completed', {
+          turn: turn(c, 'failed', [userItem, failedTool], {
+            completedAt: c.turnSeq + 100,
+            responseDurationMs: 100,
+          }),
+          item: failedTool,
+        }),
+      },
+    },
+  });
+
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    false,
+    'terminal canonical turn must settle a bound request even without assistant final text',
+  );
+  assert.equal(
+    messagesStore.messagesState.pendingRequests.size,
+    0,
+    'terminal canonical turn must clear pending request identity without assistant final text',
+  );
+  assert.equal(
+    messagesStore.listRequestBindings().length,
+    0,
+    'terminal canonical turn must retire request bindings without assistant final text',
   );
   messagesStore.setCurrentSessionId(null);
 }

@@ -632,6 +632,31 @@ pub(crate) fn builtin_role_templates() -> Vec<Value> {
     ]
 }
 
+pub(crate) fn role_templates_for_registry(
+    registry: &magi_agent_role::AgentRoleRegistry,
+) -> Vec<Value> {
+    builtin_role_templates()
+        .into_iter()
+        .map(|mut template| {
+            let template_id = template["templateId"]
+                .as_str()
+                .expect("内置角色模板必须包含 templateId");
+            let capabilities = registry
+                .capability_summaries_for_role(template_id)
+                .into_iter()
+                .map(|capability| {
+                    serde_json::to_value(capability).expect("专业能力摘要必须可以序列化")
+                })
+                .collect::<Vec<_>>();
+            template
+                .as_object_mut()
+                .expect("内置角色模板必须是对象")
+                .insert("capabilities".to_string(), Value::Array(capabilities));
+            template
+        })
+        .collect()
+}
+
 fn builtin_template_ids() -> HashSet<String> {
     builtin_role_templates()
         .iter()
@@ -1313,10 +1338,12 @@ async fn save_safeguard_config(
 }
 
 async fn list_role_templates(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
     Query(_query): Query<HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    Json(json!({ "templates": builtin_role_templates() }))
+    Json(json!({
+        "templates": role_templates_for_registry(state.agent_role_registry.as_ref())
+    }))
 }
 
 async fn list_engines(
@@ -1723,6 +1750,29 @@ mod tests {
 
     fn test_state() -> ApiState {
         test_state_with_external_catalog_snapshot(None)
+    }
+
+    #[test]
+    fn role_templates_publish_non_empty_professional_capabilities() {
+        let registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let templates = role_templates_for_registry(&registry);
+
+        assert_eq!(templates.len(), builtin_role_templates().len());
+        for template in templates {
+            let template_id = template["templateId"]
+                .as_str()
+                .expect("角色模板必须包含 templateId");
+            let capabilities = template["capabilities"]
+                .as_array()
+                .expect("角色模板必须包含能力数组");
+            assert!(!capabilities.is_empty(), "{template_id} 缺少专业能力");
+            assert!(
+                capabilities
+                    .iter()
+                    .all(|capability| capability["version"].as_u64().is_some()),
+                "{template_id} 的能力必须带版本"
+            );
+        }
     }
 
     fn test_state_with_external_catalog_snapshot(

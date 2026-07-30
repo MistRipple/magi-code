@@ -11,8 +11,8 @@ use crate::mcp_config::{
     build_mcp_config_from_entry, mcp_server_entry_enabled, normalize_mcp_server_snapshot_entry,
 };
 use crate::routes::settings::{
-    builtin_role_templates, load_registry_engines, registered_role_template_ids,
-    resolve_registry_agents,
+    load_registry_engines, registered_role_template_ids, resolve_registry_agents,
+    role_templates_for_registry,
 };
 use crate::scope_binding::strip_scope_binding_fields;
 use crate::skill_loader;
@@ -1454,7 +1454,7 @@ impl ApiState {
             "capabilityDependencies": self.capability_dependencies_json(&tool_catalog),
             "workerStatuses": object_section(&snapshot, "workerStatuses"),
             "runtimeSettings": runtime_settings_from_snapshot(&snapshot),
-            "roleTemplates": builtin_role_templates(),
+            "roleTemplates": role_templates_for_registry(self.agent_role_registry.as_ref()),
             "registryEngines": load_registry_engines(self),
             "registryAgents": resolve_registry_agents(self),
             "bootstrapScope": if hydrate_mcp_servers { "full" } else { "core" },

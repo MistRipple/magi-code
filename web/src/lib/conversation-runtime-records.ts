@@ -7,7 +7,11 @@ import type {
 import { parseModelFailureDiagnostic } from './model-failure';
 import { mergeRuntimeTimelineEntries } from './runtime-timeline';
 import { parseToolCallFailureDiagnostic } from './tool-call-failure';
-import { publicToolPayloadMessage, toolPayloadErrorCode } from './tool-error-payload';
+import {
+  parseToolPayloadRecord,
+  publicToolPayloadMessage,
+  toolPayloadErrorCode,
+} from './tool-error-payload';
 
 export interface ConversationRuntimeRecordOptions {
   isProcessing: boolean;
@@ -167,11 +171,34 @@ function buildToolRuntimeRecord(
   return buildRuntimeRecord(message, {
     suffix: `tool-${toolCall.id}`,
     type,
-    summary: toolCall.name,
+    summary: resolveToolRuntimeSummary(toolCall) || toolCall.name,
     kind: status === 'error' ? 'error' : status === 'success' ? 'success' : 'progress',
     source: toolCall.name,
     detail: detail || undefined,
   });
+}
+
+function resolveToolRuntimeSummary(toolCall: ToolCall): string {
+  if (toolCall.status === 'error') {
+    return publicToolPayloadMessage(toolCall.error)
+      || publicToolPayloadMessage(toolCall.result)
+      || textValue(toolCall.standardized?.message)
+      || textValue(toolCall.error)
+      || textValue(toolCall.result);
+  }
+  if (toolCall.status === 'success') {
+    return textValue(toolCall.standardized?.message)
+      || structuredToolResultSummary(toolCall.result);
+  }
+  return textValue(toolCall.arguments.command)
+    || textValue(toolCall.arguments.path)
+    || textValue(toolCall.arguments.file_path);
+}
+
+function structuredToolResultSummary(value: unknown): string {
+  const payload = parseToolPayloadRecord(value);
+  if (!payload) return '';
+  return textValue(payload.summary) || textValue(payload.message);
 }
 
 function resolveToolRuntimeDetail(toolCall: ToolCall): string {

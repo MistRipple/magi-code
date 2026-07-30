@@ -792,25 +792,18 @@ impl TaskStore {
         let completed_count = completed_task_ids.len() as u32;
         let settled_tasks = active_tasks
             .iter()
-            .filter(|t| matches!(t.status, TaskStatus::Completed | TaskStatus::Killed))
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+                )
+            })
             .count() as u32;
         let failed_count = failed_task_ids.len() as u32;
         let killed_count = killed_task_ids.len() as u32;
         let running_count = running_tasks.len() as u32;
 
-        let aggregate_status = if root_task.status == TaskStatus::Killed {
-            TaskStatus::Killed
-        } else if root_task.status == TaskStatus::Completed {
-            TaskStatus::Completed
-        } else if failed_count > 0 {
-            TaskStatus::Failed
-        } else if running_count > 0 {
-            TaskStatus::Running
-        } else if total_tasks > 0 && settled_tasks == total_tasks {
-            TaskStatus::Completed
-        } else {
-            root_task.status
-        };
+        let aggregate_status = root_task.status;
 
         let execution_mode = "execution_chain".to_string();
         let runner_status = match aggregate_status {
@@ -820,24 +813,26 @@ impl TaskStore {
             TaskStatus::Killed => "killed".to_string(),
             TaskStatus::Pending => "pending".to_string(),
         };
-        let display_status = if root_task.status == TaskStatus::Killed {
-            "已终止".to_string()
-        } else if root_task.status == TaskStatus::Completed && failed_count > 0 {
-            format!("主线已完成，{} 项子任务已降级处理", failed_count)
-        } else if total_tasks == 0 {
-            "待启动".to_string()
-        } else {
-            let pct = (settled_tasks as f32 / total_tasks as f32 * 100.0).round() as u32;
-            if settled_tasks == total_tasks {
-                "全部完成".to_string()
-            } else if failed_count > 0 {
-                format!("{}% 已完成，{} 项失败", pct, failed_count)
-            } else if running_count > 0 {
-                format!("{}% 已完成，{} 项执行中", pct, running_count)
-            } else if pending_count > 0 {
-                format!("{}% 已完成，{} 项待执行", pct, pending_count)
-            } else {
-                format!("{}% 已完成", pct)
+        let display_status = match root_task.status {
+            TaskStatus::Killed => "已终止".to_string(),
+            TaskStatus::Failed => "主线任务执行失败，等待用户处理".to_string(),
+            TaskStatus::Completed if failed_count > 0 => {
+                format!("主线已完成，{} 项子任务已降级处理", failed_count)
+            }
+            TaskStatus::Completed => "全部完成".to_string(),
+            TaskStatus::Pending => "待启动".to_string(),
+            TaskStatus::Running if failed_count > 0 => {
+                format!("主线仍在执行，正在接管 {} 项失败子任务", failed_count)
+            }
+            TaskStatus::Running => {
+                let pct = (settled_tasks as f32 / total_tasks.max(1) as f32 * 100.0).round() as u32;
+                if running_count > 0 {
+                    format!("{}% 已完成，{} 项执行中", pct, running_count)
+                } else if pending_count > 0 {
+                    format!("{}% 已完成，{} 项待执行", pct, pending_count)
+                } else {
+                    format!("{}% 已完成，主线汇总中", pct)
+                }
             }
         };
 

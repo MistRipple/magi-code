@@ -11,6 +11,8 @@ import type {
   ClientBridgeMessage,
 } from '../shared/bridges/client-bridge';
 import type {
+  AgentRunActionKind,
+  AgentRunActionResponseDto,
   AgentRunProjectionDto,
   TaskStatus,
 } from '../shared/rust-backend-types';
@@ -23,6 +25,8 @@ export interface AgentRunState {
   projection: AgentRunProjectionDto | null;
   loading: boolean;
   error: string | null;
+  actionInFlight: AgentRunActionKind | null;
+  actionError: string | null;
   rootTaskId: string | null;
   selectedAgentRunId: string | null;
 }
@@ -39,6 +43,8 @@ const EMPTY_AGENT_RUN_STATE: AgentRunState = {
   projection: null,
   loading: false,
   error: null,
+  actionInFlight: null,
+  actionError: null,
   rootTaskId: null,
   selectedAgentRunId: null,
 };
@@ -145,6 +151,8 @@ function createEmptyInternalState(
     projection: null,
     loading: false,
     error: null,
+    actionInFlight: null,
+    actionError: null,
     rootTaskId: null,
     selectedAgentRunId: null,
     fetchGeneration: 0,
@@ -332,17 +340,21 @@ export async function fetchAgentRunProjection(
     return;
   }
   const state = ensureSessionState(normalizedSessionId, normalizedWorkspaceId, normalizedWorkspacePath);
-  if (state.loading) {
+  const rootChanged = state.rootTaskId !== rootTaskId;
+  if (state.loading && !rootChanged) {
     state.refreshAfterLoad = true;
     return;
   }
-  const fetchGeneration = state.fetchGeneration + 1;
-  state.fetchGeneration = fetchGeneration;
-  const rootChanged = state.rootTaskId !== rootTaskId;
-  state.rootTaskId = rootTaskId;
   if (rootChanged) {
+    state.fetchGeneration += 1;
+    state.loading = false;
+    state.refreshAfterLoad = false;
+    state.projection = null;
     state.selectedAgentRunId = null;
   }
+  const fetchGeneration = state.fetchGeneration + 1;
+  state.fetchGeneration = fetchGeneration;
+  state.rootTaskId = rootTaskId;
   state.loading = true;
   state.error = null;
   let terminalProjectionLoadError = false;
@@ -443,6 +455,94 @@ export async function refreshAgentRunProjection(
       normalizedWorkspaceId,
       state.workspacePath || normalizedWorkspacePath,
     );
+  }
+}
+
+function agentRunActionOperationId(action: AgentRunActionKind): string {
+  const randomId = typeof globalThis.crypto?.randomUUID === 'function'
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `agent-run-${action}-${randomId}`;
+}
+
+function agentRunActionErrorMessage(error: unknown): string {
+  if (error && typeof error === 'object') {
+    const candidate = error as { detail?: unknown; message?: unknown };
+    if (typeof candidate.detail === 'string' && candidate.detail.trim()) {
+      return candidate.detail.trim();
+    }
+    if (typeof candidate.message === 'string' && candidate.message.trim()) {
+      return candidate.message.trim();
+    }
+  }
+  return typeof error === 'string' && error.trim() ? error.trim() : 'agent_run_action_failed';
+}
+
+export async function performAgentRunAction(
+  sessionId: string | null | undefined,
+  rootTaskId: string | null | undefined,
+  action: AgentRunActionKind,
+  workspaceId: string | null | undefined = currentWorkspaceId(),
+  workspacePath: string | null | undefined = currentWorkspacePath(),
+): Promise<AgentRunActionResponseDto | null> {
+  const normalizedSessionId = normalizeSessionKey(sessionId);
+  const normalizedRootTaskId = typeof rootTaskId === 'string' ? rootTaskId.trim() : '';
+  if (!normalizedSessionId || !normalizedRootTaskId) {
+    return null;
+  }
+  const normalizedWorkspaceId = normalizeWorkspaceKey(workspaceId);
+  const normalizedWorkspacePath = typeof workspacePath === 'string' ? workspacePath.trim() : '';
+  const state = ensureSessionState(
+    normalizedSessionId,
+    normalizedWorkspaceId,
+    normalizedWorkspacePath,
+  );
+  if (state.actionInFlight) {
+    return null;
+  }
+  state.actionInFlight = action;
+  state.actionError = null;
+  try {
+    const response = await createClient().performAgentRunAction({
+      action,
+      operationId: agentRunActionOperationId(action),
+      taskId: normalizedRootTaskId,
+      sessionId: normalizedSessionId,
+      workspaceId: normalizedWorkspaceId || undefined,
+      workspacePath: normalizedWorkspacePath || undefined,
+    });
+    if (action === 'archive') {
+      clearAgentRunProjection(
+        normalizedSessionId,
+        normalizedRootTaskId,
+        normalizedWorkspaceId,
+      );
+      return response;
+    }
+    const nextRootTaskId = action === 'restart'
+      ? (response.newRootTaskId?.trim() || response.rootTaskId.trim())
+      : response.rootTaskId.trim();
+    if (action === 'restart') {
+      retiredSessionRootIds.add(sessionRootKey(
+        normalizedWorkspaceId,
+        normalizedSessionId,
+        normalizedRootTaskId,
+      ));
+    }
+    if (nextRootTaskId) {
+      await fetchAgentRunProjection(
+        normalizedSessionId,
+        nextRootTaskId,
+        normalizedWorkspaceId,
+        normalizedWorkspacePath,
+      );
+    }
+    return response;
+  } catch (error) {
+    state.actionError = agentRunActionErrorMessage(error);
+    throw error;
+  } finally {
+    state.actionInFlight = null;
   }
 }
 

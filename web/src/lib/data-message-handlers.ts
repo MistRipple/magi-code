@@ -57,7 +57,11 @@ import {
 } from './message-utils';
 import { buildEmptyWorkspaceAppState } from '../shared/bridges/empty-workspace-state';
 import { settingsBootstrapMatchesCurrentWorkspace } from '../web/agent-api';
-import type { CanonicalTurn, CanonicalTurnEvent } from '../shared/protocol/canonical-turn';
+import {
+  isCanonicalTerminalStatus,
+  type CanonicalTurn,
+  type CanonicalTurnEvent,
+} from '../shared/protocol/canonical-turn';
 import { deriveProcessingStateFromCanonicalTurns } from '../shared/protocol/canonical-processing';
 import {
   applyCanonicalTurnEvent,
@@ -917,6 +921,30 @@ function canonicalTurnRequestId(turn: CanonicalTurn): string {
   return '';
 }
 
+function canonicalTurnMatchesRequestBinding(
+  turn: CanonicalTurn,
+  binding: ReturnType<typeof listRequestBindings>[number],
+): boolean {
+  const requestId = canonicalTurnRequestId(turn);
+  if (requestId) {
+    return requestId === binding.requestId;
+  }
+  const itemIds = new Set(
+    [binding.userMessageId, binding.placeholderMessageId, binding.realMessageId]
+      .map((itemId) => typeof itemId === 'string' ? itemId.trim() : '')
+      .filter(Boolean),
+  );
+  return itemIds.size > 0 && turn.items.some((item) => itemIds.has(item.itemId));
+}
+
+function findCanonicalTurnByRequestBinding(
+  sessionId: string,
+  binding: ReturnType<typeof listRequestBindings>[number],
+): CanonicalTurn | undefined {
+  return canonicalTurnsForSession(sessionId, turnStoreState.reducer.turns)
+    .findLast((turn) => canonicalTurnMatchesRequestBinding(turn, binding));
+}
+
 function canonicalSnapshotContainsAllBoundPendingRequests(turns: CanonicalTurn[]): boolean {
   const pendingRequestIds = new Set(
     listRequestBindings()
@@ -987,16 +1015,17 @@ function reconcileRequestBindingsFromAuthoritativeThread(sessionId: string): voi
 
   let settledResponse = false;
   for (const binding of listRequestBindings()) {
-    const matchedAssistant = findTerminalAssistantByRequestIdentity(binding);
-
-    if (!matchedAssistant) {
+    const matchedTurn = findCanonicalTurnByRequestBinding(sessionId, binding);
+    if (!matchedTurn || !isCanonicalTerminalStatus(matchedTurn.status)) {
       continue;
     }
-
-    markMessageComplete(matchedAssistant.id);
+    const matchedAssistant = findTerminalAssistantByRequestIdentity(binding);
+    if (matchedAssistant) {
+      markMessageComplete(matchedAssistant.id);
+    }
     clearPendingRequest(binding.requestId);
     updateRequestBinding(binding.requestId, {
-      realMessageId: matchedAssistant.id,
+      ...(matchedAssistant ? { realMessageId: matchedAssistant.id } : {}),
       timeoutId: undefined,
     });
     if (binding.timeoutId) {

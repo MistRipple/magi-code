@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
   import Icon from './Icon.svelte';
   import FileSpan from './FileSpan.svelte';
   import DiagramRenderer from './DiagramRenderer.svelte';
@@ -80,28 +79,11 @@
     filePreviewScope = undefined,
   }: Props = $props();
 
-  let collapsed = $state(untrack(() => !(status === 'running' || status === 'pending')));
-  let lastStatus = $state(untrack(() => status));
-  let userToggled = $state(false);
+  // 工具过程默认保持折叠；状态更新不得覆盖用户主动展开或收起的选择。
+  let collapsed = $state(true);
   let copySuccess = $state(false);
   let lastLoggedErrorSignature = $state('');
   let lastReportedAgentSpawnFailureSignature = $state('');
-
-  $effect(() => {
-    if (status === lastStatus) {
-      return;
-    }
-    lastStatus = status;
-    if (status === 'running' || status === 'pending') {
-      if (!userToggled) {
-        collapsed = false;
-      }
-      return;
-    }
-    if (!userToggled) {
-      collapsed = true;
-    }
-  });
 
   // 格式化内容
   function formatContent(content: unknown): string {
@@ -442,18 +424,6 @@
   const diagramPayload = $derived(parseToolDiagramPayload(name, output));
   const isDiagramTool = $derived(!!diagramPayload);
 
-  $effect(() => {
-    if (diagramPayload && status === 'success' && !userToggled) {
-      collapsed = false;
-    }
-  });
-
-  $effect(() => {
-    if (generatedImagePreview && status === 'success' && !userToggled) {
-      collapsed = false;
-    }
-  });
-
   const skillApplyPolicy = $derived.by(() => {
     if (name !== 'skill_apply') return null;
     const data = standardized?.data;
@@ -775,6 +745,16 @@
     || errorDiagnosis?.message
     || i18n.t('toolCall.errorDiagnosis.runtime.message')
   );
+  const headerSummary = $derived.by(() => {
+    if (!hasError) {
+      return toolSummary;
+    }
+    return [toolSummary, publicErrorMessage].filter(Boolean).join(' · ');
+  });
+
+  function toolStatusLabel(value: VisualToolStatus): string {
+    return i18n.t(`terminalSession.status.${value}`);
+  }
 
   $effect(() => {
     if (!hasError) {
@@ -798,7 +778,6 @@
       return;
     }
     collapsed = !collapsed;
-    userToggled = true;
   }
 
   async function copyOutput() {
@@ -853,18 +832,26 @@
         {errorDiagnosis.categoryLabel}
       </span>
     {/if}
-    {#if toolFilepath}
+    {#if toolFilepath && !hasError}
       <FileSpan filepath={toolFilepath} showIcon={false} clickable={true} onClick={handleOpenFile} />
-    {:else if toolSummary}
-      <span class="tool-summary" title={toolSummary}>{toolSummary}</span>
+    {:else if headerSummary}
+      <span class="tool-summary" title={headerSummary}>{headerSummary}</span>
     {/if}
   </span>
 
-  <span class="tool-status status-{statusInfo.class}">
+  <span
+    class="tool-status status-{statusInfo.class}"
+    title={toolStatusLabel(status)}
+    aria-label={toolStatusLabel(status)}
+  >
     {#if status === 'running' || status === 'pending'}
       <span class="status-dot pulsing"></span>
     {:else}
       <span class="status-dot"></span>
+    {/if}
+    <span class="tool-status-label">{toolStatusLabel(status)}</span>
+    {#if typeof duration === 'number' && duration >= 0}
+      <span class="tool-duration">{(duration / 1000).toFixed(2)}s</span>
     {/if}
   </span>
 {/snippet}
@@ -958,7 +945,7 @@
       data-tool-call-id={id || undefined}
     >
       {#if canExpand}
-        <button class="tool-header" onclick={toggle}>
+        <button class="tool-header" onclick={toggle} aria-expanded={!collapsed}>
           <span class="chevron">
             <Icon name="chevron-right" size={12} />
           </span>
@@ -1101,12 +1088,6 @@
             </div>
           {/if}
 
-          {#if duration}
-            <div class="tool-meta">
-              <Icon name="clock" size={12} />
-              {i18n.t('toolCall.duration')} <strong>{(duration / 1000).toFixed(2)}s</strong>
-            </div>
-          {/if}
         </div>
       {/if}
     </div>
@@ -1234,7 +1215,20 @@
   .tool-status {
     display: flex;
     align-items: center;
+    gap: 5px;
     flex-shrink: 0;
+  }
+
+  .tool-status-label,
+  .tool-duration {
+    color: currentColor;
+    font-size: 10px;
+    white-space: nowrap;
+  }
+
+  .tool-duration {
+    color: var(--foreground-muted);
+    font-variant-numeric: tabular-nums;
   }
 
   .status-dot {

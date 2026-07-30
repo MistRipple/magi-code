@@ -1,7 +1,12 @@
 export interface RuntimePanelVisibilityInput {
   status?: string | null;
   isProcessing: boolean;
-  attentionAssignmentCount: number;
+  activeAssignmentCount: number;
+}
+
+export interface RuntimePanelStatusInput {
+  status?: string | null;
+  isProcessing: boolean;
 }
 
 export interface RuntimeTaskProgressSnapshot {
@@ -23,7 +28,7 @@ export function shouldShowRuntimePanel(input: RuntimePanelVisibilityInput): bool
   if (status === 'completed' || status === 'cancelled') {
     return false;
   }
-  if (input.isProcessing || input.attentionAssignmentCount > 0) {
+  if (input.isProcessing || input.activeAssignmentCount > 0) {
     return true;
   }
   return status === 'running'
@@ -33,7 +38,18 @@ export function shouldShowRuntimePanel(input: RuntimePanelVisibilityInput): bool
     || status === 'failed';
 }
 
-export function runtimeAssignmentNeedsAttention(status: string | undefined): boolean {
+export function resolveRuntimePanelStatus(input: RuntimePanelStatusInput): string | undefined {
+  const status = input.status?.trim() || undefined;
+  if (
+    input.isProcessing
+    && (!status || status === 'idle' || status === 'completed' || status === 'failed' || status === 'cancelled')
+  ) {
+    return 'running';
+  }
+  return status;
+}
+
+export function runtimeAssignmentIsActive(status: string | undefined): boolean {
   switch (status?.trim().toLowerCase()) {
     case 'running':
     case 'in_progress':
@@ -44,7 +60,6 @@ export function runtimeAssignmentNeedsAttention(status: string | undefined): boo
     case 'review_required':
     case 'paused':
     case 'blocked':
-    case 'failed':
       return true;
     default:
       return false;

@@ -14,6 +14,13 @@ interface InternalGoalState extends GoalState {
   workspacePath: string;
   fetchGeneration: number;
   requestController: AbortController | null;
+  pendingPlanSnapshot: PendingPlanSnapshot | null;
+}
+
+interface PendingPlanSnapshot {
+  plan: SessionPlanDto | null;
+  planId: string;
+  revision: number | null;
 }
 
 const EMPTY_GOAL_STATE: GoalState = {
@@ -52,6 +59,7 @@ function writeGoalState(key: string, patch: Partial<InternalGoalState>): Interna
       workspacePath: '',
       fetchGeneration: 0,
       requestController: null,
+      pendingPlanSnapshot: null,
     };
   }
   Object.assign(goalStates[key], patch);
@@ -97,13 +105,19 @@ export function getGoalState(
 export function applyCurrentGoalResponse(response: CurrentGoalResponseDto): void {
   const key = goalScopeKey(response.workspaceId, response.sessionId);
   if (!key) return;
+  const current = goalStates[key];
+  const pending = current?.pendingPlanSnapshot ?? null;
+  const mergedResponse = pending
+    ? mergePlanSnapshot(response, pending.plan, pending.planId, pending.revision)
+    : response;
   writeGoalState(key, {
     sessionId: normalizeKey(response.sessionId),
     workspaceId: normalizeKey(response.workspaceId),
     workspacePath: normalizeKey(response.workspacePath),
-    response,
+    response: mergedResponse,
     loading: false,
     error: null,
+    pendingPlanSnapshot: null,
   });
 }
 
@@ -116,30 +130,59 @@ export function applySessionPlanSnapshot(
 ): boolean {
   const key = goalScopeKey(workspaceId, sessionId);
   const current = key ? goalStates[key] : null;
-  if (!key || !current?.response) return false;
-  const currentPlan = current.response.plan ?? null;
   const incomingPlanId = normalizeKey(plan?.planId ?? eventPlanId);
   const incomingRevision = plan?.revision ?? eventRevision ?? null;
-  if (currentPlan && incomingPlanId && currentPlan.planId !== incomingPlanId) {
-    if (plan === null) return true;
+  if (!key || !current) return false;
+  if (!current.response) {
+    const pending = current.pendingPlanSnapshot;
+    if (
+      !pending
+      || pending.planId !== incomingPlanId
+      || incomingRevision === null
+      || pending.revision === null
+      || incomingRevision >= pending.revision
+    ) {
+      current.pendingPlanSnapshot = {
+        plan,
+        planId: incomingPlanId,
+        revision: incomingRevision,
+      };
+    }
     return false;
-  } else if (
-    currentPlan
-    && typeof incomingRevision === 'number'
-    && Number.isFinite(incomingRevision)
-    && incomingRevision < currentPlan.revision
-  ) {
-    return true;
+  }
+  const currentPlan = current.response.plan ?? null;
+  if (currentPlan && incomingPlanId && currentPlan.planId !== incomingPlanId) {
+    return plan === null;
   }
   writeGoalState(key, {
     response: {
-      ...current.response,
-      plan,
+      ...mergePlanSnapshot(current.response, plan, incomingPlanId, incomingRevision),
     },
     loading: false,
     error: null,
   });
   return true;
+}
+
+function mergePlanSnapshot(
+  response: CurrentGoalResponseDto,
+  plan: SessionPlanDto | null,
+  incomingPlanId: string,
+  incomingRevision: number | null,
+): CurrentGoalResponseDto {
+  const currentPlan = response.plan ?? null;
+  if (currentPlan && incomingPlanId && currentPlan.planId !== incomingPlanId) {
+    return plan === null ? response : { ...response, plan };
+  }
+  if (
+    currentPlan
+    && typeof incomingRevision === 'number'
+    && Number.isFinite(incomingRevision)
+    && incomingRevision < currentPlan.revision
+  ) {
+    return response;
+  }
+  return { ...response, plan };
 }
 
 export async function refreshCurrentGoal(
@@ -172,9 +215,15 @@ export async function refreshCurrentGoal(
     const current = goalStates[key];
     if (!current || current.fetchGeneration !== generation) return;
     writeGoalState(key, {
-      response,
+      response: (() => {
+        const pending = goalStates[key]?.pendingPlanSnapshot;
+        return pending
+          ? mergePlanSnapshot(response, pending.plan, pending.planId, pending.revision)
+          : response;
+      })(),
       loading: false,
       error: null,
+      pendingPlanSnapshot: null,
     });
   } catch (error) {
     const current = goalStates[key];

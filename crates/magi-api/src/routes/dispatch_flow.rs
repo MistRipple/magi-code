@@ -47,6 +47,7 @@ pub(super) async fn accept_session_task_submission(
             task_tier,
             accepted_at: monotonic_accepted_at(),
             required_tool_chain: Vec::new(),
+            denied_tools: Vec::new(),
         },
     )
     .await
@@ -60,6 +61,7 @@ pub(super) struct SessionTaskSubmissionInput {
     pub task_tier: TaskTier,
     pub accepted_at: UtcMillis,
     pub required_tool_chain: Vec<String>,
+    pub denied_tools: Vec<String>,
 }
 
 pub(super) async fn accept_session_task_submission_at(
@@ -75,6 +77,7 @@ pub(super) async fn accept_session_task_submission_at(
         task_tier,
         accepted_at,
         required_tool_chain,
+        denied_tools,
     } = input;
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_message(trimmed_text.as_deref());
@@ -106,6 +109,7 @@ pub(super) async fn accept_session_task_submission_at(
             request,
             accepted_at,
             required_tool_chain,
+            denied_tools,
         },
     )
     .await
@@ -157,6 +161,7 @@ pub(super) async fn accept_goal_continuation_task_submission(
         placeholder_message_id: None,
         replace_turn_id: None,
         required_tool_chain: vec!["get_goal".to_string()],
+        denied_tools: Vec::new(),
         turn_origin: DispatchTurnOrigin::GoalContinuation,
     };
     let accepted = submit_dispatch_submission(state, dispatch)?;
@@ -181,6 +186,7 @@ struct ExecuteDispatchSubmissionInput<'a> {
     request: &'a SessionTurnRequestDto,
     accepted_at: UtcMillis,
     required_tool_chain: Vec<String>,
+    denied_tools: Vec<String>,
 }
 
 async fn execute_dispatch_submission(
@@ -201,6 +207,7 @@ async fn execute_dispatch_submission(
         request,
         accepted_at,
         required_tool_chain,
+        denied_tools,
     } = input;
     let placeholder_title = crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
     let (session_id, created_session, workspace_id) = resolve_dispatch_session(
@@ -254,6 +261,7 @@ async fn execute_dispatch_submission(
         placeholder_message_id: request.placeholder_message_id(),
         replace_turn_id: request.replace_turn_id(),
         required_tool_chain,
+        denied_tools,
         turn_origin: DispatchTurnOrigin::User,
     };
     let accepted = match submit_dispatch_submission(state, dispatch) {

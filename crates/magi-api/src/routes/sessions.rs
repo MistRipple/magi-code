@@ -765,6 +765,7 @@ fn local_session_turn_intent_decision(
     let requests_goal_mode = session_turn_requests_explicit_goal_mode(request);
     let requests_explicit_task_or_agent =
         session_turn_requests_explicit_task_or_agent_mode(request);
+    let requests_explicit_plan = session_turn_requests_explicit_plan(request);
     let requests_proactive_collaboration =
         !session_turn_explicitly_rejects_collaboration(&task_text.to_ascii_lowercase())
             && session_turn_has_structured_task_scope(&task_text.to_ascii_lowercase());
@@ -775,6 +776,7 @@ fn local_session_turn_intent_decision(
     } else if requests_goal_mode && !requests_explicit_task_or_agent {
         SessionTurnRouteDto::Chat
     } else if requests_explicit_task_or_agent
+        || requests_explicit_plan
         || requests_proactive_collaboration
         || (session_turn_requests_task_by_local_rules(request) && !requests_simple_execution)
     {
@@ -875,27 +877,7 @@ fn normalize_session_turn_decision(
             Some("用户请求目标模式，由主线会话使用 Goal 工具持续推进。".to_string());
         decision.task_evidence.clear();
     }
-    let rejects_collaboration = request
-        .trimmed_text()
-        .as_deref()
-        .map(|text| session_turn_explicitly_rejects_collaboration(&text.to_ascii_lowercase()))
-        .unwrap_or(false);
-    if matches!(decision.route, SessionTurnRouteDto::Task) && rejects_collaboration {
-        let task_text = request
-            .trimmed_text()
-            .unwrap_or_else(|| request.timeline_message(None));
-        decision.route = SessionTurnRouteDto::Execute;
-        decision.task_title = None;
-        decision.execution_goal = None;
-        decision.task_tier = TaskTier::ExecutionChain;
-        decision.tool_intent = Some(task_text);
-        decision.forced_tool_name = None;
-        decision.required_tool_chain.clear();
-        decision.confidence = decision.confidence.max(0.95);
-        decision.reason_code = Some("tool_request".to_string());
-        decision.route_reason = Some("用户明确要求主线直接执行，不创建协作运行记录。".to_string());
-        decision.task_evidence.clear();
-    } else if !matches!(decision.route, SessionTurnRouteDto::Continue)
+    if !matches!(decision.route, SessionTurnRouteDto::Continue)
         && session_turn_requests_explicit_task_or_agent_mode(request)
     {
         let task_text = request
@@ -1042,7 +1024,88 @@ fn normalize_session_turn_decision(
             }
         }
     }
+    if matches!(decision.route, SessionTurnRouteDto::Task)
+        && session_turn_requests_explicit_plan(request)
+    {
+        if !decision
+            .required_tool_chain
+            .iter()
+            .any(|tool| tool == "update_plan")
+        {
+            decision
+                .required_tool_chain
+                .insert(0, "update_plan".to_string());
+        } else if let Some(index) = decision
+            .required_tool_chain
+            .iter()
+            .position(|tool| tool == "update_plan")
+            && index != 0
+        {
+            let update_plan = decision.required_tool_chain.remove(index);
+            decision.required_tool_chain.insert(0, update_plan);
+        }
+        decision.route_reason = Some(
+            "用户明确要求执行计划，先由 root coordinator 建立计划，再按计划推进。".to_string(),
+        );
+        if !decision
+            .task_evidence
+            .iter()
+            .any(|evidence| evidence == "用户明确要求先建立执行计划")
+        {
+            decision
+                .task_evidence
+                .push("用户明确要求先建立执行计划".to_string());
+        }
+    }
     decision
+}
+
+fn session_turn_requests_explicit_plan(request: &SessionTurnRequestDto) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    let normalized = text.to_ascii_lowercase();
+    if [
+        "不要计划",
+        "不需要计划",
+        "无需计划",
+        "不用计划",
+        "without a plan",
+        "no plan",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        return false;
+    }
+    let has_explicit_plan_phrase = [
+        "任务计划",
+        "执行计划",
+        "任务清单",
+        "拆成",
+        "拆分",
+        "分阶段",
+        "多阶段",
+        "按步骤",
+        "task plan",
+        "execution plan",
+        "task list",
+        "break down",
+        "in phases",
+        "multiple phases",
+        "multi-phase",
+        "in steps",
+        "step by step",
+        "define milestones",
+        "milestone plan",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    has_explicit_plan_phrase
+        || (normalized.contains("计划")
+            && ["制定", "建立", "创建", "列出"]
+                .iter()
+                .any(|marker| normalized.contains(marker)))
 }
 
 fn session_turn_requests_task_by_local_rules(request: &SessionTurnRequestDto) -> bool {
@@ -1439,9 +1502,9 @@ fn session_turn_requests_explicit_agent_collaboration(request: &SessionTurnReque
         .any(|marker| normalized.contains(marker))
 }
 
-/// 这里只决定 session 是否需要创建 root task，绝不影响 root coordinator 的工具面。
-/// 工具可见性始终由执行角色、访问策略和运行时容量决定；用户明确要求单线执行时，
-/// 仅避免把普通工具操作误路由成协作任务。
+/// 识别用户明确要求单线执行的约束。任务是否需要结构化执行仍由任务复杂度决定；
+/// 协作工具禁用则通过 root task 的 TaskPolicy 固化，避免把“是否建任务”和
+/// “是否允许派发代理”错误耦合。
 fn session_turn_explicitly_rejects_collaboration(normalized: &str) -> bool {
     let rejects_collaboration = [
         "不要创建",
@@ -1450,12 +1513,22 @@ fn session_turn_explicitly_rejects_collaboration(normalized: &str) -> bool {
         "不使用",
         "无需创建",
         "无需使用",
+        "不要派发",
+        "不派发",
+        "无需派发",
+        "禁止创建",
+        "禁止使用",
+        "禁止派发",
+        "禁止启动",
         "不启用",
         "do not create",
         "do not use",
+        "do not spawn",
         "don't create",
         "don't use",
+        "don't spawn",
         "without using",
+        "without agents",
     ]
     .iter()
     .any(|prefix| normalized.contains(prefix));
@@ -1464,12 +1537,29 @@ fn session_turn_explicitly_rejects_collaboration(normalized: &str) -> bool {
             "子代理",
             "subagent",
             "agent",
+            "agents",
             "多代理",
             "multi-agent",
             "团队",
         ]
         .iter()
         .any(|term| normalized.contains(term))
+}
+
+fn session_turn_denied_collaboration_tools(request: &SessionTurnRequestDto) -> Vec<String> {
+    let rejects_collaboration = request
+        .trimmed_text()
+        .as_deref()
+        .map(|text| session_turn_explicitly_rejects_collaboration(&text.to_ascii_lowercase()))
+        .unwrap_or(false);
+    if rejects_collaboration {
+        ["agent_spawn", "agent_send", "agent_wait"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 enum RequestedBuiltinTools {
@@ -1680,6 +1770,7 @@ async fn submit_root_coordinator_session_turn(
             task_tier: decision.task_tier,
             accepted_at,
             required_tool_chain,
+            denied_tools: session_turn_denied_collaboration_tools(&request),
         },
     )
     .await?;
@@ -1795,6 +1886,10 @@ async fn schedule_goal_continuation_turn_if_idle(
     let Some(goal) = state.session_store.active_goal(&session_id) else {
         return;
     };
+    let plan_store = magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
+    if !plan_allows_goal_continuation(plan_store.snapshot().as_ref()) {
+        return;
+    }
     if state.queued_regular_session_turn_count(&session_id) > 0 {
         return;
     }
@@ -1808,6 +1903,18 @@ async fn schedule_goal_continuation_turn_if_idle(
     if let Err(error) = submit_goal_continuation_turn(state, session_id, workspace_id, goal).await {
         tracing::warn!("goal continuation turn submit failed: {error:?}");
     }
+}
+
+fn plan_allows_goal_continuation(plan: Option<&magi_session_store::SessionPlan>) -> bool {
+    plan.is_none_or(|plan| {
+        !matches!(
+            plan.state,
+            magi_core::PlanState::Paused | magi_core::PlanState::Canceled
+        ) && !plan
+            .items
+            .iter()
+            .any(|item| item.status == magi_core::PlanItemStatus::Blocked)
+    })
 }
 
 /// 用户显式恢复目标时提交一轮真实的续跑任务。
@@ -2279,7 +2386,7 @@ impl InterruptSessionTurnRequest {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ContinueSessionResponseDto {
+pub(super) struct ContinueSessionResponseDto {
     session_id: String,
     workspace_id: String,
     mission_id: String,
@@ -2290,6 +2397,14 @@ struct ContinueSessionResponseDto {
     runner_started: bool,
     event_id: String,
     continued_at: UtcMillis,
+}
+
+struct SessionContinueExecutionRequest {
+    prompt_text: Option<String>,
+    requested_agent_ids: Vec<String>,
+    request_id: Option<String>,
+    user_message_id: Option<String>,
+    placeholder_message_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2727,6 +2842,48 @@ async fn continue_session(
         request.requested_workspace_path(),
     )?;
     require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
+    let response = execute_session_continue(
+        &state,
+        &session_id,
+        &workspace_id,
+        SessionContinueExecutionRequest {
+            prompt_text: request.prompt_text,
+            requested_agent_ids: request.requested_agent_ids,
+            request_id: request.request_id,
+            user_message_id: request.user_message_id,
+            placeholder_message_id: request.placeholder_message_id,
+        },
+    )
+    .await?;
+    Ok(Json(response))
+}
+
+pub(super) async fn continue_agent_run(
+    state: &ApiState,
+    session_id: &SessionId,
+    workspace_id: &WorkspaceId,
+) -> Result<ContinueSessionResponseDto, ApiError> {
+    execute_session_continue(
+        state,
+        session_id,
+        workspace_id,
+        SessionContinueExecutionRequest {
+            prompt_text: Some("继续执行中断的任务".to_string()),
+            requested_agent_ids: Vec::new(),
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+        },
+    )
+    .await
+}
+
+async fn execute_session_continue(
+    state: &ApiState,
+    session_id: &SessionId,
+    workspace_id: &WorkspaceId,
+    request: SessionContinueExecutionRequest,
+) -> Result<ContinueSessionResponseDto, ApiError> {
     let requested_prompt_text = request
         .prompt_text
         .as_deref()
@@ -2735,7 +2892,7 @@ async fn continue_session(
         .map(str::to_string);
     let interrupted_recovery_requested = state
         .session_store
-        .has_recovery_ready_interruption(&session_id);
+        .has_recovery_ready_interruption(session_id);
     let prompt_text = requested_prompt_text
         .or_else(|| interrupted_recovery_requested.then(|| "继续执行中断的任务".to_string()));
     let request_id = trimmed_non_empty(request.request_id.as_deref()).map(str::to_string);
@@ -2751,13 +2908,13 @@ async fn continue_session(
         .collect::<Vec<_>>();
     let continued_at = UtcMillis::now();
     let (accepted, ()) = continue_execution_chain_with_pre_resume(
-        &state,
-        &session_id,
+        state,
+        session_id,
         &requested_agent_ids,
         |branches| {
             persist_resumed_branch_user_input(
-                &state,
-                &session_id,
+                state,
+                session_id,
                 branches,
                 prompt_text.as_deref(),
                 &[],
@@ -2769,9 +2926,9 @@ async fn continue_session(
     let (_, orchestrator_thread_id) =
         state
             .session_store
-            .ensure_session_mission(&session_id, continued_at, || accepted.mission_id.clone());
+            .ensure_session_mission(session_id, continued_at, || accepted.mission_id.clone());
     let _ = write_continue_user_message(ContinueUserMessageInput {
-        state: &state,
+        state,
         accepted: &accepted,
         prompt_text: prompt_text.as_deref(),
         continued_at,
@@ -2804,7 +2961,7 @@ async fn continue_session(
         ..EventContext::default()
     });
     state.event_bus.publish(event);
-    Ok(Json(ContinueSessionResponseDto {
+    Ok(ContinueSessionResponseDto {
         session_id: accepted.session_id.to_string(),
         workspace_id: workspace_id.to_string(),
         mission_id: accepted.mission_id.to_string(),
@@ -2815,7 +2972,7 @@ async fn continue_session(
         runner_started: accepted.runner_started,
         event_id: event_id.to_string(),
         continued_at,
-    }))
+    })
 }
 
 fn finalize_continue_session(
@@ -3689,6 +3846,48 @@ mod tests {
             AccessProfile::FullAccess,
             "Goal 自动续跑必须沿用目标最近一次用户选择的访问模式"
         );
+    }
+
+    #[test]
+    fn goal_continuation_stops_for_paused_or_blocked_plan() {
+        let session_store = Arc::new(SessionStore::new());
+        let session_id = SessionId::new("session-plan-continuation-gate");
+        session_store
+            .create_session(session_id.clone(), "plan continuation gate")
+            .expect("session should create");
+        let plan_store = seed_active_plan(&session_store, &session_id, "implement", "完成实现");
+        assert!(plan_allows_goal_continuation(
+            plan_store.snapshot().as_ref()
+        ));
+
+        let paused = plan_store
+            .pause()
+            .expect("plan should pause")
+            .expect("plan should exist");
+        assert!(!plan_allows_goal_continuation(Some(&paused)));
+
+        let resumed = plan_store
+            .resume()
+            .expect("plan should resume")
+            .expect("plan should exist");
+        let blocked = plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: Some(resumed.plan_id.to_string()),
+                expected_revision: Some(resumed.revision),
+                language: resumed.language,
+                explanation: None,
+                plan: resumed
+                    .items
+                    .into_iter()
+                    .map(|item| magi_plan::UpdatePlanItemInput {
+                        item_id: Some(item.item_id.to_string()),
+                        step: item.title,
+                        status: magi_core::PlanItemStatus::Blocked,
+                    })
+                    .collect(),
+            })
+            .expect("plan should block");
+        assert!(!plan_allows_goal_continuation(Some(&blocked)));
     }
 
     async fn post_json(
@@ -5509,6 +5708,84 @@ mod tests {
     }
 
     #[test]
+    fn explicit_multi_stage_task_requires_plan_before_execution() {
+        let state = test_state();
+        let request = session_turn_request(
+            "请把这个只读验收任务拆成三个连续执行阶段，先建立任务计划，再按阶段读取并汇总结果。",
+        );
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("multi-stage task should route through execution chain");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert_eq!(decision.required_tool_chain, vec!["update_plan"]);
+        assert_eq!(
+            decision.route_reason.as_deref(),
+            Some("用户明确要求执行计划，先由 root coordinator 建立计划，再按计划推进。")
+        );
+    }
+
+    #[test]
+    fn incidental_stage_word_does_not_require_plan() {
+        let state = test_state();
+        let request =
+            session_turn_request("修复连续会话第一阶段问题，完成后运行测试并汇总验证结果");
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("structured task should route locally");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert!(
+            !decision
+                .required_tool_chain
+                .iter()
+                .any(|tool| tool == "update_plan"),
+            "描述问题位置的阶段词不应被误判为制定执行计划"
+        );
+    }
+
+    #[test]
+    fn incidental_english_phase_and_step_words_do_not_require_plan() {
+        for text in [
+            "Fix the phase one regression and run the tests",
+            "Fix the failing step parser and summarize the result",
+        ] {
+            let request = session_turn_request(text);
+            assert!(
+                !session_turn_requests_explicit_plan(&request),
+                "incidental phase or step terminology should not require a plan: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_english_plan_phrases_require_plan() {
+        for text in [
+            "Complete this task in phases and verify each result",
+            "Complete this task step by step and report progress",
+            "Create an execution plan with multiple phases",
+        ] {
+            let request = session_turn_request(text);
+            assert!(
+                session_turn_requests_explicit_plan(&request),
+                "explicit plan language should require a plan: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_multi_stage_agent_task_creates_plan_before_agents() {
+        let request = session_turn_request(
+            "请按三阶段执行计划完成多代理验收，先建立计划，再分派代理并汇总结果。",
+        );
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert_eq!(
+            decision.required_tool_chain,
+            vec!["update_plan", "agent_spawn"]
+        );
+    }
+
+    #[test]
     fn explicit_goal_mode_request_stays_on_mainline_even_when_execute_words_are_present() {
         let request = session_turn_request(
             "以长期任务目标模式执行稳定性验收，按步骤读取配置并创建 checkpoint。",
@@ -5615,14 +5892,10 @@ mod tests {
         assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
         assert_eq!(decision.reason_code.as_deref(), Some("tool_request"));
         assert!(decision.execution_goal.is_none());
-
-        let mut classifier_task = classifier_chat_decision();
-        classifier_task.route = SessionTurnRouteDto::Task;
-        classifier_task
-            .task_evidence
-            .push("classifier task".to_string());
-        let normalized = normalize_session_turn_decision(classifier_task, &request);
-        assert!(matches!(normalized.route, SessionTurnRouteDto::Execute));
+        assert_eq!(
+            session_turn_denied_collaboration_tools(&request),
+            ["agent_spawn", "agent_send", "agent_wait"]
+        );
     }
 
     #[test]
@@ -6609,6 +6882,43 @@ mod tests {
             task.input_refs
                 .iter()
                 .any(|value| value.contains(&canonical_external_file.display().to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_stage_task_keeps_plan_and_enforces_no_agent_policy() {
+        let task_store = Arc::new(TaskStore::new());
+        let state = test_state().with_task_store(task_store.clone());
+        let workspace_id = register_workspace(&state, "workspace-no-agent-plan", "no-agent-plan");
+
+        let (status, body) = post_json(
+            state,
+            "/session/turn",
+            serde_json::json!({
+                "workspaceId": workspace_id.to_string(),
+                "text": "请制定并完整执行三阶段只读计划，每完成一个阶段立即更新计划，不派发子代理。",
+                "requestId": "request-no-agent-plan",
+                "userMessageId": "user-no-agent-plan",
+                "placeholderMessageId": "assistant-no-agent-plan"
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["route"], "task");
+        let action_task_id = TaskId::new(
+            body["actionTaskId"]
+                .as_str()
+                .expect("task response should carry actionTaskId"),
+        );
+        let task = task_store
+            .get_task(&action_task_id)
+            .expect("action task should exist");
+        assert_eq!(task.required_tool_chain(), ["update_plan"]);
+        let policy = task.policy_snapshot.expect("task policy should exist");
+        assert_eq!(
+            policy.denied_tools,
+            ["agent_spawn", "agent_send", "agent_wait"]
         );
     }
 

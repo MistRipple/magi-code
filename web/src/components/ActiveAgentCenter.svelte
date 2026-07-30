@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import type {
     AgentProjectionDto,
+    AgentRunActionKind,
     AgentRunProjectionDto,
     TaskStatus,
   } from '../shared/rust-backend-types';
@@ -21,13 +22,20 @@
     ensureAgentRunState,
     fetchAgentRunProjection,
     getAgentRunState,
+    performAgentRunAction,
     selectAgentRun,
   } from '../stores/agent-run-store.svelte';
   import {
+    addToast,
     getEnabledAgents,
     getState,
     messagesState,
   } from '../stores/messages.svelte';
+  import {
+    directIncidentError,
+    incidentErrorDiagnostics,
+    reportIncident,
+  } from '../lib/notifications';
   import { openAgentTab } from '../stores/right-pane.svelte';
   import Icon from './Icon.svelte';
 
@@ -59,7 +67,10 @@
   const currentProjection = $derived(agentRunState.projection);
   const agentGroups = $derived.by(() => groupActiveAgents(pinnedProjection?.agents ?? []));
   const summary = $derived.by(() => buildActiveAgentSummary(agentGroups));
-  const visible = $derived(shouldShowActiveAgentCenter(agentGroups));
+  const runOutcome = $derived.by(() => pinnedProjection?.outcome ?? null);
+  const runFailureSummary = $derived.by(() => pinnedProjection?.failureSummary ?? null);
+  const availableActions = $derived.by(() => pinnedProjection?.availableActions ?? []);
+  const visible = $derived(shouldShowActiveAgentCenter(agentGroups, runOutcome));
 
   function normalizedScopePart(value: string | null | undefined): string {
     return typeof value === 'string' ? value.trim() : '';
@@ -138,6 +149,7 @@
       rootTaskId,
       agents.length,
       dismissedRootTaskId,
+      candidate.outcome,
     )) {
       return;
     }
@@ -238,6 +250,10 @@
   }
 
   function summaryLabel(): string {
+    if (runOutcome === 'recoverable') return i18n.t('activeAgentCenter.summaryRecoverable');
+    if (runOutcome === 'failed') return i18n.t('activeAgentCenter.summaryFailed');
+    if (runOutcome === 'killed') return i18n.t('activeAgentCenter.summaryKilled');
+    if (runOutcome === 'degraded') return i18n.t('activeAgentCenter.summaryDegraded');
     if (summary.attentionCount > 0) {
       return i18n.t('activeAgentCenter.summaryAttention', {
         active: summary.activeCount,
@@ -248,6 +264,90 @@
       return i18n.t('activeAgentCenter.summaryRunning', { count: summary.activeCount });
     }
     return i18n.t('activeAgentCenter.summaryCompleted', { count: summary.completedCount });
+  }
+
+  function recoveryTone(): 'warning' | 'error' | 'muted' {
+    if (runOutcome === 'failed' || runOutcome === 'recoverable') return 'error';
+    if (runOutcome === 'degraded' || (runOutcome === 'active' && runFailureSummary)) return 'warning';
+    return 'muted';
+  }
+
+  function recoveryTitle(): string {
+    if (runOutcome === 'active') return i18n.t('activeAgentCenter.recovery.mainlineHandling');
+    if (runOutcome === 'recoverable') return i18n.t('activeAgentCenter.recovery.recoverable');
+    if (runOutcome === 'failed') return i18n.t('activeAgentCenter.recovery.failed');
+    if (runOutcome === 'degraded') return i18n.t('activeAgentCenter.recovery.degraded');
+    return i18n.t('activeAgentCenter.recovery.killed');
+  }
+
+  function recoveryDescription(): string {
+    if (runOutcome === 'active') return i18n.t('activeAgentCenter.recovery.mainlineHandlingHint');
+    if (runOutcome === 'recoverable') return i18n.t('activeAgentCenter.recovery.recoverableHint');
+    if (runOutcome === 'failed') return i18n.t('activeAgentCenter.recovery.failedHint');
+    if (runOutcome === 'degraded') return i18n.t('activeAgentCenter.recovery.degradedHint');
+    return i18n.t('activeAgentCenter.recovery.killedHint');
+  }
+
+  function shouldShowRecovery(): boolean {
+    return runOutcome === 'recoverable'
+      || runOutcome === 'failed'
+      || runOutcome === 'degraded'
+      || runOutcome === 'killed'
+      || (runOutcome === 'active' && Boolean(runFailureSummary));
+  }
+
+  function actionLabel(action: AgentRunActionKind): string {
+    return i18n.t(`activeAgentCenter.action.${action}`);
+  }
+
+  function actionIcon(action: AgentRunActionKind): IconName {
+    if (action === 'continue') return 'play';
+    if (action === 'restart') return 'restart';
+    return 'eye-slash';
+  }
+
+  async function runAction(action: AgentRunActionKind): Promise<void> {
+    const sessionId = normalizedScopePart(currentSessionId);
+    const rootTaskId = pinnedProjection?.root_task.task_id?.trim() || pinnedRootTaskId;
+    if (!sessionId || !rootTaskId || agentRunState.actionInFlight) return;
+    try {
+      const response = await performAgentRunAction(
+        sessionId,
+        rootTaskId,
+        action,
+        currentWorkspaceId,
+        currentWorkspacePath,
+      );
+      if (!response) return;
+      if (action === 'archive') {
+        dismissedRootTaskId = rootTaskId;
+        pinnedRootTaskId = '';
+        pinnedProjection = null;
+        completedExpanded = false;
+        expanded = false;
+      } else if (action === 'restart') {
+        dismissedRootTaskId = rootTaskId;
+        pinnedRootTaskId = response.newRootTaskId?.trim() || response.rootTaskId.trim();
+        pinnedProjection = agentRunState.projection;
+      } else {
+        pinnedProjection = agentRunState.projection ?? pinnedProjection;
+      }
+      persistState(agentCenterScopeKey());
+      addToast('success', i18n.t(`activeAgentCenter.action.${action}Succeeded`));
+    } catch (error) {
+      const fallback = i18n.t(`activeAgentCenter.action.${action}Failed`);
+      const message = directIncidentError(error, fallback);
+      const diagnostics = incidentErrorDiagnostics(error, message);
+      addToast('error', message);
+      reportIncident(message, {
+        scope: 'session',
+        source: 'active-agent-center',
+        title: fallback,
+        taskId: rootTaskId,
+        failureStage: `agent_run_${action}`,
+        ...diagnostics,
+      });
+    }
   }
 
   async function openAgent(agent: AgentProjectionDto): Promise<void> {
@@ -276,17 +376,6 @@
     }
   }
 
-  function clearAndClose(): void {
-    const scopeKey = agentCenterScopeKey();
-    const rootTaskId = pinnedProjection?.root_task.task_id?.trim() ?? pinnedRootTaskId;
-    if (!scopeKey || !rootTaskId) return;
-    dismissedRootTaskId = rootTaskId;
-    pinnedRootTaskId = '';
-    pinnedProjection = null;
-    completedExpanded = false;
-    expanded = false;
-    persistState(scopeKey);
-  }
 </script>
 
 {#snippet agentRow(agent: AgentProjectionDto)}
@@ -321,7 +410,7 @@
   <div class="active-agent-center" bind:this={centerRoot}>
     <button
       type="button"
-      class:has-attention={summary.attentionCount > 0}
+      class:has-attention={summary.attentionCount > 0 || shouldShowRecovery()}
       class="agent-center-trigger"
       aria-expanded={expanded}
       aria-label={i18n.t('activeAgentCenter.title')}
@@ -349,15 +438,18 @@
             <small>{summaryLabel()}</small>
           </span>
           <span class="panel-actions">
-            <button
-              type="button"
-              class="panel-clear"
-              title={i18n.t('activeAgentCenter.clearAndClose')}
-              onclick={clearAndClose}
-            >
-              <Icon name="trash" size={12} />
-              {i18n.t('activeAgentCenter.clearAndClose')}
-            </button>
+            {#if runOutcome === 'completed' && availableActions.includes('archive')}
+              <button
+                type="button"
+                class="panel-clear"
+                disabled={agentRunState.actionInFlight !== null}
+                title={i18n.t('activeAgentCenter.action.archive')}
+                onclick={() => runAction('archive')}
+              >
+                <Icon name={agentRunState.actionInFlight === 'archive' ? 'loader' : 'eye-slash'} size={12} class={agentRunState.actionInFlight === 'archive' ? 'spinning' : ''} />
+                {i18n.t('activeAgentCenter.action.archive')}
+              </button>
+            {/if}
             <button
               type="button"
               class="panel-close"
@@ -371,6 +463,43 @@
         </header>
 
         <div class="panel-content">
+          {#if shouldShowRecovery()}
+            <section class="run-recovery run-recovery--{recoveryTone()}">
+              <span class="run-recovery-icon">
+                <Icon name={runOutcome === 'active' ? 'alert-triangle' : 'warning'} size={15} />
+              </span>
+              <span class="run-recovery-copy">
+                <strong>{recoveryTitle()}</strong>
+                <span>{recoveryDescription()}</span>
+                {#if runFailureSummary?.message}
+                  <code>{runFailureSummary.message}</code>
+                {/if}
+                {#if agentRunState.actionError}
+                  <code class="run-action-error">{agentRunState.actionError}</code>
+                {/if}
+              </span>
+              {#if availableActions.length > 0}
+                <span class="run-recovery-actions">
+                  {#each availableActions as action (action)}
+                    <button
+                      type="button"
+                      class="run-recovery-action run-recovery-action--{action}"
+                      disabled={agentRunState.actionInFlight !== null}
+                      onclick={() => runAction(action)}
+                    >
+                      <Icon
+                        name={agentRunState.actionInFlight === action ? 'loader' : actionIcon(action)}
+                        size={12}
+                        class={agentRunState.actionInFlight === action ? 'spinning' : ''}
+                      />
+                      {actionLabel(action)}
+                    </button>
+                  {/each}
+                </span>
+              {/if}
+            </section>
+          {/if}
+
           {#if agentGroups.running.length > 0}
             <section class="agent-group">
               <div class="group-heading">
@@ -565,6 +694,108 @@
     overflow-y: auto;
     padding: 6px;
     scrollbar-width: thin;
+  }
+
+  .run-recovery {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 8px;
+    margin-bottom: 7px;
+    padding: 9px;
+    border: 1px solid color-mix(in srgb, var(--foreground-muted) 18%, transparent);
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--surface-raised) 88%, transparent);
+  }
+
+  .run-recovery--warning {
+    border-color: color-mix(in srgb, var(--warning) 32%, transparent);
+    background: color-mix(in srgb, var(--warning) 7%, var(--surface-raised));
+  }
+
+  .run-recovery--error {
+    border-color: color-mix(in srgb, var(--error) 32%, transparent);
+    background: color-mix(in srgb, var(--error) 7%, var(--surface-raised));
+  }
+
+  .run-recovery-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 25px;
+    height: 25px;
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, currentColor 10%, transparent);
+    color: var(--foreground-muted);
+  }
+
+  .run-recovery--warning .run-recovery-icon { color: var(--warning); }
+  .run-recovery--error .run-recovery-icon { color: var(--error); }
+
+  .run-recovery-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  .run-recovery-copy strong {
+    color: var(--foreground);
+    font-size: var(--text-sm);
+    font-weight: var(--font-semibold);
+  }
+
+  .run-recovery-copy > span,
+  .run-recovery-copy code {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    line-height: 1.45;
+  }
+
+  .run-recovery-copy code {
+    display: block;
+    overflow-wrap: anywhere;
+    font-family: var(--font-mono);
+  }
+
+  .run-recovery-copy .run-action-error {
+    color: var(--error);
+  }
+
+  .run-recovery-actions {
+    grid-column: 2;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 2px;
+  }
+
+  .run-recovery-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-height: 27px;
+    padding: 0 8px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    background: var(--surface-raised);
+    color: var(--foreground);
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+
+  .run-recovery-action:hover:not(:disabled) {
+    border-color: var(--border-strong);
+    background: var(--surface-hover);
+  }
+
+  .run-recovery-action--archive {
+    color: var(--foreground-muted);
+  }
+
+  .run-recovery-action:disabled,
+  .panel-clear:disabled {
+    cursor: default;
+    opacity: 0.55;
   }
 
   .agent-group + .agent-group {

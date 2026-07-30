@@ -15,6 +15,11 @@ const STALE_SESSION_ID = 'session-agent-run-stale';
 const STALE_ROOT_TASK_ID = 'task-root-agent-run-stale';
 const SLOW_SESSION_ID = 'session-agent-run-slow';
 const SLOW_ROOT_TASK_ID = 'task-root-agent-run-slow';
+const ACTION_SESSION_ID = 'session-agent-run-action';
+const ACTION_ROOT_TASK_ID = 'task-root-agent-run-action';
+const RESTARTED_ROOT_TASK_ID = 'task-root-agent-run-restarted';
+const ARCHIVE_SESSION_ID = 'session-agent-run-archive';
+const ARCHIVE_ROOT_TASK_ID = 'task-root-agent-run-archive';
 let releaseSlowProjection = null;
 let hasDelayedSlowProjection = false;
 
@@ -90,6 +95,9 @@ function projectionPayload(rootTaskId) {
     groups: [],
     active_task_ids: [rootTaskId],
     updated_at: 1780390000000,
+    outcome: 'active',
+    availableActions: [],
+    failureSummary: null,
   };
 }
 
@@ -107,8 +115,8 @@ function installBrowserGlobals() {
   globalThis.localStorage = globalThis.window.localStorage;
 }
 
-function installFetchStub(fetches, terminalAgentRunRootIds) {
-  globalThis.fetch = async (url) => {
+function installFetchStub(fetches, terminalAgentRunRootIds, actionRequests) {
+  globalThis.fetch = async (url, init = {}) => {
     const parsed = new URL(String(url));
     if (parsed.pathname.startsWith('/api/agent-runs/projection/')) {
       fetches.push(parsed);
@@ -123,6 +131,43 @@ function installFetchStub(fetches, terminalAgentRunRootIds) {
         });
       }
       return jsonResponse(projectionPayload(rootTaskId));
+    }
+    if (parsed.pathname === '/api/agent-runs/action') {
+      const payload = JSON.parse(String(init.body || '{}'));
+      actionRequests.push(payload);
+      if (payload.action === 'restart') {
+        return jsonResponse({
+          action: 'restart',
+          operationId: payload.operationId,
+          sessionId: payload.sessionId,
+          workspaceId: payload.workspaceId,
+          workspacePath: payload.workspacePath,
+          rootTaskId: RESTARTED_ROOT_TASK_ID,
+          oldRootTaskId: payload.taskId,
+          newRootTaskId: RESTARTED_ROOT_TASK_ID,
+          restarted: true,
+        });
+      }
+      if (payload.action === 'archive') {
+        return jsonResponse({
+          action: 'archive',
+          operationId: payload.operationId,
+          sessionId: payload.sessionId,
+          workspaceId: payload.workspaceId,
+          workspacePath: payload.workspacePath,
+          rootTaskId: payload.taskId,
+          archived: true,
+        });
+      }
+      return jsonResponse({
+        action: 'continue',
+        operationId: payload.operationId,
+        sessionId: payload.sessionId,
+        workspaceId: payload.workspaceId,
+        workspacePath: payload.workspacePath,
+        rootTaskId: payload.taskId,
+        status: 'continued',
+      });
     }
     return new Response('not found', { status: 404 });
   };
@@ -163,7 +208,8 @@ function delay(ms) {
 installBrowserGlobals();
 const agentRunFetches = [];
 const terminalAgentRunRootIds = new Set();
-installFetchStub(agentRunFetches, terminalAgentRunRootIds);
+const actionRequests = [];
+installFetchStub(agentRunFetches, terminalAgentRunRootIds, actionRequests);
 
 await withGoldenViteServer(async (server) => {
   const bridgeRuntime = await server.ssrLoadModule('/src/shared/bridges/bridge-runtime.ts');
@@ -339,9 +385,70 @@ await withGoldenViteServer(async (server) => {
     1,
     'overlapping agent projection refreshes must not issue duplicate requests',
   );
+  const switchedProjection = agentRunStore.fetchAgentRunProjection(
+    SLOW_SESSION_ID,
+    RESTARTED_ROOT_TASK_ID,
+    WORKSPACE_ID,
+    WORKSPACE_PATH,
+  );
+  await delay(0);
+  assert.equal(
+    agentRunFetches.filter((url) => url.pathname.endsWith(RESTARTED_ROOT_TASK_ID)).length,
+    1,
+    '切换 root attempt 必须立即启动新投影请求，不能被旧 root 的 loading 状态阻塞',
+  );
   releaseSlowProjection();
-  await Promise.all([firstSlowProjection, secondSlowProjection]);
+  await Promise.all([firstSlowProjection, secondSlowProjection, switchedProjection]);
   await delay(50);
+  const switchedState = agentRunStore.getAgentRunState(SLOW_SESSION_ID, WORKSPACE_ID);
+  assert.equal(switchedState.rootTaskId, RESTARTED_ROOT_TASK_ID);
+  assert.equal(switchedState.loading, false, '旧 root 请求结束后不能把新 root 留在永久 loading 状态');
+
+  agentRunStore.activateAgentRunSession(ACTION_SESSION_ID, WORKSPACE_ID, WORKSPACE_PATH);
+  await agentRunStore.fetchAgentRunProjection(
+    ACTION_SESSION_ID,
+    ACTION_ROOT_TASK_ID,
+    WORKSPACE_ID,
+    WORKSPACE_PATH,
+  );
+  const restartResponse = await agentRunStore.performAgentRunAction(
+    ACTION_SESSION_ID,
+    ACTION_ROOT_TASK_ID,
+    'restart',
+    WORKSPACE_ID,
+    WORKSPACE_PATH,
+  );
+  assert.equal(restartResponse?.newRootTaskId, RESTARTED_ROOT_TASK_ID);
+  assert.equal(
+    agentRunStore.getAgentRunState(ACTION_SESSION_ID, WORKSPACE_ID).rootTaskId,
+    RESTARTED_ROOT_TASK_ID,
+    '重新执行必须切换到新 root attempt，而不是复用或覆盖失败任务树',
+  );
+  assert.equal(
+    actionRequests.at(-1)?.operationId?.startsWith('agent-run-restart-'),
+    true,
+    '统一动作请求必须携带幂等 operationId',
+  );
+
+  agentRunStore.activateAgentRunSession(ARCHIVE_SESSION_ID, WORKSPACE_ID, WORKSPACE_PATH);
+  await agentRunStore.fetchAgentRunProjection(
+    ARCHIVE_SESSION_ID,
+    ARCHIVE_ROOT_TASK_ID,
+    WORKSPACE_ID,
+    WORKSPACE_PATH,
+  );
+  await agentRunStore.performAgentRunAction(
+    ARCHIVE_SESSION_ID,
+    ARCHIVE_ROOT_TASK_ID,
+    'archive',
+    WORKSPACE_ID,
+    WORKSPACE_PATH,
+  );
+  assert.equal(
+    agentRunStore.getAgentRunState(ARCHIVE_SESSION_ID, WORKSPACE_ID).rootTaskId,
+    null,
+    '归档成功后才允许移除当前面板状态',
+  );
 
   agentRunStore.setAgentRunBridgeConnected(false);
   agentRunStore.startAutoRefresh(30);

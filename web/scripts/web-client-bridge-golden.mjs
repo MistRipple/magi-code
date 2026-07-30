@@ -614,12 +614,12 @@ function contextUsageEnvelope() {
   };
 }
 
-function completedEnvelope() {
+function completedTurnItemEnvelope() {
   const canonicalTurn = completedCanonicalTurn();
   const canonicalItem = completedCanonicalAssistantItem();
   return {
-    event_id: `event-session-turn-completed-${ACCEPTED_AT}`,
-    event_type: 'session.turn.completed',
+    event_id: `event-session-turn-item-completed-${ACCEPTED_AT}`,
+    event_type: 'session.turn.item',
     category: 'domain',
     occurred_at: ACCEPTED_AT + 2000,
     sequence: 4,
@@ -850,7 +850,7 @@ await withGoldenViteServer(async (server) => {
   const bootstrapRequestsBeforeTerminalEvent = bootstrapRequestCount;
   summaryUpdatedAt = ACCEPTED_AT + 2_000;
   terminalPublished = true;
-  recoveredStream.onmessage?.({ data: JSON.stringify(completedEnvelope()) });
+  recoveredStream.onmessage?.({ data: JSON.stringify(completedTurnItemEnvelope()) });
   await waitFor(
     () => messagesStore.messagesState.isProcessing === false,
     'terminal session turn event with canonical payload must settle processing without waiting for recovery',

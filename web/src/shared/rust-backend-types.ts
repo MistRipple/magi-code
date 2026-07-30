@@ -1569,6 +1569,7 @@ export interface AgentProjectionDto {
   displayName: string;
   goal: string;
   role: string;
+  capabilityIds: string[];
   engineId?: string | null;
   model?: string | null;
   modelSource: 'engine' | 'inherited_orchestrator' | 'unconfigured' | string;
@@ -1588,6 +1589,47 @@ export interface AgentProjectionDto {
   responseDurationMs?: number | null;
   updatedAt: number;
   result?: AgentProjectionResultDto | null;
+  failureMessage?: string | null;
+}
+
+export type AgentRunOutcome =
+  | 'active'
+  | 'completed'
+  | 'degraded'
+  | 'recoverable'
+  | 'failed'
+  | 'killed';
+
+export type AgentRunActionKind = 'continue' | 'restart' | 'archive';
+
+export interface AgentRunFailureSummaryDto {
+  rootFailed: boolean;
+  failedAgentCount: number;
+  message?: string | null;
+  requiresUserAction: boolean;
+}
+
+export interface AgentRunActionRequestDto {
+  action: AgentRunActionKind;
+  operationId: string;
+  taskId: string;
+  sessionId: string;
+  workspaceId?: string;
+  workspacePath?: string;
+}
+
+export interface AgentRunActionResponseDto {
+  action: AgentRunActionKind;
+  operationId: string;
+  sessionId: string;
+  workspaceId: string;
+  workspacePath?: string;
+  rootTaskId: string;
+  oldRootTaskId?: string;
+  newRootTaskId?: string;
+  status?: string;
+  archived?: boolean;
+  restarted?: boolean;
 }
 
 export interface ProgressSummaryDto {
@@ -1621,4 +1663,7 @@ export interface AgentRunProjectionDto {
   has_recoverable_chain: boolean;
   recoverable_branch_count: number;
   agents: AgentProjectionDto[];
+  outcome: AgentRunOutcome;
+  availableActions: AgentRunActionKind[];
+  failureSummary?: AgentRunFailureSummaryDto | null;
 }

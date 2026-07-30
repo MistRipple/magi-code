@@ -145,6 +145,11 @@ fn task_serialization_roundtrip() {
         }),
         executor_binding: Some(
             crate::TaskExecutorBinding::for_role("developer")
+                .with_capability_ids(vec![
+                    "frontend".to_string(),
+                    "frontend".to_string(),
+                    " security ".to_string(),
+                ])
                 .with_parallelism_group(Some("group-a".to_string())),
         ),
         knowledge_refs: Vec::new(),
@@ -168,6 +173,10 @@ fn task_serialization_roundtrip() {
     assert_eq!(deserialized.dependency_ids.len(), 1);
     assert!(deserialized.policy_snapshot.is_some());
     assert!(deserialized.executor_binding.is_some());
+    assert_eq!(
+        deserialized.executor_binding_capability_ids(),
+        ["frontend", "security"]
+    );
     assert!(matches!(
         deserialized.runtime_payload,
         TaskRuntimePayload::None

@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 use magi_agent_role::AgentRoleRegistry;
 use magi_bridge_client::ModelBridgeClient;
 use magi_core::{
-    AccessProfile, DomainError, ExecutionOwnership, MissionId, SessionId, TaskExecutionTarget,
-    TaskExecutorBinding, TaskId, TaskKind, TaskStatus, TaskTier, UtcMillis, WorkerId, WorkspaceId,
+    AccessProfile, DomainError, ExecutionOwnership, MissionId, PlanItemId, SessionId,
+    TaskExecutionTarget, TaskExecutorBinding, TaskId, TaskKind, TaskStatus, TaskTier, UtcMillis,
+    WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, InMemoryEventBus, task_events};
 use magi_orchestrator::{
@@ -87,6 +88,7 @@ pub struct DispatchSubmissionRequest {
     pub placeholder_message_id: Option<String>,
     pub replace_turn_id: Option<String>,
     pub required_tool_chain: Vec<String>,
+    pub denied_tools: Vec<String>,
     pub turn_origin: DispatchTurnOrigin,
 }
 
@@ -194,6 +196,7 @@ fn build_task_policy(
     access_profile: AccessProfile,
     context_references: &[SessionContextReference],
     workspace_root_path: Option<&Path>,
+    denied_tools: Vec<String>,
 ) -> magi_core::TaskPolicy {
     let reference_policy = session_context_reference_policy(
         context_references,
@@ -206,7 +209,7 @@ fn build_task_policy(
         autonomy_level: "Autonomous".to_string(),
         access_profile,
         allowed_tools: Vec::new(),
-        denied_tools: Vec::new(),
+        denied_tools,
         allowed_paths: reference_policy.allowed_paths,
         denied_paths: Vec::new(),
         read_only_paths: reference_policy.read_only_paths,
@@ -234,6 +237,8 @@ struct DispatchTaskInput<'a> {
     context_references: &'a [SessionContextReference],
     workspace_root_path: Option<&'a Path>,
     required_tool_chain: Vec<String>,
+    denied_tools: Vec<String>,
+    plan_item_id: Option<PlanItemId>,
 }
 
 fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
@@ -250,10 +255,13 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         context_references,
         workspace_root_path,
         required_tool_chain,
+        denied_tools,
+        plan_item_id,
     } = input;
     let executor_binding = TaskExecutorBinding::for_role(target_role)
         .with_active_skill_id(active_skill_id.map(str::to_string))
-        .with_required_tool_chain(required_tool_chain);
+        .with_required_tool_chain(required_tool_chain)
+        .with_plan_item_id(plan_item_id);
 
     magi_core::Task {
         task_id: task_id.clone(),
@@ -271,6 +279,7 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
             access_profile,
             context_references,
             workspace_root_path,
+            denied_tools,
         )),
         executor_binding: Some(executor_binding),
         knowledge_refs: Vec::new(),
@@ -339,6 +348,9 @@ pub fn run_dispatch_submission(
             "role {target_role} 不支持 local_agent 任务"
         )));
     }
+    let plan_store =
+        magi_plan::PlanStore::from_store(runtime.session_store, request.session_id.clone());
+    let plan_item_id = plan_store.active_item_id();
     let task = make_dispatch_task(DispatchTaskInput {
         task_id: act_task_id.clone(),
         mission_id: mission_id.clone(),
@@ -352,8 +364,21 @@ pub fn run_dispatch_submission(
         context_references: &request.context_references,
         workspace_root_path: runtime.workspace_root_path,
         required_tool_chain: request.required_tool_chain.clone(),
+        denied_tools: request.denied_tools.clone(),
+        plan_item_id: plan_item_id.clone(),
     });
     runtime.task_store.insert_task(task);
+    if let Some(plan_item_id) = plan_item_id {
+        match plan_store.bind_task(act_task_id.clone(), plan_item_id) {
+            Ok(_) => {}
+            Err(error) => {
+                let _ = runtime.task_store.remove_task(&act_task_id);
+                return Err(DispatchSubmissionRunError::Internal(format!(
+                    "将主线任务绑定到当前计划阶段失败: {error}"
+                )));
+            }
+        }
+    }
     let event =
         task_events::task_submission_created_event(mission_id.as_str(), act_task_id.as_str(), 1)
             .with_context(EventContext {
@@ -581,6 +606,15 @@ pub fn accept_dispatch_submission(
             Ok(superseded_turn) => superseded_turn,
             Err(error) => {
                 cleanup_rejected_dispatch(task_store, execution_registry, &graph);
+                let plan_store =
+                    magi_plan::PlanStore::from_store(session_store, request.session_id.clone());
+                if let Err(unbind_error) = plan_store.unbind_task(&graph.root_task_id) {
+                    tracing::warn!(
+                        task_id = %graph.root_task_id,
+                        error = %unbind_error,
+                        "拒绝的派发清理计划任务绑定失败"
+                    );
+                }
                 return Err(DispatchSubmissionAcceptError::from_store_error(error));
             }
         };
@@ -691,6 +725,7 @@ mod tests {
             placeholder_message_id: None,
             replace_turn_id: None,
             required_tool_chain: Vec::new(),
+            denied_tools: Vec::new(),
             turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
@@ -772,6 +807,7 @@ mod tests {
             placeholder_message_id: None,
             replace_turn_id: None,
             required_tool_chain: Vec::new(),
+            denied_tools: Vec::new(),
             turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
@@ -818,6 +854,89 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_binds_root_task_to_current_plan_stage() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-plan-root-binding");
+        session_store
+            .create_session(session_id.clone(), "plan root binding")
+            .expect("session should be creatable");
+        let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
+        let plan = plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![
+                    magi_plan::UpdatePlanItemInput {
+                        item_id: Some("implement".to_string()),
+                        step: "完成实现".to_string(),
+                        status: magi_core::PlanItemStatus::InProgress,
+                    },
+                    magi_plan::UpdatePlanItemInput {
+                        item_id: Some("verify".to_string()),
+                        step: "完成验证".to_string(),
+                        status: magi_core::PlanItemStatus::Pending,
+                    },
+                ],
+            })
+            .expect("plan should create");
+        let request = DispatchSubmissionRequest {
+            accepted_at: UtcMillis(3_100),
+            session_id: session_id.clone(),
+            workspace_id: Some(WorkspaceId::new("workspace-plan-root-binding")),
+            entry_id: "timeline-plan-root-binding".to_string(),
+            timeline_message: "继续计划".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            created_session: false,
+            mission_title: "继续计划".to_string(),
+            task_title: "继续计划".to_string(),
+            trimmed_text: Some("继续计划".to_string()),
+            execution_goal: Some("完成当前计划全部阶段".to_string()),
+            task_tier: TaskTier::ExecutionChain,
+            access_profile: AccessProfile::FullAccess,
+            skill_name: None,
+            goal_mode: false,
+            target_role: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            replace_turn_id: None,
+            required_tool_chain: Vec::new(),
+            denied_tools: Vec::new(),
+            turn_origin: DispatchTurnOrigin::User,
+        };
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: None,
+        };
+
+        let graph = run_dispatch_submission(&runtime, &request).expect("dispatch should build");
+        let root_task = task_store
+            .get_task(&graph.root_task_id)
+            .expect("root task should exist");
+        assert_eq!(root_task.plan_item_id(), Some(&plan.items[0].item_id));
+        let bound_plan = plan_store.snapshot().expect("plan should remain");
+        assert_eq!(
+            bound_plan.task_bindings.get(&graph.root_task_id),
+            Some(&plan.items[0].item_id)
+        );
+    }
+
+    #[test]
     fn selected_skill_does_not_reassign_mainline_coordinator_role() {
         let session_store = SessionStore::new();
         let task_store = TaskStore::new();
@@ -854,6 +973,7 @@ mod tests {
             placeholder_message_id: None,
             replace_turn_id: None,
             required_tool_chain: Vec::new(),
+            denied_tools: Vec::new(),
             turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
@@ -923,6 +1043,7 @@ mod tests {
             placeholder_message_id: None,
             replace_turn_id: None,
             required_tool_chain: Vec::new(),
+            denied_tools: Vec::new(),
             turn_origin: DispatchTurnOrigin::User,
         };
         let runtime = DispatchSubmissionRuntime {
@@ -998,6 +1119,7 @@ mod tests {
             placeholder_message_id: None,
             replace_turn_id: None,
             required_tool_chain: Vec::new(),
+            denied_tools: Vec::new(),
             turn_origin: DispatchTurnOrigin::User,
         };
         let workspace_root = std::path::PathBuf::from("/tmp/workspace");
@@ -1082,6 +1204,7 @@ mod tests {
             placeholder_message_id: None,
             replace_turn_id: None,
             required_tool_chain: vec!["get_goal".to_string()],
+            denied_tools: Vec::new(),
             turn_origin: DispatchTurnOrigin::GoalContinuation,
         };
         let runtime = DispatchSubmissionRuntime {

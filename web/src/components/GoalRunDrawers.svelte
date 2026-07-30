@@ -26,7 +26,9 @@
 
   let goalRequestScope = '';
   let goalDrawerExpanded = $state(false);
-  let planDrawerExpanded = $state(true);
+  let planDrawerExpanded = $state(false);
+  let observedPlanId = '';
+  let observedActivePlanItemId = '';
   let isEditingGoal = $state(false);
   let goalObjectiveDraft = $state('');
   let goalActionLoading = $state<'save' | 'pause' | 'resume' | 'clear' | null>(null);
@@ -65,21 +67,36 @@
   const hasCurrentPlan = $derived(currentPlanItems.length > 0);
   const currentPlanPaused = $derived(currentPlan?.state === 'paused');
   const planSummary = $derived.by(() => buildPlanSummary(currentPlanItems));
+  const currentPlanBlocked = $derived(planSummary.blocked > 0);
   const planProgressPercent = $derived.by(() => {
     if (planSummary.total <= 0) return 0;
     return Math.min(100, Math.max(0, Math.round((planSummary.completed / planSummary.total) * 100)));
   });
   const planFinished = $derived(
     planSummary.total > 0
-    && (planSummary.completed === planSummary.total || currentGoal?.status === 'complete'),
+    && (
+      planSummary.completed === planSummary.total
+      || currentPlan?.state === 'completed'
+      || currentPlan?.state === 'canceled'
+      || currentGoal?.status === 'complete'
+    ),
   );
-  let planWasFinished = false;
-
   $effect(() => {
-    if (planFinished && !planWasFinished) {
+    const planId = currentPlan?.planId ?? '';
+    const activeItemId = currentPlanItems.find((item) => item.status === 'in_progress')?.itemId ?? '';
+    if (!planId) {
+      observedPlanId = '';
+      observedActivePlanItemId = '';
       planDrawerExpanded = false;
+      return;
     }
-    planWasFinished = planFinished;
+    if (planFinished) {
+      planDrawerExpanded = false;
+    } else if (observedPlanId !== planId || observedActivePlanItemId !== activeItemId) {
+      planDrawerExpanded = true;
+    }
+    observedPlanId = planId;
+    observedActivePlanItemId = activeItemId;
   });
 
   function createClient(): RustDaemonClient {
@@ -188,11 +205,15 @@
   }
 
   function goalCanPause(goal: SessionGoalDto): boolean {
-    return goal.status === 'active' || goal.status === 'usage_limited' || goal.status === 'budget_limited';
+    return !currentPlanPaused
+      && !currentPlanBlocked
+      && (goal.status === 'active' || goal.status === 'usage_limited' || goal.status === 'budget_limited');
   }
 
   function goalCanResume(goal: SessionGoalDto): boolean {
-    return goal.status === 'paused' || goal.status === 'blocked';
+    return goal.status === 'paused'
+      || goal.status === 'blocked'
+      || (currentPlanPaused && currentPlanBlocked);
   }
 
   function goalBudgetLabel(tokensUsed: number, tokenBudget?: number | null): string {
@@ -369,14 +390,29 @@
               total: planSummary.total,
             })}
           </span>
-          {#if currentPlanPaused}
+          {#if currentPlanBlocked}
+            <span class="plan-running plan-running--blocked">{i18n.t('goalPanel.plan.state.blocked')}</span>
+          {:else if currentPlanPaused}
             <span class="plan-running">{i18n.t('goalPanel.plan.state.paused')}</span>
           {:else if planSummary.running > 0}
             <span class="plan-running">{i18n.t('goalPanel.plan.runningCount', { count: planSummary.running })}</span>
           {/if}
           <Icon name={planDrawerExpanded ? 'chevron-down' : 'chevron-right'} size={13} class="drawer-chevron" />
         </button>
-        {#if planSummary.total > 0 && planSummary.completed === planSummary.total}
+        {#if currentGoal && goalCanResume(currentGoal)}
+          <div class="goal-actions">
+            <button
+              type="button"
+              class="plan-resume-action"
+              disabled={goalActionLoading !== null}
+              onclick={resumeGoal}
+              title={i18n.t('goalPanel.action.resumeBlockedPlan')}
+            >
+              <Icon name={goalActionLoading === 'resume' ? 'loader' : 'play'} size={12} class={goalActionLoading === 'resume' ? 'spinning' : ''} />
+              {i18n.t('goalPanel.action.resumeBlockedPlan')}
+            </button>
+          </div>
+        {:else if planSummary.total > 0 && planSummary.completed === planSummary.total}
           <div class="goal-actions">
             <button
               type="button"
@@ -393,6 +429,12 @@
       </div>
 
       {#if planDrawerExpanded}
+        {#if currentPlanBlocked}
+          <div class="plan-blocked-hint">
+            <Icon name="alert-triangle" size={14} />
+            <span>{i18n.t('goalPanel.plan.blockedHint')}</span>
+          </div>
+        {/if}
         <div class="run-progress-bar plan-progress-bar" aria-hidden="true">
           <span style="width: {planProgressPercent}%"></span>
         </div>
@@ -729,6 +771,29 @@
     flex: 0 0 auto;
   }
 
+  .plan-resume-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-height: 26px;
+    padding: 0 8px;
+    border: 1px solid color-mix(in srgb, var(--warning) 28%, var(--border));
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--warning) 8%, transparent);
+    color: color-mix(in srgb, var(--warning) 84%, var(--foreground));
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+
+  .plan-resume-action:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+  }
+
+  .plan-resume-action:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
   .icon-action {
     display: inline-flex;
     align-items: center;
@@ -889,6 +954,28 @@
     font-size: var(--text-2xs);
     font-weight: var(--font-medium);
     white-space: nowrap;
+  }
+
+  .plan-running--blocked {
+    color: var(--warning);
+  }
+
+  .plan-blocked-hint {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    padding: 8px 9px;
+    border: 1px solid color-mix(in srgb, var(--warning) 26%, transparent);
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--warning) 7%, transparent);
+    color: color-mix(in srgb, var(--warning) 78%, var(--foreground));
+    font-size: var(--text-xs);
+    line-height: 1.45;
+  }
+
+  .plan-blocked-hint :global(svg) {
+    flex: 0 0 auto;
+    margin-top: 1px;
   }
 
   .run-progress-bar {

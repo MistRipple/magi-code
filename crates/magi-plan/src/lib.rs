@@ -25,6 +25,12 @@ pub struct PlanStore {
     session_id: SessionId,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanTaskAuthority {
+    PhaseOwner,
+    Supporting,
+}
+
 impl PlanStore {
     pub fn new(session_store: Arc<SessionStore>, session_id: SessionId) -> Self {
         Self {
@@ -54,6 +60,14 @@ impl PlanStore {
     }
 
     pub fn update(&self, input: UpdatePlanInput) -> Result<SessionPlan, PlanUpdateError> {
+        self.update_for_task(input, None)
+    }
+
+    pub fn update_for_task(
+        &self,
+        input: UpdatePlanInput,
+        task_id: Option<&TaskId>,
+    ) -> Result<SessionPlan, PlanUpdateError> {
         validate_language(&input.language)?;
         let current = self.snapshot();
         validate_plan_items(&input.plan, current.is_none())?;
@@ -71,7 +85,7 @@ impl PlanStore {
             .iter()
             .map(|item| item.item_id.clone())
             .collect::<HashSet<_>>();
-        let task_bindings: HashMap<TaskId, PlanItemId> = current
+        let mut task_bindings: HashMap<TaskId, PlanItemId> = current
             .as_ref()
             .map(|plan| {
                 plan.task_bindings
@@ -82,7 +96,7 @@ impl PlanStore {
             })
             .unwrap_or_default();
         let retained_task_ids = task_bindings.keys().cloned().collect::<HashSet<_>>();
-        let task_statuses: HashMap<TaskId, TaskStatus> = current
+        let mut task_statuses: HashMap<TaskId, TaskStatus> = current
             .as_ref()
             .map(|plan| {
                 plan.task_statuses
@@ -92,6 +106,18 @@ impl PlanStore {
                     .collect()
             })
             .unwrap_or_default();
+        if let Some(task_id) = task_id
+            && let Some(item_id) = items
+                .iter()
+                .find(|item| item.status == PlanItemStatus::InProgress)
+                .map(|item| item.item_id.clone())
+        {
+            let binding_changed = task_bindings.get(task_id) != Some(&item_id);
+            task_bindings.insert(task_id.clone(), item_id);
+            if binding_changed {
+                task_statuses.insert(task_id.clone(), TaskStatus::Pending);
+            }
+        }
         let plan = SessionPlan {
             plan_id,
             session_id: self.session_id.clone(),
@@ -175,6 +201,9 @@ impl PlanStore {
         if item.status != PlanItemStatus::InProgress {
             return Err(PlanUpdateError::ItemNotActive(item_id.to_string()));
         }
+        if plan.task_bindings.get(&task_id) == Some(&item_id) {
+            return Ok(plan);
+        }
         let expected_revision = plan.revision;
         plan.task_bindings.insert(task_id.clone(), item_id);
         plan.task_statuses.insert(task_id, TaskStatus::Pending);
@@ -183,28 +212,88 @@ impl PlanStore {
             .map_err(|error| PlanUpdateError::Store(error.to_string()))
     }
 
+    pub fn unbind_task(&self, task_id: &TaskId) -> Result<bool, PlanUpdateError> {
+        let Some(mut plan) = self.snapshot() else {
+            return Ok(false);
+        };
+        let removed = plan.task_bindings.remove(task_id).is_some();
+        plan.task_statuses.remove(task_id);
+        if !removed {
+            return Ok(false);
+        }
+        let expected_revision = plan.revision;
+        self.session_store
+            .upsert_plan(&self.session_id, plan, Some(expected_revision))
+            .map(|_| true)
+            .map_err(|error| PlanUpdateError::Store(error.to_string()))
+    }
+
+    pub fn active_item_id(&self) -> Option<PlanItemId> {
+        self.snapshot().and_then(|plan| {
+            plan.items
+                .into_iter()
+                .find(|item| item.status == PlanItemStatus::InProgress)
+                .map(|item| item.item_id)
+        })
+    }
+
+    pub fn requires_execution_follow_up(&self) -> bool {
+        self.snapshot().is_some_and(|plan| {
+            plan.state == PlanState::Active
+                && plan.items.iter().any(|item| {
+                    matches!(
+                        item.status,
+                        PlanItemStatus::Pending | PlanItemStatus::InProgress
+                    )
+                })
+        })
+    }
+
+    pub fn has_blocked_item(&self) -> bool {
+        self.snapshot().is_some_and(|plan| {
+            plan.items
+                .iter()
+                .any(|item| item.status == PlanItemStatus::Blocked)
+        })
+    }
+
+    pub fn render_execution_follow_up_prompt(&self) -> Option<String> {
+        if !self.requires_execution_follow_up() {
+            return None;
+        }
+        let plan_context = self.render_for_prompt()?;
+        Some(format!(
+            "当前执行计划仍未完成，不能输出最终答复。\n\n{plan_context}\n\n请继续执行当前 in_progress 阶段；完成当前阶段后，使用 update_plan 将其标记为 completed，并将下一个真实要执行的阶段设为 in_progress。只有所有阶段都完成、阻塞或被用户取消后，才允许结束本轮。不要用文字说明代替实际执行，也不要把未执行阶段直接标记为 completed。"
+        ))
+    }
+
     pub fn sync_task_status(
         &self,
         task_id: &TaskId,
         status: TaskStatus,
     ) -> Result<Option<SessionPlan>, PlanUpdateError> {
+        self.sync_task_status_with_authority(task_id, status, PlanTaskAuthority::PhaseOwner)
+    }
+
+    pub fn sync_task_status_with_authority(
+        &self,
+        task_id: &TaskId,
+        status: TaskStatus,
+        authority: PlanTaskAuthority,
+    ) -> Result<Option<SessionPlan>, PlanUpdateError> {
         let Some(mut plan) = self.snapshot() else {
             return Ok(None);
         };
         let Some(item_id) = plan.task_bindings.get(task_id).cloned() else {
-            return Ok(Some(plan));
+            return Ok(None);
         };
         let expected_revision = plan.revision;
         plan.task_statuses.insert(task_id.clone(), status);
-        let bound_statuses = plan
-            .task_bindings
-            .iter()
-            .filter(|(_, candidate_item_id)| **candidate_item_id == item_id)
-            .filter_map(|(bound_task_id, _)| plan.task_statuses.get(bound_task_id).copied())
-            .collect::<Vec<_>>();
-        let next_status = aggregate_task_statuses(&bound_statuses);
-        if let Some(item) = plan.items.iter_mut().find(|item| item.item_id == item_id) {
-            item.status = next_status;
+        if authority == PlanTaskAuthority::PhaseOwner
+            && let Some(item) = plan.items.iter_mut().find(|item| item.item_id == item_id)
+            && item.status != PlanItemStatus::Blocked
+        {
+            item.status = plan_item_status_from_owner_task(status);
         }
         if plan.state != PlanState::Paused {
             if !plan
@@ -260,24 +349,13 @@ impl PlanStore {
     }
 }
 
-fn aggregate_task_statuses(statuses: &[TaskStatus]) -> PlanItemStatus {
-    if statuses.contains(&TaskStatus::Failed) {
-        return PlanItemStatus::Blocked;
+fn plan_item_status_from_owner_task(status: TaskStatus) -> PlanItemStatus {
+    match status {
+        TaskStatus::Pending | TaskStatus::Running => PlanItemStatus::InProgress,
+        TaskStatus::Completed => PlanItemStatus::Completed,
+        TaskStatus::Failed => PlanItemStatus::Blocked,
+        TaskStatus::Killed => PlanItemStatus::Blocked,
     }
-    if !statuses.is_empty()
-        && statuses
-            .iter()
-            .all(|status| *status == TaskStatus::Completed)
-    {
-        return PlanItemStatus::Completed;
-    }
-    if !statuses.is_empty() && statuses.iter().all(|status| *status == TaskStatus::Killed) {
-        return PlanItemStatus::Canceled;
-    }
-    if !statuses.is_empty() {
-        return PlanItemStatus::InProgress;
-    }
-    PlanItemStatus::Pending
 }
 
 fn derive_plan_state(items: &[PlanItem]) -> Result<PlanState, PlanUpdateError> {
@@ -340,8 +418,19 @@ pub struct UpdatePlanItemInput {
 pub fn parse_update_plan_arguments(
     arguments_json: &str,
 ) -> Result<UpdatePlanInput, PlanUpdateError> {
-    serde_json::from_str(arguments_json)
-        .map_err(|error| PlanUpdateError::InvalidJson(error.to_string()))
+    let mut input = serde_json::from_str::<UpdatePlanInput>(arguments_json)
+        .map_err(|error| PlanUpdateError::InvalidJson(error.to_string()))?;
+    input.plan_id = normalize_optional_id(input.plan_id);
+    for item in &mut input.plan {
+        item.item_id = normalize_optional_id(item.item_id.take());
+    }
+    Ok(input)
+}
+
+fn normalize_optional_id(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn validate_language(language: &str) -> Result<(), PlanUpdateError> {
@@ -611,7 +700,9 @@ pub fn execute_update_plan_tool(
 ) -> (String, magi_core::ExecutionResultStatus) {
     use magi_core::ExecutionResultStatus;
     debug_assert_eq!(plan_store.session_id, *session_id);
-    match parse_update_plan_arguments(arguments).and_then(|input| plan_store.update(input)) {
+    match parse_update_plan_arguments(arguments)
+        .and_then(|input| plan_store.update_for_task(input, task_id))
+    {
         Ok(plan) => {
             publish_plan_event(
                 event_bus,
@@ -875,6 +966,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_blank_optional_ids_as_omitted_ids() {
+        let input = parse_update_plan_arguments(
+            r#"{
+                "planId": "",
+                "expectedRevision": 0,
+                "language": "zh-CN",
+                "plan": [{"itemId": "", "step": "检查现状", "status": "in_progress"}]
+            }"#,
+        )
+        .expect("blank optional ids should be treated as omitted");
+
+        assert_eq!(input.plan_id, None);
+        assert_eq!(input.plan[0].item_id, None);
+    }
+
+    #[test]
     fn rejects_active_plan_without_in_progress_item() {
         let store = test_store("missing-in-progress");
         let error = store
@@ -960,6 +1067,153 @@ mod tests {
     }
 
     #[test]
+    fn supporting_task_failure_does_not_block_phase_owned_by_root_task() {
+        let store = test_store("supporting-task-failure");
+        let created = store
+            .update(UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![UpdatePlanItemInput {
+                    item_id: Some("implement".to_string()),
+                    step: "完成实现".to_string(),
+                    status: PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should create");
+        let root_task_id = TaskId::new("task-root-owner");
+        let child_task_id = TaskId::new("task-child-supporting");
+        store
+            .bind_task(root_task_id.clone(), created.items[0].item_id.clone())
+            .expect("root task should bind");
+        store
+            .bind_task(child_task_id.clone(), created.items[0].item_id.clone())
+            .expect("child task should bind");
+
+        let after_child_failure = store
+            .sync_task_status_with_authority(
+                &child_task_id,
+                TaskStatus::Failed,
+                PlanTaskAuthority::Supporting,
+            )
+            .expect("supporting task status should sync")
+            .expect("plan should exist");
+        assert_eq!(
+            after_child_failure.items[0].status,
+            PlanItemStatus::InProgress
+        );
+        assert_eq!(after_child_failure.state, PlanState::Active);
+
+        let after_root_completion = store
+            .sync_task_status_with_authority(
+                &root_task_id,
+                TaskStatus::Completed,
+                PlanTaskAuthority::PhaseOwner,
+            )
+            .expect("root task status should sync")
+            .expect("plan should exist");
+        assert_eq!(
+            after_root_completion.items[0].status,
+            PlanItemStatus::Completed
+        );
+        assert_eq!(after_root_completion.state, PlanState::Completed);
+        assert_eq!(
+            after_root_completion.task_statuses.get(&child_task_id),
+            Some(&TaskStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn phase_owner_failure_blocks_plan_until_explicit_resume() {
+        let store = test_store("phase-owner-failure");
+        let created = store
+            .update(UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![UpdatePlanItemInput {
+                    item_id: Some("verify".to_string()),
+                    step: "完成验证".to_string(),
+                    status: PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should create");
+        let root_task_id = TaskId::new("task-root-failed");
+        store
+            .bind_task(root_task_id.clone(), created.items[0].item_id.clone())
+            .expect("root task should bind");
+
+        let blocked = store
+            .sync_task_status_with_authority(
+                &root_task_id,
+                TaskStatus::Failed,
+                PlanTaskAuthority::PhaseOwner,
+            )
+            .expect("root failure should sync")
+            .expect("plan should exist");
+        assert_eq!(blocked.items[0].status, PlanItemStatus::Blocked);
+        assert_eq!(blocked.state, PlanState::Paused);
+
+        let resumed = store
+            .resume()
+            .expect("blocked plan should resume")
+            .expect("plan should exist");
+        assert_eq!(resumed.items[0].status, PlanItemStatus::InProgress);
+        assert_eq!(resumed.state, PlanState::Active);
+    }
+
+    #[test]
+    fn stopped_phase_owner_pauses_same_plan_stage_instead_of_skipping_it() {
+        let store = test_store("phase-owner-stopped");
+        let created = store
+            .update(UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![
+                    UpdatePlanItemInput {
+                        item_id: Some("execute-current".to_string()),
+                        step: "执行当前阶段".to_string(),
+                        status: PlanItemStatus::InProgress,
+                    },
+                    UpdatePlanItemInput {
+                        item_id: Some("execute-next".to_string()),
+                        step: "执行下一阶段".to_string(),
+                        status: PlanItemStatus::Pending,
+                    },
+                ],
+            })
+            .expect("plan should create");
+        let root_task_id = TaskId::new("task-root-stopped");
+        store
+            .bind_task(root_task_id.clone(), created.items[0].item_id.clone())
+            .expect("root task should bind");
+
+        let stopped = store
+            .sync_task_status_with_authority(
+                &root_task_id,
+                TaskStatus::Killed,
+                PlanTaskAuthority::PhaseOwner,
+            )
+            .expect("root stop should sync")
+            .expect("plan should exist");
+
+        assert_eq!(stopped.state, PlanState::Paused);
+        assert_eq!(stopped.items[0].status, PlanItemStatus::Blocked);
+        assert_eq!(stopped.items[1].status, PlanItemStatus::Pending);
+
+        let resumed = store
+            .resume()
+            .expect("stopped plan should resume")
+            .expect("plan should exist");
+        assert_eq!(resumed.items[0].status, PlanItemStatus::InProgress);
+        assert_eq!(resumed.items[1].status, PlanItemStatus::Pending);
+    }
+
+    #[test]
     fn task_cannot_bind_pending_plan_item() {
         let store = test_store("pending-binding");
         let created = store
@@ -986,6 +1240,149 @@ mod tests {
             .bind_task(TaskId::new("task-verify"), created.items[1].item_id.clone())
             .expect_err("pending item must reject task binding");
         assert!(matches!(error, PlanUpdateError::ItemNotActive(_)));
+    }
+
+    #[test]
+    fn active_plan_requires_execution_follow_up_until_all_items_finish() {
+        let store = test_store("execution-follow-up");
+        let created = store
+            .update(UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![
+                    UpdatePlanItemInput {
+                        item_id: Some("implement".to_string()),
+                        step: "完成实现".to_string(),
+                        status: PlanItemStatus::InProgress,
+                    },
+                    UpdatePlanItemInput {
+                        item_id: Some("verify".to_string()),
+                        step: "验证结果".to_string(),
+                        status: PlanItemStatus::Pending,
+                    },
+                ],
+            })
+            .expect("plan should create");
+        assert_eq!(
+            store.active_item_id(),
+            Some(created.items[0].item_id.clone())
+        );
+        assert!(store.requires_execution_follow_up());
+
+        let advanced = store
+            .update(UpdatePlanInput {
+                plan_id: Some(created.plan_id.to_string()),
+                expected_revision: Some(created.revision),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![
+                    UpdatePlanItemInput {
+                        item_id: Some(created.items[0].item_id.to_string()),
+                        step: "完成实现".to_string(),
+                        status: PlanItemStatus::Completed,
+                    },
+                    UpdatePlanItemInput {
+                        item_id: Some(created.items[1].item_id.to_string()),
+                        step: "验证结果".to_string(),
+                        status: PlanItemStatus::InProgress,
+                    },
+                ],
+            })
+            .expect("plan should advance");
+        assert!(store.requires_execution_follow_up());
+        let completed = store
+            .update(UpdatePlanInput {
+                plan_id: Some(advanced.plan_id.to_string()),
+                expected_revision: Some(advanced.revision),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![
+                    UpdatePlanItemInput {
+                        item_id: Some(advanced.items[0].item_id.to_string()),
+                        step: "完成实现".to_string(),
+                        status: PlanItemStatus::Completed,
+                    },
+                    UpdatePlanItemInput {
+                        item_id: Some(advanced.items[1].item_id.to_string()),
+                        step: "验证结果".to_string(),
+                        status: PlanItemStatus::Completed,
+                    },
+                ],
+            })
+            .expect("plan should complete");
+        assert_eq!(completed.state, PlanState::Completed);
+        assert!(!store.requires_execution_follow_up());
+    }
+
+    #[test]
+    fn rejected_dispatch_can_remove_plan_task_binding() {
+        let store = test_store("unbind-task");
+        let created = store
+            .update(UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![UpdatePlanItemInput {
+                    item_id: Some("execute".to_string()),
+                    step: "执行任务".to_string(),
+                    status: PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should create");
+        let task_id = TaskId::new("task-rejected");
+        store
+            .bind_task(task_id.clone(), created.items[0].item_id.clone())
+            .expect("task should bind");
+        assert!(store.unbind_task(&task_id).expect("task should unbind"));
+        let plan = store.snapshot().expect("plan should remain");
+        assert!(!plan.task_bindings.contains_key(&task_id));
+        assert!(!plan.task_statuses.contains_key(&task_id));
+    }
+
+    #[test]
+    fn completed_task_does_not_override_blocked_plan_item() {
+        let store = test_store("blocked-item");
+        let created = store
+            .update(UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![UpdatePlanItemInput {
+                    item_id: Some("execute".to_string()),
+                    step: "执行任务".to_string(),
+                    status: PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should create");
+        let task_id = TaskId::new("task-blocked");
+        store
+            .bind_task(task_id.clone(), created.items[0].item_id.clone())
+            .expect("task should bind");
+        let bound = store.snapshot().expect("bound plan should exist");
+        store
+            .update(UpdatePlanInput {
+                plan_id: Some(bound.plan_id.to_string()),
+                expected_revision: Some(bound.revision),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![UpdatePlanItemInput {
+                    item_id: Some(bound.items[0].item_id.to_string()),
+                    step: "执行任务".to_string(),
+                    status: PlanItemStatus::Blocked,
+                }],
+            })
+            .expect("plan should block");
+        let updated = store
+            .sync_task_status(&task_id, TaskStatus::Completed)
+            .expect("task status should sync")
+            .expect("plan should exist");
+        assert_eq!(updated.items[0].status, PlanItemStatus::Blocked);
+        assert!(store.has_blocked_item());
+        assert!(!store.requires_execution_follow_up());
     }
 
     #[test]
@@ -1047,5 +1444,85 @@ mod tests {
             event.event_type == "session.plan.completed"
                 && event.payload["plan"]["state"].as_str() == Some("completed")
         }));
+    }
+
+    #[test]
+    fn update_tool_binds_running_task_to_each_active_plan_stage() {
+        let store = test_store("tool-stage-binding");
+        let event_bus = InMemoryEventBus::new(16);
+        let session_id = SessionId::new("tool-stage-binding");
+        let task_id = TaskId::new("task-root-coordinator");
+        let (created_payload, created_status) = execute_update_plan_tool(
+            &event_bus,
+            &store,
+            &session_id,
+            None,
+            Some(&task_id),
+            None,
+            &serde_json::json!({
+                "expectedRevision": 0,
+                "language": "zh-CN",
+                "plan": [
+                    {
+                        "itemId": "implement",
+                        "step": "完成实现",
+                        "status": "in_progress"
+                    },
+                    {
+                        "itemId": "verify",
+                        "step": "完成验证",
+                        "status": "pending"
+                    }
+                ]
+            })
+            .to_string(),
+        );
+        assert_eq!(created_status, magi_core::ExecutionResultStatus::Succeeded);
+        let created: serde_json::Value =
+            serde_json::from_str(&created_payload).expect("tool payload should be json");
+        assert_eq!(
+            created["plan"]["taskBindings"][task_id.as_str()].as_str(),
+            created["plan"]["items"][0]["itemId"].as_str()
+        );
+
+        let plan_id = created["plan"]["planId"]
+            .as_str()
+            .expect("planId should exist");
+        let revision = created["plan"]["revision"]
+            .as_u64()
+            .expect("revision should exist");
+        let (advanced_payload, advanced_status) = execute_update_plan_tool(
+            &event_bus,
+            &store,
+            &session_id,
+            None,
+            Some(&task_id),
+            None,
+            &serde_json::json!({
+                "planId": plan_id,
+                "expectedRevision": revision,
+                "language": "zh-CN",
+                "plan": [
+                    {
+                        "itemId": "implement",
+                        "step": "完成实现",
+                        "status": "completed"
+                    },
+                    {
+                        "itemId": "verify",
+                        "step": "完成验证",
+                        "status": "in_progress"
+                    }
+                ]
+            })
+            .to_string(),
+        );
+        assert_eq!(advanced_status, magi_core::ExecutionResultStatus::Succeeded);
+        let advanced: serde_json::Value =
+            serde_json::from_str(&advanced_payload).expect("tool payload should be json");
+        assert_eq!(
+            advanced["plan"]["taskBindings"][task_id.as_str()].as_str(),
+            advanced["plan"]["items"][1]["itemId"].as_str()
+        );
     }
 }

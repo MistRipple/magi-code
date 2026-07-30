@@ -28,4 +28,12 @@ export interface RoleTemplate {
   };
   ownerships: string[];
   insightPreferences: ('decision' | 'contract' | 'risk' | 'constraint')[];
+  capabilities: ProfessionalCapabilitySummary[];
+}
+
+export interface ProfessionalCapabilitySummary {
+  id: string;
+  displayName: string;
+  description: string;
+  version: number;
 }

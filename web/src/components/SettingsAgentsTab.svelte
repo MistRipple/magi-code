@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { AgentBinding, ModelEngine } from '../shared/types/registry-types';
-  import type { RoleTemplate } from '../shared/types/role-templates';
+  import type { ProfessionalCapabilitySummary, RoleTemplate } from '../shared/types/role-templates';
   import { isAgentBindingOperational, resolveSelectableRegistryEngines } from '../shared/model-governance';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
@@ -38,6 +38,31 @@
     color: string;
     muted: string;
   };
+
+  type DomainCapability = ProfessionalCapabilitySummary & {
+    roleNames: string[];
+    availableToAllRoles: boolean;
+  };
+
+  function collectDomainCapabilities(roles: RoleAtom[]): DomainCapability[] {
+    const capabilities = new Map<string, ProfessionalCapabilitySummary & { roleNames: string[] }>();
+    for (const role of roles) {
+      for (const capability of role.template.capabilities) {
+        const existing = capabilities.get(capability.id);
+        if (existing) {
+          existing.roleNames.push(role.displayName);
+        } else {
+          capabilities.set(capability.id, { ...capability, roleNames: [role.displayName] });
+        }
+      }
+    }
+    return Array.from(capabilities.values())
+      .map((capability) => ({
+        ...capability,
+        availableToAllRoles: capability.roleNames.length === roles.length,
+      }))
+      .sort((left, right) => left.id.localeCompare(right.id));
+  }
 
   const selectableEngines = $derived(resolveSelectableRegistryEngines(registryEngines));
 
@@ -102,6 +127,7 @@
       };
     })
   );
+  const domainCapabilities = $derived(collectDomainCapabilities(atoms));
 
   let selectedKey = $state<string | null>(null);
 
@@ -132,6 +158,26 @@
       case 'risk': return i18n.t('settings.agents.insightRisk');
       case 'constraint': return i18n.t('settings.agents.insightConstraint');
     }
+  }
+
+  function capabilityName(capability: { id: string; displayName: string }): string {
+    const key = `capability.${capability.id}.displayName`;
+    const translated = i18n.t(key);
+    return translated !== key ? translated : capability.displayName;
+  }
+
+  function capabilityDescription(capability: { id: string; description: string }): string {
+    const key = `capability.${capability.id}.description`;
+    const translated = i18n.t(key);
+    return translated !== key ? translated : capability.description;
+  }
+
+  function domainCapabilityDescription(capability: DomainCapability): string {
+    const description = capabilityDescription(capability);
+    if (capability.availableToAllRoles) return description;
+    return `${description} · ${i18n.t('settings.agents.domainAvailableToRoles', {
+      roles: formatLocalizedFallbackList(capability.roleNames),
+    })}`;
   }
 
   function onTabKeydown(event: KeyboardEvent, idx: number) {
@@ -191,114 +237,139 @@
         </div>
       </div>
 
-      <div
-        id="agent-tabpanel"
-        class="agents-detail"
-        role="tabpanel"
-        aria-labelledby={selected ? `agent-tab-${selected.template.templateId}` : undefined}
-      >
-        {#if !selected}
-          <div class="detail-empty">{i18n.t('settings.agents.detailEmpty')}</div>
-        {:else}
-          {@const tmpl = selected.template}
-          {@const positioning = resolveLocalizedRolePositioning(tmpl)}
+      <div class="agents-content">
+        <div
+          id="agent-tabpanel"
+          class="agents-detail"
+          role="tabpanel"
+          aria-labelledby={selected ? `agent-tab-${selected.template.templateId}` : undefined}
+        >
+          {#if !selected}
+            <div class="detail-empty">{i18n.t('settings.agents.detailEmpty')}</div>
+          {:else}
+            {@const tmpl = selected.template}
+            {@const positioning = resolveLocalizedRolePositioning(tmpl)}
 
-          <div class="detail-layout">
-            <div class="detail-primary">
-              <header class="detail-header">
-                <div class="detail-avatar" style="background: {selected.muted}; color: {selected.color}">
-                  <Icon name="bot" size={18} />
-                </div>
-                <div class="detail-title-stack">
-                  <div class="detail-title-row">
-                    <span class="detail-title">{selected.displayName}</span>
-                    <span class="detail-status-pill status-{selected.status}">{statusTooltip(selected.status)}</span>
+            <div class="detail-layout">
+              <div class="detail-primary">
+                <header class="detail-header">
+                  <div class="detail-avatar" style="background: {selected.muted}; color: {selected.color}">
+                    <Icon name="bot" size={18} />
                   </div>
-                  {#if positioning}
-                    <div class="detail-kicker">{positioning}</div>
-                  {/if}
-                  {#if selected.description}
-                    <p class="detail-description">{selected.description}</p>
-                  {/if}
-                </div>
-              </header>
+                  <div class="detail-title-stack">
+                    <div class="detail-title-row">
+                      <span class="detail-title">{selected.displayName}</span>
+                      <span class="detail-status-pill status-{selected.status}">{statusTooltip(selected.status)}</span>
+                    </div>
+                    {#if positioning}
+                      <div class="detail-kicker">{positioning}</div>
+                    {/if}
+                    {#if selected.description}
+                      <p class="detail-description">{selected.description}</p>
+                    {/if}
+                  </div>
+                </header>
 
-              <section class="detail-section engine-row">
-                <div class="section-title">{i18n.t('settings.agents.sectionEngine')}</div>
-                <EnginePicker
-                  value={selected.engineId}
-                  engines={selectableEngines}
-                  inheritModelLabel={inheritModelLabel}
-                  getDisplayName={getWorkerDisplayName}
-                  modelStatuses={modelStatuses}
-                  error={selected.status === 'error'}
-                  onchange={(engineId: string) => updateRoleEngine(tmpl.templateId, engineId)}
-                />
-                {#if selected.status === 'error'}
-                  <div class="binding-hint err">{i18n.t('settings.agents.engineDisabledHint')}</div>
-                {:else if selected.status === 'inherit'}
-                  <div class="binding-hint">{i18n.t('settings.agents.inheritOrchestratorHint')}</div>
+                <section class="detail-section engine-row">
+                  <div class="section-title">{i18n.t('settings.agents.sectionEngine')}</div>
+                  <EnginePicker
+                    value={selected.engineId}
+                    engines={selectableEngines}
+                    inheritModelLabel={inheritModelLabel}
+                    getDisplayName={getWorkerDisplayName}
+                    modelStatuses={modelStatuses}
+                    error={selected.status === 'error'}
+                    onchange={(engineId: string) => updateRoleEngine(tmpl.templateId, engineId)}
+                  />
+                  {#if selected.status === 'error'}
+                    <div class="binding-hint err">{i18n.t('settings.agents.engineDisabledHint')}</div>
+                  {:else if selected.status === 'inherit'}
+                    <div class="binding-hint">{i18n.t('settings.agents.inheritOrchestratorHint')}</div>
+                  {/if}
+                </section>
+              </div>
+
+              <div class="detail-masonry">
+                {#if tmpl.profile.focus.length > 0}
+                  <section class="detail-section">
+                    <div class="section-title">{i18n.t('settings.agents.sectionSpecialties')}</div>
+                    <ul class="detail-list">
+                      {#each tmpl.profile.focus as item, i}
+                        <li>{resolveLocalizedListPhrase(tmpl, 'focus', i, item)}</li>
+                      {/each}
+                    </ul>
+                  </section>
                 {/if}
-              </section>
+
+                {#if tmpl.profile.constraints.length > 0}
+                  <section class="detail-section">
+                    <div class="section-title">{i18n.t('settings.agents.sectionConstraints')}</div>
+                    <ul class="detail-list">
+                      {#each tmpl.profile.constraints as item, i}
+                        <li>{resolveLocalizedListPhrase(tmpl, 'constraints', i, item)}</li>
+                      {/each}
+                    </ul>
+                  </section>
+                {/if}
+
+                {#if tmpl.profile.outputPreferences && tmpl.profile.outputPreferences.length > 0}
+                  <section class="detail-section">
+                    <div class="section-title">{i18n.t('settings.agents.sectionOutput')}</div>
+                    <ul class="detail-list">
+                      {#each tmpl.profile.outputPreferences as item, i}
+                        <li>{resolveLocalizedListPhrase(tmpl, 'outputPreferences', i, item)}</li>
+                      {/each}
+                    </ul>
+                  </section>
+                {/if}
+
+                {#if tmpl.ownerships.length > 0}
+                  <section class="detail-section">
+                    <div class="section-title">{i18n.t('settings.agents.sectionOwnerships')}</div>
+                    <div class="chip-row">
+                      {#each tmpl.ownerships as item, i}
+                        <span class="chip">{resolveLocalizedListPhrase(tmpl, 'ownerships', i, item)}</span>
+                      {/each}
+                    </div>
+                  </section>
+                {/if}
+
+                {#if tmpl.insightPreferences.length > 0}
+                  <section class="detail-section">
+                    <div class="section-title">{i18n.t('settings.agents.sectionInsights')}</div>
+                    <div class="chip-row">
+                      {#each tmpl.insightPreferences as kind}
+                        <span class="chip chip-insight chip-insight-{kind}">{insightLabel(kind)}</span>
+                      {/each}
+                    </div>
+                  </section>
+                {/if}
+              </div>
             </div>
+          {/if}
+        </div>
 
-            <div class="detail-masonry">
-              {#if tmpl.profile.focus.length > 0}
-                <section class="detail-section">
-                  <div class="section-title">{i18n.t('settings.agents.sectionFocus')}</div>
-                  <ul class="detail-list">
-                    {#each tmpl.profile.focus as item, i}
-                      <li>{resolveLocalizedListPhrase(tmpl, 'focus', i, item)}</li>
-                    {/each}
-                  </ul>
-                </section>
-              {/if}
-
-              {#if tmpl.profile.constraints.length > 0}
-                <section class="detail-section">
-                  <div class="section-title">{i18n.t('settings.agents.sectionConstraints')}</div>
-                  <ul class="detail-list">
-                    {#each tmpl.profile.constraints as item, i}
-                      <li>{resolveLocalizedListPhrase(tmpl, 'constraints', i, item)}</li>
-                    {/each}
-                  </ul>
-                </section>
-              {/if}
-
-              {#if tmpl.profile.outputPreferences && tmpl.profile.outputPreferences.length > 0}
-                <section class="detail-section">
-                  <div class="section-title">{i18n.t('settings.agents.sectionOutput')}</div>
-                  <ul class="detail-list">
-                    {#each tmpl.profile.outputPreferences as item, i}
-                      <li>{resolveLocalizedListPhrase(tmpl, 'outputPreferences', i, item)}</li>
-                    {/each}
-                  </ul>
-                </section>
-              {/if}
-
-              {#if tmpl.ownerships.length > 0}
-                <section class="detail-section">
-                  <div class="section-title">{i18n.t('settings.agents.sectionOwnerships')}</div>
-                  <div class="chip-row">
-                    {#each tmpl.ownerships as item, i}
-                      <span class="chip">{resolveLocalizedListPhrase(tmpl, 'ownerships', i, item)}</span>
-                    {/each}
-                  </div>
-                </section>
-              {/if}
-
-              {#if tmpl.insightPreferences.length > 0}
-                <section class="detail-section">
-                  <div class="section-title">{i18n.t('settings.agents.sectionInsights')}</div>
-                  <div class="chip-row">
-                    {#each tmpl.insightPreferences as kind}
-                      <span class="chip chip-insight chip-insight-{kind}">{insightLabel(kind)}</span>
-                    {/each}
-                  </div>
-                </section>
-              {/if}
+        {#if domainCapabilities.length > 0}
+          <section class="domain-library" aria-labelledby="agent-domain-library-title">
+            <div class="domain-library-heading">
+              <div>
+                <div id="agent-domain-library-title" class="section-title">
+                  {i18n.t('settings.agents.domainLibraryTitle')}
+                </div>
+                <p class="domain-library-description">{i18n.t('settings.agents.domainLibraryDescription')}</p>
+              </div>
+              <span class="domain-library-count" aria-label={i18n.t('settings.agents.domainLibraryCount', { count: domainCapabilities.length })}>
+                {domainCapabilities.length}
+              </span>
             </div>
-          </div>
+            <div class="chip-row capability-list">
+              {#each domainCapabilities as capability (capability.id)}
+                <span class="chip" title={domainCapabilityDescription(capability)}>
+                  {capabilityName(capability)}
+                </span>
+              {/each}
+            </div>
+          </section>
         {/if}
       </div>
     </div>
@@ -446,6 +517,62 @@
     min-height: 0;
     min-width: 0;
     padding: 8px 0 16px;
+  }
+
+  .agents-content {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .domain-library {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+    padding: 20px 0 24px;
+    border-top: 1px solid var(--ind-border-separator);
+  }
+
+  .domain-library-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+  }
+
+  .domain-library-description {
+    margin: 5px 0 0;
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: var(--ind-foreground-muted);
+  }
+
+  .domain-library-count {
+    flex: 0 0 auto;
+    min-width: 28px;
+    height: 22px;
+    padding: 0 7px;
+    border-radius: 7px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11.5px;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+    color: var(--ind-tab-accent);
+    background: color-mix(in srgb, var(--ind-tab-accent) 10%, var(--ind-bg-control));
+    border: 1px solid color-mix(in srgb, var(--ind-tab-accent) 22%, var(--ind-border-control));
+  }
+
+  .domain-library .section-title {
+    color: var(--ind-tab-accent);
+  }
+
+  .domain-library .capability-list .chip {
+    color: var(--ind-tab-accent);
+    background: color-mix(in srgb, var(--ind-tab-accent) 8%, transparent);
+    border-color: color-mix(in srgb, var(--ind-tab-accent) 24%, var(--ind-border-separator));
   }
 
   .detail-empty {

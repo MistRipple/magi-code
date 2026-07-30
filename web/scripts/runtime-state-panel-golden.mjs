@@ -14,8 +14,23 @@ assert.doesNotMatch(
 );
 assert.match(
   runtimePanelSource,
-  /runtimeDiagnostics\.keyRecords[\s\S]*?runtime-diagnostics__record-kind[\s\S]*?item\.detail[\s\S]*?runtime-diagnostics__record-detail/,
-  '关键运行记录必须在同一层直接展示工具或步骤的真实错误正文',
+  /let expandedRecordIds = \$state<Set<string>>\(new Set\(\)\)/,
+  '运行记录必须拥有独立、默认折叠的用户控制状态',
+);
+assert.match(
+  runtimePanelSource,
+  /aria-expanded=\{hasDetail \? recordExpanded : undefined\}[\s\S]*?\{#if recordExpanded\}[\s\S]*?runtime-diagnostics__record-detail/,
+  '运行记录详情只能在用户逐条展开后显示',
+);
+assert.doesNotMatch(
+  runtimePanelSource,
+  /\{#if item\.detail\}[\s\S]*?<pre class="runtime-diagnostics__record-detail">/,
+  '运行态面板不得默认摊开全部工具详情',
+);
+assert.doesNotMatch(
+  runtimePanelSource,
+  /canonicalFailureActive|conversationRecords\.some\(\(item\) => item\.kind === 'error'\)/,
+  '单条工具错误不得覆盖权威运行终态',
 );
 assert.doesNotMatch(
   runtimePanelSource,
@@ -30,45 +45,61 @@ await withGoldenViteServer(async (server) => {
   const rustContract = await server.ssrLoadModule('/src/shared/bridges/rust-daemon-contract.ts');
 
   assert.equal(
-    panel.shouldShowRuntimePanel({ status: 'idle', isProcessing: false, attentionAssignmentCount: 0 }),
+    panel.shouldShowRuntimePanel({ status: 'idle', isProcessing: false, activeAssignmentCount: 0 }),
     false,
     'idle sessions without active assignments must not reserve homepage space',
   );
   assert.equal(
-    panel.shouldShowRuntimePanel({ status: 'running', isProcessing: false, attentionAssignmentCount: 0 }),
+    panel.shouldShowRuntimePanel({ status: 'running', isProcessing: false, activeAssignmentCount: 0 }),
     true,
     'active runtime state must remain visible',
   );
   assert.equal(
-    panel.shouldShowRuntimePanel({ status: 'idle', isProcessing: false, attentionAssignmentCount: 2 }),
+    panel.shouldShowRuntimePanel({ status: 'idle', isProcessing: false, activeAssignmentCount: 2 }),
     true,
     'active assignments keep the runtime panel visible even if the aggregate status is stale',
   );
   assert.equal(
-    panel.shouldShowRuntimePanel({ status: 'completed', isProcessing: false, attentionAssignmentCount: 0 }),
+    panel.shouldShowRuntimePanel({ status: 'completed', isProcessing: false, activeAssignmentCount: 0 }),
     false,
     'completed sessions must not keep reserving homepage space',
   );
   assert.equal(
-    panel.shouldShowRuntimePanel({ status: 'completed', isProcessing: false, attentionAssignmentCount: 2 }),
+    panel.shouldShowRuntimePanel({ status: 'completed', isProcessing: false, activeAssignmentCount: 2 }),
     false,
     'historical assignments must not reopen a completed runtime panel',
   );
   assert.equal(
-    panel.shouldShowRuntimePanel({ status: 'cancelled', isProcessing: false, attentionAssignmentCount: 0 }),
+    panel.shouldShowRuntimePanel({ status: 'cancelled', isProcessing: false, activeAssignmentCount: 0 }),
     false,
     'cancelled sessions must not keep reserving homepage space',
   );
   assert.equal(
-    panel.shouldShowRuntimePanel({ status: 'failed', isProcessing: false, attentionAssignmentCount: 0 }),
+    panel.shouldShowRuntimePanel({ status: 'failed', isProcessing: false, activeAssignmentCount: 0 }),
     true,
     'failed sessions must keep their runtime diagnostics available',
   );
 
-  assert.equal(panel.runtimeAssignmentNeedsAttention('running'), true);
-  assert.equal(panel.runtimeAssignmentNeedsAttention('failed'), true);
-  assert.equal(panel.runtimeAssignmentNeedsAttention('completed'), false);
-  assert.equal(panel.runtimeAssignmentNeedsAttention('cancelled'), false);
+  assert.equal(panel.runtimeAssignmentIsActive('running'), true);
+  assert.equal(panel.runtimeAssignmentIsActive('failed'), false);
+  assert.equal(panel.runtimeAssignmentIsActive('completed'), false);
+  assert.equal(panel.runtimeAssignmentIsActive('cancelled'), false);
+
+  assert.equal(
+    panel.resolveRuntimePanelStatus({ status: 'failed', isProcessing: true }),
+    'running',
+    '运行仍在继续时，过程中的失败事件不得把整体状态悬挂为失败',
+  );
+  assert.equal(
+    panel.resolveRuntimePanelStatus({ status: 'completed', isProcessing: false }),
+    'completed',
+    '运行结束后必须保留权威完成终态',
+  );
+  assert.equal(
+    panel.resolveRuntimePanelStatus({ status: 'failed', isProcessing: false }),
+    'failed',
+    '只有权威终态失败时才显示整体失败',
+  );
 
   assert.equal(panel.shouldShowRuntimePhase('running', 'running'), false);
   assert.equal(panel.shouldShowRuntimePhase('idle', 'idle'), false);
@@ -175,6 +206,47 @@ await withGoldenViteServer(async (server) => {
     failedRecords[0]?.detail,
     'shell_exec_command_not_found: 当前执行环境找不到命令：missing-command',
     '工具失败记录必须从结构化载荷提取错误代码与真实核心原因',
+  );
+  assert.equal(
+    failedRecords[0]?.summary,
+    '当前执行环境找不到命令：missing-command',
+    '折叠标题必须保留真实核心错误，完整诊断留给用户按需展开',
+  );
+
+  const succeededRecords = conversationRecords.buildConversationRuntimeRecords([{
+    key: 'succeeded-tool',
+    message: {
+      id: 'message-succeeded-tool',
+      role: 'assistant',
+      source: 'orchestrator',
+      content: 'file_read',
+      timestamp: 1_700_000_000_450,
+      isStreaming: false,
+      isComplete: true,
+      type: 'tool_call',
+      blocks: [{
+        id: 'tool-succeeded',
+        type: 'tool_call',
+        content: '',
+        toolCall: {
+          id: 'call-succeeded',
+          name: 'file_read',
+          arguments: { path: '/workspace/src' },
+          status: 'success',
+          result: JSON.stringify({
+            status: 'succeeded',
+            summary: '目录 /workspace/src 包含 4 项',
+            entries: ['app.ts', 'lib.ts', 'utils.ts', 'views'],
+          }),
+        },
+      }],
+      metadata: { turnSeq: 4, canonicalItemSeq: 5 },
+    },
+  }], { isProcessing: false });
+  assert.equal(
+    succeededRecords[0]?.summary,
+    '目录 /workspace/src 包含 4 项',
+    '成功工具必须提取产品摘要，不能把原始 JSON 当作默认展示内容',
   );
 
   const processingRecords = conversationRecords.buildConversationRuntimeRecords([], {
@@ -625,7 +697,7 @@ await withGoldenViteServer(async (server) => {
     panel.shouldShowRuntimePanel({
       status: resumed.orchestratorRuntimeState?.status,
       isProcessing: false,
-      attentionAssignmentCount: 0,
+      activeAssignmentCount: 0,
     }),
     false,
     '续跑成功后不得继续展示历史失败状态面板',

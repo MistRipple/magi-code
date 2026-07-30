@@ -1,3 +1,4 @@
+use magi_agent_role::AgentRoleRegistry;
 use magi_bridge_client::{ChatToolDefinition, ChatToolFunctionDefinition, ChatToolOrigin};
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry, is_internal_builtin_tool_surface};
 
@@ -18,11 +19,26 @@ fn public_builtin_tool_definition(name: &str) -> Option<ChatToolDefinition> {
     })
 }
 
-pub fn public_builtin_tool_definitions(registry: &ToolRegistry) -> Vec<ChatToolDefinition> {
+fn apply_runtime_schema(
+    mut definition: ChatToolDefinition,
+    agent_role_registry: &AgentRoleRegistry,
+) -> ChatToolDefinition {
+    if definition.function.name == BuiltinToolName::AgentSpawn.as_str() {
+        definition.function.parameters["properties"]["capabilities"]["items"]["enum"] =
+            serde_json::json!(agent_role_registry.capability_ids());
+    }
+    definition
+}
+
+pub fn public_builtin_tool_definitions(
+    registry: &ToolRegistry,
+    agent_role_registry: &AgentRoleRegistry,
+) -> Vec<ChatToolDefinition> {
     registry
         .public_builtin_specs()
         .into_iter()
         .filter_map(|spec| public_builtin_tool_definition(&spec.name))
+        .map(|definition| apply_runtime_schema(definition, agent_role_registry))
         .collect()
 }
 
@@ -81,6 +97,26 @@ mod tests {
         assert_eq!(
             definition.function.parameters["required"],
             serde_json::json!(["path"])
+        );
+    }
+
+    #[test]
+    fn agent_spawn_schema_uses_capability_registry_as_source() {
+        let definition = apply_runtime_schema(
+            public_builtin_tool_definition("agent_spawn").expect("public agent_spawn"),
+            &AgentRoleRegistry::load_default(),
+        );
+
+        assert_eq!(
+            definition.function.parameters["properties"]["capabilities"]["items"]["enum"],
+            serde_json::json!(AgentRoleRegistry::load_default().capability_ids())
+        );
+        assert!(
+            definition.function.parameters["required"]
+                .as_array()
+                .expect("required")
+                .iter()
+                .any(|field| field == "capabilities")
         );
     }
 

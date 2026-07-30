@@ -1099,12 +1099,20 @@ function emitDataMessage(dataType: DataMessageType, payload: Record<string, unkn
 }
 
 function emitSessionTurnCanonicalEvent(canonicalEvent: CanonicalTurnEvent): void {
+  const isTerminalEvent = canonicalEvent.kind === 'turn_completed'
+    || canonicalEvent.kind === 'turn_superseded'
+    || Boolean(
+      canonicalEvent.turn
+      && isCanonicalTerminalStatus(canonicalEvent.turn.status),
+    );
   if (
     canonicalEvent.sessionId === currentSessionId
-    && canonicalEvent.turn
-    && isCanonicalTerminalStatus(canonicalEvent.turn.status)
+    && isTerminalEvent
   ) {
     clearContinueRequestInFlight();
+    // canonical 终态事件是会话执行结束的统一协议入口。增量 reducer 负责即时收敛，
+    // 随后的权威 bootstrap 负责校正任务、代理与运行态快照，不能再依赖某个旧事件名。
+    scheduleTerminalTaskRuntimeRefresh();
   }
   emitDataMessage('sessionTurnCanonicalEventUpdated', {
     sessionId: canonicalEvent.sessionId,
@@ -1852,7 +1860,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 
   if (TURN_TERMINAL_EVENTS.has(eventType)) {
-    emitCanonicalTurnEventFromRustEvent(event);
+    const emittedCanonicalTerminal = emitCanonicalTurnEventFromRustEvent(event);
     clearActiveTurnInFlight();
     const terminalErrorCode = trimBridgeString(event.payload?.error_code)
       || trimBridgeString(event.payload?.errorCode);
@@ -1882,7 +1890,9 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
         ...(terminalPublicMessage ? { publicMessage: terminalPublicMessage } : {}),
       },
     );
-    refreshBootstrapAfterTerminalTurn(terminalReason);
+    if (!emittedCanonicalTerminal) {
+      refreshBootstrapAfterTerminalTurn(terminalReason);
+    }
   }
 
   if (eventType === 'session.title.updated') {

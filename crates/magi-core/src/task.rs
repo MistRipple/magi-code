@@ -415,6 +415,10 @@ pub enum TaskRuntimePayload {
 #[serde(deny_unknown_fields)]
 pub struct TaskExecutorBinding {
     pub target_role: Option<String>,
+    /// 当前任务为目标角色激活的专业能力。能力 id 必须来自角色注册表，运行时只
+    /// 注入这里显式记录的能力，避免根据提示词临时猜测形成隐藏路由。
+    #[serde(default)]
+    pub capability_ids: Vec<String>,
     pub parallelism_group: Option<String>,
     pub exclusive_scope: Option<String>,
     pub active_skill_id: Option<String>,
@@ -441,6 +445,17 @@ impl TaskExecutorBinding {
 
     pub fn with_parallelism_group(mut self, group: Option<String>) -> Self {
         self.parallelism_group = normalized_optional_string(group);
+        self
+    }
+
+    pub fn with_capability_ids(mut self, capability_ids: Vec<String>) -> Self {
+        let mut normalized = capability_ids
+            .into_iter()
+            .filter_map(normalized_string)
+            .collect::<Vec<_>>();
+        normalized.sort();
+        normalized.dedup();
+        self.capability_ids = normalized;
         self
     }
 
@@ -477,6 +492,10 @@ impl TaskExecutorBinding {
 
     fn target_role(&self) -> Option<&str> {
         normalized_str_ref(self.target_role.as_deref())
+    }
+
+    fn capability_ids(&self) -> &[String] {
+        &self.capability_ids
     }
 
     fn parallelism_group(&self) -> Option<&str> {
@@ -548,6 +567,13 @@ impl Task {
         self.executor_binding
             .as_ref()
             .and_then(TaskExecutorBinding::target_role)
+    }
+
+    pub fn executor_binding_capability_ids(&self) -> &[String] {
+        self.executor_binding
+            .as_ref()
+            .map(TaskExecutorBinding::capability_ids)
+            .unwrap_or_default()
     }
 
     pub fn executor_binding_parallelism_group(&self) -> Option<&str> {

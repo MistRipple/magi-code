@@ -376,6 +376,7 @@ const THREAD_HISTORY_RECENT_MESSAGE_FLOOR: usize = 8;
 const THREAD_HISTORY_SUMMARY_EXCERPT_LIMIT: usize = 16;
 const THREAD_HISTORY_SUMMARY_EXCERPT_CHARS: usize = 360;
 const THREAD_HISTORY_TOOL_ARGUMENT_CHARS: usize = 220;
+const MAX_PLAN_FOLLOW_UP_ROUNDS: usize = 16;
 
 fn estimate_thread_message_tokens(message: &ThreadChatMessage) -> usize {
     let mut total = estimate_text_tokens(&message.role) + 4;
@@ -1271,6 +1272,8 @@ fn run_conversation_loop_inner(
     let mut final_response_prompt_appended = false;
     let mut last_response_observation: Option<String> = None;
     let mut tool_execution_rounds = 0usize;
+    let mut plan_follow_up_rounds = 0usize;
+    let owns_plan_execution = !is_sidechain && task.parent_task_id.is_none();
     let turn_visibility = task_turn_visibility(
         task,
         is_sidechain,
@@ -1306,15 +1309,17 @@ fn run_conversation_loop_inner(
     }
 
     let tool_call_round_limit = tool_call_round_limit(&required_tool_chain);
-    let model_round_limit =
-        tool_call_round_limit.saturating_add(MODEL_FINAL_RESPONSE_ROUND_RESERVE);
+    let model_round_limit = tool_call_round_limit
+        .saturating_add(MODEL_FINAL_RESPONSE_ROUND_RESERVE)
+        .saturating_add(MAX_PLAN_FOLLOW_UP_ROUNDS);
     let mut pre_output_invocation_recovery_attempts = 0usize;
     'conversation_round: for round in 0..model_round_limit {
         append_task_runtime_signals(
             &mut messages,
             conversation_registry.drain_task_signals(session_id, task_id),
         );
-        let final_response_only = tool_execution_rounds >= tool_call_round_limit;
+        let final_response_only = tool_execution_rounds >= tool_call_round_limit
+            && !(owns_plan_execution && plan_store.requires_execution_follow_up());
         if final_response_only && !final_response_prompt_appended {
             messages.push(ChatMessage {
                 role: "user".to_string(),
@@ -2075,6 +2080,39 @@ fn run_conversation_loop_inner(
                 });
                 continue;
             }
+            if owns_plan_execution
+                && let Some(follow_up_prompt) = plan_store.render_execution_follow_up_prompt()
+            {
+                if plan_follow_up_rounds >= MAX_PLAN_FOLLOW_UP_ROUNDS {
+                    let failure_reason =
+                        "当前计划尚未完成，模型连续多轮未推进计划阶段。请检查计划执行结果后重试。"
+                            .to_string();
+                    append_task_error_turn_item(
+                        turn_writeback_context,
+                        &failure_reason,
+                        streaming_entry_id.or(last_stream_item_id.as_deref()),
+                        None,
+                        None,
+                    );
+                    return (
+                        TaskOutcome::Failed {
+                            error: failure_reason,
+                        },
+                        context_summary,
+                    );
+                }
+                plan_follow_up_rounds = plan_follow_up_rounds.saturating_add(1);
+                messages.push(assistant_response_message.clone());
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(follow_up_prompt),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                });
+                continue;
+            }
             if !has_actionable_output
                 && empty_response_recovery_attempts < MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS
             {
@@ -2374,6 +2412,24 @@ fn run_conversation_loop_inner(
         return (
             TaskOutcome::Failed {
                 error: recovery_prompt,
+            },
+            context_summary,
+        );
+    }
+
+    if owns_plan_execution && plan_store.requires_execution_follow_up() {
+        let failure_reason =
+            "当前计划尚未完成，但主线执行已达到模型轮次上限，任务不能被标记为完成。".to_string();
+        append_task_error_turn_item(
+            turn_writeback_context,
+            &failure_reason,
+            streaming_entry_id.or(last_stream_item_id.as_deref()),
+            None,
+            None,
+        );
+        return (
+            TaskOutcome::Failed {
+                error: failure_reason,
             },
             context_summary,
         );
@@ -3492,6 +3548,11 @@ mod tests {
         content: &'static str,
         messages: Mutex<Vec<ChatMessage>>,
     }
+    struct PlanFollowUpTaskModelBridgeClient {
+        plan_store: magi_plan::PlanStore,
+        invoke_count: AtomicUsize,
+        requests: Mutex<Vec<ModelInvocationRequest>>,
+    }
 
     fn exposed_test_tool(name: &str) -> ChatToolDefinition {
         ChatToolDefinition {
@@ -4292,6 +4353,60 @@ mod tests {
         ) -> Result<ModelResponse, BridgeClientError> {
             on_delta(&ModelStreamingDelta {
                 content: self.content.to_string(),
+                thinking: String::new(),
+            });
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for PlanFollowUpTaskModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            let index = self.invoke_count.fetch_add(1, Ordering::SeqCst);
+            self.requests
+                .lock()
+                .expect("request log mutex poisoned")
+                .push(request);
+            if index == 1 {
+                let current = self.plan_store.snapshot().expect("plan should exist");
+                self.plan_store
+                    .update(magi_plan::UpdatePlanInput {
+                        plan_id: Some(current.plan_id.to_string()),
+                        expected_revision: Some(current.revision),
+                        language: current.language,
+                        explanation: None,
+                        plan: current
+                            .items
+                            .into_iter()
+                            .map(|item| magi_plan::UpdatePlanItemInput {
+                                item_id: Some(item.item_id.to_string()),
+                                step: item.title,
+                                status: magi_core::PlanItemStatus::Completed,
+                            })
+                            .collect(),
+                    })
+                    .expect("second round should complete plan");
+            }
+            Ok(model_response(serde_json::json!({
+                "content": if index == 0 { "当前阶段完成" } else { "全部阶段完成" },
+                "finish_reason": "stop"
+            })))
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<ModelResponse, BridgeClientError> {
+            let index = self.invoke_count.load(Ordering::SeqCst);
+            on_delta(&ModelStreamingDelta {
+                content: if index == 0 {
+                    "当前阶段完成".to_string()
+                } else {
+                    "全部阶段完成".to_string()
+                },
                 thinking: String::new(),
             });
             self.invoke(request)
@@ -5587,6 +5702,206 @@ mod tests {
     }
 
     #[test]
+    fn root_conversation_loop_continues_until_plan_reaches_terminal_state() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(64);
+        let task_store = TaskStore::new();
+        let session_id = SessionId::new("session-root-plan-follow-up");
+        let workspace_id = Some(WorkspaceId::new("workspace-root-plan-follow-up"));
+        let task = make_task_loop_test_task("task-root-plan-follow-up");
+        task_store.insert_task(task.clone());
+        let worker_id = WorkerId::new("worker-root-plan-follow-up");
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "coordinator",
+                60_000,
+            )
+            .expect("lease should be granted");
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "root plan follow up",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        let (_, thread_id) =
+            session_store
+                .ensure_session_mission(&session_id, UtcMillis(1), || task.mission_id.clone());
+        let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
+        plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("implement".to_string()),
+                    step: "完成实现".to_string(),
+                    status: magi_core::PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should create");
+        let client = PlanFollowUpTaskModelBridgeClient {
+            plan_store: plan_store.clone(),
+            invoke_count: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        };
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
+            conversation_registry: &ConversationRegistry::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
+            plan_store: &plan_store,
+            project_memory: None,
+            mission_metrics: None,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "完成全部计划".to_string(),
+            images: Vec::new(),
+            tools: None,
+            usage_binding: &usage_binding,
+            streaming_entry_id: None,
+            is_sidechain: false,
+            worker_id: Some(&worker_id),
+            thread_id: &thread_id,
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
+            persist_session_state: None,
+        });
+
+        assert!(matches!(outcome, TaskOutcome::Completed { .. }));
+        assert_eq!(client.invoke_count.load(Ordering::SeqCst), 2);
+        let requests = client.requests.lock().expect("request log mutex poisoned");
+        let second_messages = requests[1]
+            .messages
+            .as_ref()
+            .expect("second request should include messages");
+        assert!(second_messages.iter().any(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("当前执行计划仍未完成"))
+        }));
+        assert!(!plan_store.requires_execution_follow_up());
+    }
+
+    #[test]
+    fn sidechain_task_does_not_take_over_session_plan_execution() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(32);
+        let task_store = TaskStore::new();
+        let session_id = SessionId::new("session-sidechain-plan-isolation");
+        let workspace_id = Some(WorkspaceId::new("workspace-sidechain-plan-isolation"));
+        let task = make_task_loop_test_task("task-sidechain-plan-isolation");
+        task_store.insert_task(task.clone());
+        let worker_id = WorkerId::new("worker-sidechain-plan-isolation");
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "executor",
+                60_000,
+            )
+            .expect("lease should be granted");
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "sidechain plan isolation",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        let (_, thread_id) =
+            session_store
+                .ensure_session_mission(&session_id, UtcMillis(1), || task.mission_id.clone());
+        let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
+        plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("mainline".to_string()),
+                    step: "主线继续推进".to_string(),
+                    status: magi_core::PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should create");
+        let client = PlanFollowUpTaskModelBridgeClient {
+            plan_store: plan_store.clone(),
+            invoke_count: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        };
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
+            conversation_registry: &ConversationRegistry::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
+            plan_store: &plan_store,
+            project_memory: None,
+            mission_metrics: None,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "完成子代理任务".to_string(),
+            images: Vec::new(),
+            tools: None,
+            usage_binding: &usage_binding,
+            streaming_entry_id: None,
+            is_sidechain: true,
+            worker_id: Some(&worker_id),
+            thread_id: &thread_id,
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
+            persist_session_state: None,
+        });
+
+        assert!(matches!(outcome, TaskOutcome::Completed { .. }));
+        assert_eq!(client.invoke_count.load(Ordering::SeqCst), 1);
+        assert!(plan_store.requires_execution_follow_up());
+    }
+
+    #[test]
     fn conversation_loop_keeps_reference_context_below_current_task_prompt() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(64);
@@ -5658,6 +5973,7 @@ mod tests {
                 }],
             })
             .expect("plan fixture should write");
+        plan_store.pause().expect("plan fixture should pause");
 
         let client = CapturingPromptModelBridgeClient::new("CURRENT_TASK_RESULT");
         let prompt =

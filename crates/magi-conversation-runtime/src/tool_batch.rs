@@ -819,6 +819,48 @@ fn execute_coordinator_tool(
                     ExecutionResultStatus::Succeeded,
                 );
             }
+            let requested_capability_ids = match parse_agent_spawn_capabilities(&parsed) {
+                Ok(capability_ids) => capability_ids,
+                Err(error) => {
+                    let available = agent_role_registry
+                        .capability_ids_for_role(&role)
+                        .join(" / ");
+                    return (
+                        agent_spawn_failure_payload(
+                            tool_call,
+                            "failed",
+                            "invalid_capabilities",
+                            "input_validation",
+                            error,
+                            format!(
+                                "请从角色 {role} 拥有的专业能力中至少选择一项：{available}。能够识别专业领域时不要只选择 general_engineering。"
+                            ),
+                        ),
+                        ExecutionResultStatus::Failed,
+                    );
+                }
+            };
+            let requested_capability_ids = match agent_role_registry
+                .validate_capability_ids_for_role(&role, &requested_capability_ids)
+            {
+                Ok(capability_ids) => capability_ids,
+                Err(error) => {
+                    let available = agent_role_registry
+                        .capability_ids_for_role(&role)
+                        .join(" / ");
+                    return (
+                        agent_spawn_failure_payload(
+                            tool_call,
+                            "failed",
+                            "unsupported_capability",
+                            "input_validation",
+                            error,
+                            format!("请改用角色 {role} 拥有的专业能力：{available}"),
+                        ),
+                        ExecutionResultStatus::Failed,
+                    );
+                }
+            };
             if !(3..=30).contains(&display_name_chars) {
                 return (
                     agent_spawn_failure_payload(
@@ -915,6 +957,7 @@ fn execute_coordinator_tool(
                 policy_snapshot: Some(child_policy_snapshot),
                 executor_binding: Some(
                     TaskExecutorBinding::for_role(&role)
+                        .with_capability_ids(requested_capability_ids.clone())
                         .with_parallelism_group(
                             parsed
                                 .get("parallelism_group")
@@ -1033,6 +1076,7 @@ fn execute_coordinator_tool(
                     "canonical_task_name": canonical_task_name,
                     "plan_item_id": plan_item_id.as_ref().map(ToString::to_string),
                     "role": role,
+                    "capabilities": requested_capability_ids,
                     "access_profile": child_access_profile.as_str(),
                     "goal": goal,
                     "context_package_id": context_package.package_id,
@@ -1060,12 +1104,14 @@ fn execute_coordinator_tool(
                     "canonical_task_name": canonical_task_name,
                     "plan_item_id": plan_item_id.as_ref().map(ToString::to_string),
                     "role": role,
+                    "capabilities": requested_capability_ids,
                     "access_profile": child_access_profile.as_str(),
                     "title": child.title,
                     "assignment": {
                         "title": child.title,
                         "goal": child.goal,
                         "role": role,
+                        "capabilities": requested_capability_ids,
                         "access_profile": child_access_profile.as_str(),
                         "context_package_id": context_package.package_id,
                         "context_revision": context_package.revision,
@@ -1105,6 +1151,28 @@ fn execute_coordinator_tool(
         ),
         _ => unreachable!("execute_coordinator_tool 只接收协调器代理工具变体"),
     }
+}
+
+fn parse_agent_spawn_capabilities(parsed: &serde_json::Value) -> Result<Vec<String>, String> {
+    let capabilities = parsed
+        .get("capabilities")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "agent_spawn 缺少 capabilities 数组".to_string())?;
+    if capabilities.is_empty() {
+        return Err("agent_spawn capabilities 至少需要一项专业能力".to_string());
+    }
+    capabilities
+        .iter()
+        .enumerate()
+        .map(|(index, capability)| {
+            capability
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| format!("agent_spawn capabilities[{index}] 必须是非空字符串"))
+        })
+        .collect()
 }
 
 fn valid_agent_task_name(task_name: &str) -> bool {
@@ -3872,6 +3940,32 @@ mod tests {
             "tool_call:call-agent-spawn-invalid-context"
         );
         assert_eq!(payload["child_task_id"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn agent_spawn_capabilities_are_required_and_structured() {
+        assert_eq!(
+            parse_agent_spawn_capabilities(&serde_json::json!({})),
+            Err("agent_spawn 缺少 capabilities 数组".to_string())
+        );
+        assert_eq!(
+            parse_agent_spawn_capabilities(&serde_json::json!({ "capabilities": [] })),
+            Err("agent_spawn capabilities 至少需要一项专业能力".to_string())
+        );
+        assert!(
+            parse_agent_spawn_capabilities(&serde_json::json!({
+                "capabilities": ["frontend", { "id": "security" }]
+            }))
+            .expect_err("非字符串能力必须被拒绝")
+            .contains("capabilities[1]")
+        );
+        assert_eq!(
+            parse_agent_spawn_capabilities(&serde_json::json!({
+                "capabilities": [" frontend ", "security"]
+            }))
+            .expect("合法能力应解析成功"),
+            ["frontend", "security"]
+        );
     }
 
     #[test]

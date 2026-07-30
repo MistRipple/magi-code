@@ -151,6 +151,13 @@
   const contextAccessTokens = $derived(
     contextAccesses.reduce((total, access) => total + access.estimatedTokens, 0),
   );
+  const activeCapabilityIds = $derived(agentProjection?.capabilityIds ?? []);
+
+  function capabilityLabel(capabilityId: string): string {
+    const key = `capability.${capabilityId}.displayName`;
+    const translated = i18n.t(key);
+    return translated !== key ? translated : capabilityId;
+  }
 
   function contextKindLabel(kind: AgentContextReferenceKind): string {
     const labels: Record<AgentContextReferenceKind, string> = {
@@ -309,6 +316,14 @@
 </script>
 
 <div class="agent-tab-content">
+  {#if activeCapabilityIds.length > 0}
+    <div class="agent-capabilities" aria-label={i18n.t('settings.agents.sectionCapabilities')}>
+      <strong>{i18n.t('settings.agents.sectionCapabilities')}</strong>
+      {#each activeCapabilityIds as capabilityId (capabilityId)}
+        <span>{capabilityLabel(capabilityId)}</span>
+      {/each}
+    </div>
+  {/if}
   {#if contextPackage}
     <section class="context-observer" class:expanded={contextExpanded}>
       <button
@@ -406,6 +421,31 @@
     height: 100%;
     min-height: 0;
     overflow: hidden;
+  }
+
+  .agent-capabilities {
+    flex: 0 0 auto;
+    min-height: 32px;
+    margin: 7px 12px 0;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 5px;
+    color: var(--foreground-muted);
+    font-size: 11px;
+  }
+
+  .agent-capabilities strong {
+    margin-right: 2px;
+    color: var(--foreground);
+    font-weight: 600;
+  }
+
+  .agent-capabilities span {
+    padding: 2px 6px;
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--primary) 10%, transparent);
+    color: var(--primary);
   }
 
   .context-observer {
@@ -540,6 +580,10 @@
   }
 
   @media (max-width: 720px) {
+    .agent-capabilities {
+      margin-inline: 8px;
+    }
+
     .context-observer {
       margin-inline: 8px;
     }

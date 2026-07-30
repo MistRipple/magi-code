@@ -69,6 +69,8 @@ import type {
   SkillsLibraryResponseDto,
   SkillUpdateResponseDto,
   AgentRunProjectionDto,
+  AgentRunActionRequestDto,
+  AgentRunActionResponseDto,
   UpdatedResponseDto,
   VersionHandshakeDto,
   WorkspaceListResponseDto,
@@ -80,10 +82,56 @@ function buildApiUrl(baseUrl: string, path: string): string {
   return new URL(path, baseUrl).toString();
 }
 
+export class RustDaemonApiError extends Error {
+  public constructor(
+    public readonly status: number,
+    message: string,
+    public readonly errorCode?: string,
+    public readonly detail?: string,
+  ) {
+    super(message);
+    this.name = 'RustDaemonApiError';
+  }
+}
+
+async function rustDaemonResponseError(response: Response, action: string): Promise<RustDaemonApiError> {
+  let message = `HTTP ${response.status}: ${action}`;
+  let errorCode: string | undefined;
+  let detail: string | undefined;
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    try {
+      const payload = await response.json() as {
+        message?: unknown;
+        error?: unknown;
+        error_code?: unknown;
+        code?: unknown;
+        detail?: unknown;
+      };
+      const publicMessage = typeof payload.message === 'string' && payload.message.trim()
+        ? payload.message.trim()
+        : (typeof payload.error === 'string' && payload.error.trim() ? payload.error.trim() : '');
+      if (publicMessage) {
+        message = publicMessage;
+      }
+      const rawErrorCode = typeof payload.error_code === 'string' && payload.error_code.trim()
+        ? payload.error_code.trim()
+        : (typeof payload.code === 'string' && payload.code.trim() ? payload.code.trim() : '');
+      errorCode = rawErrorCode || undefined;
+      detail = typeof payload.detail === 'string' && payload.detail.trim()
+        ? payload.detail.trim()
+        : undefined;
+    } catch {
+      // 非法错误响应由统一 HTTP 文案表示，避免吞掉原始状态码。
+    }
+  }
+  return new RustDaemonApiError(response.status, message, errorCode, detail);
+}
+
 async function fetchJsonUrl<T>(url: string, signal?: AbortSignal): Promise<T> {
   const response = await getTransport().request(url, signal ? { signal } : undefined);
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${url}`);
+    throw await rustDaemonResponseError(response, url);
   }
   return await response.json() as T;
 }
@@ -596,6 +644,12 @@ export class RustDaemonClient {
     );
   }
 
+  public async performAgentRunAction(
+    request: AgentRunActionRequestDto,
+  ): Promise<AgentRunActionResponseDto> {
+    return this.postJson<AgentRunActionResponseDto>('/api/agent-runs/action', request);
+  }
+
   private async getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
     return await fetchJsonUrl<T>(buildApiUrl(this.baseUrl, path), signal);
   }
@@ -609,7 +663,7 @@ export class RustDaemonClient {
       body: JSON.stringify(body),
     });
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${path}`);
+      throw await rustDaemonResponseError(response, path);
     }
     return await response.json() as T;
   }

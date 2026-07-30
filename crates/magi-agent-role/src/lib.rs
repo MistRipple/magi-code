@@ -28,6 +28,12 @@ use std::{
     sync::Arc,
 };
 
+mod capability;
+
+pub use capability::{
+    ProfessionalCapability, ProfessionalCapabilityRegistry, ProfessionalCapabilitySummary,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum AgentRoleError {
     #[error("read role file {path}: {source}")]
@@ -121,18 +127,31 @@ impl AgentRole {
 #[derive(Clone, Debug, Default)]
 pub struct AgentRoleRegistry {
     roles: Arc<HashMap<String, AgentRole>>,
+    capabilities: ProfessionalCapabilityRegistry,
 }
 
 impl AgentRoleRegistry {
     pub fn empty() -> Self {
         Self {
             roles: Arc::new(HashMap::new()),
+            capabilities: ProfessionalCapabilityRegistry::empty(),
         }
     }
 
     pub fn from_map(map: HashMap<String, AgentRole>) -> Self {
         Self {
             roles: Arc::new(map),
+            capabilities: ProfessionalCapabilityRegistry::builtin(),
+        }
+    }
+
+    pub fn from_maps(
+        roles: HashMap<String, AgentRole>,
+        capabilities: ProfessionalCapabilityRegistry,
+    ) -> Self {
+        Self {
+            roles: Arc::new(roles),
+            capabilities,
         }
     }
 
@@ -155,7 +174,7 @@ impl AgentRoleRegistry {
                 }
             }
         }
-        Self::from_map(map)
+        Self::from_maps(map, ProfessionalCapabilityRegistry::load_default())
     }
 
     pub fn get(&self, role_id: &str) -> Option<&AgentRole> {
@@ -200,6 +219,51 @@ impl AgentRoleRegistry {
 
     pub fn all(&self) -> impl Iterator<Item = &AgentRole> {
         self.roles.values()
+    }
+
+    pub fn capability_summaries_for_role(
+        &self,
+        role_id: &str,
+    ) -> Vec<ProfessionalCapabilitySummary> {
+        self.capabilities.summaries_for_role(role_id)
+    }
+
+    pub fn capability_summaries(&self) -> Vec<ProfessionalCapabilitySummary> {
+        self.capabilities.summaries()
+    }
+
+    pub fn capability_ids(&self) -> Vec<String> {
+        self.capabilities.ids()
+    }
+
+    pub fn capability_ids_for_role(&self, role_id: &str) -> Vec<String> {
+        self.capabilities.ids_for_role(role_id)
+    }
+
+    pub fn validate_capability_ids_for_role(
+        &self,
+        role_id: &str,
+        capability_ids: &[String],
+    ) -> Result<Vec<String>, String> {
+        if !self.roles.contains_key(role_id) {
+            return Err(format!("代理角色不存在: {role_id}"));
+        }
+        self.capabilities
+            .validate_ids_for_role(role_id, capability_ids)
+    }
+
+    pub fn compose_system_prompt(
+        &self,
+        role_id: &str,
+        role_prompt: &str,
+        capability_ids: &[String],
+    ) -> Result<String, String> {
+        if capability_ids.is_empty() {
+            return Ok(role_prompt.trim().to_string());
+        }
+        let capability_ids = self.validate_capability_ids_for_role(role_id, capability_ids)?;
+        self.capabilities
+            .compose_prompt(role_id, role_prompt, &capability_ids)
     }
 
     pub fn role_ids(&self) -> Vec<String> {
@@ -475,6 +539,23 @@ mod tests {
             "coordinator",
         ] {
             assert!(reg.get(role).is_some(), "missing builtin role: {role}");
+        }
+    }
+
+    #[test]
+    fn builtin_roles_expose_professional_capabilities() {
+        let registry = AgentRoleRegistry::from_map(builtin_roles_map());
+        assert!(registry.capability_ids().contains(&"frontend".to_string()));
+        for role_id in ["architect", "executor", "reviewer", "explorer", "tester"] {
+            let ids = registry.capability_ids_for_role(role_id);
+            assert!(
+                ids.contains(&"general_engineering".to_string()),
+                "{role_id} 缺少通用工程能力"
+            );
+            assert!(
+                ids.contains(&"frontend".to_string()),
+                "{role_id} 缺少前端能力"
+            );
         }
     }
 

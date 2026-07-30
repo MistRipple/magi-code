@@ -61,6 +61,7 @@ use std::{collections::BTreeSet, fmt, path::PathBuf, sync::Arc};
 
 const BASE_TOOL_CALL_ROUNDS: usize = 16;
 const MAX_TOOL_CALL_ROUNDS: usize = 32;
+const MAX_PLAN_FOLLOW_UP_ROUNDS: usize = 16;
 pub const BUSINESS_MODEL_PROVIDER: &str = "openai-compatible";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -962,14 +963,18 @@ fn run_session_turn_execution_inner(
     let mut tool_call_validation_tracker = ToolCallValidationTracker::default();
     let mut final_response_tool_recovery_attempts = 0usize;
     let mut final_response_prompt_appended = false;
+    let mut plan_follow_up_rounds = 0usize;
     let mut last_response_observation: Option<String> = None;
     let mut tool_execution_rounds = 0usize;
 
     let tool_call_round_limit = tool_call_round_limit(&required_tool_chain);
-    let round_limit = tool_call_round_limit.saturating_add(MODEL_FINAL_RESPONSE_ROUND_RESERVE);
+    let round_limit = tool_call_round_limit
+        .saturating_add(MODEL_FINAL_RESPONSE_ROUND_RESERVE)
+        .saturating_add(MAX_PLAN_FOLLOW_UP_ROUNDS);
     let mut round = 0usize;
     while round < round_limit {
-        let final_response_only = tool_execution_rounds >= tool_call_round_limit;
+        let final_response_only = tool_execution_rounds >= tool_call_round_limit
+            && !plan_store.requires_execution_follow_up();
         if final_response_only && !final_response_prompt_appended {
             messages.push(ChatMessage {
                 role: "user".to_string(),
@@ -1363,6 +1368,36 @@ fn run_session_turn_execution_inner(
                         &required_tool_chain,
                         &completed_required_tool_names,
                     )),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                });
+                let steers = conversation_registry
+                    .drain_session_turn_steers(&request.session_id, &request.turn_id);
+                append_session_turn_steers_to_messages(&mut messages, steers);
+                round = round.saturating_add(1);
+                continue;
+            }
+            if plan_store.requires_execution_follow_up() {
+                if plan_follow_up_rounds >= MAX_PLAN_FOLLOW_UP_ROUNDS {
+                    return Err(SessionTurnExecutionError::new(
+                        SessionTurnFailureReason::ModelToolRoundLimitExceeded,
+                        "当前计划尚未完成，模型连续多轮未推进计划阶段。请检查计划执行结果后重试。",
+                    ));
+                }
+                plan_follow_up_rounds = plan_follow_up_rounds.saturating_add(1);
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(content),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: response_provider_context.clone(),
+                });
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: plan_store.render_execution_follow_up_prompt(),
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
@@ -3015,6 +3050,12 @@ mod tests {
         requests: std::sync::Mutex<Vec<ModelInvocationRequest>>,
     }
 
+    struct PlanFollowUpModelBridgeClient {
+        plan_store: magi_plan::PlanStore,
+        calls: AtomicUsize,
+        requests: std::sync::Mutex<Vec<ModelInvocationRequest>>,
+    }
+
     impl ModelBridgeClient for SteeringModelBridgeClient {
         fn invoke(
             &self,
@@ -3074,6 +3115,60 @@ mod tests {
                     "第一段回复".to_string()
                 } else {
                     "最终收口".to_string()
+                },
+                thinking: String::new(),
+            });
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for PlanFollowUpModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests
+                .lock()
+                .expect("request log lock")
+                .push(request);
+            if call == 1 {
+                let current = self.plan_store.snapshot().expect("plan should exist");
+                self.plan_store
+                    .update(magi_plan::UpdatePlanInput {
+                        plan_id: Some(current.plan_id.to_string()),
+                        expected_revision: Some(current.revision),
+                        language: current.language,
+                        explanation: None,
+                        plan: current
+                            .items
+                            .into_iter()
+                            .map(|item| magi_plan::UpdatePlanItemInput {
+                                item_id: Some(item.item_id.to_string()),
+                                step: item.title,
+                                status: magi_core::PlanItemStatus::Completed,
+                            })
+                            .collect(),
+                    })
+                    .expect("second round should complete plan");
+            }
+            Ok(model_response(serde_json::json!({
+                "content": if call == 0 { "第一阶段完成" } else { "全部计划完成" },
+                "finish_reason": "stop"
+            })))
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<ModelResponse, BridgeClientError> {
+            let call = self.calls.load(Ordering::SeqCst);
+            on_delta(&ModelStreamingDelta {
+                content: if call == 0 {
+                    "第一阶段完成".to_string()
+                } else {
+                    "全部计划完成".to_string()
                 },
                 thinking: String::new(),
             });
@@ -3200,6 +3295,120 @@ mod tests {
                 }),
             "主会话 thread 必须持久化提供方签名上下文"
         );
+    }
+
+    #[test]
+    fn unfinished_plan_keeps_same_turn_running_until_plan_completes() {
+        let session_id = SessionId::new("session-plan-follow-up");
+        let turn_id = "turn-plan-follow-up".to_string();
+        let store = Arc::new(SessionStore::new());
+        store
+            .create_session(session_id.clone(), "plan follow up")
+            .expect("session should be creatable");
+        let (_mission_id, orchestrator_thread_id) =
+            store.ensure_session_mission(&session_id, ts(900), || {
+                magi_core::MissionId::new("mission-plan-follow-up")
+            });
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: turn_id.clone(),
+                    turn_seq: 1,
+                    accepted_at: ts(1_000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("完成全部计划".to_string()),
+                    items: vec![session_turn_item(
+                        "user_message",
+                        "completed",
+                        None,
+                        Some("完成全部计划".to_string()),
+                        Some("user-plan-follow-up".to_string()),
+                        orchestrator_thread_id,
+                    )],
+                },
+            )
+            .expect("current turn should be stored");
+        let registry = ConversationRegistry::new();
+        registry
+            .begin_session_turn_input(session_id.clone(), turn_id.clone())
+            .expect("turn input should begin");
+        let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
+        plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("implement".to_string()),
+                    step: "完成实现".to_string(),
+                    status: magi_core::PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should create");
+        let client = PlanFollowUpModelBridgeClient {
+            plan_store: plan_store.clone(),
+            calls: AtomicUsize::new(0),
+            requests: std::sync::Mutex::new(Vec::new()),
+        };
+        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
+            client: &client,
+            event_bus: &InMemoryEventBus::new(16),
+            session_store: store.as_ref(),
+            conversation_registry: &registry,
+            plan_store: &plan_store,
+            settings_store: None,
+            safety_gate: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            snapshot_manager: None,
+            request: SessionTurnExecutionRequest {
+                session_id,
+                turn_id,
+                workspace_id: None,
+                prompt: "完成全部计划".to_string(),
+                images: Vec::new(),
+                context_references: Vec::new(),
+                use_tools: false,
+                access_profile: AccessProfile::Restricted,
+                skill_name: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+                forced_tool_name: None,
+                required_tool_chain: Vec::new(),
+                goal_turn_mode: SessionGoalTurnMode::None,
+                product_locale: "zh-CN".to_string(),
+                workspace_root_path: None,
+            },
+            prompt: "完成全部计划".to_string(),
+            knowledge_context_prompt: None,
+            tools: None,
+            persist_session_state: None,
+            live_settings_store: None,
+            model_switch_recovery: None,
+        })
+        .expect("plan turn should complete");
+
+        assert_eq!(output.final_content, "全部计划完成");
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+        let requests = client.requests.lock().expect("request log lock");
+        let second_messages = requests[1]
+            .messages
+            .as_ref()
+            .expect("follow-up request should include messages");
+        assert!(second_messages.iter().any(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("当前执行计划仍未完成"))
+        }));
+        assert!(!plan_store.requires_execution_follow_up());
     }
 
     impl ModelBridgeClient for StreamingThenFailingModelBridgeClient {

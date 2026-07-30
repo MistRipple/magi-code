@@ -77,6 +77,11 @@ await withGoldenViteServer(async (server) => {
     true,
     '主线结束后异常代理仍必须持续显示',
   );
+  assert.equal(
+    center.shouldShowActiveAgentCenter(center.groupActiveAgents([]), 'failed'),
+    true,
+    'root 失败即使没有子代理，也必须保留权威恢复入口',
+  );
 
   assert.deepEqual(
     center.buildActiveAgentSummary(grouped),
@@ -129,9 +134,14 @@ await withGoldenViteServer(async (server) => {
     '用户已清空的同一轮代理不能被轮询重新打开',
   );
   assert.equal(
-    center.shouldPinAgentProjection('root-empty', 0, ''),
+    center.shouldPinAgentProjection('root-empty', 0, '', 'active'),
     false,
     '没有实际子代理的普通任务不能刷新固定列表',
+  );
+  assert.equal(
+    center.shouldPinAgentProjection('root-failed', 0, '', 'failed'),
+    true,
+    '失败 root 必须固定恢复面板，不能因为没有子代理而丢失操作入口',
   );
 });
 
@@ -198,8 +208,18 @@ assert.doesNotMatch(
 );
 assert.match(
   activeAgentCenterSource,
-  /activeAgentCenter\.clearAndClose/,
-  '展开面板必须提供清空并关闭操作',
+  /availableActions[\s\S]*performAgentRunAction\(/,
+  '失败态操作必须完全由后端 availableActions 驱动，并统一提交任务动作',
+);
+assert.match(
+  activeAgentCenterSource,
+  /action === 'archive'[\s\S]*dismissedRootTaskId = rootTaskId/,
+  '只有后端归档成功后才能清理本地固定面板状态',
+);
+assert.match(
+  activeAgentCenterSource,
+  /reportIncident\(message,[\s\S]*failureStage: `agent_run_\$\{action\}`/,
+  '失败操作必须把真实后端错误写入统一通知中心，不能只显示泛化提示',
 );
 assert.match(
   activeAgentCenterSource,
@@ -220,6 +240,16 @@ assert.doesNotMatch(
   daemonClientSource,
   /public async (?:continueSession|restartAgentRun|archiveAgentRun)\(/,
   '删除旧代理抽屉后必须同步清理只为该抽屉服务的客户端方法',
+);
+assert.match(
+  daemonClientSource,
+  /public async performAgentRunAction\(/,
+  '任务恢复动作必须收敛为单一客户端入口',
+);
+assert.match(
+  goalRunDrawersSource,
+  /currentPlanPaused && currentPlanBlocked[\s\S]*resumeBlockedPlan/,
+  '阻塞计划即使目标仍标记 active，也必须显示明确继续入口',
 );
 
 console.log('active agent center golden tests passed');
