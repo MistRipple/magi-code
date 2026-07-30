@@ -1104,7 +1104,7 @@ fn publish_git_context_changed(
                 "branch": observation.branch,
                 "head": observation.head,
                 "context_revision": context_revision,
-                "refresh_scopes": ["file_tree", "code_index", "knowledge", "context_cache"]
+                "refresh_scopes": ["changes", "file_tree", "code_index", "knowledge", "context_cache"]
             }),
         )
         .with_context(EventContext {
@@ -1436,6 +1436,56 @@ mod tests {
         assert_eq!(event.payload["change_kind"], "fast_forward_adopted");
         assert_eq!(event.payload["previous_head"], baseline_head);
         assert_eq!(event.payload["head"], advanced_head);
+        state.release_session_git_execution_lease(&session_id);
+    }
+
+    #[tokio::test]
+    async fn next_turn_external_partial_commit_preserves_remaining_pending_changes() {
+        let (repository, state, workspace_id, session_id) = git_api_fixture();
+        let session_id = SessionId::new(session_id);
+        let workspace_id = WorkspaceId::new(workspace_id);
+        fs::write(repository.path().join("committed.txt"), "v0\n").expect("committed fixture");
+        fs::write(repository.path().join("pending.txt"), "v0\n").expect("pending fixture");
+        git(repository.path(), &["add", "committed.txt", "pending.txt"]);
+        git(repository.path(), &["commit", "-m", "partial baseline"]);
+        state
+            .ensure_snapshot_session(&session_id, repository.path())
+            .await
+            .expect("initial snapshot baseline");
+        state
+            .ensure_session_code_context(&session_id, &Some(workspace_id.clone()))
+            .await
+            .expect("initial Git context")
+            .expect("repository context");
+        state.release_session_git_execution_lease(&session_id);
+
+        fs::write(repository.path().join("committed.txt"), "v1\n").expect("committed change");
+        fs::write(repository.path().join("pending.txt"), "v1\n").expect("pending change");
+        state
+            .snapshot_session(&session_id, repository.path())
+            .expect("snapshot")
+            .reconcile()
+            .expect("snapshot reconcile");
+        git(repository.path(), &["add", "committed.txt"]);
+        git(
+            repository.path(),
+            &["commit", "-m", "partial external commit"],
+        );
+
+        state
+            .ensure_session_code_context(&session_id, &Some(workspace_id))
+            .await
+            .expect("partial fast-forward must be adopted")
+            .expect("repository context");
+        let pending = state
+            .snapshot_session(&session_id, repository.path())
+            .expect("fast-forward snapshot baseline")
+            .pending_changes()
+            .expect("pending changes");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].path, "pending.txt");
+        assert_eq!(pending[0].original_content.as_deref(), Some("v0\n"));
+        assert_eq!(pending[0].preview_content.as_deref(), Some("v1\n"));
         state.release_session_git_execution_lease(&session_id);
     }
 

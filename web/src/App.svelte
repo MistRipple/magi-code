@@ -10,11 +10,18 @@
   import Icon from './components/Icon.svelte';
   import DesktopRuntimeRecovery from './components/DesktopRuntimeRecovery.svelte';
   import { isDesktopRuntime } from './lib/desktop-updater';
-  import { setCurrentTopTab, messagesState } from './stores/messages.svelte';
+  import {
+    addToast,
+    isPersistedSessionId,
+    setCurrentTopTab,
+    messagesState,
+  } from './stores/messages.svelte';
+  import { refreshPendingChangesProjection } from './lib/pending-changes-refresh';
   import { activateRightPaneSession } from './stores/right-pane.svelte';
   import { i18n } from './stores/i18n.svelte';
   import {
     RUNTIME_CONNECTION_EVENT,
+    isWebAgentMode,
     type AgentConnectionEventDetail,
   } from './web/agent-api';
 
@@ -26,6 +33,8 @@
       ? (messagesState.currentTopTab as TopTabType)
       : 'thread'
   );
+  const isWebMode = isWebAgentMode();
+  const changeRefreshIntervalMs = 1000;
 
   // 设置面板是否打开
   let settingsOpen = $state(false);
@@ -94,6 +103,95 @@
   // 切换会话时同步 RightPane 上下文；空 sessionId 也要清掉，避免显示别的会话残留
   $effect(() => {
     activateRightPaneSession(messagesState.currentWorkspaceId, messagesState.currentSessionId);
+  });
+
+  $effect(() => {
+    const sessionId = messagesState.currentSessionId?.trim() || '';
+    const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
+    const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
+    const changesVisible = currentTopTab === 'edits';
+    if (
+      !isWebMode
+      || messagesState.sessionHydrating
+      || !isPersistedSessionId(sessionId)
+      || (!workspaceId && !workspacePath)
+    ) {
+      return;
+    }
+
+    let disposed = false;
+    let inFlight = false;
+    let forceRefreshQueued = false;
+    let errorReported = false;
+    let mutationRetryTimer: number | null = null;
+    const refresh = async (forceRefresh = false) => {
+      if (disposed) {
+        return;
+      }
+      if (inFlight) {
+        forceRefreshQueued ||= forceRefresh;
+        return;
+      }
+      if (messagesState.changeMutationStatus?.isMutating) {
+        forceRefreshQueued ||= forceRefresh;
+        if (mutationRetryTimer === null) {
+          mutationRetryTimer = window.setTimeout(() => {
+            mutationRetryTimer = null;
+            void refresh(forceRefreshQueued);
+          }, 100);
+        }
+        return;
+      }
+      inFlight = true;
+      try {
+        await refreshPendingChangesProjection({
+          sessionId,
+          workspaceId,
+          workspacePath,
+          forceRefresh,
+        });
+        errorReported = false;
+      } catch (error) {
+        console.warn('[App] 刷新变更列表失败:', error);
+        if (!errorReported) {
+          errorReported = true;
+          addToast('error', '变更列表刷新失败，请稍后重试');
+        }
+      } finally {
+        inFlight = false;
+        if (!disposed && forceRefreshQueued) {
+          forceRefreshQueued = false;
+          void refresh(true);
+        }
+      }
+    };
+    const handleWindowFocus = () => void refresh(true);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void refresh(true);
+      }
+    };
+    const handleWorkspaceContentChanged = () => void refresh(true);
+
+    void refresh(true);
+    const timer = changesVisible
+      ? window.setInterval(() => void refresh(), changeRefreshIntervalMs)
+      : null;
+    window.addEventListener('focus', handleWindowFocus);
+    window.addEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      disposed = true;
+      if (timer !== null) {
+        window.clearInterval(timer);
+      }
+      if (mutationRetryTimer !== null) {
+        window.clearTimeout(mutationRetryTimer);
+      }
+      window.removeEventListener('focus', handleWindowFocus);
+      window.removeEventListener('magi:workspaceContentChanged', handleWorkspaceContentChanged);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   });
 
 </script>

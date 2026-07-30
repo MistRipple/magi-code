@@ -103,6 +103,7 @@
       payload.workspacePath ?? '',
       payload.sessionId ?? '',
       payload.filepath,
+      payload.isChangeDiff ? (payload.changeRevision ?? '') : '',
     ].join('::');
   }
 

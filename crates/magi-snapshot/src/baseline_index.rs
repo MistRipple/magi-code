@@ -91,6 +91,10 @@ impl RefsIndex {
     pub fn get(&self, path: &str) -> Option<&FileMeta> {
         self.entries.get(path)
     }
+
+    pub fn remove(&mut self, path: &str) -> Option<FileMeta> {
+        self.entries.remove(path)
+    }
 }
 
 pub fn baseline_path(session_dir: &Path) -> PathBuf {

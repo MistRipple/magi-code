@@ -2882,11 +2882,14 @@
   .session-meta {
     display: inline-flex;
     align-items: center;
+    justify-content: flex-end;
     gap: 6px;
+    min-width: 58px;
     flex-shrink: 0;
     font-size: var(--text-xs);
     color: var(--foreground-muted);
     white-space: nowrap;
+    transition: opacity var(--transition-fast);
   }
 
   .session-msg-count {
@@ -2904,13 +2907,10 @@
     line-height: 1;
   }
 
-  .session-row:hover .session-time {
+  .session-row:hover .session-meta,
+  .session-row:focus-within .session-meta {
     opacity: 0;
     pointer-events: none;
-  }
-
-  .session-time {
-    transition: opacity var(--transition-fast);
   }
 
   .session-actions {
@@ -2920,8 +2920,10 @@
     transform: translateY(-50%);
     display: inline-flex;
     align-items: center;
+    justify-content: flex-end;
+    width: 58px;
     gap: 1px;
-    padding-left: 12px;
+    padding-left: 8px;
     background: linear-gradient(90deg, transparent, var(--surface-hover) 28%);
     opacity: 0;
     pointer-events: none;

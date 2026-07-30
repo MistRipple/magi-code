@@ -1,13 +1,11 @@
 <script lang="ts">
   import {
     getCurrentSessionId,
-    isPersistedSessionId,
     messagesState,
   } from '../stores/messages.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { ensureArray } from '../lib/utils';
-  import { openCodeTab } from '../stores/right-pane.svelte';
-  import { refreshPendingChangesProjection } from '../lib/pending-changes-refresh';
+  import { changeDiffRevision, openCodeTab } from '../stores/right-pane.svelte';
   import type { Edit } from '../types/message';
   import type { IconName } from '../lib/icons';
   import Icon from './Icon.svelte';
@@ -18,8 +16,6 @@
   } from '../web/agent-api';
 
   const isWebMode = isWebAgentMode();
-  const changeRefreshIntervalMs = 1000;
-
   const edits = $derived(ensureArray(messagesState.edits) as Edit[]);
 
   // ─── 按执行分组展示 ───
@@ -104,57 +100,6 @@
   const changeMutationPending = $derived.by(() => (
     scopeMatchesActiveChangeMutation(editScope(currentRoundEdits[0] ?? earlierPendingEdits[0] ?? edits[0]))
   ));
-
-  $effect(() => {
-    const sessionId = messagesState.currentSessionId?.trim() || '';
-    const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
-    const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
-    if (
-      !isWebMode
-      || messagesState.sessionHydrating
-      || !isPersistedSessionId(sessionId)
-      || (!workspaceId && !workspacePath)
-    ) {
-      return;
-    }
-
-    let disposed = false;
-    let inFlight = false;
-    let errorReported = false;
-    const refresh = async () => {
-      if (
-        disposed
-        || inFlight
-        || messagesState.sessionHydrating
-        || messagesState.changeMutationStatus?.isMutating
-      ) {
-        return;
-      }
-      inFlight = true;
-      try {
-        if (!disposed) {
-          await refreshPendingChangesProjection({ sessionId, workspaceId, workspacePath });
-        }
-        errorReported = false;
-      } catch (error) {
-        if (!disposed && !messagesState.sessionHydrating && !errorReported) {
-          console.warn('[EditsPanel] 刷新变更列表失败:', error);
-          errorReported = true;
-        }
-      } finally {
-        inFlight = false;
-      }
-    };
-
-    void refresh();
-    const timer = window.setInterval(() => {
-      void refresh();
-    }, changeRefreshIntervalMs);
-    return () => {
-      disposed = true;
-      window.clearInterval(timer);
-    };
-  });
 
   function approveChange(edit: Edit) {
     if (changeMutationPending) return;
@@ -295,6 +240,7 @@
       ...scope,
       diff,
       isChangeDiff: Boolean(diff),
+      changeRevision: changeDiffRevision(detail),
       originalContent: detail.originalContent ?? null,
       currentContent: detail.previewContent ?? null,
       content: diff

@@ -57,6 +57,20 @@ pub struct GitObservation {
     pub dirty: GitDirtySummary,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitRefObservation {
+    pub branch: Option<String>,
+    pub head: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitTreeBaselineEntry {
+    Deleted { path: String },
+    RegularFile { path: String, content: Vec<u8> },
+    Symlink { path: String, target: Vec<u8> },
+    Gitlink { path: String, object_id: String },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitBranch {
@@ -664,6 +678,14 @@ struct CommandOutput {
     stderr: String,
 }
 
+#[derive(Debug)]
+struct BinaryCommandOutput {
+    success: bool,
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: String,
+}
+
 impl GitService {
     pub fn new() -> Self {
         Self::default()
@@ -671,6 +693,208 @@ impl GitService {
 
     pub async fn observe(&self, path: &Path) -> Result<GitObservation, GitError> {
         observe_unlocked(path).await
+    }
+
+    /// 读取当前 worktree 的 branch/HEAD 指纹。
+    ///
+    /// 该查询只执行一次 porcelain Git 命令，不扫描未跟踪文件，供变更面板高频判断
+    /// repository 基线是否变化；只有指纹变化后才需要执行完整 `observe()`。
+    pub async fn observe_ref(&self, path: &Path) -> Result<GitRefObservation, GitError> {
+        let output = run_git(
+            path,
+            &[
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "--untracked-files=no",
+            ],
+        )
+        .await?;
+        let status = ensure_success("git_ref_observation", output)?;
+        let mut branch = None;
+        let mut head = None;
+        for line in status.lines() {
+            if let Some(value) = line.strip_prefix("# branch.head ") {
+                branch = match value.trim() {
+                    "(detached)" | "(unknown)" | "" => None,
+                    value => Some(value.to_string()),
+                };
+            } else if let Some(value) = line.strip_prefix("# branch.oid ") {
+                head = match value.trim() {
+                    "(initial)" | "" => None,
+                    value => Some(value.to_string()),
+                };
+            }
+        }
+        Ok(GitRefObservation { branch, head })
+    }
+
+    /// 读取两个不可变 Git tree 之间的 baseline 增量。
+    ///
+    /// rename 按删除旧路径 + 写入新路径展开，调用方可以直接把结果应用到独立的
+    /// workspace snapshot baseline，而不会把当前 worktree 中仍未提交的内容误吞进去。
+    pub async fn tree_baseline_patch(
+        &self,
+        worktree_path: &Path,
+        previous_head: &str,
+        current_head: &str,
+    ) -> Result<Vec<GitTreeBaselineEntry>, GitError> {
+        if previous_head.trim().is_empty() || current_head.trim().is_empty() {
+            return Err(GitError::InvalidInput {
+                message: "Git tree baseline patch requires non-empty revisions".to_string(),
+            });
+        }
+        let output = run_git(
+            worktree_path,
+            &[
+                "diff",
+                "--raw",
+                "-z",
+                "--no-abbrev",
+                "--no-renames",
+                previous_head,
+                current_head,
+            ],
+        )
+        .await?;
+        let raw = ensure_success("git_tree_baseline_diff", output)?;
+        let fields = raw.split('\0').collect::<Vec<_>>();
+        let mut entries = Vec::new();
+        let mut index = 0usize;
+        while index < fields.len() {
+            let header = fields[index];
+            index += 1;
+            if header.is_empty() {
+                continue;
+            }
+            let entry_path = fields.get(index).copied().unwrap_or_default();
+            index += 1;
+            if entry_path.is_empty() {
+                return Err(GitError::Io(
+                    "Git tree baseline diff returned an empty path".to_string(),
+                ));
+            }
+            let mut parts = header.split_whitespace();
+            let _previous_mode = parts.next();
+            let current_mode = parts
+                .next()
+                .ok_or_else(|| GitError::Io(format!("invalid Git raw diff header: {header}")))?;
+            let _previous_object = parts.next();
+            let current_object = parts
+                .next()
+                .ok_or_else(|| GitError::Io(format!("invalid Git raw diff header: {header}")))?;
+            let _status = parts.next();
+
+            match current_mode {
+                "000000" => entries.push(GitTreeBaselineEntry::Deleted {
+                    path: entry_path.to_string(),
+                }),
+                "120000" => {
+                    let target = read_git_object(worktree_path, current_object, entry_path).await?;
+                    entries.push(GitTreeBaselineEntry::Symlink {
+                        path: entry_path.to_string(),
+                        target,
+                    });
+                }
+                "160000" => entries.push(GitTreeBaselineEntry::Gitlink {
+                    path: entry_path.to_string(),
+                    object_id: current_object.to_string(),
+                }),
+                _ => {
+                    let content =
+                        read_git_object(worktree_path, current_object, entry_path).await?;
+                    entries.push(GitTreeBaselineEntry::RegularFile {
+                        path: entry_path.to_string(),
+                        content,
+                    });
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// 从指定 Git revision 读取一组路径的 baseline 内容。
+    ///
+    /// 用于 session 首次建立 Git context 或恢复丢失 context 时，把已经进入 HEAD 的
+    /// pending 路径校准到提交树，同时保留 worktree 中仍不同于 HEAD 的内容。
+    pub async fn tree_baseline_entries_for_paths(
+        &self,
+        worktree_path: &Path,
+        revision: &str,
+        paths: &[String],
+    ) -> Result<Vec<GitTreeBaselineEntry>, GitError> {
+        if revision.trim().is_empty() {
+            return Err(GitError::InvalidInput {
+                message: "Git tree baseline revision cannot be empty".to_string(),
+            });
+        }
+        let mut entries = Vec::with_capacity(paths.len());
+        for entry_path in paths {
+            let output = run_git(
+                worktree_path,
+                &[
+                    "ls-tree",
+                    "-z",
+                    "--full-tree",
+                    revision,
+                    "--",
+                    entry_path.as_str(),
+                ],
+            )
+            .await?;
+            let tree_entry = ensure_success("git_tree_baseline_entry", output)?;
+            if tree_entry.is_empty() {
+                entries.push(GitTreeBaselineEntry::Deleted {
+                    path: entry_path.clone(),
+                });
+                continue;
+            }
+            let header = tree_entry
+                .split_once('\t')
+                .map(|(header, _)| header)
+                .ok_or_else(|| {
+                    GitError::Io(format!("invalid Git ls-tree entry for {entry_path}"))
+                })?;
+            let mut parts = header.split_whitespace();
+            let mode = parts
+                .next()
+                .ok_or_else(|| GitError::Io(format!("missing Git tree mode for {entry_path}")))?;
+            let _object_type = parts.next();
+            let object_id = parts
+                .next()
+                .ok_or_else(|| GitError::Io(format!("missing Git tree object for {entry_path}")))?;
+            entries.push(
+                self.read_tree_baseline_entry(worktree_path, entry_path, mode, object_id)
+                    .await?,
+            );
+        }
+        Ok(entries)
+    }
+
+    async fn read_tree_baseline_entry(
+        &self,
+        worktree_path: &Path,
+        entry_path: &str,
+        mode: &str,
+        object_id: &str,
+    ) -> Result<GitTreeBaselineEntry, GitError> {
+        match mode {
+            "000000" => Ok(GitTreeBaselineEntry::Deleted {
+                path: entry_path.to_string(),
+            }),
+            "120000" => Ok(GitTreeBaselineEntry::Symlink {
+                path: entry_path.to_string(),
+                target: read_git_object(worktree_path, object_id, entry_path).await?,
+            }),
+            "160000" => Ok(GitTreeBaselineEntry::Gitlink {
+                path: entry_path.to_string(),
+                object_id: object_id.to_string(),
+            }),
+            _ => Ok(GitTreeBaselineEntry::RegularFile {
+                path: entry_path.to_string(),
+                content: read_git_object(worktree_path, object_id, entry_path).await?,
+            }),
+        }
     }
 
     /// 判断当前观测是否只是 session 原 Git 基线在同一工作树、同一分支上的线性快进。
@@ -1536,6 +1760,42 @@ async fn run_git(path: &Path, args: &[&str]) -> Result<CommandOutput, GitError> 
     })
 }
 
+async fn run_git_bytes(path: &Path, args: &[&str]) -> Result<BinaryCommandOutput, GitError> {
+    let output = tokio_command("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| GitError::Io(error.to_string()))?;
+    Ok(BinaryCommandOutput {
+        success: output.status.success(),
+        code: output.status.code(),
+        stdout: output.stdout,
+        stderr: String::from_utf8_lossy(&output.stderr)
+            .trim_end_matches(['\r', '\n'])
+            .to_string(),
+    })
+}
+
+async fn read_git_object(
+    worktree_path: &Path,
+    object_id: &str,
+    entry_path: &str,
+) -> Result<Vec<u8>, GitError> {
+    let output = run_git_bytes(worktree_path, &["cat-file", "blob", object_id]).await?;
+    if output.success {
+        Ok(output.stdout)
+    } else {
+        Err(GitError::CommandFailed {
+            operation: format!("git_tree_blob:{entry_path}"),
+            exit_code: output.code,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: output.stderr,
+        })
+    }
+}
+
 fn ensure_success(operation: &str, output: CommandOutput) -> Result<String, GitError> {
     if output.success {
         Ok(output.stdout)
@@ -2268,6 +2528,48 @@ mod tests {
                 .await
                 .expect("classify branch switch")
         );
+    }
+
+    #[tokio::test]
+    async fn ref_observation_and_tree_patch_preserve_git_tree_content() {
+        let repo = repository();
+        fs::write(repo.path().join("deleted.txt"), "delete me\n").expect("deleted fixture");
+        git(repo.path(), &["add", "deleted.txt"]);
+        git(repo.path(), &["commit", "-m", "add delete fixture"]);
+        let service = GitService::new();
+        let before = service.observe(repo.path()).await.expect("observe before");
+        let before_head = before.head.expect("before HEAD");
+
+        fs::write(repo.path().join("README.md"), b"updated\n\0binary").expect("modify fixture");
+        fs::write(repo.path().join("added.txt"), "added\n").expect("add fixture");
+        fs::remove_file(repo.path().join("deleted.txt")).expect("delete fixture");
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-m", "tree patch fixture"]);
+
+        let after = service.observe(repo.path()).await.expect("observe after");
+        let after_head = after.head.clone().expect("after HEAD");
+        let reference = service.observe_ref(repo.path()).await.expect("observe ref");
+        assert_eq!(reference.branch.as_deref(), Some("main"));
+        assert_eq!(reference.head.as_deref(), Some(after_head.as_str()));
+
+        let patch = service
+            .tree_baseline_patch(repo.path(), &before_head, &after_head)
+            .await
+            .expect("tree patch");
+        assert!(patch.iter().any(|entry| matches!(
+            entry,
+            GitTreeBaselineEntry::RegularFile { path, content }
+                if path == "README.md" && content == b"updated\n\0binary"
+        )));
+        assert!(patch.iter().any(|entry| matches!(
+            entry,
+            GitTreeBaselineEntry::RegularFile { path, content }
+                if path == "added.txt" && content == b"added\n"
+        )));
+        assert!(patch.iter().any(|entry| matches!(
+            entry,
+            GitTreeBaselineEntry::Deleted { path } if path == "deleted.txt"
+        )));
     }
 
     #[test]

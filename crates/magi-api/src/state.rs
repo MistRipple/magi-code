@@ -48,7 +48,7 @@ use magi_orchestrator::{
 };
 use magi_session_store::{SessionLifecycleObserver, SessionRecord, SessionStore};
 use magi_settings_store::SettingsStore;
-use magi_snapshot::{SnapshotManager, SnapshotSession};
+use magi_snapshot::{BaselinePatchEntry, SnapshotManager, SnapshotSession};
 use magi_tool_runtime::{
     RuntimeCapabilityDependencyEntry, RuntimeCapabilityDependencyProvider, ToolExecutionContext,
     ToolExecutionContextQuery, ToolRegistry,
@@ -82,6 +82,28 @@ pub struct RunnerHandle {
 
 type RunnerTerminalObserver = Arc<dyn Fn(TaskId, Option<SessionId>, String) + Send + Sync>;
 pub type SessionStateCheckpointPersist = Arc<dyn Fn(&str) -> Result<(), ApiError> + Send + Sync>;
+
+fn snapshot_baseline_patch(
+    entries: Vec<magi_git::GitTreeBaselineEntry>,
+) -> Vec<BaselinePatchEntry> {
+    entries
+        .into_iter()
+        .map(|entry| match entry {
+            magi_git::GitTreeBaselineEntry::Deleted { path } => {
+                BaselinePatchEntry::Deleted { path }
+            }
+            magi_git::GitTreeBaselineEntry::RegularFile { path, content } => {
+                BaselinePatchEntry::RegularFile { path, content }
+            }
+            magi_git::GitTreeBaselineEntry::Symlink { path, target } => {
+                BaselinePatchEntry::Symlink { path, target }
+            }
+            magi_git::GitTreeBaselineEntry::Gitlink { path, object_id } => {
+                BaselinePatchEntry::Gitlink { path, object_id }
+            }
+        })
+        .collect()
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct QueuedRegularSessionTurn {
@@ -808,6 +830,7 @@ pub struct ApiState {
     pub spawn_graph: Arc<Mutex<magi_spawn_graph::SpawnGraph>>,
     session_turn_queue: Arc<Mutex<HashMap<SessionId, VecDeque<QueuedRegularSessionTurn>>>>,
     session_turn_locks: Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
+    session_change_sync_locks: Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -996,6 +1019,7 @@ impl ApiState {
             spawn_graph: Arc::new(Mutex::new(magi_spawn_graph::SpawnGraph::new())),
             session_turn_queue: Arc::new(Mutex::new(HashMap::new())),
             session_turn_locks: Arc::new(Mutex::new(HashMap::new())),
+            session_change_sync_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1059,6 +1083,219 @@ impl ApiState {
             )
             .await
             .map_err(|error| ApiError::internal_assembly("启动会话快照账本失败", error))
+    }
+
+    /// 同步 session 变更面板依赖的磁盘状态与 Git baseline。
+    ///
+    /// `force_reconcile` 用于页面首次打开、窗口重新聚焦及执行变更操作前的强一致读取；
+    /// 常规轮询依赖 watcher 增量，只做轻量 Git ref 指纹检查。同分支快进只应用
+    /// old HEAD→new HEAD 的 tree patch，绝不把整个 dirty worktree 直接提升为 baseline。
+    pub(crate) async fn synchronize_session_changes(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &WorkspaceId,
+        workspace_root: &Path,
+        force_reconcile: bool,
+    ) -> Result<Arc<SnapshotSession>, ApiError> {
+        let _sync_guard = self.lock_session_change_sync(session_id).await;
+        let snapshot = self
+            .ensure_snapshot_session(session_id, workspace_root)
+            .await?;
+        if force_reconcile {
+            snapshot
+                .reconcile()
+                .map_err(|error| ApiError::internal_assembly("刷新磁盘变更状态失败", error))?;
+        }
+
+        let Some(existing_context) = self.session_code_contexts.get(session_id.as_str()) else {
+            match self.git_service.observe(workspace_root).await {
+                Ok(observation) => {
+                    self.align_snapshot_baseline_to_observation_head(
+                        workspace_root,
+                        &observation,
+                        &snapshot,
+                    )
+                    .await?;
+                    self.session_code_contexts.accept(
+                        session_id.as_str(),
+                        workspace_id.as_str(),
+                        vec![workspace_root.to_path_buf()],
+                        &observation,
+                    );
+                    self.persist_session_git_contexts()?;
+                }
+                Err(magi_git::GitError::NotRepository { .. }) => {}
+                Err(error) => {
+                    return Err(ApiError::internal_assembly(
+                        "初始化变更面板 Git context 失败",
+                        error,
+                    ));
+                }
+            }
+            return Ok(snapshot);
+        };
+
+        let ref_observation = match self.git_service.observe_ref(workspace_root).await {
+            Ok(observation) => observation,
+            Err(magi_git::GitError::NotRepository { .. }) => return Ok(snapshot),
+            Err(error) => {
+                return Err(ApiError::internal_assembly(
+                    "刷新变更面板 Git ref 失败",
+                    error,
+                ));
+            }
+        };
+        let observed_ref_changed = existing_context.git.observed_branch != ref_observation.branch
+            || existing_context.git.observed_head != ref_observation.head;
+        if !existing_context.has_external_drift() && !observed_ref_changed {
+            return Ok(snapshot);
+        }
+
+        let observation = self
+            .git_service
+            .observe(workspace_root)
+            .await
+            .map_err(|error| ApiError::internal_assembly("刷新变更面板 Git context 失败", error))?;
+        let observed_context = self.session_code_contexts.observe(
+            session_id.as_str(),
+            workspace_id.as_str(),
+            existing_context.runtime_workspace_roots.clone(),
+            &observation,
+        );
+        if !observed_context.has_external_drift() {
+            self.persist_session_git_contexts()?;
+            return Ok(snapshot);
+        }
+
+        let safe_fast_forward = self
+            .git_service
+            .is_session_context_fast_forward(&existing_context, &observation)
+            .await
+            .map_err(|error| {
+                ApiError::internal_assembly("判断变更面板 Git context 是否安全快进失败", error)
+            })?;
+        if !safe_fast_forward
+            || self
+                .workspace_git_coordinator
+                .session_holds_execution(session_id.as_str(), &existing_context.git.git_common_dir)
+        {
+            self.persist_session_git_contexts()?;
+            if observed_ref_changed {
+                self.publish_session_git_drift(
+                    session_id,
+                    workspace_id,
+                    &observed_context,
+                    existing_context.git.observed_head.as_deref(),
+                    if safe_fast_forward {
+                        "fast_forward_pending"
+                    } else {
+                        "external_drift_detected"
+                    },
+                );
+            }
+            return Ok(snapshot);
+        }
+
+        self.advance_snapshot_baseline_for_fast_forward(
+            session_id,
+            workspace_root,
+            &existing_context,
+            &observation,
+            &snapshot,
+        )
+        .await?;
+        let context = self.session_code_contexts.accept(
+            session_id.as_str(),
+            workspace_id.as_str(),
+            existing_context.runtime_workspace_roots.clone(),
+            &observation,
+        );
+        self.persist_session_git_contexts()?;
+        if let Some(previous_head) = existing_context.git.base_head.as_deref() {
+            self.publish_session_git_fast_forward(
+                session_id,
+                workspace_id,
+                &context,
+                previous_head,
+            );
+        }
+        self.schedule_workspace_code_index(workspace_id.clone(), workspace_root.to_path_buf());
+        Ok(snapshot)
+    }
+
+    async fn advance_snapshot_baseline_for_fast_forward(
+        &self,
+        session_id: &SessionId,
+        workspace_root: &Path,
+        existing_context: &magi_git::SessionCodeContext,
+        observation: &magi_git::GitObservation,
+        snapshot: &SnapshotSession,
+    ) -> Result<(), ApiError> {
+        let previous_head = existing_context.git.base_head.as_deref().ok_or_else(|| {
+            ApiError::InternalAssemblyError("原 Git baseline HEAD 缺失".to_string())
+        })?;
+        let current_head = observation.head.as_deref().ok_or_else(|| {
+            ApiError::InternalAssemblyError("新 Git baseline HEAD 缺失".to_string())
+        })?;
+        snapshot
+            .reconcile()
+            .map_err(|error| ApiError::internal_assembly("Git 快进前刷新磁盘状态失败", error))?;
+        let git_patch = self
+            .git_service
+            .tree_baseline_patch(workspace_root, previous_head, current_head)
+            .await
+            .map_err(|error| {
+                ApiError::internal_assembly("读取 Git 快进 baseline 补丁失败", error)
+            })?;
+        let snapshot_patch = snapshot_baseline_patch(git_patch);
+        snapshot
+            .apply_baseline_patch(&snapshot_patch)
+            .map_err(|error| {
+                tracing::error!(session_id = %session_id, ?error, "推进 session Git baseline 失败");
+                ApiError::internal_assembly("推进 session Git baseline 失败", error)
+            })?;
+        Ok(())
+    }
+
+    async fn align_snapshot_baseline_to_observation_head(
+        &self,
+        workspace_root: &Path,
+        observation: &magi_git::GitObservation,
+        snapshot: &SnapshotSession,
+    ) -> Result<(), ApiError> {
+        let Some(head) = observation.head.as_deref() else {
+            return Ok(());
+        };
+        snapshot.reconcile().map_err(|error| {
+            ApiError::internal_assembly("Git baseline 校准前刷新磁盘失败", error)
+        })?;
+        let mut paths = snapshot
+            .pending_changes()
+            .map_err(|error| ApiError::internal_assembly("读取待校准变更失败", error))?
+            .into_iter()
+            .flat_map(|change| {
+                change
+                    .old_path
+                    .into_iter()
+                    .chain(std::iter::once(change.path))
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let git_entries = self
+            .git_service
+            .tree_baseline_entries_for_paths(workspace_root, head, &paths)
+            .await
+            .map_err(|error| ApiError::internal_assembly("读取 Git HEAD baseline 失败", error))?;
+        snapshot
+            .apply_baseline_patch(&snapshot_baseline_patch(git_entries))
+            .map_err(|error| {
+                ApiError::internal_assembly("校准 snapshot Git baseline 失败", error)
+            })?;
+        Ok(())
     }
 
     pub(crate) async fn ensure_snapshot_session_for_workspace_id(
@@ -1741,6 +1978,7 @@ impl ApiState {
         let workspace_root = self
             .workspace_root_path(&Some(workspace_id.clone()))
             .ok_or_else(|| ApiError::not_found("workspace 不存在", workspace_id.as_str()))?;
+        let _change_sync_guard = self.lock_session_change_sync(session_id).await;
         let session_key = session_id.as_str();
         let existing_context = self.session_code_contexts.get(session_key);
         if let Some(existing_context) = existing_context.as_ref() {
@@ -1761,18 +1999,41 @@ impl ApiState {
                 )));
             }
         };
+        if existing_context.is_none() {
+            let snapshot = match self
+                .ensure_snapshot_session(session_id, &observation.worktree_path)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.release_session_git_execution_lease(session_id);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self
+                .align_snapshot_baseline_to_observation_head(
+                    &observation.worktree_path,
+                    &observation,
+                    &snapshot,
+                )
+                .await
+            {
+                self.release_session_git_execution_lease(session_id);
+                return Err(error);
+            }
+        }
         let mut context = if existing_context.is_some() {
             self.session_code_contexts.observe(
                 session_key,
                 workspace_id.as_str(),
-                vec![workspace_root],
+                vec![workspace_root.clone()],
                 &observation,
             )
         } else {
             self.session_code_contexts.accept(
                 session_key,
                 workspace_id.as_str(),
-                vec![workspace_root],
+                vec![workspace_root.clone()],
                 &observation,
             )
         };
@@ -1797,16 +2058,28 @@ impl ApiState {
                 }
             }
         {
+            let snapshot = match self
+                .ensure_snapshot_session(session_id, &observation.worktree_path)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.release_session_git_execution_lease(session_id);
+                    return Err(error);
+                }
+            };
             if let Err(error) = self
-                .snapshot_manager
-                .rebase_session(session_id.to_string(), observation.worktree_path.clone())
+                .advance_snapshot_baseline_for_fast_forward(
+                    session_id,
+                    &observation.worktree_path,
+                    existing_context,
+                    &observation,
+                    &snapshot,
+                )
                 .await
             {
                 self.release_session_git_execution_lease(session_id);
-                return Err(ApiError::internal_assembly(
-                    "Git 快进后重建变更基线失败",
-                    error,
-                ));
+                return Err(error);
             }
             context = self.session_code_contexts.accept(
                 session_key,
@@ -1886,7 +2159,44 @@ impl ApiState {
                     "previous_head": previous_head,
                     "context_revision": context.context_revision,
                     "change_kind": "fast_forward_adopted",
-                    "refresh_scopes": ["file_tree", "code_index", "knowledge", "context_cache"]
+                    "refresh_scopes": ["changes", "file_tree", "code_index", "knowledge", "context_cache"]
+                }),
+            )
+            .with_context(EventContext {
+                session_id: Some(session_id.clone()),
+                workspace_id: Some(workspace_id.clone()),
+                ..EventContext::default()
+            }),
+        );
+    }
+
+    fn publish_session_git_drift(
+        &self,
+        session_id: &SessionId,
+        workspace_id: &WorkspaceId,
+        context: &magi_git::SessionCodeContext,
+        previous_head: Option<&str>,
+        change_kind: &str,
+    ) {
+        let now = UtcMillis::now();
+        self.event_bus.publish(
+            EventEnvelope::domain(
+                magi_core::EventId::new(format!(
+                    "workspace-git-context-changed-{workspace_id}-{}",
+                    now.0
+                )),
+                "workspace.git.context.changed",
+                serde_json::json!({
+                    "workspace_id": workspace_id,
+                    "session_id": session_id,
+                    "repository_root": context.git.repository_root,
+                    "worktree_path": context.git.worktree_path,
+                    "branch": context.git.observed_branch,
+                    "head": context.git.observed_head,
+                    "previous_head": previous_head,
+                    "context_revision": context.context_revision,
+                    "change_kind": change_kind,
+                    "refresh_scopes": ["changes", "file_tree", "code_index", "knowledge", "context_cache"]
                 }),
             )
             .with_context(EventContext {
@@ -2141,6 +2451,23 @@ impl ApiState {
                 .session_turn_locks
                 .lock()
                 .expect("session turn locks should hold");
+            locks
+                .entry(session_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    async fn lock_session_change_sync(
+        &self,
+        session_id: &SessionId,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .session_change_sync_locks
+                .lock()
+                .expect("session change sync locks should hold");
             locks
                 .entry(session_id.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -2427,6 +2754,10 @@ impl ApiState {
         self.session_turn_locks
             .lock()
             .expect("session turn locks should hold")
+            .remove(session_id);
+        self.session_change_sync_locks
+            .lock()
+            .expect("session change sync locks should hold")
             .remove(session_id);
         Ok(())
     }

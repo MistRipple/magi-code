@@ -5,7 +5,9 @@
 //! 但 macOS sandbox / 一些 CI 环境无法投递 FSEvents，所以测试用 reconcile
 //! 显式驱动同一段代码以保证可重现。Watcher 自身在 docs 与生产 wiring 中验证。
 
-use magi_snapshot::{ChangeKind, ContentKind, SnapshotManager, SourceKind, ToolHook, ToolHookCtx};
+use magi_snapshot::{
+    BaselinePatchEntry, ChangeKind, ContentKind, SnapshotManager, SourceKind, ToolHook, ToolHookCtx,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -129,6 +131,73 @@ async fn external_write_is_captured() {
     assert!(change.original_content.as_deref() == Some("before"));
     assert!(change.preview_content.as_deref() == Some("after"));
     assert!(change.unified_diff.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn baseline_patch_clears_only_committed_paths_and_preserves_later_disk_changes() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("committed.txt"), "v0\n").unwrap();
+    fs::write(root.join("pending.txt"), "v0\n").unwrap();
+
+    let manager = SnapshotManager::new();
+    let session = manager
+        .start_session("s-baseline-patch".into(), root.clone())
+        .await
+        .unwrap();
+    fs::write(root.join("committed.txt"), "v1\n").unwrap();
+    fs::write(root.join("pending.txt"), "v1\n").unwrap();
+    session.reconcile().unwrap();
+
+    session
+        .apply_baseline_patch(&[BaselinePatchEntry::RegularFile {
+            path: "committed.txt".to_string(),
+            content: b"v1\n".to_vec(),
+        }])
+        .unwrap();
+    let pending = session.pending_changes().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].path, "pending.txt");
+
+    fs::write(root.join("committed.txt"), "v2\n").unwrap();
+    fs::write(root.join("pending.txt"), "v0\n").unwrap();
+    session.reconcile().unwrap();
+    let pending = session.pending_changes().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].path, "committed.txt");
+    assert_eq!(pending[0].original_content.as_deref(), Some("v1\n"));
+    assert_eq!(pending[0].preview_content.as_deref(), Some("v2\n"));
+    assert_eq!(pending[0].source, SourceKind::External);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn baseline_patch_preserves_pending_event_when_disk_is_newer_than_commit() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::write(root.join("tracked.txt"), "v0\n").unwrap();
+
+    let manager = SnapshotManager::new();
+    let session = manager
+        .start_session("s-baseline-newer-disk".into(), root.clone())
+        .await
+        .unwrap();
+    fs::write(root.join("tracked.txt"), "v2\n").unwrap();
+    session.reconcile().unwrap();
+    let before = session.pending_changes().unwrap();
+    assert_eq!(before.len(), 1);
+
+    session
+        .apply_baseline_patch(&[BaselinePatchEntry::RegularFile {
+            path: "tracked.txt".to_string(),
+            content: b"v1\n".to_vec(),
+        }])
+        .unwrap();
+    let after = session.pending_changes().unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].original_content.as_deref(), Some("v1\n"));
+    assert_eq!(after[0].preview_content.as_deref(), Some("v2\n"));
+    assert_eq!(after[0].source, SourceKind::External);
+    assert_eq!(after[0].timestamp_ms, before[0].timestamp_ms);
 }
 
 #[tokio::test(flavor = "multi_thread")]

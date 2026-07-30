@@ -162,5 +162,67 @@ await withGoldenViteServer(async (server) => {
   assert.equal(collapsePane.openTabs.length, 0, 'closing the final tab must empty the pane');
   assert.equal(collapsePane.collapsed, true, 'closing the final tab must collapse the pane');
 
+  rightPane.activateRightPaneSession('workspace-changes', 'session-changes');
+  const alphaRevision = rightPane.changeDiffRevision({
+    filePath: 'alpha.txt',
+    snapshotId: 'snapshot-alpha',
+    updatedAt: 1,
+  });
+  rightPane.openCodeTab('session-changes', 'alpha.txt', {
+    workspaceId: 'workspace-changes',
+    sessionId: 'session-changes',
+    isChangeDiff: true,
+    changeRevision: alphaRevision,
+    diff: '@@ -1 +1 @@\n-alpha-v1\n+alpha-v2',
+    originalContent: 'alpha-v1\n',
+    currentContent: 'alpha-v2\n',
+  });
+  rightPane.openCodeTab('session-changes', 'beta.txt', {
+    workspaceId: 'workspace-changes',
+    sessionId: 'session-changes',
+    isChangeDiff: true,
+    changeRevision: rightPane.changeDiffRevision({
+      filePath: 'beta.txt',
+      snapshotId: 'snapshot-beta',
+      updatedAt: 1,
+    }),
+  });
+  rightPane.openCodeTab('session-changes', 'README.md', {
+    workspaceId: 'workspace-changes',
+    sessionId: 'session-changes',
+    content: 'README',
+  });
+  rightPane.synchronizeChangeDiffTabs('workspace-changes', 'session-changes', [
+    {
+      filePath: 'alpha.txt',
+      snapshotId: 'snapshot-alpha',
+      updatedAt: 2,
+      contentKind: 'text',
+      size: 9,
+    },
+  ]);
+  const synchronizedPane = rightPane.getRightPaneState(rightPane.rightPaneState.activeScopeKey);
+  assert.deepEqual(
+    synchronizedPane.openTabs.map((tab) => tab.id),
+    ['code:alpha.txt', 'code:README.md'],
+    '变更投影移除文件后必须关闭对应 diff tab，同时保留普通文件预览',
+  );
+  const synchronizedAlpha = synchronizedPane.openTabs.find((tab) => tab.id === 'code:alpha.txt');
+  assert.equal(
+    synchronizedAlpha?.payload.changeRevision,
+    'snapshot-alpha:2',
+    '仍在变更集中的 diff tab 必须更新到最新投影版本',
+  );
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(synchronizedAlpha?.payload ?? {}, 'diff'),
+    false,
+    '投影版本变化后必须清除旧 diff 内容并重新读取',
+  );
+  assert.equal(
+    synchronizedPane.openTabs.find((tab) => tab.id === 'code:README.md')?.payload.content,
+    'README',
+    '普通文件预览不得被变更投影同步影响',
+  );
+
   console.log('right pane golden replay passed');
 });

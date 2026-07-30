@@ -36,6 +36,8 @@ export interface CodeTabPayload {
   currentContent?: string | null;
   /** 该 tab 来自变更记录；刷新恢复时用权威 changes/diff 接口重取 diff，不持久化大文本 */
   isChangeDiff?: boolean;
+  /** 变更投影版本；变化时废弃旧 diff 缓存并从权威接口重新读取。 */
+  changeRevision?: string;
   /** 可选：单文件源码；不存在时 RightPane 异步拉取 */
   content?: string | null;
   /** 可选：语言提示，用于语法高亮（按扩展名兜底） */
@@ -173,6 +175,7 @@ function sanitizeTabForPersist(tab: RightPaneTab): RightPaneTab {
     workspacePath: payload.workspacePath,
     sessionId: payload.sessionId,
     isChangeDiff: payload.isChangeDiff,
+    changeRevision: payload.changeRevision,
     language: payload.language ?? null,
     contentKind: payload.contentKind,
     size: payload.size,
@@ -507,6 +510,7 @@ export function openCodeTab(
     originalContent?: string | null;
     currentContent?: string | null;
     isChangeDiff?: boolean;
+    changeRevision?: string;
     content?: string | null;
     language?: string | null;
     workspaceId?: string;
@@ -557,6 +561,7 @@ export function openCodeTab(
         ? { currentContent: options?.currentContent ?? null }
         : {}),
       isChangeDiff: options?.isChangeDiff,
+      changeRevision: options?.changeRevision,
       content: options?.content ?? null,
       language: options?.language ?? null,
       contentKind: options?.contentKind,
@@ -569,6 +574,90 @@ export function openCodeTab(
     label,
     null,
   );
+}
+
+export interface PendingChangeTabProjection {
+  filePath: string;
+  snapshotId?: string;
+  updatedAt?: number;
+  contentKind?: import('../types/message').EditContentKind;
+  size?: number;
+  mime?: string;
+  symlinkTarget?: string;
+  headSummary?: string;
+  tailSummary?: string;
+}
+
+export function changeDiffRevision(change: PendingChangeTabProjection): string {
+  return [
+    change.snapshotId?.trim() ?? '',
+    typeof change.updatedAt === 'number' && Number.isFinite(change.updatedAt)
+      ? String(change.updatedAt)
+      : '0',
+  ].join(':');
+}
+
+/**
+ * 用权威 pending changes 投影同步已打开的变更 diff 页签。
+ * 已退出变更集的页签立即关闭；仍存在但版本变化的页签清除旧内容，交由 RightPane 重新拉取。
+ */
+export function synchronizeChangeDiffTabs(
+  workspaceId: string | null | undefined,
+  sessionId: string | null | undefined,
+  pendingChanges: readonly PendingChangeTabProjection[],
+): void {
+  const scopeKey = sessionScopeKey(workspaceId, sessionId);
+  if (!scopeKey) {
+    return;
+  }
+  const pane = rightPaneState.perSession[scopeKey];
+  if (!pane) {
+    return;
+  }
+  const changesByPath = new Map(
+    pendingChanges
+      .map((change) => [change.filePath.trim(), change] as const)
+      .filter(([filePath]) => filePath.length > 0),
+  );
+  const staleTabIds: string[] = [];
+  for (const tab of pane.openTabs) {
+    if (tab.kind !== 'code') {
+      continue;
+    }
+    const payload = tab.payload as CodeTabPayload;
+    if (!payload.isChangeDiff) {
+      continue;
+    }
+    const change = changesByPath.get(payload.filepath);
+    if (!change) {
+      staleTabIds.push(tab.id);
+      continue;
+    }
+    const nextRevision = changeDiffRevision(change);
+    if (payload.changeRevision === nextRevision) {
+      continue;
+    }
+    const {
+      diff: _diff,
+      originalContent: _originalContent,
+      currentContent: _currentContent,
+      content: _content,
+      ...stablePayload
+    } = payload;
+    tab.payload = {
+      ...stablePayload,
+      changeRevision: nextRevision,
+      contentKind: change.contentKind,
+      size: change.size,
+      mime: change.mime,
+      symlinkTarget: change.symlinkTarget,
+      headSummary: change.headSummary,
+      tailSummary: change.tailSummary,
+    };
+  }
+  for (const tabId of staleTabIds) {
+    closeTab(scopeKey, tabId);
+  }
 }
 
 /**

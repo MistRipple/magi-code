@@ -2172,10 +2172,18 @@ export interface AgentPendingChangesPayload {
 }
 
 export async function getAgentPendingChanges(
-  options: { sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+  options: {
+    sessionId?: string;
+    workspaceId?: string;
+    workspacePath?: string;
+    forceRefresh?: boolean;
+  } = {},
 ): Promise<AgentPendingChangesPayload> {
   try {
-    const query = buildBoundQueryWithOverride({}, options);
+    const query = buildBoundQueryWithOverride(
+      options.forceRefresh ? { forceRefresh: 'true' } : {},
+      options,
+    );
     const response = await getTransport().request(agentUrl('/api/changes', query));
     return await parseAgentJson<AgentPendingChangesPayload>(response, 'load pending changes');
   } catch (error) {

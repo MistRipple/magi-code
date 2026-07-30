@@ -19,6 +19,6 @@ pub use manager::SnapshotManager;
 pub use session::SnapshotSession;
 pub use tool_hook::{ToolHook, ToolHookCtx};
 pub use types::{
-    ChangeEvent, ChangeKind, ContentKind, FileMeta, PendingChange, SourceKind, SymlinkInfo,
-    SymlinkTargetKind,
+    BaselinePatchEntry, ChangeEvent, ChangeKind, ContentKind, FileMeta, PendingChange, SourceKind,
+    SymlinkInfo, SymlinkTargetKind,
 };

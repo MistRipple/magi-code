@@ -32,6 +32,14 @@ pub enum ChangeKind {
     Renamed,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BaselinePatchEntry {
+    Deleted { path: String },
+    RegularFile { path: String, content: Vec<u8> },
+    Symlink { path: String, target: Vec<u8> },
+    Gitlink { path: String, object_id: String },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SymlinkInfo {

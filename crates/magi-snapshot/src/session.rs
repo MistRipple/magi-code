@@ -3,17 +3,18 @@ use crate::blob_store::BlobStore;
 use crate::change_log::ChangeLog;
 use crate::error::{SnapshotError, SnapshotResult};
 use crate::scan::{
-    SnapshotPathFilter, hash_file, mtime_ms, read_file_meta, read_large_text_summary,
-    walk_workspace,
+    SnapshotPathFilter, guess_mime, hash_file, looks_binary, mtime_ms, read_file_meta,
+    read_large_text_summary, walk_workspace,
 };
 use crate::tool_hook::{ToolHook, ToolHookCtx};
 use crate::types::{
-    ChangeEvent, ChangeKind, ContentKind, FileMeta, PendingChange, SourceKind, SymlinkTargetKind,
+    BINARY_BLOB_LIMIT, BaselinePatchEntry, ChangeEvent, ChangeKind, ContentKind, FileMeta,
+    PendingChange, SourceKind, SymlinkInfo, SymlinkTargetKind, TEXT_BLOB_LIMIT,
 };
 use crate::watcher::{DebouncedEvent, DebouncedKind};
 use similar::TextDiff;
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
@@ -460,6 +461,118 @@ impl SnapshotSession {
             }
         }
         Ok(())
+    }
+
+    /// 使用外部权威代码树提供的增量推进 baseline。
+    ///
+    /// 该方法只更新补丁中出现的路径，`current` 始终保留实际 worktree 状态。因此 Git
+    /// 部分提交后，已提交内容会退出 pending，仍未提交或提交后再次修改的内容会继续展示。
+    pub fn apply_baseline_patch(&self, entries: &[BaselinePatchEntry]) -> SnapshotResult<usize> {
+        let mut prepared = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let raw_path = match entry {
+                BaselinePatchEntry::Deleted { path }
+                | BaselinePatchEntry::RegularFile { path, .. }
+                | BaselinePatchEntry::Symlink { path, .. }
+                | BaselinePatchEntry::Gitlink { path, .. } => path,
+            };
+            let path = validate_baseline_patch_path(raw_path)?;
+            if self.path_filter.excludes_relative_str(&path) {
+                continue;
+            }
+            let meta = match entry {
+                BaselinePatchEntry::Deleted { .. } | BaselinePatchEntry::Gitlink { .. } => None,
+                BaselinePatchEntry::RegularFile { content, .. } => {
+                    Some(self.file_meta_from_baseline_bytes(path.clone(), content)?)
+                }
+                BaselinePatchEntry::Symlink { target, .. } => Some(FileMeta {
+                    path: path.clone(),
+                    content_kind: ContentKind::Symlink,
+                    size: target.len() as u64,
+                    mime: None,
+                    blob_hash: None,
+                    content_hash: None,
+                    mtime_ms: None,
+                    symlink: Some(SymlinkInfo {
+                        target: String::from_utf8_lossy(target).into_owned(),
+                        target_kind: SymlinkTargetKind::Unknown,
+                    }),
+                    error: None,
+                }),
+            };
+            prepared.push((path, meta));
+        }
+
+        let mut baseline = self.baseline.write().expect("baseline poisoned");
+        let mut refs = self.refs.write().expect("refs poisoned");
+        for (path, meta) in &prepared {
+            if let Some(previous) = baseline.remove(path)
+                && let Some(hash) = previous.blob_hash.as_deref()
+            {
+                self.blobs.release(hash)?;
+            }
+            match meta {
+                Some(meta) => {
+                    baseline.upsert(meta.clone());
+                    refs.upsert(meta.clone());
+                }
+                None => {
+                    refs.remove(path);
+                }
+            }
+        }
+        baseline.save(&baseline_path(&self.session_dir))?;
+        refs.save(&refs_path(&self.session_dir))?;
+        drop(refs);
+        drop(baseline);
+
+        let current = self.current.read().expect("current poisoned");
+        let mut last_event = self.last_event.write().expect("last_event poisoned");
+        for (path, meta) in &prepared {
+            let baseline_matches_current = match (meta.as_ref(), current.get(path)) {
+                (None, None) => true,
+                (Some(baseline_meta), Some(current_meta)) => {
+                    meta_unchanged(baseline_meta, current_meta)
+                }
+                _ => false,
+            };
+            if baseline_matches_current {
+                last_event.remove(path);
+            }
+        }
+        Ok(prepared.len())
+    }
+
+    fn file_meta_from_baseline_bytes(
+        &self,
+        path: String,
+        content: &[u8],
+    ) -> SnapshotResult<FileMeta> {
+        let size = content.len() as u64;
+        let content_hash = BlobStore::hash_bytes(content);
+        let binary = looks_binary(&content[..content.len().min(8192)]);
+        let (content_kind, blob_hash) = if binary {
+            if size > BINARY_BLOB_LIMIT {
+                (ContentKind::Binary, None)
+            } else {
+                (ContentKind::Binary, Some(self.blobs.put(content, false)?))
+            }
+        } else if size > TEXT_BLOB_LIMIT {
+            (ContentKind::LargeText, None)
+        } else {
+            (ContentKind::Text, Some(self.blobs.put(content, true)?))
+        };
+        Ok(FileMeta {
+            mime: guess_mime(Path::new(&path)),
+            path,
+            content_kind,
+            size,
+            blob_hash,
+            content_hash: Some(content_hash),
+            mtime_ms: None,
+            symlink: None,
+            error: None,
+        })
     }
 
     fn active_tool_context_for_path(&self, abs: &Path) -> Option<ToolHookCtx> {
@@ -1127,14 +1240,51 @@ fn normalized_path(path: &Path) -> String {
         .to_string()
 }
 
+fn validate_baseline_patch_path(path: &str) -> SnapshotResult<String> {
+    let path = Path::new(path);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(SnapshotError::Internal(format!(
+            "baseline patch path must stay inside workspace: {}",
+            path.display()
+        )));
+    }
+    let normalized = normalized_path(path);
+    if normalized.is_empty() || normalized == "." {
+        return Err(SnapshotError::Internal(
+            "baseline patch path cannot be empty".to_string(),
+        ));
+    }
+    Ok(normalized)
+}
+
 fn meta_unchanged(a: &FileMeta, b: &FileMeta) -> bool {
     a.path == b.path
         && a.content_kind == b.content_kind
         && a.size == b.size
         && a.blob_hash == b.blob_hash
         && a.content_hash == b.content_hash
-        && a.symlink == b.symlink
+        && symlink_meta_unchanged(a.symlink.as_ref(), b.symlink.as_ref())
         && a.error == b.error
+}
+
+fn symlink_meta_unchanged(left: Option<&SymlinkInfo>, right: Option<&SymlinkInfo>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.target == right.target
+                && (left.target_kind == right.target_kind
+                    || left.target_kind == SymlinkTargetKind::Unknown
+                    || right.target_kind == SymlinkTargetKind::Unknown)
+        }
+        _ => false,
+    }
 }
 
 fn meta_can_restore(meta: &FileMeta) -> bool {

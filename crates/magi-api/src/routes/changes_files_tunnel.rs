@@ -67,9 +67,15 @@ pub fn routes() -> Router<ApiState> {
 async fn require_snapshot_session(
     state: &ApiState,
     scope: &SessionChangeScope,
+    force_reconcile: bool,
 ) -> Result<Arc<SnapshotSession>, ApiError> {
     state
-        .ensure_snapshot_session(&scope.session_id, &scope.workspace_root)
+        .synchronize_session_changes(
+            &scope.session_id,
+            &scope.workspace_id,
+            &scope.workspace_root,
+            force_reconcile,
+        )
         .await
 }
 
@@ -190,6 +196,8 @@ struct ChangesQuery {
     session_id: Option<String>,
     workspace_id: Option<String>,
     workspace_path: Option<String>,
+    #[serde(default)]
+    force_refresh: bool,
 }
 
 async fn list_changes(
@@ -204,7 +212,7 @@ async fn list_changes(
         query.workspace_path.as_deref(),
         None,
     )?;
-    require_snapshot_session(&state, &scope).await?;
+    require_snapshot_session(&state, &scope, query.force_refresh).await?;
     let projection = collect_session_pending_changes_with_state(
         &state,
         &scope.session_id,
@@ -250,7 +258,7 @@ async fn get_diff(
                 query.workspace_path.as_deref(),
                 query.execution_group_id.as_deref(),
             )?;
-            let snapshot = require_snapshot_session(&state, &scope).await?;
+            let snapshot = require_snapshot_session(&state, &scope, true).await?;
             let pending = snapshot
                 .pending_changes()
                 .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
@@ -373,7 +381,7 @@ async fn approve_change(
         None,
     )?;
     let rel = safe_relative_path(&request.file_path)?.to_string();
-    let snapshot = require_snapshot_session(&state, &scope).await?;
+    let snapshot = require_snapshot_session(&state, &scope, true).await?;
     snapshot
         .approve(&[rel])
         .map_err(|e| ApiError::internal_assembly("approve 变更失败", e))?;
@@ -409,7 +417,7 @@ async fn revert_change(
         None,
     )?;
     let rel = safe_relative_path(&request.file_path)?.to_string();
-    let snapshot = require_snapshot_session(&state, &scope).await?;
+    let snapshot = require_snapshot_session(&state, &scope, true).await?;
     snapshot
         .revert(&[rel])
         .map_err(|e| ApiError::internal_assembly("revert 变更失败", e))?;
@@ -443,7 +451,7 @@ async fn approve_all_changes(
         request.workspace_path.as_deref(),
         None,
     )?;
-    let snapshot = require_snapshot_session(&state, &scope).await?;
+    let snapshot = require_snapshot_session(&state, &scope, true).await?;
     let pending = snapshot
         .pending_changes()
         .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
@@ -481,7 +489,7 @@ async fn revert_all_changes(
         request.workspace_path.as_deref(),
         None,
     )?;
-    let snapshot = require_snapshot_session(&state, &scope).await?;
+    let snapshot = require_snapshot_session(&state, &scope, true).await?;
     let pending = snapshot
         .pending_changes()
         .map_err(|e| ApiError::internal_assembly("读取快照变更失败", e))?;
@@ -520,7 +528,7 @@ async fn revert_execution_group_changes(
         request.workspace_path.as_deref(),
         None,
     )?;
-    let snapshot = require_snapshot_session(&state, &scope).await?;
+    let snapshot = require_snapshot_session(&state, &scope, true).await?;
     if !snapshot
         .has_execution_group(&request.execution_group_id)
         .map_err(|e| ApiError::internal_assembly("检查执行分组失败", e))?
@@ -1310,6 +1318,22 @@ mod tests {
         dir
     }
 
+    fn git(path: &Path, args: &[&str]) -> String {
+        let output = magi_process::std_command("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .expect("git command should start");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     #[test]
     fn prompt_enhance_instruction_uses_requested_locale_and_data_boundaries() {
         let english = build_enhance_prompt_instruction(
@@ -2022,6 +2046,162 @@ mod tests {
             payload["currentContent"],
             serde_json::json!("alpha changed\n")
         );
+    }
+
+    #[tokio::test]
+    async fn changes_refresh_tracks_external_restore_overwrite_and_partial_commit() {
+        let state = build_state();
+        let root = unique_temp_dir("magi-changes-route-external-refresh");
+        git(&root, &["init", "-b", "main"]);
+        git(&root, &["config", "user.name", "Magi Test"]);
+        git(&root, &["config", "user.email", "magi@example.test"]);
+        fs::write(root.join("committed.txt"), "v0\n").expect("committed fixture");
+        fs::write(root.join("pending.txt"), "v0\n").expect("pending fixture");
+        git(&root, &["add", "committed.txt", "pending.txt"]);
+        git(&root, &["commit", "-m", "initial"]);
+
+        let snapshot = register_workspace_and_snapshot(
+            &state,
+            "ws-external-refresh",
+            "sess-external-refresh",
+            &root,
+            None,
+        )
+        .await;
+        let session_id = SessionId::new("sess-external-refresh");
+        let workspace_id = WorkspaceId::new("ws-external-refresh");
+        state
+            .ensure_session_code_context(&session_id, &Some(workspace_id.clone()))
+            .await
+            .expect("session Git context")
+            .expect("Git repository context");
+        state.release_session_git_execution_lease(&session_id);
+
+        let tool_context = magi_snapshot::ToolHookCtx {
+            tool_call_id: "call-external-refresh".to_string(),
+            worker_id: None,
+            execution_group_id: Some("group-external-refresh".to_string()),
+            declared_paths: vec![PathBuf::from("committed.txt"), PathBuf::from("pending.txt")],
+        };
+        snapshot.before_tool(&tool_context);
+        fs::write(root.join("committed.txt"), "v1\n").expect("committed change");
+        fs::write(root.join("pending.txt"), "v1\n").expect("pending change");
+        snapshot.after_tool(&tool_context);
+
+        git(&root, &["add", "committed.txt"]);
+        git(&root, &["commit", "-m", "partial external commit"]);
+
+        let app = routes().with_state(state.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/changes?sessionId=sess-external-refresh&workspaceId=ws-external-refresh&forceRefresh=true")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        let pending = payload["pendingChanges"]
+            .as_array()
+            .expect("pending changes array");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["filePath"], "pending.txt");
+
+        git(&root, &["restore", "pending.txt"]);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/changes?sessionId=sess-external-refresh&workspaceId=ws-external-refresh&forceRefresh=true")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["pendingChangesState"]["pendingCount"], 0);
+
+        fs::write(root.join("pending.txt"), "external overwrite\n").expect("external overwrite");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/changes?sessionId=sess-external-refresh&workspaceId=ws-external-refresh&forceRefresh=true")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        let payload = read_json_response(response).await;
+        let pending = payload["pendingChanges"]
+            .as_array()
+            .expect("pending changes array");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["filePath"], "pending.txt");
+        assert_eq!(pending[0]["sourceKind"], "external");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/changes/diff?sessionId=sess-external-refresh&workspaceId=ws-external-refresh&filePath=pending.txt")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("diff route should respond");
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["currentContent"], "external overwrite\n");
+    }
+
+    #[tokio::test]
+    async fn changes_refresh_initial_git_binding_adopts_changes_already_committed_externally() {
+        let state = build_state();
+        let root = unique_temp_dir("magi-changes-route-initial-git-binding");
+        git(&root, &["init", "-b", "main"]);
+        git(&root, &["config", "user.name", "Magi Test"]);
+        git(&root, &["config", "user.email", "magi@example.test"]);
+        fs::write(root.join("tracked.txt"), "v0\n").expect("tracked fixture");
+        git(&root, &["add", "tracked.txt"]);
+        git(&root, &["commit", "-m", "initial"]);
+        register_workspace_and_snapshot(
+            &state,
+            "ws-initial-git-binding",
+            "sess-initial-git-binding",
+            &root,
+            None,
+        )
+        .await;
+
+        fs::write(root.join("tracked.txt"), "v1\n").expect("external committed change");
+        git(&root, &["add", "tracked.txt"]);
+        git(&root, &["commit", "-m", "external before context binding"]);
+
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/changes?sessionId=sess-initial-git-binding&workspaceId=ws-initial-git-binding&forceRefresh=true")
+                    .method("GET")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["pendingChangesState"]["pendingCount"], 0);
+        let context = state
+            .session_code_contexts
+            .get("sess-initial-git-binding")
+            .expect("Git context should bind");
+        assert_eq!(context.git.base_head, context.git.observed_head);
     }
 
     #[tokio::test]

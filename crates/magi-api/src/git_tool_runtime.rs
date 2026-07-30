@@ -598,7 +598,7 @@ fn publish_context_changed(
                 "branch": observation.branch,
                 "head": observation.head,
                 "context_revision": context.context_revision,
-                "refresh_scopes": ["file_tree", "code_index", "knowledge", "context_cache"]
+                "refresh_scopes": ["changes", "file_tree", "code_index", "knowledge", "context_cache"]
             }),
         )
         .with_context(EventContext {
