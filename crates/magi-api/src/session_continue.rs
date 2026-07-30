@@ -192,6 +192,7 @@ fn rebuild_thread_history_from_canonical(
                         images: Vec::new(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
+                        provider_context: Vec::new(),
                     });
                 }
             }
@@ -207,6 +208,7 @@ fn rebuild_thread_history_from_canonical(
                         images: Vec::new(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
+                        provider_context: Vec::new(),
                     });
                 }
             }
@@ -232,6 +234,7 @@ fn rebuild_thread_history_from_canonical(
                         },
                     }],
                     tool_call_id: None,
+                    provider_context: Vec::new(),
                 });
                 let result = tool
                     .result
@@ -261,6 +264,7 @@ fn rebuild_thread_history_from_canonical(
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: Some(tool.call_id.clone()),
+                    provider_context: Vec::new(),
                 });
             }
             CanonicalTurnItemKind::AssistantThinking
@@ -377,6 +381,7 @@ pub(crate) fn persist_resumed_branch_user_input(
             .collect(),
         tool_calls: Vec::new(),
         tool_call_id: None,
+        provider_context: Vec::new(),
     };
     for thread_id in thread_ids {
         state

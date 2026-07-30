@@ -65,7 +65,7 @@ import type {
   ModelEngine,
   AgentBinding,
 } from "../shared/types/registry-types";
-import type { LLMConfig } from "../shared/types/agent-types";
+import type { LLMConfig, ModelApiProtocol } from "../shared/types/agent-types";
 import type { ModelStatus, ModelStatusMap, ModelStatusType } from "../types/message";
 import {
   getModelStatus,
@@ -95,6 +95,7 @@ export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 export interface BaseModelFormConfig {
   baseUrl: string;
   urlMode: UrlMode;
+  apiProtocol: ModelApiProtocol;
   apiKey: string;
   model: string;
 }
@@ -110,6 +111,7 @@ type ModelConfigTarget = "orch" | "comp" | "image" | "worker";
 type BaseModelConfigPayload = Record<string, unknown> & {
   baseUrl: string;
   urlMode: UrlMode;
+  apiProtocol: ModelApiProtocol;
   apiKey: string;
   model: string;
 };
@@ -359,6 +361,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     return {
       baseUrl: "",
       urlMode: "standard",
+      apiProtocol: "openai_chat",
       apiKey: "",
       model: "",
       reasoningEffort: "medium",
@@ -372,6 +375,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     return {
       baseUrl: "",
       urlMode: "standard",
+      apiProtocol: "openai_chat",
       apiKey: "",
       model: "",
       ...overrides,
@@ -391,12 +395,17 @@ function createSettingsStore(props: { onClose?: () => void }) {
     return value === "full" ? "full" : "standard";
   }
 
+  function normalizeModelApiProtocol(value: unknown): ModelApiProtocol {
+    return value === "anthropic_messages" ? "anthropic_messages" : "openai_chat";
+  }
+
   function buildBaseModelConfigPayload(
     config: BaseModelFormConfig,
   ): BaseModelConfigPayload {
     return {
       baseUrl: config.baseUrl,
       urlMode: config.urlMode,
+      apiProtocol: config.apiProtocol,
       apiKey: config.apiKey,
       model: config.model,
     };
@@ -417,6 +426,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     return {
       baseUrl: config.baseUrl,
       urlMode: config.urlMode,
+      apiProtocol: config.apiProtocol,
       apiKey: config.apiKey,
       model: "",
     };
@@ -523,6 +533,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       baseUrl: typeof config.baseUrl === "string" ? config.baseUrl.trim() : "",
       apiKey: typeof config.apiKey === "string" ? config.apiKey.trim() : "",
       urlMode: config.urlMode || "standard",
+      apiProtocol: config.apiProtocol || "openai_chat",
     });
   }
 
@@ -2761,6 +2772,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
         next[worker] = createWorkerConfig({
           baseUrl: config.baseUrl || "",
           urlMode: normalizeUrlMode(config.urlMode),
+          apiProtocol: normalizeModelApiProtocol(config.apiProtocol),
           apiKey: config.apiKey || "",
           model: config.model || "",
           reasoningEffort: config.reasoningEffort || "medium",
@@ -2783,6 +2795,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     orchConfig = createInteractiveConfig({
       baseUrl: config.baseUrl || "",
       urlMode: normalizeUrlMode(config.urlMode),
+      apiProtocol: normalizeModelApiProtocol(config.apiProtocol),
       apiKey: config.apiKey || "",
       model: "",
       reasoningEffort: "medium",
@@ -2796,6 +2809,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     compConfig = createAuxiliaryConfig({
       baseUrl: config.baseUrl || "",
       urlMode: normalizeUrlMode(config.urlMode),
+      apiProtocol: normalizeModelApiProtocol(config.apiProtocol),
       apiKey: config.apiKey || "",
       model: config.model || "",
     });
@@ -2808,6 +2822,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     imageConfig = createAuxiliaryConfig({
       baseUrl: config.baseUrl || "",
       urlMode: normalizeUrlMode(config.urlMode),
+      apiProtocol: normalizeModelApiProtocol(config.apiProtocol),
       apiKey: config.apiKey || "",
       model: config.model || "",
     });

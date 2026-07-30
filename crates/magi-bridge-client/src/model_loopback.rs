@@ -1,5 +1,7 @@
+use crate::llm_types::{LlmMessage, LlmMessageContent, LlmMessageParams};
+use crate::protocol::{OpenAiChatCompletionsAdapter, ProviderAdapter};
 use crate::{
-    BridgeResponse, LOOPBACK_MODEL_PROVIDER, ModelInvocationRequest,
+    LOOPBACK_MODEL_PROVIDER, ModelInvocationRequest, ModelResponse,
     local_process_protocol::{
         BridgeServerKind, BridgeServerServiceCatalog, BridgeServerServiceDescriptor,
         LOCAL_BRIDGE_PROTOCOL_VERSION, LocalProcessBridgeRequest, LocalProcessBridgeRpcError,
@@ -7,8 +9,8 @@ use crate::{
     },
 };
 use magi_process::std_command;
-use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{Value, json};
+use serde::Deserialize;
+use serde_json::json;
 use std::{env, fmt, sync::Arc};
 use thiserror::Error;
 
@@ -90,7 +92,7 @@ impl ModelServiceShim {
     fn invoke(
         &self,
         invocation: ModelInvocationRequest,
-    ) -> Result<BridgeResponse, LocalProcessBridgeRpcError> {
+    ) -> Result<ModelResponse, LocalProcessBridgeRpcError> {
         if invocation.prompt.trim().is_empty() {
             return Err(LocalProcessBridgeRpcError::remote_business(
                 -32002,
@@ -600,7 +602,7 @@ impl OpenAiCompatibleProviderRuntime {
         service_health_reason: Option<&str>,
         prompt: &str,
         executor: &dyn OpenAiCompatibleHttpExecutor,
-    ) -> Result<BridgeResponse, LocalProcessBridgeRpcError> {
+    ) -> Result<ModelResponse, LocalProcessBridgeRpcError> {
         let missing = self.missing_config_keys();
         if !missing.is_empty() {
             return Err(openai_provider_unavailable_error(
@@ -640,15 +642,31 @@ impl OpenAiCompatibleProviderRuntime {
             .clone();
         let url = build_openai_chat_completions_url(base_url)
             .map_err(|reason| openai_provider_misconfigured_error(provider, base_url, &reason))?;
-        let body = serde_json::to_string(&json!({
-            "model": model,
-            "messages": [{
-                "role": "user",
-                "content": prompt,
-            }],
-            "stream": false,
-        }))
-        .expect("openai-compatible request body should serialize");
+        let adapted = OpenAiChatCompletionsAdapter
+            .build_request(
+                &LlmMessageParams {
+                    messages: vec![LlmMessage {
+                        role: "user".to_string(),
+                        content: LlmMessageContent::Text(prompt.to_string()),
+                    }],
+                    max_tokens: None,
+                    temperature: None,
+                    tools: None,
+                    stream: Some(false),
+                    system_prompt: None,
+                    tool_choice: None,
+                    reasoning_effort: None,
+                },
+                &model,
+            )
+            .map_err(|reason| openai_provider_misconfigured_error(provider, base_url, &reason))?;
+        let body = serde_json::to_string(&adapted.body).map_err(|error| {
+            openai_provider_misconfigured_error(
+                provider,
+                base_url,
+                &format!("serialize request failed: {error}"),
+            )
+        })?;
 
         Ok(OpenAiCompatibleHttpRequest { url, model, body })
     }
@@ -702,7 +720,7 @@ impl ModelProvider {
         let mut capabilities = vec![
             format!("provider:{}", self.name),
             "prompt:required".to_string(),
-            "response:bridge_response".to_string(),
+            "response:model_response".to_string(),
             format!("implementation_source:{}", self.implementation_source),
             format!("capability_profile:{}", self.capability_profile),
         ];
@@ -770,12 +788,12 @@ impl ModelProvider {
         &self,
         prompt: &str,
         executor: &dyn OpenAiCompatibleHttpExecutor,
-    ) -> Result<BridgeResponse, LocalProcessBridgeRpcError> {
+    ) -> Result<ModelResponse, LocalProcessBridgeRpcError> {
         match &self.mode {
-            ModelProviderMode::Loopback => Ok(BridgeResponse {
-                ok: true,
-                payload: format!("loopback-model::{}", loopback_visible_prompt(prompt)),
-            }),
+            ModelProviderMode::Loopback => Ok(ModelResponse::completed(format!(
+                "loopback-model::{}",
+                loopback_visible_prompt(prompt)
+            ))),
             ModelProviderMode::OpenAiCompatibleHttp(runtime) => runtime.invoke(
                 self.name,
                 self.service_health,
@@ -893,205 +911,6 @@ enum OpenAiCompatibleHttpExecutorError {
 }
 
 #[derive(Debug, Deserialize)]
-struct OpenAiCompatibleChatCompletionEnvelope {
-    #[serde(default)]
-    usage: Option<OpenAiCompatibleUsage>,
-    choices: Vec<OpenAiCompatibleChatChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiCompatibleChatChoice {
-    #[serde(default)]
-    finish_reason: Option<String>,
-    #[serde(default)]
-    message: Option<OpenAiCompatibleChatMessage>,
-    #[serde(default)]
-    text: Option<String>,
-}
-
-impl OpenAiCompatibleChatChoice {
-    fn into_payload(self, usage: Option<OpenAiCompatibleUsage>) -> OpenAiCompatibleSuccessPayload {
-        let (content, reasoning_content, tool_calls) = match self.message {
-            Some(message) => {
-                let reasoning_content = message
-                    .reasoning_content
-                    .filter(|content| !content.trim().is_empty());
-                (
-                    message
-                        .content
-                        .map(OpenAiCompatibleMessageContent::into_text)
-                        .filter(|content| !content.trim().is_empty())
-                        .or(message.refusal),
-                    reasoning_content,
-                    message.tool_calls,
-                )
-            }
-            None => (None, None, Vec::new()),
-        };
-
-        OpenAiCompatibleSuccessPayload {
-            content: content.or(self.text),
-            reasoning_content,
-            finish_reason: self.finish_reason,
-            usage,
-            tool_calls,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiCompatibleChatMessage {
-    #[serde(default)]
-    content: Option<OpenAiCompatibleMessageContent>,
-    #[serde(default)]
-    reasoning_content: Option<String>,
-    #[serde(default)]
-    refusal: Option<String>,
-    #[serde(default, deserialize_with = "null_as_default")]
-    tool_calls: Vec<OpenAiCompatibleToolCall>,
-}
-
-fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Default + Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer).map(|value| value.unwrap_or_default())
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum OpenAiCompatibleMessageContent {
-    Text(String),
-    Parts(Vec<OpenAiCompatibleMessagePart>),
-}
-
-impl OpenAiCompatibleMessageContent {
-    fn into_text(self) -> String {
-        match self {
-            Self::Text(text) => text,
-            Self::Parts(parts) => parts.into_iter().filter_map(|part| part.text).collect(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiCompatibleMessagePart {
-    #[serde(rename = "type")]
-    _kind: Option<String>,
-    #[serde(default)]
-    text: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct OpenAiCompatibleSuccessPayload {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    finish_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    usage: Option<OpenAiCompatibleUsage>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    tool_calls: Vec<OpenAiCompatibleToolCall>,
-}
-
-impl OpenAiCompatibleSuccessPayload {
-    fn into_bridge_payload(self) -> Result<String, String> {
-        if self.content.is_none() && self.reasoning_content.is_none() && self.tool_calls.is_empty()
-        {
-            return Err(
-                "missing message.content/text, message.reasoning_content or message.tool_calls"
-                    .to_string(),
-            );
-        }
-
-        if self.finish_reason.is_none()
-            && self.usage.is_none()
-            && self.reasoning_content.is_none()
-            && self.tool_calls.is_empty()
-        {
-            return Ok(self.content.unwrap_or_default());
-        }
-
-        serde_json::to_string(&self)
-            .map_err(|error| format!("serialize structured payload failed: {error}"))
-    }
-}
-
-fn select_openai_bridge_payload(
-    choices: Vec<OpenAiCompatibleChatChoice>,
-    usage: Option<OpenAiCompatibleUsage>,
-) -> Result<String, String> {
-    if choices.is_empty() {
-        return Err("missing choices[0]".to_string());
-    }
-
-    let mut invalid_choices = Vec::new();
-    for (index, choice) in choices.into_iter().enumerate() {
-        match choice.into_payload(usage.clone()).into_bridge_payload() {
-            Ok(payload) => return Ok(payload),
-            Err(reason) => invalid_choices.push(format!("choices[{index}]: {reason}")),
-        }
-    }
-
-    Err(format!(
-        "no bridgeable choices in response: {}",
-        invalid_choices.join("; ")
-    ))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct OpenAiCompatibleUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-    #[serde(default)]
-    total_tokens: Option<u64>,
-    #[serde(default)]
-    prompt_tokens_details: Option<Value>,
-    #[serde(default)]
-    completion_tokens_details: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct OpenAiCompatibleToolCall {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(rename = "type", default)]
-    kind: Option<String>,
-    function: OpenAiCompatibleToolFunction,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct OpenAiCompatibleToolFunction {
-    name: String,
-    #[serde(deserialize_with = "deserialize_openai_tool_arguments")]
-    arguments: String,
-}
-
-fn deserialize_openai_tool_arguments<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum RawOpenAiToolArguments {
-        String(String),
-        Json(Value),
-    }
-
-    match RawOpenAiToolArguments::deserialize(deserializer)? {
-        RawOpenAiToolArguments::String(arguments) => Ok(arguments),
-        RawOpenAiToolArguments::Json(arguments) => {
-            serde_json::to_string(&arguments).map_err(serde::de::Error::custom)
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
 struct OpenAiCompatibleErrorEnvelope {
     error: OpenAiCompatibleErrorBody,
 }
@@ -1139,7 +958,7 @@ fn parse_openai_response(
     provider: &str,
     request: &OpenAiCompatibleHttpRequest,
     response: OpenAiCompatibleHttpResponse,
-) -> Result<BridgeResponse, LocalProcessBridgeRpcError> {
+) -> Result<ModelResponse, LocalProcessBridgeRpcError> {
     if !(200..300).contains(&response.status) {
         return Err(openai_provider_rejected_error(
             provider,
@@ -1149,28 +968,34 @@ fn parse_openai_response(
         ));
     }
 
-    let OpenAiCompatibleChatCompletionEnvelope { usage, choices } =
-        serde_json::from_str(&response.body).map_err(|error| {
+    let adapted = OpenAiChatCompletionsAdapter
+        .parse_response(response.status, &response.body)
+        .map_err(|reason| {
             openai_provider_invalid_response_error(
                 provider,
                 request,
                 response.status,
-                format!("decode chat completion failed: {error}"),
+                reason,
                 &response.body,
             )
         })?;
-
-    let payload = select_openai_bridge_payload(choices, usage).map_err(|reason| {
-        openai_provider_invalid_response_error(
+    if adapted.content.trim().is_empty()
+        && adapted
+            .thinking
+            .as_deref()
+            .is_none_or(|thinking| thinking.trim().is_empty())
+        && adapted.tool_calls.is_empty()
+    {
+        return Err(openai_provider_invalid_response_error(
             provider,
             request,
             response.status,
-            reason,
+            "empty model response".to_string(),
             &response.body,
-        )
-    })?;
+        ));
+    }
 
-    Ok(BridgeResponse { ok: true, payload })
+    Ok(adapted.into())
 }
 
 fn map_openai_executor_error(
@@ -1384,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    fn model_handler_returns_bridge_response_payload() {
+    fn model_handler_returns_typed_model_response() {
         let result = super::handle_model_invoke(LocalProcessBridgeRequest {
             id: Value::from(1),
             params: serde_json::json!({
@@ -1393,9 +1218,9 @@ mod tests {
             }),
         })
         .expect("model invoke should serialize");
-        let response: BridgeResponse =
-            serde_json::from_value(result).expect("bridge response should decode");
-        assert_eq!(response.payload, "loopback-model::hello");
+        let response: ModelResponse =
+            serde_json::from_value(result).expect("model response should decode");
+        assert_eq!(response.content.as_deref(), Some("loopback-model::hello"));
     }
 
     #[test]
@@ -1615,7 +1440,7 @@ mod tests {
             })
             .expect("openai alias should resolve through HTTP smoke path");
 
-        assert_eq!(response.payload, "hello from provider");
+        assert_eq!(response.content.as_deref(), Some("hello from provider"));
 
         let requests = executor.requests();
         assert_eq!(requests.len(), 1);
@@ -1771,29 +1596,17 @@ mod tests {
             })
             .expect("structured success payload should decode");
 
-        let payload: Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert_eq!(payload["content"], "checking weather");
-        assert_eq!(payload["finish_reason"], "tool_calls");
-        assert_eq!(payload["usage"]["prompt_tokens"], 9);
-        assert_eq!(payload["usage"]["completion_tokens"], 4);
-        assert_eq!(payload["usage"]["total_tokens"], 13);
+        assert_eq!(response.content.as_deref(), Some("checking weather"));
+        assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+        let usage = response.usage.as_ref().expect("usage should exist");
+        assert_eq!(usage["inputTokens"], 9);
+        assert_eq!(usage["outputTokens"], 4);
+        assert_eq!(usage["cacheReadTokens"], 2);
+        assert_eq!(response.tool_calls[0].id, "call_weather_1");
+        assert_eq!(response.tool_calls[0].kind, "function");
+        assert_eq!(response.tool_calls[0].function.name, "weather.lookup");
         assert_eq!(
-            payload["usage"]["prompt_tokens_details"]["cached_tokens"],
-            2
-        );
-        assert_eq!(
-            payload["usage"]["completion_tokens_details"]["reasoning_tokens"],
-            1
-        );
-        assert_eq!(payload["tool_calls"][0]["id"], "call_weather_1");
-        assert_eq!(payload["tool_calls"][0]["type"], "function");
-        assert_eq!(
-            payload["tool_calls"][0]["function"]["name"],
-            "weather.lookup"
-        );
-        assert_eq!(
-            payload["tool_calls"][0]["function"]["arguments"],
+            response.tool_calls[0].function.arguments,
             "{\"city\":\"Shanghai\"}"
         );
     }
@@ -1834,16 +1647,13 @@ mod tests {
             })
             .expect("tool-call-only success payload should remain valid");
 
-        let payload: Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert!(payload.get("content").is_none());
-        assert_eq!(payload["finish_reason"], "tool_calls");
-        assert_eq!(payload["usage"]["total_tokens"], 7);
-        assert_eq!(payload["tool_calls"][0]["function"]["name"], "lookup");
-        assert_eq!(
-            payload["tool_calls"][0]["function"]["arguments"],
-            "{\"id\":42}"
-        );
+        assert!(response.content.is_none());
+        assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+        let usage = response.usage.as_ref().expect("usage should exist");
+        assert_eq!(usage["inputTokens"], 0);
+        assert_eq!(usage["outputTokens"], 0);
+        assert_eq!(response.tool_calls[0].function.name, "lookup");
+        assert_eq!(response.tool_calls[0].function.arguments, "{\"id\":42}");
     }
 
     #[test]
@@ -1875,12 +1685,12 @@ mod tests {
             })
             .expect("refusal-only success payload should remain bridgeable");
 
-        let payload: Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert_eq!(payload["content"], "I can't help with that request.");
-        assert_eq!(payload["finish_reason"], "stop");
-        assert_eq!(payload["usage"]["total_tokens"], 11);
-        assert!(payload.get("tool_calls").is_none());
+        assert_eq!(
+            response.content.as_deref(),
+            Some("I can't help with that request.")
+        );
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+        assert!(response.tool_calls.is_empty());
     }
 
     #[test]
@@ -1915,11 +1725,11 @@ mod tests {
             })
             .expect("empty content should fall back to refusal text");
 
-        let payload: Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert_eq!(payload["content"], "I can't comply with that request.");
-        assert_eq!(payload["finish_reason"], "stop");
-        assert_eq!(payload["usage"]["total_tokens"], 5);
+        assert_eq!(
+            response.content.as_deref(),
+            Some("I can't comply with that request.")
+        );
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
     }
 
     #[test]
@@ -1965,14 +1775,8 @@ mod tests {
             })
             .expect("structured tool arguments should decode");
 
-        let payload: Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        let object_arguments = payload["tool_calls"][0]["function"]["arguments"]
-            .as_str()
-            .expect("object arguments should stay serialized as a string");
-        let array_arguments = payload["tool_calls"][1]["function"]["arguments"]
-            .as_str()
-            .expect("array arguments should stay serialized as a string");
+        let object_arguments = &response.tool_calls[0].function.arguments;
+        let array_arguments = &response.tool_calls[1].function.arguments;
 
         assert_eq!(
             serde_json::from_str::<Value>(object_arguments)
@@ -2016,7 +1820,10 @@ mod tests {
             })
             .expect("later bridgeable choice should still succeed");
 
-        assert_eq!(response.payload, "hello from fallback choice");
+        assert_eq!(
+            response.content.as_deref(),
+            Some("hello from fallback choice")
+        );
     }
 
     #[test]
@@ -2051,7 +1858,7 @@ mod tests {
         let data = error.data().expect("error data should exist");
         assert_eq!(
             data["reason"],
-            "no bridgeable choices in response: choices[0]: missing message.content/text, message.reasoning_content or message.tool_calls; choices[1]: missing message.content/text, message.reasoning_content or message.tool_calls"
+            "no actionable choices in response: choices[0] missing content, reasoning or tool_calls; choices[1] missing content, reasoning or tool_calls"
         );
     }
 

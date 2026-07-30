@@ -556,6 +556,7 @@ mod tests {
                     },
                 }],
                 tool_call_id: None,
+                provider_context: Vec::new(),
             },
             ThreadChatMessage {
                 role: "tool".to_string(),
@@ -565,6 +566,7 @@ mod tests {
                 images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call-read".to_string()),
+                provider_context: Vec::new(),
             },
         ];
 
@@ -593,6 +595,7 @@ mod tests {
                 },
             }],
             tool_call_id: None,
+            provider_context: Vec::new(),
         }];
 
         let ledger = ToolExecutionLedger::from_thread_history("写入文件", &history, None);
@@ -635,6 +638,7 @@ mod tests {
                     },
                 }],
                 tool_call_id: None,
+                provider_context: Vec::new(),
             },
             ThreadChatMessage {
                 role: "tool".to_string(),
@@ -645,6 +649,7 @@ mod tests {
                 images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call-write".to_string()),
+                provider_context: Vec::new(),
             },
         ];
 

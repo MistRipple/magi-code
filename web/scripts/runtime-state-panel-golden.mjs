@@ -25,6 +25,8 @@ assert.doesNotMatch(
 
 await withGoldenViteServer(async (server) => {
   const panel = await server.ssrLoadModule('/src/lib/runtime-state-panel.ts');
+  const conversationRecords = await server.ssrLoadModule('/src/lib/conversation-runtime-records.ts');
+  const runtimeTimeline = await server.ssrLoadModule('/src/lib/runtime-timeline.ts');
   const rustContract = await server.ssrLoadModule('/src/shared/bridges/rust-daemon-contract.ts');
 
   assert.equal(
@@ -91,6 +93,271 @@ await withGoldenViteServer(async (server) => {
     { completed: 2, failed: 1, running: 2, total: 5, percent: 40 },
   );
   assert.equal(panel.resolveRuntimeTaskProgress(undefined), null);
+
+  const runningRecords = conversationRecords.buildConversationRuntimeRecords([{
+    key: 'latest-tool',
+    message: {
+      id: 'message-latest-tool',
+      role: 'assistant',
+      source: 'orchestrator',
+      content: 'shell_exec',
+      timestamp: 1_700_000_000_200,
+      updatedAt: 1_700_000_000_300,
+      isStreaming: false,
+      isComplete: false,
+      type: 'tool_call',
+      blocks: [{
+        id: 'tool-latest',
+        type: 'tool_call',
+        content: '',
+        toolCall: {
+          id: 'call-latest',
+          name: 'shell_exec',
+          arguments: { command: 'sleep 10; printf done' },
+          status: 'running',
+        },
+      }],
+      metadata: { turnSeq: 2, canonicalItemSeq: 3 },
+    },
+  }, {
+    key: 'historical-error',
+    message: {
+      id: 'message-historical-error',
+      role: 'assistant',
+      source: 'orchestrator',
+      content: 'old error',
+      timestamp: 1_700_000_000_100,
+      isStreaming: false,
+      isComplete: true,
+      type: 'error',
+      noticeType: 'error',
+      metadata: { turnSeq: 1, canonicalItemSeq: 2 },
+    },
+  }], { isProcessing: true, processingStartedAt: 1_700_000_000_150 });
+  assert.deepEqual(
+    runningRecords.map((entry) => ({ type: entry.type, detail: entry.detail })),
+    [{ type: 'session.tool.running', detail: 'sleep 10; printf done' }],
+    '运行态只投影当前轮次，并直接展示正在执行的真实命令',
+  );
+
+  const failedRecords = conversationRecords.buildConversationRuntimeRecords([{
+    key: 'failed-tool',
+    message: {
+      id: 'message-failed-tool',
+      role: 'assistant',
+      source: 'orchestrator',
+      content: 'shell_exec',
+      timestamp: 1_700_000_000_400,
+      isStreaming: false,
+      isComplete: true,
+      type: 'tool_call',
+      blocks: [{
+        id: 'tool-failed',
+        type: 'tool_call',
+        content: '',
+        toolCall: {
+          id: 'call-failed',
+          name: 'shell_exec',
+          arguments: { command: 'missing-command' },
+          status: 'error',
+          error: JSON.stringify({
+            error_code: 'shell_exec_command_not_found',
+            error: '当前执行环境找不到命令：missing-command',
+            summary: '命令依赖不可用',
+            status: 'failed',
+          }),
+        },
+      }],
+      metadata: { turnSeq: 3, canonicalItemSeq: 4 },
+    },
+  }], { isProcessing: false });
+  assert.equal(
+    failedRecords[0]?.detail,
+    'shell_exec_command_not_found: 当前执行环境找不到命令：missing-command',
+    '工具失败记录必须从结构化载荷提取错误代码与真实核心原因',
+  );
+
+  const processingRecords = conversationRecords.buildConversationRuntimeRecords([], {
+    isProcessing: true,
+    processingStartedAt: 1_700_000_000_500,
+  });
+  assert.equal(processingRecords[0]?.type, 'session.turn.processing');
+  assert.equal(processingRecords[0]?.timestamp, 1_700_000_000_500);
+
+  assert.deepEqual(
+    runtimeTimeline.mergeRuntimeTimelineEntries([{
+      eventId: 'older-error',
+      seq: 1,
+      timestamp: 100,
+      type: 'task.failed',
+      summary: '失败',
+      kind: 'error',
+      detail: 'runtime_timeout: provider timeout',
+      diffCount: 0,
+    }], [{
+      eventId: 'newer-duplicate',
+      seq: 2,
+      timestamp: 200,
+      type: 'session.model.failed',
+      summary: '模型失败',
+      kind: 'error',
+      detail: 'provider timeout',
+      diffCount: 0,
+    }, {
+      eventId: 'newest-progress',
+      seq: 3,
+      timestamp: 300,
+      type: 'session.turn.processing',
+      summary: '',
+      kind: 'progress',
+      diffCount: 0,
+    }]).map((entry) => entry.eventId),
+    ['newest-progress', 'newer-duplicate'],
+    '运行记录必须最新优先，并按真实错误正文跨来源去重',
+  );
+  assert.deepEqual(
+    runtimeTimeline.mergeCurrentRuntimeTimelineEntries({
+      runtimeEntries: [{
+        eventId: 'previous-turn-error',
+        seq: 4,
+        timestamp: 400,
+        type: 'task.failed',
+        summary: '上一轮失败',
+        kind: 'error',
+        detail: 'previous turn failed',
+        diffCount: 0,
+      }, {
+        eventId: 'current-turn-dispatched',
+        seq: 5,
+        timestamp: 510,
+        type: 'task.dispatched',
+        summary: '本轮已派发',
+        kind: 'progress',
+        diffCount: 0,
+      }],
+      conversationEntries: [{
+        ...processingRecords[0],
+        timestamp: 505,
+      }],
+      isProcessing: true,
+      processingStartedAt: 500,
+      currentTurnStartedAt: 500,
+    }).map((entry) => entry.eventId),
+    ['current-turn-processing'],
+    '主会话已有当前轮次记录时，不得混入历史事件或内部任务推进噪音',
+  );
+
+  const cancelledRecords = conversationRecords.buildConversationRuntimeRecords([{
+    key: 'cancelled-tool',
+    message: {
+      id: 'message-cancelled-tool',
+      role: 'assistant',
+      source: 'orchestrator',
+      content: 'shell_exec',
+      timestamp: 600,
+      isStreaming: false,
+      isComplete: true,
+      type: 'tool_call',
+      blocks: [{
+        id: 'tool-cancelled',
+        type: 'tool_call',
+        content: '',
+        toolCall: {
+          id: 'call-cancelled',
+          name: 'shell_exec',
+          arguments: { command: 'sleep 30' },
+          status: 'error',
+        },
+      }],
+      metadata: {
+        turnSeq: 4,
+        turnItemKind: 'tool_call',
+        turnItemStatus: 'cancelled',
+        toolName: 'shell_exec',
+        toolCallId: 'call-cancelled',
+      },
+    },
+  }], { isProcessing: false });
+  assert.deepEqual(
+    cancelledRecords,
+    [],
+    '用户中断造成且没有诊断正文的工具取消不得伪装为工具失败',
+  );
+  assert.equal(
+    conversationRecords.resolveCurrentConversationTurnStartedAt([{
+      key: 'turn-start',
+      message: {
+        id: 'turn-start-message',
+        role: 'user',
+        source: 'user',
+        content: '开始',
+        timestamp: 700,
+        isStreaming: false,
+        isComplete: true,
+        metadata: { turnSeq: 5 },
+      },
+    }, {
+      key: 'turn-progress',
+      message: {
+        id: 'turn-progress-message',
+        role: 'assistant',
+        source: 'orchestrator',
+        content: '',
+        timestamp: 710,
+        isStreaming: true,
+        isComplete: false,
+        metadata: { turnSeq: 5 },
+      },
+    }]),
+    700,
+    '当前轮次起点必须来自该轮最早的规范化消息时间',
+  );
+  const interruptedRecords = conversationRecords.buildConversationRuntimeRecords([{
+    key: 'interrupted-user-message',
+    message: {
+      id: 'interrupted-user-message',
+      role: 'user',
+      source: 'user',
+      content: '执行长任务',
+      timestamp: 800,
+      updatedAt: 850,
+      isStreaming: false,
+      isComplete: true,
+      type: 'user_input',
+      metadata: {
+        turnSeq: 6,
+        turnStatus: 'cancelled',
+        interruptionSource: 'user',
+      },
+    },
+  }], { isProcessing: false });
+  assert.deepEqual(
+    interruptedRecords.map((entry) => ({ type: entry.type, kind: entry.kind, detail: entry.detail })),
+    [{
+      type: 'session.turn.interrupted',
+      kind: 'warning',
+      detail: 'interruptionSource: user',
+    }],
+    '用户主动停止应保留为可继续的中断记录，不得标记为工具失败',
+  );
+  assert.deepEqual(
+    runtimeTimeline.mergeCurrentRuntimeTimelineEntries({
+      runtimeEntries: [{
+        eventId: 'runtime-interrupted',
+        seq: 9,
+        timestamp: 850,
+        type: 'session.turn.interrupted',
+        summary: '本轮执行异常中断',
+        kind: 'error',
+        diffCount: 0,
+      }],
+      conversationEntries: interruptedRecords,
+      isProcessing: false,
+      currentTurnStartedAt: 800,
+    }).map((entry) => entry.eventId),
+    ['interrupted-user-message:interrupted'],
+    '同一轮会话中断只能保留当前会话事实，不能再叠加后端事件副本',
+  );
 
   const failureDetail = 'provider timeout: request req-20260727-001 returned HTTP 503';
   const toolErrorDetail = 'cargo check failed: unresolved import crate::runtime';

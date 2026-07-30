@@ -213,15 +213,7 @@ fn refine_new_session_title_inner(
         _ => client.invoke(request),
     };
     let response = match response {
-        Ok(resp) if resp.ok => resp,
-        Ok(resp) => {
-            tracing::debug!(
-                session_id = %session_id,
-                payload = %resp.payload,
-                "辅助模型返回 ok=false，跳过会话标题精修"
-            );
-            return None;
-        }
+        Ok(resp) => resp,
         Err(err) => {
             tracing::debug!(
                 session_id = %session_id,
@@ -231,11 +223,10 @@ fn refine_new_session_title_inner(
             return None;
         }
     };
-    let payload = response.parse_chat_payload();
-    let Some(raw) = payload.content else {
+    let Some(raw) = response.content else {
         tracing::debug!(
             session_id = %session_id,
-            thinking = ?payload.thinking,
+            thinking = ?response.thinking,
             "辅助模型返回缺少 content，跳过会话标题精修"
         );
         return None;
@@ -330,20 +321,17 @@ mod tests {
 
     use std::sync::Mutex;
 
-    use magi_bridge_client::{BridgeClientError, BridgeResponse, ModelStreamingDelta};
+    use magi_bridge_client::{BridgeClientError, ModelResponse, ModelStreamingDelta};
     use magi_session_store::SessionStore;
 
     struct StubAuxiliaryClient {
-        payload: Mutex<Option<Result<BridgeResponse, BridgeClientError>>>,
+        payload: Mutex<Option<Result<ModelResponse, BridgeClientError>>>,
     }
 
     impl StubAuxiliaryClient {
         fn ok_with_content(content: &str) -> Arc<Self> {
             Arc::new(Self {
-                payload: Mutex::new(Some(Ok(BridgeResponse {
-                    ok: true,
-                    payload: serde_json::json!({ "content": content }).to_string(),
-                }))),
+                payload: Mutex::new(Some(Ok(ModelResponse::completed(content)))),
             })
         }
 
@@ -362,7 +350,7 @@ mod tests {
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             self.payload
                 .lock()
                 .expect("stub payload lock poisoned")
@@ -374,7 +362,7 @@ mod tests {
             &self,
             _request: ModelInvocationRequest,
             _on_delta: &dyn Fn(&ModelStreamingDelta),
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             unreachable!("会话标题精修只走 invoke 同步路径")
         }
     }

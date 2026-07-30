@@ -126,6 +126,7 @@ pub fn system_prompt_fragment_message(
         images: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: None,
+        provider_context: Vec::new(),
     }
 }
 

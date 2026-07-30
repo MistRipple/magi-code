@@ -1,5 +1,5 @@
+use magi_bridge_client::ModelResponse;
 use serde::Serialize;
-use serde_json::Value;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct BridgeModelContractDto {
@@ -28,82 +28,38 @@ pub struct BridgeMcpDefaultRouteContractDto {
 }
 
 pub(crate) fn evaluate_model_contract(
-    payload: &str,
+    response: &ModelResponse,
     contract_profile: String,
 ) -> BridgeModelContractDto {
-    if payload.trim().is_empty() {
-        return BridgeModelContractDto {
-            contract_profile,
-            payload_kind: "plain_text".to_string(),
-            contract_ok: false,
-            has_content: false,
-            has_finish_reason: false,
-            has_usage: false,
-            tool_call_count: 0,
-            blocking_reason: Some("bridge payload was empty".to_string()),
-        };
-    }
-
-    if let Ok(Value::Object(payload)) = serde_json::from_str::<Value>(payload) {
-        let has_content = payload
-            .get("content")
-            .and_then(Value::as_str)
-            .map(|content| !content.trim().is_empty())
-            .unwrap_or(false);
-        let has_finish_reason = payload
-            .get("finish_reason")
-            .and_then(Value::as_str)
-            .map(|reason| !reason.trim().is_empty())
-            .unwrap_or(false);
-        let has_usage = payload.get("usage").is_some();
-        let tool_calls = payload
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let tool_call_count = tool_calls.len();
-        let tool_calls_valid = tool_calls.iter().all(|tool_call| {
-            tool_call
-                .get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(Value::as_str)
-                .map(|name| !name.trim().is_empty())
-                .unwrap_or(false)
-                && tool_call
-                    .get("function")
-                    .and_then(|function| function.get("arguments"))
-                    .and_then(Value::as_str)
-                    .is_some()
-        });
-        let contract_ok = (has_content || tool_call_count > 0) && tool_calls_valid;
-        let blocking_reason = if !tool_calls_valid {
-            Some("structured payload contains invalid tool_calls".to_string())
-        } else if !has_content && tool_call_count == 0 {
-            Some("structured payload missing content or tool_calls".to_string())
-        } else {
-            None
-        };
-
-        return BridgeModelContractDto {
-            contract_profile,
-            payload_kind: "structured_json".to_string(),
-            contract_ok,
-            has_content,
-            has_finish_reason,
-            has_usage,
-            tool_call_count,
-            blocking_reason,
-        };
-    }
-
+    let has_content = response
+        .content
+        .as_deref()
+        .is_some_and(|content| !content.trim().is_empty());
+    let has_finish_reason = response
+        .finish_reason
+        .as_deref()
+        .is_some_and(|reason| !reason.trim().is_empty());
+    let has_usage = response.usage.is_some();
+    let tool_call_count = response.tool_calls.len();
+    let tool_calls_valid = response.tool_calls.iter().all(|tool_call| {
+        !tool_call.function.name.trim().is_empty()
+            && !tool_call.function.arguments.trim().is_empty()
+    });
+    let contract_ok = (has_content || tool_call_count > 0) && tool_calls_valid;
     BridgeModelContractDto {
         contract_profile,
-        payload_kind: "plain_text".to_string(),
-        contract_ok: true,
-        has_content: true,
-        has_finish_reason: false,
-        has_usage: false,
-        tool_call_count: 0,
-        blocking_reason: None,
+        payload_kind: "model_response".to_string(),
+        contract_ok,
+        has_content,
+        has_finish_reason,
+        has_usage,
+        tool_call_count,
+        blocking_reason: if !tool_calls_valid {
+            Some("model response contains invalid tool_calls".to_string())
+        } else if !has_content && tool_call_count == 0 {
+            Some("model response missing content or tool_calls".to_string())
+        } else {
+            None
+        },
     }
 }

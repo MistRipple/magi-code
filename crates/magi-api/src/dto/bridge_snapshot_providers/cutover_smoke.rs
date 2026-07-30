@@ -1,9 +1,9 @@
 use magi_bridge_client::{
-    BridgeClientError, BridgeResponse, BridgeServerKind, BridgeServerServiceCatalog,
-    BridgeTransport, HttpModelBridgeClient, JsonRpcBridgeServerProbeClient, JsonRpcMcpBridgeClient,
+    BridgeClientError, BridgeServerKind, BridgeServerServiceCatalog, BridgeTransport,
+    HttpModelBridgeClient, JsonRpcBridgeServerProbeClient, JsonRpcMcpBridgeClient,
     JsonRpcMcpManagerClient, JsonRpcModelBridgeClient, LOOPBACK_MODEL_PROVIDER, McpBridgeClient,
     McpManagerServerSelectionRequest, McpToolCallRequest, ModelBridgeClient,
-    ModelInvocationRequest,
+    ModelInvocationRequest, ModelResponse,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -124,7 +124,7 @@ fn capture_model_cutover_checks(transport: Arc<dyn BridgeTransport>) -> Vec<Brid
     let mut checks = Vec::new();
 
     let loopback_profile = model_capability_profile(catalog.as_ref(), LOOPBACK_MODEL_PROVIDER)
-        .unwrap_or_else(|| "model-bridge-payload-v1".to_string());
+        .unwrap_or_else(|| "model-response-v1".to_string());
     checks.push(bridge_cutover_model_check(
         "invoke_contract",
         LOOPBACK_MODEL_PROVIDER,
@@ -324,22 +324,20 @@ fn bridge_cutover_model_check(
     check_name: impl Into<String>,
     target: impl Into<String>,
     contract_profile: String,
-    result: Result<BridgeResponse, BridgeClientError>,
+    result: Result<ModelResponse, BridgeClientError>,
 ) -> BridgeCutoverCheckDto {
     let target = target.into();
     match result {
         Ok(response) => {
-            let contract = evaluate_model_contract(&response.payload, contract_profile);
-            let mut blocking_reason = contract.blocking_reason.clone();
-            if blocking_reason.is_none() && !response.ok {
-                blocking_reason = Some("bridge response was not ok".to_string());
-            }
+            let contract = evaluate_model_contract(&response, contract_profile);
+            let blocking_reason = contract.blocking_reason.clone();
+            let response_json = serde_json::to_string(&response).unwrap_or_default();
             BridgeCutoverCheckDto {
                 check_name: check_name.into(),
                 target,
-                ok: response.ok && contract.contract_ok,
+                ok: contract.contract_ok,
                 blocking_reason,
-                response_excerpt: Some(excerpt(&response.payload)),
+                response_excerpt: Some(excerpt(&response_json)),
                 error: None,
                 model_contract: Some(contract),
                 mcp_contract: None,

@@ -6,6 +6,10 @@
   import {
     buildTimelineRenderItems,
   } from '../lib/timeline-render-items';
+  import {
+    buildConversationRuntimeRecords,
+    resolveCurrentConversationTurnStartedAt,
+  } from '../lib/conversation-runtime-records';
   import MessageList from './MessageList.svelte';
   import InputArea from './InputArea.svelte';
   import RuntimeStatePanel from './RuntimeStatePanel.svelte';
@@ -33,11 +37,23 @@
         : []
   ));
   const runtimeState = $derived.by<OrchestratorRuntimeState | null>(() => messagesState.orchestratorRuntimeState);
+  const conversationRecords = $derived.by(() => buildConversationRuntimeRecords(
+    threadRenderItems,
+    {
+      isProcessing: messagesState.isProcessing,
+      processingStartedAt: messagesState.thinkingStartAt,
+    },
+  ));
+  const conversationStartedAt = $derived(
+    resolveCurrentConversationTurnStartedAt(threadRenderItems),
+  );
 </script>
 
 <div class="thread-panel" data-desktop-drop-zone="conversation">
   <RuntimeStatePanel
     {runtimeState}
+    {conversationRecords}
+    {conversationStartedAt}
     isProcessing={messagesState.isProcessing}
     processingStartedAt={messagesState.thinkingStartAt}
   />

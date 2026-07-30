@@ -3,8 +3,8 @@ use serde_json::{Value, json};
 use super::adapter::{AdaptedRequest, AdaptedResponse, ProviderAdapter, ProviderFamily};
 use super::capability::resolve_capability_profile;
 use super::utils::{
-    convert_messages_to_openai, parse_openai_usage, reasoning_effort_label,
-    serialize_tool_definitions,
+    compatible_tool_call_id, convert_messages_to_openai, parse_openai_usage,
+    reasoning_effort_label, serialize_tool_definitions,
 };
 use crate::cache_boundary::PROMPT_CACHE_BOUNDARY;
 use crate::llm_types::{
@@ -99,39 +99,74 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
             return Err("empty choices array".to_string());
         }
 
-        let choice = &choices[0];
-        let message = &choice["message"];
-        let finish_reason = choice["finish_reason"]
-            .as_str()
-            .unwrap_or("stop")
-            .to_string();
-
-        let content = message["content"]
-            .as_str()
-            .map(|s| s.to_string())
-            .or_else(|| message["refusal"].as_str().map(|s| s.to_string()))
-            .unwrap_or_default();
-        let thinking = message["reasoning_content"]
-            .as_str()
-            .filter(|value| !value.trim().is_empty())
-            .map(ToOwned::to_owned);
-
-        let tool_calls = parse_openai_tool_calls(&message["tool_calls"]);
-
         let usage = envelope
             .get("usage")
             .map(parse_openai_usage)
             .unwrap_or_default();
+        let mut invalid_choices = Vec::new();
+        for (index, choice) in choices.iter().enumerate() {
+            let message = &choice["message"];
+            let content = openai_compatible_text(&message["content"])
+                .or_else(|| message["refusal"].as_str().map(ToOwned::to_owned))
+                .or_else(|| choice["text"].as_str().map(ToOwned::to_owned))
+                .unwrap_or_default();
+            let thinking = message["reasoning_content"]
+                .as_str()
+                .or_else(|| message["reasoning"].as_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned);
+            let raw_tool_calls = &message["tool_calls"];
+            let tool_calls = parse_openai_tool_calls(raw_tool_calls);
+            if let Some(items) = raw_tool_calls.as_array()
+                && tool_calls.len() != items.len()
+            {
+                invalid_choices.push(format!("choices[{index}] contains malformed tool_calls"));
+                continue;
+            }
+            if content.trim().is_empty()
+                && thinking
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                && tool_calls.is_empty()
+            {
+                invalid_choices.push(format!(
+                    "choices[{index}] missing content, reasoning or tool_calls"
+                ));
+                continue;
+            }
 
-        Ok(AdaptedResponse {
-            content,
-            thinking,
-            tool_calls,
-            usage,
-            stop_reason: finish_reason,
-            raw: Some(envelope),
-        })
+            return Ok(AdaptedResponse {
+                content,
+                thinking,
+                tool_calls,
+                usage,
+                stop_reason: choice["finish_reason"]
+                    .as_str()
+                    .or_else(|| choice["stop_reason"].as_str())
+                    .unwrap_or("stop")
+                    .to_string(),
+                raw: Some(envelope.clone()),
+                provider_context: Vec::new(),
+            });
+        }
+
+        Err(format!(
+            "no actionable choices in response: {}",
+            invalid_choices.join("; ")
+        ))
     }
+}
+
+fn openai_compatible_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    let text = value
+        .as_array()?
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
 }
 
 fn is_cache_boundary_marker(content: &LlmMessageContent) -> bool {
@@ -168,14 +203,19 @@ fn parse_openai_tool_calls(value: &Value) -> Vec<ToolCall> {
         return Vec::new();
     };
     arr.iter()
-        .filter_map(|tc| {
-            let id = tc["id"].as_str()?.to_string();
+        .enumerate()
+        .filter_map(|(index, tc)| {
             let func = &tc["function"];
             let name = func["name"].as_str()?.to_string();
             let args_raw = match &func["arguments"] {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
+            let id = tc["id"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| compatible_tool_call_id(index, &name, &args_raw));
             let (arguments, argument_parse_error) = parse_tool_arguments(&args_raw);
             Some(ToolCall {
                 id,
@@ -315,5 +355,46 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].raw_arguments.as_deref(), Some("null"));
         assert_eq!(calls[0].arguments, Value::Null);
+    }
+
+    #[test]
+    fn missing_tool_call_id_is_synthesized_for_compatible_providers() {
+        let calls = parse_openai_tool_calls(&json!([{
+            "function": {
+                "name": "web_search",
+                "arguments": {"query": "Magi"}
+            }
+        }]));
+
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].id.starts_with("call_compat_0_"));
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].arguments["query"], "Magi");
+    }
+
+    #[test]
+    fn compatible_response_accepts_content_parts_and_alias_fields() {
+        let adapted = OpenAiChatCompletionsAdapter
+            .parse_response(
+                200,
+                &json!({
+                    "choices": [{
+                        "stop_reason": "stop",
+                        "message": {
+                            "content": [
+                                {"type": "text", "text": "处理"},
+                                {"type": "text", "text": "完成"}
+                            ],
+                            "reasoning": "已检查工具结果"
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .expect("兼容响应应可解析");
+
+        assert_eq!(adapted.content, "处理完成");
+        assert_eq!(adapted.thinking.as_deref(), Some("已检查工具结果"));
+        assert_eq!(adapted.stop_reason, "stop");
     }
 }

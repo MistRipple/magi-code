@@ -1,6 +1,7 @@
 <script lang="ts">
   import {
     getCurrentSessionId,
+    isPersistedSessionId,
     messagesState,
   } from '../stores/messages.svelte';
   import { vscode } from '../lib/vscode-bridge';
@@ -108,7 +109,12 @@
     const sessionId = messagesState.currentSessionId?.trim() || '';
     const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
     const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
-    if (!isWebMode || !sessionId || (!workspaceId && !workspacePath)) {
+    if (
+      !isWebMode
+      || messagesState.sessionHydrating
+      || !isPersistedSessionId(sessionId)
+      || (!workspaceId && !workspacePath)
+    ) {
       return;
     }
 
@@ -116,7 +122,12 @@
     let inFlight = false;
     let errorReported = false;
     const refresh = async () => {
-      if (disposed || inFlight || messagesState.changeMutationStatus?.isMutating) {
+      if (
+        disposed
+        || inFlight
+        || messagesState.sessionHydrating
+        || messagesState.changeMutationStatus?.isMutating
+      ) {
         return;
       }
       inFlight = true;
@@ -126,7 +137,7 @@
         }
         errorReported = false;
       } catch (error) {
-        if (!disposed && !errorReported) {
+        if (!disposed && !messagesState.sessionHydrating && !errorReported) {
           console.warn('[EditsPanel] 刷新变更列表失败:', error);
           errorReported = true;
         }

@@ -543,7 +543,7 @@ impl magi_bridge_client::ModelBridgeClient for UnavailableBusinessModelBridgeCli
     fn invoke(
         &self,
         _request: magi_bridge_client::ModelInvocationRequest,
-    ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
+    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
         Err(self.error())
     }
 
@@ -551,7 +551,7 @@ impl magi_bridge_client::ModelBridgeClient for UnavailableBusinessModelBridgeCli
         &self,
         _request: magi_bridge_client::ModelInvocationRequest,
         _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
-    ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
+    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
         Err(self.error())
     }
 }
@@ -607,7 +607,7 @@ impl magi_bridge_client::ModelBridgeClient for SettingsBackedBusinessModelBridge
     fn invoke(
         &self,
         request: magi_bridge_client::ModelInvocationRequest,
-    ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
+    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
         self.build_client()?.invoke(request)
     }
 
@@ -615,7 +615,7 @@ impl magi_bridge_client::ModelBridgeClient for SettingsBackedBusinessModelBridge
         &self,
         request: magi_bridge_client::ModelInvocationRequest,
         on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
-    ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
+    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
         self.build_client()?.invoke_streaming(request, on_delta)
     }
 }
@@ -625,14 +625,13 @@ impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
     fn invoke(
         &self,
         request: magi_bridge_client::ModelInvocationRequest,
-    ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
+    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
         if let Some(payload) = classifier_payload_for_prompt(&request.prompt) {
-            return Ok(magi_bridge_client::BridgeResponse { ok: true, payload });
+            return Ok(static_test_chat_response(payload));
         }
         if request.prompt.contains("代理运行规划器") {
-            return Ok(magi_bridge_client::BridgeResponse {
-                ok: true,
-                payload: serde_json::json!({
+            return Ok(magi_bridge_client::ModelResponse::completed(
+                serde_json::json!({
                     "phases": [
                         {
                             "title": "P1",
@@ -670,40 +669,45 @@ impl magi_bridge_client::ModelBridgeClient for StaticTestModelBridgeClient {
                     ]
                 })
                 .to_string(),
-            });
+            ));
         }
         if request
             .tool_choice
             .as_ref()
             .is_some_and(|choice| choice.function.name == "agent_spawn")
         {
-            return Ok(magi_bridge_client::BridgeResponse {
-                ok: true,
-                payload: static_test_agent_spawn_payload(&request),
-            });
+            return Ok(static_test_chat_response(static_test_agent_spawn_payload(
+                &request,
+            )));
         }
         if let Some(payload) = static_test_agent_wait_payload(&request) {
-            return Ok(magi_bridge_client::BridgeResponse { ok: true, payload });
+            return Ok(static_test_chat_response(payload));
         }
         if let Some(result) = static_test_agent_wait_result(&request) {
-            return Ok(magi_bridge_client::BridgeResponse {
-                ok: true,
-                payload: format!("已吸收测试代理结果：{result}"),
-            });
+            return Ok(magi_bridge_client::ModelResponse::completed(format!(
+                "已吸收测试代理结果：{result}"
+            )));
         }
-        Ok(magi_bridge_client::BridgeResponse {
-            ok: true,
-            payload: format!("loopback-model::{}", request.prompt.trim()),
-        })
+        Ok(magi_bridge_client::ModelResponse::completed(format!(
+            "loopback-model::{}",
+            request.prompt.trim()
+        )))
     }
 
     fn invoke_streaming(
         &self,
         request: magi_bridge_client::ModelInvocationRequest,
         _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
-    ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError> {
+    ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError> {
         self.invoke(request)
     }
+}
+
+#[cfg(test)]
+fn static_test_chat_response(payload: String) -> magi_bridge_client::ModelResponse {
+    magi_bridge_client::ModelResponse::from_chat_payload(
+        serde_json::from_str(&payload).expect("daemon 测试模型响应必须符合统一响应结构"),
+    )
 }
 
 #[cfg(test)]
@@ -2004,7 +2008,8 @@ impl DaemonRuntime {
         };
         let mut section = serde_json::json!({
             "baseUrl": config.base_url,
-            "urlMode": "standard"
+            "urlMode": "standard",
+            "apiProtocol": "openai_chat"
         });
         if let Some(api_key) = config.api_key {
             section["apiKey"] = serde_json::Value::String(api_key);

@@ -2,18 +2,21 @@ use crate::llm_types::{
     LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams, ToolChoice, ToolDefinition,
     ToolInputSchema, parse_tool_result_model_content,
 };
-use crate::protocol::streaming::{SseLineParser, StreamAccumulator, parse_stream_event};
+#[cfg(test)]
+use crate::protocol::AdaptedResponse;
+use crate::protocol::streaming::{
+    SseLineParser, StreamAccumulator, parse_stream_event, parse_stream_provider_context,
+};
 use crate::protocol::{
-    AdaptedResponse, AnthropicMessagesAdapter, OpenAiChatCompletionsAdapter, ProviderAdapter,
-    ProviderFamily, ProviderToolNameCodec,
+    AnthropicMessagesAdapter, OpenAiChatCompletionsAdapter, ProviderAdapter, ProviderFamily,
+    ProviderToolNameCodec,
 };
 use crate::types::{
-    BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelBridgeClient, ModelInvocationRequest,
+    BridgeClientError, BridgeErrorLayer, ModelBridgeClient, ModelInvocationRequest, ModelResponse,
     ModelRetryRuntimeEvent, ModelRetryRuntimePhase, ModelStreamingDelta,
     model_invocation_cancelled_error, model_invocation_error_is_cancelled,
 };
 use magi_usage_authority::ReasoningEffort;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::env;
@@ -264,7 +267,7 @@ impl HttpModelBridgeClient {
         on_delta: &dyn Fn(&ModelStreamingDelta),
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
         is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<BridgeResponse, BridgeClientError> {
+    ) -> Result<ModelResponse, BridgeClientError> {
         if request.prompt.trim().is_empty() && request.messages.is_none() {
             return Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::RemoteBusiness,
@@ -297,25 +300,6 @@ impl HttpModelBridgeClient {
             );
 
             match result {
-                Ok((status, response_body, _retry_after))
-                    if is_forced_tool_choice_rejection(
-                        status,
-                        &response_body,
-                        &current_request.body,
-                        provider_family,
-                    ) =>
-                {
-                    let Some((capability, next_request)) =
-                        request_with_next_tool_choice_enforcement(
-                            &current_request,
-                            provider_family,
-                        )
-                    else {
-                        return Err(provider_http_status_error(status, &response_body));
-                    };
-                    fallback_capability = Some(capability);
-                    current_request = next_request;
-                }
                 Err(error)
                     if is_forced_tool_choice_rejection_error(
                         &error,
@@ -334,13 +318,7 @@ impl HttpModelBridgeClient {
                     fallback_capability = Some(capability);
                     current_request = next_request;
                 }
-                Ok((status, response_body, _retry_after)) => {
-                    if !(200..300).contains(&status) {
-                        for delta in buffered_deltas.into_inner() {
-                            on_delta(&delta);
-                        }
-                        return Err(provider_http_status_error(status, &response_body));
-                    }
+                Ok(response) => {
                     for delta in buffered_deltas.into_inner() {
                         on_delta(&delta);
                     }
@@ -352,10 +330,7 @@ impl HttpModelBridgeClient {
                     }) {
                         self.mark_forced_tool_choice_capability(capability);
                     }
-                    return Ok(BridgeResponse {
-                        ok: true,
-                        payload: response_body,
-                    });
+                    return Ok(response);
                 }
                 Err(error) => {
                     for delta in buffered_deltas.into_inner() {
@@ -528,13 +503,16 @@ fn retryable_bridge_error(error: &BridgeClientError) -> bool {
     if model_invocation_error_is_cancelled(error) {
         return false;
     }
-    matches!(
-        error,
+    match error {
         BridgeClientError::CallFailed {
             layer: BridgeErrorLayer::Transport,
             ..
+        } => true,
+        BridgeClientError::HttpStatusFailed { http_status, .. } => {
+            retryable_http_status(*http_status)
         }
-    )
+        _ => false,
+    }
 }
 
 fn retryable_empty_stream_error(error: &BridgeClientError) -> bool {
@@ -587,6 +565,7 @@ fn sleep_retry_delay_cancellable(delay: Duration, is_cancelled: &dyn Fn() -> boo
 }
 
 type HttpPostResult = Result<(u16, String, Option<Duration>), BridgeClientError>;
+type StreamingHttpResult = Result<ModelResponse, BridgeClientError>;
 type ToolChoiceFallbackHttpResult = Result<
     (
         HttpModelRequest,
@@ -872,7 +851,7 @@ enum StreamMessage {
     /// LLM 增量快照——携带已累积的正文与上游 thinking。
     Chunk(ModelStreamingDelta),
     /// HTTP I/O 结束——携带最终结果。
-    Done(Result<(u16, String, Option<Duration>), BridgeClientError>),
+    Done(StreamingHttpResult),
 }
 
 fn provider_stream_event_error(
@@ -938,6 +917,9 @@ fn apply_provider_stream_event(
     let mut llm_chunks = parse_stream_event(provider_family, event);
     tool_name_codec.decode_stream_chunks(&mut llm_chunks);
     accumulator.apply_all(&llm_chunks);
+    if let Some(context) = parse_stream_provider_context(provider_family, event) {
+        accumulator.apply_provider_context(context);
+    }
     let accumulated_content = accumulator.accumulated_content();
     let accumulated_thinking = accumulator.accumulated_thinking();
     if accumulated_content.len() > *last_content_delta_len
@@ -974,7 +956,7 @@ fn execute_streaming_http_post(
     tool_name_codec: ProviderToolNameCodec,
     on_chunk: &dyn Fn(&ModelStreamingDelta),
     is_cancelled: &dyn Fn() -> bool,
-) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
+) -> StreamingHttpResult {
     let cancellation = Arc::new(AtomicBool::new(false));
     let worker_cancellation = cancellation.clone();
     let (cancellation_tx, cancellation_rx) = tokio::sync::oneshot::channel();
@@ -1078,7 +1060,7 @@ fn execute_streaming_http_post_with_retries(
     on_chunk: &dyn Fn(&ModelStreamingDelta),
     on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
     is_cancelled: &dyn Fn() -> bool,
-) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
+) -> StreamingHttpResult {
     let mut retries = 0usize;
     loop {
         let emitted_delta = AtomicBool::new(false);
@@ -1100,28 +1082,6 @@ fn execute_streaming_http_post_with_retries(
             !emitted_delta.load(Ordering::SeqCst) && retries < MODEL_PROVIDER_MAX_RETRIES;
         let can_retry_empty_stream = retries < MODEL_PROVIDER_EMPTY_STREAM_RETRIES;
         match result {
-            Ok((status, _response_body, retry_after))
-                if can_retry && retryable_http_status(status) =>
-            {
-                retries += 1;
-                let delay = retry_after.unwrap_or_else(|| retry_delay(retries, &provider_key));
-                on_retry(&ModelRetryRuntimeEvent {
-                    phase: ModelRetryRuntimePhase::Scheduled,
-                    attempt: retries,
-                    max_attempts: MODEL_PROVIDER_MAX_RETRIES,
-                    delay_ms: Some(delay.as_millis() as u64),
-                });
-                if !sleep_retry_delay_cancellable(delay, is_cancelled) {
-                    return Err(model_invocation_cancelled_error());
-                }
-                on_retry(&ModelRetryRuntimeEvent {
-                    phase: ModelRetryRuntimePhase::AttemptStarted,
-                    attempt: retries,
-                    max_attempts: MODEL_PROVIDER_MAX_RETRIES,
-                    delay_ms: None,
-                });
-                continue;
-            }
             Err(error)
                 if (can_retry && retryable_bridge_error(&error))
                     || (can_retry_empty_stream && retryable_empty_stream_error(&error)) =>
@@ -1185,7 +1145,7 @@ async fn streaming_http_io(
     tool_name_codec: ProviderToolNameCodec,
     tx: &mpsc::Sender<StreamMessage>,
     mut cancellation_rx: tokio::sync::oneshot::Receiver<()>,
-) -> Result<(u16, String, Option<Duration>), BridgeClientError> {
+) -> StreamingHttpResult {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         // 流式场景下 timeout 用于检测 LLM 长时间无输出（卡死），
@@ -1236,7 +1196,7 @@ async fn streaming_http_io(
             code: Some(-32005),
             message: format!("reading error response body failed: {error}"),
         })?;
-        return Ok((status, response_body, retry_after));
+        return Err(provider_http_status_error(status, &response_body));
     }
 
     // 流式读取 SSE 事件
@@ -1352,8 +1312,7 @@ async fn streaming_http_io(
         });
     }
 
-    // 直接将 StreamAccumulator 转换为 BridgeResponse payload，
-    // 跳过自构造 OpenAI JSON → 再反序列化的冗余链路。
+    // 流聚合结果直接转换为统一模型响应，不再构造中间协议 JSON。
     let adapted = tool_name_codec.decode_adapted_response(accumulator.finalize());
     if adapted.content.trim().is_empty()
         && adapted
@@ -1368,13 +1327,12 @@ async fn streaming_http_io(
             message: "provider response invalid: empty stream response".to_string(),
         });
     }
-    let payload = adapted_response_to_bridge_payload(&adapted);
-
-    Ok((status, payload, retry_after))
+    let _ = retry_after;
+    Ok(adapted.into())
 }
 
 impl ModelBridgeClient for HttpModelBridgeClient {
-    fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError> {
+    fn invoke(&self, request: ModelInvocationRequest) -> Result<ModelResponse, BridgeClientError> {
         if request.prompt.trim().is_empty() && request.messages.is_none() {
             return Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::RemoteBusiness,
@@ -1405,17 +1363,16 @@ impl ModelBridgeClient for HttpModelBridgeClient {
             self.mark_forced_tool_choice_capability(capability);
         }
 
-        let payload =
+        let response =
             self.parse_success_payload(&response_body, &accepted_request.tool_name_codec)?;
-
-        Ok(BridgeResponse { ok: true, payload })
+        Ok(response)
     }
 
     fn invoke_with_cancellation(
         &self,
         request: ModelInvocationRequest,
         is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<BridgeResponse, BridgeClientError> {
+    ) -> Result<ModelResponse, BridgeClientError> {
         if request.prompt.trim().is_empty() && request.messages.is_none() {
             return Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::RemoteBusiness,
@@ -1443,16 +1400,16 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         }) {
             self.mark_forced_tool_choice_capability(capability);
         }
-        let payload =
+        let response =
             self.parse_success_payload(&response_body, &accepted_request.tool_name_codec)?;
-        Ok(BridgeResponse { ok: true, payload })
+        Ok(response)
     }
 
     fn invoke_streaming(
         &self,
         request: ModelInvocationRequest,
         on_delta: &dyn Fn(&ModelStreamingDelta),
-    ) -> Result<BridgeResponse, BridgeClientError> {
+    ) -> Result<ModelResponse, BridgeClientError> {
         self.invoke_streaming_observed(request, on_delta, &|_| {}, &|| false)
     }
 
@@ -1461,7 +1418,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         request: ModelInvocationRequest,
         on_delta: &dyn Fn(&ModelStreamingDelta),
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
-    ) -> Result<BridgeResponse, BridgeClientError> {
+    ) -> Result<ModelResponse, BridgeClientError> {
         self.invoke_streaming_observed(request, on_delta, on_retry, &|| false)
     }
 
@@ -1471,7 +1428,7 @@ impl ModelBridgeClient for HttpModelBridgeClient {
         on_delta: &dyn Fn(&ModelStreamingDelta),
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
         is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<BridgeResponse, BridgeClientError> {
+    ) -> Result<ModelResponse, BridgeClientError> {
         self.invoke_streaming_observed(request, on_delta, on_retry, is_cancelled)
     }
 }
@@ -1481,7 +1438,7 @@ impl HttpModelBridgeClient {
         &self,
         response_body: &str,
         tool_name_codec: &ProviderToolNameCodec,
-    ) -> Result<String, BridgeClientError> {
+    ) -> Result<ModelResponse, BridgeClientError> {
         if let Some(message) = provider_error_message(response_body) {
             return Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::RemoteBusiness,
@@ -1489,249 +1446,36 @@ impl HttpModelBridgeClient {
                 message: format!("provider rejected request: {message}"),
             });
         }
-        match self.protocol {
+        let adapted = match self.protocol {
             HttpModelBridgeProtocol::ChatCompletions => {
-                let envelope: OpenAiCompatibleChatCompletionEnvelope =
-                    serde_json::from_str(response_body).map_err(|error| {
-                        BridgeClientError::CallFailed {
-                            layer: BridgeErrorLayer::RemoteBusiness,
-                            code: Some(-32007),
-                            message: format!(
-                                "provider response invalid: decode chat completion failed: {error}"
-                            ),
-                        }
-                    })?;
-
-                select_openai_bridge_payload(envelope.choices, envelope.usage, tool_name_codec)
-                    .map_err(|reason| BridgeClientError::CallFailed {
-                        layer: BridgeErrorLayer::RemoteBusiness,
-                        code: Some(-32007),
-                        message: format!("provider response invalid: {reason}"),
-                    })
+                OpenAiChatCompletionsAdapter.parse_response(200, response_body)
             }
             HttpModelBridgeProtocol::AnthropicMessages => {
-                let adapted = AnthropicMessagesAdapter
-                    .parse_response(200, response_body)
-                    .map_err(|reason| BridgeClientError::CallFailed {
-                        layer: BridgeErrorLayer::RemoteBusiness,
-                        code: Some(-32007),
-                        message: format!("provider response invalid: {reason}"),
-                    })?;
-                Ok(adapted_response_to_bridge_payload(
-                    &tool_name_codec.decode_adapted_response(adapted),
-                ))
+                AnthropicMessagesAdapter.parse_response(200, response_body)
             }
         }
-    }
-}
-// --- OpenAI response types -- mirrors model_loopback.rs for consistency
-
-#[derive(Debug, Deserialize)]
-struct OpenAiCompatibleChatCompletionEnvelope {
-    #[serde(default)]
-    usage: Option<OpenAiCompatibleUsage>,
-    choices: Vec<OpenAiCompatibleChatChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiCompatibleChatChoice {
-    #[serde(default)]
-    finish_reason: Option<String>,
-    #[serde(default)]
-    message: Option<OpenAiCompatibleChatMessage>,
-    #[serde(default)]
-    text: Option<String>,
-}
-
-impl OpenAiCompatibleChatChoice {
-    fn into_payload(self, usage: Option<OpenAiCompatibleUsage>) -> OpenAiCompatibleSuccessPayload {
-        let (content, reasoning_content, tool_calls) = match self.message {
-            Some(message) => {
-                let reasoning_content = message
-                    .reasoning_content
-                    .filter(|content| !content.trim().is_empty());
-                (
-                    message
-                        .content
-                        .map(OpenAiCompatibleMessageContent::into_text)
-                        .filter(|content| !content.trim().is_empty())
-                        .or(message.refusal),
-                    reasoning_content,
-                    message.tool_calls,
-                )
-            }
-            None => (None, None, Vec::new()),
-        };
-
-        OpenAiCompatibleSuccessPayload {
-            content: content.or(self.text),
-            reasoning_content,
-            finish_reason: self.finish_reason,
-            usage,
-            tool_calls,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiCompatibleChatMessage {
-    #[serde(default)]
-    content: Option<OpenAiCompatibleMessageContent>,
-    #[serde(default)]
-    reasoning_content: Option<String>,
-    #[serde(default)]
-    refusal: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_openai_tool_calls")]
-    tool_calls: Vec<OpenAiCompatibleToolCall>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum OpenAiCompatibleMessageContent {
-    Text(String),
-    Parts(Vec<OpenAiCompatibleMessagePart>),
-}
-
-impl OpenAiCompatibleMessageContent {
-    fn into_text(self) -> String {
-        match self {
-            Self::Text(text) => text,
-            Self::Parts(parts) => parts.into_iter().filter_map(|part| part.text).collect(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiCompatibleMessagePart {
-    #[serde(rename = "type")]
-    _kind: Option<String>,
-    #[serde(default)]
-    text: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq)]
-struct OpenAiCompatibleSuccessPayload {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    finish_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    usage: Option<OpenAiCompatibleUsage>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    tool_calls: Vec<OpenAiCompatibleToolCall>,
-}
-
-impl OpenAiCompatibleSuccessPayload {
-    fn into_bridge_payload(self) -> Result<String, String> {
-        if self.content.is_none() && self.reasoning_content.is_none() && self.tool_calls.is_empty()
+        .map_err(|reason| BridgeClientError::CallFailed {
+            layer: BridgeErrorLayer::RemoteBusiness,
+            code: Some(-32007),
+            message: format!("provider response invalid: {reason}"),
+        })?;
+        let adapted = tool_name_codec.decode_adapted_response(adapted);
+        if adapted.content.trim().is_empty()
+            && adapted
+                .thinking
+                .as_ref()
+                .is_none_or(|value| value.trim().is_empty())
+            && adapted.tool_calls.is_empty()
         {
-            return Err(
-                "missing message.content/text, message.reasoning_content or message.tool_calls"
-                    .to_string(),
-            );
+            return Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::RemoteBusiness,
+                code: Some(-32007),
+                message: "provider response invalid: empty model response".to_string(),
+            });
         }
-
-        if self.finish_reason.is_none()
-            && self.usage.is_none()
-            && self.reasoning_content.is_none()
-            && self.tool_calls.is_empty()
-        {
-            return Ok(self.content.unwrap_or_default());
-        }
-
-        serde_json::to_string(&self)
-            .map_err(|error| format!("serialize structured payload failed: {error}"))
+        Ok(adapted.into())
     }
 }
-
-fn select_openai_bridge_payload(
-    choices: Vec<OpenAiCompatibleChatChoice>,
-    usage: Option<OpenAiCompatibleUsage>,
-    tool_name_codec: &ProviderToolNameCodec,
-) -> Result<String, String> {
-    if choices.is_empty() {
-        return Err("missing choices[0]".to_string());
-    }
-
-    let mut invalid_choices = Vec::new();
-    for (index, choice) in choices.into_iter().enumerate() {
-        let mut payload = choice.into_payload(usage.clone());
-        for tool_call in &mut payload.tool_calls {
-            tool_call.function.name = tool_name_codec.decode_name(&tool_call.function.name);
-        }
-        match payload.into_bridge_payload() {
-            Ok(payload) => return Ok(payload),
-            Err(reason) => invalid_choices.push(format!("choices[{index}]: {reason}")),
-        }
-    }
-
-    Err(format!(
-        "no bridgeable choices in response: {}",
-        invalid_choices.join("; ")
-    ))
-}
-
-#[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq)]
-struct OpenAiCompatibleUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-    #[serde(default)]
-    total_tokens: Option<u64>,
-    #[serde(default)]
-    prompt_tokens_details: Option<serde_json::Value>,
-    #[serde(default)]
-    completion_tokens_details: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq)]
-struct OpenAiCompatibleToolCall {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(rename = "type", default)]
-    kind: Option<String>,
-    function: OpenAiCompatibleToolFunction,
-}
-
-#[derive(Debug, Clone, serde::Serialize, Deserialize, PartialEq)]
-struct OpenAiCompatibleToolFunction {
-    name: String,
-    #[serde(deserialize_with = "deserialize_openai_tool_arguments")]
-    arguments: String,
-}
-
-fn deserialize_openai_tool_arguments<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum RawOpenAiToolArguments {
-        String(String),
-        Json(serde_json::Value),
-    }
-
-    match RawOpenAiToolArguments::deserialize(deserializer)? {
-        RawOpenAiToolArguments::String(arguments) => Ok(arguments),
-        RawOpenAiToolArguments::Json(arguments) => {
-            serde_json::to_string(&arguments).map_err(serde::de::Error::custom)
-        }
-    }
-}
-
-fn deserialize_openai_tool_calls<'de, D>(
-    deserializer: D,
-) -> Result<Vec<OpenAiCompatibleToolCall>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<Vec<OpenAiCompatibleToolCall>>::deserialize(deserializer)
-        .map(|tool_calls| tool_calls.unwrap_or_default())
-}
-
 fn read_non_empty_env(key: &str) -> Option<String> {
     env::var(key)
         .ok()
@@ -1846,7 +1590,12 @@ fn llm_message_from_chat_message(message: &crate::types::ChatMessage) -> LlmMess
         };
     }
 
-    let mut blocks = Vec::new();
+    let mut blocks = message
+        .provider_context
+        .iter()
+        .cloned()
+        .map(|context| LlmContentBlock::ProviderContext { context })
+        .collect::<Vec<_>>();
     if let Some(content) = message
         .content
         .as_ref()
@@ -1872,7 +1621,10 @@ fn llm_message_from_chat_message(message: &crate::types::ChatMessage) -> LlmMess
     }
 
     let content = if blocks.is_empty()
-        || (blocks.len() == 1 && message.images.is_empty() && message.tool_calls.is_empty())
+        || (message.provider_context.is_empty()
+            && blocks.len() == 1
+            && message.images.is_empty()
+            && message.tool_calls.is_empty())
     {
         LlmMessageContent::Text(message.content.clone().unwrap_or_default())
     } else {
@@ -1912,57 +1664,6 @@ fn tool_definition_from_chat_tool(tool: &crate::types::ChatToolDefinition) -> To
         },
         origin: tool.origin,
     }
-}
-
-/// 将 `AdaptedResponse` 直接转换为 `BridgeResponse.payload` 格式，
-/// 跳过自构造 OpenAI choices[] envelope → 再反序列化的冗余链路。
-fn adapted_response_to_bridge_payload(adapted: &AdaptedResponse) -> String {
-    let tool_calls: Vec<OpenAiCompatibleToolCall> = adapted
-        .tool_calls
-        .iter()
-        .map(|tc| OpenAiCompatibleToolCall {
-            id: Some(tc.id.clone()),
-            kind: Some("function".to_string()),
-            function: OpenAiCompatibleToolFunction {
-                name: tc.name.clone(),
-                arguments: tc.raw_arguments.as_deref().unwrap_or("{}").to_string(),
-            },
-        })
-        .collect();
-    let prompt_tokens_details = if adapted.usage.cache_read_included_in_input {
-        adapted
-            .usage
-            .cache_read_tokens
-            .map(|cached_tokens| json!({ "cached_tokens": cached_tokens }))
-    } else {
-        None
-    };
-
-    let payload = OpenAiCompatibleSuccessPayload {
-        content: if adapted.content.is_empty() {
-            None
-        } else {
-            Some(adapted.content.clone())
-        },
-        reasoning_content: adapted
-            .thinking
-            .as_ref()
-            .filter(|thinking| !thinking.trim().is_empty())
-            .cloned(),
-        finish_reason: Some(adapted.stop_reason.clone()),
-        usage: Some(OpenAiCompatibleUsage {
-            prompt_tokens: Some(adapted.usage.input_tokens),
-            completion_tokens: Some(adapted.usage.output_tokens),
-            total_tokens: Some(adapted.usage.input_tokens + adapted.usage.output_tokens),
-            prompt_tokens_details,
-            completion_tokens_details: None,
-        }),
-        tool_calls,
-    };
-
-    payload
-        .into_bridge_payload()
-        .unwrap_or_else(|_| adapted.content.clone())
 }
 
 /// 安全地将字节切片解码为 UTF-8 字符串，不丢弃尾部不完整的多字节序列。
@@ -2048,7 +1749,7 @@ fn is_forced_tool_choice_rejection(
 ) -> bool {
     status == 400
         && is_forced_tool_choice_request(request_body, provider_family)
-        && is_forced_tool_choice_rejection_message(response_body)
+        && is_forced_tool_choice_rejection_message(response_body, true)
 }
 
 fn is_forced_tool_choice_rejection_error(
@@ -2057,7 +1758,10 @@ fn is_forced_tool_choice_rejection_error(
     provider_family: ProviderFamily,
 ) -> bool {
     is_forced_tool_choice_request(request_body, provider_family)
-        && is_forced_tool_choice_rejection_message(&error.to_string())
+        && is_forced_tool_choice_rejection_message(
+            &error.to_string(),
+            error.http_status() == Some(400),
+        )
 }
 
 fn is_forced_tool_choice_request(request_body: &Value, provider_family: ProviderFamily) -> bool {
@@ -2107,8 +1811,14 @@ fn tool_choice_enforcement(
     }
 }
 
-fn is_forced_tool_choice_rejection_message(message: &str) -> bool {
+fn is_forced_tool_choice_rejection_message(
+    message: &str,
+    allow_opaque_gateway_error: bool,
+) -> bool {
     let normalized = message.to_ascii_lowercase().replace('_', " ");
+    // 部分 OpenAI 兼容网关会吞掉上游的 tool_choice 细节，只保留这一泛化错误。
+    // 仅在当前请求确实使用了强制工具选择时，调用方才会把它用于能力协商。
+    let opaque_upstream_rejection = normalized.contains("upstream request failed");
     let mentions_forced_choice = normalized.contains("tool choice")
         || normalized.contains("tool selection")
         || normalized.contains("function calling");
@@ -2124,7 +1834,8 @@ fn is_forced_tool_choice_rejection_message(message: &str) -> bool {
         || normalized.contains("can't")
         || normalized.contains("must be")
         || normalized.contains("must use");
-    mentions_forced_choice && rejection
+    (allow_opaque_gateway_error && opaque_upstream_rejection)
+        || (mentions_forced_choice && rejection)
 }
 
 fn request_with_next_tool_choice_enforcement(
@@ -2298,6 +2009,7 @@ mod tests {
                 images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_view_image".to_string()),
+                provider_context: Vec::new(),
             }]),
             tools: None,
             tool_choice: None,
@@ -2334,6 +2046,7 @@ mod tests {
                 }],
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                provider_context: Vec::new(),
             }]),
             tools: None,
             tool_choice: None,
@@ -2410,6 +2123,7 @@ mod tests {
                     },
                 }],
                 tool_call_id: None,
+                provider_context: Vec::new(),
             }]),
             tools: Some(vec![
                 crate::types::ChatToolDefinition {
@@ -2548,8 +2262,53 @@ mod tests {
                 &http_request.tool_name_codec,
             )
             .expect("provider response should be bridgeable");
-        let value: serde_json::Value = serde_json::from_str(&canonical).expect("canonical payload");
-        assert_eq!(value["tool_calls"][0]["function"]["name"], "web_search");
+        assert_eq!(canonical.tool_calls[0].function.name, "web_search");
+    }
+
+    #[test]
+    fn compatible_response_normalizes_missing_tool_call_identity_and_reasoning_alias() {
+        let client = HttpModelBridgeClient::new(
+            "https://api.example.com/v1".to_string(),
+            Some("test-key".to_string()),
+            "non-gpt-compatible-model".to_string(),
+        );
+        let codec = client
+            .build_http_request(
+                &ModelInvocationRequest {
+                    provider: "openai-compatible".to_string(),
+                    prompt: "test".to_string(),
+                    messages: None,
+                    tools: None,
+                    tool_choice: None,
+                },
+                false,
+            )
+            .expect("request should build")
+            .tool_name_codec;
+        let canonical = client
+            .parse_success_payload(
+                &serde_json::json!({
+                    "choices": [{
+                        "stop_reason": "tool_calls",
+                        "message": {
+                            "reasoning": "需要查询",
+                            "tool_calls": [{
+                                "function": {
+                                    "name": "web_search",
+                                    "arguments": {"query": "Magi"}
+                                }
+                            }]
+                        }
+                    }]
+                })
+                .to_string(),
+                &codec,
+            )
+            .expect("兼容提供方省略工具 id 和 type 时仍应归一化");
+        assert_eq!(canonical.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(canonical.thinking.as_deref(), Some("需要查询"));
+        assert_eq!(canonical.tool_calls[0].kind, "function");
+        assert!(canonical.tool_calls[0].id.starts_with("call_compat_0_"));
     }
 
     #[test]
@@ -2584,12 +2343,31 @@ mod tests {
             .expect("request should build")
             .tool_name_codec
             .encode_name("web_search");
+        let start_event = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "type": "function",
+                        "function": {
+                            "name": wire_name.clone(),
+                            "arguments": {"query": "Magi"}
+                        }
+                    }]
+                },
+                "stop_reason": null
+            }]
+        });
+        let finish_event = serde_json::json!({
+            "choices": [{
+                "delta": {},
+                "stop_reason": "tool_calls"
+            }]
+        });
         let server = spawn_mock_server_with_response_text(
             200,
             "text/event-stream",
-            format!(
-                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-search-1\",\"type\":\"function\",\"function\":{{\"name\":\"{wire_name}\",\"arguments\":\"{{\\\"query\\\":\\\"Magi\\\"}}\"}}}}]}},\"finish_reason\":null}}]}}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
-            ),
+            format!("data: {start_event}\n\ndata: {finish_event}\n\ndata: [DONE]\n\n"),
         );
         let client = HttpModelBridgeClient::new(
             server.address,
@@ -2601,9 +2379,12 @@ mod tests {
             .invoke_streaming(invocation, &|_| {})
             .expect("streaming response should be bridgeable");
 
-        let payload: serde_json::Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert_eq!(payload["tool_calls"][0]["function"]["name"], "web_search");
+        assert_eq!(response.tool_calls[0].function.name, "web_search");
+        assert_eq!(
+            response.tool_calls[0].function.arguments,
+            serde_json::json!({"query": "Magi"}).to_string(),
+        );
+        assert!(response.tool_calls[0].id.starts_with("call_compat_0_"));
 
         let recorded = server
             .request_receiver
@@ -2655,6 +2436,30 @@ mod tests {
         assert_eq!(capability, ForcedToolChoiceCapability::Required);
         assert_eq!(fallback.body["tool_choice"], "required");
         assert_eq!(request.body["tool_choice"]["type"], "function");
+    }
+
+    #[test]
+    fn opaque_gateway_bad_request_retries_forced_tool_choice() {
+        let body = json!({
+            "tools": [{"type": "function"}],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "shell_exec"}
+            }
+        });
+
+        assert!(is_forced_tool_choice_rejection(
+            400,
+            r#"{"error":{"message":"Upstream request failed. Please try again later."}}"#,
+            &body,
+            ProviderFamily::OpenAiChat
+        ));
+        assert!(!is_forced_tool_choice_rejection(
+            429,
+            r#"{"error":{"message":"Upstream request failed. Please try again later."}}"#,
+            &body,
+            ProviderFamily::OpenAiChat
+        ));
     }
 
     #[test]
@@ -2726,6 +2531,7 @@ mod tests {
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    provider_context: Vec::new(),
                 },
                 crate::types::ChatMessage {
                     role: "user".to_string(),
@@ -2733,6 +2539,7 @@ mod tests {
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    provider_context: Vec::new(),
                 },
             ]),
             tools: Some(vec![crate::types::ChatToolDefinition {
@@ -2946,8 +2753,8 @@ mod tests {
     }
 
     #[test]
-    fn adapted_payload_preserves_cached_prompt_tokens() {
-        let payload = adapted_response_to_bridge_payload(&AdaptedResponse {
+    fn adapted_response_preserves_cached_prompt_tokens() {
+        let response = ModelResponse::from(AdaptedResponse {
             content: "hello".to_string(),
             thinking: None,
             tool_calls: Vec::new(),
@@ -2960,12 +2767,12 @@ mod tests {
             },
             stop_reason: "stop".to_string(),
             raw: None,
+            provider_context: Vec::new(),
         });
-        let value: serde_json::Value =
-            serde_json::from_str(&payload).expect("payload should stay json");
+        let value = response.usage.expect("usage should be present");
 
-        assert_eq!(value["usage"]["prompt_tokens"], 10);
-        assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
+        assert_eq!(value["inputTokens"], 10);
+        assert_eq!(value["cacheReadTokens"], 4);
     }
 
     #[test]
@@ -3332,8 +3139,11 @@ mod tests {
             })
             .expect("invoke should succeed against mock server");
 
-        assert!(response.ok);
-        assert_eq!(response.payload, "hello from direct HTTP client");
+        assert!(response.is_actionable());
+        assert_eq!(
+            response.content.as_deref(),
+            Some("hello from direct HTTP client")
+        );
 
         let recorded = server
             .request_receiver
@@ -3509,7 +3319,7 @@ mod tests {
             )
             .expect("streaming invoke should succeed against mock server");
 
-        assert!(response.ok);
+        assert!(response.is_actionable());
         let deltas = deltas.into_inner();
         assert_eq!(deltas.last().map(String::as_str), Some("Hello"));
         assert!(
@@ -3562,7 +3372,7 @@ mod tests {
             )
             .expect("backlogged stream should complete");
 
-        assert!(response.ok);
+        assert!(response.is_actionable());
         assert_eq!(latest_content.borrow().chars().count(), 200);
         assert!(
             callback_count.get() < 20,
@@ -3575,12 +3385,17 @@ mod tests {
     }
 
     #[test]
-    fn streaming_retries_forced_tool_choice_as_required_choice() {
+    fn streaming_negotiates_opaque_forced_tool_rejection_to_automatic_choice() {
         let server = spawn_mock_server_sequence(vec![
             MockHttpResponse {
                 status: 400,
                 content_type: "application/json".to_string(),
-                response_text: r#"{"error":{"message":"tool_choice parameter does not support being set to required or object in thinking mode"}}"#.to_string(),
+                response_text: r#"{"error":{"message":"Upstream request failed. Please try again later."}}"#.to_string(),
+            },
+            MockHttpResponse {
+                status: 400,
+                content_type: "application/json".to_string(),
+                response_text: r#"{"error":{"message":"Upstream request failed. Please try again later."}}"#.to_string(),
             },
             MockHttpResponse {
                 status: 200,
@@ -3616,12 +3431,12 @@ mod tests {
 
         let response = client
             .invoke_streaming(request.clone(), &|_| {})
-            .expect("forced choice rejection should recover with required choice");
-        assert!(response.ok);
+            .expect("opaque forced choice rejection should negotiate to automatic choice");
+        assert!(response.is_actionable());
         let learned_response = client
             .invoke_streaming(request, &|_| {})
-            .expect("learned required-only capability should keep working");
-        assert!(learned_response.ok);
+            .expect("learned automatic-only capability should keep working");
+        assert!(learned_response.is_actionable());
 
         let first: Value = serde_json::from_str(
             &server
@@ -3645,11 +3460,20 @@ mod tests {
             &server
                 .request_receiver
                 .recv_timeout(Duration::from_secs(5))
+                .expect("automatic fallback request should arrive")
+                .body,
+        )
+        .expect("automatic fallback request should be json");
+        assert_eq!(third["tool_choice"], "auto");
+        let fourth: Value = serde_json::from_str(
+            &server
+                .request_receiver
+                .recv_timeout(Duration::from_secs(5))
                 .expect("learned request should arrive")
                 .body,
         )
         .expect("learned request should be json");
-        assert_eq!(third["tool_choice"], "required");
+        assert_eq!(fourth["tool_choice"], "auto");
     }
 
     #[test]
@@ -3697,7 +3521,7 @@ mod tests {
                 deltas.borrow_mut().push(delta.content.clone())
             })
             .expect("stream rejection after a partial delta should recover");
-        assert!(response.ok);
+        assert!(response.is_actionable());
         assert_eq!(deltas.into_inner(), vec!["自动恢复".to_string()]);
 
         let first: Value = serde_json::from_str(
@@ -3777,7 +3601,7 @@ mod tests {
                 deltas.borrow_mut().push(delta.content.clone())
             })
             .expect("Anthropic stream rejection should recover");
-        assert!(response.ok);
+        assert!(response.is_actionable());
         assert_eq!(deltas.into_inner(), vec!["自动恢复".to_string()]);
 
         let first: Value = serde_json::from_str(
@@ -3868,10 +3692,8 @@ mod tests {
             )
             .expect("finish_reason 已经证明 OpenAI 流完整");
 
-        let payload: serde_json::Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert_eq!(payload["content"], "完整回复");
-        assert_eq!(payload["finish_reason"], "stop");
+        assert_eq!(response.content.as_deref(), Some("完整回复"));
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
     }
 
     #[test]
@@ -3904,9 +3726,7 @@ mod tests {
             )
             .expect("EOF 前没有额外空行时仍应提交最终 SSE 事件");
 
-        let payload: serde_json::Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert_eq!(payload["content"], "完整回复");
+        assert_eq!(response.content.as_deref(), Some("完整回复"));
     }
 
     #[test]
@@ -3989,10 +3809,8 @@ mod tests {
             )
             .expect("message_stop 已经证明 Anthropic 流完整");
 
-        let payload: serde_json::Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert_eq!(payload["content"], "完整 Claude 回复");
-        assert_eq!(payload["finish_reason"], "end_turn");
+        assert_eq!(response.content.as_deref(), Some("完整 Claude 回复"));
+        assert_eq!(response.finish_reason.as_deref(), Some("end_turn"));
     }
 
     #[test]
@@ -4082,7 +3900,11 @@ mod tests {
         let response = result_receiver
             .recv_timeout(Duration::from_millis(500))
             .expect("[DONE] 后必须立即完成，不能等 socket close");
-        assert!(response.expect("streaming invoke should succeed").ok);
+        assert!(
+            response
+                .expect("streaming invoke should succeed")
+                .is_actionable()
+        );
 
         client_handle
             .join()
@@ -4182,12 +4004,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("finish_reason 后必须在排空窗口内完成，不能等待 socket close")
             .expect("streaming invoke should succeed");
-        let payload: serde_json::Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert_eq!(payload["content"], "完整回复");
-        assert_eq!(payload["finish_reason"], "stop");
-        assert_eq!(payload["usage"]["prompt_tokens"], 5);
-        assert_eq!(payload["usage"]["completion_tokens"], 3);
+        assert_eq!(response.content.as_deref(), Some("完整回复"));
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+        let usage = response.usage.expect("usage should exist");
+        assert_eq!(usage["inputTokens"], 5);
+        assert_eq!(usage["outputTokens"], 3);
 
         client_handle
             .join()
@@ -4287,9 +4108,7 @@ mod tests {
             )
             .expect("terminal empty response should reconnect before failing");
 
-        let payload: serde_json::Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert_eq!(payload["content"], "recovered");
+        assert_eq!(response.content.as_deref(), Some("recovered"));
         assert_eq!(deltas.into_inner(), vec!["recovered".to_string()]);
         for _ in 0..2 {
             server
@@ -4378,7 +4197,7 @@ mod tests {
             })
             .expect("retryable rejection should recover on the next attempt");
 
-        assert_eq!(response.payload, "retry recovered");
+        assert_eq!(response.content.as_deref(), Some("retry recovered"));
         for _ in 0..2 {
             let recorded = server
                 .request_receiver
@@ -4503,7 +4322,7 @@ mod tests {
             )
             .expect("streaming retry should recover before any delta is emitted");
 
-        assert!(response.ok);
+        assert!(response.is_actionable());
         assert_eq!(deltas.into_inner(), vec!["Hi".to_string()]);
         for _ in 0..2 {
             let recorded = server
@@ -4552,9 +4371,7 @@ mod tests {
             )
             .expect("首个可见增量前连接中断时应重连并继续");
 
-        let payload: serde_json::Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert_eq!(payload["content"], "reconnected");
+        assert_eq!(response.content.as_deref(), Some("reconnected"));
         for _ in 0..2 {
             server
                 .request_receiver
@@ -4661,9 +4478,7 @@ mod tests {
             )
             .expect("overloaded SSE error 应在首个增量前重连");
 
-        let payload: serde_json::Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert_eq!(payload["content"], "recovered");
+        assert_eq!(response.content.as_deref(), Some("recovered"));
         for _ in 0..2 {
             server
                 .request_receiver
@@ -4848,14 +4663,12 @@ mod tests {
             })
             .expect("invoke should succeed");
 
-        assert!(response.ok);
-        let payload: serde_json::Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert_eq!(payload["content"], "structured reply");
-        assert_eq!(payload["finish_reason"], "stop");
-        assert_eq!(payload["usage"]["prompt_tokens"], 5);
-        assert_eq!(payload["usage"]["completion_tokens"], 3);
-        assert_eq!(payload["usage"]["total_tokens"], 8);
+        assert!(response.is_actionable());
+        assert_eq!(response.content.as_deref(), Some("structured reply"));
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+        let usage = response.usage.expect("usage should exist");
+        assert_eq!(usage["inputTokens"], 5);
+        assert_eq!(usage["outputTokens"], 3);
     }
 
     #[test]
@@ -4897,14 +4710,13 @@ mod tests {
             })
             .expect("invoke should succeed");
 
-        assert!(response.ok);
-        let payload: serde_json::Value =
-            serde_json::from_str(&response.payload).expect("payload should be json");
-        assert_eq!(payload["content"], "anthropic reply");
-        assert_eq!(payload["finish_reason"], "end_turn");
-        assert_eq!(payload["usage"]["prompt_tokens"], 9);
-        assert_eq!(payload["usage"]["completion_tokens"], 5);
-        assert!(payload["usage"]["prompt_tokens_details"].is_null());
+        assert!(response.is_actionable());
+        assert_eq!(response.content.as_deref(), Some("anthropic reply"));
+        assert_eq!(response.finish_reason.as_deref(), Some("end_turn"));
+        let usage = response.usage.expect("usage should exist");
+        assert_eq!(usage["inputTokens"], 9);
+        assert_eq!(usage["outputTokens"], 5);
+        assert_eq!(usage["cacheReadTokens"], 2);
 
         let recorded = server
             .request_receiver
@@ -5032,8 +4844,8 @@ mod tests {
             })
             .expect("invoke should succeed without API key");
 
-        assert!(response.ok);
-        assert_eq!(response.payload, "no auth needed");
+        assert!(response.is_actionable());
+        assert_eq!(response.content.as_deref(), Some("no auth needed"));
 
         let recorded = server
             .request_receiver

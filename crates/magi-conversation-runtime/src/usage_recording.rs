@@ -7,7 +7,7 @@ use crate::model_config::{
 };
 use crate::model_context_window::resolve_model_context_window;
 use magi_bridge_client::{
-    BridgeClientError, BridgeResponse, ModelBridgeClient, ModelInvocationRequest,
+    BridgeClientError, ModelBridgeClient, ModelInvocationRequest, ModelResponse,
 };
 use magi_core::{EventId, MissionId, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
@@ -78,11 +78,10 @@ pub fn invoke_auxiliary_model_with_usage(
     client: Arc<dyn ModelBridgeClient>,
     request: ModelInvocationRequest,
     context: AuxiliaryModelUsageContext<'_>,
-) -> Result<BridgeResponse, BridgeClientError> {
+) -> Result<ModelResponse, BridgeClientError> {
     let binding = auxiliary_model_usage_binding(context.phase);
     match client.invoke(request) {
         Ok(response) => {
-            let payload = response.parse_chat_payload();
             if let Some(session_id) = context.session_id {
                 publish_model_usage_record(
                     context.event_bus,
@@ -93,14 +92,10 @@ pub fn invoke_auxiliary_model_with_usage(
                         workspace_id: context.workspace_id,
                         binding: &binding,
                         call_id: context.call_id.clone(),
-                        usage: payload.usage.as_ref(),
-                        status: if response.ok {
-                            UsageCallStatus::Success
-                        } else {
-                            UsageCallStatus::Failed
-                        },
+                        usage: response.usage.as_ref(),
+                        status: UsageCallStatus::Success,
                         assignment_id: None,
-                        error_code: (!response.ok).then(|| "auxiliary_model_rejected".to_string()),
+                        error_code: None,
                     },
                 );
             }
@@ -607,6 +602,12 @@ mod tests {
     use magi_usage_authority::UsageCallStatus;
     use serde_json::json;
 
+    fn model_response(payload: serde_json::Value) -> ModelResponse {
+        ModelResponse::from_chat_payload(
+            serde_json::from_value(payload).expect("测试模型响应必须符合统一响应结构"),
+        )
+    }
+
     #[test]
     fn session_turn_model_usage_binding_respects_phase() {
         let planning = session_turn_model_usage_binding(false);
@@ -829,26 +830,22 @@ mod tests {
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
-        ) -> Result<BridgeResponse, BridgeClientError> {
-            Ok(BridgeResponse {
-                ok: true,
-                payload: json!({
-                    "content": "辅助模型已完成",
-                    "usage": {
-                        "prompt_tokens": 17,
-                        "completion_tokens": 9,
-                        "total_tokens": 26
-                    }
-                })
-                .to_string(),
-            })
+        ) -> Result<ModelResponse, BridgeClientError> {
+            Ok(model_response(json!({
+                "content": "辅助模型已完成",
+                "usage": {
+                    "prompt_tokens": 17,
+                    "completion_tokens": 9,
+                    "total_tokens": 26
+                }
+            })))
         }
 
         fn invoke_streaming(
             &self,
             request: ModelInvocationRequest,
             _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             self.invoke(request)
         }
     }
@@ -893,7 +890,7 @@ mod tests {
         )
         .expect("辅助模型成功调用不应失败");
 
-        assert!(response.ok);
+        assert_eq!(response.content.as_deref(), Some("辅助模型已完成"));
         let event = event_bus
             .snapshot()
             .recent_events

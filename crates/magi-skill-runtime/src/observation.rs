@@ -48,7 +48,7 @@ pub(crate) fn build_dispatch_observation(
             binding_id: Some(output.binding_id.clone()),
             bridge_kind: Some(output.bridge_kind),
             dispatch_action: Some(output.dispatch_action),
-            status: if output.response.ok {
+            status: if output.response.is_success() {
                 SkillDispatchStatus::Succeeded
             } else {
                 SkillDispatchStatus::Failed
@@ -56,7 +56,7 @@ pub(crate) fn build_dispatch_observation(
             error_kind: None,
             bridge_error_layer: None,
             bridge_error_message: None,
-            detail: output.response.payload.clone(),
+            detail: output.response.payload().to_string(),
         },
         Err(error) => SkillDispatchObservation {
             tool_call_id: input.tool_call_id.clone(),

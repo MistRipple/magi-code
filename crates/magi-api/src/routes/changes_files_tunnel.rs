@@ -1229,24 +1229,13 @@ async fn enhance_prompt(
             phase: magi_usage_authority::UsagePhase::Integration,
         },
     ) {
-        Ok(resp) if resp.ok => resp,
-        Ok(resp) => {
-            tracing::warn!(
-                payload = %resp.payload.trim(),
-                "prompt enhance auxiliary model returned non-ok response"
-            );
-            return Err(ApiError::model_invocation_failed(
-                "辅助模型返回失败",
-                "辅助模型返回非成功状态",
-            ));
-        }
+        Ok(resp) => resp,
         Err(error) => {
             return Err(ApiError::model_invocation_failed("辅助模型调用失败", error));
         }
     };
 
-    let payload = response.parse_chat_payload();
-    let Some(content) = payload
+    let Some(content) = response
         .content
         .as_deref()
         .and_then(normalize_enhanced_prompt)

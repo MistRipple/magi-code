@@ -8,12 +8,15 @@ use crate::model_context_window::{resolve_model_context_window, set_model_contex
 use crate::{
     ConversationRegistry, SessionTurnInputBoundary, UserSignal,
     conversation_loop::{
-        ContextCompactionRecord, PrepareThreadHistoryInput, chat_message_to_thread_chat_message,
-        estimate_chat_messages_tokens, prepare_thread_history, thread_chat_message_to_chat_message,
+        ContextCompactionRecord, PrepareThreadHistoryInput, append_thread_messages_checkpoint,
+        chat_message_to_thread_chat_message, estimate_chat_messages_tokens,
+        insert_interrupted_tool_result_messages, prepare_thread_history,
+        thread_chat_message_to_chat_message,
     },
     model_config::resolve_orchestrator_model_config,
     model_error::{
-        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
+        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_FINAL_RESPONSE_ONLY_PROMPT,
+        MODEL_FINAL_RESPONSE_ROUND_RESERVE, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
         MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, ModelFailureDiagnostic,
         classify_model_invocation_error, extract_model_context_limit,
         model_empty_response_recovery_prompt, model_stream_interruption_recovery_prompt,
@@ -45,7 +48,7 @@ use crate::{
 };
 use magi_bridge_client::{
     ChatMessage, ChatToolChoice, ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest,
-    ModelStreamingDelta,
+    ModelProviderContext, ModelResponseStatus, ModelStreamingDelta,
 };
 use magi_core::{AccessProfile, EventId, SessionId, UtcMillis, WorkspaceId, estimate_text_tokens};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
@@ -54,7 +57,7 @@ use magi_settings_store::SettingsStore;
 use magi_snapshot::SnapshotManager;
 use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
-use std::{fmt, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, fmt, path::PathBuf, sync::Arc};
 
 const BASE_TOOL_CALL_ROUNDS: usize = 16;
 const MAX_TOOL_CALL_ROUNDS: usize = 32;
@@ -125,6 +128,8 @@ pub enum SessionTurnFailureReason {
     ModelStreamInterrupted,
     ModelEmptyResponse,
     ModelEmptyResponseAfterTools,
+    ModelResponseInvalid,
+    ModelToolRoundLimitExceeded,
     ModelImageInvocationFailed,
     ToolCallProtocolFailed,
     RuntimeInvalidState,
@@ -137,6 +142,8 @@ impl SessionTurnFailureReason {
             Self::ModelStreamInterrupted => "model_stream_interrupted",
             Self::ModelEmptyResponse => "model_empty_response",
             Self::ModelEmptyResponseAfterTools => "model_empty_response_after_tools",
+            Self::ModelResponseInvalid => "model_response_invalid",
+            Self::ModelToolRoundLimitExceeded => "model_tool_round_limit_exceeded",
             Self::ModelImageInvocationFailed => "model_image_invocation_failed",
             Self::ToolCallProtocolFailed => "tool_arguments_invalid",
             Self::RuntimeInvalidState => "session_turn_runtime_invalid_state",
@@ -296,11 +303,49 @@ fn canonical_session_turn_history(
                         images: Vec::new(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
+                        provider_context: Vec::new(),
                     })
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn started_tool_call_ids_for_session_thread(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    thread_id: &magi_core::ThreadId,
+) -> BTreeSet<String> {
+    session_store
+        .canonical_turns_for_session(session_id)
+        .into_iter()
+        .flat_map(|turn| turn.items)
+        .filter(|item| item.kind == CanonicalTurnItemKind::ToolCall)
+        .filter(|item| item.source_thread_id == *thread_id)
+        .filter_map(|item| item.tool.map(|tool| tool.call_id))
+        .collect()
+}
+
+fn normalize_interrupted_session_tool_history(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    thread_id: &magi_core::ThreadId,
+    persist_session_state: Option<&SessionStatePersistCallback>,
+) -> usize {
+    let mut history = session_store.thread_message_history(thread_id);
+    let inserted = insert_interrupted_tool_result_messages(
+        &mut history,
+        &started_tool_call_ids_for_session_thread(session_store, session_id, thread_id),
+    );
+    if inserted == 0 {
+        return 0;
+    }
+    session_store.replace_thread_messages(thread_id, history, UtcMillis::now());
+    persist_session_state_checkpoint(
+        persist_session_state,
+        "session_turn_interrupted_tool_result",
+    );
+    inserted
 }
 
 fn build_session_turn_messages(
@@ -350,6 +395,7 @@ fn build_session_turn_messages(
         images: session_turn_image_sources(&request.images),
         tool_calls: Vec::new(),
         tool_call_id: None,
+        provider_context: Vec::new(),
     });
     messages
 }
@@ -837,6 +883,12 @@ fn run_session_turn_execution_inner(
     let orchestrator_thread_id = orchestrator_thread.thread_id;
     let orchestrator_mission_id = orchestrator_thread.mission_id;
 
+    normalize_interrupted_session_tool_history(
+        session_store,
+        &request.session_id,
+        &orchestrator_thread_id,
+        persist_session_state,
+    );
     let fallback_history = canonical_session_turn_history(session_store, &request);
     let resolved_context_model = settings_store
         .and_then(|store| resolve_orchestrator_model_config(store, Some(&request.session_id)).ok())
@@ -908,10 +960,27 @@ fn run_session_turn_execution_inner(
     let mut pre_output_invocation_recovery_attempts = 0usize;
     let mut stream_interruption_recovery_attempts = 0usize;
     let mut tool_call_validation_tracker = ToolCallValidationTracker::default();
+    let mut final_response_tool_recovery_attempts = 0usize;
+    let mut final_response_prompt_appended = false;
+    let mut last_response_observation: Option<String> = None;
+    let mut tool_execution_rounds = 0usize;
 
-    let mut round_limit = tool_call_round_limit(&required_tool_chain);
+    let tool_call_round_limit = tool_call_round_limit(&required_tool_chain);
+    let round_limit = tool_call_round_limit.saturating_add(MODEL_FINAL_RESPONSE_ROUND_RESERVE);
     let mut round = 0usize;
     while round < round_limit {
+        let final_response_only = tool_execution_rounds >= tool_call_round_limit;
+        if final_response_only && !final_response_prompt_appended {
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(MODEL_FINAL_RESPONSE_ONLY_PROMPT.to_string()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                provider_context: Vec::new(),
+            });
+            final_response_prompt_appended = true;
+        }
         if request.use_tools
             && let Some(registry) = tool_registry
         {
@@ -925,8 +994,8 @@ fn run_session_turn_execution_inner(
                 &[],
             );
         }
-        let round_tools =
-            (request.use_tools && !active_tools.is_empty()).then_some(active_tools.clone());
+        let round_tools = (request.use_tools && !final_response_only && !active_tools.is_empty())
+            .then_some(active_tools.clone());
         let streamed_content = match stream_session_turn_round(
             SessionTurnRoundRuntime {
                 client: active_client,
@@ -957,19 +1026,41 @@ fn run_session_turn_execution_inner(
             Ok(output) => output,
             Err(SessionTurnRoundError::StreamInterruptedRecovered) => {
                 stream_interruption_recovery_attempts += 1;
-                round_limit = round_limit
-                    .max(round.saturating_add(2))
-                    .min(MAX_TOOL_CALL_ROUNDS);
                 round = round.saturating_add(1);
                 continue;
             }
             Err(SessionTurnRoundError::PreOutputInvocationRecovered) => {
                 pre_output_invocation_recovery_attempts += 1;
-                round_limit = round_limit
-                    .max(round.saturating_add(2))
-                    .min(MAX_TOOL_CALL_ROUNDS);
                 round = round.saturating_add(1);
                 continue;
+            }
+            Err(SessionTurnRoundError::InvalidResponse(model_failure)) => {
+                if !request_turn_is_writable(session_store, &request) {
+                    return Ok(SessionTurnExecutionOutput::interrupted());
+                }
+                let execution_error = SessionTurnExecutionError::from_model_failure(
+                    SessionTurnFailureReason::ModelResponseInvalid,
+                    *model_failure,
+                );
+                append_session_turn_error_item(
+                    event_bus,
+                    session_store,
+                    crate::session_writeback::SessionTurnErrorInput {
+                        session_id: &request.session_id,
+                        workspace_id: &request.workspace_id,
+                        task_id: None,
+                        request_id: request.request_id.as_deref(),
+                        user_message_id: request.user_message_id.as_deref(),
+                        placeholder_message_id: request.placeholder_message_id.as_deref(),
+                        error_text: &execution_error.public_message,
+                        model_failure: execution_error.model_failure.as_deref(),
+                        tool_call_failure: None,
+                        streaming_entry_id: main_timeline_entry_id.as_deref(),
+                        source_thread_id: orchestrator_thread_id.clone(),
+                        persist_session_state,
+                    },
+                );
+                return Err(execution_error);
             }
             Err(SessionTurnRoundError::Failed {
                 error,
@@ -979,6 +1070,36 @@ fn run_session_turn_execution_inner(
                     return Ok(SessionTurnExecutionOutput::interrupted());
                 }
                 let classification = classify_model_invocation_error(&error);
+                if classification.code == "model_empty_response"
+                    && empty_response_recovery_attempts < MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS
+                {
+                    empty_response_recovery_attempts += 1;
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: Some(
+                            if final_response_only {
+                                MODEL_FINAL_RESPONSE_ONLY_PROMPT
+                            } else {
+                                model_empty_response_recovery_prompt(had_tool_calls)
+                            }
+                            .to_string(),
+                        ),
+                        images: Vec::new(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        provider_context: Vec::new(),
+                    });
+                    tracing::warn!(
+                        session_id = %request.session_id,
+                        round,
+                        attempt = empty_response_recovery_attempts,
+                        max_attempts = MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS,
+                        after_tool_calls = had_tool_calls,
+                        "模型桥接空响应，追加用户可见答复约束后继续会话"
+                    );
+                    round = round.saturating_add(1);
+                    continue;
+                }
                 if classification.code == "model_context_limit" && round == 0 {
                     if !corrected_context_limit
                         && let Some(context_limit) = extract_model_context_limit(&error)
@@ -1041,8 +1162,18 @@ fn run_session_turn_execution_inner(
                 }
                 let retry_attempts = pre_output_invocation_recovery_attempts
                     + stream_interruption_recovery_attempts
+                    + empty_response_recovery_attempts
                     + usize::from(non_stream_fallback_attempted);
-                let execution_error = session_turn_model_error(&request, &error, retry_attempts);
+                let execution_error = if classification.code == "model_empty_response" {
+                    session_turn_empty_response_error(
+                        &request,
+                        had_tool_calls,
+                        retry_attempts,
+                        Some(&error),
+                    )
+                } else {
+                    session_turn_model_error(&request, &error, retry_attempts)
+                };
                 append_session_turn_error_item(
                     event_bus,
                     session_store,
@@ -1071,6 +1202,53 @@ fn run_session_turn_execution_inner(
         };
         if streamed_content.interrupted || !request_turn_is_writable(session_store, &request) {
             return Ok(SessionTurnExecutionOutput::interrupted());
+        }
+        if let Some(observation) = streamed_content.response_observation.as_ref() {
+            last_response_observation = Some(observation.clone());
+        }
+        let response_provider_context = streamed_content.provider_context.clone();
+        if final_response_only && !streamed_content.invalid_tool_calls.is_empty() {
+            if final_response_tool_recovery_attempts < MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS {
+                final_response_tool_recovery_attempts += 1;
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(MODEL_FINAL_RESPONSE_ONLY_PROMPT.to_string()),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                });
+                round = round.saturating_add(1);
+                continue;
+            }
+            let model_failure = ModelFailureDiagnostic::tool_round_limit_exceeded(
+                tool_call_round_limit,
+                final_response_tool_recovery_attempts,
+                last_response_observation.as_deref(),
+            );
+            let execution_error = SessionTurnExecutionError::from_model_failure(
+                SessionTurnFailureReason::ModelToolRoundLimitExceeded,
+                model_failure,
+            );
+            append_session_turn_error_item(
+                event_bus,
+                session_store,
+                crate::session_writeback::SessionTurnErrorInput {
+                    session_id: &request.session_id,
+                    workspace_id: &request.workspace_id,
+                    task_id: None,
+                    request_id: request.request_id.as_deref(),
+                    user_message_id: request.user_message_id.as_deref(),
+                    placeholder_message_id: request.placeholder_message_id.as_deref(),
+                    error_text: &execution_error.public_message,
+                    model_failure: execution_error.model_failure.as_deref(),
+                    tool_call_failure: None,
+                    streaming_entry_id: main_timeline_entry_id.as_deref(),
+                    source_thread_id: orchestrator_thread_id.clone(),
+                    persist_session_state,
+                },
+            );
+            return Err(execution_error);
         }
         let repeated_tool_call_failure = if streamed_content.invalid_tool_calls.is_empty() {
             None
@@ -1123,6 +1301,9 @@ fn run_session_turn_execution_inner(
             main_timeline_entry_id = streamed_content.timeline_entry_id.clone();
         }
         had_tool_calls |= streamed_content.encountered_tool_calls;
+        if streamed_content.encountered_tool_calls {
+            tool_execution_rounds = tool_execution_rounds.saturating_add(1);
+        }
         record_completed_required_tools(
             &mut completed_required_tool_names,
             &required_tool_chain,
@@ -1158,6 +1339,7 @@ fn run_session_turn_execution_inner(
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    provider_context: Vec::new(),
                 });
             }
         }
@@ -1173,6 +1355,7 @@ fn run_session_turn_execution_inner(
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    provider_context: response_provider_context.clone(),
                 });
                 messages.push(ChatMessage {
                     role: "user".to_string(),
@@ -1183,14 +1366,11 @@ fn run_session_turn_execution_inner(
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    provider_context: Vec::new(),
                 });
                 let steers = conversation_registry
                     .drain_session_turn_steers(&request.session_id, &request.turn_id);
-                if append_session_turn_steers_to_messages(&mut messages, steers) {
-                    round_limit = round_limit
-                        .max(round.saturating_add(2))
-                        .min(MAX_TOOL_CALL_ROUNDS);
-                }
+                append_session_turn_steers_to_messages(&mut messages, steers);
                 round = round.saturating_add(1);
                 continue;
             }
@@ -1204,11 +1384,9 @@ fn run_session_turn_execution_inner(
                         images: Vec::new(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
+                        provider_context: response_provider_context.clone(),
                     });
                     append_session_turn_steers_to_messages(&mut messages, steers);
-                    round_limit = round_limit
-                        .max(round.saturating_add(2))
-                        .min(MAX_TOOL_CALL_ROUNDS);
                     round = round.saturating_add(1);
                     continue;
                 }
@@ -1220,6 +1398,16 @@ fn run_session_turn_execution_inner(
             break;
         }
         if streamed_content.content_recovery_needed {
+            if !response_provider_context.is_empty() {
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: response_provider_context,
+                });
+            }
             if !required_tool_chain_is_complete(
                 &required_tool_chain,
                 &completed_required_tool_names,
@@ -1233,33 +1421,35 @@ fn run_session_turn_execution_inner(
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    provider_context: Vec::new(),
                 });
             } else if empty_response_recovery_attempts < MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS
             {
                 empty_response_recovery_attempts += 1;
                 messages.push(ChatMessage {
                     role: "user".to_string(),
-                    content: Some(model_empty_response_recovery_prompt(had_tool_calls).to_string()),
+                    content: Some(
+                        if final_response_only {
+                            MODEL_FINAL_RESPONSE_ONLY_PROMPT
+                        } else {
+                            model_empty_response_recovery_prompt(had_tool_calls)
+                        }
+                        .to_string(),
+                    ),
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    provider_context: Vec::new(),
                 });
             } else {
                 break;
             }
-            round_limit = round_limit
-                .max(round.saturating_add(2))
-                .min(MAX_TOOL_CALL_ROUNDS);
             round = round.saturating_add(1);
             continue;
         }
         let steers =
             conversation_registry.drain_session_turn_steers(&request.session_id, &request.turn_id);
-        if append_session_turn_steers_to_messages(&mut messages, steers) {
-            round_limit = round_limit
-                .max(round.saturating_add(2))
-                .min(MAX_TOOL_CALL_ROUNDS);
-        }
+        append_session_turn_steers_to_messages(&mut messages, steers);
         round = round.saturating_add(1);
     }
 
@@ -1269,7 +1459,12 @@ fn run_session_turn_execution_inner(
         if !request_turn_is_writable(session_store, &request) {
             return Ok(SessionTurnExecutionOutput::interrupted());
         }
-        let failure = session_turn_empty_response_error(&request, had_tool_calls);
+        let failure = session_turn_empty_response_error(
+            &request,
+            had_tool_calls,
+            empty_response_recovery_attempts,
+            last_response_observation.as_deref(),
+        );
         append_session_turn_error_item(
             event_bus,
             session_store,
@@ -1309,19 +1504,6 @@ fn run_session_turn_execution_inner(
         &orchestrator_thread_id,
         persist_session_state,
     );
-    session_store.append_thread_messages(
-        &orchestrator_thread_id,
-        vec![ThreadChatMessage {
-            role: "assistant".to_string(),
-            content: Some(final_content.clone()),
-            images: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }],
-        UtcMillis::now(),
-    );
-    persist_session_state_checkpoint(persist_session_state, "session_turn_thread_assistant");
-
     Ok(SessionTurnExecutionOutput::completed(final_content))
 }
 
@@ -1344,6 +1526,7 @@ fn append_session_turn_steers_to_messages(
             images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            provider_context: Vec::new(),
         });
         appended = true;
     }
@@ -1384,6 +1567,8 @@ fn session_turn_model_error(
 fn session_turn_empty_response_error(
     request: &SessionTurnExecutionRequest,
     after_tool_calls: bool,
+    retry_attempts: usize,
+    response_observation: Option<&str>,
 ) -> SessionTurnExecutionError {
     if !request.images.is_empty() {
         let summary = public_model_image_invocation_error_message("empty stream response");
@@ -1392,7 +1577,7 @@ fn session_turn_empty_response_error(
             ModelFailureDiagnostic::image_failure(
                 "模型请求成功结束，但未返回可见的图片分析结果。",
                 summary,
-                MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS,
+                retry_attempts,
             ),
         );
     }
@@ -1405,7 +1590,8 @@ fn session_turn_empty_response_error(
         reason,
         ModelFailureDiagnostic::empty_response(
             after_tool_calls,
-            MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS,
+            retry_attempts,
+            response_observation,
         ),
     )
 }
@@ -1442,6 +1628,8 @@ struct SessionTurnRoundOutput {
     activated_skill_id: Option<String>,
     content_recovery_needed: bool,
     invalid_tool_calls: Vec<ToolCallValidationIssue>,
+    response_observation: Option<String>,
+    provider_context: Vec<ModelProviderContext>,
     interrupted: bool,
 }
 
@@ -1452,6 +1640,7 @@ enum SessionTurnRoundError {
         error: String,
         non_stream_fallback_attempted: bool,
     },
+    InvalidResponse(Box<ModelFailureDiagnostic>),
     PreOutputInvocationRecovered,
     StreamInterruptedRecovered,
 }
@@ -1771,6 +1960,8 @@ fn stream_session_turn_round(
                     activated_skill_id: None,
                     content_recovery_needed: false,
                     invalid_tool_calls: Vec::new(),
+                    response_observation: None,
+                    provider_context: Vec::new(),
                     interrupted: true,
                 });
             }
@@ -1874,6 +2065,7 @@ fn stream_session_turn_round(
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
+                    provider_context: Vec::new(),
                 });
             }
             messages.push(ChatMessage {
@@ -1885,6 +2077,7 @@ fn stream_session_turn_round(
                 images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                provider_context: Vec::new(),
             });
             if stream_interruption_recovery_attempts
                 < MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS
@@ -1946,7 +2139,16 @@ fn stream_session_turn_round(
             }
         }
     };
-    let parsed = response.parse_chat_payload();
+    let parsed = response;
+    let response_observation = Some(format!(
+        "模型轮次={}，status={:?}，finish_reason={}，正文字符数={}，thinking字符数={}，工具调用数={}",
+        round + 1,
+        parsed.status,
+        parsed.finish_reason.as_deref().unwrap_or("<missing>"),
+        parsed.content.as_deref().map(str::len).unwrap_or(0),
+        parsed.thinking.as_deref().map(str::len).unwrap_or(0),
+        parsed.tool_calls.len(),
+    ));
     let tool_validation =
         validate_tool_call_batch(&parsed.tool_calls, tools.as_deref().unwrap_or_default());
     let has_actionable_output = parsed
@@ -1954,6 +2156,16 @@ fn stream_session_turn_round(
         .as_deref()
         .is_some_and(|content| !content.trim().is_empty())
         || !tool_validation.valid_calls.is_empty();
+    let response_contract_failure = match parsed.status {
+        ModelResponseStatus::Incomplete => Some(ModelFailureDiagnostic::incomplete_response(
+            parsed.finish_reason.as_deref(),
+            parsed.content.as_deref().map(str::len).unwrap_or(0),
+        )),
+        ModelResponseStatus::RequiresToolExecution if parsed.tool_calls.is_empty() => Some(
+            ModelFailureDiagnostic::missing_tool_call(parsed.finish_reason.as_deref()),
+        ),
+        ModelResponseStatus::Completed | ModelResponseStatus::RequiresToolExecution => None,
+    };
     publish_model_usage_record(
         event_bus,
         session_store,
@@ -1964,13 +2176,15 @@ fn stream_session_turn_round(
             binding: usage_binding,
             call_id,
             usage: parsed.usage.as_ref(),
-            status: if has_actionable_output {
+            status: if has_actionable_output && response_contract_failure.is_none() {
                 UsageCallStatus::Success
             } else {
                 UsageCallStatus::Failed
             },
             assignment_id: None,
-            error_code: if !tool_validation.invalid_calls.is_empty()
+            error_code: if let Some(failure) = response_contract_failure.as_ref() {
+                Some(failure.code.clone())
+            } else if !tool_validation.invalid_calls.is_empty()
                 && tool_validation.valid_calls.is_empty()
             {
                 tool_validation
@@ -2002,6 +2216,8 @@ fn stream_session_turn_round(
             activated_skill_id: None,
             content_recovery_needed: false,
             invalid_tool_calls: Vec::new(),
+            response_observation: response_observation.clone(),
+            provider_context: Vec::new(),
             interrupted: true,
         });
     }
@@ -2025,6 +2241,8 @@ fn stream_session_turn_round(
                 activated_skill_id: None,
                 content_recovery_needed: false,
                 invalid_tool_calls: Vec::new(),
+                response_observation: response_observation.clone(),
+                provider_context: Vec::new(),
                 interrupted: true,
             });
         }
@@ -2075,6 +2293,8 @@ fn stream_session_turn_round(
                 activated_skill_id: None,
                 content_recovery_needed: false,
                 invalid_tool_calls: Vec::new(),
+                response_observation: response_observation.clone(),
+                provider_context: Vec::new(),
                 interrupted: true,
             });
         }
@@ -2109,6 +2329,39 @@ fn stream_session_turn_round(
     // 不再预占 placeholder（只在首个 text delta 时按 max+1 自然分配 item_seq），无 item
     // 需要 retire——空回复直接在 canonical turn 里留白即可。
 
+    let assistant_response_message = ChatMessage {
+        role: "assistant".to_string(),
+        content: parsed
+            .content
+            .clone()
+            .or_else(|| completed_stream_content.clone()),
+        images: Vec::new(),
+        tool_calls: parsed.tool_calls.clone(),
+        tool_call_id: None,
+        provider_context: parsed.provider_context.clone(),
+    };
+    if assistant_response_message
+        .content
+        .as_deref()
+        .is_some_and(|content| !content.trim().is_empty())
+        || !assistant_response_message.tool_calls.is_empty()
+        || !assistant_response_message.provider_context.is_empty()
+    {
+        append_thread_messages_checkpoint(
+            session_store,
+            orchestrator_thread_id,
+            vec![chat_message_to_thread_chat_message(
+                &assistant_response_message,
+            )],
+            persist_session_state,
+            "session_turn_thread_assistant_response",
+        );
+    }
+
+    if let Some(failure) = response_contract_failure {
+        return Err(SessionTurnRoundError::InvalidResponse(Box::new(failure)));
+    }
+
     if !parsed.tool_calls.is_empty() {
         if !request_turn_is_writable(session_store, request) {
             return Ok(SessionTurnRoundOutput {
@@ -2120,16 +2373,13 @@ fn stream_session_turn_round(
                 activated_skill_id: None,
                 content_recovery_needed: false,
                 invalid_tool_calls: Vec::new(),
+                response_observation: response_observation.clone(),
+                provider_context: Vec::new(),
                 interrupted: true,
             });
         }
-        messages.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: parsed.content.clone(),
-            images: Vec::new(),
-            tool_calls: parsed.tool_calls.clone(),
-            tool_call_id: None,
-        });
+        messages.push(assistant_response_message);
+        let tool_result_history_start = messages.len();
         let invalid_tool_calls = tool_validation.invalid_calls;
         for invalid in &invalid_tool_calls {
             messages.push(invalid_tool_result_message(invalid));
@@ -2170,6 +2420,16 @@ fn stream_session_turn_round(
                 || request_turn_is_writable(session_store, request),
             )
         });
+        append_thread_messages_checkpoint(
+            session_store,
+            orchestrator_thread_id,
+            messages[tool_result_history_start..]
+                .iter()
+                .map(chat_message_to_thread_chat_message)
+                .collect(),
+            persist_session_state,
+            "session_turn_thread_tool_results",
+        );
         if !request_turn_is_writable(session_store, request) {
             return Ok(SessionTurnRoundOutput {
                 final_content: None,
@@ -2180,6 +2440,8 @@ fn stream_session_turn_round(
                 activated_skill_id: None,
                 content_recovery_needed: false,
                 invalid_tool_calls: Vec::new(),
+                response_observation: response_observation.clone(),
+                provider_context: Vec::new(),
                 interrupted: true,
             });
         }
@@ -2198,6 +2460,8 @@ fn stream_session_turn_round(
                 .into_iter()
                 .map(|invalid| invalid.issue)
                 .collect(),
+            response_observation: response_observation.clone(),
+            provider_context: Vec::new(),
             interrupted: false,
         });
     }
@@ -2224,6 +2488,8 @@ fn stream_session_turn_round(
         activated_skill_id: None,
         content_recovery_needed,
         invalid_tool_calls: Vec::new(),
+        response_observation,
+        provider_context: parsed.provider_context.clone(),
         interrupted: false,
     })
 }
@@ -2338,21 +2604,28 @@ fn append_final_item(
 mod tests {
     use super::*;
     use magi_bridge_client::{
-        BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelRetryRuntimeEvent,
+        BridgeClientError, BridgeErrorLayer, ModelResponse, ModelRetryRuntimeEvent,
         ModelRetryRuntimePhase,
     };
     use magi_core::SessionLifecycleStatus;
     use magi_session_store::{
-        ActiveExecutionTurn, CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind,
-        CanonicalTurnItemStatus, CanonicalTurnStatus, CanonicalTurnVisibility, ExecutionThread,
-        ExecutionThreadStatus, ORCHESTRATOR_ROLE_ID, SessionRecord, SessionStoreState,
-        TimelineEntry, TimelineEntryKind,
+        ActiveExecutionTurn, CanonicalToolCall, CanonicalTurn, CanonicalTurnItem,
+        CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus,
+        CanonicalTurnVisibility, ExecutionThread, ExecutionThreadStatus, ORCHESTRATOR_ROLE_ID,
+        SessionRecord, SessionStoreState, ThreadChatMessage, ThreadChatToolCall,
+        ThreadChatToolFunction, TimelineEntry, TimelineEntryKind,
     };
     use std::collections::HashMap;
     use std::sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    fn model_response(payload: serde_json::Value) -> ModelResponse {
+        ModelResponse::from_chat_payload(
+            serde_json::from_value(payload).expect("测试模型响应必须符合统一响应结构"),
+        )
+    }
 
     fn ts(value: u64) -> UtcMillis {
         UtcMillis(value)
@@ -2387,7 +2660,7 @@ mod tests {
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             panic!("session turn should use cancellable streaming invocation")
         }
 
@@ -2395,7 +2668,7 @@ mod tests {
             &self,
             _request: ModelInvocationRequest,
             _on_delta: &dyn Fn(&ModelStreamingDelta),
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             panic!("session turn should use cancellable streaming invocation")
         }
 
@@ -2405,7 +2678,7 @@ mod tests {
             _on_delta: &dyn Fn(&ModelStreamingDelta),
             _on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
             is_cancelled: &dyn Fn() -> bool,
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             self.store
                 .cancel_current_turn(&self.session_id)
                 .expect("turn cancellation should succeed");
@@ -2418,18 +2691,17 @@ mod tests {
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
-        ) -> Result<BridgeResponse, BridgeClientError> {
-            Ok(BridgeResponse {
-                ok: true,
-                payload: serde_json::json!({ "content": "重连后完成" }).to_string(),
-            })
+        ) -> Result<ModelResponse, BridgeClientError> {
+            Ok(model_response(
+                serde_json::json!({ "content": "重连后完成" }),
+            ))
         }
 
         fn invoke_streaming(
             &self,
             request: ModelInvocationRequest,
             on_delta: &dyn Fn(&ModelStreamingDelta),
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             on_delta(&ModelStreamingDelta {
                 content: "重连后完成".to_string(),
                 thinking: String::new(),
@@ -2442,7 +2714,7 @@ mod tests {
             request: ModelInvocationRequest,
             on_delta: &dyn Fn(&ModelStreamingDelta),
             on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             on_retry(&ModelRetryRuntimeEvent {
                 phase: ModelRetryRuntimePhase::Scheduled,
                 attempt: 1,
@@ -2470,18 +2742,17 @@ mod tests {
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
-        ) -> Result<BridgeResponse, BridgeClientError> {
-            Ok(BridgeResponse {
-                ok: true,
-                payload: self.payload.clone(),
-            })
+        ) -> Result<ModelResponse, BridgeClientError> {
+            Ok(model_response(
+                serde_json::from_str(&self.payload).expect("测试模型响应必须是 JSON"),
+            ))
         }
 
         fn invoke_streaming(
             &self,
             request: ModelInvocationRequest,
             on_delta: &dyn Fn(&ModelStreamingDelta),
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             on_delta(&ModelStreamingDelta {
                 content: self.delta_content.clone(),
                 thinking: String::new(),
@@ -2494,23 +2765,19 @@ mod tests {
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(BridgeResponse {
-                ok: true,
-                payload: serde_json::json!({
-                    "content": null,
-                    "finish_reason": "stop"
-                })
-                .to_string(),
-            })
+            Ok(model_response(serde_json::json!({
+                "content": null,
+                "finish_reason": "stop"
+            })))
         }
 
         fn invoke_streaming(
             &self,
             request: ModelInvocationRequest,
             _on_delta: &dyn Fn(&ModelStreamingDelta),
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             self.invoke(request)
         }
     }
@@ -2519,7 +2786,7 @@ mod tests {
         fn invoke(
             &self,
             request: ModelInvocationRequest,
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             let call_number = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             self.requests
                 .lock()
@@ -2530,29 +2797,25 @@ mod tests {
             } else {
                 r#"{"command":" "}"#
             };
-            Ok(BridgeResponse {
-                ok: true,
-                payload: serde_json::json!({
-                    "content": null,
-                    "finish_reason": "tool_calls",
-                    "tool_calls": [{
-                        "id": format!("call-invalid-shell-{call_number}"),
-                        "type": "function",
-                        "function": {
-                            "name": "shell_exec",
-                            "arguments": arguments
-                        }
-                    }]
-                })
-                .to_string(),
-            })
+            Ok(model_response(serde_json::json!({
+                "content": null,
+                "finish_reason": "tool_calls",
+                "tool_calls": [{
+                    "id": format!("call-invalid-shell-{call_number}"),
+                    "type": "function",
+                    "function": {
+                        "name": "shell_exec",
+                        "arguments": arguments
+                    }
+                }]
+            })))
         }
 
         fn invoke_streaming(
             &self,
             request: ModelInvocationRequest,
             _on_delta: &dyn Fn(&ModelStreamingDelta),
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             self.invoke(request)
         }
     }
@@ -2561,30 +2824,35 @@ mod tests {
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
-        ) -> Result<BridgeResponse, BridgeClientError> {
-            Ok(BridgeResponse {
-                ok: true,
-                payload: serde_json::json!({
-                    "content": "主线在暂态空流后完成。",
-                    "finish_reason": "stop"
-                })
-                .to_string(),
-            })
+        ) -> Result<ModelResponse, BridgeClientError> {
+            Ok(model_response(serde_json::json!({
+                "content": "主线在暂态空流后完成。",
+                "finish_reason": "stop"
+            })))
         }
 
         fn invoke_streaming(
             &self,
             request: ModelInvocationRequest,
             on_delta: &dyn Fn(&ModelStreamingDelta),
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             let attempt = self.streaming_calls.fetch_add(1, Ordering::SeqCst);
-            if attempt == 0 {
+            if attempt < 2 {
                 return Err(BridgeClientError::CallFailed {
                     layer: BridgeErrorLayer::RemoteBusiness,
                     code: Some(-32007),
                     message: "provider response invalid: empty stream response".to_string(),
                 });
             }
+            assert!(
+                request
+                    .messages
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|message| message.content.as_deref()
+                        == Some(model_empty_response_recovery_prompt(false)))
+            );
             on_delta(&ModelStreamingDelta {
                 content: "主线在暂态空流后完成。".to_string(),
                 thinking: String::new(),
@@ -2711,7 +2979,7 @@ mod tests {
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::RemoteBusiness,
                 code: Some(-32007),
@@ -2723,7 +2991,7 @@ mod tests {
             &self,
             request: ModelInvocationRequest,
             _on_delta: &dyn Fn(&ModelStreamingDelta),
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             self.invoke(request)
         }
     }
@@ -2751,7 +3019,7 @@ mod tests {
         fn invoke(
             &self,
             request: ModelInvocationRequest,
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             self.requests
                 .lock()
@@ -2777,21 +3045,29 @@ mod tests {
             } else {
                 "最终收口"
             };
-            Ok(BridgeResponse {
-                ok: true,
-                payload: serde_json::json!({
-                    "content": content,
-                    "finish_reason": "stop"
-                })
-                .to_string(),
-            })
+            let mut response = model_response(serde_json::json!({
+                "content": content,
+                "finish_reason": "stop"
+            }));
+            if call == 0 {
+                response.provider_context = vec![ModelProviderContext {
+                    provider: "anthropic".to_string(),
+                    kind: "thinking".to_string(),
+                    data: serde_json::json!({
+                        "type": "thinking",
+                        "thinking": "先响应第一阶段",
+                        "signature": "session-signed-thinking"
+                    }),
+                }];
+            }
+            Ok(response)
         }
 
         fn invoke_streaming(
             &self,
             request: ModelInvocationRequest,
             on_delta: &dyn Fn(&ModelStreamingDelta),
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             let next_call = self.calls.load(Ordering::SeqCst);
             on_delta(&ModelStreamingDelta {
                 content: if next_call == 0 {
@@ -2833,7 +3109,7 @@ mod tests {
                         None,
                         Some("请给出完整方案".to_string()),
                         Some("user-runtime-steer".to_string()),
-                        orchestrator_thread_id,
+                        orchestrator_thread_id.clone(),
                     )],
                 },
             )
@@ -2901,18 +3177,36 @@ mod tests {
             .as_ref()
             .expect("second call should carry messages");
         assert!(second_messages.iter().any(|message| {
-            message.role == "assistant" && message.content.as_deref() == Some("第一段回复")
+            message.role == "assistant"
+                && message.content.as_deref() == Some("第一段回复")
+                && message
+                    .provider_context
+                    .first()
+                    .is_some_and(|context| context.data["signature"] == "session-signed-thinking")
         }));
         assert!(second_messages.iter().any(|message| {
             message.role == "user" && message.content.as_deref() == Some("优先收口，不要继续扩展")
         }));
+        assert!(
+            store
+                .thread_message_history(&orchestrator_thread_id)
+                .iter()
+                .any(|message| {
+                    message.role == "assistant"
+                        && message.content.as_deref() == Some("第一段回复")
+                        && message.provider_context.first().is_some_and(|context| {
+                            context.data["signature"] == "session-signed-thinking"
+                        })
+                }),
+            "主会话 thread 必须持久化提供方签名上下文"
+        );
     }
 
     impl ModelBridgeClient for StreamingThenFailingModelBridgeClient {
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::RemoteBusiness,
                 code: Some(-32007),
@@ -2924,7 +3218,7 @@ mod tests {
             &self,
             request: ModelInvocationRequest,
             on_delta: &dyn Fn(&ModelStreamingDelta),
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             on_delta(&ModelStreamingDelta {
                 content: self.delta_content.clone(),
                 thinking: String::new(),
@@ -2937,27 +3231,23 @@ mod tests {
         fn invoke(
             &self,
             request: ModelInvocationRequest,
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             self.non_stream_calls.fetch_add(1, Ordering::SeqCst);
             *self
                 .fallback_messages
                 .lock()
                 .expect("fallback messages mutex poisoned") = request.messages.unwrap_or_default();
-            Ok(BridgeResponse {
-                ok: true,
-                payload: serde_json::json!({
-                    "content": "已通过非流式降级完成。",
-                    "finish_reason": "stop"
-                })
-                .to_string(),
-            })
+            Ok(model_response(serde_json::json!({
+                "content": "已通过非流式降级完成。",
+                "finish_reason": "stop"
+            })))
         }
 
         fn invoke_streaming(
             &self,
             _request: ModelInvocationRequest,
             on_delta: &dyn Fn(&ModelStreamingDelta),
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             let attempt = self.streaming_calls.fetch_add(1, Ordering::SeqCst);
             on_delta(&ModelStreamingDelta {
                 content: if attempt == 0 {
@@ -3578,8 +3868,8 @@ mod tests {
         assert_eq!(output.final_content, "主线在暂态空流后完成。");
         assert_eq!(
             client.streaming_calls.load(Ordering::SeqCst),
-            2,
-            "主线应在未交付内容的空流后重试一次"
+            3,
+            "主线机械重试仍为空流时，应追加用户可见答复约束后恢复"
         );
         let turn = store
             .runtime_sidecar(&session_id)
@@ -3994,6 +4284,7 @@ mod tests {
             images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            provider_context: Vec::new(),
         }];
 
         let output = stream_session_turn_round(
@@ -4125,6 +4416,7 @@ mod tests {
             images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            provider_context: Vec::new(),
         }];
 
         stream_session_turn_round(
@@ -4350,6 +4642,120 @@ mod tests {
         assert_eq!(
             contents[3],
             "请基于上一轮结果，用一句话回答：再加 4 等于几？"
+        );
+    }
+
+    #[test]
+    fn session_turn_normalizes_interrupted_tool_history_before_next_model_call() {
+        let session_id = SessionId::new("session-interrupted-tool-history");
+        let thread_id = magi_core::ThreadId::new("thread-interrupted-tool-history");
+        let tool_call_id = "call-interrupted-shell".to_string();
+        let tool_arguments = r#"{"command":"sleep 20; printf done"}"#.to_string();
+        let store = SessionStore::from_state(SessionStoreState {
+            current_session_id: Some(session_id.clone()),
+            sessions: vec![SessionRecord {
+                session_id: session_id.clone(),
+                title: "interrupted tool history".to_string(),
+                status: SessionLifecycleStatus::Active,
+                created_at: ts(900),
+                updated_at: ts(1_100),
+                message_count: None,
+                workspace_id: None,
+                last_completed_at: None,
+                last_viewed_at: None,
+            }],
+            timeline: Vec::new(),
+            canonical_turns: vec![CanonicalTurn {
+                session_id: session_id.clone(),
+                turn_id: "turn-interrupted-tool".to_string(),
+                turn_seq: 1_000,
+                accepted_at: ts(1_000),
+                completed_at: Some(ts(1_100)),
+                status: CanonicalTurnStatus::Cancelled,
+                response_duration_ms: Some(100),
+                usage: None,
+                items: vec![CanonicalTurnItem {
+                    session_id: session_id.clone(),
+                    turn_id: "turn-interrupted-tool".to_string(),
+                    turn_seq: 1_000,
+                    item_id: "turn-item-interrupted-tool".to_string(),
+                    item_seq: 2,
+                    kind: CanonicalTurnItemKind::ToolCall,
+                    created_at: ts(1_000),
+                    status: CanonicalTurnItemStatus::Cancelled,
+                    item_version: None,
+                    updated_at: ts(1_100),
+                    title: Some("shell".to_string()),
+                    content: Some("正在调用工具：shell".to_string()),
+                    blocks: Vec::new(),
+                    tool: Some(CanonicalToolCall {
+                        call_id: tool_call_id.clone(),
+                        name: "shell".to_string(),
+                        arguments: Some(serde_json::json!({
+                            "command": "sleep 20; printf done"
+                        })),
+                        result: None,
+                        error: None,
+                    }),
+                    worker: None,
+                    source_thread_id: thread_id.clone(),
+                    visibility: CanonicalTurnVisibility::default(),
+                    metadata: HashMap::new(),
+                }],
+                metadata: HashMap::new(),
+            }],
+            notifications: Vec::new(),
+            goals: Vec::new(),
+            plans: Vec::new(),
+            execution_sidecar_store: Default::default(),
+            thread_registry: vec![ExecutionThread {
+                thread_id: thread_id.clone(),
+                session_id: session_id.clone(),
+                mission_id: magi_core::MissionId::new("mission-interrupted-tool-history"),
+                role_id: ORCHESTRATOR_ROLE_ID.to_string(),
+                worker_instance_id: magi_core::WorkerId::new("worker-interrupted-tool-history"),
+                status: ExecutionThreadStatus::Idle,
+                created_at: ts(900),
+                last_used_at: ts(1_100),
+                handled_task_ids: Vec::new(),
+                message_history: vec![ThreadChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    images: Vec::new(),
+                    tool_calls: vec![ThreadChatToolCall {
+                        id: tool_call_id,
+                        kind: "function".to_string(),
+                        function: ThreadChatToolFunction {
+                            name: "shell".to_string(),
+                            arguments: tool_arguments,
+                        },
+                    }],
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                }],
+            }],
+        });
+
+        assert_eq!(
+            normalize_interrupted_session_tool_history(&store, &session_id, &thread_id, None,),
+            1
+        );
+        let history = store.thread_message_history(&thread_id);
+        assert_eq!(
+            history
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["assistant", "tool"]
+        );
+        assert!(history[1].content.as_deref().is_some_and(|content| {
+            content.contains(r#""status":"interrupted""#)
+                && content.contains(r#""execution":"unknown""#)
+        }));
+        assert_eq!(
+            normalize_interrupted_session_tool_history(&store, &session_id, &thread_id, None,),
+            0,
+            "重复进入下一轮不得再次插入中断结果"
         );
     }
 

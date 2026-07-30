@@ -29,9 +29,8 @@ pub enum BridgeCutoverBlockingReasonCode {
     ModelProviderTransportFailed,
     ModelProviderRejected,
     ModelProviderInvalidResponse,
-    ModelPayloadEmpty,
-    ModelStructuredPayloadInvalidToolCalls,
-    ModelStructuredPayloadMissingContentOrToolCalls,
+    ModelResponseInvalidToolCalls,
+    ModelResponseMissingContentOrToolCalls,
     McpListServersFailed,
     McpDefaultRouteStatusFallbackOnly,
     McpDefaultRouteStatusUnavailable,
@@ -55,12 +54,9 @@ impl BridgeCutoverBlockingReasonCode {
             Self::ModelProviderTransportFailed => "model_provider_transport_failed",
             Self::ModelProviderRejected => "model_provider_rejected",
             Self::ModelProviderInvalidResponse => "model_provider_invalid_response",
-            Self::ModelPayloadEmpty => "model_payload_empty",
-            Self::ModelStructuredPayloadInvalidToolCalls => {
-                "model_structured_payload_invalid_tool_calls"
-            }
-            Self::ModelStructuredPayloadMissingContentOrToolCalls => {
-                "model_structured_payload_missing_content_or_tool_calls"
+            Self::ModelResponseInvalidToolCalls => "model_response_invalid_tool_calls",
+            Self::ModelResponseMissingContentOrToolCalls => {
+                "model_response_missing_content_or_tool_calls"
             }
             Self::McpListServersFailed => "mcp_manager_list_servers_failed",
             Self::McpDefaultRouteStatusFallbackOnly => "mcp_default_route_status_fallback_only",
@@ -87,12 +83,9 @@ impl BridgeCutoverBlockingReasonCode {
             Self::ModelProviderTransportFailed => "provider transport failed",
             Self::ModelProviderRejected => "provider rejected request",
             Self::ModelProviderInvalidResponse => "provider response invalid",
-            Self::ModelPayloadEmpty => "bridge payload was empty",
-            Self::ModelStructuredPayloadInvalidToolCalls => {
-                "structured payload contains invalid tool_calls"
-            }
-            Self::ModelStructuredPayloadMissingContentOrToolCalls => {
-                "structured payload missing content or tool_calls"
+            Self::ModelResponseInvalidToolCalls => "model response contains invalid tool_calls",
+            Self::ModelResponseMissingContentOrToolCalls => {
+                "model response missing content or tool_calls"
             }
             Self::McpListServersFailed => MCP_MANAGER_LIST_SERVERS_FAILED_REASON,
             Self::McpDefaultRouteStatusFallbackOnly => MCP_DEFAULT_ROUTE_FALLBACK_ONLY_REASON,
@@ -228,12 +221,11 @@ fn infer_model_reason_code(
 
     if let Some(contract) = contract.filter(|contract| !contract.contract_ok) {
         return match contract.blocking_reason.as_deref() {
-            Some("bridge payload was empty") => BridgeCutoverBlockingReasonCode::ModelPayloadEmpty,
-            Some("structured payload contains invalid tool_calls") => {
-                BridgeCutoverBlockingReasonCode::ModelStructuredPayloadInvalidToolCalls
+            Some("model response contains invalid tool_calls") => {
+                BridgeCutoverBlockingReasonCode::ModelResponseInvalidToolCalls
             }
-            Some("structured payload missing content or tool_calls") => {
-                BridgeCutoverBlockingReasonCode::ModelStructuredPayloadMissingContentOrToolCalls
+            Some("model response missing content or tool_calls") => {
+                BridgeCutoverBlockingReasonCode::ModelResponseMissingContentOrToolCalls
             }
             _ => BridgeCutoverBlockingReasonCode::BridgeResponseNotOk,
         };

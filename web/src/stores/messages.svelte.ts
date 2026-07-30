@@ -193,6 +193,11 @@ function normalizeSessionId(value: string | null | undefined): string | null {
   return sessionId || null;
 }
 
+export function isPersistedSessionId(value: string | null | undefined): boolean {
+  const sessionId = normalizeSessionId(value);
+  return Boolean(sessionId && !sessionId.startsWith('session-local-'));
+}
+
 function normalizeWorkspaceId(value: string | null | undefined): string | null {
   const workspaceId = typeof value === 'string' ? value.trim() : '';
   return workspaceId || null;

@@ -18,6 +18,13 @@ pub(crate) const PUBLIC_MODEL_STREAM_INTERRUPTED_MESSAGE: &str = "模型响应�
 pub(crate) const PUBLIC_MODEL_TIMEOUT_MESSAGE: &str = "模型服务在响应完成前超时。";
 pub(crate) const PUBLIC_MODEL_EMPTY_RESPONSE_MESSAGE: &str =
     "模型服务返回了空响应，未生成正文或可执行工具调用。";
+pub(crate) const PUBLIC_MODEL_OUTPUT_TRUNCATED_MESSAGE: &str =
+    "模型输出达到长度上限，本轮响应未完整结束。";
+pub(crate) const PUBLIC_MODEL_CONTENT_FILTERED_MESSAGE: &str = "模型服务因内容策略中止了本轮响应。";
+pub(crate) const PUBLIC_MODEL_GENERATION_CANCELLED_MESSAGE: &str = "模型服务取消了本轮响应。";
+pub(crate) const PUBLIC_MODEL_RESPONSE_INCOMPLETE_MESSAGE: &str = "模型服务未能完整结束本轮响应。";
+pub(crate) const PUBLIC_MODEL_TOOL_CALL_MISSING_MESSAGE: &str =
+    "模型声明需要执行工具，但没有返回可执行的工具调用。";
 /// 传输层已经在未收到任何增量时完成自身重试；这里处理的是已经向用户输出过
 /// 片段后缺少终止 SSE 的场景。该场景不能重放同一个请求，只能让模型基于片段续写。
 pub(crate) const MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS: usize = 5;
@@ -26,8 +33,16 @@ pub(crate) const MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS: usize = 5;
 /// 可见片段，必须走续写恢复，不能重放请求。
 pub(crate) const MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS: usize = 1;
 pub(crate) const MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS: usize = 3;
+/// 工具执行预算之外必须保留最终答复请求，并覆盖请求前恢复、流中断续写、
+/// 空响应恢复和模型违规继续请求工具的恢复。该预算只用于生成用户可见终态，
+/// 不得继续执行新工具。
+pub(crate) const MODEL_FINAL_RESPONSE_ROUND_RESERVE: usize = 1
+    + MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS
+    + MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS
+    + MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS * 2;
 pub(crate) const MODEL_EMPTY_RESPONSE_RECOVERY_PROMPT: &str = "上一轮模型没有返回用户可见正文或可执行工具调用。请不要只输出 thinking：现在直接输出完整的用户可见答复；如果确实需要工具，请直接调用工具；如果无法完成，请直接说明原因。";
 pub(crate) const MODEL_EMPTY_RESPONSE_AFTER_TOOLS_RECOVERY_PROMPT: &str = "前面的工具调用已经完成，工具结果已在上下文中。请不要只输出 thinking，也不要重复已完成的工具调用；现在直接基于现有结果输出完整的用户可见答复。仅在确有缺失信息时调用新的必要工具。";
+pub(crate) const MODEL_FINAL_RESPONSE_ONLY_PROMPT: &str = "本轮可执行工具调用预算已经用完。不得继续调用或虚构任何工具；请直接基于已经完成的工具结果输出用户可见的最终答复，并明确说明已完成事项、发现的问题和仍未完成的事项。";
 pub(crate) const PUBLIC_MODEL_IMAGE_INVOCATION_FAILURE_MESSAGE: &str =
     "当前模型暂不支持图片输入，请更换支持图片的模型后重试。";
 pub(crate) const PUBLIC_MODEL_INVALID_IMAGE_INPUT_MESSAGE: &str =
@@ -70,8 +85,12 @@ impl ModelFailureDiagnostic {
         }
     }
 
-    pub(crate) fn empty_response(after_tool_calls: bool, retry_attempts: usize) -> Self {
-        let detail = if after_tool_calls {
+    pub(crate) fn empty_response(
+        after_tool_calls: bool,
+        retry_attempts: usize,
+        response_observation: Option<&str>,
+    ) -> Self {
+        let mut detail = if after_tool_calls {
             format!(
                 "工具调用已完成，但模型请求在连续 {} 次自动恢复后仍未返回用户可见正文或新的可执行工具调用。",
                 retry_attempts
@@ -82,6 +101,10 @@ impl ModelFailureDiagnostic {
                 retry_attempts
             )
         };
+        if let Some(observation) = response_observation.filter(|value| !value.trim().is_empty()) {
+            detail.push_str(" 最后一次响应状态：");
+            detail.push_str(observation.trim());
+        }
         Self {
             schema_version: MODEL_FAILURE_SCHEMA_VERSION.to_string(),
             code: if after_tool_calls {
@@ -92,6 +115,91 @@ impl ModelFailureDiagnostic {
             summary: PUBLIC_MODEL_EMPTY_RESPONSE_MESSAGE.to_string(),
             detail,
             stage: "response_validation".to_string(),
+            retryable: true,
+            retry_attempts,
+        }
+    }
+
+    pub(crate) fn incomplete_response(
+        finish_reason: Option<&str>,
+        visible_content_chars: usize,
+    ) -> Self {
+        let finish_reason = finish_reason
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("<missing>");
+        let normalized_reason = finish_reason.to_ascii_lowercase();
+        let (code, summary, retryable) = match normalized_reason.as_str() {
+            "length" | "max_tokens" | "max_output_tokens" => (
+                "model_output_truncated",
+                PUBLIC_MODEL_OUTPUT_TRUNCATED_MESSAGE,
+                true,
+            ),
+            "content_filter" | "safety" | "blocked" | "recitation" => (
+                "model_content_filtered",
+                PUBLIC_MODEL_CONTENT_FILTERED_MESSAGE,
+                false,
+            ),
+            "cancelled" | "canceled" => (
+                "model_generation_cancelled",
+                PUBLIC_MODEL_GENERATION_CANCELLED_MESSAGE,
+                true,
+            ),
+            _ => (
+                "model_response_incomplete",
+                PUBLIC_MODEL_RESPONSE_INCOMPLETE_MESSAGE,
+                true,
+            ),
+        };
+        Self {
+            schema_version: MODEL_FAILURE_SCHEMA_VERSION.to_string(),
+            code: code.to_string(),
+            summary: summary.to_string(),
+            detail: format!(
+                "模型响应状态为 incomplete；finish_reason={finish_reason}；已接收用户可见正文字符数={visible_content_chars}。"
+            ),
+            stage: "response_validation".to_string(),
+            retryable,
+            retry_attempts: 0,
+        }
+    }
+
+    pub(crate) fn missing_tool_call(finish_reason: Option<&str>) -> Self {
+        let finish_reason = finish_reason
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("<missing>");
+        Self {
+            schema_version: MODEL_FAILURE_SCHEMA_VERSION.to_string(),
+            code: "model_tool_call_missing".to_string(),
+            summary: PUBLIC_MODEL_TOOL_CALL_MISSING_MESSAGE.to_string(),
+            detail: format!(
+                "模型响应状态为 requires_tool_execution，finish_reason={finish_reason}，但工具调用数组为空。"
+            ),
+            stage: "response_validation".to_string(),
+            retryable: true,
+            retry_attempts: 0,
+        }
+    }
+
+    pub(crate) fn tool_round_limit_exceeded(
+        tool_round_limit: usize,
+        retry_attempts: usize,
+        response_observation: Option<&str>,
+    ) -> Self {
+        let mut detail = format!(
+            "模型已使用全部 {tool_round_limit} 个工具执行轮次；运行时关闭新工具后，又连续 {retry_attempts} 次要求模型生成最终答复，但模型仍继续请求工具调用。为避免无限循环，已停止本轮执行。"
+        );
+        if let Some(observation) = response_observation.filter(|value| !value.trim().is_empty()) {
+            detail.push_str(" 最后一次响应状态：");
+            detail.push_str(observation.trim());
+        }
+        Self {
+            schema_version: MODEL_FAILURE_SCHEMA_VERSION.to_string(),
+            code: "model_tool_round_limit_exceeded".to_string(),
+            summary: "模型未能在本轮工具预算内生成最终答复。".to_string(),
+            detail,
+            stage: "response_finalization".to_string(),
             retryable: true,
             retry_attempts,
         }
@@ -427,11 +535,11 @@ mod tests {
     #[test]
     fn model_invocation_errors_use_public_message() {
         assert_eq!(
-            ModelFailureDiagnostic::empty_response(false, 3).summary,
+            ModelFailureDiagnostic::empty_response(false, 3, None).summary,
             PUBLIC_MODEL_EMPTY_RESPONSE_MESSAGE
         );
         assert_eq!(
-            ModelFailureDiagnostic::empty_response(true, 3).summary,
+            ModelFailureDiagnostic::empty_response(true, 3, None).summary,
             PUBLIC_MODEL_EMPTY_RESPONSE_MESSAGE
         );
         assert_eq!(
@@ -557,6 +665,33 @@ mod tests {
             serde_json::to_value(&diagnostic).expect("diagnostic should serialize")["schemaVersion"],
             MODEL_FAILURE_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn incomplete_response_diagnostic_preserves_real_finish_reason() {
+        let truncated = ModelFailureDiagnostic::incomplete_response(Some("MAX_TOKENS"), 128);
+        assert_eq!(truncated.code, "model_output_truncated");
+        assert_eq!(truncated.summary, PUBLIC_MODEL_OUTPUT_TRUNCATED_MESSAGE);
+        assert!(truncated.detail.contains("finish_reason=MAX_TOKENS"));
+        assert!(truncated.detail.contains("正文字符数=128"));
+        assert!(truncated.retryable);
+
+        let filtered = ModelFailureDiagnostic::incomplete_response(Some("SAFETY"), 0);
+        assert_eq!(filtered.code, "model_content_filtered");
+        assert_eq!(filtered.summary, PUBLIC_MODEL_CONTENT_FILTERED_MESSAGE);
+        assert!(!filtered.retryable);
+
+        for reason in ["cancelled", "CANCELED"] {
+            let cancelled = ModelFailureDiagnostic::incomplete_response(Some(reason), 0);
+            assert_eq!(cancelled.code, "model_generation_cancelled");
+            assert_eq!(cancelled.summary, PUBLIC_MODEL_GENERATION_CANCELLED_MESSAGE);
+            assert!(cancelled.retryable);
+        }
+
+        let missing_tool = ModelFailureDiagnostic::missing_tool_call(Some("tool_use"));
+        assert_eq!(missing_tool.code, "model_tool_call_missing");
+        assert!(missing_tool.detail.contains("finish_reason=tool_use"));
+        assert!(missing_tool.detail.contains("工具调用数组为空"));
     }
 
     #[test]

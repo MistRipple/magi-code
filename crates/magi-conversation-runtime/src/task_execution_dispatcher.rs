@@ -2279,7 +2279,6 @@ struct LearningCandidate {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LearningExtractionFailure {
-    ModelRejected,
     InvocationFailed,
     MissingContent,
 }
@@ -2287,7 +2286,6 @@ enum LearningExtractionFailure {
 impl LearningExtractionFailure {
     fn as_str(self) -> &'static str {
         match self {
-            Self::ModelRejected => "model_rejected",
             Self::InvocationFailed => "model_invocation_failed",
             Self::MissingContent => "missing_content",
         }
@@ -2388,18 +2386,13 @@ fn extract_learnings_via_auxiliary(
             phase: UsagePhase::Integration,
         },
     ) {
-        Ok(resp) if resp.ok => resp,
-        Ok(resp) => {
-            tracing::debug!(payload = %resp.payload, "辅助模型 ok=false，跳过知识抽取");
-            return Err(LearningExtractionFailure::ModelRejected);
-        }
+        Ok(resp) => resp,
         Err(err) => {
             tracing::debug!(error = %err, "辅助模型调用失败，跳过知识抽取");
             return Err(LearningExtractionFailure::InvocationFailed);
         }
     };
-    let payload = response.parse_chat_payload();
-    let raw = payload
+    let raw = response
         .content
         .ok_or(LearningExtractionFailure::MissingContent)?;
     Ok(parse_learning_candidates(&raw))
@@ -2518,18 +2511,13 @@ fn extract_session_memory_via_auxiliary(
             phase: UsagePhase::Integration,
         },
     ) {
-        Ok(resp) if resp.ok => resp,
-        Ok(resp) => {
-            tracing::debug!(payload = %resp.payload, "辅助模型 ok=false，跳过会话记忆抽取");
-            return None;
-        }
+        Ok(resp) => resp,
         Err(err) => {
             tracing::debug!(error = %err, "辅助模型调用失败，跳过会话记忆抽取");
             return None;
         }
     };
-    let payload = response.parse_chat_payload();
-    let raw = payload.content?;
+    let raw = response.content?;
     parse_session_memory_slices(&raw)
 }
 
@@ -2699,7 +2687,7 @@ mod tests {
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
-        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError>
         {
             Err(magi_bridge_client::BridgeClientError::CallFailed {
                 layer: magi_bridge_client::BridgeErrorLayer::Transport,
@@ -2712,7 +2700,7 @@ mod tests {
             &self,
             request: ModelInvocationRequest,
             _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
-        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError>
         {
             self.invoke(request)
         }
@@ -4283,6 +4271,7 @@ mod tests {
                     "apiKey": "sk-orch",
                     "model": "gpt-5.5",
                     "urlMode": "standard",
+                    "apiProtocol": "openai_chat",
                     "reasoningEffort": "xhigh",
                 }),
             )
@@ -4304,6 +4293,7 @@ mod tests {
             "apiKey": "sk-orch",
             "model": "global-default-model",
             "urlMode": "standard",
+            "apiProtocol": "openai_chat",
             "reasoningEffort": "medium",
         });
         let override_section = serde_json::json!({
@@ -4340,6 +4330,7 @@ mod tests {
             "apiKey": "sk-orch",
             "model": "global-default-model",
             "urlMode": "standard",
+            "apiProtocol": "openai_chat",
         });
         let override_section = serde_json::json!({
             "baseUrl": "https://evil.example.com/v1",
@@ -4404,6 +4395,7 @@ mod tests {
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-orch",
                     "urlMode": "standard",
+                    "apiProtocol": "openai_chat",
                 }),
             )
             .unwrap();
@@ -4439,6 +4431,7 @@ mod tests {
                     "apiKey": "sk-orch",
                     "model": "global-default-model",
                     "urlMode": "standard",
+                    "apiProtocol": "openai_chat",
                     "reasoningEffort": "medium",
                 }),
             )
@@ -4603,6 +4596,7 @@ mod tests {
                     "apiKey": "sk-old",
                     "model": "model-old",
                     "urlMode": "standard",
+                    "apiProtocol": "openai_chat",
                 }),
             )
             .unwrap();

@@ -4,6 +4,66 @@ use super::adapter::{AdaptedResponse, ProviderFamily};
 use crate::llm_types::{
     LlmStreamChunk, LlmStreamChunkType, LlmUsage, PartialToolCall, ToolCall, parse_tool_arguments,
 };
+use crate::types::ModelProviderContext;
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug)]
+pub enum ProviderContextStreamDelta {
+    Start {
+        index: usize,
+        context: ModelProviderContext,
+    },
+    Append {
+        index: usize,
+        field: &'static str,
+        value: String,
+    },
+}
+
+pub fn parse_stream_provider_context(
+    family: ProviderFamily,
+    event: &SseEvent,
+) -> Option<ProviderContextStreamDelta> {
+    if family != ProviderFamily::Anthropic {
+        return None;
+    }
+    let envelope = serde_json::from_str::<Value>(&event.data).ok()?;
+    let index = envelope["index"].as_u64()? as usize;
+    match event.event_type.as_deref() {
+        Some("content_block_start") => {
+            let block = envelope.get("content_block")?;
+            let kind = block["type"].as_str()?;
+            if !matches!(kind, "thinking" | "redacted_thinking") {
+                return None;
+            }
+            Some(ProviderContextStreamDelta::Start {
+                index,
+                context: ModelProviderContext {
+                    provider: "anthropic".to_string(),
+                    kind: kind.to_string(),
+                    data: block.clone(),
+                },
+            })
+        }
+        Some("content_block_delta") => {
+            let delta = envelope.get("delta")?;
+            match delta["type"].as_str()? {
+                "thinking_delta" => Some(ProviderContextStreamDelta::Append {
+                    index,
+                    field: "thinking",
+                    value: delta["thinking"].as_str()?.to_string(),
+                }),
+                "signature_delta" => Some(ProviderContextStreamDelta::Append {
+                    index,
+                    field: "signature",
+                    value: delta["signature"].as_str()?.to_string(),
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct SseLineParser {
@@ -114,12 +174,12 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
     for choice in choices {
         let delta = &choice["delta"];
 
-        if let Some(content) = delta["content"].as_str()
+        if let Some(content) = openai_stream_text(&delta["content"])
             && !content.is_empty()
         {
             chunks.push(LlmStreamChunk {
                 kind: LlmStreamChunkType::ContentDelta,
-                content: Some(content.to_string()),
+                content: Some(content),
                 tool_call: None,
                 thinking: None,
                 usage: None,
@@ -147,7 +207,11 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
                 let func = &tc["function"];
                 let id = tc["id"].as_str().map(str::to_string);
                 let name = func["name"].as_str().map(str::to_string);
-                let args = func["arguments"].as_str().map(str::to_string);
+                let args = match &func["arguments"] {
+                    Value::Null => None,
+                    Value::String(arguments) => Some(arguments.clone()),
+                    arguments => Some(arguments.to_string()),
+                };
                 let index = tc["index"].as_u64().map(|i| i as usize);
 
                 let kind = if id.is_some() || name.is_some() {
@@ -172,7 +236,10 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
             }
         }
 
-        if let Some(reason) = choice["finish_reason"].as_str() {
+        if let Some(reason) = choice["finish_reason"]
+            .as_str()
+            .or_else(|| choice["stop_reason"].as_str())
+        {
             chunks.push(LlmStreamChunk {
                 kind: LlmStreamChunkType::ContentEnd,
                 content: None,
@@ -196,6 +263,18 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
     }
 
     chunks
+}
+
+fn openai_stream_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    let parts = value.as_array()?;
+    let text = parts
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    (!text.is_empty()).then_some(text)
 }
 
 fn parse_anthropic_stream_event(event_type: Option<&str>, data: &str) -> Vec<LlmStreamChunk> {
@@ -368,6 +447,7 @@ pub struct StreamAccumulator {
     usage: LlmUsage,
     stop_reason: Option<String>,
     terminal: bool,
+    provider_context: BTreeMap<usize, ModelProviderContext>,
 }
 
 #[derive(Clone, Debug)]
@@ -474,14 +554,52 @@ impl StreamAccumulator {
         }
     }
 
+    pub fn apply_provider_context(&mut self, delta: ProviderContextStreamDelta) {
+        match delta {
+            ProviderContextStreamDelta::Start { index, context } => {
+                self.provider_context.insert(index, context);
+            }
+            ProviderContextStreamDelta::Append {
+                index,
+                field,
+                value,
+            } => {
+                let context =
+                    self.provider_context
+                        .entry(index)
+                        .or_insert_with(|| ModelProviderContext {
+                            provider: "anthropic".to_string(),
+                            kind: "thinking".to_string(),
+                            data: serde_json::json!({"type": "thinking"}),
+                        });
+                let object = context
+                    .data
+                    .as_object_mut()
+                    .expect("provider context data is initialized as an object");
+                let target = object
+                    .entry(field)
+                    .or_insert_with(|| Value::String(String::new()));
+                if let Value::String(current) = target {
+                    current.push_str(&value);
+                }
+            }
+        }
+    }
+
     pub fn finalize(self) -> AdaptedResponse {
         let tool_calls: Vec<ToolCall> = self
             .active_tool_calls
             .into_iter()
-            .map(|tc| {
+            .enumerate()
+            .map(|(index, tc)| {
+                let id = if tc.id.trim().is_empty() {
+                    super::utils::compatible_tool_call_id(index, &tc.name, &tc.arguments_buffer)
+                } else {
+                    tc.id
+                };
                 let (arguments, argument_parse_error) = parse_tool_arguments(&tc.arguments_buffer);
                 ToolCall {
-                    id: tc.id,
+                    id,
                     name: tc.name,
                     arguments,
                     argument_parse_error,
@@ -505,6 +623,7 @@ impl StreamAccumulator {
             usage: self.usage,
             stop_reason,
             raw: None,
+            provider_context: self.provider_context.into_values().collect(),
         }
     }
 
@@ -632,6 +751,16 @@ mod tests {
     }
 
     #[test]
+    fn openai_stream_parses_content_part_arrays_from_compatible_providers() {
+        let data = r#"{"choices":[{"delta":{"content":[{"type":"text","text":"Hel"},{"type":"text","text":"lo"}]},"finish_reason":null}]}"#;
+        let chunks = parse_openai_stream_data(data);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].kind, LlmStreamChunkType::ContentDelta);
+        assert_eq!(chunks[0].content.as_deref(), Some("Hello"));
+    }
+
+    #[test]
     fn openai_stream_parses_tool_call_start_and_delta() {
         let start = r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_1","function":{"name":"search","arguments":""}}]},"finish_reason":null}]}"#;
         let delta = r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"q\":"}}]},"finish_reason":null}]}"#;
@@ -651,6 +780,22 @@ mod tests {
         let delta_chunks = parse_openai_stream_data(delta);
         assert_eq!(delta_chunks.len(), 1);
         assert_eq!(delta_chunks[0].kind, LlmStreamChunkType::ToolCallDelta);
+    }
+
+    #[test]
+    fn openai_stream_normalizes_compatible_tool_call_without_id() {
+        let chunks = parse_openai_stream_data(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"search","arguments":{"query":"Magi"}}}]},"stop_reason":"tool_calls"}]}"#,
+        );
+        let mut accumulator = StreamAccumulator::new();
+        accumulator.apply_all(&chunks);
+
+        let result = accumulator.finalize();
+
+        assert_eq!(result.stop_reason, "tool_calls");
+        assert_eq!(result.tool_calls.len(), 1);
+        assert!(result.tool_calls[0].id.starts_with("call_compat_0_"));
+        assert_eq!(result.tool_calls[0].arguments["query"], "Magi");
     }
 
     #[test]
@@ -707,6 +852,36 @@ mod tests {
             parse_anthropic_stream_event(Some("content_block_stop"), r#"{"index":0}"#);
         assert_eq!(stop_chunks.len(), 1);
         assert_eq!(stop_chunks[0].kind, LlmStreamChunkType::ContentEnd);
+    }
+
+    #[test]
+    fn anthropic_stream_accumulates_signed_thinking_context() {
+        let start = SseEvent {
+            event_type: Some("content_block_start".to_string()),
+            data: r#"{"index":0,"content_block":{"type":"thinking","thinking":""}}"#.to_string(),
+        };
+        let thinking = SseEvent {
+            event_type: Some("content_block_delta".to_string()),
+            data: r#"{"index":0,"delta":{"type":"thinking_delta","thinking":"分析"}}"#.to_string(),
+        };
+        let signature = SseEvent {
+            event_type: Some("content_block_delta".to_string()),
+            data: r#"{"index":0,"delta":{"type":"signature_delta","signature":"signed"}}"#
+                .to_string(),
+        };
+        let mut accumulator = StreamAccumulator::new();
+        for event in [&start, &thinking, &signature] {
+            if let Some(delta) = parse_stream_provider_context(ProviderFamily::Anthropic, event) {
+                accumulator.apply_provider_context(delta);
+            }
+            accumulator.apply_all(&parse_stream_event(ProviderFamily::Anthropic, event));
+        }
+
+        let response = accumulator.finalize();
+        assert_eq!(response.thinking.as_deref(), Some("分析"));
+        assert_eq!(response.provider_context.len(), 1);
+        assert_eq!(response.provider_context[0].data["thinking"], "分析");
+        assert_eq!(response.provider_context[0].data["signature"], "signed");
     }
 
     #[test]

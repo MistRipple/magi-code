@@ -1,17 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { aggregateUsageStatsForDisplay } from '../src/lib/usage-stats-aggregation.ts';
-import { resolveModelApiProtocol } from '../src/shared/model-governance.ts';
-
-assert.equal(
-  resolveModelApiProtocol({
-    baseUrl: 'https://api.deepseek.com/anthropic',
-    urlMode: 'standard',
-    model: 'deepseek-chat',
-  }),
-  'anthropic_messages',
-  '显式 /anthropic 路径必须优先使用 Anthropic Messages，不能被模型名误判为 OpenAI Chat',
-);
 
 const settingsStoreSource = await readFile(
   new URL('../src/stores/settings-store.svelte.ts', import.meta.url),
@@ -32,6 +21,22 @@ const settingsToolsTabSource = await readFile(
 const usageAggregationSource = await readFile(
   new URL('../src/lib/usage-stats-aggregation.ts', import.meta.url),
   'utf8',
+);
+
+assert.match(
+  settingsStoreSource,
+  /function buildBaseModelConfigPayload\([\s\S]*?apiProtocol: config\.apiProtocol/,
+  '模型设置保存必须显式传递 apiProtocol，运行时不得根据模型名或 URL 猜测协议',
+);
+assert.match(
+  settingsStoreSource,
+  /function buildModelListSignature\([\s\S]*?apiProtocol: config\.apiProtocol/,
+  '模型列表缓存键必须包含 apiProtocol，避免不同协议的连接结果相互污染',
+);
+assert.doesNotMatch(
+  settingsStoreSource,
+  /resolveModelApiProtocol|model\.includes\(['"]claude['"]\)/,
+  '设置链路不得保留按模型名推断请求协议的旧实现',
 );
 
 assert.match(

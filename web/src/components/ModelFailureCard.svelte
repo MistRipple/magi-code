@@ -40,6 +40,8 @@
         return i18n.t('messageItem.modelFailure.stage.responseStreamRecovery');
       case 'response_validation':
         return i18n.t('messageItem.modelFailure.stage.responseValidation');
+      case 'response_finalization':
+        return i18n.t('messageItem.modelFailure.stage.responseFinalization');
       default:
         return failure.stage;
     }

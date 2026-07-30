@@ -4,6 +4,7 @@
     resolveTaskSemanticStatus,
   } from '../shared/task-status-semantics';
   import type {
+    OrchestrationRuntimeTimelineEntry,
     OrchestratorRuntimeState,
   } from '../types/message';
   import Icon from './Icon.svelte';
@@ -16,15 +17,21 @@
     shouldShowRuntimePanel,
     shouldShowRuntimePhase,
   } from '../lib/runtime-state-panel';
+  import { mergeCurrentRuntimeTimelineEntries } from '../lib/runtime-timeline';
+  import { resolveToolDisplayName } from '../lib/tool-display-name';
 
   interface Props {
     runtimeState: OrchestratorRuntimeState | null;
+    conversationRecords?: OrchestrationRuntimeTimelineEntry[];
+    conversationStartedAt?: number | null;
     isProcessing?: boolean;
     processingStartedAt?: number | null;
   }
 
   let {
     runtimeState,
+    conversationRecords = [],
+    conversationStartedAt = null,
     isProcessing = false,
     processingStartedAt = null,
   }: Props = $props();
@@ -63,9 +70,13 @@
   const planSummary = $derived.by(() => opsView?.plan || null);
 
   const recentTimeline = $derived.by(() => (
-    Array.isArray(opsView?.recentTimeline)
-      ? opsView.recentTimeline.filter((item) => Boolean(formatTimelineSummary(item)))
-      : []
+    mergeCurrentRuntimeTimelineEntries({
+      runtimeEntries: Array.isArray(opsView?.recentTimeline) ? opsView.recentTimeline : [],
+      conversationEntries: Array.isArray(conversationRecords) ? conversationRecords : [],
+      isProcessing,
+      processingStartedAt,
+      currentTurnStartedAt: conversationStartedAt,
+    }).filter((item) => Boolean(formatTimelineSummary(item)))
   ));
   const assignmentSummaries = $derived.by(() => Array.isArray(runtimeState?.assignments) ? runtimeState.assignments : []);
   const activeWorkerSummary = $derived.by(() => {
@@ -209,11 +220,34 @@
       || status === 'cancelled';
   });
 
+  const canonicalFailureActive = $derived(
+    !canonicalProcessingActive
+    && conversationRecords.some((item) => item.kind === 'error'),
+  );
+  const canonicalInterruptionActive = $derived(
+    !canonicalProcessingActive
+    && conversationRecords.some((item) => (
+      item.type === 'session.turn.interrupted' && item.kind === 'warning'
+    )),
+  );
+
   const effectiveStatus = $derived.by(() => (
-    canonicalProcessingActive ? 'running' : runtimeState?.status
+    canonicalProcessingActive
+      ? 'running'
+      : canonicalFailureActive
+        ? 'failed'
+        : canonicalInterruptionActive
+          ? 'paused'
+          : runtimeState?.status
   ));
   const effectivePhase = $derived.by(() => (
-    canonicalProcessingActive ? 'running' : runtimeState?.phase
+    canonicalProcessingActive
+      ? 'running'
+      : canonicalFailureActive
+        ? 'failed'
+        : canonicalInterruptionActive
+          ? 'paused'
+          : runtimeState?.phase
   ));
   const effectiveLastEventAt = $derived.by(() => (
     canonicalProcessingActive
@@ -522,7 +556,7 @@
   }
 
   function formatTimelineTypeLabel(type: string): string {
-    const normalized = typeof type === 'string' ? type.trim() : '';
+    const normalized = typeof type === 'string' ? type.trim().toLowerCase() : '';
     if (!normalized) return '--';
     switch (normalized) {
       case 'task.dispatched':
@@ -577,7 +611,34 @@
     }
   }
 
-  function formatTimelineSummary(item: { type: string; summary: string }): string {
+  function formatTimelineSummary(
+    item: Pick<OrchestrationRuntimeTimelineEntry, 'type' | 'summary' | 'source'>,
+  ): string {
+    const toolName = item.source ? resolveToolDisplayName(item.source, i18n) : '';
+    switch (item.type) {
+      case 'session.turn.processing':
+        return i18n.t('runtimeDiagnostics.record.processing');
+      case 'session.tool.running':
+        return i18n.t('runtimeDiagnostics.record.toolRunning', { tool: toolName });
+      case 'session.tool.succeeded':
+        return i18n.t('runtimeDiagnostics.record.toolSucceeded', { tool: toolName });
+      case 'session.tool.failed': {
+        const reason = item.summary === item.source
+          ? ''
+          : formatHumanizedRuntimeText(item.summary);
+        return reason
+          ? i18n.t('runtimeDiagnostics.record.toolFailedWithReason', { tool: toolName, reason })
+          : i18n.t('runtimeDiagnostics.record.toolFailed', { tool: toolName });
+      }
+      case 'session.model.failed':
+        return i18n.t('runtimeDiagnostics.record.modelFailed', {
+          reason: sanitizeRuntimeDisplayText(item.summary),
+        });
+      case 'session.turn.interrupted':
+        return i18n.t('runtimeDiagnostics.record.interrupted');
+      default:
+        break;
+    }
     const typeLabel = formatTimelineTypeLabel(item.type);
     const cleanedSummary = formatHumanizedRuntimeText(item.summary);
     if (!cleanedSummary || cleanedSummary === typeLabel) {
@@ -591,8 +652,23 @@
     return cleanedSummary;
   }
 
-  function formatRuntimeRecordKind(kind: string | undefined): string {
-    switch (kind) {
+  function resolveRuntimeRecordKind(
+    item: Pick<OrchestrationRuntimeTimelineEntry, 'type' | 'kind'>,
+  ): NonNullable<OrchestrationRuntimeTimelineEntry['kind']> {
+    const type = item.type.trim().toLowerCase();
+    if (type.includes('interrupted')) {
+      return item.kind === 'warning' ? 'warning' : 'error';
+    }
+    if (type.includes('failed') || type.includes('blocked')) {
+      return 'error';
+    }
+    return item.kind || 'progress';
+  }
+
+  function formatRuntimeRecordKind(
+    item: Pick<OrchestrationRuntimeTimelineEntry, 'type' | 'kind'>,
+  ): string {
+    switch (resolveRuntimeRecordKind(item)) {
       case 'success': return '已完成';
       case 'warning': return '需处理';
       case 'error': return '错误';
@@ -848,11 +924,11 @@
         <div class="runtime-diagnostics__ops-list">
           {#each recentTimeline as item}
             <div
-              class="runtime-diagnostics__ops-item runtime-diagnostics__ops-item--{item.kind || 'progress'}"
+              class="runtime-diagnostics__ops-item runtime-diagnostics__ops-item--{resolveRuntimeRecordKind(item)}"
             >
               <div class="runtime-diagnostics__ops-title-row">
                 <span class="runtime-diagnostics__record-kind">
-                  {formatRuntimeRecordKind(item.kind)}
+                  {formatRuntimeRecordKind(item)}
                 </span>
                 <span class="runtime-diagnostics__ops-title">{formatTimelineSummary(item)}</span>
                 <span class="runtime-diagnostics__ops-time">{formatTimestamp(item.timestamp)}</span>

@@ -10,7 +10,7 @@ use crate::{
         McpManagerListServersResponse, McpManagerServerHealthUpdateRequest,
         McpManagerServerOperationResponse, McpManagerServerRegistrationRequest,
         McpManagerServerSelectionRequest, McpToolCallRequest, ModelBridgeClient,
-        ModelInvocationRequest, ModelStreamingDelta, SharedBridgeTransport,
+        ModelInvocationRequest, ModelResponse, ModelStreamingDelta, SharedBridgeTransport,
     },
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -192,7 +192,7 @@ impl JsonRpcBridgeServerProbeClient {
 }
 
 impl ModelBridgeClient for JsonRpcModelBridgeClient {
-    fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError> {
+    fn invoke(&self, request: ModelInvocationRequest) -> Result<ModelResponse, BridgeClientError> {
         let params = serde_json::to_value(request).map_err(|error| {
             protocol_call_failed(format!("serialize model request failed: {error}"))
         })?;
@@ -203,7 +203,8 @@ impl ModelBridgeClient for JsonRpcModelBridgeClient {
                 params,
             })
             .map_err(transport_call_failed)?;
-        decode_bridge_response(response.payload)
+        serde_json::from_value(response.payload)
+            .map_err(|error| protocol_call_failed(format!("decode model response failed: {error}")))
     }
 
     /// JsonRpc 子进程桥不支持真流式增量,仅用于桥探测/冒烟。
@@ -212,7 +213,7 @@ impl ModelBridgeClient for JsonRpcModelBridgeClient {
         &self,
         _request: ModelInvocationRequest,
         _on_delta: &dyn Fn(&ModelStreamingDelta),
-    ) -> Result<BridgeResponse, BridgeClientError> {
+    ) -> Result<ModelResponse, BridgeClientError> {
         Err(BridgeClientError::CallFailed {
             layer: BridgeErrorLayer::Protocol,
             code: None,

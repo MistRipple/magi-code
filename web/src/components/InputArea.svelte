@@ -6,6 +6,7 @@
     cancelTurnEditing,
     getActiveInteractionType,
     getQueuedMessages,
+    isPersistedSessionId,
     messagesState,
     removeQueuedMessage,
   } from '../stores/messages.svelte';
@@ -279,6 +280,9 @@
   const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
   const currentWorkspacePath = $derived(messagesState.currentWorkspacePath);
   const isDraftSession = $derived.by(() => !currentSessionId?.trim());
+  const persistedSessionId = $derived.by(() => (
+    isPersistedSessionId(currentSessionId) ? currentSessionId?.trim() || '' : ''
+  ));
   let composerReferenceScopeKey = '';
   const composerWorkspace = $derived.by(() => (
     resolveComposerWorkspace(currentWorkspaceId, currentWorkspacePath, isDraftSession)
@@ -914,7 +918,7 @@
     return {
       workspaceId: workspace.workspaceId,
       workspacePath: workspaceBindingPath(workspace),
-      sessionId: isDraftSession ? '' : (currentSessionId?.trim() || ''),
+      sessionId: persistedSessionId,
     };
   }
 
@@ -1483,7 +1487,8 @@
     const baseUrl = typeof config.baseUrl === 'string' ? config.baseUrl.trim() : '';
     const apiKey = typeof config.apiKey === 'string' ? config.apiKey.trim() : '';
     const urlMode = typeof config.urlMode === 'string' ? config.urlMode.trim() : '';
-    return JSON.stringify({ baseUrl, apiKey, urlMode });
+    const apiProtocol = typeof config.apiProtocol === 'string' ? config.apiProtocol.trim() : '';
+    return JSON.stringify({ baseUrl, apiKey, urlMode, apiProtocol });
   }
 
   function applyDraftOrchestratorSessionPatch(patch: Record<string, unknown>) {

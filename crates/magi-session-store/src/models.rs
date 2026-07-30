@@ -1287,6 +1287,17 @@ pub struct ThreadChatMessage {
     pub tool_calls: Vec<ThreadChatToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// 模型提供方要求随 assistant 消息跨轮持久化并原样回放的私有上下文。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_context: Vec<ThreadModelProviderContext>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadModelProviderContext {
+    pub provider: String,
+    pub kind: String,
+    pub data: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

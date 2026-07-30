@@ -1,6 +1,5 @@
 <script lang="ts">
   import { i18n } from '../stores/i18n.svelte';
-  import { resolveModelApiProtocol } from '../shared/model-governance';
   import Icon from './Icon.svelte';
 
   type FormType = 'orch' | 'comp' | 'image' | 'worker';
@@ -114,10 +113,7 @@
   const isTesting = $derived(currentTestStatus === 'testing');
   const saveDisabled = $derived(isSaving || !isDirty);
   const showSavedLabel = $derived(currentSaveStatus === 'saved' && !isDirty);
-  const resolvedProtocol = $derived(resolveModelApiProtocol(config));
-  const showResolvedProtocol = $derived(
-    showModelField && (Boolean(String(config.model || '').trim()) || config.urlMode === 'full'),
-  );
+  const showProtocolField = $derived(formType !== 'image');
 
   function handleModelListAction(event: MouseEvent) {
     const button = event.currentTarget as HTMLElement | null;
@@ -143,6 +139,7 @@
 <div class="llm-config-form" oninput={markUserEdited} onchange={markUserEdited}>
   <div
     class="llm-config-field-row url-mode-row"
+    class:has-protocol={showProtocolField}
   >
     <div class="llm-config-field">
       <label class="llm-config-label">{i18n.t('settings.model.field.baseUrl')}</label>
@@ -179,6 +176,29 @@
         </div>
       {/if}
     </div>
+    {#if showProtocolField}
+      <div class="llm-config-field llm-config-field--compact">
+        <label class="llm-config-label">{i18n.t('settings.model.field.apiProtocol')}</label>
+        <div class="segmented-control" title={i18n.t('settings.model.protocolHint')}>
+          <button
+            type="button"
+            class="segmented-control__option"
+            class:active={config.apiProtocol === 'openai_chat'}
+            onclick={() => { config.apiProtocol = 'openai_chat'; markUserEdited(); }}
+          >
+            {i18n.t('settings.model.protocol.openai')}
+          </button>
+          <button
+            type="button"
+            class="segmented-control__option"
+            class:active={config.apiProtocol === 'anthropic_messages'}
+            onclick={() => { config.apiProtocol = 'anthropic_messages'; markUserEdited(); }}
+          >
+            {i18n.t('settings.model.protocol.anthropic')}
+          </button>
+        </div>
+      </div>
+    {/if}
   </div>
 
   <div
@@ -250,21 +270,6 @@
             </div>
           {/if}
         </div>
-        {#if showResolvedProtocol}
-          <div
-            class="model-protocol-inline"
-            title={i18n.t('settings.model.protocolHint')}
-          >
-            <Icon name="info" size={12} />
-            <span>
-              {i18n.t('settings.model.protocolResolved', {
-                protocol: resolvedProtocol === 'anthropic_messages'
-                  ? i18n.t('settings.model.protocol.anthropic')
-                  : i18n.t('settings.model.protocol.openai'),
-              })}
-            </span>
-          </div>
-        {/if}
       </div>
     {/if}
 
@@ -374,6 +379,9 @@
   .llm-config-field-row.url-mode-row {
     grid-template-columns: minmax(0, 1fr) 180px;
     align-items: end;
+  }
+  .llm-config-field-row.url-mode-row.has-protocol {
+    grid-template-columns: minmax(0, 1fr) 180px 220px;
   }
 
   .llm-config-label {
@@ -508,25 +516,6 @@
     color: var(--foreground);
   }
 
-  .model-protocol-inline {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    min-width: 0;
-    align-self: flex-start;
-    max-width: 100%;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    line-height: 1.35;
-  }
-
-  .model-protocol-inline span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
   .model-dropdown {
     position: fixed;
     z-index: var(--z-popover);
@@ -625,7 +614,8 @@
     .llm-config-field-row.credentials-row,
     .llm-config-field-row.credentials-row.has-level,
     .llm-config-field-row.credentials-row.key-only,
-    .llm-config-field-row.url-mode-row {
+    .llm-config-field-row.url-mode-row,
+    .llm-config-field-row.url-mode-row.has-protocol {
       grid-template-columns: 1fr;
     }
   }
@@ -654,7 +644,8 @@
     .llm-config-field-row.credentials-row,
     .llm-config-field-row.credentials-row.has-level,
     .llm-config-field-row.credentials-row.key-only,
-    .llm-config-field-row.url-mode-row {
+    .llm-config-field-row.url-mode-row,
+    .llm-config-field-row.url-mode-row.has-protocol {
       grid-template-columns: 1fr;
     }
   }

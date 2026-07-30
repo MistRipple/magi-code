@@ -139,6 +139,7 @@ pub(crate) fn invalid_tool_result_message(invalid: &InvalidToolCall) -> ChatMess
         images: Vec::new(),
         tool_calls: Vec::new(),
         tool_call_id: Some(invalid.call.id.clone()),
+        provider_context: Vec::new(),
     }
 }
 

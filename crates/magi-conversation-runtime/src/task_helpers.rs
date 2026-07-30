@@ -482,19 +482,7 @@ pub fn task_required_tool_chain(
         return Vec::new();
     }
     let normalized = task.goal.to_ascii_lowercase();
-    let mut matches: Vec<(&'static str, usize)> = Vec::new();
-    for canonical_name in public_builtin_tool_references() {
-        let Some(position) = tool_reference_position(&normalized, canonical_name) else {
-            continue;
-        };
-        if let Some((_, existing_position)) =
-            matches.iter_mut().find(|(name, _)| *name == canonical_name)
-        {
-            *existing_position = (*existing_position).min(position);
-        } else {
-            matches.push((canonical_name, position));
-        }
-    }
+    let mut matches = requested_public_builtin_tool_matches(&normalized);
     for (canonical_name, position) in semantic_required_tool_references(&normalized) {
         if let Some((_, existing_position)) =
             matches.iter_mut().find(|(name, _)| *name == canonical_name)
@@ -509,6 +497,85 @@ pub fn task_required_tool_chain(
         .into_iter()
         .map(|(tool_name, _)| tool_name.to_string())
         .collect()
+}
+
+/// 从规范工具名和产品公开名称中提取用户明确要求执行的内置工具链。
+///
+/// 自然语言名称只在同一分句中存在“调用/使用/执行/运行”动作时才识别，避免把
+/// 问题描述里的工具名称误当成执行要求。
+pub fn requested_public_builtin_tool_chain(text: &str) -> Vec<String> {
+    requested_public_builtin_tool_matches(text)
+        .into_iter()
+        .map(|(tool_name, _)| tool_name.to_string())
+        .collect()
+}
+
+fn requested_public_builtin_tool_matches(text: &str) -> Vec<(&'static str, usize)> {
+    let normalized = text.to_ascii_lowercase();
+    let mut matches: Vec<(&'static str, usize)> = Vec::new();
+    for canonical_name in public_builtin_tool_references() {
+        if let Some(position) = tool_reference_position(&normalized, canonical_name) {
+            push_tool_match(&mut matches, canonical_name, position);
+        }
+    }
+    for (canonical_name, alias) in [
+        ("shell_exec", "shell 工具"),
+        ("shell_exec", "shell 命令"),
+        ("shell_exec", "shell tool"),
+        ("shell_exec", "shell command"),
+    ] {
+        if let Some(position) = explicit_product_tool_alias_position(&normalized, alias) {
+            push_tool_match(&mut matches, canonical_name, position);
+        }
+    }
+    matches.sort_by_key(|(_, position)| *position);
+    matches
+}
+
+fn push_tool_match(
+    matches: &mut Vec<(&'static str, usize)>,
+    canonical_name: &'static str,
+    position: usize,
+) {
+    if let Some((_, existing_position)) =
+        matches.iter_mut().find(|(name, _)| *name == canonical_name)
+    {
+        *existing_position = (*existing_position).min(position);
+    } else {
+        matches.push((canonical_name, position));
+    }
+}
+
+fn explicit_product_tool_alias_position(text: &str, alias: &str) -> Option<usize> {
+    text.match_indices(alias).find_map(|(start, _)| {
+        let end = start + alias.len();
+        let before_boundary = text[..start].chars().next_back();
+        let after_boundary = text[end..].chars().next();
+        if !is_tool_reference_boundary(before_boundary)
+            || !is_tool_reference_boundary(after_boundary)
+            || tool_reference_is_negated(text, start, end)
+        {
+            return None;
+        }
+        let clause_start = text[..start]
+            .rfind(['。', '！', '？', '；', ';', '\n'])
+            .map(|position| {
+                position
+                    + text[position..]
+                        .chars()
+                        .next()
+                        .map(char::len_utf8)
+                        .unwrap_or_default()
+            })
+            .unwrap_or(0);
+        let before = &text[clause_start..start];
+        [
+            "调用", "使用", "执行", "运行", "call", "use", "execute", "run",
+        ]
+        .iter()
+        .any(|marker| before.contains(marker))
+        .then_some(start)
+    })
 }
 
 fn semantic_required_tool_references(text: &str) -> Vec<(&'static str, usize)> {
@@ -835,5 +902,35 @@ mod tests {
 
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].function.name, "file_read");
+    }
+
+    #[test]
+    fn product_shell_name_maps_to_required_shell_tool() {
+        for prompt in [
+            "必须调用 Shell 工具执行 printf ok",
+            "请运行 Shell 命令 printf ok",
+            "use the shell tool to run printf ok",
+        ] {
+            assert_eq!(
+                requested_public_builtin_tool_chain(prompt),
+                vec!["shell_exec".to_string()],
+                "{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn product_shell_name_without_action_or_with_negation_is_not_required() {
+        for prompt in [
+            "Shell 工具是什么？",
+            "分析 Shell 命令执行失败的原因",
+            "不要调用 Shell 工具，只解释方案",
+            "do not use the shell tool",
+        ] {
+            assert!(
+                requested_public_builtin_tool_chain(prompt).is_empty(),
+                "{prompt}"
+            );
+        }
     }
 }

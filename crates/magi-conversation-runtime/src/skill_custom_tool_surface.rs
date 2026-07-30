@@ -364,11 +364,20 @@ pub fn execute_skill_custom_tool(
             custom_tool_preflight_payload(tool_name, tool_skill_name, observation)
         }
         Ok(SkillDispatchResult::Bridge { output }) => {
-            if output.response.ok {
-                (output.response.payload, ExecutionResultStatus::Succeeded)
+            if output.response.is_success() {
+                (
+                    output.response.payload().to_string(),
+                    ExecutionResultStatus::Succeeded,
+                )
             } else {
                 custom_tool_remote_failure_payload(tool_name, tool_skill_name, observation)
             }
+        }
+        Err(_error)
+            if observation.bridge_error_layer
+                == Some(magi_bridge_client::BridgeErrorLayer::RemoteBusiness) =>
+        {
+            custom_tool_remote_failure_payload(tool_name, tool_skill_name, observation)
         }
         Err(_error) => {
             custom_tool_dispatch_failure_payload(tool_name, tool_skill_name, observation)
@@ -782,11 +791,12 @@ mod tests {
         fn invoke(
             &self,
             _request: magi_bridge_client::ModelInvocationRequest,
-        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError>
         {
-            Ok(magi_bridge_client::BridgeResponse {
-                ok: false,
-                payload: "remote business detail: secret-token".to_string(),
+            Err(magi_bridge_client::BridgeClientError::CallFailed {
+                layer: magi_bridge_client::BridgeErrorLayer::RemoteBusiness,
+                code: Some(-32006),
+                message: "remote business detail: secret-token".to_string(),
             })
         }
 
@@ -794,7 +804,7 @@ mod tests {
             &self,
             request: magi_bridge_client::ModelInvocationRequest,
             _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
-        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError>
         {
             self.invoke(request)
         }
@@ -1121,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_skill_tool_ok_false_bridge_response_uses_public_error() {
+    fn custom_skill_tool_model_business_failure_uses_public_error() {
         let registry = SkillRegistry::new();
         registry.register(SkillDefinition {
             skill_id: "model-skill".to_string(),

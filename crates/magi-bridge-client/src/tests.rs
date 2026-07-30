@@ -24,14 +24,16 @@ use std::{
 
 struct RecordingTransport {
     calls: Mutex<Vec<BridgeTransportRequest>>,
-    response: Value,
+    model_response: Value,
+    mcp_response: Value,
 }
 
 impl RecordingTransport {
-    fn new(response: Value) -> Self {
+    fn new(model_response: Value, mcp_response: Value) -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
-            response,
+            model_response,
+            mcp_response,
         }
     }
 
@@ -50,7 +52,11 @@ impl BridgeTransport for RecordingTransport {
             .expect("lock poisoned")
             .push(request.clone());
         Ok(BridgeTransportResponse {
-            payload: self.response.clone(),
+            payload: if request.method == "model.invoke" {
+                self.model_response.clone()
+            } else {
+                self.mcp_response.clone()
+            },
         })
     }
 }
@@ -153,10 +159,14 @@ fn stdio_transport_reports_protocol_and_remote_business_errors() {
 
 #[test]
 fn json_rpc_clients_share_the_same_transport_abstraction() {
-    let transport = Arc::new(RecordingTransport::new(json!({
-        "ok": true,
-        "payload": "shared"
-    })));
+    let transport = Arc::new(RecordingTransport::new(
+        serde_json::to_value(crate::ModelResponse::completed("shared"))
+            .expect("model response should serialize"),
+        json!({
+            "ok": true,
+            "payload": "shared"
+        }),
+    ));
 
     let model = JsonRpcModelBridgeClient::new(transport.clone());
     let mcp = JsonRpcMcpBridgeClient::new(transport.clone());
@@ -171,8 +181,9 @@ fn json_rpc_clients_share_the_same_transport_abstraction() {
                 tool_choice: None,
             })
             .expect("model call should succeed")
-            .payload,
-        "shared"
+            .content
+            .as_deref(),
+        Some("shared")
     );
     assert_eq!(
         mcp.call_tool(McpToolCallRequest {
@@ -192,11 +203,45 @@ fn json_rpc_clients_share_the_same_transport_abstraction() {
 }
 
 #[test]
-fn dispatch_runtime_with_json_rpc_clients_is_end_to_end() {
-    let transport = Arc::new(RecordingTransport::new(json!({
+fn json_rpc_model_client_rejects_legacy_bridge_response_shape() {
+    let legacy_response = json!({
         "ok": true,
-        "payload": "dispatch"
-    })));
+        "payload": "legacy model payload"
+    });
+    let client = JsonRpcModelBridgeClient::new(Arc::new(RecordingTransport::new(
+        legacy_response.clone(),
+        legacy_response,
+    )));
+
+    let error = client
+        .invoke(ModelInvocationRequest {
+            provider: "openai".to_string(),
+            prompt: "hello".to_string(),
+            messages: None,
+            tools: None,
+            tool_choice: None,
+        })
+        .expect_err("legacy model bridge response must be rejected");
+
+    assert!(matches!(
+        error,
+        BridgeClientError::CallFailed {
+            layer: crate::BridgeErrorLayer::Protocol,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn dispatch_runtime_with_json_rpc_clients_is_end_to_end() {
+    let transport = Arc::new(RecordingTransport::new(
+        serde_json::to_value(crate::ModelResponse::completed("dispatch"))
+            .expect("model response should serialize"),
+        json!({
+            "ok": true,
+            "payload": "dispatch"
+        }),
+    ));
 
     let runtime = BridgeDispatchRuntime::new()
         .with_model_client(Arc::new(JsonRpcModelBridgeClient::new(transport.clone())))
@@ -232,7 +277,7 @@ fn dispatch_runtime_with_json_rpc_clients_is_end_to_end() {
             },
         )
         .expect("model dispatch should succeed");
-    assert_eq!(model.response.payload, "dispatch");
+    assert_eq!(model.response.payload(), "dispatch");
 
     let mcp = runtime
         .dispatch(
@@ -244,7 +289,7 @@ fn dispatch_runtime_with_json_rpc_clients_is_end_to_end() {
             },
         )
         .expect("mcp dispatch should succeed");
-    assert_eq!(mcp.response.payload, "dispatch");
+    assert_eq!(mcp.response.payload(), "dispatch");
 }
 
 // ============================================================================

@@ -5,6 +5,24 @@ use crate::llm_types::{
     LlmContentBlock, LlmMessage, LlmMessageContent, LlmUsage, ToolCall, ToolDefinition,
 };
 
+/// 部分 OpenAI-compatible 服务省略工具调用 id。运行时仍需要稳定 id 将 assistant
+/// tool_call 与后续 tool_result 配对，因此在协议边界根据调用内容生成本轮稳定标识。
+pub fn compatible_tool_call_id(index: usize, name: &str, arguments: &str) -> String {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in name
+        .as_bytes()
+        .iter()
+        .chain([0xff].iter())
+        .chain(arguments.as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("call_compat_{index}_{hash:016x}")
+}
+
 /// 将 `ReasoningEffort` 序列化为下游协议接受的字符串字面量。
 ///
 /// 四档粒度（`low | medium | high | xhigh`）原样透传，由下游模型/网关自行解释。
@@ -46,6 +64,9 @@ pub fn estimate_message_tokens(messages: &[LlmMessage]) -> u64 {
                         }
                         LlmContentBlock::Image { .. } => {
                             total += 1000;
+                        }
+                        LlmContentBlock::ProviderContext { context } => {
+                            total += (context.data.to_string().len() as u64) / 4;
                         }
                     }
                 }
@@ -172,6 +193,7 @@ fn append_openai_content_block_message(
                 tool_result_content = Some(content.clone());
                 tool_result_images = images.clone();
             }
+            LlmContentBlock::ProviderContext { .. } => {}
         }
     }
 
@@ -233,65 +255,85 @@ pub fn convert_messages_to_anthropic(messages: &[LlmMessage]) -> Vec<Value> {
     messages
         .iter()
         .map(|msg| {
-            let content_val = match &msg.content {
-                LlmMessageContent::Text(text) => json!(text),
-                LlmMessageContent::Blocks(blocks) => {
-                    let parts: Vec<Value> = blocks
-                        .iter()
-                        .map(|block| match block {
-                            LlmContentBlock::Text { text } => {
-                                json!({"type": "text", "text": text})
-                            }
-                            LlmContentBlock::ToolUse { id, name, input } => json!({
-                                "type": "tool_use",
-                                "id": id,
-                                "name": name,
-                                "input": input,
-                            }),
-                            LlmContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                is_error,
-                                images,
-                            } => {
-                                let content = if images.is_empty() {
-                                    json!(content)
-                                } else {
-                                    let mut parts = Vec::new();
-                                    if !content.trim().is_empty() {
-                                        parts.push(json!({"type": "text", "text": content}));
-                                    }
-                                    parts.extend(images.iter().map(|source| {
-                                        json!({
-                                            "type": "image",
-                                            "source": {
-                                                "type": source.kind,
-                                                "media_type": source.media_type,
-                                                "data": source.data,
-                                            }
-                                        })
-                                    }));
-                                    json!(parts)
-                                };
-                                json!({
-                                    "type": "tool_result",
-                                    "tool_use_id": tool_use_id,
-                                    "content": content,
-                                    "is_error": is_error,
-                                })
-                            }
-                            LlmContentBlock::Image { source } => json!({
-                                "type": "image",
-                                "source": {
-                                    "type": source.kind,
-                                    "media_type": source.media_type,
-                                    "data": source.data,
-                                }
-                            }),
-                        })
-                        .collect();
-                    json!(parts)
+            let mut parts = Vec::new();
+            match &msg.content {
+                LlmMessageContent::Text(text) => {
+                    if !text.is_empty() {
+                        parts.push(json!({"type": "text", "text": text}));
+                    }
                 }
+                LlmMessageContent::Blocks(blocks) => {
+                    parts.extend(blocks.iter().map(|block| match block {
+                        LlmContentBlock::Text { text } => {
+                            json!({"type": "text", "text": text})
+                        }
+                        LlmContentBlock::ToolUse { id, name, input } => json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": input,
+                        }),
+                        LlmContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                            images,
+                        } => {
+                            let content = if images.is_empty() {
+                                json!(content)
+                            } else {
+                                let mut parts = Vec::new();
+                                if !content.trim().is_empty() {
+                                    parts.push(json!({"type": "text", "text": content}));
+                                }
+                                parts.extend(images.iter().map(|source| {
+                                    json!({
+                                        "type": "image",
+                                        "source": {
+                                            "type": source.kind,
+                                            "media_type": source.media_type,
+                                            "data": source.data,
+                                        }
+                                    })
+                                }));
+                                json!(parts)
+                            };
+                            json!({
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": content,
+                                "is_error": is_error,
+                            })
+                        }
+                        LlmContentBlock::Image { source } => json!({
+                            "type": "image",
+                            "source": {
+                                "type": source.kind,
+                                "media_type": source.media_type,
+                                "data": source.data,
+                            }
+                        }),
+                        LlmContentBlock::ProviderContext { context }
+                            if msg.role == "assistant"
+                                && context.provider == "anthropic"
+                                && matches!(
+                                    context.kind.as_str(),
+                                    "thinking" | "redacted_thinking"
+                                )
+                                && context.data["type"].as_str() == Some(context.kind.as_str()) =>
+                        {
+                            context.data.clone()
+                        }
+                        LlmContentBlock::ProviderContext { .. } => Value::Null,
+                    }));
+                    parts.retain(|part| !part.is_null());
+                }
+            }
+
+            let content_val = if let LlmMessageContent::Text(text) = &msg.content {
+                json!(text)
+            } else {
+                json!(parts)
             };
 
             json!({

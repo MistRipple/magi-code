@@ -2,15 +2,12 @@
 //!
 //! 错误返回值使用 `Result<_, String>`，由上层调用方桥接到自己的错误类型。
 //!
-//! 协议判定的**唯一事实源**是归一化模型配置：
-//! - `urlMode = standard|proxy`：显式的 `/anthropic` 路径前缀优先识别为
-//!   Anthropic Messages；其余地址再按模型名识别协议。
-//! - `urlMode = full`：用户已经填写完整端点，按端点路径识别协议；`/v1/messages`
-//!   走 Anthropic Messages，其他走 OpenAI Chat Completions。
+//! 请求协议的**唯一事实源**是模型配置中的 `apiProtocol`。模型名称和 URL 只描述
+//! 模型身份与地址，不参与协议路由，避免同一聚合网关切换模型时改变请求结构。
 //!
-//! `provider` 字段不再参与路由决策，仅作为统计/展示标签，由上述推断同步派生。
-//! 配置输入不再接受 `provider` / `openaiProtocol` / `protocolEndpoint`，避免持久化
-//! 字段和推断结果形成双事实源。
+//! `provider` 字段不再参与路由决策，仅作为统计/展示标签，由 `apiProtocol` 派生。
+//! 配置输入不再接受 `provider` / `openaiProtocol` / `protocolEndpoint`，避免多个字段
+//! 同时表达协议。
 
 use magi_bridge_client::{
     HttpImageGenerationClient, HttpModelBridgeClient, HttpModelBridgeProtocol,
@@ -28,6 +25,36 @@ pub enum ModelUrlMode {
     Standard,
     Full,
     Proxy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelApiProtocol {
+    OpenAiChat,
+    AnthropicMessages,
+}
+
+impl ModelApiProtocol {
+    fn from_label(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "openai_chat" => Some(Self::OpenAiChat),
+            "anthropic_messages" => Some(Self::AnthropicMessages),
+            _ => None,
+        }
+    }
+
+    fn to_http_protocol(self) -> HttpModelBridgeProtocol {
+        match self {
+            Self::OpenAiChat => HttpModelBridgeProtocol::ChatCompletions,
+            Self::AnthropicMessages => HttpModelBridgeProtocol::AnthropicMessages,
+        }
+    }
+
+    fn provider(self) -> &'static str {
+        match self {
+            Self::OpenAiChat => "openai",
+            Self::AnthropicMessages => "anthropic",
+        }
+    }
 }
 
 impl ModelUrlMode {
@@ -83,6 +110,7 @@ pub struct NormalizedModelConfig {
     api_key: Option<String>,
     model: Option<String>,
     url_mode: ModelUrlMode,
+    api_protocol: ModelApiProtocol,
     reasoning_effort: Option<ModelReasoningEffort>,
 }
 
@@ -97,17 +125,31 @@ pub struct RoleEngineModelConfig {
 impl NormalizedModelConfig {
     /// 从 settings JSON 构造归一化模型配置。
     ///
-    /// provider 完全由归一化后的 `urlMode + baseUrl + model` 推断；配置输入只允许
-    /// 当前字段，废弃字段必须在保存前清理，否则这里直接拒绝。
+    /// `apiProtocol` 是请求协议唯一事实源。已配置的模型连接缺少该字段时直接拒绝，
+    /// 防止运行时重新根据模型名或地址猜测协议。完全空的 section 仅用于表达“未配置”，
+    /// 不会构造客户端。
     pub fn from_settings_value(value: &Value) -> Result<Self, String> {
         reject_deprecated_model_config_fields(value)?;
         let url_mode_label =
             string_field(value, "urlMode").unwrap_or_else(|| "standard".to_string());
+        let has_connection_fields = ["baseUrl", "apiKey", "model", "urlMode", "apiProtocol"]
+            .iter()
+            .any(|field| value.get(*field).is_some());
+        let api_protocol = match string_field(value, "apiProtocol") {
+            Some(label) => ModelApiProtocol::from_label(&label).ok_or_else(|| {
+                "apiProtocol 无效，必须是 openai_chat 或 anthropic_messages".to_string()
+            })?,
+            None if has_connection_fields => {
+                return Err("模型配置缺少 apiProtocol".to_string());
+            }
+            None => ModelApiProtocol::OpenAiChat,
+        };
         Ok(Self {
             base_url: string_field(value, "baseUrl"),
             api_key: string_field(value, "apiKey"),
             model: string_field(value, "model"),
             url_mode: ModelUrlMode::from_label(&url_mode_label),
+            api_protocol,
             reasoning_effort: value
                 .get("reasoningEffort")
                 .and_then(Value::as_str)
@@ -115,13 +157,9 @@ impl NormalizedModelConfig {
         })
     }
 
-    /// 推断出的 provider 标签，用于 usage authority 分组与展示。
-    /// 永远与 [`inferred_protocol`](Self::inferred_protocol) 同步。
+    /// 从显式协议派生的 provider 标签，用于 usage authority 分组与展示。
     pub fn provider(&self) -> &'static str {
-        match self.inferred_protocol() {
-            HttpModelBridgeProtocol::ChatCompletions => "openai",
-            HttpModelBridgeProtocol::AnthropicMessages => "anthropic",
-        }
+        self.api_protocol.provider()
     }
 
     pub fn provider_key(&self) -> &'static str {
@@ -152,40 +190,8 @@ impl NormalizedModelConfig {
         self
     }
 
-    pub fn inferred_protocol(&self) -> HttpModelBridgeProtocol {
-        self.inferred_protocol_for_model(self.model.as_deref())
-    }
-
-    /// 推断 HTTP 协议族。
-    ///
-    /// 显式 `/anthropic` 前缀或 `/messages` 端点优先决定 Anthropic 协议；
-    /// 普通 standard/proxy 网关根地址再按模型家族识别。full 模式必须尊重
-    /// 完整端点路径，避免把 OpenAI 兼容代理中的 Claude 模型误路由。
-    fn inferred_protocol_for_model(&self, model: Option<&str>) -> HttpModelBridgeProtocol {
-        let normalized = self
-            .base_url
-            .as_deref()
-            .map(|value| value.trim().trim_end_matches('/').to_ascii_lowercase())
-            .unwrap_or_default();
-
-        match self.url_mode {
-            ModelUrlMode::Full => {
-                if is_anthropic_endpoint(&normalized) {
-                    HttpModelBridgeProtocol::AnthropicMessages
-                } else {
-                    HttpModelBridgeProtocol::ChatCompletions
-                }
-            }
-            ModelUrlMode::Standard | ModelUrlMode::Proxy => match model {
-                _ if is_anthropic_endpoint(&normalized) => {
-                    HttpModelBridgeProtocol::AnthropicMessages
-                }
-                Some(model) if is_anthropic_model_name(model) => {
-                    HttpModelBridgeProtocol::AnthropicMessages
-                }
-                _ => HttpModelBridgeProtocol::ChatCompletions,
-            },
-        }
+    pub fn api_protocol(&self) -> HttpModelBridgeProtocol {
+        self.api_protocol.to_http_protocol()
     }
 
     pub fn to_http_model_client(&self) -> Option<HttpModelBridgeClient> {
@@ -194,12 +200,11 @@ impl NormalizedModelConfig {
         if model.is_empty() {
             return None;
         }
-        let protocol = self.inferred_protocol_for_model(Some(model));
         Some(HttpModelBridgeClient::new_with_protocol(
             base_url,
             self.api_key.clone(),
             model.to_string(),
-            protocol,
+            self.api_protocol(),
             self.reasoning_effort
                 .map(ModelReasoningEffort::to_usage_reasoning_effort),
         ))
@@ -274,7 +279,7 @@ pub fn reject_deprecated_model_config_fields(value: &Value) -> Result<(), String
     for field in DEPRECATED_MODEL_CONFIG_FIELDS {
         if object.contains_key(*field) {
             return Err(format!(
-                "模型配置字段 {field} 已废弃，请使用 baseUrl/apiKey/model/urlMode/reasoningEffort"
+                "模型配置字段 {field} 已废弃，请使用 baseUrl/apiKey/model/urlMode/apiProtocol/reasoningEffort"
             ));
         }
     }
@@ -492,14 +497,6 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn is_anthropic_model_name(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("claude")
-}
-
-fn is_anthropic_endpoint(normalized_base_url: &str) -> bool {
-    normalized_base_url.ends_with("/anthropic") || normalized_base_url.ends_with("/messages")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,133 +507,59 @@ mod tests {
     }
 
     #[test]
-    fn standard_mode_v1_suffix_infers_openai_chat() {
+    fn explicit_openai_protocol_is_independent_of_model_name_and_url() {
         let config = model_config(json!({
-            "baseUrl": "https://api.deepseek.com/v1",
+            "baseUrl": "https://gateway.example.com/anthropic",
             "apiKey": "sk-test",
-            "model": "deepseek-chat",
-            "urlMode": "standard"
+            "model": "claude-sonnet",
+            "urlMode": "standard",
+            "apiProtocol": "openai_chat"
         }));
         assert_eq!(
-            config.inferred_protocol(),
+            config.api_protocol(),
             HttpModelBridgeProtocol::ChatCompletions
         );
         assert_eq!(config.provider(), "openai");
     }
 
     #[test]
-    fn standard_mode_without_v1_suffix_uses_openai_chat() {
+    fn explicit_anthropic_protocol_is_independent_of_model_name_and_url() {
         let config = model_config(json!({
             "baseUrl": "https://gateway.example.com",
             "apiKey": "sk-test",
-            "model": "gateway-model",
-            "urlMode": "standard"
+            "model": "deepseek-chat",
+            "urlMode": "standard",
+            "apiProtocol": "anthropic_messages"
         }));
         assert_eq!(
-            config.inferred_protocol(),
-            HttpModelBridgeProtocol::ChatCompletions
+            config.api_protocol(),
+            HttpModelBridgeProtocol::AnthropicMessages
         );
-        assert_eq!(config.provider(), "openai");
+        assert_eq!(config.provider(), "anthropic");
     }
 
     #[test]
-    fn standard_mode_claude_model_infers_anthropic_messages() {
-        let config = model_config(json!({
+    fn configured_model_requires_explicit_api_protocol() {
+        let error = NormalizedModelConfig::from_settings_value(&json!({
             "baseUrl": "https://gateway.example.com",
             "apiKey": "sk-test",
             "model": "kiro-claude-sonnet-4-6",
             "urlMode": "standard"
-        }));
-        assert_eq!(
-            config.inferred_protocol(),
-            HttpModelBridgeProtocol::AnthropicMessages
-        );
-        assert_eq!(config.provider(), "anthropic");
+        }))
+        .expect_err("已配置连接不得缺少 apiProtocol");
+
+        assert!(error.contains("缺少 apiProtocol"));
     }
 
     #[test]
-    fn standard_mode_anthropic_prefix_overrides_non_claude_model_name() {
-        let config = model_config(json!({
-            "baseUrl": "https://api.deepseek.com/anthropic",
-            "apiKey": "sk-test",
-            "model": "deepseek-chat",
-            "urlMode": "standard"
-        }));
-        assert_eq!(
-            config.inferred_protocol(),
-            HttpModelBridgeProtocol::AnthropicMessages
-        );
-        assert_eq!(config.provider(), "anthropic");
-    }
+    fn invalid_api_protocol_is_rejected() {
+        let error = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": "https://gateway.example.com",
+            "apiProtocol": "auto"
+        }))
+        .expect_err("未知协议不得进入运行时");
 
-    #[test]
-    fn same_base_url_routes_by_model_family() {
-        let base = "https://gateway.example.com";
-        let claude_config = model_config(json!({
-            "baseUrl": base,
-            "apiKey": "sk-test",
-            "model": "claude-opus-4-5",
-            "urlMode": "standard"
-        }));
-        let gpt_config = model_config(json!({
-            "baseUrl": base,
-            "apiKey": "sk-test",
-            "model": "gpt-5",
-            "urlMode": "standard"
-        }));
-
-        assert_eq!(
-            claude_config.inferred_protocol(),
-            HttpModelBridgeProtocol::AnthropicMessages
-        );
-        assert_eq!(
-            gpt_config.inferred_protocol(),
-            HttpModelBridgeProtocol::ChatCompletions
-        );
-    }
-
-    #[test]
-    fn full_mode_messages_suffix_infers_anthropic() {
-        let config = model_config(json!({
-            "baseUrl": "https://proxy.example.com/v1/messages",
-            "apiKey": "sk-test",
-            "model": "claude-sonnet",
-            "urlMode": "full"
-        }));
-        assert_eq!(
-            config.inferred_protocol(),
-            HttpModelBridgeProtocol::AnthropicMessages
-        );
-        assert_eq!(config.provider(), "anthropic");
-    }
-
-    #[test]
-    fn full_mode_chat_completions_suffix_infers_openai() {
-        let config = model_config(json!({
-            "baseUrl": "https://proxy.example.com/v1/chat/completions",
-            "apiKey": "sk-test",
-            "model": "gpt-4",
-            "urlMode": "full"
-        }));
-        assert_eq!(
-            config.inferred_protocol(),
-            HttpModelBridgeProtocol::ChatCompletions
-        );
-        assert_eq!(config.provider(), "openai");
-    }
-
-    #[test]
-    fn trailing_slash_does_not_affect_v1_inference() {
-        let config = model_config(json!({
-            "baseUrl": "https://api.deepseek.com/v1/",
-            "apiKey": "sk-test",
-            "model": "deepseek-chat",
-            "urlMode": "standard"
-        }));
-        assert_eq!(
-            config.inferred_protocol(),
-            HttpModelBridgeProtocol::ChatCompletions
-        );
+        assert!(error.contains("apiProtocol 无效"));
     }
 
     #[test]
@@ -646,7 +569,8 @@ mod tests {
                 "baseUrl": "https://api.deepseek.com/v1",
                 "apiKey": "sk-test",
                 "model": "deepseek-chat",
-                "urlMode": "standard"
+                "urlMode": "standard",
+                "apiProtocol": "openai_chat"
             });
             config[field] = json!("deprecated");
 
@@ -661,7 +585,8 @@ mod tests {
         let config = model_config(json!({
             "baseUrl": "http://127.0.0.1:8320/v1",
             "apiKey": "test-key",
-            "urlMode": "standard"
+            "urlMode": "standard",
+            "apiProtocol": "openai_chat"
         }));
 
         assert_eq!(config.provider(), "openai");
@@ -684,12 +609,13 @@ mod tests {
         let config = model_config(json!({
             "baseUrl": "https://api.anthropic.com",
             "apiKey": "test-key",
-            "urlMode": "standard"
+            "urlMode": "standard",
+            "apiProtocol": "anthropic_messages"
         }));
 
         assert_eq!(
-            config.inferred_protocol(),
-            HttpModelBridgeProtocol::ChatCompletions
+            config.api_protocol(),
+            HttpModelBridgeProtocol::AnthropicMessages
         );
         config
             .require_models_listable()
@@ -705,7 +631,8 @@ mod tests {
         let config = model_config(json!({
             "baseUrl": "http://127.0.0.1:8320/v1/chat/completions",
             "apiKey": "test-key",
-            "urlMode": "full"
+            "urlMode": "full",
+            "apiProtocol": "openai_chat"
         }));
 
         let error = config
@@ -719,7 +646,8 @@ mod tests {
         let config = model_config(json!({
             "baseUrl": "https://example.test/v1",
             "model": "gpt-test",
-            "urlMode": "standard"
+            "urlMode": "standard",
+            "apiProtocol": "openai_chat"
         }));
 
         let usage = config.to_usage_llm_config().expect("usage config");
@@ -729,50 +657,53 @@ mod tests {
     }
 
     #[test]
-    fn http_client_uses_inferred_protocol() {
+    fn http_client_uses_explicit_openai_protocol() {
         let config = model_config(json!({
             "baseUrl": "https://api.deepseek.com/v1",
             "apiKey": "test-key",
             "model": "deepseek-chat",
-            "urlMode": "standard"
+            "urlMode": "standard",
+            "apiProtocol": "openai_chat"
         }));
 
         assert!(config.to_http_model_client().is_some());
         assert_eq!(
-            config.inferred_protocol(),
+            config.api_protocol(),
             HttpModelBridgeProtocol::ChatCompletions
         );
     }
 
     #[test]
-    fn http_client_uses_anthropic_for_standard_claude_model() {
+    fn http_client_uses_explicit_anthropic_protocol() {
         let config = model_config(json!({
             "baseUrl": "https://api.anthropic.com",
             "apiKey": "test-key",
             "model": "claude-sonnet",
-            "urlMode": "standard"
+            "urlMode": "standard",
+            "apiProtocol": "anthropic_messages"
         }));
 
         assert!(config.to_http_model_client().is_some());
         assert_eq!(
-            config.inferred_protocol(),
+            config.api_protocol(),
             HttpModelBridgeProtocol::AnthropicMessages
         );
     }
 
     #[test]
-    fn full_mode_path_overrides_claude_model_name() {
+    fn full_mode_does_not_override_explicit_protocol() {
         let config = model_config(json!({
             "baseUrl": "https://openai-compatible.example.com/v1/chat/completions",
             "apiKey": "test-key",
             "model": "claude-sonnet",
-            "urlMode": "full"
+            "urlMode": "full",
+            "apiProtocol": "anthropic_messages"
         }));
 
         assert!(config.to_http_model_client().is_some());
         assert_eq!(
-            config.inferred_protocol(),
-            HttpModelBridgeProtocol::ChatCompletions
+            config.api_protocol(),
+            HttpModelBridgeProtocol::AnthropicMessages
         );
     }
 
@@ -800,6 +731,7 @@ mod tests {
                         "apiKey": "sk-role",
                         "model": "role-sonnet",
                         "urlMode": "standard",
+                        "apiProtocol": "openai_chat",
                         "reasoningEffort": "high"
                     }
                 }]),
@@ -815,7 +747,7 @@ mod tests {
         assert_eq!(resolved.binding_revision, 7);
         assert_eq!(resolved.config.require_model().unwrap(), "role-sonnet");
         assert_eq!(
-            resolved.config.inferred_protocol(),
+            resolved.config.api_protocol(),
             HttpModelBridgeProtocol::ChatCompletions
         );
     }

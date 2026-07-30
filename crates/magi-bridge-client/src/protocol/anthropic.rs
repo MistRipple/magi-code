@@ -165,6 +165,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
+        let mut provider_context = Vec::new();
 
         for block in &content_blocks {
             match block["type"].as_str() {
@@ -177,6 +178,23 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
                     if let Some(thinking) = block["thinking"].as_str() {
                         thinking_parts.push(thinking.to_string());
                     }
+                    if block["signature"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty())
+                    {
+                        provider_context.push(crate::types::ModelProviderContext {
+                            provider: "anthropic".to_string(),
+                            kind: "thinking".to_string(),
+                            data: block.clone(),
+                        });
+                    }
+                }
+                Some("redacted_thinking") => {
+                    provider_context.push(crate::types::ModelProviderContext {
+                        provider: "anthropic".to_string(),
+                        kind: "redacted_thinking".to_string(),
+                        data: block.clone(),
+                    });
                 }
                 Some("tool_use") => {
                     if let (Some(id), Some(name)) = (block["id"].as_str(), block["name"].as_str()) {
@@ -210,6 +228,7 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
             usage,
             stop_reason,
             raw: Some(envelope),
+            provider_context,
         })
     }
 
@@ -416,6 +435,97 @@ mod tests {
             .expect("build");
         assert_eq!(adapted.body["thinking"]["type"], "adaptive");
         assert_eq!(adapted.body["output_config"]["effort"], "medium");
+    }
+
+    #[test]
+    fn tool_round_keeps_extended_thinking_enabled() {
+        let mut params = base_params(vec![LlmMessage {
+            role: "user".to_string(),
+            content: LlmMessageContent::Text("请查询后回答".to_string()),
+        }]);
+        params.reasoning_effort = Some(ReasoningEffort::High);
+        params.tools = Some(vec![crate::llm_types::ToolDefinition {
+            name: "search".to_string(),
+            description: "查询资料".to_string(),
+            input_schema: crate::llm_types::ToolInputSchema {
+                kind: "object".to_string(),
+                properties: json!({}),
+                required: None,
+            },
+            origin: crate::types::ChatToolOrigin::Builtin,
+        }]);
+
+        let adapted = AnthropicMessagesAdapter
+            .build_request(&params, "claude-opus-4-7-20260520")
+            .expect("build");
+
+        assert_eq!(adapted.body["thinking"]["type"], "adaptive");
+        assert_eq!(adapted.body["output_config"]["effort"], "high");
+        assert_eq!(adapted.body["temperature"], 1);
+        assert_eq!(adapted.body["tools"][0]["name"], "search");
+    }
+
+    #[test]
+    fn response_and_next_request_round_trip_signed_thinking_block() {
+        let response = AnthropicMessagesAdapter
+            .parse_response(
+                200,
+                &json!({
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "需要先查询",
+                            "signature": "signed-context"
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "tool-1",
+                            "name": "search",
+                            "input": {"query": "Magi"}
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 10, "output_tokens": 5}
+                })
+                .to_string(),
+            )
+            .expect("response should parse");
+
+        assert_eq!(response.provider_context.len(), 1);
+        assert_eq!(
+            response.provider_context[0].data["signature"],
+            "signed-context"
+        );
+
+        let params = base_params(vec![LlmMessage {
+            role: "assistant".to_string(),
+            content: LlmMessageContent::Blocks(vec![
+                crate::llm_types::LlmContentBlock::ProviderContext {
+                    context: response.provider_context[0].clone(),
+                },
+                crate::llm_types::LlmContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "search".to_string(),
+                    input: json!({"query": "Magi"}),
+                },
+            ]),
+        }]);
+        let request = AnthropicMessagesAdapter
+            .build_request(&params, "claude-opus-4-7-20260520")
+            .expect("request should build");
+
+        assert_eq!(
+            request.body["messages"][0]["content"][0]["type"],
+            "thinking"
+        );
+        assert_eq!(
+            request.body["messages"][0]["content"][0]["signature"],
+            "signed-context"
+        );
+        assert_eq!(
+            request.body["messages"][0]["content"][1]["type"],
+            "tool_use"
+        );
     }
 
     #[test]

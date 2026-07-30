@@ -120,6 +120,11 @@ pub enum LlmContentBlock {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageSource>,
     },
+    /// 提供方私有响应项。仅对应协议适配器可以还原该 wire block。
+    #[serde(rename = "provider_context")]
+    ProviderContext {
+        context: crate::types::ModelProviderContext,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -305,6 +310,8 @@ pub struct LlmResponse {
     pub tool_calls: Vec<ToolCall>,
     pub usage: LlmUsage,
     pub stop_reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_context: Vec<crate::types::ModelProviderContext>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

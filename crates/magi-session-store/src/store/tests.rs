@@ -5,7 +5,7 @@ use crate::models::{
     ExecutionThreadStatus, GoalStatus, NotificationRecord, NotificationScope, SessionDurableState,
     SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionPlan,
     SessionSidecarFlushReason, SessionStoreState, ThreadChatMessage, ThreadChatToolCall,
-    ThreadChatToolFunction,
+    ThreadChatToolFunction, ThreadModelProviderContext,
 };
 use magi_core::{
     AccessProfile, ExecutionOwnership, MissionId, PlanId, PlanItem, PlanItemId, PlanItemStatus,
@@ -3269,6 +3269,15 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
                     },
                 }],
                 tool_call_id: None,
+                provider_context: vec![ThreadModelProviderContext {
+                    provider: "anthropic".to_string(),
+                    kind: "thinking".to_string(),
+                    data: json!({
+                        "type": "thinking",
+                        "thinking": "检查测试命令",
+                        "signature": "persisted-signature"
+                    }),
+                }],
             },
             ThreadChatMessage {
                 role: "tool".to_string(),
@@ -3276,6 +3285,7 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
                 images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call-shell-round-trip".to_string()),
+                provider_context: Vec::new(),
             },
             ThreadChatMessage {
                 role: "user".to_string(),
@@ -3283,6 +3293,7 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
                 images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                provider_context: Vec::new(),
             },
         ],
         UtcMillis(2_000),
@@ -3303,6 +3314,10 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
     assert_eq!(history.len(), 3);
     assert_eq!(history[0].role, "assistant");
     assert_eq!(history[0].tool_calls[0].function.name, "shell_exec");
+    assert_eq!(
+        history[0].provider_context[0].data["signature"],
+        "persisted-signature"
+    );
     assert_eq!(
         history[1].content.as_deref(),
         Some("exit code 1: compilation failed")

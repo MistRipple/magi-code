@@ -52,13 +52,14 @@ export interface TokenUsage {
 /**
  * LLM 基础配置
  *
- * 注意：urlMode 只表达路径形态，不直接表达模型协议：
- *   - urlMode=standard → 按模型名识别协议；Claude 家族走 Anthropic Messages，其余走 OpenAI Chat
- *   - urlMode=full → 用户填写完整端点，按端点路径识别协议
+ * `urlMode` 只表达路径形态；`apiProtocol` 是请求协议的唯一事实源。
  */
+export type ModelApiProtocol = 'openai_chat' | 'anthropic_messages';
+
 export interface LLMConfig {
   baseUrl: string;
   urlMode: UrlMode;
+  apiProtocol: ModelApiProtocol;
   apiKey: string;
   model: string;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';

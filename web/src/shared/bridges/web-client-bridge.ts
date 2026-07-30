@@ -3115,13 +3115,18 @@ async function switchSession(
 }
 
 async function deleteSession(sessionId: string, scope: BridgeRequestScope = {}): Promise<void> {
-  const payload = await deleteAgentSession(sessionId, scope);
-  // 不传 sessionId 提示——它指向已被删除的会话，归一化器会用它去新列表 find()
-  // 找不到然后把 currentSessionId 错误地清空。让 bootstrap 自带的 currentSession 当真值：
-  // 删的是当前会话 → 后端 currentSession 为空，前端也清空；
-  // 删的不是当前会话 → 后端 currentSession 仍是原会话，前端继续保持激活。
-  await dispatchBootstrap(normalizeBootstrapResponse(payload), { rawPayload: payload });
-  emitBridgeSuccessToast(i18n.t('bridge.action.deleteSession'), i18n.t('toast.sessionDeleted'));
+  messagesState.sessionHydrating = true;
+  try {
+    const payload = await deleteAgentSession(sessionId, scope);
+    // 不传 sessionId 提示——它指向已被删除的会话，归一化器会用它去新列表 find()
+    // 找不到然后把 currentSessionId 错误地清空。让 bootstrap 自带的 currentSession 当真值：
+    // 删的是当前会话 → 后端 currentSession 为空，前端也清空；
+    // 删的不是当前会话 → 后端 currentSession 仍是原会话，前端继续保持激活。
+    await dispatchBootstrap(normalizeBootstrapResponse(payload), { rawPayload: payload });
+    emitBridgeSuccessToast(i18n.t('bridge.action.deleteSession'), i18n.t('toast.sessionDeleted'));
+  } finally {
+    messagesState.sessionHydrating = false;
+  }
 }
 
 async function renameSession(

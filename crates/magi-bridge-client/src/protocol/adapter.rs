@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::llm_types::{LlmMessageParams, LlmResponse, LlmUsage};
+use crate::types::{ChatCompletionPayload, ChatToolCall, ChatToolFunction, ModelResponse};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +26,7 @@ pub struct AdaptedResponse {
     pub usage: LlmUsage,
     pub stop_reason: String,
     pub raw: Option<Value>,
+    pub provider_context: Vec<crate::types::ModelProviderContext>,
 }
 
 impl From<AdaptedResponse> for LlmResponse {
@@ -35,7 +37,36 @@ impl From<AdaptedResponse> for LlmResponse {
             tool_calls: r.tool_calls,
             usage: r.usage,
             stop_reason: r.stop_reason,
+            provider_context: r.provider_context,
         }
+    }
+}
+
+impl From<AdaptedResponse> for ModelResponse {
+    fn from(response: AdaptedResponse) -> Self {
+        let tool_calls = response
+            .tool_calls
+            .into_iter()
+            .map(|tool_call| ChatToolCall {
+                id: tool_call.id,
+                kind: "function".to_string(),
+                function: ChatToolFunction {
+                    name: tool_call.name,
+                    arguments: tool_call
+                        .raw_arguments
+                        .unwrap_or_else(|| tool_call.arguments.to_string()),
+                },
+            })
+            .collect();
+
+        Self::from_chat_payload(ChatCompletionPayload {
+            content: (!response.content.is_empty()).then_some(response.content),
+            thinking: response.thinking,
+            finish_reason: Some(response.stop_reason),
+            usage: serde_json::to_value(response.usage).ok(),
+            tool_calls,
+            provider_context: response.provider_context,
+        })
     }
 }
 

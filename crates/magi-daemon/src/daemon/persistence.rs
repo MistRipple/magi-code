@@ -484,6 +484,7 @@ mod tests {
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: Some("call-persisted".to_string()),
+                    provider_context: Vec::new(),
                 }],
             }],
         };

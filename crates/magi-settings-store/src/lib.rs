@@ -350,7 +350,7 @@ fn canonicalize_settings_section_value(section: &str, value: &mut Value) -> bool
         || section == "imageGeneration"
         || (is_session_section_key(section) && section.ends_with(":auxiliary"))
     {
-        return remove_deprecated_model_fields(value);
+        return canonicalize_model_config(value);
     }
     match section {
         "workers" => normalize_workers_section(value),
@@ -360,12 +360,12 @@ fn canonicalize_settings_section_value(section: &str, value: &mut Value) -> bool
 }
 
 fn canonicalize_global_orchestrator_section(value: &mut Value) -> bool {
-    let mut changed = remove_deprecated_model_fields(value);
     let Some(object) = value.as_object_mut() else {
-        return changed;
+        return false;
     };
-    changed |= object.remove("model").is_some();
+    let mut changed = object.remove("model").is_some();
     changed |= object.remove("reasoningEffort").is_some();
+    changed |= canonicalize_model_config(value);
     changed
 }
 
@@ -393,7 +393,7 @@ fn normalize_workers_section(value: &mut Value) -> bool {
     };
     let mut changed = false;
     for config in workers.values_mut() {
-        changed |= remove_deprecated_model_fields(config);
+        changed |= canonicalize_model_config(config);
     }
     changed
 }
@@ -405,10 +405,62 @@ fn normalize_engines_section(value: &mut Value) -> bool {
     let mut changed = false;
     for engine in engines {
         if let Some(llm) = engine.get_mut("llm") {
-            changed |= remove_deprecated_model_fields(llm);
+            changed |= canonicalize_model_config(llm);
         }
     }
     changed
+}
+
+fn canonicalize_model_config(value: &mut Value) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    let has_connection_fields = [
+        "baseUrl",
+        "apiKey",
+        "model",
+        "urlMode",
+        "provider",
+        "openaiProtocol",
+        "protocolEndpoint",
+    ]
+    .iter()
+    .any(|field| object.contains_key(*field));
+    if has_connection_fields && !object.contains_key("apiProtocol") {
+        let legacy_provider_is_anthropic = object
+            .get("provider")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("anthropic"));
+        let endpoint_is_anthropic = object
+            .get("baseUrl")
+            .and_then(Value::as_str)
+            .is_some_and(is_explicit_anthropic_endpoint)
+            || object
+                .get("protocolEndpoint")
+                .and_then(Value::as_str)
+                .is_some_and(is_explicit_anthropic_endpoint);
+        object.insert(
+            "apiProtocol".to_string(),
+            Value::String(
+                if legacy_provider_is_anthropic || endpoint_is_anthropic {
+                    "anthropic_messages"
+                } else {
+                    "openai_chat"
+                }
+                .to_string(),
+            ),
+        );
+        changed = true;
+    }
+    changed | remove_deprecated_model_fields(value)
+}
+
+fn is_explicit_anthropic_endpoint(value: &str) -> bool {
+    let normalized = value.trim().trim_end_matches('/').to_ascii_lowercase();
+    normalized.contains("api.anthropic.com")
+        || normalized.ends_with("/anthropic")
+        || normalized.ends_with("/messages")
 }
 
 fn remove_deprecated_model_fields(value: &mut Value) -> bool {
@@ -579,12 +631,14 @@ mod tests {
             snapshot.get_section("orchestrator"),
             json!({
                 "baseUrl": "https://old.example.com/v1",
+                "apiProtocol": "openai_chat",
             })
         );
         assert_eq!(
             store.get_section("orchestrator"),
             json!({
                 "baseUrl": "https://new.example.com/v1",
+                "apiProtocol": "openai_chat",
             })
         );
     }
@@ -671,6 +725,10 @@ mod tests {
         store.load_from_disk().unwrap();
 
         assert!(store.get_section("orchestrator").get("provider").is_none());
+        assert_eq!(
+            store.get_section("orchestrator")["apiProtocol"],
+            json!("anthropic_messages")
+        );
         assert!(
             store
                 .get_section("orchestrator")
@@ -682,10 +740,18 @@ mod tests {
                 .get("provider")
                 .is_none()
         );
+        assert_eq!(
+            store.get_section("workers")["reviewer"]["apiProtocol"],
+            json!("openai_chat")
+        );
         assert!(
             store.get_section("engines")[0]["llm"]
                 .get("provider")
                 .is_none()
+        );
+        assert_eq!(
+            store.get_section("engines")[0]["llm"]["apiProtocol"],
+            json!("openai_chat")
         );
         assert_eq!(store.get_section("orchestratorConfig"), Value::Null);
         assert_eq!(store.get_section("workerConfigs"), Value::Null);
@@ -702,6 +768,10 @@ mod tests {
                 .unwrap()
                 .get("provider")
                 .is_none()
+        );
+        assert_eq!(
+            persisted["orchestrator"]["apiProtocol"],
+            json!("anthropic_messages")
         );
         assert!(
             persisted["orchestrator"]
@@ -794,7 +864,23 @@ mod tests {
         let engines = engines.as_array().expect("engines should be array");
         assert_eq!(engines.len(), 1);
         assert_eq!(engines[0]["llm"]["model"], json!("current-worker"));
+        assert_eq!(engines[0]["llm"]["apiProtocol"], json!("openai_chat"));
         assert!(engines[0]["llm"].get("provider").is_none());
+    }
+
+    #[test]
+    fn migration_does_not_infer_protocol_from_model_name() {
+        let mut sections = HashMap::from([(
+            "auxiliary".to_string(),
+            json!({
+                "baseUrl": "https://gateway.example.com/v1",
+                "model": "claude-sonnet",
+                "urlMode": "standard"
+            }),
+        )]);
+
+        assert!(canonicalize_settings_sections(&mut sections));
+        assert_eq!(sections["auxiliary"]["apiProtocol"], json!("openai_chat"));
     }
 
     #[test]

@@ -280,7 +280,7 @@ fn bridge_response_output(
     input: &ToolExecutionInput,
     output: &BridgeDispatchResult,
 ) -> ToolExecutionOutput {
-    let status = if output.response.ok {
+    let status = if output.response.is_success() {
         ExecutionResultStatus::Succeeded
     } else {
         ExecutionResultStatus::Failed
@@ -288,8 +288,8 @@ fn bridge_response_output(
     ToolExecutionOutput {
         tool_call_id: input.tool_call_id.clone(),
         status,
-        payload: if output.response.ok {
-            output.response.payload.clone()
+        payload: if output.response.is_success() {
+            output.response.payload().to_string()
         } else {
             tracing::warn!(
                 tool_name = %input.tool_name,

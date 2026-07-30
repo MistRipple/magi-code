@@ -664,6 +664,7 @@ mod tests {
                 images: Vec::new(),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                provider_context: Vec::new(),
             }],
         });
 

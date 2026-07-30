@@ -118,6 +118,7 @@ pub(crate) fn chat_messages_from_llm_message(message: &LlmMessage) -> Vec<ChatMe
             images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            provider_context: Vec::new(),
         }],
         LlmMessageContent::Blocks(blocks) => {
             chat_messages_from_content_blocks(&message.role, blocks)
@@ -130,6 +131,7 @@ fn chat_messages_from_content_blocks(role: &str, blocks: &[LlmContentBlock]) -> 
     let mut images = Vec::new();
     let mut tool_calls = Vec::new();
     let mut tool_results = Vec::new();
+    let mut provider_context = Vec::new();
 
     for block in blocks {
         match block {
@@ -161,7 +163,11 @@ fn chat_messages_from_content_blocks(role: &str, blocks: &[LlmContentBlock]) -> 
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: Some(tool_use_id.clone()),
+                    provider_context: Vec::new(),
                 });
+            }
+            LlmContentBlock::ProviderContext { context } => {
+                provider_context.push(context.clone());
             }
             LlmContentBlock::Text { .. } => {}
         }
@@ -181,6 +187,7 @@ fn chat_messages_from_content_blocks(role: &str, blocks: &[LlmContentBlock]) -> 
         images,
         tool_calls,
         tool_call_id: None,
+        provider_context,
     }]
 }
 
@@ -260,13 +267,12 @@ impl BaseAdapter {
             tool_choice: None,
         };
 
-        let bridge_response = self.model_client.invoke(request)?;
-        let payload = bridge_response.parse_chat_payload();
+        let response = self.model_client.invoke(request)?;
 
         Ok(LlmResponse {
-            content: payload.content.unwrap_or_default(),
-            thinking: payload.thinking,
-            tool_calls: payload
+            content: response.content.unwrap_or_default(),
+            thinking: response.thinking,
+            tool_calls: response
                 .tool_calls
                 .into_iter()
                 .map(|tc| {
@@ -281,8 +287,12 @@ impl BaseAdapter {
                     }
                 })
                 .collect(),
-            usage: LlmUsage::default(),
-            stop_reason: payload.finish_reason.unwrap_or_else(|| "stop".to_string()),
+            usage: response
+                .usage
+                .and_then(|usage| serde_json::from_value(usage).ok())
+                .unwrap_or_default(),
+            stop_reason: response.finish_reason.unwrap_or_else(|| "stop".to_string()),
+            provider_context: response.provider_context,
         })
     }
 
@@ -307,6 +317,7 @@ impl BaseAdapter {
                         tool_calls: Vec::new(),
                         usage: LlmUsage::default(),
                         stop_reason: "max_rounds".to_string(),
+                        provider_context: Vec::new(),
                     });
                 return Ok((last_response, rounds));
             }
@@ -327,7 +338,12 @@ impl BaseAdapter {
             }
 
             let assistant_blocks: Vec<LlmContentBlock> = {
-                let mut blocks = Vec::new();
+                let mut blocks = response
+                    .provider_context
+                    .iter()
+                    .cloned()
+                    .map(|context| LlmContentBlock::ProviderContext { context })
+                    .collect::<Vec<_>>();
                 if !response.content.is_empty() {
                     blocks.push(LlmContentBlock::Text {
                         text: response.content.clone(),

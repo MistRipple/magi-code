@@ -14,6 +14,7 @@ pub use models::{
     SessionProjectionInput, SessionRecord, SessionRuntimeSidecar, SessionRuntimeSidecarExport,
     SessionSidecarFlushMetadata, SessionSidecarFlushReason, SessionStoreState,
     ThreadChatImageSource, ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
-    ThreadVisibility, TimelineEntry, TimelineEntryKind, timeline_entry_visible_text,
+    ThreadModelProviderContext, ThreadVisibility, TimelineEntry, TimelineEntryKind,
+    timeline_entry_visible_text,
 };
 pub use store::{ORCHESTRATOR_ROLE_ID, SESSION_TITLE_MAX_CHARS, SessionStore, TimelineEntryInput};

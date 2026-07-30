@@ -3,7 +3,7 @@ use magi_bridge_client::{
     JsonRpcBridgeServerProbeClient, JsonRpcMcpBridgeClient, JsonRpcMcpManagerClient,
     JsonRpcModelBridgeClient, LOOPBACK_MCP_SERVER_NAME, LOOPBACK_MCP_TOOL_NAME,
     LOOPBACK_MODEL_PROVIDER, McpBridgeClient, McpToolCallRequest, ModelBridgeClient,
-    ModelInvocationRequest,
+    ModelInvocationRequest, ModelResponse,
 };
 use std::sync::Arc;
 
@@ -62,7 +62,7 @@ fn capture_model_preflight_checks(
 ) -> Vec<BridgePreflightCheckDto> {
     let probe = JsonRpcBridgeServerProbeClient::new(transport.clone());
     let client = JsonRpcModelBridgeClient::new(transport);
-    let mut checks = vec![bridge_response_check(
+    let mut checks = vec![model_response_check(
         "invoke",
         LOOPBACK_MODEL_PROVIDER,
         client.invoke(ModelInvocationRequest {
@@ -80,7 +80,7 @@ fn capture_model_preflight_checks(
                 && service.service_health.as_deref() == Some("ready")
         })
     {
-        checks.push(bridge_response_check(
+        checks.push(model_response_check(
             "invoke",
             "openai-compatible",
             client.invoke(ModelInvocationRequest {
@@ -94,6 +94,33 @@ fn capture_model_preflight_checks(
     }
 
     checks
+}
+
+fn model_response_check(
+    check_name: impl Into<String>,
+    target: impl Into<String>,
+    result: Result<ModelResponse, BridgeClientError>,
+) -> BridgePreflightCheckDto {
+    match result {
+        Ok(response) => {
+            let ok = response.is_actionable();
+            let response_json = serde_json::to_string(&response).unwrap_or_default();
+            BridgePreflightCheckDto {
+                check_name: check_name.into(),
+                target: target.into(),
+                ok,
+                response_excerpt: Some(excerpt(&response_json)),
+                error: None,
+            }
+        }
+        Err(error) => BridgePreflightCheckDto {
+            check_name: check_name.into(),
+            target: target.into(),
+            ok: false,
+            response_excerpt: None,
+            error: Some(BridgeProbeErrorDto::from_client_error(error)),
+        },
+    }
 }
 
 fn capture_mcp_preflight_checks(

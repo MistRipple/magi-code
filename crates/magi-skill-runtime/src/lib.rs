@@ -600,19 +600,19 @@ mod tests {
         fn invoke(
             &self,
             request: magi_bridge_client::ModelInvocationRequest,
-        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError>
         {
-            Ok(magi_bridge_client::BridgeResponse {
-                ok: true,
-                payload: format!("model:{}", request.prompt),
-            })
+            Ok(magi_bridge_client::ModelResponse::completed(format!(
+                "model:{}",
+                request.prompt
+            )))
         }
 
         fn invoke_streaming(
             &self,
             request: magi_bridge_client::ModelInvocationRequest,
             _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
-        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError>
         {
             self.invoke(request)
         }
@@ -633,7 +633,7 @@ mod tests {
         fn invoke(
             &self,
             _request: magi_bridge_client::ModelInvocationRequest,
-        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError>
         {
             Err(magi_bridge_client::BridgeClientError::CallFailed {
                 layer: magi_bridge_client::BridgeErrorLayer::RemoteBusiness,
@@ -646,7 +646,7 @@ mod tests {
             &self,
             request: magi_bridge_client::ModelInvocationRequest,
             _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
-        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError>
         {
             self.invoke(request)
         }
@@ -656,11 +656,12 @@ mod tests {
         fn invoke(
             &self,
             _request: magi_bridge_client::ModelInvocationRequest,
-        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError>
         {
-            Ok(magi_bridge_client::BridgeResponse {
-                ok: false,
-                payload: "remote business detail: secret-token".to_string(),
+            Err(magi_bridge_client::BridgeClientError::CallFailed {
+                layer: magi_bridge_client::BridgeErrorLayer::RemoteBusiness,
+                code: Some(-32006),
+                message: "remote business detail: secret-token".to_string(),
             })
         }
 
@@ -668,7 +669,7 @@ mod tests {
             &self,
             request: magi_bridge_client::ModelInvocationRequest,
             _on_delta: &dyn Fn(&magi_bridge_client::ModelStreamingDelta),
-        ) -> Result<magi_bridge_client::BridgeResponse, magi_bridge_client::BridgeClientError>
+        ) -> Result<magi_bridge_client::ModelResponse, magi_bridge_client::BridgeClientError>
         {
             self.invoke(request)
         }
@@ -959,7 +960,7 @@ mod tests {
         assert!(matches!(
             outcome.result,
             Ok(SkillDispatchResult::Bridge { ref output })
-                if output.response.ok && output.response.payload == "model:hello"
+                if output.response.is_success() && output.response.payload() == "model:hello"
         ));
     }
 
@@ -1183,7 +1184,7 @@ mod tests {
         assert_eq!(outcome.observation.status, SkillDispatchStatus::Succeeded);
         assert!(matches!(
             outcome.result,
-            Ok(SkillDispatchResult::Bridge { ref output }) if output.response.ok
+            Ok(SkillDispatchResult::Bridge { ref output }) if output.response.is_success()
         ));
         assert_eq!(calls.lock().expect("mcp calls lock").len(), 1);
         let invocations = tool_registry.invocations();
@@ -1368,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_ok_false_records_public_failure_payload() {
+    fn bridge_business_failure_records_public_failure_payload() {
         let governance = Arc::new(GovernanceService::default());
         let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
         let tool_registry = ToolRegistry::new(governance, event_bus);
@@ -1417,14 +1418,11 @@ mod tests {
         );
 
         assert_eq!(outcome.observation.status, SkillDispatchStatus::Failed);
-        assert!(matches!(
-            outcome.result,
-            Ok(SkillDispatchResult::Bridge { ref output }) if !output.response.ok
-        ));
+        assert!(matches!(outcome.result, Err(SkillDispatchError::Bridge(_))));
         let invocations = tool_registry.invocations();
         assert_eq!(invocations.len(), 1);
-        let payload: serde_json::Value =
-            serde_json::from_str(&invocations[0].payload).expect("bridge ok=false payload json");
+        let payload: serde_json::Value = serde_json::from_str(&invocations[0].payload)
+            .expect("bridge business failure payload json");
         assert_eq!(payload["status"], "failed");
         assert_eq!(payload["error_code"], "external_tool_remote_failed");
         assert_eq!(

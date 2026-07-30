@@ -5,6 +5,7 @@ import { deriveProcessingStateFromCanonicalTurns } from '../protocol/canonical-p
 import { deriveHasUnreadCompletion } from '../../lib/session-activity-indicator';
 import { parseModelFailureDiagnostic } from '../../lib/model-failure';
 import { parseToolCallFailureDiagnostic } from '../../lib/tool-call-failure';
+import { mergeRuntimeTimelineEntries } from '../../lib/runtime-timeline';
 import type {
   AppState,
   OrchestrationRuntimeAssignmentSummary,
@@ -1197,23 +1198,11 @@ function deriveRecentTimeline(
       } satisfies OrchestrationRuntimeTimelineEntry;
     });
 
-  const entries = [
-    ...eventEntries,
-    ...deriveCanonicalFailureTimeline(canonicalTurns, sessionId),
-    ...deriveTaskFailureTimeline(taskEntries, activeSession),
-  ].sort(compareTimelineLatestFirst);
-
-  const seen = new Set<string>();
-  return entries
-    .filter((entry) => {
-      const key = runtimeTimelineDedupKey(entry);
-      if (seen.has(key)) {
-        return false;
-      }
-      seen.add(key);
-      return true;
-    })
-    .slice(0, 8);
+  return mergeRuntimeTimelineEntries(
+    eventEntries,
+    deriveCanonicalFailureTimeline(canonicalTurns, sessionId),
+    deriveTaskFailureTimeline(taskEntries, activeSession),
+  );
 }
 
 function deriveCanonicalFailureTimeline(
@@ -1325,32 +1314,6 @@ function runtimeDetailWithCode(code: string, detail: string): string {
   return detail.toLowerCase().startsWith(`${code.toLowerCase()}:`)
     ? detail
     : `${code}: ${detail}`;
-}
-
-function compareTimelineLatestFirst(
-  left: OrchestrationRuntimeTimelineEntry,
-  right: OrchestrationRuntimeTimelineEntry,
-): number {
-  return right.timestamp - left.timestamp
-    || right.seq - left.seq
-    || right.eventId.localeCompare(left.eventId);
-}
-
-function runtimeTimelineDedupKey(entry: OrchestrationRuntimeTimelineEntry): string {
-  const detail = normalizeTimelineDetailKey(entry.detail);
-  if (detail) {
-    return `detail:${detail}`;
-  }
-  return [entry.kind || 'progress', entry.type, entry.summary]
-    .map((value) => normalizeString(value).toLowerCase().replace(/\s+/g, ' '))
-    .join('|');
-}
-
-function normalizeTimelineDetailKey(value: string | undefined): string {
-  return normalizeString(value)
-    .replace(/^[a-z][a-z0-9_.-]{2,80}:\s+/i, '')
-    .toLowerCase()
-    .replace(/\s+/g, ' ');
 }
 
 function isProductRuntimeEvent(event: RustEventEnvelope): boolean {

@@ -71,9 +71,15 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ChatToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// assistant 响应携带的提供方私有上下文。
+    ///
+    /// 该上下文属于整条 assistant message，而不是某个工具调用。运行时只负责
+    /// 持久化，协议适配器负责校验并按原协议回放。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_context: Vec<ModelProviderContext>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ChatToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -81,7 +87,7 @@ pub struct ChatToolCall {
     pub function: ChatToolFunction,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ChatToolFunction {
     pub name: String,
     pub arguments: String,
@@ -121,7 +127,7 @@ pub struct ChatToolFunctionDefinition {
     pub parameters: serde_json::Value,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ChatCompletionPayload {
     #[serde(default)]
     pub content: Option<String>,
@@ -129,6 +135,7 @@ pub struct ChatCompletionPayload {
         default,
         rename = "reasoning_content",
         alias = "thinking",
+        alias = "reasoning",
         skip_serializing_if = "Option::is_none"
     )]
     pub thinking: Option<String>,
@@ -138,6 +145,150 @@ pub struct ChatCompletionPayload {
     pub usage: Option<Value>,
     #[serde(default)]
     pub tool_calls: Vec<ChatToolCall>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_context: Vec<ModelProviderContext>,
+}
+
+/// 提供方私有但必须跨轮回放的模型上下文。
+///
+/// `data` 保存已经由协议适配器校验过的完整 wire block；业务运行时只负责持久化，
+/// 不解释其中字段。重新请求时由同一提供方适配器决定是否以及如何回放。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProviderContext {
+    pub provider: String,
+    pub kind: String,
+    pub data: Value,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelResponseStatus {
+    Completed,
+    RequiresToolExecution,
+    Incomplete,
+}
+
+/// 所有模型协议在 bridge 边界归一化后的唯一响应结构。
+///
+/// 会话、辅助模型和产品展示层只能消费该结构，不再解析提供方 JSON 字符串。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelResponse {
+    pub status: ModelResponseStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ChatToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_context: Vec<ModelProviderContext>,
+}
+
+impl ModelResponse {
+    pub fn completed(content: impl Into<String>) -> Self {
+        Self {
+            status: ModelResponseStatus::Completed,
+            content: Some(content.into()),
+            thinking: None,
+            tool_calls: Vec::new(),
+            usage: None,
+            finish_reason: Some("stop".to_string()),
+            provider_context: Vec::new(),
+        }
+    }
+
+    pub fn from_chat_payload(payload: ChatCompletionPayload) -> Self {
+        let status = model_response_status(payload.finish_reason.as_deref(), &payload.tool_calls);
+        Self {
+            status,
+            content: payload.content,
+            thinking: payload.thinking,
+            tool_calls: payload.tool_calls,
+            usage: payload.usage,
+            finish_reason: payload.finish_reason,
+            provider_context: payload.provider_context,
+        }
+    }
+
+    pub fn is_actionable(&self) -> bool {
+        self.content
+            .as_deref()
+            .is_some_and(|content| !content.trim().is_empty())
+            || !self.tool_calls.is_empty()
+    }
+}
+
+fn model_response_status(
+    finish_reason: Option<&str>,
+    tool_calls: &[ChatToolCall],
+) -> ModelResponseStatus {
+    let normalized_finish_reason = finish_reason.map(|reason| reason.trim().to_ascii_lowercase());
+    let finish_reason = normalized_finish_reason.as_deref();
+    if !tool_calls.is_empty()
+        || matches!(
+            finish_reason,
+            Some("tool_calls" | "tool_use" | "function_call")
+        )
+    {
+        return ModelResponseStatus::RequiresToolExecution;
+    }
+    if matches!(
+        finish_reason,
+        Some(
+            "length"
+                | "max_tokens"
+                | "max_output_tokens"
+                | "content_filter"
+                | "safety"
+                | "blocked"
+                | "recitation"
+                | "error"
+                | "cancelled"
+                | "canceled"
+        )
+    ) {
+        return ModelResponseStatus::Incomplete;
+    }
+    ModelResponseStatus::Completed
+}
+
+#[cfg(test)]
+mod model_response_tests {
+    use super::*;
+
+    #[test]
+    fn response_status_normalizes_cross_provider_finish_reasons() {
+        for reason in [
+            "length",
+            "MAX_TOKENS",
+            "max_output_tokens",
+            "content_filter",
+            "SAFETY",
+            "RECITATION",
+            "error",
+            "cancelled",
+        ] {
+            assert_eq!(
+                model_response_status(Some(reason), &[]),
+                ModelResponseStatus::Incomplete,
+                "finish_reason={reason}"
+            );
+        }
+        assert_eq!(
+            model_response_status(Some("TOOL_USE"), &[]),
+            ModelResponseStatus::RequiresToolExecution
+        );
+        assert_eq!(
+            model_response_status(Some("STOP"), &[]),
+            ModelResponseStatus::Completed
+        );
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -279,27 +430,36 @@ pub struct BridgeDispatchResult {
     pub binding_id: String,
     pub bridge_kind: BridgeBindingKind,
     pub dispatch_action: BridgeDispatchAction,
-    pub response: BridgeResponse,
+    pub response: BridgeDispatchResponse,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "response")]
+pub enum BridgeDispatchResponse {
+    Model(ModelResponse),
+    Mcp(BridgeResponse),
+}
+
+impl BridgeDispatchResponse {
+    pub fn is_success(&self) -> bool {
+        match self {
+            Self::Model(_) => true,
+            Self::Mcp(response) => response.ok,
+        }
+    }
+
+    pub fn payload(&self) -> &str {
+        match self {
+            Self::Model(response) => response.content.as_deref().unwrap_or_default(),
+            Self::Mcp(response) => &response.payload,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BridgeResponse {
     pub ok: bool,
     pub payload: String,
-}
-
-impl BridgeResponse {
-    pub fn parse_chat_payload(&self) -> ChatCompletionPayload {
-        serde_json::from_str::<ChatCompletionPayload>(&self.payload).unwrap_or(
-            ChatCompletionPayload {
-                content: Some(self.payload.clone()),
-                thinking: None,
-                finish_reason: None,
-                usage: None,
-                tool_calls: Vec::new(),
-            },
-        )
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -426,13 +586,13 @@ pub trait BridgeTransport: Send + Sync {
 }
 
 pub trait ModelBridgeClient: Send + Sync {
-    fn invoke(&self, request: ModelInvocationRequest) -> Result<BridgeResponse, BridgeClientError>;
+    fn invoke(&self, request: ModelInvocationRequest) -> Result<ModelResponse, BridgeClientError>;
 
     fn invoke_with_cancellation(
         &self,
         request: ModelInvocationRequest,
         is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<BridgeResponse, BridgeClientError> {
+    ) -> Result<ModelResponse, BridgeClientError> {
         if is_cancelled() {
             return Err(model_invocation_cancelled_error());
         }
@@ -445,14 +605,14 @@ pub trait ModelBridgeClient: Send + Sync {
         &self,
         request: ModelInvocationRequest,
         on_delta: &dyn Fn(&ModelStreamingDelta),
-    ) -> Result<BridgeResponse, BridgeClientError>;
+    ) -> Result<ModelResponse, BridgeClientError>;
 
     fn invoke_streaming_with_retry_events(
         &self,
         request: ModelInvocationRequest,
         on_delta: &dyn Fn(&ModelStreamingDelta),
         _on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
-    ) -> Result<BridgeResponse, BridgeClientError> {
+    ) -> Result<ModelResponse, BridgeClientError> {
         self.invoke_streaming(request, on_delta)
     }
 
@@ -462,7 +622,7 @@ pub trait ModelBridgeClient: Send + Sync {
         on_delta: &dyn Fn(&ModelStreamingDelta),
         on_retry: &dyn Fn(&ModelRetryRuntimeEvent),
         is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<BridgeResponse, BridgeClientError> {
+    ) -> Result<ModelResponse, BridgeClientError> {
         if is_cancelled() {
             return Err(model_invocation_cancelled_error());
         }

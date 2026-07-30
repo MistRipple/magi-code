@@ -363,9 +363,10 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header::CONTENT_TYPE};
+    use magi_bridge_client::ModelResponse;
     use magi_bridge_client::{
-        BridgeClientError, BridgeErrorLayer, BridgeResponse, ModelBridgeClient,
-        ModelInvocationRequest, ModelStreamingDelta,
+        BridgeClientError, BridgeErrorLayer, ModelBridgeClient, ModelInvocationRequest,
+        ModelStreamingDelta,
     };
     use magi_conversation_runtime::{
         task_execution_dispatcher::{
@@ -396,7 +397,7 @@ mod tests {
         fn invoke(
             &self,
             _request: ModelInvocationRequest,
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::RemoteBusiness,
@@ -409,7 +410,7 @@ mod tests {
             &self,
             request: ModelInvocationRequest,
             _on_delta: &dyn Fn(&ModelStreamingDelta),
-        ) -> Result<BridgeResponse, BridgeClientError> {
+        ) -> Result<ModelResponse, BridgeClientError> {
             self.invoke(request)
         }
     }

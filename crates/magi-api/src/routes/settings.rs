@@ -61,6 +61,7 @@ fn model_settings_section_request(
 ) -> Result<serde_json::Value, ApiError> {
     let config = scoped_settings_section_request(request)?;
     reject_deprecated_model_config_fields(&config).map_err(ApiError::InvalidInput)?;
+    NormalizedModelConfig::from_settings_value(&config).map_err(ApiError::InvalidInput)?;
     Ok(config)
 }
 
@@ -388,7 +389,7 @@ async fn fetch_model_ids_for_config(
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    match config.inferred_protocol() {
+    match config.api_protocol() {
         HttpModelBridgeProtocol::ChatCompletions => {
             let auth_value = HeaderValue::from_str(&format!("Bearer {}", api_key))
                 .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
@@ -1026,6 +1027,8 @@ async fn save_worker_config(
     if let (Some(worker_id), Some(worker_config)) = (worker_id, worker_config) {
         let worker_config = without_scope_binding_fields(worker_config.clone());
         reject_deprecated_model_config_fields(&worker_config).map_err(ApiError::InvalidInput)?;
+        NormalizedModelConfig::from_settings_value(&worker_config)
+            .map_err(ApiError::InvalidInput)?;
         let mut workers = state
             .settings_store
             .get_section("workers")
@@ -1213,7 +1216,7 @@ fn image_generation_section_request(request: &Value) -> Result<Value, ApiError> 
     normalized.require_model().map_err(ApiError::InvalidInput)?;
 
     let mut canonical = Map::new();
-    for field in ["baseUrl", "apiKey", "model", "urlMode"] {
+    for field in ["baseUrl", "apiKey", "model", "urlMode", "apiProtocol"] {
         if let Some(value) = config.get(field).cloned() {
             canonical.insert(field.to_string(), value);
         }
@@ -1335,6 +1338,7 @@ async fn upsert_engine(
     }
     if let Some(llm) = request.get("llm") {
         reject_deprecated_model_config_fields(llm).map_err(ApiError::InvalidInput)?;
+        NormalizedModelConfig::from_settings_value(llm).map_err(ApiError::InvalidInput)?;
     }
     let normalized = normalize_engine_entry(&request)
         .ok_or_else(|| ApiError::InvalidInput("引擎配置缺少有效的 id".to_string()))?;
@@ -1943,7 +1947,8 @@ mod tests {
             "baseUrl": base_url,
             "apiKey": "test-key",
             "model": "claude-sonnet-test",
-            "urlMode": "standard"
+            "urlMode": "standard",
+            "apiProtocol": "anthropic_messages"
         }))
         .expect("模型配置应符合当前协议");
         execute_connection_probe(&config)
@@ -1972,7 +1977,8 @@ mod tests {
             "baseUrl": base_url,
             "apiKey": "test-key",
             "model": "gpt-test",
-            "urlMode": "standard"
+            "urlMode": "standard",
+            "apiProtocol": "openai_chat"
         }))
         .await;
 
@@ -2009,7 +2015,8 @@ mod tests {
                 "config": {
                     "baseUrl": base_url,
                     "apiKey": "test-key",
-                    "urlMode": "standard"
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat"
                 }
             })),
         )
@@ -2043,7 +2050,8 @@ mod tests {
                     "baseUrl": base_url,
                     "apiKey": "test-key",
                     "model": "gpt-test",
-                    "urlMode": "standard"
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat"
                 }
             })),
         )
@@ -2079,7 +2087,8 @@ mod tests {
                     "baseUrl": base_url,
                     "apiKey": "test-image-key",
                     "model": "gpt-image-test",
-                    "urlMode": "standard"
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat"
                 }
             })),
         )
@@ -2115,7 +2124,8 @@ mod tests {
                     "baseUrl": base_url,
                     "apiKey": "test-key",
                     "model": "gpt-test",
-                    "urlMode": "standard"
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat"
                 }),
                 target: "orchestrator".to_string(),
             }),
@@ -2840,7 +2850,8 @@ mod tests {
             "llm": {
                 "baseUrl": "http://localhost:8317/",
                 "model": "kiro-claude-sonnet-4-5-agentic",
-                "urlMode": "standard"
+                "urlMode": "standard",
+                "apiProtocol": "openai_chat"
             }
         }))
         .expect("engine should normalize");
@@ -3207,6 +3218,8 @@ mod tests {
                     "baseUrl": "https://api.example.com/v1",
                     "apiKey": "sk-global",
                     "model": "global-main-model",
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat",
                     "reasoningEffort": "high",
                     "sessionId": "session-a",
                     "workspaceId": "workspace-a"
@@ -3243,6 +3256,7 @@ mod tests {
                     "apiKey": "sk-image",
                     "model": "gpt-image-1",
                     "urlMode": "standard",
+                    "apiProtocol": "openai_chat",
                     "reasoningEffort": "high",
                     "workspaceId": "workspace-ignored"
                 }
@@ -3474,6 +3488,18 @@ mod tests {
     fn first_session_model_defaults_reasoning_effort_to_medium() {
         let state = test_state();
         let session_id = SessionId::new("session-model-default-effort");
+        state
+            .settings_store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-global",
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat"
+                }),
+            )
+            .unwrap();
 
         let saved = save_orchestrator_session_override_for_session(
             &state,
@@ -3585,13 +3611,14 @@ mod tests {
 
     #[test]
     fn fetch_models_config_allows_anthropic_compatible_provider() {
-        // /v1/models 在 Anthropic 端点同样合法；standard 模式下协议由当前模型名识别。
+        // /v1/models 在 Anthropic 端点同样合法；请求头由显式协议决定。
         let (config, target) = parse_fetch_models_config(FetchModelsRequest {
             config: serde_json::json!({
                 "baseUrl": "https://api.anthropic.com",
                 "apiKey": "test-key",
                 "model": "claude-sonnet-test",
-                "urlMode": "standard"
+                "urlMode": "standard",
+                "apiProtocol": "anthropic_messages"
             }),
             target: "orch".to_string(),
         })
@@ -3611,7 +3638,8 @@ mod tests {
             config: serde_json::json!({
                 "baseUrl": "http://127.0.0.1:8320/v1",
                 "apiKey": "test-key",
-                "urlMode": "standard"
+                "urlMode": "standard",
+                "apiProtocol": "openai_chat"
             }),
             target: "orch".to_string(),
         })
@@ -3635,7 +3663,8 @@ mod tests {
             config: serde_json::json!({
                 "baseUrl": "http://127.0.0.1:8320/v1/chat/completions",
                 "apiKey": "test-key",
-                "urlMode": "full"
+                "urlMode": "full",
+                "apiProtocol": "openai_chat"
             }),
             target: "orch".to_string(),
         })

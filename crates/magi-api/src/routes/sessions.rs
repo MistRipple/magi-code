@@ -5,8 +5,8 @@ use axum::{
 };
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_conversation_runtime::{
-    SessionTurnInputCommitError, SessionTurnInputError, UserSignal, public_builtin_tool_references,
-    tool_reference_position,
+    SessionTurnInputCommitError, SessionTurnInputError, UserSignal,
+    requested_public_builtin_tool_chain,
 };
 use magi_core::{
     AccessProfile, DomainError, EventId, SessionId, TaskTier, UtcMillis, WorkerId, WorkspaceId,
@@ -1012,9 +1012,9 @@ fn normalize_session_turn_decision(
                 decision.task_title = None;
                 decision.execution_goal = None;
                 decision.task_tier = TaskTier::ExecutionChain;
-                if decision.forced_tool_name.as_deref() != Some(tool_name) {
-                    decision.tool_intent = Some(explicit_builtin_tool_intent(tool_name));
-                    decision.forced_tool_name = Some(tool_name.to_string());
+                if decision.forced_tool_name.as_deref() != Some(tool_name.as_str()) {
+                    decision.tool_intent = Some(explicit_builtin_tool_intent(&tool_name));
+                    decision.forced_tool_name = Some(tool_name.clone());
                     decision.required_tool_chain.clear();
                     decision.route_reason =
                         Some(format!("用户明确要求调用公开内置工具 {tool_name}。"));
@@ -1473,35 +1473,17 @@ fn session_turn_explicitly_rejects_collaboration(normalized: &str) -> bool {
 }
 
 enum RequestedBuiltinTools {
-    Single(&'static str),
-    Multiple(Vec<&'static str>),
+    Single(String),
+    Multiple(Vec<String>),
 }
 
 fn session_turn_requested_public_builtin_tools(
     request: &SessionTurnRequestDto,
 ) -> Option<RequestedBuiltinTools> {
-    let normalized = request.trimmed_text()?.to_ascii_lowercase();
-    let mut matches: Vec<(&'static str, usize)> = Vec::new();
-    for canonical_name in public_builtin_tool_references() {
-        let Some(position) = tool_reference_position(&normalized, canonical_name) else {
-            continue;
-        };
-        if let Some((_, existing_position)) =
-            matches.iter_mut().find(|(name, _)| *name == canonical_name)
-        {
-            *existing_position = (*existing_position).min(position);
-        } else {
-            matches.push((canonical_name, position));
-        }
-    }
-    matches.sort_by_key(|(_, position)| *position);
-    let tool_names = matches
-        .into_iter()
-        .map(|(tool_name, _)| tool_name)
-        .collect::<Vec<_>>();
+    let tool_names = requested_public_builtin_tool_chain(&request.trimmed_text()?);
     match tool_names.as_slice() {
         [] => None,
-        [tool_name] => Some(RequestedBuiltinTools::Single(tool_name)),
+        [tool_name] => Some(RequestedBuiltinTools::Single(tool_name.clone())),
         _ => Some(RequestedBuiltinTools::Multiple(tool_names)),
     }
 }
@@ -1543,7 +1525,7 @@ fn workspace_inspection_tool_intent(user_text: &str) -> String {
     )
 }
 
-fn multi_builtin_tool_intent(tool_names: &[&str]) -> String {
+fn multi_builtin_tool_intent(tool_names: &[String]) -> String {
     format!(
         "用户明确要求串联调用多个公开内置工具：{}。必须按用户原始输入描述的依赖顺序选择并调用这些工具；每个工具的 path/source/destination/command/query/content/patch/diff 参数必须从对应编号步骤原文提取。如果用户已经指定文件名、目录名或命令，禁止改名为 probe、tmp、placeholder 或其它自造临时名；最终回复只能描述工具实际结果。不要创建任务，不要只输出文字说明。某一步失败时应原位展示失败工具，并基于已执行结果给出简短说明。",
         tool_names.join(", ")
@@ -5301,6 +5283,31 @@ mod tests {
         let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
         assert!(tool_intent.contains("file_mkdir"));
         assert!(tool_intent.contains("不要只输出文字说明"));
+    }
+
+    #[test]
+    fn normalizes_product_shell_name_to_forced_execution() {
+        let request = session_turn_request("必须调用 Shell 工具执行 printf ok");
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert_eq!(decision.forced_tool_name.as_deref(), Some("shell_exec"));
+        assert_eq!(decision.reason_code.as_deref(), Some("tool_request"));
+    }
+
+    #[test]
+    fn shell_name_in_problem_description_does_not_force_execution() {
+        for prompt in [
+            "Shell 工具是什么？",
+            "分析 Shell 命令执行失败的原因",
+            "不要调用 Shell 工具，只解释方案",
+        ] {
+            let request = session_turn_request(prompt);
+            let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+            assert!(decision.forced_tool_name.is_none(), "{prompt}");
+            assert!(decision.required_tool_chain.is_empty(), "{prompt}");
+        }
     }
 
     #[test]

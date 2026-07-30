@@ -1,7 +1,7 @@
 use crate::types::{
     BridgeBindingDispatchPlan, BridgeBindingKind, BridgeClientError, BridgeDispatchAction,
-    BridgeDispatchInput, BridgeDispatchResult, McpBridgeClient, McpToolCallRequest,
-    ModelBridgeClient, ModelInvocationRequest,
+    BridgeDispatchInput, BridgeDispatchResponse, BridgeDispatchResult, McpBridgeClient,
+    McpToolCallRequest, ModelBridgeClient, ModelInvocationRequest,
 };
 use std::sync::Arc;
 
@@ -47,13 +47,25 @@ impl BridgeDispatchRuntime {
                         .ok_or(BridgeClientError::MissingClient {
                             bridge_kind: BridgeBindingKind::Model,
                         })?;
-                client.invoke(ModelInvocationRequest {
+                let response = client.invoke(ModelInvocationRequest {
                     provider: binding.bridge_target.clone(),
                     prompt: input.payload.clone(),
                     messages: None,
                     tools: None,
                     tool_choice: None,
-                })?
+                })?;
+                if response
+                    .content
+                    .as_deref()
+                    .is_none_or(|content| content.trim().is_empty())
+                {
+                    return Err(BridgeClientError::CallFailed {
+                        layer: crate::types::BridgeErrorLayer::RemoteBusiness,
+                        code: Some(-32007),
+                        message: "model dispatch returned no user-visible content".to_string(),
+                    });
+                }
+                BridgeDispatchResponse::Model(response)
             }
             (BridgeBindingKind::Mcp, BridgeDispatchAction::McpToolCall) => {
                 let client = self
@@ -62,11 +74,11 @@ impl BridgeDispatchRuntime {
                     .ok_or(BridgeClientError::MissingClient {
                         bridge_kind: BridgeBindingKind::Mcp,
                     })?;
-                client.call_tool(McpToolCallRequest {
+                BridgeDispatchResponse::Mcp(client.call_tool(McpToolCallRequest {
                     server_name: binding.bridge_target.clone(),
                     tool_name: binding.tool_name.clone(),
                     input: input.payload.clone(),
-                })?
+                })?)
             }
             (bridge_kind, dispatch_action) => {
                 return Err(BridgeClientError::IncompatibleBindingAction {

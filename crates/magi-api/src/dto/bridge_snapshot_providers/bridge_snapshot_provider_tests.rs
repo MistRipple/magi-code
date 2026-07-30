@@ -6,10 +6,10 @@ use super::*;
 use magi_bridge_client::{
     BridgeErrorLayer, BridgeResponse, BridgeServerHandshake, BridgeServerHealth, BridgeServerKind,
     BridgeServerServiceCatalog, BridgeServerServiceDescriptor, BridgeTransport,
-    BridgeTransportError, BridgeTransportRequest, BridgeTransportResponse,
+    BridgeTransportError, BridgeTransportRequest, BridgeTransportResponse, ChatCompletionPayload,
     LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD, LOCAL_BRIDGE_HANDSHAKE_METHOD,
     LOCAL_BRIDGE_HEALTH_METHOD, LOOPBACK_MCP_SERVER_NAME, LOOPBACK_MCP_TOOL_NAME,
-    LOOPBACK_MODEL_PROVIDER, McpManagerListServersResponse,
+    LOOPBACK_MODEL_PROVIDER, McpManagerListServersResponse, ModelResponse,
 };
 use serde_json::{Value, json};
 use std::{
@@ -179,6 +179,18 @@ fn bridge_response(payload: &str) -> Value {
     .expect("bridge response should serialize")
 }
 
+fn model_response(content: &str) -> Value {
+    serde_json::to_value(ModelResponse::completed(content))
+        .expect("model response should serialize")
+}
+
+fn structured_model_response(payload: Value) -> Value {
+    let payload = serde_json::from_value::<ChatCompletionPayload>(payload)
+        .expect("chat completion payload should decode");
+    serde_json::to_value(ModelResponse::from_chat_payload(payload))
+        .expect("model response should serialize")
+}
+
 fn bridge_response_with_status(ok: bool, payload: &str) -> Value {
     serde_json::to_value(BridgeResponse {
         ok,
@@ -305,7 +317,7 @@ fn preflight_snapshot_provider_executes_real_smoke_checks_from_transports() {
         Arc::new(FakeTransport::new(HashMap::from([
             (
                 "model.invoke".to_string(),
-                FakeTransportOutcome::Payload(bridge_response(
+                FakeTransportOutcome::Payload(model_response(
                     "loopback-model::bridge preflight ping",
                 )),
             ),
@@ -368,7 +380,7 @@ fn preflight_snapshot_provider_includes_openai_compatible_smoke_when_model_catal
         Arc::new(FakeTransport::new(HashMap::from([
             (
                 "model.invoke".to_string(),
-                FakeTransportOutcome::Payload(bridge_response("bridge preflight ping")),
+                FakeTransportOutcome::Payload(model_response("bridge preflight ping")),
             ),
             (
                 LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
@@ -412,7 +424,7 @@ fn preflight_snapshot_provider_redacts_sensitive_response_excerpt() {
         Arc::new(FakeTransport::new(HashMap::from([
             (
                 "model.invoke".to_string(),
-                FakeTransportOutcome::Payload(bridge_response(
+                FakeTransportOutcome::Payload(model_response(
                     r#"{"message":"provider rejected at /Users/xie/.magi/token with Bearer abcdef","api_key":"sk-live-secret"}"#,
                 )),
             ),
@@ -493,13 +505,15 @@ fn cutover_smoke_snapshot_provider_evaluates_ready_model_and_mcp_contracts() {
         Arc::new(FakeTransport::new(HashMap::from([
             (
                 "model.invoke".to_string(),
-                FakeTransportOutcome::Payload(structured_bridge_response(json!({
+                FakeTransportOutcome::Payload(structured_model_response(json!({
                     "content": "hello from provider",
                     "finish_reason": "tool_calls",
                     "usage": {
                         "total_tokens": 17,
                     },
                     "tool_calls": [{
+                        "id": "call_demo_lookup",
+                        "type": "function",
                         "function": {
                             "name": "demo.lookup",
                             "arguments": "{\"city\":\"Paris\"}",
@@ -517,7 +531,7 @@ fn cutover_smoke_snapshot_provider_evaluates_ready_model_and_mcp_contracts() {
                             descriptor_with_profile(
                                 LOOPBACK_MODEL_PROVIDER,
                                 Some("ready"),
-                                Some("model-bridge-payload-v1"),
+                                Some("model-response-v1"),
                             ),
                             descriptor_with_profile(
                                 "openai-compatible",
@@ -600,7 +614,7 @@ fn cutover_smoke_snapshot_provider_evaluates_ready_model_and_mcp_contracts() {
         model_contract.contract_profile,
         "openai-compatible-chat-completions-v1"
     );
-    assert_eq!(model_contract.payload_kind, "structured_json");
+    assert_eq!(model_contract.payload_kind, "model_response");
     assert!(model_contract.has_content);
     assert!(model_contract.has_finish_reason);
     assert!(model_contract.has_usage);
@@ -643,14 +657,14 @@ fn cutover_smoke_snapshot_provider_evaluates_ready_model_and_mcp_contracts() {
 }
 
 #[test]
-fn cutover_smoke_snapshot_provider_blocks_invalid_model_payload_contract() {
+fn cutover_smoke_snapshot_provider_blocks_invalid_model_response_contract() {
     let mut provider = BridgeCutoverSmokeSnapshotProvider::default();
     provider.register_transport(
         BridgeServerKind::Model,
         Arc::new(FakeTransport::new(HashMap::from([
             (
                 "model.invoke".to_string(),
-                FakeTransportOutcome::Payload(structured_bridge_response(json!({
+                FakeTransportOutcome::Payload(structured_model_response(json!({
                     "finish_reason": "stop",
                     "usage": {
                         "total_tokens": 5,
@@ -667,7 +681,7 @@ fn cutover_smoke_snapshot_provider_blocks_invalid_model_payload_contract() {
                             descriptor_with_profile(
                                 LOOPBACK_MODEL_PROVIDER,
                                 Some("ready"),
-                                Some("model-bridge-payload-v1"),
+                                Some("model-response-v1"),
                             ),
                             descriptor_with_profile(
                                 "openai-compatible",
@@ -692,7 +706,7 @@ fn cutover_smoke_snapshot_provider_blocks_invalid_model_payload_contract() {
         issue.server_kind == BridgeServerKind::Model
             && issue.facet == BridgeCutoverBlockingFacet::ModelContract
             && issue.reason_code
-                == BridgeCutoverBlockingReasonCode::ModelStructuredPayloadMissingContentOrToolCalls
+                == BridgeCutoverBlockingReasonCode::ModelResponseMissingContentOrToolCalls
     }));
     let model = snapshot
         .services
@@ -721,12 +735,12 @@ fn cutover_smoke_snapshot_provider_blocks_invalid_model_payload_contract() {
     assert_eq!(openai_issue.check_name, "invoke_contract");
     assert_eq!(
         openai_issue.reason_code,
-        BridgeCutoverBlockingReasonCode::ModelStructuredPayloadMissingContentOrToolCalls
+        BridgeCutoverBlockingReasonCode::ModelResponseMissingContentOrToolCalls
     );
     assert!(!openai.ok);
     assert_eq!(
         openai.blocking_reason.as_deref(),
-        Some("structured payload missing content or tool_calls")
+        Some("model response missing content or tool_calls")
     );
     assert!(
         !openai
@@ -761,7 +775,7 @@ fn cutover_smoke_snapshot_provider_does_not_skip_degraded_openai_compatible() {
                             descriptor_with_profile(
                                 LOOPBACK_MODEL_PROVIDER,
                                 Some("ready"),
-                                Some("model-bridge-payload-v1"),
+                                Some("model-response-v1"),
                             ),
                             descriptor_with_profile(
                                 "openai-compatible",
@@ -927,14 +941,14 @@ fn cutover_smoke_snapshot_provider_reports_mcp_manager_list_failure_issue() {
 }
 
 #[test]
-fn cutover_smoke_snapshot_provider_reports_empty_model_payload_issue() {
+fn cutover_smoke_snapshot_provider_reports_empty_model_response_issue() {
     let mut provider = BridgeCutoverSmokeSnapshotProvider::default();
     provider.register_transport(
         BridgeServerKind::Model,
         Arc::new(FakeTransport::new(HashMap::from([
             (
                 "model.invoke".to_string(),
-                FakeTransportOutcome::Payload(bridge_response("")),
+                FakeTransportOutcome::Payload(model_response("")),
             ),
             (
                 LOCAL_BRIDGE_DESCRIBE_SERVICES_METHOD.to_string(),
@@ -945,7 +959,7 @@ fn cutover_smoke_snapshot_provider_reports_empty_model_payload_issue() {
                         services: vec![descriptor_with_profile(
                             LOOPBACK_MODEL_PROVIDER,
                             Some("ready"),
-                            Some("model-bridge-payload-v1"),
+                            Some("model-response-v1"),
                         )],
                     })
                     .expect("catalog should serialize"),
@@ -962,9 +976,12 @@ fn cutover_smoke_snapshot_provider_reports_empty_model_payload_issue() {
     assert_eq!(issue.target, LOOPBACK_MODEL_PROVIDER);
     assert_eq!(
         issue.reason_code,
-        BridgeCutoverBlockingReasonCode::ModelPayloadEmpty
+        BridgeCutoverBlockingReasonCode::ModelResponseMissingContentOrToolCalls
     );
-    assert_eq!(issue.blocking_reason, "bridge payload was empty");
+    assert_eq!(
+        issue.blocking_reason,
+        "model response missing content or tool_calls"
+    );
 }
 
 #[test]
@@ -975,11 +992,13 @@ fn cutover_smoke_snapshot_provider_reports_invalid_model_tool_calls_issue() {
         Arc::new(FakeTransport::new(HashMap::from([
             (
                 "model.invoke".to_string(),
-                FakeTransportOutcome::Payload(structured_bridge_response(json!({
+                FakeTransportOutcome::Payload(structured_model_response(json!({
                     "tool_calls": [{
+                        "id": "call_demo_lookup",
+                        "type": "function",
                         "function": {
                             "name": "demo.lookup",
-                            "arguments": { "city": "Paris" },
+                            "arguments": "",
                         }
                     }],
                 }))),
@@ -993,7 +1012,7 @@ fn cutover_smoke_snapshot_provider_reports_invalid_model_tool_calls_issue() {
                         services: vec![descriptor_with_profile(
                             LOOPBACK_MODEL_PROVIDER,
                             Some("ready"),
-                            Some("model-bridge-payload-v1"),
+                            Some("model-response-v1"),
                         )],
                     })
                     .expect("catalog should serialize"),
@@ -1008,11 +1027,11 @@ fn cutover_smoke_snapshot_provider_reports_invalid_model_tool_calls_issue() {
     let issue = &snapshot.blocking_issues[0];
     assert_eq!(
         issue.reason_code,
-        BridgeCutoverBlockingReasonCode::ModelStructuredPayloadInvalidToolCalls
+        BridgeCutoverBlockingReasonCode::ModelResponseInvalidToolCalls
     );
     assert_eq!(
         issue.blocking_reason,
-        "structured payload contains invalid tool_calls"
+        "model response contains invalid tool_calls"
     );
 }
 

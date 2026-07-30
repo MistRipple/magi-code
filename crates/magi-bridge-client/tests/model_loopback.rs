@@ -140,8 +140,8 @@ fn model_client_round_trips_through_loopback_server() {
         })
         .expect("loopback model invoke should succeed");
 
-    assert!(response.ok);
-    assert_eq!(response.payload, "loopback-model::hello");
+    assert!(response.is_actionable());
+    assert_eq!(response.content.as_deref(), Some("loopback-model::hello"));
 }
 
 #[test]
@@ -172,8 +172,8 @@ fn openai_compatible_provider_executes_real_http_smoke_path() {
         })
         .expect("openai-compatible HTTP smoke invoke should succeed");
 
-    assert!(response.ok);
-    assert_eq!(response.payload, "hello from stub");
+    assert!(response.is_actionable());
+    assert_eq!(response.content.as_deref(), Some("hello from stub"));
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))
@@ -234,13 +234,17 @@ fn openai_compatible_provider_surfaces_structured_success_payload() {
         })
         .expect("structured openai-compatible payload should succeed");
 
-    assert!(response.ok);
-    let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
-    assert_eq!(payload["content"], "hello from stub");
-    assert_eq!(payload["finish_reason"], "tool_calls");
-    assert_eq!(payload["usage"]["total_tokens"], 17);
-    assert_eq!(payload["tool_calls"][0]["id"], "call_stub_1");
-    assert_eq!(payload["tool_calls"][0]["function"]["name"], "demo.lookup");
+    assert!(response.is_actionable());
+    assert_eq!(response.content.as_deref(), Some("hello from stub"));
+    assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+    let usage = response.usage.as_ref().expect("usage should exist");
+    assert_eq!(
+        usage["inputTokens"].as_u64().unwrap_or_default()
+            + usage["outputTokens"].as_u64().unwrap_or_default(),
+        17
+    );
+    assert_eq!(response.tool_calls[0].id, "call_stub_1");
+    assert_eq!(response.tool_calls[0].function.name, "demo.lookup");
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))
@@ -288,15 +292,14 @@ fn openai_compatible_provider_accepts_tool_call_only_success_payload() {
         })
         .expect("tool-call-only openai-compatible payload should succeed");
 
-    assert!(response.ok);
-    let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
-    assert!(payload.get("content").is_none());
-    assert_eq!(payload["finish_reason"], "tool_calls");
-    assert_eq!(payload["usage"]["total_tokens"], 7);
-    assert_eq!(payload["tool_calls"][0]["id"], "call_stub_lookup_1");
-    assert_eq!(payload["tool_calls"][0]["function"]["name"], "demo.lookup");
+    assert!(response.is_actionable());
+    assert!(response.content.is_none());
+    assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+    assert!(response.usage.is_some());
+    assert_eq!(response.tool_calls[0].id, "call_stub_lookup_1");
+    assert_eq!(response.tool_calls[0].function.name, "demo.lookup");
     assert_eq!(
-        payload["tool_calls"][0]["function"]["arguments"],
+        response.tool_calls[0].function.arguments,
         "{\"topic\":\"bridge\"}"
     );
 
@@ -340,16 +343,10 @@ fn openai_compatible_provider_treats_null_tool_calls_as_empty() {
         })
         .expect("null tool_calls should be treated as an empty tool call list");
 
-    assert!(response.ok);
-    let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
-    assert_eq!(payload["content"], "done");
-    assert_eq!(payload["finish_reason"], "stop");
-    assert!(
-        payload
-            .get("tool_calls")
-            .and_then(serde_json::Value::as_array)
-            .is_none_or(Vec::is_empty)
-    );
+    assert!(response.is_actionable());
+    assert_eq!(response.content.as_deref(), Some("done"));
+    assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    assert!(response.tool_calls.is_empty());
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))
@@ -390,12 +387,14 @@ fn openai_compatible_provider_surfaces_refusal_only_payload() {
         })
         .expect("refusal-only openai-compatible payload should succeed");
 
-    assert!(response.ok);
-    let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
-    assert_eq!(payload["content"], "I can't help with that request.");
-    assert_eq!(payload["finish_reason"], "stop");
-    assert_eq!(payload["usage"]["total_tokens"], 11);
-    assert!(payload.get("tool_calls").is_none());
+    assert!(response.is_actionable());
+    assert_eq!(
+        response.content.as_deref(),
+        Some("I can't help with that request.")
+    );
+    assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    assert!(response.usage.is_some());
+    assert!(response.tool_calls.is_empty());
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))
@@ -442,11 +441,13 @@ fn openai_compatible_provider_prefers_refusal_when_content_parts_are_empty() {
         })
         .expect("empty content parts should fall back to refusal");
 
-    assert!(response.ok);
-    let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
-    assert_eq!(payload["content"], "I can't comply with that request.");
-    assert_eq!(payload["finish_reason"], "stop");
-    assert_eq!(payload["usage"]["total_tokens"], 9);
+    assert!(response.is_actionable());
+    assert_eq!(
+        response.content.as_deref(),
+        Some("I can't comply with that request.")
+    );
+    assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    assert!(response.usage.is_some());
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))
@@ -494,11 +495,8 @@ fn openai_compatible_provider_tolerates_structured_tool_call_arguments() {
         })
         .expect("structured tool arguments should survive round-trip");
 
-    assert!(response.ok);
-    let payload: Value = serde_json::from_str(&response.payload).expect("payload should be json");
-    let arguments = payload["tool_calls"][0]["function"]["arguments"]
-        .as_str()
-        .expect("tool arguments should remain serialized as a string");
+    assert!(response.is_actionable());
+    let arguments = &response.tool_calls[0].function.arguments;
     assert_eq!(
         serde_json::from_str::<Value>(arguments).expect("tool arguments should stay valid json"),
         json!({
@@ -553,8 +551,8 @@ fn openai_compatible_provider_flattens_content_parts_without_structured_metadata
         })
         .expect("content parts without usage/finish_reason should still succeed");
 
-    assert!(response.ok);
-    assert_eq!(response.payload, "hello from parts");
+    assert!(response.is_actionable());
+    assert_eq!(response.content.as_deref(), Some("hello from parts"));
 
     let request = receiver
         .recv_timeout(Duration::from_secs(5))

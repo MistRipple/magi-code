@@ -1000,6 +1000,7 @@ pub fn append_session_tool_call_items_batch_with_context(
             images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call.id.clone()),
+            provider_context: Vec::new(),
         });
         if matches!(tool_status, ExecutionResultStatus::Succeeded) {
             succeeded_tool_names.push(tool_call.function.name.clone());
