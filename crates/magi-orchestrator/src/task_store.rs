@@ -1,7 +1,8 @@
 use magi_core::{
     AccessProfile, AgentContextAccessRecord, AgentContextPackage, AgentContextSupplement,
     AgentRunProjection, DomainError, DomainResult, LeaseId, MissionId, ProgressSummary, Task,
-    TaskId, TaskKind, TaskPolicy, TaskRuntimePayload, TaskStatus, TaskTier, UtcMillis, WorkerId,
+    TaskCompletionAttempt, TaskId, TaskKind, TaskPolicy, TaskRuntimePayload, TaskStatus, TaskTier,
+    UtcMillis, WorkerId,
 };
 use magi_worker_runtime::WorkerRuntimeDurableSnapshot;
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,14 @@ pub enum TaskLeaseState {
     Completed,
     Expired,
     Revoked,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TaskStoreCheckpoint {
+    #[serde(default)]
+    tasks: Vec<Task>,
+    #[serde(default)]
+    leases: Vec<TaskLease>,
 }
 
 /// Callback invoked after a successful `update_status` call.
@@ -280,6 +289,11 @@ impl TaskStore {
 
     /// 更新任务状态（不做迁移合法性校验，兼容内部传播场景）。
     pub fn update_status(&self, task_id: &TaskId, status: TaskStatus) -> DomainResult<()> {
+        if status == TaskStatus::Completed {
+            return Err(DomainError::InvalidState {
+                message: "Completed 只能通过 TaskStore::complete_task 提交".to_string(),
+            });
+        }
         let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
         let task = tasks
             .get_mut(task_id)
@@ -309,6 +323,11 @@ impl TaskStore {
         task_id: &TaskId,
         new_status: TaskStatus,
     ) -> DomainResult<()> {
+        if new_status == TaskStatus::Completed {
+            return Err(DomainError::InvalidState {
+                message: "Completed 只能通过 TaskStore::complete_task 提交".to_string(),
+            });
+        }
         let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
         let task = tasks
             .get_mut(task_id)
@@ -336,6 +355,56 @@ impl TaskStore {
             .expect("on_status_change lock poisoned");
         if let Some(ref cb) = *callback {
             cb(task_id, old_status, new_status, cloned_task);
+        }
+        drop(callback);
+        self.notify_status_change();
+        self.fire_checkpoint();
+        Ok(())
+    }
+
+    /// 原子验证完成合同并提交任务终态。
+    ///
+    /// 这是任务系统写入 `Completed` 的唯一入口。工具循环、确定性任务、子代理和恢复
+    /// 任务都只能提交 `TaskCompletionAttempt`，不能直接修改状态。
+    pub fn complete_task(
+        &self,
+        task_id: &TaskId,
+        attempt: TaskCompletionAttempt,
+    ) -> DomainResult<()> {
+        let mut tasks = self.tasks.write().expect("tasks write lock poisoned");
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or(DomainError::NotFound { entity: "Task" })?;
+        if task.status != TaskStatus::Running {
+            return Err(DomainError::InvalidState {
+                message: format!(
+                    "任务 {task_id} 只能从 Running 提交完成，当前状态为 {:?}",
+                    task.status
+                ),
+            });
+        }
+        task.completion_contract
+            .validate(&attempt)
+            .map_err(|message| DomainError::InvalidState { message })?;
+        let old_status = task.status;
+        task.output_refs = attempt.output_refs;
+        task.evidence_refs = attempt
+            .evidence
+            .into_iter()
+            .map(|evidence| {
+                serde_json::to_string(&evidence).expect("TaskCompletionEvidence 必须能够序列化")
+            })
+            .collect();
+        task.status = TaskStatus::Completed;
+        task.updated_at = UtcMillis::now();
+        let cloned_task = task.clone();
+        drop(tasks);
+        let callback = self
+            .on_status_change
+            .lock()
+            .expect("on_status_change lock poisoned");
+        if let Some(ref callback) = *callback {
+            callback(task_id, old_status, TaskStatus::Completed, cloned_task);
         }
         drop(callback);
         self.notify_status_change();
@@ -1091,26 +1160,21 @@ impl TaskStore {
     ///
     /// Rebuilds the mission index from task data.  The `on_status_change`
     /// callback is NOT restored — callers must re-attach it after restore if needed.
-    pub fn restore(data: &serde_json::Value) -> Self {
-        let tasks: Vec<Task> = data
-            .get("tasks")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let leases: Vec<TaskLease> = data
-            .get("leases")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+    pub fn restore(data: &serde_json::Value) -> std::io::Result<Self> {
+        let checkpoint: TaskStoreCheckpoint = serde_json::from_value(data.clone())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let store = Self::new();
 
         // Re-insert tasks (which rebuilds mission_index).
-        for task in tasks {
+        for mut task in checkpoint.tasks {
+            task.migrate_persisted_completion_contract();
             store.insert_task(task);
         }
 
         // Re-insert leases directly.
         {
             let mut lease_map = store.leases.write().expect("leases write lock poisoned");
-            for lease in leases {
+            for lease in checkpoint.leases {
                 lease_map.insert(lease.lease_id.clone(), lease);
             }
         }
@@ -1134,7 +1198,7 @@ impl TaskStore {
             }
         }
 
-        store
+        Ok(store)
     }
 
     // ------------------------------------------------------------------
@@ -1236,7 +1300,7 @@ impl TaskStore {
         let content = std::fs::read_to_string(path)?;
         let data: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        Ok(Some(Self::restore(&data)))
+        Ok(Some(Self::restore(&data)?))
     }
 }
 
@@ -1254,11 +1318,7 @@ pub fn is_valid_transition(from: TaskStatus, to: TaskStatus) -> bool {
     }
     matches!(
         (from, to),
-        (Pending, Running)
-            | (Pending, Killed)
-            | (Running, Completed)
-            | (Running, Failed)
-            | (Running, Killed)
+        (Pending, Running) | (Pending, Killed) | (Running, Failed) | (Running, Killed)
     )
 }
 
@@ -1272,4 +1332,168 @@ fn is_terminal_status(status: TaskStatus) -> bool {
 /// TaskStore 不再限制固定父子层级，具体编排约束交给 SpawnGraph/Coordinator。
 fn is_valid_parent_child_kind(_parent: TaskKind, _child: TaskKind) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magi_core::{TaskCompletionEvidence, TaskEvidenceRequirement, TaskExecutorBinding};
+    use serde_json::json;
+
+    fn task(task_id: &str, status: TaskStatus) -> Task {
+        let now = UtcMillis::now();
+        Task {
+            task_id: TaskId::new(task_id),
+            mission_id: MissionId::new("mission-task-store-tests"),
+            root_task_id: TaskId::new("root-task-store-tests"),
+            parent_task_id: None,
+            kind: TaskKind::LocalAgent,
+            title: task_id.to_string(),
+            goal: task_id.to_string(),
+            status,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: TaskRuntimePayload::default(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn successful_attempt() -> TaskCompletionAttempt {
+        TaskCompletionAttempt {
+            output_refs: vec!["output://task-store".to_string()],
+            final_response: Some("任务已完成".to_string()),
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn completed_can_only_be_written_through_completion_gate() {
+        let store = TaskStore::new();
+        let task_id = TaskId::new("task-status-gate");
+        store.insert_task(task(task_id.as_str(), TaskStatus::Running));
+
+        let error = store
+            .update_status(&task_id, TaskStatus::Completed)
+            .expect_err("直接写入 Completed 必须被拒绝");
+
+        assert!(matches!(error, DomainError::InvalidState { .. }));
+        assert_eq!(
+            store.get_task(&task_id).expect("任务应保留").status,
+            TaskStatus::Running
+        );
+    }
+
+    #[test]
+    fn completion_gate_rejects_missing_final_response_without_mutating_task() {
+        let store = TaskStore::new();
+        let task_id = TaskId::new("task-final-response-required");
+        store.insert_task(task(task_id.as_str(), TaskStatus::Running));
+
+        let error = store
+            .complete_task(
+                &task_id,
+                TaskCompletionAttempt {
+                    final_response: Some("  ".to_string()),
+                    ..successful_attempt()
+                },
+            )
+            .expect_err("空最终回复不能提交完成");
+
+        assert!(matches!(error, DomainError::InvalidState { .. }));
+        let persisted = store.get_task(&task_id).expect("任务应保留");
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert!(persisted.output_refs.is_empty());
+        assert!(persisted.evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn completion_gate_requires_matching_tool_evidence_and_persists_success() {
+        let store = TaskStore::new();
+        let task_id = TaskId::new("task-evidence-gate");
+        let mut task = task(task_id.as_str(), TaskStatus::Running);
+        task.completion_contract = magi_core::TaskCompletionContract::default()
+            .with_evidence_requirements(vec![TaskEvidenceRequirement::SuccessfulToolCall {
+                tool_name: "diagram_render".to_string(),
+                minimum_successes: 1,
+                argument_equals: [("/format".to_string(), json!("svg"))]
+                    .into_iter()
+                    .collect(),
+                result_contains: vec!["rendered".to_string()],
+            }]);
+        store.insert_task(task);
+
+        let missing_error = store
+            .complete_task(&task_id, successful_attempt())
+            .expect_err("缺少工具成功证据不能完成");
+        assert!(matches!(missing_error, DomainError::InvalidState { .. }));
+
+        let attempt = TaskCompletionAttempt {
+            evidence: vec![TaskCompletionEvidence::SuccessfulToolCall {
+                call_id: "call-diagram".to_string(),
+                tool_name: "diagram_render".to_string(),
+                arguments: json!({"format": "svg"}),
+                result: "rendered successfully".to_string(),
+            }],
+            ..successful_attempt()
+        };
+        store
+            .complete_task(&task_id, attempt)
+            .expect("满足合同后应提交完成");
+
+        let persisted = store.get_task(&task_id).expect("任务应保留");
+        assert_eq!(persisted.status, TaskStatus::Completed);
+        assert_eq!(persisted.output_refs, ["output://task-store"]);
+        assert_eq!(persisted.evidence_refs.len(), 1);
+    }
+
+    #[test]
+    fn restore_migrates_legacy_completion_requirements_and_rejects_corrupt_tasks() {
+        let mut task_value =
+            serde_json::to_value(task("task-legacy", TaskStatus::Running)).expect("任务应可序列化");
+        task_value["executor_binding"] = json!({
+            "target_role": "coordinator",
+            "required_evidence_tools": ["diagram_render"],
+            "resumes_turn_id": "turn-legacy"
+        });
+
+        let restored = TaskStore::restore(&json!({
+            "tasks": [task_value],
+            "leases": []
+        }))
+        .expect("旧 checkpoint 应完成一次性迁移");
+        let restored_task = restored
+            .get_task(&TaskId::new("task-legacy"))
+            .expect("迁移后的任务应存在");
+        assert_eq!(
+            restored_task.completion_contract.evidence_requirements,
+            vec![TaskEvidenceRequirement::successful_tool_call(
+                "diagram_render"
+            )]
+        );
+        assert_eq!(
+            restored_task.executor_binding,
+            Some(TaskExecutorBinding::for_role("coordinator"))
+        );
+
+        let error = match TaskStore::restore(&json!({
+            "tasks": [{"task_id": 123}],
+            "leases": []
+        })) {
+            Ok(_) => panic!("损坏 checkpoint 不能静默恢复为空任务列表"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 }

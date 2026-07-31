@@ -1,8 +1,8 @@
 use super::*;
 use crate::task_store::TaskStore;
 use magi_core::{
-    AccessProfile, RiskLevel, Task, TaskKind, TaskPolicy, TaskResultKind, TaskStatus, TaskTier,
-    TerminationReason, ToolCallId, VerificationStatus, WorkerId,
+    AccessProfile, RiskLevel, Task, TaskCompletionAttempt, TaskKind, TaskPolicy, TaskResultKind,
+    TaskStatus, TaskTier, TerminationReason, ToolCallId, VerificationStatus, WorkerId,
 };
 use magi_event_bus::InMemoryEventBus;
 use magi_governance::{DecisionPhase, GovernanceDecision, GovernanceService, WorkerControlKind};
@@ -58,6 +58,8 @@ fn seed_action_tasks(
             .collect(),
         policy_snapshot: None,
         executor_binding: None,
+        completion_contract: magi_core::TaskCompletionContract::default(),
+        recovery_checkpoint: None,
         knowledge_refs: Vec::new(),
         workspace_scope: None,
         write_scope: None,
@@ -83,6 +85,8 @@ fn seed_action_tasks(
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -154,6 +158,8 @@ fn seed_task_hierarchy(
         required_children: child_map.get(&root_task_id).cloned().unwrap_or_default(),
         policy_snapshot: None,
         executor_binding: None,
+        completion_contract: magi_core::TaskCompletionContract::default(),
+        recovery_checkpoint: None,
         knowledge_refs: Vec::new(),
         workspace_scope: None,
         write_scope: None,
@@ -183,6 +189,8 @@ fn seed_task_hierarchy(
             required_children: child_map.get(task_id).cloned().unwrap_or_default(),
             policy_snapshot: None,
             executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -727,12 +735,26 @@ fn agent_run_projection_preserves_all_completed_children_after_later_status_upda
         ],
     );
 
-    task_store
-        .update_status(&child_ids[2], TaskStatus::Completed)
-        .expect("第三个代理任务应完成");
-    task_store
-        .update_status(&child_ids[3], TaskStatus::Completed)
-        .expect("第四个代理任务应完成");
+    for task_id in &child_ids[2..] {
+        if task_store
+            .get_task(task_id)
+            .is_some_and(|task| task.status == TaskStatus::Pending)
+        {
+            task_store
+                .update_status(task_id, TaskStatus::Running)
+                .expect("代理任务应进入运行态");
+        }
+        task_store
+            .complete_task(
+                task_id,
+                TaskCompletionAttempt {
+                    output_refs: vec![format!("{task_id} done")],
+                    final_response: Some(format!("{task_id} done")),
+                    evidence: Vec::new(),
+                },
+            )
+            .expect("代理任务应完成");
+    }
 
     let projection = task_store
         .build_agent_run_projection(&root_task_id)

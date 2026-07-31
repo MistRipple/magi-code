@@ -967,6 +967,8 @@ fn execute_coordinator_tool(
                         .with_canonical_task_name(canonical_task_name.clone())
                         .with_plan_item_id(plan_item_id.clone()),
                 ),
+                completion_contract: magi_core::TaskCompletionContract::default(),
+                recovery_checkpoint: None,
                 knowledge_refs: Vec::new(),
                 workspace_scope: task.workspace_scope.clone(),
                 write_scope: task.write_scope.clone(),
@@ -3384,6 +3386,8 @@ mod tests {
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,

@@ -90,6 +90,22 @@ await withGoldenViteServer(async (server) => {
   );
 
   assert.equal(
+    center.isPrimaryAgentRunAction('continue', ['continue', 'restart', 'archive']),
+    true,
+    '存在可恢复检查点时，继续执行必须是主操作',
+  );
+  assert.equal(
+    center.isPrimaryAgentRunAction('restart', ['restart', 'archive']),
+    true,
+    '没有可恢复检查点时，重新执行必须成为主操作',
+  );
+  assert.equal(
+    center.isPrimaryAgentRunAction('restart', ['continue', 'restart', 'archive']),
+    false,
+    '存在继续执行时，重新执行必须降为次级操作',
+  );
+
+  assert.equal(
     center.agentDurationSeconds(agent({ startedAt: 1_000, updatedAt: 9_900 }), 20_000),
     19,
     '运行中代理必须使用当前时间持续累计耗时',
@@ -210,6 +226,16 @@ assert.match(
   activeAgentCenterSource,
   /availableActions[\s\S]*performAgentRunAction\(/,
   '失败态操作必须完全由后端 availableActions 驱动，并统一提交任务动作',
+);
+assert.match(
+  activeAgentCenterSource,
+  /restartConfirmationOpen[\s\S]*activeAgentCenter\.restartConfirm\.title/,
+  '重新执行必须先展示明确确认信息，不能直接创建新任务尝试',
+);
+assert.match(
+  activeAgentCenterSource,
+  /isPrimaryAgentRunAction\(action, availableActions\)/,
+  '恢复动作必须根据任务状态区分主次操作，避免继续与重新执行同权重',
 );
 assert.match(
   activeAgentCenterSource,

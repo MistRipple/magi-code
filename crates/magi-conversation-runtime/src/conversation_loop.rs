@@ -55,8 +55,9 @@ use magi_bridge_client::{
     ModelBridgeClient, ModelInvocationRequest, ModelResponseStatus, ModelStreamingDelta,
 };
 use magi_core::{
-    EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskId, TaskStatus, ThreadId,
-    UtcMillis, WorkspaceId, estimate_text_tokens, public_runtime_excerpt,
+    EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskCompletionAttempt,
+    TaskCompletionEvidence, TaskEvidenceRequirement, TaskId, TaskStatus, ThreadId, UtcMillis,
+    WorkspaceId, estimate_text_tokens, public_runtime_excerpt,
 };
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, SessionRuntimeUsageObservation,
@@ -367,6 +368,166 @@ fn task_is_resuming_existing_thread(
                     .any(|branch| branch.task_id == *task_id && branch.thread_id == *thread_id)
             })
         })
+}
+
+fn started_tool_call_ids_for_resumed_turn(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    resumes_turn_id: &str,
+) -> BTreeSet<String> {
+    session_store
+        .canonical_turns_for_session(session_id)
+        .into_iter()
+        .find(|turn| turn.turn_id == resumes_turn_id)
+        .map(|turn| {
+            turn.items
+                .into_iter()
+                .filter_map(|item| item.tool.map(|tool| tool.call_id))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn successful_tool_evidence_from_thread_history(
+    history: &[ThreadChatMessage],
+) -> Vec<TaskCompletionEvidence> {
+    let mut calls = BTreeMap::<String, (&str, &str)>::new();
+    for message in history {
+        if message.role == "assistant" {
+            for call in &message.tool_calls {
+                calls.insert(
+                    call.id.clone(),
+                    (
+                        call.function.name.as_str(),
+                        call.function.arguments.as_str(),
+                    ),
+                );
+            }
+        }
+    }
+    let mut evidence = Vec::new();
+    for message in history {
+        if message.role != "tool" {
+            continue;
+        }
+        let Some(call_id) = message.tool_call_id.as_deref() else {
+            continue;
+        };
+        let Some(result) = message.content.as_deref() else {
+            continue;
+        };
+        if infer_tool_call_status(result) != "success" {
+            continue;
+        }
+        let Some((tool_name, arguments)) = calls.get(call_id) else {
+            continue;
+        };
+        evidence.push(TaskCompletionEvidence::SuccessfulToolCall {
+            call_id: call_id.to_string(),
+            tool_name: canonical_tool_call_name(tool_name),
+            arguments: serde_json::from_str(arguments)
+                .unwrap_or_else(|_| serde_json::Value::String((*arguments).to_string())),
+            result: result.to_string(),
+        });
+    }
+    evidence
+}
+
+fn tool_call_records_from_thread_history(history: &[ThreadChatMessage]) -> Vec<serde_json::Value> {
+    let mut calls = BTreeMap::<String, ChatToolCall>::new();
+    let mut results = BTreeMap::<String, String>::new();
+    for message in history {
+        if message.role == "assistant" {
+            for call in &message.tool_calls {
+                calls.insert(
+                    call.id.clone(),
+                    ChatToolCall {
+                        id: call.id.clone(),
+                        kind: call.kind.clone(),
+                        function: magi_bridge_client::ChatToolFunction {
+                            name: call.function.name.clone(),
+                            arguments: call.function.arguments.clone(),
+                        },
+                    },
+                );
+            }
+        }
+        if message.role == "tool"
+            && let (Some(call_id), Some(result)) =
+                (message.tool_call_id.as_deref(), message.content.as_deref())
+        {
+            results.insert(call_id.to_string(), result.to_string());
+        }
+    }
+    calls
+        .into_iter()
+        .filter_map(|(call_id, call)| {
+            results
+                .get(&call_id)
+                .map(|result| tool_call_record(&call, result))
+        })
+        .collect()
+}
+
+fn task_required_evidence_tools(task: &Task) -> Vec<String> {
+    let mut required = Vec::new();
+    for requirement in &task.completion_contract().evidence_requirements {
+        let TaskEvidenceRequirement::SuccessfulToolCall { tool_name, .. } = requirement;
+        let canonical_name = canonical_tool_call_name(tool_name);
+        if !canonical_name.is_empty() && !required.contains(&canonical_name) {
+            required.push(canonical_name);
+        }
+    }
+    required
+}
+
+fn missing_required_evidence_tool(
+    task: &Task,
+    evidence: &[TaskCompletionEvidence],
+) -> Option<String> {
+    task.completion_contract()
+        .first_missing_evidence(evidence)
+        .map(|requirement| requirement.tool_name().to_string())
+}
+
+fn required_evidence_recovery_prompt(task: &Task, evidence: &[TaskCompletionEvidence]) -> String {
+    let missing = task
+        .completion_contract()
+        .evidence_requirements
+        .iter()
+        .filter(|requirement| !requirement.is_satisfied_by(evidence))
+        .map(|requirement| requirement.tool_name().to_string())
+        .collect::<Vec<_>>();
+    let completed = evidence
+        .iter()
+        .map(|item| match item {
+            TaskCompletionEvidence::SuccessfulToolCall { tool_name, .. } => tool_name.clone(),
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "当前任务的最终答复尚缺少结构化交付证据。已完成证据工具：{}；仍缺少：{}。不要承诺稍后补充，也不要重复已有工具；现在调用下一个缺失证据工具，成功后再给完整最终答复。",
+        if completed.is_empty() {
+            "无".to_string()
+        } else {
+            completed.join(", ")
+        },
+        missing.join(", ")
+    )
+}
+
+fn validated_task_completion(
+    task: &Task,
+    output_refs: Vec<String>,
+    final_response: String,
+    evidence: Vec<TaskCompletionEvidence>,
+) -> Result<TaskOutcome, String> {
+    let attempt = TaskCompletionAttempt {
+        output_refs,
+        final_response: Some(final_response),
+        evidence,
+    };
+    task.completion_contract().validate(&attempt)?;
+    Ok(TaskOutcome::Completed { attempt })
 }
 
 const THREAD_HISTORY_COMPACT_TARGET_TOKENS: usize = 8_000;
@@ -1182,10 +1343,24 @@ fn run_conversation_loop_inner(
     .messages;
     let resumed_task = !thread_history_snapshot.is_empty()
         && task_is_resuming_existing_thread(session_store, session_id, task_id, thread_id);
-    let inserted_interrupted_tool_results = if resumed_task {
+    let inherits_interrupted_turn =
+        !thread_history_snapshot.is_empty() && task.recovery_checkpoint().is_some();
+    let recovery_history = resumed_task || inherits_interrupted_turn;
+    let started_tool_call_ids = if resumed_task {
+        started_tool_call_ids_for_task_thread(session_store, session_id, task_id, thread_id)
+    } else if let Some(checkpoint) = task.recovery_checkpoint() {
+        started_tool_call_ids_for_resumed_turn(
+            session_store,
+            &checkpoint.source_session_id,
+            &checkpoint.source_turn_id,
+        )
+    } else {
+        BTreeSet::new()
+    };
+    let inserted_interrupted_tool_results = if recovery_history {
         insert_interrupted_tool_result_messages(
             &mut thread_history_snapshot,
-            &started_tool_call_ids_for_task_thread(session_store, session_id, task_id, thread_id),
+            &started_tool_call_ids,
         )
     } else {
         0
@@ -1249,9 +1424,13 @@ fn run_conversation_loop_inner(
     let mut final_model_round: Option<usize> = None;
     let mut active_skill_name = skill_name;
     let mut active_tools = tools.unwrap_or_default();
-    let mut tool_call_records: Vec<serde_json::Value> = Vec::new();
+    let mut tool_call_records = if recovery_history {
+        tool_call_records_from_thread_history(&thread_history_snapshot)
+    } else {
+        Vec::new()
+    };
     let mut tool_call_validation_tracker = ToolCallValidationTracker::default();
-    let mut tool_execution_ledger = if resumed_task {
+    let mut tool_execution_ledger = if recovery_history {
         ToolExecutionLedger::from_thread_history(
             &task.goal,
             &thread_history_snapshot,
@@ -1261,7 +1440,30 @@ fn run_conversation_loop_inner(
         ToolExecutionLedger::for_task_goal(&task.goal)
     };
     let required_tool_chain = task_required_tool_chain(task, Some(agent_role_registry));
-    let mut completed_required_tool_names: Vec<String> = Vec::new();
+    let required_evidence_tools = task_required_evidence_tools(task);
+    let historical_completion_evidence = if recovery_history {
+        successful_tool_evidence_from_thread_history(&thread_history_snapshot)
+    } else {
+        Vec::new()
+    };
+    let historical_completed_tool_names = historical_completion_evidence
+        .iter()
+        .map(|evidence| match evidence {
+            TaskCompletionEvidence::SuccessfulToolCall { tool_name, .. } => tool_name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut completion_evidence = historical_completion_evidence;
+    let mut completed_required_tool_names = historical_completed_tool_names
+        .iter()
+        .filter(|tool_name| required_tool_chain.contains(tool_name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut completed_evidence_tool_names = historical_completed_tool_names
+        .iter()
+        .filter(|tool_name| required_evidence_tools.contains(tool_name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut evidence_recovery_tool: Option<String> = None;
     let mut last_stream_item_id: Option<String> = None;
     let mut had_tool_calls = false;
     let mut empty_response_recovery_attempts = 0usize;
@@ -1293,6 +1495,24 @@ fn run_conversation_loop_inner(
     };
 
     if let Some(final_content) = deterministic_task_final_content(task, task_store) {
+        let outcome = match validated_task_completion(
+            task,
+            vec![final_content.clone()],
+            final_content.clone(),
+            completion_evidence.clone(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                append_task_error_turn_item(
+                    turn_writeback_context,
+                    &error,
+                    streaming_entry_id,
+                    None,
+                    None,
+                );
+                return (TaskOutcome::Failed { error }, context_summary);
+            }
+        };
         append_task_final_turn_item(
             turn_writeback_context,
             &final_content,
@@ -1300,15 +1520,16 @@ fn run_conversation_loop_inner(
             streaming_entry_id,
             None,
         );
-        return (
-            TaskOutcome::Completed {
-                output_refs: vec![final_content],
-            },
-            context_summary,
-        );
+        return (outcome, context_summary);
     }
 
-    let tool_call_round_limit = tool_call_round_limit(&required_tool_chain);
+    let mut completion_tool_budget = required_tool_chain.clone();
+    for tool_name in &required_evidence_tools {
+        if !completion_tool_budget.contains(tool_name) {
+            completion_tool_budget.push(tool_name.clone());
+        }
+    }
+    let tool_call_round_limit = tool_call_round_limit(&completion_tool_budget);
     let model_round_limit = tool_call_round_limit
         .saturating_add(MODEL_FINAL_RESPONSE_ROUND_RESERVE)
         .saturating_add(MAX_PLAN_FOLLOW_UP_ROUNDS);
@@ -1318,7 +1539,10 @@ fn run_conversation_loop_inner(
             &mut messages,
             conversation_registry.drain_task_signals(session_id, task_id),
         );
+        let required_evidence_pending =
+            missing_required_evidence_tool(task, &completion_evidence).is_some();
         let final_response_only = tool_execution_rounds >= tool_call_round_limit
+            && !required_evidence_pending
             && !(owns_plan_execution && plan_store.requires_execution_follow_up());
         if final_response_only && !final_response_prompt_appended {
             messages.push(ChatMessage {
@@ -1367,10 +1591,17 @@ fn run_conversation_loop_inner(
         // 协作工具面由 root coordinator 身份、访问策略与运行时容量统一决定。
         // 不得根据用户文本缩减工具集，也不得强制某一轮调用 agent_spawn；否则模型
         // 无法在分析、实施、等待之间自主选择正确的协作步骤。
+        let evidence_recovery_chain = evidence_recovery_tool.iter().cloned().collect::<Vec<_>>();
+        let empty_completed_tools = Vec::new();
+        let (round_required_tools, round_completed_tools) = if evidence_recovery_chain.is_empty() {
+            (&required_tool_chain, &completed_required_tool_names)
+        } else {
+            (&evidence_recovery_chain, &empty_completed_tools)
+        };
         let round_tool_definitions = required_tool_definitions_for_round(
             &active_tools,
-            &required_tool_chain,
-            &completed_required_tool_names,
+            round_required_tools,
+            round_completed_tools,
         );
         let round_tools = (!final_response_only && !round_tool_definitions.is_empty())
             .then_some(round_tool_definitions);
@@ -1380,9 +1611,9 @@ fn run_conversation_loop_inner(
             messages: Some(messages.clone()),
             tools: round_tools.clone(),
             tool_choice: forced_task_tool_choice_for_round(
-                &required_tool_chain,
+                round_required_tools,
                 round_tools.as_ref(),
-                &completed_required_tool_names,
+                round_completed_tools,
             ),
         };
         let invocation_request_template = invocation_request.clone();
@@ -2051,6 +2282,22 @@ fn run_conversation_loop_inner(
                 });
                 continue;
             }
+            if let Some(missing_tool) = missing_required_evidence_tool(task, &completion_evidence) {
+                evidence_recovery_tool = Some(missing_tool);
+                messages.push(assistant_response_message.clone());
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(required_evidence_recovery_prompt(
+                        task,
+                        &completion_evidence,
+                    )),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                });
+                continue;
+            }
             if let Some(recovery_prompt) =
                 agent_coordination_recovery_prompt(task, task_store, &tool_call_records)
             {
@@ -2229,7 +2476,16 @@ fn run_conversation_loop_inner(
                 ) {
                     content_requirement_failures.push(failure);
                 } else {
-                    completed_tool_names_this_round.push(canonical_tool_name);
+                    completed_tool_names_this_round.push(canonical_tool_name.clone());
+                    completion_evidence.push(TaskCompletionEvidence::SuccessfulToolCall {
+                        call_id: tool_call.id.clone(),
+                        tool_name: canonical_tool_name,
+                        arguments: serde_json::from_str(&tool_call.function.arguments)
+                            .unwrap_or_else(|_| {
+                                serde_json::Value::String(tool_call.function.arguments.clone())
+                            }),
+                        result: result.clone(),
+                    });
                 }
             }
             tool_call_records.push(tool_call_record(tool_call, &result));
@@ -2343,6 +2599,23 @@ fn run_conversation_loop_inner(
             &required_tool_chain,
             &completed_tool_names_this_round,
         );
+        record_completed_required_tools(
+            &mut completed_evidence_tool_names,
+            &required_evidence_tools,
+            &completed_tool_names_this_round,
+        );
+        if evidence_recovery_tool.as_ref().is_some_and(|tool_name| {
+            !task
+                .completion_contract()
+                .evidence_requirements
+                .iter()
+                .any(|requirement| {
+                    requirement.tool_name() == tool_name
+                        && !requirement.is_satisfied_by(&completion_evidence)
+                })
+        }) {
+            evidence_recovery_tool = None;
+        }
         if !content_requirement_failures.is_empty() {
             messages.push(ChatMessage {
                 role: "user".to_string(),
@@ -2384,6 +2657,23 @@ fn run_conversation_loop_inner(
             &required_tool_chain,
             &completed_required_tool_names,
         );
+        append_task_error_turn_item(
+            turn_writeback_context,
+            &failure_reason,
+            streaming_entry_id.or(last_stream_item_id.as_deref()),
+            None,
+            None,
+        );
+        return (
+            TaskOutcome::Failed {
+                error: failure_reason,
+            },
+            context_summary,
+        );
+    }
+
+    if missing_required_evidence_tool(task, &completion_evidence).is_some() {
+        let failure_reason = required_evidence_recovery_prompt(task, &completion_evidence);
         append_task_error_turn_item(
             turn_writeback_context,
             &failure_reason,
@@ -2486,6 +2776,29 @@ fn run_conversation_loop_inner(
         );
     }
 
+    let output_refs = vec![build_output_content(
+        tool_call_records,
+        final_content.clone(),
+    )];
+    let outcome = match validated_task_completion(
+        task,
+        output_refs,
+        final_content.clone(),
+        completion_evidence,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            append_task_error_turn_item(
+                turn_writeback_context,
+                &error,
+                streaming_entry_id.or(last_stream_item_id.as_deref()),
+                None,
+                None,
+            );
+            return (TaskOutcome::Failed { error }, context_summary);
+        }
+    };
+
     append_task_final_turn_item(
         turn_writeback_context,
         &final_content,
@@ -2505,12 +2818,7 @@ fn run_conversation_loop_inner(
         context_window_override: None,
     });
 
-    (
-        TaskOutcome::Completed {
-            output_refs: vec![build_output_content(tool_call_records, final_content)],
-        },
-        context_summary,
-    )
+    (outcome, context_summary)
 }
 
 fn render_mailbox_items_for_prompt(items: &[MailboxItem]) -> Option<String> {
@@ -3553,6 +3861,10 @@ mod tests {
         invoke_count: AtomicUsize,
         requests: Mutex<Vec<ModelInvocationRequest>>,
     }
+    struct EvidenceThenFinalTaskModelBridgeClient {
+        invoke_count: AtomicUsize,
+        requests: Mutex<Vec<ModelInvocationRequest>>,
+    }
 
     fn exposed_test_tool(name: &str) -> ChatToolDefinition {
         ChatToolDefinition {
@@ -4136,6 +4448,50 @@ mod tests {
                 content: self.content.to_string(),
                 thinking: String::new(),
             });
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for EvidenceThenFinalTaskModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            self.requests
+                .lock()
+                .expect("evidence requests mutex poisoned")
+                .push(request);
+            let index = self.invoke_count.fetch_add(1, Ordering::SeqCst);
+            let payload = match index {
+                0 => serde_json::json!({
+                    "content": "还没有，我接下来会补上流程图。",
+                    "finish_reason": "stop"
+                }),
+                1 => serde_json::json!({
+                    "content": null,
+                    "finish_reason": "tool_calls",
+                    "tool_calls": [{
+                        "id": "call-required-diagram",
+                        "type": "function",
+                        "function": {
+                            "name": "diagram_render",
+                            "arguments": "{}"
+                        }
+                    }]
+                }),
+                _ => serde_json::json!({
+                    "content": "流程图已经生成并展示。",
+                    "finish_reason": "stop"
+                }),
+            };
+            Ok(model_response(payload))
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<ModelResponse, BridgeClientError> {
             self.invoke(request)
         }
     }
@@ -4762,6 +5118,296 @@ mod tests {
     }
 
     #[test]
+    fn task_loop_requires_delivery_evidence_before_accepting_final_text() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(128);
+        let session_id = SessionId::new("session-required-delivery-evidence");
+        let workspace_id = Some(WorkspaceId::new("workspace-required-delivery-evidence"));
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "required delivery evidence",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+
+        let task_store = TaskStore::new();
+        let mut task = make_task_loop_test_task("task-required-delivery-evidence");
+        task.goal = "生成当前项目流程图".to_string();
+        task.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+        task.completion_contract = magi_core::TaskCompletionContract::default()
+            .with_evidence_requirements(vec![
+                magi_core::TaskEvidenceRequirement::successful_tool_call("diagram_render"),
+            ]);
+        task_store.insert_task(task.clone());
+        let worker_id = WorkerId::new("worker-required-delivery-evidence");
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "coordinator",
+                60_000,
+            )
+            .expect("lease should be granted");
+        let (_, thread_id) =
+            session_store
+                .ensure_session_mission(&session_id, UtcMillis::now(), || task.mission_id.clone());
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-required-delivery-evidence".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("生成当前项目流程图".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("turn should be creatable");
+
+        let probe = Arc::new(ConcurrentTaskToolProbe::new(Duration::from_millis(0)));
+        let tool_event_bus = Arc::new(InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::clone(&tool_event_bus),
+        );
+        tool_registry.register_builtin(Arc::new(ProbeTaskBuiltinTool::new(
+            "file_read",
+            Arc::clone(&probe),
+        )));
+        tool_registry
+            .register_builtin(Arc::new(ProbeTaskBuiltinTool::new("diagram_render", probe)));
+        let client = EvidenceThenFinalTaskModelBridgeClient {
+            invoke_count: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        };
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: Some(&tool_registry),
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
+            conversation_registry: &ConversationRegistry::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
+            plan_store: &crate::test_plan_store("test-plan"),
+            project_memory: None,
+            mission_metrics: None,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: task.goal.clone(),
+            images: Vec::new(),
+            tools: Some(vec![
+                exposed_test_tool("file_read"),
+                exposed_test_tool("diagram_render"),
+            ]),
+            usage_binding: &usage_binding,
+            streaming_entry_id: None,
+            is_sidechain: false,
+            worker_id: None,
+            thread_id: &thread_id,
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
+            persist_session_state: None,
+        });
+
+        assert!(matches!(outcome, TaskOutcome::Completed { .. }));
+        assert_eq!(client.invoke_count.load(Ordering::SeqCst), 3);
+        let requests = client
+            .requests
+            .lock()
+            .expect("evidence requests mutex poisoned");
+        assert_eq!(requests[0].tools.as_ref().map(Vec::len), Some(2));
+        assert!(requests[0].tool_choice.is_none());
+        assert_eq!(requests[1].tools.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            requests[1]
+                .tool_choice
+                .as_ref()
+                .map(|choice| choice.function.name.as_str()),
+            Some("diagram_render")
+        );
+        let history = session_store.thread_message_history(&thread_id);
+        let diagram_call_id = history
+            .iter()
+            .flat_map(|message| message.tool_calls.iter())
+            .find(|tool_call| tool_call.function.name == "diagram_render")
+            .map(|tool_call| tool_call.id.as_str())
+            .expect("diagram_render call should be persisted");
+        assert!(history.iter().any(|message| {
+            message.role == "tool"
+                && message.tool_call_id.as_deref() == Some(diagram_call_id)
+                && message.content.is_some()
+        }));
+    }
+
+    #[test]
+    fn resumed_task_reuses_completed_delivery_evidence_without_repeating_tool() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(64);
+        let session_id = SessionId::new("session-resumed-delivery-evidence");
+        let workspace_id = Some(WorkspaceId::new("workspace-resumed-delivery-evidence"));
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "resumed delivery evidence",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+
+        let task_store = TaskStore::new();
+        let mut task = make_task_loop_test_task("task-resumed-delivery-evidence");
+        task.goal = "继续生成当前项目流程图".to_string();
+        task.executor_binding = Some(magi_core::TaskExecutorBinding::for_role("coordinator"));
+        task.completion_contract = magi_core::TaskCompletionContract::default()
+            .with_evidence_requirements(vec![
+                magi_core::TaskEvidenceRequirement::successful_tool_call("diagram_render"),
+            ]);
+        task.recovery_checkpoint = Some(magi_core::TaskRecoveryCheckpoint {
+            source_session_id: session_id.clone(),
+            source_task_id: TaskId::new("task-resumed-delivery-source"),
+            source_turn_id: "turn-resumed-delivery-source".to_string(),
+            source_thread_id: ThreadId::new("thread-resumed-delivery-source"),
+        });
+        task_store.insert_task(task.clone());
+        let worker_id = WorkerId::new("worker-resumed-delivery-evidence");
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "coordinator",
+                60_000,
+            )
+            .expect("lease should be granted");
+        let (_, thread_id) =
+            session_store
+                .ensure_session_mission(&session_id, UtcMillis::now(), || task.mission_id.clone());
+        session_store.append_thread_messages(
+            &thread_id,
+            vec![
+                ThreadChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    images: Vec::new(),
+                    tool_calls: vec![magi_session_store::ThreadChatToolCall {
+                        id: "call-existing-diagram".to_string(),
+                        kind: "function".to_string(),
+                        function: magi_session_store::ThreadChatToolFunction {
+                            name: "diagram_render".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    }],
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                },
+                ThreadChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(
+                        serde_json::json!({
+                            "tool": "diagram_render",
+                            "status": "succeeded",
+                            "summary": "diagram rendered"
+                        })
+                        .to_string(),
+                    ),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some("call-existing-diagram".to_string()),
+                    provider_context: Vec::new(),
+                },
+            ],
+            UtcMillis::now(),
+        );
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-resumed-delivery-current".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("继续".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("turn should be creatable");
+
+        let client = StaticTaskFinalModelBridgeClient {
+            content: "流程图已生成，继续任务已完成。",
+        };
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
+            conversation_registry: &ConversationRegistry::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
+            plan_store: &crate::test_plan_store("test-plan"),
+            project_memory: None,
+            mission_metrics: None,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: task.goal.clone(),
+            images: Vec::new(),
+            tools: Some(vec![exposed_test_tool("diagram_render")]),
+            usage_binding: &usage_binding,
+            streaming_entry_id: None,
+            is_sidechain: false,
+            worker_id: None,
+            thread_id: &thread_id,
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
+            persist_session_state: None,
+        });
+
+        assert!(matches!(outcome, TaskOutcome::Completed { .. }));
+        let history = session_store.thread_message_history(&thread_id);
+        assert_eq!(
+            history
+                .iter()
+                .flat_map(|message| message.tool_calls.iter())
+                .filter(|call| call.function.name == "diagram_render")
+                .count(),
+            1,
+            "已成功的 diagram_render 证据不得在恢复任务中重复执行"
+        );
+    }
+
+    #[test]
     fn planning_no_tool_action_and_validation_are_deterministic() {
         let task_store = TaskStore::new();
         let mut planning = make_task_loop_test_task("task-planning-deterministic");
@@ -4993,6 +5639,8 @@ mod tests {
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -5278,8 +5926,8 @@ mod tests {
         );
 
         match outcome {
-            TaskOutcome::Completed { output_refs } => {
-                assert_eq!(output_refs.len(), 1);
+            TaskOutcome::Completed { attempt } => {
+                assert_eq!(attempt.output_refs.len(), 1);
             }
             other => panic!("action task should not use validation wording gate, got {other:?}"),
         }
@@ -5487,9 +6135,10 @@ mod tests {
         });
 
         match outcome {
-            TaskOutcome::Completed { output_refs } => {
+            TaskOutcome::Completed { attempt } => {
                 assert!(
-                    output_refs
+                    attempt
+                        .output_refs
                         .first()
                         .is_some_and(|content| content.contains("工具失败后已完成可交付总结"))
                 );
@@ -5577,9 +6226,10 @@ mod tests {
         });
 
         match outcome {
-            TaskOutcome::Completed { output_refs } => {
+            TaskOutcome::Completed { attempt } => {
                 assert!(
-                    output_refs
+                    attempt
+                        .output_refs
                         .first()
                         .is_some_and(|content| content.contains("重试恢复"))
                 );
@@ -6909,7 +7559,7 @@ mod tests {
         });
 
         let output_refs = match outcome {
-            TaskOutcome::Completed { output_refs } => output_refs,
+            TaskOutcome::Completed { attempt } => attempt.output_refs,
             other => panic!("task loop should complete, got {other:?}"),
         };
         assert!(
@@ -7093,7 +7743,7 @@ mod tests {
             "task worker 中的多个只读 shell 工具调用必须并发执行"
         );
         let output_refs = match outcome {
-            TaskOutcome::Completed { output_refs } => output_refs,
+            TaskOutcome::Completed { attempt } => attempt.output_refs,
             other => panic!("task loop should complete, got {other:?}"),
         };
         let output: serde_json::Value =

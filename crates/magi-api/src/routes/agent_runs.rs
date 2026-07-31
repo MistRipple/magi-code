@@ -775,6 +775,8 @@ mod tests {
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             knowledge_refs: Vec::new(),
             workspace_scope: Some("/tmp/magi-task-workspace-a".to_string()),
             write_scope: None,

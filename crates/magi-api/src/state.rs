@@ -117,6 +117,10 @@ pub(crate) struct QueuedRegularSessionTurn {
     pub tool_intent: Option<String>,
     pub forced_tool_name: Option<String>,
     pub required_tool_chain: Vec<String>,
+    #[serde(default)]
+    pub completion_contract: magi_core::TaskCompletionContract,
+    #[serde(default)]
+    pub recovery_checkpoint: Option<magi_core::TaskRecoveryCheckpoint>,
     pub session_id: SessionId,
     pub workspace_id: Option<WorkspaceId>,
     pub queue_id: String,
@@ -3270,6 +3274,8 @@ mod tests {
             tool_intent: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             session_id: session_id.clone(),
             workspace_id: Some(workspace_id.clone()),
             queue_id: queue_id.to_string(),
@@ -3371,6 +3377,8 @@ mod tests {
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,

@@ -583,7 +583,7 @@ impl LlmTaskDispatcher {
         let Some(store) = self.knowledge_store.as_ref() else {
             return;
         };
-        let TaskOutcome::Completed { output_refs } = outcome else {
+        let TaskOutcome::Completed { attempt } = outcome else {
             return;
         };
 
@@ -605,7 +605,7 @@ impl LlmTaskDispatcher {
             .rev()
             .collect::<Vec<_>>()
             .join("\n\n");
-        let output_text = output_refs.join("\n\n");
+        let output_text = attempt.output_refs.join("\n\n");
         let extraction_text = format!("{timeline_text}\n\n{output_text}");
         let Some(client) =
             resolve_target_for_role(settings_store, None, RoleTarget::Auxiliary, None)
@@ -2768,6 +2768,8 @@ mod tests {
                 escalation_conditions: Vec::new(),
             }),
             executor_binding: Some(magi_core::TaskExecutorBinding::for_role(role)),
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,

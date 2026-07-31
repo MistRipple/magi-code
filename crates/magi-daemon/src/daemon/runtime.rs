@@ -25,14 +25,14 @@ use magi_conversation_runtime::{
         current_turn_status_is_terminal, publish_task_status_turn_item_for_active_sessions,
     },
     task_execution_dispatcher::{LlmTaskDispatcher, LlmTaskDispatcherDependencies},
-    task_runner_bridge::{EventBasedResultReceiver, TaskOutcome, TaskResult},
+    task_runner_bridge::EventBasedResultReceiver,
     usage_recording::{
         ModelUsageRecordInput, image_generation_model_usage_binding,
         publish_model_usage_record_with_config,
     },
 };
 use magi_core::{
-    EventId, ExecutionOwnership, LeaseId, SessionId, TaskStatus, UtcMillis, public_runtime_excerpt,
+    EventId, ExecutionOwnership, SessionId, TaskStatus, UtcMillis, public_runtime_excerpt,
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_governance::GovernanceService;
@@ -1382,7 +1382,6 @@ impl DaemonRuntime {
             Ok(Some(restored)) => {
                 let eb = event_bus_for_task_store.clone();
                 let session_store = session_store_for_task_status.clone();
-                let receiver = runner_result_receiver.clone();
                 restored.set_status_change_callback(Box::new(
                     move |task_id, old_status, new_status, task: magi_core::Task| {
                         sync_task_plan_status(
@@ -1407,7 +1406,6 @@ impl DaemonRuntime {
                             &task,
                             new_status,
                         );
-                        push_terminal_task_result(&receiver, task_id, new_status);
                     },
                 ));
                 let (revoked_leases, failed_tasks) = restored
@@ -1422,7 +1420,6 @@ impl DaemonRuntime {
                 Arc::new(restored)
             }
             _ => {
-                let receiver = runner_result_receiver.clone();
                 let session_store = session_store_for_task_status.clone();
                 Arc::new(TaskStore::with_status_change_callback(Box::new(
                     move |task_id, old_status, new_status, task: magi_core::Task| {
@@ -1448,7 +1445,6 @@ impl DaemonRuntime {
                             &task,
                             new_status,
                         );
-                        push_terminal_task_result(&receiver, task_id, new_status);
                     },
                 )))
             }
@@ -2059,38 +2055,6 @@ impl DaemonRuntime {
     }
 }
 
-fn push_terminal_task_result(
-    receiver: &Arc<EventBasedResultReceiver>,
-    task_id: &magi_core::TaskId,
-    new_status: TaskStatus,
-) {
-    match new_status {
-        TaskStatus::Completed => {
-            receiver.push_result(TaskResult {
-                task_id: task_id.clone(),
-                lease_id: LeaseId::new(format!("lease-result-{}", task_id)),
-                outcome: TaskOutcome::Completed {
-                    output_refs: Vec::new(),
-                },
-            });
-        }
-        TaskStatus::Failed => {
-            receiver.push_result(TaskResult {
-                task_id: task_id.clone(),
-                lease_id: LeaseId::new(format!("lease-result-{}", task_id)),
-                outcome: TaskOutcome::Failed {
-                    error: "task store reported terminal failure".to_string(),
-                },
-            });
-        }
-        _ => {
-            // 非终态重置代表任务将重新派发；必须清掉旧终态结果，避免 runner
-            // 下一轮先消费陈旧失败/完成事件。
-            receiver.clear_task_result_state(task_id);
-        }
-    }
-}
-
 fn settle_task_execution_threads(
     session_store: &SessionStore,
     task_id: &magi_core::TaskId,
@@ -2485,6 +2449,8 @@ done
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,

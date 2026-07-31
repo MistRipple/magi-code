@@ -152,6 +152,8 @@ fn task_serialization_roundtrip() {
                 ])
                 .with_parallelism_group(Some("group-a".to_string())),
         ),
+        completion_contract: crate::TaskCompletionContract::default(),
+        recovery_checkpoint: None,
         knowledge_refs: Vec::new(),
         workspace_scope: Some("/workspace".to_string()),
         write_scope: Some("/workspace/src".to_string()),

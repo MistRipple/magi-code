@@ -558,6 +558,8 @@ mod tests {
                 escalation_conditions: Vec::new(),
             }),
             executor_binding: Some(binding),
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,

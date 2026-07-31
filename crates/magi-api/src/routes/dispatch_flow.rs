@@ -1,5 +1,6 @@
 use magi_core::{
-    EventId, SessionId, TaskStatus, TaskTier, UtcMillis, WorkspaceId, public_runtime_excerpt,
+    EventId, SessionId, TaskCompletionContract, TaskRecoveryCheckpoint, TaskStatus, TaskTier,
+    UtcMillis, WorkspaceId, public_runtime_excerpt,
 };
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::ActiveExecutionTurn;
@@ -47,6 +48,8 @@ pub(super) async fn accept_session_task_submission(
             task_tier,
             accepted_at: monotonic_accepted_at(),
             required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             denied_tools: Vec::new(),
         },
     )
@@ -61,6 +64,8 @@ pub(super) struct SessionTaskSubmissionInput {
     pub task_tier: TaskTier,
     pub accepted_at: UtcMillis,
     pub required_tool_chain: Vec<String>,
+    pub completion_contract: TaskCompletionContract,
+    pub recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
     pub denied_tools: Vec<String>,
 }
 
@@ -77,6 +82,8 @@ pub(super) async fn accept_session_task_submission_at(
         task_tier,
         accepted_at,
         required_tool_chain,
+        completion_contract,
+        recovery_checkpoint,
         denied_tools,
     } = input;
     let trimmed_text = request.trimmed_text();
@@ -109,6 +116,8 @@ pub(super) async fn accept_session_task_submission_at(
             request,
             accepted_at,
             required_tool_chain,
+            completion_contract,
+            recovery_checkpoint,
             denied_tools,
         },
     )
@@ -161,6 +170,8 @@ pub(super) async fn accept_goal_continuation_task_submission(
         placeholder_message_id: None,
         replace_turn_id: None,
         required_tool_chain: vec!["get_goal".to_string()],
+        completion_contract: TaskCompletionContract::default(),
+        recovery_checkpoint: None,
         denied_tools: Vec::new(),
         turn_origin: DispatchTurnOrigin::GoalContinuation,
     };
@@ -186,6 +197,8 @@ struct ExecuteDispatchSubmissionInput<'a> {
     request: &'a SessionTurnRequestDto,
     accepted_at: UtcMillis,
     required_tool_chain: Vec<String>,
+    completion_contract: TaskCompletionContract,
+    recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
     denied_tools: Vec<String>,
 }
 
@@ -207,6 +220,8 @@ async fn execute_dispatch_submission(
         request,
         accepted_at,
         required_tool_chain,
+        completion_contract,
+        recovery_checkpoint,
         denied_tools,
     } = input;
     let placeholder_title = crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
@@ -261,6 +276,8 @@ async fn execute_dispatch_submission(
         placeholder_message_id: request.placeholder_message_id(),
         replace_turn_id: request.replace_turn_id(),
         required_tool_chain,
+        completion_contract,
+        recovery_checkpoint,
         denied_tools,
         turn_origin: DispatchTurnOrigin::User,
     };
@@ -764,6 +781,8 @@ mod tests {
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,

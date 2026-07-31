@@ -5,8 +5,8 @@ use crate::{
 };
 use magi_context_runtime::{ExecutionContextAssemblyRequest, ExecutionContextClues};
 use magi_core::{
-    DomainError, ExecutionResultStatus, SessionId, TaskExecutionTarget, TaskStatus, WorkerId,
-    WorkspaceId,
+    DomainError, ExecutionResultStatus, SessionId, TaskCompletionAttempt, TaskExecutionTarget,
+    TaskStatus, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventCategory, EventContext};
 use magi_skill_runtime::SkillToolRuntimePlan;
@@ -266,6 +266,9 @@ impl OrchestratedExecutionRuntime {
                 }
             })?;
         }
+        self.task_store
+            .update_status_checked(&target.task_id, TaskStatus::Running)
+            .map_err(|error| map_task_store_error(&target.task_id, error))?;
         self.worker_runtime
             .register_execution_intent(intent.clone());
         let loop_controller = match self.worker_runtime.executor_kind() {
@@ -362,56 +365,39 @@ impl OrchestratedExecutionRuntime {
         workspace_id: &Option<WorkspaceId>,
     ) -> Result<(), OrchestratorCommandError> {
         let next_status = match report.termination_reason {
-            Some(magi_core::TerminationReason::Completed) => TaskStatus::Completed,
-            Some(magi_core::TerminationReason::Failed) => TaskStatus::Failed,
-            Some(magi_core::TerminationReason::Blocked) => TaskStatus::Failed,
+            Some(magi_core::TerminationReason::Failed | magi_core::TerminationReason::Blocked) => {
+                TaskStatus::Failed
+            }
             Some(magi_core::TerminationReason::Cancelled) => TaskStatus::Killed,
+            Some(magi_core::TerminationReason::Completed) => TaskStatus::Running,
             None => match report.stage {
                 WorkerStage::Execute
                 | WorkerStage::Review
                 | WorkerStage::Verify
-                | WorkerStage::Repair => TaskStatus::Running,
-                WorkerStage::Finish => {
-                    if report.result_kind == Some(magi_core::TaskResultKind::Success)
-                        && report.verification_status != magi_core::VerificationStatus::Failed
-                    {
-                        TaskStatus::Completed
-                    } else {
-                        TaskStatus::Failed
-                    }
-                }
+                | WorkerStage::Repair
+                | WorkerStage::Finish => TaskStatus::Running,
             },
         };
-        self.task_store
-            .update_status(&report.task_id, next_status)
-            .map_err(|error| match error {
-                DomainError::NotFound { .. } => OrchestratorCommandError::TaskNotFound {
-                    task_id: report.task_id.clone(),
+        let update_result = if matches!(
+            report.termination_reason,
+            Some(magi_core::TerminationReason::Completed)
+        ) || (report.termination_reason.is_none()
+            && report.stage == WorkerStage::Finish
+            && report.result_kind == Some(magi_core::TaskResultKind::Success)
+            && report.verification_status != magi_core::VerificationStatus::Failed)
+        {
+            self.task_store.complete_task(
+                &report.task_id,
+                TaskCompletionAttempt {
+                    output_refs: vec![report.summary.clone()],
+                    final_response: Some(report.summary.clone()),
+                    evidence: Vec::new(),
                 },
-                DomainError::AlreadyExists { entity } => {
-                    OrchestratorCommandError::TaskStateViolation {
-                        task_id: report.task_id.clone(),
-                        message: format!(
-                            "unexpected existing entity while applying report: {entity}"
-                        ),
-                    }
-                }
-                DomainError::InvalidState { message } | DomainError::Validation { message } => {
-                    OrchestratorCommandError::TaskStateViolation {
-                        task_id: report.task_id.clone(),
-                        message,
-                    }
-                }
-                DomainError::CurrentTurnConflict {
-                    session_id,
-                    active_turn_id,
-                } => OrchestratorCommandError::TaskStateViolation {
-                    task_id: report.task_id.clone(),
-                    message: format!(
-                        "session {session_id} already has active turn {active_turn_id}"
-                    ),
-                },
-            })?;
+            )
+        } else {
+            self.task_store.update_status(&report.task_id, next_status)
+        };
+        update_result.map_err(|error| map_task_store_error(&report.task_id, error))?;
         let assignment_id = execution_overview::assignment_id_for_task(
             &self.task_store,
             &target.root_task_id,
@@ -479,6 +465,34 @@ impl OrchestratedExecutionRuntime {
                 "status": format!("{:?}", observation.status)
             }),
         );
+    }
+}
+
+fn map_task_store_error(
+    task_id: &magi_core::TaskId,
+    error: DomainError,
+) -> OrchestratorCommandError {
+    match error {
+        DomainError::NotFound { .. } => OrchestratorCommandError::TaskNotFound {
+            task_id: task_id.clone(),
+        },
+        DomainError::AlreadyExists { entity } => OrchestratorCommandError::TaskStateViolation {
+            task_id: task_id.clone(),
+            message: format!("unexpected existing entity while applying report: {entity}"),
+        },
+        DomainError::InvalidState { message } | DomainError::Validation { message } => {
+            OrchestratorCommandError::TaskStateViolation {
+                task_id: task_id.clone(),
+                message,
+            }
+        }
+        DomainError::CurrentTurnConflict {
+            session_id,
+            active_turn_id,
+        } => OrchestratorCommandError::TaskStateViolation {
+            task_id: task_id.clone(),
+            message: format!("session {session_id} already has active turn {active_turn_id}"),
+        },
     }
 }
 

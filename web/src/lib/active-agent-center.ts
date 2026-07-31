@@ -1,4 +1,5 @@
 import type {
+  AgentRunActionKind,
   AgentProjectionDto,
   AgentRunOutcome,
 } from '../shared/rust-backend-types';
@@ -114,6 +115,14 @@ export function buildActiveAgentSummary(groups: ActiveAgentGroups): ActiveAgentS
     completedCount,
     triggerCount: activeCount + attentionCount + completedCount,
   };
+}
+
+export function isPrimaryAgentRunAction(
+  action: AgentRunActionKind,
+  availableActions: ReadonlyArray<AgentRunActionKind>,
+): boolean {
+  return action === 'continue'
+    || (action === 'restart' && !availableActions.includes('continue'));
 }
 
 export function agentDurationSeconds(agent: AgentProjectionDto, nowMs: number): number {

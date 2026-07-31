@@ -481,7 +481,27 @@ pub fn task_required_tool_chain(
     {
         return Vec::new();
     }
-    let normalized = task.goal.to_ascii_lowercase();
+    requested_required_tool_chain(&task.goal)
+}
+
+/// 从规范工具名和产品公开名称中提取用户明确要求执行的内置工具链。
+///
+/// 自然语言名称只在同一分句中存在“调用/使用/执行/运行”动作时才识别，避免把
+/// 问题描述里的工具名称误当成执行要求。
+pub fn requested_public_builtin_tool_chain(text: &str) -> Vec<String> {
+    requested_public_builtin_tool_matches(text)
+        .into_iter()
+        .map(|(tool_name, _)| tool_name.to_string())
+        .collect()
+}
+
+/// 从用户原始目标中提取必须实际完成的工具动作，并保留原文顺序。
+///
+/// 与 `requested_public_builtin_tool_chain` 不同，这里还识别“读取真实代码”等
+/// 产品动作，用于建立任务完成契约；它不参与普通聊天路由，只在入口已经确认需要
+/// 执行任务时生效。
+pub fn requested_required_tool_chain(text: &str) -> Vec<String> {
+    let normalized = text.to_ascii_lowercase();
     let mut matches = requested_public_builtin_tool_matches(&normalized);
     for (canonical_name, position) in semantic_required_tool_references(&normalized) {
         if let Some((_, existing_position)) =
@@ -494,17 +514,6 @@ pub fn task_required_tool_chain(
     }
     matches.sort_by_key(|(_, position)| *position);
     matches
-        .into_iter()
-        .map(|(tool_name, _)| tool_name.to_string())
-        .collect()
-}
-
-/// 从规范工具名和产品公开名称中提取用户明确要求执行的内置工具链。
-///
-/// 自然语言名称只在同一分句中存在“调用/使用/执行/运行”动作时才识别，避免把
-/// 问题描述里的工具名称误当成执行要求。
-pub fn requested_public_builtin_tool_chain(text: &str) -> Vec<String> {
-    requested_public_builtin_tool_matches(text)
         .into_iter()
         .map(|(tool_name, _)| tool_name.to_string())
         .collect()
@@ -609,11 +618,21 @@ fn semantic_required_tool_references(text: &str) -> Vec<(&'static str, usize)> {
         &[
             "读取该文件",
             "读取文件",
+            "读取真实代码",
+            "读取真实源码",
+            "读取代码",
+            "读取源码",
+            "读取 readme",
             "读回文件",
             "验证内容",
             "校验内容",
             "read the file",
             "read file",
+            "read the actual code",
+            "read actual code",
+            "read the source code",
+            "read source code",
+            "read readme",
             "verify content",
             "validate content",
         ],
@@ -932,5 +951,15 @@ mod tests {
                 "{prompt}"
             );
         }
+    }
+
+    #[test]
+    fn completion_contract_preserves_real_code_read_before_named_delivery_tool() {
+        assert_eq!(
+            requested_required_tool_chain(
+                "请先读取 README.md 和真实代码，再调用 diagram_render 生成流程图"
+            ),
+            vec!["file_read".to_string(), "diagram_render".to_string()]
+        );
     }
 }

@@ -11,8 +11,8 @@ use magi_agent_role::AgentRoleRegistry;
 use magi_bridge_client::ModelBridgeClient;
 use magi_core::{
     AccessProfile, DomainError, ExecutionOwnership, MissionId, PlanItemId, SessionId,
-    TaskExecutionTarget, TaskExecutorBinding, TaskId, TaskKind, TaskStatus, TaskTier, UtcMillis,
-    WorkerId, WorkspaceId,
+    TaskCompletionContract, TaskExecutionTarget, TaskExecutorBinding, TaskId, TaskKind,
+    TaskRecoveryCheckpoint, TaskStatus, TaskTier, UtcMillis, WorkerId, WorkspaceId,
 };
 use magi_event_bus::{EventContext, InMemoryEventBus, task_events};
 use magi_orchestrator::{
@@ -20,8 +20,8 @@ use magi_orchestrator::{
 };
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
-    ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurn, SessionStore, TimelineEntryInput,
-    TimelineEntryKind,
+    ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurn, CanonicalTurnItemKind,
+    SessionStore, TimelineEntryInput, TimelineEntryKind,
 };
 use magi_spawn_graph::SpawnGraph;
 
@@ -88,6 +88,8 @@ pub struct DispatchSubmissionRequest {
     pub placeholder_message_id: Option<String>,
     pub replace_turn_id: Option<String>,
     pub required_tool_chain: Vec<String>,
+    pub completion_contract: TaskCompletionContract,
+    pub recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
     pub denied_tools: Vec<String>,
     pub turn_origin: DispatchTurnOrigin,
 }
@@ -237,6 +239,8 @@ struct DispatchTaskInput<'a> {
     context_references: &'a [SessionContextReference],
     workspace_root_path: Option<&'a Path>,
     required_tool_chain: Vec<String>,
+    completion_contract: TaskCompletionContract,
+    recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
     denied_tools: Vec<String>,
     plan_item_id: Option<PlanItemId>,
 }
@@ -255,6 +259,8 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         context_references,
         workspace_root_path,
         required_tool_chain,
+        completion_contract,
+        recovery_checkpoint,
         denied_tools,
         plan_item_id,
     } = input;
@@ -282,6 +288,8 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
             denied_tools,
         )),
         executor_binding: Some(executor_binding),
+        completion_contract,
+        recovery_checkpoint,
         knowledge_refs: Vec::new(),
         workspace_scope: None,
         write_scope: None,
@@ -364,6 +372,8 @@ pub fn run_dispatch_submission(
         context_references: &request.context_references,
         workspace_root_path: runtime.workspace_root_path,
         required_tool_chain: request.required_tool_chain.clone(),
+        completion_contract: request.completion_contract.clone(),
+        recovery_checkpoint: request.recovery_checkpoint.clone(),
         denied_tools: request.denied_tools.clone(),
         plan_item_id: plan_item_id.clone(),
     });
@@ -399,6 +409,14 @@ pub fn run_dispatch_submission(
         &act_task_id,
         now,
     );
+    if let Some(recovery_checkpoint) = request.recovery_checkpoint.as_ref() {
+        seed_interrupted_turn_checkpoint(
+            runtime.session_store,
+            recovery_checkpoint,
+            &worker_thread_id,
+            now,
+        )?;
+    }
     let ownership = ExecutionOwnership {
         session_id: Some(session_id.clone()),
         workspace_id: workspace_id.clone(),
@@ -566,6 +584,80 @@ pub fn run_dispatch_submission(
     })
 }
 
+fn seed_interrupted_turn_checkpoint(
+    session_store: &SessionStore,
+    checkpoint: &TaskRecoveryCheckpoint,
+    destination_thread_id: &magi_core::ThreadId,
+    now: UtcMillis,
+) -> Result<(), DispatchSubmissionRunError> {
+    let source_turn = session_store
+        .canonical_turns_for_session(&checkpoint.source_session_id)
+        .into_iter()
+        .find(|turn| turn.turn_id == checkpoint.source_turn_id)
+        .ok_or_else(|| {
+            DispatchSubmissionRunError::InvalidInput(format!(
+                "续接来源 Turn 不存在: {}",
+                checkpoint.source_turn_id
+            ))
+        })?;
+    if source_turn.status != magi_session_store::CanonicalTurnStatus::Cancelled {
+        return Err(DispatchSubmissionRunError::InvalidInput(format!(
+            "续接来源 Turn 不是用户中断状态: {}",
+            checkpoint.source_turn_id
+        )));
+    }
+    let interrupted_by_user = source_turn.items.iter().any(|item| {
+        item.kind == CanonicalTurnItemKind::UserMessage
+            && item
+                .metadata
+                .get("interruptionSource")
+                .and_then(serde_json::Value::as_str)
+                == Some("user")
+    });
+    if !interrupted_by_user {
+        return Err(DispatchSubmissionRunError::InvalidInput(format!(
+            "续接来源 Turn 不是用户主动中断: {}",
+            checkpoint.source_turn_id
+        )));
+    }
+    if !source_turn.items.iter().any(|item| {
+        item.worker
+            .as_ref()
+            .and_then(|worker| worker.task_id.as_ref())
+            == Some(&checkpoint.source_task_id)
+    }) {
+        return Err(DispatchSubmissionRunError::InvalidInput(format!(
+            "续接来源 Turn 与任务不匹配: {}",
+            checkpoint.source_task_id
+        )));
+    }
+    let source_thread = session_store
+        .thread_registry_snapshot(&checkpoint.source_session_id)
+        .into_iter()
+        .find(|thread| thread.thread_id == checkpoint.source_thread_id)
+        .ok_or_else(|| {
+            DispatchSubmissionRunError::InvalidInput(format!(
+                "续接来源任务缺少持久化 Thread: {}",
+                checkpoint.source_task_id
+            ))
+        })?;
+    if !source_thread
+        .handled_task_ids
+        .contains(&checkpoint.source_task_id)
+    {
+        return Err(DispatchSubmissionRunError::InvalidInput(format!(
+            "续接来源 Thread 与任务不匹配: {}",
+            checkpoint.source_task_id
+        )));
+    }
+    session_store.replace_thread_messages(
+        destination_thread_id,
+        source_thread.message_history,
+        now,
+    );
+    Ok(())
+}
+
 pub fn accept_dispatch_submission(
     session_store: &SessionStore,
     task_store: Option<&TaskStore>,
@@ -662,7 +754,10 @@ pub fn accept_dispatch_submission(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_session_store::{ExecutionThread, ExecutionThreadStatus, ThreadChatMessage};
+    use magi_session_store::{
+        ExecutionThread, ExecutionThreadStatus, ThreadChatMessage, ThreadChatToolCall,
+        ThreadChatToolFunction,
+    };
 
     #[test]
     fn dispatch_submission_creates_fresh_worker_thread_even_when_role_has_idle_history() {
@@ -725,6 +820,8 @@ mod tests {
             placeholder_message_id: None,
             replace_turn_id: None,
             required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             denied_tools: Vec::new(),
             turn_origin: DispatchTurnOrigin::User,
         };
@@ -759,6 +856,202 @@ mod tests {
                 .content
                 .as_deref(),
             Some("历史验收任务：写 validation_auto_save_marker.txt / COMPLEX_WORKER_LANE_OK")
+        );
+    }
+
+    #[test]
+    fn interrupted_turn_resume_uses_new_thread_with_explicit_checkpoint_history() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-dispatch-resume-checkpoint");
+        let source_task_id = TaskId::new("task-dispatch-resume-source");
+        let now = UtcMillis(2_500);
+
+        session_store
+            .create_session(session_id.clone(), "dispatch resume checkpoint")
+            .expect("session should be creatable");
+        let (mission_id, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || {
+                MissionId::new("mission-dispatch-resume-checkpoint")
+            });
+        let source_thread_id = magi_core::ThreadId::new("thread-dispatch-resume-source");
+        let source_history = vec![
+            ThreadChatMessage {
+                role: "user".to_string(),
+                content: Some("画当前项目流程图".to_string()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                provider_context: Vec::new(),
+            },
+            ThreadChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                images: Vec::new(),
+                tool_calls: vec![ThreadChatToolCall {
+                    id: "call-resume-file-read".to_string(),
+                    kind: "function".to_string(),
+                    function: ThreadChatToolFunction {
+                        name: "file_read".to_string(),
+                        arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
+                    },
+                }],
+                tool_call_id: None,
+                provider_context: Vec::new(),
+            },
+            ThreadChatMessage {
+                role: "tool".to_string(),
+                content: Some(r#"{"status":"succeeded","content":"workspace"}"#.to_string()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call-resume-file-read".to_string()),
+                provider_context: Vec::new(),
+            },
+        ];
+        session_store.register_thread(ExecutionThread {
+            thread_id: source_thread_id.clone(),
+            session_id: session_id.clone(),
+            mission_id,
+            role_id: "coordinator".to_string(),
+            worker_instance_id: WorkerId::new("worker-dispatch-resume-source"),
+            status: ExecutionThreadStatus::Idle,
+            created_at: now,
+            last_used_at: now,
+            handled_task_ids: vec![source_task_id.clone()],
+            message_history: source_history.clone(),
+        });
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-dispatch-resume-source".to_string(),
+                    turn_seq: now.0,
+                    accepted_at: now,
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("画当前项目流程图".to_string()),
+                    items: vec![ActiveExecutionTurnItem {
+                        item_id: "user-dispatch-resume-source".to_string(),
+                        item_seq: 1,
+                        kind: "user_message".to_string(),
+                        status: "completed".to_string(),
+                        source: "user".to_string(),
+                        title: None,
+                        content: Some("画当前项目流程图".to_string()),
+                        task_id: Some(source_task_id.clone()),
+                        worker_id: None,
+                        role_id: None,
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_status: None,
+                        tool_arguments: None,
+                        tool_result: None,
+                        tool_error: None,
+                        request_id: None,
+                        user_message_id: Some("user-dispatch-resume-source".to_string()),
+                        placeholder_message_id: None,
+                        metadata: Default::default(),
+                        timeline_entry_id: None,
+                        source_thread_id: orchestrator_thread_id,
+                    }],
+                },
+            )
+            .expect("source turn should persist");
+        session_store
+            .interrupt_current_turn_by_user(&session_id)
+            .expect("source turn should be interrupted by user");
+
+        let request = DispatchSubmissionRequest {
+            accepted_at: UtcMillis(3_000),
+            session_id: session_id.clone(),
+            workspace_id: Some(WorkspaceId::new("workspace-dispatch-resume-checkpoint")),
+            entry_id: "timeline-dispatch-resume-checkpoint".to_string(),
+            timeline_message: "继续".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            created_session: false,
+            mission_title: "继续中断任务".to_string(),
+            task_title: "继续: 画当前项目流程图".to_string(),
+            trimmed_text: Some("继续".to_string()),
+            execution_goal: Some("继续原始流程图任务".to_string()),
+            task_tier: TaskTier::ExecutionChain,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            goal_mode: false,
+            target_role: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            replace_turn_id: None,
+            required_tool_chain: vec!["file_read".to_string()],
+            completion_contract: TaskCompletionContract::default().with_evidence_requirements(
+                vec![magi_core::TaskEvidenceRequirement::successful_tool_call(
+                    "diagram_render",
+                )],
+            ),
+            recovery_checkpoint: Some(TaskRecoveryCheckpoint {
+                source_session_id: session_id.clone(),
+                source_task_id: source_task_id.clone(),
+                source_turn_id: "turn-dispatch-resume-source".to_string(),
+                source_thread_id: source_thread_id.clone(),
+            }),
+            denied_tools: Vec::new(),
+            turn_origin: DispatchTurnOrigin::User,
+        };
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: None,
+        };
+
+        let graph = run_dispatch_submission(&runtime, &request)
+            .expect("resume dispatch should build graph");
+        let destination_thread_id = graph
+            .active_execution_chain
+            .as_ref()
+            .and_then(|chain| chain.branches.first())
+            .map(|branch| branch.thread_id.clone())
+            .expect("resume task should own a thread");
+        assert_ne!(destination_thread_id, source_thread_id);
+        let destination_history = session_store.thread_message_history(&destination_thread_id);
+        assert_eq!(destination_history.len(), source_history.len());
+        assert_eq!(
+            destination_history[0].content.as_deref(),
+            Some("画当前项目流程图")
+        );
+        assert_eq!(
+            destination_history[1].tool_calls[0].function.name,
+            "file_read"
+        );
+        assert_eq!(
+            destination_history[2].tool_call_id.as_deref(),
+            Some("call-resume-file-read")
+        );
+        let resumed_task = task_store
+            .get_task(&graph.action_task_id)
+            .expect("resume action task should persist");
+        assert_eq!(
+            resumed_task
+                .recovery_checkpoint()
+                .map(|checkpoint| checkpoint.source_turn_id.as_str()),
+            Some("turn-dispatch-resume-source")
+        );
+        assert_eq!(resumed_task.required_tool_chain(), ["file_read"]);
+        assert_eq!(
+            resumed_task.completion_contract().evidence_requirements,
+            [magi_core::TaskEvidenceRequirement::successful_tool_call(
+                "diagram_render"
+            )]
         );
     }
 
@@ -807,6 +1100,8 @@ mod tests {
             placeholder_message_id: None,
             replace_turn_id: None,
             required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             denied_tools: Vec::new(),
             turn_origin: DispatchTurnOrigin::User,
         };
@@ -909,6 +1204,8 @@ mod tests {
             placeholder_message_id: None,
             replace_turn_id: None,
             required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             denied_tools: Vec::new(),
             turn_origin: DispatchTurnOrigin::User,
         };
@@ -973,6 +1270,8 @@ mod tests {
             placeholder_message_id: None,
             replace_turn_id: None,
             required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             denied_tools: Vec::new(),
             turn_origin: DispatchTurnOrigin::User,
         };
@@ -1043,6 +1342,8 @@ mod tests {
             placeholder_message_id: None,
             replace_turn_id: None,
             required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             denied_tools: Vec::new(),
             turn_origin: DispatchTurnOrigin::User,
         };
@@ -1119,6 +1420,8 @@ mod tests {
             placeholder_message_id: None,
             replace_turn_id: None,
             required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             denied_tools: Vec::new(),
             turn_origin: DispatchTurnOrigin::User,
         };
@@ -1204,6 +1507,8 @@ mod tests {
             placeholder_message_id: None,
             replace_turn_id: None,
             required_tool_chain: vec!["get_goal".to_string()],
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             denied_tools: Vec::new(),
             turn_origin: DispatchTurnOrigin::GoalContinuation,
         };

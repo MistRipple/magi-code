@@ -331,13 +331,18 @@ impl TaskRunner {
                 continue;
             }
             match result.outcome {
-                TaskOutcome::Completed { output_refs } => {
-                    self.store.set_output_refs(&result.task_id, output_refs);
-                    self.store
-                        .update_status(&result.task_id, TaskStatus::Completed)
-                        .map_err(|error| {
-                            format!("任务 {} 完成状态写入失败: {error}", result.task_id)
-                        })?;
+                TaskOutcome::Completed { attempt } => {
+                    if let Err(error) = self.store.complete_task(&result.task_id, attempt) {
+                        let message = format!("任务 {} 完成合同验证失败: {error}", result.task_id);
+                        self.store
+                            .set_output_refs(&result.task_id, vec![message.clone()]);
+                        self.store
+                            .update_status(&result.task_id, TaskStatus::Failed)
+                            .map_err(|status_error| {
+                                format!("{message}；失败状态写入失败: {status_error}")
+                            })?;
+                        return Err(message);
+                    }
                 }
                 TaskOutcome::Failed { error } => {
                     self.store.set_output_refs(&result.task_id, vec![error]);
@@ -524,6 +529,8 @@ mod tests {
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,

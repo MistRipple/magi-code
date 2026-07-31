@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-use crate::ids::{MissionId, PlanItemId, TaskId};
+use crate::ids::{MissionId, PlanItemId, SessionId, TaskId, ThreadId};
 use crate::value_objects::UtcMillis;
 
 /// 子代理上下文引用类型。引用只描述来源，不隐式展开正文；需要正文时必须通过
@@ -407,6 +408,202 @@ pub enum TaskRuntimePayload {
     },
 }
 
+/// 任务完成合同。
+///
+/// 合同由任务接收层在任务创建时生成并持久化。执行器只能提交完成尝试，不能自行
+/// 改写合同；恢复任务直接继承来源任务合同，禁止再次从自然语言猜测完成条件。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCompletionContract {
+    #[serde(default = "default_requires_final_response")]
+    pub requires_final_response: bool,
+    #[serde(default)]
+    pub evidence_requirements: Vec<TaskEvidenceRequirement>,
+}
+
+impl Default for TaskCompletionContract {
+    fn default() -> Self {
+        Self {
+            requires_final_response: true,
+            evidence_requirements: Vec::new(),
+        }
+    }
+}
+
+impl TaskCompletionContract {
+    pub fn with_evidence_requirements(
+        mut self,
+        requirements: Vec<TaskEvidenceRequirement>,
+    ) -> Self {
+        self.evidence_requirements = requirements;
+        self
+    }
+
+    pub fn validate(&self, attempt: &TaskCompletionAttempt) -> Result<(), String> {
+        if self.requires_final_response
+            && attempt
+                .final_response
+                .as_deref()
+                .is_none_or(|response| response.trim().is_empty())
+        {
+            return Err("任务完成尝试缺少最终回复".to_string());
+        }
+        for requirement in &self.evidence_requirements {
+            requirement.validate(&attempt.evidence)?;
+        }
+        Ok(())
+    }
+
+    pub fn first_missing_evidence<'a>(
+        &'a self,
+        evidence: &[TaskCompletionEvidence],
+    ) -> Option<&'a TaskEvidenceRequirement> {
+        self.evidence_requirements
+            .iter()
+            .find(|requirement| !requirement.is_satisfied_by(evidence))
+    }
+}
+
+fn default_requires_final_response() -> bool {
+    true
+}
+
+/// 可验证的任务完成证据要求。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TaskEvidenceRequirement {
+    SuccessfulToolCall {
+        tool_name: String,
+        #[serde(default = "default_minimum_successes")]
+        minimum_successes: u32,
+        #[serde(default)]
+        argument_equals: BTreeMap<String, serde_json::Value>,
+        #[serde(default)]
+        result_contains: Vec<String>,
+    },
+}
+
+impl TaskEvidenceRequirement {
+    pub fn successful_tool_call(tool_name: impl Into<String>) -> Self {
+        Self::SuccessfulToolCall {
+            tool_name: tool_name.into(),
+            minimum_successes: 1,
+            argument_equals: BTreeMap::new(),
+            result_contains: Vec::new(),
+        }
+    }
+
+    pub fn tool_name(&self) -> &str {
+        match self {
+            Self::SuccessfulToolCall { tool_name, .. } => tool_name,
+        }
+    }
+
+    pub fn is_satisfied_by(&self, evidence: &[TaskCompletionEvidence]) -> bool {
+        match self {
+            Self::SuccessfulToolCall {
+                tool_name,
+                minimum_successes,
+                argument_equals,
+                result_contains,
+            } => {
+                evidence
+                    .iter()
+                    .filter(|item| {
+                        item.matches_successful_tool_call(
+                            tool_name,
+                            argument_equals,
+                            result_contains,
+                        )
+                    })
+                    .count()
+                    >= *minimum_successes as usize
+            }
+        }
+    }
+
+    fn validate(&self, evidence: &[TaskCompletionEvidence]) -> Result<(), String> {
+        if self.is_satisfied_by(evidence) {
+            return Ok(());
+        }
+        let Self::SuccessfulToolCall {
+            tool_name,
+            minimum_successes,
+            ..
+        } = self;
+        let matched = evidence
+            .iter()
+            .filter(|item| match item {
+                TaskCompletionEvidence::SuccessfulToolCall {
+                    tool_name: actual_tool_name,
+                    ..
+                } => actual_tool_name == tool_name,
+            })
+            .count();
+        Err(format!(
+            "任务完成证据不足：工具 {tool_name} 需要成功 {minimum_successes} 次，实际匹配 {matched} 次"
+        ))
+    }
+}
+
+fn default_minimum_successes() -> u32 {
+    1
+}
+
+/// 执行器提交给统一完成门的结构化证据。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TaskCompletionEvidence {
+    SuccessfulToolCall {
+        call_id: String,
+        tool_name: String,
+        arguments: serde_json::Value,
+        result: String,
+    },
+}
+
+impl TaskCompletionEvidence {
+    fn matches_successful_tool_call(
+        &self,
+        required_tool_name: &str,
+        argument_equals: &BTreeMap<String, serde_json::Value>,
+        result_contains: &[String],
+    ) -> bool {
+        let Self::SuccessfulToolCall {
+            tool_name,
+            arguments,
+            result,
+            ..
+        } = self;
+        tool_name == required_tool_name
+            && argument_equals
+                .iter()
+                .all(|(pointer, expected)| arguments.pointer(pointer) == Some(expected))
+            && result_contains.iter().all(|needle| result.contains(needle))
+    }
+}
+
+/// 执行器完成一次任务时提交的不可变事实。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCompletionAttempt {
+    #[serde(default)]
+    pub output_refs: Vec<String>,
+    pub final_response: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<TaskCompletionEvidence>,
+}
+
+/// 中断任务恢复所使用的持久化检查点引用。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRecoveryCheckpoint {
+    pub source_session_id: SessionId,
+    pub source_task_id: TaskId,
+    pub source_turn_id: String,
+    pub source_thread_id: ThreadId,
+}
+
 /// 任务执行器绑定合同。
 ///
 /// 这是任务分派、子 agent spawn、任务恢复之间共享的稳定结构。字段为空表示未绑定，
@@ -433,6 +630,12 @@ pub struct TaskExecutorBinding {
     /// 其余协作决策仍由 root coordinator 在完整工具面中自行决定。
     #[serde(default)]
     pub required_tool_chain: Vec<String>,
+    /// 旧版本持久化字段，仅用于一次性载入迁移，不参与新任务执行。
+    #[serde(default, skip_serializing, rename = "required_evidence_tools")]
+    legacy_required_evidence_tools: Vec<String>,
+    /// 旧版本持久化字段，仅用于兼容已落盘的历史任务结构。
+    #[serde(default, skip_serializing, rename = "resumes_turn_id")]
+    legacy_resumes_turn_id: Option<String>,
 }
 
 impl TaskExecutorBinding {
@@ -534,6 +737,10 @@ pub struct Task {
     pub required_children: Vec<TaskId>,
     pub policy_snapshot: Option<TaskPolicy>,
     pub executor_binding: Option<TaskExecutorBinding>,
+    #[serde(default)]
+    pub completion_contract: TaskCompletionContract,
+    #[serde(default)]
+    pub recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
     pub knowledge_refs: Vec<String>,
     pub workspace_scope: Option<String>,
     pub write_scope: Option<String>,
@@ -605,6 +812,30 @@ impl Task {
             .as_ref()
             .map(TaskExecutorBinding::required_tool_chain)
             .unwrap_or_default()
+    }
+
+    pub fn completion_contract(&self) -> &TaskCompletionContract {
+        &self.completion_contract
+    }
+
+    pub fn recovery_checkpoint(&self) -> Option<&TaskRecoveryCheckpoint> {
+        self.recovery_checkpoint.as_ref()
+    }
+
+    /// 把旧版绑定中的完成约束提升为新的任务完成合同。
+    ///
+    /// 仅在 TaskStore 从历史 checkpoint 载入时调用一次；新执行路径不再读取旧字段。
+    pub fn migrate_persisted_completion_contract(&mut self) {
+        if self.completion_contract.evidence_requirements.is_empty()
+            && let Some(binding) = self.executor_binding.as_mut()
+        {
+            let legacy_requirements = std::mem::take(&mut binding.legacy_required_evidence_tools);
+            self.completion_contract.evidence_requirements = legacy_requirements
+                .into_iter()
+                .map(TaskEvidenceRequirement::successful_tool_call)
+                .collect();
+            binding.legacy_resumes_turn_id = None;
+        }
     }
 
     pub fn plan_item_id(&self) -> Option<&PlanItemId> {
@@ -720,5 +951,24 @@ mod tests {
             ["agent_spawn", "agent_wait"],
             "结构化工具链必须按入口声明的顺序执行，只去除重复项"
         );
+    }
+
+    #[test]
+    fn completion_contract_validates_structured_tool_evidence() {
+        let contract = TaskCompletionContract::default().with_evidence_requirements(vec![
+            TaskEvidenceRequirement::successful_tool_call("diagram_render"),
+        ]);
+        let attempt = TaskCompletionAttempt {
+            output_refs: vec!["diagram".to_string()],
+            final_response: Some("图表已生成".to_string()),
+            evidence: vec![TaskCompletionEvidence::SuccessfulToolCall {
+                call_id: "call-diagram".to_string(),
+                tool_name: "diagram_render".to_string(),
+                arguments: serde_json::json!({"format": "mermaid"}),
+                result: "rendered".to_string(),
+            }],
+        };
+
+        assert_eq!(contract.validate(&attempt), Ok(()));
     }
 }

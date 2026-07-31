@@ -416,6 +416,8 @@ mod tests {
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -766,10 +768,18 @@ mod tests {
             "被容量拒绝的子代理不能写入 spawn_graph"
         );
 
+        let completed_task_id = TaskId::new("task-child-capacity-executor-0");
         task_store
-            .update_status(
-                &TaskId::new("task-child-capacity-executor-0"),
-                TaskStatus::Completed,
+            .update_status(&completed_task_id, TaskStatus::Running)
+            .expect("executor 代理应进入运行态");
+        task_store
+            .complete_task(
+                &completed_task_id,
+                magi_core::TaskCompletionAttempt {
+                    output_refs: vec!["executor done".to_string()],
+                    final_response: Some("executor done".to_string()),
+                    evidence: Vec::new(),
+                },
             )
             .expect("完成一个 executor 代理后应释放角色容量");
         registry

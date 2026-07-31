@@ -4,7 +4,7 @@
 //! 结果接收器、event-based dispatcher 与 WorkerRuntime dispatcher。
 
 use crate::execution_admission::ExecutionAdmissionPermit;
-use magi_core::{LeaseId, Task, TaskId};
+use magi_core::{LeaseId, Task, TaskCompletionAttempt, TaskId};
 use magi_orchestrator::task_store::TaskLease;
 use magi_orchestrator::task_worker_catalog::WorkerInfo;
 use std::collections::HashSet;
@@ -64,8 +64,8 @@ pub struct TaskResult {
 /// Possible outcomes when a dispatched task finishes.
 #[derive(Clone, Debug)]
 pub enum TaskOutcome {
-    /// Execution succeeded.  `output_refs` lists any produced artefacts.
-    Completed { output_refs: Vec<String> },
+    /// 执行器提交完成尝试；只有统一完成门验证合同后才会进入 Completed。
+    Completed { attempt: TaskCompletionAttempt },
     /// Execution failed with the given error description.
     Failed { error: String },
 }
@@ -177,7 +177,11 @@ mod tests {
             task_id: task_id.clone(),
             lease_id: LeaseId::new("lease-current"),
             outcome: TaskOutcome::Completed {
-                output_refs: vec!["current result".to_string()],
+                attempt: TaskCompletionAttempt {
+                    output_refs: vec!["current result".to_string()],
+                    final_response: Some("current result".to_string()),
+                    evidence: Vec::new(),
+                },
             },
         });
 
@@ -185,8 +189,8 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].lease_id, LeaseId::new("lease-current"));
         match &results[0].outcome {
-            TaskOutcome::Completed { output_refs } => {
-                assert_eq!(output_refs, &vec!["current result".to_string()]);
+            TaskOutcome::Completed { attempt } => {
+                assert_eq!(attempt.output_refs, vec!["current result".to_string()]);
             }
             TaskOutcome::Failed { error } => panic!("不应消费旧失败结果: {error}"),
         }
@@ -208,7 +212,11 @@ mod tests {
             task_id,
             lease_id: LeaseId::new("lease-current"),
             outcome: TaskOutcome::Completed {
-                output_refs: vec!["current result".to_string()],
+                attempt: TaskCompletionAttempt {
+                    output_refs: vec!["current result".to_string()],
+                    final_response: Some("current result".to_string()),
+                    evidence: Vec::new(),
+                },
             },
         });
 

@@ -68,9 +68,10 @@ pub use task_helpers::{
     forced_task_tool_choice_for_round, is_execution_tool_validation, is_planning_no_tool_action,
     is_planning_text_validation, is_tool_reference_boundary, public_builtin_tool_references,
     record_completed_required_tools, requested_public_builtin_tool_chain,
-    required_tool_chain_is_complete, required_tool_chain_recovery_prompt,
-    required_tool_definitions_for_round, task_required_tool_chain, task_turn_visibility,
-    tool_call_round_limit, tool_reference_position, validation_result_rejects_delivery,
+    requested_required_tool_chain, required_tool_chain_is_complete,
+    required_tool_chain_recovery_prompt, required_tool_definitions_for_round,
+    task_required_tool_chain, task_turn_visibility, tool_call_round_limit, tool_reference_position,
+    validation_result_rejects_delivery,
 };
 pub(crate) use tool_batch::execute_task_tool_call_batch;
 pub use turn::{Turn, TurnState, TurnTransitionError};

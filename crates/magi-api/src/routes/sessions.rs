@@ -6,10 +6,11 @@ use axum::{
 use magi_conversation_runtime::session_writeback::publish_current_session_turn_item_event;
 use magi_conversation_runtime::{
     SessionTurnInputCommitError, SessionTurnInputError, UserSignal,
-    requested_public_builtin_tool_chain,
+    requested_public_builtin_tool_chain, requested_required_tool_chain,
 };
 use magi_core::{
-    AccessProfile, DomainError, EventId, SessionId, TaskTier, UtcMillis, WorkerId, WorkspaceId,
+    AccessProfile, DomainError, EventId, SessionId, TaskCompletionContract,
+    TaskEvidenceRequirement, TaskRecoveryCheckpoint, TaskTier, UtcMillis, WorkerId, WorkspaceId,
     public_runtime_excerpt,
 };
 use magi_core::{SessionLifecycleStatus, TaskStatus};
@@ -421,6 +422,8 @@ struct SessionTurnIntentDecision {
     tool_intent: Option<String>,
     forced_tool_name: Option<String>,
     required_tool_chain: Vec<String>,
+    completion_contract: TaskCompletionContract,
+    recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
     confidence: f64,
     reason_code: Option<String>,
     route_reason: Option<String>,
@@ -470,6 +473,8 @@ fn enqueue_session_turn_response(
         tool_intent: decision.tool_intent.clone(),
         forced_tool_name: decision.forced_tool_name.clone(),
         required_tool_chain: decision.required_tool_chain.clone(),
+        completion_contract: decision.completion_contract.clone(),
+        recovery_checkpoint: decision.recovery_checkpoint.clone(),
         session_id: session_id.clone(),
         workspace_id: workspace_id.clone(),
         queue_id: queue_id.clone(),
@@ -686,6 +691,28 @@ fn decide_session_turn_with_task_planner(
             "当前会话的恢复正在启动，请等待本轮恢复完成",
         ));
     }
+    if request.replace_turn_id().is_none()
+        && let Some(resume) = user_interrupted_turn_resume(state, request)
+    {
+        return Ok(SessionTurnIntentDecision {
+            route: SessionTurnRouteDto::Execute,
+            task_title: Some(format!("继续: {}", resume.original_user_message)),
+            execution_goal: Some(interrupted_turn_resume_goal(
+                &resume,
+                request.trimmed_text().as_deref().unwrap_or("继续"),
+            )),
+            task_tier: TaskTier::ExecutionChain,
+            tool_intent: None,
+            forced_tool_name: None,
+            required_tool_chain: resume.required_tool_chain,
+            completion_contract: resume.completion_contract,
+            recovery_checkpoint: Some(resume.recovery_checkpoint),
+            confidence: 1.0,
+            reason_code: Some("user_interrupted_turn_resume".to_string()),
+            route_reason: Some("用户明确要求从最近一次主动中断的 Turn 检查点继续。".to_string()),
+            task_evidence: Vec::new(),
+        });
+    }
     if has_recovery_ready_interruption && request.replace_turn_id().is_none() {
         if !has_recoverable_chain {
             return Err(ApiError::internal_assembly(
@@ -701,6 +728,8 @@ fn decide_session_turn_with_task_planner(
             tool_intent: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             confidence: 1.0,
             reason_code: Some("interrupted_recovery_ready".to_string()),
             route_reason: Some("当前会话存在待接管的异常中断执行链。".to_string()),
@@ -720,6 +749,8 @@ fn decide_session_turn_with_task_planner(
             tool_intent: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             confidence: 1.0,
             reason_code: Some("continue_requested".to_string()),
             route_reason: Some("用户明确要求继续当前可恢复执行链。".to_string()),
@@ -736,6 +767,158 @@ fn decide_session_turn_with_task_planner(
         ));
     }
     Ok(decision)
+}
+
+struct UserInterruptedTurnResume {
+    turn_id: String,
+    original_user_message: String,
+    required_tool_chain: Vec<String>,
+    completion_contract: TaskCompletionContract,
+    recovery_checkpoint: TaskRecoveryCheckpoint,
+}
+
+fn user_interrupted_turn_resume(
+    state: &ApiState,
+    request: &SessionTurnRequestDto,
+) -> Option<UserInterruptedTurnResume> {
+    if !session_turn_explicitly_resumes_user_interrupted_task(request) {
+        return None;
+    }
+    let session_id = request.requested_session_id()?;
+    let turn = state
+        .session_store
+        .canonical_turns_for_session(&session_id)
+        .into_iter()
+        .max_by(|left, right| {
+            left.turn_seq
+                .cmp(&right.turn_seq)
+                .then_with(|| left.turn_id.cmp(&right.turn_id))
+        })?;
+    if turn.status != magi_session_store::CanonicalTurnStatus::Cancelled {
+        return None;
+    }
+    let user_item = turn
+        .items
+        .iter()
+        .find(|item| item.kind == CanonicalTurnItemKind::UserMessage)?;
+    if user_item
+        .metadata
+        .get("interruptionSource")
+        .and_then(serde_json::Value::as_str)
+        != Some("user")
+    {
+        return None;
+    }
+    let original_user_message = user_item.content.as_deref()?.trim().to_string();
+    if original_user_message.is_empty() {
+        return None;
+    }
+    let source_task_id = user_item
+        .worker
+        .as_ref()
+        .and_then(|worker| worker.task_id.as_ref())
+        .cloned()?;
+    let source_task = state.task_store()?.get_task(&source_task_id)?;
+    let source_thread_id = user_item.source_thread_id.clone();
+    if !state
+        .session_store
+        .thread_registry_snapshot(&session_id)
+        .into_iter()
+        .any(|thread| thread.thread_id == source_thread_id)
+    {
+        return None;
+    }
+    Some(UserInterruptedTurnResume {
+        turn_id: turn.turn_id.clone(),
+        original_user_message,
+        required_tool_chain: source_task.required_tool_chain().to_vec(),
+        completion_contract: source_task.completion_contract().clone(),
+        recovery_checkpoint: TaskRecoveryCheckpoint {
+            source_session_id: session_id,
+            source_task_id,
+            source_turn_id: turn.turn_id,
+            source_thread_id,
+        },
+    })
+}
+
+fn session_turn_explicitly_resumes_user_interrupted_task(request: &SessionTurnRequestDto) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    let normalized = text
+        .trim()
+        .trim_matches(|character: char| {
+            character.is_ascii_punctuation()
+                || matches!(character, '，' | '。' | '！' | '？' | '、' | '；' | '：')
+        })
+        .to_ascii_lowercase();
+    if [
+        "继续",
+        "继续啊",
+        "继续吧",
+        "继续执行",
+        "继续推进",
+        "继续跑",
+        "接着",
+        "接着啊",
+        "接着吧",
+        "接着做",
+        "接着推进",
+        "往下做",
+        "恢复任务",
+        "恢复执行",
+        "继续剩余",
+        "推进剩余",
+        "下一步",
+        "下一阶段",
+        "下个阶段",
+        "resume",
+        "continue",
+        "go on",
+    ]
+    .contains(&normalized.as_str())
+    {
+        return true;
+    }
+
+    let has_resume_action = [
+        "继续",
+        "接着",
+        "恢复",
+        "从刚才",
+        "从上次",
+        "resume",
+        "continue",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let has_interrupted_task_reference = [
+        "刚才",
+        "之前",
+        "上次",
+        "中断",
+        "未完成",
+        "剩余",
+        "原任务",
+        "前面的任务",
+        "previous task",
+        "interrupted task",
+        "unfinished task",
+        "remaining work",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    has_resume_action && has_interrupted_task_reference
+}
+
+fn interrupted_turn_resume_goal(resume: &UserInterruptedTurnResume, current_input: &str) -> String {
+    format!(
+        "[interrupted-turn-resume]\nsource_turn_id: {}\n原始用户目标：{}\n当前用户输入：{}\n\n这是用户明确要求继续的中断任务。运行时已经把来源任务的持久化模型消息、工具调用和工具结果复制到当前独占 Thread。必须直接继承其中已经成功的工具证据，不要从头重复；没有结果的外部操作必须先检查真实状态。只有原始目标的交付物已经完整产生时才能结束当前任务。",
+        resume.turn_id,
+        resume.original_user_message,
+        current_input.trim()
+    )
 }
 
 fn session_has_recoverable_chain(state: &ApiState, session_id: &SessionId) -> bool {
@@ -805,6 +988,8 @@ fn local_session_turn_intent_decision(
         tool_intent: matches!(route, SessionTurnRouteDto::Execute).then_some(task_text),
         forced_tool_name: None,
         required_tool_chain: Vec::new(),
+        completion_contract: TaskCompletionContract::default(),
+        recovery_checkpoint: None,
         confidence: 0.9,
         reason_code: Some(
             match route {
@@ -856,6 +1041,33 @@ fn normalize_session_turn_decision(
     mut decision: SessionTurnIntentDecision,
     request: &SessionTurnRequestDto,
 ) -> SessionTurnIntentDecision {
+    let requested_completion_tool_chain = request
+        .trimmed_text()
+        .as_deref()
+        .map(requested_required_tool_chain)
+        .unwrap_or_default();
+    let requires_diagram_delivery =
+        session_turn_requests_diagram_generation_by_local_rules(request);
+    if !session_turn_requests_explicit_task_or_agent_mode(request) && requires_diagram_delivery {
+        decision.route = SessionTurnRouteDto::Execute;
+        decision.task_title = None;
+        decision.execution_goal = None;
+        decision.task_tier = TaskTier::ExecutionChain;
+        decision.tool_intent = Some(diagram_generation_tool_intent(request));
+        decision.forced_tool_name = None;
+        decision.required_tool_chain.clear();
+        decision.completion_contract = TaskCompletionContract::default()
+            .with_evidence_requirements(vec![TaskEvidenceRequirement::successful_tool_call(
+                "diagram_render",
+            )]);
+        decision.recovery_checkpoint = None;
+        decision.confidence = decision.confidence.max(0.98);
+        decision.reason_code = Some("diagram_generation_request".to_string());
+        decision.route_reason = Some(
+            "用户明确要求生成结构化图表，完成前必须产生 diagram_render 成功证据。".to_string(),
+        );
+        decision.task_evidence.clear();
+    }
     if !matches!(decision.route, SessionTurnRouteDto::Continue)
         && session_turn_requests_explicit_goal_mode(request)
         && !session_turn_requests_explicit_task_or_agent_mode(request)
@@ -871,6 +1083,8 @@ fn normalize_session_turn_decision(
         } else {
             Vec::new()
         };
+        decision.completion_contract = TaskCompletionContract::default();
+        decision.recovery_checkpoint = None;
         decision.confidence = decision.confidence.max(0.95);
         decision.reason_code = Some("goal_mode_request".to_string());
         decision.route_reason =
@@ -898,6 +1112,8 @@ fn normalize_session_turn_decision(
             } else {
                 Vec::new()
             };
+        decision.completion_contract = TaskCompletionContract::default();
+        decision.recovery_checkpoint = None;
         decision.confidence = decision.confidence.max(0.95);
         decision.reason_code = Some("explicit_task_request".to_string());
         decision.route_reason =
@@ -918,6 +1134,8 @@ fn normalize_session_turn_decision(
         decision.tool_intent = Some(explicit_builtin_tool_intent("image_generate"));
         decision.forced_tool_name = Some("image_generate".to_string());
         decision.required_tool_chain.clear();
+        decision.completion_contract = TaskCompletionContract::default();
+        decision.recovery_checkpoint = None;
         decision.confidence = decision.confidence.max(0.98);
         decision.reason_code = Some("image_generation_request".to_string());
         decision.route_reason =
@@ -1057,7 +1275,51 @@ fn normalize_session_turn_decision(
                 .push("用户明确要求先建立执行计划".to_string());
         }
     }
+    if requires_diagram_delivery {
+        ensure_completion_evidence_requirement(&mut decision, "diagram_render");
+    }
+    if matches!(decision.route, SessionTurnRouteDto::Execute) {
+        merge_required_tool_chain(
+            &mut decision.required_tool_chain,
+            requested_completion_tool_chain,
+        );
+    }
+    if decision.forced_tool_name.as_deref().is_some_and(|forced| {
+        decision
+            .required_tool_chain
+            .first()
+            .is_some_and(|first| first != forced)
+    }) {
+        decision.forced_tool_name = None;
+        decision.tool_intent = Some(multi_builtin_tool_intent(&decision.required_tool_chain));
+    }
     decision
+}
+
+fn ensure_completion_evidence_requirement(
+    decision: &mut SessionTurnIntentDecision,
+    tool_name: &str,
+) {
+    if decision
+        .completion_contract
+        .evidence_requirements
+        .iter()
+        .any(|requirement| requirement.tool_name() == tool_name)
+    {
+        return;
+    }
+    decision
+        .completion_contract
+        .evidence_requirements
+        .push(TaskEvidenceRequirement::successful_tool_call(tool_name));
+}
+
+fn merge_required_tool_chain(target: &mut Vec<String>, source: Vec<String>) {
+    for tool_name in source {
+        if !target.contains(&tool_name) {
+            target.push(tool_name);
+        }
+    }
 }
 
 fn session_turn_requests_explicit_plan(request: &SessionTurnRequestDto) -> bool {
@@ -1267,6 +1529,52 @@ fn session_turn_requests_image_generation_by_local_rules(request: &SessionTurnRe
     .any(|marker| normalized.contains(marker));
 
     has_creation_intent && has_image_target
+}
+
+fn session_turn_requests_diagram_generation_by_local_rules(
+    request: &SessionTurnRequestDto,
+) -> bool {
+    let Some(text) = request.trimmed_text() else {
+        return false;
+    };
+    text_requests_diagram_generation(&text)
+}
+
+fn text_requests_diagram_generation(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    let has_creation_intent = [
+        "生成", "画", "绘制", "制作", "创建", "render", "draw", "create", "generate", "make",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    let has_diagram_target = [
+        "流程图",
+        "架构图",
+        "时序图",
+        "关系图",
+        "拓扑图",
+        "思维导图",
+        "图表",
+        "mermaid",
+        "graphviz",
+        "flowchart",
+        "sequence diagram",
+        "architecture diagram",
+        "mind map",
+        "chart",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    has_creation_intent && has_diagram_target
+}
+
+fn diagram_generation_tool_intent(request: &SessionTurnRequestDto) -> String {
+    let user_text = request
+        .trimmed_text()
+        .unwrap_or_else(|| request.timeline_message(None));
+    format!(
+        "用户明确要求生成结构化图表：{user_text}。可以先使用其它必要工具理解真实上下文，但最终必须调用 diagram_render 产生可在对话中展示的图表数据；只输出 Markdown、ASCII 图或承诺稍后补充都不构成交付完成。"
+    )
 }
 
 fn session_turn_has_structured_task_scope(normalized: &str) -> bool {
@@ -1770,6 +2078,8 @@ async fn submit_root_coordinator_session_turn(
             task_tier: decision.task_tier,
             accepted_at,
             required_tool_chain,
+            completion_contract: decision.completion_contract.clone(),
+            recovery_checkpoint: decision.recovery_checkpoint.clone(),
             denied_tools: session_turn_denied_collaboration_tools(&request),
         },
     )
@@ -2046,6 +2356,8 @@ async fn drain_next_queued_regular_session_turn(
         tool_intent: queued.tool_intent.clone(),
         forced_tool_name: queued.forced_tool_name.clone(),
         required_tool_chain: queued.required_tool_chain.clone(),
+        completion_contract: queued.completion_contract.clone(),
+        recovery_checkpoint: queued.recovery_checkpoint.clone(),
         confidence: 1.0,
         reason_code: Some("queued_regular_turn".to_string()),
         route_reason: Some("服务端 session 队列出队".to_string()),
@@ -3601,8 +3913,8 @@ mod tests {
     };
     use magi_core::{
         AbsolutePath, ExecutionOwnership, ExecutionResultStatus, GoalId, MissionId, Task,
-        TaskExecutionTarget, TaskId, TaskKind, TaskRuntimePayload, TaskStatus, ThreadId,
-        ToolCallId, UtcMillis, WorkerId, WorkspaceId,
+        TaskExecutionTarget, TaskExecutorBinding, TaskId, TaskKind, TaskRuntimePayload, TaskStatus,
+        ThreadId, ToolCallId, UtcMillis, WorkerId, WorkspaceId,
     };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
@@ -3962,6 +4274,8 @@ mod tests {
             tool_intent: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             session_id: session_id.clone(),
             workspace_id: Some(workspace_id.clone()),
             queue_id: queue_id.to_string(),
@@ -4023,6 +4337,8 @@ mod tests {
             required_children: Vec::new(),
             policy_snapshot: None,
             executor_binding: None,
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             knowledge_refs: Vec::new(),
             workspace_scope: None,
             write_scope: None,
@@ -4045,6 +4361,8 @@ mod tests {
             tool_intent: None,
             forced_tool_name: None,
             required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
             confidence: 0.86,
             reason_code: Some("plain_chat".to_string()),
             route_reason: Some("classifier returned chat".to_string()),
@@ -4062,6 +4380,142 @@ mod tests {
         assert!(session_turn_requests_continue_existing_task(
             &next_phase_request
         ));
+    }
+
+    #[test]
+    fn user_cancelled_turn_continue_restores_original_task_contract() {
+        let state = test_state();
+        let session_id = SessionId::new("session-user-cancelled-resume");
+        let mission_id = MissionId::new("mission-user-cancelled-resume");
+        let source_task_id = TaskId::new("task-user-cancelled-resume");
+        let now = UtcMillis::now();
+        state
+            .session_store
+            .create_session(session_id.clone(), "用户中断恢复")
+            .expect("session should create");
+        let (_, source_thread_id) =
+            state
+                .session_store
+                .ensure_session_mission(&session_id, now, || mission_id.clone());
+
+        let mut source_task = test_root_task(source_task_id.as_str(), mission_id.as_str());
+        source_task.executor_binding = Some(
+            TaskExecutorBinding::for_role("coordinator").with_required_tool_chain(vec![
+                "file_read".to_string(),
+                "diagram_render".to_string(),
+            ]),
+        );
+        source_task.completion_contract = TaskCompletionContract::default()
+            .with_evidence_requirements(vec![TaskEvidenceRequirement::successful_tool_call(
+                "diagram_render",
+            )]);
+        state
+            .task_store()
+            .expect("task store should exist")
+            .insert_task(source_task);
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-user-cancelled-resume".to_string(),
+                    turn_seq: now.0,
+                    accepted_at: now,
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some(
+                        "请先读取真实代码，再调用 diagram_render 生成当前项目流程图".to_string(),
+                    ),
+                    items: vec![ActiveExecutionTurnItem {
+                        item_id: "user-user-cancelled-resume".to_string(),
+                        item_seq: 1,
+                        kind: "user_message".to_string(),
+                        status: "completed".to_string(),
+                        source: "user".to_string(),
+                        title: None,
+                        content: Some(
+                            "请先读取真实代码，再调用 diagram_render 生成当前项目流程图"
+                                .to_string(),
+                        ),
+                        task_id: Some(source_task_id),
+                        worker_id: None,
+                        role_id: None,
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_status: None,
+                        tool_arguments: None,
+                        tool_result: None,
+                        tool_error: None,
+                        request_id: None,
+                        user_message_id: Some("user-user-cancelled-resume".to_string()),
+                        placeholder_message_id: None,
+                        metadata: Default::default(),
+                        timeline_entry_id: None,
+                        source_thread_id,
+                    }],
+                },
+            )
+            .expect("turn should persist");
+        state
+            .session_store
+            .interrupt_current_turn_by_user(&session_id)
+            .expect("turn should be cancellable by user");
+
+        let mut request = session_turn_request("继续");
+        request.session_id = Some(session_id.to_string());
+        let decision = decide_session_turn_with_task_planner(&state, &request)
+            .expect("user cancelled turn should resume as a new execution task");
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert_eq!(
+            decision
+                .recovery_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.source_turn_id.as_str()),
+            Some("turn-user-cancelled-resume")
+        );
+        assert_eq!(
+            decision.required_tool_chain,
+            ["file_read", "diagram_render"]
+        );
+        assert_eq!(
+            decision.completion_contract.evidence_requirements,
+            [TaskEvidenceRequirement::successful_tool_call(
+                "diagram_render"
+            )]
+        );
+        assert!(
+            decision
+                .execution_goal
+                .as_deref()
+                .is_some_and(|goal| goal.contains("原始用户目标：请先读取真实代码"))
+        );
+
+        let mut referential_request = session_turn_request("继续完成刚才未完成的流程图");
+        referential_request.session_id = Some(session_id.to_string());
+        let referential_decision =
+            decide_session_turn_with_task_planner(&state, &referential_request)
+                .expect("referential continue request should resume interrupted turn");
+        assert_eq!(
+            referential_decision
+                .recovery_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.source_turn_id.as_str()),
+            Some("turn-user-cancelled-resume")
+        );
+
+        let mut unrelated_request = session_turn_request("解释一下 Rust 所有权");
+        unrelated_request.session_id = Some(session_id.to_string());
+        let unrelated_decision = decide_session_turn_with_task_planner(&state, &unrelated_request)
+            .expect("unrelated request should remain independent");
+        assert!(unrelated_decision.recovery_checkpoint.is_none());
+
+        let mut next_topic_request = session_turn_request("下一步我们分析一个新问题");
+        next_topic_request.session_id = Some(session_id.to_string());
+        let next_topic_decision =
+            decide_session_turn_with_task_planner(&state, &next_topic_request)
+                .expect("next topic request should remain independent");
+        assert!(next_topic_decision.recovery_checkpoint.is_none());
     }
 
     #[test]
@@ -5450,6 +5904,75 @@ mod tests {
         assert!(matches!(decision.route, SessionTurnRouteDto::Chat));
         assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
         assert!(decision.forced_tool_name.is_none());
+        assert!(
+            decision
+                .completion_contract
+                .evidence_requirements
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn diagram_generation_requires_rendered_delivery_evidence() {
+        for prompt in [
+            "画当前项目流程图",
+            "生成一张系统架构图",
+            "create a sequence diagram for login",
+        ] {
+            let request = session_turn_request(prompt);
+            let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+            assert!(
+                matches!(decision.route, SessionTurnRouteDto::Execute),
+                "{prompt}"
+            );
+            assert!(decision.forced_tool_name.is_none(), "{prompt}");
+            assert!(decision.required_tool_chain.is_empty(), "{prompt}");
+            assert_eq!(
+                decision.completion_contract.evidence_requirements,
+                [TaskEvidenceRequirement::successful_tool_call(
+                    "diagram_render"
+                )],
+                "{prompt}"
+            );
+            assert!(
+                decision
+                    .tool_intent
+                    .as_deref()
+                    .is_some_and(|intent| intent.contains("只输出 Markdown、ASCII 图")
+                        && intent.contains("diagram_render")),
+                "{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagram_delivery_contract_is_independent_of_execution_route() {
+        let task_request = session_turn_request("以复杂任务模式分析并画当前项目流程图");
+        let task_decision =
+            normalize_session_turn_decision(classifier_chat_decision(), &task_request);
+        assert!(matches!(task_decision.route, SessionTurnRouteDto::Task));
+        assert_eq!(
+            task_decision.completion_contract.evidence_requirements,
+            [TaskEvidenceRequirement::successful_tool_call(
+                "diagram_render"
+            )]
+        );
+
+        let goal_request = session_turn_request("以目标模式画当前项目流程图");
+        let goal_decision =
+            normalize_session_turn_decision(classifier_chat_decision(), &goal_request);
+        assert!(matches!(goal_decision.route, SessionTurnRouteDto::Chat));
+        assert_eq!(
+            goal_decision.reason_code.as_deref(),
+            Some("goal_mode_request")
+        );
+        assert_eq!(
+            goal_decision.completion_contract.evidence_requirements,
+            [TaskEvidenceRequirement::successful_tool_call(
+                "diagram_render"
+            )]
+        );
     }
 
     #[test]
@@ -5604,6 +6127,30 @@ mod tests {
         assert!(tool_intent.contains("diagram_render"));
         assert!(tool_intent.contains("对应编号步骤原文提取"));
         assert!(tool_intent.contains("禁止改名为 probe"));
+    }
+
+    #[test]
+    fn diagram_delivery_keeps_real_code_read_as_required_prerequisite() {
+        let request = session_turn_request(
+            "请先读取 README.md 和真实代码，再调用 diagram_render 生成当前项目流程图",
+        );
+        let decision = normalize_session_turn_decision(classifier_chat_decision(), &request);
+
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert_eq!(
+            decision.required_tool_chain,
+            vec!["file_read".to_string(), "diagram_render".to_string()]
+        );
+        assert_eq!(
+            decision.completion_contract.evidence_requirements,
+            [TaskEvidenceRequirement::successful_tool_call(
+                "diagram_render"
+            )]
+        );
+        assert!(decision.forced_tool_name.is_none());
+        let tool_intent = decision.tool_intent.as_deref().unwrap_or_default();
+        assert!(tool_intent.contains("file_read"));
+        assert!(tool_intent.contains("diagram_render"));
     }
 
     #[test]
@@ -7141,6 +7688,8 @@ mod tests {
                 tool_intent: None,
                 forced_tool_name: None,
                 required_tool_chain: Vec::new(),
+                completion_contract: TaskCompletionContract::default(),
+                recovery_checkpoint: None,
                 session_id: session_id.clone(),
                 workspace_id: None,
                 queue_id: "queue-delete-runtime-resources".to_string(),

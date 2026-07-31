@@ -5,7 +5,8 @@
 //! "继续会话"实现细节。错误类型统一为 `String`，函数签名走显式 stores。
 
 use magi_core::{
-    ExecutionOwnership, RecoveryResumeInput, SessionId, TaskStatus, TerminationReason, UtcMillis,
+    ExecutionOwnership, RecoveryResumeInput, SessionId, TaskCompletionAttempt, TaskStatus,
+    TerminationReason, UtcMillis,
 };
 use magi_memory_store::MemoryStore;
 use magi_orchestrator::{ExecutionWritebackPlans, task_store::TaskStore};
@@ -125,13 +126,6 @@ fn terminal_status_for_branch(
         })
 }
 
-pub fn runtime_terminal_evidence_ref(branch: &ActiveExecutionBranch) -> String {
-    format!(
-        "evidence://worker-runtime/{}/finish?worker={}",
-        branch.task_id, branch.worker_id
-    )
-}
-
 /// 收敛 chain 中所有"已经在 worker runtime 里跑到 Finish 但 task_store 还停留在
 /// 非终态"的 branch：把它们落盘成 `TaskStatus::Completed/Failed/Cancelled`。
 /// 用于会话中断与执行链续跑入口的统一护栏。
@@ -168,13 +162,23 @@ pub fn finalize_terminal_worker_branches(
         if matches!(terminal_status, TaskStatus::Failed) {
             continue;
         }
-        if matches!(terminal_status, TaskStatus::Completed) && task.evidence_refs.is_empty() {
+        if matches!(terminal_status, TaskStatus::Completed) {
+            let final_response = task.output_refs.join("\n\n");
             task_store
-                .set_evidence_refs(&branch.task_id, vec![runtime_terminal_evidence_ref(branch)]);
+                .complete_task(
+                    &branch.task_id,
+                    TaskCompletionAttempt {
+                        output_refs: task.output_refs.clone(),
+                        final_response: Some(final_response),
+                        evidence: Vec::new(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        } else {
+            task_store
+                .update_status(&branch.task_id, terminal_status)
+                .map_err(|error| error.to_string())?;
         }
-        task_store
-            .update_status(&branch.task_id, terminal_status)
-            .map_err(|error| error.to_string())?;
         finalized_count += 1;
     }
     Ok(finalized_count)
