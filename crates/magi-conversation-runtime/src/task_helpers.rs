@@ -11,11 +11,6 @@ use magi_orchestrator::{task_store::TaskStore, task_worker_catalog::resolve_task
 use magi_session_store::ActiveExecutionTurnItem;
 use magi_tool_runtime::BuiltinToolName;
 
-/// conversation_loop / session_turn 默认工具调用轮数上限：避免一次任务被模型反复 fanout。
-pub const BASE_TOOL_CALL_ROUNDS: usize = 16;
-/// 强制工具链 + base 上限交叠时的硬天花板，防止失控放大。
-pub const MAX_TOOL_CALL_ROUNDS: usize = 32;
-
 pub(crate) fn is_orchestration_builtin_tool(tool: BuiltinToolName) -> bool {
     matches!(
         tool,
@@ -864,12 +859,6 @@ pub fn required_tool_chain_recovery_prompt(
         },
         missing.join(", ")
     )
-}
-
-pub fn tool_call_round_limit(required_tool_chain: &[String]) -> usize {
-    BASE_TOOL_CALL_ROUNDS
-        .max(required_tool_chain.len().saturating_add(2))
-        .min(MAX_TOOL_CALL_ROUNDS)
 }
 
 pub fn canonical_tool_call_name(tool_name: &str) -> String {

@@ -12,9 +12,10 @@
   interface Props {
     items: TurnNavigationItem[];
     container: HTMLDivElement | null;
+    onRevealMessage?: (messageId: string) => Promise<boolean>;
   }
 
-  let { items, container }: Props = $props();
+  let { items, container, onRevealMessage }: Props = $props();
 
   let railRef: HTMLDivElement | null = $state(null);
   let markerListRef: HTMLDivElement | null = $state(null);
@@ -134,9 +135,13 @@
     if (!insideRail && !insidePreview) resetMagnet();
   }
 
-  function focusTurn(item: TurnNavigationItem): void {
+  async function focusTurn(item: TurnNavigationItem): Promise<void> {
     if (!container) return;
-    const element = findMessageElement(item);
+    let element = findMessageElement(item);
+    if (!element && onRevealMessage) {
+      await onRevealMessage(item.anchorMessageId);
+      element = findMessageElement(item);
+    }
     if (!element) return;
     const containerRect = container.getBoundingClientRect();
     const elementRect = element.getBoundingClientRect();
@@ -291,7 +296,7 @@
             style:--turn-wave-strength={markerStrengths[item.turnId] ?? 0}
             data-turn-id={item.turnId}
             aria-label={i18n.t('messageList.turnNavigation.jump', { index: item.index, summary: item.summary })}
-            onclick={() => focusTurn(item)}
+            onclick={() => void focusTurn(item)}
           ></button>
         {/each}
       </div>

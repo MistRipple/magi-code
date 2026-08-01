@@ -19,9 +19,8 @@ use crate::{
     public_builtin_tool_definitions,
     session_images::SessionTurnImage,
     session_turn_execution::{
-        BUSINESS_MODEL_PROVIDER, SessionModelSwitchRecoveryRuntime, SessionTurnExecutionError,
-        SessionTurnExecutionOutput, SessionTurnExecutionRequest, SessionTurnExecutionRuntime,
-        run_session_turn_execution,
+        BUSINESS_MODEL_PROVIDER, SessionTurnExecutionError, SessionTurnExecutionOutput,
+        SessionTurnExecutionRequest, SessionTurnExecutionRuntime, run_session_turn_execution,
     },
     session_turn_finalize::{format_dependency_task_context, format_task_ref_list},
     session_writeback::SessionStatePersistCallback,
@@ -1795,112 +1794,12 @@ impl LlmTaskDispatcher {
         prompt
     }
 
-    fn resolve_session_model_switch_recovery(
-        &self,
-        session_id: &SessionId,
-    ) -> Option<SessionModelSwitchRecoveryRuntime> {
-        let live_settings_store = self.settings_store.as_ref()?.clone();
-        let section = live_settings_store.get_session_section(session_id, "orchestrator");
-        if !section
-            .get("modelSwitchPending")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            return None;
-        }
-        let target_model = section
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())?
-            .to_string();
-        let previous_model = section
-            .get("previousModel")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())?
-            .to_string();
-        let fallback_client =
-            resolve_orchestrator_model_config(live_settings_store.as_ref(), Some(session_id))
-                .ok()?
-                .with_model(previous_model.clone())
-                .to_http_model_client()
-                .map(|client| Arc::new(client) as Arc<dyn ModelBridgeClient>)?;
-        Some(SessionModelSwitchRecoveryRuntime {
-            target_model,
-            previous_model,
-            fallback_client,
-            live_settings_store,
-        })
-    }
-
-    fn complete_session_model_switch(&self, session_id: &SessionId, target_model: &str) {
-        let Some(settings_store) = self.settings_store.as_ref() else {
-            return;
-        };
-        let mut section = settings_store.get_session_section(session_id, "orchestrator");
-        let Some(fields) = section.as_object_mut() else {
-            return;
-        };
-        let current_model = fields
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .unwrap_or_default();
-        let pending = fields
-            .get("modelSwitchPending")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        if !pending || current_model != target_model {
-            return;
-        }
-        fields.remove("previousModel");
-        fields.remove("modelSwitchPending");
-        if let Err(error) =
-            settings_store.set_session_section(session_id, "orchestrator", section.clone())
-        {
-            tracing::warn!(session_id = %session_id, %error, "确认主模型切换状态失败");
-            return;
-        }
-        let workspace_id = self
-            .session_store
-            .session(session_id)
-            .and_then(|session| session.workspace_id)
-            .map(WorkspaceId::new);
-        let updated_at = UtcMillis::now();
-        let _ = self.event_bus.publish(
-            EventEnvelope::domain(
-                EventId::new(format!(
-                    "event-session-configuration-updated-{}-{}",
-                    session_id, updated_at.0
-                )),
-                "session.configuration.updated",
-                serde_json::json!({
-                    "sessionId": session_id.to_string(),
-                    "workspaceId": workspace_id.as_ref().map(ToString::to_string),
-                    "orchestratorSessionConfig": section,
-                    "reason": "model_switch_confirmed",
-                }),
-            )
-            .with_context(EventContext {
-                workspace_id,
-                session_id: Some(session_id.clone()),
-                ..EventContext::default()
-            }),
-        );
-    }
-
     pub fn execute_session_turn(
         &self,
         request: SessionTurnExecutionRequest,
     ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
-        let session_id = request.session_id.clone();
         let plan_store =
             magi_plan::PlanStore::new(self.session_store.clone(), request.session_id.clone());
-        let model_switch_recovery = self.resolve_session_model_switch_recovery(&session_id);
-        let pending_target_model = model_switch_recovery
-            .as_ref()
-            .map(|recovery| recovery.target_model.clone());
         let execution_settings_snapshot = self.execution_settings_snapshot();
         let execution_settings =
             self.execution_settings_or_live(execution_settings_snapshot.as_ref());
@@ -1978,7 +1877,7 @@ impl LlmTaskDispatcher {
             );
             selection.render_for_prompt()
         });
-        let result = run_session_turn_execution(SessionTurnExecutionRuntime {
+        run_session_turn_execution(SessionTurnExecutionRuntime {
             client: client.as_ref(),
             event_bus: self.event_bus.as_ref(),
             session_store: self.session_store.as_ref(),
@@ -1997,14 +1896,7 @@ impl LlmTaskDispatcher {
             tools,
             persist_session_state: self.session_state_persist_callback.as_deref(),
             live_settings_store: self.settings_store.clone(),
-            model_switch_recovery,
-        });
-        if result.is_ok()
-            && let Some(target_model) = pending_target_model.as_deref()
-        {
-            self.complete_session_model_switch(&session_id, target_model);
-        }
-        result
+        })
     }
 
     fn invoke_llm_with_tools(

@@ -12,7 +12,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import { getCurrentSessionId, messagesState } from '../stores/messages.svelte';
   import { reportIncident } from '../lib/notifications';
-  import { diagramSummary, parseToolDiagramPayload } from '../lib/diagram-payload';
+  import { parseToolDiagramPayload } from '../lib/diagram-payload';
   import { openAgentTab } from '../stores/right-pane.svelte';
   import { getAgentRunState } from '../stores/agent-run-store.svelte';
   import { getAgentVisualInfo } from '../lib/agent-colors';
@@ -133,6 +133,13 @@
       return hasInternalRedactedDisplayValue(content) ? i18n.t('toolCall.redactedInput') : '';
     }
     return formatContent(sanitized);
+  }
+
+  function hasDisplayContent(content: unknown): boolean {
+    if (content === null || content === undefined) return false;
+    if (typeof content === 'string') return content.trim().length > 0;
+    if (Array.isArray(content)) return content.length > 0;
+    return true;
   }
 
   // 获取工具图标（基于当前项目实际工具名）
@@ -380,29 +387,13 @@
   // 仅 view 类工具支持点击整行 header 打开文件
   const isHeaderOpenableTool = $derived(name === 'file_read' || name === 'view');
 
-  // 检查是否有内容
-  const inputText = $derived(formatToolInput(input));
-  const hasInput = $derived(!!inputText);
-  const outputIsStructuredError = $derived(isStructuredToolErrorPayload(output));
-  const generatedImagePreview = $derived(
-    outputIsStructuredError ? null : parseImageGenerationPreview(name, output),
+  // 折叠态只计算卡片存在性和标题摘要；完整输入输出、图片和图表在展开后解析。
+  const sanitizedInput = $derived(sanitizeToolDisplayPayload(input));
+  const hasInput = $derived(
+    hasDisplayContent(sanitizedInput) || hasInternalRedactedDisplayValue(input),
   );
-  const imagePreview = $derived.by(() => {
-    if (outputIsStructuredError) return null;
-    const viewed = parseViewImagePreview(name, output);
-    if (viewed) return { ...viewed, revisedPrompt: '' };
-    if (!generatedImagePreview) return null;
-    return {
-      ...generatedImagePreview,
-      src: agentUrl('/api/files/raw', buildFilePreviewQuery(generatedImagePreview.path, {
-        workspaceId: filePreviewScope?.workspaceId,
-        workspacePath: filePreviewScope?.workspacePath,
-        sessionId: '',
-      })),
-    };
-  });
-  const outputText = $derived(outputIsStructuredError ? '' : formatToolOutput(name, output));
-  const hasOutput = $derived(!!output && (!!outputText || !!imagePreview));
+  const outputIsStructuredError = $derived(isStructuredToolErrorPayload(output));
+  const hasOutput = $derived(!outputIsStructuredError && hasDisplayContent(output));
   const structuredErrorText = $derived.by(() => {
     if (!outputIsStructuredError) {
       return '';
@@ -421,20 +412,44 @@
   const errorForDiagnosis = $derived((error && error.trim()) || structuredErrorText);
   const hasError = $derived(!!errorForDiagnosis);
 
-  const diagramPayload = $derived(parseToolDiagramPayload(name, output));
+  const hasContent = $derived(hasInput || hasOutput || hasError);
+  const canExpand = $derived(hasContent && !isCompactReadOnlyTool && !isCompactMutation);
+  const shouldRenderCard = $derived(hasContent || isCompactReadOnlyTool || isCompactMutation);
+  const detailVisible = $derived(canExpand && !collapsed);
+  const inputText = $derived(detailVisible ? formatToolInput(input) : '');
+  const generatedImagePreview = $derived(
+    detailVisible && !outputIsStructuredError ? parseImageGenerationPreview(name, output) : null,
+  );
+  const imagePreview = $derived.by(() => {
+    if (!detailVisible || outputIsStructuredError) return null;
+    const viewed = parseViewImagePreview(name, output);
+    if (viewed) return { ...viewed, revisedPrompt: '' };
+    if (!generatedImagePreview) return null;
+    return {
+      ...generatedImagePreview,
+      src: agentUrl('/api/files/raw', buildFilePreviewQuery(generatedImagePreview.path, {
+        workspaceId: filePreviewScope?.workspaceId,
+        workspacePath: filePreviewScope?.workspacePath,
+        sessionId: '',
+      })),
+    };
+  });
+  const outputText = $derived(
+    detailVisible && !outputIsStructuredError ? formatToolOutput(name, output) : '',
+  );
+  const diagramPayload = $derived(
+    detailVisible ? parseToolDiagramPayload(name, output) : null,
+  );
   const isDiagramTool = $derived(!!diagramPayload);
 
   const skillApplyPolicy = $derived.by(() => {
-    if (name !== 'skill_apply') return null;
+    if (!detailVisible || name !== 'skill_apply') return null;
     const data = standardized?.data;
     if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
     const toolPolicy = (data as Record<string, unknown>).toolPolicy;
     if (!toolPolicy || typeof toolPolicy !== 'object' || Array.isArray(toolPolicy)) return null;
     return toolPolicy as ToolPolicyPayload;
   });
-  const hasContent = $derived(hasInput || hasOutput || hasError);
-  const canExpand = $derived(hasContent && !isCompactReadOnlyTool && !isCompactMutation);
-  const shouldRenderCard = $derived(hasContent || isCompactReadOnlyTool || isCompactMutation);
 
   // 获取工具显示名
   function getToolDisplayName(toolName: string): string {
@@ -555,9 +570,7 @@
       });
   });
   const toolSummary = $derived(
-    diagramPayload
-      ? diagramSummary(diagramPayload)
-      : toolTargetSummary || getToolSummary(name, input)
+    toolTargetSummary || getToolSummary(name, input)
   );
 
   // 判断输出内容是否包含 markdown 格式（标题、表格、列表等）

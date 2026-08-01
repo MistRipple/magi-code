@@ -9,6 +9,7 @@
   import type { Edit } from '../types/message';
   import type { IconName } from '../lib/icons';
   import Icon from './Icon.svelte';
+  import GitRepositoryPanel from './GitRepositoryPanel.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
     getAgentChangeDiff,
@@ -374,6 +375,8 @@
 {/snippet}
 
 <div class="panel-content-scrollable edits-panel">
+  <GitRepositoryPanel />
+  <div class="changes-section-label">{i18n.t('edits.section.pendingChanges')}</div>
   {#if edits.length === 0}
     <div class="empty-state">
       <Icon name="file-edit" size={32} />
@@ -504,6 +507,14 @@
     padding: var(--space-8) var(--space-5);
     color: var(--foreground-muted);
     text-align: center;
+  }
+
+  .changes-section-label {
+    flex: 0 0 auto;
+    padding: 4px calc(var(--space-2) + var(--space-1)) 0;
+    color: var(--foreground-muted);
+    font-size: var(--text-2xs);
+    font-weight: var(--font-semibold);
   }
 
   .empty-text {

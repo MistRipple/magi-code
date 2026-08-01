@@ -33,16 +33,8 @@ pub(crate) const MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS: usize = 5;
 /// 可见片段，必须走续写恢复，不能重放请求。
 pub(crate) const MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS: usize = 1;
 pub(crate) const MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS: usize = 3;
-/// 工具执行预算之外必须保留最终答复请求，并覆盖请求前恢复、流中断续写、
-/// 空响应恢复和模型违规继续请求工具的恢复。该预算只用于生成用户可见终态，
-/// 不得继续执行新工具。
-pub(crate) const MODEL_FINAL_RESPONSE_ROUND_RESERVE: usize = 1
-    + MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS
-    + MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS
-    + MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS * 2;
 pub(crate) const MODEL_EMPTY_RESPONSE_RECOVERY_PROMPT: &str = "上一轮模型没有返回用户可见正文或可执行工具调用。请不要只输出 thinking：现在直接输出完整的用户可见答复；如果确实需要工具，请直接调用工具；如果无法完成，请直接说明原因。";
 pub(crate) const MODEL_EMPTY_RESPONSE_AFTER_TOOLS_RECOVERY_PROMPT: &str = "前面的工具调用已经完成，工具结果已在上下文中。请不要只输出 thinking，也不要重复已完成的工具调用；现在直接基于现有结果输出完整的用户可见答复。仅在确有缺失信息时调用新的必要工具。";
-pub(crate) const MODEL_FINAL_RESPONSE_ONLY_PROMPT: &str = "本轮可执行工具调用预算已经用完。不得继续调用或虚构任何工具；请直接基于已经完成的工具结果输出用户可见的最终答复，并明确说明已完成事项、发现的问题和仍未完成的事项。";
 pub(crate) const PUBLIC_MODEL_IMAGE_INVOCATION_FAILURE_MESSAGE: &str =
     "当前模型暂不支持图片输入，请更换支持图片的模型后重试。";
 pub(crate) const PUBLIC_MODEL_INVALID_IMAGE_INPUT_MESSAGE: &str =
@@ -179,29 +171,6 @@ impl ModelFailureDiagnostic {
             stage: "response_validation".to_string(),
             retryable: true,
             retry_attempts: 0,
-        }
-    }
-
-    pub(crate) fn tool_round_limit_exceeded(
-        tool_round_limit: usize,
-        retry_attempts: usize,
-        response_observation: Option<&str>,
-    ) -> Self {
-        let mut detail = format!(
-            "模型已使用全部 {tool_round_limit} 个工具执行轮次；运行时关闭新工具后，又连续 {retry_attempts} 次要求模型生成最终答复，但模型仍继续请求工具调用。为避免无限循环，已停止本轮执行。"
-        );
-        if let Some(observation) = response_observation.filter(|value| !value.trim().is_empty()) {
-            detail.push_str(" 最后一次响应状态：");
-            detail.push_str(observation.trim());
-        }
-        Self {
-            schema_version: MODEL_FAILURE_SCHEMA_VERSION.to_string(),
-            code: "model_tool_round_limit_exceeded".to_string(),
-            summary: "模型未能在本轮工具预算内生成最终答复。".to_string(),
-            detail,
-            stage: "response_finalization".to_string(),
-            retryable: true,
-            retry_attempts,
         }
     }
 

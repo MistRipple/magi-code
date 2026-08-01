@@ -12,23 +12,22 @@ await withGoldenViteServer(async (server) => {
   );
 
   assert.equal(
-    sessionConfig.resolveOrchestratorModel({}, {}, ['', 'model-first', 'model-second']),
-    'model-first',
-    '未选择主模型时必须使用模型列表中的第一个有效模型',
+    sessionConfig.resolveOrchestratorModel({}, {}),
+    '',
+    '未选择主模型时不得把模型列表首项伪装成用户选择',
   );
 
   assert.equal(
     sessionConfig.resolveOrchestratorModel(
       { model: 'session-model' },
       { model: 'effective-model' },
-      ['model-first'],
     ),
     'session-model',
     '用户已经选择的会话模型必须优先于自动默认模型',
   );
 
   assert.equal(
-    sessionConfig.resolveOrchestratorModel({}, {}, []),
+    sessionConfig.resolveOrchestratorModel({}, {}),
     '',
     '模型配置不可用时不得伪造模型名称',
   );
@@ -61,6 +60,15 @@ await withGoldenViteServer(async (server) => {
     { model: 'model-1', reasoningEffort: 'medium' },
     '草稿会话首次选择模型时必须同时固化默认强度',
   );
+
+  assert.deepEqual(
+    sessionConfig.copyOrchestratorSessionConfig(
+      { model: 'session-model', reasoningEffort: 'high', apiKey: 'must-not-copy' },
+      { model: 'effective-model', reasoningEffort: 'medium', baseUrl: 'must-not-copy' },
+    ),
+    { model: 'session-model', reasoningEffort: 'high' },
+    '新会话只能继承来源会话的模型选择和推理强度',
+  );
 });
 
 const inputAreaSource = await readFile(new URL('../src/components/InputArea.svelte', import.meta.url), 'utf8');
@@ -68,6 +76,11 @@ assert.match(
   inputAreaSource,
   /const orchestratorSessionConfig = resolveTurnOrchestratorSessionConfigPayload\(\);[\s\S]*?if \(!orchestratorSessionConfig\) \{[\s\S]*?return;/,
   '回车发送必须同步读取当前模型快照，模型不可用时不得提交空配置',
+);
+assert.match(
+  inputAreaSource,
+  /\.\.\.\(isDraftSession \? \{ orchestratorSessionConfig \} : \{\}\)/,
+  '模型配置只能在新会话首轮提交时初始化，已有会话发送消息不得回写模型',
 );
 assert.match(
   inputAreaSource,
@@ -83,6 +96,16 @@ assert.match(
   inputAreaSource,
   /function handleStoredAccessProfileChange\(event: StorageEvent\)[\s\S]*?readStoredAccessProfile\(\)[\s\S]*?messagesState\.settingsBootstrapSnapshot = latest;/,
   '访问模式变更必须通过 storage 事件同步到其他窗口并刷新当前会话设置快照',
+);
+assert.doesNotMatch(
+  inputAreaSource,
+  /let draftOrchestratorSessionConfig = \$state/,
+  '草稿模型配置必须只有 messages store 一个事实源，不能保留组件级镜像',
+);
+assert.doesNotMatch(
+  inputAreaSource,
+  /pickerModelsConfigKey[\s\S]{0,500}draftOrchestratorSessionConfig\s*=\s*\{\}/,
+  '刷新模型列表或连接配置不得清空用户已经选择的草稿模型',
 );
 
 console.log('orchestrator session config golden tests passed');

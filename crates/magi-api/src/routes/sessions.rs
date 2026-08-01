@@ -17,8 +17,8 @@ use magi_core::{SessionLifecycleStatus, TaskStatus};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn,
-    CanonicalTurnItemKind, GoalStatus, NotificationRecord, NotificationScope, SessionGoal,
-    SessionRecord, TimelineEntryInput, TimelineEntryKind,
+    CanonicalTurnItemKind, NotificationRecord, NotificationScope, SessionGoal, SessionRecord,
+    TimelineEntryInput, TimelineEntryKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -2183,7 +2183,6 @@ pub(crate) fn record_active_goal_turn_failure(state: &ApiState, session_id: &Ses
         session_id = %session_id,
         goal_id = %goal.goal_id,
         consecutive_failure_turns = recorded.consecutive_failure_turns,
-        blocked = recorded.status == GoalStatus::Blocked,
         "goal turn failed"
     );
 }
@@ -2422,9 +2421,10 @@ async fn drain_next_queued_regular_session_turn(
                     return true;
                 }
             };
-            if retry_count <= 3 {
-                let retry_delay =
-                    std::time::Duration::from_secs(u64::from(retry_count).saturating_mul(2));
+            if error.queued_submission_is_retryable() {
+                let retry_delay = std::time::Duration::from_secs(
+                    u64::from(retry_count).saturating_mul(2).min(60),
+                );
                 let retry_state = state.clone();
                 let retry_session_id = session_id.clone();
                 let retry_workspace_id = workspace_id.clone();
@@ -3924,7 +3924,7 @@ mod tests {
         task_worker_catalog::WorkerInfo,
     };
     use magi_session_store::{
-        ActiveExecutionBranch, ExecutionThread, ExecutionThreadStatus,
+        ActiveExecutionBranch, ExecutionThread, ExecutionThreadStatus, GoalStatus,
         SessionExecutionSidecarStoreState, SessionStore,
     };
     use magi_settings_store::SettingsStore;

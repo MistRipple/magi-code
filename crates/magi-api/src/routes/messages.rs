@@ -27,6 +27,7 @@ struct MessagesQuery {
     workspace_path: Option<String>,
     limit: Option<usize>,
     before_cursor: Option<String>,
+    canonical_before_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -41,6 +42,8 @@ struct MessagesResponseDto {
     session_id: String,
     has_more_before: bool,
     before_cursor: Option<String>,
+    canonical_has_more_before: bool,
+    canonical_before_cursor: Option<String>,
 }
 
 async fn get_messages(
@@ -85,9 +88,16 @@ async fn get_messages(
     let start = end.saturating_sub(limit);
     let page = timeline[start..end].to_vec();
     let sessions = state.session_records_for_workspace(Some(requested_workspace_id.as_str()));
-    let canonical_turns = state
+    let canonical_limit = limit.min(20);
+    let (canonical_turns, canonical_has_more_before, canonical_before_cursor) = state
         .session_store
-        .canonical_turns_for_session(&session_id)
+        .canonical_turn_page_for_session(
+            &session_id,
+            query.canonical_before_cursor.as_deref(),
+            canonical_limit,
+        )
+        .ok_or_else(|| ApiError::InvalidInput("canonical turn 游标不存在".to_string()))?;
+    let canonical_turns = canonical_turns
         .into_iter()
         .map(public_canonical_turn)
         .collect();
@@ -100,8 +110,10 @@ async fn get_messages(
         timeline: page,
         canonical_turns,
         session_id: session_id.to_string(),
-        has_more_before: start > 0,
+        has_more_before: start > 0 || canonical_has_more_before,
         before_cursor,
+        canonical_has_more_before,
+        canonical_before_cursor,
     }))
 }
 
@@ -443,6 +455,84 @@ mod tests {
             first_ids.is_disjoint(&second_ids),
             "分页结果不应重复: first={first_ids:?}, second={second_ids:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn messages_paginates_canonical_turns_independently_from_timeline() {
+        let session_id = SessionId::new("session-messages-canonical-pagination");
+        let store = SessionStore::default();
+        store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "canonical 分页会话",
+                Some("workspace-messages-canonical-pagination".to_string()),
+            )
+            .expect("session should create");
+        for index in 0..25 {
+            store
+                .upsert_current_turn(
+                    session_id.clone(),
+                    magi_session_store::ActiveExecutionTurn {
+                        turn_id: format!("turn-{index:02}"),
+                        turn_seq: index + 1,
+                        accepted_at: UtcMillis(index + 1),
+                        completed_at: Some(UtcMillis(index + 1)),
+                        status: "completed".to_string(),
+                        user_message: Some(format!("消息 {index}")),
+                        items: Vec::new(),
+                    },
+                )
+                .expect("turn should upsert");
+        }
+        let state = test_state(store);
+
+        let first = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/messages?workspaceId=workspace-messages-canonical-pagination&sessionId=session-messages-canonical-pagination",
+                    )
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        let first_body = read_json_response(first).await;
+        let first_cursor = first_body["canonicalBeforeCursor"]
+            .as_str()
+            .expect("first canonical page should expose cursor");
+        assert_eq!(first_body["canonicalTurns"].as_array().unwrap().len(), 20);
+        assert_eq!(first_body["canonicalHasMoreBefore"], true);
+
+        let second = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/messages?workspaceId=workspace-messages-canonical-pagination&sessionId=session-messages-canonical-pagination&canonicalBeforeCursor={first_cursor}"
+                    ))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        let second_body = read_json_response(second).await;
+        let first_ids = first_body["canonicalTurns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|turn| turn["turnId"].as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let second_ids = second_body["canonicalTurns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|turn| turn["turnId"].as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(first_ids.is_disjoint(&second_ids));
+        assert_eq!(second_ids.len(), 5);
+        assert_eq!(second_body["canonicalHasMoreBefore"], false);
     }
 
     #[tokio::test]

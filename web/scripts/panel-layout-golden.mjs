@@ -6,6 +6,10 @@ const headerSource = await readFile(
   new URL('../src/components/Header.svelte', import.meta.url),
   'utf8',
 );
+const appSource = await readFile(
+  new URL('../src/App.svelte', import.meta.url),
+  'utf8',
+);
 const workbenchShellSource = await readFile(
   new URL('../src/web/WebWorkbenchShell.svelte', import.meta.url),
   'utf8',
@@ -34,6 +38,26 @@ const inputAreaSource = await readFile(
   new URL('../src/components/InputArea.svelte', import.meta.url),
   'utf8',
 );
+const messageListSource = await readFile(
+  new URL('../src/components/MessageList.svelte', import.meta.url),
+  'utf8',
+);
+const gitContextControlSource = await readFile(
+  new URL('../src/components/GitContextControl.svelte', import.meta.url),
+  'utf8',
+);
+const gitRepositoryPanelSource = await readFile(
+  new URL('../src/components/GitRepositoryPanel.svelte', import.meta.url),
+  'utf8',
+);
+const gitContextStoreSource = await readFile(
+  new URL('../src/stores/git-context.svelte.ts', import.meta.url),
+  'utf8',
+);
+const editsPanelSource = await readFile(
+  new URL('../src/components/EditsPanel.svelte', import.meta.url),
+  'utf8',
+);
 const zhLocaleSource = await readFile(
   new URL('../src/i18n/zh-CN.json', import.meta.url),
   'utf8',
@@ -43,25 +67,121 @@ const enLocaleSource = await readFile(
   'utf8',
 );
 
+assert.doesNotMatch(
+  appSource,
+  /import\s+(?:EditsPanel|KnowledgePanel|SettingsPanel|DesktopRuntimeRecovery)\s+from/,
+  '非首屏功能不得进入 App 静态依赖图',
+);
+assert.match(
+  appSource,
+  /import\('\.\/components\/EditsPanel\.svelte'\)[\s\S]*?import\('\.\/components\/KnowledgePanel\.svelte'\)[\s\S]*?import\('\.\/components\/SettingsPanel\.svelte'\)/,
+  '变更、知识和设置面板必须按可见状态动态加载',
+);
+assert.doesNotMatch(
+  workbenchShellSource,
+  /import\s+(?:RightPane|ProjectFileTree|WebFolderPicker)\s+from/,
+  '工作台非首屏表面不得进入静态依赖图',
+);
+assert.match(
+  workbenchShellSource,
+  /import\('\.\/ProjectFileTree\.svelte'\)[\s\S]*?import\('\.\/RightPane\.svelte'\)[\s\S]*?import\('\.\/WebFolderPicker\.svelte'\)/,
+  '文件树、右侧面板和工作区选择器必须按实际可见状态动态加载',
+);
+
 assert.match(
   inputAreaSource,
-  /\.ia-picker-popover\.ia-branch-popover\s*\{[\s\S]*?width:\s*min\(320px,\s*calc\(100vw - 24px\)\);/,
-  'Git 分支面板必须保持紧凑宽度，不能为长分支名扩展到宽面板',
+  /<GitContextControl[\s\S]*?workspace=\{composerWorkspace\}[\s\S]*?sessionId=\{persistedSessionId\}/,
+  '输入区必须使用统一 Git 上下文入口',
+);
+assert.doesNotMatch(
+  inputAreaSource,
+  /previewWorkspaceMerge|mergeWorkspaceBranch|deleteWorkspaceBranch|fetchWorkspaceWorktrees|createWorkspaceWorktree|removeWorkspaceWorktree/,
+  '输入区不得继续承担合并、删除和 worktree 管理职责',
+);
+assert.doesNotMatch(
+  inputAreaSource,
+  /import\s+WebFolderPicker\s+from/,
+  '输入区目录选择器不得进入主对话静态依赖图',
 );
 assert.match(
   inputAreaSource,
-  /\.ia-branch-switch-item \.ia-picker-item-label,[\s\S]*?text-overflow:\s*ellipsis;[\s\S]*?white-space:\s*nowrap;/,
-  '分支名称必须单行省略，不能撑宽或溢出 Git 面板',
+  /import\('\.\.\/web\/WebFolderPicker\.svelte'\)/,
+  '输入区目录选择器必须在用户打开时动态加载',
 );
 assert.match(
-  inputAreaSource,
-  /class="ia-picker-item-label" title=\{branch\}>\{branch\}<\/span>/,
-  '省略的分支名称必须通过悬浮提示展示完整值',
+  messageListSource,
+  /const INITIAL_RENDER_WINDOW = 72;[\s\S]*?const RENDER_WINDOW_CHUNK = 48;/,
+  '长会话首屏必须使用有界时间线窗口，并分批加载本地历史',
 );
 assert.match(
-  inputAreaSource,
-  /class="ia-branch-btn"[\s\S]*?title=\{branchStatusTitle\(\)\}/,
-  '当前分支按钮被截断时必须可悬浮查看完整分支名',
+  messageListSource,
+  /\$effect\.pre\(\(\) => \{[\s\S]*?visibleRenderLimit = Math\.min\(count, INITIAL_RENDER_WINDOW\);[\s\S]*?const activeRenderItems = \$derived\(safeRenderItems\.slice\(visibleStartIndex\)\);/,
+  '时间线窗口必须在 DOM 更新前收敛，避免先挂载完整历史再裁剪',
+);
+assert.match(
+  messageListSource,
+  /async function loadOlderHistory\(\): Promise<void> \{[\s\S]*?if \(hasHiddenLocalHistory\) \{[\s\S]*?await revealPreviousRenderItems\(\);[\s\S]*?return;/,
+  '向上滚动时必须先展开内存中的本地历史，再请求后端分页',
+);
+assert.match(
+  messageListSource,
+  /\(historyState\.hasMoreBefore && historyState\.beforeCursor\)[\s\S]*?\|\| \(historyState\.canonicalHasMoreBefore && historyState\.canonicalBeforeCursor\)/,
+  '旧时间线与规范轮次必须独立判断分页能力',
+);
+assert.match(
+  messageListSource,
+  /function setContainerScrollPosition\(nextTop: number\)[\s\S]*?async function revealPreviousRenderItems\(\)[\s\S]*?setContainerScrollPosition\(previousScrollTop \+ addedHeight\);/,
+  '时间线扩窗必须复用统一的程序化滚动入口并保持可见锚点',
+);
+assert.match(
+  messageListSource,
+  /async function revealRenderMessage\(messageId: string\)[\s\S]*?const requiredLimit = safeRenderItems\.length - targetIndex;[\s\S]*?visibleRenderLimit = requiredLimit;/,
+  '消息定位与滚动恢复必须按目标位置扩展同一个时间线窗口',
+);
+assert.match(
+  gitContextControlSource,
+  /width:\s*min\(280px,\s*calc\(100vw - 24px\)\)/,
+  'Git 快速入口必须保持紧凑宽度',
+);
+assert.match(
+  gitContextControlSource,
+  /\.git-context-trigger\s*\{[\s\S]*?border:\s*1px solid var\(--border-subtle\);[\s\S]*?border-radius:\s*var\(--radius-full\);/,
+  'Git 快速入口必须保持与输入区一致的胶囊视觉',
+);
+assert.doesNotMatch(
+  gitContextControlSource,
+  /disabled=\{[^}]*hasUncommitted/,
+  '未提交变更不得直接禁用分支切换或新建，Git 应按原生安全规则执行并返回冲突',
+);
+assert.match(
+  gitContextControlSource,
+  /text-overflow:\s*ellipsis;[\s\S]*?white-space:\s*nowrap;/,
+  '长分支名必须单行省略',
+);
+assert.match(
+  editsPanelSource,
+  /<GitRepositoryPanel\s*\/>[\s\S]*?edits\.section\.pendingChanges/,
+  '变更中心必须区分 Git 仓库上下文和 Magi 待确认文件变更',
+);
+assert.match(
+  gitRepositoryPanelSource,
+  /mergeWorkspaceBranch[\s\S]*?deleteWorkspaceBranch[\s\S]*?createWorkspaceWorktree[\s\S]*?removeWorkspaceWorktree/,
+  '高级仓库管理必须完整保留合并、删除和 worktree 能力',
+);
+assert.match(
+  gitRepositoryPanelSource,
+  /advancedOpen[\s\S]*?git-advanced-content/,
+  '高级仓库能力必须默认折叠并按需展示',
+);
+assert.match(
+  gitContextStoreSource,
+  /if \(workspaceId\) return `id:\$\{workspaceId\}\\u0000\$\{sessionId\}`;/,
+  '统一 Git 状态必须优先使用工作区 ID 作为主键，避免路径引用格式造成双状态',
+);
+assert.match(
+  gitRepositoryPanelSource,
+  /const visible = \$derived\(stateMatches && gitContextState\.loaded && gitContextState\.isRepo\)/,
+  '非 Git 工作区不得渲染仓库管理区域，但仍必须保留变更中心本身',
 );
 
 assert.match(

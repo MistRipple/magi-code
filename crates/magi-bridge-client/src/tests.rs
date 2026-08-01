@@ -1,25 +1,17 @@
 use crate::{
     BridgeBindingDispatchPlan, BridgeBindingKind, BridgeBindingReference, BridgeClientError,
     BridgeDispatchAction, BridgeDispatchInput, BridgeDispatchRuntime, BridgeTransport,
-    BridgeTransportError, BridgeTransportRequest, BridgeTransportResponse,
-    HttpImageGenerationClient, ImageGenerationRequest, ImageGenerationUrlMode,
-    JsonRpcMcpBridgeClient, JsonRpcModelBridgeClient, JsonRpcStdioTransport, McpBridgeClient,
-    McpToolCallRequest, ModelBridgeClient, ModelInvocationRequest,
-    base_adapter::ToolExecutor,
-    llm_types::{
-        ImageSource, LlmContentBlock, LlmMessage, LlmMessageContent, ToolCall, ToolResult,
-    },
+    BridgeTransportError, BridgeTransportRequest, BridgeTransportResponse, EndpointUrlMode,
+    HttpImageGenerationClient, ImageGenerationRequest, JsonRpcMcpBridgeClient,
+    JsonRpcModelBridgeClient, JsonRpcStdioTransport, McpBridgeClient, McpToolCallRequest,
+    ModelBridgeClient, ModelInvocationRequest,
 };
 use serde_json::{Value, json};
 use std::{
     io::{Read, Write},
     net::TcpListener,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant},
 };
 
 struct RecordingTransport {
@@ -293,304 +285,6 @@ fn dispatch_runtime_with_json_rpc_clients_is_end_to_end() {
 }
 
 // ============================================================================
-// Phase 4: Orchestrator Termination Tests
-// ============================================================================
-
-#[test]
-fn termination_resolution_picks_highest_priority() {
-    use crate::orchestrator_termination::*;
-
-    let candidates = vec![
-        TerminationCandidate {
-            reason: OrchestratorTerminationReason::Completed,
-            event_id: "e1".to_string(),
-            triggered_at: 100,
-        },
-        TerminationCandidate {
-            reason: OrchestratorTerminationReason::Cancelled,
-            event_id: "e2".to_string(),
-            triggered_at: 200,
-        },
-        TerminationCandidate {
-            reason: OrchestratorTerminationReason::BudgetExceeded,
-            event_id: "e3".to_string(),
-            triggered_at: 150,
-        },
-    ];
-
-    let result = resolve_termination_reason(&candidates, OrchestratorTerminationReason::Completed);
-    assert_eq!(result.reason, OrchestratorTerminationReason::Cancelled);
-    assert_eq!(result.evidence_ids, vec!["e2"]);
-}
-
-#[test]
-fn termination_resolution_uses_fallback_on_empty() {
-    use crate::orchestrator_termination::*;
-    let result = resolve_termination_reason(&[], OrchestratorTerminationReason::Failed);
-    assert_eq!(result.reason, OrchestratorTerminationReason::Failed);
-    assert!(result.evidence_ids.is_empty());
-}
-
-#[test]
-fn progress_evaluation_detects_progress() {
-    use crate::orchestrator_termination::*;
-
-    let prev = TerminationSnapshot {
-        snapshot_id: "s1".into(),
-        plan_id: "p1".into(),
-        attempt_seq: 1,
-        progress_vector: ProgressVector {
-            terminal_required_tasks: 2,
-            accepted_criteria: 1,
-            critical_path_resolved: 0,
-            unresolved_blockers: 3,
-        },
-        review_state: ReviewState::default(),
-        blocker_state: BlockerState::default(),
-        budget_state: BudgetState::default(),
-        cache_state: None,
-        cp_version: 1,
-        required_total: 5,
-        failed_required: 0,
-        running_or_pending_required: 3,
-        running_required: Some(1),
-        source_event_ids: vec![],
-        computed_at: 0,
-    };
-
-    let curr = TerminationSnapshot {
-        progress_vector: ProgressVector {
-            terminal_required_tasks: 3,
-            accepted_criteria: 2,
-            critical_path_resolved: 0,
-            unresolved_blockers: 2,
-        },
-        ..prev.clone()
-    };
-
-    let eval = evaluate_progress(Some(&prev), &curr);
-    assert!(eval.progressed);
-    assert!(!eval.regressed);
-}
-
-#[test]
-fn progress_evaluation_detects_regression() {
-    use crate::orchestrator_termination::*;
-
-    let prev = TerminationSnapshot {
-        snapshot_id: "s1".into(),
-        plan_id: "p1".into(),
-        attempt_seq: 1,
-        progress_vector: ProgressVector {
-            terminal_required_tasks: 3,
-            accepted_criteria: 2,
-            critical_path_resolved: 0,
-            unresolved_blockers: 1,
-        },
-        review_state: ReviewState::default(),
-        blocker_state: BlockerState::default(),
-        budget_state: BudgetState::default(),
-        cache_state: None,
-        cp_version: 1,
-        required_total: 5,
-        failed_required: 0,
-        running_or_pending_required: 2,
-        running_required: None,
-        source_event_ids: vec![],
-        computed_at: 0,
-    };
-
-    let curr = TerminationSnapshot {
-        progress_vector: ProgressVector {
-            terminal_required_tasks: 2,
-            accepted_criteria: 1,
-            critical_path_resolved: 0,
-            unresolved_blockers: 3,
-        },
-        ..prev.clone()
-    };
-
-    let eval = evaluate_progress(Some(&prev), &curr);
-    assert!(!eval.progressed);
-    assert!(eval.regressed);
-}
-
-// ============================================================================
-// Phase 4: Decision Engine Tests
-// ============================================================================
-
-fn test_policy() -> crate::decision_engine::OrchestratorDecisionPolicy {
-    crate::decision_engine::OrchestratorDecisionPolicy {
-        stalled_window_size: 5,
-        external_wait_sla_ms: 30_000,
-        upstream_model_error_streak: 3,
-        error_rate_min_samples: 5,
-        budget_no_progress_streak_threshold: 3,
-        budget_breach_streak_threshold: 2,
-        external_wait_breach_streak_threshold: 2,
-        budget_hard_limit_factor: 1.5,
-        external_wait_hard_limit_factor: 2.0,
-    }
-}
-
-fn test_budget() -> crate::decision_engine::OrchestratorExecutionBudget {
-    crate::decision_engine::OrchestratorExecutionBudget {
-        max_duration_ms: 60_000,
-        max_token_usage: 100_000,
-        max_error_rate: 0.5,
-        max_rounds: 50,
-    }
-}
-
-fn test_snapshot(required_total: u32) -> crate::orchestrator_termination::TerminationSnapshot {
-    use crate::orchestrator_termination::*;
-    TerminationSnapshot {
-        snapshot_id: "snap-1".into(),
-        plan_id: "plan-1".into(),
-        attempt_seq: 10,
-        progress_vector: ProgressVector::default(),
-        review_state: ReviewState::default(),
-        blocker_state: BlockerState::default(),
-        budget_state: BudgetState::default(),
-        cache_state: None,
-        cp_version: 1,
-        required_total,
-        failed_required: 0,
-        running_or_pending_required: 0,
-        running_required: Some(0),
-        source_event_ids: vec![],
-        computed_at: 0,
-    }
-}
-
-#[test]
-fn decision_engine_budget_threshold() {
-    use crate::decision_engine::*;
-    let engine = OrchestratorDecisionEngine::new(test_policy());
-    let budget = test_budget();
-
-    let mut snap = test_snapshot(5);
-    snap.budget_state.elapsed_ms = 70_000;
-    assert!(engine.is_budget_threshold_breached(&snap, &budget));
-
-    snap.budget_state.elapsed_ms = 50_000;
-    assert!(!engine.is_budget_threshold_breached(&snap, &budget));
-}
-
-#[test]
-fn decision_engine_hard_budget_breach() {
-    use crate::decision_engine::*;
-    let engine = OrchestratorDecisionEngine::new(test_policy());
-    let budget = test_budget();
-
-    let mut snap = test_snapshot(5);
-    snap.budget_state.elapsed_ms = 90_000;
-    assert!(engine.is_hard_budget_breach(&snap, &budget));
-}
-
-#[test]
-fn decision_engine_loopback_reason_completed() {
-    use crate::decision_engine::*;
-    use crate::orchestrator_termination::*;
-
-    let engine = OrchestratorDecisionEngine::new(test_policy());
-    let budget = test_budget();
-
-    let mut snap = test_snapshot(3);
-    snap.progress_vector.terminal_required_tasks = 3;
-    snap.running_or_pending_required = 0;
-    let gate = OrchestratorGateState::default();
-
-    let reason = engine.resolve_dispatch_reason(&snap, &budget, &gate, "done");
-    assert_eq!(reason, OrchestratorTerminationReason::Completed);
-}
-
-#[test]
-fn decision_engine_loopback_reason_failed_on_empty_text() {
-    use crate::decision_engine::*;
-    use crate::orchestrator_termination::*;
-
-    let engine = OrchestratorDecisionEngine::new(test_policy());
-    let budget = test_budget();
-    let snap = test_snapshot(0);
-    let gate = OrchestratorGateState::default();
-
-    let reason = engine.resolve_dispatch_reason(&snap, &budget, &gate, "   ");
-    assert_eq!(reason, OrchestratorTerminationReason::Failed);
-}
-
-// ============================================================================
-// Phase 4: Round Policy Tests
-// ============================================================================
-
-#[test]
-fn round_policy_continue_prompt_without_required_tasks() {
-    let snap = test_snapshot(0);
-    let prompt = crate::round_policy::build_continue_prompt(&snap);
-    assert!(prompt.contains("没有结构化的必需任务"));
-}
-
-#[test]
-fn round_policy_continue_prompt_with_required_tasks() {
-    let mut snap = test_snapshot(5);
-    snap.progress_vector.terminal_required_tasks = 2;
-    let prompt = crate::round_policy::build_continue_prompt(&snap);
-    assert!(prompt.contains("剩余必需任务: 3"));
-}
-
-#[test]
-fn summary_hijack_correction_rounds() {
-    let c1 = crate::round_policy::build_summary_hijack_correction(1);
-    assert!(!c1.force_no_tools_next_round);
-    let c2 = crate::round_policy::build_summary_hijack_correction(2);
-    assert!(c2.force_no_tools_next_round);
-    let c3 = crate::round_policy::build_summary_hijack_correction(5);
-    assert!(c3.force_no_tools_next_round);
-}
-
-#[test]
-fn no_task_plain_response_simple_text_terminates() {
-    use crate::round_policy::*;
-    let decision = decide_no_task_plain_response_action("hello", 0, false, None, 0, 0);
-    assert!(matches!(
-        decision,
-        NoTaskPlainResponseDecision::TerminateCompleted { .. }
-    ));
-}
-
-#[test]
-fn no_task_plain_response_empty_text_requests_outcome() {
-    use crate::round_policy::*;
-    let decision = decide_no_task_plain_response_action("", 0, false, None, 0, 0);
-    assert!(matches!(
-        decision,
-        NoTaskPlainResponseDecision::RequestOutcomeBlock { .. }
-    ));
-}
-
-#[test]
-fn pending_terminal_synthesis_retries_on_empty_text() {
-    use crate::round_policy::*;
-    let decision = decide_pending_terminal_synthesis_action("", false, false, 0, 3);
-    assert!(matches!(
-        decision,
-        PendingTerminalSynthesisDecision::Retry {
-            next_retry_count: 1
-        }
-    ));
-}
-
-#[test]
-fn pending_terminal_synthesis_finalizes_on_max() {
-    use crate::round_policy::*;
-    let decision = decide_pending_terminal_synthesis_action("done", true, false, 3, 3);
-    assert!(matches!(
-        decision,
-        PendingTerminalSynthesisDecision::Finalize
-    ));
-}
-
-// ============================================================================
 // Phase 4: Tool Concurrency Tests
 // ============================================================================
 
@@ -737,121 +431,6 @@ fn tool_concurrency_keeps_agent_spawn_serial() {
     assert_eq!(batches[2].tool_indices, vec![2]);
 }
 
-struct SleepingToolExecutor {
-    active: AtomicUsize,
-    max_active: AtomicUsize,
-    delay: Duration,
-}
-
-impl SleepingToolExecutor {
-    fn new(delay: Duration) -> Self {
-        Self {
-            active: AtomicUsize::new(0),
-            max_active: AtomicUsize::new(0),
-            delay,
-        }
-    }
-
-    fn max_active(&self) -> usize {
-        self.max_active.load(Ordering::SeqCst)
-    }
-}
-
-impl ToolExecutor for SleepingToolExecutor {
-    fn execute(&self, tool_call: &ToolCall) -> ToolResult {
-        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_active.fetch_max(active, Ordering::SeqCst);
-        thread::sleep(self.delay);
-        self.active.fetch_sub(1, Ordering::SeqCst);
-        ToolResult {
-            tool_call_id: tool_call.id.clone(),
-            content: format!("{} done", tool_call.name),
-            is_error: false,
-            standardized: None,
-            file_change: None,
-        }
-    }
-}
-
-#[test]
-fn shell_tool_calls_execute_concurrently_and_preserve_order() {
-    let executor = SleepingToolExecutor::new(Duration::from_millis(220));
-    let tool_calls = vec![
-        ToolCall {
-            id: "call-shell-a".to_string(),
-            name: "shell_exec".to_string(),
-            arguments: json!({ "command": "printf a", "access_mode": "read_only" }),
-            argument_parse_error: None,
-            raw_arguments: None,
-        },
-        ToolCall {
-            id: "call-shell-b".to_string(),
-            name: "shell_exec".to_string(),
-            arguments: json!({ "command": "printf b", "access_mode": "read_only" }),
-            argument_parse_error: None,
-            raw_arguments: None,
-        },
-    ];
-
-    let started_at = Instant::now();
-    let results = crate::base_adapter::execute_tool_calls(&tool_calls, &executor);
-
-    assert!(
-        started_at.elapsed() < Duration::from_millis(350),
-        "两个 shell 调用应并发执行，而不是串行等待"
-    );
-    assert!(
-        executor.max_active() > 1,
-        "并发执行时同时活跃的 shell 调用数应大于 1"
-    );
-    assert_eq!(
-        results
-            .iter()
-            .map(|result| result.tool_call_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["call-shell-a", "call-shell-b"]
-    );
-}
-
-#[test]
-fn base_adapter_chat_message_conversion_preserves_multimodal_tool_result() {
-    let message = LlmMessage {
-        role: "user".to_string(),
-        content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
-            tool_use_id: "call_view_image".to_string(),
-            content: "已读取图片".to_string(),
-            is_error: false,
-            images: vec![ImageSource {
-                kind: "base64".to_string(),
-                media_type: "image/png".to_string(),
-                data: "AAA".to_string(),
-            }],
-        }]),
-    };
-
-    let chat_messages = crate::base_adapter::chat_messages_from_llm_message(&message);
-
-    assert_eq!(chat_messages.len(), 1);
-    assert_eq!(chat_messages[0].role, "tool");
-    assert_eq!(
-        chat_messages[0].tool_call_id.as_deref(),
-        Some("call_view_image")
-    );
-    let content: Value = serde_json::from_str(
-        chat_messages[0]
-            .content
-            .as_deref()
-            .expect("tool result content"),
-    )
-    .expect("multimodal tool result should stay structured");
-    assert_eq!(content["model_content"][0]["text"], "已读取图片");
-    assert_eq!(
-        content["model_content"][1]["source"]["media_type"],
-        "image/png"
-    );
-    assert_eq!(content["model_content"][1]["source"]["data"], "AAA");
-}
-
 // ============================================================================
 // Phase 4: LLM Types Tests
 // ============================================================================
@@ -930,7 +509,7 @@ fn image_generation_client_builds_standard_openai_request_and_parses_base64_resu
         "http://127.0.0.1:8317/v1".to_string(),
         Some("sk-image-test".to_string()),
         "gpt-image-1".to_string(),
-        ImageGenerationUrlMode::Standard,
+        EndpointUrlMode::Standard,
     );
     let request = ImageGenerationRequest {
         prompt: "一张极简的蓝色方块".to_string(),
@@ -988,7 +567,7 @@ fn image_generation_client_maps_grok_dimensions_to_xai_request_fields() {
         "https://api.x.ai/v1".to_string(),
         Some("xai-image-test".to_string()),
         "grok-imagine-image-quality".to_string(),
-        ImageGenerationUrlMode::Standard,
+        EndpointUrlMode::Standard,
     );
     let request = ImageGenerationRequest {
         prompt: "A cinematic mountain landscape".to_string(),
@@ -1104,7 +683,7 @@ fn image_generation_client_downloads_url_response_without_forwarding_api_key() {
         format!("http://{address}/v1"),
         Some("secret-image-key".to_string()),
         "grok-imagine-image".to_string(),
-        ImageGenerationUrlMode::Standard,
+        EndpointUrlMode::Standard,
     );
     let generated = client
         .generate(ImageGenerationRequest {
@@ -1185,7 +764,7 @@ fn image_generation_client_performs_real_http_request() {
         format!("http://{address}/v1"),
         Some("sk-image-test".to_string()),
         "gpt-image-test".to_string(),
-        ImageGenerationUrlMode::Standard,
+        EndpointUrlMode::Standard,
     );
     let generated = client
         .generate(ImageGenerationRequest {
@@ -1204,10 +783,10 @@ fn image_generation_client_performs_real_http_request() {
 #[test]
 fn image_generation_client_uses_full_endpoint_without_rewriting() {
     let client = HttpImageGenerationClient::new(
-        "http://127.0.0.1:8317/custom/images".to_string(),
+        "http://127.0.0.1:8317/custom/images/?api-version=2026-07-31".to_string(),
         None,
         "image-model".to_string(),
-        ImageGenerationUrlMode::Full,
+        EndpointUrlMode::Full,
     );
     let built = client
         .build_request_for_test(&ImageGenerationRequest {
@@ -1216,6 +795,9 @@ fn image_generation_client_uses_full_endpoint_without_rewriting() {
             quality: None,
         })
         .expect("full endpoint request should build");
-    assert_eq!(built.url, "http://127.0.0.1:8317/custom/images");
+    assert_eq!(
+        built.url,
+        "http://127.0.0.1:8317/custom/images/?api-version=2026-07-31"
+    );
     assert!(built.body.get("quality").is_none());
 }

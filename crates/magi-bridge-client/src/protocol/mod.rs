@@ -3,6 +3,7 @@ mod anthropic;
 mod capability;
 mod conformance;
 mod openai_chat;
+mod openai_responses;
 pub mod streaming;
 mod tool_name_codec;
 mod utils;
@@ -14,6 +15,7 @@ pub use capability::{
 };
 pub use conformance::{ConformanceValidator, ConformanceViolation};
 pub use openai_chat::OpenAiChatCompletionsAdapter;
+pub use openai_responses::OpenAiResponsesAdapter;
 pub use streaming::{SseLineParser, StreamAccumulator, parse_stream_event};
 pub use tool_name_codec::ProviderToolNameCodec;
 pub use utils::{

@@ -248,7 +248,8 @@ pub struct LlmMessageParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
     /// 推理强度配置：必须透传到协议层（OpenAI Chat 走顶层 `reasoning_effort`，
-    /// Anthropic Messages 走 `thinking.budget_tokens` 映射）。
+    /// OpenAI Responses 走 `reasoning.effort`，Anthropic Messages 走
+    /// `thinking.budget_tokens` 映射）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
 }

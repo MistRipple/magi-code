@@ -15,8 +15,7 @@ use crate::{
     },
     model_config::resolve_orchestrator_model_config,
     model_error::{
-        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_FINAL_RESPONSE_ONLY_PROMPT,
-        MODEL_FINAL_RESPONSE_ROUND_RESERVE, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
+        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
         MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, ModelFailureDiagnostic,
         classify_model_invocation_error, extract_model_context_limit,
         model_empty_response_recovery_prompt, model_stream_interruption_recovery_prompt,
@@ -51,7 +50,7 @@ use magi_bridge_client::{
     ModelProviderContext, ModelResponseStatus, ModelStreamingDelta,
 };
 use magi_core::{AccessProfile, EventId, SessionId, UtcMillis, WorkspaceId, estimate_text_tokens};
-use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
+use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_session_store::{CanonicalTurnItemKind, SessionStore, ThreadChatMessage};
 use magi_settings_store::SettingsStore;
 use magi_snapshot::SnapshotManager;
@@ -59,9 +58,6 @@ use magi_tool_runtime::ToolRegistry;
 use magi_usage_authority::UsageCallStatus;
 use std::{collections::BTreeSet, fmt, path::PathBuf, sync::Arc};
 
-const BASE_TOOL_CALL_ROUNDS: usize = 16;
-const MAX_TOOL_CALL_ROUNDS: usize = 32;
-const MAX_PLAN_FOLLOW_UP_ROUNDS: usize = 16;
 pub const BUSINESS_MODEL_PROVIDER: &str = "openai-compatible";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -130,7 +126,6 @@ pub enum SessionTurnFailureReason {
     ModelEmptyResponse,
     ModelEmptyResponseAfterTools,
     ModelResponseInvalid,
-    ModelToolRoundLimitExceeded,
     ModelImageInvocationFailed,
     ToolCallProtocolFailed,
     RuntimeInvalidState,
@@ -144,7 +139,6 @@ impl SessionTurnFailureReason {
             Self::ModelEmptyResponse => "model_empty_response",
             Self::ModelEmptyResponseAfterTools => "model_empty_response_after_tools",
             Self::ModelResponseInvalid => "model_response_invalid",
-            Self::ModelToolRoundLimitExceeded => "model_tool_round_limit_exceeded",
             Self::ModelImageInvocationFailed => "model_image_invocation_failed",
             Self::ToolCallProtocolFailed => "tool_arguments_invalid",
             Self::RuntimeInvalidState => "session_turn_runtime_invalid_state",
@@ -635,7 +629,7 @@ fn rebuild_messages_for_context_window(input: RebuildMessagesForContextWindowInp
         workspace_id: &request.workspace_id,
         thread_id,
         fallback_history: Vec::new(),
-        phase: "model_switch_recovery",
+        phase: "context_limit_recovery",
         context_window_override: Some(context_window),
     });
     if let Some(compaction) = prepared.compaction.as_ref() {
@@ -664,132 +658,6 @@ fn rebuild_messages_for_context_window(input: RebuildMessagesForContextWindowInp
     );
 }
 
-struct PreviousModelFallbackInput<'a> {
-    event_bus: &'a InMemoryEventBus,
-    execution_settings_store: Option<&'a Arc<SettingsStore>>,
-    session_store: &'a SessionStore,
-    request: &'a SessionTurnExecutionRequest,
-    thread_id: &'a magi_core::ThreadId,
-    recovery: &'a SessionModelSwitchRecoveryRuntime,
-    provider_limit_was_applied: bool,
-    persist_session_state: Option<&'a SessionStatePersistCallback>,
-}
-
-fn activate_previous_model_fallback(input: PreviousModelFallbackInput<'_>) -> bool {
-    let PreviousModelFallbackInput {
-        event_bus,
-        execution_settings_store,
-        session_store,
-        request,
-        thread_id,
-        recovery,
-        provider_limit_was_applied,
-        persist_session_state,
-    } = input;
-    let mut section = recovery
-        .live_settings_store
-        .get_session_section(&request.session_id, "orchestrator");
-    let Some(fields) = section.as_object_mut() else {
-        return false;
-    };
-    fields.insert(
-        "model".to_string(),
-        serde_json::Value::String(recovery.previous_model.clone()),
-    );
-    fields.remove("previousModel");
-    fields.remove("modelSwitchPending");
-    if let Err(error) = recovery.live_settings_store.set_session_section(
-        &request.session_id,
-        "orchestrator",
-        section.clone(),
-    ) {
-        tracing::warn!(
-            session_id = %request.session_id,
-            %error,
-            "恢复上一个主模型配置失败"
-        );
-        return false;
-    }
-    if let Some(store) = execution_settings_store {
-        let _ = store.set_session_section(&request.session_id, "orchestrator", section.clone());
-    }
-
-    let notice = if request.product_locale == "en-US" {
-        if provider_limit_was_applied {
-            format!(
-                "{} still could not accommodate the current conversation within the context limit reported by the service. Switched back to {} and continued this turn.",
-                recovery.target_model, recovery.previous_model
-            )
-        } else {
-            format!(
-                "{} could not accommodate the current conversation and the service did not report a usable context limit. Switched back to {} and continued this turn.",
-                recovery.target_model, recovery.previous_model
-            )
-        }
-    } else if provider_limit_was_applied {
-        format!(
-            "目标模型 {} 在服务返回的上下文上限内仍无法容纳当前对话。已切换回 {} 并继续处理本轮请求。",
-            recovery.target_model, recovery.previous_model
-        )
-    } else {
-        format!(
-            "目标模型 {} 无法容纳当前对话，且服务未提供可用的上下文上限。已切换回 {} 并继续处理本轮请求。",
-            recovery.target_model, recovery.previous_model
-        )
-    };
-    let mut item = session_turn_item(
-        "assistant_phase",
-        "completed",
-        Some(notice.clone()),
-        Some(notice),
-        Some(format!(
-            "turn-item-model-context-fallback-{}",
-            UtcMillis::now().0
-        )),
-        thread_id.clone(),
-    );
-    item.metadata.insert(
-        "noticeKind".to_string(),
-        serde_json::Value::String("model_context_fallback".to_string()),
-    );
-    item.metadata.insert(
-        "noticeType".to_string(),
-        serde_json::Value::String("warning".to_string()),
-    );
-    if let Some(published) = append_session_turn_item(session_store, &request.session_id, item) {
-        persist_session_state_checkpoint(persist_session_state, "model_context_fallback_notice");
-        publish_session_turn_item_event(
-            event_bus,
-            &request.session_id,
-            &request.workspace_id,
-            &published,
-        );
-    }
-
-    let updated_at = UtcMillis::now();
-    let _ = event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!(
-                "event-session-configuration-updated-{}-{}",
-                request.session_id, updated_at.0
-            )),
-            "session.configuration.updated",
-            serde_json::json!({
-                "sessionId": request.session_id.to_string(),
-                "workspaceId": request.workspace_id.as_ref().map(ToString::to_string),
-                "orchestratorSessionConfig": section,
-                "reason": "model_context_fallback",
-            }),
-        )
-        .with_context(EventContext {
-            workspace_id: request.workspace_id.clone(),
-            session_id: Some(request.session_id.clone()),
-            ..EventContext::default()
-        }),
-    );
-    true
-}
-
 pub struct SessionTurnExecutionRuntime<'a> {
     pub client: &'a dyn ModelBridgeClient,
     pub event_bus: &'a InMemoryEventBus,
@@ -809,14 +677,6 @@ pub struct SessionTurnExecutionRuntime<'a> {
     pub tools: Option<Vec<ChatToolDefinition>>,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
     pub live_settings_store: Option<Arc<SettingsStore>>,
-    pub model_switch_recovery: Option<SessionModelSwitchRecoveryRuntime>,
-}
-
-pub struct SessionModelSwitchRecoveryRuntime {
-    pub target_model: String,
-    pub previous_model: String,
-    pub fallback_client: Arc<dyn ModelBridgeClient>,
-    pub live_settings_store: Arc<SettingsStore>,
 }
 
 pub fn run_session_turn_execution(
@@ -870,7 +730,6 @@ fn run_session_turn_execution_inner(
         tools,
         persist_session_state,
         live_settings_store,
-        model_switch_recovery,
     } = runtime;
 
     if !request_turn_is_writable(session_store, &request) {
@@ -954,38 +813,14 @@ fn run_session_turn_execution_inner(
     let mut completed_required_tool_names: Vec<String> = Vec::new();
     let required_tool_chain = session_required_tool_chain(&request);
     let usage_binding = session_turn_model_usage_binding(request.use_tools);
-    let mut active_client = client;
     let mut corrected_context_limit = false;
-    let mut fallback_activated = false;
     let mut empty_response_recovery_attempts = 0usize;
     let mut pre_output_invocation_recovery_attempts = 0usize;
     let mut stream_interruption_recovery_attempts = 0usize;
     let mut tool_call_validation_tracker = ToolCallValidationTracker::default();
-    let mut final_response_tool_recovery_attempts = 0usize;
-    let mut final_response_prompt_appended = false;
-    let mut plan_follow_up_rounds = 0usize;
     let mut last_response_observation: Option<String> = None;
-    let mut tool_execution_rounds = 0usize;
-
-    let tool_call_round_limit = tool_call_round_limit(&required_tool_chain);
-    let round_limit = tool_call_round_limit
-        .saturating_add(MODEL_FINAL_RESPONSE_ROUND_RESERVE)
-        .saturating_add(MAX_PLAN_FOLLOW_UP_ROUNDS);
     let mut round = 0usize;
-    while round < round_limit {
-        let final_response_only = tool_execution_rounds >= tool_call_round_limit
-            && !plan_store.requires_execution_follow_up();
-        if final_response_only && !final_response_prompt_appended {
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: Some(MODEL_FINAL_RESPONSE_ONLY_PROMPT.to_string()),
-                images: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                provider_context: Vec::new(),
-            });
-            final_response_prompt_appended = true;
-        }
+    loop {
         if request.use_tools
             && let Some(registry) = tool_registry
         {
@@ -999,11 +834,11 @@ fn run_session_turn_execution_inner(
                 &[],
             );
         }
-        let round_tools = (request.use_tools && !final_response_only && !active_tools.is_empty())
-            .then_some(active_tools.clone());
+        let round_tools =
+            (request.use_tools && !active_tools.is_empty()).then_some(active_tools.clone());
         let streamed_content = match stream_session_turn_round(
             SessionTurnRoundRuntime {
-                client: active_client,
+                client,
                 event_bus,
                 session_store,
                 plan_store,
@@ -1082,12 +917,7 @@ fn run_session_turn_execution_inner(
                     messages.push(ChatMessage {
                         role: "user".to_string(),
                         content: Some(
-                            if final_response_only {
-                                MODEL_FINAL_RESPONSE_ONLY_PROMPT
-                            } else {
-                                model_empty_response_recovery_prompt(had_tool_calls)
-                            }
-                            .to_string(),
+                            model_empty_response_recovery_prompt(had_tool_calls).to_string(),
                         ),
                         images: Vec::new(),
                         tool_calls: Vec::new(),
@@ -1105,65 +935,32 @@ fn run_session_turn_execution_inner(
                     round = round.saturating_add(1);
                     continue;
                 }
-                if classification.code == "model_context_limit" && round == 0 {
-                    if !corrected_context_limit
-                        && let Some(context_limit) = extract_model_context_limit(&error)
-                        && let Some(live_settings_store) = live_settings_store.as_ref()
-                        && apply_reported_context_limit(
-                            event_bus,
-                            settings_store,
-                            live_settings_store,
-                            &resolved_context_model,
-                            context_limit,
-                        )
-                    {
-                        corrected_context_limit = true;
-                        rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
-                            event_bus,
-                            session_store,
-                            request: &request,
-                            thread_id: &orchestrator_thread_id,
-                            prompt: &prompt,
-                            knowledge_context_prompt: knowledge_context_prompt.as_deref(),
-                            context_window: context_limit,
-                            messages: &mut messages,
-                            persist_session_state,
-                        });
-                        continue;
-                    }
-
-                    if let Some(recovery) = model_switch_recovery.as_ref()
-                        && !fallback_activated
-                        && activate_previous_model_fallback(PreviousModelFallbackInput {
-                            event_bus,
-                            execution_settings_store: settings_store,
-                            session_store,
-                            request: &request,
-                            thread_id: &orchestrator_thread_id,
-                            recovery,
-                            provider_limit_was_applied: corrected_context_limit,
-                            persist_session_state,
-                        })
-                    {
-                        let previous_context_window = resolve_model_context_window(
-                            Some(recovery.live_settings_store.as_ref()),
-                            &recovery.previous_model,
-                        );
-                        rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
-                            event_bus,
-                            session_store,
-                            request: &request,
-                            thread_id: &orchestrator_thread_id,
-                            prompt: &prompt,
-                            knowledge_context_prompt: knowledge_context_prompt.as_deref(),
-                            context_window: previous_context_window,
-                            messages: &mut messages,
-                            persist_session_state,
-                        });
-                        active_client = recovery.fallback_client.as_ref();
-                        fallback_activated = true;
-                        continue;
-                    }
+                if classification.code == "model_context_limit"
+                    && round == 0
+                    && !corrected_context_limit
+                    && let Some(context_limit) = extract_model_context_limit(&error)
+                    && let Some(live_settings_store) = live_settings_store.as_ref()
+                    && apply_reported_context_limit(
+                        event_bus,
+                        settings_store,
+                        live_settings_store,
+                        &resolved_context_model,
+                        context_limit,
+                    )
+                {
+                    corrected_context_limit = true;
+                    rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
+                        event_bus,
+                        session_store,
+                        request: &request,
+                        thread_id: &orchestrator_thread_id,
+                        prompt: &prompt,
+                        knowledge_context_prompt: knowledge_context_prompt.as_deref(),
+                        context_window: context_limit,
+                        messages: &mut messages,
+                        persist_session_state,
+                    });
+                    continue;
                 }
                 let retry_attempts = pre_output_invocation_recovery_attempts
                     + stream_interruption_recovery_attempts
@@ -1212,49 +1009,6 @@ fn run_session_turn_execution_inner(
             last_response_observation = Some(observation.clone());
         }
         let response_provider_context = streamed_content.provider_context.clone();
-        if final_response_only && !streamed_content.invalid_tool_calls.is_empty() {
-            if final_response_tool_recovery_attempts < MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS {
-                final_response_tool_recovery_attempts += 1;
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(MODEL_FINAL_RESPONSE_ONLY_PROMPT.to_string()),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                });
-                round = round.saturating_add(1);
-                continue;
-            }
-            let model_failure = ModelFailureDiagnostic::tool_round_limit_exceeded(
-                tool_call_round_limit,
-                final_response_tool_recovery_attempts,
-                last_response_observation.as_deref(),
-            );
-            let execution_error = SessionTurnExecutionError::from_model_failure(
-                SessionTurnFailureReason::ModelToolRoundLimitExceeded,
-                model_failure,
-            );
-            append_session_turn_error_item(
-                event_bus,
-                session_store,
-                crate::session_writeback::SessionTurnErrorInput {
-                    session_id: &request.session_id,
-                    workspace_id: &request.workspace_id,
-                    task_id: None,
-                    request_id: request.request_id.as_deref(),
-                    user_message_id: request.user_message_id.as_deref(),
-                    placeholder_message_id: request.placeholder_message_id.as_deref(),
-                    error_text: &execution_error.public_message,
-                    model_failure: execution_error.model_failure.as_deref(),
-                    tool_call_failure: None,
-                    streaming_entry_id: main_timeline_entry_id.as_deref(),
-                    source_thread_id: orchestrator_thread_id.clone(),
-                    persist_session_state,
-                },
-            );
-            return Err(execution_error);
-        }
         let repeated_tool_call_failure = if streamed_content.invalid_tool_calls.is_empty() {
             None
         } else {
@@ -1306,9 +1060,6 @@ fn run_session_turn_execution_inner(
             main_timeline_entry_id = streamed_content.timeline_entry_id.clone();
         }
         had_tool_calls |= streamed_content.encountered_tool_calls;
-        if streamed_content.encountered_tool_calls {
-            tool_execution_rounds = tool_execution_rounds.saturating_add(1);
-        }
         record_completed_required_tools(
             &mut completed_required_tool_names,
             &required_tool_chain,
@@ -1380,13 +1131,6 @@ fn run_session_turn_execution_inner(
                 continue;
             }
             if plan_store.requires_execution_follow_up() {
-                if plan_follow_up_rounds >= MAX_PLAN_FOLLOW_UP_ROUNDS {
-                    return Err(SessionTurnExecutionError::new(
-                        SessionTurnFailureReason::ModelToolRoundLimitExceeded,
-                        "当前计划尚未完成，模型连续多轮未推进计划阶段。请检查计划执行结果后重试。",
-                    ));
-                }
-                plan_follow_up_rounds = plan_follow_up_rounds.saturating_add(1);
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: Some(content),
@@ -1463,14 +1207,7 @@ fn run_session_turn_execution_inner(
                 empty_response_recovery_attempts += 1;
                 messages.push(ChatMessage {
                     role: "user".to_string(),
-                    content: Some(
-                        if final_response_only {
-                            MODEL_FINAL_RESPONSE_ONLY_PROMPT
-                        } else {
-                            model_empty_response_recovery_prompt(had_tool_calls)
-                        }
-                        .to_string(),
-                    ),
+                    content: Some(model_empty_response_recovery_prompt(had_tool_calls).to_string()),
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
@@ -1745,12 +1482,6 @@ fn required_tool_chain_recovery_prompt(
         },
         missing.join(", ")
     )
-}
-
-fn tool_call_round_limit(required_tool_chain: &[String]) -> usize {
-    BASE_TOOL_CALL_ROUNDS
-        .max(required_tool_chain.len().saturating_add(2))
-        .min(MAX_TOOL_CALL_ROUNDS)
 }
 
 fn stream_session_turn_round(
@@ -3000,7 +2731,6 @@ mod tests {
             tools: None,
             persist_session_state: None,
             live_settings_store: None,
-            model_switch_recovery: None,
         })
         .expect("cancelled model invocation should resolve as interrupted turn");
         assert!(output.interrupted);
@@ -3132,7 +2862,7 @@ mod tests {
                 .lock()
                 .expect("request log lock")
                 .push(request);
-            if call == 1 {
+            if call == 39 {
                 let current = self.plan_store.snapshot().expect("plan should exist");
                 self.plan_store
                     .update(magi_plan::UpdatePlanInput {
@@ -3150,10 +2880,10 @@ mod tests {
                             })
                             .collect(),
                     })
-                    .expect("second round should complete plan");
+                    .expect("final model round should complete plan");
             }
             Ok(model_response(serde_json::json!({
-                "content": if call == 0 { "第一阶段完成" } else { "全部计划完成" },
+                "content": if call < 39 { "继续推进当前计划" } else { "全部计划完成" },
                 "finish_reason": "stop"
             })))
         }
@@ -3165,8 +2895,8 @@ mod tests {
         ) -> Result<ModelResponse, BridgeClientError> {
             let call = self.calls.load(Ordering::SeqCst);
             on_delta(&ModelStreamingDelta {
-                content: if call == 0 {
-                    "第一阶段完成".to_string()
+                content: if call < 39 {
+                    "继续推进当前计划".to_string()
                 } else {
                     "全部计划完成".to_string()
                 },
@@ -3260,7 +2990,6 @@ mod tests {
             tools: None,
             persist_session_state: None,
             live_settings_store: None,
-            model_switch_recovery: None,
         })
         .expect("steered turn should complete");
 
@@ -3298,7 +3027,7 @@ mod tests {
     }
 
     #[test]
-    fn unfinished_plan_keeps_same_turn_running_until_plan_completes() {
+    fn unfinished_plan_continues_beyond_legacy_follow_up_limit() {
         let session_id = SessionId::new("session-plan-follow-up");
         let turn_id = "turn-plan-follow-up".to_string();
         let store = Arc::new(SessionStore::new());
@@ -3390,18 +3119,17 @@ mod tests {
             tools: None,
             persist_session_state: None,
             live_settings_store: None,
-            model_switch_recovery: None,
         })
         .expect("plan turn should complete");
 
         assert_eq!(output.final_content, "全部计划完成");
-        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(client.calls.load(Ordering::SeqCst), 40);
         let requests = client.requests.lock().expect("request log lock");
-        let second_messages = requests[1]
+        let last_messages = requests[39]
             .messages
             .as_ref()
             .expect("follow-up request should include messages");
-        assert!(second_messages.iter().any(|message| {
+        assert!(last_messages.iter().any(|message| {
             message.role == "user"
                 && message
                     .content
@@ -3598,29 +3326,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_round_limit_keeps_final_round_after_explicit_chain() {
-        let required_tool_chain = [
-            "file_mkdir",
-            "file_write",
-            "file_read",
-            "file_patch",
-            "search_text",
-            "shell_exec",
-            "diff_preview",
-            "diagram_render",
-            "file_remove",
-        ]
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-
-        assert!(
-            tool_call_round_limit(&required_tool_chain) >= required_tool_chain.len() + 2,
-            "显式工具链需要为每个工具调用轮和最终回复轮预留空间"
-        );
-    }
-
-    #[test]
     fn runtime_invalid_state_pauses_active_plan() {
         let session_id = SessionId::new("session-runtime-invalid-state");
         let store = Arc::new(SessionStore::new());
@@ -3701,7 +3406,6 @@ mod tests {
             tools: None,
             persist_session_state: None,
             live_settings_store: None,
-            model_switch_recovery: None,
         });
 
         assert!(matches!(
@@ -3805,7 +3509,6 @@ mod tests {
             tools: None,
             persist_session_state: None,
             live_settings_store: None,
-            model_switch_recovery: None,
         }) {
             Ok(_) => panic!("empty provider response should fail"),
             Err(error) => error,
@@ -3943,7 +3646,6 @@ mod tests {
             tools: Some(tools),
             persist_session_state: None,
             live_settings_store: None,
-            model_switch_recovery: None,
         }) {
             Ok(_) => panic!("repeated invalid shell call should fail the turn"),
             Err(error) => error,
@@ -4070,7 +3772,6 @@ mod tests {
             tools: None,
             persist_session_state: None,
             live_settings_store: None,
-            model_switch_recovery: None,
         })
         .expect("empty stream before output should be retried");
 
@@ -4166,7 +3867,6 @@ mod tests {
             tools: None,
             persist_session_state: None,
             live_settings_store: None,
-            model_switch_recovery: None,
         }) {
             Ok(_) => panic!("incomplete stream should fail the turn"),
             Err(error) => error,
@@ -4287,7 +3987,6 @@ mod tests {
             tools: None,
             persist_session_state: None,
             live_settings_store: None,
-            model_switch_recovery: None,
         })
         .expect("流中断应由非流式降级完成");
 
@@ -4400,7 +4099,6 @@ mod tests {
             tools: None,
             persist_session_state: None,
             live_settings_store: None,
-            model_switch_recovery: None,
         }) {
             Ok(_) => panic!("image provider empty stream should fail"),
             Err(error) => error,
@@ -5813,225 +5511,6 @@ mod tests {
                 .recent_events
                 .iter()
                 .any(|event| event.event_type == "model.context_window.updated")
-        );
-    }
-
-    #[test]
-    fn context_fallback_restores_previous_model_and_writes_notice() {
-        let session_id = SessionId::new("session-context-fallback");
-        let store = SessionStore::new();
-        store
-            .create_session(session_id.clone(), "context fallback")
-            .unwrap();
-        let (_mission_id, thread_id) = store.ensure_session_mission(&session_id, ts(1), || {
-            magi_core::MissionId::new("mission-context-fallback")
-        });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: "turn-context-fallback".to_string(),
-                    turn_seq: 1,
-                    accepted_at: ts(2),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("继续".to_string()),
-                    items: Vec::new(),
-                },
-            )
-            .unwrap();
-        let live = Arc::new(SettingsStore::new());
-        live.set_session_section(
-            &session_id,
-            "orchestrator",
-            serde_json::json!({
-                "model": "candidate-model",
-                "reasoningEffort": "high",
-                "previousModel": "verified-model",
-                "modelSwitchPending": true
-            }),
-        )
-        .unwrap();
-        let execution = Arc::new(live.execution_snapshot());
-        let recovery = SessionModelSwitchRecoveryRuntime {
-            target_model: "candidate-model".to_string(),
-            previous_model: "verified-model".to_string(),
-            fallback_client: Arc::new(StreamingTextModelBridgeClient {
-                delta_content: "完成".to_string(),
-                payload: serde_json::json!({ "content": "完成", "finish_reason": "stop" })
-                    .to_string(),
-            }),
-            live_settings_store: live.clone(),
-        };
-        let event_bus = InMemoryEventBus::new(32);
-        let request = SessionTurnExecutionRequest {
-            session_id: session_id.clone(),
-            turn_id: "turn-context-fallback".to_string(),
-            workspace_id: None,
-            prompt: "继续".to_string(),
-            images: Vec::new(),
-            context_references: Vec::new(),
-            use_tools: false,
-            access_profile: AccessProfile::Restricted,
-            skill_name: None,
-            request_id: None,
-            user_message_id: None,
-            placeholder_message_id: None,
-            forced_tool_name: None,
-            required_tool_chain: Vec::new(),
-            goal_turn_mode: SessionGoalTurnMode::None,
-            product_locale: "zh-CN".to_string(),
-            workspace_root_path: None,
-        };
-
-        assert!(activate_previous_model_fallback(
-            PreviousModelFallbackInput {
-                event_bus: &event_bus,
-                execution_settings_store: Some(&execution),
-                session_store: &store,
-                request: &request,
-                thread_id: &thread_id,
-                recovery: &recovery,
-                provider_limit_was_applied: false,
-                persist_session_state: None,
-            }
-        ));
-        let restored = live.get_session_section(&session_id, "orchestrator");
-        assert_eq!(restored["model"], serde_json::json!("verified-model"));
-        assert!(restored.get("previousModel").is_none());
-        assert!(restored.get("modelSwitchPending").is_none());
-        let turn = store
-            .runtime_sidecar(&session_id)
-            .and_then(|sidecar| sidecar.current_turn)
-            .unwrap();
-        assert!(turn.items.iter().any(|item| {
-            item.metadata.get("noticeKind") == Some(&serde_json::json!("model_context_fallback"))
-        }));
-    }
-
-    #[test]
-    fn context_limit_without_reported_window_retries_current_turn_on_previous_model() {
-        let session_id = SessionId::new("session-context-fallback-turn");
-        let turn_id = "turn-context-fallback-turn".to_string();
-        let store = Arc::new(SessionStore::new());
-        store
-            .create_session(session_id.clone(), "context fallback turn")
-            .unwrap();
-        let (_mission_id, thread_id) = store.ensure_session_mission(&session_id, ts(1), || {
-            magi_core::MissionId::new("mission-context-fallback-turn")
-        });
-        store
-            .upsert_current_turn(
-                session_id.clone(),
-                ActiveExecutionTurn {
-                    turn_id: turn_id.clone(),
-                    turn_seq: 1,
-                    accepted_at: ts(2),
-                    completed_at: None,
-                    status: "running".to_string(),
-                    user_message: Some("继续处理".to_string()),
-                    items: vec![session_turn_item(
-                        "user_message",
-                        "completed",
-                        None,
-                        Some("继续处理".to_string()),
-                        Some("user-context-fallback-turn".to_string()),
-                        thread_id,
-                    )],
-                },
-            )
-            .unwrap();
-        let registry = ConversationRegistry::new();
-        registry
-            .begin_session_turn_input(session_id.clone(), turn_id.clone())
-            .unwrap();
-        let live = Arc::new(SettingsStore::new());
-        live.set_session_section(
-            &session_id,
-            "orchestrator",
-            serde_json::json!({
-                "model": "candidate-model",
-                "reasoningEffort": "medium",
-                "previousModel": "verified-model",
-                "modelSwitchPending": true
-            }),
-        )
-        .unwrap();
-        let execution = Arc::new(live.execution_snapshot());
-        let target_client = FailingModelBridgeClient {
-            message: "http_status=400 body=context length exceeded".to_string(),
-        };
-        let event_bus = InMemoryEventBus::new(64);
-        let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
-        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
-            client: &target_client,
-            event_bus: &event_bus,
-            session_store: store.as_ref(),
-            conversation_registry: &registry,
-            plan_store: &plan_store,
-            settings_store: Some(&execution),
-            safety_gate: None,
-            tool_registry: None,
-            skill_runtime: None,
-            skill_dispatch_runtime: None,
-            skill_name: None,
-            snapshot_manager: None,
-            request: SessionTurnExecutionRequest {
-                session_id: session_id.clone(),
-                turn_id,
-                workspace_id: None,
-                prompt: "继续处理".to_string(),
-                images: Vec::new(),
-                context_references: Vec::new(),
-                use_tools: false,
-                access_profile: AccessProfile::Restricted,
-                skill_name: None,
-                request_id: None,
-                user_message_id: None,
-                placeholder_message_id: None,
-                forced_tool_name: None,
-                required_tool_chain: Vec::new(),
-                goal_turn_mode: SessionGoalTurnMode::None,
-                product_locale: "zh-CN".to_string(),
-                workspace_root_path: None,
-            },
-            prompt: "继续处理".to_string(),
-            knowledge_context_prompt: None,
-            tools: None,
-            persist_session_state: None,
-            live_settings_store: Some(live.clone()),
-            model_switch_recovery: Some(SessionModelSwitchRecoveryRuntime {
-                target_model: "candidate-model".to_string(),
-                previous_model: "verified-model".to_string(),
-                fallback_client: Arc::new(StreamingTextModelBridgeClient {
-                    delta_content: "已继续处理".to_string(),
-                    payload: serde_json::json!({
-                        "content": "已继续处理",
-                        "finish_reason": "stop"
-                    })
-                    .to_string(),
-                }),
-                live_settings_store: live.clone(),
-            }),
-        })
-        .expect("previous model should continue the current turn");
-
-        assert_eq!(output.final_content, "已继续处理");
-        assert_eq!(
-            live.get_session_section(&session_id, "orchestrator")["model"],
-            serde_json::json!("verified-model")
-        );
-        let turn = store
-            .runtime_sidecar(&session_id)
-            .and_then(|sidecar| sidecar.current_turn)
-            .unwrap();
-        assert!(turn.items.iter().any(|item| {
-            item.metadata.get("noticeKind") == Some(&serde_json::json!("model_context_fallback"))
-        }));
-        assert!(
-            turn.items
-                .iter()
-                .any(|item| item.content.as_deref() == Some("已继续处理"))
         );
     }
 

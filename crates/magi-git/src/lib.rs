@@ -989,7 +989,6 @@ impl GitService {
     ) -> Result<GitObservation, GitError> {
         let (_guard, observation) = self.lock_and_observe(path).await?;
         enforce_precondition(&observation, &options.precondition)?;
-        require_clean(&observation, "创建分支")?;
         validate_branch_name(&observation.worktree_path, &options.branch).await?;
         let start_point = resolve_revision(
             &observation.worktree_path,
@@ -1018,7 +1017,6 @@ impl GitService {
     ) -> Result<GitObservation, GitError> {
         let (_guard, observation) = self.lock_and_observe(path).await?;
         enforce_precondition(&observation, &options.precondition)?;
-        require_clean(&observation, "切换分支")?;
         validate_local_branch_exists(&observation.worktree_path, &options.branch).await?;
         let output = run_git(
             &observation.worktree_path,
@@ -1935,7 +1933,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_dirty_switch_and_stale_head() {
+    async fn preserves_dirty_changes_during_switch_and_rejects_stale_head() {
         let repo = repository();
         let service = GitService::new();
         let initial = service.observe(repo.path()).await.expect("observe");
@@ -1952,7 +1950,7 @@ mod tests {
             .await
             .expect("create branch");
         fs::write(repo.path().join("README.md"), "dirty\n").expect("dirty fixture");
-        let dirty = service
+        let switched_with_changes = service
             .branch_switch(
                 repo.path(),
                 BranchSwitchOptions {
@@ -1961,10 +1959,25 @@ mod tests {
                 },
             )
             .await
-            .expect_err("dirty switch must fail");
-        assert!(matches!(dirty, GitError::DirtyWorkspace { .. }));
+            .expect("compatible dirty changes should follow branch switch");
+        assert_eq!(switched_with_changes.branch.as_deref(), Some("other"));
+        assert!(switched_with_changes.dirty.has_uncommitted);
+        assert_eq!(
+            fs::read_to_string(repo.path().join("README.md")).expect("read dirty fixture"),
+            "dirty\n"
+        );
 
         git(repo.path(), &["restore", "README.md"]);
+        let back_on_main = service
+            .branch_switch(
+                repo.path(),
+                BranchSwitchOptions {
+                    branch: "main".to_string(),
+                    precondition: precondition(&switched_with_changes),
+                },
+            )
+            .await
+            .expect("switch back to main");
         fs::write(repo.path().join("next.txt"), "next\n").expect("next fixture");
         git(repo.path(), &["add", "next.txt"]);
         git(repo.path(), &["commit", "-m", "external commit"]);
@@ -1973,12 +1986,40 @@ mod tests {
                 repo.path(),
                 BranchSwitchOptions {
                     branch: "other".to_string(),
-                    precondition: precondition(&initial),
+                    precondition: precondition(&back_on_main),
                 },
             )
             .await
             .expect_err("stale head must fail");
         assert!(matches!(stale, GitError::StaleContext { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_and_switch_branch_preserves_dirty_changes() {
+        let repo = repository();
+        let service = GitService::new();
+        let initial = service.observe(repo.path()).await.expect("observe");
+        fs::write(repo.path().join("README.md"), "work in progress\n").expect("dirty fixture");
+
+        let created = service
+            .branch_create(
+                repo.path(),
+                BranchCreateOptions {
+                    branch: "feature/from-dirty".to_string(),
+                    start_point: None,
+                    switch: true,
+                    precondition: precondition(&initial),
+                },
+            )
+            .await
+            .expect("create branch with compatible dirty changes");
+
+        assert_eq!(created.branch.as_deref(), Some("feature/from-dirty"));
+        assert!(created.dirty.has_uncommitted);
+        assert_eq!(
+            fs::read_to_string(repo.path().join("README.md")).expect("read dirty fixture"),
+            "work in progress\n"
+        );
     }
 
     #[tokio::test]

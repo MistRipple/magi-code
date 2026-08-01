@@ -22,12 +22,10 @@ export function resolveOrchestratorReasoningEffort(
 export function resolveOrchestratorModel(
   sessionConfig: Record<string, unknown> | null | undefined,
   effectiveConfig: Record<string, unknown> | null | undefined,
-  availableModels: readonly string[],
 ): string {
   const candidates = [
     sessionConfig?.model,
     effectiveConfig?.model,
-    ...availableModels,
   ];
   for (const candidate of candidates) {
     if (typeof candidate === 'string' && candidate.trim()) {
@@ -57,7 +55,7 @@ export function copyOrchestratorSessionConfig(
   sessionConfig: Record<string, unknown> | null | undefined,
   effectiveConfig: Record<string, unknown> | null | undefined,
 ): Record<string, unknown> {
-  const model = resolveOrchestratorModel(sessionConfig, effectiveConfig, []);
+  const model = resolveOrchestratorModel(sessionConfig, effectiveConfig);
   const reasoningEffort = resolveOrchestratorReasoningEffort(sessionConfig, effectiveConfig);
   return {
     ...(model ? { model } : {}),

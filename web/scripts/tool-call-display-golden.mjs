@@ -28,6 +28,22 @@ for (const [component, source] of [
   );
 }
 
+assert.match(
+  toolCallSource,
+  /const detailVisible = \$derived\(canExpand && !collapsed\);[\s\S]*?detailVisible && !outputIsStructuredError \? formatToolOutput\(name, output\) : ''/,
+  '折叠工具卡不得在首屏格式化完整工具输出',
+);
+assert.match(
+  toolCallSource,
+  /detailVisible \? parseToolDiagramPayload\(name, output\) : null/,
+  '折叠工具卡不得在首屏解析图表载荷',
+);
+assert.match(
+  terminalCardSource,
+  /const displayOutput = \$derived\(isExpanded \? formatOutput\(rawDisplayOutput\) : ''\);/,
+  '折叠 Shell 卡片不得在首屏格式化终端输出',
+);
+
 await withGoldenViteServer(async (server) => {
   const display = await server.ssrLoadModule('/src/lib/tool-call-display.ts');
   const fileChange = await server.ssrLoadModule('/src/lib/canonical-tool-file-change.ts');

@@ -127,6 +127,16 @@ assert.match(
 );
 assert.match(
   shellSource,
+  /列表同步 effect：[\s\S]*?const sessionsWorkspaceId = messagesState\.workspaceSessionProjection\.workspaceId\?\.trim\(\) \|\| ''[\s\S]*?\[sessionsWorkspaceId\]: currentSessions/,
+  '侧栏会话集合必须按列表自身的工作区作用域同步，不能由当前草稿指针推断归属',
+);
+assert.match(
+  shellSource,
+  /async function openWorkspaceDraft[\s\S]*?if \(sessionsAlreadyLoaded\) \{[\s\S]*?replaceWorkspaceSessionProjection\(workspaceId, getWorkspaceSessionList\(workspaceId\)\);[\s\S]*?type: 'newSession'/,
+  '进入草稿前必须保留目标工作区已加载的会话集合',
+);
+assert.match(
+  shellSource,
   /class="workspace-new-session-btn"[\s\S]*?disabled=\{workspaceActionPending \|\| messagesState\.sessionHydrating \|\| Boolean\(pendingSessionSwitchId\)\}[\s\S]*?event\.stopPropagation\(\)[\s\S]*?openWorkspaceDraft\(workspace\)[\s\S]*?<Icon name="plus"/,
   '工作空间行必须提供不会触发展开的加号按钮，并在状态切换期间禁用',
 );

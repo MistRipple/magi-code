@@ -138,6 +138,16 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn queued_submission_is_retryable(&self) -> bool {
+        matches!(
+            self,
+            ApiError::ModelInvocationFailed(_)
+                | ApiError::InternalAssemblyError(_)
+                | ApiError::Conflict(_)
+                | ApiError::TurnConflict { .. }
+        )
+    }
+
     fn public_message(&self) -> &str {
         match self {
             ApiError::InvalidRequestBody(_) => "请求内容格式不正确，请检查后重试",
@@ -333,6 +343,16 @@ mod tests {
             ApiError::InternalAssemblyError("err".into()).status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn queued_submission_retries_only_transient_failures() {
+        assert!(
+            ApiError::InternalAssemblyError("temporary".into()).queued_submission_is_retryable()
+        );
+        assert!(ApiError::Conflict("busy".into()).queued_submission_is_retryable());
+        assert!(!ApiError::InvalidInput("invalid".into()).queued_submission_is_retryable());
+        assert!(!ApiError::SessionNotFound("missing".into()).queued_submission_is_retryable());
     }
 
     #[test]

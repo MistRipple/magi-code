@@ -1,9 +1,7 @@
-pub mod base_adapter;
 pub mod cache_boundary;
 mod clients;
-pub mod decision_engine;
 mod dispatch;
-pub mod execution_outcome;
+mod endpoint_url;
 pub mod final_text_policy;
 mod http_model_client;
 mod image_generation;
@@ -12,9 +10,7 @@ mod local_process_protocol;
 mod mcp_client;
 mod mcp_loopback;
 mod model_loopback;
-pub mod orchestrator_termination;
 pub mod protocol;
-pub mod round_policy;
 pub mod structured_dispatch;
 pub mod tool_concurrency;
 mod transport;
@@ -28,10 +24,9 @@ pub use clients::{
     JsonRpcModelBridgeClient,
 };
 pub use dispatch::BridgeDispatchRuntime;
+pub use endpoint_url::EndpointUrlMode;
 pub use http_model_client::{HttpModelBridgeClient, HttpModelBridgeProtocol};
-pub use image_generation::{
-    GeneratedImage, HttpImageGenerationClient, ImageGenerationRequest, ImageGenerationUrlMode,
-};
+pub use image_generation::{GeneratedImage, HttpImageGenerationClient, ImageGenerationRequest};
 pub use local_process_protocol::{
     BridgeServerCommandCapabilityProfile, BridgeServerContextResolutionBoundary,
     BridgeServerHandshake, BridgeServerHealth, BridgeServerKind, BridgeServerServiceCatalog,

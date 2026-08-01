@@ -12,6 +12,9 @@
     newCustomRule = $bindable(),
     addCustomRule,
     userRulesSaveStatus,
+    safeguardSaveStatus,
+    safeguardAuditCount,
+    safeguardAuditPersistenceHealthy,
   } = $props<{
     userRules: string;
     SAFEGUARD_CATEGORIES: any[];
@@ -22,6 +25,9 @@
     newCustomRule: string;
     addCustomRule: () => void;
     userRulesSaveStatus: string;
+    safeguardSaveStatus: string;
+    safeguardAuditCount: number;
+    safeguardAuditPersistenceHealthy: boolean;
   }>();
 
   const SAFEGUARD_ACTIONS = [
@@ -38,6 +44,19 @@
         return i18n.t('settings.profile.autoSaved');
       case 'error':
         return i18n.t('settings.profile.autoSaveFailed');
+      default:
+        return '';
+    }
+  });
+
+  const safeguardStatusText = $derived.by(() => {
+    switch (safeguardSaveStatus) {
+      case 'saving':
+        return i18n.t('settings.safeguard.status.saving');
+      case 'saved':
+        return i18n.t('settings.safeguard.status.saved');
+      case 'error':
+        return i18n.t('settings.safeguard.status.error');
       default:
         return '';
     }
@@ -94,11 +113,33 @@
 </div>
 
 <!-- 安全防护 section -->
-<div class="settings-section" style="border-bottom: none;">
-  <div class="settings-section-header">
-    <div class="settings-section-title">{i18n.t('settings.safeguard.title')}</div>
-  </div>
-  <div class="settings-section-desc">{i18n.t('settings.safeguard.desc')}</div>
+  <div class="settings-section" style="border-bottom: none;">
+    <div class="settings-section-header">
+      <div class="settings-section-title">{i18n.t('settings.safeguard.title')}</div>
+      {#if safeguardStatusText}
+        <div class="rules-save-status" class:error={safeguardSaveStatus === 'error'}>
+          {#if safeguardSaveStatus === 'saving'}
+            <Icon name="refresh" size={13} />
+          {:else if safeguardSaveStatus === 'saved'}
+            <Icon name="check" size={13} />
+          {:else}
+            <Icon name="close" size={13} />
+          {/if}
+          <span>{safeguardStatusText}</span>
+        </div>
+      {/if}
+    </div>
+    <div class="settings-section-desc">{i18n.t('settings.safeguard.desc')}</div>
+    <div class="safeguard-policy-note">
+      {i18n.t('settings.safeguard.policyNote')}
+      <div class="safeguard-audit-summary" class:unhealthy={!safeguardAuditPersistenceHealthy}>
+        {#if safeguardAuditPersistenceHealthy}
+          {i18n.t('settings.safeguard.auditSummary', { count: safeguardAuditCount })}
+        {:else}
+          {i18n.t('settings.safeguard.auditUnavailable')}
+        {/if}
+      </div>
+    </div>
   <div class="safeguard-categories">
     {#each SAFEGUARD_CATEGORIES as category}
       {@const categoryRules = getRulesForCategory(category)}
@@ -112,6 +153,8 @@
                 class="safeguard-badge"
                 class:enabled={rule.enabled}
                 class:disabled={!rule.enabled}
+                aria-pressed={rule.enabled}
+                aria-label={`${rule.pattern}: ${getSafeguardActionLabel(rule.action)}`}
                 onclick={() => toggleSafeguardRule(index)}
                 onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleSafeguardRule(index); } }}
                 title={getSafeguardRuleTitle(rule)}
@@ -179,6 +222,25 @@
   }
 
   .rules-save-status.error {
+    color: var(--danger);
+  }
+
+  .safeguard-policy-note {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    line-height: 1.5;
+  }
+
+  .safeguard-audit-summary {
+    margin-top: 4px;
+    color: var(--foreground);
+  }
+
+  .safeguard-audit-summary.unhealthy {
     color: var(--danger);
   }
 

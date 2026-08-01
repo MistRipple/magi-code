@@ -18,6 +18,8 @@ let summaryUpdatedAt = ACCEPTED_AT;
 let workspaceListPayload = null;
 const capturedTurnBodies = [];
 const bootstrapInterceptors = [];
+const workspaceSessionsInterceptors = [];
+const sessionQueueInterceptors = [];
 const bridgeMutationRequests = [];
 const bridgeMutationInterceptors = [];
 const sessionTurnInterceptors = [];
@@ -327,6 +329,10 @@ function installFetchStub() {
       });
     }
     if (parsed.pathname === '/api/session/queue' && init.method !== 'POST') {
+      const interceptor = sessionQueueInterceptors.shift();
+      if (interceptor) {
+        return interceptor(parsed, init);
+      }
       return jsonResponse({
         sessionId: parsed.searchParams.get('sessionId') || SESSION_ID,
         queuedTurns: queuedTurnPayloads,
@@ -415,6 +421,10 @@ function installFetchStub() {
     }
     if (parsed.pathname === '/api/workspaces/sessions') {
       workspaceSessionsRequestCount += 1;
+      const interceptor = workspaceSessionsInterceptors.shift();
+      if (interceptor) {
+        return interceptor(parsed, init);
+      }
       if (workspaceSessionsPayloadOverride) {
         return jsonResponse(workspaceSessionsPayloadOverride);
       }
@@ -696,7 +706,7 @@ function findArtifactByRequestId(projection, requestId) {
 }
 
 function currentSessionSummary(messagesStore) {
-  return messagesStore.messagesState.sessions.find((session) => session.id === SESSION_ID);
+  return messagesStore.messagesState.workspaceSessionProjection.sessions.find((session) => session.id === SESSION_ID);
 }
 
 function deferred() {
@@ -835,7 +845,7 @@ await withGoldenViteServer(async (server) => {
     'active turn must not rebuild SSE after only two missed keep-alives on tunnel/mobile links',
   );
   await waitFor(
-    () => messagesStore.messagesState.sessions.some((session) => session.id === SESSION_ID),
+    () => messagesStore.messagesState.workspaceSessionProjection.sessions.some((session) => session.id === SESSION_ID),
     'created live session must refresh the workspace session summary',
   );
 
@@ -982,7 +992,20 @@ await withGoldenViteServer(async (server) => {
     messagesStore.clearPendingRequest('tunnel-stale-running-state');
   }
 
-  const sessionsBeforeDraft = messagesStore.messagesState.sessions.map((session) => session.id);
+  const sessionsBeforeDraft = messagesStore.messagesState.workspaceSessionProjection.sessions.map((session) => session.id);
+  messagesStore.messagesState.settingsBootstrapSnapshot = {
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+    orchestratorSessionConfig: {
+      model: 'model-inherited-from-current-session',
+      reasoningEffort: 'high',
+    },
+    effectiveOrchestratorConfig: {
+      model: 'model-inherited-from-current-session',
+      reasoningEffort: 'high',
+    },
+  };
   bridge.postMessage({
     type: 'newSession',
     workspaceId: WORKSPACE_ID,
@@ -993,9 +1016,35 @@ await withGoldenViteServer(async (server) => {
     'new session action must enter workspace draft state',
   );
   assert.deepEqual(
-    messagesStore.messagesState.sessions.map((session) => session.id),
+    messagesStore.messagesState.draftOrchestratorSessionConfig,
+    {
+      model: 'model-inherited-from-current-session',
+      reasoningEffort: 'high',
+    },
+    'new session draft must inherit the model selected by the source session',
+  );
+  messagesStore.messagesState.draftOrchestratorSessionConfig = {
+    model: 'model-selected-in-draft',
+    reasoningEffort: 'xhigh',
+  };
+  bridge.postMessage({
+    type: 'newSession',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+  });
+  await waitFor(
+    () => messagesStore.messagesState.draftOrchestratorSessionConfig.model === 'model-selected-in-draft',
+    'reopening the same draft must preserve its explicit model selection',
+  );
+  assert.deepEqual(
+    messagesStore.messagesState.workspaceSessionProjection.sessions.map((session) => session.id),
     sessionsBeforeDraft,
     'entering and abandoning a new-session draft must not erase the sidebar session list',
+  );
+  assert.equal(
+    messagesStore.messagesState.workspaceSessionProjection.workspaceId,
+    WORKSPACE_ID,
+    'new-session draft must preserve the explicit workspace scope of the session list projection',
   );
   bridge.postMessage({
     type: 'workspaceBindingChanged',
@@ -1004,7 +1053,7 @@ await withGoldenViteServer(async (server) => {
     sessionId: '',
   });
   assert.deepEqual(
-    messagesStore.messagesState.sessions.map((session) => session.id),
+    messagesStore.messagesState.workspaceSessionProjection.sessions.map((session) => session.id),
     sessionsBeforeDraft,
     'idempotent workspace-only binding sync must not clear the preserved session list',
   );
@@ -1196,6 +1245,12 @@ await withGoldenViteServer(async (server) => {
   pendingChangesPayloadOverride = null;
 
   const switchBootstrapRequests = [];
+  pendingChangesPayloadOverride = scopedBootstrapPayloadWithPendingChange(
+    WORKSPACE_ID,
+    WORKSPACE_PATH,
+    SESSION_ID,
+    '切换后带变更会话',
+  ).pendingChanges;
   bootstrapInterceptors.push((parsed) => {
     switchBootstrapRequests.push(parsed);
     return jsonResponse(scopedBootstrapPayloadWithPendingChange(
@@ -1221,6 +1276,10 @@ await withGoldenViteServer(async (server) => {
     messagesSnapshotBeforeSwitch,
     'switchSession must not restore from /api/messages partial snapshot',
   );
+  await waitFor(
+    () => messagesStore.messagesState.edits.length === 2,
+    'switchSession must load pending changes through the independent changes projection',
+  );
   assert.equal(
     messagesStore.messagesState.edits.length,
     2,
@@ -1242,6 +1301,7 @@ await withGoldenViteServer(async (server) => {
     undefined,
     'pendingChanges must not derive workspace path from legacy snake_case fields',
   );
+  pendingChangesPayloadOverride = null;
 
   const backgroundSessionId = 'session-bridge-background-running';
   const backgroundSession = {
@@ -1258,6 +1318,7 @@ await withGoldenViteServer(async (server) => {
     SESSION_ID,
     '前台查看会话',
   );
+  pendingChangesPayloadOverride = foregroundBootstrap.pendingChanges;
   foregroundBootstrap.sessions = [backgroundSession, ...foregroundBootstrap.sessions];
   foregroundBootstrap.state.sessions = foregroundBootstrap.sessions;
   workspaceSessionsPayloadOverride = {
@@ -1276,14 +1337,19 @@ await withGoldenViteServer(async (server) => {
     workspacePath: WORKSPACE_PATH,
   });
   await waitFor(
-    () => messagesStore.messagesState.sessions.some((session) => (
+    () => messagesStore.messagesState.workspaceSessionProjection.sessions.some((session) => (
       session.id === backgroundSessionId
       && session.isRunning === true
       && session.runningTaskCount === 1
     )),
     'switchSession bootstrap must preserve the authoritative running state of background sessions',
   );
+  await waitFor(
+    () => messagesStore.messagesState.edits.length === 2,
+    'foreground session must restore pending changes through the independent changes projection',
+  );
   workspaceSessionsPayloadOverride = null;
+  pendingChangesPayloadOverride = null;
 
   const editsBeforeLiveRefresh = structuredClone(messagesStore.messagesState.edits);
   const currentChangesVersion = messagesStore.messagesState.appState?.pendingChangesStateVersion ?? 0;
@@ -1629,6 +1695,53 @@ await withGoldenViteServer(async (server) => {
   assert.equal(workspaceSessionsRequestCount, continueWorkspaceSessionsRequestCount);
   messagesStore.clearPendingRequest(continueTurnBody.requestId);
 
+  const slowWorkspaceSessions = deferred();
+  const slowSessionQueue = deferred();
+  workspaceSessionsInterceptors.push(() => slowWorkspaceSessions.promise);
+  sessionQueueInterceptors.push(() => slowSessionQueue.promise);
+  bootstrapInterceptors.push(() => jsonResponse(scopedBootstrapPayload(
+    WORKSPACE_ID,
+    WORKSPACE_PATH,
+    SESSION_ID,
+    '首屏非阻塞会话',
+  )));
+  bridge.postMessage({
+    type: 'workspaceBindingChanged',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+  });
+  messagesStore.messagesState.bootstrapped = false;
+  bridge.postMessage({ type: 'requestState' });
+  await waitForWithin(
+    () => messagesStore.messagesState.bootstrapped === true,
+    '核心 bootstrap 必须在会话摘要和排队请求完成前解除首屏等待',
+    250,
+  );
+  assert.equal(
+    messagesStore.messagesState.currentSessionId,
+    SESSION_ID,
+    '核心 bootstrap 必须先恢复当前会话',
+  );
+  slowWorkspaceSessions.resolve(jsonResponse({
+    workspace: {
+      workspaceId: WORKSPACE_ID,
+      rootPath: WORKSPACE_PATH,
+    },
+    sessionId: SESSION_ID,
+    sessions: scopedBootstrapPayload(
+      WORKSPACE_ID,
+      WORKSPACE_PATH,
+      SESSION_ID,
+      '首屏非阻塞会话',
+    ).sessions,
+  }));
+  slowSessionQueue.resolve(jsonResponse({
+    sessionId: SESSION_ID,
+    queuedTurns: [],
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
   const originalRaceWarn = console.warn;
   try {
     console.warn = () => {};
@@ -1773,7 +1886,7 @@ await withGoldenViteServer(async (server) => {
     'authoritative empty-workspace bootstrap must remove stale workspace from URL',
   );
   assert.deepEqual(
-    messagesStore.messagesState.sessions,
+    messagesStore.messagesState.workspaceSessionProjection.sessions,
     [],
     'authoritative empty-workspace bootstrap must clear stale session summaries',
   );

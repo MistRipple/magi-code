@@ -54,7 +54,7 @@ export interface TokenUsage {
  *
  * `urlMode` 只表达路径形态；`apiProtocol` 是请求协议的唯一事实源。
  */
-export type ModelApiProtocol = 'openai_chat' | 'anthropic_messages';
+export type ModelApiProtocol = 'openai_chat' | 'openai_responses' | 'anthropic_messages';
 
 export interface LLMConfig {
   baseUrl: string;

@@ -1243,6 +1243,23 @@ mod tests {
         )
     }
 
+    fn non_git_api_fixture() -> (tempfile::TempDir, ApiState, String) {
+        let workspace = tempfile::tempdir().expect("non-Git fixture");
+        let workspace_id = WorkspaceId::new("workspace-non-git-api");
+        let workspaces = Arc::new(WorkspaceStore::default());
+        workspaces
+            .register_native_path(workspace_id.clone(), workspace.path().to_path_buf())
+            .expect("register non-Git workspace");
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(64)),
+            Arc::new(SessionStore::default()),
+            workspaces,
+            Arc::new(GovernanceService::default()),
+        );
+        (workspace, state, workspace_id.to_string())
+    }
+
     async fn post_json(state: ApiState, uri: &str, body: Value) -> Value {
         let response = routes()
             .with_state(state)
@@ -1317,6 +1334,40 @@ mod tests {
         assert!(status.has_uncommitted);
         assert_eq!(status.staged, 1);
         assert_eq!(status.unstaged, 2);
+    }
+
+    #[tokio::test]
+    async fn structured_api_reports_non_git_workspace_without_repository_context() {
+        let (workspace, state, workspace_id) = non_git_api_fixture();
+        let workspace_path = workspace.path().to_string_lossy().to_string();
+
+        let status = post_json(
+            state.clone(),
+            "/workspace/vcs/status",
+            serde_json::json!({
+                "workspaceId": workspace_id,
+                "workspacePath": workspace_path,
+            }),
+        )
+        .await;
+        assert_eq!(status["isRepo"], false, "{status}");
+        assert!(status["currentBranch"].is_null(), "{status}");
+        assert!(status["status"].is_null(), "{status}");
+
+        let branches = post_json(
+            state,
+            "/workspace/vcs/branches",
+            serde_json::json!({
+                "workspaceId": workspace_id,
+                "workspacePath": workspace_path,
+                "includeRemote": true,
+            }),
+        )
+        .await;
+        assert_eq!(branches["isRepo"], false, "{branches}");
+        assert_eq!(branches["branches"], serde_json::json!([]));
+        assert_eq!(branches["remoteBranches"], serde_json::json!([]));
+        assert_eq!(branches["structuredBranches"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -1640,7 +1691,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_api_reports_dirty_and_external_head_drift() {
+    async fn structured_api_supports_dirty_branch_workflow_and_reports_external_head_drift() {
         let (repository, state, _workspace_id, session_id) = git_api_fixture();
         let workspace_path = repository.path().to_string_lossy().to_string();
         let status = post_json(
@@ -1653,7 +1704,7 @@ mod tests {
         )
         .await;
         fs::write(repository.path().join("README.md"), "dirty\n").expect("dirty fixture");
-        let dirty = post_json(
+        let dirty_branch = post_json(
             state.clone(),
             "/workspace/vcs/branch/create",
             serde_json::json!({
@@ -1664,8 +1715,9 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(dirty["ok"], false);
-        assert_eq!(dirty["error"]["kind"], "dirty_workspace");
+        assert_eq!(dirty_branch["ok"], true, "{dirty_branch}");
+        assert_eq!(dirty_branch["observation"]["branch"], "feature/dirty");
+        assert_eq!(dirty_branch["observation"]["dirty"]["hasUncommitted"], true);
 
         git(repository.path(), &["restore", "README.md"]);
         fs::write(repository.path().join("external.txt"), "external\n").expect("external fixture");

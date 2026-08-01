@@ -60,8 +60,8 @@ pub use skill_custom_tool_surface::{
     tool_execution_policy_scope,
 };
 pub use task_helpers::{
-    BASE_TOOL_CALL_ROUNDS, MAX_TOOL_CALL_ROUNDS, TaskTurnVisibility, apply_task_final_visibility,
-    apply_task_turn_visibility, apply_task_worker_detail_visibility, canonical_tool_call_name,
+    TaskTurnVisibility, apply_task_final_visibility, apply_task_turn_visibility,
+    apply_task_worker_detail_visibility, canonical_tool_call_name,
     collect_dependency_output_validation_facts, compact_validation_failure,
     deterministic_execution_tool_validation_content, deterministic_planning_content,
     deterministic_planning_validation_content, deterministic_task_final_content, extract_task_goal,
@@ -70,7 +70,7 @@ pub use task_helpers::{
     record_completed_required_tools, requested_public_builtin_tool_chain,
     requested_required_tool_chain, required_tool_chain_is_complete,
     required_tool_chain_recovery_prompt, required_tool_definitions_for_round,
-    task_required_tool_chain, task_turn_visibility, tool_call_round_limit, tool_reference_position,
+    task_required_tool_chain, task_turn_visibility, tool_reference_position,
     validation_result_rejects_delivery,
 };
 pub(crate) use tool_batch::execute_task_tool_call_batch;

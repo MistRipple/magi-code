@@ -54,6 +54,109 @@ impl SessionStore {
         }
     }
 
+    /// 为 bootstrap 构造工作区内单个会话的投影。
+    ///
+    /// 首屏只需要当前 workspace 的会话列表和当前会话历史。这里直接在读锁
+    /// 下按范围筛选，避免先克隆整个 daemon 的所有会话、timeline 和 canonical
+    /// turns，再由 API 层裁剪造成不必要的 CPU 与内存峰值。
+    pub fn projection_input_for_workspace_session(
+        &self,
+        workspace_id: &str,
+        requested_session_id: Option<&SessionId>,
+    ) -> SessionProjectionInput {
+        let workspace_id = workspace_id.trim();
+        let state = self.state.read().expect("session state read lock poisoned");
+        let mut sessions = state
+            .sessions
+            .iter()
+            .filter(|session| session.workspace_id.as_deref() == Some(workspace_id))
+            .cloned()
+            .map(|session| with_session_message_count(session, &state.timeline))
+            .filter(|session| session.message_count.unwrap_or(0) > 0)
+            .collect::<Vec<_>>();
+        sessions.sort_by(cmp_sessions_newest_first);
+
+        let selected_session_id = requested_session_id
+            .filter(|session_id| {
+                sessions
+                    .iter()
+                    .any(|session| &session.session_id == *session_id)
+            })
+            .cloned()
+            .or_else(|| {
+                state
+                    .current_session_id
+                    .as_ref()
+                    .filter(|session_id| {
+                        sessions
+                            .iter()
+                            .any(|session| &session.session_id == *session_id)
+                    })
+                    .cloned()
+            })
+            .or_else(|| sessions.first().map(|session| session.session_id.clone()));
+
+        // 多取一个 timeline entry 作为分页哨兵，避免 bootstrap 为了裁剪首屏
+        // 先复制当前会话的完整消息历史。
+        let mut timeline_refs = selected_session_id
+            .as_ref()
+            .map(|session_id| {
+                state
+                    .timeline
+                    .iter()
+                    .filter(|entry| &entry.session_id == session_id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        timeline_refs.sort_by(|left, right| {
+            left.occurred_at
+                .0
+                .cmp(&right.occurred_at.0)
+                .then_with(|| left.entry_id.cmp(&right.entry_id))
+        });
+        let timeline_start = timeline_refs.len().saturating_sub(51);
+        let timeline = timeline_refs
+            .drain(timeline_start..)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // 多取一个 turn 作为分页哨兵。DTO 会把它裁掉，但可以据此准确判断
+        // 是否还有更早历史，同时不会为了首屏复制整个 canonical history。
+        let mut canonical_turn_refs = selected_session_id
+            .as_ref()
+            .map(|session_id| {
+                let mut turns = state
+                    .canonical_turns
+                    .iter()
+                    .filter(|turn| &turn.session_id == session_id)
+                    .collect::<Vec<_>>();
+                turns.sort_by(|left, right| {
+                    left.turn_seq
+                        .cmp(&right.turn_seq)
+                        .then_with(|| left.turn_id.cmp(&right.turn_id))
+                });
+                turns
+            })
+            .unwrap_or_default();
+        let canonical_start = canonical_turn_refs.len().saturating_sub(21);
+        let canonical_turns = canonical_turn_refs
+            .drain(canonical_start..)
+            .map(|turn| {
+                let mut turn = turn.clone();
+                turn.normalize();
+                turn
+            })
+            .collect();
+
+        SessionProjectionInput {
+            current_session_id: selected_session_id,
+            sessions,
+            timeline,
+            canonical_turns,
+            notifications: Vec::new(),
+        }
+    }
+
     pub fn session_index(&self) -> Vec<SessionId> {
         let mut session_ids = self
             .state
@@ -187,6 +290,48 @@ impl SessionStore {
                 .then_with(|| left.turn_id.cmp(&right.turn_id))
         });
         turns
+    }
+
+    /// 返回当前会话 canonical turn 的倒序分页窗口。
+    ///
+    /// canonical turn 是主对话的权威事实，不能在每次 bootstrap 时完整复制。
+    /// 游标使用稳定的 turn_id，和 timeline 的 entry_id 分开，避免一条 turn
+    /// 包含大量 item 时把完整历史重新编码进首屏响应。
+    pub fn canonical_turn_page_for_session(
+        &self,
+        session_id: &SessionId,
+        before_cursor: Option<&str>,
+        limit: usize,
+    ) -> Option<(Vec<crate::models::CanonicalTurn>, bool, Option<String>)> {
+        let state = self.state.read().expect("session state read lock poisoned");
+        let mut turns = state
+            .canonical_turns
+            .iter()
+            .filter(|turn| &turn.session_id == session_id)
+            .collect::<Vec<_>>();
+        turns.sort_by(|left, right| {
+            left.turn_seq
+                .cmp(&right.turn_seq)
+                .then_with(|| left.turn_id.cmp(&right.turn_id))
+        });
+        let end = match before_cursor
+            .map(str::trim)
+            .filter(|cursor| !cursor.is_empty())
+        {
+            Some(cursor) => turns.iter().position(|turn| turn.turn_id == cursor)?,
+            None => turns.len(),
+        };
+        let start = end.saturating_sub(limit.max(1));
+        let page = turns[start..end]
+            .iter()
+            .map(|turn| {
+                let mut turn = (*turn).clone();
+                turn.normalize();
+                turn
+            })
+            .collect::<Vec<_>>();
+        let cursor = page.first().map(|turn| turn.turn_id.clone());
+        Some((page, start > 0, cursor))
     }
 
     pub fn recent_turn_messages(&self, session_id: &SessionId, limit: usize) -> Vec<String> {

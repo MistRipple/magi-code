@@ -9,7 +9,8 @@ import {
   setIsProcessing,
   setCurrentSessionId,
   adoptCurrentSessionIdForLiveTurn,
-  updateSessions,
+  replaceWorkspaceSessionProjection,
+  clearWorkspaceSessionProjection,
   setQueuedMessages,
   setAppState,
   clearPendingInteractions,
@@ -116,7 +117,6 @@ function clearCurrentSessionBeforeWorkspaceChange(nextWorkspaceId: string): void
 
 function handleWorkspaceSessionDetached(
   payload: Record<string, unknown>,
-  sessions: Session[],
 ): void {
   const draftConfig = payload.orchestratorSessionConfig;
   const nextDraftConfig = draftConfig
@@ -144,7 +144,6 @@ function handleWorkspaceSessionDetached(
     clearCurrentSessionBeforeWorkspaceChange(nextWorkspaceId);
     messagesState.currentWorkspaceId = nextWorkspaceId || messagesState.currentWorkspaceId;
     messagesState.currentWorkspacePath = typeof payload.workspacePath === 'string' ? payload.workspacePath.trim() : '';
-    updateSessions(sessions);
     setCurrentSessionId(null);
     if (!hasPendingLocalTurn) {
       setQueuedMessages([]);
@@ -152,12 +151,15 @@ function handleWorkspaceSessionDetached(
     }
     setOrchestratorRuntimeState(null);
     messagesState.draftOrchestratorSessionConfig = { ...nextDraftConfig };
+    const projectedSessions: Session[] = messagesState.workspaceSessionProjection.workspaceId === messagesState.currentWorkspaceId
+      ? ensureArray<Session>(messagesState.workspaceSessionProjection.sessions)
+      : [];
     setAppState({
       ...buildEmptyWorkspaceAppState(Date.now()),
       currentSessionId: '',
       currentWorkspaceId: messagesState.currentWorkspaceId,
       currentWorkspacePath: messagesState.currentWorkspacePath,
-      sessions,
+      sessions: projectedSessions,
     });
   });
 }
@@ -382,7 +384,15 @@ function handleStateUpdate(
     applyAuthoritativeProcessingState(state.processingState ?? null);
   }
   if (state.sessions) {
-    updateSessions(ensureArray(state.sessions) as Session[]);
+    const sessionsWorkspaceId = typeof state.currentWorkspaceId === 'string'
+      ? state.currentWorkspaceId.trim()
+      : '';
+    if (sessionsWorkspaceId) {
+      replaceWorkspaceSessionProjection(
+        sessionsWorkspaceId,
+        ensureArray(state.sessions) as Session[],
+      );
+    }
   }
 
   // currentSessionId 属于显式 bootstrap / switch 的会话锚定语义，
@@ -597,7 +607,10 @@ export function handleUnifiedData(standard: StandardMessage) {
     }
 
     case 'sessionsUpdated':
-      handleSessionsUpdated(asMessage({ sessions: payload.sessions }));
+      handleSessionsUpdated(asMessage({
+        workspaceId: payload.workspaceId,
+        sessions: payload.sessions,
+      }));
       break;
 
     case 'emptyWorkspaceStateLoaded':
@@ -609,11 +622,11 @@ export function handleUnifiedData(standard: StandardMessage) {
       break;
 
     case 'workspaceDraftStarted':
-      handleWorkspaceSessionDetached(payload, ensureArray(messagesState.sessions));
+      handleWorkspaceSessionDetached(payload);
       break;
 
     case 'workspaceSessionCleared':
-      handleWorkspaceSessionDetached(payload, []);
+      handleWorkspaceSessionDetached(payload);
       break;
 
     case 'sessionBootstrapLoaded':
@@ -628,6 +641,8 @@ export function handleUnifiedData(standard: StandardMessage) {
         orchestratorRuntimeState: payload.orchestratorRuntimeState,
         hasMoreBefore: payload.hasMoreBefore,
         beforeCursor: payload.beforeCursor,
+        canonicalHasMoreBefore: payload.canonicalHasMoreBefore,
+        canonicalBeforeCursor: payload.canonicalBeforeCursor,
       }));
       break;
 
@@ -756,8 +771,17 @@ export function handleUnifiedData(standard: StandardMessage) {
 
 function handleSessionsUpdated(message: ClientBridgeMessage) {
   const sessions = message.sessions as Session[];
+  const workspaceId = typeof message.workspaceId === 'string' ? message.workspaceId.trim() : '';
+  if (!workspaceId) {
+    console.warn('[MessageHandler] 忽略缺少 workspaceId 的会话目录更新');
+    return;
+  }
+  const currentWorkspaceId = currentWorkspaceIdValue();
+  if (currentWorkspaceId && workspaceId !== currentWorkspaceId) {
+    return;
+  }
   if (sessions) {
-    updateSessions(ensureArray(sessions));
+    replaceWorkspaceSessionProjection(workspaceId, ensureArray(sessions));
   }
 }
 
@@ -791,7 +815,11 @@ function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
     setCurrentSessionId(null);
     messagesState.currentWorkspaceId = workspaceId;
     messagesState.currentWorkspacePath = workspacePath;
-    updateSessions([]);
+    if (workspaceId) {
+      replaceWorkspaceSessionProjection(workspaceId, []);
+    } else {
+      clearWorkspaceSessionProjection();
+    }
     setSessionHistoryState(null, { workspaceId });
     setAppState({
       ...state,
@@ -1135,7 +1163,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       clearCurrentSessionBeforeWorkspaceChange(workspaceId);
       messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
       messagesState.currentWorkspacePath = workspacePath;
-      updateSessions(sessions);
+      replaceWorkspaceSessionProjection(workspaceId, sessions);
       setCurrentSessionId(null);
       messagesState.draftOrchestratorSessionConfig = {};
       clearStaleSettingsBootstrapSnapshot();
@@ -1172,7 +1200,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       const sessions = ensureArray(snapshot.sessions) as Session[];
       messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
       messagesState.currentWorkspacePath = workspacePath || messagesState.currentWorkspacePath;
-      updateSessions(sessions);
+      replaceWorkspaceSessionProjection(workspaceId, sessions);
       clearStaleSettingsBootstrapSnapshot();
       const hadLiveTurnBeforeSnapshot = hasActiveLocalTimelineTurn();
       const hadPendingLocalRequestBeforeSnapshot = hasPendingLocalRequest();
@@ -1212,6 +1240,11 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         workspaceId,
         hasMoreBefore,
         beforeCursor,
+        canonicalHasMoreBefore: message.canonicalHasMoreBefore === true,
+        canonicalBeforeCursor: typeof message.canonicalBeforeCursor === 'string'
+          && message.canonicalBeforeCursor.trim()
+          ? message.canonicalBeforeCursor.trim()
+          : null,
         isLoadingBefore: false,
         preserveLoadedWindow: true,
       });
@@ -1254,7 +1287,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     clearCurrentSessionBeforeWorkspaceChange(workspaceId);
     messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
     messagesState.currentWorkspacePath = workspacePath || messagesState.currentWorkspacePath;
-    updateSessions(sessions);
+    replaceWorkspaceSessionProjection(workspaceId, sessions);
 
     setCurrentSessionId(sessionId);
     clearStaleSettingsBootstrapSnapshot();
@@ -1278,6 +1311,11 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       workspaceId,
       hasMoreBefore,
       beforeCursor,
+      canonicalHasMoreBefore: message.canonicalHasMoreBefore === true,
+      canonicalBeforeCursor: typeof message.canonicalBeforeCursor === 'string'
+        && message.canonicalBeforeCursor.trim()
+        ? message.canonicalBeforeCursor.trim()
+        : null,
       isLoadingBefore: false,
     });
     reconcileRequestBindingsFromAuthoritativeThread(sessionId);

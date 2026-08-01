@@ -156,8 +156,18 @@ assert.match(
 );
 assert.match(
   messageListSource,
-  /<TurnNavigationRail[\s\S]*?items=\{turnNavigationItems\}[\s\S]*?container=\{containerRef\}/,
+  /<TurnNavigationRail[\s\S]*?items=\{turnNavigationItems\}[\s\S]*?container=\{containerRef\}[\s\S]*?onRevealMessage=\{revealRenderMessage\}/,
   '轮次导航必须接入主线消息列表的 canonical turn 数据与真实滚动容器',
+);
+assert.match(
+  messageListSource,
+  /for \(const item of safeRenderItems\)[\s\S]*?return buildTurnNavigationItems\(navigationMessages\);/,
+  '轮次导航必须保留完整 canonical 轮次索引，不能被 DOM 渲染窗口截断',
+);
+assert.match(
+  railSource,
+  /async function focusTurn\([\s\S]*?if \(!element && onRevealMessage\)[\s\S]*?await onRevealMessage\(item\.anchorMessageId\);/,
+  '点击尚未挂载的历史轮次时必须先扩展时间线窗口，再执行直接定位',
 );
 assert.match(
   messageListSource,

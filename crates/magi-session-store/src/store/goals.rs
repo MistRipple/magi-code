@@ -284,9 +284,6 @@ impl SessionStore {
             return Ok(goal.clone());
         }
         goal.consecutive_failure_turns = goal.consecutive_failure_turns.saturating_add(1);
-        if goal.consecutive_failure_turns >= 3 {
-            goal.status = GoalStatus::Blocked;
-        }
         goal.updated_at = now;
         Ok(goal.clone())
     }
@@ -445,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn goal_blocks_only_after_three_consecutive_failed_turns() {
+    fn goal_failure_streak_never_changes_goal_status() {
         let store = SessionStore::new();
         let session_id = SessionId::new("session-goal-failure-streak");
         store
@@ -480,13 +477,13 @@ mod tests {
             0
         );
 
-        for _ in 0..3 {
+        for _ in 0..40 {
             store
                 .record_goal_turn_failure(&session_id, &goal.goal_id)
                 .expect("failure should be recorded");
         }
-        let blocked = store.current_goal(&session_id).expect("goal should exist");
-        assert_eq!(blocked.status, GoalStatus::Blocked);
-        assert_eq!(blocked.consecutive_failure_turns, 3);
+        let active = store.current_goal(&session_id).expect("goal should exist");
+        assert_eq!(active.status, GoalStatus::Active);
+        assert_eq!(active.consecutive_failure_turns, 40);
     }
 }

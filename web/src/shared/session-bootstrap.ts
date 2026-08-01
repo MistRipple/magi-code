@@ -12,4 +12,8 @@ export interface SessionBootstrapSnapshot {
     notifications: unknown;
   };
   orchestratorRuntimeState?: unknown;
+  hasMoreBefore?: boolean;
+  beforeCursor?: string | null;
+  canonicalHasMoreBefore?: boolean;
+  canonicalBeforeCursor?: string | null;
 }

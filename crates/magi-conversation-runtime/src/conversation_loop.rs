@@ -29,12 +29,11 @@ use crate::{
     forced_task_tool_choice_for_round, record_completed_required_tools,
     required_tool_chain_is_complete, required_tool_chain_recovery_prompt,
     required_tool_definitions_for_round, task_required_tool_chain, task_turn_visibility,
-    tool_call_round_limit, validation_result_rejects_delivery,
+    validation_result_rejects_delivery,
 };
 use crate::{
     model_error::{
-        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_FINAL_RESPONSE_ONLY_PROMPT,
-        MODEL_FINAL_RESPONSE_ROUND_RESERVE, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
+        MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
         MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, ModelFailureDiagnostic,
         classify_model_invocation_error, model_empty_response_recovery_prompt,
         model_stream_interruption_recovery_prompt,
@@ -537,7 +536,6 @@ const THREAD_HISTORY_RECENT_MESSAGE_FLOOR: usize = 8;
 const THREAD_HISTORY_SUMMARY_EXCERPT_LIMIT: usize = 16;
 const THREAD_HISTORY_SUMMARY_EXCERPT_CHARS: usize = 360;
 const THREAD_HISTORY_TOOL_ARGUMENT_CHARS: usize = 220;
-const MAX_PLAN_FOLLOW_UP_ROUNDS: usize = 16;
 
 fn estimate_thread_message_tokens(message: &ThreadChatMessage) -> usize {
     let mut total = estimate_text_tokens(&message.role) + 4;
@@ -1095,9 +1093,9 @@ pub fn run_conversation_loop(
 
 /// 任务系统 — 把一次完整的 LLM IO + 工具 IO 段封装成 TurnDriver round。
 ///
-/// 当前 driver 的 round_limit = 1：内部仍保留多轮工具调用 for 循环（围绕
-/// `messages` 累积器）。Conversation::advance_turn 提供外层 Turn 状态机，本 driver
-/// 承担当前 conversation loop 的模型 IO 与工具 IO。
+/// 当前 driver 单次 `execute_round` 内部承载完整的模型/工具循环（围绕 `messages`
+/// 累积器）。Conversation::advance_turn 提供外层 Turn 状态机，本 driver 承担当前
+/// conversation loop 的模型 IO 与工具 IO。
 struct ConversationTurnDriver<'a> {
     request: Option<ConversationLoopRequest<'a>>,
     pending_mailbox_items: Vec<MailboxItem>,
@@ -1117,10 +1115,6 @@ impl<'a> ConversationTurnDriver<'a> {
 
 impl<'a> TurnDriver for ConversationTurnDriver<'a> {
     type Outcome = (TaskOutcome, Option<ExecutionContextSummary>);
-
-    fn round_limit(&self) -> usize {
-        1
-    }
 
     fn accept_mailbox_items(&mut self, items: Vec<MailboxItem>) {
         self.pending_mailbox_items = items;
@@ -1151,15 +1145,6 @@ impl<'a> TurnDriver for ConversationTurnDriver<'a> {
     fn finalize_round_failure(self, _reason: String) -> Self::Outcome {
         self.captured
             .expect("ConversationTurnDriver::finalize_round_failure 没有捕获到 outcome")
-    }
-
-    fn finalize_exhausted(self) -> Self::Outcome {
-        (
-            TaskOutcome::Failed {
-                error: "conversation_loop driver 在 round_limit 内未产出 outcome".to_string(),
-            },
-            None,
-        )
     }
 }
 
@@ -1469,12 +1454,7 @@ fn run_conversation_loop_inner(
     let mut empty_response_recovery_attempts = 0usize;
     let mut stream_interruption_recovery_attempts = 0usize;
     let mut stream_interruption_non_stream_fallback_attempted = false;
-    let mut final_response_tool_recovery_attempts = 0usize;
-    let mut final_response_tool_calls_exhausted = false;
-    let mut final_response_prompt_appended = false;
     let mut last_response_observation: Option<String> = None;
-    let mut tool_execution_rounds = 0usize;
-    let mut plan_follow_up_rounds = 0usize;
     let owns_plan_execution = !is_sidechain && task.parent_task_id.is_none();
     let turn_visibility = task_turn_visibility(
         task,
@@ -1523,38 +1503,12 @@ fn run_conversation_loop_inner(
         return (outcome, context_summary);
     }
 
-    let mut completion_tool_budget = required_tool_chain.clone();
-    for tool_name in &required_evidence_tools {
-        if !completion_tool_budget.contains(tool_name) {
-            completion_tool_budget.push(tool_name.clone());
-        }
-    }
-    let tool_call_round_limit = tool_call_round_limit(&completion_tool_budget);
-    let model_round_limit = tool_call_round_limit
-        .saturating_add(MODEL_FINAL_RESPONSE_ROUND_RESERVE)
-        .saturating_add(MAX_PLAN_FOLLOW_UP_ROUNDS);
     let mut pre_output_invocation_recovery_attempts = 0usize;
-    'conversation_round: for round in 0..model_round_limit {
+    'conversation_round: for round in 0usize.. {
         append_task_runtime_signals(
             &mut messages,
             conversation_registry.drain_task_signals(session_id, task_id),
         );
-        let required_evidence_pending =
-            missing_required_evidence_tool(task, &completion_evidence).is_some();
-        let final_response_only = tool_execution_rounds >= tool_call_round_limit
-            && !required_evidence_pending
-            && !(owns_plan_execution && plan_store.requires_execution_follow_up());
-        if final_response_only && !final_response_prompt_appended {
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: Some(MODEL_FINAL_RESPONSE_ONLY_PROMPT.to_string()),
-                images: Vec::new(),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                provider_context: Vec::new(),
-            });
-            final_response_prompt_appended = true;
-        }
         if let Some(registry) = tool_registry {
             let policy = task.policy_snapshot.as_ref();
             let access_profile = policy
@@ -1603,8 +1557,7 @@ fn run_conversation_loop_inner(
             round_required_tools,
             round_completed_tools,
         );
-        let round_tools = (!final_response_only && !round_tool_definitions.is_empty())
-            .then_some(round_tool_definitions);
+        let round_tools = (!round_tool_definitions.is_empty()).then_some(round_tool_definitions);
         let invocation_request = ModelInvocationRequest {
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: prompt.clone(),
@@ -1723,12 +1676,8 @@ fn run_conversation_loop_inner(
                             messages.push(ChatMessage {
                                 role: "user".to_string(),
                                 content: Some(
-                                    if final_response_only {
-                                        MODEL_FINAL_RESPONSE_ONLY_PROMPT
-                                    } else {
-                                        model_empty_response_recovery_prompt(had_tool_calls)
-                                    }
-                                    .to_string(),
+                                    model_empty_response_recovery_prompt(had_tool_calls)
+                                        .to_string(),
                                 ),
                                 images: Vec::new(),
                                 tool_calls: Vec::new(),
@@ -1980,12 +1929,7 @@ fn run_conversation_loop_inner(
                         messages.push(ChatMessage {
                             role: "user".to_string(),
                             content: Some(
-                                if final_response_only {
-                                    MODEL_FINAL_RESPONSE_ONLY_PROMPT
-                                } else {
-                                    model_empty_response_recovery_prompt(had_tool_calls)
-                                }
-                                .to_string(),
+                                model_empty_response_recovery_prompt(had_tool_calls).to_string(),
                             ),
                             images: Vec::new(),
                             tool_calls: Vec::new(),
@@ -2161,51 +2105,6 @@ fn run_conversation_loop_inner(
             );
         }
 
-        if final_response_only && !parsed.tool_calls.is_empty() {
-            if final_response_tool_recovery_attempts < MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS {
-                final_response_tool_recovery_attempts += 1;
-                let assistant_recovery_message = ChatMessage {
-                    role: "assistant".to_string(),
-                    content: parsed
-                        .content
-                        .clone()
-                        .or_else(|| completed_stream_content.clone()),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: parsed.provider_context.clone(),
-                };
-                if assistant_recovery_message
-                    .content
-                    .as_deref()
-                    .is_some_and(|content| !content.trim().is_empty())
-                    || !assistant_recovery_message.provider_context.is_empty()
-                {
-                    append_thread_messages_checkpoint(
-                        session_store,
-                        thread_id,
-                        vec![chat_message_to_thread_chat_message(
-                            &assistant_recovery_message,
-                        )],
-                        persist_session_state,
-                        "task_thread_final_only_recovery",
-                    );
-                    messages.push(assistant_recovery_message);
-                }
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: Some(MODEL_FINAL_RESPONSE_ONLY_PROMPT.to_string()),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                });
-                continue;
-            }
-            final_response_tool_calls_exhausted = true;
-            break;
-        }
-
         let assistant_history_content = parsed
             .content
             .clone()
@@ -2330,25 +2229,6 @@ fn run_conversation_loop_inner(
             if owns_plan_execution
                 && let Some(follow_up_prompt) = plan_store.render_execution_follow_up_prompt()
             {
-                if plan_follow_up_rounds >= MAX_PLAN_FOLLOW_UP_ROUNDS {
-                    let failure_reason =
-                        "当前计划尚未完成，模型连续多轮未推进计划阶段。请检查计划执行结果后重试。"
-                            .to_string();
-                    append_task_error_turn_item(
-                        turn_writeback_context,
-                        &failure_reason,
-                        streaming_entry_id.or(last_stream_item_id.as_deref()),
-                        None,
-                        None,
-                    );
-                    return (
-                        TaskOutcome::Failed {
-                            error: failure_reason,
-                        },
-                        context_summary,
-                    );
-                }
-                plan_follow_up_rounds = plan_follow_up_rounds.saturating_add(1);
                 messages.push(assistant_response_message.clone());
                 messages.push(ChatMessage {
                     role: "user".to_string(),
@@ -2369,14 +2249,7 @@ fn run_conversation_loop_inner(
                 }
                 messages.push(ChatMessage {
                     role: "user".to_string(),
-                    content: Some(
-                        if final_response_only {
-                            MODEL_FINAL_RESPONSE_ONLY_PROMPT
-                        } else {
-                            model_empty_response_recovery_prompt(had_tool_calls)
-                        }
-                        .to_string(),
-                    ),
+                    content: Some(model_empty_response_recovery_prompt(had_tool_calls).to_string()),
                     images: Vec::new(),
                     tool_calls: Vec::new(),
                     tool_call_id: None,
@@ -2421,9 +2294,6 @@ fn run_conversation_loop_inner(
             messages.push(tool_result_message);
         }
         let valid_tool_calls = tool_validation.valid_calls;
-        if !valid_tool_calls.is_empty() {
-            tool_execution_rounds = tool_execution_rounds.saturating_add(1);
-        }
         for tool_call in &valid_tool_calls {
             append_task_tool_call_started_turn_item(turn_writeback_context, tool_call);
         }
@@ -2631,27 +2501,6 @@ fn run_conversation_loop_inner(
         }
     }
 
-    if final_response_tool_calls_exhausted {
-        let model_failure = ModelFailureDiagnostic::tool_round_limit_exceeded(
-            tool_call_round_limit,
-            final_response_tool_recovery_attempts,
-            last_response_observation.as_deref(),
-        );
-        append_task_error_turn_item(
-            turn_writeback_context,
-            &model_failure.summary,
-            streaming_entry_id.or(last_stream_item_id.as_deref()),
-            Some(&model_failure),
-            None,
-        );
-        return (
-            TaskOutcome::Failed {
-                error: model_failure.detail,
-            },
-            context_summary,
-        );
-    }
-
     if !required_tool_chain_is_complete(&required_tool_chain, &completed_required_tool_names) {
         let failure_reason = required_tool_chain_recovery_prompt(
             &required_tool_chain,
@@ -2702,24 +2551,6 @@ fn run_conversation_loop_inner(
         return (
             TaskOutcome::Failed {
                 error: recovery_prompt,
-            },
-            context_summary,
-        );
-    }
-
-    if owns_plan_execution && plan_store.requires_execution_follow_up() {
-        let failure_reason =
-            "当前计划尚未完成，但主线执行已达到模型轮次上限，任务不能被标记为完成。".to_string();
-        append_task_error_turn_item(
-            turn_writeback_context,
-            &failure_reason,
-            streaming_entry_id.or(last_stream_item_id.as_deref()),
-            None,
-            None,
-        );
-        return (
-            TaskOutcome::Failed {
-                error: failure_reason,
             },
             context_summary,
         );
@@ -3818,7 +3649,7 @@ mod tests {
     struct TaskToolContentThenFinalModelBridgeClient {
         invoke_count: AtomicUsize,
     }
-    struct ToolBudgetThenFinalTaskModelBridgeClient {
+    struct ExtendedToolRunThenFinalTaskModelBridgeClient {
         invoke_count: AtomicUsize,
         tools_enabled: Mutex<Vec<bool>>,
     }
@@ -4236,7 +4067,7 @@ mod tests {
         }
     }
 
-    impl ModelBridgeClient for ToolBudgetThenFinalTaskModelBridgeClient {
+    impl ModelBridgeClient for ExtendedToolRunThenFinalTaskModelBridgeClient {
         fn invoke(
             &self,
             request: ModelInvocationRequest,
@@ -4250,13 +4081,8 @@ mod tests {
                 .lock()
                 .expect("tools_enabled mutex poisoned")
                 .push(tools_enabled);
-            let payload = if index == 0 {
-                serde_json::json!({
-                    "content": null,
-                    "reasoning": "先完成一次无正文恢复",
-                    "finish_reason": "stop"
-                })
-            } else if tools_enabled {
+            let payload = if index < 40 {
+                assert!(tools_enabled, "模型决定继续执行工具时工具面必须保持可用");
                 serde_json::json!({
                     "content": null,
                     "finish_reason": "tool_calls",
@@ -4269,22 +4095,10 @@ mod tests {
                         }
                     }]
                 })
-            } else if index == tool_call_round_limit(&[]).saturating_add(1) {
-                serde_json::json!({
-                    "content": null,
-                    "reasoning": "最终答复阶段先返回一次空正文",
-                    "finish_reason": "stop"
-                })
             } else {
-                let messages = request.messages.as_deref().unwrap_or_default();
-                assert_eq!(
-                    messages
-                        .last()
-                        .and_then(|message| message.content.as_deref()),
-                    Some(MODEL_FINAL_RESPONSE_ONLY_PROMPT)
-                );
+                assert!(tools_enabled, "最终答复轮也不应由运行时关闭工具面");
                 serde_json::json!({
-                    "content": "工具预算结束后已生成最终答复。",
+                    "content": "模型完成全部工具工作后主动结束任务。",
                     "finish_reason": "stop"
                 })
             };
@@ -4987,46 +4801,23 @@ mod tests {
     }
 
     #[test]
-    fn task_tool_call_round_limit_keeps_final_round_after_explicit_chain() {
-        let required_tool_chain = [
-            "file_mkdir",
-            "file_write",
-            "file_read",
-            "file_patch",
-            "search_text",
-            "shell_exec",
-            "diff_preview",
-            "diagram_render",
-            "file_remove",
-        ]
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-
-        assert!(
-            tool_call_round_limit(&required_tool_chain) >= required_tool_chain.len() + 2,
-            "显式工具链不能因为固定轮数耗尽而丢失最后的工具或总结轮"
-        );
-    }
-
-    #[test]
-    fn task_loop_reserves_final_response_after_tool_budget_is_exhausted() {
+    fn task_loop_keeps_tools_available_beyond_legacy_round_limit() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(128);
-        let session_id = SessionId::new("session-tool-budget-final-response");
-        let workspace_id = Some(WorkspaceId::new("workspace-tool-budget-final-response"));
+        let session_id = SessionId::new("session-unbounded-tool-rounds");
+        let workspace_id = Some(WorkspaceId::new("workspace-unbounded-tool-rounds"));
         session_store
             .create_session_for_workspace(
                 session_id.clone(),
-                "tool budget final response",
+                "unbounded tool rounds",
                 workspace_id.as_ref().map(ToString::to_string),
             )
             .expect("session should be creatable");
 
         let task_store = TaskStore::new();
-        let task = make_task_loop_test_task("task-tool-budget-final-response");
+        let task = make_task_loop_test_task("task-unbounded-tool-rounds");
         task_store.insert_task(task.clone());
-        let worker_id = WorkerId::new("worker-tool-budget-final-response");
+        let worker_id = WorkerId::new("worker-unbounded-tool-rounds");
         let lease = task_store
             .grant_lease(
                 &task.task_id,
@@ -5043,12 +4834,12 @@ mod tests {
             .upsert_current_turn(
                 session_id.clone(),
                 ActiveExecutionTurn {
-                    turn_id: "turn-tool-budget-final-response".to_string(),
+                    turn_id: "turn-unbounded-tool-rounds".to_string(),
                     turn_seq: 1,
                     accepted_at: UtcMillis::now(),
                     completed_at: None,
                     status: "running".to_string(),
-                    user_message: Some("验证工具预算后的最终答复".to_string()),
+                    user_message: Some("验证模型可自主持续调用工具".to_string()),
                     items: Vec::new(),
                 },
             )
@@ -5061,7 +4852,7 @@ mod tests {
             Arc::clone(&tool_event_bus),
         );
         tool_registry.register_builtin(Arc::new(ProbeTaskBuiltinTool::new("round_probe", probe)));
-        let client = ToolBudgetThenFinalTaskModelBridgeClient {
+        let client = ExtendedToolRunThenFinalTaskModelBridgeClient {
             invoke_count: AtomicUsize::new(0),
             tools_enabled: Mutex::new(Vec::new()),
         };
@@ -5090,7 +4881,7 @@ mod tests {
             lease_id: &lease.lease_id,
             session_id: &session_id,
             workspace_id: &workspace_id,
-            prompt: "持续检查，预算结束后总结".to_string(),
+            prompt: "持续检查，完成后自行总结".to_string(),
             images: Vec::new(),
             tools: Some(vec![exposed_test_tool("round_probe")]),
             usage_binding: &usage_binding,
@@ -5107,14 +4898,13 @@ mod tests {
         });
 
         assert!(matches!(outcome, TaskOutcome::Completed { .. }));
-        let tool_limit = tool_call_round_limit(&[]);
-        assert_eq!(client.invoke_count.load(Ordering::SeqCst), tool_limit + 3);
+        assert_eq!(client.invoke_count.load(Ordering::SeqCst), 41);
         let tools_enabled = client
             .tools_enabled
             .lock()
             .expect("tools_enabled mutex poisoned");
-        assert!(tools_enabled[..=tool_limit].iter().all(|enabled| *enabled));
-        assert_eq!(&tools_enabled[tool_limit + 1..], &[false, false]);
+        assert_eq!(tools_enabled.len(), 41);
+        assert!(tools_enabled.iter().all(|enabled| *enabled));
     }
 
     #[test]

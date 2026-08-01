@@ -10,8 +10,7 @@
 //! 同时表达协议。
 
 use magi_bridge_client::{
-    HttpImageGenerationClient, HttpModelBridgeClient, HttpModelBridgeProtocol,
-    ImageGenerationUrlMode,
+    EndpointUrlMode, HttpImageGenerationClient, HttpModelBridgeClient, HttpModelBridgeProtocol,
 };
 use magi_core::SessionId;
 use magi_settings_store::DEPRECATED_MODEL_CONFIG_FIELDS;
@@ -30,6 +29,7 @@ pub enum ModelUrlMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelApiProtocol {
     OpenAiChat,
+    OpenAiResponses,
     AnthropicMessages,
 }
 
@@ -37,6 +37,7 @@ impl ModelApiProtocol {
     fn from_label(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "openai_chat" => Some(Self::OpenAiChat),
+            "openai_responses" => Some(Self::OpenAiResponses),
             "anthropic_messages" => Some(Self::AnthropicMessages),
             _ => None,
         }
@@ -45,6 +46,7 @@ impl ModelApiProtocol {
     fn to_http_protocol(self) -> HttpModelBridgeProtocol {
         match self {
             Self::OpenAiChat => HttpModelBridgeProtocol::ChatCompletions,
+            Self::OpenAiResponses => HttpModelBridgeProtocol::Responses,
             Self::AnthropicMessages => HttpModelBridgeProtocol::AnthropicMessages,
         }
     }
@@ -52,6 +54,7 @@ impl ModelApiProtocol {
     fn provider(self) -> &'static str {
         match self {
             Self::OpenAiChat => "openai",
+            Self::OpenAiResponses => "openai",
             Self::AnthropicMessages => "anthropic",
         }
     }
@@ -137,7 +140,8 @@ impl NormalizedModelConfig {
             .any(|field| value.get(*field).is_some());
         let api_protocol = match string_field(value, "apiProtocol") {
             Some(label) => ModelApiProtocol::from_label(&label).ok_or_else(|| {
-                "apiProtocol 无效，必须是 openai_chat 或 anthropic_messages".to_string()
+                "apiProtocol 无效，必须是 openai_chat、openai_responses 或 anthropic_messages"
+                    .to_string()
             })?,
             None if has_connection_fields => {
                 return Err("模型配置缺少 apiProtocol".to_string());
@@ -195,16 +199,21 @@ impl NormalizedModelConfig {
     }
 
     pub fn to_http_model_client(&self) -> Option<HttpModelBridgeClient> {
-        let base_url = self.http_client_base_url()?;
+        let base_url = self.normalized_http_base_url().ok()?;
         let model = self.model.as_deref()?.trim();
         if model.is_empty() {
             return None;
         }
-        Some(HttpModelBridgeClient::new_with_protocol(
+        let url_mode = match self.url_mode {
+            ModelUrlMode::Full => EndpointUrlMode::Full,
+            ModelUrlMode::Standard | ModelUrlMode::Proxy => EndpointUrlMode::Standard,
+        };
+        Some(HttpModelBridgeClient::new_with_protocol_and_url_mode(
             base_url,
             self.api_key.clone(),
             model.to_string(),
             self.api_protocol(),
+            url_mode,
             self.reasoning_effort
                 .map(ModelReasoningEffort::to_usage_reasoning_effort),
         ))
@@ -214,8 +223,8 @@ impl NormalizedModelConfig {
         let base_url = self.normalized_http_base_url()?;
         let model = self.require_model()?.to_string();
         let url_mode = match self.url_mode {
-            ModelUrlMode::Full => ImageGenerationUrlMode::Full,
-            ModelUrlMode::Standard | ModelUrlMode::Proxy => ImageGenerationUrlMode::Standard,
+            ModelUrlMode::Full => EndpointUrlMode::Full,
+            ModelUrlMode::Standard | ModelUrlMode::Proxy => EndpointUrlMode::Standard,
         };
         Ok(HttpImageGenerationClient::new(
             base_url,
@@ -256,19 +265,19 @@ impl NormalizedModelConfig {
     }
 
     fn normalized_http_base_url(&self) -> Result<String, String> {
-        let normalized = self.require_base_url()?.trim().trim_end_matches('/');
-        if normalized.is_empty() {
+        let base_url = self.require_base_url()?.trim();
+        if base_url.is_empty() {
             return Err("模型配置缺少有效的 baseUrl".to_string());
         }
-        if !normalized.starts_with("http://") && !normalized.starts_with("https://") {
+        if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
             return Err("baseUrl 必须以 http:// 或 https:// 开头".to_string());
         }
-        Ok(normalized.to_string())
-    }
-
-    fn http_client_base_url(&self) -> Option<String> {
-        let base_url = self.base_url.as_deref()?.trim().trim_end_matches('/');
-        Some(base_url.to_string())
+        match self.url_mode {
+            ModelUrlMode::Full => Ok(base_url.to_string()),
+            ModelUrlMode::Standard | ModelUrlMode::Proxy => {
+                Ok(base_url.trim_end_matches('/').to_string())
+            }
+        }
     }
 }
 
@@ -536,6 +545,21 @@ mod tests {
             HttpModelBridgeProtocol::AnthropicMessages
         );
         assert_eq!(config.provider(), "anthropic");
+    }
+
+    #[test]
+    fn explicit_openai_responses_protocol_is_supported() {
+        let config = model_config(json!({
+            "baseUrl": "https://api.openai.com",
+            "apiKey": "sk-test",
+            "model": "gpt-5",
+            "urlMode": "standard",
+            "apiProtocol": "openai_responses"
+        }));
+
+        assert_eq!(config.api_protocol(), HttpModelBridgeProtocol::Responses);
+        assert_eq!(config.provider(), "openai");
+        assert!(config.to_http_model_client().is_some());
     }
 
     #[test]

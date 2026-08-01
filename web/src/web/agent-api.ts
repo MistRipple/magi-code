@@ -16,6 +16,7 @@ import type {
   FetchModelsResponseDto,
   EnhancePromptRequestDto,
   SkillsLibraryResponseDto,
+  MessagesResponseDto,
 } from '../shared/rust-backend-types';
 import type { CanonicalTurn, CanonicalTurnItem } from '../shared/protocol/canonical-turn';
 import { i18n } from '../stores/i18n.svelte';
@@ -286,6 +287,13 @@ function normalizeSettingsBootstrapPayload(
     userRulesConfig: normalizeSettingsSectionConfig(payload.userRulesConfig),
     skillsConfig: normalizeSettingsSectionConfig(payload.skillsConfig),
     safeguardConfig: normalizeSettingsSectionConfig(payload.safeguardConfig),
+    safeguardAudit: (
+      payload.safeguardAudit
+      && typeof payload.safeguardAudit === 'object'
+      && !Array.isArray(payload.safeguardAudit)
+        ? payload.safeguardAudit
+        : {}
+    ) as SettingsBootstrapPayload['safeguardAudit'],
     repositories: Array.isArray(payload.repositories) ? payload.repositories : [],
     mcpServers: Array.isArray(payload.mcpServers) ? payload.mcpServers : [],
     builtinTools: normalizeBuiltinTools(payload.builtinTools),
@@ -1174,6 +1182,44 @@ export async function getWorkspaceSessions(
       sessionId: payload.sessionId?.trim() || '',
       sessions,
     };
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error(i18n.t('bridge.agentUnreachable'));
+    }
+    throw error;
+  }
+}
+
+export async function getAgentSessionMessages(options: {
+  sessionId: string;
+  workspaceId: string;
+  workspacePath?: string;
+  beforeCursor?: string | null;
+  canonicalBeforeCursor?: string | null;
+  limit?: number;
+}): Promise<MessagesResponseDto> {
+  const sessionId = options.sessionId.trim();
+  const workspaceId = options.workspaceId.trim();
+  if (!sessionId || !workspaceId) {
+    throw new AgentApiError(400, '会话和工作区不能为空', 'load older session messages');
+  }
+  try {
+    const query = buildBoundQueryWithOverride(
+      {
+        ...(options.limit ? { limit: String(options.limit) } : {}),
+        ...(options.beforeCursor ? { beforeCursor: options.beforeCursor } : {}),
+        ...(options.canonicalBeforeCursor
+          ? { canonicalBeforeCursor: options.canonicalBeforeCursor }
+          : {}),
+      },
+      {
+        sessionId,
+        workspaceId,
+        workspacePath: options.workspacePath?.trim() || '',
+      },
+    );
+    const response = await getTransport().request(agentUrl('/api/messages', query));
+    return await parseAgentJson<MessagesResponseDto>(response, 'load older session messages');
   } catch (error) {
     if (error instanceof TypeError) {
       throw new Error(i18n.t('bridge.agentUnreachable'));

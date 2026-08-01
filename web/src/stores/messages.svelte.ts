@@ -106,7 +106,10 @@ export const messagesState = $state({
   // 会话状态
   currentWorkspaceId: null as string | null,
   currentWorkspacePath: '' as string,
-  sessions: [] as Session[],
+  workspaceSessionProjection: {
+    workspaceId: null as string | null,
+    sessions: [] as Session[],
+  },
   currentSessionId: null as string | null,
   sessionHydrating: false,
   sessionHistory: {
@@ -114,6 +117,8 @@ export const messagesState = $state({
     sessionId: null as string | null,
     hasMoreBefore: false,
     beforeCursor: null as string | null,
+    canonicalHasMoreBefore: false,
+    canonicalBeforeCursor: null as string | null,
     isLoadingBefore: false,
   },
   queuedMessages: [] as QueuedMessage[],
@@ -936,7 +941,7 @@ export function getState() {
     get messageJump() { return messagesState.messageJump; },
     get canonicalTimelineProjection() { return messagesState.canonicalTimelineProjection; },
     get threadMessages() { return messageProjection.thread; },
-    get sessions() { return messagesState.sessions; },
+    get sessions() { return messagesState.workspaceSessionProjection.sessions; },
     get currentWorkspaceId() { return messagesState.currentWorkspaceId; },
     get currentWorkspacePath() { return messagesState.currentWorkspacePath; },
     get currentSessionId() { return messagesState.currentSessionId; },
@@ -1028,9 +1033,11 @@ function getSessionViewState(sessionId: string | null | undefined): PersistedSes
 }
 
 function pruneSessionViewStateByKnownSessions(): void {
-  const currentWorkspaceId = normalizeWorkspaceId(messagesState.currentWorkspaceId);
+  const currentWorkspaceId = normalizeWorkspaceId(
+    messagesState.workspaceSessionProjection.workspaceId,
+  );
   const knownScopeKeys = new Set<string>();
-  for (const session of messagesState.sessions) {
+  for (const session of messagesState.workspaceSessionProjection.sessions) {
     const scopeKey = createSessionScopeKey(currentWorkspaceId, session?.id);
     if (scopeKey) {
       knownScopeKeys.add(scopeKey);
@@ -1241,6 +1248,8 @@ export function setCurrentSessionId(id: string | null) {
       sessionId: nextSessionId,
       hasMoreBefore: false,
       beforeCursor: null,
+      canonicalHasMoreBefore: false,
+      canonicalBeforeCursor: null,
       isLoadingBefore: false,
     };
     resetNotificationCenterStatus();
@@ -1280,6 +1289,8 @@ export function adoptCurrentSessionIdForLiveTurn(id: string | null | undefined):
     sessionId: nextSessionId,
     hasMoreBefore: false,
     beforeCursor: null,
+    canonicalHasMoreBefore: false,
+    canonicalBeforeCursor: null,
     isLoadingBefore: false,
   };
   resetNotificationCenterStatus();
@@ -1309,6 +1320,8 @@ export function adoptAcceptedSessionIdForLocalTurn(
     sessionId: nextSessionId,
     hasMoreBefore: false,
     beforeCursor: null,
+    canonicalHasMoreBefore: false,
+    canonicalBeforeCursor: null,
     isLoadingBefore: false,
   };
   const reboundProjection = rebindCanonicalSessionTurns(previousSessionId, nextSessionId);
@@ -1320,10 +1333,16 @@ export function adoptAcceptedSessionIdForLocalTurn(
   return true;
 }
 
-export function updateSessions(newSessions: Session[]) {
+export function replaceWorkspaceSessionProjection(
+  workspaceId: string,
+  newSessions: Session[],
+) {
   const seen = new Set<string>();
-  const currentWorkspaceId = normalizeWorkspaceId(messagesState.currentWorkspaceId);
-  messagesState.sessions = ensureArray<Session>(newSessions)
+  const currentWorkspaceId = normalizeWorkspaceId(workspaceId);
+  if (!currentWorkspaceId) {
+    throw new Error('更新工作区会话目录时必须提供 workspaceId');
+  }
+  const sessions = ensureArray<Session>(newSessions)
     .filter((session): session is Session => !!session && typeof session === 'object' && typeof session.id === 'string' && session.id.trim().length > 0)
     .filter((session) => {
       const sessionWorkspaceId = normalizeWorkspaceId(session.workspaceId);
@@ -1334,6 +1353,19 @@ export function updateSessions(newSessions: Session[]) {
       seen.add(session.id);
       return true;
     });
+  messagesState.workspaceSessionProjection = {
+    workspaceId: currentWorkspaceId,
+    sessions,
+  };
+  pruneSessionViewStateByKnownSessions();
+  saveWebviewState();
+}
+
+export function clearWorkspaceSessionProjection() {
+  messagesState.workspaceSessionProjection = {
+    workspaceId: null,
+    sessions: [],
+  };
   pruneSessionViewStateByKnownSessions();
   saveWebviewState();
 }
@@ -1859,6 +1891,8 @@ export function clearAllMessages(options: {
     sessionId: messagesState.currentSessionId,
     hasMoreBefore: false,
     beforeCursor: null,
+    canonicalHasMoreBefore: false,
+    canonicalBeforeCursor: null,
     isLoadingBefore: false,
   };
   messagesState.queuedMessages = [];
@@ -1885,6 +1919,8 @@ export function setSessionHistoryState(
     workspaceId?: string | null;
     hasMoreBefore?: boolean;
     beforeCursor?: string | null;
+    canonicalHasMoreBefore?: boolean;
+    canonicalBeforeCursor?: string | null;
     isLoadingBefore?: boolean;
     preserveLoadedWindow?: boolean;
   },
@@ -1896,6 +1932,8 @@ export function setSessionHistoryState(
       sessionId: null,
       hasMoreBefore: false,
       beforeCursor: null,
+      canonicalHasMoreBefore: false,
+      canonicalBeforeCursor: null,
       isLoadingBefore: false,
     };
     return;
@@ -1916,6 +1954,8 @@ export function setSessionHistoryState(
       sessionId: normalizedSessionId,
       hasMoreBefore: input.hasMoreBefore === true,
       beforeCursor: inputBeforeCursor,
+      canonicalHasMoreBefore: input.canonicalHasMoreBefore === true,
+      canonicalBeforeCursor: normalizeHistoryCursor(input.canonicalBeforeCursor),
       isLoadingBefore: input.isLoadingBefore === true,
     };
     return;
@@ -1923,7 +1963,12 @@ export function setSessionHistoryState(
   const shouldPreserveLoadedWindow = input.preserveLoadedWindow === true
     && current.sessionId === normalizedSessionId
     && current.workspaceId === normalizedWorkspaceId
-    && (current.beforeCursor !== null || current.hasMoreBefore);
+    && (
+      current.beforeCursor !== null
+      || current.hasMoreBefore
+      || current.canonicalBeforeCursor !== null
+      || current.canonicalHasMoreBefore
+    );
   messagesState.sessionHistory = {
     workspaceId: normalizedWorkspaceId,
     sessionId: normalizedSessionId,
@@ -1933,8 +1978,20 @@ export function setSessionHistoryState(
     beforeCursor: shouldPreserveLoadedWindow
       ? current.beforeCursor
       : (input.beforeCursor !== undefined ? inputBeforeCursor : current.beforeCursor),
+    canonicalHasMoreBefore: shouldPreserveLoadedWindow
+      ? current.canonicalHasMoreBefore
+      : (input.canonicalHasMoreBefore ?? current.canonicalHasMoreBefore),
+    canonicalBeforeCursor: shouldPreserveLoadedWindow
+      ? current.canonicalBeforeCursor
+      : (input.canonicalBeforeCursor !== undefined
+        ? normalizeHistoryCursor(input.canonicalBeforeCursor)
+        : current.canonicalBeforeCursor),
     isLoadingBefore: input.isLoadingBefore ?? current.isLoadingBefore,
   };
+}
+
+function normalizeHistoryCursor(value: string | null | undefined): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
 export function setCanonicalTimelineProjection(projection: SessionTimelineProjection): boolean {

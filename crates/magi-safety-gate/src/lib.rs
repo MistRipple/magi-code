@@ -101,7 +101,6 @@ impl SafetyRule {
         }
     }
 
-    /// 大小写不敏感的子串匹配。模式形如 `git push --force` 或 `rm -rf`。
     fn matches(&self, command: &str) -> bool {
         if !self.enabled {
             return false;
@@ -110,9 +109,7 @@ impl SafetyRule {
         if pattern.is_empty() {
             return false;
         }
-        command
-            .to_ascii_lowercase()
-            .contains(&pattern.to_ascii_lowercase())
+        contains_token_sequence(&normalize_for_match(command), &normalize_for_match(pattern))
     }
 }
 // --- Decision
@@ -148,6 +145,42 @@ impl SafetyAction {
             Self::RequireApprovalInRestricted => "require_approval_in_restricted",
             Self::AuditOnly => "audit_only",
         }
+    }
+
+    pub fn precedence(self) -> u8 {
+        match self {
+            Self::HardBlock => 3,
+            Self::RequireApprovalInRestricted => 2,
+            Self::AuditOnly => 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafetyMatch {
+    pub category: SafetyCategory,
+    pub pattern: String,
+    pub action: SafetyAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafetyEvaluation {
+    pub matches: Vec<SafetyMatch>,
+    pub decision: SafetyDecision,
+}
+
+impl SafetyEvaluation {
+    pub fn is_allow(&self) -> bool {
+        self.decision.is_allow()
+    }
+
+    pub fn selected_match(&self) -> Option<&SafetyMatch> {
+        self.matches.iter().find(|matched| match &self.decision {
+            SafetyDecision::Allow => false,
+            SafetyDecision::HardBlock { pattern, .. }
+            | SafetyDecision::RequireApprovalInRestricted { pattern, .. }
+            | SafetyDecision::AuditOnly { pattern, .. } => &matched.pattern == pattern,
+        })
     }
 }
 
@@ -213,47 +246,55 @@ impl SafetyGate {
         &self.rules
     }
 
-    /// 主判定入口：从工具名 + arguments JSON 中抽出待审命令文本，过一遍规则。
-    ///
-    /// - `shell_exec`：提取 arguments.command（若没有则把整个 JSON 当作待审字符串）。
-    /// - 其他工具：当前版本只对 `shell_exec` 生效；扩展点见 `evaluate_text`。
     pub fn evaluate(&self, tool_name: &str, arguments_json: &str) -> SafetyDecision {
-        if tool_name.trim() != "shell_exec" {
-            return SafetyDecision::Allow;
-        }
-        let command =
-            extract_shell_command(arguments_json).unwrap_or_else(|| arguments_json.to_string());
-        self.evaluate_text(&command)
+        self.evaluate_with_evidence(tool_name, arguments_json)
+            .decision
     }
 
-    /// 直接对一段文本（命令行 / 提交信息 / 任意载荷）做规则匹配。
     pub fn evaluate_text(&self, command: &str) -> SafetyDecision {
-        for rule in &self.rules {
-            if rule.matches(command) {
-                let pattern = rule.pattern.clone();
-                let reason = format!("命中安全规则（{}）：{}", rule.category.as_str(), pattern);
-                return match rule.action {
-                    SafetyAction::HardBlock => SafetyDecision::HardBlock {
-                        category: rule.category,
-                        pattern,
-                        reason,
-                    },
-                    SafetyAction::RequireApprovalInRestricted => {
-                        SafetyDecision::RequireApprovalInRestricted {
-                            category: rule.category,
-                            pattern,
-                            reason,
-                        }
-                    }
-                    SafetyAction::AuditOnly => SafetyDecision::AuditOnly {
-                        category: rule.category,
-                        pattern,
-                        reason,
-                    },
-                };
-            }
-        }
-        SafetyDecision::Allow
+        self.evaluate_text_with_evidence(command).decision
+    }
+
+    pub fn evaluate_with_evidence(
+        &self,
+        tool_name: &str,
+        arguments_json: &str,
+    ) -> SafetyEvaluation {
+        let Some(operation) = operation_text_for_tool(tool_name, arguments_json) else {
+            return SafetyEvaluation {
+                matches: Vec::new(),
+                decision: SafetyDecision::Allow,
+            };
+        };
+        self.evaluate_text_with_evidence(&operation)
+    }
+
+    pub fn evaluate_text_with_evidence(&self, command: &str) -> SafetyEvaluation {
+        let command = expand_command_aliases(command);
+        let mut matches = self
+            .rules
+            .iter()
+            .filter(|rule| rule.matches(&command))
+            .map(|rule| SafetyMatch {
+                category: rule.category,
+                pattern: rule.pattern.trim().to_string(),
+                action: rule.action,
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            right
+                .action
+                .precedence()
+                .cmp(&left.action.precedence())
+                .then_with(|| right.pattern.len().cmp(&left.pattern.len()))
+                .then_with(|| left.pattern.cmp(&right.pattern))
+        });
+
+        let decision = matches
+            .first()
+            .map(decision_for_match)
+            .unwrap_or(SafetyDecision::Allow);
+        SafetyEvaluation { matches, decision }
     }
 }
 
@@ -331,6 +372,169 @@ fn extract_shell_command(arguments_json: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn operation_text_for_tool(tool_name: &str, arguments_json: &str) -> Option<String> {
+    let tool_name = tool_name.trim();
+    if tool_name == "shell_exec" {
+        let command =
+            extract_shell_command(arguments_json).unwrap_or_else(|| arguments_json.to_string());
+        return Some(expand_command_aliases(&command));
+    }
+
+    let tool_is_structured_write = matches!(
+        tool_name,
+        "git_push"
+            | "git_merge"
+            | "git_branch_delete"
+            | "git_worktree_remove"
+            | "file_write"
+            | "file_patch"
+            | "file_remove"
+            | "file_copy"
+            | "file_move"
+            | "file_mkdir"
+    );
+    if tool_is_structured_write {
+        return Some({
+            let mut operation = if matches!(tool_name, "file_write" | "file_patch") {
+                serde_json::from_str::<serde_json::Value>(arguments_json)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("path")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|path| format!("{tool_name} {path}"))
+                    })
+                    .unwrap_or_else(|| tool_name.to_string())
+            } else {
+                format!("{tool_name} {arguments_json}")
+            };
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments_json) {
+                if tool_name == "git_push"
+                    && value
+                        .get("force")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    operation.push_str(" git push --force");
+                }
+                if tool_name == "git_branch_delete"
+                    && value
+                        .get("force")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    operation.push_str(" git branch delete --force");
+                }
+            }
+            operation
+        });
+    }
+
+    let unscoped_tools = [
+        "file_read",
+        "view_image",
+        "search_text",
+        "search_semantic",
+        "diff_preview",
+        "web_search",
+        "web_fetch",
+        "knowledge_query",
+        "code_symbols",
+        "tool_catalog",
+        "git_status",
+        "git_branch_list",
+        "git_worktree_list",
+        "get_goal",
+        "context_search",
+        "context_read",
+        "context_request",
+    ];
+    (!unscoped_tools.contains(&tool_name)).then(|| format!("{tool_name} {arguments_json}"))
+}
+
+fn decision_for_match(matched: &SafetyMatch) -> SafetyDecision {
+    let reason = format!(
+        "命中安全规则（{}）：{}",
+        matched.category.as_str(),
+        matched.pattern
+    );
+    match matched.action {
+        SafetyAction::HardBlock => SafetyDecision::HardBlock {
+            category: matched.category,
+            pattern: matched.pattern.clone(),
+            reason,
+        },
+        SafetyAction::RequireApprovalInRestricted => SafetyDecision::RequireApprovalInRestricted {
+            category: matched.category,
+            pattern: matched.pattern.clone(),
+            reason,
+        },
+        SafetyAction::AuditOnly => SafetyDecision::AuditOnly {
+            category: matched.category,
+            pattern: matched.pattern.clone(),
+            reason,
+        },
+    }
+}
+
+fn normalize_for_match(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| character.to_lowercase())
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn expand_command_aliases(command: &str) -> String {
+    let mut operation = command.to_string();
+    let normalized = normalize_for_match(command);
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        let following = &tokens[index.saturating_add(1)..];
+        if *token == "rm" && following.contains(&"r") && following.contains(&"f") {
+            operation.push_str(" rm -rf");
+        }
+        if *token == "remove"
+            && following.first() == Some(&"item")
+            && following.contains(&"recurse")
+            && following.contains(&"force")
+        {
+            operation.push_str(" Remove-Item -Recurse -Force");
+        }
+        if *token == "rm" && following.contains(&"recurse") && following.contains(&"force") {
+            operation.push_str(" Remove-Item -Recurse -Force");
+        }
+        if *token == "del" && following.contains(&"s") && following.contains(&"q") {
+            operation.push_str(" del /s /q");
+        }
+        if *token == "rmdir" && following.contains(&"s") && following.contains(&"q") {
+            operation.push_str(" rmdir /s /q");
+        }
+        if *token == "git"
+            && following.first() == Some(&"push")
+            && following
+                .iter()
+                .any(|value| matches!(*value, "f" | "force" | "forcewithlease"))
+        {
+            operation.push_str(" git push --force");
+        }
+    }
+    operation
+}
+
+fn contains_token_sequence(haystack: &str, needle: &str) -> bool {
+    !needle.is_empty() && format!(" {haystack} ").contains(&format!(" {needle} "))
+}
+
 /// 内置危险模式集合，后续只在本 crate 维护。
 /// state.rs 的 seed_default_safeguard_rules 从此读取。
 pub fn builtin_rules() -> Vec<SafetyRule> {
@@ -351,6 +555,9 @@ pub fn builtin_rules() -> Vec<SafetyRule> {
         ("pip upload", PackagePublish),
         ("rm -rf", BulkDelete),
         ("rimraf", BulkDelete),
+        ("remove-item -recurse -force", BulkDelete),
+        ("del /s /q", BulkDelete),
+        ("rmdir /s /q", BulkDelete),
     ];
     raw.iter()
         .map(|(pattern, category)| SafetyRule::new(*pattern, *category))
@@ -442,6 +649,68 @@ mod tests {
     }
 
     #[test]
+    fn normalized_matching_covers_split_posix_flags() {
+        let gate = SafetyGate::with_builtin_defaults();
+        let args = serde_json::json!({ "command": "rm -r -f ./build" }).to_string();
+        assert!(gate.evaluate("shell_exec", &args).is_require_approval());
+    }
+
+    #[test]
+    fn normalized_matching_covers_power_shell_bulk_delete() {
+        let gate = SafetyGate::with_builtin_defaults();
+        let args = serde_json::json!({
+            "command": "Remove-Item -Force -Recurse ./build"
+        })
+        .to_string();
+        assert!(gate.evaluate("shell_exec", &args).is_require_approval());
+    }
+
+    #[test]
+    fn strongest_matching_action_wins_regardless_of_rule_order() {
+        let gate = SafetyGate::new(vec![
+            SafetyRule::with_action("deploy", SafetyCategory::Custom, SafetyAction::AuditOnly),
+            SafetyRule::with_action(
+                "deploy production",
+                SafetyCategory::Custom,
+                SafetyAction::HardBlock,
+            ),
+        ]);
+        let decision = gate.evaluate(
+            "shell_exec",
+            &serde_json::json!({ "command": "deploy production" }).to_string(),
+        );
+        assert!(decision.is_block());
+    }
+
+    #[test]
+    fn structured_git_push_uses_the_same_safety_policy() {
+        let gate = SafetyGate::with_builtin_defaults();
+        let args = serde_json::json!({ "force": true, "remote": "origin" }).to_string();
+        assert!(gate.evaluate("git_push", &args).is_require_approval());
+    }
+
+    #[test]
+    fn audit_evaluation_keeps_all_matches_for_observability() {
+        let gate = SafetyGate::new(vec![
+            SafetyRule::with_action("deploy", SafetyCategory::Custom, SafetyAction::AuditOnly),
+            SafetyRule::with_action(
+                "deploy production",
+                SafetyCategory::Custom,
+                SafetyAction::AuditOnly,
+            ),
+        ]);
+        let evaluation = gate.evaluate_with_evidence(
+            "shell_exec",
+            &serde_json::json!({ "command": "deploy production" }).to_string(),
+        );
+        assert_eq!(evaluation.matches.len(), 2);
+        assert!(matches!(
+            evaluation.decision,
+            SafetyDecision::AuditOnly { .. }
+        ));
+    }
+
+    #[test]
     fn rules_from_settings_value_round_trip() {
         let json = serde_json::json!([
             { "pattern": "git push --force", "enabled": true, "category": "git_history" },
@@ -522,8 +791,8 @@ mod tests {
     #[test]
     fn builtin_rules_cover_default_patterns() {
         let rules = builtin_rules();
-        // 默认规则集保持 15 条内置规则。
-        assert_eq!(rules.len(), 15);
+        // 默认规则集保持 18 条内置规则。
+        assert_eq!(rules.len(), 18);
         assert!(rules.iter().all(|r| r.enabled));
         assert!(rules.iter().any(|r| r.pattern == "rm -rf"));
         assert!(rules.iter().any(|r| r.pattern == "cargo publish"));

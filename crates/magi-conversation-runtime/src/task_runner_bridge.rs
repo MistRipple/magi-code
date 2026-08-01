@@ -22,8 +22,10 @@ pub enum RunCycleOutcome {
         task_ids: Vec<TaskId>,
         reason: String,
     },
-    /// No runnable task can currently be dispatched.
-    Stalled(Vec<TaskId>),
+    /// 其他 Runner 抢先取得租约，本轮未派发任务，等待下一轮重试。
+    Waiting,
+    /// 当前任务图仍有非终态任务，但这些任务在现有结构下无法进入可运行状态。
+    Unrunnable(Vec<TaskId>),
     /// An unexpected error occurred during the cycle.
     Error(String),
 }

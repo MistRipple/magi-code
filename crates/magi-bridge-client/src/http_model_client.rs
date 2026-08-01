@@ -1,3 +1,4 @@
+use crate::EndpointUrlMode;
 use crate::llm_types::{
     LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams, ToolChoice, ToolDefinition,
     ToolInputSchema, parse_tool_result_model_content,
@@ -8,8 +9,8 @@ use crate::protocol::streaming::{
     SseLineParser, StreamAccumulator, parse_stream_event, parse_stream_provider_context,
 };
 use crate::protocol::{
-    AnthropicMessagesAdapter, OpenAiChatCompletionsAdapter, ProviderAdapter, ProviderFamily,
-    ProviderToolNameCodec,
+    AnthropicMessagesAdapter, OpenAiChatCompletionsAdapter, OpenAiResponsesAdapter,
+    ProviderAdapter, ProviderFamily, ProviderToolNameCodec,
 };
 use crate::types::{
     BridgeClientError, BridgeErrorLayer, ModelBridgeClient, ModelInvocationRequest, ModelResponse,
@@ -60,6 +61,7 @@ static FORCED_TOOL_CHOICE_CAPABILITIES: OnceLock<
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpModelBridgeProtocol {
     ChatCompletions,
+    Responses,
     AnthropicMessages,
 }
 
@@ -71,6 +73,7 @@ pub struct HttpModelBridgeClient {
     api_key: Option<String>,
     model: String,
     protocol: HttpModelBridgeProtocol,
+    url_mode: EndpointUrlMode,
     /// 推理强度配置：构造期注入；调用时透传到协议层 request body。
     /// `None` 表示未配置（保留协议默认行为）。
     reasoning_effort: Option<ReasoningEffort>,
@@ -122,36 +125,56 @@ impl HttpModelBridgeClient {
         protocol: HttpModelBridgeProtocol,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Self {
+        Self::new_with_protocol_and_url_mode(
+            base_url,
+            api_key,
+            model,
+            protocol,
+            EndpointUrlMode::Standard,
+            reasoning_effort,
+        )
+    }
+
+    pub fn new_with_protocol_and_url_mode(
+        base_url: String,
+        api_key: Option<String>,
+        model: String,
+        protocol: HttpModelBridgeProtocol,
+        url_mode: EndpointUrlMode,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Self {
         Self {
             base_url,
             api_key,
             model,
             protocol,
+            url_mode,
             reasoning_effort,
         }
     }
 
     #[cfg(test)]
     fn chat_completions_url(&self) -> Result<String, BridgeClientError> {
-        build_openai_chat_completions_url(&self.base_url).map_err(|reason| {
-            BridgeClientError::CallFailed {
+        build_protocol_endpoint_url(&self.base_url, "/v1/chat/completions", self.url_mode).map_err(
+            |reason| BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::Protocol,
                 code: None,
                 message: format!("invalid base_url: {reason}"),
-            }
-        })
+            },
+        )
     }
 
     fn provider_family(&self) -> ProviderFamily {
         match self.protocol {
             HttpModelBridgeProtocol::ChatCompletions => ProviderFamily::OpenAiChat,
+            HttpModelBridgeProtocol::Responses => ProviderFamily::OpenAiResponses,
             HttpModelBridgeProtocol::AnthropicMessages => ProviderFamily::Anthropic,
         }
     }
 
     fn request_headers(&self) -> Vec<(String, String)> {
         match self.protocol {
-            HttpModelBridgeProtocol::ChatCompletions => self
+            HttpModelBridgeProtocol::ChatCompletions | HttpModelBridgeProtocol::Responses => self
                 .api_key
                 .as_ref()
                 .map(|key| vec![("Authorization".to_string(), format!("Bearer {key}"))])
@@ -195,6 +218,13 @@ impl HttpModelBridgeClient {
                     code: None,
                     message: format!("build openai chat request failed: {reason}"),
                 })?,
+            HttpModelBridgeProtocol::Responses => OpenAiResponsesAdapter
+                .build_request(&params, &self.model)
+                .map_err(|reason| BridgeClientError::CallFailed {
+                    layer: BridgeErrorLayer::Protocol,
+                    code: None,
+                    message: format!("build openai responses request failed: {reason}"),
+                })?,
             HttpModelBridgeProtocol::AnthropicMessages => AnthropicMessagesAdapter
                 .build_request(&params, &self.model)
                 .map_err(|reason| BridgeClientError::CallFailed {
@@ -203,13 +233,11 @@ impl HttpModelBridgeClient {
                     message: format!("build anthropic request failed: {reason}"),
                 })?,
         };
-        let url =
-            build_protocol_endpoint_url(&self.base_url, &adapted.url_path).map_err(|reason| {
-                BridgeClientError::CallFailed {
-                    layer: BridgeErrorLayer::Protocol,
-                    code: None,
-                    message: format!("invalid base_url: {reason}"),
-                }
+        let url = build_protocol_endpoint_url(&self.base_url, &adapted.url_path, self.url_mode)
+            .map_err(|reason| BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::Protocol,
+                code: None,
+                message: format!("invalid base_url: {reason}"),
             })?;
         headers.append(&mut adapted.extra_headers);
         Ok(HttpModelRequest {
@@ -347,6 +375,7 @@ impl HttpModelBridgeProtocol {
     fn label(self) -> &'static str {
         match self {
             HttpModelBridgeProtocol::ChatCompletions => "chat-completions",
+            HttpModelBridgeProtocol::Responses => "responses",
             HttpModelBridgeProtocol::AnthropicMessages => "anthropic-messages",
         }
     }
@@ -859,14 +888,27 @@ fn provider_stream_event_error(
     event: &crate::protocol::streaming::SseEvent,
 ) -> Option<BridgeClientError> {
     let payload = serde_json::from_str::<Value>(&event.data).ok()?;
-    let error = payload.get("error")?;
     let is_error_event = match provider_family {
         ProviderFamily::OpenAiChat => true,
+        ProviderFamily::OpenAiResponses => {
+            matches!(
+                event.event_type.as_deref(),
+                Some("error" | "response.failed")
+            )
+        }
         ProviderFamily::Anthropic => event.event_type.as_deref() == Some("error"),
     };
     if !is_error_event {
         return None;
     }
+    let error = payload
+        .get("error")
+        .or_else(|| {
+            payload
+                .get("response")
+                .and_then(|response| response.get("error"))
+        })
+        .or_else(|| (provider_family == ProviderFamily::OpenAiResponses).then_some(&payload))?;
     let error_type = error
         .get("type")
         .and_then(Value::as_str)
@@ -1320,6 +1362,7 @@ async fn streaming_http_io(
             .as_ref()
             .is_none_or(|thinking| thinking.trim().is_empty())
         && adapted.tool_calls.is_empty()
+        && adapted.provider_context.is_empty()
     {
         return Err(BridgeClientError::CallFailed {
             layer: BridgeErrorLayer::RemoteBusiness,
@@ -1450,6 +1493,9 @@ impl HttpModelBridgeClient {
             HttpModelBridgeProtocol::ChatCompletions => {
                 OpenAiChatCompletionsAdapter.parse_response(200, response_body)
             }
+            HttpModelBridgeProtocol::Responses => {
+                OpenAiResponsesAdapter.parse_response(200, response_body)
+            }
             HttpModelBridgeProtocol::AnthropicMessages => {
                 AnthropicMessagesAdapter.parse_response(200, response_body)
             }
@@ -1466,6 +1512,7 @@ impl HttpModelBridgeClient {
                 .as_ref()
                 .is_none_or(|value| value.trim().is_empty())
             && adapted.tool_calls.is_empty()
+            && adapted.provider_context.is_empty()
         {
             return Err(BridgeClientError::CallFailed {
                 layer: BridgeErrorLayer::RemoteBusiness,
@@ -1481,11 +1528,6 @@ fn read_non_empty_env(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-#[cfg(test)]
-fn build_openai_chat_completions_url(base_url: &str) -> Result<String, String> {
-    build_protocol_endpoint_url(base_url, "/v1/chat/completions")
 }
 
 #[cfg(test)]
@@ -1508,11 +1550,26 @@ fn build_anthropic_messages_url_for_test(base_url: &str) -> Result<String, Strin
             "claude-test",
         )
         .expect("anthropic adapter should build test request");
-    build_protocol_endpoint_url(base_url, &request.url_path)
+    build_protocol_endpoint_url(base_url, &request.url_path, EndpointUrlMode::Standard)
 }
 
-fn build_protocol_endpoint_url(base_url: &str, endpoint_path: &str) -> Result<String, String> {
-    let normalized = base_url.trim().trim_end_matches('/');
+fn build_protocol_endpoint_url(
+    base_url: &str,
+    endpoint_path: &str,
+    url_mode: EndpointUrlMode,
+) -> Result<String, String> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return Err("base_url must not be empty".to_string());
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Err("base_url must start with http:// or https://".to_string());
+    }
+    if url_mode == EndpointUrlMode::Full {
+        return Ok(trimmed.to_string());
+    }
+
+    let normalized = trimmed.trim_end_matches('/');
     let endpoint_path = endpoint_path.trim();
     let endpoint_suffix = endpoint_path
         .trim_matches('/')
@@ -1522,12 +1579,6 @@ fn build_protocol_endpoint_url(base_url: &str, endpoint_path: &str) -> Result<St
     let endpoint_suffix = (!endpoint_suffix.is_empty())
         .then_some(endpoint_suffix)
         .ok_or_else(|| "endpoint_path must include an endpoint leaf".to_string())?;
-    if normalized.is_empty() {
-        return Err("base_url must not be empty".to_string());
-    }
-    if !normalized.starts_with("http://") && !normalized.starts_with("https://") {
-        return Err("base_url must start with http:// or https://".to_string());
-    }
     if normalized.ends_with(endpoint_path) || normalized.ends_with(&format!("/{endpoint_suffix}")) {
         return Ok(normalized.to_string());
     }
@@ -1793,6 +1844,16 @@ fn tool_choice_enforcement(
         {
             ToolChoiceEnforcement::Required
         }
+        ProviderFamily::OpenAiResponses if request_body["tool_choice"].is_object() => {
+            ToolChoiceEnforcement::Exact
+        }
+        ProviderFamily::OpenAiResponses
+            if request_body["tool_choice"]
+                .as_str()
+                .is_some_and(|choice| choice == "required") =>
+        {
+            ToolChoiceEnforcement::Required
+        }
         ProviderFamily::Anthropic
             if request_body["tool_choice"]["type"]
                 .as_str()
@@ -1846,14 +1907,14 @@ fn request_with_next_tool_choice_enforcement(
     match tool_choice_enforcement(&request.body, provider_family) {
         ToolChoiceEnforcement::Exact => {
             fallback.body["tool_choice"] = match provider_family {
-                ProviderFamily::OpenAiChat => json!("required"),
+                ProviderFamily::OpenAiChat | ProviderFamily::OpenAiResponses => json!("required"),
                 ProviderFamily::Anthropic => json!({"type": "any"}),
             };
             Some((ForcedToolChoiceCapability::Required, fallback))
         }
         ToolChoiceEnforcement::Required => {
             fallback.body["tool_choice"] = match provider_family {
-                ProviderFamily::OpenAiChat => json!("auto"),
+                ProviderFamily::OpenAiChat | ProviderFamily::OpenAiResponses => json!("auto"),
                 ProviderFamily::Anthropic => json!({"type": "auto"}),
             };
             Some((ForcedToolChoiceCapability::AutoOnly, fallback))
@@ -2848,6 +2909,57 @@ mod tests {
         assert_eq!(
             client4.chat_completions_url().unwrap(),
             "http://example.com:8320/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn full_url_mode_preserves_the_configured_endpoint() {
+        let cases = [
+            (
+                HttpModelBridgeProtocol::ChatCompletions,
+                "https://gateway.example.com/custom/model/invoke?api-version=2026-07-31",
+            ),
+            (
+                HttpModelBridgeProtocol::Responses,
+                "https://gateway.example.com/custom/responses?api-version=2026-07-31",
+            ),
+            (
+                HttpModelBridgeProtocol::AnthropicMessages,
+                "https://gateway.example.com/vendor/claude/stream/",
+            ),
+        ];
+
+        for (protocol, endpoint) in cases {
+            let client = HttpModelBridgeClient::new_with_protocol_and_url_mode(
+                endpoint.to_string(),
+                Some("test-key".to_string()),
+                "test-model".to_string(),
+                protocol,
+                EndpointUrlMode::Full,
+                None,
+            );
+            let (url, _, _) = client
+                .build_probe_request()
+                .expect("完整路径请求必须可构造");
+            assert_eq!(url, endpoint);
+        }
+    }
+
+    #[test]
+    fn responses_protocol_builds_the_responses_endpoint() {
+        let client = HttpModelBridgeClient::new_with_protocol(
+            "https://api.openai.com/v1".to_string(),
+            Some("test-key".to_string()),
+            "gpt-5".to_string(),
+            HttpModelBridgeProtocol::Responses,
+            None,
+        );
+        let (url, body, headers) = client.build_probe_request().expect("Responses request");
+        assert_eq!(url, "https://api.openai.com/v1/responses");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            headers[0],
+            ("Authorization".to_string(), "Bearer test-key".to_string())
         );
     }
 

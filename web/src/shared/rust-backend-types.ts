@@ -843,15 +843,13 @@ export interface BootstrapDto {
   recoveryHandles: RecoveryHandleDto[];
   runtimeReadModel: RuntimeReadModelDto;
   auditUsageLedger: AuditUsageLedgerDto;
-  bridgeServices: BridgeServicesSnapshotDto;
-  bridgePreflight: BridgePreflightSnapshotDto;
   notifications: NotificationDto[];
   eventStreamNextSequence: number;
   recentEvents: EventEnvelope[];
   hasMoreBefore: boolean;
   beforeCursor?: string | null;
-  pendingChanges?: unknown[];
-  pendingChangesState?: unknown;
+  canonicalHasMoreBefore: boolean;
+  canonicalBeforeCursor?: string | null;
 }
 
 // ─── Session management endpoints ───────────────────────────────────
@@ -1359,6 +1357,8 @@ export interface MessagesResponseDto {
   sessionId: string;
   hasMoreBefore: boolean;
   beforeCursor?: string | null;
+  canonicalHasMoreBefore: boolean;
+  canonicalBeforeCursor?: string | null;
 }
 
 // ─── Agent Run types (magi-core::task) ────────────────────────

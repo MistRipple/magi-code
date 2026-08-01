@@ -2727,6 +2727,27 @@ fn execute_task_tool_call(
         return (decision.payload, decision.status);
     }
 
+    if let Some(gate) = safety_gate {
+        publish_safety_evaluation_audit(
+            event_bus,
+            gate,
+            &tool_call.function.name,
+            &tool_call.function.arguments,
+            &tool_call.id,
+            SafetyEvaluationAuditContext {
+                access_profile: task
+                    .policy_snapshot
+                    .as_ref()
+                    .map(magi_core::TaskPolicy::effective_access_profile)
+                    .unwrap_or_default(),
+                session_id: Some(session_id),
+                workspace_id: workspace_id.as_ref(),
+                mission_id: Some(&task.mission_id),
+                task_id: Some(&task.task_id),
+            },
+        );
+    }
+
     if let Some(decision) = task_tool_preflight_decision(
         task,
         safety_gate,
@@ -3329,6 +3350,67 @@ pub(crate) fn safety_gate_tool_decision(
             )),
         },
     }
+}
+
+pub(crate) struct SafetyEvaluationAuditContext<'a> {
+    pub access_profile: magi_core::AccessProfile,
+    pub session_id: Option<&'a SessionId>,
+    pub workspace_id: Option<&'a WorkspaceId>,
+    pub mission_id: Option<&'a magi_core::MissionId>,
+    pub task_id: Option<&'a TaskId>,
+}
+
+pub(crate) fn publish_safety_evaluation_audit(
+    event_bus: &InMemoryEventBus,
+    gate: &magi_safety_gate::SafetyGate,
+    tool_name: &str,
+    arguments: &str,
+    tool_call_id: &str,
+    context: SafetyEvaluationAuditContext<'_>,
+) {
+    let canonical_tool_name =
+        canonical_builtin_tool_name(tool_name).unwrap_or_else(|| tool_name.trim().to_string());
+    let evaluation = gate.evaluate_with_evidence(&canonical_tool_name, arguments);
+    if evaluation.matches.is_empty() {
+        return;
+    }
+
+    let decision = match &evaluation.decision {
+        magi_safety_gate::SafetyDecision::Allow => "allow",
+        magi_safety_gate::SafetyDecision::HardBlock { .. } => "hard_block",
+        magi_safety_gate::SafetyDecision::RequireApprovalInRestricted { .. } => {
+            "require_approval_in_restricted"
+        }
+        magi_safety_gate::SafetyDecision::AuditOnly { .. } => "audit_only",
+    };
+    let _ = event_bus.publish(
+        EventEnvelope::audit(
+            EventId::new(format!(
+                "event-safety-evaluation-{}-{}",
+                tool_call_id,
+                UtcMillis::now().0
+            )),
+            "security.safety.evaluated",
+            serde_json::json!({
+                "tool_name": canonical_tool_name,
+                "tool_call_id": tool_call_id,
+                "access_profile": format!("{:?}", context.access_profile),
+                "decision": decision,
+                "matched_rules": evaluation.matches.iter().map(|matched| serde_json::json!({
+                    "category": matched.category.as_str(),
+                    "pattern": matched.pattern,
+                    "action": matched.action.as_str(),
+                })).collect::<Vec<_>>(),
+            }),
+        )
+        .with_context(EventContext {
+            workspace_id: context.workspace_id.cloned(),
+            session_id: context.session_id.cloned(),
+            mission_id: context.mission_id.cloned(),
+            task_id: context.task_id.cloned(),
+            ..EventContext::default()
+        }),
+    );
 }
 
 fn safety_gate_decision_payload(
@@ -4918,6 +5000,46 @@ mod tests {
         assert!(payload.get("safety_gate").is_none());
         assert!(!decision.payload.contains("deploy-prod"));
         assert!(!decision.payload.contains("custom"));
+    }
+
+    #[test]
+    fn safety_gate_audit_is_published_before_tool_execution() {
+        let event_bus = InMemoryEventBus::new(16);
+        let gate =
+            magi_safety_gate::SafetyGate::new(vec![magi_safety_gate::SafetyRule::with_action(
+                "deploy-prod",
+                magi_safety_gate::SafetyCategory::Custom,
+                magi_safety_gate::SafetyAction::AuditOnly,
+            )]);
+        let session_id = SessionId::new("session-safety-audit");
+        let workspace_id = WorkspaceId::new("workspace-safety-audit");
+        let mission_id = magi_core::MissionId::new("mission-safety-audit");
+        let task_id = TaskId::new("task-safety-audit");
+
+        publish_safety_evaluation_audit(
+            &event_bus,
+            &gate,
+            BuiltinToolName::ShellExec.as_str(),
+            r#"{"command":"deploy-prod"}"#,
+            "tool-call-safety-audit",
+            SafetyEvaluationAuditContext {
+                access_profile: magi_core::AccessProfile::Restricted,
+                session_id: Some(&session_id),
+                workspace_id: Some(&workspace_id),
+                mission_id: Some(&mission_id),
+                task_id: Some(&task_id),
+            },
+        );
+
+        let audit = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "security.safety.evaluated")
+            .expect("safety audit event should be published");
+        assert_eq!(audit.category, magi_event_bus::EventCategory::Audit);
+        assert_eq!(audit.payload["decision"], "audit_only");
+        assert_eq!(event_bus.audit_usage_ledger_snapshot().audit_count(), 1);
     }
 
     #[test]

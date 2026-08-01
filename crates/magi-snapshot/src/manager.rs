@@ -126,7 +126,7 @@ impl SnapshotManager {
         session_id: String,
         workspace_root: PathBuf,
     ) -> SnapshotResult<Arc<SnapshotSession>> {
-        ensure_snapshot_storage_git_excluded(&workspace_root)?;
+        ensure_workspace_state_git_excluded(&workspace_root)?;
         let snapshots_root = snapshots_root_for(&workspace_root);
         let blobs_dir = snapshots_root.join("blobs");
 
@@ -239,12 +239,13 @@ impl SnapshotManager {
     }
 }
 
-/// Snapshot 账本属于 Magi 的本地运行态，不能反过来把用户仓库标成 dirty。
+/// `.magi` 下的会话、快照和索引都属于 Magi 本地运行态，
+/// 不能反过来把用户仓库标成 dirty。
 ///
 /// 只写 repository-local 的 `info/exclude`，不改用户受版本控制的 `.gitignore`；
 /// linked worktree 则沿 `commondir` 定位共享 Git 目录。若这些路径中的文件
 /// 已经被显式跟踪，Git 仍会正常报告改动，避免隐藏用户真实文件。
-fn ensure_snapshot_storage_git_excluded(workspace_root: &Path) -> SnapshotResult<()> {
+fn ensure_workspace_state_git_excluded(workspace_root: &Path) -> SnapshotResult<()> {
     let dot_git = workspace_root.join(".git");
     let git_dir = if dot_git.is_dir() {
         dot_git
@@ -277,7 +278,7 @@ fn ensure_snapshot_storage_git_excluded(workspace_root: &Path) -> SnapshotResult
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(SnapshotError::io(&exclude_path, error)),
     };
-    const PATTERNS: [&str; 2] = ["/.magi/snapshots/", "/.magi/cache/"];
+    const PATTERNS: [&str; 1] = ["/.magi/"];
     let missing = PATTERNS
         .into_iter()
         .filter(|pattern| !existing.lines().any(|line| line.trim() == *pattern))
@@ -357,6 +358,61 @@ fn ensure_same_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_git(root: &Path, args: &[&str]) -> std::process::Output {
+        magi_process::std_command("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git command should run")
+    }
+
+    #[test]
+    fn workspace_state_is_excluded_from_repository_status() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            run_git(workspace.path(), &["init", "--quiet"])
+                .status
+                .success()
+        );
+        std::fs::create_dir_all(workspace.path().join(".magi/cache")).expect("state dir");
+        std::fs::write(workspace.path().join(".magi/sessions.json"), "{}\n")
+            .expect("session state");
+        std::fs::write(
+            workspace.path().join(".magi/cache/search-index.json.gz"),
+            b"cache",
+        )
+        .expect("cache state");
+
+        ensure_workspace_state_git_excluded(workspace.path()).expect("exclude workspace state");
+
+        let status = run_git(workspace.path(), &["status", "--porcelain", "--", ".magi"]);
+        assert!(status.status.success());
+        assert!(
+            status.stdout.is_empty(),
+            "Magi runtime state must not dirty the repository: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+    }
+
+    #[test]
+    fn workspace_state_exclusion_is_idempotent_and_preserves_existing_rules() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert!(
+            run_git(workspace.path(), &["init", "--quiet"])
+                .status
+                .success()
+        );
+        let exclude_path = workspace.path().join(".git/info/exclude");
+        std::fs::write(&exclude_path, "existing-rule\n").expect("existing exclude");
+
+        ensure_workspace_state_git_excluded(workspace.path()).expect("first exclude");
+        ensure_workspace_state_git_excluded(workspace.path()).expect("second exclude");
+
+        let exclude = std::fs::read_to_string(exclude_path).expect("read exclude");
+        assert!(exclude.lines().any(|line| line == "existing-rule"));
+        assert_eq!(exclude.lines().filter(|line| *line == "/.magi/").count(), 1);
+    }
 
     #[tokio::test]
     async fn rebase_session_replaces_old_branch_baseline_with_current_tree() {

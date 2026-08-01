@@ -146,13 +146,13 @@
   const displayMode = $derived(terminal?.runMode || '');
   const displayCommand = $derived(terminal?.command || '');
   const displayCwd = $derived(terminal?.cwd || '');
-  const displayOutput = $derived.by(() => {
+  const rawDisplayOutput = $derived.by(() => {
     const fromTerminal = terminal?.output;
     if (typeof fromTerminal === 'string' && fromTerminal.length > 0) {
       if (isStructuredToolErrorPayload(fromTerminal)) {
         return '';
       }
-      return formatOutput(fromTerminal);
+      return fromTerminal;
     }
     if (parsedResult) {
       return '';
@@ -161,7 +161,7 @@
     if (isStructuredToolErrorPayload(raw)) {
       return '';
     }
-    return formatOutput(raw);
+    return raw;
   });
 
   function normalizeDisplayText(value: string): string {
@@ -255,17 +255,11 @@
     || toolCall?.error
     || ''
   );
-  const showErrorHint = $derived.by(() => {
-    const normalizedError = normalizeDisplayText(publicErrorText || errorText);
-    if (!normalizedError) {
-      return false;
-    }
-    return !normalizeDisplayText(displayOutput).includes(normalizedError);
-  });
+  const hasErrorHint = $derived(Boolean(normalizeDisplayText(publicErrorText || errorText)));
   const accepted = $derived(terminal?.accepted);
   const killed = $derived(terminal?.killed);
   const releasedLock = $derived(terminal?.releasedLock);
-  const showOutput = $derived(displayOutput.trim().length > 0);
+  const showOutput = $derived(rawDisplayOutput.trim().length > 0);
 
   const normalizedStatus = $derived(String(displayStatus || '').toLowerCase());
 
@@ -331,7 +325,7 @@
     || displayCwd
     || showOutput
     || startupMessage
-    || showErrorHint
+    || hasErrorHint
     || typeof outputCursor === 'number'
     || typeof returnCode === 'number'
     || typeof locked === 'boolean'
@@ -341,6 +335,14 @@
   ));
   const canToggle = $derived(isExpandable);
   const isExpanded = $derived(canToggle && !collapsed);
+  const displayOutput = $derived(isExpanded ? formatOutput(rawDisplayOutput) : '');
+  const showErrorHint = $derived.by(() => {
+    const normalizedError = normalizeDisplayText(publicErrorText || errorText);
+    if (!normalizedError) {
+      return false;
+    }
+    return !normalizeDisplayText(displayOutput).includes(normalizedError);
+  });
   const showFooter = $derived(
     typeof outputCursor === 'number'
     || typeof returnCode === 'number'

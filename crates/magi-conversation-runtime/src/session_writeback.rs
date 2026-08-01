@@ -9,8 +9,8 @@ use crate::{
     execute_skill_custom_tool, internal_builtin_tool_rejection_payload,
     parse_skill_custom_tool_name,
     tool_batch::{
-        access_profile_tool_decision, execute_goal_tool, safety_gate_tool_decision,
-        select_preflight_decision,
+        SafetyEvaluationAuditContext, access_profile_tool_decision, execute_goal_tool,
+        publish_safety_evaluation_audit, safety_gate_tool_decision, select_preflight_decision,
     },
     tool_execution_policy_scope,
 };
@@ -1352,6 +1352,23 @@ fn execute_session_turn_tool_call_scoped(
 
     if tool_call.function.name == SKILL_APPLY_TOOL_NAME {
         return execute_skill_apply_from_runtime(&tool_call.function.arguments, skill_runtime);
+    }
+
+    if let Some(gate) = safety_gate {
+        publish_safety_evaluation_audit(
+            event_bus,
+            gate,
+            &tool_call.function.name,
+            &tool_call.function.arguments,
+            &tool_call.id,
+            SafetyEvaluationAuditContext {
+                access_profile,
+                session_id: Some(session_id),
+                workspace_id: workspace_id.as_ref(),
+                mission_id: Some(mission_id),
+                task_id: None,
+            },
+        );
     }
 
     let reference_policy = crate::context_reference::session_context_reference_policy(

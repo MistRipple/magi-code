@@ -202,6 +202,18 @@ struct ExecuteDispatchSubmissionInput<'a> {
     denied_tools: Vec<String>,
 }
 
+fn initial_session_orchestrator_config(
+    created_session: bool,
+    config: Option<&serde_json::Value>,
+) -> Result<Option<&serde_json::Value>, ApiError> {
+    if !created_session && config.is_some() {
+        return Err(ApiError::InvalidInput(
+            "已有会话的模型只能通过会话模型设置操作修改".to_string(),
+        ));
+    }
+    Ok(created_session.then_some(config).flatten())
+}
+
 async fn execute_dispatch_submission(
     state: &ApiState,
     input: ExecuteDispatchSubmissionInput<'_>,
@@ -232,7 +244,10 @@ async fn execute_dispatch_submission(
         placeholder_title,
         accepted_at,
     )?;
-    if let Some(config) = request.orchestrator_session_config.as_ref() {
+    if let Some(config) = initial_session_orchestrator_config(
+        created_session,
+        request.orchestrator_session_config.as_ref(),
+    )? {
         super::settings::save_orchestrator_session_override_for_session(
             state,
             &session_id,
@@ -727,7 +742,8 @@ fn assistant_final_from_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        fail_accepted_task_submission, format_action_task_title, resolve_dispatch_session,
+        fail_accepted_task_submission, format_action_task_title,
+        initial_session_orchestrator_config, resolve_dispatch_session,
     };
     use crate::{errors::ApiError, state::ApiState, task_dispatch::DispatchSubmissionAccepted};
     use magi_core::{
@@ -749,6 +765,25 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         )
+    }
+
+    #[test]
+    fn turn_payload_only_initializes_model_for_a_new_session() {
+        let config = serde_json::json!({ "model": "model-selected-by-user" });
+        assert_eq!(
+            initial_session_orchestrator_config(true, Some(&config))
+                .expect("new session config should be accepted"),
+            Some(&config),
+        );
+        assert!(
+            initial_session_orchestrator_config(false, Some(&config)).is_err(),
+            "ordinary turns must not be able to overwrite the persisted session model",
+        );
+        assert_eq!(
+            initial_session_orchestrator_config(false, None)
+                .expect("existing session should use its persisted model"),
+            None,
+        );
     }
 
     #[test]

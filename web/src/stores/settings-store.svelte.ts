@@ -396,7 +396,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   function normalizeModelApiProtocol(value: unknown): ModelApiProtocol {
-    return value === "anthropic_messages" ? "anthropic_messages" : "openai_chat";
+    if (value === "openai_responses") return "openai_responses";
+    if (value === "anthropic_messages") return "anthropic_messages";
+    return "openai_chat";
   }
 
   function buildBaseModelConfigPayload(
@@ -620,6 +622,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
   ];
   let safeguardRules = $state<SafeguardRule[]>([]);
   let newCustomRule = $state("");
+  let safeguardRevision = $state(0);
+  let persistedSafeguardRules = $state<SafeguardRule[]>([]);
+  let safeguardSaveStatus = $state<"idle" | "saving" | "saved" | "error">("idle");
+  let safeguardSaveVersion = 0;
+  let safeguardSaveQueue: Promise<void> = Promise.resolve();
+  let safeguardAuditCount = $state(0);
+  let safeguardAuditPersistenceHealthy = $state(true);
 
   // 模型配置表单
   let orchConfig = $state<InteractiveModelFormConfig>(
@@ -1214,6 +1223,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
     applySkillsConfig(payload.skillsConfig);
     applyRepositoriesPayload(payload.repositories);
     applySafeguardConfig(payload.safeguardConfig);
+    safeguardAuditCount = Number(payload.safeguardAudit?.auditCount) || 0;
+    safeguardAuditPersistenceHealthy = payload.safeguardAudit?.persistenceHealthy !== false;
     if (
       Array.isArray(payload.roleTemplates)
       && Array.isArray(payload.registryEngines)
@@ -1539,6 +1550,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   async function closeSettings() {
     await flushUserRulesSave();
+    await safeguardSaveQueue;
     // 关闭面板前清理所有未保存的引擎（只存在于前端的幽灵引擎）
     for (const engineId of unsavedEngines) {
       purgeEngineFromFrontend(engineId);
@@ -3141,7 +3153,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   function applySafeguardConfig(config: any): void {
-    safeguardRules = Array.isArray(config?.rules)
+    if (safeguardSaveStatus === "saving") return;
+    const rules: SafeguardRule[] = Array.isArray(config?.rules)
       ? config.rules.map((r: any) => ({
           pattern: String(r.pattern || ""),
           enabled: r.enabled !== false,
@@ -3149,6 +3162,11 @@ function createSettingsStore(props: { onClose?: () => void }) {
           action: normalizeSafeguardAction(r.action),
         }))
       : [];
+    safeguardRules = rules;
+    persistedSafeguardRules = rules.map((rule) => ({ ...rule }));
+    safeguardRevision = Number.isInteger(config?.revision) && config.revision >= 0
+      ? config.revision
+      : 0;
   }
 
   function normalizeSafeguardAction(action: unknown): SafeguardAction {
@@ -3162,25 +3180,62 @@ function createSettingsStore(props: { onClose?: () => void }) {
     return "require_approval_in_restricted";
   }
 
-  async function saveSafeguardRules(): Promise<void> {
-    try {
-      await saveAgentSafeguardConfig({
-        rules: safeguardRules.map((r) => ({ ...r })),
-      });
-      notifySettingsSuccess(i18n.t("settings.toast.safeguardRulesSaved"));
-    } catch (e) {
-      console.error("[SettingsPanel] 保存安全规则失败:", e);
-      notifySettingsError(
-        i18n.t("settings.toast.action.saveSafeguardRules"),
-        e,
-      );
-    }
+  function saveSafeguardRules(): void {
+    const saveVersion = ++safeguardSaveVersion;
+    const rulesSnapshot = safeguardRules.map((rule) => ({ ...rule }));
+    safeguardSaveStatus = "saving";
+    safeguardSaveQueue = safeguardSaveQueue.then(async () => {
+      try {
+        const result = await saveAgentSafeguardConfig({
+          revision: safeguardRevision,
+          rules: rulesSnapshot,
+        });
+        const nextRevision = Number(result?.revision);
+        if (!Number.isInteger(nextRevision) || nextRevision < 1) {
+          throw new Error("安全防护保存响应缺少有效 revision");
+        }
+        safeguardRevision = nextRevision;
+        persistedSafeguardRules = rulesSnapshot.map((rule) => ({ ...rule }));
+        if (saveVersion === safeguardSaveVersion) {
+          const savedConfig = result?.config as Record<string, unknown> | undefined;
+          const savedRules = savedConfig?.rules;
+          safeguardRules = Array.isArray(savedRules)
+            ? savedRules.map((rule: any) => ({
+                pattern: String(rule.pattern || ""),
+                enabled: rule.enabled !== false,
+                category: rule.category || "custom",
+                action: normalizeSafeguardAction(rule.action),
+              }))
+            : rulesSnapshot;
+          persistedSafeguardRules = safeguardRules.map((rule) => ({ ...rule }));
+          safeguardSaveStatus = "saved";
+          notifySettingsSuccess(i18n.t("settings.toast.safeguardRulesSaved"));
+        }
+      } catch (e) {
+        if (saveVersion !== safeguardSaveVersion) return;
+        safeguardRules = persistedSafeguardRules.map((rule) => ({ ...rule }));
+        safeguardSaveStatus = "error";
+        console.error("[SettingsPanel] 保存安全规则失败:", e);
+        notifySettingsError(
+          i18n.t("settings.toast.action.saveSafeguardRules"),
+          e,
+        );
+      }
+    });
   }
 
   function toggleSafeguardRule(index: number): void {
+    const rule = safeguardRules[index];
+    if (!rule) return;
+    if (
+      rule.enabled
+      && !window.confirm(i18n.t("settings.safeguard.disableConfirm", { pattern: rule.pattern }))
+    ) {
+      return;
+    }
     safeguardRules[index] = {
-      ...safeguardRules[index],
-      enabled: !safeguardRules[index].enabled,
+      ...rule,
+      enabled: !rule.enabled,
     };
     safeguardRules = [...safeguardRules];
     saveSafeguardRules();
@@ -3191,6 +3246,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!rule) return;
     const normalizedAction = normalizeSafeguardAction(action);
     if (rule.action === normalizedAction) return;
+    if (
+      safetyActionPrecedence(normalizedAction) < safetyActionPrecedence(rule.action)
+      && !window.confirm(i18n.t("settings.safeguard.downgradeConfirm", { pattern: rule.pattern }))
+    ) {
+      return;
+    }
     safeguardRules[index] = {
       ...rule,
       action: normalizedAction,
@@ -3200,14 +3261,35 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   function removeCustomRule(index: number): void {
+    const rule = safeguardRules[index];
+    if (
+      rule
+      && !window.confirm(i18n.t("settings.safeguard.removeConfirm", { pattern: rule.pattern }))
+    ) {
+      return;
+    }
     safeguardRules = safeguardRules.filter((_, i) => i !== index);
     saveSafeguardRules();
+  }
+
+  function safetyActionPrecedence(action: SafeguardAction): number {
+    switch (action) {
+      case "hard_block":
+        return 3;
+      case "require_approval_in_restricted":
+        return 2;
+      case "audit_only":
+        return 1;
+    }
   }
 
   function addCustomRule(): void {
     const pattern = newCustomRule.trim();
     if (!pattern) return;
-    if (safeguardRules.some((r) => r.pattern === pattern)) return;
+    if (safeguardRules.some((r) => r.pattern.trim().toLocaleLowerCase() === pattern.toLocaleLowerCase())) {
+      notifySettingsInfo(i18n.t("settings.safeguard.duplicateRule"));
+      return;
+    }
     safeguardRules = [
       ...safeguardRules,
       {
@@ -3396,6 +3478,15 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     get userRulesSaveStatus() {
       return userRulesSaveStatus;
+    },
+    get safeguardSaveStatus() {
+      return safeguardSaveStatus;
+    },
+    get safeguardAuditCount() {
+      return safeguardAuditCount;
+    },
+    get safeguardAuditPersistenceHealthy() {
+      return safeguardAuditPersistenceHealthy;
     },
     get installingSkills() {
       return installingSkills;

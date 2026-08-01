@@ -375,10 +375,7 @@ fn canonicalize_session_orchestrator_section(value: &mut Value) -> bool {
     };
     let mut changed = false;
     object.retain(|key, _| {
-        let keep = matches!(
-            key.as_str(),
-            "model" | "reasoningEffort" | "previousModel" | "modelSwitchPending"
-        );
+        let keep = matches!(key.as_str(), "model" | "reasoningEffort");
         if !keep {
             changed = true;
         }
@@ -803,6 +800,8 @@ mod tests {
                     "urlMode": "standard",
                     "model": "session-main",
                     "reasoningEffort": "xhigh",
+                    "previousModel": "legacy-main",
+                    "modelSwitchPending": true,
                     "provider": "openai"
                 }),
             )
@@ -814,6 +813,8 @@ mod tests {
         assert!(section.get("baseUrl").is_none());
         assert!(section.get("apiKey").is_none());
         assert!(section.get("urlMode").is_none());
+        assert!(section.get("previousModel").is_none());
+        assert!(section.get("modelSwitchPending").is_none());
         assert!(section.get("provider").is_none());
     }
 

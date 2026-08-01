@@ -24,10 +24,33 @@ pub fn parse_stream_provider_context(
     family: ProviderFamily,
     event: &SseEvent,
 ) -> Option<ProviderContextStreamDelta> {
+    let envelope = serde_json::from_str::<Value>(&event.data).ok()?;
+    if family == ProviderFamily::OpenAiResponses {
+        let item = envelope.get("item")?;
+        if item["type"].as_str() != Some("reasoning") {
+            return None;
+        }
+        if matches!(
+            event.event_type.as_deref(),
+            Some("response.output_item.added" | "response.output_item.done")
+        ) {
+            return Some(ProviderContextStreamDelta::Start {
+                index: item["id"]
+                    .as_str()
+                    .map(stable_provider_context_index)
+                    .unwrap_or(0),
+                context: ModelProviderContext {
+                    provider: "openai_responses".to_string(),
+                    kind: "reasoning".to_string(),
+                    data: item.clone(),
+                },
+            });
+        }
+        return None;
+    }
     if family != ProviderFamily::Anthropic {
         return None;
     }
-    let envelope = serde_json::from_str::<Value>(&event.data).ok()?;
     let index = envelope["index"].as_u64()? as usize;
     match event.event_type.as_deref() {
         Some("content_block_start") => {
@@ -140,10 +163,221 @@ impl SseLineParser {
 pub fn parse_stream_event(family: ProviderFamily, event: &SseEvent) -> Vec<LlmStreamChunk> {
     match family {
         ProviderFamily::OpenAiChat => parse_openai_stream_data(&event.data),
+        ProviderFamily::OpenAiResponses => {
+            parse_openai_responses_stream_event(event.event_type.as_deref(), &event.data)
+        }
         ProviderFamily::Anthropic => {
             parse_anthropic_stream_event(event.event_type.as_deref(), &event.data)
         }
     }
+}
+
+fn parse_openai_responses_stream_event(
+    event_type: Option<&str>,
+    data: &str,
+) -> Vec<LlmStreamChunk> {
+    if data.trim() == "[DONE]" {
+        return Vec::new();
+    }
+    let Ok(envelope) = serde_json::from_str::<Value>(data) else {
+        return Vec::new();
+    };
+    let empty = || LlmStreamChunk {
+        kind: LlmStreamChunkType::ContentDelta,
+        content: None,
+        tool_call: None,
+        thinking: None,
+        usage: None,
+        stop_reason: None,
+    };
+
+    match event_type {
+        Some("response.output_text.delta") => {
+            let mut chunk = empty();
+            chunk.content = envelope["delta"].as_str().map(str::to_string);
+            vec![chunk]
+        }
+        Some("response.refusal.delta") => {
+            let mut chunk = empty();
+            chunk.content = envelope["delta"].as_str().map(str::to_string);
+            vec![chunk]
+        }
+        Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta") => {
+            vec![LlmStreamChunk {
+                kind: LlmStreamChunkType::Thinking,
+                content: None,
+                tool_call: None,
+                thinking: envelope["delta"].as_str().map(str::to_string),
+                usage: None,
+                stop_reason: None,
+            }]
+        }
+        Some("response.output_item.added") => parse_responses_output_item_start(&envelope),
+        Some("response.function_call_arguments.delta") => vec![LlmStreamChunk {
+            kind: LlmStreamChunkType::ToolCallDelta,
+            content: None,
+            tool_call: Some(PartialToolCall {
+                id: None,
+                name: None,
+                arguments: envelope["delta"]
+                    .as_str()
+                    .map(|value| Value::String(value.to_string())),
+                index: responses_output_index(&envelope),
+            }),
+            thinking: None,
+            usage: None,
+            stop_reason: None,
+        }],
+        Some("response.function_call_arguments.done") => vec![LlmStreamChunk {
+            kind: LlmStreamChunkType::ToolCallEnd,
+            content: None,
+            tool_call: Some(PartialToolCall {
+                id: None,
+                name: None,
+                arguments: envelope["arguments"]
+                    .as_str()
+                    .map(|value| Value::String(value.to_string())),
+                index: responses_output_index(&envelope),
+            }),
+            thinking: None,
+            usage: None,
+            stop_reason: None,
+        }],
+        Some("response.output_item.done") => parse_responses_output_item_done(&envelope),
+        Some("response.completed") => responses_terminal_chunks("stop", &envelope),
+        Some("response.incomplete") => responses_terminal_chunks(
+            envelope["response"]["incomplete_details"]["reason"]
+                .as_str()
+                .unwrap_or("incomplete"),
+            &envelope,
+        ),
+        Some("response.failed") => responses_terminal_chunks("error", &envelope),
+        _ => parse_responses_usage_event(&envelope),
+    }
+}
+
+fn parse_responses_output_item_start(envelope: &Value) -> Vec<LlmStreamChunk> {
+    let item = &envelope["item"];
+    match item["type"].as_str() {
+        Some("message") => vec![LlmStreamChunk {
+            kind: LlmStreamChunkType::ContentStart,
+            content: None,
+            tool_call: None,
+            thinking: None,
+            usage: None,
+            stop_reason: None,
+        }],
+        Some("function_call") => vec![LlmStreamChunk {
+            kind: LlmStreamChunkType::ToolCallStart,
+            content: None,
+            tool_call: Some(PartialToolCall {
+                id: item["call_id"]
+                    .as_str()
+                    .or_else(|| item["id"].as_str())
+                    .map(str::to_string),
+                name: item["name"].as_str().map(str::to_string),
+                arguments: item["arguments"]
+                    .as_str()
+                    .map(|value| Value::String(value.to_string())),
+                index: responses_output_index(envelope),
+            }),
+            thinking: None,
+            usage: None,
+            stop_reason: None,
+        }],
+        _ => Vec::new(),
+    }
+}
+
+fn parse_responses_output_item_done(envelope: &Value) -> Vec<LlmStreamChunk> {
+    let item = &envelope["item"];
+    match item["type"].as_str() {
+        Some("message") => vec![LlmStreamChunk {
+            kind: LlmStreamChunkType::ContentEnd,
+            content: None,
+            tool_call: None,
+            thinking: None,
+            usage: None,
+            stop_reason: None,
+        }],
+        Some("function_call") => vec![LlmStreamChunk {
+            kind: LlmStreamChunkType::ToolCallEnd,
+            content: None,
+            tool_call: Some(PartialToolCall {
+                id: item["call_id"]
+                    .as_str()
+                    .or_else(|| item["id"].as_str())
+                    .map(str::to_string),
+                name: item["name"].as_str().map(str::to_string),
+                arguments: item["arguments"]
+                    .as_str()
+                    .map(|value| Value::String(value.to_string())),
+                index: responses_output_index(envelope),
+            }),
+            thinking: None,
+            usage: None,
+            stop_reason: None,
+        }],
+        _ => Vec::new(),
+    }
+}
+
+fn responses_output_index(envelope: &Value) -> Option<usize> {
+    envelope["output_index"]
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+}
+
+fn responses_terminal_chunk(reason: &str) -> LlmStreamChunk {
+    LlmStreamChunk {
+        kind: LlmStreamChunkType::ContentEnd,
+        content: None,
+        tool_call: None,
+        thinking: None,
+        usage: None,
+        stop_reason: Some(reason.to_string()),
+    }
+}
+
+fn responses_terminal_chunks(reason: &str, envelope: &Value) -> Vec<LlmStreamChunk> {
+    let mut chunks = vec![responses_terminal_chunk(reason)];
+    chunks.extend(parse_responses_usage_event(envelope));
+    chunks
+}
+
+fn parse_responses_usage_event(envelope: &Value) -> Vec<LlmStreamChunk> {
+    let usage = envelope
+        .get("response")
+        .and_then(|response| response.get("usage"))
+        .or_else(|| envelope.get("usage"));
+    let Some(usage) = usage.filter(|usage| !usage.is_null()) else {
+        return Vec::new();
+    };
+    vec![LlmStreamChunk {
+        kind: LlmStreamChunkType::Usage,
+        content: None,
+        tool_call: None,
+        thinking: None,
+        usage: Some(parse_responses_usage_value(usage)),
+        stop_reason: None,
+    }]
+}
+
+fn parse_responses_usage_value(usage: &Value) -> LlmUsage {
+    let cache_read_tokens = usage["input_tokens_details"]["cached_tokens"].as_u64();
+    LlmUsage {
+        input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
+        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+        cache_read_tokens,
+        cache_write_tokens: None,
+        cache_read_included_in_input: cache_read_tokens.is_some(),
+    }
+}
+
+fn stable_provider_context_index(value: &str) -> usize {
+    value.bytes().fold(0usize, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(byte as usize)
+    })
 }
 
 fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
@@ -526,7 +760,45 @@ impl StreamAccumulator {
                     }
                 }
             }
-            LlmStreamChunkType::ToolCallEnd => {}
+            LlmStreamChunkType::ToolCallEnd => {
+                if let Some(ref tc) = chunk.tool_call {
+                    let target_idx = tc
+                        .index
+                        .filter(|idx| *idx < self.active_tool_calls.len())
+                        .or_else(|| {
+                            tc.id.as_deref().and_then(|id| {
+                                self.active_tool_calls
+                                    .iter()
+                                    .position(|active| active.id == id)
+                            })
+                        })
+                        .or_else(|| {
+                            if self.active_tool_calls.is_empty() {
+                                None
+                            } else {
+                                Some(self.active_tool_calls.len() - 1)
+                            }
+                        });
+                    let Some(fragment) = tool_call_argument_fragment(tc.arguments.as_ref()) else {
+                        return;
+                    };
+                    if let Some(idx) = target_idx {
+                        if let Some(id) = tc.id.as_ref().filter(|id| !id.is_empty()) {
+                            self.active_tool_calls[idx].id = id.clone();
+                        }
+                        if let Some(name) = tc.name.as_ref().filter(|name| !name.is_empty()) {
+                            self.active_tool_calls[idx].name = name.clone();
+                        }
+                        self.active_tool_calls[idx].arguments_buffer = fragment;
+                    } else {
+                        self.active_tool_calls.push(ActiveToolCall {
+                            id: tc.id.clone().unwrap_or_default(),
+                            name: tc.name.clone().unwrap_or_default(),
+                            arguments_buffer: fragment,
+                        });
+                    }
+                }
+            }
             LlmStreamChunkType::Thinking => {
                 if let Some(ref text) = chunk.thinking {
                     self.thinking.push_str(text);
@@ -1132,6 +1404,66 @@ mod tests {
         assert!(result.tool_calls.is_empty());
         assert_eq!(result.usage.input_tokens, 10);
         assert_eq!(result.usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn end_to_end_responses_stream_to_response() {
+        let sse_payload = concat!(
+            "event: response.output_item.added\ndata: {\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n\n",
+            "event: response.reasoning_summary_text.delta\ndata: {\"delta\":\"先判断\"}\n\n",
+            "event: response.output_item.added\ndata: {\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"shell_exec\",\"arguments\":\"\"}}\n\n",
+            "event: response.function_call_arguments.delta\ndata: {\"item_id\":\"fc_1\",\"delta\":\"{\\\"command\\\":\\\"pwd\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\ndata: {\"item_id\":\"fc_1\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}\n\n",
+            "event: response.output_item.done\ndata: {\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"先判断\"}]}}\n\n",
+            "event: response.completed\ndata: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}\n\n",
+        );
+
+        let mut parser = SseLineParser::new();
+        let mut accumulator = StreamAccumulator::new();
+        for event in parser.feed(sse_payload) {
+            if let Some(context) =
+                parse_stream_provider_context(ProviderFamily::OpenAiResponses, &event)
+            {
+                accumulator.apply_provider_context(context);
+            }
+            accumulator.apply_all(&parse_stream_event(ProviderFamily::OpenAiResponses, &event));
+        }
+
+        let result = accumulator.finalize();
+        assert_eq!(result.thinking.as_deref(), Some("先判断"));
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].id, "call_1");
+        assert_eq!(result.tool_calls[0].arguments["command"], "pwd");
+        assert_eq!(result.stop_reason, "stop");
+        assert_eq!(result.provider_context[0].provider, "openai_responses");
+        assert_eq!(result.usage.input_tokens, 10);
+        assert_eq!(result.usage.output_tokens, 4);
+    }
+
+    #[test]
+    fn responses_parallel_tool_deltas_route_by_output_index() {
+        let sse_payload = concat!(
+            "event: response.output_item.added\ndata: {\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"\"}}\n\n",
+            "event: response.output_item.added\ndata: {\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_2\",\"name\":\"shell_exec\",\"arguments\":\"\"}}\n\n",
+            "event: response.function_call_arguments.delta\ndata: {\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"README.md\\\"}\"}\n\n",
+            "event: response.function_call_arguments.delta\ndata: {\"output_index\":1,\"delta\":\"{\\\"command\\\":\\\"pwd\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\ndata: {\"output_index\":0,\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\ndata: {\"output_index\":1,\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}\n\n",
+            "event: response.completed\ndata: {\"response\":{\"status\":\"completed\"}}\n\n",
+        );
+
+        let mut parser = SseLineParser::new();
+        let mut accumulator = StreamAccumulator::new();
+        for event in parser.feed(sse_payload) {
+            accumulator.apply_all(&parse_stream_event(ProviderFamily::OpenAiResponses, &event));
+        }
+
+        let result = accumulator.finalize();
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].id, "call_1");
+        assert_eq!(result.tool_calls[0].arguments["path"], "README.md");
+        assert_eq!(result.tool_calls[1].id, "call_2");
+        assert_eq!(result.tool_calls[1].arguments["command"], "pwd");
     }
 
     #[test]

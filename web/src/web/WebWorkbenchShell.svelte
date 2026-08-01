@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick, untrack } from 'svelte';
+  import { onMount, tick, untrack, type Component } from 'svelte';
   import App from '../App.svelte';
   import { setWebSidebarContext } from './sidebar-context';
   import Icon from '../components/Icon.svelte';
@@ -18,7 +18,12 @@
     type DesktopDropZone,
   } from '../lib/desktop-file-drop';
   import type { IconName } from '../lib/icons';
-  import { addToast, messagesState, setCurrentSessionId, updateSessions } from '../stores/messages.svelte';
+  import {
+    addToast,
+    messagesState,
+    replaceWorkspaceSessionProjection,
+    setCurrentSessionId,
+  } from '../stores/messages.svelte';
   import {
     directIncidentError,
     incidentErrorDiagnostics,
@@ -32,9 +37,6 @@
   import { normalizeRustBootstrapPayload } from '../shared/bridges/rust-daemon-contract';
   import { i18n } from '../stores/i18n.svelte';
   import type { EditContentKind, Session } from '../types/message';
-  import RightPane from './RightPane.svelte';
-  import ProjectFileTree from './ProjectFileTree.svelte';
-  import WebFolderPicker from './WebFolderPicker.svelte';
   import {
     cycleWebThemePreference,
     subscribeWebTheme,
@@ -131,6 +133,66 @@
   const workspaceSessionRequestSeqByWorkspace = new Map<string, number>();
   const sessionViewedRequests = new Set<string>();
 
+  type WorkspaceFileSelection = { pathRef: string; displayPath: string; name: string };
+  type ProjectFileTreeProps = {
+    rootPath: string;
+    workspaceId: string;
+    title?: string;
+    titlePath?: string;
+    selectedFilePath?: string | null;
+    onFileSelect?: (selection: WorkspaceFileSelection) => void;
+  };
+  type RightPaneProps = { workspaceRoot: string; overlay?: boolean };
+  type WebFolderPickerProps = {
+    title?: string;
+    onSelect: (selection: WorkspaceFileSelection) => void;
+    onCancel: () => void;
+    disabled?: boolean;
+  };
+
+  let ProjectFileTreeComponent = $state<Component<ProjectFileTreeProps> | null>(null);
+  let RightPaneComponent = $state<Component<RightPaneProps> | null>(null);
+  let WebFolderPickerComponent = $state<Component<WebFolderPickerProps> | null>(null);
+  let projectFileTreeLoad: Promise<void> | null = null;
+  let rightPaneLoad: Promise<void> | null = null;
+  let webFolderPickerLoad: Promise<void> | null = null;
+
+  function loadProjectFileTree(): Promise<void> {
+    if (ProjectFileTreeComponent) return Promise.resolve();
+    projectFileTreeLoad ??= import('./ProjectFileTree.svelte')
+      .then((module) => {
+        ProjectFileTreeComponent = module.default;
+      })
+      .finally(() => {
+        projectFileTreeLoad = null;
+      });
+    return projectFileTreeLoad;
+  }
+
+  function loadRightPane(): Promise<void> {
+    if (RightPaneComponent) return Promise.resolve();
+    rightPaneLoad ??= import('./RightPane.svelte')
+      .then((module) => {
+        RightPaneComponent = module.default;
+      })
+      .finally(() => {
+        rightPaneLoad = null;
+      });
+    return rightPaneLoad;
+  }
+
+  function loadWebFolderPicker(): Promise<void> {
+    if (WebFolderPickerComponent) return Promise.resolve();
+    webFolderPickerLoad ??= import('./WebFolderPicker.svelte')
+      .then((module) => {
+        WebFolderPickerComponent = module.default;
+      })
+      .finally(() => {
+        webFolderPickerLoad = null;
+      });
+    return webFolderPickerLoad;
+  }
+
   const INTERNAL_SESSION_NAME_PATTERNS = [
     /^auto-deep-followup-\d+$/i,
     /^auto-governance-resume-\d+$/i,
@@ -194,6 +256,30 @@
     const tab = activeRightPaneState.openTabs.find((t) => t.id === activeRightPaneState.activeTabId);
     if (!tab || tab.kind !== 'code') return '';
     return (tab.payload as CodeTabPayload).filepath;
+  });
+
+  $effect(() => {
+    if (sidebarMode === 'files') {
+      void loadProjectFileTree().catch((error) => {
+        console.error('[WebWorkbenchShell] 文件树加载失败:', error);
+        addToast('error', i18n.t('app.featureLoadFailed'));
+        sidebarMode = 'projects';
+      });
+    }
+    if (rightPaneVisible) {
+      void loadRightPane().catch((error) => {
+        console.error('[WebWorkbenchShell] 右侧面板加载失败:', error);
+        addToast('error', i18n.t('app.featureLoadFailed'));
+        setRightPaneCollapsed(rightPaneState.activeScopeKey, true);
+      });
+    }
+    if (workspaceOnboardingState.open) {
+      void loadWebFolderPicker().catch((error) => {
+        console.error('[WebWorkbenchShell] 工作区选择器加载失败:', error);
+        addToast('error', i18n.t('app.featureLoadFailed'));
+        closeWorkspaceFolderPicker();
+      });
+    }
   });
   const previewIsOverlay = $derived(rightPaneVisible && panelLayout.previewOverlay);
 
@@ -277,16 +363,16 @@
       || '';
   }
 
-  // 列表同步 effect：把 messagesState.sessions 投影到 sessionsByWorkspace[workspaceId]。
+  // 列表同步 effect：只按列表自身的工作区作用域投影，不能用当前草稿工作区推断归属。
   // 与"激活指针同步"正交——删除当前会话时 currentSessionId 会被后端清空，但列表本身的
   // 增删（删除/新建/改名）必须独立地落到 sessionsByWorkspace 上，否则左侧列表不刷新。
   $effect(() => {
-    const authoritativeWorkspaceId = currentBootstrapWorkspaceId();
-    if (!authoritativeWorkspaceId) {
+    const sessionsWorkspaceId = messagesState.workspaceSessionProjection.workspaceId?.trim() || '';
+    if (!sessionsWorkspaceId) {
       return;
     }
-    const currentSessions = Array.isArray(messagesState.sessions) ? messagesState.sessions : [];
-    const existingSessions = sessionsByWorkspace[authoritativeWorkspaceId] ?? [];
+    const currentSessions = messagesState.workspaceSessionProjection.sessions;
+    const existingSessions = sessionsByWorkspace[sessionsWorkspaceId] ?? [];
     const sessionsChanged = existingSessions.length !== currentSessions.length
       || existingSessions.some((session, index) => {
         const next = currentSessions[index];
@@ -302,7 +388,7 @@
     if (sessionsChanged) {
       sessionsByWorkspace = {
         ...sessionsByWorkspace,
-        [authoritativeWorkspaceId]: currentSessions,
+        [sessionsWorkspaceId]: currentSessions,
       };
     }
   });
@@ -351,7 +437,7 @@
         [workspaceId]: nextSessions,
       };
       if (currentBootstrapWorkspaceId() === workspaceId) {
-        updateSessions(nextSessions);
+        replaceWorkspaceSessionProjection(workspaceId, nextSessions);
       }
     }).catch((error) => {
       console.warn('[WebWorkbenchShell] 标记会话已查看失败:', error);
@@ -680,7 +766,7 @@
       const bootstrapSessionId = currentBootstrapSessionIdForWorkspace(authoritativeWorkspaceId);
       if (bootstrapSessionId === resolvedSessionId) {
         currentSessionId = resolvedSessionId;
-        updateSessions(snapshot.sessions);
+        replaceWorkspaceSessionProjection(authoritativeWorkspaceId, snapshot.sessions);
         syncBrowserSessionBinding(authoritativeWorkspaceId, workspaceBindingPath(snapshot.workspace), resolvedSessionId);
         return resolvedSessionId;
       }
@@ -696,7 +782,7 @@
       clearCurrentSessionBeforeWorkspaceChange(authoritativeWorkspaceId);
       messagesState.currentWorkspaceId = authoritativeWorkspaceId;
       messagesState.currentWorkspacePath = workspaceBindingPath(snapshot.workspace);
-      updateSessions(snapshot.sessions);
+      replaceWorkspaceSessionProjection(authoritativeWorkspaceId, snapshot.sessions);
       setCurrentSessionId(null);
     }
     return resolvedSessionId;
@@ -1294,8 +1380,10 @@
 
     clearPendingSessionSwitchState();
     currentSessionId = null;
-    setCurrentSessionId(null);
-    updateSessions(getWorkspaceSessionList(workspaceId));
+
+    if (sessionsAlreadyLoaded) {
+      replaceWorkspaceSessionProjection(workspaceId, getWorkspaceSessionList(workspaceId));
+    }
 
     if (!alreadyCurrentDraft) {
       getClientBridge().postMessage({
@@ -1314,7 +1402,7 @@
         !messagesState.currentSessionId?.trim()
         && currentBootstrapWorkspaceId() === workspaceId
       ) {
-        updateSessions(getWorkspaceSessionList(workspaceId));
+        replaceWorkspaceSessionProjection(workspaceId, getWorkspaceSessionList(workspaceId));
       }
     }
   }
@@ -1449,7 +1537,7 @@
         [authoritativeWorkspaceId]: normalizedSnapshot.sessions,
       };
       if (currentBootstrapWorkspaceId() === authoritativeWorkspaceId) {
-        updateSessions(normalizedSnapshot.sessions);
+        replaceWorkspaceSessionProjection(authoritativeWorkspaceId, normalizedSnapshot.sessions);
       }
       editingSession = null;
       sessionRenameDraft = '';
@@ -2077,17 +2165,21 @@
             <span>{i18n.t('web.projectFilesBack')}</span>
           </button>
         </div>
-        <ProjectFileTree
-          rootPath={selectedWorkspace?.rootPath || ''}
-          workspaceId={selectedWorkspaceId}
-          title={selectedWorkspace?.name || i18n.t('web.projectFiles')}
-          titlePath={selectedWorkspace?.rootPath || ''}
-          selectedFilePath={activeCodeTabFilePath}
-          onFileSelect={(selection) => handleFileSelect(selection.pathRef, {
-            displayPath: selection.displayPath,
-            label: selection.name,
-          })}
-        />
+        {#if ProjectFileTreeComponent}
+          <ProjectFileTreeComponent
+            rootPath={selectedWorkspace?.rootPath || ''}
+            workspaceId={selectedWorkspaceId}
+            title={selectedWorkspace?.name || i18n.t('web.projectFiles')}
+            titlePath={selectedWorkspace?.rootPath || ''}
+            selectedFilePath={activeCodeTabFilePath}
+            onFileSelect={(selection) => handleFileSelect(selection.pathRef, {
+              displayPath: selection.displayPath,
+              label: selection.name,
+            })}
+          />
+        {:else}
+          <div class="sidebar-empty">{i18n.t('common.loading')}</div>
+        {/if}
       </section>
     {/if}
 
@@ -2115,7 +2207,7 @@
       <div class="workbench-app-pane">
         <App />
       </div>
-      {#if rightPaneVisible}
+      {#if rightPaneVisible && RightPaneComponent}
         {#if !previewIsOverlay}
           <div
             class="preview-resize-handle"
@@ -2126,7 +2218,7 @@
             ondblclick={resetPreviewPanelWidth}
           ></div>
         {/if}
-        <RightPane
+        <RightPaneComponent
           workspaceRoot={selectedWorkspace?.rootPath || ''}
           overlay={previewIsOverlay}
         />
@@ -2146,12 +2238,16 @@
     {#if workspaceDialogError}
       <div class="workspace-dialog-error workspace-dialog-error--banner">{workspaceDialogError}</div>
     {/if}
-    <WebFolderPicker
-      title={i18n.t('web.selectWorkspaceFolder')}
-      onSelect={(selection) => void handleFolderSelected(selection)}
-      onCancel={closeAddWorkspaceDialog}
-      disabled={workspaceActionPending}
-    />
+    {#if WebFolderPickerComponent}
+      <WebFolderPickerComponent
+        title={i18n.t('web.selectWorkspaceFolder')}
+        onSelect={(selection) => void handleFolderSelected(selection)}
+        onCancel={closeAddWorkspaceDialog}
+        disabled={workspaceActionPending}
+      />
+    {:else}
+      <div class="sidebar-empty">{i18n.t('common.loading')}</div>
+    {/if}
   </Modal>
 {/if}
 

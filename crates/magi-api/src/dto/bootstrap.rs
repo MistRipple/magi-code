@@ -1,8 +1,7 @@
 use crate::{
-    change_projection::{PendingChangeDto, PendingChangesStateDto},
     dto::{
-        AuditUsageLedgerDto, BridgePreflightSnapshotDto, BridgeServicesSnapshotDto,
-        RuntimeReadModelDto, ServiceInfo, runtime_read_model_dto_with_usage,
+        AuditUsageLedgerDto, RuntimeReadModelDto, ServiceInfo,
+        runtime_read_model_dto_for_session_with_usage, runtime_read_model_dto_with_usage,
     },
     errors::ApiError,
     public_canonical::{public_canonical_turn, public_event_envelope},
@@ -25,6 +24,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 const BOOTSTRAP_TIMELINE_PAGE_SIZE: usize = 50;
+const BOOTSTRAP_CANONICAL_TURN_PAGE_SIZE: usize = 20;
 const BOOTSTRAP_RECENT_EVENT_PAGE_SIZE: usize = 200;
 const RUNTIME_MAINTENANCE_STATUS_EVENT: &str = "system.runtime.maintenance.status";
 
@@ -50,17 +50,13 @@ pub struct BootstrapDto {
     pub recovery_handles: Vec<RecoveryHandle>,
     pub runtime_read_model: RuntimeReadModelDto,
     pub audit_usage_ledger: AuditUsageLedgerDto,
-    pub bridge_services: BridgeServicesSnapshotDto,
-    pub bridge_preflight: BridgePreflightSnapshotDto,
     pub notifications: Vec<NotificationRecord>,
     pub event_stream_next_sequence: u64,
     pub recent_events: Vec<EventEnvelope>,
     pub has_more_before: bool,
     pub before_cursor: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pending_changes: Vec<PendingChangeDto>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_changes_state: Option<PendingChangesStateDto>,
+    pub canonical_has_more_before: bool,
+    pub canonical_before_cursor: Option<String>,
 }
 
 impl BootstrapDto {
@@ -85,36 +81,31 @@ impl BootstrapDto {
         session_projection: SessionProjectionInput,
         event_snapshot: EventStreamSnapshot,
     ) -> Result<Self, ApiError> {
-        let mut dto = Self::from_projection_with_usage(
+        let runtime_session_scope = session_projection.current_session_id.clone();
+        let session_sidecar_exports = runtime_session_scope
+            .as_ref()
+            .and_then(|session_id| state.session_store.execution_sidecar_export(session_id))
+            .into_iter()
+            .collect();
+        let mut dto = Self::from_projection_with_usage_scoped(
             state.runtime_epoch().to_string(),
             state.service_info.clone(),
             session_projection,
             state.workspace_registry.projection_input(),
-            state.session_store.execution_sidecar_exports(),
+            session_sidecar_exports,
             state.workspace_registry.recovery_sidecar_exports(),
             event_snapshot,
             state.event_bus.runtime_read_model_input(),
             state.audit_usage_ledger_dto(),
-            state.bridge_services_dto(),
-            state.bridge_preflight_dto(),
             state.task_store(),
             &state.ledger_usage_observations(),
+            runtime_session_scope.as_ref(),
         );
         crate::dto::apply_configured_model_context_windows(
             &mut dto.runtime_read_model,
             &state.settings_store,
         );
-        if let Some(current_session) = dto.current_session.as_ref() {
-            let pending_projection =
-                crate::change_projection::collect_session_pending_changes_with_state(
-                    state,
-                    &current_session.session_id,
-                    current_session.workspace_id.as_deref(),
-                )?;
-            dto.pending_changes = pending_projection.pending_changes;
-            dto.pending_changes_state = Some(pending_projection.state);
-        }
-        dto.truncate_initial_timeline_page();
+        dto.truncate_initial_history_page();
         Ok(dto)
     }
 
@@ -129,8 +120,6 @@ impl BootstrapDto {
         event_snapshot: EventStreamSnapshot,
         runtime_read_model: RuntimeReadModelInput,
         audit_usage_ledger: AuditUsageLedgerDto,
-        bridge_services: BridgeServicesSnapshotDto,
-        bridge_preflight: BridgePreflightSnapshotDto,
         task_store: Option<&magi_orchestrator::task_store::TaskStore>,
     ) -> Self {
         Self::from_projection_with_usage(
@@ -143,8 +132,6 @@ impl BootstrapDto {
             event_snapshot,
             runtime_read_model,
             audit_usage_ledger,
-            bridge_services,
-            bridge_preflight,
             task_store,
             &BTreeMap::new(),
         )
@@ -163,10 +150,39 @@ impl BootstrapDto {
         event_snapshot: EventStreamSnapshot,
         runtime_read_model: RuntimeReadModelInput,
         audit_usage_ledger: AuditUsageLedgerDto,
-        bridge_services: BridgeServicesSnapshotDto,
-        bridge_preflight: BridgePreflightSnapshotDto,
         task_store: Option<&magi_orchestrator::task_store::TaskStore>,
         ledger_usage_observations: &BTreeMap<String, SessionRuntimeUsageObservation>,
+    ) -> Self {
+        Self::from_projection_with_usage_scoped(
+            runtime_epoch,
+            service,
+            session_projection,
+            workspace_projection,
+            session_sidecar_exports,
+            workspace_sidecar_exports,
+            event_snapshot,
+            runtime_read_model,
+            audit_usage_ledger,
+            task_store,
+            ledger_usage_observations,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_projection_with_usage_scoped(
+        runtime_epoch: String,
+        service: ServiceInfo,
+        session_projection: SessionProjectionInput,
+        workspace_projection: WorkspaceProjectionInput,
+        session_sidecar_exports: Vec<SessionRuntimeSidecarExport>,
+        workspace_sidecar_exports: Vec<WorkspaceRecoverySidecarExport>,
+        event_snapshot: EventStreamSnapshot,
+        runtime_read_model: RuntimeReadModelInput,
+        audit_usage_ledger: AuditUsageLedgerDto,
+        task_store: Option<&magi_orchestrator::task_store::TaskStore>,
+        ledger_usage_observations: &BTreeMap<String, SessionRuntimeUsageObservation>,
+        runtime_session_scope: Option<&SessionId>,
     ) -> Self {
         let current_session =
             session_projection
@@ -186,14 +202,25 @@ impl BootstrapDto {
                 .map(public_event_envelope)
                 .map(public_bootstrap_event_envelope)
                 .collect();
-        let runtime_read_model = runtime_read_model_dto_with_usage(
-            runtime_read_model,
-            &session_sidecar_exports,
-            &workspace_sidecar_exports,
-            audit_usage_ledger.clone(),
-            task_store,
-            ledger_usage_observations,
-        );
+        let runtime_read_model = match runtime_session_scope {
+            Some(session_id) => runtime_read_model_dto_for_session_with_usage(
+                runtime_read_model,
+                session_id,
+                &session_sidecar_exports,
+                &workspace_sidecar_exports,
+                audit_usage_ledger.clone(),
+                task_store,
+                ledger_usage_observations,
+            ),
+            None => runtime_read_model_dto_with_usage(
+                runtime_read_model,
+                &session_sidecar_exports,
+                &workspace_sidecar_exports,
+                audit_usage_ledger.clone(),
+                task_store,
+                ledger_usage_observations,
+            ),
+        };
 
         let mut dto = Self {
             agent: BootstrapAgentDto { runtime_epoch },
@@ -213,33 +240,44 @@ impl BootstrapDto {
             recovery_handles: workspace_projection.recovery_handles,
             runtime_read_model,
             audit_usage_ledger,
-            bridge_services,
-            bridge_preflight,
             notifications: session_projection.notifications,
             event_stream_next_sequence: event_snapshot.next_sequence,
             recent_events,
             has_more_before: false,
             before_cursor: None,
-            pending_changes: Vec::new(),
-            pending_changes_state: None,
+            canonical_has_more_before: false,
+            canonical_before_cursor: None,
         };
         dto.prune_initial_load_runtime_details();
         dto
     }
 
-    fn truncate_initial_timeline_page(&mut self) {
-        if self.timeline.len() <= BOOTSTRAP_TIMELINE_PAGE_SIZE {
-            self.has_more_before = false;
-            self.before_cursor = self.timeline.first().map(|entry| entry.entry_id.clone());
-            return;
+    fn truncate_initial_history_page(&mut self) {
+        let timeline_has_more_before = self.timeline.len() > BOOTSTRAP_TIMELINE_PAGE_SIZE;
+        if timeline_has_more_before {
+            let start = self
+                .timeline
+                .len()
+                .saturating_sub(BOOTSTRAP_TIMELINE_PAGE_SIZE);
+            self.timeline = self.timeline.split_off(start);
         }
-        let start = self
-            .timeline
-            .len()
-            .saturating_sub(BOOTSTRAP_TIMELINE_PAGE_SIZE);
-        self.timeline = self.timeline.split_off(start);
-        self.has_more_before = true;
         self.before_cursor = self.timeline.first().map(|entry| entry.entry_id.clone());
+
+        let canonical_has_more_before =
+            self.canonical_turns.len() > BOOTSTRAP_CANONICAL_TURN_PAGE_SIZE;
+        if canonical_has_more_before {
+            let start = self
+                .canonical_turns
+                .len()
+                .saturating_sub(BOOTSTRAP_CANONICAL_TURN_PAGE_SIZE);
+            self.canonical_turns = self.canonical_turns.split_off(start);
+        }
+        self.canonical_before_cursor = self
+            .canonical_turns
+            .first()
+            .map(|turn| turn.turn_id.clone());
+        self.canonical_has_more_before = canonical_has_more_before;
+        self.has_more_before = timeline_has_more_before || canonical_has_more_before;
     }
 
     fn prune_initial_load_runtime_details(&mut self) {
@@ -576,8 +614,9 @@ mod tests {
             bootstrap.audit_usage_ledger.audit_count,
             bootstrap.runtime_read_model.meta.ledger.audit_count
         );
-        assert!(bootstrap.bridge_services.services.is_empty());
-        assert!(bootstrap.bridge_preflight.services.is_empty());
+        let value = serde_json::to_value(&bootstrap).expect("bootstrap should serialize");
+        assert!(value.get("bridgeServices").is_none());
+        assert!(value.get("bridgePreflight").is_none());
     }
 
     #[test]
@@ -620,8 +659,6 @@ mod tests {
             EventStreamSnapshot::default(),
             RuntimeReadModelInput::default(),
             AuditUsageLedgerDto::default(),
-            BridgeServicesSnapshotDto::default(),
-            BridgePreflightSnapshotDto::default(),
             None,
         );
 
@@ -735,8 +772,6 @@ mod tests {
             event_snapshot,
             RuntimeReadModelInput::default(),
             AuditUsageLedgerDto::default(),
-            BridgeServicesSnapshotDto::default(),
-            BridgePreflightSnapshotDto::default(),
             None,
         );
 
@@ -861,8 +896,6 @@ mod tests {
             event_snapshot,
             RuntimeReadModelInput::default(),
             AuditUsageLedgerDto::default(),
-            BridgeServicesSnapshotDto::default(),
-            BridgePreflightSnapshotDto::default(),
             None,
         );
 
@@ -894,8 +927,6 @@ mod tests {
             EventStreamSnapshot::default(),
             read_model,
             AuditUsageLedgerDto::default(),
-            BridgeServicesSnapshotDto::default(),
-            BridgePreflightSnapshotDto::default(),
             None,
         );
 
@@ -938,8 +969,6 @@ mod tests {
             EventStreamSnapshot::default(),
             read_model,
             AuditUsageLedgerDto::default(),
-            BridgeServicesSnapshotDto::default(),
-            BridgePreflightSnapshotDto::default(),
             None,
         );
 
@@ -990,8 +1019,6 @@ mod tests {
             EventStreamSnapshot::default(),
             read_model,
             audit_usage_ledger,
-            BridgeServicesSnapshotDto::default(),
-            BridgePreflightSnapshotDto::default(),
             None,
         );
 
@@ -1040,8 +1067,6 @@ mod tests {
                 persistence_path: None,
                 last_persist_error: None,
             }),
-            BridgeServicesSnapshotDto::default(),
-            BridgePreflightSnapshotDto::default(),
             None,
         );
 
@@ -1228,7 +1253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_pending_changes_uses_summary_payload() {
+    async fn bootstrap_excludes_pending_changes_projection() {
         let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(32));
         let session_store = Arc::new(SessionStore::default());
         let workspace_store = Arc::new(WorkspaceStore::default());
@@ -1273,67 +1298,9 @@ mod tests {
         let bootstrap = BootstrapDto::from_state_with_selected_session(&state, Some(&session_id))
             .expect("bootstrap should build");
 
-        assert_eq!(bootstrap.pending_changes.len(), 1);
-        let change = &bootstrap.pending_changes[0];
-        assert_eq!(change.file_path, "alpha.txt");
-        assert_eq!(change.additions, 1);
-        assert_eq!(change.deletions, 1);
-        assert!(change.diff.is_empty());
-        assert!(change.original_content.is_none());
-        assert!(change.preview_content.is_none());
-
-        let _ = fs::remove_dir_all(workspace_root);
-    }
-
-    #[test]
-    fn bootstrap_marks_pending_changes_not_ready_when_snapshot_session_is_missing() {
-        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(32));
-        let session_store = Arc::new(SessionStore::default());
-        let workspace_store = Arc::new(WorkspaceStore::default());
-        let governance = Arc::new(GovernanceService::default());
-        let workspace_root = std::env::temp_dir().join(format!(
-            "magi-bootstrap-pending-state-{}",
-            UtcMillis::now().0
-        ));
-        fs::create_dir_all(&workspace_root).expect("workspace root should create");
-        workspace_store
-            .register(
-                WorkspaceId::new("workspace-pending-state"),
-                AbsolutePath::new(workspace_root.to_string_lossy().to_string()),
-            )
-            .expect("workspace should register");
-        let state = ApiState::new(
-            "magi",
-            event_bus,
-            session_store.clone(),
-            workspace_store,
-            governance,
-        );
-
-        let session_id = SessionId::new("session-pending-state");
-        session_store
-            .create_session_for_workspace(
-                session_id.clone(),
-                "Pending State",
-                Some("workspace-pending-state".to_string()),
-            )
-            .expect("session should be creatable");
-
-        let bootstrap = BootstrapDto::from_state_with_selected_session(&state, Some(&session_id))
-            .expect("bootstrap should build");
-
-        assert!(bootstrap.pending_changes.is_empty());
-        let state = bootstrap
-            .pending_changes_state
-            .expect("bootstrap should expose pending changes state");
-        assert_eq!(state.status, "not_ready");
-        assert_eq!(state.reason_code.as_deref(), Some("changes_preparing"));
-        assert_eq!(state.pending_count, 0);
-        assert_eq!(state.session_id.as_deref(), Some("session-pending-state"));
-        assert_eq!(
-            state.workspace_id.as_deref(),
-            Some("workspace-pending-state")
-        );
+        let value = serde_json::to_value(bootstrap).expect("bootstrap should serialize");
+        assert!(value.get("pendingChanges").is_none());
+        assert!(value.get("pendingChangesState").is_none());
 
         let _ = fs::remove_dir_all(workspace_root);
     }

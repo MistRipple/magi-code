@@ -101,6 +101,40 @@ export function replaceCanonicalSessionTurns(
   return publishProjection();
 }
 
+export function prependCanonicalSessionTurns(
+  sessionId: string,
+  turns: CanonicalTurn[],
+): SessionTimelineProjection | null {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  if (!normalizedSessionId || turnStoreState.reducer.sessionId !== normalizedSessionId) {
+    return turnStoreState.projection;
+  }
+  const byTurnId = new Map(turns
+    .filter((turn) => turn.sessionId === normalizedSessionId)
+    .map((turn) => [turn.turnId, turn] as const));
+  for (const turn of turnStoreState.reducer.turns) {
+    byTurnId.set(turn.turnId, turn);
+  }
+  turnStoreState.reducer = {
+    ...turnStoreState.reducer,
+    turns: [...byTurnId.values()]
+      .map((turn) => ({
+        ...turn,
+        items: turn.items.map((item) => ({
+          ...item,
+          blocks: Array.isArray(item.blocks) ? [...item.blocks] : undefined,
+          tool: item.tool ? { ...item.tool } : undefined,
+          worker: item.worker ? { ...item.worker } : undefined,
+          visibility: { ...item.visibility },
+          metadata: item.metadata ? { ...item.metadata } : undefined,
+        })),
+      }))
+      .sort((left, right) => left.turnSeq - right.turnSeq || left.turnId.localeCompare(right.turnId)),
+  };
+  turnStoreState.lastError = null;
+  return publishProjection();
+}
+
 export function clearCanonicalSessionTurns(sessionId?: string): void {
   const nextSessionId = normalizeSessionId(sessionId);
   turnStoreState.reducer = createCanonicalTurnReducerState(nextSessionId);

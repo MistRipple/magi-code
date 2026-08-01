@@ -5164,7 +5164,7 @@ done
     }
 
     #[tokio::test]
-    async fn daemon_bootstrap_exports_bridge_services_and_preflight_snapshots() {
+    async fn daemon_exposes_bridge_diagnostics_outside_bootstrap() {
         for binary_name in ["model_bridge_loopback", "mcp_bridge_loopback"] {
             let path = test_bridge_binary_path(binary_name);
             assert!(
@@ -5186,21 +5186,21 @@ done
         let bridge_services = get_json(app.clone(), "/bridges/services").await;
         let bridge_preflight = get_json(app, "/bridges/preflight").await;
 
-        assert_eq!(bootstrap["bridgeServices"], bridge_services);
-        assert_eq!(bootstrap["bridgePreflight"], bridge_preflight);
+        assert!(bootstrap.get("bridgeServices").is_none());
+        assert!(bootstrap.get("bridgePreflight").is_none());
 
-        let services = service_entries_by_kind(&bootstrap["bridgeServices"]);
+        let services = service_entries_by_kind(&bridge_services);
         assert_eq!(
             services.len(),
             2,
-            "unexpected bootstrap bridge services: {bootstrap:?}"
+            "unexpected bridge services: {bridge_services:?}"
         );
 
-        let preflight = service_entries_by_kind(&bootstrap["bridgePreflight"]);
+        let preflight = service_entries_by_kind(&bridge_preflight);
         assert_eq!(
             preflight.len(),
             2,
-            "unexpected bootstrap bridge preflight: {bootstrap:?}"
+            "unexpected bridge preflight: {bridge_preflight:?}"
         );
     }
 }

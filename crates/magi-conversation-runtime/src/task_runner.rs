@@ -122,7 +122,12 @@ impl TaskRunner {
             if !active_leases.is_empty() {
                 return RunCycleOutcome::Continue;
             }
-            return RunCycleOutcome::Stalled(self.collect_non_terminal_task_ids(root_task_id));
+            let task_ids = self.collect_non_terminal_task_ids(root_task_id);
+            return if task_ids.is_empty() {
+                RunCycleOutcome::Waiting
+            } else {
+                RunCycleOutcome::Unrunnable(task_ids)
+            };
         }
 
         let mut dispatched = 0usize;
@@ -200,12 +205,14 @@ impl TaskRunner {
                 task_ids: vec![task_id],
                 reason,
             }
+        } else if unmatched.is_empty() {
+            RunCycleOutcome::Waiting
         } else {
-            RunCycleOutcome::Stalled(unmatched)
+            RunCycleOutcome::Unrunnable(unmatched)
         }
     }
 
-    pub fn finalize_stalled_outcome(
+    pub fn finalize_unrunnable_outcome(
         &self,
         _root_task_id: &TaskId,
         task_ids: &[TaskId],
@@ -218,7 +225,7 @@ impl TaskRunner {
                     self.store.revoke_lease(task_id, &lease.lease_id);
                 }
                 self.store
-                    .set_output_refs(task_id, vec![self.stalled_task_reason(&task)]);
+                    .set_output_refs(task_id, vec![self.unrunnable_task_reason(&task)]);
                 self.store
                     .update_status(task_id, TaskStatus::Failed)
                     .map_err(|error| format!("收口不可运行任务 {task_id} 失败: {error}"))?;
@@ -256,7 +263,7 @@ impl TaskRunner {
         Ok(())
     }
 
-    fn stalled_task_reason(&self, task: &Task) -> String {
+    fn unrunnable_task_reason(&self, task: &Task) -> String {
         let role = resolve_task_role(task, &self.agent_role_registry)
             .or_else(|| task.executor_binding_target_role())
             .unwrap_or("unknown");
@@ -576,6 +583,31 @@ mod tests {
             TaskStatus::Pending
         );
         assert!(store.get_active_lease(&root.task_id).is_none());
+    }
+
+    #[test]
+    fn unmatched_task_is_reported_as_unrunnable() {
+        let store = Arc::new(TaskStore::new());
+        let root = test_task("task-root-unmatched", "task-root-unmatched", None);
+        store.insert_task(root.clone());
+        let runner = TaskRunner::with_dispatcher(
+            Arc::clone(&store),
+            Vec::new(),
+            Arc::new(RejectingDispatcher),
+            Arc::new(EventBasedResultReceiver::new()),
+        );
+
+        assert_eq!(
+            runner.run_cycle(&root.task_id),
+            RunCycleOutcome::Unrunnable(vec![root.task_id.clone()])
+        );
+        assert_eq!(
+            store
+                .get_task(&root.task_id)
+                .expect("task should remain available for failure reporting")
+                .status,
+            TaskStatus::Pending
+        );
     }
 
     #[test]

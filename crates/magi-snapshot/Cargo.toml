@@ -16,4 +16,5 @@ ignore.workspace = true
 similar.workspace = true
 
 [dev-dependencies]
+magi-process = { path = "../magi-process" }
 tempfile = "3"

@@ -1,14 +1,10 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, type Component } from 'svelte';
   import Header from './components/Header.svelte';
   import TopTabs from './components/TopTabs.svelte';
   import ThreadPanel from './components/ThreadPanel.svelte';
-  import EditsPanel from './components/EditsPanel.svelte';
-  import KnowledgePanel from './components/KnowledgePanel.svelte';
-  import SettingsPanel from './components/SettingsPanel.svelte';
   import ToastContainer from './components/ToastContainer.svelte';
   import Icon from './components/Icon.svelte';
-  import DesktopRuntimeRecovery from './components/DesktopRuntimeRecovery.svelte';
   import { isDesktopRuntime } from './lib/desktop-updater';
   import {
     addToast,
@@ -38,6 +34,62 @@
 
   // 设置面板是否打开
   let settingsOpen = $state(false);
+  let EditsPanelComponent = $state<Component | null>(null);
+  let KnowledgePanelComponent = $state<Component | null>(null);
+  let SettingsPanelComponent = $state<Component<{ onClose: () => void }> | null>(null);
+  let DesktopRuntimeRecoveryComponent = $state<Component | null>(null);
+  let editsPanelLoad: Promise<void> | null = null;
+  let knowledgePanelLoad: Promise<void> | null = null;
+  let settingsPanelLoad: Promise<void> | null = null;
+  let desktopRecoveryLoad: Promise<void> | null = null;
+
+  function loadEditsPanel(): Promise<void> {
+    if (EditsPanelComponent) return Promise.resolve();
+    editsPanelLoad ??= import('./components/EditsPanel.svelte')
+      .then((module) => {
+        EditsPanelComponent = module.default;
+      })
+      .finally(() => {
+        editsPanelLoad = null;
+      });
+    return editsPanelLoad;
+  }
+
+  function loadKnowledgePanel(): Promise<void> {
+    if (KnowledgePanelComponent) return Promise.resolve();
+    knowledgePanelLoad ??= import('./components/KnowledgePanel.svelte')
+      .then((module) => {
+        KnowledgePanelComponent = module.default;
+      })
+      .finally(() => {
+        knowledgePanelLoad = null;
+      });
+    return knowledgePanelLoad;
+  }
+
+  function loadSettingsPanel(): Promise<void> {
+    if (SettingsPanelComponent) return Promise.resolve();
+    settingsPanelLoad ??= import('./components/SettingsPanel.svelte')
+      .then((module) => {
+        SettingsPanelComponent = module.default;
+      })
+      .finally(() => {
+        settingsPanelLoad = null;
+      });
+    return settingsPanelLoad;
+  }
+
+  function loadDesktopRuntimeRecovery(): Promise<void> {
+    if (DesktopRuntimeRecoveryComponent) return Promise.resolve();
+    desktopRecoveryLoad ??= import('./components/DesktopRuntimeRecovery.svelte')
+      .then((module) => {
+        DesktopRuntimeRecoveryComponent = module.default;
+      })
+      .finally(() => {
+        desktopRecoveryLoad = null;
+      });
+    return desktopRecoveryLoad;
+  }
 
   // 启动连接状态：启动数据尚未就绪时显示等待提示
   const isBootstrapping = $derived(!messagesState.bootstrapped);
@@ -54,6 +106,11 @@
 
   function openSettings() {
     settingsOpen = true;
+    void loadSettingsPanel().catch((error) => {
+      console.error('[App] 设置面板加载失败:', error);
+      settingsOpen = false;
+      addToast('error', i18n.t('app.featureLoadFailed'));
+    });
   }
 
   function closeSettings() {
@@ -97,6 +154,30 @@
   $effect(() => {
     if (messagesState.bootstrapped) {
       bootstrapConnectionFailed = false;
+    }
+  });
+
+  $effect(() => {
+    if (currentTopTab === 'edits') {
+      void loadEditsPanel().catch((error) => {
+        console.error('[App] 变更面板加载失败:', error);
+        addToast('error', i18n.t('app.featureLoadFailed'));
+        setCurrentTopTab('thread');
+      });
+    } else if (currentTopTab === 'knowledge') {
+      void loadKnowledgePanel().catch((error) => {
+        console.error('[App] 知识面板加载失败:', error);
+        addToast('error', i18n.t('app.featureLoadFailed'));
+        setCurrentTopTab('thread');
+      });
+    }
+  });
+
+  $effect(() => {
+    if (showDesktopRecovery) {
+      void loadDesktopRuntimeRecovery().catch((error) => {
+        console.error('[App] 桌面恢复面板加载失败:', error);
+      });
     }
   });
 
@@ -207,8 +288,8 @@
     {#if isBootstrapping || runtimeRecoveryVisible}
       <!-- 启动连接等待层：启动数据尚未就绪 -->
       <div class="bootstrap-overlay">
-        {#if showDesktopRecovery}
-          <DesktopRuntimeRecovery />
+        {#if showDesktopRecovery && DesktopRuntimeRecoveryComponent}
+          <DesktopRuntimeRecoveryComponent />
         {:else}
           <div class="bootstrap-content" class:error={bootstrapConnectionFailed}>
             <div class="bootstrap-spinner" class:static={bootstrapConnectionFailed}>
@@ -229,19 +310,31 @@
     </div>
     <div class="top-tab-pane" class:active={currentTopTab === 'edits'}>
       {#if currentTopTab === 'edits'}
-        <EditsPanel />
+        {#if EditsPanelComponent}
+          <EditsPanelComponent />
+        {:else}
+          <div class="lazy-panel-loading" role="status"><Icon name="loader" size={18} /><span>{i18n.t('common.loading')}</span></div>
+        {/if}
       {/if}
     </div>
     <div class="top-tab-pane" class:active={currentTopTab === 'knowledge'}>
       {#if currentTopTab === 'knowledge'}
-        <KnowledgePanel />
+        {#if KnowledgePanelComponent}
+          <KnowledgePanelComponent />
+        {:else}
+          <div class="lazy-panel-loading" role="status"><Icon name="loader" size={18} /><span>{i18n.t('common.loading')}</span></div>
+        {/if}
       {/if}
     </div>
   </div>
 
   <!-- 设置面板（覆盖层） -->
   {#if settingsOpen}
-    <SettingsPanel onClose={closeSettings} />
+    {#if SettingsPanelComponent}
+      <SettingsPanelComponent onClose={closeSettings} />
+    {:else}
+      <div class="lazy-settings-loading" role="status"><Icon name="loader" size={22} /><span>{i18n.t('common.loading')}</span></div>
+    {/if}
   {/if}
   <!-- Toast 通知容器 -->
   <ToastContainer />
@@ -264,6 +357,33 @@
     display: flex;
     flex-direction: column;
     position: relative;
+  }
+
+  .lazy-panel-loading,
+  .lazy-settings-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    color: var(--foreground-muted);
+    font-size: var(--text-sm);
+  }
+
+  .lazy-panel-loading {
+    width: 100%;
+    height: 100%;
+  }
+
+  .lazy-settings-loading {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    background: var(--background);
+  }
+
+  .lazy-panel-loading :global(svg),
+  .lazy-settings-loading :global(svg) {
+    animation: bootstrap-spin 1s linear infinite;
   }
 
   /* 启动连接等待覆盖层 */

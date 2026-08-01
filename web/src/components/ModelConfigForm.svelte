@@ -133,14 +133,31 @@
     }
     return i18n.t('settings.model.fetchModelList');
   }
+
+  function protocolEndpointPath(protocol: string): string {
+    if (protocol === 'openai_responses') return '/v1/responses';
+    if (protocol === 'anthropic_messages') return '/v1/messages';
+    return '/v1/chat/completions';
+  }
+
+  function protocolEndpointLabel(): string {
+    const baseUrl = String(config.baseUrl ?? '').trim();
+    if (config.urlMode === 'full') {
+      return baseUrl || i18n.t('settings.model.protocol.fullEndpoint');
+    }
+    return protocolEndpointPath(config.apiProtocol);
+  }
+
+  function protocolBehaviorKey(protocol: string): string {
+    if (protocol === 'openai_responses') return 'settings.model.protocol.openaiResponsesBehavior';
+    if (protocol === 'anthropic_messages') return 'settings.model.protocol.anthropicMessagesBehavior';
+    return 'settings.model.protocol.openaiChatBehavior';
+  }
 </script>
 
 <!-- svelte-ignore a11y_label_has_associated_control -->
 <div class="llm-config-form" oninput={markUserEdited} onchange={markUserEdited}>
-  <div
-    class="llm-config-field-row url-mode-row"
-    class:has-protocol={showProtocolField}
-  >
+  <div class="llm-config-field-row url-mode-row">
     <div class="llm-config-field">
       <label class="llm-config-label">{i18n.t('settings.model.field.baseUrl')}</label>
       <input
@@ -176,30 +193,36 @@
         </div>
       {/if}
     </div>
-    {#if showProtocolField}
-      <div class="llm-config-field llm-config-field--compact">
-        <label class="llm-config-label">{i18n.t('settings.model.field.apiProtocol')}</label>
-        <div class="segmented-control" title={i18n.t('settings.model.protocolHint')}>
-          <button
-            type="button"
-            class="segmented-control__option"
-            class:active={config.apiProtocol === 'openai_chat'}
-            onclick={() => { config.apiProtocol = 'openai_chat'; markUserEdited(); }}
-          >
-            {i18n.t('settings.model.protocol.openai')}
-          </button>
-          <button
-            type="button"
-            class="segmented-control__option"
-            class:active={config.apiProtocol === 'anthropic_messages'}
-            onclick={() => { config.apiProtocol = 'anthropic_messages'; markUserEdited(); }}
-          >
-            {i18n.t('settings.model.protocol.anthropic')}
-          </button>
+  </div>
+
+  {#if showProtocolField}
+    <div class="llm-config-field protocol-field">
+      <label class="llm-config-label">{i18n.t('settings.model.field.apiProtocol')}</label>
+      <div class="protocol-control-row">
+        <select
+          class="llm-config-select protocol-select"
+          bind:value={config.apiProtocol}
+          aria-label={i18n.t('settings.model.field.apiProtocol')}
+          title={i18n.t('settings.model.protocolHint')}
+        >
+          <option value="openai_responses">{i18n.t('settings.model.protocol.openaiResponses')}</option>
+          <option value="openai_chat">{i18n.t('settings.model.protocol.openaiChat')}</option>
+          <option value="anthropic_messages">{i18n.t('settings.model.protocol.anthropicMessages')}</option>
+        </select>
+        <div
+          class="protocol-endpoint"
+          aria-live="polite"
+          title={`POST ${protocolEndpointLabel()}`}
+        >
+          <span class="protocol-endpoint__label">{i18n.t('settings.model.protocol.endpoint')}</span>
+          <code>POST {protocolEndpointLabel()}</code>
         </div>
       </div>
-    {/if}
-  </div>
+      <div class="protocol-behavior" role="note">
+        {i18n.t(protocolBehaviorKey(config.apiProtocol))}
+      </div>
+    </div>
+  {/if}
 
   <div
     class="llm-config-field-row credentials-row"
@@ -380,9 +403,6 @@
     grid-template-columns: minmax(0, 1fr) 180px;
     align-items: end;
   }
-  .llm-config-field-row.url-mode-row.has-protocol {
-    grid-template-columns: minmax(0, 1fr) 180px 220px;
-  }
 
   .llm-config-label {
     font-size: var(--text-sm);
@@ -398,6 +418,55 @@
     font-size: var(--text-xs);
     line-height: 1.4;
     color: var(--foreground-muted);
+  }
+
+  .protocol-field {
+    gap: var(--space-2);
+  }
+
+  .protocol-control-row {
+    display: grid;
+    grid-template-columns: minmax(230px, 300px) minmax(0, 1fr);
+    gap: var(--space-3);
+    align-items: center;
+  }
+
+  .protocol-select {
+    min-width: 0;
+  }
+
+  .protocol-endpoint {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+    min-height: var(--btn-height-md);
+    padding: 0 var(--space-3);
+    border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--surface-2) 78%, transparent);
+  }
+
+  .protocol-endpoint__label {
+    flex: 0 0 auto;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+  }
+
+  .protocol-endpoint code {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--foreground);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .protocol-behavior {
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    line-height: 1.45;
   }
 
   .llm-config-input,
@@ -614,8 +683,10 @@
     .llm-config-field-row.credentials-row,
     .llm-config-field-row.credentials-row.has-level,
     .llm-config-field-row.credentials-row.key-only,
-    .llm-config-field-row.url-mode-row,
-    .llm-config-field-row.url-mode-row.has-protocol {
+    .llm-config-field-row.url-mode-row {
+      grid-template-columns: 1fr;
+    }
+    .protocol-control-row {
       grid-template-columns: 1fr;
     }
   }
@@ -644,8 +715,10 @@
     .llm-config-field-row.credentials-row,
     .llm-config-field-row.credentials-row.has-level,
     .llm-config-field-row.credentials-row.key-only,
-    .llm-config-field-row.url-mode-row,
-    .llm-config-field-row.url-mode-row.has-protocol {
+    .llm-config-field-row.url-mode-row {
+      grid-template-columns: 1fr;
+    }
+    .protocol-control-row {
       grid-template-columns: 1fr;
     }
   }

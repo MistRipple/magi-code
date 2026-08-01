@@ -145,46 +145,8 @@ pub(super) fn save_orchestrator_session_override_for_session(
     let next_fields = next_config
         .as_object_mut()
         .expect("session orchestrator config should be object");
-    let current_model = next_fields
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    let existing_previous_model = next_fields
-        .get("previousModel")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    let switch_was_pending = next_fields
-        .get("modelSwitchPending")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     for (key, value) in override_fields {
         next_fields.insert(key.clone(), value.clone());
-    }
-    let next_model = next_fields
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    if current_model != next_model {
-        let verified_model = if switch_was_pending {
-            existing_previous_model
-        } else {
-            current_model
-        };
-        if let (Some(verified_model), Some(next_model)) = (verified_model, next_model) {
-            if verified_model == next_model {
-                next_fields.remove("previousModel");
-                next_fields.remove("modelSwitchPending");
-            } else {
-                next_fields.insert("previousModel".to_string(), Value::String(verified_model));
-                next_fields.insert("modelSwitchPending".to_string(), Value::Bool(true));
-            }
-        }
     }
     let reasoning_effort_is_valid = next_fields
         .get("reasoningEffort")
@@ -390,7 +352,7 @@ async fn fetch_model_ids_for_config(
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     match config.api_protocol() {
-        HttpModelBridgeProtocol::ChatCompletions => {
+        HttpModelBridgeProtocol::ChatCompletions | HttpModelBridgeProtocol::Responses => {
             let auth_value = HeaderValue::from_str(&format!("Bearer {}", api_key))
                 .map_err(|_| ApiError::InvalidInput("apiKey 包含非法字符".to_string()))?;
             headers.insert(AUTHORIZATION, auth_value);
@@ -1328,13 +1290,50 @@ async fn save_safeguard_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let normalized =
+    let mut normalized =
         crate::state::normalize_safeguard_config_value(scoped_settings_section_request(&request)?);
+    let expected_revision = normalized
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| ApiError::InvalidInput("安全防护配置缺少 revision".to_string()))?;
+    let current = state.settings_store.get_section("safeguardConfig");
+    let current_revision = current
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if expected_revision != current_revision {
+        return Err(ApiError::Conflict(format!(
+            "安全防护配置已被其他窗口更新，请刷新后重试（expected={expected_revision}, actual={current_revision}）"
+        )));
+    }
+    let next_revision = current_revision.saturating_add(1);
+    normalized["revision"] = serde_json::Value::from(next_revision);
     state
         .settings_store
-        .set_section("safeguardConfig", normalized)
+        .set_section("safeguardConfig", normalized.clone())
         .map_err(settings_persistence_error)?;
-    Ok(Json(serde_json::json!({ "saved": true })))
+    state.event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-safeguard-config-updated-{}",
+                UtcMillis::now().0
+            )),
+            "settings.safeguard.updated",
+            serde_json::json!({
+                "revision": next_revision,
+                "rule_count": normalized
+                    .get("rules")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len),
+            }),
+        )
+        .with_context(EventContext::default()),
+    );
+    Ok(Json(serde_json::json!({
+        "saved": true,
+        "revision": next_revision,
+        "config": normalized,
+    })))
 }
 
 async fn list_role_templates(
@@ -1923,6 +1922,60 @@ mod tests {
         )
     }
 
+    async fn openai_responses_probe_stub(
+        headers: HeaderMap,
+        Json(payload): Json<Value>,
+    ) -> impl axum::response::IntoResponse {
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-key")
+        );
+        assert_eq!(payload["model"], json!("gpt-5-test"));
+        assert_eq!(payload["input"][0]["type"], json!("message"));
+        assert_eq!(
+            payload["input"][0]["content"][0]["type"],
+            json!("input_text")
+        );
+        (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "text/event-stream")],
+            concat!(
+                "event: response.output_text.delta\n",
+                "data: {\"delta\":\"pong\"}\n\n",
+                "event: response.completed\n",
+                "data: {\"response\":{\"status\":\"completed\"}}\n\n",
+            ),
+        )
+    }
+
+    async fn full_path_openai_probe_stub(
+        axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+        headers: HeaderMap,
+        Json(payload): Json<Value>,
+    ) -> impl axum::response::IntoResponse {
+        assert_eq!(
+            uri.path_and_query().map(|value| value.as_str()),
+            Some("/custom/model/invoke/?api-version=2026-07-31")
+        );
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-key")
+        );
+        assert_eq!(payload["model"], json!("custom-model"));
+        (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "text/event-stream")],
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"pong\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            ),
+        )
+    }
+
     async fn rejected_probe_stub() -> (StatusCode, Json<Value>) {
         (
             StatusCode::UNAUTHORIZED,
@@ -2004,6 +2057,66 @@ mod tests {
         execute_connection_probe(&config)
             .await
             .expect("anthropic probe should succeed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connection_probe_supports_openai_responses_api() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("stub addr should exist")
+        );
+        let app = Router::new().route("/v1/responses", post(openai_responses_probe_stub));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("stub server should run");
+        });
+
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": base_url,
+            "apiKey": "test-key",
+            "model": "gpt-5-test",
+            "urlMode": "standard",
+            "apiProtocol": "openai_responses"
+        }))
+        .expect("模型配置应符合 Responses 协议");
+        execute_connection_probe(&config)
+            .await
+            .expect("Responses probe should succeed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connection_probe_preserves_full_endpoint_path_and_query() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub listener should bind");
+        let endpoint = format!(
+            "http://{}/custom/model/invoke/?api-version=2026-07-31",
+            listener.local_addr().expect("stub addr should exist")
+        );
+        let app = Router::new().route("/custom/model/invoke/", post(full_path_openai_probe_stub));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("stub server should run");
+        });
+
+        let config = NormalizedModelConfig::from_settings_value(&json!({
+            "baseUrl": endpoint,
+            "apiKey": "test-key",
+            "model": "custom-model",
+            "urlMode": "full",
+            "apiProtocol": "openai_chat"
+        }))
+        .expect("完整路径模型配置应符合当前协议");
+        execute_connection_probe(&config)
+            .await
+            .expect("完整路径连接测试必须命中原始端点");
         server.abort();
     }
 
@@ -2215,6 +2328,16 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("session should create");
+        state.event_bus.publish(EventEnvelope::audit(
+            EventId::new("event-settings-safety-audit"),
+            "security.safety.evaluated",
+            json!({"decision": "audit_only"}),
+        ));
+        state.event_bus.publish(EventEnvelope::audit(
+            EventId::new("event-settings-unrelated-audit"),
+            "context.reference.read",
+            json!({"path": "README.md"}),
+        ));
 
         let bootstrap = settings_bootstrap(
             State(state),
@@ -2248,6 +2371,7 @@ mod tests {
         assert_eq!(bootstrap["workspaceId"], json!("workspace-contract"));
         assert_eq!(bootstrap["sessionId"], json!("session-empty-contract"));
         assert_eq!(bootstrap["workspacePath"], json!(workspace_path));
+        assert_eq!(bootstrap["safeguardAudit"]["auditCount"], json!(1));
         for key in [
             "repositories",
             "mcpServers",
@@ -3458,14 +3582,14 @@ mod tests {
             response["effectiveOrchestratorConfig"]["reasoningEffort"],
             json!("high")
         );
-        assert_eq!(saved["previousModel"], json!("model-before"));
-        assert_eq!(saved["modelSwitchPending"], json!(true));
+        assert!(saved.get("previousModel").is_none());
+        assert!(saved.get("modelSwitchPending").is_none());
     }
 
     #[test]
-    fn pending_model_switch_keeps_last_verified_model_across_reselection() {
+    fn model_reselection_keeps_only_the_user_selected_model() {
         let state = test_state();
-        let session_id = SessionId::new("session-model-pending-reselection");
+        let session_id = SessionId::new("session-model-reselection");
         state
             .settings_store
             .set_session_section(
@@ -3482,8 +3606,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(first["previousModel"], json!("verified-model"));
-        assert_eq!(first["modelSwitchPending"], json!(true));
+        assert_eq!(first["model"], json!("candidate-a"));
 
         let second = save_orchestrator_session_override_for_session(
             &state,
@@ -3492,17 +3615,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(second["previousModel"], json!("verified-model"));
-
-        let restored = save_orchestrator_session_override_for_session(
-            &state,
-            &session_id,
-            &json!({ "model": "verified-model" }),
-        )
-        .unwrap()
-        .unwrap();
-        assert!(restored.get("previousModel").is_none());
-        assert!(restored.get("modelSwitchPending").is_none());
+        assert_eq!(second["model"], json!("candidate-b"));
+        assert!(second.get("previousModel").is_none());
+        assert!(second.get("modelSwitchPending").is_none());
     }
 
     #[tokio::test]
@@ -4192,6 +4307,7 @@ mod tests {
             "userRules": "【全局生效】"
         });
         let safeguard_payload = serde_json::json!({
+            "revision": 0,
             "rules": [
                 {
                     "pattern": "custom-danger-global",
@@ -4229,6 +4345,13 @@ mod tests {
             .await
             .expect("save safeguard config should succeed");
         assert_eq!(saved_safeguard.0["saved"], serde_json::json!(true));
+        assert_eq!(saved_safeguard.0["revision"], serde_json::json!(1));
+        let stale_save = save_safeguard_config(
+            State(state.clone()),
+            Json(serde_json::json!({ "revision": 0, "rules": [] })),
+        )
+        .await;
+        assert!(matches!(stale_save, Err(ApiError::Conflict(_))));
         let saved_section = state.settings_store.get_section("safeguardConfig");
         let saved_rules = saved_section["rules"]
             .as_array()

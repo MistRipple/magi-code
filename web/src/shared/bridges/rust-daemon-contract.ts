@@ -395,13 +395,15 @@ interface RustBootstrapDto {
   sessions?: RustBootstrapSessionRecord[];
   timeline?: RustTimelineEntry[];
   canonicalTurns?: unknown[];
-  pendingChanges?: unknown[];
-  pendingChangesState?: unknown;
   workspaces?: RustBootstrapWorkspaceRecord[];
   runtimeReadModel?: RustRuntimeReadModelDto;
   notifications?: RustNotificationRecord[];
   eventStreamNextSequence?: number;
   recentEvents?: RustEventEnvelope[];
+  hasMoreBefore?: boolean;
+  beforeCursor?: string | null;
+  canonicalHasMoreBefore?: boolean;
+  canonicalBeforeCursor?: string | null;
   agent?: {
     runtimeEpoch?: string;
   };
@@ -411,6 +413,8 @@ interface RustTimelinePageDto {
   sessionId?: string;
   hasMoreBefore?: boolean;
   beforeCursor?: string | null;
+  canonicalHasMoreBefore?: boolean;
+  canonicalBeforeCursor?: string | null;
 }
 
 function normalizeString(value: unknown): string {
@@ -2028,10 +2032,6 @@ export function normalizeRustBootstrapPayload(
     currentSession?.id || '',
     canonicalTurns,
   );
-  const pendingChanges = Array.isArray(payload.pendingChanges)
-    ? payload.pendingChanges
-    : [];
-  const pendingChangesState = payload.pendingChangesState ?? null;
   const state: AppState = {
     ...buildEmptyWorkspaceAppState(generatedAt),
     sessions,
@@ -2041,9 +2041,6 @@ export function normalizeRustBootstrapPayload(
     currentWorkspacePath: workspace.rootPath,
     isProcessing: Boolean(processingState?.isProcessing),
     processingState,
-    pendingChanges,
-    pendingChangesState,
-    pendingChangesStateVersion: generatedAt,
     stateUpdatedAt: generatedAt,
   };
   const normalizedNotifications = normalizeNotifications(payload.notifications);
@@ -2084,11 +2081,15 @@ export function readRustTimelinePageMeta(rawPayload: unknown): {
   sessionId: string;
   hasMoreBefore: boolean;
   beforeCursor: string | null;
+  canonicalHasMoreBefore: boolean;
+  canonicalBeforeCursor: string | null;
 } {
   const payload = (rawPayload ?? {}) as RustTimelinePageDto;
   return {
     sessionId: normalizeString(payload.sessionId),
     hasMoreBefore: payload.hasMoreBefore === true,
     beforeCursor: normalizeString(payload.beforeCursor) || null,
+    canonicalHasMoreBefore: payload.canonicalHasMoreBefore === true,
+    canonicalBeforeCursor: normalizeString(payload.canonicalBeforeCursor) || null,
   };
 }

@@ -2791,6 +2791,7 @@ name = "magi-snapshot"
 version = "3.0.32"
 dependencies = [
  "ignore",
+ "magi-process",
  "notify",
  "serde",
  "serde_json",

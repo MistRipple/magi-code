@@ -119,7 +119,7 @@ impl Conversation {
     /// 把每一轮内部的"拼请求 / 调模型 / 工具执行 / 写 turn item"全部交给 driver。
     ///
     /// 这是 Tier 1 取代旧式单体调度中的
-    /// `for round in 0..tool_call_round_limit` 段的唯一入口。Conversation 自己
+    /// `run_conversation_loop_inner` 完整模型/工具执行段的唯一入口。Conversation 自己
     /// 调 `begin_turn` / `enter_modeling` / `enter_tool_calling` / `finish_done` /
     /// `finish_failed` / `end_turn`，业务侧拿不到中间状态。
     pub fn advance_turn<D>(&mut self, mut driver: D) -> Result<D::Outcome, AdvanceTurnError>
@@ -140,8 +140,7 @@ impl Conversation {
         self.advance_current_turn(|turn| turn.enter_modeling())
             .map_err(AdvanceTurnError::Advance)?;
 
-        let limit = driver.round_limit();
-        for round in 0..limit {
+        for round in 0usize.. {
             // 每轮入口确保处于 Modeling（除第一轮已由上面 enter_modeling 进入外，
             // 后续轮次需要从 ToolCalling 回到 Modeling）。
             if round > 0 {
@@ -172,11 +171,7 @@ impl Conversation {
             }
         }
 
-        // round_limit 耗尽——driver 自决最终 Outcome 形态（旧实现通常把这归到失败）。
-        self.advance_current_turn(|turn| turn.finish_failed())
-            .map_err(AdvanceTurnError::Advance)?;
-        self.end_turn().map_err(AdvanceTurnError::Advance)?;
-        Ok(driver.finalize_exhausted())
+        unreachable!("无固定轮次上限的执行循环只能由 Done 或 Failed 结束")
     }
 }
 
@@ -301,9 +296,8 @@ mod tests {
         assert_eq!(err, TurnAdvanceError::NoActiveTurn);
     }
 
-    /// 用 fake driver 验证 advance_turn 的 for-round 循环骨架。
+    /// 用 fake driver 验证 advance_turn 的无固定上限循环骨架。
     struct FakeDriver {
-        round_limit: usize,
         plan: Vec<RoundOutcome>,
         executed: Vec<usize>,
         finalize_call: std::cell::Cell<Option<&'static str>>,
@@ -313,17 +307,11 @@ mod tests {
     impl FakeDriver {
         fn new(plan: Vec<RoundOutcome>) -> Self {
             Self {
-                round_limit: plan.len().max(1),
                 plan,
                 executed: Vec::new(),
                 finalize_call: std::cell::Cell::new(None),
                 deterministic: None,
             }
-        }
-
-        fn with_round_limit(mut self, limit: usize) -> Self {
-            self.round_limit = limit;
-            self
         }
 
         fn with_deterministic(mut self, value: &'static str) -> Self {
@@ -334,10 +322,6 @@ mod tests {
 
     impl crate::driver::TurnDriver for FakeDriver {
         type Outcome = String;
-
-        fn round_limit(&self) -> usize {
-            self.round_limit
-        }
 
         fn deterministic_shortcut(&mut self) -> Option<Self::Outcome> {
             self.deterministic.map(|v| v.to_string())
@@ -361,11 +345,6 @@ mod tests {
         fn finalize_round_failure(self, reason: String) -> Self::Outcome {
             self.finalize_call.set(Some("failure"));
             format!("failure:{reason}")
-        }
-
-        fn finalize_exhausted(self) -> Self::Outcome {
-            self.finalize_call.set(Some("exhausted"));
-            "exhausted".to_string()
         }
     }
 
@@ -396,12 +375,13 @@ mod tests {
     }
 
     #[test]
-    fn advance_turn_exhausted_when_round_limit_hit() {
+    fn advance_turn_continues_beyond_legacy_round_limit() {
         let mut conv = Conversation::new(SessionId::new("s"));
-        let driver = FakeDriver::new(vec![RoundOutcome::Continue, RoundOutcome::Continue])
-            .with_round_limit(2);
+        let mut rounds = (0..64).map(|_| RoundOutcome::Continue).collect::<Vec<_>>();
+        rounds.push(RoundOutcome::Done);
+        let driver = FakeDriver::new(rounds);
         let outcome = conv.advance_turn(driver).unwrap();
-        assert_eq!(outcome, "exhausted");
+        assert_eq!(outcome, "success");
     }
 
     #[test]
@@ -437,10 +417,6 @@ mod tests {
         impl crate::driver::TurnDriver for CapturingDriver {
             type Outcome = usize;
 
-            fn round_limit(&self) -> usize {
-                1
-            }
-
             fn accept_mailbox_items(&mut self, items: Vec<MailboxItem>) {
                 self.captured_len = items.len();
             }
@@ -454,10 +430,6 @@ mod tests {
             }
 
             fn finalize_round_failure(self, _reason: String) -> Self::Outcome {
-                self.captured_len
-            }
-
-            fn finalize_exhausted(self) -> Self::Outcome {
                 self.captured_len
             }
         }

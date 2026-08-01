@@ -32,7 +32,7 @@ use magi_conversation_runtime::{
     },
 };
 use magi_core::{
-    SessionId, SessionLifecycleStatus, TaskId, TaskStatus, TaskTier, UtcMillis, WorkspaceId,
+    SessionId, SessionLifecycleStatus, TaskId, TaskTier, UtcMillis, WorkspaceId,
     public_runtime_excerpt,
 };
 use magi_event_bus::{
@@ -327,8 +327,7 @@ impl RunnerManager {
         let bg_checkpoint_path = self.checkpoint_path.clone();
         let terminal_observer = self.terminal_observer.clone();
         let join_handle = tokio::spawn(async move {
-            let mut stalled_streak = 0u32;
-            let max_stalled_streak = 20u32;
+            let mut waiting_streak = 0u32;
             loop {
                 if bg_handle.cancel.load(Ordering::Relaxed) {
                     let mut status = bg_handle.status.lock().expect("status lock should hold");
@@ -405,7 +404,7 @@ impl RunnerManager {
 
                 match outcome {
                     RunCycleOutcome::Continue => {
-                        stalled_streak = 0;
+                        waiting_streak = 0;
                         {
                             let mut status =
                                 bg_handle.status.lock().expect("status lock should hold");
@@ -436,17 +435,14 @@ impl RunnerManager {
                         }
                         break;
                     }
-                    RunCycleOutcome::Stalled(stalled_ids) => {
-                        stalled_streak += 1;
-                        let should_finalize_stalled = stalled_streak >= max_stalled_streak
-                            || stalled_outcome_is_terminally_unrunnable(
-                                &bg_task_store,
-                                &stalled_ids,
-                            );
-                        if should_finalize_stalled {
-                            let runner_status = match task_runner
-                                .finalize_stalled_outcome(&root_id, &stalled_ids)
-                            {
+                    RunCycleOutcome::Waiting => {
+                        waiting_streak = waiting_streak.saturating_add(1);
+                        let backoff_ms = 200u64.saturating_mul(waiting_streak as u64).min(2_000);
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    }
+                    RunCycleOutcome::Unrunnable(task_ids) => {
+                        let runner_status =
+                            match task_runner.finalize_unrunnable_outcome(&root_id, &task_ids) {
                                 Ok(_) => "error",
                                 Err(err) => {
                                     let mut last_error = bg_handle
@@ -457,27 +453,23 @@ impl RunnerManager {
                                     "error"
                                 }
                             };
-                            if let Some(ref path) = bg_checkpoint_path {
-                                let _ = bg_task_store.checkpoint_to_file(path);
-                            }
-                            let mut status =
-                                bg_handle.status.lock().expect("status lock should hold");
-                            *status = runner_status.to_string();
-                            bg_active.store(false, Ordering::Relaxed);
-                            if let Some(observer) = terminal_observer.as_ref() {
-                                observer(
-                                    root_id.clone(),
-                                    observer_session_id.clone(),
-                                    runner_status.to_string(),
-                                );
-                            }
-                            break;
+                        if let Some(ref path) = bg_checkpoint_path {
+                            let _ = bg_task_store.checkpoint_to_file(path);
                         }
-                        let backoff_ms = 200u64.saturating_mul(stalled_streak as u64).min(2_000);
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        let mut status = bg_handle.status.lock().expect("status lock should hold");
+                        *status = runner_status.to_string();
+                        bg_active.store(false, Ordering::Relaxed);
+                        if let Some(observer) = terminal_observer.as_ref() {
+                            observer(
+                                root_id.clone(),
+                                observer_session_id.clone(),
+                                runner_status.to_string(),
+                            );
+                        }
+                        break;
                     }
                     RunCycleOutcome::Blocked { reason, .. } => {
-                        stalled_streak = 0;
+                        waiting_streak = 0;
                         {
                             let mut status =
                                 bg_handle.status.lock().expect("status lock should hold");
@@ -756,17 +748,6 @@ impl RunnerManager {
         let mut current = handle.status.lock().expect("status lock should hold");
         *current = status.to_string();
     }
-}
-
-fn stalled_outcome_is_terminally_unrunnable(
-    task_store: &TaskStore,
-    stalled_task_ids: &[TaskId],
-) -> bool {
-    stalled_task_ids.iter().any(|task_id| {
-        task_store
-            .get_task(task_id)
-            .is_some_and(|task| matches!(task.status, TaskStatus::Failed | TaskStatus::Killed))
-    })
 }
 
 #[derive(Debug)]
@@ -1461,43 +1442,10 @@ impl ApiState {
             return BootstrapDto::from_state_with_selected_session(self, requested_session_id);
         };
         let event_snapshot = self.event_bus.snapshot();
-        let mut projection = self.session_store.projection_input();
-        projection.sessions = self.session_records_for_workspace(Some(ws_id));
-        let stored_current_session_id = projection.current_session_id.clone();
-        let selected_session_id = requested_session_id
-            .filter(|session_id| {
-                projection
-                    .sessions
-                    .iter()
-                    .any(|session| session.session_id == **session_id)
-            })
-            .cloned()
-            .or_else(|| {
-                stored_current_session_id.filter(|session_id| {
-                    projection
-                        .sessions
-                        .iter()
-                        .any(|session| session.session_id == *session_id)
-                })
-            })
-            .or_else(|| {
-                projection
-                    .sessions
-                    .first()
-                    .map(|session| session.session_id.clone())
-            });
-        projection.current_session_id = selected_session_id.clone();
-        if let Some(session_id) = selected_session_id.as_ref() {
-            projection
-                .timeline
-                .retain(|entry| entry.session_id == *session_id);
-            projection
-                .canonical_turns
-                .retain(|turn| turn.session_id == *session_id);
-        } else {
-            projection.timeline.clear();
-            projection.canonical_turns.clear();
-        }
+        let mut projection = self
+            .session_store
+            .projection_input_for_workspace_session(ws_id, requested_session_id);
+        let selected_session_id = projection.current_session_id.clone();
         projection.notifications = self
             .session_store
             .notifications_for_context(ws_id, selected_session_id.as_ref());
@@ -1520,15 +1468,9 @@ impl ApiState {
                 .collect();
         };
         self.session_store
-            .sessions()
+            .sessions_for_workspace(workspace_id)
             .into_iter()
             .filter(session_has_user_content)
-            .filter(|session| {
-                self.session_workspace_id(session)
-                    .as_ref()
-                    .map(|bound_workspace_id| bound_workspace_id.as_str())
-                    == Some(workspace_id)
-            })
             .collect()
     }
 
@@ -1680,6 +1622,14 @@ impl ApiState {
         let tool_catalog = self.settings_tool_catalog_json(hydrate_mcp_servers, tool_context);
         let skills_config = public_skills_config_section(object_section(&snapshot, "skillsConfig"));
         let public_mcp_servers = public_mcp_servers_section(&snapshot);
+        let audit_ledger = self.audit_usage_ledger_dto();
+        let safeguard_audit_count = self
+            .event_bus
+            .audit_usage_ledger_snapshot()
+            .audit_entries
+            .iter()
+            .filter(|entry| entry.event_type == "security.safety.evaluated")
+            .count();
         serde_json::json!({
             "workerConfigs": object_section(&snapshot, "workers"),
             "orchestratorConfig": object_section(&snapshot, "orchestrator"),
@@ -1689,6 +1639,11 @@ impl ApiState {
             "userRulesConfig": object_section(&snapshot, "userRulesConfig"),
             "skillsConfig": skills_config,
             "safeguardConfig": object_section(&snapshot, "safeguardConfig"),
+            "safeguardAudit": {
+                "auditCount": safeguard_audit_count,
+                "persistenceHealthy": audit_ledger.is_persist_healthy,
+                "pendingFlush": audit_ledger.pending_flush,
+            },
             "repositories": array_section(&snapshot, "repositories"),
             "mcpServers": public_mcp_servers,
             "builtinTools": self.builtin_tools_json(&tool_catalog),
@@ -3132,10 +3087,15 @@ pub(crate) fn normalize_safeguard_config_value(mut value: serde_json::Value) -> 
         .into_iter()
         .map(safeguard_rule_json)
         .collect::<Vec<_>>();
+    let revision = object
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     object.insert(
         "rules".to_string(),
         serde_json::Value::Array(normalized_rules),
     );
+    object.insert("revision".to_string(), serde_json::Value::from(revision));
     serde_json::Value::Object(object)
 }
 
@@ -3218,7 +3178,7 @@ fn normalize_mcp_servers_section(snapshot: &mut HashMap<String, serde_json::Valu
 mod tests {
     use super::*;
     use magi_agent_role::{AgentRole, AgentRoleRegistry, TaskKindLabel};
-    use magi_core::{AbsolutePath, MissionId, Task, TaskKind, WorkerId};
+    use magi_core::{AbsolutePath, MissionId, Task, TaskKind, TaskStatus, WorkerId};
     use magi_orchestrator::task_store::TaskLease;
     use magi_session_store::{ActiveExecutionChain, ActiveExecutionDispatchContext};
     use std::collections::HashMap;
@@ -4133,30 +4093,6 @@ mod tests {
             "unregistered workspace session should not start a stale snapshot lifecycle"
         );
         let _ = std::fs::remove_dir_all(workspace_root);
-    }
-
-    #[test]
-    fn stalled_outcome_with_failed_task_is_terminally_unrunnable() {
-        let store = TaskStore::new();
-        let failed_id = TaskId::new("task-failed");
-        store.insert_task(task_with_status(failed_id.as_str(), TaskStatus::Failed));
-
-        assert!(stalled_outcome_is_terminally_unrunnable(
-            &store,
-            &[failed_id]
-        ));
-    }
-
-    #[test]
-    fn stalled_outcome_with_pending_task_still_uses_debounce() {
-        let store = TaskStore::new();
-        let pending_id = TaskId::new("task-pending-unmatched");
-        store.insert_task(task_with_status(pending_id.as_str(), TaskStatus::Pending));
-
-        assert!(!stalled_outcome_is_terminally_unrunnable(
-            &store,
-            &[pending_id]
-        ));
     }
 
     #[test]

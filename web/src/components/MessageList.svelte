@@ -20,6 +20,9 @@
   } from '../stores/messages.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { vscode } from '../lib/vscode-bridge';
+  import { getAgentSessionMessages } from '../web/agent-api';
+  import { normalizeCanonicalTurn } from '../shared/protocol/canonical-turn';
+  import { prependCanonicalSessionTurns } from '../stores/turn-store.svelte';
   import {
     buildTurnNavigationItems,
     isTurnNavigationStatus,
@@ -69,8 +72,46 @@
     (renderItems || [])
       .filter((item): item is TimelineRenderItem => Boolean(item && item.message && item.message.id))
   );
+  const INITIAL_RENDER_WINDOW = 72;
+  const RENDER_WINDOW_CHUNK = 48;
+  let visibleRenderLimit = $state(INITIAL_RENDER_WINDOW);
+  let previousRenderItemCount = 0;
+  let previousLastRenderItemKey = '';
+  let previousRenderWindowScope = '';
+  const renderWindowScope = $derived(
+    `${displayContext}:${taskId || ''}:${safeRenderItems[safeRenderItems.length - 1]?.sessionId || ''}`
+  );
 
-  const activeRenderItems = $derived(safeRenderItems);
+  $effect.pre(() => {
+    const items = safeRenderItems;
+    const scope = renderWindowScope;
+    const count = items.length;
+    const lastKey = items[count - 1]?.key || '';
+    if (scope !== previousRenderWindowScope || previousRenderItemCount === 0) {
+      visibleRenderLimit = Math.min(count, INITIAL_RENDER_WINDOW);
+    } else if (count < previousRenderItemCount) {
+      visibleRenderLimit = Math.min(count, INITIAL_RENDER_WINDOW);
+    } else if (count > previousRenderItemCount) {
+      const previousLastIndex = previousLastRenderItemKey
+        ? items.findIndex((item) => item.key === previousLastRenderItemKey)
+        : -1;
+      if (previousLastIndex < 0) {
+        visibleRenderLimit = Math.min(count, INITIAL_RENDER_WINDOW);
+      } else {
+        const appendedCount = Math.max(0, count - previousLastIndex - 1);
+        if (appendedCount > 0) {
+          visibleRenderLimit = Math.min(count, visibleRenderLimit + appendedCount);
+        }
+      }
+    }
+    previousRenderWindowScope = scope;
+    previousRenderItemCount = count;
+    previousLastRenderItemKey = lastKey;
+  });
+
+  const visibleStartIndex = $derived(Math.max(0, safeRenderItems.length - visibleRenderLimit));
+  const activeRenderItems = $derived(safeRenderItems.slice(visibleStartIndex));
+  const hasHiddenLocalHistory = $derived(safeRenderItems.length > visibleRenderLimit);
 
   function continueInterruptedSession(): void {
     vscode.postMessage({ type: 'continueTask' });
@@ -84,7 +125,7 @@
   const turnNavigationItems = $derived.by(() => {
     if (displayContext !== 'thread') return [];
     const navigationMessages: TurnNavigationMessage[] = [];
-    for (const item of activeRenderItems) {
+    for (const item of safeRenderItems) {
       const metadata = item.message.metadata || {};
       const turnId = typeof metadata.turnId === 'string' ? metadata.turnId.trim() : '';
       const turnSeq = typeof metadata.turnSeq === 'number' && Number.isFinite(metadata.turnSeq)
@@ -452,11 +493,16 @@
   const shouldAutoScroll = $derived(messagesState.autoScrollEnabled[panelKey]);
   const sessionHistory = $derived(messagesState.sessionHistory);
   const canLoadOlderHistory = $derived(Boolean(
-    currentSessionId
-    && sessionHistory.sessionId === currentSessionId
-    && sessionHistory.hasMoreBefore
-    && sessionHistory.beforeCursor
-    && !sessionHistory.isLoadingBefore
+    hasHiddenLocalHistory
+    || (
+      currentSessionId
+      && sessionHistory.sessionId === currentSessionId
+      && (
+        (sessionHistory.hasMoreBefore && sessionHistory.beforeCursor)
+        || (sessionHistory.canonicalHasMoreBefore && sessionHistory.canonicalBeforeCursor)
+      )
+      && !sessionHistory.isLoadingBefore
+    )
   ));
 
   // 容器引用
@@ -529,7 +575,10 @@
     };
 
     // 多阶段恢复：覆盖 tab 切换后异步布局变化（代码高亮/卡片内容扩展）导致的位置漂移。
-    tick().then(() => {
+    tick().then(async () => {
+      if (persistedScrollAnchor?.messageId) {
+        await revealRenderMessage(persistedScrollAnchor.messageId);
+      }
       attemptRestore();
       requestAnimationFrame(() => {
         attemptRestore();
@@ -539,6 +588,19 @@
         setTimeout(() => attemptRestore(), 220),
       ];
     });
+  }
+
+  async function revealRenderMessage(messageId: string): Promise<boolean> {
+    const targetIndex = safeRenderItems.findIndex((item) => item.message.id === messageId);
+    if (targetIndex < 0) {
+      return false;
+    }
+    const requiredLimit = safeRenderItems.length - targetIndex;
+    if (requiredLimit > visibleRenderLimit) {
+      visibleRenderLimit = requiredLimit;
+      await tick();
+    }
+    return true;
   }
 
   function setContainerScrollPosition(nextTop: number) {
@@ -657,19 +719,23 @@
   });
 
   // 外部触发的消息定位（例如：目标面板点击历史计划，穿透定位到对应对话轮次）
+  let handledMessageJumpNonce = 0;
   $effect(() => {
     const jumpNonce = messagesState.messageJump.nonce;
-    void jumpNonce;
     const targetMessageId = messagesState.messageJump.messageId;
     if (!targetMessageId) return;
+    if (jumpNonce === handledMessageJumpNonce) return;
     if (displayContext !== 'thread') return;
     if (!isActive) return;
     if (!containerRef) return;
 
-    const existsInCurrentList = safeRenderMessages.some((message) => message.id === targetMessageId);
+    const existsInCurrentList = safeRenderItems.some((item) => item.message.id === targetMessageId);
     if (!existsInCurrentList) return;
+    handledMessageJumpNonce = jumpNonce;
 
-    tick().then(() => {
+    void revealRenderMessage(targetMessageId).then(async (revealed) => {
+      if (!revealed) return;
+      await tick();
       if (!containerRef) return;
       const selectorSafeId = targetMessageId.replace(/"/g, '\\"');
       const targetElement = containerRef.querySelector(`[data-message-id="${selectorSafeId}"]`) as HTMLElement | null;
@@ -702,10 +768,17 @@
       container
       && sentinel
       && isActive
-      && sessionId
-      && historyState.sessionId === sessionId
-      && historyState.hasMoreBefore
-      && historyState.beforeCursor
+      && (
+        hasHiddenLocalHistory
+        || (
+          sessionId
+          && historyState.sessionId === sessionId
+          && (
+            (historyState.hasMoreBefore && historyState.beforeCursor)
+            || (historyState.canonicalHasMoreBefore && historyState.canonicalBeforeCursor)
+          )
+        )
+      )
     );
 
     disconnectHistoryObserver();
@@ -733,18 +806,93 @@
     };
   });
 
-  function loadOlderHistory(): void {
+  async function revealPreviousRenderItems(): Promise<void> {
+    if (!hasHiddenLocalHistory) return;
+    const previousScrollHeight = containerRef?.scrollHeight ?? 0;
+    const previousScrollTop = containerRef?.scrollTop ?? 0;
+    visibleRenderLimit = Math.min(safeRenderItems.length, visibleRenderLimit + RENDER_WINDOW_CHUNK);
+    await tick();
+    if (containerRef) {
+      const addedHeight = Math.max(0, containerRef.scrollHeight - previousScrollHeight);
+      setContainerScrollPosition(previousScrollTop + addedHeight);
+      syncPanelScrollState(containerRef.scrollTop, shouldAutoScroll);
+    }
+  }
+
+  async function loadOlderHistory(): Promise<void> {
     const sessionId = (messagesState.currentSessionId || '').trim();
     const workspaceId = (messagesState.currentWorkspaceId || '').trim();
+    if (hasHiddenLocalHistory) {
+      await revealPreviousRenderItems();
+      return;
+    }
     if (!sessionId || hasActiveLocalTimelineTurn()) {
       return;
     }
+    const historyState = messagesState.sessionHistory;
+    if (
+      historyState.sessionId !== sessionId
+      || historyState.workspaceId !== workspaceId
+      || historyState.isLoadingBefore
+      || !(
+        (historyState.hasMoreBefore && historyState.beforeCursor)
+        || (historyState.canonicalHasMoreBefore && historyState.canonicalBeforeCursor)
+      )
+    ) {
+      return;
+    }
+    const previousScrollHeight = containerRef?.scrollHeight ?? 0;
+    const previousScrollTop = containerRef?.scrollTop ?? 0;
     setSessionHistoryState(sessionId, {
       workspaceId,
-      hasMoreBefore: false,
-      beforeCursor: null,
-      isLoadingBefore: false,
+      isLoadingBefore: true,
     });
+    try {
+      const response = await getAgentSessionMessages({
+        sessionId,
+        workspaceId,
+        workspacePath: messagesState.currentWorkspacePath,
+        beforeCursor: historyState.beforeCursor,
+        canonicalBeforeCursor: historyState.canonicalBeforeCursor,
+        limit: 50,
+      });
+      if (messagesState.currentSessionId !== sessionId) {
+        return;
+      }
+      const turns = Array.isArray(response.canonicalTurns)
+        ? response.canonicalTurns
+          .map((turn) => normalizeCanonicalTurn(turn))
+          .filter((turn): turn is NonNullable<ReturnType<typeof normalizeCanonicalTurn>> => Boolean(turn))
+        : [];
+      prependCanonicalSessionTurns(sessionId, turns);
+      setSessionHistoryState(sessionId, {
+        workspaceId,
+        hasMoreBefore: response.hasMoreBefore === true,
+        beforeCursor: typeof response.beforeCursor === 'string' ? response.beforeCursor : null,
+        canonicalHasMoreBefore: response.canonicalHasMoreBefore === true,
+        canonicalBeforeCursor: typeof response.canonicalBeforeCursor === 'string'
+          ? response.canonicalBeforeCursor
+          : null,
+        isLoadingBefore: false,
+      });
+      await tick();
+      if (hasHiddenLocalHistory) {
+        await revealPreviousRenderItems();
+        return;
+      }
+      if (containerRef) {
+        setContainerScrollPosition(
+          previousScrollTop + (containerRef.scrollHeight - previousScrollHeight),
+        );
+        syncPanelScrollState(containerRef.scrollTop, shouldAutoScroll);
+      }
+    } catch (error) {
+      console.error('[message-list] 加载更早的会话历史失败:', error);
+      setSessionHistoryState(sessionId, {
+        workspaceId,
+        isLoadingBefore: false,
+      });
+    }
   }
 
   // 检测用户是否手动滚动
@@ -800,7 +948,11 @@
 </script>
 
 <div class="message-list-wrapper" class:has-turn-navigation={showTurnNavigation}>
-  <TurnNavigationRail items={turnNavigationItems} container={containerRef} />
+  <TurnNavigationRail
+    items={turnNavigationItems}
+    container={containerRef}
+    onRevealMessage={revealRenderMessage}
+  />
   <div
     class="message-list"
     bind:this={containerRef}

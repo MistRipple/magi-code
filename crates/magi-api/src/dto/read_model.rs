@@ -1,5 +1,6 @@
 use magi_core::{
-    TaskId, TaskStatus, public_runtime_excerpt, public_runtime_summary, public_runtime_text,
+    SessionId, TaskId, TaskStatus, public_runtime_excerpt, public_runtime_summary,
+    public_runtime_text,
 };
 use magi_event_bus::{
     ExecutionGroupRuntimeSummaryEntry, RecoveryActivityStage, RecoveryDiagnosticSummaryEntry,
@@ -63,6 +64,45 @@ pub fn runtime_read_model_dto_with_usage(
     prune_terminal_runtime_live_ids(&mut runtime_read_model);
     runtime_read_model.meta.ledger = audit_usage_ledger;
     runtime_read_model
+}
+
+/// 构造单个会话的运行投影。
+///
+/// bootstrap 只展示当前会话，必须在 sidecar 脱敏和运行态合并之前完成范围裁剪。
+/// 如果先构造全局读模型再裁剪，会对所有历史会话的工具参数、结果和错误重复执行
+/// JSON 解析与脱敏，导致首屏耗时随全局历史线性增长。
+#[allow(clippy::too_many_arguments)]
+pub fn runtime_read_model_dto_for_session_with_usage(
+    mut runtime_read_model: RuntimeReadModelInput,
+    session_id: &SessionId,
+    session_sidecar_exports: &[SessionRuntimeSidecarExport],
+    workspace_sidecar_exports: &[WorkspaceRecoverySidecarExport],
+    audit_usage_ledger: AuditUsageLedgerDto,
+    task_store: Option<&TaskStore>,
+    ledger_usage_observations: &BTreeMap<String, SessionRuntimeUsageObservation>,
+) -> RuntimeReadModelDto {
+    runtime_read_model
+        .details
+        .sessions
+        .retain(|entry| entry.session_id == session_id.as_str());
+    runtime_read_model
+        .details
+        .knowledge_audit
+        .retain(|entry| entry.session_id.as_deref() == Some(session_id.as_str()));
+    let scoped_sidecars = session_sidecar_exports
+        .iter()
+        .filter(|export| export.session_id == *session_id)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    runtime_read_model_dto_with_usage(
+        runtime_read_model,
+        &scoped_sidecars,
+        workspace_sidecar_exports,
+        audit_usage_ledger,
+        task_store,
+        ledger_usage_observations,
+    )
 }
 
 /// 仅当实时投影未提供观测值时,用账本回放结果回填会话的 `usage_observation`。

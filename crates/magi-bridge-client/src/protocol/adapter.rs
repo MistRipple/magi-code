@@ -8,6 +8,7 @@ use crate::types::{ChatCompletionPayload, ChatToolCall, ChatToolFunction, ModelR
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFamily {
     OpenAiChat,
+    OpenAiResponses,
     Anthropic,
 }
 

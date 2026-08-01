@@ -66,6 +66,11 @@ export interface SettingsBootstrapPayload {
   userRulesConfig: Record<string, unknown>;
   skillsConfig: Record<string, unknown>;
   safeguardConfig: Record<string, unknown>;
+  safeguardAudit?: {
+    auditCount?: number;
+    persistenceHealthy?: boolean;
+    pendingFlush?: boolean;
+  };
   repositories: unknown[];
   mcpServers: unknown[];
   builtinTools?: SettingsBuiltinTool[];

@@ -7,6 +7,7 @@ import {
   resolveAgentBaseUrl,
   RUNTIME_BASE_URL_STORAGE_KEY,
   isPublicTunnelAccess,
+  settingsBootstrapMatchesCurrentWorkspace,
 } from '../../web/agent-api';
 import {
   clearAgentBindingContext,
@@ -872,7 +873,10 @@ function syncTunnelRuntimeForSilentEventStream(reason: string, error: Error): vo
     if (bootstrapBindingKey(resolveWorkspaceQuery()) !== syncBindingKey) {
       return;
     }
-    emitDataMessage('sessionsUpdated', { sessions: snapshot.sessions });
+    emitDataMessage('sessionsUpdated', {
+      workspaceId: binding.workspaceId,
+      sessions: snapshot.sessions,
+    });
     const currentSession = snapshot.sessions.find((session) => session.id === binding.sessionId);
     if (currentSession?.isRunning !== false) {
       return;
@@ -1455,7 +1459,10 @@ function scheduleWorkspaceSessionSummaryRefresh(reason: string): void {
       if (currentBinding.workspaceId !== binding.workspaceId) {
         return;
       }
-      emitDataMessage('sessionsUpdated', { sessions: snapshot.sessions });
+      emitDataMessage('sessionsUpdated', {
+        workspaceId: binding.workspaceId,
+        sessions: snapshot.sessions,
+      });
     }).catch((error) => {
       reportExpectedRecoveryFailure(
         i18n.t('bridge.action.syncMessages'),
@@ -2447,26 +2454,10 @@ function dispatchWorkspaceSessionDetached(
   workspaceId: string,
   workspacePath: string,
   dataType: 'workspaceDraftStarted' | 'workspaceSessionCleared',
+  carriedSessionConfig: Record<string, unknown> = {},
 ): void {
   const normalizedWorkspaceId = workspaceId.trim();
   const normalizedWorkspacePath = workspacePath.trim();
-  const isAlreadyBoundToDraft = dataType === 'workspaceDraftStarted'
-    && !currentSessionId
-    && currentWorkspaceId === normalizedWorkspaceId
-    && currentWorkspacePath === normalizedWorkspacePath;
-  // 草稿被再次打开时，沿用第一次进入草稿时保存的来源会话配置。
-  // 不能从当前草稿的全局 bootstrap 重新取值，否则会在用户放弃草稿后
-  // 回退到模型列表默认项，导致下一次新建失去原会话配置参考。
-  const carriedSessionConfig = dataType === 'workspaceDraftStarted'
-    ? (isAlreadyBoundToDraft && Object.keys(messagesState.draftOrchestratorSessionConfig).length > 0
-      ? { ...messagesState.draftOrchestratorSessionConfig }
-      : cachedSettingsBootstrap
-        ? copyOrchestratorSessionConfig(
-          cachedSettingsBootstrap.orchestratorSessionConfig,
-          cachedSettingsBootstrap.effectiveOrchestratorConfig,
-        )
-        : {})
-    : {};
   closeEventStream();
   const settingsBindingChanged = clearWorkspaceSessionBinding(normalizedWorkspaceId, normalizedWorkspacePath);
   emitDataMessage(dataType, {
@@ -2477,6 +2468,64 @@ function dispatchWorkspaceSessionDetached(
   if (settingsBindingChanged) {
     refreshSettingsBootstrapForCurrentWorkspace('workspace_session_cleared');
   }
+}
+
+function currentBoundSettingsBootstrap(): SettingsBootstrapPayload | null {
+  const stateSnapshot = messagesState.settingsBootstrapSnapshot;
+  if (stateSnapshot && settingsBootstrapMatchesCurrentWorkspace(stateSnapshot)) {
+    return stateSnapshot as SettingsBootstrapPayload;
+  }
+  if (cachedSettingsBootstrap && settingsBootstrapMatchesCurrentWorkspace(cachedSettingsBootstrap)) {
+    return cachedSettingsBootstrap;
+  }
+  return null;
+}
+
+async function startWorkspaceSessionDraft(workspaceId: string, workspacePath: string): Promise<void> {
+  const normalizedWorkspaceId = workspaceId.trim();
+  const normalizedWorkspacePath = workspacePath.trim();
+  const alreadyCurrentDraft = !currentSessionId
+    && currentWorkspaceId === normalizedWorkspaceId
+    && currentWorkspacePath === normalizedWorkspacePath;
+  if (alreadyCurrentDraft && Object.keys(messagesState.draftOrchestratorSessionConfig).length > 0) {
+    dispatchWorkspaceSessionDetached(
+      normalizedWorkspaceId,
+      normalizedWorkspacePath,
+      'workspaceDraftStarted',
+      { ...messagesState.draftOrchestratorSessionConfig },
+    );
+    return;
+  }
+
+  const sourceBindingKey = settingsBootstrapBindingKey();
+  let sourceSnapshot = currentBoundSettingsBootstrap();
+  if (!sourceSnapshot && currentSessionId) {
+    try {
+      sourceSnapshot = await getAgentSettingsBootstrap({ scope: 'core' });
+    } catch (error) {
+      emitBridgeErrorToast(i18n.t('header.newSession'), error, { reportIncident: false });
+      return;
+    }
+    if (
+      sourceBindingKey !== settingsBootstrapBindingKey()
+      || !settingsBootstrapMatchesCurrentWorkspace(sourceSnapshot)
+    ) {
+      return;
+    }
+  }
+
+  const carriedSessionConfig = sourceSnapshot
+    ? copyOrchestratorSessionConfig(
+      sourceSnapshot.orchestratorSessionConfig,
+      sourceSnapshot.effectiveOrchestratorConfig,
+    )
+    : {};
+  dispatchWorkspaceSessionDetached(
+    normalizedWorkspaceId,
+    normalizedWorkspacePath,
+    'workspaceDraftStarted',
+    carriedSessionConfig,
+  );
 }
 
 function clearPersistedWorkspaceBinding(): void {
@@ -2589,18 +2638,16 @@ async function restoreBridgeState(reason: string, force = false): Promise<void> 
       forceEventStreamReconnect: true,
       refreshSettingsBootstrapOnBindingChange: false,
     });
-    const recoveredBinding = resolveWorkspaceQuery();
-    if (recoveredBinding.sessionId) {
-      try {
-        await refreshPendingChangesProjection(recoveredBinding);
-      } catch (error) {
-        console.warn('[web-client-bridge] 工作区恢复后刷新变更列表失败:', error);
-      }
-    }
-    await dispatchSettingsBootstrap(force, 'core');
     clearRecoveryTimer();
     recoveryAttempt = 0;
     emitConnectedState(reason, recovered);
+    void dispatchSettingsBootstrap(force, 'core').catch((error) => {
+      reportExpectedRecoveryFailure(
+        i18n.t('settings.toast.action.loadSettingsData'),
+        '[web-client-bridge] 核心会话恢复后加载设置失败:',
+        error,
+      );
+    });
   })().finally(() => {
     if (recoveryInFlight === request) {
       recoveryInFlight = null;
@@ -2782,12 +2829,25 @@ async function dispatchBootstrap(
     ...payload,
     hasMoreBefore: pageMeta.hasMoreBefore,
     beforeCursor: pageMeta.beforeCursor,
+    canonicalHasMoreBefore: pageMeta.canonicalHasMoreBefore,
+    canonicalBeforeCursor: pageMeta.canonicalBeforeCursor,
   } as Record<string, unknown>);
-  await syncSessionTurnQueue(
+  if (payload.sessionId) {
+    void refreshPendingChangesProjection({
+      sessionId: payload.sessionId,
+      workspaceId: payload.workspace.workspaceId,
+      workspacePath: payload.workspace.rootPath,
+    }).catch((error) => {
+      console.warn('[web-client-bridge] bootstrap 后刷新变更列表失败:', error);
+    });
+  }
+  void syncSessionTurnQueue(
     payload.sessionId,
     payload.workspace.workspaceId,
     payload.workspace.rootPath,
-  );
+  ).catch((error) => {
+    console.warn('[web-client-bridge] bootstrap 后同步排队消息失败:', error);
+  });
   void ensureEventStream({
     forceReconnect: options.forceEventStreamReconnect === true,
     waitUntilOpen: false,
@@ -2865,6 +2925,7 @@ async function fetchBootstrap(
               && currentBinding.workspaceId === effectiveBinding.workspaceId
             ) {
               emitDataMessage('sessionsUpdated', {
+                workspaceId: effectiveBinding.workspaceId,
                 sessions: snapshot.sessions,
               });
             }
@@ -2899,21 +2960,17 @@ async function fetchBootstrap(
     if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
       return;
     }
-    const workspaceSessionSnapshot = options.workspaceSessionSnapshot
-      ?? await getWorkspaceSessions(
-        payload.workspace.workspaceId,
-        payload.sessionId,
-        payload.workspace.rootPath,
-      );
-    if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
-      return;
+    if (options.workspaceSessionSnapshot) {
+      payload = applyWorkspaceSessionSnapshotToBootstrap(payload, options.workspaceSessionSnapshot);
     }
-    payload = applyWorkspaceSessionSnapshotToBootstrap(payload, workspaceSessionSnapshot);
     await dispatchBootstrap(payload, {
       forceEventStreamReconnect: options.forceEventStreamReconnect,
       refreshSettingsBootstrapOnBindingChange: options.refreshSettingsBootstrapOnBindingChange,
       rawPayload,
     });
+    if (!options.workspaceSessionSnapshot) {
+      void refreshWorkspaceSessionsAfterBootstrap(payload, requestBindingKey, requestSeq);
+    }
   };
   let requestPromise: Promise<void>;
   requestPromise = doFetch().finally(() => {
@@ -2925,6 +2982,43 @@ async function fetchBootstrap(
   bootstrapInFlight = requestPromise;
   bootstrapInFlightBindingKey = requestBindingKey;
   return requestPromise;
+}
+
+async function refreshWorkspaceSessionsAfterBootstrap(
+  payload: BootstrapPayload,
+  requestBindingKey: string,
+  requestSeq: number,
+): Promise<void> {
+  try {
+    const snapshot = await getWorkspaceSessions(
+      payload.workspace.workspaceId,
+      payload.sessionId,
+      payload.workspace.rootPath,
+    );
+    if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
+      return;
+    }
+    if (snapshot.workspace.workspaceId !== payload.workspace.workspaceId) {
+      console.warn('[web-client-bridge] 忽略工作区不一致的会话摘要快照', {
+        expectedWorkspaceId: payload.workspace.workspaceId,
+        actualWorkspaceId: snapshot.workspace.workspaceId,
+      });
+      return;
+    }
+    if (payload.sessionId && !snapshot.sessions.some((session) => session.id === payload.sessionId)) {
+      console.warn('[web-client-bridge] 忽略不包含当前会话的摘要快照', {
+        workspaceId: payload.workspace.workspaceId,
+        sessionId: payload.sessionId,
+      });
+      return;
+    }
+    emitDataMessage('sessionsUpdated', {
+      workspaceId: payload.workspace.workspaceId,
+      sessions: snapshot.sessions,
+    });
+  } catch (error) {
+    console.warn('[web-client-bridge] bootstrap 后刷新会话摘要失败:', error);
+  }
 }
 
 async function fetchSettingsBootstrap(
@@ -4516,10 +4610,9 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'newSession': {
           const workspaceScope = resolveWorkspaceScopeFromSource(message);
-          dispatchWorkspaceSessionDetached(
+          void startWorkspaceSessionDraft(
             workspaceScope.workspaceId,
             workspaceScope.workspacePath,
-            'workspaceDraftStarted',
           );
           return;
         }
