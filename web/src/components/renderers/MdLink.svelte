@@ -12,6 +12,7 @@
     normalizeFileReferenceTarget,
   } from '../../lib/file-reference';
   import { vscode } from '../../lib/vscode-bridge';
+  import { desktopContextMenu, type DesktopContextMenuDescriptor } from '../../lib/desktop-context-menu-contract';
 
   interface Props {
     href?: string;
@@ -27,8 +28,7 @@
     return readFilePreviewScope?.() ?? {};
   }
 
-  function handleClick(e: MouseEvent) {
-    e.preventDefault();
+  function openTarget() {
     if (!href) {
       return;
     }
@@ -42,11 +42,21 @@
     }
     vscode.postMessage({ type: 'openLink', url: href });
   }
+
+  function handleClick(e: MouseEvent) {
+    e.preventDefault();
+    openTarget();
+  }
+
+  const contextDescriptor = $derived.by((): DesktopContextMenuDescriptor => fileTarget
+    ? { kind: 'file', filePath: fileTarget, open: openTarget, fileScope: currentFilePreviewScope() }
+    : { kind: 'link', url: href, open: openTarget });
 </script>
 
 <a
   {href}
   {title}
   class="md-link"
+  use:desktopContextMenu={contextDescriptor}
   onclick={handleClick}
 >{@render children?.()}</a>

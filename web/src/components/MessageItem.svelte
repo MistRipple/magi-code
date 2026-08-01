@@ -20,6 +20,7 @@
   import { isRuntimeInternalTool } from '../shared/tool-visibility';
   import { parseModelFailureDiagnostic } from '../lib/model-failure';
   import { parseToolCallFailureDiagnostic } from '../lib/tool-call-failure';
+  import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
 
   // Props
   interface Props {
@@ -408,7 +409,13 @@
     {#if messageImages.length > 0}
       <div class="user-images">
         {#each messageImages as img, i (`${message.id}-img-${i}`)}
-          <button class="user-image-thumb" onclick={() => openImagePreview(img.dataUrl)} type="button" title={i18n.t('messageItem.imageClickTitle')}>
+          <button
+            class="user-image-thumb"
+            onclick={() => openImagePreview(img.dataUrl)}
+            type="button"
+            title={i18n.t('messageItem.imageClickTitle')}
+            use:desktopContextMenu={{ kind: 'image', open: () => openImagePreview(img.dataUrl) }}
+          >
             <img src={img.dataUrl} alt={img.name || i18n.t('messageItem.imageAlt', { index: i + 1 })} />
           </button>
         {/each}

@@ -10,6 +10,7 @@
   } from '../lib/image-generation-preview';
   import Icon from './Icon.svelte';
   import { i18n } from '../stores/i18n.svelte';
+  import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
 
   interface Props {
     block: ContentBlock;
@@ -56,6 +57,12 @@
       class="generated-image-button"
       onclick={openImageFile}
       title={i18n.t('messageItem.generatedImageOpen')}
+      use:desktopContextMenu={{
+        kind: 'image',
+        filePath: preview.path,
+        fileScope: filePreviewScope,
+        open: openImageFile,
+      }}
     >
       <img
         src={imageSrc}

@@ -6,6 +6,7 @@
     type FilePreviewScopeReader,
   } from '../../lib/file-reference';
   import { vscode } from '../../lib/vscode-bridge';
+  import { desktopContextMenu } from '../../lib/desktop-context-menu-contract';
 
   interface Props {
     label: string;
@@ -20,14 +21,18 @@
     return readFilePreviewScope?.() ?? {};
   }
 
-  function handleClick(event: MouseEvent) {
-    event.preventDefault();
-    event.stopPropagation();
+  function openTarget() {
     const scope = currentFilePreviewScope();
     if (dispatchFilePreviewEvent({ filepath: target, ...scope })) {
       return;
     }
     vscode.postMessage({ type: 'openFile', filepath: target, ...scope });
+  }
+
+  function handleClick(event: MouseEvent) {
+    event.preventDefault();
+    event.stopPropagation();
+    openTarget();
   }
 </script>
 
@@ -35,6 +40,12 @@
   href={target}
   title={target}
   class="md-file-ref md-file-ref--{variant}"
+  use:desktopContextMenu={{
+    kind: 'file',
+    filePath: target,
+    open: openTarget,
+    fileScope: currentFilePreviewScope(),
+  }}
   onclick={handleClick}
 >
   {#if variant === 'code'}

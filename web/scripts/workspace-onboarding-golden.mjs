@@ -132,8 +132,13 @@ assert.match(
 );
 assert.match(
   shellSource,
-  /async function openWorkspaceDraft[\s\S]*?if \(sessionsAlreadyLoaded\) \{[\s\S]*?replaceWorkspaceSessionProjection\(workspaceId, getWorkspaceSessionList\(workspaceId\)\);[\s\S]*?type: 'newSession'/,
-  '进入草稿前必须保留目标工作区已加载的会话集合',
+  /async function openWorkspaceDraft[\s\S]*?sessionsAlreadyLoaded[\s\S]*?messagesState\.workspaceSessionProjection\.workspaceId !== workspaceId[\s\S]*?replaceWorkspaceSessionProjection\(workspaceId, sessionsByWorkspace\[workspaceId\] \?\? \[\]\);[\s\S]*?type: 'newSession'/,
+  '跨工作区进入草稿时必须切换会话目录投影，同工作区不得重复替换已加载列表',
+);
+assert.doesNotMatch(
+  shellSource,
+  /if \(!bootstrapSessionId\) \{[\s\S]{0,900}?loadWorkspaceSessionsForSidebar/,
+  '当前会话指针清空不得驱动工作区会话目录重新加载',
 );
 assert.match(
   shellSource,

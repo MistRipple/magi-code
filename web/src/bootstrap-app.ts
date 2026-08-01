@@ -8,6 +8,7 @@ import { getState, initializeState, setCurrentSessionId } from './stores/message
 import { i18n } from './stores/i18n.svelte';
 import type { ClientBridge } from './shared/bridges/client-bridge';
 import { notifyBridgeReady, setClientBridge } from './shared/bridges/bridge-runtime';
+import { installDesktopContextMenu } from './lib/desktop-context-menu';
 
 declare global {
   interface Window {
@@ -71,6 +72,7 @@ export function bootstrapApp(
   primeEventSeqTracking(restoredState.currentSessionId, restoredState.currentWorkspaceId);
   initMessageHandler(bridge);
   installPasteDeduplication();
+  installDesktopContextMenu();
 
   app = mount(RootComponent, {
     target: document.getElementById('app')!,

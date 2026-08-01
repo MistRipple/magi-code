@@ -54,6 +54,7 @@ pub fn routes() -> Router<ApiState> {
         )
         .route("/files/content", get(get_file_content))
         .route("/files/raw", get(get_file_raw))
+        .route("/files/reveal-target", post(resolve_file_reveal_target))
         .route("/filesystem/list", get(list_filesystem))
         .route("/filesystem/browse", get(browse_filesystem))
         .route("/filesystem/resolve", post(resolve_filesystem_path))
@@ -572,6 +573,65 @@ struct FileContentQuery {
     workspace_id: Option<String>,
     workspace_path: Option<String>,
     execution_group_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileRevealTargetRequest {
+    file_path: Option<String>,
+    session_id: Option<String>,
+    workspace_id: Option<String>,
+    workspace_path: Option<String>,
+}
+
+async fn resolve_file_reveal_target(
+    State(state): State<ApiState>,
+    Json(request): Json<FileRevealTargetRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let file_path = request
+        .file_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("文件路径不能为空".to_string()))?;
+    let workspace_root = if request
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        let session_id = parse_session_id(request.session_id.as_deref())?;
+        resolve_session_change_scope_from_request(
+            &state,
+            &session_id,
+            request.workspace_id.as_deref(),
+            request.workspace_path.as_deref(),
+            None,
+        )?
+        .workspace_root
+    } else {
+        resolve_workspace_change_scope_from_request(
+            &state,
+            request.workspace_id.as_deref(),
+            request.workspace_path.as_deref(),
+        )?
+        .workspace_root
+    };
+    let (target_path, _) = safe_workspace_path(&workspace_root, file_path)?;
+    if !target_path.is_file() {
+        return Err(ApiError::InvalidInput("路径不是可定位的文件".to_string()));
+    }
+    let canonical_workspace_root = magi_core::HostPath::canonicalize(&workspace_root)
+        .map(magi_core::HostPath::into_path_buf)
+        .map_err(|error| {
+            directory_access_error("规范化工作区根目录失败", &workspace_root, error)
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "targetPathRef": path_ref(&target_path),
+        "workspaceRootPathRef": path_ref(&canonical_workspace_root),
+        "displayPath": display_path(&target_path),
+    })))
 }
 
 async fn get_file_content(
@@ -1759,6 +1819,116 @@ mod tests {
             entry["displayPath"],
             canonical_file.to_string_lossy().as_ref()
         );
+    }
+
+    #[tokio::test]
+    async fn file_reveal_target_returns_only_existing_workspace_file() {
+        let root = unique_temp_dir("magi-file-reveal-target");
+        let file = root.join("src/main.rs");
+        fs::create_dir_all(file.parent().unwrap()).expect("source directory should create");
+        fs::write(&file, "fn main() {}\n").expect("source file should write");
+        let state = build_state_with_workspace_root(&root, "workspace-file-reveal");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/files/reveal-target")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workspaceId": "workspace-file-reveal",
+                            "filePath": "src/main.rs"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json_response(response).await;
+        assert!(
+            payload["targetPathRef"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("mhp1:"))
+        );
+        assert!(
+            payload["workspaceRootPathRef"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("mhp1:"))
+        );
+        assert_eq!(
+            payload["displayPath"],
+            file.canonicalize().unwrap().to_string_lossy().as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn file_reveal_target_rejects_directory() {
+        let root = unique_temp_dir("magi-file-reveal-directory");
+        fs::create_dir_all(root.join("src")).expect("source directory should create");
+        let state = build_state_with_workspace_root(&root, "workspace-file-reveal-directory");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/files/reveal-target")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workspaceId": "workspace-file-reveal-directory",
+                            "filePath": "src"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["message"], "路径不是可定位的文件");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_reveal_target_rejects_symlink_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("magi-file-reveal-symlink");
+        let outside = unique_temp_dir("magi-file-reveal-outside").join("outside.txt");
+        fs::write(&outside, "outside\n").expect("outside file should write");
+        symlink(&outside, root.join("outside-link.txt")).expect("symlink should create");
+        let state = build_state_with_workspace_root(&root, "workspace-file-reveal-symlink");
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/files/reveal-target")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workspaceId": "workspace-file-reveal-symlink",
+                            "filePath": "outside-link.txt"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = read_json_response(response).await;
+        assert_eq!(payload["message"], "路径越出工作区边界");
     }
 
     #[cfg(target_os = "linux")]

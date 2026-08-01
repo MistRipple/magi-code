@@ -36,13 +36,13 @@ assert.match(
 );
 assert.match(
   statusSource,
-  /\.header-update-action-slot[\s\S]*?width: 70px[\s\S]*?flex: 0 0 70px/,
-  '顶部更新动作槽必须预留固定宽度，状态切换时版本号不得移动',
+  /\.header-update-action-slot[\s\S]*?width: 32px[\s\S]*?flex: 0 0 32px/,
+  '顶部更新动作槽必须保持固定图标宽度，状态切换时版本号不得移动',
 );
-assert.match(
+assert.doesNotMatch(
   statusSource,
-  /header-update-action--expanded[\s\S]*?width: 70px/,
-  '只有具备明确下一步动作的更新状态才展开为文字按钮',
+  /header-update-action--expanded|header-update-action-label|expanded:\s*(?:true|false)/,
+  '顶部更新动作不得扩展为文字卡片',
 );
 assert.match(
   statusSource,
@@ -76,28 +76,23 @@ assert.match(
 );
 assert.match(
   statusSource,
-  /case 'ready':[\s\S]*?icon: 'restart'[\s\S]*?app\.update\.restart/,
+  /case 'ready':[\s\S]*?icon: 'restart'/,
   '更新包已就绪时必须显示重启图标，不能继续复用检查更新图标',
 );
 assert.match(
   statusSource,
-  /case 'downloading':[\s\S]*?\$\{progress\.percent\}%/,
-  '下载过程必须在顶部动作中展示真实百分比',
+  /case 'downloading':[\s\S]*?progress:\s*true/,
+  '下载过程必须切换为紧凑环形进度状态',
 );
 assert.match(
   statusSource,
-  /case 'available':[\s\S]*?icon: 'download'[\s\S]*?app\.update\.update/,
-  '发现更新后必须展开为明确的更新动作，不能只依赖装饰性状态点',
+  /case 'available':[\s\S]*?icon: 'download'/,
+  '发现更新后必须显示明确的下载图标',
 );
 assert.match(
   statusSource,
   /case 'installing':[\s\S]*?icon: 'restart'[\s\S]*?spinning: true/,
   '进入安装重启阶段后必须持续显示旋转的重启图标',
-);
-assert.match(
-  statusSource,
-  /case 'ready':[\s\S]*?app\.update\.restart/,
-  '下载完成后必须展示明确的重启文字',
 );
 assert.match(
   statusSource,
@@ -108,6 +103,16 @@ assert.match(
   statusSource,
   /header-update-progress-value[\s\S]*?stroke-dasharray: 100[\s\S]*?stroke-dashoffset/,
   '可计算下载进度时必须通过环形弧线长度表达百分比',
+);
+assert.match(
+  statusSource,
+  /header-update-progress-percent[\s\S]*?progress\.percent/,
+  '纯图标状态下仍必须在进度环中心展示下载百分比',
+);
+assert.doesNotMatch(
+  statusSource,
+  /header-update-action--(?:available|downloading|ready|installing|error)[\s\S]*?background:\s*color-mix/,
+  '更新状态不得使用常驻卡片背景包裹图标',
 );
 const progressMarkup = statusSource.match(
   /\{#if actionPresentation\.progress\}([\s\S]*?)\{:else\}/,

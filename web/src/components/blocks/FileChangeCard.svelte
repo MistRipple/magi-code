@@ -7,6 +7,7 @@
   import { i18n } from '../../stores/i18n.svelte';
   import { openCodeTab } from '../../stores/right-pane.svelte';
   import DiffCodeBlock from './DiffCodeBlock.svelte';
+  import { desktopContextMenu } from '../../lib/desktop-context-menu-contract';
 
   interface Props {
     block: ContentBlock;
@@ -67,6 +68,11 @@
   const displayPath = $derived(change?.changeType === 'rename' && change.oldPath
     ? `${change.oldPath} → ${change.filePath}`
     : change?.filePath);
+  const contextFileScope = $derived({
+    sessionId: filePreviewScope?.sessionId ?? change?.sessionId,
+    workspaceId: filePreviewScope?.workspaceId ?? change?.workspaceId,
+    workspacePath: filePreviewScope?.workspacePath ?? change?.workspacePath,
+  });
 
   function formatSize(size?: number): string {
     if (typeof size !== 'number' || !Number.isFinite(size) || size < 0) {
@@ -128,6 +134,12 @@
             title={displayPath}
             role="button"
             tabindex="0"
+            use:desktopContextMenu={{
+              kind: 'file',
+              filePath: change.filePath,
+              open: () => previewInRightPane(change.filePath),
+              fileScope: contextFileScope,
+            }}
             onclick={(event) => {
               event.stopPropagation();
               previewInRightPane(change.filePath);
@@ -141,7 +153,13 @@
             }}
           >{displayPath}</span>
         {:else}
-          <FileSpan filepath={change.filePath} showIcon={false} clickable={true} onClick={previewInRightPane} />
+          <FileSpan
+            filepath={change.filePath}
+            showIcon={false}
+            clickable={true}
+            onClick={previewInRightPane}
+            filePreviewScope={contextFileScope}
+          />
         {/if}
       </span>
 

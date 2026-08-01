@@ -1072,6 +1072,12 @@ export interface ResolvedAgentPath {
   kind: 'file' | 'directory';
 }
 
+export interface AgentFileRevealTarget {
+  targetPathRef: string;
+  workspaceRootPathRef: string;
+  displayPath: string;
+}
+
 function throwNormalizedDirectoryError(error: unknown): never {
   if (error instanceof TypeError) {
     throw new Error(i18n.t('bridge.agentUnreachable'));
@@ -1148,6 +1154,21 @@ export async function resolveAgentPath(
     'resolve filesystem path',
     undefined,
     false,
+  );
+}
+
+export async function resolveAgentFileRevealTarget(
+  filePath: string,
+  scope: { workspaceId?: string; workspacePath?: string; sessionId?: string },
+  signal?: AbortSignal,
+): Promise<AgentFileRevealTarget> {
+  return await postJsonWithBinding<AgentFileRevealTarget>(
+    '/api/files/reveal-target',
+    { filePath },
+    'resolve workspace file reveal target',
+    scope,
+    true,
+    signal,
   );
 }
 

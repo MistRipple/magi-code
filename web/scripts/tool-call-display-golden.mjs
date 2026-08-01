@@ -10,6 +10,21 @@ const terminalCardSource = await readFile(
   new URL('../src/components/TerminalSessionCard.svelte', import.meta.url),
   'utf8',
 );
+const modelFailureCardSource = await readFile(
+  new URL('../src/components/ModelFailureCard.svelte', import.meta.url),
+  'utf8',
+);
+
+assert.match(
+  modelFailureCardSource,
+  /\.model-failure\s*\{[\s\S]*?width:\s*100%;[\s\S]*?max-width:\s*none;[\s\S]*?box-sizing:\s*border-box;/,
+  '模型失败卡片必须跟随主消息区域占满可用宽度',
+);
+assert.doesNotMatch(
+  modelFailureCardSource,
+  /width:\s*min\(720px,\s*100%\)/,
+  '模型失败卡片不得保留独立固定宽度上限',
+);
 
 for (const [component, source] of [
   ['ToolCall', toolCallSource],

@@ -1,19 +1,23 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
   import type { IconName } from '../lib/icons';
+  import type { FilePreviewScope } from '../lib/file-reference';
+  import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
 
   interface Props {
     filepath: string;
     showIcon?: boolean;
     clickable?: boolean;
     onClick?: (filepath: string) => void;
+    filePreviewScope?: FilePreviewScope;
   }
 
   let {
     filepath,
     showIcon = true,
     clickable = true,
-    onClick
+    onClick,
+    filePreviewScope = undefined,
   }: Props = $props();
 
   function lastPathSeparatorIndex(path: string): number {
@@ -77,12 +81,19 @@
       onClick(filepath);
     }
   }
+
+  function openFile() {
+    if (clickable && onClick) {
+      onClick(filepath);
+    }
+  }
 </script>
 
 {#if clickable}
   <button 
     class="filespan" 
     class:clickable
+    use:desktopContextMenu={{ kind: 'file', filePath: filepath, open: openFile, fileScope: filePreviewScope }}
     onclick={handleClick}
     onkeydown={handleKeydown}
     title={filepath}
@@ -98,7 +109,11 @@
     {/if}
   </button>
 {:else}
-  <span class="filespan" title={filepath}>
+  <span
+    class="filespan"
+    title={filepath}
+    use:desktopContextMenu={{ kind: 'file', filePath: filepath, fileScope: filePreviewScope }}
+  >
     {#if showIcon}
       <span class="filespan-icon">
         <Icon name={fileIcon} size={14} />

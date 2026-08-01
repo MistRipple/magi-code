@@ -11,6 +11,7 @@
     normalizeFileReferenceTarget,
   } from '../lib/file-reference';
   import { vscode } from '../lib/vscode-bridge';
+  import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
 
   // Props
   interface Props {
@@ -176,6 +177,12 @@
               title={filepath}
               role="button"
               tabindex="0"
+              use:desktopContextMenu={{
+                kind: 'file',
+                filePath: filepath,
+                open: previewFilepathTarget,
+                fileScope: currentFilePreviewScope(),
+              }}
               onclick={previewFilepathClick}
               onkeydown={previewFilepathKeydown}
             >{filepath}</span>
@@ -210,7 +217,16 @@
           </div>
         {/if}
         <!-- 🔧 改用 {@html} 渲染，彻底避免 DOM 操作冲突 -->
-        <pre class="code-pre"><code
+        <pre
+          class="code-pre"
+          use:desktopContextMenu={{
+            kind: 'code',
+            content: trimmedCode,
+            filePath: filepath || undefined,
+            openFile: filepath ? previewFilepathTarget : undefined,
+            fileScope: filepath ? currentFilePreviewScope() : undefined,
+          }}
+        ><code
           class="code-text {language ? `language-${language}` : ''}"
         >{@html highlightedHtml}</code></pre>
       </div>

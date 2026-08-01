@@ -5,6 +5,7 @@ use serde_json::Value;
 const BUILD_SOURCE: &str = include_str!("../build.rs");
 const CAPABILITY_SOURCE: &str = include_str!("../capabilities/default.json");
 const DESKTOP_MAIN_SOURCE: &str = include_str!("../src/main.rs");
+const FILE_REVEAL_SOURCE: &str = include_str!("../src/file_reveal.rs");
 
 const UPDATE_COMMANDS: [&str; 5] = [
     "prepare_update_restart",
@@ -15,6 +16,7 @@ const UPDATE_COMMANDS: [&str; 5] = [
 ];
 const RUNTIME_RECOVERY_COMMANDS: [&str; 2] =
     ["get_desktop_runtime_recovery", "restart_desktop_runtime"];
+const FILE_REVEAL_COMMAND: &str = "reveal_workspace_file";
 
 #[test]
 fn remote_desktop_origin_has_only_the_required_update_command_permissions() {
@@ -114,4 +116,25 @@ fn remote_desktop_origin_can_only_open_web_urls_externally() {
             && !CAPABILITY_SOURCE.contains("opener:allow-reveal-item-in-dir"),
         "desktop external-link capability must not grant filesystem opener permissions"
     );
+}
+
+#[test]
+fn remote_desktop_origin_reveals_files_only_through_the_bounded_command() {
+    let capability: Value =
+        serde_json::from_str(CAPABILITY_SOURCE).expect("desktop capability must be valid JSON");
+    let permissions = capability["permissions"]
+        .as_array()
+        .expect("desktop capability must define permissions")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let permission = format!("allow-{}", FILE_REVEAL_COMMAND.replace('_', "-"));
+
+    assert!(permissions.contains(permission.as_str()));
+    assert!(BUILD_SOURCE.contains(&format!("\"{FILE_REVEAL_COMMAND}\"")));
+    assert!(DESKTOP_MAIN_SOURCE.contains(&format!("            {FILE_REVEAL_COMMAND},")));
+    assert!(DESKTOP_MAIN_SOURCE.contains("mod file_reveal;"));
+    assert!(FILE_REVEAL_SOURCE.contains("canonical_target.starts_with(&canonical_workspace_root)"));
+    assert!(FILE_REVEAL_SOURCE.contains("canonical_target.is_file()"));
+    assert!(FILE_REVEAL_SOURCE.contains("magi_process::std_command"));
 }

@@ -25,8 +25,6 @@
   interface ActionPresentation {
     tone: 'idle' | 'checking' | 'latest' | 'available' | 'downloading' | 'ready' | 'installing' | 'error';
     icon: IconName;
-    label: string;
-    expanded: boolean;
     spinning: boolean;
     progress: boolean;
   }
@@ -36,8 +34,6 @@
       return {
         tone: 'error',
         icon: 'warning',
-        label: i18n.t('app.update.installFirst'),
-        expanded: true,
         spinning: false,
         progress: false,
       };
@@ -48,8 +44,6 @@
         return {
           tone: 'checking',
           icon: 'refresh',
-          label: '',
-          expanded: false,
           spinning: true,
           progress: false,
         };
@@ -57,8 +51,6 @@
         return {
           tone: 'latest',
           icon: 'check-circle',
-          label: '',
-          expanded: false,
           spinning: false,
           progress: false,
         };
@@ -66,8 +58,6 @@
         return {
           tone: 'available',
           icon: 'download',
-          label: i18n.t('app.update.update'),
-          expanded: true,
           spinning: false,
           progress: false,
         };
@@ -75,8 +65,6 @@
         return {
           tone: 'downloading',
           icon: 'download',
-          label: progress?.percent === undefined ? '…' : `${progress.percent}%`,
-          expanded: true,
           spinning: false,
           progress: true,
         };
@@ -84,8 +72,6 @@
         return {
           tone: 'ready',
           icon: 'restart',
-          label: i18n.t('app.update.restart'),
-          expanded: true,
           spinning: false,
           progress: false,
         };
@@ -93,8 +79,6 @@
         return {
           tone: 'installing',
           icon: 'restart',
-          label: '',
-          expanded: false,
           spinning: true,
           progress: false,
         };
@@ -102,8 +86,6 @@
         return {
           tone: 'error',
           icon: 'warning',
-          label: i18n.t('app.update.retry'),
-          expanded: true,
           spinning: false,
           progress: false,
         };
@@ -111,8 +93,6 @@
         return {
           tone: 'idle',
           icon: 'refresh',
-          label: '',
-          expanded: false,
           spinning: false,
           progress: false,
         };
@@ -215,7 +195,6 @@
       <button
         type="button"
         class={`header-update-action header-update-action--${actionPresentation.tone}`}
-        class:header-update-action--expanded={actionPresentation.expanded}
         aria-label={actionTitle}
         title={actionTitle}
         aria-busy={phase === 'checking' || phase === 'downloading' || phase === 'installing'}
@@ -223,31 +202,33 @@
         onclick={activateAction}
       >
         {#if actionPresentation.progress}
-          <svg
-            class="header-update-progress-ring"
-            class:header-update-progress-ring--indeterminate={progress?.percent === undefined}
-            viewBox="0 0 20 20"
-            aria-hidden="true"
-          >
-            <circle class="header-update-progress-track" cx="10" cy="10" r="8" pathLength="100"></circle>
-            <circle
-              class="header-update-progress-value"
-              cx="10"
-              cy="10"
-              r="8"
-              pathLength="100"
-              style:stroke-dashoffset={100 - downloadProgress}
-            ></circle>
-          </svg>
+          <span class="header-update-progress">
+            <svg
+              class="header-update-progress-ring"
+              class:header-update-progress-ring--indeterminate={progress?.percent === undefined}
+              viewBox="0 0 20 20"
+              aria-hidden="true"
+            >
+              <circle class="header-update-progress-track" cx="10" cy="10" r="8" pathLength="100"></circle>
+              <circle
+                class="header-update-progress-value"
+                cx="10"
+                cy="10"
+                r="8"
+                pathLength="100"
+                style:stroke-dashoffset={100 - downloadProgress}
+              ></circle>
+            </svg>
+            {#if progress?.percent !== undefined}
+              <span class="header-update-progress-percent">{progress.percent}</span>
+            {/if}
+          </span>
         {:else}
           <Icon
             name={actionPresentation.icon}
             size={14}
             class={`header-update-action-icon${actionPresentation.spinning ? ' header-update-action-icon--spinning' : ''}`}
           />
-        {/if}
-        {#if actionPresentation.label}
-          <span class="header-update-action-label">{actionPresentation.label}</span>
         {/if}
       </button>
     </span>
@@ -278,11 +259,11 @@
 
   .header-update-action-slot {
     display: inline-flex;
-    width: 70px;
+    width: 32px;
     height: 32px;
     align-items: center;
-    justify-content: flex-end;
-    flex: 0 0 70px;
+    justify-content: center;
+    flex: 0 0 32px;
   }
 
   .header-update-action {
@@ -295,18 +276,11 @@
     flex: 0 0 32px;
     padding: 0;
     border: 0;
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius-md);
     background: transparent;
-    gap: 4px;
     color: var(--update-tone);
     cursor: pointer;
-    transition: width var(--transition-fast), background var(--transition-fast), color var(--transition-fast), opacity var(--transition-fast);
-  }
-
-  .header-update-action--expanded {
-    width: 70px;
-    flex-basis: 70px;
-    padding: 0 7px;
+    transition: background var(--transition-fast), color var(--transition-fast), opacity var(--transition-fast);
   }
 
   .header-update-action--idle {
@@ -323,27 +297,22 @@
 
   .header-update-action--available {
     --update-tone: var(--warning, #d97706);
-    background: color-mix(in srgb, var(--warning, #d97706) 11%, transparent);
   }
 
   .header-update-action--downloading {
     --update-tone: var(--color-codex, var(--info, #3b82f6));
-    background: color-mix(in srgb, var(--color-codex, var(--info, #3b82f6)) 10%, transparent);
   }
 
   .header-update-action--ready {
     --update-tone: var(--success, #16a34a);
-    background: color-mix(in srgb, var(--success, #16a34a) 14%, transparent);
   }
 
   .header-update-action--installing {
     --update-tone: var(--color-orchestrator, #8b5cf6);
-    background: color-mix(in srgb, var(--color-orchestrator, #8b5cf6) 10%, transparent);
   }
 
   .header-update-action--error {
     --update-tone: var(--error, #dc2626);
-    background: color-mix(in srgb, var(--error, #dc2626) 9%, transparent);
   }
 
   .header-update-action:hover:not([aria-disabled='true']) {
@@ -371,20 +340,19 @@
     animation: header-update-action-spin 0.8s linear infinite;
   }
 
-  .header-update-action-label {
-    min-width: 0;
-    color: currentColor;
-    font-size: 11px;
-    font-weight: var(--font-semibold);
-    font-variant-numeric: tabular-nums;
-    line-height: 1;
-    white-space: nowrap;
+  .header-update-progress {
+    position: relative;
+    display: inline-flex;
+    width: 20px;
+    height: 20px;
+    align-items: center;
+    justify-content: center;
   }
 
   .header-update-progress-ring {
-    width: 18px;
-    height: 18px;
-    flex: 0 0 18px;
+    width: 20px;
+    height: 20px;
+    flex: 0 0 20px;
     overflow: visible;
     transform: rotate(-90deg);
   }
@@ -413,6 +381,20 @@
   .header-update-progress-ring--indeterminate .header-update-progress-value {
     stroke-dasharray: 28 72;
     stroke-dashoffset: 0 !important;
+  }
+
+  .header-update-progress-percent {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: currentColor;
+    font-size: 6.5px;
+    font-weight: var(--font-semibold);
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    pointer-events: none;
   }
 
   @keyframes header-update-action-spin {

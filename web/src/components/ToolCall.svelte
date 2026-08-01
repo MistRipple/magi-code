@@ -27,6 +27,7 @@
     parseImageGenerationPreview,
   } from '../lib/image-generation-preview';
   import { agentUrl, buildFilePreviewQuery } from '../web/agent-api';
+  import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
   import {
     ACCESS_MODE_APPROVAL_ERROR_CODES,
     isAccessModeApprovalErrorPayload,
@@ -846,7 +847,13 @@
       </span>
     {/if}
     {#if toolFilepath && !hasError}
-      <FileSpan filepath={toolFilepath} showIcon={false} clickable={true} onClick={handleOpenFile} />
+      <FileSpan
+        filepath={toolFilepath}
+        showIcon={false}
+        clickable={true}
+        onClick={handleOpenFile}
+        filePreviewScope={filePreviewScope}
+      />
     {:else if headerSummary}
       <span class="tool-summary" title={headerSummary}>{headerSummary}</span>
     {/if}
@@ -1014,6 +1021,12 @@
                       onclick={imagePreview.path ? handleOpenFile : undefined}
                       disabled={!imagePreview.path}
                       title={imagePreview.path ? i18n.t('toolCall.openGeneratedImage') : undefined}
+                      use:desktopContextMenu={{
+                        kind: 'image',
+                        filePath: imagePreview.path || undefined,
+                        fileScope: filePreviewScope,
+                        open: imagePreview.path ? handleOpenFile : undefined,
+                      }}
                     >
                       <img src={imagePreview.src} alt={imagePreview.path || toolDisplayName} />
                     </button>

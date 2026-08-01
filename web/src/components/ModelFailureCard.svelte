@@ -140,7 +140,9 @@
 
 <style>
   .model-failure {
-    width: min(720px, 100%);
+    width: 100%;
+    max-width: none;
+    box-sizing: border-box;
     padding: var(--space-3) var(--space-4);
     border: 1px solid color-mix(in srgb, var(--error) 42%, var(--border));
     border-left: 3px solid var(--error);

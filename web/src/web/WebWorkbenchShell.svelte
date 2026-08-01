@@ -520,13 +520,13 @@
     }
 
     if (!bootstrapSessionId) {
-      // bootstrap 清空（删除/关闭/新建当前会话）→ 同步清空本地指针 + URL 参数
+      // 当前会话指针与工作区会话目录是两个独立投影。进入草稿只同步指针和 URL，
+      // 目录只能由显式加载或增删改结果更新，不能因指针清空而重新请求。
       invalidateWorkspaceSessionRequests(authoritativeWorkspaceId);
       currentSessionId = '';
       clearPendingSessionSwitchState();
       if (workspace) {
         syncBrowserSessionBinding(workspace.workspaceId, workspaceBindingPath(workspace), null);
-        void loadWorkspaceSessionsForSidebar(workspace);
       }
       return;
     }
@@ -1381,8 +1381,11 @@
     clearPendingSessionSwitchState();
     currentSessionId = null;
 
-    if (sessionsAlreadyLoaded) {
-      replaceWorkspaceSessionProjection(workspaceId, getWorkspaceSessionList(workspaceId));
+    if (
+      sessionsAlreadyLoaded
+      && messagesState.workspaceSessionProjection.workspaceId !== workspaceId
+    ) {
+      replaceWorkspaceSessionProjection(workspaceId, sessionsByWorkspace[workspaceId] ?? []);
     }
 
     if (!alreadyCurrentDraft) {
@@ -1402,7 +1405,7 @@
         !messagesState.currentSessionId?.trim()
         && currentBootstrapWorkspaceId() === workspaceId
       ) {
-        replaceWorkspaceSessionProjection(workspaceId, getWorkspaceSessionList(workspaceId));
+        replaceWorkspaceSessionProjection(workspaceId, sessionsByWorkspace[workspaceId] ?? []);
       }
     }
   }
