@@ -39,11 +39,10 @@
   import { i18n } from '../stores/i18n.svelte';
   import type { EditContentKind, Session } from '../types/message';
   import {
-    cycleWebThemePreference,
-    subscribeWebTheme,
-    type WebThemeMode,
-    type WebThemePreference,
-  } from './theme';
+    cycleBuiltinAppearance,
+    subscribeAppearanceRuntime,
+    type AppearanceRuntimeSnapshot,
+  } from '../appearance/runtime';
   import {
     RUNTIME_CONNECTION_EVENT,
     resolveAgentPath,
@@ -116,8 +115,12 @@
   let sessionRenameError = $state('');
   let renamingSessionId = $state<string | null>(null);
   let sessionRenameInput = $state<HTMLInputElement | null>(null);
-  let webThemePreference = $state<WebThemePreference>('system');
-  let webThemeMode = $state<WebThemeMode>('dark');
+  let appearanceRuntime = $state<AppearanceRuntimeSnapshot>({
+    library: null,
+    activeTheme: null,
+    mode: 'dark',
+    previewing: false,
+  });
   let sidebarMode = $state<'projects' | 'files'>(readInitialSidebarMode());
   let sidebarWidth = $state<number | null>(null);
   let isSidebarResizing = $state(false);
@@ -610,48 +613,25 @@
   }
 
 
-  function getThemePreferenceLabel(preference: WebThemePreference): string {
-    switch (preference) {
-      case 'light':
-        return i18n.t('web.themeLight');
-      case 'dark':
-        return i18n.t('web.themeDark');
-      default:
-        return i18n.t('web.themeSystem');
-    }
-  }
-
-  function getThemeIconName(preference: WebThemePreference): IconName {
-    switch (preference) {
-      case 'light':
-        return 'sun';
-      case 'dark':
-        return 'moon';
-      default:
-        return 'monitor';
-    }
-  }
-
-  function getNextThemePreference(preference: WebThemePreference): WebThemePreference {
-    switch (preference) {
-      case 'system':
-        return 'light';
-      case 'light':
-        return 'dark';
-      default:
-        return 'system';
-    }
-  }
-
-  const themeIconName = $derived.by(() => getThemeIconName(webThemePreference));
+  const themeIconName = $derived.by<IconName>(() => {
+    if (appearanceRuntime.activeTheme?.id === 'builtin.system') return 'monitor';
+    return appearanceRuntime.mode === 'light' ? 'sun' : 'moon';
+  });
   const themeToggleTitle = $derived.by(() => {
-    const currentLabel = getThemePreferenceLabel(webThemePreference);
-    const nextLabel = getThemePreferenceLabel(getNextThemePreference(webThemePreference));
-    return i18n.t('web.themeToggleTitle', { current: currentLabel, next: nextLabel });
+    return appearanceRuntime.activeTheme?.name || i18n.t('web.themeSystem');
   });
 
   function toggleWebTheme(): void {
-    cycleWebThemePreference();
+    void cycleBuiltinAppearance().catch((error) => {
+      const message = directIncidentError(error, i18n.t('appearance.applyFailed'));
+      reportIncident(message, {
+        scope: 'workspace',
+        title: i18n.t('appearance.applyFailed'),
+        ...incidentErrorDiagnostics(error, message),
+        failureStage: 'appearance_activation',
+        source: 'appearance-runtime',
+      });
+    });
   }
 
   function syncBrowserSessionBinding(workspaceId: string, workspacePath: string, sessionId: string | null): void {
@@ -1862,9 +1842,8 @@
   });
 
   onMount(() => {
-    return subscribeWebTheme((snapshot) => {
-      webThemePreference = snapshot.preference;
-      webThemeMode = snapshot.mode;
+    return subscribeAppearanceRuntime((snapshot) => {
+      appearanceRuntime = snapshot;
     });
   });
 </script>
@@ -1921,8 +1900,8 @@
             type="button"
             data-tooltip={themeToggleTitle}
             aria-label={themeToggleTitle}
-            data-theme-preference={webThemePreference}
-            data-theme-mode={webThemeMode}
+            data-theme-id={appearanceRuntime.activeTheme?.id || ''}
+            data-theme-mode={appearanceRuntime.mode}
             onclick={toggleWebTheme}
           >
             <Icon name={themeIconName} size={14} />
@@ -2212,7 +2191,7 @@
       class:workbench-body--with-preview={rightPaneVisible && !previewIsOverlay}
       class:workbench-body--overlay-preview={rightPaneVisible && previewIsOverlay}
     >
-      <div class="workbench-app-pane">
+      <div class="workbench-app-pane" data-testid="workbench-app-pane">
         <App />
       </div>
       {#if rightPaneVisible && RightPaneComponent}
@@ -2273,8 +2252,8 @@
     {/if}
 
     {#snippet footer()}
-      <button class="modal-btn secondary" type="button" onclick={() => closeRemoveWorkspaceDialog()} disabled={workspaceActionPending}>{i18n.t('web.folderPickerCancel')}</button>
-      <button class="modal-btn danger" type="button" onclick={() => void removeWorkspace()} disabled={workspaceActionPending}>
+      <button class="btn btn--secondary" type="button" onclick={() => closeRemoveWorkspaceDialog()} disabled={workspaceActionPending}>{i18n.t('web.folderPickerCancel')}</button>
+      <button class="btn btn--danger" type="button" onclick={() => void removeWorkspace()} disabled={workspaceActionPending}>
         {workspaceActionPending ? i18n.t('web.removingWorkspace') : i18n.t('web.confirmRemoveWorkspace')}
       </button>
     {/snippet}
@@ -2291,8 +2270,8 @@
     <p>{i18n.t('header.deleteSessionConfirm', { name: pendingDeleteSession.session.name || i18n.t('header.unnamedSession') })}</p>
 
     {#snippet footer()}
-      <button class="modal-btn secondary" type="button" onclick={closeDeleteSessionDialog}>{i18n.t('header.cancel')}</button>
-      <button class="modal-btn danger" type="button" onclick={confirmDeleteSession}>{i18n.t('header.confirmDelete')}</button>
+      <button class="btn btn--secondary" type="button" onclick={closeDeleteSessionDialog}>{i18n.t('header.cancel')}</button>
+      <button class="btn btn--danger" type="button" onclick={confirmDeleteSession}>{i18n.t('header.confirmDelete')}</button>
     {/snippet}
   </Modal>
 {/if}
@@ -2306,7 +2285,7 @@
     width: 100vw;
     padding: 8px;
     box-sizing: border-box;
-    background: var(--background);
+    background: transparent;
     color: var(--foreground);
     isolation: isolate;
     overflow: hidden;
@@ -2361,7 +2340,7 @@
     padding: var(--space-4);
     border-radius: var(--radius-lg);
     border: 1px solid var(--border);
-    background: var(--background);
+    background: var(--magi-surface-sidebar);
     overflow: visible;
   }
 
@@ -2498,8 +2477,8 @@
     color: var(--foreground);
   }
 
-  .theme-toggle-btn[data-theme-preference='light'],
-  .theme-toggle-btn[data-theme-preference='dark'] {
+  .theme-toggle-btn[data-theme-id='builtin.light'],
+  .theme-toggle-btn[data-theme-id='builtin.dark'] {
     color: var(--primary);
   }
 
@@ -3156,6 +3135,9 @@
        外层 .web-workbench-shell 已用 isolation: isolate 做了一层隔离。 */
     min-width: 0;
     min-height: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--magi-surface-main);
     overflow: hidden;
   }
 
@@ -3258,9 +3240,8 @@
     position: absolute;
     inset: 0;
     z-index: var(--z-overlay-preview);
-    border-radius: 0;
-    border: none;
-    border-left: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border);
     background: var(--background);
     box-shadow: var(--shadow-lg);
   }
@@ -3308,6 +3289,12 @@
     .web-workbench-shell {
       padding: 0;
       gap: 0;
+    }
+
+    .workbench-app-pane,
+    .web-workbench-shell--preview-overlay :global(.right-pane) {
+      border: 0;
+      border-radius: 0;
     }
 
     .web-workbench-shell--sidebar-drawer .sidebar {

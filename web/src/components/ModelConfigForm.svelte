@@ -159,20 +159,20 @@
 <div class="llm-config-form" oninput={markUserEdited} onchange={markUserEdited}>
   <div class="llm-config-field-row url-mode-row">
     <div class="llm-config-field">
-      <label class="llm-config-label">{i18n.t('settings.model.field.baseUrl')}</label>
+      <label class="form-label">{i18n.t('settings.model.field.baseUrl')}</label>
       <input
         type="text"
-        class="llm-config-input"
+        class="form-input"
         bind:value={config.baseUrl}
         placeholder={getBaseUrlPlaceholder()}
       />
     </div>
     <div class="llm-config-field llm-config-field--compact">
-      <label class="llm-config-label">{i18n.t('settings.model.field.urlMode')}</label>
-      <div class="segmented-control">
+      <label class="form-label">{i18n.t('settings.model.field.urlMode')}</label>
+      <div class="ui-segmented url-mode-switch">
         <button
           type="button"
-          class="segmented-control__option"
+          class="ui-segmented__option"
           class:active={config.urlMode === 'standard'}
           onclick={() => { config.urlMode = 'standard'; markUserEdited(); }}
         >
@@ -180,7 +180,7 @@
         </button>
         <button
           type="button"
-          class="segmented-control__option"
+          class="ui-segmented__option"
           class:active={config.urlMode === 'full'}
           onclick={() => { config.urlMode = 'full'; markUserEdited(); }}
         >
@@ -197,10 +197,10 @@
 
   {#if showProtocolField}
     <div class="llm-config-field protocol-field">
-      <label class="llm-config-label">{i18n.t('settings.model.field.apiProtocol')}</label>
+      <label class="form-label">{i18n.t('settings.model.field.apiProtocol')}</label>
       <div class="protocol-control-row">
         <select
-          class="llm-config-select protocol-select"
+          class="form-input protocol-select"
           bind:value={config.apiProtocol}
           aria-label={i18n.t('settings.model.field.apiProtocol')}
           title={i18n.t('settings.model.protocolHint')}
@@ -230,11 +230,11 @@
     class:key-only={!showModelField && !showAdvancedOptions}
   >
     <div class="llm-config-field">
-      <label class="llm-config-label">{i18n.t('settings.model.field.apiKey')}</label>
+      <label class="form-label">{i18n.t('settings.model.field.apiKey')}</label>
       <div class="api-key-wrapper">
         <input
           type={keyVisible[keyVisibleKey] ? 'text' : 'password'}
-          class="llm-config-input api-key-input"
+          class="form-input api-key-input"
           bind:value={config.apiKey}
           placeholder="sk-ant-..."
         />
@@ -251,11 +251,11 @@
 
     {#if showModelField}
       <div class="llm-config-field">
-        <label class="llm-config-label">{i18n.t('settings.model.field.model')}</label>
+        <label class="form-label">{i18n.t('settings.model.field.model')}</label>
         <div class="model-combobox" bind:this={comboboxEl}>
           <input
             type="text"
-            class="llm-config-input"
+            class="form-input"
             bind:value={config.model}
             onfocus={(e) => {
               if ((modelLists[statusKey]?.length ?? 0) > 0) openModelDropdown(statusKey, e.currentTarget);
@@ -279,6 +279,7 @@
             <div
               bind:this={dropdownEl}
               class="model-dropdown"
+              data-magi-surface="popover"
               style="top: {dropdownPosition.top}px; left: {dropdownPosition.left}px; width: {dropdownPosition.width}px;"
             >
               {#each modelLists[statusKey] as m}
@@ -298,8 +299,8 @@
 
     {#if showAdvancedOptions}
       <div class="llm-config-field">
-        <label class="llm-config-label">{i18n.t('settings.model.field.level')}</label>
-        <select class="llm-config-select" bind:value={config.reasoningEffort}>
+        <label class="form-label">{i18n.t('settings.model.field.level')}</label>
+        <select class="form-input" bind:value={config.reasoningEffort}>
           <option value="low">{i18n.t('settings.model.reasoning.low')}</option>
           <option value="medium">{i18n.t('settings.model.reasoning.medium')}</option>
           <option value="high">{i18n.t('settings.model.reasoning.high')}</option>
@@ -331,10 +332,10 @@
     {/if}
     <div class="settings-section-actions">
       <button
-        class="apple-action-btn secondary"
-        class:testing={currentTestStatus === 'testing'}
-        class:success={currentTestStatus === 'success'}
-        class:error={currentTestStatus === 'error'}
+        class="btn btn--secondary btn--sm"
+        class:is-testing={currentTestStatus === 'testing'}
+        class:is-success={currentTestStatus === 'success'}
+        class:is-error={currentTestStatus === 'error'}
         onclick={() => testModelConnection(formType)}
         disabled={isTesting}
       >
@@ -353,8 +354,8 @@
         {/if}
       </button>
       <button
-        class="apple-action-btn primary"
-        class:saving={isSaving}
+        class="btn btn--primary btn--sm"
+        class:is-saving={isSaving}
         onclick={() => saveModelConfig(formType)}
         disabled={saveDisabled}
       >
@@ -402,11 +403,6 @@
   .llm-config-field-row.url-mode-row {
     grid-template-columns: minmax(0, 1fr) 180px;
     align-items: end;
-  }
-
-  .llm-config-label {
-    font-size: var(--text-sm);
-    color: var(--foreground-muted);
   }
 
   .llm-config-field--compact {
@@ -469,66 +465,12 @@
     line-height: 1.45;
   }
 
-  .llm-config-input,
-  .llm-config-select {
-    height: var(--btn-height-md);
-    padding: 0 var(--space-3);
-    font-size: var(--text-sm);
-    width: 100%;
-    box-sizing: border-box;
-  }
-
-  .llm-config-input:focus,
-  .llm-config-select:focus {
-    border-color: var(--primary);
-  }
-
-  .segmented-control {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    overflow: hidden;
-    min-width: 0;
-    height: var(--btn-height-md);
-    background: var(--surface-2);
-  }
-
-  .segmented-control__option {
-    border: none;
-    background: transparent;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    font-weight: var(--font-medium);
-    cursor: pointer;
-    transition: all var(--transition-fast);
-    min-width: 0;
-    padding: 0 var(--space-2);
-    white-space: nowrap;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-  }
-
-  .segmented-control__option + .segmented-control__option {
-    border-left: 1px solid var(--border);
-  }
-
-  .segmented-control__option:hover {
-    color: var(--foreground);
-    background: var(--surface-3);
-  }
-
-  .segmented-control__option.active {
-    background: var(--primary);
-    color: var(--primary-foreground);
-  }
+  .url-mode-switch { min-width: 0; }
 
   .api-key-wrapper {
     position: relative;
   }
-  .api-key-wrapper .api-key-input {
+  .api-key-wrapper .form-input {
     padding-right: 32px;
   }
   .api-key-toggle {
@@ -559,7 +501,7 @@
   .model-combobox {
     position: relative;
   }
-  .model-combobox .llm-config-input {
+  .model-combobox .form-input {
     padding-right: 32px;
   }
   .model-fetch-btn {
@@ -590,7 +532,6 @@
     z-index: var(--z-popover);
     max-height: 200px;
     overflow-y: auto;
-    background: var(--vscode-input-background, var(--surface-2));
     border: 1px solid var(--border);
     border-top: none;
     border-radius: 0 0 var(--radius-sm) var(--radius-sm);
@@ -672,7 +613,7 @@
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: var(--space-2);
     }
-    .model-form-actions :global(.apple-action-btn) {
+    .model-form-actions :global(.btn) {
       width: 100%;
       justify-content: center;
     }
@@ -704,7 +645,7 @@
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: var(--space-2);
     }
-    .model-form-actions :global(.apple-action-btn) {
+    .model-form-actions :global(.btn) {
       width: 100%;
       justify-content: center;
     }

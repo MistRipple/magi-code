@@ -192,7 +192,7 @@
         {/if}
       </button>
       {#if activeHeaderPanel === 'more'}
-        <div class="header-more-menu">
+        <div class="header-more-menu" data-magi-surface="popover">
           <div class="header-menu-section-label">{i18n.t('header.more')}</div>
           <button class="header-menu-item header-mobile-menu-item" type="button" onclick={() => setNotificationOpen(true)}>
             <Icon name="bell" size={14} />

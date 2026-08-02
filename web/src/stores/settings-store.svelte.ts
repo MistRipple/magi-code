@@ -293,7 +293,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   const clientKind = getClientKind();
 
   // 当前激活的 Tab
-  let activeTab = $state<"stats" | "model" | "agents" | "tools" | "rules" | "project">(
+  let activeTab = $state<"appearance" | "stats" | "model" | "agents" | "tools" | "rules" | "project">(
     "model",
   );
 

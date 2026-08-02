@@ -787,6 +787,7 @@ pub struct ApiState {
     pub governance: Arc<GovernanceService>,
     pub knowledge_store: Arc<KnowledgeStore>,
     pub settings_store: Arc<SettingsStore>,
+    pub appearance_library: Arc<magi_appearance::AppearanceLibrary>,
     runtime_persistence: Option<Arc<RuntimeStatePersistence>>,
     session_state_checkpoint_persist: Option<SessionStateCheckpointPersist>,
     bridge_probe_snapshot_provider: BridgeProbeSnapshotProvider,
@@ -980,6 +981,7 @@ impl ApiState {
             governance,
             knowledge_store: Arc::new(KnowledgeStore::new()),
             settings_store: Arc::new(SettingsStore::new()),
+            appearance_library: Arc::new(magi_appearance::AppearanceLibrary::in_memory()),
             runtime_persistence: None,
             session_state_checkpoint_persist: None,
             bridge_probe_snapshot_provider: BridgeProbeSnapshotProvider::default(),
@@ -1813,6 +1815,14 @@ impl ApiState {
 
     pub fn with_settings_store(mut self, store: Arc<SettingsStore>) -> Self {
         self.settings_store = store;
+        self
+    }
+
+    pub fn with_appearance_library(
+        mut self,
+        library: Arc<magi_appearance::AppearanceLibrary>,
+    ) -> Self {
+        self.appearance_library = library;
         self
     }
 

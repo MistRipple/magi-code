@@ -110,6 +110,7 @@
   <div
     bind:this={dialogEl}
     class="modal-dialog modal-dialog--{size}"
+    data-magi-surface="window"
     role="dialog"
     aria-modal="true"
     aria-labelledby={title ? 'modal-title' : undefined}

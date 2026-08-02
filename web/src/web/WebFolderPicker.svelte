@@ -276,8 +276,8 @@
         <Icon name="close" size={24} />
         <div class="mac-empty-text">{error}</div>
         <div class="mac-empty-actions">
-          <button class="apple-action-btn secondary" onclick={retryLoad}>{i18n.t('web.folderPickerRetry')}</button>
-          <button class="apple-action-btn" onclick={toggleManualInput}>{i18n.t('web.folderPickerManualPath')}</button>
+          <button class="btn btn--secondary btn--sm" onclick={retryLoad}>{i18n.t('web.folderPickerRetry')}</button>
+          <button class="btn btn--primary btn--sm" onclick={toggleManualInput}>{i18n.t('web.folderPickerManualPath')}</button>
         </div>
       </div>
     {:else if entries.length === 0}
@@ -322,11 +322,11 @@
     </div>
     
     <div class="mac-footer-right">
-      <button class="apple-action-btn secondary" onclick={onCancel} disabled={disabled}>{i18n.t('web.folderPickerCancel')}</button>
+      <button class="btn btn--secondary btn--sm" onclick={onCancel} disabled={disabled}>{i18n.t('web.folderPickerCancel')}</button>
       {#if selectedPathRef}
-        <button class="apple-action-btn primary" onclick={confirmSelection} disabled={disabled || loading}>{i18n.t('web.folderPickerConfirm')}</button>
+        <button class="btn btn--primary btn--sm" onclick={confirmSelection} disabled={disabled || loading}>{i18n.t('web.folderPickerConfirm')}</button>
       {:else}
-        <button class="apple-action-btn primary" onclick={selectCurrentDir} disabled={disabled || loading || !hasLoaded}>{i18n.t('web.folderPickerSelectCurrent')}</button>
+        <button class="btn btn--primary btn--sm" onclick={selectCurrentDir} disabled={disabled || loading || !hasLoaded}>{i18n.t('web.folderPickerSelectCurrent')}</button>
       {/if}
     </div>
   </div>
@@ -736,43 +736,6 @@
   .mac-selected-hint strong {
     color: var(--foreground);
     font-weight: 600;
-  }
-
-  /* Apple风格按钮重用 */
-  .apple-action-btn {
-    height: 30px;
-    padding: 0 14px;
-    border-radius: 6px;
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-    border: 1px solid transparent;
-    transition: all 0.2s ease;
-  }
-
-  .apple-action-btn.primary {
-    background: var(--primary);
-    color: var(--primary-foreground);
-    box-shadow: 0 1px 3px rgba(var(--primary-rgb, 0, 122, 255), 0.3);
-  }
-
-  .apple-action-btn.primary:hover:not(:disabled) {
-    filter: brightness(1.1);
-  }
-
-  .apple-action-btn.secondary {
-    background: rgba(var(--foreground-rgb, 100, 100, 100), 0.06);
-    color: var(--foreground);
-    border-color: rgba(var(--foreground-rgb, 100, 100, 100), 0.1);
-  }
-
-  .apple-action-btn.secondary:hover:not(:disabled) {
-    background: rgba(var(--foreground-rgb, 100, 100, 100), 0.1);
-  }
-
-  .apple-action-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
   }
 
   /* 加载动画 */

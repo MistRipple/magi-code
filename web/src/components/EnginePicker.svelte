@@ -167,6 +167,7 @@
       bind:this={popupEl}
       class="engine-picker-popup"
       class:drop-up={dropUp}
+      data-magi-surface="popover"
       role="listbox"
       tabindex="-1"
       onkeydown={onListKey}
@@ -311,7 +312,6 @@
     left: 0;
     right: 0;
     z-index: 50;
-    background: var(--ind-bg-elevated, var(--background));
     border: 1px solid var(--ind-border-separator);
     border-radius: 10px;
     padding: 4px;

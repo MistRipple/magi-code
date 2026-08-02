@@ -1,0 +1,17 @@
+[package]
+name = "magi-appearance"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+base64.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zip.workspace = true
+magi-core = { path = "../magi-core" }
+
+[dev-dependencies]
+tempfile = "3"

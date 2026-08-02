@@ -6,6 +6,7 @@ import SettingsAgentsTab from './SettingsAgentsTab.svelte';
 import SettingsModelTab from './SettingsModelTab.svelte';
 import SettingsToolsTab from './SettingsToolsTab.svelte';
 import SettingsProjectTab from './SettingsProjectTab.svelte';
+import SettingsAppearanceTab from './SettingsAppearanceTab.svelte';
 import Icon from './Icon.svelte';
 import Modal from './Modal.svelte';
 import Toggle from './Toggle.svelte';
@@ -35,7 +36,7 @@ import { getAgentColor } from '../lib/agent-colors';
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div class="settings-overlay">
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="magi-settings-layout" onclick={(e) => e.stopPropagation()}>
+  <div class="magi-settings-layout" data-magi-surface="window" onclick={(e) => e.stopPropagation()}>
     <!-- 左侧导航 -->
     <aside class="settings-sidebar">
       <div class="sidebar-header">
@@ -95,6 +96,16 @@ import { getAgentColor } from '../lib/agent-colors';
         <button
           type="button"
           class="nav-item"
+          class:active={store.activeTab === 'appearance'}
+          aria-label={i18n.t('settings.zone.appearance')}
+          onclick={() => store.activeTab = 'appearance'}
+        >
+          <Icon name="sparkles" size={16} />
+          <span>{i18n.t('settings.zone.appearance')}</span>
+        </button>
+        <button
+          type="button"
+          class="nav-item"
           class:active={store.activeTab === 'project'}
           aria-label={i18n.t('settings.zone.project')}
           onclick={() => store.activeTab = 'project'}
@@ -107,7 +118,7 @@ import { getAgentColor } from '../lib/agent-colors';
         {#if store.userInfo && store.clientKind === 'vscode'}
           <div class="logout-section">
             <span class="user-info-text" title={store.userInfo}>{store.userInfo}</span>
-            <button class="settings-btn secondary" onclick={store.logout}>{i18n.t('settings.logout')}</button>
+            <button class="btn btn--secondary btn--sm" onclick={store.logout}>{i18n.t('settings.logout')}</button>
           </div>
         {/if}
       </div>
@@ -117,35 +128,40 @@ import { getAgentColor } from '../lib/agent-colors';
     <main class="settings-main">
       <header class="main-header">
         <div class="header-breadcrumbs">
-          {#if store.activeTab === 'model'}
-            <div style="display: flex; align-items: baseline; gap: 12px;">
+          {#if store.activeTab === 'appearance'}
+            <div class="header-title-group">
+              <h2>{i18n.t('settings.zone.appearance')}</h2>
+              <span class="header-description">{i18n.t('settings.zone.appearanceDesc')}</span>
+            </div>
+          {:else if store.activeTab === 'model'}
+            <div class="header-title-group">
               <h2>{i18n.t('settings.zone.quickStart')}</h2>
-              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.zone.quickStartDesc')}</span>
+              <span class="header-description">{i18n.t('settings.zone.quickStartDesc')}</span>
             </div>
           {:else if store.activeTab === 'tools'}
-            <div style="display: flex; align-items: baseline; gap: 12px;">
+            <div class="header-title-group">
               <h2>{i18n.t('settings.zone.capabilities')}</h2>
-              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.zone.capabilitiesDesc')}</span>
+              <span class="header-description">{i18n.t('settings.zone.capabilitiesDesc')}</span>
             </div>
           {:else if store.activeTab === 'rules'}
-            <div style="display: flex; align-items: baseline; gap: 12px;">
+            <div class="header-title-group">
               <h2>{i18n.t('settings.zone.preferences')}</h2>
-              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.zone.preferencesDesc')}</span>
+              <span class="header-description">{i18n.t('settings.zone.preferencesDesc')}</span>
             </div>
           {:else if store.activeTab === 'stats'}
-            <div style="display: flex; align-items: baseline; gap: 12px;">
+            <div class="header-title-group">
               <h2>{i18n.t('settings.zone.usage')}</h2>
-              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.zone.usageDesc')}</span>
+              <span class="header-description">{i18n.t('settings.zone.usageDesc')}</span>
             </div>
           {:else if store.activeTab === 'agents'}
-            <div style="display: flex; align-items: baseline; gap: 12px;">
+            <div class="header-title-group">
               <h2>{i18n.t('settings.zone.roles')}</h2>
-              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.zone.rolesDesc')}</span>
+              <span class="header-description">{i18n.t('settings.zone.rolesDesc')}</span>
             </div>
           {:else if store.activeTab === 'project'}
-            <div style="display: flex; align-items: baseline; gap: 12px;">
+            <div class="header-title-group">
               <h2>{i18n.t('settings.zone.project')}</h2>
-              <span style="font-size: 12px; color: var(--foreground-muted); font-weight: 500;">{i18n.t('settings.zone.projectDesc')}</span>
+              <span class="header-description">{i18n.t('settings.zone.projectDesc')}</span>
             </div>
           {/if}
         </div>
@@ -182,7 +198,9 @@ import { getAgentColor } from '../lib/agent-colors';
 
       <!-- Tab 内容区域 -->
       <div class="settings-tab-content scroll-content" onscroll={() => { store.closeAllModelDropdowns(); }}>
-      {#if store.activeTab === 'project'}
+      {#if store.activeTab === 'appearance'}
+        <SettingsAppearanceTab />
+      {:else if store.activeTab === 'project'}
         <SettingsProjectTab />
       {:else if store.activeTab === 'stats'}
         <!-- 统计 Tab -->
@@ -223,11 +241,11 @@ import { getAgentColor } from '../lib/agent-colors';
       <h3>{store.inputDialogTitle}</h3>
     {/snippet}
     <div class="form-field">
-      <input type="text" bind:value={store.inputDialogValue} placeholder={i18n.t('settings.dialog.inputPlaceholder')}>
+      <input class="form-input" type="text" bind:value={store.inputDialogValue} placeholder={i18n.t('settings.dialog.inputPlaceholder')}>
     </div>
     {#snippet footer()}
-      <button class="apple-action-btn secondary" onclick={store.cancelInputDialog}>{i18n.t('settings.dialog.cancel')}</button>
-      <button class="apple-action-btn" onclick={store.confirmInputDialog}>{i18n.t('settings.dialog.confirm')}</button>
+      <button class="btn btn--secondary btn--sm" onclick={store.cancelInputDialog}>{i18n.t('settings.dialog.cancel')}</button>
+      <button class="btn btn--primary btn--sm" onclick={store.confirmInputDialog}>{i18n.t('settings.dialog.confirm')}</button>
     {/snippet}
   </Modal>
 {/if}
@@ -274,8 +292,9 @@ import { getAgentColor } from '../lib/agent-colors';
         <div class="mcp-form">
           <div class="mcp-form-grid">
             <div class="form-field">
-              <label for="mcp-name">{i18n.t('settings.mcp.nameLabel')}</label>
+              <label class="form-label" for="mcp-name">{i18n.t('settings.mcp.nameLabel')}</label>
               <input
+                class="form-input"
                 id="mcp-name"
                 type="text"
                 value={store.mcpFormDraft.name}
@@ -284,14 +303,16 @@ import { getAgentColor } from '../lib/agent-colors';
               >
             </div>
             <div class="form-field">
-              <span class="mcp-field-label">{i18n.t('settings.mcp.transportLabel')}</span>
-              <div class="mcp-transport-switch">
+              <span class="form-label mcp-field-label">{i18n.t('settings.mcp.transportLabel')}</span>
+              <div class="ui-segmented mcp-transport-switch">
                 <button
+                  class="ui-segmented__option"
                   type="button"
                   class:active={store.mcpFormDraft.type === 'stdio'}
                   onclick={() => store.updateMcpFormField('type', 'stdio')}
                 >{i18n.t('settings.mcp.transportStdio')}</button>
                 <button
+                  class="ui-segmented__option"
                   type="button"
                   class:active={store.mcpFormDraft.type === 'streamable-http'}
                   onclick={() => store.updateMcpFormField('type', 'streamable-http')}
@@ -302,9 +323,10 @@ import { getAgentColor } from '../lib/agent-colors';
 
           <div class="mcp-form-options">
             <div class="mcp-timeout-field">
-              <label for="mcp-timeout">{i18n.t('settings.mcp.timeoutLabel')}</label>
+              <label class="form-label" for="mcp-timeout">{i18n.t('settings.mcp.timeoutLabel')}</label>
               <div class="mcp-input-suffix">
                 <input
+                  class="form-input"
                   id="mcp-timeout"
                   type="number"
                   min="1"
@@ -338,8 +360,9 @@ import { getAgentColor } from '../lib/agent-colors';
                 </div>
               </div>
               <div class="form-field">
-                <label for="mcp-command">{i18n.t('settings.mcp.commandLabel')}</label>
+                <label class="form-label" for="mcp-command">{i18n.t('settings.mcp.commandLabel')}</label>
                 <input
+                  class="form-input"
                   id="mcp-command"
                   type="text"
                   value={store.mcpFormDraft.command}
@@ -362,6 +385,7 @@ import { getAgentColor } from '../lib/agent-colors';
                     {#each store.mcpFormDraft.args as arg, index}
                       <div class="mcp-value-row">
                         <input
+                          class="form-input"
                           type="text"
                           value={arg}
                           aria-label={i18n.t('settings.mcp.argIndex', { index: index + 1 })}
@@ -390,8 +414,8 @@ import { getAgentColor } from '../lib/agent-colors';
                   <div class="mcp-row-list">
                     {#each store.mcpFormDraft.env as row, index}
                       <div class="mcp-key-value-row">
-                        <input type="text" value={row.key} placeholder={i18n.t('settings.mcp.keyPlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('env', index, 'key', event.currentTarget.value)}>
-                        <input type="text" value={row.value} placeholder={i18n.t('settings.mcp.valuePlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('env', index, 'value', event.currentTarget.value)}>
+                        <input class="form-input" type="text" value={row.key} placeholder={i18n.t('settings.mcp.keyPlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('env', index, 'key', event.currentTarget.value)}>
+                        <input class="form-input" type="text" value={row.value} placeholder={i18n.t('settings.mcp.valuePlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('env', index, 'value', event.currentTarget.value)}>
                         <button type="button" class="mcp-remove-row" title={i18n.t('settings.mcp.removeRow')} onclick={() => store.removeMcpFormKeyValue('env', index)}>
                           <Icon name="close" size={14} />
                         </button>
@@ -410,8 +434,9 @@ import { getAgentColor } from '../lib/agent-colors';
                 </div>
               </div>
               <div class="form-field">
-                <label for="mcp-url">{i18n.t('settings.mcp.urlLabel')}</label>
+                <label class="form-label" for="mcp-url">{i18n.t('settings.mcp.urlLabel')}</label>
                 <input
+                  class="form-input"
                   id="mcp-url"
                   type="text"
                   value={store.mcpFormDraft.url}
@@ -433,8 +458,8 @@ import { getAgentColor } from '../lib/agent-colors';
                   <div class="mcp-row-list">
                     {#each store.mcpFormDraft.headers as row, index}
                       <div class="mcp-key-value-row">
-                        <input type="text" value={row.key} placeholder={i18n.t('settings.mcp.headerKeyPlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('headers', index, 'key', event.currentTarget.value)}>
-                        <input type="text" value={row.value} placeholder={i18n.t('settings.mcp.headerValuePlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('headers', index, 'value', event.currentTarget.value)}>
+                        <input class="form-input" type="text" value={row.key} placeholder={i18n.t('settings.mcp.headerKeyPlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('headers', index, 'key', event.currentTarget.value)}>
+                        <input class="form-input" type="text" value={row.value} placeholder={i18n.t('settings.mcp.headerValuePlaceholder')} oninput={(event) => store.updateMcpFormKeyValue('headers', index, 'value', event.currentTarget.value)}>
                         <button type="button" class="mcp-remove-row" title={i18n.t('settings.mcp.removeRow')} onclick={() => store.removeMcpFormKeyValue('headers', index)}>
                           <Icon name="close" size={14} />
                         </button>
@@ -448,8 +473,8 @@ import { getAgentColor } from '../lib/agent-colors';
         </div>
       {:else}
         <div class="mcp-json-editor form-field">
-          <label for="mcp-json">{i18n.t('settings.mcp.jsonLabel')}</label>
-          <textarea id="mcp-json" rows="16" spellcheck="false" placeholder={i18n.t('settings.mcp.jsonPlaceholder')} bind:value={store.mcpDialogJson} oninput={() => store.mcpDialogError = ''}></textarea>
+          <label class="form-label" for="mcp-json">{i18n.t('settings.mcp.jsonLabel')}</label>
+          <textarea class="form-textarea" id="mcp-json" rows="16" spellcheck="false" placeholder={i18n.t('settings.mcp.jsonPlaceholder')} bind:value={store.mcpDialogJson} oninput={() => store.mcpDialogError = ''}></textarea>
           <div class="mcp-json-help">{i18n.t('settings.mcp.jsonHelp')}</div>
         </div>
       {/if}
@@ -459,11 +484,11 @@ import { getAgentColor } from '../lib/agent-colors';
       {/if}
     </div>
     {#snippet footer()}
-      <button class="settings-btn secondary" onclick={store.closeMCPDialog}>{i18n.t('settings.dialog.cancel')}</button>
+      <button class="btn btn--secondary" onclick={store.closeMCPDialog}>{i18n.t('settings.dialog.cancel')}</button>
       <button
-        class="settings-btn"
-        class:saving={store.saveStatus.mcp === 'saving'}
-        class:saved={store.saveStatus.mcp === 'saved'}
+        class="btn btn--primary"
+        class:is-saving={store.saveStatus.mcp === 'saving'}
+        class:is-saved={store.saveStatus.mcp === 'saved'}
         onclick={store.saveMCPServer}
         disabled={store.saveStatus.mcp === 'saving'}
       >
@@ -494,17 +519,17 @@ import { getAgentColor } from '../lib/agent-colors';
     {/snippet}
     <div class="repo-add-form" style="margin-bottom: 24px;">
       <div class="form-field" style="flex: 1; margin-bottom: 0;">
-        <label for="repo-url">{i18n.t('settings.repo.urlLabel')}</label>
-        <input type="text" id="repo-url" placeholder={i18n.t('settings.repo.urlPlaceholder')} bind:value={store.repoAddUrl}>
+        <label class="form-label" for="repo-url">{i18n.t('settings.repo.urlLabel')}</label>
+        <input class="form-input" type="text" id="repo-url" placeholder={i18n.t('settings.repo.urlPlaceholder')} bind:value={store.repoAddUrl}>
       </div>
-      <button class="apple-action-btn" onclick={store.addRepository} disabled={store.repoAddLoading}>
+      <button class="btn btn--primary btn--sm" onclick={store.addRepository} disabled={store.repoAddLoading}>
         <Icon name="plus" size={14} />
         <span>{store.repoAddLoading ? i18n.t('settings.repo.adding') : i18n.t('settings.repo.add')}</span>
       </button>
     </div>
     <div class="repo-list-heading">
       <div class="repo-list-title">{i18n.t('settings.repo.addedRepos')}</div>
-      <button class="apple-action-btn secondary" onclick={store.checkSkillUpdates} disabled={store.skillUpdatesChecking || store.repositories.length === 0}>
+      <button class="btn btn--secondary btn--sm" onclick={store.checkSkillUpdates} disabled={store.skillUpdatesChecking || store.repositories.length === 0}>
         <Icon name="refresh" size={13} />
         <span>{i18n.t('settings.repo.refreshAll')}</span>
       </button>
@@ -542,7 +567,7 @@ import { getAgentColor } from '../lib/agent-colors';
       {/if}
     </div>
     {#snippet footer()}
-      <button class="apple-action-btn secondary" onclick={store.closeRepoDialog}>{i18n.t('settings.repo.close')}</button>
+      <button class="btn btn--secondary btn--sm" onclick={store.closeRepoDialog}>{i18n.t('settings.repo.close')}</button>
     {/snippet}
   </Modal>
 {/if}
@@ -560,12 +585,12 @@ import { getAgentColor } from '../lib/agent-colors';
     {/snippet}
     <div class="skill-library-search">
       <div class="skill-library-search-row form-field" style="margin-bottom: 0;">
-        <input type="text" placeholder={i18n.t('settings.skillLibrary.searchPlaceholder')} bind:value={store.skillSearchQuery}>
-        <button class="apple-action-btn secondary" onclick={store.checkSkillUpdates} disabled={store.skillUpdatesChecking}>
+        <input class="form-input" type="text" placeholder={i18n.t('settings.skillLibrary.searchPlaceholder')} bind:value={store.skillSearchQuery}>
+        <button class="btn btn--secondary btn--sm" onclick={store.checkSkillUpdates} disabled={store.skillUpdatesChecking}>
           <Icon name="refresh" size={14} />
           {i18n.t('settings.skillLibrary.checkUpdates')}
         </button>
-        <button class="apple-action-btn secondary" onclick={store.installLocalSkill} disabled={store.localSkillInstalling}>
+        <button class="btn btn--secondary btn--sm" onclick={store.installLocalSkill} disabled={store.localSkillInstalling}>
           {#if store.localSkillInstalling}
             <Icon name="refresh" size={14} />
             {i18n.t('settings.skillLibrary.importing')}
@@ -629,8 +654,9 @@ import { getAgentColor } from '../lib/agent-colors';
                 </div>
                 <div class="skill-library-actions">
                   <button
-                    class="settings-btn secondary"
-                    class:primary={(!skill.installed || skill.updateAvailable) && !store.installingSkills.has(skill.fullName) && !store.skillUpdatingIds.has(skill.fullName)}
+                    class="btn btn--sm"
+                    class:btn--primary={(!skill.installed || skill.updateAvailable) && !store.installingSkills.has(skill.fullName) && !store.skillUpdatingIds.has(skill.fullName)}
+                    class:btn--secondary={!((!skill.installed || skill.updateAvailable) && !store.installingSkills.has(skill.fullName) && !store.skillUpdatingIds.has(skill.fullName))}
                     class:is-saving={store.installingSkills.has(skill.fullName) || store.skillUpdatingIds.has(skill.fullName)}
                     onclick={() => skill.installed ? store.updateSkill(skill.fullName) : store.installSkill(skill.fullName)}
                     disabled={(skill.installed && !skill.updateAvailable) || store.installingSkills.has(skill.fullName) || store.skillUpdatingIds.has(skill.fullName)}
@@ -654,7 +680,7 @@ import { getAgentColor } from '../lib/agent-colors';
       {/if}
     </div>
     {#snippet footer()}
-      <button class="settings-btn secondary" onclick={store.closeSkillLibraryDialog}>{i18n.t('settings.skillLibrary.close')}</button>
+      <button class="btn btn--secondary" onclick={store.closeSkillLibraryDialog}>{i18n.t('settings.skillLibrary.close')}</button>
     {/snippet}
   </Modal>
 {/if}
@@ -687,8 +713,8 @@ import { getAgentColor } from '../lib/agent-colors';
     <p style="margin: 0; color: var(--foreground);">{i18n.t('settings.resetConfirm.workspaceMessage')}</p>
     <p style="margin: var(--space-2) 0 0; color: var(--foreground-muted); font-size: var(--text-sm);">{i18n.t('settings.resetConfirm.irreversible')}</p>
     {#snippet footer()}
-      <button class="settings-btn secondary" onclick={store.cancelResetStats}>{i18n.t('settings.resetConfirm.cancel')}</button>
-      <button class="settings-btn" onclick={store.confirmResetStats}>{i18n.t('settings.resetConfirm.confirm')}</button>
+      <button class="btn btn--secondary" onclick={store.cancelResetStats}>{i18n.t('settings.resetConfirm.cancel')}</button>
+      <button class="btn btn--primary" onclick={store.confirmResetStats}>{i18n.t('settings.resetConfirm.confirm')}</button>
     {/snippet}
   </Modal>
 {/if}
@@ -703,8 +729,8 @@ import { getAgentColor } from '../lib/agent-colors';
   >
     <p style="margin: 0; color: var(--foreground);">{store.confirmDialogMessage}</p>
     {#snippet footer()}
-      <button class="settings-btn secondary" onclick={store.handleConfirmNo}>{i18n.t('settings.confirmDialog.cancel')}</button>
-      <button class="settings-btn" onclick={store.handleConfirmYes}>{i18n.t('settings.confirmDialog.confirm')}</button>
+      <button class="btn btn--secondary" onclick={store.handleConfirmNo}>{i18n.t('settings.confirmDialog.cancel')}</button>
+      <button class="btn btn--primary" onclick={store.handleConfirmYes}>{i18n.t('settings.confirmDialog.confirm')}</button>
     {/snippet}
   </Modal>
 {/if}
@@ -802,11 +828,8 @@ import { getAgentColor } from '../lib/agent-colors';
   /* 表单字段 */
   .form-field { margin-bottom: var(--space-4); }
   .form-field:last-child { margin-bottom: 0; }
-  .form-field label {
+  .form-field > .form-label {
     display: block;
-    font-size: var(--text-sm);
-    font-weight: var(--font-medium);
-    color: var(--foreground);
     margin-bottom: var(--space-2);
   }
 
@@ -867,32 +890,7 @@ import { getAgentColor } from '../lib/agent-colors';
   .mcp-mode-switch button.active { color: var(--foreground); }
   .mcp-mode-switch button.active::after { background: var(--primary); }
   .mcp-transport-switch {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
     min-height: 34px;
-    padding: 2px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--surface-2);
-  }
-  .mcp-transport-switch button {
-    min-width: 0;
-    min-height: 28px;
-    border: 0;
-    border-radius: calc(var(--radius-sm) - 2px);
-    background: transparent;
-    color: var(--foreground-muted);
-    font: inherit;
-    font-size: var(--text-xs);
-    font-weight: var(--font-medium);
-    cursor: pointer;
-    transition: color var(--transition-fast), background var(--transition-fast), box-shadow var(--transition-fast);
-  }
-  .mcp-transport-switch button:hover { color: var(--foreground); }
-  .mcp-transport-switch button.active {
-    background: var(--surface-1);
-    color: var(--foreground);
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
   }
   .mcp-form {
     display: flex;
@@ -905,29 +903,9 @@ import { getAgentColor } from '../lib/agent-colors';
     gap: var(--space-3);
   }
   .mcp-form-grid .form-field { margin-bottom: 0; }
-  .mcp-form .form-field input[type="text"],
-  .mcp-json-editor textarea {
-    border-color: var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--surface-1);
-    box-shadow: none;
-  }
-  .mcp-form .form-field input[type="text"] {
-    height: 34px;
-    padding: 6px 10px;
-  }
-  .mcp-form .form-field input[type="text"]:focus,
-  .mcp-json-editor textarea:focus {
-    border-color: var(--primary);
-    background: var(--surface-1);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 14%, transparent);
-  }
   .mcp-field-label {
     display: block;
     margin-bottom: var(--space-2);
-    color: var(--foreground);
-    font-size: var(--text-sm);
-    font-weight: var(--font-medium);
   }
   .mcp-form-options {
     display: flex;
@@ -962,18 +940,12 @@ import { getAgentColor } from '../lib/agent-colors';
     align-items: center;
     gap: 7px;
   }
-  .mcp-input-suffix input {
+  .mcp-input-suffix .form-input {
     width: 64px;
     min-width: 0;
     height: 28px;
     padding: 4px 8px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--surface-1);
-    color: var(--foreground);
-    font: inherit;
     font-size: var(--text-xs);
-    box-sizing: border-box;
   }
   .mcp-input-suffix span { color: var(--foreground-muted); font-size: var(--text-xs); }
   .mcp-enabled-field {
@@ -1051,27 +1023,12 @@ import { getAgentColor } from '../lib/agent-colors';
   }
   .mcp-value-row { grid-template-columns: minmax(0, 1fr) 30px; }
   .mcp-key-value-row { grid-template-columns: minmax(120px, 0.8fr) minmax(0, 1.2fr) 30px; }
-  .mcp-value-row input,
-  .mcp-key-value-row input {
+  .mcp-value-row .form-input,
+  .mcp-key-value-row .form-input {
     min-width: 0;
-    width: 100%;
     height: 32px;
-    padding: 6px 9px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--surface-1);
-    color: var(--foreground);
-    font: inherit;
     font-family: var(--font-mono);
     font-size: var(--text-xs);
-    box-sizing: border-box;
-  }
-  .mcp-value-row input:focus,
-  .mcp-key-value-row input:focus,
-  .mcp-input-suffix input:focus {
-    outline: none;
-    border-color: var(--primary);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 15%, transparent);
   }
   .mcp-remove-row {
     display: inline-flex;
@@ -1097,7 +1054,7 @@ import { getAgentColor } from '../lib/agent-colors';
     font-size: var(--text-xs);
   }
   .mcp-json-editor { margin-bottom: 0; }
-  .mcp-json-editor textarea {
+  .mcp-json-editor .form-textarea {
     min-height: 320px;
     resize: vertical;
     font-family: var(--font-mono);
@@ -1136,9 +1093,9 @@ import { getAgentColor } from '../lib/agent-colors';
     }
     .mcp-enabled-field span { white-space: normal; }
     .mcp-key-value-row { grid-template-columns: minmax(0, 1fr) 30px; }
-    .mcp-key-value-row input:nth-child(2) { grid-column: 1 / 2; }
+    .mcp-key-value-row .form-input:nth-child(2) { grid-column: 1 / 2; }
     .mcp-key-value-row .mcp-remove-row { grid-column: 2; grid-row: 1 / 3; align-self: center; }
-    .mcp-json-editor textarea { min-height: 260px; }
+    .mcp-json-editor .form-textarea { min-height: 260px; }
   }
 
   /* 仓库管理 */
@@ -1257,7 +1214,7 @@ import { getAgentColor } from '../lib/agent-colors';
       grid-template-columns: 1fr 1fr;
     }
 
-    .skill-library-search-row input {
+    .skill-library-search-row .form-input {
       grid-column: 1 / -1;
     }
 
@@ -1271,7 +1228,6 @@ import { getAgentColor } from '../lib/agent-colors';
     /* Custom Layout CSS - UX/UI Fix */
     .magi-settings-layout {
       position: relative;
-      background: var(--vscode-editor-background);
       border-radius: 12px;
       width: 90vw;
       max-width: 1050px;
@@ -1287,7 +1243,7 @@ import { getAgentColor } from '../lib/agent-colors';
 
     .settings-sidebar {
       width: 140px;
-      background: var(--vscode-sideBar-background, rgba(0, 0, 0, 0.02));
+      background: color-mix(in srgb, var(--magi-surface-dialog) 92%, var(--foreground) 8%);
       border-right: 1px solid var(--vscode-widget-border, rgba(0, 0, 0, 0.08));
       display: flex;
       flex-direction: column;
@@ -1358,7 +1314,7 @@ import { getAgentColor } from '../lib/agent-colors';
       flex-direction: column;
       min-width: 0;
       min-height: 0;
-      background: var(--vscode-editor-background);
+      background: transparent;
     }
 
     .main-header {
@@ -1367,7 +1323,7 @@ import { getAgentColor } from '../lib/agent-colors';
       justify-content: space-between;
       padding: 20px 32px;
       border-bottom: 1px solid var(--vscode-widget-border, rgba(0, 0, 0, 0.08));
-      background: var(--vscode-editor-background);
+      background: transparent;
       z-index: 10;
     }
 
@@ -1376,12 +1332,34 @@ import { getAgentColor } from '../lib/agent-colors';
       font-size: 18px;
       font-weight: 600;
       color: var(--vscode-foreground);
+      white-space: nowrap;
+    }
+
+    .header-breadcrumbs {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .header-title-group {
+      min-width: 0;
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+    }
+
+    .header-description {
+      min-width: 0;
+      color: var(--foreground-muted);
+      font-size: 12px;
+      font-weight: 500;
+      line-height: 1.35;
     }
 
     .header-actions {
       display: flex;
       align-items: center;
       gap: 16px;
+      flex: 0 0 auto;
     }
 
     .scroll-content {
@@ -1450,5 +1428,28 @@ import { getAgentColor } from '../lib/agent-colors';
       font-size: 12px;
     }
 
+  }
+
+  @media (max-width: 480px) {
+    .main-header {
+      align-items: flex-start;
+      gap: 10px;
+      padding: 14px 12px 14px 20px;
+    }
+    .header-title-group {
+      align-items: flex-start;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .header-description {
+      display: -webkit-box;
+      overflow: hidden;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+      line-clamp: 2;
+    }
+    .header-actions {
+      gap: 8px;
+    }
   }
 </style>

@@ -451,7 +451,7 @@
         aria-label={i18n.t('common.close')}
         onclick={() => expanded = false}
       ></button>
-      <section class="agent-center-panel" aria-label={i18n.t('activeAgentCenter.title')}>
+      <section class="agent-center-panel" data-magi-surface="popover" aria-label={i18n.t('activeAgentCenter.title')}>
         <header class="panel-header">
           <span class="panel-heading">
             <strong>{i18n.t('activeAgentCenter.title')}</strong>

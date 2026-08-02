@@ -1645,6 +1645,13 @@ function applyContextCompactionRuntimeEvent(event: RustEventEnvelope): void {
 function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   const eventType = trimBridgeString(event.event_type);
 
+  if (eventType === 'appearance.changed') {
+    window.dispatchEvent(new CustomEvent('magi:appearanceChanged', {
+      detail: event.payload ?? {},
+    }));
+    return;
+  }
+
   if (!eventMatchesCurrentWorkspace(event)) {
     return;
   }

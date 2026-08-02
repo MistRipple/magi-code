@@ -862,7 +862,7 @@
     height: 100%;
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
-    background: var(--background);
+    background: var(--magi-surface-right-pane);
     overflow: hidden;
   }
 
@@ -873,7 +873,7 @@
     height: 38px;
     flex-shrink: 0;
     border-bottom: 1px solid var(--border);
-    background: var(--background);
+    background: transparent;
     padding-right: var(--space-2);
   }
 

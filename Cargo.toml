@@ -24,6 +24,7 @@ members = [
   "crates/magi-usage-authority",
   "crates/magi-runtime-state",
   "crates/magi-settings-store",
+  "crates/magi-appearance",
   "crates/magi-agent-role",
   "crates/magi-permissions",
   "crates/magi-safety-gate",
@@ -35,7 +36,7 @@ members = [
 ]
 
 [workspace.package]
-version = "3.0.34"
+version = "3.0.35"
 edition = "2024"
 license = "MIT"
 
@@ -52,6 +53,9 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 notify = "8"
 sha2 = "0.10"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 getrandom = "0.3"
 zstd = "0.13"
 ignore = "0.4"

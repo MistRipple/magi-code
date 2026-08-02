@@ -304,6 +304,7 @@
         <div
           class="turn-navigation-preview"
           class:show={focusedTurnId !== ''}
+          data-magi-surface="popover"
           bind:this={previewRef}
           style={`top: ${markerPositions[focusedItem.turnId] ?? 8}px;`}
         >
@@ -322,7 +323,7 @@
 
     <div class="turn-navigation-capsule" class:open={menuOpen} bind:this={capsuleRef}>
       {#if menuOpen}
-        <div class="turn-navigation-menu" role="menu">
+        <div class="turn-navigation-menu" data-magi-surface="popover" role="menu">
           <div class="turn-navigation-menu-title">{i18n.t('messageList.turnNavigation.menuTitle')}</div>
           {#each items as item (item.turnId)}
             <button

@@ -8,6 +8,7 @@
     checked?: boolean;
     disabled?: boolean;
     title?: string;
+    ariaLabel?: string;
     size?: 'small' | 'default';
     onchange?: (checked: boolean) => void;
   }
@@ -16,6 +17,7 @@
     checked = false,
     disabled = false,
     title = '',
+    ariaLabel = '',
     size = 'default',
     onchange
   }: Props = $props();
@@ -33,6 +35,7 @@
     type="checkbox"
     {checked}
     {disabled}
+    aria-label={ariaLabel || title || undefined}
     onchange={handleChange}
   />
   <span class="toggle-slider"></span>

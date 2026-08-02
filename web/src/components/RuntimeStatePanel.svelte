@@ -815,7 +815,7 @@
       {/if}
     </button>
     {#if isPanelExpanded}
-    <div class="runtime-diagnostics__content">
+    <div class="runtime-diagnostics__content" data-magi-surface="popover">
       {#if summaryEntries.length > 0}
         <div class="runtime-diagnostics__block">
           <div class="runtime-diagnostics__label">{i18n.t('runtimeState.summary.title')}</div>
@@ -1158,7 +1158,6 @@
     border-top: 0;
     border-left: 2px solid var(--runtime-status-color);
     border-radius: 0 0 8px 8px;
-    background: var(--vscode-editorWidget-background, var(--surface-2));
     box-shadow: 0 14px 36px rgba(0, 0, 0, 0.34);
     pointer-events: auto;
   }

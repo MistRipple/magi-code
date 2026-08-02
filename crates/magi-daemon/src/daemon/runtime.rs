@@ -1169,6 +1169,10 @@ impl DaemonRuntime {
         settings_store
             .load_from_disk()
             .map_err(|error| DaemonError::internal(format!("加载设置文件失败: {error}")))?;
+        let appearance_library = Arc::new(
+            magi_appearance::AppearanceLibrary::open(self.state_root.join("appearance"))
+                .map_err(|error| DaemonError::internal(format!("加载外观主题失败: {error}")))?,
+        );
         Self::seed_orchestrator_settings_from_env_if_empty(&settings_store, bridge_env)
             .map_err(|error| DaemonError::internal(format!("保存环境模型设置失败: {error}")))?;
         let agent_role_registry = Arc::new(magi_agent_role::AgentRoleRegistry::load_default());
@@ -1535,6 +1539,7 @@ impl DaemonRuntime {
         )
         .with_knowledge_store(self.knowledge_store.clone())
         .with_settings_store(settings_store.clone())
+        .with_appearance_library(appearance_library)
         .with_snapshot_manager(snapshot_manager)
         .with_skill_runtime(app_skill_runtime.clone())
         .with_skill_dispatch_runtime(Arc::new(skill_runtime.clone()))

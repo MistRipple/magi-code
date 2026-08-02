@@ -104,7 +104,7 @@
   <div class="profile-editor">
     <div class="profile-field">
       <textarea
-        class="profile-textarea user-rules-textarea"
+        class="form-textarea user-rules-textarea"
         bind:value={userRules}
         placeholder={i18n.t('settings.profile.userRulesPlaceholder')}
       ></textarea>
@@ -183,12 +183,12 @@
             <div class="safeguard-add-row">
               <input
                 type="text"
-                class="safeguard-add-input"
+                class="form-input safeguard-add-input"
                 bind:value={newCustomRule}
                 placeholder={i18n.t('settings.safeguard.addPlaceholder')}
                 onkeydown={(e) => e.key === 'Enter' && addCustomRule()}
               />
-              <button class="apple-action-btn" onclick={addCustomRule}>
+              <button class="btn btn--primary btn--sm" onclick={addCustomRule}>
                 <Icon name="plus" size={14} />
                 {i18n.t('settings.safeguard.add')}
               </button>
@@ -206,10 +206,6 @@
 <style>
   .profile-editor { display: flex; flex-direction: column; gap: var(--space-4); margin-top: var(--space-4); }
   .profile-field { display: flex; flex-direction: column; gap: var(--space-2); }
-  .profile-textarea {
-    padding: var(--space-3);
-    font-size: var(--text-sm);
-  }
   .user-rules-textarea { resize: none; min-height: 140px; width: 100%; box-sizing: border-box; }
 
   .rules-save-status {
@@ -353,8 +349,6 @@
 
   .safeguard-add-input {
     flex: 1;
-    padding: 4px 10px;
-    font-size: 12px;
     font-family: var(--font-mono, monospace);
   }
 

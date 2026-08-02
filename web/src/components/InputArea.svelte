@@ -1812,7 +1812,7 @@
     ></div>
 
     {#if slashMenuOpen}
-      <div class="ia-slash-popover" role="listbox" aria-label={i18n.t('input.slash.label')}>
+      <div class="ia-slash-popover" data-magi-surface="popover" role="listbox" aria-label={i18n.t('input.slash.label')}>
         <div class="ia-slash-list" bind:this={slashListEl}>
           {#each filteredSlashCommands as command, index (`${command.kind}:${command.id}`)}
             {#if index === 0 || filteredSlashCommands[index - 1]?.kind !== command.kind}
@@ -1879,7 +1879,7 @@
             <Icon name="plus" size={15} />
           </button>
           {#if addMenuOpen}
-            <div class="ia-picker-popover ia-add-popover" role="menu">
+            <div class="ia-picker-popover ia-add-popover" data-magi-surface="popover" role="menu">
               {#each composerActions as action, index (`${action.kind}:${action.id}`)}
                 {#if index === 0 || composerActions[index - 1]?.kind !== action.kind}
                   <div class="ia-add-group-label">
@@ -1946,7 +1946,7 @@
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div class="ia-popover-backdrop" onclick={() => (workspacePickerOpen = false)}></div>
-            <div class="ia-picker-popover ia-workspace-popover" role="menu">
+            <div class="ia-picker-popover ia-workspace-popover" data-magi-surface="popover" role="menu">
               <div class="ia-picker-header">{i18n.t('input.workspace.title')}</div>
               {#if workspaceOptions.length === 0}
                 <div class="ia-picker-status">{i18n.t('input.workspace.empty')}</div>
@@ -2007,7 +2007,7 @@
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <!-- svelte-ignore a11y_no_static_element_interactions -->
               <div class="ia-popover-backdrop" onclick={() => (accessProfilePickerOpen = false)}></div>
-              <div class="ia-picker-popover ia-access-popover" role="menu">
+              <div class="ia-picker-popover ia-access-popover" data-magi-surface="popover" role="menu">
                 <div class="ia-picker-header">{i18n.t('input.access.title')}</div>
                 <div class="ia-picker-list">
                   {#each accessProfileOptions as option (option.value)}
@@ -2075,7 +2075,7 @@
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div class="ia-popover-backdrop" onclick={() => (pickerOpen = false)}></div>
-            <div class="ia-session-model-popover" role="menu">
+            <div class="ia-session-model-popover" data-magi-surface="popover" role="menu">
               <div class="ia-effort-section">
                 <div class="ia-picker-header">{i18n.t('input.mainModelPicker.reasoning.header')}</div>
                 <div class="ia-effort-strip">
@@ -2275,6 +2275,8 @@
   .ia-wrapper {
     display: flex;
     flex-direction: column;
+    container-name: magi-composer;
+    container-type: inline-size;
     max-height: 50vh;
     background: var(--vscode-input-background);
     border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
@@ -2414,9 +2416,23 @@
     min-width: 0;
   }
 
+  .ia-left {
+    flex: 0 1 auto;
+    max-width: 48%;
+  }
+
   .ia-right {
+    flex: 1 1 auto;
     flex-wrap: nowrap;
     justify-content: flex-end;
+  }
+
+  .ia-runtime-controls {
+    flex: 0 0 auto;
+  }
+
+  .ia-submit-controls {
+    flex: 0 1 auto;
   }
 
   .ia-toolbar-divider {
@@ -3388,71 +3404,6 @@
       border-radius: var(--radius-lg);
     }
 
-    .ia-actions {
-      display: flex;
-      flex-wrap: nowrap;
-      align-items: center;
-      gap: 4px;
-      padding: 4px 6px;
-    }
-
-    .ia-left {
-      display: flex;
-      flex: 0 1 auto;
-      width: auto;
-      max-width: min(180px, 40vw);
-      min-width: 0;
-    }
-
-    .ia-left:empty {
-      display: none;
-    }
-
-    .ia-right {
-      display: flex;
-      flex: 1 1 auto;
-      min-width: 0;
-    }
-
-    .ia-runtime-controls {
-      flex: 0 0 auto;
-      gap: 3px;
-    }
-
-    .ia-submit-controls {
-      flex: 0 1 auto;
-      width: auto;
-      min-width: 0;
-      gap: 4px;
-    }
-
-    .ia-runtime-controls .ia-toolbar-divider,
-    .ia-submit-controls .ia-toolbar-divider {
-      display: none;
-    }
-
-    .ia-workspace-wrap,
-    .ia-left > .ia-picker-wrap {
-      flex: 0 1 auto;
-      min-width: 0;
-    }
-
-    .ia-workspace-btn {
-      width: auto;
-      max-width: 100%;
-    }
-
-    .ia-workspace-btn-label {
-      min-width: 34px;
-      max-width: 100%;
-    }
-
-    .ia-access-wrap {
-      flex: 0 0 28px;
-      width: 28px;
-      max-width: 28px;
-    }
-
     .ia-access-popover {
       position: fixed;
       right: 10px;
@@ -3460,50 +3411,6 @@
       left: auto;
       width: min(248px, calc(100vw - 20px));
       min-width: 0;
-    }
-
-    .ia-model-wrap {
-      flex: 0 1 auto;
-      min-width: 0;
-      max-width: min(180px, 42vw);
-    }
-
-    .ia-access-wrap .ia-picker-btn {
-      width: 28px;
-      max-width: 28px;
-      padding: 0;
-      justify-content: center;
-    }
-
-    .ia-model-wrap .ia-picker-btn {
-      width: auto;
-      max-width: 100%;
-      justify-content: flex-start;
-    }
-
-    .ia-model-wrap .ia-picker-btn :global(svg) {
-      margin-left: auto;
-    }
-
-    .ia-access-btn-label {
-      display: none;
-    }
-
-    .ia-picker-btn-label {
-      max-width: 100%;
-      min-width: 0;
-    }
-
-    .ia-enhance {
-      flex: 0 0 24px;
-    }
-
-    .ia-model-effort {
-      display: none;
-    }
-
-    .ia-send {
-      flex: 0 0 28px;
     }
 
     .ia-picker-popover {
@@ -3521,26 +3428,97 @@
 
   }
 
-  @media (max-width: 420px) {
-    .ia-left {
-      flex-basis: auto;
-      max-width: min(132px, 34vw);
+  @container magi-composer (max-width: 800px) {
+    .ia-actions {
+      flex-wrap: nowrap;
+      gap: 4px;
+      padding: 4px 6px;
     }
 
-    .ia-workspace-btn-label {
-      min-width: 0;
+    .ia-left {
+      flex: 0 0 auto;
+      max-width: none;
     }
 
-  }
+    .ia-right {
+      flex: 0 1 auto;
+      margin-left: auto;
+    }
 
-  @media (max-width: 360px) {
-    .ia-left {
-      flex-basis: auto;
-      max-width: min(96px, 30vw);
+    .ia-runtime-controls {
+      gap: 3px;
+    }
+
+    .ia-submit-controls {
+      flex: 0 1 auto;
+      gap: 4px;
+    }
+
+    .ia-runtime-controls .ia-toolbar-divider,
+    .ia-submit-controls .ia-toolbar-divider {
+      display: none;
+    }
+
+    .ia-workspace-wrap {
+      flex: 0 0 28px;
+      width: 28px;
+      max-width: 28px;
+    }
+
+    .ia-workspace-btn {
+      width: 28px;
+      max-width: 28px;
+      padding: 0;
+      justify-content: center;
+    }
+
+    .ia-workspace-btn-label,
+    .ia-access-btn-label,
+    .ia-model-effort {
+      display: none;
+    }
+
+    .ia-access-wrap {
+      flex: 0 0 28px;
+      width: 28px;
+      max-width: 28px;
+    }
+
+    .ia-access-wrap .ia-picker-btn {
+      width: 28px;
+      max-width: 28px;
+      padding: 0;
+      justify-content: center;
     }
 
     .ia-model-wrap {
-      max-width: min(132px, 41vw);
+      flex: 0 1 132px;
+      width: auto;
+      min-width: 0;
+      max-width: 132px;
+    }
+
+    .ia-model-wrap .ia-picker-btn {
+      width: 100%;
+      max-width: 100%;
+      justify-content: flex-start;
+    }
+
+    .ia-model-wrap .ia-picker-btn :global(svg) {
+      margin-left: auto;
+    }
+
+    .ia-picker-btn-label {
+      min-width: 0;
+      max-width: 100%;
+    }
+
+    .ia-enhance {
+      flex: 0 0 24px;
+    }
+
+    .ia-send {
+      flex: 0 0 28px;
     }
   }
 

@@ -922,7 +922,7 @@
   <!-- 清空确认弹窗 -->
   {#if showClearConfirm}
     <div class="kp-confirm-overlay" role="dialog">
-      <div class="kp-confirm-dialog">
+      <div class="kp-confirm-dialog" data-magi-surface="critical">
         <div class="kp-confirm-icon">
           <Icon name="warning" size={24} />
         </div>
@@ -1958,7 +1958,6 @@
   }
 
   .kp-confirm-dialog {
-    background: var(--background);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     padding: var(--space-5);

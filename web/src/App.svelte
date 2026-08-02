@@ -347,7 +347,7 @@
     height: 100%;
     width: 100%;
     overflow: hidden;
-    background: var(--background);
+    background: var(--magi-surface-main);
   }
 
   .tab-content-wrapper {

@@ -190,7 +190,7 @@
     </button>
 
     {#if open}
-      <div class="git-context-popover" role="menu">
+      <div class="git-context-popover" data-magi-surface="popover" role="menu">
         <div class="git-context-search">
           <Icon name="search" size={12} />
           <input bind:value={search} placeholder={i18n.t('input.branch.searchPlaceholder')} aria-label={i18n.t('input.branch.searchPlaceholder')} />
@@ -256,9 +256,9 @@
 {/if}
 
 <style>
-  .git-context-control { position: relative; min-width: 0; }
+  .git-context-control { position: relative; flex: 0 1 auto; min-width: 0; max-width: 150px; }
   .git-context-trigger {
-    display: inline-flex; align-items: center; gap: 5px; max-width: 150px; height: 24px; padding: 0 8px;
+    position: relative; display: inline-flex; align-items: center; gap: 5px; width: max-content; min-width: 0; max-width: 100%; height: 24px; padding: 0 8px;
     border: 1px solid var(--border-subtle); border-radius: var(--radius-full);
     background: color-mix(in srgb, var(--surface-1) 88%, transparent); color: var(--foreground-muted); cursor: pointer;
     transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
@@ -293,7 +293,37 @@
   .git-context-actions { display: flex; justify-content: space-between; gap: 4px; padding-top: 4px; border-top: 1px solid var(--border-subtle); }
   .git-context-empty { padding: 12px 8px; color: var(--foreground-muted); font-size: 11px; text-align: center; }
   @media (max-width: 640px) {
-    .git-context-trigger { max-width: 96px; }
     .git-context-popover { position: fixed; bottom: calc(44px + env(safe-area-inset-bottom)); left: 12px; width: calc(100vw - 24px); }
+  }
+
+  @container magi-composer (max-width: 800px) {
+    .git-context-control {
+      flex: 0 0 28px;
+      width: 28px;
+      max-width: 28px;
+    }
+
+    .git-context-trigger {
+      width: 28px;
+      max-width: 28px;
+      padding: 0;
+      justify-content: center;
+    }
+
+    .git-context-branch {
+      display: none;
+    }
+
+    .git-context-dirty,
+    .git-context-conflict {
+      position: absolute;
+      top: 2px;
+      right: 2px;
+    }
+
+    .git-context-conflict {
+      font-size: 8px;
+      line-height: 1;
+    }
   }
 </style>

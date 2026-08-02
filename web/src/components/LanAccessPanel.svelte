@@ -174,7 +174,7 @@
 </script>
 
 {#if visible}
-<div class="lan-access-panel">
+<div class="lan-access-panel" data-magi-surface="popover">
   <div class="panel-header">
     <span class="panel-title">{i18n.t('lanAccess.title')}</span>
     <button

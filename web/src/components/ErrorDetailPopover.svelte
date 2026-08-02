@@ -99,7 +99,7 @@
   {/if}
 
   {#if popover}
-    <div class="error-popover" style={`top:${popover.top}px;left:${popover.left}px;width:${popover.width}px;max-height:${popover.maxHeight}px;`}>
+    <div class="error-popover" data-magi-surface="popover" style={`top:${popover.top}px;left:${popover.left}px;width:${popover.width}px;max-height:${popover.maxHeight}px;`}>
       <div class="error-popover-header">
         <span class="error-popover-title">{i18n.t('errorDetail.title')}</span>
         <div class="error-popover-actions">

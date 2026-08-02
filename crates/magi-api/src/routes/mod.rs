@@ -1,5 +1,6 @@
 mod agent_run_actions;
 mod agent_runs;
+mod appearance;
 mod changes_files_tunnel;
 mod conversation_bridge;
 mod dispatch_flow;
@@ -104,6 +105,7 @@ pub fn build_router(state: ApiState) -> Router {
         .merge(goals::routes())
         .merge(knowledge::routes())
         .merge(settings::routes())
+        .merge(appearance::routes())
         .merge(mcp_skills_repos::routes())
         .merge(changes_files_tunnel::routes())
         .merge(file_site::routes())

@@ -163,7 +163,7 @@
 
 <div class="notification-center">
   {#if open}
-    <div class="notification-panel">
+    <div class="notification-panel" data-magi-surface="popover">
       <div class="panel-header">
         <span class="panel-title">{i18n.t('notification.title')}</span>
         <div class="panel-actions">

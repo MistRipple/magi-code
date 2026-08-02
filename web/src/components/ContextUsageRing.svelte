@@ -172,6 +172,7 @@
     id={popoverId}
     class="ia-context-popover"
     class:visible={pinned}
+    data-magi-surface="popover"
     role="tooltip"
   >
     <div class="context-popover-title">

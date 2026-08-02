@@ -827,7 +827,7 @@
               <div class="settings-section-desc">{i18n.t('settings.tools.mcpDesc')}</div>
             </div>
             <div class="settings-section-actions">
-              <button class="apple-action-btn" onclick={() => openMCPDialog(null)}>
+              <button class="btn btn--primary btn--sm" onclick={() => openMCPDialog(null)}>
                 <Icon name="plus" size={14} />
                 <span>{i18n.t('settings.tools.addServer')}</span>
               </button>
@@ -904,7 +904,7 @@
                   </div>
 
                   {#if mcpExpandedServer === server.id}
-                    <div class="mcp-tools-popover">
+                    <div class="mcp-tools-popover" data-magi-surface="popover">
                       <div class="mcp-tools-header">
                         <div class="mcp-tools-heading">
                           <span>{i18n.t('settings.tools.toolList')}</span>
@@ -972,21 +972,21 @@
               <div class="settings-section-desc">{i18n.t('settings.tools.skillsDesc')}</div>
             </div>
             <div class="settings-section-actions">
-              <button class="apple-action-btn secondary" onclick={() => checkSkillUpdates()} disabled={skillUpdatesChecking}>
+              <button class="btn btn--secondary btn--sm" onclick={() => checkSkillUpdates()} disabled={skillUpdatesChecking}>
                 <Icon name="refresh" size={14} />
                 <span>{skillUpdatesChecking ? i18n.t('settings.tools.checkingSkillUpdates') : i18n.t('settings.tools.checkSkillUpdates')}</span>
               </button>
               {#if skillUpdateAvailableCount > 0}
-                <button class="apple-action-btn" onclick={() => updateAllSkills()} disabled={skillUpdatesChecking}>
+                <button class="btn btn--primary btn--sm" onclick={() => updateAllSkills()} disabled={skillUpdatesChecking}>
                   <Icon name="download" size={14} />
                   <span>{i18n.t('settings.tools.updateAllSkills', { count: skillUpdateAvailableCount })}</span>
                 </button>
               {/if}
-              <button class="apple-action-btn" onclick={() => openSkillLibraryDialog()}>
+              <button class="btn btn--primary btn--sm" onclick={() => openSkillLibraryDialog()}>
                 <Icon name="plus" size={14} />
                 <span>{i18n.t('settings.tools.installSkill')}</span>
               </button>
-              <button class="apple-action-btn" onclick={() => openRepoDialog()}>
+              <button class="btn btn--primary btn--sm" onclick={() => openRepoDialog()}>
                 <Icon name="grid" size={14} />
                 <span>{i18n.t('settings.tools.manageRepos')}</span>
               </button>
@@ -1068,6 +1068,7 @@
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="mcp-tool-desc-popover"
+    data-magi-surface="popover"
     style="top: {descAnchor.y}px; left: {descAnchor.x}px;"
     role="tooltip"
     onmouseenter={clearCloseTimer}
