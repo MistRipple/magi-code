@@ -9,3 +9,4 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 magi-core = { path = "../magi-core" }
+magi-usage-authority = { path = "../magi-usage-authority" }

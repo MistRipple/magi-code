@@ -914,6 +914,7 @@ mod tests {
             status: ExecutionThreadStatus::Active,
             created_at: UtcMillis(1),
             last_used_at: UtcMillis(2),
+            observed_context_window_tokens: None,
             handled_task_ids: vec![task.task_id.clone()],
             message_history: Vec::new(),
         };
@@ -1028,6 +1029,7 @@ mod tests {
             status: ExecutionThreadStatus::Idle,
             created_at: UtcMillis(9),
             last_used_at: UtcMillis(21),
+            observed_context_window_tokens: None,
             handled_task_ids: vec![child_id.clone()],
             message_history: vec![magi_session_store::ThreadChatMessage {
                 role: "assistant".to_string(),

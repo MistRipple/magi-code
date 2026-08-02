@@ -3,6 +3,7 @@ use magi_core::{
     AssignmentId, MissionId, SessionId, TaskId, UtcMillis, WorkspaceId, public_runtime_excerpt,
     public_runtime_summary,
 };
+use magi_usage_authority::{UsageTokenInput, context_window_tokens_from_usage};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -364,9 +365,9 @@ pub struct SessionRuntimeBudgetEntry {
 
 /// 会话最近一次上下文压缩记录。
 ///
-/// 这是面向产品可见性的结构化摘要：conversation runtime 完成真实历史替换后
-/// 发布 `session.context.compacted`，读模型只保留最近一次，前端据此解释上下文
-/// 圆环在自动压缩后的状态变化。
+/// 这是面向产品可见性的结构化摘要：conversation runtime 安装主线语义检查点后
+/// 发布 `session.context.compacted`，读模型只保留主线最近一次，worker 检查点不会
+/// 改写主对话上下文圆环。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionRuntimeContextCompactionEntry {
     pub reason: String,
@@ -375,6 +376,7 @@ pub struct SessionRuntimeContextCompactionEntry {
     pub compacted_message_count: u64,
     pub original_token_estimate: u64,
     pub compacted_token_estimate: u64,
+    pub request_token_estimate: Option<u64>,
     pub context_window_tokens: Option<u64>,
     pub token_limit: Option<u64>,
     pub threshold_tokens: Option<u64>,
@@ -2380,6 +2382,13 @@ fn context_compaction_from_event(
         return None;
     }
     let payload = &event.payload;
+    if payload
+        .get("thread_scope")
+        .and_then(serde_json::Value::as_str)
+        != Some("mainline")
+    {
+        return None;
+    }
     let reason = payload
         .get("reason")
         .and_then(serde_json::Value::as_str)
@@ -2413,6 +2422,9 @@ fn context_compaction_from_event(
             .get("compacted_token_estimate")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
+        request_token_estimate: payload
+            .get("request_token_estimate")
+            .and_then(serde_json::Value::as_u64),
         context_window_tokens: payload
             .get("context_window_tokens")
             .and_then(serde_json::Value::as_u64),
@@ -2438,8 +2450,8 @@ fn context_compaction_from_event(
 /// 路径共用同一口径,避免重启前后预算计算出现漂移。
 ///
 /// 口径对齐 Codex:展示用的上下文窗口占用取最近一次模型调用返回的
-/// `totalTokens`；没有显式 total 时用 raw input + raw output。这里不扣
-/// cache read,因为缓存命中仍然占用模型上下文窗口,只是不按同样价格计费。
+/// `totalTokens`；没有显式 total 时使用用量权威层的统一口径。OpenAI 缓存读
+/// 已包含在 input 中，Anthropic 的独立缓存读写则必须计入上下文窗口。
 ///
 /// 输入区圆环展示主线 orchestrator 的上下文窗口。worker / auxiliary 的模型
 /// 调用仍进入审计账本与任务指标,但不能覆盖主线会话窗口统计。
@@ -2447,6 +2459,39 @@ fn usage_observation_from_payload(
     event_type: &str,
     payload: &serde_json::Value,
 ) -> Option<SessionRuntimeUsageObservation> {
+    if event_type == "session.context.compacted" {
+        if payload
+            .get("thread_scope")
+            .and_then(serde_json::Value::as_str)
+            != Some("mainline")
+        {
+            return None;
+        }
+        return Some(SessionRuntimeUsageObservation {
+            context_window_tokens: payload
+                .get("request_token_estimate")
+                .and_then(serde_json::Value::as_u64)?,
+            resolved_model: payload
+                .get("resolved_model")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string),
+            observed_at: payload
+                .get("compacted_at")
+                .and_then(serde_json::Value::as_u64)
+                .map(UtcMillis),
+            measurement: Some("estimated".to_string()),
+            phase: Some("compacted".to_string()),
+            turn_id: payload
+                .get("turn_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            call_id: payload
+                .get("checkpoint_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        });
+    }
     if event_type != "model.usage.recorded" {
         return None;
     }
@@ -2457,24 +2502,8 @@ fn usage_observation_from_payload(
         return None;
     }
     let usage = payload.get("usage")?;
-    let input_tokens = usage
-        .get("inputTokens")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let output_tokens = usage
-        .get("outputTokens")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let total_tokens = usage
-        .get("totalTokens")
-        .or_else(|| usage.get("total_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let context_window_tokens = if total_tokens > 0 {
-        total_tokens
-    } else {
-        input_tokens.saturating_add(output_tokens)
-    };
+    let usage = serde_json::from_value::<UsageTokenInput>(usage.clone()).ok()?;
+    let context_window_tokens = context_window_tokens_from_usage(&usage);
     if context_window_tokens == 0 {
         return None;
     }
@@ -3278,6 +3307,43 @@ mod tests {
     }
 
     #[test]
+    fn model_usage_recorded_counts_anthropic_cache_tokens_for_context_window() {
+        let mut usage_event = EventEnvelope::audit(
+            EventId::new("event-model-usage-anthropic-cache"),
+            "model.usage.recorded",
+            json!({
+                "status": "success",
+                "usage": {
+                    "inputTokens": 1_000,
+                    "outputTokens": 200,
+                    "cacheReadTokens": 4_000,
+                    "cacheWriteTokens": 800,
+                    "cacheReadIncludedInInput": false
+                },
+                "executionBinding": { "role": "orchestrator" },
+                "modelConfig": { "model": "claude-sonnet" },
+                "timestamp": 1_700_000_000_001_u64
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(SessionId::new("session-usage-anthropic-cache")),
+            ..EventContext::default()
+        });
+        usage_event.sequence = 1;
+
+        let read_model = RuntimeReadModelInput::from_events(&[usage_event]);
+        let observation = read_model
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-usage-anthropic-cache")
+            .and_then(|entry| entry.usage_observation.as_ref())
+            .expect("Anthropic cache usage should be recorded");
+
+        assert_eq!(observation.context_window_tokens, 6_000);
+    }
+
+    #[test]
     fn session_context_compacted_records_latest_session_compaction() {
         let mut compacted_event = EventEnvelope::domain(
             EventId::new("event-session-context-compacted"),
@@ -3289,10 +3355,12 @@ mod tests {
                 "compacted_message_count": 9,
                 "original_token_estimate": 180_000,
                 "compacted_token_estimate": 36_000,
+                "request_token_estimate": 48_000,
                 "context_window_tokens": 245_000,
                 "token_limit": 272_000,
                 "threshold_tokens": 244_800,
                 "resolved_model": "gpt-5-codex",
+                "thread_scope": "mainline",
                 "compacted_at": 1_700_000_000_002_u64
             }),
         )
@@ -3317,11 +3385,53 @@ mod tests {
         assert_eq!(compaction.compacted_message_count, 9);
         assert_eq!(compaction.original_token_estimate, 180_000);
         assert_eq!(compaction.compacted_token_estimate, 36_000);
+        assert_eq!(compaction.request_token_estimate, Some(48_000));
         assert_eq!(compaction.context_window_tokens, Some(245_000));
         assert_eq!(compaction.token_limit, Some(272_000));
         assert_eq!(compaction.threshold_tokens, Some(244_800));
         assert_eq!(compaction.resolved_model.as_deref(), Some("gpt-5-codex"));
         assert_eq!(compaction.compacted_at, Some(UtcMillis(1_700_000_000_002)));
+        let observation = read_model
+            .details
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == "session-compacted")
+            .and_then(|entry| entry.usage_observation.as_ref())
+            .expect("compaction should immediately update context usage");
+        assert_eq!(observation.context_window_tokens, 48_000);
+        assert_eq!(observation.measurement.as_deref(), Some("estimated"));
+        assert_eq!(observation.phase.as_deref(), Some("compacted"));
+    }
+
+    #[test]
+    fn worker_context_compaction_does_not_update_mainline_session_state() {
+        let event = EventEnvelope::domain(
+            EventId::new("event-worker-context-compacted"),
+            "session.context.compacted",
+            json!({
+                "reason": "context_window_pressure",
+                "thread_scope": "worker",
+                "original_message_count": 42,
+                "compacted_message_count": 9,
+                "original_token_estimate": 180_000,
+                "compacted_token_estimate": 36_000
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(SessionId::new("session-worker-compacted")),
+            ..EventContext::default()
+        });
+
+        let read_model = RuntimeReadModelInput::from_events(&[event]);
+        assert!(
+            read_model
+                .details
+                .sessions
+                .iter()
+                .find(|entry| entry.session_id == "session-worker-compacted")
+                .and_then(|entry| entry.context_compaction.as_ref())
+                .is_none()
+        );
     }
 
     #[test]
@@ -3449,6 +3559,44 @@ mod tests {
         // timestamp 700 wins:20_000 input + 1_000 output.
         assert_eq!(observation.context_window_tokens, 21_000);
         assert_eq!(observation.observed_at, Some(UtcMillis(700)));
+    }
+
+    #[test]
+    fn latest_usage_observations_from_ledger_restores_post_compaction_estimate() {
+        let entries = vec![
+            usage_ledger_entry(
+                "session-compaction-ledger",
+                1,
+                18_000,
+                2_000,
+                "gpt-5-codex",
+                100,
+            ),
+            crate::AuditUsageLedgerEntry {
+                event_id: "event-context-compaction-ledger".to_string(),
+                event_type: "session.context.compacted".to_string(),
+                occurred_at: UtcMillis(200),
+                sequence: 2,
+                context: EventContext {
+                    session_id: Some(SessionId::new("session-compaction-ledger")),
+                    ..EventContext::default()
+                },
+                payload: json!({
+                    "thread_scope": "mainline",
+                    "request_token_estimate": 7_200,
+                    "resolved_model": "gpt-5-codex",
+                    "compacted_at": 200_u64
+                }),
+            },
+        ];
+
+        let observations = latest_usage_observations_from_ledger(&entries);
+        let observation = observations
+            .get("session-compaction-ledger")
+            .expect("compaction estimate should survive ledger restore");
+        assert_eq!(observation.context_window_tokens, 7_200);
+        assert_eq!(observation.measurement.as_deref(), Some("estimated"));
+        assert_eq!(observation.phase.as_deref(), Some("compacted"));
     }
 
     #[test]

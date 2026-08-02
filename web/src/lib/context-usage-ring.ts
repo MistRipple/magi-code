@@ -16,6 +16,15 @@ export interface ContextRingInput {
   measurement?: 'estimated' | 'authoritative' | null;
 }
 
+export interface SessionContextBudgetProjection extends Omit<ContextRingInput, 'warningLevel'> {
+  warningLevel?: ContextRingTone | null;
+}
+
+export interface SessionContextBudgetProjectionInput {
+  budget?: SessionContextBudgetProjection | null;
+  tokenLimit?: number | null;
+}
+
 export interface ContextRingGeometry {
   radius: number;
   circumference: number;
@@ -37,6 +46,52 @@ export interface ContextRingDetailItem {
 }
 
 export const RING_RADIUS = 7;
+
+function normalizePositiveInteger(value: number | null | undefined): number | null {
+  return value != null && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : null;
+}
+
+function warningLevelForRatio(ratio: number): ContextRingTone {
+  if (ratio >= 0.9) return 'danger';
+  if (ratio >= 0.8) return 'warning';
+  if (ratio >= 0.6) return 'notice';
+  return 'normal';
+}
+
+export function projectSessionContextBudget(
+  input: SessionContextBudgetProjectionInput,
+): SessionContextBudgetProjection {
+  const budget = input.budget ?? null;
+  const configuredTokenLimit = normalizePositiveInteger(input.tokenLimit);
+  const runtimeTokenLimit = normalizePositiveInteger(budget?.tokenLimit);
+  const tokenLimit = configuredTokenLimit ?? runtimeTokenLimit;
+
+  if (!budget) {
+    return { tokenLimit };
+  }
+
+  const tokenUsed = budget.tokenUsed != null && Number.isFinite(budget.tokenUsed)
+    ? Math.max(0, Math.floor(budget.tokenUsed))
+    : null;
+  if (tokenUsed == null || tokenLimit == null) {
+    return {
+      ...budget,
+      tokenLimit,
+    };
+  }
+
+  const usageRatio = Math.min(1, tokenUsed / tokenLimit);
+  return {
+    ...budget,
+    tokenUsed,
+    tokenLimit,
+    remainingTokens: Math.max(0, tokenLimit - tokenUsed),
+    usageRatio,
+    warningLevel: warningLevelForRatio(usageRatio),
+  };
+}
 
 export function hasUsageData(ratio: number | null | undefined): boolean {
   return ratio != null && Number.isFinite(ratio);

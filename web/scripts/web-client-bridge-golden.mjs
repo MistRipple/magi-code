@@ -780,6 +780,7 @@ await withGoldenViteServer(async (server) => {
       measurement: 'estimated',
       phase: 'streaming',
       updatedAt: ACCEPTED_AT + 2,
+      eventSequence: 3,
       turnId: TURN_ID,
       callId: 'call-context-streaming',
       resolvedModel: 'gpt-5.6',

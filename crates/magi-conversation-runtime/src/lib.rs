@@ -7,6 +7,7 @@
 #![recursion_limit = "256"]
 
 mod builtin_tool_schema;
+mod context_authority;
 pub mod context_reference;
 mod conversation;
 pub mod conversation_loop;

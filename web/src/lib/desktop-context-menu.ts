@@ -42,12 +42,24 @@ function descriptorFileContext(descriptor: DesktopContextMenuDescriptor | null):
   filePath: string;
   fileScope: NonNullable<Extract<DesktopContextMenuDescriptor, { kind: 'file' | 'code' | 'image' }>['fileScope']>;
 } | null {
-  if (!descriptor || descriptor.kind === 'link') return null;
-  const filePath = descriptor.filePath?.trim() ?? '';
-  const fileScope = descriptor.fileScope;
+  if (!descriptor || !['file', 'code', 'image'].includes(descriptor.kind)) return null;
+  const fileDescriptor = descriptor as Extract<DesktopContextMenuDescriptor, { kind: 'file' | 'code' | 'image' }>;
+  const filePath = fileDescriptor.filePath?.trim() ?? '';
+  const fileScope = fileDescriptor.fileScope;
   if (!filePath || !fileScope) return null;
   if (!fileScope.workspaceId?.trim() && !fileScope.workspacePath?.trim()) return null;
   return { filePath, fileScope };
+}
+
+function openActiveWorkspaceFolder(): void {
+  const workspacePathRef = currentDescriptor('workspace')?.workspacePathRef.trim() ?? '';
+  if (!workspacePathRef) return;
+  runContextAction(async () => {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('open_workspace_folder', {
+      request: { workspaceRootPathRef: workspacePathRef },
+    });
+  }, i18n.t('contextMenu.openFolder'));
 }
 
 async function resolveRevealTarget(
@@ -112,6 +124,12 @@ async function createMenu(kind: DesktopContextMenuKind, revealAvailable: boolean
         separator(),
         predefined('SelectAll', 'contextMenu.selectAll'),
       ]),
+    });
+  }
+
+  if (kind === 'workspace') {
+    return Menu.new({
+      items: [await custom('contextMenu.openFolder', openActiveWorkspaceFolder)],
     });
   }
 

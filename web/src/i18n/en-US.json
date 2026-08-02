@@ -68,6 +68,7 @@
   "contextMenu.openLink": "Open Link",
   "contextMenu.copyLink": "Copy Link",
   "contextMenu.openFile": "Open File",
+  "contextMenu.openFolder": "Open Folder",
   "contextMenu.openImage": "Open Image",
   "contextMenu.copyImageAddress": "Copy Image Address",
   "contextMenu.revealFile": "Show in Folder",

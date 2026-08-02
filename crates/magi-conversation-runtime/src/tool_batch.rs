@@ -43,7 +43,7 @@ use magi_tool_runtime::{
 use crate::builtin_tool_schema::internal_builtin_tool_rejection_payload;
 use crate::skill_apply_tool::{SKILL_APPLY_TOOL_NAME, execute_skill_apply_from_runtime};
 use crate::task_execution_registry::SpawnedChildExecutionError;
-use crate::tool_execution_ledger::{ToolCallExecutionDecision, ToolExecutionLedger};
+use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::{
     ConversationRegistry, MailboxAuthor, MailboxKind, RuntimeSignal,
     task_execution_registry::{SpawnedChildExecutionRequest, TaskExecutionRegistry},
@@ -224,95 +224,8 @@ pub(crate) fn execute_task_tool_call_batch(
     snapshot_session: Option<Arc<SnapshotSession>>,
     execution_group_id: Option<String>,
 ) -> Vec<(String, ExecutionResultStatus)> {
-    let decisions = tool_execution_ledger.plan(tool_calls, tool_registry);
-    let execution_indices = decisions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, decision)| {
-            matches!(decision, ToolCallExecutionDecision::Execute { .. }).then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let execution_calls = execution_indices
-        .iter()
-        .map(|index| tool_calls[*index].clone())
-        .collect::<Vec<_>>();
-    let executed_results = execute_task_tool_call_batch_unchecked(
-        event_bus,
-        tool_registry,
-        agent_role_registry,
-        skill_runtime,
-        skill_dispatch_runtime,
-        skill_name,
-        task_store,
-        session_store,
-        execution_registry,
-        conversation_registry,
-        spawn_graph,
-        safety_gate,
-        plan_store,
-        project_memory,
-        task,
-        session_id,
-        workspace_id,
-        workspace_root_path,
-        worker_id,
-        &execution_calls,
-        snapshot_session.clone(),
-        execution_group_id.clone(),
-    );
-    let mut results = vec![None; tool_calls.len()];
-    for (execution_index, result) in execution_indices.iter().zip(executed_results) {
-        let ToolCallExecutionDecision::Execute { fingerprint } = &decisions[*execution_index]
-        else {
-            unreachable!("only execute decisions are dispatched");
-        };
-        tool_execution_ledger.record_execution(
-            &tool_calls[*execution_index],
-            fingerprint.as_ref(),
-            &result,
-        );
-        results[*execution_index] = Some(result);
-    }
-
-    let mut fallback_indices = Vec::new();
-    for (index, decision) in decisions.iter().enumerate() {
-        if let Some(result) = decision.immediate_result() {
-            results[index] = Some(result);
-            continue;
-        }
-        match decision {
-            ToolCallExecutionDecision::ReuseAfterExecution {
-                source_index,
-                fingerprint,
-            } => {
-                let Some(source_result) = results[*source_index].as_ref() else {
-                    unreachable!("duplicate source must execute before its reuse decision");
-                };
-                if let Some(reused) = tool_execution_ledger.reuse_after_execution(
-                    &tool_calls[index],
-                    fingerprint,
-                    source_result,
-                ) {
-                    results[index] = Some(reused);
-                } else {
-                    fallback_indices.push(index);
-                }
-            }
-            ToolCallExecutionDecision::Execute { .. } => {}
-            ToolCallExecutionDecision::Reuse { .. }
-            | ToolCallExecutionDecision::BudgetExhausted { .. }
-            | ToolCallExecutionDecision::RecoveryBlocked { .. } => {
-                unreachable!("immediate decisions are handled before deferred execution")
-            }
-        }
-    }
-
-    if !fallback_indices.is_empty() {
-        let fallback_calls = fallback_indices
-            .iter()
-            .map(|index| tool_calls[*index].clone())
-            .collect::<Vec<_>>();
-        let fallback_results = execute_task_tool_call_batch_unchecked(
+    tool_execution_ledger.execute_batch_with(tool_calls, tool_registry, |execution_calls| {
+        execute_task_tool_call_batch_unchecked(
             event_bus,
             tool_registry,
             agent_role_registry,
@@ -332,28 +245,11 @@ pub(crate) fn execute_task_tool_call_batch(
             workspace_id,
             workspace_root_path,
             worker_id,
-            &fallback_calls,
-            snapshot_session,
-            execution_group_id,
-        );
-        for (index, result) in fallback_indices.into_iter().zip(fallback_results) {
-            let ToolCallExecutionDecision::ReuseAfterExecution { fingerprint, .. } =
-                &decisions[index]
-            else {
-                unreachable!("only failed duplicate calls are retried");
-            };
-            tool_execution_ledger.record_execution(&tool_calls[index], Some(fingerprint), &result);
-            results[index] = Some(result);
-        }
-    }
-
-    results
-        .into_iter()
-        .enumerate()
-        .map(|(index, result)| {
-            result.unwrap_or_else(|| tool_execution_failed_result(&tool_calls[index].function.name))
-        })
-        .collect()
+            execution_calls,
+            snapshot_session.clone(),
+            execution_group_id.clone(),
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5706,6 +5602,7 @@ mod tests {
             status: magi_session_store::ExecutionThreadStatus::Idle,
             created_at: UtcMillis(1),
             last_used_at: UtcMillis(2),
+            observed_context_window_tokens: None,
             handled_task_ids: vec![child_id],
             message_history: vec![magi_session_store::ThreadChatMessage {
                 role: "assistant".to_string(),

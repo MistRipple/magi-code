@@ -5,7 +5,8 @@ use crate::models::{
     ExecutionThreadStatus, GoalStatus, NotificationRecord, NotificationScope, SessionDurableState,
     SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionPlan,
     SessionSidecarFlushReason, SessionStoreState, ThreadChatMessage, ThreadChatToolCall,
-    ThreadChatToolFunction, ThreadModelProviderContext,
+    ThreadChatToolFunction, ThreadContextCheckpoint, ThreadFileFactVersion,
+    ThreadModelProviderContext,
 };
 use magi_core::{
     AccessProfile, ExecutionOwnership, MissionId, PlanId, PlanItem, PlanItemId, PlanItemStatus,
@@ -3223,6 +3224,7 @@ fn sample_thread(
         status,
         created_at: now,
         last_used_at: now,
+        observed_context_window_tokens: None,
         handled_task_ids: Vec::new(),
         message_history: Vec::new(),
     }
@@ -3253,6 +3255,7 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
     );
     thread.handled_task_ids.push(task_id.clone());
     store.register_thread(thread);
+    store.record_thread_context_window_tokens(&thread_id, 128_000, UtcMillis(1_100));
     store.append_thread_messages(
         &thread_id,
         vec![
@@ -3298,6 +3301,31 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
         ],
         UtcMillis(2_000),
     );
+    store.install_thread_context_checkpoint(
+        &thread_id,
+        ThreadContextCheckpoint {
+            thread_id: thread_id.clone(),
+            checkpoint_id: "checkpoint-round-trip".to_string(),
+            source_message_count: 2,
+            summary_message: ThreadChatMessage {
+                role: "system".to_string(),
+                content: Some("已执行测试，编译失败。".to_string()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                provider_context: Vec::new(),
+            },
+            reason: "context_window_pressure".to_string(),
+            original_token_estimate: 12_000,
+            checkpoint_token_estimate: 400,
+            created_at: UtcMillis(2_100),
+            file_fact_versions: vec![ThreadFileFactVersion {
+                path: "/tmp/example.rs".to_string(),
+                content_hash: "hash-example".to_string(),
+            }],
+        },
+        UtcMillis(2_100),
+    );
 
     let restored = SessionStore::from_persisted_parts(
         store.durable_state(),
@@ -3309,6 +3337,14 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
     assert_eq!(restored_threads[0].mission_id, mission_id);
     assert_eq!(restored_threads[0].handled_task_ids, vec![task_id]);
     assert_eq!(restored_threads[0].status, ExecutionThreadStatus::Active);
+    assert_eq!(
+        restored_threads[0].observed_context_window_tokens,
+        Some(128_000)
+    );
+    assert_eq!(
+        restored.thread_context_window_tokens(&restored_threads[0].thread_id),
+        Some(128_000)
+    );
 
     let history = restored.thread_message_history(&restored_threads[0].thread_id);
     assert_eq!(history.len(), 3);
@@ -3323,6 +3359,22 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
         Some("exit code 1: compilation failed")
     );
     assert_eq!(history[2].content.as_deref(), Some("继续"));
+    let context_history = restored.thread_context_history(&restored_threads[0].thread_id);
+    assert_eq!(context_history.len(), 2);
+    assert_eq!(context_history[0].role, "system");
+    assert_eq!(context_history[1].content.as_deref(), Some("继续"));
+    let checkpoint = restored
+        .thread_context_checkpoint(&restored_threads[0].thread_id)
+        .expect("checkpoint should survive persistence");
+    assert_eq!(checkpoint.source_message_count, 2);
+    assert_eq!(checkpoint.file_fact_versions.len(), 1);
+
+    restored.replace_thread_messages(&restored_threads[0].thread_id, history, UtcMillis(3_000));
+    assert!(
+        restored
+            .thread_context_checkpoint(&restored_threads[0].thread_id)
+            .is_none()
+    );
 }
 
 #[test]

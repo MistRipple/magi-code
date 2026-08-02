@@ -5,6 +5,7 @@
 use crate::{
     ConversationRegistry, SKILL_APPLY_TOOL_NAME, active_skill_tool_execution_policy,
     build_skill_custom_tool_definitions,
+    context_authority::current_session_file_facts,
     conversation_loop::{self, ConversationLoopRequest},
     execution_admission::ExecutionAdmissionPermit,
     model_config::{
@@ -37,7 +38,8 @@ use crate::{
 use magi_bridge_client::{ChatToolDefinition, ModelBridgeClient, ModelInvocationRequest};
 use magi_context_runtime::{
     ContextBudget, ContextRuntime, ExecutionContextAssemblyRequest, ExecutionContextClues,
-    KnowledgeConsumer, KnowledgeContextRequest, KnowledgeContextSelection, RecentTurnSource,
+    FileSummaryItem, FileSummaryRecord, KnowledgeConsumer, KnowledgeContextRequest,
+    KnowledgeContextSelection, RecentTurnSource,
 };
 use magi_core::{
     AccessProfile, EventId, ExecutionOwnership, LeaseId, SessionId, TaskId, TaskKind, UtcMillis,
@@ -289,6 +291,29 @@ fn fallback_context_budget() -> ContextBudget {
         max_shared_items: 4,
         max_file_summaries: 4,
     }
+}
+
+fn refresh_file_summary_projection(
+    context_runtime: &ContextRuntime,
+    session_store: &SessionStore,
+    session_id: &SessionId,
+    workspace_id: &WorkspaceId,
+) {
+    let facts = current_session_file_facts(session_store, session_id)
+        .into_iter()
+        .map(|fact| FileSummaryRecord {
+            item: FileSummaryItem {
+                absolute_path: fact.absolute_path,
+                summary: fact.summary,
+            },
+            workspace_id: Some(workspace_id.clone()),
+            project_key: None,
+            updated_at: UtcMillis::now(),
+        })
+        .collect::<Vec<_>>();
+    context_runtime
+        .file_summary_store()
+        .replace_scope(Some(workspace_id), None, facts);
 }
 
 impl LlmTaskDispatcher {
@@ -1538,8 +1563,13 @@ impl LlmTaskDispatcher {
             context_budget.max_turns = 0;
             context_budget.max_memory = 0;
             context_budget.max_shared_items = 0;
-            context_budget.max_file_summaries = 0;
         }
+        refresh_file_summary_projection(
+            ctx_runtime,
+            self.session_store.as_ref(),
+            session_id,
+            &ws_id,
+        );
         let result = ctx_runtime.assemble_execution_context(&ExecutionContextAssemblyRequest {
             session_id: session_id.clone(),
             workspace_id: ws_id,
@@ -2026,6 +2056,7 @@ impl LlmTaskDispatcher {
             event_bus: self.event_bus.as_ref(),
             session_store: self.session_store.as_ref(),
             settings_store: execution_settings,
+            live_settings_store: self.settings_store.as_ref(),
             tool_registry: self.tool_registry.as_ref(),
             skill_runtime: self.skill_runtime.as_deref(),
             skill_dispatch_runtime: self.skill_dispatch_runtime.as_deref(),
@@ -3012,7 +3043,7 @@ mod tests {
     }
 
     #[test]
-    fn assemble_prompt_for_subagent_uses_package_without_automatic_session_context() {
+    fn assemble_prompt_for_subagent_uses_package_and_current_file_facts_only() {
         let session_id = SessionId::new("session-context-prompt");
         let workspace_id = WorkspaceId::new("workspace-context-prompt");
         let session_store = SessionStore::from_state(magi_session_store::SessionStoreState {
@@ -3039,6 +3070,7 @@ mod tests {
             canonical_turns: vec![],
             goals: vec![],
             plans: vec![],
+            thread_context_checkpoints: vec![],
             thread_registry: vec![],
             execution_sidecar_store: magi_session_store::SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
@@ -3046,15 +3078,6 @@ mod tests {
         });
 
         let file_summary_store = magi_context_runtime::FileSummaryStore::default();
-        file_summary_store.upsert(magi_context_runtime::FileSummaryRecord {
-            item: magi_context_runtime::FileSummaryItem {
-                absolute_path: "/repo/src/lib.rs".to_string(),
-                summary: "Important file summary from current workspace.".to_string(),
-            },
-            workspace_id: Some(workspace_id.clone()),
-            project_key: None,
-            updated_at: UtcMillis(20),
-        });
 
         let context_runtime = ContextRuntime::with_runtime_sources(
             KnowledgeStore::new(),
@@ -3073,6 +3096,42 @@ mod tests {
                 max_shared_items: 0,
                 max_file_summaries: 1,
             });
+        dispatcher
+            .session_store
+            .create_session(session_id.clone(), "Context prompt session")
+            .expect("dispatcher session should create");
+        let (_, thread_id) =
+            dispatcher
+                .session_store
+                .ensure_session_mission(&session_id, UtcMillis(15), || {
+                    MissionId::new("mission-context-prompt")
+                });
+        let directory = tempfile::tempdir().expect("tempdir");
+        let file_path = directory.path().join("src-lib.rs");
+        std::fs::write(&file_path, "Important file summary from current workspace.")
+            .expect("write file fact");
+        dispatcher.session_store.append_thread_messages(
+            &thread_id,
+            vec![magi_session_store::ThreadChatMessage {
+                role: "tool".to_string(),
+                content: Some(
+                    serde_json::json!({
+                        "tool": "file_read",
+                        "status": "succeeded",
+                        "path": file_path,
+                        "content_hash": magi_snapshot::path_content_hash(&file_path)
+                            .expect("hash file fact"),
+                        "content": "Important file summary from current workspace."
+                    })
+                    .to_string(),
+                ),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call-file-summary".to_string()),
+                provider_context: Vec::new(),
+            }],
+            UtcMillis(20),
+        );
         let mut task = task_with_role("executor", TaskTier::ExecutionChain);
         task.runtime_payload = magi_core::TaskRuntimePayload::AgentContext {
             package: Box::new(magi_core::AgentContextPackage {
@@ -3091,16 +3150,23 @@ mod tests {
         };
 
         let (prompt, summary) =
-            dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id));
+            dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id.clone()));
 
         assert!(prompt.contains("[agent-context-package]"));
         assert!(prompt.contains("只检查当前任务包"));
         assert!(!prompt.contains("prior session fact for runtime context"));
-        assert!(!prompt.contains("Important file summary from current workspace"));
+        assert!(prompt.contains("Important file summary from current workspace"));
         assert!(prompt.contains("--- Task ---"));
         let summary = summary.expect("context summary");
         assert_eq!(summary.used_turns, 0);
-        assert_eq!(summary.used_file_summaries, 0);
+        assert_eq!(summary.used_file_summaries, 1);
+
+        std::fs::write(&file_path, "Externally changed content.")
+            .expect("change projected file fact");
+        let (prompt, summary) =
+            dispatcher.assemble_prompt(None, &task, &session_id, &Some(workspace_id));
+        assert!(!prompt.contains("Important file summary from current workspace"));
+        assert_eq!(summary.expect("context summary").used_file_summaries, 0);
     }
 
     #[test]

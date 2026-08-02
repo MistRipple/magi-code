@@ -327,6 +327,7 @@ pub(crate) fn restore_missing_resumed_branch_threads(
             status: ExecutionThreadStatus::Active,
             created_at,
             last_used_at: UtcMillis::now(),
+            observed_context_window_tokens: None,
             handled_task_ids: vec![branch.task_id.clone()],
             message_history: rebuild_thread_history_from_canonical(
                 &canonical_turns,

@@ -12,6 +12,7 @@ magi-governance = { path = "../magi-governance" }
 magi-knowledge-store = { path = "../magi-knowledge-store" }
 magi-permissions = { path = "../magi-permissions" }
 magi-process = { path = "../magi-process" }
+magi-snapshot = { path = "../magi-snapshot" }
 reqwest = { workspace = true, features = ["blocking"] }
 regex = "1"
 urlencoding = "2"

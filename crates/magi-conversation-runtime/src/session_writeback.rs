@@ -1,4 +1,5 @@
 use crate::tool_declared_paths::{append_result_declared_paths, derive_declared_paths};
+use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
     model_visible_tool_result, summarize_tool_result, tool_execution_failed_result,
     tool_execution_status_label, turn_item_status_for_tool_result,
@@ -832,6 +833,7 @@ fn append_session_tool_call_items_batch(
     } = context;
     let plan_store = crate::test_plan_store("test-plan");
     let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
+    let mut tool_execution_ledger = ToolExecutionLedger::default();
     append_session_tool_call_items_batch_with_context(
         SessionToolCallBatchContext {
             session_store,
@@ -852,6 +854,7 @@ fn append_session_tool_call_items_batch(
             execution_group_id,
             source_thread_id,
             persist_session_state,
+            tool_execution_ledger: &mut tool_execution_ledger,
         },
         tool_calls,
         messages,
@@ -859,7 +862,7 @@ fn append_session_tool_call_items_batch(
     )
 }
 
-pub struct SessionToolCallBatchContext<'a> {
+pub(crate) struct SessionToolCallBatchContext<'a> {
     pub session_store: &'a SessionStore,
     pub event_bus: &'a InMemoryEventBus,
     pub tool_registry: Option<&'a ToolRegistry>,
@@ -878,9 +881,10 @@ pub struct SessionToolCallBatchContext<'a> {
     pub execution_group_id: Option<String>,
     pub source_thread_id: &'a ThreadId,
     pub persist_session_state: Option<&'a SessionStatePersistCallback>,
+    pub tool_execution_ledger: &'a mut ToolExecutionLedger,
 }
 
-pub fn append_session_tool_call_items_batch_with_context(
+pub(crate) fn append_session_tool_call_items_batch_with_context(
     context: SessionToolCallBatchContext<'_>,
     tool_calls: &[ChatToolCall],
     messages: &mut Vec<ChatMessage>,
@@ -905,6 +909,7 @@ pub fn append_session_tool_call_items_batch_with_context(
         execution_group_id,
         source_thread_id,
         persist_session_state,
+        tool_execution_ledger,
     } = context;
     for tool_call in tool_calls {
         if !write_allowed() {
@@ -928,37 +933,40 @@ pub fn append_session_tool_call_items_batch_with_context(
         }
     }
 
-    let hook_contexts: Vec<ToolHookCtx> = tool_calls
-        .iter()
-        .map(|tool_call| ToolHookCtx {
-            tool_call_id: tool_call.id.clone(),
-            worker_id: None,
-            execution_group_id: execution_group_id.clone(),
-            declared_paths: derive_declared_paths(tool_call),
-        })
-        .collect();
-
-    let tool_results = execute_session_turn_tool_call_batch(
-        SessionToolExecutionContext {
-            session_store,
-            event_bus,
-            tool_registry,
-            skill_runtime,
-            skill_dispatch_runtime,
-            skill_name,
-            safety_gate,
-            plan_store,
-            mission_id,
-            session_id,
-            workspace_id,
-            workspace_root_path: workspace_root_path.as_ref(),
-            context_references,
-            access_profile,
-        },
-        tool_calls,
-        snapshot_session.as_ref(),
-        &hook_contexts,
-    );
+    let execution_context = SessionToolExecutionContext {
+        session_store,
+        event_bus,
+        tool_registry,
+        skill_runtime,
+        skill_dispatch_runtime,
+        skill_name,
+        safety_gate,
+        plan_store,
+        mission_id,
+        session_id,
+        workspace_id,
+        workspace_root_path: workspace_root_path.as_ref(),
+        context_references,
+        access_profile,
+    };
+    let tool_results =
+        tool_execution_ledger.execute_batch_with(tool_calls, tool_registry, |execution_calls| {
+            let hook_contexts = execution_calls
+                .iter()
+                .map(|tool_call| ToolHookCtx {
+                    tool_call_id: tool_call.id.clone(),
+                    worker_id: None,
+                    execution_group_id: execution_group_id.clone(),
+                    declared_paths: derive_declared_paths(tool_call),
+                })
+                .collect::<Vec<_>>();
+            execute_session_turn_tool_call_batch(
+                execution_context,
+                execution_calls,
+                snapshot_session.as_ref(),
+                &hook_contexts,
+            )
+        });
 
     if let Some(snapshot) = snapshot_session.as_deref()
         && let Err(err) = snapshot.reconcile()
@@ -3268,6 +3276,7 @@ mod tests {
             .expect("turn should be creatable");
         let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
         let mut messages = Vec::new();
+        let mut tool_execution_ledger = ToolExecutionLedger::default();
         let valid_call = ChatToolCall {
             id: "tool-call-mainline-plan-valid".to_string(),
             kind: "function".to_string(),
@@ -3305,6 +3314,7 @@ mod tests {
                 execution_group_id: None,
                 source_thread_id: &thread_id,
                 persist_session_state: None,
+                tool_execution_ledger: &mut tool_execution_ledger,
             },
             &[valid_call],
             &mut messages,
@@ -3358,6 +3368,7 @@ mod tests {
                 execution_group_id: None,
                 source_thread_id: &thread_id,
                 persist_session_state: None,
+                tool_execution_ledger: &mut tool_execution_ledger,
             },
             &[invalid_call],
             &mut messages,
@@ -3423,6 +3434,7 @@ mod tests {
         );
         let plan_store = crate::test_plan_store("skill-activation-ledger");
         let mut messages = Vec::new();
+        let mut tool_execution_ledger = ToolExecutionLedger::default();
         let call = ChatToolCall {
             id: "tool-call-skill-activation".to_string(),
             kind: "function".to_string(),
@@ -3452,6 +3464,7 @@ mod tests {
                 execution_group_id: None,
                 source_thread_id: &thread_id,
                 persist_session_state: None,
+                tool_execution_ledger: &mut tool_execution_ledger,
             },
             &[call],
             &mut messages,

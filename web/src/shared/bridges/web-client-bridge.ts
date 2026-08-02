@@ -1516,11 +1516,18 @@ function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
   const current = messagesState.orchestratorRuntimeState;
   const currentBudget = current?.runtimeSnapshot?.budgetState;
   const currentUpdatedAt = currentBudget?.updatedAt ?? 0;
+  const currentEventSequence = currentBudget?.eventSequence ?? 0;
+  const nextEventSequence = typeof event.sequence === 'number' ? Math.floor(event.sequence) : 0;
   const currentMeasurementRank = currentBudget?.measurement === 'authoritative' ? 1 : 0;
   const nextMeasurementRank = measurement === 'authoritative' ? 1 : 0;
   if (
-    currentUpdatedAt > updatedAt
-    || (currentUpdatedAt === updatedAt && currentMeasurementRank > nextMeasurementRank)
+    currentEventSequence > nextEventSequence
+    || (currentEventSequence === nextEventSequence && currentUpdatedAt > updatedAt)
+    || (
+      currentEventSequence === nextEventSequence
+      && currentUpdatedAt === updatedAt
+      && currentMeasurementRank > nextMeasurementRank
+    )
   ) {
     return;
   }
@@ -1545,6 +1552,7 @@ function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
     measurement,
     phase: trimBridgeString(payload.phase) || undefined,
     updatedAt: Math.floor(updatedAt),
+    eventSequence: nextEventSequence,
     turnId: trimBridgeString(payload.turn_id ?? payload.turnId) || undefined,
     callId: trimBridgeString(payload.call_id ?? payload.callId) || undefined,
     resolvedModel: trimBridgeString(payload.resolved_model ?? payload.resolvedModel) || undefined,
@@ -1582,14 +1590,19 @@ function applyContextCompactionRuntimeEvent(event: RustEventEnvelope): void {
   const tokenLimit = readFiniteEventNumber(payload, 'token_limit', 'tokenLimit')
     ?? messagesState.orchestratorRuntimeState?.runtimeSnapshot?.budgetState?.tokenLimit;
   if (compactedTokenEstimate === undefined || tokenLimit === undefined) return;
+  const requestTokenEstimate = readFiniteEventNumber(
+    payload,
+    'request_token_estimate',
+    'requestTokenEstimate',
+  ) ?? compactedTokenEstimate;
   applyContextBudgetRuntimeEvent({
     ...event,
     payload: {
       ...payload,
-      token_used: compactedTokenEstimate,
+      token_used: requestTokenEstimate,
       token_limit: tokenLimit,
-      remaining_tokens: Math.max(0, tokenLimit - compactedTokenEstimate),
-      usage_ratio: tokenLimit > 0 ? compactedTokenEstimate / tokenLimit : 0,
+      remaining_tokens: Math.max(0, tokenLimit - requestTokenEstimate),
+      usage_ratio: tokenLimit > 0 ? requestTokenEstimate / tokenLimit : 0,
       phase: 'compacted',
       accuracy: 'estimated',
       updated_at: readFiniteEventNumber(payload, 'compacted_at', 'compactedAt')
@@ -1613,6 +1626,7 @@ function applyContextCompactionRuntimeEvent(event: RustEventEnvelope): void {
           'originalTokenEstimate',
         ),
         compactedTokenEstimate,
+        requestTokenEstimate,
         originalMessageCount: readFiniteEventNumber(
           payload,
           'original_message_count',
@@ -1699,6 +1713,9 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
   }
 
   if (eventType === 'session.context.compacted') {
+    if (trimBridgeString(event.payload?.thread_scope) !== 'mainline') {
+      return;
+    }
     applyContextCompactionRuntimeEvent(event);
     return;
   }

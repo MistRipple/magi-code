@@ -416,12 +416,17 @@ fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
             }
         };
         entries.sort();
+        let content_hash = match magi_snapshot::path_content_hash(&path) {
+            Ok(content_hash) => content_hash,
+            Err(error) => return builtin_error("file_read", format!("计算目录版本失败：{error}")),
+        };
         return serde_json::json!({
             "tool": "file_read",
             "status": "succeeded",
             "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
             "mode": "directory",
             "path": path.display().to_string(),
+            "content_hash": content_hash,
             "entries": entries,
             "entry_count": entries.len(),
             "summary": format!("目录 {} 包含 {} 项", path.display(), entries.len())
@@ -450,6 +455,10 @@ fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
         bytes.truncate(max_bytes);
     }
     let content = String::from_utf8_lossy(&bytes).to_string();
+    let content_hash = match magi_snapshot::path_content_hash(&path) {
+        Ok(content_hash) => content_hash,
+        Err(error) => return builtin_error("file_read", format!("计算文件版本失败：{error}")),
+    };
 
     serde_json::json!({
         "tool": "file_read",
@@ -457,6 +466,7 @@ fn execute_file_read(input: &str, context: &ToolExecutionContext) -> String {
         "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
         "mode": "file",
         "path": path.display().to_string(),
+        "content_hash": content_hash,
         "file_size_bytes": file_size_bytes,
         "max_bytes": max_bytes,
         "bytes_read": bytes.len(),

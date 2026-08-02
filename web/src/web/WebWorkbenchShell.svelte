@@ -18,6 +18,7 @@
     type DesktopDropZone,
   } from '../lib/desktop-file-drop';
   import type { IconName } from '../lib/icons';
+  import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
   import {
     addToast,
     messagesState,
@@ -1985,6 +1986,10 @@
                   <button
                     type="button"
                     class="workspace-header-btn"
+                    use:desktopContextMenu={{
+                      kind: 'workspace',
+                      workspacePathRef: workspaceBindingPath(workspace),
+                    }}
                     class:active={workspace.workspaceId === selectedWorkspaceId}
                     aria-expanded={!!expandedWorkspaceIds[workspace.workspaceId]}
                     data-workspace-id={workspace.workspaceId}

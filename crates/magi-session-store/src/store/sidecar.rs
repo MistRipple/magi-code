@@ -5,7 +5,7 @@ use crate::models::{
     CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus, CanonicalTurnVisibility,
     CanonicalWorkerRef, ExecutionThread, ExecutionThreadStatus, SessionExecutionSidecarStatus,
     SessionExecutionSidecarStoreState, SessionRuntimeSidecar, SessionSidecarFlushReason,
-    SessionStoreState, ThreadChatMessage, ThreadVisibility, TimelineEntry,
+    SessionStoreState, ThreadChatMessage, ThreadContextCheckpoint, ThreadVisibility, TimelineEntry,
 };
 use magi_core::{
     DomainError, DomainResult, ExecutionOwnership, MissionId, RecoveryResumeInput, SessionId,
@@ -1025,6 +1025,7 @@ impl SessionStore {
             status: ExecutionThreadStatus::Idle,
             created_at: now,
             last_used_at: now,
+            observed_context_window_tokens: None,
             handled_task_ids: Vec::new(),
             message_history: Vec::new(),
         });
@@ -1070,6 +1071,139 @@ impl SessionStore {
             .unwrap_or_default()
     }
 
+    /// 返回供模型消费的 thread 上下文视图。检查点覆盖的原始消息不会重复注入，
+    /// 但仍完整保留在 transcript 中用于审计、恢复和后续重新压缩。
+    pub fn thread_context_history(&self, thread_id: &ThreadId) -> Vec<ThreadChatMessage> {
+        let state = self.state.read().expect("session state read lock poisoned");
+        let Some(thread) = state
+            .thread_registry
+            .iter()
+            .find(|thread| &thread.thread_id == thread_id)
+        else {
+            return Vec::new();
+        };
+        let Some(checkpoint) = state
+            .thread_context_checkpoints
+            .iter()
+            .find(|checkpoint| &checkpoint.thread_id == thread_id)
+        else {
+            return thread.message_history.clone();
+        };
+        let source_message_count = checkpoint
+            .source_message_count
+            .min(thread.message_history.len());
+        let mut history = Vec::with_capacity(
+            thread
+                .message_history
+                .len()
+                .saturating_sub(source_message_count)
+                + 1,
+        );
+        history.push(checkpoint.summary_message.clone());
+        history.extend(
+            thread.message_history[source_message_count..]
+                .iter()
+                .cloned(),
+        );
+        history
+    }
+
+    pub fn thread_context_checkpoint(
+        &self,
+        thread_id: &ThreadId,
+    ) -> Option<ThreadContextCheckpoint> {
+        let state = self.state.read().expect("session state read lock poisoned");
+        state
+            .thread_context_checkpoints
+            .iter()
+            .find(|checkpoint| &checkpoint.thread_id == thread_id)
+            .cloned()
+    }
+
+    pub fn thread_context_window_tokens(&self, thread_id: &ThreadId) -> Option<u64> {
+        self.state
+            .read()
+            .expect("session state read lock poisoned")
+            .thread_registry
+            .iter()
+            .find(|thread| &thread.thread_id == thread_id)
+            .and_then(|thread| thread.observed_context_window_tokens)
+    }
+
+    pub fn record_thread_context_window_tokens(
+        &self,
+        thread_id: &ThreadId,
+        context_window_tokens: u64,
+        now: UtcMillis,
+    ) {
+        if context_window_tokens == 0 {
+            return;
+        }
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        if let Some(thread) = state
+            .thread_registry
+            .iter_mut()
+            .find(|thread| &thread.thread_id == thread_id)
+        {
+            thread.observed_context_window_tokens = Some(context_window_tokens);
+            thread.last_used_at = now;
+        }
+    }
+
+    pub fn install_thread_context_checkpoint(
+        &self,
+        thread_id: &ThreadId,
+        checkpoint: ThreadContextCheckpoint,
+        now: UtcMillis,
+    ) {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        let Some(message_count) = state
+            .thread_registry
+            .iter()
+            .find(|thread| &thread.thread_id == thread_id)
+            .map(|thread| thread.message_history.len())
+        else {
+            return;
+        };
+        let checkpoint = ThreadContextCheckpoint {
+            thread_id: thread_id.clone(),
+            source_message_count: checkpoint.source_message_count.min(message_count),
+            ..checkpoint
+        };
+        if let Some(existing) = state
+            .thread_context_checkpoints
+            .iter_mut()
+            .find(|existing| &existing.thread_id == thread_id)
+        {
+            *existing = checkpoint;
+        } else {
+            state.thread_context_checkpoints.push(checkpoint);
+        }
+        if let Some(thread) = state
+            .thread_registry
+            .iter_mut()
+            .find(|thread| &thread.thread_id == thread_id)
+        {
+            thread.last_used_at = now;
+        }
+    }
+
+    pub fn clear_thread_context_checkpoint(&self, thread_id: &ThreadId) {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        state
+            .thread_context_checkpoints
+            .retain(|checkpoint| &checkpoint.thread_id != thread_id);
+    }
+
     /// P6b：将本轮 task 的 LLM 对话追加到当前 thread 的审计 / 恢复记录。
     pub fn append_thread_messages(
         &self,
@@ -1094,10 +1228,9 @@ impl SessionStore {
         }
     }
 
-    /// P6b：用压缩后的消息集替换指定 thread 的对话记录。
+    /// 用新的 transcript 替换指定 thread 的原始对话记录。
     ///
-    /// 这是上下文压缩的唯一写入口：压缩不是追加一个旁路摘要，而是直接替换当前
-    /// thread 的可恢复历史，确保下一轮只会读取最新结构。
+    /// 该操作用于用户编辑、恢复分支复制等真实历史变更；已有上下文检查点会失效。
     pub fn replace_thread_messages(
         &self,
         thread_id: &ThreadId,
@@ -1116,6 +1249,9 @@ impl SessionStore {
             thread.message_history = messages;
             thread.last_used_at = now;
         }
+        state
+            .thread_context_checkpoints
+            .retain(|checkpoint| &checkpoint.thread_id != thread_id);
     }
 
     pub fn bind_execution_ownership(&self, session_id: SessionId, ownership: ExecutionOwnership) {

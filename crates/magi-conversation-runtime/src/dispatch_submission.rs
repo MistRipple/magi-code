@@ -650,11 +650,22 @@ fn seed_interrupted_turn_checkpoint(
             checkpoint.source_task_id
         )));
     }
+    let source_checkpoint = session_store.thread_context_checkpoint(&checkpoint.source_thread_id);
     session_store.replace_thread_messages(
         destination_thread_id,
         source_thread.message_history,
         now,
     );
+    if let Some(source_checkpoint) = source_checkpoint {
+        session_store.install_thread_context_checkpoint(
+            destination_thread_id,
+            magi_session_store::ThreadContextCheckpoint {
+                thread_id: destination_thread_id.clone(),
+                ..source_checkpoint
+            },
+            now,
+        );
+    }
     Ok(())
 }
 
@@ -783,6 +794,7 @@ mod tests {
             status: ExecutionThreadStatus::Idle,
             created_at: UtcMillis(1_000),
             last_used_at: UtcMillis(1_000),
+            observed_context_window_tokens: None,
             handled_task_ids: vec![TaskId::new("task-old")],
             message_history: vec![ThreadChatMessage {
                 role: "user".to_string(),
@@ -921,6 +933,7 @@ mod tests {
             status: ExecutionThreadStatus::Idle,
             created_at: now,
             last_used_at: now,
+            observed_context_window_tokens: None,
             handled_task_ids: vec![source_task_id.clone()],
             message_history: source_history.clone(),
         });

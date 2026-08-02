@@ -1187,6 +1187,7 @@ mod tests {
             notifications: Vec::new(),
             goals: Vec::new(),
             plans: Vec::new(),
+            thread_context_checkpoints: Vec::new(),
             thread_registry: Vec::new(),
         };
         let sidecar_state = SessionExecutionSidecarStoreState {

@@ -17,7 +17,7 @@ pub use context_window::{
     DEFAULT_CONTEXT_WINDOW, EFFECTIVE_CONTEXT_WINDOW_PERCENT, evaluate_context_budget,
     percent_of_context_window_remaining, resolve_context_window,
 };
-pub use costing::{NormalizedUsageTotals, normalize_usage_delta};
+pub use costing::{NormalizedUsageTotals, context_window_tokens_from_usage, normalize_usage_delta};
 pub use ledger_store::InMemoryLedgerStore;
 pub use model_identity::{build_model_resolution_identity, prepare_llm_config_for_persistence};
 pub use query_service::UsageQueryService;

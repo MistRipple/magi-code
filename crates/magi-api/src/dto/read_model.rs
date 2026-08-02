@@ -166,7 +166,18 @@ pub fn apply_configured_model_context_windows(
         let Some(observation) = session.usage_observation.as_ref() else {
             continue;
         };
-        let resolved_model = observation.resolved_model.as_deref().unwrap_or("");
+        let session_id = SessionId::new(session.session_id.clone());
+        let active_model =
+            magi_conversation_runtime::model_config::resolve_orchestrator_model_config(
+                settings_store,
+                Some(&session_id),
+            )
+            .ok()
+            .and_then(|config| config.require_model().ok().map(str::to_string));
+        let resolved_model = active_model
+            .as_deref()
+            .or(observation.resolved_model.as_deref())
+            .unwrap_or("");
         let context_window =
             magi_conversation_runtime::model_context_window::resolve_model_context_window(
                 Some(settings_store),
@@ -2226,6 +2237,62 @@ mod tests {
             .find(|entry| entry.session_id == "session-no-usage")
             .expect("session without usage should exist");
         assert!(without_usage.budget.is_none());
+    }
+
+    #[test]
+    fn configured_budget_keeps_session_usage_when_active_model_changes() {
+        let settings_store = SettingsStore::new();
+        settings_store
+            .set_section(
+                "orchestrator",
+                serde_json::json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-test",
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat"
+                }),
+            )
+            .unwrap();
+        let session_id = SessionId::new("session-model-switch-budget");
+        settings_store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                serde_json::json!({
+                    "model": "claude-opus-4.8",
+                    "reasoningEffort": "high"
+                }),
+            )
+            .unwrap();
+        magi_conversation_runtime::model_context_window::set_model_context_window(
+            &settings_store,
+            "claude-opus-4.8",
+            1_000_000,
+        )
+        .unwrap();
+
+        let mut input = RuntimeReadModelInput::default();
+        input.details.sessions.push(SessionRuntimeSummaryEntry {
+            session_id: session_id.to_string(),
+            usage_observation: Some(SessionRuntimeUsageObservation {
+                context_window_tokens: 64_000,
+                resolved_model: Some("gpt-5.6-luna".to_string()),
+                observed_at: Some(UtcMillis(1)),
+                ..SessionRuntimeUsageObservation::default()
+            }),
+            ..SessionRuntimeSummaryEntry::default()
+        });
+
+        apply_configured_model_context_windows(&mut input, &settings_store);
+
+        let budget = input.details.sessions[0]
+            .budget
+            .as_ref()
+            .expect("model switch should preserve session context budget");
+        assert_eq!(budget.token_used, 64_000);
+        assert_eq!(budget.token_limit, 1_000_000);
+        assert_eq!(budget.remaining_tokens, 936_000);
+        assert!((budget.usage_ratio - 0.064).abs() < f64::EPSILON);
     }
 
     #[test]

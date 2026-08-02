@@ -30,7 +30,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 mod file_reveal;
 
-use file_reveal::reveal_workspace_file;
+use file_reveal::{open_workspace_folder, reveal_workspace_file};
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const OPEN_MENU_ID: &str = "open-magi";
@@ -941,6 +941,7 @@ fn main() {
             install_staged_desktop_update,
             get_desktop_runtime_recovery,
             restart_desktop_runtime,
+            open_workspace_folder,
             reveal_workspace_file,
         ])
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {

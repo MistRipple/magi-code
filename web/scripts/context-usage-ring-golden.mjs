@@ -419,6 +419,77 @@ await withGoldenViteServer(async (server) => {
     assert.match(ring.buildRingTooltip(input, t), /实时估算/);
   }
 
+  // 场景 12.1：上下文占用属于会话；切换模型只改变窗口上限，不能重置已用量。
+  {
+    const projected = ring.projectSessionContextBudget({
+      tokenLimit: 1_000_000,
+      budget: {
+        tokenUsed: 18_100,
+        remainingTokens: 253_900,
+        tokenLimit: 272_000,
+        usageRatio: 18_100 / 272_000,
+        warningLevel: 'normal',
+        measurement: 'authoritative',
+      },
+    });
+    assert.equal(projected.tokenUsed, 18_100);
+    assert.equal(projected.tokenLimit, 1_000_000);
+    assert.equal(projected.remainingTokens, 981_900);
+    assert.equal(projected.usageRatio, 0.0181);
+    assert.equal(ring.resolveRingView(projected).percentText, '2');
+  }
+
+  // 场景 12.2：窗口配置变化后，圆环的已用、剩余、比例和告警必须同步重算。
+  {
+    const projected = ring.projectSessionContextBudget({
+      tokenLimit: 20_000,
+      budget: {
+        tokenUsed: 18_100,
+        remainingTokens: 253_900,
+        tokenLimit: 272_000,
+        usageRatio: 18_100 / 272_000,
+        warningLevel: 'normal',
+        measurement: 'authoritative',
+      },
+    });
+    assert.equal(projected.tokenUsed, 18_100);
+    assert.equal(projected.tokenLimit, 20_000);
+    assert.equal(projected.remainingTokens, 1_900);
+    assert.equal(projected.usageRatio, 0.905);
+    assert.equal(projected.warningLevel, 'danger');
+  }
+
+  // 场景 12.3：压缩事件必须让圆环按压缩后的活动上下文回落，而非保留压缩前占用。
+  {
+    const before = ring.resolveRingView(ring.projectSessionContextBudget({
+      tokenLimit: 16_000,
+      budget: {
+        tokenUsed: 14_800,
+        tokenLimit: 16_000,
+        usageRatio: 0.925,
+        warningLevel: 'danger',
+        measurement: 'estimated',
+      },
+    }));
+    const after = ring.resolveRingView(ring.projectSessionContextBudget({
+      tokenLimit: 16_000,
+      budget: {
+        tokenUsed: 3_200,
+        tokenLimit: 16_000,
+        usageRatio: 0.2,
+        warningLevel: 'normal',
+        measurement: 'estimated',
+        lastCompactionReason: 'context_window_pressure',
+        originalTokenEstimate: 14_800,
+        compactedTokenEstimate: 3_200,
+      },
+    }));
+    assert.equal(before.percentText, '93');
+    assert.equal(after.percentText, '20');
+    assert.ok(after.geometry.dashOffset > before.geometry.dashOffset,
+      'smaller active context must visibly reduce the ring fill after compaction');
+  }
+
   // 场景 13：知识能力的五种决策必须完整投影到当前会话诊断，且不泄漏知识正文。
   {
     const decisions = [

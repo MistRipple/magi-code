@@ -371,6 +371,26 @@ impl FileSummaryStore {
             .insert(FileSummaryKey::from_record(&record), record);
     }
 
+    /// 以 transcript 派生结果整体替换指定作用域。该存储是可重建投影，不是事实源。
+    pub fn replace_scope(
+        &self,
+        workspace_id: Option<&WorkspaceId>,
+        project_key: Option<&str>,
+        records: Vec<FileSummaryRecord>,
+    ) {
+        let mut entries = self
+            .entries
+            .write()
+            .expect("file summary store write lock poisoned");
+        entries.retain(|_, record| {
+            record.workspace_id.as_ref() != workspace_id
+                || record.project_key.as_deref() != project_key
+        });
+        for record in records {
+            entries.insert(FileSummaryKey::from_record(&record), record);
+        }
+    }
+
     pub fn query(&self, query: &FileSummaryQuery) -> Vec<FileSummaryRecord> {
         let mut records =
             self.entries
@@ -543,6 +563,7 @@ mod tests {
             canonical_turns: vec![],
             goals: vec![],
             plans: vec![],
+            thread_context_checkpoints: vec![],
             thread_registry: vec![],
             execution_sidecar_store: SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
@@ -725,6 +746,7 @@ mod tests {
             canonical_turns: vec![],
             goals: vec![],
             plans: vec![],
+            thread_context_checkpoints: vec![],
             thread_registry: vec![],
             execution_sidecar_store: SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
@@ -979,6 +1001,7 @@ mod tests {
             canonical_turns: vec![],
             goals: vec![],
             plans: vec![],
+            thread_context_checkpoints: vec![],
             thread_registry: vec![],
             execution_sidecar_store: SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
@@ -1538,6 +1561,7 @@ mod tests {
             canonical_turns: vec![],
             goals: vec![],
             plans: vec![],
+            thread_context_checkpoints: vec![],
             thread_registry: vec![],
             execution_sidecar_store: SessionExecutionSidecarStoreState {
                 runtime_sidecars: vec![],
@@ -1721,6 +1745,7 @@ mod tests {
                 canonical_turns: vec![],
                 goals: vec![],
                 plans: vec![],
+                thread_context_checkpoints: vec![],
                 thread_registry: vec![],
                 execution_sidecar_store: SessionExecutionSidecarStoreState {
                     runtime_sidecars: vec![],

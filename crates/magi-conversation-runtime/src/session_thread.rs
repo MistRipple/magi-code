@@ -27,6 +27,7 @@ pub fn ensure_thread_for_role(
         status: ExecutionThreadStatus::Active,
         created_at: now,
         last_used_at: now,
+        observed_context_window_tokens: None,
         handled_task_ids: vec![task_id.clone()],
         message_history: Vec::new(),
     };
@@ -59,6 +60,7 @@ mod tests {
             status: ExecutionThreadStatus::Idle,
             created_at: UtcMillis(1_000),
             last_used_at: UtcMillis(1_000),
+            observed_context_window_tokens: None,
             handled_task_ids: vec![old_task_id],
             message_history: vec![magi_session_store::ThreadChatMessage {
                 role: "user".to_string(),

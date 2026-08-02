@@ -16,6 +16,7 @@ pub mod watcher;
 
 pub use error::{SnapshotError, SnapshotResult};
 pub use manager::SnapshotManager;
+pub use scan::path_content_hash;
 pub use session::SnapshotSession;
 pub use tool_hook::{ToolHook, ToolHookCtx};
 pub use types::{

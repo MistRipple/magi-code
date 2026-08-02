@@ -25,6 +25,7 @@
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
   import ContextUsageRing from './ContextUsageRing.svelte';
+  import { projectSessionContextBudget } from '../lib/context-usage-ring';
   import GitContextControl from './GitContextControl.svelte';
   import { generateId } from '../lib/utils';
   import { i18n } from '../stores/i18n.svelte';
@@ -217,36 +218,10 @@
       : null;
   });
   const contextBudgetView = $derived.by(() => {
-    const budget = contextBudgetState;
-    const model = currentPickerModel.trim().toLowerCase();
-    const budgetModel = budget?.resolvedModel?.trim().toLowerCase() || '';
-    const runtimeWindow = !budgetModel || budgetModel === model
-      ? budget?.tokenLimit ?? null
-      : null;
-    const tokenLimit = configuredContextWindow ?? runtimeWindow;
-    if (!budget || tokenLimit == null || tokenLimit <= 0) {
-      return {
-        ...(budget ?? {}),
-        tokenLimit,
-      };
-    }
-    const tokenUsed = Math.max(0, Math.floor(budget.tokenUsed ?? 0));
-    const usageRatio = Math.min(1, tokenUsed / tokenLimit);
-    const warningLevel: 'normal' | 'notice' | 'warning' | 'danger' = usageRatio >= 0.9
-      ? 'danger'
-      : usageRatio >= 0.8
-        ? 'warning'
-        : usageRatio >= 0.6
-          ? 'notice'
-          : 'normal';
-    return {
-      ...budget,
-      tokenUsed,
-      tokenLimit,
-      remainingTokens: Math.max(0, tokenLimit - tokenUsed),
-      usageRatio,
-      warningLevel,
-    };
+    return projectSessionContextBudget({
+      budget: contextBudgetState,
+      tokenLimit: configuredContextWindow,
+    });
   });
   const currentAccessProfileOption = $derived.by(() => (
     accessProfileOptions.find((option) => option.value === selectedAccessProfile)

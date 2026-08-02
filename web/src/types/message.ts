@@ -505,11 +505,13 @@ export interface OrchestratorRuntimeSnapshot {
     lastCompactionReason?: string;
     originalTokenEstimate?: number;
     compactedTokenEstimate?: number;
+    requestTokenEstimate?: number;
     originalMessageCount?: number;
     compactedMessageCount?: number;
     measurement?: 'estimated' | 'authoritative';
     phase?: string;
     updatedAt?: number;
+    eventSequence?: number;
     turnId?: string;
     callId?: string;
     resolvedModel?: string;

@@ -13,19 +13,30 @@ pub(crate) struct RevealWorkspaceFileRequest {
     workspace_root_path_ref: String,
 }
 
-fn resolve_reveal_paths(
-    request: &RevealWorkspaceFileRequest,
-) -> Result<(PathBuf, PathBuf), String> {
-    let workspace_root = HostPath::from_path_ref(&request.workspace_root_path_ref)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OpenWorkspaceFolderRequest {
+    workspace_root_path_ref: String,
+}
+
+fn resolve_workspace_root(workspace_root_path_ref: &str) -> Result<PathBuf, String> {
+    let workspace_root = HostPath::from_path_ref(workspace_root_path_ref)
         .map_err(|_| "工作区路径引用无效".to_string())?;
-    let target_path = HostPath::from_path_ref(&request.target_path_ref)
-        .map_err(|_| "文件路径引用无效".to_string())?;
     let canonical_workspace_root = HostPath::canonicalize(workspace_root.as_path())
         .map(HostPath::into_path_buf)
         .map_err(|error| format!("工作区目录不可读取或不存在: {error}"))?;
     if !canonical_workspace_root.is_dir() {
         return Err("工作区路径不是目录".to_string());
     }
+    Ok(canonical_workspace_root)
+}
+
+fn resolve_reveal_paths(
+    request: &RevealWorkspaceFileRequest,
+) -> Result<(PathBuf, PathBuf), String> {
+    let canonical_workspace_root = resolve_workspace_root(&request.workspace_root_path_ref)?;
+    let target_path = HostPath::from_path_ref(&request.target_path_ref)
+        .map_err(|_| "文件路径引用无效".to_string())?;
     let canonical_target = HostPath::canonicalize(target_path.as_path())
         .map(HostPath::into_path_buf)
         .map_err(|error| format!("文件不可读取或不存在: {error}"))?;
@@ -36,6 +47,29 @@ fn resolve_reveal_paths(
         return Err("文件路径越出工作区边界".to_string());
     }
     Ok((canonical_workspace_root, canonical_target))
+}
+
+fn open_folder_command(folder_path: &std::path::Path) -> Command {
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = magi_process::std_command("open");
+        command.arg(folder_path);
+        command
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = magi_process::std_command("explorer.exe");
+        command.arg(folder_path);
+        command
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut command = magi_process::std_command("xdg-open");
+        command.arg(folder_path);
+        command
+    }
 }
 
 fn reveal_file_command(target_path: &std::path::Path) -> Result<Command, String> {
@@ -73,6 +107,15 @@ pub(crate) fn reveal_workspace_file(request: RevealWorkspaceFileRequest) -> Resu
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("打开文件所在目录失败: {error}"))
+}
+
+#[tauri::command]
+pub(crate) fn open_workspace_folder(request: OpenWorkspaceFolderRequest) -> Result<(), String> {
+    let workspace_root = resolve_workspace_root(&request.workspace_root_path_ref)?;
+    open_folder_command(&workspace_root)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("打开工作区文件夹失败: {error}"))
 }
 
 #[cfg(test)]
@@ -116,6 +159,13 @@ mod tests {
     }
 
     #[test]
+    fn workspace_root_accepts_existing_directory() {
+        let workspace = test_directory("open-workspace-valid");
+        let resolved = resolve_workspace_root(&path_ref(workspace.clone())).unwrap();
+        assert_eq!(resolved, workspace.canonicalize().unwrap());
+    }
+
+    #[test]
     fn reveal_paths_reject_directory_and_outside_file() {
         let workspace = test_directory("reveal-boundary");
         let outside = test_directory("reveal-outside").join("outside.txt");
@@ -151,6 +201,17 @@ mod tests {
                 std::ffi::OsStr::new("-R"),
                 std::ffi::OsStr::new("/tmp/example.txt")
             ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_open_workspace_uses_finder() {
+        let command = open_folder_command(std::path::Path::new("/tmp/example"));
+        assert_eq!(command.get_program(), "open");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![std::ffi::OsStr::new("/tmp/example")]
         );
     }
 }

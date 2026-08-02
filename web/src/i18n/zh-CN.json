@@ -68,6 +68,7 @@
   "contextMenu.openLink": "打开链接",
   "contextMenu.copyLink": "复制链接",
   "contextMenu.openFile": "打开文件",
+  "contextMenu.openFolder": "打开文件夹",
   "contextMenu.openImage": "打开图片",
   "contextMenu.copyImageAddress": "复制图片地址",
   "contextMenu.revealFile": "在文件夹中显示",

@@ -1919,7 +1919,7 @@ fn goal_mode_requires_update_plan(request: &SessionTurnRequestDto) -> bool {
 
 fn workspace_inspection_tool_intent(user_text: &str) -> String {
     format!(
-        "用户请求理解当前工作区：{user_text}。必须使用可用工具读取当前工作区的真实目录、README、配置或关键源码后再回答；不要在未调用工具时声称已经读取文件、执行命令或输出 tool_call_block。工具完成后只基于实际工具结果总结。"
+        "用户请求理解当前工作区：{user_text}。优先使用当前 thread 中 fact_state=current 的真实工具事实；只有缺少所需事实、事实标记为 stale，或用户明确要求重新检查时，才使用可用工具读取目录、README、配置或关键源码。不得把历史陈旧内容当作当前事实，也不要声称执行过实际未执行或未复用成功的工具。最终只基于当前有效事实总结。"
     )
 }
 
@@ -4642,6 +4642,7 @@ mod tests {
                     status: ExecutionThreadStatus::Active,
                     created_at: now,
                     last_used_at: now,
+                    observed_context_window_tokens: None,
                     handled_task_ids: vec![task_id.clone()],
                     message_history: Vec::new(),
                 });

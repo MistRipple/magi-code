@@ -1,7 +1,7 @@
 use crate::authority::{
     UsageAuthority, build_execution_binding_identity, build_usage_call_identity,
 };
-use crate::costing::normalize_usage_delta;
+use crate::costing::{context_window_tokens_from_usage, normalize_usage_delta};
 use crate::model_identity::{build_model_resolution_identity, canonicalize_base_url};
 use crate::reducer::{
     rebuild_session_snapshot_from_events, rebuild_workspace_snapshot_from_sessions,
@@ -106,6 +106,48 @@ fn test_normalize_usage_delta() {
     assert_eq!(normalized.net_input_tokens, 1000);
     assert_eq!(normalized.net_output_tokens, 500);
     assert_eq!(normalized.total_tokens, 1500);
+}
+
+#[test]
+fn context_window_tokens_do_not_double_count_openai_cache_reads() {
+    let usage = UsageTokenInput {
+        input_tokens: 1_000,
+        output_tokens: 200,
+        total_tokens: None,
+        cache_read_tokens: Some(700),
+        cache_write_tokens: None,
+        cache_read_included_in_input: true,
+    };
+
+    assert_eq!(context_window_tokens_from_usage(&usage), 1_200);
+}
+
+#[test]
+fn context_window_tokens_include_anthropic_cache_reads_and_writes() {
+    let usage = UsageTokenInput {
+        input_tokens: 300,
+        output_tokens: 200,
+        total_tokens: None,
+        cache_read_tokens: Some(1_000),
+        cache_write_tokens: Some(500),
+        cache_read_included_in_input: false,
+    };
+
+    assert_eq!(context_window_tokens_from_usage(&usage), 2_000);
+}
+
+#[test]
+fn context_window_tokens_prefer_provider_authoritative_total() {
+    let usage = UsageTokenInput {
+        input_tokens: 300,
+        output_tokens: 200,
+        total_tokens: Some(750),
+        cache_read_tokens: Some(1_000),
+        cache_write_tokens: Some(500),
+        cache_read_included_in_input: false,
+    };
+
+    assert_eq!(context_window_tokens_from_usage(&usage), 750);
 }
 
 #[test]

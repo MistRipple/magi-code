@@ -17,6 +17,7 @@ const UPDATE_COMMANDS: [&str; 5] = [
 const RUNTIME_RECOVERY_COMMANDS: [&str; 2] =
     ["get_desktop_runtime_recovery", "restart_desktop_runtime"];
 const FILE_REVEAL_COMMAND: &str = "reveal_workspace_file";
+const WORKSPACE_FOLDER_COMMAND: &str = "open_workspace_folder";
 
 #[test]
 fn remote_desktop_origin_has_only_the_required_update_command_permissions() {
@@ -137,4 +138,11 @@ fn remote_desktop_origin_reveals_files_only_through_the_bounded_command() {
     assert!(FILE_REVEAL_SOURCE.contains("canonical_target.starts_with(&canonical_workspace_root)"));
     assert!(FILE_REVEAL_SOURCE.contains("canonical_target.is_file()"));
     assert!(FILE_REVEAL_SOURCE.contains("magi_process::std_command"));
+
+    let workspace_permission = format!("allow-{}", WORKSPACE_FOLDER_COMMAND.replace('_', "-"));
+    assert!(permissions.contains(workspace_permission.as_str()));
+    assert!(BUILD_SOURCE.contains(&format!("\"{WORKSPACE_FOLDER_COMMAND}\"")));
+    assert!(DESKTOP_MAIN_SOURCE.contains(&format!("            {WORKSPACE_FOLDER_COMMAND},")));
+    assert!(FILE_REVEAL_SOURCE.contains("resolve_workspace_root"));
+    assert!(FILE_REVEAL_SOURCE.contains("canonical_workspace_root.is_dir()"));
 }

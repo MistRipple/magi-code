@@ -370,8 +370,8 @@ mod tests {
     };
     use magi_session_store::{
         ExecutionThread, ExecutionThreadStatus, NotificationRecord, NotificationScope,
-        SessionDurableState, SessionPlan, SessionRecord, ThreadChatMessage, TimelineEntry,
-        TimelineEntryKind,
+        SessionDurableState, SessionPlan, SessionRecord, ThreadChatMessage,
+        ThreadContextCheckpoint, TimelineEntry, TimelineEntryKind,
     };
     use std::collections::HashMap;
 
@@ -477,6 +477,7 @@ mod tests {
                 status: ExecutionThreadStatus::Active,
                 created_at: now,
                 last_used_at: now,
+                observed_context_window_tokens: Some(32_000),
                 handled_task_ids: vec![TaskId::new("task-persisted")],
                 message_history: vec![ThreadChatMessage {
                     role: "tool".to_string(),
@@ -486,6 +487,24 @@ mod tests {
                     tool_call_id: Some("call-persisted".to_string()),
                     provider_context: Vec::new(),
                 }],
+            }],
+            thread_context_checkpoints: vec![ThreadContextCheckpoint {
+                thread_id: ThreadId::new("thread-persisted"),
+                checkpoint_id: "checkpoint-persisted".to_string(),
+                source_message_count: 1,
+                summary_message: ThreadChatMessage {
+                    role: "system".to_string(),
+                    content: Some("恢复后的上下文检查点".to_string()),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                },
+                reason: "context_window_pressure".to_string(),
+                original_token_estimate: 32_000,
+                checkpoint_token_estimate: 4_000,
+                created_at: now,
+                file_fact_versions: Vec::new(),
             }],
         };
         repository
@@ -505,9 +524,18 @@ mod tests {
         assert_eq!(merged.plans.len(), 1);
         assert_eq!(merged.plans[0].items[0].title, "恢复目标任务清单");
         assert_eq!(merged.thread_registry.len(), 1);
+        assert_eq!(merged.thread_context_checkpoints.len(), 1);
+        assert_eq!(
+            merged.thread_context_checkpoints[0].checkpoint_id,
+            "checkpoint-persisted"
+        );
         assert_eq!(
             merged.thread_registry[0].thread_id.as_str(),
             "thread-persisted"
+        );
+        assert_eq!(
+            merged.thread_registry[0].observed_context_window_tokens,
+            Some(32_000)
         );
         assert_eq!(
             merged.thread_registry[0].message_history[0]
@@ -560,6 +588,7 @@ mod tests {
                 goals: vec![],
                 plans: vec![],
                 thread_registry: vec![],
+                thread_context_checkpoints: vec![],
             })
             .expect("invalid global session state should save");
 
@@ -614,6 +643,7 @@ mod tests {
                 goals: vec![],
                 plans: vec![],
                 thread_registry: vec![],
+                thread_context_checkpoints: vec![],
             })
             .expect("invalid global session state should save");
 
@@ -679,6 +709,7 @@ mod tests {
                 goals: vec![],
                 plans: vec![],
                 thread_registry: vec![],
+                thread_context_checkpoints: vec![],
             })
             .expect("global session durable state should save");
 
@@ -710,6 +741,7 @@ mod tests {
                     goals: vec![],
                     plans: vec![],
                     thread_registry: vec![],
+                    thread_context_checkpoints: vec![],
                 },
             )
             .expect("workspace session durable state should save");
@@ -763,6 +795,7 @@ mod tests {
                 goals: vec![],
                 plans: vec![],
                 thread_registry: vec![],
+                thread_context_checkpoints: vec![],
             })
             .expect("global session durable state should save");
 

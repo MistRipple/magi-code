@@ -8,6 +8,10 @@ export type DesktopFileScope = {
 
 export type DesktopContextMenuDescriptor =
   | {
+      kind: 'workspace';
+      workspacePathRef: string;
+    }
+  | {
       kind: 'link';
       url: string;
       open: ContextAction;
@@ -37,6 +41,7 @@ export type DesktopContextMenuKind =
   | 'editable'
   | 'readonly'
   | 'selection'
+  | 'workspace'
   | 'link'
   | 'link-selection'
   | 'file'
@@ -128,6 +133,9 @@ export function resolveDesktopContextMenuRequest(event: MouseEvent): DesktopCont
     return selection ? { kind: 'selection', descriptor: null } : null;
   }
 
+  if (descriptor.kind === 'workspace') {
+    return { kind: 'workspace', descriptor };
+  }
   if (descriptor.kind === 'link') {
     return { kind: selection ? 'link-selection' : 'link', descriptor };
   }

@@ -78,6 +78,13 @@ await withGoldenViteServer(async (server) => {
   );
 
   selectedTarget = null;
+  const workspace = new MockHTMLElement();
+  contextMenu.desktopContextMenu(workspace, {
+    kind: 'workspace',
+    workspacePathRef: 'mhp1:u:L3dvcmtzcGFjZQ',
+  });
+  assert.equal(resolve(contextEvent(workspace))?.kind, 'workspace', '工作区必须提供独立的文件夹操作菜单');
+
   const link = new MockHTMLElement();
   contextMenu.desktopContextMenu(link, { kind: 'link', url: 'https://example.com', open: () => undefined });
   assert.equal(resolve(contextEvent(link))?.kind, 'link', '网页链接必须提供打开和复制链接菜单');
@@ -141,10 +148,11 @@ await withGoldenViteServer(async (server) => {
   assert.equal(resolve(contextEvent(previewImage))?.kind, 'image-open', '内嵌图片必须至少保留打开预览操作');
 });
 
-const [bootstrap, controller, capability, codeBlock, markdownLink, markdownImage, fileReference, fileSpan, generatedImage, messageItem, toolCall, apiRoutes, desktopReveal] = await Promise.all([
+const [bootstrap, controller, capability, workbench, codeBlock, markdownLink, markdownImage, fileReference, fileSpan, generatedImage, messageItem, toolCall, apiRoutes, desktopReveal] = await Promise.all([
   readFile(new URL('../src/bootstrap-app.ts', import.meta.url), 'utf8'),
   readFile(new URL('../src/lib/desktop-context-menu.ts', import.meta.url), 'utf8'),
   readFile(new URL('../../apps/desktop/capabilities/default.json', import.meta.url), 'utf8'),
+  readFile(new URL('../src/web/WebWorkbenchShell.svelte', import.meta.url), 'utf8'),
   readFile(new URL('../src/components/CodeBlock.svelte', import.meta.url), 'utf8'),
   readFile(new URL('../src/components/renderers/MdLink.svelte', import.meta.url), 'utf8'),
   readFile(new URL('../src/components/renderers/MdImage.svelte', import.meta.url), 'utf8'),
@@ -167,15 +175,19 @@ assert.match(controller, /kind\.startsWith\('image'\)/, '图片必须使用独�
 assert.match(controller, /contextMenu\.copyImageAddress/, '网络图片必须支持复制图片地址');
 assert.match(controller, /resolveAgentFileRevealTarget/, '文件夹定位菜单必须先通过 daemon 解析真实文件');
 assert.match(controller, /invoke\('reveal_workspace_file'/, '文件夹定位必须调用受限桌面命令');
+assert.match(controller, /invoke\('open_workspace_folder'/, '打开工作区必须调用受限桌面命令');
 assert.match(controller, /revealAvailable \? 'reveal' : 'plain'/, '菜单缓存必须区分可定位与普通文件状态');
 assert.match(apiRoutes, /safe_workspace_path\(&workspace_root, file_path\)/, 'daemon 必须按工作区边界规范化定位目标');
 assert.match(apiRoutes, /!target_path\.is_file\(\)/, 'daemon 不得把目录或特殊路径暴露为文件定位目标');
 assert.match(desktopReveal, /canonical_target\.starts_with\(&canonical_workspace_root\)/, '桌面命令必须再次校验工作区边界');
 assert.match(desktopReveal, /canonical_target\.is_file\(\)/, '桌面命令必须再次确认目标是文件');
+assert.match(desktopReveal, /canonical_workspace_root\.is_dir\(\)/, '打开工作区前必须再次确认目标是目录');
+assert.match(workbench, /use:desktopContextMenu=\{\{[\s\S]*?kind: 'workspace'[\s\S]*?workspacePathRef: workspaceBindingPath\(workspace\)/, '工作区标题必须声明打开文件夹菜单语义');
 
 const desktopCapability = JSON.parse(capability);
 assert.ok(desktopCapability.permissions.includes('core:default'), '桌面 capability 必须包含原生菜单权限');
 assert.ok(desktopCapability.permissions.includes('allow-reveal-workspace-file'), '桌面 capability 必须仅授权受限文件定位命令');
+assert.ok(desktopCapability.permissions.includes('allow-open-workspace-folder'), '桌面 capability 必须授权受限工作区目录打开命令');
 for (const [source, label] of [
   [codeBlock, '代码块'],
   [markdownLink, 'Markdown 链接'],

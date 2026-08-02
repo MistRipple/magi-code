@@ -891,6 +891,8 @@ pub struct SessionStoreState {
     /// 随 session 常驻；worker thread 绑定单个 task 执行，不跨 task 复用。
     #[serde(skip, default)]
     pub thread_registry: Vec<ExecutionThread>,
+    #[serde(skip, default)]
+    pub thread_context_checkpoints: Vec<ThreadContextCheckpoint>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -907,6 +909,8 @@ pub struct SessionDurableState {
     pub plans: Vec<SessionPlan>,
     #[serde(default)]
     pub thread_registry: Vec<ExecutionThread>,
+    #[serde(default)]
+    pub thread_context_checkpoints: Vec<ThreadContextCheckpoint>,
 }
 
 impl SessionDurableState {
@@ -919,6 +923,7 @@ impl SessionDurableState {
             && self.goals.is_empty()
             && self.plans.is_empty()
             && self.thread_registry.is_empty()
+            && self.thread_context_checkpoints.is_empty()
     }
 
     pub fn append_state(&mut self, other: SessionDurableState) {
@@ -936,6 +941,8 @@ impl SessionDurableState {
         self.goals.extend(other.goals);
         self.plans.extend(other.plans);
         self.thread_registry.extend(other.thread_registry);
+        self.thread_context_checkpoints
+            .extend(other.thread_context_checkpoints);
     }
 
     pub fn clear_current_session_if_owned_by_workspace_states(
@@ -996,6 +1003,7 @@ impl SessionDurableState {
                     goals: Vec::new(),
                     plans: Vec::new(),
                     thread_registry: Vec::new(),
+                    thread_context_checkpoints: Vec::new(),
                 },
             );
         }
@@ -1011,6 +1019,7 @@ impl SessionDurableState {
             goals: Vec::new(),
             plans: Vec::new(),
             thread_registry: Vec::new(),
+            thread_context_checkpoints: Vec::new(),
         };
 
         for entry in &self.timeline {
@@ -1132,6 +1141,36 @@ impl SessionDurableState {
             }
         }
 
+        let global_thread_ids = global_state
+            .thread_registry
+            .iter()
+            .map(|thread| thread.thread_id.clone())
+            .collect::<HashSet<_>>();
+        for checkpoint in &self.thread_context_checkpoints {
+            if global_thread_ids.contains(&checkpoint.thread_id) {
+                global_state
+                    .thread_context_checkpoints
+                    .push(checkpoint.clone());
+                continue;
+            }
+            let workspace_id = workspace_states
+                .iter()
+                .find(|(_, state)| {
+                    state
+                        .thread_registry
+                        .iter()
+                        .any(|thread| thread.thread_id == checkpoint.thread_id)
+                })
+                .map(|(workspace_id, _)| workspace_id.clone());
+            if let Some(workspace_id) = workspace_id {
+                workspace_states
+                    .get_mut(&workspace_id)
+                    .expect("workspace durable state should exist")
+                    .thread_context_checkpoints
+                    .push(checkpoint.clone());
+            }
+        }
+
         (global_state, workspace_states)
     }
 }
@@ -1185,6 +1224,7 @@ impl SessionStoreState {
             plans,
             execution_sidecar_store,
             thread_registry: durable_state.thread_registry,
+            thread_context_checkpoints: durable_state.thread_context_checkpoints,
         }
     }
 
@@ -1198,6 +1238,7 @@ impl SessionStoreState {
             goals: self.goals.clone(),
             plans: self.plans.clone(),
             thread_registry: self.thread_registry.clone(),
+            thread_context_checkpoints: self.thread_context_checkpoints.clone(),
         }
     }
 }
@@ -1264,6 +1305,9 @@ pub struct ExecutionThread {
     pub status: ExecutionThreadStatus,
     pub created_at: UtcMillis,
     pub last_used_at: UtcMillis,
+    /// 当前模型在该 thread 上已确认的上下文窗口；用于跨轮次和重启后的预算门禁。
+    #[serde(default)]
+    pub observed_context_window_tokens: Option<u64>,
     /// 该 thread 处理过的 task 序列，用于调试 / UI 呈现时间线；worker thread 通常只有一个。
     #[serde(default)]
     pub handled_task_ids: Vec<TaskId>,
@@ -1271,6 +1315,29 @@ pub struct ExecutionThread {
     /// 下一 task 的执行上下文。
     #[serde(default)]
     pub message_history: Vec<ThreadChatMessage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadContextCheckpoint {
+    pub thread_id: ThreadId,
+    pub checkpoint_id: String,
+    /// 检查点摘要覆盖的原始 transcript 消息数量。
+    pub source_message_count: usize,
+    pub summary_message: ThreadChatMessage,
+    pub reason: String,
+    pub original_token_estimate: usize,
+    pub checkpoint_token_estimate: usize,
+    pub created_at: UtcMillis,
+    #[serde(default)]
+    pub file_fact_versions: Vec<ThreadFileFactVersion>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadFileFactVersion {
+    pub path: String,
+    pub content_hash: String,
 }
 
 /// ExecutionThread 消息历史的最小存储格式：与 magi_bridge_client::ChatMessage 同构，

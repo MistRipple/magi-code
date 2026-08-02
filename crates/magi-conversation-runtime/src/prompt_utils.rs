@@ -1,4 +1,5 @@
 use magi_bridge_client::ChatMessage;
+use magi_skill_runtime::SkillRuntime;
 
 /// 17 段 system prompt 装配中，文本级小节之间的固定分隔串。
 ///
@@ -68,6 +69,33 @@ pub const SUBAGENT_MULTI_AGENT_MODE_RULE: &str = "\
 
 pub fn current_turn_context_priority_prompt() -> String {
     CURRENT_TURN_CONTEXT_PRIORITY_RULE.to_string()
+}
+
+pub fn skill_prompt_message(runtime: &SkillRuntime, skill_id: &str) -> Option<ChatMessage> {
+    let skill = runtime.registry().get(skill_id)?;
+    Some(ChatMessage {
+        role: "system".to_string(),
+        content: Some(format!(
+            "--- Skill: {} ---\n{}\n{}",
+            skill.title, SKILL_PROMPT_PRIORITY_NOTE, skill.instruction
+        )),
+        images: Vec::new(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        provider_context: Vec::new(),
+    })
+}
+
+pub fn dynamic_skill_prompt_message(
+    runtime: Option<&SkillRuntime>,
+    initial_skill_id: Option<&str>,
+    active_skill_id: Option<&str>,
+) -> Option<ChatMessage> {
+    let active_skill_id = active_skill_id?;
+    if initial_skill_id == Some(active_skill_id) {
+        return None;
+    }
+    skill_prompt_message(runtime?, active_skill_id)
 }
 
 pub fn root_multi_agent_mode_prompt() -> String {
@@ -211,6 +239,7 @@ pub fn normalize_model_stream_preview_content(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magi_skill_runtime::{SkillDefinition, SkillMetadata, SkillRegistry};
 
     #[test]
     fn prepend_session_instructions_keeps_plain_prompt_when_rules_empty() {
@@ -312,6 +341,43 @@ mod tests {
         assert!(prompt.contains("结论依赖外部事实"));
         assert!(prompt.contains("必须先调用对应工具取证"));
         assert!(prompt.contains("证据已足够时停止重复调用"));
+    }
+
+    #[test]
+    fn dynamic_skill_prompt_only_reinjects_runtime_activation() {
+        let registry = SkillRegistry::new();
+        registry.register(SkillDefinition {
+            skill_id: "runtime-review".to_string(),
+            title: "运行时审查".to_string(),
+            instruction: "检查压缩后的执行约束。".to_string(),
+            metadata: SkillMetadata {
+                category: "quality".to_string(),
+                tags: vec![],
+            },
+            restrict_standard_tools: false,
+            allowed_tools: vec![],
+            custom_tool_bindings: vec![],
+            prompt_priority: 50,
+        });
+        let runtime = SkillRuntime::new(registry);
+
+        assert!(
+            dynamic_skill_prompt_message(
+                Some(&runtime),
+                Some("runtime-review"),
+                Some("runtime-review"),
+            )
+            .is_none(),
+            "初始 Skill 已在原始 prompt 中，不应重复注入"
+        );
+        let message = dynamic_skill_prompt_message(Some(&runtime), None, Some("runtime-review"))
+            .expect("运行中激活的 Skill 必须可重建");
+        assert!(
+            message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("检查压缩后的执行约束"))
+        );
     }
 
     #[test]

@@ -1,6 +1,9 @@
+use magi_core::{EventId, UtcMillis};
+use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_settings_store::SettingsStore;
 use magi_usage_authority::resolve_context_window;
 use serde_json::{Map, Value};
+use std::sync::Arc;
 
 pub const MODEL_CONTEXT_WINDOWS_SECTION: &str = "modelContextWindows";
 pub const MIN_MODEL_CONTEXT_WINDOW: u64 = 16_000;
@@ -59,6 +62,49 @@ pub fn set_model_context_window(
         )
         .map_err(|error| format!("保存模型上下文窗口失败：{error}"))?;
     Ok(entries)
+}
+
+pub(crate) fn apply_reported_context_limit(
+    event_bus: &InMemoryEventBus,
+    execution_settings_store: Option<&Arc<SettingsStore>>,
+    live_settings_store: Option<&Arc<SettingsStore>>,
+    model: &str,
+    context_limit: u64,
+) -> bool {
+    let Some(primary_store) = live_settings_store.or(execution_settings_store) else {
+        return false;
+    };
+    let entries = match set_model_context_window(primary_store.as_ref(), model, context_limit) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                model,
+                context_limit,
+                %error,
+                "保存上游返回的模型上下文窗口失败"
+            );
+            return false;
+        }
+    };
+    if let Some(store) = execution_settings_store {
+        let _ = set_model_context_window(store.as_ref(), model, context_limit);
+    }
+    let updated_at = UtcMillis::now();
+    let _ = event_bus.publish(EventEnvelope::domain(
+        EventId::new(format!(
+            "event-model-context-window-updated-{}",
+            updated_at.0
+        )),
+        "model.context_window.updated",
+        serde_json::json!({
+            "model": model,
+            "contextWindowTokens": context_limit,
+            "modelContextWindows": entries,
+            "source": "provider_error",
+            "updatedAt": updated_at.0,
+        }),
+    ));
+    true
 }
 
 #[cfg(test)]

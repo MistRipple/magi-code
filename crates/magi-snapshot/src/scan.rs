@@ -235,7 +235,7 @@ pub fn read_file_meta(
     })
 }
 
-pub(crate) fn hash_file(path: &Path) -> SnapshotResult<String> {
+pub fn hash_file(path: &Path) -> SnapshotResult<String> {
     let mut file = fs::File::open(path).map_err(|error| SnapshotError::io(path, error))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -254,6 +254,30 @@ pub(crate) fn hash_file(path: &Path) -> SnapshotResult<String> {
         output.push_str(&format!("{byte:02x}"));
     }
     Ok(output)
+}
+
+/// 返回当前路径的稳定内容版本。普通文件按完整字节计算；目录按当前一级目录项名称
+/// 排序后计算，语义与 `file_read` 的目录读取结果一致。
+pub fn path_content_hash(path: &Path) -> SnapshotResult<String> {
+    let metadata = std::fs::metadata(path).map_err(|error| SnapshotError::io(path, error))?;
+    if metadata.is_file() {
+        return hash_file(path);
+    }
+    if metadata.is_dir() {
+        let mut entries = std::fs::read_dir(path)
+            .map_err(|error| SnapshotError::io(path, error))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        entries.sort();
+        return Ok(crate::blob_store::BlobStore::hash_bytes(
+            entries.join("\n").as_bytes(),
+        ));
+    }
+    Err(SnapshotError::Internal(format!(
+        "unsupported path type for content hash: {}",
+        path.display()
+    )))
 }
 
 /// 读取大文件头/尾摘要（每端 64 KB），用于 LargeText 前端展示。

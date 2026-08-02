@@ -27,6 +27,7 @@
     "allow-install-staged-desktop-update",
     "allow-get-desktop-runtime-recovery",
     "allow-restart-desktop-runtime",
+    "allow-open-workspace-folder",
     "allow-reveal-workspace-file"
   ]
 }

@@ -2682,6 +2682,7 @@ done
                 status: magi_session_store::ExecutionThreadStatus::Active,
                 created_at: UtcMillis(1_000),
                 last_used_at: UtcMillis(2_000),
+                observed_context_window_tokens: None,
                 handled_task_ids: vec![task_id.clone()],
                 message_history: Vec::new(),
             });

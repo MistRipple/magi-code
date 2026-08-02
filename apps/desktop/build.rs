@@ -7,6 +7,7 @@ fn main() {
         "install_staged_desktop_update",
         "get_desktop_runtime_recovery",
         "restart_desktop_runtime",
+        "open_workspace_folder",
         "reveal_workspace_file",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(app_manifest))

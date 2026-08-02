@@ -1,3 +1,12 @@
+use crate::context_authority::{
+    ContextAuthority, ContextPrepareRequest, current_session_file_facts,
+    estimate_chat_messages_tokens, estimate_tool_definition_tokens,
+};
+#[cfg(test)]
+use crate::context_authority::{
+    ThreadHistoryCompactionDecision, thread_history_compaction_decision,
+};
+use crate::model_context_window::{apply_reported_context_limit, resolve_model_context_window};
 use crate::session_writeback::{
     SessionStatePersistCallback, SessionTurnStreamPublishGate, SessionTurnStreamUpdate,
     append_session_turn_item_with_task_store, apply_model_response_round,
@@ -35,18 +44,19 @@ use crate::{
     model_error::{
         MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
         MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, ModelFailureDiagnostic,
-        classify_model_invocation_error, model_empty_response_recovery_prompt,
-        model_stream_interruption_recovery_prompt,
+        classify_model_invocation_error, extract_model_context_limit,
+        model_empty_response_recovery_prompt, model_stream_interruption_recovery_prompt,
     },
     prompt_utils::{
-        PromptFragmentKind, current_turn_context_priority_prompt,
+        PromptFragmentKind, current_turn_context_priority_prompt, dynamic_skill_prompt_message,
         normalize_model_stream_preview_content, normalize_model_visible_content,
-        render_prompt_fragment, system_prompt_fragment_message, workspace_context_system_prompt,
+        skill_prompt_message, system_prompt_fragment_message, workspace_context_system_prompt,
     },
     session_images::{SessionTurnImage, session_turn_image_sources},
     usage_recording::{
-        ModelUsageBinding, account_active_goal_turn, publish_model_usage_record,
-        record_mission_turn,
+        ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
+        account_active_goal_turn, current_turn_id, publish_model_usage_record, record_mission_turn,
+        resolved_model_for_usage_binding,
     },
 };
 use magi_bridge_client::{
@@ -56,12 +66,11 @@ use magi_bridge_client::{
 use magi_core::{
     EventId, ExecutionResultStatus, LeaseId, SessionId, Task, TaskCompletionAttempt,
     TaskCompletionEvidence, TaskEvidenceRequirement, TaskId, TaskStatus, ThreadId, UtcMillis,
-    WorkspaceId, estimate_text_tokens, public_runtime_excerpt,
+    WorkspaceId, public_runtime_excerpt,
 };
-use magi_event_bus::{
-    EventContext, EventEnvelope, InMemoryEventBus, SessionRuntimeUsageObservation,
-    latest_usage_observations_from_ledger,
-};
+#[cfg(test)]
+use magi_event_bus::SessionRuntimeUsageObservation;
+use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::{ExecutionContextSummary, task_store::TaskStore};
 use magi_session_store::{
     SessionStore, ThreadChatImageSource, ThreadChatMessage, ThreadChatToolCall,
@@ -69,9 +78,7 @@ use magi_session_store::{
 };
 use magi_settings_store::SettingsStore;
 use magi_tool_runtime::ToolRegistry;
-use magi_usage_authority::{
-    AUTO_COMPACT_PERCENT, DEFAULT_CONTEXT_WINDOW, UsageCallStatus, resolve_context_window,
-};
+use magi_usage_authority::UsageCallStatus;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
@@ -83,6 +90,7 @@ pub struct ConversationLoopRequest<'a> {
     pub event_bus: &'a InMemoryEventBus,
     pub session_store: &'a SessionStore,
     pub settings_store: Option<&'a Arc<SettingsStore>>,
+    pub live_settings_store: Option<&'a Arc<SettingsStore>>,
     pub tool_registry: Option<&'a ToolRegistry>,
     pub skill_runtime: Option<&'a magi_skill_runtime::SkillRuntime>,
     pub skill_dispatch_runtime: Option<&'a magi_skill_runtime::SkillDispatchRuntime>,
@@ -199,7 +207,7 @@ pub(crate) fn thread_chat_message_to_chat_message(message: &ThreadChatMessage) -
 }
 
 /// P6b：把本轮新产生的 bridge-client 消息（含 system prompt 之外的所有条目）
-/// 压缩为 thread 持久化格式。系统提示 / 工作区提示等重复上下文不再次写入。
+/// 转换为 thread 持久化格式。系统提示 / 工作区提示等重复上下文不再次写入。
 pub(crate) fn chat_message_to_thread_chat_message(message: &ChatMessage) -> ThreadChatMessage {
     ThreadChatMessage {
         role: message.role.clone(),
@@ -529,538 +537,6 @@ fn validated_task_completion(
     Ok(TaskOutcome::Completed { attempt })
 }
 
-const THREAD_HISTORY_COMPACT_TARGET_TOKENS: usize = 8_000;
-const THREAD_HISTORY_ESTIMATED_PREFILL_COMPACT_PERCENT: i64 = 90;
-const THREAD_HISTORY_RECENT_MESSAGE_TARGET: usize = 12;
-const THREAD_HISTORY_RECENT_MESSAGE_FLOOR: usize = 8;
-const THREAD_HISTORY_SUMMARY_EXCERPT_LIMIT: usize = 16;
-const THREAD_HISTORY_SUMMARY_EXCERPT_CHARS: usize = 360;
-const THREAD_HISTORY_TOOL_ARGUMENT_CHARS: usize = 220;
-
-fn estimate_thread_message_tokens(message: &ThreadChatMessage) -> usize {
-    let mut total = estimate_text_tokens(&message.role) + 4;
-    if let Some(content) = message.content.as_deref() {
-        total += estimate_text_tokens(content);
-    }
-    if let Some(tool_call_id) = message.tool_call_id.as_deref() {
-        total += estimate_text_tokens(tool_call_id);
-    }
-    for call in &message.tool_calls {
-        total += estimate_text_tokens(&call.id);
-        total += estimate_text_tokens(&call.kind);
-        total += estimate_text_tokens(&call.function.name);
-        total += estimate_text_tokens(&call.function.arguments);
-    }
-    total
-}
-
-pub(crate) fn estimate_thread_history_tokens(history: &[ThreadChatMessage]) -> usize {
-    history.iter().map(estimate_thread_message_tokens).sum()
-}
-
-pub(crate) fn estimate_chat_messages_tokens(messages: &[ChatMessage]) -> usize {
-    messages
-        .iter()
-        .map(chat_message_to_thread_chat_message)
-        .map(|message| estimate_thread_message_tokens(&message))
-        .sum()
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ContextCompactionRecord {
-    pub reason: &'static str,
-    pub original_message_count: usize,
-    pub compacted_message_count: usize,
-    pub original_token_estimate: usize,
-    pub compacted_token_estimate: usize,
-    pub compacted_at: UtcMillis,
-}
-
-pub(crate) struct PreparedThreadHistory {
-    pub messages: Vec<ThreadChatMessage>,
-    pub compaction: Option<ContextCompactionRecord>,
-}
-
-pub(crate) struct PrepareThreadHistoryInput<'a> {
-    pub event_bus: &'a InMemoryEventBus,
-    pub session_store: &'a SessionStore,
-    pub session_id: &'a SessionId,
-    pub workspace_id: &'a Option<WorkspaceId>,
-    pub thread_id: &'a ThreadId,
-    pub fallback_history: Vec<ThreadChatMessage>,
-    pub phase: &'static str,
-    pub context_window_override: Option<u64>,
-}
-
-#[derive(Clone, Debug)]
-enum ThreadHistoryCompactionDecision {
-    ContextWindowPressure {
-        tokens_used: u64,
-        token_limit: u64,
-        threshold_tokens: u64,
-        resolved_model: Option<String>,
-    },
-    EstimatedPrefill {
-        estimated_tokens: usize,
-        threshold_tokens: usize,
-    },
-}
-
-impl ThreadHistoryCompactionDecision {
-    fn reason_label(&self) -> &'static str {
-        match self {
-            ThreadHistoryCompactionDecision::ContextWindowPressure { .. } => {
-                "context_window_pressure"
-            }
-            ThreadHistoryCompactionDecision::EstimatedPrefill { .. } => "estimated_prefill",
-        }
-    }
-}
-
-pub(crate) fn latest_session_usage_observation(
-    event_bus: &InMemoryEventBus,
-    session_id: &SessionId,
-) -> Option<SessionRuntimeUsageObservation> {
-    let snapshot = event_bus.audit_usage_ledger_snapshot();
-    latest_usage_observations_from_ledger(&snapshot.usage_entries).remove(&session_id.to_string())
-}
-
-fn thread_history_compaction_decision(
-    history: &[ThreadChatMessage],
-    usage_observation: Option<&SessionRuntimeUsageObservation>,
-    context_window_override: Option<u64>,
-) -> Option<ThreadHistoryCompactionDecision> {
-    let estimated_tokens = estimate_thread_history_tokens(history);
-    if estimated_tokens <= THREAD_HISTORY_COMPACT_TARGET_TOKENS {
-        return None;
-    }
-
-    if let Some(context_window) = context_window_override {
-        let threshold_tokens = context_window.saturating_mul(AUTO_COMPACT_PERCENT as u64) / 100;
-        let pressure_tokens = usage_observation
-            .map(|observation| observation.context_window_tokens)
-            .unwrap_or_default()
-            .max(estimated_tokens as u64);
-        if pressure_tokens >= threshold_tokens.max(1) {
-            return Some(ThreadHistoryCompactionDecision::ContextWindowPressure {
-                tokens_used: pressure_tokens,
-                token_limit: context_window,
-                threshold_tokens: threshold_tokens.max(1),
-                resolved_model: usage_observation
-                    .and_then(|observation| observation.resolved_model.clone()),
-            });
-        }
-        return None;
-    }
-
-    if let Some(observation) = usage_observation {
-        let context_window =
-            resolve_context_window(observation.resolved_model.as_deref().unwrap_or(""));
-        let threshold_tokens =
-            (context_window.saturating_mul(AUTO_COMPACT_PERCENT) / 100).max(1) as u64;
-        if observation.context_window_tokens >= threshold_tokens {
-            return Some(ThreadHistoryCompactionDecision::ContextWindowPressure {
-                tokens_used: observation.context_window_tokens,
-                token_limit: context_window.max(0) as u64,
-                threshold_tokens,
-                resolved_model: observation.resolved_model.clone(),
-            });
-        }
-        if estimated_tokens >= threshold_tokens as usize {
-            return Some(ThreadHistoryCompactionDecision::EstimatedPrefill {
-                estimated_tokens,
-                threshold_tokens: threshold_tokens as usize,
-            });
-        }
-        return None;
-    }
-
-    let threshold_tokens = (DEFAULT_CONTEXT_WINDOW
-        .saturating_mul(THREAD_HISTORY_ESTIMATED_PREFILL_COMPACT_PERCENT)
-        / 100)
-        .max(1) as usize;
-    (estimated_tokens >= threshold_tokens).then_some(
-        ThreadHistoryCompactionDecision::EstimatedPrefill {
-            estimated_tokens,
-            threshold_tokens,
-        },
-    )
-}
-
-fn truncate_for_thread_summary(value: &str, max_chars: usize) -> String {
-    let normalized = value
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if normalized.chars().count() <= max_chars {
-        return normalized;
-    }
-    let mut out = normalized
-        .chars()
-        .take(max_chars.saturating_sub(3))
-        .collect::<String>();
-    out.push_str("...");
-    out
-}
-
-fn thread_role_label(role: &str) -> &str {
-    match role {
-        "system" => "系统",
-        "user" => "用户",
-        "assistant" => "助手",
-        "tool" => "工具结果",
-        _ => "消息",
-    }
-}
-
-fn summarize_thread_message(index: usize, message: &ThreadChatMessage) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(content) = message
-        .content
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        parts.push(format!(
-            "内容：{}",
-            truncate_for_thread_summary(content, THREAD_HISTORY_SUMMARY_EXCERPT_CHARS)
-        ));
-    }
-    if !message.tool_calls.is_empty() {
-        let calls = message
-            .tool_calls
-            .iter()
-            .map(|call| {
-                let args = truncate_for_thread_summary(
-                    &call.function.arguments,
-                    THREAD_HISTORY_TOOL_ARGUMENT_CHARS,
-                );
-                if args.is_empty() {
-                    call.function.name.clone()
-                } else {
-                    format!("{}({args})", call.function.name)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("；");
-        parts.push(format!("工具调用：{calls}"));
-    }
-    if message.role == "tool"
-        && let Some(tool_call_id) = message.tool_call_id.as_deref()
-    {
-        parts.push(format!("对应调用：{tool_call_id}"));
-    }
-    if parts.is_empty() {
-        parts.push("空消息".to_string());
-    }
-    format!(
-        "- #{} {}：{}",
-        index + 1,
-        thread_role_label(&message.role),
-        parts.join("；")
-    )
-}
-
-fn thread_history_tail_is_tool_balanced(tail: &[ThreadChatMessage]) -> bool {
-    let mut tool_call_ids = BTreeSet::new();
-    let mut tool_result_ids = BTreeSet::new();
-    for message in tail {
-        for call in &message.tool_calls {
-            tool_call_ids.insert(call.id.as_str());
-        }
-        if message.role == "tool" {
-            let Some(tool_call_id) = message.tool_call_id.as_deref() else {
-                return false;
-            };
-            if !tool_call_ids.contains(tool_call_id) {
-                return false;
-            }
-            tool_result_ids.insert(tool_call_id);
-        }
-    }
-    tool_call_ids
-        .iter()
-        .all(|tool_call_id| tool_result_ids.contains(tool_call_id))
-}
-
-fn choose_thread_history_compaction_split(history: &[ThreadChatMessage]) -> Option<usize> {
-    if history.len() <= 1 {
-        return None;
-    }
-    let target_tail = THREAD_HISTORY_RECENT_MESSAGE_TARGET.min(history.len().saturating_sub(1));
-    let floor_tail = THREAD_HISTORY_RECENT_MESSAGE_FLOOR.min(history.len().saturating_sub(1));
-    let max_split = history.len().saturating_sub(floor_tail);
-    let mut split = history.len().saturating_sub(target_tail).max(1);
-
-    while split < max_split
-        && estimate_thread_history_tokens(&history[split..]) > THREAD_HISTORY_COMPACT_TARGET_TOKENS
-    {
-        split += 1;
-    }
-    while split > 0 && !thread_history_tail_is_tool_balanced(&history[split..]) {
-        split -= 1;
-    }
-
-    (split > 0).then_some(split)
-}
-
-fn build_thread_history_compaction_message(
-    compacted_prefix: &[ThreadChatMessage],
-    original_tokens: usize,
-) -> ThreadChatMessage {
-    let mut role_counts: BTreeMap<String, usize> = BTreeMap::new();
-    for message in compacted_prefix {
-        *role_counts.entry(message.role.clone()).or_default() += 1;
-    }
-    let role_summary = role_counts
-        .iter()
-        .map(|(role, count)| format!("{} {}", thread_role_label(role), count))
-        .collect::<Vec<_>>()
-        .join("，");
-
-    let mut selected_indices = BTreeSet::new();
-    for index in 0..compacted_prefix.len().min(3) {
-        selected_indices.insert(index);
-    }
-    let remaining_slots =
-        THREAD_HISTORY_SUMMARY_EXCERPT_LIMIT.saturating_sub(selected_indices.len());
-    let tail_start = compacted_prefix.len().saturating_sub(remaining_slots);
-    for index in tail_start..compacted_prefix.len() {
-        selected_indices.insert(index);
-    }
-
-    let excerpts = selected_indices
-        .into_iter()
-        .map(|index| summarize_thread_message(index, &compacted_prefix[index]))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let content = render_prompt_fragment(
-        PromptFragmentKind::ThreadHistoryBoundary,
-        format!(
-            "[context_compaction]\n\
-这是 Magi 自动生成的当前 thread 早期历史摘要，用于替代已压缩的完整消息。它是历史事实；如果它与后续保留的完整消息冲突，以后续完整消息为准。\n\
-压缩范围：{} 条消息；压缩前估算 token：{}；角色分布：{}。\n\
-关键历史摘录：\n{}\n\
-[/context_compaction]",
-            compacted_prefix.len(),
-            original_tokens,
-            if role_summary.is_empty() {
-                "无".to_string()
-            } else {
-                role_summary
-            },
-            if excerpts.is_empty() {
-                "- 无".to_string()
-            } else {
-                excerpts
-            }
-        ),
-    );
-
-    ThreadChatMessage {
-        role: "system".to_string(),
-        content: Some(content),
-        images: Vec::new(),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-        provider_context: Vec::new(),
-    }
-}
-
-fn compact_thread_history_if_needed(
-    history: &[ThreadChatMessage],
-    decision: &ThreadHistoryCompactionDecision,
-) -> Option<Vec<ThreadChatMessage>> {
-    let original_tokens = estimate_thread_history_tokens(history);
-    if original_tokens <= THREAD_HISTORY_COMPACT_TARGET_TOKENS {
-        tracing::debug!(
-            reason = decision.reason_label(),
-            original_tokens,
-            target_tokens = THREAD_HISTORY_COMPACT_TARGET_TOKENS,
-            "thread 历史已低于压缩目标，跳过重复压缩"
-        );
-        return None;
-    }
-    let split = choose_thread_history_compaction_split(history)?;
-    let compacted_prefix = &history[..split];
-    let retained_tail = &history[split..];
-    let summary = build_thread_history_compaction_message(compacted_prefix, original_tokens);
-    let mut compacted = Vec::with_capacity(retained_tail.len() + 1);
-    compacted.push(summary);
-    compacted.extend(retained_tail.iter().cloned());
-
-    let compacted_tokens = estimate_thread_history_tokens(&compacted);
-    if compacted_tokens >= original_tokens {
-        return None;
-    }
-    Some(compacted)
-}
-
-pub(crate) fn prepare_thread_history(
-    input: PrepareThreadHistoryInput<'_>,
-) -> PreparedThreadHistory {
-    let PrepareThreadHistoryInput {
-        event_bus,
-        session_store,
-        session_id,
-        workspace_id,
-        thread_id,
-        fallback_history,
-        phase,
-        context_window_override,
-    } = input;
-    let mut history = session_store.thread_message_history(thread_id);
-    if history.is_empty() && !fallback_history.is_empty() {
-        history = fallback_history;
-        session_store.replace_thread_messages(thread_id, history.clone(), UtcMillis::now());
-    }
-    let original_count = history.len();
-    let original_tokens = estimate_thread_history_tokens(&history);
-    let usage_observation = latest_session_usage_observation(event_bus, session_id);
-    let Some(decision) = thread_history_compaction_decision(
-        &history,
-        usage_observation.as_ref(),
-        context_window_override,
-    ) else {
-        tracing::debug!(
-            thread_id = %thread_id,
-            session_id = %session_id,
-            phase,
-            original_count,
-            original_tokens,
-            last_context_window_tokens = usage_observation
-                .as_ref()
-                .map(|observation| observation.context_window_tokens),
-            "thread 历史未达到上下文压缩阈值"
-        );
-        return PreparedThreadHistory {
-            messages: history,
-            compaction: None,
-        };
-    };
-    let Some(compacted) = compact_thread_history_if_needed(&history, &decision) else {
-        return PreparedThreadHistory {
-            messages: history,
-            compaction: None,
-        };
-    };
-    let compacted_count = compacted.len();
-    let compacted_tokens = estimate_thread_history_tokens(&compacted);
-    session_store.replace_thread_messages(thread_id, compacted.clone(), UtcMillis::now());
-    let compacted_at = UtcMillis::now();
-    let mut context_payload = serde_json::json!({
-        "title": "上下文已自动压缩",
-        "thread_id": thread_id.to_string(),
-        "session_id": session_id.to_string(),
-        "phase": phase,
-        "reason": decision.reason_label(),
-        "original_message_count": original_count,
-        "compacted_message_count": compacted_count,
-        "original_token_estimate": original_tokens,
-        "compacted_token_estimate": compacted_tokens,
-        "compacted_at": compacted_at.0,
-    });
-    match &decision {
-        ThreadHistoryCompactionDecision::ContextWindowPressure {
-            tokens_used,
-            token_limit,
-            threshold_tokens,
-            resolved_model,
-        } => {
-            if let Some(payload) = context_payload.as_object_mut() {
-                payload.insert(
-                    "context_window_tokens".to_string(),
-                    serde_json::json!(*tokens_used),
-                );
-                payload.insert("token_limit".to_string(), serde_json::json!(*token_limit));
-                payload.insert(
-                    "threshold_tokens".to_string(),
-                    serde_json::json!(*threshold_tokens),
-                );
-                payload.insert(
-                    "resolved_model".to_string(),
-                    serde_json::json!(resolved_model.as_deref().unwrap_or("")),
-                );
-            }
-            tracing::info!(
-                thread_id = %thread_id,
-                session_id = %session_id,
-                phase,
-                reason = decision.reason_label(),
-                original_count,
-                compacted_count,
-                original_tokens,
-                compacted_tokens,
-                tokens_used,
-                token_limit,
-                threshold_tokens,
-                resolved_model = resolved_model.as_deref().unwrap_or(""),
-                "thread 历史已按最近一次上下文窗口压力压缩并替换"
-            );
-        }
-        ThreadHistoryCompactionDecision::EstimatedPrefill {
-            estimated_tokens,
-            threshold_tokens,
-        } => {
-            if let Some(payload) = context_payload.as_object_mut() {
-                payload.insert(
-                    "context_window_tokens".to_string(),
-                    serde_json::json!(*estimated_tokens as u64),
-                );
-                payload.insert(
-                    "token_limit".to_string(),
-                    serde_json::json!(DEFAULT_CONTEXT_WINDOW.max(0) as u64),
-                );
-                payload.insert(
-                    "threshold_tokens".to_string(),
-                    serde_json::json!(*threshold_tokens as u64),
-                );
-            }
-            tracing::info!(
-                thread_id = %thread_id,
-                session_id = %session_id,
-                phase,
-                reason = decision.reason_label(),
-                original_count,
-                compacted_count,
-                original_tokens,
-                compacted_tokens,
-                estimated_tokens,
-                threshold_tokens,
-                "thread 历史已按冷启动估算压力压缩并替换"
-            );
-        }
-    }
-    let _ = event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!(
-                "event-session-context-compacted-{}",
-                compacted_at.0
-            )),
-            "session.context.compacted",
-            context_payload,
-        )
-        .with_context(EventContext {
-            workspace_id: workspace_id.clone(),
-            session_id: Some(session_id.clone()),
-            ..EventContext::default()
-        }),
-    );
-    PreparedThreadHistory {
-        messages: compacted,
-        compaction: Some(ContextCompactionRecord {
-            reason: decision.reason_label(),
-            original_message_count: original_count,
-            compacted_message_count: compacted_count,
-            original_token_estimate: original_tokens,
-            compacted_token_estimate: compacted_tokens,
-            compacted_at,
-        }),
-    }
-}
-
 pub fn run_conversation_loop(
     request: ConversationLoopRequest<'_>,
 ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
@@ -1148,6 +624,46 @@ impl<'a> TurnDriver for ConversationTurnDriver<'a> {
     }
 }
 
+fn build_task_context_base_messages(
+    static_messages: &[ChatMessage],
+    project_memory: Option<&magi_project_memory::ProjectMemoryStore>,
+    memory_write_visible: bool,
+    plan_store: &magi_plan::PlanStore,
+    mailbox_prompt: Option<&str>,
+) -> Vec<ChatMessage> {
+    let mut messages = static_messages.to_vec();
+    if let Some(store) = project_memory {
+        let rendered = if memory_write_visible {
+            store.render_for_prompt()
+        } else {
+            store.render_for_prompt_read_only()
+        };
+        match rendered {
+            Ok(Some(rendered)) => messages.push(system_prompt_fragment_message(
+                PromptFragmentKind::ProjectMemory,
+                rendered,
+            )),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "ProjectMemory: 渲染 prompt 失败，本轮跳过");
+            }
+        }
+    }
+    if let Some(rendered) = plan_store.render_for_prompt() {
+        messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::UserPlan,
+            rendered,
+        ));
+    }
+    if let Some(mailbox_prompt) = mailbox_prompt {
+        messages.push(system_prompt_fragment_message(
+            PromptFragmentKind::Mailbox,
+            mailbox_prompt,
+        ));
+    }
+    messages
+}
+
 /// 一轮 LLM IO + 工具 IO 全段——driver 内部唯一调用点。
 fn run_conversation_loop_inner(
     request: ConversationLoopRequest<'_>,
@@ -1158,6 +674,7 @@ fn run_conversation_loop_inner(
         event_bus,
         session_store,
         settings_store,
+        live_settings_store,
         tool_registry,
         skill_runtime,
         skill_dispatch_runtime,
@@ -1192,7 +709,7 @@ fn run_conversation_loop_inner(
         persist_session_state,
     } = request;
 
-    let mut messages = Vec::new();
+    let mut static_context_messages = Vec::new();
     // ===================================================================
     // Prompt 装配 · 缓存边界
     // -------------------------------------------------------------------
@@ -1230,7 +747,7 @@ fn run_conversation_loop_inner(
     // -------- Tier A · STATIC --------
     // [CACHE: STATIC] S1 · 角色 / agent role 系统提示。
     if let Some(system) = system_prompt {
-        messages.push(system_prompt_fragment_message(
+        static_context_messages.push(system_prompt_fragment_message(
             PromptFragmentKind::Role,
             system,
         ));
@@ -1239,7 +756,7 @@ fn run_conversation_loop_inner(
     // 引导模型把"当前项目 / current repo"等措辞默认对齐到该 workspace；
     // 并强制 Git 状态命令前必须先做 NOT_GIT_WORKTREE 探测。
     if let Some(root_path) = workspace_root_path.as_ref() {
-        messages.push(system_prompt_fragment_message(
+        static_context_messages.push(system_prompt_fragment_message(
             PromptFragmentKind::WorkspaceContext,
             workspace_context_system_prompt(&root_path.display().to_string()),
         ));
@@ -1252,8 +769,8 @@ fn run_conversation_loop_inner(
     // cache_control 的 adapter 会透明剥离这个标记，不影响输出语义。
     //
     // 仅在 STATIC 段实际产出过至少一条消息时插入，避免空前缀触发退化路径。
-    if messages.iter().any(|m| m.role == "system") {
-        messages.push(ChatMessage {
+    if static_context_messages.iter().any(|m| m.role == "system") {
+        static_context_messages.push(ChatMessage {
             role: "system".to_string(),
             content: Some(magi_bridge_client::cache_boundary::PROMPT_CACHE_BOUNDARY.to_string()),
             images: Vec::new(),
@@ -1263,73 +780,72 @@ fn run_conversation_loop_inner(
         });
     }
 
-    // -------- Tier B · SEMI-STATIC --------
-    // [CACHE: SEMI-STATIC] S10 · ProjectMemory 索引。
-    // 把 `~/.magi/projects/{slug}/memory/MEMORY.md` 视图渲染进 system prompt，
-    // 跨 conversation 复用同一项目的长期记忆。仅在 memory_write 后变化。
-    // 代理也需要读取项目记忆；是否提示写入由实际工具面决定，避免只读代理看到
-    // 不可调用的 `memory_write` 指令。
     let memory_write_visible = tools.as_ref().is_some_and(|definitions| {
         definitions
             .iter()
             .any(|definition| definition.function.name == "memory_write")
     });
-    if let Some(store) = project_memory {
-        let rendered = if memory_write_visible {
-            store.render_for_prompt()
-        } else {
-            store.render_for_prompt_read_only()
-        };
-        match rendered {
-            Ok(Some(rendered)) => {
-                messages.push(system_prompt_fragment_message(
-                    PromptFragmentKind::ProjectMemory,
-                    rendered,
-                ));
-            }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, "ProjectMemory: 渲染 prompt 失败，本轮跳过");
-            }
-        }
-    }
-    // -------- Tier C · DYNAMIC --------
-    // [CACHE: DYNAMIC] S9 · UserPlan 快照。
-    // 本 session 模型在之前轮次写过 update_plan 时，这里把当前列表渲染进 system prompt，
-    // 让本轮 Turn 起点自动看到分解 + 进度。每轮 update_plan 后变化。
-    if let Some(rendered) = plan_store.render_for_prompt() {
-        messages.push(system_prompt_fragment_message(
-            PromptFragmentKind::UserPlan,
-            rendered,
-        ));
-    }
-    // [CACHE: DYNAMIC] Runtime tail · Mailbox 待处理消息。
-    // 来自 user / system / 代理回执的跨 task 投递；按 Conversation 层渲染。
-    if let Some(rendered) = render_mailbox_items_for_prompt(&pending_mailbox_items) {
-        messages.push(system_prompt_fragment_message(
-            PromptFragmentKind::Mailbox,
-            rendered,
-        ));
-    }
+    let pending_mailbox_prompt = render_mailbox_items_for_prompt(&pending_mailbox_items);
+    let mut messages = build_task_context_base_messages(
+        &static_context_messages,
+        project_memory,
+        memory_write_visible,
+        plan_store,
+        pending_mailbox_prompt.as_deref(),
+    );
     // [CACHE: APPEND-ONLY] Runtime tail · Thread 历史。
     // P6b：只读取当前 thread 内部已经持久化的运行时输入 / 恢复记录。worker thread
     // 为单 task 独占，因此这里不能出现同 role 的历史 task 对话。历史超出水位线时
-    // 直接替换为「摘要 + 最近完整消息」，下一轮不再读到旧结构。
-    let mut thread_history_snapshot = prepare_thread_history(PrepareThreadHistoryInput {
+    // 上下文权威层只生成「摘要 + 最近完整消息」模型视图，原始 transcript 永久追加保留。
+    let current_turn_budget_messages = vec![
+        system_prompt_fragment_message(
+            PromptFragmentKind::CurrentTurnPriority,
+            current_turn_context_priority_prompt(),
+        ),
+        ChatMessage {
+            role: "user".to_string(),
+            content: Some(prompt.clone()),
+            images: session_turn_image_sources(&images),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            provider_context: Vec::new(),
+        },
+    ];
+    let additional_token_estimate = estimate_chat_messages_tokens(&messages)
+        .saturating_add(estimate_chat_messages_tokens(&current_turn_budget_messages))
+        .saturating_add(estimate_tool_definition_tokens(tools.as_deref()));
+    let resolved_context_model = resolved_model_for_usage_binding(
+        settings_store.or(live_settings_store),
+        usage_binding,
+        session_id,
+    )
+    .unwrap_or_default();
+    let mut effective_context_window = resolve_model_context_window(
+        live_settings_store.or(settings_store).map(Arc::as_ref),
+        &resolved_context_model,
+    );
+    let initial_skill_name = skill_name.clone();
+    let mut persisted_thread_history = session_store.thread_message_history(thread_id);
+    let mut thread_history_snapshot = ContextAuthority::new(
+        client,
         event_bus,
         session_store,
         session_id,
         workspace_id,
         thread_id,
+        settings_store,
+    )
+    .prepare(ContextPrepareRequest {
         fallback_history: Vec::new(),
         phase: "pre_turn",
-        context_window_override: None,
+        context_window_override: Some(effective_context_window),
+        additional_token_estimate,
     })
     .messages;
-    let resumed_task = !thread_history_snapshot.is_empty()
+    let resumed_task = !persisted_thread_history.is_empty()
         && task_is_resuming_existing_thread(session_store, session_id, task_id, thread_id);
     let inherits_interrupted_turn =
-        !thread_history_snapshot.is_empty() && task.recovery_checkpoint().is_some();
+        !persisted_thread_history.is_empty() && task.recovery_checkpoint().is_some();
     let recovery_history = resumed_task || inherits_interrupted_turn;
     let started_tool_call_ids = if resumed_task {
         started_tool_call_ids_for_task_thread(session_store, session_id, task_id, thread_id)
@@ -1344,7 +860,7 @@ fn run_conversation_loop_inner(
     };
     let inserted_interrupted_tool_results = if recovery_history {
         insert_interrupted_tool_result_messages(
-            &mut thread_history_snapshot,
+            &mut persisted_thread_history,
             &started_tool_call_ids,
         )
     } else {
@@ -1353,13 +869,29 @@ fn run_conversation_loop_inner(
     if inserted_interrupted_tool_results > 0 {
         session_store.replace_thread_messages(
             thread_id,
-            thread_history_snapshot.clone(),
+            persisted_thread_history,
             UtcMillis::now(),
         );
         persist_session_state_checkpoint(
             persist_session_state,
             "task_thread_interrupted_tool_result",
         );
+        thread_history_snapshot = ContextAuthority::new(
+            client,
+            event_bus,
+            session_store,
+            session_id,
+            workspace_id,
+            thread_id,
+            settings_store,
+        )
+        .prepare(ContextPrepareRequest {
+            fallback_history: Vec::new(),
+            phase: "interrupted_tool_normalization",
+            context_window_override: Some(effective_context_window),
+            additional_token_estimate,
+        })
+        .messages;
     }
     if !thread_history_snapshot.is_empty() {
         for history_msg in &thread_history_snapshot {
@@ -1418,12 +950,16 @@ fn run_conversation_loop_inner(
     let mut tool_execution_ledger = if recovery_history {
         ToolExecutionLedger::from_thread_history(
             &task.goal,
-            &thread_history_snapshot,
+            &session_store.thread_message_history(thread_id),
             tool_registry,
         )
     } else {
         ToolExecutionLedger::for_task_goal(&task.goal)
-    };
+    }
+    .with_current_file_facts(
+        &current_session_file_facts(session_store, session_id),
+        workspace_root_path.as_deref(),
+    );
     let required_tool_chain = task_required_tool_chain(task, Some(agent_role_registry));
     let required_evidence_tools = task_required_evidence_tools(task);
     let historical_completion_evidence = if recovery_history {
@@ -1454,6 +990,7 @@ fn run_conversation_loop_inner(
     let mut empty_response_recovery_attempts = 0usize;
     let mut stream_interruption_recovery_attempts = 0usize;
     let mut stream_interruption_non_stream_fallback_attempted = false;
+    let mut context_budget_recheck_required = false;
     let mut last_response_observation: Option<String> = None;
     let owns_plan_execution = !is_sidechain && task.parent_task_id.is_none();
     let turn_visibility = task_turn_visibility(
@@ -1472,6 +1009,58 @@ fn run_conversation_loop_inner(
         workspace_id,
         turn_visibility: &turn_visibility,
         persist_session_state,
+    };
+    let rebuild_task_context = |context_window: u64,
+                                round_tools: Option<&[ChatToolDefinition]>,
+                                active_skill_name: Option<&str>| {
+        let mut context_base_messages = build_task_context_base_messages(
+            &static_context_messages,
+            project_memory,
+            memory_write_visible,
+            plan_store,
+            pending_mailbox_prompt.as_deref(),
+        );
+        if let Some(skill_message) = dynamic_skill_prompt_message(
+            skill_runtime,
+            initial_skill_name.as_deref(),
+            active_skill_name,
+        ) {
+            context_base_messages.push(skill_message);
+        }
+        let prepared = ContextAuthority::new(
+            client,
+            event_bus,
+            session_store,
+            session_id,
+            workspace_id,
+            thread_id,
+            settings_store,
+        )
+        .prepare(ContextPrepareRequest {
+            fallback_history: Vec::new(),
+            phase: "context_limit_recovery",
+            context_window_override: Some(context_window),
+            additional_token_estimate: estimate_chat_messages_tokens(&context_base_messages)
+                .saturating_add(estimate_tool_definition_tokens(round_tools)),
+        });
+        prepared.compaction.map(|_| {
+            let mut rebuilt = context_base_messages.clone();
+            rebuilt.extend(
+                prepared
+                    .messages
+                    .iter()
+                    .map(thread_chat_message_to_chat_message),
+            );
+            rebuilt.push(system_prompt_fragment_message(
+                PromptFragmentKind::ThreadHistoryBoundary,
+                "以上是当前 task 的压缩检查点与最近完整运行记录。仅使用其中当前有效事实继续执行。",
+            ));
+            rebuilt.push(system_prompt_fragment_message(
+                PromptFragmentKind::CurrentTurnPriority,
+                current_turn_context_priority_prompt(),
+            ));
+            rebuilt
+        })
     };
 
     if let Some(final_content) = deterministic_task_final_content(task, task_store) {
@@ -1558,6 +1147,16 @@ fn run_conversation_loop_inner(
             round_completed_tools,
         );
         let round_tools = (!round_tool_definitions.is_empty()).then_some(round_tool_definitions);
+        if context_budget_recheck_required {
+            if let Some(rebuilt_messages) = rebuild_task_context(
+                effective_context_window,
+                round_tools.as_deref(),
+                active_skill_name.as_deref(),
+            ) {
+                messages = rebuilt_messages;
+            }
+            context_budget_recheck_required = false;
+        }
         let invocation_request = ModelInvocationRequest {
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: prompt.clone(),
@@ -1569,6 +1168,22 @@ fn run_conversation_loop_inner(
                 round_completed_tools,
             ),
         };
+        let round_call_id = format!("task-{}-{}-{round}", task_id, lease_id);
+        let current_turn_id = current_turn_id(session_store, session_id);
+        let context_usage_tracker = usage_binding.tracks_active_context().then(|| {
+            ContextUsageRuntimeTracker::start(ContextUsageRuntimeTrackerInput {
+                event_bus,
+                settings_store: settings_store.map(Arc::as_ref),
+                session_id,
+                workspace_id,
+                turn_id: current_turn_id.as_deref(),
+                call_id: &round_call_id,
+                resolved_model: &resolved_context_model,
+                prefill_tokens: estimate_chat_messages_tokens(&messages)
+                    .saturating_add(estimate_tool_definition_tokens(round_tools.as_deref()))
+                    as u64,
+            })
+        });
         let invocation_request_template = invocation_request.clone();
         let non_stream_fallback_template = invocation_request.clone();
         let invocation_cancelled = || !task_lease_is_current(task_store, task_id, lease_id);
@@ -1577,6 +1192,9 @@ fn run_conversation_loop_inner(
             let on_delta = |delta: &ModelStreamingDelta| {
                 if invocation_cancelled() {
                     return;
+                }
+                if let Some(tracker) = context_usage_tracker.as_ref() {
+                    tracker.observe_accumulated_output(&delta.content, &delta.thinking);
                 }
                 publish_task_thinking_delta(
                     turn_writeback_context,
@@ -1641,13 +1259,40 @@ fn run_conversation_loop_inner(
                                 session_id,
                                 workspace_id,
                                 binding: usage_binding,
-                                call_id: format!("task-{}-{}-{round}", task_id, lease_id),
+                                call_id: round_call_id.clone(),
                                 usage: None,
                                 status: UsageCallStatus::Failed,
                                 assignment_id: Some(lease_id.to_string()),
                                 error_code: Some(classification.code.to_string()),
                             },
                         );
+                        if classification.code == "model_context_limit"
+                            && let Some(context_limit) =
+                                extract_model_context_limit(&raw_error_message)
+                        {
+                            let _ = apply_reported_context_limit(
+                                event_bus,
+                                settings_store,
+                                live_settings_store,
+                                &resolved_context_model,
+                                context_limit,
+                            );
+                            effective_context_window = context_limit;
+                            if let Some(rebuilt_messages) = rebuild_task_context(
+                                effective_context_window,
+                                round_tools.as_deref(),
+                                active_skill_name.as_deref(),
+                            ) {
+                                messages = rebuilt_messages;
+                                tracing::warn!(
+                                    task_id = %task.task_id,
+                                    round,
+                                    context_limit,
+                                    "任务模型上下文超限，已安装语义检查点并重建请求"
+                                );
+                                continue 'conversation_round;
+                            }
+                        }
                         let partial_visible_content =
                             streamed_visible_content.borrow().trim().to_string();
                         let partial_thinking = streamed_thinking.borrow().trim().to_string();
@@ -1899,13 +1544,39 @@ fn run_conversation_loop_inner(
                             session_id,
                             workspace_id,
                             binding: usage_binding,
-                            call_id: format!("task-{}-{}-{round}", task_id, lease_id),
+                            call_id: round_call_id.clone(),
                             usage: None,
                             status: UsageCallStatus::Failed,
                             assignment_id: Some(lease_id.to_string()),
                             error_code: Some(classification.code.to_string()),
                         },
                     );
+                    if classification.code == "model_context_limit"
+                        && let Some(context_limit) = extract_model_context_limit(&raw_error_message)
+                    {
+                        let _ = apply_reported_context_limit(
+                            event_bus,
+                            settings_store,
+                            live_settings_store,
+                            &resolved_context_model,
+                            context_limit,
+                        );
+                        effective_context_window = context_limit;
+                        if let Some(rebuilt_messages) = rebuild_task_context(
+                            effective_context_window,
+                            round_tools.as_deref(),
+                            active_skill_name.as_deref(),
+                        ) {
+                            messages = rebuilt_messages;
+                            tracing::warn!(
+                                task_id = %task.task_id,
+                                round,
+                                context_limit,
+                                "非流式任务模型上下文超限，已安装语义检查点并重建请求"
+                            );
+                            continue 'conversation_round;
+                        }
+                    }
                     if classification.retryable_before_output
                         && pre_output_invocation_recovery_attempts
                             < MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS
@@ -2064,7 +1735,7 @@ fn run_conversation_loop_inner(
                 session_id,
                 workspace_id,
                 binding: usage_binding,
-                call_id: format!("task-{}-{}-{round}", task_id, lease_id),
+                call_id: round_call_id.clone(),
                 usage: parsed.usage.as_ref(),
                 status: if has_actionable_output && response_contract_failure.is_none() {
                     UsageCallStatus::Success
@@ -2118,6 +1789,7 @@ fn run_conversation_loop_inner(
         }
         if round_has_tool_calls {
             had_tool_calls = true;
+            context_budget_recheck_required = true;
         }
 
         let assistant_response_message = ChatMessage {
@@ -2448,20 +2120,8 @@ fn run_conversation_loop_inner(
                     "动态 Skill 已用于当前轮，但执行链状态同步失败"
                 );
             }
-            if let Some(skill) = runtime.registry().get(&skill_id) {
-                messages.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: Some(format!(
-                        "--- Skill: {} ---\n{}\n{}",
-                        skill.title,
-                        crate::prompt_utils::SKILL_PROMPT_PRIORITY_NOTE,
-                        skill.instruction
-                    )),
-                    images: Vec::new(),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    provider_context: Vec::new(),
-                });
+            if let Some(skill_message) = skill_prompt_message(runtime, &skill_id) {
+                messages.push(skill_message);
             }
         }
         record_completed_required_tools(
@@ -2638,15 +2298,20 @@ fn run_conversation_loop_inner(
         final_model_round,
     );
 
-    let _ = prepare_thread_history(PrepareThreadHistoryInput {
+    let _ = ContextAuthority::new(
+        client,
         event_bus,
         session_store,
         session_id,
         workspace_id,
         thread_id,
+        settings_store,
+    )
+    .prepare(ContextPrepareRequest {
         fallback_history: Vec::new(),
         phase: "post_turn",
-        context_window_override: None,
+        context_window_override: Some(effective_context_window),
+        additional_token_estimate: 0,
     });
 
     (outcome, context_summary)
@@ -3646,6 +3311,7 @@ mod tests {
     struct TaskToolBatchModelBridgeClient {
         invoke_count: AtomicUsize,
     }
+    struct SemanticCompactionModelBridgeClient;
     struct TaskToolContentThenFinalModelBridgeClient {
         invoke_count: AtomicUsize,
     }
@@ -3656,6 +3322,12 @@ mod tests {
     struct DuplicateReadToolModelBridgeClient {
         invoke_count: AtomicUsize,
         file_path: String,
+    }
+    struct TaskToolThenContextLimitModelBridgeClient {
+        main_calls: AtomicUsize,
+        compaction_calls: AtomicUsize,
+        requests: Mutex<Vec<ModelInvocationRequest>>,
+        plan_store: magi_plan::PlanStore,
     }
 
     struct FailingTaskModelBridgeClient;
@@ -3695,6 +3367,106 @@ mod tests {
     struct EvidenceThenFinalTaskModelBridgeClient {
         invoke_count: AtomicUsize,
         requests: Mutex<Vec<ModelInvocationRequest>>,
+    }
+
+    impl ModelBridgeClient for TaskToolThenContextLimitModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            if request.provider == "context-compaction" {
+                self.compaction_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(ModelResponse::completed(
+                    "## 已完成\n- round_probe 已成功执行。\n## 未完成与下一步\n- 基于工具结果完成最终答复。",
+                ));
+            }
+            self.requests
+                .lock()
+                .expect("task context requests mutex poisoned")
+                .push(request);
+            match self.main_calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(model_response(serde_json::json!({
+                    "content": null,
+                    "finish_reason": "tool_calls",
+                    "tool_calls": [{
+                        "id": "call-context-limit-probe",
+                        "type": "function",
+                        "function": {
+                            "name": "round_probe",
+                            "arguments": "{}"
+                        }
+                    }]
+                }))),
+                1 => {
+                    let current = self
+                        .plan_store
+                        .snapshot()
+                        .expect("context limit test plan should exist");
+                    self.plan_store
+                        .update(magi_plan::UpdatePlanInput {
+                            plan_id: Some(current.plan_id.to_string()),
+                            expected_revision: Some(current.revision),
+                            language: current.language.clone(),
+                            explanation: Some("工具完成后推进下一阶段".to_string()),
+                            plan: vec![
+                                magi_plan::UpdatePlanItemInput {
+                                    item_id: Some(current.items[0].item_id.to_string()),
+                                    step: "执行工具探针".to_string(),
+                                    status: magi_core::PlanItemStatus::Completed,
+                                },
+                                magi_plan::UpdatePlanItemInput {
+                                    item_id: Some(current.items[1].item_id.to_string()),
+                                    step: "压缩后继续完成任务".to_string(),
+                                    status: magi_core::PlanItemStatus::InProgress,
+                                },
+                            ],
+                        })
+                        .expect("context limit test should advance plan before recovery");
+                    Err(BridgeClientError::CallFailed {
+                        layer: BridgeErrorLayer::RemoteBusiness,
+                        code: Some(400),
+                        message:
+                            "maximum context length is 16000 tokens, however you requested 30000"
+                                .to_string(),
+                    })
+                }
+                _ => {
+                    if let Some(current) = self.plan_store.snapshot()
+                        && current
+                            .items
+                            .iter()
+                            .any(|item| item.status == magi_core::PlanItemStatus::InProgress)
+                    {
+                        self.plan_store
+                            .update(magi_plan::UpdatePlanInput {
+                                plan_id: Some(current.plan_id.to_string()),
+                                expected_revision: Some(current.revision),
+                                language: current.language.clone(),
+                                explanation: Some("恢复后任务完成".to_string()),
+                                plan: current
+                                    .items
+                                    .iter()
+                                    .map(|item| magi_plan::UpdatePlanItemInput {
+                                        item_id: Some(item.item_id.to_string()),
+                                        step: item.title.clone(),
+                                        status: magi_core::PlanItemStatus::Completed,
+                                    })
+                                    .collect(),
+                            })
+                            .expect("context limit test should complete plan");
+                    }
+                    Ok(ModelResponse::completed("工具结果已继承，任务完成。"))
+                }
+            }
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<ModelResponse, BridgeClientError> {
+            self.invoke(request)
+        }
     }
 
     fn exposed_test_tool(name: &str) -> ChatToolDefinition {
@@ -3746,7 +3518,7 @@ mod tests {
             observed_at: Some(UtcMillis(1)),
             ..SessionRuntimeUsageObservation::default()
         };
-        assert!(thread_history_compaction_decision(&history, Some(&low_usage), None).is_none());
+        assert!(thread_history_compaction_decision(&history, Some(&low_usage), None, 0).is_none());
 
         let high_usage = SessionRuntimeUsageObservation {
             context_window_tokens: 245_000,
@@ -3754,7 +3526,7 @@ mod tests {
             observed_at: Some(UtcMillis(2)),
             ..SessionRuntimeUsageObservation::default()
         };
-        let decision = thread_history_compaction_decision(&history, Some(&high_usage), None)
+        let decision = thread_history_compaction_decision(&history, Some(&high_usage), None, 0)
             .expect("high context usage should trigger compaction");
         match decision {
             ThreadHistoryCompactionDecision::ContextWindowPressure {
@@ -3762,6 +3534,7 @@ mod tests {
                 token_limit,
                 threshold_tokens,
                 resolved_model,
+                ..
             } => {
                 assert_eq!(tokens_used, 245_000);
                 assert_eq!(token_limit, 272_000);
@@ -3775,21 +3548,47 @@ mod tests {
     #[test]
     fn thread_history_compaction_uses_estimated_prefill_only_without_usage() {
         let normal_history = repeated_thread_history(40, 1_000);
-        assert!(thread_history_compaction_decision(&normal_history, None, None).is_none());
+        assert!(thread_history_compaction_decision(&normal_history, None, None, 0).is_none());
 
         let huge_history = repeated_thread_history(1_000, 1_000);
-        let decision = thread_history_compaction_decision(&huge_history, None, None)
+        let decision = thread_history_compaction_decision(&huge_history, None, None, 0)
             .expect("huge cold-start history should trigger estimated prefill compaction");
         match decision {
             ThreadHistoryCompactionDecision::EstimatedPrefill {
                 estimated_tokens,
                 threshold_tokens,
+                ..
             } => {
                 assert!(estimated_tokens >= threshold_tokens);
                 assert_eq!(threshold_tokens, 230_400);
             }
             other => panic!("expected estimated prefill decision, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn thread_history_compaction_counts_non_history_request_tokens() {
+        let history = repeated_thread_history(40, 1_000);
+        assert!(thread_history_compaction_decision(&history, None, Some(20_000), 0).is_none());
+        assert!(matches!(
+            thread_history_compaction_decision(&history, None, Some(20_000), 12_000),
+            Some(ThreadHistoryCompactionDecision::ContextWindowPressure { .. })
+        ));
+    }
+
+    #[test]
+    fn reported_small_context_window_uses_dynamic_history_target() {
+        let history = repeated_thread_history(20, 1_000);
+        let decision = thread_history_compaction_decision(&history, None, Some(4_000), 500)
+            .expect("上游报告的小窗口必须覆盖固定 8K 压缩目标");
+        let ThreadHistoryCompactionDecision::ContextWindowPressure {
+            target_history_tokens,
+            ..
+        } = decision
+        else {
+            panic!("small reported context should trigger pressure compaction");
+        };
+        assert_eq!(target_history_tokens, 2_300);
     }
 
     #[test]
@@ -3806,6 +3605,7 @@ mod tests {
             &huge_history,
             Some(&low_usage_after_compaction),
             None,
+            0,
         )
         .expect("完整历史仍超过窗口水位时必须继续压缩，不能因上轮压缩后用量降低而反弹");
 
@@ -3816,7 +3616,8 @@ mod tests {
     }
 
     #[test]
-    fn prepare_thread_history_persists_compaction_and_reuses_internal_snapshot() {
+    fn context_authority_persists_checkpoint_without_replacing_transcript() {
+        let client = SemanticCompactionModelBridgeClient;
         let session_store = SessionStore::new();
         let session_id = SessionId::new("session-context-compaction-persistence");
         session_store
@@ -3830,20 +3631,31 @@ mod tests {
         let workspace_id = Some(WorkspaceId::new("workspace-context-compaction"));
         let fallback_history = repeated_thread_history(1_000, 1_000);
 
-        let first = prepare_thread_history(PrepareThreadHistoryInput {
-            event_bus: &event_bus,
-            session_store: &session_store,
-            session_id: &session_id,
-            workspace_id: &workspace_id,
-            thread_id: &thread_id,
+        let authority = ContextAuthority::new(
+            &client,
+            &event_bus,
+            &session_store,
+            &session_id,
+            &workspace_id,
+            &thread_id,
+            None,
+        );
+        let first = authority.prepare(ContextPrepareRequest {
             fallback_history: fallback_history.clone(),
             phase: "pre_turn",
             context_window_override: None,
+            additional_token_estimate: 0,
         });
         assert!(first.compaction.is_some());
         assert_eq!(
             session_store.thread_message_history(&thread_id).len(),
-            first.messages.len()
+            fallback_history.len()
+        );
+        assert!(first.messages.len() < fallback_history.len());
+        assert!(
+            session_store
+                .thread_context_checkpoint(&thread_id)
+                .is_some()
         );
         assert!(
             event_bus
@@ -3853,18 +3665,226 @@ mod tests {
                 .any(|event| event.event_type == "session.context.compacted")
         );
 
-        let second = prepare_thread_history(PrepareThreadHistoryInput {
-            event_bus: &event_bus,
-            session_store: &session_store,
-            session_id: &session_id,
-            workspace_id: &workspace_id,
-            thread_id: &thread_id,
+        let second = authority.prepare(ContextPrepareRequest {
             fallback_history,
             phase: "pre_turn",
             context_window_override: None,
+            additional_token_estimate: 0,
         });
         assert!(second.compaction.is_none());
         assert_eq!(second.messages.len(), first.messages.len());
+    }
+
+    #[test]
+    fn context_authority_recompacts_after_new_runtime_history_crosses_threshold() {
+        let client = SemanticCompactionModelBridgeClient;
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new("session-context-successive-compaction");
+        session_store
+            .create_session(session_id.clone(), "successive compaction")
+            .expect("session should be created");
+        let (_, thread_id) =
+            session_store.ensure_session_mission(&session_id, UtcMillis(1), || {
+                MissionId::new("mission-context-successive-compaction")
+            });
+        let event_bus = InMemoryEventBus::new(64);
+        session_store.append_thread_messages(
+            &thread_id,
+            repeated_thread_history(100, 1_000),
+            UtcMillis(2),
+        );
+        let authority = ContextAuthority::new(
+            &client,
+            &event_bus,
+            &session_store,
+            &session_id,
+            &None,
+            &thread_id,
+            None,
+        );
+
+        let first = authority.prepare(ContextPrepareRequest {
+            fallback_history: Vec::new(),
+            phase: "runtime_budget_gate",
+            context_window_override: Some(20_000),
+            additional_token_estimate: 1_000,
+        });
+        assert!(first.compaction.is_some());
+        let first_source_count = session_store
+            .thread_context_checkpoint(&thread_id)
+            .expect("first checkpoint should exist")
+            .source_message_count;
+
+        session_store.append_thread_messages(
+            &thread_id,
+            repeated_thread_history(60, 1_000),
+            UtcMillis(3),
+        );
+        let second = authority.prepare(ContextPrepareRequest {
+            fallback_history: Vec::new(),
+            phase: "runtime_budget_gate",
+            context_window_override: None,
+            additional_token_estimate: 1_000,
+        });
+
+        assert!(
+            second.compaction.is_some(),
+            "新增工具历史达到阈值后必须再次压缩"
+        );
+        assert!(
+            session_store
+                .thread_context_checkpoint(&thread_id)
+                .expect("second checkpoint should exist")
+                .source_message_count
+                > first_source_count
+        );
+        assert_eq!(
+            session_store.thread_context_window_tokens(&thread_id),
+            Some(20_000)
+        );
+    }
+
+    #[test]
+    fn context_authority_invalidates_checkpoint_when_file_fact_changes() {
+        let client = SemanticCompactionModelBridgeClient;
+        let session_store = SessionStore::new();
+        let session_id = SessionId::new("session-context-file-invalidation");
+        session_store
+            .create_session(session_id.clone(), "context file invalidation")
+            .expect("session should be created");
+        let (_, thread_id) =
+            session_store.ensure_session_mission(&session_id, UtcMillis(1), || {
+                MissionId::new("mission-context-file-invalidation")
+            });
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("facts.txt");
+        std::fs::write(&path, "old fact").expect("write old fact");
+        let content_hash = magi_snapshot::path_content_hash(&path).expect("hash old fact");
+        session_store.append_thread_messages(
+            &thread_id,
+            vec![
+                ThreadChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    images: Vec::new(),
+                    tool_calls: vec![ThreadChatToolCall {
+                        id: "call-file-fact".to_string(),
+                        kind: "function".to_string(),
+                        function: ThreadChatToolFunction {
+                            name: "file_read".to_string(),
+                            arguments: serde_json::json!({"path": path}).to_string(),
+                        },
+                    }],
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                },
+                ThreadChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(
+                        serde_json::json!({
+                            "tool": "file_read",
+                            "status": "succeeded",
+                            "path": path,
+                            "content_hash": content_hash,
+                            "content": "old fact"
+                        })
+                        .to_string(),
+                    ),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some("call-file-fact".to_string()),
+                    provider_context: Vec::new(),
+                },
+                ThreadChatMessage {
+                    role: "user".to_string(),
+                    content: Some("继续".to_string()),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                },
+            ],
+            UtcMillis(2),
+        );
+        session_store.install_thread_context_checkpoint(
+            &thread_id,
+            magi_session_store::ThreadContextCheckpoint {
+                thread_id: thread_id.clone(),
+                checkpoint_id: "checkpoint-file-fact".to_string(),
+                source_message_count: 2,
+                summary_message: ThreadChatMessage {
+                    role: "system".to_string(),
+                    content: Some("文件内容是 old fact".to_string()),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                },
+                reason: "test".to_string(),
+                original_token_estimate: 100,
+                checkpoint_token_estimate: 20,
+                created_at: UtcMillis(3),
+                file_fact_versions: vec![magi_session_store::ThreadFileFactVersion {
+                    path: path.display().to_string(),
+                    content_hash,
+                }],
+            },
+            UtcMillis(3),
+        );
+
+        std::fs::write(&path, "new fact").expect("write new fact");
+        let prepared = ContextAuthority::new(
+            &client,
+            &InMemoryEventBus::new(8),
+            &session_store,
+            &session_id,
+            &None,
+            &thread_id,
+            None,
+        )
+        .prepare(ContextPrepareRequest {
+            fallback_history: Vec::new(),
+            phase: "pre_turn",
+            context_window_override: None,
+            additional_token_estimate: 0,
+        });
+
+        assert!(
+            session_store
+                .thread_context_checkpoint(&thread_id)
+                .is_none()
+        );
+        let stale = prepared
+            .messages
+            .iter()
+            .find_map(|message| message.content.as_deref())
+            .filter(|content| content.contains("workspace_content_changed"));
+        assert!(stale.is_some());
+        assert!(prepared.messages.iter().all(|message| {
+            !message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("old fact"))
+        }));
+    }
+
+    impl ModelBridgeClient for SemanticCompactionModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            Ok(ModelResponse::completed(
+                "## 目标与约束\n- 保留原始任务约束。\n## 已完成\n- 历史事实已确认。\n## 关键事实\n- 工具结果保持原样。\n## 未完成与下一步\n- 继续当前任务。",
+            ))
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<ModelResponse, BridgeClientError> {
+            self.invoke(request)
+        }
     }
 
     impl ModelBridgeClient for TaskToolBatchModelBridgeClient {
@@ -4863,6 +4883,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: Some(&tool_registry),
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -4897,7 +4918,10 @@ mod tests {
             persist_session_state: None,
         });
 
-        assert!(matches!(outcome, TaskOutcome::Completed { .. }));
+        assert!(
+            matches!(outcome, TaskOutcome::Completed { .. }),
+            "unexpected task outcome: {outcome:?}"
+        );
         assert_eq!(client.invoke_count.load(Ordering::SeqCst), 41);
         let tools_enabled = client
             .tools_enabled
@@ -4905,6 +4929,227 @@ mod tests {
             .expect("tools_enabled mutex poisoned");
         assert_eq!(tools_enabled.len(), 41);
         assert!(tools_enabled.iter().all(|enabled| *enabled));
+    }
+
+    fn assert_task_loop_recovers_context_limit_after_tool(is_sidechain: bool) {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(128);
+        let session_id = SessionId::new("session-task-context-limit-after-tool");
+        let workspace_id = Some(WorkspaceId::new("workspace-task-context-limit-after-tool"));
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "task context limit after tool",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should create");
+        let task_store = TaskStore::new();
+        let task = make_task_loop_test_task("task-context-limit-after-tool");
+        task_store.insert_task(task.clone());
+        let worker_id = WorkerId::new("worker-context-limit-after-tool");
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "executor",
+                60_000,
+            )
+            .expect("lease should grant");
+        let (_, thread_id) =
+            session_store
+                .ensure_session_mission(&session_id, UtcMillis::now(), || task.mission_id.clone());
+        session_store.append_thread_messages(
+            &thread_id,
+            (0..80)
+                .map(|index| ThreadChatMessage {
+                    role: if index % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                    content: Some("x".repeat(1_000)),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                })
+                .collect(),
+            UtcMillis::now(),
+        );
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-task-context-limit-after-tool".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis::now(),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("执行探针后完成".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("turn should create");
+        let probe = Arc::new(ConcurrentTaskToolProbe::new(Duration::from_millis(0)));
+        let tool_event_bus = Arc::new(InMemoryEventBus::new(16));
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(GovernanceService::default()),
+            Arc::clone(&tool_event_bus),
+        );
+        tool_registry.register_builtin(Arc::new(ProbeTaskBuiltinTool::new("round_probe", probe)));
+        let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
+        plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![
+                    magi_plan::UpdatePlanItemInput {
+                        item_id: None,
+                        step: "执行工具探针".to_string(),
+                        status: magi_core::PlanItemStatus::InProgress,
+                    },
+                    magi_plan::UpdatePlanItemInput {
+                        item_id: None,
+                        step: "压缩后继续完成任务".to_string(),
+                        status: magi_core::PlanItemStatus::Pending,
+                    },
+                ],
+            })
+            .expect("context limit test plan should create");
+        let client = TaskToolThenContextLimitModelBridgeClient {
+            main_calls: AtomicUsize::new(0),
+            compaction_calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+            plan_store: plan_store.clone(),
+        };
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+        let live_settings = Arc::new(SettingsStore::new());
+        live_settings
+            .set_section(
+                "orchestrator",
+                serde_json::json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "test-key",
+                    "model": "context-window-test-model",
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat"
+                }),
+            )
+            .expect("orchestrator settings should save");
+        crate::model_context_window::set_model_context_window(
+            live_settings.as_ref(),
+            "context-window-test-model",
+            16_000,
+        )
+        .expect("context window should save");
+        let execution_settings = Arc::new(live_settings.execution_snapshot());
+
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: Some(&execution_settings),
+            live_settings_store: Some(&live_settings),
+            tool_registry: Some(&tool_registry),
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
+            conversation_registry: &ConversationRegistry::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
+            plan_store: &plan_store,
+            project_memory: None,
+            mission_metrics: None,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "执行探针后完成".to_string(),
+            images: Vec::new(),
+            tools: Some(vec![exposed_test_tool("round_probe")]),
+            usage_binding: &usage_binding,
+            streaming_entry_id: None,
+            is_sidechain,
+            worker_id: is_sidechain.then_some(&worker_id),
+            thread_id: &thread_id,
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
+            persist_session_state: None,
+        });
+
+        assert!(
+            matches!(outcome, TaskOutcome::Completed { .. }),
+            "unexpected task outcome: {outcome:?}"
+        );
+        assert_eq!(client.main_calls.load(Ordering::SeqCst), 3);
+        assert!(
+            client.compaction_calls.load(Ordering::SeqCst) > 1,
+            "16K 窗口恢复应使用分块语义压缩"
+        );
+        let requests = client
+            .requests
+            .lock()
+            .expect("task context requests mutex poisoned");
+        assert!(
+            requests[2]
+                .messages
+                .as_ref()
+                .is_some_and(|messages| messages.iter().any(|message| {
+                    message
+                        .content
+                        .as_deref()
+                        .is_some_and(|content| content.contains("round_probe 已成功执行"))
+                }))
+        );
+        assert!(
+            requests[2]
+                .messages
+                .as_ref()
+                .is_some_and(|messages| messages.iter().any(|message| {
+                    message.content.as_deref().is_some_and(|content| {
+                        content.contains("压缩后继续完成任务") && content.contains("in_progress")
+                    })
+                })),
+            "压缩恢复请求必须从 PlanStore 读取最新计划进度"
+        );
+        let tool_result_count = session_store
+            .thread_message_history(&thread_id)
+            .iter()
+            .filter(|message| {
+                message.role == "tool"
+                    && message.content.as_deref().is_some_and(|content| {
+                        content.contains("round_probe")
+                            && infer_tool_call_status(content) == "success"
+                    })
+            })
+            .count();
+        assert_eq!(tool_result_count, 1, "恢复不得重复执行已经完成的工具");
+        assert_eq!(
+            session_store.thread_context_window_tokens(&thread_id),
+            Some(16_000),
+            "任务 thread 必须持久化实际采用的上下文窗口"
+        );
+        assert!(
+            session_store
+                .thread_context_checkpoint(&thread_id)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn task_loop_compacts_and_continues_when_context_limit_occurs_after_tool() {
+        assert_task_loop_recovers_context_limit_after_tool(false);
+    }
+
+    #[test]
+    fn subagent_loop_compacts_and_continues_when_context_limit_occurs_after_tool() {
+        assert_task_loop_recovers_context_limit_after_tool(true);
     }
 
     #[test]
@@ -4981,6 +5226,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: Some(&tool_registry),
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -5150,6 +5396,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -5476,6 +5723,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -5544,6 +5792,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -5632,6 +5881,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -5890,6 +6140,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -5981,6 +6232,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: Some(&tool_registry),
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -6196,6 +6448,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -6302,6 +6555,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -6425,6 +6679,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -6723,6 +6978,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -6904,6 +7160,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -7022,6 +7279,7 @@ mod tests {
             status: ExecutionThreadStatus::Active,
             created_at: now,
             last_used_at: now,
+            observed_context_window_tokens: None,
             handled_task_ids: vec![task.task_id.clone()],
             message_history: Vec::new(),
         });
@@ -7035,6 +7293,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -7148,6 +7407,7 @@ mod tests {
             status: ExecutionThreadStatus::Active,
             created_at: now,
             last_used_at: now,
+            observed_context_window_tokens: None,
             handled_task_ids: vec![task.task_id.clone()],
             message_history: Vec::new(),
         });
@@ -7163,6 +7423,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: None,
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -7314,6 +7575,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: Some(&tool_registry),
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -7442,6 +7704,7 @@ mod tests {
                 status: ExecutionThreadStatus::Active,
                 created_at: now,
                 last_used_at: now,
+                observed_context_window_tokens: None,
                 handled_task_ids: vec![task_id.clone()],
                 message_history: Vec::new(),
             };
@@ -7494,6 +7757,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: Some(&tool_registry),
             skill_runtime: None,
             skill_dispatch_runtime: None,
@@ -7656,6 +7920,7 @@ mod tests {
                 status: ExecutionThreadStatus::Active,
                 created_at: now,
                 last_used_at: now,
+                observed_context_window_tokens: None,
                 handled_task_ids: vec![task.task_id.clone()],
                 message_history: Vec::new(),
             };
@@ -7709,6 +7974,7 @@ mod tests {
             event_bus: &event_bus,
             session_store: &session_store,
             settings_store: None,
+            live_settings_store: None,
             tool_registry: Some(&tool_registry),
             skill_runtime: None,
             skill_dispatch_runtime: None,

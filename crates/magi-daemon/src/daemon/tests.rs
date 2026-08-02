@@ -3153,6 +3153,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
             status: ExecutionThreadStatus::Active,
             created_at: now,
             last_used_at: now,
+            observed_context_window_tokens: None,
             handled_task_ids: vec![branch.task_id.clone()],
             message_history: Vec::new(),
         });

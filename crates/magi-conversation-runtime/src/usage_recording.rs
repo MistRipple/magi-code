@@ -9,7 +9,7 @@ use crate::model_context_window::resolve_model_context_window;
 use magi_bridge_client::{
     BridgeClientError, ModelBridgeClient, ModelInvocationRequest, ModelResponse,
 };
-use magi_core::{EventId, MissionId, SessionId, UtcMillis, WorkspaceId};
+use magi_core::{EventId, MissionId, SessionId, UtcMillis, WorkspaceId, estimate_text_tokens};
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_mission_metrics::{MissionMetricsStore, TurnUsage};
 use magi_orchestrator::task_worker_catalog::WorkerInfo;
@@ -17,10 +17,13 @@ use magi_session_store::SessionStore;
 use magi_settings_store::SettingsStore;
 use magi_usage_authority::{
     ExecutionBindingIdentity, LlmConfig, UsageCallIdentity, UsageCallRecordInput, UsageCallStatus,
-    UsagePhase, UsageSourceRole, UsageTokenInput, evaluate_context_budget,
-    prepare_llm_config_for_persistence,
+    UsagePhase, UsageSourceRole, UsageTokenInput, context_window_tokens_from_usage,
+    evaluate_context_budget, prepare_llm_config_for_persistence,
 };
 use std::sync::Arc;
+
+const CONTEXT_USAGE_EMIT_INTERVAL_MS: u64 = 300;
+const CONTEXT_USAGE_EMIT_TOKEN_DELTA: u64 = 128;
 
 #[derive(Clone, Debug)]
 pub struct ModelUsageBinding {
@@ -29,6 +32,84 @@ pub struct ModelUsageBinding {
     binding_revision: u32,
     role: UsageSourceRole,
     phase: UsagePhase,
+}
+
+impl ModelUsageBinding {
+    pub fn tracks_active_context(&self) -> bool {
+        self.role == UsageSourceRole::Orchestrator
+    }
+}
+
+pub struct ContextUsageRuntimeTrackerInput<'a> {
+    pub event_bus: &'a InMemoryEventBus,
+    pub settings_store: Option<&'a SettingsStore>,
+    pub session_id: &'a SessionId,
+    pub workspace_id: &'a Option<WorkspaceId>,
+    pub turn_id: Option<&'a str>,
+    pub call_id: &'a str,
+    pub resolved_model: &'a str,
+    pub prefill_tokens: u64,
+}
+
+pub struct ContextUsageRuntimeTracker<'a> {
+    input: ContextUsageRuntimeTrackerInput<'a>,
+    last_emit_at: std::cell::Cell<u64>,
+    last_emitted_tokens: std::cell::Cell<u64>,
+}
+
+impl<'a> ContextUsageRuntimeTracker<'a> {
+    pub fn start(input: ContextUsageRuntimeTrackerInput<'a>) -> Self {
+        publish_context_usage_update(
+            input.event_bus,
+            input.settings_store,
+            input.session_id,
+            input.workspace_id,
+            input.turn_id,
+            input.call_id,
+            input.resolved_model,
+            input.prefill_tokens,
+            "prefill",
+            "estimated",
+        );
+        let prefill_tokens = input.prefill_tokens;
+        Self {
+            input,
+            last_emit_at: std::cell::Cell::new(0),
+            last_emitted_tokens: std::cell::Cell::new(prefill_tokens),
+        }
+    }
+
+    pub fn observe_accumulated_output(&self, content: &str, thinking: &str) {
+        let estimated_output_tokens =
+            estimate_text_tokens(content).saturating_add(estimate_text_tokens(thinking));
+        let estimated_context_tokens = self
+            .input
+            .prefill_tokens
+            .saturating_add(estimated_output_tokens as u64);
+        let now = UtcMillis::now().0;
+        let previous_tokens = self.last_emitted_tokens.get();
+        if self.last_emit_at.get() != 0
+            && now.saturating_sub(self.last_emit_at.get()) < CONTEXT_USAGE_EMIT_INTERVAL_MS
+            && estimated_context_tokens.saturating_sub(previous_tokens)
+                < CONTEXT_USAGE_EMIT_TOKEN_DELTA
+        {
+            return;
+        }
+        publish_context_usage_update(
+            self.input.event_bus,
+            self.input.settings_store,
+            self.input.session_id,
+            self.input.workspace_id,
+            self.input.turn_id,
+            self.input.call_id,
+            self.input.resolved_model,
+            estimated_context_tokens,
+            "streaming",
+            "estimated",
+        );
+        self.last_emit_at.set(now);
+        self.last_emitted_tokens.set(estimated_context_tokens);
+    }
 }
 
 pub struct ModelUsageRecordInput<'a> {
@@ -265,7 +346,7 @@ fn publish_model_usage_record_internal(
         assignment_id,
         error_code,
     } = input;
-    let usage = match usage_tokens_from_payload(usage) {
+    let mut usage = match usage_tokens_from_payload(usage) {
         Some(usage) => usage,
         None => UsageTokenInput {
             input_tokens: 0,
@@ -286,9 +367,8 @@ fn publish_model_usage_record_internal(
         );
         return;
     };
-    let authoritative_context_tokens = usage
-        .total_tokens
-        .unwrap_or_else(|| usage.input_tokens.saturating_add(usage.output_tokens));
+    let authoritative_context_tokens = context_window_tokens_from_usage(&usage);
+    usage.total_tokens = Some(authoritative_context_tokens);
     let resolved_model = model_config.model.clone();
     let publishes_authoritative_context = binding.role == UsageSourceRole::Orchestrator
         && status == UsageCallStatus::Success
@@ -386,9 +466,7 @@ pub fn account_active_goal_turn(
     let Some(goal) = session_store.active_goal(session_id) else {
         return;
     };
-    let token_delta = tokens
-        .total_tokens
-        .unwrap_or_else(|| tokens.input_tokens.saturating_add(tokens.output_tokens));
+    let token_delta = context_window_tokens_from_usage(&tokens);
     if let Err(error) = session_store.account_goal_progress(
         session_id,
         &goal.goal_id,
@@ -404,7 +482,10 @@ pub fn account_active_goal_turn(
     }
 }
 
-fn current_turn_id(session_store: &SessionStore, session_id: &SessionId) -> Option<String> {
+pub(crate) fn current_turn_id(
+    session_store: &SessionStore,
+    session_id: &SessionId,
+) -> Option<String> {
     session_store
         .runtime_sidecar(session_id)
         .and_then(|sidecar| sidecar.current_turn)
@@ -477,7 +558,11 @@ fn usage_model_config_for_binding(
         UsageSourceRole::Auxiliary => {
             let config = store.get_section("auxiliary");
             match NormalizedModelConfig::from_settings_value(&config) {
-                Ok(config) => return config.to_usage_llm_config(),
+                Ok(config) => {
+                    if let Some(config) = config.to_usage_llm_config() {
+                        return Some(config);
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(error = %error, "auxiliary 模型配置无效，跳过用量身份归因");
                     return None;
@@ -503,6 +588,14 @@ fn usage_model_config_for_binding(
             None
         }
     }
+}
+
+pub(crate) fn resolved_model_for_usage_binding(
+    settings_store: Option<&Arc<SettingsStore>>,
+    binding: &ModelUsageBinding,
+    session_id: &SessionId,
+) -> Option<String> {
+    usage_model_config_for_binding(settings_store, binding, session_id).map(|config| config.model)
 }
 
 fn usage_tokens_from_payload(usage: Option<&serde_json::Value>) -> Option<UsageTokenInput> {
@@ -618,6 +711,42 @@ mod tests {
         assert!(matches!(planning.role, UsageSourceRole::Orchestrator));
         assert!(matches!(planning.phase, UsagePhase::Planning));
         assert!(matches!(execution.phase, UsagePhase::Execution));
+    }
+
+    #[test]
+    fn context_usage_runtime_tracker_publishes_prefill_and_streaming_estimates() {
+        let event_bus = InMemoryEventBus::new(8);
+        let settings_store = SettingsStore::new();
+        let session_id = SessionId::new("session-context-runtime");
+        let workspace_id = Some(WorkspaceId::new("workspace-context-runtime"));
+        let tracker = ContextUsageRuntimeTracker::start(ContextUsageRuntimeTrackerInput {
+            event_bus: &event_bus,
+            settings_store: Some(&settings_store),
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            turn_id: Some("turn-context-runtime"),
+            call_id: "call-context-runtime",
+            resolved_model: "gpt-5.6-luna",
+            prefill_tokens: 1_000,
+        });
+
+        tracker.observe_accumulated_output("圆环实时增长", "正在思考");
+
+        let events = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .filter(|event| event.event_type == "session.context.usage.updated")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].payload["phase"], json!("prefill"));
+        assert_eq!(events[0].payload["accuracy"], json!("estimated"));
+        assert_eq!(events[0].payload["token_used"], json!(1_000));
+        assert_eq!(events[1].payload["phase"], json!("streaming"));
+        assert_eq!(events[1].payload["accuracy"], json!("estimated"));
+        assert!(events[1].payload["token_used"].as_u64().unwrap_or_default() > 1_000);
+        assert_eq!(events[1].payload["call_id"], json!("call-context-runtime"));
+        assert_eq!(events[1].payload["turn_id"], json!("turn-context-runtime"));
     }
 
     #[test]
@@ -914,6 +1043,67 @@ mod tests {
                 .payload
                 .to_string()
                 .contains("secret-auxiliary-success-key")
+        );
+    }
+
+    #[test]
+    fn auxiliary_usage_inherits_orchestrator_identity_when_auxiliary_is_unconfigured() {
+        let event_bus = InMemoryEventBus::new(8);
+        let session_store = SessionStore::new();
+        let settings_store = Arc::new(SettingsStore::new());
+        let session_id = SessionId::new("session-auxiliary-inherits-orchestrator");
+        settings_store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://orchestrator.example.test/v1",
+                    "provider": "openai-compatible",
+                    "apiKey": "secret-orchestrator-key"
+                }),
+            )
+            .unwrap();
+        settings_store
+            .set_session_section(
+                &session_id,
+                "orchestrator",
+                json!({"model": "orchestrator-inherited-model"}),
+            )
+            .unwrap();
+        let binding = auxiliary_model_usage_binding(UsagePhase::Integration);
+        let workspace_id = Some(WorkspaceId::new(
+            "workspace-auxiliary-inherits-orchestrator",
+        ));
+
+        publish_model_usage_record(
+            &event_bus,
+            &session_store,
+            Some(&settings_store),
+            ModelUsageRecordInput {
+                session_id: &session_id,
+                workspace_id: &workspace_id,
+                binding: &binding,
+                call_id: "auxiliary-inherited-call".to_string(),
+                usage: Some(&json!({"input_tokens": 5, "output_tokens": 3})),
+                status: UsageCallStatus::Success,
+                assignment_id: None,
+                error_code: None,
+            },
+        );
+
+        let event = event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "model.usage.recorded")
+            .expect("继承 orchestrator 的辅助调用必须写入用量账本");
+        assert_eq!(
+            event.payload["executionBinding"]["role"],
+            json!("auxiliary")
+        );
+        assert_eq!(event.payload["callIdentity"]["phase"], json!("integration"));
+        assert_eq!(
+            event.payload["modelConfig"]["model"],
+            json!("orchestrator-inherited-model")
         );
     }
 
