@@ -6104,6 +6104,10 @@ fn idempotent_read_tool_classification_uses_builtin_and_mcp_metadata() {
     }));
 
     assert!(registry.is_idempotent_read_tool(BuiltinToolName::WebSearch.as_str()));
+    assert!(
+        !registry.is_idempotent_read_tool(BuiltinToolName::GetGoal.as_str()),
+        "get_goal 返回可变的 Goal/Plan revision，必须每次读取当前状态"
+    );
     assert!(!registry.is_idempotent_read_tool(BuiltinToolName::ShellExec.as_str()));
     assert!(registry.is_idempotent_read_tool("mcp__repo_tools__inspect"));
     assert!(!registry.is_idempotent_read_tool("mcp__repo_tools__apply"));

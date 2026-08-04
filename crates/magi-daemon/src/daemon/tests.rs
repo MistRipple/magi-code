@@ -87,10 +87,15 @@ fn workspace_session_loader_preserves_goals() {
             Some(workspace_id.to_string()),
         )
         .expect("workspace session should create");
+    let (_, thread_id) =
+        session_store.ensure_session_mission(&session_id, UtcMillis::now(), || {
+            MissionId::new("mission-goal-load")
+        });
     let goal = session_store
         .create_goal(
             session_id.clone(),
-            ThreadId::new("thread-goal-load"),
+            thread_id,
+            "turn-goal-load",
             "恢复工作区目标",
             AccessProfile::Restricted,
             Some(256_000),

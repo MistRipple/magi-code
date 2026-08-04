@@ -35,6 +35,9 @@ pub struct ToolCall {
 
 impl ToolCall {
     pub fn arguments_for_wire(&self) -> String {
+        if self.argument_parse_error.is_none() {
+            return self.arguments.to_string();
+        }
         self.raw_arguments
             .clone()
             .unwrap_or_else(|| self.arguments.to_string())
@@ -298,6 +301,21 @@ mod tests {
         };
 
         assert_eq!(call.arguments_for_wire(), r#"{"command":"printf hello""#);
+    }
+
+    #[test]
+    fn tool_call_arguments_for_wire_canonicalizes_parseable_duplicate_fields() {
+        let raw = r#"{"planId":"stale","planId":"current"}"#;
+        let (arguments, argument_parse_error) = parse_tool_arguments(raw);
+        let call = ToolCall {
+            id: "call-duplicate-fields".to_string(),
+            name: "update_plan".to_string(),
+            arguments,
+            argument_parse_error,
+            raw_arguments: Some(raw.to_string()),
+        };
+
+        assert_eq!(call.arguments_for_wire(), r#"{"planId":"current"}"#);
     }
 }
 

@@ -115,7 +115,8 @@ pub enum ChatToolOrigin {
     ExternalMcp,
     /// Skill 安装或激活后提供的自定义工具。
     Skill,
-    /// 旧会话或第三方 bridge 生成的未分类工具；不参与 provider 专属改名。
+    /// 旧会话或第三方 bridge 生成的未分类工具；协议边界使用独立 legacy
+    /// 命名空间，绝不把未知身份猜测为内置、MCP 或 Skill 工具。
     #[default]
     Unspecified,
 }

@@ -45,7 +45,7 @@ use crate::{
     tool_surface_state::{activate_skill_tool_definitions, refresh_live_mcp_tool_definitions},
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
-        account_active_goal_turn, publish_model_usage_record, session_turn_model_usage_binding,
+        account_active_goal_usage, publish_model_usage_record, session_turn_model_usage_binding,
     },
 };
 use magi_bridge_client::{
@@ -359,19 +359,22 @@ fn build_session_turn_messages(
         Vec::new()
     };
     if let Some(execution_state) =
-        session_execution_state_prompt(session_store, &request.session_id)
+        session_execution_state_prompt(session_store, &request.session_id, &request.turn_id)
     {
         messages.push(system_prompt_fragment_message(
             PromptFragmentKind::UserPlan,
             execution_state,
         ));
     }
-    if request.goal_turn_mode.is_goal_driven() || session_store.plan(&request.session_id).is_some()
+    if request.goal_turn_mode.is_goal_driven()
+        || session_store
+            .active_plan_for_execution_owner(&request.session_id, &request.turn_id)
+            .is_some()
     {
         messages.push(system_prompt_fragment_message(
             PromptFragmentKind::CurrentTurnPriority,
             format!(
-                "计划语言规则：用户明确指定的语言优先，其次当前用户消息的主要语言，再次产品 locale={}，最后默认 zh-CN。调用 update_plan 时必须将最终选择写入 language，计划创建后不得切换。",
+                "计划语言规则：用户明确指定的语言优先，其次当前用户消息的主要语言，再次产品 locale={}，最后默认 zh-CN。调用 update_plan 时必须将最终选择写入 language，计划创建后不得切换；存在未完成 Goal 时，必须使用本轮 get_goal 或 create_goal 返回的 goalId 与 controlRevision 作为 expectedGoalId 与 expectedGoalControlRevision。",
                 request.product_locale
             ),
         ));
@@ -409,9 +412,10 @@ fn build_session_turn_messages(
 fn session_execution_state_prompt(
     session_store: &SessionStore,
     session_id: &SessionId,
+    owner_id: &str,
 ) -> Option<String> {
-    let goal = session_store.current_visible_goal(session_id);
-    let plan = session_store.plan(session_id);
+    let goal = session_store.active_goal_for_execution_owner(session_id, owner_id);
+    let plan = session_store.plan_for_execution_observer(session_id, owner_id);
     if goal.is_none() && plan.is_none() {
         return None;
     }
@@ -708,12 +712,35 @@ pub fn run_session_turn_execution(
     runtime: SessionTurnExecutionRuntime<'_>,
 ) -> Result<SessionTurnExecutionOutput, SessionTurnExecutionError> {
     let plan_store = runtime.plan_store;
+    let session_store = runtime.session_store;
     let session_id = runtime.request.session_id.clone();
+    let turn_id = runtime.request.turn_id.clone();
     let workspace_id = runtime.request.workspace_id.clone();
     let event_bus = runtime.event_bus;
     let result = run_session_turn_execution_inner(runtime);
     if result.is_err() {
-        match plan_store.pause() {
+        let owns_active_plan = session_store
+            .active_plan_for_execution_owner(&session_id, &turn_id)
+            .is_some();
+        let stopped_goal = session_store
+            .active_goal_for_execution_owner(&session_id, &turn_id)
+            .map(|goal| {
+                session_store.stop_goal_for_runtime_failure(
+                    &session_id,
+                    &goal.goal_id,
+                    None,
+                    &turn_id,
+                    "session_turn_failed",
+                )
+            })
+            .transpose();
+        let plan_result = match stopped_goal {
+            Ok(Some(_)) => Ok(session_store.plan(&session_id)),
+            Ok(None) if owns_active_plan => plan_store.pause(),
+            Ok(None) => Ok(None),
+            Err(error) => Err(magi_plan::PlanUpdateError::Store(error.to_string())),
+        };
+        match plan_result {
             Ok(Some(plan)) => magi_plan::publish_plan_event(
                 event_bus,
                 magi_plan::plan_event_type(&plan),
@@ -726,7 +753,7 @@ pub fn run_session_turn_execution(
             Err(error) => tracing::warn!(
                 session_id = %session_id,
                 %error,
-                "对话轮次失败后暂停计划失败"
+                "对话轮次失败后停止 Goal/Plan 失败"
             ),
         }
     }
@@ -1201,7 +1228,11 @@ fn run_session_turn_execution_inner(
                 round = round.saturating_add(1);
                 continue;
             }
-            if plan_store.requires_execution_follow_up() {
+            if session_store
+                .active_plan_for_execution_owner(&request.session_id, &request.turn_id)
+                .is_some()
+                && plan_store.requires_execution_follow_up()
+            {
                 messages.push(ChatMessage {
                     role: "assistant".to_string(),
                     content: Some(content),
@@ -1735,7 +1766,9 @@ fn stream_session_turn_round(
         round,
         completed_required_tool_names,
     );
-    let round_started_at = UtcMillis::now();
+    let round_goal_id = session_store
+        .active_goal_for_execution_owner(&request.session_id, &request.turn_id)
+        .map(|goal| goal.goal_id);
     let on_retry = |retry_event: &magi_bridge_client::ModelRetryRuntimeEvent| {
         publish_model_retry_runtime_event(
             event_bus,
@@ -2008,14 +2041,11 @@ fn stream_session_turn_round(
             },
         },
     );
-    account_active_goal_turn(
+    account_active_goal_usage(
         session_store,
         &request.session_id,
+        round_goal_id.as_ref(),
         parsed.usage.as_ref(),
-        UtcMillis::now()
-            .0
-            .saturating_sub(round_started_at.0)
-            .saturating_div(1000),
     );
     let timeline_entry_id = None;
     if writeback_aborted.get() || !request_turn_is_writable(session_store, request) {
@@ -2942,6 +2972,8 @@ mod tests {
                     .update(magi_plan::UpdatePlanInput {
                         plan_id: Some(current.plan_id.to_string()),
                         expected_revision: Some(current.revision),
+                        expected_goal_id: None,
+                        expected_goal_control_revision: None,
                         language: current.language,
                         explanation: None,
                         plan: current
@@ -3142,6 +3174,8 @@ mod tests {
             .update(magi_plan::UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![magi_plan::UpdatePlanItemInput {
@@ -3211,6 +3245,151 @@ mod tests {
                     .is_some_and(|content| content.contains("当前执行计划仍未完成"))
         }));
         assert!(!plan_store.requires_execution_follow_up());
+    }
+
+    #[test]
+    fn ordinary_turn_does_not_consume_waiting_goal_plan() {
+        let session_id = SessionId::new("session-waiting-goal-plan-isolation");
+        let goal_turn_id = "turn-goal-owner".to_string();
+        let ordinary_turn_id = "turn-ordinary-diversion".to_string();
+        let store = Arc::new(SessionStore::new());
+        store
+            .create_session(session_id.clone(), "waiting goal plan isolation")
+            .expect("session should be creatable");
+        let (_mission_id, orchestrator_thread_id) =
+            store.ensure_session_mission(&session_id, ts(900), || {
+                magi_core::MissionId::new("mission-waiting-goal-plan-isolation")
+            });
+        let goal = store
+            .create_goal(
+                session_id.clone(),
+                orchestrator_thread_id.clone(),
+                goal_turn_id,
+                "验证普通 Turn 不接管等待中的 Goal",
+                AccessProfile::Restricted,
+                None,
+            )
+            .expect("goal should create");
+        let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
+        let plan = plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                expected_goal_id: Some(goal.goal_id.to_string()),
+                expected_goal_control_revision: Some(goal.control_revision),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("goal-step".to_string()),
+                    step: "继续 Goal".to_string(),
+                    status: magi_core::PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("goal plan should create");
+        let paused = store
+            .pause_goal_with_plan(
+                &session_id,
+                &goal.goal_id,
+                goal.control_revision,
+                Some(plan.revision),
+            )
+            .expect("goal should pause")
+            .0;
+        let paused_plan = store.plan(&session_id).expect("paused plan should exist");
+        store
+            .resume_goal_with_plan(
+                &session_id,
+                &goal.goal_id,
+                paused.control_revision,
+                Some(paused_plan.revision),
+                None,
+                None,
+            )
+            .expect("goal resume request should wait for an owner");
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: ordinary_turn_id.clone(),
+                    turn_seq: 2,
+                    accepted_at: ts(1_000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("执行普通任务".to_string()),
+                    items: vec![session_turn_item(
+                        "user_message",
+                        "completed",
+                        None,
+                        Some("执行普通任务".to_string()),
+                        Some("user-ordinary-diversion".to_string()),
+                        orchestrator_thread_id,
+                    )],
+                },
+            )
+            .expect("ordinary turn should be stored");
+        let registry = ConversationRegistry::new();
+        registry
+            .begin_session_turn_input(session_id.clone(), ordinary_turn_id.clone())
+            .expect("ordinary turn input should begin");
+        let client = PlanFollowUpModelBridgeClient {
+            plan_store: plan_store.clone(),
+            calls: AtomicUsize::new(0),
+            requests: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let output = run_session_turn_execution(SessionTurnExecutionRuntime {
+            client: &client,
+            event_bus: &InMemoryEventBus::new(16),
+            session_store: store.as_ref(),
+            conversation_registry: &registry,
+            plan_store: &plan_store,
+            settings_store: None,
+            safety_gate: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            snapshot_manager: None,
+            request: SessionTurnExecutionRequest {
+                session_id,
+                turn_id: ordinary_turn_id,
+                workspace_id: None,
+                prompt: "执行普通任务".to_string(),
+                images: Vec::new(),
+                context_references: Vec::new(),
+                use_tools: false,
+                access_profile: AccessProfile::Restricted,
+                skill_name: None,
+                request_id: None,
+                user_message_id: None,
+                placeholder_message_id: None,
+                forced_tool_name: None,
+                required_tool_chain: Vec::new(),
+                goal_turn_mode: SessionGoalTurnMode::None,
+                product_locale: "zh-CN".to_string(),
+                workspace_root_path: None,
+            },
+            prompt: "执行普通任务".to_string(),
+            knowledge_context_prompt: None,
+            tools: None,
+            persist_session_state: None,
+            live_settings_store: None,
+        })
+        .expect("ordinary turn should complete independently");
+
+        assert_eq!(output.final_content, "继续推进当前计划");
+        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+        assert!(plan_store.requires_execution_follow_up());
+        let requests = client.requests.lock().expect("request log lock");
+        let messages = requests[0]
+            .messages
+            .as_ref()
+            .expect("ordinary request should include messages");
+        assert!(!messages.iter().any(|message| {
+            message.content.as_deref().is_some_and(|content| {
+                content.contains("当前持久化执行状态") || content.contains("当前执行计划仍未完成")
+            })
+        }));
     }
 
     impl ModelBridgeClient for StreamingThenFailingModelBridgeClient {
@@ -3425,6 +3604,8 @@ mod tests {
             .update(magi_plan::UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![magi_plan::UpdatePlanItemInput {
@@ -3535,6 +3716,8 @@ mod tests {
             .update(magi_plan::UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![magi_plan::UpdatePlanItemInput {

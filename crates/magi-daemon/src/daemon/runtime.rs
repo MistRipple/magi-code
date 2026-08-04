@@ -1683,7 +1683,10 @@ impl DaemonRuntime {
     }
 
     fn reconcile_stale_session_task_chains(&self, task_store: &TaskStore) -> usize {
+        let orphan_task_count =
+            fail_orphan_session_root_tasks(self.session_store.as_ref(), task_store);
         let interrupted_task_count = self.fail_interrupted_session_task_chains(task_store);
+        let reconciled_task_count = orphan_task_count.saturating_add(interrupted_task_count);
         let stale_sidecars = self
             .session_store
             .runtime_sidecars()
@@ -1705,16 +1708,16 @@ impl DaemonRuntime {
             // 即便没有 stale chain，也要扫一遍 chain 缺失但 current_turn 非终态的 sidecar，
             // 防止 daemon 重启后这些孤立轮次让前端误判会话仍在执行。
             self.cancel_orphan_non_terminal_current_turns();
-            if interrupted_task_count > 0 {
+            if reconciled_task_count > 0 {
                 self.flush_reconciled_runtime_sidecars(
                     "收敛重启遗留的 session task chain 后持久化 sidecar 失败",
                 );
                 warn!(
-                    interrupted_task_count,
-                    "已将 daemon 重启遗留的执行中任务收口为可恢复状态"
+                    orphan_task_count,
+                    interrupted_task_count, "已将 daemon 重启遗留的执行中任务收口为可恢复状态"
                 );
             }
-            return interrupted_task_count;
+            return reconciled_task_count;
         }
 
         let stale_count = stale_sidecars.len();
@@ -1758,9 +1761,11 @@ impl DaemonRuntime {
         self.flush_reconciled_runtime_sidecars("清理失效 session task chain 后持久化 sidecar 失败");
         warn!(
             stale_count,
-            interrupted_task_count, "已清理指向缺失 root task 的 session task chain"
+            orphan_task_count,
+            interrupted_task_count,
+            "已清理指向缺失 root task 的 session task chain"
         );
-        interrupted_task_count
+        reconciled_task_count
     }
 
     fn fail_interrupted_session_task_chains(&self, task_store: &TaskStore) -> usize {
@@ -2060,6 +2065,50 @@ impl DaemonRuntime {
     }
 }
 
+fn fail_orphan_session_root_tasks(session_store: &SessionStore, task_store: &TaskStore) -> usize {
+    let active_root_task_ids = session_store
+        .runtime_sidecars()
+        .into_iter()
+        .filter_map(|sidecar| {
+            sidecar
+                .active_execution_chain
+                .map(|chain| chain.root_task_id)
+        })
+        .collect::<HashSet<_>>();
+    let session_task_ids = session_store
+        .session_index()
+        .into_iter()
+        .flat_map(|session_id| session_store.execution_task_ids_for_session(&session_id))
+        .collect::<HashSet<_>>();
+    let orphan_task_ids = task_store
+        .all_tasks()
+        .into_iter()
+        .filter(|task| {
+            task.parent_task_id.is_none()
+                && task.root_task_id == task.task_id
+                && matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+                && session_task_ids.contains(&task.task_id)
+                && !active_root_task_ids.contains(&task.task_id)
+        })
+        .map(|task| task.task_id)
+        .collect::<Vec<_>>();
+
+    let mut failed_count = 0usize;
+    for task_id in orphan_task_ids {
+        task_store.set_output_refs(
+            &task_id,
+            vec!["daemon 重启时检测到任务未绑定 execution chain，已终止孤立执行状态".to_string()],
+        );
+        if task_store
+            .update_status(&task_id, TaskStatus::Failed)
+            .is_ok()
+        {
+            failed_count += 1;
+        }
+    }
+    failed_count
+}
+
 fn settle_task_execution_threads(
     session_store: &SessionStore,
     task_id: &magi_core::TaskId,
@@ -2225,8 +2274,8 @@ fn task_matches_runtime_sidecar(sidecar: &SessionRuntimeSidecar, task: &magi_cor
 mod tests {
     use super::{
         DaemonRuntime, SettingsBackedMcpBridgeClient, build_agent_role_catalog_provider,
-        external_mcp_server_catalog_entry, publish_task_status_changed_event,
-        reconcile_terminal_task_execution_threads,
+        external_mcp_server_catalog_entry, fail_orphan_session_root_tasks,
+        publish_task_status_changed_event, reconcile_terminal_task_execution_threads,
     };
     use crate::daemon::{config::DaemonConfig, persistence::StateRepository};
     use axum::{
@@ -2713,6 +2762,91 @@ done
         assert_eq!(
             status("thread-terminal-running"),
             magi_session_store::ExecutionThreadStatus::Active
+        );
+    }
+
+    #[test]
+    fn daemon_restore_fails_only_session_owned_root_tasks_without_execution_chain() {
+        let session_store = Arc::new(SessionStore::new());
+        let session_store_for_status = Arc::clone(&session_store);
+        let task_store =
+            TaskStore::with_status_change_callback(Box::new(move |task_id, _, new_status, _| {
+                if matches!(
+                    new_status,
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed
+                ) {
+                    session_store_for_status.mark_task_threads_idle(task_id, UtcMillis::now());
+                }
+            }));
+        let session_id = SessionId::new("session-orphan-root-reconcile");
+        let mission_id = MissionId::new("mission-orphan-root-reconcile");
+        let orphan_task_id = TaskId::new("task-orphan-root-reconcile");
+        let unrelated_task_id = TaskId::new("task-unrelated-root-reconcile");
+        let now = UtcMillis(5_000);
+
+        session_store
+            .create_session(session_id.clone(), "orphan root reconcile")
+            .expect("session should be created");
+        session_store.register_thread(magi_session_store::ExecutionThread {
+            thread_id: ThreadId::new("thread-orphan-root-reconcile"),
+            session_id,
+            mission_id: mission_id.clone(),
+            role_id: "coordinator".to_string(),
+            worker_instance_id: WorkerId::new("worker-orphan-root-reconcile"),
+            status: magi_session_store::ExecutionThreadStatus::Active,
+            created_at: now,
+            last_used_at: now,
+            observed_context_window_tokens: None,
+            handled_task_ids: vec![orphan_task_id.clone()],
+            message_history: Vec::new(),
+        });
+        let mut orphan_task = spawn_graph_restore_task(
+            orphan_task_id.as_str(),
+            orphan_task_id.as_str(),
+            None,
+            TaskStatus::Pending,
+            now.0,
+        );
+        orphan_task.mission_id = mission_id.clone();
+        task_store.insert_task(orphan_task);
+        let mut unrelated_task = spawn_graph_restore_task(
+            unrelated_task_id.as_str(),
+            unrelated_task_id.as_str(),
+            None,
+            TaskStatus::Pending,
+            now.0,
+        );
+        unrelated_task.mission_id = mission_id;
+        task_store.insert_task(unrelated_task);
+
+        assert_eq!(
+            fail_orphan_session_root_tasks(session_store.as_ref(), &task_store),
+            1
+        );
+        let orphan_task = task_store
+            .get_task(&orphan_task_id)
+            .expect("orphan task should remain as terminal history");
+        assert_eq!(orphan_task.status, TaskStatus::Failed);
+        assert!(
+            orphan_task
+                .output_refs
+                .iter()
+                .any(|output| output.contains("未绑定 execution chain"))
+        );
+        assert_eq!(
+            task_store
+                .get_task(&unrelated_task_id)
+                .expect("unrelated task should remain")
+                .status,
+            TaskStatus::Pending,
+            "没有会话归属的任务不能被 session 恢复逻辑处理",
+        );
+        assert_eq!(
+            session_store
+                .thread_registry_snapshot(&SessionId::new("session-orphan-root-reconcile"))[0]
+                .status,
+            magi_session_store::ExecutionThreadStatus::Idle,
+            "孤立任务进入终态时必须同步收口对应 thread",
         );
     }
 

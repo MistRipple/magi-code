@@ -3,13 +3,15 @@ use crate::models::{
     ActiveExecutionBranchSnapshotUpdate, ActiveExecutionChain, ActiveExecutionTurn,
     ActiveExecutionTurnItem, CanonicalToolCall, CanonicalTurn, CanonicalTurnItem,
     CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus, CanonicalTurnVisibility,
-    CanonicalWorkerRef, ExecutionThread, ExecutionThreadStatus, SessionExecutionSidecarStatus,
-    SessionExecutionSidecarStoreState, SessionRuntimeSidecar, SessionSidecarFlushReason,
-    SessionStoreState, ThreadChatMessage, ThreadContextCheckpoint, ThreadVisibility, TimelineEntry,
+    CanonicalWorkerRef, ExecutionThread, ExecutionThreadStatus, GoalContinuationPhase,
+    GoalContinuationState, GoalStatus, InterruptedGoalResumeCheckpoint,
+    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionPlan,
+    SessionRuntimeSidecar, SessionSidecarFlushReason, SessionStoreState, ThreadChatMessage,
+    ThreadContextCheckpoint, ThreadVisibility, TimelineEntry,
 };
 use magi_core::{
-    DomainError, DomainResult, ExecutionOwnership, MissionId, RecoveryResumeInput, SessionId,
-    TaskExecutionTarget, TaskId, ThreadId, UtcMillis, WorkerId,
+    DomainError, DomainResult, ExecutionOwnership, GoalId, MissionId, PlanState,
+    RecoveryResumeInput, SessionId, TaskExecutionTarget, TaskId, ThreadId, UtcMillis, WorkerId,
 };
 use magi_tool_runtime::BuiltinToolName;
 use serde_json::Value;
@@ -28,6 +30,12 @@ const TURN_REPLACES_TURN_ID_METADATA_KEY: &str = "replacesTurnId";
 const TURN_SUPERSEDED_AT_METADATA_KEY: &str = "supersededAt";
 const TURN_SUPERSEDED_REASON_METADATA_KEY: &str = "supersededReason";
 const TURN_SUPERSEDED_BY_TURN_ID_METADATA_KEY: &str = "supersededByTurnId";
+const TURN_GOAL_ID_METADATA_KEY: &str = "goalId";
+const TURN_RESPONSE_DURATION_SCOPE_METADATA_KEY: &str = "responseDurationScope";
+const TURN_RESPONSE_DURATION_SCOPE_GOAL_PROGRESS: &str = "goal_progress";
+const GOAL_CONTINUATION_USER_INTERRUPTED: &str = "user_interrupted";
+const GOAL_CONTINUATION_DAEMON_RESTART_INTERRUPTED: &str = "daemon_restart_interrupted";
+const GOAL_CONTINUATION_TURN_TERMINAL: &str = "goal_continuation_turn_terminal";
 
 fn inherit_current_turn_aliases(turn: &ActiveExecutionTurn, item: &mut ActiveExecutionTurnItem) {
     let Some(alias_source) = turn.items.iter().find(|existing| {
@@ -219,6 +227,17 @@ fn current_turn_item_to_canonical_worker(
 
 fn current_turn_item_metadata(item: &ActiveExecutionTurnItem) -> HashMap<String, Value> {
     let mut metadata = item.metadata.clone();
+    if let Some(output_kind) = match item.kind.as_str() {
+        "assistant_stream" => Some("progress"),
+        "assistant_final" => Some("final"),
+        "assistant_error" => Some("error"),
+        _ => None,
+    } {
+        metadata.insert(
+            "assistantOutputKind".to_string(),
+            Value::String(output_kind.to_string()),
+        );
+    }
     if let Some(value) = item
         .request_id
         .as_ref()
@@ -362,6 +381,7 @@ fn upsert_canonical_turn_in_state(
     turn: &ActiveExecutionTurn,
 ) -> DomainResult<()> {
     let mut incoming = current_turn_to_canonical_turn(session_id, turn)?;
+    apply_goal_response_duration_scope(state, &mut incoming);
     incoming.normalize();
     if let Some(existing) = state
         .canonical_turns
@@ -387,7 +407,306 @@ fn upsert_canonical_turn_in_state(
             .cmp(&right.turn_seq)
             .then_with(|| left.turn_id.cmp(&right.turn_id))
     });
+    reconcile_goal_time_used(state);
     Ok(())
+}
+
+fn turn_matches_owner_id(turn: &CanonicalTurn, owner_id: &str) -> bool {
+    turn.turn_id == owner_id
+        || turn.items.iter().any(|item| {
+            item.worker
+                .as_ref()
+                .and_then(|worker| worker.task_id.as_ref())
+                .is_some_and(|task_id| task_id.as_str() == owner_id)
+        })
+}
+
+fn goal_owns_turn(
+    state: &SessionStoreState,
+    goal: &crate::models::SessionGoal,
+    turn: &CanonicalTurn,
+) -> bool {
+    turn.metadata
+        .get(TURN_GOAL_ID_METADATA_KEY)
+        .and_then(Value::as_str)
+        .is_some_and(|goal_id| goal_id == goal.goal_id.as_str())
+        || [
+            goal.created_by_turn_id.as_deref(),
+            goal.continuation.turn_id.as_deref(),
+            goal.completion
+                .as_ref()
+                .map(|completion| completion.turn_id.as_str()),
+            goal.blocker
+                .as_ref()
+                .map(|blocker| blocker.last_observed_turn_id.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|owner_id| turn_matches_owner_id(turn, owner_id))
+        || state.plans.iter().any(|plan| {
+            plan.session_id == turn.session_id
+                && plan.goal_id.as_ref() == Some(&goal.goal_id)
+                && plan
+                    .task_bindings
+                    .keys()
+                    .any(|task_id| turn_matches_owner_id(turn, task_id.as_str()))
+        })
+}
+
+fn goal_owns_execution_chain(
+    state: &SessionStoreState,
+    goal: &crate::models::SessionGoal,
+    turn: &CanonicalTurn,
+    chain: &ActiveExecutionChain,
+) -> bool {
+    goal_owns_turn(state, goal, turn)
+        || [
+            goal.created_by_turn_id.as_deref(),
+            goal.continuation.turn_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|owner_id| owner_id == chain.root_task_id.as_str())
+        || state.plans.iter().any(|plan| {
+            plan.session_id == turn.session_id
+                && plan.goal_id.as_ref() == Some(&goal.goal_id)
+                && (plan.task_bindings.contains_key(&chain.root_task_id)
+                    || chain
+                        .branches
+                        .iter()
+                        .any(|branch| plan.task_bindings.contains_key(&branch.task_id)))
+        })
+}
+
+fn goal_owns_execution_owner(
+    state: &SessionStoreState,
+    goal: &crate::models::SessionGoal,
+    owner_id: &str,
+) -> bool {
+    match goal.continuation.phase {
+        GoalContinuationPhase::Waiting => false,
+        GoalContinuationPhase::Running => {
+            goal.continuation.turn_id.as_deref() == Some(owner_id)
+                || state.canonical_turns.iter().any(|turn| {
+                    turn.session_id == goal.session_id
+                        && turn_matches_owner_id(turn, owner_id)
+                        && turn
+                            .metadata
+                            .get(TURN_GOAL_ID_METADATA_KEY)
+                            .and_then(Value::as_str)
+                            .is_some_and(|goal_id| goal_id == goal.goal_id.as_str())
+                })
+        }
+        GoalContinuationPhase::Idle => {
+            goal.created_by_turn_id.as_deref() == Some(owner_id)
+                || state.plans.iter().any(|plan| {
+                    plan.session_id == goal.session_id
+                        && plan.goal_id.as_ref() == Some(&goal.goal_id)
+                        && plan
+                            .task_bindings
+                            .keys()
+                            .any(|task_id| task_id.as_str() == owner_id)
+                })
+                || state.canonical_turns.iter().any(|turn| {
+                    turn.session_id == goal.session_id
+                        && turn_matches_owner_id(turn, owner_id)
+                        && goal_owns_turn(state, goal, turn)
+                })
+        }
+    }
+}
+
+impl SessionStore {
+    /// 返回当前执行允许观察的计划快照。
+    ///
+    /// 普通计划即使暂停仍可作为上下文展示；Goal 计划则必须同时满足 Goal active
+    /// 且当前执行拥有该 Goal，避免暂停、等待或其他普通 Turn 读取到 Goal 指令。
+    pub fn plan_for_execution_observer(
+        &self,
+        session_id: &SessionId,
+        owner_id: &str,
+    ) -> Option<SessionPlan> {
+        let state = self.state.read().expect("session state read lock poisoned");
+        let plan = state
+            .plans
+            .iter()
+            .find(|plan| &plan.session_id == session_id)?;
+        let Some(goal_id) = plan.goal_id.as_ref() else {
+            return Some(plan.clone());
+        };
+        state
+            .goals
+            .iter()
+            .find(|goal| {
+                &goal.session_id == session_id
+                    && &goal.goal_id == goal_id
+                    && goal.status == GoalStatus::Active
+                    && goal_owns_execution_owner(&state, goal, owner_id)
+            })
+            .map(|_| plan.clone())
+    }
+
+    /// 返回当前执行实际拥有的 active plan。
+    ///
+    /// 无 Goal 的普通计划仍由主线执行消费；绑定 Goal 的计划只能由创建该 Goal
+    /// 的 Turn、已认领的 continuation Turn 或其明确绑定的任务消费。这样同一会话
+    /// 中插入的普通 Turn 不会读取 Goal 计划，也不会被计划 follow-up 劫持。
+    pub fn active_plan_for_execution_owner(
+        &self,
+        session_id: &SessionId,
+        owner_id: &str,
+    ) -> Option<SessionPlan> {
+        self.plan_for_execution_observer(session_id, owner_id)
+            .filter(|plan| plan.state == PlanState::Active)
+    }
+
+    pub fn active_goal_for_execution_owner(
+        &self,
+        session_id: &SessionId,
+        owner_id: &str,
+    ) -> Option<crate::models::SessionGoal> {
+        let state = self.state.read().expect("session state read lock poisoned");
+        state
+            .goals
+            .iter()
+            .find(|goal| {
+                &goal.session_id == session_id
+                    && goal.status == GoalStatus::Active
+                    && goal_owns_execution_owner(&state, goal, owner_id)
+            })
+            .cloned()
+    }
+}
+
+fn bind_canonical_turn_to_goal_in_state(
+    state: &mut SessionStoreState,
+    session_id: &SessionId,
+    turn_id: &str,
+    goal_id: &GoalId,
+) {
+    if let Some(turn) = state
+        .canonical_turns
+        .iter_mut()
+        .find(|turn| turn.session_id == *session_id && turn.turn_id == turn_id)
+    {
+        turn.metadata.insert(
+            TURN_GOAL_ID_METADATA_KEY.to_string(),
+            Value::String(goal_id.to_string()),
+        );
+    }
+    reconcile_goal_time_used(state);
+}
+
+fn is_goal_response_boundary(goal: &crate::models::SessionGoal, turn: &CanonicalTurn) -> bool {
+    match goal.status {
+        GoalStatus::Complete => goal
+            .completion
+            .as_ref()
+            .is_some_and(|completion| turn_matches_owner_id(turn, &completion.turn_id)),
+        GoalStatus::Blocked => goal
+            .blocker
+            .as_ref()
+            .is_some_and(|blocker| turn_matches_owner_id(turn, &blocker.last_observed_turn_id)),
+        GoalStatus::Active
+        | GoalStatus::Paused
+        | GoalStatus::UsageLimited
+        | GoalStatus::BudgetLimited => false,
+    }
+}
+
+fn apply_goal_response_duration_scope(state: &SessionStoreState, turn: &mut CanonicalTurn) {
+    let owning_goal = state
+        .goals
+        .iter()
+        .find(|goal| goal.session_id == turn.session_id && goal_owns_turn(state, goal, turn));
+    let Some(goal) = owning_goal else {
+        return;
+    };
+    turn.metadata.insert(
+        TURN_GOAL_ID_METADATA_KEY.to_string(),
+        Value::String(goal.goal_id.to_string()),
+    );
+    turn.metadata
+        .remove(TURN_RESPONSE_DURATION_SCOPE_METADATA_KEY);
+    if turn.status.is_terminal() && !is_goal_response_boundary(goal, turn) {
+        turn.metadata.insert(
+            TURN_RESPONSE_DURATION_SCOPE_METADATA_KEY.to_string(),
+            Value::String(TURN_RESPONSE_DURATION_SCOPE_GOAL_PROGRESS.to_string()),
+        );
+    }
+}
+
+pub(super) fn reconcile_goal_time_used(state: &mut SessionStoreState) {
+    let timing_by_goal = state
+        .goals
+        .iter()
+        .map(|goal| {
+            let elapsed_millis = state
+                .canonical_turns
+                .iter()
+                .filter(|turn| {
+                    turn.status != CanonicalTurnStatus::Superseded
+                        && turn.completed_at.is_some()
+                        && goal_owns_turn(state, goal, turn)
+                })
+                .filter_map(|turn| {
+                    turn.completed_at
+                        .map(|completed_at| completed_at.0.saturating_sub(turn.accepted_at.0))
+                })
+                .fold(0_u64, u64::saturating_add);
+            let running_turn = match (goal.status, &goal.continuation.phase) {
+                (GoalStatus::Active, GoalContinuationPhase::Waiting) => None,
+                (GoalStatus::Active, _) => state
+                    .canonical_turns
+                    .iter()
+                    .filter(|turn| {
+                        turn.status != CanonicalTurnStatus::Superseded
+                            && turn.completed_at.is_none()
+                            && goal_owns_turn(state, goal, turn)
+                    })
+                    .max_by_key(|turn| (turn.accepted_at, turn.turn_seq)),
+                (GoalStatus::Complete, _) => goal.completion.as_ref().and_then(|completion| {
+                    state.canonical_turns.iter().find(|turn| {
+                        turn.status != CanonicalTurnStatus::Superseded
+                            && turn.completed_at.is_none()
+                            && turn_matches_owner_id(turn, &completion.turn_id)
+                            && goal_owns_turn(state, goal, turn)
+                    })
+                }),
+                (GoalStatus::Paused, _)
+                | (GoalStatus::Blocked, _)
+                | (GoalStatus::UsageLimited, _)
+                | (GoalStatus::BudgetLimited, _) => None,
+            };
+            (
+                goal.goal_id.clone(),
+                (
+                    elapsed_millis,
+                    running_turn.map(|turn| (turn.accepted_at, turn.turn_id.clone())),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    for goal in &mut state.goals {
+        let (elapsed_millis, running_turn) = timing_by_goal
+            .get(&goal.goal_id)
+            .cloned()
+            .unwrap_or_default();
+        goal.time_used_millis = elapsed_millis;
+        goal.time_used_seconds = elapsed_millis.saturating_div(1000);
+        goal.timing_started_at = running_turn.as_ref().map(|(started_at, _)| *started_at);
+        goal.timing_turn_id = running_turn.map(|(_, turn_id)| turn_id);
+    }
+}
+
+pub(super) fn reconcile_goal_response_duration_scopes(state: &mut SessionStoreState) {
+    let mut canonical_turns = std::mem::take(&mut state.canonical_turns);
+    for turn in &mut canonical_turns {
+        apply_goal_response_duration_scope(state, turn);
+    }
+    state.canonical_turns = canonical_turns;
+    reconcile_goal_time_used(state);
 }
 
 fn replace_canonical_turn_in_state(
@@ -396,6 +715,7 @@ fn replace_canonical_turn_in_state(
     turn: &ActiveExecutionTurn,
 ) -> DomainResult<()> {
     let mut incoming = current_turn_to_canonical_turn(session_id, turn)?;
+    apply_goal_response_duration_scope(state, &mut incoming);
     incoming.normalize();
     if let Some(existing) = state
         .canonical_turns
@@ -411,6 +731,7 @@ fn replace_canonical_turn_in_state(
             .cmp(&right.turn_seq)
             .then_with(|| left.turn_id.cmp(&right.turn_id))
     });
+    reconcile_goal_time_used(state);
     Ok(())
 }
 
@@ -520,6 +841,36 @@ fn durable_terminal_turn_should_win(
     })
 }
 
+fn reconcile_assistant_output_kinds_from_sidecar(
+    state: &mut SessionStoreState,
+    session_id: &SessionId,
+    turn: &ActiveExecutionTurn,
+) -> DomainResult<()> {
+    let source = current_turn_to_canonical_turn(session_id, turn)?;
+    let Some(existing) = state
+        .canonical_turns
+        .iter_mut()
+        .find(|candidate| candidate.session_id == *session_id && candidate.turn_id == turn.turn_id)
+    else {
+        return Ok(());
+    };
+    for source_item in source.items {
+        let Some(output_kind) = source_item.metadata.get("assistantOutputKind").cloned() else {
+            continue;
+        };
+        if let Some(existing_item) = existing
+            .items
+            .iter_mut()
+            .find(|candidate| candidate.item_id == source_item.item_id)
+        {
+            existing_item
+                .metadata
+                .insert("assistantOutputKind".to_string(), output_kind);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn restore_canonical_turns_from_sidecars(
     state: &mut SessionStoreState,
 ) -> DomainResult<()> {
@@ -543,11 +894,97 @@ pub(super) fn restore_canonical_turns_from_sidecars(
 
     for (session_id, turn) in turns {
         if durable_terminal_turn_should_win(state, &session_id, &turn) {
+            reconcile_assistant_output_kinds_from_sidecar(state, &session_id, &turn)?;
             continue;
         }
         upsert_canonical_turn_in_state(state, &session_id, &turn)?;
     }
     Ok(())
+}
+
+pub(super) fn reconcile_terminal_goal_continuations(state: &mut SessionStoreState) {
+    for goal in &mut state.goals {
+        if goal.status != GoalStatus::Active
+            || goal.continuation.phase != GoalContinuationPhase::Running
+        {
+            continue;
+        }
+        let Some(sidecar) = state
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .find(|sidecar| sidecar.session_id == goal.session_id)
+        else {
+            continue;
+        };
+        let Some(turn) = sidecar.current_turn.as_ref().or_else(|| {
+            sidecar
+                .active_execution_chain
+                .as_ref()
+                .and_then(|chain| chain.current_turn.as_ref())
+        }) else {
+            continue;
+        };
+        let owner_matches = [
+            goal.continuation.turn_id.as_deref(),
+            goal.created_by_turn_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|owner_turn_id| {
+            turn.turn_id == owner_turn_id
+                || turn.items.iter().any(|item| {
+                    item.task_id
+                        .as_ref()
+                        .is_some_and(|id| id.as_str() == owner_turn_id)
+                })
+                || sidecar
+                    .active_execution_chain
+                    .as_ref()
+                    .is_some_and(|chain| chain.root_task_id.as_str() == owner_turn_id)
+        });
+        if !owner_matches {
+            continue;
+        }
+        if !current_turn_status_is_terminal(&turn.status) {
+            continue;
+        }
+        let reason = match turn.status.trim().to_ascii_lowercase().as_str() {
+            "cancelled" | "canceled" => GOAL_CONTINUATION_USER_INTERRUPTED,
+            "interrupted" => GOAL_CONTINUATION_DAEMON_RESTART_INTERRUPTED,
+            _ => GOAL_CONTINUATION_TURN_TERMINAL,
+        };
+        goal.continuation = GoalContinuationState {
+            phase: GoalContinuationPhase::Waiting,
+            turn_id: None,
+            reason: Some(reason.to_string()),
+        };
+        goal.updated_at = turn.completed_at.unwrap_or(sidecar.updated_at);
+    }
+}
+
+fn release_running_goal_continuation(
+    state: &mut SessionStoreState,
+    session_id: &SessionId,
+    continuation_turn_id: &str,
+    reason: &str,
+    updated_at: UtcMillis,
+) {
+    let Some(goal) = state.goals.iter_mut().find(|goal| {
+        &goal.session_id == session_id
+            && goal.status == GoalStatus::Active
+            && goal.continuation.phase == GoalContinuationPhase::Running
+            && (goal.continuation.turn_id.as_deref() == Some(continuation_turn_id)
+                || goal.created_by_turn_id.as_deref() == Some(continuation_turn_id))
+    }) else {
+        return;
+    };
+    goal.continuation = GoalContinuationState {
+        phase: GoalContinuationPhase::Waiting,
+        turn_id: None,
+        reason: Some(reason.to_string()),
+    };
+    goal.updated_at = updated_at;
 }
 
 fn reject_changed_current_turn_item_field(
@@ -1494,12 +1931,43 @@ impl SessionStore {
         timeline_entry: TimelineEntryInput,
         active_execution_chain: ActiveExecutionChain,
     ) -> DomainResult<(String, SessionRuntimeSidecar)> {
+        self.accept_active_execution_chain_with_timeline_entry_inner(
+            session_id,
+            timeline_entry,
+            active_execution_chain,
+            None,
+        )
+    }
+
+    pub fn accept_goal_continuation_with_timeline_entry(
+        &self,
+        session_id: SessionId,
+        goal_id: &GoalId,
+        timeline_entry: TimelineEntryInput,
+        active_execution_chain: ActiveExecutionChain,
+    ) -> DomainResult<(String, SessionRuntimeSidecar)> {
+        self.accept_active_execution_chain_with_timeline_entry_inner(
+            session_id,
+            timeline_entry,
+            active_execution_chain,
+            Some(goal_id),
+        )
+    }
+
+    fn accept_active_execution_chain_with_timeline_entry_inner(
+        &self,
+        session_id: SessionId,
+        timeline_entry: TimelineEntryInput,
+        active_execution_chain: ActiveExecutionChain,
+        continuation_goal_id: Option<&GoalId>,
+    ) -> DomainResult<(String, SessionRuntimeSidecar)> {
         let TimelineEntryInput {
             entry_id,
             kind,
             message,
             occurred_at,
         } = timeline_entry;
+        let continuation_turn_id = active_execution_chain.root_task_id.to_string();
         let mut state = self
             .state
             .write()
@@ -1510,6 +1978,28 @@ impl SessionStore {
             .any(|session| session.session_id == session_id)
         {
             return Err(DomainError::NotFound { entity: "session" });
+        }
+        let continuation_goal_index = continuation_goal_id
+            .map(|goal_id| {
+                state
+                    .goals
+                    .iter()
+                    .position(|goal| goal.session_id == session_id && &goal.goal_id == goal_id)
+                    .ok_or(DomainError::NotFound { entity: "goal" })
+            })
+            .transpose()?;
+        if let Some(goal_index) = continuation_goal_index {
+            let goal = &state.goals[goal_index];
+            if goal.status != GoalStatus::Active {
+                return Err(DomainError::InvalidState {
+                    message: "only an active goal can start continuation".to_string(),
+                });
+            }
+            if goal.continuation.phase == GoalContinuationPhase::Running {
+                return Err(DomainError::InvalidState {
+                    message: "goal continuation is already running".to_string(),
+                });
+            }
         }
         let existing = state
             .execution_sidecar_store
@@ -1523,6 +2013,18 @@ impl SessionStore {
             existing,
         )?;
         reject_duplicate_timeline_entry(&state.timeline, &entry_id)?;
+
+        if let Some(turn) = updated.current_turn.as_ref() {
+            upsert_canonical_turn_in_state(&mut state, &session_id, turn)?;
+            if let Some(goal_id) = continuation_goal_id {
+                bind_canonical_turn_to_goal_in_state(
+                    &mut state,
+                    &session_id,
+                    &turn.turn_id,
+                    goal_id,
+                );
+            }
+        }
 
         state.timeline.push(TimelineEntry {
             entry_id: entry_id.clone(),
@@ -1539,10 +2041,16 @@ impl SessionStore {
             session.updated_at = occurred_at;
         }
 
-        if let Some(turn) = updated.current_turn.as_ref() {
-            upsert_canonical_turn_in_state(&mut state, &session_id, turn)?;
-        }
         upsert_runtime_sidecar_in_state(&mut state, updated.clone());
+        if let Some(goal_index) = continuation_goal_index {
+            let goal = &mut state.goals[goal_index];
+            goal.continuation = GoalContinuationState {
+                phase: GoalContinuationPhase::Running,
+                turn_id: Some(continuation_turn_id),
+                reason: None,
+            };
+            goal.updated_at = occurred_at;
+        }
         drop(state);
         self.mark_sidecar_dirty(SessionSidecarFlushReason::UpsertActiveExecutionChain);
         self.sync_session_workspace_binding(
@@ -2408,6 +2916,8 @@ impl SessionStore {
                 }
 
                 let now = UtcMillis::now();
+                let interrupted_at =
+                    UtcMillis(sidecar.updated_at.0.max(turn.accepted_at.0).min(now.0));
                 for item in &mut turn.items {
                     if current_turn_item_status_is_active(&item.status) {
                         item.status = "cancelled".to_string();
@@ -2472,28 +2982,44 @@ impl SessionStore {
                         ),
                         (
                             TURN_INTERRUPTED_AT_METADATA_KEY.to_string(),
-                            Value::from(now.0),
+                            Value::from(interrupted_at.0),
                         ),
                     ]),
                     timeline_entry_id: None,
                     source_thread_id,
                 });
                 turn.status = "interrupted".to_string();
-                turn.completed_at = Some(now);
+                turn.completed_at = Some(interrupted_at);
+                let current_turn_id = turn.turn_id.clone();
                 turn.normalize();
                 if let Some(chain) = sidecar.active_execution_chain.as_mut() {
                     chain.current_turn = sidecar.current_turn.clone();
                     chain.normalize();
                 }
                 sidecar.updated_at = now;
-                Some(sidecar.clone())
+                Some((
+                    sidecar
+                        .active_execution_chain
+                        .as_ref()
+                        .map(|chain| chain.root_task_id.to_string())
+                        .unwrap_or(current_turn_id),
+                    interrupted_at,
+                    sidecar.clone(),
+                ))
             };
-            if let Some(updated) = updated.as_ref()
+            if let Some((continuation_turn_id, updated_at, updated)) = updated.as_ref()
                 && let Some(turn) = updated.current_turn.as_ref()
             {
                 upsert_canonical_turn_in_state(&mut state, session_id, turn)?;
+                release_running_goal_continuation(
+                    &mut state,
+                    session_id,
+                    continuation_turn_id,
+                    GOAL_CONTINUATION_DAEMON_RESTART_INTERRUPTED,
+                    *updated_at,
+                );
             }
-            updated
+            updated.map(|(_, _, sidecar)| sidecar)
         };
         if updated.is_some() {
             self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);
@@ -2503,6 +3029,173 @@ impl SessionStore {
 
     pub fn has_recovery_ready_interruption(&self, session_id: &SessionId) -> bool {
         self.has_interrupted_recovery_with_state(session_id, RECOVERY_STATE_READY)
+    }
+
+    /// 将异常中断执行链关联的 Goal 与 plan 一并恢复，并返回可精确回滚的内存快照。
+    ///
+    /// 归属必须由 canonical `goalId`、Goal owner 或 plan task binding 证明；同一会话里
+    /// 仅仅存在暂停 Goal 不构成关联。预算、用量或 blocker 限制也不会被异常恢复绕过。
+    pub fn resume_goal_for_interrupted_execution(
+        &self,
+        session_id: &SessionId,
+        interrupted_turn_id: &str,
+        resumed_turn_id: &str,
+        now: UtcMillis,
+    ) -> DomainResult<Option<InterruptedGoalResumeCheckpoint>> {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        let sidecar = state
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter()
+            .find(|sidecar| &sidecar.session_id == session_id)
+            .ok_or(DomainError::NotFound {
+                entity: "session_runtime_sidecar",
+            })?;
+        let current_turn =
+            sidecar
+                .current_turn
+                .as_ref()
+                .ok_or_else(|| DomainError::InvalidState {
+                    message: format!("session {session_id} 缺少异常中断轮次"),
+                })?;
+        if current_turn.turn_id != interrupted_turn_id || current_turn.status != "interrupted" {
+            return Err(DomainError::InvalidState {
+                message: format!(
+                    "session {session_id} 的异常中断轮次已变化: {}",
+                    current_turn.turn_id
+                ),
+            });
+        }
+        let recovery_claimed = current_turn.items.iter().any(|item| {
+            item.metadata.get("noticeKind").and_then(Value::as_str)
+                == Some(INTERRUPTION_NOTICE_KIND)
+                && item
+                    .metadata
+                    .get(RECOVERY_STATE_METADATA_KEY)
+                    .and_then(Value::as_str)
+                    == Some(RECOVERY_STATE_CLAIMED)
+        });
+        if !recovery_claimed {
+            return Err(DomainError::InvalidState {
+                message: format!("session {session_id} 尚未领取异常中断恢复权"),
+            });
+        }
+        let chain = sidecar
+            .active_execution_chain
+            .as_ref()
+            .ok_or_else(|| DomainError::InvalidState {
+                message: format!("session {session_id} 没有可恢复的执行链"),
+            })?
+            .clone();
+        let interrupted_turn = state
+            .canonical_turns
+            .iter()
+            .find(|turn| turn.session_id == *session_id && turn.turn_id == interrupted_turn_id)
+            .cloned()
+            .ok_or_else(|| DomainError::InvalidState {
+                message: format!("异常中断 canonical turn 不存在: {interrupted_turn_id}"),
+            })?;
+        let Some(goal_index) = state.goals.iter().position(|goal| {
+            &goal.session_id == session_id
+                && goal.status.is_unfinished()
+                && goal_owns_execution_chain(&state, goal, &interrupted_turn, &chain)
+        }) else {
+            return Ok(None);
+        };
+        let goal_before = state.goals[goal_index].clone();
+        if !matches!(goal_before.status, GoalStatus::Active | GoalStatus::Paused) {
+            return Err(DomainError::InvalidState {
+                message: format!("关联目标当前状态不允许异常恢复: {:?}", goal_before.status),
+            });
+        }
+        let plan_index = state.plans.iter().position(|plan| {
+            &plan.session_id == session_id && plan.goal_id.as_ref() == Some(&goal_before.goal_id)
+        });
+        let plan_before = plan_index.map(|index| state.plans[index].clone());
+        if let Some(plan_index) = plan_index
+            && state.plans[plan_index].state == magi_core::PlanState::Paused
+        {
+            super::goals::activate_paused_plan(&mut state.plans[plan_index], now);
+        }
+        {
+            let goal = &mut state.goals[goal_index];
+            if goal.status == GoalStatus::Paused {
+                goal.status = GoalStatus::Active;
+                goal.control_revision = goal.control_revision.saturating_add(1);
+            }
+            goal.continuation = GoalContinuationState {
+                phase: GoalContinuationPhase::Running,
+                turn_id: Some(resumed_turn_id.to_string()),
+                reason: None,
+            };
+            goal.updated_at = now;
+        }
+        let applied_goal_revision = state.goals[goal_index].control_revision;
+        let applied_plan_revision = plan_index.map(|index| state.plans[index].revision);
+        reconcile_goal_time_used(&mut state);
+        Ok(Some(InterruptedGoalResumeCheckpoint {
+            goal_before,
+            plan_before,
+            applied_goal_revision,
+            applied_plan_revision,
+            resumed_turn_id: resumed_turn_id.to_string(),
+        }))
+    }
+
+    pub fn rollback_interrupted_goal_resume(
+        &self,
+        checkpoint: InterruptedGoalResumeCheckpoint,
+    ) -> DomainResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        let goal_index = state
+            .goals
+            .iter()
+            .position(|goal| goal.goal_id == checkpoint.goal_before.goal_id)
+            .ok_or(DomainError::NotFound { entity: "goal" })?;
+        let current_goal = &state.goals[goal_index];
+        if current_goal.control_revision != checkpoint.applied_goal_revision
+            || current_goal.continuation.phase != GoalContinuationPhase::Running
+            || current_goal.continuation.turn_id.as_deref()
+                != Some(checkpoint.resumed_turn_id.as_str())
+        {
+            return Err(DomainError::InvalidState {
+                message: "异常恢复后的 Goal 已被并发修改，拒绝覆盖回滚".to_string(),
+            });
+        }
+        match checkpoint.plan_before {
+            Some(plan_before) => {
+                let plan_index = state
+                    .plans
+                    .iter()
+                    .position(|plan| plan.plan_id == plan_before.plan_id)
+                    .ok_or(DomainError::NotFound { entity: "plan" })?;
+                if Some(state.plans[plan_index].revision) != checkpoint.applied_plan_revision {
+                    return Err(DomainError::InvalidState {
+                        message: "异常恢复后的 plan 已被并发修改，拒绝覆盖回滚".to_string(),
+                    });
+                }
+                state.plans[plan_index] = plan_before;
+            }
+            None => {
+                if state.plans.iter().any(|plan| {
+                    plan.session_id == checkpoint.goal_before.session_id
+                        && plan.goal_id.as_ref() == Some(&checkpoint.goal_before.goal_id)
+                }) {
+                    return Err(DomainError::InvalidState {
+                        message: "异常恢复后出现新的绑定 plan，拒绝覆盖回滚".to_string(),
+                    });
+                }
+            }
+        }
+        state.goals[goal_index] = checkpoint.goal_before;
+        reconcile_goal_time_used(&mut state);
+        Ok(())
     }
 
     pub fn has_claimed_interrupted_recovery(&self, session_id: &SessionId) -> bool {
@@ -2687,20 +3380,49 @@ impl SessionStore {
                         turn.completed_at = Some(now);
                     }
                 }
+                let current_turn_id = turn.turn_id.clone();
                 turn.normalize();
                 if let Some(chain) = sidecar.active_execution_chain.as_mut() {
                     chain.current_turn = sidecar.current_turn.clone();
                     chain.normalize();
                 }
                 sidecar.updated_at = UtcMillis::now();
-                Some(sidecar.clone())
+                let continuation_turn_id = sidecar
+                    .active_execution_chain
+                    .as_ref()
+                    .map(|chain| chain.root_task_id.to_string())
+                    .unwrap_or(current_turn_id);
+                Some((continuation_turn_id, sidecar.updated_at, sidecar.clone()))
             };
-            if let Some(updated) = updated.as_ref()
+            if let Some((continuation_turn_id, updated_at, updated)) = updated.as_ref()
                 && let Some(turn) = updated.current_turn.as_ref()
             {
                 upsert_canonical_turn_in_state(&mut state, session_id, turn)?;
+                if interrupted_by_user {
+                    let goal_index = state.goals.iter().position(|goal| {
+                        &goal.session_id == session_id
+                            && goal.status == GoalStatus::Active
+                            && goal_owns_execution_owner(&state, goal, continuation_turn_id)
+                    });
+                    if let Some(goal_index) = goal_index {
+                        super::goals::pause_goal_and_bound_plan_in_state(
+                            &mut state,
+                            goal_index,
+                            *updated_at,
+                        );
+                    }
+                } else {
+                    release_running_goal_continuation(
+                        &mut state,
+                        session_id,
+                        continuation_turn_id,
+                        GOAL_CONTINUATION_TURN_TERMINAL,
+                        *updated_at,
+                    );
+                }
+                reconcile_goal_time_used(&mut state);
             }
-            updated
+            updated.map(|(_, _, sidecar)| sidecar)
         };
         if updated.is_some() {
             self.mark_sidecar_dirty(SessionSidecarFlushReason::UpdateCurrentTurnStatus);

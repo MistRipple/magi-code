@@ -1727,6 +1727,7 @@ pub(crate) fn execute_goal_tool(
     session_id: &SessionId,
     thread_id: magi_core::ThreadId,
     access_profile: AccessProfile,
+    turn_id: &str,
     tool: BuiltinToolName,
     arguments: &str,
 ) -> (String, ExecutionResultStatus) {
@@ -1747,12 +1748,18 @@ pub(crate) fn execute_goal_tool(
 
     match tool {
         BuiltinToolName::GetGoal => {
-            let goal = session_store.current_unfinished_goal(session_id);
+            let goal = session_store.current_goal(session_id);
+            let plan = goal.as_ref().and_then(|goal| {
+                session_store
+                    .plan(session_id)
+                    .filter(|plan| plan.goal_id.as_ref() == Some(&goal.goal_id))
+            });
             (
                 serde_json::json!({
                     "tool": tool.as_str(),
                     "status": "ok",
                     "goal": goal,
+                    "plan": plan,
                 })
                 .to_string(),
                 ExecutionResultStatus::Succeeded,
@@ -1764,7 +1771,34 @@ pub(crate) fn execute_goal_tool(
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
                 .trim();
-            let token_budget = parsed.get("token_budget").and_then(|value| value.as_u64());
+            let token_budget = match parsed.get("token_budget") {
+                Some(serde_json::Value::Null) => None,
+                Some(value) => match value.as_u64() {
+                    Some(budget) => Some(budget),
+                    None => {
+                        return (
+                            serde_json::json!({
+                                "tool": tool.as_str(),
+                                "status": "failed",
+                                "error": "token_budget 必须是正整数；用户没有明确预算时传 null",
+                            })
+                            .to_string(),
+                            ExecutionResultStatus::Failed,
+                        );
+                    }
+                },
+                None => {
+                    return (
+                        serde_json::json!({
+                            "tool": tool.as_str(),
+                            "status": "failed",
+                            "error": "create_goal 必须提供 token_budget；用户没有明确预算时传 null",
+                        })
+                        .to_string(),
+                        ExecutionResultStatus::Failed,
+                    );
+                }
+            };
             if token_budget == Some(0) {
                 return (
                     serde_json::json!({
@@ -1782,7 +1816,7 @@ pub(crate) fn execute_goal_tool(
                         "tool": tool.as_str(),
                         "status": "failed",
                         "error": format!(
-                            "token_budget 不能低于 {MIN_CREATE_GOAL_TOKEN_BUDGET}；若用户没有明确给出预算，请省略 token_budget"
+                            "token_budget 不能低于 {MIN_CREATE_GOAL_TOKEN_BUDGET}；若用户没有明确给出预算，请传 null"
                         ),
                     })
                     .to_string(),
@@ -1796,7 +1830,7 @@ pub(crate) fn execute_goal_tool(
                     serde_json::json!({
                         "tool": tool.as_str(),
                         "status": "failed",
-                        "error": "token_budget 必须来自用户目标原文里的明确预算数值；若用户未明确给预算或要求不要设置预算，请省略 token_budget",
+                        "error": "token_budget 必须来自用户目标原文里的明确预算数值；若用户未明确给预算或要求不要设置预算，请传 null",
                     })
                     .to_string(),
                     ExecutionResultStatus::Failed,
@@ -1805,6 +1839,7 @@ pub(crate) fn execute_goal_tool(
             match session_store.create_goal(
                 session_id.clone(),
                 thread_id,
+                turn_id,
                 objective,
                 access_profile,
                 token_budget,
@@ -1848,28 +1883,112 @@ pub(crate) fn execute_goal_tool(
             let goal_id = parsed
                 .get("goal_id")
                 .and_then(|value| value.as_str())
-                .map(|value| GoalId::new(value.trim().to_string()))
-                .or_else(|| {
-                    session_store
-                        .active_goal(session_id)
-                        .map(|goal| goal.goal_id)
-                });
+                .map(|value| GoalId::new(value.trim().to_string()));
             let Some(goal_id) = goal_id else {
                 return (
                     serde_json::json!({
                         "tool": tool.as_str(),
                         "status": "failed",
-                        "error": "当前会话没有 active goal",
+                        "error": "update_goal 必须提供 get_goal 返回的 goal_id",
                     })
                     .to_string(),
                     ExecutionResultStatus::Failed,
                 );
             };
-            match session_store.update_goal_status(session_id, &goal_id, status) {
+            let Some(expected_revision) = parsed
+                .get("expected_revision")
+                .and_then(|value| value.as_u64())
+            else {
+                return (
+                    serde_json::json!({
+                        "tool": tool.as_str(),
+                        "status": "failed",
+                        "error": "update_goal 必须提供 get_goal 返回的 control_revision",
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Failed,
+                );
+            };
+            let expected_plan_revision = match parsed.get("expected_plan_revision") {
+                Some(serde_json::Value::Null) => None,
+                Some(value) => match value.as_u64().filter(|revision| *revision > 0) {
+                    Some(revision) => Some(revision),
+                    None => {
+                        return (
+                            serde_json::json!({
+                                "tool": tool.as_str(),
+                                "status": "failed",
+                                "error": "update_goal expected_plan_revision 必须是 get_goal 返回的 plan.revision，当前目标没有绑定计划时传 null",
+                            })
+                            .to_string(),
+                            ExecutionResultStatus::Failed,
+                        );
+                    }
+                },
+                None => {
+                    return (
+                        serde_json::json!({
+                            "tool": tool.as_str(),
+                            "status": "failed",
+                            "error": "update_goal 必须提供 expected_plan_revision；使用 get_goal 返回的 plan.revision，当前目标没有绑定计划时传 null",
+                        })
+                        .to_string(),
+                        ExecutionResultStatus::Failed,
+                    );
+                }
+            };
+            let result = match status {
+                GoalStatus::Complete => {
+                    let summary = parsed
+                        .get("completion_summary")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    let evidence_refs = parsed
+                        .get("evidence_refs")
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    session_store.complete_goal(
+                        session_id,
+                        &goal_id,
+                        expected_revision,
+                        expected_plan_revision,
+                        turn_id,
+                        summary,
+                        evidence_refs,
+                    )
+                }
+                GoalStatus::Blocked => session_store.observe_goal_blocker(
+                    session_id,
+                    &goal_id,
+                    expected_revision,
+                    expected_plan_revision,
+                    turn_id,
+                    parsed
+                        .get("blocker_key")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                    parsed
+                        .get("reason")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                ),
+                _ => unreachable!("model goal status is limited above"),
+            };
+            match result {
                 Ok(goal) => (
                     serde_json::json!({
                         "tool": tool.as_str(),
-                        "status": "updated",
+                        "status": if status == GoalStatus::Blocked && goal.status == GoalStatus::Active {
+                            "blocker_observed"
+                        } else {
+                            "updated"
+                        },
                         "goal": goal,
                     })
                     .to_string(),
@@ -2675,6 +2794,7 @@ fn execute_task_tool_call(
                     .as_ref()
                     .map(|policy| policy.access_profile)
                     .unwrap_or_default(),
+                task.task_id.as_str(),
                 canonical,
                 &tool_call.function.arguments,
             );
@@ -3135,20 +3255,38 @@ fn task_policy_decision_payload(
     reason: String,
     access_profile: Option<magi_core::AccessProfile>,
 ) -> ToolPreflightDecision {
-    let (error_code, public_error) = match status {
+    let constrained_by_access_profile = reason.starts_with("只读任务")
+        || reason.starts_with("受限执行")
+        || reason.starts_with("只读访问");
+    let (error_code, public_error, required_access_profile, instruction) = match status {
         ExecutionResultStatus::NeedsApproval => (
             "tool_policy_needs_approval",
             TOOL_POLICY_NEEDS_APPROVAL_PUBLIC_ERROR,
+            Some("full_access"),
+            "不要在相同访问模式下重复调用。若该操作是完成任务所必需的，请停止当前执行并等待用户切换为完全访问；若目标只需读取，请改用专用读取或搜索工具。",
         ),
         ExecutionResultStatus::Rejected => (
             "tool_policy_rejected",
-            if access_profile == Some(magi_core::AccessProfile::FullAccess) {
+            if !constrained_by_access_profile
+                || access_profile == Some(magi_core::AccessProfile::FullAccess)
+            {
                 TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR
             } else {
                 "该工具在当前访问模式下不可用"
             },
+            constrained_by_access_profile.then_some("full_access"),
+            if constrained_by_access_profile {
+                "不要重复相同调用。只读目的必须改写为真实只读命令或改用专用读取、搜索工具；任务确实需要写入时，等待用户切换为完全访问后再恢复。"
+            } else {
+                "不要重复相同调用。该工具受当前任务角色、路径范围或显式策略限制，请使用当前任务允许的工具和路径。"
+            },
         ),
-        _ => ("tool_policy_failed", "该工具暂不可用"),
+        _ => (
+            "tool_policy_failed",
+            "该工具暂不可用",
+            None,
+            "不要重复相同调用，请改用当前可用工具继续。",
+        ),
     };
     tracing::warn!(
         tool_name,
@@ -3164,6 +3302,9 @@ fn task_policy_decision_payload(
             "error_code": error_code,
             "error": public_error,
             "access_profile": access_profile.map(|profile| profile.as_str()),
+            "required_access_profile": required_access_profile,
+            "retryable_with_same_arguments": false,
+            "instruction": instruction,
         })
         .to_string(),
         status,
@@ -3974,6 +4115,10 @@ mod tests {
             payload["error"].as_str(),
             Some("该工具在当前访问模式下不可用")
         );
+        assert_eq!(
+            payload["required_access_profile"].as_str(),
+            Some("full_access")
+        );
     }
 
     #[test]
@@ -4029,7 +4174,12 @@ mod tests {
         assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
         assert_eq!(
             payload["error"].as_str(),
-            Some("该工具在当前访问模式下不可用")
+            Some(TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR)
+        );
+        assert!(payload["required_access_profile"].is_null());
+        assert_eq!(
+            payload["retryable_with_same_arguments"].as_bool(),
+            Some(false)
         );
         assert!(
             !decision.payload.contains("当前任务阶段不允许调用工具"),
@@ -4067,7 +4217,10 @@ mod tests {
             function: ChatToolFunction {
                 name: BuiltinToolName::UpdatePlan.as_str().to_string(),
                 arguments: serde_json::json!({
+                    "planId": null,
                     "expectedRevision": 0,
+                    "expectedGoalId": null,
+                    "expectedGoalControlRevision": null,
                     "language": "zh-CN",
                     "plan": [
                         {
@@ -4164,6 +4317,22 @@ mod tests {
             )
         };
 
+        let (missing_budget_payload, missing_budget_status) = call(
+            BuiltinToolName::CreateGoal,
+            serde_json::json!({
+                "objective": "完成 goal 模式升级",
+            }),
+        );
+        assert_eq!(missing_budget_status, ExecutionResultStatus::Failed);
+        let missing_budget: serde_json::Value =
+            serde_json::from_str(&missing_budget_payload).expect("failure payload should be json");
+        assert!(
+            missing_budget["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("必须提供 token_budget")
+        );
+
         let (small_budget_payload, small_budget_status) = call(
             BuiltinToolName::CreateGoal,
             serde_json::json!({
@@ -4212,10 +4381,35 @@ mod tests {
             "完成 goal 模式升级"
         );
 
+        let (missing_plan_revision_payload, missing_plan_revision_status) = call(
+            BuiltinToolName::UpdateGoal,
+            serde_json::json!({
+                "goal_id": goal_id,
+                "expected_revision": current["goal"]["controlRevision"],
+                "status": "complete",
+                "completion_summary": "不应绕过计划版本校验",
+            }),
+        );
+        assert_eq!(missing_plan_revision_status, ExecutionResultStatus::Failed);
+        let missing_plan_revision: serde_json::Value =
+            serde_json::from_str(&missing_plan_revision_payload)
+                .expect("missing plan revision payload should be json");
+        assert!(
+            missing_plan_revision["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("expected_plan_revision")
+        );
+
         let (updated_payload, updated_status) = call(
             BuiltinToolName::UpdateGoal,
             serde_json::json!({
+                "goal_id": goal_id,
+                "expected_revision": current["goal"]["controlRevision"],
+                "expected_plan_revision": null,
                 "status": "complete",
+                "completion_summary": "Goal 模式升级已完成并通过状态存储验证",
+                "evidence_refs": ["tool-call-get_goal"],
             }),
         );
         assert_eq!(updated_status, ExecutionResultStatus::Succeeded);
@@ -4298,6 +4492,29 @@ mod tests {
         assert!(
             decision.is_none(),
             "full_access 下只读探测丢弃输出到 /dev/null 不应被 preflight 拒绝"
+        );
+    }
+
+    #[test]
+    fn restricted_policy_allows_real_goal_workspace_inspection_command() {
+        let mut task = test_task(
+            "task-restricted-goal-shell-inspection",
+            "task-restricted-goal-shell-inspection",
+            None,
+        );
+        task.policy_snapshot = Some(default_agent_spawn_policy());
+        let arguments = serde_json::json!({
+            "access_mode": "read_only",
+            "command": "echo \"--- root ---\"; ls -la; echo \"--- src ---\"; find src -type f 2>/dev/null | sort; echo \"--- tests ---\"; find tests -type f 2>/dev/null | sort; echo \"--- docs ---\"; find docs -type f 2>/dev/null | sort; echo \"--- package.json ---\"; cat package.json 2>/dev/null; echo \"--- tsconfig ---\"; cat tsconfig.json 2>/dev/null"
+        })
+        .to_string();
+
+        let decision =
+            task_policy_tool_decision(&task, BuiltinToolName::ShellExec.as_str(), &arguments);
+
+        assert!(
+            decision.is_none(),
+            "受限访问下的真实只读 Goal 工作区探查不能被权限预检误拒绝"
         );
     }
 
@@ -4455,6 +4672,19 @@ mod tests {
             Some("受限访问已拦截该操作，请切换为完全访问权限后重试")
         );
         assert_eq!(payload["access_profile"].as_str(), Some("restricted"));
+        assert_eq!(
+            payload["required_access_profile"].as_str(),
+            Some("full_access")
+        );
+        assert_eq!(
+            payload["retryable_with_same_arguments"].as_bool(),
+            Some(false)
+        );
+        assert!(
+            payload["instruction"]
+                .as_str()
+                .is_some_and(|instruction| instruction.contains("不要在相同访问模式下重复调用"))
+        );
     }
 
     #[test]
@@ -4519,7 +4749,12 @@ mod tests {
         assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
         assert_eq!(
             payload["error"].as_str(),
-            Some("该工具在当前访问模式下不可用")
+            Some(TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR)
+        );
+        assert!(payload["required_access_profile"].is_null());
+        assert_eq!(
+            payload["retryable_with_same_arguments"].as_bool(),
+            Some(false)
         );
         assert!(
             !decision
@@ -4610,7 +4845,12 @@ mod tests {
             );
             assert_eq!(
                 payload["error"].as_str(),
-                Some("该工具在当前访问模式下不可用")
+                Some(TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR)
+            );
+            assert!(payload["required_access_profile"].is_null());
+            assert_eq!(
+                payload["retryable_with_same_arguments"].as_bool(),
+                Some(false)
             );
             assert!(
                 !decision
@@ -4669,7 +4909,12 @@ mod tests {
             );
             assert_eq!(
                 payload["error"].as_str(),
-                Some("该工具在当前访问模式下不可用")
+                Some(TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR)
+            );
+            assert!(payload["required_access_profile"].is_null());
+            assert_eq!(
+                payload["retryable_with_same_arguments"].as_bool(),
+                Some(false)
             );
             assert!(
                 !decision
@@ -4730,7 +4975,12 @@ mod tests {
             );
             assert_eq!(
                 payload["error"].as_str(),
-                Some("该工具在当前访问模式下不可用")
+                Some(TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR)
+            );
+            assert!(payload["required_access_profile"].is_null());
+            assert_eq!(
+                payload["retryable_with_same_arguments"].as_bool(),
+                Some(false)
             );
         }
     }
@@ -4835,7 +5085,12 @@ mod tests {
         assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
         assert_eq!(
             payload["error"].as_str(),
-            Some("该工具在当前访问模式下不可用")
+            Some(TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR)
+        );
+        assert!(payload["required_access_profile"].is_null());
+        assert_eq!(
+            payload["retryable_with_same_arguments"].as_bool(),
+            Some(false)
         );
     }
 
@@ -4862,7 +5117,12 @@ mod tests {
         assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
         assert_eq!(
             payload["error"].as_str(),
-            Some("该工具在当前访问模式下不可用")
+            Some(TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR)
+        );
+        assert!(payload["required_access_profile"].is_null());
+        assert_eq!(
+            payload["retryable_with_same_arguments"].as_bool(),
+            Some(false)
         );
     }
 
@@ -5085,7 +5345,12 @@ mod tests {
         assert_eq!(payload["error_code"].as_str(), Some("tool_policy_rejected"));
         assert_eq!(
             payload["error"].as_str(),
-            Some("该工具在当前访问模式下不可用")
+            Some(TOOL_POLICY_CONTEXT_REJECTED_PUBLIC_ERROR)
+        );
+        assert!(payload["required_access_profile"].is_null());
+        assert_eq!(
+            payload["retryable_with_same_arguments"].as_bool(),
+            Some(false)
         );
         assert!(
             !selected.payload.contains("当前任务阶段不允许调用工具"),

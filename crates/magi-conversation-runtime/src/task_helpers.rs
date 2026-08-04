@@ -74,7 +74,10 @@ pub(crate) fn task_can_see_builtin_tool(
     tool: BuiltinToolName,
 ) -> bool {
     if is_goal_builtin_tool(tool) {
-        return task.is_none() || task_is_coordinator(task, registry);
+        return task.is_none()
+            || task.is_some_and(|task| {
+                task.parent_task_id.is_none() && task_is_coordinator(Some(task), registry)
+            });
     }
     if is_git_builtin_tool(tool) {
         return task.is_none() || task_is_coordinator(task, registry);
@@ -641,10 +644,38 @@ fn push_first_semantic_match(
     text: &str,
     phrases: &[&str],
 ) {
-    let Some(position) = phrases.iter().filter_map(|phrase| text.find(phrase)).min() else {
+    let Some(position) = phrases
+        .iter()
+        .flat_map(|phrase| text.match_indices(phrase).map(|(position, _)| position))
+        .filter(|position| !semantic_action_uses_named_tool(text, *position, tool_name))
+        .min()
+    else {
         return;
     };
     matches.push((tool_name, position));
+}
+
+/// “用 shell_exec 读取/写入”描述的是 shell 动作，不能再推导出 file_read/file_write。
+/// 只检查动作短语之前的当前分句，避免后续“再调用 diagram_render”覆盖前置读取动作。
+fn semantic_action_uses_named_tool(
+    text: &str,
+    action_position: usize,
+    inferred_tool: &str,
+) -> bool {
+    let clause_start = text[..action_position]
+        .rfind(['。', '！', '？', '；', ';', '，', ',', '\n'])
+        .map(|position| {
+            position
+                + text[position..]
+                    .chars()
+                    .next()
+                    .map(char::len_utf8)
+                    .unwrap_or_default()
+        })
+        .unwrap_or(0);
+    requested_public_builtin_tool_matches(&text[clause_start..action_position])
+        .into_iter()
+        .any(|(tool_name, _)| tool_name != inferred_tool)
 }
 
 pub fn public_builtin_tool_references() -> Vec<&'static str> {
@@ -704,6 +735,12 @@ fn tool_reference_is_negated(text: &str, start: usize, end: usize) -> bool {
         "不能使用",
         "不应使用",
         "避免使用",
+        "不要改用",
+        "不得改用",
+        "禁止改用",
+        "不能改用",
+        "不应改用",
+        "避免改用",
         "do not call",
         "don't call",
         "must not call",
@@ -716,6 +753,11 @@ fn tool_reference_is_negated(text: &str, start: usize, end: usize) -> bool {
         "never use",
         "without using",
         "avoid using",
+        "do not switch to",
+        "don't switch to",
+        "must not switch to",
+        "never switch to",
+        "avoid switching to",
     ];
     let positive_markers = ["只调用", "调用", "使用", "only call", "call", "use"];
 
@@ -949,6 +991,26 @@ mod tests {
                 "请先读取 README.md 和真实代码，再调用 diagram_render 生成流程图"
             ),
             vec!["file_read".to_string(), "diagram_render".to_string()]
+        );
+    }
+
+    #[test]
+    fn forbidden_alternative_tools_are_not_added_to_required_chain() {
+        assert_eq!(
+            requested_required_tool_chain(
+                "只能用 shell_exec 执行 printf 写入目标文件，不得改用 file_write、apply_patch 或其他写工具"
+            ),
+            vec!["shell_exec".to_string()]
+        );
+    }
+
+    #[test]
+    fn semantic_file_action_does_not_override_explicit_shell_implementation() {
+        assert_eq!(
+            requested_required_tool_chain(
+                "用 shell_exec 读取该文件并运行 npm test，不要调用 file_read"
+            ),
+            vec!["shell_exec".to_string()]
         );
     }
 }

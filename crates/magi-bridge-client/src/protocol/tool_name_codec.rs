@@ -5,9 +5,7 @@
 //! 都不会把本地工具名与上游原生能力混在同一个命名空间内。
 
 use super::adapter::AdaptedResponse;
-use crate::llm_types::{
-    LlmContentBlock, LlmMessageContent, LlmMessageParams, LlmStreamChunk, ToolChoice,
-};
+use crate::llm_types::{LlmContentBlock, LlmMessageContent, LlmMessageParams, ToolChoice};
 use crate::types::ChatToolOrigin;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -114,18 +112,6 @@ impl ProviderToolNameCodec {
         }
         response
     }
-
-    /// SSE 的 tool-call 与非流式响应走同一个入站边界，避免流式会话把 wire
-    /// 名称写入 session 或交给工具运行时。
-    pub fn decode_stream_chunks(&self, chunks: &mut [LlmStreamChunk]) {
-        for chunk in chunks {
-            if let Some(tool_call) = chunk.tool_call.as_mut()
-                && let Some(name) = tool_call.name.as_mut()
-            {
-                *name = self.decode_name(name);
-            }
-        }
-    }
 }
 
 fn register_identity(
@@ -153,6 +139,17 @@ fn allocate_wire_name(
     assigned_wire_names: &BTreeSet<String>,
 ) -> String {
     let namespace = origin_namespace(origin);
+    // wire name 是模型必须原样复现的接口标识。规范名本身满足协议约束时直接加
+    // 来源命名空间即可；只有发生字符集、长度或碰撞约束时才引入摘要，避免普通
+    // 工具名因不透明长哈希产生抄写错误。
+    let direct = format!("magi_{namespace}_{canonical_name}");
+    if provider_safe_name(canonical_name)
+        && direct.len() <= MAX_WIRE_NAME_LEN
+        && !assigned_wire_names.contains(&direct)
+    {
+        return direct;
+    }
+
     let readable = readable_component(canonical_name);
     let hash = stable_tool_identity_hash(origin, canonical_name);
     let base = format!("magi_{namespace}_{readable}_{hash:016x}");
@@ -171,6 +168,13 @@ fn allocate_wire_name(
         }
     }
     unreachable!("unbounded collision suffix allocation must find a free name")
+}
+
+fn provider_safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn origin_namespace(origin: ChatToolOrigin) -> &'static str {
@@ -230,9 +234,7 @@ fn stable_tool_identity_hash(origin: ChatToolOrigin, canonical_name: &str) -> u6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_types::{
-        LlmMessage, LlmStreamChunkType, PartialToolCall, ToolDefinition, ToolInputSchema,
-    };
+    use crate::llm_types::{LlmMessage, LlmUsage, ToolCall, ToolDefinition, ToolInputSchema};
     use serde_json::json;
 
     fn tool(name: &str, origin: ChatToolOrigin) -> ToolDefinition {
@@ -262,6 +264,7 @@ mod tests {
             temperature: None,
             tools: Some(vec![
                 tool("web_search", ChatToolOrigin::Builtin),
+                tool("file_read", ChatToolOrigin::Builtin),
                 tool("agent_spawn", ChatToolOrigin::Builtin),
                 tool("mcp__filesystem__read", ChatToolOrigin::ExternalMcp),
                 tool("skill__review__inspect", ChatToolOrigin::Skill),
@@ -282,6 +285,7 @@ mod tests {
         let codec = ProviderToolNameCodec::for_params(&params);
         for canonical_name in [
             "web_search",
+            "file_read",
             "agent_spawn",
             "mcp__filesystem__read",
             "skill__review__inspect",
@@ -297,6 +301,17 @@ mod tests {
             );
             assert_eq!(codec.decode_name(&wire_name), canonical_name);
         }
+        assert_eq!(codec.encode_name("file_read"), "magi_builtin_file_read");
+        let mut unsafe_params = params.clone();
+        unsafe_params.tools = Some(vec![tool("repo.tools/read", ChatToolOrigin::ExternalMcp)]);
+        let unsafe_codec = ProviderToolNameCodec::for_params(&unsafe_params);
+        let unsafe_wire_name = unsafe_codec.encode_name("repo.tools/read");
+        assert!(unsafe_wire_name.starts_with("magi_mcp_repo_tools_read_"));
+        assert!(unsafe_wire_name.len() <= MAX_WIRE_NAME_LEN);
+        assert_eq!(
+            unsafe_codec.decode_name(&unsafe_wire_name),
+            "repo.tools/read"
+        );
         assert_ne!(
             codec.encode_name("web_search"),
             codec.encode_name("mcp__filesystem__read")
@@ -332,38 +347,34 @@ mod tests {
         let codec = ProviderToolNameCodec::for_params(&params);
         assert_eq!(codec.decode_name("web_search"), "web_search");
         assert_eq!(
-            codec.decode_name("magi_builtin_forged_1234"),
-            "magi_builtin_forged_1234"
+            codec.decode_name("magi_builtin_file_read_a2b797dc85b43f"),
+            "magi_builtin_file_read_a2b797dc85b43f"
         );
     }
 
     #[test]
-    fn stream_response_decoding_returns_canonical_tool_identity() {
+    fn adapted_response_decoding_returns_canonical_tool_identity() {
         let params = params();
         let codec = ProviderToolNameCodec::for_params(&params);
         let wire_name = codec.encode_name("web_search");
-        let mut chunks = vec![LlmStreamChunk {
-            kind: LlmStreamChunkType::ToolCallStart,
-            content: None,
-            tool_call: Some(PartialToolCall {
-                id: Some("call-1".to_string()),
-                name: Some(wire_name),
-                arguments: None,
-                index: Some(0),
-            }),
+        let response = AdaptedResponse {
+            content: String::new(),
             thinking: None,
-            usage: None,
-            stop_reason: None,
-        }];
+            tool_calls: vec![ToolCall {
+                id: "call-1".to_string(),
+                name: wire_name,
+                arguments: json!({"query": "Magi"}),
+                argument_parse_error: None,
+                raw_arguments: Some(r#"{"query":"Magi"}"#.to_string()),
+            }],
+            usage: LlmUsage::default(),
+            stop_reason: "tool_use".to_string(),
+            raw: None,
+            provider_context: Vec::new(),
+        };
 
-        codec.decode_stream_chunks(&mut chunks);
+        let response = codec.decode_adapted_response(response);
 
-        assert_eq!(
-            chunks[0]
-                .tool_call
-                .as_ref()
-                .and_then(|call| call.name.as_deref()),
-            Some("web_search")
-        );
+        assert_eq!(response.tool_calls[0].name, "web_search");
     }
 }

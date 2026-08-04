@@ -635,8 +635,6 @@ fn explicit_single_call_budgets(goal: &str) -> BTreeMap<String, usize> {
             format!("仅调用一次 {name}"),
             format!("只使用一次 {name}"),
             format!("仅使用一次 {name}"),
-            format!("调用一次 {name}"),
-            format!("使用一次 {name}"),
             format!("{name} 只调用一次"),
             format!("{name} 仅调用一次"),
         ];
@@ -864,6 +862,31 @@ mod tests {
     }
 
     #[test]
+    fn get_goal_is_never_reused_across_state_mutations() {
+        let mut ledger = ToolExecutionLedger::for_task_goal("推进 Goal");
+        let first = call("call-goal-1", "get_goal", "{}");
+        let first_plan = ledger.plan(std::slice::from_ref(&first), None);
+        let ToolCallExecutionDecision::Execute { fingerprint } = &first_plan[0] else {
+            panic!("first get_goal must execute");
+        };
+        assert!(fingerprint.is_none());
+        ledger.record_execution(
+            &first,
+            None,
+            &(
+                r#"{"tool":"get_goal","status":"ok","goal":null,"plan":null}"#.to_string(),
+                ExecutionResultStatus::Succeeded,
+            ),
+        );
+
+        let repeat = call("call-goal-2", "get_goal", "{}");
+        assert!(matches!(
+            ledger.plan(&[repeat], None)[0],
+            ToolCallExecutionDecision::Execute { fingerprint: None }
+        ));
+    }
+
+    #[test]
     fn treats_object_key_order_as_the_same_idempotent_call() {
         let ledger = ToolExecutionLedger::for_task_goal("搜索 Rust");
         let calls = [
@@ -924,6 +947,24 @@ mod tests {
             plan[1],
             ToolCallExecutionDecision::BudgetExhausted { .. }
         ));
+    }
+
+    #[test]
+    fn additional_call_instruction_does_not_create_single_call_budget() {
+        let ledger = ToolExecutionLedger::for_task_goal(
+            "先调用 shell_exec 探查；权限失败时再调用一次 shell_exec 验证止损。",
+        );
+        let calls = [
+            call("call-1", "shell_exec", r#"{"command":"pwd"}"#),
+            call("call-2", "shell_exec", r#"{"command":"printf ok"}"#),
+        ];
+
+        assert!(
+            ledger
+                .plan(&calls, None)
+                .iter()
+                .all(|decision| matches!(decision, ToolCallExecutionDecision::Execute { .. }))
+        );
     }
 
     #[test]

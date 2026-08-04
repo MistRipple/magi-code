@@ -2,11 +2,11 @@ use super::*;
 use crate::models::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurnStatus, ExecutionThread,
-    ExecutionThreadStatus, GoalStatus, NotificationRecord, NotificationScope, SessionDurableState,
-    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionPlan,
-    SessionSidecarFlushReason, SessionStoreState, ThreadChatMessage, ThreadChatToolCall,
-    ThreadChatToolFunction, ThreadContextCheckpoint, ThreadFileFactVersion,
-    ThreadModelProviderContext,
+    ExecutionThreadStatus, GoalContinuationPhase, GoalContinuationState, GoalStatus,
+    NotificationRecord, NotificationScope, SessionDurableState, SessionExecutionSidecarStatus,
+    SessionExecutionSidecarStoreState, SessionPlan, SessionSidecarFlushReason, SessionStoreState,
+    ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction, ThreadContextCheckpoint,
+    ThreadFileFactVersion, ThreadModelProviderContext,
 };
 use magi_core::{
     AccessProfile, ExecutionOwnership, MissionId, PlanId, PlanItem, PlanItemId, PlanItemStatus,
@@ -15,6 +15,28 @@ use magi_core::{
 };
 use serde_json::json;
 use std::{collections::HashMap, thread, time::Duration};
+
+fn create_test_goal(
+    store: &SessionStore,
+    session_id: &SessionId,
+    turn_id: &str,
+    objective: &str,
+    token_budget: Option<u64>,
+) -> crate::models::SessionGoal {
+    let (_, thread_id) = store.ensure_session_mission(session_id, UtcMillis::now(), || {
+        MissionId::new(format!("mission-{session_id}"))
+    });
+    store
+        .create_goal(
+            session_id.clone(),
+            thread_id,
+            turn_id,
+            objective,
+            AccessProfile::Restricted,
+            token_budget,
+        )
+        .expect("test goal should be creatable")
+}
 
 fn test_turn(turn_id: &str, status: &str, accepted_at: u64) -> ActiveExecutionTurn {
     ActiveExecutionTurn {
@@ -377,21 +399,20 @@ fn goal_store_rejects_second_unfinished_goal_for_same_session() {
         .create_session(session_id.clone(), "goal singleton")
         .expect("session should be creatable");
 
-    let first = store
-        .create_goal(
-            session_id.clone(),
-            ThreadId::new("thread-main"),
-            "完成项目级重构",
-            AccessProfile::Restricted,
-            Some(1_000),
-        )
-        .expect("first goal should be creatable");
+    let first = create_test_goal(
+        &store,
+        &session_id,
+        "turn-goal-singleton-1",
+        "完成项目级重构",
+        Some(1_000),
+    );
     assert_eq!(first.status, GoalStatus::Active);
 
     let err = store
         .create_goal(
             session_id.clone(),
-            ThreadId::new("thread-main"),
+            first.thread_id.clone(),
+            "turn-goal-singleton-2",
             "另一个未结束目标",
             AccessProfile::Restricted,
             None,
@@ -400,18 +421,78 @@ fn goal_store_rejects_second_unfinished_goal_for_same_session() {
     assert!(matches!(err, DomainError::InvalidState { .. }));
 
     let completed = store
-        .update_goal_status(&session_id, &first.goal_id, GoalStatus::Complete)
+        .complete_goal(
+            &session_id,
+            &first.goal_id,
+            first.control_revision,
+            None,
+            "turn-goal-singleton-1",
+            "第一个目标已完成",
+            Vec::new(),
+        )
         .expect("goal can be completed");
     assert_eq!(completed.status, GoalStatus::Complete);
     store
         .create_goal(
             session_id,
-            ThreadId::new("thread-main"),
+            completed.thread_id,
+            "turn-goal-singleton-3",
             "完成下一阶段",
             AccessProfile::Restricted,
             None,
         )
         .expect("new goal after terminal status should be allowed");
+}
+
+#[test]
+fn persisted_goal_normalization_keeps_latest_goal_without_resurrecting_older_work() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-goal-latest-restore");
+    store
+        .create_session(session_id.clone(), "goal latest restore")
+        .expect("session should be creatable");
+    let older = create_test_goal(
+        &store,
+        &session_id,
+        "turn-goal-latest-restore",
+        "旧目标",
+        None,
+    );
+    let mut latest = older.clone();
+    latest.goal_id = magi_core::GoalId::new("goal-latest-terminal");
+    latest.objective = "最新目标".to_string();
+    latest.status = GoalStatus::Complete;
+    latest.updated_at = UtcMillis(older.updated_at.0.saturating_add(1));
+    let mut durable = store.durable_state();
+    durable.goals = vec![older.clone(), latest.clone()];
+    durable.plans = vec![SessionPlan {
+        plan_id: PlanId::new("plan-goal-latest-restore"),
+        session_id: session_id.clone(),
+        goal_id: Some(magi_core::GoalId::new("goal-older")),
+        revision: 1,
+        language: "zh-CN".to_string(),
+        state: PlanState::Completed,
+        items: Vec::new(),
+        task_bindings: HashMap::new(),
+        task_statuses: HashMap::new(),
+        updated_at: UtcMillis(older.updated_at.0),
+    }];
+
+    let restored =
+        SessionStore::from_persisted_parts(durable, SessionExecutionSidecarStoreState::default());
+    let current = restored
+        .current_goal(&session_id)
+        .expect("latest goal should restore");
+    assert_eq!(current.goal_id, latest.goal_id);
+    assert_eq!(current.status, GoalStatus::Complete);
+    assert_eq!(current.objective, "最新目标");
+    assert_eq!(
+        restored
+            .plan(&session_id)
+            .expect("plan should restore")
+            .goal_id,
+        Some(latest.goal_id)
+    );
 }
 
 #[test]
@@ -431,6 +512,7 @@ fn plan_is_session_scoped_and_survives_durable_restore() {
             SessionPlan {
                 plan_id: PlanId::new("plan-persistence"),
                 session_id: session_a.clone(),
+                goal_id: None,
                 revision: 1,
                 language: "zh-CN".to_string(),
                 state: PlanState::Active,
@@ -509,31 +591,15 @@ fn goal_accounting_budget_limits_active_goal_without_cross_session_leakage() {
         .create_session(session_b.clone(), "goal b")
         .expect("session b should be creatable");
 
-    let goal_a = store
-        .create_goal(
-            session_a.clone(),
-            ThreadId::new("thread-a"),
-            "分析并修复 A",
-            AccessProfile::Restricted,
-            Some(10),
-        )
-        .expect("goal a should be creatable");
-    let goal_b = store
-        .create_goal(
-            session_b.clone(),
-            ThreadId::new("thread-b"),
-            "分析并修复 B",
-            AccessProfile::Restricted,
-            Some(100),
-        )
-        .expect("goal b should be creatable");
+    let goal_a = create_test_goal(&store, &session_a, "turn-goal-a", "分析并修复 A", Some(10));
+    let goal_b = create_test_goal(&store, &session_b, "turn-goal-b", "分析并修复 B", Some(100));
 
     let limited = store
-        .account_goal_progress(&session_a, &goal_a.goal_id, 11, 3)
+        .account_goal_token_usage(&session_a, &goal_a.goal_id, 11)
         .expect("accounting should update goal a");
     assert_eq!(limited.status, GoalStatus::BudgetLimited);
     assert_eq!(limited.tokens_used, 11);
-    assert_eq!(limited.time_used_seconds, 3);
+    assert_eq!(limited.time_used_seconds, 0);
 
     let untouched_b = store
         .current_goal(&session_b)
@@ -1000,6 +1066,410 @@ fn replacing_latest_user_interrupted_turn_is_atomic_and_rejects_stale_retry() {
 }
 
 #[test]
+fn user_interruption_atomically_pauses_running_goal_and_plan() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-goal-user-interruption");
+    store
+        .create_session(session_id.clone(), "Goal user interruption")
+        .expect("session should be creatable");
+    let goal = create_test_goal(
+        &store,
+        &session_id,
+        "turn-create-goal-user-interruption",
+        "验证用户中断释放 Goal continuation",
+        None,
+    );
+    let chain = test_active_chain(
+        &session_id,
+        "goal-user-interruption",
+        Some(test_turn("turn-goal-user-interruption", "running", 10)),
+    );
+    let continuation_turn_id = chain.root_task_id.to_string();
+    store
+        .upsert_plan_for_goal_progress(
+            &session_id,
+            SessionPlan {
+                plan_id: PlanId::new("plan-goal-user-interruption"),
+                session_id: session_id.clone(),
+                goal_id: Some(goal.goal_id.clone()),
+                revision: 1,
+                language: "zh-CN".to_string(),
+                state: PlanState::Active,
+                items: vec![PlanItem::new(
+                    PlanItemId::new("interruptible-step"),
+                    "可中断步骤",
+                    PlanItemStatus::InProgress,
+                )],
+                task_bindings: HashMap::new(),
+                task_statuses: HashMap::new(),
+                updated_at: UtcMillis(9),
+            },
+            Some(0),
+            Some(goal.goal_id.clone()),
+            Some(goal.control_revision),
+        )
+        .expect("goal plan should create");
+    store
+        .accept_goal_continuation_with_timeline_entry(
+            session_id.clone(),
+            &goal.goal_id,
+            TimelineEntryInput::new(
+                "timeline-goal-user-interruption",
+                TimelineEntryKind::UserMessage,
+                "继续 Goal",
+                UtcMillis(10),
+            ),
+            chain,
+        )
+        .expect("goal continuation should start");
+    assert_eq!(
+        store
+            .current_goal(&session_id)
+            .expect("goal should exist")
+            .continuation
+            .turn_id
+            .as_deref(),
+        Some(continuation_turn_id.as_str())
+    );
+
+    store
+        .interrupt_current_turn_by_user(&session_id)
+        .expect("user interruption should succeed");
+
+    let paused_goal = store.current_goal(&session_id).expect("goal should remain");
+    assert_eq!(paused_goal.status, GoalStatus::Paused);
+    assert_eq!(paused_goal.continuation, GoalContinuationState::default());
+    assert_eq!(
+        store
+            .plan(&session_id)
+            .expect("bound plan should remain")
+            .state,
+        PlanState::Paused
+    );
+}
+
+#[test]
+fn daemon_restart_releases_running_goal_continuation() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-goal-daemon-interruption");
+    store
+        .create_session(session_id.clone(), "Goal daemon interruption")
+        .expect("session should be creatable");
+    let goal = create_test_goal(
+        &store,
+        &session_id,
+        "turn-create-goal-daemon-interruption",
+        "验证 daemon 重启释放 Goal continuation",
+        None,
+    );
+    let chain = test_active_chain(
+        &session_id,
+        "goal-daemon-interruption",
+        Some(test_turn("turn-goal-daemon-interruption", "running", 10)),
+    );
+    store
+        .accept_goal_continuation_with_timeline_entry(
+            session_id.clone(),
+            &goal.goal_id,
+            TimelineEntryInput::new(
+                "timeline-goal-daemon-interruption",
+                TimelineEntryKind::UserMessage,
+                "继续 Goal",
+                UtcMillis(10),
+            ),
+            chain,
+        )
+        .expect("goal continuation should start");
+
+    store
+        .interrupt_current_turn_by_daemon_restart(&session_id)
+        .expect("daemon restart interruption should succeed");
+
+    let continuation = store
+        .current_goal(&session_id)
+        .expect("goal should remain")
+        .continuation;
+    assert_eq!(continuation.phase, GoalContinuationPhase::Waiting);
+    assert_eq!(continuation.turn_id, None);
+    assert_eq!(
+        continuation.reason.as_deref(),
+        Some("daemon_restart_interrupted")
+    );
+}
+
+#[test]
+fn interrupted_execution_resume_restores_owned_goal_plan_and_live_timing() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-interrupted-goal-resume");
+    store
+        .create_session(session_id.clone(), "Interrupted Goal Resume")
+        .expect("session should be creatable");
+    let chain = test_active_chain(
+        &session_id,
+        "interrupted-goal-resume",
+        Some(test_turn("turn-interrupted-goal-resume", "running", 10)),
+    );
+    let goal = create_test_goal(
+        &store,
+        &session_id,
+        chain.root_task_id.as_str(),
+        "验证异常中断恢复同步 Goal",
+        None,
+    );
+    let plan = store
+        .upsert_plan(
+            &session_id,
+            SessionPlan {
+                plan_id: PlanId::new("plan-interrupted-goal-resume"),
+                session_id: session_id.clone(),
+                goal_id: Some(goal.goal_id.clone()),
+                revision: 0,
+                language: "zh-CN".to_string(),
+                state: PlanState::Active,
+                items: vec![PlanItem {
+                    item_id: PlanItemId::new("resume"),
+                    title: "恢复异常中断任务".to_string(),
+                    status: PlanItemStatus::InProgress,
+                }],
+                task_bindings: HashMap::new(),
+                task_statuses: HashMap::new(),
+                updated_at: UtcMillis(10),
+            },
+            Some(0),
+        )
+        .expect("goal plan should persist");
+    store
+        .accept_goal_continuation_with_timeline_entry(
+            session_id.clone(),
+            &goal.goal_id,
+            TimelineEntryInput::new(
+                "timeline-interrupted-goal-resume",
+                TimelineEntryKind::UserMessage,
+                "推进 Goal",
+                UtcMillis(10),
+            ),
+            chain,
+        )
+        .expect("goal continuation should start");
+    assert_eq!(
+        store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| turn.turn_id == "turn-interrupted-goal-resume")
+            .and_then(|turn| turn.metadata.get("goalId").cloned())
+            .and_then(|value| value.as_str().map(str::to_string))
+            .as_deref(),
+        Some(goal.goal_id.as_str())
+    );
+    store
+        .interrupt_current_turn_by_daemon_restart(&session_id)
+        .expect("daemon interruption should persist");
+    let interrupted_goal = store
+        .current_goal(&session_id)
+        .expect("goal should remain after interruption");
+    let (paused_goal, paused_plan) = store
+        .pause_goal_with_plan(
+            &session_id,
+            &goal.goal_id,
+            interrupted_goal.control_revision,
+            Some(plan.revision),
+        )
+        .expect("goal and plan should pause");
+    let interrupted_turn_id = store
+        .claim_interrupted_recovery(&session_id)
+        .expect("recovery should be claimable")
+        .expect("daemon interruption should return turn id");
+
+    let resumed_turn_id = "turn-session-continue-20";
+    let checkpoint = store
+        .resume_goal_for_interrupted_execution(
+            &session_id,
+            &interrupted_turn_id,
+            resumed_turn_id,
+            UtcMillis(20),
+        )
+        .expect("owned goal should resume")
+        .expect("owned goal should produce rollback checkpoint");
+    let resumed_goal = store.current_goal(&session_id).expect("goal should remain");
+    assert_eq!(resumed_goal.status, GoalStatus::Active);
+    assert_eq!(
+        resumed_goal.control_revision,
+        paused_goal.control_revision + 1
+    );
+    assert_eq!(
+        resumed_goal.continuation.phase,
+        GoalContinuationPhase::Running
+    );
+    assert_eq!(
+        resumed_goal.continuation.turn_id.as_deref(),
+        Some(resumed_turn_id)
+    );
+    let resumed_plan = store.plan(&session_id).expect("plan should remain");
+    assert_eq!(resumed_plan.state, PlanState::Active);
+    assert_eq!(
+        resumed_plan.revision,
+        paused_plan.expect("paused plan").revision + 1
+    );
+
+    store
+        .rollback_interrupted_goal_resume(checkpoint)
+        .expect("pre-runner failure should restore exact Goal snapshot");
+    let rolled_back_goal = store.current_goal(&session_id).expect("goal should remain");
+    assert_eq!(rolled_back_goal, paused_goal);
+    assert_eq!(
+        store.plan(&session_id).expect("plan should remain").state,
+        PlanState::Paused
+    );
+
+    let checkpoint = store
+        .resume_goal_for_interrupted_execution(
+            &session_id,
+            &interrupted_turn_id,
+            resumed_turn_id,
+            UtcMillis(20),
+        )
+        .expect("second owned resume should succeed")
+        .expect("second owned resume should produce checkpoint");
+    drop(checkpoint);
+    store
+        .upsert_current_turn(
+            session_id.clone(),
+            test_turn(resumed_turn_id, "running", 20),
+        )
+        .expect("resumed turn should become canonical");
+    let running_goal = store.current_goal(&session_id).expect("goal should remain");
+    assert_eq!(running_goal.timing_started_at, Some(UtcMillis(20)));
+    assert_eq!(
+        running_goal.timing_turn_id.as_deref(),
+        Some(resumed_turn_id)
+    );
+}
+
+#[test]
+fn interrupted_execution_does_not_resume_unrelated_paused_goal() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-unrelated-interrupted-goal");
+    store
+        .create_session(session_id.clone(), "Unrelated Interrupted Goal")
+        .expect("session should be creatable");
+    let goal = create_test_goal(
+        &store,
+        &session_id,
+        "task-unrelated-goal-owner",
+        "保持无关 Goal 暂停",
+        None,
+    );
+    let paused_goal = store
+        .pause_goal_with_plan(&session_id, &goal.goal_id, goal.control_revision, None)
+        .expect("goal should pause")
+        .0;
+    store
+        .accept_active_execution_chain_with_timeline_entry(
+            session_id.clone(),
+            TimelineEntryInput::new(
+                "timeline-unrelated-interruption",
+                TimelineEntryKind::UserMessage,
+                "无关执行链",
+                UtcMillis(10),
+            ),
+            test_active_chain(
+                &session_id,
+                "unrelated-interruption",
+                Some(test_turn("turn-unrelated-interruption", "running", 10)),
+            ),
+        )
+        .expect("unrelated chain should persist");
+    store
+        .interrupt_current_turn_by_daemon_restart(&session_id)
+        .expect("daemon interruption should persist");
+    let interrupted_turn_id = store
+        .claim_interrupted_recovery(&session_id)
+        .expect("recovery should be claimable")
+        .expect("interruption should return turn id");
+
+    assert!(
+        store
+            .resume_goal_for_interrupted_execution(
+                &session_id,
+                &interrupted_turn_id,
+                "turn-session-continue-unrelated",
+                UtcMillis(20),
+            )
+            .expect("unrelated recovery should be valid")
+            .is_none()
+    );
+    assert_eq!(store.current_goal(&session_id), Some(paused_goal));
+}
+
+#[test]
+fn restore_reconciles_terminal_goal_continuation() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-goal-terminal-restore");
+    store
+        .create_session(session_id.clone(), "Goal terminal restore")
+        .expect("session should be creatable");
+    let goal = create_test_goal(
+        &store,
+        &session_id,
+        "turn-create-goal-terminal-restore",
+        "验证旧持久化 continuation 对账",
+        None,
+    );
+    let mut turn = test_turn("turn-goal-terminal-restore", "running", 10);
+    let mut task_item = test_turn_item("item-goal-terminal-restore", "继续 Goal");
+    task_item.task_id = Some(TaskId::new("task-root-goal-terminal-restore"));
+    turn.items.push(task_item);
+    let chain = test_active_chain(&session_id, "goal-terminal-restore", Some(turn));
+    let continuation_turn_id = chain.root_task_id.to_string();
+    store
+        .accept_goal_continuation_with_timeline_entry(
+            session_id.clone(),
+            &goal.goal_id,
+            TimelineEntryInput::new(
+                "timeline-goal-terminal-restore",
+                TimelineEntryKind::UserMessage,
+                "继续 Goal",
+                UtcMillis(10),
+            ),
+            chain,
+        )
+        .expect("goal continuation should start");
+    store
+        .interrupt_current_turn_by_user(&session_id)
+        .expect("turn should become terminal");
+
+    let mut durable = store.durable_state();
+    let persisted_goal = durable
+        .goals
+        .iter_mut()
+        .find(|persisted| persisted.goal_id == goal.goal_id)
+        .expect("persisted goal should exist");
+    persisted_goal.status = GoalStatus::Active;
+    persisted_goal.continuation = GoalContinuationState {
+        phase: GoalContinuationPhase::Running,
+        turn_id: Some(continuation_turn_id),
+        reason: None,
+    };
+    let mut sidecars = store.execution_sidecar_store_state();
+    let sidecar = sidecars
+        .runtime_sidecars
+        .iter_mut()
+        .find(|sidecar| sidecar.session_id == session_id)
+        .expect("persisted sidecar should exist");
+    sidecar.active_execution_chain = None;
+    sidecar.status = SessionExecutionSidecarStatus::Detached;
+    let restored = SessionStore::from_persisted_parts(durable, sidecars);
+
+    let continuation = restored
+        .current_goal(&session_id)
+        .expect("goal should restore")
+        .continuation;
+    assert_eq!(continuation.phase, GoalContinuationPhase::Waiting);
+    assert_eq!(continuation.turn_id, None);
+    assert_eq!(continuation.reason.as_deref(), Some("user_interrupted"));
+}
+
+#[test]
 fn accept_active_execution_chain_with_timeline_entry_writes_timeline_and_turn_atomically() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-atomic-task-accept");
@@ -1044,6 +1514,44 @@ fn accept_active_execution_chain_with_timeline_entry_writes_timeline_and_turn_at
             .is_some(),
         "active chain 内部必须同步携带当前 turn"
     );
+}
+
+#[test]
+fn accept_active_execution_chain_rejects_invalid_canonical_turn_without_partial_writes() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-atomic-invalid-canonical-turn");
+    store
+        .create_session(session_id.clone(), "Atomic Invalid Canonical Turn")
+        .expect("session should be creatable");
+    let chain = test_active_chain(
+        &session_id,
+        "chain-atomic-invalid-canonical-turn",
+        Some(test_turn("turn-invalid", "invalid", 4)),
+    );
+
+    let result = store.accept_active_execution_chain_with_timeline_entry(
+        session_id.clone(),
+        TimelineEntryInput::new(
+            "timeline-invalid-canonical-turn",
+            TimelineEntryKind::UserMessage,
+            "不应写入的无效任务消息",
+            UtcMillis(4),
+        ),
+        chain,
+    );
+
+    assert!(matches!(
+        result,
+        Err(magi_core::DomainError::InvalidState { .. })
+    ));
+    assert!(
+        store
+            .timeline_for_session(&session_id)
+            .iter()
+            .all(|entry| entry.entry_id != "timeline-invalid-canonical-turn")
+    );
+    assert!(store.canonical_turns_for_session(&session_id).is_empty());
+    assert!(store.runtime_sidecar(&session_id).is_none());
 }
 
 #[test]
@@ -1212,6 +1720,321 @@ fn upsert_current_turn_item_allows_assistant_stream_to_final_canonical_update() 
     assert_eq!(item.kind, "assistant_final");
     assert_eq!(item.status, "completed");
     assert_eq!(item.content.as_deref(), Some("最终回复"));
+
+    let canonical = store.canonical_turns_for_session(&session_id);
+    let canonical_item = canonical
+        .iter()
+        .flat_map(|turn| &turn.items)
+        .find(|item| item.item_id == "turn-item-assistant")
+        .expect("canonical assistant item should remain");
+    assert_eq!(
+        canonical_item
+            .metadata
+            .get("assistantOutputKind")
+            .and_then(serde_json::Value::as_str),
+        Some("final")
+    );
+
+    store
+        .update_current_turn_status(&session_id, "completed")
+        .expect("turn should become terminal before restore");
+    let mut durable = store.durable_state();
+    durable
+        .canonical_turns
+        .iter_mut()
+        .flat_map(|turn| &mut turn.items)
+        .find(|item| item.item_id == "turn-item-assistant")
+        .expect("durable canonical assistant should exist")
+        .metadata
+        .remove("assistantOutputKind");
+    let restored =
+        SessionStore::from_persisted_parts(durable, store.execution_sidecar_store_state());
+    assert_eq!(
+        restored
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .flat_map(|turn| turn.items)
+            .find(|item| item.item_id == "turn-item-assistant")
+            .and_then(|item| item.metadata.get("assistantOutputKind").cloned())
+            .and_then(|value| value.as_str().map(str::to_string))
+            .as_deref(),
+        Some("final"),
+        "restore must recover the raw final/progress identity from the durable sidecar"
+    );
+}
+
+#[test]
+fn active_goal_terminal_turn_is_not_a_user_response_duration_boundary() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-goal-progress-duration");
+    let turn_id = "turn-goal-progress-duration";
+    store
+        .create_session(session_id.clone(), "Goal Progress Duration")
+        .expect("session should be creatable");
+    create_test_goal(
+        &store,
+        &session_id,
+        turn_id,
+        "验证 Goal 中间 Turn 不展示总耗时",
+        None,
+    );
+    store
+        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 10))
+        .expect("goal turn should start");
+    store
+        .update_current_turn_status(&session_id, "failed")
+        .expect("goal progress turn should become terminal");
+
+    let canonical = store
+        .canonical_turns_for_session(&session_id)
+        .into_iter()
+        .find(|turn| turn.turn_id == turn_id)
+        .expect("goal progress turn should be canonical");
+    assert_eq!(
+        canonical
+            .metadata
+            .get("responseDurationScope")
+            .and_then(serde_json::Value::as_str),
+        Some("goal_progress")
+    );
+
+    let mut durable = store.durable_state();
+    durable
+        .canonical_turns
+        .iter_mut()
+        .find(|turn| turn.turn_id == turn_id)
+        .expect("durable goal progress turn should exist")
+        .metadata
+        .clear();
+    let restored =
+        SessionStore::from_persisted_parts(durable, store.execution_sidecar_store_state());
+    assert_eq!(
+        restored
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| turn.turn_id == turn_id)
+            .and_then(|turn| turn.metadata.get("responseDurationScope").cloned())
+            .and_then(|value| value.as_str().map(str::to_string))
+            .as_deref(),
+        Some("goal_progress"),
+        "restore must repair historical goal turns that predate the scope metadata"
+    );
+}
+
+#[test]
+fn goal_time_uses_owned_canonical_turn_wall_clock_without_model_usage() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-goal-canonical-time");
+    let turn_id = "turn-goal-canonical-time";
+    store
+        .create_session(session_id.clone(), "Goal Canonical Time")
+        .expect("session should be creatable");
+    let goal = create_test_goal(
+        &store,
+        &session_id,
+        turn_id,
+        "验证 Goal 使用完整 Turn 墙钟时间",
+        None,
+    );
+    let mut turn = test_turn(turn_id, "completed", 1_000);
+    turn.completed_at = Some(UtcMillis(5_250));
+    store
+        .upsert_current_turn(session_id.clone(), turn)
+        .expect("terminal goal turn should upsert");
+
+    let current = store
+        .current_goal(&session_id)
+        .expect("goal should remain readable");
+    assert_eq!(current.time_used_seconds, 4);
+    assert_eq!(current.time_used_millis, 4_250);
+    assert_eq!(current.timing_started_at, None);
+    assert_eq!(current.timing_turn_id, None);
+    let canonical = store
+        .canonical_turns_for_session(&session_id)
+        .into_iter()
+        .find(|turn| turn.turn_id == turn_id)
+        .expect("goal turn should be canonical");
+    assert_eq!(
+        canonical
+            .metadata
+            .get("goalId")
+            .and_then(serde_json::Value::as_str),
+        Some(goal.goal_id.as_str())
+    );
+
+    let mut durable = store.durable_state();
+    durable
+        .goals
+        .iter_mut()
+        .find(|candidate| candidate.goal_id == goal.goal_id)
+        .expect("durable goal should exist")
+        .time_used_seconds = 99;
+    durable
+        .canonical_turns
+        .iter_mut()
+        .find(|turn| turn.turn_id == turn_id)
+        .expect("durable canonical turn should exist")
+        .metadata
+        .clear();
+    let restored =
+        SessionStore::from_persisted_parts(durable, store.execution_sidecar_store_state());
+    assert_eq!(
+        restored
+            .current_goal(&session_id)
+            .expect("restored goal should exist")
+            .time_used_seconds,
+        4,
+        "restore must replace legacy model-only timing with canonical wall-clock timing"
+    );
+}
+
+#[test]
+fn running_goal_turn_exposes_live_timing_until_terminal_settlement() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-goal-live-time");
+    let turn_id = "turn-goal-live-time";
+    store
+        .create_session(session_id.clone(), "Goal Live Time")
+        .expect("session should be creatable");
+    create_test_goal(&store, &session_id, turn_id, "验证 Goal 运行中计时", None);
+    store
+        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 1_000))
+        .expect("running goal turn should upsert");
+
+    let running = store
+        .current_goal(&session_id)
+        .expect("running goal should remain readable");
+    assert_eq!(running.time_used_millis, 0);
+    assert_eq!(running.timing_started_at, Some(UtcMillis(1_000)));
+    assert_eq!(running.timing_turn_id.as_deref(), Some(turn_id));
+
+    let mut terminal_turn = test_turn(turn_id, "completed", 1_000);
+    terminal_turn.completed_at = Some(UtcMillis(5_250));
+    store
+        .upsert_current_turn(session_id.clone(), terminal_turn.clone())
+        .expect("terminal goal turn should settle timing");
+    store
+        .upsert_current_turn(session_id.clone(), terminal_turn)
+        .expect("repeated terminal upsert should remain idempotent");
+
+    let settled = store
+        .current_goal(&session_id)
+        .expect("settled goal should remain readable");
+    assert_eq!(settled.time_used_millis, 4_250);
+    assert_eq!(settled.time_used_seconds, 4);
+    assert_eq!(settled.timing_started_at, None);
+    assert_eq!(settled.timing_turn_id, None);
+}
+
+#[test]
+fn paused_goal_hides_live_timing_and_completed_goal_keeps_final_turn_running() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-goal-timing-status");
+    let turn_id = "turn-goal-timing-status";
+    store
+        .create_session(session_id.clone(), "Goal Timing Status")
+        .expect("session should be creatable");
+    let goal = create_test_goal(&store, &session_id, turn_id, "验证 Goal 状态计时边界", None);
+    store
+        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 1_000))
+        .expect("running goal turn should upsert");
+
+    let (paused, _) = store
+        .pause_goal_with_plan(&session_id, &goal.goal_id, goal.control_revision, None)
+        .expect("goal should pause");
+    assert_eq!(paused.timing_started_at, None);
+    assert_eq!(paused.timing_turn_id, None);
+
+    let (resumed, _, _) = store
+        .resume_goal_with_plan(
+            &session_id,
+            &goal.goal_id,
+            paused.control_revision,
+            None,
+            None,
+            None,
+        )
+        .expect("goal should resume");
+    assert_eq!(resumed.continuation.phase, GoalContinuationPhase::Waiting);
+    assert_eq!(resumed.timing_started_at, None);
+
+    let completed = store
+        .complete_goal(
+            &session_id,
+            &goal.goal_id,
+            resumed.control_revision,
+            None,
+            turn_id,
+            "目标完成，正在输出最终回复",
+            Vec::new(),
+        )
+        .expect("goal should complete inside its final turn");
+    assert_eq!(completed.status, GoalStatus::Complete);
+    assert_eq!(completed.timing_started_at, Some(UtcMillis(1_000)));
+    assert_eq!(completed.timing_turn_id.as_deref(), Some(turn_id));
+}
+
+#[test]
+fn blocked_goal_turn_with_completion_timestamp_is_settled() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-goal-blocked-time");
+    let turn_id = "turn-goal-blocked-time";
+    store
+        .create_session(session_id.clone(), "Goal Blocked Time")
+        .expect("session should be creatable");
+    create_test_goal(&store, &session_id, turn_id, "验证阻塞 Turn 计时结算", None);
+    let mut turn = test_turn(turn_id, "blocked", 1_000);
+    turn.completed_at = Some(UtcMillis(5_250));
+    store
+        .upsert_current_turn(session_id.clone(), turn)
+        .expect("blocked goal turn should upsert");
+
+    let current = store
+        .current_goal(&session_id)
+        .expect("goal should remain readable");
+    assert_eq!(current.time_used_millis, 4_250);
+    assert_eq!(current.timing_started_at, None);
+}
+
+#[test]
+fn completed_goal_terminal_turn_is_the_user_response_duration_boundary() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-goal-complete-duration");
+    let turn_id = "turn-goal-complete-duration";
+    store
+        .create_session(session_id.clone(), "Goal Complete Duration")
+        .expect("session should be creatable");
+    let goal = create_test_goal(
+        &store,
+        &session_id,
+        turn_id,
+        "验证 Goal 最终 Turn 展示总耗时",
+        None,
+    );
+    store
+        .upsert_current_turn(session_id.clone(), test_turn(turn_id, "running", 20))
+        .expect("goal turn should start");
+    store
+        .complete_goal(
+            &session_id,
+            &goal.goal_id,
+            goal.control_revision,
+            None,
+            turn_id,
+            "目标已完成",
+            Vec::new(),
+        )
+        .expect("goal should complete");
+    store
+        .update_current_turn_status(&session_id, "completed")
+        .expect("completed goal turn should become terminal");
+
+    let canonical = store
+        .canonical_turns_for_session(&session_id)
+        .into_iter()
+        .find(|turn| turn.turn_id == turn_id)
+        .expect("completed goal turn should be canonical");
+    assert_eq!(canonical.metadata.get("responseDurationScope"), None);
 }
 
 #[test]
@@ -1578,6 +2401,20 @@ fn daemon_restart_interruption_is_terminal_recoverable_and_single_claim() {
         )
         .expect("active chain should be accepted");
 
+    {
+        let mut state = store
+            .state
+            .write()
+            .expect("session state write lock should hold");
+        state
+            .execution_sidecar_store
+            .runtime_sidecars
+            .iter_mut()
+            .find(|sidecar| sidecar.session_id == session_id)
+            .expect("runtime sidecar should exist")
+            .updated_at = UtcMillis(2_500);
+    }
+
     let interrupted = store
         .interrupt_current_turn_by_daemon_restart(&session_id)
         .expect("daemon restart should interrupt current turn")
@@ -1586,7 +2423,7 @@ fn daemon_restart_interruption_is_terminal_recoverable_and_single_claim() {
         .current_turn
         .expect("turn should remain durable");
     assert_eq!(interrupted_turn.status, "interrupted");
-    assert!(interrupted_turn.completed_at.is_some());
+    assert_eq!(interrupted_turn.completed_at, Some(UtcMillis(2_500)));
     assert_eq!(interrupted_turn.items[1].status, "cancelled");
     assert!(store.has_recovery_ready_interruption(&session_id));
     store
@@ -1605,6 +2442,8 @@ fn daemon_restart_interruption_is_terminal_recoverable_and_single_claim() {
         .iter()
         .find(|item| item.metadata.get("noticeKind") == Some(&json!("session_interrupted")))
         .expect("interruption notice should be appended");
+    assert_eq!(canonical_turn.completed_at, Some(UtcMillis(2_500)));
+    assert_eq!(notice.metadata.get("interruptedAt"), Some(&json!(2_500)));
     assert_eq!(
         notice.kind,
         crate::models::CanonicalTurnItemKind::SystemNotice

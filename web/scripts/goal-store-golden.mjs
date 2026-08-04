@@ -47,6 +47,7 @@ globalThis.fetch = async (url) => {
       sessionId: parsed.searchParams.get('sessionId'),
       workspaceId: parsed.searchParams.get('workspaceId'),
       workspacePath: parsed.searchParams.get('workspacePath'),
+      observedAt: 1780000003000,
       goal: {
         goalId: 'goal-store-golden',
         sessionId: SESSION_ID,
@@ -195,6 +196,10 @@ await withGoldenViteServer(async (server) => {
   );
   releaseSlowGoalRequest();
   await Promise.all([firstSlowRefresh, secondSlowRefresh]);
+  await waitFor(
+    () => fetches.filter((url) => url.searchParams.get('sessionId') === SLOW_SESSION_ID).length === 2,
+    'a refresh requested during an in-flight read must run once after the stale read completes',
+  );
   const recoveredSlowState = goalStore.getGoalState(SLOW_SESSION_ID, WORKSPACE_ID);
   assert.equal(
     recoveredSlowState.response?.plan?.revision,
@@ -204,3 +209,12 @@ await withGoldenViteServer(async (server) => {
   assert.equal(recoveredSlowState.response?.plan?.items[0]?.status, 'in_progress');
   console.log('goal store golden passed');
 });
+
+async function waitFor(predicate, label) {
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(label);
+}

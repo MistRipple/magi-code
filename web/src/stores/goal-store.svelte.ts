@@ -14,6 +14,7 @@ interface InternalGoalState extends GoalState {
   workspacePath: string;
   fetchGeneration: number;
   requestController: AbortController | null;
+  refreshQueued: boolean;
   pendingPlanSnapshot: PendingPlanSnapshot | null;
 }
 
@@ -59,6 +60,7 @@ function writeGoalState(key: string, patch: Partial<InternalGoalState>): Interna
       workspacePath: '',
       fetchGeneration: 0,
       requestController: null,
+      refreshQueued: false,
       pendingPlanSnapshot: null,
     };
   }
@@ -133,6 +135,11 @@ export function applySessionPlanSnapshot(
   const incomingPlanId = normalizeKey(plan?.planId ?? eventPlanId);
   const incomingRevision = plan?.revision ?? eventRevision ?? null;
   if (!key || !current) return false;
+  const currentGoalId = normalizeKey(current.response?.goal?.goalId);
+  const incomingGoalId = normalizeKey(plan?.goalId);
+  if (currentGoalId && incomingGoalId && currentGoalId !== incomingGoalId) {
+    return false;
+  }
   if (!current.response) {
     const pending = current.pendingPlanSnapshot;
     if (
@@ -192,7 +199,10 @@ export async function refreshCurrentGoal(
 ): Promise<void> {
   const state = ensureGoalState(sessionId, workspaceId, workspacePath) as InternalGoalState;
   if (!state.sessionId) return;
-  if (state.requestController) return;
+  if (state.requestController) {
+    state.refreshQueued = true;
+    return;
+  }
   const generation = state.fetchGeneration + 1;
   const key = goalScopeKey(state.workspaceId, state.sessionId);
   if (!key) return;
@@ -201,6 +211,7 @@ export async function refreshCurrentGoal(
     loading: !hasExistingResponse,
     error: null,
     fetchGeneration: generation,
+    refreshQueued: false,
   });
   const controller = new AbortController();
   state.requestController = controller;
@@ -240,6 +251,11 @@ export async function refreshCurrentGoal(
     if (current?.fetchGeneration === generation && current.requestController === controller) {
       current.requestController = null;
       current.loading = false;
+      const refreshQueued = current.refreshQueued;
+      current.refreshQueued = false;
+      if (refreshQueued) {
+        void refreshCurrentGoal(current.sessionId, current.workspaceId, current.workspacePath);
+      }
     }
   }
 }

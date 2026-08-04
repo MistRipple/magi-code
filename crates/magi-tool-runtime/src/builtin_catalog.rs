@@ -352,7 +352,6 @@ impl BuiltinToolName {
                 | Self::GitBranchList
                 | Self::GitMergePreview
                 | Self::GitWorktreeList
-                | Self::GetGoal
                 | Self::ContextSearch
                 | Self::ContextRead
         )
@@ -746,7 +745,7 @@ impl BuiltinToolName {
                 "为当前会话创建一个主动 Goal。Goal 是用户长期目标的一等产品实体，负责跨多轮自动推进、预算记账和终止状态；同一会话同一时间只能存在一个未结束 Goal。token_budget 必须显式传值：用户没有指定预算时传 null，只有用户原文明示 token 预算时才传对应整数。"
             }
             Self::UpdateGoal => {
-                "更新当前会话 Goal 的终态。模型只能把目标标记为 complete 或 blocked；pause、budget_limited、usage_limited 由用户或系统控制，不能由模型伪造。"
+                "更新当前会话 Goal 的终态。调用前必须用 get_goal 取得 goal_id、control_revision 与绑定计划 revision；没有绑定计划时 expected_plan_revision 传 null。complete 必须提供完成摘要；blocked 必须提供稳定 blocker_key 与原因，服务端只在同一阻塞连续三个 Goal Turn 出现后进入 blocked。"
             }
             Self::AgentSpawn => {
                 "【模型可直接调用，但仅限任务执行链中的 root coordinator】向已注册的代理角色派发一个子任务（architect / executor / reviewer 等）。必须明确提供角色本次激活的 capabilities，并同时提供结构化 context_package；它必须是 function arguments 内的 JSON 对象，不能把对象二次编码成字符串。子代理不会自动继承主对话近期记录。该工具只创建代理并投递初始任务消息，立即返回代理 task_id；后续使用 agent_wait 收集代理终态结果。若运行中需要补充上下文，使用 agent_send。\n\n\
@@ -818,7 +817,7 @@ impl BuiltinToolName {
                 "当 AgentContextPackage 和 context_search/context_read 都不足以完成任务时，向父任务发送明确的上下文请求。父任务可通过 agent_send 回复；不要用它替代已有引用读取。"
             }
             Self::UpdatePlan => {
-                "更新当前会话的用户可见计划。计划只表达顶层执行阶段；真实主线、代理和工具执行由执行链负责。首次创建时可省略 planId、itemId，并使用 expectedRevision=0；后续更新必须沿用工具返回的 planId、revision、itemId 和 language。\n\n\
+                "更新当前会话的用户可见计划。计划只表达顶层执行阶段；真实主线、代理和工具执行由执行链负责。首次创建时 planId 和每个 itemId 必须显式传 null，并使用 expectedRevision=0；后续更新必须沿用工具返回的 planId、revision、itemId 和 language。存在未完成 Goal 时，expectedGoalId 和 expectedGoalControlRevision 必须使用本轮 get_goal 或 create_goal 返回的 goalId 与 controlRevision；没有 Goal 时两者都显式传 null。\n\n\
                 # 何时用\n\
                 - 非平凡、多阶段、有依赖或需要多次工具调用的任务\n\
                 - 跨多轮推进、用户明确要求计划或目标模式\n\
@@ -1334,6 +1333,7 @@ impl BuiltinToolName {
                 "properties": {
                     "objective": {
                         "type": "string",
+                        "maxLength": 4000,
                         "description": "用户要持续推进的完整目标。应保留用户给出的核心交付要求、边界和完成标准。"
                     },
                     "token_budget": {
@@ -1351,15 +1351,44 @@ impl BuiltinToolName {
                 "properties": {
                     "goal_id": {
                         "type": "string",
-                        "description": "可选。省略时更新当前会话最新 active goal。"
+                        "description": "必填。使用本轮 get_goal 返回的 goalId。"
+                    },
+                    "expected_revision": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "必填。使用本轮 get_goal 返回的 controlRevision，防止旧 Turn 覆盖新状态。"
+                    },
+                    "expected_plan_revision": {
+                        "anyOf": [
+                            { "type": "integer", "minimum": 1 },
+                            { "type": "null" }
+                        ],
+                        "description": "必填。绑定计划存在时使用本轮 get_goal 返回的 plan.revision；没有绑定计划时传 null，防止并发计划变更与 Goal 终态交错。"
                     },
                     "status": {
                         "type": "string",
                         "enum": ["complete", "blocked"],
                         "description": "模型只能提交 complete 或 blocked。pause / budget_limited / usage_limited 由用户或系统控制。"
+                    },
+                    "completion_summary": {
+                        "type": "string",
+                        "description": "status=complete 时必填，说明目标要求如何被当前证据满足。"
+                    },
+                    "evidence_refs": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "可选。当前 Goal Turn 中可核验的 canonical item、工具调用、测试或文件事实引用。"
+                    },
+                    "blocker_key": {
+                        "type": "string",
+                        "description": "status=blocked 时必填。跨 Turn 保持稳定的阻塞条件标识。"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "status=blocked 时必填。说明为何无法自行推进以及需要的外部变化。"
                     }
                 },
-                "required": ["status"]
+                "required": ["goal_id", "expected_revision", "expected_plan_revision", "status"]
             }),
             Self::AgentSpawn => serde_json::json!({
                 "type": "object",
@@ -1475,8 +1504,28 @@ impl BuiltinToolName {
             Self::UpdatePlan => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "planId": { "type": "string", "minLength": 1, "description": "更新现有计划时必须传入工具上次返回的 planId；首次创建必须省略，不要传空字符串。" },
+                    "planId": {
+                        "anyOf": [
+                            { "type": "string", "minLength": 1 },
+                            { "type": "null" }
+                        ],
+                        "description": "首次创建必须传 null；更新现有计划时必须传入工具上次返回的 planId。"
+                    },
                     "expectedRevision": { "type": "integer", "minimum": 0, "description": "乐观并发版本。首次创建传 0；后续必须传入工具上次返回的 revision。" },
+                    "expectedGoalId": {
+                        "anyOf": [
+                            { "type": "string", "minLength": 1 },
+                            { "type": "null" }
+                        ],
+                        "description": "存在未完成 Goal 时必填本轮 get_goal 或 create_goal 返回的 goalId；没有 Goal 时传 null。"
+                    },
+                    "expectedGoalControlRevision": {
+                        "anyOf": [
+                            { "type": "integer", "minimum": 1 },
+                            { "type": "null" }
+                        ],
+                        "description": "存在未完成 Goal 时必填本轮 get_goal 或 create_goal 返回的 controlRevision，用于和 Plan revision 一起原子校验；没有 Goal 时传 null。"
+                    },
                     "language": { "type": "string", "description": "计划语言的 BCP-47 标识。用户明确要求优先，其次当前消息主要语言，再次产品 locale，默认 zh-CN。计划创建后不得切换。" },
                     "explanation": { "type": "string", "description": "可选：说明本次拆分、排序或范围变化原因。" },
                     "plan": {
@@ -1485,7 +1534,13 @@ impl BuiltinToolName {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "itemId": { "type": "string", "minLength": 1, "description": "稳定计划项 ID。首次创建必须省略，不要传空字符串；后续更新必须原样传回。" },
+                                "itemId": {
+                                    "anyOf": [
+                                        { "type": "string", "minLength": 1 },
+                                        { "type": "null" }
+                                    ],
+                                    "description": "稳定计划项 ID。首次创建必须传 null；后续更新必须原样传回。"
+                                },
                                 "step": { "type": "string", "description": "简短、可执行、可验证的步骤标题，使用计划 language。" },
                                 "status": {
                                     "type": "string",
@@ -1493,11 +1548,11 @@ impl BuiltinToolName {
                                     "description": "步骤状态。同时只允许有一个步骤处于 in_progress。"
                                 }
                             },
-                            "required": ["step", "status"]
+                            "required": ["itemId", "step", "status"]
                         }
                     }
                 },
-                "required": ["expectedRevision", "language", "plan"]
+                "required": ["planId", "expectedRevision", "expectedGoalId", "expectedGoalControlRevision", "language", "plan"]
             }),
             Self::MemoryWrite => serde_json::json!({
                 "type": "object",
@@ -1803,5 +1858,46 @@ mod tests {
         assert_eq!(properties["title"]["type"], "string");
         assert!(!required.iter().any(|value| value == "title"));
         assert!(!required.iter().any(|value| value == "preview"));
+    }
+
+    #[test]
+    fn update_plan_schema_requires_explicit_nullable_identity_fields() {
+        let schema = BuiltinToolName::UpdatePlan.parameters_schema();
+        let required = schema["required"]
+            .as_array()
+            .expect("update_plan required should be an array");
+        let item_schema = &schema["properties"]["plan"]["items"];
+        let item_required = item_schema["required"]
+            .as_array()
+            .expect("update_plan item required should be an array");
+
+        assert!(required.iter().any(|value| value == "planId"));
+        assert!(required.iter().any(|value| value == "expectedGoalId"));
+        assert!(
+            schema["properties"]["expectedGoalId"]["anyOf"]
+                .as_array()
+                .is_some_and(|variants| variants.iter().any(|value| value["type"] == "null"))
+        );
+        assert!(
+            required
+                .iter()
+                .any(|value| value == "expectedGoalControlRevision")
+        );
+        assert!(
+            schema["properties"]["expectedGoalControlRevision"]["anyOf"]
+                .as_array()
+                .is_some_and(|variants| variants.iter().any(|value| value["type"] == "null"))
+        );
+        assert!(
+            schema["properties"]["planId"]["anyOf"]
+                .as_array()
+                .is_some_and(|variants| variants.iter().any(|value| value["type"] == "null"))
+        );
+        assert!(item_required.iter().any(|value| value == "itemId"));
+        assert!(
+            item_schema["properties"]["itemId"]["anyOf"]
+                .as_array()
+                .is_some_and(|variants| variants.iter().any(|value| value["type"] == "null"))
+        );
     }
 }

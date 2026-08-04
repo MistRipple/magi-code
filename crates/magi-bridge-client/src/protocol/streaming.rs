@@ -18,6 +18,9 @@ pub enum ProviderContextStreamDelta {
         field: &'static str,
         value: String,
     },
+    ReasoningContentAppend {
+        value: String,
+    },
 }
 
 pub fn parse_stream_provider_context(
@@ -25,6 +28,19 @@ pub fn parse_stream_provider_context(
     event: &SseEvent,
 ) -> Option<ProviderContextStreamDelta> {
     let envelope = serde_json::from_str::<Value>(&event.data).ok()?;
+    if family == ProviderFamily::OpenAiChat {
+        let value = envelope["choices"]
+            .as_array()?
+            .iter()
+            .find_map(|choice| {
+                choice["delta"]["reasoning_content"]
+                    .as_str()
+                    .or_else(|| choice["delta"]["reasoning"].as_str())
+            })?
+            .to_string();
+        return (!value.is_empty())
+            .then_some(ProviderContextStreamDelta::ReasoningContentAppend { value });
+    }
     if family == ProviderFamily::OpenAiResponses {
         let item = envelope.get("item")?;
         if item["type"].as_str() != Some("reasoning") {
@@ -855,6 +871,20 @@ impl StreamAccumulator {
                     current.push_str(&value);
                 }
             }
+            ProviderContextStreamDelta::ReasoningContentAppend { value } => {
+                let context = self.provider_context.entry(usize::MAX).or_insert_with(|| {
+                    ModelProviderContext {
+                        provider: "openai_chat".to_string(),
+                        kind: "reasoning_content".to_string(),
+                        data: serde_json::json!({"reasoning_content": ""}),
+                    }
+                });
+                let current = context.data["reasoning_content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                context.data["reasoning_content"] = Value::String(format!("{current}{value}"));
+            }
         }
     }
 
@@ -1068,6 +1098,30 @@ mod tests {
         assert_eq!(result.tool_calls.len(), 1);
         assert!(result.tool_calls[0].id.starts_with("call_compat_0_"));
         assert_eq!(result.tool_calls[0].arguments["query"], "Magi");
+    }
+
+    #[test]
+    fn openai_stream_accumulates_reasoning_content_context() {
+        let event = SseEvent {
+            event_type: None,
+            data: r#"{"choices":[{"delta":{"reasoning_content":"先分析"},"finish_reason":null}]}"#
+                .to_string(),
+        };
+        let mut accumulator = StreamAccumulator::new();
+        if let Some(delta) = parse_stream_provider_context(ProviderFamily::OpenAiChat, &event) {
+            accumulator.apply_provider_context(delta);
+        }
+        accumulator.apply_all(&parse_stream_event(ProviderFamily::OpenAiChat, &event));
+
+        let response = accumulator.finalize();
+
+        assert_eq!(response.thinking.as_deref(), Some("先分析"));
+        assert_eq!(response.provider_context.len(), 1);
+        assert_eq!(response.provider_context[0].provider, "openai_chat");
+        assert_eq!(
+            response.provider_context[0].data["reasoning_content"],
+            "先分析"
+        );
     }
 
     #[test]

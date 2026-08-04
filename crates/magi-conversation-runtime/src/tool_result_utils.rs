@@ -3,6 +3,7 @@
 //! runtime 内部的 writeback / round 实现直接访问这些纯函数。
 
 use magi_core::ExecutionResultStatus;
+use std::collections::BTreeMap;
 
 pub const TOOL_EXECUTION_FAILED_PUBLIC_ERROR: &str = "工具执行失败，请稍后重试";
 pub const TOOL_SAFETY_NEEDS_APPROVAL_PUBLIC_ERROR: &str =
@@ -12,6 +13,71 @@ pub const TOOL_SAFETY_NEEDS_APPROVAL_PUBLIC_ERROR: &str =
 pub struct PublicToolError {
     pub error_code: &'static str,
     pub error: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeterministicToolFailure {
+    pub summary: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DeterministicToolFailureTracker {
+    observations: BTreeMap<String, usize>,
+}
+
+impl DeterministicToolFailureTracker {
+    pub fn observe(
+        &mut self,
+        tool_name: &str,
+        result: &str,
+        status: ExecutionResultStatus,
+    ) -> Option<DeterministicToolFailure> {
+        if status == ExecutionResultStatus::Succeeded {
+            let prefix = format!("{tool_name}\u{1f}");
+            self.observations.retain(|key, _| !key.starts_with(&prefix));
+            return None;
+        }
+        if !matches!(
+            status,
+            ExecutionResultStatus::Rejected | ExecutionResultStatus::NeedsApproval
+        ) {
+            return None;
+        }
+        let payload = serde_json::from_str::<serde_json::Value>(result).ok()?;
+        let error_code = payload.get("error_code")?.as_str()?.trim();
+        if !matches!(
+            error_code,
+            "tool_policy_rejected"
+                | "tool_policy_needs_approval"
+                | "tool_safety_rejected"
+                | "tool_safety_needs_approval"
+                | "skill_tool_policy_rejected"
+                | "skill_tool_needs_approval"
+        ) {
+            return None;
+        }
+        let access_profile = payload
+            .get("access_profile")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let key = format!("{tool_name}\u{1f}{error_code}\u{1f}{access_profile}");
+        let observations = self.observations.entry(key).or_default();
+        *observations = observations.saturating_add(1);
+        if *observations < 2 {
+            return None;
+        }
+        let error = payload
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("工具调用被确定性策略拒绝");
+        Some(DeterministicToolFailure {
+            summary: format!("{tool_name} 在当前运行权限下重复被拒绝，已停止重复执行。"),
+            detail: format!(
+                "工具：{tool_name}\n错误码：{error_code}\n访问模式：{access_profile}\n原因：{error}\n相同权限条件下重复调用不会成功；需要改用当前权限允许的工具，或由用户调整访问模式后恢复任务。"
+            ),
+        })
+    }
 }
 
 pub fn tool_execution_status_label(status: ExecutionResultStatus) -> &'static str {
@@ -146,24 +212,7 @@ pub fn summarize_tool_result(result: &str) -> String {
     format!("{}…", &result[..end])
 }
 
-pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) -> String {
-    if matches!(status, ExecutionResultStatus::Succeeded) {
-        return result.to_string();
-    }
-
-    let structured_public_error = serde_json::from_str::<serde_json::Value>(result)
-        .ok()
-        .and_then(|value| value.as_object().cloned())
-        .is_some_and(|payload| {
-            payload.contains_key("error_code")
-                || payload.contains_key("summary")
-                || payload.contains_key("message")
-                || payload.contains_key("error")
-        });
-    if structured_public_error {
-        return summarize_tool_result(result);
-    }
-
+pub fn model_visible_tool_result(result: &str, _status: ExecutionResultStatus) -> String {
     result.to_string()
 }
 
@@ -238,12 +287,55 @@ mod tests {
     }
 
     #[test]
-    fn model_visible_tool_result_summarizes_structured_error() {
-        let result = r#"{"status":"needs_approval","error_code":"tool_policy_needs_approval","error":"受限访问已拦截该操作，请切换为完全访问权限后重试"}"#;
+    fn model_visible_tool_result_keeps_structured_error_for_recovery() {
+        let result = r#"{"status":"needs_approval","error_code":"tool_policy_needs_approval","error":"受限访问已拦截该操作，请切换为完全访问权限后重试","access_profile":"restricted","required_access_profile":"full_access"}"#;
 
         assert_eq!(
             model_visible_tool_result(result, ExecutionResultStatus::NeedsApproval),
-            "受限访问已拦截该操作，请切换为完全访问权限后重试"
+            result
+        );
+    }
+
+    #[test]
+    fn deterministic_policy_failure_stops_after_second_observation() {
+        let mut tracker = DeterministicToolFailureTracker::default();
+        let result = r#"{"status":"needs_approval","error_code":"tool_policy_needs_approval","error":"需要完全访问","access_profile":"restricted"}"#;
+
+        assert!(
+            tracker
+                .observe("shell_exec", result, ExecutionResultStatus::NeedsApproval)
+                .is_none()
+        );
+        let failure = tracker
+            .observe("shell_exec", result, ExecutionResultStatus::NeedsApproval)
+            .expect("第二次相同策略失败必须止损");
+        assert!(failure.summary.contains("停止重复执行"));
+        assert!(failure.detail.contains("tool_policy_needs_approval"));
+    }
+
+    #[test]
+    fn successful_tool_call_resets_deterministic_failure_observations() {
+        let mut tracker = DeterministicToolFailureTracker::default();
+        let result = r#"{"status":"rejected","error_code":"tool_policy_rejected","error":"不可用","access_profile":"read_only"}"#;
+
+        assert!(
+            tracker
+                .observe("shell_exec", result, ExecutionResultStatus::Rejected)
+                .is_none()
+        );
+        assert!(
+            tracker
+                .observe(
+                    "shell_exec",
+                    r#"{"status":"succeeded"}"#,
+                    ExecutionResultStatus::Succeeded,
+                )
+                .is_none()
+        );
+        assert!(
+            tracker
+                .observe("shell_exec", result, ExecutionResultStatus::Rejected)
+                .is_none()
         );
     }
 }

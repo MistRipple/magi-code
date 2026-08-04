@@ -19,6 +19,7 @@
   } from '../stores/goal-store.svelte';
   import { RustDaemonClient } from '../shared/rust-daemon-client';
   import { resolveAgentBaseUrl } from '../web/agent-api';
+  import { readStoredAccessProfile } from '../shared/access-profile';
 
   const currentSessionId = $derived(messagesState.currentSessionId);
   const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
@@ -31,8 +32,12 @@
   let observedActivePlanItemId = '';
   let isEditingGoal = $state(false);
   let goalObjectiveDraft = $state('');
+  let goalBudgetDraft = $state('');
+  let observedBudgetGoalRevision = '';
   let goalActionLoading = $state<'save' | 'pause' | 'resume' | 'clear' | null>(null);
   let planClearLoading = $state(false);
+  let goalClockNow = $state(Date.now());
+  let goalClockObservedAt = $state(Date.now());
 
   $effect(() => {
     ensureGoalState(currentSessionId, currentWorkspaceId, currentWorkspacePathValue());
@@ -41,13 +46,63 @@
   const goalState = $derived(getGoalState(currentSessionId, currentWorkspaceId));
   const currentGoal = $derived<SessionGoalDto | null>(goalState.response?.goal ?? null);
   const currentPlan = $derived<SessionPlanDto | null>(goalState.response?.plan ?? null);
+  const allowedGoalActions = $derived(goalState.response?.allowedActions ?? null);
+  const currentGoalTimeSeconds = $derived.by(() => {
+    if (!currentGoal) return 0;
+    const settledMillis = typeof currentGoal.timeUsedMillis === 'number'
+      && Number.isFinite(currentGoal.timeUsedMillis)
+      ? Math.max(0, currentGoal.timeUsedMillis)
+      : Math.max(0, currentGoal.timeUsedSeconds) * 1000;
+    const timingStartedAt = currentGoal.timingStartedAt;
+    const serverObservedAt = goalState.response?.observedAt;
+    const runningMillis = typeof timingStartedAt === 'number'
+      && Number.isFinite(timingStartedAt)
+      && timingStartedAt > 0
+      && typeof serverObservedAt === 'number'
+      && Number.isFinite(serverObservedAt)
+      ? Math.max(0, serverObservedAt - timingStartedAt)
+        + Math.max(0, goalClockNow - goalClockObservedAt)
+      : 0;
+    return Math.floor((settledMillis + runningMillis) / 1000);
+  });
   const currentPlanItems = $derived<PlanItemDto[]>(
     Array.isArray(currentPlan?.items) ? currentPlan.items : []
   );
 
   $effect(() => {
+    const timingStartedAt = currentGoal?.timingStartedAt;
+    const serverObservedAt = goalState.response?.observedAt;
+    const localObservedAt = Date.now();
+    goalClockNow = localObservedAt;
+    goalClockObservedAt = localObservedAt;
+    if (
+      typeof timingStartedAt !== 'number'
+      || !Number.isFinite(timingStartedAt)
+      || timingStartedAt <= 0
+      || typeof serverObservedAt !== 'number'
+      || !Number.isFinite(serverObservedAt)
+    ) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      goalClockNow = Date.now();
+    }, 1000);
+    return () => window.clearInterval(timer);
+  });
+
+  $effect(() => {
     if (!isEditingGoal) {
       goalObjectiveDraft = currentGoal?.objective ?? '';
+    }
+    if (currentGoal?.status === 'budget_limited') {
+      const revisionKey = `${currentGoal.goalId}:${currentGoal.controlRevision}`;
+      if (observedBudgetGoalRevision !== revisionKey) {
+        observedBudgetGoalRevision = revisionKey;
+        goalBudgetDraft = '';
+      }
+    } else {
+      observedBudgetGoalRevision = '';
+      goalBudgetDraft = '';
     }
   });
 
@@ -176,21 +231,24 @@
     return planItemStatusLabel(item.status);
   }
 
-  function goalStatusLabel(status: string): string {
-    switch (status) {
+  function goalStatusLabel(goal: SessionGoalDto): string {
+    if (goal.status === 'active' && goal.continuation.phase === 'waiting') {
+      return i18n.t('goalPanel.goal.statusWaiting');
+    }
+    switch (goal.status) {
       case 'active': return i18n.t('goalPanel.goal.statusActive');
       case 'paused': return i18n.t('goalPanel.goal.statusPaused');
       case 'blocked': return i18n.t('goalPanel.goal.statusBlocked');
       case 'usage_limited': return i18n.t('goalPanel.goal.statusUsageLimited');
       case 'budget_limited': return i18n.t('goalPanel.goal.statusBudgetLimited');
       case 'complete': return i18n.t('goalPanel.goal.statusComplete');
-      case 'cleared': return i18n.t('goalPanel.goal.statusCleared');
-      default: return status;
+      default: return goal.status;
     }
   }
 
-  function goalStatusIcon(status: string): IconName {
-    switch (status) {
+  function goalStatusIcon(goal: SessionGoalDto): IconName {
+    if (goal.status === 'active' && goal.continuation.phase === 'waiting') return 'clock';
+    switch (goal.status) {
       case 'complete': return 'check-circle';
       case 'paused': return 'pause';
       case 'blocked':
@@ -201,19 +259,22 @@
   }
 
   function goalCanEdit(goal: SessionGoalDto): boolean {
-    return goal.status !== 'complete' && goal.status !== 'cleared';
+    return allowedGoalActions?.canEdit ?? goal.status !== 'complete';
   }
 
   function goalCanPause(goal: SessionGoalDto): boolean {
-    return !currentPlanPaused
-      && !currentPlanBlocked
-      && (goal.status === 'active' || goal.status === 'usage_limited' || goal.status === 'budget_limited');
+    return allowedGoalActions?.canPause
+      ?? (!currentPlanPaused && !currentPlanBlocked && goal.status === 'active');
   }
 
   function goalCanResume(goal: SessionGoalDto): boolean {
-    return goal.status === 'paused'
-      || goal.status === 'blocked'
-      || (currentPlanPaused && currentPlanBlocked);
+    return allowedGoalActions?.canResume
+      ?? (goal.status === 'paused' || goal.status === 'blocked');
+  }
+
+  function goalResumeBudgetValid(goal: SessionGoalDto): boolean {
+    return goal.status !== 'budget_limited'
+      || Number.parseInt(goalBudgetDraft, 10) > goal.tokensUsed;
   }
 
   function goalBudgetLabel(tokensUsed: number, tokenBudget?: number | null): string {
@@ -222,15 +283,6 @@
       return `${used.toLocaleString()} tokens`;
     }
     return `${used.toLocaleString()} / ${Math.round(tokenBudget).toLocaleString()} tokens`;
-  }
-
-  function goalRemainingTokenLabel(tokensUsed: number, tokenBudget?: number | null): string {
-    if (!tokenBudget || tokenBudget <= 0) {
-      return i18n.t('common.unlimited');
-    }
-    const used = Number.isFinite(tokensUsed) ? Math.max(0, Math.round(tokensUsed)) : 0;
-    const remaining = Math.max(0, Math.round(tokenBudget) - used);
-    return `${remaining.toLocaleString()} tokens`;
   }
 
   function goalTimeLabel(seconds: number): string {
@@ -254,10 +306,17 @@
   }
 
   function goalActionRequest() {
+    const newTokenBudget = currentGoal?.status === 'budget_limited'
+      ? Number.parseInt(goalBudgetDraft, 10)
+      : undefined;
     return {
       sessionId: currentSessionIdValue() ?? '',
       workspaceId: currentWorkspaceIdValue(),
       workspacePath: currentWorkspacePathValue(),
+      goalId: currentGoal?.goalId ?? '',
+      expectedRevision: currentGoal?.controlRevision ?? 0,
+      ...(currentPlan ? { expectedPlanRevision: currentPlan.revision } : {}),
+      ...(Number.isFinite(newTokenBudget) ? { newTokenBudget } : {}),
     };
   }
 
@@ -325,8 +384,12 @@
 
   async function resumeGoal(): Promise<void> {
     if (!currentGoal || !goalCanResume(currentGoal)) return;
+    if (!goalResumeBudgetValid(currentGoal)) return;
     await runGoalAction('resume', async () => {
-      await createClient().resumeCurrentGoal(goalActionRequest());
+      await createClient().resumeCurrentGoal({
+        ...goalActionRequest(),
+        accessProfile: readStoredAccessProfile(),
+      });
       await refreshGoalAfterMutation();
       addToast('success', i18n.t('goalPanel.action.goalResumed'));
     }).catch((err) => {
@@ -339,13 +402,7 @@
     if (!currentGoal) return;
     await runGoalAction('clear', async () => {
       const response = await createClient().clearCurrentGoal(goalActionRequest());
-      applyCurrentGoalResponse({
-        sessionId: response.sessionId,
-        workspaceId: response.workspaceId,
-        workspacePath: response.workspacePath,
-        goal: null,
-        plan: null,
-      });
+      applyCurrentGoalResponse(response);
       isEditingGoal = false;
       addToast('info', i18n.t('goalPanel.action.goalCleared'));
     }).catch((err) => {
@@ -404,7 +461,7 @@
             <button
               type="button"
               class="plan-resume-action"
-              disabled={goalActionLoading !== null}
+              disabled={goalActionLoading !== null || !goalResumeBudgetValid(currentGoal)}
               onclick={resumeGoal}
               title={i18n.t('goalPanel.action.resumeBlockedPlan')}
             >
@@ -469,12 +526,12 @@
           aria-expanded={goalDrawerExpanded}
           onclick={() => goalDrawerExpanded = !goalDrawerExpanded}
         >
-          <span class="drawer-leading-icon goal-status-icon"><Icon name={goalStatusIcon(currentGoal.status)} size={14} /></span>
+          <span class="drawer-leading-icon goal-status-icon"><Icon name={goalStatusIcon(currentGoal)} size={14} /></span>
           <span class="goal-heading">
-            <span class="goal-status-title">{goalStatusLabel(currentGoal.status)}</span>
+            <span class="goal-status-title">{goalStatusLabel(currentGoal)}</span>
             <span class="goal-objective">{currentGoal.objective}</span>
           </span>
-          <span class="goal-meta">{goalTimeLabel(currentGoal.timeUsedSeconds)}</span>
+          <span class="goal-meta">{goalTimeLabel(currentGoalTimeSeconds)}</span>
           <Icon name={goalDrawerExpanded ? 'chevron-down' : 'chevron-right'} size={13} class="drawer-chevron" />
         </button>
         <div class="goal-actions">
@@ -494,7 +551,7 @@
             <button
               type="button"
               class="icon-action"
-              disabled={goalActionLoading !== null}
+              disabled={goalActionLoading !== null || !goalResumeBudgetValid(currentGoal)}
               onclick={resumeGoal}
               title={i18n.t('goalPanel.action.resumeGoalTitle')}
               aria-label={i18n.t('goalPanel.action.resumeGoalTitle')}
@@ -531,6 +588,7 @@
             <input
               class="goal-edit-input"
               bind:value={goalObjectiveDraft}
+              maxlength="4000"
               aria-label={i18n.t('goalPanel.action.editGoalTitle')}
             />
             <button
@@ -552,18 +610,25 @@
         {:else}
           <div class="goal-detail">
             <p class="goal-detail-objective-text">{currentGoal.objective}</p>
+            {#if currentGoal.status === 'budget_limited'}
+              <label class="goal-budget-resume-field">
+                <span>{i18n.t('goalPanel.goal.newBudget')}</span>
+                <input
+                  type="number"
+                  min={currentGoal.tokensUsed + 1}
+                  step="1"
+                  bind:value={goalBudgetDraft}
+                />
+              </label>
+            {/if}
             <div class="goal-stat-strip">
               <span class="goal-detail-item">
                 <span class="goal-detail-label">{i18n.t('goalPanel.goal.elapsed')}</span>
-                <strong>{goalTimeLabel(currentGoal.timeUsedSeconds)}</strong>
+                <strong>{goalTimeLabel(currentGoalTimeSeconds)}</strong>
               </span>
               <span class="goal-detail-item">
                 <span class="goal-detail-label">{i18n.t('goalPanel.goal.budget')}</span>
                 <strong>{goalBudgetLabel(currentGoal.tokensUsed, currentGoal.tokenBudget)}</strong>
-              </span>
-              <span class="goal-detail-item">
-                <span class="goal-detail-label">{i18n.t('goalPanel.goal.remaining')}</span>
-                <strong>{goalRemainingTokenLabel(currentGoal.tokensUsed, currentGoal.tokenBudget)}</strong>
               </span>
               <span class="goal-detail-item">
                 <span class="goal-detail-label">{i18n.t('goalPanel.goal.updatedAtShort')}</span>
@@ -616,8 +681,7 @@
     background: color-mix(in srgb, var(--vscode-input-background) 94%, var(--background));
   }
 
-  .goal-panel--paused,
-  .goal-panel--cleared {
+  .goal-panel--paused {
     --goal-tone: var(--foreground-muted);
   }
 
@@ -664,6 +728,26 @@
   .goal-edit-input:focus-visible {
     outline: 2px solid color-mix(in srgb, var(--primary) 58%, transparent);
     outline-offset: 2px;
+  }
+
+  .goal-budget-resume-field {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(120px, 180px);
+    align-items: center;
+    gap: 10px;
+    color: var(--foreground-muted);
+    font-size: 12px;
+  }
+
+  .goal-budget-resume-field input {
+    min-width: 0;
+    height: 28px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--vscode-input-background);
+    color: var(--foreground);
+    font: inherit;
   }
 
   .run-drawer-toggle:focus-visible {

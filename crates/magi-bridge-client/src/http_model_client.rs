@@ -19,7 +19,7 @@ use crate::types::{
 };
 use magi_usage_authority::ReasoningEffort;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
@@ -939,7 +939,6 @@ fn provider_stream_event_error(
 
 fn apply_provider_stream_event(
     provider_family: ProviderFamily,
-    tool_name_codec: ProviderToolNameCodec,
     event: &crate::protocol::streaming::SseEvent,
     accumulator: &mut StreamAccumulator,
     last_content_delta_len: &mut usize,
@@ -956,8 +955,7 @@ fn apply_provider_stream_event(
         return Ok(true);
     }
 
-    let mut llm_chunks = parse_stream_event(provider_family, event);
-    tool_name_codec.decode_stream_chunks(&mut llm_chunks);
+    let llm_chunks = parse_stream_event(provider_family, event);
     accumulator.apply_all(&llm_chunks);
     if let Some(context) = parse_stream_provider_context(provider_family, event) {
         accumulator.apply_provider_context(context);
@@ -1303,7 +1301,6 @@ async fn streaming_http_io(
             saw_sse_event = true;
             if apply_provider_stream_event(
                 provider_family,
-                tool_name_codec.clone(),
                 &sse_event,
                 &mut accumulator,
                 &mut last_content_delta_len,
@@ -1325,7 +1322,6 @@ async fn streaming_http_io(
             saw_sse_event = true;
             if apply_provider_stream_event(
                 provider_family,
-                tool_name_codec.clone(),
                 &sse_event,
                 &mut accumulator,
                 &mut last_content_delta_len,
@@ -1597,7 +1593,12 @@ fn llm_message_params_from_invocation(
     let messages = request
         .messages
         .as_ref()
-        .map(|messages| messages.iter().map(llm_message_from_chat_message).collect())
+        .map(|messages| {
+            normalize_chat_tool_call_history(messages)
+                .iter()
+                .map(llm_message_from_chat_message)
+                .collect()
+        })
         .unwrap_or_else(|| {
             vec![LlmMessage {
                 role: "user".to_string(),
@@ -1625,6 +1626,79 @@ fn llm_message_params_from_invocation(
             }),
         reasoning_effort,
     }
+}
+
+fn normalize_chat_tool_call_history(
+    messages: &[crate::types::ChatMessage],
+) -> Vec<crate::types::ChatMessage> {
+    let mut normalized = Vec::with_capacity(messages.len());
+    let mut result_ids = HashMap::<String, VecDeque<Option<String>>>::new();
+
+    for message in messages {
+        if !message.tool_calls.is_empty() {
+            let mut message = message.clone();
+            let mut calls = Vec::with_capacity(message.tool_calls.len());
+            let mut seen = HashMap::<String, (String, String)>::new();
+            let mut used_ids = HashSet::<String>::new();
+
+            for (index, mut tool_call) in message.tool_calls.into_iter().enumerate() {
+                let original_id = tool_call.id.trim().to_string();
+                let fingerprint = (
+                    tool_call.function.name.clone(),
+                    tool_call.function.arguments.clone(),
+                );
+                if !original_id.is_empty() && seen.get(&original_id) == Some(&fingerprint) {
+                    result_ids.entry(original_id).or_default().push_back(None);
+                    continue;
+                }
+
+                if original_id.is_empty() || used_ids.contains(&original_id) {
+                    let base = crate::protocol::compatible_tool_call_id(
+                        index,
+                        &tool_call.function.name,
+                        &tool_call.function.arguments,
+                    );
+                    let mut candidate = base.clone();
+                    let mut suffix = 1usize;
+                    while used_ids.contains(&candidate) {
+                        candidate = format!("{base}_{suffix}");
+                        suffix += 1;
+                    }
+                    tool_call.id = candidate;
+                } else {
+                    tool_call.id = original_id.clone();
+                }
+
+                seen.insert(original_id.clone(), fingerprint);
+                used_ids.insert(tool_call.id.clone());
+                result_ids
+                    .entry(original_id)
+                    .or_default()
+                    .push_back(Some(tool_call.id.clone()));
+                calls.push(tool_call);
+            }
+
+            message.tool_calls = calls;
+            normalized.push(message);
+            continue;
+        }
+
+        if let Some(original_id) = message.tool_call_id.as_ref()
+            && let Some(ids) = result_ids.get_mut(original_id)
+            && let Some(normalized_id) = ids.pop_front()
+        {
+            if let Some(normalized_id) = normalized_id {
+                let mut message = message.clone();
+                message.tool_call_id = Some(normalized_id);
+                normalized.push(message);
+            }
+            continue;
+        }
+
+        normalized.push(message.clone());
+    }
+
+    normalized
 }
 
 fn llm_message_from_chat_message(message: &crate::types::ChatMessage) -> LlmMessage {
@@ -1993,6 +2067,17 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    fn chat_tool_call(id: &str, path: &str) -> crate::types::ChatToolCall {
+        crate::types::ChatToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: crate::types::ChatToolFunction {
+                name: "file_read".to_string(),
+                arguments: serde_json::json!({"path": path}).to_string(),
+            },
+        }
+    }
+
     #[test]
     fn from_env_returns_none_when_base_url_not_set() {
         // Ensure the env var is not set in this process context.
@@ -2087,6 +2172,99 @@ mod tests {
     }
 
     #[test]
+    fn request_history_coalesces_duplicate_tool_call_and_matching_result() {
+        let duplicate_id = "call_duplicate";
+        let normalized = normalize_chat_tool_call_history(&[
+            crate::types::ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                images: Vec::new(),
+                tool_calls: vec![
+                    chat_tool_call(duplicate_id, "package.json"),
+                    chat_tool_call(duplicate_id, "package.json"),
+                    chat_tool_call("call_unique", "tsconfig.json"),
+                ],
+                tool_call_id: None,
+                provider_context: Vec::new(),
+            },
+            crate::types::ChatMessage {
+                role: "tool".to_string(),
+                content: Some("package contents".to_string()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(duplicate_id.to_string()),
+                provider_context: Vec::new(),
+            },
+            crate::types::ChatMessage {
+                role: "tool".to_string(),
+                content: Some("reused package contents".to_string()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(duplicate_id.to_string()),
+                provider_context: Vec::new(),
+            },
+            crate::types::ChatMessage {
+                role: "tool".to_string(),
+                content: Some("tsconfig contents".to_string()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_unique".to_string()),
+                provider_context: Vec::new(),
+            },
+        ]);
+
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0].tool_calls.len(), 2);
+        assert_eq!(normalized[1].tool_call_id.as_deref(), Some(duplicate_id));
+        assert_eq!(normalized[2].tool_call_id.as_deref(), Some("call_unique"));
+        assert_eq!(normalized[1].content.as_deref(), Some("package contents"));
+    }
+
+    #[test]
+    fn request_history_rewrites_conflicting_duplicate_ids_and_matching_results() {
+        let duplicate_id = "call_duplicate";
+        let normalized = normalize_chat_tool_call_history(&[
+            crate::types::ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                images: Vec::new(),
+                tool_calls: vec![
+                    chat_tool_call(duplicate_id, "package.json"),
+                    chat_tool_call(duplicate_id, "tsconfig.json"),
+                ],
+                tool_call_id: None,
+                provider_context: Vec::new(),
+            },
+            crate::types::ChatMessage {
+                role: "tool".to_string(),
+                content: Some("package contents".to_string()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(duplicate_id.to_string()),
+                provider_context: Vec::new(),
+            },
+            crate::types::ChatMessage {
+                role: "tool".to_string(),
+                content: Some("tsconfig contents".to_string()),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(duplicate_id.to_string()),
+                provider_context: Vec::new(),
+            },
+        ]);
+
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0].tool_calls.len(), 2);
+        assert_eq!(normalized[0].tool_calls[0].id, duplicate_id);
+        assert_ne!(normalized[0].tool_calls[1].id, duplicate_id);
+        assert_eq!(normalized[1].tool_call_id.as_deref(), Some(duplicate_id));
+        assert_eq!(
+            normalized[2].tool_call_id,
+            Some(normalized[0].tool_calls[1].id.clone())
+        );
+    }
+
+    #[test]
     fn build_request_body_sends_chat_message_images_as_multimodal_blocks() {
         let client = HttpModelBridgeClient::new(
             "https://api.example.com/v1".to_string(),
@@ -2154,10 +2332,9 @@ mod tests {
         });
 
         assert_eq!(body["tool_choice"]["type"], "function");
-        assert!(
-            body["tool_choice"]["function"]["name"]
-                .as_str()
-                .is_some_and(|name| name.starts_with("magi_builtin_classify_session_turn_"))
+        assert_eq!(
+            body["tool_choice"]["function"]["name"],
+            "magi_builtin_classify_session_turn"
         );
     }
 
@@ -2248,20 +2425,17 @@ mod tests {
                     .is_some_and(|name| name.starts_with("magi_"))
             );
         }
-        assert!(
-            body["tools"][0]["function"]["name"]
-                .as_str()
-                .is_some_and(|name| name.starts_with("magi_builtin_web_search_"))
+        assert_eq!(
+            body["tools"][0]["function"]["name"],
+            "magi_builtin_web_search"
         );
-        assert!(
-            body["tools"][2]["function"]["name"]
-                .as_str()
-                .is_some_and(|name| name.starts_with("magi_mcp_mcp_repo_inspect_"))
+        assert_eq!(
+            body["tools"][2]["function"]["name"],
+            "magi_mcp_mcp__repo__inspect"
         );
-        assert!(
-            body["tools"][3]["function"]["name"]
-                .as_str()
-                .is_some_and(|name| name.starts_with("magi_skill_skill_review_inspect_"))
+        assert_eq!(
+            body["tools"][3]["function"]["name"],
+            "magi_skill_skill__review__inspect"
         );
         assert!(body["tools"][0].get("origin").is_none());
         assert!(body["tools"][2].get("origin").is_none());
@@ -2625,11 +2799,7 @@ mod tests {
         assert_eq!(body["system"], "系统约束");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "你好");
-        assert!(
-            body["tools"][0]["name"]
-                .as_str()
-                .is_some_and(|name| name.starts_with("magi_builtin_shell_exec_"))
-        );
+        assert_eq!(body["tools"][0]["name"], "magi_builtin_shell_exec");
         assert_eq!(body["tools"][0]["input_schema"]["required"][0], "cmd");
         assert_eq!(body["tool_choice"]["type"], "tool");
         assert_eq!(body["tool_choice"]["name"], body["tools"][0]["name"]);
@@ -2954,11 +3124,35 @@ mod tests {
             HttpModelBridgeProtocol::Responses,
             None,
         );
-        let (url, body, headers) = client.build_probe_request().expect("Responses request");
-        assert_eq!(url, "https://api.openai.com/v1/responses");
+        let request = ModelInvocationRequest {
+            provider: "openai".to_string(),
+            prompt: "读取文件".to_string(),
+            messages: None,
+            tools: Some(vec![crate::types::ChatToolDefinition {
+                kind: "function".to_string(),
+                function: crate::types::ChatToolFunctionDefinition {
+                    name: "file_read".to_string(),
+                    description: "读取文件".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } },
+                        "required": ["path"]
+                    }),
+                },
+                origin: crate::types::ChatToolOrigin::Builtin,
+            }]),
+            tool_choice: Some(crate::types::ChatToolChoice::force_function("file_read")),
+        };
+        let http_request = client
+            .build_http_request(&request, false)
+            .expect("Responses request");
+        assert_eq!(http_request.url, "https://api.openai.com/v1/responses");
+        let body = http_request.body;
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["tools"][0]["name"], "magi_builtin_file_read");
+        assert_eq!(body["tool_choice"]["name"], "magi_builtin_file_read");
         assert_eq!(
-            headers[0],
+            http_request.headers[0],
             ("Authorization".to_string(), "Bearer test-key".to_string())
         );
     }

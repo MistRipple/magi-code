@@ -1,6 +1,6 @@
 use crate::state::ApiState;
 use magi_conversation_runtime::session_writeback::SessionStatePersistCallback;
-use magi_core::{SessionId, TaskId};
+use magi_core::{SessionId, TaskId, public_runtime_excerpt};
 use std::sync::Arc;
 
 fn session_state_persist_callback(state: &ApiState) -> Arc<SessionStatePersistCallback> {
@@ -28,6 +28,11 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     );
     if finalized {
         state.release_session_git_execution_lease(session_id);
+        crate::routes::sessions::record_active_goal_turn_success(
+            state,
+            session_id,
+            root_task_id.as_str(),
+        );
         schedule_next_queued_session_turn(state, session_id);
     }
     finalized
@@ -50,17 +55,40 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         Some(persist_session_state.as_ref()),
     );
     if finalized {
+        let owns_active_plan = state
+            .session_store
+            .active_plan_for_execution_owner(session_id, root_task_id.as_str())
+            .is_some();
         state.release_session_git_execution_lease(session_id);
         let root_completed = state
             .task_store()
             .and_then(|task_store| task_store.get_task(root_task_id))
             .is_some_and(|task| task.status == magi_core::TaskStatus::Completed);
         if root_completed {
-            crate::routes::sessions::record_active_goal_turn_success(state, session_id);
+            crate::routes::sessions::record_active_goal_turn_success(
+                state,
+                session_id,
+                root_task_id.as_str(),
+            );
         } else {
-            crate::routes::sessions::record_active_goal_turn_failure(state, session_id);
+            let failure_reason = state
+                .task_store()
+                .and_then(|task_store| task_store.get_task(root_task_id))
+                .and_then(|task| {
+                    task.output_refs
+                        .into_iter()
+                        .find(|value| !value.trim().is_empty())
+                })
+                .map(|value| public_runtime_excerpt(&value, 4096))
+                .unwrap_or_else(|| runner_status.to_string());
+            crate::routes::sessions::record_active_goal_turn_failure(
+                state,
+                session_id,
+                root_task_id.as_str(),
+                &failure_reason,
+            );
         }
-        if runner_status != "completed" && !root_completed {
+        if runner_status != "completed" && !root_completed && owns_active_plan {
             let plan_store =
                 magi_plan::PlanStore::new(state.session_store.clone(), session_id.clone());
             match plan_store.pause() {
@@ -108,7 +136,12 @@ fn schedule_next_queued_session_turn(state: &ApiState, session_id: &SessionId) {
 }
 
 pub fn schedule_restored_session_turn_queues(state: &ApiState) -> usize {
-    let session_ids = state.queued_regular_session_ids();
+    let mut session_ids = state.queued_regular_session_ids();
+    for session_id in state.session_store.waiting_goal_session_ids() {
+        if !session_ids.contains(&session_id) {
+            session_ids.push(session_id);
+        }
+    }
     for session_id in &session_ids {
         schedule_next_queued_session_turn(state, session_id);
     }
@@ -126,14 +159,53 @@ pub fn reconcile_terminal_session_task_turns(state: &ApiState) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_core::{MissionId, Task, TaskKind, TaskRuntimePayload, TaskStatus, UtcMillis};
+    use magi_core::{
+        AccessProfile, MissionId, Task, TaskKind, TaskRuntimePayload, TaskStatus, UtcMillis,
+    };
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_orchestrator::task_store::TaskStore;
     use magi_session_store::{
-        ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn, SessionStore,
+        ActiveExecutionChain, ActiveExecutionDispatchContext, ActiveExecutionTurn,
+        GoalContinuationPhase, SessionStore, TimelineEntryInput, TimelineEntryKind,
     };
     use magi_workspace::WorkspaceStore;
+
+    #[tokio::test]
+    async fn restored_waiting_goal_is_included_in_startup_scheduling() {
+        let session_store = Arc::new(SessionStore::new());
+        let session_id = SessionId::new("session-restored-waiting-goal");
+        session_store
+            .create_session(session_id.clone(), "restored waiting goal")
+            .expect("session should create");
+        let (_, thread_id) =
+            session_store.ensure_session_mission(&session_id, UtcMillis::now(), || {
+                MissionId::new("mission-restored-waiting-goal")
+            });
+        let goal = session_store
+            .create_goal(
+                session_id.clone(),
+                thread_id,
+                "turn-restored-waiting-goal",
+                "验证启动时恢复 waiting Goal",
+                AccessProfile::Restricted,
+                None,
+            )
+            .expect("goal should create");
+        session_store
+            .mark_goal_continuation_waiting(&session_id, &goal.goal_id, "resume_requested")
+            .expect("goal should enter waiting");
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(16)),
+            session_store,
+            Arc::new(WorkspaceStore::new()),
+            Arc::new(GovernanceService::default()),
+        );
+
+        assert_eq!(schedule_restored_session_turn_queues(&state), 1);
+        tokio::task::yield_now().await;
+    }
 
     #[tokio::test]
     async fn failed_task_terminalization_pauses_session_plan() {
@@ -182,6 +254,8 @@ mod tests {
             .update(magi_plan::UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![magi_plan::UpdatePlanItemInput {
@@ -236,5 +310,122 @@ mod tests {
         let plan = plan_store.snapshot().expect("plan should remain visible");
         assert_eq!(plan.state, magi_core::PlanState::Paused);
         assert_eq!(plan.items[0].status, magi_core::PlanItemStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn fast_completed_goal_turn_releases_continuation_before_scheduling_next_turn() {
+        let session_store = Arc::new(SessionStore::new());
+        let session_id = SessionId::new("session-fast-goal-completion");
+        let root_task_id = TaskId::new("task-fast-goal-completion");
+        let mission_id = MissionId::new("mission-fast-goal-completion");
+        let now = UtcMillis::now();
+        session_store
+            .create_session(session_id.clone(), "fast goal completion")
+            .expect("session should create");
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || mission_id.clone());
+        let goal = session_store
+            .create_goal(
+                session_id.clone(),
+                orchestrator_thread_id,
+                "task-goal-creator",
+                "验证快速完成续跑",
+                AccessProfile::Restricted,
+                None,
+            )
+            .expect("goal should create");
+        session_store
+            .accept_goal_continuation_with_timeline_entry(
+                session_id.clone(),
+                &goal.goal_id,
+                TimelineEntryInput::new(
+                    "timeline-fast-goal-completion",
+                    TimelineEntryKind::NotificationPublished,
+                    "目标自动推进",
+                    now,
+                ),
+                ActiveExecutionChain {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    root_task_id: root_task_id.clone(),
+                    execution_chain_ref: "chain-fast-goal-completion".to_string(),
+                    workspace_id: None,
+                    active_branch_task_ids: vec![root_task_id.clone()],
+                    active_worker_bindings: Vec::new(),
+                    branches: Vec::new(),
+                    recovery_ref: None,
+                    dispatch_context: ActiveExecutionDispatchContext {
+                        accepted_at: now,
+                        entry_id: "timeline-fast-goal-completion".to_string(),
+                        trimmed_text: None,
+                        skill_name: None,
+                    },
+                    current_turn: Some(ActiveExecutionTurn {
+                        turn_id: "turn-fast-goal-completion".to_string(),
+                        turn_seq: now.0,
+                        accepted_at: now,
+                        status: "running".to_string(),
+                        completed_at: None,
+                        user_message: None,
+                        items: Vec::new(),
+                    }),
+                },
+            )
+            .expect("goal continuation should be accepted");
+        assert_eq!(
+            session_store
+                .current_goal(&session_id)
+                .expect("goal should remain")
+                .continuation
+                .phase,
+            GoalContinuationPhase::Running
+        );
+
+        let task_store = Arc::new(TaskStore::new());
+        task_store.insert_task(Task {
+            task_id: root_task_id.clone(),
+            mission_id,
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            kind: TaskKind::LocalAgent,
+            title: "快速完成任务".to_string(),
+            goal: "验证快速完成路径释放 Goal continuation".to_string(),
+            status: TaskStatus::Completed,
+            dependency_ids: Vec::new(),
+            required_children: Vec::new(),
+            policy_snapshot: None,
+            executor_binding: None,
+            completion_contract: magi_core::TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            knowledge_refs: Vec::new(),
+            workspace_scope: None,
+            write_scope: None,
+            input_refs: Vec::new(),
+            output_refs: vec!["快速完成路径已验证".to_string()],
+            evidence_refs: Vec::new(),
+            retry_count: 0,
+            runtime_payload: TaskRuntimePayload::default(),
+            created_at: now,
+            updated_at: now,
+        });
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            session_store.clone(),
+            Arc::new(WorkspaceStore::new()),
+            Arc::new(GovernanceService::default()),
+        )
+        .with_task_store(task_store);
+
+        assert!(finalize_background_session_task_turn_if_root_completed(
+            &state,
+            &session_id,
+            &root_task_id,
+        ));
+        let goal = session_store
+            .current_goal(&session_id)
+            .expect("goal should remain active");
+        assert_eq!(goal.continuation.phase, GoalContinuationPhase::Idle);
+        assert!(goal.continuation.turn_id.is_none());
     }
 }

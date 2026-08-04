@@ -266,6 +266,19 @@ mod tests {
             let definition = definition.expect("public builtin definition");
 
             assert_eq!(definition.function.name, name.as_str());
+            assert_eq!(definition.origin, ChatToolOrigin::Builtin);
+            assert!(
+                definition
+                    .function
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+                "{name:?} 必须能直接映射为跨模型安全工具名"
+            );
+            assert!(
+                format!("magi_builtin_{}", definition.function.name).len() <= 64,
+                "{name:?} 的协议工具名不得触发不透明哈希"
+            );
             assert_eq!(definition.function.description, name.description());
             assert_eq!(definition.function.parameters, name.parameters_schema());
             assert_eq!(definition.function.parameters["type"], "object", "{name:?}");

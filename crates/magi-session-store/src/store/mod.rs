@@ -201,6 +201,8 @@ impl SessionStore {
         prune_incident_notifications(&mut state.notifications);
         sidecar::restore_canonical_turns_from_sidecars(&mut state)
             .expect("persisted sidecar current turn should be canonical-compatible");
+        sidecar::reconcile_terminal_goal_continuations(&mut state);
+        sidecar::reconcile_goal_response_duration_scopes(&mut state);
         Self::from_state(state)
     }
 
@@ -490,8 +492,34 @@ impl SessionStore {
     pub fn upsert_plan(
         &self,
         session_id: &SessionId,
+        plan: SessionPlan,
+        expected_revision: Option<u64>,
+    ) -> DomainResult<SessionPlan> {
+        self.upsert_plan_inner(session_id, plan, expected_revision, None)
+    }
+
+    pub fn upsert_plan_for_goal_progress(
+        &self,
+        session_id: &SessionId,
+        plan: SessionPlan,
+        expected_revision: Option<u64>,
+        expected_goal_id: Option<magi_core::GoalId>,
+        expected_goal_control_revision: Option<u64>,
+    ) -> DomainResult<SessionPlan> {
+        self.upsert_plan_inner(
+            session_id,
+            plan,
+            expected_revision,
+            Some((expected_goal_id, expected_goal_control_revision)),
+        )
+    }
+
+    fn upsert_plan_inner(
+        &self,
+        session_id: &SessionId,
         mut plan: SessionPlan,
         expected_revision: Option<u64>,
+        goal_progress_guard: Option<(Option<magi_core::GoalId>, Option<u64>)>,
     ) -> DomainResult<SessionPlan> {
         let mut state = self
             .state
@@ -507,6 +535,94 @@ impl SessionStore {
         if &plan.session_id != session_id {
             return Err(DomainError::Validation {
                 message: "计划 session_id 与写入作用域不一致".to_string(),
+            });
+        }
+        let unfinished_goal = state
+            .goals
+            .iter()
+            .find(|goal| &goal.session_id == session_id && goal.status.is_unfinished());
+        if let Some(goal) = unfinished_goal {
+            if plan.goal_id.as_ref() != Some(&goal.goal_id) {
+                return Err(DomainError::InvalidState {
+                    message: "unfinished goal plan must be bound to the current goal".to_string(),
+                });
+            }
+            if plan.state == magi_core::PlanState::Active
+                && goal.status != crate::models::GoalStatus::Active
+            {
+                return Err(DomainError::InvalidState {
+                    message: "non-active goal cannot have an active plan".to_string(),
+                });
+            }
+            if goal.status == crate::models::GoalStatus::Active
+                && plan.state == magi_core::PlanState::Paused
+            {
+                return Err(DomainError::InvalidState {
+                    message: "active goal plan cannot be paused independently".to_string(),
+                });
+            }
+        }
+        if let Some((expected_goal_id, expected_goal_control_revision)) = goal_progress_guard {
+            match (
+                unfinished_goal,
+                expected_goal_id.as_ref(),
+                expected_goal_control_revision,
+            ) {
+                (None, None, None) if plan.goal_id.is_none() => {}
+                (None, _, _) => {
+                    return Err(DomainError::InvalidState {
+                        message: "goal no longer exists".to_string(),
+                    });
+                }
+                (Some(goal), None, _) => {
+                    return Err(DomainError::InvalidState {
+                        message: format!("goal id is required; current goal is {}", goal.goal_id),
+                    });
+                }
+                (Some(goal), Some(expected_goal_id), _) if &goal.goal_id != expected_goal_id => {
+                    return Err(DomainError::InvalidState {
+                        message: format!(
+                            "goal id conflict: expected {}, current {}",
+                            expected_goal_id, goal.goal_id
+                        ),
+                    });
+                }
+                (Some(goal), Some(_), None) => {
+                    return Err(DomainError::InvalidState {
+                        message: format!(
+                            "goal control revision is required; current revision is {}",
+                            goal.control_revision
+                        ),
+                    });
+                }
+                (Some(goal), Some(_), Some(expected_goal_control_revision)) => {
+                    if goal.control_revision != expected_goal_control_revision {
+                        return Err(DomainError::InvalidState {
+                            message: format!(
+                                "goal revision conflict: expected {}, current {}",
+                                expected_goal_control_revision, goal.control_revision
+                            ),
+                        });
+                    }
+                    if goal.status != crate::models::GoalStatus::Active {
+                        return Err(DomainError::InvalidState {
+                            message: format!(
+                                "goal is not active and cannot advance its plan: {:?}",
+                                goal.status
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(plan_goal_id) = plan.goal_id.as_ref()
+            && !state
+                .goals
+                .iter()
+                .any(|goal| &goal.session_id == session_id && &goal.goal_id == plan_goal_id)
+        {
+            return Err(DomainError::InvalidState {
+                message: "plan references a non-current goal".to_string(),
             });
         }
         let now = UtcMillis::now();

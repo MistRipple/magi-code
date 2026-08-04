@@ -376,6 +376,7 @@ export interface MessageMetadata {
   turnSeq?: number;
   turnItemId?: string;
   turnItemKind?: string;
+  assistantOutputKind?: 'progress' | 'final' | 'error';
   itemSeq?: number;
   rustStreamItemId?: string;
   rustEventItemId?: string;

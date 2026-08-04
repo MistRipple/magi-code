@@ -227,13 +227,19 @@ fn required_fields_for_empty_call(tool_name: &str, schema: Option<&Value>) -> Ve
 }
 
 fn schema_missing_required_fields(object: &Map<String, Value>, schema: &Value) -> Vec<String> {
+    let properties = schema.get("properties").and_then(Value::as_object);
     schema
         .get("required")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .filter(|field| !field_has_required_value(object.get(*field)))
+        .filter(|field| {
+            !field_has_required_value(
+                object.get(*field),
+                properties.and_then(|properties| properties.get(*field)),
+            )
+        })
         .map(str::to_string)
         .collect()
 }
@@ -248,7 +254,7 @@ fn shell_exec_missing_fields(tool_name: &str, object: &Map<String, Value>) -> Ve
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase);
-    let has_command = field_has_required_value(object.get("command"));
+    let has_command = field_has_required_value(object.get("command"), None);
     let has_terminal_id = object
         .get("terminal_id")
         .is_some_and(|value| value.is_number());
@@ -262,12 +268,27 @@ fn shell_exec_missing_fields(tool_name: &str, object: &Map<String, Value>) -> Ve
     }
 }
 
-fn field_has_required_value(value: Option<&Value>) -> bool {
+fn field_has_required_value(value: Option<&Value>, schema: Option<&Value>) -> bool {
     match value {
-        None | Some(Value::Null) => false,
+        None => false,
+        Some(Value::Null) => schema.is_some_and(schema_allows_null),
         Some(Value::String(value)) => !value.trim().is_empty(),
         Some(_) => true,
     }
+}
+
+fn schema_allows_null(schema: &Value) -> bool {
+    let type_allows_null = match schema.get("type") {
+        Some(Value::String(value)) => value == "null",
+        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some("null")),
+        _ => false,
+    };
+    type_allows_null
+        || ["anyOf", "oneOf"]
+            .into_iter()
+            .filter_map(|keyword| schema.get(keyword).and_then(Value::as_array))
+            .flatten()
+            .any(schema_allows_null)
 }
 
 fn validation_issue(
@@ -382,6 +403,37 @@ mod tests {
             validate_tool_call_batch(&[call("file_read", r#"{"path":"  "}"#)], &definitions);
 
         assert_eq!(batch.invalid_calls[0].issue.missing_fields, ["path"]);
+    }
+
+    #[test]
+    fn schema_required_field_accepts_explicit_null_when_property_is_nullable() {
+        let definitions = vec![definition(
+            "create_goal",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "objective": {"type": "string"},
+                    "token_budget": {
+                        "anyOf": [
+                            {"type": "integer", "minimum": 16000},
+                            {"type": "null"}
+                        ]
+                    }
+                },
+                "required": ["objective", "token_budget"]
+            }),
+        )];
+
+        let batch = validate_tool_call_batch(
+            &[call(
+                "create_goal",
+                r#"{"objective":"读取 Cargo.toml","token_budget":null}"#,
+            )],
+            &definitions,
+        );
+
+        assert_eq!(batch.valid_calls.len(), 1);
+        assert!(batch.invalid_calls.is_empty());
     }
 
     #[test]

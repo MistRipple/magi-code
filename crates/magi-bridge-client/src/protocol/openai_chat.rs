@@ -137,6 +137,16 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
 
             return Ok(AdaptedResponse {
                 content,
+                provider_context: thinking
+                    .as_ref()
+                    .map(|reasoning_content| {
+                        vec![crate::types::ModelProviderContext {
+                            provider: "openai_chat".to_string(),
+                            kind: "reasoning_content".to_string(),
+                            data: json!({"reasoning_content": reasoning_content}),
+                        }]
+                    })
+                    .unwrap_or_default(),
                 thinking,
                 tool_calls,
                 usage,
@@ -146,7 +156,6 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
                     .unwrap_or("stop")
                     .to_string(),
                 raw: Some(envelope.clone()),
-                provider_context: Vec::new(),
             });
         }
 
@@ -395,6 +404,11 @@ mod tests {
 
         assert_eq!(adapted.content, "处理完成");
         assert_eq!(adapted.thinking.as_deref(), Some("已检查工具结果"));
+        assert_eq!(adapted.provider_context.len(), 1);
+        assert_eq!(
+            adapted.provider_context[0].data["reasoning_content"],
+            "已检查工具结果"
+        );
         assert_eq!(adapted.stop_reason, "stop");
     }
 }

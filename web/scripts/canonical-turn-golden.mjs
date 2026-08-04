@@ -107,6 +107,9 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertSplitToolStartedAndResultCollapseIntoOneCard(reducer, projection);
   assertCancelledToolShowsTurnResponseDuration(reducer, projection);
   assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, projection);
+  assertTurnResponseDurationAnchorsToExplicitFinalOutput(reducer, projection);
+  assertCompletedTurnWithoutExplicitFinalHidesResponseDuration(reducer, projection);
+  assertGoalProgressTurnHidesResponseDuration(reducer, projection);
   assertUserImageMetadataProjectsToMessage(reducer, projection, timelineRenderItems);
   assertViewImageToolResultProjectsAsPreview(reducer, projection, viewImagePreview);
   assertAgentSpawnToolCardStaysOnMainlineAndTaskTabsFilterByTaskId(reducer, projection, timelineRenderItems);
@@ -2594,6 +2597,99 @@ function assertFailedToolWithoutAssistantShowsTurnResponseDuration(reducer, proj
     toolArtifact.message.metadata?.responseDurationMs,
     250,
     'failed tool without assistant final should show the terminal turn response duration',
+  );
+}
+
+function assertTurnResponseDurationAnchorsToExplicitFinalOutput(reducer, projection) {
+  const c = baseCase(
+    'explicit-final-duration-anchor',
+    'session-golden-explicit-final-duration',
+    'turn-golden-explicit-final-duration',
+    9300,
+  );
+  const userItem = user(c, 1, '请分多轮调用工具后完成。');
+  const progress = assistantText(c, 2, 'assistant-progress', '第一轮进度。', 'completed', {
+    metadata: { assistantOutputKind: 'progress', modelRound: 0 },
+  });
+  const toolItem = tool(c, 3, 'tool-between-rounds', 'call-between-rounds', 'pwd', 'completed', {
+    stdout: '/tmp',
+  });
+  const finalOutput = assistantText(c, 4, 'assistant-final', '最终回复。', 'completed', {
+    metadata: { assistantOutputKind: 'final', modelRound: 1 },
+  });
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'completed', [userItem, progress, toolItem, finalOutput], {
+      completedAt: 9500,
+      responseDurationMs: 200,
+    }),
+  ]);
+  const artifacts = projection.buildCanonicalTimelineProjection(state).artifacts;
+  const progressArtifact = findArtifactByTurnItemId({ artifacts }, progress.itemId);
+  const finalArtifact = findArtifactByTurnItemId({ artifacts }, finalOutput.itemId);
+
+  assert.ok(progressArtifact, 'progress assistant artifact should exist');
+  assert.ok(finalArtifact, 'final assistant artifact should exist');
+  assert.equal(
+    progressArtifact.message.metadata?.responseDurationMs,
+    undefined,
+    'intermediate model-round output must not receive the turn total duration',
+  );
+  assert.equal(
+    finalArtifact.message.metadata?.responseDurationMs,
+    200,
+    'explicit final output must be the unique turn total duration anchor',
+  );
+}
+
+function assertCompletedTurnWithoutExplicitFinalHidesResponseDuration(reducer, projection) {
+  const c = baseCase(
+    'missing-explicit-final-duration',
+    'session-golden-missing-final-duration',
+    'turn-golden-missing-final-duration',
+    9600,
+  );
+  const userItem = user(c, 1, '请完成本轮。');
+  const progress = assistantText(c, 2, 'assistant-progress-only', '仍在推进。', 'completed', {
+    metadata: { assistantOutputKind: 'progress', modelRound: 0 },
+  });
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'completed', [userItem, progress], {
+      completedAt: 9700,
+      responseDurationMs: 100,
+    }),
+  ]);
+  const artifacts = projection.buildCanonicalTimelineProjection(state).artifacts;
+
+  assert.equal(
+    artifacts.some((artifact) => artifact.message.metadata?.responseDurationMs !== undefined),
+    false,
+    'a completed turn with only progress output must expose the missing final protocol fact',
+  );
+}
+
+function assertGoalProgressTurnHidesResponseDuration(reducer, projection) {
+  const c = baseCase(
+    'goal-progress-duration-scope',
+    'session-golden-goal-progress-duration',
+    'turn-golden-goal-progress-duration',
+    9800,
+  );
+  const errorOutput = assistantText(c, 1, 'assistant-goal-progress-error', '本轮失败，目标仍会继续。', 'failed', {
+    metadata: { assistantOutputKind: 'error' },
+  });
+  const state = reducer.replaceCanonicalTurns(c.sessionId, [
+    turn(c, 'failed', [errorOutput], {
+      completedAt: 9900,
+      responseDurationMs: 100,
+      metadata: { responseDurationScope: 'goal_progress' },
+    }),
+  ]);
+  const artifacts = projection.buildCanonicalTimelineProjection(state).artifacts;
+
+  assert.equal(
+    artifacts.some((artifact) => artifact.message.metadata?.responseDurationMs !== undefined),
+    false,
+    'a terminal execution unit inside an active goal must not look like a completed user turn',
   );
 }
 

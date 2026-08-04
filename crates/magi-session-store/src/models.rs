@@ -807,7 +807,6 @@ pub enum GoalStatus {
     UsageLimited,
     BudgetLimited,
     Complete,
-    Cleared,
 }
 
 impl GoalStatus {
@@ -821,12 +820,57 @@ impl GoalStatus {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GoalBlockerState {
+    pub blocker_key: String,
+    pub reason: String,
+    pub consecutive_turns: u32,
+    pub last_observed_turn_id: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalContinuationPhase {
+    #[default]
+    Idle,
+    Running,
+    Waiting,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GoalContinuationState {
+    #[serde(default)]
+    pub phase: GoalContinuationPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GoalCompletionRecord {
+    pub turn_id: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_revision: Option<u64>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub completed_at: UtcMillis,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionGoal {
     pub goal_id: GoalId,
     pub session_id: SessionId,
     pub thread_id: ThreadId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_turn_id: Option<String>,
     pub objective: String,
     pub status: GoalStatus,
+    #[serde(default = "default_goal_control_revision")]
+    pub control_revision: u64,
     #[serde(default)]
     pub access_profile: AccessProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -836,9 +880,40 @@ pub struct SessionGoal {
     #[serde(default)]
     pub time_used_seconds: u64,
     #[serde(default)]
-    pub consecutive_failure_turns: u32,
+    pub time_used_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing_started_at: Option<UtcMillis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<GoalBlockerState>,
+    #[serde(default)]
+    pub continuation: GoalContinuationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<GoalCompletionRecord>,
     pub created_at: UtcMillis,
     pub updated_at: UtcMillis,
+}
+
+#[derive(Clone, Debug)]
+pub struct InterruptedGoalResumeCheckpoint {
+    pub(crate) goal_before: SessionGoal,
+    pub(crate) plan_before: Option<SessionPlan>,
+    pub(crate) applied_goal_revision: u64,
+    pub(crate) applied_plan_revision: Option<u64>,
+    pub(crate) resumed_turn_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct GoalResumeCheckpoint {
+    pub(crate) goal_before: SessionGoal,
+    pub(crate) plan_before: Option<SessionPlan>,
+    pub(crate) applied_goal_revision: u64,
+    pub(crate) applied_plan_revision: Option<u64>,
+}
+
+fn default_goal_control_revision() -> u64 {
+    1
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -847,6 +922,8 @@ pub struct SessionPlan {
     #[serde(default = "empty_plan_id")]
     pub plan_id: PlanId,
     pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<GoalId>,
     #[serde(default = "default_plan_revision")]
     pub revision: u64,
     #[serde(default = "default_plan_language")]
@@ -1212,15 +1289,18 @@ impl SessionStoreState {
         for notification in &mut notifications {
             notification.normalize_incident();
         }
+        let mut goals = normalize_session_goals(durable_state.goals);
         let mut plans = durable_state.plans;
         normalize_session_plans(&mut plans);
+        bind_unfinished_goal_plans(&goals, &mut plans);
+        normalize_goal_plan_control_states(&mut goals, &mut plans);
         Self {
             current_session_id: durable_state.current_session_id,
             sessions: durable_state.sessions,
             timeline,
             canonical_turns,
             notifications,
-            goals: durable_state.goals,
+            goals,
             plans,
             execution_sidecar_store,
             thread_registry: durable_state.thread_registry,
@@ -1239,6 +1319,66 @@ impl SessionStoreState {
             plans: self.plans.clone(),
             thread_registry: self.thread_registry.clone(),
             thread_context_checkpoints: self.thread_context_checkpoints.clone(),
+        }
+    }
+}
+
+fn normalize_goal_plan_control_states(goals: &mut [SessionGoal], plans: &mut [SessionPlan]) {
+    for goal in goals.iter_mut().filter(|goal| goal.status.is_unfinished()) {
+        let Some(plan) = plans.iter_mut().find(|plan| {
+            plan.session_id == goal.session_id && plan.goal_id.as_ref() == Some(&goal.goal_id)
+        }) else {
+            continue;
+        };
+        if goal.status == GoalStatus::Active && plan.state != PlanState::Active {
+            goal.status = GoalStatus::Paused;
+            goal.blocker = None;
+            goal.continuation = GoalContinuationState::default();
+            goal.control_revision = goal.control_revision.saturating_add(1);
+            goal.updated_at = goal.updated_at.max(plan.updated_at);
+        } else if goal.status != GoalStatus::Active && plan.state == PlanState::Active {
+            plan.state = PlanState::Paused;
+            plan.revision = plan.revision.saturating_add(1);
+            plan.updated_at = plan.updated_at.max(goal.updated_at);
+        }
+    }
+}
+
+fn normalize_session_goals(goals: Vec<SessionGoal>) -> Vec<SessionGoal> {
+    let mut by_session = HashMap::<SessionId, Vec<SessionGoal>>::new();
+    for mut goal in goals {
+        if goal.control_revision == 0 {
+            goal.control_revision = 1;
+        }
+        by_session
+            .entry(goal.session_id.clone())
+            .or_default()
+            .push(goal);
+    }
+
+    let mut current = Vec::with_capacity(by_session.len());
+    for (_, mut candidates) in by_session {
+        candidates.sort_by(|left, right| {
+            left.updated_at
+                .0
+                .cmp(&right.updated_at.0)
+                .then_with(|| left.goal_id.as_str().cmp(right.goal_id.as_str()))
+        });
+        let selected = candidates.pop();
+        if let Some(selected) = selected {
+            current.push(selected);
+        }
+    }
+    current.sort_by(|left, right| left.session_id.as_str().cmp(right.session_id.as_str()));
+    current
+}
+
+fn bind_unfinished_goal_plans(goals: &[SessionGoal], plans: &mut [SessionPlan]) {
+    for plan in plans {
+        if let Some(goal) = goals.iter().find(|goal| goal.session_id == plan.session_id)
+            && (plan.goal_id.is_some() || goal.status.is_unfinished())
+        {
+            plan.goal_id = Some(goal.goal_id.clone());
         }
     }
 }

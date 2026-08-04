@@ -161,6 +161,7 @@ pub fn session_turn_stream_update(
 }
 
 fn published_session_turn_item_from_sidecar(
+    session_store: &SessionStore,
     sidecar: SessionRuntimeSidecar,
     item_id: &str,
     task_store: Option<&TaskStore>,
@@ -175,8 +176,21 @@ fn published_session_turn_item_from_sidecar(
     let response_duration_ms = turn
         .completed_at
         .map(|completed_at| completed_at.0.saturating_sub(turn.accepted_at.0));
-    let canonical_turn = to_canonical_turn(&sidecar.session_id, turn);
-    let canonical_item = to_canonical_turn_item(&sidecar.session_id, turn, &item);
+    let canonical_turn = session_store
+        .canonical_turns_for_session(&sidecar.session_id)
+        .into_iter()
+        .find(|canonical| canonical.turn_id == turn.turn_id)
+        .or_else(|| to_canonical_turn(&sidecar.session_id, turn));
+    let canonical_item = canonical_turn
+        .as_ref()
+        .and_then(|canonical| {
+            canonical
+                .items
+                .iter()
+                .find(|candidate| candidate.item_id == item.item_id)
+        })
+        .cloned()
+        .or_else(|| to_canonical_turn_item(&sidecar.session_id, turn, &item));
     Some(PublishedSessionTurnItem {
         turn_id: turn.turn_id.clone(),
         turn_seq: turn.turn_seq,
@@ -322,6 +336,17 @@ fn to_canonical_worker_ref(item: &ActiveExecutionTurnItem) -> Option<CanonicalWo
 
 fn canonical_item_metadata(item: &ActiveExecutionTurnItem) -> HashMap<String, Value> {
     let mut metadata = item.metadata.clone();
+    if let Some(output_kind) = match item.kind.as_str() {
+        "assistant_stream" => Some("progress"),
+        "assistant_final" => Some("final"),
+        "assistant_error" => Some("error"),
+        _ => None,
+    } {
+        metadata.insert(
+            "assistantOutputKind".to_string(),
+            Value::String(output_kind.to_string()),
+        );
+    }
     if let Some(value) = item
         .request_id
         .as_ref()
@@ -502,7 +527,7 @@ pub fn append_session_turn_item_with_task_store(
         .append_current_turn_item(session_id, item)
         .ok()
         .flatten()?;
-    published_session_turn_item_from_sidecar(sidecar, &item_id, task_store)
+    published_session_turn_item_from_sidecar(session_store, sidecar, &item_id, task_store)
 }
 
 pub fn upsert_session_turn_item(
@@ -524,7 +549,7 @@ pub fn upsert_session_turn_item_with_task_store(
         .upsert_current_turn_item(session_id, item)
         .ok()
         .flatten()?;
-    published_session_turn_item_from_sidecar(sidecar, &item_id, task_store)
+    published_session_turn_item_from_sidecar(session_store, sidecar, &item_id, task_store)
 }
 
 pub fn publish_session_turn_item_event(
@@ -668,7 +693,8 @@ pub fn publish_current_session_turn_item_event(
     let Some(sidecar) = session_store.runtime_sidecar(session_id) else {
         return;
     };
-    let Some(published) = published_session_turn_item_from_sidecar(sidecar, item_id, task_store)
+    let Some(published) =
+        published_session_turn_item_from_sidecar(session_store, sidecar, item_id, task_store)
     else {
         return;
     };
@@ -1309,11 +1335,17 @@ fn execute_session_turn_tool_call_scoped(
                 ExecutionResultStatus::Failed,
             );
         };
+        let goal_turn_id = session_store
+            .runtime_sidecar(session_id)
+            .and_then(|sidecar| sidecar.current_turn)
+            .map(|turn| turn.turn_id)
+            .unwrap_or_else(|| tool_call.id.clone());
         return execute_goal_tool(
             session_store,
             session_id,
             thread_id,
             access_profile,
+            &goal_turn_id,
             canonical,
             &tool_call.function.arguments,
         );
@@ -2065,6 +2097,47 @@ mod tests {
 
         assert!(!canonical.visibility.renderable);
         assert_eq!(canonical.content.as_deref(), Some("目标仍在推进"));
+    }
+
+    #[test]
+    fn canonical_assistant_output_metadata_distinguishes_progress_final_and_error() {
+        let session_id = SessionId::new("session-assistant-output-kind");
+        let thread_id = ThreadId::new("thread-assistant-output-kind");
+        let now = UtcMillis::now();
+
+        for (kind, expected) in [
+            ("assistant_stream", "progress"),
+            ("assistant_final", "final"),
+            ("assistant_error", "error"),
+        ] {
+            let item = session_turn_item(
+                kind,
+                "completed",
+                Some("模型输出".to_string()),
+                Some("内容".to_string()),
+                Some(format!("turn-item-{expected}")),
+                thread_id.clone(),
+            );
+            let turn = ActiveExecutionTurn {
+                turn_id: "turn-assistant-output-kind".to_string(),
+                turn_seq: 1,
+                accepted_at: now,
+                completed_at: Some(now),
+                status: "completed".to_string(),
+                user_message: None,
+                items: vec![item.clone()],
+            };
+
+            let canonical = to_canonical_turn_item(&session_id, &turn, &item)
+                .expect("assistant output should remain canonical");
+            assert_eq!(
+                canonical
+                    .metadata
+                    .get("assistantOutputKind")
+                    .and_then(serde_json::Value::as_str),
+                Some(expected)
+            );
+        }
     }
 
     #[test]
@@ -3134,7 +3207,8 @@ mod tests {
             function: ChatToolFunction {
                 name: BuiltinToolName::CreateGoal.as_str().to_string(),
                 arguments: serde_json::json!({
-                    "objective": "验证 goal 工具写回"
+                    "objective": "验证 goal 工具写回",
+                    "token_budget": null
                 })
                 .to_string(),
             },
@@ -3188,7 +3262,11 @@ mod tests {
                 name: BuiltinToolName::UpdateGoal.as_str().to_string(),
                 arguments: serde_json::json!({
                     "goal_id": created_goal.goal_id,
-                    "status": "complete"
+                    "expected_revision": created_goal.control_revision,
+                    "expected_plan_revision": null,
+                    "status": "complete",
+                    "completion_summary": "Goal 工具写回已完成",
+                    "evidence_refs": ["tool-call-create-goal"]
                 })
                 .to_string(),
             },
@@ -3283,7 +3361,10 @@ mod tests {
             function: ChatToolFunction {
                 name: BuiltinToolName::UpdatePlan.as_str().to_string(),
                 arguments: serde_json::json!({
+                    "planId": null,
                     "expectedRevision": 0,
+                    "expectedGoalId": null,
+                    "expectedGoalControlRevision": null,
                     "language": "zh-CN",
                     "plan": [
                         {"itemId": "first", "step": "推进第一项", "status": "in_progress"},
@@ -3340,6 +3421,8 @@ mod tests {
                 arguments: serde_json::json!({
                     "planId": plan_store.snapshot().expect("plan should exist").plan_id,
                     "expectedRevision": plan_store.snapshot().expect("plan should exist").revision,
+                    "expectedGoalId": null,
+                    "expectedGoalControlRevision": null,
                     "language": "zh-CN",
                     "plan": [
                         {"itemId": "first", "step": "错误状态", "status": "unknown"}
@@ -3564,11 +3647,33 @@ mod tests {
                 .and_then(|message| message.tool_call_id.as_deref()),
             Some("tool-call-approval-shell")
         );
-        assert_eq!(
+        let model_visible_result: serde_json::Value = serde_json::from_str(
             messages
                 .first()
-                .and_then(|message| message.content.as_deref()),
-            Some("受限访问已拦截该操作，请切换为完全访问权限后重试")
+                .and_then(|message| message.content.as_deref())
+                .expect("tool result should be visible to the model"),
+        )
+        .expect("model-visible tool failure should preserve structured json");
+        assert_eq!(
+            model_visible_result["error_code"].as_str(),
+            Some("tool_policy_needs_approval")
+        );
+        assert_eq!(
+            model_visible_result["access_profile"].as_str(),
+            Some("restricted")
+        );
+        assert_eq!(
+            model_visible_result["required_access_profile"].as_str(),
+            Some("full_access")
+        );
+        assert_eq!(
+            model_visible_result["retryable_with_same_arguments"].as_bool(),
+            Some(false)
+        );
+        assert!(
+            model_visible_result["instruction"]
+                .as_str()
+                .is_some_and(|instruction| instruction.contains("不要在相同访问模式下重复调用"))
         );
 
         let canonical_turn = session_store
@@ -3893,9 +3998,13 @@ mod tests {
         let sidecar = session_store
             .runtime_sidecar(&session_id)
             .expect("runtime sidecar should exist");
-        let published =
-            published_session_turn_item_from_sidecar(sidecar, "turn-item-plain-final", None)
-                .expect("plain final item should publish");
+        let published = published_session_turn_item_from_sidecar(
+            &session_store,
+            sidecar,
+            "turn-item-plain-final",
+            None,
+        )
+        .expect("plain final item should publish");
 
         assert_eq!(
             published.current_turn.mission_id, None,

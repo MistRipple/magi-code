@@ -23,8 +23,8 @@ use magi_core::{
 use magi_orchestrator::ExecutionWritebackPlans;
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, CanonicalTurn, CanonicalTurnItemKind,
-    ExecutionThread, ExecutionThreadStatus, SessionStore, ThreadChatImageSource, ThreadChatMessage,
-    ThreadChatToolCall, ThreadChatToolFunction,
+    ExecutionThread, ExecutionThreadStatus, InterruptedGoalResumeCheckpoint, SessionStore,
+    ThreadChatImageSource, ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
 };
 use magi_settings_store::SettingsStore;
 use std::sync::Arc;
@@ -52,6 +52,10 @@ impl InterruptedRecoveryClaimGuard {
     fn commit(mut self) {
         self.committed = true;
     }
+
+    fn turn_id(&self) -> Option<&str> {
+        self.turn_id.as_deref()
+    }
 }
 
 impl Drop for InterruptedRecoveryClaimGuard {
@@ -72,6 +76,61 @@ impl Drop for InterruptedRecoveryClaimGuard {
                 turn_id,
                 "释放异常中断恢复领取权失败"
             );
+        }
+    }
+}
+
+struct InterruptedGoalResumeGuard {
+    session_store: SessionStore,
+    checkpoint: Option<InterruptedGoalResumeCheckpoint>,
+    committed: bool,
+}
+
+impl InterruptedGoalResumeGuard {
+    fn prepare(
+        session_store: &SessionStore,
+        session_id: &SessionId,
+        interrupted_turn_id: Option<&str>,
+        resumed_turn_id: &str,
+        resumed_at: UtcMillis,
+    ) -> Result<Self, ApiError> {
+        let checkpoint = interrupted_turn_id
+            .map(|interrupted_turn_id| {
+                session_store.resume_goal_for_interrupted_execution(
+                    session_id,
+                    interrupted_turn_id,
+                    resumed_turn_id,
+                    resumed_at,
+                )
+            })
+            .transpose()
+            .map_err(|error| ApiError::conflict("继续会话失败", &error.to_string()))?
+            .flatten();
+        Ok(Self {
+            session_store: session_store.clone(),
+            checkpoint,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for InterruptedGoalResumeGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let Some(checkpoint) = self.checkpoint.take() else {
+            return;
+        };
+        if let Err(error) = self
+            .session_store
+            .rollback_interrupted_goal_resume(checkpoint)
+        {
+            tracing::error!(?error, "回滚异常中断关联 Goal 失败");
         }
     }
 }
@@ -401,6 +460,8 @@ pub(crate) async fn continue_execution_chain_with_pre_resume<T, F>(
     state: &ApiState,
     session_id: &SessionId,
     requested_agent_ids: &[WorkerId],
+    resumed_turn_id: &str,
+    resumed_at: UtcMillis,
     prepare_input: F,
 ) -> Result<(SessionContinueAccepted, T), ApiError>
 where
@@ -635,6 +696,13 @@ where
     let recovery_claim = InterruptedRecoveryClaimGuard::claim(&state.session_store, session_id)?;
     restore_missing_resumed_branch_threads(state, session_id, &chain, &branches_to_resume)?;
     let prepared_input = prepare_input(&branches_to_resume)?;
+    let goal_resume_guard = InterruptedGoalResumeGuard::prepare(
+        &state.session_store,
+        session_id,
+        recovery_claim.turn_id(),
+        resumed_turn_id,
+        resumed_at,
+    )?;
 
     // resume 入口幂等地保证 orchestrator thread 存在：
     //  * 已存在 → 直接复用 (同 session 同 mission 同 orchestrator thread 不变量)；
@@ -724,6 +792,7 @@ where
         }
     }
 
+    goal_resume_guard.commit();
     let accepted = SessionContinueAccepted {
         session_id: session_id.clone(),
         mission_id: chain.mission_id,

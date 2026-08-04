@@ -5,6 +5,7 @@ use magi_session_store::{SessionDurableState, SessionExecutionSidecarStoreState,
 use magi_worker_runtime::{WorkerRuntime, WorkerRuntimeDurableSnapshot};
 use magi_workspace::{WorkspaceDurableState, WorkspaceRecoverySidecarStoreState, WorkspaceStore};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -203,7 +204,16 @@ impl StateRepository {
         if !path.exists() {
             return Ok(SessionDurableState::default());
         }
-        self.read_json_value_or_default(path)
+        let content = fs::read_to_string(&path)?;
+        let mut value = match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(value) => value,
+            Err(error) => return self.backup_stale_json(path, error),
+        };
+        migrate_session_goal_state(&mut value);
+        match serde_json::from_value(value) {
+            Ok(value) => Ok(value),
+            Err(error) => self.backup_stale_json(path, error),
+        }
     }
 
     fn backup_stale_json<T>(
@@ -246,6 +256,102 @@ impl StateRepository {
         let content = serde_json::to_vec_pretty(value)?;
         magi_core::fs_atomic::write_atomic(&path, content)?;
         Ok(())
+    }
+}
+
+fn migrate_session_goal_state(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let latest = {
+        let Some(goals) = object
+            .get_mut("goals")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return;
+        };
+        let mut latest = HashMap::<String, (u64, String, bool, bool)>::new();
+        for goal in goals.iter_mut() {
+            let Some(goal) = goal.as_object_mut() else {
+                continue;
+            };
+            goal.remove("consecutiveFailureTurns");
+            let Some(session_id) = goal.get("sessionId").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(goal_id) = goal.get("goalId").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let updated_at = goal
+                .get("updatedAt")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            let status = goal
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let cleared = status == "cleared";
+            let unfinished = matches!(
+                status,
+                "active" | "paused" | "blocked" | "usage_limited" | "budget_limited"
+            );
+            let entry = latest.entry(session_id.to_string()).or_insert((
+                updated_at,
+                goal_id.to_string(),
+                cleared,
+                unfinished,
+            ));
+            if updated_at > entry.0 || (updated_at == entry.0 && goal_id > entry.1.as_str()) {
+                *entry = (updated_at, goal_id.to_string(), cleared, unfinished);
+            }
+        }
+        goals.retain(|goal| {
+            let Some(goal) = goal.as_object() else {
+                return false;
+            };
+            let Some(session_id) = goal.get("sessionId").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            let Some(goal_id) = goal.get("goalId").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            latest
+                .get(session_id)
+                .is_some_and(|(_, latest_goal_id, cleared, _)| {
+                    !cleared && latest_goal_id == goal_id
+                })
+        });
+        latest
+    };
+
+    for plans_key in ["plans", "todo_lists"] {
+        let Some(plans) = object
+            .get_mut(plans_key)
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        plans.retain_mut(|plan| {
+            let Some(plan) = plan.as_object_mut() else {
+                return false;
+            };
+            let Some(session_id) = plan.get("sessionId").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            let Some((_, goal_id, cleared, unfinished)) = latest.get(session_id) else {
+                return true;
+            };
+            if *cleared {
+                return false;
+            }
+            if *unfinished || plan.get("goalId").is_some() {
+                plan.insert(
+                    "goalId".to_string(),
+                    serde_json::Value::String(goal_id.clone()),
+                );
+            }
+            true
+        });
     }
 }
 
@@ -375,6 +481,70 @@ mod tests {
     };
     use std::collections::HashMap;
 
+    #[test]
+    fn legacy_cleared_goal_migrates_to_empty_current_slot() {
+        let mut value = serde_json::json!({
+            "goals": [
+                {
+                    "sessionId": "session-migrated-goal",
+                    "goalId": "goal-complete",
+                    "status": "complete",
+                    "updatedAt": 10,
+                    "consecutiveFailureTurns": 2
+                },
+                {
+                    "sessionId": "session-migrated-goal",
+                    "goalId": "goal-cleared",
+                    "status": "cleared",
+                    "updatedAt": 20,
+                    "consecutiveFailureTurns": 0
+                }
+            ],
+            "todo_lists": [{
+                "sessionId": "session-migrated-goal",
+                "planId": "plan-cleared"
+            }]
+        });
+
+        migrate_session_goal_state(&mut value);
+
+        assert_eq!(value["goals"], serde_json::json!([]));
+        assert_eq!(value["todo_lists"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn legacy_goal_history_collapses_to_latest_goal_and_binds_plan() {
+        let mut value = serde_json::json!({
+            "goals": [
+                {
+                    "sessionId": "session-migrated-goal",
+                    "goalId": "goal-old",
+                    "status": "complete",
+                    "updatedAt": 10,
+                    "consecutiveFailureTurns": 2
+                },
+                {
+                    "sessionId": "session-migrated-goal",
+                    "goalId": "goal-current",
+                    "status": "active",
+                    "updatedAt": 20,
+                    "consecutiveFailureTurns": 1
+                }
+            ],
+            "plans": [{
+                "sessionId": "session-migrated-goal",
+                "planId": "plan-current"
+            }]
+        });
+
+        migrate_session_goal_state(&mut value);
+
+        assert_eq!(value["goals"].as_array().map(Vec::len), Some(1));
+        assert_eq!(value["goals"][0]["goalId"], "goal-current");
+        assert!(value["goals"][0].get("consecutiveFailureTurns").is_none());
+        assert_eq!(value["plans"][0]["goalId"], "goal-current");
+    }
+
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "{prefix}-{}-{}",
@@ -456,6 +626,7 @@ mod tests {
             plans: vec![SessionPlan {
                 plan_id: PlanId::new("plan-persisted"),
                 session_id: session_id.clone(),
+                goal_id: None,
                 revision: 1,
                 language: "zh-CN".to_string(),
                 state: PlanState::Active,

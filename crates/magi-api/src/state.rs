@@ -116,6 +116,8 @@ pub(crate) struct QueuedRegularSessionTurn {
     pub task_tier: TaskTier,
     pub tool_intent: Option<String>,
     pub forced_tool_name: Option<String>,
+    #[serde(default)]
+    pub goal_mode: bool,
     pub required_tool_chain: Vec<String>,
     #[serde(default)]
     pub completion_contract: magi_core::TaskCompletionContract,
@@ -3243,6 +3245,7 @@ mod tests {
             task_tier: TaskTier::ExecutionChain,
             tool_intent: None,
             forced_tool_name: None,
+            goal_mode: false,
             required_tool_chain: Vec::new(),
             completion_contract: magi_core::TaskCompletionContract::default(),
             recovery_checkpoint: None,

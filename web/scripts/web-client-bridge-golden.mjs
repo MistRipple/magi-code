@@ -32,6 +32,7 @@ let workspaceSessionsPayloadOverride = null;
 let pendingChangesRequestCount = 0;
 let pendingChangesPayloadOverride = null;
 let queuedTurnPayloads = [];
+const goalRefreshQueries = [];
 
 class MemoryStorage {
   constructor() {
@@ -374,6 +375,23 @@ function installFetchStub() {
         beforeCursor: null,
       });
     }
+    if (parsed.pathname === '/api/goals/current') {
+      goalRefreshQueries.push(parsed.searchParams);
+      return jsonResponse({
+        sessionId: parsed.searchParams.get('sessionId') || '',
+        workspaceId: parsed.searchParams.get('workspaceId') || '',
+        workspacePath: parsed.searchParams.get('workspacePath') || '',
+        goal: null,
+        plan: null,
+        allowedActions: {
+          canEdit: false,
+          canPause: false,
+          canResume: false,
+          canClear: false,
+          requiresBudgetIncrease: false,
+        },
+      });
+    }
     if (parsed.pathname === '/api/changes' && (!init.method || init.method === 'GET')) {
       pendingChangesRequestCount += 1;
       const sessionId = parsed.searchParams.get('sessionId') || SESSION_ID;
@@ -632,7 +650,7 @@ function completedTurnItemEnvelope() {
     event_type: 'session.turn.item',
     category: 'domain',
     occurred_at: ACCEPTED_AT + 2000,
-    sequence: 4,
+    sequence: 5,
     workspace_id: WORKSPACE_ID,
     session_id: SESSION_ID,
     payload: {
@@ -666,7 +684,41 @@ function messageCreatedEnvelope() {
   };
 }
 
-function laggedEnvelope(sequence = 5) {
+function planUpdatedEnvelope() {
+  return {
+    event_id: 'event-session-plan-updated-goal-refresh',
+    event_type: 'session.plan.updated',
+    category: 'domain',
+    occurred_at: ACCEPTED_AT + 1500,
+    sequence: 4,
+    workspace_id: WORKSPACE_ID,
+    session_id: SESSION_ID,
+    payload: {
+      session_id: SESSION_ID,
+      workspace_id: WORKSPACE_ID,
+      plan: {
+        planId: 'plan-bridge-goal-refresh',
+        sessionId: SESSION_ID,
+        goalId: 'goal-bridge-goal-refresh',
+        revision: 2,
+        language: 'zh-CN',
+        state: 'active',
+        items: [
+          {
+            itemId: 'plan-bridge-goal-refresh-item-1',
+            title: '恢复执行',
+            status: 'in_progress',
+          },
+        ],
+        taskBindings: {},
+        taskStatuses: {},
+        updatedAt: ACCEPTED_AT + 1500,
+      },
+    },
+  };
+}
+
+function laggedEnvelope(sequence = 6) {
   return {
     event_id: `event-stream-lagged-${sequence}`,
     event_type: 'event.stream.lagged',
@@ -858,10 +910,23 @@ await withGoldenViteServer(async (server) => {
     'current-session message events must refresh the workspace session summary without waiting for a full page reload',
   );
 
+  const goalRefreshCountBeforePlanEvent = goalRefreshQueries.length;
+  recoveredStream.onmessage?.({ data: JSON.stringify(planUpdatedEnvelope()) });
+  await waitFor(
+    () => goalRefreshQueries.length > goalRefreshCountBeforePlanEvent,
+    'plan events must refresh the authoritative Goal state because plan snapshots cannot update Goal timing or actions',
+  );
+
   const bootstrapRequestsBeforeTerminalEvent = bootstrapRequestCount;
   summaryUpdatedAt = ACCEPTED_AT + 2_000;
   terminalPublished = true;
   recoveredStream.onmessage?.({ data: JSON.stringify(completedTurnItemEnvelope()) });
+  await waitFor(
+    () => goalRefreshQueries.length > 0,
+    'canonical turn item events must refresh the matching session Goal projection',
+  );
+  assert.equal(goalRefreshQueries.at(-1)?.get('sessionId'), SESSION_ID);
+  assert.equal(goalRefreshQueries.at(-1)?.get('workspaceId'), WORKSPACE_ID);
   await waitFor(
     () => messagesStore.messagesState.isProcessing === false,
     'terminal session turn event with canonical payload must settle processing without waiting for recovery',

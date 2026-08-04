@@ -121,6 +121,15 @@ impl PlanStore {
         let plan = SessionPlan {
             plan_id,
             session_id: self.session_id.clone(),
+            goal_id: current
+                .as_ref()
+                .and_then(|plan| plan.goal_id.clone())
+                .or_else(|| {
+                    input
+                        .expected_goal_id
+                        .as_ref()
+                        .map(|goal_id| magi_core::GoalId::new(goal_id.clone()))
+                }),
             revision: current.as_ref().map_or(1, |plan| plan.revision),
             language: input.language,
             state,
@@ -130,7 +139,13 @@ impl PlanStore {
             updated_at: UtcMillis::now(),
         };
         self.session_store
-            .upsert_plan(&self.session_id, plan, input.expected_revision)
+            .upsert_plan_for_goal_progress(
+                &self.session_id,
+                plan,
+                input.expected_revision,
+                input.expected_goal_id.map(magi_core::GoalId::new),
+                input.expected_goal_control_revision,
+            )
             .map_err(|error| PlanUpdateError::Store(error.to_string()))
     }
 
@@ -230,6 +245,9 @@ impl PlanStore {
 
     pub fn active_item_id(&self) -> Option<PlanItemId> {
         self.snapshot().and_then(|plan| {
+            if plan.state != PlanState::Active {
+                return None;
+            }
             plan.items
                 .into_iter()
                 .find(|item| item.status == PlanItemStatus::InProgress)
@@ -400,6 +418,10 @@ pub struct UpdatePlanInput {
     pub plan_id: Option<String>,
     #[serde(default)]
     pub expected_revision: Option<u64>,
+    #[serde(default)]
+    pub expected_goal_id: Option<String>,
+    #[serde(default)]
+    pub expected_goal_control_revision: Option<u64>,
     pub language: String,
     #[serde(default)]
     pub explanation: Option<String>,
@@ -421,6 +443,7 @@ pub fn parse_update_plan_arguments(
     let mut input = serde_json::from_str::<UpdatePlanInput>(arguments_json)
         .map_err(|error| PlanUpdateError::InvalidJson(error.to_string()))?;
     input.plan_id = normalize_optional_id(input.plan_id);
+    input.expected_goal_id = normalize_optional_id(input.expected_goal_id);
     for item in &mut input.plan {
         item.item_id = normalize_optional_id(item.item_id.take());
     }
@@ -842,6 +865,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![UpdatePlanItemInput {
@@ -862,6 +887,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "en-US".to_string(),
                 explanation: None,
                 plan: vec![
@@ -882,6 +909,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: Some(created.plan_id.to_string()),
                 expected_revision: Some(created.revision),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "en-US".to_string(),
                 explanation: None,
                 plan: vec![
@@ -908,6 +937,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![UpdatePlanItemInput {
@@ -921,6 +952,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: Some(created.plan_id.to_string()),
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![UpdatePlanItemInput {
@@ -940,6 +973,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![UpdatePlanItemInput {
@@ -953,6 +988,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(created.revision),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![UpdatePlanItemInput {
@@ -971,6 +1008,8 @@ mod tests {
             r#"{
                 "planId": "",
                 "expectedRevision": 0,
+                "expectedGoalId": null,
+                "expectedGoalControlRevision": null,
                 "language": "zh-CN",
                 "plan": [{"itemId": "", "step": "检查现状", "status": "in_progress"}]
             }"#,
@@ -988,6 +1027,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![UpdatePlanItemInput {
@@ -1007,6 +1048,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![UpdatePlanItemInput {
@@ -1037,6 +1080,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![
@@ -1073,6 +1118,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![UpdatePlanItemInput {
@@ -1131,6 +1178,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![UpdatePlanItemInput {
@@ -1171,6 +1220,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![
@@ -1220,6 +1271,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![
@@ -1249,6 +1302,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![
@@ -1275,6 +1330,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: Some(created.plan_id.to_string()),
                 expected_revision: Some(created.revision),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![
@@ -1296,6 +1353,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: Some(advanced.plan_id.to_string()),
                 expected_revision: Some(advanced.revision),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![
@@ -1323,6 +1382,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![UpdatePlanItemInput {
@@ -1349,6 +1410,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![UpdatePlanItemInput {
@@ -1367,6 +1430,8 @@ mod tests {
             .update(UpdatePlanInput {
                 plan_id: Some(bound.plan_id.to_string()),
                 expected_revision: Some(bound.revision),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![UpdatePlanItemInput {
@@ -1398,7 +1463,10 @@ mod tests {
             None,
             None,
             &serde_json::json!({
+                "planId": null,
                 "expectedRevision": 0,
+                "expectedGoalId": null,
+                "expectedGoalControlRevision": null,
                 "language": "zh-CN",
                 "plan": [{
                     "itemId": "implement",
@@ -1427,6 +1495,8 @@ mod tests {
             &serde_json::json!({
                 "planId": plan_id,
                 "expectedRevision": revision,
+                "expectedGoalId": null,
+                "expectedGoalControlRevision": null,
                 "language": "zh-CN",
                 "plan": [{
                     "itemId": "implement",
@@ -1460,7 +1530,10 @@ mod tests {
             Some(&task_id),
             None,
             &serde_json::json!({
+                "planId": null,
                 "expectedRevision": 0,
+                "expectedGoalId": null,
+                "expectedGoalControlRevision": null,
                 "language": "zh-CN",
                 "plan": [
                     {
@@ -1501,6 +1574,8 @@ mod tests {
             &serde_json::json!({
                 "planId": plan_id,
                 "expectedRevision": revision,
+                "expectedGoalId": null,
+                "expectedGoalControlRevision": null,
                 "language": "zh-CN",
                 "plan": [
                     {
@@ -1524,5 +1599,28 @@ mod tests {
             advanced["plan"]["taskBindings"][task_id.as_str()].as_str(),
             advanced["plan"]["items"][1]["itemId"].as_str()
         );
+    }
+
+    #[test]
+    fn paused_plan_has_no_active_task_binding_target() {
+        let store = test_store("paused-plan-binding-target");
+        store
+            .update(UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![UpdatePlanItemInput {
+                    item_id: Some("execute".to_string()),
+                    step: "执行任务".to_string(),
+                    status: PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("plan should create");
+        assert!(store.active_item_id().is_some());
+        store.pause().expect("plan should pause");
+        assert!(store.active_item_id().is_none());
     }
 }

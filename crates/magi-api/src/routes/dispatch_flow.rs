@@ -173,10 +173,10 @@ pub(super) async fn accept_goal_continuation_task_submission(
         completion_contract: TaskCompletionContract::default(),
         recovery_checkpoint: None,
         denied_tools: Vec::new(),
-        turn_origin: DispatchTurnOrigin::GoalContinuation,
+        turn_origin: DispatchTurnOrigin::GoalContinuation(goal.goal_id.clone()),
     };
     let accepted = submit_dispatch_submission(state, dispatch)?;
-    if let Err(error) = state.persist_session_state_checkpoint("goal_continuation_task_accepted") {
+    if let Err(error) = state.persist_session_state_checkpoint("goal_continuation_accepted") {
         fail_accepted_task_submission(state, &accepted, error.message());
         return Err(error);
     }
@@ -256,15 +256,33 @@ async fn execute_dispatch_submission(
         super::settings::require_orchestrator_session_model(state, &session_id)?;
     }
     state
-        .session_store
-        .set_active_goal_access_profile(&session_id, request.requested_access_profile())
-        .map_err(|error| ApiError::internal_assembly("更新 active goal 访问模式失败", error))?;
-    state
         .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
         .await?;
     state
         .ensure_session_code_context(&session_id, &workspace_id)
         .await?;
+    if request.goal_mode {
+        state
+            .session_store
+            .set_active_goal_access_profile(&session_id, request.requested_access_profile())
+            .map_err(|error| ApiError::internal_assembly("更新 active goal 访问模式失败", error))?;
+    } else if let Some((_goal, plan)) = state
+        .session_store
+        .pause_active_goal_for_diversion(&session_id)
+        .map_err(|error| ApiError::internal_assembly("切换任务时暂停当前 Goal 失败", error))?
+    {
+        if let Some(plan) = plan.as_ref() {
+            magi_plan::publish_plan_event(
+                &state.event_bus,
+                magi_plan::plan_event_type(plan),
+                plan,
+                workspace_id.as_ref(),
+                None,
+                None,
+            );
+        }
+        state.persist_session_state_checkpoint("goal_paused_for_diversion")?;
+    }
     let user_timeline_entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let action_task_title = format_action_task_title(&mission_title);
 

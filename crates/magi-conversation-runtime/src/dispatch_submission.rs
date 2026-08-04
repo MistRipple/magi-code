@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use magi_agent_role::AgentRoleRegistry;
 use magi_bridge_client::ModelBridgeClient;
 use magi_core::{
-    AccessProfile, DomainError, ExecutionOwnership, MissionId, PlanItemId, SessionId,
+    AccessProfile, DomainError, ExecutionOwnership, GoalId, MissionId, PlanItemId, SessionId,
     TaskCompletionContract, TaskExecutionTarget, TaskExecutorBinding, TaskId, TaskKind,
     TaskRecoveryCheckpoint, TaskStatus, TaskTier, UtcMillis, WorkerId, WorkspaceId,
 };
@@ -21,7 +21,8 @@ use magi_orchestrator::{
 use magi_session_store::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurn, CanonicalTurnItemKind,
-    SessionStore, TimelineEntryInput, TimelineEntryKind,
+    SessionStore, ThreadChatMessage, ThreadContextCheckpoint, TimelineEntryInput,
+    TimelineEntryKind,
 };
 use magi_spawn_graph::SpawnGraph;
 
@@ -45,22 +46,29 @@ pub struct DispatchSubmissionGraph {
 ///
 /// 用户输入和 Goal 自动续跑都使用同一条 ExecutionChain；区别只体现在持久化的
 /// 时间线及 canonical item，可见性不能再由另一套 session runner 决定。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DispatchTurnOrigin {
     User,
-    GoalContinuation,
+    GoalContinuation(GoalId),
 }
 
 impl DispatchTurnOrigin {
-    fn timeline_kind(self) -> TimelineEntryKind {
+    fn timeline_kind(&self) -> TimelineEntryKind {
         match self {
             Self::User => TimelineEntryKind::UserMessage,
-            Self::GoalContinuation => TimelineEntryKind::NotificationPublished,
+            Self::GoalContinuation(_) => TimelineEntryKind::NotificationPublished,
         }
     }
 
-    fn creates_user_message_item(self) -> bool {
+    fn creates_user_message_item(&self) -> bool {
         matches!(self, Self::User)
+    }
+
+    fn continuation_goal_id(&self) -> Option<&GoalId> {
+        match self {
+            Self::User => None,
+            Self::GoalContinuation(goal_id) => Some(goal_id),
+        }
     }
 }
 
@@ -152,7 +160,9 @@ impl DispatchSubmissionAcceptError {
                 if message.contains("最近轮次")
                     || message.contains("最后一轮")
                     || message.contains("不是已停止")
-                    || message.contains("不是用户主动停止") =>
+                    || message.contains("不是用户主动停止")
+                    || message.contains("only an active goal can start continuation")
+                    || message.contains("goal continuation is already running") =>
             {
                 Self::Conflict { message }
             }
@@ -333,6 +343,25 @@ pub fn run_dispatch_submission(
             )
         })?;
 
+    // 恢复来源校验必须先于任何任务、thread 或事件写入。否则无效检查点会在返回错误时
+    // 留下没有 execution chain 的 pending task。
+    let interrupted_turn_checkpoint = request
+        .recovery_checkpoint
+        .as_ref()
+        .map(|checkpoint| prepare_interrupted_turn_checkpoint(runtime.session_store, checkpoint))
+        .transpose()?;
+    // Skill 是本轮方法上下文，不是角色路由信号。聊天框进入的主线任务必须保留 coordinator
+    // 权限面，具体 worker role 只能由显式 target_role 或后续 agent_spawn 决定。
+    let target_role = request.target_role.as_deref().unwrap_or("coordinator");
+    if !runtime
+        .agent_role_registry
+        .role_supports_task_kind(target_role, TaskKind::LocalAgent)
+    {
+        return Err(DispatchSubmissionRunError::InvalidInput(format!(
+            "role {target_role} 不支持 local_agent 任务"
+        )));
+    }
+
     let now = UtcMillis::now();
     let (mission_id, orchestrator_thread_id) =
         runtime
@@ -345,17 +374,6 @@ pub fn run_dispatch_submission(
     let act_task_id = TaskId::new(format!("task-local-agent-{}", accepted_at.0));
 
     let task_goal_text = execution_goal.to_string();
-    // Skill 是本轮方法上下文，不是角色路由信号。聊天框进入的主线任务必须保留 coordinator
-    // 权限面，具体 worker role 只能由显式 target_role 或后续 agent_spawn 决定。
-    let target_role = request.target_role.as_deref().unwrap_or("coordinator");
-    if !runtime
-        .agent_role_registry
-        .role_supports_task_kind(target_role, TaskKind::LocalAgent)
-    {
-        return Err(DispatchSubmissionRunError::InvalidInput(format!(
-            "role {target_role} 不支持 local_agent 任务"
-        )));
-    }
     let plan_store =
         magi_plan::PlanStore::from_store(runtime.session_store, request.session_id.clone());
     let plan_item_id = plan_store.active_item_id();
@@ -409,13 +427,13 @@ pub fn run_dispatch_submission(
         &act_task_id,
         now,
     );
-    if let Some(recovery_checkpoint) = request.recovery_checkpoint.as_ref() {
-        seed_interrupted_turn_checkpoint(
+    if let Some(checkpoint) = interrupted_turn_checkpoint {
+        install_interrupted_turn_checkpoint(
             runtime.session_store,
-            recovery_checkpoint,
             &worker_thread_id,
+            checkpoint,
             now,
-        )?;
+        );
     }
     let ownership = ExecutionOwnership {
         session_id: Some(session_id.clone()),
@@ -487,9 +505,9 @@ pub fn run_dispatch_submission(
             .unwrap_or_else(|| format!("turn-item-user-{}", accepted_at.0))
     });
     let mut current_turn = ActiveExecutionTurn {
-        turn_id: match request.turn_origin {
+        turn_id: match &request.turn_origin {
             DispatchTurnOrigin::User => format!("turn-session-action-{}", accepted_at.0),
-            DispatchTurnOrigin::GoalContinuation => {
+            DispatchTurnOrigin::GoalContinuation(_) => {
                 format!("turn-goal-continuation-{}-{}", session_id, accepted_at.0)
             }
         },
@@ -584,12 +602,15 @@ pub fn run_dispatch_submission(
     })
 }
 
-fn seed_interrupted_turn_checkpoint(
+struct InterruptedTurnCheckpointSeed {
+    message_history: Vec<ThreadChatMessage>,
+    context_checkpoint: Option<ThreadContextCheckpoint>,
+}
+
+fn prepare_interrupted_turn_checkpoint(
     session_store: &SessionStore,
     checkpoint: &TaskRecoveryCheckpoint,
-    destination_thread_id: &magi_core::ThreadId,
-    now: UtcMillis,
-) -> Result<(), DispatchSubmissionRunError> {
+) -> Result<InterruptedTurnCheckpointSeed, DispatchSubmissionRunError> {
     let source_turn = session_store
         .canonical_turns_for_session(&checkpoint.source_session_id)
         .into_iter()
@@ -650,13 +671,21 @@ fn seed_interrupted_turn_checkpoint(
             checkpoint.source_task_id
         )));
     }
-    let source_checkpoint = session_store.thread_context_checkpoint(&checkpoint.source_thread_id);
-    session_store.replace_thread_messages(
-        destination_thread_id,
-        source_thread.message_history,
-        now,
-    );
-    if let Some(source_checkpoint) = source_checkpoint {
+    let context_checkpoint = session_store.thread_context_checkpoint(&checkpoint.source_thread_id);
+    Ok(InterruptedTurnCheckpointSeed {
+        message_history: source_thread.message_history,
+        context_checkpoint,
+    })
+}
+
+fn install_interrupted_turn_checkpoint(
+    session_store: &SessionStore,
+    destination_thread_id: &magi_core::ThreadId,
+    checkpoint: InterruptedTurnCheckpointSeed,
+    now: UtcMillis,
+) {
+    session_store.replace_thread_messages(destination_thread_id, checkpoint.message_history, now);
+    if let Some(source_checkpoint) = checkpoint.context_checkpoint {
         session_store.install_thread_context_checkpoint(
             destination_thread_id,
             magi_session_store::ThreadContextCheckpoint {
@@ -666,7 +695,6 @@ fn seed_interrupted_turn_checkpoint(
             now,
         );
     }
-    Ok(())
 }
 
 pub fn accept_dispatch_submission(
@@ -677,7 +705,21 @@ pub fn accept_dispatch_submission(
     graph: DispatchSubmissionGraph,
 ) -> Result<DispatchSubmissionAccepted, DispatchSubmissionAcceptError> {
     if let Some(active_execution_chain) = graph.active_execution_chain.clone() {
-        let accept_result = if let Some(replace_turn_id) = request.replace_turn_id.as_deref() {
+        let accept_result = if let Some(goal_id) = request.turn_origin.continuation_goal_id() {
+            session_store
+                .accept_goal_continuation_with_timeline_entry(
+                    request.session_id.clone(),
+                    goal_id,
+                    TimelineEntryInput::new(
+                        request.entry_id.clone(),
+                        request.turn_origin.timeline_kind(),
+                        request.timeline_message.clone(),
+                        request.accepted_at,
+                    ),
+                    active_execution_chain,
+                )
+                .map(|_| None)
+        } else if let Some(replace_turn_id) = request.replace_turn_id.as_deref() {
             session_store
                 .replace_current_turn_with_active_execution_chain_and_timeline_entry(
                     request.session_id.clone(),
@@ -766,8 +808,8 @@ pub fn accept_dispatch_submission(
 mod tests {
     use super::*;
     use magi_session_store::{
-        ExecutionThread, ExecutionThreadStatus, ThreadChatMessage, ThreadChatToolCall,
-        ThreadChatToolFunction,
+        ExecutionThread, ExecutionThreadStatus, GoalContinuationPhase, GoalStatus,
+        ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction,
     };
 
     #[test]
@@ -1068,6 +1110,144 @@ mod tests {
         );
     }
 
+    #[test]
+    fn invalid_interrupted_turn_checkpoint_is_rejected_before_dispatch_side_effects() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-invalid-resume-checkpoint");
+        let source_task_id = TaskId::new("task-invalid-resume-source");
+        let now = UtcMillis(3_500);
+
+        session_store
+            .create_session(session_id.clone(), "invalid resume checkpoint")
+            .expect("session should be creatable");
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, now, || {
+                MissionId::new("mission-invalid-resume-checkpoint")
+            });
+        session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-invalid-resume-source".to_string(),
+                    turn_seq: now.0,
+                    accepted_at: now,
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("继续验证".to_string()),
+                    items: vec![ActiveExecutionTurnItem {
+                        item_id: "user-invalid-resume-source".to_string(),
+                        item_seq: 1,
+                        kind: "user_message".to_string(),
+                        status: "completed".to_string(),
+                        source: "user".to_string(),
+                        title: None,
+                        content: Some("继续验证".to_string()),
+                        task_id: Some(source_task_id.clone()),
+                        worker_id: None,
+                        role_id: None,
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_status: None,
+                        tool_arguments: None,
+                        tool_result: None,
+                        tool_error: None,
+                        request_id: None,
+                        user_message_id: None,
+                        placeholder_message_id: None,
+                        metadata: Default::default(),
+                        timeline_entry_id: None,
+                        source_thread_id: orchestrator_thread_id.clone(),
+                    }],
+                },
+            )
+            .expect("source turn should persist");
+        session_store
+            .interrupt_current_turn_by_user(&session_id)
+            .expect("source turn should be interrupted by user");
+        let thread_count_before = session_store.thread_registry_snapshot(&session_id).len();
+        let event_count_before = event_bus.snapshot().recent_events.len();
+        let request = DispatchSubmissionRequest {
+            accepted_at: UtcMillis(4_000),
+            session_id: session_id.clone(),
+            workspace_id: Some(WorkspaceId::new("workspace-invalid-resume-checkpoint")),
+            entry_id: "timeline-invalid-resume-checkpoint".to_string(),
+            timeline_message: "继续".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            created_session: false,
+            mission_title: "继续中断任务".to_string(),
+            task_title: "继续: 验证恢复原子性".to_string(),
+            trimmed_text: Some("继续".to_string()),
+            execution_goal: Some("继续验证恢复原子性".to_string()),
+            task_tier: TaskTier::ExecutionChain,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            goal_mode: false,
+            target_role: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            replace_turn_id: None,
+            required_tool_chain: vec!["shell_exec".to_string()],
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: Some(TaskRecoveryCheckpoint {
+                source_session_id: session_id.clone(),
+                source_task_id,
+                source_turn_id: "turn-invalid-resume-source".to_string(),
+                // 主线 thread 不处理 action task，正是本次真实故障中的错误参数。
+                source_thread_id: orchestrator_thread_id,
+            }),
+            denied_tools: Vec::new(),
+            turn_origin: DispatchTurnOrigin::User,
+        };
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: None,
+        };
+
+        let error = match run_dispatch_submission(&runtime, &request) {
+            Ok(_) => panic!("mismatched source thread should reject dispatch"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .into_message()
+                .contains("续接来源 Thread 与任务不匹配")
+        );
+        assert!(task_store.all_tasks().is_empty());
+        assert!(
+            execution_registry
+                .get(&TaskId::new("task-local-agent-4000"))
+                .is_none()
+        );
+        assert_eq!(
+            session_store.thread_registry_snapshot(&session_id).len(),
+            thread_count_before,
+            "拒绝恢复不得创建空的 task thread",
+        );
+        assert_eq!(event_bus.snapshot().recent_events.len(), event_count_before);
+        assert_eq!(
+            session_store
+                .canonical_turns_for_session(&session_id)
+                .last()
+                .map(|turn| turn.status),
+            Some(magi_session_store::CanonicalTurnStatus::Cancelled),
+        );
+    }
+
     /// 任务系统验收：所有 action task 统一走 ExecutionChain 路径。
     ///
     /// 验收点：
@@ -1178,6 +1358,8 @@ mod tests {
             .update(magi_plan::UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![
@@ -1497,9 +1679,23 @@ mod tests {
         session_store
             .create_session(session_id.clone(), "goal continuation dispatch")
             .expect("session should be creatable");
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, UtcMillis(4_999), || {
+                MissionId::new("mission-goal-continuation-dispatch")
+            });
+        let goal = session_store
+            .create_goal(
+                session_id.clone(),
+                orchestrator_thread_id,
+                "task-goal-creator",
+                "完成验收",
+                AccessProfile::Restricted,
+                None,
+            )
+            .expect("goal should be creatable");
         let request = DispatchSubmissionRequest {
             accepted_at: UtcMillis(5_000),
-            session_id,
+            session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-goal-continuation-dispatch")),
             entry_id: "timeline-goal-continuation-dispatch".to_string(),
             timeline_message: "目标自动推进: 完成验收".to_string(),
@@ -1523,7 +1719,7 @@ mod tests {
             completion_contract: TaskCompletionContract::default(),
             recovery_checkpoint: None,
             denied_tools: Vec::new(),
-            turn_origin: DispatchTurnOrigin::GoalContinuation,
+            turn_origin: DispatchTurnOrigin::GoalContinuation(goal.goal_id.clone()),
         };
         let runtime = DispatchSubmissionRuntime {
             session_store: &session_store,
@@ -1540,8 +1736,12 @@ mod tests {
         let graph = run_dispatch_submission(&runtime, &request).expect("dispatch should build");
         let chain = graph
             .active_execution_chain
+            .as_ref()
             .expect("execution chain should exist");
-        let turn = chain.current_turn.expect("continuation turn should exist");
+        let turn = chain
+            .current_turn
+            .as_ref()
+            .expect("continuation turn should exist");
         assert!(turn.user_message.is_none());
         assert!(turn.items.is_empty());
         let root_task = task_store
@@ -1552,5 +1752,170 @@ mod tests {
             Some("coordinator")
         );
         assert_eq!(root_task.required_tool_chain(), ["get_goal"]);
+        let root_task_id = graph.root_task_id.clone();
+        accept_dispatch_submission(
+            &session_store,
+            Some(&task_store),
+            &execution_registry,
+            request,
+            graph,
+        )
+        .expect("continuation should be accepted");
+        let accepted_goal = session_store
+            .current_goal(&session_id)
+            .expect("goal should remain visible");
+        assert_eq!(
+            accepted_goal.continuation.phase,
+            GoalContinuationPhase::Running
+        );
+        assert_eq!(
+            accepted_goal.continuation.turn_id.as_deref(),
+            Some(root_task_id.as_str())
+        );
+        assert!(
+            session_store
+                .runtime_sidecar(&session_id)
+                .and_then(|sidecar| sidecar.current_turn)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn paused_goal_rejects_built_continuation_without_leaving_pending_turn() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-goal-continuation-pause-race");
+        session_store
+            .create_session(session_id.clone(), "goal continuation pause race")
+            .expect("session should be creatable");
+        let (_, orchestrator_thread_id) =
+            session_store.ensure_session_mission(&session_id, UtcMillis(5_999), || {
+                MissionId::new("mission-goal-continuation-pause-race")
+            });
+        let goal = session_store
+            .create_goal(
+                session_id.clone(),
+                orchestrator_thread_id,
+                "task-goal-creator",
+                "验证暂停竞态",
+                AccessProfile::Restricted,
+                None,
+            )
+            .expect("goal should be creatable");
+        let request = DispatchSubmissionRequest {
+            accepted_at: UtcMillis(6_000),
+            session_id: session_id.clone(),
+            workspace_id: Some(WorkspaceId::new("workspace-goal-continuation-pause-race")),
+            entry_id: "timeline-goal-continuation-pause-race".to_string(),
+            timeline_message: "目标自动推进: 验证暂停竞态".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            created_session: false,
+            mission_title: "目标自动推进".to_string(),
+            task_title: "执行: 目标自动推进".to_string(),
+            trimmed_text: None,
+            execution_goal: Some("先读取当前目标，再继续推进".to_string()),
+            task_tier: TaskTier::ExecutionChain,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            goal_mode: true,
+            target_role: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            replace_turn_id: None,
+            required_tool_chain: vec!["get_goal".to_string()],
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            denied_tools: Vec::new(),
+            turn_origin: DispatchTurnOrigin::GoalContinuation(goal.goal_id.clone()),
+        };
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: None,
+        };
+
+        let graph = run_dispatch_submission(&runtime, &request).expect("dispatch should build");
+        let root_task_id = graph.root_task_id.clone();
+        let mut clear_request = request.clone();
+        clear_request.accepted_at = UtcMillis(6_001);
+        clear_request.entry_id = "timeline-goal-continuation-clear-race".to_string();
+        clear_request.timeline_message = "目标自动推进: 验证清除竞态".to_string();
+        session_store
+            .pause_goal_with_plan(&session_id, &goal.goal_id, goal.control_revision, None)
+            .expect("goal should pause before acceptance");
+
+        assert!(
+            accept_dispatch_submission(
+                &session_store,
+                Some(&task_store),
+                &execution_registry,
+                request,
+                graph,
+            )
+            .is_err()
+        );
+        assert!(task_store.get_task(&root_task_id).is_none());
+        assert!(execution_registry.get(&root_task_id).is_none());
+        assert!(
+            session_store
+                .runtime_sidecar(&session_id)
+                .and_then(|sidecar| sidecar.current_turn)
+                .is_none()
+        );
+        assert!(
+            session_store
+                .timeline_for_session(&session_id)
+                .iter()
+                .all(|entry| entry.entry_id != "timeline-goal-continuation-pause-race")
+        );
+        let paused = session_store
+            .current_goal(&session_id)
+            .expect("paused goal should remain");
+        assert_eq!(paused.status, GoalStatus::Paused);
+        assert_eq!(paused.continuation.phase, GoalContinuationPhase::Idle);
+
+        let clear_graph = run_dispatch_submission(&runtime, &clear_request)
+            .expect("dispatch should build before goal clear");
+        let clear_root_task_id = clear_graph.root_task_id.clone();
+        session_store
+            .clear_goal_with_plan(&session_id, &goal.goal_id, paused.control_revision, None)
+            .expect("goal should clear before acceptance");
+        assert!(
+            accept_dispatch_submission(
+                &session_store,
+                Some(&task_store),
+                &execution_registry,
+                clear_request,
+                clear_graph,
+            )
+            .is_err()
+        );
+        assert!(task_store.get_task(&clear_root_task_id).is_none());
+        assert!(execution_registry.get(&clear_root_task_id).is_none());
+        assert!(session_store.current_goal(&session_id).is_none());
+        assert!(
+            session_store
+                .runtime_sidecar(&session_id)
+                .and_then(|sidecar| sidecar.current_turn)
+                .is_none()
+        );
+        assert!(
+            session_store
+                .timeline_for_session(&session_id)
+                .iter()
+                .all(|entry| entry.entry_id != "timeline-goal-continuation-clear-race")
+        );
     }
 }

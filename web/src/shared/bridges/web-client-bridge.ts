@@ -1782,25 +1782,23 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       const eventRevision = typeof event.payload.revision === 'number'
         ? event.payload.revision
         : null;
-      const applied = applySessionPlanSnapshot(
+      applySessionPlanSnapshot(
         sessionId,
         workspaceId,
         null,
         eventPlanId,
         eventRevision,
       );
-      if (!applied) {
-        void refreshCurrentGoal(sessionId, workspaceId, currentWorkspacePath);
-      }
+      void refreshCurrentGoal(sessionId, workspaceId, currentWorkspacePath);
     } else if (sessionId && plan && typeof plan === 'object' && !Array.isArray(plan)) {
-      const applied = applySessionPlanSnapshot(
+      applySessionPlanSnapshot(
         sessionId,
         workspaceId,
         plan as unknown as SessionPlanDto,
       );
-      if (!applied) {
-        void refreshCurrentGoal(sessionId, workspaceId, currentWorkspacePath);
-      }
+      // plan 事件只携带 plan，不能据此推导 Goal 状态、计时和 allowedActions。
+      // 先增量展示计划，再读取权威 Goal 快照，避免恢复链已运行而卡片仍显示暂停。
+      void refreshCurrentGoal(sessionId, workspaceId, currentWorkspacePath);
     }
     return;
   }
@@ -1850,6 +1848,11 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
   if (eventType === 'session.turn.item') {
     if (handleSessionTurnItemEvent(event)) {
+      const sessionId = rustEventSessionId(event) || currentSessionId;
+      const workspaceId = rustEventWorkspaceId(event) || currentWorkspaceId;
+      if (sessionId) {
+        void refreshCurrentGoal(sessionId, workspaceId, currentWorkspacePath);
+      }
       return;
     }
   }
@@ -1971,10 +1974,11 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     }
   }
 
-  if (eventType.startsWith('session.turn.')) {
+  if (eventType.startsWith('session.turn.') || eventType === 'session.continue.executed') {
     const sessionId = rustEventSessionId(event) || currentSessionId;
+    const workspaceId = rustEventWorkspaceId(event) || currentWorkspaceId;
     if (sessionId) {
-      void refreshCurrentGoal(sessionId, currentWorkspaceId, currentWorkspacePath);
+      void refreshCurrentGoal(sessionId, workspaceId, currentWorkspacePath);
     }
   }
 
@@ -3732,6 +3736,7 @@ async function continueSessionExecution(): Promise<void> {
     contextReferences: [],
   });
   if (accepted) {
+    void refreshCurrentGoal(sessionId, currentWorkspaceId, currentWorkspacePath);
     window.dispatchEvent(new CustomEvent('magi:interruptedRecoveryContinueStatus', {
       detail: { status: 'accepted' },
     }));

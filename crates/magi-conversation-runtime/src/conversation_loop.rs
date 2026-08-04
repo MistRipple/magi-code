@@ -23,8 +23,8 @@ use crate::tool_call_validation::{
 };
 use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
-    infer_tool_call_status, model_visible_tool_result, summarize_tool_result,
-    tool_execution_status_label, turn_item_status_for_tool_result,
+    DeterministicToolFailureTracker, infer_tool_call_status, model_visible_tool_result,
+    summarize_tool_result, tool_execution_status_label, turn_item_status_for_tool_result,
 };
 use crate::tool_surface_state::{
     activate_skill_tool_definitions, activated_skill_id_from_tool_result,
@@ -55,8 +55,8 @@ use crate::{
     session_images::{SessionTurnImage, session_turn_image_sources},
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
-        account_active_goal_turn, current_turn_id, publish_model_usage_record, record_mission_turn,
-        resolved_model_for_usage_binding,
+        account_active_goal_usage, current_turn_id, publish_model_usage_record,
+        record_mission_turn, resolved_model_for_usage_binding,
     },
 };
 use magi_bridge_client::{
@@ -537,6 +537,23 @@ fn validated_task_completion(
     Ok(TaskOutcome::Completed { attempt })
 }
 
+fn task_round_tool_definitions(
+    active_tools: &[ChatToolDefinition],
+    required_tool_chain: &[String],
+    completed_required_tool_names: &[String],
+    preserve_goal_control_surface: bool,
+) -> Vec<ChatToolDefinition> {
+    if preserve_goal_control_surface {
+        active_tools.to_vec()
+    } else {
+        required_tool_definitions_for_round(
+            active_tools,
+            required_tool_chain,
+            completed_required_tool_names,
+        )
+    }
+}
+
 pub fn run_conversation_loop(
     request: ConversationLoopRequest<'_>,
 ) -> (TaskOutcome, Option<ExecutionContextSummary>) {
@@ -629,6 +646,7 @@ fn build_task_context_base_messages(
     project_memory: Option<&magi_project_memory::ProjectMemoryStore>,
     memory_write_visible: bool,
     plan_store: &magi_plan::PlanStore,
+    include_plan: bool,
     mailbox_prompt: Option<&str>,
 ) -> Vec<ChatMessage> {
     let mut messages = static_messages.to_vec();
@@ -649,7 +667,7 @@ fn build_task_context_base_messages(
             }
         }
     }
-    if let Some(rendered) = plan_store.render_for_prompt() {
+    if include_plan && let Some(rendered) = plan_store.render_for_prompt() {
         messages.push(system_prompt_fragment_message(
             PromptFragmentKind::UserPlan,
             rendered,
@@ -786,11 +804,24 @@ fn run_conversation_loop_inner(
             .any(|definition| definition.function.name == "memory_write")
     });
     let pending_mailbox_prompt = render_mailbox_items_for_prompt(&pending_mailbox_items);
+    let is_primary_execution = !is_sidechain && task.parent_task_id.is_none();
+    let can_observe_plan = || {
+        session_store
+            .plan_for_execution_observer(session_id, task_id.as_str())
+            .is_some()
+    };
+    let owns_active_plan = || {
+        is_primary_execution
+            && session_store
+                .active_plan_for_execution_owner(session_id, task_id.as_str())
+                .is_some()
+    };
     let mut messages = build_task_context_base_messages(
         &static_context_messages,
         project_memory,
         memory_write_visible,
         plan_store,
+        can_observe_plan(),
         pending_mailbox_prompt.as_deref(),
     );
     // [CACHE: APPEND-ONLY] Runtime tail · Thread 历史。
@@ -947,6 +978,7 @@ fn run_conversation_loop_inner(
         Vec::new()
     };
     let mut tool_call_validation_tracker = ToolCallValidationTracker::default();
+    let mut deterministic_tool_failure_tracker = DeterministicToolFailureTracker::default();
     let mut tool_execution_ledger = if recovery_history {
         ToolExecutionLedger::from_thread_history(
             &task.goal,
@@ -992,7 +1024,6 @@ fn run_conversation_loop_inner(
     let mut stream_interruption_non_stream_fallback_attempted = false;
     let mut context_budget_recheck_required = false;
     let mut last_response_observation: Option<String> = None;
-    let owns_plan_execution = !is_sidechain && task.parent_task_id.is_none();
     let turn_visibility = task_turn_visibility(
         task,
         is_sidechain,
@@ -1018,6 +1049,7 @@ fn run_conversation_loop_inner(
             project_memory,
             memory_write_visible,
             plan_store,
+            can_observe_plan(),
             pending_mailbox_prompt.as_deref(),
         );
         if let Some(skill_message) = dynamic_skill_prompt_message(
@@ -1131,6 +1163,9 @@ fn run_conversation_loop_inner(
         let thinking_publish_gate =
             std::cell::RefCell::new(SessionTurnStreamPublishGate::default());
         let round_started_at = UtcMillis::now();
+        let round_goal_id = session_store
+            .active_goal_for_execution_owner(session_id, task_id.as_str())
+            .map(|goal| goal.goal_id);
         // 协作工具面由 root coordinator 身份、访问策略与运行时容量统一决定。
         // 不得根据用户文本缩减工具集，也不得强制某一轮调用 agent_spawn；否则模型
         // 无法在分析、实施、等待之间自主选择正确的协作步骤。
@@ -1141,10 +1176,13 @@ fn run_conversation_loop_inner(
         } else {
             (&evidence_recovery_chain, &empty_completed_tools)
         };
-        let round_tool_definitions = required_tool_definitions_for_round(
+        let preserve_goal_control_surface =
+            round_goal_id.is_some() && evidence_recovery_chain.is_empty();
+        let round_tool_definitions = task_round_tool_definitions(
             &active_tools,
             round_required_tools,
             round_completed_tools,
+            preserve_goal_control_surface,
         );
         let round_tools = (!round_tool_definitions.is_empty()).then_some(round_tool_definitions);
         if context_budget_recheck_required {
@@ -1162,11 +1200,15 @@ fn run_conversation_loop_inner(
             prompt: prompt.clone(),
             messages: Some(messages.clone()),
             tools: round_tools.clone(),
-            tool_choice: forced_task_tool_choice_for_round(
-                round_required_tools,
-                round_tools.as_ref(),
-                round_completed_tools,
-            ),
+            tool_choice: if preserve_goal_control_surface {
+                None
+            } else {
+                forced_task_tool_choice_for_round(
+                    round_required_tools,
+                    round_tools.as_ref(),
+                    round_completed_tools,
+                )
+            },
         };
         let round_call_id = format!("task-{}-{}-{round}", task_id, lease_id);
         let current_turn_id = current_turn_id(session_store, session_id);
@@ -1757,14 +1799,11 @@ fn run_conversation_loop_inner(
                 },
             },
         );
-        account_active_goal_turn(
+        account_active_goal_usage(
             session_store,
             session_id,
+            round_goal_id.as_ref(),
             parsed.usage.as_ref(),
-            UtcMillis::now()
-                .0
-                .saturating_sub(round_started_at.0)
-                .saturating_div(1000),
         );
         if let Some(metrics_store) = mission_metrics {
             record_mission_turn(
@@ -1898,7 +1937,7 @@ fn run_conversation_loop_inner(
                 });
                 continue;
             }
-            if owns_plan_execution
+            if owns_active_plan()
                 && let Some(follow_up_prompt) = plan_store.render_execution_follow_up_prompt()
             {
                 messages.push(assistant_response_message.clone());
@@ -1999,6 +2038,7 @@ fn run_conversation_loop_inner(
         let mut completed_tool_names_this_round = Vec::new();
         let mut content_requirement_failures = Vec::new();
         let mut activated_skill_this_round = None;
+        let mut deterministic_tool_failure = None;
         for (tool_call, (result, tool_status)) in valid_tool_calls.iter().zip(tool_results) {
             upsert_task_tool_call_result_turn_item(
                 turn_writeback_context,
@@ -2021,7 +2061,7 @@ fn run_conversation_loop_inner(
                     completed_tool_names_this_round.push(canonical_tool_name.clone());
                     completion_evidence.push(TaskCompletionEvidence::SuccessfulToolCall {
                         call_id: tool_call.id.clone(),
-                        tool_name: canonical_tool_name,
+                        tool_name: canonical_tool_name.clone(),
                         arguments: serde_json::from_str(&tool_call.function.arguments)
                             .unwrap_or_else(|_| {
                                 serde_json::Value::String(tool_call.function.arguments.clone())
@@ -2031,6 +2071,13 @@ fn run_conversation_loop_inner(
                 }
             }
             tool_call_records.push(tool_call_record(tool_call, &result));
+            if let Some(failure) = deterministic_tool_failure_tracker.observe(
+                &canonical_tool_name,
+                &result,
+                tool_status,
+            ) {
+                deterministic_tool_failure.get_or_insert(failure);
+            }
             if let Some(skill_id) =
                 activated_skill_id_from_tool_result(&tool_call.function.name, &result, tool_status)
             {
@@ -2052,6 +2099,21 @@ fn run_conversation_loop_inner(
                 "task_thread_tool_result",
             );
             messages.push(tool_result_message);
+        }
+        if let Some(failure) = deterministic_tool_failure {
+            append_task_error_turn_item(
+                turn_writeback_context,
+                &failure.summary,
+                streaming_entry_id.or(last_stream_item_id.as_deref()),
+                None,
+                None,
+            );
+            return (
+                TaskOutcome::Failed {
+                    error: failure.detail,
+                },
+                context_summary,
+            );
         }
         let repeated_tool_call_failure = if invalid_tool_calls.is_empty() {
             None
@@ -3406,6 +3468,8 @@ mod tests {
                         .update(magi_plan::UpdatePlanInput {
                             plan_id: Some(current.plan_id.to_string()),
                             expected_revision: Some(current.revision),
+                            expected_goal_id: None,
+                            expected_goal_control_revision: None,
                             language: current.language.clone(),
                             explanation: Some("工具完成后推进下一阶段".to_string()),
                             plan: vec![
@@ -3441,6 +3505,8 @@ mod tests {
                             .update(magi_plan::UpdatePlanInput {
                                 plan_id: Some(current.plan_id.to_string()),
                                 expected_revision: Some(current.revision),
+                                expected_goal_id: None,
+                                expected_goal_control_revision: None,
                                 language: current.language.clone(),
                                 explanation: Some("恢复后任务完成".to_string()),
                                 plan: current
@@ -4565,6 +4631,8 @@ mod tests {
                     .update(magi_plan::UpdatePlanInput {
                         plan_id: Some(current.plan_id.to_string()),
                         expected_revision: Some(current.revision),
+                        expected_goal_id: None,
+                        expected_goal_control_revision: None,
                         language: current.language,
                         explanation: None,
                         plan: current
@@ -4642,6 +4710,36 @@ mod tests {
         assert!(
             task_required_tool_chain(&task, None).is_empty(),
             "只读阶段即使复述用户目标，也不能强制执行写工具链"
+        );
+    }
+
+    #[test]
+    fn active_goal_round_keeps_control_tools_during_incomplete_required_action() {
+        let tools = vec![
+            exposed_test_tool("shell_exec"),
+            exposed_test_tool("update_plan"),
+            exposed_test_tool("update_goal"),
+            exposed_test_tool("file_read"),
+        ];
+        let required = vec!["shell_exec".to_string()];
+
+        let regular = task_round_tool_definitions(&tools, &required, &[], false);
+        assert_eq!(
+            regular
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["shell_exec"]
+        );
+
+        let goal_driven = task_round_tool_definitions(&tools, &required, &[], true);
+        let names = goal_driven
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["shell_exec", "update_plan", "update_goal", "file_read"]
         );
     }
 
@@ -4999,6 +5097,8 @@ mod tests {
             .update(magi_plan::UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![
@@ -6427,6 +6527,8 @@ mod tests {
             .update(magi_plan::UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![magi_plan::UpdatePlanItemInput {
@@ -6501,6 +6603,145 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_root_task_does_not_consume_waiting_goal_plan() {
+        let session_store = SessionStore::new();
+        let event_bus = InMemoryEventBus::new(32);
+        let task_store = TaskStore::new();
+        let session_id = SessionId::new("session-task-waiting-goal-isolation");
+        let workspace_id = Some(WorkspaceId::new("workspace-task-waiting-goal-isolation"));
+        let task = make_task_loop_test_task("task-ordinary-diversion");
+        task_store.insert_task(task.clone());
+        let worker_id = WorkerId::new("worker-task-waiting-goal-isolation");
+        let lease = task_store
+            .grant_lease(
+                &task.task_id,
+                &task.root_task_id,
+                &worker_id,
+                "coordinator",
+                60_000,
+            )
+            .expect("lease should be granted");
+        session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "task waiting goal isolation",
+                workspace_id.as_ref().map(ToString::to_string),
+            )
+            .expect("session should be creatable");
+        let (_, thread_id) =
+            session_store
+                .ensure_session_mission(&session_id, UtcMillis(1), || task.mission_id.clone());
+        let goal = session_store
+            .create_goal(
+                session_id.clone(),
+                thread_id.clone(),
+                "task-goal-owner",
+                "验证普通根任务不接管等待中的 Goal",
+                magi_core::AccessProfile::Restricted,
+                None,
+            )
+            .expect("goal should create");
+        let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
+        let plan = plan_store
+            .update(magi_plan::UpdatePlanInput {
+                plan_id: None,
+                expected_revision: Some(0),
+                expected_goal_id: Some(goal.goal_id.to_string()),
+                expected_goal_control_revision: Some(goal.control_revision),
+                language: "zh-CN".to_string(),
+                explanation: None,
+                plan: vec![magi_plan::UpdatePlanItemInput {
+                    item_id: Some("goal-step".to_string()),
+                    step: "继续 Goal".to_string(),
+                    status: magi_core::PlanItemStatus::InProgress,
+                }],
+            })
+            .expect("goal plan should create");
+        let paused = session_store
+            .pause_goal_with_plan(
+                &session_id,
+                &goal.goal_id,
+                goal.control_revision,
+                Some(plan.revision),
+            )
+            .expect("goal should pause")
+            .0;
+        let paused_plan = session_store
+            .plan(&session_id)
+            .expect("paused plan should exist");
+        session_store
+            .resume_goal_with_plan(
+                &session_id,
+                &goal.goal_id,
+                paused.control_revision,
+                Some(paused_plan.revision),
+                None,
+                None,
+            )
+            .expect("goal resume request should wait for an owner");
+        let client = PlanFollowUpTaskModelBridgeClient {
+            plan_store: plan_store.clone(),
+            invoke_count: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        };
+        let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
+
+        let (outcome, _) = run_conversation_loop(ConversationLoopRequest {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &session_store,
+            settings_store: None,
+            live_settings_store: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            task_store: &task_store,
+            execution_registry: &TaskExecutionRegistry::default(),
+            conversation_registry: &ConversationRegistry::new(),
+            agent_role_registry: &magi_agent_role::AgentRoleRegistry::load_default(),
+            spawn_graph: &std::sync::Mutex::new(magi_spawn_graph::SpawnGraph::new()),
+            safety_gate: None,
+            plan_store: &plan_store,
+            project_memory: None,
+            mission_metrics: None,
+            task: &task,
+            task_id: &task.task_id,
+            lease_id: &lease.lease_id,
+            session_id: &session_id,
+            workspace_id: &workspace_id,
+            prompt: "执行普通任务".to_string(),
+            images: Vec::new(),
+            tools: None,
+            usage_binding: &usage_binding,
+            streaming_entry_id: None,
+            is_sidechain: false,
+            worker_id: Some(&worker_id),
+            thread_id: &thread_id,
+            context_summary: None,
+            system_prompt: None,
+            workspace_root_path: None,
+            snapshot_session: None,
+            execution_group_id: None,
+            persist_session_state: None,
+        });
+
+        assert!(matches!(outcome, TaskOutcome::Completed { .. }));
+        assert_eq!(client.invoke_count.load(Ordering::SeqCst), 1);
+        assert!(plan_store.requires_execution_follow_up());
+        let requests = client.requests.lock().expect("request log mutex poisoned");
+        let messages = requests[0]
+            .messages
+            .as_ref()
+            .expect("ordinary task request should include messages");
+        assert!(!messages.iter().any(|message| {
+            message.content.as_deref().is_some_and(|content| {
+                content.contains("当前执行计划") || content.contains("当前执行计划仍未完成")
+            })
+        }));
+    }
+
+    #[test]
     fn sidechain_task_does_not_take_over_session_plan_execution() {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(32);
@@ -6534,6 +6775,8 @@ mod tests {
             .update(magi_plan::UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![magi_plan::UpdatePlanItemInput {
@@ -6653,11 +6896,13 @@ mod tests {
                 body: "旧内容".to_string(),
             })
             .expect("project memory entry should save");
-        let plan_store = crate::test_plan_store("test-plan");
+        let plan_store = magi_plan::PlanStore::from_store(&session_store, session_id.clone());
         plan_store
             .update(magi_plan::UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![magi_plan::UpdatePlanItemInput {

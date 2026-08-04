@@ -352,6 +352,17 @@ function isTurnResponseDurationAnchorCandidate(item: CanonicalTurnItem): boolean
     && shouldRenderItem(item);
 }
 
+function assistantOutputKind(item: CanonicalTurnItem): 'progress' | 'final' | 'error' | null {
+  const value = item.metadata?.assistantOutputKind;
+  return value === 'progress' || value === 'final' || value === 'error' ? value : null;
+}
+
+function isExplicitTurnResponseDurationAnchor(item: CanonicalTurnItem): boolean {
+  const outputKind = assistantOutputKind(item);
+  return (outputKind === 'final' || outputKind === 'error')
+    && isTurnResponseDurationAnchorCandidate(item);
+}
+
 function canShowTurnResponseDuration(
   presentation: TurnPresentation,
   item: CanonicalTurnItem,
@@ -556,17 +567,32 @@ function buildTurnPresentation(turn: CanonicalTurn): TurnPresentation {
   });
 
   let responseDurationAnchorItemId: string | undefined;
+  const responseDurationIsDeferredToGoalBoundary = turn.metadata?.responseDurationScope === 'goal_progress';
   if (
-    isCanonicalTerminalStatus(turn.status)
+    !responseDurationIsDeferredToGoalBoundary
+    && isCanonicalTerminalStatus(turn.status)
     && typeof turn.responseDurationMs === 'number'
     && Number.isFinite(turn.responseDurationMs)
     && turn.responseDurationMs >= 0
   ) {
     for (let i = ordered.length - 1; i >= 0; i -= 1) {
       const candidate = ordered[i]!;
-      if (isTurnResponseDurationAnchorCandidate(candidate)) {
+      if (isExplicitTurnResponseDurationAnchor(candidate)) {
         responseDurationAnchorItemId = candidate.itemId;
         break;
+      }
+    }
+    const carriesAssistantOutputKind = ordered.some((item) => assistantOutputKind(item) !== null);
+    const completedTurnMissingFinalOutput = turn.status === 'completed'
+      && carriesAssistantOutputKind
+      && responseDurationAnchorItemId === undefined;
+    if (!completedTurnMissingFinalOutput && responseDurationAnchorItemId === undefined) {
+      for (let i = ordered.length - 1; i >= 0; i -= 1) {
+        const candidate = ordered[i]!;
+        if (isTurnResponseDurationAnchorCandidate(candidate)) {
+          responseDurationAnchorItemId = candidate.itemId;
+          break;
+        }
       }
     }
   }

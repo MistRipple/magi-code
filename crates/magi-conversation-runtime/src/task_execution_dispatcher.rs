@@ -1841,7 +1841,30 @@ impl LlmTaskDispatcher {
         ) {
             Ok(client) => client,
             Err(_) => {
-                match plan_store.pause() {
+                let owns_active_plan = self
+                    .session_store
+                    .active_plan_for_execution_owner(&request.session_id, &request.turn_id)
+                    .is_some();
+                let stopped_goal = self
+                    .session_store
+                    .active_goal_for_execution_owner(&request.session_id, &request.turn_id)
+                    .map(|goal| {
+                        self.session_store.stop_goal_for_runtime_failure(
+                            &request.session_id,
+                            &goal.goal_id,
+                            None,
+                            &request.turn_id,
+                            "model_configuration_unavailable",
+                        )
+                    })
+                    .transpose();
+                let plan_result = match stopped_goal {
+                    Ok(Some(_)) => Ok(self.session_store.plan(&request.session_id)),
+                    Ok(None) if owns_active_plan => plan_store.pause(),
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(magi_plan::PlanUpdateError::Store(error.to_string())),
+                };
+                match plan_result {
                     Ok(Some(plan)) => magi_plan::publish_plan_event(
                         &self.event_bus,
                         magi_plan::plan_event_type(&plan),
@@ -1854,7 +1877,7 @@ impl LlmTaskDispatcher {
                     Err(error) => tracing::warn!(
                         session_id = %request.session_id,
                         %error,
-                        "模型配置解析失败后暂停计划失败"
+                        "模型配置解析失败后停止 Goal/Plan 失败"
                     ),
                 }
                 return Err(SessionTurnExecutionError {
@@ -2967,6 +2990,8 @@ mod tests {
             .update(magi_plan::UpdatePlanInput {
                 plan_id: None,
                 expected_revision: Some(0),
+                expected_goal_id: None,
+                expected_goal_control_revision: None,
                 language: "zh-CN".to_string(),
                 explanation: None,
                 plan: vec![magi_plan::UpdatePlanItemInput {
@@ -3521,6 +3546,27 @@ mod tests {
                 "只读访问只限制外部副作用，不能屏蔽内部协调工具 {internal}: {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn full_access_with_empty_allowed_tools_keeps_shell_exec_visible() {
+        let dispatcher = dispatcher_with_default_tool_surface();
+        let mut task = task_with_role("coordinator", TaskTier::ExecutionChain);
+        let policy = task.policy_snapshot.as_mut().expect("policy");
+        policy.access_profile = magi_core::AccessProfile::FullAccess;
+        policy.command_mode = "full".to_string();
+        policy.allowed_tools.clear();
+        policy.denied_tools.clear();
+
+        let names = dispatcher
+            .build_tool_definitions(Some(&task), None, magi_core::AccessProfile::FullAccess)
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "shell_exec"));
+        assert!(names.iter().any(|name| name == "file_write"));
+        assert!(names.iter().any(|name| name == "apply_patch"));
     }
 
     #[test]

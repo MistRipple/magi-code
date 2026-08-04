@@ -161,6 +161,7 @@ fn append_openai_content_block_message(
     let mut tool_calls_out = Vec::new();
     let mut text_parts = Vec::new();
     let mut image_parts = Vec::new();
+    let mut reasoning_parts = Vec::new();
     let mut tool_result_id = None;
     let mut tool_result_content = None;
     let mut tool_result_images = Vec::new();
@@ -193,7 +194,13 @@ fn append_openai_content_block_message(
                 tool_result_content = Some(content.clone());
                 tool_result_images = images.clone();
             }
-            LlmContentBlock::ProviderContext { .. } => {}
+            LlmContentBlock::ProviderContext { context } => {
+                if msg.role == "assistant"
+                    && let Some(reasoning_content) = openai_reasoning_content(context)
+                {
+                    reasoning_parts.push(reasoning_content);
+                }
+            }
         }
     }
 
@@ -225,10 +232,14 @@ fn append_openai_content_block_message(
             .map(|text| json!({"type": "text", "text": text}))
             .collect::<Vec<_>>();
         content_parts.extend(image_parts);
-        converted.push(json!({
+        let mut message = json!({
             "role": msg.role,
             "content": content_parts,
-        }));
+        });
+        if !reasoning_parts.is_empty() {
+            message["reasoning_content"] = json!(reasoning_parts.join(""));
+        }
+        converted.push(message);
         return;
     }
 
@@ -239,7 +250,35 @@ fn append_openai_content_block_message(
     if !tool_calls_out.is_empty() {
         obj["tool_calls"] = json!(tool_calls_out);
     }
+    if !reasoning_parts.is_empty() {
+        obj["reasoning_content"] = json!(reasoning_parts.join(""));
+    }
     converted.push(obj);
+}
+
+fn openai_reasoning_content(context: &crate::types::ModelProviderContext) -> Option<String> {
+    if context.provider == "openai_chat" && context.kind == "reasoning_content" {
+        return context.data["reasoning_content"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+    }
+    if context.provider != "openai_responses" || context.kind != "reasoning" {
+        return None;
+    }
+
+    for field in ["content", "summary"] {
+        let text = context.data[field]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<String>();
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    None
 }
 
 fn openai_image_part(source: &crate::llm_types::ImageSource) -> Value {
@@ -426,6 +465,60 @@ mod tests {
             converted[1]["content"][1]["image_url"]["url"],
             "data:image/png;base64,AAA"
         );
+    }
+
+    #[test]
+    fn openai_assistant_message_replays_reasoning_content_from_chat_context() {
+        let messages = vec![LlmMessage {
+            role: "assistant".to_string(),
+            content: LlmMessageContent::Blocks(vec![
+                LlmContentBlock::ProviderContext {
+                    context: crate::types::ModelProviderContext {
+                        provider: "openai_chat".to_string(),
+                        kind: "reasoning_content".to_string(),
+                        data: json!({"reasoning_content": "先分析再调用工具"}),
+                    },
+                },
+                LlmContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "file_read".to_string(),
+                    input: json!({"path": "package.json"}),
+                },
+            ]),
+        }];
+
+        let converted = convert_messages_to_openai(&messages);
+
+        assert_eq!(converted[0]["reasoning_content"], "先分析再调用工具");
+        assert_eq!(converted[0]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn openai_assistant_message_migrates_responses_reasoning_context() {
+        let messages = vec![LlmMessage {
+            role: "assistant".to_string(),
+            content: LlmMessageContent::Blocks(vec![
+                LlmContentBlock::ProviderContext {
+                    context: crate::types::ModelProviderContext {
+                        provider: "openai_responses".to_string(),
+                        kind: "reasoning".to_string(),
+                        data: json!({
+                            "type": "reasoning",
+                            "content": [{"type": "reasoning_text", "text": "迁移现有推理上下文"}]
+                        }),
+                    },
+                },
+                LlmContentBlock::ToolUse {
+                    id: "call_legacy".to_string(),
+                    name: "file_read".to_string(),
+                    input: json!({"path": "README.md"}),
+                },
+            ]),
+        }];
+
+        let converted = convert_messages_to_openai(&messages);
+
+        assert_eq!(converted[0]["reasoning_content"], "迁移现有推理上下文");
     }
 
     #[test]

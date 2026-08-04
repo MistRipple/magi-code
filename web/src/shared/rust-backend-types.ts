@@ -1500,18 +1500,47 @@ export type GoalStatus =
   | 'blocked'
   | 'usage_limited'
   | 'budget_limited'
-  | 'complete'
-  | 'cleared';
+  | 'complete';
+
+export interface GoalBlockerDto {
+  blockerKey: string;
+  reason: string;
+  consecutiveTurns: number;
+  lastObservedTurnId: string;
+}
+
+export interface GoalContinuationDto {
+  phase: 'idle' | 'running' | 'waiting';
+  turnId?: string | null;
+  reason?: string | null;
+}
+
+export interface GoalCompletionDto {
+  turnId: string;
+  summary: string;
+  planRevision?: number | null;
+  evidenceRefs: string[];
+  completedAt: number;
+}
 
 export interface SessionGoalDto {
   goalId: string;
   sessionId: string;
   threadId: string;
+  createdByTurnId?: string | null;
   objective: string;
   status: GoalStatus;
+  controlRevision: number;
+  accessProfile: 'read_only' | 'restricted' | 'full_access';
   tokenBudget?: number | null;
   tokensUsed: number;
   timeUsedSeconds: number;
+  timeUsedMillis?: number;
+  timingStartedAt?: number | null;
+  timingTurnId?: string | null;
+  blocker?: GoalBlockerDto | null;
+  continuation: GoalContinuationDto;
+  completion?: GoalCompletionDto | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -1528,6 +1557,7 @@ export interface PlanItemDto {
 export interface SessionPlanDto {
   planId: string;
   sessionId: string;
+  goalId?: string | null;
   revision: number;
   language: string;
   state: PlanState;
@@ -1541,14 +1571,29 @@ export interface CurrentGoalResponseDto {
   sessionId: string;
   workspaceId: string;
   workspacePath: string;
+  observedAt: number;
   goal?: SessionGoalDto | null;
   plan?: SessionPlanDto | null;
+  allowedActions: GoalAllowedActionsDto;
+}
+
+export interface GoalAllowedActionsDto {
+  canEdit: boolean;
+  canPause: boolean;
+  canResume: boolean;
+  canClear: boolean;
+  requiresBudgetIncrease: boolean;
 }
 
 export interface GoalActionRequestDto {
   sessionId?: string;
   workspaceId?: string;
   workspacePath?: string;
+  goalId: string;
+  expectedRevision: number;
+  expectedPlanRevision?: number;
+  newTokenBudget?: number;
+  accessProfile?: 'read_only' | 'restricted' | 'full_access';
 }
 
 export interface GoalUpdateRequestDto extends GoalActionRequestDto {
@@ -1559,7 +1604,10 @@ export interface GoalMutationResponseDto {
   sessionId: string;
   workspaceId: string;
   workspacePath: string;
+  observedAt: number;
   goal?: SessionGoalDto | null;
+  plan?: SessionPlanDto | null;
+  allowedActions: GoalAllowedActionsDto;
 }
 
 export interface AgentProjectionDto {
