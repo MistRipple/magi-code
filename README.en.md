@@ -2,7 +2,7 @@
 
 **Your local AI engineering team.**
 
-A local-first, self-hostable AI engineering workspace where one main agent coordinates the work, specialized agents collaborate by responsibility, and every tool, knowledge source, and permission boundary remains observable and controllable.
+Magi is a local-first, self-hostable AI engineering workspace. It keeps goals, ownership, context, tools, changes, and verification on one observable workflow, so complex software work is not a one-shot prompt but something that can run, recover, be reviewed, and ship.
 
 ![Magi mainline task overview](docs/images/readme/mainline-task-overview.jpg)
 
@@ -12,17 +12,38 @@ A local-first, self-hostable AI engineering workspace where one main agent coord
 
 ## English
 
-### What Magi is for
+### Complex work should not depend on repeated prompting
 
-Complex software work is rarely a single prompt. It requires understanding a codebase, decomposing an outcome, investigating in parallel, editing files, running checks, recovering from failures, preserving context, and producing results that can be reviewed.
+A real change usually involves a chain of decisions: what outcome matters, where to start, who investigates, which model fits, which files change, how to verify, and where to recover after a failure. Magi organizes that chain into a long-running local engineering team:
 
-Magi turns that full chain into a durable engineering workflow. The main agent owns the goal and coordination, specialized agents work on bounded responsibilities, and the runtime keeps tools, knowledge, permissions, and results connected to the same workspace.
+- The main agent owns the goal, breaks down the work, waits for results, and synthesizes the outcome.
+- Executor, explorer, architect, tester, and reviewer agents work in parallel with bounded responsibilities and independent models.
+- Files, Shell, search, knowledge, MCP, Skills, and image generation share one permission and governance model.
+- Goals, task state, tool calls, changes, and verification results stay visible on the same execution trail.
+
+Magi is not another chat window with extra controls. It turns every request into an engineering pipeline that can run for a long time, recover from failures, and be reviewed end to end.
+
+### From request to delivery
+
+~~~text
+Outcome
+   ↓
+Main agent interprets constraints and decomposes the work
+   ↓
+Specialized agents execute in parallel with their own models
+   ↓
+Files, Shell, search, knowledge, MCP, and Skills run under one governance model
+   ↓
+Streaming output, task state, changes, and agent results stay visible
+   ↓
+Main agent waits, synthesizes, verifies, and keeps the goal moving
+~~~
 
 ### Product capabilities
 
 #### One mainline, many specialists
 
-The main agent understands the request, assigns work, waits for results, and produces the final synthesis. Built-in specialist roles include executor, explorer, architect, tester, and reviewer.
+The main agent works like an engineering lead: it understands the request, assigns work, waits for results, and produces the final synthesis. Built-in specialist roles include executor, explorer, architect, tester, and reviewer.
 
 Each role can use its own model, and one role can run multiple agent instances in the same task. Subagents do not spawn deeper subagents; the mainline owns the topology so fan-out remains deliberate, visible, and bounded.
 
@@ -30,18 +51,18 @@ Each role can use its own model, and one role can run multiple agent instances i
 
 Goal mode is durable task state, not a one-off planning message. It keeps the outcome, constraints, acceptance criteria, task ledger, progress, pause state, and terminal reason together.
 
-Users can steer a running goal, pause it, resume it, edit it, or clear it. The mainline continues the same goal with its existing context instead of reconstructing the task from scratch on every turn.
+You can steer a running goal, pause it, resume it, edit it, or clear it. The mainline continues the same goal with its existing context instead of reconstructing the task from scratch on every turn.
 
 #### Models assigned by responsibility
 
-Magi separates model responsibilities instead of forcing the whole product through one model selector:
+Different responsibilities should not be locked into one model. Magi separates them instead of forcing the whole product through one selector:
 
 - Main model for the conversation and orchestration.
 - Auxiliary model for titles, knowledge extraction, memory, and context compaction.
 - Image model for image generation.
 - Role models for executor, explorer, architect, tester, reviewer, and other agents.
 
-Magi supports the standard OpenAI-compatible API format and the Anthropic Messages API format. Image generation uses the OpenAI-compatible Images API.
+It supports the standard OpenAI-compatible API format and the Anthropic Messages API format. Image generation uses the OpenAI-compatible Images API, so model choice serves the workflow rather than limiting it.
 
 #### One governed tool runtime
 
@@ -51,7 +72,7 @@ Every call is evaluated against workspace and session scope, access profile, too
 
 #### Context that stays connected
 
-Magi assembles the active task context from the current conversation, workspace code index, project knowledge, goals, task ledger, agent runs, tool records, and user-selected references. The backend owns this assembly so the desktop app, browser, mobile client, and public tunnel see the same state.
+Magi assembles the active task context from the current conversation, workspace code index, project knowledge, goals, task ledger, agent runs, tool records, and user-selected references. The backend owns this assembly, so the desktop app, browser, mobile browser, and public tunnel all see the same state.
 
 #### One service, many clients
 
@@ -61,17 +82,23 @@ Magi targets Windows, Linux, and macOS while retaining Web, LAN, and optional pu
 
 #### Visible engineering operations
 
-Magi keeps the important runtime state visible: streaming output from the mainline and each subagent, agent lifecycle, tool cards, file previews, changes, Goal progress, task status, context usage, knowledge access, and runtime diagnostics.
+Magi keeps the important runtime state visible: streaming output from the mainline and each subagent, agent lifecycle, tool cards, file previews, changes, Goal progress, task status, context usage, knowledge access, and runtime diagnostics. You do not have to trust a black box; you can inspect the evidence before deciding what to approve or roll back.
+
+#### Themes, wallpapers, and workspace materials
+
+Appearance is more than a light/dark switch. Magi includes a shared theme library with system, light, dark, Deep Forest, Starry Snow Mountain, Azure Shrine, Quantum Matrix, Coastal Dawn, and Desert Dawn themes. Themes can carry wallpapers and clear or immersive materials, be previewed, customized, imported, and exported. The daemon persists the active appearance so desktop and Web use the same configuration.
 
 ### Product evidence
 
-These are full-window captures from the local Chrome browser using the `magi` workspace and sanitized demonstration data.
+These captures come from the daemon-hosted local entry point using the `magi` and `magi-rust-rewrite` workspaces. The mainline, model, and appearance captures use sanitized demonstration data, while the change review shows real workspace changes as they appeared when the image was captured. They are not concept art or component crops; every image is a complete application-window capture on the same `1913 × 1263` canvas.
 
-![Magi mainline task overview](docs/images/readme/mainline-task-overview.jpg)
+![Magi mainline task overview with the Starry Snow Mountain skin](docs/images/readme/mainline-task-overview.jpg)
 
 ![Magi multi-agent conversation](docs/images/readme/multi-agent-conversation.jpg)
 
-![Magi model configuration](docs/images/readme/model-configuration.jpg)
+![Magi model and role configuration with the Starry Snow Mountain skin](docs/images/readme/model-configuration.jpg)
+
+![Magi theme library and skin previews](docs/images/readme/appearance-themes.jpg)
 
 ![Magi tools, MCP, and Skills](docs/images/readme/tools-mcp-skills.jpg)
 
@@ -83,7 +110,7 @@ These are full-window captures from the local Chrome browser using the `magi` wo
 
 ### Why teams use Magi
 
-Magi is built for software work that must remain understandable and recoverable over time:
+Magi is built to turn model capability into a local engineering system that can cooperate, recover, and be reviewed over time:
 
 - **Bring your own model stack** with independent connections for orchestration, support, image generation, and specialist roles.
 - **Coordinate bounded specialists** with explicit responsibilities, controlled fan-out, and one mainline responsible for synthesis.
@@ -94,7 +121,9 @@ Magi is built for software work that must remain understandable and recoverable 
 - **Continue from any client** because desktop, browser, LAN, and tunnel access share the same authoritative runtime.
 - **Support real delivery workflows** with cancellation, recovery, failure diagnostics, change review, and release verification.
 
-### Use cases
+### When it fits
+
+When you need to move a project forward instead of receiving a one-off answer, Magi fits naturally:
 
 - Architecture analysis and module-level review of large codebases.
 - Refactors that benefit from parallel exploration, implementation, testing, and review.
@@ -178,7 +207,7 @@ npm --prefix web run build
 - Issues: [Report an issue](https://github.com/MistRipple/magi-code/issues)
 - Releases: [Download releases](https://github.com/MistRipple/magi-code/releases)
 
-The core Magi code is licensed under the [MIT License](LICENSE).
+The core Magi code is licensed under the [Apache License 2.0](LICENSE).
 
 ---
 
@@ -226,4 +255,4 @@ Feature suggestions, bug reports, and business inquiries are welcome.
 > [!NOTE]
 > **Left**: personal WeChat for business inquiries and feedback | **Right**: Magi test group QR code
 
-Magi is released under the [MIT License](LICENSE). You may use, modify, and distribute it as permitted by the license terms.
+Magi is released under the [Apache License 2.0](LICENSE). You may use, modify, and distribute it as permitted by the license terms.

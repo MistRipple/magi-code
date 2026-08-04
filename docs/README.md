@@ -46,3 +46,7 @@ cargo run -p magi-desktop
 - 跨轮、可恢复、高风险工作以 Mission / Checkpoint / Validation 等运行事实承载
 
 后续设计说明从当前代码和产品形态反向整理。
+
+## 方案文档
+
+- [Magi Connect 与移动端方案](./magi-connect-mobile-plan.md)：账号、设备配对、连接服务、Desktop 边界及 Android/iOS 推进基线。
