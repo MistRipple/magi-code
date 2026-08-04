@@ -75,7 +75,6 @@
     error,
     standardized,
     status = 'success',
-    duration,
     filepath,
     filePreviewScope = undefined,
   }: Props = $props();
@@ -869,10 +868,6 @@
     {:else}
       <span class="status-dot"></span>
     {/if}
-    <span class="tool-status-label">{toolStatusLabel(status)}</span>
-    {#if typeof duration === 'number' && duration >= 0}
-      <span class="tool-duration">{(duration / 1000).toFixed(2)}s</span>
-    {/if}
   </span>
 {/snippet}
 
@@ -932,7 +927,11 @@
       {/if}
     </span>
     <span class="agent-spawn-meta">
-      <span class="tool-status status-{agentSpawnStatusInfo.class}">
+      <span
+        class="tool-status status-{agentSpawnStatusInfo.class}"
+        title={toolStatusLabel(agentSpawnVisualStatus)}
+        aria-label={toolStatusLabel(agentSpawnVisualStatus)}
+      >
         {#if agentSpawnRunning}
           <span class="status-dot pulsing"></span>
         {:else}
@@ -1243,18 +1242,6 @@
     align-items: center;
     gap: 5px;
     flex-shrink: 0;
-  }
-
-  .tool-status-label,
-  .tool-duration {
-    color: currentColor;
-    font-size: 10px;
-    white-space: nowrap;
-  }
-
-  .tool-duration {
-    color: var(--foreground-muted);
-    font-variant-numeric: tabular-nums;
   }
 
   .status-dot {

@@ -305,21 +305,6 @@
     const failure = normalizeDisplayText(publicErrorText || errorText);
     return [summary, failure].filter(Boolean).join(' · ');
   });
-  const durationMs = $derived.by(() => {
-    if (typeof toolCall?.durationMs === 'number' && Number.isFinite(toolCall.durationMs)) {
-      return Math.max(0, toolCall.durationMs);
-    }
-    if (
-      typeof toolCall?.startTime === 'number'
-      && typeof toolCall?.endTime === 'number'
-      && Number.isFinite(toolCall.startTime)
-      && Number.isFinite(toolCall.endTime)
-    ) {
-      return Math.max(0, toolCall.endTime - toolCall.startTime);
-    }
-    return null;
-  });
-
   const isExpandable = $derived(Boolean(
     displayCommand
     || displayCwd
@@ -400,10 +385,6 @@
           {:else}
             <span class="status-dot"></span>
           {/if}
-          <span class="tool-status-label">{displayStatusLabel}</span>
-          {#if durationMs !== null}
-            <span class="tool-duration">{(durationMs / 1000).toFixed(2)}s</span>
-          {/if}
         </span>
       </button>
     {:else}
@@ -418,10 +399,6 @@
             <span class="status-dot pulsing"></span>
           {:else}
             <span class="status-dot"></span>
-          {/if}
-          <span class="tool-status-label">{displayStatusLabel}</span>
-          {#if durationMs !== null}
-            <span class="tool-duration">{(durationMs / 1000).toFixed(2)}s</span>
           {/if}
         </span>
       </div>
@@ -510,7 +487,11 @@
         <span class="tool-name">{toolNameLabel}</span>
         <span class="tool-summary" title={titleText}>{titleText}</span>
       </span>
-      <span class="tool-status status-{statusClass}">
+      <span
+        class="tool-status status-{statusClass}"
+        title={displayStatusLabel}
+        aria-label={displayStatusLabel}
+      >
         {#if showStatusPulse}
           <span class="status-dot pulsing"></span>
         {:else}
@@ -571,18 +552,6 @@
     align-items: center;
     gap: 5px;
     flex-shrink: 0;
-  }
-
-  .tool-status-label,
-  .tool-duration {
-    color: currentColor;
-    font-size: 10px;
-    white-space: nowrap;
-  }
-
-  .tool-duration {
-    color: var(--foreground-muted);
-    font-variant-numeric: tabular-nums;
   }
 
   .status-dot {
