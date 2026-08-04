@@ -558,7 +558,7 @@ function reconcileCurrentInterruptTaskId(activeTaskIds: string[]): void {
   }
 }
 
-function extractBootstrapAgentRunTrackingHints(payload: BootstrapPayload, rawPayload: unknown): BootstrapAgentRunTrackingHints {
+export function extractBootstrapAgentRunTrackingHints(payload: BootstrapPayload, rawPayload: unknown): BootstrapAgentRunTrackingHints {
   const rawBootstrap = asBridgeRecord(rawPayload);
   const expectedSessionId = trimBridgeString(payload.sessionId);
 
@@ -613,20 +613,6 @@ function extractBootstrapAgentRunTrackingHints(payload: BootstrapPayload, rawPay
   const activity = asBridgeRecord(overview?.activity);
   const sessionTaskIds = normalizeBridgeStringArray(activeRuntimeSession?.active_task_ids);
   const sessionMissionIds = new Set(normalizeBridgeStringArray(activeRuntimeSession?.active_execution_group_ids));
-  const runtimeSessionStatus = trimBridgeString(activeRuntimeSession?.current_status)
-    || trimBridgeString(activeRuntimeSession?.currentStatus);
-  if (
-    activeRuntimeSession
-    && !rootTaskId
-    && sessionTaskIds.length === 0
-    && sessionMissionIds.size === 0
-    && runtimeSessionStatus === 'detached'
-  ) {
-    return {
-      rootTaskId: '',
-      activeTaskIds: [],
-    };
-  }
   for (const taskId of sessionTaskIds) {
     const missionId = trimBridgeString(runtimeTaskMap.get(taskId)?.mission_id);
     if (missionId) {

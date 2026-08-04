@@ -140,24 +140,29 @@ await withGoldenViteServer(async (server) => {
   );
 
   assert.equal(
-    center.shouldPinAgentProjection('root-new', 2, 'root-old'),
-    true,
+    center.resolveAgentProjectionPin('root-new', 2, 'root-old'),
+    'pin',
     '不同 rootTaskId 的新代理组必须替换上一轮固定列表',
   );
   assert.equal(
-    center.shouldPinAgentProjection('root-cleared', 2, 'root-cleared'),
-    false,
+    center.resolveAgentProjectionPin('root-cleared', 2, 'root-cleared'),
+    'clear',
     '用户已清空的同一轮代理不能被轮询重新打开',
   );
   assert.equal(
-    center.shouldPinAgentProjection('root-empty', 0, '', 'active'),
-    false,
-    '没有实际子代理的普通任务不能刷新固定列表',
+    center.resolveAgentProjectionPin('root-empty', 0, '', 'active'),
+    'clear',
+    '没有实际子代理的新任务必须清理上一轮固定列表',
   );
   assert.equal(
-    center.shouldPinAgentProjection('root-failed', 0, '', 'failed'),
-    true,
+    center.resolveAgentProjectionPin('root-failed', 0, '', 'failed'),
+    'pin',
     '失败 root 必须固定恢复面板，不能因为没有子代理而丢失操作入口',
+  );
+  assert.equal(
+    center.resolveAgentProjectionPin('', 0, '', 'completed'),
+    'ignore',
+    '缺少权威 rootTaskId 时不能改写现有固定状态',
   );
 });
 
@@ -215,7 +220,12 @@ assert.match(
 assert.match(
   activeAgentCenterSource,
   /localStorage/,
-  '代理中心必须按会话持久化固定 rootTaskId 与清空标记',
+  '代理中心必须按会话持久化用户清空标记',
+);
+assert.doesNotMatch(
+  activeAgentCenterSource,
+  /pinnedRootTaskId|readPersistedState[\s\S]*fetchAgentRunProjection\(/,
+  '组件不能从本地固定状态反向加载 root；root 选择只能由权威运行投影驱动',
 );
 assert.doesNotMatch(
   activeAgentCenterSource,

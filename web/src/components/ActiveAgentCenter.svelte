@@ -12,7 +12,7 @@
     formatAgentDuration,
     groupActiveAgents,
     isPrimaryAgentRunAction,
-    shouldPinAgentProjection,
+    resolveAgentProjectionPin,
     shouldShowActiveAgentCenter,
   } from '../lib/active-agent-center';
   import { getAgentVisualInfo } from '../lib/agent-colors';
@@ -21,7 +21,6 @@
   import { i18n } from '../stores/i18n.svelte';
   import {
     ensureAgentRunState,
-    fetchAgentRunProjection,
     getAgentRunState,
     performAgentRunAction,
     selectAgentRun,
@@ -45,7 +44,6 @@
   const STORAGE_PREFIX = 'magi.active-agent-center.v1';
 
   interface PersistedAgentCenterState {
-    pinnedRootTaskId: string;
     dismissedRootTaskId: string;
   }
 
@@ -55,7 +53,6 @@
   let mobile = $state(typeof window !== 'undefined' && window.innerWidth <= MOBILE_BREAKPOINT);
   let nowMs = $state(Date.now());
   let pinnedProjection: AgentRunProjectionDto | null = $state(null);
-  let pinnedRootTaskId = $state('');
   let dismissedRootTaskId = $state('');
   let activeScopeKey = '';
   let centerRoot: HTMLDivElement | undefined = $state();
@@ -93,24 +90,22 @@
 
   function readPersistedState(scopeKey: string): PersistedAgentCenterState {
     if (!scopeKey || typeof localStorage === 'undefined') {
-      return { pinnedRootTaskId: '', dismissedRootTaskId: '' };
+      return { dismissedRootTaskId: '' };
     }
     try {
       const value = JSON.parse(localStorage.getItem(storageKey(scopeKey)) ?? '{}') as Partial<PersistedAgentCenterState>;
       return {
-        pinnedRootTaskId: normalizedScopePart(value.pinnedRootTaskId),
         dismissedRootTaskId: normalizedScopePart(value.dismissedRootTaskId),
       };
     } catch {
       localStorage.removeItem(storageKey(scopeKey));
-      return { pinnedRootTaskId: '', dismissedRootTaskId: '' };
+      return { dismissedRootTaskId: '' };
     }
   }
 
   function persistState(scopeKey: string): void {
     if (!scopeKey || typeof localStorage === 'undefined') return;
     const value: PersistedAgentCenterState = {
-      pinnedRootTaskId,
       dismissedRootTaskId,
     };
     localStorage.setItem(storageKey(scopeKey), JSON.stringify(value));
@@ -125,22 +120,11 @@
     if (scopeKey === activeScopeKey) return;
     activeScopeKey = scopeKey;
     pinnedProjection = null;
-    pinnedRootTaskId = '';
     dismissedRootTaskId = '';
     if (!scopeKey) return;
 
     const persisted = readPersistedState(scopeKey);
-    pinnedRootTaskId = persisted.pinnedRootTaskId;
     dismissedRootTaskId = persisted.dismissedRootTaskId;
-    const sessionId = normalizedScopePart(currentSessionId);
-    if (pinnedRootTaskId && pinnedRootTaskId !== dismissedRootTaskId && sessionId) {
-      void fetchAgentRunProjection(
-        sessionId,
-        pinnedRootTaskId,
-        currentWorkspaceId,
-        currentWorkspacePath,
-      );
-    }
   });
 
   $effect(() => {
@@ -148,16 +132,27 @@
     const scopeKey = agentCenterScopeKey();
     const rootTaskId = candidate?.root_task.task_id?.trim() ?? '';
     const agents = candidate?.agents ?? [];
-    if (!candidate || !scopeKey || !shouldPinAgentProjection(
+    if (!candidate || !scopeKey) {
+      return;
+    }
+    const pinDecision = resolveAgentProjectionPin(
       rootTaskId,
       agents.length,
       dismissedRootTaskId,
       candidate.outcome,
-    )) {
+    );
+    if (pinDecision === 'ignore') {
+      return;
+    }
+    if (pinDecision === 'clear') {
+      pinnedProjection = null;
+      if (dismissedRootTaskId && dismissedRootTaskId !== rootTaskId) {
+        dismissedRootTaskId = '';
+      }
+      persistState(scopeKey);
       return;
     }
     pinnedProjection = candidate;
-    pinnedRootTaskId = rootTaskId;
     if (dismissedRootTaskId && dismissedRootTaskId !== rootTaskId) {
       dismissedRootTaskId = '';
     }
@@ -311,7 +306,9 @@
 
   async function runAction(action: AgentRunActionKind): Promise<void> {
     const sessionId = normalizedScopePart(currentSessionId);
-    const rootTaskId = pinnedProjection?.root_task.task_id?.trim() || pinnedRootTaskId;
+    const rootTaskId = pinnedProjection?.root_task.task_id?.trim()
+      || agentRunState.rootTaskId?.trim()
+      || '';
     if (!sessionId || !rootTaskId || agentRunState.actionInFlight) return;
     try {
       const response = await performAgentRunAction(
@@ -324,13 +321,11 @@
       if (!response) return;
       if (action === 'archive') {
         dismissedRootTaskId = rootTaskId;
-        pinnedRootTaskId = '';
         pinnedProjection = null;
         completedExpanded = false;
         expanded = false;
       } else if (action === 'restart') {
         dismissedRootTaskId = rootTaskId;
-        pinnedRootTaskId = response.newRootTaskId?.trim() || response.rootTaskId.trim();
         pinnedProjection = agentRunState.projection;
       } else {
         pinnedProjection = agentRunState.projection ?? pinnedProjection;
@@ -373,16 +368,6 @@
   async function openAgent(agent: AgentProjectionDto): Promise<void> {
     const sessionId = currentSessionId?.trim() ?? '';
     if (!sessionId) return;
-    const rootTaskId = pinnedProjection?.root_task.task_id?.trim() ?? '';
-    const loadedRootTaskId = agentRunState.projection?.root_task.task_id?.trim() ?? '';
-    if (rootTaskId && rootTaskId !== loadedRootTaskId) {
-      await fetchAgentRunProjection(
-        sessionId,
-        rootTaskId,
-        currentWorkspaceId,
-        currentWorkspacePath,
-      );
-    }
     const visual = agentVisual(agent);
     selectAgentRun(sessionId, agent.agentRunId, currentWorkspaceId, currentWorkspacePath);
     openAgentTab(sessionId, agent.agentRunId, {

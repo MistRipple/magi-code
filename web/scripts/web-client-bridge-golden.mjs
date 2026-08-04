@@ -781,6 +781,45 @@ await withGoldenViteServer(async (server) => {
   const messagesStore = await server.ssrLoadModule('/src/stores/messages.svelte.ts');
   const turnStore = await server.ssrLoadModule('/src/stores/turn-store.svelte.ts');
 
+  const resumedRootHints = bridgeModule.extractBootstrapAgentRunTrackingHints(
+    { sessionId: 'session-resumed-root' },
+    {
+      runtimeReadModel: {
+        details: {
+          sessions: [{
+            session_id: 'session-resumed-root',
+            current_status: 'detached',
+            root_task_id: null,
+            active_task_ids: [],
+            active_execution_group_ids: [],
+          }],
+          tasks: [
+            { task_id: 'task-interrupted-root', current_status: 'killed' },
+            { task_id: 'task-resumed-root', current_status: 'completed' },
+          ],
+          execution_groups: [],
+        },
+      },
+      recentEvents: [
+        {
+          session_id: 'session-resumed-root',
+          task_id: 'task-interrupted-root',
+          payload: { root_task_id: 'task-interrupted-root' },
+        },
+        {
+          session_id: 'session-resumed-root',
+          task_id: 'task-resumed-root',
+          payload: { root_task_id: 'task-resumed-root' },
+        },
+      ],
+    },
+  );
+  assert.deepEqual(
+    resumedRootHints,
+    { rootTaskId: 'task-resumed-root', activeTaskIds: [] },
+    'detached 会话必须从最近事件恢复最新 root，不能继续固定已被续跑取代的中断任务',
+  );
+
   const bridge = bridgeModule.createWebClientBridge();
   bridgeRuntime.setClientBridge(bridge);
   messagesStore.initializeState();
