@@ -3,8 +3,8 @@ use crate::{
     ExternalMcpToolExecutor, ExternalToolCatalogProvider, ExternalToolCatalogSnapshot,
     GitToolExecutor, ImageGenerationExecutor, ImageGenerationReadinessProvider,
     RuntimeCapabilityDependencyProvider, ToolExecutionContext, ToolExecutionContextQuery,
-    ToolExecutionInput, ToolExecutionOutput, ToolExecutionPolicy, ToolExecutionSummary,
-    ToolInvocationRecord, ToolRuntimeResources,
+    ToolExecutionInput, ToolExecutionOutput, ToolExecutionPolicy, ToolExecutionProgress,
+    ToolExecutionSummary, ToolInvocationRecord, ToolRuntimeResources,
     builtin::{self, NormalizedBuiltinTool, infer_execution_status},
     is_public_builtin_tool_surface,
     policy::WriteProtectionClaim,
@@ -258,7 +258,17 @@ impl ToolRegistry {
         context: ToolExecutionContext,
         policy: &ToolExecutionPolicy,
     ) -> ToolExecutionOutput {
-        self.execute_with_policy_for_surface(input, context, policy, false)
+        self.execute_with_policy_for_surface(input, context, policy, false, None)
+    }
+
+    pub fn execute_with_policy_and_progress(
+        &self,
+        input: ToolExecutionInput,
+        context: ToolExecutionContext,
+        policy: &ToolExecutionPolicy,
+        on_progress: &(dyn Fn(ToolExecutionProgress) + Sync),
+    ) -> ToolExecutionOutput {
+        self.execute_with_policy_for_surface(input, context, policy, false, Some(on_progress))
     }
 
     pub fn cancel_active_processes(&self, query: &ToolExecutionContextQuery) -> usize {
@@ -276,7 +286,7 @@ impl ToolRegistry {
         context: ToolExecutionContext,
         policy: &ToolExecutionPolicy,
     ) -> ToolExecutionOutput {
-        self.execute_with_policy_for_surface(input, context, policy, true)
+        self.execute_with_policy_for_surface(input, context, policy, true, None)
     }
 
     fn execute_with_policy_for_surface(
@@ -285,6 +295,7 @@ impl ToolRegistry {
         mut context: ToolExecutionContext,
         policy: &ToolExecutionPolicy,
         allow_internal_builtin_surface: bool,
+        on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
     ) -> ToolExecutionOutput {
         context.access_profile = policy.effective_access_profile();
         if input.tool_kind == ToolKind::Builtin
@@ -354,12 +365,21 @@ impl ToolRegistry {
                         }
                     };
                     let before_changes = capture_tool_workspace_snapshot(&input, &context);
-                    let payload = tool.execute(
-                        &input.tool_call_id,
-                        &input.input,
-                        &context,
-                        &self.runtime_resources,
-                    );
+                    let payload = match on_progress {
+                        Some(on_progress) => tool.execute_with_progress(
+                            &input.tool_call_id,
+                            &input.input,
+                            &context,
+                            &self.runtime_resources,
+                            on_progress,
+                        ),
+                        None => tool.execute(
+                            &input.tool_call_id,
+                            &input.input,
+                            &context,
+                            &self.runtime_resources,
+                        ),
+                    };
                     let payload =
                         append_workspace_changed_paths(payload, before_changes.as_ref(), &context);
                     drop(write_guard);

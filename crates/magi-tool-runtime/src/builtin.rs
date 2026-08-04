@@ -1,8 +1,8 @@
 use crate::{
     BuiltinTool, BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec, ToolExecutionContext,
-    ToolExecutionContextQuery, ToolRuntimeResources, apply_patch::execute_apply_patch,
-    image_generate::execute_image_generate, tool_catalog::execute_tool_catalog,
-    view_image::execute_view_image,
+    ToolExecutionContextQuery, ToolExecutionProgress, ToolRuntimeResources,
+    apply_patch::execute_apply_patch, image_generate::execute_image_generate,
+    tool_catalog::execute_tool_catalog, view_image::execute_view_image,
 };
 use base64::Engine as _;
 use magi_core::{ApprovalRequirement, ExecutionResultStatus, RiskLevel, ToolCallId, UtcMillis};
@@ -29,6 +29,7 @@ const SHELL_TIMEOUT_POLL_MS: u64 = 20;
 const DEFAULT_FILE_READ_MAX_BYTES: usize = 64 * 1024;
 const FILE_READ_MAX_BYTES: usize = 1024 * 1024;
 const SHELL_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+const SHELL_PROGRESS_INTERVAL_MS: u64 = 250;
 const FILE_READ_PUBLIC_ERROR: &str = "文件暂不可读取，请检查路径或权限";
 const FILE_WRITE_PUBLIC_ERROR: &str = "文件暂不可写入，请检查路径或权限";
 const FILE_DELETE_PUBLIC_ERROR: &str = "文件暂不可删除，请检查路径或权限";
@@ -69,12 +70,29 @@ struct ShellExecOutput {
     cancelled: bool,
 }
 
+#[derive(Clone, Default)]
+struct ShellProgressState {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    revision: u64,
+    finished: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ShellProgressStream {
+    Stdout,
+    Stderr,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ShellCommandSpec {
     program: String,
     arguments: Vec<String>,
 }
 
+#[cfg(test)]
 pub(crate) struct ShellPipeOutput {
     pub(crate) bytes: Vec<u8>,
     pub(crate) truncated: bool,
@@ -155,7 +173,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::FileMove => execute_file_move(input, context),
             BuiltinToolName::SearchText => execute_search_text(input, context),
             BuiltinToolName::SearchSemantic => execute_search_semantic(input, context, resources),
-            BuiltinToolName::ShellExec => execute_shell_exec(input, context),
+            BuiltinToolName::ShellExec => execute_shell_exec(input, context, None),
             BuiltinToolName::ProcessLaunch => execute_process_launch(input, context),
             BuiltinToolName::ProcessRead => execute_process_read(input, context),
             BuiltinToolName::ProcessWrite => execute_process_write(input, context),
@@ -194,6 +212,21 @@ impl BuiltinTool for NormalizedBuiltinTool {
             | BuiltinToolName::ContextRequest
             | BuiltinToolName::UpdatePlan
             | BuiltinToolName::MemoryWrite => execute_orchestration_only(self.name, input),
+        }
+    }
+
+    fn execute_with_progress(
+        &self,
+        tool_call_id: &ToolCallId,
+        input: &str,
+        context: &ToolExecutionContext,
+        resources: &ToolRuntimeResources,
+        on_progress: &(dyn Fn(ToolExecutionProgress) + Sync),
+    ) -> String {
+        if self.name == BuiltinToolName::ShellExec {
+            execute_shell_exec(input, context, Some((tool_call_id, on_progress)))
+        } else {
+            self.execute(tool_call_id, input, context, resources)
         }
     }
 
@@ -577,7 +610,11 @@ fn execute_search_text(input: &str, context: &ToolExecutionContext) -> String {
     .to_string()
 }
 
-fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
+fn execute_shell_exec(
+    input: &str,
+    context: &ToolExecutionContext,
+    progress: Option<(&ToolCallId, &(dyn Fn(ToolExecutionProgress) + Sync))>,
+) -> String {
     let request = parse_json_object(input);
     if let Some(payload) = execute_shell_exec_background_action(input, request.as_ref(), context) {
         return payload;
@@ -720,18 +757,19 @@ fn execute_shell_exec(input: &str, context: &ToolExecutionContext) -> String {
         .to_string();
     }
 
-    let output =
-        match execute_shell_command_with_timeout(&shell, &command, &cwd, timeout_ms, context) {
-            Ok(output) => output,
-            Err(error) => {
-                return builtin_runtime_error(
-                    "shell_exec",
-                    SHELL_EXEC_PUBLIC_ERROR,
-                    "启动 shell 命令失败",
-                    error,
-                );
-            }
-        };
+    let output = match execute_shell_command_with_timeout(
+        &shell, &command, &cwd, timeout_ms, context, progress,
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            return builtin_runtime_error(
+                "shell_exec",
+                SHELL_EXEC_PUBLIC_ERROR,
+                "启动 shell 命令失败",
+                error,
+            );
+        }
+    };
 
     let succeeded = output
         .status
@@ -1026,6 +1064,7 @@ fn execute_shell_command_with_timeout(
     cwd: &Path,
     timeout_ms: u64,
     context: &ToolExecutionContext,
+    progress: Option<(&ToolCallId, &(dyn Fn(ToolExecutionProgress) + Sync))>,
 ) -> Result<ShellExecOutput, String> {
     let mut command_builder = std_command(&shell.program);
     command_builder
@@ -1040,61 +1079,161 @@ fn execute_shell_command_with_timeout(
     let stderr = child.take_stderr();
     let child = Arc::new(Mutex::new(child));
     let (execution_id, cancellation_requested) = register_active_shell_exec(context, &child);
-    let stdout_reader = thread::spawn(move || read_child_pipe(stdout));
-    let stderr_reader = thread::spawn(move || read_child_pipe(stderr));
+    let progress_state = Arc::new(Mutex::new(ShellProgressState::default()));
     let started_at = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let mut timed_out = false;
     let mut cancelled = false;
-    let status = loop {
-        let wait_state = {
-            child
-                .lock()
-                .expect("shell child lock poisoned")
-                .try_wait()
-                .map_err(|error| error.to_string())?
-        };
-        match wait_state {
-            Some(status) => {
-                if cancellation_requested.load(Ordering::SeqCst)
-                    || !active_shell_exec_is_registered(execution_id)
+    let status = thread::scope(|scope| {
+        let progress_publisher = progress.map(|(tool_call_id, on_progress)| {
+            let publisher_state = Arc::clone(&progress_state);
+            scope.spawn(move || publish_shell_progress(tool_call_id, on_progress, publisher_state))
+        });
+        let stdout_state = Arc::clone(&progress_state);
+        let stdout_reader = scope.spawn(move || {
+            read_child_pipe_with_progress(stdout, ShellProgressStream::Stdout, stdout_state)
+        });
+        let stderr_state = Arc::clone(&progress_state);
+        let stderr_reader = scope.spawn(move || {
+            read_child_pipe_with_progress(stderr, ShellProgressStream::Stderr, stderr_state)
+        });
+        let status = loop {
+            let wait_state = {
+                child
+                    .lock()
+                    .expect("shell child lock poisoned")
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+            };
+            match wait_state {
+                Some(status) => {
+                    if cancellation_requested.load(Ordering::SeqCst)
+                        || !active_shell_exec_is_registered(execution_id)
+                    {
+                        cancelled = true;
+                    }
+                    break Some(status);
+                }
+                None if started_at.elapsed() >= timeout => {
+                    timed_out = true;
+                    break terminate_shell_child(&child);
+                }
+                None if cancellation_requested.load(Ordering::SeqCst)
+                    || !active_shell_exec_is_registered(execution_id) =>
                 {
                     cancelled = true;
+                    break terminate_shell_child(&child);
                 }
-                break Some(status);
+                None => thread::sleep(Duration::from_millis(SHELL_TIMEOUT_POLL_MS)),
             }
-            None if started_at.elapsed() >= timeout => {
-                timed_out = true;
-                break terminate_shell_child(&child);
-            }
-            None if cancellation_requested.load(Ordering::SeqCst)
-                || !active_shell_exec_is_registered(execution_id) =>
-            {
-                cancelled = true;
-                break terminate_shell_child(&child);
-            }
-            None => thread::sleep(Duration::from_millis(SHELL_TIMEOUT_POLL_MS)),
+        };
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        progress_state
+            .lock()
+            .expect("shell progress state lock poisoned")
+            .finished = true;
+        if let Some(progress_publisher) = progress_publisher {
+            let _ = progress_publisher.join();
         }
-    };
+        Ok::<_, String>(status)
+    })?;
     unregister_active_shell_exec(execution_id);
-
-    let stdout = stdout_reader.join().unwrap_or(ShellPipeOutput {
-        bytes: Vec::new(),
-        truncated: false,
-    });
-    let stderr = stderr_reader.join().unwrap_or(ShellPipeOutput {
-        bytes: Vec::new(),
-        truncated: false,
-    });
+    let progress_state = progress_state
+        .lock()
+        .expect("shell progress state lock poisoned")
+        .clone();
     Ok(ShellExecOutput {
         status,
-        stdout: stdout.bytes,
-        stderr: stderr.bytes,
-        stdout_truncated: stdout.truncated,
-        stderr_truncated: stderr.truncated,
+        stdout: progress_state.stdout,
+        stderr: progress_state.stderr,
+        stdout_truncated: progress_state.stdout_truncated,
+        stderr_truncated: progress_state.stderr_truncated,
         timed_out,
         cancelled,
     })
+}
+
+fn read_child_pipe_with_progress<T: Read>(
+    pipe: Option<T>,
+    stream: ShellProgressStream,
+    state: Arc<Mutex<ShellProgressState>>,
+) {
+    let Some(mut pipe) = pipe else {
+        return;
+    };
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let size = match pipe.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(size) => size,
+        };
+        {
+            let mut state = state.lock().expect("shell progress state lock poisoned");
+            match stream {
+                ShellProgressStream::Stdout => {
+                    state.stdout.extend_from_slice(&chunk[..size]);
+                    if state.stdout.len() > SHELL_OUTPUT_MAX_BYTES {
+                        state.stdout_truncated = true;
+                        let excess = state.stdout.len() - SHELL_OUTPUT_MAX_BYTES;
+                        state.stdout.drain(..excess);
+                    }
+                }
+                ShellProgressStream::Stderr => {
+                    state.stderr.extend_from_slice(&chunk[..size]);
+                    if state.stderr.len() > SHELL_OUTPUT_MAX_BYTES {
+                        state.stderr_truncated = true;
+                        let excess = state.stderr.len() - SHELL_OUTPUT_MAX_BYTES;
+                        state.stderr.drain(..excess);
+                    }
+                }
+            }
+            state.revision = state.revision.saturating_add(1);
+        }
+    }
+}
+
+fn publish_shell_progress(
+    tool_call_id: &ToolCallId,
+    on_progress: &(dyn Fn(ToolExecutionProgress) + Sync),
+    state: Arc<Mutex<ShellProgressState>>,
+) {
+    let interval = Duration::from_millis(SHELL_PROGRESS_INTERVAL_MS);
+    let mut published_revision = 0_u64;
+    let mut last_published_at = Instant::now() - interval;
+    loop {
+        let snapshot = state
+            .lock()
+            .expect("shell progress state lock poisoned")
+            .clone();
+        let has_new_output = snapshot.revision > published_revision;
+        if has_new_output
+            && (published_revision == 0
+                || last_published_at.elapsed() >= interval
+                || snapshot.finished)
+        {
+            on_progress(ToolExecutionProgress {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: "shell_exec".to_string(),
+                payload: serde_json::json!({
+                    "tool": "shell_exec",
+                    "status": "running",
+                    "stdout": String::from_utf8_lossy(&snapshot.stdout),
+                    "stderr": String::from_utf8_lossy(&snapshot.stderr),
+                    "stdout_truncated": snapshot.stdout_truncated,
+                    "stderr_truncated": snapshot.stderr_truncated,
+                    "summary": "命令正在执行",
+                })
+                .to_string(),
+            });
+            published_revision = snapshot.revision;
+            last_published_at = Instant::now();
+        }
+        if snapshot.finished && published_revision >= snapshot.revision {
+            break;
+        }
+        thread::sleep(Duration::from_millis(SHELL_TIMEOUT_POLL_MS));
+    }
 }
 
 fn register_active_shell_exec(
@@ -1262,6 +1401,7 @@ fn terminate_shell_child(child: &Arc<Mutex<ManagedChild>>) -> Option<ExitStatus>
     }
 }
 
+#[cfg(test)]
 pub(crate) fn read_child_pipe<T: Read>(pipe: Option<T>) -> ShellPipeOutput {
     let Some(mut pipe) = pipe else {
         return ShellPipeOutput {

@@ -295,6 +295,14 @@
     typeof message.metadata?.recoveryState === 'string' ? message.metadata.recoveryState : '',
   );
   const isInterruptedRecoveryNotice = $derived(noticeKind === 'session_interrupted');
+  const compactionState = $derived(
+    typeof message.metadata?.compactionState === 'string'
+      ? message.metadata.compactionState
+      : '',
+  );
+  const isContextCompactionRunning = $derived(
+    noticeKind === 'context_compaction' && compactionState === 'running',
+  );
   const canContinueInterrupted = $derived(
     isInterruptedRecoveryNotice
       && recoveryState === 'ready'
@@ -320,6 +328,26 @@
   }
   const noticeText = $derived.by(() => {
     if (message.metadata?.noticeKind === 'context_compaction') {
+      if (compactionState === 'running') {
+        const completed = typeof message.metadata.completedChunks === 'number'
+          ? message.metadata.completedChunks
+          : 0;
+        const total = typeof message.metadata.totalChunks === 'number'
+          ? message.metadata.totalChunks
+          : 0;
+        return total > 0
+          ? i18n.t('messageItem.contextCompactionRunningWithProgress', { completed, total })
+          : i18n.t('messageItem.contextCompactionRunning');
+      }
+      if (compactionState === 'skipped') {
+        return i18n.t('messageItem.contextCompactionSkipped');
+      }
+      if (compactionState === 'cancelled') {
+        return i18n.t('messageItem.contextCompactionCancelled');
+      }
+      if (compactionState === 'failed') {
+        return i18n.t('messageItem.contextCompactionFailed');
+      }
       return i18n.t('messageItem.contextCompaction', {
         before: compactTokenLabel(message.metadata.originalTokenEstimate),
         after: compactTokenLabel(message.metadata.compactedTokenEstimate),
@@ -373,8 +401,12 @@
         onclick={continueInterruptedSession}
       >继续</button>
     {:else}
-      <span class="notice-icon" style="color: {noticeColors[noticeType] || noticeColors.info}">
-        <Icon name={noticeIcons[noticeType] || 'info'} size={14} />
+      <span
+        class="notice-icon"
+        class:compacting={isContextCompactionRunning}
+        style="color: {noticeColors[noticeType] || noticeColors.info}"
+      >
+        <Icon name={isContextCompactionRunning ? 'loader' : (noticeIcons[noticeType] || 'info')} size={14} />
       </span>
       <span class="notice-text">
         <ErrorDetailPopover text={noticeText} maxInlineChars={96} />
@@ -556,6 +588,13 @@
   .system-notice.success { color: var(--success); }
   .system-notice.warning { color: var(--warning); }
   .system-notice.error { color: var(--error); }
+  .notice-icon.compacting {
+    display: inline-flex;
+    animation: context-compaction-spin 900ms linear infinite;
+  }
+  @keyframes context-compaction-spin {
+    to { transform: rotate(360deg); }
+  }
   .system-notice.interrupted-recovery {
     align-items: baseline;
     justify-content: flex-start;

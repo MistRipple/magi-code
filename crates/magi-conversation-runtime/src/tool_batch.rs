@@ -35,9 +35,9 @@ use magi_session_store::{
 };
 use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
 use magi_tool_runtime::{
-    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy, ToolRegistry,
-    builtin_permission_engine, canonical_builtin_tool_name, effective_tool_policy_allowed_paths,
-    normalize_tool_policy_paths, tool_path_access_requests,
+    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionPolicy,
+    ToolExecutionProgress, ToolRegistry, builtin_permission_engine, canonical_builtin_tool_name,
+    effective_tool_policy_allowed_paths, normalize_tool_policy_paths, tool_path_access_requests,
 };
 
 use crate::builtin_tool_schema::internal_builtin_tool_rejection_payload;
@@ -221,6 +221,7 @@ pub(crate) fn execute_task_tool_call_batch(
     worker_id: Option<&magi_core::WorkerId>,
     tool_calls: &[ChatToolCall],
     tool_execution_ledger: &mut ToolExecutionLedger,
+    on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
     snapshot_session: Option<Arc<SnapshotSession>>,
     execution_group_id: Option<String>,
 ) -> Vec<(String, ExecutionResultStatus)> {
@@ -246,6 +247,7 @@ pub(crate) fn execute_task_tool_call_batch(
             workspace_root_path,
             worker_id,
             execution_calls,
+            on_progress,
             snapshot_session.clone(),
             execution_group_id.clone(),
         )
@@ -274,6 +276,7 @@ fn execute_task_tool_call_batch_unchecked(
     workspace_root_path: Option<&PathBuf>,
     worker_id: Option<&magi_core::WorkerId>,
     tool_calls: &[ChatToolCall],
+    on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
     snapshot_session: Option<Arc<SnapshotSession>>,
     execution_group_id: Option<String>,
 ) -> Vec<(String, ExecutionResultStatus)> {
@@ -343,6 +346,7 @@ fn execute_task_tool_call_batch_unchecked(
                                 workspace_root_path,
                                 worker_id,
                                 tool_call,
+                                on_progress,
                             )
                         },
                     );
@@ -403,6 +407,7 @@ fn execute_task_tool_call_batch_unchecked(
                                                 workspace_root_path,
                                                 worker_id,
                                                 tool_call,
+                                                on_progress,
                                             )
                                         },
                                     );
@@ -2728,6 +2733,7 @@ fn execute_task_tool_call(
     workspace_root_path: Option<&PathBuf>,
     worker_id: Option<&magi_core::WorkerId>,
     tool_call: &ChatToolCall,
+    on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
 ) -> (String, ExecutionResultStatus) {
     // S7-E：协调器工具（agent_spawn）由 orchestration 层拦截，
     // 不进 BuiltinTool::execute —— 它需要 task_store / spawn_graph / event_bus 等上下文。
@@ -2942,22 +2948,25 @@ fn execute_task_tool_call(
     let mut tool_policy =
         active_skill_tool_execution_policy(access_profile, skill_runtime, skill_name);
     apply_task_policy_scope(&mut tool_policy, task.policy_snapshot.as_ref());
-    let output = registry.execute_with_policy(
-        ToolExecutionInput::for_builtin_invocation(
-            ToolCallId::new(&tool_call.id),
-            &tool_call.function.name,
-            tool_call.function.arguments.clone(),
-        ),
-        ToolExecutionContext {
-            worker_id: worker_id.cloned(),
-            task_id: Some(task.task_id.clone()),
-            session_id: Some(session_id.clone()),
-            workspace_id: workspace_id.clone(),
-            access_profile: tool_policy.access_profile,
-            working_directory: workspace_root_path.cloned(),
-        },
-        &tool_policy,
+    let input = ToolExecutionInput::for_builtin_invocation(
+        ToolCallId::new(&tool_call.id),
+        &tool_call.function.name,
+        tool_call.function.arguments.clone(),
     );
+    let context = ToolExecutionContext {
+        worker_id: worker_id.cloned(),
+        task_id: Some(task.task_id.clone()),
+        session_id: Some(session_id.clone()),
+        workspace_id: workspace_id.clone(),
+        access_profile: tool_policy.access_profile,
+        working_directory: workspace_root_path.cloned(),
+    };
+    let output = match on_progress {
+        Some(on_progress) => {
+            registry.execute_with_policy_and_progress(input, context, &tool_policy, on_progress)
+        }
+        None => registry.execute_with_policy(input, context, &tool_policy),
+    };
 
     (output.payload, output.status)
 }
@@ -3711,6 +3720,7 @@ mod tests {
             &mut ledger,
             None,
             None,
+            None,
         );
 
         assert_eq!(executions.load(Ordering::SeqCst), 1);
@@ -3753,6 +3763,7 @@ mod tests {
             None,
             &[second_round_call],
             &mut ledger,
+            None,
             None,
             None,
         );
@@ -3822,6 +3833,7 @@ mod tests {
             &mut ledger,
             None,
             None,
+            None,
         );
         assert_eq!(first_results[0].1, ExecutionResultStatus::Succeeded);
 
@@ -3854,6 +3866,7 @@ mod tests {
                 },
             }],
             &mut ledger,
+            None,
             None,
             None,
         );
@@ -4254,6 +4267,7 @@ mod tests {
             None,
             None,
             &tool_call,
+            None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&payload).expect("plan payload json");
 
@@ -4313,6 +4327,7 @@ mod tests {
                 None,
                 None,
                 &tool_call,
+                None,
             )
         };
 
@@ -5415,6 +5430,7 @@ mod tests {
             &mut ToolExecutionLedger::default(),
             None,
             None,
+            None,
         );
 
         assert_eq!(result[0].1, ExecutionResultStatus::NeedsApproval);
@@ -5427,6 +5443,87 @@ mod tests {
             Some("tool_policy_needs_approval")
         );
         assert!(target.exists(), "受限访问拦截的删除不能提前执行");
+    }
+
+    #[test]
+    fn task_shell_tool_forwards_running_output_progress() {
+        let event_bus = InMemoryEventBus::new(16);
+        let task_store = TaskStore::new();
+        let session_store = SessionStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let conversation_registry = ConversationRegistry::new();
+        let spawn_graph = Mutex::new(magi_spawn_graph::SpawnGraph::new());
+        let plan_store = crate::test_plan_store("test-plan");
+        let agent_role_registry = magi_agent_role::AgentRoleRegistry::load_default();
+        let mut tool_registry = ToolRegistry::new(
+            Arc::new(magi_governance::GovernanceService::default()),
+            Arc::new(InMemoryEventBus::new(8)),
+        );
+        tool_registry.register_default_builtins();
+        let dir = tempdir().expect("temp dir");
+        let mut task = test_task("task-shell-progress", "task-shell-progress", None);
+        task.policy_snapshot = Some(default_agent_spawn_policy());
+        task.policy_snapshot
+            .as_mut()
+            .expect("policy")
+            .access_profile = magi_core::AccessProfile::FullAccess;
+        let session_id = SessionId::new("session-shell-progress");
+        let workspace_id = Some(WorkspaceId::new("workspace-shell-progress"));
+        let tool_call = ChatToolCall {
+            id: "call-shell-progress".to_string(),
+            kind: "function".to_string(),
+            function: ChatToolFunction {
+                name: BuiltinToolName::ShellExec.as_str().to_string(),
+                arguments: serde_json::json!({
+                    "command": "printf first; sleep 1; printf second",
+                    "access_mode": "read_only",
+                    "timeout_ms": 5_000,
+                })
+                .to_string(),
+            },
+        };
+        let progress = Arc::new(Mutex::new(Vec::<ToolExecutionProgress>::new()));
+        let captured = Arc::clone(&progress);
+        let on_progress = move |update| {
+            captured.lock().expect("progress lock").push(update);
+        };
+
+        let result = execute_task_tool_call_batch(
+            &event_bus,
+            Some(&tool_registry),
+            &agent_role_registry,
+            None,
+            None,
+            None,
+            &task_store,
+            &session_store,
+            &execution_registry,
+            &conversation_registry,
+            &spawn_graph,
+            None,
+            &plan_store,
+            None,
+            &task,
+            &session_id,
+            &workspace_id,
+            Some(&dir.path().to_path_buf()),
+            None,
+            &[tool_call],
+            &mut ToolExecutionLedger::default(),
+            Some(&on_progress),
+            None,
+            None,
+        );
+
+        assert_eq!(result[0].1, ExecutionResultStatus::Succeeded);
+        let progress = progress.lock().expect("progress lock");
+        assert!(progress.iter().any(|update| {
+            let payload = serde_json::from_str::<serde_json::Value>(&update.payload)
+                .expect("progress payload should be json");
+            update.tool_call_id.as_str() == "call-shell-progress"
+                && payload["status"] == "running"
+                && payload["stdout"] == "first"
+        }));
     }
 
     #[test]
@@ -5481,6 +5578,7 @@ mod tests {
             None,
             &[tool_call],
             &mut ToolExecutionLedger::default(),
+            None,
             None,
             None,
         );
@@ -5558,6 +5656,7 @@ mod tests {
             Some(&worker_id),
             &[tool_call],
             &mut ToolExecutionLedger::default(),
+            None,
             Some(snapshot.clone()),
             Some(task.mission_id.to_string()),
         );
@@ -5613,6 +5712,7 @@ mod tests {
             None,
             &[mainline_tool_call],
             &mut ToolExecutionLedger::default(),
+            None,
             Some(snapshot.clone()),
             Some(task.mission_id.to_string()),
         );
@@ -5724,6 +5824,7 @@ mod tests {
             Some(&worker_id),
             &tool_calls,
             &mut ToolExecutionLedger::default(),
+            None,
             Some(snapshot.clone()),
             Some(task.mission_id.to_string()),
         );
@@ -6556,6 +6657,7 @@ mod tests {
                 },
             }],
             &mut ToolExecutionLedger::default(),
+            None,
             None,
             None,
         );

@@ -5,9 +5,11 @@
 //! 等方式桥接到 `ApiError` 枚举。
 
 use crate::context_authority::{
-    ContextAuthority, ContextCompactionRecord, ContextPrepareRequest, current_session_file_facts,
+    ContextAuthority, ContextCompactionTerminal, ContextPrepareRequest, current_session_file_facts,
     estimate_chat_messages_tokens, estimate_tool_definition_tokens,
 };
+#[cfg(test)]
+use crate::context_authority::{ContextCompactionProgress, ContextCompactionRecord};
 use crate::model_context_window::{apply_reported_context_limit, resolve_model_context_window};
 use crate::{
     ConversationRegistry, SessionTurnInputBoundary, UserSignal,
@@ -30,12 +32,14 @@ use crate::{
     },
     session_images::{SessionTurnImage, session_turn_image_sources},
     session_writeback::{
-        SessionStatePersistCallback, SessionTurnStreamPublishGate,
-        append_session_tool_call_items_batch_with_context, append_session_turn_error_item,
-        append_session_turn_item, apply_model_response_round, persist_session_state_checkpoint,
+        ContextCompactionWritebackContext, SessionStatePersistCallback,
+        SessionTurnStreamPublishGate, append_session_tool_call_items_batch_with_context,
+        append_session_turn_error_item, append_session_turn_item, apply_model_response_round,
+        new_context_compaction_item_id, persist_session_state_checkpoint,
         publish_current_session_turn_item_event, publish_model_retry_runtime_event,
         publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
-        session_turn_stream_update, upsert_session_turn_item,
+        session_turn_stream_update, upsert_context_compaction_completed_notice,
+        upsert_context_compaction_progress_notice, upsert_session_turn_item,
     },
     tool_call_validation::{
         ToolCallFailureDiagnostic, ToolCallValidationIssue, ToolCallValidationTracker,
@@ -131,6 +135,7 @@ pub enum SessionTurnFailureReason {
     ModelResponseInvalid,
     ModelImageInvocationFailed,
     ToolCallProtocolFailed,
+    ContextCompactionFailed,
     RuntimeInvalidState,
 }
 
@@ -144,6 +149,7 @@ impl SessionTurnFailureReason {
             Self::ModelResponseInvalid => "model_response_invalid",
             Self::ModelImageInvocationFailed => "model_image_invocation_failed",
             Self::ToolCallProtocolFailed => "tool_arguments_invalid",
+            Self::ContextCompactionFailed => "context_compaction_failed",
             Self::RuntimeInvalidState => "session_turn_runtime_invalid_state",
         }
     }
@@ -196,6 +202,13 @@ impl SessionTurnExecutionError {
         Self::new(
             SessionTurnFailureReason::RuntimeInvalidState,
             "对话运行状态异常，请重新发送。",
+        )
+    }
+
+    fn context_compaction_failed() -> Self {
+        Self::new(
+            SessionTurnFailureReason::ContextCompactionFailed,
+            "上下文压缩失败，本轮已停止。请检查辅助模型配置或网络后重试。",
         )
     }
 }
@@ -528,68 +541,6 @@ fn workspace_context_messages(request: &SessionTurnExecutionRequest) -> Vec<Chat
     )]
 }
 
-fn append_context_compaction_notice(
-    event_bus: &InMemoryEventBus,
-    session_store: &SessionStore,
-    request: &SessionTurnExecutionRequest,
-    thread_id: &magi_core::ThreadId,
-    record: &ContextCompactionRecord,
-    persist_session_state: Option<&SessionStatePersistCallback>,
-) {
-    let mut item = session_turn_item(
-        "assistant_phase",
-        "completed",
-        Some("Context compacted".to_string()),
-        Some("Context compacted".to_string()),
-        Some(format!(
-            "turn-item-context-compaction-{}",
-            record.compacted_at.0
-        )),
-        thread_id.clone(),
-    );
-    item.metadata.insert(
-        "noticeKind".to_string(),
-        serde_json::Value::String("context_compaction".to_string()),
-    );
-    item.metadata.insert(
-        "noticeType".to_string(),
-        serde_json::Value::String("info".to_string()),
-    );
-    item.metadata.insert(
-        "reason".to_string(),
-        serde_json::Value::String(record.reason.to_string()),
-    );
-    item.metadata.insert(
-        "originalMessageCount".to_string(),
-        serde_json::json!(record.original_message_count),
-    );
-    item.metadata.insert(
-        "compactedMessageCount".to_string(),
-        serde_json::json!(record.compacted_message_count),
-    );
-    item.metadata.insert(
-        "originalTokenEstimate".to_string(),
-        serde_json::json!(record.original_token_estimate),
-    );
-    item.metadata.insert(
-        "compactedTokenEstimate".to_string(),
-        serde_json::json!(record.compacted_token_estimate),
-    );
-    item.metadata.insert(
-        "compactedAt".to_string(),
-        serde_json::json!(record.compacted_at.0),
-    );
-    if let Some(published) = append_session_turn_item(session_store, &request.session_id, item) {
-        persist_session_state_checkpoint(persist_session_state, "context_compaction_notice");
-        publish_session_turn_item_event(
-            event_bus,
-            &request.session_id,
-            &request.workspace_id,
-            &published,
-        );
-    }
-}
-
 struct RebuildMessagesForContextWindowInput<'a> {
     client: &'a dyn ModelBridgeClient,
     event_bus: &'a InMemoryEventBus,
@@ -608,7 +559,9 @@ struct RebuildMessagesForContextWindowInput<'a> {
     active_skill_name: Option<&'a str>,
 }
 
-fn rebuild_messages_for_context_window(input: RebuildMessagesForContextWindowInput<'_>) -> bool {
+fn rebuild_messages_for_context_window(
+    input: RebuildMessagesForContextWindowInput<'_>,
+) -> Result<bool, ContextCompactionTerminal> {
     let RebuildMessagesForContextWindowInput {
         client,
         event_bus,
@@ -638,6 +591,24 @@ fn rebuild_messages_for_context_window(input: RebuildMessagesForContextWindowInp
     {
         fixed_messages.insert(fixed_messages.len().saturating_sub(2), skill_message);
     }
+    let compaction_item_id =
+        new_context_compaction_item_id(&request.turn_id, thread_id, "context_limit_recovery");
+    let compaction_writeback = ContextCompactionWritebackContext {
+        event_bus,
+        session_store,
+        session_id: &request.session_id,
+        workspace_id: &request.workspace_id,
+        thread_id,
+        item_id: &compaction_item_id,
+        phase: "context_limit_recovery",
+        persist_session_state,
+        task: None,
+        turn_visibility: None,
+    };
+    let compaction_observer = |progress| {
+        upsert_context_compaction_progress_notice(compaction_writeback, progress);
+    };
+    let compaction_cancelled = || !request_turn_is_writable(session_store, request);
     let prepared = ContextAuthority::new(
         client,
         event_bus,
@@ -647,6 +618,7 @@ fn rebuild_messages_for_context_window(input: RebuildMessagesForContextWindowInp
         thread_id,
         settings_store,
     )
+    .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
     .prepare(ContextPrepareRequest {
         fallback_history: Vec::new(),
         phase: "context_limit_recovery",
@@ -654,16 +626,12 @@ fn rebuild_messages_for_context_window(input: RebuildMessagesForContextWindowInp
         additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages)
             .saturating_add(estimate_tool_definition_tokens(tools)),
     });
+    if let Some(terminal) = prepared.terminal {
+        return Err(terminal);
+    }
     let compacted = prepared.compaction.is_some();
     if let Some(compaction) = prepared.compaction.as_ref() {
-        append_context_compaction_notice(
-            event_bus,
-            session_store,
-            request,
-            thread_id,
-            compaction,
-            persist_session_state,
-        );
+        upsert_context_compaction_completed_notice(compaction_writeback, compaction);
     }
     let mut history = prepared.messages;
     if history
@@ -684,7 +652,7 @@ fn rebuild_messages_for_context_window(input: RebuildMessagesForContextWindowInp
     {
         messages.insert(messages.len().saturating_sub(2), skill_message);
     }
-    compacted
+    Ok(compacted)
 }
 
 pub struct SessionTurnExecutionRuntime<'a> {
@@ -816,6 +784,24 @@ fn run_session_turn_execution_inner(
         knowledge_context_prompt.as_deref(),
         &[],
     );
+    let compaction_item_id =
+        new_context_compaction_item_id(&request.turn_id, &orchestrator_thread_id, "pre_turn");
+    let compaction_writeback = ContextCompactionWritebackContext {
+        event_bus,
+        session_store,
+        session_id: &request.session_id,
+        workspace_id: &request.workspace_id,
+        thread_id: &orchestrator_thread_id,
+        item_id: &compaction_item_id,
+        phase: "pre_turn",
+        persist_session_state,
+        task: None,
+        turn_visibility: None,
+    };
+    let compaction_observer = |progress| {
+        upsert_context_compaction_progress_notice(compaction_writeback, progress);
+    };
+    let compaction_cancelled = || !request_turn_is_writable(session_store, &request);
     let prepared_history = ContextAuthority::new(
         client,
         event_bus,
@@ -825,6 +811,7 @@ fn run_session_turn_execution_inner(
         &orchestrator_thread_id,
         settings_store,
     )
+    .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
     .prepare(ContextPrepareRequest {
         fallback_history,
         phase: "pre_turn",
@@ -832,15 +819,16 @@ fn run_session_turn_execution_inner(
         additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages)
             .saturating_add(estimate_tool_definition_tokens(tools.as_deref())),
     });
+    if let Some(terminal) = prepared_history.terminal {
+        return match terminal {
+            ContextCompactionTerminal::Cancelled => Ok(SessionTurnExecutionOutput::interrupted()),
+            ContextCompactionTerminal::Failed => {
+                Err(SessionTurnExecutionError::context_compaction_failed())
+            }
+        };
+    }
     if let Some(compaction) = prepared_history.compaction.as_ref() {
-        append_context_compaction_notice(
-            event_bus,
-            session_store,
-            &request,
-            &orchestrator_thread_id,
-            compaction,
-            persist_session_state,
-        );
+        upsert_context_compaction_completed_notice(compaction_writeback, compaction);
     }
     let mut messages = build_session_turn_messages(
         session_store,
@@ -919,23 +907,33 @@ fn run_session_turn_execution_inner(
                 settings_store.map(Arc::as_ref),
                 &resolved_context_model,
             );
-            rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
-                client,
-                event_bus,
-                session_store,
-                request: &request,
-                thread_id: &orchestrator_thread_id,
-                prompt: &prompt,
-                knowledge_context_prompt: knowledge_context_prompt.as_deref(),
-                context_window,
-                messages: &mut messages,
-                persist_session_state,
-                settings_store,
-                tools: round_tools.as_deref(),
-                skill_runtime,
-                initial_skill_name: initial_skill_name.as_deref(),
-                active_skill_name: active_skill_name.as_deref(),
-            });
+            let rebuild_result =
+                rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
+                    client,
+                    event_bus,
+                    session_store,
+                    request: &request,
+                    thread_id: &orchestrator_thread_id,
+                    prompt: &prompt,
+                    knowledge_context_prompt: knowledge_context_prompt.as_deref(),
+                    context_window,
+                    messages: &mut messages,
+                    persist_session_state,
+                    settings_store,
+                    tools: round_tools.as_deref(),
+                    skill_runtime,
+                    initial_skill_name: initial_skill_name.as_deref(),
+                    active_skill_name: active_skill_name.as_deref(),
+                });
+            match rebuild_result {
+                Ok(_) => {}
+                Err(ContextCompactionTerminal::Cancelled) => {
+                    return Ok(SessionTurnExecutionOutput::interrupted());
+                }
+                Err(ContextCompactionTerminal::Failed) => {
+                    return Err(SessionTurnExecutionError::context_compaction_failed());
+                }
+            }
             context_budget_recheck_required = false;
         }
         let streamed_content = match stream_session_turn_round(
@@ -1049,8 +1047,8 @@ fn run_session_turn_execution_inner(
                         context_limit,
                     )
                 {
-                    let compacted =
-                        rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
+                    let compacted = match rebuild_messages_for_context_window(
+                        RebuildMessagesForContextWindowInput {
                             client,
                             event_bus,
                             session_store,
@@ -1066,7 +1064,16 @@ fn run_session_turn_execution_inner(
                             skill_runtime,
                             initial_skill_name: initial_skill_name.as_deref(),
                             active_skill_name: active_skill_name.as_deref(),
-                        });
+                        },
+                    ) {
+                        Ok(compacted) => compacted,
+                        Err(ContextCompactionTerminal::Cancelled) => {
+                            return Ok(SessionTurnExecutionOutput::interrupted());
+                        }
+                        Err(ContextCompactionTerminal::Failed) => {
+                            return Err(SessionTurnExecutionError::context_compaction_failed());
+                        }
+                    };
                     if compacted {
                         continue;
                     }
@@ -2498,6 +2505,15 @@ mod tests {
         requests: Mutex<Vec<ModelInvocationRequest>>,
     }
 
+    struct FailingContextCompactionModelBridgeClient {
+        calls: AtomicUsize,
+    }
+
+    struct CancellingContextCompactionModelBridgeClient {
+        store: Arc<SessionStore>,
+        session_id: SessionId,
+    }
+
     struct CancellingModelBridgeClient {
         store: Arc<SessionStore>,
         session_id: SessionId,
@@ -2687,6 +2703,48 @@ mod tests {
             _on_delta: &dyn Fn(&ModelStreamingDelta),
         ) -> Result<ModelResponse, BridgeClientError> {
             self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for FailingContextCompactionModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(BridgeClientError::CallFailed {
+                layer: BridgeErrorLayer::Transport,
+                code: Some(503),
+                message: "compaction unavailable".to_string(),
+            })
+        }
+
+        fn invoke_streaming(
+            &self,
+            _request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<ModelResponse, BridgeClientError> {
+            panic!("上下文压缩不应调用流式接口")
+        }
+    }
+
+    impl ModelBridgeClient for CancellingContextCompactionModelBridgeClient {
+        fn invoke(
+            &self,
+            _request: ModelInvocationRequest,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            self.store
+                .cancel_current_turn(&self.session_id)
+                .expect("turn cancellation should succeed");
+            Ok(ModelResponse::completed("不应安装的压缩摘要"))
+        }
+
+        fn invoke_streaming(
+            &self,
+            _request: ModelInvocationRequest,
+            _on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<ModelResponse, BridgeClientError> {
+            panic!("上下文压缩不应调用流式接口")
         }
     }
 
@@ -5709,11 +5767,29 @@ mod tests {
             product_locale: "zh-CN".to_string(),
             workspace_root_path: None,
         };
-        append_context_compaction_notice(
-            &event_bus,
-            &store,
-            &request,
-            &thread_id,
+        let item_id = new_context_compaction_item_id(&request.turn_id, &thread_id, "pre_turn");
+        let writeback = ContextCompactionWritebackContext {
+            event_bus: &event_bus,
+            session_store: &store,
+            session_id: &request.session_id,
+            workspace_id: &request.workspace_id,
+            thread_id: &thread_id,
+            item_id: &item_id,
+            phase: "pre_turn",
+            persist_session_state: None,
+            task: None,
+            turn_visibility: None,
+        };
+        upsert_context_compaction_progress_notice(
+            writeback,
+            ContextCompactionProgress::Advanced {
+                stage: "history_chunk",
+                completed_chunks: 2,
+                total_chunks: 4,
+            },
+        );
+        upsert_context_compaction_completed_notice(
+            writeback,
             &ContextCompactionRecord {
                 reason: "context_window_pressure",
                 original_message_count: 42,
@@ -5722,7 +5798,6 @@ mod tests {
                 compacted_token_estimate: 36_000,
                 compacted_at: ts(1_001),
             },
-            None,
         );
 
         let turn = store
@@ -5743,6 +5818,21 @@ mod tests {
         assert_eq!(
             notice.metadata.get("compactedTokenEstimate"),
             Some(&serde_json::json!(36_000))
+        );
+        assert_eq!(
+            notice.metadata.get("compactionState"),
+            Some(&serde_json::json!("completed"))
+        );
+        assert_eq!(
+            turn.items
+                .iter()
+                .filter(|item| {
+                    item.metadata.get("noticeKind")
+                        == Some(&serde_json::json!("context_compaction"))
+                })
+                .count(),
+            1,
+            "压缩进度和终态必须更新同一个 canonical item"
         );
         assert!(
             event_bus
@@ -5903,7 +5993,10 @@ mod tests {
             active_skill_name: None,
         });
 
-        assert!(rebuilt, "小窗口恢复必须生成更小的上下文检查点");
+        assert!(
+            rebuilt.expect("上下文压缩应成功"),
+            "小窗口恢复必须生成更小的上下文检查点"
+        );
         let compaction_requests = client
             .requests
             .lock()
@@ -5921,6 +6014,214 @@ mod tests {
                 .is_some_and(|content| content.contains("file_read 已成功读取 facts.txt"))
         }));
         assert!(store.thread_context_checkpoint(&thread_id).is_some());
+    }
+
+    #[test]
+    fn context_limit_recovery_returns_terminal_failure_instead_of_reusing_oversized_history() {
+        let session_id = SessionId::new("session-context-compaction-failure");
+        let store = SessionStore::new();
+        store
+            .create_session(session_id.clone(), "context compaction failure")
+            .expect("session should create");
+        let (_, thread_id) = store.ensure_session_mission(&session_id, ts(1), || {
+            magi_core::MissionId::new("mission-context-compaction-failure")
+        });
+        store.append_thread_messages(
+            &thread_id,
+            (0..32)
+                .map(|index| ThreadChatMessage {
+                    role: if index % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                    content: Some("x".repeat(1_000)),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                })
+                .collect(),
+            ts(2),
+        );
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-context-compaction-failure".to_string(),
+                    turn_seq: 3,
+                    accepted_at: ts(3),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("继续".to_string()),
+                    items: vec![],
+                },
+            )
+            .expect("current turn should store");
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: "turn-context-compaction-failure".to_string(),
+            workspace_id: Some(WorkspaceId::new("workspace-context-compaction-failure")),
+            prompt: "继续".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: true,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
+            workspace_root_path: None,
+        };
+        let client = FailingContextCompactionModelBridgeClient {
+            calls: AtomicUsize::new(0),
+        };
+        let event_bus = InMemoryEventBus::new(16);
+        let mut messages = Vec::new();
+
+        let result = rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &store,
+            request: &request,
+            thread_id: &thread_id,
+            prompt: &request.prompt,
+            knowledge_context_prompt: None,
+            context_window: 4_000,
+            messages: &mut messages,
+            persist_session_state: None,
+            settings_store: None,
+            tools: None,
+            skill_runtime: None,
+            initial_skill_name: None,
+            active_skill_name: None,
+        });
+
+        assert_eq!(result, Err(ContextCompactionTerminal::Failed));
+        assert!(client.calls.load(Ordering::SeqCst) > 0);
+        assert!(messages.is_empty(), "失败后不能重新使用超大原始上下文");
+        assert!(store.thread_context_checkpoint(&thread_id).is_none());
+        let turn = store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| turn.turn_id == request.turn_id)
+            .expect("canonical turn should exist");
+        let compaction_notice = turn
+            .items
+            .iter()
+            .find(|item| {
+                item.metadata.get("noticeKind") == Some(&serde_json::json!("context_compaction"))
+            })
+            .expect("failed compaction notice should exist");
+        assert_eq!(compaction_notice.status, CanonicalTurnItemStatus::Failed);
+        assert_eq!(
+            compaction_notice.metadata.get("compactionState"),
+            Some(&serde_json::json!("failed"))
+        );
+    }
+
+    #[test]
+    fn context_limit_recovery_cancellation_does_not_install_checkpoint() {
+        let session_id = SessionId::new("session-context-compaction-cancelled");
+        let store = Arc::new(SessionStore::new());
+        store
+            .create_session(session_id.clone(), "context compaction cancelled")
+            .expect("session should create");
+        let (_, thread_id) = store.ensure_session_mission(&session_id, ts(1), || {
+            magi_core::MissionId::new("mission-context-compaction-cancelled")
+        });
+        store.append_thread_messages(
+            &thread_id,
+            (0..32)
+                .map(|index| ThreadChatMessage {
+                    role: if index % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                    content: Some("x".repeat(1_000)),
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    provider_context: Vec::new(),
+                })
+                .collect(),
+            ts(2),
+        );
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-context-compaction-cancelled".to_string(),
+                    turn_seq: 3,
+                    accepted_at: ts(3),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("继续".to_string()),
+                    items: vec![],
+                },
+            )
+            .expect("current turn should store");
+        let request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: "turn-context-compaction-cancelled".to_string(),
+            workspace_id: Some(WorkspaceId::new("workspace-context-compaction-cancelled")),
+            prompt: "继续".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: true,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
+            workspace_root_path: None,
+        };
+        let client = CancellingContextCompactionModelBridgeClient {
+            store: Arc::clone(&store),
+            session_id: session_id.clone(),
+        };
+        let event_bus = InMemoryEventBus::new(16);
+        let mut messages = Vec::new();
+
+        let result = rebuild_messages_for_context_window(RebuildMessagesForContextWindowInput {
+            client: &client,
+            event_bus: &event_bus,
+            session_store: &store,
+            request: &request,
+            thread_id: &thread_id,
+            prompt: &request.prompt,
+            knowledge_context_prompt: None,
+            context_window: 4_000,
+            messages: &mut messages,
+            persist_session_state: None,
+            settings_store: None,
+            tools: None,
+            skill_runtime: None,
+            initial_skill_name: None,
+            active_skill_name: None,
+        });
+
+        assert_eq!(result, Err(ContextCompactionTerminal::Cancelled));
+        assert!(messages.is_empty());
+        assert!(store.thread_context_checkpoint(&thread_id).is_none());
+        let turn = store
+            .canonical_turns_for_session(&session_id)
+            .into_iter()
+            .find(|turn| turn.turn_id == request.turn_id)
+            .expect("canonical turn should exist");
+        let compaction_notice = turn
+            .items
+            .iter()
+            .find(|item| {
+                item.metadata.get("noticeKind") == Some(&serde_json::json!("context_compaction"))
+            })
+            .expect("cancelled compaction notice should exist");
+        assert_eq!(compaction_notice.status, CanonicalTurnItemStatus::Cancelled);
+        assert_eq!(
+            compaction_notice.metadata.get("compactionState"),
+            Some(&serde_json::json!("cancelled"))
+        );
     }
 
     #[test]

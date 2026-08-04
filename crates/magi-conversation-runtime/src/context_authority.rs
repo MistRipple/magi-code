@@ -25,7 +25,11 @@ use magi_usage_authority::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
 };
 
 const THREAD_HISTORY_COMPACT_TARGET_TOKENS: usize = 8_000;
@@ -36,6 +40,23 @@ const COMPACTION_INPUT_WINDOW_PERCENT: u64 = 60;
 const COMPACTION_MAX_SOURCE_TOKENS: usize = 32_000;
 const COMPACTION_PROMPT_RESERVE_TOKENS: usize = 768;
 const COMPACTION_MAX_REDUCTION_LEVELS: usize = 8;
+const COMPACTION_MAX_CONCURRENCY: usize = 3;
+
+#[derive(Clone, Debug)]
+pub(crate) enum ContextCompactionProgress {
+    Started {
+        stage: &'static str,
+        total_chunks: usize,
+    },
+    Advanced {
+        stage: &'static str,
+        completed_chunks: usize,
+        total_chunks: usize,
+    },
+    Skipped,
+    Cancelled,
+    Failed,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ContextCompactionRecord {
@@ -50,6 +71,45 @@ pub(crate) struct ContextCompactionRecord {
 pub(crate) struct PreparedThreadHistory {
     pub messages: Vec<ThreadChatMessage>,
     pub compaction: Option<ContextCompactionRecord>,
+    pub terminal: Option<ContextCompactionTerminal>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContextCompactionTerminal {
+    Cancelled,
+    Failed,
+}
+
+#[derive(Default)]
+struct ContextCompactionProgressGate {
+    stage: Option<&'static str>,
+    completed_chunks: usize,
+}
+
+impl ContextCompactionProgressGate {
+    fn accepts(&mut self, progress: &ContextCompactionProgress) -> bool {
+        match progress {
+            ContextCompactionProgress::Started { stage, .. } => {
+                self.stage = Some(stage);
+                self.completed_chunks = 0;
+            }
+            ContextCompactionProgress::Advanced {
+                stage,
+                completed_chunks,
+                ..
+            } => {
+                if self.stage == Some(stage) && *completed_chunks <= self.completed_chunks {
+                    return false;
+                }
+                self.stage = Some(stage);
+                self.completed_chunks = *completed_chunks;
+            }
+            ContextCompactionProgress::Skipped
+            | ContextCompactionProgress::Cancelled
+            | ContextCompactionProgress::Failed => {}
+        }
+        true
+    }
 }
 
 pub(crate) struct ContextAuthority<'a> {
@@ -60,6 +120,9 @@ pub(crate) struct ContextAuthority<'a> {
     workspace_id: &'a Option<WorkspaceId>,
     thread_id: &'a ThreadId,
     settings_store: Option<&'a Arc<SettingsStore>>,
+    compaction_observer: Option<&'a (dyn Fn(ContextCompactionProgress) + Sync)>,
+    is_cancelled: Option<&'a (dyn Fn() -> bool + Sync)>,
+    compaction_progress_gate: Mutex<ContextCompactionProgressGate>,
 }
 
 pub(crate) struct ContextPrepareRequest {
@@ -140,7 +203,20 @@ impl<'a> ContextAuthority<'a> {
             workspace_id,
             thread_id,
             settings_store,
+            compaction_observer: None,
+            is_cancelled: None,
+            compaction_progress_gate: Mutex::new(ContextCompactionProgressGate::default()),
         }
+    }
+
+    pub(crate) fn with_compaction_runtime(
+        mut self,
+        observer: &'a (dyn Fn(ContextCompactionProgress) + Sync),
+        is_cancelled: &'a (dyn Fn() -> bool + Sync),
+    ) -> Self {
+        self.compaction_observer = Some(observer);
+        self.is_cancelled = Some(is_cancelled);
+        self
     }
 
     pub(crate) fn prepare(&self, request: ContextPrepareRequest) -> PreparedThreadHistory {
@@ -209,6 +285,7 @@ impl<'a> ContextAuthority<'a> {
             return PreparedThreadHistory {
                 messages: history,
                 compaction: None,
+                terminal: None,
             };
         };
 
@@ -218,22 +295,40 @@ impl<'a> ContextAuthority<'a> {
                 return PreparedThreadHistory {
                     messages: history,
                     compaction: None,
+                    terminal: None,
                 };
             }
             Err(error) => {
+                let terminal = if self.cancelled() {
+                    self.notify_compaction(ContextCompactionProgress::Cancelled);
+                    ContextCompactionTerminal::Cancelled
+                } else {
+                    self.notify_compaction(ContextCompactionProgress::Failed);
+                    ContextCompactionTerminal::Failed
+                };
                 tracing::warn!(
                     thread_id = %self.thread_id,
                     session_id = %self.session_id,
                     phase = request.phase,
                     %error,
-                    "上下文语义压缩失败，保留完整上下文"
+                    "上下文语义压缩失败，停止当前执行以避免重复压缩"
                 );
                 return PreparedThreadHistory {
                     messages: history,
                     compaction: None,
+                    terminal: Some(terminal),
                 };
             }
         };
+
+        if self.cancelled() {
+            self.notify_compaction(ContextCompactionProgress::Cancelled);
+            return PreparedThreadHistory {
+                messages: history,
+                compaction: None,
+                terminal: Some(ContextCompactionTerminal::Cancelled),
+            };
+        }
 
         let compacted_count = compacted.len();
         let compacted_tokens = estimate_thread_history_tokens(&compacted);
@@ -287,6 +382,7 @@ impl<'a> ContextAuthority<'a> {
                 compacted_token_estimate: compacted_tokens,
                 compacted_at,
             }),
+            terminal: None,
         }
     }
 
@@ -322,6 +418,7 @@ impl<'a> ContextAuthority<'a> {
         compacted.push(summary);
         compacted.extend(history[split..].iter().cloned());
         if estimate_thread_history_tokens(&compacted) >= original_tokens {
+            self.notify_compaction(ContextCompactionProgress::Skipped);
             return Ok(None);
         }
         Ok(Some((compacted, split)))
@@ -359,17 +456,12 @@ impl<'a> ContextAuthority<'a> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let source_chunks = pack_compaction_sources(serialized_messages, source_budget);
-        let mut summaries = Vec::with_capacity(source_chunks.len());
-        for (index, chunk) in source_chunks.iter().enumerate() {
-            summaries.push(self.invoke_compaction_summary(
-                compaction_client,
-                chunk,
-                "history_chunk",
-                index,
-                source_chunks.len(),
-                summary_target_tokens,
-            )?);
-        }
+        let mut summaries = self.invoke_compaction_batch(
+            compaction_client,
+            &source_chunks,
+            "history_chunk",
+            summary_target_tokens,
+        )?;
         let mut reduction_level = 0usize;
         while summaries.len() > 1
             || summaries
@@ -384,17 +476,12 @@ impl<'a> ContextAuthority<'a> {
                 .map(|summary| estimate_text_tokens(summary))
                 .sum::<usize>();
             let chunks = pack_compaction_sources(summaries, source_budget);
-            let mut reduced = Vec::with_capacity(chunks.len());
-            for (index, chunk) in chunks.iter().enumerate() {
-                reduced.push(self.invoke_compaction_summary(
-                    compaction_client,
-                    chunk,
-                    "summary_merge",
-                    index,
-                    chunks.len(),
-                    summary_target_tokens,
-                )?);
-            }
+            let reduced = self.invoke_compaction_batch(
+                compaction_client,
+                &chunks,
+                "summary_merge",
+                summary_target_tokens,
+            )?;
             let after_tokens = reduced
                 .iter()
                 .map(|summary| estimate_text_tokens(summary))
@@ -432,6 +519,85 @@ impl<'a> ContextAuthority<'a> {
             tool_call_id: None,
             provider_context: Vec::new(),
         })
+    }
+
+    fn invoke_compaction_batch(
+        &self,
+        client: &dyn ModelBridgeClient,
+        chunks: &[String],
+        stage: &'static str,
+        summary_target_tokens: usize,
+    ) -> Result<Vec<String>, String> {
+        if chunks.is_empty() {
+            return Err("上下文压缩没有可处理的内容片段".to_string());
+        }
+        self.notify_compaction(ContextCompactionProgress::Started {
+            stage,
+            total_chunks: chunks.len(),
+        });
+        let completed = AtomicUsize::new(0);
+        let mut summaries = Vec::with_capacity(chunks.len());
+        for batch_start in (0..chunks.len()).step_by(COMPACTION_MAX_CONCURRENCY) {
+            if self.cancelled() {
+                return Err("上下文压缩已取消".to_string());
+            }
+            let batch_end = (batch_start + COMPACTION_MAX_CONCURRENCY).min(chunks.len());
+            let batch = thread::scope(|scope| {
+                let completed = &completed;
+                let handles = (batch_start..batch_end)
+                    .map(|index| {
+                        scope.spawn(move || {
+                            let summary = self.invoke_compaction_summary(
+                                client,
+                                &chunks[index],
+                                stage,
+                                index,
+                                chunks.len(),
+                                summary_target_tokens,
+                            )?;
+                            let completed_chunks = completed.fetch_add(1, Ordering::SeqCst) + 1;
+                            self.notify_compaction(ContextCompactionProgress::Advanced {
+                                stage,
+                                completed_chunks,
+                                total_chunks: chunks.len(),
+                            });
+                            Ok::<_, String>((index, summary))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .map_err(|_| "上下文压缩工作线程异常退出".to_string())?
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })?;
+            summaries.extend(batch.into_iter().map(|(_, summary)| summary));
+        }
+        if self.cancelled() {
+            return Err("上下文压缩已取消".to_string());
+        }
+        Ok(summaries)
+    }
+
+    fn notify_compaction(&self, progress: ContextCompactionProgress) {
+        let Some(observer) = self.compaction_observer else {
+            return;
+        };
+        let mut gate = self
+            .compaction_progress_gate
+            .lock()
+            .expect("context compaction progress gate lock poisoned");
+        if !gate.accepts(&progress) {
+            return;
+        }
+        observer(progress);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.is_cancelled.is_some_and(|is_cancelled| is_cancelled())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -477,7 +643,12 @@ impl<'a> ContextAuthority<'a> {
             stage,
             chunk_index,
         );
-        let response = client.invoke(request);
+        let never_cancelled = || false;
+        let is_cancelled: &dyn Fn() -> bool = self
+            .is_cancelled
+            .map(|callback| callback as &dyn Fn() -> bool)
+            .unwrap_or(&never_cancelled);
+        let response = client.invoke_with_cancellation(request, is_cancelled);
         let binding = auxiliary_model_usage_binding(UsagePhase::Integration);
         publish_model_usage_record(
             self.event_bus,
@@ -1033,4 +1204,37 @@ fn choose_thread_history_compaction_split(
                 .rev()
                 .find(|split| thread_history_tail_is_tool_balanced(&history[*split..]))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContextCompactionProgress, ContextCompactionProgressGate};
+
+    #[test]
+    fn compaction_progress_gate_rejects_regressive_concurrent_updates() {
+        let mut gate = ContextCompactionProgressGate::default();
+        assert!(gate.accepts(&ContextCompactionProgress::Started {
+            stage: "history_chunk",
+            total_chunks: 3,
+        }));
+        assert!(gate.accepts(&ContextCompactionProgress::Advanced {
+            stage: "history_chunk",
+            completed_chunks: 2,
+            total_chunks: 3,
+        }));
+        assert!(!gate.accepts(&ContextCompactionProgress::Advanced {
+            stage: "history_chunk",
+            completed_chunks: 1,
+            total_chunks: 3,
+        }));
+        assert!(gate.accepts(&ContextCompactionProgress::Started {
+            stage: "summary_merge",
+            total_chunks: 1,
+        }));
+        assert!(gate.accepts(&ContextCompactionProgress::Advanced {
+            stage: "summary_merge",
+            completed_chunks: 1,
+            total_chunks: 1,
+        }));
+    }
 }

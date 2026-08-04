@@ -13,7 +13,7 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -449,6 +449,58 @@ fn shell_exec_runs_and_reports_failure_semantics() {
         &ToolExecutionPolicy::default(),
     );
     assert_eq!(blocked.status, ExecutionResultStatus::NeedsApproval);
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_exec_publishes_output_before_process_completion() {
+    let registry = make_registry();
+    let progress = Arc::new(Mutex::new(Vec::<ToolExecutionProgress>::new()));
+    let progress_for_callback = Arc::clone(&progress);
+    let on_progress = move |event| {
+        progress_for_callback
+            .lock()
+            .expect("progress lock")
+            .push(event);
+    };
+
+    let output = registry.execute_with_policy_and_progress(
+        ToolExecutionInput::for_builtin_invocation(
+            ToolCallId::new("tool-call-shell-progress"),
+            "shell_exec",
+            serde_json::json!({
+                "command": "printf first; sleep 0.05; printf second; sleep 0.45; printf third",
+                "timeout_ms": 5_000,
+            })
+            .to_string(),
+        ),
+        ToolExecutionContext::default(),
+        &full_access_policy(),
+        &on_progress,
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    let snapshots = progress.lock().expect("progress lock");
+    assert!(!snapshots.is_empty(), "长命令结束前应发布增量输出");
+    let first_payload: Value =
+        serde_json::from_str(&snapshots[0].payload).expect("progress payload json");
+    assert_eq!(first_payload["status"], "running");
+    assert!(
+        first_payload["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.contains("first"))
+    );
+    assert!(
+        snapshots.iter().any(|snapshot| {
+            serde_json::from_str::<Value>(&snapshot.payload)
+                .ok()
+                .and_then(|payload| payload["stdout"].as_str().map(str::to_string))
+                .is_some_and(|stdout| stdout == "firstsecond")
+        }),
+        "节流窗口内的最后一批输出不能等到下一次管道读取才发布"
+    );
+    let final_payload: Value = serde_json::from_str(&output.payload).expect("final payload json");
+    assert_eq!(final_payload["stdout"], "firstsecondthird");
 }
 
 #[test]

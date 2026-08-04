@@ -30,8 +30,8 @@ pub use types::{
     ImageGenerationExecutionContext, ImageGenerationExecutor, ImageGenerationReadinessProvider,
     ImageGenerationRequest, RuntimeCapabilityDependencyEntry, RuntimeCapabilityDependencyProvider,
     ToolExecutionContext, ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput,
-    ToolExecutionPolicy, ToolExecutionSummary, ToolInvocationRecord, ToolRuntimeResources,
-    WriteProtectionScope,
+    ToolExecutionPolicy, ToolExecutionProgress, ToolExecutionSummary, ToolInvocationRecord,
+    ToolRuntimeResources, WriteProtectionScope,
 };
 
 #[cfg(test)]

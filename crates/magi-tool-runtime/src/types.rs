@@ -83,6 +83,13 @@ pub struct ToolExecutionOutput {
     pub governance: GovernanceDecision,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolExecutionProgress {
+    pub tool_call_id: ToolCallId,
+    pub tool_name: String,
+    pub payload: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ToolExecutionPolicy {
     pub access_profile: magi_core::AccessProfile,
@@ -363,5 +370,15 @@ pub trait BuiltinTool: Send + Sync {
         context: &ToolExecutionContext,
         resources: &ToolRuntimeResources,
     ) -> String;
+    fn execute_with_progress(
+        &self,
+        tool_call_id: &ToolCallId,
+        input: &str,
+        context: &ToolExecutionContext,
+        resources: &ToolRuntimeResources,
+        _on_progress: &(dyn Fn(ToolExecutionProgress) + Sync),
+    ) -> String {
+        self.execute(tool_call_id, input, context, resources)
+    }
     fn spec(&self) -> BuiltinToolSpec;
 }

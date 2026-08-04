@@ -1,3 +1,4 @@
+use crate::context_authority::{ContextCompactionProgress, ContextCompactionRecord};
 use crate::tool_declared_paths::{append_result_declared_paths, derive_declared_paths};
 use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
@@ -6,7 +7,8 @@ use crate::tool_result_utils::{
 };
 use crate::tool_surface_state::activated_skill_id_from_tool_result;
 use crate::{
-    SKILL_APPLY_TOOL_NAME, active_skill_tool_execution_policy, execute_skill_apply_from_runtime,
+    SKILL_APPLY_TOOL_NAME, TaskTurnVisibility, active_skill_tool_execution_policy,
+    apply_task_worker_detail_visibility, execute_skill_apply_from_runtime,
     execute_skill_custom_tool, internal_builtin_tool_rejection_payload,
     parse_skill_custom_tool_name,
     tool_batch::{
@@ -35,11 +37,208 @@ use magi_session_store::{
 };
 use magi_skill_runtime::{SkillDispatchRuntime, SkillRuntime};
 use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
-use magi_tool_runtime::{BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolRegistry};
+use magi_tool_runtime::{
+    BuiltinToolName, ToolExecutionContext, ToolExecutionInput, ToolExecutionProgress, ToolRegistry,
+};
 use serde_json::Value;
-use std::{collections::HashMap, path::PathBuf, sync::Arc, thread};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+};
 
 pub type SessionStatePersistCallback = dyn Fn(&str) + Send + Sync;
+static CONTEXT_COMPACTION_ITEM_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+pub(crate) struct ContextCompactionWritebackContext<'a> {
+    pub(crate) event_bus: &'a InMemoryEventBus,
+    pub(crate) session_store: &'a SessionStore,
+    pub(crate) session_id: &'a SessionId,
+    pub(crate) workspace_id: &'a Option<WorkspaceId>,
+    pub(crate) thread_id: &'a ThreadId,
+    pub(crate) item_id: &'a str,
+    pub(crate) phase: &'static str,
+    pub(crate) persist_session_state: Option<&'a SessionStatePersistCallback>,
+    pub(crate) task: Option<&'a magi_core::Task>,
+    pub(crate) turn_visibility: Option<&'a TaskTurnVisibility>,
+}
+
+pub(crate) fn new_context_compaction_item_id(
+    owner_id: &str,
+    thread_id: &ThreadId,
+    phase: &str,
+) -> String {
+    format!(
+        "turn-item-context-compaction-{owner_id}-{thread_id}-{phase}-{}-{}",
+        UtcMillis::now().0,
+        CONTEXT_COMPACTION_ITEM_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+pub(crate) fn upsert_context_compaction_progress_notice(
+    context: ContextCompactionWritebackContext<'_>,
+    progress: ContextCompactionProgress,
+) {
+    let (status, state, notice_type, stage, completed_chunks, total_chunks) = match progress {
+        ContextCompactionProgress::Started {
+            stage,
+            total_chunks,
+        } => (
+            "running",
+            "running",
+            "info",
+            Some(stage),
+            Some(0),
+            Some(total_chunks),
+        ),
+        ContextCompactionProgress::Advanced {
+            stage,
+            completed_chunks,
+            total_chunks,
+        } => (
+            "running",
+            "running",
+            "info",
+            Some(stage),
+            Some(completed_chunks),
+            Some(total_chunks),
+        ),
+        ContextCompactionProgress::Skipped => ("completed", "skipped", "info", None, None, None),
+        ContextCompactionProgress::Cancelled => {
+            ("cancelled", "cancelled", "info", None, None, None)
+        }
+        ContextCompactionProgress::Failed => ("failed", "failed", "warning", None, None, None),
+    };
+    let mut item = session_turn_item(
+        "assistant_phase",
+        status,
+        Some("Context compaction".to_string()),
+        Some("Context compaction".to_string()),
+        Some(context.item_id.to_string()),
+        context.thread_id.clone(),
+    );
+    if let (Some(task), Some(turn_visibility)) = (context.task, context.turn_visibility) {
+        apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
+    }
+    item.metadata.insert(
+        "noticeKind".to_string(),
+        serde_json::Value::String("context_compaction".to_string()),
+    );
+    item.metadata.insert(
+        "noticeType".to_string(),
+        serde_json::Value::String(notice_type.to_string()),
+    );
+    item.metadata.insert(
+        "compactionState".to_string(),
+        serde_json::Value::String(state.to_string()),
+    );
+    item.metadata.insert(
+        "phase".to_string(),
+        serde_json::Value::String(context.phase.to_string()),
+    );
+    if let Some(stage) = stage {
+        item.metadata.insert(
+            "compactionStage".to_string(),
+            serde_json::Value::String(stage.to_string()),
+        );
+    }
+    if let Some(completed_chunks) = completed_chunks {
+        item.metadata.insert(
+            "completedChunks".to_string(),
+            serde_json::json!(completed_chunks),
+        );
+    }
+    if let Some(total_chunks) = total_chunks {
+        item.metadata
+            .insert("totalChunks".to_string(), serde_json::json!(total_chunks));
+    }
+    if let Some(published) =
+        upsert_session_turn_item(context.session_store, context.session_id, item)
+    {
+        publish_session_turn_item_event(
+            context.event_bus,
+            context.session_id,
+            context.workspace_id,
+            &published,
+        );
+    }
+}
+
+pub(crate) fn upsert_context_compaction_completed_notice(
+    context: ContextCompactionWritebackContext<'_>,
+    record: &ContextCompactionRecord,
+) {
+    let mut item = session_turn_item(
+        "assistant_phase",
+        "completed",
+        Some("Context compacted".to_string()),
+        Some("Context compacted".to_string()),
+        Some(context.item_id.to_string()),
+        context.thread_id.clone(),
+    );
+    if let (Some(task), Some(turn_visibility)) = (context.task, context.turn_visibility) {
+        apply_task_worker_detail_visibility(&mut item, task, turn_visibility);
+    }
+    item.metadata.insert(
+        "noticeKind".to_string(),
+        serde_json::Value::String("context_compaction".to_string()),
+    );
+    item.metadata.insert(
+        "noticeType".to_string(),
+        serde_json::Value::String("info".to_string()),
+    );
+    item.metadata.insert(
+        "compactionState".to_string(),
+        serde_json::Value::String("completed".to_string()),
+    );
+    item.metadata.insert(
+        "phase".to_string(),
+        serde_json::Value::String(context.phase.to_string()),
+    );
+    item.metadata.insert(
+        "reason".to_string(),
+        serde_json::Value::String(record.reason.to_string()),
+    );
+    item.metadata.insert(
+        "originalMessageCount".to_string(),
+        serde_json::json!(record.original_message_count),
+    );
+    item.metadata.insert(
+        "compactedMessageCount".to_string(),
+        serde_json::json!(record.compacted_message_count),
+    );
+    item.metadata.insert(
+        "originalTokenEstimate".to_string(),
+        serde_json::json!(record.original_token_estimate),
+    );
+    item.metadata.insert(
+        "compactedTokenEstimate".to_string(),
+        serde_json::json!(record.compacted_token_estimate),
+    );
+    item.metadata.insert(
+        "compactedAt".to_string(),
+        serde_json::json!(record.compacted_at.0),
+    );
+    if let Some(published) =
+        upsert_session_turn_item(context.session_store, context.session_id, item)
+    {
+        persist_session_state_checkpoint(
+            context.persist_session_state,
+            "context_compaction_notice",
+        );
+        publish_session_turn_item_event(
+            context.event_bus,
+            context.session_id,
+            context.workspace_id,
+            &published,
+        );
+    }
+}
 
 /// 同一模型调用轮次的思考与正文必须共享这个稳定关联键。
 /// 呈现层据此只在同一轮内重排思考与正文，不能把后续轮次错误并入前一段思考。
@@ -974,6 +1173,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         workspace_root_path: workspace_root_path.as_ref(),
         context_references,
         access_profile,
+        source_thread_id,
     };
     let tool_results =
         tool_execution_ledger.execute_batch_with(tool_calls, tool_registry, |execution_calls| {
@@ -1115,6 +1315,7 @@ struct SessionToolExecutionContext<'a> {
     workspace_root_path: Option<&'a PathBuf>,
     context_references: &'a [crate::context_reference::SessionContextReference],
     access_profile: magi_core::AccessProfile,
+    source_thread_id: &'a ThreadId,
 }
 
 fn execute_session_turn_tool_call_batch(
@@ -1274,6 +1475,7 @@ fn execute_session_turn_tool_call(
     } = context;
     let plan_store = crate::test_plan_store("test-plan");
     let mission_id = magi_core::MissionId::new(format!("mission-{session_id}"));
+    let source_thread_id = ThreadId::new(format!("thread-{session_id}"));
     execute_session_turn_tool_call_scoped(
         SessionToolExecutionContext {
             session_store,
@@ -1290,6 +1492,7 @@ fn execute_session_turn_tool_call(
             workspace_root_path,
             context_references: &[],
             access_profile,
+            source_thread_id: &source_thread_id,
         },
         tool_call,
     )
@@ -1314,6 +1517,7 @@ fn execute_session_turn_tool_call_scoped(
         workspace_root_path,
         context_references,
         access_profile,
+        source_thread_id,
     } = context;
     if let Some(canonical) = BuiltinToolName::from_name(tool_call.function.name.as_str())
         && matches!(
@@ -1490,7 +1694,29 @@ fn execute_session_turn_tool_call_scoped(
         active_skill_tool_execution_policy(access_profile, skill_runtime, skill_name);
     tool_policy.allowed_paths = reference_policy.allowed_paths;
     tool_policy.read_only_paths = reference_policy.read_only_paths;
-    let output = registry.execute_with_policy(
+    let progress_callback = |progress: ToolExecutionProgress| {
+        if progress.tool_call_id.as_str() != tool_call.id {
+            return;
+        }
+        let mut item = session_turn_item(
+            "tool_call_started",
+            "running",
+            Some(tool_call.function.name.clone()),
+            Some(summarize_tool_result(&progress.payload)),
+            Some(format!("turn-item-tool-{}", tool_call.id)),
+            source_thread_id.clone(),
+        );
+        item.source = "tool".to_string();
+        item.tool_call_id = Some(tool_call.id.clone());
+        item.tool_name = Some(progress.tool_name);
+        item.tool_status = Some("running".to_string());
+        item.tool_arguments = Some(tool_call.function.arguments.clone());
+        item.tool_result = Some(progress.payload);
+        if let Some(published) = upsert_session_turn_item(session_store, session_id, item) {
+            publish_session_turn_item_event(event_bus, session_id, workspace_id, &published);
+        }
+    };
+    let output = registry.execute_with_policy_and_progress(
         ToolExecutionInput::for_builtin_invocation(
             ToolCallId::new(&tool_call.id),
             &tool_call.function.name,
@@ -1505,6 +1731,7 @@ fn execute_session_turn_tool_call_scoped(
             working_directory: workspace_root_path.cloned(),
         },
         &tool_policy,
+        &progress_callback,
     );
     (output.payload, output.status)
 }

@@ -1,5 +1,5 @@
 use crate::context_authority::{
-    ContextAuthority, ContextPrepareRequest, current_session_file_facts,
+    ContextAuthority, ContextCompactionTerminal, ContextPrepareRequest, current_session_file_facts,
     estimate_chat_messages_tokens, estimate_tool_definition_tokens,
 };
 #[cfg(test)]
@@ -8,12 +8,13 @@ use crate::context_authority::{
 };
 use crate::model_context_window::{apply_reported_context_limit, resolve_model_context_window};
 use crate::session_writeback::{
-    SessionStatePersistCallback, SessionTurnStreamPublishGate, SessionTurnStreamUpdate,
-    append_session_turn_item_with_task_store, apply_model_response_round,
-    persist_session_state_checkpoint, publish_current_session_turn_item_event,
-    publish_model_retry_runtime_event, publish_session_turn_item_event,
-    publish_session_turn_item_stream_event, session_turn_item, session_turn_stream_update,
-    upsert_session_turn_item_with_task_store,
+    ContextCompactionWritebackContext, SessionStatePersistCallback, SessionTurnStreamPublishGate,
+    SessionTurnStreamUpdate, append_session_turn_item_with_task_store, apply_model_response_round,
+    new_context_compaction_item_id, persist_session_state_checkpoint,
+    publish_current_session_turn_item_event, publish_model_retry_runtime_event,
+    publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
+    session_turn_stream_update, upsert_context_compaction_completed_notice,
+    upsert_context_compaction_progress_notice, upsert_session_turn_item_with_task_store,
 };
 use crate::task_execution_registry::TaskExecutionRegistry;
 use crate::task_runner_bridge::TaskOutcome;
@@ -77,7 +78,7 @@ use magi_session_store::{
     ThreadChatToolFunction, ThreadModelProviderContext,
 };
 use magi_settings_store::SettingsStore;
-use magi_tool_runtime::ToolRegistry;
+use magi_tool_runtime::{ToolExecutionProgress, ToolRegistry};
 use magi_usage_authority::UsageCallStatus;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -856,23 +857,81 @@ fn run_conversation_loop_inner(
         &resolved_context_model,
     );
     let initial_skill_name = skill_name.clone();
-    let mut persisted_thread_history = session_store.thread_message_history(thread_id);
-    let mut thread_history_snapshot = ContextAuthority::new(
-        client,
+    let turn_visibility = task_turn_visibility(
+        task,
+        is_sidechain,
+        worker_id,
+        thread_id,
+        agent_role_registry,
+    );
+    let turn_writeback_context = TaskTurnWritebackContext {
         event_bus,
         session_store,
+        task_store,
+        task,
         session_id,
         workspace_id,
-        thread_id,
-        settings_store,
-    )
-    .prepare(ContextPrepareRequest {
-        fallback_history: Vec::new(),
-        phase: "pre_turn",
-        context_window_override: Some(effective_context_window),
+        turn_visibility: &turn_visibility,
+        persist_session_state,
+    };
+    let prepare_task_history = |phase: &'static str,
+                                context_window: u64,
+                                additional_token_estimate: usize| {
+        let compaction_item_id = new_context_compaction_item_id(task_id.as_str(), thread_id, phase);
+        let compaction_writeback = ContextCompactionWritebackContext {
+            event_bus,
+            session_store,
+            session_id,
+            workspace_id,
+            thread_id,
+            item_id: &compaction_item_id,
+            phase,
+            persist_session_state,
+            task: Some(task),
+            turn_visibility: Some(&turn_visibility),
+        };
+        let compaction_observer = |progress| {
+            upsert_context_compaction_progress_notice(compaction_writeback, progress);
+        };
+        let compaction_cancelled = || !task_lease_is_current(task_store, task_id, lease_id);
+        let prepared = ContextAuthority::new(
+            client,
+            event_bus,
+            session_store,
+            session_id,
+            workspace_id,
+            thread_id,
+            settings_store,
+        )
+        .with_compaction_runtime(&compaction_observer, &compaction_cancelled)
+        .prepare(ContextPrepareRequest {
+            fallback_history: Vec::new(),
+            phase,
+            context_window_override: Some(context_window),
+            additional_token_estimate,
+        });
+        if let Some(compaction) = prepared.compaction.as_ref() {
+            upsert_context_compaction_completed_notice(compaction_writeback, compaction);
+        }
+        prepared
+    };
+    let mut persisted_thread_history = session_store.thread_message_history(thread_id);
+    let initial_prepared_history = prepare_task_history(
+        "pre_turn",
+        effective_context_window,
         additional_token_estimate,
-    })
-    .messages;
+    );
+    if let Some(terminal) = initial_prepared_history.terminal {
+        return (
+            task_context_compaction_terminal_outcome(
+                turn_writeback_context,
+                terminal,
+                streaming_entry_id,
+            ),
+            context_summary,
+        );
+    }
+    let mut thread_history_snapshot = initial_prepared_history.messages;
     let resumed_task = !persisted_thread_history.is_empty()
         && task_is_resuming_existing_thread(session_store, session_id, task_id, thread_id);
     let inherits_interrupted_turn =
@@ -907,22 +966,22 @@ fn run_conversation_loop_inner(
             persist_session_state,
             "task_thread_interrupted_tool_result",
         );
-        thread_history_snapshot = ContextAuthority::new(
-            client,
-            event_bus,
-            session_store,
-            session_id,
-            workspace_id,
-            thread_id,
-            settings_store,
-        )
-        .prepare(ContextPrepareRequest {
-            fallback_history: Vec::new(),
-            phase: "interrupted_tool_normalization",
-            context_window_override: Some(effective_context_window),
+        let normalized_history = prepare_task_history(
+            "interrupted_tool_normalization",
+            effective_context_window,
             additional_token_estimate,
-        })
-        .messages;
+        );
+        if let Some(terminal) = normalized_history.terminal {
+            return (
+                task_context_compaction_terminal_outcome(
+                    turn_writeback_context,
+                    terminal,
+                    streaming_entry_id,
+                ),
+                context_summary,
+            );
+        }
+        thread_history_snapshot = normalized_history.messages;
     }
     if !thread_history_snapshot.is_empty() {
         for history_msg in &thread_history_snapshot {
@@ -1024,23 +1083,6 @@ fn run_conversation_loop_inner(
     let mut stream_interruption_non_stream_fallback_attempted = false;
     let mut context_budget_recheck_required = false;
     let mut last_response_observation: Option<String> = None;
-    let turn_visibility = task_turn_visibility(
-        task,
-        is_sidechain,
-        worker_id,
-        thread_id,
-        agent_role_registry,
-    );
-    let turn_writeback_context = TaskTurnWritebackContext {
-        event_bus,
-        session_store,
-        task_store,
-        task,
-        session_id,
-        workspace_id,
-        turn_visibility: &turn_visibility,
-        persist_session_state,
-    };
     let rebuild_task_context = |context_window: u64,
                                 round_tools: Option<&[ChatToolDefinition]>,
                                 active_skill_name: Option<&str>| {
@@ -1059,23 +1101,16 @@ fn run_conversation_loop_inner(
         ) {
             context_base_messages.push(skill_message);
         }
-        let prepared = ContextAuthority::new(
-            client,
-            event_bus,
-            session_store,
-            session_id,
-            workspace_id,
-            thread_id,
-            settings_store,
-        )
-        .prepare(ContextPrepareRequest {
-            fallback_history: Vec::new(),
-            phase: "context_limit_recovery",
-            context_window_override: Some(context_window),
-            additional_token_estimate: estimate_chat_messages_tokens(&context_base_messages)
+        let prepared = prepare_task_history(
+            "context_limit_recovery",
+            context_window,
+            estimate_chat_messages_tokens(&context_base_messages)
                 .saturating_add(estimate_tool_definition_tokens(round_tools)),
-        });
-        prepared.compaction.map(|_| {
+        );
+        if let Some(terminal) = prepared.terminal {
+            return Err(terminal);
+        }
+        Ok(prepared.compaction.map(|_| {
             let mut rebuilt = context_base_messages.clone();
             rebuilt.extend(
                 prepared
@@ -1092,7 +1127,7 @@ fn run_conversation_loop_inner(
                 current_turn_context_priority_prompt(),
             ));
             rebuilt
-        })
+        }))
     };
 
     if let Some(final_content) = deterministic_task_final_content(task, task_store) {
@@ -1186,12 +1221,23 @@ fn run_conversation_loop_inner(
         );
         let round_tools = (!round_tool_definitions.is_empty()).then_some(round_tool_definitions);
         if context_budget_recheck_required {
-            if let Some(rebuilt_messages) = rebuild_task_context(
+            match rebuild_task_context(
                 effective_context_window,
                 round_tools.as_deref(),
                 active_skill_name.as_deref(),
             ) {
-                messages = rebuilt_messages;
+                Ok(Some(rebuilt_messages)) => messages = rebuilt_messages,
+                Ok(None) => {}
+                Err(terminal) => {
+                    return (
+                        task_context_compaction_terminal_outcome(
+                            turn_writeback_context,
+                            terminal,
+                            streaming_entry_id.or(last_stream_item_id.as_deref()),
+                        ),
+                        context_summary,
+                    );
+                }
             }
             context_budget_recheck_required = false;
         }
@@ -1320,19 +1366,32 @@ fn run_conversation_loop_inner(
                                 context_limit,
                             );
                             effective_context_window = context_limit;
-                            if let Some(rebuilt_messages) = rebuild_task_context(
+                            match rebuild_task_context(
                                 effective_context_window,
                                 round_tools.as_deref(),
                                 active_skill_name.as_deref(),
                             ) {
-                                messages = rebuilt_messages;
-                                tracing::warn!(
-                                    task_id = %task.task_id,
-                                    round,
-                                    context_limit,
-                                    "任务模型上下文超限，已安装语义检查点并重建请求"
-                                );
-                                continue 'conversation_round;
+                                Ok(Some(rebuilt_messages)) => {
+                                    messages = rebuilt_messages;
+                                    tracing::warn!(
+                                        task_id = %task.task_id,
+                                        round,
+                                        context_limit,
+                                        "任务模型上下文超限，已安装语义检查点并重建请求"
+                                    );
+                                    continue 'conversation_round;
+                                }
+                                Ok(None) => {}
+                                Err(terminal) => {
+                                    return (
+                                        task_context_compaction_terminal_outcome(
+                                            turn_writeback_context,
+                                            terminal,
+                                            streaming_entry_id.or(last_stream_item_id.as_deref()),
+                                        ),
+                                        context_summary,
+                                    );
+                                }
                             }
                         }
                         let partial_visible_content =
@@ -1604,19 +1663,32 @@ fn run_conversation_loop_inner(
                             context_limit,
                         );
                         effective_context_window = context_limit;
-                        if let Some(rebuilt_messages) = rebuild_task_context(
+                        match rebuild_task_context(
                             effective_context_window,
                             round_tools.as_deref(),
                             active_skill_name.as_deref(),
                         ) {
-                            messages = rebuilt_messages;
-                            tracing::warn!(
-                                task_id = %task.task_id,
-                                round,
-                                context_limit,
-                                "非流式任务模型上下文超限，已安装语义检查点并重建请求"
-                            );
-                            continue 'conversation_round;
+                            Ok(Some(rebuilt_messages)) => {
+                                messages = rebuilt_messages;
+                                tracing::warn!(
+                                    task_id = %task.task_id,
+                                    round,
+                                    context_limit,
+                                    "非流式任务模型上下文超限，已安装语义检查点并重建请求"
+                                );
+                                continue 'conversation_round;
+                            }
+                            Ok(None) => {}
+                            Err(terminal) => {
+                                return (
+                                    task_context_compaction_terminal_outcome(
+                                        turn_writeback_context,
+                                        terminal,
+                                        streaming_entry_id.or(last_stream_item_id.as_deref()),
+                                    ),
+                                    context_summary,
+                                );
+                            }
                         }
                     }
                     if classification.retryable_before_output
@@ -2009,6 +2081,15 @@ fn run_conversation_loop_inner(
             append_task_tool_call_started_turn_item(turn_writeback_context, tool_call);
         }
 
+        let tool_progress_callback = |progress: ToolExecutionProgress| {
+            let Some(tool_call) = valid_tool_calls
+                .iter()
+                .find(|tool_call| tool_call.id == progress.tool_call_id.as_str())
+            else {
+                return;
+            };
+            upsert_task_tool_call_progress_turn_item(turn_writeback_context, tool_call, progress);
+        };
         let tool_results = execute_task_tool_call_batch(
             event_bus,
             tool_registry,
@@ -2031,6 +2112,7 @@ fn run_conversation_loop_inner(
             turn_visibility.worker_id(),
             &valid_tool_calls,
             &mut tool_execution_ledger,
+            Some(&tool_progress_callback),
             snapshot_session.clone(),
             execution_group_id.clone(),
         );
@@ -2359,22 +2441,6 @@ fn run_conversation_loop_inner(
         streaming_entry_id,
         final_model_round,
     );
-
-    let _ = ContextAuthority::new(
-        client,
-        event_bus,
-        session_store,
-        session_id,
-        workspace_id,
-        thread_id,
-        settings_store,
-    )
-    .prepare(ContextPrepareRequest {
-        fallback_history: Vec::new(),
-        phase: "post_turn",
-        context_window_override: Some(effective_context_window),
-        additional_token_estimate: 0,
-    });
 
     (outcome, context_summary)
 }
@@ -2863,6 +2929,25 @@ struct TaskTurnWritebackContext<'a> {
     persist_session_state: Option<&'a SessionStatePersistCallback>,
 }
 
+fn task_context_compaction_terminal_outcome(
+    context: TaskTurnWritebackContext<'_>,
+    terminal: ContextCompactionTerminal,
+    timeline_entry_id: Option<&str>,
+) -> TaskOutcome {
+    match terminal {
+        ContextCompactionTerminal::Cancelled => TaskOutcome::Failed {
+            error: "任务已中断".to_string(),
+        },
+        ContextCompactionTerminal::Failed => {
+            let error = "上下文压缩失败，任务已停止。请检查辅助模型配置或网络后继续目标。";
+            append_task_error_turn_item(context, error, timeline_entry_id, None, None);
+            TaskOutcome::Failed {
+                error: error.to_string(),
+            }
+        }
+    }
+}
+
 fn publish_task_llm_started(
     event_bus: &InMemoryEventBus,
     task: &magi_core::Task,
@@ -3147,6 +3232,43 @@ fn upsert_task_tool_call_result_turn_item(
         Some(context.task_store),
     ) {
         persist_session_state_checkpoint(context.persist_session_state, "task_turn_tool_result");
+        publish_session_turn_item_event(
+            context.event_bus,
+            context.session_id,
+            context.workspace_id,
+            &published,
+        );
+    }
+}
+
+fn upsert_task_tool_call_progress_turn_item(
+    context: TaskTurnWritebackContext<'_>,
+    tool_call: &ChatToolCall,
+    progress: ToolExecutionProgress,
+) {
+    if progress.tool_call_id.as_str() != tool_call.id {
+        return;
+    }
+    let mut item = session_turn_item(
+        "tool_call_started",
+        "running",
+        Some(tool_call.function.name.clone()),
+        Some(summarize_tool_result(&progress.payload)),
+        Some(format!("turn-item-tool-{}", tool_call.id)),
+        context.turn_visibility.thread_id().clone(),
+    );
+    apply_task_worker_detail_visibility(&mut item, context.task, context.turn_visibility);
+    item.tool_call_id = Some(tool_call.id.clone());
+    item.tool_name = Some(progress.tool_name);
+    item.tool_status = Some("running".to_string());
+    item.tool_arguments = Some(tool_call.function.arguments.clone());
+    item.tool_result = Some(progress.payload);
+    if let Some(published) = upsert_session_turn_item_with_task_store(
+        context.session_store,
+        context.session_id,
+        item,
+        Some(context.task_store),
+    ) {
         publish_session_turn_item_event(
             context.event_bus,
             context.session_id,
