@@ -38,7 +38,7 @@ members = [
 [workspace.package]
 version = "3.0.35"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 axum = { version = "0.8.6", features = ["json", "tokio", "http1"] }
