@@ -29,9 +29,9 @@ use magi_core::{
 };
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_orchestrator::task_store::TaskStore;
-use magi_session_store::GoalStatus;
 use magi_session_store::{
-    ExecutionThread, SessionStore, TimelineEntryKind, timeline_entry_visible_text,
+    ExecutionThread, GoalRevisionExpectation, GoalStatus, SessionStore, TimelineEntryKind,
+    timeline_entry_visible_text,
 };
 use magi_snapshot::{SnapshotSession, ToolHook, ToolHookCtx};
 use magi_tool_runtime::{
@@ -1956,8 +1956,7 @@ pub(crate) fn execute_goal_tool(
                     session_store.complete_goal(
                         session_id,
                         &goal_id,
-                        expected_revision,
-                        expected_plan_revision,
+                        GoalRevisionExpectation::new(expected_revision, expected_plan_revision),
                         turn_id,
                         summary,
                         evidence_refs,

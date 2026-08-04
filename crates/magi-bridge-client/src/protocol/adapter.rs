@@ -116,6 +116,30 @@ impl From<AdaptedResponse> for ModelResponse {
     }
 }
 
+pub trait ProviderAdapter: Send + Sync {
+    fn family(&self) -> ProviderFamily;
+
+    fn build_request(
+        &self,
+        params: &LlmMessageParams,
+        model: &str,
+    ) -> Result<AdaptedRequest, String>;
+
+    fn parse_response(&self, status: u16, body: &str) -> Result<AdaptedResponse, String>;
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn max_output_tokens_field(&self) -> &str {
+        "max_tokens"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,29 +194,5 @@ mod tests {
             model_response.tool_calls[0].id,
             model_response.tool_calls[1].id
         );
-    }
-}
-
-pub trait ProviderAdapter: Send + Sync {
-    fn family(&self) -> ProviderFamily;
-
-    fn build_request(
-        &self,
-        params: &LlmMessageParams,
-        model: &str,
-    ) -> Result<AdaptedRequest, String>;
-
-    fn parse_response(&self, status: u16, body: &str) -> Result<AdaptedResponse, String>;
-
-    fn supports_streaming(&self) -> bool {
-        true
-    }
-
-    fn supports_tools(&self) -> bool {
-        true
-    }
-
-    fn max_output_tokens_field(&self) -> &str {
-        "max_tokens"
     }
 }

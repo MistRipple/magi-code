@@ -517,7 +517,7 @@ mod tests {
     use magi_event_bus::InMemoryEventBus;
     use magi_governance::GovernanceService;
     use magi_orchestrator::{OrchestratorService, task_store::TaskStore};
-    use magi_session_store::{ActiveExecutionTurn, SessionStore};
+    use magi_session_store::{ActiveExecutionTurn, GoalRevisionExpectation, SessionStore};
     use magi_tool_runtime::ToolRegistry;
     use magi_worker_runtime::WorkerRuntime;
     use magi_workspace::WorkspaceStore;
@@ -1175,8 +1175,10 @@ mod tests {
             .complete_goal(
                 &session_id,
                 &active_goal.goal_id,
-                active_goal.control_revision,
-                Some(completed_plan.revision),
+                GoalRevisionExpectation::new(
+                    active_goal.control_revision,
+                    Some(completed_plan.revision),
+                ),
                 "turn-goal-actions",
                 "目标已完成",
                 vec!["test:goal-actions".to_string()],
@@ -1461,8 +1463,7 @@ mod tests {
             .complete_goal(
                 &session_id,
                 &goal.goal_id,
-                goal.control_revision,
-                Some(completed_plan.revision),
+                GoalRevisionExpectation::new(goal.control_revision, Some(completed_plan.revision)),
                 "turn-goal-plan-clear",
                 "计划已完成",
                 vec!["test:completed-plan-clear".to_string()],

@@ -2,11 +2,12 @@ use super::*;
 use crate::models::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurnStatus, ExecutionThread,
-    ExecutionThreadStatus, GoalContinuationPhase, GoalContinuationState, GoalStatus,
-    NotificationRecord, NotificationScope, SessionDurableState, SessionExecutionSidecarStatus,
-    SessionExecutionSidecarStoreState, SessionPlan, SessionSidecarFlushReason, SessionStoreState,
-    ThreadChatMessage, ThreadChatToolCall, ThreadChatToolFunction, ThreadContextCheckpoint,
-    ThreadFileFactVersion, ThreadModelProviderContext,
+    ExecutionThreadStatus, GoalContinuationPhase, GoalContinuationState, GoalRevisionExpectation,
+    GoalStatus, NotificationRecord, NotificationScope, SessionDurableState,
+    SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionPlan,
+    SessionSidecarFlushReason, SessionStoreState, ThreadChatMessage, ThreadChatToolCall,
+    ThreadChatToolFunction, ThreadContextCheckpoint, ThreadFileFactVersion,
+    ThreadModelProviderContext,
 };
 use magi_core::{
     AccessProfile, ExecutionOwnership, MissionId, PlanId, PlanItem, PlanItemId, PlanItemStatus,
@@ -424,8 +425,7 @@ fn goal_store_rejects_second_unfinished_goal_for_same_session() {
         .complete_goal(
             &session_id,
             &first.goal_id,
-            first.control_revision,
-            None,
+            GoalRevisionExpectation::new(first.control_revision, None),
             "turn-goal-singleton-1",
             "第一个目标已完成",
             Vec::new(),
@@ -1962,8 +1962,7 @@ fn paused_goal_hides_live_timing_and_completed_goal_keeps_final_turn_running() {
         .complete_goal(
             &session_id,
             &goal.goal_id,
-            resumed.control_revision,
-            None,
+            GoalRevisionExpectation::new(resumed.control_revision, None),
             turn_id,
             "目标完成，正在输出最终回复",
             Vec::new(),
@@ -2018,8 +2017,7 @@ fn completed_goal_terminal_turn_is_the_user_response_duration_boundary() {
         .complete_goal(
             &session_id,
             &goal.goal_id,
-            goal.control_revision,
-            None,
+            GoalRevisionExpectation::new(goal.control_revision, None),
             turn_id,
             "目标已完成",
             Vec::new(),

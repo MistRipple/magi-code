@@ -895,6 +895,21 @@ pub struct SessionGoal {
     pub updated_at: UtcMillis,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GoalRevisionExpectation {
+    pub goal_control_revision: u64,
+    pub plan_revision: Option<u64>,
+}
+
+impl GoalRevisionExpectation {
+    pub const fn new(goal_control_revision: u64, plan_revision: Option<u64>) -> Self {
+        Self {
+            goal_control_revision,
+            plan_revision,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct InterruptedGoalResumeCheckpoint {
     pub(crate) goal_before: SessionGoal,

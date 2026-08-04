@@ -1,8 +1,8 @@
 use super::{SessionStore, unique_timeline_entry_id};
 use crate::models::{
     GoalBlockerState, GoalCompletionRecord, GoalContinuationPhase, GoalContinuationState,
-    GoalResumeCheckpoint, GoalStatus, SessionGoal, SessionPlan, SessionStoreState, TimelineEntry,
-    TimelineEntryKind,
+    GoalResumeCheckpoint, GoalRevisionExpectation, GoalStatus, SessionGoal, SessionPlan,
+    SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{
     AccessProfile, DomainError, DomainResult, GoalId, PlanItemStatus, PlanState, SessionId, TaskId,
@@ -525,8 +525,7 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
         goal_id: &GoalId,
-        expected_revision: u64,
-        expected_plan_revision: Option<u64>,
+        expected_revisions: GoalRevisionExpectation,
         turn_id: impl Into<String>,
         summary: impl Into<String>,
         evidence_refs: Vec<String>,
@@ -543,7 +542,10 @@ impl SessionStore {
             .iter()
             .position(|goal| &goal.session_id == session_id && &goal.goal_id == goal_id)
             .ok_or(DomainError::NotFound { entity: "goal" })?;
-        validate_control_revision(&state.goals[goal_index], Some(expected_revision))?;
+        validate_control_revision(
+            &state.goals[goal_index],
+            Some(expected_revisions.goal_control_revision),
+        )?;
         if state.goals[goal_index].status != GoalStatus::Active {
             return Err(DomainError::InvalidState {
                 message: "only an active goal can be completed".to_string(),
@@ -558,7 +560,7 @@ impl SessionStore {
             .plans
             .iter()
             .find(|plan| &plan.session_id == session_id && plan.goal_id.as_ref() == Some(goal_id));
-        validate_bound_plan_revision(bound_plan, expected_plan_revision)?;
+        validate_bound_plan_revision(bound_plan, expected_revisions.plan_revision)?;
         if let Some(plan) = bound_plan {
             if plan.items.iter().any(|item| {
                 matches!(
@@ -615,8 +617,7 @@ impl SessionStore {
         let (goal, plan, _) = self.transition_goal_with_plan(
             session_id,
             goal_id,
-            expected_revision,
-            expected_plan_revision,
+            GoalRevisionExpectation::new(expected_revision, expected_plan_revision),
             GoalStatus::Paused,
             None,
             None,
@@ -657,8 +658,7 @@ impl SessionStore {
         let (goal, plan, checkpoint) = self.transition_goal_with_plan(
             session_id,
             goal_id,
-            expected_revision,
-            expected_plan_revision,
+            GoalRevisionExpectation::new(expected_revision, expected_plan_revision),
             GoalStatus::Active,
             new_token_budget,
             new_access_profile,
@@ -674,8 +674,7 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
         goal_id: &GoalId,
-        expected_revision: u64,
-        expected_plan_revision: Option<u64>,
+        expected_revisions: GoalRevisionExpectation,
         next_status: GoalStatus,
         new_token_budget: Option<u64>,
         new_access_profile: Option<AccessProfile>,
@@ -694,13 +693,16 @@ impl SessionStore {
             .iter()
             .position(|goal| &goal.session_id == session_id && &goal.goal_id == goal_id)
             .ok_or(DomainError::NotFound { entity: "goal" })?;
-        validate_control_revision(&state.goals[goal_index], Some(expected_revision))?;
+        validate_control_revision(
+            &state.goals[goal_index],
+            Some(expected_revisions.goal_control_revision),
+        )?;
         let current_status = state.goals[goal_index].status;
         let bound_plan = state
             .plans
             .iter()
             .find(|plan| &plan.session_id == session_id && plan.goal_id.as_ref() == Some(goal_id));
-        validate_bound_plan_revision(bound_plan, expected_plan_revision)?;
+        validate_bound_plan_revision(bound_plan, expected_revisions.plan_revision)?;
         let allowed = match next_status {
             GoalStatus::Paused => current_status == GoalStatus::Active,
             GoalStatus::Active => {
@@ -1191,8 +1193,7 @@ mod tests {
             .complete_goal(
                 &session_id,
                 &first.goal_id,
-                first.control_revision,
-                None,
+                GoalRevisionExpectation::new(first.control_revision, None),
                 "turn-goal-history-1",
                 "第一个目标已完成",
                 Vec::new(),
@@ -1233,8 +1234,7 @@ mod tests {
             .complete_goal(
                 &session_id,
                 &goal.goal_id,
-                goal.control_revision,
-                None,
+                GoalRevisionExpectation::new(goal.control_revision, None),
                 "turn-goal-terminal",
                 "终态目标已完成",
                 Vec::new(),
@@ -1352,8 +1352,7 @@ mod tests {
                 .complete_goal(
                     &session_id,
                     &goal.goal_id,
-                    goal.control_revision,
-                    None,
+                    GoalRevisionExpectation::new(goal.control_revision, None),
                     "turn-stale",
                     "旧 Turn 不应完成目标",
                     Vec::new(),
@@ -1375,8 +1374,7 @@ mod tests {
             .complete_goal(
                 &session_id,
                 &goal.goal_id,
-                goal.control_revision,
-                None,
+                GoalRevisionExpectation::new(goal.control_revision, None),
                 "turn-current-continuation",
                 "当前续跑 Turn 完成目标",
                 Vec::new(),
@@ -1438,8 +1436,7 @@ mod tests {
             .complete_goal(
                 &session_id,
                 &first.goal_id,
-                first.control_revision,
-                None,
+                GoalRevisionExpectation::new(first.control_revision, None),
                 "turn-stale-accounting-1",
                 "第一个目标已完成",
                 Vec::new(),
@@ -1518,8 +1515,7 @@ mod tests {
                 .complete_goal(
                     &session_id,
                     &goal.goal_id,
-                    goal.control_revision,
-                    Some(1),
+                    GoalRevisionExpectation::new(goal.control_revision, Some(1)),
                     "turn-goal-completion-gate",
                     "尚未完成",
                     Vec::new(),
@@ -1537,8 +1533,7 @@ mod tests {
             .complete_goal(
                 &session_id,
                 &goal.goal_id,
-                goal.control_revision,
-                Some(2),
+                GoalRevisionExpectation::new(goal.control_revision, Some(2)),
                 "turn-goal-completion-gate",
                 "计划和验证均已完成",
                 vec!["test:goal-completion-gate".to_string()],
@@ -1625,8 +1620,7 @@ mod tests {
                 .complete_goal(
                     &session_id,
                     &goal.goal_id,
-                    goal.control_revision,
-                    Some(plan.revision),
+                    GoalRevisionExpectation::new(goal.control_revision, Some(plan.revision)),
                     owning_turn_id,
                     "仍有其他任务运行",
                     vec!["test:other-task-running".to_string()],
@@ -1648,8 +1642,7 @@ mod tests {
             .complete_goal(
                 &session_id,
                 &goal.goal_id,
-                goal.control_revision,
-                Some(plan.revision),
+                GoalRevisionExpectation::new(goal.control_revision, Some(plan.revision)),
                 owning_turn_id,
                 "当前 Goal Turn 已完成计划和证据验证",
                 vec!["test:owning-turn-completion".to_string()],
@@ -1699,8 +1692,10 @@ mod tests {
                     .complete_goal(
                         &completion_session_id,
                         &completion_goal.goal_id,
-                        completion_goal.control_revision,
-                        expected_plan_revision,
+                        GoalRevisionExpectation::new(
+                            completion_goal.control_revision,
+                            expected_plan_revision
+                        ),
                         "turn-goal-completion-plan-cas",
                         "旧计划快照不能完成目标",
                         vec!["test:goal-completion-plan-cas".to_string()],
@@ -1719,8 +1714,7 @@ mod tests {
             .complete_goal(
                 &completion_session_id,
                 &completion_goal.goal_id,
-                completion_goal.control_revision,
-                Some(1),
+                GoalRevisionExpectation::new(completion_goal.control_revision, Some(1)),
                 "turn-goal-completion-plan-cas",
                 "当前计划快照允许完成目标",
                 vec!["test:goal-completion-plan-cas".to_string()],
