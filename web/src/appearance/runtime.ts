@@ -4,6 +4,7 @@ import {
   fetchAppearanceSnapshot,
 } from './client';
 import type { AppearanceSnapshot, ThemePack, ThemeScheme } from './contract';
+import { synchronizeDesktopAppearance } from '../lib/desktop-appearance';
 
 export type EffectiveAppearanceMode = 'light' | 'dark';
 
@@ -106,6 +107,12 @@ async function applyTheme(pack: ThemePack): Promise<void> {
   applyRootTheme(pack, scheme, wallpaperUrl);
   pruneAssetUrls(referencedAppearanceAssetIds(pack.wallpaper?.assetId));
   emit();
+  void synchronizeDesktopAppearance({
+    backgroundColor: scheme.background,
+    mode: nextMode,
+  }).catch((error) => {
+    console.error('[appearance] 同步桌面壳外观失败', error);
+  });
 }
 
 function resolveMode(pack: ThemePack): EffectiveAppearanceMode {

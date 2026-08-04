@@ -684,7 +684,6 @@
   "appearance.deleteConfirm": "确定删除主题“{name}”吗？",
   "appearance.previewHint": "调整会实时预览；取消后恢复当前主题",
   "appearance.name": "主题名称",
-  "appearance.description": "说明",
   "appearance.materialTitle": "界面材质",
   "appearance.material.clear": "清晰",
   "appearance.material.clearDesc": "高可读性的实色面板",

@@ -684,7 +684,6 @@
   "appearance.deleteConfirm": "Delete the theme “{name}”?",
   "appearance.previewHint": "Changes preview live; cancel restores the active theme",
   "appearance.name": "Theme name",
-  "appearance.description": "Description",
   "appearance.materialTitle": "Interface material",
   "appearance.material.clear": "Clear",
   "appearance.material.clearDesc": "Solid surfaces for maximum readability",

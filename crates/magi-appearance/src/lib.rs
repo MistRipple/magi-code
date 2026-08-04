@@ -94,21 +94,32 @@ mod tests {
     }
 
     #[test]
-    fn builtin_wallpaper_is_installed_and_survives_cleanup() {
+    fn builtin_wallpapers_are_installed_and_survive_cleanup() {
         let library = AppearanceLibrary::in_memory();
         let snapshot = library.snapshot();
-        let wallpaper = snapshot
-            .themes
-            .iter()
-            .find(|record| record.pack.id == "builtin.forest")
-            .and_then(|record| record.pack.wallpaper.as_ref())
-            .expect("深林主题必须包含内置背景图");
+        let expected_theme_ids = [
+            "builtin.forest",
+            "builtin.starry-snow-mountain",
+            "builtin.anime-shrine",
+            "builtin.quantum-grid",
+            "builtin.coastal-dawn",
+            "builtin.desert-dawn",
+        ];
+        let wallpaper_asset_ids = expected_theme_ids.map(|theme_id| {
+            snapshot
+                .themes
+                .iter()
+                .find(|record| record.pack.id == theme_id)
+                .and_then(|record| record.pack.wallpaper.as_ref())
+                .map(|wallpaper| wallpaper.asset_id.clone())
+                .unwrap_or_else(|| panic!("{theme_id} 必须包含内置背景图"))
+        });
 
-        let (bytes, mime_type) = library
-            .read_asset(&wallpaper.asset_id)
-            .expect("内置背景图必须可读取");
-        assert!(!bytes.is_empty());
-        assert_eq!(mime_type, "image/webp");
+        for asset_id in &wallpaper_asset_ids {
+            let (bytes, mime_type) = library.read_asset(asset_id).expect("内置背景图必须可读取");
+            assert!(!bytes.is_empty());
+            assert_eq!(mime_type, "image/webp");
+        }
 
         library
             .create_theme(
@@ -117,7 +128,9 @@ mod tests {
                 ThemeSource::Created,
             )
             .expect("创建主题并触发资源清理必须成功");
-        assert!(library.read_asset(&wallpaper.asset_id).is_ok());
+        for asset_id in &wallpaper_asset_ids {
+            assert!(library.read_asset(asset_id).is_ok());
+        }
     }
 
     #[test]

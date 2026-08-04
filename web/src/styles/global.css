@@ -282,7 +282,6 @@
    浅色主题覆盖 - 表面颜色使用黑色透明度
    ========================================== */
 body.vscode-light,
-body.theme-light,
 :root.theme-light {
   --vscode-sideBar-background: #f5f7fb;
   --vscode-sideBar-secondaryBackground: #ffffff;
@@ -325,7 +324,6 @@ body.theme-light,
   --diagram-node-text: #111827;
 }
 
-body.theme-dark,
 body.vscode-dark,
 :root.theme-dark {
   --scrollbar-thumb: rgba(255, 255, 255, 0.15);

@@ -784,36 +784,6 @@
     min-height: 0;
     overflow: hidden;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
-
-    --ind-bg-card: rgba(255, 255, 255, 0.92);
-    --ind-bg-card-elevated: #ffffff;
-    --ind-border-card: rgba(60, 60, 67, 0.16);
-    --ind-border-card-strong: rgba(60, 60, 67, 0.2);
-    --ind-border-separator: rgba(60, 60, 67, 0.10);
-    --ind-foreground: #1d1d1f;
-    --ind-foreground-secondary: #515154;
-    --ind-foreground-muted: #86868b;
-    --ind-foreground-soft: #aeaeb2;
-    --ind-radius-card: 12px;
-    --ind-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04), 0 6px 18px rgba(0, 0, 0, 0.05);
-    --ind-row-hover: rgba(0, 0, 0, 0.025);
-    --ind-row-selected: color-mix(in srgb, var(--primary, #0a84ff) 8%, transparent);
-  }
-
-  :global(body.vscode-dark) .stats-tab-inner,
-  :global(body.theme-dark) .stats-tab-inner,
-  :global(:root.theme-dark) .stats-tab-inner {
-    --ind-bg-card: rgba(255, 255, 255, 0.04);
-    --ind-bg-card-elevated: rgba(255, 255, 255, 0.07);
-    --ind-border-card: rgba(255, 255, 255, 0.14);
-    --ind-border-card-strong: rgba(255, 255, 255, 0.20);
-    --ind-border-separator: rgba(255, 255, 255, 0.08);
-    --ind-foreground: var(--foreground);
-    --ind-foreground-secondary: color-mix(in srgb, var(--foreground) 70%, var(--foreground-muted) 30%);
-    --ind-foreground-muted: var(--foreground-muted);
-    --ind-foreground-soft: color-mix(in srgb, var(--foreground-muted) 65%, transparent);
-    --ind-row-hover: rgba(255, 255, 255, 0.04);
-    --ind-row-selected: color-mix(in srgb, var(--primary, #0a84ff) 14%, transparent);
   }
 
   .scroll-proxy { min-height: 0; }

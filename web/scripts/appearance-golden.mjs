@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { access, readFile } from 'node:fs/promises';
 
-const [mainWeb, runtime, appearanceContract, client, settingsPanel, settingsAppearance, modal, modelConfigForm, enginePicker, knowledgePanel, runtimeStatePanel, settingsRules, settingsTools, webFolderPicker, workbenchShell, globalCss, settingsCss, bridge] = await Promise.all([
+const [mainWeb, runtime, desktopAppearance, desktopCapability, appearanceContract, client, settingsPanel, settingsAppearance, modal, modelConfigForm, enginePicker, knowledgePanel, runtimeStatePanel, settingsRules, settingsTools, webFolderPicker, workbenchShell, globalCss, settingsCss, bridge] = await Promise.all([
   readFile(new URL('../src/main-web.ts', import.meta.url), 'utf8'),
   readFile(new URL('../src/appearance/runtime.ts', import.meta.url), 'utf8'),
+  readFile(new URL('../src/lib/desktop-appearance.ts', import.meta.url), 'utf8'),
+  readFile(new URL('../../apps/desktop/capabilities/default.json', import.meta.url), 'utf8'),
   readFile(new URL('../src/appearance/contract.ts', import.meta.url), 'utf8'),
   readFile(new URL('../src/appearance/client.ts', import.meta.url), 'utf8'),
   readFile(new URL('../src/components/SettingsPanel.svelte', import.meta.url), 'utf8'),
@@ -29,6 +31,15 @@ assert.ok(
 );
 assert.doesNotMatch(runtime, /localStorage\.setItem/, '外观运行时不得把 localStorage 作为主题权威');
 assert.match(runtime, /fetchAppearanceSnapshot[\s\S]*?applyAppearanceSnapshot/, '主题恢复必须从 daemon 快照进入唯一应用链路');
+assert.match(runtime, /synchronizeDesktopAppearance[\s\S]*?backgroundColor: scheme\.background[\s\S]*?mode: nextMode/, '权威主题应用链路必须同步桌面壳背景与实际明暗模式');
+assert.match(desktopAppearance, /isDesktopRuntime[\s\S]*?requestedSequence[\s\S]*?synchronizationQueue[\s\S]*?getCurrentWebviewWindow[\s\S]*?setTheme[\s\S]*?setBackgroundColor/, '桌面壳外观必须串行同步并保证最新主题最终生效');
+for (const permission of [
+  'core:window:allow-set-background-color',
+  'core:window:allow-set-theme',
+  'core:webview:allow-set-webview-background-color',
+]) {
+  assert.match(desktopCapability, new RegExp(permission), `桌面壳外观缺少最小权限：${permission}`);
+}
 assert.match(runtime, /--magi-surface-dialog[\s\S]*?--magi-surface-popover[\s\S]*?--magi-surface-critical[\s\S]*?--magi-window-overlay[\s\S]*?--magi-popover-overlay[\s\S]*?--magi-critical-overlay/, '主题必须提供完整的语义材质表面');
 assert.match(runtime, /pruneAssetUrls[\s\S]*?URL\.revokeObjectURL/, '切换背景后必须释放未使用的 Blob URL');
 assert.match(runtime, /resolveAppearanceAssetUrl[\s\S]*?referencedAppearanceAssetIds[\s\S]*?library\?\.themes/, '主题卡片与运行时必须共享资源 URL，并按主题库引用统一管理生命周期');

@@ -449,10 +449,6 @@
               <span class="form-label">{i18n.t('appearance.name')}</span>
               <input class="form-input" type="text" maxlength="60" bind:value={draft.name} />
             </label>
-            <label>
-              <span class="form-label">{i18n.t('appearance.description')}</span>
-              <input class="form-input" type="text" maxlength="160" bind:value={draft.description} />
-            </label>
           </div>
 
           <div class="editor-section">
@@ -575,7 +571,7 @@
   .editor-content { flex: 1; min-height: 0; overflow: auto; padding: 0 20px; }
   .editor-section { padding: 17px 0; border-bottom: 1px solid var(--border-subtle); }
   .editor-section:last-child { border-bottom: 0; }
-  .editor-section--identity { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .editor-section--identity { max-width: 420px; }
   label { min-width: 0; }
   .editor-section .form-label, .section-label { display: block; margin-bottom: 7px; font-size: var(--text-xs); }
   .material-options { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
@@ -603,7 +599,7 @@
   .confirm-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
   @media (max-width: 720px) {
     .theme-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
-    .editor-section--identity, .material-options, .color-grid { grid-template-columns: 1fr; }
+    .material-options, .color-grid { grid-template-columns: 1fr; }
     .wallpaper-heading { align-items: flex-start; flex-direction: column; }
     .range-row { grid-template-columns: 92px 1fr 42px; }
   }
