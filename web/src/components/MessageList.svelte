@@ -517,8 +517,24 @@
   let contentResizeObserver: ResizeObserver | null = null;
   let contentResizeFrame = 0;
   let programmaticScrollDepth = 0;
+  let historyLoadGeneration = 0;
+  let historyLoadScopeKey = '';
 
   const HISTORY_LOAD_THRESHOLD_PX = 120;
+
+  function currentHistoryLoadScopeKey(): string {
+    const workspaceId = (messagesState.currentWorkspaceId || '').trim();
+    const workspacePath = (messagesState.currentWorkspacePath || '').trim();
+    const sessionId = (messagesState.currentSessionId || '').trim();
+    return `${workspaceId || workspacePath}\u0000${sessionId}`;
+  }
+
+  $effect(() => {
+    const nextScopeKey = currentHistoryLoadScopeKey();
+    if (nextScopeKey === historyLoadScopeKey) return;
+    historyLoadScopeKey = nextScopeKey;
+    historyLoadGeneration += 1;
+  });
 
   function disconnectHistoryObserver() {
     if (!historyObserver) return;
@@ -843,6 +859,8 @@
     }
     const previousScrollHeight = containerRef?.scrollHeight ?? 0;
     const previousScrollTop = containerRef?.scrollTop ?? 0;
+    const requestGeneration = historyLoadGeneration;
+    const requestScopeKey = currentHistoryLoadScopeKey();
     setSessionHistoryState(sessionId, {
       workspaceId,
       isLoadingBefore: true,
@@ -856,7 +874,10 @@
         canonicalBeforeCursor: historyState.canonicalBeforeCursor,
         limit: 50,
       });
-      if (messagesState.currentSessionId !== sessionId) {
+      if (
+        requestGeneration !== historyLoadGeneration
+        || requestScopeKey !== currentHistoryLoadScopeKey()
+      ) {
         return;
       }
       const turns = Array.isArray(response.canonicalTurns)
@@ -873,7 +894,6 @@
         canonicalBeforeCursor: typeof response.canonicalBeforeCursor === 'string'
           ? response.canonicalBeforeCursor
           : null,
-        isLoadingBefore: false,
       });
       await tick();
       if (hasHiddenLocalHistory) {
@@ -887,11 +907,23 @@
         syncPanelScrollState(containerRef.scrollTop, shouldAutoScroll);
       }
     } catch (error) {
+      if (
+        requestGeneration !== historyLoadGeneration
+        || requestScopeKey !== currentHistoryLoadScopeKey()
+      ) {
+        return;
+      }
       console.error('[message-list] 加载更早的会话历史失败:', error);
-      setSessionHistoryState(sessionId, {
-        workspaceId,
-        isLoadingBefore: false,
-      });
+    } finally {
+      if (
+        requestGeneration === historyLoadGeneration
+        && requestScopeKey === currentHistoryLoadScopeKey()
+      ) {
+        setSessionHistoryState(sessionId, {
+          workspaceId,
+          isLoadingBefore: false,
+        });
+      }
     }
   }
 

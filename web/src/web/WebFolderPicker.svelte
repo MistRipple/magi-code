@@ -44,14 +44,27 @@
     void loadDirectory();
   });
 
-  async function loadDirectory(pathRef?: string): Promise<void> {
+  async function loadDirectory(pathRef?: string, manualPath?: string): Promise<void> {
     const token = ++requestToken;
     loading = true;
     error = '';
     selectedPathRef = '';
 
     try {
-      const result = await browseAgentDirectory({ pathRef, showHidden });
+      let targetPathRef = pathRef;
+      if (manualPath) {
+        const resolved = await resolveAgentPath(manualPath, currentPathRef || undefined);
+        if (token !== requestToken) {
+          return;
+        }
+        if (resolved.kind !== 'directory') {
+          error = directoryLoadFailedText();
+          return;
+        }
+        targetPathRef = resolved.pathRef;
+        showManualInput = false;
+      }
+      const result = await browseAgentDirectory({ pathRef: targetPathRef, showHidden });
       if (token !== requestToken) {
         return;
       }
@@ -149,22 +162,7 @@
     if (!target) {
       return;
     }
-    loading = true;
-    error = '';
-    try {
-      const resolved = await resolveAgentPath(target, currentPathRef || undefined);
-      if (resolved.kind !== 'directory') {
-        error = directoryLoadFailedText();
-        return;
-      }
-      showManualInput = false;
-      await loadDirectory(resolved.pathRef);
-    } catch (err) {
-      console.warn('[WebFolderPicker] manual path resolve failed:', err);
-      error = directoryLoadFailedText();
-    } finally {
-      loading = false;
-    }
+    await loadDirectory(undefined, target);
   }
 
   function handleManualInputKeydown(event: KeyboardEvent): void {

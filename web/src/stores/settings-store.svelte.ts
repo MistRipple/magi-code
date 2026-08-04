@@ -704,6 +704,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
   let mcpServers = $state<MCPServer[]>([]);
   let mcpServersHydrated = $state(true);
   let mcpServersLoading = $state(false);
+  let settingsBootstrapBindingGeneration = 0;
+  let fullSettingsBootstrapRequestSeq = 0;
   let mcpExpandedServer = $state<string | null>(null);
   let mcpServerTools = $state<
     Record<
@@ -769,6 +771,30 @@ function createSettingsStore(props: { onClose?: () => void }) {
   let confirmDialogTitle = $state("");
   let confirmDialogMessage = $state("");
   let confirmDialogAction: (() => void) | null = $state(null);
+
+  function currentSettingsBootstrapBindingKey(): string {
+    const workspaceId = typeof appState.currentWorkspaceId === "string"
+      ? appState.currentWorkspaceId.trim()
+      : "";
+    const workspacePath = typeof appState.currentWorkspacePath === "string"
+      ? appState.currentWorkspacePath.trim()
+      : "";
+    const sessionId = typeof appState.currentSessionId === "string"
+      ? appState.currentSessionId.trim()
+      : "";
+    return `${workspaceId || workspacePath}\u0000${sessionId}`;
+  }
+
+  let activeSettingsBootstrapBindingKey = currentSettingsBootstrapBindingKey();
+
+  $effect(() => {
+    const nextBindingKey = currentSettingsBootstrapBindingKey();
+    if (nextBindingKey === activeSettingsBootstrapBindingKey) return;
+    activeSettingsBootstrapBindingKey = nextBindingKey;
+    settingsBootstrapBindingGeneration += 1;
+    fullSettingsBootstrapRequestSeq += 1;
+    mcpServersLoading = false;
+  });
 
   // 显示确认对话框
   function showConfirm(title: string, message: string, action: () => void) {
@@ -1262,23 +1288,41 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   async function refreshSettingsBootstrapFromApi(scope: SettingsBootstrapScope = "core"): Promise<void> {
     const hydratesMcpState = scope === "full";
+    const requestBindingGeneration = settingsBootstrapBindingGeneration;
+    const requestBindingKey = currentSettingsBootstrapBindingKey();
+    const fullRequestSeq = hydratesMcpState
+      ? ++fullSettingsBootstrapRequestSeq
+      : 0;
     if (hydratesMcpState) {
       mcpServersLoading = true;
     }
     try {
       const payload = await fetchCurrentSettingsBootstrap({ scope });
+      if (
+        requestBindingGeneration !== settingsBootstrapBindingGeneration
+        || requestBindingKey !== currentSettingsBootstrapBindingKey()
+      ) {
+        return;
+      }
       if (!payload) return;
       appState.settingsBootstrapSnapshot = payload;
       applySettingsBootstrapPayload(payload);
     } catch (e) {
-      if (hydratesMcpState) {
-        mcpServersLoading = false;
+      if (
+        requestBindingGeneration !== settingsBootstrapBindingGeneration
+        || requestBindingKey !== currentSettingsBootstrapBindingKey()
+      ) {
+        return;
       }
       console.error("[SettingsPanel] 加载设置数据失败:", e);
       notifySettingsError(
         i18n.t("settings.toast.action.loadSettingsData"),
         e,
       );
+    } finally {
+      if (hydratesMcpState && fullRequestSeq === fullSettingsBootstrapRequestSeq) {
+        mcpServersLoading = false;
+      }
     }
   }
 

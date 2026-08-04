@@ -11,6 +11,7 @@
   let lanUrl = $state('');
   let copied = $state(false);
   let loading = $state(false);
+  let lanInfoRequestSeq = 0;
   let qrSvg = $state('');
   let qrError = $state('');
   let wasVisible = false;
@@ -22,6 +23,7 @@
   let tunnelQrSvg = $state('');
   let tunnelCopied = $state(false);
   let tunnelBusy = $state(false);
+  let tunnelOperationSeq = 0;
 
   function currentBindingValue(name: string): string {
     return new URLSearchParams(window.location.search).get(name) || '';
@@ -52,58 +54,75 @@
   }
 
   async function requestLanInfo() {
+    const requestSeq = ++lanInfoRequestSeq;
     loading = true; lanUrl = ''; qrSvg = ''; qrError = '';
     try {
       const query = currentAccessBindingQuery();
       const res = await getTransport().request(agentUrl('/api/lan-access', query));
       const data = await res.json();
-      if (data?.url) {
-        lanUrl = data.url;
-        qrSvg = await renderQR(data.url);
-        qrError = qrSvg ? '' : 'fail';
-      } else {
-        qrError = 'fail';
-      }
+      const nextLanUrl = typeof data?.url === 'string' ? data.url : '';
+      const nextQrSvg = nextLanUrl ? await renderQR(nextLanUrl) : '';
+      if (requestSeq !== lanInfoRequestSeq) return;
+      lanUrl = nextLanUrl;
+      qrSvg = nextQrSvg;
+      qrError = nextLanUrl && nextQrSvg ? '' : 'fail';
     } catch {
+      if (requestSeq !== lanInfoRequestSeq) return;
       qrError = 'fail';
+    } finally {
+      if (requestSeq === lanInfoRequestSeq) {
+        loading = false;
+      }
     }
-    loading = false;
   }
 
-  async function applyTunnelState(data: Record<string, unknown>) {
-    tunnelStatus = typeof data?.status === 'string' ? data.status : 'stopped';
-    tunnelAccessUrl = typeof data?.accessUrl === 'string' ? data.accessUrl : '';
+  function tunnelOperationIsCurrent(operationSeq: number): boolean {
+    return visible && operationSeq === tunnelOperationSeq;
+  }
+
+  async function applyTunnelState(data: Record<string, unknown>, operationSeq: number): Promise<string | null> {
+    const nextStatus = typeof data?.status === 'string' ? data.status : 'stopped';
+    const nextAccessUrl = typeof data?.accessUrl === 'string' ? data.accessUrl : '';
     const rawError = typeof data?.error === 'string' ? data.error.trim() : '';
+    const nextQrSvg = nextAccessUrl ? await renderQR(nextAccessUrl) : '';
+    if (!tunnelOperationIsCurrent(operationSeq)) return null;
     if (rawError) {
       console.warn('[LanAccessPanel] tunnel state error:', rawError);
     }
+    tunnelStatus = nextStatus;
+    tunnelAccessUrl = nextAccessUrl;
     tunnelError = rawError ? i18n.t('lanAccess.tunnelUnavailable') : '';
-    tunnelQrSvg = tunnelAccessUrl ? await renderQR(tunnelAccessUrl) : '';
+    tunnelQrSvg = nextQrSvg;
+    return nextStatus;
   }
 
-  async function fetchTunnelStatus() {
+  async function fetchTunnelStatus(operationSeq = ++tunnelOperationSeq): Promise<string | null> {
     try {
       const res = await getTransport().request(agentUrl('/api/tunnel/status'));
       if (!res.ok) {
+        if (!tunnelOperationIsCurrent(operationSeq)) return null;
         console.warn('[LanAccessPanel] tunnel status request failed:', res.status);
         tunnelStatus = 'error';
         tunnelError = i18n.t('lanAccess.tunnelStatusFailed');
         tunnelAccessUrl = '';
         tunnelQrSvg = '';
-        return;
+        return tunnelStatus;
       }
       const data = await res.json();
-      await applyTunnelState(data);
+      return await applyTunnelState(data, operationSeq);
     } catch (error) {
+      if (!tunnelOperationIsCurrent(operationSeq)) return null;
       console.warn('[LanAccessPanel] tunnel status request failed:', error);
       tunnelStatus = 'error';
       tunnelError = i18n.t('lanAccess.tunnelStatusFailed');
       tunnelAccessUrl = '';
       tunnelQrSvg = '';
+      return tunnelStatus;
     }
   }
 
   async function toggleTunnel() {
+    const operationSeq = ++tunnelOperationSeq;
     tunnelBusy = true;
     const action = tunnelStatus === 'running' ? 'stop' : 'start';
     try {
@@ -117,6 +136,7 @@
         : { method: 'POST' };
       const res = await getTransport().request(agentUrl(`/api/tunnel/${action}`), init);
       if (!res.ok) {
+        if (!tunnelOperationIsCurrent(operationSeq)) return;
         console.warn('[LanAccessPanel] tunnel action failed:', action, res.status);
         tunnelStatus = 'error';
         tunnelError = i18n.t(action === 'start' ? 'lanAccess.tunnelStartFailed' : 'lanAccess.tunnelStopFailed');
@@ -125,10 +145,11 @@
         return;
       }
       const data = await res.json();
-      await applyTunnelState(data);
+      if (await applyTunnelState(data, operationSeq) === null) return;
       // 隧道启动是异步的，轮询直到状态稳定
-      await pollTunnelUntilStable();
+      await pollTunnelUntilStable(operationSeq);
     } catch (error) {
+      if (!tunnelOperationIsCurrent(operationSeq)) return;
       console.warn('[LanAccessPanel] tunnel action failed:', action, error);
       tunnelStatus = 'error';
       tunnelError = i18n.t(action === 'start' ? 'lanAccess.tunnelStartFailed' : 'lanAccess.tunnelStopFailed');
@@ -136,18 +157,21 @@
       tunnelQrSvg = '';
     }
     finally {
-      tunnelBusy = false;
+      if (tunnelOperationIsCurrent(operationSeq)) {
+        tunnelBusy = false;
+      }
     }
   }
 
-  async function pollTunnelUntilStable() {
+  async function pollTunnelUntilStable(operationSeq: number) {
     const maxAttempts = 30; // 最多轮询 30 次，每次 1 秒
     for (let i = 0; i < maxAttempts; i++) {
-      await fetchTunnelStatus();
-      if (tunnelStatus === 'running' || tunnelStatus === 'stopped' || tunnelStatus === 'error') {
+      const status = await fetchTunnelStatus(operationSeq);
+      if (status === null || status === 'running' || status === 'stopped' || status === 'error') {
         return;
       }
       await new Promise(r => setTimeout(r, 1000));
+      if (!tunnelOperationIsCurrent(operationSeq)) return;
     }
   }
 
@@ -160,9 +184,15 @@
   $effect(() => {
     if (visible === wasVisible) return;
     wasVisible = visible;
-    if (!visible) return;
-    requestLanInfo();
-    fetchTunnelStatus();
+    if (!visible) {
+      lanInfoRequestSeq += 1;
+      tunnelOperationSeq += 1;
+      loading = false;
+      tunnelBusy = false;
+      return;
+    }
+    void requestLanInfo();
+    void fetchTunnelStatus();
   });
 
   async function copyUrl() {

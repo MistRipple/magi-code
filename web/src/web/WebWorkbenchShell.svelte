@@ -696,13 +696,46 @@
     messagesState.sessionHydrating = false;
   }
 
+  function setWorkspaceSessionLoading(workspaceId: string, isLoading: boolean): void {
+    if (isLoading) {
+      if (loadingWorkspaceIds[workspaceId]) {
+        return;
+      }
+      loadingWorkspaceIds = { ...loadingWorkspaceIds, [workspaceId]: true };
+      return;
+    }
+    if (!Object.prototype.hasOwnProperty.call(loadingWorkspaceIds, workspaceId)) {
+      return;
+    }
+    const nextLoadingWorkspaceIds = { ...loadingWorkspaceIds };
+    delete nextLoadingWorkspaceIds[workspaceId];
+    loadingWorkspaceIds = nextLoadingWorkspaceIds;
+  }
+
+  function beginWorkspaceSessionRequest(workspaceId: string): number {
+    const requestSeq = ++workspaceSessionRequestSeq;
+    workspaceSessionRequestSeqByWorkspace.set(workspaceId, requestSeq);
+    setWorkspaceSessionLoading(workspaceId, true);
+    return requestSeq;
+  }
+
+  function finishWorkspaceSessionRequest(workspaceId: string, requestSeq: number): void {
+    if (workspaceSessionRequestSeqByWorkspace.get(workspaceId) !== requestSeq) {
+      return;
+    }
+    workspaceSessionRequestSeqByWorkspace.delete(workspaceId);
+    setWorkspaceSessionLoading(workspaceId, false);
+  }
+
   function invalidateWorkspaceSessionRequests(workspaceId?: string): void {
     const normalizedWorkspaceId = workspaceId?.trim() || '';
     if (normalizedWorkspaceId) {
       workspaceSessionRequestSeqByWorkspace.delete(normalizedWorkspaceId);
+      setWorkspaceSessionLoading(normalizedWorkspaceId, false);
       return;
     }
     workspaceSessionRequestSeqByWorkspace.clear();
+    loadingWorkspaceIds = {};
   }
 
   function applyWorkspaceSessionsSnapshot(
@@ -1055,9 +1088,7 @@
       setCurrentSessionId(null);
       return '';
     }
-    const requestSeq = ++workspaceSessionRequestSeq;
-    workspaceSessionRequestSeqByWorkspace.set(requestedWorkspaceId, requestSeq);
-    loadingWorkspaceIds = { ...loadingWorkspaceIds, [requestedWorkspaceId]: true };
+    const requestSeq = beginWorkspaceSessionRequest(requestedWorkspaceId);
     try {
       const snapshot = await getWorkspaceSessions(requestedWorkspaceId, preferredSessionId, workspacePath);
       if (workspaceSessionRequestSeqByWorkspace.get(requestedWorkspaceId) !== requestSeq) {
@@ -1068,10 +1099,7 @@
       notifyWorkbenchError(i18n.t('web.action.loadWorkspaceSessions'), error);
       return '';
     } finally {
-      if (workspaceSessionRequestSeqByWorkspace.get(requestedWorkspaceId) === requestSeq) {
-        workspaceSessionRequestSeqByWorkspace.delete(requestedWorkspaceId);
-        loadingWorkspaceIds = { ...loadingWorkspaceIds, [requestedWorkspaceId]: false };
-      }
+      finishWorkspaceSessionRequest(requestedWorkspaceId, requestSeq);
     }
   }
 
@@ -1080,9 +1108,7 @@
     if (!requestedWorkspaceId) {
       return;
     }
-    const requestSeq = ++workspaceSessionRequestSeq;
-    workspaceSessionRequestSeqByWorkspace.set(requestedWorkspaceId, requestSeq);
-    loadingWorkspaceIds = { ...loadingWorkspaceIds, [requestedWorkspaceId]: true };
+    const requestSeq = beginWorkspaceSessionRequest(requestedWorkspaceId);
     try {
       const snapshot = await getWorkspaceSessions(requestedWorkspaceId, '', workspaceBindingPath(workspace));
       if (workspaceSessionRequestSeqByWorkspace.get(requestedWorkspaceId) !== requestSeq) {
@@ -1095,10 +1121,7 @@
     } catch (error) {
       notifyWorkbenchError(i18n.t('web.action.loadWorkspaceSessions'), error);
     } finally {
-      if (workspaceSessionRequestSeqByWorkspace.get(requestedWorkspaceId) === requestSeq) {
-        workspaceSessionRequestSeqByWorkspace.delete(requestedWorkspaceId);
-        loadingWorkspaceIds = { ...loadingWorkspaceIds, [requestedWorkspaceId]: false };
-      }
+      finishWorkspaceSessionRequest(requestedWorkspaceId, requestSeq);
     }
   }
 
@@ -1111,7 +1134,6 @@
       workspaces = next;
       invalidateWorkspaceSessionRequests();
       sessionsByWorkspace = {};
-      loadingWorkspaceIds = {};
       expandedWorkspaceIds = {};
       // 首次启动时 bootstrap 尚未返回，工作区列表的 isActive 只是工作区管理状态，
       // 不能抢先作为会话导航真值。否则会发起显式 workspace bootstrap，覆盖 daemon
@@ -1293,9 +1315,6 @@
       workspaces = next;
       sessionsByWorkspace = Object.fromEntries(
         Object.entries(sessionsByWorkspace).filter(([workspaceId]) => workspaceId !== removedId)
-      );
-      loadingWorkspaceIds = Object.fromEntries(
-        Object.entries(loadingWorkspaceIds).filter(([workspaceId]) => workspaceId !== removedId)
       );
       expandedWorkspaceIds = Object.fromEntries(
         Object.entries(expandedWorkspaceIds).filter(([workspaceId]) => workspaceId !== removedId)

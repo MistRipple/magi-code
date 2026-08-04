@@ -274,8 +274,13 @@ assert.match(
 );
 assert.match(
   goalRunDrawersSource,
-  /currentPlanPaused && currentPlanBlocked[\s\S]*resumeBlockedPlan/,
-  '阻塞计划即使目标仍标记 active，也必须显示明确继续入口',
+  /allowedGoalActions\?\.canResume === true/,
+  '目标恢复权限必须直接使用后端权威 allowedActions',
+);
+assert.doesNotMatch(
+  goalRunDrawersSource,
+  /goalCanResume[\s\S]{0,300}currentPlanPaused|goalCanResume[\s\S]{0,300}currentPlanBlocked/,
+  '前端不能再根据计划展示状态推导目标恢复权限',
 );
 
 console.log('active agent center golden tests passed');

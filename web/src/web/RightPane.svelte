@@ -74,10 +74,19 @@
   let documentModes = $state<Record<string, 'rendered' | 'raw'>>({});
   /** HTML iframe 刷新序号，仅重载当前 Tab。 */
   let htmlPreviewRevisions = $state<Record<string, number>>({});
+  let previewRequestSeq = 0;
+  const contentRequestSeqByKey = new Map<string, number>();
+  const diffRequestSeqByKey = new Map<string, number>();
+
+  function invalidatePreviewRequests(): void {
+    contentRequestSeqByKey.clear();
+    diffRequestSeqByKey.clear();
+  }
 
   // 工作区内容变更（如切分支）后，清空已拉取的文件内容缓存，触发 $effect 按新分支重新拉取。
   onMount(() => {
     const handleWorkspaceContentChanged = () => {
+      invalidatePreviewRequests();
       fetchedContents = {};
       fetchErrors = {};
       fetchingFlags = {};
@@ -144,6 +153,12 @@
       const key = codePayloadCacheKey(tab.payload as CodeTabPayload);
       if (key) retainedKeys.add(key);
     }
+    for (const key of contentRequestSeqByKey.keys()) {
+      if (!retainedKeys.has(key)) contentRequestSeqByKey.delete(key);
+    }
+    for (const key of diffRequestSeqByKey.keys()) {
+      if (!retainedKeys.has(key)) diffRequestSeqByKey.delete(key);
+    }
     fetchedContents = pruneRecord(fetchedContents, retainedKeys);
     fetchErrors = pruneRecord(fetchErrors, retainedKeys);
     fetchingFlags = pruneRecord(fetchingFlags, retainedKeys);
@@ -172,6 +187,8 @@
     if (typeof fetchErrors[cacheKey] === 'string' && fetchErrors[cacheKey].length > 0) return; // 已失败过，停止重试避免死循环
     if (fetchingFlags[cacheKey]) return; // 拉取中
 
+    const requestSeq = ++previewRequestSeq;
+    contentRequestSeqByKey.set(cacheKey, requestSeq);
     fetchingFlags = { ...fetchingFlags, [cacheKey]: true };
     fetchErrors = { ...fetchErrors, [cacheKey]: '' };
     (async () => {
@@ -181,12 +198,17 @@
           workspaceId: activeCodePayload?.workspaceId,
           workspacePath: activeCodePayload?.workspacePath,
         });
+        if (contentRequestSeqByKey.get(cacheKey) !== requestSeq) return;
         fetchedContents = { ...fetchedContents, [cacheKey]: payload.content || '' };
       } catch (error) {
+        if (contentRequestSeqByKey.get(cacheKey) !== requestSeq) return;
         console.warn('[RightPane] file preview load failed:', error);
         fetchErrors = { ...fetchErrors, [cacheKey]: i18n.t('web.filePreviewError') };
       } finally {
-        fetchingFlags = { ...fetchingFlags, [cacheKey]: false };
+        if (contentRequestSeqByKey.get(cacheKey) === requestSeq) {
+          contentRequestSeqByKey.delete(cacheKey);
+          fetchingFlags = { ...fetchingFlags, [cacheKey]: false };
+        }
       }
     })();
   });
@@ -203,6 +225,8 @@
     if (typeof fetchDiffErrors[cacheKey] === 'string' && fetchDiffErrors[cacheKey].length > 0) return;
     if (fetchingDiffFlags[cacheKey]) return;
 
+    const requestSeq = ++previewRequestSeq;
+    diffRequestSeqByKey.set(cacheKey, requestSeq);
     fetchingDiffFlags = { ...fetchingDiffFlags, [cacheKey]: true };
     fetchDiffErrors = { ...fetchDiffErrors, [cacheKey]: '' };
     (async () => {
@@ -212,6 +236,7 @@
           workspaceId: activeCodePayload?.workspaceId,
           workspacePath: activeCodePayload?.workspacePath,
         });
+        if (diffRequestSeqByKey.get(cacheKey) !== requestSeq) return;
         fetchedDiffDetails = {
           ...fetchedDiffDetails,
           [cacheKey]: {
@@ -221,10 +246,14 @@
           },
         };
       } catch (error) {
+        if (diffRequestSeqByKey.get(cacheKey) !== requestSeq) return;
         console.warn('[RightPane] change diff load failed:', error);
         fetchDiffErrors = { ...fetchDiffErrors, [cacheKey]: i18n.t('web.filePreviewError') };
       } finally {
-        fetchingDiffFlags = { ...fetchingDiffFlags, [cacheKey]: false };
+        if (diffRequestSeqByKey.get(cacheKey) === requestSeq) {
+          diffRequestSeqByKey.delete(cacheKey);
+          fetchingDiffFlags = { ...fetchingDiffFlags, [cacheKey]: false };
+        }
       }
     })();
   });

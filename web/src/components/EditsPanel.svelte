@@ -385,31 +385,6 @@
     </div>
   {:else}
     <div class="edits-main">
-      {#if edits.length > 0}
-        <div class="edits-toolbar">
-          <button
-            type="button"
-            class="toolbar-btn approve"
-            disabled={changeMutationPending}
-            title={i18n.t('edits.actions.approveAllTitle')}
-            onclick={approveAllChanges}
-          >
-            <Icon name="check" size={13} />
-            <span>{i18n.t('edits.actions.approveAll')}</span>
-          </button>
-          <button
-            type="button"
-            class="toolbar-btn revert"
-            disabled={changeMutationPending || !allEditsRevertible}
-            title={allEditsRevertible ? i18n.t('edits.actions.revertAllTitle') : i18n.t('edits.actions.revertUnavailable')}
-            onclick={revertAllChanges}
-          >
-            <Icon name="undo" size={13} />
-            <span>{i18n.t('edits.actions.revertAll')}</span>
-          </button>
-        </div>
-      {/if}
-
       {#if hasGroups}
         <div class="group-section">
           <div class="group-header">
@@ -440,18 +415,40 @@
               <span class="stat-add">+{currentRoundTotals.additions}</span>
               <span class="stat-del">-{currentRoundTotals.deletions}</span>
             </span>
-            {#if currentRoundEdits.length > 0 && latestExecutionGroupId}
+            <div class="group-actions">
               <button
                 type="button"
-                class="group-action"
-                disabled={changeMutationPending || !currentRoundRevertible}
-                title={currentRoundRevertible ? i18n.t('edits.group.revertRoundTitle') : i18n.t('edits.actions.revertUnavailable')}
-                onclick={revertCurrentRound}
+                class="group-action approve"
+                disabled={changeMutationPending}
+                title={i18n.t('edits.actions.approveAllTitle')}
+                onclick={approveAllChanges}
+              >
+                <Icon name="check" size={12} />
+                <span>{i18n.t('edits.actions.approveAll')}</span>
+              </button>
+              <button
+                type="button"
+                class="group-action revert"
+                disabled={changeMutationPending || !allEditsRevertible}
+                title={allEditsRevertible ? i18n.t('edits.actions.revertAllTitle') : i18n.t('edits.actions.revertUnavailable')}
+                onclick={revertAllChanges}
               >
                 <Icon name="undo" size={12} />
-                <span>{i18n.t('edits.group.revertRound')}</span>
+                <span>{i18n.t('edits.actions.revertAll')}</span>
               </button>
-            {/if}
+              {#if currentRoundEdits.length > 0 && latestExecutionGroupId}
+                <button
+                  type="button"
+                  class="group-action revert"
+                  disabled={changeMutationPending || !currentRoundRevertible}
+                  title={currentRoundRevertible ? i18n.t('edits.group.revertRoundTitle') : i18n.t('edits.actions.revertUnavailable')}
+                  onclick={revertCurrentRound}
+                >
+                  <Icon name="undo" size={12} />
+                  <span>{i18n.t('edits.group.revertRound')}</span>
+                </button>
+              {/if}
+            </div>
           </div>
           <div class="file-list">
             {#each displayedCurrentEdits as edit (getEditKey(edit))}
@@ -482,16 +479,6 @@
 
   .edits-panel * {
     box-sizing: border-box;
-  }
-
-  :global(.theme-light) .edits-panel,
-  :global(body.vscode-light) .edits-panel,
-  :global(:root.theme-light) .edits-panel {
-    --edits-card-bg: #f6f8fa;
-    --edits-card-border: #d7dce5;
-    --edits-row-bg: #f9fafb;
-    --edits-row-bg-hover: #eef1f5;
-    --edits-row-border: #e2e6ed;
   }
 
   .empty-state {
@@ -552,58 +539,20 @@
     background-clip: padding-box;
   }
 
-  .edits-toolbar {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-    margin: 0 0 var(--space-2);
-    padding: var(--space-2);
-    border: 1px solid var(--edits-row-border);
-    border-radius: var(--radius-md);
-    background: var(--edits-row-bg);
-  }
-
-  .toolbar-btn {
+  .group-actions {
     display: inline-flex;
+    flex: 0 0 auto;
     align-items: center;
-    gap: 6px;
-    height: 28px;
-    padding: 0 10px;
-    border: 1px solid var(--edits-card-border);
-    border-radius: var(--radius-sm);
-    background: var(--edits-card-bg);
-    color: var(--foreground);
-    cursor: pointer;
-    font-size: var(--text-xs);
-    font-weight: var(--font-medium);
-    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
-  }
-
-  .toolbar-btn:hover:not(:disabled) {
-    background: var(--surface-hover);
-  }
-
-  .toolbar-btn:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
-  }
-
-  .toolbar-btn.approve:hover:not(:disabled) {
-    border-color: color-mix(in srgb, var(--success) 50%, var(--edits-card-border));
-    color: var(--success);
-  }
-
-  .toolbar-btn.revert:hover:not(:disabled) {
-    border-color: color-mix(in srgb, var(--error) 50%, var(--edits-card-border));
-    color: var(--error);
+    gap: 2px;
+    margin-left: auto;
   }
 
   .group-action {
-    margin-left: auto;
     display: inline-flex;
     align-items: center;
+    justify-content: center;
     gap: 4px;
-    height: 22px;
+    height: 24px;
     padding: 0 8px;
     border: 1px solid transparent;
     border-radius: var(--radius-sm);
@@ -615,9 +564,20 @@
     transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
   }
 
-  .group-action:hover:not(:disabled) {
-    border-color: color-mix(in srgb, var(--error) 40%, var(--edits-card-border));
-    background: var(--surface-hover);
+  .group-action.approve {
+    border-color: color-mix(in srgb, var(--primary) 28%, transparent);
+    background: var(--primary-muted);
+    color: var(--primary);
+  }
+
+  .group-action.approve:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--primary) 44%, transparent);
+    background: color-mix(in srgb, var(--primary) 22%, transparent);
+  }
+
+  .group-action.revert:hover:not(:disabled) {
+    border-color: color-mix(in srgb, var(--error) 35%, transparent);
+    background: color-mix(in srgb, var(--error) 10%, transparent);
     color: var(--error);
   }
 
@@ -869,6 +829,18 @@
   @media (max-width: 768px) {
     .edits-panel {
       padding: var(--space-2);
+    }
+
+    .group-header.current-round {
+      flex-wrap: wrap;
+    }
+
+    .group-actions {
+      margin-left: auto;
+    }
+
+    .group-action {
+      padding-inline: 6px;
     }
 
     .file-row {

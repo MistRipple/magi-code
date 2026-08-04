@@ -182,8 +182,13 @@ assert.match(
 );
 assert.match(
   folderPickerSource,
-  /result\.breadcrumbs[\s\S]*?entry\.pathRef[\s\S]*?resolveAgentPath\(target, currentPathRef/,
-  '目录选择器必须使用后端面包屑、pathRef 和基准目录解析粘贴路径',
+  /breadcrumbs = result\.breadcrumbs[\s\S]*?loadDirectory\(entry\.pathRef\)/,
+  '目录选择器必须使用后端面包屑和 pathRef 导航',
+);
+assert.match(
+  folderPickerSource,
+  /async function loadDirectory[\s\S]*?const token = \+\+requestToken[\s\S]*?resolveAgentPath\(manualPath, currentPathRef \|\| undefined\)[\s\S]*?browseAgentDirectory[\s\S]*?token === requestToken[\s\S]*?loading = false/,
+  '粘贴路径解析和目录浏览必须共用同一请求身份与 loading 生命周期',
 );
 assert.match(
   agentApiSource,

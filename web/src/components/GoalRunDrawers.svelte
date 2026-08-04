@@ -259,17 +259,15 @@
   }
 
   function goalCanEdit(goal: SessionGoalDto): boolean {
-    return allowedGoalActions?.canEdit ?? goal.status !== 'complete';
+    return currentGoal?.goalId === goal.goalId && allowedGoalActions?.canEdit === true;
   }
 
   function goalCanPause(goal: SessionGoalDto): boolean {
-    return allowedGoalActions?.canPause
-      ?? (!currentPlanPaused && !currentPlanBlocked && goal.status === 'active');
+    return currentGoal?.goalId === goal.goalId && allowedGoalActions?.canPause === true;
   }
 
   function goalCanResume(goal: SessionGoalDto): boolean {
-    return allowedGoalActions?.canResume
-      ?? (goal.status === 'paused' || goal.status === 'blocked');
+    return currentGoal?.goalId === goal.goalId && allowedGoalActions?.canResume === true;
   }
 
   function goalResumeBudgetValid(goal: SessionGoalDto): boolean {

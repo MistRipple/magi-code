@@ -47,6 +47,12 @@ let refreshRequestSeq = 0;
 let refreshInFlight: Promise<WorkspaceBranchesResult | null> | null = null;
 let refreshInFlightKey = '';
 
+function invalidateGitContextRefresh(): void {
+  refreshRequestSeq += 1;
+  refreshInFlight = null;
+  refreshInFlightKey = '';
+}
+
 function normalizeBindingPart(value?: string | null): string {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -117,7 +123,7 @@ export async function refreshGitContext(
   const normalized = normalizedBinding(binding);
   const bindingKey = gitContextBindingKey(normalized);
   if (!bindingKey) {
-    refreshRequestSeq += 1;
+    invalidateGitContextRefresh();
     clearGitContext();
     return null;
   }

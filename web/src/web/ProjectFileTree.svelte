@@ -22,7 +22,8 @@
   let loadingDirPaths = $state<Set<string>>(new Set());
   let dirErrors = $state<Map<string, string>>(new Map());
   let showHidden = $state(false);
-  let loadedRootPath = $state('');
+  let loadedTreeKey = $state('');
+  let treeGeneration = 0;
   const ROOT_DIRECTORY_KEY = '__workspace_root__';
 
   const rootEntries = $derived(dirCache.get(ROOT_DIRECTORY_KEY) ?? []);
@@ -31,15 +32,24 @@
 
   $effect(() => {
     const nextRoot = rootPath?.trim() || '';
-    if (!nextRoot || nextRoot === loadedRootPath) {
+    const nextWorkspaceId = workspaceId?.trim() || '';
+    const nextTreeKey = `${nextWorkspaceId}\u0000${nextRoot}`;
+    if (nextTreeKey === loadedTreeKey) {
       return;
     }
-    resetTree(nextRoot);
-    void loadDirectory(undefined, { force: true });
+    resetTree(nextTreeKey);
+    if (nextRoot) {
+      void loadDirectory(undefined, { force: true });
+    }
   });
 
-  function resetTree(nextRoot = rootPath): void {
-    loadedRootPath = nextRoot;
+  function currentTreeKey(): string {
+    return `${workspaceId?.trim() || ''}\u0000${rootPath?.trim() || ''}`;
+  }
+
+  function resetTree(nextTreeKey = currentTreeKey()): void {
+    treeGeneration += 1;
+    loadedTreeKey = nextTreeKey;
     expandedDirPaths = new Set();
     dirCache = new Map();
     loadingDirPaths = new Set();
@@ -55,26 +65,37 @@
       return;
     }
 
+    const requestGeneration = treeGeneration;
+    const requestTreeKey = loadedTreeKey;
+    const requestWorkspaceId = workspaceId;
     loadingDirPaths = new Set(loadingDirPaths).add(cacheKey);
     const nextErrors = new Map(dirErrors);
     nextErrors.delete(cacheKey);
     dirErrors = nextErrors;
 
     try {
-      const result = await listAgentDirectory(pathRef || '', showHidden, workspaceId);
+      const result = await listAgentDirectory(pathRef || '', showHidden, requestWorkspaceId);
+      if (requestGeneration !== treeGeneration || requestTreeKey !== loadedTreeKey) {
+        return;
+      }
       const entries = [...(result.entries ?? [])].sort(compareEntries);
       const nextCache = new Map(dirCache);
       nextCache.set(cacheKey, entries);
       dirCache = nextCache;
     } catch (error) {
+      if (requestGeneration !== treeGeneration || requestTreeKey !== loadedTreeKey) {
+        return;
+      }
       console.warn('[ProjectFileTree] directory load failed:', error);
       const nextErrorMap = new Map(dirErrors);
       nextErrorMap.set(cacheKey, i18n.t('web.projectFilesLoadFailed'));
       dirErrors = nextErrorMap;
     } finally {
-      const nextLoading = new Set(loadingDirPaths);
-      nextLoading.delete(cacheKey);
-      loadingDirPaths = nextLoading;
+      if (requestGeneration === treeGeneration && requestTreeKey === loadedTreeKey) {
+        const nextLoading = new Set(loadingDirPaths);
+        nextLoading.delete(cacheKey);
+        loadingDirPaths = nextLoading;
+      }
     }
   }
 
@@ -98,7 +119,7 @@
   }
 
   function refreshRoot(): void {
-    resetTree(rootPath);
+    resetTree();
     void loadDirectory(undefined, { force: true });
   }
 

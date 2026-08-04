@@ -26,6 +26,7 @@
   let worktrees = $state<GitWorktree[]>([]);
   let worktreesLoading = $state(false);
   let worktreesLoaded = $state(false);
+  let worktreeRequestSeq = 0;
   let worktreeMode = $state<'readOnly' | 'writable'>('readOnly');
   let worktreeBranch = $state('');
   let localError = $state<string | null>(null);
@@ -63,10 +64,16 @@
 
   async function loadWorktrees(force = false): Promise<void> {
     if (!visible || worktreesLoading || (worktreesLoaded && !force)) return;
+    const requestBindingKey = bindingKey;
+    const requestBinding = { ...binding };
+    const requestSeq = ++worktreeRequestSeq;
     worktreesLoading = true;
     localError = null;
     try {
-      const result = await fetchWorkspaceWorktrees(binding);
+      const result = await fetchWorkspaceWorktrees(requestBinding);
+      if (requestSeq !== worktreeRequestSeq || bindingKey !== requestBindingKey) {
+        return;
+      }
       if (!result.ok) {
         localError = result.error?.message || i18n.t('input.branch.worktreeLoadFailed');
         return;
@@ -74,10 +81,15 @@
       worktrees = Array.isArray(result.data) ? result.data as GitWorktree[] : [];
       worktreesLoaded = true;
     } catch (error) {
+      if (requestSeq !== worktreeRequestSeq || bindingKey !== requestBindingKey) {
+        return;
+      }
       console.warn('[GitRepositoryPanel] 读取 worktree 失败:', error);
       localError = i18n.t('input.branch.worktreeLoadFailed');
     } finally {
-      worktreesLoading = false;
+      if (requestSeq === worktreeRequestSeq && bindingKey === requestBindingKey) {
+        worktreesLoading = false;
+      }
     }
   }
 
@@ -224,8 +236,10 @@
 
   $effect(() => {
     const key = bindingKey;
+    worktreeRequestSeq += 1;
     advancedOpen = false;
     worktrees = [];
+    worktreesLoading = false;
     worktreesLoaded = false;
     localError = null;
     if (!key) return;
