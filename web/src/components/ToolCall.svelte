@@ -307,7 +307,7 @@
   const agentSpawnRoleVisual = $derived.by(() => {
     const role = agentSpawnDisplay?.role;
     if (!role) return null;
-    return getAgentVisualInfo(role);
+    return getAgentVisualInfo(role, undefined, (key) => i18n.t(key));
   });
 
   const agentProjectionTask = $derived.by(() => {

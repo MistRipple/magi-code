@@ -196,7 +196,7 @@
   }
 
   function agentVisual(agent: AgentProjectionDto) {
-    return getAgentVisualInfo(agent.role, roleColorToken(agent.role));
+    return getAgentVisualInfo(agent.role, roleColorToken(agent.role), (key) => i18n.t(key));
   }
 
   function agentDisplayName(agent: AgentProjectionDto): string {

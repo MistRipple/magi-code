@@ -58,12 +58,28 @@ assert.match(
   /const displayOutput = \$derived\(isExpanded \? formatOutput\(rawDisplayOutput\) : ''\);/,
   '折叠 Shell 卡片不得在首屏格式化终端输出',
 );
+assert.match(
+  toolCallSource,
+  /getAgentVisualInfo\(role, undefined, \(key\) => i18n\.t\(key\)\)/,
+  'agent_spawn 角色角标必须通过当前语言翻译，不能直接展示英文模板名',
+);
 
 await withGoldenViteServer(async (server) => {
   const display = await server.ssrLoadModule('/src/lib/tool-call-display.ts');
+  const agentColors = await server.ssrLoadModule('/src/lib/agent-colors.ts');
   const fileChange = await server.ssrLoadModule('/src/lib/canonical-tool-file-change.ts');
   const terminal = await server.ssrLoadModule('/src/lib/terminal-utils.ts');
   const toolCallFailure = await server.ssrLoadModule('/src/lib/tool-call-failure.ts');
+
+  assert.equal(
+    agentColors.getAgentVisualInfo(
+      'executor',
+      undefined,
+      (key) => key === 'roleTemplate.executor.displayName' ? '执行工程师' : key,
+    ).label,
+    '执行工程师',
+    '统一代理视觉信息必须保留角色翻译器',
+  );
 
   assert.deepEqual(
     toolCallFailure.parseToolCallFailureDiagnostic({
