@@ -589,6 +589,7 @@ fn annotations_are_authoritative_revision_bound_and_durable() {
         annotation_id: BrowserAnnotationId::new("annotation-1"),
         browser_session_id: browser_session_id.clone(),
         tab_id: tab_id.clone(),
+        sequence: 0,
         author: BrowserAnnotationAuthor::User,
         kind: BrowserAnnotationKind::Region,
         anchor: BrowserAnnotationAnchor::Region(BrowserRegionAnnotationAnchor {
@@ -607,11 +608,12 @@ fn annotations_are_authoritative_revision_bound_and_durable() {
         }),
         comment: "检查标题".to_string(),
         status: BrowserAnnotationStatus::Active,
-        screenshot_artifact_id: None,
+        screenshot_artifact_id: Some("session-annotation/annotation-1.png".to_string()),
         created_at: now,
         updated_at: now,
     };
-    authority.create_annotation(annotation).unwrap();
+    let created = authority.create_annotation(annotation).unwrap();
+    assert_eq!(created.sequence, 1);
     assert_eq!(authority.annotations_for_tab(&tab_id).len(), 1);
     let updated = authority
         .update_annotation_comment(
@@ -668,6 +670,11 @@ fn annotations_are_authoritative_revision_bound_and_durable() {
         .unwrap();
     assert_eq!(restored_annotation.comment, "检查标题和间距");
     assert_eq!(restored_annotation.status, BrowserAnnotationStatus::Stale);
+    assert_eq!(
+        restored_annotation.screenshot_artifact_id.as_deref(),
+        Some("session-annotation/annotation-1.png"),
+        "服务恢复只能使实时锚点失效，持久化截图引用必须继续可读"
+    );
 
     let stale_anchor = match &restored_annotation.anchor {
         BrowserAnnotationAnchor::Region(anchor) => {

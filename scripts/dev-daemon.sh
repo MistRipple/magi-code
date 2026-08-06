@@ -37,6 +37,10 @@ restart_fixed_port() {
 restart_fixed_port
 
 cd "$ROOT_DIR"
+# Browser Host 通过 `dist/index.cjs` 启动。开发态必须先重新构建，避免 Rust
+# 协议已升级而 Host 仍使用上一次构建产物，导致运行时握手不兼容。
+npm --prefix browser-host run build
+
 # 先编译 bridge loopback 二进制，daemon 运行时通过子进程方式拉起它们。
 # cargo clean 后只编译 magi-daemon-app 会导致 bridge 可执行文件缺失。
 cargo build -p magi-bridge-client --bins

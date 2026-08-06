@@ -822,6 +822,7 @@ export interface BrowserAnnotationSnapshot {
   annotationId: string;
   browserSessionId: string;
   tabId: string;
+  sequence: number;
   author: 'user' | 'agent';
   kind: 'element' | 'region';
   anchor: BrowserAnnotationAnchor;

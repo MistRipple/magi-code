@@ -403,6 +403,22 @@ test(
         { width: 390, height: 844 },
         "CDP screenshot output must stay in logical viewport pixels at high DPI",
       );
+      const clippedScreenshotResponse = await client.call({
+        type: "screenshot",
+        payload: {
+          tab_id: "tab-responsive",
+          target: null,
+          clip: { x: 0.1, y: 0.25, width: 0.5, height: 0.25 },
+          full_page: false,
+          format: "png",
+        },
+      });
+      assert.equal(clippedScreenshotResponse.outcome.status, "succeeded");
+      assert.deepEqual(
+        pngDimensions(await client.waitForBinary()),
+        { width: 195, height: 211 },
+        "annotation screenshots must contain only the selected viewport region",
+      );
 
       await client.call({
         type: "update_control",

@@ -1123,6 +1123,7 @@ function emitLocalPendingCanonicalTurn(input: {
     annotationId: string;
     browserSessionId: string;
     tabId: string;
+    sequence?: number;
     kind: 'element' | 'region';
     comment: string;
     screenshotArtifactId?: string | null;
@@ -1221,6 +1222,7 @@ function emitLocalPendingCanonicalTurnFailed(input: {
     annotationId: string;
     browserSessionId: string;
     tabId: string;
+    sequence?: number;
     kind: 'element' | 'region';
     comment: string;
     screenshotArtifactId?: string | null;
@@ -3401,6 +3403,7 @@ interface ExecuteTaskInput {
     annotationId: string;
     browserSessionId: string;
     tabId: string;
+    sequence?: number;
     kind: 'element' | 'region';
     comment: string;
     screenshotArtifactId?: string | null;
@@ -3549,6 +3552,9 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
         annotationId: annotation.annotationId.trim(),
         browserSessionId: annotation.browserSessionId.trim(),
         tabId: annotation.tabId.trim(),
+        sequence: Number.isSafeInteger(annotation.sequence) && Number(annotation.sequence) > 0
+          ? Number(annotation.sequence)
+          : undefined,
         kind: annotation.kind,
         comment: annotation.comment.trim(),
         screenshotArtifactId: annotation.screenshotArtifactId?.trim() || null,
@@ -4820,6 +4826,7 @@ export function createWebClientBridge(): ClientBridge {
                     annotationId: string;
                     browserSessionId: string;
                     tabId: string;
+                    sequence?: number;
                     kind: 'element' | 'region';
                     comment: string;
                     screenshotArtifactId?: string | null;

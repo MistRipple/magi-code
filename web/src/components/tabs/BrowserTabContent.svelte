@@ -4,6 +4,7 @@
   import { i18n } from '../../stores/i18n.svelte';
   import { normalizeExternalWebUrl, openExternalWebUrl } from '../../lib/external-link';
   import {
+    browserAnnotationArtifactUrl,
     browserChannelUrl,
     browserScreenshotUrl,
     createBrowserElementAnnotation,
@@ -77,6 +78,15 @@
   let lastReadyViewportTabId = '';
   let viewportMenuOpen = $state(false);
   let viewportMenuElement = $state<HTMLDivElement | undefined>();
+  let annotationMenuOpen = $state(false);
+  let annotationMenuElement = $state<HTMLDivElement | undefined>();
+  let annotationPreview = $state<{
+    annotationId: string;
+    sequence: number;
+    comment: string;
+    url: string;
+  } | null>(null);
+  let annotationPreviewFailed = $state(false);
   let customViewportWidth = $state(390);
   let customViewportHeight = $state(844);
   let customViewportDeviceType = $state<BrowserDeviceType>('mobile');
@@ -112,6 +122,20 @@
 
   const activeTab = $derived.by<BrowserTabSnapshot | null>(() => {
     return snapshot?.tabs.find((tab) => tab.tabId === tabId && tab.lifecycle !== 'closed') ?? null;
+  });
+  const savedAnnotations = $derived.by(() => (
+    (activeTab?.annotations ?? []).filter((annotation) => annotation.status !== 'deleted')
+  ));
+  const nextAnnotationSequence = $derived(
+    Math.max(0, ...(activeTab?.annotations ?? []).map((annotation) => annotation.sequence)) + 1,
+  );
+  $effect(() => {
+    if (
+      annotationPreview
+      && !savedAnnotations.some((annotation) => annotation.annotationId === annotationPreview?.annotationId)
+    ) {
+      closeAnnotationPreview();
+    }
   });
   const runtimeReady = $derived(snapshot?.lifecycle === 'ready');
   const externalUrl = $derived(normalizeExternalWebUrl(activeTab?.url ?? ''));
@@ -705,7 +729,7 @@
     window.addEventListener('pageshow', reclaimViewportControl);
     window.addEventListener('magi:browserViewportControllerClaim', reclaimViewportControl);
     document.addEventListener('visibilitychange', reclaimViewportControl);
-    const handleViewportMenuPointer = (event: PointerEvent) => {
+    const handleToolbarMenuPointer = (event: PointerEvent) => {
       const target = event.target;
       if (
         viewportMenuOpen
@@ -715,20 +739,31 @@
       ) {
         viewportMenuOpen = false;
       }
+      if (
+        annotationMenuOpen
+        && annotationMenuElement
+        && target instanceof Node
+        && !annotationMenuElement.contains(target)
+      ) {
+        annotationMenuOpen = false;
+      }
     };
-    const handleViewportMenuKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') viewportMenuOpen = false;
+    const handleToolbarMenuKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      viewportMenuOpen = false;
+      annotationMenuOpen = false;
+      closeAnnotationPreview();
     };
-    window.addEventListener('pointerdown', handleViewportMenuPointer);
-    window.addEventListener('keydown', handleViewportMenuKey);
+    window.addEventListener('pointerdown', handleToolbarMenuPointer);
+    window.addEventListener('keydown', handleToolbarMenuKey);
     return () => {
       window.clearInterval(refreshTimer);
       window.removeEventListener('focus', reclaimViewportControl);
       window.removeEventListener('pageshow', reclaimViewportControl);
       window.removeEventListener('magi:browserViewportControllerClaim', reclaimViewportControl);
       document.removeEventListener('visibilitychange', reclaimViewportControl);
-      window.removeEventListener('pointerdown', handleViewportMenuPointer);
-      window.removeEventListener('keydown', handleViewportMenuKey);
+      window.removeEventListener('pointerdown', handleToolbarMenuPointer);
+      window.removeEventListener('keydown', handleToolbarMenuKey);
       resizeObserver.disconnect();
       clearViewportResizeTimer();
       clearCustomViewportResizeTimer();
@@ -845,6 +880,31 @@
     window.dispatchEvent(new CustomEvent('magi:browserAnnotationCreated', {
       detail: annotation,
     }));
+  }
+
+  function toggleAnnotationMenu(): void {
+    annotationMenuOpen = !annotationMenuOpen;
+    if (annotationMenuOpen) viewportMenuOpen = false;
+  }
+
+  function openAnnotationPreview(
+    annotation: BrowserTabSnapshot['annotations'][number],
+    sequence: number,
+  ): void {
+    if (!annotation.screenshotArtifactId) return;
+    annotationPreviewFailed = false;
+    annotationPreview = {
+      annotationId: annotation.annotationId,
+      sequence,
+      comment: annotation.comment,
+      url: browserAnnotationArtifactUrl(annotation.annotationId),
+    };
+    annotationMenuOpen = false;
+  }
+
+  function closeAnnotationPreview(): void {
+    annotationPreview = null;
+    annotationPreviewFailed = false;
   }
 
   function savePendingAnnotation(): void {
@@ -1157,6 +1217,38 @@
     <button type="button" class="icon-button" class:active={marking} onclick={toggleMarking} disabled={!activeTab || busy} title={i18n.t('browser.action.annotate')} aria-label={i18n.t('browser.action.annotate')}>
       <Icon name="edit" size={13} />
     </button>
+    <div class="annotation-menu-wrap" bind:this={annotationMenuElement}>
+      <button
+        type="button"
+        class="icon-button annotation-history-button"
+        class:active={annotationMenuOpen}
+        onclick={toggleAnnotationMenu}
+        disabled={savedAnnotations.length === 0}
+        title={i18n.t('browser.annotation.history')}
+        aria-label={i18n.t('browser.annotation.history')}
+        aria-expanded={annotationMenuOpen}
+      >
+        <Icon name="target" size={13} />
+        {#if savedAnnotations.length > 0}<span class="annotation-count">{savedAnnotations.length}</span>{/if}
+      </button>
+      {#if annotationMenuOpen}
+        <div class="annotation-menu" role="menu" aria-label={i18n.t('browser.annotation.history')}>
+          {#each savedAnnotations as annotation (annotation.annotationId)}
+            <button
+              type="button"
+              class:stale={annotation.status === 'stale'}
+              disabled={!annotation.screenshotArtifactId}
+              onclick={() => openAnnotationPreview(annotation, annotation.sequence)}
+              role="menuitem"
+              title={annotation.comment}
+            >
+              <span class="annotation-menu-number">{annotation.sequence}</span>
+              <span class="annotation-menu-comment">{annotation.comment}</span>
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </div>
     <span
       class="status-light"
       class:ready={connectionState === 'ready'}
@@ -1195,7 +1287,7 @@
         onkeydown={(event) => handleKey(event, 'key_down')}
         onkeyup={(event) => handleKey(event, 'key_up')}
       ></canvas>
-      {#each (activeTab?.annotations ?? []).filter((annotation) => annotation.status === 'active') as annotation, annotationIndex (annotation.annotationId)}
+      {#each (activeTab?.annotations ?? []).filter((annotation) => annotation.status === 'active') as annotation (annotation.annotationId)}
         {@const rect = annotationRect(annotation)}
         {#if rect}
           <button
@@ -1206,7 +1298,7 @@
             title={annotation.comment}
             aria-label={annotation.comment}
             onclick={() => selectSavedAnnotation(annotation)}
-          ><span class="annotation-number">{annotationIndex + 1}</span></button>
+          ><span class="annotation-number">{annotation.sequence}</span></button>
         {/if}
       {/each}
       {#if annotationDrag}
@@ -1217,7 +1309,7 @@
           class="annotation-selection"
           class:element={pendingAnnotation.kind === 'element'}
           style={pendingAnnotationStyle()}
-        ><span class="annotation-number">{(activeTab?.annotations ?? []).filter((annotation) => annotation.status === 'active').length + 1}</span></div>
+        ><span class="annotation-number">{nextAnnotationSequence}</span></div>
       {/if}
     </div>
     {#if pendingAnnotation}
@@ -1239,10 +1331,32 @@
       </div>
     {/if}
   </div>
+  {#if annotationPreview}
+    <div class="annotation-preview" role="dialog" aria-label={i18n.t('browser.annotation.preview')}>
+      <div class="annotation-preview-header">
+        <span class="annotation-menu-number">{annotationPreview.sequence}</span>
+        <span class="annotation-preview-comment">{annotationPreview.comment}</span>
+        <button type="button" class="icon-button" onclick={closeAnnotationPreview} title={i18n.t('browser.annotation.closePreview')} aria-label={i18n.t('browser.annotation.closePreview')}>
+          <Icon name="close" size={13} />
+        </button>
+      </div>
+      <div class="annotation-preview-body">
+        {#if annotationPreviewFailed}
+          <span>{i18n.t('browser.annotation.previewFailed')}</span>
+        {:else}
+          <img
+            src={annotationPreview.url}
+            alt={i18n.t('browser.annotation.previewAlt', { index: annotationPreview.sequence })}
+            onerror={() => { annotationPreviewFailed = true; }}
+          />
+        {/if}
+      </div>
+    </div>
+  {/if}
 </section>
 
 <style>
-  .browser-pane { display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--background); }
+  .browser-pane { position: relative; display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--background); }
   .browser-toolbar { display: flex; align-items: center; min-height: 34px; gap: 3px; padding: 4px 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
   .icon-button { width: 27px; height: 27px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; flex-shrink: 0; }
   .icon-button:hover:not(:disabled) { background: var(--surface-2); color: var(--foreground); }
@@ -1255,6 +1369,16 @@
   .address-submit:hover:not(:disabled) { background: var(--surface-hover); color: var(--foreground); }
   .address-submit:disabled { opacity: .45; cursor: default; }
   .viewport-menu-wrap { position: relative; display: flex; flex: 0 0 auto; }
+  .annotation-menu-wrap { position: relative; display: flex; flex: 0 0 auto; }
+  .annotation-history-button { position: relative; }
+  .annotation-count { position: absolute; top: 1px; right: 1px; min-width: 12px; height: 12px; padding: 0 2px; border-radius: 6px; background: var(--info); color: white; font-size: 8px; font-weight: 700; line-height: 12px; text-align: center; }
+  .annotation-menu { position: absolute; z-index: 20; top: calc(100% + 5px); right: 0; width: min(300px, calc(100vw - 24px)); max-height: 240px; overflow: auto; padding: 5px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); }
+  .annotation-menu > button { box-sizing: border-box; display: flex; align-items: center; gap: 7px; width: 100%; min-height: 32px; padding: 4px 7px; border: 0; border-radius: 4px; background: transparent; color: var(--foreground); font: inherit; font-size: var(--text-xs); cursor: pointer; text-align: left; }
+  .annotation-menu > button:hover:not(:disabled) { background: var(--surface-hover); }
+  .annotation-menu > button.stale { color: var(--foreground-muted); }
+  .annotation-menu > button:disabled { opacity: .5; cursor: default; }
+  .annotation-menu-number { display: grid; place-items: center; flex: 0 0 19px; width: 19px; height: 19px; border-radius: 50%; background: var(--info); color: white; font-size: 10px; font-weight: 700; line-height: 1; }
+  .annotation-menu-comment { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .viewport-menu { position: absolute; z-index: 20; top: calc(100% + 5px); right: 0; width: 242px; padding: 5px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); }
   .viewport-menu > button { box-sizing: border-box; display: flex; align-items: center; justify-content: space-between; width: 100%; min-height: 30px; padding: 0 8px; border: 0; border-radius: 4px; background: transparent; color: var(--foreground); font: inherit; font-size: var(--text-xs); cursor: pointer; }
   .viewport-menu > button:hover,
@@ -1295,4 +1419,9 @@
   .annotation-editor-actions button { min-height: 27px; padding: 0 10px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); cursor: pointer; }
   .annotation-editor-actions button.primary { border-color: var(--accent); background: var(--accent); color: var(--accent-foreground, white); }
   .annotation-editor-actions button:disabled { opacity: .5; cursor: default; }
+  .annotation-preview { position: absolute; z-index: 30; inset: 38px 8px 8px; display: flex; flex-direction: column; min-width: 0; min-height: 0; border: 1px solid var(--border); border-radius: 6px; background: var(--background); box-shadow: var(--shadow-lg); }
+  .annotation-preview-header { display: flex; align-items: center; gap: 7px; min-height: 34px; padding: 3px 4px 3px 8px; border-bottom: 1px solid var(--border); }
+  .annotation-preview-comment { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); font-size: var(--text-xs); }
+  .annotation-preview-body { display: grid; place-items: center; flex: 1; min-height: 0; overflow: auto; padding: 8px; background: #151719; color: #b6bbc2; font-size: var(--text-xs); }
+  .annotation-preview-body img { display: block; max-width: 100%; max-height: 100%; object-fit: contain; image-rendering: auto; }
 </style>

@@ -21,6 +21,7 @@ import type {
   HostViewport,
   HitTest,
   MouseButton,
+  NormalizedRect,
   PageState,
   ScreencastFrame,
   UserInputEvent,
@@ -568,9 +569,19 @@ export class BrowserHost {
   private async screenshot(input: {
     tab_id: string;
     target?: { snapshot_revision: number; element_ref: string } | null;
+    clip?: NormalizedRect | null;
     full_page: boolean;
     format: "png" | "jpeg";
   }): Promise<ExecutedCommand> {
+    if (Number(Boolean(input.target)) + Number(Boolean(input.clip)) + Number(input.full_page) > 1) {
+      throw new ProtocolFailure(
+        "browser_screenshot_scope_invalid",
+        "screenshot target, clip, and full_page are mutually exclusive",
+        false,
+        false,
+      );
+    }
+    if (input.clip) validateNormalizedRect(input.clip);
     const record = this.pageRecord(input.tab_id);
     const cdp = await this.cdpSession(record);
     const metrics = await cdp.send("Page.getLayoutMetrics");
@@ -602,6 +613,20 @@ export class BrowserHost {
         scale: 1 / deviceScaleFactor,
       };
       captureBeyondViewport = true;
+    } else if (input.clip) {
+      const visualViewport = metrics.cssVisualViewport;
+      const visualScale = Math.min(
+        record.viewport.width / Math.max(1, visualViewport.clientWidth),
+        record.viewport.height / Math.max(1, visualViewport.clientHeight),
+      );
+      clip = {
+        x: visualViewport.pageX + input.clip.x * visualViewport.clientWidth,
+        y: visualViewport.pageY + input.clip.y * visualViewport.clientHeight,
+        width: Math.max(1, input.clip.width * visualViewport.clientWidth),
+        height: Math.max(1, input.clip.height * visualViewport.clientHeight),
+        scale: visualScale / deviceScaleFactor,
+      };
+      captureBeyondViewport = false;
     } else {
       const visualViewport = metrics.cssVisualViewport;
       const visualScale = Math.min(
@@ -1032,6 +1057,27 @@ function validateViewport(viewport: {
     throw new ProtocolFailure(
       "browser_device_type_invalid",
       "viewport.device_type is invalid",
+      false,
+      false,
+    );
+  }
+}
+
+function validateNormalizedRect(rect: NormalizedRect): void {
+  for (const [name, value] of Object.entries(rect)) {
+    requireFinite(`screenshot.clip.${name}`, value);
+  }
+  if (
+    rect.x < 0
+    || rect.y < 0
+    || rect.width <= 0
+    || rect.height <= 0
+    || rect.x + rect.width > 1
+    || rect.y + rect.height > 1
+  ) {
+    throw new ProtocolFailure(
+      "browser_screenshot_clip_invalid",
+      "screenshot clip must be a non-empty normalized viewport rectangle",
       false,
       false,
     );

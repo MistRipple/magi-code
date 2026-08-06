@@ -1,9 +1,9 @@
-use crate::BrowserDeviceType;
+use crate::{BrowserDeviceType, BrowserNormalizedRect};
 use magi_core::{BrowserCommandId, BrowserLeaseId, BrowserTabId};
 use serde::{Deserialize, Serialize};
 
 pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 1;
-pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 7;
+pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 8;
 pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 400;
 pub const DEFAULT_BROWSER_SNAPSHOT_TEXT_LIMIT_BYTES: u32 = 32 * 1024;
 
@@ -112,6 +112,7 @@ pub enum BrowserHostCommand {
     Screenshot {
         tab_id: BrowserTabId,
         target: Option<BrowserSnapshotTarget>,
+        clip: Option<BrowserNormalizedRect>,
         full_page: bool,
         format: BrowserScreenshotFormat,
     },

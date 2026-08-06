@@ -605,6 +605,7 @@ export interface MessageBrowserAnnotationReference {
   annotationId: string;
   browserSessionId: string;
   tabId: string;
+  sequence?: number;
   kind: 'element' | 'region';
   comment: string;
   screenshotArtifactId?: string | null;
@@ -699,6 +700,7 @@ export interface QueuedMessageBrowserAnnotationReference {
   annotationId: string;
   browserSessionId: string;
   tabId: string;
+  sequence?: number;
   kind: 'element' | 'region';
   comment: string;
   screenshotArtifactId?: string | null;

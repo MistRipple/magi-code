@@ -84,6 +84,7 @@
     | 'annotationId'
     | 'browserSessionId'
     | 'tabId'
+    | 'sequence'
     | 'kind'
     | 'comment'
     | 'status'
@@ -451,8 +452,9 @@
       id: `${reference.kind}:${reference.pathRef || reference.path}`,
       ...reference,
     }));
-    selectedBrowserAnnotations = draft.browserAnnotationRefs.map((reference) => ({
+    selectedBrowserAnnotations = draft.browserAnnotationRefs.map((reference, index) => ({
       ...reference,
+      sequence: reference.sequence ?? index + 1,
       screenshotArtifactId: reference.screenshotArtifactId ?? null,
       status: 'active',
     }));
@@ -1232,6 +1234,7 @@
           annotationId: annotation.annotationId,
           browserSessionId: annotation.browserSessionId,
           tabId: annotation.tabId,
+          sequence: annotation.sequence,
           kind: annotation.kind,
           comment: annotation.comment,
           screenshotArtifactId: annotation.screenshotArtifactId,
@@ -1885,7 +1888,7 @@
         {/each}
         {#each selectedBrowserAnnotations as annotation (annotation.annotationId)}
           <span class="ia-reference-chip ia-browser-annotation-chip" title={annotation.comment}>
-            <Icon name="target" size={11} />
+            <span class="ia-browser-annotation-number">{annotation.sequence}</span>
             <span class="ia-reference-chip-label">{annotation.comment}</span>
             <button
               type="button"
@@ -3306,6 +3309,19 @@
     background: var(--surface-2);
     border-color: var(--border-subtle);
     color: var(--foreground-secondary);
+  }
+  .ia-browser-annotation-number {
+    display: grid;
+    place-items: center;
+    flex: 0 0 17px;
+    width: 17px;
+    height: 17px;
+    border-radius: var(--radius-full);
+    background: var(--info);
+    color: white;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
   }
   .ia-reference-chip-label {
     font-weight: var(--font-medium, 500);

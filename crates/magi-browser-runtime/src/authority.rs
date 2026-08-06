@@ -159,11 +159,20 @@ impl BrowserAuthority {
     }
 
     pub fn annotations_for_tab(&self, tab_id: &BrowserTabId) -> Vec<BrowserAnnotation> {
-        self.annotations
+        let mut annotations = self
+            .annotations
             .values()
             .filter(|annotation| &annotation.tab_id == tab_id)
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        annotations.sort_by(|left, right| {
+            left.sequence.cmp(&right.sequence).then_with(|| {
+                left.annotation_id
+                    .as_str()
+                    .cmp(right.annotation_id.as_str())
+            })
+        });
+        annotations
     }
 
     pub fn create_annotation(
@@ -189,6 +198,19 @@ impl BrowserAuthority {
                 provided: snapshot_revision,
             });
         }
+        annotation.sequence = self
+            .annotations
+            .values()
+            .filter(|existing| existing.tab_id == annotation.tab_id)
+            .map(|existing| existing.sequence)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                BrowserAuthorityError::InvalidSnapshot(
+                    "browser annotation sequence overflow".to_string(),
+                )
+            })?;
         annotation.status = BrowserAnnotationStatus::Active;
         self.annotations
             .insert(annotation.annotation_id.clone(), annotation.clone());
@@ -939,6 +961,13 @@ impl BrowserAuthority {
     }
 
     pub fn snapshot(&self) -> BrowserAuthoritySnapshot {
+        let mut annotations = self.annotations.values().cloned().collect::<Vec<_>>();
+        annotations.sort_by(|left, right| {
+            left.tab_id
+                .as_str()
+                .cmp(right.tab_id.as_str())
+                .then_with(|| left.sequence.cmp(&right.sequence))
+        });
         BrowserAuthoritySnapshot {
             revision: self.revision,
             profiles: self.profiles.values().cloned().collect(),
@@ -962,7 +991,7 @@ impl BrowserAuthority {
                         .unwrap_or_default(),
                 })
                 .collect(),
-            annotations: self.annotations.values().cloned().collect(),
+            annotations,
         }
     }
 
@@ -971,13 +1000,20 @@ impl BrowserAuthority {
         for tab in &mut tabs {
             tab.frame_sequence = 0;
         }
+        let mut annotations = self.annotations.values().cloned().collect::<Vec<_>>();
+        annotations.sort_by(|left, right| {
+            left.tab_id
+                .as_str()
+                .cmp(right.tab_id.as_str())
+                .then_with(|| left.sequence.cmp(&right.sequence))
+        });
         BrowserDurableState {
             schema_version: BROWSER_DURABLE_STATE_SCHEMA_VERSION,
             revision: self.revision,
             profiles: self.profiles.values().cloned().collect(),
             sessions: self.sessions.values().cloned().collect(),
             tabs,
-            annotations: self.annotations.values().cloned().collect(),
+            annotations,
         }
     }
 
@@ -1071,7 +1107,7 @@ impl BrowserAuthority {
     }
 
     pub fn restore(
-        snapshot: BrowserAuthoritySnapshot,
+        mut snapshot: BrowserAuthoritySnapshot,
         now: UtcMillis,
     ) -> Result<Self, BrowserAuthorityError> {
         let mut authority = Self::new();
@@ -1164,6 +1200,14 @@ impl BrowserAuthority {
                 ));
             }
         }
+        snapshot.annotations.sort_by(|left, right| {
+            left.created_at.cmp(&right.created_at).then_with(|| {
+                left.annotation_id
+                    .as_str()
+                    .cmp(right.annotation_id.as_str())
+            })
+        });
+        let mut maximum_annotation_sequences = HashMap::<BrowserTabId, u64>::new();
         for mut annotation in snapshot.annotations {
             if !authority
                 .sessions
@@ -1184,6 +1228,17 @@ impl BrowserAuthority {
                 annotation.status = BrowserAnnotationStatus::Stale;
                 annotation.updated_at = now;
             }
+            let maximum_sequence = maximum_annotation_sequences
+                .entry(annotation.tab_id.clone())
+                .or_default();
+            if annotation.sequence == 0 || annotation.sequence <= *maximum_sequence {
+                annotation.sequence = maximum_sequence.checked_add(1).ok_or_else(|| {
+                    BrowserAuthorityError::InvalidSnapshot(
+                        "browser annotation sequence overflow".to_string(),
+                    )
+                })?;
+            }
+            *maximum_sequence = annotation.sequence;
             if authority
                 .annotations
                 .insert(annotation.annotation_id.clone(), annotation)

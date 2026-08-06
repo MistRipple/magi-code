@@ -268,6 +268,7 @@ pub(crate) fn resolve_browser_annotation_context(
             .flatten()
             .map(|path| path.to_string_lossy().into_owned());
         resolved.push(serde_json::json!({
+            "sequence": annotation.sequence,
             "annotationId": annotation.annotation_id,
             "browserSessionId": annotation.browser_session_id,
             "tabId": annotation.tab_id,
@@ -487,6 +488,7 @@ struct BrowserAnnotationResponse {
     annotation_id: BrowserAnnotationId,
     browser_session_id: BrowserSessionId,
     tab_id: BrowserTabId,
+    sequence: u64,
     author: BrowserAnnotationAuthor,
     kind: BrowserAnnotationKind,
     anchor: BrowserAnnotationAnchorResponse,
@@ -611,6 +613,7 @@ impl From<BrowserAnnotation> for BrowserAnnotationResponse {
             annotation_id: annotation.annotation_id,
             browser_session_id: annotation.browser_session_id,
             tab_id: annotation.tab_id,
+            sequence: annotation.sequence,
             author: annotation.author,
             kind: annotation.kind,
             anchor: annotation.anchor.into(),
@@ -1065,8 +1068,17 @@ async fn create_annotation(
             snapshot_revision: tab.snapshot_revision,
         })),
     };
-    let screenshot_artifact_id =
-        persist_browser_annotation_screenshot(&state, &session.session_id, &tab.tab_id).await?;
+    let screenshot_clip = match &anchor {
+        BrowserAnnotationAnchor::Element(anchor) => anchor.bounding_box,
+        BrowserAnnotationAnchor::Region(anchor) => anchor.rect,
+    };
+    let screenshot_artifact_id = persist_browser_annotation_screenshot(
+        &state,
+        &session.session_id,
+        &tab.tab_id,
+        screenshot_clip,
+    )
+    .await?;
     let now = UtcMillis::now();
     let annotation = state.mutate_browser_authority(|authority| {
         authority.validate_navigation_ref(
@@ -1082,6 +1094,7 @@ async fn create_annotation(
             )),
             browser_session_id: session.browser_session_id.clone(),
             tab_id: tab.tab_id.clone(),
+            sequence: 0,
             author: BrowserAnnotationAuthor::User,
             kind,
             anchor,
@@ -1113,11 +1126,13 @@ async fn persist_browser_annotation_screenshot(
     state: &ApiState,
     session_id: &SessionId,
     tab_id: &BrowserTabId,
+    clip: BrowserNormalizedRect,
 ) -> Result<String, ApiError> {
     let reply = require_browser_host(state)?
         .request(BrowserHostCommand::Screenshot {
             tab_id: tab_id.clone(),
             target: None,
+            clip: Some(clip),
             full_page: false,
             format: magi_browser_runtime::BrowserScreenshotFormat::Png,
         })
@@ -1669,6 +1684,7 @@ async fn screenshot_tab(
         .request(BrowserHostCommand::Screenshot {
             tab_id,
             target: None,
+            clip: None,
             full_page: request.full_page,
             format: magi_browser_runtime::BrowserScreenshotFormat::Png,
         })
@@ -2175,6 +2191,7 @@ mod tests {
                     annotation_id: annotation_id.clone(),
                     browser_session_id,
                     tab_id,
+                    sequence: 0,
                     author: BrowserAnnotationAuthor::User,
                     kind: BrowserAnnotationKind::Region,
                     anchor: BrowserAnnotationAnchor::Region(BrowserRegionAnnotationAnchor {
@@ -2213,6 +2230,7 @@ mod tests {
                 .expect("active annotation should resolve");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0]["annotationId"], annotation_id.to_string());
+        assert_eq!(resolved[0]["sequence"], 1);
         assert_eq!(resolved[0]["comment"], "检查保存按钮");
         assert_eq!(resolved[0]["anchor"]["url"], "https://example.com/settings");
         assert_eq!(

@@ -221,6 +221,9 @@ function sanitizeMessageBrowserAnnotationRefs(
       ? reference.kind
       : null;
     const comment = typeof reference.comment === 'string' ? reference.comment.trim() : '';
+    const sequence = Number.isSafeInteger(reference.sequence) && Number(reference.sequence) > 0
+      ? Number(reference.sequence)
+      : undefined;
     if (!annotationId || !browserSessionId || !tabId || !kind || !comment) {
       throw new Error(`${errorPrefix} browserAnnotationRefs 字段无效`);
     }
@@ -228,6 +231,7 @@ function sanitizeMessageBrowserAnnotationRefs(
       annotationId,
       browserSessionId,
       tabId,
+      ...(sequence ? { sequence } : {}),
       kind,
       comment,
       screenshotArtifactId: typeof reference.screenshotArtifactId === 'string'

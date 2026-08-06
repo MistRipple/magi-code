@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = { major: 1, minor: 7 } as const;
+export const PROTOCOL_VERSION = { major: 1, minor: 8 } as const;
 export const DEFAULT_SNAPSHOT_LIMITS = {
   max_nodes: 400,
   max_text_bytes: 32 * 1024,
@@ -89,6 +89,7 @@ export type HostCommand =
       payload: {
         tab_id: string;
         target?: SnapshotTarget | null;
+        clip?: NormalizedRect | null;
         full_page: boolean;
         format: "png" | "jpeg";
       };
@@ -156,6 +157,13 @@ export interface SnapshotLimits {
 export interface SnapshotTarget {
   snapshot_revision: number;
   element_ref: string;
+}
+
+export interface NormalizedRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 export type MouseButton =

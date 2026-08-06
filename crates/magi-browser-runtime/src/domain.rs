@@ -344,6 +344,8 @@ pub struct BrowserAnnotation {
     pub annotation_id: BrowserAnnotationId,
     pub browser_session_id: BrowserSessionId,
     pub tab_id: BrowserTabId,
+    #[serde(default)]
+    pub sequence: u64,
     pub author: BrowserAnnotationAuthor,
     pub kind: BrowserAnnotationKind,
     pub anchor: BrowserAnnotationAnchor,

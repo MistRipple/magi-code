@@ -441,6 +441,7 @@ impl BrowserToolRuntimeDependencies {
                     .request(BrowserHostCommand::Screenshot {
                         tab_id: tab.tab_id.clone(),
                         target,
+                        clip: None,
                         full_page: arguments
                             .get("full_page")
                             .and_then(Value::as_bool)

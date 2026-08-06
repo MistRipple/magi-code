@@ -345,6 +345,9 @@ function normalizeMessageBrowserAnnotationRefsFromMetadata(
         annotationId,
         browserSessionId,
         tabId,
+        sequence: Number.isSafeInteger(reference.sequence) && Number(reference.sequence) > 0
+          ? Number(reference.sequence)
+          : undefined,
         kind,
         comment,
         screenshotArtifactId: typeof reference.screenshotArtifactId === 'string'

@@ -21,6 +21,7 @@
   import { parseModelFailureDiagnostic } from '../lib/model-failure';
   import { parseToolCallFailureDiagnostic } from '../lib/tool-call-failure';
   import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
+  import { browserAnnotationArtifactUrl } from '../web/agent-api';
 
   // Props
   interface Props {
@@ -370,6 +371,10 @@
     showImagePreview = true;
   }
 
+  function openBrowserAnnotationPreview(annotationId: string): void {
+    openImagePreview(browserAnnotationArtifactUrl(annotationId));
+  }
+
   // 关闭图片预览
   function closeImagePreview() {
     showImagePreview = false;
@@ -440,11 +445,17 @@
     {/if}
     {#if messageBrowserAnnotationRefs.length > 0}
       <div class="user-browser-annotations" aria-label={i18n.t('messageItem.browserAnnotations')}>
-        {#each messageBrowserAnnotationRefs as annotation (`${message.id}-${annotation.annotationId}`)}
-          <span class="user-browser-annotation" title={annotation.comment}>
-            <Icon name="target" size={12} />
+        {#each messageBrowserAnnotationRefs as annotation, annotationIndex (`${message.id}-${annotation.annotationId}`)}
+          <button
+            type="button"
+            class="user-browser-annotation"
+            title={annotation.comment}
+            disabled={!annotation.screenshotArtifactId}
+            onclick={() => openBrowserAnnotationPreview(annotation.annotationId)}
+          >
+            <span class="user-browser-annotation-number">{annotation.sequence ?? annotationIndex + 1}</span>
             <span>{annotation.comment}</span>
-          </span>
+          </button>
         {/each}
       </div>
     {/if}
@@ -971,6 +982,7 @@
   }
 
   .user-browser-annotation {
+    appearance: none;
     display: inline-flex;
     align-items: center;
     gap: 5px;
@@ -981,10 +993,35 @@
     border-radius: 6px;
     background: color-mix(in srgb, var(--info) 9%, var(--background));
     color: var(--foreground-secondary);
+    font-family: inherit;
     font-size: 12px;
+    cursor: pointer;
   }
 
-  .user-browser-annotation span {
+  .user-browser-annotation:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--info) 15%, var(--background));
+    border-color: color-mix(in srgb, var(--info) 55%, var(--border));
+  }
+
+  .user-browser-annotation:disabled {
+    cursor: default;
+  }
+
+  .user-browser-annotation-number {
+    display: grid;
+    place-items: center;
+    flex: 0 0 18px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--info);
+    color: white;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+  }
+
+  .user-browser-annotation > span:last-child {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
