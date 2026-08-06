@@ -183,6 +183,17 @@ impl BuiltinTool for NormalizedBuiltinTool {
             BuiltinToolName::DiffPreview => execute_diff_preview(input, context),
             BuiltinToolName::WebSearch => execute_web_search(input),
             BuiltinToolName::WebFetch => execute_web_fetch(input),
+            BuiltinToolName::BrowserNavigate
+            | BuiltinToolName::BrowserSnapshot
+            | BuiltinToolName::BrowserClick
+            | BuiltinToolName::BrowserType
+            | BuiltinToolName::BrowserPress
+            | BuiltinToolName::BrowserScroll
+            | BuiltinToolName::BrowserScreenshot
+            | BuiltinToolName::BrowserTabs
+            | BuiltinToolName::BrowserViewport => {
+                execute_browser_tool(tool_call_id, self.name, input, context, resources)
+            }
             BuiltinToolName::DiagramRender => execute_diagram_render(input),
             BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input, context, resources),
             BuiltinToolName::CodeSymbols => execute_code_symbols(input, context, resources),
@@ -237,6 +248,27 @@ impl BuiltinTool for NormalizedBuiltinTool {
             approval_requirement: self.approval_requirement,
         }
     }
+}
+
+fn execute_browser_tool(
+    tool_call_id: &ToolCallId,
+    tool: BuiltinToolName,
+    input: &str,
+    context: &ToolExecutionContext,
+    resources: &ToolRuntimeResources,
+) -> String {
+    let Some(executor) = resources.browser_tool_executor.as_ref() else {
+        return serde_json::json!({
+            "tool": tool.as_str(),
+            "status": "failed",
+            "error_code": "browser_runtime_unavailable",
+            "recoverable": false,
+            "requires_user_action": true,
+            "error": "内置浏览器运行时不可用",
+        })
+        .to_string();
+    };
+    executor(tool_call_id, tool.as_str(), input, context).0
 }
 
 fn execute_git_tool(

@@ -48,6 +48,10 @@ pub struct SessionTurnRequestDto {
     pub images: Vec<SessionTurnImageDto>,
     #[serde(default)]
     pub context_references: Vec<SessionContextReferenceDto>,
+    /// 浏览器标记 ID。提交时由 BrowserAuthority 按当前 Magi session 重新解析，
+    /// 前端不能直接提交可执行的坐标或伪造的页面快照。
+    #[serde(default)]
+    pub browser_annotation_refs: Vec<String>,
     #[serde(default)]
     pub access_profile: Option<AccessProfile>,
     #[serde(default)]
@@ -178,6 +182,16 @@ impl SessionTurnRequestDto {
             .collect()
     }
 
+    pub fn browser_annotation_refs(&self) -> Vec<String> {
+        self.browser_annotation_refs
+            .iter()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     pub fn mission_title(&self, trimmed_text: Option<&str>) -> String {
         trimmed_text
             .map(normalize_task_title)
@@ -236,6 +250,12 @@ impl SessionTurnRequestDto {
         }
         if message_lines.is_empty() && !self.context_references.is_empty() {
             message_lines.push(format!("[上下文引用 {} 项]", self.context_references.len()));
+        }
+        if message_lines.is_empty() && !self.browser_annotation_refs.is_empty() {
+            message_lines.push(format!(
+                "[浏览器标记 {} 项]",
+                self.browser_annotation_refs.len()
+            ));
         }
         if message_lines.is_empty() {
             "[空输入]".to_string()
@@ -408,6 +428,7 @@ mod tests {
             goal_mode: false,
             images: Vec::new(),
             context_references: Vec::new(),
+            browser_annotation_refs: Vec::new(),
             access_profile: None,
             orchestrator_session_config: None,
             request_id: None,

@@ -452,7 +452,7 @@ impl TaskStore {
             .ok_or(DomainError::NotFound { entity: "Task" })?;
         let accesses = match &mut task.runtime_payload {
             TaskRuntimePayload::AgentContext { accesses, .. } => std::mem::take(accesses),
-            TaskRuntimePayload::None => Vec::new(),
+            TaskRuntimePayload::None | TaskRuntimePayload::BrowserAnnotations { .. } => Vec::new(),
         };
         task.runtime_payload = TaskRuntimePayload::AgentContext {
             package: Box::new(package),

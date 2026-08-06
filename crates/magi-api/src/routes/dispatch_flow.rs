@@ -7,6 +7,7 @@ use magi_session_store::ActiveExecutionTurn;
 use serde_json::json;
 
 use super::{
+    browser::resolve_browser_annotation_context,
     conversation_bridge::ingest_user_input_to_conversation, monotonic_accepted_at, new_session_id,
     session_scope::resolve_session_workspace_binding,
 };
@@ -155,6 +156,7 @@ pub(super) async fn accept_goal_continuation_task_submission(
         timeline_message: format!("目标自动推进: {}", goal.objective),
         images: Vec::new(),
         context_references: Vec::new(),
+        browser_annotation_refs: Vec::new(),
         created_session: false,
         mission_title: "目标自动推进".to_string(),
         task_title: "执行: 目标自动推进".to_string(),
@@ -258,6 +260,8 @@ async fn execute_dispatch_submission(
     state
         .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
         .await?;
+    let browser_annotation_refs =
+        resolve_browser_annotation_context(state, &session_id, &request.browser_annotation_refs())?;
     state
         .ensure_session_code_context(&session_id, &workspace_id)
         .await?;
@@ -294,6 +298,7 @@ async fn execute_dispatch_submission(
         timeline_message: message.clone(),
         images,
         context_references: request.context_references(),
+        browser_annotation_refs,
         created_session,
         mission_title,
         task_title: action_task_title,

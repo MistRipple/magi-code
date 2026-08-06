@@ -213,6 +213,12 @@ async fn pause_current_goal(
             request.expected_plan_revision,
         )
         .map_err(map_goal_domain_error)?;
+    state.cancel_execution_resources(
+        Some(&scope.session_id),
+        None,
+        None,
+        magi_browser_runtime::BrowserLeaseEndReason::GoalPaused,
+    );
     if let Some((root_task_id, turn_id)) = execution_to_interrupt {
         if let Some(root_task_id) = root_task_id
             && let Some(manager) = state.runner_manager()
@@ -225,7 +231,6 @@ async fn pause_current_goal(
                 "暂停 Goal 时终止执行树失败，继续通过 Turn 取消信号收口"
             );
         }
-        state.cancel_active_tool_executions(Some(&scope.session_id), None, None);
         state
             .session_store
             .interrupt_current_turn_by_user(&scope.session_id)

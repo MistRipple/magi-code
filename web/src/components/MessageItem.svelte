@@ -358,6 +358,7 @@
 
   const messageImages = $derived(message.images || []);
   const messageContextReferences = $derived(message.contextReferences || []);
+  const messageBrowserAnnotationRefs = $derived(message.browserAnnotationRefs || []);
 
   // 图片预览弹窗状态
   let showImagePreview = $state(false);
@@ -434,6 +435,16 @@
             <Icon name={reference.kind === 'directory' ? 'folder' : 'document'} size={12} />
             <span>{reference.name}</span>
           </button>
+        {/each}
+      </div>
+    {/if}
+    {#if messageBrowserAnnotationRefs.length > 0}
+      <div class="user-browser-annotations" aria-label={i18n.t('messageItem.browserAnnotations')}>
+        {#each messageBrowserAnnotationRefs as annotation (`${message.id}-${annotation.annotationId}`)}
+          <span class="user-browser-annotation" title={annotation.comment}>
+            <Icon name="target" size={12} />
+            <span>{annotation.comment}</span>
+          </span>
         {/each}
       </div>
     {/if}
@@ -950,6 +961,33 @@
     flex-wrap: wrap;
     gap: 6px;
     margin-bottom: 8px;
+  }
+
+  .user-browser-annotations {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+
+  .user-browser-annotation {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    max-width: min(360px, 100%);
+    min-height: 28px;
+    padding: 4px 8px;
+    border: 1px solid color-mix(in srgb, var(--info) 34%, var(--border));
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--info) 9%, var(--background));
+    color: var(--foreground-secondary);
+    font-size: 12px;
+  }
+
+  .user-browser-annotation span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .user-context-reference {

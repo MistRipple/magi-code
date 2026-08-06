@@ -293,7 +293,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   const clientKind = getClientKind();
 
   // 当前激活的 Tab
-  let activeTab = $state<"appearance" | "stats" | "model" | "agents" | "tools" | "rules" | "project">(
+  let activeTab = $state<"appearance" | "stats" | "model" | "agents" | "tools" | "browser" | "rules" | "project">(
     "model",
   );
 
@@ -440,6 +440,100 @@ function createSettingsStore(props: { onClose?: () => void }) {
     return {
       ...buildInteractiveModelConfigPayload(config),
     };
+  }
+
+  function resolveModelConfigKey(target: ModelConfigTarget, statusKey?: string): string {
+    return target === "worker" ? (statusKey || activeWorkerEngineId) : target;
+  }
+
+  function getModelFormConfig(
+    target: ModelConfigTarget,
+    key: string,
+  ): BaseModelFormConfig | InteractiveModelFormConfig | WorkerModelFormConfig | undefined {
+    if (target === "worker") return workerConfigs[key];
+    if (target === "orch") return orchConfig;
+    if (target === "comp") return compConfig;
+    return imageConfig;
+  }
+
+  function cloneModelFormConfig<T extends BaseModelFormConfig>(config: T): T {
+    return { ...config };
+  }
+
+  function buildModelConfigSignature(
+    target: ModelConfigTarget,
+    config: BaseModelFormConfig | InteractiveModelFormConfig | WorkerModelFormConfig,
+  ): string {
+    const payload = target === "orch"
+      ? buildOrchestratorConnectionConfigPayload(config as InteractiveModelFormConfig)
+      : target === "worker"
+        ? buildWorkerModelConfigPayload(config as WorkerModelFormConfig)
+        : buildBaseModelConfigPayload(config as BaseModelFormConfig);
+    return JSON.stringify(payload);
+  }
+
+  function isModelConfigDraftDirty(
+    target: ModelConfigTarget,
+    key: string,
+    config: BaseModelFormConfig | InteractiveModelFormConfig | WorkerModelFormConfig | undefined,
+  ): boolean {
+    const baseline = modelConfigBaselines[key];
+    return Boolean(
+      config
+      && baseline
+      && buildModelConfigSignature(target, config) !== buildModelConfigSignature(target, baseline),
+    );
+  }
+
+  function setModelConfigBaseline(
+    key: string,
+    config: BaseModelFormConfig | InteractiveModelFormConfig,
+  ): void {
+    modelConfigBaselines = {
+      ...modelConfigBaselines,
+      [key]: cloneModelFormConfig(config),
+    };
+  }
+
+  function normalizeOrchestratorFormConfig(config: any): InteractiveModelFormConfig {
+    return createInteractiveConfig({
+      baseUrl: config?.baseUrl || "",
+      urlMode: normalizeUrlMode(config?.urlMode),
+      apiProtocol: normalizeModelApiProtocol(config?.apiProtocol),
+      apiKey: config?.apiKey || "",
+      model: "",
+      reasoningEffort: "medium",
+    });
+  }
+
+  function normalizeAuxiliaryFormConfig(config: any): BaseModelFormConfig {
+    return createAuxiliaryConfig({
+      baseUrl: config?.baseUrl || "",
+      urlMode: normalizeUrlMode(config?.urlMode),
+      apiProtocol: normalizeModelApiProtocol(config?.apiProtocol),
+      apiKey: config?.apiKey || "",
+      model: config?.model || "",
+    });
+  }
+
+  function normalizeWorkerFormConfig(config: any): WorkerModelFormConfig {
+    return createWorkerConfig({
+      baseUrl: config?.baseUrl || "",
+      urlMode: normalizeUrlMode(config?.urlMode),
+      apiProtocol: normalizeModelApiProtocol(config?.apiProtocol),
+      apiKey: config?.apiKey || "",
+      model: config?.model || "",
+      reasoningEffort: config?.reasoningEffort || "medium",
+    });
+  }
+
+  function normalizeSavedModelConfig(
+    target: ModelConfigTarget,
+    config: any,
+  ): BaseModelFormConfig | InteractiveModelFormConfig {
+    if (target === "orch") return normalizeOrchestratorFormConfig(config);
+    if (target === "worker") return normalizeWorkerFormConfig(config);
+    return normalizeAuxiliaryFormConfig(config);
   }
 
   function getBaseUrlPlaceholder(): string {
@@ -637,6 +731,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
   let compConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
   let imageConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
   let workerConfigs = $state<Record<string, WorkerModelFormConfig>>({});
+  let modelConfigBaselines = $state<
+    Record<string, BaseModelFormConfig | InteractiveModelFormConfig>
+  >({
+    orch: createInteractiveConfig(),
+    comp: createAuxiliaryConfig(),
+    image: createAuxiliaryConfig(),
+  });
 
   function deriveWorkerModelTabs(): string[] {
     const seen = new Set<string>();
@@ -1061,31 +1162,50 @@ function createSettingsStore(props: { onClose?: () => void }) {
     setModelStatus(buildConfiguredModelStatuses(incoming));
   }
 
+  function resolveModelStatusKey(target: ModelConfigTarget, configKey: string): string {
+    if (target === "worker") return configKey;
+    if (target === "orch") return "orchestrator";
+    if (target === "comp") return "auxiliary";
+    return "imageGeneration";
+  }
+
+  async function executeModelConnectionTest(
+    target: ModelConfigTarget,
+    configKey: string,
+    config: BaseModelFormConfig | InteractiveModelFormConfig | WorkerModelFormConfig,
+  ): Promise<void> {
+    if (target === "worker") {
+      await testAgentWorkerConnection(
+        configKey,
+        buildWorkerModelConfigPayload(config as WorkerModelFormConfig),
+      );
+      return;
+    }
+    if (target === "orch") {
+      await testAgentOrchestratorConnection(
+        buildOrchestratorConnectionConfigPayload(config as InteractiveModelFormConfig),
+      );
+      return;
+    }
+    if (target === "comp") {
+      await testAgentAuxiliaryConnection(
+        buildBaseModelConfigPayload(config as BaseModelFormConfig),
+      );
+      return;
+    }
+    await testAgentImageGenerationConnection(
+      buildBaseModelConfigPayload(config as BaseModelFormConfig),
+    );
+  }
+
   async function probeModelStatus(
     target: ModelConfigTarget,
-    explicitWorkerKey?: string,
-  ): Promise<{ key: string; value: ModelStatus }> {
-    const workerKey = explicitWorkerKey || activeWorkerEngineId;
-    const statusKey =
-      target === "worker"
-        ? workerKey
-        : target === "orch"
-          ? "orchestrator"
-          : target === "comp"
-            ? "auxiliary"
-            : "imageGeneration";
-    const config:
-      | InteractiveModelFormConfig
-      | BaseModelFormConfig
-      | WorkerModelFormConfig
-      | undefined =
-      target === "worker"
-        ? workerConfigs[workerKey]
-        : target === "orch"
-          ? orchConfig
-          : target === "comp"
-            ? compConfig
-            : imageConfig;
+    explicitConfigKey?: string,
+  ): Promise<{ key: string; value: ModelStatus; error?: unknown }> {
+    const configKey = resolveModelConfigKey(target, explicitConfigKey);
+    const statusKey = resolveModelStatusKey(target, configKey);
+    const currentConfig = getModelFormConfig(target, configKey);
+    const config = currentConfig ? cloneModelFormConfig(currentConfig) : undefined;
     const model = config?.model?.trim() || undefined;
 
     const hasUsableConfig =
@@ -1098,26 +1218,15 @@ function createSettingsStore(props: { onClose?: () => void }) {
         value: { status: "not_configured", model },
       };
     }
+    if (!config) {
+      return {
+        key: statusKey,
+        value: { status: "not_configured", model },
+      };
+    }
 
     try {
-      if (target === "worker") {
-        await testAgentWorkerConnection(
-          workerKey,
-          buildWorkerModelConfigPayload(config as WorkerModelFormConfig),
-        );
-      } else if (target === "orch") {
-        await testAgentOrchestratorConnection(
-          buildOrchestratorConnectionConfigPayload(config as InteractiveModelFormConfig),
-        );
-      } else if (target === "comp") {
-        await testAgentAuxiliaryConnection(
-          buildBaseModelConfigPayload(config as BaseModelFormConfig),
-        );
-      } else {
-        await testAgentImageGenerationConnection(
-          buildBaseModelConfigPayload(config as BaseModelFormConfig),
-        );
-      }
+      await executeModelConnectionTest(target, configKey, config);
       return {
         key: statusKey,
         value: { status: "connected", model },
@@ -1129,6 +1238,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
           ...inferModelErrorStatus(error),
           model,
         },
+        error,
       };
     }
   }
@@ -1664,93 +1774,101 @@ function createSettingsStore(props: { onClose?: () => void }) {
     }
   }
 
+  const modelTestRequestSequences: Record<string, number> = {};
+  const modelTestResetTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+
   async function testModelConnection(
     target: ModelConfigTarget,
-    explicitWorkerKey?: string,
+    explicitConfigKey?: string,
   ) {
-    if (target === "worker" && !explicitWorkerKey && !activeWorkerEngineId) {
+    const configKey = resolveModelConfigKey(target, explicitConfigKey);
+    if (!configKey) {
       return;
     }
+    const currentConfig = getModelFormConfig(target, configKey);
+    if (!currentConfig) return;
+    const config = cloneModelFormConfig(currentConfig);
+    const requestSignature = buildModelConfigSignature(target, config);
+    const requestSequence = (modelTestRequestSequences[configKey] || 0) + 1;
+    modelTestRequestSequences[configKey] = requestSequence;
 
-    // 设置测试中状态
-    const workerKey = explicitWorkerKey || activeWorkerEngineId;
-    const statusKey = target === "worker" ? workerKey : target;
-    const modelStatusKey =
-      target === "worker"
-        ? workerKey
-        : target === "orch"
-          ? "orchestrator"
-          : target === "comp"
-            ? "auxiliary"
-            : "imageGeneration";
-    testStatus[statusKey] = "testing";
+    const requestStillMatchesCurrentConfig = () => {
+      const latestConfig = getModelFormConfig(target, configKey);
+      return Boolean(
+        modelTestRequestSequences[configKey] === requestSequence
+        && latestConfig
+        && buildModelConfigSignature(target, latestConfig) === requestSignature,
+      );
+    };
+    const discardStaleTestResult = () => {
+      if (modelTestRequestSequences[configKey] !== requestSequence) return;
+      testStatus[configKey] = "idle";
+      testStatus = { ...testStatus };
+    };
+
+    const modelStatusKey = resolveModelStatusKey(target, configKey);
+    testStatus[configKey] = "testing";
     testStatus = { ...testStatus };
     const currentModelStatus = getModelStatus();
     setModelStatus({
       ...buildConfiguredModelStatuses(currentModelStatus),
       [modelStatusKey]: {
         ...(currentModelStatus[modelStatusKey] || {}),
-        model:
-          (target === "worker"
-            ? workerConfigs[workerKey]?.model
-            : target === "orch"
-              ? orchConfig.model
-              : target === "comp"
-                ? compConfig.model
-                : imageConfig.model)?.trim() || undefined,
+        model: config.model?.trim() || undefined,
         status: "checking",
       },
     });
 
     try {
-      const result = await probeModelStatus(target, explicitWorkerKey);
+      await executeModelConnectionTest(target, configKey, config);
+      if (!requestStillMatchesCurrentConfig()) {
+        discardStaleTestResult();
+        return;
+      }
       setModelStatus({
         ...buildConfiguredModelStatuses(getModelStatus()),
-        [result.key]: result.value,
+        [modelStatusKey]: {
+          status: "connected",
+          model: config.model?.trim() || undefined,
+        },
       });
-      testStatus[statusKey] =
-        result.value.status === "connected" ? "success" : "error";
+      testStatus[configKey] = "success";
       notifySettingsSuccess(i18n.t("settings.toast.connectionTestCompleted"));
     } catch (e) {
+      if (!requestStillMatchesCurrentConfig()) {
+        discardStaleTestResult();
+        return;
+      }
       console.error("[SettingsPanel] 连接测试失败:", e);
-      testStatus[statusKey] = "error";
+      testStatus[configKey] = "error";
       const failed = inferModelErrorStatus(e);
       setModelStatus({
         ...buildConfiguredModelStatuses(getModelStatus()),
         [modelStatusKey]: {
           ...failed,
-          model:
-            (target === "worker"
-              ? workerConfigs[workerKey]?.model
-              : target === "orch"
-                ? orchConfig.model
-                : target === "comp"
-                  ? compConfig.model
-                  : imageConfig.model)?.trim() || undefined,
+          model: config.model?.trim() || undefined,
         },
       });
       notifySettingsError(i18n.t("settings.toast.action.testConnection"), e);
     }
-    testStatus = { ...testStatus };
-    resetTestStatus(statusKey);
-  }
-
-  async function fetchModelList(target: ModelConfigTarget) {
-    const key = target === "worker" ? activeWorkerEngineId : target;
-    let config: any;
-    if (target === "worker") {
-      config = workerConfigs[activeWorkerEngineId];
-    } else if (target === "orch") {
-      config = orchConfig;
-    } else if (target === "comp") {
-      config = compConfig;
-    } else {
-      config = imageConfig;
-    }
-
-    if (!config) {
+    if (!requestStillMatchesCurrentConfig()) {
+      discardStaleTestResult();
       return;
     }
+    testStatus = { ...testStatus };
+    resetTestStatus(configKey, requestSequence);
+  }
+
+  const modelListRequestSequences: Record<string, number> = {};
+
+  async function fetchModelList(
+    target: ModelConfigTarget,
+    explicitConfigKey?: string,
+  ) {
+    const key = resolveModelConfigKey(target, explicitConfigKey);
+    const currentConfig = getModelFormConfig(target, key);
+    if (!key || !currentConfig) return;
+    const config = cloneModelFormConfig(currentConfig);
 
     const blockReason = resolveModelListFetchBlockReason(config);
     if (blockReason) {
@@ -1762,6 +1880,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
       return;
     }
 
+    const requestSignature = buildModelListSignature(config);
+    const requestSequence = (modelListRequestSequences[key] || 0) + 1;
+    modelListRequestSequences[key] = requestSequence;
     fetchingModels[key] = true;
     fetchingModels = { ...fetchingModels };
 
@@ -1773,22 +1894,29 @@ function createSettingsStore(props: { onClose?: () => void }) {
             ? buildOrchestratorConnectionConfigPayload(config as InteractiveModelFormConfig)
             : buildBaseModelConfigPayload(config as BaseModelFormConfig);
       const result = await fetchAgentModelList(payload, key);
-      fetchingModels[key] = false;
-      fetchingModels = { ...fetchingModels };
-      if (result.success && Array.isArray(result.models)) {
-        modelLists[key] = result.models;
-        modelLists = { ...modelLists };
-        if (result.models.length > 0) {
-          modelDropdownOpen[key] = true;
-          modelDropdownOpen = { ...modelDropdownOpen };
-        }
-        notifySettingsSuccess(i18n.t("settings.toast.modelListRefreshed"));
+      const latestConfig = getModelFormConfig(target, key);
+      if (
+        modelListRequestSequences[key] !== requestSequence
+        || requestSignature !== buildModelListSignature(latestConfig)
+      ) {
+        return;
       }
+      modelLists[key] = result.models;
+      modelLists = { ...modelLists };
+      if (result.models.length > 0 && modelConfigTab === key) {
+        modelDropdownOpen[key] = true;
+        modelDropdownOpen = { ...modelDropdownOpen };
+      }
+      notifySettingsSuccess(i18n.t("settings.toast.modelListRefreshed"));
     } catch (e) {
+      if (modelListRequestSequences[key] !== requestSequence) return;
       console.error("[SettingsPanel] 获取模型列表失败:", e);
-      fetchingModels[key] = false;
-      fetchingModels = { ...fetchingModels };
       notifySettingsError(i18n.t("settings.toast.action.fetchModelList"), e);
+    } finally {
+      if (modelListRequestSequences[key] === requestSequence) {
+        fetchingModels[key] = false;
+        fetchingModels = { ...fetchingModels };
+      }
     }
   }
 
@@ -1806,15 +1934,31 @@ function createSettingsStore(props: { onClose?: () => void }) {
     modelDropdownOpen = { ...modelDropdownOpen };
   }
 
-  // 重置测试状态（5秒后自动重置为 idle）
-  function resetTestStatus(key: string) {
-    setTimeout(() => {
-      testStatus[key] = "idle";
-      testStatus = { ...testStatus };
+  function resetTestStatus(key: string, requestSequence: number) {
+    if (modelTestResetTimers[key]) clearTimeout(modelTestResetTimers[key]);
+    modelTestResetTimers[key] = setTimeout(() => {
+      if (modelTestRequestSequences[key] === requestSequence) {
+        testStatus[key] = "idle";
+        testStatus = { ...testStatus };
+      }
+      delete modelTestResetTimers[key];
     }, 5000);
   }
 
-  // 重置保存状态（2秒后自动重置为 idle）
+  const modelSaveRequestSequences: Record<string, number> = {};
+  const modelSaveResetTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+
+  function resetModelSaveStatus(key: string, requestSequence: number) {
+    if (modelSaveResetTimers[key]) clearTimeout(modelSaveResetTimers[key]);
+    modelSaveResetTimers[key] = setTimeout(() => {
+      if (modelSaveRequestSequences[key] === requestSequence) {
+        saveStatus[key] = "idle";
+        saveStatus = { ...saveStatus };
+      }
+      delete modelSaveResetTimers[key];
+    }, 2000);
+  }
+
   function resetSaveStatus(key: string) {
     setTimeout(() => {
       saveStatus[key] = "idle";
@@ -1832,58 +1976,141 @@ function createSettingsStore(props: { onClose?: () => void }) {
     }, 2000);
   }
 
-  async function saveModelConfig(target: ModelConfigTarget) {
-    const key = target === "worker" ? activeWorkerEngineId : target;
+  function replaceModelFormConfig(
+    target: ModelConfigTarget,
+    key: string,
+    config: BaseModelFormConfig | InteractiveModelFormConfig,
+  ): void {
+    if (target === "worker") {
+      workerConfigs = {
+        ...workerConfigs,
+        [key]: cloneModelFormConfig(config as WorkerModelFormConfig),
+      };
+    } else if (target === "orch") {
+      orchConfig = cloneModelFormConfig(config as InteractiveModelFormConfig);
+    } else if (target === "comp") {
+      compConfig = cloneModelFormConfig(config as BaseModelFormConfig);
+    } else {
+      imageConfig = cloneModelFormConfig(config as BaseModelFormConfig);
+    }
+  }
 
-    // 设置保存中状态
+  function updateModelConfigSnapshot(
+    target: ModelConfigTarget,
+    key: string,
+    config: BaseModelFormConfig | InteractiveModelFormConfig,
+  ): void {
+    const snapshot = messagesState.settingsBootstrapSnapshot as
+      | AgentSettingsBootstrapSnapshot
+      | null;
+    if (!snapshot) return;
+
+    const next = { ...snapshot } as AgentSettingsBootstrapSnapshot;
+    if (target === "worker") {
+      next.workerConfigs = {
+        ...(snapshot.workerConfigs || {}),
+        [key]: cloneModelFormConfig(config),
+      };
+    } else if (target === "orch") {
+      next.orchestratorConfig = cloneModelFormConfig(config) as unknown as Record<string, unknown>;
+    } else if (target === "comp") {
+      next.auxiliaryConfig = cloneModelFormConfig(config) as unknown as Record<string, unknown>;
+    } else {
+      next.imageGenerationConfig = cloneModelFormConfig(config) as unknown as Record<string, unknown>;
+    }
+    messagesState.settingsBootstrapSnapshot = next;
+  }
+
+  function commitSavedModelConfig(
+    target: ModelConfigTarget,
+    key: string,
+    savedConfig: BaseModelFormConfig | InteractiveModelFormConfig,
+    submittedSignature: string,
+  ): void {
+    setModelConfigBaseline(key, savedConfig);
+    const currentConfig = getModelFormConfig(target, key);
+    if (
+      currentConfig
+      && buildModelConfigSignature(target, currentConfig) === submittedSignature
+    ) {
+      replaceModelFormConfig(target, key, savedConfig);
+    }
+    updateModelConfigSnapshot(target, key, savedConfig);
+  }
+
+  async function saveModelConfig(
+    target: ModelConfigTarget,
+    explicitConfigKey?: string,
+  ) {
+    const key = resolveModelConfigKey(target, explicitConfigKey);
+    const currentConfig = getModelFormConfig(target, key);
+    if (!key || !currentConfig) return;
+    const config = cloneModelFormConfig(currentConfig);
+    const submittedSignature = buildModelConfigSignature(target, config);
+    const requestSequence = (modelSaveRequestSequences[key] || 0) + 1;
+    modelSaveRequestSequences[key] = requestSequence;
+
     saveStatus[key] = "saving";
     saveStatus = { ...saveStatus };
 
     try {
+      let response: Record<string, unknown>;
       if (target === "worker") {
         const workerKey = key;
-        const wc = workerConfigs[workerKey];
         // 新建或待持久化改名：调用 Registry upsert 写入 displayName
         const pendingName = engineDisplayNames[workerKey];
         if (unsavedEngines.has(workerKey) || pendingName) {
           const displayName = pendingName || workerKey;
-          const workerPayload = buildWorkerModelConfigPayload(wc);
+          const workerPayload = buildWorkerModelConfigPayload(config as WorkerModelFormConfig);
           await upsertAgentRegistryEngine({
             id: workerKey,
             displayName,
             llm: workerPayload,
           });
         }
-        await saveAgentWorkerConfig(workerKey, buildWorkerModelConfigPayload(wc));
+        response = await saveAgentWorkerConfig(
+          workerKey,
+          buildWorkerModelConfigPayload(config as WorkerModelFormConfig),
+        );
         // 保存成功后清理暂存
         unsavedEngines.delete(workerKey);
         const { [workerKey]: _renamed, ...restNames } = engineDisplayNames;
         engineDisplayNames = restNames;
         await loadRegistryData();
       } else if (target === "orch") {
-        await saveAgentOrchestratorConfig(
-          buildOrchestratorConnectionConfigPayload(orchConfig),
+        response = await saveAgentOrchestratorConfig(
+          buildOrchestratorConnectionConfigPayload(config as InteractiveModelFormConfig),
         );
       } else if (target === "comp") {
-        await saveAgentAuxiliaryConfig(buildBaseModelConfigPayload(compConfig));
+        response = await saveAgentAuxiliaryConfig(
+          buildBaseModelConfigPayload(config as BaseModelFormConfig),
+        );
       } else if (target === "image") {
-        await saveAgentImageGenerationConfig(buildBaseModelConfigPayload(imageConfig));
+        response = await saveAgentImageGenerationConfig(
+          buildBaseModelConfigPayload(config as BaseModelFormConfig),
+        );
+      } else {
+        return;
       }
 
+      if (modelSaveRequestSequences[key] !== requestSequence) return;
+      const savedConfig = normalizeSavedModelConfig(
+        target,
+        response.config || config,
+      );
+      commitSavedModelConfig(target, key, savedConfig, submittedSignature);
       saveStatus[key] = "saved";
       saveStatus = { ...saveStatus };
       notifySettingsSuccess(i18n.t("settings.toast.modelConfigSaved"));
-      resetSaveStatus(key);
+      resetModelSaveStatus(key, requestSequence);
     } catch (e) {
+      if (modelSaveRequestSequences[key] !== requestSequence) return;
       console.error("[SettingsPanel] 保存模型配置失败:", e);
       saveStatus[key] = "error";
       notifySettingsError(i18n.t("settings.toast.action.saveModelConfig"), e);
       saveStatus = { ...saveStatus };
-      resetSaveStatus(key);
+      resetModelSaveStatus(key, requestSequence);
     }
-
-    // 保存后强制拉取最新 bootstrap，避免先套用旧快照导致 tab 闪回。
-    await requestSettingsBootstrap(true);
   }
 
   function confirmInputDialog() {
@@ -2821,26 +3048,33 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!configs) {
       return;
     }
-    // 以后端返回的当前协议 workerConfigs 为准重建，保留未保存引擎的前端暂存。
-    const next: Record<string, any> = {};
+    const next: Record<string, WorkerModelFormConfig> = {};
+    const nextBaselines = { ...modelConfigBaselines };
     for (const [worker, config] of Object.entries(configs)) {
       if (config) {
-        next[worker] = createWorkerConfig({
-          baseUrl: config.baseUrl || "",
-          urlMode: normalizeUrlMode(config.urlMode),
-          apiProtocol: normalizeModelApiProtocol(config.apiProtocol),
-          apiKey: config.apiKey || "",
-          model: config.model || "",
-          reasoningEffort: config.reasoningEffort || "medium",
-        });
+        const persisted = normalizeWorkerFormConfig(config);
+        next[worker] = isModelConfigDraftDirty("worker", worker, workerConfigs[worker])
+          ? workerConfigs[worker]
+          : persisted;
+        nextBaselines[worker] = cloneModelFormConfig(persisted);
       }
     }
-    // 保留未保存引擎的前端暂存配置
-    for (const engineId of unsavedEngines) {
-      if (!next[engineId] && workerConfigs[engineId]) {
-        next[engineId] = workerConfigs[engineId];
+
+    for (const [worker, current] of Object.entries(workerConfigs)) {
+      if (next[worker]) continue;
+      if (unsavedEngines.has(worker)) {
+        next[worker] = current;
+        continue;
+      }
+      if (isModelConfigDraftDirty("worker", worker, current)) {
+        next[worker] = current;
+        nextBaselines[worker] = createWorkerConfig();
+      } else {
+        delete nextBaselines[worker];
       }
     }
+
+    modelConfigBaselines = nextBaselines;
     workerConfigs = next;
   }
 
@@ -2848,40 +3082,30 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!config) {
       return;
     }
-    orchConfig = createInteractiveConfig({
-      baseUrl: config.baseUrl || "",
-      urlMode: normalizeUrlMode(config.urlMode),
-      apiProtocol: normalizeModelApiProtocol(config.apiProtocol),
-      apiKey: config.apiKey || "",
-      model: "",
-      reasoningEffort: "medium",
-    });
+    const persisted = normalizeOrchestratorFormConfig(config);
+    const preserveDraft = isModelConfigDraftDirty("orch", "orch", orchConfig);
+    setModelConfigBaseline("orch", persisted);
+    if (!preserveDraft) orchConfig = persisted;
   }
 
   function applyAuxiliaryConfig(config: any): void {
     if (!config) {
       return;
     }
-    compConfig = createAuxiliaryConfig({
-      baseUrl: config.baseUrl || "",
-      urlMode: normalizeUrlMode(config.urlMode),
-      apiProtocol: normalizeModelApiProtocol(config.apiProtocol),
-      apiKey: config.apiKey || "",
-      model: config.model || "",
-    });
+    const persisted = normalizeAuxiliaryFormConfig(config);
+    const preserveDraft = isModelConfigDraftDirty("comp", "comp", compConfig);
+    setModelConfigBaseline("comp", persisted);
+    if (!preserveDraft) compConfig = persisted;
   }
 
   function applyImageGenerationConfig(config: any): void {
     if (!config) {
       return;
     }
-    imageConfig = createAuxiliaryConfig({
-      baseUrl: config.baseUrl || "",
-      urlMode: normalizeUrlMode(config.urlMode),
-      apiProtocol: normalizeModelApiProtocol(config.apiProtocol),
-      apiKey: config.apiKey || "",
-      model: config.model || "",
-    });
+    const persisted = normalizeAuxiliaryFormConfig(config);
+    const preserveDraft = isModelConfigDraftDirty("image", "image", imageConfig);
+    setModelConfigBaseline("image", persisted);
+    if (!preserveDraft) imageConfig = persisted;
   }
 
   function applyMcpServersPayload(serversPayload: unknown): void {
@@ -3567,6 +3791,9 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     set workerConfigs(v) {
       workerConfigs = v;
+    },
+    get modelConfigBaselines() {
+      return modelConfigBaselines;
     },
     get workerModelTabs() {
       return workerModelTabs;

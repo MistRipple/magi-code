@@ -20,6 +20,14 @@ use magi_bridge_client::{
     BridgeServerKind, BridgeTransport, JsonRpcBridgeServerProbeClient, McpServerClient,
     ModelBridgeClient,
 };
+use magi_browser_runtime::{
+    BrowserAuthority, BrowserAuthorityError, BrowserCapabilitySnapshot, BrowserDurableState,
+    BrowserHostClient, BrowserHostCommand, BrowserHostCommandOutcome, BrowserHostCommandResult,
+    BrowserHostControlMode, BrowserLeaseEndReason, BrowserLeaseSelector, BrowserProfile,
+    BrowserProfileControlMode, BrowserProfileControlSnapshot, BrowserProfileKind,
+    BrowserRuntimeComponentStatus, BrowserRuntimeControlClient, BrowserRuntimeUpdateLevel,
+    BrowserScreencastFormat,
+};
 use magi_conversation_runtime::{
     ConversationRegistry,
     execution_admission::{ExecutionAdmissionController, ExecutionAdmissionSnapshot},
@@ -32,8 +40,8 @@ use magi_conversation_runtime::{
     },
 };
 use magi_core::{
-    SessionId, SessionLifecycleStatus, TaskId, TaskTier, UtcMillis, WorkspaceId,
-    public_runtime_excerpt,
+    AccessProfile, BrowserProfileId, BrowserTabId, SessionId, SessionLifecycleStatus, TaskId,
+    TaskTier, UtcMillis, WorkspaceId, public_runtime_excerpt,
 };
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, latest_usage_observations_from_ledger,
@@ -773,6 +781,360 @@ pub struct RunnerStatusSnapshot {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BrowserRuntimeStatusSnapshot {
+    pub revision: u64,
+    pub in_app_browser_enabled: bool,
+    pub browser_use_enabled: bool,
+    pub component_status: BrowserRuntimeComponentStatus,
+    pub runtime_mode: String,
+    pub host_status: String,
+    pub host_protocol_compatible: bool,
+    pub runtime_version: Option<String>,
+    pub host_version: Option<String>,
+    pub playwright_version: Option<String>,
+    pub chromium_version: Option<String>,
+    pub available_runtime_version: Option<String>,
+    pub update_level: Option<BrowserRuntimeUpdateLevel>,
+    pub component_management_available: bool,
+    pub last_error_code: Option<String>,
+}
+
+impl Default for BrowserRuntimeStatusSnapshot {
+    fn default() -> Self {
+        Self {
+            revision: 1,
+            in_app_browser_enabled: true,
+            browser_use_enabled: false,
+            component_status: BrowserRuntimeComponentStatus::NotInstalled,
+            runtime_mode: "unavailable".to_string(),
+            host_status: "stopped".to_string(),
+            host_protocol_compatible: false,
+            runtime_version: None,
+            host_version: None,
+            playwright_version: None,
+            chromium_version: None,
+            available_runtime_version: None,
+            update_level: None,
+            component_management_available: false,
+            last_error_code: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BrowserScreencastSubscription {
+    tab_id: BrowserTabId,
+    host_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BrowserScreencastOptions {
+    pub format: BrowserScreencastFormat,
+    pub quality: u8,
+    pub max_width: u32,
+    pub max_height: u32,
+}
+
+#[derive(Debug, Default)]
+struct BrowserScreencastEntry {
+    host_generation: u64,
+    subscriber_count: usize,
+    active: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct BrowserScreencastCoordinator {
+    host_generation: AtomicU64,
+    entries: Mutex<HashMap<BrowserTabId, Arc<tokio::sync::Mutex<BrowserScreencastEntry>>>>,
+}
+
+impl BrowserScreencastCoordinator {
+    fn advance_host_generation(&self) {
+        self.host_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn host_generation(&self) -> u64 {
+        self.host_generation.load(Ordering::Acquire)
+    }
+
+    fn entry(&self, tab_id: &BrowserTabId) -> Arc<tokio::sync::Mutex<BrowserScreencastEntry>> {
+        self.entries
+            .lock()
+            .expect("browser screencast registry lock poisoned")
+            .entry(tab_id.clone())
+            .or_default()
+            .clone()
+    }
+
+    pub(crate) async fn subscribe(
+        &self,
+        client: &BrowserHostClient,
+        host_generation: u64,
+        tab_id: &BrowserTabId,
+        options: BrowserScreencastOptions,
+    ) -> Result<BrowserScreencastSubscription, String> {
+        if self.host_generation() != host_generation {
+            return Err("浏览器 Host 已切换，无法建立画面订阅".to_string());
+        }
+        let entry = self.entry(tab_id);
+        let mut current = entry.lock().await;
+        if self.host_generation() != host_generation {
+            return Err("浏览器 Host 已切换，无法建立画面订阅".to_string());
+        }
+        if current.host_generation != host_generation {
+            *current = BrowserScreencastEntry {
+                host_generation,
+                ..BrowserScreencastEntry::default()
+            };
+        }
+        let reply = client
+            .request(BrowserHostCommand::StartScreencast {
+                tab_id: tab_id.clone(),
+                format: options.format,
+                quality: options.quality,
+                max_width: options.max_width,
+                max_height: options.max_height,
+            })
+            .await
+            .map_err(|error| format!("启动浏览器画面流失败: {error}"))?;
+        if self.host_generation() != host_generation {
+            return Err("浏览器 Host 在画面流启动期间发生切换".to_string());
+        }
+        if !matches!(
+            reply.response.outcome,
+            BrowserHostCommandOutcome::Succeeded(ref result)
+                if matches!(result.as_ref(), BrowserHostCommandResult::Empty)
+        ) {
+            return Err(format!(
+                "启动浏览器画面流失败: {:?}",
+                reply.response.outcome
+            ));
+        }
+        current.active = true;
+        current.subscriber_count = current.subscriber_count.saturating_add(1);
+        Ok(BrowserScreencastSubscription {
+            tab_id: tab_id.clone(),
+            host_generation,
+        })
+    }
+
+    pub(crate) async fn unsubscribe(
+        &self,
+        client: &BrowserHostClient,
+        subscription: BrowserScreencastSubscription,
+    ) {
+        if self.host_generation() != subscription.host_generation {
+            return;
+        }
+        let entry = self.entry(&subscription.tab_id);
+        let mut current = entry.lock().await;
+        if current.host_generation != subscription.host_generation || current.subscriber_count == 0
+        {
+            return;
+        }
+        current.subscriber_count -= 1;
+        if current.subscriber_count > 0 || !current.active {
+            return;
+        }
+        current.active = false;
+        let result = client
+            .request(BrowserHostCommand::StopScreencast {
+                tab_id: subscription.tab_id.clone(),
+            })
+            .await;
+        if !matches!(
+            result,
+            Ok(ref reply) if matches!(
+                reply.response.outcome,
+                BrowserHostCommandOutcome::Succeeded(ref result)
+                    if matches!(result.as_ref(), BrowserHostCommandResult::Empty)
+            )
+        ) {
+            tracing::warn!(
+                tab_id = %subscription.tab_id,
+                ?result,
+                "停止浏览器画面流失败"
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecutionResourceCancellationReport {
+    pub process_count: usize,
+    pub browser_lease_count: usize,
+}
+
+impl ExecutionResourceCancellationReport {
+    pub fn total(self) -> usize {
+        self.process_count.saturating_add(self.browser_lease_count)
+    }
+}
+
+#[derive(Clone)]
+pub struct ExecutionResourceCoordinator {
+    tool_registry: Arc<RwLock<Option<ToolRegistry>>>,
+    browser_authority: Arc<Mutex<BrowserAuthority>>,
+    browser_write_lock: Arc<Mutex<()>>,
+    browser_host_client: Arc<RwLock<Option<BrowserHostClient>>>,
+    event_bus: Arc<InMemoryEventBus>,
+}
+
+impl ExecutionResourceCoordinator {
+    fn new(
+        browser_authority: Arc<Mutex<BrowserAuthority>>,
+        browser_write_lock: Arc<Mutex<()>>,
+        browser_host_client: Arc<RwLock<Option<BrowserHostClient>>>,
+        event_bus: Arc<InMemoryEventBus>,
+    ) -> Self {
+        Self {
+            tool_registry: Arc::new(RwLock::new(None)),
+            browser_authority,
+            browser_write_lock,
+            browser_host_client,
+            event_bus,
+        }
+    }
+
+    fn set_tool_registry(&self, registry: ToolRegistry) {
+        *self
+            .tool_registry
+            .write()
+            .expect("execution resource tool registry lock poisoned") = Some(registry);
+    }
+
+    pub fn cancel(
+        &self,
+        query: ToolExecutionContextQuery,
+        reason: BrowserLeaseEndReason,
+        now: UtcMillis,
+    ) -> ExecutionResourceCancellationReport {
+        let process_count = self
+            .tool_registry
+            .read()
+            .expect("execution resource tool registry lock poisoned")
+            .as_ref()
+            .map_or(0, |registry| registry.cancel_active_processes(&query));
+        let selector = BrowserLeaseSelector {
+            session_id: query.session_id.clone(),
+            workspace_id: query.workspace_id.clone(),
+            task_id: query.task_id.clone(),
+            worker_id: query.worker_id.clone(),
+            ..BrowserLeaseSelector::default()
+        };
+        let (revoked, controls) = {
+            let _write_guard = self
+                .browser_write_lock
+                .lock()
+                .expect("browser authority write lock poisoned");
+            let mut authority = self
+                .browser_authority
+                .lock()
+                .expect("browser authority lock poisoned");
+            let revoked = authority.revoke_leases(&selector, reason, now);
+            let profile_ids = revoked
+                .iter()
+                .map(|lease| lease.profile_id.clone())
+                .collect::<HashSet<_>>();
+            let controls = profile_ids
+                .iter()
+                .filter_map(|profile_id| authority.profile_control_snapshot(profile_id).ok())
+                .collect::<Vec<_>>();
+            (revoked, controls)
+        };
+        self.synchronize_browser_controls(controls);
+        for lease in &revoked {
+            self.event_bus.publish(
+                EventEnvelope::domain(
+                    magi_core::EventId::new(format!(
+                        "event-browser-lease-revoked-{}-{}",
+                        lease.lease_id, now.0
+                    )),
+                    "browser.lease.revoked",
+                    serde_json::json!({
+                        "lease_id": lease.lease_id,
+                        "browser_session_id": lease.browser_session_id,
+                        "profile_id": lease.profile_id,
+                        "reason": reason,
+                        "fence": lease.fence,
+                    }),
+                )
+                .with_context(EventContext {
+                    workspace_id: lease.owner.workspace_id.clone(),
+                    session_id: lease.owner.session_id.clone(),
+                    mission_id: lease.owner.mission_id.clone(),
+                    task_id: lease.owner.task_id.clone(),
+                    ..EventContext::default()
+                }),
+            );
+        }
+        ExecutionResourceCancellationReport {
+            process_count,
+            browser_lease_count: revoked.len(),
+        }
+    }
+
+    fn synchronize_browser_controls(&self, controls: Vec<BrowserProfileControlSnapshot>) {
+        let client = self
+            .browser_host_client
+            .read()
+            .expect("browser Host client lock poisoned")
+            .clone();
+        let Some(client) = client else {
+            return;
+        };
+        for control in controls {
+            spawn_browser_control_sync(client.clone(), control);
+        }
+    }
+}
+
+fn spawn_browser_control_sync(client: BrowserHostClient, control: BrowserProfileControlSnapshot) {
+    let future = async move {
+        let result = client
+            .request(BrowserHostCommand::UpdateControl {
+                fence: control.fence,
+                mode: match control.mode {
+                    BrowserProfileControlMode::Agent => BrowserHostControlMode::Agent,
+                    BrowserProfileControlMode::User => BrowserHostControlMode::User,
+                },
+            })
+            .await;
+        match result {
+            Ok(reply)
+                if matches!(
+                    reply.response.outcome,
+                    BrowserHostCommandOutcome::Succeeded(_)
+                ) => {}
+            Ok(reply) => tracing::warn!(
+                profile_id = %control.profile_id,
+                fence = control.fence,
+                outcome = ?reply.response.outcome,
+                "同步已撤销 Browser Lease 的 Host fence 失败"
+            ),
+            Err(error) => tracing::warn!(
+                profile_id = %control.profile_id,
+                fence = control.fence,
+                ?error,
+                "同步已撤销 Browser Lease 的 Host fence 失败"
+            ),
+        }
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(future);
+    } else {
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            if let Ok(runtime) = runtime {
+                runtime.block_on(future);
+            }
+        });
+    }
+}
+
 #[derive(Clone)]
 pub struct ApiState {
     pub service_info: ServiceInfo,
@@ -805,6 +1167,16 @@ pub struct ApiState {
     model_bridge_client: Option<Arc<dyn ModelBridgeClient>>,
     model_bridge_client_is_real: bool,
     tool_registry: Option<ToolRegistry>,
+    pub browser_authority: Arc<Mutex<BrowserAuthority>>,
+    browser_write_lock: Arc<Mutex<()>>,
+    pub(crate) browser_control_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) browser_viewport_controllers: Arc<Mutex<HashMap<BrowserTabId, String>>>,
+    pub(crate) browser_screencasts: Arc<BrowserScreencastCoordinator>,
+    browser_state_writable: Arc<AtomicBool>,
+    browser_runtime_status: Arc<RwLock<BrowserRuntimeStatusSnapshot>>,
+    browser_host_client: Arc<RwLock<Option<BrowserHostClient>>>,
+    browser_runtime_control: Arc<RwLock<Option<BrowserRuntimeControlClient>>>,
+    execution_resources: ExecutionResourceCoordinator,
     pub skill_runtime: Option<Arc<magi_skill_runtime::SkillRuntime>>,
     pub skill_dispatch_runtime: Option<Arc<magi_skill_runtime::SkillDispatchRuntime>>,
     pub tunnel_manager: crate::tunnel::TunnelManager,
@@ -832,6 +1204,8 @@ pub struct RuntimeStatePersistence {
 const SESSION_PERSISTENCE_PUBLIC_ERROR: &str = "会话状态暂不可保存，请稍后重试";
 const WORKSPACE_PERSISTENCE_PUBLIC_ERROR: &str = "工作区状态暂不可保存，请稍后重试";
 const KNOWLEDGE_PERSISTENCE_PUBLIC_ERROR: &str = "知识库状态暂不可保存，请稍后重试";
+const BROWSER_PERSISTENCE_PUBLIC_ERROR: &str = "浏览器状态暂不可保存，请稍后重试";
+const DEFAULT_BROWSER_PROFILE_ID: &str = "browser-profile-default";
 
 impl RuntimeStatePersistence {
     pub fn new(
@@ -960,6 +1334,80 @@ fn canonicalize_path_for_workspace_match(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn default_browser_authority(state_root: &Path) -> Result<BrowserAuthority, BrowserAuthorityError> {
+    let now = UtcMillis::now();
+    let mut authority = BrowserAuthority::new();
+    authority.register_profile(BrowserProfile {
+        profile_id: BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID),
+        kind: BrowserProfileKind::ManagedDefault,
+        data_path: state_root.join("browser/profiles/default"),
+        created_at: now,
+        updated_at: now,
+    })?;
+    Ok(authority)
+}
+
+fn load_browser_authority(
+    state_root: &Path,
+) -> Result<(BrowserAuthority, bool), Box<dyn std::error::Error + Send + Sync>> {
+    let path = state_root.join("browser/state.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((default_browser_authority(state_root)?, true));
+        }
+        Err(error) => return Err(Box::new(error)),
+    };
+    let durable: BrowserDurableState = serde_json::from_slice(&bytes)?;
+    let mut authority = BrowserAuthority::restore_durable(durable, UtcMillis::now())?;
+    if authority
+        .profile(&BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID))
+        .is_none()
+    {
+        authority.register_profile(BrowserProfile {
+            profile_id: BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID),
+            kind: BrowserProfileKind::ManagedDefault,
+            data_path: state_root.join("browser/profiles/default"),
+            created_at: UtcMillis::now(),
+            updated_at: UtcMillis::now(),
+        })?;
+    }
+    Ok((authority, false))
+}
+
+fn browser_authority_api_error(error: BrowserAuthorityError) -> ApiError {
+    match error {
+        BrowserAuthorityError::UnknownProfile(_)
+        | BrowserAuthorityError::UnknownSession(_)
+        | BrowserAuthorityError::UnknownTab(_)
+        | BrowserAuthorityError::UnknownLease(_) => ApiError::NotFound(error.to_string()),
+        BrowserAuthorityError::ProfileAlreadyExists(_)
+        | BrowserAuthorityError::SessionAlreadyExists(_)
+        | BrowserAuthorityError::OpenSessionAlreadyExists { .. }
+        | BrowserAuthorityError::TabAlreadyExists(_)
+        | BrowserAuthorityError::LeaseAlreadyExists(_)
+        | BrowserAuthorityError::UserHasControl(_)
+        | BrowserAuthorityError::LeaseConflict { .. }
+        | BrowserAuthorityError::LeaseNotHeld(_)
+        | BrowserAuthorityError::LeaseExpired(_)
+        | BrowserAuthorityError::LeaseFenceMismatch { .. }
+        | BrowserAuthorityError::LeaseSessionMismatch { .. }
+        | BrowserAuthorityError::GoalBindingMismatch
+        | BrowserAuthorityError::LeaseOwnerMismatch
+        | BrowserAuthorityError::LeaseTurnMismatch
+        | BrowserAuthorityError::SnapshotRevisionMismatch { .. }
+        | BrowserAuthorityError::FrameSequenceMismatch { .. }
+        | BrowserAuthorityError::NavigationRevisionMismatch { .. }
+        | BrowserAuthorityError::NavigationRevisionRegression { .. } => {
+            ApiError::Conflict(error.to_string())
+        }
+        BrowserAuthorityError::InvalidSnapshot(_) => {
+            ApiError::InternalAssemblyError(error.to_string())
+        }
+        _ => ApiError::InvalidInput(error.to_string()),
+    }
+}
+
 impl ApiState {
     pub fn new(
         service_name: impl Into<String>,
@@ -968,6 +1416,18 @@ impl ApiState {
         workspace_registry: Arc<WorkspaceStore>,
         governance: Arc<GovernanceService>,
     ) -> Self {
+        let browser_authority = Arc::new(Mutex::new(BrowserAuthority::new()));
+        let browser_write_lock = Arc::new(Mutex::new(()));
+        let browser_control_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let browser_viewport_controllers = Arc::new(Mutex::new(HashMap::new()));
+        let browser_screencasts = Arc::new(BrowserScreencastCoordinator::default());
+        let browser_host_client = Arc::new(RwLock::new(None));
+        let execution_resources = ExecutionResourceCoordinator::new(
+            Arc::clone(&browser_authority),
+            Arc::clone(&browser_write_lock),
+            Arc::clone(&browser_host_client),
+            Arc::clone(&event_bus),
+        );
         Self {
             service_info: ServiceInfo {
                 service_name: service_name.into(),
@@ -999,6 +1459,16 @@ impl ApiState {
             model_bridge_client: None,
             model_bridge_client_is_real: false,
             tool_registry: None,
+            browser_authority,
+            browser_write_lock,
+            browser_control_lock,
+            browser_viewport_controllers,
+            browser_screencasts,
+            browser_state_writable: Arc::new(AtomicBool::new(true)),
+            browser_runtime_status: Arc::new(RwLock::new(BrowserRuntimeStatusSnapshot::default())),
+            browser_host_client,
+            browser_runtime_control: Arc::new(RwLock::new(None)),
+            execution_resources,
             skill_runtime: None,
             skill_dispatch_runtime: None,
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
@@ -1368,6 +1838,8 @@ impl ApiState {
     }
 
     pub fn with_tool_registry(mut self, tool_registry: ToolRegistry) -> Self {
+        self.execution_resources
+            .set_tool_registry(tool_registry.clone());
         self.tool_registry = Some(tool_registry);
         self
     }
@@ -1403,15 +1875,157 @@ impl ApiState {
         workspace_id: Option<&WorkspaceId>,
         task_id: Option<&TaskId>,
     ) -> usize {
-        let Some(registry) = &self.tool_registry else {
-            return 0;
-        };
-        registry.cancel_active_processes(&ToolExecutionContextQuery {
-            session_id: session_id.cloned(),
-            workspace_id: workspace_id.cloned(),
-            task_id: task_id.cloned(),
-            worker_id: None,
-        })
+        self.cancel_execution_resources(
+            session_id,
+            workspace_id,
+            task_id,
+            BrowserLeaseEndReason::TurnStopped,
+        )
+        .total()
+    }
+
+    pub fn cancel_execution_resources(
+        &self,
+        session_id: Option<&SessionId>,
+        workspace_id: Option<&WorkspaceId>,
+        task_id: Option<&TaskId>,
+        reason: BrowserLeaseEndReason,
+    ) -> ExecutionResourceCancellationReport {
+        self.execution_resources.cancel(
+            ToolExecutionContextQuery {
+                session_id: session_id.cloned(),
+                workspace_id: workspace_id.cloned(),
+                task_id: task_id.cloned(),
+                worker_id: None,
+            },
+            reason,
+            UtcMillis::now(),
+        )
+    }
+
+    pub fn execution_resource_coordinator(&self) -> &ExecutionResourceCoordinator {
+        &self.execution_resources
+    }
+
+    pub fn browser_runtime_status(&self) -> BrowserRuntimeStatusSnapshot {
+        self.browser_runtime_status
+            .read()
+            .expect("browser runtime status lock poisoned")
+            .clone()
+    }
+
+    pub fn set_browser_runtime_status(&self, mut status: BrowserRuntimeStatusSnapshot) {
+        let mut current = self
+            .browser_runtime_status
+            .write()
+            .expect("browser runtime status lock poisoned");
+        status.revision = current.revision.saturating_add(1);
+        status.in_app_browser_enabled = current.in_app_browser_enabled;
+        status.browser_use_enabled = current.browser_use_enabled;
+        *current = status;
+    }
+
+    pub fn update_browser_capability_settings(
+        &self,
+        in_app_browser_enabled: bool,
+        browser_use_enabled: bool,
+    ) -> Result<(), ApiError> {
+        self.settings_store
+            .set_section(
+                "browser",
+                serde_json::json!({
+                    "inAppBrowserEnabled": in_app_browser_enabled,
+                    "browserUseEnabled": browser_use_enabled,
+                }),
+            )
+            .map_err(crate::errors::settings_persistence_error)?;
+        let mut current = self
+            .browser_runtime_status
+            .write()
+            .expect("browser runtime status lock poisoned");
+        current.in_app_browser_enabled = in_app_browser_enabled;
+        current.browser_use_enabled = browser_use_enabled;
+        current.revision = current.revision.saturating_add(1);
+        Ok(())
+    }
+
+    pub fn set_browser_host_client(&self, client: Option<BrowserHostClient>) {
+        let mut current = self
+            .browser_host_client
+            .write()
+            .expect("browser Host client lock poisoned");
+        *current = client;
+        self.browser_screencasts.advance_host_generation();
+    }
+
+    pub fn browser_host_client(&self) -> Option<BrowserHostClient> {
+        self.browser_host_client
+            .read()
+            .expect("browser Host client lock poisoned")
+            .clone()
+    }
+
+    pub(crate) fn browser_host_client_with_generation(&self) -> Option<(BrowserHostClient, u64)> {
+        let current = self
+            .browser_host_client
+            .read()
+            .expect("browser Host client lock poisoned");
+        current
+            .clone()
+            .map(|client| (client, self.browser_screencasts.host_generation()))
+    }
+
+    pub fn set_browser_runtime_control(&self, control: BrowserRuntimeControlClient) {
+        *self
+            .browser_runtime_control
+            .write()
+            .expect("browser runtime control lock poisoned") = Some(control);
+    }
+
+    pub fn browser_runtime_control(&self) -> Option<BrowserRuntimeControlClient> {
+        self.browser_runtime_control
+            .read()
+            .expect("browser runtime control lock poisoned")
+            .clone()
+    }
+
+    pub fn browser_tool_runtime_dependencies(&self) -> crate::BrowserToolRuntimeDependencies {
+        crate::BrowserToolRuntimeDependencies {
+            authority: Arc::clone(&self.browser_authority),
+            write_lock: Arc::clone(&self.browser_write_lock),
+            control_lock: Arc::clone(&self.browser_control_lock),
+            state_writable: Arc::clone(&self.browser_state_writable),
+            runtime_status: Arc::clone(&self.browser_runtime_status),
+            host_client: Arc::clone(&self.browser_host_client),
+            event_bus: Arc::clone(&self.event_bus),
+            session_store: Arc::clone(&self.session_store),
+            persistence: self.runtime_persistence.clone(),
+        }
+    }
+
+    pub fn browser_runtime_component_root(&self) -> Option<PathBuf> {
+        self.runtime_persistence
+            .as_ref()
+            .and_then(|persistence| persistence.state_root())
+            .map(|root| root.join("runtimes/browser"))
+    }
+
+    pub fn browser_capability_snapshot(
+        &self,
+        session_id: Option<&SessionId>,
+    ) -> BrowserCapabilitySnapshot {
+        let runtime = self.browser_runtime_status();
+        let access_profile = session_id
+            .and_then(|session_id| self.session_store.active_goal(session_id))
+            .map_or(AccessProfile::Restricted, |goal| goal.access_profile);
+        BrowserCapabilitySnapshot {
+            revision: runtime.revision,
+            in_app_browser_enabled: runtime.in_app_browser_enabled,
+            browser_use_enabled: runtime.browser_use_enabled,
+            runtime_status: runtime.component_status,
+            host_protocol_compatible: runtime.host_protocol_compatible,
+            access_profile,
+        }
     }
 
     pub fn runtime_persistence(&self) -> Option<&RuntimeStatePersistence> {
@@ -1816,6 +2430,20 @@ impl ApiState {
     }
 
     pub fn with_settings_store(mut self, store: Arc<SettingsStore>) -> Self {
+        let browser = store.get_section("browser");
+        let mut runtime = self
+            .browser_runtime_status
+            .write()
+            .expect("browser runtime status lock poisoned");
+        runtime.in_app_browser_enabled = browser
+            .get("inAppBrowserEnabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        runtime.browser_use_enabled = browser
+            .get("browserUseEnabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        drop(runtime);
         self.settings_store = store;
         self
     }
@@ -1850,8 +2478,148 @@ impl ApiState {
                 ),
             }
         }
+        let browser_load = persistence
+            .state_root()
+            .map(load_browser_authority)
+            .transpose();
         self.runtime_persistence = Some(persistence);
+        match browser_load {
+            Ok(Some((authority, is_new))) => {
+                *self
+                    .browser_authority
+                    .lock()
+                    .expect("browser authority lock poisoned") = authority;
+                if is_new && let Err(error) = self.persist_browser_durable_state() {
+                    self.browser_state_writable.store(false, Ordering::Release);
+                    self.set_browser_runtime_status(BrowserRuntimeStatusSnapshot {
+                        component_status: BrowserRuntimeComponentStatus::Failed,
+                        last_error_code: Some("browser_state_persist_failed".to_string()),
+                        ..self.browser_runtime_status()
+                    });
+                    tracing::error!(?error, "初始化浏览器持久状态失败");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.browser_state_writable.store(false, Ordering::Release);
+                self.set_browser_runtime_status(BrowserRuntimeStatusSnapshot {
+                    component_status: BrowserRuntimeComponentStatus::Failed,
+                    host_protocol_compatible: false,
+                    runtime_version: None,
+                    host_status: "failed".to_string(),
+                    last_error_code: Some("browser_state_invalid".to_string()),
+                    revision: 0,
+                    ..BrowserRuntimeStatusSnapshot::default()
+                });
+                tracing::error!(error = %error, "浏览器持久状态无效，禁止覆盖原文件");
+            }
+        }
         self
+    }
+
+    pub fn persist_browser_durable_state(&self) -> Result<(), ApiError> {
+        if !self.browser_state_writable.load(Ordering::Acquire) {
+            return Err(ApiError::InternalAssemblyError(
+                "浏览器持久状态不可写，原状态文件需要修复".to_string(),
+            ));
+        }
+        let Some(persistence) = &self.runtime_persistence else {
+            return Ok(());
+        };
+        let Some(state_root) = persistence.state_root() else {
+            return Ok(());
+        };
+        let durable = self
+            .browser_authority
+            .lock()
+            .expect("browser authority lock poisoned")
+            .durable_state();
+        persistence.save_json(&state_root.join("browser/state.json"), &durable)
+    }
+
+    pub fn persist_browser_durable_state_for_api(&self) -> Result<(), ApiError> {
+        self.persist_browser_durable_state().map_err(|error| {
+            public_runtime_persistence_error("browser", BROWSER_PERSISTENCE_PUBLIC_ERROR, error)
+        })
+    }
+
+    pub fn mutate_browser_authority<T>(
+        &self,
+        mutation: impl FnOnce(&mut BrowserAuthority) -> Result<T, BrowserAuthorityError>,
+    ) -> Result<T, ApiError> {
+        if !self.browser_state_writable.load(Ordering::Acquire) {
+            return Err(ApiError::Conflict(
+                "浏览器状态文件无效，修复前不能修改浏览器状态".to_string(),
+            ));
+        }
+        let _write_guard = self
+            .browser_write_lock
+            .lock()
+            .expect("browser authority write lock poisoned");
+        let current = self
+            .browser_authority
+            .lock()
+            .expect("browser authority lock poisoned")
+            .clone();
+        let mut candidate = current;
+        let output = mutation(&mut candidate).map_err(browser_authority_api_error)?;
+        if let Some(persistence) = &self.runtime_persistence
+            && let Some(state_root) = persistence.state_root()
+        {
+            persistence.save_json(
+                &state_root.join("browser/state.json"),
+                &candidate.durable_state(),
+            )?;
+        }
+        *self
+            .browser_authority
+            .lock()
+            .expect("browser authority lock poisoned") = candidate;
+        Ok(output)
+    }
+
+    pub(crate) fn accept_browser_viewport_controller(
+        &self,
+        tab_id: &BrowserTabId,
+        controller_id: &str,
+        claim: bool,
+    ) -> bool {
+        let mut controllers = self
+            .browser_viewport_controllers
+            .lock()
+            .expect("browser viewport controller lock poisoned");
+        match controllers.get(tab_id) {
+            Some(current) if current == controller_id => true,
+            Some(_) if !claim => false,
+            _ => {
+                controllers.insert(tab_id.clone(), controller_id.to_string());
+                true
+            }
+        }
+    }
+
+    pub(crate) fn clear_browser_viewport_controller(&self, tab_id: &BrowserTabId) {
+        self.browser_viewport_controllers
+            .lock()
+            .expect("browser viewport controller lock poisoned")
+            .remove(tab_id);
+    }
+
+    pub fn record_browser_frame(
+        &self,
+        tab_id: &magi_core::BrowserTabId,
+        frame_sequence: u64,
+        now: UtcMillis,
+    ) -> Result<(), ApiError> {
+        let _write_guard = self
+            .browser_write_lock
+            .lock()
+            .expect("browser authority write lock poisoned");
+        self.browser_authority
+            .lock()
+            .expect("browser authority lock poisoned")
+            .record_frame(tab_id, frame_sequence, now)
+            .map_err(browser_authority_api_error)
     }
 
     pub fn restore_regular_session_turn_queues(&self) -> Result<usize, ApiError> {
@@ -3190,7 +3958,10 @@ fn normalize_mcp_servers_section(snapshot: &mut HashMap<String, serde_json::Valu
 mod tests {
     use super::*;
     use magi_agent_role::{AgentRole, AgentRoleRegistry, TaskKindLabel};
-    use magi_core::{AbsolutePath, MissionId, Task, TaskKind, TaskStatus, WorkerId};
+    use magi_core::{
+        AbsolutePath, BrowserLeaseId, BrowserProfileId, BrowserSessionId, BrowserTabId,
+        ExecutionOwnership, MissionId, Task, TaskKind, TaskStatus, WorkerId,
+    };
     use magi_orchestrator::task_store::TaskLease;
     use magi_session_store::{ActiveExecutionChain, ActiveExecutionDispatchContext};
     use std::collections::HashMap;
@@ -3228,6 +3999,7 @@ mod tests {
                 goal_mode: false,
                 images: Vec::new(),
                 context_references: Vec::new(),
+                browser_annotation_refs: Vec::new(),
                 access_profile: None,
                 orchestrator_session_config: None,
                 request_id: Some(format!("request-{queue_id}")),
@@ -3254,6 +4026,122 @@ mod tests {
             queue_id: queue_id.to_string(),
             retry_count: 0,
         }
+    }
+
+    #[test]
+    fn browser_viewport_controller_enforces_single_writer_until_explicit_claim() {
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let tab_id = BrowserTabId::new("browser-tab-viewport-controller");
+
+        assert!(state.accept_browser_viewport_controller(&tab_id, "controller-a", false));
+        assert!(state.accept_browser_viewport_controller(&tab_id, "controller-a", false));
+        assert!(!state.accept_browser_viewport_controller(&tab_id, "controller-b", false));
+        assert!(state.accept_browser_viewport_controller(&tab_id, "controller-b", true));
+        assert!(!state.accept_browser_viewport_controller(&tab_id, "controller-a", false));
+
+        state.clear_browser_viewport_controller(&tab_id);
+        assert!(state.accept_browser_viewport_controller(&tab_id, "controller-a", false));
+    }
+
+    #[test]
+    fn execution_resource_coordinator_revokes_browser_lease_by_session_scope() {
+        let state = ApiState::new(
+            "magi-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let workspace_id = WorkspaceId::new("workspace-resource-coordinator");
+        let session_id = SessionId::new("session-resource-coordinator");
+        let browser_session_id = BrowserSessionId::new("browser-session-resource-coordinator");
+        let profile_id = BrowserProfileId::new("browser-profile-resource-coordinator");
+        let tab_id = BrowserTabId::new("browser-tab-resource-coordinator");
+        let lease_id = BrowserLeaseId::new("browser-lease-resource-coordinator");
+        let now = UtcMillis(100);
+
+        state
+            .mutate_browser_authority(|authority| {
+                authority.register_profile(magi_browser_runtime::BrowserProfile {
+                    profile_id: profile_id.clone(),
+                    kind: magi_browser_runtime::BrowserProfileKind::ManagedDefault,
+                    data_path: tempfile::tempdir()
+                        .expect("browser profile fixture should create")
+                        .keep(),
+                    created_at: now,
+                    updated_at: now,
+                })?;
+                authority.create_session(magi_browser_runtime::CreateBrowserSession {
+                    browser_session_id: browser_session_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    session_id: session_id.clone(),
+                    profile_id: profile_id.clone(),
+                    now,
+                })?;
+                authority.transition_session(
+                    &browser_session_id,
+                    magi_browser_runtime::BrowserSessionLifecycle::Ready,
+                    now,
+                )?;
+                authority.create_tab(magi_browser_runtime::CreateBrowserTab {
+                    tab_id: tab_id.clone(),
+                    browser_session_id: browser_session_id.clone(),
+                    url: "about:blank".to_string(),
+                    viewport: magi_browser_runtime::BrowserViewport::default(),
+                    now,
+                })?;
+                authority.transition_tab(
+                    &tab_id,
+                    magi_browser_runtime::BrowserTabLifecycle::Ready,
+                    now,
+                )?;
+                authority.acquire_lease(magi_browser_runtime::AcquireBrowserLease {
+                    lease_id: lease_id.clone(),
+                    profile_id: profile_id.clone(),
+                    browser_session_id,
+                    owner: ExecutionOwnership {
+                        session_id: Some(session_id.clone()),
+                        workspace_id: Some(workspace_id.clone()),
+                        task_id: Some(TaskId::new("task-resource-coordinator")),
+                        ..ExecutionOwnership::default()
+                    },
+                    turn_id: "turn-resource-coordinator".to_string(),
+                    goal_binding: None,
+                    acquired_at: now,
+                    expires_at: UtcMillis(1_000),
+                })?;
+                Ok(())
+            })
+            .expect("browser resource fixture should initialize");
+
+        let report = state.cancel_execution_resources(
+            Some(&session_id),
+            None,
+            None,
+            magi_browser_runtime::BrowserLeaseEndReason::GoalPaused,
+        );
+        assert_eq!(report.browser_lease_count, 1);
+        assert_eq!(report.total(), 1);
+        let authority = state
+            .browser_authority
+            .lock()
+            .expect("browser authority lock should not poison");
+        assert_eq!(
+            authority.lease(&lease_id).map(|lease| lease.lifecycle),
+            Some(magi_browser_runtime::BrowserLeaseLifecycle::Revoked)
+        );
+        assert_eq!(
+            authority
+                .lease(&lease_id)
+                .and_then(|lease| lease.end_reason),
+            Some(magi_browser_runtime::BrowserLeaseEndReason::GoalPaused)
+        );
     }
 
     #[tokio::test]

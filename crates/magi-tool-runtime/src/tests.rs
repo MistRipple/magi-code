@@ -140,6 +140,7 @@ fn file_read_accepts_host_path_ref_without_reconstructing_native_path() {
         },
         ToolExecutionContext {
             working_directory: Some(root.clone()),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &ToolExecutionPolicy::default(),
@@ -641,6 +642,7 @@ fn shell_exec_accepts_shell_program_with_arguments() {
         },
         ToolExecutionContext {
             working_directory: Some(workspace),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &full_access_policy(),
@@ -677,6 +679,7 @@ fn shell_exec_reports_unavailable_workspace_before_starting_shell() {
         },
         ToolExecutionContext {
             working_directory: Some(missing_workspace),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &full_access_policy(),
@@ -715,6 +718,7 @@ fn shell_exec_reclassifies_read_only_mode_with_write_redirection() {
         },
         ToolExecutionContext {
             working_directory: Some(root.clone()),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &ToolExecutionPolicy::default(),
@@ -809,6 +813,7 @@ fn shell_exec_rejects_writes_to_policy_read_only_paths_in_full_access() {
             },
             ToolExecutionContext {
                 working_directory: Some(root.clone()),
+                browser_capability_revision: None,
                 ..ToolExecutionContext::default()
             },
             &policy,
@@ -868,6 +873,7 @@ fn shell_exec_allows_reading_or_copying_from_policy_read_only_paths() {
         },
         ToolExecutionContext {
             working_directory: Some(workspace_dir.clone()),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &policy,
@@ -889,6 +895,7 @@ fn shell_exec_allows_reading_or_copying_from_policy_read_only_paths() {
         },
         ToolExecutionContext {
             working_directory: Some(workspace_dir),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &policy,
@@ -917,6 +924,7 @@ fn shell_exec_background_process_can_be_controlled_through_shell_surface() {
         session_id: Some(SessionId::new("session-shell-background-control")),
         workspace_id: Some(WorkspaceId::new("workspace-shell-background-control")),
         working_directory: Some(root),
+        browser_capability_revision: None,
         ..ToolExecutionContext::default()
     };
 
@@ -1031,6 +1039,7 @@ fn shell_exec_read_only_git_status_in_non_git_workspace_is_stable_probe() {
         session_id: Some(SessionId::new("session-shell-non-git")),
         workspace_id: Some(WorkspaceId::new("workspace-shell-non-git")),
         working_directory: Some(root.clone()),
+        browser_capability_revision: None,
         ..ToolExecutionContext::default()
     };
 
@@ -1070,6 +1079,7 @@ fn shell_exec_read_only_compound_git_status_in_non_git_workspace_is_stable_probe
         session_id: Some(SessionId::new("session-shell-compound-non-git")),
         workspace_id: Some(WorkspaceId::new("workspace-shell-compound-non-git")),
         working_directory: Some(root.clone()),
+        browser_capability_revision: None,
         ..ToolExecutionContext::default()
     };
     let command = format!(
@@ -1142,6 +1152,7 @@ fn shell_exec_records_git_worktree_changed_paths() {
         session_id: Some(SessionId::new("session-shell-change-capture")),
         workspace_id: Some(WorkspaceId::new("workspace-shell-change-capture")),
         working_directory: Some(root.clone()),
+        browser_capability_revision: None,
         ..ToolExecutionContext::default()
     };
 
@@ -1187,6 +1198,7 @@ fn shell_exec_records_non_git_filesystem_changed_paths() {
         session_id: Some(SessionId::new("session-shell-non-git-change")),
         workspace_id: Some(WorkspaceId::new("workspace-shell-non-git-change")),
         working_directory: Some(root.clone()),
+        browser_capability_revision: None,
         ..ToolExecutionContext::default()
     };
 
@@ -1229,6 +1241,7 @@ fn shell_exec_cancel_active_session_kills_running_command() {
         workspace_id: Some(WorkspaceId::new("workspace-shell-cancel")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
     let runner_registry = registry.clone();
     let runner_context = context.clone();
@@ -1282,6 +1295,7 @@ fn shell_exec_cancel_active_scope_requires_matching_workspace() {
         workspace_id: Some(WorkspaceId::new("workspace-shell-cancel-workspace-scope")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
     let runner_registry = registry.clone();
     let runner_context = context.clone();
@@ -1335,6 +1349,7 @@ fn session_cancellation_stops_background_processes_in_the_same_scope() {
         workspace_id: Some(WorkspaceId::new("workspace-background-cancel")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
     let launch = registry.execute_with_policy(
         ToolExecutionInput {
@@ -1463,6 +1478,7 @@ fn builtins_use_context_working_directory_for_relative_inputs() {
     tool_registry.register_default_builtins();
     let context = ToolExecutionContext {
         working_directory: Some(root.clone()),
+        browser_capability_revision: None,
         ..ToolExecutionContext::default()
     };
 
@@ -1550,6 +1566,7 @@ fn shell_exec_blocks_conflicting_write_scope_until_guard_drops() {
         workspace_id: Some(WorkspaceId::new("workspace-write")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
     let guarded_input = ToolExecutionInput {
         tool_call_id: ToolCallId::new("tool-call-shell-write-guard"),
@@ -1631,6 +1648,7 @@ fn write_guard_tracks_file_copy_destination_path() {
         workspace_id: Some(WorkspaceId::new("workspace-copy-guard")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
     let blocked_context = ToolExecutionContext {
         task_id: Some(TaskId::new("write-task")),
@@ -1706,6 +1724,7 @@ fn shell_exec_isolates_write_guards_by_workspace_and_session() {
         workspace_id: Some(WorkspaceId::new("workspace-a")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
     let other_context = ToolExecutionContext {
         worker_id: None,
@@ -1714,6 +1733,7 @@ fn shell_exec_isolates_write_guards_by_workspace_and_session() {
         workspace_id: Some(WorkspaceId::new("workspace-b")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
     let guarded_input = ToolExecutionInput {
         tool_call_id: ToolCallId::new("tool-call-shell-workdir-guard"),
@@ -1829,6 +1849,7 @@ fn process_launch_does_not_block_followup_shell_in_same_session() {
         workspace_id: Some(WorkspaceId::new("workspace-process-launch")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
 
     let launch = tool_registry.execute_internal_builtin_with_policy(
@@ -1931,6 +1952,7 @@ fn process_launch_spawn_failure_uses_public_error_message() {
         workspace_id: Some(WorkspaceId::new("workspace-process-spawn-error")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: Some(root.clone()),
+        browser_capability_revision: None,
     };
 
     let output = registry.execute_internal_builtin_with_policy(
@@ -1979,6 +2001,7 @@ fn process_write_failure_uses_public_error_message() {
         workspace_id: Some(WorkspaceId::new("workspace-process-write-error")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: Some(root.clone()),
+        browser_capability_revision: None,
     };
 
     let launch = registry.execute_internal_builtin_with_policy(
@@ -2070,6 +2093,7 @@ fn process_tools_reject_missing_session_or_workspace_context() {
         workspace_id: Some(WorkspaceId::new("workspace-process-context")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
     let launch = tool_registry.execute_internal_builtin_with_policy(
         ToolExecutionInput {
@@ -2140,6 +2164,7 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
         workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
     let workspace_only_context = ToolExecutionContext {
         worker_id: None,
@@ -2148,6 +2173,7 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
         workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
     let other_session_context = ToolExecutionContext {
         worker_id: None,
@@ -2156,6 +2182,7 @@ fn process_tools_do_not_cross_sessions_with_workspace_only_context() {
         workspace_id: Some(WorkspaceId::new("workspace-process-shared")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
 
     let launch = tool_registry.execute_internal_builtin_with_policy(
@@ -2340,6 +2367,7 @@ fn diff_preview_resolves_relative_paths_from_tool_working_directory() {
     let registry = make_registry();
     let context = ToolExecutionContext {
         working_directory: Some(root.clone()),
+        browser_capability_revision: None,
         ..ToolExecutionContext::default()
     };
 
@@ -2458,6 +2486,7 @@ fn governance_blocked_invocations_appear_in_summary_and_events() {
         workspace_id: Some(WorkspaceId::new("workspace-gov")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
 
     let ok_output = tool_registry.execute_with_policy(
@@ -2569,6 +2598,7 @@ fn path_level_write_protection_detects_overlapping_paths() {
         workspace_id: None,
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
     let input_a = ToolExecutionInput {
         tool_call_id: ToolCallId::new("tc-path-a"),
@@ -2597,6 +2627,7 @@ fn path_level_write_protection_detects_overlapping_paths() {
         workspace_id: None,
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
     let input_b = ToolExecutionInput {
         tool_call_id: ToolCallId::new("tc-path-b"),
@@ -2657,6 +2688,7 @@ fn summary_for_query_filters_by_context_fields() {
         workspace_id: Some(WorkspaceId::new("ws1")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
     let ctx_w2 = ToolExecutionContext {
         worker_id: Some(WorkerId::new("w2")),
@@ -2665,6 +2697,7 @@ fn summary_for_query_filters_by_context_fields() {
         workspace_id: Some(WorkspaceId::new("ws1")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
 
     // Execute 2 invocations in context w1
@@ -2877,6 +2910,7 @@ fn full_chain_invocations_events_summary_consistent() {
         workspace_id: Some(WorkspaceId::new("ws-chain")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
 
     // 1) Successful file read
@@ -3121,6 +3155,7 @@ fn registry_enforces_effective_read_only_profile_default_path_scope() {
         ),
         ToolExecutionContext {
             working_directory: Some(workspace),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &ToolExecutionPolicy {
@@ -3270,6 +3305,7 @@ fn structured_git_builtins_delegate_through_runtime_resource() {
         workspace_id: Some(WorkspaceId::new("workspace-git-builtin")),
         access_profile: magi_core::AccessProfile::FullAccess,
         working_directory: Some(PathBuf::from("/tmp/git-builtin")),
+        browser_capability_revision: None,
         ..ToolExecutionContext::default()
     };
 
@@ -3394,6 +3430,7 @@ fn registry_reclassifies_misdeclared_shell_without_blocking_full_access() {
         ),
         ToolExecutionContext {
             working_directory: Some(root.clone()),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &full_access_policy(),
@@ -3425,6 +3462,7 @@ fn registry_requires_approval_for_misdeclared_shell_in_restricted_access() {
         ),
         ToolExecutionContext {
             working_directory: Some(root.clone()),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &ToolExecutionPolicy::default(),
@@ -3481,6 +3519,7 @@ fn registry_rejects_background_shell_declared_read_only_in_read_only_access() {
                 "workspace-read-only-background",
             )),
             working_directory: Some(root.clone()),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &ToolExecutionPolicy {
@@ -3534,6 +3573,7 @@ fn registry_rejects_restricted_file_write_outside_workspace_root() {
     let registry = make_registry();
     let context = ToolExecutionContext {
         working_directory: Some(workspace.clone()),
+        browser_capability_revision: None,
         ..ToolExecutionContext::default()
     };
     let policy = ToolExecutionPolicy {
@@ -3593,6 +3633,7 @@ fn referenced_external_paths_are_readable_but_never_writable() {
     let registry = make_registry();
     let context = ToolExecutionContext {
         working_directory: Some(workspace.clone()),
+        browser_capability_revision: None,
         ..ToolExecutionContext::default()
     };
     let policy = ToolExecutionPolicy {
@@ -3650,6 +3691,7 @@ fn registry_rejects_outside_shell_path_before_approval() {
         ),
         ToolExecutionContext {
             working_directory: Some(workspace),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &ToolExecutionPolicy {
@@ -3687,6 +3729,7 @@ fn registry_applies_path_policy_to_code_symbols_path() {
         ),
         ToolExecutionContext {
             working_directory: Some(workspace),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &ToolExecutionPolicy {
@@ -3994,6 +4037,7 @@ fn apply_patch_tool_applies_patch_envelope_through_registry() {
         },
         ToolExecutionContext {
             working_directory: Some(root.clone()),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &ToolExecutionPolicy::default(),
@@ -4058,6 +4102,7 @@ fn file_remove_rejects_workspace_root_even_in_full_access() {
         &serde_json::json!({ "path": ".", "recursive": true }).to_string(),
         ToolExecutionContext {
             working_directory: Some(root.clone()),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         ToolExecutionPolicy {
@@ -4087,6 +4132,7 @@ fn file_remove_rejects_absolute_working_directory_even_in_full_access() {
         &serde_json::json!({ "path": root.to_string_lossy(), "recursive": true }).to_string(),
         ToolExecutionContext {
             working_directory: Some(root.clone()),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         ToolExecutionPolicy {
@@ -4115,6 +4161,7 @@ fn file_read_reports_missing_path_without_mislabeling_it_as_permission_failure()
         &serde_json::json!({ "path": "missing.txt" }).to_string(),
         ToolExecutionContext {
             working_directory: Some(root),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         ToolExecutionPolicy {
@@ -5167,6 +5214,15 @@ fn public_builtin_specs_exclude_shell_internal_process_tools() {
             "diff_preview",
             "web_search",
             "web_fetch",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_press",
+            "browser_scroll",
+            "browser_screenshot",
+            "browser_tabs",
+            "browser_viewport",
             "diagram_render",
             "image_generate",
             "knowledge_query",
@@ -5224,6 +5280,37 @@ fn public_builtin_specs_exclude_shell_internal_process_tools() {
                 .all(|spec| spec.name != internal_tool.as_str())
         );
     }
+}
+
+#[test]
+fn browser_tools_do_not_depend_on_workspace_access_permissions() {
+    for tool in [
+        BuiltinToolName::BrowserNavigate,
+        BuiltinToolName::BrowserSnapshot,
+        BuiltinToolName::BrowserClick,
+        BuiltinToolName::BrowserType,
+        BuiltinToolName::BrowserPress,
+        BuiltinToolName::BrowserScroll,
+        BuiltinToolName::BrowserScreenshot,
+        BuiltinToolName::BrowserTabs,
+        BuiltinToolName::BrowserViewport,
+    ] {
+        assert_eq!(tool.default_access_mode(), BuiltinToolAccessMode::ReadOnly);
+        assert!(!tool.is_access_profile_write_operation());
+        assert_eq!(
+            tool.default_approval_requirement(),
+            ApprovalRequirement::None
+        );
+    }
+}
+
+#[test]
+fn browser_viewport_exposes_only_wide_and_narrow_device_semantics() {
+    let schema = BuiltinToolName::BrowserViewport.parameters_schema();
+    assert_eq!(
+        schema["properties"]["device_type"]["enum"],
+        serde_json::json!(["desktop", "mobile"])
+    );
 }
 
 #[test]
@@ -5718,6 +5805,7 @@ fn registry_rejects_internal_process_tools_as_public_builtin_calls() {
         workspace_id: Some(WorkspaceId::new("workspace-internal-process")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
 
     for (tool_name, input) in [
@@ -5775,6 +5863,7 @@ fn shell_exec_background_keeps_shell_public_payload() {
         workspace_id: Some(WorkspaceId::new("workspace-shell-background")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
 
     let output = registry.execute_with_policy(
@@ -5813,6 +5902,7 @@ fn file_write_execution_respects_active_write_guard() {
         workspace_id: Some(WorkspaceId::new("workspace-file-write-guard")),
         access_profile: magi_core::AccessProfile::Restricted,
         working_directory: None,
+        browser_capability_revision: None,
     };
     let held_input = ToolExecutionInput {
         tool_call_id: ToolCallId::new("tool-call-file-write-held"),
@@ -5955,6 +6045,7 @@ fn search_semantic_uses_workspace_local_index() {
     let context = ToolExecutionContext {
         workspace_id: Some(workspace_id),
         working_directory: Some(root.clone()),
+        browser_capability_revision: None,
         ..ToolExecutionContext::default()
     };
 
@@ -6027,6 +6118,7 @@ fn search_semantic_lazily_builds_missing_workspace_index() {
         ToolExecutionContext {
             workspace_id: Some(workspace_id.clone()),
             working_directory: Some(root.clone()),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &ToolExecutionPolicy::default(),
@@ -6067,6 +6159,7 @@ fn search_semantic_returns_empty_success_for_empty_workspace() {
         ToolExecutionContext {
             workspace_id: Some(workspace_id.clone()),
             working_directory: Some(root.clone()),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &ToolExecutionPolicy::default(),
@@ -6340,6 +6433,7 @@ fn search_semantic_uses_context_workspace_when_multiple_indexes_are_ready() {
         ToolExecutionContext {
             workspace_id: Some(workspace_a),
             working_directory: Some(root_a.clone()),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &ToolExecutionPolicy::default(),
@@ -6374,6 +6468,7 @@ fn search_semantic_uses_context_workspace_when_multiple_indexes_are_ready() {
         ToolExecutionContext {
             workspace_id: Some(workspace_b),
             working_directory: Some(root_b.clone()),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &ToolExecutionPolicy::default(),
@@ -6422,6 +6517,7 @@ fn search_semantic_does_not_fallback_to_text_scan() {
     let context = ToolExecutionContext {
         workspace_id: Some(workspace_id),
         working_directory: Some(root.clone()),
+        browser_capability_revision: None,
         ..ToolExecutionContext::default()
     };
 
@@ -6476,6 +6572,7 @@ fn code_symbols_definition_and_file_symbols() {
     let context = ToolExecutionContext {
         workspace_id: Some(workspace_id),
         working_directory: Some(root.clone()),
+        browser_capability_revision: None,
         ..ToolExecutionContext::default()
     };
 
@@ -6687,6 +6784,7 @@ fn image_generate_writes_provider_bytes_to_workspace_without_persisting_base64()
             session_id: Some(magi_core::SessionId::new("session-image-generate")),
             workspace_id: Some(magi_core::WorkspaceId::new("workspace-image-generate")),
             working_directory: Some(root.clone()),
+            browser_capability_revision: None,
             access_profile: magi_core::AccessProfile::FullAccess,
             ..ToolExecutionContext::default()
         },
@@ -6731,6 +6829,7 @@ fn image_generate_is_unavailable_in_read_only_access_profile() {
         ),
         ToolExecutionContext {
             working_directory: Some(root.clone()),
+            browser_capability_revision: None,
             ..ToolExecutionContext::default()
         },
         &ToolExecutionPolicy {
@@ -6761,6 +6860,7 @@ fn image_generate_rejects_unconfigured_runtime_before_provider_call() {
     registry.register_default_builtins();
     let context = ToolExecutionContext {
         working_directory: Some(root.clone()),
+        browser_capability_revision: None,
         access_profile: magi_core::AccessProfile::FullAccess,
         ..ToolExecutionContext::default()
     };
@@ -6821,6 +6921,7 @@ fn image_generate_rejects_workspace_escape_before_calling_provider() {
         ),
         ToolExecutionContext {
             working_directory: Some(root.clone()),
+            browser_capability_revision: None,
             access_profile: magi_core::AccessProfile::FullAccess,
             ..ToolExecutionContext::default()
         },
@@ -6859,6 +6960,7 @@ fn image_generate_normalizes_extension_and_avoids_overwriting_existing_image() {
     registry.register_default_builtins();
     let context = ToolExecutionContext {
         working_directory: Some(root.clone()),
+        browser_capability_revision: None,
         access_profile: magi_core::AccessProfile::FullAccess,
         ..ToolExecutionContext::default()
     };

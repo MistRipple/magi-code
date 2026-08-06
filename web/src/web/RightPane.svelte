@@ -4,8 +4,15 @@
   import MarkdownContent from '../components/MarkdownContent.svelte';
   import DiffCodeBlock from '../components/blocks/DiffCodeBlock.svelte';
   import AgentTabContent from '../components/tabs/AgentTabContent.svelte';
+  import BrowserTabContent from '../components/tabs/BrowserTabContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { highlightCode } from '../lib/code-highlighter';
+  import {
+    OPEN_URL_IN_BROWSER_EVENT,
+    type OpenUrlInBrowserRequest,
+  } from '../lib/browser-navigation';
+  import { normalizeExternalWebUrl } from '../lib/external-link';
+  import { addToast } from '../stores/messages.svelte';
   import {
     isHtmlFile,
     isKnownBinaryFile,
@@ -13,23 +20,30 @@
     isWordFile,
     isImageFile,
   } from '../lib/file-preview-utils';
-  import { vscode } from '../lib/vscode-bridge';
   import {
     rightPaneState,
     getRightPaneState,
     closeTab,
     setActiveRightPaneTab,
+    updateRightPaneTabLabel,
     setRightPaneCollapsed,
     type RightPaneTab,
     type CodeTabPayload,
     type AgentTabPayload,
+    type BrowserTabPayload,
+    openBrowserTab,
   } from '../stores/right-pane.svelte';
   import {
+    activateBrowserTab,
+    closeBrowserTab,
+    createBrowserSession,
+    createBrowserTab,
+    getBrowserCapabilities,
     getAgentChangeDiff,
     getAgentFilePreview,
-    agentNavigationUrl,
     agentUrl,
     buildFilePreviewQuery,
+    type BrowserCapabilitiesSnapshot,
   } from './agent-api';
 
   interface Props {
@@ -46,6 +60,127 @@
 
   function closePane(): void {
     setRightPaneCollapsed(paneScopeKey, true);
+  }
+  let creatingBrowserPane = $state(false);
+  let browserUiEnabled = $state(false);
+  let addPaneMenuOpen = $state(false);
+  let addPaneMenuElement = $state<HTMLDivElement | undefined>(undefined);
+  const canCreateBrowserPane = $derived(Boolean(
+    browserUiEnabled
+      && rightPaneState.activeWorkspaceId.trim()
+      && rightPaneState.activeSessionId.trim(),
+  ));
+
+  function applyBrowserCapabilities(snapshot: BrowserCapabilitiesSnapshot): void {
+    browserUiEnabled = snapshot.inAppBrowserEnabled;
+  }
+
+  onMount(() => {
+    void getBrowserCapabilities()
+      .then(applyBrowserCapabilities)
+      .catch((error) => console.warn('[RightPane] 获取浏览器能力失败:', error));
+    const handleCapabilitiesChanged = (event: Event) => {
+      applyBrowserCapabilities((event as CustomEvent<BrowserCapabilitiesSnapshot>).detail);
+    };
+    window.addEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
+    const handleOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (addPaneMenuElement && target instanceof Node && !addPaneMenuElement.contains(target)) {
+        addPaneMenuOpen = false;
+      }
+    };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') addPaneMenuOpen = false;
+    };
+    const handleOpenUrlInBrowser = (event: Event) => {
+      const request = (event as CustomEvent<OpenUrlInBrowserRequest>).detail;
+      if (!request?.url) return;
+      void createBrowserPane(request.url);
+    };
+    window.addEventListener('pointerdown', handleOutsidePointer);
+    window.addEventListener('keydown', handleEscape);
+    window.addEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
+    return () => {
+      window.removeEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
+      window.removeEventListener('pointerdown', handleOutsidePointer);
+      window.removeEventListener('keydown', handleEscape);
+      window.removeEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
+    };
+  });
+
+  async function closeBrowserPanelResource(tabId: string): Promise<void> {
+    try {
+      await closeBrowserTab(tabId);
+    } catch (error) {
+      console.warn('[RightPane] 关闭浏览器面板资源失败:', error);
+    }
+  }
+
+  function registerBrowserPane(
+    browserSessionId: string,
+    tabId: string,
+    workspaceId: string,
+    sessionId: string,
+    workspacePath?: string,
+  ): void {
+    openBrowserTab(browserSessionId, tabId, {
+      workspaceId,
+      workspacePath,
+      sessionId,
+      label: i18n.t('browser.tab.new'),
+    });
+  }
+
+  async function createBrowserPane(initialUrl = 'about:blank'): Promise<void> {
+    if (creatingBrowserPane) return;
+    if (!canCreateBrowserPane) {
+      addToast('warning', i18n.t('browser.error.internalUnavailable'), undefined, { forceVisible: true });
+      return;
+    }
+    const targetUrl = initialUrl === 'about:blank'
+      ? initialUrl
+      : normalizeExternalWebUrl(initialUrl);
+    if (!targetUrl) return;
+    const workspaceId = rightPaneState.activeWorkspaceId.trim();
+    const sessionId = rightPaneState.activeSessionId.trim();
+    creatingBrowserPane = true;
+    try {
+      const browserSession = await createBrowserSession(workspaceId, sessionId);
+      const tab = await createBrowserTab(browserSession.browserSessionId, targetUrl);
+      await activateBrowserTab(tab.tabId);
+      registerBrowserPane(
+        browserSession.browserSessionId,
+        tab.tabId,
+        workspaceId,
+        sessionId,
+        workspaceRoot,
+      );
+    } catch (error) {
+      console.warn('[RightPane] 新建浏览器面板失败:', error);
+      addToast('error', i18n.t('browser.error.openInternal'), undefined, { forceVisible: true });
+    } finally {
+      creatingBrowserPane = false;
+    }
+  }
+
+  type RightPaneCreationKind = 'browser';
+  const addablePaneKinds = $derived([
+    {
+      kind: 'browser' as const,
+      label: i18n.t('rightPane.addPanelBrowser'),
+      icon: 'globe' as const,
+      enabled: canCreateBrowserPane,
+    },
+  ]);
+
+  function toggleAddPaneMenu(): void {
+    if (!canCreateBrowserPane || creatingBrowserPane) return;
+    addPaneMenuOpen = !addPaneMenuOpen;
+  }
+
+  function chooseAddPane(kind: RightPaneCreationKind): void {
+    addPaneMenuOpen = false;
+    if (kind === 'browser') void createBrowserPane();
   }
   const activeTab = $derived.by<RightPaneTab | null>(() => {
     if (!paneState.activeTabId) return null;
@@ -72,8 +207,6 @@
   let fetchDiffErrors = $state<Record<string, string>>({});
   /** 每个文档 Tab 独立保存预览/源码模式，避免切换 Tab 时相互污染。 */
   let documentModes = $state<Record<string, 'rendered' | 'raw'>>({});
-  /** HTML iframe 刷新序号，仅重载当前 Tab。 */
-  let htmlPreviewRevisions = $state<Record<string, number>>({});
   let previewRequestSeq = 0;
   const contentRequestSeqByKey = new Map<string, number>();
   const diffRequestSeqByKey = new Map<string, number>();
@@ -145,7 +278,7 @@
     });
   });
 
-  // 右栏 tab 有上限，异步内容缓存也必须跟随当前 tab 集合裁剪，避免长期预览不同文件后常驻增长。
+  // 异步内容缓存跟随当前 Tab 集合裁剪，关闭预览后立即释放对应内容。
   $effect(() => {
     const retainedKeys = new Set<string>();
     for (const tab of openTabs) {
@@ -166,7 +299,6 @@
     fetchDiffErrors = pruneRecord(fetchDiffErrors, retainedKeys);
     fetchingDiffFlags = pruneRecord(fetchingDiffFlags, retainedKeys);
     documentModes = pruneRecord(documentModes, retainedKeys);
-    htmlPreviewRevisions = pruneRecord(htmlPreviewRevisions, retainedKeys);
   });
 
   /**
@@ -332,6 +464,10 @@
   const documentFile = $derived(markdownFile || htmlFile);
   const wordFile = $derived(isWordFile(activeDisplayFilePath));
   const imageFile = $derived(activeDisplayFilePath ? isImageFile(activeDisplayFilePath) : false);
+  const imageSource = $derived(
+    activeCodePayload?.imageDataUrl?.trim()
+      || agentUrl('/api/files/raw', activeFilePreviewQuery),
+  );
   // 图片虽属二进制，但走专门的 <img> 预览分支，故从 binaryFile（元信息兜底）排除。
   const binaryFile = $derived(
     !imageFile
@@ -417,9 +553,10 @@
     (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
   }
 
-  // ============ Markdown / HTML 预览与源码切换 ============
+  // ============ Markdown 预览与源码切换 ============
   const documentMode = $derived.by<'rendered' | 'raw'>(() => {
     if (!activeContentCacheKey) return 'rendered';
+    if (htmlFile) return 'raw';
     return documentModes[activeContentCacheKey] ?? 'rendered';
   });
   function setDocumentMode(mode: 'rendered' | 'raw'): void {
@@ -427,25 +564,29 @@
     documentModes = { ...documentModes, [activeContentCacheKey]: mode };
   }
 
-  const htmlPreviewUrl = $derived.by(() => {
-    if (!htmlFile || !activeFilePreviewQuery) return '';
-    const url = new URL(agentNavigationUrl('/api/files/site-open', activeFilePreviewQuery));
-    const revision = activeContentCacheKey ? (htmlPreviewRevisions[activeContentCacheKey] ?? 0) : 0;
-    url.searchParams.set('_previewRevision', String(revision));
-    return url.toString();
-  });
-
-  function refreshHtmlPreview(): void {
-    if (!activeContentCacheKey) return;
-    htmlPreviewRevisions = {
-      ...htmlPreviewRevisions,
-      [activeContentCacheKey]: (htmlPreviewRevisions[activeContentCacheKey] ?? 0) + 1,
-    };
-  }
-
-  function openHtmlInBrowser(): void {
-    if (!htmlPreviewUrl) return;
-    vscode.postMessage({ type: 'openLink', url: htmlPreviewUrl });
+  let openingHtmlInBrowser = $state(false);
+  async function openHtmlInMagiBrowser(): Promise<void> {
+    const workspaceId = activeCodePayload?.workspaceId?.trim() || '';
+    const sessionId = activeCodePayload?.sessionId?.trim() || '';
+    if (!htmlFile || !activeFilePreviewQuery || !workspaceId || !sessionId || openingHtmlInBrowser) return;
+    openingHtmlInBrowser = true;
+    try {
+      const browserSession = await createBrowserSession(workspaceId, sessionId);
+      const tab = await createBrowserTab(
+        browserSession.browserSessionId,
+        agentUrl('/api/files/site-open', activeFilePreviewQuery),
+      );
+      await activateBrowserTab(tab.tabId);
+      registerBrowserPane(
+        browserSession.browserSessionId,
+        tab.tabId,
+        workspaceId,
+        sessionId,
+        activeCodePayload?.workspacePath,
+      );
+    } finally {
+      openingHtmlInBrowser = false;
+    }
   }
   const rawPreviewContent = $derived(previewContent ?? '');
   const truncatedContent = $derived(
@@ -480,10 +621,6 @@
       && !largeTextFile && !symlinkFile && !specialFile
       && (hasDiff || (hasContent && (!documentFile || documentMode === 'raw'))),
   );
-  const htmlPreviewMode = $derived(
-    htmlFile && documentMode === 'rendered' && !previewLoading && !previewError
-      && !hasDiff && !wordFile && !binaryFile && !largeTextFile && !symlinkFile && !specialFile,
-  );
 
   // ============ Tab 视觉 ============
   // 代理 tab 的 label / accentToken 由 ToolCall 触发 openAgentTab 时一次性写入；
@@ -512,14 +649,18 @@
     return tab.label;
   }
 
-  function tabIcon(tab: RightPaneTab): 'file-text' | 'chevron-right' {
-    return tab.kind === 'code' ? 'file-text' : 'chevron-right';
+  function tabIcon(tab: RightPaneTab): 'file-text' | 'chevron-right' | 'globe' {
+    if (tab.kind === 'code') return 'file-text';
+    return tab.kind === 'browser' ? 'globe' : 'chevron-right';
   }
 
   function tabTooltip(tab: RightPaneTab): string {
     if (tab.kind === 'code') {
       const payload = tab.payload as CodeTabPayload;
       return payload.displayPath || payload.filepath;
+    }
+    if (tab.kind === 'browser') {
+      return (tab.payload as BrowserTabPayload).browserSessionId;
     }
     return tabLabel(tab);
   }
@@ -545,12 +686,23 @@
   function handleTabClick(tabId: string) {
     if (recentlyDragged()) return;
     setActiveRightPaneTab(paneScopeKey, tabId);
+    const tab = openTabs.find((item) => item.id === tabId);
+    if (tab?.kind === 'browser') {
+      void activateBrowserTab((tab.payload as BrowserTabPayload).tabId).catch((error) => {
+        console.warn('[RightPane] 激活浏览器面板失败:', error);
+      });
+    }
   }
 
   function handleTabClose(event: MouseEvent, tabId: string) {
     event.stopPropagation();
     if (recentlyDragged()) return;
+    const tab = openTabs.find((item) => item.id === tabId);
     closeTab(paneScopeKey, tabId);
+    if (tab?.kind === 'browser') {
+      const browserTabId = (tab.payload as BrowserTabPayload).tabId;
+      void closeBrowserPanelResource(browserTabId);
+    }
   }
 
   /**
@@ -664,6 +816,7 @@
           class="right-pane-tab"
           class:active={isActive}
           role="tab"
+          data-tab-id={tab.id}
           tabindex="0"
           aria-selected={isActive}
           style={`--tab-accent: ${accent};`}
@@ -686,6 +839,40 @@
         </div>
       {/each}
     </div>
+    {#if browserUiEnabled}
+      <div bind:this={addPaneMenuElement} class="right-pane-add-wrap">
+        <button
+          type="button"
+          class="right-pane-add-tab"
+          data-open-tab-count={openTabs.length}
+          onclick={toggleAddPaneMenu}
+          disabled={!canCreateBrowserPane || creatingBrowserPane}
+          title={i18n.t('rightPane.addPanel')}
+          aria-label={i18n.t('rightPane.addPanel')}
+          aria-haspopup="menu"
+          aria-expanded={addPaneMenuOpen}
+          aria-busy={creatingBrowserPane}
+        >
+          <Icon name={creatingBrowserPane ? 'loader' : 'plus'} size={14} />
+        </button>
+        {#if addPaneMenuOpen}
+          <div class="right-pane-add-menu" role="menu" aria-label={i18n.t('rightPane.addPanel')}>
+            {#each addablePaneKinds as item (item.kind)}
+              <button
+                type="button"
+                class="right-pane-add-menu-item"
+                role="menuitem"
+                disabled={!item.enabled}
+                onclick={() => chooseAddPane(item.kind)}
+              >
+                <Icon name={item.icon} size={14} />
+                <span>{item.label}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
   </header>
 
   <!-- 当前 code tab 的副标题：路径 + 文档预览操作 -->
@@ -694,36 +881,30 @@
       <div class="right-pane-path" title={activeDisplayFilePath}>{displayPath}</div>
       {#if documentFile && !hasDiff && !previewLoading && !previewError && !wordFile && !binaryFile && !largeTextFile && !symlinkFile && !specialFile && (htmlFile || hasContent)}
         <div class="right-pane-document-actions">
-          <div class="right-pane-document-modes" role="tablist" aria-label={i18n.t('web.filePreviewTitle')}>
-            <button
-              type="button"
-              class="right-pane-document-mode"
-              class:active={documentMode === 'rendered'}
-              onclick={() => setDocumentMode('rendered')}
-            >{i18n.t('web.filePreviewRendered')}</button>
-            <button
-              type="button"
-              class="right-pane-document-mode"
-              class:active={documentMode === 'raw'}
-              onclick={() => setDocumentMode('raw')}
-            >{i18n.t('web.filePreviewRaw')}</button>
-          </div>
-          {#if htmlFile}
-            <span class="right-pane-document-action-divider" aria-hidden="true"></span>
-            <button
-              type="button"
-              class="right-pane-document-icon-action"
-              onclick={refreshHtmlPreview}
-              title={i18n.t('web.filePreviewRefresh')}
-              aria-label={i18n.t('web.filePreviewRefresh')}
-            ><Icon name="refresh" size={13} /></button>
+          {#if markdownFile}
+            <div class="right-pane-document-modes" role="tablist" aria-label={i18n.t('web.filePreviewTitle')}>
+              <button
+                type="button"
+                class="right-pane-document-mode"
+                class:active={documentMode === 'rendered'}
+                onclick={() => setDocumentMode('rendered')}
+              >{i18n.t('web.filePreviewRendered')}</button>
+              <button
+                type="button"
+                class="right-pane-document-mode"
+                class:active={documentMode === 'raw'}
+                onclick={() => setDocumentMode('raw')}
+              >{i18n.t('web.filePreviewRaw')}</button>
+            </div>
+          {:else if htmlFile}
             <button
               type="button"
               class="right-pane-document-icon-action"
-              onclick={openHtmlInBrowser}
+              onclick={() => void openHtmlInMagiBrowser()}
+              disabled={openingHtmlInBrowser}
               title={i18n.t('web.filePreviewOpenBrowser')}
               aria-label={i18n.t('web.filePreviewOpenBrowser')}
-            ><Icon name="external-link" size={13} /></button>
+            ><Icon name="globe" size={13} /></button>
           {/if}
         </div>
       {/if}
@@ -734,7 +915,7 @@
   <div
     class="right-pane-body"
     class:right-pane-body--code={codeMode}
-    class:right-pane-body--html={htmlPreviewMode}
+    class:right-pane-body--browser={activeTab?.kind === 'browser'}
   >
     {#if !activeTab}
       <div class="right-pane-state">
@@ -749,6 +930,13 @@
         workspaceId={agentPayload.workspaceId}
         workspacePath={agentPayload.workspacePath}
         sessionId={agentPayload.sessionId}
+      />
+    {:else if activeTab.kind === 'browser'}
+      {@const browserPayload = activeTab.payload as BrowserTabPayload}
+      <BrowserTabContent
+        browserSessionId={browserPayload.browserSessionId}
+        tabId={browserPayload.tabId}
+        onTitleChange={(label) => updateRightPaneTabLabel(paneScopeKey, activeTab.id, label)}
       />
     {:else if previewLoading}
       <div class="right-pane-state">{i18n.t('web.filePreviewLoading')}</div>
@@ -777,7 +965,7 @@
         >
           <img
             class="right-pane-image-el"
-            src={agentUrl('/api/files/raw', activeFilePreviewQuery)}
+            src={imageSource}
             alt={displayPath}
             draggable="false"
             style={`transform: translate(${imagePanX}px, ${imagePanY}px) scale(${imageZoom});`}
@@ -841,13 +1029,6 @@
           fill={true}
         />
       </div>
-    {:else if htmlPreviewMode}
-      <iframe
-        class="right-pane-html-preview"
-        src={htmlPreviewUrl}
-        title={displayPath}
-        sandbox="allow-scripts allow-forms allow-modals"
-      ></iframe>
     {:else if !hasContent}
       <div class="right-pane-state">{i18n.t('edits.preview.empty')}</div>
     {:else}
@@ -897,6 +1078,7 @@
 
   /* ============ Tab 条 ============ */
   .right-pane-tabbar {
+    position: relative;
     display: flex;
     align-items: stretch;
     height: 38px;
@@ -923,6 +1105,88 @@
   .right-pane-tabbar--overlay {
     gap: 4px;
     padding: 0 6px;
+  }
+
+  .right-pane-add-tab {
+    flex: 0 0 auto;
+    align-self: center;
+    width: 28px;
+    height: 28px;
+    margin: 0 4px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+
+  .right-pane-add-wrap {
+    position: relative;
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+  }
+
+  .right-pane-add-menu {
+    position: absolute;
+    z-index: 20;
+    top: calc(100% + 4px);
+    right: 4px;
+    min-width: 168px;
+    padding: 4px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--dropdown-bg);
+    box-shadow: var(--shadow-lg);
+  }
+
+  .right-pane-add-menu-item {
+    width: 100%;
+    min-height: 32px;
+    padding: 0 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground);
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .right-pane-add-menu-item:hover:not(:disabled),
+  .right-pane-add-menu-item:focus-visible {
+    background: var(--surface-hover);
+  }
+
+  .right-pane-add-menu-item:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  .right-pane-add-tab:hover:not(:disabled),
+  .right-pane-add-tab:focus-visible {
+    background: var(--surface-hover);
+    color: var(--foreground);
+  }
+
+  .right-pane-add-tab:disabled {
+    cursor: default;
+    opacity: 0.4;
+  }
+
+  .right-pane-add-tab[aria-busy='true'] :global(svg) {
+    animation: right-pane-spin 0.8s linear infinite;
+  }
+
+  @keyframes right-pane-spin {
+    to { transform: rotate(360deg); }
   }
 
   .right-pane-overlay-action {
@@ -1081,13 +1345,6 @@
     color: var(--foreground);
   }
 
-  .right-pane-document-action-divider {
-    width: 1px;
-    height: 14px;
-    margin: 0 4px;
-    background: var(--border);
-  }
-
   .right-pane-document-icon-action {
     display: inline-flex;
     align-items: center;
@@ -1123,18 +1380,9 @@
     padding: 0;
   }
 
-  .right-pane-body--html {
+  .right-pane-body--browser {
     overflow: hidden;
     padding: 0;
-    background: #fff;
-  }
-
-  .right-pane-html-preview {
-    display: block;
-    width: 100%;
-    height: 100%;
-    border: 0;
-    background: #fff;
   }
 
   .right-pane-source {

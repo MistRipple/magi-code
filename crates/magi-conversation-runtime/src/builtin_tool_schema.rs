@@ -2,7 +2,7 @@ use magi_agent_role::AgentRoleRegistry;
 use magi_bridge_client::{ChatToolDefinition, ChatToolFunctionDefinition, ChatToolOrigin};
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry, is_internal_builtin_tool_surface};
 
-fn public_builtin_tool_definition(name: &str) -> Option<ChatToolDefinition> {
+pub(crate) fn public_builtin_tool_definition(name: &str) -> Option<ChatToolDefinition> {
     let tool_name = BuiltinToolName::from_name(name)?;
     if !tool_name.is_public_tool_surface() {
         return None;

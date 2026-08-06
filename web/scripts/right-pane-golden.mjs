@@ -16,14 +16,280 @@ await withGoldenViteServer(async (server) => {
     new URL('../src/web/RightPane.svelte', import.meta.url),
     'utf8',
   );
+  const browserPaneSource = await readFile(
+    new URL('../src/components/tabs/BrowserTabContent.svelte', import.meta.url),
+    'utf8',
+  );
+  const markdownLinkSource = await readFile(
+    new URL('../src/components/renderers/MdLink.svelte', import.meta.url),
+    'utf8',
+  );
+  assert.doesNotMatch(rightPaneSource, /<iframe\b/, 'HTML preview must not retain the old iframe path');
+  assert.match(rightPaneSource, /createBrowserTab\(/);
+  assert.match(rightPaneSource, /agentUrl\('\/api\/files\/site-open'/);
+  assert.match(rightPaneSource, /openHtmlInMagiBrowser/);
+  assert.match(rightPaneSource, /class="right-pane-add-tab"/);
+  assert.match(rightPaneSource, /class="right-pane-add-menu"/);
+  assert.match(rightPaneSource, /addablePaneKinds/);
+  assert.match(rightPaneSource, /rightPane\.addPanelBrowser/);
+  assert.doesNotMatch(
+    rightPaneSource,
+    /onclick=\{\(\) => void createBrowserPane\(\)\}/,
+    'the top-level add button must open the extensible pane chooser',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /setBrowserUserControl|toggleControl|control-button/,
+    'browser control ownership must be automatic rather than a user-facing mode switch',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /class="browser-tabs"/,
+    'a browser pane must not render a nested browser tab strip',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /class="browser-status"/,
+    'browser connection state must stay in the toolbar instead of consuming a separate row',
+  );
+  assert.match(
+    browserPaneSource,
+    /<form class="address-form"[\s\S]*?<button type="submit" class="address-submit"/,
+    'browser address navigation must expose an explicit submit control while retaining Enter submission',
+  );
+  assert.match(
+    browserPaneSource,
+    /onkeydown=\{\(event\) => \{[\s\S]*?event\.key !== 'Enter'[\s\S]*?navigate\('url'\)/,
+    'browser address navigation must handle Enter without relying on implicit form submission',
+  );
+  assert.match(
+    browserPaneSource,
+    /async function refreshSession\(initialLoad = false\)[\s\S]*?if \(initialLoad\) loading = true;/,
+    'background authority polling must not project as a foreground loading state',
+  );
+  assert.match(
+    browserPaneSource,
+    /nextSnapshot\.lifecycle !== 'ready' \|\| nextTab\?\.lifecycle !== 'ready'[\s\S]*?disconnectChannel\(\)/,
+    'the frame channel must only exist while both session and tab authority are ready',
+  );
+  assert.match(
+    browserPaneSource,
+    /canvas\.width = image\.width;[\s\S]*?canvas\.height = image\.height;/,
+    'the canvas backing store must preserve the encoded high-DPI frame dimensions',
+  );
+  assert.match(
+    browserPaneSource,
+    /queuedFrame = \{ bytes, metadata \};[\s\S]*?if \(!frameDecoderActive\) void drainFrameQueue/,
+    'high-DPI frame decoding must coalesce pending frames instead of creating parallel decoders',
+  );
+  assert.match(
+    browserPaneSource,
+    /while \(generation === frameDecoderGeneration\)[\s\S]*?const frame = queuedFrame;[\s\S]*?queuedFrame = null;/,
+    'the frame decoder must consume only the latest queued frame for the active channel generation',
+  );
+  assert.match(
+    browserPaneSource,
+    /const scale = Math\.min\(\s*1,/,
+    'a stale browser frame must never be enlarged beyond its native CSS viewport',
+  );
+  assert.match(
+    browserPaneSource,
+    /document\.visibilityState === 'visible' && document\.hasFocus\(\)/,
+    'only the foreground Magi window may control a shared BrowserTab viewport',
+  );
+  assert.match(
+    browserPaneSource,
+    /controllerId: viewportControllerId,[\s\S]*?claim,/,
+    'panel viewport sync must carry a stable controller identity and explicit takeover flag',
+  );
+  assert.match(
+    browserPaneSource,
+    /magi:browserViewportControllerClaim/,
+    'manual panel resizing must reclaim the single viewport writer',
+  );
+  assert.match(
+    browserPaneSource,
+    /window\.addEventListener\('focus', reclaimViewportControl\)[\s\S]*?document\.addEventListener\('visibilitychange', reclaimViewportControl\)/,
+    'a Magi window must reclaim its BrowserTab viewport when it becomes active',
+  );
+  assert.match(
+    browserPaneSource,
+    /Math\.min\(frame\.width,[\s\S]*?frame\.width \/ rect\.width/,
+    'browser input coordinates must remain in CSS viewport units when the canvas backing store is high-DPI',
+  );
+  assert.match(
+    browserPaneSource,
+    /const VIEWPORT_DEVICE_MODES = \[[\s\S]*?id: 'wide'[\s\S]*?id: 'narrow'/,
+    'browser device emulation must expose only wide and narrow modes',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /id: 'laptop'|id: 'tablet'|viewport-custom-apply|applyCustomViewport/,
+    'viewport controls must not retain redundant device presets or a manual apply path',
+  );
+  assert.match(
+    browserPaneSource,
+    /CUSTOM_VIEWPORT_DEBOUNCE_MILLIS[\s\S]*?oninput=\{scheduleCustomViewportUpdate\}/,
+    'custom viewport dimensions must update dynamically through one debounced path',
+  );
+  assert.match(
+    browserPaneSource,
+    /function deviceTypeForWidth\(width: number\)[\s\S]*?width <= 600 \? 'mobile' : 'desktop'[\s\S]*?customViewportDeviceType = deviceType/,
+    'custom viewport width must determine the canonical wide or narrow device mode',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /annotations: candidate\.annotations\.map[\s\S]*?status: 'stale'/,
+    'resizing the browser pane must not invalidate annotations on the same document',
+  );
+  assert.match(
+    browserPaneSource,
+    /function selectSavedAnnotation[\s\S]*?magi:browserAnnotationCreated[\s\S]*?onclick=\{\(\) => selectSavedAnnotation\(annotation\)\}/,
+    'clicking a saved annotation must select it for the composer instead of silently resolving it',
+  );
+  assert.match(
+    browserPaneSource,
+    /\.browser-viewport\.marking \.annotation-marker \{ pointer-events: none; \}/,
+    'saved annotations must not intercept region selection while annotation mode is active',
+  );
+  assert.match(
+    markdownLinkSource,
+    /requestOpenUrlInBrowser\(webTarget\)/,
+    'conversation web links must prefer the built-in browser',
+  );
+  assert.match(
+    markdownLinkSource,
+    /handleOpenExternal[\s\S]*?openExternalWebUrl\(webTarget\)/,
+    'conversation web links must retain an explicit external-browser action',
+  );
+  assert.match(markdownLinkSource, /class="md-link-external"[\s\S]*?onclick=\{handleOpenExternal\}/);
   assert.match(
     rightPaneSource,
-    /sandbox="allow-scripts allow-forms allow-modals"/,
-    'HTML preview must stay in a sandbox without allow-same-origin',
+    /OPEN_URL_IN_BROWSER_EVENT[\s\S]*?createBrowserPane\(request\.url\)/,
+    'built-in link navigation must create one authority-backed browser pane',
   );
-  assert.match(rightPaneSource, /agentNavigationUrl\('\/api\/files\/site-open'/);
-  assert.match(rightPaneSource, /htmlPreviewRevisions/);
-  assert.match(rightPaneSource, /openHtmlInBrowser/);
+  assert.match(
+    browserPaneSource,
+    /openCurrentPageExternally[\s\S]*?openExternalWebUrl\(url\)[\s\S]*?browser\.action\.openExternal/,
+    'the browser toolbar must expose the current page to the external browser',
+  );
+
+  rightPane.activateRightPaneSession('workspace-browser', 'session-browser');
+  for (let index = 0; index < 8; index += 1) {
+    rightPane.openBrowserTab('browser-session', `browser-tab-${index}`, {
+      workspaceId: 'workspace-browser',
+      workspacePath: '/tmp/workspace-browser',
+      sessionId: 'session-browser',
+      label: `网页 ${index + 1}`,
+    });
+  }
+  const browserPane = rightPane.getRightPaneState(rightPane.rightPaneState.activeScopeKey);
+  assert.deepEqual(
+    browserPane.openTabs.map((tab) => tab.id),
+    Array.from({ length: 8 }, (_, index) => `browser:browser-session:browser-tab-${index}`),
+    'each BrowserTabId must map to one top-level right-pane tab without LRU eviction',
+  );
+  assert.equal(browserPane.activeTabId, 'browser:browser-session:browser-tab-7');
+
+  rightPane.activateRightPaneSession('workspace-browser-sync', 'session-browser-sync');
+  rightPane.openCodeTab('session-browser-sync', 'index.html', {
+    workspaceId: 'workspace-browser-sync',
+    workspacePath: '/tmp/workspace-browser-sync',
+    sessionId: 'session-browser-sync',
+  });
+  const browserSyncScope = rightPane.rightPaneState.activeScopeKey;
+  rightPane.synchronizeBrowserTabs(
+    'workspace-browser-sync',
+    '/tmp/workspace-browser-sync',
+    'session-browser-sync',
+    {
+      browserSessionId: 'browser-session-sync',
+      activeTabId: 'browser-tab-sync-1',
+      tabs: [
+        {
+          tabId: 'browser-tab-sync-1',
+          lifecycle: 'ready',
+          url: 'https://example.com/one',
+          title: '页面一',
+        },
+      ],
+    },
+    { newTabLabel: '新标签页' },
+  );
+  const browserSyncPane = rightPane.getRightPaneState(browserSyncScope);
+  assert.deepEqual(
+    browserSyncPane.openTabs.map((tab) => tab.id),
+    ['code:index.html', 'browser:browser-session-sync:browser-tab-sync-1'],
+    'authority recovery must register one top-level pane per BrowserTabId',
+  );
+  assert.equal(
+    browserSyncPane.activeTabId,
+    'code:index.html',
+    'background authority recovery must not steal focus from a code pane',
+  );
+
+  rightPane.synchronizeBrowserTabs(
+    'workspace-browser-sync',
+    '/tmp/workspace-browser-sync',
+    'session-browser-sync',
+    {
+      browserSessionId: 'browser-session-sync',
+      activeTabId: 'browser-tab-sync-2',
+      tabs: [
+        {
+          tabId: 'browser-tab-sync-1',
+          lifecycle: 'ready',
+          url: 'https://example.com/one',
+          title: '页面一',
+        },
+        {
+          tabId: 'browser-tab-sync-2',
+          lifecycle: 'ready',
+          url: 'about:blank',
+          title: '',
+        },
+      ],
+    },
+    { revealActiveTab: true, newTabLabel: '新标签页' },
+  );
+  assert.equal(
+    browserSyncPane.activeTabId,
+    'browser:browser-session-sync:browser-tab-sync-2',
+    'a newly created authority Page must reveal its matching top-level pane',
+  );
+  assert.equal(
+    browserSyncPane.openTabs.find((tab) => tab.id.endsWith('browser-tab-sync-2'))?.label,
+    '新标签页',
+  );
+
+  rightPane.synchronizeBrowserTabs(
+    'workspace-browser-sync',
+    '/tmp/workspace-browser-sync',
+    'session-browser-sync',
+    {
+      browserSessionId: 'browser-session-sync',
+      activeTabId: 'browser-tab-sync-1',
+      tabs: [
+        {
+          tabId: 'browser-tab-sync-1',
+          lifecycle: 'ready',
+          url: 'https://example.com/one',
+          title: '页面一',
+        },
+      ],
+    },
+    { newTabLabel: '新标签页' },
+  );
+  assert.deepEqual(
+    browserSyncPane.openTabs.map((tab) => tab.id),
+    ['code:index.html', 'browser:browser-session-sync:browser-tab-sync-1'],
+    'a closed authority Page must remove exactly its matching top-level pane',
+  );
+  assert.equal(
+    browserSyncPane.activeTabId,
+    'browser:browser-session-sync:browser-tab-sync-1',
+    'closing the active Page must follow BrowserAuthority activeTabId',
+  );
 
   rightPane.activateRightPaneSession('workspace-active', 'session-active');
   rightPane.openCodeTab('session-stale', 'README.md', {

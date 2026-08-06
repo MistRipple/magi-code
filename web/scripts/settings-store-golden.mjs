@@ -18,6 +18,10 @@ const settingsToolsTabSource = await readFile(
   new URL('../src/components/SettingsToolsTab.svelte', import.meta.url),
   'utf8',
 );
+const modelConfigFormSource = await readFile(
+  new URL('../src/components/ModelConfigForm.svelte', import.meta.url),
+  'utf8',
+);
 const usageAggregationSource = await readFile(
   new URL('../src/lib/usage-stats-aggregation.ts', import.meta.url),
   'utf8',
@@ -90,6 +94,59 @@ assert.doesNotMatch(
   modelDraftEffect[0],
   /appState\.settingsBootstrapSnapshot/,
   '模型表单草稿不能通过不可追踪的 getState() 返回对象读取 snapshot',
+);
+assert.match(
+  modelConfigFormSource,
+  /const isDirty = \$derived\(editableConfigSnapshot\(config\) !== editableConfigSnapshot\(baselineConfig\)\)/,
+  '模型保存按钮必须直接比较当前草稿与后端持久化基线，任一可编辑字段变化都应立即启用',
+);
+assert.doesNotMatch(
+  modelConfigFormSource,
+  /userHasEdited|oninput=\{markUserEdited\}|onchange=\{markUserEdited\}/,
+  '模型脏态不能依赖 DOM 事件闸门，否则程序化模型选择和异步装载会漏报',
+);
+assert.match(
+  modelConfigFormSource,
+  /const saveDisabled = \$derived\(isSaving \|\| !isDirty\)/,
+  '模型配置发生变化后只应在保存期间禁用保存按钮，连接测试不得阻止用户保存',
+);
+assert.doesNotMatch(
+  modelConfigFormSource,
+  /model-dropdown-refresh|model-dropdown-toolbar/,
+  '修复模型配置链路不应额外增加模型列表刷新入口',
+);
+assert.match(
+  settingsStoreSource,
+  /function isModelConfigDraftDirty\([\s\S]*?modelConfigBaselines\[key\]/,
+  '模型 bootstrap 刷新必须识别未保存草稿，不能覆盖用户正在编辑的配置',
+);
+assert.match(
+  settingsStoreSource,
+  /async function testModelConnection\([\s\S]*?await executeModelConnectionTest\(target, configKey, config\)[\s\S]*?notifySettingsError/,
+  '手动连接测试必须保留真实请求异常并进入错误反馈，不能把失败包装成完成提示',
+);
+assert.match(
+  settingsStoreSource,
+  /async function testModelConnection\([\s\S]*?requestSignature = buildModelConfigSignature\(target, config\)[\s\S]*?requestStillMatchesCurrentConfig/,
+  '连接测试结果必须绑定请求时的配置快照，编辑期间返回的旧结果不得污染当前状态',
+);
+assert.match(
+  settingsStoreSource,
+  /async function fetchModelList\([\s\S]*?modelListRequestSequences\[key\][\s\S]*?requestSignature !== buildModelListSignature\(latestConfig\)/,
+  '模型列表结果必须绑定请求时的具体配置与引擎，过期响应不得污染当前表单',
+);
+const saveModelConfigSource = settingsStoreSource.match(
+  /async function saveModelConfig\([\s\S]*?\n  function confirmInputDialog/,
+)?.[0] || '';
+assert.match(
+  saveModelConfigSource,
+  /commitSavedModelConfig\(target, key, savedConfig, submittedSignature\)/,
+  '保存成功必须用服务端回传的权威配置更新持久化基线',
+);
+assert.doesNotMatch(
+  saveModelConfigSource,
+  /requestSettingsBootstrap/,
+  '模型保存失败后不得通过 bootstrap 覆盖未提交草稿，成功也不应额外读后写',
 );
 
 assert.match(

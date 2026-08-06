@@ -46,25 +46,49 @@ await withGoldenViteServer(async (server) => {
 
 const zhCN = JSON.parse(await readFile(new URL('../src/i18n/zh-CN.json', import.meta.url), 'utf8'));
 const enUS = JSON.parse(await readFile(new URL('../src/i18n/en-US.json', import.meta.url), 'utf8'));
-const requiredBuiltinToolLabels = {
-  imageGenerate: ['生成图片', 'Image Generation'],
-  gitStatus: ['Git 状态', 'Git Status'],
-  gitBranchCreate: ['创建分支', 'Create Branch'],
-  gitWorktreeCreate: ['创建工作树', 'Create Worktree'],
-  getGoal: ['查看目标', 'Get Goal'],
-  createGoal: ['创建目标', 'Create Goal'],
-  updateGoal: ['更新目标', 'Update Goal'],
-};
+const builtinCatalogSource = await readFile(
+  new URL('../../crates/magi-tool-runtime/src/builtin_catalog.rs', import.meta.url),
+  'utf8',
+);
+const builtinNamesSource = builtinCatalogSource.match(
+  /pub fn as_str\(&self\)[\s\S]*?pub fn category\(&self\)/,
+)?.[0] || '';
+const builtinToolNames = Array.from(
+  builtinNamesSource.matchAll(/Self::\w+\s*=>\s*"([a-z0-9_]+)"/g),
+  (match) => match[1],
+);
 
-for (const [suffix, [expectedZh, expectedEn]] of Object.entries(requiredBuiltinToolLabels)) {
+assert.ok(builtinToolNames.length > 0, 'golden test must read the Rust built-in tool catalog');
+assert.equal(
+  new Set(builtinToolNames).size,
+  builtinToolNames.length,
+  'Rust built-in tool names must remain unique',
+);
+for (const name of builtinToolNames) {
+  const suffix = name.replace(/_([a-z0-9])/g, (_, char) => char.toUpperCase());
   const key = `settings.tools.builtin.${suffix}`;
-  assert.equal(zhCN[key], expectedZh, `${key} must have a complete Chinese label`);
-  assert.equal(enUS[key], expectedEn, `${key} must have a complete English label`);
+  assert.equal(typeof zhCN[key], 'string', `${key} must have a Chinese label`);
+  assert.ok(zhCN[key].trim(), `${key} must have a non-empty Chinese label`);
+  assert.equal(typeof enUS[key], 'string', `${key} must have an English label`);
+  assert.ok(enUS[key].trim(), `${key} must have a non-empty English label`);
 }
+
+assert.equal(zhCN['settings.tools.builtinCategory.browser'], '浏览器');
+assert.equal(enUS['settings.tools.builtinCategory.browser'], 'Browser');
 
 const settingsToolsSource = await readFile(
   new URL('../src/components/SettingsToolsTab.svelte', import.meta.url),
   'utf8',
+);
+assert.match(
+  settingsToolsSource,
+  /function getBuiltinToolLabel[\s\S]*?return formatBuiltinToolFallbackLabel\(name\);/,
+  'unknown built-in tools must preserve a readable tool identity',
+);
+assert.doesNotMatch(
+  settingsToolsSource,
+  /getBuiltinToolLabel[\s\S]*?settings\.tools\.builtin\.unknown/,
+  'Chinese built-in tool labels must not collapse unknown names into one generic label',
 );
 assert.match(
   settingsToolsSource,

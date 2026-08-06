@@ -202,6 +202,42 @@ function sanitizeMessageContextReferences(
   return normalized.length > 0 ? normalized : undefined;
 }
 
+function sanitizeMessageBrowserAnnotationRefs(
+  references: unknown,
+  errorPrefix: string,
+): import('../types/message').MessageBrowserAnnotationReference[] | undefined {
+  if (references === undefined) return undefined;
+  if (!Array.isArray(references)) {
+    throw new Error(`${errorPrefix} browserAnnotationRefs 无效`);
+  }
+  const normalized = references.map((reference) => {
+    if (!isPlainRecord(reference)) {
+      throw new Error(`${errorPrefix} browserAnnotationRefs 条目无效`);
+    }
+    const annotationId = typeof reference.annotationId === 'string' ? reference.annotationId.trim() : '';
+    const browserSessionId = typeof reference.browserSessionId === 'string' ? reference.browserSessionId.trim() : '';
+    const tabId = typeof reference.tabId === 'string' ? reference.tabId.trim() : '';
+    const kind: 'element' | 'region' | null = reference.kind === 'element' || reference.kind === 'region'
+      ? reference.kind
+      : null;
+    const comment = typeof reference.comment === 'string' ? reference.comment.trim() : '';
+    if (!annotationId || !browserSessionId || !tabId || !kind || !comment) {
+      throw new Error(`${errorPrefix} browserAnnotationRefs 字段无效`);
+    }
+    return {
+      annotationId,
+      browserSessionId,
+      tabId,
+      kind,
+      comment,
+      screenshotArtifactId: typeof reference.screenshotArtifactId === 'string'
+        ? reference.screenshotArtifactId.trim() || null
+        : null,
+    };
+  });
+  return normalized.length > 0 ? normalized : undefined;
+}
+
 function resolveMessageType(message: Pick<Message, 'role' | 'type'>, errorPrefix: string): MessageType {
   if (typeof message.type === 'string' && MESSAGE_TYPE_SET.has(message.type as MessageType)) {
     return message.type as MessageType;
@@ -439,6 +475,10 @@ export function normalizeMessagePayload(message: Message, errorPrefix = '[Messag
     message.contextReferences,
     errorPrefix,
   );
+  const browserAnnotationRefs = sanitizeMessageBrowserAnnotationRefs(
+    message.browserAnnotationRefs,
+    errorPrefix,
+  );
   const type = resolveMessageType({ role, type: message.type }, errorPrefix);
   const noticeType = typeof message.noticeType === 'string' && NOTICE_TYPE_SET.has(message.noticeType as NoticeType)
     ? message.noticeType as NoticeType
@@ -458,6 +498,7 @@ export function normalizeMessagePayload(message: Message, errorPrefix = '[Messag
     ...(noticeType ? { noticeType } : {}),
     ...(images ? { images } : {}),
     ...(contextReferences ? { contextReferences } : {}),
+    ...(browserAnnotationRefs ? { browserAnnotationRefs } : {}),
     ...(metadata ? { metadata } : {}),
   };
 }
@@ -582,6 +623,11 @@ export function sanitizeMessagePatch(
     normalized.contextReferences = updates.contextReferences === undefined
       ? undefined
       : sanitizeMessageContextReferences(updates.contextReferences, errorPrefix);
+  }
+  if ('browserAnnotationRefs' in updates) {
+    normalized.browserAnnotationRefs = updates.browserAnnotationRefs === undefined
+      ? undefined
+      : sanitizeMessageBrowserAnnotationRefs(updates.browserAnnotationRefs, errorPrefix);
   }
 
   if ('metadata' in updates) {

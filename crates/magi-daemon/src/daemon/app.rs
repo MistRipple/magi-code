@@ -140,6 +140,8 @@ async fn wait_for_process_shutdown_signal() -> Result<&'static str, DaemonError>
 
         let mut terminate = signal(SignalKind::terminate())
             .map_err(|error| DaemonError::internal(format!("注册 SIGTERM 监听失败: {error}")))?;
+        let mut hangup = signal(SignalKind::hangup())
+            .map_err(|error| DaemonError::internal(format!("注册 SIGHUP 监听失败: {error}")))?;
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 result.map_err(|error| {
@@ -148,6 +150,7 @@ async fn wait_for_process_shutdown_signal() -> Result<&'static str, DaemonError>
                 Ok("process interrupt signal")
             }
             _ = terminate.recv() => Ok("process terminate signal"),
+            _ = hangup.recv() => Ok("process hangup signal"),
         }
     }
 

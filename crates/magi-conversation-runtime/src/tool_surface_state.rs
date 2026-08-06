@@ -1,10 +1,111 @@
 use crate::{
-    SKILL_APPLY_TOOL_NAME, build_skill_custom_tool_definitions, parse_skill_custom_tool_name,
+    SKILL_APPLY_TOOL_NAME, build_skill_custom_tool_definitions,
+    builtin_tool_schema::public_builtin_tool_definition, parse_skill_custom_tool_name,
 };
 use magi_bridge_client::{ChatToolDefinition, ChatToolFunctionDefinition, ChatToolOrigin};
-use magi_core::{AccessProfile, ExecutionResultStatus};
+use magi_core::{AccessProfile, ExecutionResultStatus, SessionId};
 use magi_skill_runtime::{SkillRuntime, SkillSelection};
 use magi_tool_runtime::{BuiltinToolName, ToolRegistry};
+
+pub(crate) struct BrowserToolSurfaceSnapshot {
+    pub definitions: Vec<ChatToolDefinition>,
+    pub capability_revision: Option<u64>,
+}
+
+pub(crate) struct BrowserToolSurfaceContext<'a> {
+    skill_runtime: Option<&'a SkillRuntime>,
+    active_skill_id: Option<&'a str>,
+    access_profile: AccessProfile,
+    allowed_tools: Option<&'a [String]>,
+    denied_tools: &'a [String],
+    session_id: Option<&'a SessionId>,
+}
+
+impl<'a> BrowserToolSurfaceContext<'a> {
+    pub(crate) fn new(
+        skill_runtime: Option<&'a SkillRuntime>,
+        active_skill_id: Option<&'a str>,
+        access_profile: AccessProfile,
+        allowed_tools: Option<&'a [String]>,
+        denied_tools: &'a [String],
+        session_id: Option<&'a SessionId>,
+    ) -> Self {
+        Self {
+            skill_runtime,
+            active_skill_id,
+            access_profile,
+            allowed_tools,
+            denied_tools,
+            session_id,
+        }
+    }
+}
+
+pub(crate) fn refresh_live_browser_tool_definitions(
+    mut definitions: Vec<ChatToolDefinition>,
+    tool_registry: &ToolRegistry,
+    context: BrowserToolSurfaceContext<'_>,
+) -> BrowserToolSurfaceSnapshot {
+    definitions.retain(|definition| {
+        BuiltinToolName::from_name(&definition.function.name)
+            .is_none_or(|tool| tool.browser_tool_kind().is_none())
+    });
+
+    let Some(capability) =
+        tool_registry.browser_capability_snapshot(context.access_profile, context.session_id)
+    else {
+        return BrowserToolSurfaceSnapshot {
+            definitions,
+            capability_revision: None,
+        };
+    };
+    let skill_allowed_tools = context.active_skill_id.and_then(|skill_id| {
+        context.skill_runtime.and_then(|runtime| {
+            let policy = runtime
+                .build_tool_runtime_plan(SkillSelection {
+                    skill_ids: vec![skill_id.to_string()],
+                    requested_tools: Vec::new(),
+                })
+                .tool_policy;
+            (!policy.source_skill_ids.is_empty()).then_some(policy.allowed_tool_names)
+        })
+    });
+    let registered_public_tools = tool_registry
+        .public_builtin_specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for tool in BuiltinToolName::ALL {
+        let Some(kind) = tool.browser_tool_kind() else {
+            continue;
+        };
+        let name = tool.as_str();
+        if !capability.allows_catalog_tool(kind)
+            || !registered_public_tools.contains(name)
+            || context.denied_tools.iter().any(|denied| denied == name)
+            || context
+                .allowed_tools
+                .is_some_and(|allowed| !allowed.iter().any(|item| item == name))
+            || skill_allowed_tools
+                .as_ref()
+                .is_some_and(|allowed| !allowed.iter().any(|item| item == name))
+            || definitions
+                .iter()
+                .any(|definition| definition.function.name == name)
+        {
+            continue;
+        }
+        if let Some(definition) = public_builtin_tool_definition(name) {
+            definitions.push(definition);
+        }
+    }
+
+    BrowserToolSurfaceSnapshot {
+        definitions,
+        capability_revision: Some(capability.revision),
+    }
+}
 
 pub(crate) fn activated_skill_id_from_tool_result(
     tool_name: &str,
@@ -132,7 +233,118 @@ pub(crate) fn refresh_live_mcp_tool_definitions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magi_browser_runtime::{BrowserCapabilitySnapshot, BrowserRuntimeComponentStatus};
     use magi_skill_runtime::{SkillDefinition, SkillMetadata, SkillRegistry};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+
+    #[test]
+    fn browser_tool_surface_uses_one_round_scoped_capability_snapshot() {
+        let revision = Arc::new(AtomicU64::new(7));
+        let enabled = Arc::new(AtomicBool::new(true));
+        let provider_revision = Arc::clone(&revision);
+        let provider_enabled = Arc::clone(&enabled);
+        let mut registry = ToolRegistry::new(
+            Arc::new(magi_governance::GovernanceService::default()),
+            Arc::new(magi_event_bus::InMemoryEventBus::new(8)),
+        )
+        .with_browser_runtime(
+            Arc::new(|_, tool, _, _| {
+                (
+                    serde_json::json!({ "tool": tool, "status": "succeeded" }).to_string(),
+                    ExecutionResultStatus::Succeeded,
+                )
+            }),
+            Arc::new(move |_| BrowserCapabilitySnapshot {
+                revision: provider_revision.load(Ordering::Acquire),
+                in_app_browser_enabled: true,
+                browser_use_enabled: provider_enabled.load(Ordering::Acquire),
+                runtime_status: BrowserRuntimeComponentStatus::Installed,
+                host_protocol_compatible: true,
+                access_profile: AccessProfile::Restricted,
+            }),
+        );
+        registry.register_default_builtins();
+
+        let first = refresh_live_browser_tool_definitions(
+            Vec::new(),
+            &registry,
+            BrowserToolSurfaceContext::new(
+                None,
+                None,
+                AccessProfile::FullAccess,
+                None,
+                &[],
+                Some(&SessionId::new("session-browser-surface")),
+            ),
+        );
+        assert_eq!(first.capability_revision, Some(7));
+        assert_eq!(
+            first
+                .definitions
+                .iter()
+                .filter(|definition| {
+                    BuiltinToolName::from_name(&definition.function.name)
+                        .is_some_and(|tool| tool.browser_tool_kind().is_some())
+                })
+                .count(),
+            9
+        );
+
+        revision.store(8, Ordering::Release);
+        enabled.store(false, Ordering::Release);
+        let disabled = refresh_live_browser_tool_definitions(
+            first.definitions,
+            &registry,
+            BrowserToolSurfaceContext::new(
+                None,
+                None,
+                AccessProfile::FullAccess,
+                None,
+                &[],
+                Some(&SessionId::new("session-browser-surface")),
+            ),
+        );
+        assert_eq!(disabled.capability_revision, Some(8));
+        assert!(disabled.definitions.is_empty());
+
+        revision.store(9, Ordering::Release);
+        enabled.store(true, Ordering::Release);
+        let read_only = refresh_live_browser_tool_definitions(
+            disabled.definitions,
+            &registry,
+            BrowserToolSurfaceContext::new(
+                None,
+                None,
+                AccessProfile::ReadOnly,
+                None,
+                &[],
+                Some(&SessionId::new("session-browser-surface")),
+            ),
+        );
+        let names = read_only
+            .definitions
+            .iter()
+            .map(|definition| definition.function.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(read_only.capability_revision, Some(9));
+        assert_eq!(
+            names,
+            vec![
+                "browser_navigate",
+                "browser_snapshot",
+                "browser_click",
+                "browser_type",
+                "browser_press",
+                "browser_scroll",
+                "browser_screenshot",
+                "browser_tabs",
+                "browser_viewport"
+            ]
+        );
+    }
 
     #[test]
     fn successful_skill_activation_replaces_apply_surface_with_skill_tools() {

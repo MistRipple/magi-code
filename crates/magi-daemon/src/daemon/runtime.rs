@@ -1298,6 +1298,48 @@ impl DaemonRuntime {
                 managed_worktree_root: self.state_root.join("worktrees"),
             },
         );
+        // ToolRegistry 在 ApiState 之前装配；只捕获共享依赖，避免完整 ApiState 引用环。
+        let browser_runtime_holder =
+            Arc::new(OnceLock::<magi_api::BrowserToolRuntimeDependencies>::new());
+        let browser_tool_executor: magi_tool_runtime::BrowserToolExecutor = {
+            let holder = Arc::clone(&browser_runtime_holder);
+            Arc::new(move |tool_call_id, tool_name, input, context| {
+                holder.get().map_or_else(
+                    || {
+                        (
+                            serde_json::json!({
+                                "tool": tool_name,
+                                "status": "failed",
+                                "error_code": "browser_runtime_not_initialized",
+                                "recoverable": false,
+                                "requires_user_action": false,
+                                "error": "浏览器运行时尚未初始化",
+                            })
+                            .to_string(),
+                            magi_core::ExecutionResultStatus::Failed,
+                        )
+                    },
+                    |dependencies| dependencies.execute(tool_call_id, tool_name, input, context),
+                )
+            })
+        };
+        let browser_capability_provider: magi_tool_runtime::BrowserCapabilityProvider = {
+            let holder = Arc::clone(&browser_runtime_holder);
+            Arc::new(move |session_id| {
+                holder.get().map_or_else(
+                    || magi_browser_runtime::BrowserCapabilitySnapshot {
+                        revision: 0,
+                        in_app_browser_enabled: false,
+                        browser_use_enabled: false,
+                        runtime_status:
+                            magi_browser_runtime::BrowserRuntimeComponentStatus::NotInstalled,
+                        host_protocol_compatible: false,
+                        access_profile: magi_core::AccessProfile::Restricted,
+                    },
+                    |dependencies| dependencies.capabilities(session_id),
+                )
+            })
+        };
         let mut tool_registry = ToolRegistry::new(self.governance.clone(), self.event_bus.clone())
             .with_knowledge_store(self.knowledge_store.clone())
             .with_external_tool_catalog_provider(external_tool_catalog_provider)
@@ -1308,6 +1350,7 @@ impl DaemonRuntime {
                 image_generation_readiness_provider,
             )
             .with_git_tool_executor(git_tool_executor)
+            .with_browser_runtime(browser_tool_executor, browser_capability_provider)
             .with_runtime_capability_dependency_provider(runtime_capability_dependency_provider);
         tool_registry.register_default_builtins();
 
@@ -1558,6 +1601,9 @@ impl DaemonRuntime {
         .with_bridge_probe_transport(BridgeServerKind::Model, model_transport)
         .with_bridge_probe_transport(BridgeServerKind::Mcp, mcp_transport)
         .with_execution_pipeline(orchestrator, execution_runtime, memory_store);
+        browser_runtime_holder
+            .set(state.browser_tool_runtime_dependencies())
+            .map_err(|_| DaemonError::internal("重复装配 Browser 工具运行时依赖"))?;
 
         state
             .restore_regular_session_turn_queues()
@@ -1638,6 +1684,22 @@ impl DaemonRuntime {
             let Some(session_id) = session_id else {
                 return;
             };
+            if matches!(status.as_str(), "completed" | "failed" | "killed") {
+                let report = state_for_runner_terminal.cancel_execution_resources(
+                    Some(&session_id),
+                    None,
+                    Some(&root_task_id),
+                    magi_browser_runtime::BrowserLeaseEndReason::TaskFinished,
+                );
+                if report.browser_lease_count > 0 {
+                    tracing::debug!(
+                        %session_id,
+                        %root_task_id,
+                        browser_lease_count = report.browser_lease_count,
+                        "任务进入终态，已释放 Browser Lease"
+                    );
+                }
+            }
             let Some(runner_manager) = terminal_runner_manager_for_observer
                 .get()
                 .and_then(Weak::upgrade)
@@ -1678,6 +1740,7 @@ impl DaemonRuntime {
         // 测试可用 ApiState::new 直接构造而不调用此函数，惰性 fallback 仍兜底。
         state.install_snapshot_lifecycle_observer();
         magi_api::task_turn_finalize::schedule_restored_session_turn_queues(&state);
+        super::browser_runtime::start_controller(&state);
 
         Ok(state)
     }

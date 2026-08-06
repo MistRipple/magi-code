@@ -41,4 +41,42 @@ cd "$ROOT_DIR"
 # cargo clean 后只编译 magi-daemon-app 会导致 bridge 可执行文件缺失。
 cargo build -p magi-bridge-client --bins
 
-exec env MAGI_WEB_DEV="${MAGI_WEB_DEV:-1}" MAGI_PORT="$PORT" cargo run -p magi-daemon-app
+DAEMON_ENV=(
+  "MAGI_WEB_DEV=${MAGI_WEB_DEV:-1}"
+  "MAGI_PORT=$PORT"
+)
+
+# 开发态优先复用 browser-host 自己声明的 Playwright Chromium，确保 Host 与
+# Chromium 版本匹配；显式环境变量仍可覆盖自动发现结果。
+BROWSER_HOST_ENTRY="${MAGI_BROWSER_DEV_HOST_ENTRY:-$ROOT_DIR/browser-host/dist/index.cjs}"
+BROWSER_NODE_MODULES="$ROOT_DIR/browser-host/node_modules"
+BROWSER_CHROMIUM="${MAGI_BROWSER_DEV_CHROMIUM:-}"
+if [ -z "$BROWSER_CHROMIUM" ] && [ "$(uname -s)" = "Darwin" ]; then
+  for candidate in \
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    "/Applications/Chromium.app/Contents/MacOS/Chromium"; do
+    if [ -f "$candidate" ]; then
+      BROWSER_CHROMIUM="$candidate"
+      break
+    fi
+  done
+fi
+if [ -z "$BROWSER_CHROMIUM" ]; then
+  for candidate in google-chrome-stable google-chrome chromium chromium-browser; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      BROWSER_CHROMIUM="$(command -v "$candidate")"
+      break
+    fi
+  done
+fi
+if [ -z "$BROWSER_CHROMIUM" ] && [ -d "$BROWSER_NODE_MODULES/playwright-core" ]; then
+  BROWSER_CHROMIUM="$(${MAGI_BROWSER_DEV_NODE:-node} -e "const { chromium } = require('$BROWSER_NODE_MODULES/playwright-core'); process.stdout.write(chromium.executablePath())")"
+fi
+if [ -f "$BROWSER_HOST_ENTRY" ] && [ -f "$BROWSER_CHROMIUM" ]; then
+  DAEMON_ENV+=(
+    "MAGI_BROWSER_DEV_HOST_ENTRY=$BROWSER_HOST_ENTRY"
+    "MAGI_BROWSER_DEV_CHROMIUM=$BROWSER_CHROMIUM"
+  )
+fi
+
+exec env "${DAEMON_ENV[@]}" cargo run -p magi-daemon-app

@@ -17,8 +17,9 @@ pub use errors::{DomainError, DomainResult};
 pub use execution::{ExecutionOwnership, RecoveryResumeInput, TaskExecutionTarget};
 pub use host_path::{HostPath, HostPathError, HostPathRef};
 pub use ids::{
-    AssignmentId, EventId, GoalId, LeaseId, MissionId, PlanId, PlanItemId, SessionId, TaskId,
-    ThreadId, ToolCallId, WorkerId, WorkspaceId,
+    AssignmentId, BrowserAnnotationId, BrowserCommandId, BrowserLeaseId, BrowserProfileId,
+    BrowserSessionId, BrowserTabId, EventId, GoalId, LeaseId, MissionId, PlanId, PlanItemId,
+    SessionId, TaskId, ThreadId, ToolCallId, WorkerId, WorkspaceId,
 };
 pub use public_text::{
     PUBLIC_REDACTED_PATH, PUBLIC_REDACTED_VALUE, PUBLIC_RUNTIME_SUMMARY_MAX_CHARS,

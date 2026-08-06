@@ -5,6 +5,7 @@ import SettingsRulesTab from './SettingsRulesTab.svelte';
 import SettingsAgentsTab from './SettingsAgentsTab.svelte';
 import SettingsModelTab from './SettingsModelTab.svelte';
 import SettingsToolsTab from './SettingsToolsTab.svelte';
+import SettingsBrowserTab from './SettingsBrowserTab.svelte';
 import SettingsProjectTab from './SettingsProjectTab.svelte';
 import SettingsAppearanceTab from './SettingsAppearanceTab.svelte';
 import Icon from './Icon.svelte';
@@ -62,6 +63,16 @@ import { getAgentColor } from '../lib/agent-colors';
         >
           <Icon name="tools" size={16} />
           <span>{i18n.t('settings.zone.capabilities')}</span>
+        </button>
+        <button
+          type="button"
+          class="nav-item"
+          class:active={store.activeTab === 'browser'}
+          aria-label={i18n.t('settings.zone.browser')}
+          onclick={() => store.activeTab = 'browser'}
+        >
+          <Icon name="globe" size={16} />
+          <span>{i18n.t('settings.zone.browser')}</span>
         </button>
         <button
           type="button"
@@ -143,6 +154,11 @@ import { getAgentColor } from '../lib/agent-colors';
               <h2>{i18n.t('settings.zone.capabilities')}</h2>
               <span class="header-description">{i18n.t('settings.zone.capabilitiesDesc')}</span>
             </div>
+          {:else if store.activeTab === 'browser'}
+            <div class="header-title-group">
+              <h2>{i18n.t('settings.zone.browser')}</h2>
+              <span class="header-description">{i18n.t('settings.zone.browserDesc')}</span>
+            </div>
           {:else if store.activeTab === 'rules'}
             <div class="header-title-group">
               <h2>{i18n.t('settings.zone.preferences')}</h2>
@@ -208,7 +224,7 @@ import { getAgentColor } from '../lib/agent-colors';
         />
       {:else if store.activeTab === 'model'}
         <!-- 模型配置 Tab -->
-        <SettingsModelTab bind:modelConfigTab={store.modelConfigTab} bind:orchConfig={store.orchConfig} bind:compConfig={store.compConfig} bind:imageConfig={store.imageConfig} bind:workerConfigs={store.workerConfigs} workerModelTabs={store.workerModelTabs} modelStatuses={store.modelStatuses} saveStatus={store.saveStatus} testStatus={store.testStatus} fetchingModels={store.fetchingModels} bind:keyVisible={store.keyVisible} modelDropdownOpen={store.modelDropdownOpen} dropdownPosition={store.dropdownPosition} modelLists={store.modelLists} roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} getBaseUrlPlaceholder={store.getBaseUrlPlaceholder} shouldRecommendStandardUrlMode={store.shouldRecommendStandardUrlMode} openModelDropdown={store.openModelDropdown} closeModelDropdown={store.closeModelDropdown} fetchModelList={store.fetchModelList} selectModel={store.selectModel} saveModelConfig={store.saveModelConfig} testModelConnection={store.testModelConnection} getStatusClass={store.getStatusClass} getStatusText={store.getStatusText} getWorkerDisplayName={store.getWorkerDisplayName}
+        <SettingsModelTab bind:modelConfigTab={store.modelConfigTab} bind:orchConfig={store.orchConfig} bind:compConfig={store.compConfig} bind:imageConfig={store.imageConfig} bind:workerConfigs={store.workerConfigs} modelConfigBaselines={store.modelConfigBaselines} workerModelTabs={store.workerModelTabs} modelStatuses={store.modelStatuses} saveStatus={store.saveStatus} testStatus={store.testStatus} fetchingModels={store.fetchingModels} bind:keyVisible={store.keyVisible} modelDropdownOpen={store.modelDropdownOpen} dropdownPosition={store.dropdownPosition} modelLists={store.modelLists} roleTemplates={store.roleTemplates} registryAgents={store.registryAgents} getBaseUrlPlaceholder={store.getBaseUrlPlaceholder} shouldRecommendStandardUrlMode={store.shouldRecommendStandardUrlMode} openModelDropdown={store.openModelDropdown} closeModelDropdown={store.closeModelDropdown} fetchModelList={store.fetchModelList} selectModel={store.selectModel} saveModelConfig={store.saveModelConfig} testModelConnection={store.testModelConnection} getStatusClass={store.getStatusClass} getStatusText={store.getStatusText} getWorkerDisplayName={store.getWorkerDisplayName}
           {getAgentColor} deleteEngine={store.deleteEngine} openAddEngineDialog={store.openAddEngineDialog} renameEngineDisplay={store.renameEngineDisplay}
         />
       {:else if store.activeTab === 'agents'}
@@ -225,6 +241,8 @@ import { getAgentColor } from '../lib/agent-colors';
         <!-- 工具 Tab -->
         <SettingsToolsTab mcpServersHydrated={store.mcpServersHydrated} mcpServersLoading={store.mcpServersLoading} mcpServers={store.mcpServers} mcpExpandedServer={store.mcpExpandedServer} mcpServerTools={store.mcpServerTools} mcpRefreshingServers={store.mcpRefreshingServers} builtinTools={store.builtinTools} builtinToolsLoading={store.builtinToolsLoading} capabilityDependencies={store.capabilityDependencies} commandEnvironment={store.commandEnvironment} commandEnvironmentLoading={store.commandEnvironmentLoading} skills={store.skills} skillUpdateAvailableCount={store.skillUpdateAvailableCount} skillUpdatesChecking={store.skillUpdatesChecking} skillUpdatingIds={store.skillUpdatingIds} skillTogglingIds={store.skillTogglingIds} openMCPDialog={store.openMCPDialog} toggleMCPExpand={store.toggleMCPExpand} getMCPHealthLabel={store.getMCPHealthLabel} toggleMCPServer={store.toggleMCPServer} deleteMCPServer={store.deleteMCPServer} refreshMCPTools={store.refreshMCPTools} refreshBuiltinToolCatalog={store.refreshBuiltinToolCatalog} refreshCommandEnvironment={store.refreshCommandEnvironment} openSkillLibraryDialog={store.openSkillLibraryDialog} openRepoDialog={store.openRepoDialog} checkSkillUpdates={store.checkSkillUpdates} updateSkill={store.updateSkill} toggleSkill={store.toggleSkill} updateAllSkills={store.updateAllSkills} rollbackSkill={store.rollbackSkill} deleteSkill={store.deleteSkill}
         />
+      {:else if store.activeTab === 'browser'}
+        <SettingsBrowserTab />
       {/if}
     </div>
   </main>

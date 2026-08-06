@@ -13,10 +13,15 @@
     messagesState,
   } from './stores/messages.svelte';
   import { refreshPendingChangesProjection } from './lib/pending-changes-refresh';
-  import { activateRightPaneSession } from './stores/right-pane.svelte';
+  import {
+    activateRightPaneSession,
+    synchronizeBrowserTabs,
+  } from './stores/right-pane.svelte';
   import { i18n } from './stores/i18n.svelte';
   import {
     RUNTIME_CONNECTION_EVENT,
+    BROWSER_AUTHORITY_CHANGED_EVENT,
+    getCurrentBrowserSession,
     isWebAgentMode,
     type AgentConnectionEventDetail,
   } from './web/agent-api';
@@ -31,6 +36,34 @@
   );
   const isWebMode = isWebAgentMode();
   const changeRefreshIntervalMs = 1000;
+  let browserAuthoritySyncRequest = 0;
+
+  async function synchronizeCurrentBrowserAuthority(revealActiveTab = false): Promise<void> {
+    const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
+    const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
+    const sessionId = messagesState.currentSessionId?.trim() || '';
+    if (!workspaceId || !isPersistedSessionId(sessionId)) return;
+
+    const request = ++browserAuthoritySyncRequest;
+    try {
+      const snapshot = await getCurrentBrowserSession(workspaceId, sessionId);
+      if (
+        request !== browserAuthoritySyncRequest
+        || workspaceId !== (messagesState.currentWorkspaceId?.trim() || '')
+        || sessionId !== (messagesState.currentSessionId?.trim() || '')
+      ) {
+        return;
+      }
+      synchronizeBrowserTabs(workspaceId, workspacePath, sessionId, snapshot, {
+        revealActiveTab,
+        newTabLabel: i18n.t('browser.tab.new'),
+      });
+    } catch (error) {
+      if (request === browserAuthoritySyncRequest) {
+        console.warn('[App] 同步浏览器权威状态失败:', error);
+      }
+    }
+  }
 
   // 设置面板是否打开
   let settingsOpen = $state(false);
@@ -131,6 +164,7 @@
         clearRecoveryTimer();
         bootstrapConnectionFailed = false;
         runtimeRecoveryVisible = false;
+        void synchronizeCurrentBrowserAuthority();
         return;
       }
       if (!messagesState.bootstrapped) {
@@ -144,10 +178,37 @@
         }, 3_000);
       }
     };
+    const handleBrowserAuthorityChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        eventType?: string;
+        workspaceId?: string;
+        sessionId?: string;
+      }>).detail;
+      const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
+      const sessionId = messagesState.currentSessionId?.trim() || '';
+      if (
+        (detail?.workspaceId?.trim() && detail.workspaceId.trim() !== workspaceId)
+        || (detail?.sessionId?.trim() && detail.sessionId.trim() !== sessionId)
+      ) {
+        return;
+      }
+      const eventType = detail?.eventType?.trim() || '';
+      void synchronizeCurrentBrowserAuthority(
+        eventType === 'browser.tab.created' || eventType === 'browser.tab.activated',
+      );
+    };
     window.addEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
+    window.addEventListener(
+      BROWSER_AUTHORITY_CHANGED_EVENT,
+      handleBrowserAuthorityChanged as EventListener,
+    );
     return () => {
       clearRecoveryTimer();
       window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
+      window.removeEventListener(
+        BROWSER_AUTHORITY_CHANGED_EVENT,
+        handleBrowserAuthorityChanged as EventListener,
+      );
     };
   });
 
@@ -184,6 +245,7 @@
   // 切换会话时同步 RightPane 上下文；空 sessionId 也要清掉，避免显示别的会话残留
   $effect(() => {
     activateRightPaneSession(messagesState.currentWorkspaceId, messagesState.currentSessionId);
+    void synchronizeCurrentBrowserAuthority();
   });
 
   $effect(() => {

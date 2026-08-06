@@ -164,9 +164,7 @@
     const key = builtinToolI18nKey(name);
     const translated = key ? i18n.t(key) : '';
     if (translated && translated !== key) return translated;
-    return i18n.locale === 'zh-CN'
-      ? i18n.t('settings.tools.builtin.unknown')
-      : formatBuiltinToolFallbackLabel(name);
+    return formatBuiltinToolFallbackLabel(name);
   }
 
   function getBuiltinCategoryLabel(category: string): string {
@@ -188,6 +186,7 @@
       case 'code_navigation': return 'code';
       case 'process': return 'terminal';
       case 'web': return 'globe';
+      case 'browser': return 'globe';
       case 'knowledge': return 'database';
       case 'git': return 'git-branch';
       case 'session_goal': return 'target';

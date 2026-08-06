@@ -1050,6 +1050,16 @@ function assertUserImageMetadataProjectsToMessage(reducer, projection, timelineR
         name: 'reference.md',
       },
     ],
+    browserAnnotationRefs: [
+      {
+        annotationId: 'browser-annotation-1',
+        browserSessionId: 'browser-session-1',
+        tabId: 'browser-tab-1',
+        kind: 'element',
+        comment: '按钮间距需要调整',
+        screenshotArtifactId: 'browser/artifacts/annotation-1.png',
+      },
+    ],
   };
   const userItem = user(c, 1, '请分析这张图片。');
   userItem.metadata = imageMetadata;
@@ -1085,6 +1095,21 @@ function assertUserImageMetadataProjectsToMessage(reducer, projection, timelineR
     userArtifact.message.metadata?.contextReferences,
     undefined,
     'transport context reference metadata should not remain duplicated on projected message metadata',
+  );
+  assert.deepEqual(
+    userArtifact.message.browserAnnotationRefs,
+    imageMetadata.browserAnnotationRefs,
+    'browser annotation metadata must project to first-class Message.browserAnnotationRefs',
+  );
+  assert.deepEqual(
+    threadItems.find((entry) => entry.message.type === 'user_input')?.message.browserAnnotationRefs,
+    imageMetadata.browserAnnotationRefs,
+    'timeline render cloning must preserve browser annotations for MessageItem rendering',
+  );
+  assert.equal(
+    userArtifact.message.metadata?.browserAnnotationRefs,
+    undefined,
+    'transport browser annotation metadata should not remain duplicated on projected message metadata',
   );
 }
 

@@ -3,15 +3,14 @@
  *
  * 设计约束（代理详情与代码详情共用的右侧多 Tab 面板）：
  * - 状态以 workspace/session 为边界，跨会话隔离；workspace 文件预览允许无 session
- * - 三个正交轴：openTabs（LRU 上限 6）/ activeTabId / collapsed
+ * - 三个正交轴：openTabs / activeTabId / collapsed
  * - collapsed 与 openTabs 正交：折叠不销毁 tabs，关闭单 tab 才销毁
  * - 全部 tab 关闭 → 强制 collapsed = true（下一次展开为空白 Pane）
  * - togglePane() 仅切 collapsed；openTab*() 触发自动展开
- * - LRU 淘汰：插入第 7 个 tab 时，从非 active tab 里挑 lastActivatedAt 最小的踢掉
- * - 同 kind 同 key（agent: agentRunId / code: filepath）幂等：复用现有 tab 并激活
+ * - 同 kind 同 key（agent: agentRunId / code: filepath / browser: BrowserTabId）幂等：复用现有 tab 并激活
  */
 
-export type RightPaneTabKind = 'agent' | 'code';
+export type RightPaneTabKind = 'agent' | 'code' | 'browser';
 
 /** Agent tab payload —— 代理运行 ID，内容由 canonical projection 按 metadata.taskId 过滤运行输出 */
 export interface AgentTabPayload {
@@ -54,9 +53,32 @@ export interface CodeTabPayload {
   headSummary?: string;
   /** large_text 尾部摘要 */
   tailSummary?: string;
+  /** 工具输出携带的瞬时图片数据；不得写入 localStorage。 */
+  imageDataUrl?: string;
 }
 
-export type RightPaneTabPayload = AgentTabPayload | CodeTabPayload;
+export interface BrowserTabPayload {
+  browserSessionId: string;
+  tabId: string;
+  workspaceId: string;
+  workspacePath?: string;
+  sessionId: string;
+}
+
+export interface BrowserAuthorityTabProjection {
+  tabId: string;
+  lifecycle: 'creating' | 'ready' | 'crashed' | 'closed';
+  url: string;
+  title: string;
+}
+
+export interface BrowserAuthoritySessionProjection {
+  browserSessionId: string;
+  activeTabId: string | null;
+  tabs: BrowserAuthorityTabProjection[];
+}
+
+export type RightPaneTabPayload = AgentTabPayload | CodeTabPayload | BrowserTabPayload;
 
 export interface RightPaneTab {
   id: string;
@@ -66,7 +88,7 @@ export interface RightPaneTab {
   /** 强调色，可传 CSS 颜色值或 token 名（如 'color-claude'）；null 表示无强调色 */
   accentToken: string | null;
   payload: RightPaneTabPayload;
-  /** LRU 淘汰参考时间戳（performance.now 或 Date.now，递增即可） */
+  /** 最近激活时间，用于关闭活动 Tab 后选择恢复目标。 */
   lastActivatedAt: number;
 }
 
@@ -85,9 +107,6 @@ interface RightPaneRootState {
   activeSessionId: string;
   perSession: Record<string, SessionPaneState>;
 }
-
-/** LRU 上限；超过即淘汰 lastActivatedAt 最小的非 active tab */
-export const RIGHT_PANE_TAB_CAP = 6;
 
 const EMPTY_SESSION_STATE: SessionPaneState = {
   openTabs: [],
@@ -160,7 +179,7 @@ function normalizeStoredScopeKey(scopeKeyOrSessionId: string | null | undefined)
 }
 
 /**
- * 序列化前裁剪 code tab payload —— content / diff / headSummary / tailSummary
+ * 序列化前裁剪 code tab payload —— content / diff / headSummary / tailSummary / imageDataUrl
  * 单条可达 100KB+，恢复后由 RightPane.svelte 的 fetchedContents $effect 重新拉取，
  * 不需要进 localStorage。元数据（filepath / contentKind / size / mime / symlinkTarget / language）
  * 全部保留，刷新后能立即识别 tab kind 与文件信息。
@@ -181,7 +200,7 @@ function sanitizeTabForPersist(tab: RightPaneTab): RightPaneTab {
     size: payload.size,
     mime: payload.mime,
     symlinkTarget: payload.symlinkTarget,
-    // 显式丢弃：content / diff / headSummary / tailSummary
+    // 显式丢弃：content / diff / headSummary / tailSummary / imageDataUrl
   };
   return { ...tab, payload: slim };
 }
@@ -196,6 +215,15 @@ function isRestorableTab(tab: RightPaneTab): boolean {
   }
   if (tab.kind === 'code') {
     return Boolean((tab.payload as CodeTabPayload | undefined)?.filepath?.trim());
+  }
+  if (tab.kind === 'browser') {
+    const payload = tab.payload as BrowserTabPayload | undefined;
+    return Boolean(
+      payload?.browserSessionId?.trim()
+      && payload?.tabId?.trim()
+      && payload?.workspaceId?.trim()
+      && payload?.sessionId?.trim(),
+    );
   }
   return false;
 }
@@ -309,7 +337,11 @@ function tabKey(kind: RightPaneTabKind, payload: RightPaneTabPayload): string {
   if (kind === 'agent') {
     return `agent:${(payload as AgentTabPayload).agentRunId}`;
   }
-  return `code:${(payload as CodeTabPayload).filepath}`;
+  if (kind === 'code') {
+    return `code:${(payload as CodeTabPayload).filepath}`;
+  }
+  const browserPayload = payload as BrowserTabPayload;
+  return `browser:${browserPayload.browserSessionId}:${browserPayload.tabId}`;
 }
 
 function now(): number {
@@ -317,20 +349,6 @@ function now(): number {
     return performance.now();
   }
   return Date.now();
-}
-
-/** 选择 LRU 淘汰目标：非 active tab 中 lastActivatedAt 最小的；找不到（理论上不会）返回 null */
-function pickLruVictim(state: SessionPaneState): RightPaneTab | null {
-  let victim: RightPaneTab | null = null;
-  for (const tab of state.openTabs) {
-    if (tab.id === state.activeTabId) {
-      continue;
-    }
-    if (!victim || tab.lastActivatedAt < victim.lastActivatedAt) {
-      victim = tab;
-    }
-  }
-  return victim;
 }
 
 function migrateWorkspacePaneIntoSession(workspaceId: string, targetScopeKey: string): void {
@@ -359,29 +377,27 @@ function migrateWorkspacePaneIntoSession(workspaceId: string, targetScopeKey: st
     target.activeTabId = source.activeTabId;
   }
   target.collapsed = target.openTabs.length === 0 ? true : target.collapsed && source.collapsed;
-  while (target.openTabs.length > RIGHT_PANE_TAB_CAP) {
-    const victim = pickLruVictim(target);
-    if (!victim) {
-      break;
-    }
-    target.openTabs = target.openTabs.filter((tab) => tab.id !== victim.id);
-  }
   delete rightPaneState.perSession[sourceScopeKey];
 }
 
-/** 内部：插入或激活已有 tab；负责 LRU 淘汰、自动展开、设为 active */
+/** 内部：插入或激活已有 tab；负责自动展开并设为 active。 */
 function upsertTab(
   scopeKey: string,
   kind: RightPaneTabKind,
   payload: RightPaneTabPayload,
   label: string,
   accentToken: string | null,
+  activate = true,
 ): RightPaneTab | null {
   rightPaneState.activeScopeKey = scopeKey;
   if (kind === 'code') {
     const codePayload = payload as CodeTabPayload;
     rightPaneState.activeWorkspaceId = normalizeWorkspaceId(codePayload.workspaceId);
     rightPaneState.activeSessionId = normalizeSessionId(codePayload.sessionId);
+  } else if (kind === 'browser') {
+    const browserPayload = payload as BrowserTabPayload;
+    rightPaneState.activeWorkspaceId = normalizeWorkspaceId(browserPayload.workspaceId);
+    rightPaneState.activeSessionId = normalizeSessionId(browserPayload.sessionId);
   }
   const session = ensureSession(scopeKey);
   const id = tabKey(kind, payload);
@@ -392,17 +408,12 @@ function upsertTab(
     existing.label = label;
     existing.accentToken = accentToken;
     existing.payload = payload;
-    existing.lastActivatedAt = timestamp;
-    session.activeTabId = id;
-    session.collapsed = false;
-    return existing;
-  }
-
-  if (session.openTabs.length >= RIGHT_PANE_TAB_CAP) {
-    const victim = pickLruVictim(session);
-    if (victim) {
-      session.openTabs = session.openTabs.filter((tab) => tab.id !== victim.id);
+    if (activate) {
+      existing.lastActivatedAt = timestamp;
+      session.activeTabId = id;
+      session.collapsed = false;
     }
+    return existing;
   }
 
   const tab: RightPaneTab = {
@@ -414,8 +425,10 @@ function upsertTab(
     lastActivatedAt: timestamp,
   };
   session.openTabs = [...session.openTabs, tab];
-  session.activeTabId = id;
-  session.collapsed = false;
+  if (activate) {
+    session.activeTabId = id;
+    session.collapsed = false;
+  }
   return tab;
 }
 
@@ -522,6 +535,7 @@ export function openCodeTab(
     symlinkTarget?: string;
     headSummary?: string;
     tailSummary?: string;
+    imageDataUrl?: string;
   },
 ): void {
   const trimmedFilepath = typeof filepath === 'string' ? filepath.trim() : '';
@@ -570,10 +584,145 @@ export function openCodeTab(
       symlinkTarget: options?.symlinkTarget,
       headSummary: options?.headSummary,
       tailSummary: options?.tailSummary,
+      imageDataUrl: options?.imageDataUrl,
     },
     label,
     null,
   );
+}
+
+export function openBrowserTab(
+  browserSessionId: string | null | undefined,
+  tabId: string | null | undefined,
+  options: {
+    workspaceId: string;
+    workspacePath?: string;
+    sessionId: string;
+    label?: string;
+  },
+): void {
+  const normalizedBrowserSessionId = typeof browserSessionId === 'string'
+    ? browserSessionId.trim()
+    : '';
+  const normalizedTabId = typeof tabId === 'string' ? tabId.trim() : '';
+  const workspaceId = normalizeWorkspaceId(options.workspaceId);
+  const sessionId = normalizeSessionId(options.sessionId);
+  const scopeKey = sessionScopeKey(workspaceId, sessionId);
+  if (!normalizedBrowserSessionId || !normalizedTabId || !workspaceId || !sessionId || !scopeKey) {
+    return;
+  }
+  upsertTab(
+    scopeKey,
+    'browser',
+    {
+      browserSessionId: normalizedBrowserSessionId,
+      tabId: normalizedTabId,
+      workspaceId,
+      workspacePath: options.workspacePath?.trim() || undefined,
+      sessionId,
+    },
+    options.label?.trim() || 'Browser',
+    null,
+  );
+}
+
+/**
+ * 将 BrowserAuthority 会话快照投影到右侧一级 Tab。
+ * BrowserAuthority 决定 Browser Page 的存在性和活动 Page；本地 store 只保留布局状态。
+ */
+export function synchronizeBrowserTabs(
+  workspaceId: string | null | undefined,
+  workspacePath: string | null | undefined,
+  sessionId: string | null | undefined,
+  snapshot: BrowserAuthoritySessionProjection | null,
+  options?: {
+    revealActiveTab?: boolean;
+    newTabLabel?: string;
+  },
+): void {
+  const normalizedWorkspaceId = normalizeWorkspaceId(workspaceId);
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  const scopeKey = sessionScopeKey(normalizedWorkspaceId, normalizedSessionId);
+  if (!scopeKey) return;
+
+  const pane = ensureSession(scopeKey);
+  const previousActiveTabId = pane.activeTabId;
+  const previousActiveTab = pane.openTabs.find((tab) => tab.id === previousActiveTabId);
+  const browserSessionId = snapshot?.browserSessionId.trim() || '';
+  const authorityTabs = (snapshot?.tabs ?? []).filter((tab) => (
+    tab.tabId.trim() && tab.lifecycle !== 'closed'
+  ));
+  const authorityPaneIds = new Set(
+    authorityTabs.map((tab) => `browser:${browserSessionId}:${tab.tabId.trim()}`),
+  );
+
+  pane.openTabs = pane.openTabs.filter((tab) => (
+    tab.kind !== 'browser' || authorityPaneIds.has(tab.id)
+  ));
+
+  for (const tab of authorityTabs) {
+    const normalizedTabId = tab.tabId.trim();
+    const title = tab.title.trim();
+    const url = tab.url.trim();
+    const label = title
+      || (url && url !== 'about:blank' ? url : options?.newTabLabel?.trim() || 'Browser');
+    upsertTab(
+      scopeKey,
+      'browser',
+      {
+        browserSessionId,
+        tabId: normalizedTabId,
+        workspaceId: normalizedWorkspaceId,
+        workspacePath: normalizeWorkspaceId(workspacePath) || undefined,
+        sessionId: normalizedSessionId,
+      },
+      label,
+      null,
+      false,
+    );
+  }
+
+  const authorityActivePaneId = snapshot?.activeTabId?.trim()
+    ? `browser:${browserSessionId}:${snapshot.activeTabId.trim()}`
+    : null;
+  const authorityActiveExists = Boolean(
+    authorityActivePaneId
+      && pane.openTabs.some((tab) => tab.id === authorityActivePaneId),
+  );
+  const previousActiveStillExists = Boolean(
+    previousActiveTabId
+      && pane.openTabs.some((tab) => tab.id === previousActiveTabId),
+  );
+
+  if (options?.revealActiveTab && authorityActivePaneId && authorityActiveExists) {
+    pane.activeTabId = authorityActivePaneId;
+    pane.collapsed = false;
+    const active = pane.openTabs.find((tab) => tab.id === authorityActivePaneId);
+    if (active) active.lastActivatedAt = now();
+    return;
+  }
+
+  if (previousActiveTab?.kind === 'browser' && authorityActivePaneId && authorityActiveExists) {
+    pane.activeTabId = authorityActivePaneId;
+    return;
+  }
+
+  if (previousActiveStillExists) {
+    pane.activeTabId = previousActiveTabId;
+    return;
+  }
+
+  if (pane.openTabs.length === 0) {
+    pane.activeTabId = null;
+    pane.collapsed = true;
+    return;
+  }
+
+  let next = pane.openTabs[0];
+  for (const tab of pane.openTabs) {
+    if (tab.lastActivatedAt > next.lastActivatedAt) next = tab;
+  }
+  pane.activeTabId = next.id;
 }
 
 export interface PendingChangeTabProjection {
@@ -734,6 +883,21 @@ export function setActiveRightPaneTab(
   }
   session.activeTabId = tabId;
   tab.lastActivatedAt = now();
+}
+
+/** 更新 tab 的展示标题，不改变激活顺序。 */
+export function updateRightPaneTabLabel(
+  scopeKeyOrSessionId: string | null | undefined,
+  tabId: string,
+  label: string,
+): void {
+  const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
+  const normalizedLabel = label.trim();
+  if (!scopeKey || !normalizedLabel) return;
+  const tab = rightPaneState.perSession[scopeKey]?.openTabs.find((item) => item.id === tabId);
+  if (tab && tab.label !== normalizedLabel) {
+    tab.label = normalizedLabel;
+  }
 }
 
 /** 清理某个 session 的所有 tab 状态（在 session 关闭/重置时调用） */

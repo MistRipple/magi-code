@@ -124,6 +124,7 @@ struct QueuedSessionTurnDto {
     access_profile: Option<AccessProfile>,
     images: Vec<crate::dto::SessionTurnImageDto>,
     context_references: Vec<crate::dto::SessionContextReferenceDto>,
+    browser_annotation_refs: Vec<String>,
     retry_count: u8,
 }
 
@@ -169,6 +170,7 @@ fn session_turn_queue_response(
                 access_profile: queued.request.access_profile,
                 images: queued.request.images,
                 context_references: queued.request.context_references,
+                browser_annotation_refs: queued.request.browser_annotation_refs,
                 retry_count: queued.retry_count,
             }
         })
@@ -527,6 +529,7 @@ async fn submit_steer_current_turn(
         || request.goal_mode
         || !request.images.is_empty()
         || !request.context_references.is_empty()
+        || !request.browser_annotation_refs.is_empty()
     {
         return Err(ApiError::InvalidInput(
             "引导当前回复仅支持文字输入".to_string(),
@@ -656,6 +659,7 @@ fn validate_session_turn_input(request: &SessionTurnRequestDto) -> Result<(), Ap
             .is_none()
         && request.images.is_empty()
         && request.context_references.is_empty()
+        && request.browser_annotation_refs.is_empty()
     {
         return Err(ApiError::InvalidInput("会话输入不能为空".to_string()));
     }
@@ -3056,8 +3060,14 @@ async fn interrupt_session_turn(
                 .kill_tree(chain.root_task_id.as_str())
                 .map_err(|error| ApiError::internal_assembly("中断活动任务树失败", error))?;
         }
-        cancelled_tool_process_count =
-            state.cancel_active_tool_executions(Some(&session_id), None, None);
+        cancelled_tool_process_count = state
+            .cancel_execution_resources(
+                Some(&session_id),
+                None,
+                None,
+                magi_browser_runtime::BrowserLeaseEndReason::TurnStopped,
+            )
+            .total();
         for entry_id in &streaming_entry_ids {
             state
                 .session_store
@@ -3158,6 +3168,23 @@ async fn interrupt_session_turn(
         cleared_queued_turn_count,
         removed_timeline_entry_ids: streaming_entry_ids,
     }))
+}
+
+pub(crate) async fn interrupt_session_turn_for_browser_takeover(
+    state: &ApiState,
+    session_id: &SessionId,
+    workspace_id: &WorkspaceId,
+) -> Result<(), ApiError> {
+    let _ = interrupt_session_turn(
+        State(state.clone()),
+        Json(InterruptSessionTurnRequest {
+            session_id: Some(session_id.to_string()),
+            workspace_id: Some(workspace_id.to_string()),
+            workspace_path: None,
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 fn finalize_terminal_root_current_turn(
@@ -3535,8 +3562,14 @@ async fn close_session(
 }
 
 fn cancel_active_session_turn_for_lifecycle(state: &ApiState, session_id: &SessionId) -> bool {
-    let cancelled_tool_process_count =
-        state.cancel_active_tool_executions(Some(session_id), None, None);
+    let cancelled_tool_process_count = state
+        .cancel_execution_resources(
+            Some(session_id),
+            None,
+            None,
+            magi_browser_runtime::BrowserLeaseEndReason::SessionClosed,
+        )
+        .total();
     let current_turn = state
         .session_store
         .runtime_sidecar(session_id)
@@ -4336,6 +4369,7 @@ mod tests {
             goal_mode: false,
             images: Vec::new(),
             context_references: Vec::new(),
+            browser_annotation_refs: Vec::new(),
             access_profile: None,
             orchestrator_session_config: None,
             request_id: None,

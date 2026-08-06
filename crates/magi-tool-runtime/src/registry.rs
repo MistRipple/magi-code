@@ -1,10 +1,11 @@
 use crate::{
-    AgentRoleCatalogProvider, BuiltinTool, BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec,
-    ExternalMcpToolExecutor, ExternalToolCatalogProvider, ExternalToolCatalogSnapshot,
-    GitToolExecutor, ImageGenerationExecutor, ImageGenerationReadinessProvider,
-    RuntimeCapabilityDependencyProvider, ToolExecutionContext, ToolExecutionContextQuery,
-    ToolExecutionInput, ToolExecutionOutput, ToolExecutionPolicy, ToolExecutionProgress,
-    ToolExecutionSummary, ToolInvocationRecord, ToolRuntimeResources,
+    AgentRoleCatalogProvider, BrowserCapabilityProvider, BrowserToolExecutor, BuiltinTool,
+    BuiltinToolAccessMode, BuiltinToolName, BuiltinToolSpec, ExternalMcpToolExecutor,
+    ExternalToolCatalogProvider, ExternalToolCatalogSnapshot, GitToolExecutor,
+    ImageGenerationExecutor, ImageGenerationReadinessProvider, RuntimeCapabilityDependencyProvider,
+    ToolExecutionContext, ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput,
+    ToolExecutionPolicy, ToolExecutionProgress, ToolExecutionSummary, ToolInvocationRecord,
+    ToolRuntimeResources,
     builtin::{self, NormalizedBuiltinTool, infer_execution_status},
     is_public_builtin_tool_surface,
     policy::WriteProtectionClaim,
@@ -164,6 +165,43 @@ impl ToolRegistry {
     pub fn with_git_tool_executor(mut self, executor: GitToolExecutor) -> Self {
         self.runtime_resources.git_tool_executor = Some(executor);
         self
+    }
+
+    pub fn with_browser_runtime(
+        mut self,
+        executor: BrowserToolExecutor,
+        capability_provider: BrowserCapabilityProvider,
+    ) -> Self {
+        self.runtime_resources.browser_tool_executor = Some(executor);
+        self.runtime_resources.browser_capability_provider = Some(capability_provider);
+        self
+    }
+
+    pub fn browser_tool_available(
+        &self,
+        tool: BuiltinToolName,
+        access_profile: AccessProfile,
+        session_id: Option<&magi_core::SessionId>,
+    ) -> bool {
+        let Some(kind) = tool.browser_tool_kind() else {
+            return true;
+        };
+        self.browser_capability_snapshot(access_profile, session_id)
+            .is_some_and(|snapshot| snapshot.allows_catalog_tool(kind))
+    }
+
+    pub fn browser_capability_snapshot(
+        &self,
+        access_profile: AccessProfile,
+        session_id: Option<&magi_core::SessionId>,
+    ) -> Option<magi_browser_runtime::BrowserCapabilitySnapshot> {
+        let provider = self
+            .runtime_resources
+            .browser_capability_provider
+            .as_ref()?;
+        let mut snapshot = provider(session_id);
+        snapshot.access_profile = access_profile;
+        Some(snapshot)
     }
 
     pub fn register_builtin(&mut self, tool: Arc<dyn BuiltinTool>) {

@@ -1,4 +1,5 @@
 mod app;
+mod browser_runtime;
 mod config;
 mod events;
 mod maintenance;

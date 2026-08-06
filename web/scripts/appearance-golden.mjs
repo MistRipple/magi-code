@@ -70,6 +70,9 @@ assert.match(modal, /data-magi-surface="window"/, '通用 Modal 必须接入统�
 assert.match(settingsPanel, /magi-settings-layout" data-magi-surface="window"/, '设置窗口必须接入统一窗口材质');
 assert.match(settingsAppearance, /theme-editor" data-magi-surface="window"[\s\S]*?confirm-dialog" data-magi-surface="critical"/, '主题编辑与关键确认必须使用对应语义材质');
 assert.match(modelConfigForm, /model-dropdown"[\s\S]*?data-magi-surface="popover"/, '模型选择浮层必须接入统一悬浮材质');
+assert.match(modelConfigForm, /function portalToBody[\s\S]*?document\.body\.appendChild\(node\)/, '模型选择浮层必须挂载到页面根层，不能受设置窗口坐标系与裁切影响');
+assert.match(modelConfigForm, /use:portalToBody[\s\S]*?class="model-dropdown"/, '模型选择列表必须通过统一根层 portal 渲染');
+assert.match(modelConfigForm, /addEventListener\('scroll', handleScroll, true\)/, '模型选择浮层必须在任意滚动容器滚动时关闭，避免脱离锚点');
 assert.match(enginePicker, /engine-picker-popup"[\s\S]*?data-magi-surface="popover"/, '代理模型选择浮层必须接入统一悬浮材质');
 assert.match(knowledgePanel, /kp-confirm-dialog" data-magi-surface="critical"/, '知识库关键确认必须接入统一关键材质');
 assert.match(runtimeStatePanel, /runtime-diagnostics__content" data-magi-surface="popover"/, '运行态展开面板必须接入统一悬浮材质');

@@ -15,6 +15,7 @@
     compConfig = $bindable(),
     imageConfig = $bindable(),
     workerConfigs = $bindable(),
+    modelConfigBaselines,
     workerModelTabs,
     modelStatuses,
     saveStatus,
@@ -47,6 +48,7 @@
     compConfig: any;
     imageConfig: any;
     workerConfigs: Record<string, any>;
+    modelConfigBaselines: Record<string, any>;
     workerModelTabs: string[];
     modelStatuses: Record<string, { status?: string }>;
     saveStatus: Record<string, string>;
@@ -62,10 +64,10 @@
     shouldRecommendStandardUrlMode: (baseUrl: string) => boolean;
     openModelDropdown: (type: string, target: HTMLElement) => void;
     closeModelDropdown: (key: string) => void;
-    fetchModelList: (type: 'orch' | 'comp' | 'image' | 'worker') => void;
+    fetchModelList: (type: 'orch' | 'comp' | 'image' | 'worker', statusKey: string) => void;
     selectModel: (type: string, model: string) => void;
-    saveModelConfig: (type: 'orch' | 'comp' | 'image' | 'worker') => void;
-    testModelConnection: (type: 'orch' | 'comp' | 'image' | 'worker') => void;
+    saveModelConfig: (type: 'orch' | 'comp' | 'image' | 'worker', statusKey: string) => void;
+    testModelConnection: (type: 'orch' | 'comp' | 'image' | 'worker', statusKey: string) => void;
     getStatusClass: (status: string) => string;
     getStatusText: (status: string) => string;
     getWorkerDisplayName: (workerId: string) => string;
@@ -306,6 +308,7 @@
             formType="orch"
             statusKey="orch"
             bind:config={orchConfig}
+            baselineConfig={modelConfigBaselines.orch}
             bind:keyVisible
             showModelField={false}
             showAdvancedOptions={false}
@@ -330,6 +333,7 @@
             formType="comp"
             statusKey="comp"
             bind:config={compConfig}
+            baselineConfig={modelConfigBaselines.comp}
             bind:keyVisible
             showAdvancedOptions={false}
             description={i18n.t('settings.model.auxiliaryDesc')}
@@ -353,6 +357,7 @@
             formType="image"
             statusKey="image"
             bind:config={imageConfig}
+            baselineConfig={modelConfigBaselines.image}
             bind:keyVisible
             showAdvancedOptions={false}
             description={i18n.t('settings.model.imageGenerationDesc')}
@@ -376,6 +381,7 @@
             formType="worker"
             statusKey={modelConfigTab}
             bind:config={workerConfigs[modelConfigTab]}
+            baselineConfig={modelConfigBaselines[modelConfigTab]}
             bind:keyVisible
             showAdvancedOptions={true}
             description={null}

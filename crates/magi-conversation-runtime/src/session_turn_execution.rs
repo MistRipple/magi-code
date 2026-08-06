@@ -46,7 +46,10 @@ use crate::{
         invalid_tool_result_message, validate_tool_call_batch,
     },
     tool_execution_ledger::ToolExecutionLedger,
-    tool_surface_state::{activate_skill_tool_definitions, refresh_live_mcp_tool_definitions},
+    tool_surface_state::{
+        BrowserToolSurfaceContext, activate_skill_tool_definitions,
+        refresh_live_browser_tool_definitions, refresh_live_mcp_tool_definitions,
+    },
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
         account_active_goal_usage, publish_model_usage_record, session_turn_model_usage_binding,
@@ -887,9 +890,24 @@ fn run_session_turn_execution_inner(
     let mut last_response_observation: Option<String> = None;
     let mut round = 0usize;
     loop {
+        let mut browser_capability_revision = None;
         if request.use_tools
             && let Some(registry) = tool_registry
         {
+            let browser_surface = refresh_live_browser_tool_definitions(
+                active_tools,
+                registry,
+                BrowserToolSurfaceContext::new(
+                    skill_runtime,
+                    active_skill_name.as_deref(),
+                    request.access_profile,
+                    None,
+                    &[],
+                    Some(&request.session_id),
+                ),
+            );
+            active_tools = browser_surface.definitions;
+            browser_capability_revision = browser_surface.capability_revision;
             active_tools = refresh_live_mcp_tool_definitions(
                 active_tools,
                 registry,
@@ -949,6 +967,7 @@ fn run_session_turn_execution_inner(
                 usage_binding: &usage_binding,
                 prompt: &prompt,
                 tools: round_tools,
+                browser_capability_revision,
                 messages: &mut messages,
                 completed_required_tool_names: &completed_required_tool_names,
                 pre_output_invocation_recovery_attempts,
@@ -1489,6 +1508,7 @@ struct SessionTurnRoundRuntime<'a> {
     usage_binding: &'a ModelUsageBinding,
     prompt: &'a str,
     tools: Option<Vec<ChatToolDefinition>>,
+    browser_capability_revision: Option<u64>,
     messages: &'a mut Vec<ChatMessage>,
     completed_required_tool_names: &'a [String],
     pre_output_invocation_recovery_attempts: usize,
@@ -1613,6 +1633,7 @@ fn stream_session_turn_round(
         usage_binding,
         prompt,
         tools,
+        browser_capability_revision,
         messages,
         completed_required_tool_names,
         pre_output_invocation_recovery_attempts,
@@ -2259,6 +2280,7 @@ fn stream_session_turn_round(
                     workspace_root_path: request.workspace_root_path.as_deref().map(PathBuf::from),
                     context_references: &request.context_references,
                     access_profile: request.access_profile,
+                    browser_capability_revision,
                     snapshot_session,
                     execution_group_id: Some(execution_group_id),
                     source_thread_id: orchestrator_thread_id,
@@ -4522,6 +4544,7 @@ mod tests {
                 usage_binding: &usage_binding,
                 prompt: &request.prompt,
                 tools: None,
+                browser_capability_revision: None,
                 messages: &mut messages,
                 completed_required_tool_names: &[],
                 pre_output_invocation_recovery_attempts: 0,
@@ -4656,6 +4679,7 @@ mod tests {
                 usage_binding: &usage_binding,
                 prompt: &request.prompt,
                 tools: None,
+                browser_capability_revision: None,
                 messages: &mut messages,
                 completed_required_tool_names: &[],
                 pre_output_invocation_recovery_attempts: 0,

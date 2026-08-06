@@ -157,6 +157,30 @@
     text-decoration: underline;
   }
 
+  .markdown-content :global(.md-link-external) {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 17px;
+    height: 17px;
+    margin: 0 1px 0 2px;
+    padding: 0;
+    border: 0;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--foreground-muted);
+    vertical-align: text-bottom;
+    cursor: pointer;
+    opacity: .68;
+  }
+
+  .markdown-content :global(.md-link-external:hover),
+  .markdown-content :global(.md-link-external:focus-visible) {
+    background: var(--surface-2);
+    color: var(--foreground);
+    opacity: 1;
+  }
+
   /* 内联代码样式 */
   .markdown-content :global(:not(pre) > code) {
     background: var(--code-bg, rgba(0,0,0,0.2));

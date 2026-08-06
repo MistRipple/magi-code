@@ -28,7 +28,8 @@ use crate::tool_result_utils::{
     summarize_tool_result, tool_execution_status_label, turn_item_status_for_tool_result,
 };
 use crate::tool_surface_state::{
-    activate_skill_tool_definitions, activated_skill_id_from_tool_result,
+    BrowserToolSurfaceContext, activate_skill_tool_definitions,
+    activated_skill_id_from_tool_result, refresh_live_browser_tool_definitions,
     refresh_live_mcp_tool_definitions,
 };
 use crate::{
@@ -542,16 +543,16 @@ fn task_round_tool_definitions(
     active_tools: &[ChatToolDefinition],
     required_tool_chain: &[String],
     completed_required_tool_names: &[String],
-    preserve_goal_control_surface: bool,
+    constrain_to_recovery_tool: bool,
 ) -> Vec<ChatToolDefinition> {
-    if preserve_goal_control_surface {
-        active_tools.to_vec()
-    } else {
+    if constrain_to_recovery_tool {
         required_tool_definitions_for_round(
             active_tools,
             required_tool_chain,
             completed_required_tool_names,
         )
+    } else {
+        active_tools.to_vec()
     }
 }
 
@@ -1165,6 +1166,7 @@ fn run_conversation_loop_inner(
             &mut messages,
             conversation_registry.drain_task_signals(session_id, task_id),
         );
+        let mut browser_capability_revision = None;
         if let Some(registry) = tool_registry {
             let policy = task.policy_snapshot.as_ref();
             let access_profile = policy
@@ -1176,6 +1178,20 @@ fn run_conversation_loop_inner(
             let denied_tools = policy
                 .map(|policy| policy.denied_tools.as_slice())
                 .unwrap_or_default();
+            let browser_surface = refresh_live_browser_tool_definitions(
+                active_tools,
+                registry,
+                BrowserToolSurfaceContext::new(
+                    skill_runtime,
+                    active_skill_name.as_deref(),
+                    access_profile,
+                    allowed_tools,
+                    denied_tools,
+                    Some(session_id),
+                ),
+            );
+            active_tools = browser_surface.definitions;
+            browser_capability_revision = browser_surface.capability_revision;
             active_tools = refresh_live_mcp_tool_definitions(
                 active_tools,
                 registry,
@@ -1211,13 +1227,13 @@ fn run_conversation_loop_inner(
         } else {
             (&evidence_recovery_chain, &empty_completed_tools)
         };
-        let preserve_goal_control_surface =
-            round_goal_id.is_some() && evidence_recovery_chain.is_empty();
+        let constrain_to_recovery_tool =
+            round_goal_id.is_none() && !evidence_recovery_chain.is_empty();
         let round_tool_definitions = task_round_tool_definitions(
             &active_tools,
             round_required_tools,
             round_completed_tools,
-            preserve_goal_control_surface,
+            constrain_to_recovery_tool,
         );
         let round_tools = (!round_tool_definitions.is_empty()).then_some(round_tool_definitions);
         if context_budget_recheck_required {
@@ -1246,14 +1262,14 @@ fn run_conversation_loop_inner(
             prompt: prompt.clone(),
             messages: Some(messages.clone()),
             tools: round_tools.clone(),
-            tool_choice: if preserve_goal_control_surface {
-                None
-            } else {
+            tool_choice: if constrain_to_recovery_tool {
                 forced_task_tool_choice_for_round(
                     round_required_tools,
                     round_tools.as_ref(),
                     round_completed_tools,
                 )
+            } else {
+                None
             },
         };
         let round_call_id = format!("task-{}-{}-{round}", task_id, lease_id);
@@ -2110,6 +2126,7 @@ fn run_conversation_loop_inner(
             workspace_id,
             workspace_root_path.as_ref(),
             turn_visibility.worker_id(),
+            browser_capability_revision,
             &valid_tool_calls,
             &mut tool_execution_ledger,
             Some(&tool_progress_callback),
@@ -4836,7 +4853,7 @@ mod tests {
     }
 
     #[test]
-    fn active_goal_round_keeps_control_tools_during_incomplete_required_action() {
+    fn ordinary_task_round_keeps_full_surface_and_recovery_round_is_targeted() {
         let tools = vec![
             exposed_test_tool("shell_exec"),
             exposed_test_tool("update_plan"),
@@ -4846,22 +4863,22 @@ mod tests {
         let required = vec!["shell_exec".to_string()];
 
         let regular = task_round_tool_definitions(&tools, &required, &[], false);
-        assert_eq!(
-            regular
-                .iter()
-                .map(|tool| tool.function.name.as_str())
-                .collect::<Vec<_>>(),
-            ["shell_exec"]
-        );
-
-        let goal_driven = task_round_tool_definitions(&tools, &required, &[], true);
-        let names = goal_driven
+        let regular_names = regular
             .iter()
             .map(|tool| tool.function.name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(
-            names,
+            regular_names,
             ["shell_exec", "update_plan", "update_goal", "file_read"]
+        );
+
+        let recovery = task_round_tool_definitions(&tools, &required, &[], true);
+        assert_eq!(
+            recovery
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["shell_exec"]
         );
     }
 

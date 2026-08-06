@@ -1669,6 +1669,7 @@ mod tests {
             session_id: Some(magi_core::SessionId::new("ss-skill")),
             workspace_id: Some(magi_core::WorkspaceId::new("ws-skill")),
             access_profile: magi_core::AccessProfile::Restricted,
+            browser_capability_revision: None,
             working_directory: None,
         };
 

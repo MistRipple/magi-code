@@ -56,6 +56,12 @@ pub struct ToolExecutionContext {
     pub access_profile: magi_core::AccessProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<PathBuf>,
+    /// 当前模型轮次收到的浏览器能力快照 revision。
+    ///
+    /// 浏览器工具目录与执行校验必须使用同一 revision；该值由对话运行时在
+    /// 每次模型调用前捕获，不能在工具执行时重新读取最新 revision。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_capability_revision: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -205,6 +211,15 @@ pub type GitToolExecutor = Arc<
         + Send
         + Sync
         + 'static,
+>;
+pub type BrowserToolExecutor = Arc<
+    dyn Fn(&ToolCallId, &str, &str, &ToolExecutionContext) -> (String, ExecutionResultStatus)
+        + Send
+        + Sync
+        + 'static,
+>;
+pub type BrowserCapabilityProvider = Arc<
+    dyn Fn(Option<&SessionId>) -> magi_browser_runtime::BrowserCapabilitySnapshot + Send + Sync,
 >;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -359,6 +374,8 @@ pub struct ToolRuntimeResources {
     pub image_generation_executor: Option<ImageGenerationExecutor>,
     pub image_generation_readiness_provider: Option<ImageGenerationReadinessProvider>,
     pub git_tool_executor: Option<GitToolExecutor>,
+    pub browser_tool_executor: Option<BrowserToolExecutor>,
+    pub browser_capability_provider: Option<BrowserCapabilityProvider>,
 }
 
 pub trait BuiltinTool: Send + Sync {

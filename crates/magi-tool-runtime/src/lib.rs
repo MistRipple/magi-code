@@ -24,9 +24,10 @@ pub use policy::{
 pub use registry::ToolRegistry;
 pub use types::external_mcp_model_tool_name;
 pub use types::{
-    AgentRoleCatalogEntry, AgentRoleCatalogProvider, BuiltinTool, ExternalMcpServerCatalogEntry,
-    ExternalMcpToolCatalogEntry, ExternalMcpToolExecutor, ExternalToolCatalogEntry,
-    ExternalToolCatalogProvider, ExternalToolCatalogSnapshot, GeneratedImageData, GitToolExecutor,
+    AgentRoleCatalogEntry, AgentRoleCatalogProvider, BrowserCapabilityProvider,
+    BrowserToolExecutor, BuiltinTool, ExternalMcpServerCatalogEntry, ExternalMcpToolCatalogEntry,
+    ExternalMcpToolExecutor, ExternalToolCatalogEntry, ExternalToolCatalogProvider,
+    ExternalToolCatalogSnapshot, GeneratedImageData, GitToolExecutor,
     ImageGenerationExecutionContext, ImageGenerationExecutor, ImageGenerationReadinessProvider,
     ImageGenerationRequest, RuntimeCapabilityDependencyEntry, RuntimeCapabilityDependencyProvider,
     ToolExecutionContext, ToolExecutionContextQuery, ToolExecutionInput, ToolExecutionOutput,

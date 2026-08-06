@@ -573,6 +573,8 @@ export interface Message {
   images?: MessageImage[];
   /** 用户显式添加的文件或目录上下文引用。 */
   contextReferences?: MessageContextReference[];
+  /** 用户在内置浏览器中创建并随本轮提交的权威标记引用。 */
+  browserAnnotationRefs?: MessageBrowserAnnotationReference[];
   metadata?: {
     model?: string;
     tokens?: number;
@@ -597,6 +599,15 @@ export interface Message {
     lateFromCardId?: string;          // 晚到来源 cardId
     [key: string]: unknown;
   };
+}
+
+export interface MessageBrowserAnnotationReference {
+  annotationId: string;
+  browserSessionId: string;
+  tabId: string;
+  kind: 'element' | 'region';
+  comment: string;
+  screenshotArtifactId?: string | null;
 }
 
 export type { AgentId, AnyAgentId };
@@ -684,6 +695,15 @@ export interface QueuedMessageContextReference {
   name: string;
 }
 
+export interface QueuedMessageBrowserAnnotationReference {
+  annotationId: string;
+  browserSessionId: string;
+  tabId: string;
+  kind: 'element' | 'region';
+  comment: string;
+  screenshotArtifactId?: string | null;
+}
+
 export interface QueuedMessage {
   id: string;
   requestId?: string;
@@ -701,6 +721,7 @@ export interface QueuedMessage {
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   images?: QueuedMessageImage[];
   contextReferences?: QueuedMessageContextReference[];
+  browserAnnotationRefs?: string[];
 }
 
 // 处理中的 Actor

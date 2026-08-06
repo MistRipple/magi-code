@@ -36,5 +36,6 @@ sysinfo.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+magi-browser-runtime = { path = "../magi-browser-runtime" }
 magi-process = { path = "../magi-process" }
 tempfile = "3"

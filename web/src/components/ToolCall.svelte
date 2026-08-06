@@ -420,10 +420,14 @@
   const generatedImagePreview = $derived(
     detailVisible && !outputIsStructuredError ? parseImageGenerationPreview(name, output) : null,
   );
+  // view_image 的模型结果包含可直接渲染的 base64 数据。它必须在卡片折叠时
+  // 也可用，因为用户点击工具卡标题就是直接打开图片预览的入口。
+  const viewImagePreview = $derived(
+    !outputIsStructuredError ? parseViewImagePreview(name, output) : null,
+  );
   const imagePreview = $derived.by(() => {
     if (!detailVisible || outputIsStructuredError) return null;
-    const viewed = parseViewImagePreview(name, output);
-    if (viewed) return { ...viewed, revisedPrompt: '' };
+    if (viewImagePreview) return { ...viewImagePreview, revisedPrompt: '' };
     if (!generatedImagePreview) return null;
     return {
       ...generatedImagePreview,
@@ -813,9 +817,21 @@
     if (!toolFilepath) {
       return;
     }
+    const directImagePreview = viewImagePreview;
     if (typeof window !== 'undefined') {
       const previewEvent = new CustomEvent('magi:previewFile', {
-        detail: { filepath: toolFilepath, ...filePreviewScope },
+        detail: {
+          filepath: toolFilepath,
+          ...filePreviewScope,
+          ...(directImagePreview?.path === toolFilepath
+            ? {
+                imageDataUrl: directImagePreview.src,
+                mime: directImagePreview.mime,
+                size: directImagePreview.bytes,
+                contentKind: 'binary',
+              }
+            : {}),
+        },
         cancelable: true,
       });
       window.dispatchEvent(previewEvent);

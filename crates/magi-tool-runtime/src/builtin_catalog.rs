@@ -29,6 +29,15 @@ pub enum BuiltinToolName {
     // ── Web ──
     WebSearch,
     WebFetch,
+    BrowserNavigate,
+    BrowserSnapshot,
+    BrowserClick,
+    BrowserType,
+    BrowserPress,
+    BrowserScroll,
+    BrowserScreenshot,
+    BrowserTabs,
+    BrowserViewport,
     // ── 可视化 ──
     DiagramRender,
     /// 通过已配置的图片生成模型生成图片并保存到当前工作区。
@@ -92,7 +101,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 49] = [
+    pub const ALL: [Self; 58] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -114,6 +123,15 @@ impl BuiltinToolName {
         Self::DiffPreview,
         Self::WebSearch,
         Self::WebFetch,
+        Self::BrowserNavigate,
+        Self::BrowserSnapshot,
+        Self::BrowserClick,
+        Self::BrowserType,
+        Self::BrowserPress,
+        Self::BrowserScroll,
+        Self::BrowserScreenshot,
+        Self::BrowserTabs,
+        Self::BrowserViewport,
         Self::DiagramRender,
         Self::ImageGenerate,
         Self::KnowledgeQuery,
@@ -167,6 +185,15 @@ impl BuiltinToolName {
             Self::DiffPreview => "diff_preview",
             Self::WebSearch => "web_search",
             Self::WebFetch => "web_fetch",
+            Self::BrowserNavigate => "browser_navigate",
+            Self::BrowserSnapshot => "browser_snapshot",
+            Self::BrowserClick => "browser_click",
+            Self::BrowserType => "browser_type",
+            Self::BrowserPress => "browser_press",
+            Self::BrowserScroll => "browser_scroll",
+            Self::BrowserScreenshot => "browser_screenshot",
+            Self::BrowserTabs => "browser_tabs",
+            Self::BrowserViewport => "browser_viewport",
             Self::DiagramRender => "diagram_render",
             Self::ImageGenerate => "image_generate",
             Self::KnowledgeQuery => "knowledge_query",
@@ -219,6 +246,15 @@ impl BuiltinToolName {
             | Self::ProcessInspect => "process",
             Self::DiffPreview => "diff",
             Self::WebSearch | Self::WebFetch => "web",
+            Self::BrowserNavigate
+            | Self::BrowserSnapshot
+            | Self::BrowserClick
+            | Self::BrowserType
+            | Self::BrowserPress
+            | Self::BrowserScroll
+            | Self::BrowserScreenshot
+            | Self::BrowserTabs
+            | Self::BrowserViewport => "browser",
             Self::DiagramRender | Self::ImageGenerate => "visualization",
             Self::KnowledgeQuery => "knowledge",
             Self::ToolCatalog => "tooling",
@@ -269,6 +305,15 @@ impl BuiltinToolName {
             "diff_preview" => Some(Self::DiffPreview),
             "web_search" => Some(Self::WebSearch),
             "web_fetch" => Some(Self::WebFetch),
+            "browser_navigate" => Some(Self::BrowserNavigate),
+            "browser_snapshot" => Some(Self::BrowserSnapshot),
+            "browser_click" => Some(Self::BrowserClick),
+            "browser_type" => Some(Self::BrowserType),
+            "browser_press" => Some(Self::BrowserPress),
+            "browser_scroll" => Some(Self::BrowserScroll),
+            "browser_screenshot" => Some(Self::BrowserScreenshot),
+            "browser_tabs" => Some(Self::BrowserTabs),
+            "browser_viewport" => Some(Self::BrowserViewport),
             "diagram_render" => Some(Self::DiagramRender),
             "image_generate" => Some(Self::ImageGenerate),
             "knowledge_query" => Some(Self::KnowledgeQuery),
@@ -301,6 +346,21 @@ impl BuiltinToolName {
         }
     }
 
+    pub fn browser_tool_kind(&self) -> Option<magi_browser_runtime::BrowserToolKind> {
+        match self {
+            Self::BrowserNavigate => Some(magi_browser_runtime::BrowserToolKind::Navigate),
+            Self::BrowserSnapshot => Some(magi_browser_runtime::BrowserToolKind::Snapshot),
+            Self::BrowserClick => Some(magi_browser_runtime::BrowserToolKind::Click),
+            Self::BrowserType => Some(magi_browser_runtime::BrowserToolKind::Type),
+            Self::BrowserPress => Some(magi_browser_runtime::BrowserToolKind::Press),
+            Self::BrowserScroll => Some(magi_browser_runtime::BrowserToolKind::Scroll),
+            Self::BrowserScreenshot => Some(magi_browser_runtime::BrowserToolKind::Screenshot),
+            Self::BrowserTabs => Some(magi_browser_runtime::BrowserToolKind::Tabs),
+            Self::BrowserViewport => Some(magi_browser_runtime::BrowserToolKind::Viewport),
+            _ => None,
+        }
+    }
+
     pub fn is_write_operation(&self) -> bool {
         matches!(
             self,
@@ -327,6 +387,12 @@ impl BuiltinToolName {
                 | Self::UpdateGoal
                 | Self::UpdatePlan
                 | Self::MemoryWrite
+                | Self::BrowserClick
+                | Self::BrowserType
+                | Self::BrowserPress
+                | Self::BrowserScroll
+                | Self::BrowserTabs
+                | Self::BrowserViewport
         )
     }
 
@@ -354,6 +420,8 @@ impl BuiltinToolName {
                 | Self::GitWorktreeList
                 | Self::ContextSearch
                 | Self::ContextRead
+                | Self::BrowserSnapshot
+                | Self::BrowserScreenshot
         )
     }
 
@@ -394,7 +462,9 @@ impl BuiltinToolName {
     }
 
     pub fn default_access_mode(&self) -> BuiltinToolAccessMode {
-        if matches!(
+        if self.browser_tool_kind().is_some() {
+            BuiltinToolAccessMode::ReadOnly
+        } else if matches!(
             self,
             Self::ShellExec | Self::ProcessLaunch | Self::ProcessWrite | Self::ProcessKill
         ) {
@@ -435,6 +505,12 @@ impl BuiltinToolName {
             | Self::UpdateGoal
             | Self::UpdatePlan
             | Self::MemoryWrite => RestrictedWriteProfilePolicy::AutoAllowed,
+            Self::BrowserClick
+            | Self::BrowserType
+            | Self::BrowserPress
+            | Self::BrowserScroll
+            | Self::BrowserTabs
+            | Self::BrowserViewport => RestrictedWriteProfilePolicy::AutoAllowed,
             _ => return None,
         };
         Some(policy)
@@ -510,7 +586,11 @@ impl BuiltinToolName {
             | Self::ContextRead
             | Self::ContextRequest
             | Self::UpdatePlan
-            | Self::MemoryWrite => RiskLevel::Low,
+            | Self::MemoryWrite
+            | Self::BrowserNavigate
+            | Self::BrowserSnapshot
+            | Self::BrowserScreenshot
+            | Self::BrowserViewport => RiskLevel::Low,
             Self::FileWrite
             | Self::FilePatch
             | Self::ApplyPatch
@@ -521,7 +601,12 @@ impl BuiltinToolName {
             | Self::GitBranchSwitch
             | Self::GitWorktreeCreate
             | Self::ProcessWrite
-            | Self::AgentSpawn => RiskLevel::Medium,
+            | Self::AgentSpawn
+            | Self::BrowserClick
+            | Self::BrowserType
+            | Self::BrowserPress
+            | Self::BrowserScroll
+            | Self::BrowserTabs => RiskLevel::Medium,
             Self::FileRemove
             | Self::ShellExec
             | Self::ProcessLaunch
@@ -672,6 +757,25 @@ impl BuiltinToolName {
             Self::DiffPreview => "对两段文本生成 unified diff 预览",
             Self::WebSearch => "通过 DuckDuckGo 搜索网络并返回结果",
             Self::WebFetch => "抓取一个 URL 的内容并将 HTML 转为 markdown",
+            Self::BrowserNavigate => {
+                "在 Magi 内置浏览器中创建或复用页面，并执行 URL 导航、后退、前进或刷新。"
+            }
+            Self::BrowserSnapshot => {
+                "读取当前浏览器页面的紧凑可访问性快照。返回的元素 ref 只在同一 snapshot_revision 内有效。"
+            }
+            Self::BrowserClick => {
+                "点击当前浏览器快照中的元素。必须传入 browser_snapshot 返回的 element_ref 和 snapshot_revision。"
+            }
+            Self::BrowserType => {
+                "向当前浏览器快照中的可编辑元素输入文本。不能用于密码、验证码或支付字段。"
+            }
+            Self::BrowserPress => "向当前浏览器页面发送一个按键或组合键。",
+            Self::BrowserScroll => "滚动当前浏览器页面或快照中的指定元素。",
+            Self::BrowserScreenshot => "截取当前浏览器页面或指定元素并返回图片 artifact。",
+            Self::BrowserTabs => "列出、激活、新建或关闭当前 Magi 会话的内置浏览器标签页。",
+            Self::BrowserViewport => {
+                "读取或设置当前内置浏览器页面的设备视口。设置时会同步应用 CSS 视口、宽屏或窄屏设备类型、移动端 UA 与触控语义；适合验证电脑/平板宽屏和手机窄屏响应式布局，而不是裁切桌面页面。"
+            }
             Self::DiagramRender => {
                 "渲染图表：支持 Mermaid、DOT、结构化 graph 节点/边、结构化 flow 节点/边"
             }
@@ -1058,6 +1162,91 @@ impl BuiltinToolName {
                     "url": { "type": "string", "description": "要抓取内容的 URL" }
                 },
                 "required": ["url"]
+            }),
+            Self::BrowserNavigate => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["url", "back", "forward", "reload"] },
+                    "url": { "type": "string", "description": "action=url 时必填" },
+                    "tab_id": { "type": "string", "description": "可选；省略时使用活动标签页" }
+                },
+                "required": ["action"]
+            }),
+            Self::BrowserSnapshot => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string", "description": "可选；省略时使用活动标签页" },
+                    "subtree_ref": { "type": "string", "description": "读取截断快照的指定子树" }
+                },
+                "required": []
+            }),
+            Self::BrowserClick => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "snapshot_revision": { "type": "integer", "minimum": 1 },
+                    "element_ref": { "type": "string" }
+                },
+                "required": ["snapshot_revision", "element_ref"]
+            }),
+            Self::BrowserType => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "snapshot_revision": { "type": "integer", "minimum": 1 },
+                    "element_ref": { "type": "string" },
+                    "text": { "type": "string" },
+                    "replace": { "type": "boolean", "description": "默认 true" }
+                },
+                "required": ["snapshot_revision", "element_ref", "text"]
+            }),
+            Self::BrowserPress => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "key": { "type": "string", "description": "按键或组合键，例如 Enter、Control+L" }
+                },
+                "required": ["key"]
+            }),
+            Self::BrowserScroll => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "snapshot_revision": { "type": "integer", "minimum": 1 },
+                    "element_ref": { "type": "string", "description": "可选；省略时滚动页面" },
+                    "delta_x": { "type": "number" },
+                    "delta_y": { "type": "number" }
+                },
+                "required": ["delta_y"]
+            }),
+            Self::BrowserScreenshot => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "snapshot_revision": { "type": "integer", "minimum": 1 },
+                    "element_ref": { "type": "string", "description": "可选；省略时截取页面" },
+                    "full_page": { "type": "boolean", "description": "默认 false" }
+                },
+                "required": []
+            }),
+            Self::BrowserTabs => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "new", "activate", "close"] },
+                    "tab_id": { "type": "string", "description": "activate/close 时必填" }
+                },
+                "required": ["action"]
+            }),
+            Self::BrowserViewport => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["get", "set"] },
+                    "tab_id": { "type": "string", "description": "可选；省略时使用活动标签页" },
+                    "width": { "type": "integer", "minimum": 320, "maximum": 7680, "description": "action=set 时必填" },
+                    "height": { "type": "integer", "minimum": 240, "maximum": 4320, "description": "action=set 时必填" },
+                    "device_type": { "type": "string", "enum": ["desktop", "mobile"], "description": "action=set 时可选；宽度 320-600 固定为 mobile，601 以上固定为 desktop，传入值必须与 width 一致。mobile 启用手机窄屏仿真，desktop 表示电脑/平板宽屏。" }
+                },
+                "required": ["action"]
             }),
             Self::DiagramRender => serde_json::json!({
                 "type": "object",

@@ -77,6 +77,7 @@ export interface TurnEditingDraft {
   text: string;
   images: NonNullable<Message['images']>;
   contextReferences: NonNullable<Message['contextReferences']>;
+  browserAnnotationRefs: NonNullable<Message['browserAnnotationRefs']>;
   skillName: string | null;
   goalMode: boolean;
 }
@@ -1855,6 +1856,7 @@ export function beginTurnEditing(draft: TurnEditingDraft): void {
     text: draft.text,
     images: draft.images.map((image) => ({ ...image })),
     contextReferences: draft.contextReferences.map((reference) => ({ ...reference })),
+    browserAnnotationRefs: draft.browserAnnotationRefs.map((reference) => ({ ...reference })),
     skillName: draft.skillName?.trim() || null,
     goalMode: draft.goalMode === true,
   };

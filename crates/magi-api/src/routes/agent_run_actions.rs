@@ -380,6 +380,7 @@ async fn restart_task(
         goal_mode: false,
         images: Vec::new(),
         context_references: Vec::new(),
+        browser_annotation_refs: Vec::new(),
         access_profile: root_task
             .policy_snapshot
             .as_ref()

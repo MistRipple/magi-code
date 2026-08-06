@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+arboard = { version = "3.6.1", default-features = false }
 axum.workspace = true
 base64.workspace = true
 futures-util.workspace = true
@@ -15,6 +16,7 @@ tracing.workspace = true
 reqwest.workspace = true
 urlencoding = "2"
 magi-core = { path = "../magi-core" }
+magi-browser-runtime = { path = "../magi-browser-runtime" }
 magi-appearance = { path = "../magi-appearance" }
 magi-agent-role = { path = "../magi-agent-role" }
 magi-bridge-client = { path = "../magi-bridge-client" }

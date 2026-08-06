@@ -9,6 +9,8 @@ export interface FilePreviewEventDetail {
   symlinkTarget?: string;
   headSummary?: string;
   tailSummary?: string;
+  /** 工具结果中已经可用的瞬时图片数据；仅在当前内存预览链中传递。 */
+  imageDataUrl?: string;
 }
 
 export type FilePreviewScope = Pick<FilePreviewEventDetail, 'workspaceId' | 'workspacePath' | 'sessionId'>;

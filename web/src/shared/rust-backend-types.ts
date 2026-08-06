@@ -42,6 +42,7 @@ export interface SessionTurnRequestDto {
     pathRef?: string;
     name: string;
   }>;
+  browserAnnotationRefs?: string[];
   accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
   orchestratorSessionConfig?: Record<string, unknown> | null;
   requestId?: string | null;
@@ -96,6 +97,7 @@ export interface QueuedSessionTurnDto {
     pathRef?: string;
     name: string;
   }>;
+  browserAnnotationRefs: string[];
   retryCount: number;
 }
 

@@ -219,6 +219,7 @@ pub(crate) fn execute_task_tool_call_batch(
     workspace_id: &Option<WorkspaceId>,
     workspace_root_path: Option<&PathBuf>,
     worker_id: Option<&magi_core::WorkerId>,
+    browser_capability_revision: Option<u64>,
     tool_calls: &[ChatToolCall],
     tool_execution_ledger: &mut ToolExecutionLedger,
     on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
@@ -246,6 +247,7 @@ pub(crate) fn execute_task_tool_call_batch(
             workspace_id,
             workspace_root_path,
             worker_id,
+            browser_capability_revision,
             execution_calls,
             on_progress,
             snapshot_session.clone(),
@@ -275,6 +277,7 @@ fn execute_task_tool_call_batch_unchecked(
     workspace_id: &Option<WorkspaceId>,
     workspace_root_path: Option<&PathBuf>,
     worker_id: Option<&magi_core::WorkerId>,
+    browser_capability_revision: Option<u64>,
     tool_calls: &[ChatToolCall],
     on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
     snapshot_session: Option<Arc<SnapshotSession>>,
@@ -345,6 +348,7 @@ fn execute_task_tool_call_batch_unchecked(
                                 workspace_id,
                                 workspace_root_path,
                                 worker_id,
+                                browser_capability_revision,
                                 tool_call,
                                 on_progress,
                             )
@@ -406,6 +410,7 @@ fn execute_task_tool_call_batch_unchecked(
                                                 workspace_id,
                                                 workspace_root_path,
                                                 worker_id,
+                                                browser_capability_revision,
                                                 tool_call,
                                                 on_progress,
                                             )
@@ -2732,6 +2737,7 @@ fn execute_task_tool_call(
     workspace_id: &Option<WorkspaceId>,
     workspace_root_path: Option<&PathBuf>,
     worker_id: Option<&magi_core::WorkerId>,
+    browser_capability_revision: Option<u64>,
     tool_call: &ChatToolCall,
     on_progress: Option<&(dyn Fn(ToolExecutionProgress) + Sync)>,
 ) -> (String, ExecutionResultStatus) {
@@ -2926,6 +2932,7 @@ fn execute_task_tool_call(
                 workspace_id: workspace_id.clone(),
                 access_profile,
                 working_directory: workspace_root_path.cloned(),
+                browser_capability_revision,
             },
             workspace_root_path
                 .as_ref()
@@ -2960,6 +2967,7 @@ fn execute_task_tool_call(
         workspace_id: workspace_id.clone(),
         access_profile: tool_policy.access_profile,
         working_directory: workspace_root_path.cloned(),
+        browser_capability_revision,
     };
     let output = match on_progress {
         Some(on_progress) => {
@@ -3716,6 +3724,7 @@ mod tests {
             &workspace_id,
             None,
             None,
+            None,
             &first_round_calls,
             &mut ledger,
             None,
@@ -3759,6 +3768,7 @@ mod tests {
             &task,
             &session_id,
             &workspace_id,
+            None,
             None,
             None,
             &[second_round_call],
@@ -3822,6 +3832,7 @@ mod tests {
             &workspace_id,
             None,
             None,
+            None,
             &[ChatToolCall {
                 id: "call-web-search-budget-1".to_string(),
                 kind: "function".to_string(),
@@ -3855,6 +3866,7 @@ mod tests {
             &task,
             &session_id,
             &workspace_id,
+            None,
             None,
             None,
             &[ChatToolCall {
@@ -4266,6 +4278,7 @@ mod tests {
             &workspace_id,
             None,
             None,
+            None,
             &tool_call,
             None,
         );
@@ -4324,6 +4337,7 @@ mod tests {
                 &task,
                 &session_id,
                 &workspace_id,
+                None,
                 None,
                 None,
                 &tool_call,
@@ -5426,6 +5440,7 @@ mod tests {
             &workspace_id,
             Some(&dir.path().to_path_buf()),
             None,
+            None,
             &[tool_call],
             &mut ToolExecutionLedger::default(),
             None,
@@ -5508,6 +5523,7 @@ mod tests {
             &workspace_id,
             Some(&dir.path().to_path_buf()),
             None,
+            None,
             &[tool_call],
             &mut ToolExecutionLedger::default(),
             Some(&on_progress),
@@ -5574,6 +5590,7 @@ mod tests {
             &task,
             &session_id,
             &workspace_id,
+            None,
             None,
             None,
             &[tool_call],
@@ -5654,6 +5671,7 @@ mod tests {
             &workspace_id,
             Some(&workspace_root),
             Some(&worker_id),
+            None,
             &[tool_call],
             &mut ToolExecutionLedger::default(),
             None,
@@ -5709,6 +5727,7 @@ mod tests {
             &session_id,
             &workspace_id,
             Some(&workspace_root),
+            None,
             None,
             &[mainline_tool_call],
             &mut ToolExecutionLedger::default(),
@@ -5822,6 +5841,7 @@ mod tests {
             &workspace_id,
             Some(&workspace_root),
             Some(&worker_id),
+            None,
             &tool_calls,
             &mut ToolExecutionLedger::default(),
             None,
@@ -6646,6 +6666,7 @@ mod tests {
             &worker,
             &session_id,
             &workspace_id,
+            None,
             None,
             None,
             &[ChatToolCall {

@@ -88,6 +88,7 @@ pub fn execute_intent_with_drivers(
         workspace_id: intent.workspace_id.clone(),
         access_profile: tool_policy.effective_access_profile(),
         working_directory: None,
+        browser_capability_revision: None,
     };
 
     let mut tool_invocations = Vec::new();
@@ -187,6 +188,7 @@ pub fn execute_intent_step_with_drivers(
         workspace_id: intent.workspace_id.clone(),
         access_profile: tool_policy.effective_access_profile(),
         working_directory: None,
+        browser_capability_revision: None,
     };
     let step = intent.steps.get(step_index).ok_or_else(|| {
         WorkerExecutorFailure::remote_business(format!(

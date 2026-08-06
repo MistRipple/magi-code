@@ -1,6 +1,7 @@
 mod agent_run_actions;
 mod agent_runs;
 mod appearance;
+mod browser;
 mod changes_files_tunnel;
 mod conversation_bridge;
 mod dispatch_flow;
@@ -106,6 +107,7 @@ pub fn build_router(state: ApiState) -> Router {
         .merge(knowledge::routes())
         .merge(settings::routes())
         .merge(appearance::routes())
+        .merge(browser::routes())
         .merge(mcp_skills_repos::routes())
         .merge(changes_files_tunnel::routes())
         .merge(file_site::routes())
@@ -172,7 +174,7 @@ async fn enforce_public_tunnel_auth(
         .into_response()
 }
 
-fn is_public_tunnel_request(headers: &HeaderMap) -> bool {
+pub(crate) fn is_public_tunnel_request(headers: &HeaderMap) -> bool {
     headers.contains_key("cf-ray")
         || headers
             .get(HOST)

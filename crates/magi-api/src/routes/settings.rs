@@ -993,6 +993,11 @@ async fn update_setting(
     State(state): State<ApiState>,
     Json(request): Json<UpdateSettingRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if request.key.trim() == "browser" {
+        return Err(ApiError::InvalidInput(
+            "浏览器能力设置必须通过专用接口更新".to_string(),
+        ));
+    }
     state
         .settings_store
         .set(&request.key, request.value.clone())
@@ -1011,7 +1016,9 @@ async fn save_worker_config(
         .filter(|value| !value.is_empty());
     let worker_config = request.get("config");
 
-    if let (Some(worker_id), Some(worker_config)) = (worker_id, worker_config) {
+    let (saved_worker, saved_config) = if let (Some(worker_id), Some(worker_config)) =
+        (worker_id, worker_config)
+    {
         let worker_config = without_scope_binding_fields(worker_config.clone());
         reject_deprecated_model_config_fields(&worker_config).map_err(ApiError::InvalidInput)?;
         NormalizedModelConfig::from_settings_value(&worker_config)
@@ -1022,18 +1029,25 @@ async fn save_worker_config(
             .as_object()
             .cloned()
             .unwrap_or_default();
-        workers.insert(worker_id.to_string(), worker_config);
+        workers.insert(worker_id.to_string(), worker_config.clone());
         state
             .settings_store
             .set_section("workers", serde_json::Value::Object(workers))
             .map_err(settings_persistence_error)?;
+        (Some(worker_id.to_string()), worker_config)
     } else {
+        let workers = model_settings_section_request(&request)?;
         state
             .settings_store
-            .set_section("workers", model_settings_section_request(&request)?)
+            .set_section("workers", workers.clone())
             .map_err(settings_persistence_error)?;
-    }
-    Ok(Json(serde_json::json!({ "saved": true })))
+        (None, workers)
+    };
+    Ok(Json(serde_json::json!({
+        "saved": true,
+        "worker": saved_worker,
+        "config": saved_config,
+    })))
 }
 
 async fn remove_worker_config(
@@ -1062,14 +1076,12 @@ async fn save_orchestrator_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let config = orchestrator_connection_section_request(&request)?;
     state
         .settings_store
-        .set_section(
-            "orchestrator",
-            orchestrator_connection_section_request(&request)?,
-        )
+        .set_section("orchestrator", config.clone())
         .map_err(settings_persistence_error)?;
-    Ok(Json(serde_json::json!({ "saved": true })))
+    Ok(Json(serde_json::json!({ "saved": true, "config": config })))
 }
 
 async fn save_orchestrator_session_config(
@@ -1176,11 +1188,12 @@ async fn save_auxiliary_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let config = model_settings_section_request(&request)?;
     state
         .settings_store
-        .set_section("auxiliary", model_settings_section_request(&request)?)
+        .set_section("auxiliary", config.clone())
         .map_err(settings_persistence_error)?;
-    Ok(Json(serde_json::json!({ "saved": true })))
+    Ok(Json(serde_json::json!({ "saved": true, "config": config })))
 }
 
 async fn test_auxiliary_connection(
@@ -1215,14 +1228,12 @@ async fn save_image_generation_config(
     State(state): State<ApiState>,
     Json(request): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    let config = image_generation_section_request(&request)?;
     state
         .settings_store
-        .set_section(
-            "imageGeneration",
-            image_generation_section_request(&request)?,
-        )
+        .set_section("imageGeneration", config.clone())
         .map_err(settings_persistence_error)?;
-    Ok(Json(json!({ "saved": true })))
+    Ok(Json(json!({ "saved": true, "config": config })))
 }
 
 async fn test_image_generation_connection(
@@ -2407,6 +2418,15 @@ mod tests {
             "diff_preview",
             "web_search",
             "web_fetch",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_press",
+            "browser_scroll",
+            "browser_screenshot",
+            "browser_tabs",
+            "browser_viewport",
             "diagram_render",
             "image_generate",
             "knowledge_query",
@@ -3385,7 +3405,7 @@ mod tests {
     #[tokio::test]
     async fn save_orchestrator_config_writes_only_global_connection() {
         let state = test_state();
-        let _ = save_orchestrator_config(
+        let response = save_orchestrator_config(
             State(state.clone()),
             Json(json!({
                 "config": {
@@ -3401,7 +3421,8 @@ mod tests {
             })),
         )
         .await
-        .expect("orchestrator config should save");
+        .expect("orchestrator config should save")
+        .0;
 
         let saved = state.settings_store.get_section("orchestrator");
         assert_eq!(saved["baseUrl"], json!("https://api.example.com/v1"));
@@ -3410,6 +3431,7 @@ mod tests {
         assert!(saved.get("reasoningEffort").is_none());
         assert!(saved.get("sessionId").is_none());
         assert!(saved.get("workspaceId").is_none());
+        assert_eq!(response["config"], saved);
         assert!(
             state
                 .settings_store
@@ -3422,7 +3444,7 @@ mod tests {
     #[tokio::test]
     async fn save_image_generation_config_persists_canonical_model_fields() {
         let state = test_state();
-        let _ = save_image_generation_config(
+        let response = save_image_generation_config(
             State(state.clone()),
             Json(json!({
                 "config": {
@@ -3437,7 +3459,8 @@ mod tests {
             })),
         )
         .await
-        .expect("image generation config should save");
+        .expect("image generation config should save")
+        .0;
 
         let saved = state.settings_store.get_section("imageGeneration");
         assert_eq!(saved["baseUrl"], json!("https://cpa.example.com/v1"));
@@ -3446,6 +3469,52 @@ mod tests {
         assert_eq!(saved["urlMode"], json!("standard"));
         assert!(saved.get("reasoningEffort").is_none());
         assert!(saved.get("workspaceId").is_none());
+        assert_eq!(response["config"], saved);
+    }
+
+    #[tokio::test]
+    async fn worker_and_auxiliary_save_return_persisted_config() {
+        let state = test_state();
+        let worker_response = save_worker_config(
+            State(state.clone()),
+            Json(json!({
+                "worker": "test-worker",
+                "config": {
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-worker",
+                    "model": "worker-model",
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat",
+                    "reasoningEffort": "high"
+                }
+            })),
+        )
+        .await
+        .expect("worker config should save")
+        .0;
+        assert_eq!(worker_response["worker"], json!("test-worker"));
+        assert_eq!(
+            worker_response["config"],
+            state.settings_store.get_section("workers")["test-worker"]
+        );
+
+        let auxiliary_response = save_auxiliary_config(
+            State(state.clone()),
+            Json(json!({
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-auxiliary",
+                "model": "auxiliary-model",
+                "urlMode": "standard",
+                "apiProtocol": "openai_responses"
+            })),
+        )
+        .await
+        .expect("auxiliary config should save")
+        .0;
+        assert_eq!(
+            auxiliary_response["config"],
+            state.settings_store.get_section("auxiliary")
+        );
     }
 
     #[tokio::test]

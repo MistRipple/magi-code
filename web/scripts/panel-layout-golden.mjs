@@ -341,9 +341,9 @@ await withGoldenViteServer(async (server) => {
     {
       sidebarDrawer: false,
       previewOverlay: false,
-      panelsCanCoexist: false,
+      panelsCanCoexist: true,
     },
-    'compact desktop should keep split preview but require mutually exclusive side panels',
+    'compact desktop should keep the sidebar when the reduced conversation minimum still fits',
   );
 
   assert.deepEqual(
@@ -354,10 +354,10 @@ await withGoldenViteServer(async (server) => {
     }),
     {
       sidebarDrawer: false,
-      previewOverlay: true,
+      previewOverlay: false,
       panelsCanCoexist: false,
     },
-    'narrow tablet should use an overlay preview before the mobile drawer breakpoint',
+    'narrow tablet should keep the browser split while temporarily suppressing the sidebar',
   );
 
   assert.deepEqual(
@@ -432,6 +432,42 @@ await withGoldenViteServer(async (server) => {
     }),
     { sidebarVisible: false, rightPaneVisible: true },
     'mobile overlays must never expose both side surfaces at once',
+  );
+
+  assert.deepEqual(
+    panelLayout.resolvePreviewPanelWidthBounds({
+      viewportWidth: 1280,
+      sidebarWidth: 320,
+      sidebarVisible: true,
+      rightPaneOpen: true,
+      previewOverlay: false,
+    }),
+    { minWidth: 320, maxWidth: 808 },
+    'browser focus width should use the full workbench after the sidebar yields space',
+  );
+
+  assert.deepEqual(
+    panelLayout.resolvePreviewPanelWidthBounds({
+      viewportWidth: 1440,
+      sidebarWidth: 320,
+      sidebarVisible: false,
+      rightPaneOpen: true,
+      previewOverlay: false,
+    }),
+    { minWidth: 320, maxWidth: 960 },
+    'browser focus width should reach two thirds of a standard desktop window',
+  );
+
+  assert.deepEqual(
+    panelLayout.resolvePreviewPanelWidthBounds({
+      viewportWidth: 1280,
+      sidebarWidth: 320,
+      sidebarVisible: false,
+      rightPaneOpen: true,
+      previewOverlay: false,
+    }),
+    { minWidth: 320, maxWidth: 808 },
+    'conversation minimum should cap the browser before it distorts a compact window',
   );
 
   console.log('panel layout golden passed');

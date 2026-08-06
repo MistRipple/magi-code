@@ -406,6 +406,15 @@ pub enum TaskRuntimePayload {
         #[serde(default)]
         accesses: Vec<AgentContextAccessRecord>,
     },
+    /// 用户在浏览器中创建的页面标记。
+    ///
+    /// 该负载只保存经过 BrowserAuthority 校验的结构化引用，实际截图仍由
+    /// 浏览器 artifact 存储负责。任务执行器可以把它注入模型上下文，但不
+    /// 允许把前端提交的未校验坐标直接当作事实使用。
+    BrowserAnnotations {
+        #[serde(default)]
+        references: Vec<serde_json::Value>,
+    },
 }
 
 /// 任务完成合同。
@@ -759,14 +768,21 @@ impl Task {
     pub fn agent_context_package(&self) -> Option<&AgentContextPackage> {
         match &self.runtime_payload {
             TaskRuntimePayload::AgentContext { package, .. } => Some(package.as_ref()),
-            TaskRuntimePayload::None => None,
+            TaskRuntimePayload::None | TaskRuntimePayload::BrowserAnnotations { .. } => None,
         }
     }
 
     pub fn agent_context_accesses(&self) -> &[AgentContextAccessRecord] {
         match &self.runtime_payload {
             TaskRuntimePayload::AgentContext { accesses, .. } => accesses,
-            TaskRuntimePayload::None => &[],
+            TaskRuntimePayload::None | TaskRuntimePayload::BrowserAnnotations { .. } => &[],
+        }
+    }
+
+    pub fn browser_annotation_references(&self) -> &[serde_json::Value] {
+        match &self.runtime_payload {
+            TaskRuntimePayload::BrowserAnnotations { references } => references,
+            TaskRuntimePayload::None | TaskRuntimePayload::AgentContext { .. } => &[],
         }
     }
 

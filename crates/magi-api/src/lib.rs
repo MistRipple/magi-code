@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod browser_tool_runtime;
 mod change_projection;
 mod dto;
 mod errors;
@@ -20,10 +21,12 @@ mod task_dispatch;
 pub mod task_turn_finalize;
 pub mod tunnel;
 
+pub use browser_tool_runtime::BrowserToolRuntimeDependencies;
 pub use dto::DirectHttpModelProbeConfig;
 pub use errors::{ApiError, ErrorResponseDto};
 pub use routes::build_router;
 pub use state::{
-    ApiState, RunnerManager, RunnerStartError, RunnerStopError, RuntimeStatePersistence,
-    build_runtime_capability_dependency_provider,
+    ApiState, BrowserRuntimeStatusSnapshot, ExecutionResourceCancellationReport,
+    ExecutionResourceCoordinator, RunnerManager, RunnerStartError, RunnerStopError,
+    RuntimeStatePersistence, build_runtime_capability_dependency_provider,
 };

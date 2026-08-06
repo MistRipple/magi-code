@@ -2,6 +2,7 @@ import type {
   AgentId,
   ContentBlock,
   Message,
+  MessageBrowserAnnotationReference,
   MessageImage,
   SessionTimelineProjection,
   ThinkingSegment,
@@ -301,7 +302,7 @@ function normalizeMessageContextReferencesFromMetadata(
     .filter((reference): reference is Record<string, unknown> => (
       Boolean(reference) && typeof reference === 'object' && !Array.isArray(reference)
     ))
-    .map((reference) => {
+    .map((reference): import('../types/message').MessageContextReference | null => {
       const kind = reference.kind === 'file' || reference.kind === 'directory'
         ? reference.kind
         : null;
@@ -318,7 +319,44 @@ function normalizeMessageContextReferencesFromMetadata(
   return normalized.length > 0 ? normalized : undefined;
 }
 
-function messageMetadataWithoutTransportImages(
+function normalizeMessageBrowserAnnotationRefsFromMetadata(
+  metadata: Record<string, unknown> | undefined,
+): MessageBrowserAnnotationReference[] | undefined {
+  const references = metadata?.browserAnnotationRefs;
+  if (!Array.isArray(references)) return undefined;
+  const normalized = references
+    .filter((reference): reference is Record<string, unknown> => (
+      Boolean(reference) && typeof reference === 'object' && !Array.isArray(reference)
+    ))
+    .map((reference): MessageBrowserAnnotationReference | null => {
+      const annotationId = typeof reference.annotationId === 'string'
+        ? reference.annotationId.trim()
+        : '';
+      const browserSessionId = typeof reference.browserSessionId === 'string'
+        ? reference.browserSessionId.trim()
+        : '';
+      const tabId = typeof reference.tabId === 'string' ? reference.tabId.trim() : '';
+      const kind = reference.kind === 'element' || reference.kind === 'region'
+        ? reference.kind
+        : null;
+      const comment = typeof reference.comment === 'string' ? reference.comment.trim() : '';
+      if (!annotationId || !browserSessionId || !tabId || !kind || !comment) return null;
+      return {
+        annotationId,
+        browserSessionId,
+        tabId,
+        kind,
+        comment,
+        screenshotArtifactId: typeof reference.screenshotArtifactId === 'string'
+          ? reference.screenshotArtifactId.trim() || null
+          : null,
+      };
+    })
+    .filter((reference): reference is MessageBrowserAnnotationReference => reference !== null);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function messageMetadataWithoutTransportAttachments(
   metadata: Record<string, unknown> | undefined,
 ): Record<string, unknown> {
   if (!metadata) {
@@ -327,6 +365,7 @@ function messageMetadataWithoutTransportImages(
   const messageMetadata = { ...metadata };
   delete messageMetadata.images;
   delete messageMetadata.contextReferences;
+  delete messageMetadata.browserAnnotationRefs;
   return messageMetadata;
 }
 
@@ -408,6 +447,9 @@ function buildMessage(
   const contextReferences = item.kind === 'user_message'
     ? normalizeMessageContextReferencesFromMetadata(item.metadata)
     : undefined;
+  const browserAnnotationRefs = item.kind === 'user_message'
+    ? normalizeMessageBrowserAnnotationRefsFromMetadata(item.metadata)
+    : undefined;
   const noticeType = item.metadata?.noticeType;
   const normalizedNoticeType = noticeType === 'success'
     || noticeType === 'error'
@@ -423,6 +465,7 @@ function buildMessage(
     ...(blocks ? { blocks } : {}),
     ...(images ? { images } : {}),
     ...(contextReferences ? { contextReferences } : {}),
+    ...(browserAnnotationRefs ? { browserAnnotationRefs } : {}),
     timestamp: resolveItemTimestamp(item),
     updatedAt: item.updatedAt,
     isStreaming,
@@ -430,7 +473,7 @@ function buildMessage(
     type: resolveMessageType(item),
     ...(normalizedNoticeType ? { noticeType: normalizedNoticeType } : {}),
     metadata: {
-      ...messageMetadataWithoutTransportImages(item.metadata),
+      ...messageMetadataWithoutTransportAttachments(item.metadata),
       turnId: item.turnId,
       turnSeq: item.turnSeq,
       turnStatus: turn.status,

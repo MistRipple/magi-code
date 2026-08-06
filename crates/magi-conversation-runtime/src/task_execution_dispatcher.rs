@@ -989,6 +989,11 @@ impl LlmTaskDispatcher {
                                     tool,
                                     tool_surface_access_profile,
                                 )
+                                && registry.browser_tool_available(
+                                    tool,
+                                    tool_surface_access_profile,
+                                    None,
+                                )
                         },
                     )
                 })
@@ -1447,6 +1452,11 @@ impl LlmTaskDispatcher {
                 "[task-input] {}",
                 format_task_ref_list(&task.input_refs)
             ));
+        }
+        if let Some(prompt) = crate::context_reference::browser_annotation_references_prompt(
+            task.browser_annotation_references(),
+        ) {
+            parts.push(prompt);
         }
 
         let task_store = self.pipeline.execution_runtime.task_store();

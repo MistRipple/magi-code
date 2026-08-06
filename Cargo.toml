@@ -4,6 +4,7 @@ members = [
   "apps/daemon",
   "apps/desktop",
   "crates/magi-core",
+  "crates/magi-browser-runtime",
   "crates/magi-process",
   "crates/magi-daemon",
   "crates/magi-api",
@@ -41,7 +42,7 @@ edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-axum = { version = "0.8.6", features = ["json", "tokio", "http1"] }
+axum = { version = "0.8.6", features = ["json", "tokio", "http1", "ws"] }
 futures-util = "0.3.31"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

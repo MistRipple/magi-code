@@ -80,6 +80,7 @@
   import {
     PANEL_LAYOUT,
     resolvePanelLayout,
+    resolvePreviewPanelWidthBounds,
     resolvePanelVisibility,
   } from './panel-layout';
 
@@ -209,9 +210,7 @@
   const COMPACT_SIDEBAR_WIDTH = 240;
   const MIN_SIDEBAR_WIDTH = 220;
   const MAX_SIDEBAR_WIDTH = 520;
-  const MIN_PREVIEW_PANEL_WIDTH = 320;
-  const DEFAULT_PREVIEW_PANEL_WIDTH = 320;
-  const MAX_PREVIEW_PANEL_WIDTH = 900;
+  const DEFAULT_PREVIEW_PANEL_WIDTH = 360;
   const SESSION_NAME_MAX_CHARS = 40;
 
   const selectedWorkspace = $derived(
@@ -229,6 +228,9 @@
   const shellLayoutStyle = $derived([
     sidebarWidth ? `--sidebar-width: ${sidebarWidth}px` : '',
     previewPanelWidth ? `--preview-panel-width: ${previewPanelWidth}px` : '',
+    `--workbench-min-content-width: ${PANEL_LAYOUT.minContentWidth}px`,
+    `--preview-min-width: ${PANEL_LAYOUT.minPreviewWidth}px`,
+    `--preview-handle-width: ${PANEL_LAYOUT.previewHandleWidth}px`,
   ].filter(Boolean).join('; '));
 
   const effectiveSidebarWidth = $derived(
@@ -821,29 +823,19 @@
 
   function clampPreviewPanelWidth(width: number): number {
     if (typeof window === 'undefined') {
-      return Math.max(MIN_PREVIEW_PANEL_WIDTH, Math.min(MAX_PREVIEW_PANEL_WIDTH, Math.round(width)));
+      return Math.max(PANEL_LAYOUT.minPreviewWidth, Math.round(width));
     }
     const vw = viewportWidth || window.innerWidth;
-    if (panelLayout.previewOverlay) {
-      return Math.max(
-        MIN_PREVIEW_PANEL_WIDTH,
-        Math.min(MAX_PREVIEW_PANEL_WIDTH, Math.round(width)),
-      );
-    }
-    const sidebarTakenWidth = sidebarIsDrawer || sidebarCollapsed
-      ? 0
-      : effectiveSidebarWidth + PANEL_LAYOUT.shellGap;
-    const availableWidth = Math.max(
-      MIN_PREVIEW_PANEL_WIDTH,
-      vw
-        - PANEL_LAYOUT.shellPadding * 2
-        - sidebarTakenWidth
-        - PANEL_LAYOUT.minContentWidth
-        - PANEL_LAYOUT.previewHandleWidth,
-    );
+    const bounds = resolvePreviewPanelWidthBounds({
+      viewportWidth: vw,
+      sidebarWidth: effectiveSidebarWidth,
+      sidebarVisible: panelVisibility.sidebarVisible,
+      rightPaneOpen: rightPaneVisible,
+      previewOverlay: panelLayout.previewOverlay,
+    });
     return Math.max(
-      MIN_PREVIEW_PANEL_WIDTH,
-      Math.min(Math.min(MAX_PREVIEW_PANEL_WIDTH, availableWidth), Math.round(width)),
+      bounds.minWidth,
+      Math.min(bounds.maxWidth, Math.round(width)),
     );
   }
 
@@ -1002,6 +994,7 @@
       return;
     }
     event.preventDefault();
+    window.dispatchEvent(new Event('magi:browserViewportControllerClaim'));
     isPreviewPanelResizing = true;
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
@@ -1043,6 +1036,7 @@
       symlinkTarget?: string;
       headSummary?: string;
       tailSummary?: string;
+      imageDataUrl?: string;
       displayPath?: string;
       label?: string;
     } = {},
@@ -1070,6 +1064,7 @@
       symlinkTarget: metadata.symlinkTarget,
       headSummary: metadata.headSummary,
       tailSummary: metadata.tailSummary,
+      imageDataUrl: metadata.imageDataUrl,
     });
     if (sidebarIsDrawer) {
       sidebarOpen = false;
@@ -1778,6 +1773,7 @@
         symlinkTarget?: string;
         headSummary?: string;
         tailSummary?: string;
+        imageDataUrl?: string;
       }>).detail;
       const filepath = detail?.filepath;
       if (typeof filepath === 'string') {
@@ -1791,6 +1787,7 @@
           symlinkTarget: detail?.symlinkTarget,
           headSummary: detail?.headSummary,
           tailSummary: detail?.tailSummary,
+          imageDataUrl: detail?.imageDataUrl,
         });
         if (handled) {
           event.preventDefault();
@@ -3145,7 +3142,10 @@
   }
 
   .workbench-body--with-preview {
-    grid-template-columns: minmax(620px, 1fr) 8px minmax(320px, var(--preview-panel-width, 320px));
+    grid-template-columns:
+      minmax(var(--workbench-min-content-width, 448px), 1fr)
+      var(--preview-handle-width, 8px)
+      minmax(var(--preview-min-width, 320px), var(--preview-panel-width, 360px));
   }
 
   .workbench-app-pane {

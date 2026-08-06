@@ -50,3 +50,4 @@ cargo run -p magi-desktop
 ## 方案文档
 
 - [Magi Connect 与移动端方案](./magi-connect-mobile-plan.md)：账号、设备配对、连接服务、Desktop 边界及 Android/iOS 推进基线。
+- [Magi 内置浏览器完整设计](./browser-runtime-design.md)：Browser Authority、Playwright Host、Goal/子代理租约、右侧预览、页面标记与跨平台发布基线。

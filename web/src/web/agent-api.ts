@@ -766,15 +766,369 @@ export function agentUrl(pathname: string, query?: string): string {
   return q ? `${base}${pathname}?${q}` : `${base}${pathname}`;
 }
 
-/** 构造可直接交给 iframe / 新窗口导航的 URL，并显式携带公网传输凭据。 */
-export function agentNavigationUrl(pathname: string, query?: string): string {
-  const url = new URL(agentUrl(pathname, query));
-  if (typeof window !== 'undefined') {
-    const tunnelToken = new URL(window.location.href).searchParams.get('tunnel_token')?.trim();
-    if (tunnelToken && !url.searchParams.has('tunnel_token')) {
-      url.searchParams.set('tunnel_token', tunnelToken);
+export type BrowserSessionLifecycle = 'creating' | 'ready' | 'recovering' | 'failed' | 'closed';
+export type BrowserTabLifecycle = 'creating' | 'ready' | 'crashed' | 'closed';
+export type BrowserControlMode = 'agent' | 'user';
+export type BrowserViewportMode = 'auto' | 'fixed';
+export type BrowserDeviceType = 'desktop' | 'mobile';
+export const BROWSER_AUTHORITY_CHANGED_EVENT = 'magi:browserAuthorityChanged';
+
+export interface BrowserViewport {
+  width: number;
+  height: number;
+  deviceScaleFactorMillis: number;
+  deviceType: BrowserDeviceType;
+}
+
+export type BrowserAnnotationStatus = 'active' | 'resolved' | 'stale' | 'deleted';
+
+export interface BrowserNormalizedRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface BrowserAnnotationAnchorBase {
+  url: string;
+  origin: string | null;
+  viewport: BrowserViewport;
+  scrollX: number;
+  scrollY: number;
+  snapshotRevision: number;
+}
+
+export type BrowserAnnotationAnchor =
+  | (BrowserAnnotationAnchorBase & {
+      kind: 'element';
+      boundingBox: BrowserNormalizedRect;
+      framePath: string[];
+      testId: string | null;
+      stableId: string | null;
+      ariaRole: string | null;
+      ariaName: string | null;
+      tagName: string;
+      textExcerpt: string | null;
+      cssPath: string;
+      ancestorFingerprint: string;
+      domFingerprint: string;
+    })
+  | (BrowserAnnotationAnchorBase & {
+      kind: 'region';
+      rect: BrowserNormalizedRect;
+    });
+
+export interface BrowserAnnotationSnapshot {
+  annotationId: string;
+  browserSessionId: string;
+  tabId: string;
+  author: 'user' | 'agent';
+  kind: 'element' | 'region';
+  anchor: BrowserAnnotationAnchor;
+  comment: string;
+  status: BrowserAnnotationStatus;
+  screenshotArtifactId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface BrowserTabSnapshot {
+  tabId: string;
+  browserSessionId: string;
+  lifecycle: BrowserTabLifecycle;
+  url: string;
+  origin: string | null;
+  title: string;
+  viewport: BrowserViewport;
+  viewportMode: BrowserViewportMode;
+  navigationRevision: number;
+  snapshotRevision: number;
+  frameSequence: number;
+  createdAt: number;
+  updatedAt: number;
+  annotations: BrowserAnnotationSnapshot[];
+}
+
+export interface BrowserSessionSnapshot {
+  browserSessionId: string;
+  workspaceId: string;
+  sessionId: string;
+  profileId: string;
+  lifecycle: BrowserSessionLifecycle;
+  activeTabId: string | null;
+  tabs: BrowserTabSnapshot[];
+  runtimeEpoch: number;
+  revision: number;
+  controlMode: BrowserControlMode;
+  controlFence: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface BrowserCapabilitiesSnapshot {
+  revision: number;
+  inAppBrowserEnabled: boolean;
+  browserUseEnabled: boolean;
+  runtimeStatus: string;
+  hostProtocolCompatible: boolean;
+  accessProfile: string;
+  runtimeMode: 'development' | 'managed' | 'unavailable';
+  hostStatus: 'stopped' | 'starting' | 'ready' | 'recovering' | 'failed';
+  runtimeVersion: string | null;
+  hostVersion: string | null;
+  playwrightVersion: string | null;
+  chromiumVersion: string | null;
+  availableRuntimeVersion: string | null;
+  updateLevel: 'optional' | 'recommended' | 'required_security' | null;
+  componentManagementAvailable: boolean;
+  lastErrorCode: string | null;
+}
+
+export async function getBrowserCapabilities(sessionId?: string): Promise<BrowserCapabilitiesSnapshot> {
+  const query = sessionId?.trim() ? `sessionId=${encodeURIComponent(sessionId.trim())}` : undefined;
+  const response = await getTransport().request(agentUrl('/api/browser/capabilities', query), {
+    cache: 'no-store',
+  });
+  return parseAgentJson<BrowserCapabilitiesSnapshot>(response, 'load browser capabilities');
+}
+
+export async function updateBrowserSettings(settings: {
+  inAppBrowserEnabled: boolean;
+  browserUseEnabled: boolean;
+}): Promise<BrowserCapabilitiesSnapshot> {
+  const response = await getTransport().request(agentUrl('/api/browser/settings'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(settings),
+  });
+  return parseAgentJson<BrowserCapabilitiesSnapshot>(response, 'update browser settings');
+}
+
+export async function runBrowserRuntimeAction(
+  action: 'check-updates' | 'install' | 'uninstall',
+): Promise<BrowserCapabilitiesSnapshot> {
+  const response = await getTransport().request(agentUrl(`/api/browser/runtime/${action}`), {
+    method: 'POST',
+  });
+  return parseAgentJson<BrowserCapabilitiesSnapshot>(response, `run browser runtime action: ${action}`);
+}
+
+export async function createBrowserSession(
+  workspaceId: string,
+  sessionId: string,
+): Promise<BrowserSessionSnapshot> {
+  const response = await getTransport().request(agentUrl('/api/browser/sessions'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ workspaceId, sessionId }),
+  });
+  return parseAgentJson<BrowserSessionSnapshot>(response, 'create browser session');
+}
+
+export async function getBrowserSession(browserSessionId: string): Promise<BrowserSessionSnapshot> {
+  const response = await getTransport().request(
+    agentUrl(`/api/browser/sessions/${encodeURIComponent(browserSessionId)}`),
+    { cache: 'no-store' },
+  );
+  return parseAgentJson<BrowserSessionSnapshot>(response, 'load browser session');
+}
+
+export async function getCurrentBrowserSession(
+  workspaceId: string,
+  sessionId: string,
+): Promise<BrowserSessionSnapshot | null> {
+  const query = new URLSearchParams({ workspaceId, sessionId }).toString();
+  const response = await getTransport().request(
+    agentUrl('/api/browser/sessions/current', query),
+    { cache: 'no-store' },
+  );
+  const payload = await parseAgentJson<{ session: BrowserSessionSnapshot | null }>(
+    response,
+    'load current browser session',
+  );
+  return payload.session;
+}
+
+export async function createBrowserTab(
+  browserSessionId: string,
+  initialUrl = 'about:blank',
+): Promise<BrowserTabSnapshot> {
+  const response = await getTransport().request(
+    agentUrl(`/api/browser/sessions/${encodeURIComponent(browserSessionId)}/tabs`),
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ initialUrl }),
+    },
+  );
+  return parseAgentJson<BrowserTabSnapshot>(response, 'create browser tab');
+}
+
+export async function activateBrowserTab(tabId: string): Promise<BrowserSessionSnapshot> {
+  const response = await getTransport().request(
+    agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/activate`),
+    { method: 'POST' },
+  );
+  return parseAgentJson<BrowserSessionSnapshot>(response, 'activate browser tab');
+}
+
+export async function setBrowserTabViewport(
+  tabId: string,
+  request:
+    | {
+        action: 'sync';
+        width: number;
+        height: number;
+        controllerId: string;
+        claim?: boolean;
+      }
+    | {
+        action: 'set';
+        mode: BrowserViewportMode;
+        width: number;
+        height: number;
+        deviceType: BrowserDeviceType;
+        controllerId?: string;
+      },
+): Promise<BrowserTabSnapshot> {
+  const response = await getTransport().request(
+    agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/viewport`),
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(request),
+    },
+  );
+  return parseAgentJson<BrowserTabSnapshot>(response, 'resize browser tab viewport');
+}
+
+export async function closeBrowserTab(tabId: string): Promise<void> {
+  const response = await getTransport().request(
+    agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}`),
+    { method: 'DELETE' },
+  );
+  if (!response.ok) await parseAgentJson(response, 'close browser tab');
+}
+
+export async function navigateBrowserTab(
+  tabId: string,
+  action: 'url' | 'back' | 'forward' | 'reload',
+  url?: string,
+): Promise<BrowserTabSnapshot> {
+  const response = await getTransport().request(
+    agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/navigation`),
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action, ...(url ? { url } : {}) }),
+    },
+  );
+  return parseAgentJson<BrowserTabSnapshot>(response, 'navigate browser tab');
+}
+
+export type BrowserAnnotationSelection =
+  | {
+      kind: 'element';
+      navigationRevision: number;
+      x: number;
+      y: number;
     }
-  }
+  | {
+      kind: 'region';
+      navigationRevision: number;
+      rect: BrowserNormalizedRect;
+    };
+
+export async function createBrowserAnnotation(
+  tabId: string,
+  selection: BrowserAnnotationSelection,
+  comment: string,
+): Promise<BrowserAnnotationSnapshot> {
+  const response = await getTransport().request(
+    agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/annotations`),
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ selection, comment }),
+    },
+  );
+  return parseAgentJson<BrowserAnnotationSnapshot>(response, 'create browser annotation');
+}
+
+export function createBrowserElementAnnotation(
+  tabId: string,
+  selection: Omit<Extract<BrowserAnnotationSelection, { kind: 'element' }>, 'kind'>,
+  comment: string,
+): Promise<BrowserAnnotationSnapshot> {
+  return createBrowserAnnotation(tabId, { kind: 'element', ...selection }, comment);
+}
+
+export function createBrowserRegionAnnotation(
+  tabId: string,
+  selection: Omit<Extract<BrowserAnnotationSelection, { kind: 'region' }>, 'kind'>,
+  comment: string,
+): Promise<BrowserAnnotationSnapshot> {
+  return createBrowserAnnotation(tabId, { kind: 'region', ...selection }, comment);
+}
+
+export async function updateBrowserAnnotationStatus(
+  annotationId: string,
+  status: BrowserAnnotationStatus,
+): Promise<BrowserAnnotationSnapshot> {
+  const response = await getTransport().request(
+    agentUrl(`/api/browser/annotations/${encodeURIComponent(annotationId)}/status`),
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status }),
+    },
+  );
+  return parseAgentJson<BrowserAnnotationSnapshot>(response, 'update browser annotation');
+}
+
+export async function updateBrowserAnnotationComment(
+  annotationId: string,
+  comment: string,
+): Promise<BrowserAnnotationSnapshot> {
+  const response = await getTransport().request(
+    agentUrl(`/api/browser/annotations/${encodeURIComponent(annotationId)}`),
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ comment }),
+    },
+  );
+  return parseAgentJson<BrowserAnnotationSnapshot>(response, 'update browser annotation comment');
+}
+
+export function browserScreenshotUrl(tabId: string): string {
+  return agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/screenshot`);
+}
+
+export function browserAnnotationArtifactUrl(annotationId: string): string {
+  return agentUrl(`/api/browser/annotations/${encodeURIComponent(annotationId)}/artifact`);
+}
+
+export async function readBrowserClipboardText(): Promise<string> {
+  const response = await getTransport().request(agentUrl('/api/browser/clipboard/text'), {
+    cache: 'no-store',
+  });
+  const payload = await parseAgentJson<{ text: string }>(response, 'read browser clipboard');
+  return payload.text;
+}
+
+export async function writeBrowserClipboardText(text: string): Promise<void> {
+  const response = await getTransport().request(agentUrl('/api/browser/clipboard/text'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
+  if (!response.ok) await parseAgentJson(response, 'write browser clipboard');
+}
+
+export function browserChannelUrl(tabId: string): string {
+  const url = new URL(agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/channel`));
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   return url.toString();
 }
 
@@ -1380,6 +1734,7 @@ export async function submitSessionTurn(
       pathRef?: string;
       name: string;
     }>;
+    browserAnnotationRefs?: string[];
     accessProfile?: 'read_only' | 'restricted' | 'full_access' | null;
     orchestratorSessionConfig?: Record<string, unknown> | null;
     requestId?: string | null;
@@ -1424,6 +1779,9 @@ export async function submitSessionTurn(
           ...(reference.pathRef ? { pathRef: reference.pathRef } : {}),
           name: reference.name,
         })),
+        browserAnnotationRefs: (payload.browserAnnotationRefs ?? [])
+          .map((annotationId) => annotationId.trim())
+          .filter(Boolean),
         orchestratorSessionConfig: payload.orchestratorSessionConfig ?? null,
       }),
     });

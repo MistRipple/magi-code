@@ -1,5 +1,6 @@
 import {
   AgentApiError,
+  BROWSER_AUTHORITY_CHANGED_EVENT,
   agentUrl,
   dispatchAgentConnectionEvent,
   getAgentSettingsBootstrap,
@@ -1118,6 +1119,14 @@ function emitLocalPendingCanonicalTurn(input: {
   text: string;
   images: Array<{ name: string; dataUrl: string }>;
   contextReferences: Array<{ kind: 'file' | 'directory'; path: string; pathRef?: string; name: string }>;
+  browserAnnotationSnapshots: Array<{
+    annotationId: string;
+    browserSessionId: string;
+    tabId: string;
+    kind: 'element' | 'region';
+    comment: string;
+    screenshotArtifactId?: string | null;
+  }>;
   turnSeq: number;
   createdAt: number;
 }): boolean {
@@ -1134,6 +1143,9 @@ function emitLocalPendingCanonicalTurn(input: {
     ...(input.images.length > 0 ? { images: input.images } : {}),
     ...(input.contextReferences.length > 0
       ? { contextReferences: input.contextReferences }
+      : {}),
+    ...(input.browserAnnotationSnapshots.length > 0
+      ? { browserAnnotationRefs: input.browserAnnotationSnapshots }
       : {}),
     localOptimistic: true,
   };
@@ -1205,6 +1217,14 @@ function emitLocalPendingCanonicalTurnFailed(input: {
   text: string;
   images: Array<{ name: string; dataUrl: string }>;
   contextReferences: Array<{ kind: 'file' | 'directory'; path: string; pathRef?: string; name: string }>;
+  browserAnnotationSnapshots: Array<{
+    annotationId: string;
+    browserSessionId: string;
+    tabId: string;
+    kind: 'element' | 'region';
+    comment: string;
+    screenshotArtifactId?: string | null;
+  }>;
   turnSeq: number;
   createdAt: number;
   failedAt: number;
@@ -1223,6 +1243,9 @@ function emitLocalPendingCanonicalTurnFailed(input: {
     ...(input.images.length > 0 ? { images: input.images } : {}),
     ...(input.contextReferences.length > 0
       ? { contextReferences: input.contextReferences }
+      : {}),
+    ...(input.browserAnnotationSnapshots.length > 0
+      ? { browserAnnotationRefs: input.browserAnnotationSnapshots }
       : {}),
     localTerminal: true,
   };
@@ -1676,6 +1699,18 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     if (shouldRefreshExternalWorkspaceSessionSummary(eventType, event)) {
       scheduleWorkspaceSessionSummaryRefresh(`external_${eventType.replaceAll('.', '_')}`);
     }
+    return;
+  }
+
+  if (eventType.startsWith('browser.')) {
+    window.dispatchEvent(new CustomEvent(BROWSER_AUTHORITY_CHANGED_EVENT, {
+      detail: {
+        eventType,
+        workspaceId: rustEventWorkspaceId(event) || currentWorkspaceId,
+        sessionId: rustEventSessionId(event) || currentSessionId,
+        payload: event.payload ?? {},
+      },
+    }));
     return;
   }
 
@@ -3361,6 +3396,15 @@ interface ExecuteTaskInput {
     pathRef?: string;
     name: string;
   }>;
+  browserAnnotationRefs?: string[];
+  browserAnnotationSnapshots?: Array<{
+    annotationId: string;
+    browserSessionId: string;
+    tabId: string;
+    kind: 'element' | 'region';
+    comment: string;
+    screenshotArtifactId?: string | null;
+  }>;
 }
 
 function bridgeRuntimeIsBusy(): boolean {
@@ -3389,6 +3433,7 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
     accessProfile: turn.accessProfile ?? null,
     images: turn.images,
     contextReferences: turn.contextReferences,
+    browserAnnotationRefs: turn.browserAnnotationRefs,
   };
 }
 
@@ -3485,7 +3530,32 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
           : reference.path.trim().split(/[\\/]/u).filter(Boolean).pop() || reference.path.trim(),
       }))
     : [];
-  if (!normalizedText && !skillName && images.length === 0 && contextReferences.length === 0) {
+  const browserAnnotationRefs = Array.isArray(input.browserAnnotationRefs)
+    ? input.browserAnnotationRefs
+      .filter((annotationId): annotationId is string => typeof annotationId === 'string')
+      .map((annotationId) => annotationId.trim())
+      .filter(Boolean)
+    : [];
+  const browserAnnotationSnapshots = Array.isArray(input.browserAnnotationSnapshots)
+    ? input.browserAnnotationSnapshots
+      .filter((annotation) => (
+        typeof annotation?.annotationId === 'string'
+        && typeof annotation?.browserSessionId === 'string'
+        && typeof annotation?.tabId === 'string'
+        && (annotation?.kind === 'element' || annotation?.kind === 'region')
+        && typeof annotation?.comment === 'string'
+      ))
+      .map((annotation) => ({
+        annotationId: annotation.annotationId.trim(),
+        browserSessionId: annotation.browserSessionId.trim(),
+        tabId: annotation.tabId.trim(),
+        kind: annotation.kind,
+        comment: annotation.comment.trim(),
+        screenshotArtifactId: annotation.screenshotArtifactId?.trim() || null,
+      }))
+      .filter((annotation) => annotation.annotationId && annotation.browserSessionId && annotation.tabId && annotation.comment)
+    : [];
+  if (!normalizedText && !skillName && images.length === 0 && contextReferences.length === 0 && browserAnnotationRefs.length === 0) {
     return false;
   }
   const requestId = input.requestId || generateMessageId();
@@ -3526,6 +3596,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
     text: normalizedText,
     images,
     contextReferences,
+    browserAnnotationSnapshots,
     turnSeq: turnOrderSeq,
     createdAt: requestCreatedAt,
   });
@@ -3553,6 +3624,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       goalMode: input.goalMode === true,
       images,
       contextReferences,
+      browserAnnotationRefs,
       accessProfile: input.accessProfile ?? null,
       orchestratorSessionConfig: input.orchestratorSessionConfig ?? null,
       requestId,
@@ -3645,6 +3717,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       text: normalizedText,
       images,
       contextReferences,
+      browserAnnotationSnapshots,
       turnSeq: turnOrderSeq,
       createdAt: requestCreatedAt,
       failedAt: Date.now(),
@@ -4706,6 +4779,7 @@ export function createWebClientBridge(): ClientBridge {
             || (typeof message.skillName === 'string' && message.skillName.trim())
             || (Array.isArray(message.images) && message.images.length > 0)
             || (Array.isArray(message.contextReferences) && message.contextReferences.length > 0)
+            || (Array.isArray(message.browserAnnotationRefs) && message.browserAnnotationRefs.length > 0)
           ) {
             void executeTask({
               text: typeof message.text === 'string' ? message.text : null,
@@ -4736,6 +4810,19 @@ export function createWebClientBridge(): ClientBridge {
                     path: string;
                     pathRef?: string;
                     name: string;
+                  }>
+                : [],
+              browserAnnotationRefs: Array.isArray(message.browserAnnotationRefs)
+                ? message.browserAnnotationRefs.filter((value): value is string => typeof value === 'string')
+                : [],
+              browserAnnotationSnapshots: Array.isArray(message.browserAnnotationSnapshots)
+                ? message.browserAnnotationSnapshots as Array<{
+                    annotationId: string;
+                    browserSessionId: string;
+                    tabId: string;
+                    kind: 'element' | 'region';
+                    comment: string;
+                    screenshotArtifactId?: string | null;
                   }>
                 : [],
             });

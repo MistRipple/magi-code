@@ -2,7 +2,7 @@ use crate::ids::{MissionId, SessionId, TaskId, WorkerId, WorkspaceId};
 use crate::value_objects::UtcMillis;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionOwnership {
     pub session_id: Option<SessionId>,
     pub workspace_id: Option<WorkspaceId>,

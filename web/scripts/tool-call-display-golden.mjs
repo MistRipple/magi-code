@@ -54,6 +54,16 @@ assert.match(
   '折叠工具卡不得在首屏解析图表载荷',
 );
 assert.match(
+  toolCallSource,
+  /const viewImagePreview = \$derived\(\s*!outputIsStructuredError \? parseViewImagePreview\(name, output\) : null,/,
+  '折叠 view_image 卡片必须保留直接打开图片所需的数据解析',
+);
+assert.match(
+  toolCallSource,
+  /const directImagePreview = viewImagePreview;[\s\S]*?imageDataUrl: directImagePreview\.src/,
+  'view_image 文件入口必须把工具结果中的图片数据直接交给右栏预览',
+);
+assert.match(
   terminalCardSource,
   /const displayOutput = \$derived\(isExpanded \? formatOutput\(rawDisplayOutput\) : ''\);/,
   '折叠 Shell 卡片不得在首屏格式化终端输出',

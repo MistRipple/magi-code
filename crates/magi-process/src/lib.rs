@@ -19,6 +19,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+#[cfg(unix)]
+use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
 
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
@@ -339,6 +341,14 @@ impl AsyncManagedChild {
         self.child.stderr.take()
     }
 
+    pub fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub fn take_stdin(&mut self) -> Option<tokio::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         let status = self.child.try_wait()?;
         if status.is_some() {
@@ -420,13 +430,7 @@ pub fn terminate_all_managed_processes() -> usize {
     #[cfg(unix)]
     {
         for process in &processes {
-            let _ = send_unix_process_group_signal(process.process_group_id, libc::SIGTERM);
-        }
-        if !processes.is_empty() {
-            thread::sleep(Duration::from_millis(50));
-        }
-        for process in &processes {
-            let _ = send_unix_process_group_signal(process.process_group_id, libc::SIGKILL);
+            let _ = terminate_unix_process_tree(process.process_group_id);
         }
     }
 
@@ -503,12 +507,105 @@ fn terminate_async_process_tree(process: &mut AsyncManagedChild) -> io::Result<(
 
 #[cfg(unix)]
 fn terminate_unix_process_group(pid: u32) -> io::Result<()> {
-    send_unix_process_group_signal(pid, libc::SIGTERM)?;
-    thread::sleep(Duration::from_millis(50));
-    match send_unix_process_group_signal(pid, libc::SIGKILL) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(()),
-        Err(error) => Err(error),
+    terminate_unix_process_tree(pid)
+}
+
+#[cfg(unix)]
+fn terminate_unix_process_tree(root_pid: u32) -> io::Result<()> {
+    let tracked_processes = unix_process_tree(root_pid);
+    send_unix_process_group_signal(root_pid, libc::SIGTERM)?;
+    if wait_for_unix_processes_to_exit(&tracked_processes, Duration::from_secs(2)) {
+        return Ok(());
+    }
+
+    // Chromium 等子进程可能主动创建新进程组。仅清理根进程组无法覆盖这些进程，
+    // 因此强制阶段按启动时快照逐个终止整个后代树。
+    for pid in tracked_processes.iter().rev().copied() {
+        let _ = send_unix_process_signal(pid, libc::SIGKILL);
+    }
+    if wait_for_unix_processes_to_exit(&tracked_processes, Duration::from_millis(500)) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("受管进程树 {root_pid} 未在终止期限内退出"),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn unix_process_tree(root_pid: u32) -> Vec<u32> {
+    let mut system = System::new_all();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let root = Pid::from_u32(root_pid);
+    let mut tree = vec![root];
+    let mut cursor = 0;
+    while cursor < tree.len() {
+        let parent = tree[cursor];
+        for process in system.processes().values() {
+            if process.parent() == Some(parent) && !tree.contains(&process.pid()) {
+                tree.push(process.pid());
+            }
+        }
+        cursor += 1;
+    }
+    tree.into_iter().map(Pid::as_u32).collect()
+}
+
+#[cfg(unix)]
+fn wait_for_unix_processes_to_exit(processes: &[u32], timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let processes = processes
+        .iter()
+        .copied()
+        .map(Pid::from_u32)
+        .collect::<Vec<_>>();
+    let mut system = System::new();
+    loop {
+        system.refresh_processes(ProcessesToUpdate::Some(&processes), true);
+        if processes.iter().all(|pid| {
+            system.process(*pid).is_none_or(|process| {
+                matches!(
+                    process.status(),
+                    ProcessStatus::Zombie | ProcessStatus::Dead
+                )
+            })
+        }) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(all(unix, test))]
+fn unix_process_alive(pid: u32) -> bool {
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    system.process(pid).is_some_and(|process| {
+        !matches!(
+            process.status(),
+            ProcessStatus::Zombie | ProcessStatus::Dead
+        )
+    })
+}
+
+#[cfg(unix)]
+fn send_unix_process_signal(pid: u32, signal: libc::c_int) -> io::Result<()> {
+    let pid = i32::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "进程 ID 超出系统范围"))?;
+    let result = unsafe { libc::kill(pid, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
@@ -906,10 +1003,14 @@ mod tests {
     use std::{ffi::OsString, fs, path::Path};
 
     #[cfg(unix)]
-    use std::{collections::BTreeMap, os::unix::ffi::OsStringExt};
+    use std::{
+        collections::BTreeMap,
+        os::unix::ffi::OsStringExt,
+        time::{Duration, Instant},
+    };
 
     #[cfg(unix)]
-    use super::environment_overrides;
+    use super::{environment_overrides, unix_process_alive};
     use super::{
         initialize_user_process_environment, spawn_managed, spawn_managed_tokio, std_command,
         tokio_command,
@@ -934,6 +1035,55 @@ mod tests {
     #[cfg(unix)]
     fn configure_long_running_tokio_command(command: &mut tokio::process::Command) {
         command.args(["-c", "sleep 5"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_process_termination_cleans_descendant_that_changed_process_group() {
+        use std::{fs, os::unix::process::CommandExt, process::Command, thread};
+
+        if std::env::var_os("MAGI_PROCESS_TREE_HELPER").is_some() {
+            let mut descendant = Command::new("sleep");
+            descendant.arg("30").process_group(0);
+            let mut child = descendant.spawn().expect("descendant should start");
+            let pid_file = std::env::var_os("MAGI_PROCESS_TREE_PID_FILE")
+                .expect("helper pid file should be configured");
+            fs::write(pid_file, child.id().to_string()).expect("descendant pid should persist");
+            thread::sleep(Duration::from_secs(30));
+            let _ = child.wait();
+            return;
+        }
+
+        let pid_file = tempfile::NamedTempFile::new().expect("pid fixture should create");
+        let mut command = std_command(std::env::current_exe().expect("test executable exists"));
+        command
+            .args([
+                "--exact",
+                "tests::managed_process_termination_cleans_descendant_that_changed_process_group",
+                "--nocapture",
+            ])
+            .env("MAGI_PROCESS_TREE_HELPER", "1")
+            .env("MAGI_PROCESS_TREE_PID_FILE", pid_file.path());
+        let mut managed = spawn_managed(&mut command).expect("helper should start");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let descendant_pid = loop {
+            if let Ok(value) = fs::read_to_string(pid_file.path())
+                && !value.trim().is_empty()
+            {
+                break value
+                    .trim()
+                    .parse::<u32>()
+                    .expect("descendant pid should be numeric");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "helper should publish descendant pid"
+            );
+            thread::sleep(Duration::from_millis(25));
+        };
+
+        managed.terminate().expect("managed tree should terminate");
+        assert!(!unix_process_alive(descendant_pid));
     }
 
     #[cfg(windows)]

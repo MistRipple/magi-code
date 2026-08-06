@@ -207,6 +207,9 @@
       text: message.content || '',
       images: Array.isArray(message.images) ? message.images : [],
       contextReferences: Array.isArray(message.contextReferences) ? message.contextReferences : [],
+      browserAnnotationRefs: Array.isArray(message.browserAnnotationRefs)
+        ? message.browserAnnotationRefs
+        : [],
       skillName: typeof message.metadata?.skillName === 'string' ? message.metadata.skillName : null,
       goalMode: message.metadata?.goalMode === true,
     });

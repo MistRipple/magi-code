@@ -29,8 +29,10 @@ use magi_spawn_graph::SpawnGraph;
 use crate::session_thread;
 
 use crate::context_reference::{
-    SessionContextReference, session_context_reference_input_refs,
-    session_context_reference_policy, session_context_references_metadata,
+    SessionContextReference, browser_annotation_artifact_paths,
+    browser_annotation_reference_input_refs, browser_annotation_references_metadata,
+    session_context_reference_input_refs, session_context_reference_policy,
+    session_context_references_metadata,
 };
 use crate::session_images::SessionTurnImage;
 use crate::task_execution_registry::{TaskExecutionPlan, TaskExecutionRegistry};
@@ -81,6 +83,8 @@ pub struct DispatchSubmissionRequest {
     pub timeline_message: String,
     pub images: Vec<SessionTurnImage>,
     pub context_references: Vec<SessionContextReference>,
+    /// 已由 Magi API 的 BrowserAuthority 解析并校验的页面标记引用。
+    pub browser_annotation_refs: Vec<serde_json::Value>,
     pub created_session: bool,
     pub mission_title: String,
     pub task_title: String,
@@ -207,16 +211,35 @@ fn build_task_policy(
     task_tier: TaskTier,
     access_profile: AccessProfile,
     context_references: &[SessionContextReference],
+    browser_annotation_refs: &[serde_json::Value],
     workspace_root_path: Option<&Path>,
     denied_tools: Vec<String>,
 ) -> magi_core::TaskPolicy {
-    let reference_policy = session_context_reference_policy(
+    let mut reference_policy = session_context_reference_policy(
         context_references,
         workspace_root_path
             .map(|path| path.to_string_lossy())
             .as_deref(),
         access_profile,
     );
+    if access_profile != AccessProfile::FullAccess
+        && reference_policy.allowed_paths.is_empty()
+        && let Some(workspace_root_path) = workspace_root_path
+    {
+        reference_policy
+            .allowed_paths
+            .push(workspace_root_path.to_string_lossy().into_owned());
+    }
+    for artifact_path in browser_annotation_artifact_paths(browser_annotation_refs) {
+        if access_profile != AccessProfile::FullAccess
+            && !reference_policy.allowed_paths.contains(&artifact_path)
+        {
+            reference_policy.allowed_paths.push(artifact_path.clone());
+        }
+        if !reference_policy.read_only_paths.contains(&artifact_path) {
+            reference_policy.read_only_paths.push(artifact_path);
+        }
+    }
     magi_core::TaskPolicy {
         autonomy_level: "Autonomous".to_string(),
         access_profile,
@@ -253,6 +276,7 @@ struct DispatchTaskInput<'a> {
     recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
     denied_tools: Vec<String>,
     plan_item_id: Option<PlanItemId>,
+    browser_annotation_refs: &'a [serde_json::Value],
 }
 
 fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
@@ -273,11 +297,16 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         recovery_checkpoint,
         denied_tools,
         plan_item_id,
+        browser_annotation_refs,
     } = input;
     let executor_binding = TaskExecutorBinding::for_role(target_role)
         .with_active_skill_id(active_skill_id.map(str::to_string))
         .with_required_tool_chain(required_tool_chain)
         .with_plan_item_id(plan_item_id);
+    let mut input_refs = session_context_reference_input_refs(context_references);
+    input_refs.extend(browser_annotation_reference_input_refs(
+        browser_annotation_refs,
+    ));
 
     magi_core::Task {
         task_id: task_id.clone(),
@@ -294,6 +323,7 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
             task_tier,
             access_profile,
             context_references,
+            browser_annotation_refs,
             workspace_root_path,
             denied_tools,
         )),
@@ -303,11 +333,17 @@ fn make_dispatch_task(input: DispatchTaskInput<'_>) -> magi_core::Task {
         knowledge_refs: Vec::new(),
         workspace_scope: None,
         write_scope: None,
-        input_refs: session_context_reference_input_refs(context_references),
+        input_refs,
         output_refs: Vec::new(),
         evidence_refs: Vec::new(),
         retry_count: 0,
-        runtime_payload: magi_core::TaskRuntimePayload::None,
+        runtime_payload: if browser_annotation_refs.is_empty() {
+            magi_core::TaskRuntimePayload::None
+        } else {
+            magi_core::TaskRuntimePayload::BrowserAnnotations {
+                references: browser_annotation_refs.to_vec(),
+            }
+        },
         created_at: now,
         updated_at: now,
     }
@@ -388,6 +424,7 @@ pub fn run_dispatch_submission(
         task_tier: request.task_tier,
         access_profile: request.access_profile,
         context_references: &request.context_references,
+        browser_annotation_refs: &request.browser_annotation_refs,
         workspace_root_path: runtime.workspace_root_path,
         required_tool_chain: request.required_tool_chain.clone(),
         completion_contract: request.completion_contract.clone(),
@@ -547,6 +584,9 @@ pub fn run_dispatch_submission(
                         crate::session_images::session_turn_images_metadata(&request.images);
                     metadata.extend(session_context_references_metadata(
                         &request.context_references,
+                    ));
+                    metadata.extend(browser_annotation_references_metadata(
+                        &request.browser_annotation_refs,
                     ));
                     if let Some(replace_turn_id) = request.replace_turn_id.as_ref() {
                         metadata.insert(
@@ -859,6 +899,7 @@ mod tests {
             timeline_message: "创建当前任务文件".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
+            browser_annotation_refs: Vec::new(),
             created_session: false,
             mission_title: "当前任务推进".to_string(),
             task_title: "当前任务推进".to_string(),
@@ -910,6 +951,112 @@ mod tests {
                 .content
                 .as_deref(),
             Some("历史验收任务：写 validation_auto_save_marker.txt / COMPLEX_WORKER_LANE_OK")
+        );
+    }
+
+    #[test]
+    fn dispatch_submission_persists_authoritative_browser_annotations_on_turn_and_task() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-dispatch-browser-annotation");
+        session_store
+            .create_session(session_id.clone(), "dispatch browser annotation")
+            .expect("session should be creatable");
+        let annotation = serde_json::json!({
+            "annotationId": "browser-annotation-dispatch",
+            "browserSessionId": "browser-session-dispatch",
+            "tabId": "browser-tab-dispatch",
+            "comment": "检查保存按钮",
+            "anchor": {
+                "kind": "region",
+                "url": "https://example.com/settings",
+                "snapshotRevision": 4
+            },
+            "screenshotArtifactId": "session-dispatch/annotation.png",
+            "screenshotPath": "/tmp/browser-artifacts/session-dispatch/annotation.png",
+            "status": "active"
+        });
+        let request = DispatchSubmissionRequest {
+            accepted_at: UtcMillis(2_100),
+            session_id: session_id.clone(),
+            workspace_id: Some(WorkspaceId::new("workspace-dispatch-browser-annotation")),
+            entry_id: "timeline-dispatch-browser-annotation".to_string(),
+            timeline_message: "根据浏览器标记检查页面".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            browser_annotation_refs: vec![annotation.clone()],
+            created_session: false,
+            mission_title: "浏览器标记检查".to_string(),
+            task_title: "浏览器标记检查".to_string(),
+            trimmed_text: Some("根据浏览器标记检查页面".to_string()),
+            execution_goal: Some("核对标记位置并报告问题".to_string()),
+            task_tier: TaskTier::ExecutionChain,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            goal_mode: false,
+            target_role: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            replace_turn_id: None,
+            required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            denied_tools: Vec::new(),
+            turn_origin: DispatchTurnOrigin::User,
+        };
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: Some(Path::new("/tmp/workspace-dispatch-browser-annotation")),
+        };
+
+        let graph = run_dispatch_submission(&runtime, &request)
+            .expect("browser annotation dispatch should build graph");
+        let task = task_store
+            .get_task(&graph.root_task_id)
+            .expect("root task should persist");
+        assert_eq!(
+            task.browser_annotation_references(),
+            std::slice::from_ref(&annotation)
+        );
+        let policy = task
+            .policy_snapshot
+            .as_ref()
+            .expect("browser annotation task should have policy");
+        assert_eq!(
+            policy.allowed_paths,
+            vec![
+                "/tmp/workspace-dispatch-browser-annotation",
+                "/tmp/browser-artifacts/session-dispatch/annotation.png"
+            ]
+        );
+        assert_eq!(
+            policy.read_only_paths,
+            vec!["/tmp/browser-artifacts/session-dispatch/annotation.png"]
+        );
+        assert!(task.input_refs.iter().any(|reference| {
+            reference.contains("/tmp/browser-artifacts/session-dispatch/annotation.png")
+        }));
+        let user_item = graph
+            .active_execution_chain
+            .as_ref()
+            .and_then(|chain| chain.current_turn.as_ref())
+            .and_then(|turn| turn.items.iter().find(|item| item.kind == "user_message"))
+            .expect("canonical user item should persist");
+        assert_eq!(
+            user_item.metadata.get("browserAnnotationRefs"),
+            Some(&serde_json::Value::Array(vec![annotation]))
         );
     }
 
@@ -1028,6 +1175,7 @@ mod tests {
             timeline_message: "继续".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
+            browser_annotation_refs: Vec::new(),
             created_session: false,
             mission_title: "继续中断任务".to_string(),
             task_title: "继续: 画当前项目流程图".to_string(),
@@ -1179,6 +1327,7 @@ mod tests {
             timeline_message: "继续".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
+            browser_annotation_refs: Vec::new(),
             created_session: false,
             mission_title: "继续中断任务".to_string(),
             task_title: "继续: 验证恢复原子性".to_string(),
@@ -1278,6 +1427,7 @@ mod tests {
             timeline_message: "修复明确 bug 并跑相关验证".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
+            browser_annotation_refs: Vec::new(),
             created_session: false,
             mission_title: "修复 bug + 验证".to_string(),
             task_title: "修复 bug + 验证".to_string(),
@@ -1384,6 +1534,7 @@ mod tests {
             timeline_message: "继续计划".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
+            browser_annotation_refs: Vec::new(),
             created_session: false,
             mission_title: "继续计划".to_string(),
             task_title: "继续计划".to_string(),
@@ -1450,6 +1601,7 @@ mod tests {
             timeline_message: "使用 browser Skill 创建 explorer 子代理".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
+            browser_annotation_refs: Vec::new(),
             created_session: false,
             mission_title: "Skill 子代理继承".to_string(),
             task_title: "Skill 子代理继承".to_string(),
@@ -1522,6 +1674,7 @@ mod tests {
             timeline_message: "使用代码审查 skill 检查当前改动".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
+            browser_annotation_refs: Vec::new(),
             created_session: false,
             mission_title: "代码审查".to_string(),
             task_title: "代码审查".to_string(),
@@ -1600,6 +1753,7 @@ mod tests {
                 path: std::path::PathBuf::from("/tmp/external/reference.md"),
                 name: "reference.md".to_string(),
             }],
+            browser_annotation_refs: Vec::new(),
             created_session: false,
             mission_title: "检查引用文件".to_string(),
             task_title: "检查引用文件".to_string(),
@@ -1701,6 +1855,7 @@ mod tests {
             timeline_message: "目标自动推进: 完成验收".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
+            browser_annotation_refs: Vec::new(),
             created_session: false,
             mission_title: "目标自动推进".to_string(),
             task_title: "执行: 目标自动推进".to_string(),
@@ -1814,6 +1969,7 @@ mod tests {
             timeline_message: "目标自动推进: 验证暂停竞态".to_string(),
             images: Vec::new(),
             context_references: Vec::new(),
+            browser_annotation_refs: Vec::new(),
             created_session: false,
             mission_title: "目标自动推进".to_string(),
             task_title: "执行: 目标自动推进".to_string(),

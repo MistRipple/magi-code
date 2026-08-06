@@ -18,6 +18,8 @@
     saveAgentModelContextWindow,
     saveAgentOrchestratorSessionConfig,
     resolveAgentPath,
+    updateBrowserAnnotationComment,
+    type BrowserAnnotationSnapshot,
     type ResolvedAgentPath,
     type AgentSettingsBootstrapSnapshot,
     settingsBootstrapMatchesCurrentWorkspace,
@@ -77,6 +79,17 @@
     name: string;
   }
 
+  type SelectedBrowserAnnotation = Pick<
+    BrowserAnnotationSnapshot,
+    | 'annotationId'
+    | 'browserSessionId'
+    | 'tabId'
+    | 'kind'
+    | 'comment'
+    | 'status'
+    | 'screenshotArtifactId'
+  >;
+
   // 输入框可识别的 instruction skill。来源：bootstrap 中的 skillsConfig.instructionSkills，
   // 这一组才是 `/` 唤起的指令型技能，与 customTools（已注册到工具表）的语义不同。
   type SkillOption = ComposerSkillOption;
@@ -126,6 +139,10 @@
   let selectedGoalMode = $state(false);
   let selectedSkill = $state<SkillOption | null>(null);
   let selectedContextReferences = $state<ComposerContextReference[]>([]);
+  let selectedBrowserAnnotations = $state<SelectedBrowserAnnotation[]>([]);
+  let editingBrowserAnnotation = $state<SelectedBrowserAnnotation | null>(null);
+  let editingBrowserAnnotationComment = $state('');
+  let browserAnnotationSaving = $state(false);
   let addMenuOpen = $state(false);
   let contextPickerOpen = $state(false);
   let WebFolderPickerComponent = $state<Component<{
@@ -267,6 +284,7 @@
     selectedGoalMode = false;
     selectedSkill = null;
     selectedContextReferences = [];
+    selectedBrowserAnnotations = [];
     addMenuOpen = false;
     contextPickerOpen = false;
     closeSlashMenu();
@@ -385,6 +403,7 @@
     inputValue = '';
     selectedImages = [];
     selectedContextReferences = [];
+    selectedBrowserAnnotations = [];
     selectedGoalMode = false;
     selectedSkill = null;
     addMenuOpen = false;
@@ -402,6 +421,7 @@
       || selectedImages.length > 0
       || pendingImageReadCount > 0
       || selectedContextReferences.length > 0
+      || selectedBrowserAnnotations.length > 0
       || selectedGoalMode
       || selectedSkill !== null
       || editingTurn !== null,
@@ -430,6 +450,11 @@
     selectedContextReferences = draft.contextReferences.map((reference) => ({
       id: `${reference.kind}:${reference.pathRef || reference.path}`,
       ...reference,
+    }));
+    selectedBrowserAnnotations = draft.browserAnnotationRefs.map((reference) => ({
+      ...reference,
+      screenshotArtifactId: reference.screenshotArtifactId ?? null,
+      status: 'active',
     }));
     selectedGoalMode = draft.goalMode;
     selectedSkill = draft.skillName
@@ -513,12 +538,7 @@
     reader.onload = (event) => {
       const dataUrl = event.target?.result;
       if (typeof dataUrl !== 'string' || dataUrl.length === 0) return;
-      selectedImages = [...selectedImages, {
-        id: generateId(),
-        dataUrl,
-        name: imageName,
-      }];
-      addToast('success', i18n.t('input.imageAdded'));
+      addImageToComposer({ dataUrl, name: imageName, size: file.size });
     };
     reader.onerror = () => {
       addToast('error', i18n.t('input.imageReadFailed'));
@@ -529,6 +549,62 @@
     } catch {
       finishImageRead();
       addToast('error', i18n.t('input.imageReadFailed'));
+    }
+  }
+
+  function addImageToComposer(image: { dataUrl: string; name: string; size: number }): boolean {
+    if (selectedImages.length >= MAX_IMAGES) {
+      addToast('warning', i18n.t('input.maxImages', { max: MAX_IMAGES }));
+      return false;
+    }
+    if (image.size > MAX_IMAGE_SIZE) {
+      addToast('warning', i18n.t('input.imageTooLarge', {
+        size: (image.size / 1024 / 1024).toFixed(1),
+      }));
+      return false;
+    }
+    if (!image.dataUrl.startsWith('data:image/')) {
+      addToast('error', i18n.t('input.imageReadFailed'));
+      return false;
+    }
+    selectedImages = [...selectedImages, {
+      id: generateId(),
+      dataUrl: image.dataUrl,
+      name: image.name,
+    }];
+    addToast('success', i18n.t('input.imageAdded'));
+    return true;
+  }
+
+  function startBrowserAnnotationEditing(annotation: SelectedBrowserAnnotation): void {
+    editingBrowserAnnotation = annotation;
+    editingBrowserAnnotationComment = annotation.comment;
+  }
+
+  function closeBrowserAnnotationEditing(): void {
+    if (browserAnnotationSaving) return;
+    editingBrowserAnnotation = null;
+    editingBrowserAnnotationComment = '';
+  }
+
+  async function saveBrowserAnnotationEditing(): Promise<void> {
+    const annotation = editingBrowserAnnotation;
+    const comment = editingBrowserAnnotationComment.trim();
+    if (!annotation || !comment || browserAnnotationSaving) return;
+    browserAnnotationSaving = true;
+    try {
+      const updated = await updateBrowserAnnotationComment(annotation.annotationId, comment);
+      selectedBrowserAnnotations = selectedBrowserAnnotations.map((item) => (
+        item.annotationId === updated.annotationId ? updated : item
+      ));
+      window.dispatchEvent(new CustomEvent('magi:browserAnnotationUpdated', { detail: updated }));
+      editingBrowserAnnotation = null;
+      editingBrowserAnnotationComment = '';
+      addToast('success', i18n.t('browser.annotation.updated'));
+    } catch (cause) {
+      addToast('error', cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      browserAnnotationSaving = false;
     }
   }
 
@@ -937,6 +1013,42 @@
         mode: i18n.t(accessProfileOptions.find((option) => option.value === profile)?.labelKey ?? 'input.access.restricted'),
       }));
     }
+    function handleBrowserAnnotationCreated(event: Event) {
+      const annotation = (event as CustomEvent<BrowserAnnotationSnapshot>).detail;
+      if (!annotation?.annotationId || annotation.status !== 'active') return;
+      if (selectedBrowserAnnotations.some((item) => item.annotationId === annotation.annotationId)) return;
+      if (selectedBrowserAnnotations.length >= 20) {
+        addToast('warning', i18n.t('browser.annotation.limit'));
+        return;
+      }
+      selectedBrowserAnnotations = [...selectedBrowserAnnotations, annotation];
+    }
+    function handleBrowserAnnotationUpdated(event: Event) {
+      const annotation = (event as CustomEvent<BrowserAnnotationSnapshot>).detail;
+      if (!annotation?.annotationId) return;
+      selectedBrowserAnnotations = selectedBrowserAnnotations.map((item) => (
+        item.annotationId === annotation.annotationId ? annotation : item
+      ));
+    }
+    function handleBrowserScreenshotCaptured(event: Event) {
+      const detail = (event as CustomEvent<{
+        dataUrl?: unknown;
+        name?: unknown;
+        size?: unknown;
+      }>).detail;
+      if (
+        typeof detail?.dataUrl !== 'string'
+        || typeof detail.name !== 'string'
+        || typeof detail.size !== 'number'
+      ) return;
+      if (selectedImages.length + pendingImageReadCount >= MAX_IMAGES) {
+        addToast('warning', i18n.t('input.maxImages', { max: MAX_IMAGES }));
+        return;
+      }
+      if (addImageToComposer({ dataUrl: detail.dataUrl, name: detail.name, size: detail.size })) {
+        queueMicrotask(focusEditor);
+      }
+    }
     function handlePickerOutsidePointerDown(event: PointerEvent) {
       const target = event.target;
       if (workspacePickerOpen && !(target instanceof Element && target.closest('.ia-workspace-wrap'))) {
@@ -972,6 +1084,9 @@
     }
     window.addEventListener('magi:fillComposer', handleFillComposer as EventListener);
     window.addEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
+    window.addEventListener('magi:browserAnnotationCreated', handleBrowserAnnotationCreated as EventListener);
+    window.addEventListener('magi:browserAnnotationUpdated', handleBrowserAnnotationUpdated as EventListener);
+    window.addEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
     window.addEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
     window.addEventListener('storage', handleStoredAccessProfileChange);
     document.addEventListener('pointerdown', handlePickerOutsidePointerDown, true);
@@ -979,6 +1094,9 @@
       setComposerHasUnsavedInput(false);
       window.removeEventListener('magi:fillComposer', handleFillComposer as EventListener);
       window.removeEventListener('magi:setAccessProfile', handleSetAccessProfile as EventListener);
+      window.removeEventListener('magi:browserAnnotationCreated', handleBrowserAnnotationCreated as EventListener);
+      window.removeEventListener('magi:browserAnnotationUpdated', handleBrowserAnnotationUpdated as EventListener);
+      window.removeEventListener('magi:browserScreenshotCaptured', handleBrowserScreenshotCaptured as EventListener);
       window.removeEventListener(DESKTOP_CONTEXT_DROP_EVENT, handleDesktopContextDrop as EventListener);
       window.removeEventListener('storage', handleStoredAccessProfileChange);
       document.removeEventListener('pointerdown', handlePickerOutsidePointerDown, true);
@@ -1052,7 +1170,7 @@
       const rawContent = resolveComposerRawContent();
       const normalizedContent = rawContent.trim();
       if (
-        (!normalizedContent && selectedImages.length === 0 && selectedContextReferences.length === 0)
+        (!normalizedContent && selectedImages.length === 0 && selectedContextReferences.length === 0 && selectedBrowserAnnotations.length === 0)
         || sessionInputLocked
         || isInteractionBlocking
       ) return;
@@ -1066,6 +1184,8 @@
           ? i18n.t('input.analyzeImages')
           : selectedContextReferences.length > 0
             ? i18n.t('input.analyzeReferences')
+            : selectedBrowserAnnotations.length > 0
+              ? i18n.t('browser.annotation.context')
             : null;
       const submissionLength = submissionText?.length ?? 0;
 
@@ -1107,6 +1227,15 @@
           dataUrl: img.dataUrl,
         })),
         contextReferences: toSessionContextReferencePayload(selectedContextReferences),
+        browserAnnotationRefs: selectedBrowserAnnotations.map((annotation) => annotation.annotationId),
+        browserAnnotationSnapshots: selectedBrowserAnnotations.map((annotation) => ({
+          annotationId: annotation.annotationId,
+          browserSessionId: annotation.browserSessionId,
+          tabId: annotation.tabId,
+          kind: annotation.kind,
+          comment: annotation.comment,
+          screenshotArtifactId: annotation.screenshotArtifactId,
+        })),
       });
       if (!replaceTurnId) {
         clearComposerState();
@@ -1726,7 +1855,7 @@
     {/if}
 
     <!-- 快捷引用保持结构化状态，不把 /goal 或 Skill 名称注入用户正文。 -->
-    {#if selectedContextReferences.length > 0 || selectedGoalMode || selectedSkill}
+    {#if selectedContextReferences.length > 0 || selectedBrowserAnnotations.length > 0 || selectedGoalMode || selectedSkill}
       <div class="ia-reference-chip-row">
         {#each selectedContextReferences as reference (reference.id)}
           <span class="ia-reference-chip ia-context-reference-chip" title={reference.path}>
@@ -1738,6 +1867,30 @@
               onclick={() => removeContextReference(reference.id)}
               title={i18n.t('input.add.removeContext')}
               aria-label={i18n.t('input.add.removeContext')}
+            >
+              <Icon name="close" size={10} />
+            </button>
+          </span>
+        {/each}
+        {#each selectedBrowserAnnotations as annotation (annotation.annotationId)}
+          <span class="ia-reference-chip ia-browser-annotation-chip" title={annotation.comment}>
+            <Icon name="target" size={11} />
+            <span class="ia-reference-chip-label">{annotation.comment}</span>
+            <button
+              type="button"
+              class="ia-reference-chip-remove"
+              onclick={() => startBrowserAnnotationEditing(annotation)}
+              title={i18n.t('browser.annotation.edit')}
+              aria-label={i18n.t('browser.annotation.edit')}
+            >
+              <Icon name="edit" size={10} />
+            </button>
+            <button
+              type="button"
+              class="ia-reference-chip-remove"
+              onclick={() => { selectedBrowserAnnotations = selectedBrowserAnnotations.filter((item) => item.annotationId !== annotation.annotationId); }}
+              title={i18n.t('browser.annotation.remove')}
+              aria-label={i18n.t('browser.annotation.remove')}
             >
               <Icon name="close" size={10} />
             </button>
@@ -2236,6 +2389,44 @@
     {:else}
       <div class="ia-context-picker-loading" role="status"><Icon name="loader" size={18} /><span>{i18n.t('common.loading')}</span></div>
     {/if}
+  </Modal>
+{/if}
+
+{#if editingBrowserAnnotation}
+  <Modal
+    title={i18n.t('browser.annotation.editTitle')}
+    onClose={closeBrowserAnnotationEditing}
+    closeOnBackdrop={true}
+    size="sm"
+    modalClass="browser-annotation-edit-modal"
+  >
+    <div class="browser-annotation-edit-form">
+      <textarea
+        bind:value={editingBrowserAnnotationComment}
+        maxlength="4000"
+        rows="4"
+        aria-label={i18n.t('browser.annotation.placeholder')}
+        onkeydown={(event) => {
+          if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+            event.preventDefault();
+            void saveBrowserAnnotationEditing();
+          }
+        }}
+      ></textarea>
+      <div class="browser-annotation-edit-actions">
+        <button type="button" onclick={closeBrowserAnnotationEditing} disabled={browserAnnotationSaving}>
+          {i18n.t('browser.annotation.cancel')}
+        </button>
+        <button
+          type="button"
+          class="primary"
+          onclick={() => void saveBrowserAnnotationEditing()}
+          disabled={browserAnnotationSaving || !editingBrowserAnnotationComment.trim()}
+        >
+          {i18n.t('browser.annotation.save')}
+        </button>
+      </div>
+    </div>
   </Modal>
 {/if}
 
@@ -3136,6 +3327,47 @@
   }
   .ia-reference-chip-remove:hover {
     background: color-mix(in srgb, var(--primary) 24%, transparent);
+  }
+
+  :global(.browser-annotation-edit-modal .modal-dialog) {
+    max-width: calc(100vw - 24px);
+  }
+  .browser-annotation-edit-form textarea {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 92px;
+    resize: vertical;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--background);
+    color: var(--foreground);
+    padding: 8px;
+    font: inherit;
+  }
+  .browser-annotation-edit-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .browser-annotation-edit-actions button {
+    min-height: 30px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface-1);
+    color: var(--foreground);
+    font: inherit;
+    cursor: pointer;
+  }
+  .browser-annotation-edit-actions button.primary {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--accent-foreground, white);
+  }
+  .browser-annotation-edit-actions button:disabled {
+    opacity: .5;
+    cursor: default;
   }
 
   .ia-slash-popover {

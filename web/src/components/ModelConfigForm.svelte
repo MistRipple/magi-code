@@ -8,6 +8,7 @@
     formType,
     statusKey,
     config = $bindable(),
+    baselineConfig,
     keyVisible = $bindable(),
     showModelField = true,
     showAdvancedOptions = true,
@@ -30,6 +31,7 @@
     formType: FormType;
     statusKey: string;
     config: any;
+    baselineConfig: any;
     keyVisible: Record<string, boolean>;
     showModelField?: boolean;
     showAdvancedOptions?: boolean;
@@ -44,48 +46,31 @@
     shouldRecommendStandardUrlMode: (baseUrl: string) => boolean;
     openModelDropdown: (type: string, target: HTMLElement) => void;
     closeModelDropdown: (key: string) => void;
-    fetchModelList: (type: FormType) => void;
+    fetchModelList: (type: FormType, statusKey: string) => void;
     selectModel: (type: string, model: string) => void;
-    saveModelConfig: (type: FormType) => void;
-    testModelConnection: (type: FormType) => void;
+    saveModelConfig: (type: FormType, statusKey: string) => void;
+    testModelConnection: (type: FormType, statusKey: string) => void;
   }>();
 
   const keyVisibleKey = $derived(formType);
 
-  // --- 脏态检测 ---
-  // 父组件会异步重新赋值 config（首次加载 / 切换 provider 时），proxy 引用整体替换，
-  // 单纯比较快照无法分辨「外部数据装入」与「用户编辑」。因此用 userHasEdited 作为闸门：
-  // 仅在表单收到 input 事件（来自用户键入或切换）后才进入脏态比对，避免冷启动误报。
-  function snapshot(value: any): string {
-    try {
-      return JSON.stringify($state.snapshot(value));
-    } catch {
-      return '';
-    }
+  function editableConfigSnapshot(value: any): string {
+    const normalized = {
+      baseUrl: String(value?.baseUrl ?? ''),
+      urlMode: value?.urlMode === 'full' ? 'full' : 'standard',
+      ...(formType !== 'image'
+        ? { apiProtocol: String(value?.apiProtocol ?? 'openai_chat') }
+        : {}),
+      apiKey: String(value?.apiKey ?? ''),
+      ...(showModelField ? { model: String(value?.model ?? '') } : {}),
+      ...(showAdvancedOptions
+        ? { reasoningEffort: String(value?.reasoningEffort ?? 'medium') }
+        : {})
+    };
+    return JSON.stringify(normalized);
   }
 
-  let baseline = $state(snapshot(config));
-  let userHasEdited = $state(false);
-
-  $effect(() => {
-    // 用户未编辑前，保持 baseline 与外部数据同步，避免父组件异步装入时误判脏态
-    if (!userHasEdited) {
-      baseline = snapshot(config);
-    }
-  });
-
-  $effect(() => {
-    if (saveStatus[statusKey] === 'saved') {
-      baseline = snapshot(config);
-      userHasEdited = false;
-    }
-  });
-
-  const isDirty = $derived(userHasEdited && snapshot(config) !== baseline);
-
-  function markUserEdited() {
-    userHasEdited = true;
-  }
+  const isDirty = $derived(editableConfigSnapshot(config) !== editableConfigSnapshot(baselineConfig));
 
   // --- 下拉外部点击关闭 ---
   // 模型下拉用 position: fixed 渲染到 .model-combobox 之外的 stacking context，
@@ -93,6 +78,15 @@
   // 其余 pointerdown 一律关闭本表单的下拉。
   let comboboxEl: HTMLDivElement | undefined = $state();
   let dropdownEl: HTMLDivElement | undefined = $state();
+
+  function portalToBody(node: HTMLElement) {
+    document.body.appendChild(node);
+    return {
+      destroy() {
+        node.remove();
+      }
+    };
+  }
 
   $effect(() => {
     if (!modelDropdownOpen[statusKey]) return;
@@ -103,8 +97,15 @@
       if (dropdownEl?.contains(target)) return;
       closeModelDropdown(statusKey);
     }
+    function handleScroll() {
+      closeModelDropdown(statusKey);
+    }
     window.addEventListener('pointerdown', handlePointerDown, true);
-    return () => window.removeEventListener('pointerdown', handlePointerDown, true);
+    window.addEventListener('scroll', handleScroll, true);
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown, true);
+      window.removeEventListener('scroll', handleScroll, true);
+    };
   });
 
   const currentSaveStatus = $derived(saveStatus[statusKey]);
@@ -123,7 +124,7 @@
       openModelDropdown(statusKey, input);
     }
     if (!hasModels) {
-      void fetchModelList(formType);
+      void fetchModelList(formType, statusKey);
     }
   }
 
@@ -156,7 +157,7 @@
 </script>
 
 <!-- svelte-ignore a11y_label_has_associated_control -->
-<div class="llm-config-form" oninput={markUserEdited} onchange={markUserEdited}>
+<div class="llm-config-form">
   <div class="llm-config-field-row url-mode-row">
     <div class="llm-config-field">
       <label class="form-label">{i18n.t('settings.model.field.baseUrl')}</label>
@@ -174,7 +175,7 @@
           type="button"
           class="ui-segmented__option"
           class:active={config.urlMode === 'standard'}
-          onclick={() => { config.urlMode = 'standard'; markUserEdited(); }}
+          onclick={() => { config.urlMode = 'standard'; }}
         >
           {i18n.t('settings.model.urlMode.standard')}
         </button>
@@ -182,7 +183,7 @@
           type="button"
           class="ui-segmented__option"
           class:active={config.urlMode === 'full'}
-          onclick={() => { config.urlMode = 'full'; markUserEdited(); }}
+          onclick={() => { config.urlMode = 'full'; }}
         >
           {i18n.t('settings.model.urlMode.full')}
         </button>
@@ -263,7 +264,9 @@
           />
           <button
             class="model-fetch-btn"
+            type="button"
             onclick={handleModelListAction}
+            disabled={fetchingModels[statusKey]}
             aria-label={modelListActionTitle()}
             title={modelListActionTitle()}
           >
@@ -278,6 +281,7 @@
           {#if modelDropdownOpen[statusKey] && (modelLists[statusKey]?.length ?? 0) > 0}
             <div
               bind:this={dropdownEl}
+              use:portalToBody
               class="model-dropdown"
               data-magi-surface="popover"
               style="top: {dropdownPosition.top}px; left: {dropdownPosition.left}px; width: {dropdownPosition.width}px;"
@@ -286,7 +290,7 @@
                 <button
                   class="model-dropdown-item"
                   class:selected={config.model === m}
-                  onclick={() => { selectModel(statusKey, m); markUserEdited(); }}
+                  onclick={() => { selectModel(statusKey, m); }}
                 >
                   {m}
                 </button>
@@ -336,8 +340,8 @@
         class:is-testing={currentTestStatus === 'testing'}
         class:is-success={currentTestStatus === 'success'}
         class:is-error={currentTestStatus === 'error'}
-        onclick={() => testModelConnection(formType)}
-        disabled={isTesting}
+        onclick={() => testModelConnection(formType, statusKey)}
+        disabled={isTesting || isSaving}
       >
         {#if currentTestStatus === 'testing'}
           <Icon name="refresh" size={14} />
@@ -356,7 +360,7 @@
       <button
         class="btn btn--primary btn--sm"
         class:is-saving={isSaving}
-        onclick={() => saveModelConfig(formType)}
+        onclick={() => saveModelConfig(formType, statusKey)}
         disabled={saveDisabled}
       >
         {#if isSaving}
@@ -525,6 +529,10 @@
   .model-fetch-btn:hover {
     background: var(--secondary);
     color: var(--foreground);
+  }
+  .model-fetch-btn:disabled {
+    cursor: wait;
+    opacity: 0.6;
   }
 
   .model-dropdown {
