@@ -5,7 +5,6 @@ use crate::llm_types::{
     LlmStreamChunk, LlmStreamChunkType, LlmUsage, PartialToolCall, ToolCall, parse_tool_arguments,
 };
 use crate::types::ModelProviderContext;
-use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub enum ProviderContextStreamDelta {
@@ -19,6 +18,7 @@ pub enum ProviderContextStreamDelta {
         value: String,
     },
     ReasoningContentAppend {
+        field: &'static str,
         value: String,
     },
 }
@@ -29,35 +29,38 @@ pub fn parse_stream_provider_context(
 ) -> Option<ProviderContextStreamDelta> {
     let envelope = serde_json::from_str::<Value>(&event.data).ok()?;
     if family == ProviderFamily::OpenAiChat {
-        let value = envelope["choices"]
-            .as_array()?
-            .iter()
-            .find_map(|choice| {
-                choice["delta"]["reasoning_content"]
-                    .as_str()
-                    .or_else(|| choice["delta"]["reasoning"].as_str())
-            })?
-            .to_string();
-        return (!value.is_empty())
-            .then_some(ProviderContextStreamDelta::ReasoningContentAppend { value });
+        let (field, value) = envelope["choices"].as_array()?.iter().find_map(|choice| {
+            ["reasoning_content", "reasoning_text", "reasoning"]
+                .into_iter()
+                .find_map(|field| choice["delta"][field].as_str().map(|value| (field, value)))
+        })?;
+        return (!value.is_empty()).then_some(ProviderContextStreamDelta::ReasoningContentAppend {
+            field,
+            value: value.to_string(),
+        });
     }
     if family == ProviderFamily::OpenAiResponses {
         let item = envelope.get("item")?;
-        if item["type"].as_str() != Some("reasoning") {
+        if !matches!(
+            item["type"].as_str(),
+            Some("message" | "reasoning" | "function_call")
+        ) {
             return None;
         }
-        if matches!(
-            event.event_type.as_deref(),
-            Some("response.output_item.added" | "response.output_item.done")
-        ) {
+        if event.event_type.as_deref() == Some("response.output_item.done") {
             return Some(ProviderContextStreamDelta::Start {
-                index: item["id"]
-                    .as_str()
-                    .map(stable_provider_context_index)
-                    .unwrap_or(0),
+                // `done` 才携带可重放的完整原始 item；`added` 中的函数参数和
+                // reasoning 加密上下文通常尚未齐全，不能提前持久化。
+                index: responses_output_index(&envelope).unwrap_or_else(|| {
+                    item["id"]
+                        .as_str()
+                        .or_else(|| item["call_id"].as_str())
+                        .map(stable_provider_context_index)
+                        .unwrap_or(usize::MAX)
+                }),
                 context: ModelProviderContext {
                     provider: "openai_responses".to_string(),
-                    kind: "reasoning".to_string(),
+                    kind: "response_output_item".to_string(),
                     data: item.clone(),
                 },
             });
@@ -439,6 +442,7 @@ fn parse_openai_stream_data(data: &str) -> Vec<LlmStreamChunk> {
 
         if let Some(reasoning) = delta["reasoning_content"]
             .as_str()
+            .or_else(|| delta["reasoning_text"].as_str())
             .or_else(|| delta["reasoning"].as_str())
             && !reasoning.is_empty()
         {
@@ -697,7 +701,9 @@ pub struct StreamAccumulator {
     usage: LlmUsage,
     stop_reason: Option<String>,
     terminal: bool,
-    provider_context: BTreeMap<usize, ModelProviderContext>,
+    // provider context 是下一轮请求必须原样回放的协议数据。使用 Vec 保留
+    // Responses 的 output_index；不能使用 BTreeMap 对 provider id 哈希后排序。
+    provider_context: Vec<(usize, ModelProviderContext)>,
 }
 
 #[derive(Clone, Debug)]
@@ -845,21 +851,18 @@ impl StreamAccumulator {
     pub fn apply_provider_context(&mut self, delta: ProviderContextStreamDelta) {
         match delta {
             ProviderContextStreamDelta::Start { index, context } => {
-                self.provider_context.insert(index, context);
+                self.upsert_provider_context(index, context);
             }
             ProviderContextStreamDelta::Append {
                 index,
                 field,
                 value,
             } => {
-                let context =
-                    self.provider_context
-                        .entry(index)
-                        .or_insert_with(|| ModelProviderContext {
-                            provider: "anthropic".to_string(),
-                            kind: "thinking".to_string(),
-                            data: serde_json::json!({"type": "thinking"}),
-                        });
+                let context = self.provider_context_mut(index, || ModelProviderContext {
+                    provider: "anthropic".to_string(),
+                    kind: "thinking".to_string(),
+                    data: serde_json::json!({"type": "thinking"}),
+                });
                 let object = context
                     .data
                     .as_object_mut()
@@ -871,21 +874,53 @@ impl StreamAccumulator {
                     current.push_str(&value);
                 }
             }
-            ProviderContextStreamDelta::ReasoningContentAppend { value } => {
-                let context = self.provider_context.entry(usize::MAX).or_insert_with(|| {
-                    ModelProviderContext {
-                        provider: "openai_chat".to_string(),
-                        kind: "reasoning_content".to_string(),
-                        data: serde_json::json!({"reasoning_content": ""}),
-                    }
+            ProviderContextStreamDelta::ReasoningContentAppend { field, value } => {
+                let context = self.provider_context_mut(usize::MAX, || ModelProviderContext {
+                    provider: "openai_chat".to_string(),
+                    kind: "reasoning".to_string(),
+                    data: serde_json::json!({field: ""}),
                 });
-                let current = context.data["reasoning_content"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
-                context.data["reasoning_content"] = Value::String(format!("{current}{value}"));
+                let current = context.data[field].as_str().unwrap_or_default().to_string();
+                context.data[field] = Value::String(format!("{current}{value}"));
             }
         }
+    }
+
+    fn upsert_provider_context(&mut self, index: usize, context: ModelProviderContext) {
+        if let Some((_, existing)) = self
+            .provider_context
+            .iter_mut()
+            .find(|(existing_index, _)| *existing_index == index)
+        {
+            *existing = context;
+            return;
+        }
+        let insert_at = self
+            .provider_context
+            .iter()
+            .position(|(existing_index, _)| *existing_index > index)
+            .unwrap_or(self.provider_context.len());
+        self.provider_context.insert(insert_at, (index, context));
+    }
+
+    fn provider_context_mut(
+        &mut self,
+        index: usize,
+        create: impl FnOnce() -> ModelProviderContext,
+    ) -> &mut ModelProviderContext {
+        if let Some(position) = self
+            .provider_context
+            .iter()
+            .position(|(existing_index, _)| *existing_index == index)
+        {
+            return &mut self.provider_context[position].1;
+        }
+        self.provider_context.push((index, create()));
+        &mut self
+            .provider_context
+            .last_mut()
+            .expect("新建的 provider context 必须存在")
+            .1
     }
 
     pub fn finalize(self) -> AdaptedResponse {
@@ -925,7 +960,11 @@ impl StreamAccumulator {
             usage: self.usage,
             stop_reason,
             raw: None,
-            provider_context: self.provider_context.into_values().collect(),
+            provider_context: self
+                .provider_context
+                .into_iter()
+                .map(|(_, context)| context)
+                .collect(),
         }
     }
 
@@ -956,6 +995,8 @@ fn tool_call_argument_fragment(arguments: Option<&Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm_types::{LlmContentBlock, LlmMessage, LlmMessageContent, LlmMessageParams};
+    use crate::protocol::{OpenAiResponsesAdapter, ProviderAdapter};
 
     #[test]
     fn sse_parser_yields_events_from_chunked_input() {
@@ -1101,10 +1142,10 @@ mod tests {
     }
 
     #[test]
-    fn openai_stream_accumulates_reasoning_content_context() {
+    fn openai_stream_preserves_reasoning_field_name() {
         let event = SseEvent {
             event_type: None,
-            data: r#"{"choices":[{"delta":{"reasoning_content":"先分析"},"finish_reason":null}]}"#
+            data: r#"{"choices":[{"delta":{"reasoning_text":"先分析"},"finish_reason":null}]}"#
                 .to_string(),
         };
         let mut accumulator = StreamAccumulator::new();
@@ -1119,7 +1160,7 @@ mod tests {
         assert_eq!(response.provider_context.len(), 1);
         assert_eq!(response.provider_context[0].provider, "openai_chat");
         assert_eq!(
-            response.provider_context[0].data["reasoning_content"],
+            response.provider_context[0].data["reasoning_text"],
             "先分析"
         );
     }
@@ -1463,12 +1504,13 @@ mod tests {
     #[test]
     fn end_to_end_responses_stream_to_response() {
         let sse_payload = concat!(
-            "event: response.output_item.added\ndata: {\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n\n",
+            "event: response.output_item.added\ndata: {\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n\n",
             "event: response.reasoning_summary_text.delta\ndata: {\"delta\":\"先判断\"}\n\n",
-            "event: response.output_item.added\ndata: {\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"shell_exec\",\"arguments\":\"\"}}\n\n",
+            "event: response.output_item.added\ndata: {\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"shell_exec\",\"arguments\":\"\"}}\n\n",
             "event: response.function_call_arguments.delta\ndata: {\"item_id\":\"fc_1\",\"delta\":\"{\\\"command\\\":\\\"pwd\\\"}\"}\n\n",
             "event: response.function_call_arguments.done\ndata: {\"item_id\":\"fc_1\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}\n\n",
-            "event: response.output_item.done\ndata: {\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"先判断\"}]}}\n\n",
+            "event: response.output_item.done\ndata: {\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"shell_exec\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}\n\n",
+            "event: response.output_item.done\ndata: {\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"encrypted-context\",\"content\":[{\"type\":\"reasoning_text\",\"text\":\"先判断\"}]}}\n\n",
             "event: response.completed\ndata: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}\n\n",
         );
 
@@ -1489,9 +1531,63 @@ mod tests {
         assert_eq!(result.tool_calls[0].id, "call_1");
         assert_eq!(result.tool_calls[0].arguments["command"], "pwd");
         assert_eq!(result.stop_reason, "stop");
-        assert_eq!(result.provider_context[0].provider, "openai_responses");
+        assert_eq!(result.provider_context.len(), 2);
+        assert_eq!(result.provider_context[0].data["id"], "rs_1");
+        assert_eq!(
+            result.provider_context[0].data["encrypted_content"],
+            "encrypted-context"
+        );
+        assert_eq!(result.provider_context[1].data["id"], "fc_1");
+        assert_eq!(result.provider_context[1].data["call_id"], "call_1");
         assert_eq!(result.usage.input_tokens, 10);
         assert_eq!(result.usage.output_tokens, 4);
+
+        let assistant_blocks = result
+            .provider_context
+            .into_iter()
+            .map(|context| LlmContentBlock::ProviderContext { context })
+            .chain(std::iter::once(LlmContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "shell_exec".to_string(),
+                input: serde_json::json!({"command": "pwd"}),
+            }))
+            .collect();
+        let request = OpenAiResponsesAdapter
+            .build_request(
+                &LlmMessageParams {
+                    messages: vec![
+                        LlmMessage {
+                            role: "assistant".to_string(),
+                            content: LlmMessageContent::Blocks(assistant_blocks),
+                        },
+                        LlmMessage {
+                            role: "user".to_string(),
+                            content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
+                                tool_use_id: "call_1".to_string(),
+                                content: "/workspace".to_string(),
+                                is_error: false,
+                                images: Vec::new(),
+                            }]),
+                        },
+                    ],
+                    max_tokens: None,
+                    temperature: None,
+                    tools: None,
+                    stream: Some(true),
+                    system_prompt: None,
+                    tool_choice: None,
+                    reasoning_effort: None,
+                },
+                "deepseek-v4-flash-0731",
+            )
+            .expect("request should build");
+        let input = request.body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["id"], "rs_1");
+        assert_eq!(input[0]["encrypted_content"], "encrypted-context");
+        assert_eq!(input[1]["id"], "fc_1");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[2]["type"], "function_call_output");
     }
 
     #[test]

@@ -221,7 +221,7 @@
   "input.modeSwitching": "Switching mode...",
   "input.currentAskMode": "Current: Ask mode",
   "input.currentAutoMode": "Current: Auto mode",
-  "input.send": "Send (Enter to send, Option/Alt+Enter for newline)",
+  "input.send": "Send (Enter to send, Shift+Enter or Option/Alt+Enter for newline)",
   "input.sending": "Sending...",
   "input.stop": "Stop",
   "input.stopTaskTitle": "Stop the current task and keep progress",

@@ -1261,8 +1261,26 @@
     return event.key === 'Enter' || event.code === 'Enter' || event.code === 'NumpadEnter';
   }
 
+  function isNewlineShortcut(event: KeyboardEvent): boolean {
+    if (!isEnterKey(event) || event.metaKey || event.ctrlKey) {
+      return false;
+    }
+    // Shift+Enter 是统一主快捷键；保留既有的 Option/Alt+Enter，避免 macOS 用户升级后失去原有操作。
+    return (event.shiftKey && !event.altKey) || (event.altKey && !event.shiftKey);
+  }
+
   // 处理键盘事件
   function handleKeydown(event: KeyboardEvent) {
+    if (isNewlineShortcut(event)) {
+      // 输入法组合态下回车只用于上屏，不能插入换行或触发发送。
+      if (event.isComposing || event.keyCode === 229) {
+        return;
+      }
+      event.preventDefault();
+      closeSlashMenu();
+      insertNewlineAtCursor();
+      return;
+    }
     if (slashMenuOpen) {
       // 斜杠菜单展开时优先处理导航；输入法组合态下不拦截，交给 IME 完成上屏。
       if (!event.isComposing && event.keyCode !== 229) {
@@ -1292,13 +1310,6 @@
     if (isEnterKey(event)) {
       // 输入法组合态下回车只用于上屏，不能误触发发送
       if (event.isComposing || event.keyCode === 229) {
-        return;
-      }
-      const isAltEnter = event.altKey
-        || event.getModifierState?.('Alt');
-      if (isAltEnter) {
-        event.preventDefault();
-        insertNewlineAtCursor();
         return;
       }
       if (event.metaKey || event.ctrlKey || event.shiftKey) {

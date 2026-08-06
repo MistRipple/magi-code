@@ -93,6 +93,18 @@ assert.match(
   /<GitContextControl[\s\S]*?workspace=\{composerWorkspace\}[\s\S]*?sessionId=\{persistedSessionId\}/,
   '输入区必须使用统一 Git 上下文入口',
 );
+assert.match(
+  inputAreaSource,
+  /function isNewlineShortcut\([\s\S]*?event\.metaKey[\s\S]*?event\.ctrlKey[\s\S]*?event\.shiftKey[\s\S]*?event\.altKey/,
+  '换行快捷键必须支持跨平台一致的 Shift+Enter，并保留 Option/Alt+Enter',
+);
+assert.match(
+  inputAreaSource,
+  /if \(isNewlineShortcut\(event\)\) \{[\s\S]*?event\.isComposing[\s\S]*?closeSlashMenu\(\);[\s\S]*?insertNewlineAtCursor\(\);/,
+  '换行快捷键必须优先于斜杠菜单处理，并在输入法组合态下不改变输入内容',
+);
+assert.match(zhLocaleSource, /"input\.send": "发送 \(Enter 发送，Shift\+Enter 或 Option\/Alt\+Enter 换行\)"/, '中文发送提示必须与实际快捷键一致');
+assert.match(enLocaleSource, /"input\.send": "Send \(Enter to send, Shift\+Enter or Option\/Alt\+Enter for newline\)"/, '英文发送提示必须与实际快捷键一致');
 assert.doesNotMatch(
   inputAreaSource,
   /previewWorkspaceMerge|mergeWorkspaceBranch|deleteWorkspaceBranch|fetchWorkspaceWorktrees|createWorkspaceWorktree|removeWorkspaceWorktree/,

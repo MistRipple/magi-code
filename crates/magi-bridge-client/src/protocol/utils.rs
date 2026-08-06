@@ -1,5 +1,6 @@
 use magi_usage_authority::ReasoningEffort;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 use crate::llm_types::{
     LlmContentBlock, LlmMessage, LlmMessageContent, LlmUsage, ToolCall, ToolDefinition,
@@ -161,7 +162,7 @@ fn append_openai_content_block_message(
     let mut tool_calls_out = Vec::new();
     let mut text_parts = Vec::new();
     let mut image_parts = Vec::new();
-    let mut reasoning_parts = Vec::new();
+    let mut reasoning_parts = BTreeMap::<&str, Vec<String>>::new();
     let mut tool_result_id = None;
     let mut tool_result_content = None;
     let mut tool_result_images = Vec::new();
@@ -196,9 +197,12 @@ fn append_openai_content_block_message(
             }
             LlmContentBlock::ProviderContext { context } => {
                 if msg.role == "assistant"
-                    && let Some(reasoning_content) = openai_reasoning_content(context)
+                    && let Some((field, reasoning_content)) = openai_reasoning_content(context)
                 {
-                    reasoning_parts.push(reasoning_content);
+                    reasoning_parts
+                        .entry(field)
+                        .or_default()
+                        .push(reasoning_content);
                 }
             }
         }
@@ -236,8 +240,8 @@ fn append_openai_content_block_message(
             "role": msg.role,
             "content": content_parts,
         });
-        if !reasoning_parts.is_empty() {
-            message["reasoning_content"] = json!(reasoning_parts.join(""));
+        for (field, parts) in reasoning_parts {
+            message[field] = json!(parts.join(""));
         }
         converted.push(message);
         return;
@@ -250,20 +254,31 @@ fn append_openai_content_block_message(
     if !tool_calls_out.is_empty() {
         obj["tool_calls"] = json!(tool_calls_out);
     }
-    if !reasoning_parts.is_empty() {
-        obj["reasoning_content"] = json!(reasoning_parts.join(""));
+    for (field, parts) in reasoning_parts {
+        obj[field] = json!(parts.join(""));
     }
     converted.push(obj);
 }
 
-fn openai_reasoning_content(context: &crate::types::ModelProviderContext) -> Option<String> {
-    if context.provider == "openai_chat" && context.kind == "reasoning_content" {
-        return context.data["reasoning_content"]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
+fn openai_reasoning_content(
+    context: &crate::types::ModelProviderContext,
+) -> Option<(&'static str, String)> {
+    if context.provider == "openai_chat"
+        && matches!(context.kind.as_str(), "reasoning" | "reasoning_content")
+    {
+        return ["reasoning_content", "reasoning_text", "reasoning"]
+            .into_iter()
+            .find_map(|field| {
+                context.data[field]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(|value| (field, value.to_string()))
+            });
     }
-    if context.provider != "openai_responses" || context.kind != "reasoning" {
+    if context.provider != "openai_responses"
+        || !matches!(context.kind.as_str(), "reasoning" | "response_output_item")
+        || context.data["type"].as_str() != Some("reasoning")
+    {
         return None;
     }
 
@@ -275,7 +290,7 @@ fn openai_reasoning_content(context: &crate::types::ModelProviderContext) -> Opt
             .filter_map(|part| part["text"].as_str())
             .collect::<String>();
         if !text.is_empty() {
-            return Some(text);
+            return Some(("reasoning_content", text));
         }
     }
     None

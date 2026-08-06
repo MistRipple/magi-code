@@ -110,11 +110,17 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
                 .or_else(|| message["refusal"].as_str().map(ToOwned::to_owned))
                 .or_else(|| choice["text"].as_str().map(ToOwned::to_owned))
                 .unwrap_or_default();
-            let thinking = message["reasoning_content"]
-                .as_str()
-                .or_else(|| message["reasoning"].as_str())
-                .filter(|value| !value.trim().is_empty())
-                .map(ToOwned::to_owned);
+            // OpenAI-compatible 网关对推理字段的命名并不完全一致。后续工具轮次
+            // 必须按服务实际返回的字段名回传，不能统一改写为 reasoning_content。
+            let reasoning = ["reasoning_content", "reasoning_text", "reasoning"]
+                .into_iter()
+                .find_map(|field| {
+                    message[field]
+                        .as_str()
+                        .filter(|value| !value.trim().is_empty())
+                        .map(|value| (field, value.to_string()))
+                });
+            let thinking = reasoning.as_ref().map(|(_, value)| value.clone());
             let raw_tool_calls = &message["tool_calls"];
             let tool_calls = parse_openai_tool_calls(raw_tool_calls);
             if let Some(items) = raw_tool_calls.as_array()
@@ -137,13 +143,13 @@ impl ProviderAdapter for OpenAiChatCompletionsAdapter {
 
             return Ok(AdaptedResponse {
                 content,
-                provider_context: thinking
+                provider_context: reasoning
                     .as_ref()
-                    .map(|reasoning_content| {
+                    .map(|(field, value)| {
                         vec![crate::types::ModelProviderContext {
                             provider: "openai_chat".to_string(),
-                            kind: "reasoning_content".to_string(),
-                            data: json!({"reasoning_content": reasoning_content}),
+                            kind: "reasoning".to_string(),
+                            data: json!({*field: value}),
                         }]
                     })
                     .unwrap_or_default(),
@@ -394,7 +400,7 @@ mod tests {
                                 {"type": "text", "text": "处理"},
                                 {"type": "text", "text": "完成"}
                             ],
-                            "reasoning": "已检查工具结果"
+                            "reasoning_text": "已检查工具结果"
                         }
                     }]
                 })
@@ -406,7 +412,7 @@ mod tests {
         assert_eq!(adapted.thinking.as_deref(), Some("已检查工具结果"));
         assert_eq!(adapted.provider_context.len(), 1);
         assert_eq!(
-            adapted.provider_context[0].data["reasoning_content"],
+            adapted.provider_context[0].data["reasoning_text"],
             "已检查工具结果"
         );
         assert_eq!(adapted.stop_reason, "stop");

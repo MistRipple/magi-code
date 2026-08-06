@@ -221,7 +221,7 @@
   "input.modeSwitching": "模式切换中…",
   "input.currentAskMode": "当前: Ask 模式",
   "input.currentAutoMode": "当前: Auto 模式",
-  "input.send": "发送 (Enter 发送，Option/Alt+Enter 换行)",
+  "input.send": "发送 (Enter 发送，Shift+Enter 或 Option/Alt+Enter 换行)",
   "input.sending": "正在发送...",
   "input.stop": "停止",
   "input.stopTaskTitle": "停止当前任务，保留进度",

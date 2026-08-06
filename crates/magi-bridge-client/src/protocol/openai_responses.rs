@@ -17,6 +17,8 @@ use crate::types::ModelProviderContext;
 /// 并把 reasoning/function_call 等 output items 还原为运行时统一结构。
 pub struct OpenAiResponsesAdapter;
 
+const RESPONSE_OUTPUT_ITEM_CONTEXT_KIND: &str = "response_output_item";
+
 impl ProviderAdapter for OpenAiResponsesAdapter {
     fn family(&self) -> ProviderFamily {
         ProviderFamily::OpenAiResponses
@@ -107,22 +109,48 @@ fn append_response_input_items(input: &mut Vec<Value>, message: &LlmMessage) -> 
             }
         }
         LlmMessageContent::Blocks(blocks) => {
+            // Responses 的 reasoning 模型要求后续请求按原顺序回放上轮 output item。
+            // 不能只还原语义化的 ToolUse：部分兼容服务会校验 reasoning、函数调用
+            // 及其 provider id 是否仍属于同一条推理链。
+            let has_raw_response_message = blocks.iter().any(|block| {
+                response_output_item_from_context_block(block)
+                    .is_some_and(|item| item["type"].as_str() == Some("message"))
+            });
+            let raw_function_call_ids = blocks
+                .iter()
+                .filter_map(response_output_item_from_context_block)
+                .filter(|item| item["type"].as_str() == Some("function_call"))
+                .filter_map(|item| {
+                    item["call_id"]
+                        .as_str()
+                        .or_else(|| item["id"].as_str())
+                        .map(str::to_string)
+                })
+                .collect::<std::collections::HashSet<_>>();
             let mut message_parts = Vec::new();
             for block in blocks {
                 match block {
                     LlmContentBlock::Text { text } => {
-                        if !text.is_empty() && text != PROMPT_CACHE_BOUNDARY {
+                        if !has_raw_response_message
+                            && !text.is_empty()
+                            && text != PROMPT_CACHE_BOUNDARY
+                        {
                             message_parts.push(response_text_part(&message.role, text));
                         }
                     }
                     LlmContentBlock::Image { source } => {
-                        message_parts.push(response_image_part(source));
+                        if !has_raw_response_message {
+                            message_parts.push(response_image_part(source));
+                        }
                     }
                     LlmContentBlock::ToolUse {
                         id,
                         name,
                         input: args,
                     } => {
+                        if raw_function_call_ids.contains(id) {
+                            continue;
+                        }
                         flush_response_message(input, &message.role, &mut message_parts);
                         input.push(json!({
                             "type": "function_call",
@@ -146,9 +174,7 @@ fn append_response_input_items(input: &mut Vec<Value>, message: &LlmMessage) -> 
                         ));
                     }
                     LlmContentBlock::ProviderContext { context }
-                        if context.provider == "openai_responses"
-                            && context.kind == "reasoning"
-                            && context.data["type"].as_str() == Some("reasoning") =>
+                        if replayable_response_output_item(context).is_some() =>
                     {
                         flush_response_message(input, &message.role, &mut message_parts);
                         input.push(context.data.clone());
@@ -160,6 +186,37 @@ fn append_response_input_items(input: &mut Vec<Value>, message: &LlmMessage) -> 
         }
     }
     Ok(())
+}
+
+fn response_output_item_from_context_block(block: &LlmContentBlock) -> Option<&Value> {
+    let LlmContentBlock::ProviderContext { context } = block else {
+        return None;
+    };
+    replayable_response_output_item(context)
+}
+
+fn replayable_response_output_item(context: &ModelProviderContext) -> Option<&Value> {
+    if context.provider != "openai_responses" {
+        return None;
+    }
+    let item_type = context.data["type"].as_str()?;
+    let is_current_raw_item = context.kind == RESPONSE_OUTPUT_ITEM_CONTEXT_KIND;
+    let is_legacy_reasoning_item = context.kind == "reasoning" && item_type == "reasoning";
+    (is_current_raw_item || is_legacy_reasoning_item)
+        .then_some(&context.data)
+        .filter(|_| matches!(item_type, "message" | "reasoning" | "function_call"))
+}
+
+fn response_output_item_context(item: &Value) -> Option<ModelProviderContext> {
+    matches!(
+        item["type"].as_str(),
+        Some("message" | "reasoning" | "function_call")
+    )
+    .then(|| ModelProviderContext {
+        provider: "openai_responses".to_string(),
+        kind: RESPONSE_OUTPUT_ITEM_CONTEXT_KIND.to_string(),
+        data: item.clone(),
+    })
 }
 
 fn flush_response_message(input: &mut Vec<Value>, role: &str, parts: &mut Vec<Value>) {
@@ -272,6 +329,9 @@ fn parse_responses_envelope(envelope: &Value) -> Result<AdaptedResponse, String>
     let mut provider_context = Vec::new();
 
     for item in output {
+        if let Some(context) = response_output_item_context(item) {
+            provider_context.push(context);
+        }
         match item["type"].as_str() {
             Some("message") => {
                 if let Some(content) = item["content"].as_array() {
@@ -297,11 +357,6 @@ fn parse_responses_envelope(envelope: &Value) -> Result<AdaptedResponse, String>
                         }
                     }
                 }
-                provider_context.push(ModelProviderContext {
-                    provider: "openai_responses".to_string(),
-                    kind: "reasoning".to_string(),
-                    data: item.clone(),
-                });
             }
             Some("function_call") => {
                 let name = item["name"].as_str().ok_or("function_call missing name")?;
@@ -468,6 +523,89 @@ mod tests {
         assert_eq!(response.provider_context[0].provider, "openai_responses");
         assert_eq!(response.usage.input_tokens, 10);
         assert_eq!(response.usage.cache_read_tokens, Some(3));
+    }
+
+    #[test]
+    fn replays_complete_reasoning_and_function_output_items_before_tool_result() {
+        let reasoning_item = json!({
+            "type": "reasoning",
+            "id": "rs_123",
+            "encrypted_content": "encrypted-reasoning-context",
+            "content": [{"type": "reasoning_text", "text": "先检查工作区"}]
+        });
+        let message_item = json!({
+            "type": "message",
+            "id": "msg_123",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "正在读取文件。"}]
+        });
+        let function_call_item = json!({
+            "type": "function_call",
+            "id": "fc_123",
+            "call_id": "call_123",
+            "name": "shell_exec",
+            "arguments": "{\"command\":\"pwd\"}"
+        });
+        let response = OpenAiResponsesAdapter
+            .parse_response(
+                200,
+                &json!({
+                    "status": "completed",
+                    "output": [
+                        message_item,
+                        reasoning_item,
+                        function_call_item
+                    ]
+                })
+                .to_string(),
+            )
+            .expect("response should parse");
+
+        let assistant_blocks = response
+            .provider_context
+            .into_iter()
+            .map(|context| LlmContentBlock::ProviderContext { context })
+            .chain(std::iter::once(LlmContentBlock::Text {
+                text: response.content,
+            }))
+            .chain(std::iter::once(LlmContentBlock::ToolUse {
+                id: "call_123".to_string(),
+                name: "shell_exec".to_string(),
+                input: json!({"command": "pwd"}),
+            }))
+            .collect();
+        let request = OpenAiResponsesAdapter
+            .build_request(
+                &params(vec![
+                    LlmMessage {
+                        role: "assistant".to_string(),
+                        content: LlmMessageContent::Blocks(assistant_blocks),
+                    },
+                    LlmMessage {
+                        role: "user".to_string(),
+                        content: LlmMessageContent::Blocks(vec![LlmContentBlock::ToolResult {
+                            tool_use_id: "call_123".to_string(),
+                            content: "/workspace".to_string(),
+                            is_error: false,
+                            images: Vec::new(),
+                        }]),
+                    },
+                ]),
+                "deepseek-v4-flash-0731",
+            )
+            .expect("request should build");
+
+        let input = request.body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0]["id"], "msg_123");
+        assert_eq!(input[1]["id"], "rs_123");
+        assert_eq!(input[1]["encrypted_content"], "encrypted-reasoning-context");
+        assert_eq!(input[1]["content"][0]["type"], "reasoning_text");
+        assert_eq!(input[2]["id"], "fc_123");
+        assert_eq!(input[2]["call_id"], "call_123");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_123");
     }
 
     #[test]
