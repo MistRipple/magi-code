@@ -521,10 +521,7 @@
     if (!tab || snapshot?.lifecycle !== 'ready' || tab.lifecycle !== 'ready') return;
     if (lastReadyViewportTabId === tab.tabId) return;
     lastReadyViewportTabId = tab.tabId;
-    // 切换到新 tab 时需要强制 claim viewport 控制权，否则如果该 tab 之前被
-    // 另一个 controller 注册过，非 claim 的 sync 请求会被服务端拒绝，导致
-    // viewport 永远停留在旧值（如 1280x800），浏览器自适应布局无法生效。
-    scheduleCurrentPanelViewport(true, true);
+    scheduleCurrentPanelViewport();
   });
 
   $effect(() => {
@@ -816,18 +813,12 @@
     if (!frame || !viewportSize.width || !viewportSize.height) {
       return 'width: 0; height: 0;';
     }
-    // 两种模式都按 Chromium CSS viewport 的宽高比来计算 frame 的 CSS 尺寸，
-    // 而不是用 screencast 报告的设备像素比例。这样 canvas 位图虽然在设备
-    // 像素层面与 CSS viewport 比例不一致，但 CSS 显示尺寸始终匹配 viewport，
-    // 网页的响应式布局（@media / viewport meta）自然生效。
-    const tab = activeTab;
-    const vpW = tab?.viewport.width ?? frame.width;
-    const vpH = tab?.viewport.height ?? frame.height;
     const scale = Math.min(
-      viewportSize.width / vpW,
-      viewportSize.height / vpH,
+      1,
+      viewportSize.width / frame.width,
+      viewportSize.height / frame.height,
     );
-    return `width: ${Math.max(1, Math.floor(vpW * scale))}px; height: ${Math.max(1, Math.floor(vpH * scale))}px;`;
+    return `width: ${Math.max(1, Math.floor(frame.width * scale))}px; height: ${Math.max(1, Math.floor(frame.height * scale))}px;`;
   }
 
   async function focusAnnotationInput(): Promise<void> {
