@@ -292,7 +292,10 @@
   }
 
   function viewportControllerActive(): boolean {
-    return document.visibilityState === 'visible' && document.hasFocus();
+    // 右侧区域仅挂载当前打开的面板；hasFocus() 在面板首次挂载、
+    // 从后台恢复或嵌入容器交接焦点时可能为 false，会阻止首次布局同步，
+    // 导致浏览器保留初始 1280x800 视口。只需检查页面可见即可。
+    return document.visibilityState === 'visible';
   }
 
   function scheduleCurrentPanelViewport(force = false, claim = false): void {
@@ -806,16 +809,15 @@
   }
 
   function displayedFrameStyle(): string {
-    const frame = renderedFrameMetadata;
-    if (!frame || !viewportSize.width || !viewportSize.height) {
+    if (!renderedFrameMetadata || !viewportSize.width || !viewportSize.height) {
       return 'width: 0; height: 0;';
     }
-    const scale = Math.min(
-      1,
-      viewportSize.width / frame.width,
-      viewportSize.height / frame.height,
-    );
-    return `width: ${Math.max(1, Math.floor(frame.width * scale))}px; height: ${Math.max(1, Math.floor(frame.height * scale))}px;`;
+    // frame CSS 尺寸只跟随 ResizeObserver 的容器尺寸，不与 snapshot viewport 耦合。
+    // Chromium viewport 通过 sync 机制独立跟随容器，Host screencast 帧的设备像素
+    // 比例与 CSS viewport 比例可能不同，但 canvas width:100%/height:100% 会自动
+    // 拉伸填满 frame。标注坐标用 framePoint() 基于 getBoundingClientRect 归一化，
+    // 不受 CSS 拉伸影响。这样消除了 snapshot 轮询回退导致的 frame 比例闪烁。
+    return `width: ${viewportSize.width}px; height: ${viewportSize.height}px;`;
   }
 
   async function focusAnnotationInput(): Promise<void> {
@@ -1360,7 +1362,7 @@
   .browser-toolbar { display: flex; align-items: center; min-height: 34px; gap: 3px; padding: 4px 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
   .icon-button { width: 27px; height: 27px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; flex-shrink: 0; }
   .icon-button:hover:not(:disabled) { background: var(--surface-2); color: var(--foreground); }
-  .icon-button.active { color: var(--accent); background: var(--surface-2); }
+  .icon-button.active { color: var(--primary); background: var(--surface-2); }
   .icon-button:disabled { opacity: .45; cursor: default; }
   .flip { transform: scaleX(-1); }
   .address-form { display: flex; flex: 1; min-width: 80px; }
@@ -1383,13 +1385,13 @@
   .viewport-menu > button { box-sizing: border-box; display: flex; align-items: center; justify-content: space-between; width: 100%; min-height: 30px; padding: 0 8px; border: 0; border-radius: 4px; background: transparent; color: var(--foreground); font: inherit; font-size: var(--text-xs); cursor: pointer; }
   .viewport-menu > button:hover,
   .viewport-menu > button.selected { background: var(--surface-hover); }
-  .viewport-menu > button.selected { color: var(--accent); }
+  .viewport-menu > button.selected { color: var(--primary); }
   .viewport-size { color: var(--foreground-muted); font-variant-numeric: tabular-nums; }
   .viewport-menu-divider { height: 1px; margin: 4px 3px; background: var(--border); }
   .viewport-device-modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px; padding: 3px; }
   .viewport-device-modes button { min-width: 0; height: 28px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground-muted); font: inherit; font-size: var(--text-xs); cursor: pointer; }
   .viewport-device-modes button:hover { background: var(--surface-hover); color: var(--foreground); }
-  .viewport-device-modes button.selected { border-color: var(--accent); background: var(--surface-hover); color: var(--accent); }
+  .viewport-device-modes button.selected { border-color: var(--primary); background: var(--surface-hover); color: var(--primary); }
   .viewport-custom { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 5px; align-items: end; padding: 3px; }
   .viewport-custom label { display: grid; gap: 3px; min-width: 0; color: var(--foreground-muted); font-size: 10px; }
   .viewport-custom input { box-sizing: border-box; width: 100%; height: 27px; min-width: 0; padding: 0 5px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); }
@@ -1414,10 +1416,10 @@
   .annotation-editor { position: absolute; z-index: 8; top: 12px; right: 12px; box-sizing: border-box; width: min(300px, calc(100% - 24px)); padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--background); box-shadow: 0 10px 30px rgb(0 0 0 / 28%); }
   .annotation-editor-title { margin-bottom: 7px; color: var(--foreground); font-size: var(--text-sm); font-weight: 600; }
   .annotation-editor textarea { box-sizing: border-box; display: block; width: 100%; min-height: 70px; resize: vertical; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); padding: 7px 8px; font: inherit; font-size: var(--text-sm); line-height: 1.45; }
-  .annotation-editor textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  .annotation-editor textarea:focus { outline: 1px solid var(--primary); border-color: var(--primary); }
   .annotation-editor-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px; }
   .annotation-editor-actions button { min-height: 27px; padding: 0 10px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); cursor: pointer; }
-  .annotation-editor-actions button.primary { border-color: var(--accent); background: var(--accent); color: var(--accent-foreground, white); }
+  .annotation-editor-actions button.primary { border-color: var(--primary); background: var(--primary); color: var(--primary-foreground); }
   .annotation-editor-actions button:disabled { opacity: .5; cursor: default; }
   .annotation-preview { position: absolute; z-index: 30; inset: 38px 8px 8px; display: flex; flex-direction: column; min-width: 0; min-height: 0; border: 1px solid var(--border); border-radius: 6px; background: var(--background); box-shadow: var(--shadow-lg); }
   .annotation-preview-header { display: flex; align-items: center; gap: 7px; min-height: 34px; padding: 3px 4px 3px 8px; border-bottom: 1px solid var(--border); }

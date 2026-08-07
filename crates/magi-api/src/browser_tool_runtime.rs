@@ -1315,10 +1315,13 @@ fn snapshot_target(
 fn optional_snapshot_target(
     arguments: &Map<String, Value>,
 ) -> Result<Option<BrowserSnapshotTarget>, BrowserToolError> {
-    if arguments.get("element_ref").is_none() {
-        return Ok(None);
+    match optional_string(arguments, "element_ref").as_deref() {
+        // browser_snapshot 返回的合成根节点 element_ref="root" 不对应可定位
+        // DOM 元素。截图时将其视为整页作用域（None），避免 Host 报
+        // "snapshot element ref does not exist: root"。
+        None | Some("root") => Ok(None),
+        Some(_) => snapshot_target(arguments).map(Some),
     }
-    snapshot_target(arguments).map(Some)
 }
 
 fn succeeded_result(
