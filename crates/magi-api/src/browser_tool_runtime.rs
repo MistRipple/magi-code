@@ -1315,12 +1315,10 @@ fn snapshot_target(
 fn optional_snapshot_target(
     arguments: &Map<String, Value>,
 ) -> Result<Option<BrowserSnapshotTarget>, BrowserToolError> {
-    match optional_string(arguments, "element_ref").as_deref() {
-        // `root` 是 browser_snapshot 人工构造的文档根节点，并不对应可定位的 DOM
-        // 元素。截图把它解释为整页作用域，避免模型按快照根节点截图时触发无效引用。
-        None | Some("root") => Ok(None),
-        Some(_) => snapshot_target(arguments).map(Some),
+    if arguments.get("element_ref").is_none() {
+        return Ok(None);
     }
+    snapshot_target(arguments).map(Some)
 }
 
 fn succeeded_result(
@@ -1369,11 +1367,8 @@ mod tests {
     use magi_core::{BrowserProfileId, SessionId, UtcMillis, WorkspaceId};
     use magi_event_bus::InMemoryEventBus;
     use magi_session_store::SessionStore;
-    use serde_json::json;
 
-    use super::{
-        BrowserToolRuntimeDependencies, DEFAULT_BROWSER_PROFILE_ID, optional_snapshot_target,
-    };
+    use super::{BrowserToolRuntimeDependencies, DEFAULT_BROWSER_PROFILE_ID};
     use crate::state::BrowserRuntimeStatusSnapshot;
 
     #[test]
@@ -1424,31 +1419,5 @@ mod tests {
                 .count(),
             1
         );
-    }
-
-    #[test]
-    fn screenshot_root_reference_uses_page_scope() {
-        let arguments = json!({
-            "snapshot_revision": 7,
-            "element_ref": "root",
-        });
-        let target =
-            optional_snapshot_target(arguments.as_object().expect("fixture should be an object"))
-                .expect("root screenshot target should be accepted");
-        assert!(target.is_none());
-    }
-
-    #[test]
-    fn screenshot_element_reference_remains_targeted() {
-        let arguments = json!({
-            "snapshot_revision": 7,
-            "element_ref": "e-7-12",
-        });
-        let target =
-            optional_snapshot_target(arguments.as_object().expect("fixture should be an object"))
-                .expect("element screenshot target should be accepted")
-                .expect("element ref should remain targeted");
-        assert_eq!(target.snapshot_revision, 7);
-        assert_eq!(target.element_ref, "e-7-12");
     }
 }
