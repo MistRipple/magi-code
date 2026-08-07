@@ -93,11 +93,17 @@ jobs:
         run: npm --prefix browser-host run build
 
       - name: 真实 Chromium 回归
+        if: matrix.runtime_os == 'macos'
         shell: bash
         run: |
           set -euo pipefail
           chromium="$(node -p "require('./browser-host/node_modules/playwright-core').chromium.executablePath()")"
           MAGI_BROWSER_TEST_CHROMIUM="$chromium" npm --prefix browser-host test
+
+      - name: Browser Host 协议回归
+        if: matrix.runtime_os != 'macos'
+        shell: bash
+        run: npm --prefix browser-host test
 
       - name: 准备独立运行组件
         shell: bash
