@@ -143,6 +143,9 @@ export class BrowserHost {
           "--disable-sync",
           "--no-first-run",
           "--no-default-browser-check",
+          // 给 headless Chromium 一个不受 runner 物理屏幕限制的虚拟工作区。
+          // 实际页面尺寸仍由 Emulation.setDeviceMetricsOverride 控制。
+          "--window-size=3840,2160",
           `--force-device-scale-factor=${this.#config.deviceScaleFactor}`,
         ],
       },
