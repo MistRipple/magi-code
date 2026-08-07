@@ -96,7 +96,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          chromium="$(node -p "require('playwright-core').chromium.executablePath()")"
+          chromium="$(node -p "require('./browser-host/node_modules/playwright-core').chromium.executablePath()")"
           MAGI_BROWSER_TEST_CHROMIUM="$chromium" npm --prefix browser-host test
 
       - name: 准备独立运行组件
