@@ -31,10 +31,12 @@ const OPENAI_MODEL_ENV: &str = "MAGI_OPENAI_COMPAT_MODEL";
 const MODEL_PROVIDER_MAX_IN_FLIGHT: usize = 16;
 const MODEL_PROVIDER_MAX_RETRIES: usize = 5;
 const MODEL_PROVIDER_EMPTY_STREAM_RETRIES: usize = 2;
-const MODEL_PROVIDER_RETRY_DELAYS_SECONDS: [u64; MODEL_PROVIDER_MAX_RETRIES] = [10, 15, 30, 45, 60];
+const MODEL_PROVIDER_RETRY_DELAYS_MILLIS: [u64; MODEL_PROVIDER_MAX_RETRIES] =
+    [200, 400, 800, 1_600, 3_200];
 const MODEL_PROVIDER_EMPTY_STREAM_RETRY_DELAYS_MILLIS: [u64; MODEL_PROVIDER_EMPTY_STREAM_RETRIES] =
     [1_000, 3_000];
-const MODEL_PROVIDER_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+const MODEL_PROVIDER_MAX_RETRY_AFTER_DELAY: Duration = Duration::from_secs(60);
+const MODEL_PROVIDER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MODEL_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MODEL_PROVIDER_TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -493,8 +495,8 @@ fn record_forced_tool_choice_capability(
 fn retry_delay(attempt: usize, _provider_key: &str) -> Duration {
     let index = attempt
         .saturating_sub(1)
-        .min(MODEL_PROVIDER_RETRY_DELAYS_SECONDS.len().saturating_sub(1));
-    Duration::from_secs(MODEL_PROVIDER_RETRY_DELAYS_SECONDS[index])
+        .min(MODEL_PROVIDER_RETRY_DELAYS_MILLIS.len().saturating_sub(1));
+    Duration::from_millis(MODEL_PROVIDER_RETRY_DELAYS_MILLIS[index])
 }
 
 fn empty_stream_retry_delay(attempt: usize) -> Duration {
@@ -521,7 +523,7 @@ fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
                 .duration_since(now)
                 .ok()
         })?;
-    Some(delay.min(MODEL_PROVIDER_MAX_RETRY_DELAY))
+    Some(delay.min(MODEL_PROVIDER_MAX_RETRY_AFTER_DELAY))
 }
 
 fn retryable_http_status(status: u16) -> bool {
@@ -984,6 +986,17 @@ fn apply_provider_stream_event(
     Ok(false)
 }
 
+fn provider_stream_idle_timeout_error(stage: &str) -> BridgeClientError {
+    BridgeClientError::CallFailed {
+        layer: BridgeErrorLayer::Transport,
+        code: Some(-32005),
+        message: format!(
+            "provider stream idle timeout after {} seconds while waiting for {stage}",
+            MODEL_PROVIDER_STREAM_IDLE_TIMEOUT.as_secs()
+        ),
+    }
+}
+
 /// 执行流式 HTTP POST，通过 SSE 逐块读取 LLM 响应。
 ///
 /// HTTP I/O 在独立线程内运行异步 reqwest，请求发送、响应体读取和 provider
@@ -1188,9 +1201,8 @@ async fn streaming_http_io(
 ) -> StreamingHttpResult {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        // 流式场景下 timeout 用于检测 LLM 长时间无输出（卡死），
-        // 设 5 分钟：正常思考时间足够，真正无响应时能及时报错。
-        .timeout(Duration::from_secs(300))
+        // reqwest 默认不设置总请求 timeout，流式读取在 response.chunk()
+        // 上单独执行 idle timeout，避免把正常的长响应误判为超时。
         .build()
         .map_err(|error| BridgeClientError::CallFailed {
             layer: BridgeErrorLayer::Transport,
@@ -1210,13 +1222,20 @@ async fn streaming_http_io(
 
     let mut response = tokio::select! {
         _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
-        result = req_builder.send() => result,
-    }
-    .map_err(|error| BridgeClientError::CallFailed {
-        layer: BridgeErrorLayer::Transport,
-        code: Some(-32005),
-        message: format!("provider transport failed: {error}"),
-    })?;
+        result = tokio::time::timeout(MODEL_PROVIDER_STREAM_IDLE_TIMEOUT, req_builder.send()) => {
+            match result {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    return Err(BridgeClientError::CallFailed {
+                        layer: BridgeErrorLayer::Transport,
+                        code: Some(-32005),
+                        message: format!("provider transport failed: {error}"),
+                    });
+                }
+                Err(_) => return Err(provider_stream_idle_timeout_error("response headers")),
+            }
+        },
+    };
 
     let status = response.status().as_u16();
     let retry_after = response
@@ -1229,7 +1248,12 @@ async fn streaming_http_io(
     if !(200..300).contains(&status) {
         let response_body = tokio::select! {
             _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
-            result = response.text() => result,
+            result = tokio::time::timeout(MODEL_PROVIDER_STREAM_IDLE_TIMEOUT, response.text()) => {
+                match result {
+                    Ok(result) => result,
+                    Err(_) => return Err(provider_stream_idle_timeout_error("error response body")),
+                }
+            },
         }
         .map_err(|error| BridgeClientError::CallFailed {
             layer: BridgeErrorLayer::Transport,
@@ -1262,7 +1286,13 @@ async fn streaming_http_io(
         } else {
             tokio::select! {
                 _ = &mut cancellation_rx => return Err(model_invocation_cancelled_error()),
-                result = response.chunk() => result,
+                result = tokio::time::timeout(
+                    MODEL_PROVIDER_STREAM_IDLE_TIMEOUT,
+                    response.chunk(),
+                ) => match result {
+                    Ok(result) => result,
+                    Err(_) => return Err(provider_stream_idle_timeout_error("SSE event")),
+                },
             }
         };
         let chunk = match chunk_result {
@@ -4794,13 +4824,13 @@ mod tests {
     }
 
     #[test]
-    fn model_retry_policy_uses_fixed_five_step_backoff() {
+    fn model_retry_policy_uses_short_exponential_backoff() {
         assert_eq!(MODEL_PROVIDER_MAX_RETRIES, 5);
-        assert_eq!(retry_delay(1, "provider"), Duration::from_secs(10));
-        assert_eq!(retry_delay(2, "provider"), Duration::from_secs(15));
-        assert_eq!(retry_delay(3, "provider"), Duration::from_secs(30));
-        assert_eq!(retry_delay(4, "provider"), Duration::from_secs(45));
-        assert_eq!(retry_delay(5, "provider"), Duration::from_secs(60));
+        assert_eq!(retry_delay(1, "provider"), Duration::from_millis(200));
+        assert_eq!(retry_delay(2, "provider"), Duration::from_millis(400));
+        assert_eq!(retry_delay(3, "provider"), Duration::from_millis(800));
+        assert_eq!(retry_delay(4, "provider"), Duration::from_millis(1_600));
+        assert_eq!(retry_delay(5, "provider"), Duration::from_millis(3_200));
     }
 
     #[test]
@@ -4855,7 +4885,7 @@ mod tests {
                     phase: ModelRetryRuntimePhase::Scheduled,
                     attempt: 1,
                     max_attempts: 5,
-                    delay_ms: Some(10_000),
+                    delay_ms: Some(200),
                 },
                 ModelRetryRuntimeEvent {
                     phase: ModelRetryRuntimePhase::AttemptStarted,

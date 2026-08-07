@@ -3,11 +3,22 @@
 //! runtime 内部的 writeback / round 实现直接访问这些纯函数。
 
 use magi_core::ExecutionResultStatus;
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 pub const TOOL_EXECUTION_FAILED_PUBLIC_ERROR: &str = "工具执行失败，请稍后重试";
 pub const TOOL_SAFETY_NEEDS_APPROVAL_PUBLIC_ERROR: &str =
     "安全防护已在受限访问下拦截该操作，请切换为完全访问权限后重试";
+/// 模型可见的单个工具结果上限。完整结果仍由审计、UI 和恢复状态保存。
+pub const MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES: usize = 12 * 1024;
+/// 单轮模型上下文中所有历史工具结果的总预算。
+///
+/// 单条结果上限只能阻止一个大文件拖垮请求；长时间的只读探索会累积很多
+/// 小结果，仍然把每一轮请求推向上下文上限。这里把模型视图中的工具结果
+/// 做一次确定性总量收敛，完整结果继续保留在 thread/audit/UI 中。
+pub const MODEL_VISIBLE_TOOL_HISTORY_MAX_BYTES: usize = 48 * 1024;
+const MODEL_VISIBLE_TOOL_RESULT_FIELD_MAX_BYTES: usize = 2 * 1024;
+const MODEL_VISIBLE_TOOL_RESULT_MARKER: &str = "...[model output truncated]...";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PublicToolError {
@@ -87,6 +98,23 @@ pub fn tool_execution_status_label(status: ExecutionResultStatus) -> &'static st
         ExecutionResultStatus::Rejected => "rejected",
         ExecutionResultStatus::NeedsApproval => "needs_approval",
         ExecutionResultStatus::Cancelled => "cancelled",
+    }
+}
+
+pub fn tool_result_execution_status(result: &str) -> ExecutionResultStatus {
+    let explicit = serde_json::from_str::<Value>(result)
+        .ok()
+        .and_then(|payload| payload.get("status")?.as_str().map(str::to_ascii_lowercase));
+    match explicit.as_deref() {
+        Some("succeeded" | "success" | "ok" | "completed" | "degraded") => {
+            ExecutionResultStatus::Succeeded
+        }
+        Some("rejected" | "blocked" | "denied" | "forbidden") => ExecutionResultStatus::Rejected,
+        Some("needs_approval" | "needsapproval") => ExecutionResultStatus::NeedsApproval,
+        Some("cancelled" | "canceled" | "aborted" | "killed") => ExecutionResultStatus::Cancelled,
+        Some("failed" | "error" | "timeout" | "timed_out") => ExecutionResultStatus::Failed,
+        _ if infer_tool_call_status(result) == "success" => ExecutionResultStatus::Succeeded,
+        _ => ExecutionResultStatus::Failed,
     }
 }
 
@@ -212,8 +240,240 @@ pub fn summarize_tool_result(result: &str) -> String {
     format!("{}…", &result[..end])
 }
 
-pub fn model_visible_tool_result(result: &str, _status: ExecutionResultStatus) -> String {
-    result.to_string()
+pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) -> String {
+    if result.len() <= MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES {
+        return result.to_string();
+    }
+
+    let original_bytes = result.len();
+    let mut envelope = Map::new();
+    envelope.insert(
+        "execution_status".to_string(),
+        Value::String(tool_execution_status_label(status).to_string()),
+    );
+    envelope.insert("model_truncated".to_string(), Value::Bool(true));
+    envelope.insert(
+        "original_bytes".to_string(),
+        Value::from(original_bytes as u64),
+    );
+
+    if let Ok(parsed) = serde_json::from_str::<Value>(result) {
+        if let Some(object) = parsed.as_object() {
+            for key in [
+                "tool",
+                "status",
+                "error_code",
+                "summary",
+                "message",
+                "path",
+                "content_hash",
+                "exit_code",
+                "file_size_bytes",
+                "bytes_read",
+                "truncated",
+                "original_token_count",
+                "omitted_bytes",
+            ] {
+                if let Some(value) = object.get(key) {
+                    let bounded = value
+                        .as_str()
+                        .map(|text| {
+                            Value::String(truncate_utf8_middle(
+                                text,
+                                MODEL_VISIBLE_TOOL_RESULT_FIELD_MAX_BYTES,
+                            ))
+                        })
+                        .unwrap_or_else(|| value.clone());
+                    envelope.insert(key.to_string(), bounded);
+                }
+            }
+            if let Some(error) = object.get("error").and_then(Value::as_str) {
+                envelope.insert(
+                    "error".to_string(),
+                    Value::String(truncate_utf8_middle(
+                        error,
+                        MODEL_VISIBLE_TOOL_RESULT_FIELD_MAX_BYTES,
+                    )),
+                );
+            }
+            let preview = ["content", "stdout", "stderr", "output"]
+                .into_iter()
+                .find_map(|key| object.get(key).and_then(Value::as_str))
+                .unwrap_or(result);
+            envelope.insert(
+                "preview".to_string(),
+                Value::String(truncate_utf8_middle(
+                    preview,
+                    MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES / 2,
+                )),
+            );
+        }
+    }
+
+    if !envelope.contains_key("preview") {
+        envelope.insert(
+            "preview".to_string(),
+            Value::String(truncate_utf8_middle(
+                result,
+                MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES / 2,
+            )),
+        );
+    }
+
+    let encoded = serde_json::to_string(&envelope).unwrap_or_else(|_| {
+        format!(
+            "{{\"execution_status\":\"{}\",\"model_truncated\":true,\"original_bytes\":{},\"preview\":{}}}",
+            tool_execution_status_label(status),
+            original_bytes,
+            serde_json::to_string(&truncate_utf8_middle(
+                result,
+                MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES / 2,
+            ))
+            .unwrap_or_else(|_| "\"[unavailable]\"".to_string())
+        )
+    });
+    if encoded.len() <= MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES {
+        encoded
+    } else {
+        serde_json::json!({
+            "execution_status": tool_execution_status_label(status),
+            "model_truncated": true,
+            "original_bytes": original_bytes,
+            "preview": truncate_utf8_middle(result, MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES / 3),
+        })
+        .to_string()
+    }
+}
+
+/// 对一组已经按单条上限裁剪过的工具结果继续施加总预算。
+///
+/// 最近结果优先保留完整内容；较早结果降为结构化事实摘要。该函数不调用
+/// 模型、不修改持久化结果，调用方只应把返回值用于下一次模型请求的上下文视图。
+pub fn bound_model_visible_tool_history(results: &[String]) -> Vec<String> {
+    if results.is_empty() {
+        return Vec::new();
+    }
+    let visible = results
+        .iter()
+        .map(|result| model_visible_tool_result(result, tool_result_execution_status(result)))
+        .collect::<Vec<_>>();
+    let total = visible.iter().map(String::len).sum::<usize>();
+    if total <= MODEL_VISIBLE_TOOL_HISTORY_MAX_BYTES {
+        return visible;
+    }
+
+    // 至少给最近一批结果留出一半预算；它们最可能直接决定下一步动作。
+    let recent_budget = MODEL_VISIBLE_TOOL_HISTORY_MAX_BYTES / 2;
+    let mut recent_start = visible.len();
+    let mut recent_bytes = 0usize;
+    for (index, result) in visible.iter().enumerate().rev() {
+        if recent_start < visible.len() && recent_bytes.saturating_add(result.len()) > recent_budget
+        {
+            break;
+        }
+        recent_start = index;
+        recent_bytes = recent_bytes.saturating_add(result.len());
+    }
+    let old_count = recent_start;
+    if old_count == 0 {
+        return vec![truncate_history_result(
+            &visible[0],
+            MODEL_VISIBLE_TOOL_HISTORY_MAX_BYTES,
+        )];
+    }
+    let old_budget = MODEL_VISIBLE_TOOL_HISTORY_MAX_BYTES.saturating_sub(recent_bytes);
+    let per_old_budget = old_budget / old_count;
+    let mut bounded = Vec::with_capacity(visible.len());
+    for (index, result) in visible.into_iter().enumerate() {
+        if index < recent_start {
+            bounded.push(compact_historical_tool_result(&result, per_old_budget));
+        } else {
+            bounded.push(result);
+        }
+    }
+    bounded
+}
+
+fn compact_historical_tool_result(result: &str, max_bytes: usize) -> String {
+    if max_bytes == 0 {
+        return String::new();
+    }
+    let parsed = serde_json::from_str::<Value>(result).ok();
+    let mut envelope = Map::new();
+    envelope.insert("history_compacted".to_string(), Value::Bool(true));
+    if let Some(object) = parsed.as_ref().and_then(Value::as_object) {
+        for key in [
+            "tool",
+            "status",
+            "error_code",
+            "path",
+            "content_hash",
+            "file_size_bytes",
+            "exit_code",
+            "summary",
+            "message",
+            "error",
+        ] {
+            if let Some(value) = object.get(key) {
+                let bounded = value
+                    .as_str()
+                    .map(|text| {
+                        Value::String(truncate_utf8_middle(
+                            text,
+                            MODEL_VISIBLE_TOOL_RESULT_FIELD_MAX_BYTES,
+                        ))
+                    })
+                    .unwrap_or_else(|| value.clone());
+                envelope.insert(key.to_string(), bounded);
+            }
+        }
+    }
+    let encoded = serde_json::to_string(&envelope)
+        .unwrap_or_else(|_| "{\"history_compacted\":true}".to_string());
+    truncate_history_result(&encoded, max_bytes)
+}
+
+fn truncate_history_result(result: &str, max_bytes: usize) -> String {
+    if result.len() <= max_bytes {
+        return result.to_string();
+    }
+    // 保持 JSON 可解析，避免 tool_result 配对在 bridge 协议边界失效。
+    let minimal = "{\"history_compacted\":true}";
+    if minimal.len() <= max_bytes {
+        return minimal.to_string();
+    }
+    if max_bytes >= 2 {
+        "{}".to_string()
+    } else {
+        "0".to_string()
+    }
+}
+
+fn truncate_utf8_middle(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    if max_bytes <= MODEL_VISIBLE_TOOL_RESULT_MARKER.len() {
+        return MODEL_VISIBLE_TOOL_RESULT_MARKER
+            .chars()
+            .take(max_bytes)
+            .collect();
+    }
+    let available = max_bytes - MODEL_VISIBLE_TOOL_RESULT_MARKER.len();
+    let mut head_bytes = available / 2;
+    while head_bytes > 0 && !value.is_char_boundary(head_bytes) {
+        head_bytes -= 1;
+    }
+    let mut tail_bytes = available.saturating_sub(head_bytes);
+    while tail_bytes > 0 && !value.is_char_boundary(value.len() - tail_bytes) {
+        tail_bytes -= 1;
+    }
+    format!(
+        "{}{}{}",
+        &value[..head_bytes],
+        MODEL_VISIBLE_TOOL_RESULT_MARKER,
+        &value[value.len().saturating_sub(tail_bytes)..]
+    )
 }
 
 #[cfg(test)]
@@ -233,6 +493,22 @@ mod tests {
         assert_eq!(
             turn_item_status_for_tool_result(ExecutionResultStatus::Cancelled),
             "failed"
+        );
+    }
+
+    #[test]
+    fn tool_result_execution_status_preserves_recovery_semantics() {
+        assert_eq!(
+            tool_result_execution_status(r#"{"status":"needs_approval"}"#),
+            ExecutionResultStatus::NeedsApproval
+        );
+        assert_eq!(
+            tool_result_execution_status(r#"{"status":"rejected"}"#),
+            ExecutionResultStatus::Rejected
+        );
+        assert_eq!(
+            tool_result_execution_status(r#"{"status":"succeeded"}"#),
+            ExecutionResultStatus::Succeeded
         );
     }
 
@@ -293,6 +569,80 @@ mod tests {
         assert_eq!(
             model_visible_tool_result(result, ExecutionResultStatus::NeedsApproval),
             result
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_keeps_file_patch_recovery_details() {
+        let result = r#"{"status":"failed","error_code":"file_patch_no_match","error":"目标内容与当前文件不匹配，请重新读取文件后再修改","errors":["patch[0]: old_string 未在文件中找到"]}"#;
+
+        assert_eq!(
+            model_visible_tool_result(result, ExecutionResultStatus::Failed),
+            result
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_result_bounds_large_structured_payload() {
+        let result = serde_json::json!({
+            "tool": "shell_exec",
+            "status": "succeeded",
+            "stdout": "前缀".to_string() + &"x".repeat(50_000) + "后缀",
+            "content_hash": "sha256:test-content",
+            "exit_code": 0,
+        })
+        .to_string();
+
+        let visible = model_visible_tool_result(&result, ExecutionResultStatus::Succeeded);
+        assert!(visible.len() <= MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES);
+        let parsed: Value = serde_json::from_str(&visible).expect("裁剪结果必须保持 JSON");
+        assert_eq!(parsed["tool"], "shell_exec");
+        assert_eq!(parsed["status"], "succeeded");
+        assert_eq!(parsed["content_hash"], "sha256:test-content");
+        assert_eq!(parsed["model_truncated"], true);
+        assert_eq!(parsed["original_bytes"], result.len());
+        assert!(
+            parsed["preview"]
+                .as_str()
+                .unwrap()
+                .contains("model output truncated")
+        );
+    }
+
+    #[test]
+    fn bound_model_visible_tool_history_applies_a_total_budget_and_keeps_recent_results() {
+        let results = (0..80)
+            .map(|index| {
+                serde_json::json!({
+                    "tool": "file_read",
+                    "status": "succeeded",
+                    "path": format!("src/file-{index}.rs"),
+                    "content_hash": format!("sha256:{index:064}"),
+                    "content": "x".repeat(8_000),
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        let bounded = bound_model_visible_tool_history(&results);
+
+        assert!(
+            bounded.iter().map(String::len).sum::<usize>() <= MODEL_VISIBLE_TOOL_HISTORY_MAX_BYTES
+        );
+        assert!(
+            bounded
+                .last()
+                .is_some_and(|result| result.contains("content"))
+        );
+        assert!(
+            bounded
+                .first()
+                .is_some_and(|result| result.contains("history_compacted"))
+        );
+        assert!(
+            bounded
+                .iter()
+                .all(|result| { serde_json::from_str::<Value>(result).is_ok() })
         );
     }
 

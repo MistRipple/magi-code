@@ -724,6 +724,7 @@ export interface QueuedMessage {
   images?: QueuedMessageImage[];
   contextReferences?: QueuedMessageContextReference[];
   browserAnnotationRefs?: string[];
+  canGuide: boolean;
 }
 
 // 处理中的 Actor

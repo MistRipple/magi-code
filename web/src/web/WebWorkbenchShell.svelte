@@ -21,9 +21,13 @@
   import { desktopContextMenu } from '../lib/desktop-context-menu-contract';
   import {
     addToast,
+    advanceWorkspaceSessionProjectionCursor,
+    canApplyWorkspaceSessionProjectionCursor,
     messagesState,
     replaceWorkspaceSessionProjection,
     setCurrentSessionId,
+    updateWorkspaceSessionProjectionSessions,
+    type WorkspaceSessionProjectionCursor,
   } from '../stores/messages.svelte';
   import {
     directIncidentError,
@@ -136,6 +140,7 @@
   let pendingSessionSwitchTimer: ReturnType<typeof setTimeout> | null = null;
   let workspaceSessionRequestSeq = 0;
   const workspaceSessionRequestSeqByWorkspace = new Map<string, number>();
+  const workspaceSessionCursorByWorkspace = new Map<string, WorkspaceSessionProjectionCursor>();
   const sessionViewedRequests = new Set<string>();
 
   type WorkspaceFileSelection = { pathRef: string; displayPath: string; name: string };
@@ -378,6 +383,14 @@
       return;
     }
     const currentSessions = messagesState.workspaceSessionProjection.sessions;
+    const projectionRuntimeEpoch = messagesState.workspaceSessionProjection.runtimeEpoch?.trim() || '';
+    const projectionNextSequence = messagesState.workspaceSessionProjection.eventStreamNextSequence;
+    if (projectionRuntimeEpoch && projectionNextSequence >= 1) {
+      workspaceSessionCursorByWorkspace.set(sessionsWorkspaceId, {
+        runtimeEpoch: projectionRuntimeEpoch,
+        eventStreamNextSequence: projectionNextSequence,
+      });
+    }
     const existingSessions = sessionsByWorkspace[sessionsWorkspaceId] ?? [];
     const sessionsChanged = existingSessions.length !== currentSessions.length
       || existingSessions.some((session, index) => {
@@ -432,7 +445,13 @@
       workspaceId,
       workspacePath,
       sessionId,
-    }).then(() => {
+    }).then((result) => {
+      const cursor = {
+        runtimeEpoch: result.runtimeEpoch,
+        eventStreamNextSequence: result.eventStreamNextSequence,
+      };
+      advanceWorkspaceSessionProjectionCursor(workspaceId, cursor);
+      workspaceSessionCursorByWorkspace.set(workspaceId, cursor);
       const nextSessions = (sessionsByWorkspace[workspaceId] ?? []).map((candidate) => (
         candidate.id === sessionId
           ? { ...candidate, hasUnreadCompletion: false }
@@ -443,7 +462,7 @@
         [workspaceId]: nextSessions,
       };
       if (currentBootstrapWorkspaceId() === workspaceId) {
-        replaceWorkspaceSessionProjection(workspaceId, nextSessions);
+        updateWorkspaceSessionProjectionSessions(workspaceId, nextSessions);
       }
     }).catch((error) => {
       console.warn('[WebWorkbenchShell] 标记会话已查看失败:', error);
@@ -541,6 +560,10 @@
     const belongsToSelectedWorkspace = (sessionsByWorkspace[selectedWorkspaceId] ?? [])
       .some((session) => session.id === bootstrapSessionId);
     if (!belongsToSelectedWorkspace) {
+      // 新会话首条消息会先建立本地 session 身份，再等待服务端 accepted。
+      // 这时任何更早发出的目录请求都不再具备清理当前指针的因果资格；先使其
+      // 失效，accepted 后再由带事件游标的新快照接管目录。
+      invalidateWorkspaceSessionRequests(authoritativeWorkspaceId);
       return;
     }
     currentSessionId = bootstrapSessionId;
@@ -714,6 +737,40 @@
     loadingWorkspaceIds = nextLoadingWorkspaceIds;
   }
 
+  function workspaceSessionCursor(
+    snapshot: Awaited<ReturnType<typeof getWorkspaceSessions>>,
+  ): WorkspaceSessionProjectionCursor {
+    return {
+      runtimeEpoch: snapshot.runtimeEpoch,
+      eventStreamNextSequence: snapshot.eventStreamNextSequence,
+    };
+  }
+
+  function commitSidebarWorkspaceSessionsSnapshot(
+    workspaceId: string,
+    snapshot: Awaited<ReturnType<typeof getWorkspaceSessions>>,
+  ): boolean {
+    const normalizedWorkspaceId = workspaceId.trim();
+    const incomingCursor = workspaceSessionCursor(snapshot);
+    if (!canApplyWorkspaceSessionProjectionCursor(normalizedWorkspaceId, incomingCursor)) {
+      return false;
+    }
+    const currentCursor = workspaceSessionCursorByWorkspace.get(normalizedWorkspaceId);
+    if (
+      currentCursor
+      && currentCursor.runtimeEpoch === incomingCursor.runtimeEpoch
+      && currentCursor.eventStreamNextSequence > incomingCursor.eventStreamNextSequence
+    ) {
+      return false;
+    }
+    workspaceSessionCursorByWorkspace.set(normalizedWorkspaceId, incomingCursor);
+    sessionsByWorkspace = {
+      ...sessionsByWorkspace,
+      [normalizedWorkspaceId]: snapshot.sessions,
+    };
+    return true;
+  }
+
   function beginWorkspaceSessionRequest(workspaceId: string): number {
     const requestSeq = ++workspaceSessionRequestSeq;
     workspaceSessionRequestSeqByWorkspace.set(workspaceId, requestSeq);
@@ -749,10 +806,9 @@
     if (!authoritativeWorkspaceId) {
       return '';
     }
-    sessionsByWorkspace = {
-      ...sessionsByWorkspace,
-      [authoritativeWorkspaceId]: snapshot.sessions,
-    };
+    if (!commitSidebarWorkspaceSessionsSnapshot(authoritativeWorkspaceId, snapshot)) {
+      return '';
+    }
 
     const requestStillTargetsSelection = selectedWorkspaceId === requestedWorkspaceId
       || selectedWorkspaceId === authoritativeWorkspaceId;
@@ -782,7 +838,11 @@
       const bootstrapSessionId = currentBootstrapSessionIdForWorkspace(authoritativeWorkspaceId);
       if (bootstrapSessionId === resolvedSessionId) {
         currentSessionId = resolvedSessionId;
-        replaceWorkspaceSessionProjection(authoritativeWorkspaceId, snapshot.sessions);
+        replaceWorkspaceSessionProjection(
+          authoritativeWorkspaceId,
+          snapshot.sessions,
+          workspaceSessionCursor(snapshot),
+        );
         syncBrowserSessionBinding(authoritativeWorkspaceId, workspaceBindingPath(snapshot.workspace), resolvedSessionId);
         return resolvedSessionId;
       }
@@ -798,7 +858,11 @@
       clearCurrentSessionBeforeWorkspaceChange(authoritativeWorkspaceId);
       messagesState.currentWorkspaceId = authoritativeWorkspaceId;
       messagesState.currentWorkspacePath = workspaceBindingPath(snapshot.workspace);
-      replaceWorkspaceSessionProjection(authoritativeWorkspaceId, snapshot.sessions);
+      replaceWorkspaceSessionProjection(
+        authoritativeWorkspaceId,
+        snapshot.sessions,
+        workspaceSessionCursor(snapshot),
+      );
       setCurrentSessionId(null);
     }
     return resolvedSessionId;
@@ -1109,10 +1173,7 @@
       if (workspaceSessionRequestSeqByWorkspace.get(requestedWorkspaceId) !== requestSeq) {
         return;
       }
-      sessionsByWorkspace = {
-        ...sessionsByWorkspace,
-        [requestedWorkspaceId]: snapshot.sessions,
-      };
+      commitSidebarWorkspaceSessionsSnapshot(requestedWorkspaceId, snapshot);
     } catch (error) {
       notifyWorkbenchError(i18n.t('web.action.loadWorkspaceSessions'), error);
     } finally {
@@ -1128,6 +1189,7 @@
       const next = await listAgentWorkspaces();
       workspaces = next;
       invalidateWorkspaceSessionRequests();
+      workspaceSessionCursorByWorkspace.clear();
       sessionsByWorkspace = {};
       expandedWorkspaceIds = {};
       // 首次启动时 bootstrap 尚未返回，工作区列表的 isActive 只是工作区管理状态，
@@ -1311,6 +1373,7 @@
       sessionsByWorkspace = Object.fromEntries(
         Object.entries(sessionsByWorkspace).filter(([workspaceId]) => workspaceId !== removedId)
       );
+      workspaceSessionCursorByWorkspace.delete(removedId);
       expandedWorkspaceIds = Object.fromEntries(
         Object.entries(expandedWorkspaceIds).filter(([workspaceId]) => workspaceId !== removedId)
       );
@@ -1380,7 +1443,10 @@
       sessionsAlreadyLoaded
       && messagesState.workspaceSessionProjection.workspaceId !== workspaceId
     ) {
-      replaceWorkspaceSessionProjection(workspaceId, sessionsByWorkspace[workspaceId] ?? []);
+      const cursor = workspaceSessionCursorByWorkspace.get(workspaceId);
+      if (cursor) {
+        replaceWorkspaceSessionProjection(workspaceId, sessionsByWorkspace[workspaceId] ?? [], cursor);
+      }
     }
 
     if (!alreadyCurrentDraft) {
@@ -1400,7 +1466,10 @@
         !messagesState.currentSessionId?.trim()
         && currentBootstrapWorkspaceId() === workspaceId
       ) {
-        replaceWorkspaceSessionProjection(workspaceId, sessionsByWorkspace[workspaceId] ?? []);
+        const cursor = workspaceSessionCursorByWorkspace.get(workspaceId);
+        if (cursor) {
+          replaceWorkspaceSessionProjection(workspaceId, sessionsByWorkspace[workspaceId] ?? [], cursor);
+        }
       }
     }
   }
@@ -1530,12 +1599,20 @@
       });
       const authoritativeWorkspaceId = normalizedSnapshot.workspace.workspaceId?.trim()
         || workspace.workspaceId;
+      const cursor = {
+        runtimeEpoch: normalizedSnapshot.agent?.runtimeEpoch || '',
+        eventStreamNextSequence: normalizedSnapshot.eventStreamNextSequence || 0,
+      };
+      if (!canApplyWorkspaceSessionProjectionCursor(authoritativeWorkspaceId, cursor)) {
+        return;
+      }
+      workspaceSessionCursorByWorkspace.set(authoritativeWorkspaceId, cursor);
       sessionsByWorkspace = {
         ...sessionsByWorkspace,
         [authoritativeWorkspaceId]: normalizedSnapshot.sessions,
       };
       if (currentBootstrapWorkspaceId() === authoritativeWorkspaceId) {
-        replaceWorkspaceSessionProjection(authoritativeWorkspaceId, normalizedSnapshot.sessions);
+        replaceWorkspaceSessionProjection(authoritativeWorkspaceId, normalizedSnapshot.sessions, cursor);
       }
       editingSession = null;
       sessionRenameDraft = '';

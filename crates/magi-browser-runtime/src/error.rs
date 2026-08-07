@@ -23,6 +23,13 @@ pub enum BrowserAuthorityError {
     UnknownSession(BrowserSessionId),
     #[error("browser tab already exists: {0}")]
     TabAlreadyExists(BrowserTabId),
+    #[error("browser session {browser_session_id} reached the tab limit: {limit}")]
+    SessionTabLimitReached {
+        browser_session_id: BrowserSessionId,
+        limit: usize,
+    },
+    #[error("browser runtime reached the global tab limit: {limit}")]
+    GlobalTabLimitReached { limit: usize },
     #[error("browser tab does not exist: {0}")]
     UnknownTab(BrowserTabId),
     #[error("browser annotation already exists: {0}")]

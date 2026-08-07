@@ -9,6 +9,7 @@ import {
   setIsProcessing,
   setCurrentSessionId,
   adoptCurrentSessionIdForLiveTurn,
+  advanceWorkspaceSessionProjectionCursor,
   replaceWorkspaceSessionProjection,
   clearWorkspaceSessionProjection,
   setQueuedMessages,
@@ -383,18 +384,6 @@ function handleStateUpdate(
   if (!options.preserveLocalProcessing) {
     applyAuthoritativeProcessingState(state.processingState ?? null);
   }
-  if (state.sessions) {
-    const sessionsWorkspaceId = typeof state.currentWorkspaceId === 'string'
-      ? state.currentWorkspaceId.trim()
-      : '';
-    if (sessionsWorkspaceId) {
-      replaceWorkspaceSessionProjection(
-        sessionsWorkspaceId,
-        ensureArray(state.sessions) as Session[],
-      );
-    }
-  }
-
   // currentSessionId 属于显式 bootstrap / switch 的会话锚定语义，
   // 不能由常规 stateUpdate 反向覆盖当前浏览器查看的会话。
   // 否则会出现侧边栏 active、URL、主内容三者分裂，破坏 live/restore 单一真相源。
@@ -610,6 +599,8 @@ export function handleUnifiedData(standard: StandardMessage) {
       handleSessionsUpdated(asMessage({
         workspaceId: payload.workspaceId,
         sessions: payload.sessions,
+        runtimeEpoch: payload.runtimeEpoch,
+        eventStreamNextSequence: payload.eventStreamNextSequence,
       }));
       break;
 
@@ -631,6 +622,7 @@ export function handleUnifiedData(standard: StandardMessage) {
 
     case 'sessionBootstrapLoaded':
       handleSessionBootstrapLoaded(asMessage({
+        agent: payload.agent,
         sessionId: payload.sessionId,
         workspace: payload.workspace,
         sessions: payload.sessions,
@@ -648,8 +640,17 @@ export function handleUnifiedData(standard: StandardMessage) {
 
     case 'sessionTurnAccepted': {
       const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
+      const workspaceId = typeof payload.workspaceId === 'string' ? payload.workspaceId.trim() : '';
       if (sessionId) {
         adoptCurrentSessionIdForLiveTurn(sessionId);
+      }
+      const runtimeEpoch = typeof payload.runtimeEpoch === 'string' ? payload.runtimeEpoch.trim() : '';
+      const eventStreamNextSequence = Number(payload.eventStreamNextSequence);
+      if (workspaceId && runtimeEpoch && Number.isFinite(eventStreamNextSequence) && eventStreamNextSequence >= 1) {
+        advanceWorkspaceSessionProjectionCursor(workspaceId, {
+          runtimeEpoch,
+          eventStreamNextSequence,
+        });
       }
       break;
     }
@@ -781,8 +782,24 @@ function handleSessionsUpdated(message: ClientBridgeMessage) {
     return;
   }
   if (sessions) {
-    replaceWorkspaceSessionProjection(workspaceId, ensureArray(sessions));
+    replaceWorkspaceSessionProjection(workspaceId, ensureArray(sessions), {
+      runtimeEpoch: typeof message.runtimeEpoch === 'string' ? message.runtimeEpoch : '',
+      eventStreamNextSequence: Number(message.eventStreamNextSequence),
+    }, {
+      allowRuntimeEpochChange: message.allowRuntimeEpochChange === true,
+    });
   }
+}
+
+function workspaceSessionCursorFromBootstrap(message: ClientBridgeMessage) {
+  const agentRecord = (message as Record<string, unknown>).agent;
+  const agent = agentRecord && typeof agentRecord === 'object' && !Array.isArray(agentRecord)
+    ? agentRecord as Record<string, unknown>
+    : null;
+  return {
+    runtimeEpoch: typeof agent?.runtimeEpoch === 'string' ? agent.runtimeEpoch : '',
+    eventStreamNextSequence: Number((message as Record<string, unknown>).eventStreamNextSequence),
+  };
 }
 
 function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
@@ -815,11 +832,7 @@ function handleEmptyWorkspaceStateLoaded(message: ClientBridgeMessage) {
     setCurrentSessionId(null);
     messagesState.currentWorkspaceId = workspaceId;
     messagesState.currentWorkspacePath = workspacePath;
-    if (workspaceId) {
-      replaceWorkspaceSessionProjection(workspaceId, []);
-    } else {
-      clearWorkspaceSessionProjection();
-    }
+    clearWorkspaceSessionProjection();
     setSessionHistoryState(null, { workspaceId });
     setAppState({
       ...state,
@@ -1163,7 +1176,12 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       clearCurrentSessionBeforeWorkspaceChange(workspaceId);
       messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
       messagesState.currentWorkspacePath = workspacePath;
-      replaceWorkspaceSessionProjection(workspaceId, sessions);
+      replaceWorkspaceSessionProjection(
+        workspaceId,
+        sessions,
+        workspaceSessionCursorFromBootstrap(message),
+        { allowRuntimeEpochChange: true },
+      );
       setCurrentSessionId(null);
       messagesState.draftOrchestratorSessionConfig = {};
       clearStaleSettingsBootstrapSnapshot();
@@ -1200,7 +1218,12 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       const sessions = ensureArray(snapshot.sessions) as Session[];
       messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
       messagesState.currentWorkspacePath = workspacePath || messagesState.currentWorkspacePath;
-      replaceWorkspaceSessionProjection(workspaceId, sessions);
+      replaceWorkspaceSessionProjection(
+        workspaceId,
+        sessions,
+        workspaceSessionCursorFromBootstrap(message),
+        { allowRuntimeEpochChange: true },
+      );
       clearStaleSettingsBootstrapSnapshot();
       const hadLiveTurnBeforeSnapshot = hasActiveLocalTimelineTurn();
       const hadPendingLocalRequestBeforeSnapshot = hasPendingLocalRequest();
@@ -1287,7 +1310,12 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     clearCurrentSessionBeforeWorkspaceChange(workspaceId);
     messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
     messagesState.currentWorkspacePath = workspacePath || messagesState.currentWorkspacePath;
-    replaceWorkspaceSessionProjection(workspaceId, sessions);
+    replaceWorkspaceSessionProjection(
+      workspaceId,
+      sessions,
+      workspaceSessionCursorFromBootstrap(message),
+      { allowRuntimeEpochChange: true },
+    );
 
     setCurrentSessionId(sessionId);
     clearStaleSettingsBootstrapSnapshot();

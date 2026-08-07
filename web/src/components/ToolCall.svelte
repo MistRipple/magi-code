@@ -677,6 +677,10 @@
     }
 
     if (matches(
+      'file_patch_no_match',
+      'file_patch_ambiguous_match',
+      'file_patch_not_applicable',
+      'file_patch_invalid_input',
       'file_remove_invalid_args',
       'file_path_required',
       'file_path_outside_workspace',

@@ -110,6 +110,8 @@ export const messagesState = $state({
   workspaceSessionProjection: {
     workspaceId: null as string | null,
     sessions: [] as Session[],
+    runtimeEpoch: null as string | null,
+    eventStreamNextSequence: 0,
   },
   currentSessionId: null as string | null,
   sessionHydrating: false,
@@ -371,6 +373,11 @@ function normalizeQueuedMessageList(value: unknown): QueuedMessage[] {
       contextReferences: ensureArray(item.contextReferences)
         .map(normalizeQueuedMessageContextReference)
         .filter((reference): reference is QueuedMessageContextReferenceItem => reference !== null),
+      browserAnnotationRefs: ensureArray(item.browserAnnotationRefs)
+        .filter((annotationId): annotationId is string => typeof annotationId === 'string')
+        .map((annotationId) => annotationId.trim())
+        .filter(Boolean),
+      canGuide: item.canGuide === true,
     }));
 }
 
@@ -1334,14 +1341,61 @@ export function adoptAcceptedSessionIdForLocalTurn(
   return true;
 }
 
+export interface WorkspaceSessionProjectionCursor {
+  runtimeEpoch: string;
+  eventStreamNextSequence: number;
+}
+
+function normalizeWorkspaceSessionProjectionCursor(
+  cursor: WorkspaceSessionProjectionCursor,
+): WorkspaceSessionProjectionCursor {
+  const runtimeEpoch = cursor.runtimeEpoch?.trim() || '';
+  const eventStreamNextSequence = Number.isFinite(cursor.eventStreamNextSequence)
+    ? Math.floor(cursor.eventStreamNextSequence)
+    : 0;
+  if (!runtimeEpoch || eventStreamNextSequence < 1) {
+    throw new Error('更新工作区会话目录时必须提供有效的运行时代际和事件游标');
+  }
+  return { runtimeEpoch, eventStreamNextSequence };
+}
+
+export function canApplyWorkspaceSessionProjectionCursor(
+  workspaceId: string,
+  cursor: WorkspaceSessionProjectionCursor,
+  options: { allowRuntimeEpochChange?: boolean } = {},
+): boolean {
+  const currentWorkspaceId = normalizeWorkspaceId(workspaceId);
+  const normalized = normalizeWorkspaceSessionProjectionCursor(cursor);
+  const current = messagesState.workspaceSessionProjection;
+  if (normalizeWorkspaceId(current.workspaceId) !== currentWorkspaceId) {
+    return true;
+  }
+  const currentRuntimeEpoch = current.runtimeEpoch?.trim() || '';
+  if (
+    currentRuntimeEpoch
+    && currentRuntimeEpoch !== normalized.runtimeEpoch
+    && options.allowRuntimeEpochChange !== true
+  ) {
+    return false;
+  }
+  return currentRuntimeEpoch !== normalized.runtimeEpoch
+    || normalized.eventStreamNextSequence >= current.eventStreamNextSequence;
+}
+
 export function replaceWorkspaceSessionProjection(
   workspaceId: string,
   newSessions: Session[],
-) {
+  cursor: WorkspaceSessionProjectionCursor,
+  options: { allowRuntimeEpochChange?: boolean } = {},
+): boolean {
   const seen = new Set<string>();
   const currentWorkspaceId = normalizeWorkspaceId(workspaceId);
   if (!currentWorkspaceId) {
     throw new Error('更新工作区会话目录时必须提供 workspaceId');
+  }
+  const normalizedCursor = normalizeWorkspaceSessionProjectionCursor(cursor);
+  if (!canApplyWorkspaceSessionProjectionCursor(currentWorkspaceId, normalizedCursor, options)) {
+    return false;
   }
   const sessions = ensureArray<Session>(newSessions)
     .filter((session): session is Session => !!session && typeof session === 'object' && typeof session.id === 'string' && session.id.trim().length > 0)
@@ -1357,15 +1411,67 @@ export function replaceWorkspaceSessionProjection(
   messagesState.workspaceSessionProjection = {
     workspaceId: currentWorkspaceId,
     sessions,
+    runtimeEpoch: normalizedCursor.runtimeEpoch,
+    eventStreamNextSequence: normalizedCursor.eventStreamNextSequence,
   };
   pruneSessionViewStateByKnownSessions();
   saveWebviewState();
+  return true;
+}
+
+export function advanceWorkspaceSessionProjectionCursor(
+  workspaceId: string,
+  cursor: WorkspaceSessionProjectionCursor,
+): boolean {
+  const currentWorkspaceId = normalizeWorkspaceId(workspaceId);
+  if (!currentWorkspaceId || normalizeWorkspaceId(messagesState.workspaceSessionProjection.workspaceId) !== currentWorkspaceId) {
+    return false;
+  }
+  const normalizedCursor = normalizeWorkspaceSessionProjectionCursor(cursor);
+  if (!canApplyWorkspaceSessionProjectionCursor(currentWorkspaceId, normalizedCursor)) {
+    return false;
+  }
+  if (
+    messagesState.workspaceSessionProjection.runtimeEpoch === normalizedCursor.runtimeEpoch
+    && messagesState.workspaceSessionProjection.eventStreamNextSequence === normalizedCursor.eventStreamNextSequence
+  ) {
+    return true;
+  }
+  messagesState.workspaceSessionProjection = {
+    ...messagesState.workspaceSessionProjection,
+    runtimeEpoch: normalizedCursor.runtimeEpoch,
+    eventStreamNextSequence: normalizedCursor.eventStreamNextSequence,
+  };
+  saveWebviewState();
+  return true;
+}
+
+export function updateWorkspaceSessionProjectionSessions(
+  workspaceId: string,
+  newSessions: Session[],
+): boolean {
+  const current = messagesState.workspaceSessionProjection;
+  const currentWorkspaceId = normalizeWorkspaceId(workspaceId);
+  if (
+    !currentWorkspaceId
+    || normalizeWorkspaceId(current.workspaceId) !== currentWorkspaceId
+    || !current.runtimeEpoch
+    || current.eventStreamNextSequence < 1
+  ) {
+    return false;
+  }
+  return replaceWorkspaceSessionProjection(currentWorkspaceId, newSessions, {
+    runtimeEpoch: current.runtimeEpoch,
+    eventStreamNextSequence: current.eventStreamNextSequence,
+  });
 }
 
 export function clearWorkspaceSessionProjection() {
   messagesState.workspaceSessionProjection = {
     workspaceId: null,
     sessions: [],
+    runtimeEpoch: null,
+    eventStreamNextSequence: 0,
   };
   pruneSessionViewStateByKnownSessions();
   saveWebviewState();
@@ -1374,14 +1480,6 @@ export function clearWorkspaceSessionProjection() {
 export function setQueuedMessages(newQueuedMessages: QueuedMessage[]) {
   const normalized = normalizeQueuedMessageList(newQueuedMessages);
   messagesState.queuedMessages = normalized;
-}
-
-export function removeQueuedMessage(id: string) {
-  const normalizedId = typeof id === 'string' ? id.trim() : '';
-  if (!normalizedId) {
-    return;
-  }
-  setQueuedMessages(messagesState.queuedMessages.filter((message) => message.id !== normalizedId));
 }
 
 // 处理状态操作

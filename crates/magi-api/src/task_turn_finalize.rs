@@ -1,14 +1,197 @@
 use crate::state::ApiState;
 use magi_conversation_runtime::session_writeback::SessionStatePersistCallback;
 use magi_core::{SessionId, TaskId, public_runtime_excerpt};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::Duration;
 
-fn session_state_persist_callback(state: &ApiState) -> Arc<SessionStatePersistCallback> {
-    let state_for_persist = state.clone();
-    Arc::new(move |checkpoint: &str| {
-        if let Err(error) = state_for_persist.persist_session_state_checkpoint(checkpoint) {
-            tracing::warn!(checkpoint, ?error, "session task turn 终态持久化失败");
+const INTERMEDIATE_PERSIST_DEBOUNCE: Duration = Duration::from_millis(100);
+
+type PersistSessionState = dyn Fn(&str) -> Result<(), String> + Send + Sync;
+
+#[derive(Default)]
+struct SessionStatePersistenceState {
+    pending: Option<(&'static str, u64)>,
+    worker_active: bool,
+    generation: u64,
+}
+
+struct SessionStatePersistenceScheduler {
+    persist: Arc<PersistSessionState>,
+    state: Mutex<SessionStatePersistenceState>,
+    idle: Condvar,
+    write_lock: Mutex<()>,
+}
+
+impl SessionStatePersistenceScheduler {
+    fn new(state: &ApiState) -> Arc<Self> {
+        let state = state.clone();
+        Self::with_persist(Arc::new(move |checkpoint| {
+            state
+                .persist_session_state_checkpoint(checkpoint)
+                .map_err(|error| format!("{error:?}"))
+        }))
+    }
+
+    fn with_persist(persist: Arc<PersistSessionState>) -> Arc<Self> {
+        Arc::new(Self {
+            persist,
+            state: Mutex::new(SessionStatePersistenceState::default()),
+            idle: Condvar::new(),
+            write_lock: Mutex::new(()),
+        })
+    }
+
+    fn request(self: &Arc<Self>, checkpoint: &'static str) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("session persistence state lock poisoned");
+        state.pending = Some((checkpoint, state.generation));
+        if state.worker_active {
+            return;
         }
+        state.worker_active = true;
+        drop(state);
+
+        let scheduler = Arc::clone(self);
+        if let Err(error) = thread::Builder::new()
+            .name("magi-session-persist".to_string())
+            .spawn(move || scheduler.run_worker())
+        {
+            tracing::warn!(%error, "启动 session 状态持久化线程失败，改为当前线程落盘");
+            let pending = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("session persistence state lock poisoned");
+                state.worker_active = false;
+                let pending = state.pending.take();
+                self.idle.notify_all();
+                pending
+            };
+            if let Some((checkpoint, generation)) = pending {
+                self.persist_intermediate(checkpoint, generation);
+            }
+        }
+    }
+
+    fn run_worker(self: Arc<Self>) {
+        loop {
+            thread::sleep(INTERMEDIATE_PERSIST_DEBOUNCE);
+            let checkpoint = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("session persistence state lock poisoned");
+                if state.pending.is_none() {
+                    state.worker_active = false;
+                    self.idle.notify_all();
+                    return;
+                }
+                state.pending.take()
+            };
+
+            if let Some((checkpoint, generation)) = checkpoint {
+                self.persist_intermediate(checkpoint, generation);
+            }
+        }
+    }
+
+    fn persist_intermediate(&self, checkpoint: &'static str, generation: u64) {
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("session persistence write lock poisoned");
+        if self
+            .state
+            .lock()
+            .expect("session persistence state lock poisoned")
+            .generation
+            != generation
+        {
+            return;
+        }
+        if let Err(error) = (self.persist)(checkpoint) {
+            tracing::warn!(checkpoint, %error, "异步 session 状态持久化失败");
+        }
+    }
+
+    fn persist_terminal(&self, checkpoint: &'static str) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("session persistence state lock poisoned");
+            state.generation = state.generation.saturating_add(1);
+            state.pending = None;
+        }
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("session persistence write lock poisoned");
+        if let Err(error) = (self.persist)(checkpoint) {
+            tracing::warn!(checkpoint, %error, "session task turn 终态持久化失败");
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_until_idle(&self, timeout: Duration) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("session persistence state lock poisoned");
+        let (state, _) = self
+            .idle
+            .wait_timeout_while(state, timeout, |state| state.worker_active)
+            .expect("session persistence idle wait lock poisoned");
+        !state.worker_active
+    }
+}
+
+pub fn session_state_persist_callback(state: &ApiState) -> Arc<SessionStatePersistCallback> {
+    let scheduler = SessionStatePersistenceScheduler::new(state);
+    Arc::new(move |checkpoint: &str| {
+        let checkpoint: &'static str = match checkpoint {
+            "session_turn_completed"
+            | "session_turn_failed"
+            | "session_task_chain_archived"
+            | "session_turn_final_item" => {
+                // 这些 checkpoint 是终态或用户可见最终结果，必须在回调返回前落盘。
+                match checkpoint {
+                    "session_turn_completed" => "session_turn_completed",
+                    "session_turn_failed" => "session_turn_failed",
+                    "session_task_chain_archived" => "session_task_chain_archived",
+                    "session_turn_final_item" => "session_turn_final_item",
+                    _ => unreachable!(),
+                }
+            }
+            other => {
+                // 工具开始/结果、思考流和进度通知会在一个 Turn 内高频产生；将它们
+                // 合并到 100ms 窗口内，避免每个事件都同步序列化全量 sessions.json。
+                let checkpoint = match other {
+                    "session_turn_tool_result" => "session_turn_tool_result",
+                    "session_turn_tool" => "session_turn_tool",
+                    "session_goal_tool" => "session_goal_tool",
+                    "task_turn_tool_started" => "task_turn_tool_started",
+                    "task_turn_tool_result" => "task_turn_tool_result",
+                    "task_turn_final_item" => "task_turn_final_item",
+                    "task_turn_completed" => "task_turn_completed",
+                    "task_turn_failed" => "task_turn_failed",
+                    "session_task_turn_completed" => "session_task_turn_completed",
+                    "session_task_turn_failed" => "session_task_turn_failed",
+                    "context_compaction_notice" => "context_compaction_notice",
+                    "session_turn_thread_user" => "session_turn_thread_user",
+                    "session_turn_stream_interrupted_content" => {
+                        "session_turn_stream_interrupted_content"
+                    }
+                    _ => "session_turn_progress",
+                };
+                scheduler.request(checkpoint);
+                return;
+            }
+        };
+        scheduler.persist_terminal(checkpoint);
     })
 }
 
@@ -170,6 +353,55 @@ mod tests {
         GoalContinuationPhase, SessionStore, TimelineEntryInput, TimelineEntryKind,
     };
     use magi_workspace::WorkspaceStore;
+
+    #[test]
+    fn persistence_scheduler_coalesces_burst_into_one_write() {
+        let writes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let writes_for_persist = Arc::clone(&writes);
+        let scheduler =
+            SessionStatePersistenceScheduler::with_persist(Arc::new(move |checkpoint| {
+                writes_for_persist
+                    .lock()
+                    .expect("writes lock poisoned")
+                    .push(checkpoint.to_string());
+                Ok(())
+            }));
+
+        for _ in 0..50 {
+            scheduler.request("task_turn_tool_result");
+        }
+
+        assert!(scheduler.wait_until_idle(Duration::from_secs(2)));
+        assert_eq!(
+            writes.lock().expect("writes lock poisoned").as_slice(),
+            ["task_turn_tool_result"]
+        );
+    }
+
+    #[test]
+    fn terminal_write_cancels_older_pending_checkpoint() {
+        let writes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let writes_for_persist = Arc::clone(&writes);
+        let scheduler =
+            SessionStatePersistenceScheduler::with_persist(Arc::new(move |checkpoint| {
+                writes_for_persist
+                    .lock()
+                    .expect("writes lock poisoned")
+                    .push(checkpoint.to_string());
+                Ok(())
+            }));
+
+        for _ in 0..50 {
+            scheduler.request("task_turn_tool_result");
+        }
+        scheduler.persist_terminal("session_turn_completed");
+
+        assert!(scheduler.wait_until_idle(Duration::from_secs(2)));
+        assert_eq!(
+            writes.lock().expect("writes lock poisoned").as_slice(),
+            ["session_turn_completed"]
+        );
+    }
 
     #[tokio::test]
     async fn restored_waiting_goal_is_included_in_startup_scheduling() {

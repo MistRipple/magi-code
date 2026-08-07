@@ -372,7 +372,9 @@
   }
 
   function openBrowserAnnotationPreview(annotationId: string): void {
-    openImagePreview(browserAnnotationArtifactUrl(annotationId));
+    const sessionId = filePreviewScope?.sessionId?.trim();
+    if (!sessionId) return;
+    openImagePreview(browserAnnotationArtifactUrl(annotationId, sessionId));
   }
 
   // 关闭图片预览

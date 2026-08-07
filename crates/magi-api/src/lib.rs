@@ -19,6 +19,7 @@ mod sse;
 mod state;
 mod task_dispatch;
 pub mod task_turn_finalize;
+mod terminal_runtime;
 pub mod tunnel;
 
 pub use browser_tool_runtime::BrowserToolRuntimeDependencies;

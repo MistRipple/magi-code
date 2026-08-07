@@ -179,7 +179,6 @@ pub struct RunnerManager {
 
 /// Number of runner cycles between periodic checkpoints.
 const CHECKPOINT_INTERVAL_CYCLES: u64 = 5;
-
 impl RunnerManager {
     pub fn with_dispatcher_and_worker_catalog(
         task_store: Arc<TaskStore>,
@@ -805,7 +804,7 @@ impl Default for BrowserRuntimeStatusSnapshot {
         Self {
             revision: 1,
             in_app_browser_enabled: true,
-            browser_use_enabled: false,
+            browser_use_enabled: true,
             component_status: BrowserRuntimeComponentStatus::NotInstalled,
             runtime_mode: "unavailable".to_string(),
             host_status: "stopped".to_string(),
@@ -1182,6 +1181,7 @@ pub struct ApiState {
     pub tunnel_manager: crate::tunnel::TunnelManager,
     pub snapshot_manager: Arc<SnapshotManager>,
     pub conversation_registry: Arc<ConversationRegistry>,
+    pub(crate) terminal_sessions: crate::terminal_runtime::TerminalSessionManager,
     /// 任务系统：AgentRole 注册表（替代 task_worker_catalog 硬编码 prompt）。
     /// 加载策略：`~/.magi/roles/*.json` 优先，回落到 crate 内置 builtin 集。
     pub agent_role_registry: Arc<magi_agent_role::AgentRoleRegistry>,
@@ -1474,6 +1474,7 @@ impl ApiState {
             tunnel_manager: crate::tunnel::TunnelManager::new(38123),
             snapshot_manager: Arc::new(SnapshotManager::new()),
             conversation_registry: Arc::new(ConversationRegistry::new()),
+            terminal_sessions: crate::terminal_runtime::TerminalSessionManager::default(),
             agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
             spawn_graph: Arc::new(Mutex::new(magi_spawn_graph::SpawnGraph::new())),
             session_turn_queue: Arc::new(Mutex::new(HashMap::new())),
@@ -2442,7 +2443,7 @@ impl ApiState {
         runtime.browser_use_enabled = browser
             .get("browserUseEnabled")
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+            .unwrap_or(true);
         drop(runtime);
         self.settings_store = store;
         self
@@ -3396,7 +3397,7 @@ impl ApiState {
             .collect()
     }
 
-    pub(crate) fn clear_all_regular_session_turn_queues(
+    pub(crate) fn clear_regular_session_turn_queue_for_lifecycle(
         &self,
         session_id: &SessionId,
     ) -> Result<usize, ApiError> {
@@ -3432,11 +3433,13 @@ impl ApiState {
                 .unbind_session_after_lifecycle_lock(session_id)
                 .await;
         }
+        self.terminal_sessions
+            .close_for_session(session_id.as_str());
         self.cleanup_session_git_resources(session_id).await;
         self.settings_store
             .remove_session(session_id)
             .map_err(crate::errors::settings_persistence_error)?;
-        self.clear_all_regular_session_turn_queues(session_id)?;
+        self.clear_regular_session_turn_queue_for_lifecycle(session_id)?;
 
         let mut mission_ids = HashSet::new();
         if let Some(thread) = self

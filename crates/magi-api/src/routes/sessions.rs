@@ -52,6 +52,7 @@ pub fn routes() -> Router<ApiState> {
             "/session/queue/remove",
             post(remove_session_turn_queue_item),
         )
+        .route("/session/queue/guide", post(guide_session_turn_queue_item))
         .route("/session/interrupt", post(interrupt_session_turn))
         .route("/session/continue", post(continue_session))
         .route("/session/switch", post(switch_session))
@@ -125,6 +126,7 @@ struct QueuedSessionTurnDto {
     images: Vec<crate::dto::SessionTurnImageDto>,
     context_references: Vec<crate::dto::SessionContextReferenceDto>,
     browser_annotation_refs: Vec<String>,
+    can_guide: bool,
     retry_count: u8,
 }
 
@@ -155,6 +157,7 @@ fn session_turn_queue_response(
         .enumerate()
         .map(|(index, queued)| {
             let text = queued.request.trimmed_text();
+            let can_guide = session_turn_request_is_plain_text(&queued.request);
             QueuedSessionTurnDto {
                 queue_id: queued.queue_id,
                 queue_position: index + 1,
@@ -171,6 +174,7 @@ fn session_turn_queue_response(
                 images: queued.request.images,
                 context_references: queued.request.context_references,
                 browser_annotation_refs: queued.request.browser_annotation_refs,
+                can_guide,
                 retry_count: queued.retry_count,
             }
         })
@@ -214,6 +218,68 @@ async fn remove_session_turn_queue_item(
     }
     let _session_turn_guard = state.lock_session_turn(&session_id).await;
     state.remove_regular_session_turn(&session_id, queue_id)?;
+    Ok(Json(session_turn_queue_response(&state, &session_id)))
+}
+
+async fn guide_session_turn_queue_item(
+    State(state): State<ApiState>,
+    Json(request): Json<RemoveSessionTurnQueueItemRequest>,
+) -> Result<Json<SessionTurnQueueResponseDto>, ApiError> {
+    let (session_id, workspace_id) = require_session_turn_queue_scope(&state, &request.scope)?;
+    let queue_id = request.queue_id.trim();
+    if queue_id.is_empty() {
+        return Err(ApiError::InvalidInput("queueId 不能为空".to_string()));
+    }
+
+    // 队列消费、删除和转引导必须共用同一个 session 临界区，避免后台出队与用户操作
+    // 同时取得同一条消息。引导先写入 canonical Turn，再持久化移除队列项；若第二步
+    // 失败，重试会通过 requestId + userMessageId 识别已提交消息，不会重复引导。
+    let _session_turn_guard = state.lock_session_turn(&session_id).await;
+    let queued = state
+        .queued_regular_session_turns(&session_id)
+        .into_iter()
+        .find(|turn| turn.queue_id == queue_id)
+        .ok_or_else(|| ApiError::not_found("排队消息不存在", queue_id))?;
+
+    let already_committed = state
+        .session_store
+        .canonical_turns_for_session(&session_id)
+        .into_iter()
+        .any(|turn| canonical_turn_matches_queued_regular_turn(&turn, &queued));
+    if !already_committed {
+        if !session_turn_request_is_plain_text(&queued.request) {
+            return Err(ApiError::InvalidInput(
+                "仅纯文字排队消息可以转为当前回复的引导".to_string(),
+            ));
+        }
+        let expected_turn_id = state
+            .session_store
+            .runtime_sidecar(&session_id)
+            .and_then(|sidecar| sidecar.current_turn.map(|turn| turn.turn_id))
+            .ok_or_else(|| {
+                ApiError::turn_conflict(
+                    "no_active_turn",
+                    None,
+                    "当前回复已经结束，无法把排队消息转为引导",
+                )
+            })?;
+        let mut steer_request = queued.request.clone();
+        steer_request.session_id = Some(session_id.to_string());
+        steer_request.workspace_id = Some(workspace_id.to_string());
+        steer_request.steer_current_turn = true;
+        steer_request.expected_turn_id = Some(expected_turn_id);
+        submit_steer_current_turn(
+            &state,
+            &steer_request,
+            &workspace_id,
+            super::monotonic_accepted_at(),
+        )
+        .await?;
+    }
+
+    if !state.remove_regular_session_turn(&session_id, queue_id)? {
+        return Err(ApiError::not_found("排队消息不存在", queue_id));
+    }
     Ok(Json(session_turn_queue_response(&state, &session_id)))
 }
 
@@ -336,7 +402,7 @@ async fn submit_session_turn(
     }
     match decision.route {
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute | SessionTurnRouteDto::Task => {
-            submit_root_coordinator_session_turn(
+            submit_mainline_session_turn(
                 state,
                 request,
                 images,
@@ -410,6 +476,8 @@ async fn submit_session_turn(
                     entry_id,
                     event_id,
                     accepted_at,
+                    runtime_epoch: state.runtime_epoch().to_string(),
+                    event_stream_next_sequence: state.event_bus.snapshot().next_sequence,
                     created_session: false,
                     route: SessionTurnRouteDto::Continue,
                     root_task_id: Some(accepted.root_task_id),
@@ -504,6 +572,8 @@ fn enqueue_session_turn_response(
         entry_id: queue_id.clone(),
         event_id,
         accepted_at,
+        runtime_epoch: state.runtime_epoch().to_string(),
+        event_stream_next_sequence: state.event_bus.snapshot().next_sequence,
         created_session: false,
         route: decision.route,
         root_task_id: None,
@@ -525,12 +595,7 @@ async fn submit_steer_current_turn(
     let expected_turn_id = request
         .expected_turn_id()
         .ok_or_else(|| ApiError::InvalidInput("引导当前回复必须提供 expectedTurnId".to_string()))?;
-    if request.skill_name.is_some()
-        || request.goal_mode
-        || !request.images.is_empty()
-        || !request.context_references.is_empty()
-        || !request.browser_annotation_refs.is_empty()
-    {
+    if !session_turn_request_is_plain_text(request) {
         return Err(ApiError::InvalidInput(
             "引导当前回复仅支持文字输入".to_string(),
         ));
@@ -620,6 +685,8 @@ async fn submit_steer_current_turn(
         entry_id,
         event_id,
         accepted_at,
+        runtime_epoch: state.runtime_epoch().to_string(),
+        event_stream_next_sequence: state.event_bus.snapshot().next_sequence,
         created_session: false,
         route: SessionTurnRouteDto::Steer,
         root_task_id: None,
@@ -629,6 +696,18 @@ async fn submit_steer_current_turn(
     })
     .with_steered_turn(expected_turn_id)
     .with_canonical_event("turn_item_upsert", canonical_turn, canonical_item))
+}
+
+fn session_turn_request_is_plain_text(request: &SessionTurnRequestDto) -> bool {
+    request.trimmed_text().is_some()
+        && request
+            .skill_name
+            .as_deref()
+            .is_none_or(|skill_name| skill_name.trim().is_empty())
+        && !request.goal_mode
+        && request.images.is_empty()
+        && request.context_references.is_empty()
+        && request.browser_annotation_refs.is_empty()
 }
 
 fn steer_input_error(error: SessionTurnInputError) -> ApiError {
@@ -963,33 +1042,25 @@ fn local_session_turn_intent_decision(
     let requests_explicit_task_or_agent =
         session_turn_requests_explicit_task_or_agent_mode(request);
     let requests_explicit_plan = session_turn_requests_explicit_plan(request);
-    let requests_proactive_collaboration =
-        !session_turn_explicitly_rejects_collaboration(&task_text.to_ascii_lowercase())
-            && session_turn_has_structured_task_scope(&task_text.to_ascii_lowercase());
     let requests_simple_execution = session_turn_requests_simple_execution_by_local_rules(request)
         || session_turn_requested_public_builtin_tools(request).is_some();
     let route = if has_recoverable_chain && session_turn_requests_continue_existing_task(request) {
         SessionTurnRouteDto::Continue
     } else if requests_goal_mode && !requests_explicit_task_or_agent {
         SessionTurnRouteDto::Chat
-    } else if requests_explicit_task_or_agent
-        || requests_explicit_plan
-        || requests_proactive_collaboration
-        || (session_turn_requests_task_by_local_rules(request) && !requests_simple_execution)
-    {
+    } else if requests_explicit_task_or_agent || requests_explicit_plan {
         SessionTurnRouteDto::Task
-    } else if requests_simple_execution || session_turn_requests_execute_by_local_rules(request) {
+    } else if requests_simple_execution
+        || session_turn_requests_execute_by_local_rules(request)
+        || session_turn_requests_task_by_local_rules(request)
+    {
         SessionTurnRouteDto::Execute
     } else {
         SessionTurnRouteDto::Chat
     };
     let task_tier = TaskTier::ExecutionChain;
     let task_evidence = if matches!(route, SessionTurnRouteDto::Task) {
-        vec![if requests_proactive_collaboration {
-            "任务具有可独立推进的多个工作面，交由 root coordinator 评估协作".to_string()
-        } else {
-            "本地路由判定需要结构化任务执行".to_string()
-        }]
+        vec!["用户明确要求任务模式或执行计划".to_string()]
     } else {
         Vec::new()
     };
@@ -1008,13 +1079,7 @@ fn local_session_turn_intent_decision(
         reason_code: Some(
             match route {
                 SessionTurnRouteDto::Continue => "continue_requested",
-                SessionTurnRouteDto::Task => {
-                    if requests_proactive_collaboration {
-                        "proactive_collaboration_candidate"
-                    } else {
-                        "structured_task_request"
-                    }
-                }
+                SessionTurnRouteDto::Task => "explicit_task_request",
                 SessionTurnRouteDto::Execute => "tool_request",
                 SessionTurnRouteDto::Chat | SessionTurnRouteDto::Steer => {
                     if requests_goal_mode {
@@ -1029,13 +1094,7 @@ fn local_session_turn_intent_decision(
         route_reason: Some(
             match route {
                 SessionTurnRouteDto::Continue => "用户要求继续且存在可恢复链",
-                SessionTurnRouteDto::Task => {
-                    if requests_proactive_collaboration {
-                        "任务具有多个可独立推进的工作面，由 root coordinator 评估是否组队"
-                    } else {
-                        "用户请求需要结构化任务执行"
-                    }
-                }
+                SessionTurnRouteDto::Task => "用户明确要求任务模式或执行计划",
                 SessionTurnRouteDto::Execute => "用户请求需要工具执行但不需要代理运行记录",
                 SessionTurnRouteDto::Chat | SessionTurnRouteDto::Steer => {
                     if requests_goal_mode {
@@ -1167,6 +1226,7 @@ fn normalize_session_turn_decision(
         || session_turn_requested_public_builtin_tools(request).is_some();
     if matches!(decision.route, SessionTurnRouteDto::Task)
         && !session_turn_requests_explicit_task_or_agent_mode(request)
+        && !session_turn_requests_explicit_plan(request)
         && requests_direct_execution
     {
         let task_text = request
@@ -1419,9 +1479,7 @@ fn session_turn_requests_simple_execution_by_local_rules(request: &SessionTurnRe
         return false;
     };
     let normalized = text.to_ascii_lowercase();
-    if session_turn_requests_explicit_task_or_agent_mode(request)
-        || session_turn_has_structured_task_scope(&normalized)
-    {
+    if session_turn_requests_explicit_task_or_agent_mode(request) {
         return false;
     }
     let has_direct_work = [
@@ -1596,38 +1654,6 @@ fn diagram_generation_tool_intent(request: &SessionTurnRequestDto) -> String {
     format!(
         "用户明确要求生成结构化图表：{user_text}。可以先使用其它必要工具理解真实上下文，但最终必须调用 diagram_render 产生可在对话中展示的图表数据；只输出 Markdown、ASCII 图或承诺稍后补充都不构成交付完成。"
     )
-}
-
-fn session_turn_has_structured_task_scope(normalized: &str) -> bool {
-    [
-        "并验证",
-        "完成后",
-        "拆分",
-        "规划",
-        "多阶段",
-        "多轮",
-        "可恢复",
-        "任务编排",
-        "中等任务",
-        "复杂任务",
-        "长期任务",
-        "重构",
-        "迁移",
-        "架构",
-        "全量",
-        "完整",
-        "端到端",
-        "e2e",
-        "验收",
-        "运行测试",
-        "测试并",
-        "validate",
-        "verify",
-        "migration",
-        "refactor",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
 }
 
 fn session_turn_requests_execute_by_local_rules(request: &SessionTurnRequestDto) -> bool {
@@ -1877,20 +1903,22 @@ fn session_turn_explicitly_rejects_collaboration(normalized: &str) -> bool {
         .any(|term| normalized.contains(term))
 }
 
-fn session_turn_denied_collaboration_tools(request: &SessionTurnRequestDto) -> Vec<String> {
-    let rejects_collaboration = request
-        .trimmed_text()
-        .as_deref()
-        .map(|text| session_turn_explicitly_rejects_collaboration(&text.to_ascii_lowercase()))
-        .unwrap_or(false);
-    if rejects_collaboration {
-        ["agent_spawn", "agent_send", "agent_wait"]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
-    } else {
-        Vec::new()
+fn session_turn_denied_tools(request: &SessionTurnRequestDto) -> Vec<String> {
+    let explicitly_requests_collaboration =
+        session_turn_requests_explicit_agent_collaboration(request);
+    let explicitly_requests_goal = session_turn_requests_explicit_goal_mode(request);
+    let explicitly_requests_plan = session_turn_requests_explicit_plan(request);
+    let mut denied = Vec::new();
+    if !explicitly_requests_collaboration {
+        denied.extend(["agent_spawn", "agent_send", "agent_wait"].map(str::to_string));
     }
+    if !explicitly_requests_goal {
+        denied.extend(["get_goal", "create_goal", "update_goal"].map(str::to_string));
+    }
+    if !explicitly_requests_goal && !explicitly_requests_plan {
+        denied.push("update_plan".to_string());
+    }
+    denied
 }
 
 enum RequestedBuiltinTools {
@@ -2042,11 +2070,12 @@ fn build_user_message_turn_item(
     )
 }
 
-/// 所有可执行的主线 Turn 都创建内部 root coordinator task。
+/// 所有可执行的主线 Turn 共用同一个任务执行状态机。
 ///
-/// 前端仍按原始 route 呈现普通对话或直接执行；运行时不再存在 session runner 与
-/// task runner 两套工具实现。只有被 `agent_spawn` 创建的 worker 会失去协作工具面。
-async fn submit_root_coordinator_session_turn(
+/// Chat/Execute 只把 task 作为内部恢复与审计记录，并从 TaskPolicy 移除协作工具；
+/// 只有用户显式要求代理协作的请求才启用 root coordinator 工具面和对应提示。
+/// 这样继续保持单一 runner，同时避免普通请求被语义升级成多代理任务。
+async fn submit_mainline_session_turn(
     state: ApiState,
     request: SessionTurnRequestDto,
     images: Vec<magi_conversation_runtime::session_images::SessionTurnImage>,
@@ -2114,7 +2143,7 @@ async fn submit_root_coordinator_session_turn(
             required_tool_chain,
             completion_contract: decision.completion_contract.clone(),
             recovery_checkpoint: decision.recovery_checkpoint.clone(),
-            denied_tools: session_turn_denied_collaboration_tools(&request),
+            denied_tools: session_turn_denied_tools(&request),
         },
     )
     .await?;
@@ -2130,6 +2159,8 @@ async fn submit_root_coordinator_session_turn(
         entry_id: accepted.entry_id,
         event_id,
         accepted_at: accepted.accepted_at,
+        runtime_epoch: state.runtime_epoch().to_string(),
+        event_stream_next_sequence: state.event_bus.snapshot().next_sequence,
         created_session: accepted.created_session,
         route,
         root_task_id: Some(accepted.root_task_id),
@@ -2157,12 +2188,13 @@ pub(crate) fn schedule_next_queued_regular_session_turn(
         {
             return;
         }
-        if !drain_next_queued_regular_session_turn(
+        if drain_next_queued_regular_session_turn(
             state.clone(),
             session_id.clone(),
             workspace_id.clone(),
         )
         .await
+            == QueuedRegularSessionTurnDrainOutcome::Empty
         {
             schedule_goal_continuation_turn_if_idle(state, session_id, workspace_id).await;
         }
@@ -2356,17 +2388,25 @@ fn goal_continuation_prompt(goal: &SessionGoal) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuedRegularSessionTurnDrainOutcome {
+    Empty,
+    Deferred,
+    Started,
+    RetainedAfterFailure,
+}
+
 async fn drain_next_queued_regular_session_turn(
     state: ApiState,
     session_id: SessionId,
     workspace_id: Option<WorkspaceId>,
-) -> bool {
+) -> QueuedRegularSessionTurnDrainOutcome {
     let _session_turn_guard = state.lock_session_turn(&session_id).await;
     if state.queued_regular_session_turn_count(&session_id) == 0 {
-        return false;
+        return QueuedRegularSessionTurnDrainOutcome::Empty;
     }
     let Some(queued) = state.peek_next_regular_session_turn(&session_id) else {
-        return false;
+        return QueuedRegularSessionTurnDrainOutcome::Empty;
     };
     if state
         .session_store
@@ -2376,7 +2416,7 @@ async fn drain_next_queued_regular_session_turn(
     {
         if let Err(error) = state.acknowledge_regular_session_turn(&session_id, &queued.queue_id) {
             tracing::error!(%session_id, queue_id = %queued.queue_id, ?error, "确认已接受排队消息失败");
-            return true;
+            return QueuedRegularSessionTurnDrainOutcome::RetainedAfterFailure;
         }
         if state
             .session_store
@@ -2386,14 +2426,14 @@ async fn drain_next_queued_regular_session_turn(
         {
             schedule_next_queued_regular_session_turn(state, session_id, workspace_id);
         }
-        return true;
+        return QueuedRegularSessionTurnDrainOutcome::Started;
     }
     if state
         .session_store
         .ensure_current_turn_acceptance_available(&session_id)
         .is_err()
     {
-        return true;
+        return QueuedRegularSessionTurnDrainOutcome::Deferred;
     }
     state.release_session_git_execution_lease(&session_id);
     let failed_event_session_id = queued.session_id.clone();
@@ -2428,7 +2468,7 @@ async fn drain_next_queued_regular_session_turn(
             SessionTurnRouteDto::Chat
             | SessionTurnRouteDto::Execute
             | SessionTurnRouteDto::Task => {
-                submit_root_coordinator_session_turn(
+                submit_mainline_session_turn(
                     state.clone(),
                     queued.request,
                     images,
@@ -2458,7 +2498,7 @@ async fn drain_next_queued_regular_session_turn(
                     "排队消息已接受，但确认队列消费失败"
                 );
             }
-            true
+            QueuedRegularSessionTurnDrainOutcome::Started
         }
         Err(error) => {
             tracing::error!(
@@ -2479,7 +2519,7 @@ async fn drain_next_queued_regular_session_turn(
                         ?persist_error,
                         "排队消息仍保留，但重试计数持久化失败"
                     );
-                    return true;
+                    return QueuedRegularSessionTurnDrainOutcome::RetainedAfterFailure;
                 }
             };
             if error.queued_submission_is_retryable() {
@@ -2508,7 +2548,7 @@ async fn drain_next_queued_regular_session_turn(
                     error.message(),
                 );
             }
-            true
+            QueuedRegularSessionTurnDrainOutcome::RetainedAfterFailure
         }
     }
 }
@@ -2790,7 +2830,8 @@ struct SessionInterruptResponseDto {
     event_id: String,
     requested_at: UtcMillis,
     cancelled_tool_process_count: usize,
-    cleared_queued_turn_count: usize,
+    remaining_queued_turn_count: usize,
+    next_queued_turn_started: bool,
     removed_timeline_entry_ids: Vec<String>,
 }
 
@@ -3013,8 +3054,7 @@ async fn interrupt_session_turn(
 ) -> Result<Json<SessionInterruptResponseDto>, ApiError> {
     let session = resolve_interrupt_session_record(&state, &request)?;
     let session_id = session.session_id.clone();
-    let _session_turn_guard = state.lock_session_turn(&session_id).await;
-    let cleared_queued_turn_count = state.clear_all_regular_session_turn_queues(&session_id)?;
+    let session_turn_guard = state.lock_session_turn(&session_id).await;
     let now = UtcMillis::now();
     let workspace_id = session_workspace_id(&state, &session);
     let current_turn = state
@@ -3135,7 +3175,6 @@ async fn interrupt_session_turn(
         "turn_id": turn_id.clone(),
         "interrupted": interrupted,
         "cancelled_tool_process_count": cancelled_tool_process_count,
-        "cleared_queued_turn_count": cleared_queued_turn_count,
         "requested_at": now.0,
         "removed_timeline_entry_ids": streaming_entry_ids.clone(),
     });
@@ -3157,6 +3196,20 @@ async fn interrupt_session_turn(
     });
     state.event_bus.publish(event);
 
+    drop(session_turn_guard);
+    let next_queued_turn_started = if state.queued_regular_session_turn_count(&session_id) > 0 {
+        drain_next_queued_regular_session_turn(
+            state.clone(),
+            session_id.clone(),
+            workspace_id.clone(),
+        )
+        .await
+            == QueuedRegularSessionTurnDrainOutcome::Started
+    } else {
+        false
+    };
+    let remaining_queued_turn_count = state.queued_regular_session_turn_count(&session_id);
+
     Ok(Json(SessionInterruptResponseDto {
         interrupted,
         session_id: session_id.to_string(),
@@ -3165,7 +3218,8 @@ async fn interrupt_session_turn(
         event_id: event_id.to_string(),
         requested_at: now,
         cancelled_tool_process_count,
-        cleared_queued_turn_count,
+        remaining_queued_turn_count,
+        next_queued_turn_started,
         removed_timeline_entry_ids: streaming_entry_ids,
     }))
 }
@@ -3444,6 +3498,7 @@ async fn delete_session(
     require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
     state.delete_session_and_resources(&session_id).await?;
     state.persist_session_durable_state_for_api()?;
+    publish_session_directory_event(&state, "session.deleted", &session_id, &workspace_id);
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         Some(workspace_id.as_str()),
         None,
@@ -3547,18 +3602,46 @@ async fn close_session(
         .session_store
         .archive_session(&session_id)
         .map_err(|e| ApiError::internal_assembly("关闭会话失败", e))?;
-    state.clear_all_regular_session_turn_queues(&session_id)?;
+    state.clear_regular_session_turn_queue_for_lifecycle(&session_id)?;
     if let Some(manager) = manager {
         manager
             .unbind_session_after_lifecycle_lock(&session_id)
             .await;
     }
+    state
+        .terminal_sessions
+        .close_for_session(session_id.as_str());
     state.release_session_git_execution_lease(&session_id);
     state.persist_session_durable_state_for_api()?;
+    publish_session_directory_event(&state, "session.closed", &session_id, &workspace_id);
     Ok(Json(state.bootstrap_dto_for_workspace_session(
         Some(workspace_id.as_str()),
         None,
     )?))
+}
+
+fn publish_session_directory_event(
+    state: &ApiState,
+    event_type: &str,
+    session_id: &SessionId,
+    workspace_id: &WorkspaceId,
+) {
+    let occurred_at = UtcMillis::now();
+    state.event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!("event-{event_type}-{session_id}-{}", occurred_at.0)),
+            event_type,
+            json!({
+                "session_id": session_id.to_string(),
+                "workspace_id": workspace_id.to_string(),
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(session_id.clone()),
+            workspace_id: Some(workspace_id.clone()),
+            ..EventContext::default()
+        }),
+    );
 }
 
 fn cancel_active_session_turn_for_lifecycle(state: &ApiState, session_id: &SessionId) -> bool {
@@ -6541,36 +6624,77 @@ mod tests {
     }
 
     #[test]
-    fn medium_fix_with_validation_stays_structured_task() {
+    fn medium_fix_with_validation_stays_on_direct_execution_path() {
         let state = test_state();
         let request = session_turn_request("修复登录流程问题，完成后运行测试并汇总验证结果");
 
         let decision = decide_session_turn_with_task_planner(&state, &request)
             .expect("medium fix should route locally");
 
-        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
         assert_eq!(decision.task_tier, TaskTier::ExecutionChain);
-        assert!(decision.execution_goal.is_some());
-        assert!(!decision.task_evidence.is_empty());
+        assert!(decision.execution_goal.is_none());
+        assert!(decision.task_evidence.is_empty());
     }
 
     #[test]
-    fn proactive_collaboration_task_exposes_root_evaluation_reason() {
+    fn multi_step_wording_does_not_implicitly_enable_collaboration() {
         let state = test_state();
         let request = session_turn_request("修复登录流程问题，并运行测试验证回归结果");
 
         let decision = decide_session_turn_with_task_planner(&state, &request)
-            .expect("automatic team task should route locally");
+            .expect("multi-step execution should route locally");
 
-        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
+        assert!(decision.task_evidence.is_empty());
         assert_eq!(
-            decision.reason_code.as_deref(),
-            Some("proactive_collaboration_candidate")
+            session_turn_denied_tools(&request),
+            [
+                "agent_spawn",
+                "agent_send",
+                "agent_wait",
+                "get_goal",
+                "create_goal",
+                "update_goal",
+                "update_plan",
+            ]
         );
-        assert_eq!(
-            decision.route_reason.as_deref(),
-            Some("任务具有多个可独立推进的工作面，由 root coordinator 评估是否组队")
-        );
+    }
+
+    #[test]
+    fn complete_workspace_analysis_routes_to_execute_without_collaboration() {
+        for text in [
+            "完整分析当前项目",
+            "完整检查当前仓库",
+            "全面分析 current codebase and verify the result",
+        ] {
+            let request = session_turn_request(text);
+            let decision = normalize_session_turn_decision(
+                local_session_turn_intent_decision(&request, false),
+                &request,
+            );
+
+            assert!(
+                matches!(decision.route, SessionTurnRouteDto::Execute),
+                "工作区检查不应因为复杂度修饰词升级成 Task: {text}"
+            );
+            assert_eq!(
+                decision.reason_code.as_deref(),
+                Some("workspace_inspection_request")
+            );
+            assert_eq!(
+                session_turn_denied_tools(&request),
+                [
+                    "agent_spawn",
+                    "agent_send",
+                    "agent_wait",
+                    "get_goal",
+                    "create_goal",
+                    "update_goal",
+                    "update_plan",
+                ]
+            );
+        }
     }
 
     #[test]
@@ -6610,14 +6734,14 @@ mod tests {
     }
 
     #[test]
-    fn incidental_stage_word_does_not_require_plan() {
+    fn incidental_stage_word_stays_direct_execution_without_plan() {
         let state = test_state();
         let request =
             session_turn_request("修复连续会话第一阶段问题，完成后运行测试并汇总验证结果");
         let decision = decide_session_turn_with_task_planner(&state, &request)
             .expect("structured task should route locally");
 
-        assert!(matches!(decision.route, SessionTurnRouteDto::Task));
+        assert!(matches!(decision.route, SessionTurnRouteDto::Execute));
         assert!(
             !decision
                 .required_tool_chain
@@ -6833,8 +6957,16 @@ mod tests {
         assert_eq!(decision.reason_code.as_deref(), Some("tool_request"));
         assert!(decision.execution_goal.is_none());
         assert_eq!(
-            session_turn_denied_collaboration_tools(&request),
-            ["agent_spawn", "agent_send", "agent_wait"]
+            session_turn_denied_tools(&request),
+            [
+                "agent_spawn",
+                "agent_send",
+                "agent_wait",
+                "get_goal",
+                "create_goal",
+                "update_goal",
+                "update_plan",
+            ]
         );
     }
 
@@ -7191,8 +7323,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_interrupt_clears_all_queued_turns_and_reports_count() {
-        let state = test_state();
+    async fn session_interrupt_starts_next_queued_turn_and_preserves_fifo_tail() {
+        let state = test_state_with_pending_runner();
         let workspace_id = register_workspace(
             &state,
             "workspace-interrupt-queued-turns",
@@ -7207,15 +7339,61 @@ mod tests {
                 Some(workspace_id.to_string()),
             )
             .expect("session should create");
-        for (queue_id, accepted_at) in [("queue-interrupt-a", 101), ("queue-interrupt-b", 102)] {
-            state
-                .enqueue_regular_session_turn(queued_regular_turn(
-                    &session_id,
-                    &workspace_id,
-                    queue_id,
-                    UtcMillis(accepted_at),
-                ))
-                .expect("queued turn should persist");
+        let (first_status, first_body) = post_json(
+            state.clone(),
+            "/session/turn",
+            json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+                "text": "正在处理的消息",
+                "requestId": "request-before-interrupt",
+                "userMessageId": "user-before-interrupt",
+                "placeholderMessageId": "assistant-before-interrupt",
+            }),
+        )
+        .await;
+        assert_eq!(
+            first_status,
+            StatusCode::OK,
+            "unexpected body: {first_body}"
+        );
+        assert_eq!(first_body["queued"], false);
+        let interrupted_root_task_id = first_body["rootTaskId"]
+            .as_str()
+            .expect("active turn should own a root task")
+            .to_string();
+
+        for (request_id, user_message_id, text) in [
+            (
+                "request-queue-interrupt-a",
+                "user-queue-interrupt-a",
+                "停止后第一条发送",
+            ),
+            (
+                "request-queue-interrupt-b",
+                "user-queue-interrupt-b",
+                "停止后第二条继续排队",
+            ),
+        ] {
+            let (queued_status, queued_body) = post_json(
+                state.clone(),
+                "/session/turn",
+                json!({
+                    "workspaceId": workspace_id.as_str(),
+                    "sessionId": session_id.as_str(),
+                    "text": text,
+                    "requestId": request_id,
+                    "userMessageId": user_message_id,
+                    "placeholderMessageId": format!("assistant-{request_id}"),
+                }),
+            )
+            .await;
+            assert_eq!(
+                queued_status,
+                StatusCode::OK,
+                "unexpected body: {queued_body}"
+            );
+            assert_eq!(queued_body["queued"], true);
         }
 
         let (status, body) = post_json(
@@ -7229,8 +7407,48 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
-        assert_eq!(body["clearedQueuedTurnCount"], 2);
-        assert_eq!(state.queued_regular_session_turn_count(&session_id), 0);
+        assert_eq!(body["interrupted"], true);
+        assert_eq!(body["nextQueuedTurnStarted"], true);
+        assert_eq!(body["remainingQueuedTurnCount"], 1);
+        assert_eq!(state.queued_regular_session_turn_count(&session_id), 1);
+        assert_eq!(
+            state
+                .peek_next_regular_session_turn(&session_id)
+                .expect("FIFO tail should remain queued")
+                .request
+                .request_id()
+                .as_deref(),
+            Some("request-queue-interrupt-b")
+        );
+        assert!(
+            state
+                .session_store
+                .canonical_turns_for_session(&session_id)
+                .into_iter()
+                .any(|turn| turn
+                    .items
+                    .iter()
+                    .any(|item| { item.item_id == "user-queue-interrupt-a" })),
+            "停止后必须按 FIFO 启动队首消息"
+        );
+        assert_eq!(
+            state
+                .task_store()
+                .and_then(|store| store.get_task(&TaskId::new(interrupted_root_task_id.clone())))
+                .map(|task| task.status),
+            Some(TaskStatus::Killed),
+            "启动队首消息前必须先终止原执行树"
+        );
+
+        let active_root_task_id = state
+            .session_store
+            .active_execution_chain(&session_id)
+            .expect("queued head should own the new active chain")
+            .root_task_id
+            .to_string();
+        let manager = state.runner_manager().expect("runner manager should exist");
+        manager.quiesce_for_restart(&interrupted_root_task_id).await;
+        manager.quiesce_for_restart(&active_root_task_id).await;
     }
 
     #[tokio::test]
@@ -7282,6 +7500,7 @@ mod tests {
         assert_eq!(payload["queuedTurns"][0]["queueId"], "queue-route-a");
         assert_eq!(payload["queuedTurns"][0]["queuePosition"], 1);
         assert_eq!(payload["queuedTurns"][0]["text"], "queued queue-route-a");
+        assert_eq!(payload["queuedTurns"][0]["canGuide"], true);
 
         let (status, payload) = post_json(
             state.clone(),
@@ -7296,6 +7515,174 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "unexpected body: {payload}");
         assert_eq!(payload["queuedTurns"], json!([]));
         assert_eq!(state.queued_regular_session_turn_count(&session_id), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_plain_text_can_be_guided_once_and_removed_atomically() {
+        let state = test_state();
+        let workspace_id =
+            register_workspace(&state, "workspace-queued-turn-guide", "queued-turn-guide");
+        let session_id = SessionId::new("session-queued-turn-guide");
+        let accepted_at = UtcMillis(1_777_200_000_000);
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "排队消息转引导",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state
+            .session_store
+            .ensure_session_mission(&session_id, accepted_at, || {
+                MissionId::new("mission-queued-turn-guide")
+            });
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-queued-turn-guide".to_string(),
+                    turn_seq: accepted_at.0,
+                    accepted_at,
+                    status: "running".to_string(),
+                    completed_at: None,
+                    user_message: Some("继续执行当前工作".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("active turn should persist");
+        state
+            .conversation_registry
+            .begin_session_turn_input(session_id.clone(), "turn-queued-turn-guide".to_string())
+            .expect("active turn input should begin");
+        let queued = queued_regular_turn(
+            &session_id,
+            &workspace_id,
+            "queue-guide-once",
+            UtcMillis(accepted_at.0 + 1),
+        );
+        state
+            .enqueue_regular_session_turn(queued.clone())
+            .expect("queued turn should persist");
+
+        let guide_request = json!({
+            "workspaceId": workspace_id.as_str(),
+            "sessionId": session_id.as_str(),
+            "queueId": "queue-guide-once",
+        });
+        let (status, body) =
+            post_json(state.clone(), "/session/queue/guide", guide_request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["queuedTurns"], json!([]));
+        let steers = state
+            .conversation_registry
+            .drain_session_turn_steers(&session_id, "turn-queued-turn-guide");
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0].text.as_deref(), Some("queued queue-guide-once"));
+        assert_eq!(
+            steers[0].request_id.as_deref(),
+            Some("request-queue-guide-once")
+        );
+        assert_eq!(
+            steers[0].user_message_id.as_deref(),
+            Some("user-queue-guide-once")
+        );
+
+        // 模拟 canonical 引导已提交、队列持久化删除尚未完成后的恢复重试。
+        state
+            .enqueue_regular_session_turn(queued)
+            .expect("recovery queue should persist");
+        let (retry_status, retry_body) =
+            post_json(state.clone(), "/session/queue/guide", guide_request).await;
+        assert_eq!(
+            retry_status,
+            StatusCode::OK,
+            "unexpected body: {retry_body}"
+        );
+        assert_eq!(retry_body["queuedTurns"], json!([]));
+        assert!(
+            state
+                .conversation_registry
+                .drain_session_turn_steers(&session_id, "turn-queued-turn-guide")
+                .is_empty(),
+            "恢复重试不得重复写入引导信号"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_guide_rejects_structured_message_and_missing_active_turn_without_removal() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-queued-turn-guide-reject",
+            "queued-turn-guide-reject",
+        );
+        let session_id = SessionId::new("session-queued-turn-guide-reject");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "拒绝无效排队引导",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        let mut structured = queued_regular_turn(
+            &session_id,
+            &workspace_id,
+            "queue-guide-structured",
+            UtcMillis(1_777_200_000_100),
+        );
+        structured.request.goal_mode = true;
+        state
+            .enqueue_regular_session_turn(structured)
+            .expect("structured queue should persist");
+
+        let (structured_status, structured_body) = post_json(
+            state.clone(),
+            "/session/queue/guide",
+            json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+                "queueId": "queue-guide-structured",
+            }),
+        )
+        .await;
+        assert_eq!(
+            structured_status,
+            StatusCode::BAD_REQUEST,
+            "unexpected body: {structured_body}"
+        );
+        assert_eq!(state.queued_regular_session_turn_count(&session_id), 1);
+
+        state
+            .remove_regular_session_turn(&session_id, "queue-guide-structured")
+            .expect("structured queue removal should persist");
+        state
+            .enqueue_regular_session_turn(queued_regular_turn(
+                &session_id,
+                &workspace_id,
+                "queue-guide-no-active-turn",
+                UtcMillis(1_777_200_000_101),
+            ))
+            .expect("plain queue should persist");
+        let (inactive_status, inactive_body) = post_json(
+            state.clone(),
+            "/session/queue/guide",
+            json!({
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+                "queueId": "queue-guide-no-active-turn",
+            }),
+        )
+        .await;
+        assert_eq!(
+            inactive_status,
+            StatusCode::CONFLICT,
+            "unexpected body: {inactive_body}"
+        );
+        assert_eq!(inactive_body["conflict_kind"], "no_active_turn");
+        assert_eq!(state.queued_regular_session_turn_count(&session_id), 1);
     }
 
     #[tokio::test]
@@ -7329,13 +7716,14 @@ mod tests {
             .enqueue_regular_session_turn(queued)
             .expect("queued turn should persist");
 
-        assert!(
+        assert_eq!(
             drain_next_queued_regular_session_turn(
                 state.clone(),
                 session_id.clone(),
                 Some(workspace_id),
             )
-            .await
+            .await,
+            QueuedRegularSessionTurnDrainOutcome::RetainedAfterFailure,
         );
 
         let retained = state
@@ -7433,13 +7821,14 @@ mod tests {
             .enqueue_regular_session_turn(matching)
             .expect("matching recovery turn should persist");
 
-        assert!(
+        assert_eq!(
             drain_next_queued_regular_session_turn(
                 state.clone(),
                 session_id.clone(),
                 Some(workspace_id),
             )
-            .await
+            .await,
+            QueuedRegularSessionTurnDrainOutcome::Started,
         );
         assert_eq!(state.queued_regular_session_turn_count(&session_id), 0);
         assert_eq!(
@@ -7536,14 +7925,15 @@ mod tests {
             .session_store
             .update_current_turn_status(&session_id, "completed")
             .expect("current turn should complete");
-        assert!(
+        assert_eq!(
             drain_next_queued_regular_session_turn(
                 state.clone(),
                 session_id.clone(),
                 Some(workspace_id.clone()),
             )
             .await,
-            "terminal current turn should drain one queued turn"
+            QueuedRegularSessionTurnDrainOutcome::Started,
+            "terminal current turn should drain one queued turn",
         );
 
         let drained_turn = state
@@ -7623,9 +8013,10 @@ mod tests {
             .session_store
             .update_current_turn_status(&session_id, "completed")
             .expect("current turn should complete");
-        assert!(
+        assert_eq!(
             drain_next_queued_regular_session_turn(state, session_id, Some(workspace_id),).await,
-            "terminal current turn should drain queued goal turn"
+            QueuedRegularSessionTurnDrainOutcome::Started,
+            "terminal current turn should drain queued goal turn",
         );
 
         let goal_task = task_store
@@ -7933,7 +8324,14 @@ mod tests {
         let policy = task.policy_snapshot.expect("task policy should exist");
         assert_eq!(
             policy.denied_tools,
-            ["agent_spawn", "agent_send", "agent_wait"]
+            [
+                "agent_spawn",
+                "agent_send",
+                "agent_wait",
+                "get_goal",
+                "create_goal",
+                "update_goal",
+            ]
         );
     }
 

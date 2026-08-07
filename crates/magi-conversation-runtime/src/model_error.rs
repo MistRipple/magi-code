@@ -26,8 +26,9 @@ pub(crate) const PUBLIC_MODEL_RESPONSE_INCOMPLETE_MESSAGE: &str = "模型服务�
 pub(crate) const PUBLIC_MODEL_TOOL_CALL_MISSING_MESSAGE: &str =
     "模型声明需要执行工具，但没有返回可执行的工具调用。";
 /// 传输层已经在未收到任何增量时完成自身重试；这里处理的是已经向用户输出过
-/// 片段后缺少终止 SSE 的场景。该场景不能重放同一个请求，只能让模型基于片段续写。
-pub(crate) const MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS: usize = 5;
+/// 片段后缺少终止 SSE 的场景。该场景不能重放同一个请求，只允许有限次数基于片段续写，
+/// 随后降级为一次非流式兜底，避免单个 Turn 无限叠加完整模型请求。
+pub(crate) const MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS: usize = 2;
 /// 上游已经完成连接级重试后，任务运行时只在尚未向用户交付任何内容时额外重试一次。
 /// 这层监督用于覆盖代理网关返回空流等无法在 HTTP 状态码层判断的暂态故障；一旦有
 /// 可见片段，必须走续写恢复，不能重放请求。
@@ -519,7 +520,7 @@ mod tests {
         );
         assert_eq!(MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, 3);
         assert_eq!(MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS, 1);
-        assert_eq!(MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, 5);
+        assert_eq!(MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, 2);
         assert!(model_empty_response_recovery_prompt(false).contains("用户可见答复"));
         assert!(model_empty_response_recovery_prompt(true).contains("工具调用已经完成"));
         assert!(model_stream_interruption_recovery_prompt(true).contains("不要重复"));

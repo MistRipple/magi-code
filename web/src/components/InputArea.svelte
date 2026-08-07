@@ -8,8 +8,8 @@
     getQueuedMessages,
     isPersistedSessionId,
     messagesState,
-    removeQueuedMessage,
   } from '../stores/messages.svelte';
+  import type { QueuedMessage } from '../types/message';
   import { getAgentRunState } from '../stores/agent-run-store.svelte';
   import {
     enhanceAgentPrompt,
@@ -1348,7 +1348,27 @@
     });
   }
 
-  // 修改：取出排队消息内容回填到输入框，并从队列移除；用户重新点击发送后会按当前会话状态再次进入排队。
+  function canGuideQueuedMessage(queued: QueuedMessage): boolean {
+    return queued.canGuide === true;
+  }
+
+  function guideQueuedMessageTitle(queued: QueuedMessage): string {
+    if (queued.canGuide !== true) {
+      return i18n.t('input.queue.guideStructuredUnavailable');
+    }
+    return i18n.t('input.queue.guideTitle');
+  }
+
+  function guideQueuedMessage(queuedMessageId: string) {
+    const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
+    if (!normalizedId) return;
+    vscode.postMessage({
+      type: 'guideQueuedMessage',
+      queuedMessageId: normalizedId,
+    });
+  }
+
+  // 编辑只回填内容；队列移除仍由服务端权威请求完成，失败时原消息会保留并重新同步。
   function editQueuedMessage(queuedMessageId: string) {
     const normalizedId = typeof queuedMessageId === 'string' ? queuedMessageId.trim() : '';
     if (!normalizedId) return;
@@ -1359,7 +1379,6 @@
       type: 'removeQueuedMessage',
       queuedMessageId: normalizedId,
     });
-    removeQueuedMessage(normalizedId);
     invalidateEnhanceState();
     pendingCaretOffset = text.length;
     inputValue = text;
@@ -1827,10 +1846,22 @@
       </div>
       <div class="ia-queue-list">
         {#each queuedMessages as queued (queued.id)}
+          {@const guideAvailable = canGuideQueuedMessage(queued)}
           <div class="ia-queue-item">
             <span class="ia-queue-index" aria-hidden="true"></span>
             <div class="ia-queue-content" title={queued.content}>{queued.content}</div>
             <div class="ia-queue-actions">
+              <button
+                type="button"
+                class="ia-queue-action ia-queue-guide"
+                disabled={!guideAvailable}
+                onclick={() => guideQueuedMessage(queued.id)}
+                title={guideQueuedMessageTitle(queued)}
+                aria-label={guideQueuedMessageTitle(queued)}
+              >
+                <Icon name="corner-down-right" size={12} />
+                <span>{i18n.t('input.queue.guide')}</span>
+              </button>
               <button
                 type="button"
                 class="ia-queue-action"
@@ -3610,17 +3641,8 @@
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    opacity: 0;
-    pointer-events: none;
-    transform: translateX(3px);
-    transition: opacity 120ms ease, transform 120ms ease;
-  }
-
-  .ia-queue-item:hover .ia-queue-actions,
-  .ia-queue-item:focus-within .ia-queue-actions {
     opacity: 1;
     pointer-events: auto;
-    transform: translateX(0);
   }
 
   .ia-queue-action {
@@ -3641,16 +3663,24 @@
     color: var(--primary);
   }
 
-  .ia-queue-action.danger:hover {
-    color: var(--error);
+  .ia-queue-guide {
+    width: auto;
+    gap: 4px;
+    padding: 0 4px;
   }
 
-  @media (hover: none) {
-    .ia-queue-actions {
-      opacity: 1;
-      pointer-events: auto;
-      transform: none;
-    }
+  .ia-queue-action:disabled {
+    color: color-mix(in srgb, var(--foreground-muted) 55%, transparent);
+    cursor: not-allowed;
+    opacity: 0.62;
+  }
+
+  .ia-queue-action:disabled:hover {
+    color: color-mix(in srgb, var(--foreground-muted) 55%, transparent);
+  }
+
+  .ia-queue-action.danger:hover {
+    color: var(--error);
   }
 
   @media (max-width: 640px) {

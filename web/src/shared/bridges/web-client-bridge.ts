@@ -43,6 +43,7 @@ import {
   getAgentProjectKnowledge,
   getAgentNotifications,
   getAgentSessionTurnQueue,
+  guideAgentSessionTurnQueueItem,
   getWorkspaceSessions,
   interruptAgentSession,
   installAgentLocalSkill,
@@ -90,7 +91,6 @@ import { openExternalWebUrl } from '../../lib/external-link';
 import type {
   AgentKnowledgeItemPatch,
   AgentKnowledgeItemPayload,
-  AgentWorkspaceSessionsSnapshot,
 } from '../../web/agent-api';
 import type { ClientBridge, ClientBridgeMessage, SupportedLocale } from './client-bridge';
 import {
@@ -165,6 +165,7 @@ let currentSessionId = '';
 let currentInterruptTaskId = '';
 let continueRequestId = '';
 let currentRuntimeEpoch = '';
+const guidingQueuedMessageIds = new Set<string>();
 let cachedSettingsBootstrap: SettingsBootstrapPayload | null = null;
 let cachedSettingsBootstrapScope: 'none' | 'core' | 'full' = 'none';
 let cachedSettingsBootstrapBindingKey = '';
@@ -209,6 +210,9 @@ let eventStreamSnapshotRefreshBindingKey = '';
 let eventStreamTunnelSyncInFlight: Promise<void> | null = null;
 let eventStreamTunnelSyncBindingKey = '';
 let initialWindowBindingHydrated = false;
+// 新会话草稿是明确的工作区级绑定状态，不能与“启动时尚未解析会话”混为一谈。
+// 恢复链路据此只重建工作区事件流和会话目录，禁止 bootstrap 自动选回旧会话。
+let workspaceDraftActive = false;
 let workspaceSessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let terminalTaskRuntimeRefreshTimer: number | null = null;
 const inFlightChangeMutationScopes = new Set<string>();
@@ -251,6 +255,8 @@ const EXTERNAL_SESSION_SUMMARY_EVENTS = new Set([
   'session.turn.failed',
   'session.turn.interrupted',
   'session.title.updated',
+  'session.deleted',
+  'session.closed',
   'session.viewed',
   'message.created',
 ]);
@@ -860,12 +866,14 @@ function syncTunnelRuntimeForSilentEventStream(reason: string, error: Error): vo
     if (bootstrapBindingKey(resolveWorkspaceQuery()) !== syncBindingKey) {
       return;
     }
-    emitDataMessage('sessionsUpdated', {
-      workspaceId: binding.workspaceId,
-      sessions: snapshot.sessions,
-    });
     const currentSession = snapshot.sessions.find((session) => session.id === binding.sessionId);
     if (currentSession?.isRunning !== false) {
+      emitDataMessage('sessionsUpdated', {
+        workspaceId: binding.workspaceId,
+        sessions: snapshot.sessions,
+        runtimeEpoch: snapshot.runtimeEpoch,
+        eventStreamNextSequence: snapshot.eventStreamNextSequence,
+      });
       return;
     }
     emitForcedProcessingIdle('event_stream_tunnel_terminal_summary', {
@@ -875,7 +883,7 @@ function syncTunnelRuntimeForSilentEventStream(reason: string, error: Error): vo
       forceFresh: true,
       forceEventStreamReconnect: false,
       refreshSettingsBootstrapOnBindingChange: false,
-      workspaceSessionSnapshot: snapshot,
+      refreshWorkspaceSessionsAfterBootstrap: false,
     });
   })().catch((syncError) => {
     scheduleRecovery(reason, syncError || error, true);
@@ -1041,6 +1049,7 @@ function emitMessage(message: ClientBridgeMessage): void {
        previous: currentRuntimeEpoch,
        current: incomingEpoch,
      });
+     resetEventStreamCursor();
      currentRuntimeEpoch = incomingEpoch;
      closeEventStream();
      scheduleRecovery('runtime_epoch_changed', undefined, true);
@@ -1473,6 +1482,8 @@ function scheduleWorkspaceSessionSummaryRefresh(reason: string): void {
       emitDataMessage('sessionsUpdated', {
         workspaceId: binding.workspaceId,
         sessions: snapshot.sessions,
+        runtimeEpoch: snapshot.runtimeEpoch,
+        eventStreamNextSequence: snapshot.eventStreamNextSequence,
       });
     }).catch((error) => {
       reportExpectedRecoveryFailure(
@@ -1840,6 +1851,10 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       emitDataMessage('sessionTurnAccepted', {
         sessionId: acceptedSessionId,
         workspaceId: acceptedWorkspaceId,
+        runtimeEpoch: currentRuntimeEpoch,
+        eventStreamNextSequence: typeof event.sequence === 'number' && Number.isFinite(event.sequence)
+          ? Math.max(1, Math.floor(event.sequence) + 1)
+          : 0,
         createdSession: acceptedCreatedSession,
         route: event.payload.route ?? 'task',
       });
@@ -2262,16 +2277,25 @@ function eventStreamScopeKey(): string {
   return query.toString();
 }
 
-function updateEventStreamCursorFromBootstrap(payload: BootstrapPayload): void {
-  const nextSequence = typeof payload.eventStreamNextSequence === 'number' && Number.isFinite(payload.eventStreamNextSequence)
-    ? Math.floor(payload.eventStreamNextSequence)
+function resetEventStreamCursor(): void {
+  eventStreamCursorScopeKey = '';
+  eventStreamAfterSequence = 0;
+}
+
+function updateEventStreamCursorFromSnapshot(eventStreamNextSequence: unknown): void {
+  const nextSequence = typeof eventStreamNextSequence === 'number' && Number.isFinite(eventStreamNextSequence)
+    ? Math.floor(eventStreamNextSequence)
     : 0;
   if (nextSequence <= 1) {
-    eventStreamCursorScopeKey = '';
-    eventStreamAfterSequence = 0;
+    resetEventStreamCursor();
     return;
   }
-  eventStreamCursorScopeKey = eventStreamScopeKey();
+  const scopeKey = eventStreamScopeKey();
+  if (eventStreamCursorScopeKey === scopeKey) {
+    eventStreamAfterSequence = Math.max(eventStreamAfterSequence, nextSequence - 1);
+    return;
+  }
+  eventStreamCursorScopeKey = scopeKey;
   eventStreamAfterSequence = nextSequence - 1;
 }
 
@@ -2410,6 +2434,9 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = incomingSessionId;
+  if (incomingSessionId) {
+    workspaceDraftActive = false;
+  }
   if (
     previousWorkspaceId !== normalizedWorkspaceId
     || previousWorkspacePath !== normalizedWorkspacePath
@@ -2509,7 +2536,11 @@ function dispatchWorkspaceSessionDetached(
 ): void {
   const normalizedWorkspaceId = workspaceId.trim();
   const normalizedWorkspacePath = workspacePath.trim();
-  closeEventStream();
+  workspaceDraftActive = dataType === 'workspaceDraftStarted';
+  // 进入草稿是一次正式绑定切换，必须让此前的 session bootstrap 失效。
+  // 事件流本身按 workspace 订阅；同工作区继续复用，跨工作区由 ensureEventStream
+  // 统一重连，不能先关闭后留下一个等待焦点恢复的断流状态。
+  invalidateBootstrapRequests();
   const settingsBindingChanged = clearWorkspaceSessionBinding(normalizedWorkspaceId, normalizedWorkspacePath);
   emitDataMessage(dataType, {
     workspaceId: normalizedWorkspaceId,
@@ -2519,6 +2550,9 @@ function dispatchWorkspaceSessionDetached(
   if (settingsBindingChanged) {
     refreshSettingsBootstrapForCurrentWorkspace('workspace_session_cleared');
   }
+  void ensureEventStream().catch((error) => {
+    scheduleRecovery('workspace_session_detached_event_stream', error, true);
+  });
 }
 
 function currentBoundSettingsBootstrap(): SettingsBootstrapPayload | null {
@@ -2580,6 +2614,7 @@ async function startWorkspaceSessionDraft(workspaceId: string, workspacePath: st
 }
 
 function clearPersistedWorkspaceBinding(): void {
+  workspaceDraftActive = false;
   clearSettingsBootstrapCache();
   currentWorkspaceId = '';
   currentWorkspacePath = '';
@@ -2645,33 +2680,9 @@ function normalizeBootstrapResponse(
   });
 }
 
-function applyWorkspaceSessionSnapshotToBootstrap(
-  payload: BootstrapPayload,
-  snapshot: AgentWorkspaceSessionsSnapshot,
-): BootstrapPayload {
-  if (snapshot.workspace.workspaceId !== payload.workspace.workspaceId) {
-    throw new Error('会话列表快照与 bootstrap 工作区不一致');
-  }
-  const currentSession = payload.sessionId
-    ? snapshot.sessions.find((session) => session.id === payload.sessionId)
-    : undefined;
-  if (payload.sessionId && !currentSession) {
-    throw new Error(`bootstrap 当前会话不在工作区会话列表中: ${payload.sessionId}`);
-  }
-  return {
-    ...payload,
-    sessions: snapshot.sessions,
-    state: {
-      ...payload.state,
-      sessions: snapshot.sessions,
-      currentSession,
-      currentSessionId: payload.sessionId,
-    },
-  };
-}
-
 async function restoreBridgeState(reason: string, force = false): Promise<void> {
-  const recoveryBindingKey = bootstrapBindingKey(resolveWorkspaceQuery());
+  const recoveryBinding = resolveWorkspaceQuery();
+  const recoveryBindingKey = bootstrapBindingKey(recoveryBinding);
   if (recoveryInFlight && !force && recoveryInFlightBindingKey === recoveryBindingKey) {
     return recoveryInFlight;
   }
@@ -2685,10 +2696,14 @@ async function restoreBridgeState(reason: string, force = false): Promise<void> 
     if (force) {
       clearSettingsBootstrapCache();
     }
-    await fetchBootstrap({
-      forceEventStreamReconnect: true,
-      refreshSettingsBootstrapOnBindingChange: false,
-    });
+    if (workspaceDraftActive && !recoveryBinding.sessionId && recoveryBinding.workspaceId) {
+      await restoreWorkspaceDraftState(recoveryBinding, recoveryBindingKey);
+    } else {
+      await fetchBootstrap({
+        forceEventStreamReconnect: true,
+        refreshSettingsBootstrapOnBindingChange: false,
+      });
+    }
     clearRecoveryTimer();
     recoveryAttempt = 0;
     emitConnectedState(reason, recovered);
@@ -2707,6 +2722,36 @@ async function restoreBridgeState(reason: string, force = false): Promise<void> 
   });
   recoveryInFlight = request;
   return request;
+}
+
+async function restoreWorkspaceDraftState(
+  binding: { workspaceId: string; workspacePath: string; sessionId: string },
+  bindingKey: string,
+): Promise<void> {
+  const snapshot = await getWorkspaceSessions(
+    binding.workspaceId,
+    '',
+    binding.workspacePath,
+  );
+  if (!workspaceDraftActive || bootstrapBindingKey(resolveWorkspaceQuery()) !== bindingKey) {
+    return;
+  }
+  const snapshotRuntimeEpoch = snapshot.runtimeEpoch.trim();
+  if (snapshotRuntimeEpoch && currentRuntimeEpoch && snapshotRuntimeEpoch !== currentRuntimeEpoch) {
+    resetEventStreamCursor();
+  }
+  if (snapshotRuntimeEpoch) {
+    currentRuntimeEpoch = snapshotRuntimeEpoch;
+  }
+  updateEventStreamCursorFromSnapshot(snapshot.eventStreamNextSequence);
+  emitDataMessage('sessionsUpdated', {
+    workspaceId: binding.workspaceId,
+    sessions: snapshot.sessions,
+    runtimeEpoch: snapshot.runtimeEpoch,
+    eventStreamNextSequence: snapshot.eventStreamNextSequence,
+    allowRuntimeEpochChange: true,
+  });
+  await ensureEventStream({ forceReconnect: true, waitUntilOpen: true });
 }
 
 function scheduleRecovery(reason: string, error?: unknown, immediate = false): void {
@@ -2857,6 +2902,7 @@ async function dispatchBootstrap(
       previous: currentRuntimeEpoch,
       current: incomingEpoch,
     });
+    resetEventStreamCursor();
   }
   if (incomingEpoch) {
     currentRuntimeEpoch = incomingEpoch;
@@ -2866,7 +2912,7 @@ async function dispatchBootstrap(
     payload.workspace.rootPath,
     payload.sessionId,
   );
-  updateEventStreamCursorFromBootstrap(payload);
+  updateEventStreamCursorFromSnapshot(payload.eventStreamNextSequence);
   activateAgentRunSession(payload.sessionId, payload.workspace.workspaceId, payload.workspace.rootPath);
   const agentRunTrackingHints = extractBootstrapAgentRunTrackingHints(payload, options.rawPayload);
   if (previousSessionId && payload.sessionId && previousSessionId !== payload.sessionId) {
@@ -2930,7 +2976,7 @@ async function fetchBootstrap(
     forceEventStreamReconnect?: boolean;
     forceFresh?: boolean;
     refreshSettingsBootstrapOnBindingChange?: boolean;
-    workspaceSessionSnapshot?: AgentWorkspaceSessionsSnapshot;
+    refreshWorkspaceSessionsAfterBootstrap?: boolean;
   } = {},
 ): Promise<void> {
   const requestBinding = resolveWorkspaceQuery();
@@ -2978,6 +3024,8 @@ async function fetchBootstrap(
               emitDataMessage('sessionsUpdated', {
                 workspaceId: effectiveBinding.workspaceId,
                 sessions: snapshot.sessions,
+                runtimeEpoch: snapshot.runtimeEpoch,
+                eventStreamNextSequence: snapshot.eventStreamNextSequence,
               });
             }
           } catch (error) {
@@ -3011,15 +3059,12 @@ async function fetchBootstrap(
     if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
       return;
     }
-    if (options.workspaceSessionSnapshot) {
-      payload = applyWorkspaceSessionSnapshotToBootstrap(payload, options.workspaceSessionSnapshot);
-    }
     await dispatchBootstrap(payload, {
       forceEventStreamReconnect: options.forceEventStreamReconnect,
       refreshSettingsBootstrapOnBindingChange: options.refreshSettingsBootstrapOnBindingChange,
       rawPayload,
     });
-    if (!options.workspaceSessionSnapshot) {
+    if (options.refreshWorkspaceSessionsAfterBootstrap !== false) {
       void refreshWorkspaceSessionsAfterBootstrap(payload, requestBindingKey, requestSeq);
     }
   };
@@ -3066,6 +3111,8 @@ async function refreshWorkspaceSessionsAfterBootstrap(
     emitDataMessage('sessionsUpdated', {
       workspaceId: payload.workspace.workspaceId,
       sessions: snapshot.sessions,
+      runtimeEpoch: snapshot.runtimeEpoch,
+      eventStreamNextSequence: snapshot.eventStreamNextSequence,
     });
   } catch (error) {
     console.warn('[web-client-bridge] bootstrap 后刷新会话摘要失败:', error);
@@ -3437,6 +3484,7 @@ function queuedMessageFromServer(turn: QueuedSessionTurnDto): QueuedMessage {
     images: turn.images,
     contextReferences: turn.contextReferences,
     browserAnnotationRefs: turn.browserAnnotationRefs,
+    canGuide: turn.canGuide,
   };
 }
 
@@ -3484,6 +3532,35 @@ async function removeQueuedMessageFromServer(queuedMessageId: string): Promise<v
   } catch (error) {
     emitBridgeErrorToast(i18n.t('input.queue.delete'), error);
     await syncSessionTurnQueue().catch(() => {});
+  }
+}
+
+async function guideQueuedMessageFromServer(queuedMessageId: string): Promise<void> {
+  const normalizedId = queuedMessageId.trim();
+  if (!normalizedId || !currentSessionId || guidingQueuedMessageIds.has(normalizedId)) return;
+  guidingQueuedMessageIds.add(normalizedId);
+  try {
+    const snapshot = await guideAgentSessionTurnQueueItem(
+      currentSessionId,
+      normalizedId,
+      {
+        workspaceId: currentWorkspaceId,
+        workspacePath: currentWorkspacePath,
+        sessionId: currentSessionId,
+      },
+    );
+    if (snapshot.sessionId === currentSessionId) {
+      applyServerQueuedTurns(snapshot.queuedTurns);
+      emitBridgeSuccessToast(
+        i18n.t('input.queue.guide'),
+        i18n.t('input.queue.guideSuccess'),
+      );
+    }
+  } catch (error) {
+    emitBridgeErrorToast(i18n.t('input.queue.guide'), error);
+    await syncSessionTurnQueue().catch(() => {});
+  } finally {
+    guidingQueuedMessageIds.delete(normalizedId);
   }
 }
 
@@ -3650,6 +3727,16 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       adoptAcceptedSessionIdForLocalTurn(optimisticSessionId, resolvedSessionId);
     }
     if (resolvedSessionId) {
+      emitDataMessage('sessionTurnAccepted', {
+        sessionId: resolvedSessionId,
+        workspaceId: targetWorkspaceId,
+        runtimeEpoch: turnResult.runtimeEpoch,
+        eventStreamNextSequence: turnResult.eventStreamNextSequence,
+        createdSession: turnResult.createdSession,
+        route: turnResult.route,
+      });
+    }
+    if (resolvedSessionId) {
       persistWorkspaceBinding(targetWorkspaceId, targetWorkspacePath, resolvedSessionId);
     }
     if (turnResult.queued) {
@@ -3756,14 +3843,20 @@ async function interruptTask(): Promise<void> {
   }
   try {
     const response = await interruptAgentSession(sessionId);
-    const clearedQueuedTurnCount = typeof response.clearedQueuedTurnCount === 'number'
-      ? response.clearedQueuedTurnCount
-      : 0;
-    if (clearedQueuedTurnCount > 0 || messagesState.queuedMessages.length > 0) {
-      setQueuedMessages([]);
+    try {
+      await syncSessionTurnQueue(sessionId, currentWorkspaceId, currentWorkspacePath);
+    } catch (queueSyncError) {
+      reportExpectedRecoveryFailure(
+        i18n.t('bridge.action.syncMessages'),
+        '[web-client-bridge] 停止会话后同步排队消息失败:',
+        queueSyncError,
+      );
+      scheduleRecovery('user_interrupt_queue_sync_failed', queueSyncError, true);
     }
     clearActiveTurnInFlight();
-    emitForcedProcessingIdle('user_interrupt_confirmed', { trigger, sessionId });
+    if (response.nextQueuedTurnStarted !== true) {
+      emitForcedProcessingIdle('user_interrupt_confirmed', { trigger, sessionId });
+    }
   } catch (error) {
     console.error('[web-client-bridge] 中断执行失败:', error);
     emitBridgeErrorToast(i18n.t('bridge.action.stopTask'), error);
@@ -4838,6 +4931,11 @@ export function createWebClientBridge(): ClientBridge {
         case 'removeQueuedMessage':
           if (typeof message.queuedMessageId === 'string') {
             void removeQueuedMessageFromServer(message.queuedMessageId);
+          }
+          return;
+        case 'guideQueuedMessage':
+          if (typeof message.queuedMessageId === 'string') {
+            void guideQueuedMessageFromServer(message.queuedMessageId);
           }
           return;
         case 'interruptTask':

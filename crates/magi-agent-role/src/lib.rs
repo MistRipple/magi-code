@@ -560,6 +560,28 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_routes_web_tasks_to_browser_capable_workers() {
+        let registry = AgentRoleRegistry::from_map(builtin_roles_map());
+        let coordinator = registry
+            .get("coordinator")
+            .expect("coordinator role exists");
+
+        for expected in [
+            "Web 网站",
+            "`frontend`",
+            "`quality_engineering`",
+            "`browser_*`",
+            "真实页面操作",
+        ] {
+            assert!(
+                coordinator.system_prompt.contains(expected),
+                "coordinator 缺少 Web Worker 路由契约 {expected}: {}",
+                coordinator.system_prompt
+            );
+        }
+    }
+
+    #[test]
     fn architect_supports_local_agent() {
         let reg = AgentRoleRegistry::from_map(builtin_roles_map());
         let role = reg.get("architect").expect("architect role exists");

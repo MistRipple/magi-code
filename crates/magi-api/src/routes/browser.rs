@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json, Router,
@@ -42,6 +45,8 @@ const MAX_BROWSER_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
 const BROWSER_SCREENCAST_JPEG_QUALITY: u8 = 90;
 const BROWSER_SCREENCAST_MAX_WIDTH: u32 = 7_680;
 const BROWSER_SCREENCAST_MAX_HEIGHT: u32 = 4_320;
+const BROWSER_READY_WAIT_TIMEOUT: Duration = Duration::from_secs(65);
+const BROWSER_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -253,7 +258,10 @@ pub(crate) fn resolve_browser_annotation_context(
                 "浏览器标记不属于当前会话: {id}"
             )));
         }
-        if annotation.status != BrowserAnnotationStatus::Active {
+        if matches!(
+            annotation.status,
+            BrowserAnnotationStatus::Resolved | BrowserAnnotationStatus::Deleted
+        ) {
             return Err(ApiError::Conflict(format!(
                 "浏览器标记已失效，不能作为本轮上下文: {id}"
             )));
@@ -416,6 +424,12 @@ struct CreateBrowserSessionRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CurrentBrowserSessionQuery {
     workspace_id: String,
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AnnotationArtifactQuery {
     session_id: String,
 }
 
@@ -656,19 +670,37 @@ async fn create_session(
         request.workspace_id.trim(),
         request.session_id.trim(),
     )?;
-    ensure_browser_ui_ready(&state, &session_id)?;
-    let existing = {
-        let authority = state
-            .browser_authority
-            .lock()
-            .expect("browser authority lock poisoned");
-        authority.session_for_magi_session(&session_id).cloned()
-    };
+    wait_for_browser_ui_ready(&state, &session_id).await?;
+    let existing = wait_for_magi_browser_session(&state, &session_id).await?;
     if let Some(existing) = existing {
-        return Ok((
-            StatusCode::OK,
-            Json(browser_session_response(&state, existing)?),
-        ));
+        if existing.lifecycle != BrowserSessionLifecycle::Failed {
+            return Ok((
+                StatusCode::OK,
+                Json(browser_session_response(&state, existing)?),
+            ));
+        }
+
+        // 失败会话不能复用：其 Tab 已经没有对应的 Browser Host 页面。
+        // 先关闭失效的权威边界，再为用户下一次浏览器操作创建新会话。
+        let closed = state.mutate_browser_authority(|authority| {
+            authority.transition_session(
+                &existing.browser_session_id,
+                BrowserSessionLifecycle::Closed,
+                UtcMillis::now(),
+            )
+        })?;
+        publish_browser_event(
+            &state,
+            "browser.session.closed",
+            &closed.workspace_id,
+            &closed.session_id,
+            serde_json::json!({
+                "browser_session_id": closed.browser_session_id,
+                "lifecycle": closed.lifecycle,
+                "reason": "failed_session_replaced",
+                "revision": closed.revision,
+            }),
+        );
     }
     let now = UtcMillis::now();
     let browser_session_id = BrowserSessionId::new(format!(
@@ -795,9 +827,7 @@ async fn close_session(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateBrowserTabRequest {
-    #[serde(default = "default_browser_url")]
     initial_url: String,
-    #[serde(default)]
     viewport: BrowserViewport,
 }
 
@@ -811,17 +841,16 @@ enum SetBrowserViewportRequest {
     Sync {
         width: u32,
         height: u32,
-        #[serde(default)]
-        controller_id: Option<String>,
-        #[serde(default)]
+        controller_id: String,
         claim: bool,
     },
     Set {
         mode: BrowserViewportMode,
         width: u32,
         height: u32,
-        #[serde(default)]
-        device_type: Option<magi_browser_runtime::BrowserDeviceType>,
+        surface_width: u32,
+        surface_height: u32,
+        device_type: magi_browser_runtime::BrowserDeviceType,
         #[serde(default)]
         controller_id: Option<String>,
     },
@@ -864,10 +893,6 @@ struct UpdateBrowserAnnotationCommentRequest {
     comment: String,
 }
 
-fn default_browser_url() -> String {
-    "about:blank".to_string()
-}
-
 async fn create_tab(
     State(state): State<ApiState>,
     Path(browser_session_id): Path<String>,
@@ -881,7 +906,8 @@ async fn create_tab(
         .session(&browser_session_id)
         .cloned()
         .ok_or_else(|| ApiError::not_found("浏览器会话不存在", browser_session_id.as_str()))?;
-    ensure_browser_ui_ready(&state, &session.session_id)?;
+    wait_for_browser_ui_ready(&state, &session.session_id).await?;
+    let session = wait_for_browser_session_ready(&state, &browser_session_id).await?;
     validate_navigation_url(&request.initial_url)?;
     let client = state
         .browser_host_client()
@@ -908,6 +934,8 @@ async fn create_tab(
             viewport: magi_browser_runtime::HostViewport {
                 width: request.viewport.width,
                 height: request.viewport.height,
+                surface_width: request.viewport.width,
+                surface_height: request.viewport.height,
                 device_scale_factor_millis: request.viewport.device_scale_factor_millis,
                 device_type: request.viewport.device_type,
             },
@@ -991,7 +1019,7 @@ async fn create_annotation(
     Json(request): Json<CreateBrowserAnnotationRequest>,
 ) -> Result<(StatusCode, Json<BrowserAnnotationResponse>), ApiError> {
     let tab_id = BrowserTabId::new(tab_id);
-    let (tab, session) = browser_tab_scope(&state, &tab_id)?;
+    let (_tab_before_lock, session) = browser_tab_scope(&state, &tab_id)?;
     let comment = request.comment.trim().to_string();
     if comment.is_empty() || comment.chars().count() > 4_000 {
         return Err(ApiError::InvalidInput(
@@ -1000,6 +1028,9 @@ async fn create_annotation(
     }
     let _control_guard = state.browser_control_lock.lock().await;
     ensure_user_control_for_ui_locked(&state, &session).await?;
+    // Re-read the authoritative tab after acquiring the control lock. A panel
+    // resize or navigation may have completed while the request was waiting.
+    let (tab, session) = browser_tab_scope(&state, &tab_id)?;
     let (kind, navigation_revision, hit_x, hit_y, region) = match request.selection {
         BrowserAnnotationSelectionRequest::Element {
             navigation_revision,
@@ -1010,8 +1041,8 @@ async fn create_annotation(
             (
                 BrowserAnnotationKind::Element,
                 navigation_revision,
-                x * f64::from(tab.viewport.width),
-                y * f64::from(tab.viewport.height),
+                x,
+                y,
                 None,
             )
         }
@@ -1020,8 +1051,8 @@ async fn create_annotation(
             rect,
         } => {
             validate_annotation_rect(rect)?;
-            let x = (rect.x + rect.width / 2.0) * f64::from(tab.viewport.width);
-            let y = (rect.y + rect.height / 2.0) * f64::from(tab.viewport.height);
+            let x = rect.x + rect.width / 2.0;
+            let y = rect.y + rect.height / 2.0;
             (
                 BrowserAnnotationKind::Region,
                 navigation_revision,
@@ -1064,7 +1095,11 @@ async fn create_annotation(
             css_path: hit.css_path,
             ancestor_fingerprint: hit.ancestor_fingerprint,
             dom_fingerprint: hit.dom_fingerprint,
-            bounding_box: normalize_hit_bounds(&tab, hit.bounds)?,
+            bounding_box: normalize_hit_bounds(
+                hit.viewport_width,
+                hit.viewport_height,
+                hit.bounds,
+            )?,
             snapshot_revision: tab.snapshot_revision,
         })),
     };
@@ -1238,11 +1273,12 @@ fn validate_annotation_rect(rect: BrowserNormalizedRect) -> Result<(), ApiError>
 }
 
 fn normalize_hit_bounds(
-    tab: &BrowserTab,
+    viewport_width: u32,
+    viewport_height: u32,
     bounds: BrowserHostRect,
 ) -> Result<BrowserNormalizedRect, ApiError> {
-    let width = f64::from(tab.viewport.width);
-    let height = f64::from(tab.viewport.height);
+    let width = f64::from(viewport_width);
+    let height = f64::from(viewport_height);
     if width <= 0.0
         || height <= 0.0
         || !bounds.x.is_finite()
@@ -1343,8 +1379,10 @@ async fn update_annotation_comment(
 async fn annotation_artifact(
     State(state): State<ApiState>,
     Path(annotation_id): Path<String>,
+    Query(query): Query<AnnotationArtifactQuery>,
 ) -> Result<Response, ApiError> {
     let annotation_id = BrowserAnnotationId::new(annotation_id);
+    let session_id = SessionId::new(query.session_id.trim());
     let artifact_id = {
         let authority = state
             .browser_authority
@@ -1353,6 +1391,17 @@ async fn annotation_artifact(
         let annotation = authority
             .annotation(&annotation_id)
             .ok_or_else(|| ApiError::not_found("浏览器标记不存在", annotation_id.as_str()))?;
+        let browser_session = authority
+            .session_for_magi_session(&session_id)
+            .ok_or_else(|| ApiError::not_found("浏览器会话不存在", session_id.as_str()))?;
+        if annotation.browser_session_id != browser_session.browser_session_id
+            || !browser_session
+                .tab_ids
+                .iter()
+                .any(|tab_id| tab_id == &annotation.tab_id)
+        {
+            return Err(ApiError::NotFound("浏览器标记不存在".to_string()));
+        }
         annotation
             .screenshot_artifact_id
             .clone()
@@ -1416,39 +1465,55 @@ async fn set_viewport(
     Path(tab_id): Path<String>,
     Json(request): Json<SetBrowserViewportRequest>,
 ) -> Result<Json<BrowserTabResponse>, ApiError> {
-    let (width, height, requested_mode, requested_device_type, panel_sync, controller_id, claim) =
-        match request {
-            SetBrowserViewportRequest::Sync {
-                width,
-                height,
-                controller_id,
-                claim,
-            } => (
-                width,
-                height,
-                BrowserViewportMode::Auto,
-                None,
-                true,
-                controller_id,
-                claim,
-            ),
-            SetBrowserViewportRequest::Set {
-                mode,
-                width,
-                height,
-                device_type,
-                controller_id,
-            } => (
-                width,
-                height,
-                mode,
-                device_type,
-                false,
-                controller_id,
-                false,
-            ),
-        };
+    let (
+        width,
+        height,
+        surface_width,
+        surface_height,
+        requested_mode,
+        requested_device_type,
+        panel_sync,
+        controller_id,
+        claim,
+    ) = match request {
+        SetBrowserViewportRequest::Sync {
+            width,
+            height,
+            controller_id,
+            claim,
+        } => (
+            width,
+            height,
+            width,
+            height,
+            BrowserViewportMode::Auto,
+            None,
+            true,
+            Some(controller_id),
+            claim,
+        ),
+        SetBrowserViewportRequest::Set {
+            mode,
+            width,
+            height,
+            surface_width,
+            surface_height,
+            device_type,
+            controller_id,
+        } => (
+            width,
+            height,
+            surface_width,
+            surface_height,
+            mode,
+            Some(device_type),
+            false,
+            controller_id,
+            false,
+        ),
+    };
     validate_viewport_dimensions(width, height)?;
+    validate_viewport_dimensions(surface_width, surface_height)?;
     let device_type = magi_browser_runtime::BrowserDeviceType::for_dimensions(width);
     if requested_device_type.is_some_and(|requested| requested != device_type) {
         return Err(ApiError::InvalidInput(
@@ -1459,24 +1524,37 @@ async fn set_viewport(
     let _control_guard = state.browser_control_lock.lock().await;
     let (tab, session) = browser_tab_scope(&state, &tab_id)?;
     ensure_browser_ui_ready(&state, &session.session_id)?;
-    if panel_sync && tab.viewport_mode != BrowserViewportMode::Auto {
-        return Ok(Json(tab.into()));
-    }
     if panel_sync {
-        let Some(controller_id) = normalize_viewport_controller_id(controller_id.as_deref())?
-        else {
-            // 旧页面没有控制器身份，不能继续覆盖当前权威视口。
-            return Ok(Json(tab.into()));
-        };
+        let controller_id = normalize_viewport_controller_id(controller_id.as_deref())?
+            .ok_or_else(|| ApiError::InvalidInput("浏览器视口控制器标识不能为空".to_string()))?;
         if !state.accept_browser_viewport_controller(&tab_id, controller_id, claim) {
             return Ok(Json(tab.into()));
         }
     } else if requested_mode == BrowserViewportMode::Auto {
-        if let Some(controller_id) = normalize_viewport_controller_id(controller_id.as_deref())? {
-            state.accept_browser_viewport_controller(&tab_id, controller_id, true);
-        }
+        let controller_id = normalize_viewport_controller_id(controller_id.as_deref())?
+            .ok_or_else(|| ApiError::InvalidInput("自动视口必须提供控制器标识".to_string()))?;
+        state.accept_browser_viewport_controller(&tab_id, controller_id, true);
     } else {
         state.clear_browser_viewport_controller(&tab_id);
+    }
+    if panel_sync && tab.viewport_mode == BrowserViewportMode::Fixed {
+        require_host_success(
+            require_browser_host(&state)?
+                .request(BrowserHostCommand::SetViewport {
+                    tab_id: tab_id.clone(),
+                    viewport: magi_browser_runtime::HostViewport {
+                        width: tab.viewport.width,
+                        height: tab.viewport.height,
+                        surface_width,
+                        surface_height,
+                        device_scale_factor_millis: tab.viewport.device_scale_factor_millis,
+                        device_type: tab.viewport.device_type,
+                    },
+                })
+                .await,
+            "调整浏览器显示表面失败",
+        )?;
+        return Ok(Json(tab.into()));
     }
     let viewport = BrowserViewport {
         width,
@@ -1484,24 +1562,24 @@ async fn set_viewport(
         device_scale_factor_millis: tab.viewport.device_scale_factor_millis,
         device_type,
     };
+    require_host_success(
+        require_browser_host(&state)?
+            .request(BrowserHostCommand::SetViewport {
+                tab_id: tab_id.clone(),
+                viewport: magi_browser_runtime::HostViewport {
+                    width: viewport.width,
+                    height: viewport.height,
+                    surface_width,
+                    surface_height,
+                    device_scale_factor_millis: viewport.device_scale_factor_millis,
+                    device_type: viewport.device_type,
+                },
+            })
+            .await,
+        "调整浏览器页面视口失败",
+    )?;
     if tab.viewport == viewport && tab.viewport_mode == requested_mode {
         return Ok(Json(tab.into()));
-    }
-    if tab.viewport != viewport {
-        require_host_success(
-            require_browser_host(&state)?
-                .request(BrowserHostCommand::SetViewport {
-                    tab_id: tab_id.clone(),
-                    viewport: magi_browser_runtime::HostViewport {
-                        width: viewport.width,
-                        height: viewport.height,
-                        device_scale_factor_millis: viewport.device_scale_factor_millis,
-                        device_type: viewport.device_type,
-                    },
-                })
-                .await,
-            "调整浏览器页面视口失败",
-        )?;
     }
     let updated = state.mutate_browser_authority(|authority| {
         authority.set_tab_viewport(&tab_id, viewport, requested_mode, UtcMillis::now())
@@ -1863,6 +1941,8 @@ async fn run_browser_channel(socket: WebSocket, state: ApiState, tab_id: Browser
                     "mimeType": frame.mime_type,
                     "width": frame.width,
                     "height": frame.height,
+                    "surfaceWidth": frame.surface_width,
+                    "surfaceHeight": frame.surface_height,
                     "deviceScaleFactorMillis": frame.device_scale_factor_millis,
                 });
                 if sink.send(Message::Text(metadata.to_string().into())).await.is_err()
@@ -2039,6 +2119,102 @@ fn ensure_browser_ui_ready(state: &ApiState, session_id: &SessionId) -> Result<(
         return Err(ApiError::Conflict("浏览器运行组件尚未就绪".to_string()));
     }
     Ok(())
+}
+
+async fn wait_for_browser_ui_ready(
+    state: &ApiState,
+    session_id: &SessionId,
+) -> Result<(), ApiError> {
+    let deadline = Instant::now() + BROWSER_READY_WAIT_TIMEOUT;
+    loop {
+        match ensure_browser_ui_ready(state, session_id) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let runtime = state.browser_runtime_status();
+                // 未安装、无效或明确禁用的运行组件不会因等待而就绪，立即返回权威错误；
+                // 只有已安装且 Host 正在启动或恢复页面时才继续等待。
+                if !runtime.component_status.is_usable()
+                    || runtime.host_status == "failed"
+                    || !runtime.in_app_browser_enabled
+                {
+                    return Err(error);
+                }
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+                tokio::time::sleep(BROWSER_READY_POLL_INTERVAL).await;
+            }
+        }
+    }
+}
+
+async fn wait_for_magi_browser_session(
+    state: &ApiState,
+    session_id: &SessionId,
+) -> Result<Option<BrowserSession>, ApiError> {
+    let deadline = Instant::now() + BROWSER_READY_WAIT_TIMEOUT;
+    loop {
+        let existing = {
+            let authority = state
+                .browser_authority
+                .lock()
+                .expect("browser authority lock poisoned");
+            authority.session_for_magi_session(session_id).cloned()
+        };
+        match existing {
+            Some(session)
+                if matches!(
+                    session.lifecycle,
+                    BrowserSessionLifecycle::Creating | BrowserSessionLifecycle::Recovering
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(ApiError::Conflict(
+                        "浏览器会话恢复超时，请稍后重试".to_string(),
+                    ));
+                }
+                tokio::time::sleep(BROWSER_READY_POLL_INTERVAL).await;
+            }
+            other => return Ok(other),
+        }
+    }
+}
+
+async fn wait_for_browser_session_ready(
+    state: &ApiState,
+    browser_session_id: &BrowserSessionId,
+) -> Result<BrowserSession, ApiError> {
+    let deadline = Instant::now() + BROWSER_READY_WAIT_TIMEOUT;
+    loop {
+        let session = {
+            let authority = state
+                .browser_authority
+                .lock()
+                .expect("browser authority lock poisoned");
+            authority
+                .session(browser_session_id)
+                .cloned()
+                .ok_or_else(|| {
+                    ApiError::not_found("浏览器会话不存在", browser_session_id.as_str())
+                })?
+        };
+        match session.lifecycle {
+            BrowserSessionLifecycle::Ready | BrowserSessionLifecycle::Failed => {
+                return Ok(session);
+            }
+            BrowserSessionLifecycle::Closed => {
+                return Err(ApiError::Conflict("浏览器会话已关闭".to_string()));
+            }
+            BrowserSessionLifecycle::Creating | BrowserSessionLifecycle::Recovering => {
+                if Instant::now() >= deadline {
+                    return Err(ApiError::Conflict(
+                        "浏览器会话恢复超时，请稍后重试".to_string(),
+                    ));
+                }
+                tokio::time::sleep(BROWSER_READY_POLL_INTERVAL).await;
+            }
+        }
+    }
 }
 
 fn browser_session_response(
@@ -2223,7 +2399,7 @@ mod tests {
     }
 
     #[test]
-    fn annotation_context_is_authoritative_session_scoped_and_active_only() {
+    fn annotation_context_is_session_scoped_and_keeps_stale_artifact_context() {
         let (state, session_id, other_session_id, annotation_id) = annotation_fixture();
         let resolved =
             resolve_browser_annotation_context(&state, &session_id, &[annotation_id.to_string()])
@@ -2251,8 +2427,22 @@ mod tests {
             .mutate_browser_authority(|authority| {
                 authority.update_annotation_status(
                     &annotation_id,
-                    BrowserAnnotationStatus::Resolved,
+                    BrowserAnnotationStatus::Stale,
                     UtcMillis(3),
+                )
+            })
+            .expect("annotation should become stale");
+        let stale =
+            resolve_browser_annotation_context(&state, &session_id, &[annotation_id.to_string()])
+                .expect("stale annotation artifact should remain usable as historical context");
+        assert_eq!(stale[0]["status"], "stale");
+
+        state
+            .mutate_browser_authority(|authority| {
+                authority.update_annotation_status(
+                    &annotation_id,
+                    BrowserAnnotationStatus::Resolved,
+                    UtcMillis(4),
                 )
             })
             .expect("annotation should resolve");

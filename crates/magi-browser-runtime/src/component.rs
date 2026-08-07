@@ -51,6 +51,8 @@ pub struct BrowserRuntimeFile {
     pub sha256: String,
     pub size_bytes: u64,
     pub executable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,6 +460,17 @@ fn validate_manifest_files(
     let mut total = 0u64;
     for file in &manifest.files {
         validate_relative_path(Path::new(&file.path))?;
+        if let Some(target) = file.symlink_target.as_deref() {
+            validate_symlink_target(Path::new(&file.path), Path::new(target))?;
+            if file.size_bytes != 0 || !file.sha256.is_empty() || file.executable {
+                return Err(BrowserRuntimeComponentError::InvalidManifest(format!(
+                    "symlink metadata must not declare size, hash, or executable: {}",
+                    file.path
+                )));
+            }
+        } else {
+            verify_sha256_text(&file.sha256)?;
+        }
         if file.path == BROWSER_RUNTIME_MANIFEST_FILE || file.path == BROWSER_RUNTIME_RELEASE_FILE {
             return Err(BrowserRuntimeComponentError::InvalidManifest(format!(
                 "reserved metadata path appears in runtime file list: {}",
@@ -470,7 +483,6 @@ fn validate_manifest_files(
             ));
         }
         previous = Some(&file.path);
-        verify_sha256_text(&file.sha256)?;
         total = total
             .checked_add(file.size_bytes)
             .ok_or_else(|| BrowserRuntimeComponentError::InvalidManifest("size overflow".into()))?;
@@ -518,7 +530,7 @@ fn validate_manifest_entrypoint(
                 "{field} does not reference a runtime file: {path}"
             ))
         })?;
-    if must_be_executable && !file.executable {
+    if must_be_executable && (!file.executable || file.symlink_target.is_some()) {
         return Err(BrowserRuntimeComponentError::InvalidManifest(format!(
             "{field} must reference an executable runtime file: {path}"
         )));
@@ -572,12 +584,52 @@ fn extract_runtime_archive(
             fs::create_dir_all(&output_path)?;
             continue;
         }
-        if !entry_type.is_file() {
+        let relative_text = path_to_manifest_text(&relative)?;
+        let expected = manifest
+            .files
+            .iter()
+            .find(|file| file.path == relative_text);
+        if expected.is_none() && relative_text != BROWSER_RUNTIME_MANIFEST_FILE {
+            return Err(BrowserRuntimeComponentError::ArchiveFileSetMismatch {
+                missing: Vec::new(),
+                unexpected: vec![relative_text.clone()],
+            });
+        }
+        if entry_type.is_symlink() {
+            let expected = expected.ok_or_else(|| {
+                BrowserRuntimeComponentError::UnsupportedArchiveEntry(relative_text.clone())
+            })?;
+            let target = entry
+                .link_name()?
+                .ok_or_else(|| {
+                    BrowserRuntimeComponentError::InvalidManifest(format!(
+                        "symlink target is missing: {relative_text}"
+                    ))
+                })?
+                .into_owned();
+            let target_text = path_to_symlink_text(&target)?;
+            validate_symlink_target(&relative, &target)?;
+            if expected.symlink_target.as_deref() != Some(target_text.as_str()) {
+                return Err(BrowserRuntimeComponentError::InvalidManifest(format!(
+                    "symlink target does not match manifest: {relative_text}"
+                )));
+            }
+            if !extracted_files.insert(relative_text.clone()) {
+                return Err(BrowserRuntimeComponentError::DuplicateArchiveEntry(
+                    relative_text,
+                ));
+            }
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            create_symlink(&target, &output_path)?;
+            continue;
+        }
+        if !entry_type.is_file() || expected.is_some_and(|file| file.symlink_target.is_some()) {
             return Err(BrowserRuntimeComponentError::UnsupportedArchiveEntry(
                 relative.display().to_string(),
             ));
         }
-        let relative_text = path_to_manifest_text(&relative)?;
         if !extracted_files.insert(relative_text.clone()) {
             return Err(BrowserRuntimeComponentError::DuplicateArchiveEntry(
                 relative_text,
@@ -636,12 +688,28 @@ fn verify_installed_files(
 ) -> Result<(), BrowserRuntimeComponentError> {
     for file in &manifest.files {
         let path = root.join(&file.path);
-        let metadata = fs::metadata(&path).map_err(|error| {
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
             BrowserRuntimeComponentError::InstalledFileInvalid {
                 path: file.path.clone(),
                 reason: error.to_string(),
             }
         })?;
+        if let Some(expected_target) = file.symlink_target.as_deref() {
+            if !metadata.file_type().is_symlink() {
+                return Err(BrowserRuntimeComponentError::InstalledFileInvalid {
+                    path: file.path.clone(),
+                    reason: "expected a symbolic link".to_string(),
+                });
+            }
+            let actual_target = fs::read_link(&path)?;
+            if path_to_symlink_text(&actual_target)? != expected_target {
+                return Err(BrowserRuntimeComponentError::InstalledFileInvalid {
+                    path: file.path.clone(),
+                    reason: "symbolic link target mismatch".to_string(),
+                });
+            }
+            continue;
+        }
         if !metadata.is_file() || metadata.len() != file.size_bytes {
             return Err(BrowserRuntimeComponentError::InstalledFileInvalid {
                 path: file.path.clone(),
@@ -710,6 +778,74 @@ fn path_to_manifest_text(path: &Path) -> Result<String, BrowserRuntimeComponentE
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(parts.join("/"))
+}
+
+fn path_to_symlink_text(path: &Path) -> Result<String, BrowserRuntimeComponentError> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(BrowserRuntimeComponentError::UnsafeArchivePath(
+            path.display().to_string(),
+        ));
+    }
+    let parts = path
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value
+                .to_str()
+                .map(str::to_owned)
+                .ok_or(BrowserRuntimeComponentError::NonUtf8ArchivePath),
+            Component::CurDir => Ok(".".to_string()),
+            Component::ParentDir => Ok("..".to_string()),
+            Component::RootDir | Component::Prefix(_) => Err(
+                BrowserRuntimeComponentError::UnsafeArchivePath(path.display().to_string()),
+            ),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(parts.join("/"))
+}
+
+fn validate_symlink_target(
+    link_path: &Path,
+    target: &Path,
+) -> Result<(), BrowserRuntimeComponentError> {
+    if target.as_os_str().is_empty() || target.is_absolute() {
+        return Err(BrowserRuntimeComponentError::UnsafeArchivePath(
+            target.display().to_string(),
+        ));
+    }
+    let mut depth = link_path
+        .parent()
+        .map_or(0, |parent| parent.components().count());
+    for component in target.components() {
+        match component {
+            Component::Normal(value) => {
+                value
+                    .to_str()
+                    .ok_or(BrowserRuntimeComponentError::NonUtf8ArchivePath)?;
+                depth = depth.saturating_add(1);
+            }
+            Component::CurDir => {}
+            Component::ParentDir if depth > 0 => depth -= 1,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(BrowserRuntimeComponentError::UnsafeArchivePath(
+                    target.display().to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, output: &Path) -> Result<(), BrowserRuntimeComponentError> {
+    std::os::unix::fs::symlink(target, output)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_target: &Path, output: &Path) -> Result<(), BrowserRuntimeComponentError> {
+    Err(BrowserRuntimeComponentError::UnsupportedArchiveEntry(
+        output.display().to_string(),
+    ))
 }
 
 fn verify_sha256_text(value: &str) -> Result<(), BrowserRuntimeComponentError> {

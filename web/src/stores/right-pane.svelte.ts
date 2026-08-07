@@ -8,9 +8,10 @@
  * - 全部 tab 关闭 → 强制 collapsed = true（下一次展开为空白 Pane）
  * - togglePane() 仅切 collapsed；openTab*() 触发自动展开
  * - 同 kind 同 key（agent: agentRunId / code: filepath / browser: BrowserTabId）幂等：复用现有 tab 并激活
+ * - terminal 以 terminalTabId 作为唯一键；每次新建都是独立命令终端，不共享输出历史
  */
 
-export type RightPaneTabKind = 'agent' | 'code' | 'browser';
+export type RightPaneTabKind = 'agent' | 'code' | 'browser' | 'terminal';
 
 /** Agent tab payload —— 代理运行 ID，内容由 canonical projection 按 metadata.taskId 过滤运行输出 */
 export interface AgentTabPayload {
@@ -65,6 +66,14 @@ export interface BrowserTabPayload {
   sessionId: string;
 }
 
+/** Terminal tab payload —— 用户手动命令终端的稳定实例 ID，不持久化运行输出。 */
+export interface TerminalTabPayload {
+  terminalTabId: string;
+  workspaceId: string;
+  workspacePath?: string;
+  sessionId: string;
+}
+
 export interface BrowserAuthorityTabProjection {
   tabId: string;
   lifecycle: 'creating' | 'ready' | 'crashed' | 'closed';
@@ -78,7 +87,7 @@ export interface BrowserAuthoritySessionProjection {
   tabs: BrowserAuthorityTabProjection[];
 }
 
-export type RightPaneTabPayload = AgentTabPayload | CodeTabPayload | BrowserTabPayload;
+export type RightPaneTabPayload = AgentTabPayload | CodeTabPayload | BrowserTabPayload | TerminalTabPayload;
 
 export interface RightPaneTab {
   id: string;
@@ -121,7 +130,7 @@ const MAX_PERSISTED_SESSIONS = 50;
 const WORKSPACE_SCOPE_PREFIX = 'workspace:';
 
 interface PersistedShape {
-  version: 3;
+  version: 3 | 4;
   activeScopeKey: string;
   activeWorkspaceId: string;
   activeSessionId: string;
@@ -225,6 +234,14 @@ function isRestorableTab(tab: RightPaneTab): boolean {
       && payload?.sessionId?.trim(),
     );
   }
+  if (tab.kind === 'terminal') {
+    const payload = tab.payload as TerminalTabPayload | undefined;
+    return Boolean(
+      payload?.terminalTabId?.trim()
+      && payload?.workspaceId?.trim()
+      && payload?.sessionId?.trim(),
+    );
+  }
   return false;
 }
 
@@ -235,7 +252,7 @@ function loadPersisted(): void {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return;
     const parsed = JSON.parse(raw) as PersistedShape;
-    if (!parsed || parsed.version !== 3) return;
+    if (!parsed || (parsed.version !== 3 && parsed.version !== 4)) return;
     const recovered: Record<string, SessionPaneState> = {};
     for (const [sid, state] of Object.entries(parsed.perSession ?? {})) {
       if (!state || !Array.isArray(state.openTabs)) continue;
@@ -277,7 +294,7 @@ function persistState(): void {
       kept = ranked.slice(0, MAX_PERSISTED_SESSIONS).map((x) => [x.sid, x.state]);
     }
     const slim: PersistedShape = {
-      version: 3,
+      version: 4,
       activeScopeKey: rightPaneState.activeScopeKey,
       activeWorkspaceId: rightPaneState.activeWorkspaceId,
       activeSessionId: rightPaneState.activeSessionId,
@@ -340,6 +357,9 @@ function tabKey(kind: RightPaneTabKind, payload: RightPaneTabPayload): string {
   if (kind === 'code') {
     return `code:${(payload as CodeTabPayload).filepath}`;
   }
+  if (kind === 'terminal') {
+    return `terminal:${(payload as TerminalTabPayload).terminalTabId}`;
+  }
   const browserPayload = payload as BrowserTabPayload;
   return `browser:${browserPayload.browserSessionId}:${browserPayload.tabId}`;
 }
@@ -398,6 +418,10 @@ function upsertTab(
     const browserPayload = payload as BrowserTabPayload;
     rightPaneState.activeWorkspaceId = normalizeWorkspaceId(browserPayload.workspaceId);
     rightPaneState.activeSessionId = normalizeSessionId(browserPayload.sessionId);
+  } else if (kind === 'terminal') {
+    const terminalPayload = payload as TerminalTabPayload;
+    rightPaneState.activeWorkspaceId = normalizeWorkspaceId(terminalPayload.workspaceId);
+    rightPaneState.activeSessionId = normalizeSessionId(terminalPayload.sessionId);
   }
   const session = ensureSession(scopeKey);
   const id = tabKey(kind, payload);
@@ -624,6 +648,47 @@ export function openBrowserTab(
     options.label?.trim() || 'Browser',
     null,
   );
+}
+
+let terminalTabCounter = 0;
+
+function newTerminalTabId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  terminalTabCounter += 1;
+  return `terminal-${Date.now()}-${terminalTabCounter}`;
+}
+
+/**
+ * 新建独立的用户命令终端 Tab。每个 Tab 的执行记录仅保留在内存中，刷新页面后不伪造
+ * 旧进程或旧输出仍然可用；后台进程本身继续由 shell_exec 按 session/workspace 管理。
+ */
+export function openTerminalTab(options: {
+  workspaceId: string;
+  workspacePath?: string;
+  sessionId: string;
+}): string | null {
+  const workspaceId = normalizeWorkspaceId(options.workspaceId);
+  const sessionId = normalizeSessionId(options.sessionId);
+  const scopeKey = sessionScopeKey(workspaceId, sessionId);
+  if (!workspaceId || !sessionId || !scopeKey) {
+    return null;
+  }
+  const terminalTabId = newTerminalTabId();
+  upsertTab(
+    scopeKey,
+    'terminal',
+    {
+      terminalTabId,
+      workspaceId,
+      workspacePath: options.workspacePath?.trim() || undefined,
+      sessionId,
+    },
+    'Terminal',
+    null,
+  );
+  return terminalTabId;
 }
 
 /**

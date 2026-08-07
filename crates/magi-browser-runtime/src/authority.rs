@@ -14,6 +14,9 @@ use crate::{
     GoalControlBinding,
 };
 
+const MAX_BROWSER_TABS_PER_SESSION: usize = 32;
+const MAX_BROWSER_TABS_TOTAL: usize = 64;
+
 #[derive(Clone, Debug)]
 pub struct CreateBrowserSession {
     pub browser_session_id: BrowserSessionId,
@@ -392,7 +395,23 @@ impl BrowserAuthority {
         if self.tabs.contains_key(&input.tab_id) {
             return Err(BrowserAuthorityError::TabAlreadyExists(input.tab_id));
         }
-        self.require_ready_session(&input.browser_session_id)?;
+        let session = self.require_ready_session(&input.browser_session_id)?;
+        if session.tab_ids.len() >= MAX_BROWSER_TABS_PER_SESSION {
+            return Err(BrowserAuthorityError::SessionTabLimitReached {
+                browser_session_id: input.browser_session_id.clone(),
+                limit: MAX_BROWSER_TABS_PER_SESSION,
+            });
+        }
+        let open_tab_count = self
+            .sessions
+            .values()
+            .map(|session| session.tab_ids.len())
+            .sum::<usize>();
+        if open_tab_count >= MAX_BROWSER_TABS_TOTAL {
+            return Err(BrowserAuthorityError::GlobalTabLimitReached {
+                limit: MAX_BROWSER_TABS_TOTAL,
+            });
+        }
         let tab = BrowserTab {
             tab_id: input.tab_id,
             browser_session_id: input.browser_session_id.clone(),

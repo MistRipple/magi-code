@@ -3,7 +3,7 @@ use magi_core::{BrowserCommandId, BrowserLeaseId, BrowserTabId};
 use serde::{Deserialize, Serialize};
 
 pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 1;
-pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 8;
+pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 10;
 pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 400;
 pub const DEFAULT_BROWSER_SNAPSHOT_TEXT_LIMIT_BYTES: u32 = 32 * 1024;
 
@@ -68,6 +68,12 @@ pub enum BrowserHostCommand {
     SetViewport {
         tab_id: BrowserTabId,
         viewport: HostViewport,
+    },
+    /// Change only Chromium's logical CSS viewport. The display surface is
+    /// owned by the UI subscription and must not be overwritten by an agent.
+    SetLogicalViewport {
+        tab_id: BrowserTabId,
+        viewport: BrowserLogicalViewport,
     },
     ClosePage {
         tab_id: BrowserTabId,
@@ -174,6 +180,16 @@ pub enum BrowserHostControlMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostViewport {
+    pub width: u32,
+    pub height: u32,
+    pub surface_width: u32,
+    pub surface_height: u32,
+    pub device_scale_factor_millis: u32,
+    pub device_type: BrowserDeviceType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserLogicalViewport {
     pub width: u32,
     pub height: u32,
     pub device_scale_factor_millis: u32,
@@ -384,6 +400,8 @@ pub struct BrowserHostBinaryPayload {
 pub struct BrowserHostHitTest {
     pub frame_sequence: u64,
     pub navigation_revision: u64,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
     pub scroll_x: f64,
     pub scroll_y: f64,
     pub element_ref: String,
@@ -420,6 +438,9 @@ pub struct BrowserHostEventEnvelope {
 pub enum BrowserHostEvent {
     Ready(BrowserHostHandshake),
     PageUpdated(BrowserHostPageState),
+    PageSuspended {
+        tab_id: BrowserTabId,
+    },
     PageCrashed {
         tab_id: BrowserTabId,
         diagnostic: Option<String>,
@@ -438,6 +459,14 @@ pub enum BrowserHostEvent {
         tab_id: BrowserTabId,
         suggested_filename: String,
         state: String,
+        byte_length: Option<u64>,
+        error: Option<String>,
+    },
+    FileChooser {
+        tab_id: BrowserTabId,
+    },
+    PopupBlocked {
+        tab_id: BrowserTabId,
     },
     ScreencastFrame(BrowserScreencastFrame),
     BinaryPayloadReady(BrowserHostBinaryPayload),
@@ -457,5 +486,7 @@ pub struct BrowserScreencastFrame {
     pub sha256: String,
     pub width: u32,
     pub height: u32,
+    pub surface_width: u32,
+    pub surface_height: u32,
     pub device_scale_factor_millis: u32,
 }

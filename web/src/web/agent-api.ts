@@ -12,6 +12,7 @@ import type {
   IncidentNotificationItemDto,
   NotificationCenterSnapshotDto,
   NotificationsResponseDto,
+  SessionInterruptResponseDto,
   SessionTurnQueueResponseDto,
   FetchModelsResponseDto,
   EnhancePromptRequestDto,
@@ -82,6 +83,8 @@ export interface AgentSessionSummary {
 }
 
 export interface AgentWorkspaceSessionsSnapshot {
+  runtimeEpoch: string;
+  eventStreamNextSequence: number;
   workspace: AgentWorkspaceSummary;
   sessionId: string;
   sessions: AgentSessionSummary[];
@@ -433,6 +436,8 @@ export interface AgentSessionTurnResult {
   entryId: string;
   eventId: string;
   acceptedAt: number;
+  runtimeEpoch: string;
+  eventStreamNextSequence: number;
   createdSession: boolean;
   route: 'chat' | 'execute' | 'task' | 'continue' | 'steer';
   /** Root task ID when the backend created an agent run for this action. */
@@ -766,6 +771,42 @@ export function agentUrl(pathname: string, query?: string): string {
   return q ? `${base}${pathname}?${q}` : `${base}${pathname}`;
 }
 
+export interface TerminalSessionRequest {
+  terminalTabId: string;
+  workspaceId: string;
+  workspacePath?: string;
+  sessionId: string;
+  cols?: number;
+  rows?: number;
+}
+
+function terminalSessionUrl(request: TerminalSessionRequest, channel: boolean): URL {
+  const suffix = channel ? '/channel' : '';
+  const url = new URL(agentUrl(
+    `/api/terminal/sessions/${encodeURIComponent(request.terminalTabId.trim())}${suffix}`,
+  ));
+  url.searchParams.set('workspaceId', request.workspaceId.trim());
+  url.searchParams.set('sessionId', request.sessionId.trim());
+  const workspacePath = request.workspacePath?.trim();
+  if (workspacePath) url.searchParams.set('workspacePath', workspacePath);
+  if (request.cols) url.searchParams.set('cols', String(request.cols));
+  if (request.rows) url.searchParams.set('rows', String(request.rows));
+  return url;
+}
+
+export function terminalChannelUrl(request: TerminalSessionRequest): string {
+  const url = terminalSessionUrl(request, true);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  return url.toString();
+}
+
+export async function closeTerminalSession(request: TerminalSessionRequest): Promise<void> {
+  const response = await getTransport().request(terminalSessionUrl(request, false).toString(), {
+    method: 'DELETE',
+  });
+  if (!response.ok) await parseAgentJson(response, 'close terminal session');
+}
+
 export type BrowserSessionLifecycle = 'creating' | 'ready' | 'recovering' | 'failed' | 'closed';
 export type BrowserTabLifecycle = 'creating' | 'ready' | 'crashed' | 'closed';
 export type BrowserControlMode = 'agent' | 'user';
@@ -952,14 +993,15 @@ export async function getCurrentBrowserSession(
 
 export async function createBrowserTab(
   browserSessionId: string,
-  initialUrl = 'about:blank',
+  initialUrl: string,
+  viewport: BrowserViewport,
 ): Promise<BrowserTabSnapshot> {
   const response = await getTransport().request(
     agentUrl(`/api/browser/sessions/${encodeURIComponent(browserSessionId)}/tabs`),
     {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ initialUrl }),
+      body: JSON.stringify({ initialUrl, viewport }),
     },
   );
   return parseAgentJson<BrowserTabSnapshot>(response, 'create browser tab');
@@ -981,13 +1023,15 @@ export async function setBrowserTabViewport(
         width: number;
         height: number;
         controllerId: string;
-        claim?: boolean;
+        claim: boolean;
       }
     | {
         action: 'set';
         mode: BrowserViewportMode;
         width: number;
         height: number;
+        surfaceWidth: number;
+        surfaceHeight: number;
         deviceType: BrowserDeviceType;
         controllerId?: string;
       },
@@ -1106,8 +1150,10 @@ export function browserScreenshotUrl(tabId: string): string {
   return agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/screenshot`);
 }
 
-export function browserAnnotationArtifactUrl(annotationId: string): string {
-  return agentUrl(`/api/browser/annotations/${encodeURIComponent(annotationId)}/artifact`);
+export function browserAnnotationArtifactUrl(annotationId: string, sessionId: string): string {
+  const url = new URL(agentUrl(`/api/browser/annotations/${encodeURIComponent(annotationId)}/artifact`));
+  url.searchParams.set('sessionId', sessionId.trim());
+  return url.toString();
 }
 
 export async function readBrowserClipboardText(): Promise<string> {
@@ -1544,6 +1590,8 @@ export async function getWorkspaceSessions(
       agentUrl('/api/workspaces/sessions', query.toString())
     );
     const payload = await parseAgentJson<{
+      runtimeEpoch?: string;
+      eventStreamNextSequence?: number;
       workspace?: RawAgentWorkspaceSummary;
       sessionId?: string;
       sessions?: RawAgentSessionSummary[];
@@ -1551,7 +1599,19 @@ export async function getWorkspaceSessions(
     const sessions = Array.isArray(payload.sessions)
       ? payload.sessions.map((session) => normalizeSessionSummary(session))
       : [];
+    const runtimeEpoch = payload.runtimeEpoch?.trim() || '';
+    const eventStreamNextSequence = payload.eventStreamNextSequence;
+    if (
+      !runtimeEpoch
+      || typeof eventStreamNextSequence !== 'number'
+      || !Number.isFinite(eventStreamNextSequence)
+      || eventStreamNextSequence < 1
+    ) {
+      throw new Error('workspace sessions 缺少有效的运行时代际或事件游标');
+    }
     return {
+      runtimeEpoch,
+      eventStreamNextSequence: Math.floor(eventStreamNextSequence),
       workspace: payload.workspace
         ? normalizeWorkspaceSummary(payload.workspace)
         : findCachedWorkspaceSummary(workspaceId),
@@ -1628,13 +1688,35 @@ export async function deleteAgentSession(
 export async function markAgentSessionViewed(
   sessionId: string,
   bindingOverride?: Partial<AgentBindingContext>,
-): Promise<{ sessionId: string; hasUnreadCompletion: boolean }> {
-  return await postWorkspaceBoundJson<{ sessionId: string; hasUnreadCompletion: boolean }>(
+): Promise<{
+  runtimeEpoch: string;
+  eventStreamNextSequence: number;
+  sessionId: string;
+  hasUnreadCompletion: boolean;
+}> {
+  const result = await postWorkspaceBoundJson<{
+    runtimeEpoch: string;
+    eventStreamNextSequence: number;
+    sessionId: string;
+    hasUnreadCompletion: boolean;
+  }>(
     '/api/workspaces/sessions/viewed',
     { sessionId },
     'mark session viewed',
     bindingOverride,
   );
+  if (
+    !result.runtimeEpoch?.trim()
+    || !Number.isFinite(result.eventStreamNextSequence)
+    || result.eventStreamNextSequence < 1
+  ) {
+    throw new Error('mark session viewed 缺少有效的运行时代际或事件游标');
+  }
+  return {
+    ...result,
+    runtimeEpoch: result.runtimeEpoch.trim(),
+    eventStreamNextSequence: Math.floor(result.eventStreamNextSequence),
+  };
 }
 
 export async function renameAgentSession(
@@ -1791,6 +1873,8 @@ export async function submitSessionTurn(
       entryId: string;
       eventId: string;
       acceptedAt: number;
+      runtimeEpoch: string;
+      eventStreamNextSequence: number;
       createdSession: boolean;
       route: 'chat' | 'execute' | 'task' | 'continue' | 'steer';
       rootTaskId?: string | null;
@@ -1806,11 +1890,21 @@ export async function submitSessionTurn(
       canonicalItem?: CanonicalTurnItem | null;
       steeredTurnId?: string | null;
     }>(response, 'submit session turn');
+    const runtimeEpoch = typeof raw.runtimeEpoch === 'string' ? raw.runtimeEpoch.trim() : '';
+    const eventStreamNextSequence = typeof raw.eventStreamNextSequence === 'number'
+      && Number.isFinite(raw.eventStreamNextSequence)
+      ? Math.floor(raw.eventStreamNextSequence)
+      : 0;
+    if (!runtimeEpoch || eventStreamNextSequence < 1) {
+      throw new Error('submit session turn 缺少有效的运行时代际或事件游标');
+    }
     return {
       sessionId: raw.sessionId,
       entryId: raw.entryId,
       eventId: raw.eventId,
       acceptedAt: raw.acceptedAt,
+      runtimeEpoch,
+      eventStreamNextSequence,
       createdSession: raw.createdSession,
       route: raw.route,
       rootTaskId: typeof raw.rootTaskId === 'string' && raw.rootTaskId.trim() ? raw.rootTaskId.trim() : null,
@@ -1884,9 +1978,27 @@ export async function removeAgentSessionTurnQueueItem(
   );
 }
 
+export async function guideAgentSessionTurnQueueItem(
+  sessionId: string,
+  queueId: string,
+  bindingOverride?: Partial<AgentBindingContext>,
+): Promise<SessionTurnQueueResponseDto> {
+  const normalizedSessionId = sessionId.trim();
+  const normalizedQueueId = queueId.trim();
+  if (!normalizedSessionId || !normalizedQueueId) {
+    throw new AgentApiError(400, 'sessionId 和 queueId 不能为空', 'guide session turn queue item');
+  }
+  return await postBoundJson<SessionTurnQueueResponseDto>(
+    '/api/session/queue/guide',
+    { sessionId: normalizedSessionId, queueId: normalizedQueueId },
+    'guide session turn queue item',
+    bindingOverride,
+  );
+}
+
 export async function interruptAgentSession(
   sessionId: string,
-): Promise<Record<string, unknown>> {
+): Promise<SessionInterruptResponseDto> {
   const normalizedSessionId = sessionId.trim();
   if (!normalizedSessionId) {
     throw new AgentApiError(400, 'sessionId 不能为空', 'interrupt session turn');
@@ -1894,7 +2006,7 @@ export async function interruptAgentSession(
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort('interrupt_request_timeout'), 10_000);
   try {
-    return await postBoundJson<Record<string, unknown>>(
+    return await postBoundJson<SessionInterruptResponseDto>(
       '/api/session/interrupt',
       { sessionId: normalizedSessionId },
       'interrupt session turn',

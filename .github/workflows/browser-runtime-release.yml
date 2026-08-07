@@ -1,0 +1,220 @@
+name: 发布 Browser Runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_version:
+        description: Browser Runtime 版本
+        required: true
+        type: string
+      manifest_sequence:
+        description: 单调递增的 manifest sequence
+        required: true
+        type: string
+      update_level:
+        description: 更新级别
+        required: true
+        default: recommended
+        type: choice
+        options:
+          - optional
+          - recommended
+          - required_security
+      expires_days:
+        description: 清单有效期天数
+        required: true
+        default: '90'
+        type: string
+  push:
+    tags:
+      - browser-runtime-v*
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: '1.97.0'
+  BROWSER_RUNTIME_RELEASE_KEY_HEX: ${{ vars.BROWSER_RUNTIME_RELEASE_KEY_HEX }}
+  BROWSER_RUNTIME_MANIFEST_SEQUENCE: ${{ vars.BROWSER_RUNTIME_MANIFEST_SEQUENCE }}
+  BROWSER_RUNTIME_EXPIRES_DAYS: ${{ vars.BROWSER_RUNTIME_EXPIRES_DAYS || '90' }}
+  BROWSER_RUNTIME_UPDATE_LEVEL: ${{ vars.BROWSER_RUNTIME_UPDATE_LEVEL || 'recommended' }}
+
+jobs:
+  package:
+    name: 打包 ${{ matrix.platform }} Browser Runtime
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            runner: macos-15
+            runtime_os: macos
+            runtime_arch: aarch64
+          - platform: macos-intel
+            runner: macos-15-intel
+            runtime_os: macos
+            runtime_arch: x86_64
+          - platform: linux
+            runner: ubuntu-22.04
+            runtime_os: linux
+            runtime_arch: x86_64
+          - platform: windows
+            runner: windows-2022
+            runtime_os: windows
+            runtime_arch: x86_64
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: browser-host/package-lock.json
+
+      - name: 安装 Rust
+        shell: bash
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+
+      - name: 安装 Browser Host 依赖
+        shell: bash
+        run: npm --prefix browser-host ci
+
+      - name: 下载 Playwright Chromium
+        shell: bash
+        run: npm --prefix browser-host exec -- playwright-core install chromium
+
+      - name: 构建 Browser Host
+        shell: bash
+        run: npm --prefix browser-host run build
+
+      - name: 真实 Chromium 回归
+        shell: bash
+        run: |
+          set -euo pipefail
+          chromium="$(node -p "require('playwright-core').chromium.executablePath()")"
+          MAGI_BROWSER_TEST_CHROMIUM="$chromium" npm --prefix browser-host test
+
+      - name: 准备独立运行组件
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/stage-browser-runtime.mjs \
+            --root dist/browser-runtime-root \
+            --metadata dist/browser-runtime-metadata.json
+          node scripts/self-test-browser-runtime.mjs \
+            --metadata dist/browser-runtime-metadata.json
+
+      - name: 生成签名 Runtime 归档
+        shell: bash
+        env:
+          MAGI_BROWSER_RUNTIME_SIGNING_KEY_HEX: ${{ secrets.MAGI_BROWSER_RUNTIME_SIGNING_KEY_HEX }}
+        run: |
+          set -euo pipefail
+          test -n "${MAGI_BROWSER_RUNTIME_SIGNING_KEY_HEX:-}" || {
+            echo '缺少 Secret: MAGI_BROWSER_RUNTIME_SIGNING_KEY_HEX' >&2
+            exit 1
+          }
+          test -n "${BROWSER_RUNTIME_RELEASE_KEY_HEX:-}" || {
+            echo '缺少 Repository Variable: BROWSER_RUNTIME_RELEASE_KEY_HEX' >&2
+            exit 1
+          }
+          if [[ "$GITHUB_REF_NAME" == browser-runtime-v* ]]; then
+            runtime_version="${GITHUB_REF_NAME#browser-runtime-v}"
+          else
+            runtime_version="${{ inputs.runtime_version }}"
+          fi
+          sequence="${{ inputs.manifest_sequence }}"
+          expires_days="${{ inputs.expires_days }}"
+          update_level="${{ inputs.update_level }}"
+          if [[ "$GITHUB_REF_NAME" == browser-runtime-v* ]]; then
+            sequence="${BROWSER_RUNTIME_MANIFEST_SEQUENCE:-1}"
+            expires_days="${BROWSER_RUNTIME_EXPIRES_DAYS:-90}"
+            update_level="${BROWSER_RUNTIME_UPDATE_LEVEL:-recommended}"
+          fi
+          test -n "$runtime_version"
+          test -n "$sequence"
+          test -n "$expires_days"
+          test -n "$update_level"
+          metadata='dist/browser-runtime-metadata.json'
+          node_version="$(node -p "JSON.parse(require('fs').readFileSync('$metadata')).nodeVersion")"
+          playwright_version="$(node -p "JSON.parse(require('fs').readFileSync('$metadata')).playwrightVersion")"
+          chromium_version="$(node -p "JSON.parse(require('fs').readFileSync('$metadata')).chromiumVersion")"
+          node_path="$(node -p "JSON.parse(require('fs').readFileSync('$metadata')).nodeExecutablePath")"
+          host_path="$(node -p "JSON.parse(require('fs').readFileSync('$metadata')).hostEntryPath")"
+          chromium_path="$(node -p "JSON.parse(require('fs').readFileSync('$metadata')).chromiumExecutablePath")"
+          magi_version="$(node -p "require('./web/package.json').version")"
+          archive_name="magi-browser-runtime-${runtime_version}-${{ matrix.runtime_os }}-${{ matrix.runtime_arch }}.tar.zst"
+          archive_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/browser-runtime-v${runtime_version}/${archive_name}"
+          cargo run --locked -p magi-browser-runtime --bin package-browser-runtime -- \
+            --root dist/browser-runtime-root \
+            --output-dir dist/browser-runtime \
+            --runtime-version "$runtime_version" \
+            --host-version "$magi_version" \
+            --node-version "$node_version" \
+            --playwright-version "$playwright_version" \
+            --chromium-version "$chromium_version" \
+            --os '${{ matrix.runtime_os }}' \
+            --arch '${{ matrix.runtime_arch }}' \
+            --manifest-sequence "$sequence" \
+            --expires-days "$expires_days" \
+            --minimum-magi-version "$magi_version" \
+            --minimum-safe-runtime-version "$runtime_version" \
+            --node-executable-path "$node_path" \
+            --host-entry-path "$host_path" \
+            --chromium-executable-path "$chromium_path" \
+            --archive-url "$archive_url" \
+            --channel stable \
+            --update-level "$update_level" \
+            --verify-install-root dist/browser-runtime-verified \
+            --expected-public-key-hex "$BROWSER_RUNTIME_RELEASE_KEY_HEX"
+          test -s "dist/browser-runtime/$archive_name"
+          test -s "dist/browser-runtime/release-${{ matrix.runtime_os }}-${{ matrix.runtime_arch }}.json"
+
+      - name: 上传 Browser Runtime 产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-runtime-${{ matrix.platform }}
+          path: dist/browser-runtime
+          if-no-files-found: error
+
+  publish:
+    name: 发布 Browser Runtime 清单与归档
+    needs: package
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 下载各平台产物
+        uses: actions/download-artifact@v8
+        with:
+          pattern: browser-runtime-*
+          path: dist/browser-runtime
+          merge-multiple: true
+
+      - name: 发布版本 Runtime Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_NAME" == browser-runtime-v* ]]; then
+            runtime_tag="$GITHUB_REF_NAME"
+          else
+            runtime_tag="browser-runtime-v${{ inputs.runtime_version }}"
+          fi
+          gh release view "$runtime_tag" >/dev/null 2>&1 || \
+            gh release create "$runtime_tag" --title "Magi Browser Runtime ${runtime_tag#browser-runtime-v}" --notes 'Magi 独立 Browser Runtime 组件。'
+          gh release upload "$runtime_tag" dist/browser-runtime/magi-browser-runtime-*.tar.zst dist/browser-runtime/signed-release-*.json --clobber
+
+      - name: 更新稳定版 Runtime Feed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view browser-runtime-stable >/dev/null 2>&1 || \
+            gh release create browser-runtime-stable --title 'Magi Browser Runtime Stable Feed' --notes '由 Browser Runtime 发布工作流维护。'
+          gh release upload browser-runtime-stable dist/browser-runtime/release-*.json --clobber

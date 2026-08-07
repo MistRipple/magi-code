@@ -24,8 +24,9 @@ use crate::tool_call_validation::{
 };
 use crate::tool_execution_ledger::ToolExecutionLedger;
 use crate::tool_result_utils::{
-    DeterministicToolFailureTracker, infer_tool_call_status, model_visible_tool_result,
-    summarize_tool_result, tool_execution_status_label, turn_item_status_for_tool_result,
+    DeterministicToolFailureTracker, bound_model_visible_tool_history, infer_tool_call_status,
+    model_visible_tool_result, summarize_tool_result, tool_execution_status_label,
+    turn_item_status_for_tool_result,
 };
 use crate::tool_surface_state::{
     BrowserToolSurfaceContext, activate_skill_tool_definitions,
@@ -86,6 +87,11 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
+
+const DISCOVERY_WRAP_UP_ROUNDS: usize = 8;
+const DISCOVERY_MAX_ROUNDS: usize = 12;
+const DISCOVERY_WRAP_UP_TOOL_CALLS: usize = 40;
+const DISCOVERY_MAX_TOOL_CALLS: usize = 64;
 
 pub struct ConversationLoopRequest<'a> {
     pub client: &'a dyn ModelBridgeClient,
@@ -932,6 +938,7 @@ fn run_conversation_loop_inner(
             context_summary,
         );
     }
+    let mut proactive_context_compaction_completed = initial_prepared_history.compaction.is_some();
     let mut thread_history_snapshot = initial_prepared_history.messages;
     let resumed_task = !persisted_thread_history.is_empty()
         && task_is_resuming_existing_thread(session_store, session_id, task_id, thread_id);
@@ -982,6 +989,7 @@ fn run_conversation_loop_inner(
                 context_summary,
             );
         }
+        proactive_context_compaction_completed |= normalized_history.compaction.is_some();
         thread_history_snapshot = normalized_history.messages;
     }
     if !thread_history_snapshot.is_empty() {
@@ -1083,6 +1091,11 @@ fn run_conversation_loop_inner(
     let mut stream_interruption_recovery_attempts = 0usize;
     let mut stream_interruption_non_stream_fallback_attempted = false;
     let mut context_budget_recheck_required = false;
+    let mut context_limit_recovery_attempted = false;
+    let mut discovery_only_rounds = 0usize;
+    let mut discovery_tool_calls = 0usize;
+    let mut non_discovery_tool_seen = false;
+    let mut discovery_wrap_up_sent = false;
     let mut last_response_observation: Option<String> = None;
     let rebuild_task_context = |context_window: u64,
                                 round_tools: Option<&[ChatToolDefinition]>,
@@ -1235,14 +1248,43 @@ fn run_conversation_loop_inner(
             round_completed_tools,
             constrain_to_recovery_tool,
         );
-        let round_tools = (!round_tool_definitions.is_empty()).then_some(round_tool_definitions);
-        if context_budget_recheck_required {
+        let mut round_tools =
+            (!round_tool_definitions.is_empty()).then_some(round_tool_definitions);
+        let discovery_wrap_up = (discovery_only_rounds >= DISCOVERY_WRAP_UP_ROUNDS
+            || discovery_tool_calls >= DISCOVERY_WRAP_UP_TOOL_CALLS)
+            && !non_discovery_tool_seen
+            && !discovery_wrap_up_sent;
+        let force_discovery_synthesis = (discovery_only_rounds >= DISCOVERY_MAX_ROUNDS
+            || discovery_tool_calls >= DISCOVERY_MAX_TOOL_CALLS)
+            && !non_discovery_tool_seen
+            && required_tool_chain.is_empty()
+            && required_evidence_tools.is_empty();
+        if force_discovery_synthesis {
+            // 宽泛只读分析不能无限扫描。工具结果和审计仍完整保留，但本轮强制
+            // 把已获得的结构证据收束为答复，避免再次把同类文件送入模型。
+            round_tools = None;
+        }
+        if discovery_wrap_up || force_discovery_synthesis {
+            messages.push(system_prompt_fragment_message(
+                PromptFragmentKind::CurrentTurnPriority,
+                if force_discovery_synthesis {
+                    "只读探索已达到本轮分析预算。现在禁止继续调用工具，必须基于已取得的目录、入口、关键链路和风险证据输出完整结论；不要声称已执行未执行的验证。"
+                } else {
+                    "只读探索已覆盖多个独立证据面。除非存在明确未满足的硬性证据要求，否则停止读取同类文件，下一轮直接综合结论。"
+                },
+            ));
+            discovery_wrap_up_sent = true;
+        }
+        if context_budget_recheck_required && !proactive_context_compaction_completed {
             match rebuild_task_context(
                 effective_context_window,
                 round_tools.as_deref(),
                 active_skill_name.as_deref(),
             ) {
-                Ok(Some(rebuilt_messages)) => messages = rebuilt_messages,
+                Ok(Some(rebuilt_messages)) => {
+                    messages = rebuilt_messages;
+                    proactive_context_compaction_completed = true;
+                }
                 Ok(None) => {}
                 Err(terminal) => {
                     return (
@@ -1255,8 +1297,9 @@ fn run_conversation_loop_inner(
                     );
                 }
             }
-            context_budget_recheck_required = false;
         }
+        context_budget_recheck_required = false;
+        bound_model_visible_chat_tool_results(&mut messages);
         let invocation_request = ModelInvocationRequest {
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: prompt.clone(),
@@ -1371,9 +1414,11 @@ fn run_conversation_loop_inner(
                             },
                         );
                         if classification.code == "model_context_limit"
+                            && !context_limit_recovery_attempted
                             && let Some(context_limit) =
                                 extract_model_context_limit(&raw_error_message)
                         {
+                            context_limit_recovery_attempted = true;
                             let _ = apply_reported_context_limit(
                                 event_bus,
                                 settings_store,
@@ -1389,6 +1434,7 @@ fn run_conversation_loop_inner(
                             ) {
                                 Ok(Some(rebuilt_messages)) => {
                                     messages = rebuilt_messages;
+                                    proactive_context_compaction_completed = true;
                                     tracing::warn!(
                                         task_id = %task.task_id,
                                         round,
@@ -1669,8 +1715,10 @@ fn run_conversation_loop_inner(
                         },
                     );
                     if classification.code == "model_context_limit"
+                        && !context_limit_recovery_attempted
                         && let Some(context_limit) = extract_model_context_limit(&raw_error_message)
                     {
+                        context_limit_recovery_attempted = true;
                         let _ = apply_reported_context_limit(
                             event_bus,
                             settings_store,
@@ -1686,6 +1734,7 @@ fn run_conversation_loop_inner(
                         ) {
                             Ok(Some(rebuilt_messages)) => {
                                 messages = rebuilt_messages;
+                                proactive_context_compaction_completed = true;
                                 tracing::warn!(
                                     task_id = %task.task_id,
                                     round,
@@ -2138,6 +2187,8 @@ fn run_conversation_loop_inner(
         let mut content_requirement_failures = Vec::new();
         let mut activated_skill_this_round = None;
         let mut deterministic_tool_failure = None;
+        let mut round_had_discovery_tool = false;
+        let mut round_had_successful_non_discovery_tool = false;
         for (tool_call, (result, tool_status)) in valid_tool_calls.iter().zip(tool_results) {
             upsert_task_tool_call_result_turn_item(
                 turn_writeback_context,
@@ -2146,6 +2197,13 @@ fn run_conversation_loop_inner(
                 tool_status,
             );
             let canonical_tool_name = canonical_tool_call_name(&tool_call.function.name);
+            if discovery_tool_name(&canonical_tool_name) {
+                round_had_discovery_tool = true;
+            } else if matches!(tool_status, ExecutionResultStatus::Succeeded)
+                && !tool_result_execution_was_skipped(&result)
+            {
+                round_had_successful_non_discovery_tool = true;
+            }
             if !tool_result_execution_was_skipped(&result)
                 && matches!(tool_status, ExecutionResultStatus::Succeeded)
             {
@@ -2198,6 +2256,18 @@ fn run_conversation_loop_inner(
                 "task_thread_tool_result",
             );
             messages.push(tool_result_message);
+        }
+        if round_had_successful_non_discovery_tool {
+            discovery_only_rounds = 0;
+            non_discovery_tool_seen = true;
+        } else if round_had_discovery_tool {
+            discovery_only_rounds = discovery_only_rounds.saturating_add(1);
+            discovery_tool_calls = discovery_tool_calls.saturating_add(
+                valid_tool_calls
+                    .iter()
+                    .filter(|call| discovery_tool_name(&call.function.name))
+                    .count(),
+            );
         }
         if let Some(failure) = deterministic_tool_failure {
             append_task_error_turn_item(
@@ -2460,6 +2530,35 @@ fn run_conversation_loop_inner(
     );
 
     (outcome, context_summary)
+}
+
+/// 在每次模型请求前限制当前 turn 的工具结果总量。
+///
+/// thread 中的完整结果仍由 session store 保留；这里仅收敛本轮模型视图，避免
+/// 长时间只读探索把每个旧 file_read/search 结果永久累加到下一轮 prefill。
+fn bound_model_visible_chat_tool_results(messages: &mut [ChatMessage]) {
+    let indices = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            (message.role == "tool" && message.content.is_some()).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let results = indices
+        .iter()
+        .filter_map(|index| messages[*index].content.clone())
+        .collect::<Vec<_>>();
+    let bounded = bound_model_visible_tool_history(&results);
+    for (index, result) in indices.into_iter().zip(bounded) {
+        messages[index].content = Some(result);
+    }
+}
+
+fn discovery_tool_name(name: &str) -> bool {
+    matches!(
+        canonical_tool_call_name(name).as_str(),
+        "file_read" | "search_text" | "search_semantic" | "code_symbols" | "git_status"
+    )
 }
 
 fn render_mailbox_items_for_prompt(items: &[MailboxItem]) -> Option<String> {
@@ -5327,9 +5426,10 @@ mod tests {
             "unexpected task outcome: {outcome:?}"
         );
         assert_eq!(client.main_calls.load(Ordering::SeqCst), 3);
-        assert!(
-            client.compaction_calls.load(Ordering::SeqCst) > 1,
-            "16K 窗口恢复应使用分块语义压缩"
+        assert_eq!(
+            client.compaction_calls.load(Ordering::SeqCst),
+            1,
+            "同一次上下文超限恢复只能执行一次有界语义压缩"
         );
         let requests = client
             .requests

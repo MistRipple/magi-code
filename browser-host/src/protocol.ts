@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = { major: 1, minor: 8 } as const;
+export const PROTOCOL_VERSION = { major: 1, minor: 10 } as const;
 export const DEFAULT_SNAPSHOT_LIMITS = {
   max_nodes: 400,
   max_text_bytes: 32 * 1024,
@@ -32,6 +32,13 @@ export type HostCommand =
       payload: {
         tab_id: string;
         viewport: HostViewport;
+      };
+    }
+  | {
+      type: "set_logical_viewport";
+      payload: {
+        tab_id: string;
+        viewport: HostLogicalViewport;
       };
     }
   | { type: "close_page"; payload: { tab_id: string } }
@@ -135,6 +142,15 @@ export type HostControl =
 export type HostControlMode = "agent" | "user" | "disabled";
 
 export interface HostViewport {
+  width: number;
+  height: number;
+  surface_width: number;
+  surface_height: number;
+  device_scale_factor_millis: number;
+  device_type: HostDeviceType;
+}
+
+export interface HostLogicalViewport {
   width: number;
   height: number;
   device_scale_factor_millis: number;
@@ -290,6 +306,8 @@ export interface BinaryPayload {
 export interface HitTest {
   frame_sequence: number;
   navigation_revision: number;
+  viewport_width: number;
+  viewport_height: number;
   scroll_x: number;
   scroll_y: number;
   element_ref: string;
@@ -326,6 +344,7 @@ export type HostEvent =
       type: "page_crashed";
       payload: { tab_id: string; diagnostic?: string | null };
     }
+  | { type: "page_suspended"; payload: { tab_id: string } }
   | {
       type: "console";
       payload: { tab_id: string; level: string; text: string };
@@ -340,8 +359,12 @@ export type HostEvent =
         tab_id: string;
         suggested_filename: string;
         state: string;
+        byte_length?: number;
+        error?: string;
       };
     }
+  | { type: "file_chooser"; payload: { tab_id: string } }
+  | { type: "popup_blocked"; payload: { tab_id: string } }
   | { type: "screencast_frame"; payload: ScreencastFrame }
   | { type: "binary_payload_ready"; payload: BinaryPayload }
   | { type: "heartbeat"; payload: { monotonic_millis: number } };
@@ -366,5 +389,7 @@ export interface ScreencastFrame {
   sha256: string;
   width: number;
   height: number;
+  surface_width: number;
+  surface_height: number;
   device_scale_factor_millis: number;
 }

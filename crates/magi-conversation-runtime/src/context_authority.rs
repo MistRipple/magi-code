@@ -1,7 +1,7 @@
 use crate::{
     model_config::NormalizedModelConfig,
     prompt_utils::{PromptFragmentKind, render_prompt_fragment},
-    tool_result_utils::infer_tool_call_status,
+    tool_result_utils::{bound_model_visible_tool_history, infer_tool_call_status},
     usage_recording::{
         ModelUsageRecordInput, auxiliary_model_usage_binding, publish_model_usage_record,
     },
@@ -25,11 +25,7 @@ use magi_usage_authority::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
-    thread,
+    sync::{Arc, Mutex},
 };
 
 const THREAD_HISTORY_COMPACT_TARGET_TOKENS: usize = 8_000;
@@ -39,8 +35,6 @@ const THREAD_HISTORY_RECENT_MESSAGE_TARGET: usize = 12;
 const COMPACTION_INPUT_WINDOW_PERCENT: u64 = 60;
 const COMPACTION_MAX_SOURCE_TOKENS: usize = 32_000;
 const COMPACTION_PROMPT_RESERVE_TOKENS: usize = 768;
-const COMPACTION_MAX_REDUCTION_LEVELS: usize = 8;
-const COMPACTION_MAX_CONCURRENCY: usize = 3;
 
 #[derive(Clone, Debug)]
 pub(crate) enum ContextCompactionProgress {
@@ -255,6 +249,7 @@ impl<'a> ContextAuthority<'a> {
         let previous_checkpoint = self.session_store.thread_context_checkpoint(self.thread_id);
         let mut history = self.session_store.thread_context_history(self.thread_id);
         validate_workspace_file_facts(&mut history);
+        bound_model_visible_tool_results(&mut history);
         let original_count = history.len();
         let original_tokens = estimate_thread_history_tokens(&history);
         let usage_observation = latest_session_usage_observation(self.event_bus, self.session_id)
@@ -455,49 +450,25 @@ impl<'a> ContextAuthority<'a> {
                     .map_err(|error| format!("序列化待压缩上下文失败：{error}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let source_chunks = pack_compaction_sources(serialized_messages, source_budget);
-        let mut summaries = self.invoke_compaction_batch(
+        let bounded_source = bounded_compaction_source(serialized_messages, source_budget);
+        self.notify_compaction(ContextCompactionProgress::Started {
+            stage: "history_summary",
+            total_chunks: 1,
+        });
+        let summary = self.invoke_compaction_summary(
             compaction_client,
-            &source_chunks,
-            "history_chunk",
+            &bounded_source,
+            "history_summary",
+            0,
+            1,
             summary_target_tokens,
         )?;
-        let mut reduction_level = 0usize;
-        while summaries.len() > 1
-            || summaries
-                .first()
-                .is_some_and(|summary| estimate_text_tokens(summary) > summary_target_tokens)
-        {
-            if reduction_level >= COMPACTION_MAX_REDUCTION_LEVELS {
-                return Err("上下文压缩摘要未能在有限层级内收敛".to_string());
-            }
-            let before_tokens = summaries
-                .iter()
-                .map(|summary| estimate_text_tokens(summary))
-                .sum::<usize>();
-            let chunks = pack_compaction_sources(summaries, source_budget);
-            let reduced = self.invoke_compaction_batch(
-                compaction_client,
-                &chunks,
-                "summary_merge",
-                summary_target_tokens,
-            )?;
-            let after_tokens = reduced
-                .iter()
-                .map(|summary| estimate_text_tokens(summary))
-                .sum::<usize>();
-            if after_tokens >= before_tokens {
-                return Err(format!(
-                    "上下文压缩摘要未缩小：压缩前 {before_tokens} token，压缩后 {after_tokens} token"
-                ));
-            }
-            summaries = reduced;
-            reduction_level = reduction_level.saturating_add(1);
-        }
-        let summary = summaries
-            .pop()
-            .filter(|summary| !summary.trim().is_empty())
-            .ok_or_else(|| "上下文压缩模型未返回摘要".to_string())?;
+        self.notify_compaction(ContextCompactionProgress::Advanced {
+            stage: "history_summary",
+            completed_chunks: 1,
+            total_chunks: 1,
+        });
+        let summary = truncate_text_to_token_budget(&summary, summary_target_tokens);
         let content = render_prompt_fragment(
             PromptFragmentKind::ThreadHistoryBoundary,
             format!(
@@ -519,67 +490,6 @@ impl<'a> ContextAuthority<'a> {
             tool_call_id: None,
             provider_context: Vec::new(),
         })
-    }
-
-    fn invoke_compaction_batch(
-        &self,
-        client: &dyn ModelBridgeClient,
-        chunks: &[String],
-        stage: &'static str,
-        summary_target_tokens: usize,
-    ) -> Result<Vec<String>, String> {
-        if chunks.is_empty() {
-            return Err("上下文压缩没有可处理的内容片段".to_string());
-        }
-        self.notify_compaction(ContextCompactionProgress::Started {
-            stage,
-            total_chunks: chunks.len(),
-        });
-        let completed = AtomicUsize::new(0);
-        let mut summaries = Vec::with_capacity(chunks.len());
-        for batch_start in (0..chunks.len()).step_by(COMPACTION_MAX_CONCURRENCY) {
-            if self.cancelled() {
-                return Err("上下文压缩已取消".to_string());
-            }
-            let batch_end = (batch_start + COMPACTION_MAX_CONCURRENCY).min(chunks.len());
-            let batch = thread::scope(|scope| {
-                let completed = &completed;
-                let handles = (batch_start..batch_end)
-                    .map(|index| {
-                        scope.spawn(move || {
-                            let summary = self.invoke_compaction_summary(
-                                client,
-                                &chunks[index],
-                                stage,
-                                index,
-                                chunks.len(),
-                                summary_target_tokens,
-                            )?;
-                            let completed_chunks = completed.fetch_add(1, Ordering::SeqCst) + 1;
-                            self.notify_compaction(ContextCompactionProgress::Advanced {
-                                stage,
-                                completed_chunks,
-                                total_chunks: chunks.len(),
-                            });
-                            Ok::<_, String>((index, summary))
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                handles
-                    .into_iter()
-                    .map(|handle| {
-                        handle
-                            .join()
-                            .map_err(|_| "上下文压缩工作线程异常退出".to_string())?
-                    })
-                    .collect::<Result<Vec<_>, String>>()
-            })?;
-            summaries.extend(batch.into_iter().map(|(_, summary)| summary));
-        }
-        if self.cancelled() {
-            return Err("上下文压缩已取消".to_string());
-        }
-        Ok(summaries)
     }
 
     fn notify_compaction(&self, progress: ContextCompactionProgress) {
@@ -809,41 +719,78 @@ impl<'a> ContextAuthority<'a> {
     }
 }
 
-fn pack_compaction_sources(sources: Vec<String>, token_budget: usize) -> Vec<String> {
-    let mut fragments = Vec::new();
-    for source in sources {
-        if estimate_text_tokens(&source) <= token_budget {
-            fragments.push(source);
-            continue;
-        }
-        let chars = source.chars().collect::<Vec<_>>();
-        for (index, chunk) in chars.chunks(token_budget.max(1)).enumerate() {
-            fragments.push(format!(
-                "oversized_source_fragment={}\n{}",
-                index,
-                chunk.iter().collect::<String>()
-            ));
+fn bounded_compaction_source(sources: Vec<String>, token_budget: usize) -> String {
+    let source = sources.join("\n\n");
+    truncate_text_to_token_budget(&source, token_budget)
+}
+
+fn truncate_text_to_token_budget(value: &str, token_budget: usize) -> String {
+    if token_budget == 0 || value.is_empty() {
+        return String::new();
+    }
+    let original_tokens = estimate_text_tokens(value);
+    if original_tokens <= token_budget {
+        return value.to_string();
+    }
+
+    let marker = format!(
+        "\n\n[context_compaction_omitted: 中间历史已按预算省略；原始估算 {original_tokens} token]\n\n"
+    );
+    let marker_tokens = estimate_text_tokens(&marker);
+    if marker_tokens >= token_budget {
+        return prefix_with_token_budget(value, token_budget);
+    }
+
+    let available = token_budget - marker_tokens;
+    let head_budget = available / 3;
+    let tail_budget = available - head_budget;
+    let chars = value.chars().collect::<Vec<_>>();
+    let head_count = prefix_char_count_with_token_budget(&chars, head_budget);
+    let max_tail_count = chars.len().saturating_sub(head_count);
+    let tail_count = suffix_char_count_with_token_budget(&chars, tail_budget).min(max_tail_count);
+    let head = chars[..head_count].iter().collect::<String>();
+    let tail = chars[chars.len().saturating_sub(tail_count)..]
+        .iter()
+        .collect::<String>();
+    let bounded = format!("{head}{marker}{tail}");
+    if estimate_text_tokens(&bounded) <= token_budget {
+        bounded
+    } else {
+        prefix_with_token_budget(&bounded, token_budget)
+    }
+}
+
+fn prefix_with_token_budget(value: &str, token_budget: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    let count = prefix_char_count_with_token_budget(&chars, token_budget);
+    chars[..count].iter().collect()
+}
+
+fn prefix_char_count_with_token_budget(chars: &[char], token_budget: usize) -> usize {
+    char_count_with_token_budget(chars, token_budget, false)
+}
+
+fn suffix_char_count_with_token_budget(chars: &[char], token_budget: usize) -> usize {
+    char_count_with_token_budget(chars, token_budget, true)
+}
+
+fn char_count_with_token_budget(chars: &[char], token_budget: usize, from_end: bool) -> usize {
+    let mut low = 0usize;
+    let mut high = chars.len();
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let candidate = if from_end {
+            chars[chars.len() - mid..].iter().collect::<String>()
+        } else {
+            chars[..mid].iter().collect::<String>()
+        };
+        if estimate_text_tokens(&candidate) <= token_budget {
+            low = mid;
+        } else {
+            high = mid - 1;
         }
     }
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut current_tokens = 0usize;
-    for fragment in fragments {
-        let fragment_tokens = estimate_text_tokens(&fragment);
-        if !current.is_empty() && current_tokens.saturating_add(fragment_tokens) > token_budget {
-            chunks.push(std::mem::take(&mut current));
-            current_tokens = 0;
-        }
-        if !current.is_empty() {
-            current.push_str("\n\n");
-        }
-        current.push_str(&fragment);
-        current_tokens = current_tokens.saturating_add(fragment_tokens);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
+    low
 }
 
 fn estimate_thread_message_tokens(message: &ThreadChatMessage) -> usize {
@@ -956,6 +903,24 @@ fn validate_workspace_file_facts(history: &mut [ThreadChatMessage]) {
             })
             .to_string(),
         );
+    }
+}
+
+fn bound_model_visible_tool_results(history: &mut [ThreadChatMessage]) {
+    let indices = history
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            (message.role == "tool" && message.content.is_some()).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let results = indices
+        .iter()
+        .filter_map(|index| history[*index].content.clone())
+        .collect::<Vec<_>>();
+    let bounded = bound_model_visible_tool_history(&results);
+    for (index, result) in indices.into_iter().zip(bounded) {
+        history[index].content = Some(result);
     }
 }
 
@@ -1208,7 +1173,62 @@ fn choose_thread_history_compaction_split(
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextCompactionProgress, ContextCompactionProgressGate};
+    use super::{
+        ContextCompactionProgress, ContextCompactionProgressGate, bound_model_visible_tool_results,
+        bounded_compaction_source, estimate_text_tokens, truncate_text_to_token_budget,
+    };
+    use magi_session_store::ThreadChatMessage;
+
+    #[test]
+    fn bounded_compaction_source_preserves_early_and_recent_history_within_budget() {
+        let sources = (0..80)
+            .map(|index| format!("message_index={index}\n{}", "x".repeat(1_000)))
+            .collect::<Vec<_>>();
+        let bounded = bounded_compaction_source(sources, 2_000);
+
+        assert!(estimate_text_tokens(&bounded) <= 2_000);
+        assert!(bounded.contains("message_index=0"));
+        assert!(bounded.contains("message_index=79"));
+        assert!(bounded.contains("context_compaction_omitted"));
+    }
+
+    #[test]
+    fn compaction_summary_is_locally_bounded_without_recursive_model_calls() {
+        let summary = format!("开头事实{}结尾事实", "内容".repeat(20_000));
+        let bounded = truncate_text_to_token_budget(&summary, 800);
+
+        assert!(estimate_text_tokens(&bounded) <= 800);
+        assert!(bounded.contains("开头事实"));
+        assert!(bounded.contains("结尾事实"));
+    }
+
+    #[test]
+    fn historical_tool_results_are_bounded_only_in_model_context_view() {
+        let original = serde_json::json!({
+            "tool": "shell_exec",
+            "status": "succeeded",
+            "stdout": "x".repeat(50_000),
+        })
+        .to_string();
+        let mut history = vec![ThreadChatMessage {
+            role: "tool".to_string(),
+            content: Some(original.clone()),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call-large-output".to_string()),
+            provider_context: Vec::new(),
+        }];
+
+        bound_model_visible_tool_results(&mut history);
+
+        let visible = history[0].content.as_deref().expect("tool result");
+        assert!(visible.len() < original.len());
+        assert!(visible.contains("model_truncated"));
+        assert_eq!(
+            history[0].tool_call_id.as_deref(),
+            Some("call-large-output")
+        );
+    }
 
     #[test]
     fn compaction_progress_gate_rejects_regressive_concurrent_updates() {

@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import Icon from '../components/Icon.svelte';
   import MarkdownContent from '../components/MarkdownContent.svelte';
   import DiffCodeBlock from '../components/blocks/DiffCodeBlock.svelte';
   import AgentTabContent from '../components/tabs/AgentTabContent.svelte';
   import BrowserTabContent from '../components/tabs/BrowserTabContent.svelte';
+  import TerminalTabContent from '../components/tabs/TerminalTabContent.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { highlightCode } from '../lib/code-highlighter';
   import {
@@ -31,11 +32,15 @@
     type CodeTabPayload,
     type AgentTabPayload,
     type BrowserTabPayload,
+    type TerminalTabPayload,
     openBrowserTab,
+    openTerminalTab,
   } from '../stores/right-pane.svelte';
   import {
     activateBrowserTab,
+    BROWSER_AUTHORITY_CHANGED_EVENT,
     closeBrowserTab,
+    closeTerminalSession,
     createBrowserSession,
     createBrowserTab,
     getBrowserCapabilities,
@@ -43,7 +48,9 @@
     getAgentFilePreview,
     agentUrl,
     buildFilePreviewQuery,
+    isPublicTunnelAccess,
     type BrowserCapabilitiesSnapshot,
+    type BrowserViewport,
   } from './agent-api';
 
   interface Props {
@@ -57,22 +64,66 @@
   const paneScopeKey = $derived(rightPaneState.activeScopeKey);
   const paneState = $derived(getRightPaneState(paneScopeKey));
   const openTabs = $derived(paneState.openTabs);
+  let tabStripElement: HTMLDivElement | undefined;
+  let rightPaneBodyElement: HTMLDivElement | undefined;
+
+  function initialBrowserViewport(): BrowserViewport {
+    const width = Math.min(7_680, Math.max(320, Math.round(
+      rightPaneBodyElement?.clientWidth || 390,
+    )));
+    const height = Math.min(4_320, Math.max(240, Math.round(
+      rightPaneBodyElement?.clientHeight || 800,
+    )));
+    return {
+      width,
+      height,
+      deviceScaleFactorMillis: 1_000,
+      deviceType: width <= 600 ? 'mobile' : 'desktop',
+    };
+  }
+
+  $effect(() => {
+    const activeTabId = paneState.activeTabId;
+    void openTabs.length;
+    if (!activeTabId || !tabStripElement) return;
+    void tick().then(() => {
+      const strip = tabStripElement;
+      const activeElement = Array.from(strip?.children ?? []).find((element) => (
+        element instanceof HTMLElement && element.dataset.tabId === activeTabId
+      ));
+      if (!strip || !(activeElement instanceof HTMLElement)) return;
+      const left = activeElement.offsetLeft;
+      const right = left + activeElement.offsetWidth;
+      if (left < strip.scrollLeft) {
+        strip.scrollLeft = left;
+      } else if (right > strip.scrollLeft + strip.clientWidth) {
+        strip.scrollLeft = right - strip.clientWidth;
+      }
+    });
+  });
 
   function closePane(): void {
     setRightPaneCollapsed(paneScopeKey, true);
   }
   let creatingBrowserPane = $state(false);
-  let browserUiEnabled = $state(false);
+  let browserCapabilities = $state<BrowserCapabilitiesSnapshot | null>(null);
   let addPaneMenuOpen = $state(false);
   let addPaneMenuElement = $state<HTMLDivElement | undefined>(undefined);
   const canCreateBrowserPane = $derived(Boolean(
-    browserUiEnabled
+    browserCapabilities?.inAppBrowserEnabled
+      && browserCapabilities.hostStatus === 'ready'
+      && browserCapabilities.hostProtocolCompatible
+      && rightPaneState.activeWorkspaceId.trim()
+      && rightPaneState.activeSessionId.trim(),
+  ));
+  const canCreateTerminalPane = $derived(Boolean(
+    !isPublicTunnelAccess()
       && rightPaneState.activeWorkspaceId.trim()
       && rightPaneState.activeSessionId.trim(),
   ));
 
   function applyBrowserCapabilities(snapshot: BrowserCapabilitiesSnapshot): void {
-    browserUiEnabled = snapshot.inAppBrowserEnabled;
+    browserCapabilities = snapshot;
   }
 
   onMount(() => {
@@ -82,7 +133,15 @@
     const handleCapabilitiesChanged = (event: Event) => {
       applyBrowserCapabilities((event as CustomEvent<BrowserCapabilitiesSnapshot>).detail);
     };
+    const handleRuntimeStatusChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{ eventType?: string }>).detail;
+      if (detail?.eventType !== 'browser.runtime.status_changed') return;
+      void getBrowserCapabilities()
+        .then(applyBrowserCapabilities)
+        .catch((error) => console.warn('[RightPane] 刷新浏览器运行能力失败:', error));
+    };
     window.addEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
+    window.addEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, handleRuntimeStatusChanged);
     const handleOutsidePointer = (event: PointerEvent) => {
       const target = event.target;
       if (addPaneMenuElement && target instanceof Node && !addPaneMenuElement.contains(target)) {
@@ -102,6 +161,7 @@
     window.addEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
     return () => {
       window.removeEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
+      window.removeEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, handleRuntimeStatusChanged);
       window.removeEventListener('pointerdown', handleOutsidePointer);
       window.removeEventListener('keydown', handleEscape);
       window.removeEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
@@ -113,6 +173,19 @@
       await closeBrowserTab(tabId);
     } catch (error) {
       console.warn('[RightPane] 关闭浏览器面板资源失败:', error);
+    }
+  }
+
+  async function closeTerminalPanelResources(payload: TerminalTabPayload): Promise<void> {
+    try {
+      await closeTerminalSession({
+        terminalTabId: payload.terminalTabId,
+        workspaceId: payload.workspaceId,
+        workspacePath: payload.workspacePath,
+        sessionId: payload.sessionId,
+      });
+    } catch (error) {
+      console.warn('[RightPane] 关闭终端面板资源失败:', error);
     }
   }
 
@@ -146,7 +219,11 @@
     creatingBrowserPane = true;
     try {
       const browserSession = await createBrowserSession(workspaceId, sessionId);
-      const tab = await createBrowserTab(browserSession.browserSessionId, targetUrl);
+      const tab = await createBrowserTab(
+        browserSession.browserSessionId,
+        targetUrl,
+        initialBrowserViewport(),
+      );
       await activateBrowserTab(tab.tabId);
       registerBrowserPane(
         browserSession.browserSessionId,
@@ -163,8 +240,23 @@
     }
   }
 
-  type RightPaneCreationKind = 'browser';
+  function createTerminalPane(): void {
+    if (!canCreateTerminalPane) return;
+    openTerminalTab({
+      workspaceId: rightPaneState.activeWorkspaceId,
+      workspacePath: workspaceRoot,
+      sessionId: rightPaneState.activeSessionId,
+    });
+  }
+
+  type RightPaneCreationKind = 'browser' | 'terminal';
   const addablePaneKinds = $derived([
+    {
+      kind: 'terminal' as const,
+      label: i18n.t('rightPane.addPanelTerminal'),
+      icon: 'terminal' as const,
+      enabled: canCreateTerminalPane,
+    },
     {
       kind: 'browser' as const,
       label: i18n.t('rightPane.addPanelBrowser'),
@@ -172,19 +264,31 @@
       enabled: canCreateBrowserPane,
     },
   ]);
+  const canOpenAddPaneMenu = $derived(addablePaneKinds.some((item) => item.enabled));
 
   function toggleAddPaneMenu(): void {
-    if (!canCreateBrowserPane || creatingBrowserPane) return;
+    if (!canOpenAddPaneMenu || creatingBrowserPane) return;
     addPaneMenuOpen = !addPaneMenuOpen;
   }
 
   function chooseAddPane(kind: RightPaneCreationKind): void {
     addPaneMenuOpen = false;
-    if (kind === 'browser') void createBrowserPane();
+    if (kind === 'browser') {
+      void createBrowserPane();
+      return;
+    }
+    createTerminalPane();
   }
   const activeTab = $derived.by<RightPaneTab | null>(() => {
-    if (!paneState.activeTabId) return null;
-    return openTabs.find((tab) => tab.id === paneState.activeTabId) ?? null;
+    // Tab 条与内容区必须从同一份根状态解析当前 Tab。不要透过 paneState/openTabs
+    // 的派生引用再做二次缓存，否则同一轮内新增 Tab 并激活时可能出现 Tab 条已更新、
+    // 内容区仍读取旧 activeTab 的撕裂状态。
+    const scopeKey = rightPaneState.activeScopeKey;
+    const state = scopeKey ? rightPaneState.perSession[scopeKey] : undefined;
+    const activeTabId = state?.activeTabId;
+    return activeTabId
+      ? state?.openTabs.find((tab) => tab.id === activeTabId) ?? null
+      : null;
   });
 
   // ============ Code tab：内容拉取 ============
@@ -575,6 +679,7 @@
       const tab = await createBrowserTab(
         browserSession.browserSessionId,
         agentUrl('/api/files/site-open', activeFilePreviewQuery),
+        initialBrowserViewport(),
       );
       await activateBrowserTab(tab.tabId);
       registerBrowserPane(
@@ -646,12 +751,14 @@
   }
 
   function tabLabel(tab: RightPaneTab): string {
+    if (tab.kind === 'terminal') return i18n.t('terminalPanel.title');
     return tab.label;
   }
 
-  function tabIcon(tab: RightPaneTab): 'file-text' | 'chevron-right' | 'globe' {
+  function tabIcon(tab: RightPaneTab): 'file-text' | 'chevron-right' | 'globe' | 'terminal' {
     if (tab.kind === 'code') return 'file-text';
-    return tab.kind === 'browser' ? 'globe' : 'chevron-right';
+    if (tab.kind === 'browser') return 'globe';
+    return tab.kind === 'terminal' ? 'terminal' : 'chevron-right';
   }
 
   function tabTooltip(tab: RightPaneTab): string {
@@ -661,6 +768,10 @@
     }
     if (tab.kind === 'browser') {
       return (tab.payload as BrowserTabPayload).browserSessionId;
+    }
+    if (tab.kind === 'terminal') {
+      const payload = tab.payload as TerminalTabPayload;
+      return payload.workspacePath || payload.workspaceId;
     }
     return tabLabel(tab);
   }
@@ -702,6 +813,8 @@
     if (tab?.kind === 'browser') {
       const browserTabId = (tab.payload as BrowserTabPayload).tabId;
       void closeBrowserPanelResource(browserTabId);
+    } else if (tab?.kind === 'terminal') {
+      void closeTerminalPanelResources(tab.payload as TerminalTabPayload);
     }
   }
 
@@ -797,6 +910,7 @@
       </button>
     {/if}
     <div
+      bind:this={tabStripElement}
       class="right-pane-tabs"
       class:dragging={isDraggingTabs}
       role="tablist"
@@ -839,14 +953,14 @@
         </div>
       {/each}
     </div>
-    {#if browserUiEnabled}
+    {#if canOpenAddPaneMenu}
       <div bind:this={addPaneMenuElement} class="right-pane-add-wrap">
         <button
           type="button"
           class="right-pane-add-tab"
           data-open-tab-count={openTabs.length}
           onclick={toggleAddPaneMenu}
-          disabled={!canCreateBrowserPane || creatingBrowserPane}
+          disabled={!canOpenAddPaneMenu || creatingBrowserPane}
           title={i18n.t('rightPane.addPanel')}
           aria-label={i18n.t('rightPane.addPanel')}
           aria-haspopup="menu"
@@ -913,9 +1027,11 @@
 
   <!-- Body：按 activeTab 路由 -->
   <div
+    bind:this={rightPaneBodyElement}
     class="right-pane-body"
     class:right-pane-body--code={codeMode}
     class:right-pane-body--browser={activeTab?.kind === 'browser'}
+    class:right-pane-body--terminal={activeTab?.kind === 'terminal'}
   >
     {#if !activeTab}
       <div class="right-pane-state">
@@ -936,7 +1052,16 @@
       <BrowserTabContent
         browserSessionId={browserPayload.browserSessionId}
         tabId={browserPayload.tabId}
+        sessionId={browserPayload.sessionId}
         onTitleChange={(label) => updateRightPaneTabLabel(paneScopeKey, activeTab.id, label)}
+      />
+    {:else if activeTab.kind === 'terminal'}
+      {@const terminalPayload = activeTab.payload as TerminalTabPayload}
+      <TerminalTabContent
+        terminalTabId={terminalPayload.terminalTabId}
+        workspaceId={terminalPayload.workspaceId}
+        workspacePath={terminalPayload.workspacePath}
+        sessionId={terminalPayload.sessionId}
       />
     {:else if previewLoading}
       <div class="right-pane-state">{i18n.t('web.filePreviewLoading')}</div>
@@ -1381,6 +1506,12 @@
   }
 
   .right-pane-body--browser {
+    overflow: hidden;
+    padding: 0;
+  }
+
+  .right-pane-body--terminal {
+    display: flex;
     overflow: hidden;
     padding: 0;
   }

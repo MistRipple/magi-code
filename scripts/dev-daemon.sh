@@ -55,6 +55,9 @@ DAEMON_ENV=(
 BROWSER_HOST_ENTRY="${MAGI_BROWSER_DEV_HOST_ENTRY:-$ROOT_DIR/browser-host/dist/index.cjs}"
 BROWSER_NODE_MODULES="$ROOT_DIR/browser-host/node_modules"
 BROWSER_CHROMIUM="${MAGI_BROWSER_DEV_CHROMIUM:-}"
+if [ -z "$BROWSER_CHROMIUM" ] && [ -d "$BROWSER_NODE_MODULES/playwright-core" ]; then
+  BROWSER_CHROMIUM="$(${MAGI_BROWSER_DEV_NODE:-node} -e "const { chromium } = require('$BROWSER_NODE_MODULES/playwright-core'); process.stdout.write(chromium.executablePath())")"
+fi
 if [ -z "$BROWSER_CHROMIUM" ] && [ "$(uname -s)" = "Darwin" ]; then
   for candidate in \
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
@@ -72,9 +75,6 @@ if [ -z "$BROWSER_CHROMIUM" ]; then
       break
     fi
   done
-fi
-if [ -z "$BROWSER_CHROMIUM" ] && [ -d "$BROWSER_NODE_MODULES/playwright-core" ]; then
-  BROWSER_CHROMIUM="$(${MAGI_BROWSER_DEV_NODE:-node} -e "const { chromium } = require('$BROWSER_NODE_MODULES/playwright-core'); process.stdout.write(chromium.executablePath())")"
 fi
 if [ -f "$BROWSER_HOST_ENTRY" ] && [ -f "$BROWSER_CHROMIUM" ]; then
   DAEMON_ENV+=(

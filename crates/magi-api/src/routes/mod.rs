@@ -13,6 +13,7 @@ mod messages;
 mod session_scope;
 pub(crate) mod sessions;
 pub(crate) mod settings;
+mod terminal;
 mod tools;
 mod workspace_vcs;
 mod workspaces;
@@ -113,6 +114,7 @@ pub fn build_router(state: ApiState) -> Router {
         .merge(file_site::routes())
         .merge(agent_run_actions::routes())
         .merge(agent_runs::routes())
+        .merge(terminal::routes())
         .merge(tools::routes())
         .merge(messages::routes())
         .layer(middleware::from_fn(

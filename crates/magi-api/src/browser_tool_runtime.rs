@@ -293,9 +293,9 @@ impl BrowserToolRuntimeDependencies {
                 };
                 if tab.viewport != viewport {
                     let reply = client
-                        .request(BrowserHostCommand::SetViewport {
+                        .request(BrowserHostCommand::SetLogicalViewport {
                             tab_id: tab.tab_id.clone(),
-                            viewport: magi_browser_runtime::HostViewport {
+                            viewport: magi_browser_runtime::BrowserLogicalViewport {
                                 width,
                                 height,
                                 device_scale_factor_millis: viewport.device_scale_factor_millis,
@@ -590,6 +590,8 @@ impl BrowserToolRuntimeDependencies {
                 viewport: magi_browser_runtime::HostViewport {
                     width: tab.viewport.width,
                     height: tab.viewport.height,
+                    surface_width: tab.viewport.width,
+                    surface_height: tab.viewport.height,
                     device_scale_factor_millis: tab.viewport.device_scale_factor_millis,
                     device_type: tab.viewport.device_type,
                 },
@@ -1017,6 +1019,8 @@ impl BrowserToolRuntimeDependencies {
                         viewport: magi_browser_runtime::HostViewport {
                             width: created.viewport.width,
                             height: created.viewport.height,
+                            surface_width: created.viewport.width,
+                            surface_height: created.viewport.height,
                             device_scale_factor_millis: created.viewport.device_scale_factor_millis,
                             device_type: created.viewport.device_type,
                         },

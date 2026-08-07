@@ -400,7 +400,7 @@ impl BuiltinToolName {
     ///
     /// 该分类服务于运行时执行账本，和访问权限、风险等级不同：只有不会改变
     /// 外部状态，且重复读取不会产生新的产品语义的内置工具才可以复用。Shell、
-    /// 进程查询以及所有协调、写入工具都不能依赖这个分类。
+    /// 进程查询、动态浏览器状态以及所有协调、写入工具都不能依赖这个分类。
     pub fn is_idempotent_read_operation(&self) -> bool {
         matches!(
             self,
@@ -420,8 +420,6 @@ impl BuiltinToolName {
                 | Self::GitWorktreeList
                 | Self::ContextSearch
                 | Self::ContextRead
-                | Self::BrowserSnapshot
-                | Self::BrowserScreenshot
         )
     }
 
@@ -701,6 +699,9 @@ impl BuiltinToolName {
                 - 创建新文件 → 用 file_write\n\
                 - 整体重构 / 改动量 ≥ 50% → 用 file_write 整体覆盖更清晰\n\
                 - old_string 在文件中出现多次又不能扩展上下文 → 改用批量 patches 数组逐条精确替换\n\n\
+                # 输入约束\n\
+                - old_string/new_string 与 patches 二选一，不能混用\n\
+                - 批量 patches 原子执行；任一项无法唯一匹配时整批不写入\n\n\
                 # 反例\n\
                 - ❌ old_string 只写一行短代码且文件里出现多次 → 替换位置歧义、可能改错位置\n\
                 - ✅ old_string 包含目标行 + 前后各 1-2 行上下文确保唯一性"
@@ -731,7 +732,8 @@ impl BuiltinToolName {
                 # 何时用\n\
                 - 没有专用工具能完成的任务：构建（cargo build / npm run）、运行测试、查 PID\n\
                 - 一次性 ad-hoc 命令（解压、统计行数、查磁盘占用）\n\
-                - 启动后台命令时设置 background=true；后续用同一个 shell_exec 传 action=read/write/kill/list 和 terminal_id 管理\n\n\
+                - 启动后台命令时设置 background=true；后续用同一个 shell_exec 传 action=read/write/kill/list 和 terminal_id 管理\n\
+                - 验证 Web 项目时，用 background=true 启动项目已有的开发服务，从输出确认真实监听 URL，再用 browser_navigate 和其他 browser_* 工具完成页面验收\n\n\
                 # 命令准确性\n\
                 - 执行项目测试或构建前，先读取 package.json、Cargo.toml 等项目清单确认已有脚本和参数\n\
                 - 禁止臆造 --runInBand 等测试框架参数；只使用项目清单、用户指令或工具帮助中已确认支持的参数\n\n\
@@ -758,7 +760,13 @@ impl BuiltinToolName {
             Self::WebSearch => "通过 DuckDuckGo 搜索网络并返回结果",
             Self::WebFetch => "抓取一个 URL 的内容并将 HTML 转为 markdown",
             Self::BrowserNavigate => {
-                "在 Magi 内置浏览器中创建或复用页面，并执行 URL 导航、后退、前进或刷新。"
+                "在 Magi 内置浏览器中创建或复用页面，并执行 URL 导航、后退、前进或刷新。\n\n\
+                # Web 项目验收\n\
+                - 先读取项目清单确认启动命令，再用 shell_exec(background=true) 启动开发服务\n\
+                - 从服务输出确认实际监听 URL 和端口，不要臆测 localhost 端口\n\
+                - 导航后必须继续用 browser_snapshot 获取可交互元素，并按任务需要调用 browser_click / browser_type / browser_press / browser_scroll\n\
+                - 响应式任务使用 browser_viewport 覆盖桌面和手机视口；视觉结果使用 browser_screenshot 留证\n\
+                - 构建成功、curl 成功或静态阅读都不能替代真实浏览器验收"
             }
             Self::BrowserSnapshot => {
                 "读取当前浏览器页面的紧凑可访问性快照。返回的元素 ref 只在同一 snapshot_revision 内有效。"
@@ -980,15 +988,16 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "要修改文件的工作区相对路径（推荐）或当前平台原生绝对路径" },
-                    "old_string": { "type": "string", "description": "要查找的原文本（必须在文件中精确匹配一次）" },
+                    "old_string": { "type": "string", "minLength": 1, "description": "要查找的原文本（必须在文件中精确匹配一次）" },
                     "new_string": { "type": "string", "description": "替换后的文本" },
                     "patches": {
                         "type": "array",
+                        "minItems": 1,
                         "description": "批量补丁数组（与 old_string / new_string 二选一）",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "old_string": { "type": "string" },
+                                "old_string": { "type": "string", "minLength": 1 },
                                 "new_string": { "type": "string" }
                             },
                             "required": ["old_string", "new_string"]
@@ -1933,16 +1942,12 @@ fn shell_exec_invocation_policy(input: &str) -> BuiltinToolInvocationPolicy {
 
     match action.as_deref() {
         None if has_terminal_id && !has_command => return low_risk_policy(),
-        Some("read" | "list") => return low_risk_policy(),
-        Some("write" | "kill") => {
+        Some("read" | "list" | "kill") => return low_risk_policy(),
+        Some("write") => {
             return medium_risk_policy();
         }
         Some("run") | None => {}
         Some(_) => return medium_risk_policy(),
-    }
-
-    if json_field_bool(&request, &["background"]).unwrap_or(false) {
-        return medium_risk_policy();
     }
 
     match json_field_string(&request, &["access_mode"])
@@ -1985,22 +1990,20 @@ fn json_field_string(
     })
 }
 
-fn json_field_bool(
-    object: &serde_json::Map<String, serde_json::Value>,
-    keys: &[&str],
-) -> Option<bool> {
-    keys.iter().find_map(|key| {
-        object.get(*key).and_then(|value| {
-            value
-                .as_bool()
-                .or_else(|| value.as_str().and_then(|value| value.parse::<bool>().ok()))
-        })
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_patch_schema_requires_non_empty_match_inputs() {
+        let schema = BuiltinToolName::FilePatch.parameters_schema();
+        assert_eq!(schema["properties"]["old_string"]["minLength"], 1);
+        assert_eq!(schema["properties"]["patches"]["minItems"], 1);
+        assert_eq!(
+            schema["properties"]["patches"]["items"]["properties"]["old_string"]["minLength"],
+            1
+        );
+    }
 
     #[test]
     fn web_fetch_schema_only_exposes_supported_url_parameter() {

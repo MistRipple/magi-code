@@ -400,4 +400,27 @@ mod tests {
         assert!(prompt.contains("`security`"));
         assert!(prompt.find("`frontend`") < prompt.find("`security`"));
     }
+
+    #[test]
+    fn web_capabilities_require_managed_service_and_real_browser_validation() {
+        let registry = ProfessionalCapabilityRegistry::builtin();
+        for capability_id in ["frontend", "quality_engineering"] {
+            let capability = registry
+                .get(capability_id)
+                .unwrap_or_else(|| panic!("missing {capability_id} capability"));
+            for expected in [
+                "shell_exec",
+                "browser_navigate",
+                "browser_snapshot",
+                "browser_viewport",
+            ] {
+                assert!(
+                    capability.system_prompt.contains(expected),
+                    "{capability_id} 缺少浏览器验收契约 {expected}: {}",
+                    capability.system_prompt
+                );
+            }
+            assert!(capability.system_prompt.contains("curl"));
+        }
+    }
 }

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -94,6 +95,9 @@ test(
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Responsive device test</title>
     <style>
+      body {
+        min-height: 2_000px;
+      }
       #responsive-grid {
         display: grid;
         grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -134,6 +138,21 @@ test(
 </html>`);
         return;
       }
+      if (request.url === "/download") {
+        response
+          .writeHead(200, {
+            "content-type": "text/plain; charset=utf-8",
+            "content-disposition": 'attachment; filename="sample.txt"',
+          })
+          .end("Magi browser download");
+        return;
+      }
+      if (request.url === "/popup") {
+        response
+          .writeHead(200, { "content-type": "text/html; charset=utf-8" })
+          .end("<!doctype html><title>Popup</title><p>Popup content</p>");
+        return;
+      }
       response
         .writeHead(200, { "content-type": "text/html; charset=utf-8" })
         .end(`<!doctype html>
@@ -141,6 +160,10 @@ test(
   <body>
     <button id="increment">Increment</button>
     <button id="delete-account">Delete account</button>
+    <button id="show-dialog" onclick="alert('Dialog content')">Show dialog</button>
+    <button id="open-popup" onclick="window.open('/popup', '_blank')">Open popup</button>
+    <a id="download" href="/download" download="sample.txt">Download sample</a>
+    <input aria-label="Upload file" type="file" />
     <input aria-label="Name" />
     <input aria-label="Password" type="password" value="server-secret" />
     <input aria-label="Verification code" autocomplete="one-time-code" value="123456" />
@@ -163,6 +186,7 @@ test(
     const appAddress = appServer.address();
     assert(appAddress && typeof appAddress !== "string");
     const token = "browser-host-integration-token-000000000000";
+    const downloadPath = join(profilePath, "downloads");
     let hostServer: Awaited<ReturnType<typeof startBrowserHostServer>> | undefined;
     let client: HostTestClient | undefined;
 
@@ -176,16 +200,35 @@ test(
         runtimeEpoch: 1,
         headless: true,
         deviceScaleFactor: 2,
+        downloadPath,
+        maxActivePages: 16,
+        maxTabs: 16,
         bindHost: "127.0.0.1",
         port: 0,
         authToken: token,
       });
+      if (process.platform !== "win32") {
+        const browserCommands = execFileSync("/bin/ps", ["-axo", "command"], {
+          encoding: "utf8",
+        })
+          .split("\n")
+          .filter((line) => line.includes(profilePath));
+        assert(browserCommands.length > 0, "sandbox test must locate the Chromium process");
+        assert(
+          browserCommands.every((line) => !line.includes("--no-sandbox")),
+          "Browser Runtime must never disable the Chromium sandbox",
+        );
+      }
       client = new HostTestClient(
         `ws://127.0.0.1:${hostServer.port}/control`,
         token,
       );
       await client.open();
       await client.waitForEvent("ready");
+      await client.call({
+        type: "update_control",
+        payload: { fence: 1, mode: "agent" },
+      });
       const failedPage = await client.call({
         type: "create_page",
         payload: {
@@ -194,6 +237,8 @@ test(
           viewport: {
             width: 900,
             height: 700,
+            surface_width: 900,
+            surface_height: 700,
             device_scale_factor_millis: 1_000,
             device_type: "desktop",
           },
@@ -210,6 +255,8 @@ test(
           viewport: {
             width: 900,
             height: 700,
+            surface_width: 900,
+            surface_height: 700,
             device_scale_factor_millis: 1_000,
             device_type: "desktop",
           },
@@ -226,6 +273,8 @@ test(
           viewport: {
             width: 900,
             height: 700,
+            surface_width: 900,
+            surface_height: 700,
             device_scale_factor_millis: 1_000,
             device_type: "desktop",
           },
@@ -243,6 +292,8 @@ test(
           viewport: {
             width: 900,
             height: 700,
+            surface_width: 900,
+            surface_height: 700,
             device_scale_factor_millis: 1_000,
             device_type: "desktop",
           },
@@ -264,6 +315,8 @@ test(
           viewport: {
             width: 900,
             height: 700,
+            surface_width: 900,
+            surface_height: 700,
             device_scale_factor_millis: 1_000,
             device_type: "desktop",
           },
@@ -298,6 +351,8 @@ test(
           viewport: {
             width: 900,
             height: 700,
+            surface_width: 900,
+            surface_height: 700,
             device_scale_factor_millis: 1_000,
             device_type: "desktop",
           },
@@ -348,6 +403,8 @@ test(
           viewport: {
             width: 390,
             height: 844,
+            surface_width: 390,
+            surface_height: 844,
             device_scale_factor_millis: 1_000,
             device_type: "mobile",
           },
@@ -420,6 +477,186 @@ test(
         "annotation screenshots must contain only the selected viewport region",
       );
 
+      const fittedWideViewport = await client.call({
+        type: "set_viewport",
+        payload: {
+          tab_id: "tab-responsive",
+          viewport: {
+            width: 1_280,
+            height: 800,
+            surface_width: 511,
+            surface_height: 1_099,
+            device_scale_factor_millis: 1_000,
+            device_type: "desktop",
+          },
+        },
+      });
+      assert.equal(fittedWideViewport.outcome.status, "succeeded");
+      const fittedWideSnapshot = snapshotFrom(
+        await client.call({
+          type: "snapshot",
+          payload: {
+            tab_id: "tab-responsive",
+            limits: { max_nodes: 400, max_text_bytes: 32 * 1024 },
+            subtree_ref: null,
+          },
+        }),
+      );
+      assert(
+        fittedWideSnapshot.root.children.some(
+          (node) => node.name === "Viewport 1280 / Media desktop / Touch 0 / Resize 2",
+        ),
+        "browser-native fitting must preserve the requested logical desktop viewport",
+      );
+      await client.call({
+        type: "start_screencast",
+        payload: {
+          tab_id: "tab-responsive",
+          format: "jpeg",
+          quality: 88,
+          max_width: 7_680,
+          max_height: 4_320,
+        },
+      });
+      const fittedWideCapture = await waitForScreencastFrame(
+        client,
+        (event) => event.event.type === "screencast_frame"
+          && event.event.payload.tab_id === "tab-responsive"
+          && event.event.payload.width === 1_280
+          && event.event.payload.surface_width === 511,
+      );
+      const fittedWideFrame = fittedWideCapture.event;
+      assert.equal(fittedWideFrame.event.type, "screencast_frame");
+      if (fittedWideFrame.event.type === "screencast_frame") {
+        assert.equal(fittedWideFrame.event.payload.width, 1_280);
+        assert.equal(fittedWideFrame.event.payload.height, 800);
+        assert.equal(fittedWideFrame.event.payload.surface_width, 511);
+        assert.equal(fittedWideFrame.event.payload.surface_height, 319);
+      }
+      assert.deepEqual(
+        jpegDimensions(fittedWideCapture.binary),
+        { width: 2_560, height: 1_600 },
+        "Chromium must keep a native high-DPI frame while the panel surface fits it for display",
+      );
+      const resizedSurface = await client.call({
+        type: "set_viewport",
+        payload: {
+          tab_id: "tab-responsive",
+          viewport: {
+            width: 1_280,
+            height: 800,
+            surface_width: 400,
+            surface_height: 900,
+            device_scale_factor_millis: 1_000,
+            device_type: "desktop",
+          },
+        },
+      });
+      assert.equal(resizedSurface.outcome.status, "succeeded");
+      const resizedSurfaceSnapshot = snapshotFrom(
+        await client.call({
+          type: "snapshot",
+          payload: {
+            tab_id: "tab-responsive",
+            limits: { max_nodes: 400, max_text_bytes: 32 * 1_024 },
+            subtree_ref: null,
+          },
+        }),
+      );
+      assert.equal(
+        resizedSurfaceSnapshot.snapshot_revision,
+        fittedWideSnapshot.snapshot_revision + 1,
+        "surface-only fitting must not invalidate the canonical DOM snapshot",
+      );
+      assert(
+        resizedSurfaceSnapshot.root.children.some(
+          (node) => node.name === "Viewport 1280 / Media desktop / Touch 0 / Resize 2",
+        ),
+        "resizing only the Chromium output surface must not resize the logical page viewport",
+      );
+      const resizedSurfaceScroll = await client.call({
+        type: "scroll",
+        payload: {
+          tab_id: "tab-responsive",
+          control: { mode: "agent", lease_id: "lease-a", fence: 1 },
+          target: null,
+          delta_x: 0,
+          delta_y: 100,
+        },
+      });
+      assert.equal(resizedSurfaceScroll.outcome.status, "succeeded");
+      const resizedSurfaceCapture = await waitForScreencastFrame(
+        client,
+        (event) => event.event.type === "screencast_frame"
+          && event.event.payload.tab_id === "tab-responsive"
+          && event.event.payload.width === 1_280
+          && event.event.payload.surface_width === 400,
+      );
+      const resizedSurfaceFrame = resizedSurfaceCapture.event;
+      assert.equal(resizedSurfaceFrame.event.type, "screencast_frame");
+      if (resizedSurfaceFrame.event.type === "screencast_frame") {
+        assert.equal(resizedSurfaceFrame.event.payload.width, 1_280);
+        assert.equal(resizedSurfaceFrame.event.payload.height, 800);
+        assert.equal(resizedSurfaceFrame.event.payload.surface_width, 400);
+        assert.equal(resizedSurfaceFrame.event.payload.surface_height, 250);
+      }
+      assert.deepEqual(
+        jpegDimensions(resizedSurfaceCapture.binary),
+        { width: 2_560, height: 1_600 },
+        "surface-only changes must not lower the stable screencast resolution",
+      );
+      await client.call({
+        type: "stop_screencast",
+        payload: { tab_id: "tab-responsive" },
+      });
+
+      const logicalOnlyViewport = await client.call({
+        type: "set_logical_viewport",
+        payload: {
+          tab_id: "tab-responsive",
+          viewport: {
+            width: 1_600,
+            height: 900,
+            device_scale_factor_millis: 1_000,
+            device_type: "desktop",
+          },
+        },
+      });
+      assert.equal(logicalOnlyViewport.outcome.status, "succeeded");
+      await client.call({
+        type: "start_screencast",
+        payload: {
+          tab_id: "tab-responsive",
+          format: "jpeg",
+          quality: 88,
+          max_width: 7_680,
+          max_height: 4_320,
+        },
+      });
+      const logicalOnlyCapture = await waitForScreencastFrame(
+        client,
+        (event) => event.event.type === "screencast_frame"
+          && event.event.payload.tab_id === "tab-responsive"
+          && event.event.payload.width === 1_600,
+      );
+      const logicalOnlyFrame = logicalOnlyCapture.event;
+      assert.equal(logicalOnlyFrame.event.type, "screencast_frame");
+      if (logicalOnlyFrame.event.type === "screencast_frame") {
+        assert.equal(logicalOnlyFrame.event.payload.width, 1_600);
+        assert.equal(logicalOnlyFrame.event.payload.height, 900);
+        assert.equal(logicalOnlyFrame.event.payload.surface_width, 400);
+        assert.equal(logicalOnlyFrame.event.payload.surface_height, 225);
+      }
+      assert.deepEqual(
+        jpegDimensions(logicalOnlyCapture.binary),
+        { width: 3_200, height: 1_800 },
+        "logical viewport changes must preserve the existing display surface",
+      );
+      await client.call({
+        type: "stop_screencast",
+        payload: { tab_id: "tab-responsive" },
+      });
+
       await client.call({
         type: "update_control",
         payload: { fence: 1, mode: "agent" },
@@ -433,6 +670,8 @@ test(
           viewport: {
             width: 900,
             height: 700,
+            surface_width: 900,
+            surface_height: 700,
             device_scale_factor_millis: 1_000,
             device_type: "desktop",
           },
@@ -470,6 +709,18 @@ test(
       const deleteAccount = firstSnapshot.root.children.find(
         (node) => node.name === "Delete account",
       );
+      const showDialog = firstSnapshot.root.children.find(
+        (node) => node.name === "Show dialog",
+      );
+      const openPopup = firstSnapshot.root.children.find(
+        (node) => node.name === "Open popup",
+      );
+      const downloadSample = firstSnapshot.root.children.find(
+        (node) => node.name === "Download sample",
+      );
+      const uploadFile = firstSnapshot.root.children.find(
+        (node) => node.name === "Upload file",
+      );
       const password = firstSnapshot.root.children.find(
         (node) => node.name === "Password",
       );
@@ -482,6 +733,10 @@ test(
       assert(button, "button snapshot ref should exist");
       assert(input, "input snapshot ref should exist");
       assert(deleteAccount, "sensitive action snapshot ref should exist");
+      assert(showDialog, "dialog test ref should exist");
+      assert(openPopup, "popup test ref should exist");
+      assert(downloadSample, "download test ref should exist");
+      assert(uploadFile, "file chooser test ref should exist");
       assert(password, "password snapshot ref should exist");
       assert(verificationCode, "verification code snapshot ref should exist");
       assert(cardNumber, "card number snapshot ref should exist");
@@ -494,6 +749,49 @@ test(
       assert.equal(cardNumber.editable, false);
       assert.equal(cardNumber.value, null);
       assert.equal(cardNumber.sensitive_input_kind, "payment_card");
+      const clickTestTarget = async (target: typeof showDialog) => {
+        assert(target);
+        const response = await client!.call({
+          type: "click",
+          payload: {
+            tab_id: "tab-a",
+            control: { mode: "agent", lease_id: "lease-a", fence: 1 },
+            target: {
+              snapshot_revision: firstSnapshot.snapshot_revision,
+              element_ref: target.element_ref,
+            },
+          },
+        });
+        assert.equal(response.outcome.status, "succeeded");
+      };
+      await clickTestTarget(showDialog);
+      const dialogEvent = await client.waitForEvent("dialog");
+      assert.equal(dialogEvent.event.type, "dialog");
+      if (dialogEvent.event.type === "dialog") {
+        assert.equal(dialogEvent.event.payload.message, "Dialog content");
+      }
+      await clickTestTarget(openPopup);
+      await client.waitForEvent("popup_blocked");
+      await clickTestTarget(uploadFile);
+      await client.waitForEvent("file_chooser");
+      await clickTestTarget(downloadSample);
+      const completedDownload = await client.waitForEvent("download");
+      assert.equal(completedDownload.event.type, "download");
+      const finalDownload = completedDownload.event.type === "download"
+        && completedDownload.event.payload.state === "completed"
+        ? completedDownload
+        : await client.waitForEvent("download");
+      assert.equal(finalDownload.event.type, "download");
+      if (finalDownload.event.type === "download") {
+        assert.equal(finalDownload.event.payload.state, "completed");
+        assert.equal(finalDownload.event.payload.byte_length, 21);
+      }
+      const downloadedFiles = await readdir(downloadPath);
+      assert.equal(downloadedFiles.length, 1);
+      assert.equal(
+        await readFile(join(downloadPath, downloadedFiles[0]), "utf8"),
+        "Magi browser download",
+      );
       const blockedSensitiveClick = await client.call({
         type: "click",
         payload: {
@@ -674,12 +972,19 @@ test(
           max_height: 1_400,
         },
       });
-      const screencastEvent = await client.waitForEvent("screencast_frame");
+      const screencastFrame = await waitForScreencastFrame(
+        client,
+        (event) => event.event.type === "screencast_frame"
+          && event.event.payload.tab_id === "tab-a",
+      );
+      const screencastEvent = screencastFrame.event;
       assert.equal(screencastEvent.event.type, "screencast_frame");
       assert.equal(screencastEvent.event.payload.width, 900);
       assert.equal(screencastEvent.event.payload.height, 700);
+      assert.equal(screencastEvent.event.payload.surface_width, 900);
+      assert.equal(screencastEvent.event.payload.surface_height, 700);
       assert.equal(screencastEvent.event.payload.device_scale_factor_millis, 2_000);
-      const frame = await client.waitForBinary();
+      const frame = screencastFrame.binary;
       assert.equal(frame[0], 0xff);
       assert.equal(frame[1], 0xd8);
       assert.deepEqual(jpegDimensions(frame), { width: 1_800, height: 1_400 });
@@ -696,6 +1001,8 @@ test(
           viewport: {
             width: 900,
             height: 700,
+            surface_width: 900,
+            surface_height: 700,
             device_scale_factor_millis: 1_000,
             device_type: "desktop",
           },
@@ -876,6 +1183,8 @@ test(
           viewport: {
             width: 600,
             height: 800,
+            surface_width: 600,
+            surface_height: 800,
             device_scale_factor_millis: 1_000,
             device_type: "mobile",
           },
@@ -909,18 +1218,25 @@ test(
         },
       });
       assert.equal(startScaledScreencast.outcome.status, "succeeded");
-      const scaledFrameEvent = await client.waitForEvent("screencast_frame");
+      const scaledFrame = await waitForScreencastFrame(
+        client,
+        (event) => event.event.type === "screencast_frame"
+          && event.event.payload.tab_id === "tab-scaled-mobile",
+      );
+      const scaledFrameEvent = scaledFrame.event;
       assert.equal(scaledFrameEvent.event.type, "screencast_frame");
       if (scaledFrameEvent.event.type === "screencast_frame") {
         assert.equal(scaledFrameEvent.event.payload.width, 980);
         assert.equal(scaledFrameEvent.event.payload.height, 1_307);
+        assert.equal(scaledFrameEvent.event.payload.surface_width, 600);
+        assert.equal(scaledFrameEvent.event.payload.surface_height, 800);
         assert.equal(
           scaledFrameEvent.event.payload.device_scale_factor_millis,
           1_224,
         );
       }
       assert.deepEqual(
-        jpegDimensions(await client.waitForBinary()),
+        jpegDimensions(scaledFrame.binary),
         { width: 1_200, height: 1_600 },
       );
       await client.call({
@@ -935,6 +1251,18 @@ test(
     }
   },
 );
+
+async function waitForScreencastFrame(
+  client: HostTestClient,
+  matches: (event: EventEnvelope) => boolean,
+): Promise<{ event: EventEnvelope; binary: Buffer }> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const event = await client.waitForEvent("screencast_frame");
+    const binary = await client.waitForBinary();
+    if (matches(event)) return { event, binary };
+  }
+  throw new Error("Host did not produce the expected screencast frame");
+}
 
 function snapshotFrom(response: ResponseEnvelope): HostSnapshot {
   assert.equal(

@@ -3943,8 +3943,32 @@ fn file_patch_applies_single_replacement() {
 }
 
 #[test]
-fn file_patch_empty_patches_falls_back_to_old_new_fields() {
+fn file_patch_rejects_empty_patches_without_falling_back_to_single_fields() {
     let root = unique_temp_dir("magi-tool-file-patch-empty-array");
+    let registry = make_registry();
+    let file = root.join("patch_me.txt");
+    fs::write(&file, "alpha needle beta").unwrap();
+
+    let output = exec_tool(
+        &registry,
+        BuiltinToolName::FilePatch,
+        &serde_json::json!({
+            "path": file.to_string_lossy(),
+            "patches": []
+        })
+        .to_string(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    let payload: Value = serde_json::from_str(&output.payload).unwrap();
+    assert_eq!(payload["error_code"], "file_patch_invalid_input");
+    assert_eq!(payload["error"], "patches 不能为空");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "alpha needle beta");
+}
+
+#[test]
+fn file_patch_rejects_mixed_single_and_batch_inputs() {
+    let root = unique_temp_dir("magi-tool-file-patch-mixed-input");
     let registry = make_registry();
     let file = root.join("patch_me.txt");
     fs::write(&file, "alpha needle beta").unwrap();
@@ -3956,18 +3980,21 @@ fn file_patch_empty_patches_falls_back_to_old_new_fields() {
             "path": file.to_string_lossy(),
             "old_string": "needle",
             "new_string": "needle_patched",
-            "patches": []
+            "patches": [
+                { "old_string": "alpha", "new_string": "ALPHA" }
+            ]
         })
         .to_string(),
     );
 
-    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
     let payload: Value = serde_json::from_str(&output.payload).unwrap();
-    assert_eq!(payload["applied"], 1);
+    assert_eq!(payload["error_code"], "file_patch_invalid_input");
     assert_eq!(
-        fs::read_to_string(&file).unwrap(),
-        "alpha needle_patched beta"
+        payload["error"],
+        "patches 与 old_string/new_string 不能同时提供"
     );
+    assert_eq!(fs::read_to_string(&file).unwrap(), "alpha needle beta");
 }
 
 #[test]
@@ -4013,7 +4040,179 @@ fn file_patch_rejects_ambiguous_match() {
         .to_string(),
     );
     assert_eq!(output.status, ExecutionResultStatus::Failed);
+    let payload: Value = serde_json::from_str(&output.payload).unwrap();
+    assert_eq!(payload["error_code"], "file_patch_ambiguous_match");
+    assert_eq!(
+        payload["error"],
+        "目标内容在当前文件中不是唯一匹配，请增加上下文后重试"
+    );
+    assert_eq!(
+        payload["errors"][0],
+        "patch[0]: old_string 匹配了 2 处（需要唯一匹配）"
+    );
     assert_eq!(fs::read_to_string(&file).unwrap(), "same\nsame\nother");
+}
+
+#[test]
+fn file_patch_rejects_missing_match_with_recovery_instruction() {
+    let root = unique_temp_dir("magi-tool-file-patch-no-match");
+    let registry = make_registry();
+    let file = root.join("changed.txt");
+    fs::write(&file, "current content").unwrap();
+
+    let output = exec_tool(
+        &registry,
+        BuiltinToolName::FilePatch,
+        &serde_json::json!({
+            "path": file.to_string_lossy(),
+            "old_string": "stale content",
+            "new_string": "new content"
+        })
+        .to_string(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    let payload: Value = serde_json::from_str(&output.payload).unwrap();
+    assert_eq!(payload["error_code"], "file_patch_no_match");
+    assert_eq!(
+        payload["error"],
+        "目标内容与当前文件不匹配，请重新读取文件后再修改"
+    );
+    assert_eq!(payload["errors"][0], "patch[0]: old_string 未在文件中找到");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "current content");
+}
+
+#[test]
+fn file_patch_reports_mixed_non_applicable_reasons() {
+    let root = unique_temp_dir("magi-tool-file-patch-mixed-failure");
+    let registry = make_registry();
+    let file = root.join("mixed.txt");
+    fs::write(&file, "duplicate\nduplicate\ncurrent").unwrap();
+
+    let output = exec_tool(
+        &registry,
+        BuiltinToolName::FilePatch,
+        &serde_json::json!({
+            "path": file.to_string_lossy(),
+            "patches": [
+                { "old_string": "missing", "new_string": "replacement" },
+                { "old_string": "duplicate", "new_string": "replacement" }
+            ]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    let payload: Value = serde_json::from_str(&output.payload).unwrap();
+    assert_eq!(payload["error_code"], "file_patch_not_applicable");
+    assert_eq!(
+        payload["error"],
+        "patch 与当前文件内容不匹配，请重新读取文件并生成精确修改"
+    );
+    assert_eq!(payload["errors"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "duplicate\nduplicate\ncurrent"
+    );
+}
+
+#[test]
+fn file_patch_rejects_partial_batch_atomically() {
+    let root = unique_temp_dir("magi-tool-file-patch-atomic-failure");
+    let registry = make_registry();
+    let file = root.join("atomic.txt");
+    fs::write(&file, "first\nsecond").unwrap();
+
+    let output = exec_tool(
+        &registry,
+        BuiltinToolName::FilePatch,
+        &serde_json::json!({
+            "path": file.to_string_lossy(),
+            "patches": [
+                { "old_string": "first", "new_string": "FIRST" },
+                { "old_string": "missing", "new_string": "replacement" }
+            ]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    let payload: Value = serde_json::from_str(&output.payload).unwrap();
+    assert_eq!(payload["error_code"], "file_patch_not_applicable");
+    assert_eq!(payload["applied"], 0);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "first\nsecond");
+}
+
+#[test]
+fn file_patch_rejects_malformed_batch_entries() {
+    let root = unique_temp_dir("magi-tool-file-patch-malformed-batch");
+    let registry = make_registry();
+    let file = root.join("malformed.txt");
+    fs::write(&file, "first\nsecond").unwrap();
+
+    let output = exec_tool(
+        &registry,
+        BuiltinToolName::FilePatch,
+        &serde_json::json!({
+            "path": file.to_string_lossy(),
+            "patches": [
+                { "old_string": "first", "new_string": "FIRST" },
+                { "old_string": "second" }
+            ]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    let payload: Value = serde_json::from_str(&output.payload).unwrap();
+    assert_eq!(payload["error_code"], "file_patch_invalid_input");
+    assert_eq!(payload["error"], "patches[1] 缺少 new_string 字段");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "first\nsecond");
+}
+
+#[test]
+fn file_patch_read_failure_has_distinct_error_code() {
+    let root = unique_temp_dir("magi-tool-file-patch-read-failure");
+    let registry = make_registry();
+    let missing_file = root.join("missing.txt");
+
+    let output = exec_tool(
+        &registry,
+        BuiltinToolName::FilePatch,
+        &serde_json::json!({
+            "path": missing_file.to_string_lossy(),
+            "old_string": "old",
+            "new_string": "new"
+        })
+        .to_string(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    let payload: Value = serde_json::from_str(&output.payload).unwrap();
+    assert_eq!(payload["error_code"], "file_patch_read_failed");
+    assert_eq!(payload["error"], "文件暂不可读取，请检查路径或权限");
+}
+
+#[test]
+fn file_patch_validates_input_before_reading_target() {
+    let root = unique_temp_dir("magi-tool-file-patch-validation-order");
+    let registry = make_registry();
+    let missing_file = root.join("missing.txt");
+
+    let output = exec_tool(
+        &registry,
+        BuiltinToolName::FilePatch,
+        &serde_json::json!({
+            "path": missing_file.to_string_lossy(),
+            "patches": []
+        })
+        .to_string(),
+    );
+
+    assert_eq!(output.status, ExecutionResultStatus::Failed);
+    let payload: Value = serde_json::from_str(&output.payload).unwrap();
+    assert_eq!(payload["error_code"], "file_patch_invalid_input");
+    assert_eq!(payload["error"], "patches 不能为空");
 }
 
 #[test]
@@ -5609,6 +5808,28 @@ fn shell_schema_forbids_inventing_test_runner_arguments() {
 }
 
 #[test]
+fn browser_navigation_description_exposes_the_web_validation_workflow() {
+    let shell_description = BuiltinToolName::ShellExec.description();
+    let browser_description = BuiltinToolName::BrowserNavigate.description();
+
+    assert!(shell_description.contains("background=true"));
+    assert!(shell_description.contains("browser_navigate"));
+    for expected in [
+        "shell_exec(background=true)",
+        "browser_snapshot",
+        "browser_click",
+        "browser_viewport",
+        "browser_screenshot",
+        "不能替代真实浏览器验收",
+    ] {
+        assert!(
+            browser_description.contains(expected),
+            "browser_navigate 描述缺少 Web 验收契约 {expected}: {browser_description}"
+        );
+    }
+}
+
+#[test]
 fn filesystem_schemas_prefer_workspace_relative_or_native_absolute_paths() {
     for tool in [
         BuiltinToolName::FileRead,
@@ -6254,6 +6475,22 @@ fn idempotent_read_tool_classification_uses_builtin_and_mcp_metadata() {
         "get_goal 返回可变的 Goal/Plan revision，必须每次读取当前状态"
     );
     assert!(!registry.is_idempotent_read_tool(BuiltinToolName::ShellExec.as_str()));
+    for browser_tool in [
+        BuiltinToolName::BrowserNavigate,
+        BuiltinToolName::BrowserSnapshot,
+        BuiltinToolName::BrowserClick,
+        BuiltinToolName::BrowserType,
+        BuiltinToolName::BrowserPress,
+        BuiltinToolName::BrowserScroll,
+        BuiltinToolName::BrowserScreenshot,
+        BuiltinToolName::BrowserTabs,
+        BuiltinToolName::BrowserViewport,
+    ] {
+        assert!(
+            !registry.is_idempotent_read_tool(browser_tool.as_str()),
+            "浏览器页面和 artifact 会随交互变化，不能复用 {browser_tool:?} 的旧结果"
+        );
+    }
     assert!(registry.is_idempotent_read_tool("mcp__repo_tools__inspect"));
     assert!(!registry.is_idempotent_read_tool("mcp__repo_tools__apply"));
     assert!(!registry.is_idempotent_read_tool("unknown_tool"));

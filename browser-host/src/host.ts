@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import { copyFile, mkdir, stat, unlink } from "node:fs/promises";
+import { basename, join } from "node:path";
 import type {
   BrowserContext,
   CDPSession,
@@ -16,6 +18,7 @@ import type {
   HostCommand,
   HostControl,
   HostDeviceType,
+  HostLogicalViewport,
   HostEvent,
   HostHandshake,
   HostViewport,
@@ -30,6 +33,7 @@ import { PROTOCOL_VERSION } from "./protocol";
 import { SnapshotRegistry } from "./snapshot";
 
 const PAGE_NAVIGATION_TIMEOUT_MILLIS = 15_000;
+const SCREENCAST_INITIAL_FRAME_TIMEOUT_MILLIS = 5_000;
 const MAX_SCREENCAST_WIDTH = 7_680;
 const MAX_SCREENCAST_HEIGHT = 4_320;
 
@@ -42,6 +46,9 @@ export interface BrowserHostConfig {
   runtimeEpoch: number;
   headless: boolean;
   deviceScaleFactor: number;
+  downloadPath: string;
+  maxActivePages: number;
+  maxTabs: number;
 }
 
 export interface HostTransport {
@@ -56,17 +63,31 @@ export interface ExecutedCommand {
 
 interface PageRecord {
   readonly tabId: string;
-  readonly page: Page;
+  page?: Page;
   readonly snapshot: SnapshotRegistry;
   navigationRevision: number;
   frameSequence: number;
   blockedNavigationUrl?: string;
   restoringInitialPage: boolean;
   viewport: HostViewport;
-  readonly defaultUserAgent: string;
-  readonly defaultPlatform: string;
+  defaultUserAgent: string;
+  defaultPlatform: string;
+  currentUrl: string;
+  currentOrigin: string | null;
+  currentTitle: string;
+  lastUsedSequence: number;
+  inFlightCommands: number;
   cdp?: CDPSession;
   screencastListener?: (event: ScreencastFrameEvent) => void;
+  screencastSettings?: ScreencastSettings;
+  screencastAck: Promise<void>;
+}
+
+interface ScreencastSettings {
+  format: "jpeg" | "png";
+  quality: number;
+  maxWidth: number;
+  maxHeight: number;
 }
 
 interface ScreencastFrameEvent {
@@ -86,6 +107,8 @@ export class BrowserHost {
   readonly #pages = new Map<string, PageRecord>();
   #context?: BrowserContext;
   #chromiumVersion = "unknown";
+  #useSequence = 0;
+  #foregroundTabId?: string;
 
   constructor(config: BrowserHostConfig, transport: HostTransport) {
     this.#config = config;
@@ -101,12 +124,16 @@ export class BrowserHost {
         false,
       );
     }
+    await mkdir(this.#config.downloadPath, { recursive: true });
     this.#context = await chromium.launchPersistentContext(
       this.#config.profilePath,
       {
         executablePath: this.#config.chromiumExecutable,
         headless: this.#config.headless,
+        chromiumSandbox: true,
         acceptDownloads: true,
+        downloadsPath: this.#config.downloadPath,
+        permissions: [],
         serviceWorkers: "block",
         viewport: null,
         args: [
@@ -122,6 +149,7 @@ export class BrowserHost {
     );
     this.#context.setDefaultTimeout(5_000);
     this.#context.setDefaultNavigationTimeout(PAGE_NAVIGATION_TIMEOUT_MILLIS);
+    await this.installNavigationGuard();
     this.#chromiumVersion = this.#context.browser()?.version() ?? "unknown";
     for (const page of this.#context.pages()) {
       await page.close().catch(() => undefined);
@@ -142,7 +170,11 @@ export class BrowserHost {
   }
 
   async execute(command: HostCommand): Promise<ExecutedCommand> {
-    switch (command.type) {
+    const tabId = commandTabId(command);
+    const record = tabId ? this.#pages.get(tabId) : undefined;
+    if (record) record.inFlightCommands += 1;
+    try {
+      switch (command.type) {
       case "ping":
         return {
           result: {
@@ -157,6 +189,8 @@ export class BrowserHost {
         return this.createPage(command.payload);
       case "set_viewport":
         return this.setViewport(command.payload);
+      case "set_logical_viewport":
+        return this.setLogicalViewport(command.payload);
       case "close_page":
         return this.closePage(command.payload.tab_id);
       case "activate_page":
@@ -183,9 +217,19 @@ export class BrowserHost {
         return this.stopScreencast(command.payload.tab_id);
       case "user_input":
         return this.userInput(command.payload);
-      case "shutdown":
-        await this.close();
-        return emptyResult();
+        case "shutdown":
+          await this.close();
+          return emptyResult();
+        default:
+          throw new ProtocolFailure(
+            "browser_command_unsupported",
+            "browser Host command is unsupported",
+            false,
+            false,
+          );
+      }
+    } finally {
+      if (record) record.inFlightCommands -= 1;
     }
   }
 
@@ -215,47 +259,43 @@ export class BrowserHost {
     }
     validateViewport(input.viewport);
     validateNavigationUrl(input.initial_url);
-    const page = await this.context().newPage();
-    try {
-      const [defaultUserAgent, defaultPlatform] = await Promise.all([
-        page.evaluate(() => navigator.userAgent),
-        page.evaluate(() => navigator.platform),
-      ]);
-      const record: PageRecord = {
+    if (this.#pages.size >= this.#config.maxTabs) {
+      throw new ProtocolFailure(
+        "browser_tab_limit_reached",
+        `browser tab limit reached: ${this.#config.maxTabs}`,
+        true,
+        false,
+        "请关闭不再使用的浏览器面板后重试。",
+      );
+    }
+    const record: PageRecord = {
         tabId: input.tab_id,
-        page,
         snapshot: new SnapshotRegistry(input.snapshot_revision),
         navigationRevision: input.navigation_revision,
         frameSequence: 0,
         restoringInitialPage: false,
         viewport: input.viewport,
-        defaultUserAgent,
-        defaultPlatform,
-      };
-      this.#pages.set(input.tab_id, record);
-      await this.applyViewport(record, input.viewport);
-      await this.bindPageEvents(record);
-      if (input.initial_url && input.initial_url !== "about:blank") {
-        record.restoringInitialPage = true;
-        try {
-          await this.withNavigationGuard(record, () => page.goto(input.initial_url, {
-            waitUntil: "domcontentloaded",
-            timeout: PAGE_NAVIGATION_TIMEOUT_MILLIS,
-          }));
-          this.throwBlockedNavigation(record);
-        } finally {
-          record.restoringInitialPage = false;
-        }
-      }
-      // CreatePage 的 revision 是页面创建完成后的权威基线；首次加载属于恢复/创建过程，
-      // 不能被记成一次额外导航，否则 about:blank 与普通 URL 会产生不同的版本语义。
+        defaultUserAgent: "",
+        defaultPlatform: "",
+        currentUrl: input.initial_url,
+        currentOrigin: null,
+        currentTitle: "",
+        lastUsedSequence: 0,
+      inFlightCommands: 0,
+      screencastAck: Promise.resolve(),
+    };
+    this.#pages.set(input.tab_id, record);
+    record.inFlightCommands = 1;
+    try {
+      await this.ensurePage(record);
       const state = await this.pageState(record);
       this.#transport.emit({ type: "page_updated", payload: state });
       return { result: { type: "page_state", payload: state } };
     } catch (error) {
       this.#pages.delete(input.tab_id);
-      await page.close().catch(() => undefined);
       throw playwrightFailure("browser_page_creation_failed", error, false);
+    } finally {
+      record.inFlightCommands -= 1;
     }
   }
 
@@ -263,7 +303,8 @@ export class BrowserHost {
     const record = this.pageRecord(tabId);
     await this.stopScreencast(tabId);
     this.#pages.delete(tabId);
-    await record.page.close();
+    if (this.#foregroundTabId === tabId) this.#foregroundTabId = undefined;
+    await record.page?.close().catch(() => undefined);
     return emptyResult();
   }
 
@@ -273,36 +314,61 @@ export class BrowserHost {
   }): Promise<ExecutedCommand> {
     validateViewport(input.viewport);
     const record = this.pageRecord(input.tab_id);
-    await this.applyViewport(record, input.viewport);
-    record.snapshot.invalidate();
+    await this.ensurePage(record);
+    const logicalViewportChanged = await this.applyViewport(record, input.viewport);
+    if (logicalViewportChanged) record.snapshot.invalidate();
     return emptyResult();
   }
 
-  private async applyViewport(record: PageRecord, viewport: HostViewport): Promise<void> {
-    const cdp = await this.cdpSession(record);
-    const mobile = viewport.device_type !== "desktop";
-    const portrait = viewport.height >= viewport.width;
-    await this.applyUserAgent(record, viewport.device_type);
-    await cdp.send("Emulation.setTouchEmulationEnabled", {
-      enabled: mobile,
-      maxTouchPoints: mobile ? 5 : 1,
+  private async setLogicalViewport(input: {
+    tab_id: string;
+    viewport: HostLogicalViewport;
+  }): Promise<ExecutedCommand> {
+    validateLogicalViewport(input.viewport);
+    const record = this.pageRecord(input.tab_id);
+    await this.ensurePage(record);
+    await this.applyViewport(record, {
+      ...input.viewport,
+      surface_width: record.viewport.surface_width,
+      surface_height: record.viewport.surface_height,
     });
-    await cdp.send("Emulation.setDeviceMetricsOverride", {
-      width: viewport.width,
-      height: viewport.height,
-      deviceScaleFactor: this.#config.deviceScaleFactor,
-      mobile,
-      screenWidth: viewport.width,
-      screenHeight: viewport.height,
-      screenOrientation: {
-        type: portrait ? "portraitPrimary" : "landscapePrimary",
-        angle: portrait ? 0 : 90,
-      },
-    });
-    await record.page.evaluate(
-      () => new Promise<void>((accept) => requestAnimationFrame(() => accept())),
-    );
+    return emptyResult();
+  }
+
+  private async applyViewport(record: PageRecord, viewport: HostViewport): Promise<boolean> {
+    const logicalViewportChanged = !record.cdp
+      || record.viewport.width !== viewport.width
+      || record.viewport.height !== viewport.height
+      || record.viewport.device_scale_factor_millis !== viewport.device_scale_factor_millis
+      || record.viewport.device_type !== viewport.device_type;
+    if (logicalViewportChanged) {
+      const page = this.requirePage(record);
+      const cdp = await this.cdpSession(record);
+      const mobile = viewport.device_type !== "desktop";
+      const portrait = viewport.height >= viewport.width;
+      await this.applyUserAgent(record, viewport.device_type);
+      await cdp.send("Emulation.setTouchEmulationEnabled", {
+        enabled: mobile,
+        maxTouchPoints: mobile ? 5 : 1,
+      });
+      await cdp.send("Emulation.setDeviceMetricsOverride", {
+        width: viewport.width,
+        height: viewport.height,
+        deviceScaleFactor: this.#config.deviceScaleFactor,
+        mobile,
+        screenWidth: viewport.width,
+        screenHeight: viewport.height,
+        screenOrientation: {
+          type: portrait ? "portraitPrimary" : "landscapePrimary",
+          angle: portrait ? 0 : 90,
+        },
+      });
+      await page.evaluate(
+        () => new Promise<void>((accept) => requestAnimationFrame(() => accept())),
+      );
+    }
     record.viewport = viewport;
+    return logicalViewportChanged;
   }
 
   private async applyUserAgent(
@@ -347,14 +413,85 @@ export class BrowserHost {
     });
   }
 
+  private async ensurePage(record: PageRecord): Promise<void> {
+    if (record.page) {
+      await this.flushScreencastAck(record);
+      this.touch(record);
+      return;
+    }
+    await this.ensureActiveCapacity();
+    const page = await this.context().newPage();
+    record.page = page;
+    try {
+      if (!record.defaultUserAgent || !record.defaultPlatform) {
+        [record.defaultUserAgent, record.defaultPlatform] = await Promise.all([
+          page.evaluate(() => navigator.userAgent),
+          page.evaluate(() => navigator.platform),
+        ]);
+      }
+      await this.applyViewport(record, record.viewport);
+      await this.bindPageEvents(record);
+      if (record.currentUrl && record.currentUrl !== "about:blank") {
+        record.restoringInitialPage = true;
+        try {
+          await this.withNavigationGuard(record, () => page.goto(record.currentUrl, {
+            waitUntil: "domcontentloaded",
+            timeout: PAGE_NAVIGATION_TIMEOUT_MILLIS,
+          }));
+          this.throwBlockedNavigation(record);
+        } finally {
+          record.restoringInitialPage = false;
+        }
+      }
+      await this.pageState(record);
+      this.touch(record);
+    } catch (error) {
+      record.page = undefined;
+      record.cdp = undefined;
+      await page.close().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async ensureActiveCapacity(): Promise<void> {
+    const active = [...this.#pages.values()].filter((record) => record.page).length;
+    if (active < this.#config.maxActivePages) return;
+    throw new ProtocolFailure(
+      "browser_active_page_limit_reached",
+      `active browser page limit reached: ${this.#config.maxActivePages}`,
+      true,
+      false,
+      "请先关闭其他浏览器面板后重试。页面不会被自动关闭或重建。",
+    );
+  }
+
+  private touch(record: PageRecord): void {
+    record.lastUsedSequence = ++this.#useSequence;
+  }
+
+  private requirePage(record: PageRecord): Page {
+    if (!record.page) {
+      throw new ProtocolFailure(
+        "browser_page_not_active",
+        `browser page is not active: ${record.tabId}`,
+        true,
+        false,
+      );
+    }
+    return record.page;
+  }
+
   private async cdpSession(record: PageRecord): Promise<CDPSession> {
-    record.cdp ??= await this.context().newCDPSession(record.page);
+    record.cdp ??= await this.context().newCDPSession(this.requirePage(record));
     return record.cdp;
   }
 
   private async activatePage(tabId: string): Promise<ExecutedCommand> {
     const record = this.pageRecord(tabId);
-    await record.page.bringToFront();
+    await this.ensurePage(record);
+    await this.requirePage(record).bringToFront();
+    this.#foregroundTabId = tabId;
+    this.touch(record);
     return {
       result: { type: "page_state", payload: await this.pageState(record) },
     };
@@ -371,24 +508,26 @@ export class BrowserHost {
   }): Promise<ExecutedCommand> {
     this.control.validate(input.control);
     const record = this.pageRecord(input.tab_id);
+    await this.ensurePage(record);
+    const page = this.requirePage(record);
     return this.withNavigationGuard(record, async () => {
       this.control.validate(input.control);
       try {
         switch (input.navigation.action) {
           case "url":
             validateNavigationUrl(input.navigation.url);
-            await record.page.goto(input.navigation.url, {
+            await page.goto(input.navigation.url, {
               waitUntil: "domcontentloaded",
             });
             break;
           case "back":
-            await record.page.goBack({ waitUntil: "domcontentloaded" });
+            await page.goBack({ waitUntil: "domcontentloaded" });
             break;
           case "forward":
-            await record.page.goForward({ waitUntil: "domcontentloaded" });
+            await page.goForward({ waitUntil: "domcontentloaded" });
             break;
           case "reload":
-            await record.page.reload({ waitUntil: "domcontentloaded" });
+            await page.reload({ waitUntil: "domcontentloaded" });
             break;
         }
       } catch (error) {
@@ -408,8 +547,10 @@ export class BrowserHost {
     subtree_ref?: string | null;
   }): Promise<ExecutedCommand> {
     const record = this.pageRecord(input.tab_id);
+    await this.ensurePage(record);
+    const page = this.requirePage(record);
     const snapshot = await record.snapshot.capture(
-      record.page,
+      page,
       record.tabId,
       input.limits,
       input.subtree_ref,
@@ -424,7 +565,9 @@ export class BrowserHost {
   }): Promise<ExecutedCommand> {
     this.control.validate(input.control);
     const record = this.pageRecord(input.tab_id);
-    const locator = await record.snapshot.resolve(record.page, input.target);
+    await this.ensurePage(record);
+    const page = this.requirePage(record);
+    const locator = await record.snapshot.resolve(page, input.target);
     const sensitiveActionKind = await locator.evaluate((element) => {
       const form = element.closest("form");
       const descriptor = [
@@ -475,7 +618,9 @@ export class BrowserHost {
   }): Promise<ExecutedCommand> {
     this.control.validate(input.control);
     const record = this.pageRecord(input.tab_id);
-    const locator = await record.snapshot.resolve(record.page, input.target);
+    await this.ensurePage(record);
+    const page = this.requirePage(record);
+    const locator = await record.snapshot.resolve(page, input.target);
     const sensitiveInputKind = await locator.evaluate((element) => {
       const type = ((element as HTMLInputElement).type || element.getAttribute("type") || "text").toLowerCase();
       const autocomplete = (element.getAttribute("autocomplete") ?? "").toLowerCase();
@@ -507,7 +652,7 @@ export class BrowserHost {
         if (input.replace) {
           await locator.fill(input.text);
         } else {
-          await record.page.keyboard.insertText(input.text);
+          await page.keyboard.insertText(input.text);
         }
       } catch (error) {
         this.throwBlockedNavigation(record);
@@ -525,10 +670,12 @@ export class BrowserHost {
   }): Promise<ExecutedCommand> {
     this.control.validate(input.control);
     const record = this.pageRecord(input.tab_id);
+    await this.ensurePage(record);
+    const page = this.requirePage(record);
     return this.withNavigationGuard(record, async () => {
       this.control.validate(input.control);
       try {
-        await record.page.keyboard.press(input.key);
+        await page.keyboard.press(input.key);
       } catch (error) {
         this.throwBlockedNavigation(record);
         throw playwrightFailure("browser_press_failed", error, true);
@@ -549,9 +696,11 @@ export class BrowserHost {
     requireFinite("delta_x", input.delta_x);
     requireFinite("delta_y", input.delta_y);
     const record = this.pageRecord(input.tab_id);
+    await this.ensurePage(record);
+    const page = this.requirePage(record);
     return this.withNavigationGuard(record, async () => {
       if (input.target) {
-        const locator = await record.snapshot.resolve(record.page, input.target);
+        const locator = await record.snapshot.resolve(page, input.target);
         this.control.validate(input.control);
         await locator.evaluate(
           (element, delta) => (element as HTMLElement).scrollBy(delta.x, delta.y),
@@ -559,7 +708,7 @@ export class BrowserHost {
         );
       } else {
         this.control.validate(input.control);
-        await record.page.mouse.wheel(input.delta_x, input.delta_y);
+        await page.mouse.wheel(input.delta_x, input.delta_y);
       }
       this.throwBlockedNavigation(record);
       return { result: { type: "page_state", payload: await this.pageState(record) } };
@@ -583,6 +732,8 @@ export class BrowserHost {
     }
     if (input.clip) validateNormalizedRect(input.clip);
     const record = this.pageRecord(input.tab_id);
+    await this.ensurePage(record);
+    const page = this.requirePage(record);
     const cdp = await this.cdpSession(record);
     const metrics = await cdp.send("Page.getLayoutMetrics");
     const deviceScaleFactor = this.#config.deviceScaleFactor;
@@ -595,7 +746,7 @@ export class BrowserHost {
     };
     let captureBeyondViewport: boolean;
     if (input.target) {
-      const locator = await record.snapshot.resolve(record.page, input.target);
+      const locator = await record.snapshot.resolve(page, input.target);
       const bounds = await locator.boundingBox();
       if (!bounds || bounds.width <= 0 || bounds.height <= 0) {
         throw new ProtocolFailure(
@@ -674,6 +825,8 @@ export class BrowserHost {
     y: number;
   }): Promise<ExecutedCommand> {
     const record = this.pageRecord(input.tab_id);
+    await this.ensurePage(record);
+    const page = this.requirePage(record);
     if (input.navigation_revision !== record.navigationRevision) {
       throw new ProtocolFailure(
         "browser_navigation_stale",
@@ -684,8 +837,20 @@ export class BrowserHost {
     }
     requireFinite("x", input.x);
     requireFinite("y", input.y);
-    const hit = await record.page.evaluate(
-      ({ x, y, frameSequence, navigationRevision }): HitTest | null => {
+    if (input.x < 0 || input.x > 1 || input.y < 0 || input.y > 1) {
+      throw new ProtocolFailure(
+        "browser_hit_test_invalid_coordinates",
+        "hit-test coordinates must be normalized to [0, 1]",
+        false,
+        false,
+      );
+    }
+    const cssViewport = await page.evaluate(() => ({
+      width: Math.max(1, window.innerWidth),
+      height: Math.max(1, window.innerHeight),
+    }));
+    const hit = await page.evaluate(
+      ({ x, y, frameSequence, navigationRevision, viewportWidth, viewportHeight }): HitTest | null => {
         const element = document.elementFromPoint(x, y);
         if (!element) return null;
         const rect = element.getBoundingClientRect();
@@ -745,6 +910,8 @@ export class BrowserHost {
         return {
           frame_sequence: frameSequence,
           navigation_revision: navigationRevision,
+          viewport_width: viewportWidth,
+          viewport_height: viewportHeight,
           scroll_x: window.scrollX,
           scroll_y: window.scrollY,
           element_ref: `hit-${frameSequence}-${Math.round(x)}-${Math.round(y)}`,
@@ -766,10 +933,12 @@ export class BrowserHost {
         };
       },
       {
-        x: input.x,
-        y: input.y,
+        x: input.x * cssViewport.width,
+        y: input.y * cssViewport.height,
         frameSequence: record.frameSequence,
         navigationRevision: input.navigation_revision,
+        viewportWidth: cssViewport.width,
+        viewportHeight: cssViewport.height,
       },
     );
     if (!hit) {
@@ -791,9 +960,26 @@ export class BrowserHost {
     max_height: number;
   }): Promise<ExecutedCommand> {
     const record = this.pageRecord(input.tab_id);
-    await this.stopScreencast(input.tab_id);
+    await this.ensurePage(record);
+    record.screencastSettings = {
+      format: input.format,
+      quality: Math.max(0, Math.min(Math.floor(input.quality), 100)),
+      maxWidth: Math.max(320, Math.min(Math.floor(input.max_width), MAX_SCREENCAST_WIDTH)),
+      maxHeight: Math.max(240, Math.min(Math.floor(input.max_height), MAX_SCREENCAST_HEIGHT)),
+    };
+    await this.restartScreencast(record);
+    return emptyResult();
+  }
+
+  private async restartScreencast(record: PageRecord): Promise<void> {
+    const settings = record.screencastSettings;
+    if (!settings) return;
+    await this.stopScreencastSession(record);
     const cdp = await this.cdpSession(record);
-    const quality = Math.max(0, Math.min(Math.floor(input.quality), 100));
+    let acceptFirstFrame: (() => void) | undefined;
+    const firstFrame = new Promise<void>((accept) => {
+      acceptFirstFrame = accept;
+    });
     const listener = (frame: ScreencastFrameEvent) => {
       const bytes = Buffer.from(frame.data, "base64");
       record.frameSequence += 1;
@@ -811,7 +997,7 @@ export class BrowserHost {
       );
       const payload = binaryPayload(
         bytes,
-        input.format === "png" ? "image/png" : "image/jpeg",
+        settings.format === "png" ? "image/png" : "image/jpeg",
       );
       const metadata: ScreencastFrame = {
         tab_id: record.tabId,
@@ -823,6 +1009,8 @@ export class BrowserHost {
         sha256: payload.sha256,
         width,
         height,
+        surface_width: Math.max(1, Math.round(record.viewport.width * viewportSurfaceScale(record.viewport))),
+        surface_height: Math.max(1, Math.round(record.viewport.height * viewportSurfaceScale(record.viewport))),
         device_scale_factor_millis: Math.max(
           1,
           Math.round(
@@ -834,32 +1022,74 @@ export class BrowserHost {
       };
       this.#transport.emit({ type: "screencast_frame", payload: metadata });
       this.#transport.emitBinary(bytes);
-      void cdp
-        .send("Page.screencastFrameAck", { sessionId: frame.sessionId })
-        .catch(() => undefined);
+      acceptFirstFrame?.();
+      acceptFirstFrame = undefined;
+      record.screencastAck = record.screencastAck
+        .catch(() => undefined)
+        .then(async () => {
+          await cdp
+            .send("Page.screencastFrameAck", { sessionId: frame.sessionId })
+            .catch(() => undefined);
+        });
     };
     record.screencastListener = listener;
     cdp.on("Page.screencastFrame", listener);
-    await cdp.send("Page.startScreencast", {
-      format: input.format,
-      quality: input.format === "jpeg" ? quality : undefined,
-      maxWidth: Math.max(320, Math.min(Math.floor(input.max_width), MAX_SCREENCAST_WIDTH)),
-      maxHeight: Math.max(240, Math.min(Math.floor(input.max_height), MAX_SCREENCAST_HEIGHT)),
-      everyNthFrame: 1,
-    });
-    return emptyResult();
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await cdp.send("Page.startScreencast", {
+        format: settings.format,
+        quality: settings.format === "jpeg" ? settings.quality : undefined,
+        // Keep the stream at the logical resolution. The UI fits this stable
+        // stream into its panel without stopping the stream during resize.
+        maxWidth: settings.maxWidth,
+        maxHeight: settings.maxHeight,
+        everyNthFrame: 1,
+      });
+      await Promise.race([
+        firstFrame,
+        new Promise<void>((_, reject) => {
+          timeoutHandle = setTimeout(
+            () => reject(new ProtocolFailure(
+              "browser_screencast_start_timeout",
+              "Chromium did not produce the initial browser frame in time",
+              true,
+              false,
+              "请稍后重试浏览器面板。",
+            )),
+            SCREENCAST_INITIAL_FRAME_TIMEOUT_MILLIS,
+          );
+        }),
+      ]);
+    } catch (error) {
+      record.screencastSettings = undefined;
+      await this.stopScreencastSession(record);
+      throw error;
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
   }
 
   private async stopScreencast(tabId: string): Promise<ExecutedCommand> {
     const record = this.#pages.get(tabId);
-    if (!record?.cdp) return emptyResult();
+    if (!record) return emptyResult();
+    record.screencastSettings = undefined;
+    await this.stopScreencastSession(record);
+    return emptyResult();
+  }
+
+  private async stopScreencastSession(record: PageRecord): Promise<void> {
+    if (!record.cdp) return;
     const cdp = record.cdp;
     if (record.screencastListener) {
       cdp.off("Page.screencastFrame", record.screencastListener);
     }
     record.screencastListener = undefined;
+    await this.flushScreencastAck(record);
     await cdp.send("Page.stopScreencast").catch(() => undefined);
-    return emptyResult();
+  }
+
+  private async flushScreencastAck(record: PageRecord): Promise<void> {
+    await record.screencastAck.catch(() => undefined);
   }
 
   private async userInput(input: {
@@ -869,9 +1099,11 @@ export class BrowserHost {
   }): Promise<ExecutedCommand> {
     this.control.validate(input.control);
     const record = this.pageRecord(input.tab_id);
+    await this.ensurePage(record);
+    const page = this.requirePage(record);
     const cdp = await this.cdpSession(record);
     this.control.validate(input.control);
-    const clipboard = await clipboardTextForShortcut(record.page, input.event);
+    const clipboard = await clipboardTextForShortcut(page, input.event);
     await dispatchUserInput(cdp, input.event);
     return clipboard
       ? { result: { type: "clipboard_text", payload: clipboard } }
@@ -879,7 +1111,8 @@ export class BrowserHost {
   }
 
   private async bindPageEvents(record: PageRecord): Promise<void> {
-    record.page.on("console", (message: ConsoleMessage) => {
+    const page = this.requirePage(record);
+    page.on("console", (message: ConsoleMessage) => {
       this.#transport.emit({
         type: "console",
         payload: {
@@ -889,7 +1122,7 @@ export class BrowserHost {
         },
       });
     });
-    record.page.on("dialog", (dialog: Dialog) => {
+    page.on("dialog", (dialog: Dialog) => {
       this.#transport.emit({
         type: "dialog",
         payload: {
@@ -900,24 +1133,71 @@ export class BrowserHost {
       });
       void dialog.dismiss().catch(() => undefined);
     });
-    record.page.on("download", (download: Download) => {
+    page.on("download", (download: Download) => {
+      const suggestedFilename = basename(download.suggestedFilename()) || "download";
       this.#transport.emit({
         type: "download",
         payload: {
           tab_id: record.tabId,
-          suggested_filename: download.suggestedFilename(),
+          suggested_filename: suggestedFilename,
           state: "started",
         },
       });
+      void (async () => {
+        try {
+          const sourcePath = await download.path();
+          if (!sourcePath) throw new Error("download path is unavailable");
+          const destinationPath = join(
+            this.#config.downloadPath,
+            `${Date.now()}-${randomUUID()}-${suggestedFilename}`,
+          );
+          await copyFile(sourcePath, destinationPath);
+          await unlink(sourcePath).catch(() => undefined);
+          const fileStat = await stat(destinationPath);
+          this.#transport.emit({
+            type: "download",
+            payload: {
+              tab_id: record.tabId,
+              suggested_filename: suggestedFilename,
+              state: "completed",
+              byte_length: fileStat.size,
+            },
+          });
+        } catch (error) {
+          this.#transport.emit({
+            type: "download",
+            payload: {
+              tab_id: record.tabId,
+              suggested_filename: suggestedFilename,
+              state: "failed",
+              error: error instanceof Error ? error.message : String(error),
+            },
+          });
+        }
+      })();
     });
-    record.page.on("crash", () => {
+    page.on("filechooser", (filechooser) => {
+      this.#transport.emit({
+        type: "file_chooser",
+        payload: { tab_id: record.tabId },
+      });
+      void filechooser.setFiles([]).catch(() => undefined);
+    });
+    page.on("popup", (popup) => {
+      this.#transport.emit({
+        type: "popup_blocked",
+        payload: { tab_id: record.tabId },
+      });
+      void popup.close().catch(() => undefined);
+    });
+    page.on("crash", () => {
       this.#transport.emit({
         type: "page_crashed",
         payload: { tab_id: record.tabId },
       });
     });
-    record.page.on("framenavigated", (frame) => {
-      if (frame !== record.page.mainFrame()) return;
+    page.on("framenavigated", (frame) => {
+      if (frame !== page.mainFrame()) return;
       if (record.restoringInitialPage) return;
       record.navigationRevision += 1;
       record.snapshot.invalidate();
@@ -931,11 +1211,22 @@ export class BrowserHost {
     record: PageRecord,
     action: () => Promise<T>,
   ): Promise<T> {
-    const handler = async (route: import("playwright-core").Route) => {
+    // The security policy is installed once for the whole Context. Keeping a
+    // per-command Context route creates cross-tab races because Playwright
+    // routes are Context-scoped, not Page-scoped.
+    void record;
+    return action();
+  }
+
+  private async installNavigationGuard(): Promise<void> {
+    await this.context().route("**/*", async (route) => {
       const request = route.request();
+      const page = request.frame().page();
+      const record = [...this.#pages.values()].find((candidate) => candidate.page === page);
       if (
-        !request.isNavigationRequest()
-        || request.frame() !== record.page.mainFrame()
+        !record
+        || !request.isNavigationRequest()
+        || request.frame() !== page.mainFrame()
       ) {
         await route.continue();
         return;
@@ -946,14 +1237,7 @@ export class BrowserHost {
         return;
       }
       await route.continue();
-    };
-    const context = this.context();
-    await context.route("**/*", handler);
-    try {
-      return await action();
-    } finally {
-      await context.unroute("**/*", handler).catch(() => undefined);
-    }
+    });
   }
 
   private throwBlockedNavigation(record: PageRecord): void {
@@ -970,7 +1254,17 @@ export class BrowserHost {
   }
 
   private async pageState(record: PageRecord): Promise<PageState> {
-    const url = record.page.url();
+    const page = record.page;
+    if (!page) {
+      return {
+        tab_id: record.tabId,
+        url: record.currentUrl,
+        origin: record.currentOrigin,
+        title: record.currentTitle,
+        navigation_revision: record.navigationRevision,
+      };
+    }
+    const url = page.url();
     let origin: string | null = null;
     try {
       const parsed = new URL(url);
@@ -978,13 +1272,17 @@ export class BrowserHost {
     } catch {
       origin = null;
     }
-    return {
+    const state = {
       tab_id: record.tabId,
       url,
       origin,
-      title: await record.page.title().catch(() => ""),
+      title: await page.title().catch(() => ""),
       navigation_revision: record.navigationRevision,
     };
+    record.currentUrl = state.url;
+    record.currentOrigin = state.origin ?? null;
+    record.currentTitle = state.title;
+    return state;
   }
 
   private context(): BrowserContext {
@@ -1017,6 +1315,13 @@ function emptyResult(): ExecutedCommand {
   return { result: { type: "empty" } };
 }
 
+function commandTabId(command: HostCommand): string | null {
+  const payload = (command as { payload?: unknown }).payload;
+  if (!payload || typeof payload !== "object") return null;
+  const tabId = (payload as { tab_id?: unknown }).tab_id;
+  return typeof tabId === "string" ? tabId : null;
+}
+
 function binaryPayload(bytes: Buffer, mimeType: string): BinaryPayload {
   return {
     payload_id: randomUUID(),
@@ -1029,11 +1334,15 @@ function binaryPayload(bytes: Buffer, mimeType: string): BinaryPayload {
 function validateViewport(viewport: {
   width: number;
   height: number;
+  surface_width: number;
+  surface_height: number;
   device_scale_factor_millis: number;
   device_type: HostDeviceType;
 }): void {
   requireSafeInteger("viewport.width", viewport.width);
   requireSafeInteger("viewport.height", viewport.height);
+  requireSafeInteger("viewport.surface_width", viewport.surface_width);
+  requireSafeInteger("viewport.surface_height", viewport.surface_height);
   requireSafeInteger(
     "viewport.device_scale_factor_millis",
     viewport.device_scale_factor_millis,
@@ -1043,6 +1352,10 @@ function validateViewport(viewport: {
     viewport.width > 7_680 ||
     viewport.height < 240 ||
     viewport.height > 4_320 ||
+    viewport.surface_width < 1 ||
+    viewport.surface_width > 7_680 ||
+    viewport.surface_height < 1 ||
+    viewport.surface_height > 4_320 ||
     viewport.device_scale_factor_millis < 500 ||
     viewport.device_scale_factor_millis > 4_000
   ) {
@@ -1061,6 +1374,46 @@ function validateViewport(viewport: {
       false,
     );
   }
+}
+
+function validateLogicalViewport(viewport: HostLogicalViewport): void {
+  requireSafeInteger("viewport.width", viewport.width);
+  requireSafeInteger("viewport.height", viewport.height);
+  requireSafeInteger(
+    "viewport.device_scale_factor_millis",
+    viewport.device_scale_factor_millis,
+  );
+  if (
+    viewport.width < 320
+    || viewport.width > 7_680
+    || viewport.height < 240
+    || viewport.height > 4_320
+    || viewport.device_scale_factor_millis < 500
+    || viewport.device_scale_factor_millis > 4_000
+  ) {
+    throw new ProtocolFailure(
+      "browser_viewport_invalid",
+      "logical viewport is outside the supported range",
+      false,
+      false,
+    );
+  }
+  if (!( ["desktop", "mobile"] as const).includes(viewport.device_type)) {
+    throw new ProtocolFailure(
+      "browser_device_type_invalid",
+      "viewport.device_type is invalid",
+      false,
+      false,
+    );
+  }
+}
+
+function viewportSurfaceScale(viewport: HostViewport): number {
+  return Math.min(
+    1,
+    viewport.surface_width / viewport.width,
+    viewport.surface_height / viewport.height,
+  );
 }
 
 function validateNormalizedRect(rect: NormalizedRect): void {

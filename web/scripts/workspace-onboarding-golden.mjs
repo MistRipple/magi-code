@@ -132,7 +132,7 @@ assert.match(
 );
 assert.match(
   shellSource,
-  /async function openWorkspaceDraft[\s\S]*?sessionsAlreadyLoaded[\s\S]*?messagesState\.workspaceSessionProjection\.workspaceId !== workspaceId[\s\S]*?replaceWorkspaceSessionProjection\(workspaceId, sessionsByWorkspace\[workspaceId\] \?\? \[\]\);[\s\S]*?type: 'newSession'/,
+  /async function openWorkspaceDraft[\s\S]*?sessionsAlreadyLoaded[\s\S]*?messagesState\.workspaceSessionProjection\.workspaceId !== workspaceId[\s\S]*?const cursor = workspaceSessionCursorByWorkspace\.get\(workspaceId\)[\s\S]*?replaceWorkspaceSessionProjection\(workspaceId, sessionsByWorkspace\[workspaceId\] \?\? \[\], cursor\);[\s\S]*?type: 'newSession'/,
   '跨工作区进入草稿时必须切换会话目录投影，同工作区不得重复替换已加载列表',
 );
 assert.doesNotMatch(
@@ -230,10 +230,15 @@ assert.match(
   /function scheduleWorkspaceSessionSummaryRefresh[\s\S]*?getWorkspaceSessions\([\s\S]*?emitDataMessage\('sessionsUpdated'/,
   '会话状态事件必须通过专用会话列表接口同步运行态和未读完成态',
 );
+assert.doesNotMatch(
+  bridgeSource,
+  /applyWorkspaceSessionSnapshotToBootstrap|workspaceSessionSnapshot/,
+  'bootstrap 不得再混入另一条会话目录快照，避免新旧读取链路组合出伪造的高游标旧列表',
+);
 assert.match(
   bridgeSource,
-  /function applyWorkspaceSessionSnapshotToBootstrap[\s\S]*?sessions: snapshot\.sessions[\s\S]*?currentSessionId: payload\.sessionId/,
-  'bootstrap 必须在提交 UI 前合并权威会话运行态，避免切换时清空后台呼吸灯',
+  /function refreshWorkspaceSessionsAfterBootstrap[\s\S]*?runtimeEpoch: snapshot\.runtimeEpoch[\s\S]*?eventStreamNextSequence: snapshot\.eventStreamNextSequence/,
+  'bootstrap 后的会话运行态必须通过带运行时代际和事件游标的唯一目录快照接管',
 );
 assert.match(
   shellSource,

@@ -833,6 +833,7 @@ fn run_session_turn_execution_inner(
     if let Some(compaction) = prepared_history.compaction.as_ref() {
         upsert_context_compaction_completed_notice(compaction_writeback, compaction);
     }
+    let mut proactive_context_compaction_completed = prepared_history.compaction.is_some();
     let mut messages = build_session_turn_messages(
         session_store,
         &request,
@@ -886,6 +887,7 @@ fn run_session_turn_execution_inner(
     let mut empty_response_recovery_attempts = 0usize;
     let mut pre_output_invocation_recovery_attempts = 0usize;
     let mut stream_interruption_recovery_attempts = 0usize;
+    let mut context_limit_recovery_attempted = false;
     let mut tool_call_validation_tracker = ToolCallValidationTracker::default();
     let mut last_response_observation: Option<String> = None;
     let mut round = 0usize;
@@ -920,7 +922,7 @@ fn run_session_turn_execution_inner(
         }
         let round_tools =
             (request.use_tools && !active_tools.is_empty()).then_some(active_tools.clone());
-        if context_budget_recheck_required {
+        if context_budget_recheck_required && !proactive_context_compaction_completed {
             let context_window = resolve_model_context_window(
                 settings_store.map(Arc::as_ref),
                 &resolved_context_model,
@@ -944,7 +946,7 @@ fn run_session_turn_execution_inner(
                     active_skill_name: active_skill_name.as_deref(),
                 });
             match rebuild_result {
-                Ok(_) => {}
+                Ok(compacted) => proactive_context_compaction_completed |= compacted,
                 Err(ContextCompactionTerminal::Cancelled) => {
                     return Ok(SessionTurnExecutionOutput::interrupted());
                 }
@@ -952,8 +954,8 @@ fn run_session_turn_execution_inner(
                     return Err(SessionTurnExecutionError::context_compaction_failed());
                 }
             }
-            context_budget_recheck_required = false;
         }
+        context_budget_recheck_required = false;
         let streamed_content = match stream_session_turn_round(
             SessionTurnRoundRuntime {
                 client,
@@ -1056,6 +1058,7 @@ fn run_session_turn_execution_inner(
                     continue;
                 }
                 if classification.code == "model_context_limit"
+                    && !context_limit_recovery_attempted
                     && let Some(context_limit) = extract_model_context_limit(&error)
                     && let Some(live_settings_store) = live_settings_store.as_ref()
                     && apply_reported_context_limit(
@@ -1066,6 +1069,7 @@ fn run_session_turn_execution_inner(
                         context_limit,
                     )
                 {
+                    context_limit_recovery_attempted = true;
                     let compacted = match rebuild_messages_for_context_window(
                         RebuildMessagesForContextWindowInput {
                             client,
@@ -1094,6 +1098,7 @@ fn run_session_turn_execution_inner(
                         }
                     };
                     if compacted {
+                        proactive_context_compaction_completed = true;
                         continue;
                     }
                 }
@@ -6025,7 +6030,11 @@ mod tests {
             .requests
             .lock()
             .expect("context compaction requests mutex poisoned");
-        assert!(compaction_requests.len() > 1, "小窗口应使用分块语义压缩");
+        assert_eq!(
+            compaction_requests.len(),
+            1,
+            "同一次恢复只能执行一次有界语义压缩"
+        );
         assert!(
             compaction_requests
                 .iter()

@@ -849,12 +849,14 @@ fn create_signed_runtime_archive(
                 sha256: sha256_bytes(node),
                 size_bytes: node.len() as u64,
                 executable: true,
+                symlink_target: None,
             },
             BrowserRuntimeFile {
                 path: "host/index.cjs".to_string(),
                 sha256: sha256_bytes(host),
                 size_bytes: host.len() as u64,
                 executable: false,
+                symlink_target: None,
             },
         ],
     };

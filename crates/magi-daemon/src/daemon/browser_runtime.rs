@@ -34,10 +34,12 @@ const HOST_START_TIMEOUT: Duration = Duration::from_secs(30);
 const HOST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const HOST_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(6);
 const HOST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const HOST_READY_WAIT_TIMEOUT: Duration = Duration::from_secs(65);
 const STALE_PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const HOST_MAX_ATTEMPTS: usize = 2;
 const RUNTIME_CONTROL_QUEUE_CAPACITY: usize = 8;
 const RELEASE_FEED_MAX_BYTES: u64 = 1024 * 1024;
+const MAX_SAFE_RUNTIME_EPOCH: u64 = (1 << 53) - 1;
 const TRANSIENT_BROWSER_CACHE_PATHS: &[&str] = &[
     "Default/Cache",
     "Default/Code Cache",
@@ -100,6 +102,12 @@ pub(super) fn start_controller(state: &ApiState) {
 
 #[cfg(debug_assertions)]
 fn configured_dev_runtime(state: &ApiState) -> Option<BrowserHostProcessConfig> {
+    // 只有 daemon 开发托管模式才允许注入外部 Browser Host。
+    // 桌面 Debug 包也带有 debug_assertions，不能因为继承了同一终端的
+    // Host 路径就被误判为开发态，否则设置页会永久关闭组件管理。
+    if env::var("MAGI_WEB_DEV").ok().as_deref() != Some("1") {
+        return None;
+    }
     let host_entry = env::var_os("MAGI_BROWSER_DEV_HOST_ENTRY").map(PathBuf::from)?;
     let chromium_executable = match env::var_os("MAGI_BROWSER_DEV_CHROMIUM").map(PathBuf::from) {
         Some(path) => path,
@@ -433,6 +441,7 @@ async fn install_component(
     .map_err(|error| format!("浏览器安装评估任务异常退出: {error}"))?
     .map_err(|error| format!("浏览器安装清单校验失败: {error}"))?;
     if !assessment.requires_install {
+        ensure_managed_host_ready(state, &manager, supervisor).await?;
         let mut status = state.browser_runtime_status();
         status.component_status = BrowserRuntimeComponentStatus::Installed;
         status.available_runtime_version = None;
@@ -503,28 +512,75 @@ async fn install_component(
     })?;
 
     stop_host_supervisor(state, supervisor, true).await;
-    let config = configured_component_runtime(state, manager.as_ref())?
-        .ok_or_else(|| "浏览器运行组件安装后没有激活版本".to_string())?;
-    let mut status = state.browser_runtime_status();
-    status.component_status = BrowserRuntimeComponentStatus::Installed;
-    status.runtime_mode = "managed".to_string();
-    status.host_status = "starting".to_string();
-    status.host_protocol_compatible = false;
-    status.runtime_version = Some(release.manifest.runtime_version.to_string());
-    status.host_version = Some(release.manifest.host_version.to_string());
-    status.playwright_version = Some(release.manifest.playwright_version.to_string());
-    status.chromium_version = Some(release.manifest.chromium_version.clone());
-    status.available_runtime_version = None;
-    status.update_level = None;
-    status.component_management_available = true;
-    status.last_error_code = None;
-    state.set_browser_runtime_status(status);
-    *supervisor = Some(tokio::spawn(supervise_browser_host(state.clone(), config)));
+    ensure_managed_host_ready(state, &manager, supervisor).await?;
     Ok(BrowserRuntimeComponentOperation {
         action: BrowserRuntimeComponentAction::Install,
         runtime_version: Some(release.manifest.runtime_version.to_string()),
         update_available: false,
     })
+}
+
+async fn ensure_managed_host_ready(
+    state: &ApiState,
+    manager: &BrowserRuntimeManager,
+    supervisor: &mut Option<tokio::task::JoinHandle<()>>,
+) -> Result<(), String> {
+    let current = state.browser_runtime_status();
+    if current.host_status == "ready"
+        && current.host_protocol_compatible
+        && state.browser_host_client().is_some()
+    {
+        return Ok(());
+    }
+
+    if supervisor
+        .as_ref()
+        .is_some_and(|handle| handle.is_finished())
+    {
+        supervisor.take();
+    }
+    if supervisor.is_none() {
+        let config = configured_component_runtime(state, manager)?
+            .ok_or_else(|| "浏览器运行组件安装后没有激活版本".to_string())?;
+        let mut status = state.browser_runtime_status();
+        status.component_status = BrowserRuntimeComponentStatus::Installed;
+        status.runtime_mode = "managed".to_string();
+        status.host_status = "starting".to_string();
+        status.host_protocol_compatible = false;
+        status.runtime_version = Some(config.runtime_version.clone());
+        status.host_version = Some(config.host_version.clone());
+        status.playwright_version = Some(config.playwright_version.clone());
+        status.available_runtime_version = None;
+        status.update_level = None;
+        status.component_management_available = true;
+        status.last_error_code = None;
+        state.set_browser_runtime_status(status);
+        *supervisor = Some(tokio::spawn(supervise_browser_host(state.clone(), config)));
+    }
+
+    let deadline = Instant::now() + HOST_READY_WAIT_TIMEOUT;
+    loop {
+        let status = state.browser_runtime_status();
+        if status.host_status == "ready"
+            && status.host_protocol_compatible
+            && state.browser_host_client().is_some()
+        {
+            return Ok(());
+        }
+        if status.host_status == "failed" {
+            return Err(format!(
+                "Browser Host 启动失败: {}",
+                status
+                    .last_error_code
+                    .as_deref()
+                    .unwrap_or("browser_host_start_failed")
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err("Browser Host 在 65 秒内未完成握手".to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn uninstall_component(
@@ -760,7 +816,8 @@ fn runtime_component_self_test(
         .build()
         .map_err(|error| format!("创建浏览器自检运行时失败: {error}"))?;
     let result = runtime.block_on(async {
-        let (mut child, client, handshake) = start_host_attempt(&config, u64::MAX).await?;
+        let (mut child, client, handshake) =
+            start_host_attempt(&config, runtime_self_test_epoch()).await?;
         let validation = if handshake.host_version != manifest.host_version.to_string() {
             Err("Browser Host 版本与签名清单不一致".to_string())
         } else if handshake.playwright_version != manifest.playwright_version.to_string() {
@@ -776,6 +833,10 @@ fn runtime_component_self_test(
     });
     let _ = fs::remove_dir_all(profile_path);
     result
+}
+
+fn runtime_self_test_epoch() -> u64 {
+    UtcMillis::now().0.min(MAX_SAFE_RUNTIME_EPOCH)
 }
 
 fn parse_release_key(value: &str) -> Result<[u8; 32], ()> {
@@ -817,11 +878,33 @@ async fn supervise_browser_host(state: ApiState, config: BrowserHostProcessConfi
             continue;
         }
         state.set_browser_host_client(Some(client.clone()));
+        // `ready` 是会话级契约，不只是 Host 进程完成握手。
+        // 现有权威会话在页面重建完成前仍处于恢复中，因此这段时间对 API
+        // 调用方必须保持 Host 不可用。
+        if let Err(error) = restore_browser_sessions(&state, &client).await {
+            last_failure = format!("browser_session_restore_failed:{error}");
+            tracing::warn!(error = %last_failure, "Browser Host 启动后恢复页面边界失败");
+            let _ = child.start_terminate();
+            let _ = child.wait().await;
+            client.close().await;
+            state.set_browser_host_client(None);
+            begin_runtime_recovery(&state);
+            set_runtime_status(
+                &state,
+                &config,
+                "recovering",
+                false,
+                Some(last_failure.clone()),
+                None,
+            );
+            publish_runtime_status(&state, "recovering", Some(&last_failure));
+            if attempt + 1 < HOST_MAX_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            continue;
+        }
         set_runtime_status(&state, &config, "ready", true, None, Some(&handshake));
         publish_runtime_status(&state, "ready", None);
-        if let Err(error) = restore_browser_sessions(&state, &client).await {
-            tracing::warn!(?error, "Browser Host 启动后恢复页面边界失败");
-        }
 
         let mut events = client.subscribe();
         let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -1224,6 +1307,8 @@ async fn restore_browser_sessions(
                     viewport: HostViewport {
                         width: tab.viewport.width,
                         height: tab.viewport.height,
+                        surface_width: tab.viewport.width,
+                        surface_height: tab.viewport.height,
                         device_scale_factor_millis: tab.viewport.device_scale_factor_millis,
                         device_type: tab.viewport.device_type,
                     },
@@ -1337,6 +1422,14 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent) {
                 );
             }
         }
+        BrowserHostEvent::PageSuspended { tab_id } => {
+            publish_tab_event(
+                state,
+                "browser.tab.suspended",
+                browser_tab_context(state, &tab_id),
+                serde_json::json!({ "tab_id": tab_id }),
+            );
+        }
         BrowserHostEvent::PageCrashed { tab_id, diagnostic } => {
             let context = browser_tab_context(state, &tab_id);
             let _ = state.mutate_browser_authority(|authority| {
@@ -1356,10 +1449,60 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent) {
             let _ =
                 state.record_browser_frame(&frame.tab_id, frame.frame_sequence, UtcMillis::now());
         }
+        BrowserHostEvent::Dialog {
+            tab_id,
+            dialog_type,
+            message,
+        } => {
+            publish_tab_event(
+                state,
+                "browser.dialog.dismissed",
+                browser_tab_context(state, &tab_id),
+                serde_json::json!({
+                    "tab_id": tab_id,
+                    "dialog_type": dialog_type,
+                    "message": magi_core::public_runtime_excerpt(&message, 1024),
+                }),
+            );
+        }
+        BrowserHostEvent::Download {
+            tab_id,
+            suggested_filename,
+            state: download_state,
+            byte_length,
+            error,
+        } => {
+            publish_tab_event(
+                state,
+                "browser.download.updated",
+                browser_tab_context(state, &tab_id),
+                serde_json::json!({
+                    "tab_id": tab_id,
+                    "suggested_filename": suggested_filename,
+                    "state": download_state,
+                    "byte_length": byte_length,
+                    "error": error.map(|value| magi_core::public_runtime_excerpt(&value, 1024)),
+                }),
+            );
+        }
+        BrowserHostEvent::FileChooser { tab_id } => {
+            publish_tab_event(
+                state,
+                "browser.file_chooser.cancelled",
+                browser_tab_context(state, &tab_id),
+                serde_json::json!({ "tab_id": tab_id }),
+            );
+        }
+        BrowserHostEvent::PopupBlocked { tab_id } => {
+            publish_tab_event(
+                state,
+                "browser.popup.blocked",
+                browser_tab_context(state, &tab_id),
+                serde_json::json!({ "tab_id": tab_id }),
+            );
+        }
         BrowserHostEvent::Ready(_)
         | BrowserHostEvent::Console { .. }
-        | BrowserHostEvent::Dialog { .. }
-        | BrowserHostEvent::Download { .. }
         | BrowserHostEvent::BinaryPayloadReady(_)
         | BrowserHostEvent::Heartbeat { .. } => {}
     }
@@ -1689,8 +1832,13 @@ mod tests {
 
     use super::{
         BrowserProcessMatchSpec, begin_runtime_recovery, browser_process_matches,
-        clear_transient_browser_cache,
+        clear_transient_browser_cache, runtime_self_test_epoch,
     };
+
+    #[test]
+    fn browser_host_self_test_epoch_is_safe_for_javascript() {
+        assert!(runtime_self_test_epoch() <= (1 << 53) - 1);
+    }
 
     #[test]
     fn stale_browser_process_matching_is_profile_and_executable_specific() {

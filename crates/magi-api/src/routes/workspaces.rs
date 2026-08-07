@@ -64,6 +64,8 @@ struct WorkspaceSessionDto {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceSessionsResponse {
+    runtime_epoch: String,
+    event_stream_next_sequence: u64,
     workspace: WorkspaceDto,
     session_id: String,
     sessions: Vec<WorkspaceSessionDto>,
@@ -245,6 +247,8 @@ struct MarkWorkspaceSessionViewedRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MarkWorkspaceSessionViewedResponse {
+    runtime_epoch: String,
+    event_stream_next_sequence: u64,
     session_id: String,
     has_unread_completion: bool,
 }
@@ -287,6 +291,8 @@ async fn mark_workspace_session_viewed(
         }),
     );
     Ok(Json(MarkWorkspaceSessionViewedResponse {
+        runtime_epoch: state.runtime_epoch().to_string(),
+        event_stream_next_sequence: state.event_bus.snapshot().next_sequence,
         session_id: scope.session_id.to_string(),
         has_unread_completion: session.has_unread_completion(),
     }))
@@ -337,6 +343,11 @@ async fn workspace_sessions(
         is_active: active_id.as_ref() == Some(&workspace.workspace_id),
     };
     let scoped_workspace_id = workspace.workspace_id.to_string();
+    // 目录游标必须先于 SessionStore 快照读取。所有会话目录变更都先提交
+    // SessionStore、再发布事件，因此这个顺序保证：游标一旦包含某个事件，
+    // 同一响应里的目录快照也一定包含该事件对应的事实。客户端可据此拒绝
+    // 晚到的旧响应，避免旧空列表覆盖刚接受的新会话。
+    let event_stream_next_sequence = state.event_bus.snapshot().next_sequence;
 
     let scoped_sessions = state
         .session_records_for_workspace(Some(scoped_workspace_id.as_str()))
@@ -379,6 +390,8 @@ async fn workspace_sessions(
         .to_string();
 
     Ok(Json(WorkspaceSessionsResponse {
+        runtime_epoch: state.runtime_epoch().to_string(),
+        event_stream_next_sequence,
         workspace: workspace_dto,
         session_id: current_session_id,
         sessions: scoped_sessions,
@@ -711,6 +724,16 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let payload = read_json_response(response).await;
+        assert!(
+            payload["runtimeEpoch"]
+                .as_str()
+                .is_some_and(|runtime_epoch| !runtime_epoch.is_empty())
+        );
+        assert!(
+            payload["eventStreamNextSequence"]
+                .as_u64()
+                .is_some_and(|sequence| sequence >= 1)
+        );
         assert_eq!(payload["workspace"]["workspaceId"], "workspace-count");
         assert_eq!(payload["sessionId"], "session-counted");
         let sessions = payload["sessions"]

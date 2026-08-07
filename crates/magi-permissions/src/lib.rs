@@ -268,18 +268,13 @@ impl PermissionEngine {
         let has_command = json_string(&object, &["command", "script", "line"])
             .is_some_and(|value| !value.trim().is_empty());
 
-        if object
-            .get("background")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            return false;
-        }
-
         match action.as_deref() {
             None if has_terminal_id && !has_command => return true,
             Some("read" | "poll" | "status" | "list" | "ls") => return true,
-            Some("write" | "stdin" | "send" | "kill" | "stop" | "terminate" | "cancel") => {
+            // 已受 session/workspace 作用域约束的停止动作不会扩大命令的写入能力，
+            // 在只读模式下也必须可以停止自己已启动的后台进程。
+            Some("kill" | "stop" | "terminate" | "cancel") => return true,
+            Some("write" | "stdin" | "send") => {
                 return false;
             }
             Some("run" | "exec" | "command") | None => {}
@@ -1311,11 +1306,11 @@ mod tests {
     }
 
     #[test]
-    fn shell_background_execution_is_never_classified_as_read_only() {
+    fn shell_background_read_only_command_keeps_read_only_classification() {
         let args = r#"{"command":"printf background","access_mode":"read_only","background":true}"#;
 
-        assert!(!PermissionEngine::shell_arguments_request_read_only(args));
-        assert!(matches!(
+        assert!(PermissionEngine::shell_arguments_request_read_only(args));
+        assert_eq!(
             engine_with_test_tools().decide(
                 &PermissionRequest::ShellCommand {
                     arguments_json: args,
@@ -1323,8 +1318,25 @@ mod tests {
                 &PermissionPolicy::default(),
                 AccessProfile::Restricted,
             ),
-            Decision::NeedsApproval { .. }
-        ));
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn shell_kill_action_is_available_in_read_only_mode() {
+        let args = r#"{"action":"kill","terminal_id":42}"#;
+
+        assert!(PermissionEngine::shell_arguments_request_read_only(args));
+        assert_eq!(
+            engine_with_test_tools().decide(
+                &PermissionRequest::ShellCommand {
+                    arguments_json: args,
+                },
+                &PermissionPolicy::default(),
+                AccessProfile::ReadOnly,
+            ),
+            Decision::Allow
+        );
     }
 
     #[test]
@@ -1349,9 +1361,9 @@ mod tests {
                 false,
             ),
             (
-                "background process",
+                "background read-only process",
                 r#"{"command":"printf hello","access_mode":"read_only","background":true}"#,
-                false,
+                true,
             ),
             (
                 "declared write",

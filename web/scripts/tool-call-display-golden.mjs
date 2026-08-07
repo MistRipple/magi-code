@@ -121,6 +121,70 @@ await withGoldenViteServer(async (server) => {
 
   const { render } = await server.ssrLoadModule('svelte/server');
   const failureCard = await server.ssrLoadModule('/src/components/ModelFailureCard.svelte');
+  const toolCall = await server.ssrLoadModule('/src/components/ToolCall.svelte');
+  for (const [errorCode, errorMessage] of [
+    ['file_patch_no_match', '目标内容与当前文件不匹配，请重新读取文件后再修改'],
+    ['file_patch_ambiguous_match', '目标内容在当前文件中不是唯一匹配，请增加上下文后重试'],
+    ['file_patch_not_applicable', 'patch 与当前文件内容不匹配，请重新读取文件并生成精确修改'],
+    ['file_patch_invalid_input', 'patches[1] 缺少 new_string 字段'],
+  ]) {
+    const mismatchMarkup = render(toolCall.default, {
+      props: {
+        name: 'file_patch',
+        status: 'error',
+        input: { path: 'backend/internal/handlers/app.go' },
+        error: JSON.stringify({
+          tool: 'file_patch',
+          status: 'failed',
+          error_code: errorCode,
+          error: errorMessage,
+        }),
+      },
+    }).body;
+    assert.match(mismatchMarkup, /输入不匹配/);
+    assert.ok(mismatchMarkup.includes(errorMessage));
+    assert.doesNotMatch(mismatchMarkup, /写入失败|检查文件是否可写/);
+  }
+
+  const writeFailureMarkup = render(toolCall.default, {
+    props: {
+      name: 'file_patch',
+      status: 'error',
+      input: { path: 'backend/internal/handlers/app.go' },
+      error: JSON.stringify({
+        tool: 'file_patch',
+        status: 'failed',
+        error_code: 'file_patch_failed',
+        error: '文件暂不可写入，请检查路径或权限',
+      }),
+    },
+  }).body;
+  assert.match(writeFailureMarkup, /写入失败/);
+  assert.match(writeFailureMarkup, /文件暂不可写入，请检查路径或权限/);
+  assert.doesNotMatch(writeFailureMarkup, /输入不匹配/);
+
+  for (const [errorCode, errorMessage] of [
+    ['file_patch_read_failed', '文件暂不可读取，请检查路径或权限'],
+    ['file_patch_path_resolution_failed', '路径暂不可解析，请检查工作区或路径'],
+  ]) {
+    const runtimeFailureMarkup = render(toolCall.default, {
+      props: {
+        name: 'file_patch',
+        status: 'error',
+        input: { path: 'backend/internal/handlers/app.go' },
+        error: JSON.stringify({
+          tool: 'file_patch',
+          status: 'failed',
+          error_code: errorCode,
+          error: errorMessage,
+        }),
+      },
+    }).body;
+    assert.match(runtimeFailureMarkup, /执行异常/);
+    assert.ok(runtimeFailureMarkup.includes(errorMessage));
+    assert.doesNotMatch(runtimeFailureMarkup, /输入不匹配|写入失败|检查文件是否可写/);
+  }
+
   const invalidToolMarkup = render(failureCard.default, {
     props: {
       failure: toolCallFailure.parseToolCallFailureDiagnostic({

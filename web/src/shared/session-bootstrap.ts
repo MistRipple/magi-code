@@ -1,4 +1,8 @@
 export interface SessionBootstrapSnapshot {
+  agent?: {
+    runtimeEpoch?: string;
+  };
+  eventStreamNextSequence?: number;
   workspace?: {
     workspaceId?: string;
     rootPath?: string;

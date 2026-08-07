@@ -87,6 +87,7 @@ function runGoldenReplay(reducer, projection, messagesStore, dataHandlers, timel
   assertMessagesStoreRejectsForeignSessionProjection(reducer, projection, messagesStore);
   assertMessagesStoreAdoptsLiveCanonicalEventForEmptySession(dataHandlers, messagesStore);
   assertWorkspaceDraftPreservesSessionList(dataHandlers, messagesStore);
+  assertWorkspaceSessionCatalogRejectsLatePreAcceptanceSnapshot(messagesStore);
   assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsEmpty(dataHandlers, messagesStore);
   assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, messagesStore);
   assertMessagesStoreSettlesProcessingFromLiveTerminalCanonicalEvent(dataHandlers, messagesStore);
@@ -726,7 +727,10 @@ function assertWorkspaceDraftPreservesSessionList(dataHandlers, messagesStore) {
 
   messagesStore.messagesState.currentWorkspaceId = workspaceId;
   messagesStore.messagesState.currentWorkspacePath = workspacePath;
-  messagesStore.replaceWorkspaceSessionProjection(workspaceId, sessions);
+  messagesStore.replaceWorkspaceSessionProjection(workspaceId, sessions, {
+    runtimeEpoch: 'runtime-golden-draft-preserve',
+    eventStreamNextSequence: 1,
+  });
   messagesStore.setCurrentSessionId(sessions[0].id);
 
   dataHandlers.handleUnifiedData({
@@ -756,6 +760,62 @@ function assertWorkspaceDraftPreservesSessionList(dataHandlers, messagesStore) {
     messagesStore.messagesState.appState?.sessions?.map((session) => session.id),
     sessions.map((session) => session.id),
     'draft app state must expose the same preserved session list',
+  );
+}
+
+function assertWorkspaceSessionCatalogRejectsLatePreAcceptanceSnapshot(messagesStore) {
+  const workspaceId = 'workspace-golden-session-catalog-race';
+  const runtimeEpoch = 'runtime-golden-session-catalog-race';
+  const existingSession = {
+    id: 'session-golden-existing',
+    name: '已有会话',
+    createdAt: 30_000,
+    updatedAt: 30_000,
+    messageCount: 1,
+    workspaceId,
+  };
+  const createdSession = {
+    id: 'session-golden-created',
+    name: '刚创建的会话',
+    createdAt: 31_000,
+    updatedAt: 31_000,
+    messageCount: 1,
+    workspaceId,
+  };
+
+  messagesStore.replaceWorkspaceSessionProjection(workspaceId, [existingSession], {
+    runtimeEpoch,
+    eventStreamNextSequence: 8,
+  }, { allowRuntimeEpochChange: true });
+  messagesStore.advanceWorkspaceSessionProjectionCursor(workspaceId, {
+    runtimeEpoch,
+    eventStreamNextSequence: 10,
+  });
+
+  const staleApplied = messagesStore.replaceWorkspaceSessionProjection(workspaceId, [], {
+    runtimeEpoch,
+    eventStreamNextSequence: 9,
+  });
+  assert.equal(staleApplied, false, '新会话 accepted 前发出的旧目录响应必须被事件游标拒绝');
+  assert.deepEqual(
+    messagesStore.messagesState.workspaceSessionProjection.sessions.map((session) => session.id),
+    [existingSession.id],
+    '晚到的旧空目录不得清空 accepted 时仍可见的会话目录',
+  );
+
+  const freshApplied = messagesStore.replaceWorkspaceSessionProjection(
+    workspaceId,
+    [createdSession, existingSession],
+    {
+      runtimeEpoch,
+      eventStreamNextSequence: 10,
+    },
+  );
+  assert.equal(freshApplied, true, 'accepted 后同游标的新目录快照必须正常接管');
+  assert.deepEqual(
+    messagesStore.messagesState.workspaceSessionProjection.sessions.map((session) => session.id),
+    [createdSession.id, existingSession.id],
+    '新会话必须稳定保留在工作区目录中',
   );
 }
 
@@ -1663,6 +1723,8 @@ function assertSameSessionBootstrapAppliesAuthoritativeSnapshotWhenProjectionIsE
     data: {
       dataType: 'sessionBootstrapLoaded',
       payload: {
+        agent: { runtimeEpoch: 'runtime-golden-bootstrap-empty-projection' },
+        eventStreamNextSequence: 1,
         sessionId: c.sessionId,
         workspace: {
           workspaceId,
@@ -1832,6 +1894,8 @@ function assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, me
     data: {
       dataType: 'sessionBootstrapLoaded',
       payload: {
+        agent: { runtimeEpoch: 'runtime-golden-stale-idle-bootstrap' },
+        eventStreamNextSequence: 1,
         sessionId,
         workspace: {
           workspaceId,
@@ -1916,6 +1980,8 @@ function assertSameSessionStaleIdleBootstrapPreservesActiveTurn(dataHandlers, me
     data: {
       dataType: 'sessionBootstrapLoaded',
       payload: {
+        agent: { runtimeEpoch: 'runtime-golden-authoritative-bootstrap' },
+        eventStreamNextSequence: 1,
         sessionId,
         workspace: {
           workspaceId,

@@ -1616,19 +1616,13 @@ impl DaemonRuntime {
         }
         let state_for_task_workers = state.clone();
         let state_for_knowledge_persist = state.clone();
-        let state_for_session_turn_persist = state.clone();
         let knowledge_persist_callback = Arc::new(move || {
             if let Err(error) = state_for_knowledge_persist.persist_knowledge_state() {
                 tracing::warn!(?error, "自动知识沉淀持久化失败");
             }
         });
-        let session_state_persist_callback = Arc::new(move |checkpoint: &str| {
-            if let Err(error) =
-                state_for_session_turn_persist.persist_session_state_checkpoint(checkpoint)
-            {
-                tracing::warn!(checkpoint, ?error, "session turn 关键状态持久化失败");
-            }
-        });
+        let session_state_persist_callback =
+            magi_api::task_turn_finalize::session_state_persist_callback(&state);
         let llm_task_dispatcher = LlmTaskDispatcher::new(
             self.event_bus.clone(),
             state

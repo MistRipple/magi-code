@@ -887,6 +887,38 @@ mod tests {
     }
 
     #[test]
+    fn browser_observations_are_never_reused_across_page_state_changes() {
+        for tool_name in ["browser_snapshot", "browser_screenshot"] {
+            let mut ledger = ToolExecutionLedger::for_task_goal("验证浏览器交互前后状态");
+            let first = call("call-browser-1", tool_name, r#"{"full_page":false}"#);
+            let first_plan = ledger.plan(std::slice::from_ref(&first), None);
+            let ToolCallExecutionDecision::Execute { fingerprint } = &first_plan[0] else {
+                panic!("首次 {tool_name} 必须执行");
+            };
+            assert!(fingerprint.is_none(), "{tool_name} 不应进入可复用结果账本");
+            ledger.record_execution(
+                &first,
+                None,
+                &(
+                    serde_json::json!({
+                        "tool": tool_name,
+                        "status": "succeeded",
+                        "page_revision": 1,
+                    })
+                    .to_string(),
+                    ExecutionResultStatus::Succeeded,
+                ),
+            );
+
+            let repeat = call("call-browser-2", tool_name, r#"{"full_page":false}"#);
+            assert!(matches!(
+                ledger.plan(&[repeat], None)[0],
+                ToolCallExecutionDecision::Execute { fingerprint: None }
+            ));
+        }
+    }
+
+    #[test]
     fn treats_object_key_order_as_the_same_idempotent_call() {
         let ledger = ToolExecutionLedger::for_task_goal("搜索 Rust");
         let calls = [

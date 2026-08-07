@@ -571,30 +571,53 @@ impl LlmTaskDispatcher {
         if matches!(&outcome, TaskOutcome::Completed { .. }) {
             self.session_store
                 .bind_execution_ownership(session_id.clone(), ownership);
-            let should_extract_knowledge = !writebacks.is_empty();
+            let should_enrich_session = !writebacks.is_empty();
             writebacks.apply(&self.pipeline.memory_store);
             self.publish_execution_overview(task, &session_id, &workspace_id, context_summary);
             self.push_result(task_id, lease_id, outcome.clone());
             self.finalize_agent_worktree(task, &session_id, &workspace_id, is_sidechain);
-            if should_extract_knowledge {
-                let execution_settings =
-                    self.execution_settings_or_live(execution_settings_snapshot.as_ref());
-                self.extract_and_persist_knowledge(
-                    execution_settings,
-                    &session_id,
-                    &workspace_id,
-                    &outcome,
-                );
-                self.extract_and_persist_session_memory(
-                    execution_settings,
-                    &session_id,
-                    &workspace_id,
+            if should_enrich_session {
+                self.schedule_post_completion_enrichment(
+                    session_id,
+                    workspace_id,
+                    outcome,
+                    execution_settings_snapshot,
                 );
             }
             return;
         }
         self.push_result(task_id, lease_id, outcome);
         self.finalize_agent_worktree(task, &session_id, &workspace_id, is_sidechain);
+    }
+
+    fn schedule_post_completion_enrichment(
+        &self,
+        session_id: SessionId,
+        workspace_id: Option<WorkspaceId>,
+        outcome: TaskOutcome,
+        execution_settings_snapshot: Option<Arc<SettingsStore>>,
+    ) {
+        let dispatcher = self.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("magi-session-enrichment".to_string())
+            .spawn(move || {
+                let execution_settings =
+                    dispatcher.execution_settings_or_live(execution_settings_snapshot.as_ref());
+                dispatcher.extract_and_persist_knowledge(
+                    execution_settings,
+                    &session_id,
+                    &workspace_id,
+                    &outcome,
+                );
+                dispatcher.extract_and_persist_session_memory(
+                    execution_settings,
+                    &session_id,
+                    &workspace_id,
+                );
+            })
+        {
+            tracing::warn!(%error, "启动会话后台沉淀线程失败");
+        }
     }
 
     fn extract_and_persist_knowledge(
@@ -629,7 +652,22 @@ impl LlmTaskDispatcher {
             .rev()
             .collect::<Vec<_>>()
             .join("\n\n");
-        let output_text = attempt.output_refs.join("\n\n");
+        // output_refs 可能包含完整的工具证据（一次大型只读分析可达数百 KB），
+        // 不应把它原样复制给辅助模型。知识抽取只需要用户可见的终态答复；
+        // 完整证据继续留在 task/session 审计链路中。
+        let output_text = attempt
+            .final_response
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                attempt
+                    .output_refs
+                    .iter()
+                    .map(|output| public_runtime_excerpt(output, 8_000))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            });
         let extraction_text = format!("{timeline_text}\n\n{output_text}");
         let Some(client) =
             resolve_target_for_role(settings_store, None, RoleTarget::Auxiliary, None)
@@ -1490,6 +1528,13 @@ impl LlmTaskDispatcher {
         }
         let registry = Some(self.agent_role_registry.as_ref());
         if task_is_coordinator(Some(task), registry) {
+            let collaboration_disabled = task
+                .policy_snapshot
+                .as_ref()
+                .is_some_and(|policy| policy.denied_tools.iter().any(|tool| tool == "agent_spawn"));
+            if collaboration_disabled {
+                return None;
+            }
             return Some(root_multi_agent_mode_prompt());
         }
         Some(subagent_multi_agent_mode_prompt())
@@ -2665,7 +2710,13 @@ mod tests {
         merge_orchestrator_session_override, resolve_orchestrator_model_config,
     };
     use crate::task_runner_bridge::TaskResultReceiver;
-    use magi_core::{MissionId, Task, TaskPolicy, TaskRuntimePayload, TaskTier};
+    use magi_core::{
+        MissionId, Task, TaskCompletionAttempt, TaskPolicy, TaskRuntimePayload, TaskTier,
+    };
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     struct FailingAuxiliaryClient;
 
@@ -2744,6 +2795,38 @@ mod tests {
         let governance = Arc::new(magi_governance::GovernanceService::default());
         let mut tool_registry = ToolRegistry::new(governance, Arc::clone(&event_bus));
         tool_registry.register_default_builtins();
+        dispatcher_with_tool_surface(event_bus, tool_registry, "dispatcher-default-tool-surface")
+    }
+
+    fn dispatcher_with_ready_browser_tool_surface() -> LlmTaskDispatcher {
+        let event_bus = Arc::new(InMemoryEventBus::new(64));
+        let governance = Arc::new(magi_governance::GovernanceService::default());
+        let mut tool_registry = ToolRegistry::new(governance, Arc::clone(&event_bus))
+            .with_browser_runtime(
+                Arc::new(|_, tool, _, _| {
+                    (
+                        serde_json::json!({ "tool": tool, "status": "succeeded" }).to_string(),
+                        magi_core::ExecutionResultStatus::Succeeded,
+                    )
+                }),
+                Arc::new(|_| magi_browser_runtime::BrowserCapabilitySnapshot {
+                    revision: 11,
+                    in_app_browser_enabled: true,
+                    browser_use_enabled: true,
+                    runtime_status: magi_browser_runtime::BrowserRuntimeComponentStatus::Installed,
+                    host_protocol_compatible: true,
+                    access_profile: magi_core::AccessProfile::Restricted,
+                }),
+            );
+        tool_registry.register_default_builtins();
+        dispatcher_with_tool_surface(event_bus, tool_registry, "dispatcher-browser-tool-surface")
+    }
+
+    fn dispatcher_with_tool_surface(
+        event_bus: Arc<InMemoryEventBus>,
+        tool_registry: ToolRegistry,
+        state_label: &str,
+    ) -> LlmTaskDispatcher {
         let orchestrator = OrchestratorService::new(Arc::clone(&event_bus));
         let skill_runtime = magi_skill_runtime::SkillDispatchRuntime::new(
             tool_registry.clone(),
@@ -2771,9 +2854,92 @@ mod tests {
                 conversation_registry: Arc::new(ConversationRegistry::new()),
                 agent_role_registry: Arc::new(magi_agent_role::AgentRoleRegistry::load_default()),
             },
-            test_mission_state_root("dispatcher-default-tool-surface"),
+            test_mission_state_root(state_label),
         )
         .with_tool_registry(tool_registry)
+    }
+
+    #[test]
+    fn post_completion_enrichment_does_not_block_terminal_result() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind auxiliary test server");
+        let address = listener.local_addr().expect("auxiliary test address");
+        let (request_started_tx, request_started_rx) = mpsc::channel();
+        let (release_response_tx, release_response_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept auxiliary request");
+            request_started_tx
+                .send(())
+                .expect("signal auxiliary request start");
+            release_response_rx
+                .recv()
+                .expect("wait for auxiliary response release");
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"[]"}}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write auxiliary response");
+        });
+
+        let settings = Arc::new(SettingsStore::new());
+        settings
+            .set_section(
+                "auxiliary",
+                serde_json::json!({
+                    "baseUrl": format!("http://{address}/v1"),
+                    "model": "auxiliary-enrichment-test",
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat"
+                }),
+            )
+            .expect("auxiliary settings should save");
+        let dispatcher = dispatcher_with_default_tool_surface()
+            .with_settings_store(settings)
+            .with_knowledge_store(Arc::new(KnowledgeStore::new()));
+        let (scheduled_tx, scheduled_rx) = mpsc::channel();
+        let schedule_call = std::thread::spawn(move || {
+            dispatcher.schedule_post_completion_enrichment(
+                SessionId::new("session-nonblocking-enrichment"),
+                Some(WorkspaceId::new("workspace-nonblocking-enrichment")),
+                TaskOutcome::Completed {
+                    attempt: TaskCompletionAttempt {
+                        output_refs: vec!["已完成真实任务输出，等待后台知识抽取".to_string()],
+                        final_response: Some("任务已完成".to_string()),
+                        evidence: Vec::new(),
+                    },
+                },
+                None,
+            );
+            scheduled_tx.send(()).expect("signal scheduling return");
+        });
+
+        let returned_before_auxiliary_release =
+            scheduled_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        let auxiliary_request_started = request_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .is_ok();
+        if !auxiliary_request_started {
+            let _ = TcpStream::connect(address);
+        }
+        release_response_tx
+            .send(())
+            .expect("release auxiliary response");
+        schedule_call
+            .join()
+            .expect("join enrichment scheduling call");
+        server.join().expect("join auxiliary test server");
+
+        assert!(
+            returned_before_auxiliary_release,
+            "任务终态不能等待后台知识/记忆抽取返回"
+        );
+        assert!(
+            auxiliary_request_started,
+            "后台知识抽取必须真实启动，测试不能通过跳过辅助模型伪造非阻塞"
+        );
     }
 
     fn git_fixture(path: &std::path::Path, args: &[&str]) {
@@ -3494,13 +3660,36 @@ mod tests {
             "root coordinator 必须明确知道 runtime_internal 不等于模型不可调用"
         );
 
-        let automatic_task = task_with_role("coordinator", TaskTier::ExecutionChain);
-        let (automatic_prompt, _) =
-            dispatcher.assemble_prompt(None, &automatic_task, &session_id, &workspace_id);
+        let mut ordinary_task = task_with_role("coordinator", TaskTier::ExecutionChain);
+        ordinary_task
+            .policy_snapshot
+            .as_mut()
+            .expect("policy")
+            .denied_tools = ["agent_spawn", "agent_send", "agent_wait"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let (ordinary_prompt, _) =
+            dispatcher.assemble_prompt(None, &ordinary_task, &session_id, &workspace_id);
         assert!(
-            !automatic_prompt.contains("[team-orchestration-contract]"),
-            "协作能力只由 root coordinator 工具面决定，不能再注入文本派发合同"
+            !ordinary_prompt.contains("多代理模式（root coordinator 必须遵守）"),
+            "普通主线请求禁用协作工具后不能再注入 coordinator 提示"
         );
+        let ordinary_tools = dispatcher
+            .build_tool_definitions(
+                Some(&ordinary_task),
+                None,
+                magi_core::AccessProfile::Restricted,
+            )
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+        for hidden in ["agent_spawn", "agent_send", "agent_wait"] {
+            assert!(
+                !ordinary_tools.iter().any(|name| name == hidden),
+                "普通主线请求不能暴露协作工具 {hidden}: {ordinary_tools:?}"
+            );
+        }
 
         let worker_task = task_with_role("executor", TaskTier::ExecutionChain);
         let (worker_prompt, _) =
@@ -3649,6 +3838,35 @@ mod tests {
                 worker_names.iter().any(|name| name == "file_write"),
                 access_profile != magi_core::AccessProfile::ReadOnly,
                 "子代理文件写入工具可见性必须与访问模式一致"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_browser_runtime_is_exposed_to_regular_execution_worker() {
+        let dispatcher = dispatcher_with_ready_browser_tool_surface();
+        let worker = task_with_role("executor", TaskTier::ExecutionChain);
+        let names = dispatcher
+            .build_tool_definitions(Some(&worker), None, magi_core::AccessProfile::Restricted)
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "shell_exec"));
+        for browser_tool in [
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_press",
+            "browser_scroll",
+            "browser_screenshot",
+            "browser_tabs",
+            "browser_viewport",
+        ] {
+            assert!(
+                names.iter().any(|name| name == browser_tool),
+                "普通执行 Worker 未发现 {browser_tool}: {names:?}"
             );
         }
     }

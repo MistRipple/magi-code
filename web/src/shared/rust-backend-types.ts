@@ -98,6 +98,7 @@ export interface QueuedSessionTurnDto {
     name: string;
   }>;
   browserAnnotationRefs: string[];
+  canGuide: boolean;
   retryCount: number;
 }
 
@@ -154,7 +155,8 @@ export interface SessionInterruptResponseDto {
   turnId?: string | null;
   eventId: string;
   requestedAt: number;
-  clearedQueuedTurnCount: number;
+  remainingQueuedTurnCount: number;
+  nextQueuedTurnStarted: boolean;
   removedTimelineEntryIds: string[];
 }
 

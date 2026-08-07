@@ -321,9 +321,34 @@ assert.doesNotMatch(
   /type FollowUpMode = 'queue' \| 'guide'|data-testid="input-followup-mode-button"|ia-followup-mode/,
   '运行中输入区必须默认排队，不得保留排队与引导模式切换入口',
 );
+assert.match(
+  inputAreaSource,
+  /type:\s*'guideQueuedMessage'[\s\S]*?queuedMessageId:/,
+  '单条排队消息必须保留服务端转引导操作',
+);
+assert.match(
+  inputAreaSource,
+  /function canGuideQueuedMessage\(queued: QueuedMessage\): boolean \{\s*return queued\.canGuide === true;\s*\}/,
+  '排队消息能否转引导必须只使用服务端权威能力字段',
+);
+assert.doesNotMatch(
+  inputAreaSource,
+  /function canGuideQueuedMessage\(queued: QueuedMessage\): boolean \{[^}]*isSending[^}]*\}/,
+  '前端不得再用瞬时发送状态阻断服务端允许的引导操作',
+);
+assert.match(
+  inputAreaSource,
+  /\.ia-queue-actions\s*\{[\s\S]*?opacity:\s*1;[\s\S]*?pointer-events:\s*auto;/,
+  '排队消息操作区必须始终可点击，不能依赖 hover 才启用',
+);
+assert.doesNotMatch(
+  inputAreaSource,
+  /\.ia-queue-actions\s*\{[^}]*pointer-events:\s*none;/,
+  '排队消息操作区不得默认禁用指针事件',
+);
 assert.doesNotMatch(
   `${zhLocaleSource}\n${enLocaleSource}`,
-  /"input\.followUp\.(mode|queue|guide|guideTitle)"|"input\.queue\.banner"/,
+  /"input\.followUp\.(mode|queue|guide|guideTitle)"|"input\.queue\.(banner|guideInactiveUnavailable)"/,
   '删除输入区模式切换后必须同步清理废弃文案',
 );
 

@@ -11,12 +11,15 @@ const SESSION_ID = 'session-bridge-live-adopt';
 const TURN_ID = 'turn-bridge-live-adopt';
 const USER_ITEM_ID = 'user-bridge-live-adopt';
 const ACCEPTED_AT = 1780390000000;
+const RUNTIME_EPOCH = 'bridge-golden-runtime';
+const EVENT_STREAM_NEXT_SEQUENCE = 10;
 let acceptedPublished = false;
 let terminalPublished = false;
 let summaryMessageCount = 1;
 let summaryUpdatedAt = ACCEPTED_AT;
 let workspaceListPayload = null;
 const capturedTurnBodies = [];
+const capturedGuideQueueBodies = [];
 const bootstrapInterceptors = [];
 const workspaceSessionsInterceptors = [];
 const sessionQueueInterceptors = [];
@@ -32,6 +35,7 @@ let workspaceSessionsPayloadOverride = null;
 let pendingChangesRequestCount = 0;
 let pendingChangesPayloadOverride = null;
 let queuedTurnPayloads = [];
+let interruptRequestCount = 0;
 const goalRefreshQueries = [];
 
 class MemoryStorage {
@@ -190,9 +194,9 @@ function bootstrapPayload() {
     notifications: {
       notifications: [],
     },
-    eventStreamNextSequence: 1,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
     agent: {
-      runtimeEpoch: 'bridge-golden-runtime',
+      runtimeEpoch: RUNTIME_EPOCH,
     },
   };
 }
@@ -230,9 +234,9 @@ function scopedBootstrapPayload(workspaceId, workspacePath, sessionId, title) {
     notifications: {
       notifications: [],
     },
-    eventStreamNextSequence: 1,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
     agent: {
-      runtimeEpoch: `${workspaceId}:${sessionId}`,
+      runtimeEpoch: RUNTIME_EPOCH,
     },
   };
 }
@@ -320,6 +324,8 @@ function installFetchStub() {
         entryId: 'timeline-bridge-partial-scope',
         eventId: 'event-bridge-partial-scope',
         acceptedAt: ACCEPTED_AT + capturedTurnBodies.length,
+        runtimeEpoch: RUNTIME_EPOCH,
+        eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
         createdSession: false,
         route: 'chat',
         userMessageItemId: 'user-bridge-partial-scope',
@@ -347,6 +353,30 @@ function installFetchStub() {
         queuedTurns: queuedTurnPayloads,
       });
     }
+    if (parsed.pathname === '/api/session/queue/guide') {
+      const body = JSON.parse(String(init.body || '{}'));
+      capturedGuideQueueBodies.push(body);
+      queuedTurnPayloads = queuedTurnPayloads.filter((turn) => turn.queueId !== body.queueId);
+      return jsonResponse({
+        sessionId: body.sessionId || SESSION_ID,
+        queuedTurns: queuedTurnPayloads,
+      });
+    }
+    if (parsed.pathname === '/api/session/interrupt') {
+      interruptRequestCount += 1;
+      queuedTurnPayloads = queuedTurnPayloads.slice(1);
+      return jsonResponse({
+        interrupted: true,
+        sessionId: SESSION_ID,
+        workspaceId: WORKSPACE_ID,
+        turnId: TURN_ID,
+        eventId: `event-interrupt-${interruptRequestCount}`,
+        requestedAt: ACCEPTED_AT + 2600,
+        remainingQueuedTurnCount: queuedTurnPayloads.length,
+        nextQueuedTurnStarted: true,
+        removedTimelineEntryIds: [],
+      });
+    }
     if (parsed.pathname === '/api/session/switch') {
       switchSessionRequestCount += 1;
       return jsonResponse({
@@ -359,6 +389,15 @@ function installFetchStub() {
           messageCount: summaryMessageCount,
           workspaceId: WORKSPACE_ID,
         },
+      });
+    }
+    if (parsed.pathname === '/api/workspaces/sessions/viewed') {
+      const body = JSON.parse(String(init.body || '{}'));
+      return jsonResponse({
+        runtimeEpoch: RUNTIME_EPOCH,
+        eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
+        sessionId: body.sessionId || SESSION_ID,
+        hasUnreadCompletion: false,
       });
     }
     if (parsed.pathname === '/api/messages') {
@@ -463,6 +502,8 @@ function installFetchStub() {
             }]
           : [];
         return jsonResponse({
+          runtimeEpoch: RUNTIME_EPOCH,
+          eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
           workspace: {
             workspaceId: requestedWorkspaceId,
             rootPath: requestedWorkspacePath,
@@ -473,6 +514,8 @@ function installFetchStub() {
       }
       const payload = bootstrapPayload();
       return jsonResponse({
+        runtimeEpoch: RUNTIME_EPOCH,
+        eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
         workspace: payload.workspace,
         sessionId: payload.currentSession?.sessionId || '',
         sessions: payload.sessions.map((session) => ({
@@ -1029,6 +1072,8 @@ await withGoldenViteServer(async (server) => {
     entryId: 'timeline-later-round-immediate-feedback',
     eventId: 'event-later-round-immediate-feedback',
     acceptedAt: ACCEPTED_AT + 2250,
+    runtimeEpoch: RUNTIME_EPOCH,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
     createdSession: false,
     route: 'chat',
     userMessageItemId: 'user-later-round-immediate-feedback',
@@ -1162,6 +1207,60 @@ await withGoldenViteServer(async (server) => {
     sessionsBeforeDraft,
     'idempotent workspace-only binding sync must not clear the preserved session list',
   );
+
+  const bootstrapRequestsBeforeDraftFocus = bootstrapRequestCount;
+  const streamsBeforeDraftFocus = FakeEventSource.instances.length;
+  window.dispatchEvent(new Event('focus'));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(
+    bootstrapRequestCount,
+    bootstrapRequestsBeforeDraftFocus,
+    '窗口重新获得焦点时不得用 bootstrap 自动选回旧会话覆盖新会话草稿',
+  );
+  assert.equal(
+    FakeEventSource.instances.length,
+    streamsBeforeDraftFocus,
+    '工作区级事件流正常时，草稿页面重新获得焦点不得重复重连',
+  );
+  assert.equal(messagesStore.messagesState.currentSessionId, null,
+    '窗口重新获得焦点后必须继续停留在未发送的新会话草稿');
+
+  const activeDraftStream = FakeEventSource.instances.at(-1);
+  const workspaceSessionRequestsBeforeDraftRecovery = workspaceSessionsRequestCount;
+  activeDraftStream.onerror?.();
+  window.dispatchEvent(new Event('focus'));
+  await waitForWithin(
+    () => FakeEventSource.instances.length > streamsBeforeDraftFocus,
+    '草稿事件流中断后必须按工作区绑定恢复',
+    350,
+  );
+  const recoveredDraftStream = FakeEventSource.instances.at(-1);
+  recoveredDraftStream.onopen?.();
+  await waitFor(
+    () => workspaceSessionsRequestCount > workspaceSessionRequestsBeforeDraftRecovery,
+    '草稿恢复必须重新同步工作区会话目录',
+  );
+  assert.equal(
+    bootstrapRequestCount,
+    bootstrapRequestsBeforeDraftFocus,
+    '草稿断流恢复不得调用会自动选择旧会话的 session bootstrap',
+  );
+  assert.equal(messagesStore.messagesState.currentSessionId, null,
+    '草稿断流恢复后必须保持无会话绑定');
+  assert.deepEqual(
+    messagesStore.messagesState.draftOrchestratorSessionConfig,
+    {
+      model: 'model-selected-in-draft',
+      reasoningEffort: 'xhigh',
+    },
+    '草稿断流恢复不得覆盖用户在新会话中尚未发送的配置状态',
+  );
+  assert.deepEqual(
+    messagesStore.messagesState.workspaceSessionProjection.sessions.map((session) => session.id),
+    sessionsBeforeDraft,
+    '草稿断流恢复只能刷新目录，不能把页面切回旧会话',
+  );
+
   bridge.postMessage({
     type: 'switchSession',
     sessionId: SESSION_ID,
@@ -1226,33 +1325,58 @@ await withGoldenViteServer(async (server) => {
     true,
     'queued follow-up may show a local pending turn only while the daemon response is unresolved',
   );
-  queuedTurnPayloads = [{
-    queueId: 'queued-session-turn-golden',
-    queuePosition: 1,
-    requestId: 'request-queued-immediate-feedback',
-    sessionId: SESSION_ID,
-    workspaceId: WORKSPACE_ID,
-    workspacePath: WORKSPACE_PATH,
-    acceptedAt: ACCEPTED_AT + 2500,
-    content: '排队消息必须在出队提交时立刻进入主线。',
-    text: '排队消息必须在出队提交时立刻进入主线。',
-    skillName: null,
-    goalMode: true,
-    accessProfile: null,
-    images: [],
-    contextReferences: [{
-      kind: 'file',
-      path: '/tmp/reference-queued.md',
-      pathRef: 'mhp1:u:reference-queued',
-      name: 'reference-queued.md',
-    }],
-    retryCount: 0,
-  }];
+  queuedTurnPayloads = [
+    {
+      queueId: 'queued-session-turn-golden',
+      queuePosition: 1,
+      requestId: 'request-queued-immediate-feedback',
+      sessionId: SESSION_ID,
+      workspaceId: WORKSPACE_ID,
+      workspacePath: WORKSPACE_PATH,
+      acceptedAt: ACCEPTED_AT + 2500,
+      content: '排队消息必须在出队提交时立刻进入主线。',
+      text: '排队消息必须在出队提交时立刻进入主线。',
+      skillName: null,
+      goalMode: true,
+      accessProfile: null,
+      images: [],
+      contextReferences: [{
+        kind: 'file',
+        path: '/tmp/reference-queued.md',
+        pathRef: 'mhp1:u:reference-queued',
+        name: 'reference-queued.md',
+      }],
+      browserAnnotationRefs: [],
+      canGuide: false,
+      retryCount: 0,
+    },
+    {
+      queueId: 'queued-session-turn-guide-golden',
+      queuePosition: 2,
+      requestId: 'request-queued-guide-feedback',
+      sessionId: SESSION_ID,
+      workspaceId: WORKSPACE_ID,
+      workspacePath: WORKSPACE_PATH,
+      acceptedAt: ACCEPTED_AT + 2501,
+      content: '请优先给出结论。',
+      text: '请优先给出结论。',
+      skillName: null,
+      goalMode: false,
+      accessProfile: null,
+      images: [],
+      contextReferences: [],
+      browserAnnotationRefs: [],
+      canGuide: true,
+      retryCount: 0,
+    },
+  ];
   queuedTurnAccepted.resolve(jsonResponse({
     sessionId: SESSION_ID,
     entryId: 'queued-session-turn-golden',
     eventId: 'event-queued-immediate-feedback',
     acceptedAt: ACCEPTED_AT + 2500,
+    runtimeEpoch: RUNTIME_EPOCH,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
     createdSession: false,
     route: 'chat',
     userMessageItemId: 'user-queued-immediate-feedback',
@@ -1272,6 +1396,13 @@ await withGoldenViteServer(async (server) => {
     'accepted queued turn must be rendered from the daemon queue snapshot',
   );
   assert.equal(
+    messagesStore.messagesState.queuedMessages.find((message) => (
+      message.id === 'queued-session-turn-guide-golden'
+    ))?.canGuide,
+    true,
+    'queue normalization must preserve the server-authoritative guidance capability',
+  );
+  assert.equal(
     findArtifactByRequestId(
       messagesStore.messagesState.canonicalTimelineProjection,
       'request-queued-immediate-feedback',
@@ -1281,12 +1412,78 @@ await withGoldenViteServer(async (server) => {
   );
   messagesStore.clearPendingRequest('busy-before-queued-follow-up');
   bridge.postMessage({
+    type: 'guideQueuedMessage',
+    queuedMessageId: 'queued-session-turn-guide-golden',
+  });
+  await waitFor(
+    () => messagesStore.messagesState.queuedMessages.length === 1,
+    'guiding a queued turn must atomically update the daemon queue snapshot',
+  );
+  assert.deepEqual(
+    capturedGuideQueueBodies.at(-1),
+    {
+      workspaceId: WORKSPACE_ID,
+      workspacePath: WORKSPACE_PATH,
+      sessionId: SESSION_ID,
+      queueId: 'queued-session-turn-guide-golden',
+    },
+    'queued guidance must use the dedicated server-authoritative endpoint',
+  );
+  bridge.postMessage({
     type: 'removeQueuedMessage',
     queuedMessageId: 'queued-session-turn-golden',
   });
   await waitFor(
     () => messagesStore.messagesState.queuedMessages.length === 0,
     'removing a queued turn must update the daemon queue and then refresh the UI snapshot',
+  );
+
+  queuedTurnPayloads = [{
+    queueId: 'queued-after-interrupt-golden',
+    queuePosition: 1,
+    requestId: 'request-after-interrupt-golden',
+    sessionId: SESSION_ID,
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    acceptedAt: ACCEPTED_AT + 2600,
+    content: '停止后按队列顺序发送。',
+    text: '停止后按队列顺序发送。',
+    skillName: null,
+    goalMode: false,
+    accessProfile: null,
+    images: [],
+    contextReferences: [],
+    browserAnnotationRefs: [],
+    canGuide: true,
+    retryCount: 0,
+  }];
+  messagesStore.setQueuedMessages(queuedTurnPayloads.map((turn) => ({
+    id: turn.queueId,
+    requestId: turn.requestId,
+    content: turn.content,
+    text: turn.text,
+    sessionId: turn.sessionId,
+    workspaceId: turn.workspaceId,
+    workspacePath: turn.workspacePath,
+    createdAt: turn.acceptedAt,
+    skillName: turn.skillName,
+    goalMode: turn.goalMode,
+    accessProfile: turn.accessProfile,
+    images: turn.images,
+    contextReferences: turn.contextReferences,
+    browserAnnotationRefs: turn.browserAnnotationRefs,
+    canGuide: turn.canGuide,
+  })));
+  messagesStore.setIsProcessing(true);
+  bridge.postMessage({ type: 'interruptTask' });
+  await waitFor(
+    () => interruptRequestCount === 1 && messagesStore.messagesState.queuedMessages.length === 0,
+    '停止当前轮次后必须同步服务端已按 FIFO 启动的队首消息',
+  );
+  assert.equal(
+    messagesStore.messagesState.isProcessing,
+    true,
+    '队首消息已启动时，停止响应不得把新轮次覆盖为空闲态',
   );
 
   const streamCountBeforeLagged = FakeEventSource.instances.length;
@@ -1427,6 +1624,8 @@ await withGoldenViteServer(async (server) => {
   foregroundBootstrap.sessions = [backgroundSession, ...foregroundBootstrap.sessions];
   foregroundBootstrap.state.sessions = foregroundBootstrap.sessions;
   workspaceSessionsPayloadOverride = {
+    runtimeEpoch: RUNTIME_EPOCH,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
     workspace: foregroundBootstrap.workspace,
     sessionId: SESSION_ID,
     sessions: [
@@ -1730,6 +1929,8 @@ await withGoldenViteServer(async (server) => {
     entryId: 'timeline-first-turn-immediate-feedback',
     eventId: 'event-first-turn-immediate-feedback',
     acceptedAt: ACCEPTED_AT + 2600,
+    runtimeEpoch: RUNTIME_EPOCH,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
     createdSession: true,
     route: 'chat',
     userMessageItemId: 'user-first-turn-immediate-feedback',
@@ -1782,6 +1983,8 @@ await withGoldenViteServer(async (server) => {
     entryId: 'timeline-continue-no-refresh',
     eventId: 'event-continue-no-refresh',
     acceptedAt: ACCEPTED_AT + 2700,
+    runtimeEpoch: RUNTIME_EPOCH,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
     createdSession: false,
     route: 'continue',
     rootTaskId: 'task-continue-no-refresh',
@@ -1829,6 +2032,8 @@ await withGoldenViteServer(async (server) => {
     '核心 bootstrap 必须先恢复当前会话',
   );
   slowWorkspaceSessions.resolve(jsonResponse({
+    runtimeEpoch: RUNTIME_EPOCH,
+    eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
     workspace: {
       workspaceId: WORKSPACE_ID,
       rootPath: WORKSPACE_PATH,

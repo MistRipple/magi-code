@@ -1612,13 +1612,9 @@ fn execute_process_read_with_surface(
     if !process_belongs_to_context(process, context) {
         return builtin_error(surface_tool, "进程不属于当前 session/workspace");
     }
-    let running = process
-        .child
-        .try_wait()
-        .ok()
-        .flatten()
-        .map(|_| false)
-        .unwrap_or(true);
+    let exit_status = process.child.try_wait().ok().flatten();
+    let running = exit_status.is_none();
+    let exit_code = exit_status.as_ref().and_then(ExitStatus::code);
     let stdout = tail_utf8(
         &process.stdout.lock().expect("stdout lock poisoned"),
         max_bytes,
@@ -1633,6 +1629,7 @@ fn execute_process_read_with_surface(
         "status": "succeeded",
         "terminal_id": terminal_id,
         "running": running,
+        "exit_code": exit_code,
         "stdout": stdout,
         "stderr": stderr,
         "summary": if running {
@@ -2063,6 +2060,24 @@ fn builtin_filesystem_error(
     path: &Path,
     error: impl Display,
 ) -> String {
+    builtin_filesystem_error_with_code(
+        tool,
+        builtin_error_code(tool, "failed"),
+        public_message,
+        action,
+        path,
+        error,
+    )
+}
+
+fn builtin_filesystem_error_with_code(
+    tool: &str,
+    error_code: impl Into<String>,
+    public_message: &'static str,
+    action: &'static str,
+    path: &Path,
+    error: impl Display,
+) -> String {
     tracing::warn!(
         tool,
         action,
@@ -2070,7 +2085,7 @@ fn builtin_filesystem_error(
         error = %error,
         "builtin filesystem operation failed"
     );
-    builtin_error(tool, public_message)
+    builtin_error_with_code(tool, error_code, public_message)
 }
 
 fn builtin_runtime_error(
@@ -2089,13 +2104,27 @@ fn builtin_runtime_error(
 }
 
 fn builtin_path_resolution_error(tool: &str, requested_path: &str, error: impl Display) -> String {
+    builtin_path_resolution_error_with_code(
+        tool,
+        builtin_error_code(tool, "failed"),
+        requested_path,
+        error,
+    )
+}
+
+fn builtin_path_resolution_error_with_code(
+    tool: &str,
+    error_code: impl Into<String>,
+    requested_path: &str,
+    error: impl Display,
+) -> String {
     tracing::warn!(
         tool,
         requested_path,
         error = %error,
         "builtin path resolution failed"
     );
-    builtin_error(tool, PATH_RESOLUTION_PUBLIC_ERROR)
+    builtin_error_with_code(tool, error_code, PATH_RESOLUTION_PUBLIC_ERROR)
 }
 
 fn builtin_rejected(tool: &str, message: impl Into<String>) -> String {
@@ -2618,25 +2647,126 @@ fn execute_file_write(input: &str, context: &ToolExecutionContext) -> String {
 fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
     let request = match parse_json_object(input) {
         Some(obj) => obj,
-        None => return builtin_error("file_patch", "输入必须为 JSON 对象"),
+        None => {
+            return builtin_error_with_code(
+                "file_patch",
+                "file_patch_invalid_input",
+                "输入必须为 JSON 对象",
+            );
+        }
     };
 
     let path_input = match field_string(&request, &["path"]) {
-        Some(p) => p,
-        None => return builtin_error("file_patch", "缺少 path 字段"),
+        Some(p) if !p.trim().is_empty() => p,
+        None => {
+            return builtin_error_with_code(
+                "file_patch",
+                "file_patch_invalid_input",
+                "缺少 path 字段",
+            );
+        }
+        Some(_) => {
+            return builtin_error_with_code(
+                "file_patch",
+                "file_patch_invalid_input",
+                "path 不能为空",
+            );
+        }
     };
+
+    if request.contains_key("patches")
+        && (request.contains_key("old_string") || request.contains_key("new_string"))
+    {
+        return builtin_error_with_code(
+            "file_patch",
+            "file_patch_invalid_input",
+            "patches 与 old_string/new_string 不能同时提供",
+        );
+    }
+
+    let patches: Vec<(String, String)> = match request.get("patches") {
+        Some(Value::Array(items)) if items.is_empty() => {
+            return builtin_error_with_code(
+                "file_patch",
+                "file_patch_invalid_input",
+                "patches 不能为空",
+            );
+        }
+        Some(Value::Array(items)) => {
+            let mut patches = Vec::with_capacity(items.len());
+            for (index, item) in items.iter().enumerate() {
+                let Some(old) = item.get("old_string").and_then(Value::as_str) else {
+                    return builtin_error_with_code(
+                        "file_patch",
+                        "file_patch_invalid_input",
+                        format!("patches[{index}] 缺少 old_string 字段"),
+                    );
+                };
+                if old.is_empty() {
+                    return builtin_error_with_code(
+                        "file_patch",
+                        "file_patch_invalid_input",
+                        format!("patches[{index}].old_string 不能为空"),
+                    );
+                }
+                let Some(new) = item.get("new_string").and_then(Value::as_str) else {
+                    return builtin_error_with_code(
+                        "file_patch",
+                        "file_patch_invalid_input",
+                        format!("patches[{index}] 缺少 new_string 字段"),
+                    );
+                };
+                patches.push((old.to_string(), new.to_string()));
+            }
+            patches
+        }
+        Some(_) => {
+            return builtin_error_with_code(
+                "file_patch",
+                "file_patch_invalid_input",
+                "patches 必须为数组",
+            );
+        }
+        None => {
+            let (Some(old), Some(new)) = (
+                field_string(&request, &["old_string"]),
+                field_string(&request, &["new_string"]),
+            ) else {
+                return builtin_error_with_code(
+                    "file_patch",
+                    "file_patch_invalid_input",
+                    "缺少 patches 数组或 old_string/new_string 字段",
+                );
+            };
+            if old.is_empty() {
+                return builtin_error_with_code(
+                    "file_patch",
+                    "file_patch_invalid_input",
+                    "old_string 不能为空",
+                );
+            }
+            vec![(old, new)]
+        }
+    };
+
     let path = match resolve_path_with_context(&path_input, context) {
         Ok(p) => p,
         Err(error) => {
-            return builtin_path_resolution_error("file_patch", &path_input, error);
+            return builtin_path_resolution_error_with_code(
+                "file_patch",
+                "file_patch_path_resolution_failed",
+                &path_input,
+                error,
+            );
         }
     };
 
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) => {
-            return builtin_filesystem_error(
+            return builtin_filesystem_error_with_code(
                 "file_patch",
+                "file_patch_read_failed",
                 FILE_READ_PUBLIC_ERROR,
                 "读取待修改文件失败",
                 &path,
@@ -2645,48 +2775,21 @@ fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
         }
     };
 
-    let patches_from_array: Vec<(String, String)> = request
-        .get("patches")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|p| {
-                    let old = p.get("old_string").and_then(Value::as_str)?;
-                    let new = p.get("new_string").and_then(Value::as_str)?;
-                    Some((old.to_string(), new.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let patches: Vec<(String, String)> = if !patches_from_array.is_empty() {
-        patches_from_array
-    } else if let (Some(old), Some(new)) = (
-        field_string(&request, &["old_string"]),
-        field_string(&request, &["new_string"]),
-    ) {
-        vec![(old, new)]
-    } else {
-        return builtin_error(
-            "file_patch",
-            "缺少 patches 数组或 old_string/new_string 字段",
-        );
-    };
-
-    if patches.is_empty() {
-        return builtin_error("file_patch", "patches 为空");
-    }
-
     let mut result = content.clone();
-    let mut applied = 0usize;
+    let mut matched = 0usize;
+    let mut missing_matches = 0usize;
+    let mut ambiguous_matches = 0usize;
     let mut errors: Vec<String> = Vec::new();
 
     for (i, (old, new)) in patches.iter().enumerate() {
         let count = result.matches(old.as_str()).count();
         if count == 0 {
+            missing_matches += 1;
             errors.push(format!("patch[{}]: old_string 未在文件中找到", i));
             continue;
         }
         if count > 1 {
+            ambiguous_matches += 1;
             errors.push(format!(
                 "patch[{}]: old_string 匹配了 {} 处（需要唯一匹配）",
                 i, count
@@ -2694,23 +2797,39 @@ fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
             continue;
         }
         result = result.replacen(old, new, 1);
-        applied += 1;
+        matched += 1;
     }
 
-    if applied == 0 {
+    if !errors.is_empty() {
+        let (error_code, error) = match (missing_matches, ambiguous_matches) {
+            (missing, 0) if matched == 0 && missing == patches.len() => (
+                "file_patch_no_match",
+                "目标内容与当前文件不匹配，请重新读取文件后再修改",
+            ),
+            (0, ambiguous) if matched == 0 && ambiguous == patches.len() => (
+                "file_patch_ambiguous_match",
+                "目标内容在当前文件中不是唯一匹配，请增加上下文后重试",
+            ),
+            _ => (
+                "file_patch_not_applicable",
+                "patch 与当前文件内容不匹配，请重新读取文件并生成精确修改",
+            ),
+        };
         tracing::warn!(
             tool = "file_patch",
             path = %path.display(),
             total = patches.len(),
+            matched,
+            error_code,
             errors = ?errors,
-            "file_patch failed to apply any patch"
+            "file_patch batch is not applicable"
         );
         return serde_json::json!({
             "tool": "file_patch",
             "status": "failed",
             "access_mode": BuiltinToolAccessMode::ExplicitWrite.as_str(),
-            "error_code": builtin_error_code("file_patch", "failed"),
-            "error": "所有 patch 均未能应用",
+            "error_code": error_code,
+            "error": error,
             "applied": 0,
             "total": patches.len(),
             "errors": errors,
@@ -2733,10 +2852,10 @@ fn execute_file_patch(input: &str, context: &ToolExecutionContext) -> String {
         "status": "succeeded",
         "access_mode": BuiltinToolAccessMode::ExplicitWrite.as_str(),
         "path": path.display().to_string(),
-        "applied": applied,
+        "applied": matched,
         "total": patches.len(),
         "errors": errors,
-        "summary": format!("已应用 {}/{} 个 patch 到 {}", applied, patches.len(), path.display())
+        "summary": format!("已应用 {}/{} 个 patch 到 {}", matched, patches.len(), path.display())
     })
     .to_string()
 }

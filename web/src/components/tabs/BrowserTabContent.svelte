@@ -23,6 +23,7 @@
   interface Props {
     browserSessionId: string;
     tabId: string;
+    sessionId: string;
     onTitleChange?: (label: string) => void;
   }
 
@@ -34,7 +35,7 @@
 
   const viewportControllerId = `viewport-${crypto.randomUUID()}`;
 
-  let { browserSessionId, tabId, onTitleChange }: Props = $props();
+  let { browserSessionId, tabId, sessionId, onTitleChange }: Props = $props();
   let snapshot = $state<BrowserSessionSnapshot | null>(null);
   let address = $state('');
   let lastObservedUrl = '';
@@ -59,7 +60,13 @@
     navigationRevision: number;
     width: number;
     height: number;
+    surfaceWidth: number;
+    surfaceHeight: number;
   }
+  type BrowserChannelServerMessage =
+    | ({ type: 'frame' } & FrameMetadata)
+    | { type: 'error'; message: string }
+    | { type: 'clipboard_text'; operation: 'copy' | 'cut'; text: string };
   let pendingFrameMetadata: FrameMetadata | null = null;
   interface PendingFrame {
     bytes: ArrayBuffer;
@@ -89,7 +96,6 @@
   let annotationPreviewFailed = $state(false);
   let customViewportWidth = $state(390);
   let customViewportHeight = $state(844);
-  let customViewportDeviceType = $state<BrowserDeviceType>('mobile');
   let customViewportResizeTimer: number | null = null;
   let customViewportSyncInFlight = false;
   let pendingCustomViewport: {
@@ -303,7 +309,6 @@
     const tab = activeTab;
     if (
       !tab
-      || tab.viewportMode !== 'auto'
       || snapshot?.lifecycle !== 'ready'
       || tab.lifecycle !== 'ready'
     ) return;
@@ -327,7 +332,6 @@
     if (
       !tab
       || tab.lifecycle !== 'ready'
-      || tab.viewportMode !== 'auto'
       || snapshot?.lifecycle !== 'ready'
       || requested.width <= 0
       || requested.height <= 0
@@ -338,6 +342,7 @@
     pendingViewportClaim = false;
     if (
       !claim
+      && tab.viewportMode === 'auto'
       && tab.viewport.width === requested.width
       && tab.viewport.height === requested.height
     ) return;
@@ -407,7 +412,6 @@
     if (width < 320 || width > 7_680 || height < 240 || height > 4_320) return;
     const requested = normalizedViewportSize(width, height);
     const deviceType = deviceTypeForWidth(requested.width);
-    customViewportDeviceType = deviceType;
     pendingCustomViewport = { ...requested, deviceType };
     clearCustomViewportResizeTimer();
     if (immediate) {
@@ -434,16 +438,19 @@
     ) return;
     customViewportSyncInFlight = true;
     try {
+      const surface = normalizedViewportSize(viewportSize.width, viewportSize.height);
       const updated = await setBrowserTabViewport(tab.tabId, {
         action: 'set',
         mode: 'fixed',
         width: requested.width,
         height: requested.height,
+        surfaceWidth: surface.width,
+        surfaceHeight: surface.height,
         deviceType: requested.deviceType,
       });
       applyViewportUpdate(updated);
-      lastRequestedViewportSize = { width: requested.width, height: requested.height };
-      pendingViewportSize = { width: requested.width, height: requested.height };
+      lastRequestedViewportSize = surface;
+      pendingViewportSize = surface;
       annotationDrag = null;
       pendingAnnotation = null;
       pendingAnnotationComment = '';
@@ -474,6 +481,8 @@
         action: 'set',
         mode: 'auto',
         ...requested,
+        surfaceWidth: requested.width,
+        surfaceHeight: requested.height,
         deviceType: deviceTypeForWidth(requested.width),
         controllerId: viewportControllerId,
       });
@@ -511,7 +520,6 @@
     if (tab) {
       customViewportWidth = tab.viewport.width;
       customViewportHeight = tab.viewport.height;
-      customViewportDeviceType = tab.viewport.deviceType;
     }
     viewportMenuOpen = true;
   }
@@ -529,7 +537,6 @@
     if (!tab || viewportMenuOpen) return;
     customViewportWidth = tab.viewport.width;
     customViewportHeight = tab.viewport.height;
-    customViewportDeviceType = tab.viewport.deviceType;
   });
 
   function channelEligible(targetTabId: string): boolean {
@@ -589,32 +596,48 @@
       if (socket !== next || channelGeneration !== generation) return;
       if (typeof event.data === 'string') {
         try {
-          const message = JSON.parse(event.data) as {
-            type?: string;
-            message?: string;
-            frameSequence?: number;
-            navigationRevision?: number;
-            width?: number;
-            height?: number;
-            operation?: 'copy' | 'cut';
-            text?: string;
-          };
+          const message = JSON.parse(event.data) as BrowserChannelServerMessage;
           if (message.type === 'frame') {
+            const frameSequence = Number(message.frameSequence);
+            const navigationRevision = Number(message.navigationRevision);
+            const width = Number(message.width);
+            const height = Number(message.height);
+            const surfaceWidth = Number(message.surfaceWidth);
+            const surfaceHeight = Number(message.surfaceHeight);
+            if (
+              !Number.isSafeInteger(frameSequence) || frameSequence < 1
+              || !Number.isSafeInteger(navigationRevision) || navigationRevision < 0
+              || !Number.isSafeInteger(width) || width < 1
+              || !Number.isSafeInteger(height) || height < 1
+              || !Number.isSafeInteger(surfaceWidth) || surfaceWidth < 1
+              || !Number.isSafeInteger(surfaceHeight) || surfaceHeight < 1
+            ) {
+              throw new Error('invalid browser frame metadata');
+            }
             pendingFrameMetadata = {
-              frameSequence: Number(message.frameSequence) || 0,
-              navigationRevision: Number(message.navigationRevision) || 0,
-              width: Math.max(1, Number(message.width) || 1),
-              height: Math.max(1, Number(message.height) || 1),
+              frameSequence,
+              navigationRevision,
+              width,
+              height,
+              surfaceWidth,
+              surfaceHeight,
             };
           } else if (message.type === 'error') {
             error = message.message?.trim() || i18n.t('browser.error.channelDisconnected');
-          } else if (message.type === 'clipboard_text' && typeof message.text === 'string') {
+          } else if (message.type === 'clipboard_text') {
             void writeBrowserClipboardText(message.text).catch(() => {
               error = i18n.t('browser.error.clipboardWrite');
             });
           }
         } catch {
           pendingFrameMetadata = null;
+          error = i18n.t('browser.error.channelDisconnected');
+          channelConnected = false;
+          channelDisconnected = true;
+          channelGeneration += 1;
+          channelTabId = '';
+          if (socket === next) socket = null;
+          next.close(1002, 'invalid browser channel message');
         }
         return;
       }
@@ -809,15 +832,26 @@
   }
 
   function displayedFrameStyle(): string {
-    if (!renderedFrameMetadata || !viewportSize.width || !viewportSize.height) {
+    const frame = renderedFrameMetadata;
+    if (!frame) {
       return 'width: 0; height: 0;';
     }
-    // frame CSS 尺寸只跟随 ResizeObserver 的容器尺寸，不与 snapshot viewport 耦合。
-    // Chromium viewport 通过 sync 机制独立跟随容器，Host screencast 帧的设备像素
-    // 比例与 CSS viewport 比例可能不同，但 canvas width:100%/height:100% 会自动
-    // 拉伸填满 frame。标注坐标用 framePoint() 基于 getBoundingClientRect 归一化，
-    // 不受 CSS 拉伸影响。这样消除了 snapshot 轮询回退导致的 frame 比例闪烁。
-    return `width: ${viewportSize.width}px; height: ${viewportSize.height}px;`;
+    // 逻辑视口属于 Chromium，面板只决定画面在可视区域中的容纳尺寸。
+    // 只允许等比缩小，避免固定宽屏视口在窄面板中被裁剪，也不对位图做放大。
+    const availableWidth = viewportSize.width > 0 ? viewportSize.width : frame.surfaceWidth;
+    const availableHeight = viewportSize.height > 0 ? viewportSize.height : frame.surfaceHeight;
+    const scale = Math.min(
+      1,
+      availableWidth / frame.surfaceWidth,
+      availableHeight / frame.surfaceHeight,
+    );
+    return `width: ${Math.max(1, Math.round(frame.surfaceWidth * scale))}px; height: ${Math.max(1, Math.round(frame.surfaceHeight * scale))}px;`;
+  }
+
+  function fixedPresetSelected(mode: (typeof VIEWPORT_DEVICE_MODES)[number]): boolean {
+    return activeTab?.viewportMode === 'fixed'
+      && activeTab.viewport.width === mode.width
+      && activeTab.viewport.height === mode.height;
   }
 
   async function focusAnnotationInput(): Promise<void> {
@@ -899,7 +933,7 @@
       annotationId: annotation.annotationId,
       sequence,
       comment: annotation.comment,
-      url: browserAnnotationArtifactUrl(annotation.annotationId),
+      url: browserAnnotationArtifactUrl(annotation.annotationId, sessionId),
     };
     annotationMenuOpen = false;
   }
@@ -1189,7 +1223,7 @@
             {#each VIEWPORT_DEVICE_MODES as mode (mode.id)}
               <button
                 type="button"
-                class:selected={activeTab.viewportMode === 'fixed' && customViewportDeviceType === mode.deviceType}
+                class:selected={fixedPresetSelected(mode)}
                 onclick={() => useFixedViewport(mode.width, mode.height)}
               >
                 {i18n.t(`browser.viewport.mode.${mode.id}`)}

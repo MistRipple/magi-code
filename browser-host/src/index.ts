@@ -214,6 +214,7 @@ function commandQueueKey(command: HostCommand): string | null {
   switch (command.type) {
     case "create_page":
     case "set_viewport":
+    case "set_logical_viewport":
     case "close_page":
     case "activate_page":
     case "navigate":
@@ -284,6 +285,7 @@ function isHostCommand(value: unknown): value is HostCommand {
       "ping",
       "create_page",
       "set_viewport",
+      "set_logical_viewport",
       "close_page",
       "activate_page",
       "navigate",
@@ -365,8 +367,17 @@ export function configFromEnvironment(
   if (!Number.isFinite(deviceScaleFactor) || deviceScaleFactor < 1 || deviceScaleFactor > 4) {
     throw new Error("MAGI_BROWSER_DEVICE_SCALE_FACTOR must be between 1 and 4");
   }
+  const maxActivePages = Number(environment.MAGI_BROWSER_MAX_ACTIVE_PAGES ?? "8");
+  const maxTabs = Number(environment.MAGI_BROWSER_MAX_TABS ?? "64");
+  if (!Number.isSafeInteger(maxActivePages) || maxActivePages < 1 || maxActivePages > 64) {
+    throw new Error("MAGI_BROWSER_MAX_ACTIVE_PAGES must be an integer between 1 and 64");
+  }
+  if (!Number.isSafeInteger(maxTabs) || maxTabs < 1 || maxTabs > 256 || maxActivePages > maxTabs) {
+    throw new Error("MAGI_BROWSER_MAX_TABS must be an integer between 1 and 256");
+  }
+  const profilePath = resolve(required("MAGI_BROWSER_PROFILE_PATH"));
   return {
-    profilePath: resolve(required("MAGI_BROWSER_PROFILE_PATH")),
+    profilePath,
     chromiumExecutable: resolve(required("MAGI_BROWSER_CHROMIUM_EXECUTABLE")),
     runtimeVersion: required("MAGI_BROWSER_RUNTIME_VERSION"),
     hostVersion: environment.MAGI_BROWSER_HOST_VERSION?.trim() || "0.1.0",
@@ -375,6 +386,11 @@ export function configFromEnvironment(
     runtimeEpoch,
     headless: environment.MAGI_BROWSER_HEADLESS !== "0",
     deviceScaleFactor,
+    downloadPath: resolve(
+      environment.MAGI_BROWSER_DOWNLOAD_PATH?.trim() || resolve(profilePath, "Downloads"),
+    ),
+    maxActivePages,
+    maxTabs,
     bindHost: "127.0.0.1",
     port,
     authToken: required("MAGI_BROWSER_HOST_TOKEN"),

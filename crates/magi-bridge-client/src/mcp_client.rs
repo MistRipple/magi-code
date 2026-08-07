@@ -1685,7 +1685,7 @@ done
     fn stdio_mcp_client_times_out_and_invalidates_hung_connection() {
         let script = r#"
 while IFS= read -r line; do
-    sleep 2
+    sleep 5
 done
 "#;
         let config = McpServerConfig::new("sh", vec!["-c".to_string(), script.to_string()])
@@ -1697,7 +1697,10 @@ done
             .list_tools()
             .expect_err("hung MCP server should reach the request deadline");
 
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // 这里验证的是请求没有等到 mock server 的 5 秒响应，而不是把宿主机调度
+        // 抖动误判为协议超时失效。并行测试或高负载 CI 下，进程创建和回收可能超过
+        // 1 秒；2 秒仍与 5 秒的无超时路径保持明确间隔。
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
         match error {
             BridgeClientError::CallFailed { layer, message, .. } => {
                 assert_eq!(layer, BridgeErrorLayer::Transport);

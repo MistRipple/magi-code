@@ -20,18 +20,73 @@ await withGoldenViteServer(async (server) => {
     new URL('../src/components/tabs/BrowserTabContent.svelte', import.meta.url),
     'utf8',
   );
+  const terminalPaneSource = await readFile(
+    new URL('../src/components/tabs/TerminalTabContent.svelte', import.meta.url),
+    'utf8',
+  );
   const markdownLinkSource = await readFile(
     new URL('../src/components/renderers/MdLink.svelte', import.meta.url),
     'utf8',
   );
   assert.doesNotMatch(rightPaneSource, /<iframe\b/, 'HTML preview must not retain the old iframe path');
   assert.match(rightPaneSource, /createBrowserTab\(/);
+  assert.match(
+    rightPaneSource,
+    /createBrowserTab\([\s\S]*?initialBrowserViewport\(\)/,
+    'browser pages with an initial URL must load with the current pane viewport',
+  );
+  assert.match(
+    rightPaneSource,
+    /deviceType: width <= 600 \? 'mobile' : 'desktop'/,
+    'the initial browser request must use the device identity implied by the pane width',
+  );
   assert.match(rightPaneSource, /agentUrl\('\/api\/files\/site-open'/);
   assert.match(rightPaneSource, /openHtmlInMagiBrowser/);
   assert.match(rightPaneSource, /class="right-pane-add-tab"/);
   assert.match(rightPaneSource, /class="right-pane-add-menu"/);
   assert.match(rightPaneSource, /addablePaneKinds/);
+  assert.match(
+    rightPaneSource,
+    /activeTabId[\s\S]*?dataset\.tabId === activeTabId[\s\S]*?strip\.scrollLeft/,
+    'newly activated panes must scroll their tab into the visible strip',
+  );
   assert.match(rightPaneSource, /rightPane\.addPanelBrowser/);
+  assert.match(rightPaneSource, /rightPane\.addPanelTerminal/);
+  assert.match(
+    rightPaneSource,
+    /BROWSER_AUTHORITY_CHANGED_EVENT[\s\S]*?browser\.runtime\.status_changed[\s\S]*?getBrowserCapabilities\(\)/,
+    'browser runtime readiness changes must refresh the right-pane capability snapshot',
+  );
+  assert.match(
+    rightPaneSource,
+    /activeTab\.kind === 'terminal'[\s\S]*?<TerminalTabContent/,
+    'terminal panes must render their own command surface rather than reuse browser content',
+  );
+  assert.doesNotMatch(
+    rightPaneSource,
+    /bodyActiveTab/,
+    'the body must reuse the canonical active-tab projection instead of keeping another cached selection',
+  );
+  assert.match(
+    rightPaneSource,
+    /const activeTab = \$derived\.by<[\s\S]*?rightPaneState\.perSession\[scopeKey\][\s\S]*?activeTabId/,
+    'the active tab must resolve directly from the root pane state so the tab strip and body cannot diverge',
+  );
+  assert.match(
+    terminalPaneSource,
+    /@xterm\/xterm[\s\S]*?FitAddon[\s\S]*?new WebSocket\(terminalChannelUrl/,
+    'terminal panes must use xterm with the daemon PTY websocket channel',
+  );
+  assert.match(
+    terminalPaneSource,
+    /terminal\.onData[\s\S]*?terminal\.onResize/,
+    'terminal panes must forward interactive input and viewport size to the PTY',
+  );
+  assert.doesNotMatch(
+    terminalPaneSource,
+    /runTerminalCommand|readTerminalProcess|commandPlaceholder|<textarea/,
+    'the retired command-card terminal implementation must not remain in the UI',
+  );
   assert.doesNotMatch(
     rightPaneSource,
     /onclick=\{\(\) => void createBrowserPane\(\)\}/,
@@ -89,13 +144,28 @@ await withGoldenViteServer(async (server) => {
   );
   assert.match(
     browserPaneSource,
-    /const scale = Math\.min\(\s*1,/,
-    'a stale browser frame must never be enlarged beyond its native CSS viewport',
+    /const availableWidth = viewportSize\.width > 0 \? viewportSize\.width : frame\.surfaceWidth;[\s\S]*?const scale = Math\.min\([\s\S]*?availableHeight \/ frame\.surfaceHeight,/,
+    'the displayed frame must fit the stable Chromium surface into the panel without cropping',
   );
   assert.match(
     browserPaneSource,
-    /document\.visibilityState === 'visible' && document\.hasFocus\(\)/,
-    'only the foreground Magi window may control a shared BrowserTab viewport',
+    /!Number\.isSafeInteger\(surfaceWidth\) \|\| surfaceWidth < 1[\s\S]*?next\.close\(1002, 'invalid browser channel message'\)/,
+    'missing Chromium surface metadata must terminate the channel instead of falling back to a fake frame size',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /Math\.max\(1, Number\(message\.(?:width|height|surfaceWidth|surfaceHeight)\) \|\| 1\)/,
+    'frame metadata must not retain the retired 1x1 compatibility fallback',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /transform:\s*scale\([^)]*viewport|object-fit:\s*(fill|cover)/,
+    'the frontend must not use a non-uniform transform or crop the browser surface',
+  );
+  assert.match(
+    browserPaneSource,
+    /return document\.visibilityState === 'visible';/,
+    'the mounted visible browser pane must be able to establish viewport ownership before focus enters it',
   );
   assert.match(
     browserPaneSource,
@@ -134,8 +204,13 @@ await withGoldenViteServer(async (server) => {
   );
   assert.match(
     browserPaneSource,
-    /function deviceTypeForWidth\(width: number\)[\s\S]*?width <= 600 \? 'mobile' : 'desktop'[\s\S]*?customViewportDeviceType = deviceType/,
+    /function deviceTypeForWidth\(width: number\)[\s\S]*?width <= 600 \? 'mobile' : 'desktop'[\s\S]*?pendingCustomViewport = \{ \.\.\.requested, deviceType \}/,
     'custom viewport width must determine the canonical wide or narrow device mode',
+  );
+  assert.match(
+    browserPaneSource,
+    /action: 'set',[\s\S]*?surfaceWidth: surface\.width,[\s\S]*?surfaceHeight: surface\.height/,
+    'fixed viewport updates must send the panel surface to Chromium with the logical viewport',
   );
   assert.doesNotMatch(
     browserPaneSource,
@@ -190,6 +265,40 @@ await withGoldenViteServer(async (server) => {
     'each BrowserTabId must map to one top-level right-pane tab without LRU eviction',
   );
   assert.equal(browserPane.activeTabId, 'browser:browser-session:browser-tab-7');
+
+  rightPane.activateRightPaneSession('workspace-terminal', 'session-terminal');
+  const firstTerminalId = rightPane.openTerminalTab({
+    workspaceId: 'workspace-terminal',
+    workspacePath: '/tmp/workspace-terminal',
+    sessionId: 'session-terminal',
+  });
+  const secondTerminalId = rightPane.openTerminalTab({
+    workspaceId: 'workspace-terminal',
+    workspacePath: '/tmp/workspace-terminal',
+    sessionId: 'session-terminal',
+  });
+  assert.ok(firstTerminalId && secondTerminalId && firstTerminalId !== secondTerminalId);
+  const terminalScope = rightPane.rightPaneState.activeScopeKey;
+  const terminalPane = rightPane.getRightPaneState(terminalScope);
+  assert.deepEqual(
+    terminalPane.openTabs.map((tab) => tab.id),
+    [`terminal:${firstTerminalId}`, `terminal:${secondTerminalId}`],
+    'each user-created terminal must keep an independent top-level PTY pane',
+  );
+  assert.equal(terminalPane.activeTabId, `terminal:${secondTerminalId}`);
+  assert.deepEqual(
+    terminalPane.openTabs.map((tab) => tab.label),
+    ['Terminal', 'Terminal'],
+    'terminal tabs must use a stable product label instead of the workspace name',
+  );
+  rightPane.setActiveRightPaneTab(terminalScope, `terminal:${firstTerminalId}`);
+  assert.equal(terminalPane.activeTabId, `terminal:${firstTerminalId}`);
+  rightPane.closeTab(terminalScope, `terminal:${firstTerminalId}`);
+  assert.deepEqual(
+    terminalPane.openTabs.map((tab) => tab.id),
+    [`terminal:${secondTerminalId}`],
+    'closing one terminal must not affect another terminal tab',
+  );
 
   rightPane.activateRightPaneSession('workspace-browser-sync', 'session-browser-sync');
   rightPane.openCodeTab('session-browser-sync', 'index.html', {
@@ -419,6 +528,11 @@ await withGoldenViteServer(async (server) => {
   const collapsePane = rightPane.getRightPaneState(collapseScope);
   const collapseTabId = collapsePane.activeTabId;
   rightPane.setRightPaneCollapsed(collapseScope, true);
+  assert.equal(
+    rightPane.getRightPaneState(collapseScope),
+    collapsePane,
+    'right-pane session state must keep a stable reactive reference for shell visibility consumers',
+  );
   assert.equal(collapsePane.collapsed, true, 'explicit collapse must close the surface');
   assert.equal(collapsePane.openTabs.length, 1, 'explicit collapse must preserve open tabs');
   rightPane.setRightPaneCollapsed(collapseScope, false);

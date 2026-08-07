@@ -4,6 +4,8 @@
   import Toggle from './Toggle.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
+    AgentApiError,
+    BROWSER_AUTHORITY_CHANGED_EVENT,
     getBrowserCapabilities,
     runBrowserRuntimeAction,
     updateBrowserSettings,
@@ -13,8 +15,22 @@
   let snapshot = $state<BrowserCapabilitiesSnapshot | null>(null);
   let loading = $state(false);
   let loadError = $state('');
+  let actionNotice = $state('');
   let savingSetting = $state<'inAppBrowserEnabled' | 'browserUseEnabled' | ''>('');
   let runtimeAction = $state<'check-updates' | 'install' | 'uninstall' | ''>('');
+  let actionNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+  let runtimeStatusPollGeneration = 0;
+  let disposed = false;
+
+  function runtimeActionErrorMessage(error: unknown): string {
+    if (error instanceof AgentApiError && error.message.trim()) {
+      return error.message.trim();
+    }
+    if (error instanceof Error && error.message.trim()) {
+      return error.message.trim();
+    }
+    return i18n.t('settings.browser.actionFailed');
+  }
 
   const runtimeInstalled = $derived(snapshot?.runtimeStatus === 'installed'
     || snapshot?.runtimeStatus === 'update_available'
@@ -29,18 +45,80 @@
     : i18n.t('settings.browser.install'));
   const managementAvailable = $derived(Boolean(snapshot?.componentManagementAvailable));
 
-  async function refresh(): Promise<void> {
+  function clearActionNotice(): void {
+    if (actionNoticeTimer !== null) {
+      clearTimeout(actionNoticeTimer);
+      actionNoticeTimer = null;
+    }
+    actionNotice = '';
+  }
+
+  function showActionNotice(message: string): void {
+    clearActionNotice();
+    actionNotice = message;
+    actionNoticeTimer = setTimeout(() => {
+      actionNotice = '';
+      actionNoticeTimer = null;
+    }, 2500);
+  }
+
+  function applySnapshot(next: BrowserCapabilitiesSnapshot): void {
+    if (!snapshot || next.revision >= snapshot.revision) {
+      snapshot = next;
+    }
+  }
+
+  async function fetchSnapshot(): Promise<BrowserCapabilitiesSnapshot> {
+    const next = await getBrowserCapabilities();
+    applySnapshot(next);
+    return next;
+  }
+
+  async function refresh(showNotice = false): Promise<void> {
     if (loading) return;
     loading = true;
     loadError = '';
+    clearActionNotice();
     try {
-      snapshot = await getBrowserCapabilities();
+      await fetchSnapshot();
+      if (showNotice) {
+        showActionNotice(i18n.t('settings.browser.refreshSucceeded'));
+      }
     } catch (error) {
       console.warn('[SettingsBrowserTab] 获取浏览器运行组件状态失败:', error);
       loadError = i18n.t('settings.browser.loadFailed');
     } finally {
       loading = false;
     }
+  }
+
+  async function pollRuntimeStatus(generation: number): Promise<void> {
+    while (!disposed && generation === runtimeStatusPollGeneration && runtimeAction) {
+      try {
+        await fetchSnapshot();
+      } catch (error) {
+        console.warn('[SettingsBrowserTab] 轮询浏览器运行组件状态失败:', error);
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 350));
+    }
+  }
+
+  function runtimeActionSuccessMessage(
+    action: 'check-updates' | 'install' | 'uninstall',
+    next: BrowserCapabilitiesSnapshot,
+  ): string {
+    if (action === 'install') {
+      return i18n.t('settings.browser.installSucceeded');
+    }
+    if (action === 'uninstall') {
+      return i18n.t('settings.browser.uninstallSucceeded');
+    }
+    if (next.availableRuntimeVersion) {
+      return i18n.t('settings.browser.updateAvailable', {
+        version: next.availableRuntimeVersion,
+      });
+    }
+    return i18n.t('settings.browser.upToDate');
   }
 
   async function saveCapabilitySetting(
@@ -72,16 +150,30 @@
 
   async function runRuntimeAction(action: 'check-updates' | 'install' | 'uninstall'): Promise<void> {
     if (runtimeAction || !managementAvailable) return;
+    const generation = ++runtimeStatusPollGeneration;
     runtimeAction = action;
     loadError = '';
+    clearActionNotice();
+    const operation = runBrowserRuntimeAction(action);
+    const statusPolling = pollRuntimeStatus(generation);
     try {
-      snapshot = await runBrowserRuntimeAction(action);
+      const next = await operation;
+      applySnapshot(next);
+      window.dispatchEvent(new CustomEvent('magi:browserCapabilitiesChanged', {
+        detail: next,
+      }));
+      showActionNotice(runtimeActionSuccessMessage(action, next));
     } catch (error) {
       console.warn(`[SettingsBrowserTab] 浏览器运行组件操作失败: ${action}`, error);
-      loadError = i18n.t('settings.browser.actionFailed');
+      const actionError = runtimeActionErrorMessage(error);
       await refresh();
+      loadError = actionError;
     } finally {
-      runtimeAction = '';
+      if (generation === runtimeStatusPollGeneration) {
+        runtimeAction = '';
+        runtimeStatusPollGeneration += 1;
+      }
+      await statusPolling;
     }
   }
 
@@ -101,7 +193,20 @@
   }
 
   onMount(() => {
+    disposed = false;
     void refresh();
+    const handleRuntimeStatusChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{ eventType?: string }>).detail;
+      if (detail?.eventType !== 'browser.runtime.status_changed') return;
+      void refresh();
+    };
+    window.addEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, handleRuntimeStatusChanged);
+    return () => {
+      disposed = true;
+      runtimeStatusPollGeneration += 1;
+      window.removeEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, handleRuntimeStatusChanged);
+      clearActionNotice();
+    };
   });
 </script>
 
@@ -149,7 +254,13 @@
           <h3 id="browser-runtime-title">{i18n.t('settings.browser.runtimeTitle')}</h3>
           <p>{i18n.t('settings.browser.runtimeDescription')}</p>
         </div>
-        <span class:runtime-status--ready={snapshot?.hostStatus === 'ready'} class="runtime-status">
+        <span
+          class:runtime-status--ready={snapshot?.hostStatus === 'ready'}
+          class:runtime-status--busy={snapshot?.runtimeStatus === 'downloading'
+            || snapshot?.runtimeStatus === 'verifying'
+            || snapshot?.hostStatus === 'starting'}
+          class="runtime-status"
+        >
           <span aria-hidden="true"></span>{statusText()}
         </span>
       </div>
@@ -164,15 +275,20 @@
         <div><dt>{i18n.t('settings.browser.hostVersion')}</dt><dd>{snapshot?.hostVersion ?? '-'}</dd></div>
       </dl>
 
-      {#if snapshot?.lastErrorCode}
+      {#if loadError}
+        <div class="runtime-error" role="status">
+          <Icon name="alert-circle" size={14} />
+          <span>{loadError}</span>
+        </div>
+      {:else if snapshot?.lastErrorCode}
         <div class="runtime-error" role="status">
           <Icon name="alert-circle" size={14} />
           <code>{snapshot.lastErrorCode}</code>
         </div>
-      {:else if loadError}
-        <div class="runtime-error" role="status">
-          <Icon name="alert-circle" size={14} />
-          <span>{loadError}</span>
+      {:else if actionNotice}
+        <div class="runtime-feedback" role="status" aria-live="polite">
+          <Icon name="check-circle" size={14} />
+          <span>{actionNotice}</span>
         </div>
       {/if}
     </section>
@@ -188,7 +304,8 @@
         <button
           type="button"
           class="icon-action"
-          onclick={() => void refresh()}
+          class:icon-action--loading={loading}
+          onclick={() => void refresh(true)}
           disabled={loading}
           title={i18n.t('settings.browser.refreshStatus')}
           aria-label={i18n.t('settings.browser.refreshStatus')}
@@ -202,7 +319,7 @@
             type="button"
             onclick={() => void runRuntimeAction('install')}
             disabled={!managementAvailable || !runtimeInstallActionAvailable || Boolean(runtimeAction)}
-          >{runtimeAction === 'install' ? i18n.t('settings.browser.working') : runtimeInstallActionLabel}</button>
+          >{runtimeAction === 'install' ? i18n.t('settings.browser.installing') : runtimeInstallActionLabel}</button>
         </div>
         <div class="action-row">
           <div><strong>{i18n.t('settings.browser.checkUpdates')}</strong><span>{i18n.t('settings.browser.checkUpdatesDescription')}</span></div>
@@ -210,7 +327,7 @@
             type="button"
             onclick={() => void runRuntimeAction('check-updates')}
             disabled={!managementAvailable || Boolean(runtimeAction)}
-          >{runtimeAction === 'check-updates' ? i18n.t('settings.browser.working') : i18n.t('settings.browser.checkUpdates')}</button>
+          >{runtimeAction === 'check-updates' ? i18n.t('settings.browser.checkingUpdates') : i18n.t('settings.browser.checkUpdates')}</button>
         </div>
         <div class="action-row">
           <div><strong>{i18n.t('settings.browser.uninstall')}</strong><span>{i18n.t('settings.browser.uninstallDescription')}</span></div>
@@ -219,7 +336,7 @@
             type="button"
             onclick={() => void runRuntimeAction('uninstall')}
             disabled={!managementAvailable || !runtimeInstalled || Boolean(runtimeAction)}
-          >{runtimeAction === 'uninstall' ? i18n.t('settings.browser.working') : i18n.t('settings.browser.uninstall')}</button>
+          >{runtimeAction === 'uninstall' ? i18n.t('settings.browser.uninstalling') : i18n.t('settings.browser.uninstall')}</button>
         </div>
       </div>
 
@@ -345,6 +462,14 @@
   }
 
   .runtime-status--ready > span { background: var(--success, #2f9e63); }
+  .runtime-status--busy > span {
+    background: var(--ind-tab-accent);
+    animation: browser-runtime-status-pulse 1.1s ease-in-out infinite;
+  }
+
+  @keyframes browser-runtime-status-pulse {
+    50% { opacity: 0.35; }
+  }
 
   .runtime-details {
     margin: 24px 0 0;
@@ -368,13 +493,24 @@
     text-align: right;
   }
 
-  .runtime-error {
+  .runtime-error,
+  .runtime-feedback {
     display: flex;
     align-items: center;
     gap: 8px;
     margin-top: 14px;
-    color: var(--danger, #c53f4f);
     font-size: 12px;
+  }
+
+  .runtime-error { color: var(--danger, #c53f4f); }
+  .runtime-feedback { color: var(--success, #2f9e63); }
+
+  .icon-action--loading :global(svg) {
+    animation: browser-runtime-refresh-spin 0.9s linear infinite;
+  }
+
+  @keyframes browser-runtime-refresh-spin {
+    to { transform: rotate(360deg); }
   }
 
   .section-heading { margin-bottom: 12px; }

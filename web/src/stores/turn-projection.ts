@@ -341,13 +341,14 @@ function normalizeMessageBrowserAnnotationRefsFromMetadata(
         : null;
       const comment = typeof reference.comment === 'string' ? reference.comment.trim() : '';
       if (!annotationId || !browserSessionId || !tabId || !kind || !comment) return null;
+      const sequence = Number.isSafeInteger(reference.sequence) && Number(reference.sequence) > 0
+        ? Number(reference.sequence)
+        : undefined;
       return {
         annotationId,
         browserSessionId,
         tabId,
-        sequence: Number.isSafeInteger(reference.sequence) && Number(reference.sequence) > 0
-          ? Number(reference.sequence)
-          : undefined,
+        ...(sequence ? { sequence } : {}),
         kind,
         comment,
         screenshotArtifactId: typeof reference.screenshotArtifactId === 'string'
