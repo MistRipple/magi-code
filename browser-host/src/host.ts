@@ -1221,12 +1221,25 @@ export class BrowserHost {
   private async installNavigationGuard(): Promise<void> {
     await this.context().route("**/*", async (route) => {
       const request = route.request();
-      const page = request.frame().page();
+      let frame: ReturnType<typeof request.frame>;
+      try {
+        // Chromium may emit the initial navigation before its main frame exists.
+        // Request.frame() is intentionally unavailable in that window.
+        frame = request.frame();
+      } catch {
+        if (isBlockedNavigationUrl(request.url())) {
+          await route.abort("blockedbyclient");
+        } else {
+          await route.continue();
+        }
+        return;
+      }
+      const page = frame.page();
       const record = [...this.#pages.values()].find((candidate) => candidate.page === page);
       if (
         !record
         || !request.isNavigationRequest()
-        || request.frame() !== page.mainFrame()
+        || frame !== page.mainFrame()
       ) {
         await route.continue();
         return;
