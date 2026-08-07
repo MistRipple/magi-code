@@ -124,16 +124,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     if let Some(verify_root) = args.get("verify-install-root") {
-        verify_installed_archive(
-            Path::new(verify_root),
-            &archive_path,
-            &release,
-            &signing_key,
-            &os,
-            &arch,
+        verify_installed_archive(VerifyInstalledArchive {
+            root: Path::new(verify_root),
+            archive_path: &archive_path,
+            release: &release,
+            signing_key: &signing_key,
+            os: &os,
+            arch: &arch,
             channel,
-            &minimum_magi_version,
-        )?;
+            magi_version: &minimum_magi_version,
+        })?;
     }
     println!(
         "{}",
@@ -147,16 +147,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn verify_installed_archive(
-    root: &Path,
-    archive_path: &Path,
-    release: &SignedBrowserRuntimeRelease,
-    signing_key: &SigningKey,
-    os: &str,
-    arch: &str,
+struct VerifyInstalledArchive<'a> {
+    root: &'a Path,
+    archive_path: &'a Path,
+    release: &'a SignedBrowserRuntimeRelease,
+    signing_key: &'a SigningKey,
+    os: &'a str,
+    arch: &'a str,
     channel: BrowserRuntimeReleaseChannel,
-    magi_version: &Version,
+    magi_version: &'a Version,
+}
+
+fn verify_installed_archive(
+    config: VerifyInstalledArchive<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let VerifyInstalledArchive {
+        root,
+        archive_path,
+        release,
+        signing_key,
+        os,
+        arch,
+        channel,
+        magi_version,
+    } = config;
     let _ = fs::remove_dir_all(root);
     let manager = BrowserRuntimeManager::new(BrowserRuntimeManagerConfig::production_defaults(
         root.to_path_buf(),
@@ -192,7 +206,7 @@ fn verify_installed_archive(
     )?;
     manager
         .inspect_active_release(UtcMillis::now())?
-        .ok_or_else(|| "runtime archive self-test did not activate an installed release")?;
+        .ok_or("runtime archive self-test did not activate an installed release")?;
     Ok(())
 }
 

@@ -257,57 +257,57 @@ pub fn model_visible_tool_result(result: &str, status: ExecutionResultStatus) ->
         Value::from(original_bytes as u64),
     );
 
-    if let Ok(parsed) = serde_json::from_str::<Value>(result) {
-        if let Some(object) = parsed.as_object() {
-            for key in [
-                "tool",
-                "status",
-                "error_code",
-                "summary",
-                "message",
-                "path",
-                "content_hash",
-                "exit_code",
-                "file_size_bytes",
-                "bytes_read",
-                "truncated",
-                "original_token_count",
-                "omitted_bytes",
-            ] {
-                if let Some(value) = object.get(key) {
-                    let bounded = value
-                        .as_str()
-                        .map(|text| {
-                            Value::String(truncate_utf8_middle(
-                                text,
-                                MODEL_VISIBLE_TOOL_RESULT_FIELD_MAX_BYTES,
-                            ))
-                        })
-                        .unwrap_or_else(|| value.clone());
-                    envelope.insert(key.to_string(), bounded);
-                }
+    if let Ok(parsed) = serde_json::from_str::<Value>(result)
+        && let Some(object) = parsed.as_object()
+    {
+        for key in [
+            "tool",
+            "status",
+            "error_code",
+            "summary",
+            "message",
+            "path",
+            "content_hash",
+            "exit_code",
+            "file_size_bytes",
+            "bytes_read",
+            "truncated",
+            "original_token_count",
+            "omitted_bytes",
+        ] {
+            if let Some(value) = object.get(key) {
+                let bounded = value
+                    .as_str()
+                    .map(|text| {
+                        Value::String(truncate_utf8_middle(
+                            text,
+                            MODEL_VISIBLE_TOOL_RESULT_FIELD_MAX_BYTES,
+                        ))
+                    })
+                    .unwrap_or_else(|| value.clone());
+                envelope.insert(key.to_string(), bounded);
             }
-            if let Some(error) = object.get("error").and_then(Value::as_str) {
-                envelope.insert(
-                    "error".to_string(),
-                    Value::String(truncate_utf8_middle(
-                        error,
-                        MODEL_VISIBLE_TOOL_RESULT_FIELD_MAX_BYTES,
-                    )),
-                );
-            }
-            let preview = ["content", "stdout", "stderr", "output"]
-                .into_iter()
-                .find_map(|key| object.get(key).and_then(Value::as_str))
-                .unwrap_or(result);
+        }
+        if let Some(error) = object.get("error").and_then(Value::as_str) {
             envelope.insert(
-                "preview".to_string(),
+                "error".to_string(),
                 Value::String(truncate_utf8_middle(
-                    preview,
-                    MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES / 2,
+                    error,
+                    MODEL_VISIBLE_TOOL_RESULT_FIELD_MAX_BYTES,
                 )),
             );
         }
+        let preview = ["content", "stdout", "stderr", "output"]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(Value::as_str))
+            .unwrap_or(result);
+        envelope.insert(
+            "preview".to_string(),
+            Value::String(truncate_utf8_middle(
+                preview,
+                MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES / 2,
+            )),
+        );
     }
 
     if !envelope.contains_key("preview") {

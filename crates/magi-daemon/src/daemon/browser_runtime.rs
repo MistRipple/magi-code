@@ -1837,7 +1837,7 @@ mod tests {
 
     #[test]
     fn browser_host_self_test_epoch_is_safe_for_javascript() {
-        assert!(runtime_self_test_epoch() <= (1 << 53) - 1);
+        assert!(runtime_self_test_epoch() < (1 << 53));
     }
 
     #[test]
