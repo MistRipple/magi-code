@@ -39,6 +39,7 @@ const STALE_PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const HOST_MAX_ATTEMPTS: usize = 2;
 const RUNTIME_CONTROL_QUEUE_CAPACITY: usize = 8;
 const RELEASE_FEED_MAX_BYTES: u64 = 1024 * 1024;
+const MAX_RUNTIME_REDIRECTS: usize = 5;
 const MAX_SAFE_RUNTIME_EPOCH: u64 = (1 << 53) - 1;
 const TRANSIENT_BROWSER_CACHE_PATHS: &[&str] = &[
     "Default/Cache",
@@ -689,7 +690,7 @@ async fn fetch_release_feed(url: &str) -> Result<BrowserRuntimeReleaseFeed, Stri
     tokio::task::spawn_blocking(move || {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(runtime_redirect_policy())
             .build()
             .map_err(|error| format!("创建浏览器发布源客户端失败: {error}"))?;
         let mut response = client
@@ -698,6 +699,7 @@ async fn fetch_release_feed(url: &str) -> Result<BrowserRuntimeReleaseFeed, Stri
             .map_err(|error| format!("读取浏览器发布源失败: {error}"))?
             .error_for_status()
             .map_err(|error| format!("浏览器发布源返回失败: {error}"))?;
+        validate_runtime_response_url(&response)?;
         if response
             .content_length()
             .is_some_and(|length| length > RELEASE_FEED_MAX_BYTES)
@@ -740,7 +742,7 @@ async fn download_release_archive(
         let result = (|| {
             let client = reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(30 * 60))
-                .redirect(reqwest::redirect::Policy::none())
+                .redirect(runtime_redirect_policy())
                 .build()
                 .map_err(|error| format!("创建浏览器下载客户端失败: {error}"))?;
             let mut response = client
@@ -749,6 +751,7 @@ async fn download_release_archive(
                 .map_err(|error| format!("下载浏览器运行组件失败: {error}"))?
                 .error_for_status()
                 .map_err(|error| format!("浏览器运行组件下载源返回失败: {error}"))?;
+            validate_runtime_response_url(&response)?;
             if response
                 .content_length()
                 .is_some_and(|length| length != expected_size)
@@ -777,6 +780,32 @@ async fn download_release_archive(
     })
     .await
     .map_err(|error| format!("浏览器下载任务异常退出: {error}"))?
+}
+
+fn runtime_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let url = attempt.url();
+        let secure = url.scheme() == "https";
+        #[cfg(debug_assertions)]
+        let local_development = url.scheme() == "http"
+            && url
+                .host_str()
+                .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1"));
+        #[cfg(not(debug_assertions))]
+        let local_development = false;
+
+        if attempt.previous().len() >= MAX_RUNTIME_REDIRECTS {
+            attempt.stop()
+        } else if secure || local_development {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+fn validate_runtime_response_url(response: &reqwest::blocking::Response) -> Result<(), String> {
+    validate_runtime_download_url(response.url().as_str()).map(|_| ())
 }
 
 fn validate_runtime_download_url(value: &str) -> Result<reqwest::Url, String> {
@@ -1814,9 +1843,22 @@ fn random_auth_token() -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, ffi::OsString, path::PathBuf, sync::Arc};
+    use std::{
+        collections::HashMap,
+        ffi::OsString,
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        path::PathBuf,
+        sync::Arc,
+        thread::JoinHandle,
+    };
 
     use magi_api::ApiState;
+    use magi_browser_runtime::{
+        BrowserHostProtocolRange, BrowserHostProtocolVersion, BrowserRuntimeManifest,
+        BrowserRuntimeReleaseChannel, BrowserRuntimeTarget, BrowserRuntimeUpdateLevel,
+        SignedBrowserRuntimeRelease,
+    };
     use magi_core::{
         AccessProfile, BrowserLeaseId, BrowserProfileId, BrowserSessionId, BrowserTabId,
         ExecutionOwnership, MissionId, PlanId, PlanItem, PlanItemId, PlanItemStatus, PlanState,
@@ -1829,11 +1871,147 @@ mod tests {
         SessionPlan, SessionStore,
     };
     use magi_workspace::WorkspaceStore;
+    use semver::Version;
 
     use super::{
         BrowserProcessMatchSpec, begin_runtime_recovery, browser_process_matches,
-        clear_transient_browser_cache, runtime_self_test_epoch,
+        clear_transient_browser_cache, download_release_archive, fetch_release_feed,
+        runtime_self_test_epoch,
     };
+
+    struct RedirectServer {
+        url: String,
+        thread: JoinHandle<()>,
+    }
+
+    fn redirect_server(body: Vec<u8>, content_type: &str) -> RedirectServer {
+        let content_type = content_type.to_string();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("redirect server should bind");
+        let address = listener
+            .local_addr()
+            .expect("redirect server should expose an address");
+        let thread = std::thread::spawn(move || {
+            let (mut redirect, _) = listener
+                .accept()
+                .expect("redirect server should accept the first request");
+            consume_request(&mut redirect);
+            write_response(
+                &mut redirect,
+                "HTTP/1.1 302 Found\r\nLocation: /final\r\nConnection: close\r\n\r\n",
+            );
+            drop(redirect);
+
+            let (mut final_response, _) = listener
+                .accept()
+                .expect("redirect server should accept the redirected request");
+            consume_request(&mut final_response);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            write_response(&mut final_response, &header);
+            final_response
+                .write_all(&body)
+                .expect("redirect server should write the response body");
+        });
+        RedirectServer {
+            url: format!("http://{address}/start"),
+            thread,
+        }
+    }
+
+    fn consume_request(stream: &mut TcpStream) {
+        let mut buffer = [0u8; 1024];
+        let _ = stream.read(&mut buffer);
+    }
+
+    fn write_response(stream: &mut TcpStream, response: &str) {
+        stream
+            .write_all(response.as_bytes())
+            .expect("redirect server should write response headers");
+        stream
+            .flush()
+            .expect("redirect server should flush response");
+    }
+
+    fn release_feed_json(archive_url: &str, archive_size_bytes: u64) -> Vec<u8> {
+        let version = Version::new(1, 0, 0);
+        let manifest = BrowserRuntimeManifest {
+            format_version: 1,
+            runtime_version: version.clone(),
+            host_version: version.clone(),
+            host_protocol: BrowserHostProtocolRange {
+                minimum: BrowserHostProtocolVersion::CURRENT,
+                maximum: BrowserHostProtocolVersion::CURRENT,
+            },
+            node_version: version.clone(),
+            playwright_version: version.clone(),
+            chromium_version: "test-chromium".to_string(),
+            target: BrowserRuntimeTarget {
+                os: "test".to_string(),
+                arch: "test".to_string(),
+            },
+            channel: BrowserRuntimeReleaseChannel::Stable,
+            manifest_sequence: 1,
+            released_at: UtcMillis(1),
+            expires_at: UtcMillis(u64::MAX),
+            minimum_magi_version: version.clone(),
+            minimum_safe_runtime_version: version,
+            unpacked_size_bytes: 0,
+            node_executable_path: "node".to_string(),
+            host_entry_path: "host".to_string(),
+            chromium_executable_path: "chromium".to_string(),
+            files: Vec::new(),
+        };
+        serde_json::to_vec(&serde_json::json!({
+            "release": SignedBrowserRuntimeRelease {
+                manifest,
+                update_level: BrowserRuntimeUpdateLevel::Recommended,
+                archive_sha256: "test".to_string(),
+                archive_size_bytes,
+                signature: "test".to_string(),
+            },
+            "archiveUrl": archive_url,
+        }))
+        .expect("test release feed should serialize")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn browser_runtime_downloads_follow_github_style_redirects() {
+        let archive = b"runtime archive".to_vec();
+        let archive_server = redirect_server(archive.clone(), "application/octet-stream");
+        let feed_server = redirect_server(
+            release_feed_json(&archive_server.url, archive.len() as u64),
+            "application/json",
+        );
+
+        let feed = fetch_release_feed(&feed_server.url)
+            .await
+            .expect("redirected release feed should parse");
+        assert_eq!(feed.archive_url, archive_server.url);
+
+        let root = tempfile::tempdir().expect("runtime download root should create");
+        let archive_path = download_release_archive(
+            &feed.archive_url,
+            root.path().to_path_buf(),
+            archive.len() as u64,
+        )
+        .await
+        .expect("redirected runtime archive should download");
+        assert_eq!(
+            std::fs::read(&archive_path).expect("archive should be readable"),
+            archive
+        );
+
+        feed_server
+            .thread
+            .join()
+            .expect("feed redirect server should finish");
+        archive_server
+            .thread
+            .join()
+            .expect("archive redirect server should finish");
+    }
 
     #[test]
     fn browser_host_self_test_epoch_is_safe_for_javascript() {
