@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { chmod, copyFile, cp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -67,14 +66,15 @@ await writeFile(
   'utf8',
 );
 
-const stagedChromiumExecutable = path.join(stagedChromiumRoot, chromiumExecutableRelative);
 const chromiumRelative = toManifestPath(path.join('chromium', chromiumExecutableRelative));
-const chromiumVersionOutput = execFileSync(stagedChromiumExecutable, ['--version'], {
-  encoding: 'utf8',
-}).trim();
-const chromiumVersion = chromiumVersionOutput.match(/\d+(?:\.\d+){3}/)?.[0];
+const browsersManifest = JSON.parse(
+  await readFile(path.join(stagedPlaywright, 'browsers.json'), 'utf8'),
+);
+const chromiumVersion = browsersManifest.browsers
+  ?.find((browser) => browser.name === 'chromium')
+  ?.browserVersion;
 if (!chromiumVersion) {
-  throw new Error(`无法识别 Chromium 版本：${chromiumVersionOutput}`);
+  throw new Error('无法从 Playwright 浏览器清单识别 Chromium 版本');
 }
 const playwrightPackage = JSON.parse(
   await readFile(path.join(playwrightRoot, 'package.json'), 'utf8'),
