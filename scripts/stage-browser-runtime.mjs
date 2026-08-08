@@ -77,7 +77,7 @@ if (!chromiumVersion) {
   throw new Error('无法从 Playwright 浏览器清单识别 Chromium 版本');
 }
 const playwrightPackage = JSON.parse(
-  await readFile(path.join(playwrightRoot, 'package.json'), 'utf8'),
+  await readFile(path.join(stagedPlaywright, 'package.json'), 'utf8'),
 );
 const protocolSource = await readFile(path.join(browserHostRoot, 'src', 'protocol.ts'), 'utf8');
 const protocolMatch = protocolSource.match(
