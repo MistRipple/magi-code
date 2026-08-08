@@ -151,6 +151,7 @@ async function copyDirectory(source, destination) {
       '/DCOPY:DAT',
       '/R:2',
       '/W:1',
+      '/MT:32',
       '/NFL',
       '/NDL',
       '/NJH',
