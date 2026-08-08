@@ -37,6 +37,7 @@ const HOST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const HOST_READY_WAIT_TIMEOUT: Duration = Duration::from_secs(65);
 const STALE_PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const HOST_MAX_ATTEMPTS: usize = 2;
+const BROWSER_HOST_EARLY_EXIT_ERROR: &str = "Browser Host 在就绪前退出";
 const RUNTIME_CONTROL_QUEUE_CAPACITY: usize = 8;
 const RELEASE_FEED_MAX_BYTES: u64 = 1024 * 1024;
 const MAX_RUNTIME_REDIRECTS: usize = 5;
@@ -891,6 +892,23 @@ async fn supervise_browser_host(state: ApiState, config: BrowserHostProcessConfi
                 last_failure = error;
                 tracing::warn!(attempt = attempt + 1, error = %last_failure, "Browser Host 启动失败");
                 if attempt + 1 < HOST_MAX_ATTEMPTS {
+                    if last_failure == BROWSER_HOST_EARLY_EXIT_ERROR {
+                        match recover_browser_profile(&config).await {
+                            Ok(Some(backup_path)) => {
+                                tracing::warn!(
+                                    backup_path = %backup_path.display(),
+                                    "Browser Host 启动时 Chromium 退出，已隔离损坏的浏览器 Profile 并重试"
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(recovery_error) => {
+                                tracing::warn!(
+                                    error = %recovery_error,
+                                    "隔离损坏的浏览器 Profile 失败，将继续使用原 Profile 重试"
+                                );
+                            }
+                        }
+                    }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
                 continue;
@@ -1050,13 +1068,15 @@ async fn start_host_attempt(
     std::fs::create_dir_all(&config.profile_path)
         .map_err(|error| format!("创建浏览器 Profile 失败: {error}"))?;
     let recovered_processes = cleanup_stale_browser_processes(config).await?;
+    let cleared_profile_locks = clear_stale_browser_profile_locks(&config.profile_path)?;
     let cleared_cache_entries = clear_transient_browser_cache(&config.profile_path)?;
     tracing::info!(
         profile_path = %config.profile_path.display(),
+        cleared_profile_locks,
         cleared_cache_entries,
         recovered_processes,
         runtime_epoch,
-        "Browser Host 启动前已清理临时缓存"
+        "Browser Host 启动前已清理 Profile 状态"
     );
     let token = random_auth_token()?;
     let mut command = magi_process::tokio_command(&config.node_executable);
@@ -1102,7 +1122,7 @@ async fn start_host_attempt(
         Ok(Ok(Some(line))) => line,
         Ok(Ok(None)) => {
             let _ = child.terminate().await;
-            return Err("Browser Host 在就绪前退出".to_string());
+            return Err(BROWSER_HOST_EARLY_EXIT_ERROR.to_string());
         }
         Ok(Err(error)) => {
             let _ = child.terminate().await;
@@ -1180,6 +1200,68 @@ async fn cleanup_stale_browser_processes(
     }
 }
 
+async fn recover_browser_profile(
+    config: &BrowserHostProcessConfig,
+) -> Result<Option<PathBuf>, String> {
+    let recovered_processes = cleanup_stale_browser_processes(config).await?;
+    if recovered_processes > 0 {
+        tracing::info!(recovered_processes, "隔离浏览器 Profile 前已终止残留进程");
+    }
+    quarantine_browser_profile(&config.profile_path)
+}
+
+fn quarantine_browser_profile(profile_path: &std::path::Path) -> Result<Option<PathBuf>, String> {
+    let metadata = match fs::symlink_metadata(profile_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(profile_path)
+                .map_err(|error| format!("创建浏览器 Profile 失败: {error}"))?;
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(format!(
+                "读取浏览器 Profile 失败 {}: {error}",
+                profile_path.display()
+            ));
+        }
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "浏览器 Profile 路径不是目录: {}",
+            profile_path.display()
+        ));
+    }
+
+    let parent = profile_path
+        .parent()
+        .ok_or_else(|| format!("浏览器 Profile 缺少父目录: {}", profile_path.display()))?;
+    let name = profile_path
+        .file_name()
+        .ok_or_else(|| format!("浏览器 Profile 缺少目录名: {}", profile_path.display()))?
+        .to_string_lossy();
+    let timestamp = UtcMillis::now().0;
+    let mut backup_path = parent.join(format!("{name}.recovery-{timestamp}"));
+    let mut suffix = 1u32;
+    while fs::symlink_metadata(&backup_path).is_ok() {
+        backup_path = parent.join(format!("{name}.recovery-{timestamp}-{suffix}"));
+        suffix = suffix.saturating_add(1);
+    }
+    fs::rename(profile_path, &backup_path).map_err(|error| {
+        format!(
+            "隔离浏览器 Profile 失败 {} -> {}: {error}",
+            profile_path.display(),
+            backup_path.display()
+        )
+    })?;
+    fs::create_dir_all(profile_path).map_err(|error| {
+        format!(
+            "重建浏览器 Profile 失败 {}: {error}",
+            profile_path.display()
+        )
+    })?;
+    Ok(Some(backup_path))
+}
+
 fn matching_browser_processes(system: &System, config: &BrowserHostProcessConfig) -> Vec<Pid> {
     let profile_environment = OsString::from(format!(
         "MAGI_BROWSER_PROFILE_PATH={}",
@@ -1188,9 +1270,6 @@ fn matching_browser_processes(system: &System, config: &BrowserHostProcessConfig
     let user_data_argument =
         OsString::from(format!("--user-data-dir={}", config.profile_path.display()));
     let match_spec = BrowserProcessMatchSpec {
-        node_executable: &config.node_executable,
-        host_entry: &config.host_entry,
-        chromium_executable: &config.chromium_executable,
         profile_environment: &profile_environment,
         user_data_argument: &user_data_argument,
     };
@@ -1199,12 +1278,7 @@ fn matching_browser_processes(system: &System, config: &BrowserHostProcessConfig
         .values()
         .filter(|process| {
             process.pid().as_u32() != std::process::id()
-                && browser_process_matches(
-                    process.exe(),
-                    process.cmd(),
-                    process.environ(),
-                    match_spec,
-                )
+                && browser_process_matches(process.cmd(), process.environ(), match_spec)
         })
         .map(|process| process.pid())
         .collect()
@@ -1212,15 +1286,11 @@ fn matching_browser_processes(system: &System, config: &BrowserHostProcessConfig
 
 #[derive(Clone, Copy)]
 struct BrowserProcessMatchSpec<'a> {
-    node_executable: &'a std::path::Path,
-    host_entry: &'a std::path::Path,
-    chromium_executable: &'a std::path::Path,
     profile_environment: &'a OsString,
     user_data_argument: &'a OsString,
 }
 
 fn browser_process_matches(
-    executable: Option<&std::path::Path>,
     arguments: &[OsString],
     environment: &[OsString],
     spec: BrowserProcessMatchSpec<'_>,
@@ -1229,34 +1299,21 @@ fn browser_process_matches(
         .iter()
         .any(|value| value == spec.profile_environment);
     let host_matches = environment_matches
-        && executable.is_some_and(|path| same_executable(path, spec.node_executable))
         && arguments
             .iter()
-            .any(|argument| same_path_argument(argument, spec.host_entry));
-    let chromium_matches = executable
-        .is_some_and(|path| same_executable(path, spec.chromium_executable))
-        && arguments
-            .iter()
-            .any(|argument| argument == spec.user_data_argument);
+            .any(|argument| is_browser_host_entry(argument));
+    let chromium_matches = arguments
+        .iter()
+        .any(|argument| argument == spec.user_data_argument);
     host_matches || chromium_matches
 }
 
-fn same_executable(actual: &std::path::Path, expected: &std::path::Path) -> bool {
-    actual == expected
-        || actual
-            .canonicalize()
-            .ok()
-            .zip(expected.canonicalize().ok())
-            .is_some_and(|(actual, expected)| actual == expected)
-}
-
-fn same_path_argument(actual: &OsStr, expected: &std::path::Path) -> bool {
-    std::path::Path::new(actual) == expected
-        || std::path::Path::new(actual)
-            .canonicalize()
-            .ok()
-            .zip(expected.canonicalize().ok())
-            .is_some_and(|(actual, expected)| actual == expected)
+fn is_browser_host_entry(argument: &OsStr) -> bool {
+    let path = std::path::Path::new(argument);
+    path.file_name().is_some_and(|name| name == "index.cjs")
+        && path
+            .parent()
+            .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "host"))
 }
 
 async fn wait_for_processes_to_exit(
@@ -1297,6 +1354,39 @@ fn clear_transient_browser_cache(profile_path: &std::path::Path) -> Result<usize
             fs::remove_file(&path)
         };
         result.map_err(|error| format!("清理浏览器临时缓存失败 {}: {error}", path.display()))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+const STALE_BROWSER_PROFILE_LOCK_PATHS: &[&str] = &[
+    "Default/LOCK",
+    "RunningChromeVersion",
+    "SingletonCookie",
+    "SingletonLock",
+    "SingletonSocket",
+];
+
+fn clear_stale_browser_profile_locks(profile_path: &std::path::Path) -> Result<usize, String> {
+    let mut removed = 0;
+    for relative in STALE_BROWSER_PROFILE_LOCK_PATHS {
+        let path = profile_path.join(relative);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "读取浏览器 Profile 锁失败 {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        result.map_err(|error| format!("清理浏览器 Profile 锁失败 {}: {error}", path.display()))?;
         removed += 1;
     }
     Ok(removed)
@@ -1853,6 +1943,11 @@ mod tests {
         thread::JoinHandle,
     };
 
+    use super::{
+        STALE_BROWSER_PROFILE_LOCK_PATHS, clear_stale_browser_profile_locks,
+        quarantine_browser_profile,
+    };
+
     use magi_api::ApiState;
     use magi_browser_runtime::{
         BrowserHostProtocolRange, BrowserHostProtocolVersion, BrowserRuntimeManifest,
@@ -2019,43 +2114,39 @@ mod tests {
     }
 
     #[test]
-    fn stale_browser_process_matching_is_profile_and_executable_specific() {
+    fn stale_browser_process_matching_is_profile_specific_across_runtime_versions() {
         let profile = PathBuf::from("/tmp/magi-browser-profile");
-        let node = PathBuf::from("/usr/local/bin/node");
-        let host = PathBuf::from("/tmp/browser-host/index.cjs");
-        let chromium = PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium");
+        let host = PathBuf::from("/tmp/host/index.cjs");
         let profile_environment =
             OsString::from(format!("MAGI_BROWSER_PROFILE_PATH={}", profile.display()));
         let user_data_argument = OsString::from(format!("--user-data-dir={}", profile.display()));
         let host_argument = host.clone().into_os_string();
         let match_spec = BrowserProcessMatchSpec {
-            node_executable: &node,
-            host_entry: &host,
-            chromium_executable: &chromium,
             profile_environment: &profile_environment,
             user_data_argument: &user_data_argument,
         };
 
         assert!(browser_process_matches(
-            Some(&node),
             std::slice::from_ref(&host_argument),
             std::slice::from_ref(&profile_environment),
             match_spec,
         ));
         assert!(browser_process_matches(
-            Some(&chromium),
             std::slice::from_ref(&user_data_argument),
             &[],
             match_spec,
         ));
+        assert!(browser_process_matches(
+            &[OsString::from("/Users/old/runtime/host/index.cjs")],
+            &[profile_environment.clone()],
+            match_spec,
+        ));
         assert!(!browser_process_matches(
-            Some(&chromium),
             &[OsString::from("--user-data-dir=/tmp/other-profile")],
             &[],
             match_spec,
         ));
         assert!(!browser_process_matches(
-            Some(&node),
             std::slice::from_ref(&host_argument),
             &[OsString::from(
                 "MAGI_BROWSER_PROFILE_PATH=/tmp/other-profile",
@@ -2118,6 +2209,46 @@ mod tests {
                 "{relative}"
             );
         }
+    }
+
+    #[test]
+    fn browser_restart_removes_stale_profile_locks_after_process_cleanup() {
+        let profile = tempfile::tempdir().expect("browser profile fixture should create");
+        for relative in STALE_BROWSER_PROFILE_LOCK_PATHS {
+            let path = profile.path().join(relative);
+            std::fs::create_dir_all(path.parent().expect("lock path should have parent"))
+                .expect("lock parent should create");
+            std::fs::write(path, b"stale").expect("lock fixture should write");
+        }
+
+        assert_eq!(
+            clear_stale_browser_profile_locks(profile.path())
+                .expect("stale browser profile locks should clear"),
+            STALE_BROWSER_PROFILE_LOCK_PATHS.len()
+        );
+        for relative in STALE_BROWSER_PROFILE_LOCK_PATHS {
+            assert!(!profile.path().join(relative).exists(), "{relative}");
+        }
+    }
+
+    #[test]
+    fn browser_startup_recovery_quarantines_existing_profile_and_recreates_path() {
+        let parent = tempfile::tempdir().expect("browser profile parent should create");
+        let profile_path = parent.path().join("default");
+        std::fs::create_dir_all(&profile_path).expect("browser profile should create");
+        std::fs::write(profile_path.join("Local State"), b"recoverable state")
+            .expect("browser profile state should write");
+
+        let backup_path = quarantine_browser_profile(&profile_path)
+            .expect("browser profile should quarantine")
+            .expect("existing browser profile should have a backup");
+
+        assert!(profile_path.is_dir());
+        assert_eq!(
+            std::fs::read(backup_path.join("Local State"))
+                .expect("backup browser profile should remain readable"),
+            b"recoverable state"
+        );
     }
 
     #[test]
