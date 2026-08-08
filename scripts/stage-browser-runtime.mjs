@@ -146,6 +146,7 @@ async function copyDirectory(source, destination) {
       destination,
       '/E',
       '/SL',
+      '/XJ',
       '/COPY:DAT',
       '/DCOPY:DAT',
       '/R:2',
