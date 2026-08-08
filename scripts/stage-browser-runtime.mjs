@@ -46,13 +46,13 @@ if (process.platform !== 'win32') {
   }).catch(() => undefined);
 }
 await copyFile(hostEntry, stagedHost);
-await stagePlaywrightDirectory(playwrightRoot, stagedPlaywright);
-await stageChromiumDirectory(chromiumRoot, stagedChromiumRoot);
-
 await copyFile(
   path.join(playwrightRoot, 'LICENSE'),
   path.join(root, 'licenses', 'playwright-core.txt'),
 );
+await stagePlaywrightDirectory(playwrightRoot, stagedPlaywright);
+await stageChromiumDirectory(chromiumRoot, stagedChromiumRoot);
+
 const nodeLicense = await findNodeLicense(process.execPath);
 if (nodeLicense) {
   await copyFile(nodeLicense, path.join(root, 'licenses', 'node.txt'));
