@@ -152,6 +152,7 @@ async function copyDirectory(source, destination) {
       '/R:2',
       '/W:1',
       '/MT:32',
+      '/J',
       '/NFL',
       '/NDL',
       '/NJH',
