@@ -46,7 +46,7 @@ if (process.platform !== 'win32') {
   }).catch(() => undefined);
 }
 await copyFile(hostEntry, stagedHost);
-await copyDirectory(playwrightRoot, stagedPlaywright);
+await stagePlaywrightDirectory(playwrightRoot, stagedPlaywright);
 await stageChromiumDirectory(chromiumRoot, stagedChromiumRoot);
 
 await copyFile(
@@ -139,6 +139,14 @@ async function stageChromiumDirectory(source, destination) {
   if (process.platform === 'win32') {
     // CI 将 Playwright 浏览器缓存放在工作区内，直接移动目录，避免 Windows runner
     // 对数十万 Chromium 文件做跨盘递归复制。
+    await rename(source, destination);
+    return;
+  }
+  await copyDirectory(source, destination);
+}
+
+async function stagePlaywrightDirectory(source, destination) {
+  if (process.platform === 'win32') {
     await rename(source, destination);
     return;
   }
