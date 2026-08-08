@@ -1008,6 +1008,35 @@ fn runtime_manifest_sequence_cannot_move_backwards() {
 }
 
 #[test]
+fn runtime_manifest_sequence_migrates_past_legacy_date_based_trust() {
+    let directory = tempfile::tempdir().unwrap();
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let manager = runtime_manager(directory.path().join("browser"), &signing_key);
+    let (legacy_archive, legacy_release) = create_signed_runtime_archive(
+        directory.path(),
+        &signing_key,
+        "3.0.38-local.2",
+        2_026_080_802,
+    );
+    manager
+        .install_archive(
+            &legacy_release,
+            &legacy_archive,
+            at(100),
+            &runtime_self_test_ok,
+        )
+        .unwrap();
+    manager.uninstall().unwrap();
+
+    let (_, current_release) =
+        create_signed_runtime_archive(directory.path(), &signing_key, "3.0.40", 3_000_000_000_040);
+    let assessment = manager.assess_release(&current_release, at(101)).unwrap();
+
+    assert_eq!(assessment.runtime_version, version("3.0.40"));
+    assert!(assessment.requires_install);
+}
+
+#[test]
 fn failed_runtime_self_test_leaves_no_install_or_active_pointer() {
     let directory = tempfile::tempdir().unwrap();
     let signing_key = SigningKey::from_bytes(&[7u8; 32]);

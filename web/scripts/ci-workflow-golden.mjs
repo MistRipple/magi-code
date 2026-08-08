@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 
 const [workflow, securityWorkflow, releaseWorkflow, browserRuntimeReleaseWorkflow] = await Promise.all([
   readFile(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8'),
@@ -56,8 +58,14 @@ assert.doesNotMatch(releaseWorkflow, /cargo test -p magi-desktop/, 'release pack
 
 assert.match(browserRuntimeReleaseWorkflow, /push:[\s\S]*?tags:[\s\S]*?-\s*"v\*"/, 'Browser Runtime must follow product release tags');
 assert.doesNotMatch(browserRuntimeReleaseWorkflow, /runtime_version:\s*\n/, 'Browser Runtime must not expose an independent version input');
-assert.match(browserRuntimeReleaseWorkflow, /runtime_version="\$magi_version"/, 'Browser Runtime version must derive from the product version');
-assert.match(browserRuntimeReleaseWorkflow, /test "\$tag_version" = "\$magi_version"/, 'Browser Runtime must reject mismatched product tags');
+assert.doesNotMatch(browserRuntimeReleaseWorkflow, /BROWSER_RUNTIME_MANIFEST_SEQUENCE/, 'Browser Runtime must not depend on a manually maintained sequence variable');
+assert.match(browserRuntimeReleaseWorkflow, /prepare-release:[\s\S]*?manifest_sequence:/, 'Browser Runtime must create one shared manifest sequence before platform packaging');
+assert.match(browserRuntimeReleaseWorkflow, /needs\.prepare-release\.outputs\.manifest_sequence/, 'every platform package must use the prepared manifest sequence');
+assert.match(browserRuntimeReleaseWorkflow, /concurrency:[\s\S]*?browser-runtime-stable-release[\s\S]*?cancel-in-progress:\s*false/, 'Browser Runtime publications must serialize stable-feed sequence allocation');
 assert.match(browserRuntimeReleaseWorkflow, /runtime_tag="browser-runtime-v\$\{runtime_version\}"/, 'Runtime archive URLs must use the derived version');
+
+const sequenceScript = fileURLToPath(new URL('../../scripts/browser-runtime-manifest-sequence.mjs', import.meta.url));
+const sequenceFloor = execFileSync(process.execPath, [sequenceScript, '3.0.40'], { encoding: 'utf8' }).trim();
+assert.equal(sequenceFloor, '3000000000040', 'product version must map above the legacy date-based manifest sequence range');
 
 console.log('CI workflow golden replay passed');

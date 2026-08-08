@@ -3,10 +3,6 @@ name: 发布 Browser Runtime
 on:
   workflow_dispatch:
     inputs:
-      manifest_sequence:
-        description: 单调递增的 manifest sequence
-        required: true
-        type: string
       update_level:
         description: 更新级别
         required: true
@@ -28,17 +24,94 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: browser-runtime-stable-release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: '1.97.0'
   BROWSER_RUNTIME_RELEASE_KEY_HEX: ${{ vars.BROWSER_RUNTIME_RELEASE_KEY_HEX }}
-  BROWSER_RUNTIME_MANIFEST_SEQUENCE: ${{ vars.BROWSER_RUNTIME_MANIFEST_SEQUENCE }}
   BROWSER_RUNTIME_EXPIRES_DAYS: ${{ vars.BROWSER_RUNTIME_EXPIRES_DAYS || '90' }}
   BROWSER_RUNTIME_UPDATE_LEVEL: ${{ vars.BROWSER_RUNTIME_UPDATE_LEVEL || 'recommended' }}
 
 jobs:
+  prepare-release:
+    name: 准备 Browser Runtime 发布
+    runs-on: ubuntu-22.04
+    outputs:
+      magi_version: ${{ steps.release.outputs.magi_version }}
+      runtime_version: ${{ steps.release.outputs.runtime_version }}
+      manifest_sequence: ${{ steps.release.outputs.manifest_sequence }}
+      expires_days: ${{ steps.release.outputs.expires_days }}
+      update_level: ${{ steps.release.outputs.update_level }}
+    steps:
+      - name: 检出发布版本
+        uses: actions/checkout@v7
+
+      - name: 生成发布序列
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          magi_version="$(node -p "require('./web/package.json').version")"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            test "$tag_version" = "$magi_version" || {
+              echo "产品标签 $tag_version 与 web/package.json 版本 $magi_version 不一致。" >&2
+              exit 1
+            }
+          fi
+
+          sequence_floor="$(node scripts/browser-runtime-manifest-sequence.mjs "$magi_version")"
+          highest_sequence=0
+          feed_dir="$(mktemp -d)"
+          if gh release view browser-runtime-stable --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download browser-runtime-stable \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern 'release-*.json' \
+              --dir "$feed_dir" \
+              --clobber
+            while IFS= read -r feed; do
+              candidate="$(jq -er '.release.manifest.manifest_sequence' "$feed")"
+              [[ "$candidate" =~ ^[0-9]+$ ]] || {
+                echo "Browser Runtime 稳定清单序列无效：$feed" >&2
+                exit 1
+              }
+              if (( candidate > highest_sequence )); then
+                highest_sequence="$candidate"
+              fi
+            done < <(find "$feed_dir" -maxdepth 1 -type f -name 'release-*.json' -print)
+          fi
+          if (( highest_sequence >= sequence_floor )); then
+            manifest_sequence=$((highest_sequence + 1))
+          else
+            manifest_sequence="$sequence_floor"
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            expires_days="${{ inputs.expires_days }}"
+            update_level="${{ inputs.update_level }}"
+          else
+            expires_days="$BROWSER_RUNTIME_EXPIRES_DAYS"
+            update_level="$BROWSER_RUNTIME_UPDATE_LEVEL"
+          fi
+          [[ "$expires_days" =~ ^[1-9][0-9]*$ ]]
+          case "$update_level" in optional|recommended|required_security) ;; *) exit 1 ;; esac
+
+          {
+            echo "magi_version=$magi_version"
+            echo "runtime_version=$magi_version"
+            echo "manifest_sequence=$manifest_sequence"
+            echo "expires_days=$expires_days"
+            echo "update_level=$update_level"
+          } >> "$GITHUB_OUTPUT"
+
   package:
     name: 打包 ${{ matrix.platform }} Browser Runtime
+    needs: prepare-release
     runs-on: ${{ matrix.runner }}
     env:
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
@@ -123,24 +196,11 @@ jobs:
             echo '缺少 Repository Variable: BROWSER_RUNTIME_RELEASE_KEY_HEX' >&2
             exit 1
           }
-          magi_version="$(node -p "require('./web/package.json').version")"
-          runtime_version="$magi_version"
-          if [[ "$GITHUB_REF_NAME" == v* ]]; then
-            tag_version="${GITHUB_REF_NAME#v}"
-            test "$tag_version" = "$magi_version" || {
-              echo "产品标签 $tag_version 与 web/package.json 版本 $magi_version 不一致。" >&2
-              exit 1
-            }
-          fi
-          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            sequence="${{ inputs.manifest_sequence }}"
-            expires_days="${{ inputs.expires_days }}"
-            update_level="${{ inputs.update_level }}"
-          else
-            sequence="${BROWSER_RUNTIME_MANIFEST_SEQUENCE:-1}"
-            expires_days="${BROWSER_RUNTIME_EXPIRES_DAYS:-90}"
-            update_level="${BROWSER_RUNTIME_UPDATE_LEVEL:-recommended}"
-          fi
+          magi_version="${{ needs.prepare-release.outputs.magi_version }}"
+          runtime_version="${{ needs.prepare-release.outputs.runtime_version }}"
+          sequence="${{ needs.prepare-release.outputs.manifest_sequence }}"
+          expires_days="${{ needs.prepare-release.outputs.expires_days }}"
+          update_level="${{ needs.prepare-release.outputs.update_level }}"
           test -n "$runtime_version"
           test -n "$sequence"
           test -n "$expires_days"
@@ -188,7 +248,7 @@ jobs:
 
   publish:
     name: 发布 Browser Runtime 清单与归档
-    needs: package
+    needs: [prepare-release, package]
     runs-on: ubuntu-22.04
     steps:
       - name: 检出发布版本
@@ -207,12 +267,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          magi_version="$(node -p "require('./web/package.json').version")"
-          runtime_version="$magi_version"
-          if [[ "$GITHUB_REF_NAME" == v* ]]; then
-            tag_version="${GITHUB_REF_NAME#v}"
-            test "$tag_version" = "$magi_version"
-          fi
+          runtime_version="${{ needs.prepare-release.outputs.runtime_version }}"
           runtime_tag="browser-runtime-v${runtime_version}"
           gh release view "$runtime_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$runtime_tag" --repo "$GITHUB_REPOSITORY" --title "Magi Browser Runtime ${runtime_tag#browser-runtime-v}" --notes 'Magi 独立 Browser Runtime 组件。'
