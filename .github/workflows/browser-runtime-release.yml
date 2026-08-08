@@ -209,9 +209,9 @@ jobs:
           else
             runtime_tag="browser-runtime-v${{ inputs.runtime_version }}"
           fi
-          gh release view "$runtime_tag" >/dev/null 2>&1 || \
-            gh release create "$runtime_tag" --title "Magi Browser Runtime ${runtime_tag#browser-runtime-v}" --notes 'Magi 独立 Browser Runtime 组件。'
-          gh release upload "$runtime_tag" dist/browser-runtime/magi-browser-runtime-*.tar.zst dist/browser-runtime/signed-release-*.json --clobber
+          gh release view "$runtime_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$runtime_tag" --repo "$GITHUB_REPOSITORY" --title "Magi Browser Runtime ${runtime_tag#browser-runtime-v}" --notes 'Magi 独立 Browser Runtime 组件。'
+          gh release upload "$runtime_tag" --repo "$GITHUB_REPOSITORY" dist/browser-runtime/magi-browser-runtime-*.tar.zst dist/browser-runtime/signed-release-*.json --clobber
 
       - name: 更新稳定版 Runtime Feed
         shell: bash
@@ -219,6 +219,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release view browser-runtime-stable >/dev/null 2>&1 || \
-            gh release create browser-runtime-stable --title 'Magi Browser Runtime Stable Feed' --notes '由 Browser Runtime 发布工作流维护。'
-          gh release upload browser-runtime-stable dist/browser-runtime/release-*.json --clobber
+          gh release view browser-runtime-stable --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create browser-runtime-stable --repo "$GITHUB_REPOSITORY" --title 'Magi Browser Runtime Stable Feed' --notes '由 Browser Runtime 发布工作流维护。'
+          gh release upload browser-runtime-stable --repo "$GITHUB_REPOSITORY" dist/browser-runtime/release-*.json --clobber
