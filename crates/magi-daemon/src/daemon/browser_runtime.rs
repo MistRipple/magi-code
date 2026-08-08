@@ -2138,7 +2138,7 @@ mod tests {
         ));
         assert!(browser_process_matches(
             &[OsString::from("/Users/old/runtime/host/index.cjs")],
-            &[profile_environment.clone()],
+            std::slice::from_ref(&profile_environment),
             match_spec,
         ));
         assert!(!browser_process_matches(
