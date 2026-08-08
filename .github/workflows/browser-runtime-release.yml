@@ -44,6 +44,8 @@ jobs:
   package:
     name: 打包 ${{ matrix.platform }} Browser Runtime
     runs-on: ${{ matrix.runner }}
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
     strategy:
       fail-fast: false
       matrix:

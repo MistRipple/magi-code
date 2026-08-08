@@ -2,7 +2,7 @@
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { chmod, copyFile, cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, cp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 const args = parseArgs(process.argv.slice(2));
@@ -17,6 +17,7 @@ const chromiumExecutable = path.resolve(
   args['chromium-executable'] ?? chromium.executablePath(),
 );
 const chromiumRoot = findChromiumRoot(chromiumExecutable);
+const chromiumExecutableRelative = path.relative(chromiumRoot, chromiumExecutable);
 const nodeName = process.platform === 'win32' ? 'node.exe' : 'node';
 const nodeRoot = process.platform === 'win32'
   ? path.dirname(process.execPath)
@@ -46,7 +47,7 @@ if (process.platform !== 'win32') {
 }
 await copyFile(hostEntry, stagedHost);
 await copyDirectory(playwrightRoot, stagedPlaywright);
-await copyDirectory(chromiumRoot, stagedChromiumRoot);
+await stageChromiumDirectory(chromiumRoot, stagedChromiumRoot);
 
 await copyFile(
   path.join(playwrightRoot, 'LICENSE'),
@@ -66,10 +67,9 @@ await writeFile(
   'utf8',
 );
 
-const chromiumRelative = toManifestPath(
-  path.join('chromium', path.relative(chromiumRoot, chromiumExecutable)),
-);
-const chromiumVersionOutput = execFileSync(chromiumExecutable, ['--version'], {
+const stagedChromiumExecutable = path.join(stagedChromiumRoot, chromiumExecutableRelative);
+const chromiumRelative = toManifestPath(path.join('chromium', chromiumExecutableRelative));
+const chromiumVersionOutput = execFileSync(stagedChromiumExecutable, ['--version'], {
   encoding: 'utf8',
 }).trim();
 const chromiumVersion = chromiumVersionOutput.match(/\d+(?:\.\d+){3}/)?.[0];
@@ -164,6 +164,16 @@ async function copyDirectory(source, destination) {
   if (result.status === null || result.status > 7) {
     throw new Error(`robocopy 复制运行组件失败，退出码：${result.status ?? 'unknown'}`);
   }
+}
+
+async function stageChromiumDirectory(source, destination) {
+  if (process.platform === 'win32') {
+    // CI 将 Playwright 浏览器缓存放在工作区内，直接移动目录，避免 Windows runner
+    // 对数十万 Chromium 文件做跨盘递归复制。
+    await rename(source, destination);
+    return;
+  }
+  await copyDirectory(source, destination);
 }
 
 async function findNodeLicense(executable) {
