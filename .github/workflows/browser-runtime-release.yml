@@ -105,6 +105,11 @@ jobs:
           node scripts/stage-browser-runtime.mjs \
             --root dist/browser-runtime-root \
             --metadata dist/browser-runtime-metadata.json
+
+      - name: Browser Runtime 协议回归
+        shell: bash
+        run: |
+          set -euo pipefail
           node scripts/self-test-browser-runtime.mjs \
             --metadata dist/browser-runtime-metadata.json
 
