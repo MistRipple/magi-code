@@ -34,6 +34,17 @@ assert.match(
 );
 assert.match(
   releaseWorkflow,
+  /desktop_tag="magi-desktop-stable"[\s\S]*dist\/release-assets\/latest\.json/,
+  'release workflow must publish the desktop updater manifest to its dedicated stable feed',
+);
+const desktopConfig = JSON.parse(fs.readFileSync(path.resolve('../apps/desktop/tauri.conf.json'), 'utf8'));
+assert.deepEqual(
+  desktopConfig.plugins?.updater?.endpoints,
+  ['https://github.com/MistRipple/magi-code/releases/download/magi-desktop-stable/latest.json'],
+  'desktop updater must use the dedicated stable feed instead of GitHub global latest',
+);
+assert.match(
+  releaseWorkflow,
   /notes_file="\.github\/releases\/\$\{tag\}\.md"/,
   'release workflow must read the versioned product release notes',
 );

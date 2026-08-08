@@ -1,7 +1,7 @@
 {
   "productName": "Magi",
   "mainBinaryName": "Magi",
-  "version": "3.0.38",
+  "version": "3.0.39",
   "identifier": "com.mistripple.magi",
   "build": {
     "frontendDist": "bootstrap"
@@ -42,7 +42,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDkxNzMzRURENEM2RkVGNjUKUldSbDcyOU0zVDV6a1RVR29YRVhXcmNrcnh3UmhLRFJ4eHdhRSs3Y2p5dzY2TzNGSGtGajJXSkQK",
       "endpoints": [
-        "https://github.com/MistRipple/magi-code/releases/latest/download/latest.json"
+        "https://github.com/MistRipple/magi-code/releases/download/magi-desktop-stable/latest.json"
       ]
     }
   }
