@@ -935,6 +935,44 @@ fn signed_runtime_is_verified_installed_and_atomically_activated() {
 }
 
 #[test]
+fn same_version_release_replaces_stale_install_and_reactivates() {
+    let directory = tempfile::tempdir().unwrap();
+    let signing_key = SigningKey::from_bytes(&[31u8; 32]);
+    let manager = runtime_manager(directory.path().join("browser"), &signing_key);
+    let (current_archive, current_release) =
+        create_signed_runtime_archive(directory.path(), &signing_key, "1.0.0", 10);
+    manager
+        .install_archive(
+            &current_release,
+            &current_archive,
+            at(100),
+            &runtime_self_test_ok,
+        )
+        .unwrap();
+
+    let (next_archive, next_release) =
+        create_signed_runtime_archive(directory.path(), &signing_key, "1.0.0", 11);
+    let assessment = manager.assess_release(&next_release, at(101)).unwrap();
+    assert!(assessment.requires_install);
+
+    let outcome = manager
+        .install_archive(&next_release, &next_archive, at(102), &runtime_self_test_ok)
+        .unwrap();
+    assert_eq!(outcome.active.manifest_sequence, 11);
+    assert_eq!(
+        manager.inspect_active_release(at(20_000)).unwrap(),
+        Some(next_release)
+    );
+    assert!(!manager.root().read_dir().unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".replacing-")
+    }));
+}
+
+#[test]
 fn runtime_uninstall_removes_payload_but_preserves_rollback_trust() {
     let root = tempfile::tempdir().unwrap();
     let signing_key = SigningKey::from_bytes(&[23; 32]);

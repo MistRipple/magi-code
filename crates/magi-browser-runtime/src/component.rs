@@ -228,9 +228,15 @@ impl BrowserRuntimeManager {
             runtime_version: release.manifest.runtime_version.clone(),
             update_level: release.update_level,
             archive_size_bytes: release.archive_size_bytes,
-            requires_install: active
-                .as_ref()
-                .is_none_or(|active| active.runtime_version != release.manifest.runtime_version),
+            requires_install: active.as_ref().is_none_or(|active| {
+                active.runtime_version != release.manifest.runtime_version
+                    || active.manifest_sequence != release.manifest.manifest_sequence
+                    || self.inspect_active_release(now).map_or(true, |installed| {
+                        installed
+                            .as_ref()
+                            .is_none_or(|installed| !same_release_identity(installed, release))
+                    })
+            }),
         })
     }
 
@@ -270,8 +276,11 @@ impl BrowserRuntimeManager {
 
         let install_path = self.runtime_path(&release.manifest.runtime_version);
         if install_path.exists() {
-            verify_existing_install(&install_path, release)?;
-            fs::remove_dir_all(&staging_path)?;
+            if verify_existing_install(&install_path, release).is_ok() {
+                fs::remove_dir_all(&staging_path)?;
+            } else {
+                replace_runtime_install(&self.config.root, &staging_path, &install_path)?;
+            }
         } else {
             fs::rename(&staging_path, &install_path)?;
             sync_directory(&self.config.root);
@@ -742,12 +751,45 @@ fn verify_existing_install(
 ) -> Result<(), BrowserRuntimeComponentError> {
     let installed: SignedBrowserRuntimeRelease =
         read_required_json(&install_path.join(BROWSER_RUNTIME_RELEASE_FILE))?;
-    if &installed != release {
-        return Err(BrowserRuntimeComponentError::VersionAlreadyInstalled(
-            release.manifest.runtime_version.clone(),
+    if !same_release_identity(&installed, release) {
+        return Err(BrowserRuntimeComponentError::InvalidManifest(
+            "installed runtime release does not match the requested release".to_string(),
         ));
     }
     verify_installed_files(install_path, &release.manifest)
+}
+
+fn same_release_identity(
+    installed: &SignedBrowserRuntimeRelease,
+    requested: &SignedBrowserRuntimeRelease,
+) -> bool {
+    installed.manifest.manifest_sequence == requested.manifest.manifest_sequence
+        && installed.archive_sha256 == requested.archive_sha256
+        && installed.archive_size_bytes == requested.archive_size_bytes
+        && installed.signature == requested.signature
+}
+
+fn replace_runtime_install(
+    root: &Path,
+    staging_path: &Path,
+    install_path: &Path,
+) -> Result<(), BrowserRuntimeComponentError> {
+    let backup_path = root.join(format!(
+        ".replacing-{}-{}",
+        install_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("runtime"),
+        STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::rename(install_path, &backup_path)?;
+    if let Err(error) = fs::rename(staging_path, install_path) {
+        let _ = fs::rename(&backup_path, install_path);
+        return Err(error.into());
+    }
+    let _ = fs::remove_dir_all(&backup_path);
+    sync_directory(root);
+    Ok(())
 }
 
 fn validate_relative_path(path: &Path) -> Result<(), BrowserRuntimeComponentError> {
@@ -999,8 +1041,6 @@ pub enum BrowserRuntimeComponentError {
     InstalledFileInvalid { path: String, reason: String },
     #[error("browser runtime self-test failed: {0}")]
     SelfTestFailed(String),
-    #[error("browser runtime version is already installed with different contents: {0}")]
-    VersionAlreadyInstalled(Version),
     #[error("browser runtime active state does not match installed release")]
     ActiveStateMismatch,
 }

@@ -486,6 +486,7 @@ async fn install_component(
         Some(assessment.update_level),
         None,
     );
+    stop_host_supervisor(state, supervisor, true).await;
     let install_result = tokio::task::spawn_blocking({
         let manager = manager.clone();
         let release = release.clone();
@@ -513,7 +514,6 @@ async fn install_component(
         format!("浏览器运行组件安装失败: {error}")
     })?;
 
-    stop_host_supervisor(state, supervisor, true).await;
     ensure_managed_host_ready(state, &manager, supervisor).await?;
     Ok(BrowserRuntimeComponentOperation {
         action: BrowserRuntimeComponentAction::Install,
