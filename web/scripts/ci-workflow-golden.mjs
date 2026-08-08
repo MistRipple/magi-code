@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
-const [workflow, securityWorkflow, releaseWorkflow] = await Promise.all([
+const [workflow, securityWorkflow, releaseWorkflow, browserRuntimeReleaseWorkflow] = await Promise.all([
   readFile(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8'),
   readFile(new URL('../../.github/workflows/security.yml', import.meta.url), 'utf8'),
   readFile(new URL('../../.github/workflows/release.yml', import.meta.url), 'utf8'),
+  readFile(new URL('../../.github/workflows/browser-runtime-release.yml', import.meta.url), 'utf8'),
 ]);
 
 assert.match(workflow, /RUST_TOOLCHAIN:\s*"1\.97\.0"/, 'CI must pin the Rust toolchain');
@@ -52,5 +53,11 @@ assert.match(releaseWorkflow, /build-web:[\s\S]*?needs:\s*verify-ci/, 'release b
 assert.match(releaseWorkflow, /npm --prefix web run build/, 'release packaging must create production web assets');
 assert.doesNotMatch(releaseWorkflow, /npm --prefix web (?:run )?(?:check|test)/, 'release packaging must not repeat CI frontend validation');
 assert.doesNotMatch(releaseWorkflow, /cargo test -p magi-desktop/, 'release packaging must not repeat CI desktop tests on every platform');
+
+assert.match(browserRuntimeReleaseWorkflow, /push:[\s\S]*?tags:[\s\S]*?-\s*"v\*"/, 'Browser Runtime must follow product release tags');
+assert.doesNotMatch(browserRuntimeReleaseWorkflow, /runtime_version:\s*\n/, 'Browser Runtime must not expose an independent version input');
+assert.match(browserRuntimeReleaseWorkflow, /runtime_version="\$magi_version"/, 'Browser Runtime version must derive from the product version');
+assert.match(browserRuntimeReleaseWorkflow, /test "\$tag_version" = "\$magi_version"/, 'Browser Runtime must reject mismatched product tags');
+assert.match(browserRuntimeReleaseWorkflow, /runtime_tag="browser-runtime-v\$\{runtime_version\}"/, 'Runtime archive URLs must use the derived version');
 
 console.log('CI workflow golden replay passed');
