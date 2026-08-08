@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { chmod, copyFile, cp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -128,42 +128,11 @@ function findChromiumRoot(executable) {
 }
 
 async function copyDirectory(source, destination) {
-  if (process.platform !== 'win32') {
-    await cp(source, destination, {
-      recursive: true,
-      force: true,
-      verbatimSymlinks: true,
-    });
-    return;
-  }
-
-  // Windows 的 Chromium 目录包含大量二进制文件，Node fs.cp 在 runner 上可能长时间卡在递归复制。
-  // 使用系统 robocopy，既能处理长路径，也不会把符号链接展开成递归目录。
-  const result = spawnSync(
-    'robocopy',
-    [
-      source,
-      destination,
-      '/E',
-      '/SL',
-      '/XJ',
-      '/COPY:DAT',
-      '/DCOPY:DAT',
-      '/R:2',
-      '/W:1',
-      '/MT:32',
-      '/J',
-      '/NFL',
-      '/NDL',
-      '/NJH',
-      '/NJS',
-    ],
-    { stdio: 'inherit', windowsHide: true },
-  );
-  if (result.error) throw result.error;
-  if (result.status === null || result.status > 7) {
-    throw new Error(`robocopy 复制运行组件失败，退出码：${result.status ?? 'unknown'}`);
-  }
+  await cp(source, destination, {
+    recursive: true,
+    force: true,
+    verbatimSymlinks: true,
+  });
 }
 
 async function stageChromiumDirectory(source, destination) {
