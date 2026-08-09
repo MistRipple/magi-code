@@ -1018,6 +1018,36 @@ fn runtime_signature_failure_never_creates_active_state() {
 }
 
 #[test]
+fn runtime_update_check_reports_newer_magi_requirement_without_rejecting_feed() {
+    let directory = tempfile::tempdir().unwrap();
+    let signing_key = SigningKey::from_bytes(&[41u8; 32]);
+    let manager = runtime_manager(directory.path().join("browser"), &signing_key);
+    let (archive_path, mut release) =
+        create_signed_runtime_archive(directory.path(), &signing_key, "4.0.0", 40);
+    release.manifest.minimum_magi_version = version("4.0.0");
+    release.signature = BASE64_STANDARD.encode(
+        signing_key
+            .sign(&release.signing_bytes().unwrap())
+            .to_bytes(),
+    );
+
+    let assessment = manager.assess_release(&release, at(100)).unwrap();
+    assert!(assessment.magi_update_required);
+    assert_eq!(assessment.minimum_magi_version, version("4.0.0"));
+
+    let error = manager
+        .install_archive(&release, &archive_path, at(100), &runtime_self_test_ok)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        BrowserRuntimeComponentError::MagiVersionTooOld {
+            minimum,
+            current
+        } if minimum == version("4.0.0") && current == version("3.0.37")
+    ));
+}
+
+#[test]
 fn runtime_manifest_sequence_cannot_move_backwards() {
     let directory = tempfile::tempdir().unwrap();
     let signing_key = SigningKey::from_bytes(&[7u8; 32]);

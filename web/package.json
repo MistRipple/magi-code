@@ -1,6 +1,5 @@
 {
   "name": "magi-web",
-  "version": "3.0.42",
   "private": true,
   "type": "module",
   "scripts": {

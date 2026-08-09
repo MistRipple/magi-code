@@ -6,8 +6,10 @@ import path from 'node:path';
 import { createUpdateManifest } from './generate-update-manifest.mjs';
 
 const releaseWorkflow = fs.readFileSync(path.resolve('../.github/workflows/release.yml'), 'utf8');
-const webPackage = JSON.parse(fs.readFileSync(path.resolve('package.json'), 'utf8'));
-const currentReleaseNotesPath = path.resolve(`../.github/releases/v${webPackage.version}.md`);
+const productVersion = execFileSync(process.execPath, [path.resolve('../scripts/product-version.mjs')], {
+  encoding: 'utf8',
+}).trim();
+const currentReleaseNotesPath = path.resolve(`../.github/releases/v${productVersion}.md`);
 const currentReleaseNotes = fs.readFileSync(currentReleaseNotesPath, 'utf8').trim();
 
 assert.ok(currentReleaseNotes, `current release notes must not be empty: ${currentReleaseNotesPath}`);

@@ -163,6 +163,8 @@ impl BrowserRuntimeManagerConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrowserRuntimeReleaseAssessment {
     pub runtime_version: Version,
+    pub minimum_magi_version: Version,
+    pub magi_update_required: bool,
     pub update_level: BrowserRuntimeUpdateLevel,
     pub archive_size_bytes: u64,
     pub requires_install: bool,
@@ -222,10 +224,12 @@ impl BrowserRuntimeManager {
         now: UtcMillis,
     ) -> Result<BrowserRuntimeReleaseAssessment, BrowserRuntimeComponentError> {
         let trust = self.trust_state()?;
-        self.verify_release(release, &trust, now, true)?;
+        self.verify_release(release, &trust, now, true, false)?;
         let active = self.active()?;
         Ok(BrowserRuntimeReleaseAssessment {
             runtime_version: release.manifest.runtime_version.clone(),
+            minimum_magi_version: release.manifest.minimum_magi_version.clone(),
+            magi_update_required: self.config.magi_version < release.manifest.minimum_magi_version,
             update_level: release.update_level,
             archive_size_bytes: release.archive_size_bytes,
             requires_install: active.as_ref().is_none_or(|active| {
@@ -249,7 +253,7 @@ impl BrowserRuntimeManager {
     ) -> Result<BrowserRuntimeInstallOutcome, BrowserRuntimeComponentError> {
         fs::create_dir_all(&self.config.root)?;
         let trust = self.trust_state()?;
-        self.verify_release(release, &trust, now, true)?;
+        self.verify_release(release, &trust, now, true, true)?;
         verify_archive(archive_path, release, self.config.max_archive_size_bytes)?;
 
         let staging_root = self.config.root.join(".staging");
@@ -323,7 +327,7 @@ impl BrowserRuntimeManager {
         let release: SignedBrowserRuntimeRelease =
             read_required_json(&install_path.join(BROWSER_RUNTIME_RELEASE_FILE))?;
         let trust = self.trust_state()?;
-        self.verify_release(&release, &trust, now, false)?;
+        self.verify_release(&release, &trust, now, false, true)?;
         verify_installed_files(&install_path, &release.manifest)?;
         if release.manifest.manifest_sequence != active.manifest_sequence {
             return Err(BrowserRuntimeComponentError::ActiveStateMismatch);
@@ -378,6 +382,7 @@ impl BrowserRuntimeManager {
         trust: &BrowserRuntimeTrustState,
         now: UtcMillis,
         enforce_expiry: bool,
+        enforce_magi_version: bool,
     ) -> Result<(), BrowserRuntimeComponentError> {
         let manifest = &release.manifest;
         if manifest.format_version != BROWSER_RUNTIME_MANIFEST_FORMAT_VERSION {
@@ -405,7 +410,7 @@ impl BrowserRuntimeManager {
                 received: manifest.manifest_sequence,
             });
         }
-        if self.config.magi_version < manifest.minimum_magi_version {
+        if enforce_magi_version && self.config.magi_version < manifest.minimum_magi_version {
             return Err(BrowserRuntimeComponentError::MagiVersionTooOld {
                 minimum: manifest.minimum_magi_version.clone(),
                 current: self.config.magi_version.clone(),

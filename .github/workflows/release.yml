@@ -106,14 +106,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tauri_version="$(node -p "require('./apps/desktop/tauri.conf.json').version")"
-          web_version="$(node -p "require('./web/package.json').version")"
-          cargo_version="$(awk 'BEGIN{inside=0} /^\[workspace\.package\]/{inside=1; next} /^\[/{inside=0} inside && $1 == "version" {gsub(/"/, "", $3); print $3; exit}' Cargo.toml)"
-          test -n "$tauri_version"
-          test "$tauri_version" = "$web_version"
-          test "$tauri_version" = "$cargo_version"
+          product_version="$(node scripts/product-version.mjs)"
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            test "${GITHUB_REF_NAME#v}" = "$tauri_version"
+            test "${GITHUB_REF_NAME#v}" = "$product_version"
           fi
 
       - name: 安装前端依赖
@@ -308,7 +303,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="$(node -p "require('./apps/desktop/tauri.conf.json').version")"
+          version="$(node scripts/product-version.mjs)"
           mkdir -p dist/package-assets
           host_triple="$(rustc -vV | sed -n 's/^host: //p')"
           host_arch="${host_triple%%-*}"
@@ -472,7 +467,7 @@ jobs:
       - name: 生成自动更新清单
         run: |
           set -euo pipefail
-          version="$(node -p "require('./apps/desktop/tauri.conf.json').version")"
+          version="$(node scripts/product-version.mjs)"
           test "${GITHUB_REF_NAME#v}" = "$version"
           node web/scripts/generate-update-manifest.mjs \
             --version "$version" \
@@ -483,6 +478,61 @@ jobs:
             --output dist/release-assets/latest.json
           node -e "const m=require('./dist/release-assets/latest.json'); if(!m.version || !m.platforms || Object.keys(m.platforms).length < 3) process.exit(1)"
           cat dist/release-assets/latest.json
+
+      - name: 等待并校验同版本 Browser Runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(node scripts/product-version.mjs)"
+          runtime_tag="browser-runtime-v${version}"
+          runtime_dir="dist/browser-runtime-feed"
+          deadline=$((SECONDS + 1200))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            rm -rf "$runtime_dir"
+            mkdir -p "$runtime_dir"
+            if gh release download "$runtime_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern 'release-*.json' \
+              --dir "$runtime_dir" \
+              --clobber >/dev/null 2>&1 && \
+              [ "$(find "$runtime_dir" -maxdepth 1 -type f -name 'release-*.json' | wc -l | tr -d ' ')" -eq 4 ]; then
+              break
+            fi
+            echo "同版本 Browser Runtime 尚未完成，15 秒后继续检查：$runtime_tag"
+            sleep 15
+          done
+          test "$(find "$runtime_dir" -maxdepth 1 -type f -name 'release-*.json' | wc -l | tr -d ' ')" -eq 4
+          for feed in "$runtime_dir"/release-*.json; do
+            test "$(jq -r '.release.manifest.runtime_version' "$feed")" = "$version"
+            test -n "$(jq -r '.release.manifest.minimum_magi_version' "$feed")"
+          done
+          node - "$runtime_dir" "$version" <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const [runtimeDir, productVersion] = process.argv.slice(2);
+          const parse = (value) => {
+            const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(value);
+            if (!match) throw new Error(`无效 SemVer: ${value}`);
+            return match.slice(1, 4).map(Number);
+          };
+          const compare = (left, right) => {
+            const a = parse(left);
+            const b = parse(right);
+            for (let index = 0; index < a.length; index += 1) {
+              if (a[index] !== b[index]) return a[index] - b[index];
+            }
+            return 0;
+          };
+          const feeds = fs.readdirSync(runtimeDir)
+            .filter((name) => name.startsWith('release-') && name.endsWith('.json'))
+            .map((name) => JSON.parse(fs.readFileSync(path.join(runtimeDir, name), 'utf8')));
+          const minimumVersions = new Set(feeds.map((feed) => feed.release.manifest.minimum_magi_version));
+          if (minimumVersions.size !== 1 || compare([...minimumVersions][0], productVersion) > 0) {
+            throw new Error('同版本 Browser Runtime 的最低 Magi 版本不一致或高于产品版本');
+          }
+          NODE
 
       - name: 创建 Release 并上传产物
         uses: softprops/action-gh-release@v2
@@ -509,4 +559,21 @@ jobs:
           gh release upload "$desktop_tag" \
             --repo "$GITHUB_REPOSITORY" \
             dist/release-assets/latest.json \
+            --clobber
+
+      - name: 提升 Browser Runtime 稳定版 Feed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          runtime_tag="browser-runtime-stable"
+          gh release view "$runtime_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$runtime_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title 'Magi Browser Runtime Stable Feed' \
+              --notes '仅在同版本桌面端发布成功后提升的 Browser Runtime 清单。'
+          gh release upload "$runtime_tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            dist/browser-runtime-feed/release-*.json \
             --clobber

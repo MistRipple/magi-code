@@ -35,10 +35,12 @@
   const runtimeInstalled = $derived(snapshot?.runtimeStatus === 'installed'
     || snapshot?.runtimeStatus === 'update_available'
     || snapshot?.runtimeStatus === 'update_required');
-  const runtimeInstallActionAvailable = $derived(snapshot?.runtimeStatus === 'not_installed'
-    || snapshot?.runtimeStatus === 'failed'
-    || snapshot?.runtimeStatus === 'update_available'
-    || snapshot?.runtimeStatus === 'update_required');
+  const runtimeInstallActionAvailable = $derived(!snapshot?.requiredMagiVersion && (
+    snapshot?.runtimeStatus === 'not_installed'
+      || snapshot?.runtimeStatus === 'failed'
+      || snapshot?.runtimeStatus === 'update_available'
+      || snapshot?.runtimeStatus === 'update_required'
+  ));
   const runtimeInstallActionLabel = $derived(snapshot?.runtimeStatus === 'update_available'
     || snapshot?.runtimeStatus === 'update_required'
     ? i18n.t('settings.browser.update')
@@ -112,6 +114,11 @@
     }
     if (action === 'uninstall') {
       return i18n.t('settings.browser.uninstallSucceeded');
+    }
+    if (next.requiredMagiVersion) {
+      return i18n.t('settings.browser.magiUpdateRequired', {
+        version: next.requiredMagiVersion,
+      });
     }
     if (next.availableRuntimeVersion) {
       return i18n.t('settings.browser.updateAvailable', {
@@ -279,6 +286,11 @@
         <div class="runtime-error" role="status">
           <Icon name="alert-circle" size={14} />
           <span>{loadError}</span>
+        </div>
+      {:else if snapshot?.requiredMagiVersion}
+        <div class="runtime-warning" role="status">
+          <Icon name="alert-circle" size={14} />
+          <span>{i18n.t('settings.browser.magiUpdateRequired', { version: snapshot.requiredMagiVersion })}</span>
         </div>
       {:else if snapshot?.lastErrorCode}
         <div class="runtime-error" role="status">
@@ -494,6 +506,7 @@
   }
 
   .runtime-error,
+  .runtime-warning,
   .runtime-feedback {
     display: flex;
     align-items: center;
@@ -503,6 +516,7 @@
   }
 
   .runtime-error { color: var(--danger, #c53f4f); }
+  .runtime-warning { color: var(--warning, #b7791f); }
   .runtime-feedback { color: var(--success, #2f9e63); }
 
   .icon-action--loading :global(svg) {

@@ -2316,6 +2316,7 @@
   "settings.browser.actionFailed": "浏览器运行组件操作失败。",
   "settings.browser.refreshSucceeded": "运行状态已刷新",
   "settings.browser.updateAvailable": "发现可用浏览器组件 {version}",
+  "settings.browser.magiUpdateRequired": "Browser Runtime 需要 Magi {version} 或更高版本，请先更新 Magi；当前浏览器继续可用。",
   "settings.browser.upToDate": "浏览器组件当前已是最新版本",
   "settings.browser.installSucceeded": "浏览器组件已安装并自动启动",
   "settings.browser.uninstallSucceeded": "浏览器组件已卸载",

@@ -42,6 +42,7 @@ jobs:
     outputs:
       magi_version: ${{ steps.release.outputs.magi_version }}
       runtime_version: ${{ steps.release.outputs.runtime_version }}
+      minimum_magi_version: ${{ steps.release.outputs.minimum_magi_version }}
       manifest_sequence: ${{ steps.release.outputs.manifest_sequence }}
       expires_days: ${{ steps.release.outputs.expires_days }}
       update_level: ${{ steps.release.outputs.update_level }}
@@ -56,11 +57,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          magi_version="$(node -p "require('./web/package.json').version")"
+          magi_version="$(node scripts/product-version.mjs)"
+          minimum_magi_version="$magi_version"
+          desktop_feed_dir="$(mktemp -d)"
+          if gh release view magi-desktop-stable --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download magi-desktop-stable \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern 'latest.json' \
+              --dir "$desktop_feed_dir" \
+              --clobber
+            minimum_magi_version="$(node -e "const fs=require('node:fs'); const m=JSON.parse(fs.readFileSync(process.argv[1], 'utf8')); process.stdout.write(m.version || '')" "$desktop_feed_dir/latest.json")"
+            node -e "const parse=(value)=>{const match=/^(\\d+)\\.(\\d+)\\.(\\d+)(?:[-+].*)?$/.exec(value); if (!match) process.exit(1); return match.slice(1,4).map(Number)}; const compare=(a,b)=>{for(let i=0;i<3;i+=1){if(a[i]!==b[i]) return a[i]-b[i]} return 0}; if (compare(parse(process.argv[2]), parse(process.argv[1])) > 0) process.exit(1)" "$magi_version" "$minimum_magi_version"
+          fi
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             tag_version="${GITHUB_REF_NAME#v}"
             test "$tag_version" = "$magi_version" || {
-              echo "产品标签 $tag_version 与 web/package.json 版本 $magi_version 不一致。" >&2
+              echo "产品标签 $tag_version 与 Cargo workspace 版本 $magi_version 不一致。" >&2
               exit 1
             }
           fi
@@ -104,6 +116,7 @@ jobs:
           {
             echo "magi_version=$magi_version"
             echo "runtime_version=$magi_version"
+            echo "minimum_magi_version=$minimum_magi_version"
             echo "manifest_sequence=$manifest_sequence"
             echo "expires_days=$expires_days"
             echo "update_level=$update_level"
@@ -198,6 +211,7 @@ jobs:
           }
           magi_version="${{ needs.prepare-release.outputs.magi_version }}"
           runtime_version="${{ needs.prepare-release.outputs.runtime_version }}"
+          minimum_magi_version="${{ needs.prepare-release.outputs.minimum_magi_version }}"
           sequence="${{ needs.prepare-release.outputs.manifest_sequence }}"
           expires_days="${{ needs.prepare-release.outputs.expires_days }}"
           update_level="${{ needs.prepare-release.outputs.update_level }}"
@@ -226,7 +240,7 @@ jobs:
             --arch '${{ matrix.runtime_arch }}' \
             --manifest-sequence "$sequence" \
             --expires-days "$expires_days" \
-            --minimum-magi-version "$magi_version" \
+            --minimum-magi-version "$minimum_magi_version" \
             --minimum-safe-runtime-version "$runtime_version" \
             --node-executable-path "$node_path" \
             --host-entry-path "$host_path" \
@@ -271,14 +285,9 @@ jobs:
           runtime_tag="browser-runtime-v${runtime_version}"
           gh release view "$runtime_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$runtime_tag" --repo "$GITHUB_REPOSITORY" --title "Magi Browser Runtime ${runtime_tag#browser-runtime-v}" --notes 'Magi 独立 Browser Runtime 组件。'
-          gh release upload "$runtime_tag" --repo "$GITHUB_REPOSITORY" dist/browser-runtime/magi-browser-runtime-*.tar.zst dist/browser-runtime/signed-release-*.json --clobber
-
-      - name: 更新稳定版 Runtime Feed
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release view browser-runtime-stable --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create browser-runtime-stable --repo "$GITHUB_REPOSITORY" --title 'Magi Browser Runtime Stable Feed' --notes '由 Browser Runtime 发布工作流维护。'
-          gh release upload browser-runtime-stable --repo "$GITHUB_REPOSITORY" dist/browser-runtime/release-*.json --clobber
+          gh release upload "$runtime_tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            dist/browser-runtime/magi-browser-runtime-*.tar.zst \
+            dist/browser-runtime/signed-release-*.json \
+            dist/browser-runtime/release-*.json \
+            --clobber

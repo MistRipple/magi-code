@@ -2316,6 +2316,7 @@
   "settings.browser.actionFailed": "The browser runtime operation failed.",
   "settings.browser.refreshSucceeded": "Runtime status refreshed",
   "settings.browser.updateAvailable": "Browser component {version} is available",
+  "settings.browser.magiUpdateRequired": "Browser Runtime requires Magi {version} or later. Update Magi first; the current browser remains available.",
   "settings.browser.upToDate": "The browser component is up to date",
   "settings.browser.installSucceeded": "Browser components installed and started",
   "settings.browser.uninstallSucceeded": "Browser components uninstalled",

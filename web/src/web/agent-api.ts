@@ -921,6 +921,7 @@ export interface BrowserCapabilitiesSnapshot {
   playwrightVersion: string | null;
   chromiumVersion: string | null;
   availableRuntimeVersion: string | null;
+  requiredMagiVersion: string | null;
   updateLevel: 'optional' | 'recommended' | 'required_security' | null;
   componentManagementAvailable: boolean;
   lastErrorCode: string | null;

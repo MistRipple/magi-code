@@ -397,7 +397,10 @@ async fn check_for_component_updates(
         .map_err(|error| format!("读取浏览器安装状态任务异常退出: {error}"))?
         .map_err(|error| format!("读取浏览器安装状态失败: {error}"))?
         .is_some();
-    let component_status = if !assessment.requires_install {
+    let current = state.browser_runtime_status();
+    let component_status = if assessment.magi_update_required {
+        current.component_status
+    } else if !assessment.requires_install {
         BrowserRuntimeComponentStatus::Installed
     } else if !installed {
         BrowserRuntimeComponentStatus::NotInstalled
@@ -406,15 +409,17 @@ async fn check_for_component_updates(
     } else {
         BrowserRuntimeComponentStatus::UpdateAvailable
     };
-    let mut status = state.browser_runtime_status();
+    let mut status = current;
     status.component_status = component_status;
     status.runtime_mode = "managed".to_string();
     status.component_management_available = true;
     status.available_runtime_version = assessment
         .requires_install
         .then(|| assessment.runtime_version.to_string());
-    status.update_level = assessment
-        .requires_install
+    status.required_magi_version = assessment
+        .magi_update_required
+        .then(|| assessment.minimum_magi_version.to_string());
+    status.update_level = (!assessment.magi_update_required && assessment.requires_install)
         .then_some(assessment.update_level);
     status.last_error_code = None;
     state.set_browser_runtime_status(status);
@@ -422,7 +427,7 @@ async fn check_for_component_updates(
     Ok(BrowserRuntimeComponentOperation {
         action: BrowserRuntimeComponentAction::CheckForUpdates,
         runtime_version: Some(assessment.runtime_version.to_string()),
-        update_available: assessment.requires_install,
+        update_available: !assessment.magi_update_required && assessment.requires_install,
     })
 }
 
@@ -442,11 +447,18 @@ async fn install_component(
     .await
     .map_err(|error| format!("浏览器安装评估任务异常退出: {error}"))?
     .map_err(|error| format!("浏览器安装清单校验失败: {error}"))?;
+    if assessment.magi_update_required {
+        return Err(format!(
+            "请先将 Magi 更新到 {} 或更高版本，再安装 Browser Runtime {}",
+            assessment.minimum_magi_version, assessment.runtime_version
+        ));
+    }
     if !assessment.requires_install {
         ensure_managed_host_ready(state, &manager, supervisor).await?;
         let mut status = state.browser_runtime_status();
         status.component_status = BrowserRuntimeComponentStatus::Installed;
         status.available_runtime_version = None;
+        status.required_magi_version = None;
         status.update_level = None;
         status.last_error_code = None;
         state.set_browser_runtime_status(status);
@@ -553,6 +565,7 @@ async fn ensure_managed_host_ready(
         status.host_version = Some(config.host_version.clone());
         status.playwright_version = Some(config.playwright_version.clone());
         status.available_runtime_version = None;
+        status.required_magi_version = None;
         status.update_level = None;
         status.component_management_available = true;
         status.last_error_code = None;
@@ -621,6 +634,7 @@ fn update_component_operation_status(
     status.component_status = component_status;
     status.runtime_mode = "managed".to_string();
     status.available_runtime_version = available_runtime_version;
+    status.required_magi_version = None;
     status.update_level = update_level;
     status.component_management_available = true;
     status.last_error_code = error_code.clone();
@@ -647,6 +661,7 @@ fn set_component_state(
     status.playwright_version = None;
     status.chromium_version = None;
     status.available_runtime_version = None;
+    status.required_magi_version = None;
     status.update_level = None;
     status.component_management_available = management_available;
     status.last_error_code = error_code.clone();
@@ -1894,6 +1909,7 @@ fn set_runtime_status(
                 })
             }),
         available_runtime_version: previous.available_runtime_version,
+        required_magi_version: previous.required_magi_version,
         update_level: previous.update_level,
         component_management_available: if config.runtime_mode == "development" {
             false
