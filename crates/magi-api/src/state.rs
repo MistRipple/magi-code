@@ -2685,15 +2685,14 @@ impl ApiState {
             .clone();
         let mut candidate = current;
         let output = mutation(&mut candidate).map_err(browser_authority_api_error)?;
-        if persist {
-            if let Some(persistence) = &self.runtime_persistence
-                && let Some(state_root) = persistence.state_root()
-            {
-                persistence.save_json(
-                    &state_root.join("browser/state.json"),
-                    &candidate.durable_state(),
-                )?;
-            }
+        if persist
+            && let Some(persistence) = &self.runtime_persistence
+            && let Some(state_root) = persistence.state_root()
+        {
+            persistence.save_json(
+                &state_root.join("browser/state.json"),
+                &candidate.durable_state(),
+            )?;
         }
         *self
             .browser_authority
