@@ -184,18 +184,18 @@ await withGoldenViteServer(async (server) => {
   );
   assert.match(
     browserPaneSource,
-    /controllerId: viewportControllerId,[\s\S]*?claim,/,
-    'panel viewport sync must carry a stable controller identity and explicit takeover flag',
+    /controllerId: viewportControllerId,/,
+    'each browser pane must carry its stable physical View identity when changing viewport',
   );
   assert.match(
     browserPaneSource,
-    /magi:browserViewportControllerClaim/,
-    'manual panel resizing must reclaim the single viewport writer',
+    /browserChannelUrl\([\s\S]*?viewportControllerId,[\s\S]*?initialViewport,[\s\S]*?\)/,
+    'the browser channel must bind its initial surface size to the same physical View',
   );
   assert.match(
     browserPaneSource,
-    /window\.addEventListener\('focus', reclaimViewportControl\)[\s\S]*?document\.addEventListener\('visibilitychange', reclaimViewportControl\)/,
-    'a Magi window must reclaim its BrowserTab viewport when it becomes active',
+    /releaseBrowserTabViewportController\(targetTabId, viewportControllerId\)/,
+    'unmounting a browser pane must release only its physical View binding',
   );
   assert.match(
     browserPaneSource,
