@@ -807,8 +807,8 @@ export async function closeTerminalSession(request: TerminalSessionRequest): Pro
   if (!response.ok) await parseAgentJson(response, 'close terminal session');
 }
 
-export type BrowserSessionLifecycle = 'creating' | 'ready' | 'recovering' | 'failed' | 'closed';
-export type BrowserTabLifecycle = 'creating' | 'ready' | 'crashed' | 'closed';
+export type BrowserSessionLifecycle = 'creating' | 'ready' | 'recovering' | 'interrupted' | 'failed' | 'closed';
+export type BrowserTabLifecycle = 'creating' | 'ready' | 'suspended' | 'crashed' | 'closed';
 export type BrowserControlMode = 'agent' | 'user';
 export type BrowserViewportMode = 'auto' | 'fixed';
 export type BrowserDeviceType = 'desktop' | 'mobile';
@@ -1024,7 +1024,6 @@ export async function setBrowserTabViewport(
         width: number;
         height: number;
         controllerId: string;
-        claim: boolean;
       }
     | {
         action: 'set';
@@ -1048,6 +1047,21 @@ export async function setBrowserTabViewport(
   return parseAgentJson<BrowserTabSnapshot>(response, 'resize browser tab viewport');
 }
 
+export async function releaseBrowserTabViewportController(
+  tabId: string,
+  controllerId: string,
+): Promise<void> {
+  const response = await getTransport().request(
+    agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/viewport-controller`),
+    {
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ controllerId }),
+    },
+  );
+  if (!response.ok) await parseAgentJson(response, 'release browser viewport controller');
+}
+
 export async function closeBrowserTab(tabId: string): Promise<void> {
   const response = await getTransport().request(
     agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}`),
@@ -1060,13 +1074,18 @@ export async function navigateBrowserTab(
   tabId: string,
   action: 'url' | 'back' | 'forward' | 'reload',
   url?: string,
+  viewId?: string,
 ): Promise<BrowserTabSnapshot> {
   const response = await getTransport().request(
     agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/navigation`),
     {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ action, ...(url ? { url } : {}) }),
+      body: JSON.stringify({
+        action,
+        ...(url ? { url } : {}),
+        ...(viewId ? { viewId } : {}),
+      }),
     },
   );
   return parseAgentJson<BrowserTabSnapshot>(response, 'navigate browser tab');
@@ -1089,13 +1108,14 @@ export async function createBrowserAnnotation(
   tabId: string,
   selection: BrowserAnnotationSelection,
   comment: string,
+  viewId?: string,
 ): Promise<BrowserAnnotationSnapshot> {
   const response = await getTransport().request(
     agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/annotations`),
     {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ selection, comment }),
+      body: JSON.stringify({ selection, comment, ...(viewId ? { viewId } : {}) }),
     },
   );
   return parseAgentJson<BrowserAnnotationSnapshot>(response, 'create browser annotation');
@@ -1105,16 +1125,18 @@ export function createBrowserElementAnnotation(
   tabId: string,
   selection: Omit<Extract<BrowserAnnotationSelection, { kind: 'element' }>, 'kind'>,
   comment: string,
+  viewId?: string,
 ): Promise<BrowserAnnotationSnapshot> {
-  return createBrowserAnnotation(tabId, { kind: 'element', ...selection }, comment);
+  return createBrowserAnnotation(tabId, { kind: 'element', ...selection }, comment, viewId);
 }
 
 export function createBrowserRegionAnnotation(
   tabId: string,
   selection: Omit<Extract<BrowserAnnotationSelection, { kind: 'region' }>, 'kind'>,
   comment: string,
+  viewId?: string,
 ): Promise<BrowserAnnotationSnapshot> {
-  return createBrowserAnnotation(tabId, { kind: 'region', ...selection }, comment);
+  return createBrowserAnnotation(tabId, { kind: 'region', ...selection }, comment, viewId);
 }
 
 export async function updateBrowserAnnotationStatus(
@@ -1147,8 +1169,10 @@ export async function updateBrowserAnnotationComment(
   return parseAgentJson<BrowserAnnotationSnapshot>(response, 'update browser annotation comment');
 }
 
-export function browserScreenshotUrl(tabId: string): string {
-  return agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/screenshot`);
+export function browserScreenshotUrl(tabId: string, viewId?: string): string {
+  const url = new URL(agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/screenshot`));
+  if (viewId) url.searchParams.set('viewId', viewId);
+  return url.toString();
 }
 
 export function browserAnnotationArtifactUrl(annotationId: string, sessionId: string): string {
@@ -1174,8 +1198,15 @@ export async function writeBrowserClipboardText(text: string): Promise<void> {
   if (!response.ok) await parseAgentJson(response, 'write browser clipboard');
 }
 
-export function browserChannelUrl(tabId: string): string {
+export function browserChannelUrl(
+  tabId: string,
+  viewId: string,
+  viewport: { width: number; height: number },
+): string {
   const url = new URL(agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/channel`));
+  url.searchParams.set('viewId', viewId);
+  url.searchParams.set('width', String(Math.round(viewport.width)));
+  url.searchParams.set('height', String(Math.round(viewport.height)));
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   return url.toString();
 }
@@ -1478,6 +1509,7 @@ export interface AgentFileRevealTarget {
   targetPathRef: string;
   workspaceRootPathRef: string;
   displayPath: string;
+  ancestorPathRefs: string[];
 }
 
 function throwNormalizedDirectoryError(error: unknown): never {

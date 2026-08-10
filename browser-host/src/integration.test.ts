@@ -1252,6 +1252,114 @@ test(
   },
 );
 
+test(
+  "restored tabs occupy a Chromium slot only while materialized",
+  { skip: !chromiumExecutable, timeout: 30_000 },
+  async () => {
+    const profilePath = await mkdtemp(join(tmpdir(), "magi-browser-host-restore-"));
+    const token = "browser-host-restore-token-00000000000000";
+    let hostServer: Awaited<ReturnType<typeof startBrowserHostServer>> | undefined;
+    let client: HostTestClient | undefined;
+    const viewport = {
+      width: 900,
+      height: 700,
+      surface_width: 900,
+      surface_height: 700,
+      device_scale_factor_millis: 1_000,
+      device_type: "desktop" as const,
+    };
+
+    try {
+      hostServer = await startBrowserHostServer({
+        profilePath,
+        chromiumExecutable: chromiumExecutable!,
+        runtimeVersion: "test-runtime",
+        hostVersion: "0.1.0",
+        playwrightVersion: "1.58.2",
+        runtimeEpoch: 2,
+        headless: true,
+        deviceScaleFactor: 2,
+        downloadPath: join(profilePath, "downloads"),
+        maxActivePages: 1,
+        maxTabs: 4,
+        bindHost: "127.0.0.1",
+        port: 0,
+        authToken: token,
+      });
+      client = new HostTestClient(
+        `ws://127.0.0.1:${hostServer.port}/control`,
+        token,
+      );
+      await client.open();
+      await client.waitForEvent("ready");
+
+      const firstActivation = await client.call({
+        type: "restore_page",
+        payload: {
+          tab_id: "restored-a",
+          initial_url: "about:blank",
+          viewport,
+          navigation_revision: 0,
+          snapshot_revision: 0,
+          allow_streaming_eviction: true,
+        },
+      });
+      assert.equal(firstActivation.outcome.status, "succeeded");
+      const screencast = await client.call({
+        type: "start_screencast",
+        payload: {
+          tab_id: "restored-a",
+          format: "jpeg",
+          quality: 80,
+          max_width: 900,
+          max_height: 700,
+        },
+      });
+      assert.equal(screencast.outcome.status, "succeeded");
+
+      const secondActivation = await client.call({
+        type: "restore_page",
+        payload: {
+          tab_id: "restored-b",
+          initial_url: "about:blank",
+          viewport,
+          navigation_revision: 0,
+          snapshot_revision: 0,
+          allow_streaming_eviction: true,
+        },
+      });
+      assert.equal(secondActivation.outcome.status, "succeeded");
+      const suspended = await client.waitForEvent("page_suspended");
+      assert.equal(suspended.event.type, "page_suspended");
+      if (suspended.event.type === "page_suspended") {
+        assert.equal(suspended.event.payload.tab_id, "restored-a");
+      }
+
+      const thirdActivation = await client.call({
+        type: "restore_page",
+        payload: {
+          tab_id: "restored-a",
+          initial_url: "about:blank",
+          viewport,
+          navigation_revision: 1,
+          snapshot_revision: 1,
+          allow_streaming_eviction: true,
+        },
+      });
+      assert.equal(thirdActivation.outcome.status, "succeeded");
+      const suspendedAgain = await client.waitForEvent("page_suspended");
+      assert.equal(suspendedAgain.event.type, "page_suspended");
+      if (suspendedAgain.event.type === "page_suspended") {
+        assert.equal(suspendedAgain.event.payload.tab_id, "restored-b");
+      }
+    } finally {
+      client?.close();
+      await hostServer?.close();
+      await rm(profilePath, { recursive: true, force: true });
+    }
+  },
+);
+
 async function waitForScreencastFrame(
   client: HostTestClient,
   matches: (event: EventEnvelope) => boolean,

@@ -410,14 +410,20 @@ impl BrowserRuntimeManager {
                 received: manifest.manifest_sequence,
             });
         }
-        if enforce_magi_version && self.config.magi_version < manifest.minimum_magi_version {
+        let magi_version_supported = self.config.magi_version >= manifest.minimum_magi_version;
+        if enforce_magi_version && !magi_version_supported {
             return Err(BrowserRuntimeComponentError::MagiVersionTooOld {
                 minimum: manifest.minimum_magi_version.clone(),
                 current: self.config.magi_version.clone(),
             });
         }
-        if !manifest.host_protocol.is_valid()
-            || !manifest
+        if !manifest.host_protocol.is_valid() {
+            return Err(BrowserRuntimeComponentError::HostProtocolIncompatible);
+        }
+        // 更新检查必须先能识别“需要升级 Magi”。当清单明确要求更高版本 Magi 时，
+        // 当前进程的 Host 协议不兼容是预期结果；安装阶段仍由版本门禁先行拒绝。
+        if magi_version_supported
+            && !manifest
                 .host_protocol
                 .contains(self.config.host_protocol_version)
         {

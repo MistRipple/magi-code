@@ -837,6 +837,100 @@ pub(crate) struct BrowserScreencastOptions {
     pub max_height: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BrowserViewBinding {
+    pub view_id: String,
+    pub tab_id: BrowserTabId,
+    pub host_tab_id: BrowserTabId,
+    pub host_generation: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct BrowserViewRegistry {
+    bindings: Mutex<HashMap<(BrowserTabId, String), BrowserViewBinding>>,
+}
+
+impl BrowserViewRegistry {
+    pub(crate) fn bind(
+        &self,
+        tab_id: BrowserTabId,
+        view_id: String,
+        host_tab_id: BrowserTabId,
+        host_generation: u64,
+    ) -> (BrowserViewBinding, Option<BrowserViewBinding>) {
+        let binding = BrowserViewBinding {
+            view_id: view_id.clone(),
+            tab_id: tab_id.clone(),
+            host_tab_id,
+            host_generation,
+        };
+        let previous = self
+            .bindings
+            .lock()
+            .expect("browser view registry lock poisoned")
+            .insert((tab_id, view_id), binding.clone());
+        (binding, previous)
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        tab_id: &BrowserTabId,
+        view_id: &str,
+        host_generation: u64,
+    ) -> Option<BrowserViewBinding> {
+        self.bindings
+            .lock()
+            .expect("browser view registry lock poisoned")
+            .get(&(tab_id.clone(), view_id.to_string()))
+            .filter(|binding| binding.host_generation == host_generation)
+            .cloned()
+    }
+
+    pub(crate) fn release(&self, binding: &BrowserViewBinding) -> bool {
+        let mut bindings = self
+            .bindings
+            .lock()
+            .expect("browser view registry lock poisoned");
+        let key = (binding.tab_id.clone(), binding.view_id.clone());
+        if bindings.get(&key).is_some_and(|current| current == binding) {
+            bindings.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn remove_for_tab(&self, tab_id: &BrowserTabId) -> Vec<BrowserViewBinding> {
+        let mut bindings = self
+            .bindings
+            .lock()
+            .expect("browser view registry lock poisoned");
+        let keys = bindings
+            .keys()
+            .filter(|(candidate, _)| candidate == tab_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| bindings.remove(&key))
+            .collect()
+    }
+
+    pub(crate) fn remove_for_session(&self, tab_ids: &[BrowserTabId]) -> Vec<BrowserViewBinding> {
+        let mut bindings = self
+            .bindings
+            .lock()
+            .expect("browser view registry lock poisoned");
+        let keys = bindings
+            .keys()
+            .filter(|(candidate, _)| tab_ids.iter().any(|tab_id| tab_id == candidate))
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| bindings.remove(&key))
+            .collect()
+    }
+}
+
 #[derive(Debug, Default)]
 struct BrowserScreencastEntry {
     host_generation: u64,
@@ -1171,7 +1265,7 @@ pub struct ApiState {
     pub browser_authority: Arc<Mutex<BrowserAuthority>>,
     browser_write_lock: Arc<Mutex<()>>,
     pub(crate) browser_control_lock: Arc<tokio::sync::Mutex<()>>,
-    pub(crate) browser_viewport_controllers: Arc<Mutex<HashMap<BrowserTabId, String>>>,
+    pub(crate) browser_views: Arc<BrowserViewRegistry>,
     pub(crate) browser_screencasts: Arc<BrowserScreencastCoordinator>,
     browser_state_writable: Arc<AtomicBool>,
     browser_runtime_status: Arc<RwLock<BrowserRuntimeStatusSnapshot>>,
@@ -1421,7 +1515,7 @@ impl ApiState {
         let browser_authority = Arc::new(Mutex::new(BrowserAuthority::new()));
         let browser_write_lock = Arc::new(Mutex::new(()));
         let browser_control_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let browser_viewport_controllers = Arc::new(Mutex::new(HashMap::new()));
+        let browser_views = Arc::new(BrowserViewRegistry::default());
         let browser_screencasts = Arc::new(BrowserScreencastCoordinator::default());
         let browser_host_client = Arc::new(RwLock::new(None));
         let execution_resources = ExecutionResourceCoordinator::new(
@@ -1464,7 +1558,7 @@ impl ApiState {
             browser_authority,
             browser_write_lock,
             browser_control_lock,
-            browser_viewport_controllers,
+            browser_views,
             browser_screencasts,
             browser_state_writable: Arc::new(AtomicBool::new(true)),
             browser_runtime_status: Arc::new(RwLock::new(BrowserRuntimeStatusSnapshot::default())),
@@ -1952,13 +2046,14 @@ impl ApiState {
         Ok(())
     }
 
-    pub fn set_browser_host_client(&self, client: Option<BrowserHostClient>) {
+    pub fn set_browser_host_client(&self, client: Option<BrowserHostClient>) -> u64 {
         let mut current = self
             .browser_host_client
             .write()
             .expect("browser Host client lock poisoned");
         *current = client;
         self.browser_screencasts.advance_host_generation();
+        self.browser_screencasts.host_generation()
     }
 
     pub fn browser_host_client(&self) -> Option<BrowserHostClient> {
@@ -1976,6 +2071,10 @@ impl ApiState {
         current
             .clone()
             .map(|client| (client, self.browser_screencasts.host_generation()))
+    }
+
+    pub fn browser_host_generation(&self) -> u64 {
+        self.browser_screencasts.host_generation()
     }
 
     pub fn set_browser_runtime_control(&self, control: BrowserRuntimeControlClient) {
@@ -2550,6 +2649,26 @@ impl ApiState {
         &self,
         mutation: impl FnOnce(&mut BrowserAuthority) -> Result<T, BrowserAuthorityError>,
     ) -> Result<T, ApiError> {
+        self.mutate_browser_authority_with_persistence(true, mutation)
+    }
+
+    /// 修改浏览器运行态但不写入 browser/state.json。
+    ///
+    /// viewport 属于当前父容器的运行时布局，不是会话文档状态。多个 Magi
+    /// 窗口可以同时观察同一 URL，因此 viewport 更新必须留在内存中，避免
+    /// 某个窗口的面板尺寸污染下次启动或覆盖另一个窗口的布局。
+    pub fn mutate_browser_authority_transient<T>(
+        &self,
+        mutation: impl FnOnce(&mut BrowserAuthority) -> Result<T, BrowserAuthorityError>,
+    ) -> Result<T, ApiError> {
+        self.mutate_browser_authority_with_persistence(false, mutation)
+    }
+
+    fn mutate_browser_authority_with_persistence<T>(
+        &self,
+        persist: bool,
+        mutation: impl FnOnce(&mut BrowserAuthority) -> Result<T, BrowserAuthorityError>,
+    ) -> Result<T, ApiError> {
         if !self.browser_state_writable.load(Ordering::Acquire) {
             return Err(ApiError::Conflict(
                 "浏览器状态文件无效，修复前不能修改浏览器状态".to_string(),
@@ -2566,46 +2685,21 @@ impl ApiState {
             .clone();
         let mut candidate = current;
         let output = mutation(&mut candidate).map_err(browser_authority_api_error)?;
-        if let Some(persistence) = &self.runtime_persistence
-            && let Some(state_root) = persistence.state_root()
-        {
-            persistence.save_json(
-                &state_root.join("browser/state.json"),
-                &candidate.durable_state(),
-            )?;
+        if persist {
+            if let Some(persistence) = &self.runtime_persistence
+                && let Some(state_root) = persistence.state_root()
+            {
+                persistence.save_json(
+                    &state_root.join("browser/state.json"),
+                    &candidate.durable_state(),
+                )?;
+            }
         }
         *self
             .browser_authority
             .lock()
             .expect("browser authority lock poisoned") = candidate;
         Ok(output)
-    }
-
-    pub(crate) fn accept_browser_viewport_controller(
-        &self,
-        tab_id: &BrowserTabId,
-        controller_id: &str,
-        claim: bool,
-    ) -> bool {
-        let mut controllers = self
-            .browser_viewport_controllers
-            .lock()
-            .expect("browser viewport controller lock poisoned");
-        match controllers.get(tab_id) {
-            Some(current) if current == controller_id => true,
-            Some(_) if !claim => false,
-            _ => {
-                controllers.insert(tab_id.clone(), controller_id.to_string());
-                true
-            }
-        }
-    }
-
-    pub(crate) fn clear_browser_viewport_controller(&self, tab_id: &BrowserTabId) {
-        self.browser_viewport_controllers
-            .lock()
-            .expect("browser viewport controller lock poisoned")
-            .remove(tab_id);
     }
 
     pub fn record_browser_frame(
@@ -4034,7 +4128,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_viewport_controller_enforces_single_writer_until_explicit_claim() {
+    fn browser_views_are_isolated_by_tab_and_panel_instance() {
         let state = ApiState::new(
             "magi-test",
             Arc::new(InMemoryEventBus::new(32)),
@@ -4042,16 +4136,52 @@ mod tests {
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         );
-        let tab_id = BrowserTabId::new("browser-tab-viewport-controller");
-
-        assert!(state.accept_browser_viewport_controller(&tab_id, "controller-a", false));
-        assert!(state.accept_browser_viewport_controller(&tab_id, "controller-a", false));
-        assert!(!state.accept_browser_viewport_controller(&tab_id, "controller-b", false));
-        assert!(state.accept_browser_viewport_controller(&tab_id, "controller-b", true));
-        assert!(!state.accept_browser_viewport_controller(&tab_id, "controller-a", false));
-
-        state.clear_browser_viewport_controller(&tab_id);
-        assert!(state.accept_browser_viewport_controller(&tab_id, "controller-a", false));
+        let tab_id = BrowserTabId::new("browser-tab-view-registry");
+        let first_host_tab_id = BrowserTabId::new("browser-view-first");
+        let second_host_tab_id = BrowserTabId::new("browser-view-second");
+        let (first, previous) = state.browser_views.bind(
+            tab_id.clone(),
+            "panel-first".to_string(),
+            first_host_tab_id,
+            7,
+        );
+        assert!(previous.is_none());
+        let (second, previous) = state.browser_views.bind(
+            tab_id.clone(),
+            "panel-second".to_string(),
+            second_host_tab_id,
+            7,
+        );
+        assert!(previous.is_none());
+        assert_eq!(
+            state
+                .browser_views
+                .resolve(&tab_id, "panel-first", 7)
+                .expect("first view should resolve")
+                .host_tab_id,
+            first.host_tab_id
+        );
+        assert_eq!(
+            state
+                .browser_views
+                .resolve(&tab_id, "panel-second", 7)
+                .expect("second view should resolve")
+                .host_tab_id,
+            second.host_tab_id
+        );
+        assert!(
+            state
+                .browser_views
+                .resolve(&tab_id, "panel-first", 8)
+                .is_none()
+        );
+        assert!(state.browser_views.release(&first));
+        assert!(
+            state
+                .browser_views
+                .resolve(&tab_id, "panel-second", 7)
+                .is_some()
+        );
     }
 
     #[test]

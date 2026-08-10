@@ -5,10 +5,16 @@
   } from '../stores/messages.svelte';
   import { vscode } from '../lib/vscode-bridge';
   import { ensureArray } from '../lib/utils';
-  import { changeDiffRevision, openCodeTab } from '../stores/right-pane.svelte';
+  import {
+    changeDiffRevision,
+    getRightPaneState,
+    openCodeTab,
+    rightPaneState,
+    type CodeTabPayload,
+  } from '../stores/right-pane.svelte';
   import type { Edit } from '../types/message';
-  import type { IconName } from '../lib/icons';
   import Icon from './Icon.svelte';
+  import ChangeFileTree from './ChangeFileTree.svelte';
   import GitRepositoryPanel from './GitRepositoryPanel.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import {
@@ -53,22 +59,6 @@
     currentRoundEdits.length > 0 && currentRoundEdits.every((edit) => edit.revertible === true)
   );
 
-  // 拆分文件名和目录
-  function splitPath(filePath: string): { dir: string; name: string } {
-    const lastSlash = filePath.lastIndexOf('/');
-    if (lastSlash === -1) return { dir: '', name: filePath };
-    return { dir: filePath.substring(0, lastSlash + 1), name: filePath.substring(lastSlash + 1) };
-  }
-
-  // 文件类型图标名
-  function getFileIconName(edit: Edit): IconName {
-    if (edit?.type === 'add') return 'file-plus';
-    if (edit?.type === 'delete') return 'file-minus';
-    if (edit?.type === 'modify') return 'file-edit';
-    if (edit?.type === 'rename') return 'git-branch';
-    return 'file-text';
-  }
-
   function editScope(edit?: Edit): { sessionId?: string; workspaceId?: string; workspacePath?: string } {
     return {
       sessionId: edit?.sessionId?.trim() || getCurrentSessionId() || undefined,
@@ -102,6 +92,13 @@
     scopeMatchesActiveChangeMutation(editScope(currentRoundEdits[0] ?? earlierPendingEdits[0] ?? edits[0]))
   ));
 
+  const activeCodeFilePath = $derived.by(() => {
+    const pane = getRightPaneState(rightPaneState.activeScopeKey);
+    if (!pane.activeTabId) return '';
+    const tab = pane.openTabs.find((item) => item.id === pane.activeTabId);
+    return tab?.kind === 'code' ? (tab.payload as CodeTabPayload).filepath : '';
+  });
+
   function approveChange(edit: Edit) {
     if (changeMutationPending) return;
     vscode.postMessage({ type: 'approveChange', filePath: edit.filePath, ...editScope(edit) });
@@ -132,12 +129,6 @@
       executionGroupId: latestExecutionGroupId,
       ...editScope(currentRoundEdits[0]),
     });
-  }
-
-  function editTitle(edit: Edit): string {
-    return edit.type === 'rename' && edit.oldPath
-      ? `${edit.oldPath} → ${edit.filePath}`
-      : edit.filePath;
   }
 
   /**
@@ -260,119 +251,7 @@
     });
   }
 
-  function getEditKey(edit: Edit): string {
-    return `${edit.filePath}::${edit.executionGroupId ?? 'none'}::${edit.snapshotId ?? 'na'}`;
-  }
-
-  function formatSize(size?: number): string {
-    if (typeof size !== 'number' || !Number.isFinite(size) || size < 0) {
-      return '-';
-    }
-    if (size < 1024) return `${size} B`;
-    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-    if (size < 1024 * 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-  }
-
-  function contentKindLabel(kind?: string): string {
-    switch (kind) {
-      case 'binary':
-        return i18n.t('edits.kind.binary');
-      case 'large_text':
-        return i18n.t('edits.kind.largeText');
-      case 'symlink':
-        return i18n.t('edits.kind.symlink');
-      case 'special':
-        return i18n.t('edits.kind.special');
-      default:
-        return i18n.t('edits.kind.text');
-    }
-  }
-
-  function editActorPresentation(edit: Edit): {
-    kind: 'mainline' | 'agent' | 'external';
-    label: string;
-    title: string;
-  } | null {
-    if (edit.sourceKind === 'tool') {
-      if (edit.workerId?.trim()) {
-        return {
-          kind: 'agent',
-          label: i18n.t('edits.actor.agent'),
-          title: i18n.t('edits.actor.agentTitle'),
-        };
-      }
-      return {
-        kind: 'mainline',
-        label: i18n.t('edits.actor.mainline'),
-        title: i18n.t('edits.actor.mainlineTitle'),
-      };
-    }
-    if (edit.sourceKind === 'watcher' || edit.sourceKind === 'external') {
-      return {
-        kind: 'external',
-        label: i18n.t('edits.actor.external'),
-        title: i18n.t('edits.actor.externalTitle'),
-      };
-    }
-    return null;
-  }
 </script>
-
-{#snippet fileRow(edit: Edit)}
-  {@const { name } = splitPath(edit.filePath)}
-  {@const oldName = edit.oldPath ? splitPath(edit.oldPath).name : ''}
-  {@const kind = edit.contentKind ?? 'text'}
-  {@const isText = kind === 'text'}
-  {@const actor = editActorPresentation(edit)}
-  <div
-    class="file-row"
-    role="button"
-    tabindex="0"
-    onclick={() => viewDiff(edit)}
-    onkeydown={(e) => e.key === 'Enter' && viewDiff(edit)}
-    title={editTitle(edit)}
-  >
-    <div class="type-indicator" class:add={edit.type === 'add'} class:modify={edit.type === 'modify'} class:del={edit.type === 'delete'} class:rename={edit.type === 'rename'}></div>
-    <div class="file-icon" class:add={edit.type === 'add'} class:modify={edit.type === 'modify'} class:del={edit.type === 'delete'} class:rename={edit.type === 'rename'}>
-      <Icon name={getFileIconName(edit)} size={14} />
-    </div>
-    <div class="file-info">
-      <div class="file-primary">
-        {#if actor}
-          <span class="file-actor-tag actor-{actor.kind}" title={actor.title}>{actor.label}</span>
-        {/if}
-        {#if edit.type === 'rename' && oldName}
-          <span class="file-name rename-name"><span class="old-path">{oldName}</span><span class="rename-arrow">→</span><span>{name}</span></span>
-        {:else}
-          <span class="file-name">{name}</span>
-        {/if}
-        {#if !isText}
-          <span class="file-kind-tag" title={contentKindLabel(kind)}>{contentKindLabel(kind)}</span>
-        {/if}
-        {#if edit.hasError}
-          <span class="file-error-tag" title={i18n.t('edits.row.errorTitle')}>{i18n.t('edits.row.error')}</span>
-        {/if}
-      </div>
-    </div>
-    <div class="file-stats">
-      {#if isText}
-        <span class="stat-add">+{edit.additions ?? 0}</span>
-        <span class="stat-del">-{edit.deletions ?? 0}</span>
-      {:else}
-        <span class="stat-meta">{formatSize(edit.size)}</span>
-      {/if}
-    </div>
-    <div class="file-actions">
-      <button class="action-icon approve" type="button" disabled={changeMutationPending} title={i18n.t('edits.actions.approveChange')} onclick={(e) => { e.stopPropagation(); approveChange(edit); }}>
-        <Icon name="check" size={14} />
-      </button>
-      <button class="action-icon revert" type="button" disabled={changeMutationPending || edit.revertible !== true} title={edit.revertible === true ? i18n.t('edits.actions.revertChange') : i18n.t('edits.actions.revertUnavailable')} onclick={(e) => { e.stopPropagation(); revertChange(edit); }}>
-        <Icon name="undo" size={14} />
-      </button>
-    </div>
-  </div>
-{/snippet}
 
 <div class="panel-content-scrollable edits-panel">
   <GitRepositoryPanel />
@@ -391,11 +270,15 @@
             <span class="group-label">{i18n.t('edits.group.earlierPending')}</span>
             <span class="group-count">{i18n.t('edits.group.earlierPendingCount', { count: earlierPendingEdits.length })}</span>
           </div>
-          <div class="file-list">
-            {#each earlierPendingEdits as edit (getEditKey(edit))}
-              {@render fileRow(edit)}
-            {/each}
-          </div>
+          <ChangeFileTree
+            edits={earlierPendingEdits}
+            workspacePath={messagesState.currentWorkspacePath || ''}
+            activeFilePath={activeCodeFilePath}
+            changeMutationPending={changeMutationPending}
+            onOpen={viewDiff}
+            onApprove={approveChange}
+            onRevert={revertChange}
+          />
         </div>
       {/if}
 
@@ -450,11 +333,15 @@
               {/if}
             </div>
           </div>
-          <div class="file-list">
-            {#each displayedCurrentEdits as edit (getEditKey(edit))}
-              {@render fileRow(edit)}
-            {/each}
-          </div>
+          <ChangeFileTree
+            edits={displayedCurrentEdits}
+            workspacePath={messagesState.currentWorkspacePath || ''}
+            activeFilePath={activeCodeFilePath}
+            changeMutationPending={changeMutationPending}
+            onOpen={viewDiff}
+            onApprove={approveChange}
+            onRevert={revertChange}
+          />
         {/if}
       </div>
     </div>
@@ -463,11 +350,6 @@
 
 <style>
   .edits-panel {
-    --edits-card-bg: color-mix(in srgb, var(--surface-1) 88%, var(--background));
-    --edits-card-border: color-mix(in srgb, var(--border-subtle) 82%, transparent);
-    --edits-row-bg: color-mix(in srgb, var(--background) 62%, var(--surface-1));
-    --edits-row-bg-hover: color-mix(in srgb, var(--surface-hover) 86%, var(--surface-1));
-    --edits-row-border: color-mix(in srgb, var(--border-subtle) 76%, transparent);
     display: flex;
     flex-direction: column;
     height: 100%;
@@ -625,207 +507,8 @@
     font-weight: var(--font-semibold);
   }
 
-  .file-list {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    overflow: hidden;
-    border: 1px solid var(--edits-row-border);
-    border-radius: var(--radius-md);
-    background: var(--edits-row-border);
-  }
-
-  .file-row {
-    display: grid;
-    grid-template-columns: 3px 20px minmax(0, 1fr) auto auto;
-    grid-template-areas: "indicator icon info stats actions";
-    align-items: center;
-    gap: var(--space-2);
-    min-height: 42px;
-    padding: 0 var(--space-2);
-    background: var(--edits-row-bg);
-    cursor: pointer;
-    transition: background var(--transition-fast), box-shadow var(--transition-fast);
-  }
-
-  .file-row:hover {
-    background: var(--edits-row-bg-hover);
-  }
-
-  .type-indicator {
-    grid-area: indicator;
-    width: 3px;
-    height: 22px;
-    border-radius: 2px;
-    background: var(--foreground-muted);
-    opacity: 0.28;
-  }
-
-  .type-indicator.add { background: var(--success); opacity: 1; }
-  .type-indicator.modify { background: var(--warning); opacity: 1; }
-  .type-indicator.del { background: var(--error); opacity: 1; }
-  .type-indicator.rename { background: var(--info); opacity: 1; }
-
-  .file-icon {
-    grid-area: icon;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--foreground-muted);
-  }
-
-  .file-icon.add { color: var(--success); }
-  .file-icon.modify { color: var(--warning); }
-  .file-icon.del { color: var(--error); }
-  .file-icon.rename { color: var(--info); }
-
-  .file-info {
-    grid-area: info;
-    min-width: 0;
-    overflow: hidden;
-  }
-
-  .file-primary {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;
-  }
-
-  .file-name {
-    display: block;
-    flex: 0 1 auto;
-    min-width: 0;
-    overflow: hidden;
-    color: var(--foreground);
-    font-size: var(--text-sm);
-    font-weight: var(--font-medium);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .rename-name {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-  }
-
-  .old-path,
-  .rename-arrow {
-    color: var(--foreground-muted);
-    font-weight: var(--font-normal);
-  }
-
-  .file-stats {
-    grid-area: stats;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--foreground-muted);
-    font-size: var(--text-xs);
-    font-variant-numeric: tabular-nums;
-    font-weight: var(--font-semibold);
-  }
-
   .stat-add { color: var(--success); }
   .stat-del { color: var(--error); }
-  .stat-meta {
-    color: var(--foreground-muted);
-    font-weight: var(--font-medium);
-  }
-
-  .file-kind-tag,
-  .file-error-tag,
-  .file-actor-tag {
-    display: inline-flex;
-    flex: 0 0 auto;
-    align-items: center;
-    padding: 1px 6px;
-    border: 1px solid var(--edits-card-border);
-    border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--surface-2) 60%, transparent);
-    color: var(--foreground-muted);
-    font-size: var(--text-2xs);
-    font-weight: var(--font-medium);
-    line-height: 1.4;
-    vertical-align: middle;
-  }
-
-  .file-error-tag {
-    background: color-mix(in srgb, var(--error) 18%, transparent);
-    color: var(--error);
-    border-color: color-mix(in srgb, var(--error) 35%, var(--edits-card-border));
-  }
-
-  .file-actor-tag {
-    font-weight: var(--font-semibold);
-  }
-
-  .file-actor-tag.actor-mainline {
-    border-color: color-mix(in srgb, var(--info) 42%, var(--edits-card-border));
-    background: color-mix(in srgb, var(--info) 16%, transparent);
-    color: var(--info);
-  }
-
-  .file-actor-tag.actor-external {
-    border-color: color-mix(in srgb, var(--warning) 44%, var(--edits-card-border));
-    background: color-mix(in srgb, var(--warning) 16%, transparent);
-    color: var(--warning);
-  }
-
-  .file-actor-tag.actor-agent {
-    border-color: color-mix(in srgb, var(--color-orchestrator) 42%, var(--edits-card-border));
-    background: color-mix(in srgb, var(--color-orchestrator) 16%, transparent);
-    color: var(--color-orchestrator);
-  }
-
-  .file-actions {
-    grid-area: actions;
-    display: inline-flex;
-    gap: 2px;
-    opacity: 0;
-    transition: opacity var(--transition-fast);
-  }
-
-  .file-row:hover .file-actions,
-  .file-row:focus-within .file-actions {
-    opacity: 1;
-  }
-
-  .action-icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--foreground-muted);
-    cursor: pointer;
-    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
-  }
-
-  .action-icon:hover:not(:disabled) {
-    border-color: var(--edits-card-border);
-    background: var(--surface-hover);
-    color: var(--foreground);
-  }
-
-  .action-icon:disabled {
-    cursor: not-allowed;
-    opacity: 0.45;
-  }
-
-  .action-icon.approve:hover:not(:disabled) { color: var(--success); }
-  .action-icon.revert:hover:not(:disabled) { color: var(--error); }
-
-  @media (hover: none) {
-    .file-actions {
-      opacity: 1;
-    }
-  }
-
   @media (max-width: 768px) {
     .edits-panel {
       padding: var(--space-2);
@@ -843,11 +526,5 @@
       padding-inline: 6px;
     }
 
-    .file-row {
-      grid-template-columns: 3px 18px minmax(0, 1fr) auto auto;
-      gap: 6px;
-      min-height: 44px;
-      padding-inline: 6px;
-    }
   }
 </style>

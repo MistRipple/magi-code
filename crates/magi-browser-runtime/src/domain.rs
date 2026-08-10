@@ -27,6 +27,7 @@ pub enum BrowserSessionLifecycle {
     Creating,
     Ready,
     Recovering,
+    Interrupted,
     Failed,
     Closed,
 }
@@ -36,16 +37,32 @@ impl BrowserSessionLifecycle {
         self != Self::Closed
     }
 
+    /// 只有仍然拥有可恢复运行边界的会话才允许在 Browser Host 重启后恢复。
+    /// Failed 是终态故障记录，不能重新物化为 Chromium 页面。
+    pub fn is_recoverable(self) -> bool {
+        matches!(
+            self,
+            Self::Creating | Self::Ready | Self::Recovering | Self::Interrupted
+        )
+    }
+
     pub fn can_transition_to(self, next: Self) -> bool {
         if self == next {
             return true;
         }
         matches!(
             (self, next),
-            (Self::Creating, Self::Ready | Self::Failed | Self::Closed)
-                | (Self::Ready, Self::Recovering | Self::Failed | Self::Closed)
-                | (Self::Recovering, Self::Ready | Self::Failed | Self::Closed)
-                | (Self::Failed, Self::Recovering | Self::Closed)
+            (
+                Self::Creating,
+                Self::Ready | Self::Interrupted | Self::Failed | Self::Closed
+            ) | (
+                Self::Ready,
+                Self::Recovering | Self::Interrupted | Self::Failed | Self::Closed
+            ) | (
+                Self::Recovering,
+                Self::Ready | Self::Interrupted | Self::Failed | Self::Closed
+            ) | (Self::Interrupted, Self::Recovering | Self::Closed)
+                | (Self::Failed, Self::Closed)
         )
     }
 }
@@ -70,6 +87,9 @@ pub struct BrowserSession {
 pub enum BrowserTabLifecycle {
     Creating,
     Ready,
+    /// 逻辑 Tab 仍然存在，但当前 Browser Host 没有为它物化 Chromium Page。
+    /// 该状态用于 daemon 重启、运行组件升级和 Host 的页面淘汰，不代表 Tab 丢失。
+    Suspended,
     Crashed,
     Closed,
 }
@@ -81,9 +101,12 @@ impl BrowserTabLifecycle {
         }
         matches!(
             (self, next),
-            (Self::Creating, Self::Ready | Self::Crashed | Self::Closed)
-                | (Self::Ready, Self::Crashed | Self::Closed)
-                | (Self::Crashed, Self::Ready | Self::Closed)
+            (
+                Self::Creating,
+                Self::Ready | Self::Suspended | Self::Crashed | Self::Closed
+            ) | (Self::Ready, Self::Suspended | Self::Crashed | Self::Closed)
+                | (Self::Suspended, Self::Ready | Self::Crashed | Self::Closed)
+                | (Self::Crashed, Self::Suspended | Self::Closed)
         )
     }
 }

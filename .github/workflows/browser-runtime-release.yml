@@ -31,7 +31,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: '1.97.0'
-  BROWSER_RUNTIME_RELEASE_KEY_HEX: ${{ vars.BROWSER_RUNTIME_RELEASE_KEY_HEX }}
   BROWSER_RUNTIME_EXPIRES_DAYS: ${{ vars.BROWSER_RUNTIME_EXPIRES_DAYS || '90' }}
   BROWSER_RUNTIME_UPDATE_LEVEL: ${{ vars.BROWSER_RUNTIME_UPDATE_LEVEL || 'recommended' }}
 
@@ -59,16 +58,6 @@ jobs:
           set -euo pipefail
           magi_version="$(node scripts/product-version.mjs)"
           minimum_magi_version="$magi_version"
-          desktop_feed_dir="$(mktemp -d)"
-          if gh release view magi-desktop-stable --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release download magi-desktop-stable \
-              --repo "$GITHUB_REPOSITORY" \
-              --pattern 'latest.json' \
-              --dir "$desktop_feed_dir" \
-              --clobber
-            minimum_magi_version="$(node -e "const fs=require('node:fs'); const m=JSON.parse(fs.readFileSync(process.argv[1], 'utf8')); process.stdout.write(m.version || '')" "$desktop_feed_dir/latest.json")"
-            node -e "const parse=(value)=>{const match=/^(\\d+)\\.(\\d+)\\.(\\d+)(?:[-+].*)?$/.exec(value); if (!match) process.exit(1); return match.slice(1,4).map(Number)}; const compare=(a,b)=>{for(let i=0;i<3;i+=1){if(a[i]!==b[i]) return a[i]-b[i]} return 0}; if (compare(parse(process.argv[2]), parse(process.argv[1])) > 0) process.exit(1)" "$magi_version" "$minimum_magi_version"
-          fi
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             tag_version="${GITHUB_REF_NAME#v}"
             test "$tag_version" = "$magi_version" || {
@@ -201,12 +190,9 @@ jobs:
           MAGI_BROWSER_RUNTIME_SIGNING_KEY_HEX: ${{ secrets.MAGI_BROWSER_RUNTIME_SIGNING_KEY_HEX }}
         run: |
           set -euo pipefail
+          BROWSER_RUNTIME_RELEASE_KEY_HEX="$(node scripts/browser-runtime-release-config.mjs public-key)"
           test -n "${MAGI_BROWSER_RUNTIME_SIGNING_KEY_HEX:-}" || {
             echo '缺少 Secret: MAGI_BROWSER_RUNTIME_SIGNING_KEY_HEX' >&2
-            exit 1
-          }
-          test -n "${BROWSER_RUNTIME_RELEASE_KEY_HEX:-}" || {
-            echo '缺少 Repository Variable: BROWSER_RUNTIME_RELEASE_KEY_HEX' >&2
             exit 1
           }
           magi_version="${{ needs.prepare-release.outputs.magi_version }}"

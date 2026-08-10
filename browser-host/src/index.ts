@@ -213,10 +213,10 @@ export async function startBrowserHostServer(
 function commandQueueKey(command: HostCommand): string | null {
   switch (command.type) {
     case "create_page":
+    case "restore_page":
     case "set_viewport":
     case "set_logical_viewport":
     case "close_page":
-    case "activate_page":
     case "navigate":
     case "snapshot":
     case "click":
@@ -284,10 +284,10 @@ function isHostCommand(value: unknown): value is HostCommand {
     [
       "ping",
       "create_page",
+      "restore_page",
       "set_viewport",
       "set_logical_viewport",
       "close_page",
-      "activate_page",
       "navigate",
       "snapshot",
       "click",

@@ -419,7 +419,11 @@ fn restore_revokes_leases_and_recovers_only_persistent_session_boundary() {
     let mut authority = BrowserAuthority::new();
     register_default_profile(&mut authority);
     let session = create_ready_session(&mut authority, "browser-session-a", "session-a");
-    create_ready_tab(&mut authority, &session, "tab-a");
+    let tab = create_ready_tab(&mut authority, &session, "tab-a");
+    let crashed_tab = create_ready_tab(&mut authority, &session, "tab-crashed");
+    authority
+        .transition_tab(&crashed_tab, BrowserTabLifecycle::Crashed, at(9))
+        .unwrap();
     let lease = acquire(&mut authority, "lease-a", &session, "session-a", 10);
     let snapshot = authority.snapshot();
 
@@ -429,6 +433,14 @@ fn restore_revokes_leases_and_recovers_only_persistent_session_boundary() {
         BrowserSessionLifecycle::Recovering
     );
     assert_eq!(restored.session(&session).unwrap().runtime_epoch, 1);
+    assert_eq!(
+        restored.tab(&tab).unwrap().lifecycle,
+        BrowserTabLifecycle::Suspended
+    );
+    assert_eq!(
+        restored.tab(&crashed_tab).unwrap().lifecycle,
+        BrowserTabLifecycle::Suspended
+    );
     let restored_lease = restored.lease(&lease.lease_id).unwrap();
     assert_eq!(restored_lease.lifecycle, BrowserLeaseLifecycle::Revoked);
     assert_eq!(
@@ -547,6 +559,112 @@ fn changing_tab_viewport_updates_snapshot_without_navigation() {
         .unwrap();
     assert_eq!(automatic.viewport_mode, BrowserViewportMode::Auto);
     assert_eq!(automatic.snapshot_revision, updated.snapshot_revision);
+}
+
+#[test]
+fn durable_browser_tab_contains_url_state_but_never_parent_viewport_state() {
+    let mut authority = BrowserAuthority::new();
+    register_default_profile(&mut authority);
+    let browser_session_id = create_ready_session(
+        &mut authority,
+        "browser-session-durable-viewport",
+        "session-durable-viewport",
+    );
+    let tab_id = create_ready_tab(&mut authority, &browser_session_id, "tab-durable-viewport");
+    authority
+        .set_tab_viewport(
+            &tab_id,
+            BrowserViewport {
+                width: 390,
+                height: 844,
+                device_scale_factor_millis: 1_000,
+                device_type: crate::BrowserDeviceType::Mobile,
+            },
+            BrowserViewportMode::Fixed,
+            at(10),
+        )
+        .unwrap();
+
+    let durable = authority.durable_state();
+    let encoded = serde_json::to_value(&durable).unwrap();
+    let tab = encoded
+        .get("tabs")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|tabs| {
+            tabs.iter().find(|tab| {
+                tab.get("tab_id").and_then(serde_json::Value::as_str) == Some(tab_id.as_str())
+            })
+        })
+        .expect("durable browser tab should be present");
+    assert!(tab.get("url").is_some());
+    assert!(tab.get("viewport").is_none());
+    assert!(tab.get("viewport_mode").is_none());
+    assert!(tab.get("frame_sequence").is_none());
+
+    let restored = BrowserAuthority::restore_durable(durable, at(20)).unwrap();
+    let restored_tab = restored.tab(&tab_id).expect("browser tab should restore");
+    assert_eq!(restored_tab.viewport, BrowserViewport::default());
+    assert_eq!(restored_tab.viewport_mode, BrowserViewportMode::Auto);
+    assert_eq!(restored_tab.frame_sequence, 0);
+}
+
+#[test]
+fn viewport_runtime_state_is_scoped_to_each_browser_tab() {
+    let mut authority = BrowserAuthority::new();
+    register_default_profile(&mut authority);
+    let browser_session_id = create_ready_session(
+        &mut authority,
+        "browser-session-viewport-scope",
+        "session-viewport-scope",
+    );
+    let narrow_tab_id = create_ready_tab(
+        &mut authority,
+        &browser_session_id,
+        "tab-viewport-scope-narrow",
+    );
+    let wide_tab_id = create_ready_tab(
+        &mut authority,
+        &browser_session_id,
+        "tab-viewport-scope-wide",
+    );
+
+    authority
+        .set_tab_viewport(
+            &narrow_tab_id,
+            BrowserViewport {
+                width: 390,
+                height: 844,
+                device_scale_factor_millis: 1_000,
+                device_type: crate::BrowserDeviceType::Mobile,
+            },
+            BrowserViewportMode::Fixed,
+            at(10),
+        )
+        .unwrap();
+    authority
+        .set_tab_viewport(
+            &wide_tab_id,
+            BrowserViewport {
+                width: 1_280,
+                height: 800,
+                device_scale_factor_millis: 1_000,
+                device_type: crate::BrowserDeviceType::Desktop,
+            },
+            BrowserViewportMode::Auto,
+            at(11),
+        )
+        .unwrap();
+
+    assert_eq!(authority.tab(&narrow_tab_id).unwrap().viewport.width, 390);
+    assert_eq!(authority.tab(&wide_tab_id).unwrap().viewport.width, 1_280);
+    assert_eq!(
+        authority.tab(&narrow_tab_id).unwrap().viewport_mode,
+        BrowserViewportMode::Fixed
+    );
+    assert_eq!(
+        authority.tab(&wide_tab_id).unwrap().viewport_mode,
+        BrowserViewportMode::Auto
+    );
 }
 
 #[test]
@@ -706,7 +824,7 @@ fn annotations_are_authoritative_revision_bound_and_durable() {
 }
 
 #[test]
-fn legacy_durable_state_infers_fixed_device_type_without_changing_auto_mode() {
+fn legacy_durable_state_restores_every_tab_to_parent_owned_auto_viewport() {
     let mut authority = BrowserAuthority::new();
     register_default_profile(&mut authority);
     let browser_session_id = create_ready_session(
@@ -757,16 +875,179 @@ fn legacy_durable_state_infers_fixed_device_type_without_changing_auto_mode() {
 
     assert_eq!(
         restored.tab(&fixed_tab_id).unwrap().viewport.device_type,
-        crate::BrowserDeviceType::Mobile
+        crate::BrowserDeviceType::Desktop
     );
     assert_eq!(
         restored.tab(&auto_tab_id).unwrap().viewport.device_type,
         crate::BrowserDeviceType::Desktop
     );
     assert_eq!(
+        restored.tab(&fixed_tab_id).unwrap().viewport_mode,
+        BrowserViewportMode::Auto
+    );
+    assert_eq!(
+        restored.tab(&auto_tab_id).unwrap().viewport_mode,
+        BrowserViewportMode::Auto
+    );
+    assert_eq!(
         restored.durable_state().schema_version,
         crate::BROWSER_DURABLE_STATE_SCHEMA_VERSION
     );
+}
+
+#[test]
+fn failed_browser_sessions_are_closed_during_restore() {
+    let mut authority = BrowserAuthority::new();
+    register_default_profile(&mut authority);
+    let browser_session_id = create_ready_session(
+        &mut authority,
+        "browser-session-failed-restore",
+        "session-failed-restore",
+    );
+    let tab_id = create_ready_tab(&mut authority, &browser_session_id, "tab-failed-restore");
+    authority
+        .transition_session(&browser_session_id, BrowserSessionLifecycle::Failed, at(6))
+        .unwrap();
+
+    let restored = BrowserAuthority::restore_durable(authority.durable_state(), at(20)).unwrap();
+    let session = restored.session(&browser_session_id).unwrap();
+    let tab = restored.tab(&tab_id).unwrap();
+
+    assert_eq!(session.lifecycle, BrowserSessionLifecycle::Closed);
+    assert_eq!(tab.lifecycle, BrowserTabLifecycle::Closed);
+    assert!(session.tab_ids.is_empty());
+    assert!(!session.lifecycle.is_recoverable());
+}
+
+#[test]
+fn schema_two_tabs_restore_as_suspended_without_remaining_open_records() {
+    let mut authority = BrowserAuthority::new();
+    register_default_profile(&mut authority);
+    let browser_session_id = create_ready_session(
+        &mut authority,
+        "browser-session-schema-two",
+        "session-schema-two",
+    );
+    let tab_id = create_ready_tab(&mut authority, &browser_session_id, "tab-schema-two");
+    let mut durable = authority.durable_state();
+    durable.schema_version = 2;
+
+    let restored = BrowserAuthority::restore_durable(durable, at(20)).unwrap();
+
+    assert_eq!(
+        restored.session(&browser_session_id).unwrap().lifecycle,
+        BrowserSessionLifecycle::Recovering
+    );
+    assert_eq!(
+        restored.tab(&tab_id).unwrap().lifecycle,
+        BrowserTabLifecycle::Suspended
+    );
+    assert_eq!(
+        restored.durable_state().schema_version,
+        crate::BROWSER_DURABLE_STATE_SCHEMA_VERSION
+    );
+}
+
+#[test]
+fn crashed_tabs_do_not_consume_global_tab_quota() {
+    let mut authority = BrowserAuthority::new();
+    register_default_profile(&mut authority);
+    let first_session =
+        create_ready_session(&mut authority, "browser-session-quota-a", "session-quota-a");
+    let second_session =
+        create_ready_session(&mut authority, "browser-session-quota-b", "session-quota-b");
+
+    let mut first_tab = None;
+    for index in 0..32 {
+        let tab_id = create_ready_tab(
+            &mut authority,
+            &first_session,
+            &format!("tab-quota-a-{index}"),
+        );
+        first_tab.get_or_insert(tab_id);
+    }
+    for index in 0..32 {
+        create_ready_tab(
+            &mut authority,
+            &second_session,
+            &format!("tab-quota-b-{index}"),
+        );
+    }
+
+    authority
+        .transition_tab(
+            &first_tab.expect("the first session must contain a tab"),
+            BrowserTabLifecycle::Crashed,
+            at(10),
+        )
+        .unwrap();
+    let third_session =
+        create_ready_session(&mut authority, "browser-session-quota-c", "session-quota-c");
+
+    let replacement = create_ready_tab(&mut authority, &third_session, "tab-quota-replacement");
+    assert_eq!(
+        authority.tab(&replacement).unwrap().lifecycle,
+        BrowserTabLifecycle::Ready
+    );
+}
+
+#[test]
+fn suspended_tabs_invalidate_page_references_before_materialization() {
+    let mut authority = BrowserAuthority::new();
+    register_default_profile(&mut authority);
+    let browser_session_id = create_ready_session(
+        &mut authority,
+        "browser-session-suspended-quota",
+        "session-suspended-quota",
+    );
+    let tab_id = create_ready_tab(&mut authority, &browser_session_id, "tab-suspended-quota");
+    let before = authority.tab(&tab_id).unwrap().clone();
+
+    let suspended = authority
+        .transition_tab(&tab_id, BrowserTabLifecycle::Suspended, at(10))
+        .unwrap();
+
+    assert_eq!(suspended.lifecycle, BrowserTabLifecycle::Suspended);
+    assert_eq!(
+        suspended.navigation_revision,
+        before.navigation_revision.saturating_add(1)
+    );
+    assert_eq!(
+        suspended.snapshot_revision,
+        before.snapshot_revision.saturating_add(1)
+    );
+    assert_eq!(suspended.frame_sequence, 0);
+    let restored = authority
+        .transition_tab(&tab_id, BrowserTabLifecycle::Ready, at(11))
+        .unwrap();
+    assert_eq!(restored.lifecycle, BrowserTabLifecycle::Ready);
+}
+
+#[test]
+fn interrupted_sessions_restore_for_the_next_runtime() {
+    let mut authority = BrowserAuthority::new();
+    register_default_profile(&mut authority);
+    let browser_session_id = create_ready_session(
+        &mut authority,
+        "browser-session-interrupted",
+        "session-interrupted",
+    );
+    let tab_id = create_ready_tab(&mut authority, &browser_session_id, "tab-interrupted");
+    authority
+        .transition_session(
+            &browser_session_id,
+            BrowserSessionLifecycle::Interrupted,
+            at(6),
+        )
+        .unwrap();
+
+    let restored = BrowserAuthority::restore_durable(authority.durable_state(), at(20)).unwrap();
+    let session = restored.session(&browser_session_id).unwrap();
+    let tab = restored.tab(&tab_id).unwrap();
+
+    assert_eq!(session.lifecycle, BrowserSessionLifecycle::Recovering);
+    assert_eq!(tab.lifecycle, BrowserTabLifecycle::Suspended);
+    assert!(session.lifecycle.is_recoverable());
 }
 
 #[test]
@@ -1025,6 +1306,10 @@ fn runtime_update_check_reports_newer_magi_requirement_without_rejecting_feed() 
     let (archive_path, mut release) =
         create_signed_runtime_archive(directory.path(), &signing_key, "4.0.0", 40);
     release.manifest.minimum_magi_version = version("4.0.0");
+    release.manifest.host_protocol = crate::BrowserHostProtocolRange {
+        minimum: crate::BrowserHostProtocolVersion { major: 2, minor: 0 },
+        maximum: crate::BrowserHostProtocolVersion { major: 2, minor: 0 },
+    };
     release.signature = BASE64_STANDARD.encode(
         signing_key
             .sign(&release.signing_bytes().unwrap())

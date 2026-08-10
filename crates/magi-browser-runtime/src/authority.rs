@@ -8,10 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BrowserAnnotation, BrowserAnnotationAnchor, BrowserAnnotationStatus, BrowserAuthorityError,
-    BrowserControlLease, BrowserDeviceType, BrowserLeaseEndReason, BrowserLeaseLifecycle,
-    BrowserLeaseSelector, BrowserProfile, BrowserProfileControlMode, BrowserSession,
-    BrowserSessionLifecycle, BrowserTab, BrowserTabLifecycle, BrowserViewport, BrowserViewportMode,
-    GoalControlBinding,
+    BrowserControlLease, BrowserLeaseEndReason, BrowserLeaseLifecycle, BrowserLeaseSelector,
+    BrowserProfile, BrowserProfileControlMode, BrowserSession, BrowserSessionLifecycle, BrowserTab,
+    BrowserTabLifecycle, BrowserViewport, BrowserViewportMode, GoalControlBinding,
 };
 
 const MAX_BROWSER_TABS_PER_SESSION: usize = 32;
@@ -92,13 +91,67 @@ pub struct BrowserDurableState {
     pub revision: u64,
     pub profiles: Vec<BrowserProfile>,
     pub sessions: Vec<BrowserSession>,
-    pub tabs: Vec<BrowserTab>,
+    pub tabs: Vec<BrowserDurableTab>,
     #[serde(default)]
     pub annotations: Vec<BrowserAnnotation>,
 }
 
-pub const BROWSER_DURABLE_STATE_SCHEMA_VERSION: u16 = 2;
+/// 浏览器 Tab 的持久部分。viewport 是当前父容器的运行时布局，不属于会话状态。
+/// 省略这些字段也让旧 state.json 可以自然反序列化，恢复时统一回到 Auto + 默认值。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BrowserDurableTab {
+    pub tab_id: BrowserTabId,
+    pub browser_session_id: BrowserSessionId,
+    pub lifecycle: BrowserTabLifecycle,
+    pub url: String,
+    pub origin: Option<String>,
+    pub title: String,
+    pub navigation_revision: u64,
+    pub snapshot_revision: u64,
+    pub created_at: UtcMillis,
+    pub updated_at: UtcMillis,
+}
+
+impl From<&BrowserTab> for BrowserDurableTab {
+    fn from(tab: &BrowserTab) -> Self {
+        Self {
+            tab_id: tab.tab_id.clone(),
+            browser_session_id: tab.browser_session_id.clone(),
+            lifecycle: tab.lifecycle,
+            url: tab.url.clone(),
+            origin: tab.origin.clone(),
+            title: tab.title.clone(),
+            navigation_revision: tab.navigation_revision,
+            snapshot_revision: tab.snapshot_revision,
+            created_at: tab.created_at,
+            updated_at: tab.updated_at,
+        }
+    }
+}
+
+impl BrowserDurableTab {
+    fn into_runtime_tab(self) -> BrowserTab {
+        BrowserTab {
+            tab_id: self.tab_id,
+            browser_session_id: self.browser_session_id,
+            lifecycle: self.lifecycle,
+            url: self.url,
+            origin: self.origin,
+            title: self.title,
+            viewport: BrowserViewport::default(),
+            viewport_mode: BrowserViewportMode::Auto,
+            navigation_revision: self.navigation_revision,
+            snapshot_revision: self.snapshot_revision,
+            frame_sequence: 0,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+pub const BROWSER_DURABLE_STATE_SCHEMA_VERSION: u16 = 4;
 const LEGACY_BROWSER_DURABLE_STATE_SCHEMA_VERSION: u16 = 1;
+const PRE_SUSPENDED_BROWSER_DURABLE_STATE_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Default)]
 pub struct BrowserAuthority {
@@ -362,7 +415,9 @@ impl BrowserAuthority {
             self.close_session_resources(browser_session_id, now)?;
         } else if matches!(
             lifecycle,
-            BrowserSessionLifecycle::Recovering | BrowserSessionLifecycle::Failed
+            BrowserSessionLifecycle::Recovering
+                | BrowserSessionLifecycle::Interrupted
+                | BrowserSessionLifecycle::Failed
         ) {
             self.revoke_leases(
                 &BrowserLeaseSelector {
@@ -396,17 +451,13 @@ impl BrowserAuthority {
             return Err(BrowserAuthorityError::TabAlreadyExists(input.tab_id));
         }
         let session = self.require_ready_session(&input.browser_session_id)?;
-        if session.tab_ids.len() >= MAX_BROWSER_TABS_PER_SESSION {
+        if self.live_tab_count_for_session(session) >= MAX_BROWSER_TABS_PER_SESSION {
             return Err(BrowserAuthorityError::SessionTabLimitReached {
                 browser_session_id: input.browser_session_id.clone(),
                 limit: MAX_BROWSER_TABS_PER_SESSION,
             });
         }
-        let open_tab_count = self
-            .sessions
-            .values()
-            .map(|session| session.tab_ids.len())
-            .sum::<usize>();
+        let open_tab_count = self.live_tab_count();
         if open_tab_count >= MAX_BROWSER_TABS_TOTAL {
             return Err(BrowserAuthorityError::GlobalTabLimitReached {
                 limit: MAX_BROWSER_TABS_TOTAL,
@@ -457,13 +508,19 @@ impl BrowserAuthority {
             return Ok(self.require_tab(tab_id)?.clone());
         }
         let browser_session_id = self.require_tab(tab_id)?.browser_session_id.clone();
-        let tab = self
-            .tabs
-            .get_mut(tab_id)
-            .expect("browser tab was validated before mutation");
-        tab.lifecycle = lifecycle;
-        tab.updated_at = now;
-        let tab = tab.clone();
+        {
+            let tab = self
+                .tabs
+                .get_mut(tab_id)
+                .expect("browser tab was validated before mutation");
+            tab.lifecycle = lifecycle;
+            tab.updated_at = now;
+            if lifecycle == BrowserTabLifecycle::Suspended {
+                tab.navigation_revision = tab.navigation_revision.saturating_add(1);
+                tab.snapshot_revision = tab.snapshot_revision.saturating_add(1);
+                tab.frame_sequence = 0;
+            }
+        }
         if lifecycle == BrowserTabLifecycle::Closed {
             let session = self
                 .sessions
@@ -475,7 +532,37 @@ impl BrowserAuthority {
             }
             session.revision = session.revision.saturating_add(1);
             session.updated_at = now;
+        } else if lifecycle == BrowserTabLifecycle::Suspended {
+            self.mark_active_annotations_stale(tab_id, now);
+        } else if lifecycle == BrowserTabLifecycle::Crashed {
+            let next_active_tab_id = self.sessions.get(&browser_session_id).and_then(|session| {
+                session.tab_ids.iter().rev().find_map(|candidate| {
+                    self.tabs.get(candidate).and_then(|tab| {
+                        matches!(
+                            tab.lifecycle,
+                            BrowserTabLifecycle::Creating
+                                | BrowserTabLifecycle::Ready
+                                | BrowserTabLifecycle::Suspended
+                        )
+                        .then(|| candidate.clone())
+                    })
+                })
+            });
+            let session = self
+                .sessions
+                .get_mut(&browser_session_id)
+                .expect("browser tab cannot outlive its owning session");
+            if session.active_tab_id.as_ref() == Some(tab_id) {
+                session.active_tab_id = next_active_tab_id;
+                session.revision = session.revision.saturating_add(1);
+                session.updated_at = now;
+            }
         }
+        let tab = self
+            .tabs
+            .get(tab_id)
+            .expect("browser tab remains available")
+            .clone();
         self.bump_revision();
         Ok(tab)
     }
@@ -1015,10 +1102,7 @@ impl BrowserAuthority {
     }
 
     pub fn durable_state(&self) -> BrowserDurableState {
-        let mut tabs = self.tabs.values().cloned().collect::<Vec<_>>();
-        for tab in &mut tabs {
-            tab.frame_sequence = 0;
-        }
+        let tabs = self.tabs.values().collect::<Vec<_>>();
         let mut annotations = self.annotations.values().cloned().collect::<Vec<_>>();
         annotations.sort_by(|left, right| {
             left.tab_id
@@ -1031,7 +1115,7 @@ impl BrowserAuthority {
             revision: self.revision,
             profiles: self.profiles.values().cloned().collect(),
             sessions: self.sessions.values().cloned().collect(),
-            tabs,
+            tabs: tabs.into_iter().map(BrowserDurableTab::from).collect(),
             annotations,
         }
     }
@@ -1040,14 +1124,10 @@ impl BrowserAuthority {
         mut state: BrowserDurableState,
         now: UtcMillis,
     ) -> Result<Self, BrowserAuthorityError> {
-        if state.schema_version == LEGACY_BROWSER_DURABLE_STATE_SCHEMA_VERSION {
-            for tab in &mut state.tabs {
-                tab.viewport.device_type = if tab.viewport_mode == BrowserViewportMode::Fixed {
-                    BrowserDeviceType::for_dimensions(tab.viewport.width)
-                } else {
-                    BrowserDeviceType::Desktop
-                };
-            }
+        if state.schema_version == LEGACY_BROWSER_DURABLE_STATE_SCHEMA_VERSION
+            || state.schema_version == PRE_SUSPENDED_BROWSER_DURABLE_STATE_SCHEMA_VERSION
+            || state.schema_version == 3
+        {
             state.schema_version = BROWSER_DURABLE_STATE_SCHEMA_VERSION;
         }
         if state.schema_version != BROWSER_DURABLE_STATE_SCHEMA_VERSION {
@@ -1061,7 +1141,11 @@ impl BrowserAuthority {
                 revision: state.revision,
                 profiles: state.profiles,
                 sessions: state.sessions,
-                tabs: state.tabs,
+                tabs: state
+                    .tabs
+                    .into_iter()
+                    .map(BrowserDurableTab::into_runtime_tab)
+                    .collect(),
                 leases: Vec::new(),
                 profile_controls: Vec::new(),
                 annotations: state.annotations,
@@ -1085,7 +1169,7 @@ impl BrowserAuthority {
         let recovering_session_ids = self
             .sessions
             .values()
-            .filter(|session| session.lifecycle.is_open())
+            .filter(|session| session.lifecycle.is_recoverable())
             .map(|session| session.browser_session_id.clone())
             .collect::<Vec<_>>();
         for browser_session_id in &recovering_session_ids {
@@ -1098,9 +1182,15 @@ impl BrowserAuthority {
                 session.updated_at = now;
                 for tab_id in &session.tab_ids {
                     if let Some(tab) = self.tabs.get_mut(tab_id)
-                        && tab.lifecycle != BrowserTabLifecycle::Closed
+                        && matches!(
+                            tab.lifecycle,
+                            BrowserTabLifecycle::Creating
+                                | BrowserTabLifecycle::Ready
+                                | BrowserTabLifecycle::Suspended
+                                | BrowserTabLifecycle::Crashed
+                        )
                     {
-                        tab.lifecycle = BrowserTabLifecycle::Creating;
+                        tab.lifecycle = BrowserTabLifecycle::Suspended;
                         tab.navigation_revision = tab.navigation_revision.saturating_add(1);
                         tab.snapshot_revision = tab.snapshot_revision.saturating_add(1);
                         tab.frame_sequence = 0;
@@ -1123,6 +1213,43 @@ impl BrowserAuthority {
             self.bump_revision();
         }
         recovering_session_ids
+    }
+
+    /// 将上一次 Browser Host 耗尽重试后保留的中断会话重新投入恢复。
+    /// 该操作只改变运行边界，不创建或恢复 Chromium Page。
+    pub fn resume_interrupted_sessions(&mut self, now: UtcMillis) -> Vec<BrowserSessionId> {
+        let session_ids = self
+            .sessions
+            .values()
+            .filter(|session| session.lifecycle == BrowserSessionLifecycle::Interrupted)
+            .map(|session| session.browser_session_id.clone())
+            .collect::<Vec<_>>();
+        for browser_session_id in &session_ids {
+            let _ = self.transition_session(
+                browser_session_id,
+                BrowserSessionLifecycle::Recovering,
+                now,
+            );
+            let tab_ids = self
+                .sessions
+                .get(browser_session_id)
+                .map(|session| session.tab_ids.clone())
+                .unwrap_or_default();
+            for tab_id in tab_ids {
+                if self.tabs.get(&tab_id).is_some_and(|tab| {
+                    matches!(
+                        tab.lifecycle,
+                        BrowserTabLifecycle::Creating
+                            | BrowserTabLifecycle::Ready
+                            | BrowserTabLifecycle::Suspended
+                            | BrowserTabLifecycle::Crashed
+                    )
+                }) {
+                    let _ = self.transition_tab(&tab_id, BrowserTabLifecycle::Suspended, now);
+                }
+            }
+        }
+        session_ids
     }
 
     pub fn restore(
@@ -1173,7 +1300,7 @@ impl BrowserAuthority {
                     session.browser_session_id, session.profile_id
                 )));
             }
-            if session.lifecycle.is_open() {
+            if session.lifecycle.is_recoverable() {
                 session.lifecycle = BrowserSessionLifecycle::Recovering;
                 session.runtime_epoch = session.runtime_epoch.saturating_add(1);
                 session.revision = session.revision.saturating_add(1);
@@ -1205,9 +1332,15 @@ impl BrowserAuthority {
                 )));
             }
             if session.lifecycle == BrowserSessionLifecycle::Recovering
-                && tab.lifecycle != BrowserTabLifecycle::Closed
+                && matches!(
+                    tab.lifecycle,
+                    BrowserTabLifecycle::Creating
+                        | BrowserTabLifecycle::Ready
+                        | BrowserTabLifecycle::Suspended
+                        | BrowserTabLifecycle::Crashed
+                )
             {
-                tab.lifecycle = BrowserTabLifecycle::Creating;
+                tab.lifecycle = BrowserTabLifecycle::Suspended;
                 tab.navigation_revision = tab.navigation_revision.saturating_add(1);
                 tab.snapshot_revision = tab.snapshot_revision.saturating_add(1);
                 tab.frame_sequence = 0;
@@ -1219,6 +1352,7 @@ impl BrowserAuthority {
                 ));
             }
         }
+        normalize_active_tab_ids(&mut authority);
         snapshot.annotations.sort_by(|left, right| {
             left.created_at.cmp(&right.created_at).then_with(|| {
                 left.annotation_id
@@ -1267,6 +1401,22 @@ impl BrowserAuthority {
                     "duplicate browser annotation".to_string(),
                 ));
             }
+        }
+        // Failed 是旧运行边界的终态，不是可恢复工作区。升级或重启后直接
+        // 收口为 Closed，避免不可用 Tab 继续占据右侧 Tab 栏；记录本身仍
+        // 留在 durable state 中用于历史审计。
+        let failed_session_ids = authority
+            .sessions
+            .values()
+            .filter(|session| session.lifecycle == BrowserSessionLifecycle::Failed)
+            .map(|session| session.browser_session_id.clone())
+            .collect::<Vec<_>>();
+        for browser_session_id in failed_session_ids {
+            authority.transition_session(
+                &browser_session_id,
+                BrowserSessionLifecycle::Closed,
+                now,
+            )?;
         }
         validate_open_session_uniqueness(&authority.sessions)?;
         for mut lease in snapshot.leases {
@@ -1427,6 +1577,70 @@ impl BrowserAuthority {
             });
         }
         Ok(tab)
+    }
+
+    fn live_tab_count_for_session(&self, session: &BrowserSession) -> usize {
+        session
+            .tab_ids
+            .iter()
+            .filter(|tab_id| {
+                self.tabs.get(*tab_id).is_some_and(|tab| {
+                    matches!(
+                        tab.lifecycle,
+                        BrowserTabLifecycle::Creating
+                            | BrowserTabLifecycle::Ready
+                            | BrowserTabLifecycle::Suspended
+                    )
+                })
+            })
+            .count()
+    }
+
+    fn live_tab_count(&self) -> usize {
+        self.sessions
+            .values()
+            .map(|session| self.live_tab_count_for_session(session))
+            .sum()
+    }
+}
+
+fn normalize_active_tab_ids(authority: &mut BrowserAuthority) {
+    let session_ids = authority.sessions.keys().cloned().collect::<Vec<_>>();
+    for browser_session_id in session_ids {
+        let Some(session) = authority.sessions.get(&browser_session_id).cloned() else {
+            continue;
+        };
+        let active_tab_id = session
+            .active_tab_id
+            .filter(|tab_id| {
+                authority.tabs.get(tab_id).is_some_and(|tab| {
+                    matches!(
+                        tab.lifecycle,
+                        BrowserTabLifecycle::Creating
+                            | BrowserTabLifecycle::Ready
+                            | BrowserTabLifecycle::Suspended
+                    )
+                })
+            })
+            .or_else(|| {
+                session.tab_ids.iter().rev().find_map(|tab_id| {
+                    authority.tabs.get(tab_id).and_then(|tab| {
+                        matches!(
+                            tab.lifecycle,
+                            BrowserTabLifecycle::Creating
+                                | BrowserTabLifecycle::Ready
+                                | BrowserTabLifecycle::Suspended
+                        )
+                        .then(|| tab_id.clone())
+                    })
+                })
+            });
+        if let Some(current) = authority.sessions.get_mut(&browser_session_id)
+            && current.active_tab_id != active_tab_id
+        {
+            current.active_tab_id = active_tab_id;
+            current.revision = current.revision.saturating_add(1);
+        }
     }
 }
 

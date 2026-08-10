@@ -310,7 +310,7 @@
         <div>
           <h3 id="browser-runtime-actions-title">{i18n.t('settings.browser.managementTitle')}</h3>
           <p>{snapshot?.runtimeMode === 'development'
-            ? i18n.t('settings.browser.developmentManagedExternally')
+            ? i18n.t('settings.browser.workspaceRuntimeManagementDescription')
             : i18n.t('settings.browser.managementDescription')}</p>
         </div>
         <button

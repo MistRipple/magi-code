@@ -308,7 +308,7 @@ impl BrowserToolRuntimeDependencies {
                         })?;
                     succeeded_result(reply.response.outcome, "调整浏览器页面视口失败")?;
                 }
-                let updated = self.mutate(|authority| {
+                let updated = self.mutate_transient(|authority| {
                     authority.set_tab_viewport(
                         &tab.tab_id,
                         viewport,
@@ -551,7 +551,12 @@ impl BrowserToolRuntimeDependencies {
                         "指定的浏览器 Tab 不属于当前浏览器会话",
                     ));
                 }
-                if tab.lifecycle != magi_browser_runtime::BrowserTabLifecycle::Ready {
+                if !matches!(
+                    tab.lifecycle,
+                    magi_browser_runtime::BrowserTabLifecycle::Ready
+                        | magi_browser_runtime::BrowserTabLifecycle::Suspended
+                        | magi_browser_runtime::BrowserTabLifecycle::Crashed
+                ) {
                     return Err(BrowserToolError::new(
                         "browser_tab_not_ready",
                         "指定的浏览器 Tab 当前不可用",
@@ -563,11 +568,18 @@ impl BrowserToolRuntimeDependencies {
                     .active_tab_id
                     .as_ref()
                     .and_then(|id| authority.tab(id).cloned())
-                    .filter(|tab| tab.lifecycle == magi_browser_runtime::BrowserTabLifecycle::Ready)
+                    .filter(|tab| {
+                        matches!(
+                            tab.lifecycle,
+                            magi_browser_runtime::BrowserTabLifecycle::Ready
+                                | magi_browser_runtime::BrowserTabLifecycle::Suspended
+                                | magi_browser_runtime::BrowserTabLifecycle::Crashed
+                        )
+                    })
             }
         };
         if let Some(tab) = tab {
-            return Ok(tab);
+            return self.materialize_tab(tab, client).await;
         }
         let tab_id = BrowserTabId::new(format!(
             "browser-tool-tab-{}-{}",
@@ -597,6 +609,7 @@ impl BrowserToolRuntimeDependencies {
                 },
                 navigation_revision: 0,
                 snapshot_revision: 0,
+                allow_streaming_eviction: false,
             })
             .await
         {
@@ -619,6 +632,57 @@ impl BrowserToolRuntimeDependencies {
         let tab = self.apply_page_state(&tab_id, page)?;
         self.publish_tab_event("browser.tab.created", &tab);
         Ok(tab)
+    }
+
+    async fn materialize_tab(
+        &self,
+        tab: magi_browser_runtime::BrowserTab,
+        client: &BrowserHostClient,
+    ) -> Result<magi_browser_runtime::BrowserTab, BrowserToolError> {
+        if !matches!(
+            tab.lifecycle,
+            magi_browser_runtime::BrowserTabLifecycle::Ready
+                | magi_browser_runtime::BrowserTabLifecycle::Suspended
+                | magi_browser_runtime::BrowserTabLifecycle::Crashed
+        ) {
+            return Err(BrowserToolError::new(
+                "browser_tab_not_ready",
+                "指定的浏览器 Tab 当前不可用",
+            ));
+        }
+        let tab = if tab.lifecycle == magi_browser_runtime::BrowserTabLifecycle::Crashed {
+            self.mutate(|authority| {
+                authority.transition_tab(
+                    &tab.tab_id,
+                    magi_browser_runtime::BrowserTabLifecycle::Suspended,
+                    UtcMillis::now(),
+                )
+            })?
+        } else {
+            tab
+        };
+        let reply = client
+            .request(BrowserHostCommand::RestorePage {
+                tab_id: tab.tab_id.clone(),
+                initial_url: tab.url.clone(),
+                viewport: magi_browser_runtime::HostViewport {
+                    width: tab.viewport.width,
+                    height: tab.viewport.height,
+                    surface_width: tab.viewport.width,
+                    surface_height: tab.viewport.height,
+                    device_scale_factor_millis: tab.viewport.device_scale_factor_millis,
+                    device_type: tab.viewport.device_type,
+                },
+                navigation_revision: tab.navigation_revision,
+                snapshot_revision: tab.snapshot_revision,
+                allow_streaming_eviction: false,
+            })
+            .await
+            .map_err(|error| {
+                BrowserToolError::new("browser_host_disconnected", error.to_string())
+            })?;
+        let page = page_state(reply.response.outcome, "恢复浏览器 Tab 失败")?;
+        self.apply_page_state(&tab.tab_id, page)
     }
 
     async fn prepare_agent_write(
@@ -833,6 +897,26 @@ impl BrowserToolRuntimeDependencies {
             &mut magi_browser_runtime::BrowserAuthority,
         ) -> Result<T, magi_browser_runtime::BrowserAuthorityError>,
     ) -> Result<T, BrowserToolError> {
+        self.mutate_with_persistence(true, mutation)
+    }
+
+    /// 浏览器视口属于当前 Browser Tab 的运行态，不得写入会话持久状态。
+    fn mutate_transient<T>(
+        &self,
+        mutation: impl FnOnce(
+            &mut magi_browser_runtime::BrowserAuthority,
+        ) -> Result<T, magi_browser_runtime::BrowserAuthorityError>,
+    ) -> Result<T, BrowserToolError> {
+        self.mutate_with_persistence(false, mutation)
+    }
+
+    fn mutate_with_persistence<T>(
+        &self,
+        persist: bool,
+        mutation: impl FnOnce(
+            &mut magi_browser_runtime::BrowserAuthority,
+        ) -> Result<T, magi_browser_runtime::BrowserAuthorityError>,
+    ) -> Result<T, BrowserToolError> {
         if !self
             .state_writable
             .load(std::sync::atomic::Ordering::Acquire)
@@ -851,7 +935,7 @@ impl BrowserToolRuntimeDependencies {
         let value = mutation(&mut candidate).map_err(|error| {
             BrowserToolError::new("browser_authority_rejected", error.to_string())
         })?;
-        if let Some(persistence) = self.persistence.as_ref() {
+        if persist && let Some(persistence) = self.persistence.as_ref() {
             let state_root = persistence.state_root().ok_or_else(|| {
                 BrowserToolError::new(
                     "browser_state_persist_failed",
@@ -1026,6 +1110,7 @@ impl BrowserToolRuntimeDependencies {
                         },
                         navigation_revision: 0,
                         snapshot_revision: 0,
+                        allow_streaming_eviction: false,
                     })
                     .await
                 {
@@ -1054,17 +1139,11 @@ impl BrowserToolRuntimeDependencies {
             }
             "activate" => {
                 let tab_id = BrowserTabId::new(string_arg(arguments, "tab_id")?);
-                let target = tab_in_session(self, session, &tab_id)?;
+                let target = self
+                    .materialize_tab(tab_in_session(self, session, &tab_id)?, client)
+                    .await?;
                 self.prepare_agent_write(client, session, &target, scope)
                     .await?;
-                client
-                    .request(BrowserHostCommand::ActivatePage {
-                        tab_id: tab_id.clone(),
-                    })
-                    .await
-                    .map_err(|error| {
-                        BrowserToolError::new("browser_host_disconnected", error.to_string())
-                    })?;
                 let updated = self.mutate(|authority| {
                     authority.set_active_tab(&session.browser_session_id, &tab_id, UtcMillis::now())
                 })?;
@@ -1081,9 +1160,7 @@ impl BrowserToolRuntimeDependencies {
             }
             "close" => {
                 let tab_id = BrowserTabId::new(string_arg(arguments, "tab_id")?);
-                let target = tab_in_session(self, session, &tab_id)?;
-                self.prepare_agent_write(client, session, &target, scope)
-                    .await?;
+                let _target = tab_in_session(self, session, &tab_id)?;
                 client
                     .request(BrowserHostCommand::ClosePage {
                         tab_id: tab_id.clone(),

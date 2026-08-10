@@ -1,6 +1,7 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
+    fmt,
     fs::{self, File},
     io::{Read, Write},
     path::PathBuf,
@@ -14,12 +15,12 @@ use std::{
 
 use magi_api::{ApiState, BrowserRuntimeStatusSnapshot};
 use magi_browser_runtime::{
-    BrowserHostClient, BrowserHostCommand, BrowserHostCommandOutcome, BrowserHostCommandResult,
-    BrowserHostControlMode, BrowserHostEvent, BrowserHostHandshake, BrowserHostIncomingEvent,
-    BrowserProfileControlMode, BrowserRuntimeComponentAction, BrowserRuntimeComponentOperation,
+    BrowserHostClient, BrowserHostCommand, BrowserHostCommandOutcome, BrowserHostControlMode,
+    BrowserHostEvent, BrowserHostHandshake, BrowserHostIncomingEvent, BrowserProfileControlMode,
+    BrowserRuntimeComponentAction, BrowserRuntimeComponentError, BrowserRuntimeComponentOperation,
     BrowserRuntimeComponentStatus, BrowserRuntimeControlReceiver, BrowserRuntimeManager,
     BrowserRuntimeManagerConfig, BrowserRuntimeReleaseChannel, BrowserRuntimeTarget,
-    BrowserRuntimeUpdateLevel, BrowserSessionLifecycle, BrowserTabLifecycle, HostViewport,
+    BrowserRuntimeUpdateLevel, BrowserSessionLifecycle, BrowserTabLifecycle,
     SignedBrowserRuntimeRelease, browser_runtime_control_channel,
 };
 use magi_core::{BrowserProfileId, EventId, UtcMillis};
@@ -42,6 +43,8 @@ const RUNTIME_CONTROL_QUEUE_CAPACITY: usize = 8;
 const RELEASE_FEED_MAX_BYTES: u64 = 1024 * 1024;
 const MAX_RUNTIME_REDIRECTS: usize = 5;
 const MAX_SAFE_RUNTIME_EPOCH: u64 = (1 << 53) - 1;
+const BROWSER_RUNTIME_RELEASE_CONFIG: &str =
+    include_str!("../../../../config/browser-runtime-release.json");
 const TRANSIENT_BROWSER_CACHE_PATHS: &[&str] = &[
     "Default/Cache",
     "Default/Code Cache",
@@ -57,6 +60,7 @@ const TRANSIENT_BROWSER_CACHE_PATHS: &[&str] = &[
     "ShaderCache",
 ];
 static DOWNLOAD_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static HOST_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
 struct BrowserHostProcessConfig {
@@ -73,6 +77,72 @@ struct BrowserHostProcessConfig {
 struct ManagedBrowserRuntime {
     manager: Arc<BrowserRuntimeManager>,
     release_feed_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrowserRuntimeReleaseConfig {
+    repository: String,
+    stable_release_tag: String,
+    release_public_key_hex: String,
+}
+
+#[derive(Debug)]
+enum ConfiguredBrowserRuntimeError {
+    Component(BrowserRuntimeComponentError),
+    MissingEntrypoint(&'static str),
+    MissingDefaultProfile,
+}
+
+impl ConfiguredBrowserRuntimeError {
+    fn component_status(&self) -> BrowserRuntimeComponentStatus {
+        match self {
+            Self::Component(
+                BrowserRuntimeComponentError::HostProtocolIncompatible
+                | BrowserRuntimeComponentError::MagiVersionTooOld { .. },
+            ) => BrowserRuntimeComponentStatus::UpdateRequired,
+            Self::Component(_) | Self::MissingEntrypoint(_) | Self::MissingDefaultProfile => {
+                BrowserRuntimeComponentStatus::Failed
+            }
+        }
+    }
+
+    fn error_code(&self) -> &'static str {
+        match self {
+            Self::Component(BrowserRuntimeComponentError::HostProtocolIncompatible) => {
+                "browser_runtime_update_required"
+            }
+            Self::Component(BrowserRuntimeComponentError::MagiVersionTooOld { .. }) => {
+                "browser_runtime_magi_update_required"
+            }
+            Self::Component(_) | Self::MissingEntrypoint(_) | Self::MissingDefaultProfile => {
+                "browser_runtime_invalid"
+            }
+        }
+    }
+
+    fn required_magi_version(&self) -> Option<String> {
+        match self {
+            Self::Component(BrowserRuntimeComponentError::MagiVersionTooOld {
+                minimum, ..
+            }) => Some(minimum.to_string()),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ConfiguredBrowserRuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Component(error) => {
+                write!(formatter, "Browser Runtime Component 校验失败: {error}")
+            }
+            Self::MissingEntrypoint(name) => {
+                write!(formatter, "已激活 Browser Runtime 入口不存在: {name}")
+            }
+            Self::MissingDefaultProfile => formatter.write_str("浏览器默认 Profile 尚未初始化"),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +166,12 @@ pub(super) fn start_controller(state: &ApiState) {
     };
     let (control, receiver) = browser_runtime_control_channel(RUNTIME_CONTROL_QUEUE_CAPACITY);
     state.set_browser_runtime_control(control);
+    // 控制器异步检查已安装组件并启动 Host。先同步标记为 starting，避免 API 在这段
+    // 初始化窗口暴露默认的 not_installed/stopped，导致前端把瞬态误认为最终状态。
+    let mut status = state.browser_runtime_status();
+    status.host_status = "starting".to_string();
+    status.last_error_code = None;
+    state.set_browser_runtime_status(status);
     let state = state.clone();
     handle.spawn(async move {
         run_browser_runtime_controller(state, receiver).await;
@@ -104,10 +180,9 @@ pub(super) fn start_controller(state: &ApiState) {
 
 #[cfg(debug_assertions)]
 fn configured_dev_runtime(state: &ApiState) -> Option<BrowserHostProcessConfig> {
-    // 只有 daemon 开发托管模式才允许注入外部 Browser Host。
-    // 桌面 Debug 包也带有 debug_assertions，不能因为继承了同一终端的
-    // Host 路径就被误判为开发态，否则设置页会永久关闭组件管理。
-    if env::var("MAGI_WEB_DEV").ok().as_deref() != Some("1") {
+    // 只有显式 workspace 模式才允许注入源码 Browser Host。默认开发启动仍走
+    // managed Runtime，避免开发环境与正式包使用两套组件管理语义。
+    if env::var("MAGI_BROWSER_RUNTIME_MODE").ok().as_deref() != Some("workspace") {
         return None;
     }
     let host_entry = env::var_os("MAGI_BROWSER_DEV_HOST_ENTRY").map(PathBuf::from)?;
@@ -204,7 +279,7 @@ fn configured_release_key_hex() -> Option<String> {
     if let Ok(value) = env::var("MAGI_BROWSER_RUNTIME_RELEASE_KEY_HEX") {
         return Some(value);
     }
-    option_env!("MAGI_BROWSER_RUNTIME_RELEASE_KEY_HEX").map(str::to_owned)
+    bundled_release_config().map(|config| config.release_public_key_hex)
 }
 
 fn configured_release_feed_url() -> Option<String> {
@@ -212,17 +287,34 @@ fn configured_release_feed_url() -> Option<String> {
     if let Ok(value) = env::var("MAGI_BROWSER_RUNTIME_RELEASE_FEED_URL") {
         return Some(value);
     }
-    option_env!("MAGI_BROWSER_RUNTIME_RELEASE_FEED_URL").map(str::to_owned)
+    let config = bundled_release_config()?;
+    Some(format!(
+        "https://github.com/{}/releases/download/{}/release-{}-{}.json",
+        config.repository,
+        config.stable_release_tag,
+        env::consts::OS,
+        env::consts::ARCH,
+    ))
+}
+
+fn bundled_release_config() -> Option<BrowserRuntimeReleaseConfig> {
+    match serde_json::from_str(BROWSER_RUNTIME_RELEASE_CONFIG) {
+        Ok(config) => Some(config),
+        Err(error) => {
+            tracing::error!(%error, "内置 Browser Runtime 发布配置无效");
+            None
+        }
+    }
 }
 
 fn configured_component_runtime(
     state: &ApiState,
     manager: &BrowserRuntimeManager,
-) -> Result<Option<BrowserHostProcessConfig>, String> {
+) -> Result<Option<BrowserHostProcessConfig>, ConfiguredBrowserRuntimeError> {
     let release = match manager.inspect_active_release(UtcMillis::now()) {
         Ok(Some(release)) => release,
         Ok(None) => return Ok(None),
-        Err(error) => return Err(format!("Browser Runtime Component 校验失败: {error}")),
+        Err(error) => return Err(ConfiguredBrowserRuntimeError::Component(error)),
     };
     let install_root = manager.runtime_path(&release.manifest.runtime_version);
     let entrypoints = magi_browser_runtime::BrowserRuntimeEntrypoints {
@@ -238,7 +330,7 @@ fn configured_component_runtime(
     ] {
         if !path.is_file() {
             tracing::warn!(component = name, path = %path.display(), "已激活 Browser Runtime 入口不存在");
-            return Err(format!("已激活 Browser Runtime 入口不存在: {name}"));
+            return Err(ConfiguredBrowserRuntimeError::MissingEntrypoint(name));
         }
     }
     let profile_path = state
@@ -247,7 +339,7 @@ fn configured_component_runtime(
         .expect("browser authority lock poisoned")
         .profile(&BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID))
         .map(|profile| profile.data_path.clone())
-        .ok_or_else(|| "浏览器默认 Profile 尚未初始化".to_string())?;
+        .ok_or(ConfiguredBrowserRuntimeError::MissingDefaultProfile)?;
     Ok(Some(BrowserHostProcessConfig {
         node_executable: entrypoints.node_executable,
         host_entry: entrypoints.host_entry,
@@ -265,16 +357,19 @@ async fn run_browser_runtime_controller(
     mut receiver: BrowserRuntimeControlReceiver,
 ) {
     let development = configured_dev_runtime(&state);
-    let development_mode = development.is_some();
     let managed = configured_managed_runtime(&state);
-    let management_available = development.is_none()
-        && managed
-            .as_ref()
-            .and_then(|runtime| runtime.release_feed_url.as_ref())
-            .is_some();
+    let management_available = managed
+        .as_ref()
+        .and_then(|runtime| runtime.release_feed_url.as_ref())
+        .is_some();
     let mut supervisor = None;
 
     if let Some(config) = development {
+        let mut status = state.browser_runtime_status();
+        status.runtime_mode = config.runtime_mode.to_string();
+        status.component_management_available = management_available;
+        status.last_error_code = None;
+        state.set_browser_runtime_status(status);
         supervisor = Some(tokio::spawn(supervise_browser_host(state.clone(), config)));
     } else if let Some(runtime) = managed.as_ref() {
         match configured_component_runtime(&state, runtime.manager.as_ref()) {
@@ -287,24 +382,30 @@ async fn run_browser_runtime_controller(
                 state.set_browser_runtime_status(status);
                 supervisor = Some(tokio::spawn(supervise_browser_host(state.clone(), config)));
             }
-            Ok(None) => set_component_state(
-                &state,
-                BrowserRuntimeComponentStatus::NotInstalled,
-                "managed",
-                "stopped",
-                management_available,
-                None,
-            ),
+            Ok(None) => {
+                set_component_state(
+                    &state,
+                    BrowserRuntimeComponentStatus::NotInstalled,
+                    "managed",
+                    "stopped",
+                    management_available,
+                    None,
+                    None,
+                );
+                mark_runtime_interrupted(&state);
+            }
             Err(error) => {
                 tracing::warn!(%error);
                 set_component_state(
                     &state,
-                    BrowserRuntimeComponentStatus::Failed,
+                    error.component_status(),
                     "managed",
-                    "failed",
+                    "stopped",
                     management_available,
-                    Some("browser_runtime_invalid".to_string()),
+                    Some(error.error_code().to_string()),
+                    error.required_magi_version(),
                 );
+                mark_runtime_interrupted(&state);
             }
         }
     } else {
@@ -315,13 +416,13 @@ async fn run_browser_runtime_controller(
             "stopped",
             false,
             None,
+            None,
         );
+        mark_runtime_interrupted(&state);
     }
 
     while let Some(request) = receiver.recv().await {
-        let result = if development_mode {
-            Err("开发工作区运行时由 daemon 启动配置管理，不能从设置页修改".to_string())
-        } else if let Some(runtime) = managed.as_ref() {
+        let result = if let Some(runtime) = managed.as_ref() {
             handle_component_action(&state, runtime, &mut supervisor, request.action).await
         } else {
             Err("浏览器运行组件发布配置不可用".to_string())
@@ -409,10 +510,12 @@ async fn check_for_component_updates(
     } else {
         BrowserRuntimeComponentStatus::UpdateAvailable
     };
+    let current_runtime_mode = current.runtime_mode.clone();
+    let management_available = current.component_management_available;
     let mut status = current;
     status.component_status = component_status;
-    status.runtime_mode = "managed".to_string();
-    status.component_management_available = true;
+    status.runtime_mode = current_runtime_mode;
+    status.component_management_available = management_available;
     status.available_runtime_version = assessment
         .requires_install
         .then(|| assessment.runtime_version.to_string());
@@ -516,13 +619,16 @@ async fn install_component(
     .map_err(|error| format!("浏览器安装任务异常退出: {error}"))?;
     let _ = fs::remove_file(&archive_path);
     install_result.map_err(|error| {
-        update_component_operation_status(
+        set_component_state(
             state,
             BrowserRuntimeComponentStatus::Failed,
-            Some(assessment.runtime_version.to_string()),
-            Some(assessment.update_level),
+            "managed",
+            "stopped",
+            true,
             Some("browser_runtime_install_failed".to_string()),
+            None,
         );
+        mark_runtime_interrupted(state);
         format!("浏览器运行组件安装失败: {error}")
     })?;
 
@@ -554,7 +660,8 @@ async fn ensure_managed_host_ready(
         supervisor.take();
     }
     if supervisor.is_none() {
-        let config = configured_component_runtime(state, manager)?
+        let config = configured_component_runtime(state, manager)
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| "浏览器运行组件安装后没有激活版本".to_string())?;
         let mut status = state.browser_runtime_status();
         status.component_status = BrowserRuntimeComponentStatus::Installed;
@@ -604,10 +711,22 @@ async fn uninstall_component(
     supervisor: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<BrowserRuntimeComponentOperation, String> {
     stop_host_supervisor(state, supervisor, true).await;
-    tokio::task::spawn_blocking(move || manager.uninstall())
+    let uninstall_result = tokio::task::spawn_blocking(move || manager.uninstall())
         .await
-        .map_err(|error| format!("浏览器卸载任务异常退出: {error}"))?
-        .map_err(|error| format!("浏览器运行组件卸载失败: {error}"))?;
+        .map_err(|error| format!("浏览器卸载任务异常退出: {error}"))?;
+    if let Err(error) = uninstall_result {
+        set_component_state(
+            state,
+            BrowserRuntimeComponentStatus::Failed,
+            "managed",
+            "stopped",
+            true,
+            Some("browser_runtime_uninstall_failed".to_string()),
+            None,
+        );
+        mark_runtime_interrupted(state);
+        return Err(format!("浏览器运行组件卸载失败: {error}"));
+    }
     set_component_state(
         state,
         BrowserRuntimeComponentStatus::NotInstalled,
@@ -615,7 +734,9 @@ async fn uninstall_component(
         "stopped",
         true,
         None,
+        None,
     );
+    mark_runtime_interrupted(state);
     Ok(BrowserRuntimeComponentOperation {
         action: BrowserRuntimeComponentAction::Uninstall,
         runtime_version: None,
@@ -650,6 +771,7 @@ fn set_component_state(
     host_status: &str,
     management_available: bool,
     error_code: Option<String>,
+    required_magi_version: Option<String>,
 ) {
     let mut status = state.browser_runtime_status();
     status.component_status = component_status;
@@ -661,7 +783,7 @@ fn set_component_state(
     status.playwright_version = None;
     status.chromium_version = None;
     status.available_runtime_version = None;
-    status.required_magi_version = None;
+    status.required_magi_version = required_magi_version;
     status.update_level = None;
     status.component_management_available = management_available;
     status.last_error_code = error_code.clone();
@@ -674,9 +796,22 @@ async fn stop_host_supervisor(
     supervisor: &mut Option<tokio::task::JoinHandle<()>>,
     recover_sessions: bool,
 ) {
-    let had_host = state.browser_host_client().is_some();
-    if let Some(client) = state.browser_host_client() {
-        state.set_browser_host_client(None);
+    let client = state.browser_host_client();
+    // 先撤销唯一 Host 客户端并推进 generation，阻止新请求和旧 Host 事件进入。
+    // 一次停止只推进一次 generation，避免生命周期代次因重复 detach 产生空洞。
+    state.set_browser_host_client(None);
+    let host_status = if recover_sessions {
+        "recovering"
+    } else {
+        "stopped"
+    };
+    let mut runtime = state.browser_runtime_status();
+    runtime.host_status = host_status.to_string();
+    runtime.host_protocol_compatible = false;
+    runtime.chromium_version = None;
+    state.set_browser_runtime_status(runtime);
+    publish_runtime_status(state, host_status, None);
+    if let Some(client) = client {
         let shutdown = tokio::time::timeout(
             HOST_SHUTDOWN_TIMEOUT,
             client.request(BrowserHostCommand::Shutdown),
@@ -695,8 +830,7 @@ async fn stop_host_supervisor(
         handle.abort();
         let _ = handle.await;
     }
-    state.set_browser_host_client(None);
-    if recover_sessions && had_host {
+    if recover_sessions {
         begin_runtime_recovery(state);
     }
 }
@@ -884,6 +1018,10 @@ fn runtime_self_test_epoch() -> u64 {
     UtcMillis::now().0.min(MAX_SAFE_RUNTIME_EPOCH)
 }
 
+fn next_host_instance_epoch() -> u64 {
+    HOST_INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
 fn parse_release_key(value: &str) -> Result<[u8; 32], ()> {
     let value = value.trim();
     if value.len() != 64 {
@@ -897,10 +1035,16 @@ fn parse_release_key(value: &str) -> Result<[u8; 32], ()> {
 }
 
 async fn supervise_browser_host(state: ApiState, config: BrowserHostProcessConfig) {
+    if let Err(error) = state.mutate_browser_authority(|authority| {
+        authority.resume_interrupted_sessions(UtcMillis::now());
+        Ok(())
+    }) {
+        tracing::warn!(?error, "Browser Host 启动前恢复中断会话失败");
+    }
     let mut last_failure = "browser_host_start_failed".to_string();
     for attempt in 0..HOST_MAX_ATTEMPTS {
         set_runtime_status(&state, &config, "starting", false, None, None);
-        let started = start_host_attempt(&config, attempt as u64).await;
+        let started = start_host_attempt(&config, next_host_instance_epoch()).await;
         let (mut child, client, handshake) = match started {
             Ok(started) => started,
             Err(error) => {
@@ -939,11 +1083,11 @@ async fn supervise_browser_host(state: ApiState, config: BrowserHostProcessConfi
             }
             continue;
         }
-        state.set_browser_host_client(Some(client.clone()));
+        let host_generation = state.set_browser_host_client(Some(client.clone()));
         // `ready` 是会话级契约，不只是 Host 进程完成握手。
         // 现有权威会话在页面重建完成前仍处于恢复中，因此这段时间对 API
         // 调用方必须保持 Host 不可用。
-        if let Err(error) = restore_browser_sessions(&state, &client).await {
+        if let Err(error) = restore_browser_sessions(&state) {
             last_failure = format!("browser_session_restore_failed:{error}");
             tracing::warn!(error = %last_failure, "Browser Host 启动后恢复页面边界失败");
             let _ = child.start_terminate();
@@ -979,7 +1123,7 @@ async fn supervise_browser_host(state: ApiState, config: BrowserHostProcessConfi
                             if matches!(event.envelope.event, BrowserHostEvent::Heartbeat { .. }) {
                                 last_heartbeat = Instant::now();
                             }
-                            handle_host_event(&state, event);
+                            handle_host_event(&state, event, host_generation);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             tracing::warn!(skipped, "Browser Host 事件消费者落后，状态投影将以 Authority 为准");
@@ -1024,7 +1168,7 @@ async fn supervise_browser_host(state: ApiState, config: BrowserHostProcessConfi
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
-    mark_runtime_failed(&state);
+    mark_runtime_interrupted(&state);
     set_runtime_status(
         &state,
         &config,
@@ -1407,10 +1551,11 @@ fn clear_stale_browser_profile_locks(profile_path: &std::path::Path) -> Result<u
     Ok(removed)
 }
 
-async fn restore_browser_sessions(
-    state: &ApiState,
-    client: &BrowserHostClient,
-) -> Result<(), String> {
+fn restore_browser_sessions(state: &ApiState) -> Result<(), String> {
+    // Browser Host 只管理已经物化的 Chromium Page。恢复阶段只恢复
+    // Authority 的 Session 边界，逻辑 Tab 保持 Suspended，首次激活时再
+    // 通过 RestorePage 创建物理页面。这样升级/重启不会把旧 Tab 数量带入
+    // Host 的物理记录配额，也不会在恢复阶段批量触发页面导航。
     let sessions = state
         .browser_authority
         .lock()
@@ -1421,90 +1566,33 @@ async fn restore_browser_sessions(
         .filter(|session| session.lifecycle == BrowserSessionLifecycle::Recovering)
         .collect::<Vec<_>>();
     for session in sessions {
-        let tabs = {
-            let authority = state
-                .browser_authority
-                .lock()
-                .expect("browser authority lock poisoned");
-            session
-                .tab_ids
-                .iter()
-                .filter_map(|tab_id| authority.tab(tab_id).cloned())
-                .collect::<Vec<_>>()
-        };
-        let mut failure = None;
-        for tab in tabs {
-            let reply = client
-                .request(BrowserHostCommand::CreatePage {
-                    tab_id: tab.tab_id.clone(),
-                    initial_url: tab.url.clone(),
-                    viewport: HostViewport {
-                        width: tab.viewport.width,
-                        height: tab.viewport.height,
-                        surface_width: tab.viewport.width,
-                        surface_height: tab.viewport.height,
-                        device_scale_factor_millis: tab.viewport.device_scale_factor_millis,
-                        device_type: tab.viewport.device_type,
-                    },
-                    navigation_revision: tab.navigation_revision,
-                    snapshot_revision: tab.snapshot_revision,
-                })
-                .await;
-            let page_state = match reply {
-                Ok(reply) => match reply.response.outcome {
-                    BrowserHostCommandOutcome::Succeeded(result) => match *result {
-                        BrowserHostCommandResult::PageState(page_state) => page_state,
-                        result => {
-                            failure = Some(format!(
-                                "恢复 Tab {} 失败: {:?}",
-                                tab.tab_id,
-                                BrowserHostCommandOutcome::Succeeded(Box::new(result))
-                            ));
-                            break;
-                        }
-                    },
-                    outcome => {
-                        failure = Some(format!("恢复 Tab {} 失败: {outcome:?}", tab.tab_id));
-                        break;
-                    }
-                },
-                Err(error) => {
-                    failure = Some(format!("恢复 Tab {} 失败: {error}", tab.tab_id));
-                    break;
-                }
-            };
-            state
-                .mutate_browser_authority(|authority| {
-                    authority.transition_tab(
-                        &tab.tab_id,
-                        BrowserTabLifecycle::Ready,
-                        UtcMillis::now(),
-                    )?;
-                    authority.apply_host_page_state(
-                        &tab.tab_id,
-                        page_state.navigation_revision,
-                        page_state.url.clone(),
-                        page_state.origin.clone(),
-                        page_state.title.clone(),
-                        UtcMillis::now(),
-                    )
-                })
-                .map_err(|error| format!("恢复 Tab 权威状态失败: {error:?}"))?;
-        }
-        if let Some(error) = failure {
-            mark_session_failed(state, &session.browser_session_id);
-            tracing::warn!(browser_session_id = %session.browser_session_id, %error);
-            continue;
-        }
-        state
+        let restored_session = state
             .mutate_browser_authority(|authority| {
-                authority.transition_session(
-                    &session.browser_session_id,
-                    BrowserSessionLifecycle::Ready,
-                    UtcMillis::now(),
-                )
+                let current = authority
+                    .session(&session.browser_session_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        magi_browser_runtime::BrowserAuthorityError::UnknownSession(
+                            session.browser_session_id.clone(),
+                        )
+                    })?;
+                match current.lifecycle {
+                    BrowserSessionLifecycle::Recovering => authority.transition_session(
+                        &session.browser_session_id,
+                        BrowserSessionLifecycle::Ready,
+                        UtcMillis::now(),
+                    ),
+                    BrowserSessionLifecycle::Ready
+                    | BrowserSessionLifecycle::Interrupted
+                    | BrowserSessionLifecycle::Failed
+                    | BrowserSessionLifecycle::Closed => Ok(current),
+                    BrowserSessionLifecycle::Creating => Ok(current),
+                }
             })
             .map_err(|error| format!("恢复 Browser Session 权威状态失败: {error:?}"))?;
+        if restored_session.lifecycle != BrowserSessionLifecycle::Ready {
+            continue;
+        }
         state.event_bus.publish(
             EventEnvelope::domain(
                 EventId::new(format!(
@@ -1528,7 +1616,11 @@ async fn restore_browser_sessions(
     Ok(())
 }
 
-fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent) {
+fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, host_generation: u64) {
+    if state.browser_host_generation() != host_generation {
+        tracing::debug!(host_generation, "忽略旧 Browser Host 代次事件");
+        return;
+    }
     match event.envelope.event {
         BrowserHostEvent::PageUpdated(page_state) => {
             let context = browser_tab_context(state, &page_state.tab_id);
@@ -1556,13 +1648,44 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent) {
                 );
             }
         }
-        BrowserHostEvent::PageSuspended { tab_id } => {
-            publish_tab_event(
-                state,
-                "browser.tab.suspended",
-                browser_tab_context(state, &tab_id),
-                serde_json::json!({ "tab_id": tab_id }),
-            );
+        BrowserHostEvent::PageSuspended(page_state) => {
+            let context = browser_tab_context(state, &page_state.tab_id);
+            let suspended = state.mutate_browser_authority(|authority| {
+                let current = authority.tab(&page_state.tab_id).cloned();
+                if current
+                    .as_ref()
+                    .is_none_or(|tab| !matches!(tab.lifecycle, BrowserTabLifecycle::Ready))
+                {
+                    return Ok(false);
+                }
+                authority.apply_host_page_state(
+                    &page_state.tab_id,
+                    page_state.navigation_revision,
+                    page_state.url.clone(),
+                    page_state.origin.clone(),
+                    page_state.title.clone(),
+                    UtcMillis::now(),
+                )?;
+                authority.transition_tab(
+                    &page_state.tab_id,
+                    BrowserTabLifecycle::Suspended,
+                    UtcMillis::now(),
+                )?;
+                Ok(true)
+            });
+            if suspended.is_ok_and(|changed| changed) {
+                publish_tab_event(
+                    state,
+                    "browser.tab.suspended",
+                    context,
+                    serde_json::json!({
+                        "tab_id": page_state.tab_id,
+                        "url": page_state.url,
+                        "title": page_state.title,
+                        "navigation_revision": page_state.navigation_revision,
+                    }),
+                );
+            }
         }
         BrowserHostEvent::PageCrashed { tab_id, diagnostic } => {
             let context = browser_tab_context(state, &tab_id);
@@ -1703,7 +1826,7 @@ fn interrupt_sessions_for_browser_runtime_failure(state: &ApiState) {
         .snapshot()
         .sessions
         .into_iter()
-        .filter(|session| session.lifecycle.is_open())
+        .filter(|session| session.lifecycle.is_recoverable())
         .collect::<Vec<_>>();
     for browser_session in sessions {
         state.cancel_execution_resources(
@@ -1815,7 +1938,7 @@ fn interrupt_sessions_for_browser_runtime_failure(state: &ApiState) {
     }
 }
 
-fn mark_runtime_failed(state: &ApiState) {
+fn mark_runtime_interrupted(state: &ApiState) {
     let sessions = state
         .browser_authority
         .lock()
@@ -1825,52 +1948,33 @@ fn mark_runtime_failed(state: &ApiState) {
     if let Err(error) = state.mutate_browser_authority(|authority| {
         for session in &sessions {
             if session.lifecycle == BrowserSessionLifecycle::Recovering {
-                authority.transition_session(
-                    &session.browser_session_id,
-                    BrowserSessionLifecycle::Failed,
-                    UtcMillis::now(),
-                )?;
                 for tab_id in &session.tab_ids {
-                    let lifecycle = authority.tab(tab_id).map(|tab| tab.lifecycle);
-                    if lifecycle == Some(BrowserTabLifecycle::Creating) {
+                    if authority.tab(tab_id).is_some_and(|tab| {
+                        matches!(
+                            tab.lifecycle,
+                            BrowserTabLifecycle::Creating
+                                | BrowserTabLifecycle::Ready
+                                | BrowserTabLifecycle::Crashed
+                        )
+                    }) {
                         authority.transition_tab(
                             tab_id,
-                            BrowserTabLifecycle::Crashed,
+                            BrowserTabLifecycle::Suspended,
                             UtcMillis::now(),
                         )?;
                     }
                 }
+                authority.transition_session(
+                    &session.browser_session_id,
+                    BrowserSessionLifecycle::Interrupted,
+                    UtcMillis::now(),
+                )?;
             }
         }
         Ok(())
     }) {
         tracing::error!(?error, "Browser Host 恢复耗尽后标记失败状态失败");
     }
-}
-
-fn mark_session_failed(state: &ApiState, browser_session_id: &magi_core::BrowserSessionId) {
-    let _ = state.mutate_browser_authority(|authority| {
-        let session = authority
-            .session(browser_session_id)
-            .cloned()
-            .ok_or_else(|| {
-                magi_browser_runtime::BrowserAuthorityError::UnknownSession(
-                    browser_session_id.clone(),
-                )
-            })?;
-        for tab_id in &session.tab_ids {
-            if authority.tab(tab_id).map(|tab| tab.lifecycle) == Some(BrowserTabLifecycle::Creating)
-            {
-                authority.transition_tab(tab_id, BrowserTabLifecycle::Crashed, UtcMillis::now())?;
-            }
-        }
-        authority.transition_session(
-            browser_session_id,
-            BrowserSessionLifecycle::Failed,
-            UtcMillis::now(),
-        )?;
-        Ok(())
-    });
 }
 
 fn set_runtime_status(
@@ -1911,11 +2015,7 @@ fn set_runtime_status(
         available_runtime_version: previous.available_runtime_version,
         required_magi_version: previous.required_magi_version,
         update_level: previous.update_level,
-        component_management_available: if config.runtime_mode == "development" {
-            false
-        } else {
-            previous.component_management_available
-        },
+        component_management_available: previous.component_management_available,
         last_error_code: error_code,
     });
 }
@@ -2448,6 +2548,10 @@ mod tests {
                 .session(&browser_session_id)
                 .map(|session| session.lifecycle),
             Some(magi_browser_runtime::BrowserSessionLifecycle::Recovering)
+        );
+        assert_eq!(
+            authority.tab(&browser_tab_id).map(|tab| tab.lifecycle),
+            Some(magi_browser_runtime::BrowserTabLifecycle::Suspended)
         );
         assert_eq!(
             authority

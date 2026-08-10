@@ -10,8 +10,9 @@ mod navigation;
 
 pub use authority::{
     AcquireBrowserLease, BROWSER_DURABLE_STATE_SCHEMA_VERSION, BrowserAuthority,
-    BrowserAuthoritySnapshot, BrowserDurableState, BrowserProfileControlSnapshot,
-    CreateBrowserSession, CreateBrowserTab, ValidateBrowserWrite, ValidatedBrowserWrite,
+    BrowserAuthoritySnapshot, BrowserDurableState, BrowserDurableTab,
+    BrowserProfileControlSnapshot, CreateBrowserSession, CreateBrowserTab, ValidateBrowserWrite,
+    ValidatedBrowserWrite,
 };
 pub use capability::{
     BrowserCapabilityRejection, BrowserCapabilitySnapshot, BrowserCapabilityUnavailableReason,

@@ -1,10 +1,13 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Icon from '../components/Icon.svelte';
+  import FileTypeIcon from '../components/FileTypeIcon.svelte';
   import { i18n } from '../stores/i18n.svelte';
-  import { listAgentDirectory, type WorkspaceDirectoryEntry as DirectoryEntry } from './agent-api';
-  import { isMarkdownFile, isWordFile } from '../lib/file-preview-utils';
-  import type { IconName } from '../lib/icons';
+  import {
+    listAgentDirectory,
+    resolveAgentFileRevealTarget,
+    type WorkspaceDirectoryEntry as DirectoryEntry,
+  } from './agent-api';
 
   interface Props {
     rootPath: string;
@@ -23,7 +26,10 @@
   let dirErrors = $state<Map<string, string>>(new Map());
   let showHidden = $state(false);
   let loadedTreeKey = $state('');
+  let selectedPathRef = $state('');
+  let treeElement = $state<HTMLElement | null>(null);
   let treeGeneration = 0;
+  let selectionGeneration = 0;
   const ROOT_DIRECTORY_KEY = '__workspace_root__';
 
   const rootEntries = $derived(dirCache.get(ROOT_DIRECTORY_KEY) ?? []);
@@ -49,11 +55,69 @@
 
   function resetTree(nextTreeKey = currentTreeKey()): void {
     treeGeneration += 1;
+    selectionGeneration += 1;
     loadedTreeKey = nextTreeKey;
     expandedDirPaths = new Set();
     dirCache = new Map();
     loadingDirPaths = new Set();
     dirErrors = new Map();
+    selectedPathRef = '';
+  }
+
+  $effect(() => {
+    const filePath = selectedFilePath?.trim() || '';
+    const nextWorkspaceId = workspaceId?.trim() || '';
+    const nextRootPath = rootPath?.trim() || '';
+    const currentSelectionGeneration = ++selectionGeneration;
+    selectedPathRef = '';
+    if (!filePath || !nextWorkspaceId || !nextRootPath) {
+      return;
+    }
+    void revealActiveFile(filePath, currentSelectionGeneration, nextWorkspaceId, nextRootPath);
+  });
+
+  async function revealActiveFile(
+    filePath: string,
+    currentSelectionGeneration: number,
+    nextWorkspaceId: string,
+    nextRootPath: string,
+  ): Promise<void> {
+    try {
+      const response = await resolveAgentFileRevealTarget(filePath, {
+        workspaceId: nextWorkspaceId,
+        workspacePath: nextRootPath,
+      });
+      if (currentSelectionGeneration !== selectionGeneration || currentTreeKey() !== loadedTreeKey) {
+        return;
+      }
+      for (const directoryPathRef of response.ancestorPathRefs ?? []) {
+        if (currentSelectionGeneration !== selectionGeneration) {
+          return;
+        }
+        expandedDirPaths = new Set(expandedDirPaths).add(directoryPathRef);
+        await loadDirectory(directoryPathRef);
+        if (dirErrors.has(directoryPathRef)) {
+          return;
+        }
+      }
+      if (currentSelectionGeneration !== selectionGeneration) {
+        return;
+      }
+      selectedPathRef = response.targetPathRef;
+      await scrollSelectedFileIntoView();
+    } catch (error) {
+      if (currentSelectionGeneration === selectionGeneration) {
+        console.debug('[ProjectFileTree] active file is not revealable:', error);
+      }
+    }
+  }
+
+  async function scrollSelectedFileIntoView(): Promise<void> {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    treeElement?.querySelector<HTMLElement>('[aria-selected="true"]')?.scrollIntoView({
+      block: 'nearest',
+      behavior: 'auto',
+    });
   }
 
   async function loadDirectory(pathRef?: string, options: { force?: boolean } = {}): Promise<void> {
@@ -147,15 +211,9 @@
     });
   }
 
-  function getEntryIcon(entry: DirectoryEntry): IconName {
-    if (entry.isDirectory) return 'folder';
-    if (isMarkdownFile(entry.displayPath)) return 'file-text';
-    if (isWordFile(entry.displayPath)) return 'document';
-    return 'file';
-  }
 </script>
 
-<div class="project-file-tree" data-workspace-id={workspaceId}>
+<div class="project-file-tree" data-workspace-id={workspaceId} bind:this={treeElement}>
   <div class="file-tree-heading-row">
     <div class="file-tree-heading" title={titlePath || rootPath}>
       <Icon name="folder" size={12} />
@@ -212,12 +270,12 @@
     class="file-tree-node"
     role="treeitem"
     aria-expanded={entry.isDirectory ? expanded : undefined}
-    aria-selected={!entry.isDirectory && entry.pathRef === selectedFilePath}
+    aria-selected={!entry.isDirectory && entry.pathRef === selectedPathRef}
   >
     <button
       type="button"
       class="file-tree-row"
-      class:selected={!entry.isDirectory && entry.pathRef === selectedFilePath}
+      class:selected={!entry.isDirectory && entry.pathRef === selectedPathRef}
       style={`--tree-depth: ${depth}`}
       title={entry.displayPath}
       onclick={() => handleEntryClick(entry)}
@@ -227,7 +285,11 @@
           <Icon name="chevronDown" size={9} />
         {/if}
       </span>
-      <Icon name={getEntryIcon(entry)} size={12} class="file-tree-entry-icon" />
+      {#if entry.isDirectory}
+        <Icon name="folder" size={12} class="file-tree-entry-icon file-tree-folder-icon" />
+      {:else}
+        <FileTypeIcon path={entry.displayPath} size={14} />
+      {/if}
       <span class="file-tree-name">{entry.name}</span>
     </button>
 
@@ -382,6 +444,10 @@
   :global(.file-tree-entry-icon) {
     flex-shrink: 0;
     color: var(--foreground-muted);
+  }
+
+  :global(.file-tree-row.selected .file-type-icon) {
+    filter: saturate(1.12) brightness(1.08);
   }
 
   .file-tree-name {

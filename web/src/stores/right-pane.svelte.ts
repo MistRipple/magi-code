@@ -8,6 +8,7 @@
  * - 全部 tab 关闭 → 强制 collapsed = true（下一次展开为空白 Pane）
  * - togglePane() 仅切 collapsed；openTab*() 触发自动展开
  * - 同 kind 同 key（agent: agentRunId / code: filepath / browser: BrowserTabId）幂等：复用现有 tab 并激活
+ * - 浏览器 Tab 的存在性只由 BrowserAuthority 决定，前端 localStorage 只保存布局，不保存浏览器 Tab 实体
  * - terminal 以 terminalTabId 作为唯一键；每次新建都是独立命令终端，不共享输出历史
  */
 
@@ -76,7 +77,7 @@ export interface TerminalTabPayload {
 
 export interface BrowserAuthorityTabProjection {
   tabId: string;
-  lifecycle: 'creating' | 'ready' | 'crashed' | 'closed';
+  lifecycle: 'creating' | 'ready' | 'suspended' | 'crashed' | 'closed';
   url: string;
   title: string;
 }
@@ -214,6 +215,12 @@ function sanitizeTabForPersist(tab: RightPaneTab): RightPaneTab {
   return { ...tab, payload: slim };
 }
 
+function tabsForPersist(tabs: RightPaneTab[]): RightPaneTab[] {
+  // BrowserAuthority 在 daemon 重启和运行组件升级时负责恢复浏览器 Tab。
+  // 不把浏览器实体复制到 localStorage，避免前端先挂载已经失效的 Host 引用。
+  return tabs.filter((tab) => tab.kind !== 'browser').map(sanitizeTabForPersist);
+}
+
 function isRestorableTab(tab: RightPaneTab): boolean {
   if (!tab || typeof tab.id !== 'string') {
     return false;
@@ -225,15 +232,7 @@ function isRestorableTab(tab: RightPaneTab): boolean {
   if (tab.kind === 'code') {
     return Boolean((tab.payload as CodeTabPayload | undefined)?.filepath?.trim());
   }
-  if (tab.kind === 'browser') {
-    const payload = tab.payload as BrowserTabPayload | undefined;
-    return Boolean(
-      payload?.browserSessionId?.trim()
-      && payload?.tabId?.trim()
-      && payload?.workspaceId?.trim()
-      && payload?.sessionId?.trim(),
-    );
-  }
+  if (tab.kind === 'browser') return false;
   if (tab.kind === 'terminal') {
     const payload = tab.payload as TerminalTabPayload | undefined;
     return Boolean(
@@ -264,7 +263,9 @@ function loadPersisted(): void {
       recovered[sid] = {
         openTabs,
         activeTabId,
-        collapsed: openTabs.length === 0 ? true : Boolean(state.collapsed),
+        // 浏览器 Tab 会在连接 BrowserAuthority 后重新投影，不能因启动时
+        // 尚未投影而把用户原本展开的右侧面板永久折叠。
+        collapsed: Boolean(state.collapsed),
       };
     }
     rightPaneState.perSession = recovered;
@@ -302,7 +303,7 @@ function persistState(): void {
         kept.map(([sid, state]) => [
           sid,
           {
-            openTabs: state.openTabs.map(sanitizeTabForPersist),
+            openTabs: tabsForPersist(state.openTabs),
             activeTabId: state.activeTabId,
             collapsed: state.collapsed,
           },
@@ -774,6 +775,13 @@ export function synchronizeBrowserTabs(
 
   if (previousActiveStillExists) {
     pane.activeTabId = previousActiveTabId;
+    return;
+  }
+
+  // 页面刷新后浏览器 Tab 不从 localStorage 恢复，首轮权威投影没有本地
+  // activeTabId。此时使用 BrowserAuthority 的活动 Tab，但不改变 collapsed。
+  if (!previousActiveTabId && authorityActiveExists) {
+    pane.activeTabId = authorityActivePaneId;
     return;
   }
 

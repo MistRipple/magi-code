@@ -626,11 +626,25 @@ async fn resolve_file_reveal_target(
         .map_err(|error| {
             directory_access_error("规范化工作区根目录失败", &workspace_root, error)
         })?;
+    let mut ancestor_path_refs = Vec::new();
+    let mut ancestor = target_path.parent();
+    while let Some(path) = ancestor {
+        if path == canonical_workspace_root {
+            break;
+        }
+        if !path.starts_with(&canonical_workspace_root) {
+            break;
+        }
+        ancestor_path_refs.push(path_ref(path));
+        ancestor = path.parent();
+    }
+    ancestor_path_refs.reverse();
 
     Ok(Json(serde_json::json!({
         "targetPathRef": path_ref(&target_path),
         "workspaceRootPathRef": path_ref(&canonical_workspace_root),
         "displayPath": display_path(&target_path),
+        "ancestorPathRefs": ancestor_path_refs,
     })))
 }
 
@@ -1859,6 +1873,21 @@ mod tests {
             payload["workspaceRootPathRef"]
                 .as_str()
                 .is_some_and(|value| value.starts_with("mhp1:"))
+        );
+        let ancestor_path_refs = payload["ancestorPathRefs"]
+            .as_array()
+            .expect("ancestor path refs array");
+        assert_eq!(ancestor_path_refs.len(), 1);
+        let ancestor_path = magi_core::HostPath::from_path_ref(
+            ancestor_path_refs[0]
+                .as_str()
+                .expect("ancestor path ref should be a string"),
+        )
+        .expect("ancestor path ref should decode")
+        .into_path_buf();
+        assert_eq!(
+            ancestor_path,
+            file.parent().unwrap().canonicalize().unwrap()
         );
         assert_eq!(
             payload["displayPath"],

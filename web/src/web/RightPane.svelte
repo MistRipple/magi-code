@@ -107,12 +107,22 @@
   }
   let creatingBrowserPane = $state(false);
   let browserCapabilities = $state<BrowserCapabilitiesSnapshot | null>(null);
+  let browserCapabilitiesPollTimer: number | null = null;
   let addPaneMenuOpen = $state(false);
   let addPaneMenuElement = $state<HTMLDivElement | undefined>(undefined);
+  const browserRuntimeUsable = $derived(
+    browserCapabilities?.runtimeStatus === 'installed'
+      || browserCapabilities?.runtimeStatus === 'update_available',
+  );
   const canCreateBrowserPane = $derived(Boolean(
     browserCapabilities?.inAppBrowserEnabled
-      && browserCapabilities.hostStatus === 'ready'
-      && browserCapabilities.hostProtocolCompatible
+      && browserRuntimeUsable
+      && (
+        (browserCapabilities.hostStatus === 'ready'
+          && browserCapabilities.hostProtocolCompatible)
+        || browserCapabilities.hostStatus === 'starting'
+        || browserCapabilities.hostStatus === 'recovering'
+      )
       && rightPaneState.activeWorkspaceId.trim()
       && rightPaneState.activeSessionId.trim(),
   ));
@@ -126,10 +136,45 @@
     browserCapabilities = snapshot;
   }
 
+  function stopBrowserCapabilitiesPoll(): void {
+    if (browserCapabilitiesPollTimer === null) return;
+    window.clearInterval(browserCapabilitiesPollTimer);
+    browserCapabilitiesPollTimer = null;
+  }
+
+  function browserCapabilitiesSettled(snapshot: BrowserCapabilitiesSnapshot | null): boolean {
+    if (!snapshot) return false;
+    // Magi 启动时能力接口可能先返回默认组件状态，Host 随后才完成握手。
+    // 只有启动/恢复和安装过程结束后才停止轮询，不能把“暂不可用”误判成最终状态。
+    if (snapshot.hostStatus === 'starting' || snapshot.hostStatus === 'recovering') {
+      return false;
+    }
+    return snapshot.runtimeStatus !== 'downloading'
+      && snapshot.runtimeStatus !== 'verifying';
+  }
+
+  function pollBrowserCapabilities(): void {
+    if (browserCapabilitiesPollTimer !== null) return;
+    browserCapabilitiesPollTimer = window.setInterval(() => {
+      const current = browserCapabilities;
+      if (browserCapabilitiesSettled(current)) {
+        stopBrowserCapabilitiesPoll();
+        return;
+      }
+      void getBrowserCapabilities()
+        .then(applyBrowserCapabilities)
+        .catch((error) => console.warn('[RightPane] 刷新浏览器运行能力失败:', error));
+    }, 500);
+  }
+
   onMount(() => {
     void getBrowserCapabilities()
       .then(applyBrowserCapabilities)
-      .catch((error) => console.warn('[RightPane] 获取浏览器能力失败:', error));
+      .catch((error) => {
+        console.warn('[RightPane] 获取浏览器能力失败:', error);
+        pollBrowserCapabilities();
+      });
+    pollBrowserCapabilities();
     const handleCapabilitiesChanged = (event: Event) => {
       applyBrowserCapabilities((event as CustomEvent<BrowserCapabilitiesSnapshot>).detail);
     };
@@ -162,6 +207,7 @@
     return () => {
       window.removeEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
       window.removeEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, handleRuntimeStatusChanged);
+      stopBrowserCapabilitiesPoll();
       window.removeEventListener('pointerdown', handleOutsidePointer);
       window.removeEventListener('keydown', handleEscape);
       window.removeEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
@@ -224,7 +270,6 @@
         targetUrl,
         initialBrowserViewport(),
       );
-      await activateBrowserTab(tab.tabId);
       registerBrowserPane(
         browserSession.browserSessionId,
         tab.tabId,
@@ -289,6 +334,29 @@
     return activeTabId
       ? state?.openTabs.find((tab) => tab.id === activeTabId) ?? null
       : null;
+  });
+
+  // 右侧一级 Tab 是用户当前查看页面的唯一选择源。浏览器内容组件只读取并订阅
+  // BrowserAuthority，不再在挂载时自行激活页面，避免旧组件的迟到请求抢回 activeTab。
+  let activeBrowserActivationKey = '';
+  let activeBrowserActivationRequest = 0;
+  $effect(() => {
+    const current = activeTab;
+    if (!current || current.kind !== 'browser') {
+      activeBrowserActivationKey = '';
+      return;
+    }
+    const payload = current.payload as BrowserTabPayload;
+    const activationKey = `${payload.browserSessionId}\u0000${payload.tabId}`;
+    if (activationKey === activeBrowserActivationKey) return;
+    activeBrowserActivationKey = activationKey;
+    const request = ++activeBrowserActivationRequest;
+    void activateBrowserTab(payload.tabId).catch((error) => {
+      if (request !== activeBrowserActivationRequest) return;
+      activeBrowserActivationKey = '';
+      console.warn('[RightPane] 激活浏览器面板失败:', error);
+      addToast('error', i18n.t('browser.error.openInternal'), undefined, { forceVisible: true });
+    });
   });
 
   // ============ Code tab：内容拉取 ============
@@ -681,7 +749,6 @@
         agentUrl('/api/files/site-open', activeFilePreviewQuery),
         initialBrowserViewport(),
       );
-      await activateBrowserTab(tab.tabId);
       registerBrowserPane(
         browserSession.browserSessionId,
         tab.tabId,
@@ -797,12 +864,6 @@
   function handleTabClick(tabId: string) {
     if (recentlyDragged()) return;
     setActiveRightPaneTab(paneScopeKey, tabId);
-    const tab = openTabs.find((item) => item.id === tabId);
-    if (tab?.kind === 'browser') {
-      void activateBrowserTab((tab.payload as BrowserTabPayload).tabId).catch((error) => {
-        console.warn('[RightPane] 激活浏览器面板失败:', error);
-      });
-    }
   }
 
   function handleTabClose(event: MouseEvent, tabId: string) {

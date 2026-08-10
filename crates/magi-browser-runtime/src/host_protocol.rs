@@ -3,7 +3,7 @@ use magi_core::{BrowserCommandId, BrowserLeaseId, BrowserTabId};
 use serde::{Deserialize, Serialize};
 
 pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 1;
-pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 10;
+pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 11;
 pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 400;
 pub const DEFAULT_BROWSER_SNAPSHOT_TEXT_LIMIT_BYTES: u32 = 32 * 1024;
 
@@ -64,6 +64,17 @@ pub enum BrowserHostCommand {
         viewport: HostViewport,
         navigation_revision: u64,
         snapshot_revision: u64,
+        allow_streaming_eviction: bool,
+    },
+    /// 将 Authority 中的逻辑 Tab 物化为 Chromium Page；已存在的 Page 则只做激活。
+    /// Browser Host 不在启动时登记全部逻辑 Tab，避免恢复 Tab 占用 Host 的物理记录槽位。
+    RestorePage {
+        tab_id: BrowserTabId,
+        initial_url: String,
+        viewport: HostViewport,
+        navigation_revision: u64,
+        snapshot_revision: u64,
+        allow_streaming_eviction: bool,
     },
     SetViewport {
         tab_id: BrowserTabId,
@@ -76,9 +87,6 @@ pub enum BrowserHostCommand {
         viewport: BrowserLogicalViewport,
     },
     ClosePage {
-        tab_id: BrowserTabId,
-    },
-    ActivatePage {
         tab_id: BrowserTabId,
     },
     Navigate {
@@ -438,9 +446,9 @@ pub struct BrowserHostEventEnvelope {
 pub enum BrowserHostEvent {
     Ready(BrowserHostHandshake),
     PageUpdated(BrowserHostPageState),
-    PageSuspended {
-        tab_id: BrowserTabId,
-    },
+    /// Host 淘汰了一个物理 Page。Authority 必须先接收这个状态，再允许 UI/worker
+    /// 通过 RestorePage 按需重新物化，不能只发一条无法驱动状态机的遥测事件。
+    PageSuspended(BrowserHostPageState),
     PageCrashed {
         tab_id: BrowserTabId,
         diagnostic: Option<String>,

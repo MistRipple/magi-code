@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = { major: 1, minor: 10 } as const;
+export const PROTOCOL_VERSION = { major: 1, minor: 11 } as const;
 export const DEFAULT_SNAPSHOT_LIMITS = {
   max_nodes: 400,
   max_text_bytes: 32 * 1024,
@@ -25,6 +25,18 @@ export type HostCommand =
         viewport: HostViewport;
         navigation_revision: number;
         snapshot_revision: number;
+        allow_streaming_eviction?: boolean;
+      };
+    }
+  | {
+      type: "restore_page";
+      payload: {
+        tab_id: string;
+        initial_url: string;
+        viewport: HostViewport;
+        navigation_revision: number;
+        snapshot_revision: number;
+        allow_streaming_eviction: boolean;
       };
     }
   | {
@@ -42,7 +54,6 @@ export type HostCommand =
       };
     }
   | { type: "close_page"; payload: { tab_id: string } }
-  | { type: "activate_page"; payload: { tab_id: string } }
   | {
       type: "navigate";
       payload: {
@@ -344,7 +355,7 @@ export type HostEvent =
       type: "page_crashed";
       payload: { tab_id: string; diagnostic?: string | null };
     }
-  | { type: "page_suspended"; payload: { tab_id: string } }
+  | { type: "page_suspended"; payload: PageState }
   | {
       type: "console";
       payload: { tab_id: string; level: string; text: string };

@@ -80,6 +80,7 @@ interface PageRecord {
   cdp?: CDPSession;
   screencastListener?: (event: ScreencastFrameEvent) => void;
   screencastSettings?: ScreencastSettings;
+  screencastViewportRefreshScheduled: boolean;
   screencastAck: Promise<void>;
 }
 
@@ -190,14 +191,14 @@ export class BrowserHost {
         return emptyResult();
       case "create_page":
         return this.createPage(command.payload);
+      case "restore_page":
+        return this.restorePage(command.payload);
       case "set_viewport":
         return this.setViewport(command.payload);
       case "set_logical_viewport":
         return this.setLogicalViewport(command.payload);
       case "close_page":
         return this.closePage(command.payload.tab_id);
-      case "activate_page":
-        return this.activatePage(command.payload.tab_id);
       case "navigate":
         return this.navigate(command.payload);
       case "snapshot":
@@ -251,6 +252,7 @@ export class BrowserHost {
     viewport: HostViewport;
     navigation_revision: number;
     snapshot_revision: number;
+    allow_streaming_eviction?: boolean;
   }): Promise<ExecutedCommand> {
     if (this.#pages.has(input.tab_id)) {
       throw new ProtocolFailure(
@@ -262,35 +264,12 @@ export class BrowserHost {
     }
     validateViewport(input.viewport);
     validateNavigationUrl(input.initial_url);
-    if (this.#pages.size >= this.#config.maxTabs) {
-      throw new ProtocolFailure(
-        "browser_tab_limit_reached",
-        `browser tab limit reached: ${this.#config.maxTabs}`,
-        true,
-        false,
-        "请关闭不再使用的浏览器面板后重试。",
-      );
-    }
-    const record: PageRecord = {
-        tabId: input.tab_id,
-        snapshot: new SnapshotRegistry(input.snapshot_revision),
-        navigationRevision: input.navigation_revision,
-        frameSequence: 0,
-        restoringInitialPage: false,
-        viewport: input.viewport,
-        defaultUserAgent: "",
-        defaultPlatform: "",
-        currentUrl: input.initial_url,
-        currentOrigin: null,
-        currentTitle: "",
-        lastUsedSequence: 0,
-      inFlightCommands: 0,
-      screencastAck: Promise.resolve(),
-    };
+    this.ensureRecordCapacity();
+    const record = this.newPageRecord(input);
     this.#pages.set(input.tab_id, record);
     record.inFlightCommands = 1;
     try {
-      await this.ensurePage(record);
+      await this.ensurePage(record, Boolean(input.allow_streaming_eviction));
       const state = await this.pageState(record);
       this.#transport.emit({ type: "page_updated", payload: state });
       return { result: { type: "page_state", payload: state } };
@@ -302,8 +281,78 @@ export class BrowserHost {
     }
   }
 
+  private async restorePage(input: {
+    tab_id: string;
+    initial_url: string;
+    viewport: HostViewport;
+    navigation_revision: number;
+    snapshot_revision: number;
+    allow_streaming_eviction: boolean;
+  }): Promise<ExecutedCommand> {
+    validateViewport(input.viewport);
+    validateNavigationUrl(input.initial_url);
+    const existing = this.#pages.get(input.tab_id);
+    if (existing) {
+      await this.ensurePage(existing, input.allow_streaming_eviction);
+      await this.requirePage(existing).bringToFront();
+      this.#foregroundTabId = input.tab_id;
+      this.touch(existing);
+      return { result: { type: "page_state", payload: await this.pageState(existing) } };
+    }
+
+    // Authority 是逻辑 Tab 的唯一来源。Host 只在真正使用 Tab 时创建记录和
+    // Chromium Page，因此 daemon 重启后恢复的 Tab 不会预先占用 Host 卡槽。
+    this.ensureRecordCapacity();
+    const record = this.newPageRecord(input);
+    this.#pages.set(input.tab_id, record);
+    record.inFlightCommands = 1;
+    try {
+      await this.ensurePage(record, input.allow_streaming_eviction);
+      await this.requirePage(record).bringToFront();
+      this.#foregroundTabId = input.tab_id;
+      const state = await this.pageState(record);
+      this.#transport.emit({ type: "page_updated", payload: state });
+      return { result: { type: "page_state", payload: state } };
+    } catch (error) {
+      this.#pages.delete(input.tab_id);
+      throw playwrightFailure("browser_page_restore_failed", error, false);
+    } finally {
+      record.inFlightCommands -= 1;
+    }
+  }
+
+  private newPageRecord(input: {
+    tab_id: string;
+    initial_url: string;
+    viewport: HostViewport;
+    navigation_revision: number;
+    snapshot_revision: number;
+  }): PageRecord {
+    return {
+      tabId: input.tab_id,
+      snapshot: new SnapshotRegistry(input.snapshot_revision),
+      navigationRevision: input.navigation_revision,
+      frameSequence: 0,
+      restoringInitialPage: false,
+      viewport: input.viewport,
+      defaultUserAgent: "",
+      defaultPlatform: "",
+      currentUrl: input.initial_url,
+      currentOrigin: null,
+      currentTitle: "",
+      lastUsedSequence: 0,
+      inFlightCommands: 0,
+      screencastViewportRefreshScheduled: false,
+      screencastAck: Promise.resolve(),
+    };
+  }
+
   private async closePage(tabId: string): Promise<ExecutedCommand> {
-    const record = this.pageRecord(tabId);
+    // Page 崩溃后会从 Host 的物理页面表移除，但 Authority 仍保留
+    // crashed Tab 供用户查看和关闭。关闭操作必须幂等，不能因物理页已不存在
+    // 阻止 Authority 收口这个逻辑 Tab。
+    const record = this.#pages.get(tabId);
+    if (!record) return emptyResult();
     await this.stopScreencast(tabId);
     this.#pages.delete(tabId);
     if (this.#foregroundTabId === tabId) this.#foregroundTabId = undefined;
@@ -320,6 +369,9 @@ export class BrowserHost {
     await this.ensurePage(record);
     const logicalViewportChanged = await this.applyViewport(record, input.viewport);
     if (logicalViewportChanged) record.snapshot.invalidate();
+    if (record.screencastListener) {
+      await this.emitCurrentViewportFrame(record);
+    }
     return emptyResult();
   }
 
@@ -338,8 +390,12 @@ export class BrowserHost {
     return emptyResult();
   }
 
-  private async applyViewport(record: PageRecord, viewport: HostViewport): Promise<boolean> {
-    const logicalViewportChanged = !record.cdp
+  private async applyViewport(
+    record: PageRecord,
+    viewport: HostViewport,
+    force = false,
+  ): Promise<boolean> {
+    const logicalViewportChanged = force || !record.cdp
       || record.viewport.width !== viewport.width
       || record.viewport.height !== viewport.height
       || record.viewport.device_scale_factor_millis !== viewport.device_scale_factor_millis
@@ -416,13 +472,16 @@ export class BrowserHost {
     });
   }
 
-  private async ensurePage(record: PageRecord): Promise<void> {
+  private async ensurePage(
+    record: PageRecord,
+    allowStreamingEviction = false,
+  ): Promise<void> {
     if (record.page) {
       await this.flushScreencastAck(record);
       this.touch(record);
       return;
     }
-    await this.ensureActiveCapacity();
+    await this.ensureActiveCapacity(record, allowStreamingEviction);
     const page = await this.context().newPage();
     record.page = page;
     try {
@@ -456,16 +515,79 @@ export class BrowserHost {
     }
   }
 
-  private async ensureActiveCapacity(): Promise<void> {
+  private async ensureActiveCapacity(
+    target: PageRecord,
+    allowStreamingEviction: boolean,
+  ): Promise<void> {
     const active = [...this.#pages.values()].filter((record) => record.page).length;
     if (active < this.#config.maxActivePages) return;
+    const candidates = [...this.#pages.values()]
+      .filter((record) => (
+        record !== target
+        && record.page
+        && record.inFlightCommands === 0
+      ))
+      .sort((left, right) => left.lastUsedSequence - right.lastUsedSequence);
+    const candidate = candidates.find((record) => !record.screencastSettings)
+      ?? (allowStreamingEviction ? candidates[0] : undefined);
+    if (candidate) {
+      await this.suspendPage(candidate);
+      return;
+    }
     throw new ProtocolFailure(
       "browser_active_page_limit_reached",
       `active browser page limit reached: ${this.#config.maxActivePages}`,
       true,
       false,
-      "请先关闭其他浏览器面板后重试。页面不会被自动关闭或重建。",
+      "所有浏览器页面当前都在执行操作，请稍后重试。",
     );
+  }
+
+  private ensureRecordCapacity(): void {
+    while (this.#pages.size >= this.#config.maxTabs) {
+      const candidate = [...this.#pages.values()]
+        .filter((record) => !record.page && record.inFlightCommands === 0)
+        .sort((left, right) => left.lastUsedSequence - right.lastUsedSequence)[0];
+      if (!candidate) {
+        throw new ProtocolFailure(
+          "browser_tab_limit_reached",
+          `browser tab limit reached: ${this.#config.maxTabs}`,
+          true,
+          false,
+          "所有浏览器页面当前都在执行操作，请稍后重试。",
+        );
+      }
+      // Suspended Page 的最新文档状态已经通过 page_suspended 事件交给
+      // Authority；这里只清理 Host 的易失记录，不删除用户的逻辑 Tab。
+      this.#pages.delete(candidate.tabId);
+    }
+  }
+
+  private async suspendPage(record: PageRecord): Promise<void> {
+    const page = record.page;
+    if (!page) return;
+    const state = await this.pageState(record).catch(() => ({
+      tab_id: record.tabId,
+      url: record.currentUrl,
+      origin: record.currentOrigin,
+      title: record.currentTitle,
+      navigation_revision: record.navigationRevision,
+    } satisfies PageState));
+    record.screencastSettings = undefined;
+    await this.stopScreencastSession(record);
+    record.page = undefined;
+    record.cdp = undefined;
+    record.screencastListener = undefined;
+    record.navigationRevision += 1;
+    record.snapshot.invalidate();
+    record.frameSequence = 0;
+    if (this.#foregroundTabId === record.tabId) this.#foregroundTabId = undefined;
+    await page.close().catch(() => undefined);
+    this.#pages.delete(record.tabId);
+    this.#transport.emit({
+      type: "page_suspended",
+      payload: state,
+    });
   }
 
   private touch(record: PageRecord): void {
@@ -487,17 +609,6 @@ export class BrowserHost {
   private async cdpSession(record: PageRecord): Promise<CDPSession> {
     record.cdp ??= await this.context().newCDPSession(this.requirePage(record));
     return record.cdp;
-  }
-
-  private async activatePage(tabId: string): Promise<ExecutedCommand> {
-    const record = this.pageRecord(tabId);
-    await this.ensurePage(record);
-    await this.requirePage(record).bringToFront();
-    this.#foregroundTabId = tabId;
-    this.touch(record);
-    return {
-      result: { type: "page_state", payload: await this.pageState(record) },
-    };
   }
 
   private async navigate(input: {
@@ -963,7 +1074,7 @@ export class BrowserHost {
     max_height: number;
   }): Promise<ExecutedCommand> {
     const record = this.pageRecord(input.tab_id);
-    await this.ensurePage(record);
+    await this.ensurePage(record, true);
     record.screencastSettings = {
       format: input.format,
       quality: Math.max(0, Math.min(Math.floor(input.quality), 100)),
@@ -972,6 +1083,70 @@ export class BrowserHost {
     };
     await this.restartScreencast(record);
     return emptyResult();
+  }
+
+  private async emitCurrentViewportFrame(
+    record: PageRecord,
+    geometry?: {
+      width: number;
+      height: number;
+      deviceScaleFactorMillis: number;
+    },
+  ): Promise<void> {
+    const settings = record.screencastSettings;
+    if (!settings || !record.page) return;
+    let bytes: Buffer | undefined;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const candidate = await record.page.screenshot({
+        type: settings.format,
+        quality: settings.format === "jpeg" ? settings.quality : undefined,
+        fullPage: false,
+      });
+      if (this.screencastBitmapMatchesViewport(record, settings, candidate)) {
+        bytes = candidate;
+        break;
+      }
+      await this.applyViewport(record, record.viewport, true);
+    }
+    if (!bytes) {
+      throw new ProtocolFailure(
+        "browser_screencast_frame_size_mismatch",
+        "Chromium screenshot dimensions do not match the active browser viewport",
+        true,
+        false,
+        "浏览器画面尺寸尚未稳定，请稍后重试。",
+      );
+    }
+    record.frameSequence += 1;
+    const payload = binaryPayload(
+      bytes,
+      settings.format === "png" ? "image/png" : "image/jpeg",
+    );
+    const metadata: ScreencastFrame = {
+      tab_id: record.tabId,
+      frame_sequence: record.frameSequence,
+      navigation_revision: record.navigationRevision,
+      payload_id: payload.payload_id,
+      mime_type: payload.mime_type,
+      byte_length: payload.byte_length,
+      sha256: payload.sha256,
+      width: geometry?.width ?? record.viewport.width,
+      height: geometry?.height ?? record.viewport.height,
+      surface_width: Math.max(
+        1,
+        Math.round(record.viewport.width * viewportSurfaceScale(record.viewport)),
+      ),
+      surface_height: Math.max(
+        1,
+        Math.round(record.viewport.height * viewportSurfaceScale(record.viewport)),
+      ),
+      device_scale_factor_millis: geometry?.deviceScaleFactorMillis ?? Math.max(
+        1,
+        Math.round(this.#config.deviceScaleFactor * 1_000),
+      ),
+    };
+    this.#transport.emit({ type: "screencast_frame", payload: metadata });
+    this.#transport.emitBinary(bytes);
   }
 
   private async restartScreencast(record: PageRecord): Promise<void> {
@@ -985,7 +1160,6 @@ export class BrowserHost {
     });
     const listener = (frame: ScreencastFrameEvent) => {
       const bytes = Buffer.from(frame.data, "base64");
-      record.frameSequence += 1;
       const pageScaleFactor = Number.isFinite(frame.metadata.pageScaleFactor)
         && frame.metadata.pageScaleFactor > 0
         ? frame.metadata.pageScaleFactor
@@ -998,6 +1172,46 @@ export class BrowserHost {
         1,
         Math.round(frame.metadata.deviceHeight / pageScaleFactor),
       );
+      // Chromium 偶尔会在 Page.startScreencast 后发出虚拟窗口尺寸的旧首帧，
+      // 同时 metadata 却已经是新 View 的尺寸。只检查 metadata 会把一张
+      // 7680px 位图当成 478px 面板帧，最终在 UI 中被非等比压扁。
+      // 二进制位图尺寸才是生产端协议边界，必须与当前设备视口和 DPR 一致。
+      const frameMatchesViewport = this.screencastBitmapMatchesViewport(
+        record,
+        settings,
+        bytes,
+      );
+      record.screencastAck = record.screencastAck
+        .catch(() => undefined)
+        .then(async () => {
+          await cdp
+            .send("Page.screencastFrameAck", { sessionId: frame.sessionId })
+            .catch(() => undefined);
+        });
+      if (!frameMatchesViewport) {
+        if (!record.screencastViewportRefreshScheduled) {
+          record.screencastViewportRefreshScheduled = true;
+          void this.applyViewport(record, record.viewport, true)
+            .then(() => this.emitCurrentViewportFrame(record, {
+              width,
+              height,
+              deviceScaleFactorMillis: Math.max(
+                1,
+                Math.round(pageScaleFactor * this.#config.deviceScaleFactor * 1_000),
+              ),
+            }))
+            .then(() => {
+              acceptFirstFrame?.();
+              acceptFirstFrame = undefined;
+            })
+            .catch(() => undefined)
+            .finally(() => {
+              record.screencastViewportRefreshScheduled = false;
+            });
+        }
+        return;
+      }
+      record.frameSequence += 1;
       const payload = binaryPayload(
         bytes,
         settings.format === "png" ? "image/png" : "image/jpeg",
@@ -1027,13 +1241,6 @@ export class BrowserHost {
       this.#transport.emitBinary(bytes);
       acceptFirstFrame?.();
       acceptFirstFrame = undefined;
-      record.screencastAck = record.screencastAck
-        .catch(() => undefined)
-        .then(async () => {
-          await cdp
-            .send("Page.screencastFrameAck", { sessionId: frame.sessionId })
-            .catch(() => undefined);
-        });
     };
     record.screencastListener = listener;
     cdp.on("Page.screencastFrame", listener);
@@ -1048,6 +1255,10 @@ export class BrowserHost {
         maxHeight: settings.maxHeight,
         everyNthFrame: 1,
       });
+      // 并发创建多个 Page 时，Chromium 可能先发出窗口默认尺寸的首帧，
+      // 即使之前已经设置过 Emulation。重新应用一次只改变当前 Page 的
+      // metrics，不导航、不重载页面，并由上面的首帧校验决定何时对外发布。
+      await this.applyViewport(record, record.viewport, true);
       await Promise.race([
         firstFrame,
         new Promise<void>((_, reject) => {
@@ -1072,6 +1283,27 @@ export class BrowserHost {
     }
   }
 
+  private screencastBitmapMatchesViewport(
+    record: PageRecord,
+    settings: ScreencastSettings,
+    bytes: Buffer,
+  ): boolean {
+    const actual = encodedImageDimensions(bytes, settings.format);
+    if (!actual) return false;
+    const physicalWidth = record.viewport.width * this.#config.deviceScaleFactor;
+    const physicalHeight = record.viewport.height * this.#config.deviceScaleFactor;
+    const scale = Math.min(
+      1,
+      settings.maxWidth / physicalWidth,
+      settings.maxHeight / physicalHeight,
+    );
+    const expected = {
+      width: Math.max(1, Math.round(physicalWidth * scale)),
+      height: Math.max(1, Math.round(physicalHeight * scale)),
+    };
+    return actual.width === expected.width && actual.height === expected.height;
+  }
+
   private async stopScreencast(tabId: string): Promise<ExecutedCommand> {
     const record = this.#pages.get(tabId);
     if (!record) return emptyResult();
@@ -1087,6 +1319,7 @@ export class BrowserHost {
       cdp.off("Page.screencastFrame", record.screencastListener);
     }
     record.screencastListener = undefined;
+    record.screencastViewportRefreshScheduled = false;
     await this.flushScreencastAck(record);
     await cdp.send("Page.stopScreencast").catch(() => undefined);
   }
@@ -1194,6 +1427,14 @@ export class BrowserHost {
       void popup.close().catch(() => undefined);
     });
     page.on("crash", () => {
+      if (!this.retirePageRecord(record, page)) return;
+      this.#transport.emit({
+        type: "page_crashed",
+        payload: { tab_id: record.tabId },
+      });
+    });
+    page.on("close", () => {
+      if (!this.retirePageRecord(record, page)) return;
       this.#transport.emit({
         type: "page_crashed",
         payload: { tab_id: record.tabId },
@@ -1325,6 +1566,17 @@ export class BrowserHost {
     }
     return record;
   }
+
+  private retirePageRecord(record: PageRecord, page: Page): boolean {
+    if (this.#pages.get(record.tabId) !== record || record.page !== page) return false;
+    this.#pages.delete(record.tabId);
+    if (this.#foregroundTabId === record.tabId) this.#foregroundTabId = undefined;
+    record.page = undefined;
+    record.cdp = undefined;
+    record.screencastListener = undefined;
+    record.screencastSettings = undefined;
+    return true;
+  }
 }
 
 function emptyResult(): ExecutedCommand {
@@ -1430,6 +1682,60 @@ function viewportSurfaceScale(viewport: HostViewport): number {
     viewport.surface_width / viewport.width,
     viewport.surface_height / viewport.height,
   );
+}
+
+function encodedImageDimensions(
+  bytes: Buffer,
+  format: "jpeg" | "png",
+): { width: number; height: number } | undefined {
+  if (format === "png") {
+    if (
+      bytes.length < 24
+      || !bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+    ) {
+      return undefined;
+    }
+    return {
+      width: bytes.readUInt32BE(16),
+      height: bytes.readUInt32BE(20),
+    };
+  }
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
+    return undefined;
+  }
+  const startOfFrameMarkers = new Set([
+    0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7,
+    0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
+  ]);
+  let offset = 2;
+  while (offset + 3 < bytes.length) {
+    if (bytes[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+    const marker = bytes[offset + 1];
+    offset += 2;
+    if (
+      marker === 0xd8
+      || marker === 0xd9
+      || marker === 0x01
+      || (marker >= 0xd0 && marker <= 0xd7)
+    ) {
+      continue;
+    }
+    if (offset + 2 > bytes.length) return undefined;
+    const segmentLength = bytes.readUInt16BE(offset);
+    if (segmentLength < 2 || offset + segmentLength > bytes.length) return undefined;
+    if (startOfFrameMarkers.has(marker)) {
+      if (segmentLength < 7) return undefined;
+      return {
+        width: bytes.readUInt16BE(offset + 5),
+        height: bytes.readUInt16BE(offset + 3),
+      };
+    }
+    offset += segmentLength;
+  }
+  return undefined;
 }
 
 function validateNormalizedRect(rect: NormalizedRect): void {

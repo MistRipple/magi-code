@@ -88,13 +88,18 @@ assert.match(
 );
 assert.match(
   browserRuntimeReleaseWorkflow,
-  /gh release download magi-desktop-stable[\s\S]*latest\.json[\s\S]*minimum_magi_version=/,
-  'Browser Runtime compatibility floor must follow the last stable desktop release',
+  /minimum_magi_version="\$magi_version"/,
+  'Browser Runtime compatibility floor must follow the same authoritative product version',
+);
+assert.doesNotMatch(
+  browserRuntimeReleaseWorkflow,
+  /gh release download magi-desktop-stable/,
+  'Runtime packaging must not derive compatibility from a different desktop release',
 );
 assert.match(
   browserRuntimeReleaseWorkflow,
   /--minimum-magi-version "\$minimum_magi_version"/,
-  'Runtime manifests must use the derived compatibility floor instead of duplicating the product version',
+  'Runtime manifests must use the prepared compatibility floor',
 );
 assert.match(
   browserRuntimeReleaseWorkflow,

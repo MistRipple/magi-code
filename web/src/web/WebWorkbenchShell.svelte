@@ -1058,7 +1058,6 @@
       return;
     }
     event.preventDefault();
-    window.dispatchEvent(new Event('magi:browserViewportControllerClaim'));
     isPreviewPanelResizing = true;
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';

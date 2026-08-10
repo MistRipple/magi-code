@@ -124,6 +124,21 @@ await withGoldenViteServer(async (server) => {
   );
   assert.match(
     browserPaneSource,
+    /const targetBrowserSessionId = browserSessionId\.trim\(\);[\s\S]*?untrack\(\(\) => \{[\s\S]*?disconnectChannel\(\);[\s\S]*?void refreshSession\(true\);/,
+    'browser connection lifecycle must only track the session and tab ids, not socket state',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /activateBrowserTab/,
+    'browser content must not mutate the authority active tab while mounting or polling',
+  );
+  assert.match(
+    rightPaneSource,
+    /const activationKey = `\$\{payload\.browserSessionId\}\\u0000\$\{payload\.tabId\}`;[\s\S]*?activateBrowserTab\(payload\.tabId\)/,
+    'the selected top-level pane must be the single browser activation source',
+  );
+  assert.match(
+    browserPaneSource,
     /nextSnapshot\.lifecycle !== 'ready' \|\| nextTab\?\.lifecycle !== 'ready'[\s\S]*?disconnectChannel\(\)/,
     'the frame channel must only exist while both session and tab authority are ready',
   );

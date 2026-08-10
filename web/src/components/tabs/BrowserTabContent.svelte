@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import Icon from '../Icon.svelte';
   import { i18n } from '../../stores/i18n.svelte';
   import { normalizeExternalWebUrl, openExternalWebUrl } from '../../lib/external-link';
@@ -12,11 +12,13 @@
     getBrowserSession,
     navigateBrowserTab,
     readBrowserClipboardText,
+    releaseBrowserTabViewportController,
     setBrowserTabViewport,
     writeBrowserClipboardText,
     type BrowserSessionSnapshot,
     type BrowserTabSnapshot,
     type BrowserDeviceType,
+    type BrowserViewportMode,
     type BrowserNormalizedRect,
   } from '../../web/agent-api';
 
@@ -66,6 +68,7 @@
   type BrowserChannelServerMessage =
     | ({ type: 'frame' } & FrameMetadata)
     | { type: 'error'; message: string }
+    | { type: 'page_suspended' }
     | { type: 'clipboard_text'; operation: 'copy' | 'cut'; text: string };
   let pendingFrameMetadata: FrameMetadata | null = null;
   interface PendingFrame {
@@ -79,10 +82,16 @@
   let viewportSize = $state({ width: 0, height: 0 });
   let viewportResizeTimer: number | null = null;
   let viewportSyncInFlight = false;
+  let viewportBindingGeneration = 0;
   let pendingViewportSize = { width: 0, height: 0 };
-  let pendingViewportClaim = false;
   let lastRequestedViewportSize = { width: 0, height: 0 };
   let lastReadyViewportTabId = '';
+  let localViewportMode = $state<BrowserViewportMode>('auto');
+  let localViewport = $state({
+    width: 1280,
+    height: 800,
+    deviceType: 'desktop' as BrowserDeviceType,
+  });
   let viewportMenuOpen = $state(false);
   let viewportMenuElement = $state<HTMLDivElement | undefined>();
   let annotationMenuOpen = $state(false);
@@ -151,6 +160,7 @@
       || sessionError
       || channelDisconnected
       || activeTab?.lifecycle === 'crashed'
+      || snapshot?.lifecycle === 'interrupted'
       || snapshot?.lifecycle === 'failed'
     ) {
       return 'error';
@@ -169,7 +179,11 @@
   const connectionStatusText = $derived.by(() => {
     if (error) return error;
     if (sessionError) return sessionError;
-    if (activeTab?.lifecycle === 'crashed' || snapshot?.lifecycle === 'failed') {
+    if (
+      activeTab?.lifecycle === 'crashed'
+      || snapshot?.lifecycle === 'interrupted'
+      || snapshot?.lifecycle === 'failed'
+    ) {
       return i18n.t('browser.status.unavailable');
     }
     if (snapshot?.lifecycle === 'recovering') return i18n.t('browser.status.recovering');
@@ -304,7 +318,7 @@
     return document.visibilityState === 'visible';
   }
 
-  function scheduleCurrentPanelViewport(force = false, claim = false): void {
+  function scheduleCurrentPanelViewport(force = false): void {
     if (!viewportControllerActive()) return;
     const tab = activeTab;
     if (
@@ -314,20 +328,17 @@
     ) return;
     if (!viewportSize.width || !viewportSize.height) return;
     const nextViewportSize = normalizedViewportSize(viewportSize.width, viewportSize.height);
-    if (!force && !claim && sameViewportSize(lastRequestedViewportSize, nextViewportSize)) return;
-    lastRequestedViewportSize = nextViewportSize;
+    if (!force && sameViewportSize(lastRequestedViewportSize, nextViewportSize)) return;
     pendingViewportSize = nextViewportSize;
-    pendingViewportClaim ||= claim;
     scheduleViewportSync();
-  }
-
-  function reclaimViewportControl(): void {
-    scheduleCurrentPanelViewport(true, true);
   }
 
   async function syncViewportToPanel(): Promise<void> {
     if (viewportSyncInFlight) return;
+    if (localViewportMode !== 'auto') return;
+    if (!channelConnected) return;
     const tab = activeTab;
+    const bindingGeneration = viewportBindingGeneration;
     const requested = pendingViewportSize;
     if (
       !tab
@@ -338,14 +349,14 @@
     ) {
       return;
     }
-    const claim = pendingViewportClaim;
-    pendingViewportClaim = false;
     if (
-      !claim
-      && tab.viewportMode === 'auto'
-      && tab.viewport.width === requested.width
-      && tab.viewport.height === requested.height
-    ) return;
+      localViewportMode === 'auto'
+      && localViewport.width === requested.width
+      && localViewport.height === requested.height
+    ) {
+      lastRequestedViewportSize = requested;
+      return;
+    }
     viewportSyncInFlight = true;
     let applied = false;
     try {
@@ -353,9 +364,10 @@
         action: 'sync',
         ...requested,
         controllerId: viewportControllerId,
-        claim,
       });
+      if (bindingGeneration !== viewportBindingGeneration || tabId !== tab.tabId) return;
       applyViewportUpdate(updated);
+      lastRequestedViewportSize = requested;
       annotationDrag = null;
       pendingAnnotation = null;
       pendingAnnotationComment = '';
@@ -364,6 +376,7 @@
     } catch (cause) {
       error = errorMessage(cause);
     } finally {
+      if (bindingGeneration !== viewportBindingGeneration) return;
       viewportSyncInFlight = false;
       if (
         applied
@@ -375,20 +388,11 @@
   }
 
   function applyViewportUpdate(updated: BrowserTabSnapshot): void {
-    if (!snapshot || tabId !== updated.tabId) return;
-    snapshot = {
-      ...snapshot,
-      tabs: snapshot.tabs.map((candidate) => (
-        candidate.tabId === updated.tabId
-          ? {
-              ...candidate,
-              viewport: updated.viewport,
-              viewportMode: updated.viewportMode,
-              snapshotRevision: updated.snapshotRevision,
-              updatedAt: updated.updatedAt,
-            }
-          : candidate
-      )),
+    if (tabId !== updated.tabId) return;
+    localViewport = {
+      width: updated.viewport.width,
+      height: updated.viewport.height,
+      deviceType: updated.viewport.deviceType,
     };
   }
 
@@ -428,13 +432,14 @@
     if (customViewportSyncInFlight) return;
     const requested = pendingCustomViewport;
     const tab = activeTab;
+    const bindingGeneration = viewportBindingGeneration;
     if (!requested || !tab || tab.lifecycle !== 'ready' || snapshot?.lifecycle !== 'ready') return;
     pendingCustomViewport = null;
     if (
-      tab.viewportMode === 'fixed'
-      && tab.viewport.width === requested.width
-      && tab.viewport.height === requested.height
-      && tab.viewport.deviceType === requested.deviceType
+      localViewportMode === 'fixed'
+      && localViewport.width === requested.width
+      && localViewport.height === requested.height
+      && localViewport.deviceType === requested.deviceType
     ) return;
     customViewportSyncInFlight = true;
     try {
@@ -447,8 +452,16 @@
         surfaceWidth: surface.width,
         surfaceHeight: surface.height,
         deviceType: requested.deviceType,
+        controllerId: viewportControllerId,
       });
+      if (bindingGeneration !== viewportBindingGeneration || tabId !== tab.tabId) return;
       applyViewportUpdate(updated);
+      localViewportMode = 'fixed';
+      localViewport = {
+        width: requested.width,
+        height: requested.height,
+        deviceType: requested.deviceType,
+      };
       lastRequestedViewportSize = surface;
       pendingViewportSize = surface;
       annotationDrag = null;
@@ -458,6 +471,7 @@
     } catch (cause) {
       error = errorMessage(cause);
     } finally {
+      if (bindingGeneration !== viewportBindingGeneration) return;
       customViewportSyncInFlight = false;
       if (pendingCustomViewport) {
         clearCustomViewportResizeTimer();
@@ -473,6 +487,7 @@
     if (!viewportSize.width || !viewportSize.height) return;
     const requested = normalizedViewportSize(viewportSize.width, viewportSize.height);
     const tab = activeTab;
+    const bindingGeneration = viewportBindingGeneration;
     if (!tab || busy) return;
     cancelPendingCustomViewport();
     viewportMenuOpen = false;
@@ -486,7 +501,9 @@
         deviceType: deviceTypeForWidth(requested.width),
         controllerId: viewportControllerId,
       });
+      if (bindingGeneration !== viewportBindingGeneration || tabId !== tab.tabId) return;
       applyViewportUpdate(updated);
+      localViewportMode = 'auto';
       lastRequestedViewportSize = requested;
       pendingViewportSize = requested;
       annotationDrag = null;
@@ -518,8 +535,13 @@
     }
     const tab = activeTab;
     if (tab) {
-      customViewportWidth = tab.viewport.width;
-      customViewportHeight = tab.viewport.height;
+      if (localViewportMode === 'auto' && viewportSize.width && viewportSize.height) {
+        customViewportWidth = Math.round(viewportSize.width);
+        customViewportHeight = Math.round(viewportSize.height);
+      } else {
+        customViewportWidth = localViewport.width;
+        customViewportHeight = localViewport.height;
+      }
     }
     viewportMenuOpen = true;
   }
@@ -529,14 +551,17 @@
     if (!tab || snapshot?.lifecycle !== 'ready' || tab.lifecycle !== 'ready') return;
     if (lastReadyViewportTabId === tab.tabId) return;
     lastReadyViewportTabId = tab.tabId;
+    localViewportMode = 'auto';
+    localViewport = {
+      width: 1280,
+      height: 800,
+      deviceType: 'desktop',
+    };
+    if (viewportSize.width && viewportSize.height) {
+      customViewportWidth = Math.round(viewportSize.width);
+      customViewportHeight = Math.round(viewportSize.height);
+    }
     scheduleCurrentPanelViewport();
-  });
-
-  $effect(() => {
-    const tab = activeTab;
-    if (!tab || viewportMenuOpen) return;
-    customViewportWidth = tab.viewport.width;
-    customViewportHeight = tab.viewport.height;
   });
 
   function channelEligible(targetTabId: string): boolean {
@@ -554,6 +579,10 @@
       if (channelTabId) disconnectChannel();
       return;
     }
+    // 物理 Chromium View 必须用当前面板的真实尺寸创建。刷新时
+    // ResizeObserver 可能晚于会话快照返回；尺寸未就绪时等待观察结果，
+    // 不能回退到逻辑 Tab 的历史视口，否则首帧会以错误布局恢复。
+    if (!viewportSize.width || !viewportSize.height) return;
     if (channelTabId === targetTabId && (socket !== null || reconnectTimer !== null)) return;
     disconnectChannel();
     channelTabId = targetTabId;
@@ -583,7 +612,13 @@
       || channelGeneration !== generation
       || !channelEligible(tabId)
     ) return;
-    const next = new WebSocket(browserChannelUrl(tabId));
+    if (!viewportSize.width || !viewportSize.height) return;
+    const initialViewport = normalizedViewportSize(viewportSize.width, viewportSize.height);
+    const next = new WebSocket(browserChannelUrl(
+      tabId,
+      viewportControllerId,
+      initialViewport,
+    ));
     next.binaryType = 'arraybuffer';
     socket = next;
     next.onopen = () => {
@@ -591,6 +626,16 @@
       reconnectAttempt = 0;
       channelConnected = true;
       channelDisconnected = false;
+      localViewportMode = 'auto';
+      localViewport = {
+        ...initialViewport,
+        deviceType: deviceTypeForWidth(initialViewport.width),
+      };
+      lastRequestedViewportSize = initialViewport;
+      pendingViewportSize = initialViewport;
+      // WebSocket 建立期间父容器仍可能发生一次布局变化。以最新尺寸复核，
+      // 相同尺寸不会发请求，变化时只更新当前物理 View。
+      scheduleCurrentPanelViewport();
     };
     next.onmessage = (event) => {
       if (socket !== next || channelGeneration !== generation) return;
@@ -624,6 +669,20 @@
             };
           } else if (message.type === 'error') {
             error = message.message?.trim() || i18n.t('browser.error.channelDisconnected');
+          } else if (message.type === 'page_suspended') {
+            channelConnected = false;
+            channelDisconnected = false;
+            if (snapshot) {
+              snapshot = {
+                ...snapshot,
+                tabs: snapshot.tabs.map((candidate) => (
+                  candidate.tabId === tabId
+                    ? { ...candidate, lifecycle: 'suspended' }
+                    : candidate
+                )),
+              };
+            }
+            void refreshSession();
           } else if (message.type === 'clipboard_text') {
             void writeBrowserClipboardText(message.text).catch(() => {
               error = i18n.t('browser.error.clipboardWrite');
@@ -720,24 +779,49 @@
   $effect(() => {
     const targetBrowserSessionId = browserSessionId.trim();
     const targetTabId = tabId.trim();
-    disconnectChannel();
-    snapshot = null;
-    address = '';
-    lastObservedUrl = '';
-    lastReadyViewportTabId = '';
-    pendingViewportSize = { width: 0, height: 0 };
-    pendingViewportClaim = false;
-    lastRequestedViewportSize = { width: 0, height: 0 };
-    clearViewportResizeTimer();
-    error = '';
-    sessionError = '';
-    if (!targetBrowserSessionId || !targetTabId) {
-      loading = false;
-      return;
-    }
-    loading = true;
-    void refreshSession(true);
-    return disconnectChannel;
+    viewportBindingGeneration += 1;
+    const bindingGeneration = viewportBindingGeneration;
+    // 生命周期只由两个实体 ID 驱动。连接清理会读取 socket、重连计时器等
+    // 响应式状态；若让这些读取进入依赖收集，WebSocket 建立本身就会触发
+    // effect 重跑并立即断开，最终永久停在“正在连接浏览器”。
+    untrack(() => {
+      disconnectChannel();
+      snapshot = null;
+      address = '';
+      lastObservedUrl = '';
+      localViewportMode = 'auto';
+      localViewport = { width: 1280, height: 800, deviceType: 'desktop' };
+      customViewportWidth = 390;
+      customViewportHeight = 844;
+      lastReadyViewportTabId = '';
+      pendingViewportSize = { width: 0, height: 0 };
+      lastRequestedViewportSize = { width: 0, height: 0 };
+      clearViewportResizeTimer();
+      clearCustomViewportResizeTimer();
+      pendingCustomViewport = null;
+      viewportSyncInFlight = false;
+      customViewportSyncInFlight = false;
+      viewportMenuOpen = false;
+      annotationMenuOpen = false;
+      closeAnnotationPreview();
+      error = '';
+      sessionError = '';
+      if (!targetBrowserSessionId || !targetTabId) {
+        loading = false;
+        return;
+      }
+      loading = true;
+      void refreshSession(true);
+    });
+    return () => untrack(() => {
+      if (bindingGeneration !== viewportBindingGeneration) return;
+      refreshGeneration += 1;
+      refreshInFlightKey = '';
+      disconnectChannel();
+      if (targetTabId) {
+        void releaseBrowserTabViewportController(targetTabId, viewportControllerId).catch(() => undefined);
+      }
+    });
   });
 
   onMount(() => {
@@ -747,14 +831,11 @@
         width: Math.max(0, box?.width ?? 0),
         height: Math.max(0, box?.height ?? 0),
       };
+      if (snapshot) syncChannel(snapshot, tabId);
       scheduleCurrentPanelViewport();
     });
     if (viewportElement) resizeObserver.observe(viewportElement);
     const refreshTimer = window.setInterval(() => void refreshSession(), 2_000);
-    window.addEventListener('focus', reclaimViewportControl);
-    window.addEventListener('pageshow', reclaimViewportControl);
-    window.addEventListener('magi:browserViewportControllerClaim', reclaimViewportControl);
-    document.addEventListener('visibilitychange', reclaimViewportControl);
     const handleToolbarMenuPointer = (event: PointerEvent) => {
       const target = event.target;
       if (
@@ -784,10 +865,6 @@
     window.addEventListener('keydown', handleToolbarMenuKey);
     return () => {
       window.clearInterval(refreshTimer);
-      window.removeEventListener('focus', reclaimViewportControl);
-      window.removeEventListener('pageshow', reclaimViewportControl);
-      window.removeEventListener('magi:browserViewportControllerClaim', reclaimViewportControl);
-      document.removeEventListener('visibilitychange', reclaimViewportControl);
       window.removeEventListener('pointerdown', handleToolbarMenuPointer);
       window.removeEventListener('keydown', handleToolbarMenuKey);
       resizeObserver.disconnect();
@@ -814,7 +891,12 @@
     const tab = activeTab;
     if (!tab) return;
     void run(async () => {
-      const updated = await navigateBrowserTab(tab.tabId, action, action === 'url' ? address : undefined);
+      const updated = await navigateBrowserTab(
+        tab.tabId,
+        action,
+        action === 'url' ? address : undefined,
+        viewportControllerId,
+      );
       address = updated.url;
       lastObservedUrl = updated.url;
       await refreshSession();
@@ -849,9 +931,9 @@
   }
 
   function fixedPresetSelected(mode: (typeof VIEWPORT_DEVICE_MODES)[number]): boolean {
-    return activeTab?.viewportMode === 'fixed'
-      && activeTab.viewport.width === mode.width
-      && activeTab.viewport.height === mode.height;
+    return localViewportMode === 'fixed'
+      && customViewportWidth === mode.width
+      && customViewportHeight === mode.height;
   }
 
   async function focusAnnotationInput(): Promise<void> {
@@ -957,11 +1039,11 @@
             navigationRevision: pending.navigationRevision,
             x: pending.x,
             y: pending.y,
-          }, comment)
+          }, comment, viewportControllerId)
         : await createBrowserRegionAnnotation(tab.tabId, {
             navigationRevision: pending.navigationRevision,
             rect: pending.rect,
-          }, comment);
+          }, comment, viewportControllerId);
       window.dispatchEvent(new CustomEvent('magi:browserAnnotationCreated', {
         detail: annotation,
       }));
@@ -999,10 +1081,10 @@
     const tab = activeTab;
     if (!tab) return;
     void run(async () => {
-      const response = await fetch(browserScreenshotUrl(tab.tabId), {
+      const response = await fetch(browserScreenshotUrl(tab.tabId, viewportControllerId), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ fullPage: false }),
+        body: JSON.stringify({ fullPage: false, viewId: viewportControllerId }),
       });
       if (!response.ok) {
         throw new Error(i18n.t('browser.error.screenshot').replace('{status}', String(response.status)));
@@ -1041,7 +1123,6 @@
   }
 
   function handlePointer(event: PointerEvent, type: 'mouse_move' | 'mouse_down' | 'mouse_up'): void {
-    if (type === 'mouse_down') reclaimViewportControl();
     const point = framePoint(event);
     if (marking) {
       event.preventDefault();
@@ -1198,7 +1279,7 @@
       <button
         type="button"
         class="icon-button"
-        class:active={activeTab?.viewportMode === 'fixed'}
+        class:active={localViewportMode === 'fixed'}
         onclick={toggleViewportMenu}
         disabled={!activeTab || busy}
         title={i18n.t('browser.viewport.control')}
@@ -1211,7 +1292,7 @@
         <div class="viewport-menu" role="menu" aria-label={i18n.t('browser.viewport.control')}>
           <button
             type="button"
-            class:selected={activeTab.viewportMode === 'auto'}
+            class:selected={localViewportMode === 'auto'}
             onclick={useAutomaticViewport}
             role="menuitem"
           >
