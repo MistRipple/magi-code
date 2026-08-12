@@ -13,6 +13,7 @@
     type OpenUrlInBrowserRequest,
   } from '../lib/browser-navigation';
   import { normalizeExternalWebUrl } from '../lib/external-link';
+  import { automaticBrowserViewport } from '../lib/browser-viewport';
   import { addToast } from '../stores/messages.svelte';
   import {
     isHtmlFile,
@@ -68,17 +69,15 @@
   let rightPaneBodyElement: HTMLDivElement | undefined;
 
   function initialBrowserViewport(): BrowserViewport {
-    const width = Math.min(7_680, Math.max(320, Math.round(
-      rightPaneBodyElement?.clientWidth || 390,
-    )));
-    const height = Math.min(4_320, Math.max(240, Math.round(
-      rightPaneBodyElement?.clientHeight || 800,
-    )));
+    const viewport = automaticBrowserViewport({
+      width: rightPaneBodyElement?.clientWidth || 390,
+      height: rightPaneBodyElement?.clientHeight || 800,
+    });
     return {
-      width,
-      height,
+      width: viewport.width,
+      height: viewport.height,
       deviceScaleFactorMillis: 1_000,
-      deviceType: width <= 600 ? 'mobile' : 'desktop',
+      deviceType: viewport.deviceType,
     };
   }
 
@@ -834,7 +833,8 @@
       return payload.displayPath || payload.filepath;
     }
     if (tab.kind === 'browser') {
-      return (tab.payload as BrowserTabPayload).browserSessionId;
+      const occupied = (tab.payload as BrowserTabPayload).agentOccupied;
+      return `${tabLabel(tab)} · ${i18n.t(occupied ? 'browser.control.agentOccupied' : 'browser.control.released')}`;
     }
     if (tab.kind === 'terminal') {
       const payload = tab.payload as TerminalTabPayload;
@@ -1002,6 +1002,15 @@
           <span class="right-pane-tab-icon" aria-hidden="true">
             <Icon name={tabIcon(tab)} size={12} />
           </span>
+          {#if tab.kind === 'browser'}
+            {@const agentOccupied = (tab.payload as BrowserTabPayload).agentOccupied}
+            <span
+              class="browser-control-status"
+              class:occupied={agentOccupied}
+              title={i18n.t(agentOccupied ? 'browser.control.agentOccupied' : 'browser.control.released')}
+              aria-label={i18n.t(agentOccupied ? 'browser.control.agentOccupied' : 'browser.control.released')}
+            ></span>
+          {/if}
           <span class="right-pane-tab-label" class:mono={tab.kind === 'code'}>{tabLabel(tab)}</span>
           <button
             type="button"
@@ -1456,6 +1465,19 @@
     min-width: 0;
   }
   .right-pane-tab-label.mono { font-family: var(--font-mono); font-size: var(--text-xs); }
+
+  .browser-control-status {
+    width: 7px;
+    height: 7px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: var(--foreground-subtle);
+  }
+
+  .browser-control-status.occupied {
+    background: var(--success);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--success) 16%, transparent);
+  }
 
   .right-pane-tab-close {
     width: 16px;

@@ -719,6 +719,10 @@ fn tool_reference_is_negated(text: &str, start: usize, end: usize) -> bool {
     let after = text[end..clause_end].trim_start_matches([' ', '\t', '：', ':', '，', ',']);
 
     let negative_markers = [
+        "禁止重复",
+        "不得重复",
+        "不要重复",
+        "避免重复",
         "不要调用",
         "不得调用",
         "禁止调用",
@@ -758,6 +762,13 @@ fn tool_reference_is_negated(text: &str, start: usize, end: usize) -> bool {
         "must not switch to",
         "never switch to",
         "avoid switching to",
+        "禁止",
+        "不得",
+        "不要",
+        "不能",
+        "无需",
+        "不用",
+        "避免",
     ];
     let positive_markers = ["只调用", "调用", "使用", "only call", "call", "use"];
 
@@ -982,6 +993,16 @@ mod tests {
                 "{prompt}"
             );
         }
+    }
+
+    #[test]
+    fn prohibited_builtin_tool_list_is_not_promoted_to_required_chain() {
+        let prompt = "用 browser_navigate 一次打开页面，只点击一次 Issues。禁止 shell_exec、search_text、browser_scroll、browser_screenshot、view_image；禁止重复 browser_navigate。";
+
+        assert_eq!(
+            requested_public_builtin_tool_chain(prompt),
+            vec!["browser_navigate".to_string()]
+        );
     }
 
     #[test]

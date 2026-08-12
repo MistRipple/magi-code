@@ -81,6 +81,20 @@ try {
   if (response.outcome?.status !== 'succeeded') {
     throw new Error(`Browser Host 创建页面失败：${JSON.stringify(response)}`);
   }
+  const lighthouse = await request(socket, metadata, {
+    type: 'devtools',
+    payload: {
+      tab_id: 'self-test-tab',
+      operation: 'lighthouse',
+      arguments: { mode: 'snapshot', device: 'desktop' },
+    },
+  }, 60_000);
+  if (
+    lighthouse.outcome?.status !== 'succeeded'
+    || lighthouse.outcome.payload?.type !== 'json'
+  ) {
+    throw new Error(`Browser Host Lighthouse 自检失败：${JSON.stringify(lighthouse)}`);
+  }
   await request(socket, metadata, { type: 'shutdown' });
   socket.terminate();
   await waitForExit(child, 10_000);
@@ -139,9 +153,13 @@ function assertSandboxEnabled(profilePath) {
   }
 }
 
-function request(socket, metadata, command) {
+function request(socket, metadata, command, timeoutMillis = 10_000) {
   const requestId = `self-test-${Date.now()}-${Math.random()}`;
-  const response = waitForMessage(socket, (value) => value?.request_id === requestId);
+  const response = waitForMessage(
+    socket,
+    (value) => value?.request_id === requestId,
+    timeoutMillis,
+  );
   socket.send(JSON.stringify({
     request_id: requestId,
     protocol_version: {
@@ -153,12 +171,12 @@ function request(socket, metadata, command) {
   return response;
 }
 
-function waitForMessage(socket, predicate) {
+function waitForMessage(socket, predicate, timeoutMillis = 10_000) {
   return new Promise((accept, reject) => {
     const timer = setTimeout(() => {
       cleanup();
       reject(new Error('Browser Host 响应超时'));
-    }, 10_000);
+    }, timeoutMillis);
     const onMessage = (data, isBinary) => {
       if (isBinary) return;
       const value = JSON.parse(data.toString());

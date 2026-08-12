@@ -86,7 +86,6 @@ export interface AgentWorkspaceSessionsSnapshot {
   runtimeEpoch: string;
   eventStreamNextSequence: number;
   workspace: AgentWorkspaceSummary;
-  sessionId: string;
   sessions: AgentSessionSummary[];
 }
 
@@ -903,6 +902,7 @@ export interface BrowserSessionSnapshot {
   revision: number;
   controlMode: BrowserControlMode;
   controlFence: number;
+  agentOccupied: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -1023,6 +1023,8 @@ export async function setBrowserTabViewport(
         action: 'sync';
         width: number;
         height: number;
+        surfaceWidth: number;
+        surfaceHeight: number;
         controllerId: string;
       }
     | {
@@ -1202,11 +1204,14 @@ export function browserChannelUrl(
   tabId: string,
   viewId: string,
   viewport: { width: number; height: number },
+  surface: { width: number; height: number },
 ): string {
   const url = new URL(agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/channel`));
   url.searchParams.set('viewId', viewId);
   url.searchParams.set('width', String(Math.round(viewport.width)));
   url.searchParams.set('height', String(Math.round(viewport.height)));
+  url.searchParams.set('surfaceWidth', String(Math.round(surface.width)));
+  url.searchParams.set('surfaceHeight', String(Math.round(surface.height)));
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   return url.toString();
 }
@@ -1608,16 +1613,12 @@ export async function resolveAgentFileRevealTarget(
 
 export async function getWorkspaceSessions(
   workspaceId: string,
-  preferredSessionId?: string,
   workspacePath?: string,
 ): Promise<AgentWorkspaceSessionsSnapshot> {
   try {
     const query = new URLSearchParams({ workspaceId });
     if (workspacePath?.trim()) {
       query.set('workspacePath', workspacePath.trim());
-    }
-    if (preferredSessionId && preferredSessionId.trim()) {
-      query.set('sessionId', preferredSessionId.trim());
     }
     const response = await getTransport().request(
       agentUrl('/api/workspaces/sessions', query.toString())
@@ -1626,7 +1627,6 @@ export async function getWorkspaceSessions(
       runtimeEpoch?: string;
       eventStreamNextSequence?: number;
       workspace?: RawAgentWorkspaceSummary;
-      sessionId?: string;
       sessions?: RawAgentSessionSummary[];
     }>(response, 'workspace sessions');
     const sessions = Array.isArray(payload.sessions)
@@ -1648,7 +1648,6 @@ export async function getWorkspaceSessions(
       workspace: payload.workspace
         ? normalizeWorkspaceSummary(payload.workspace)
         : findCachedWorkspaceSummary(workspaceId),
-      sessionId: payload.sessionId?.trim() || '',
       sessions,
     };
   } catch (error) {

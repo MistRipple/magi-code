@@ -191,7 +191,26 @@ impl BuiltinTool for NormalizedBuiltinTool {
             | BuiltinToolName::BrowserScroll
             | BuiltinToolName::BrowserScreenshot
             | BuiltinToolName::BrowserTabs
-            | BuiltinToolName::BrowserViewport => {
+            | BuiltinToolName::BrowserViewport
+            | BuiltinToolName::BrowserWaitFor
+            | BuiltinToolName::BrowserHover
+            | BuiltinToolName::BrowserDrag
+            | BuiltinToolName::BrowserFillForm
+            | BuiltinToolName::BrowserDialog
+            | BuiltinToolName::BrowserUploadFile
+            | BuiltinToolName::BrowserClickAt
+            | BuiltinToolName::BrowserEvaluate
+            | BuiltinToolName::BrowserConsole
+            | BuiltinToolName::BrowserNetwork
+            | BuiltinToolName::BrowserEmulate
+            | BuiltinToolName::BrowserPerformance
+            | BuiltinToolName::BrowserLighthouse
+            | BuiltinToolName::BrowserScreencast
+            | BuiltinToolName::BrowserHeap
+            | BuiltinToolName::BrowserExtensions
+            | BuiltinToolName::BrowserThirdParty
+            | BuiltinToolName::BrowserWebMcp
+            | BuiltinToolName::BrowserPwa => {
                 execute_browser_tool(tool_call_id, self.name, input, context, resources)
             }
             BuiltinToolName::DiagramRender => execute_diagram_render(input),

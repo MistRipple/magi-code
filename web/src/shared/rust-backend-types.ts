@@ -901,11 +901,6 @@ export interface SessionContinueResponseDto {
   continuedAt: number;
 }
 
-export interface SessionSelectionResponseDto {
-  sessionId: string;
-  currentSession?: SessionDto | null;
-}
-
 export type IncidentScopeDto = 'app' | 'workspace' | 'session';
 
 export interface IncidentNotificationItemDto {

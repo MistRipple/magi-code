@@ -9,6 +9,8 @@ import type {
 } from "./protocol";
 
 interface RawSnapshotNode {
+  documentOrder: number;
+  priority: number;
   selector: string;
   tagName: string;
   role: string | null;
@@ -33,7 +35,7 @@ interface SnapshotReference {
 
 export class SnapshotRegistry {
   #revision = 0;
-  #references = new Map<string, SnapshotReference>();
+  #referencesByRevision = new Map<number, Map<string, SnapshotReference>>();
 
   constructor(initialRevision = 0) {
     this.#revision = Math.max(0, Math.floor(initialRevision));
@@ -43,9 +45,16 @@ export class SnapshotRegistry {
     return this.#revision;
   }
 
+  advanceTo(revision: number): void {
+    const nextRevision = Math.max(0, Math.floor(revision));
+    if (nextRevision <= this.#revision) return;
+    this.#revision = nextRevision;
+    this.#referencesByRevision.clear();
+  }
+
   invalidate(): void {
     this.#revision += 1;
-    this.#references.clear();
+    this.#referencesByRevision.clear();
   }
 
   async capture(
@@ -56,19 +65,18 @@ export class SnapshotRegistry {
   ): Promise<HostSnapshot> {
     const limits = normalizeLimits(requestedLimits);
     let root: Locator = page.locator("body");
-    if (subtreeRef) {
-      root = await this.resolveRef(page, this.#revision, subtreeRef);
+    if (subtreeRef && subtreeRef !== "root") {
+      root = await this.resolveRef(page, snapshotRevisionForRef(subtreeRef), subtreeRef);
     }
     this.#revision += 1;
-    this.#references.clear();
+    const references = new Map<string, SnapshotReference>();
     const scanLimit = Math.min(Math.max(limits.max_nodes * 20, 1_000), 20_000);
     const raw = await root.evaluate(
       (rootElement, input) => {
-        const all = [
-          rootElement,
-          ...Array.from(rootElement.querySelectorAll("*")),
-        ].slice(0, input.scanLimit);
-        const totalNodes = all.length;
+        const descendants = Array.from(rootElement.querySelectorAll("*"));
+        const all = [rootElement, ...descendants].slice(0, input.scanLimit);
+        let totalNodes = 0;
+        let truncated = descendants.length + 1 > input.scanLimit;
         const output: RawSnapshotNode[] = [];
         let textBytes = 0;
 
@@ -95,15 +103,50 @@ export class SnapshotRegistry {
           if (tag === "textarea") return "textbox";
           if (tag === "select") return "combobox";
           if (tag === "img") return "img";
+          if (/^h[1-6]$/.test(tag)) return "heading";
+          if (tag === "p") return "paragraph";
           if (tag === "input") {
             const type = (element.getAttribute("type") ?? "text").toLowerCase();
             if (type === "checkbox") return "checkbox";
             if (type === "radio") return "radio";
             if (type === "button" || type === "submit") return "button";
+            if (type === "search") return "searchbox";
+            const searchIdentity = [
+              element.getAttribute("id"),
+              element.getAttribute("name"),
+              element.getAttribute("aria-label"),
+            ]
+              .filter(Boolean)
+              .join(" ")
+              .toLowerCase();
+            const formAction =
+              element.closest("form")?.getAttribute("action")?.toLowerCase() ?? "";
+            if (
+              /(^|[^a-z])(search|query|keyword|kw|wd|q)([^a-z]|$)/.test(searchIdentity) ||
+              /(^|\/)search([/?#]|$)|(^|\/)s([/?#]|$)/.test(formAction)
+            ) {
+              return "searchbox";
+            }
             return "textbox";
           }
           return null;
         };
+        const semanticAncestorSelector = [
+          "a[href]",
+          "button",
+          "input",
+          "textarea",
+          "select",
+          "h1",
+          "h2",
+          "h3",
+          "h4",
+          "h5",
+          "h6",
+          "p",
+          "[role]",
+          "[contenteditable='true']",
+        ].join(",");
         const sensitiveInputKind = (
           element: Element,
         ): "password" | "one_time_code" | "payment_card" | null => {
@@ -162,7 +205,7 @@ export class SnapshotRegistry {
           return `html > ${parts.join(" > ")}`;
         };
 
-        for (const element of all) {
+        for (const [documentOrder, element] of all.entries()) {
           const html = element as HTMLElement;
           const style = getComputedStyle(element);
           const rect = element.getBoundingClientRect();
@@ -189,14 +232,65 @@ export class SnapshotRegistry {
               .join(" "),
             240,
           );
+          if (
+            !role
+            && !editable
+            && element.parentElement?.closest(semanticAncestorSelector)
+          ) {
+            continue;
+          }
           if (!role && !editable && !directText) continue;
+          totalNodes += 1;
+          const inViewport =
+            rect.right > 0 &&
+            rect.bottom > 0 &&
+            rect.left < globalThis.innerWidth &&
+            rect.top < globalThis.innerHeight;
+          const semanticText =
+            role &&
+            [
+              "button",
+              "checkbox",
+              "combobox",
+              "heading",
+              "link",
+              "paragraph",
+              "radio",
+              "searchbox",
+              "switch",
+              "textbox",
+            ].includes(role)
+              ? text(html.innerText, role === "link" ? 120 : 240)
+              : directText;
           const inputElement = element as HTMLInputElement;
-          const inputType = (inputElement.type ?? "").toLowerCase();
+          const labelledBy = (element.getAttribute("aria-labelledby") ?? "")
+            .split(/\s+/)
+            .filter(Boolean)
+            .map((id) => document.getElementById(id)?.textContent ?? "")
+            .join(" ");
+          const controlLabels =
+            element instanceof HTMLInputElement ||
+            element instanceof HTMLTextAreaElement ||
+            element instanceof HTMLSelectElement
+              ? Array.from(element.labels ?? [])
+                  .map((label) => label.textContent ?? "")
+                  .join(" ")
+              : "";
           const name = text(
-            element.getAttribute("aria-label") ??
-              element.getAttribute("alt") ??
-              element.getAttribute("title") ??
-              directText,
+            [
+              element.getAttribute("aria-label"),
+              labelledBy,
+              controlLabels,
+              element.getAttribute("alt"),
+              element.getAttribute("title"),
+              semanticText,
+              role === "searchbox" ? "Search" : null,
+              role || editable
+                ? element.getAttribute("placeholder") ??
+                  element.getAttribute("name") ??
+                  element.getAttribute("id")
+                : null,
+            ].find((value) => value?.trim()) ?? "",
             240,
           );
           const value =
@@ -208,27 +302,38 @@ export class SnapshotRegistry {
                     : element.getAttribute("aria-valuetext"),
                   240,
                 ) || null;
-          const description =
-            text(element.getAttribute("aria-description"), 240) || null;
+          const explicitDescription = text(
+            element.getAttribute("aria-description"),
+            240,
+          );
+          const description = explicitDescription
+            || (semanticText && semanticText !== name ? semanticText : null);
           const fingerprint = [
             tagName,
             element.getAttribute("id") ?? "",
             element.getAttribute("data-testid") ?? "",
-            role ?? "",
-            name,
-            directText.slice(0, 80),
+            element.getAttribute("name") ?? "",
+            element.getAttribute("type") ?? "",
+            element.getAttribute("href") ?? "",
+            element.getAttribute("role") ?? "",
           ].join("|");
-          const candidateTextBytes = new TextEncoder().encode(
-            `${name}${value ?? ""}${description ?? ""}`,
-          ).length;
-          if (
-            output.length >= input.maxNodes ||
-            textBytes + candidateTextBytes > input.maxTextBytes
-          ) {
-            break;
-          }
-          textBytes += candidateTextBytes;
           output.push({
+            documentOrder,
+            priority: html.matches(":focus")
+              ? 0
+              : editable || ["searchbox", "textbox", "combobox"].includes(role ?? "")
+                ? 1
+                : ["button", "checkbox", "radio", "switch"].includes(role ?? "")
+                  ? 2
+                  : role === "link"
+                    ? 3
+                    : role === "heading"
+                      ? 4
+                      : role === "paragraph"
+                        ? 5
+                      : inViewport
+                        ? 5
+                        : 6,
             selector: cssPath(element),
             tagName,
             role,
@@ -252,7 +357,53 @@ export class SnapshotRegistry {
             childElementCount: element.childElementCount,
           });
         }
-        return { output, totalNodes, textBytes };
+        output.sort(
+          (left, right) =>
+            left.priority - right.priority ||
+            left.documentOrder - right.documentOrder,
+        );
+        const selected: RawSnapshotNode[] = [];
+        const priorityBudgets = [4, 24, 32, 48, 20, 28, 4];
+        const selectedByPriority = new Set<number>();
+        textBytes = 0;
+        for (const priority of priorityBudgets.keys()) {
+          const budget = priorityBudgets[priority];
+          let selectedInPriority = 0;
+          for (const node of output) {
+            if (node.priority !== priority || selectedInPriority >= budget) continue;
+            const candidateTextBytes = new TextEncoder().encode(
+              `${node.name ?? ""}${node.value ?? ""}${node.description ?? ""}`,
+            ).length;
+            if (
+              selected.length >= input.maxNodes ||
+              textBytes + candidateTextBytes > input.maxTextBytes
+            ) {
+              truncated = true;
+              continue;
+            }
+            selected.push(node);
+            selectedByPriority.add(node.documentOrder);
+            selectedInPriority += 1;
+            textBytes += candidateTextBytes;
+          }
+        }
+        for (const node of output) {
+          if (selectedByPriority.has(node.documentOrder)) continue;
+          const candidateTextBytes = new TextEncoder().encode(
+            `${node.name ?? ""}${node.value ?? ""}${node.description ?? ""}`,
+          ).length;
+          if (
+            selected.length >= input.maxNodes ||
+            textBytes + candidateTextBytes > input.maxTextBytes
+          ) {
+            truncated = true;
+            continue;
+          }
+          selected.push(node);
+          textBytes += candidateTextBytes;
+        }
+        selected.sort((left, right) => left.documentOrder - right.documentOrder);
+        return { output: selected, totalNodes, textBytes, truncated };
       },
       {
         maxNodes: limits.max_nodes,
@@ -263,7 +414,7 @@ export class SnapshotRegistry {
 
     const children: SnapshotNode[] = raw.output.map((node, index) => {
       const elementRef = `e-${this.#revision}-${index + 1}`;
-      this.#references.set(elementRef, {
+      references.set(elementRef, {
         selector: node.selector,
         tagName: node.tagName,
         fingerprint: node.fingerprint,
@@ -284,11 +435,14 @@ export class SnapshotRegistry {
       };
     });
     const continuationRefs = raw.output
-      .map((node, index) => ({ node, ref: `e-${this.#revision}-${index + 1}` }))
+      .map((node, index) => ({
+        node,
+        ref: `e-${this.#revision}-${index + 1}`,
+      }))
       .filter(({ node }) => node.childElementCount > 0)
       .slice(-8)
       .map(({ ref }) => ref);
-    return {
+    const snapshot = {
       tab_id: tabId,
       snapshot_revision: this.#revision,
       root: {
@@ -308,9 +462,16 @@ export class SnapshotRegistry {
       returned_nodes: children.length,
       total_nodes: raw.totalNodes,
       text_bytes: raw.textBytes,
-      truncated: children.length < raw.totalNodes,
+      truncated: raw.truncated,
       continuation_refs: continuationRefs,
     };
+    this.#referencesByRevision.set(this.#revision, references);
+    while (this.#referencesByRevision.size > 8) {
+      const oldestRevision = this.#referencesByRevision.keys().next().value;
+      if (oldestRevision === undefined) break;
+      this.#referencesByRevision.delete(oldestRevision);
+    }
+    return snapshot;
   }
 
   async resolve(page: Page, target: SnapshotTarget): Promise<Locator> {
@@ -322,7 +483,8 @@ export class SnapshotRegistry {
     revision: number,
     elementRef: string,
   ): Promise<Locator> {
-    if (revision !== this.#revision) {
+    const references = this.#referencesByRevision.get(revision);
+    if (!references) {
       throw new ProtocolFailure(
         "browser_snapshot_stale",
         `snapshot revision changed: current=${this.#revision}, received=${revision}`,
@@ -330,7 +492,7 @@ export class SnapshotRegistry {
         false,
       );
     }
-    const reference = this.#references.get(elementRef);
+    const reference = references.get(elementRef);
     if (!reference) {
       throw new ProtocolFailure(
         "browser_snapshot_ref_unknown",
@@ -344,41 +506,15 @@ export class SnapshotRegistry {
       throw staleElement(elementRef);
     }
     const fingerprint = await locator.evaluate((element) => {
-      const text = (value: string | null | undefined, max: number) => {
-        const normalized = (value ?? "").replace(/\s+/g, " ").trim();
-        return normalized.length > max ? normalized.slice(0, max) : normalized;
-      };
       const tag = element.tagName.toLowerCase();
-      const role =
-        element.getAttribute("role") ??
-        (tag === "button"
-          ? "button"
-          : tag === "a" && element.hasAttribute("href")
-            ? "link"
-            : tag === "input" || tag === "textarea"
-              ? "textbox"
-              : "");
-      const directText = text(
-        Array.from(element.childNodes)
-          .filter((node) => node.nodeType === Node.TEXT_NODE)
-          .map((node) => node.textContent ?? "")
-          .join(" "),
-        240,
-      );
-      const name = text(
-        element.getAttribute("aria-label") ??
-          element.getAttribute("alt") ??
-          element.getAttribute("title") ??
-          directText,
-        240,
-      );
       return [
         tag,
         element.getAttribute("id") ?? "",
         element.getAttribute("data-testid") ?? "",
-        role,
-        name,
-        directText.slice(0, 80),
+        element.getAttribute("name") ?? "",
+        element.getAttribute("type") ?? "",
+        element.getAttribute("href") ?? "",
+        element.getAttribute("role") ?? "",
       ].join("|");
     });
     if (fingerprint !== reference.fingerprint) {
@@ -388,11 +524,24 @@ export class SnapshotRegistry {
   }
 }
 
+function snapshotRevisionForRef(elementRef: string): number {
+  const match = /^e-(\d+)-\d+$/.exec(elementRef);
+  if (!match) {
+    throw new ProtocolFailure(
+      "browser_snapshot_ref_unknown",
+      `snapshot element ref does not exist: ${elementRef}`,
+      true,
+      false,
+    );
+  }
+  return Number(match[1]);
+}
+
 function normalizeLimits(limits: SnapshotLimits): SnapshotLimits {
-  const maxNodes = Math.max(1, Math.min(Math.floor(limits.max_nodes), 400));
+  const maxNodes = Math.max(1, Math.min(Math.floor(limits.max_nodes), 160));
   const maxTextBytes = Math.max(
     1_024,
-    Math.min(Math.floor(limits.max_text_bytes), 32 * 1024),
+    Math.min(Math.floor(limits.max_text_bytes), 16 * 1024),
   );
   return { max_nodes: maxNodes, max_text_bytes: maxTextBytes };
 }

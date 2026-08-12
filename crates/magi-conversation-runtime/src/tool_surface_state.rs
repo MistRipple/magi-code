@@ -281,6 +281,10 @@ mod tests {
             ),
         );
         assert_eq!(first.capability_revision, Some(7));
+        let browser_tool_count = BuiltinToolName::ALL
+            .iter()
+            .filter(|tool| tool.browser_tool_kind().is_some())
+            .count();
         assert_eq!(
             first
                 .definitions
@@ -290,7 +294,7 @@ mod tests {
                         .is_some_and(|tool| tool.browser_tool_kind().is_some())
                 })
                 .count(),
-            9
+            browser_tool_count
         );
 
         revision.store(8, Ordering::Release);
@@ -329,21 +333,13 @@ mod tests {
             .iter()
             .map(|definition| definition.function.name.as_str())
             .collect::<Vec<_>>();
+        let expected_names = BuiltinToolName::ALL
+            .iter()
+            .filter(|tool| tool.browser_tool_kind().is_some())
+            .map(BuiltinToolName::as_str)
+            .collect::<Vec<_>>();
         assert_eq!(read_only.capability_revision, Some(9));
-        assert_eq!(
-            names,
-            vec![
-                "browser_navigate",
-                "browser_snapshot",
-                "browser_click",
-                "browser_type",
-                "browser_press",
-                "browser_scroll",
-                "browser_screenshot",
-                "browser_tabs",
-                "browser_viewport"
-            ]
-        );
+        assert_eq!(names, expected_names);
     }
 
     #[test]

@@ -72,7 +72,11 @@ impl SessionStore {
             .filter(|session| session.workspace_id.as_deref() == Some(workspace_id))
             .cloned()
             .map(|session| with_session_message_count(session, &state.timeline))
-            .filter(|session| session.message_count.unwrap_or(0) > 0)
+            .filter(|session| {
+                session.message_count.unwrap_or(0) > 0
+                    || requested_session_id == Some(&session.session_id)
+                    || state.current_session_id.as_ref() == Some(&session.session_id)
+            })
             .collect::<Vec<_>>();
         sessions.sort_by(cmp_sessions_newest_first);
 
@@ -93,8 +97,7 @@ impl SessionStore {
                             .any(|session| &session.session_id == *session_id)
                     })
                     .cloned()
-            })
-            .or_else(|| sessions.first().map(|session| session.session_id.clone()));
+            });
 
         // 多取一个 timeline entry 作为分页哨兵，避免 bootstrap 为了裁剪首屏
         // 先复制当前会话的完整消息历史。

@@ -3,9 +3,9 @@ use magi_core::{BrowserCommandId, BrowserLeaseId, BrowserTabId};
 use serde::{Deserialize, Serialize};
 
 pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 1;
-pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 11;
-pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 400;
-pub const DEFAULT_BROWSER_SNAPSHOT_TEXT_LIMIT_BYTES: u32 = 32 * 1024;
+pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 14;
+pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 160;
+pub const DEFAULT_BROWSER_SNAPSHOT_TEXT_LIMIT_BYTES: u32 = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BrowserHostProtocolVersion {
@@ -110,6 +110,7 @@ pub enum BrowserHostCommand {
         target: BrowserSnapshotTarget,
         text: String,
         replace: bool,
+        submit_key: Option<String>,
     },
     Press {
         tab_id: BrowserTabId,
@@ -123,12 +124,22 @@ pub enum BrowserHostCommand {
         delta_x: f64,
         delta_y: f64,
     },
+    /// 受控的 Chromium DevTools 高级操作。具体动作仍由 Magi 工具目录提供，
+    /// Host 只执行白名单 operation，避免把任意 CDP 调用暴露给模型。
+    Devtools {
+        tab_id: BrowserTabId,
+        control: Option<BrowserHostControl>,
+        operation: String,
+        arguments: serde_json::Value,
+    },
     Screenshot {
         tab_id: BrowserTabId,
         target: Option<BrowserSnapshotTarget>,
         clip: Option<BrowserNormalizedRect>,
         full_page: bool,
         format: BrowserScreenshotFormat,
+        #[serde(default)]
+        quality: Option<u8>,
     },
     HitTest {
         tab_id: BrowserTabId,
@@ -207,10 +218,31 @@ pub struct BrowserLogicalViewport {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum BrowserNavigation {
-    Url { url: String },
-    Back,
-    Forward,
-    Reload,
+    Url {
+        url: String,
+        #[serde(default)]
+        handle_before_unload: Option<String>,
+        #[serde(default)]
+        init_script: Option<String>,
+        #[serde(default)]
+        timeout_ms: Option<u32>,
+    },
+    Back {
+        #[serde(default)]
+        timeout_ms: Option<u32>,
+    },
+    Forward {
+        #[serde(default)]
+        timeout_ms: Option<u32>,
+    },
+    Reload {
+        #[serde(default)]
+        ignore_cache: bool,
+        #[serde(default)]
+        handle_before_unload: Option<String>,
+        #[serde(default)]
+        timeout_ms: Option<u32>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +271,7 @@ pub struct BrowserSnapshotTarget {
 pub enum BrowserScreenshotFormat {
     Png,
     Jpeg,
+    Webp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,6 +360,7 @@ pub enum BrowserHostCommandResult {
     BinaryPayload(BrowserHostBinaryPayload),
     HitTest(BrowserHostHitTest),
     ClipboardText(BrowserHostClipboardText),
+    Json(serde_json::Value),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,6 +494,7 @@ pub enum BrowserHostEvent {
     },
     Dialog {
         tab_id: BrowserTabId,
+        dialog_id: u64,
         dialog_type: String,
         message: String,
     },
@@ -476,11 +511,31 @@ pub enum BrowserHostEvent {
     PopupBlocked {
         tab_id: BrowserTabId,
     },
+    AgentCursor(BrowserAgentCursor),
     ScreencastFrame(BrowserScreencastFrame),
     BinaryPayloadReady(BrowserHostBinaryPayload),
     Heartbeat {
         monotonic_millis: u64,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BrowserAgentCursor {
+    pub tab_id: BrowserTabId,
+    pub visible: bool,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub action: Option<BrowserAgentCursorAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserAgentCursorAction {
+    Move,
+    Click,
+    Drag,
+    Type,
+    Scroll,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

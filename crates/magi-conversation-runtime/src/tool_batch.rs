@@ -2933,6 +2933,7 @@ fn execute_task_tool_call(
                 access_profile,
                 working_directory: workspace_root_path.cloned(),
                 browser_capability_revision,
+                browser_execution_id: Some(format!("task:{}", task.task_id)),
             },
             workspace_root_path
                 .as_ref()
@@ -2968,6 +2969,7 @@ fn execute_task_tool_call(
         access_profile: tool_policy.access_profile,
         working_directory: workspace_root_path.cloned(),
         browser_capability_revision,
+        browser_execution_id: Some(format!("task:{}", task.task_id)),
     };
     let output = match on_progress {
         Some(on_progress) => {

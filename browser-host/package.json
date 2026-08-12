@@ -3,12 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --format=cjs --target=node22 --external:playwright-core --outfile=dist/index.cjs",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=cjs --target=node22 --external:playwright-core --external:lighthouse --outfile=dist/index.cjs",
     "check": "tsc --noEmit",
     "test": "tsc --noEmit false --outDir .test-dist && node --test .test-dist/**/*.test.js"
   },
   "dependencies": {
-    "playwright-core": "1.58.2",
+    "lighthouse": "13.4.0",
+    "playwright-core": "1.62.1",
+    "puppeteer-core": "25.5.0",
     "ws": "8.21.2"
   },
   "devDependencies": {

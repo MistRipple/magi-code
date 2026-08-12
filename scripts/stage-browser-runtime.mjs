@@ -50,6 +50,8 @@ await copyFile(
   path.join(root, 'licenses', 'playwright-core.txt'),
 );
 await stagePlaywrightDirectory(playwrightRoot, stagedPlaywright);
+const lighthouseRoot = path.dirname(requireFromHost.resolve('lighthouse/package.json'));
+await stagePackageTree(lighthouseRoot, path.join(root, 'host', 'node_modules'), new Set());
 await stageChromiumDirectory(chromiumRoot, stagedChromiumRoot);
 
 const nodeLicense = await findNodeLicense(process.execPath);
@@ -151,6 +153,72 @@ async function stagePlaywrightDirectory(source, destination) {
     return;
   }
   await copyDirectory(source, destination);
+}
+
+async function stagePackageTree(sourcePackageRoot, destinationNodeModules, stagedPackages) {
+  const packageJson = JSON.parse(
+    await readFile(path.join(sourcePackageRoot, 'package.json'), 'utf8'),
+  );
+  const packageName = packageJson.name;
+  if (typeof packageName !== 'string' || !packageName) {
+    throw new Error(`无法识别 Node 依赖包名称：${sourcePackageRoot}`);
+  }
+  const packageVersion = typeof packageJson.version === 'string' ? packageJson.version : '';
+  const packageKey = `${packageName}@${packageVersion}`;
+  if (stagedPackages.has(packageKey)) return;
+  stagedPackages.add(packageKey);
+  await copyDirectory(
+    sourcePackageRoot,
+    path.join(destinationNodeModules, ...packageName.split('/')),
+  );
+
+  const resolver = createRequire(path.join(sourcePackageRoot, 'package.json'));
+  const requiredDependencies = packageJson.dependencies ?? {};
+  const optionalDependencies = packageJson.optionalDependencies ?? {};
+  for (const [dependencyName, optional] of [
+    ...Object.keys(requiredDependencies).map((name) => [name, false]),
+    ...Object.keys(optionalDependencies).map((name) => [name, true]),
+  ]) {
+    let dependencyRoot;
+    try {
+      dependencyRoot = await findPackageRoot(resolver.resolve(dependencyName), dependencyName);
+    } catch {
+      const installedRoot = path.join(
+        browserHostRoot,
+        'node_modules',
+        ...dependencyName.split('/'),
+      );
+      try {
+        await readFile(path.join(installedRoot, 'package.json'), 'utf8');
+        dependencyRoot = installedRoot;
+      } catch {
+        if (optional) continue;
+        throw new Error(`无法解析 Lighthouse 依赖：${packageName} -> ${dependencyName}`);
+      }
+    }
+    const nestedPath = path.relative(sourcePackageRoot, dependencyRoot);
+    if (nestedPath && !nestedPath.startsWith('..') && !path.isAbsolute(nestedPath)) {
+      // 父包目录已整体复制，嵌套版本随包一起保留，避免破坏依赖树。
+      continue;
+    }
+    await stagePackageTree(dependencyRoot, destinationNodeModules, stagedPackages);
+  }
+}
+
+async function findPackageRoot(entryPath, expectedName) {
+  let current = path.dirname(entryPath);
+  while (current !== path.dirname(current)) {
+    try {
+      const packageJson = JSON.parse(
+        await readFile(path.join(current, 'package.json'), 'utf8'),
+      );
+      if (packageJson.name === expectedName) return current;
+    } catch {
+      // 继续向依赖包根目录查找。
+    }
+    current = path.dirname(current);
+  }
+  throw new Error(`无法定位 Node 依赖包根目录：${expectedName}`);
 }
 
 async function findNodeLicense(executable) {

@@ -1,16 +1,25 @@
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, mkdir, stat, unlink } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { copyFile, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import type {
   BrowserContext,
   CDPSession,
   ConsoleMessage,
   Dialog,
   Download,
+  Frame,
   Page,
+  Request,
+  Response,
 } from "playwright-core";
-import { chromium } from "playwright-core";
+import type {
+  Browser as PuppeteerBrowser,
+  Page as PuppeteerPage,
+  ScreenRecorder,
+} from "puppeteer-core";
+import { chromium, errors } from "playwright-core";
 import { ControlFence, ProtocolFailure, requireSafeInteger } from "./control";
+import { HeapSnapshotModel } from "./heap-snapshot";
 import type {
   BinaryPayload,
   ClipboardText,
@@ -20,6 +29,7 @@ import type {
   HostDeviceType,
   HostLogicalViewport,
   HostEvent,
+  AgentCursorAction,
   HostHandshake,
   HostViewport,
   HitTest,
@@ -33,9 +43,77 @@ import { PROTOCOL_VERSION } from "./protocol";
 import { SnapshotRegistry } from "./snapshot";
 
 const PAGE_NAVIGATION_TIMEOUT_MILLIS = 15_000;
+const ACTION_NAVIGATION_EXPECT_TIMEOUT_MILLIS = 150;
+const POPUP_URL_TIMEOUT_MILLIS = 15_000;
+const ACTION_EXPECTED_URL_TIMEOUT_MILLIS = 3_000;
+const ACTION_DOM_STABLE_FOR_MILLIS = 100;
+const ACTION_DOM_STABILITY_TIMEOUT_MILLIS = 2_000;
+const ACTION_NETWORK_STABLE_FOR_MILLIS = 200;
+const ACTION_NETWORK_SETTLEMENT_TIMEOUT_MILLIS = 5_000;
+const ACTION_PAGE_METADATA_STABLE_FOR_MILLIS = 120;
+const ACTION_PAGE_METADATA_TIMEOUT_MILLIS = 2_000;
+const ACTION_PAGE_METADATA_POLL_MILLIS = 20;
 const SCREENCAST_INITIAL_FRAME_TIMEOUT_MILLIS = 5_000;
 const MAX_SCREENCAST_WIDTH = 7_680;
 const MAX_SCREENCAST_HEIGHT = 4_320;
+const MAX_CONSOLE_MESSAGES = 500;
+const MAX_NETWORK_REQUESTS = 500;
+const MAX_NETWORK_BODY_BYTES = 512 * 1024;
+const MAX_TRACE_EVENTS = 100_000;
+
+interface BrowserConsoleEntry {
+  id: number;
+  level: string;
+  text: string;
+  url: string;
+  line: number;
+  column: number;
+  timestamp: number;
+}
+
+interface BrowserNetworkEntry {
+  id: number;
+  method: string;
+  url: string;
+  resourceType: string;
+  requestHeaders: Record<string, string>;
+  status?: number;
+  statusText?: string;
+  responseHeaders?: Record<string, string>;
+  mimeType?: string;
+  failure?: string;
+  startedAt: number;
+  finishedAt?: number;
+  response?: Response;
+}
+
+interface BrowserDialogEntry {
+  id: number;
+  dialogType: string;
+  message: string;
+  defaultValue: string;
+  openedAt: number;
+  handledAs?: "accepted" | "dismissed";
+}
+
+interface PendingBrowserDialog {
+  dialog: Dialog;
+  entry: BrowserDialogEntry;
+  timeout: NodeJS.Timeout;
+}
+
+interface BrowserTraceState {
+  events: unknown[];
+  startedAt: number;
+  listener: (event: { value?: unknown[] }) => void;
+}
+
+interface BrowserRecordingState {
+  recorder: ScreenRecorder;
+  filePath: string;
+  format: "mp4" | "webm";
+  startedAt: number;
+}
 
 export interface BrowserHostConfig {
   profilePath: string;
@@ -53,7 +131,7 @@ export interface BrowserHostConfig {
 
 export interface HostTransport {
   emit(event: HostEvent): void;
-  emitBinary(payload: Buffer): void;
+  emitScreencast(event: HostEvent, payload: Buffer): boolean;
 }
 
 export interface ExecutedCommand {
@@ -78,10 +156,39 @@ interface PageRecord {
   lastUsedSequence: number;
   inFlightCommands: number;
   cdp?: CDPSession;
+  cdpPageDomainEnabled: boolean;
+  cdpMainFrameId?: string;
   screencastListener?: (event: ScreencastFrameEvent) => void;
   screencastSettings?: ScreencastSettings;
   screencastViewportRefreshScheduled: boolean;
   screencastAck: Promise<void>;
+  presentationPhase: "stable" | "navigation_pending";
+  presentationRevision: number;
+  presentationSettlement?: {
+    revision: number;
+    promise: Promise<void>;
+  };
+  hasPresentedFrame: boolean;
+  cdpFrameStartedNavigatingListener?: (event: FrameStartedNavigatingEvent) => void;
+  cdpFrameStoppedLoadingListener?: (event: FrameStoppedLoadingEvent) => void;
+  agentCursor?: {
+    x: number;
+    y: number;
+    action: AgentCursorAction;
+  };
+  pageStateRefreshScheduled: boolean;
+  consoleMessages: BrowserConsoleEntry[];
+  networkRequests: BrowserNetworkEntry[];
+  networkRequestIds: WeakMap<Request, number>;
+  nextConsoleMessageId: number;
+  nextNetworkRequestId: number;
+  dialogs: BrowserDialogEntry[];
+  pendingDialog?: PendingBrowserDialog;
+  nextDialogId: number;
+  trace?: BrowserTraceState;
+  lastTraceSummary?: Record<string, unknown>;
+  recording?: BrowserRecordingState;
+  popupHandler?: (popup: Page) => void;
 }
 
 interface ScreencastSettings {
@@ -89,6 +196,38 @@ interface ScreencastSettings {
   quality: number;
   maxWidth: number;
   maxHeight: number;
+}
+
+type NavigationInput =
+  | {
+      action: "url";
+      url: string;
+      handle_before_unload?: "accept" | "dismiss";
+      init_script?: string;
+      timeout_ms?: number;
+    }
+  | { action: "back"; timeout_ms?: number }
+  | { action: "forward"; timeout_ms?: number }
+  | {
+      action: "reload";
+      ignore_cache?: boolean;
+      handle_before_unload?: "accept" | "dismiss";
+      timeout_ms?: number;
+    };
+
+interface ActionSettlement {
+  waitForNavigationSignal(): Promise<boolean>;
+  finishPopupNavigation(): Promise<boolean>;
+  waitForNetworkSettlement(): Promise<void>;
+  dispose(): void;
+}
+
+interface FrameStartedNavigatingEvent {
+  frameId: string;
+}
+
+interface FrameStoppedLoadingEvent {
+  frameId: string;
 }
 
 interface ScreencastFrameEvent {
@@ -106,8 +245,12 @@ export class BrowserHost {
   readonly #config: BrowserHostConfig;
   readonly #transport: HostTransport;
   readonly #pages = new Map<string, PageRecord>();
+  readonly #heapSnapshots = new Map<string, HeapSnapshotModel>();
   #context?: BrowserContext;
+  #browserCdp?: CDPSession;
+  #puppeteerBrowser?: PuppeteerBrowser;
   #chromiumVersion = "unknown";
+  #devtoolsBrowserWSEndpoint?: string;
   #useSequence = 0;
   #foregroundTabId?: string;
 
@@ -132,16 +275,19 @@ export class BrowserHost {
         executablePath: this.#config.chromiumExecutable,
         headless: this.#config.headless,
         chromiumSandbox: true,
+        ignoreDefaultArgs: ["--disable-extensions"],
         acceptDownloads: true,
         downloadsPath: this.#config.downloadPath,
         permissions: [],
-        serviceWorkers: "block",
+        serviceWorkers: "allow",
         viewport: null,
         args: [
           "--disable-background-networking",
           "--disable-component-update",
           "--disable-default-apps",
           "--disable-sync",
+          "--enable-unsafe-extension-debugging",
+          "--remote-debugging-port=0",
           "--no-first-run",
           "--no-default-browser-check",
           // 给 headless Chromium 一个不受 runner 物理屏幕限制的虚拟工作区。
@@ -153,6 +299,7 @@ export class BrowserHost {
     );
     this.#context.setDefaultTimeout(5_000);
     this.#context.setDefaultNavigationTimeout(PAGE_NAVIGATION_TIMEOUT_MILLIS);
+    this.#devtoolsBrowserWSEndpoint = await readDevtoolsBrowserWSEndpoint(this.#config.profilePath);
     await this.installNavigationGuard();
     this.#chromiumVersion = this.#context.browser()?.version() ?? "unknown";
     for (const page of this.#context.pages()) {
@@ -188,6 +335,8 @@ export class BrowserHost {
         };
       case "update_control":
         this.control.update(command.payload.fence, command.payload.mode);
+        if (command.payload.mode === "agent") this.showAgentCursors();
+        else this.hideAgentCursors();
         return emptyResult();
       case "create_page":
         return this.createPage(command.payload);
@@ -211,6 +360,8 @@ export class BrowserHost {
         return this.press(command.payload);
       case "scroll":
         return this.scroll(command.payload);
+      case "devtools":
+        return this.devtools(command.payload);
       case "screenshot":
         return this.screenshot(command.payload);
       case "hit_test":
@@ -240,7 +391,13 @@ export class BrowserHost {
   async close(): Promise<void> {
     const context = this.#context;
     this.#context = undefined;
+    this.#browserCdp = undefined;
+    this.#puppeteerBrowser?.disconnect();
+    this.#puppeteerBrowser = undefined;
+    this.#devtoolsBrowserWSEndpoint = undefined;
+    for (const record of this.#pages.values()) this.disposePageRecord(record);
     this.#pages.clear();
+    this.#heapSnapshots.clear();
     if (context) {
       await context.close();
     }
@@ -294,10 +451,24 @@ export class BrowserHost {
     const existing = this.#pages.get(input.tab_id);
     if (existing) {
       await this.ensurePage(existing, input.allow_streaming_eviction);
-      await this.requirePage(existing).bringToFront();
-      this.#foregroundTabId = input.tab_id;
-      this.touch(existing);
-      return { result: { type: "page_state", payload: await this.pageState(existing) } };
+      const existingState = await this.pageState(existing);
+      if (existingState.url === input.initial_url) {
+        const viewportChanged = await this.applyViewport(existing, input.viewport);
+        existing.navigationRevision = Math.max(
+          existing.navigationRevision,
+          input.navigation_revision,
+        );
+        existing.snapshot.advanceTo(input.snapshot_revision);
+        if (viewportChanged) existing.snapshot.invalidate();
+        await this.requirePage(existing).bringToFront();
+        this.#foregroundTabId = input.tab_id;
+        this.touch(existing);
+        return { result: { type: "page_state", payload: await this.pageState(existing) } };
+      }
+
+      // 右侧面板恢复期间，物理 Page 可能落后于逻辑 Authority。此时复用
+      // 旧 Page 会返回过期 URL/修订号，破坏 Authority 的单调状态契约。
+      await this.discardPhysicalPage(existing);
     }
 
     // Authority 是逻辑 Tab 的唯一来源。Host 只在真正使用 Tab 时创建记录和
@@ -342,8 +513,20 @@ export class BrowserHost {
       currentTitle: "",
       lastUsedSequence: 0,
       inFlightCommands: 0,
+      cdpPageDomainEnabled: false,
       screencastViewportRefreshScheduled: false,
       screencastAck: Promise.resolve(),
+      presentationPhase: "stable",
+      presentationRevision: 0,
+      hasPresentedFrame: false,
+      pageStateRefreshScheduled: false,
+      consoleMessages: [],
+      networkRequests: [],
+      networkRequestIds: new WeakMap(),
+      nextConsoleMessageId: 1,
+      nextNetworkRequestId: 1,
+      dialogs: [],
+      nextDialogId: 1,
     };
   }
 
@@ -354,6 +537,7 @@ export class BrowserHost {
     const record = this.#pages.get(tabId);
     if (!record) return emptyResult();
     await this.stopScreencast(tabId);
+    this.disposePageRecord(record);
     this.#pages.delete(tabId);
     if (this.#foregroundTabId === tabId) this.#foregroundTabId = undefined;
     await record.page?.close().catch(() => undefined);
@@ -477,8 +661,12 @@ export class BrowserHost {
     allowStreamingEviction = false,
   ): Promise<void> {
     if (record.page) {
-      await this.flushScreencastAck(record);
+      // 页面已经物理存在时，恢复只是一次幂等的激活确认。实时画面流有
+      // 自己的 ACK 管道，不能把它当成页面可用性的同步屏障：在持续输出
+      // screencast 的页面上，ACK 队列可能一直有新帧，等待它会阻塞后续
+      // 的导航、快照和交互命令。只有停止画面流时才需要收口 ACK。
       this.touch(record);
+      this.ensureAgentCursor(record);
       return;
     }
     await this.ensureActiveCapacity(record, allowStreamingEviction);
@@ -507,9 +695,12 @@ export class BrowserHost {
       }
       await this.pageState(record);
       this.touch(record);
+      this.ensureAgentCursor(record);
     } catch (error) {
       record.page = undefined;
       record.cdp = undefined;
+      record.cdpPageDomainEnabled = false;
+      record.cdpMainFrameId = undefined;
       await page.close().catch(() => undefined);
       throw error;
     }
@@ -575,8 +766,11 @@ export class BrowserHost {
     } satisfies PageState));
     record.screencastSettings = undefined;
     await this.stopScreencastSession(record);
+    this.disposePageRecord(record);
     record.page = undefined;
     record.cdp = undefined;
+    record.cdpPageDomainEnabled = false;
+    record.cdpMainFrameId = undefined;
     record.screencastListener = undefined;
     record.navigationRevision += 1;
     record.snapshot.invalidate();
@@ -588,6 +782,23 @@ export class BrowserHost {
       type: "page_suspended",
       payload: state,
     });
+  }
+
+  private async discardPhysicalPage(record: PageRecord): Promise<void> {
+    const page = record.page;
+    if (!page) return;
+    record.screencastSettings = undefined;
+    await this.stopScreencastSession(record);
+    this.disposePageRecord(record);
+    this.#pages.delete(record.tabId);
+    if (this.#foregroundTabId === record.tabId) this.#foregroundTabId = undefined;
+    record.page = undefined;
+    record.cdp = undefined;
+    record.cdpPageDomainEnabled = false;
+    record.cdpMainFrameId = undefined;
+    record.screencastListener = undefined;
+    record.screencastSettings = undefined;
+    await page.close().catch(() => undefined);
   }
 
   private touch(record: PageRecord): void {
@@ -606,53 +817,163 @@ export class BrowserHost {
     return record.page;
   }
 
+  private ensureNoPendingDialog(record: PageRecord): void {
+    if (!record.pendingDialog) return;
+    throw new ProtocolFailure(
+      "browser_dialog_pending",
+      "浏览器页面有一个待处理的对话框，请先调用 browser_dialog accept 或 dismiss",
+      true,
+      false,
+    );
+  }
+
   private async cdpSession(record: PageRecord): Promise<CDPSession> {
-    record.cdp ??= await this.context().newCDPSession(this.requirePage(record));
+    if (!record.cdp) {
+      record.cdp = await this.context().newCDPSession(this.requirePage(record));
+      record.cdpPageDomainEnabled = false;
+      record.cdpMainFrameId = undefined;
+    }
     return record.cdp;
+  }
+
+  private async browserCdpSession(): Promise<CDPSession> {
+    if (this.#browserCdp) return this.#browserCdp;
+    const browser = this.context().browser();
+    if (!browser) throw new Error("Chromium browser connection is unavailable");
+    this.#browserCdp = await browser.newBrowserCDPSession();
+    return this.#browserCdp;
+  }
+
+  private async puppeteerBrowser(): Promise<PuppeteerBrowser> {
+    if (this.#puppeteerBrowser?.connected) return this.#puppeteerBrowser;
+    const endpoint = this.#devtoolsBrowserWSEndpoint;
+    if (!endpoint) throw new Error("Chromium DevTools connection is unavailable");
+    const { default: puppeteer } = await import("puppeteer-core");
+    this.#puppeteerBrowser = await puppeteer.connect({
+      browserWSEndpoint: endpoint,
+      defaultViewport: null,
+      handleDevToolsAsPage: true,
+      targetFilter: () => true,
+    });
+    return this.#puppeteerBrowser;
+  }
+
+  private async puppeteerPage(record: PageRecord): Promise<PuppeteerPage> {
+    const cdp = await this.cdpSession(record);
+    const targetInfo = await cdp.send("Target.getTargetInfo");
+    const browser = await this.puppeteerBrowser();
+    const target = browser.targets().find(candidate => (
+      candidate.type() === "page"
+      && (candidate as unknown as { _targetId?: string })._targetId === targetInfo.targetInfo.targetId
+    ));
+    const page = await target?.page();
+    if (!page) throw new Error(`Puppeteer page target not found: ${targetInfo.targetInfo.targetId}`);
+    return page;
   }
 
   private async navigate(input: {
     tab_id: string;
     control: HostControl;
-    navigation:
-      | { action: "url"; url: string }
-      | { action: "back" }
-      | { action: "forward" }
-      | { action: "reload" };
+    navigation: NavigationInput;
   }): Promise<ExecutedCommand> {
     this.control.validate(input.control);
     const record = this.pageRecord(input.tab_id);
     await this.ensurePage(record);
+    this.ensureNoPendingDialog(record);
     const page = this.requirePage(record);
-    return this.withNavigationGuard(record, async () => {
-      this.control.validate(input.control);
-      try {
-        switch (input.navigation.action) {
-          case "url":
-            validateNavigationUrl(input.navigation.url);
-            await page.goto(input.navigation.url, {
-              waitUntil: "domcontentloaded",
-            });
-            break;
-          case "back":
-            await page.goBack({ waitUntil: "domcontentloaded" });
-            break;
-          case "forward":
-            await page.goForward({ waitUntil: "domcontentloaded" });
-            break;
-          case "reload":
-            await page.reload({ waitUntil: "domcontentloaded" });
-            break;
+    const timeout = boundedTimeout(input.navigation.timeout_ms, PAGE_NAVIGATION_TIMEOUT_MILLIS, 60_000);
+    const requestedBeforeUnload = "handle_before_unload" in input.navigation
+      ? input.navigation.handle_before_unload
+      : undefined;
+    const beforeUnloadAction = requestedBeforeUnload ?? "accept";
+    if (beforeUnloadAction !== "accept" && beforeUnloadAction !== "dismiss") {
+      throw invalidDevtoolsArguments("handle_before_unload must be accept or dismiss");
+    }
+    const cdp = await this.cdpSession(record);
+    let initScriptId: string | undefined;
+    if (input.navigation.action === "url" && input.navigation.init_script) {
+      const result = await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+        source: input.navigation.init_script,
+      }) as { identifier?: string };
+      initScriptId = result.identifier;
+    }
+    let beforeUnloadHandler: ((dialog: Dialog) => void) | undefined;
+    let beforeUnloadHandling: Promise<void> | undefined;
+    this.beginNavigationPresentation(record, page);
+    if (requestedBeforeUnload) {
+      beforeUnloadHandler = (dialog: Dialog) => {
+        if (dialog.type() !== "beforeunload") return;
+        beforeUnloadHandling = (async () => {
+          try {
+            if (beforeUnloadAction === "accept") await dialog.accept();
+            else await dialog.dismiss();
+            if (record.pendingDialog?.dialog === dialog) {
+              clearTimeout(record.pendingDialog.timeout);
+              record.pendingDialog.entry.handledAs = beforeUnloadAction === "accept" ? "accepted" : "dismissed";
+              record.pendingDialog = undefined;
+            }
+          } catch {
+            // 导航结果中的对话框可能已被并发关闭，此时无需重复处理。
+          }
+        })();
+        void beforeUnloadHandling;
+      };
+      page.on("dialog", beforeUnloadHandler);
+    }
+    try {
+      await this.withNavigationGuard(record, async () => {
+        this.control.validate(input.control);
+        try {
+          switch (input.navigation.action) {
+            case "url":
+              validateNavigationUrl(input.navigation.url);
+              await page.goto(input.navigation.url, { waitUntil: "domcontentloaded", timeout });
+              break;
+            case "back":
+              await page.goBack({ waitUntil: "domcontentloaded", timeout });
+              break;
+            case "forward":
+              await page.goForward({ waitUntil: "domcontentloaded", timeout });
+              break;
+            case "reload":
+              if (input.navigation.ignore_cache) {
+                const loaded = page.waitForEvent("domcontentloaded", { timeout });
+                await cdp.send("Page.reload", { ignoreCache: true });
+                await loaded;
+              } else {
+                await page.reload({ waitUntil: "domcontentloaded", timeout });
+              }
+              break;
+          }
+        } catch (error) {
+          // Playwright 的 page.goto 超时后，Chromium 可能仍保持一个未完成的
+          // navigation。若直接返回，下一条 snapshot/type 会继续等待这次旧
+          // navigation，形成连续工具错误。先停止当前加载，让页面回到可操作
+          // 状态；当前导航仍按 indeterminate/recoverable 错误返回给调用方。
+          await cdp.send("Page.stopLoading").catch(() => undefined);
+          await page
+            .waitForLoadState("domcontentloaded", { timeout: 1_000 })
+            .catch(() => undefined);
+          this.throwBlockedNavigation(record);
+          if (beforeUnloadAction === "dismiss" && beforeUnloadHandling) {
+            await beforeUnloadHandling;
+            return;
+          }
+          throw playwrightFailure("browser_navigation_failed", error, true);
         }
-      } catch (error) {
-        this.throwBlockedNavigation(record);
-        throw playwrightFailure("browser_navigation_failed", error, true);
+      });
+    } finally {
+      await this.completeNavigationPresentation(record, page);
+      if (beforeUnloadHandling) await beforeUnloadHandling;
+      if (beforeUnloadHandler) page.off("dialog", beforeUnloadHandler);
+      if (initScriptId) {
+        await cdp.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: initScriptId }).catch(() => undefined);
       }
-      this.throwBlockedNavigation(record);
-      const state = await this.pageState(record);
-      this.#transport.emit({ type: "page_updated", payload: state });
-      return { result: { type: "page_state", payload: state } };
-    });
+    }
+    this.throwBlockedNavigation(record);
+    const state = await this.pageState(record);
+    this.#transport.emit({ type: "page_updated", payload: state });
+    return { result: { type: "page_state", payload: state } };
   }
 
   private async snapshot(input: {
@@ -662,6 +983,7 @@ export class BrowserHost {
   }): Promise<ExecutedCommand> {
     const record = this.pageRecord(input.tab_id);
     await this.ensurePage(record);
+    this.ensureNoPendingDialog(record);
     const page = this.requirePage(record);
     const snapshot = await record.snapshot.capture(
       page,
@@ -680,9 +1002,10 @@ export class BrowserHost {
     this.control.validate(input.control);
     const record = this.pageRecord(input.tab_id);
     await this.ensurePage(record);
+    this.ensureNoPendingDialog(record);
     const page = this.requirePage(record);
     const locator = await record.snapshot.resolve(page, input.target);
-    const sensitiveActionKind = await locator.evaluate((element) => {
+    const clickTarget = await locator.evaluate((element) => {
       const form = element.closest("form");
       const descriptor = [
         element.textContent,
@@ -699,28 +1022,87 @@ export class BrowserHost {
         ["publish", /\b(publish|deploy|release to production|go live)\b|发布|部署|上线/],
         ["permission", /\b(grant access|authorize|change permissions?|make public)\b|授权|更改权限|设为公开/],
       ];
-      return patterns.find(([, pattern]) => pattern.test(descriptor))?.[0] ?? null;
+      const sensitiveActionKind = patterns.find(([, pattern]) => pattern.test(descriptor))?.[0] ?? null;
+      const anchor = element.closest("a[href]") as HTMLAnchorElement | null;
+      let expectedNavigationUrl: string | null = null;
+      if (
+        anchor
+        && !anchor.hasAttribute("download")
+        && (!anchor.target || anchor.target === "_self")
+      ) {
+        const target = new URL(anchor.href, document.baseURI);
+        const current = new URL(globalThis.location.href);
+        const onlyHashChanges = target.origin === current.origin
+          && target.pathname === current.pathname
+          && target.search === current.search;
+        if (
+          (target.protocol === "http:" || target.protocol === "https:")
+          && target.href !== current.href
+          && !onlyHashChanges
+        ) {
+          expectedNavigationUrl = target.href;
+        }
+      }
+      return { sensitiveActionKind, expectedNavigationUrl };
     });
-    if (sensitiveActionKind) {
+    if (clickTarget.sensitiveActionKind) {
       throw new ProtocolFailure(
         "browser_sensitive_action_requires_user",
-        `model click is blocked for sensitive action: ${sensitiveActionKind}`,
+        `model click is blocked for sensitive action: ${clickTarget.sensitiveActionKind}`,
         true,
         false,
         "用户接管浏览器后可以手动完成该操作；不要自动重试当前点击。",
       );
     }
     this.control.validate(input.control);
-    return this.withNavigationGuard(record, async () => {
+    await this.withNavigationGuard(record, async () => {
       try {
-        await locator.click();
+        await locator.scrollIntoViewIfNeeded();
+          const bounds = await locator.boundingBox();
+        if (!bounds) {
+          throw new Error("browser click target has no visible bounds");
+        }
+        let resolveDialog: (() => void) | undefined;
+        const dialogOpened = new Promise<void>((resolve) => { resolveDialog = resolve; });
+        const onDialog = () => resolveDialog?.();
+        page.once("dialog", onDialog);
+        try {
+          const cdp = await this.cdpSession(record);
+          const x = bounds.x + bounds.width / 2;
+          const y = bounds.y + bounds.height / 2;
+          this.showAgentCursor(record, x, y, "click");
+          await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+          await cdp.send("Input.dispatchMouseEvent", {
+            type: "mousePressed",
+            x,
+            y,
+            button: "left",
+            buttons: 1,
+            clickCount: 1,
+          });
+          const released = cdp.send("Input.dispatchMouseEvent", {
+            type: "mouseReleased",
+            x,
+            y,
+            button: "left",
+            buttons: 0,
+            clickCount: 1,
+          });
+          const dialogWon = await Promise.race([
+            released.then(() => false),
+            dialogOpened.then(() => true),
+          ]);
+          if (dialogWon) void released.catch(() => undefined);
+        } finally {
+          page.off("dialog", onDialog);
+        }
       } catch (error) {
         this.throwBlockedNavigation(record);
         throw playwrightFailure("browser_click_failed", error, true);
       }
-      this.throwBlockedNavigation(record);
-      return { result: { type: "page_state", payload: await this.pageState(record) } };
-    });
+    }, clickTarget.expectedNavigationUrl);
+    this.throwBlockedNavigation(record);
+    return { result: { type: "page_state", payload: await this.pageState(record) } };
   }
 
   private async type(input: {
@@ -729,10 +1111,12 @@ export class BrowserHost {
     target: { snapshot_revision: number; element_ref: string };
     text: string;
     replace: boolean;
+    submit_key?: string | null;
   }): Promise<ExecutedCommand> {
     this.control.validate(input.control);
     const record = this.pageRecord(input.tab_id);
     await this.ensurePage(record);
+    this.ensureNoPendingDialog(record);
     const page = this.requirePage(record);
     const locator = await record.snapshot.resolve(page, input.target);
     const sensitiveInputKind = await locator.evaluate((element) => {
@@ -759,8 +1143,17 @@ export class BrowserHost {
         "用户接管浏览器后可以手动填写敏感字段；敏感值不会进入模型快照或日志。",
       );
     }
-    return this.withNavigationGuard(record, async () => {
+    await this.withNavigationGuard(record, async () => {
       await locator.focus();
+      const bounds = await locator.boundingBox();
+      if (bounds) {
+        this.showAgentCursor(
+          record,
+          bounds.x + bounds.width / 2,
+          bounds.y + bounds.height / 2,
+          "type",
+        );
+      }
       this.control.validate(input.control);
       try {
         if (input.replace) {
@@ -768,13 +1161,16 @@ export class BrowserHost {
         } else {
           await page.keyboard.insertText(input.text);
         }
+        if (input.submit_key) {
+          await page.keyboard.press(input.submit_key);
+        }
       } catch (error) {
         this.throwBlockedNavigation(record);
         throw playwrightFailure("browser_type_failed", error, true);
       }
-      this.throwBlockedNavigation(record);
-      return { result: { type: "page_state", payload: await this.pageState(record) } };
     });
+    this.throwBlockedNavigation(record);
+    return { result: { type: "page_state", payload: await this.pageState(record) } };
   }
 
   private async press(input: {
@@ -785,8 +1181,9 @@ export class BrowserHost {
     this.control.validate(input.control);
     const record = this.pageRecord(input.tab_id);
     await this.ensurePage(record);
+    this.ensureNoPendingDialog(record);
     const page = this.requirePage(record);
-    return this.withNavigationGuard(record, async () => {
+    await this.withNavigationGuard(record, async () => {
       this.control.validate(input.control);
       try {
         await page.keyboard.press(input.key);
@@ -794,9 +1191,9 @@ export class BrowserHost {
         this.throwBlockedNavigation(record);
         throw playwrightFailure("browser_press_failed", error, true);
       }
-      this.throwBlockedNavigation(record);
-      return { result: { type: "page_state", payload: await this.pageState(record) } };
     });
+    this.throwBlockedNavigation(record);
+    return { result: { type: "page_state", payload: await this.pageState(record) } };
   }
 
   private async scroll(input: {
@@ -811,10 +1208,20 @@ export class BrowserHost {
     requireFinite("delta_y", input.delta_y);
     const record = this.pageRecord(input.tab_id);
     await this.ensurePage(record);
+    this.ensureNoPendingDialog(record);
     const page = this.requirePage(record);
-    return this.withNavigationGuard(record, async () => {
+    await this.withNavigationGuard(record, async () => {
       if (input.target) {
         const locator = await record.snapshot.resolve(page, input.target);
+        const bounds = await locator.boundingBox();
+        if (bounds) {
+          this.showAgentCursor(
+            record,
+            bounds.x + bounds.width / 2,
+            bounds.y + bounds.height / 2,
+            "scroll",
+          );
+        }
         this.control.validate(input.control);
         await locator.evaluate(
           (element, delta) => (element as HTMLElement).scrollBy(delta.x, delta.y),
@@ -822,11 +1229,801 @@ export class BrowserHost {
         );
       } else {
         this.control.validate(input.control);
+        this.showAgentCursor(record, record.viewport.width / 2, record.viewport.height / 2, "scroll");
         await page.mouse.wheel(input.delta_x, input.delta_y);
       }
-      this.throwBlockedNavigation(record);
-      return { result: { type: "page_state", payload: await this.pageState(record) } };
     });
+    this.throwBlockedNavigation(record);
+    return { result: { type: "page_state", payload: await this.pageState(record) } };
+  }
+
+  private async devtools(input: {
+    tab_id: string;
+    control?: HostControl | null;
+    operation: string;
+    arguments: Record<string, unknown>;
+  }): Promise<ExecutedCommand> {
+    if (input.control) this.control.validate(input.control);
+    const record = this.pageRecord(input.tab_id);
+    await this.ensurePage(record);
+    if (input.operation !== "dialog") this.ensureNoPendingDialog(record);
+    const page = this.requirePage(record);
+    const args = input.arguments ?? {};
+    if (devtoolsOperationRequiresControl(input.operation, args)) {
+      this.requireDevtoolsControl(input.control);
+    }
+
+    switch (input.operation) {
+      case "wait_for": {
+        const timeout = boundedTimeout(args.timeout_ms, 5_000, 60_000);
+        const selector = optionalDevtoolsString(args, "selector");
+        const url = optionalDevtoolsString(args, "url");
+        const texts = devtoolsStringArray(args.text ?? args.texts);
+        if (!selector && !url && texts.length === 0) {
+          throw invalidDevtoolsArguments("wait_for requires text, selector, or url");
+        }
+        try {
+          if (selector) {
+            await page.locator(selector).first().waitFor({ state: "visible", timeout });
+          }
+          if (url) {
+            await page.waitForURL(value => value.href.includes(url), {
+              timeout,
+              waitUntil: "domcontentloaded",
+            });
+          }
+          if (texts.length > 0) {
+            await page.waitForFunction(
+              expected => expected.some(text => document.body?.innerText.includes(text)),
+              texts,
+              { timeout },
+            );
+          }
+        } catch (error) {
+          if (error instanceof errors.TimeoutError) {
+            throw new ProtocolFailure(
+              "browser_wait_timeout",
+              `browser wait condition was not met within ${timeout}ms`,
+              true,
+              false,
+            );
+          }
+          throw playwrightFailure("browser_wait_failed", error, false);
+        }
+        return jsonResult({ matched: { selector, url, texts }, url: page.url() });
+      }
+      case "hover": {
+        const target = devtoolsTarget(args);
+        const locator = await record.snapshot.resolve(page, target);
+        await locator.scrollIntoViewIfNeeded();
+        const bounds = await locator.boundingBox();
+        if (!bounds) throw new Error("browser hover target has no visible bounds");
+        this.showAgentCursor(
+          record,
+          bounds.x + bounds.width / 2,
+          bounds.y + bounds.height / 2,
+          "move",
+        );
+        await locator.hover();
+        return jsonResult({ hovered: target.element_ref });
+      }
+      case "drag": {
+        const from = devtoolsTarget(devtoolsObject(args, "from"));
+        const to = devtoolsTarget(devtoolsObject(args, "to"));
+        const fromLocator = await record.snapshot.resolve(page, from);
+        const toLocator = await record.snapshot.resolve(page, to);
+        await fromLocator.scrollIntoViewIfNeeded();
+        const fromBounds = await fromLocator.boundingBox();
+        const toBounds = await toLocator.boundingBox();
+        if (!fromBounds || !toBounds) throw new Error("browser drag target has no visible bounds");
+        this.showAgentCursor(
+          record,
+          fromBounds.x + fromBounds.width / 2,
+          fromBounds.y + fromBounds.height / 2,
+          "drag",
+        );
+        await fromLocator.dragTo(toLocator);
+        this.showAgentCursor(
+          record,
+          toBounds.x + toBounds.width / 2,
+          toBounds.y + toBounds.height / 2,
+          "drag",
+        );
+        return jsonResult({ from: from.element_ref, to: to.element_ref });
+      }
+      case "fill_form": {
+        const elements = devtoolsObjectArray(args, "elements");
+        for (const element of elements) {
+          const target = devtoolsTarget(element);
+          const value = element.value;
+          const locator = await record.snapshot.resolve(page, target);
+          const bounds = await locator.boundingBox();
+          if (bounds) {
+            this.showAgentCursor(
+              record,
+              bounds.x + bounds.width / 2,
+              bounds.y + bounds.height / 2,
+              "type",
+            );
+          }
+          const kind = await locator.evaluate(node => ({
+            tag: node.tagName.toLowerCase(),
+            type: (node.getAttribute("type") ?? "").toLowerCase(),
+          }));
+          if (kind.tag === "select") {
+            await locator.selectOption(String(value ?? ""));
+          } else if (kind.type === "checkbox" || kind.type === "radio") {
+            const checked = value === true || value === "true";
+            if (checked) await locator.check();
+            else if (kind.type === "checkbox") await locator.uncheck();
+          } else {
+            await locator.fill(String(value ?? ""));
+          }
+        }
+        return jsonResult({ filled: elements.length });
+      }
+      case "upload_file": {
+        const target = devtoolsTarget(args);
+        const filePath = requiredDevtoolsString(args, "file_path");
+        const locator = await record.snapshot.resolve(page, target);
+        const bounds = await locator.boundingBox();
+        if (bounds) {
+          this.showAgentCursor(
+            record,
+            bounds.x + bounds.width / 2,
+            bounds.y + bounds.height / 2,
+            "click",
+          );
+        }
+        await locator.setInputFiles(filePath);
+        return jsonResult({ uploaded: true, element_ref: target.element_ref });
+      }
+      case "click_at": {
+        const x = requiredFiniteDevtoolsNumber(args, "x");
+        const y = requiredFiniteDevtoolsNumber(args, "y");
+        this.showAgentCursor(record, x, y, "click");
+        await page.mouse.click(x, y, { clickCount: args.double_click === true ? 2 : 1 });
+        return jsonResult({ x, y, double_click: args.double_click === true });
+      }
+      case "evaluate": {
+        const source = requiredDevtoolsString(args, "function");
+        const callArgs = Array.isArray(args.args) ? args.args : [];
+        const result = await page.evaluate(
+          async ({ expression, values }) => {
+            const candidate = (0, eval)(`(${expression})`);
+            if (typeof candidate !== "function") {
+              throw new Error("browser evaluate input must be a function declaration");
+            }
+            return await candidate(...values);
+          },
+          { expression: source, values: callArgs },
+        );
+        if (args.wait_for_stable_dom !== false) {
+          await this.waitForStableDom(page);
+        }
+        return jsonResult({ value: boundJsonValue(result) });
+      }
+      case "console":
+        return this.consoleOperation(record, args);
+      case "network":
+        return this.networkOperation(record, args);
+      case "dialog":
+        return this.dialogOperation(record, args);
+      case "emulate": {
+        return this.emulateOperation(record, args);
+      }
+      case "performance":
+        return this.performanceOperation(record, args);
+      case "lighthouse":
+        return this.lighthouseOperation(record, args);
+      case "heap":
+        return this.heapOperation(record, args);
+      case "extensions":
+        return this.extensionsOperation(record, args);
+      case "third_party":
+        return this.thirdPartyOperation(page, args);
+      case "webmcp":
+        return this.webMcpOperation(page, args);
+      case "pwa":
+        return this.pwaOperation(record, args);
+      case "recording":
+        return this.recordingOperation(record, args);
+      default:
+        throw new ProtocolFailure(
+          "browser_devtools_operation_unsupported",
+          `unsupported browser devtools operation: ${input.operation}`,
+          false,
+          false,
+        );
+    }
+  }
+
+  private requireDevtoolsControl(control?: HostControl | null): void {
+    if (!control) {
+      throw invalidDevtoolsArguments("browser devtools write operation requires control");
+    }
+    this.control.validate(control);
+  }
+
+  private consoleOperation(
+    record: PageRecord,
+    args: Record<string, unknown>,
+  ): ExecutedCommand {
+    const action = optionalDevtoolsString(args, "action") ?? "list";
+    if (action === "clear") {
+      record.consoleMessages = [];
+      return jsonResult({ cleared: true });
+    }
+    if (action === "get") {
+      const id = requiredDevtoolsInteger(args, "message_id");
+      const message = record.consoleMessages.find(entry => entry.id === id);
+      if (!message) throw invalidDevtoolsArguments(`console message not found: ${id}`);
+      return jsonResult({ message });
+    }
+    if (action !== "list") throw invalidDevtoolsArguments("invalid console action");
+    const levels = new Set(devtoolsStringArray(args.levels));
+    const pageSize = boundedInteger(args.page_size, 100, 1, 500);
+    const messages = record.consoleMessages
+      .filter(entry => levels.size === 0 || levels.has(entry.level))
+      .slice(-pageSize);
+    return jsonResult({ messages, total: record.consoleMessages.length });
+  }
+
+  private async networkOperation(
+    record: PageRecord,
+    args: Record<string, unknown>,
+  ): Promise<ExecutedCommand> {
+    const action = optionalDevtoolsString(args, "action") ?? "list";
+    if (action === "clear") {
+      record.networkRequests = [];
+      record.networkRequestIds = new WeakMap();
+      return jsonResult({ cleared: true });
+    }
+    if (action === "get") {
+      const id = requiredDevtoolsInteger(args, "request_id");
+      const entry = record.networkRequests.find(candidate => candidate.id === id);
+      if (!entry) throw invalidDevtoolsArguments(`network request not found: ${id}`);
+      let responseBody: string | null = null;
+      let bodyTruncated = false;
+      if (args.include_body === true && entry.response) {
+        const body = await entry.response.body().catch(() => Buffer.alloc(0));
+        bodyTruncated = body.length > MAX_NETWORK_BODY_BYTES;
+        responseBody = body.subarray(0, MAX_NETWORK_BODY_BYTES).toString("utf8");
+      }
+      return jsonResult({ request: publicNetworkEntry(entry), response_body: responseBody, body_truncated: bodyTruncated });
+    }
+    if (action !== "list") throw invalidDevtoolsArguments("invalid network action");
+    const resourceTypes = new Set(devtoolsStringArray(args.resource_types));
+    const pageSize = boundedInteger(args.page_size, 100, 1, 500);
+    const requests = record.networkRequests
+      .filter(entry => resourceTypes.size === 0 || resourceTypes.has(entry.resourceType))
+      .slice(-pageSize)
+      .map(publicNetworkEntry);
+    return jsonResult({ requests, total: record.networkRequests.length });
+  }
+
+  private async dialogOperation(
+    record: PageRecord,
+    args: Record<string, unknown>,
+  ): Promise<ExecutedCommand> {
+    const action = optionalDevtoolsString(args, "action") ?? "list";
+    if (action === "clear") {
+      record.dialogs = [];
+      return jsonResult({ cleared: true });
+    }
+    if (action === "list") {
+      return jsonResult({
+        dialogs: record.dialogs.slice(-100),
+        pending: record.pendingDialog ? {
+          id: record.pendingDialog.entry.id,
+          dialog_type: record.pendingDialog.entry.dialogType,
+          message: record.pendingDialog.entry.message,
+          default_value: record.pendingDialog.entry.defaultValue,
+        } : null,
+      });
+    }
+    if (action !== "accept" && action !== "dismiss") {
+      throw invalidDevtoolsArguments("invalid dialog action");
+    }
+    const pending = record.pendingDialog;
+    if (!pending) throw invalidDevtoolsArguments("no browser dialog is pending");
+    clearTimeout(pending.timeout);
+    record.pendingDialog = undefined;
+    try {
+      if (action === "accept") {
+        await pending.dialog.accept(optionalDevtoolsString(args, "prompt_text"));
+        pending.entry.handledAs = "accepted";
+      } else {
+        await pending.dialog.dismiss();
+        pending.entry.handledAs = "dismissed";
+      }
+    } catch (error) {
+      throw new ProtocolFailure(
+        "browser_dialog_handle_failed",
+        error instanceof Error ? error.message : String(error),
+        true,
+        true,
+      );
+    }
+    return Promise.resolve(jsonResult({ handled: action, dialog_id: pending.entry.id }));
+  }
+
+  private async emulateOperation(
+    record: PageRecord,
+    args: Record<string, unknown>,
+  ): Promise<ExecutedCommand> {
+    const page = this.requirePage(record);
+    const cdp = await this.cdpSession(record);
+    const colorScheme = optionalDevtoolsString(args, "color_scheme");
+    if (colorScheme && !["auto", "dark", "light"].includes(colorScheme)) {
+      throw invalidDevtoolsArguments("color_scheme must be auto, dark, or light");
+    }
+    await page.emulateMedia({
+      colorScheme: !colorScheme || colorScheme === "auto"
+        ? null
+        : colorScheme as "dark" | "light",
+    });
+    const cpuRate = optionalDevtoolsNumber(args, "cpu_throttling_rate");
+    if (cpuRate !== undefined && (cpuRate < 1 || cpuRate > 20)) {
+      throw invalidDevtoolsArguments("cpu_throttling_rate must be between 1 and 20");
+    }
+    await cdp.send("Emulation.setCPUThrottlingRate", { rate: cpuRate ?? 1 });
+    const userAgent = optionalDevtoolsString(args, "user_agent");
+    if (userAgent) await cdp.send("Emulation.setUserAgentOverride", { userAgent });
+    else await this.applyUserAgent(record, record.viewport.device_type);
+    if (args.geolocation && typeof args.geolocation === "object") {
+      const location = args.geolocation as Record<string, unknown>;
+      const latitude = requiredFiniteDevtoolsNumber(location, "latitude");
+      const longitude = requiredFiniteDevtoolsNumber(location, "longitude");
+      const accuracy = optionalDevtoolsNumber(location, "accuracy") ?? 1;
+      if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180 || accuracy < 0) {
+        throw invalidDevtoolsArguments("geolocation is outside the supported coordinate range");
+      }
+      await cdp.send("Emulation.setGeolocationOverride", {
+        latitude,
+        longitude,
+        accuracy,
+      });
+    } else {
+      await cdp.send("Emulation.clearGeolocationOverride");
+    }
+    if (Object.prototype.hasOwnProperty.call(args, "extra_http_headers")) {
+      if (args.extra_http_headers !== null && typeof args.extra_http_headers !== "object") {
+        throw invalidDevtoolsArguments("extra_http_headers must be an object or null");
+      }
+      const headers = args.extra_http_headers && typeof args.extra_http_headers === "object"
+        ? Object.fromEntries(
+          Object.entries(args.extra_http_headers as Record<string, unknown>)
+            .filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+        )
+        : {};
+      await cdp.send("Network.enable");
+      await cdp.send("Network.setExtraHTTPHeaders", { headers });
+    }
+    const network = optionalDevtoolsString(args, "network_conditions");
+    await cdp.send("Network.enable");
+    await cdp.send("Network.emulateNetworkConditions", network
+      ? networkCondition(network)
+      : { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+    return jsonResult({ configured: true });
+  }
+
+  private async performanceOperation(
+    record: PageRecord,
+    args: Record<string, unknown>,
+  ): Promise<ExecutedCommand> {
+    const action = optionalDevtoolsString(args, "action") ?? "metrics";
+    const cdp = await this.cdpSession(record);
+    if (action === "start") {
+      if (record.trace) throw invalidDevtoolsArguments("performance trace already running");
+      const trace: BrowserTraceState = {
+        events: [],
+        startedAt: Date.now(),
+        listener: event => {
+          if (!Array.isArray(event.value) || trace.events.length >= MAX_TRACE_EVENTS) return;
+          trace.events.push(...event.value.slice(0, MAX_TRACE_EVENTS - trace.events.length));
+        },
+      };
+      record.trace = trace;
+      cdp.on("Tracing.dataCollected", trace.listener);
+      await cdp.send("Tracing.start", {
+        categories: "devtools.timeline,blink.user_timing,loading,disabled-by-default-devtools.timeline",
+        transferMode: "ReportEvents",
+      });
+      if (args.reload === true) {
+        await this.requirePage(record).reload({ waitUntil: "domcontentloaded" });
+        await this.waitForStableDom(this.requirePage(record));
+      }
+      if (args.auto_stop === true) {
+        return this.performanceOperation(record, { ...args, action: "stop" });
+      }
+      return jsonResult({ tracing: true, started_at: trace.startedAt });
+    }
+    if (action === "stop") {
+      const trace = record.trace;
+      if (!trace) throw invalidDevtoolsArguments("performance trace is not running");
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("performance trace stop timed out")), 10_000);
+        cdp.once("Tracing.tracingComplete", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        void cdp.send("Tracing.end").catch(reject);
+      });
+      cdp.off("Tracing.dataCollected", trace.listener);
+      record.trace = undefined;
+      record.lastTraceSummary = summarizeTrace(trace.events, trace.startedAt);
+      const filePath = optionalDevtoolsString(args, "file_path");
+      if (filePath) {
+        await mkdir(dirname(filePath), { recursive: true });
+        await writeFile(filePath, JSON.stringify({ traceEvents: trace.events }), "utf8");
+        record.lastTraceSummary.file_path = filePath;
+      }
+      return jsonResult(record.lastTraceSummary);
+    }
+    await cdp.send("Performance.enable");
+    const metrics = await cdp.send("Performance.getMetrics");
+    if (action === "analyze") {
+      const trace = record.lastTraceSummary ?? null;
+      const insightName = optionalDevtoolsString(args, "insight_name");
+      const insightSetId = optionalDevtoolsString(args, "insight_set_id");
+      if (insightName || insightSetId) {
+        if (!trace) throw invalidDevtoolsArguments("no completed performance trace is available");
+        const sets = Array.isArray(trace.insight_sets) ? trace.insight_sets as Array<Record<string, unknown>> : [];
+        const set = sets.find(candidate => !insightSetId || candidate.id === insightSetId);
+        const insights = set && Array.isArray(set.insights) ? set.insights as Array<Record<string, unknown>> : [];
+        const insight = insights.find(candidate => !insightName || candidate.name === insightName);
+        if (!set || !insight) throw invalidDevtoolsArguments("performance insight was not found in the latest trace");
+        return jsonResult({ insight_set: set.id, insight, metrics: metrics.metrics });
+      }
+      return jsonResult({ metrics: metrics.metrics, trace });
+    }
+    if (action !== "metrics") throw invalidDevtoolsArguments("invalid performance action");
+    return jsonResult({ metrics: metrics.metrics });
+  }
+
+  private async lighthouseOperation(
+    record: PageRecord,
+    args: Record<string, unknown>,
+  ): Promise<ExecutedCommand> {
+    const endpoint = this.#devtoolsBrowserWSEndpoint;
+    if (!endpoint) {
+      throw new ProtocolFailure(
+        "browser_lighthouse_unavailable",
+        "Chromium DevTools 连接地址不可用",
+        true,
+        false,
+      );
+    }
+    const mode = optionalDevtoolsString(args, "mode") ?? "navigation";
+    const device = optionalDevtoolsString(args, "device") ?? "desktop";
+    if (mode !== "navigation" && mode !== "snapshot") {
+      throw invalidDevtoolsArguments("lighthouse mode must be navigation or snapshot");
+    }
+    if (device !== "desktop" && device !== "mobile") {
+      throw invalidDevtoolsArguments("lighthouse device must be desktop or mobile");
+    }
+    const cdp = await this.cdpSession(record);
+    const targetInfo = await cdp.send("Target.getTargetInfo");
+    const [{ default: puppeteer }, lighthouse] = await Promise.all([
+      import("puppeteer-core"),
+      import("lighthouse"),
+    ]);
+    const browser = await puppeteer.connect({
+      browserWSEndpoint: endpoint,
+      defaultViewport: null,
+    });
+    try {
+      const target = browser.targets().find(candidate => (
+        candidate as unknown as { _targetId?: string }
+      )._targetId === targetInfo.targetInfo.targetId);
+      const puppeteerPage = await target?.page();
+      if (!puppeteerPage) {
+        throw new Error(`Lighthouse target not found: ${targetInfo.targetInfo.targetId}`);
+      }
+      const flags = {
+        onlyCategories: ["accessibility", "seo", "best-practices", "agentic-browsing"],
+        output: ["json", "html"],
+        maxWaitForLoad: 30_000,
+        formFactor: device,
+        screenEmulation: device === "desktop"
+          ? { mobile: false, width: 1_350, height: 940, deviceScaleFactor: 1, disabled: false }
+          : { mobile: true, width: 412, height: 823, deviceScaleFactor: 1.75, disabled: false },
+      } as const;
+      const result = mode === "navigation"
+        ? await lighthouse.navigation(puppeteerPage as never, puppeteerPage.url(), { flags: flags as never })
+        : await lighthouse.snapshot(puppeteerPage as never, { flags: flags as never });
+      if (!result) throw new Error("Lighthouse audit did not produce a result");
+      const outputDir = optionalDevtoolsString(args, "output_dir_path")
+        ?? join(this.#config.downloadPath, `lighthouse-${Date.now()}-${record.tabId}`);
+      await mkdir(outputDir, { recursive: true });
+      const jsonPath = join(outputDir, "report.json");
+      const htmlPath = join(outputDir, "report.html");
+      await Promise.all([
+        writeFile(jsonPath, lighthouse.generateReport(result.lhr, "json"), "utf8"),
+        writeFile(htmlPath, lighthouse.generateReport(result.lhr, "html"), "utf8"),
+      ]);
+      const categories = Object.values(result.lhr.categories).map(category => ({
+        id: category.id,
+        title: category.title,
+        score: category.score,
+      }));
+      const audits = Object.values(result.lhr.audits);
+      return jsonResult({
+        mode,
+        device,
+        url: result.lhr.mainDocumentUrl,
+        scores: categories,
+        audits: {
+          passed: audits.filter(audit => audit.score === 1).length,
+          failed: audits.filter(audit => audit.score !== null && audit.score < 1).length,
+        },
+        timing: { total: result.lhr.timing.total },
+        reports: [jsonPath, htmlPath],
+      });
+    } finally {
+      browser.disconnect();
+    }
+  }
+
+  private async heapOperation(
+    record: PageRecord,
+    args: Record<string, unknown>,
+  ): Promise<ExecutedCommand> {
+    const action = optionalDevtoolsString(args, "action") ?? "usage";
+    const cdp = await this.cdpSession(record);
+    if (action === "usage") {
+      const [heap, dom] = await Promise.all([
+        cdp.send("Runtime.getHeapUsage"),
+        cdp.send("Memory.getDOMCounters"),
+      ]);
+      return jsonResult({ heap, dom });
+    }
+    if (action === "take_snapshot") {
+      const chunks: string[] = [];
+      const listener = (event: { chunk?: string }) => {
+        if (typeof event.chunk === "string") chunks.push(event.chunk);
+      };
+      cdp.on("HeapProfiler.addHeapSnapshotChunk", listener);
+      try {
+        await cdp.send("HeapProfiler.enable");
+        await cdp.send("HeapProfiler.takeHeapSnapshot", { reportProgress: false });
+      } finally {
+        cdp.off("HeapProfiler.addHeapSnapshotChunk", listener);
+      }
+      const bytes = Buffer.from(chunks.join(""));
+      const filePath = optionalDevtoolsString(args, "file_path")
+        ?? join(this.#config.downloadPath, `${Date.now()}-${record.tabId}.heapsnapshot`);
+      await mkdir(dirname(filePath), { recursive: true });
+      await writeFile(filePath, bytes);
+      return jsonResult({ file_path: filePath, byte_length: bytes.length });
+    }
+    if (action === "close_snapshot") {
+      const filePath = requiredDevtoolsString(args, "file_path");
+      return jsonResult({ file_path: filePath, closed: this.#heapSnapshots.delete(filePath) });
+    }
+    if (action === "compare_snapshots") {
+      const basePath = requiredDevtoolsString(args, "base_file_path");
+      const currentPath = requiredDevtoolsString(args, "current_file_path");
+      const [base, current] = await Promise.all([
+        this.loadHeapSnapshot(basePath),
+        this.loadHeapSnapshot(currentPath),
+      ]);
+      return jsonResult(base.compare(current, optionalDevtoolsInteger(args, "class_id")));
+    }
+    const filePath = requiredDevtoolsString(args, "file_path");
+    const snapshot = await this.loadHeapSnapshot(filePath);
+    const pageIndex = boundedInteger(args.page_index, 0, 0, Number.MAX_SAFE_INTEGER);
+    const pageSize = boundedInteger(args.page_size, 100, 1, 500);
+    if (action === "summary") return jsonResult(snapshot.summary());
+    if (action === "details") return jsonResult(snapshot.details(pageIndex, pageSize));
+    if (action === "class_nodes") {
+      return jsonResult(snapshot.classNodes(requiredDevtoolsInteger(args, "class_id"), pageIndex, pageSize));
+    }
+    if (action === "dominators") return jsonResult(snapshot.dominators(requiredDevtoolsInteger(args, "node_id")));
+    if (action === "duplicate_strings") return jsonResult(snapshot.duplicateStrings(pageIndex, pageSize));
+    if (action === "edges") {
+      return jsonResult(snapshot.edges(requiredDevtoolsInteger(args, "node_id"), pageIndex, pageSize));
+    }
+    if (action === "object_details") {
+      return jsonResult(snapshot.objectDetails(requiredDevtoolsInteger(args, "node_id")));
+    }
+    if (action === "retainers") {
+      return jsonResult(snapshot.retainersFor(requiredDevtoolsInteger(args, "node_id"), pageIndex, pageSize));
+    }
+    if (action === "retaining_paths") {
+      return jsonResult(snapshot.retainingPaths(
+        requiredDevtoolsInteger(args, "node_id"),
+        boundedInteger(args.max_depth, 8, 1, 64),
+        boundedInteger(args.max_nodes, 200, 1, 10_000),
+        boundedInteger(args.max_siblings, 20, 1, 1_000),
+      ));
+    }
+    throw invalidDevtoolsArguments("invalid heap action");
+  }
+
+  private async loadHeapSnapshot(filePath: string): Promise<HeapSnapshotModel> {
+    const cached = this.#heapSnapshots.get(filePath);
+    if (cached) return cached;
+    const snapshot = await HeapSnapshotModel.load(filePath);
+    this.#heapSnapshots.set(filePath, snapshot);
+    return snapshot;
+  }
+
+  private async extensionsOperation(
+    record: PageRecord,
+    args: Record<string, unknown>,
+  ): Promise<ExecutedCommand> {
+    const action = optionalDevtoolsString(args, "action") ?? "list";
+    const browser = await this.puppeteerBrowser();
+    const extensions = await browser.extensions();
+    if (action === "list") {
+      return jsonResult({ extensions: [...extensions.values()].map(extension => ({
+        id: extension.id,
+        path: extension.path,
+        name: extension.name,
+        version: extension.version,
+        enabled: extension.enabled,
+      })) });
+    }
+    if (action === "install") {
+      const id = await browser.installExtension(requiredDevtoolsString(args, "path"));
+      const extension = (await browser.extensions()).get(id);
+      return jsonResult({ result: extension ? {
+        id: extension.id,
+        path: extension.path,
+        name: extension.name,
+        version: extension.version,
+        enabled: extension.enabled,
+      } : { id } });
+    }
+    const id = requiredDevtoolsString(args, "extension_id");
+    const extension = extensions.get(id);
+    if (action === "uninstall") {
+      await browser.uninstallExtension(id);
+      return jsonResult({ uninstalled: id });
+    }
+    if (!extension) throw invalidDevtoolsArguments(`extension not found: ${id}`);
+    if (action === "reload") {
+      await browser.installExtension(extension.path);
+      return jsonResult({ reloaded: id });
+    }
+    if (action === "trigger_action") {
+      const page = await this.puppeteerPage(record);
+      await extension.triggerAction(page);
+      return jsonResult({ triggered: id, url: page.url() });
+    }
+    throw invalidDevtoolsArguments("invalid extensions action");
+  }
+
+  private async thirdPartyOperation(
+    page: Page,
+    args: Record<string, unknown>,
+  ): Promise<ExecutedCommand> {
+    const action = optionalDevtoolsString(args, "action") ?? "list";
+    return jsonResult(await page.evaluate(async input => {
+      const api = (globalThis as typeof globalThis & { __dtmcp?: { listTools?: () => unknown; executeTool?: (name: string, params: unknown) => unknown } }).__dtmcp;
+      if (!api) return { available: false, tools: [] };
+      if (input.action === "execute") {
+        if (!api.executeTool) throw new Error("third-party developer tool execution is unavailable");
+        return { available: true, result: await api.executeTool(String(input.tool_name ?? ""), input.params ?? {}) };
+      }
+      return { available: true, tools: api.listTools ? await api.listTools() : [] };
+    }, { action, tool_name: args.tool_name, params: args.params }));
+  }
+
+  private async webMcpOperation(
+    page: Page,
+    args: Record<string, unknown>,
+  ): Promise<ExecutedCommand> {
+    const action = optionalDevtoolsString(args, "action") ?? "list";
+    return jsonResult(await page.evaluate(async input => {
+      const context = (navigator as Navigator & { modelContext?: { tools?: Array<{ name: string; execute?: (value: unknown) => unknown }> } }).modelContext;
+      const tools = Array.isArray(context?.tools) ? context.tools : [];
+      if (input.action === "execute") {
+        const tool = tools.find(candidate => candidate.name === input.tool_name);
+        if (!tool?.execute) throw new Error(`WebMCP tool not found: ${String(input.tool_name ?? "")}`);
+        return { available: true, result: await tool.execute(input.input ?? {}) };
+      }
+      return { available: Boolean(context), tools: tools.map(tool => ({ name: tool.name })) };
+    }, { action, tool_name: args.tool_name, input: args.input }));
+  }
+
+  private async pwaOperation(
+    _record: PageRecord,
+    args: Record<string, unknown>,
+  ): Promise<ExecutedCommand> {
+    const action = requiredDevtoolsString(args, "action");
+    const manifestId = requiredDevtoolsString(args, "manifest_id");
+    const cdp = await this.browserCdpSession();
+    if (action === "state") {
+      return jsonResult(await cdp.send("PWA.getOsAppState" as never, { manifestId } as never));
+    }
+    if (action === "install") {
+      const installResult = await cdp.send("PWA.install" as never, {
+        manifestId,
+        installUrlOrBundleUrl: requiredDevtoolsString(args, "install_url"),
+      } as never);
+      const displayMode = optionalDevtoolsString(args, "display_mode");
+      if (displayMode && displayMode !== "browser" && displayMode !== "standalone") {
+        throw invalidDevtoolsArguments("display_mode must be browser or standalone");
+      }
+      if (displayMode) {
+        await cdp.send("PWA.changeAppUserSettings" as never, {
+          manifestId,
+          displayMode,
+        } as never);
+      }
+      return jsonResult({ manifest_id: manifestId, display_mode: displayMode, result: installResult });
+    }
+    if (action === "launch") {
+      return jsonResult(await cdp.send("PWA.launch" as never, {
+        manifestId,
+        url: optionalDevtoolsString(args, "url"),
+      } as never));
+    }
+    if (action === "uninstall") {
+      return jsonResult(await cdp.send("PWA.uninstall" as never, { manifestId } as never));
+    }
+    throw invalidDevtoolsArguments("invalid PWA action");
+  }
+
+  private async recordingOperation(
+    record: PageRecord,
+    args: Record<string, unknown>,
+  ): Promise<ExecutedCommand> {
+    const action = requiredDevtoolsString(args, "action");
+    if (action === "start") {
+      if (record.recording) {
+        throw invalidDevtoolsArguments("a browser recording is already in progress for this tab");
+      }
+      let filePath = optionalDevtoolsString(args, "file_path")
+        ?? join(this.#config.downloadPath, `${Date.now()}-${record.tabId}.mp4`);
+      let extension = filePath.toLowerCase().match(/\.(mp4|webm)$/)?.[1] as "mp4" | "webm" | undefined;
+      if (!extension) {
+        if (filePath.includes(".")) {
+          throw invalidDevtoolsArguments("browser recording file_path must use .mp4 or .webm");
+        }
+        extension = "mp4";
+        filePath = `${filePath}.mp4`;
+      }
+      await mkdir(dirname(filePath), { recursive: true });
+      const page = await this.puppeteerPage(record);
+      const recorder = await page.screencast({
+        path: filePath as `${string}.mp4` | `${string}.webm`,
+        format: extension,
+        ffmpegPath: optionalDevtoolsString(args, "ffmpeg_path"),
+      });
+      record.recording = {
+        recorder,
+        filePath,
+        format: extension,
+        startedAt: Date.now(),
+      };
+      return jsonResult({
+        recording: true,
+        file_path: filePath,
+        format: extension,
+        started_at: record.recording.startedAt,
+      });
+    }
+    if (action === "stop") {
+      const recording = record.recording;
+      if (!recording) {
+        throw invalidDevtoolsArguments("no browser recording is active for this tab");
+      }
+      record.recording = undefined;
+      await recording.recorder.stop();
+      const metadata = await stat(recording.filePath);
+      return jsonResult({
+        recording: false,
+        file_path: recording.filePath,
+        format: recording.format,
+        byte_length: metadata.size,
+        duration_millis: Date.now() - recording.startedAt,
+      });
+    }
+    throw invalidDevtoolsArguments("browser recording action must be start or stop");
   }
 
   private async screenshot(input: {
@@ -834,7 +2031,8 @@ export class BrowserHost {
     target?: { snapshot_revision: number; element_ref: string } | null;
     clip?: NormalizedRect | null;
     full_page: boolean;
-    format: "png" | "jpeg";
+    format: "png" | "jpeg" | "webp";
+    quality?: number;
   }): Promise<ExecutedCommand> {
     if (Number(Boolean(input.target)) + Number(Boolean(input.clip)) + Number(input.full_page) > 1) {
       throw new ProtocolFailure(
@@ -917,6 +2115,7 @@ export class BrowserHost {
     }
     const capture = await cdp.send("Page.captureScreenshot", {
       format: input.format,
+      quality: input.format === "png" ? undefined : Math.max(0, Math.min(100, Math.floor(input.quality ?? 90))),
       fromSurface: true,
       captureBeyondViewport,
       clip,
@@ -924,7 +2123,7 @@ export class BrowserHost {
     const bytes = Buffer.from(capture.data, "base64");
     const payload = binaryPayload(
       bytes,
-      input.format === "png" ? "image/png" : "image/jpeg",
+      input.format === "png" ? "image/png" : input.format === "webp" ? "image/webp" : "image/jpeg",
     );
     return {
       result: { type: "binary_payload", payload },
@@ -1066,6 +2265,75 @@ export class BrowserHost {
     return { result: { type: "hit_test", payload: hit } };
   }
 
+  private showAgentCursor(
+    record: PageRecord,
+    x: number,
+    y: number,
+    action: AgentCursorAction,
+  ): void {
+    const width = record.viewport.width;
+    const height = record.viewport.height;
+    if (!Number.isFinite(x) || !Number.isFinite(y) || width < 1 || height < 1) return;
+    record.agentCursor = {
+      x: Math.max(0, Math.min(1, x / width)),
+      y: Math.max(0, Math.min(1, y / height)),
+      action,
+    };
+    this.emitAgentCursor(record);
+  }
+
+  private emitAgentCursor(record: PageRecord): void {
+    const cursor = record.agentCursor;
+    if (!cursor) return;
+    this.#transport.emit({
+      type: "agent_cursor",
+      payload: {
+        tab_id: record.tabId,
+        visible: true,
+        x: cursor.x,
+        y: cursor.y,
+        action: cursor.action,
+      },
+    });
+  }
+
+  private ensureAgentCursor(record: PageRecord): void {
+    if (this.control.mode !== "agent" || !record.page) return;
+    if (record.agentCursor) return;
+    this.showAgentCursor(
+      record,
+      record.viewport.width / 2,
+      record.viewport.height / 2,
+      "move",
+    );
+  }
+
+  private hideAgentCursor(record: PageRecord): void {
+    record.agentCursor = undefined;
+    this.#transport.emit({
+      type: "agent_cursor",
+      payload: {
+        tab_id: record.tabId,
+        visible: false,
+        x: null,
+        y: null,
+        action: null,
+      },
+    });
+  }
+
+  private hideAgentCursors(): void {
+    for (const record of this.#pages.values()) this.hideAgentCursor(record);
+  }
+
+  private showAgentCursors(): void {
+    for (const record of this.#pages.values()) {
+      if (!record.page) continue;
+      if (record.agentCursor) this.emitAgentCursor(record);
+      else this.ensureAgentCursor(record);
+    }
+  }
+
   private async startScreencast(input: {
     tab_id: string;
     format: "jpeg" | "png";
@@ -1095,13 +2363,31 @@ export class BrowserHost {
   ): Promise<void> {
     const settings = record.screencastSettings;
     if (!settings || !record.page) return;
+    const cdp = await this.cdpSession(record);
     let bytes: Buffer | undefined;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const candidate = await record.page.screenshot({
-        type: settings.format,
+      const deviceScaleFactor = this.#config.deviceScaleFactor;
+      const physicalWidth = record.viewport.width * deviceScaleFactor;
+      const physicalHeight = record.viewport.height * deviceScaleFactor;
+      const scale = Math.min(
+        1,
+        settings.maxWidth / physicalWidth,
+        settings.maxHeight / physicalHeight,
+      );
+      const capture = await cdp.send("Page.captureScreenshot", {
+        format: settings.format,
         quality: settings.format === "jpeg" ? settings.quality : undefined,
-        fullPage: false,
+        fromSurface: true,
+        captureBeyondViewport: false,
+        clip: {
+          x: 0,
+          y: 0,
+          width: record.viewport.width,
+          height: record.viewport.height,
+          scale,
+        },
       });
+      const candidate = Buffer.from(capture.data, "base64");
       if (this.screencastBitmapMatchesViewport(record, settings, candidate)) {
         bytes = candidate;
         break;
@@ -1145,8 +2431,9 @@ export class BrowserHost {
         Math.round(this.#config.deviceScaleFactor * 1_000),
       ),
     };
-    this.#transport.emit({ type: "screencast_frame", payload: metadata });
-    this.#transport.emitBinary(bytes);
+    if (this.#transport.emitScreencast({ type: "screencast_frame", payload: metadata }, bytes)) {
+      record.hasPresentedFrame = true;
+    }
   }
 
   private async restartScreencast(record: PageRecord): Promise<void> {
@@ -1192,18 +2479,6 @@ export class BrowserHost {
         if (!record.screencastViewportRefreshScheduled) {
           record.screencastViewportRefreshScheduled = true;
           void this.applyViewport(record, record.viewport, true)
-            .then(() => this.emitCurrentViewportFrame(record, {
-              width,
-              height,
-              deviceScaleFactorMillis: Math.max(
-                1,
-                Math.round(pageScaleFactor * this.#config.deviceScaleFactor * 1_000),
-              ),
-            }))
-            .then(() => {
-              acceptFirstFrame?.();
-              acceptFirstFrame = undefined;
-            })
             .catch(() => undefined)
             .finally(() => {
               record.screencastViewportRefreshScheduled = false;
@@ -1211,6 +2486,9 @@ export class BrowserHost {
         }
         return;
       }
+      // 导航期间 Chromium 会短暂提交空白合成帧。面板继续展示上一张已发布
+      // 画面，直到新文档稳定后由 completeNavigationPresentation 原子替换。
+      if (record.presentationPhase === "navigation_pending" && record.hasPresentedFrame) return;
       record.frameSequence += 1;
       const payload = binaryPayload(
         bytes,
@@ -1237,10 +2515,11 @@ export class BrowserHost {
           ),
         ),
       };
-      this.#transport.emit({ type: "screencast_frame", payload: metadata });
-      this.#transport.emitBinary(bytes);
-      acceptFirstFrame?.();
-      acceptFirstFrame = undefined;
+      if (this.#transport.emitScreencast({ type: "screencast_frame", payload: metadata }, bytes)) {
+        record.hasPresentedFrame = true;
+        acceptFirstFrame?.();
+        acceptFirstFrame = undefined;
+      }
     };
     record.screencastListener = listener;
     cdp.on("Page.screencastFrame", listener);
@@ -1338,6 +2617,7 @@ export class BrowserHost {
     await this.ensurePage(record);
     const page = this.requirePage(record);
     const cdp = await this.cdpSession(record);
+    this.hideAgentCursor(record);
     this.control.validate(input.control);
     const clipboard = await clipboardTextForShortcut(page, input.event);
     await dispatchUserInput(cdp, input.event);
@@ -1348,7 +2628,42 @@ export class BrowserHost {
 
   private async bindPageEvents(record: PageRecord): Promise<void> {
     const page = this.requirePage(record);
+    const cdp = await this.cdpSession(record);
+    if (!record.cdpPageDomainEnabled) {
+      await cdp.send("Page.enable");
+      record.cdpPageDomainEnabled = true;
+    }
+    const frameTree = await cdp.send("Page.getFrameTree") as {
+      frameTree?: { frame?: { id?: string } };
+    };
+    record.cdpMainFrameId = frameTree.frameTree?.frame?.id;
+    record.cdpFrameStartedNavigatingListener = (event) => {
+      if (record.cdpMainFrameId && event.frameId !== record.cdpMainFrameId) return;
+      this.beginNavigationPresentation(record, page);
+    };
+    record.cdpFrameStoppedLoadingListener = (event) => {
+      if (record.cdpMainFrameId && event.frameId !== record.cdpMainFrameId) return;
+      void this.completeNavigationPresentation(record, page);
+    };
+    cdp.on("Page.frameStartedNavigating", record.cdpFrameStartedNavigatingListener);
+    cdp.on("Page.frameStoppedLoading", record.cdpFrameStoppedLoadingListener);
+    page.on("domcontentloaded", () => {
+      void this.completeNavigationPresentation(record, page);
+    });
+    page.on("load", () => {
+      void this.completeNavigationPresentation(record, page);
+    });
     page.on("console", (message: ConsoleMessage) => {
+      const location = message.location();
+      boundedPush(record.consoleMessages, {
+        id: record.nextConsoleMessageId++,
+        level: message.type(),
+        text: message.text(),
+        url: location.url || page.url(),
+        line: location.lineNumber ?? 0,
+        column: location.columnNumber ?? 0,
+        timestamp: Date.now(),
+      }, MAX_CONSOLE_MESSAGES);
       this.#transport.emit({
         type: "console",
         payload: {
@@ -1359,15 +2674,62 @@ export class BrowserHost {
       });
     });
     page.on("dialog", (dialog: Dialog) => {
+      const entry: BrowserDialogEntry = {
+        id: record.nextDialogId++,
+        dialogType: dialog.type(),
+        message: dialog.message(),
+        defaultValue: dialog.defaultValue(),
+        openedAt: Date.now(),
+      };
+      boundedPush(record.dialogs, entry, 100);
       this.#transport.emit({
         type: "dialog",
         payload: {
           tab_id: record.tabId,
+          dialog_id: entry.id,
           dialog_type: dialog.type(),
           message: dialog.message(),
         },
       });
-      void dialog.dismiss().catch(() => undefined);
+      const timeout = setTimeout(() => {
+        if (record.pendingDialog?.entry !== entry) return;
+        record.pendingDialog = undefined;
+        void dialog.dismiss()
+          .then(() => { entry.handledAs = "dismissed"; })
+          .catch(() => undefined);
+      }, 30_000);
+      record.pendingDialog = { dialog, entry, timeout };
+    });
+    page.on("request", (request: Request) => {
+      const id = record.nextNetworkRequestId++;
+      record.networkRequestIds.set(request, id);
+      boundedPush(record.networkRequests, {
+        id,
+        method: request.method(),
+        url: request.url(),
+        resourceType: request.resourceType(),
+        requestHeaders: request.headers(),
+        startedAt: Date.now(),
+      }, MAX_NETWORK_REQUESTS);
+    });
+    page.on("response", (response: Response) => {
+      const entry = networkEntry(record, response.request());
+      if (!entry) return;
+      entry.status = response.status();
+      entry.statusText = response.statusText();
+      entry.responseHeaders = response.headers();
+      entry.mimeType = response.headers()["content-type"] ?? "";
+      entry.response = response;
+    });
+    page.on("requestfinished", (request: Request) => {
+      const entry = networkEntry(record, request);
+      if (entry) entry.finishedAt = Date.now();
+    });
+    page.on("requestfailed", (request: Request) => {
+      const entry = networkEntry(record, request);
+      if (!entry) return;
+      entry.finishedAt = Date.now();
+      entry.failure = request.failure()?.errorText ?? "request failed";
     });
     page.on("download", (download: Download) => {
       const suggestedFilename = basename(download.suggestedFilename()) || "download";
@@ -1420,11 +2782,17 @@ export class BrowserHost {
       void filechooser.setFiles([]).catch(() => undefined);
     });
     page.on("popup", (popup) => {
-      this.#transport.emit({
-        type: "popup_blocked",
-        payload: { tab_id: record.tabId },
+      const handler = record.popupHandler;
+      if (handler) {
+        handler(popup);
+        return;
+      }
+      void this.adoptPopupNavigation(record, page, popup).catch(() => {
+        this.#transport.emit({
+          type: "popup_blocked",
+          payload: { tab_id: record.tabId },
+        });
       });
-      void popup.close().catch(() => undefined);
     });
     page.on("crash", () => {
       if (!this.retirePageRecord(record, page)) return;
@@ -1445,21 +2813,379 @@ export class BrowserHost {
       if (record.restoringInitialPage) return;
       record.navigationRevision += 1;
       record.snapshot.invalidate();
-      void this.pageState(record).then((state) => {
-        this.#transport.emit({ type: "page_updated", payload: state });
-      });
+      this.scheduleSettledPageState(record);
     });
+  }
+
+  private async adoptPopupNavigation(
+    record: PageRecord,
+    sourcePage: Page,
+    popup: Page,
+  ): Promise<void> {
+    let targetUrl = popup.url();
+    try {
+      if (!targetUrl || targetUrl === "about:blank") {
+        await popup.waitForURL(
+          value => value.href !== "about:blank",
+          { timeout: POPUP_URL_TIMEOUT_MILLIS, waitUntil: "commit" },
+        );
+        targetUrl = popup.url();
+      }
+      validateNavigationUrl(targetUrl);
+      await popup.close().catch(() => undefined);
+      if (record.page !== sourcePage) {
+        throw new ProtocolFailure(
+          "browser_page_not_active",
+          `browser page is not active: ${record.tabId}`,
+          true,
+          false,
+        );
+      }
+      try {
+        await sourcePage.goto(targetUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: PAGE_NAVIGATION_TIMEOUT_MILLIS,
+        });
+      } catch (error) {
+        const cdp = await this.cdpSession(record).catch(() => undefined);
+        await cdp?.send("Page.stopLoading").catch(() => undefined);
+        throw playwrightFailure("browser_popup_navigation_failed", error, true);
+      }
+      this.throwBlockedNavigation(record);
+      this.#transport.emit({
+        type: "page_updated",
+        payload: await this.pageState(record),
+      });
+    } catch (error) {
+      await popup.close().catch(() => undefined);
+      if (error instanceof ProtocolFailure) throw error;
+      throw playwrightFailure("browser_popup_navigation_failed", error, true);
+    }
   }
 
   private async withNavigationGuard<T>(
     record: PageRecord,
     action: () => Promise<T>,
+    expectedNavigationUrl?: string | null,
   ): Promise<T> {
     // The security policy is installed once for the whole Context. Keeping a
     // per-command Context route creates cross-tab races because Playwright
     // routes are Context-scoped, not Page-scoped.
-    void record;
-    return action();
+    const page = this.requirePage(record);
+    const settle = await this.prepareActionSettlement(record, page);
+    try {
+      const result = await action();
+      if (!record.pendingDialog) {
+        await this.finishActionSettlement(page, settle, expectedNavigationUrl);
+      }
+      return result;
+    } finally {
+      await this.completeNavigationPresentation(record, page);
+      settle.dispose();
+    }
+  }
+
+  private beginNavigationPresentation(record: PageRecord, page: Page): void {
+    if (
+      record.page !== page
+      || !record.screencastListener
+      || !record.hasPresentedFrame
+    ) {
+      return;
+    }
+    record.presentationRevision += 1;
+    record.presentationPhase = "navigation_pending";
+    record.presentationSettlement = undefined;
+  }
+
+  private async completeNavigationPresentation(record: PageRecord, page: Page): Promise<void> {
+    if (
+      record.page !== page
+      || record.presentationPhase !== "navigation_pending"
+    ) {
+      return;
+    }
+    const revision = record.presentationRevision;
+    if (record.presentationSettlement?.revision === revision) {
+      await record.presentationSettlement.promise;
+      return;
+    }
+    const promise = (async () => {
+      await this.waitForStableDom(page);
+      await this.waitForStablePageMetadata(page);
+      await page.evaluate(
+        () => new Promise<void>((resolve) => {
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+        }),
+      );
+      if (
+        record.page !== page
+        || record.presentationPhase !== "navigation_pending"
+        || record.presentationRevision !== revision
+      ) {
+        return;
+      }
+      await this.emitCurrentViewportFrame(record);
+      if (
+        record.page === page
+        && record.presentationRevision === revision
+      ) {
+        record.presentationPhase = "stable";
+      }
+    })().catch(() => undefined);
+    record.presentationSettlement = { revision, promise };
+    await promise;
+    if (record.presentationSettlement?.revision === revision) {
+      record.presentationSettlement = undefined;
+    }
+  }
+
+  private async prepareActionSettlement(
+    record: PageRecord,
+    page: Page,
+  ): Promise<ActionSettlement> {
+    const initialUrl = page.url();
+    const cdp = await this.cdpSession(record);
+    if (!record.cdpPageDomainEnabled) {
+      await cdp.send("Page.enable");
+      record.cdpPageDomainEnabled = true;
+    }
+    if (!record.cdpMainFrameId) {
+      const frameTree = await cdp.send("Page.getFrameTree") as {
+        frameTree?: { frame?: { id?: string } };
+      };
+      record.cdpMainFrameId = frameTree.frameTree?.frame?.id;
+    }
+    const mainFrameId = record.cdpMainFrameId;
+    let navigationDetected = false;
+    let navigationWaiter: ((value: boolean) => void) | undefined;
+    let urlPoll: ReturnType<typeof setInterval> | undefined;
+    let navigationTimeout: ReturnType<typeof setTimeout> | undefined;
+    let popupNavigation: Promise<void> | undefined;
+    const trackedRequests = new Set<Request>();
+    let networkWaiter: (() => void) | undefined;
+    let networkStableTimer: ReturnType<typeof setTimeout> | undefined;
+    let networkTimeout: ReturnType<typeof setTimeout> | undefined;
+    const markNavigationDetected = () => {
+      if (navigationDetected) return;
+      navigationDetected = true;
+      if (urlPoll) clearInterval(urlPoll);
+      if (navigationTimeout) clearTimeout(navigationTimeout);
+      navigationWaiter?.(true);
+      navigationWaiter = undefined;
+    };
+    const handlePopup = (popup: Page) => {
+      popupNavigation = this.adoptPopupNavigation(record, page, popup);
+      markNavigationDetected();
+    };
+    const onFrameStartedNavigating = (event: FrameStartedNavigatingEvent) => {
+      if (mainFrameId && event.frameId !== mainFrameId) return;
+      markNavigationDetected();
+    };
+    const onFrameNavigated = (frame: Frame) => {
+      if (frame.page() !== page || frame !== page.mainFrame()) return;
+      markNavigationDetected();
+    };
+    const resolveNetworkWaiter = () => {
+      if (networkStableTimer) clearTimeout(networkStableTimer);
+      if (networkTimeout) clearTimeout(networkTimeout);
+      networkStableTimer = undefined;
+      networkTimeout = undefined;
+      networkWaiter?.();
+      networkWaiter = undefined;
+    };
+    const scheduleNetworkSettlement = () => {
+      if (!networkWaiter || trackedRequests.size > 0) return;
+      if (networkStableTimer) clearTimeout(networkStableTimer);
+      networkStableTimer = setTimeout(
+        resolveNetworkWaiter,
+        ACTION_NETWORK_STABLE_FOR_MILLIS,
+      );
+    };
+    const onRequest = (request: Request) => {
+      if (!isActionSettlementRequest(request)) return;
+      trackedRequests.add(request);
+      if (networkStableTimer) clearTimeout(networkStableTimer);
+      networkStableTimer = undefined;
+    };
+    const onRequestSettled = (request: Request) => {
+      if (!trackedRequests.delete(request)) return;
+      scheduleNetworkSettlement();
+    };
+    cdp.on("Page.frameStartedNavigating", onFrameStartedNavigating);
+    page.on("framenavigated", onFrameNavigated);
+    page.on("request", onRequest);
+    page.on("requestfinished", onRequestSettled);
+    page.on("requestfailed", onRequestSettled);
+    record.popupHandler = handlePopup;
+    return {
+      waitForNavigationSignal: async () => {
+        if (navigationDetected || page.url() !== initialUrl) return true;
+        return new Promise<boolean>((resolve) => {
+          navigationWaiter = resolve;
+          urlPoll = setInterval(() => {
+            if (page.url() !== initialUrl) markNavigationDetected();
+          }, 20);
+          navigationTimeout = setTimeout(() => {
+            if (navigationDetected) return;
+            navigationWaiter = undefined;
+            resolve(false);
+          }, ACTION_NAVIGATION_EXPECT_TIMEOUT_MILLIS);
+        });
+      },
+      finishPopupNavigation: async () => {
+        const pending = popupNavigation;
+        if (!pending) return false;
+        await pending;
+        return true;
+      },
+      waitForNetworkSettlement: () => new Promise<void>((resolve) => {
+        networkWaiter = resolve;
+        networkTimeout = setTimeout(
+          resolveNetworkWaiter,
+          ACTION_NETWORK_SETTLEMENT_TIMEOUT_MILLIS,
+        );
+        scheduleNetworkSettlement();
+      }),
+      dispose: () => {
+        cdp.off("Page.frameStartedNavigating", onFrameStartedNavigating);
+        page.off("framenavigated", onFrameNavigated);
+        page.off("request", onRequest);
+        page.off("requestfinished", onRequestSettled);
+        page.off("requestfailed", onRequestSettled);
+        if (record.popupHandler === handlePopup) record.popupHandler = undefined;
+        if (urlPoll) clearInterval(urlPoll);
+        if (navigationTimeout) clearTimeout(navigationTimeout);
+        resolveNetworkWaiter();
+      },
+    };
+  }
+
+  private async finishActionSettlement(
+    page: Page,
+    settlement: ActionSettlement,
+    expectedNavigationUrl?: string | null,
+  ): Promise<boolean> {
+    let navigated = await settlement.waitForNavigationSignal();
+    await settlement.waitForNetworkSettlement();
+    navigated = (await settlement.finishPopupNavigation()) || navigated;
+    if (expectedNavigationUrl && !navigationUrlMatches(page.url(), expectedNavigationUrl)) {
+      const reachedExpectedUrl = await page.waitForURL(
+        (url) => navigationUrlMatches(url.href, expectedNavigationUrl),
+        {
+          timeout: ACTION_EXPECTED_URL_TIMEOUT_MILLIS,
+          waitUntil: "domcontentloaded",
+        },
+      ).then(() => true).catch(() => false);
+      navigated = navigated || reachedExpectedUrl;
+    }
+    if (navigated) {
+      await page.waitForLoadState("domcontentloaded", {
+        timeout: PAGE_NAVIGATION_TIMEOUT_MILLIS,
+      }).catch(() => undefined);
+    }
+    // 只等待本次动作开始后产生的 document/xhr/fetch/script/style 请求。
+    // Playwright 的全页 networkidle 对已加载的 SPA 可能立即返回，无法覆盖
+    // 路由提交后才加载的代码块和数据请求。
+    // 从动作边界开始观察稳定窗口，同时覆盖同文档 SPA 渲染，以及原生导航
+    // 提交后才发生的延迟 DOM 更新。
+    await this.waitForStableDom(page);
+    // URL 和标题属于页面元数据，不是 DOM 内容。客户端路由提交标题之前，
+    // Chromium 可能已经暴露新 DOM，因此页面状态必须在同一稳定窗口内同时
+    // 观察这两个值。
+    await this.waitForStablePageMetadata(page);
+    return navigated;
+  }
+
+  private async waitForStableDom(page: Page): Promise<boolean> {
+    return page.evaluate(
+      ({ stableFor, timeout }) => new Promise<void>((resolve) => {
+        const root = document.documentElement;
+        if (!root) {
+          resolve();
+          return;
+        }
+        let finished = false;
+        let stableTimer: ReturnType<typeof setTimeout> | undefined;
+        let timeoutTimer: ReturnType<typeof setTimeout>;
+        let observer: MutationObserver;
+        const finish = () => {
+          if (finished) return;
+          finished = true;
+          if (stableTimer) clearTimeout(stableTimer);
+          clearTimeout(timeoutTimer);
+          observer.disconnect();
+          resolve();
+        };
+        const schedule = () => {
+          if (stableTimer) clearTimeout(stableTimer);
+          stableTimer = setTimeout(finish, stableFor);
+        };
+        observer = new MutationObserver(schedule);
+        timeoutTimer = setTimeout(finish, timeout);
+        observer.observe(root, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          characterData: true,
+        });
+        schedule();
+      }),
+      {
+        stableFor: ACTION_DOM_STABLE_FOR_MILLIS,
+        timeout: ACTION_DOM_STABILITY_TIMEOUT_MILLIS,
+      },
+    ).then(() => true).catch(() => false);
+  }
+
+  private async waitForStablePageMetadata(page: Page): Promise<boolean> {
+    return page.evaluate(
+      ({ stableFor, timeout, pollEvery }) => new Promise<void>((resolve) => {
+        const startedAt = performance.now();
+        let lastValue = `${globalThis.location.href}\u0000${document.title}`;
+        let stableSince = startedAt;
+        const check = () => {
+          const now = performance.now();
+          const value = `${globalThis.location.href}\u0000${document.title}`;
+          if (value !== lastValue) {
+            lastValue = value;
+            stableSince = now;
+          }
+          if (
+            now - stableSince >= stableFor
+            || now - startedAt >= timeout
+          ) {
+            resolve();
+            return;
+          }
+          globalThis.setTimeout(check, pollEvery);
+        };
+        check();
+      }),
+      {
+        stableFor: ACTION_PAGE_METADATA_STABLE_FOR_MILLIS,
+        timeout: ACTION_PAGE_METADATA_TIMEOUT_MILLIS,
+        pollEvery: ACTION_PAGE_METADATA_POLL_MILLIS,
+      },
+    ).then(() => true).catch(() => false);
+  }
+
+  private scheduleSettledPageState(record: PageRecord): void {
+    if (record.pageStateRefreshScheduled || !record.page) return;
+    record.pageStateRefreshScheduled = true;
+    const page = record.page;
+    void this.waitForStableDom(page)
+      .then(() => this.waitForStablePageMetadata(page))
+      .then(() => this.pageState(record))
+      .then((state) => {
+        if (record.page === page) {
+          this.#transport.emit({ type: "page_updated", payload: state });
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        record.pageStateRefreshScheduled = false;
+      });
   }
 
   private async installNavigationGuard(): Promise<void> {
@@ -1512,7 +3238,7 @@ export class BrowserHost {
 
   private async pageState(record: PageRecord): Promise<PageState> {
     const page = record.page;
-    if (!page) {
+    if (!page || record.pendingDialog) {
       return {
         tab_id: record.tabId,
         url: record.currentUrl,
@@ -1569,18 +3295,279 @@ export class BrowserHost {
 
   private retirePageRecord(record: PageRecord, page: Page): boolean {
     if (this.#pages.get(record.tabId) !== record || record.page !== page) return false;
+    this.disposePageRecord(record);
     this.#pages.delete(record.tabId);
     if (this.#foregroundTabId === record.tabId) this.#foregroundTabId = undefined;
     record.page = undefined;
     record.cdp = undefined;
+    record.cdpPageDomainEnabled = false;
+    record.cdpMainFrameId = undefined;
     record.screencastListener = undefined;
     record.screencastSettings = undefined;
     return true;
   }
+
+  private disposePageRecord(record: PageRecord): void {
+    if (record.cdp && record.cdpFrameStartedNavigatingListener) {
+      record.cdp.off("Page.frameStartedNavigating", record.cdpFrameStartedNavigatingListener);
+      record.cdpFrameStartedNavigatingListener = undefined;
+    }
+    if (record.cdp && record.cdpFrameStoppedLoadingListener) {
+      record.cdp.off("Page.frameStoppedLoading", record.cdpFrameStoppedLoadingListener);
+      record.cdpFrameStoppedLoadingListener = undefined;
+    }
+    record.presentationPhase = "stable";
+    record.presentationSettlement = undefined;
+    record.hasPresentedFrame = false;
+    if (record.pendingDialog) {
+      clearTimeout(record.pendingDialog.timeout);
+      record.pendingDialog = undefined;
+    }
+    if (record.trace && record.cdp) {
+      record.cdp.off("Tracing.dataCollected", record.trace.listener);
+      void record.cdp.send("Tracing.end").catch(() => undefined);
+      record.trace = undefined;
+    }
+    if (record.recording) {
+      void record.recording.recorder.stop().catch(() => undefined);
+      record.recording = undefined;
+    }
+  }
+}
+
+async function readDevtoolsBrowserWSEndpoint(profilePath: string): Promise<string> {
+  const activePortPath = join(profilePath, "DevToolsActivePort");
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    try {
+      const [port, websocketPath] = (await readFile(activePortPath, "utf8")).trim().split(/\r?\n/);
+      if (port && websocketPath) return `ws://127.0.0.1:${port}${websocketPath}`;
+    } catch {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  }
+  throw new ProtocolFailure(
+    "browser_devtools_endpoint_unavailable",
+    "Chromium 未在启动期限内提供 DevToolsActivePort",
+    true,
+    false,
+  );
 }
 
 function emptyResult(): ExecutedCommand {
   return { result: { type: "empty" } };
+}
+
+function jsonResult(value: unknown): ExecutedCommand {
+  return { result: { type: "json", payload: { value: boundJsonValue(value) } } };
+}
+
+function boundedPush<T>(items: T[], value: T, max: number): void {
+  items.push(value);
+  if (items.length > max) items.splice(0, items.length - max);
+}
+
+function networkEntry(record: PageRecord, request: Request): BrowserNetworkEntry | undefined {
+  const id = record.networkRequestIds.get(request);
+  return id === undefined ? undefined : record.networkRequests.find(entry => entry.id === id);
+}
+
+function publicNetworkEntry(entry: BrowserNetworkEntry): Omit<BrowserNetworkEntry, "response"> {
+  const { response: _response, ...publicEntry } = entry;
+  return publicEntry;
+}
+
+function invalidDevtoolsArguments(message: string): ProtocolFailure {
+  return new ProtocolFailure("browser_devtools_invalid_arguments", message, false, false);
+}
+
+function devtoolsOperationRequiresControl(
+  operation: string,
+  args: Record<string, unknown>,
+): boolean {
+  const action = optionalDevtoolsString(args, "action");
+  switch (operation) {
+    case "hover":
+    case "drag":
+    case "fill_form":
+    case "upload_file":
+    case "click_at":
+    case "evaluate":
+    case "emulate":
+      return true;
+    case "dialog":
+      return action !== "list";
+    case "console":
+    case "network":
+      return action === "clear";
+    case "performance":
+      return action === "start" || action === "stop";
+    case "lighthouse":
+      return (optionalDevtoolsString(args, "mode") ?? "navigation") === "navigation";
+    case "heap":
+      return action === "take_snapshot";
+    case "extensions":
+      return action !== "list";
+    case "third_party":
+    case "webmcp":
+      return action === "execute";
+    case "pwa":
+      return action !== "state";
+    case "recording":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function requiredDevtoolsString(args: Record<string, unknown>, name: string): string {
+  const value = optionalDevtoolsString(args, name);
+  if (!value) throw invalidDevtoolsArguments(`missing ${name}`);
+  return value;
+}
+
+function optionalDevtoolsString(args: Record<string, unknown>, name: string): string | undefined {
+  return typeof args[name] === "string" && args[name].trim() ? args[name].trim() : undefined;
+}
+
+function optionalDevtoolsNumber(args: Record<string, unknown>, name: string): number | undefined {
+  return typeof args[name] === "number" && Number.isFinite(args[name]) ? args[name] : undefined;
+}
+
+function requiredFiniteDevtoolsNumber(args: Record<string, unknown>, name: string): number {
+  const value = optionalDevtoolsNumber(args, name);
+  if (value === undefined) throw invalidDevtoolsArguments(`${name} must be a finite number`);
+  return value;
+}
+
+function requiredDevtoolsInteger(args: Record<string, unknown>, name: string): number {
+  const value = requiredFiniteDevtoolsNumber(args, name);
+  if (!Number.isSafeInteger(value) || value < 1) throw invalidDevtoolsArguments(`${name} must be a positive integer`);
+  return value;
+}
+
+function optionalDevtoolsInteger(args: Record<string, unknown>, name: string): number | undefined {
+  const value = optionalDevtoolsNumber(args, name);
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || value < 1) throw invalidDevtoolsArguments(`${name} must be a positive integer`);
+  return value;
+}
+
+function boundedInteger(value: unknown, fallback: number, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) return fallback;
+  return Math.min(max, Math.max(min, value));
+}
+
+function boundedTimeout(value: unknown, fallback: number, max: number): number {
+  return boundedInteger(value, fallback, 1, max);
+}
+
+function devtoolsStringArray(value: unknown): string[] {
+  if (typeof value === "string") return value.trim() ? [value.trim()] : [];
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is string => typeof entry === "string" && Boolean(entry.trim())).map(entry => entry.trim());
+}
+
+function devtoolsObject(args: Record<string, unknown>, name: string): Record<string, unknown> {
+  const value = args[name];
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw invalidDevtoolsArguments(`${name} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function devtoolsObjectArray(args: Record<string, unknown>, name: string): Array<Record<string, unknown>> {
+  const value = args[name];
+  if (!Array.isArray(value)) throw invalidDevtoolsArguments(`${name} must be an array`);
+  return value.map((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw invalidDevtoolsArguments(`${name}[${index}] must be an object`);
+    }
+    return entry as Record<string, unknown>;
+  });
+}
+
+function devtoolsTarget(args: Record<string, unknown>): { snapshot_revision: number; element_ref: string } {
+  const revision = requiredDevtoolsInteger(args, "snapshot_revision");
+  const elementRef = requiredDevtoolsString(args, "element_ref");
+  return { snapshot_revision: revision, element_ref: elementRef };
+}
+
+function boundJsonValue(value: unknown): unknown {
+  try {
+    const encoded = JSON.stringify(value);
+    if (encoded === undefined) return null;
+    if (Buffer.byteLength(encoded, "utf8") <= 128 * 1024) return JSON.parse(encoded);
+    return { truncated: true, preview: encoded.slice(0, 128 * 1024) };
+  } catch {
+    return { unserializable: true, value: String(value) };
+  }
+}
+
+function networkCondition(name: string): {
+  offline: boolean;
+  latency: number;
+  downloadThroughput: number;
+  uploadThroughput: number;
+} {
+  if (name.toLowerCase() === "offline") {
+    return { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 };
+  }
+  const presets: Record<string, { latency: number; downloadThroughput: number; uploadThroughput: number }> = {
+    "slow 3g": { latency: 400, downloadThroughput: 50 * 1024, uploadThroughput: 50 * 1024 },
+    "fast 3g": { latency: 100, downloadThroughput: 750 * 1024, uploadThroughput: 750 * 1024 },
+    "slow 4g": { latency: 100, downloadThroughput: 1_500 * 1024, uploadThroughput: 750 * 1024 },
+    "fast 4g": { latency: 20, downloadThroughput: 9_000 * 1024, uploadThroughput: 1_500 * 1024 },
+  };
+  const preset = presets[name.toLowerCase()];
+  if (!preset) throw invalidDevtoolsArguments(`unknown network condition: ${name}`);
+  return { offline: false, ...preset };
+}
+
+function summarizeTrace(events: unknown[], startedAt: number): Record<string, unknown> {
+  const records = events.filter(value => value && typeof value === "object") as Array<Record<string, unknown>>;
+  const longTasks = records.filter(event => event.name === "RunTask" && typeof event.dur === "number" && event.dur >= 50);
+  const paints = records.filter(event => typeof event.name === "string" && /Paint|LargestContentfulPaint|firstContentfulPaint/i.test(event.name));
+  const layoutShifts = records.filter(event => event.name === "LayoutShift" && (event.args as { data?: { had_recent_input?: boolean } } | undefined)?.data?.had_recent_input !== true);
+  const requests = records.filter(event => event.name === "ResourceSendRequest");
+  const responses = records.filter(event => event.name === "ResourceReceiveResponse");
+  const lcp = [...records].reverse().find(event => typeof event.name === "string" && /LargestContentfulPaint/i.test(event.name));
+  const navigation = records.find(event => event.name === "navigationStart");
+  const insightSetId = `navigation-${Number(navigation?.ts ?? startedAt)}`;
+  const longTaskDuration = longTasks.reduce((total, event) => total + Number(event.dur ?? 0) / 1000, 0);
+  const insights = [
+    {
+      name: "DocumentLatency",
+      request_count: requests.length,
+      response_count: responses.length,
+      navigation_timestamp: navigation?.ts ?? null,
+    },
+    {
+      name: "LCPBreakdown",
+      lcp_timestamp: lcp?.ts ?? null,
+      paint_event_count: paints.length,
+    },
+    {
+      name: "LongTasks",
+      long_task_count: longTasks.length,
+      total_blocking_duration_ms: longTaskDuration,
+      max_long_task_ms: longTasks.reduce((max, event) => Math.max(max, Number(event.dur ?? 0) / 1000), 0),
+    },
+    {
+      name: "CLSCulprits",
+      layout_shift_count: layoutShifts.length,
+      score_sum: layoutShifts.reduce((total, event) => total + Number((event.args as { data?: { weighted_score_delta?: number } } | undefined)?.data?.weighted_score_delta ?? 0), 0),
+    },
+  ];
+  return {
+    started_at: startedAt,
+    stopped_at: Date.now(),
+    event_count: records.length,
+    long_task_count: longTasks.length,
+    max_long_task_ms: longTasks.reduce((max, event) => Math.max(max, Number(event.dur ?? 0) / 1000), 0),
+    paint_event_count: paints.length,
+    insight_sets: [{ id: insightSetId, insights }],
+  };
 }
 
 function commandTabId(command: HostCommand): string | null {
@@ -1796,6 +3783,24 @@ export function validateNavigationUrl(value: string): void {
       false,
     );
   }
+}
+
+function navigationUrlMatches(currentValue: string, expectedValue: string): boolean {
+  try {
+    const current = new URL(currentValue);
+    const expected = new URL(expectedValue);
+    return current.origin === expected.origin
+      && current.pathname.replace(/\/$/, "") === expected.pathname.replace(/\/$/, "")
+      && current.search === expected.search;
+  } catch {
+    return currentValue === expectedValue;
+  }
+}
+
+function isActionSettlementRequest(request: Request): boolean {
+  return ["document", "xhr", "fetch", "script", "stylesheet"].includes(
+    request.resourceType(),
+  );
 }
 
 function isBlockedNavigationUrl(value: string): boolean {

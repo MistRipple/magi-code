@@ -11,6 +11,7 @@ use crate::{
     BrowserControlLease, BrowserLeaseEndReason, BrowserLeaseLifecycle, BrowserLeaseSelector,
     BrowserProfile, BrowserProfileControlMode, BrowserSession, BrowserSessionLifecycle, BrowserTab,
     BrowserTabLifecycle, BrowserViewport, BrowserViewportMode, GoalControlBinding,
+    normalize_browser_page_state,
 };
 
 const MAX_BROWSER_TABS_PER_SESSION: usize = 32;
@@ -114,13 +115,15 @@ pub struct BrowserDurableTab {
 
 impl From<&BrowserTab> for BrowserDurableTab {
     fn from(tab: &BrowserTab) -> Self {
+        let (url, origin, title) =
+            normalize_browser_page_state(tab.url.clone(), tab.origin.clone(), tab.title.clone());
         Self {
             tab_id: tab.tab_id.clone(),
             browser_session_id: tab.browser_session_id.clone(),
             lifecycle: tab.lifecycle,
-            url: tab.url.clone(),
-            origin: tab.origin.clone(),
-            title: tab.title.clone(),
+            url,
+            origin,
+            title,
             navigation_revision: tab.navigation_revision,
             snapshot_revision: tab.snapshot_revision,
             created_at: tab.created_at,
@@ -131,13 +134,14 @@ impl From<&BrowserTab> for BrowserDurableTab {
 
 impl BrowserDurableTab {
     fn into_runtime_tab(self) -> BrowserTab {
+        let (url, origin, title) = normalize_browser_page_state(self.url, self.origin, self.title);
         BrowserTab {
             tab_id: self.tab_id,
             browser_session_id: self.browser_session_id,
             lifecycle: self.lifecycle,
-            url: self.url,
-            origin: self.origin,
-            title: self.title,
+            url,
+            origin,
+            title,
             viewport: BrowserViewport::default(),
             viewport_mode: BrowserViewportMode::Auto,
             navigation_revision: self.navigation_revision,
@@ -632,6 +636,7 @@ impl BrowserAuthority {
         now: UtcMillis,
     ) -> Result<BrowserTab, BrowserAuthorityError> {
         self.require_ready_tab(tab_id)?;
+        let (url, origin, title) = normalize_browser_page_state(url, origin, title);
         let (tab, document_changed, changed) = {
             let tab = self
                 .tabs

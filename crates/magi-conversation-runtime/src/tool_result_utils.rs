@@ -41,8 +41,10 @@ impl DeterministicToolFailureTracker {
     pub fn observe(
         &mut self,
         tool_name: &str,
+        arguments: &str,
         result: &str,
         status: ExecutionResultStatus,
+        retry_limit: u32,
     ) -> Option<DeterministicToolFailure> {
         if status == ExecutionResultStatus::Succeeded {
             let prefix = format!("{tool_name}\u{1f}");
@@ -51,41 +53,43 @@ impl DeterministicToolFailureTracker {
         }
         if !matches!(
             status,
-            ExecutionResultStatus::Rejected | ExecutionResultStatus::NeedsApproval
+            ExecutionResultStatus::Failed
+                | ExecutionResultStatus::Rejected
+                | ExecutionResultStatus::NeedsApproval
         ) {
             return None;
         }
-        let payload = serde_json::from_str::<serde_json::Value>(result).ok()?;
-        let error_code = payload.get("error_code")?.as_str()?.trim();
-        if !matches!(
-            error_code,
-            "tool_policy_rejected"
-                | "tool_policy_needs_approval"
-                | "tool_safety_rejected"
-                | "tool_safety_needs_approval"
-                | "skill_tool_policy_rejected"
-                | "skill_tool_needs_approval"
-        ) {
-            return None;
-        }
+        let payload = serde_json::from_str::<serde_json::Value>(result).ok();
+        let error_code = payload
+            .as_ref()
+            .and_then(|payload| payload.get("error_code"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+            .unwrap_or("tool_execution_failed");
         let access_profile = payload
-            .get("access_profile")
+            .as_ref()
+            .and_then(|payload| payload.get("access_profile"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        let key = format!("{tool_name}\u{1f}{error_code}\u{1f}{access_profile}");
+        let key = format!("{tool_name}\u{1f}{arguments}\u{1f}{error_code}\u{1f}{access_profile}");
         let observations = self.observations.entry(key).or_default();
         *observations = observations.saturating_add(1);
-        if *observations < 2 {
+        let max_attempts = retry_limit.saturating_add(1) as usize;
+        if *observations < max_attempts {
             return None;
         }
         let error = payload
-            .get("error")
+            .as_ref()
+            .and_then(|payload| payload.get("error"))
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("工具调用被确定性策略拒绝");
+            .unwrap_or(result);
         Some(DeterministicToolFailure {
-            summary: format!("{tool_name} 在当前运行权限下重复被拒绝，已停止重复执行。"),
+            summary: format!(
+                "{tool_name} 使用相同参数连续失败 {max_attempts} 次，已停止重复执行。"
+            ),
             detail: format!(
-                "工具：{tool_name}\n错误码：{error_code}\n访问模式：{access_profile}\n原因：{error}\n相同权限条件下重复调用不会成功；需要改用当前权限允许的工具，或由用户调整访问模式后恢复任务。"
+                "工具：{tool_name}\n错误码：{error_code}\n访问模式：{access_profile}\n原因：{error}\n相同参数和错误重复出现，继续调用不会改变结果；请修正参数、启动依赖服务或由用户调整访问模式后恢复任务。"
             ),
         })
     }
@@ -653,11 +657,23 @@ mod tests {
 
         assert!(
             tracker
-                .observe("shell_exec", result, ExecutionResultStatus::NeedsApproval)
+                .observe(
+                    "shell_exec",
+                    r#"{"command":"printf test"}"#,
+                    result,
+                    ExecutionResultStatus::NeedsApproval,
+                    1,
+                )
                 .is_none()
         );
         let failure = tracker
-            .observe("shell_exec", result, ExecutionResultStatus::NeedsApproval)
+            .observe(
+                "shell_exec",
+                r#"{"command":"printf test"}"#,
+                result,
+                ExecutionResultStatus::NeedsApproval,
+                1,
+            )
             .expect("第二次相同策略失败必须止损");
         assert!(failure.summary.contains("停止重复执行"));
         assert!(failure.detail.contains("tool_policy_needs_approval"));
@@ -670,22 +686,66 @@ mod tests {
 
         assert!(
             tracker
-                .observe("shell_exec", result, ExecutionResultStatus::Rejected)
+                .observe(
+                    "shell_exec",
+                    r#"{"command":"printf test"}"#,
+                    result,
+                    ExecutionResultStatus::Rejected,
+                    1,
+                )
                 .is_none()
         );
         assert!(
             tracker
                 .observe(
                     "shell_exec",
+                    r#"{"command":"printf test"}"#,
                     r#"{"status":"succeeded"}"#,
                     ExecutionResultStatus::Succeeded,
+                    1,
                 )
                 .is_none()
         );
         assert!(
             tracker
-                .observe("shell_exec", result, ExecutionResultStatus::Rejected)
+                .observe(
+                    "shell_exec",
+                    r#"{"command":"printf test"}"#,
+                    result,
+                    ExecutionResultStatus::Rejected,
+                    1,
+                )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn identical_failed_tool_call_stops_at_task_retry_limit() {
+        let mut tracker = DeterministicToolFailureTracker::default();
+        let result = r#"{"status":"failed","error_code":"browser_navigation_failed","error":"connection refused","recoverable":true}"#;
+        let arguments = r#"{"url":"http://127.0.0.1:4174/"}"#;
+
+        assert!(
+            tracker
+                .observe(
+                    "browser_navigate",
+                    arguments,
+                    result,
+                    ExecutionResultStatus::Failed,
+                    1,
+                )
+                .is_none()
+        );
+        let failure = tracker
+            .observe(
+                "browser_navigate",
+                arguments,
+                result,
+                ExecutionResultStatus::Failed,
+                1,
+            )
+            .expect("任务 retry_limit=1 时第二次相同失败必须止损");
+        assert!(failure.summary.contains("连续失败 2 次"));
+        assert!(failure.detail.contains("browser_navigation_failed"));
     }
 }

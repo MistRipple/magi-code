@@ -8,7 +8,6 @@ import {
   resolveAgentBaseUrl,
   RUNTIME_BASE_URL_STORAGE_KEY,
   isPublicTunnelAccess,
-  settingsBootstrapMatchesCurrentWorkspace,
 } from '../../web/agent-api';
 import {
   clearAgentBindingContext,
@@ -152,7 +151,6 @@ import {
 } from '../../stores/messages.svelte';
 import { resolveModelListFetchBlockReason } from '../model-governance';
 import type { OrchestratorRuntimeSnapshot, QueuedMessage } from '../../types/message';
-import { copyOrchestratorSessionConfig } from '../orchestrator-session-config';
 import { refreshPendingChangesProjection } from '../../lib/pending-changes-refresh';
 
 const listeners: Set<(message: ClientBridgeMessage) => void> = new Set();
@@ -197,7 +195,6 @@ let bridgeRecovering = false;
 let bootstrapInFlight: Promise<void> | null = null;
 let bootstrapInFlightBindingKey = '';
 let bootstrapRequestSeq = 0;
-let activeSessionSwitchBindingKey = '';
 let settingsBootstrapInFlight: Promise<void> | null = null;
 let settingsBootstrapInFlightBindingKey = '';
 let settingsBootstrapRequestSeq = 0;
@@ -210,9 +207,6 @@ let eventStreamSnapshotRefreshBindingKey = '';
 let eventStreamTunnelSyncInFlight: Promise<void> | null = null;
 let eventStreamTunnelSyncBindingKey = '';
 let initialWindowBindingHydrated = false;
-// 新会话草稿是明确的工作区级绑定状态，不能与“启动时尚未解析会话”混为一谈。
-// 恢复链路据此只重建工作区事件流和会话目录，禁止 bootstrap 自动选回旧会话。
-let workspaceDraftActive = false;
 let workspaceSessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let terminalTaskRuntimeRefreshTimer: number | null = null;
 const inFlightChangeMutationScopes = new Set<string>();
@@ -860,7 +854,6 @@ function syncTunnelRuntimeForSilentEventStream(reason: string, error: Error): vo
     }
     const snapshot = await getWorkspaceSessions(
       binding.workspaceId,
-      binding.sessionId,
       binding.workspacePath,
     );
     if (bootstrapBindingKey(resolveWorkspaceQuery()) !== syncBindingKey) {
@@ -1472,7 +1465,6 @@ function scheduleWorkspaceSessionSummaryRefresh(reason: string): void {
     }
     void getWorkspaceSessions(
       binding.workspaceId,
-      binding.sessionId,
       binding.workspacePath,
     ).then((snapshot) => {
       const currentBinding = resolveWorkspaceQuery();
@@ -2351,9 +2343,6 @@ async function readAgentErrorPayload(
 }
 
 function isCurrentBootstrapRequest(bindingKey: string, requestSeq: number): boolean {
-  if (activeSessionSwitchBindingKey && bindingKey !== activeSessionSwitchBindingKey) {
-    return false;
-  }
   return requestSeq === bootstrapRequestSeq
     && bindingKey === bootstrapBindingKey(resolveWorkspaceQuery());
 }
@@ -2434,9 +2423,6 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = incomingSessionId;
-  if (incomingSessionId) {
-    workspaceDraftActive = false;
-  }
   if (
     previousWorkspaceId !== normalizedWorkspaceId
     || previousWorkspacePath !== normalizedWorkspacePath
@@ -2528,93 +2514,7 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
   return settingsBindingChanged;
 }
 
-function dispatchWorkspaceSessionDetached(
-  workspaceId: string,
-  workspacePath: string,
-  dataType: 'workspaceDraftStarted' | 'workspaceSessionCleared',
-  carriedSessionConfig: Record<string, unknown> = {},
-): void {
-  const normalizedWorkspaceId = workspaceId.trim();
-  const normalizedWorkspacePath = workspacePath.trim();
-  workspaceDraftActive = dataType === 'workspaceDraftStarted';
-  // 进入草稿是一次正式绑定切换，必须让此前的 session bootstrap 失效。
-  // 事件流本身按 workspace 订阅；同工作区继续复用，跨工作区由 ensureEventStream
-  // 统一重连，不能先关闭后留下一个等待焦点恢复的断流状态。
-  invalidateBootstrapRequests();
-  const settingsBindingChanged = clearWorkspaceSessionBinding(normalizedWorkspaceId, normalizedWorkspacePath);
-  emitDataMessage(dataType, {
-    workspaceId: normalizedWorkspaceId,
-    workspacePath: normalizedWorkspacePath,
-    orchestratorSessionConfig: carriedSessionConfig,
-  });
-  if (settingsBindingChanged) {
-    refreshSettingsBootstrapForCurrentWorkspace('workspace_session_cleared');
-  }
-  void ensureEventStream().catch((error) => {
-    scheduleRecovery('workspace_session_detached_event_stream', error, true);
-  });
-}
-
-function currentBoundSettingsBootstrap(): SettingsBootstrapPayload | null {
-  const stateSnapshot = messagesState.settingsBootstrapSnapshot;
-  if (stateSnapshot && settingsBootstrapMatchesCurrentWorkspace(stateSnapshot)) {
-    return stateSnapshot as SettingsBootstrapPayload;
-  }
-  if (cachedSettingsBootstrap && settingsBootstrapMatchesCurrentWorkspace(cachedSettingsBootstrap)) {
-    return cachedSettingsBootstrap;
-  }
-  return null;
-}
-
-async function startWorkspaceSessionDraft(workspaceId: string, workspacePath: string): Promise<void> {
-  const normalizedWorkspaceId = workspaceId.trim();
-  const normalizedWorkspacePath = workspacePath.trim();
-  const alreadyCurrentDraft = !currentSessionId
-    && currentWorkspaceId === normalizedWorkspaceId
-    && currentWorkspacePath === normalizedWorkspacePath;
-  if (alreadyCurrentDraft && Object.keys(messagesState.draftOrchestratorSessionConfig).length > 0) {
-    dispatchWorkspaceSessionDetached(
-      normalizedWorkspaceId,
-      normalizedWorkspacePath,
-      'workspaceDraftStarted',
-      { ...messagesState.draftOrchestratorSessionConfig },
-    );
-    return;
-  }
-
-  const sourceBindingKey = settingsBootstrapBindingKey();
-  let sourceSnapshot = currentBoundSettingsBootstrap();
-  if (!sourceSnapshot && currentSessionId) {
-    try {
-      sourceSnapshot = await getAgentSettingsBootstrap({ scope: 'core' });
-    } catch (error) {
-      emitBridgeErrorToast(i18n.t('header.newSession'), error, { reportIncident: false });
-      return;
-    }
-    if (
-      sourceBindingKey !== settingsBootstrapBindingKey()
-      || !settingsBootstrapMatchesCurrentWorkspace(sourceSnapshot)
-    ) {
-      return;
-    }
-  }
-
-  const carriedSessionConfig = sourceSnapshot
-    ? copyOrchestratorSessionConfig(
-      sourceSnapshot.orchestratorSessionConfig,
-      sourceSnapshot.effectiveOrchestratorConfig,
-    )
-    : {};
-  dispatchWorkspaceSessionDetached(
-    normalizedWorkspaceId,
-    normalizedWorkspacePath,
-    'workspaceDraftStarted',
-    carriedSessionConfig,
-  );
-}
-
 function clearPersistedWorkspaceBinding(): void {
-  workspaceDraftActive = false;
   clearSettingsBootstrapCache();
   currentWorkspaceId = '';
   currentWorkspacePath = '';
@@ -2696,14 +2596,10 @@ async function restoreBridgeState(reason: string, force = false): Promise<void> 
     if (force) {
       clearSettingsBootstrapCache();
     }
-    if (workspaceDraftActive && !recoveryBinding.sessionId && recoveryBinding.workspaceId) {
-      await restoreWorkspaceDraftState(recoveryBinding, recoveryBindingKey);
-    } else {
-      await fetchBootstrap({
-        forceEventStreamReconnect: true,
-        refreshSettingsBootstrapOnBindingChange: false,
-      });
-    }
+    await fetchBootstrap({
+      forceEventStreamReconnect: true,
+      refreshSettingsBootstrapOnBindingChange: false,
+    });
     clearRecoveryTimer();
     recoveryAttempt = 0;
     emitConnectedState(reason, recovered);
@@ -2722,36 +2618,6 @@ async function restoreBridgeState(reason: string, force = false): Promise<void> 
   });
   recoveryInFlight = request;
   return request;
-}
-
-async function restoreWorkspaceDraftState(
-  binding: { workspaceId: string; workspacePath: string; sessionId: string },
-  bindingKey: string,
-): Promise<void> {
-  const snapshot = await getWorkspaceSessions(
-    binding.workspaceId,
-    '',
-    binding.workspacePath,
-  );
-  if (!workspaceDraftActive || bootstrapBindingKey(resolveWorkspaceQuery()) !== bindingKey) {
-    return;
-  }
-  const snapshotRuntimeEpoch = snapshot.runtimeEpoch.trim();
-  if (snapshotRuntimeEpoch && currentRuntimeEpoch && snapshotRuntimeEpoch !== currentRuntimeEpoch) {
-    resetEventStreamCursor();
-  }
-  if (snapshotRuntimeEpoch) {
-    currentRuntimeEpoch = snapshotRuntimeEpoch;
-  }
-  updateEventStreamCursorFromSnapshot(snapshot.eventStreamNextSequence);
-  emitDataMessage('sessionsUpdated', {
-    workspaceId: binding.workspaceId,
-    sessions: snapshot.sessions,
-    runtimeEpoch: snapshot.runtimeEpoch,
-    eventStreamNextSequence: snapshot.eventStreamNextSequence,
-    allowRuntimeEpochChange: true,
-  });
-  await ensureEventStream({ forceReconnect: true, waitUntilOpen: true });
 }
 
 function scheduleRecovery(reason: string, error?: unknown, immediate = false): void {
@@ -2891,6 +2757,11 @@ async function dispatchBootstrap(
     forceEventStreamReconnect?: boolean;
     rawPayload?: unknown;
     refreshSettingsBootstrapOnBindingChange?: boolean;
+    navigation?: {
+      requestId: string;
+      target: 'draft' | 'session';
+      orchestratorSessionConfig: Record<string, unknown>;
+    };
   } = {},
 ): Promise<void> {
   const previousSessionId = currentSessionId;
@@ -2924,6 +2795,11 @@ async function dispatchBootstrap(
   }
   emitDataMessage('sessionBootstrapLoaded', {
     ...payload,
+    ...(options.navigation ? {
+      navigationRequestId: options.navigation.requestId,
+      navigationTarget: options.navigation.target,
+      navigationOrchestratorSessionConfig: options.navigation.orchestratorSessionConfig,
+    } : {}),
     hasMoreBefore: pageMeta.hasMoreBefore,
     beforeCursor: pageMeta.beforeCursor,
     canonicalHasMoreBefore: pageMeta.canonicalHasMoreBefore,
@@ -3005,15 +2881,13 @@ async function fetchBootstrap(
           if (!bootstrapRequestCanClearMissingSession(effectiveBinding, requestSeq)) {
             return;
           }
-          dispatchWorkspaceSessionDetached(
+          clearWorkspaceSessionBinding(
             effectiveBinding.workspaceId,
             effectiveBinding.workspacePath,
-            'workspaceSessionCleared',
           );
           try {
             const snapshot = await getWorkspaceSessions(
               effectiveBinding.workspaceId,
-              '',
               effectiveBinding.workspacePath,
             );
             const currentBinding = resolveWorkspaceQuery();
@@ -3088,7 +2962,6 @@ async function refreshWorkspaceSessionsAfterBootstrap(
   try {
     const snapshot = await getWorkspaceSessions(
       payload.workspace.workspaceId,
-      payload.sessionId,
       payload.workspace.rootPath,
     );
     if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
@@ -3268,52 +3141,92 @@ async function emitKnowledgePayload(scope: BridgeRequestScope = {}): Promise<voi
   await dispatchProjectKnowledge(scope);
 }
 
-async function switchSession(
+async function commitSessionNavigation(
+  target: 'draft' | 'session',
+  workspaceId: string,
+  workspacePath: string,
+  requestId: string,
   sessionId: string,
-  options: { workspaceId?: string; workspacePath?: string } = {},
+  carriedSessionConfig: Record<string, unknown>,
 ): Promise<void> {
-  const targetWorkspaceScope = resolveWorkspaceScopeFromSource(options);
-  const targetWorkspaceId = targetWorkspaceScope.workspaceId;
-  const targetWorkspacePath = targetWorkspaceScope.workspacePath;
-  const switchBindingKey = bootstrapBindingKey({
-    workspaceId: targetWorkspaceId,
-    workspacePath: targetWorkspacePath,
+  const previousWorkspaceId = currentWorkspaceId;
+  const previousWorkspacePath = currentWorkspacePath;
+  invalidateBootstrapRequests();
+  const response = await getTransport().request(agentUrl('/api/session/navigation'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      target,
+      workspaceId,
+      workspacePath,
+      ...(target === 'session' ? { sessionId } : {}),
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`session navigation failed: ${response.status}`);
+  }
+  const rawPayload = await response.json();
+  const payload = normalizeBootstrapResponse(rawPayload, {
+    workspaceId,
+    workspacePath,
     sessionId,
   });
-  activeSessionSwitchBindingKey = switchBindingKey;
-  invalidateBootstrapRequests();
-  messagesState.sessionHydrating = true;
-  try {
-    const forceEventStreamReconnect = targetWorkspaceId !== currentWorkspaceId
-      || targetWorkspacePath !== currentWorkspacePath;
-    const response = await getTransport().request(agentUrl('/api/session/switch'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        workspaceId: targetWorkspaceId,
-        workspacePath: targetWorkspacePath,
-        sessionId,
-      }),
-    });
-    if (!response.ok) {
-      throw new Error(`switch session failed: ${response.status}`);
-    }
-    await response.json();
-    const settingsBindingChanged = persistWorkspaceBinding(targetWorkspaceId, targetWorkspacePath, sessionId);
-    await fetchBootstrap({
-      forceFresh: true,
-      forceEventStreamReconnect,
-      refreshSettingsBootstrapOnBindingChange: !settingsBindingChanged,
-    });
-    if (settingsBindingChanged) {
-      refreshSettingsBootstrapForCurrentWorkspace('session_switch_binding_changed');
-    }
-  } finally {
-    if (activeSessionSwitchBindingKey === switchBindingKey) {
-      activeSessionSwitchBindingKey = '';
-    }
-    messagesState.sessionHydrating = false;
+  const navigationRequestSeq = bootstrapRequestSeq;
+  const navigationBindingKey = bootstrapBindingKey({
+    workspaceId: payload.workspace.workspaceId,
+    workspacePath: payload.workspace.rootPath,
+    sessionId: payload.sessionId,
+  });
+  await dispatchBootstrap(payload, {
+    forceEventStreamReconnect: previousWorkspaceId !== workspaceId
+      || previousWorkspacePath !== workspacePath,
+    rawPayload,
+    navigation: {
+      requestId,
+      target,
+      orchestratorSessionConfig: carriedSessionConfig,
+    },
+  });
+  void refreshWorkspaceSessionsAfterBootstrap(
+    payload,
+    navigationBindingKey,
+    navigationRequestSeq,
+  );
+}
+
+async function navigateSession(message: ClientBridgeMessage): Promise<void> {
+  const requestId = trimBridgeString(message.requestId);
+  const target = message.target === 'session' ? 'session' : 'draft';
+  const scope = resolveWorkspaceScopeFromSource(message);
+  if (!requestId || !scope.workspaceId || !scope.workspacePath) {
+    throw new Error('会话导航缺少 requestId 或工作区绑定');
   }
+  if (target === 'session') {
+    const sessionId = trimBridgeString(message.sessionId);
+    if (!sessionId) throw new Error('会话导航缺少 sessionId');
+    await commitSessionNavigation(
+      'session',
+      scope.workspaceId,
+      scope.workspacePath,
+      requestId,
+      sessionId,
+      {},
+    );
+    return;
+  }
+  const carriedSessionConfig = message.orchestratorSessionConfig
+    && typeof message.orchestratorSessionConfig === 'object'
+    && !Array.isArray(message.orchestratorSessionConfig)
+    ? message.orchestratorSessionConfig as Record<string, unknown>
+    : {};
+  await commitSessionNavigation(
+    'draft',
+    scope.workspaceId,
+    scope.workspacePath,
+    requestId,
+    '',
+    carriedSessionConfig,
+  );
 }
 
 async function deleteSession(sessionId: string, scope: BridgeRequestScope = {}): Promise<void> {
@@ -4482,31 +4395,6 @@ export function createWebClientBridge(): ClientBridge {
     kind: 'web',
     postMessage(message: ClientBridgeMessage): void {
       switch (message.type) {
-        case 'workspaceBindingChanged': {
-          const workspaceId = typeof message.workspaceId === 'string' ? message.workspaceId : '';
-          const workspacePath = typeof message.workspacePath === 'string' ? message.workspacePath : '';
-          const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
-          if (!sessionId && (workspaceId.trim() || workspacePath.trim())) {
-            const normalizedWorkspaceId = workspaceId.trim();
-            const normalizedWorkspacePath = workspacePath.trim();
-            const alreadyBoundToWorkspaceDraft = !currentSessionId
-              && currentWorkspaceId === normalizedWorkspaceId
-              && currentWorkspacePath === normalizedWorkspacePath;
-            if (!alreadyBoundToWorkspaceDraft) {
-              dispatchWorkspaceSessionDetached(
-                normalizedWorkspaceId,
-                normalizedWorkspacePath,
-                'workspaceSessionCleared',
-              );
-            }
-            return;
-          }
-          const settingsBindingChanged = persistWorkspaceBinding(workspaceId, workspacePath, sessionId);
-          if (settingsBindingChanged) {
-            refreshSettingsBootstrapForCurrentWorkspace('workspace_binding_changed');
-          }
-          return;
-        }
         case 'webviewReady':
         case 'getState':
         case 'requestState':
@@ -4795,14 +4683,20 @@ export function createWebClientBridge(): ClientBridge {
             );
           });
           return;
-        case 'newSession': {
-          const workspaceScope = resolveWorkspaceScopeFromSource(message);
-          void startWorkspaceSessionDraft(
-            workspaceScope.workspaceId,
-            workspaceScope.workspacePath,
-          );
+        case 'navigateSession':
+          void navigateSession(message).catch((error) => {
+            emitDataMessage('sessionNavigationFailed', {
+              requestId: trimBridgeString(message.requestId),
+              target: message.target === 'session' ? 'session' : 'draft',
+              workspaceId: trimBridgeString(message.workspaceId),
+              workspacePath: trimBridgeString(message.workspacePath),
+              sessionId: trimBridgeString(message.sessionId),
+              message: normalizeErrorMessage(error) || i18n.t('web.workbenchActionFailed', {
+                action: i18n.t('bridge.action.switchSession'),
+              }),
+            });
+          });
           return;
-        }
         case 'loadNotifications':
           {
             const scope = resolveNotificationOperationScope(message);
@@ -4943,16 +4837,6 @@ export function createWebClientBridge(): ClientBridge {
           return;
         case 'continueTask':
           void continueSessionExecution();
-          return;
-        case 'switchSession':
-          if (typeof message.sessionId === 'string' && message.sessionId.trim()) {
-            void switchSession(message.sessionId, {
-              workspaceId: typeof message.workspaceId === 'string' ? message.workspaceId : undefined,
-              workspacePath: typeof message.workspacePath === 'string' ? message.workspacePath : undefined,
-            }).catch((error) => {
-              logBridgeOperationFailure(i18n.t('bridge.action.switchSession'), '[web-client-bridge] 切换会话失败:', error);
-            });
-          }
           return;
         case 'renameSession':
           if (

@@ -68,7 +68,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, RwLock,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 /// Tracks the state of a single running Runner instance.
@@ -837,18 +837,104 @@ pub(crate) struct BrowserScreencastOptions {
     pub max_height: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, Default)]
+struct BrowserViewLeaseState {
+    active_uses: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct BrowserViewBinding {
     pub view_id: String,
     pub tab_id: BrowserTabId,
     pub host_tab_id: BrowserTabId,
     pub host_generation: u64,
+    sequence: u64,
+    lease: Arc<BrowserViewLeaseState>,
+}
+
+impl PartialEq for BrowserViewBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.view_id == other.view_id
+            && self.tab_id == other.tab_id
+            && self.host_tab_id == other.host_tab_id
+            && self.host_generation == other.host_generation
+            && self.sequence == other.sequence
+    }
+}
+
+impl Eq for BrowserViewBinding {}
+
+impl BrowserViewBinding {
+    pub(crate) async fn wait_until_idle(&self) {
+        loop {
+            let notified = self.lease.idle.notified();
+            if self.lease.active_uses.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BrowserViewUse {
+    binding: BrowserViewBinding,
+}
+
+impl BrowserViewUse {
+    pub(crate) fn host_tab_id(&self) -> &BrowserTabId {
+        &self.binding.host_tab_id
+    }
+
+    fn view_id(&self) -> &str {
+        &self.binding.view_id
+    }
+
+    fn host_generation(&self) -> u64 {
+        self.binding.host_generation
+    }
+}
+
+impl Drop for BrowserViewUse {
+    fn drop(&mut self) {
+        if self
+            .binding
+            .lease
+            .active_uses
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            self.binding.lease.idle.notify_waiters();
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct BrowserViewRegistry {
     bindings: Mutex<HashMap<(BrowserTabId, String), BrowserViewBinding>>,
+    worker_targets: Mutex<HashMap<BrowserTabId, BrowserWorkerTargetAffinity>>,
+    next_sequence: AtomicU64,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BrowserWorkerTargetKind {
+    Logical,
+    View {
+        view_id: String,
+        host_tab_id: BrowserTabId,
+        host_generation: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BrowserWorkerTargetAffinity {
+    execution_id: String,
+    target: BrowserWorkerTargetKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BrowserWorkerTargetChanged;
 
 impl BrowserViewRegistry {
     pub(crate) fn bind(
@@ -863,6 +949,8 @@ impl BrowserViewRegistry {
             tab_id: tab_id.clone(),
             host_tab_id,
             host_generation,
+            sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
+            lease: Arc::new(BrowserViewLeaseState::default()),
         };
         let previous = self
             .bindings
@@ -886,6 +974,130 @@ impl BrowserViewRegistry {
             .cloned()
     }
 
+    #[cfg(test)]
+    pub(crate) fn resolve_active(&self, tab_id: &BrowserTabId) -> Option<BrowserViewBinding> {
+        self.bindings
+            .lock()
+            .expect("browser view registry lock poisoned")
+            .values()
+            .filter(|binding| &binding.tab_id == tab_id)
+            .max_by_key(|binding| (binding.host_generation, binding.sequence))
+            .cloned()
+    }
+
+    pub(crate) fn acquire_active(&self, tab_id: &BrowserTabId) -> Option<BrowserViewUse> {
+        let bindings = self
+            .bindings
+            .lock()
+            .expect("browser view registry lock poisoned");
+        let binding = bindings
+            .values()
+            .filter(|binding| &binding.tab_id == tab_id)
+            .max_by_key(|binding| (binding.host_generation, binding.sequence))?
+            .clone();
+        binding.lease.active_uses.fetch_add(1, Ordering::AcqRel);
+        Some(BrowserViewUse { binding })
+    }
+
+    pub(crate) fn acquire(
+        &self,
+        tab_id: &BrowserTabId,
+        view_id: &str,
+        host_generation: u64,
+    ) -> Option<BrowserViewUse> {
+        let bindings = self
+            .bindings
+            .lock()
+            .expect("browser view registry lock poisoned");
+        let binding = bindings
+            .get(&(tab_id.clone(), view_id.to_string()))
+            .filter(|binding| binding.host_generation == host_generation)?
+            .clone();
+        binding.lease.active_uses.fetch_add(1, Ordering::AcqRel);
+        Some(BrowserViewUse { binding })
+    }
+
+    /// 为一次浏览器自动化流程固定物理执行 Page。首次调用若存在前台 View，
+    /// 固定到该 View；否则固定到逻辑 Page。后续即使面板晚到也不切换，确保
+    /// snapshot revision 与 element_ref 始终属于同一个物理 Page。
+    pub(crate) fn acquire_worker_target(
+        &self,
+        tab_id: &BrowserTabId,
+        execution_id: &str,
+    ) -> Result<Option<BrowserViewUse>, BrowserWorkerTargetChanged> {
+        let existing = self
+            .worker_targets
+            .lock()
+            .expect("browser worker target lock poisoned")
+            .get(tab_id)
+            .filter(|affinity| affinity.execution_id == execution_id)
+            .cloned();
+        if let Some(existing) = existing {
+            return match &existing.target {
+                BrowserWorkerTargetKind::Logical => Ok(None),
+                BrowserWorkerTargetKind::View {
+                    view_id,
+                    host_tab_id,
+                    host_generation,
+                } => {
+                    let view_use = self.acquire(tab_id, view_id, *host_generation);
+                    if view_use
+                        .as_ref()
+                        .is_some_and(|view| view.host_tab_id() == host_tab_id)
+                    {
+                        Ok(view_use)
+                    } else {
+                        let mut targets = self
+                            .worker_targets
+                            .lock()
+                            .expect("browser worker target lock poisoned");
+                        if targets
+                            .get(tab_id)
+                            .is_some_and(|current| current == &existing)
+                        {
+                            targets.remove(tab_id);
+                        }
+                        Err(BrowserWorkerTargetChanged)
+                    }
+                }
+            };
+        }
+
+        if let Some(view_use) = self.acquire_active(tab_id) {
+            self.worker_targets
+                .lock()
+                .expect("browser worker target lock poisoned")
+                .insert(
+                    tab_id.clone(),
+                    BrowserWorkerTargetAffinity {
+                        execution_id: execution_id.to_string(),
+                        target: BrowserWorkerTargetKind::View {
+                            view_id: view_use.view_id().to_string(),
+                            host_tab_id: view_use.host_tab_id().clone(),
+                            host_generation: view_use.host_generation(),
+                        },
+                    },
+                );
+            return Ok(Some(view_use));
+        }
+
+        self.pin_worker_to_logical(tab_id, execution_id);
+        Ok(None)
+    }
+
+    pub(crate) fn pin_worker_to_logical(&self, tab_id: &BrowserTabId, execution_id: &str) {
+        self.worker_targets
+            .lock()
+            .expect("browser worker target lock poisoned")
+            .insert(
+                tab_id.clone(),
+                BrowserWorkerTargetAffinity {
+                    execution_id: execution_id.to_string(),
+                    target: BrowserWorkerTargetKind::Logical,
+                },
+            );
+    }
+
     pub(crate) fn release(&self, binding: &BrowserViewBinding) -> bool {
         let mut bindings = self
             .bindings
@@ -901,6 +1113,10 @@ impl BrowserViewRegistry {
     }
 
     pub(crate) fn remove_for_tab(&self, tab_id: &BrowserTabId) -> Vec<BrowserViewBinding> {
+        self.worker_targets
+            .lock()
+            .expect("browser worker target lock poisoned")
+            .remove(tab_id);
         let mut bindings = self
             .bindings
             .lock()
@@ -916,6 +1132,10 @@ impl BrowserViewRegistry {
     }
 
     pub(crate) fn remove_for_session(&self, tab_ids: &[BrowserTabId]) -> Vec<BrowserViewBinding> {
+        self.worker_targets
+            .lock()
+            .expect("browser worker target lock poisoned")
+            .retain(|tab_id, _| !tab_ids.iter().any(|candidate| candidate == tab_id));
         let mut bindings = self
             .bindings
             .lock()
@@ -1287,6 +1507,7 @@ pub struct ApiState {
     session_turn_queue: Arc<Mutex<HashMap<SessionId, VecDeque<QueuedRegularSessionTurn>>>>,
     session_turn_locks: Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
     session_change_sync_locks: Arc<Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>>,
+    session_navigation_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1576,6 +1797,7 @@ impl ApiState {
             session_turn_queue: Arc::new(Mutex::new(HashMap::new())),
             session_turn_locks: Arc::new(Mutex::new(HashMap::new())),
             session_change_sync_locks: Arc::new(Mutex::new(HashMap::new())),
+            session_navigation_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -2102,6 +2324,7 @@ impl ApiState {
             event_bus: Arc::clone(&self.event_bus),
             session_store: Arc::clone(&self.session_store),
             persistence: self.runtime_persistence.clone(),
+            browser_views: Arc::clone(&self.browser_views),
         }
     }
 
@@ -3294,6 +3517,10 @@ impl ApiState {
         lock.lock_owned().await
     }
 
+    pub(crate) async fn lock_session_navigation(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.session_navigation_lock.lock().await
+    }
+
     async fn lock_session_change_sync(
         &self,
         session_id: &SessionId,
@@ -4168,19 +4395,172 @@ mod tests {
                 .host_tab_id,
             second.host_tab_id
         );
+        assert_eq!(
+            state
+                .browser_views
+                .resolve_active(&tab_id)
+                .expect("newest ready view should be the worker target")
+                .host_tab_id,
+            second.host_tab_id
+        );
         assert!(
             state
                 .browser_views
                 .resolve(&tab_id, "panel-first", 8)
                 .is_none()
         );
+        assert!(state.browser_views.release(&second));
+        assert_eq!(
+            state
+                .browser_views
+                .resolve_active(&tab_id)
+                .expect("previous ready view should resume as worker target")
+                .host_tab_id,
+            first.host_tab_id
+        );
         assert!(state.browser_views.release(&first));
         assert!(
             state
                 .browser_views
                 .resolve(&tab_id, "panel-second", 7)
-                .is_some()
+                .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn retiring_browser_view_waits_for_active_worker_use() {
+        let registry = BrowserViewRegistry::default();
+        let tab_id = BrowserTabId::new("browser-tab-view-lease");
+        let host_tab_id = BrowserTabId::new("browser-view-lease-host");
+        let (binding, previous) =
+            registry.bind(tab_id.clone(), "panel-lease".to_string(), host_tab_id, 1);
+        assert!(previous.is_none());
+        let active_use = registry
+            .acquire(&tab_id, "panel-lease", 1)
+            .expect("active view should be acquirable");
+        assert!(registry.release(&binding));
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                binding.wait_until_idle()
+            )
+            .await
+            .is_err()
+        );
+        drop(active_use);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            binding.wait_until_idle(),
+        )
+        .await
+        .expect("view should become idle after worker use is dropped");
+    }
+
+    #[test]
+    fn worker_target_stays_logical_when_view_arrives_during_turn() {
+        let registry = BrowserViewRegistry::default();
+        let tab_id = BrowserTabId::new("browser-tab-logical-affinity");
+
+        assert!(
+            registry
+                .acquire_worker_target(&tab_id, "turn-first")
+                .expect("logical target should resolve")
+                .is_none()
+        );
+        registry.bind(
+            tab_id.clone(),
+            "panel-late".to_string(),
+            BrowserTabId::new("browser-view-late"),
+            1,
+        );
+        assert!(
+            registry
+                .acquire_worker_target(&tab_id, "turn-first")
+                .expect("late view must not replace the logical target in the same turn")
+                .is_none()
+        );
+        assert_eq!(
+            registry
+                .acquire_worker_target(&tab_id, "turn-second")
+                .expect("new turn should select the active view")
+                .expect("active view should be selected")
+                .host_tab_id(),
+            &BrowserTabId::new("browser-view-late")
+        );
+    }
+
+    #[test]
+    fn worker_target_stays_on_first_view_during_turn() {
+        let registry = BrowserViewRegistry::default();
+        let tab_id = BrowserTabId::new("browser-tab-view-affinity");
+        registry.bind(
+            tab_id.clone(),
+            "panel-first".to_string(),
+            BrowserTabId::new("browser-view-first"),
+            1,
+        );
+        let first = registry
+            .acquire_worker_target(&tab_id, "turn-first")
+            .expect("first view target should resolve")
+            .expect("first view should be selected");
+        assert_eq!(
+            first.host_tab_id(),
+            &BrowserTabId::new("browser-view-first")
+        );
+        drop(first);
+
+        registry.bind(
+            tab_id.clone(),
+            "panel-second".to_string(),
+            BrowserTabId::new("browser-view-second"),
+            1,
+        );
+        assert_eq!(
+            registry
+                .acquire_worker_target(&tab_id, "turn-first")
+                .expect("same turn should keep its first view")
+                .expect("first view should remain selected")
+                .host_tab_id(),
+            &BrowserTabId::new("browser-view-first")
+        );
+        assert_eq!(
+            registry
+                .acquire_worker_target(&tab_id, "turn-second")
+                .expect("new turn should select the newest view")
+                .expect("newest view should be selected")
+                .host_tab_id(),
+            &BrowserTabId::new("browser-view-second")
+        );
+    }
+
+    #[test]
+    fn worker_target_reports_when_pinned_view_is_replaced() {
+        let registry = BrowserViewRegistry::default();
+        let tab_id = BrowserTabId::new("browser-tab-reconnected-affinity");
+        let (first, previous) = registry.bind(
+            tab_id.clone(),
+            "panel-reconnected".to_string(),
+            BrowserTabId::new("browser-view-before-reconnect"),
+            1,
+        );
+        assert!(previous.is_none());
+        drop(
+            registry
+                .acquire_worker_target(&tab_id, "turn-first")
+                .expect("first view target should resolve")
+                .expect("first view should be selected"),
+        );
+        let (_, previous) = registry.bind(
+            tab_id.clone(),
+            "panel-reconnected".to_string(),
+            BrowserTabId::new("browser-view-after-reconnect"),
+            1,
+        );
+        assert_eq!(previous, Some(first));
+        assert!(matches!(
+            registry.acquire_worker_target(&tab_id, "turn-first"),
+            Err(BrowserWorkerTargetChanged)
+        ));
     }
 
     #[test]
@@ -4238,7 +4618,7 @@ mod tests {
                 authority.acquire_lease(magi_browser_runtime::AcquireBrowserLease {
                     lease_id: lease_id.clone(),
                     profile_id: profile_id.clone(),
-                    browser_session_id,
+                    browser_session_id: browser_session_id.clone(),
                     owner: ExecutionOwnership {
                         session_id: Some(session_id.clone()),
                         workspace_id: Some(workspace_id.clone()),
@@ -4258,7 +4638,7 @@ mod tests {
             Some(&session_id),
             None,
             None,
-            magi_browser_runtime::BrowserLeaseEndReason::GoalPaused,
+            magi_browser_runtime::BrowserLeaseEndReason::TaskFinished,
         );
         assert_eq!(report.browser_lease_count, 1);
         assert_eq!(report.total(), 1);
@@ -4274,8 +4654,24 @@ mod tests {
             authority
                 .lease(&lease_id)
                 .and_then(|lease| lease.end_reason),
-            Some(magi_browser_runtime::BrowserLeaseEndReason::GoalPaused)
+            Some(magi_browser_runtime::BrowserLeaseEndReason::TaskFinished)
         );
+        let browser_session = authority
+            .session(&browser_session_id)
+            .expect("completed task must retain its browser session");
+        assert_eq!(
+            browser_session.lifecycle,
+            magi_browser_runtime::BrowserSessionLifecycle::Ready
+        );
+        assert_eq!(browser_session.active_tab_id, Some(tab_id.clone()));
+        let tab = authority
+            .tab(&tab_id)
+            .expect("completed task must retain its browser tab");
+        assert_eq!(
+            tab.lifecycle,
+            magi_browser_runtime::BrowserTabLifecycle::Ready
+        );
+        assert_eq!(tab.url, "about:blank");
     }
 
     #[tokio::test]
@@ -5329,7 +5725,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_workspace_session_selects_latest_visible_history() {
+    async fn bootstrap_workspace_session_preserves_explicit_draft_selection() {
         let event_bus = Arc::new(InMemoryEventBus::new(32));
         let session_store = Arc::new(SessionStore::default());
         let workspace_store = Arc::new(WorkspaceStore::default());
@@ -5397,17 +5793,18 @@ mod tests {
             )
             .await
             .expect("selected session snapshot should start");
+        session_store.clear_current_session();
 
         let bootstrap = state
             .bootstrap_dto_for_workspace_session(Some(workspace_id.as_str()), None)
             .expect("bootstrap should build");
 
-        assert_eq!(
+        assert!(bootstrap.current_session.is_none());
+        assert!(
             bootstrap
-                .current_session
-                .as_ref()
-                .map(|session| session.session_id.clone()),
-            Some(newer_session_id)
+                .sessions
+                .iter()
+                .any(|session| session.session_id == newer_session_id)
         );
         assert_eq!(bootstrap.sessions.len(), 2);
         assert!(
@@ -5478,21 +5875,10 @@ mod tests {
             .bootstrap_dto_for_workspace_session(Some(workspace_a.as_str()), Some(&session_b))
             .expect("bootstrap should build");
 
-        assert_eq!(
-            bootstrap
-                .current_session
-                .as_ref()
-                .map(|session| session.session_id.clone()),
-            Some(session_a.clone())
-        );
+        assert!(bootstrap.current_session.is_none());
         assert_eq!(bootstrap.sessions.len(), 1);
         assert_eq!(bootstrap.sessions[0].session_id, session_a);
-        assert!(
-            bootstrap
-                .timeline
-                .iter()
-                .all(|entry| entry.session_id == session_a)
-        );
+        assert!(bootstrap.timeline.is_empty());
     }
 
     #[tokio::test]

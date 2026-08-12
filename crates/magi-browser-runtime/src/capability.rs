@@ -31,10 +31,29 @@ pub enum BrowserToolKind {
     Screenshot,
     Tabs,
     Viewport,
+    WaitFor,
+    Hover,
+    Drag,
+    FillForm,
+    Dialog,
+    UploadFile,
+    ClickAt,
+    Evaluate,
+    Console,
+    Network,
+    Emulate,
+    Performance,
+    Lighthouse,
+    Screencast,
+    Heap,
+    Extensions,
+    ThirdParty,
+    WebMcp,
+    Pwa,
 }
 
 impl BrowserToolKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 28] = [
         Self::Navigate,
         Self::Snapshot,
         Self::Click,
@@ -44,6 +63,25 @@ impl BrowserToolKind {
         Self::Screenshot,
         Self::Tabs,
         Self::Viewport,
+        Self::WaitFor,
+        Self::Hover,
+        Self::Drag,
+        Self::FillForm,
+        Self::Dialog,
+        Self::UploadFile,
+        Self::ClickAt,
+        Self::Evaluate,
+        Self::Console,
+        Self::Network,
+        Self::Emulate,
+        Self::Performance,
+        Self::Lighthouse,
+        Self::Screencast,
+        Self::Heap,
+        Self::Extensions,
+        Self::ThirdParty,
+        Self::WebMcp,
+        Self::Pwa,
     ];
 
     pub fn name(self) -> &'static str {
@@ -57,14 +95,58 @@ impl BrowserToolKind {
             Self::Screenshot => "browser_screenshot",
             Self::Tabs => "browser_tabs",
             Self::Viewport => "browser_viewport",
+            Self::WaitFor => "browser_wait_for",
+            Self::Hover => "browser_hover",
+            Self::Drag => "browser_drag",
+            Self::FillForm => "browser_fill_form",
+            Self::Dialog => "browser_dialog",
+            Self::UploadFile => "browser_upload_file",
+            Self::ClickAt => "browser_click_at",
+            Self::Evaluate => "browser_evaluate",
+            Self::Console => "browser_console",
+            Self::Network => "browser_network",
+            Self::Emulate => "browser_emulate",
+            Self::Performance => "browser_performance",
+            Self::Lighthouse => "browser_lighthouse",
+            Self::Screencast => "browser_screencast",
+            Self::Heap => "browser_heap",
+            Self::Extensions => "browser_extensions",
+            Self::ThirdParty => "browser_third_party",
+            Self::WebMcp => "browser_webmcp",
+            Self::Pwa => "browser_pwa",
         }
     }
 
     pub fn catalog_access(self) -> BrowserToolAccess {
         match self {
-            Self::Navigate | Self::Snapshot | Self::Screenshot => BrowserToolAccess::Read,
-            Self::Tabs | Self::Viewport => BrowserToolAccess::Mixed,
-            Self::Click | Self::Type | Self::Press | Self::Scroll => BrowserToolAccess::Write,
+            Self::Navigate
+            | Self::Snapshot
+            | Self::Screenshot
+            | Self::WaitFor
+            | Self::Console
+            | Self::Network
+            | Self::Performance
+            | Self::Lighthouse
+            | Self::Heap => BrowserToolAccess::Read,
+            Self::Tabs
+            | Self::Viewport
+            | Self::Dialog
+            | Self::Emulate
+            | Self::Screencast
+            | Self::Extensions
+            | Self::ThirdParty
+            | Self::WebMcp
+            | Self::Pwa => BrowserToolAccess::Mixed,
+            Self::Click
+            | Self::Type
+            | Self::Press
+            | Self::Scroll
+            | Self::Hover
+            | Self::Drag
+            | Self::FillForm
+            | Self::UploadFile
+            | Self::ClickAt
+            | Self::Evaluate => BrowserToolAccess::Write,
         }
     }
 }

@@ -62,6 +62,7 @@ export interface CodeTabPayload {
 export interface BrowserTabPayload {
   browserSessionId: string;
   tabId: string;
+  agentOccupied: boolean;
   workspaceId: string;
   workspacePath?: string;
   sessionId: string;
@@ -85,6 +86,7 @@ export interface BrowserAuthorityTabProjection {
 export interface BrowserAuthoritySessionProjection {
   browserSessionId: string;
   activeTabId: string | null;
+  agentOccupied: boolean;
   tabs: BrowserAuthorityTabProjection[];
 }
 
@@ -642,6 +644,7 @@ export function openBrowserTab(
     {
       browserSessionId: normalizedBrowserSessionId,
       tabId: normalizedTabId,
+      agentOccupied: false,
       workspaceId,
       workspacePath: options.workspacePath?.trim() || undefined,
       sessionId,
@@ -738,6 +741,7 @@ export function synchronizeBrowserTabs(
       {
         browserSessionId,
         tabId: normalizedTabId,
+        agentOccupied: snapshot?.agentOccupied === true,
         workspaceId: normalizedWorkspaceId,
         workspacePath: normalizeWorkspaceId(workspacePath) || undefined,
         sessionId: normalizedSessionId,

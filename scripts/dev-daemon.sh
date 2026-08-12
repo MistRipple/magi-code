@@ -53,66 +53,30 @@ if [ "${MAGI_BROWSER_RUNTIME_MODE:-managed}" = "workspace" ]; then
 
   BROWSER_HOST_ENTRY="${MAGI_BROWSER_DEV_HOST_ENTRY:-$ROOT_DIR/browser-host/dist/index.cjs}"
   BROWSER_NODE_MODULES="$ROOT_DIR/browser-host/node_modules"
+  BROWSER_PLAYWRIGHT_VERSION="$(${MAGI_BROWSER_DEV_NODE:-node} -p "require('$ROOT_DIR/browser-host/package.json').dependencies['playwright-core']")"
+  BROWSER_EXPECTED_CHROMIUM_VERSION="$(${MAGI_BROWSER_DEV_NODE:-node} -e "const manifest = require('$BROWSER_NODE_MODULES/playwright-core/browsers.json'); const chromium = manifest.browsers.find((entry) => entry.name === 'chromium'); if (!chromium?.browserVersion) process.exit(1); process.stdout.write(chromium.browserVersion)")"
   BROWSER_CHROMIUM="${MAGI_BROWSER_DEV_CHROMIUM:-}"
-  if [ -z "$BROWSER_CHROMIUM" ]; then
-    BROWSER_RUNTIME_ROOT="${MAGI_STATE_ROOT:-$HOME/.magi}/runtimes/browser"
-    if ACTIVE_RUNTIME_CHROMIUM="$(${MAGI_BROWSER_DEV_NODE:-node} - "$BROWSER_RUNTIME_ROOT" <<'NODE'
-const fs = require('node:fs');
-const path = require('node:path');
-
-const root = path.resolve(process.argv[2]);
-const active = JSON.parse(fs.readFileSync(path.join(root, 'active.json'), 'utf8'));
-const runtimeVersion = active.runtime_version;
-if (typeof runtimeVersion !== 'string' || runtimeVersion.length === 0) process.exit(1);
-
-const installRoot = path.resolve(root, runtimeVersion);
-if (!installRoot.startsWith(`${root}${path.sep}`)) process.exit(1);
-const manifest = JSON.parse(fs.readFileSync(path.join(installRoot, 'manifest.json'), 'utf8'));
-if (manifest.runtime_version !== runtimeVersion) process.exit(1);
-
-const executablePath = manifest.chromium_executable_path;
-if (typeof executablePath !== 'string' || executablePath.length === 0) process.exit(1);
-const executable = path.resolve(installRoot, executablePath);
-if (!executable.startsWith(`${installRoot}${path.sep}`)) process.exit(1);
-if (!fs.statSync(executable, { throwIfNoEntry: false })?.isFile()) process.exit(1);
-process.stdout.write(executable);
-NODE
-    )"; then
-      BROWSER_CHROMIUM="$ACTIVE_RUNTIME_CHROMIUM"
-    fi
-  fi
   if [ -z "$BROWSER_CHROMIUM" ] && [ -d "$BROWSER_NODE_MODULES/playwright-core" ]; then
     PLAYWRIGHT_CHROMIUM="$(${MAGI_BROWSER_DEV_NODE:-node} -e "const { chromium } = require('$BROWSER_NODE_MODULES/playwright-core'); process.stdout.write(chromium.executablePath())")"
     if [ -f "$PLAYWRIGHT_CHROMIUM" ]; then
       BROWSER_CHROMIUM="$PLAYWRIGHT_CHROMIUM"
     fi
   fi
-  if [ -z "$BROWSER_CHROMIUM" ] && [ "$(uname -s)" = "Darwin" ]; then
-    for candidate in \
-      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-      "/Applications/Chromium.app/Contents/MacOS/Chromium"; do
-      if [ -f "$candidate" ]; then
-        BROWSER_CHROMIUM="$candidate"
-        break
-      fi
-    done
-  fi
-  if [ -z "$BROWSER_CHROMIUM" ]; then
-    for candidate in google-chrome-stable google-chrome chromium chromium-browser; do
-      if command -v "$candidate" >/dev/null 2>&1; then
-        BROWSER_CHROMIUM="$(command -v "$candidate")"
-        break
-      fi
-    done
-  fi
   if [ ! -f "$BROWSER_HOST_ENTRY" ] || [ ! -f "$BROWSER_CHROMIUM" ]; then
-    echo "workspace 模式缺少 Browser Host 或 Chromium：请设置 MAGI_BROWSER_DEV_HOST_ENTRY/MAGI_BROWSER_DEV_CHROMIUM。" >&2
+    echo "workspace 模式缺少与 Playwright $BROWSER_PLAYWRIGHT_VERSION 匹配的 Chromium。" >&2
+    echo "请执行 npm --prefix browser-host exec -- playwright-core install chromium，或显式设置 MAGI_BROWSER_DEV_CHROMIUM。" >&2
+    exit 1
+  fi
+  BROWSER_ACTUAL_CHROMIUM_VERSION="$("$BROWSER_CHROMIUM" --version | sed -E 's/[^0-9]*([0-9]+(\.[0-9]+){1,3}).*/\1/')"
+  if [ "${BROWSER_ACTUAL_CHROMIUM_VERSION%%.*}" != "${BROWSER_EXPECTED_CHROMIUM_VERSION%%.*}" ]; then
+    echo "workspace 模式 Chromium 协议版本不匹配：当前 $BROWSER_ACTUAL_CHROMIUM_VERSION，Playwright $BROWSER_PLAYWRIGHT_VERSION 需要 $BROWSER_EXPECTED_CHROMIUM_VERSION。" >&2
     exit 1
   fi
   DAEMON_ENV+=(
     "MAGI_BROWSER_RUNTIME_MODE=workspace"
     "MAGI_BROWSER_DEV_HOST_ENTRY=$BROWSER_HOST_ENTRY"
     "MAGI_BROWSER_DEV_CHROMIUM=$BROWSER_CHROMIUM"
+    "MAGI_BROWSER_PLAYWRIGHT_VERSION=$BROWSER_PLAYWRIGHT_VERSION"
   )
 elif [ "${MAGI_BROWSER_RUNTIME_MODE:-managed}" != "managed" ]; then
   echo "MAGI_BROWSER_RUNTIME_MODE 只能是 managed 或 workspace。" >&2

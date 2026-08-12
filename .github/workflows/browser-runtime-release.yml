@@ -167,7 +167,10 @@ jobs:
 
       - name: Browser Host 协议回归
         shell: bash
-        run: npm --prefix browser-host test
+        run: |
+          set -euo pipefail
+          chromium_executable="$(node -e "console.log(require('./browser-host/node_modules/playwright-core').chromium.executablePath())")"
+          MAGI_BROWSER_TEST_CHROMIUM="$chromium_executable" npm --prefix browser-host test
 
       - name: 准备独立运行组件
         shell: bash

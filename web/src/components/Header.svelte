@@ -3,13 +3,13 @@
   import { getState, getUnreadNotificationCount, messagesState } from '../stores/messages.svelte';
   import { showFeedback } from '../lib/notifications';
   import { ensureArray } from '../lib/utils';
-  import { vscode } from '../lib/vscode-bridge';
   import Icon from './Icon.svelte';
   import NotificationCenter from './NotificationCenter.svelte';
   import LanAccessPanel from './LanAccessPanel.svelte';
   import DesktopUpdateStatus from './DesktopUpdateStatus.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { getWebSidebarContext } from '../web/sidebar-context';
+  import { navigateSession, sessionNavigationState } from '../shared/session-navigation.svelte';
   import {
     rightPaneState,
     getRightPaneState,
@@ -32,6 +32,86 @@
   type HeaderPanel = 'notifications' | 'more' | 'lan';
   let activeHeaderPanel = $state<HeaderPanel | null>(null);
 
+  let headerBar: HTMLElement | null = $state(null);
+  let headerCenter: HTMLElement | null = $state(null);
+  let headerActions: HTMLElement | null = $state(null);
+  let sidebarToggle: HTMLButtonElement | null = $state(null);
+  let compactActions = $state(false);
+  let fullActionsWidth = 0;
+  let compactActionsWidthReduction = 0;
+  let headerLayoutFrame = 0;
+
+  const HEADER_COMPACT_RESTORE_HYSTERESIS_PX = 24;
+
+  function cssPixels(value: string): number {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function isViewportNarrow(): boolean {
+    return typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches;
+  }
+
+  function scheduleHeaderLayoutMeasurement() {
+    if (headerLayoutFrame || typeof requestAnimationFrame === 'undefined') return;
+    headerLayoutFrame = requestAnimationFrame(() => {
+      headerLayoutFrame = 0;
+      measureHeaderLayout();
+    });
+  }
+
+  function measureHeaderLayout() {
+    const viewportNarrow = isViewportNarrow();
+    if (!headerBar || !headerCenter || !headerActions || viewportNarrow) {
+      if (viewportNarrow && compactActions) {
+        compactActions = false;
+        compactActionsWidthReduction = 0;
+      }
+      return;
+    }
+
+    const headerStyle = getComputedStyle(headerBar);
+    const contentWidth = Math.max(
+      0,
+      headerBar.clientWidth
+        - cssPixels(headerStyle.paddingLeft)
+        - cssPixels(headerStyle.paddingRight),
+    );
+    const sidebarStyle = sidebarToggle ? getComputedStyle(sidebarToggle) : null;
+    const sidebarWidth = sidebarToggle
+      ? sidebarToggle.getBoundingClientRect().width + cssPixels(sidebarStyle?.marginRight ?? '0')
+      : 0;
+    const centerContent = headerCenter.firstElementChild;
+    const centerWidth = centerContent instanceof HTMLElement ? centerContent.scrollWidth : 0;
+    const actionsWidth = headerActions.scrollWidth;
+
+    if (!compactActions) {
+      fullActionsWidth = actionsWidth;
+      compactActionsWidthReduction = 0;
+    } else if (compactActionsWidthReduction === 0 && fullActionsWidth > actionsWidth) {
+      compactActionsWidthReduction = fullActionsWidth - actionsWidth;
+    }
+
+    const measuredFullActionsWidth = compactActions
+      ? actionsWidth + compactActionsWidthReduction
+      : (fullActionsWidth || actionsWidth);
+    const requiredFullWidth = sidebarWidth + centerWidth + measuredFullActionsWidth;
+    const shouldCompact = requiredFullWidth > contentWidth + 1;
+
+    if (shouldCompact && !compactActions) {
+      fullActionsWidth = actionsWidth;
+      compactActions = true;
+      return;
+    }
+
+    if (compactActions) {
+      const restoreWidth = requiredFullWidth + HEADER_COMPACT_RESTORE_HYSTERESIS_PX;
+      if (contentWidth >= restoreWidth) {
+        compactActions = false;
+      }
+    }
+  }
+
   // 只有“已有当前会话且该会话为空”时才禁止重复新建；草稿态不要求先绑定工作区。
   const hasCurrentSession = $derived.by(() => Boolean(messagesState.currentSessionId?.trim()));
   const unreadNotificationCount = $derived.by(() => getUnreadNotificationCount());
@@ -39,10 +119,12 @@
     ensureArray(appState.threadMessages).length === 0
   );
   const newSessionDisabled = $derived(
-    messagesState.sessionHydrating || (hasCurrentSession && isCurrentSessionEmpty)
+    sessionNavigationState.pending !== null
+      || messagesState.sessionHydrating
+      || (hasCurrentSession && isCurrentSessionEmpty)
   );
   const newSessionTitle = $derived(
-    messagesState.sessionHydrating
+    sessionNavigationState.pending !== null
       ? '正在打开新会话面板'
       : (hasCurrentSession && isCurrentSessionEmpty ? i18n.t('header.currentSessionEmpty') : i18n.t('header.newSession'))
   );
@@ -53,9 +135,10 @@
       source: 'session-management',
       duration: 1800,
     });
-    vscode.postMessage({
-      type: 'newSession',
-    });
+    const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
+    const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
+    if (!workspaceId || !workspacePath) return;
+    navigateSession({ kind: 'draft', workspaceId, workspacePath });
   }
 
   // 打开设置
@@ -95,19 +178,38 @@
     };
     window.addEventListener('pointerdown', closeHeaderPanel);
     window.addEventListener('keydown', closeHeaderPanelOnEscape);
+
+    scheduleHeaderLayoutMeasurement();
+
+    let resizeObserver: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      resizeObserver = new ResizeObserver(() => scheduleHeaderLayoutMeasurement());
+      if (headerBar) resizeObserver.observe(headerBar);
+      if (headerCenter) resizeObserver.observe(headerCenter);
+      if (headerCenter?.firstElementChild) resizeObserver.observe(headerCenter.firstElementChild);
+      if (headerActions) resizeObserver.observe(headerActions);
+      if (sidebarToggle) resizeObserver.observe(sidebarToggle);
+    }
+
     return () => {
       window.removeEventListener('pointerdown', closeHeaderPanel);
       window.removeEventListener('keydown', closeHeaderPanelOnEscape);
+      resizeObserver?.disconnect();
+      if (headerLayoutFrame) {
+        cancelAnimationFrame(headerLayoutFrame);
+        headerLayoutFrame = 0;
+      }
     };
   });
 
 </script>
 
-<header class="header-bar">
+<header class="header-bar" class:header-bar--compact={compactActions} bind:this={headerBar}>
   {#if webSidebar}
     <button
       type="button"
       class="header-sidebar-toggle"
+      bind:this={sidebarToggle}
       aria-label={i18n.t(webSidebar.hidden || (webSidebar.isDrawer && !webSidebar.drawerOpen) ? 'web.expandSidebar' : 'web.collapseSidebar')}
       title={i18n.t(webSidebar.hidden || (webSidebar.isDrawer && !webSidebar.drawerOpen) ? 'web.expandSidebar' : 'web.collapseSidebar')}
       onclick={() => webSidebar.toggle()}
@@ -115,12 +217,12 @@
       <Icon name="sidebar-toggle" size={14} />
     </button>
   {/if}
-  <div class="header-center">
+  <div class="header-center" bind:this={headerCenter}>
     {@render children?.()}
   </div>
 
   <!-- 右侧操作按钮 -->
-  <div class="header-actions">
+  <div class="header-actions" bind:this={headerActions}>
     <DesktopUpdateStatus />
     <button class="btn-icon header-action-btn" onclick={newSession} title={newSessionTitle} disabled={newSessionDisabled}>
       <Icon name="plus" size={14} />
@@ -239,6 +341,7 @@
   .header-center {
     display: flex;
     flex: 1;
+    min-width: 0;
     justify-content: center;
   }
 
@@ -373,6 +476,35 @@
   }
 
   .header-more-menu .header-mobile-menu-item {
+    display: none;
+  }
+
+  /* 中间工作区变窄时，按真实可用宽度收起低频入口。 */
+  .header-bar--compact .header-notification-btn,
+  .header-bar--compact .header-remote-btn,
+  .header-bar--compact .header-settings-btn {
+    display: none;
+  }
+
+  .header-bar--compact .header-more-wrapper {
+    display: inline-flex;
+  }
+
+  .header-bar--compact .header-more-unread-dot {
+    display: block;
+  }
+
+  .header-bar--compact .header-more-menu .header-mobile-menu-item {
+    display: flex;
+  }
+
+  .header-bar--compact .header-center {
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .header-bar--compact .header-center::-webkit-scrollbar {
     display: none;
   }
 

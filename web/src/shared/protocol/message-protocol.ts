@@ -119,8 +119,7 @@ export type DataMessageType =
   | 'workerConnectionTestResult'
   | 'workerSessionCreated'
   | 'workerSessionResumed'
-  | 'workspaceDraftStarted'
-  | 'workspaceSessionCleared'
+  | 'sessionNavigationFailed'
   | 'executionChainInterrupted'
   | 'messageCreated';
 

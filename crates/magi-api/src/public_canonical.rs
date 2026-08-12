@@ -494,4 +494,28 @@ mod tests {
             json!(["index.html", "styles.css"])
         );
     }
+
+    #[test]
+    fn public_canonical_browser_navigate_keeps_http_url() {
+        let mut item = canonical_tool_item();
+        let tool = item.tool.as_mut().expect("tool should exist");
+        tool.name = "browser_navigate".to_string();
+        tool.arguments = Some(json!({
+            "url": "https://cn.bing.com/search?q=magi-code",
+            "include_snapshot": true,
+        }));
+
+        let public = public_canonical_turn_item(item);
+        let arguments = public
+            .tool
+            .expect("public tool should exist")
+            .arguments
+            .expect("arguments should exist");
+
+        assert_eq!(
+            arguments["url"],
+            json!("https://cn.bing.com/search?q=magi-code")
+        );
+        assert_ne!(arguments["url"], json!("http[path]"));
+    }
 }

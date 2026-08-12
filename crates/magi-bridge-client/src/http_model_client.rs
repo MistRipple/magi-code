@@ -920,6 +920,7 @@ fn provider_stream_event_error(
         .and_then(Value::as_str)
         .filter(|message| !message.trim().is_empty())
         .unwrap_or("provider stream returned an error");
+    let normalized_message = message.to_ascii_lowercase();
     let transient = matches!(
         error_type,
         "overloaded_error"
@@ -927,7 +928,11 @@ fn provider_stream_event_error(
             | "server_error"
             | "timeout_error"
             | "service_unavailable"
-    );
+    ) || normalized_message.contains("overloaded")
+        || normalized_message.contains("server is busy")
+        || normalized_message.contains("servers are busy")
+        || normalized_message.contains("service unavailable")
+        || normalized_message.contains("temporarily unavailable");
     Some(BridgeClientError::CallFailed {
         layer: if transient {
             BridgeErrorLayer::Transport
@@ -4777,7 +4782,7 @@ mod tests {
                 content_type: "text/event-stream".to_string(),
                 response_text: concat!(
                     "event: error\n",
-                    "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"temporarily overloaded\"}}\n\n",
+                    "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
                 )
                 .to_string(),
             },

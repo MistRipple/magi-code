@@ -452,6 +452,11 @@ fn contains_empty_response_error(error: &str) -> bool {
 fn contains_retryable_transport_error(error: &str) -> bool {
     error.contains("桥接调用失败[transport]")
         || error.contains("provider transport failed")
+        || error.contains("overloaded")
+        || error.contains("server is busy")
+        || error.contains("servers are busy")
+        || error.contains("service unavailable")
+        || error.contains("temporarily unavailable")
         || error.contains("connection reset")
         || error.contains("connection aborted")
         || error.contains("connection closed")
@@ -606,6 +611,12 @@ mod tests {
         );
         assert_eq!(transport.code, "model_invocation_failed");
         assert!(transport.retryable_before_output);
+
+        let overloaded = classify_model_invocation_error(
+            "桥接调用失败[RemoteBusiness]: provider stream rejected request: Our servers are currently overloaded. Please try again later. (error_code=-32006)",
+        );
+        assert_eq!(overloaded.code, "model_invocation_failed");
+        assert!(overloaded.retryable_before_output);
 
         let invalid_request = classify_model_invocation_error(
             "桥接调用失败[RemoteBusiness]: provider rejected request (http_status=400)",

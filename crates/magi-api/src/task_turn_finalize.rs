@@ -1,4 +1,5 @@
 use crate::state::ApiState;
+use magi_browser_runtime::BrowserLeaseEndReason;
 use magi_conversation_runtime::session_writeback::SessionStatePersistCallback;
 use magi_core::{SessionId, TaskId, public_runtime_excerpt};
 use std::sync::{Arc, Condvar, Mutex};
@@ -200,6 +201,7 @@ pub fn finalize_background_session_task_turn_if_root_completed(
     session_id: &SessionId,
     root_task_id: &TaskId,
 ) -> bool {
+    release_terminal_browser_resources(state, session_id, root_task_id);
     let persist_session_state = session_state_persist_callback(state);
     let finalized = magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_completed(
         state.session_store.as_ref(),
@@ -227,6 +229,7 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
     root_task_id: &TaskId,
     runner_status: &str,
 ) -> bool {
+    release_terminal_browser_resources(state, session_id, root_task_id);
     let persist_session_state = session_state_persist_callback(state);
     let finalized = magi_conversation_runtime::session_turn_finalize::finalize_background_session_task_turn_if_root_terminal(
         state.session_store.as_ref(),
@@ -304,6 +307,29 @@ pub fn finalize_background_session_task_turn_if_root_terminal(
         schedule_next_queued_session_turn(state, session_id);
     }
     finalized
+}
+
+fn release_terminal_browser_resources(
+    state: &ApiState,
+    session_id: &SessionId,
+    root_task_id: &TaskId,
+) {
+    // Turn 终态只结束代理控制权。BrowserAuthority 中的会话、标签和当前 URL
+    // 属于用户可继续查看的任务结果，只有显式关闭操作才能销毁。
+    let report = state.cancel_execution_resources(
+        Some(session_id),
+        None,
+        None,
+        BrowserLeaseEndReason::TaskFinished,
+    );
+    if report.browser_lease_count > 0 {
+        tracing::debug!(
+            %session_id,
+            %root_task_id,
+            browser_lease_count = report.browser_lease_count,
+            "session turn entered terminal state, released browser leases"
+        );
+    }
 }
 
 fn schedule_next_queued_session_turn(state: &ApiState, session_id: &SessionId) {

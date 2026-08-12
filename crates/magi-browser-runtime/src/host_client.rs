@@ -31,6 +31,13 @@ type HostWebSocketSink = SplitSink<HostWebSocket, Message>;
 type PendingResponse =
     tokio::sync::oneshot::Sender<Result<BrowserHostCommandReply, BrowserHostClientError>>;
 
+const DEFAULT_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// 页面导航自身允许使用 60 秒，并且 Host 还需要在导航失败后停止加载、
+// 收口画面与页面状态。客户端必须给这些收口步骤留出独立余量，否则
+// 一个可恢复的 navigation timeout 会被错误改写成 Host disconnected。
+const NAVIGATION_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const LONG_RUNNING_BROWSER_HOST_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Clone, Debug)]
 pub struct BrowserHostCommandReply {
     pub response: BrowserHostResponseEnvelope,
@@ -93,7 +100,7 @@ impl BrowserHostClient {
             events,
             command_sequence: Arc::new(AtomicU64::new(1)),
             closed,
-            request_timeout: Duration::from_secs(30),
+            request_timeout: DEFAULT_BROWSER_HOST_REQUEST_TIMEOUT,
         };
         let handshake = tokio::time::timeout(handshake_timeout, handshake_receiver)
             .await
@@ -134,6 +141,7 @@ impl BrowserHostClient {
             UtcMillis::now().0,
             self.command_sequence.fetch_add(1, Ordering::Relaxed)
         ));
+        let request_timeout = request_timeout_for(&command, self.request_timeout);
         let envelope = BrowserHostRequestEnvelope {
             request_id: request_id.clone(),
             protocol_version: BrowserHostProtocolVersion::CURRENT,
@@ -158,7 +166,7 @@ impl BrowserHostClient {
                 .remove(&request_id);
             return Err(BrowserHostClientError::Transport(error.to_string()));
         }
-        match tokio::time::timeout(self.request_timeout, receiver).await {
+        match tokio::time::timeout(request_timeout, receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(BrowserHostClientError::Disconnected),
             Err(_) => {
@@ -178,6 +186,20 @@ impl BrowserHostClient {
         let _ = self.sink.lock().await.send(Message::Close(None)).await;
         fail_pending(&self.pending, BrowserHostClientError::Disconnected);
     }
+}
+
+fn request_timeout_for(command: &BrowserHostCommand, default: Duration) -> Duration {
+    if matches!(command, BrowserHostCommand::Navigate { .. }) {
+        return default.max(NAVIGATION_BROWSER_HOST_REQUEST_TIMEOUT);
+    }
+    if matches!(
+        command,
+        BrowserHostCommand::Devtools { operation, .. }
+            if matches!(operation.as_str(), "lighthouse" | "heap")
+    ) {
+        return default.max(LONG_RUNNING_BROWSER_HOST_REQUEST_TIMEOUT);
+    }
+    default
 }
 
 async fn read_host_messages(
@@ -423,5 +445,61 @@ pub enum BrowserHostClientError {
 impl From<serde_json::Error> for BrowserHostClientError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn devtools(operation: &str) -> BrowserHostCommand {
+        BrowserHostCommand::Devtools {
+            tab_id: magi_core::BrowserTabId::new("test-tab"),
+            control: None,
+            operation: operation.to_string(),
+            arguments: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn long_running_devtools_operations_have_a_dedicated_timeout() {
+        assert_eq!(
+            request_timeout_for(&devtools("lighthouse"), Duration::from_secs(30)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            request_timeout_for(&devtools("heap"), Duration::from_secs(30)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            request_timeout_for(&devtools("performance"), Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            request_timeout_for(&devtools("lighthouse"), Duration::from_secs(180)),
+            Duration::from_secs(180)
+        );
+    }
+
+    #[test]
+    fn navigation_requests_have_time_to_report_a_page_timeout() {
+        let navigation = BrowserHostCommand::Navigate {
+            tab_id: magi_core::BrowserTabId::new("test-tab"),
+            control: crate::BrowserHostControl::User { fence: 1 },
+            navigation: crate::BrowserNavigation::Url {
+                url: "https://example.com".to_string(),
+                handle_before_unload: None,
+                init_script: None,
+                timeout_ms: Some(60_000),
+            },
+        };
+        assert_eq!(
+            request_timeout_for(&navigation, Duration::from_secs(30)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            request_timeout_for(&navigation, Duration::from_secs(180)),
+            Duration::from_secs(180)
+        );
     }
 }

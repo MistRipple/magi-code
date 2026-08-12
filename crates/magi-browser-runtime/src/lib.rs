@@ -44,7 +44,9 @@ pub use host_client::{
     BrowserHostClient, BrowserHostClientError, BrowserHostCommandReply, BrowserHostIncomingEvent,
 };
 pub use host_protocol::*;
-pub use navigation::{BrowserNavigationUrlError, validate_browser_navigation_url};
+pub use navigation::{
+    BrowserNavigationUrlError, normalize_browser_page_state, validate_browser_navigation_url,
+};
 
 #[cfg(test)]
 mod tests;

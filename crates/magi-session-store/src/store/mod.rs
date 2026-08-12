@@ -332,6 +332,16 @@ impl SessionStore {
         Ok(with_session_message_count(session, &state.timeline))
     }
 
+    /// 进入未发送的新会话草稿。该操作只清除导航选择，不创建空会话，
+    /// 不写 timeline，也不改变任何既有会话的业务时间。
+    pub fn clear_current_session(&self) {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        state.current_session_id = None;
+    }
+
     pub fn mark_session_viewed_at(
         &self,
         session_id: &SessionId,

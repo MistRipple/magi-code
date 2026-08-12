@@ -2286,6 +2286,7 @@ fn stream_session_turn_round(
                     context_references: &request.context_references,
                     access_profile: request.access_profile,
                     browser_capability_revision,
+                    browser_execution_id: Some(&request.turn_id),
                     snapshot_session,
                     execution_group_id: Some(execution_group_id),
                     source_thread_id: orchestrator_thread_id,

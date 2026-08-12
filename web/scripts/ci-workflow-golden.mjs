@@ -103,6 +103,11 @@ assert.match(
 );
 assert.match(
   browserRuntimeReleaseWorkflow,
+  /Browser Host 协议回归[\s\S]*?MAGI_BROWSER_TEST_CHROMIUM=.*npm --prefix browser-host test/,
+  'Browser Runtime CI must execute the real Chromium Host regression instead of silently skipping it',
+);
+assert.match(
+  browserRuntimeReleaseWorkflow,
   /gh release upload "\$runtime_tag"[\s\S]*?dist\/browser-runtime\/release-\*\.json/,
   'versioned Runtime releases must stage feed manifests for desktop release promotion',
 );

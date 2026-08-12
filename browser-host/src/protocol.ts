@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = { major: 1, minor: 11 } as const;
+export const PROTOCOL_VERSION = { major: 1, minor: 14 } as const;
 export const DEFAULT_SNAPSHOT_LIMITS = {
   max_nodes: 400,
   max_text_bytes: 32 * 1024,
@@ -86,6 +86,7 @@ export type HostCommand =
         target: SnapshotTarget;
         text: string;
         replace: boolean;
+        submit_key?: string | null;
       };
     }
   | {
@@ -103,13 +104,23 @@ export type HostCommand =
       };
     }
   | {
+      type: "devtools";
+      payload: {
+        tab_id: string;
+        control?: HostControl | null;
+        operation: string;
+        arguments: Record<string, unknown>;
+      };
+    }
+  | {
       type: "screenshot";
       payload: {
         tab_id: string;
         target?: SnapshotTarget | null;
         clip?: NormalizedRect | null;
         full_page: boolean;
-        format: "png" | "jpeg";
+        format: "png" | "jpeg" | "webp";
+        quality?: number;
       };
     }
   | {
@@ -171,10 +182,21 @@ export interface HostLogicalViewport {
 export type HostDeviceType = "desktop" | "mobile";
 
 export type Navigation =
-  | { action: "url"; url: string }
-  | { action: "back" }
-  | { action: "forward" }
-  | { action: "reload" };
+  | {
+      action: "url";
+      url: string;
+      handle_before_unload?: "accept" | "dismiss";
+      init_script?: string;
+      timeout_ms?: number;
+    }
+  | { action: "back"; timeout_ms?: number }
+  | { action: "forward"; timeout_ms?: number }
+  | {
+      action: "reload";
+      ignore_cache?: boolean;
+      handle_before_unload?: "accept" | "dismiss";
+      timeout_ms?: number;
+    };
 
 export interface SnapshotLimits {
   max_nodes: number;
@@ -259,7 +281,8 @@ export type CommandResult =
   | { type: "snapshot"; payload: HostSnapshot }
   | { type: "binary_payload"; payload: BinaryPayload }
   | { type: "hit_test"; payload: HitTest }
-  | { type: "clipboard_text"; payload: ClipboardText };
+  | { type: "clipboard_text"; payload: ClipboardText }
+  | { type: "json"; payload: { value: unknown } };
 
 export interface ClipboardText {
   operation: "copy" | "cut";
@@ -362,7 +385,7 @@ export type HostEvent =
     }
   | {
       type: "dialog";
-      payload: { tab_id: string; dialog_type: string; message: string };
+      payload: { tab_id: string; dialog_id: number; dialog_type: string; message: string };
     }
   | {
       type: "download";
@@ -376,9 +399,20 @@ export type HostEvent =
     }
   | { type: "file_chooser"; payload: { tab_id: string } }
   | { type: "popup_blocked"; payload: { tab_id: string } }
+  | { type: "agent_cursor"; payload: AgentCursor }
   | { type: "screencast_frame"; payload: ScreencastFrame }
   | { type: "binary_payload_ready"; payload: BinaryPayload }
   | { type: "heartbeat"; payload: { monotonic_millis: number } };
+
+export type AgentCursorAction = "move" | "click" | "drag" | "type" | "scroll";
+
+export interface AgentCursor {
+  tab_id: string;
+  visible: boolean;
+  x: number | null;
+  y: number | null;
+  action: AgentCursorAction | null;
+}
 
 export interface HostHandshake {
   protocol_version: ProtocolVersion;

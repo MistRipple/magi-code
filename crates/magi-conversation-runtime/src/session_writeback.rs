@@ -1078,6 +1078,7 @@ fn append_session_tool_call_items_batch(
             context_references: &[],
             access_profile,
             browser_capability_revision,
+            browser_execution_id: None,
             snapshot_session,
             execution_group_id,
             source_thread_id,
@@ -1106,6 +1107,7 @@ pub(crate) struct SessionToolCallBatchContext<'a> {
     pub context_references: &'a [crate::context_reference::SessionContextReference],
     pub access_profile: magi_core::AccessProfile,
     pub browser_capability_revision: Option<u64>,
+    pub browser_execution_id: Option<&'a str>,
     pub snapshot_session: Option<Arc<SnapshotSession>>,
     pub execution_group_id: Option<String>,
     pub source_thread_id: &'a ThreadId,
@@ -1135,6 +1137,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         context_references,
         access_profile,
         browser_capability_revision,
+        browser_execution_id,
         snapshot_session,
         execution_group_id,
         source_thread_id,
@@ -1179,6 +1182,7 @@ pub(crate) fn append_session_tool_call_items_batch_with_context(
         context_references,
         access_profile,
         browser_capability_revision,
+        browser_execution_id,
         source_thread_id,
     };
     let tool_results =
@@ -1322,6 +1326,7 @@ struct SessionToolExecutionContext<'a> {
     context_references: &'a [crate::context_reference::SessionContextReference],
     access_profile: magi_core::AccessProfile,
     browser_capability_revision: Option<u64>,
+    browser_execution_id: Option<&'a str>,
     source_thread_id: &'a ThreadId,
 }
 
@@ -1500,6 +1505,7 @@ fn execute_session_turn_tool_call(
             context_references: &[],
             access_profile,
             browser_capability_revision: None,
+            browser_execution_id: None,
             source_thread_id: &source_thread_id,
         },
         tool_call,
@@ -1526,6 +1532,7 @@ fn execute_session_turn_tool_call_scoped(
         context_references,
         access_profile,
         browser_capability_revision,
+        browser_execution_id,
         source_thread_id,
     } = context;
     if let Some(canonical) = BuiltinToolName::from_name(tool_call.function.name.as_str())
@@ -1655,6 +1662,7 @@ fn execute_session_turn_tool_call_scoped(
                 access_profile,
                 working_directory: workspace_root_path.cloned(),
                 browser_capability_revision,
+                browser_execution_id: browser_execution_id.map(str::to_string),
             },
             workspace_root_path
                 .as_ref()
@@ -1740,6 +1748,7 @@ fn execute_session_turn_tool_call_scoped(
             access_profile: tool_policy.access_profile,
             working_directory: workspace_root_path.cloned(),
             browser_capability_revision,
+            browser_execution_id: browser_execution_id.map(str::to_string),
         },
         &tool_policy,
         &progress_callback,
@@ -3633,6 +3642,7 @@ mod tests {
                 context_references: &[],
                 access_profile: magi_core::AccessProfile::Restricted,
                 browser_capability_revision: None,
+                browser_execution_id: None,
                 snapshot_session: None,
                 execution_group_id: None,
                 source_thread_id: &thread_id,
@@ -3690,6 +3700,7 @@ mod tests {
                 context_references: &[],
                 access_profile: magi_core::AccessProfile::Restricted,
                 browser_capability_revision: None,
+                browser_execution_id: None,
                 snapshot_session: None,
                 execution_group_id: None,
                 source_thread_id: &thread_id,
@@ -3787,6 +3798,7 @@ mod tests {
                 context_references: &[],
                 access_profile: magi_core::AccessProfile::Restricted,
                 browser_capability_revision: None,
+                browser_execution_id: None,
                 snapshot_session: None,
                 execution_group_id: None,
                 source_thread_id: &thread_id,

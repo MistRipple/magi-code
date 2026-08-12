@@ -207,6 +207,31 @@ fn selecting_current_session_is_durable_without_changing_business_history() {
 }
 
 #[test]
+fn clearing_current_session_is_durable_without_changing_business_history() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-clear-current");
+    store
+        .create_session(session_id.clone(), "Current")
+        .expect("session should create");
+    let timeline_before =
+        serde_json::to_value(store.timeline()).expect("timeline should serialize");
+
+    store.clear_current_session();
+
+    assert!(store.current_session().is_none());
+    assert_eq!(
+        serde_json::to_value(store.timeline()).expect("timeline should serialize"),
+        timeline_before
+    );
+    let restored = SessionStore::from_persisted_parts(
+        store.durable_state(),
+        SessionExecutionSidecarStoreState::default(),
+    );
+    assert!(restored.current_session().is_none());
+    assert!(restored.session(&session_id).is_some());
+}
+
+#[test]
 fn rename_session_validates_title_and_skips_noop_history() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-rename-validation");

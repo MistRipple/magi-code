@@ -17,6 +17,9 @@ import { PROTOCOL_VERSION } from "./protocol";
 
 const MAX_COMMAND_BYTES = 2 * 1024 * 1024;
 const HEARTBEAT_INTERVAL_MILLIS = 2_000;
+// 控制响应和实时画面共享 Host WebSocket。画面只能丢帧，不能让图片
+// 在发送缓冲中排队，否则后续导航、快照和交互响应会被图片阻塞。
+const MAX_SCREENCAST_BUFFERED_BYTES = 16 * 1024 * 1024;
 
 export interface BrowserHostServerConfig extends BrowserHostConfig {
   bindHost: string;
@@ -45,9 +48,19 @@ export async function startBrowserHostServer(
       };
       client.send(JSON.stringify(envelope));
     },
-    emitBinary(payload: Buffer) {
-      if (!client || client.readyState !== WebSocket.OPEN) return;
+    emitScreencast(event: HostEvent, payload: Buffer) {
+      if (!client || client.readyState !== WebSocket.OPEN) return false;
+      if (client.bufferedAmount > MAX_SCREENCAST_BUFFERED_BYTES) return false;
+      const envelope: EventEnvelope = {
+        protocol_version: PROTOCOL_VERSION,
+        sequence: ++eventSequence,
+        event,
+      };
+      // 元数据和二进制必须作为一对发送；丢弃时整帧丢弃，避免 Rust 端
+      // 的二进制队列与事件队列错位。
+      client.send(JSON.stringify(envelope));
       client.send(payload, { binary: true });
+      return true;
     },
   };
   const host = new BrowserHost(config, transport);
@@ -105,13 +118,14 @@ export async function startBrowserHostServer(
         websocket.close(1003, "binary client messages are not supported");
         return;
       }
+      const encodedRequest = data.toString();
       let request: RequestEnvelope;
       try {
-        request = parseRequest(data.toString());
+        request = parseRequest(encodedRequest);
       } catch (error) {
         websocket.send(
           JSON.stringify(
-            failedResponse("invalid-request", normalizeError(error, false)),
+            failedResponse(requestIdFromInvalidRequest(encodedRequest), normalizeError(error, false)),
           ),
         );
         return;
@@ -229,6 +243,10 @@ function commandQueueKey(command: HostCommand): string | null {
     case "stop_screencast":
     case "user_input":
       return command.payload.tab_id;
+    case "devtools":
+      // 对话框处理必须绕过标签页动作队列。点击或导航可能一直等待 Chromium
+      // 收到接受或取消指令；若把恢复命令排在该动作之后，会让标签页死锁。
+      return command.payload.operation === "dialog" ? null : command.payload.tab_id;
     case "ping":
     case "update_control":
     case "shutdown":
@@ -294,6 +312,7 @@ function isHostCommand(value: unknown): value is HostCommand {
       "type",
       "press",
       "scroll",
+      "devtools",
       "screenshot",
       "hit_test",
       "start_screencast",
@@ -303,6 +322,17 @@ function isHostCommand(value: unknown): value is HostCommand {
       "shutdown",
     ].includes(type)
   );
+}
+
+function requestIdFromInvalidRequest(value: string): string {
+  try {
+    const request = JSON.parse(value) as { request_id?: unknown };
+    return typeof request.request_id === "string" && request.request_id
+      ? request.request_id
+      : "invalid-request";
+  } catch {
+    return "invalid-request";
+  }
 }
 
 function authorized(request: IncomingMessage, expectedToken: string): boolean {
@@ -381,8 +411,7 @@ export function configFromEnvironment(
     chromiumExecutable: resolve(required("MAGI_BROWSER_CHROMIUM_EXECUTABLE")),
     runtimeVersion: required("MAGI_BROWSER_RUNTIME_VERSION"),
     hostVersion: environment.MAGI_BROWSER_HOST_VERSION?.trim() || "0.1.0",
-    playwrightVersion:
-      environment.MAGI_BROWSER_PLAYWRIGHT_VERSION?.trim() || "1.58.2",
+    playwrightVersion: required("MAGI_BROWSER_PLAYWRIGHT_VERSION"),
     runtimeEpoch,
     headless: environment.MAGI_BROWSER_HEADLESS !== "0",
     deviceScaleFactor,

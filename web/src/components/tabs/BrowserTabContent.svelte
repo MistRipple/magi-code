@@ -2,6 +2,10 @@
   import { onMount, tick, untrack } from 'svelte';
   import Icon from '../Icon.svelte';
   import { i18n } from '../../stores/i18n.svelte';
+  import {
+    automaticBrowserViewport,
+    normalizeBrowserViewportSize,
+  } from '../../lib/browser-viewport';
   import { normalizeExternalWebUrl, openExternalWebUrl } from '../../lib/external-link';
   import {
     browserAnnotationArtifactUrl,
@@ -55,7 +59,7 @@
   let reconnectTimer: number | null = null;
   let refreshGeneration = 0;
   let refreshInFlightKey = '';
-  let canvas: HTMLCanvasElement | undefined;
+  let frameImage: HTMLImageElement | undefined;
   let viewportElement: HTMLDivElement | undefined;
   interface FrameMetadata {
     frameSequence: number;
@@ -65,8 +69,30 @@
     surfaceWidth: number;
     surfaceHeight: number;
   }
+  type AgentCursorAction = 'move' | 'click' | 'drag' | 'type' | 'scroll';
+  interface AgentCursorState {
+    x: number;
+    y: number;
+    action: AgentCursorAction;
+    revision: number;
+  }
+  function isAgentCursorAction(value: unknown): value is AgentCursorAction {
+    return value === 'move'
+      || value === 'click'
+      || value === 'drag'
+      || value === 'type'
+      || value === 'scroll';
+  }
   type BrowserChannelServerMessage =
+    | { type: 'ready' }
     | ({ type: 'frame' } & FrameMetadata)
+    | {
+      type: 'agent_cursor';
+      visible: boolean;
+      x: number | null;
+      y: number | null;
+      action: AgentCursorAction | null;
+    }
     | { type: 'error'; message: string }
     | { type: 'page_suspended' }
     | { type: 'clipboard_text'; operation: 'copy' | 'cut'; text: string };
@@ -79,12 +105,17 @@
   let frameDecoderActive = false;
   let frameDecoderGeneration = 0;
   let renderedFrameMetadata = $state<FrameMetadata | null>(null);
+  let renderedFrameUrl = $state('');
+  let renderedFrameObjectUrl = '';
+  let frameSurface: HTMLDivElement | undefined;
+  let agentCursor = $state<AgentCursorState | null>(null);
+  let agentCursorRevision = 0;
   let viewportSize = $state({ width: 0, height: 0 });
   let viewportResizeTimer: number | null = null;
   let viewportSyncInFlight = false;
   let viewportBindingGeneration = 0;
-  let pendingViewportSize = { width: 0, height: 0 };
-  let lastRequestedViewportSize = { width: 0, height: 0 };
+  let pendingViewportSurface = { width: 0, height: 0 };
+  let lastRequestedViewportSurface = { width: 0, height: 0 };
   let lastReadyViewportTabId = '';
   let localViewportMode = $state<BrowserViewportMode>('auto');
   let localViewport = $state({
@@ -274,22 +305,24 @@
     queuedFrame = null;
     frameDecoderGeneration += 1;
     renderedFrameMetadata = null;
+    releaseRenderedFrame();
+    agentCursor = null;
     annotationDrag = null;
     pendingAnnotation = null;
     pendingAnnotationComment = '';
+  }
+
+  function releaseRenderedFrame(): void {
+    const objectUrl = renderedFrameObjectUrl;
+    renderedFrameObjectUrl = '';
+    renderedFrameUrl = '';
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
   }
 
   function clearViewportResizeTimer(): void {
     if (viewportResizeTimer === null) return;
     window.clearTimeout(viewportResizeTimer);
     viewportResizeTimer = null;
-  }
-
-  function normalizedViewportSize(width: number, height: number): { width: number; height: number } {
-    return {
-      width: Math.min(7_680, Math.max(320, Math.round(width))),
-      height: Math.min(4_320, Math.max(240, Math.round(height))),
-    };
   }
 
   function scheduleViewportSync(): void {
@@ -327,9 +360,9 @@
       || tab.lifecycle !== 'ready'
     ) return;
     if (!viewportSize.width || !viewportSize.height) return;
-    const nextViewportSize = normalizedViewportSize(viewportSize.width, viewportSize.height);
-    if (!force && sameViewportSize(lastRequestedViewportSize, nextViewportSize)) return;
-    pendingViewportSize = nextViewportSize;
+    const nextViewportSize = normalizeBrowserViewportSize(viewportSize.width, viewportSize.height);
+    if (!force && sameViewportSize(lastRequestedViewportSurface, nextViewportSize)) return;
+    pendingViewportSurface = nextViewportSize;
     scheduleViewportSync();
   }
 
@@ -339,7 +372,7 @@
     if (!channelConnected) return;
     const tab = activeTab;
     const bindingGeneration = viewportBindingGeneration;
-    const requested = pendingViewportSize;
+    const requested = pendingViewportSurface;
     if (
       !tab
       || tab.lifecycle !== 'ready'
@@ -349,25 +382,28 @@
     ) {
       return;
     }
-    if (
-      localViewportMode === 'auto'
-      && localViewport.width === requested.width
-      && localViewport.height === requested.height
-    ) {
-      lastRequestedViewportSize = requested;
-      return;
-    }
     viewportSyncInFlight = true;
     let applied = false;
     try {
+      const viewport = automaticBrowserViewport(requested);
+      const previousDeviceType = localViewport.deviceType;
       const updated = await setBrowserTabViewport(tab.tabId, {
         action: 'sync',
-        ...requested,
+        width: viewport.width,
+        height: viewport.height,
+        surfaceWidth: requested.width,
+        surfaceHeight: requested.height,
         controllerId: viewportControllerId,
       });
       if (bindingGeneration !== viewportBindingGeneration || tabId !== tab.tabId) return;
       applyViewportUpdate(updated);
-      lastRequestedViewportSize = requested;
+      await reloadAfterDeviceTypeChange(
+        tab,
+        previousDeviceType,
+        viewport.deviceType,
+        bindingGeneration,
+      );
+      lastRequestedViewportSurface = requested;
       annotationDrag = null;
       pendingAnnotation = null;
       pendingAnnotationComment = '';
@@ -380,11 +416,30 @@
       viewportSyncInFlight = false;
       if (
         applied
-        && !sameViewportSize(requested, pendingViewportSize)
+        && !sameViewportSize(requested, pendingViewportSurface)
       ) {
         scheduleViewportSync();
       }
     }
+  }
+
+  async function reloadAfterDeviceTypeChange(
+    tab: BrowserTabSnapshot,
+    previousDeviceType: BrowserDeviceType,
+    nextDeviceType: BrowserDeviceType,
+    bindingGeneration: number,
+  ): Promise<void> {
+    if (previousDeviceType === nextDeviceType) return;
+    const updated = await navigateBrowserTab(
+      tab.tabId,
+      'reload',
+      undefined,
+      viewportControllerId,
+    );
+    if (bindingGeneration !== viewportBindingGeneration || tabId !== tab.tabId) return;
+    address = updated.url;
+    lastObservedUrl = updated.url;
+    await refreshSession();
   }
 
   function applyViewportUpdate(updated: BrowserTabSnapshot): void {
@@ -414,7 +469,7 @@
   ): void {
     if (!Number.isFinite(width) || !Number.isFinite(height)) return;
     if (width < 320 || width > 7_680 || height < 240 || height > 4_320) return;
-    const requested = normalizedViewportSize(width, height);
+    const requested = normalizeBrowserViewportSize(width, height);
     const deviceType = deviceTypeForWidth(requested.width);
     pendingCustomViewport = { ...requested, deviceType };
     clearCustomViewportResizeTimer();
@@ -443,7 +498,8 @@
     ) return;
     customViewportSyncInFlight = true;
     try {
-      const surface = normalizedViewportSize(viewportSize.width, viewportSize.height);
+      const surface = normalizeBrowserViewportSize(viewportSize.width, viewportSize.height);
+      const previousDeviceType = localViewport.deviceType;
       const updated = await setBrowserTabViewport(tab.tabId, {
         action: 'set',
         mode: 'fixed',
@@ -462,8 +518,14 @@
         height: requested.height,
         deviceType: requested.deviceType,
       };
-      lastRequestedViewportSize = surface;
-      pendingViewportSize = surface;
+      await reloadAfterDeviceTypeChange(
+        tab,
+        previousDeviceType,
+        requested.deviceType,
+        bindingGeneration,
+      );
+      lastRequestedViewportSurface = surface;
+      pendingViewportSurface = surface;
       annotationDrag = null;
       pendingAnnotation = null;
       pendingAnnotationComment = '';
@@ -485,27 +547,36 @@
 
   function useAutomaticViewport(): void {
     if (!viewportSize.width || !viewportSize.height) return;
-    const requested = normalizedViewportSize(viewportSize.width, viewportSize.height);
+    const requested = normalizeBrowserViewportSize(viewportSize.width, viewportSize.height);
+    const viewport = automaticBrowserViewport(requested);
     const tab = activeTab;
     const bindingGeneration = viewportBindingGeneration;
     if (!tab || busy) return;
     cancelPendingCustomViewport();
     viewportMenuOpen = false;
     void run(async () => {
+      const previousDeviceType = localViewport.deviceType;
       const updated = await setBrowserTabViewport(tab.tabId, {
         action: 'set',
         mode: 'auto',
-        ...requested,
+        width: viewport.width,
+        height: viewport.height,
         surfaceWidth: requested.width,
         surfaceHeight: requested.height,
-        deviceType: deviceTypeForWidth(requested.width),
+        deviceType: viewport.deviceType,
         controllerId: viewportControllerId,
       });
       if (bindingGeneration !== viewportBindingGeneration || tabId !== tab.tabId) return;
       applyViewportUpdate(updated);
       localViewportMode = 'auto';
-      lastRequestedViewportSize = requested;
-      pendingViewportSize = requested;
+      await reloadAfterDeviceTypeChange(
+        tab,
+        previousDeviceType,
+        viewport.deviceType,
+        bindingGeneration,
+      );
+      lastRequestedViewportSurface = requested;
+      pendingViewportSurface = requested;
       annotationDrag = null;
       pendingAnnotation = null;
       pendingAnnotationComment = '';
@@ -613,36 +684,38 @@
       || !channelEligible(tabId)
     ) return;
     if (!viewportSize.width || !viewportSize.height) return;
-    const initialViewport = normalizedViewportSize(viewportSize.width, viewportSize.height);
+    const initialSurface = normalizeBrowserViewportSize(viewportSize.width, viewportSize.height);
+    const initialViewport = automaticBrowserViewport(initialSurface);
     const next = new WebSocket(browserChannelUrl(
       tabId,
       viewportControllerId,
       initialViewport,
+      initialSurface,
     ));
     next.binaryType = 'arraybuffer';
     socket = next;
     next.onopen = () => {
       if (socket !== next || channelGeneration !== generation) return;
       reconnectAttempt = 0;
-      channelConnected = true;
       channelDisconnected = false;
-      localViewportMode = 'auto';
-      localViewport = {
-        ...initialViewport,
-        deviceType: deviceTypeForWidth(initialViewport.width),
-      };
-      lastRequestedViewportSize = initialViewport;
-      pendingViewportSize = initialViewport;
-      // WebSocket 建立期间父容器仍可能发生一次布局变化。以最新尺寸复核，
-      // 相同尺寸不会发请求，变化时只更新当前物理 View。
-      scheduleCurrentPanelViewport();
     };
     next.onmessage = (event) => {
       if (socket !== next || channelGeneration !== generation) return;
       if (typeof event.data === 'string') {
         try {
           const message = JSON.parse(event.data) as BrowserChannelServerMessage;
-          if (message.type === 'frame') {
+          if (message.type === 'ready') {
+            channelConnected = true;
+            channelDisconnected = false;
+            localViewportMode = 'auto';
+            localViewport = {
+              ...initialViewport,
+            };
+            lastRequestedViewportSurface = initialSurface;
+            pendingViewportSurface = initialSurface;
+            // 服务端完成 RestorePage 与 screencast 订阅后才允许面板发起视口和输入请求。
+            scheduleCurrentPanelViewport();
+          } else if (message.type === 'frame') {
             const frameSequence = Number(message.frameSequence);
             const navigationRevision = Number(message.navigationRevision);
             const width = Number(message.width);
@@ -667,11 +740,32 @@
               surfaceWidth,
               surfaceHeight,
             };
+          } else if (message.type === 'agent_cursor') {
+            if (!message.visible) {
+              agentCursor = null;
+              return;
+            }
+            const x = Number(message.x);
+            const y = Number(message.y);
+            if (
+              !Number.isFinite(x) || x < 0 || x > 1
+              || !Number.isFinite(y) || y < 0 || y > 1
+              || !isAgentCursorAction(message.action)
+            ) {
+              throw new Error('invalid browser agent cursor event');
+            }
+            agentCursor = {
+              x,
+              y,
+              action: message.action,
+              revision: ++agentCursorRevision,
+            };
           } else if (message.type === 'error') {
             error = message.message?.trim() || i18n.t('browser.error.channelDisconnected');
           } else if (message.type === 'page_suspended') {
             channelConnected = false;
             channelDisconnected = false;
+            agentCursor = null;
             if (snapshot) {
               snapshot = {
                 ...snapshot,
@@ -690,6 +784,7 @@
           }
         } catch {
           pendingFrameMetadata = null;
+          agentCursor = null;
           error = i18n.t('browser.error.channelDisconnected');
           channelConnected = false;
           channelDisconnected = true;
@@ -707,12 +802,14 @@
     };
     next.onerror = () => {
       if (socket !== next || channelGeneration !== generation) return;
+      agentCursor = null;
       channelConnected = false;
       channelDisconnected = true;
     };
     next.onclose = () => {
       if (socket === next) socket = null;
       if (channelTabId !== tabId || channelGeneration !== generation) return;
+      agentCursor = null;
       channelConnected = false;
       channelDisconnected = true;
       scheduleReconnect(tabId, generation);
@@ -750,25 +847,30 @@
     metadata: FrameMetadata,
     generation: number,
   ): Promise<void> {
-    let image: ImageBitmap;
+    const objectUrl = URL.createObjectURL(new Blob([bytes], { type: 'image/jpeg' }));
+    const image = new Image();
+    image.decoding = 'async';
+    image.src = objectUrl;
     try {
-      image = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
+      await image.decode();
     } catch {
+      URL.revokeObjectURL(objectUrl);
       return;
     }
     if (
       generation !== frameDecoderGeneration
-      || !canvas
+      || !frameImage
       || (renderedFrameMetadata?.frameSequence ?? -1) >= metadata.frameSequence
     ) {
-      image.close();
+      URL.revokeObjectURL(objectUrl);
       return;
     }
-    canvas.width = image.width;
-    canvas.height = image.height;
-    canvas.getContext('2d')?.drawImage(image, 0, 0);
-    image.close();
+    const previousObjectUrl = renderedFrameObjectUrl;
+    renderedFrameObjectUrl = objectUrl;
+    renderedFrameUrl = objectUrl;
     renderedFrameMetadata = metadata;
+    await tick();
+    if (previousObjectUrl) URL.revokeObjectURL(previousObjectUrl);
     if (pendingAnnotation && pendingAnnotation.navigationRevision !== metadata.navigationRevision) {
       pendingAnnotation = null;
       pendingAnnotationComment = '';
@@ -794,8 +896,8 @@
       customViewportWidth = 390;
       customViewportHeight = 844;
       lastReadyViewportTabId = '';
-      pendingViewportSize = { width: 0, height: 0 };
-      lastRequestedViewportSize = { width: 0, height: 0 };
+      pendingViewportSurface = { width: 0, height: 0 };
+      lastRequestedViewportSurface = { width: 0, height: 0 };
       clearViewportResizeTimer();
       clearCustomViewportResizeTimer();
       pendingCustomViewport = null;
@@ -889,7 +991,7 @@
 
   function navigate(action: 'url' | 'back' | 'forward' | 'reload'): void {
     const tab = activeTab;
-    if (!tab) return;
+    if (!tab || !channelConnected) return;
     void run(async () => {
       const updated = await navigateBrowserTab(
         tab.tabId,
@@ -905,7 +1007,7 @@
 
   function toggleMarking(): void {
     const tab = activeTab;
-    if (!tab) return;
+    if (!tab || !channelConnected) return;
     marking = !marking;
     annotationDrag = null;
     pendingAnnotation = null;
@@ -928,6 +1030,14 @@
       availableHeight / frame.surfaceHeight,
     );
     return `width: ${Math.max(1, Math.round(frame.surfaceWidth * scale))}px; height: ${Math.max(1, Math.round(frame.surfaceHeight * scale))}px;`;
+  }
+
+  function isFrameSurfaceTarget(event: Event): boolean {
+    return event.target === frameSurface || event.target === frameImage;
+  }
+
+  function agentCursorStyle(cursor: AgentCursorState): string {
+    return `left: ${cursor.x * 100}%; top: ${cursor.y * 100}%;`;
   }
 
   function fixedPresetSelected(mode: (typeof VIEWPORT_DEVICE_MODES)[number]): boolean {
@@ -1079,7 +1189,7 @@
 
   function captureScreenshotForMessage(): void {
     const tab = activeTab;
-    if (!tab) return;
+    if (!tab || !channelConnected) return;
     void run(async () => {
       const response = await fetch(browserScreenshotUrl(tab.tabId, viewportControllerId), {
         method: 'POST',
@@ -1108,8 +1218,8 @@
 
   function framePoint(event: PointerEvent | WheelEvent): { x: number; y: number } | null {
     const frame = renderedFrameMetadata;
-    if (!canvas || !frame) return null;
-    const rect = canvas.getBoundingClientRect();
+    if (!frameSurface || !frame) return null;
+    const rect = frameSurface.getBoundingClientRect();
     if (!rect.width || !rect.height) return null;
     return {
       x: Math.max(0, Math.min(frame.width, (event.clientX - rect.left) * frame.width / rect.width)),
@@ -1118,7 +1228,7 @@
   }
 
   function sendInput(event: Record<string, unknown>): void {
-    if (socket?.readyState !== WebSocket.OPEN) return;
+    if (!channelConnected || socket?.readyState !== WebSocket.OPEN) return;
     socket.send(JSON.stringify({ type: 'user_input', event }));
   }
 
@@ -1128,16 +1238,16 @@
       event.preventDefault();
       if (!point) return;
       if (type === 'mouse_down') {
-        canvas?.setPointerCapture(event.pointerId);
+        frameSurface?.setPointerCapture(event.pointerId);
         annotationDrag = { pointerId: event.pointerId, start: point, current: point };
       } else if (type === 'mouse_move' && annotationDrag?.pointerId === event.pointerId) {
         annotationDrag = { ...annotationDrag, current: point };
       } else if (type === 'mouse_up' && annotationDrag?.pointerId === event.pointerId) {
         const drag = annotationDrag;
         annotationDrag = null;
-        if (canvas?.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+        if (frameSurface?.hasPointerCapture(event.pointerId)) frameSurface.releasePointerCapture(event.pointerId);
         const frameWidth = renderedFrameMetadata?.width ?? 0;
-        const displayRect = canvas?.getBoundingClientRect();
+        const displayRect = frameSurface?.getBoundingClientRect();
         const threshold = displayRect?.width
           ? 6 * frameWidth / displayRect.width
           : 6;
@@ -1150,7 +1260,7 @@
       return;
     }
     if (!point) return;
-    if (type === 'mouse_down') canvas?.focus();
+    if (type === 'mouse_down') frameSurface?.focus();
     sendInput({
       type,
       ...point,
@@ -1216,7 +1326,7 @@
   function cancelAnnotationDrag(event: PointerEvent): void {
     if (annotationDrag?.pointerId !== event.pointerId) return;
     annotationDrag = null;
-    if (canvas?.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+    if (frameSurface?.hasPointerCapture(event.pointerId)) frameSurface.releasePointerCapture(event.pointerId);
   }
 
   function annotationRect(annotation: BrowserTabSnapshot['annotations'][number]): {
@@ -1250,13 +1360,13 @@
 
 <section class="browser-pane" aria-label={i18n.t('browser.pane.label')}>
   <div class="browser-toolbar">
-    <button type="button" class="icon-button flip" onclick={() => navigate('back')} disabled={!activeTab || busy} title={i18n.t('browser.navigation.back')} aria-label={i18n.t('browser.navigation.back')}>
+    <button type="button" class="icon-button flip" onclick={() => navigate('back')} disabled={!activeTab || !channelConnected || busy} title={i18n.t('browser.navigation.back')} aria-label={i18n.t('browser.navigation.back')}>
       <Icon name="chevron-right" size={13} />
     </button>
-    <button type="button" class="icon-button" onclick={() => navigate('forward')} disabled={!activeTab || busy} title={i18n.t('browser.navigation.forward')} aria-label={i18n.t('browser.navigation.forward')}>
+    <button type="button" class="icon-button" onclick={() => navigate('forward')} disabled={!activeTab || !channelConnected || busy} title={i18n.t('browser.navigation.forward')} aria-label={i18n.t('browser.navigation.forward')}>
       <Icon name="chevron-right" size={13} />
     </button>
-    <button type="button" class="icon-button" onclick={() => navigate('reload')} disabled={!activeTab || busy} title={i18n.t('browser.navigation.reload')} aria-label={i18n.t('browser.navigation.reload')}>
+    <button type="button" class="icon-button" onclick={() => navigate('reload')} disabled={!activeTab || !channelConnected || busy} title={i18n.t('browser.navigation.reload')} aria-label={i18n.t('browser.navigation.reload')}>
       <Icon name="refresh" size={13} />
     </button>
     <form class="address-form" onsubmit={(event) => { event.preventDefault(); navigate('url'); }}>
@@ -1264,14 +1374,14 @@
         bind:value={address}
         aria-label={i18n.t('browser.navigation.address')}
         spellcheck="false"
-        disabled={!activeTab || busy}
+        disabled={!activeTab || !channelConnected || busy}
         onkeydown={(event) => {
           if (event.key !== 'Enter') return;
           event.preventDefault();
           navigate('url');
         }}
       />
-      <button type="submit" class="address-submit" disabled={!activeTab || busy} title={i18n.t('browser.navigation.go')} aria-label={i18n.t('browser.navigation.go')}>
+      <button type="submit" class="address-submit" disabled={!activeTab || !channelConnected || busy} title={i18n.t('browser.navigation.go')} aria-label={i18n.t('browser.navigation.go')}>
         <Icon name="chevron-right" size={12} />
       </button>
     </form>
@@ -1281,7 +1391,7 @@
         class="icon-button"
         class:active={localViewportMode === 'fixed'}
         onclick={toggleViewportMenu}
-        disabled={!activeTab || busy}
+        disabled={!activeTab || !channelConnected || busy}
         title={i18n.t('browser.viewport.control')}
         aria-label={i18n.t('browser.viewport.control')}
         aria-expanded={viewportMenuOpen}
@@ -1328,10 +1438,10 @@
     <button type="button" class="icon-button" onclick={openCurrentPageExternally} disabled={!externalUrl || busy} title={i18n.t('browser.action.openExternal')} aria-label={i18n.t('browser.action.openExternal')}>
       <Icon name="external-link" size={13} />
     </button>
-    <button type="button" class="icon-button" onclick={captureScreenshotForMessage} disabled={!activeTab || busy} title={i18n.t('browser.action.screenshot')} aria-label={i18n.t('browser.action.screenshot')}>
+    <button type="button" class="icon-button" onclick={captureScreenshotForMessage} disabled={!activeTab || !channelConnected || busy} title={i18n.t('browser.action.screenshot')} aria-label={i18n.t('browser.action.screenshot')}>
       <Icon name="file-plus" size={13} />
     </button>
-    <button type="button" class="icon-button" class:active={marking} onclick={toggleMarking} disabled={!activeTab || busy} title={i18n.t('browser.action.annotate')} aria-label={i18n.t('browser.action.annotate')}>
+    <button type="button" class="icon-button" class:active={marking} onclick={toggleMarking} disabled={!activeTab || !channelConnected || busy} title={i18n.t('browser.action.annotate')} aria-label={i18n.t('browser.action.annotate')}>
       <Icon name="edit" size={13} />
     </button>
     <div class="annotation-menu-wrap" bind:this={annotationMenuElement}>
@@ -1392,18 +1502,47 @@
       <div class="browser-placeholder">{i18n.t('browser.status.noTab')}</div>
     {/if}
     <div class="browser-frame" style={displayedFrameStyle()}>
-      <canvas
-        bind:this={canvas}
+      <!-- 输入面由浏览器画面代理，焦点和鼠标事件需要交给宿主页面。 -->
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <div
+        bind:this={frameSurface}
+        class="browser-input-surface"
+        role="application"
         tabindex="0"
         aria-label={i18n.t('browser.viewport.label')}
-        onpointermove={(event) => handlePointer(event, 'mouse_move')}
-        onpointerdown={(event) => handlePointer(event, 'mouse_down')}
-        onpointerup={(event) => handlePointer(event, 'mouse_up')}
-        onpointercancel={cancelAnnotationDrag}
-        onwheel={handleWheel}
+        onpointermove={(event) => { if (isFrameSurfaceTarget(event)) handlePointer(event, 'mouse_move'); }}
+        onpointerdown={(event) => { if (isFrameSurfaceTarget(event)) handlePointer(event, 'mouse_down'); }}
+        onpointerup={(event) => { if (isFrameSurfaceTarget(event)) handlePointer(event, 'mouse_up'); }}
+        onpointercancel={(event) => { if (isFrameSurfaceTarget(event)) cancelAnnotationDrag(event); }}
+        onwheel={(event) => { if (isFrameSurfaceTarget(event)) handleWheel(event); }}
         onkeydown={(event) => handleKey(event, 'key_down')}
         onkeyup={(event) => handleKey(event, 'key_up')}
-      ></canvas>
+      >
+        <img
+          bind:this={frameImage}
+          src={renderedFrameUrl || undefined}
+          alt=""
+          draggable="false"
+        />
+      {#if agentCursor}
+        <div
+          class="agent-cursor"
+          style={agentCursorStyle(agentCursor)}
+          aria-hidden="true"
+        >
+          <span
+            class="agent-cursor-shape"
+            class:drag={agentCursor.action === 'drag'}
+            class:type={agentCursor.action === 'type'}
+          ></span>
+          {#key agentCursor.revision}
+            {#if agentCursor.action === 'click'}
+              <span class="agent-cursor-click"></span>
+            {/if}
+          {/key}
+        </div>
+      {/if}
       {#each (activeTab?.annotations ?? []).filter((annotation) => annotation.status === 'active') as annotation (annotation.annotationId)}
         {@const rect = annotationRect(annotation)}
         {#if rect}
@@ -1428,6 +1567,7 @@
           style={pendingAnnotationStyle()}
         ><span class="annotation-number">{nextAnnotationSequence}</span></div>
       {/if}
+      </div>
     </div>
     {#if pendingAnnotation}
       <div class="annotation-editor" role="dialog" aria-label={i18n.t('browser.annotation.title')}>
@@ -1515,9 +1655,18 @@
   .status-light.error { background: var(--error); }
   .browser-viewport { position: relative; flex: 1; min-height: 0; overflow: hidden; background: #151719; display: grid; place-items: center; }
   .browser-frame { position: relative; flex: 0 0 auto; overflow: hidden; }
-  .browser-frame canvas { display: block; width: 100%; height: 100%; outline: none; }
-  .browser-viewport.interactive canvas { cursor: default; }
-  .browser-viewport.marking canvas { cursor: crosshair; }
+  .browser-input-surface { position: relative; width: 100%; height: 100%; outline: none; }
+  .browser-frame img { display: block; width: 100%; height: 100%; outline: none; }
+  .agent-cursor { position: absolute; z-index: 6; width: 18px; height: 24px; transform: translate(-2px, -2px); pointer-events: none; transition: left 90ms ease-out, top 90ms ease-out; }
+  .agent-cursor-shape { position: absolute; inset: 0; filter: drop-shadow(0 1px 2px rgb(0 0 0 / 72%)); }
+  .agent-cursor-shape::before { content: ''; position: absolute; inset: 0; background: #fff; clip-path: polygon(0 0, 0 100%, 31% 73%, 48% 100%, 62% 92%, 45% 65%, 100% 65%); }
+  .agent-cursor-shape::after { content: ''; position: absolute; inset: 2px; background: #20242a; clip-path: polygon(0 0, 0 88%, 29% 67%, 45% 94%, 54% 87%, 38% 61%, 88% 61%); }
+  .agent-cursor-shape.drag::before { background: #79b8ff; }
+  .agent-cursor-shape.type::before { background: #7ee2b8; }
+  .agent-cursor-click { position: absolute; top: -5px; left: -5px; width: 12px; height: 12px; border: 1px solid rgb(121 184 255 / 78%); border-radius: 50%; animation: agent-cursor-click 360ms ease-out forwards; }
+  @keyframes agent-cursor-click { from { opacity: .9; transform: scale(.45); } to { opacity: 0; transform: scale(1.6); } }
+  .browser-viewport.interactive img { cursor: default; }
+  .browser-viewport.marking img { cursor: crosshair; }
   .browser-placeholder { position: absolute; color: #b6bbc2; font-size: var(--text-sm); }
   .browser-notice { position: absolute; z-index: 7; top: 10px; left: 50%; max-width: calc(100% - 24px); transform: translateX(-50%); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 4px 8px; border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border)); border-radius: 4px; background: color-mix(in srgb, var(--background) 92%, transparent); color: var(--foreground-muted); box-shadow: 0 2px 8px rgb(0 0 0 / 18%); font-size: var(--text-xs); }
   .browser-notice.error { border-color: color-mix(in srgb, var(--error) 45%, var(--border)); color: var(--error); }

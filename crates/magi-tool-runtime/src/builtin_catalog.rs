@@ -38,6 +38,25 @@ pub enum BuiltinToolName {
     BrowserScreenshot,
     BrowserTabs,
     BrowserViewport,
+    BrowserWaitFor,
+    BrowserHover,
+    BrowserDrag,
+    BrowserFillForm,
+    BrowserDialog,
+    BrowserUploadFile,
+    BrowserClickAt,
+    BrowserEvaluate,
+    BrowserConsole,
+    BrowserNetwork,
+    BrowserEmulate,
+    BrowserPerformance,
+    BrowserLighthouse,
+    BrowserScreencast,
+    BrowserHeap,
+    BrowserExtensions,
+    BrowserThirdParty,
+    BrowserWebMcp,
+    BrowserPwa,
     // ── 可视化 ──
     DiagramRender,
     /// 通过已配置的图片生成模型生成图片并保存到当前工作区。
@@ -101,7 +120,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 58] = [
+    pub const ALL: [Self; 77] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -132,6 +151,25 @@ impl BuiltinToolName {
         Self::BrowserScreenshot,
         Self::BrowserTabs,
         Self::BrowserViewport,
+        Self::BrowserWaitFor,
+        Self::BrowserHover,
+        Self::BrowserDrag,
+        Self::BrowserFillForm,
+        Self::BrowserDialog,
+        Self::BrowserUploadFile,
+        Self::BrowserClickAt,
+        Self::BrowserEvaluate,
+        Self::BrowserConsole,
+        Self::BrowserNetwork,
+        Self::BrowserEmulate,
+        Self::BrowserPerformance,
+        Self::BrowserLighthouse,
+        Self::BrowserScreencast,
+        Self::BrowserHeap,
+        Self::BrowserExtensions,
+        Self::BrowserThirdParty,
+        Self::BrowserWebMcp,
+        Self::BrowserPwa,
         Self::DiagramRender,
         Self::ImageGenerate,
         Self::KnowledgeQuery,
@@ -194,6 +232,25 @@ impl BuiltinToolName {
             Self::BrowserScreenshot => "browser_screenshot",
             Self::BrowserTabs => "browser_tabs",
             Self::BrowserViewport => "browser_viewport",
+            Self::BrowserWaitFor => "browser_wait_for",
+            Self::BrowserHover => "browser_hover",
+            Self::BrowserDrag => "browser_drag",
+            Self::BrowserFillForm => "browser_fill_form",
+            Self::BrowserDialog => "browser_dialog",
+            Self::BrowserUploadFile => "browser_upload_file",
+            Self::BrowserClickAt => "browser_click_at",
+            Self::BrowserEvaluate => "browser_evaluate",
+            Self::BrowserConsole => "browser_console",
+            Self::BrowserNetwork => "browser_network",
+            Self::BrowserEmulate => "browser_emulate",
+            Self::BrowserPerformance => "browser_performance",
+            Self::BrowserLighthouse => "browser_lighthouse",
+            Self::BrowserScreencast => "browser_screencast",
+            Self::BrowserHeap => "browser_heap",
+            Self::BrowserExtensions => "browser_extensions",
+            Self::BrowserThirdParty => "browser_third_party",
+            Self::BrowserWebMcp => "browser_webmcp",
+            Self::BrowserPwa => "browser_pwa",
             Self::DiagramRender => "diagram_render",
             Self::ImageGenerate => "image_generate",
             Self::KnowledgeQuery => "knowledge_query",
@@ -254,7 +311,26 @@ impl BuiltinToolName {
             | Self::BrowserScroll
             | Self::BrowserScreenshot
             | Self::BrowserTabs
-            | Self::BrowserViewport => "browser",
+            | Self::BrowserViewport
+            | Self::BrowserWaitFor
+            | Self::BrowserHover
+            | Self::BrowserDrag
+            | Self::BrowserFillForm
+            | Self::BrowserDialog
+            | Self::BrowserUploadFile
+            | Self::BrowserClickAt
+            | Self::BrowserEvaluate
+            | Self::BrowserConsole
+            | Self::BrowserNetwork
+            | Self::BrowserEmulate
+            | Self::BrowserPerformance
+            | Self::BrowserLighthouse
+            | Self::BrowserScreencast
+            | Self::BrowserHeap
+            | Self::BrowserExtensions
+            | Self::BrowserThirdParty
+            | Self::BrowserWebMcp
+            | Self::BrowserPwa => "browser",
             Self::DiagramRender | Self::ImageGenerate => "visualization",
             Self::KnowledgeQuery => "knowledge",
             Self::ToolCatalog => "tooling",
@@ -314,6 +390,25 @@ impl BuiltinToolName {
             "browser_screenshot" => Some(Self::BrowserScreenshot),
             "browser_tabs" => Some(Self::BrowserTabs),
             "browser_viewport" => Some(Self::BrowserViewport),
+            "browser_wait_for" => Some(Self::BrowserWaitFor),
+            "browser_hover" => Some(Self::BrowserHover),
+            "browser_drag" => Some(Self::BrowserDrag),
+            "browser_fill_form" => Some(Self::BrowserFillForm),
+            "browser_dialog" => Some(Self::BrowserDialog),
+            "browser_upload_file" => Some(Self::BrowserUploadFile),
+            "browser_click_at" => Some(Self::BrowserClickAt),
+            "browser_evaluate" => Some(Self::BrowserEvaluate),
+            "browser_console" => Some(Self::BrowserConsole),
+            "browser_network" => Some(Self::BrowserNetwork),
+            "browser_emulate" => Some(Self::BrowserEmulate),
+            "browser_performance" => Some(Self::BrowserPerformance),
+            "browser_lighthouse" => Some(Self::BrowserLighthouse),
+            "browser_screencast" => Some(Self::BrowserScreencast),
+            "browser_heap" => Some(Self::BrowserHeap),
+            "browser_extensions" => Some(Self::BrowserExtensions),
+            "browser_third_party" => Some(Self::BrowserThirdParty),
+            "browser_webmcp" => Some(Self::BrowserWebMcp),
+            "browser_pwa" => Some(Self::BrowserPwa),
             "diagram_render" => Some(Self::DiagramRender),
             "image_generate" => Some(Self::ImageGenerate),
             "knowledge_query" => Some(Self::KnowledgeQuery),
@@ -357,6 +452,25 @@ impl BuiltinToolName {
             Self::BrowserScreenshot => Some(magi_browser_runtime::BrowserToolKind::Screenshot),
             Self::BrowserTabs => Some(magi_browser_runtime::BrowserToolKind::Tabs),
             Self::BrowserViewport => Some(magi_browser_runtime::BrowserToolKind::Viewport),
+            Self::BrowserWaitFor => Some(magi_browser_runtime::BrowserToolKind::WaitFor),
+            Self::BrowserHover => Some(magi_browser_runtime::BrowserToolKind::Hover),
+            Self::BrowserDrag => Some(magi_browser_runtime::BrowserToolKind::Drag),
+            Self::BrowserFillForm => Some(magi_browser_runtime::BrowserToolKind::FillForm),
+            Self::BrowserDialog => Some(magi_browser_runtime::BrowserToolKind::Dialog),
+            Self::BrowserUploadFile => Some(magi_browser_runtime::BrowserToolKind::UploadFile),
+            Self::BrowserClickAt => Some(magi_browser_runtime::BrowserToolKind::ClickAt),
+            Self::BrowserEvaluate => Some(magi_browser_runtime::BrowserToolKind::Evaluate),
+            Self::BrowserConsole => Some(magi_browser_runtime::BrowserToolKind::Console),
+            Self::BrowserNetwork => Some(magi_browser_runtime::BrowserToolKind::Network),
+            Self::BrowserEmulate => Some(magi_browser_runtime::BrowserToolKind::Emulate),
+            Self::BrowserPerformance => Some(magi_browser_runtime::BrowserToolKind::Performance),
+            Self::BrowserLighthouse => Some(magi_browser_runtime::BrowserToolKind::Lighthouse),
+            Self::BrowserScreencast => Some(magi_browser_runtime::BrowserToolKind::Screencast),
+            Self::BrowserHeap => Some(magi_browser_runtime::BrowserToolKind::Heap),
+            Self::BrowserExtensions => Some(magi_browser_runtime::BrowserToolKind::Extensions),
+            Self::BrowserThirdParty => Some(magi_browser_runtime::BrowserToolKind::ThirdParty),
+            Self::BrowserWebMcp => Some(magi_browser_runtime::BrowserToolKind::WebMcp),
+            Self::BrowserPwa => Some(magi_browser_runtime::BrowserToolKind::Pwa),
             _ => None,
         }
     }
@@ -393,6 +507,19 @@ impl BuiltinToolName {
                 | Self::BrowserScroll
                 | Self::BrowserTabs
                 | Self::BrowserViewport
+                | Self::BrowserHover
+                | Self::BrowserDrag
+                | Self::BrowserFillForm
+                | Self::BrowserDialog
+                | Self::BrowserUploadFile
+                | Self::BrowserClickAt
+                | Self::BrowserEvaluate
+                | Self::BrowserEmulate
+                | Self::BrowserScreencast
+                | Self::BrowserExtensions
+                | Self::BrowserThirdParty
+                | Self::BrowserWebMcp
+                | Self::BrowserPwa
         )
     }
 
@@ -509,6 +636,19 @@ impl BuiltinToolName {
             | Self::BrowserScroll
             | Self::BrowserTabs
             | Self::BrowserViewport => RestrictedWriteProfilePolicy::AutoAllowed,
+            Self::BrowserHover
+            | Self::BrowserDrag
+            | Self::BrowserFillForm
+            | Self::BrowserDialog
+            | Self::BrowserUploadFile
+            | Self::BrowserClickAt
+            | Self::BrowserEvaluate
+            | Self::BrowserEmulate
+            | Self::BrowserScreencast
+            | Self::BrowserExtensions
+            | Self::BrowserThirdParty
+            | Self::BrowserWebMcp
+            | Self::BrowserPwa => RestrictedWriteProfilePolicy::AutoAllowed,
             _ => return None,
         };
         Some(policy)
@@ -588,7 +728,13 @@ impl BuiltinToolName {
             | Self::BrowserNavigate
             | Self::BrowserSnapshot
             | Self::BrowserScreenshot
-            | Self::BrowserViewport => RiskLevel::Low,
+            | Self::BrowserViewport
+            | Self::BrowserWaitFor
+            | Self::BrowserConsole
+            | Self::BrowserNetwork
+            | Self::BrowserPerformance
+            | Self::BrowserLighthouse
+            | Self::BrowserHeap => RiskLevel::Low,
             Self::FileWrite
             | Self::FilePatch
             | Self::ApplyPatch
@@ -604,7 +750,20 @@ impl BuiltinToolName {
             | Self::BrowserType
             | Self::BrowserPress
             | Self::BrowserScroll
-            | Self::BrowserTabs => RiskLevel::Medium,
+            | Self::BrowserTabs
+            | Self::BrowserHover
+            | Self::BrowserDrag
+            | Self::BrowserFillForm
+            | Self::BrowserDialog
+            | Self::BrowserUploadFile
+            | Self::BrowserClickAt
+            | Self::BrowserEvaluate
+            | Self::BrowserScreencast
+            | Self::BrowserExtensions
+            | Self::BrowserThirdParty
+            | Self::BrowserWebMcp
+            | Self::BrowserPwa
+            | Self::BrowserEmulate => RiskLevel::Medium,
             Self::FileRemove
             | Self::ShellExec
             | Self::ProcessLaunch
@@ -764,26 +923,65 @@ impl BuiltinToolName {
                 # Web 项目验收\n\
                 - 先读取项目清单确认启动命令，再用 shell_exec(background=true) 启动开发服务\n\
                 - 从服务输出确认实际监听 URL 和端口，不要臆测 localhost 端口\n\
-                - 导航后必须继续用 browser_snapshot 获取可交互元素，并按任务需要调用 browser_click / browser_type / browser_press / browser_scroll\n\
-                - 响应式任务使用 browser_viewport 覆盖桌面和手机视口；视觉结果使用 browser_screenshot 留证\n\
+                - 导航后还要继续交互时，在本次调用设置 include_snapshot=true，直接取得最新可交互元素，避免再单独调用 browser_snapshot\n\
+                - 使用 browser_click、browser_type、browser_press 和 browser_scroll 完成真实用户路径；搜索或表单提交优先 browser_type(submit_key=Enter)\n\
+                - 文本、标题、计数、控件与状态全部从快照读取；只读取 URL 或标题时不要附带快照\n\
+                - 仅在页面结构确实变化且当前结果未附带快照时调用 browser_snapshot，不要因为页面内容很多而重复快照\n\
+                - browser_screenshot 只用于布局、样式、图像等视觉问题或用户明确要求截图的场景，不能用于读取文本或定位控件\n\
+                - 响应式任务使用 browser_viewport 覆盖桌面和手机视口\n\
                 - 构建成功、curl 成功或静态阅读都不能替代真实浏览器验收"
             }
             Self::BrowserSnapshot => {
-                "读取当前浏览器页面的紧凑可访问性快照。返回的元素 ref 只在同一 snapshot_revision 内有效。"
+                "读取当前浏览器页面的高价值可访问性快照，优先用于读取文本、标题、计数、控件和状态。返回的元素 ref 只在同一 snapshot_revision 内有效。不要用截图替代文本快照。"
             }
             Self::BrowserClick => {
                 "点击当前浏览器快照中的元素。必须传入 browser_snapshot 返回的 element_ref 和 snapshot_revision。"
             }
             Self::BrowserType => {
-                "向当前浏览器快照中的可编辑元素输入文本。不能用于密码、验证码或支付字段。"
+                "向当前浏览器快照中的可编辑元素输入文本。需要提交搜索或表单时同时传 submit_key=Enter，避免再调用 browser_press。不能用于密码、验证码或支付字段。"
             }
             Self::BrowserPress => "向当前浏览器页面发送一个按键或组合键。",
             Self::BrowserScroll => "滚动当前浏览器页面或快照中的指定元素。",
-            Self::BrowserScreenshot => "截取当前浏览器页面或指定元素并返回图片 artifact。",
-            Self::BrowserTabs => "列出、激活、新建或关闭当前 Magi 会话的内置浏览器标签页。",
+            Self::BrowserScreenshot => {
+                "截取当前浏览器页面或指定元素并返回图片 artifact。仅用于布局、样式、图像等视觉问题或用户明确要求截图的场景；读取文本、标题、计数、控件和状态必须使用 browser_snapshot。"
+            }
+            Self::BrowserTabs => {
+                "列出、激活或新建当前 Magi 会话的内置浏览器标签页；任务完成时必须保留标签及其当前页面，不得把 close 当作清理动作。只有用户明确要求关闭指定标签时才允许使用 close。"
+            }
             Self::BrowserViewport => {
                 "读取或设置当前内置浏览器页面的设备视口。设置时会同步应用 CSS 视口、宽屏或窄屏设备类型、移动端 UA 与触控语义；适合验证电脑/平板宽屏和手机窄屏响应式布局，而不是裁切桌面页面。"
             }
+            Self::BrowserWaitFor => {
+                "等待当前页面出现指定文本、选择器或 URL，适合等待异步页面稳定。"
+            }
+            Self::BrowserHover => "将鼠标悬停到当前浏览器快照中的元素。",
+            Self::BrowserDrag => "把当前浏览器快照中的一个元素拖到另一个元素。",
+            Self::BrowserFillForm => "按快照引用一次性填写多个输入框、选择框、复选框或单选框。",
+            Self::BrowserDialog => {
+                "列出或处理当前页面待处理的 alert、confirm、prompt 对话框；必须先列出，再用 accept 或 dismiss。"
+            }
+            Self::BrowserUploadFile => "通过当前浏览器页面的文件输入控件上传本地文件。",
+            Self::BrowserClickAt => "在当前浏览器页面的坐标位置点击，支持双击。",
+            Self::BrowserEvaluate => "在当前浏览器页面中执行一个可序列化结果的 JavaScript 函数。",
+            Self::BrowserConsole => "读取、筛选、查看或清理当前浏览器页面的控制台消息。",
+            Self::BrowserNetwork => "读取、筛选、查看请求体或清理当前浏览器页面的网络请求记录。",
+            Self::BrowserEmulate => {
+                "使用 Chromium DevTools 协议仿真颜色、CPU、网络、地理位置、UA 和请求头。"
+            }
+            Self::BrowserPerformance => {
+                "读取性能指标，或启动、停止并分析当前页面的 Chromium 性能追踪。"
+            }
+            Self::BrowserLighthouse => {
+                "对当前页面执行 Lighthouse 可访问性、SEO、最佳实践和 agentic browsing 审计；不包含性能评分。"
+            }
+            Self::BrowserScreencast => {
+                "启动或停止当前浏览器页面的视频录制，并返回生成的 MP4 或 WebM 文件路径。"
+            }
+            Self::BrowserHeap => "读取当前页面堆和 DOM 计数，或生成可供后续分析的堆快照文件。",
+            Self::BrowserExtensions => "列出、安装、重载或卸载当前 Chromium Profile 中的扩展。",
+            Self::BrowserThirdParty => "列出或执行页面通过 window.__dtmcp 暴露的第三方开发工具。",
+            Self::BrowserWebMcp => "列出或执行页面通过 navigator.modelContext 暴露的 WebMCP 工具。",
+            Self::BrowserPwa => "读取、安装、启动或卸载当前 Chromium 支持的 Progressive Web App。",
             Self::DiagramRender => {
                 "渲染图表：支持 Mermaid、DOT、结构化 graph 节点/边、结构化 flow 节点/边"
             }
@@ -1175,17 +1373,21 @@ impl BuiltinToolName {
             Self::BrowserNavigate => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["url", "back", "forward", "reload"] },
-                    "url": { "type": "string", "description": "action=url 时必填" },
-                    "tab_id": { "type": "string", "description": "可选；省略时使用活动标签页" }
+                    "action": { "type": "string", "enum": ["url", "back", "forward", "reload"], "description": "可选；提供 url 时默认执行 URL 导航，后退、前进或刷新时再显式填写" },
+                    "url": { "type": "string", "description": "要打开的 URL；提供该字段时 action 默认是 url" },
+                    "tab_id": { "type": "string", "description": "可选；省略时使用活动标签页" },
+                    "ignore_cache": { "type": "boolean", "description": "action=reload 时忽略缓存；默认 false" },
+                    "handle_before_unload": { "type": "string", "enum": ["accept", "dismiss"], "description": "导航触发 beforeunload 时自动接受或取消" },
+                    "init_script": { "type": "string", "description": "只对本次 URL 导航生效、在页面脚本前执行的 JavaScript" },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 60000, "description": "导航超时，默认 15000 毫秒" },
+                    "include_snapshot": { "type": "boolean", "description": "导航后还要继续交互时设为 true，在同一次工具结果中附带最新可访问性快照；默认 false" }
                 },
-                "required": ["action"]
+                "required": []
             }),
             Self::BrowserSnapshot => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "tab_id": { "type": "string", "description": "可选；省略时使用活动标签页" },
-                    "subtree_ref": { "type": "string", "description": "读取截断快照的指定子树" }
+                    "tab_id": { "type": "string", "description": "可选；省略时使用活动标签页" }
                 },
                 "required": []
             }),
@@ -1194,7 +1396,8 @@ impl BuiltinToolName {
                 "properties": {
                     "tab_id": { "type": "string" },
                     "snapshot_revision": { "type": "integer", "minimum": 1 },
-                    "element_ref": { "type": "string" }
+                    "element_ref": { "type": "string" },
+                    "include_snapshot": { "type": "boolean", "description": "操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false" }
                 },
                 "required": ["snapshot_revision", "element_ref"]
             }),
@@ -1205,7 +1408,9 @@ impl BuiltinToolName {
                     "snapshot_revision": { "type": "integer", "minimum": 1 },
                     "element_ref": { "type": "string" },
                     "text": { "type": "string" },
-                    "replace": { "type": "boolean", "description": "默认 true" }
+                    "replace": { "type": "boolean", "description": "默认 true" },
+                    "submit_key": { "type": "string", "description": "可选；输入后立即发送的按键，例如 Enter。搜索或表单提交应与输入合并，避免额外 browser_press 往返" },
+                    "include_snapshot": { "type": "boolean", "description": "操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false" }
                 },
                 "required": ["snapshot_revision", "element_ref", "text"]
             }),
@@ -1213,7 +1418,8 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "tab_id": { "type": "string" },
-                    "key": { "type": "string", "description": "按键或组合键，例如 Enter、Control+L" }
+                    "key": { "type": "string", "description": "按键或组合键，例如 Enter、Control+L" },
+                    "include_snapshot": { "type": "boolean", "description": "操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false" }
                 },
                 "required": ["key"]
             }),
@@ -1224,7 +1430,8 @@ impl BuiltinToolName {
                     "snapshot_revision": { "type": "integer", "minimum": 1 },
                     "element_ref": { "type": "string", "description": "可选；省略时滚动页面" },
                     "delta_x": { "type": "number" },
-                    "delta_y": { "type": "number" }
+                    "delta_y": { "type": "number" },
+                    "include_snapshot": { "type": "boolean", "description": "操作后附带最新可访问性快照；需要继续交互时设为 true，默认 false" }
                 },
                 "required": ["delta_y"]
             }),
@@ -1234,6 +1441,9 @@ impl BuiltinToolName {
                     "tab_id": { "type": "string" },
                     "snapshot_revision": { "type": "integer", "minimum": 1 },
                     "element_ref": { "type": "string", "description": "可选；省略时截取页面" },
+                    "clip": { "type": "object", "properties": { "x": { "type": "number", "minimum": 0, "maximum": 1 }, "y": { "type": "number", "minimum": 0, "maximum": 1 }, "width": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }, "height": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 } }, "required": ["x", "y", "width", "height"], "description": "按当前视口归一化坐标截取区域，不能与 element_ref 或 full_page 同时使用" },
+                    "format": { "type": "string", "enum": ["png", "jpeg", "webp"], "description": "图片格式，默认 png" },
+                    "quality": { "type": "integer", "minimum": 0, "maximum": 100, "description": "jpeg/webp 压缩质量" },
                     "full_page": { "type": "boolean", "description": "默认 false" }
                 },
                 "required": []
@@ -1241,8 +1451,9 @@ impl BuiltinToolName {
             Self::BrowserTabs => serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "new", "activate", "close"] },
-                    "tab_id": { "type": "string", "description": "activate/close 时必填" }
+                    "action": { "type": "string", "enum": ["list", "new", "activate", "close"], "description": "任务完成后不要使用 close；仅在用户明确要求关闭指定标签时使用。" },
+                    "tab_id": { "type": "string", "description": "activate/close 时必填；close 只能响应用户明确的关闭要求" },
+                    "url": { "type": "string", "description": "new 时可选；新建后立即打开的 URL，省略时为 about:blank" }
                 },
                 "required": ["action"]
             }),
@@ -1254,6 +1465,217 @@ impl BuiltinToolName {
                     "width": { "type": "integer", "minimum": 320, "maximum": 7680, "description": "action=set 时必填" },
                     "height": { "type": "integer", "minimum": 240, "maximum": 4320, "description": "action=set 时必填" },
                     "device_type": { "type": "string", "enum": ["desktop", "mobile"], "description": "action=set 时可选；宽度 320-600 固定为 mobile，601 以上固定为 desktop，传入值必须与 width 一致。mobile 启用手机窄屏仿真，desktop 表示电脑/平板宽屏。" }
+                },
+                "required": ["action"]
+            }),
+            Self::BrowserWaitFor => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "text": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "texts": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "selector": { "type": "string" },
+                    "url": { "type": "string" },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 60000 }
+                },
+                "required": []
+            }),
+            Self::BrowserHover => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "snapshot_revision": { "type": "integer", "minimum": 1 },
+                    "element_ref": { "type": "string" },
+                    "include_snapshot": { "type": "boolean" }
+                },
+                "required": ["snapshot_revision", "element_ref"]
+            }),
+            Self::BrowserDrag => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "from": { "type": "object", "properties": { "snapshot_revision": { "type": "integer" }, "element_ref": { "type": "string" } }, "required": ["snapshot_revision", "element_ref"] },
+                    "to": { "type": "object", "properties": { "snapshot_revision": { "type": "integer" }, "element_ref": { "type": "string" } }, "required": ["snapshot_revision", "element_ref"] },
+                    "include_snapshot": { "type": "boolean" }
+                },
+                "required": ["from", "to"]
+            }),
+            Self::BrowserFillForm => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "elements": { "type": "array", "items": { "type": "object", "properties": { "snapshot_revision": { "type": "integer" }, "element_ref": { "type": "string" }, "value": {} }, "required": ["snapshot_revision", "element_ref", "value"] }, "minItems": 1 },
+                    "include_snapshot": { "type": "boolean" }
+                },
+                "required": ["elements"]
+            }),
+            Self::BrowserDialog => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "action": { "type": "string", "enum": ["list", "clear", "accept", "dismiss"] },
+                    "prompt_text": { "type": "string" }
+                },
+                "required": ["action"]
+            }),
+            Self::BrowserUploadFile => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "snapshot_revision": { "type": "integer", "minimum": 1 },
+                    "element_ref": { "type": "string" },
+                    "file_path": { "type": "string" },
+                    "include_snapshot": { "type": "boolean" }
+                },
+                "required": ["snapshot_revision", "element_ref", "file_path"]
+            }),
+            Self::BrowserClickAt => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "x": { "type": "number" },
+                    "y": { "type": "number" },
+                    "double_click": { "type": "boolean" },
+                    "include_snapshot": { "type": "boolean" }
+                },
+                "required": ["x", "y"]
+            }),
+            Self::BrowserEvaluate => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "function": { "type": "string" },
+                    "args": { "type": "array", "items": {} },
+                    "wait_for_stable_dom": { "type": "boolean" }
+                },
+                "required": ["function"]
+            }),
+            Self::BrowserConsole => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "action": { "type": "string", "enum": ["list", "get", "clear"] },
+                    "message_id": { "type": "integer", "minimum": 1 },
+                    "levels": { "type": "array", "items": { "type": "string" } },
+                    "page_size": { "type": "integer", "minimum": 1, "maximum": 500 }
+                },
+                "required": ["action"]
+            }),
+            Self::BrowserNetwork => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "action": { "type": "string", "enum": ["list", "get", "clear"] },
+                    "request_id": { "type": "integer", "minimum": 1 },
+                    "resource_types": { "type": "array", "items": { "type": "string" } },
+                    "page_size": { "type": "integer", "minimum": 1, "maximum": 500 },
+                    "include_body": { "type": "boolean" }
+                },
+                "required": ["action"]
+            }),
+            Self::BrowserEmulate => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "network_conditions": { "type": "string", "enum": ["offline", "slow 3g", "fast 3g", "slow 4g", "fast 4g"] },
+                    "cpu_throttling_rate": { "type": "number", "minimum": 1, "maximum": 20 },
+                    "geolocation": { "type": ["object", "null"] },
+                    "user_agent": { "type": ["string", "null"] },
+                    "color_scheme": { "type": "string", "enum": ["dark", "light", "auto"] },
+                    "extra_http_headers": { "type": ["object", "null"] }
+                },
+                "required": []
+            }),
+            Self::BrowserPerformance => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "action": { "type": "string", "enum": ["start", "stop", "metrics", "analyze"] },
+                    "reload": { "type": "boolean" },
+                    "auto_stop": { "type": "boolean" },
+                    "file_path": { "type": "string" },
+                    "insight_name": { "type": "string" },
+                    "insight_set_id": { "type": "string" }
+                },
+                "required": ["action"]
+            }),
+            Self::BrowserLighthouse => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "mode": { "type": "string", "enum": ["navigation", "snapshot"] },
+                    "device": { "type": "string", "enum": ["desktop", "mobile"] },
+                    "output_dir_path": { "type": "string" }
+                },
+                "required": []
+            }),
+            Self::BrowserScreencast => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "action": { "type": "string", "enum": ["start", "stop"] },
+                    "file_path": { "type": "string", "description": "start 时可选；输出 .mp4 或 .webm 文件路径，省略时写入 Browser Runtime 下载目录" },
+                    "ffmpeg_path": { "type": "string", "description": "start 时可选；ffmpeg 可执行文件路径，省略时从 PATH 查找" }
+                },
+                "required": ["action"]
+            }),
+            Self::BrowserHeap => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "action": { "type": "string", "enum": ["usage", "take_snapshot", "close_snapshot", "compare_snapshots", "summary", "details", "class_nodes", "dominators", "duplicate_strings", "edges", "object_details", "retainers", "retaining_paths"] },
+                    "file_path": { "type": "string" },
+                    "base_file_path": { "type": "string" },
+                    "current_file_path": { "type": "string" },
+                    "class_id": { "type": "integer", "minimum": 1 },
+                    "node_id": { "type": "integer", "minimum": 1 },
+                    "page_index": { "type": "integer", "minimum": 0 },
+                    "page_size": { "type": "integer", "minimum": 1, "maximum": 500 },
+                    "max_depth": { "type": "integer", "minimum": 1, "maximum": 64 },
+                    "max_nodes": { "type": "integer", "minimum": 1, "maximum": 10000 },
+                    "max_siblings": { "type": "integer", "minimum": 1, "maximum": 1000 }
+                },
+                "required": ["action"]
+            }),
+            Self::BrowserExtensions => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "action": { "type": "string", "enum": ["list", "install", "reload", "trigger_action", "uninstall"] },
+                    "path": { "type": "string" },
+                    "extension_id": { "type": "string" }
+                },
+                "required": ["action"]
+            }),
+            Self::BrowserThirdParty => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "action": { "type": "string", "enum": ["list", "execute"] },
+                    "tool_name": { "type": "string" },
+                    "params": { "type": "object" }
+                },
+                "required": ["action"]
+            }),
+            Self::BrowserWebMcp => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "action": { "type": "string", "enum": ["list", "execute"] },
+                    "tool_name": { "type": "string" },
+                    "input": { "type": "object" }
+                },
+                "required": ["action"]
+            }),
+            Self::BrowserPwa => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string" },
+                    "action": { "type": "string", "enum": ["state", "install", "launch", "uninstall"] },
+                    "manifest_id": { "type": "string" },
+                    "install_url": { "type": "string" },
+                    "display_mode": { "type": "string", "enum": ["browser", "standalone"], "description": "安装后的显示模式；browser 在标签页中打开，standalone 在独立应用窗口中打开" },
+                    "url": { "type": "string" }
                 },
                 "required": ["action"]
             }),
@@ -2015,6 +2437,252 @@ mod tests {
         assert_eq!(properties.len(), 1);
         assert!(properties.contains_key("url"));
         assert!(!properties.contains_key("prompt"));
+    }
+
+    #[test]
+    fn browser_navigate_schema_does_not_require_redundant_url_action() {
+        let schema = BuiltinToolName::BrowserNavigate.parameters_schema();
+        let required = schema["required"]
+            .as_array()
+            .expect("browser_navigate required should be an array");
+
+        assert!(required.is_empty());
+        assert_eq!(schema["properties"]["url"]["type"], "string");
+        assert_eq!(schema["properties"]["include_snapshot"]["type"], "boolean");
+    }
+
+    #[test]
+    fn browser_tabs_contract_preserves_current_page_after_task_completion() {
+        let description = BuiltinToolName::BrowserTabs.description();
+        assert!(description.contains("任务完成时必须保留标签及其当前页面"));
+        assert!(description.contains("只有用户明确要求关闭指定标签时才允许使用 close"));
+        let schema = BuiltinToolName::BrowserTabs.parameters_schema();
+        assert!(
+            schema["properties"]["action"]["description"]
+                .as_str()
+                .is_some_and(|value| value.contains("任务完成后不要使用 close"))
+        );
+    }
+
+    #[test]
+    fn chrome_devtools_reference_tools_have_one_magi_execution_mapping() {
+        // 当前参考项目在完整模式下暴露 57 个工具。Magi 有意将相关能力聚合到
+        // 带 action 的浏览器工具中；该映射矩阵防止目录项只有名称而没有执行路径。
+        let mappings = [
+            ("click", BuiltinToolName::BrowserClick, None),
+            ("click_at", BuiltinToolName::BrowserClickAt, None),
+            ("drag", BuiltinToolName::BrowserDrag, None),
+            ("fill", BuiltinToolName::BrowserType, None),
+            ("fill_form", BuiltinToolName::BrowserFillForm, None),
+            (
+                "handle_dialog",
+                BuiltinToolName::BrowserDialog,
+                Some("accept"),
+            ),
+            ("hover", BuiltinToolName::BrowserHover, None),
+            ("press_key", BuiltinToolName::BrowserPress, None),
+            ("type_text", BuiltinToolName::BrowserType, None),
+            ("upload_file", BuiltinToolName::BrowserUploadFile, None),
+            ("emulate", BuiltinToolName::BrowserEmulate, None),
+            (
+                "install_extension",
+                BuiltinToolName::BrowserExtensions,
+                Some("install"),
+            ),
+            (
+                "uninstall_extension",
+                BuiltinToolName::BrowserExtensions,
+                Some("uninstall"),
+            ),
+            (
+                "list_extensions",
+                BuiltinToolName::BrowserExtensions,
+                Some("list"),
+            ),
+            (
+                "reload_extension",
+                BuiltinToolName::BrowserExtensions,
+                Some("reload"),
+            ),
+            (
+                "trigger_extension_action",
+                BuiltinToolName::BrowserExtensions,
+                Some("trigger_action"),
+            ),
+            ("lighthouse_audit", BuiltinToolName::BrowserLighthouse, None),
+            (
+                "take_heapsnapshot",
+                BuiltinToolName::BrowserHeap,
+                Some("take_snapshot"),
+            ),
+            (
+                "get_heapsnapshot_summary",
+                BuiltinToolName::BrowserHeap,
+                Some("summary"),
+            ),
+            (
+                "get_heapsnapshot_details",
+                BuiltinToolName::BrowserHeap,
+                Some("details"),
+            ),
+            (
+                "get_heapsnapshot_class_nodes",
+                BuiltinToolName::BrowserHeap,
+                Some("class_nodes"),
+            ),
+            (
+                "get_heapsnapshot_retainers",
+                BuiltinToolName::BrowserHeap,
+                Some("retainers"),
+            ),
+            (
+                "close_heapsnapshot",
+                BuiltinToolName::BrowserHeap,
+                Some("close_snapshot"),
+            ),
+            (
+                "get_heapsnapshot_retaining_paths",
+                BuiltinToolName::BrowserHeap,
+                Some("retaining_paths"),
+            ),
+            (
+                "get_heapsnapshot_edges",
+                BuiltinToolName::BrowserHeap,
+                Some("edges"),
+            ),
+            (
+                "get_heapsnapshot_dominators",
+                BuiltinToolName::BrowserHeap,
+                Some("dominators"),
+            ),
+            (
+                "compare_heapsnapshots",
+                BuiltinToolName::BrowserHeap,
+                Some("compare_snapshots"),
+            ),
+            (
+                "get_heapsnapshot_duplicate_strings",
+                BuiltinToolName::BrowserHeap,
+                Some("duplicate_strings"),
+            ),
+            (
+                "get_heapsnapshot_object_details",
+                BuiltinToolName::BrowserHeap,
+                Some("object_details"),
+            ),
+            (
+                "list_network_requests",
+                BuiltinToolName::BrowserNetwork,
+                Some("list"),
+            ),
+            (
+                "get_network_request",
+                BuiltinToolName::BrowserNetwork,
+                Some("get"),
+            ),
+            ("list_pages", BuiltinToolName::BrowserTabs, Some("list")),
+            (
+                "select_page",
+                BuiltinToolName::BrowserTabs,
+                Some("activate"),
+            ),
+            ("close_page", BuiltinToolName::BrowserTabs, Some("close")),
+            ("new_page", BuiltinToolName::BrowserTabs, Some("new")),
+            ("navigate_page", BuiltinToolName::BrowserNavigate, None),
+            ("resize_page", BuiltinToolName::BrowserViewport, Some("set")),
+            ("get_tab_id", BuiltinToolName::BrowserTabs, Some("list")),
+            (
+                "performance_start_trace",
+                BuiltinToolName::BrowserPerformance,
+                Some("start"),
+            ),
+            (
+                "performance_stop_trace",
+                BuiltinToolName::BrowserPerformance,
+                Some("stop"),
+            ),
+            (
+                "performance_analyze_insight",
+                BuiltinToolName::BrowserPerformance,
+                Some("analyze"),
+            ),
+            ("install_pwa", BuiltinToolName::BrowserPwa, Some("install")),
+            (
+                "uninstall_pwa",
+                BuiltinToolName::BrowserPwa,
+                Some("uninstall"),
+            ),
+            ("launch_pwa", BuiltinToolName::BrowserPwa, Some("launch")),
+            (
+                "get_os_app_state",
+                BuiltinToolName::BrowserPwa,
+                Some("state"),
+            ),
+            (
+                "screencast_start",
+                BuiltinToolName::BrowserScreencast,
+                Some("start"),
+            ),
+            (
+                "screencast_stop",
+                BuiltinToolName::BrowserScreencast,
+                Some("stop"),
+            ),
+            ("take_screenshot", BuiltinToolName::BrowserScreenshot, None),
+            ("evaluate_script", BuiltinToolName::BrowserEvaluate, None),
+            ("take_snapshot", BuiltinToolName::BrowserSnapshot, None),
+            ("wait_for", BuiltinToolName::BrowserWaitFor, None),
+            (
+                "list_3p_developer_tools",
+                BuiltinToolName::BrowserThirdParty,
+                Some("list"),
+            ),
+            (
+                "execute_3p_developer_tool",
+                BuiltinToolName::BrowserThirdParty,
+                Some("execute"),
+            ),
+            (
+                "list_webmcp_tools",
+                BuiltinToolName::BrowserWebMcp,
+                Some("list"),
+            ),
+            (
+                "execute_webmcp_tool",
+                BuiltinToolName::BrowserWebMcp,
+                Some("execute"),
+            ),
+            (
+                "list_console_messages",
+                BuiltinToolName::BrowserConsole,
+                Some("list"),
+            ),
+            (
+                "get_console_message",
+                BuiltinToolName::BrowserConsole,
+                Some("get"),
+            ),
+        ];
+        assert_eq!(mappings.len(), 57);
+        for (reference_name, magi_name, action) in mappings {
+            assert_eq!(
+                BuiltinToolName::from_name(magi_name.as_str()),
+                Some(magi_name),
+                "{reference_name}"
+            );
+            assert!(magi_name.browser_tool_kind().is_some(), "{reference_name}");
+            let schema = magi_name.parameters_schema();
+            assert!(schema["properties"].is_object(), "{reference_name}");
+            if let Some(action) = action {
+                let actions = schema["properties"]["action"]["enum"]
+                    .as_array()
+                    .expect("action enum should be present");
+                assert!(
+                    actions.iter().any(|value| value == action),
+                    "{reference_name} -> {action}"
+                );
+            }
+        }
     }
 
     #[test]

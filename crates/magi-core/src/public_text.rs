@@ -193,6 +193,7 @@ fn starts_windows_absolute_path(value: &str) -> bool {
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && (bytes[2] == b'\\' || bytes[2] == b'/')
+        && bytes.get(3).is_none_or(|next| *next != bytes[2])
 }
 
 fn is_value_delimiter(ch: char) -> bool {
@@ -281,6 +282,17 @@ mod tests {
         assert!(public.contains(PUBLIC_REDACTED_PATH));
         assert!(!public.contains("C:\\Users"));
         assert!(!public.contains(".magi"));
+    }
+
+    #[test]
+    fn public_runtime_text_preserves_http_urls() {
+        let public = public_runtime_text(
+            r#"{"http":"http://127.0.0.1:38123/web.html","https":"https://cn.bing.com/search?q=magi-code"}"#,
+        );
+
+        assert!(public.contains(r#""http":"http://127.0.0.1:38123/web.html""#));
+        assert!(public.contains(r#""https":"https://cn.bing.com/search?q=magi-code""#));
+        assert!(!public.contains(PUBLIC_REDACTED_PATH));
     }
 
     #[test]

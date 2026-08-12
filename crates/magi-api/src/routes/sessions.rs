@@ -55,7 +55,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/session/queue/guide", post(guide_session_turn_queue_item))
         .route("/session/interrupt", post(interrupt_session_turn))
         .route("/session/continue", post(continue_session))
-        .route("/session/switch", post(switch_session))
+        .route("/session/navigation", post(navigate_session))
         .route("/session/delete", post(delete_session))
         .route("/session/rename", post(rename_session))
         .route("/session/close", post(close_session))
@@ -2729,15 +2729,17 @@ fn publish_session_turn_continue_event(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SwitchSessionRequest {
-    session_id: String,
+struct SessionNavigationRequest {
+    target: SessionNavigationTarget,
     #[serde(default)]
     workspace_id: Option<String>,
     #[serde(default)]
     workspace_path: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
-impl SwitchSessionRequest {
+impl SessionNavigationRequest {
     fn requested_workspace_id(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_id.as_deref())
     }
@@ -2745,6 +2747,17 @@ impl SwitchSessionRequest {
     fn requested_workspace_path(&self) -> Option<&str> {
         trimmed_non_empty(self.workspace_path.as_deref())
     }
+
+    fn requested_session_id(&self) -> Option<&str> {
+        trimmed_non_empty(self.session_id.as_deref())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum SessionNavigationTarget {
+    Draft,
+    Session,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2833,13 +2846,6 @@ struct SessionInterruptResponseDto {
     remaining_queued_turn_count: usize,
     next_queued_turn_started: bool,
     removed_timeline_entry_ids: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionSelectionResponseDto {
-    session_id: String,
-    current_session: Option<SessionRecord>,
 }
 
 fn resolve_interrupt_session_record(
@@ -3276,25 +3282,51 @@ fn finalize_terminal_root_current_turn(
     )
 }
 
-async fn switch_session(
+async fn navigate_session(
     State(state): State<ApiState>,
-    Json(request): Json<SwitchSessionRequest>,
-) -> Result<Json<SessionSelectionResponseDto>, ApiError> {
-    let session_id = SessionId::new(&request.session_id);
+    Json(request): Json<SessionNavigationRequest>,
+) -> Result<Json<BootstrapDto>, ApiError> {
+    let _navigation_guard = state.lock_session_navigation().await;
     let workspace_id = require_request_workspace_id(
         &state,
         request.requested_workspace_id(),
         request.requested_workspace_path(),
     )?;
-    require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
-    let current_session = state
-        .session_store
-        .select_current_session(&session_id)
-        .map_err(|error| ApiError::internal_assembly("切换当前会话失败", error))?;
-    state.persist_session_durable_state_for_api()?;
-    Ok(Json(SessionSelectionResponseDto {
-        session_id: current_session.session_id.to_string(),
-        current_session: Some(current_session),
+    let selected_session_id = match &request.target {
+        SessionNavigationTarget::Draft => {
+            if request.requested_session_id().is_some() {
+                return Err(ApiError::InvalidInput(
+                    "草稿导航不能携带 sessionId".to_string(),
+                ));
+            }
+            None
+        }
+        SessionNavigationTarget::Session => {
+            let session_id = parse_session_id(request.requested_session_id())?;
+            require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
+            Some(session_id)
+        }
+    };
+    state
+        .workspace_registry
+        .activate(&workspace_id)
+        .map_err(|error| ApiError::internal_assembly("切换会话工作区失败", error))?;
+    match selected_session_id.as_ref() {
+        Some(session_id) => {
+            state
+                .session_store
+                .select_current_session(session_id)
+                .map_err(|error| ApiError::internal_assembly("切换当前会话失败", error))?;
+        }
+        None => {
+            state.session_store.clear_current_session();
+        }
+    }
+    state.persist_runtime_durable_state_for_api()?;
+    Ok(Json(match selected_session_id.as_ref() {
+        Some(session_id) => state
+            .bootstrap_dto_for_workspace_session(Some(workspace_id.as_str()), Some(session_id))?,
+        None => state.bootstrap_dto_for_workspace_session(Some(workspace_id.as_str()), None)?,
     }))
 }
 
@@ -9097,7 +9129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn switch_session_requires_workspace_scope() {
+    async fn session_navigation_requires_workspace_scope() {
         let state = test_state();
         let session_id = SessionId::new("session-switch-requires-workspace");
         state
@@ -9111,8 +9143,9 @@ mod tests {
 
         let (status, body) = post_json(
             state,
-            "/session/switch",
+            "/session/navigation",
             serde_json::json!({
+                "target": "session",
                 "sessionId": session_id.as_str(),
             }),
         )
@@ -9129,7 +9162,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn switch_session_uses_workspace_path_when_workspace_id_is_stale() {
+    async fn draft_navigation_persists_empty_selection_without_deleting_history() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-draft-navigation",
+            "session-draft-navigation",
+        );
+        let session_id = SessionId::new("session-draft-existing-history");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "已有会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state.session_store.append_timeline_entry(
+            session_id.clone(),
+            TimelineEntryKind::UserMessage,
+            "已有消息",
+        );
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/navigation",
+            serde_json::json!({
+                "target": "draft",
+                "workspaceId": workspace_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert!(body["currentSession"].is_null());
+        assert_eq!(body["sessions"].as_array().map(Vec::len), Some(1));
+        assert!(body["timeline"].as_array().is_some_and(Vec::is_empty));
+        assert!(state.session_store.current_session().is_none());
+        assert!(state.session_store.session(&session_id).is_some());
+        assert_eq!(
+            state.workspace_registry.active_workspace_id(),
+            Some(workspace_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_navigation_rejects_session_id_without_mutating_selection() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-draft-invalid-session",
+            "session-draft-invalid-session",
+        );
+        let session_id = SessionId::new("session-draft-invalid-session");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "保留当前会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("session should create");
+        state
+            .session_store
+            .select_current_session(&session_id)
+            .expect("session should select");
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/navigation",
+            serde_json::json!({
+                "target": "draft",
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert_eq!(
+            state.session_store.current_session().unwrap().session_id,
+            session_id
+        );
+    }
+
+    #[tokio::test]
+    async fn session_navigation_uses_workspace_path_when_workspace_id_is_stale() {
         let state = test_state();
         let workspace_a = WorkspaceId::new("workspace-switch-path-a");
         let workspace_b = WorkspaceId::new("workspace-switch-path-b");
@@ -9161,8 +9279,9 @@ mod tests {
 
         let (status, body) = post_json(
             state,
-            "/session/switch",
+            "/session/navigation",
             serde_json::json!({
+                "target": "session",
                 "workspaceId": workspace_b.as_str(),
                 "workspacePath": root_a.display().to_string(),
                 "sessionId": session_id.as_str(),
@@ -9171,11 +9290,11 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
-        assert_eq!(body["sessionId"], session_id.as_str());
+        assert_eq!(body["currentSession"]["sessionId"], session_id.as_str());
     }
 
     #[tokio::test]
-    async fn switch_session_persists_navigation_selection_without_business_side_effects() {
+    async fn session_navigation_persists_selection_without_business_side_effects() {
         let state = test_state();
         register_workspace(&state, "workspace-a", "session-switch-navigation-only");
         let first_session_id = SessionId::new("session-switch-navigation-first");
@@ -9210,8 +9329,9 @@ mod tests {
 
         let (status, body) = post_json(
             state.clone(),
-            "/session/switch",
+            "/session/navigation",
             serde_json::json!({
+                "target": "session",
                 "workspaceId": "workspace-a",
                 "sessionId": first_session_id.as_str(),
             }),
@@ -9219,7 +9339,6 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
-        assert_eq!(body["sessionId"], first_session_id.as_str());
         assert_eq!(
             body["currentSession"]["sessionId"],
             first_session_id.as_str()

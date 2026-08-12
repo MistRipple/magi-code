@@ -89,6 +89,7 @@ pub fn execute_intent_with_drivers(
         access_profile: tool_policy.effective_access_profile(),
         working_directory: None,
         browser_capability_revision: None,
+        browser_execution_id: Some(format!("task:{}", intent.task_id)),
     };
 
     let mut tool_invocations = Vec::new();
@@ -189,6 +190,7 @@ pub fn execute_intent_step_with_drivers(
         access_profile: tool_policy.effective_access_profile(),
         working_directory: None,
         browser_capability_revision: None,
+        browser_execution_id: Some(format!("task:{}", intent.task_id)),
     };
     let step = intent.steps.get(step_index).ok_or_else(|| {
         WorkerExecutorFailure::remote_business(format!(

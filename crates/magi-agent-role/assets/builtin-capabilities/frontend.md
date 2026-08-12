@@ -15,4 +15,4 @@ version: 1
 - 用户可见错误应保留真实原因和操作上下文，同时避免泄漏敏感信息；
 - 修改交互后必须检查控制台错误、失败请求、焦点、滚动、重复提交和异步竞态。
 
-工具与验收：有可运行页面时必须完成以下闭环：读取项目清单确认已有启动命令；用 `shell_exec(background=true)` 启动受管开发服务并从输出确认真实 URL；用 `browser_navigate` 打开页面；用 `browser_snapshot` 获取可交互元素并通过 `browser_click`、`browser_type`、`browser_press`、`browser_scroll` 验证关键路径；用 `browser_viewport` 至少覆盖一个桌面和一个手机视口；按需用 `browser_screenshot` 留存视觉证据。构建、类型检查、静态阅读或 curl 不能替代真实浏览器验收；服务和浏览器工具不可用时必须报告真实阻塞与未覆盖范围。
+工具与验收：有可运行页面时必须完成以下闭环：读取项目清单确认已有启动命令；用 `shell_exec(background=true)` 启动受管开发服务并从输出确认真实 URL；需要继续交互时用 `browser_navigate(include_snapshot=true)` 一次打开页面并取得可交互元素，通过 `browser_click`、`browser_type`、`browser_press`、`browser_scroll` 验证关键路径，输入后需要提交搜索或表单时用 `browser_type(submit_key=Enter)` 合并完成，后续仍需观察页面时给交互工具设置 `include_snapshot=true`；文本、标题、计数、控件和状态直接从快照读取，仅在页面结构确实变化且当前结果没有附带快照时调用 `browser_snapshot`，不要重复获取快照；`browser_screenshot` 只用于布局、样式、图像等视觉问题或用户明确要求截图的场景，不能用于读取文本或定位控件；用 `browser_viewport` 至少覆盖一个桌面和一个手机视口。构建、类型检查、静态阅读或 curl 不能替代真实浏览器验收；服务和浏览器工具不可用时必须报告真实阻塞与未覆盖范围。

@@ -7,10 +7,21 @@ globalThis.$state = (value) => value;
 await withGoldenViteServer(async (server) => {
   const rightPane = await server.ssrLoadModule('/src/stores/right-pane.svelte.ts');
   const filePreview = await server.ssrLoadModule('/src/lib/file-preview-utils.ts');
+  const browserViewport = await server.ssrLoadModule('/src/lib/browser-viewport.ts');
 
   assert.equal(filePreview.isHtmlFile('design/index.html'), true);
   assert.equal(filePreview.isHtmlFile('design/index.HTM'), true);
   assert.equal(filePreview.isHtmlFile('design/index.ts'), false);
+  assert.deepEqual(
+    browserViewport.automaticBrowserViewport({ width: 750, height: 628 }),
+    { width: 1280, height: 1072, deviceType: 'desktop' },
+    'automatic desktop mode must keep a full wide Chromium viewport and fit it to the panel surface',
+  );
+  assert.deepEqual(
+    browserViewport.automaticBrowserViewport({ width: 478, height: 628 }),
+    { width: 478, height: 628, deviceType: 'mobile' },
+    'automatic narrow mode must use the browser-native mobile viewport instead of clipping a desktop page',
+  );
 
   const rightPaneSource = await readFile(
     new URL('../src/web/RightPane.svelte', import.meta.url),
@@ -37,8 +48,8 @@ await withGoldenViteServer(async (server) => {
   );
   assert.match(
     rightPaneSource,
-    /deviceType: width <= 600 \? 'mobile' : 'desktop'/,
-    'the initial browser request must use the device identity implied by the pane width',
+    /automaticBrowserViewport\(\{[\s\S]*?rightPaneBodyElement\?\.clientWidth[\s\S]*?rightPaneBodyElement\?\.clientHeight/,
+    'the initial browser request must use the shared logical viewport and panel-surface policy',
   );
   assert.match(rightPaneSource, /agentUrl\('\/api\/files\/site-open'/);
   assert.match(rightPaneSource, /openHtmlInMagiBrowser/);
@@ -144,8 +155,13 @@ await withGoldenViteServer(async (server) => {
   );
   assert.match(
     browserPaneSource,
-    /canvas\.width = image\.width;[\s\S]*?canvas\.height = image\.height;/,
-    'the canvas backing store must preserve the encoded high-DPI frame dimensions',
+    /renderedFrameObjectUrl = objectUrl;[\s\S]*?renderedFrameUrl = objectUrl;[\s\S]*?renderedFrameMetadata = metadata;/,
+    'the encoded Browser Host frame must be displayed directly without canvas resampling',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /drawImage\(|getContext\(['"]2d['"]\)/,
+    'browser frames must not be resampled through a canvas',
   );
   assert.match(
     browserPaneSource,
@@ -189,8 +205,8 @@ await withGoldenViteServer(async (server) => {
   );
   assert.match(
     browserPaneSource,
-    /browserChannelUrl\([\s\S]*?viewportControllerId,[\s\S]*?initialViewport,[\s\S]*?\)/,
-    'the browser channel must bind its initial surface size to the same physical View',
+    /browserChannelUrl\([\s\S]*?viewportControllerId,[\s\S]*?initialViewport,[\s\S]*?initialSurface,[\s\S]*?\)/,
+    'the browser channel must bind separate logical viewport and display surface sizes to the same physical View',
   );
   assert.match(
     browserPaneSource,
@@ -226,6 +242,11 @@ await withGoldenViteServer(async (server) => {
     browserPaneSource,
     /action: 'set',[\s\S]*?surfaceWidth: surface\.width,[\s\S]*?surfaceHeight: surface\.height/,
     'fixed viewport updates must send the panel surface to Chromium with the logical viewport',
+  );
+  assert.match(
+    browserPaneSource,
+    /action: 'sync',[\s\S]*?width: viewport\.width,[\s\S]*?height: viewport\.height,[\s\S]*?surfaceWidth: requested\.width,[\s\S]*?surfaceHeight: requested\.height/,
+    'automatic viewport updates must resize the panel surface without collapsing the desktop logical viewport',
   );
   assert.doesNotMatch(
     browserPaneSource,
@@ -329,6 +350,7 @@ await withGoldenViteServer(async (server) => {
     {
       browserSessionId: 'browser-session-sync',
       activeTabId: 'browser-tab-sync-1',
+      agentOccupied: false,
       tabs: [
         {
           tabId: 'browser-tab-sync-1',
@@ -359,6 +381,7 @@ await withGoldenViteServer(async (server) => {
     {
       browserSessionId: 'browser-session-sync',
       activeTabId: 'browser-tab-sync-2',
+      agentOccupied: true,
       tabs: [
         {
           tabId: 'browser-tab-sync-1',
@@ -385,6 +408,11 @@ await withGoldenViteServer(async (server) => {
     browserSyncPane.openTabs.find((tab) => tab.id.endsWith('browser-tab-sync-2'))?.label,
     '新标签页',
   );
+  assert.equal(
+    browserSyncPane.openTabs.find((tab) => tab.id.endsWith('browser-tab-sync-2'))?.payload.agentOccupied,
+    true,
+    'authority occupancy must be projected into every browser pane without persistence',
+  );
 
   rightPane.synchronizeBrowserTabs(
     'workspace-browser-sync',
@@ -393,6 +421,7 @@ await withGoldenViteServer(async (server) => {
     {
       browserSessionId: 'browser-session-sync',
       activeTabId: 'browser-tab-sync-1',
+      agentOccupied: false,
       tabs: [
         {
           tabId: 'browser-tab-sync-1',
@@ -413,6 +442,11 @@ await withGoldenViteServer(async (server) => {
     browserSyncPane.activeTabId,
     'browser:browser-session-sync:browser-tab-sync-1',
     'closing the active Page must follow BrowserAuthority activeTabId',
+  );
+  assert.equal(
+    browserSyncPane.openTabs.find((tab) => tab.id.endsWith('browser-tab-sync-1'))?.payload.agentOccupied,
+    false,
+    'a released authority snapshot must clear stale browser occupancy',
   );
 
   rightPane.activateRightPaneSession('workspace-active', 'session-active');

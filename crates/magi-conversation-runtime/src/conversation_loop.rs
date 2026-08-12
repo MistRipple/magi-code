@@ -1832,6 +1832,14 @@ fn run_conversation_loop_inner(
             }
         };
 
+        if !task_lease_is_current(task_store, task_id, lease_id) {
+            return (
+                TaskOutcome::Failed {
+                    error: "任务执行已被中断，丢弃晚到模型结果".to_string(),
+                },
+                context_summary,
+            );
+        }
         let parsed = response;
         last_response_observation = Some(format!(
             "模型轮次={}，status={:?}，finish_reason={}，正文字符数={}，thinking字符数={}，工具调用数={}",
@@ -2230,8 +2238,13 @@ fn run_conversation_loop_inner(
             tool_call_records.push(tool_call_record(tool_call, &result));
             if let Some(failure) = deterministic_tool_failure_tracker.observe(
                 &canonical_tool_name,
+                &tool_call.function.arguments,
                 &result,
                 tool_status,
+                task.policy_snapshot
+                    .as_ref()
+                    .map(|policy| policy.retry_limit)
+                    .unwrap_or(1),
             ) {
                 deterministic_tool_failure.get_or_insert(failure);
             }

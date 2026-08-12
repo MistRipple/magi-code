@@ -97,8 +97,8 @@ assert.match(
 );
 assert.match(
   inputAreaSource,
-  /function selectWorkspace\([\s\S]*?type: 'workspaceBindingChanged'[\s\S]*?workspaceId: workspace\.workspaceId[\s\S]*?workspacePath: workspaceBindingPath\(workspace\)[\s\S]*?sessionId: ''/,
-  '草稿态选择已有项目后必须使用权威 pathRef 切换工作空间绑定',
+  /function selectWorkspace\([\s\S]*?navigateSession\(\{[\s\S]*?kind: 'draft'[\s\S]*?workspaceId: workspace\.workspaceId[\s\S]*?workspacePath: workspaceBindingPath\(workspace\)/,
+  '草稿态选择已有项目后必须通过统一导航事务使用权威 pathRef',
 );
 assert.match(
   shellSource,
@@ -107,13 +107,8 @@ assert.match(
 );
 assert.match(
   shellSource,
-  /async function registerWorkspaceRoot\(rootPath: string, openDraft: boolean\)[\s\S]*?if \(openDraft\)[\s\S]*?selectComposerDraftWorkspace\(addedWorkspace\.workspaceId\)[\s\S]*?loadWorkspaceSessionsForSidebar\(addedWorkspace\)/,
-  '共享工作区注册流程必须能够自动选中新的草稿工作空间并只加载侧栏历史',
-);
-assert.match(
-  shellSource,
-  /if \(openDraft\)[\s\S]*?setCurrentSessionId\(null\)[\s\S]*?requestWorkspaceBindingSync\(addedWorkspace, null\)[\s\S]*?loadWorkspaceSessionsForSidebar\(addedWorkspace\)/,
-  '从输入区注册目录后必须切换权威工作空间绑定并继续保留新会话',
+  /async function registerWorkspaceRoot\(rootPath: string, openDraft: boolean\)[\s\S]*?if \(openDraft\)[\s\S]*?navigateSession\(\{[\s\S]*?kind: 'draft'[\s\S]*?workspaceId: addedWorkspace\.workspaceId[\s\S]*?workspacePath: workspaceBindingPath\(addedWorkspace\)/,
+  '共享工作区注册流程必须通过统一导航事务打开新工作区草稿',
 );
 assert.match(
   shellSource,
@@ -122,8 +117,8 @@ assert.match(
 );
 assert.match(
   shellSource,
-  /async function openWorkspaceDraft\(workspace: AgentWorkspaceSummary\): Promise<void>[\s\S]*?const workspacePath = workspaceBindingPath\(workspace\)[\s\S]*?selectComposerDraftWorkspace\(workspaceId\)[\s\S]*?type: 'newSession'[\s\S]*?workspaceId,[\s\S]*?workspacePath,[\s\S]*?loadWorkspaceSessionsForSidebar\(workspace\)/,
-  '工作空间快捷新会话必须使用权威 pathRef 进入 bridge',
+  /async function openWorkspaceDraft\(workspace: AgentWorkspaceSummary\): Promise<void>[\s\S]*?const workspacePath = workspaceBindingPath\(workspace\)[\s\S]*?navigateSession\(\{ kind: 'draft', workspaceId, workspacePath \}\)/,
+  '工作空间快捷新会话必须使用权威 pathRef 进入统一导航事务',
 );
 assert.match(
   shellSource,
@@ -132,8 +127,8 @@ assert.match(
 );
 assert.match(
   shellSource,
-  /async function openWorkspaceDraft[\s\S]*?sessionsAlreadyLoaded[\s\S]*?messagesState\.workspaceSessionProjection\.workspaceId !== workspaceId[\s\S]*?const cursor = workspaceSessionCursorByWorkspace\.get\(workspaceId\)[\s\S]*?replaceWorkspaceSessionProjection\(workspaceId, sessionsByWorkspace\[workspaceId\] \?\? \[\], cursor\);[\s\S]*?type: 'newSession'/,
-  '跨工作区进入草稿时必须切换会话目录投影，同工作区不得重复替换已加载列表',
+  /async function openWorkspaceDraft[\s\S]*?navigateSession\(\{ kind: 'draft', workspaceId, workspacePath \}\)[\s\S]*?if \(!sessionsAlreadyLoaded\)[\s\S]*?loadWorkspaceSessionsForSidebar\(workspace\)/,
+  '工作区草稿导航与侧栏目录加载必须保持职责分离',
 );
 assert.doesNotMatch(
   shellSource,
@@ -142,7 +137,7 @@ assert.doesNotMatch(
 );
 assert.match(
   shellSource,
-  /class="workspace-new-session-btn"[\s\S]*?disabled=\{workspaceActionPending \|\| messagesState\.sessionHydrating \|\| Boolean\(pendingSessionSwitchId\)\}[\s\S]*?event\.stopPropagation\(\)[\s\S]*?openWorkspaceDraft\(workspace\)[\s\S]*?<Icon name="plus"/,
+  /class="workspace-new-session-btn"[\s\S]*?disabled=\{workspaceActionPending \|\| messagesState\.sessionHydrating \|\| Boolean\(pendingNavigation\)\}[\s\S]*?event\.stopPropagation\(\)[\s\S]*?openWorkspaceDraft\(workspace\)[\s\S]*?<Icon name="plus"/,
   '工作空间行必须提供不会触发展开的加号按钮，并在状态切换期间禁用',
 );
 assert.match(

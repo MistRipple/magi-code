@@ -41,11 +41,11 @@
   import {
     composerWorkspaceState,
     resolveComposerWorkspace,
-    selectComposerDraftWorkspace,
     setComposerHasUnsavedInput,
     type ComposerWorkspaceOption,
   } from '../stores/composer-workspace.svelte';
   import { openWorkspaceFolderPicker } from '../stores/workspace-onboarding.svelte';
+  import { navigateSession, sessionNavigationState } from '../shared/session-navigation.svelte';
   import { canFetchModelList } from '../shared/model-governance';
   import {
     resolveOrchestratorModel,
@@ -299,7 +299,7 @@
     return projection.runner_status === 'running';
   });
   const sessionInputLocked = $derived.by(() => (
-    messagesState.sessionHydrating
+    sessionNavigationState.pending !== null || messagesState.sessionHydrating
   ));
 
   const isSending = $derived.by(() => messagesState.isProcessing || shouldInterruptAgentRunFromComposer);
@@ -975,14 +975,13 @@
 
   function selectWorkspace(workspaceId: string) {
     if (!isDraftSession || sessionInputLocked || isInteractionBlocking) return;
-    const workspace = selectComposerDraftWorkspace(workspaceId);
+    const workspace = composerWorkspaceState.workspaces.find((candidate) => candidate.workspaceId === workspaceId) ?? null;
     if (!workspace) return;
     workspacePickerOpen = false;
-    vscode.postMessage({
-      type: 'workspaceBindingChanged',
+    navigateSession({
+      kind: 'draft',
       workspaceId: workspace.workspaceId,
       workspacePath: workspaceBindingPath(workspace),
-      sessionId: '',
     });
   }
 

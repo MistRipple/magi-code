@@ -200,6 +200,13 @@ fn configured_dev_runtime(state: &ApiState) -> Option<BrowserHostProcessConfig> 
         tracing::warn!("开发态 Browser Host 缺少 Node 可执行文件");
         return None;
     };
+    let playwright_version = match env::var("MAGI_BROWSER_PLAYWRIGHT_VERSION") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            tracing::warn!("开发态 Browser Host 缺少 Playwright 版本");
+            return None;
+        }
+    };
     for (name, path) in [
         ("node", &node_executable),
         ("host", &host_entry),
@@ -227,7 +234,7 @@ fn configured_dev_runtime(state: &ApiState) -> Option<BrowserHostProcessConfig> 
         profile_path,
         runtime_version: "dev-workspace".to_string(),
         host_version: env!("CARGO_PKG_VERSION").to_string(),
-        playwright_version: "1.58.2".to_string(),
+        playwright_version,
         runtime_mode: "development",
     })
 }
@@ -1708,15 +1715,17 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, host_gen
         }
         BrowserHostEvent::Dialog {
             tab_id,
+            dialog_id,
             dialog_type,
             message,
         } => {
             publish_tab_event(
                 state,
-                "browser.dialog.dismissed",
+                "browser.dialog.opened",
                 browser_tab_context(state, &tab_id),
                 serde_json::json!({
                     "tab_id": tab_id,
+                    "dialog_id": dialog_id,
                     "dialog_type": dialog_type,
                     "message": magi_core::public_runtime_excerpt(&message, 1024),
                 }),
@@ -1760,6 +1769,7 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, host_gen
         }
         BrowserHostEvent::Ready(_)
         | BrowserHostEvent::Console { .. }
+        | BrowserHostEvent::AgentCursor(_)
         | BrowserHostEvent::BinaryPayloadReady(_)
         | BrowserHostEvent::Heartbeat { .. } => {}
     }

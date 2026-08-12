@@ -62,6 +62,12 @@ pub struct ToolExecutionContext {
     /// 每次模型调用前捕获，不能在工具执行时重新读取最新 revision。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_capability_revision: Option<u64>,
+    /// 一次浏览器自动化流程的稳定执行标识。
+    ///
+    /// 同一用户轮次或任务中的所有浏览器工具调用必须携带同一值，浏览器运行时
+    /// 据此把逻辑 Tab 固定到同一个物理 Page，避免快照引用跨 Page 失效。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_execution_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

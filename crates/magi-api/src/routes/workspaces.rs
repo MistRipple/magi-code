@@ -67,7 +67,6 @@ struct WorkspaceSessionsResponse {
     runtime_epoch: String,
     event_stream_next_sequence: u64,
     workspace: WorkspaceDto,
-    session_id: String,
     sessions: Vec<WorkspaceSessionDto>,
 }
 
@@ -233,7 +232,6 @@ async fn pick_workspace(State(state): State<ApiState>) -> Json<serde_json::Value
 struct WorkspaceSessionsQuery {
     workspace_id: Option<String>,
     workspace_path: Option<String>,
-    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,30 +368,10 @@ async fn workspace_sessions(
         })
         .collect::<Vec<_>>();
 
-    let requested_session_id = query
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let current_session_id = requested_session_id
-        .filter(|session_id| {
-            scoped_sessions
-                .iter()
-                .any(|session| session.session_id == *session_id)
-        })
-        .or_else(|| {
-            scoped_sessions
-                .first()
-                .map(|session| session.session_id.as_str())
-        })
-        .unwrap_or_default()
-        .to_string();
-
     Ok(Json(WorkspaceSessionsResponse {
         runtime_epoch: state.runtime_epoch().to_string(),
         event_stream_next_sequence,
         workspace: workspace_dto,
-        session_id: current_session_id,
         sessions: scoped_sessions,
     }))
 }
@@ -715,7 +693,7 @@ mod tests {
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/workspaces/sessions?workspaceId=workspace-count&sessionId=session-counted")
+                    .uri("/workspaces/sessions?workspaceId=workspace-count")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -735,7 +713,7 @@ mod tests {
                 .is_some_and(|sequence| sequence >= 1)
         );
         assert_eq!(payload["workspace"]["workspaceId"], "workspace-count");
-        assert_eq!(payload["sessionId"], "session-counted");
+        assert!(payload.get("sessionId").is_none());
         let sessions = payload["sessions"]
             .as_array()
             .expect("sessions should be an array");
@@ -798,7 +776,7 @@ mod tests {
                 .with_state(state.clone())
                 .oneshot(
                     Request::builder()
-                        .uri("/workspaces/sessions?workspaceId=workspace-unread-completion&sessionId=session-unread-completion")
+                        .uri("/workspaces/sessions?workspaceId=workspace-unread-completion")
                         .body(Body::empty())
                         .expect("request should build"),
                 )
@@ -996,7 +974,7 @@ mod tests {
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/workspaces/sessions?workspaceId=workspace-running-session&sessionId=session-running")
+                    .uri("/workspaces/sessions?workspaceId=workspace-running-session")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -1052,7 +1030,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/workspaces/sessions?workspaceId=workspace-stale-query&workspacePath={}&sessionId=session-path-bound",
+                        "/workspaces/sessions?workspaceId=workspace-stale-query&workspacePath={}",
                         urlencoding::encode(root.to_string_lossy().as_ref())
                     ))
                     .body(Body::empty())
@@ -1068,7 +1046,7 @@ mod tests {
             payload["workspace"]["rootPath"],
             root.to_string_lossy().as_ref()
         );
-        assert_eq!(payload["sessionId"], "session-path-bound");
+        assert!(payload.get("sessionId").is_none());
         let sessions = payload["sessions"]
             .as_array()
             .expect("sessions should be an array");
@@ -1165,7 +1143,7 @@ mod tests {
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/workspaces/sessions?workspaceId=workspace-session-list&sessionId=session-workspace-bound")
+                    .uri("/workspaces/sessions?workspaceId=workspace-session-list")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -1178,7 +1156,7 @@ mod tests {
             .expect("body should read");
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("payload should deserialize");
-        assert_eq!(payload["sessionId"], "session-workspace-bound");
+        assert!(payload.get("sessionId").is_none());
         let sessions = payload["sessions"]
             .as_array()
             .expect("sessions should be an array");
@@ -1269,7 +1247,7 @@ mod tests {
             .expect("body should read");
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("payload should deserialize");
-        assert_eq!(payload["sessionId"], "");
+        assert!(payload.get("sessionId").is_none());
         assert!(
             payload["sessions"]
                 .as_array()
@@ -1326,7 +1304,7 @@ mod tests {
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/workspaces/sessions?workspaceId=workspace-session-order&sessionId=session-newer")
+                    .uri("/workspaces/sessions?workspaceId=workspace-session-order")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -1339,7 +1317,7 @@ mod tests {
             .expect("body should read");
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("payload should deserialize");
-        assert_eq!(payload["sessionId"], "session-newer");
+        assert!(payload.get("sessionId").is_none());
         let sessions = payload["sessions"]
             .as_array()
             .expect("sessions should be an array");
@@ -1349,7 +1327,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_sessions_selects_latest_visible_session_without_explicit_session() {
+    async fn workspace_sessions_does_not_select_session_without_explicit_navigation() {
         let state = test_state();
         let workspace_id = WorkspaceId::new("workspace-default-latest");
         state
@@ -1406,7 +1384,7 @@ mod tests {
             .expect("body should read");
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("payload should deserialize");
-        assert_eq!(payload["sessionId"], "session-default-newer");
+        assert!(payload.get("sessionId").is_none());
         assert_eq!(
             payload["sessions"]
                 .as_array()
@@ -1453,7 +1431,7 @@ mod tests {
             .expect("body should read");
         let payload: serde_json::Value =
             serde_json::from_slice(&body).expect("payload should deserialize");
-        assert_eq!(payload["sessionId"], "");
+        assert!(payload.get("sessionId").is_none());
         assert!(
             payload["sessions"]
                 .as_array()

@@ -58,6 +58,8 @@ import {
   handleRetryRuntimePayload,
 } from './message-utils';
 import { buildEmptyWorkspaceAppState } from '../shared/bridges/empty-workspace-state';
+import { failSessionNavigation, settleSessionNavigation } from '../shared/session-navigation.svelte';
+import { selectComposerDraftWorkspace } from '../stores/composer-workspace.svelte';
 import { settingsBootstrapMatchesCurrentWorkspace } from '../web/agent-api';
 import {
   isCanonicalTerminalStatus,
@@ -114,55 +116,6 @@ function clearCurrentSessionBeforeWorkspaceChange(nextWorkspaceId: string): void
   ) {
     setCurrentSessionId(null);
   }
-}
-
-function handleWorkspaceSessionDetached(
-  payload: Record<string, unknown>,
-): void {
-  const draftConfig = payload.orchestratorSessionConfig;
-  const nextDraftConfig = draftConfig
-    && typeof draftConfig === 'object'
-    && !Array.isArray(draftConfig)
-    ? draftConfig as Record<string, unknown>
-    : {};
-  batchWebviewStatePersistence(() => {
-    messagesState.sessionHydrating = false;
-    const hasPendingLocalTurn = messagesState.pendingRequests.size > 0;
-    if (!hasPendingLocalTurn) {
-      clearAllMessages({
-        persist: false,
-        resetTimelineView: true,
-        resetPanelState: true,
-        skipAntiLiftBack: true,
-      });
-      clearAllRequestBindings();
-      clearPendingInteractions();
-      clearProcessingState({ skipAntiLiftBack: true });
-    }
-    const nextWorkspaceId = typeof payload.workspaceId === 'string' && payload.workspaceId.trim()
-      ? payload.workspaceId.trim()
-      : currentWorkspaceIdValue();
-    clearCurrentSessionBeforeWorkspaceChange(nextWorkspaceId);
-    messagesState.currentWorkspaceId = nextWorkspaceId || messagesState.currentWorkspaceId;
-    messagesState.currentWorkspacePath = typeof payload.workspacePath === 'string' ? payload.workspacePath.trim() : '';
-    setCurrentSessionId(null);
-    if (!hasPendingLocalTurn) {
-      setQueuedMessages([]);
-      clearCanonicalSessionTurns();
-    }
-    setOrchestratorRuntimeState(null);
-    messagesState.draftOrchestratorSessionConfig = { ...nextDraftConfig };
-    const projectedSessions: Session[] = messagesState.workspaceSessionProjection.workspaceId === messagesState.currentWorkspaceId
-      ? ensureArray<Session>(messagesState.workspaceSessionProjection.sessions)
-      : [];
-    setAppState({
-      ...buildEmptyWorkspaceAppState(Date.now()),
-      currentSessionId: '',
-      currentWorkspaceId: messagesState.currentWorkspaceId,
-      currentWorkspacePath: messagesState.currentWorkspacePath,
-      sessions: projectedSessions,
-    });
-  });
 }
 
 const MODEL_STATUS_TYPES = new Set<ModelStatusType>([
@@ -612,12 +565,15 @@ export function handleUnifiedData(standard: StandardMessage) {
       }));
       break;
 
-    case 'workspaceDraftStarted':
-      handleWorkspaceSessionDetached(payload);
-      break;
-
-    case 'workspaceSessionCleared':
-      handleWorkspaceSessionDetached(payload);
+    case 'sessionNavigationFailed':
+      if (failSessionNavigation(payload.requestId)) {
+        showFeedback('error', typeof payload.message === 'string' ? payload.message : i18n.t('web.workbenchActionFailed', {
+          action: i18n.t('bridge.action.switchSession'),
+        }), {
+          source: 'session-management',
+          presentation: 'toast',
+        });
+      }
       break;
 
     case 'sessionBootstrapLoaded':
@@ -635,6 +591,9 @@ export function handleUnifiedData(standard: StandardMessage) {
         beforeCursor: payload.beforeCursor,
         canonicalHasMoreBefore: payload.canonicalHasMoreBefore,
         canonicalBeforeCursor: payload.canonicalBeforeCursor,
+        navigationRequestId: payload.navigationRequestId,
+        navigationTarget: payload.navigationTarget,
+        navigationOrchestratorSessionConfig: payload.navigationOrchestratorSessionConfig,
       }));
       break;
 
@@ -1149,6 +1108,26 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   const canonicalEventWatermark = Number.isFinite(eventStreamNextSequence)
     ? Math.max(0, Math.floor(eventStreamNextSequence) - 1)
     : 0;
+  const navigationRequestId = typeof message.navigationRequestId === 'string'
+    ? message.navigationRequestId.trim()
+    : '';
+  const navigationTarget = message.navigationTarget === 'draft'
+    ? 'draft'
+    : message.navigationTarget === 'session' ? 'session' : null;
+  const navigationDraftConfig = message.navigationOrchestratorSessionConfig
+    && typeof message.navigationOrchestratorSessionConfig === 'object'
+    && !Array.isArray(message.navigationOrchestratorSessionConfig)
+    ? message.navigationOrchestratorSessionConfig as Record<string, unknown>
+    : {};
+
+  const settleCommittedNavigation = (): boolean => {
+    if (!navigationRequestId || !navigationTarget) return false;
+    return settleSessionNavigation(navigationRequestId, {
+      kind: navigationTarget,
+      workspaceId,
+      sessionId,
+    });
+  };
 
   if (!state) {
     return;
@@ -1157,6 +1136,9 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
     const sessions = ensureArray(snapshot.sessions) as Session[];
     const hasPendingLocalTurn = messagesState.pendingRequests.size > 0;
+    const preserveExistingDraftConfig = navigationTarget === null
+      && !getState().currentSessionId
+      && getState().currentWorkspaceId?.trim() === workspaceId;
     batchWebviewStatePersistence(() => {
       messagesState.sessionHydrating = false;
       if (!hasPendingLocalTurn) {
@@ -1183,7 +1165,10 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         { allowRuntimeEpochChange: true },
       );
       setCurrentSessionId(null);
-      messagesState.draftOrchestratorSessionConfig = {};
+      messagesState.draftOrchestratorSessionConfig = navigationTarget === 'draft'
+        ? { ...navigationDraftConfig }
+        : preserveExistingDraftConfig ? { ...messagesState.draftOrchestratorSessionConfig } : {};
+      selectComposerDraftWorkspace(workspaceId);
       clearStaleSettingsBootstrapSnapshot();
       setSessionHistoryState(null, { workspaceId });
       setAppState({
@@ -1200,6 +1185,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         applyNotificationsSnapshot(null, snapshot.notifications.notifications, workspaceId);
       }
     });
+    settleCommittedNavigation();
     return;
   }
 
@@ -1285,6 +1271,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         settleAuthoritativeIdleState();
       }
     });
+    settleCommittedNavigation();
     return;
   }
 
@@ -1348,6 +1335,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     });
     reconcileRequestBindingsFromAuthoritativeThread(sessionId);
   });
+  settleCommittedNavigation();
 }
 
 function handleNotificationsLoaded(message: ClientBridgeMessage) {

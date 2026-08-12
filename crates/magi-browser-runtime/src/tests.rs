@@ -609,6 +609,45 @@ fn durable_browser_tab_contains_url_state_but_never_parent_viewport_state() {
 }
 
 #[test]
+fn chromium_error_pages_are_normalized_before_runtime_and_durable_restore() {
+    let mut authority = BrowserAuthority::new();
+    register_default_profile(&mut authority);
+    let browser_session_id = create_ready_session(
+        &mut authority,
+        "browser-session-error-page",
+        "session-error-page",
+    );
+    let tab_id = create_ready_tab(&mut authority, &browser_session_id, "tab-error-page");
+
+    let updated = authority
+        .apply_host_page_state(
+            &tab_id,
+            1,
+            "chrome-error://chromewebdata/".to_string(),
+            None,
+            "无法访问此网站".to_string(),
+            at(10),
+        )
+        .unwrap();
+    assert_eq!(updated.url, "about:blank");
+    assert_eq!(updated.origin, None);
+    assert_eq!(updated.title, "");
+
+    let mut durable = authority.durable_state();
+    assert_eq!(durable.tabs[0].url, "about:blank");
+    assert_eq!(durable.tabs[0].origin, None);
+    assert_eq!(durable.tabs[0].title, "");
+    durable.tabs[0].url = "chrome-error://chromewebdata/".to_string();
+    durable.tabs[0].origin = Some("chrome-error://chromewebdata".to_string());
+    durable.tabs[0].title = "无法访问此网站".to_string();
+    let restored = BrowserAuthority::restore_durable(durable, at(20)).unwrap();
+    let restored_tab = restored.tab(&tab_id).unwrap();
+    assert_eq!(restored_tab.url, "about:blank");
+    assert_eq!(restored_tab.origin, None);
+    assert_eq!(restored_tab.title, "");
+}
+
+#[test]
 fn viewport_runtime_state_is_scoped_to_each_browser_tab() {
     let mut authority = BrowserAuthority::new();
     register_default_profile(&mut authority);

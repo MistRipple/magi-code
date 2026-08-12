@@ -12,6 +12,22 @@ pub enum BrowserNavigationUrlError {
     BlockedMetadataEndpoint,
 }
 
+/// 将 Browser Host 的页面状态收敛到可恢复的 URL 边界。
+///
+/// Chromium 在网络失败或内部错误页时可能返回 `chrome-error://` 等内部
+/// scheme。它们只代表当前渲染失败，不能作为下一次恢复导航的输入；统一
+/// 降级到空白页，避免重启后反复恢复同一个无效 URL。
+pub fn normalize_browser_page_state(
+    url: String,
+    origin: Option<String>,
+    title: String,
+) -> (String, Option<String>, String) {
+    if validate_browser_navigation_url(&url).is_ok() {
+        return (url, origin, title);
+    }
+    ("about:blank".to_string(), None, String::new())
+}
+
 /// 校验所有进入 Browser Host 的 URL。浏览器不做逐 Origin 授权，但固定阻止危险
 /// scheme、URL 凭据和云元数据地址，避免本机网络边界被网页导航绕过。
 pub fn validate_browser_navigation_url(raw_url: &str) -> Result<(), BrowserNavigationUrlError> {

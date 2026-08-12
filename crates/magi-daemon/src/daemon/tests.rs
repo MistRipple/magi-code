@@ -2613,8 +2613,9 @@ async fn restart_restores_last_selected_workspace_session() {
 
     let (switch_status, switch_body) = post_json(
         app.clone(),
-        "/api/session/switch",
+        "/api/session/navigation",
         json!({
+            "target": "session",
             "workspaceId": second_workspace_id,
             "sessionId": selected_session_id,
         }),

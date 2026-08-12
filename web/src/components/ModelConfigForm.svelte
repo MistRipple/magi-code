@@ -97,7 +97,11 @@
       if (dropdownEl?.contains(target)) return;
       closeModelDropdown(statusKey);
     }
-    function handleScroll() {
+    function handleScroll(event: Event) {
+      const target = event.target;
+      if (target instanceof Node && (comboboxEl?.contains(target) || dropdownEl?.contains(target))) {
+        return;
+      }
       closeModelDropdown(statusKey);
     }
     window.addEventListener('pointerdown', handlePointerDown, true);

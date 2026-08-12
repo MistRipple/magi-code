@@ -21,13 +21,14 @@ let workspaceListPayload = null;
 const capturedTurnBodies = [];
 const capturedGuideQueueBodies = [];
 const bootstrapInterceptors = [];
+const sessionNavigationInterceptors = [];
 const workspaceSessionsInterceptors = [];
 const sessionQueueInterceptors = [];
 const bridgeMutationRequests = [];
 const bridgeMutationInterceptors = [];
 const sessionTurnInterceptors = [];
 let messagesSnapshotRequestCount = 0;
-let switchSessionRequestCount = 0;
+let sessionNavigationRequestCount = 0;
 let bootstrapRequestCount = 0;
 let workspaceSessionsRequestCount = 0;
 let workspaceSessionIsRunning = false;
@@ -377,18 +378,22 @@ function installFetchStub() {
         removedTimelineEntryIds: [],
       });
     }
-    if (parsed.pathname === '/api/session/switch') {
-      switchSessionRequestCount += 1;
+    if (parsed.pathname === '/api/session/navigation') {
+      sessionNavigationRequestCount += 1;
+      const body = JSON.parse(String(init.body || '{}'));
+      const interceptor = sessionNavigationInterceptors.shift();
+      if (interceptor) {
+        return interceptor(parsed, init);
+      }
+      const payload = bootstrapPayload();
+      if (body.target === 'session') {
+        return jsonResponse(payload);
+      }
       return jsonResponse({
-        sessionId: SESSION_ID,
-        currentSession: {
-          sessionId: SESSION_ID,
-          title: '桥接层实时会话',
-          createdAt: ACCEPTED_AT,
-          updatedAt: summaryUpdatedAt,
-          messageCount: summaryMessageCount,
-          workspaceId: WORKSPACE_ID,
-        },
+        ...payload,
+        currentSession: null,
+        timeline: [],
+        canonicalTurns: [],
       });
     }
     if (parsed.pathname === '/api/workspaces/sessions/viewed') {
@@ -471,6 +476,15 @@ function installFetchStub() {
       if (interceptor) {
         return interceptor(parsed);
       }
+      if (!parsed.searchParams.get('sessionId')) {
+        const payload = bootstrapPayload();
+        return jsonResponse({
+          ...payload,
+          currentSession: null,
+          timeline: [],
+          canonicalTurns: [],
+        });
+      }
       return jsonResponse(bootstrapPayload());
     }
     if (parsed.pathname === '/api/workspaces' && Array.isArray(workspaceListPayload)) {
@@ -487,20 +501,7 @@ function installFetchStub() {
       }
       const requestedWorkspaceId = parsed.searchParams.get('workspaceId') || '';
       if (requestedWorkspaceId && requestedWorkspaceId !== WORKSPACE_ID) {
-        const requestedSessionId = parsed.searchParams.get('sessionId') || '';
         const requestedWorkspacePath = parsed.searchParams.get('workspacePath') || '';
-        const sessions = requestedSessionId
-          ? [{
-              sessionId: requestedSessionId,
-              title: requestedSessionId,
-              createdAt: ACCEPTED_AT,
-              updatedAt: ACCEPTED_AT,
-              messageCount: 0,
-              workspaceId: requestedWorkspaceId,
-              isRunning: false,
-              runningTaskCount: 0,
-            }]
-          : [];
         return jsonResponse({
           runtimeEpoch: RUNTIME_EPOCH,
           eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
@@ -508,8 +509,7 @@ function installFetchStub() {
             workspaceId: requestedWorkspaceId,
             rootPath: requestedWorkspacePath,
           },
-          sessionId: requestedSessionId,
-          sessions,
+          sessions: [],
         });
       }
       const payload = bootstrapPayload();
@@ -517,7 +517,6 @@ function installFetchStub() {
         runtimeEpoch: RUNTIME_EPOCH,
         eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
         workspace: payload.workspace,
-        sessionId: payload.currentSession?.sessionId || '',
         sessions: payload.sessions.map((session) => ({
           ...session,
           isRunning: workspaceSessionIsRunning,
@@ -1157,9 +1156,15 @@ await withGoldenViteServer(async (server) => {
     },
   };
   bridge.postMessage({
-    type: 'newSession',
+    type: 'navigateSession',
+    target: 'draft',
+    requestId: 'navigation-draft-from-current-session',
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
+    orchestratorSessionConfig: {
+      model: 'model-inherited-from-current-session',
+      reasoningEffort: 'high',
+    },
   });
   await waitFor(
     () => !messagesStore.messagesState.currentSessionId,
@@ -1178,9 +1183,15 @@ await withGoldenViteServer(async (server) => {
     reasoningEffort: 'xhigh',
   };
   bridge.postMessage({
-    type: 'newSession',
+    type: 'navigateSession',
+    target: 'draft',
+    requestId: 'navigation-reopen-current-draft',
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
+    orchestratorSessionConfig: {
+      model: 'model-selected-in-draft',
+      reasoningEffort: 'xhigh',
+    },
   });
   await waitFor(
     () => messagesStore.messagesState.draftOrchestratorSessionConfig.model === 'model-selected-in-draft',
@@ -1197,10 +1208,15 @@ await withGoldenViteServer(async (server) => {
     'new-session draft must preserve the explicit workspace scope of the session list projection',
   );
   bridge.postMessage({
-    type: 'workspaceBindingChanged',
+    type: 'navigateSession',
+    target: 'draft',
+    requestId: 'navigation-idempotent-workspace-draft',
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
-    sessionId: '',
+    orchestratorSessionConfig: {
+      model: 'model-selected-in-draft',
+      reasoningEffort: 'xhigh',
+    },
   });
   assert.deepEqual(
     messagesStore.messagesState.workspaceSessionProjection.sessions.map((session) => session.id),
@@ -1242,8 +1258,8 @@ await withGoldenViteServer(async (server) => {
   );
   assert.equal(
     bootstrapRequestCount,
-    bootstrapRequestsBeforeDraftFocus,
-    '草稿断流恢复不得调用会自动选择旧会话的 session bootstrap',
+    bootstrapRequestsBeforeDraftFocus + 1,
+    '草稿断流恢复必须通过工作区级 bootstrap 原子恢复目录与空会话选择',
   );
   assert.equal(messagesStore.messagesState.currentSessionId, null,
     '草稿断流恢复后必须保持无会话绑定');
@@ -1262,7 +1278,9 @@ await withGoldenViteServer(async (server) => {
   );
 
   bridge.postMessage({
-    type: 'switchSession',
+    type: 'navigateSession',
+    target: 'session',
+    requestId: 'navigation-back-to-current-session',
     sessionId: SESSION_ID,
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
@@ -1553,7 +1571,7 @@ await withGoldenViteServer(async (server) => {
     SESSION_ID,
     '切换后带变更会话',
   ).pendingChanges;
-  bootstrapInterceptors.push((parsed) => {
+  sessionNavigationInterceptors.push((parsed) => {
     switchBootstrapRequests.push(parsed);
     return jsonResponse(scopedBootstrapPayloadWithPendingChange(
       WORKSPACE_ID,
@@ -1564,7 +1582,9 @@ await withGoldenViteServer(async (server) => {
   });
   const messagesSnapshotBeforeSwitch = messagesSnapshotRequestCount;
   bridge.postMessage({
-    type: 'switchSession',
+    type: 'navigateSession',
+    target: 'session',
+    requestId: 'navigation-restore-authoritative-bootstrap',
     sessionId: SESSION_ID,
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
@@ -1627,15 +1647,16 @@ await withGoldenViteServer(async (server) => {
     runtimeEpoch: RUNTIME_EPOCH,
     eventStreamNextSequence: EVENT_STREAM_NEXT_SEQUENCE,
     workspace: foregroundBootstrap.workspace,
-    sessionId: SESSION_ID,
     sessions: [
       { ...backgroundSession, isRunning: true, runningTaskCount: 1 },
       { ...foregroundBootstrap.sessions[1], isRunning: false, runningTaskCount: 0 },
     ],
   };
-  bootstrapInterceptors.push(() => jsonResponse(foregroundBootstrap));
+  sessionNavigationInterceptors.push(() => jsonResponse(foregroundBootstrap));
   bridge.postMessage({
-    type: 'switchSession',
+    type: 'navigateSession',
+    target: 'session',
+    requestId: 'navigation-foreground-running-session',
     sessionId: SESSION_ID,
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
@@ -1848,10 +1869,11 @@ await withGoldenViteServer(async (server) => {
 
   const staleUrlBootstrapRequests = [];
   bridge.postMessage({
-    type: 'workspaceBindingChanged',
+    type: 'navigateSession',
+    target: 'draft',
+    requestId: 'navigation-clear-stale-url',
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
-    sessionId: '',
   });
   await waitFor(
     () => !messagesStore.messagesState.currentSessionId,
@@ -2013,12 +2035,7 @@ await withGoldenViteServer(async (server) => {
     SESSION_ID,
     '首屏非阻塞会话',
   )));
-  bridge.postMessage({
-    type: 'workspaceBindingChanged',
-    workspaceId: WORKSPACE_ID,
-    workspacePath: WORKSPACE_PATH,
-    sessionId: SESSION_ID,
-  });
+  window.location.href = `http://127.0.0.1:38123/web.html?workspaceId=${encodeURIComponent(WORKSPACE_ID)}&workspacePath=${encodeURIComponent(WORKSPACE_PATH)}&sessionId=${encodeURIComponent(SESSION_ID)}`;
   messagesStore.messagesState.bootstrapped = false;
   bridge.postMessage({ type: 'requestState' });
   await waitForWithin(
@@ -2069,13 +2086,7 @@ await withGoldenViteServer(async (server) => {
       'race setup must start the first bootstrap request',
     );
 
-    bridge.postMessage({
-      type: 'workspaceBindingChanged',
-      workspaceId: RACE_WORKSPACE_ID,
-      workspacePath: RACE_WORKSPACE_PATH,
-      sessionId: RACE_SESSION_ID,
-    });
-    bootstrapInterceptors.push((parsed) => {
+    sessionNavigationInterceptors.push((parsed) => {
       raceBootstrapRequests.push(parsed);
       return secondBootstrap.promise.then(() => jsonResponse(scopedBootstrapPayload(
         RACE_WORKSPACE_ID,
@@ -2084,7 +2095,14 @@ await withGoldenViteServer(async (server) => {
         '启动竞态会话',
       )));
     });
-    bridge.postMessage({ type: 'requestState' });
+    bridge.postMessage({
+      type: 'navigateSession',
+      target: 'session',
+      requestId: 'navigation-bootstrap-race-latest',
+      workspaceId: RACE_WORKSPACE_ID,
+      workspacePath: RACE_WORKSPACE_PATH,
+      sessionId: RACE_SESSION_ID,
+    });
     await waitFor(
       () => raceBootstrapRequests.length === 2,
       'binding-changed requestState must start a fresh bootstrap instead of reusing stale recovery',
@@ -2110,26 +2128,27 @@ await withGoldenViteServer(async (server) => {
   }
 
   const missingSessionId = 'session-bridge-explicitly-missing';
+  const navigationRequestsBeforeMissingSession = sessionNavigationRequestCount;
+  sessionNavigationInterceptors.push(() => new Response(
+    JSON.stringify({ message: `session 不存在: ${missingSessionId}` }),
+    { status: 404, headers: { 'content-type': 'application/json' } },
+  ));
   bridge.postMessage({
-    type: 'workspaceBindingChanged',
+    type: 'navigateSession',
+    target: 'session',
+    requestId: 'navigation-missing-session',
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
     sessionId: missingSessionId,
   });
-  bootstrapInterceptors.push(() => new Response(
-    JSON.stringify({ message: `session 不存在: ${missingSessionId}` }),
-    { status: 404, headers: { 'content-type': 'application/json' } },
-  ));
-  bridge.postMessage({ type: 'requestState' });
   await waitFor(
-    () => messagesStore.messagesState.currentWorkspaceId === WORKSPACE_ID
-      && !messagesStore.messagesState.currentSessionId,
-    'unknown explicit session bootstrap must keep workspace but clear the invalid session binding',
+    () => sessionNavigationRequestCount > navigationRequestsBeforeMissingSession,
+    'unknown explicit session navigation must reach backend',
   );
   assert.equal(
-    window.location.href.includes('sessionId='),
-    false,
-    'unknown explicit session bootstrap must remove the invalid session from URL',
+    messagesStore.messagesState.currentSessionId,
+    RACE_SESSION_ID,
+    'failed navigation must preserve the previously committed session',
   );
 
   workspaceListPayload = [];
@@ -2148,19 +2167,20 @@ await withGoldenViteServer(async (server) => {
     () => staleEmptyBootstrapRequested,
     'stale empty-workspace bootstrap request must start',
   );
-  bridge.postMessage({
-    type: 'workspaceBindingChanged',
-    workspaceId: WORKSPACE_ID,
-    workspacePath: WORKSPACE_PATH,
-    sessionId: SESSION_ID,
-  });
-  bootstrapInterceptors.push(() => jsonResponse(scopedBootstrapPayload(
+  sessionNavigationInterceptors.push(() => jsonResponse(scopedBootstrapPayload(
     WORKSPACE_ID,
     WORKSPACE_PATH,
     SESSION_ID,
     '最新会话',
   )));
-  bridge.postMessage({ type: 'requestState' });
+  bridge.postMessage({
+    type: 'navigateSession',
+    target: 'session',
+    requestId: 'navigation-after-stale-empty-bootstrap',
+    workspaceId: WORKSPACE_ID,
+    workspacePath: WORKSPACE_PATH,
+    sessionId: SESSION_ID,
+  });
   await waitFor(
     () => messagesStore.messagesState.currentWorkspaceId === WORKSPACE_ID
       && messagesStore.messagesState.currentSessionId === SESSION_ID,

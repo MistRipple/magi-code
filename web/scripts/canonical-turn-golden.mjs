@@ -734,7 +734,7 @@ function assertWorkspaceDraftPreservesSessionList(dataHandlers, messagesStore) {
   messagesStore.setCurrentSessionId(sessions[0].id);
 
   dataHandlers.handleUnifiedData({
-    id: 'golden-workspace-draft-started',
+    id: 'golden-workspace-draft-bootstrap',
     category: 'data',
     type: 'system',
     source: 'orchestrator',
@@ -744,8 +744,28 @@ function assertWorkspaceDraftPreservesSessionList(dataHandlers, messagesStore) {
     timestamp: 22_000,
     updatedAt: 22_000,
     data: {
-      dataType: 'workspaceDraftStarted',
-      payload: { workspaceId, workspacePath },
+      dataType: 'sessionBootstrapLoaded',
+      payload: {
+        agent: { runtimeEpoch: 'runtime-golden-draft-preserve' },
+        eventStreamNextSequence: 1,
+        sessionId: '',
+        workspace: { workspaceId, rootPath: workspacePath },
+        sessions,
+        canonicalTurns: [],
+        state: {
+          currentSessionId: '',
+          currentWorkspaceId: workspaceId,
+          currentWorkspacePath: workspacePath,
+          sessions,
+          isProcessing: false,
+          processingState: null,
+          messages: [],
+          edits: [],
+          changedFiles: [],
+          pendingChanges: [],
+          pendingChangesState: null,
+        },
+      },
     },
   });
 
