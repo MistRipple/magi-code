@@ -1051,6 +1051,7 @@ export interface FetchModelsResponseDto {
   success: boolean;
   target: string;
   models: string[];
+  orchestratorSessionDefaults?: Record<string, unknown> | null;
   requestedAt: number;
 }
 

@@ -205,15 +205,36 @@ struct ExecuteDispatchSubmissionInput<'a> {
 }
 
 fn initial_session_orchestrator_config(
+    state: &ApiState,
     created_session: bool,
     config: Option<&serde_json::Value>,
-) -> Result<Option<&serde_json::Value>, ApiError> {
+) -> Result<Option<serde_json::Value>, ApiError> {
     if !created_session && config.is_some() {
         return Err(ApiError::InvalidInput(
             "已有会话的模型只能通过会话模型设置操作修改".to_string(),
         ));
     }
-    Ok(created_session.then_some(config).flatten())
+    if !created_session {
+        return Ok(None);
+    }
+    let mut initial = super::settings::orchestrator_session_defaults(state);
+    let has_default_model = initial
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    if config.is_none() && !has_default_model {
+        return Ok(None);
+    }
+    if let Some(config) = config {
+        let explicit = super::settings::orchestrator_session_override_request(
+            &serde_json::json!({ "config": config }),
+        )?;
+        magi_conversation_runtime::model_config::merge_orchestrator_session_override(
+            &mut initial,
+            &explicit,
+        );
+    }
+    Ok(Some(initial))
 }
 
 async fn execute_dispatch_submission(
@@ -247,13 +268,14 @@ async fn execute_dispatch_submission(
         accepted_at,
     )?;
     if let Some(config) = initial_session_orchestrator_config(
+        state,
         created_session,
         request.orchestrator_session_config.as_ref(),
     )? {
         super::settings::save_orchestrator_session_override_for_session(
             state,
             &session_id,
-            config,
+            &config,
         )?;
         super::settings::require_orchestrator_session_model(state, &session_id)?;
     }
@@ -792,20 +814,55 @@ mod tests {
 
     #[test]
     fn turn_payload_only_initializes_model_for_a_new_session() {
+        let state = test_state();
+        state
+            .settings_store
+            .set_section(
+                magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
+                serde_json::json!({
+                    "model": "model-last-used",
+                    "reasoningEffort": "high"
+                }),
+            )
+            .unwrap();
         let config = serde_json::json!({ "model": "model-selected-by-user" });
         assert_eq!(
-            initial_session_orchestrator_config(true, Some(&config))
+            initial_session_orchestrator_config(&state, true, Some(&config))
                 .expect("new session config should be accepted"),
-            Some(&config),
+            Some(serde_json::json!({
+                "model": "model-selected-by-user",
+                "reasoningEffort": "high"
+            })),
         );
         assert!(
-            initial_session_orchestrator_config(false, Some(&config)).is_err(),
+            initial_session_orchestrator_config(&state, false, Some(&config)).is_err(),
             "ordinary turns must not be able to overwrite the persisted session model",
         );
         assert_eq!(
-            initial_session_orchestrator_config(false, None)
+            initial_session_orchestrator_config(&state, false, None)
                 .expect("existing session should use its persisted model"),
             None,
+        );
+    }
+
+    #[test]
+    fn new_session_without_explicit_config_uses_persisted_default() {
+        let state = test_state();
+        state
+            .settings_store
+            .set_section(
+                magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
+                serde_json::json!({ "model": "model-last-used" }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            initial_session_orchestrator_config(&state, true, None)
+                .expect("new session should inherit the persisted default"),
+            Some(serde_json::json!({
+                "model": "model-last-used",
+                "reasoningEffort": "medium"
+            })),
         );
     }
 

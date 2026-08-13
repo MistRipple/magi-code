@@ -1599,9 +1599,39 @@
     if (!snapshot || !settingsBootstrapMatchesCurrentWorkspace(snapshot)) return;
     messagesState.settingsBootstrapSnapshot = {
       ...snapshot,
+      orchestratorSessionDefaults: { ...sessionConfig },
       orchestratorSessionConfig: { ...sessionConfig },
       effectiveOrchestratorConfig: { ...effectiveConfig },
     } as AgentSettingsBootstrapSnapshot;
+  }
+
+  function applyOrchestratorSessionDefaults(defaults: Record<string, unknown>) {
+    const defaultModel = typeof defaults.model === 'string' ? defaults.model.trim() : '';
+    if (!defaultModel) return;
+    const snapshot = messagesState.settingsBootstrapSnapshot;
+    if (snapshot && settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
+      const currentSessionConfig = objectRecord(snapshot.orchestratorSessionConfig);
+      const currentModel = typeof currentSessionConfig.model === 'string'
+        ? currentSessionConfig.model.trim()
+        : '';
+      const resolvedSessionConfig = currentModel
+        ? currentSessionConfig
+        : { ...defaults, ...currentSessionConfig };
+      messagesState.settingsBootstrapSnapshot = {
+        ...snapshot,
+        orchestratorSessionDefaults: { ...defaults },
+        ...(!currentModel ? {
+          orchestratorSessionConfig: { ...resolvedSessionConfig },
+          effectiveOrchestratorConfig: {
+            ...snapshot.orchestratorConfig,
+            ...resolvedSessionConfig,
+          },
+        } : {}),
+      } as AgentSettingsBootstrapSnapshot;
+    }
+    if (isDraftSession) {
+      messagesState.draftOrchestratorSessionConfig = { ...defaults };
+    }
   }
 
   async function refreshPickerSettingsSnapshot() {
@@ -1648,6 +1678,9 @@
           'orch',
         );
         pickerModels = Array.isArray(payload.models) ? payload.models : [];
+        applyOrchestratorSessionDefaults(
+          objectRecord(payload.orchestratorSessionDefaults),
+        );
         pickerModelsConfigKey = configKey;
         pickerLoadedOnce = true;
       } catch (error) {

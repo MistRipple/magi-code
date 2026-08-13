@@ -89,6 +89,11 @@ assert.match(
 );
 assert.match(
   inputAreaSource,
+  /applyOrchestratorSessionDefaults\([\s\S]*?payload\.orchestratorSessionDefaults[\s\S]*?\);/,
+  '主线模型目录返回后必须立即应用后端权威的新会话默认配置',
+);
+assert.match(
+  inputAreaSource,
   /if \(!pickerLoadedOnce && !pickerLoading\) \{[\s\S]*?void loadPickerModels\(\);/,
   '模型快照不可用时必须打开选择器并后台加载模型，不得阻塞发送交互',
 );
@@ -101,6 +106,18 @@ assert.doesNotMatch(
   inputAreaSource,
   /let draftOrchestratorSessionConfig = \$state/,
   '草稿模型配置必须只有 messages store 一个事实源，不能保留组件级镜像',
+);
+
+const navigationSource = await readFile(new URL('../src/shared/session-navigation.svelte.ts', import.meta.url), 'utf8');
+assert.match(
+  navigationSource,
+  /snapshot\?\.orchestratorSessionDefaults/,
+  '新增会话必须继承持久化的新会话默认配置，不能依赖当前会话快照时序',
+);
+assert.doesNotMatch(
+  navigationSource,
+  /settingsBootstrapMatchesCurrentWorkspace/,
+  '新增会话默认模型不得因设置快照绑定切换而回退为空',
 );
 assert.doesNotMatch(
   inputAreaSource,

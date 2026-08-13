@@ -11,6 +11,7 @@ use magi_bridge_client::{
 use magi_conversation_runtime::model_context_window::set_model_context_window;
 use magi_core::{AccessProfile, EventId, SessionId, UtcMillis};
 use magi_event_bus::{EventContext, EventEnvelope};
+use magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION;
 use magi_usage_authority::{
     ExecutionBindingIdentity, LlmConfig, UrlMode, UsageAuthority, UsageCallIdentity,
     UsageCallRecordInput, UsageCallStatus, UsageModelSnapshot, UsagePhase, UsageSourceRole,
@@ -122,6 +123,73 @@ pub(super) fn orchestrator_session_override_request(
     Ok(Value::Object(override_config))
 }
 
+fn ensure_session_reasoning_effort(config: &mut Value) {
+    if !config.is_object() {
+        *config = json!({});
+    }
+    let fields = config
+        .as_object_mut()
+        .expect("orchestrator session config should be object");
+    let reasoning_effort_is_valid = fields
+        .get("reasoningEffort")
+        .and_then(Value::as_str)
+        .is_some_and(|value| matches!(value.trim(), "low" | "medium" | "high" | "xhigh"));
+    if !reasoning_effort_is_valid {
+        fields.insert(
+            "reasoningEffort".to_string(),
+            Value::String(DEFAULT_ORCHESTRATOR_REASONING_EFFORT.to_string()),
+        );
+    }
+}
+
+pub(super) fn orchestrator_session_defaults(state: &ApiState) -> Value {
+    let stored = state
+        .settings_store
+        .get_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION);
+    let request = json!({ "config": stored });
+    let mut defaults =
+        orchestrator_session_override_request(&request).unwrap_or_else(|_| json!({}));
+    ensure_session_reasoning_effort(&mut defaults);
+    defaults
+}
+
+fn resolved_orchestrator_session_config(state: &ApiState, session_id: &SessionId) -> Value {
+    let mut config = orchestrator_session_defaults(state);
+    let session_override = state
+        .settings_store
+        .get_session_section(session_id, "orchestrator");
+    merge_orchestrator_session_override(&mut config, &session_override);
+    config
+}
+
+fn ensure_orchestrator_session_defaults_from_models(
+    state: &ApiState,
+    models: &[String],
+) -> Result<Value, ApiError> {
+    let first_model = models.first().cloned();
+    state
+        .settings_store
+        .update_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION, |stored| {
+            let request = json!({ "config": stored.clone() });
+            let mut defaults =
+                orchestrator_session_override_request(&request).unwrap_or_else(|_| json!({}));
+            ensure_session_reasoning_effort(&mut defaults);
+            let fields = defaults
+                .as_object_mut()
+                .expect("orchestrator session defaults should be object");
+            let has_model = fields
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty());
+            if !has_model && let Some(model) = first_model.as_ref() {
+                fields.insert("model".to_string(), Value::String(model.clone()));
+            }
+            *stored = defaults;
+        })
+        .map_err(settings_persistence_error)?;
+    Ok(orchestrator_session_defaults(state))
+}
+
 pub(super) fn save_orchestrator_session_override_for_session(
     state: &ApiState,
     session_id: &SessionId,
@@ -148,19 +216,18 @@ pub(super) fn save_orchestrator_session_override_for_session(
     for (key, value) in override_fields {
         next_fields.insert(key.clone(), value.clone());
     }
-    let reasoning_effort_is_valid = next_fields
-        .get("reasoningEffort")
-        .and_then(Value::as_str)
-        .is_some_and(|value| matches!(value.trim(), "low" | "medium" | "high" | "xhigh"));
-    if !reasoning_effort_is_valid {
-        next_fields.insert(
-            "reasoningEffort".to_string(),
-            Value::String(DEFAULT_ORCHESTRATOR_REASONING_EFFORT.to_string()),
-        );
-    }
+    ensure_session_reasoning_effort(&mut next_config);
+    let mut next_defaults = orchestrator_session_defaults(state);
+    merge_orchestrator_session_override(&mut next_defaults, &next_config);
     state
         .settings_store
-        .set_session_section(session_id, "orchestrator", next_config.clone())
+        .set_session_and_global_sections(
+            session_id,
+            "orchestrator",
+            next_config.clone(),
+            ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
+            next_defaults,
+        )
         .map_err(settings_persistence_error)?;
     let workspace_id = state
         .session_store
@@ -928,9 +995,8 @@ async fn settings_bootstrap(
                 .cloned()
                 .unwrap_or(Value::Null);
             strip_orchestrator_session_owned_fields(&mut effective_orchestrator_config);
-            let session_orchestrator_config = state
-                .settings_store
-                .get_session_section(session_id, "orchestrator");
+            let session_orchestrator_config =
+                resolved_orchestrator_session_config(&state, session_id);
             merge_orchestrator_session_override(
                 &mut effective_orchestrator_config,
                 &session_orchestrator_config,
@@ -944,19 +1010,29 @@ async fn settings_bootstrap(
                 effective_orchestrator_config,
             );
         } else {
-            object.insert("orchestratorSessionConfig".to_string(), json!({}));
+            let session_defaults = orchestrator_session_defaults(&state);
+            let mut effective_orchestrator_config = object
+                .get("orchestratorConfig")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            strip_orchestrator_session_owned_fields(&mut effective_orchestrator_config);
+            merge_orchestrator_session_override(
+                &mut effective_orchestrator_config,
+                &session_defaults,
+            );
+            object.insert(
+                "orchestratorSessionConfig".to_string(),
+                session_defaults.clone(),
+            );
             object.insert(
                 "effectiveOrchestratorConfig".to_string(),
-                object
-                    .get("orchestratorConfig")
-                    .cloned()
-                    .map(|mut value| {
-                        strip_orchestrator_session_owned_fields(&mut value);
-                        value
-                    })
-                    .unwrap_or_else(|| json!({})),
+                effective_orchestrator_config,
             );
         }
+        object.insert(
+            "orchestratorSessionDefaults".to_string(),
+            orchestrator_session_defaults(&state),
+        );
         object.insert(
             "workspaceId".to_string(),
             Value::String(scope.workspace_id_string()),
@@ -1513,7 +1589,7 @@ async fn remove_agent(
 }
 
 async fn fetch_models(
-    State(_state): State<ApiState>,
+    State(state): State<ApiState>,
     Json(request): Json<FetchModelsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (config, target) = parse_fetch_models_config(request)?;
@@ -1525,10 +1601,14 @@ async fn fetch_models(
         ));
     }
 
+    let session_defaults = matches!(target.as_str(), "orch" | "orchestrator")
+        .then(|| ensure_orchestrator_session_defaults_from_models(&state, &models))
+        .transpose()?;
     Ok(Json(serde_json::json!({
         "success": true,
         "target": target,
         "models": models,
+        "orchestratorSessionDefaults": session_defaults,
         "requestedAt": now.0,
     })))
 }
@@ -2198,6 +2278,72 @@ mod tests {
 
         let _ =
             result.expect("orchestrator connection-only probe should pass through model catalog");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn orchestrator_model_catalog_initializes_first_model_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("stub addr should exist")
+        );
+        let app = Router::new().route("/v1/models", get(successful_models_stub));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("stub server should run");
+        });
+        let state = test_state();
+
+        let first = fetch_models(
+            State(state.clone()),
+            Json(FetchModelsRequest {
+                config: json!({
+                    "baseUrl": base_url,
+                    "apiKey": "test-key",
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat"
+                }),
+                target: "orch".to_string(),
+            }),
+        )
+        .await
+        .expect("first catalog fetch should initialize the default")
+        .0;
+        assert_eq!(
+            first["orchestratorSessionDefaults"],
+            json!({ "model": "gpt-test", "reasoningEffort": "medium" })
+        );
+
+        state
+            .settings_store
+            .set_section(
+                ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
+                json!({ "model": "model-last-used", "reasoningEffort": "high" }),
+            )
+            .unwrap();
+        let second = fetch_models(
+            State(state.clone()),
+            Json(FetchModelsRequest {
+                config: json!({
+                    "baseUrl": base_url,
+                    "apiKey": "test-key",
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat"
+                }),
+                target: "orch".to_string(),
+            }),
+        )
+        .await
+        .expect("later catalog fetch should preserve the latest selection")
+        .0;
+        assert_eq!(
+            second["orchestratorSessionDefaults"],
+            json!({ "model": "model-last-used", "reasoningEffort": "high" })
+        );
         server.abort();
     }
 

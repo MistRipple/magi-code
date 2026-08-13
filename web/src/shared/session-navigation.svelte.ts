@@ -1,5 +1,4 @@
 import { messagesState } from '../stores/messages.svelte';
-import { settingsBootstrapMatchesCurrentWorkspace } from '../web/agent-api';
 import { getClientBridge } from './bridges/bridge-runtime';
 import type { ClientBridgeMessage } from './bridges/client-bridge';
 import { copyOrchestratorSessionConfig } from './orchestrator-session-config';
@@ -28,11 +27,19 @@ function normalizeTarget(target: SessionNavigationTarget): SessionNavigationTarg
 }
 
 function inheritedDraftConfig(): Record<string, unknown> {
+  if (!messagesState.currentSessionId?.trim()) {
+    const draftConfig = copyOrchestratorSessionConfig(
+      messagesState.draftOrchestratorSessionConfig,
+      undefined,
+    );
+    if (typeof draftConfig.model === 'string' && draftConfig.model.trim()) {
+      return draftConfig;
+    }
+  }
   const snapshot = messagesState.settingsBootstrapSnapshot;
-  if (!snapshot || !settingsBootstrapMatchesCurrentWorkspace(snapshot)) return {};
   return copyOrchestratorSessionConfig(
-    snapshot.orchestratorSessionConfig,
-    snapshot.effectiveOrchestratorConfig,
+    snapshot?.orchestratorSessionDefaults,
+    snapshot?.effectiveOrchestratorConfig,
   );
 }
 

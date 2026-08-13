@@ -342,6 +342,9 @@ pub fn resolve_orchestrator_model_config(
 ) -> Result<NormalizedModelConfig, String> {
     let mut config = settings_store.get_section("orchestrator");
     strip_orchestrator_session_owned_fields(&mut config);
+    let defaults =
+        settings_store.get_section(magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION);
+    merge_orchestrator_session_override(&mut config, &defaults);
     if let Some(session_id) = session_id {
         let override_section = settings_store.get_session_section(session_id, "orchestrator");
         merge_orchestrator_session_override(&mut config, &override_section);
@@ -794,6 +797,45 @@ mod tests {
             configured_role_engine_model_config(&store, "executor")
                 .expect("orchestrator inheritance is valid")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn orchestrator_model_config_uses_defaults_for_legacy_session() {
+        let store = magi_settings_store::SettingsStore::new();
+        store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-orch",
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat",
+                }),
+            )
+            .unwrap();
+        store
+            .set_section(
+                magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
+                json!({
+                    "model": "model-last-used",
+                    "reasoningEffort": "high"
+                }),
+            )
+            .unwrap();
+        let legacy_session = SessionId::new("session-without-model-override");
+
+        let config = resolve_orchestrator_model_config(&store, Some(&legacy_session))
+            .expect("旧会话应继承权威的用户默认模型");
+        assert_eq!(
+            config.require_model().expect("默认模型必须可执行"),
+            "model-last-used"
+        );
+        assert_eq!(
+            config
+                .to_usage_llm_config()
+                .and_then(|config| config.reasoning_effort),
+            Some(magi_usage_authority::ReasoningEffort::High),
         );
     }
 }

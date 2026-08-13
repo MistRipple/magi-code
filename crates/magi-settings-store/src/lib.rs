@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 const SESSION_SECTION_PREFIX: &str = "__session__:";
+pub const ORCHESTRATOR_SESSION_DEFAULTS_SECTION: &str = "orchestratorSessionDefaults";
 const PUBLIC_RESPONSE_ALIAS_SECTIONS: &[&str] = &[
     "workerConfigs",
     "orchestratorConfig",
@@ -217,6 +218,47 @@ impl SettingsStore {
         self.set_section(&session_section_key(session_id, section), value)
     }
 
+    /// 原子更新一个会话 section 与一个全局 section。
+    ///
+    /// 会话模型选择同时承担“当前会话配置”和“后续新会话默认值”两项职责，
+    /// 两者必须在同一次持久化事务中提交，避免写入失败时产生相互矛盾的状态。
+    pub fn set_session_and_global_sections(
+        &self,
+        session_id: &SessionId,
+        session_section: &str,
+        session_value: Value,
+        global_section: &str,
+        global_value: Value,
+    ) -> Result<(), std::io::Error> {
+        let session_key = session_section_key(session_id, session_section);
+        let mut session_value = session_value;
+        let mut global_value = global_value;
+        canonicalize_settings_section_value(&session_key, &mut session_value);
+        canonicalize_settings_section_value(global_section, &mut global_value);
+        self.mutate(|sections| {
+            sections.insert(session_key, session_value);
+            sections.insert(global_section.to_string(), global_value);
+        })
+    }
+
+    /// 在持久化写锁内读取并更新单个 section。
+    ///
+    /// 用于“仅当尚未初始化时写入默认值”这类读改写操作，防止并发请求
+    /// 分别读取旧值后互相覆盖。
+    pub fn update_section<R>(
+        &self,
+        section: &str,
+        update: impl FnOnce(&mut Value) -> R,
+    ) -> Result<R, std::io::Error> {
+        let section = section.to_string();
+        self.mutate(|sections| {
+            let value = sections.entry(section.clone()).or_insert(Value::Null);
+            let result = update(value);
+            canonicalize_settings_section_value(&section, value);
+            result
+        })
+    }
+
     pub fn remove_session_section(
         &self,
         session_id: &SessionId,
@@ -343,7 +385,9 @@ fn canonicalize_settings_section_value(section: &str, value: &mut Value) -> bool
     if section == "orchestrator" {
         return canonicalize_global_orchestrator_section(value);
     }
-    if is_session_section_key(section) && section.ends_with(":orchestrator") {
+    if section == ORCHESTRATOR_SESSION_DEFAULTS_SECTION
+        || (is_session_section_key(section) && section.ends_with(":orchestrator"))
+    {
         return canonicalize_session_orchestrator_section(value);
     }
     if section == "auxiliary"
@@ -816,6 +860,64 @@ mod tests {
         assert!(section.get("previousModel").is_none());
         assert!(section.get("modelSwitchPending").is_none());
         assert!(section.get("provider").is_none());
+    }
+
+    #[test]
+    fn orchestrator_session_defaults_keep_only_session_owned_fields() {
+        let store = SettingsStore::new();
+        store
+            .set_section(
+                ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
+                json!({
+                    "model": "model-default",
+                    "reasoningEffort": "high",
+                    "apiKey": "must-not-persist",
+                    "baseUrl": "https://must-not-persist.example.com"
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.get_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION),
+            json!({
+                "model": "model-default",
+                "reasoningEffort": "high"
+            })
+        );
+    }
+
+    #[test]
+    fn session_and_default_model_are_persisted_together() {
+        let store = SettingsStore::new();
+        let session_id = SessionId::new("session-model-default-transaction");
+        let config = json!({
+            "model": "model-current",
+            "reasoningEffort": "xhigh",
+            "apiKey": "must-not-persist"
+        });
+
+        store
+            .set_session_and_global_sections(
+                &session_id,
+                "orchestrator",
+                config.clone(),
+                ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
+                config,
+            )
+            .unwrap();
+
+        let expected = json!({
+            "model": "model-current",
+            "reasoningEffort": "xhigh"
+        });
+        assert_eq!(
+            store.get_session_section(&session_id, "orchestrator"),
+            expected
+        );
+        assert_eq!(
+            store.get_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION),
+            expected
+        );
     }
 
     #[test]

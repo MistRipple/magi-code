@@ -277,6 +277,7 @@ function normalizeSettingsBootstrapPayload(
         : {}
     ) as Record<string, unknown>,
     orchestratorConfig: normalizeSettingsSectionConfig(payload.orchestratorConfig),
+    orchestratorSessionDefaults: normalizeSettingsSectionConfig(payload.orchestratorSessionDefaults),
     orchestratorSessionConfig: normalizeSettingsSectionConfig(payload.orchestratorSessionConfig),
     effectiveOrchestratorConfig: normalizeSettingsSectionConfig(payload.effectiveOrchestratorConfig),
     auxiliaryConfig: normalizeSettingsSectionConfig(payload.auxiliaryConfig),
