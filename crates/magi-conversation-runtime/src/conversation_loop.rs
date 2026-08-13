@@ -6,15 +6,18 @@ use crate::context_authority::{
 use crate::context_authority::{
     ThreadHistoryCompactionDecision, thread_history_compaction_decision,
 };
+use crate::image_understanding::route_messages_for_model;
 use crate::model_context_window::{apply_reported_context_limit, resolve_model_context_window};
 use crate::session_writeback::{
-    ContextCompactionWritebackContext, SessionStatePersistCallback, SessionTurnStreamPublishGate,
-    SessionTurnStreamUpdate, append_session_turn_item_with_task_store, apply_model_response_round,
+    ContextCompactionWritebackContext, ImageUnderstandingWritebackContext,
+    SessionStatePersistCallback, SessionTurnStreamPublishGate, SessionTurnStreamUpdate,
+    append_session_turn_item_with_task_store, apply_model_response_round,
     new_context_compaction_item_id, persist_session_state_checkpoint,
     publish_current_session_turn_item_event, publish_model_retry_runtime_event,
     publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
     session_turn_stream_update, upsert_context_compaction_completed_notice,
-    upsert_context_compaction_progress_notice, upsert_session_turn_item_with_task_store,
+    upsert_context_compaction_progress_notice, upsert_image_understanding_notice,
+    upsert_session_turn_item_with_task_store,
 };
 use crate::task_execution_registry::TaskExecutionRegistry;
 use crate::task_runner_bridge::TaskOutcome;
@@ -881,6 +884,22 @@ fn run_conversation_loop_inner(
         turn_visibility: &turn_visibility,
         persist_session_state,
     };
+    let image_understanding_item_id =
+        format!("turn-item-image-understanding-{}-{}", task_id, thread_id);
+    let image_understanding_writeback = ImageUnderstandingWritebackContext {
+        event_bus,
+        session_store,
+        session_id,
+        workspace_id,
+        thread_id,
+        item_id: &image_understanding_item_id,
+        persist_session_state,
+        task: Some(task),
+        turn_visibility: Some(&turn_visibility),
+    };
+    let image_understanding_observer = |progress| {
+        upsert_image_understanding_notice(image_understanding_writeback, progress);
+    };
     let prepare_task_history = |phase: &'static str,
                                 context_window: u64,
                                 additional_token_estimate: usize| {
@@ -993,9 +1012,29 @@ fn run_conversation_loop_inner(
         thread_history_snapshot = normalized_history.messages;
     }
     if !thread_history_snapshot.is_empty() {
-        for history_msg in &thread_history_snapshot {
-            messages.push(thread_chat_message_to_chat_message(history_msg));
+        let mut routed_history = thread_history_snapshot
+            .iter()
+            .map(thread_chat_message_to_chat_message)
+            .collect::<Vec<_>>();
+        if let Err(error) = route_messages_for_model(
+            &mut routed_history,
+            settings_store,
+            event_bus,
+            session_store,
+            session_id,
+            workspace_id,
+            &resolved_context_model,
+            &|| !task_lease_is_current(task_store, task_id, lease_id),
+            Some(&image_understanding_observer),
+        ) {
+            return (
+                TaskOutcome::Failed {
+                    error: error.to_string(),
+                },
+                context_summary,
+            );
         }
+        messages.extend(routed_history);
         messages.push(system_prompt_fragment_message(
             PromptFragmentKind::ThreadHistoryBoundary,
             "以上是当前 task 已持久化的运行记录。它们是恢复后的工作事实：已完成的工具结果必须直接继承，不要从头重复；结果未知的外部操作必须先检查当前状态。后续当前任务输入必须以当前任务为准。",
@@ -1017,14 +1056,45 @@ fn run_conversation_loop_inner(
             tool_call_id: None,
             provider_context: Vec::new(),
         };
+        messages.push(current_user_message);
+    }
+    if let Err(error) = route_messages_for_model(
+        &mut messages,
+        settings_store,
+        event_bus,
+        session_store,
+        session_id,
+        workspace_id,
+        &resolved_context_model,
+        &|| !task_lease_is_current(task_store, task_id, lease_id),
+        Some(&image_understanding_observer),
+    ) {
+        return (
+            TaskOutcome::Failed {
+                error: error.to_string(),
+            },
+            context_summary,
+        );
+    }
+    if !resumed_task {
+        let current_user_message = messages.last().expect("当前任务必须包含用户消息");
+        let mut persisted_user_message = chat_message_to_thread_chat_message(current_user_message);
+        // 模型视图只移除图片；会话审计仍保留原始图片，后续轮次依据已生成的标记文本复用。
+        persisted_user_message.images = session_turn_image_sources(&images)
+            .into_iter()
+            .map(|image| ThreadChatImageSource {
+                kind: image.kind,
+                media_type: image.media_type,
+                data: image.data,
+            })
+            .collect();
         append_thread_messages_checkpoint(
             session_store,
             thread_id,
-            vec![chat_message_to_thread_chat_message(&current_user_message)],
+            vec![persisted_user_message],
             persist_session_state,
             "task_thread_user_input",
         );
-        messages.push(current_user_message);
     }
     let task_context = task_event_context(task, session_id, workspace_id);
     publish_task_llm_started(
@@ -1300,6 +1370,24 @@ fn run_conversation_loop_inner(
         }
         context_budget_recheck_required = false;
         bound_model_visible_chat_tool_results(&mut messages);
+        if let Err(error) = route_messages_for_model(
+            &mut messages,
+            settings_store,
+            event_bus,
+            session_store,
+            session_id,
+            workspace_id,
+            &resolved_context_model,
+            &|| !task_lease_is_current(task_store, task_id, lease_id),
+            Some(&image_understanding_observer),
+        ) {
+            return (
+                TaskOutcome::Failed {
+                    error: error.to_string(),
+                },
+                context_summary,
+            );
+        }
         let invocation_request = ModelInvocationRequest {
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: prompt.clone(),

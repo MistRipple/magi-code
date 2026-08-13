@@ -539,6 +539,12 @@ pub fn routes() -> Router<ApiState> {
         )
         .route("/settings/auxiliary/save", post(save_auxiliary_config))
         .route("/settings/auxiliary/test", post(test_auxiliary_connection))
+        .route("/settings/vision/save", post(save_vision_config))
+        .route("/settings/vision/test", post(test_vision_connection))
+        .route(
+            "/settings/model-capability/save",
+            post(save_model_capability),
+        )
         .route(
             "/settings/image-generation/save",
             post(save_image_generation_config),
@@ -1260,6 +1266,45 @@ async fn test_orchestrator_connection(
     })))
 }
 
+async fn save_model_capability(
+    State(state): State<ApiState>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("模型名称不能为空".to_string()))?;
+    let supports_images = request
+        .get("supportsImages")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ApiError::InvalidInput("supportsImages 必须是布尔值".to_string()))?;
+    state
+        .settings_store
+        .update_section("modelCapabilities", |stored| {
+            if !stored.is_object() {
+                *stored = json!({});
+            }
+            let fields = stored
+                .as_object_mut()
+                .expect("modelCapabilities 必须是对象");
+            if supports_images {
+                fields.insert(model.to_string(), Value::String("multimodal".to_string()));
+            } else {
+                fields.remove(model);
+            }
+        })
+        .map_err(settings_persistence_error)?;
+    let entries = state.settings_store.get_section("modelCapabilities");
+    Ok(Json(json!({
+        "saved": true,
+        "model": model,
+        "supportsImages": supports_images,
+        "modelCapabilities": entries,
+    })))
+}
+
 async fn save_auxiliary_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
@@ -1273,6 +1318,25 @@ async fn save_auxiliary_config(
 }
 
 async fn test_auxiliary_connection(
+    State(_state): State<ApiState>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    probe_connection_response(request).await
+}
+
+async fn save_vision_config(
+    State(state): State<ApiState>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let config = model_settings_section_request(&request)?;
+    state
+        .settings_store
+        .set_section("vision", config.clone())
+        .map_err(settings_persistence_error)?;
+    Ok(Json(serde_json::json!({ "saved": true, "config": config })))
+}
+
+async fn test_vision_connection(
     State(_state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -3679,6 +3743,39 @@ mod tests {
         assert_eq!(
             auxiliary_response["config"],
             state.settings_store.get_section("auxiliary")
+        );
+    }
+
+    #[tokio::test]
+    async fn model_capability_save_returns_authoritative_persisted_map() {
+        let state = test_state();
+        let enabled = save_model_capability(
+            State(state.clone()),
+            Json(json!({"model": "vision-capable-model", "supportsImages": true})),
+        )
+        .await
+        .expect("model capability should save")
+        .0;
+        assert_eq!(
+            enabled["modelCapabilities"]["vision-capable-model"],
+            json!("multimodal")
+        );
+        assert_eq!(
+            enabled["modelCapabilities"],
+            state.settings_store.get_section("modelCapabilities")
+        );
+
+        let disabled = save_model_capability(
+            State(state.clone()),
+            Json(json!({"model": "vision-capable-model", "supportsImages": false})),
+        )
+        .await
+        .expect("model capability should clear")
+        .0;
+        assert_eq!(disabled["modelCapabilities"], json!({}));
+        assert_eq!(
+            disabled["modelCapabilities"],
+            state.settings_store.get_section("modelCapabilities")
         );
     }
 

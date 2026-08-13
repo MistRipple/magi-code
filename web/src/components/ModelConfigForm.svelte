@@ -2,7 +2,7 @@
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
 
-  type FormType = 'orch' | 'comp' | 'image' | 'worker';
+  type FormType = 'orch' | 'comp' | 'vision' | 'image' | 'worker';
 
   let {
     formType,

@@ -13,6 +13,7 @@
     modelConfigTab = $bindable(),
     orchConfig = $bindable(),
     compConfig = $bindable(),
+    visionConfig = $bindable(),
     imageConfig = $bindable(),
     workerConfigs = $bindable(),
     modelConfigBaselines,
@@ -46,6 +47,7 @@
     modelConfigTab: string;
     orchConfig: any;
     compConfig: any;
+    visionConfig: any;
     imageConfig: any;
     workerConfigs: Record<string, any>;
     modelConfigBaselines: Record<string, any>;
@@ -64,10 +66,10 @@
     shouldRecommendStandardUrlMode: (baseUrl: string) => boolean;
     openModelDropdown: (type: string, target: HTMLElement) => void;
     closeModelDropdown: (key: string) => void;
-    fetchModelList: (type: 'orch' | 'comp' | 'image' | 'worker', statusKey: string) => void;
+    fetchModelList: (type: 'orch' | 'comp' | 'vision' | 'image' | 'worker', statusKey: string) => void;
     selectModel: (type: string, model: string) => void;
-    saveModelConfig: (type: 'orch' | 'comp' | 'image' | 'worker', statusKey: string) => void;
-    testModelConnection: (type: 'orch' | 'comp' | 'image' | 'worker', statusKey: string) => void;
+    saveModelConfig: (type: 'orch' | 'comp' | 'vision' | 'image' | 'worker', statusKey: string) => void;
+    testModelConnection: (type: 'orch' | 'comp' | 'vision' | 'image' | 'worker', statusKey: string) => void;
     getStatusClass: (status: string) => string;
     getStatusText: (status: string) => string;
     getWorkerDisplayName: (workerId: string) => string;
@@ -216,7 +218,7 @@
               <span class="role-tab-name">{i18n.t('settings.model.auxiliaryModel')}</span>
             </button>
 
-            <!-- 图片生成模型 -->
+            <!-- 生图模型 -->
             <button
               type="button"
               class="role-tab"
@@ -231,6 +233,23 @@
                 title={getStatusText(resolveModelConfigTabStatus('imageGeneration', modelStatuses))}
               ></span>
               <span class="role-tab-name">{i18n.t('settings.model.imageGenerationModel')}</span>
+            </button>
+
+            <!-- 识图模型 -->
+            <button
+              type="button"
+              class="role-tab"
+              class:active={modelConfigTab === 'vision'}
+              role="tab"
+              aria-selected={modelConfigTab === 'vision'}
+              data-tab-id="vision"
+              onclick={() => selectTab('vision')}
+            >
+              <span
+                class="role-tab-status {getStatusClass(resolveModelConfigTabStatus('vision', modelStatuses))}"
+                title={getStatusText(resolveModelConfigTabStatus('vision', modelStatuses))}
+              ></span>
+              <span class="role-tab-name">{i18n.t('settings.model.visionModel')}</span>
             </button>
 
             <!-- 代理引擎 -->
@@ -376,6 +395,30 @@
             {saveModelConfig}
             {testModelConnection}
           />
+        {:else if modelConfigTab === 'vision'}
+          <ModelConfigForm
+            formType="vision"
+            statusKey="vision"
+            bind:config={visionConfig}
+            baselineConfig={modelConfigBaselines.vision}
+            bind:keyVisible
+            showAdvancedOptions={false}
+            description={i18n.t('settings.model.visionDesc')}
+            {saveStatus}
+            {testStatus}
+            {fetchingModels}
+            {modelDropdownOpen}
+            {dropdownPosition}
+            {modelLists}
+            {getBaseUrlPlaceholder}
+            {shouldRecommendStandardUrlMode}
+            {openModelDropdown}
+            {closeModelDropdown}
+            {fetchModelList}
+            {selectModel}
+            {saveModelConfig}
+            {testModelConnection}
+          />
         {:else if workerConfigs[modelConfigTab]}
           <ModelConfigForm
             formType="worker"
@@ -447,6 +490,25 @@
         </div>
 
         <div class="engine-usage-row engine-usage-row--system">
+          <div class="engine-avatar engine-avatar--auxiliary" aria-hidden="true">
+            <Icon name="sparkles" size={15} />
+            <span
+              class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('comp', modelStatuses))}"
+              title={getStatusText(resolveModelConfigTabStatus('comp', modelStatuses))}
+            ></span>
+          </div>
+          <div class="engine-identity">
+            <span class="engine-name">{i18n.t('settings.model.auxiliaryModel')}</span>
+            {#if compConfig?.model}
+              <span class="engine-model-tag">{compConfig.model}</span>
+            {/if}
+          </div>
+          <div class="engine-consumers">
+            <span class="engine-system-note">{i18n.t('settings.model.auxiliarySystemUsage')}</span>
+          </div>
+        </div>
+
+        <div class="engine-usage-row engine-usage-row--system">
           <div class="engine-avatar engine-avatar--image" aria-hidden="true">
             <Icon name="sparkles" size={15} />
             <span
@@ -466,21 +528,21 @@
         </div>
 
         <div class="engine-usage-row engine-usage-row--system">
-          <div class="engine-avatar engine-avatar--auxiliary" aria-hidden="true">
-            <Icon name="sparkles" size={15} />
+          <div class="engine-avatar engine-avatar--vision" aria-hidden="true">
+            <Icon name="eye" size={15} />
             <span
-              class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('comp', modelStatuses))}"
-              title={getStatusText(resolveModelConfigTabStatus('comp', modelStatuses))}
+              class="model-status-dot {getStatusClass(resolveModelConfigTabStatus('vision', modelStatuses))}"
+              title={getStatusText(resolveModelConfigTabStatus('vision', modelStatuses))}
             ></span>
           </div>
           <div class="engine-identity">
-            <span class="engine-name">{i18n.t('settings.model.auxiliaryModel')}</span>
-            {#if compConfig?.model}
-              <span class="engine-model-tag">{compConfig.model}</span>
+            <span class="engine-name">{i18n.t('settings.model.visionModel')}</span>
+            {#if visionConfig?.model}
+              <span class="engine-model-tag">{visionConfig.model}</span>
             {/if}
           </div>
           <div class="engine-consumers">
-            <span class="engine-system-note">{i18n.t('settings.model.auxiliarySystemUsage')}</span>
+            <span class="engine-system-note">{i18n.t('settings.model.visionDesc')}</span>
           </div>
         </div>
 

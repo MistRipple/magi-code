@@ -2577,6 +2577,8 @@ impl ApiState {
             "workerConfigs": object_section(&snapshot, "workers"),
             "orchestratorConfig": object_section(&snapshot, "orchestrator"),
             "auxiliaryConfig": object_section(&snapshot, "auxiliary"),
+            "visionConfig": object_section(&snapshot, "vision"),
+            "modelCapabilities": object_section(&snapshot, "modelCapabilities"),
             "imageGenerationConfig": object_section(&snapshot, "imageGeneration"),
             "modelContextWindows": object_section(&snapshot, "modelContextWindows"),
             "userRulesConfig": object_section(&snapshot, "userRulesConfig"),

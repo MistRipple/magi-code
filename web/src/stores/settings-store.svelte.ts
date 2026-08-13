@@ -43,6 +43,7 @@ import {
   rollbackAgentSkill,
   settingsBootstrapMatchesCurrentWorkspace,
   saveAgentAuxiliaryConfig,
+  saveAgentVisionConfig,
   saveAgentImageGenerationConfig,
   saveAgentUserRules,
   saveAgentSafeguardConfig,
@@ -50,6 +51,7 @@ import {
   saveAgentOrchestratorConfig,
   removeAgentWorkerConfig,
   testAgentAuxiliaryConnection,
+  testAgentVisionConnection,
   testAgentImageGenerationConnection,
   testAgentOrchestratorConnection,
   testAgentWorkerConnection,
@@ -106,7 +108,7 @@ export interface InteractiveModelFormConfig extends BaseModelFormConfig {
 
 export interface WorkerModelFormConfig extends InteractiveModelFormConfig {}
 
-type ModelConfigTarget = "orch" | "comp" | "image" | "worker";
+type ModelConfigTarget = "orch" | "comp" | "vision" | "image" | "worker";
 
 type BaseModelConfigPayload = Record<string, unknown> & {
   baseUrl: string;
@@ -345,12 +347,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
   });
 
   // Model Tab 状态
-  // 统一 tab 选择：'orch' | 'comp' | 'image' | 任意 engineId（worker）
+  // 统一 tab 选择：'orch' | 'comp' | 'vision' | 'image' | 任意 engineId（worker）
   let modelConfigTab = $state<string>("orch");
   // worker 模式下的当前引擎 ID；系统模型 tab 时为空串。
   // 给保留依赖 worker key 的 API（saveModelConfig/probeModelStatus 等）一个稳定入口。
   const activeWorkerEngineId = $derived(
-    modelConfigTab === "orch" || modelConfigTab === "comp" || modelConfigTab === "image"
+    modelConfigTab === "orch" || modelConfigTab === "comp" || modelConfigTab === "vision" || modelConfigTab === "image"
       ? ""
       : modelConfigTab,
   );
@@ -453,6 +455,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (target === "worker") return workerConfigs[key];
     if (target === "orch") return orchConfig;
     if (target === "comp") return compConfig;
+    if (target === "vision") return visionConfig;
     return imageConfig;
   }
 
@@ -533,6 +536,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   ): BaseModelFormConfig | InteractiveModelFormConfig {
     if (target === "orch") return normalizeOrchestratorFormConfig(config);
     if (target === "worker") return normalizeWorkerFormConfig(config);
+    if (target === "vision") return normalizeAuxiliaryFormConfig(config);
     return normalizeAuxiliaryFormConfig(config);
   }
 
@@ -589,6 +593,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   let modelDropdownOpen = $state<Record<string, boolean>>({
     orch: false,
     comp: false,
+    vision: false,
     image: false,
   });
 
@@ -659,9 +664,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
   $effect(() => {
     syncModelListSignature("orch", buildModelListSignature(orchConfig));
     syncModelListSignature("comp", buildModelListSignature(compConfig));
+    syncModelListSignature("vision", buildModelListSignature(visionConfig));
     syncModelListSignature("image", buildModelListSignature(imageConfig));
 
-    const liveWorkerKeys = new Set<string>(["orch", "comp", "image"]);
+    const liveWorkerKeys = new Set<string>(["orch", "comp", "vision", "image"]);
     for (const [workerId, config] of Object.entries(workerConfigs)) {
       liveWorkerKeys.add(workerId);
       syncModelListSignature(workerId, buildModelListSignature(config));
@@ -729,6 +735,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     createInteractiveConfig(),
   );
   let compConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
+  let visionConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
   let imageConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
   let workerConfigs = $state<Record<string, WorkerModelFormConfig>>({});
   let modelConfigBaselines = $state<
@@ -736,6 +743,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   >({
     orch: createInteractiveConfig(),
     comp: createAuxiliaryConfig(),
+    vision: createAuxiliaryConfig(),
     image: createAuxiliaryConfig(),
   });
 
@@ -1123,6 +1131,13 @@ function createSettingsStore(props: { onClose?: () => void }) {
       model: auxiliaryModel,
     };
 
+    const visionModel = visionConfig.model?.trim() || undefined;
+    const incomingVision = resolveIncoming("vision", visionModel);
+    next.vision = incomingVision || {
+      status: hasUsableModelConfig(visionConfig) ? "configured" : "not_configured",
+      model: visionModel,
+    };
+
     const imageModel = imageConfig.model?.trim() || undefined;
     const incomingImage = resolveIncoming("imageGeneration", imageModel);
     next.imageGeneration = incomingImage || {
@@ -1166,6 +1181,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (target === "worker") return configKey;
     if (target === "orch") return "orchestrator";
     if (target === "comp") return "auxiliary";
+    if (target === "vision") return "vision";
     return "imageGeneration";
   }
 
@@ -1189,6 +1205,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     }
     if (target === "comp") {
       await testAgentAuxiliaryConnection(
+        buildBaseModelConfigPayload(config as BaseModelFormConfig),
+      );
+      return;
+    }
+    if (target === "vision") {
+      await testAgentVisionConnection(
         buildBaseModelConfigPayload(config as BaseModelFormConfig),
       );
       return;
@@ -1264,7 +1286,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   function getStatsRoleModelStatus(roleKey: string): ModelStatus | undefined {
-    if (roleKey === "orchestrator" || roleKey === "auxiliary" || roleKey === "imageGeneration") {
+    if (roleKey === "orchestrator" || roleKey === "auxiliary" || roleKey === "vision" || roleKey === "imageGeneration") {
       return modelStatuses[roleKey];
     }
     const binding = registryAgents.find((item) => item.templateId === roleKey);
@@ -1276,6 +1298,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     const orderedBuiltIns = [
       "orchestrator",
       "auxiliary",
+      "vision",
       "imageGeneration",
       "executor",
       "explorer",
@@ -1925,6 +1948,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
       return;
     } else if (target === "comp") {
       compConfig.model = model;
+    } else if (target === "vision") {
+      visionConfig.model = model;
     } else if (target === "image") {
       imageConfig.model = model;
     } else if (workerConfigs[target]) {
@@ -1990,6 +2015,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
       orchConfig = cloneModelFormConfig(config as InteractiveModelFormConfig);
     } else if (target === "comp") {
       compConfig = cloneModelFormConfig(config as BaseModelFormConfig);
+    } else if (target === "vision") {
+      visionConfig = cloneModelFormConfig(config as BaseModelFormConfig);
     } else {
       imageConfig = cloneModelFormConfig(config as BaseModelFormConfig);
     }
@@ -2015,6 +2042,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
       next.orchestratorConfig = cloneModelFormConfig(config) as unknown as Record<string, unknown>;
     } else if (target === "comp") {
       next.auxiliaryConfig = cloneModelFormConfig(config) as unknown as Record<string, unknown>;
+    } else if (target === "vision") {
+      next.visionConfig = cloneModelFormConfig(config) as unknown as Record<string, unknown>;
     } else {
       next.imageGenerationConfig = cloneModelFormConfig(config) as unknown as Record<string, unknown>;
     }
@@ -2083,6 +2112,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
         );
       } else if (target === "comp") {
         response = await saveAgentAuxiliaryConfig(
+          buildBaseModelConfigPayload(config as BaseModelFormConfig),
+        );
+      } else if (target === "vision") {
+        response = await saveAgentVisionConfig(
           buildBaseModelConfigPayload(config as BaseModelFormConfig),
         );
       } else if (target === "image") {
@@ -3098,6 +3131,14 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!preserveDraft) compConfig = persisted;
   }
 
+  function applyVisionConfig(config: any): void {
+    if (!config) return;
+    const persisted = normalizeAuxiliaryFormConfig(config);
+    const preserveDraft = isModelConfigDraftDirty("vision", "vision", visionConfig);
+    setModelConfigBaseline("vision", persisted);
+    if (!preserveDraft) visionConfig = persisted;
+  }
+
   function applyImageGenerationConfig(config: any): void {
     if (!config) {
       return;
@@ -3599,6 +3640,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       );
       applyOrchestratorConfig(snapshot.orchestratorConfig);
       applyAuxiliaryConfig(snapshot.auxiliaryConfig);
+      applyVisionConfig(snapshot.visionConfig);
       applyImageGenerationConfig(snapshot.imageGenerationConfig);
     });
   });
@@ -3776,6 +3818,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
     },
     get compConfig() {
       return compConfig;
+    },
+    get visionConfig() {
+      return visionConfig;
+    },
+    set visionConfig(v) {
+      visionConfig = v;
     },
     set compConfig(v) {
       compConfig = v;

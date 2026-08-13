@@ -62,6 +62,7 @@
   function workerLabel(worker: string): string {
     if (worker === 'orchestrator') return i18n.t('settings.stats.orchestratorModel');
     if (worker === 'auxiliary') return i18n.t('settings.stats.auxiliaryModel');
+    if (worker === 'vision') return i18n.t('settings.stats.visionModel');
     if (worker === 'imageGeneration') return i18n.t('settings.stats.imageModel');
     return getWorkerDisplayName(worker);
   }

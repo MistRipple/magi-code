@@ -17,6 +17,7 @@ use crate::{
         append_thread_messages_checkpoint, chat_message_to_thread_chat_message,
         insert_interrupted_tool_result_messages, thread_chat_message_to_chat_message,
     },
+    image_understanding::route_messages_for_model,
     model_config::resolve_orchestrator_model_config,
     model_error::{
         MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
@@ -32,14 +33,15 @@ use crate::{
     },
     session_images::{SessionTurnImage, session_turn_image_sources},
     session_writeback::{
-        ContextCompactionWritebackContext, SessionStatePersistCallback,
-        SessionTurnStreamPublishGate, append_session_tool_call_items_batch_with_context,
-        append_session_turn_error_item, append_session_turn_item, apply_model_response_round,
-        new_context_compaction_item_id, persist_session_state_checkpoint,
-        publish_current_session_turn_item_event, publish_model_retry_runtime_event,
-        publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
-        session_turn_stream_update, upsert_context_compaction_completed_notice,
-        upsert_context_compaction_progress_notice, upsert_session_turn_item,
+        ContextCompactionWritebackContext, ImageUnderstandingWritebackContext,
+        SessionStatePersistCallback, SessionTurnStreamPublishGate,
+        append_session_tool_call_items_batch_with_context, append_session_turn_error_item,
+        append_session_turn_item, apply_model_response_round, new_context_compaction_item_id,
+        persist_session_state_checkpoint, publish_current_session_turn_item_event,
+        publish_model_retry_runtime_event, publish_session_turn_item_event,
+        publish_session_turn_item_stream_event, session_turn_item, session_turn_stream_update,
+        upsert_context_compaction_completed_notice, upsert_context_compaction_progress_notice,
+        upsert_image_understanding_notice, upsert_session_turn_item,
     },
     tool_call_validation::{
         ToolCallFailureDiagnostic, ToolCallValidationIssue, ToolCallValidationTracker,
@@ -841,6 +843,45 @@ fn run_session_turn_execution_inner(
         knowledge_context_prompt.as_deref(),
         &prepared_history.messages,
     );
+    let image_understanding_item_id = format!(
+        "turn-item-image-understanding-{}-{}",
+        request.turn_id, orchestrator_thread_id
+    );
+    let image_understanding_writeback = ImageUnderstandingWritebackContext {
+        event_bus,
+        session_store,
+        session_id: &request.session_id,
+        workspace_id: &request.workspace_id,
+        thread_id: &orchestrator_thread_id,
+        item_id: &image_understanding_item_id,
+        persist_session_state,
+        task: None,
+        turn_visibility: None,
+    };
+    let image_understanding_observer = |progress| {
+        upsert_image_understanding_notice(image_understanding_writeback, progress);
+    };
+    if let Err(error) = route_messages_for_model(
+        &mut messages,
+        settings_store,
+        event_bus,
+        session_store,
+        &request.session_id,
+        &request.workspace_id,
+        &resolved_context_model,
+        &|| !request_turn_is_writable(session_store, &request),
+        Some(&image_understanding_observer),
+    ) {
+        return match error {
+            crate::image_understanding::ImageUnderstandingError::Cancelled => {
+                Ok(SessionTurnExecutionOutput::interrupted())
+            }
+            other => Err(SessionTurnExecutionError::new(
+                SessionTurnFailureReason::ModelImageInvocationFailed,
+                other.to_string(),
+            )),
+        };
+    }
     if let Some(identity_prompt) =
         model_identity_prompt_for_request(&request.prompt, &resolved_context_model)
     {
@@ -853,9 +894,18 @@ fn run_session_turn_execution_inner(
         );
     }
     if let Some(current_user_message) = messages.last() {
+        let mut persisted_user_message = chat_message_to_thread_chat_message(current_user_message);
+        persisted_user_message.images = session_turn_image_sources(&request.images)
+            .into_iter()
+            .map(|image| magi_session_store::ThreadChatImageSource {
+                kind: image.kind,
+                media_type: image.media_type,
+                data: image.data,
+            })
+            .collect();
         session_store.append_thread_messages(
             &orchestrator_thread_id,
-            vec![chat_message_to_thread_chat_message(current_user_message)],
+            vec![persisted_user_message],
             UtcMillis::now(),
         );
         persist_session_state_checkpoint(persist_session_state, "session_turn_thread_user");
@@ -946,7 +996,30 @@ fn run_session_turn_execution_inner(
                     active_skill_name: active_skill_name.as_deref(),
                 });
             match rebuild_result {
-                Ok(compacted) => proactive_context_compaction_completed |= compacted,
+                Ok(compacted) => {
+                    proactive_context_compaction_completed |= compacted;
+                    if let Err(error) = route_messages_for_model(
+                        &mut messages,
+                        settings_store,
+                        event_bus,
+                        session_store,
+                        &request.session_id,
+                        &request.workspace_id,
+                        &resolved_context_model,
+                        &|| !request_turn_is_writable(session_store, &request),
+                        Some(&image_understanding_observer),
+                    ) {
+                        return match error {
+                            crate::image_understanding::ImageUnderstandingError::Cancelled => {
+                                Ok(SessionTurnExecutionOutput::interrupted())
+                            }
+                            other => Err(SessionTurnExecutionError::new(
+                                SessionTurnFailureReason::ModelImageInvocationFailed,
+                                other.to_string(),
+                            )),
+                        };
+                    }
+                }
                 Err(ContextCompactionTerminal::Cancelled) => {
                     return Ok(SessionTurnExecutionOutput::interrupted());
                 }
@@ -956,6 +1029,27 @@ fn run_session_turn_execution_inner(
             }
         }
         context_budget_recheck_required = false;
+        if let Err(error) = route_messages_for_model(
+            &mut messages,
+            settings_store,
+            event_bus,
+            session_store,
+            &request.session_id,
+            &request.workspace_id,
+            &resolved_context_model,
+            &|| !request_turn_is_writable(session_store, &request),
+            Some(&image_understanding_observer),
+        ) {
+            return match error {
+                crate::image_understanding::ImageUnderstandingError::Cancelled => {
+                    Ok(SessionTurnExecutionOutput::interrupted())
+                }
+                other => Err(SessionTurnExecutionError::new(
+                    SessionTurnFailureReason::ModelImageInvocationFailed,
+                    other.to_string(),
+                )),
+            };
+        }
         let streamed_content = match stream_session_turn_round(
             SessionTurnRoundRuntime {
                 client,

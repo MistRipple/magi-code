@@ -156,6 +156,16 @@ pub fn image_generation_model_usage_binding() -> ModelUsageBinding {
     }
 }
 
+pub fn vision_model_usage_binding() -> ModelUsageBinding {
+    ModelUsageBinding {
+        template_id: "vision".to_string(),
+        engine_id: "vision".to_string(),
+        binding_revision: 0,
+        role: UsageSourceRole::Vision,
+        phase: UsagePhase::Execution,
+    }
+}
+
 /// 调用辅助模型并把这次调用写入统一用量账本。
 pub fn invoke_auxiliary_model_with_usage(
     client: Arc<dyn ModelBridgeClient>,
@@ -572,6 +582,16 @@ fn usage_model_config_for_binding(
                 Ok(config) => return config.to_usage_llm_config(),
                 Err(error) => {
                     tracing::warn!(error = %error, "图片模型配置无效，跳过用量身份归因");
+                    return None;
+                }
+            }
+        }
+        UsageSourceRole::Vision => {
+            let config = store.get_section(crate::model_config::VISION_MODEL_SECTION);
+            match NormalizedModelConfig::from_settings_value(&config) {
+                Ok(config) => return config.to_usage_llm_config(),
+                Err(error) => {
+                    tracing::warn!(error = %error, "vision 模型配置无效，跳过用量身份归因");
                     return None;
                 }
             }

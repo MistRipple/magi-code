@@ -281,6 +281,8 @@ function normalizeSettingsBootstrapPayload(
     orchestratorSessionConfig: normalizeSettingsSectionConfig(payload.orchestratorSessionConfig),
     effectiveOrchestratorConfig: normalizeSettingsSectionConfig(payload.effectiveOrchestratorConfig),
     auxiliaryConfig: normalizeSettingsSectionConfig(payload.auxiliaryConfig),
+    visionConfig: normalizeSettingsSectionConfig(payload.visionConfig),
+    modelCapabilities: normalizeSettingsSectionConfig(payload.modelCapabilities),
     imageGenerationConfig: normalizeSettingsSectionConfig(payload.imageGenerationConfig),
     modelContextWindows: Object.fromEntries(
       Object.entries(normalizeSettingsSectionConfig(payload.modelContextWindows))
@@ -2420,8 +2422,23 @@ export async function saveAgentModelContextWindow(
   );
 }
 
+export async function saveAgentModelCapability(
+  model: string,
+  supportsImages: boolean,
+): Promise<Record<string, unknown>> {
+  return await postWorkspaceBoundJson<Record<string, unknown>>(
+    '/api/settings/model-capability/save',
+    { model, supportsImages },
+    'save model capability',
+  );
+}
+
 export async function saveAgentAuxiliaryConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/auxiliary/save', config, 'save auxiliary config');
+}
+
+export async function saveAgentVisionConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/vision/save', config, 'save vision config');
 }
 
 export async function saveAgentImageGenerationConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -2442,6 +2459,10 @@ export async function testAgentOrchestratorConnection(config: Record<string, unk
 
 export async function testAgentAuxiliaryConnection(config: Record<string, unknown>): Promise<Record<string, unknown>> {
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/auxiliary/test', config, 'test auxiliary connection');
+}
+
+export async function testAgentVisionConnection(config: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/vision/test', config, 'test vision connection');
 }
 
 export async function testAgentImageGenerationConnection(config: Record<string, unknown>): Promise<Record<string, unknown>> {

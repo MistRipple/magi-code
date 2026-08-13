@@ -7,6 +7,7 @@ pub enum UsageSourceRole {
     Orchestrator,
     Auxiliary,
     ImageGeneration,
+    Vision,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

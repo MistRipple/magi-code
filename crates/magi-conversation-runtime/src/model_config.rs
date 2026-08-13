@@ -18,6 +18,8 @@ use magi_usage_authority::{LlmConfig, ReasoningEffort, UrlMode};
 use serde_json::Value;
 
 pub const DEFAULT_ORCHESTRATOR_REASONING_EFFORT: &str = "medium";
+pub const VISION_MODEL_SECTION: &str = "vision";
+pub const MODEL_CAPABILITIES_SECTION: &str = "modelCapabilities";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelUrlMode {
@@ -234,6 +236,11 @@ impl NormalizedModelConfig {
         ))
     }
 
+    /// 图片理解使用普通对话协议，独立于图片生成协议。
+    pub fn to_http_vision_client(&self) -> Option<HttpModelBridgeClient> {
+        self.to_http_model_client()
+    }
+
     pub fn to_usage_llm_config(&self) -> Option<LlmConfig> {
         Some(LlmConfig {
             provider: self.provider().to_string(),
@@ -279,6 +286,25 @@ impl NormalizedModelConfig {
             }
         }
     }
+}
+
+/// 只有显式声明为 multimodal 的模型才会直接接收图片；未知能力一律按 text-only 处理。
+pub fn model_supports_images(
+    settings_store: Option<&magi_settings_store::SettingsStore>,
+    model: &str,
+) -> bool {
+    let Some(store) = settings_store else {
+        return false;
+    };
+    let model = model.trim();
+    if model.is_empty() {
+        return false;
+    }
+    store
+        .get_section(MODEL_CAPABILITIES_SECTION)
+        .get(model)
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("multimodal"))
 }
 
 pub fn reject_deprecated_model_config_fields(value: &Value) -> Result<(), String> {
@@ -732,6 +758,20 @@ mod tests {
             config.api_protocol(),
             HttpModelBridgeProtocol::AnthropicMessages
         );
+    }
+
+    #[test]
+    fn image_capability_requires_explicit_multimodal_declaration() {
+        let store = magi_settings_store::SettingsStore::new();
+        assert!(!model_supports_images(Some(&store), "gpt-test"));
+        store
+            .set_section(
+                MODEL_CAPABILITIES_SECTION,
+                json!({"gpt-test": "multimodal", "text-test": "text"}),
+            )
+            .unwrap();
+        assert!(model_supports_images(Some(&store), "gpt-test"));
+        assert!(!model_supports_images(Some(&store), "text-test"));
     }
 
     #[test]

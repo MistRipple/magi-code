@@ -1075,7 +1075,7 @@ export interface ExecutionStatsItemDto {
   templateId: string;
   engineId: string;
   bindingRevision: number;
-  role: 'worker' | 'orchestrator' | 'auxiliary' | 'image_generation';
+  role: 'worker' | 'orchestrator' | 'auxiliary' | 'image_generation' | 'vision';
   displayName: string;
   provider?: string | null;
   declaredModelSpec?: string | null;

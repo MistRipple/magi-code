@@ -83,7 +83,7 @@ export function isAgentBindingOperational(
 }
 
 export function resolveModelConfigTabStatus(
-  target: 'orch' | 'comp' | string,
+  target: 'orch' | 'comp' | 'vision' | string,
   modelStatuses: Readonly<Record<string, ModelStatusLike>>,
 ): string {
   if (target === 'orch') {
@@ -91,6 +91,9 @@ export function resolveModelConfigTabStatus(
   }
   if (target === 'comp') {
     return modelStatuses.auxiliary?.status || 'not_configured';
+  }
+  if (target === 'vision') {
+    return modelStatuses.vision?.status || 'not_configured';
   }
   return modelStatuses[target]?.status || 'not_configured';
 }

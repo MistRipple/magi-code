@@ -16,6 +16,7 @@
     fetchAgentModelList,
     getAgentSettingsBootstrap,
     saveAgentModelContextWindow,
+    saveAgentModelCapability,
     saveAgentOrchestratorSessionConfig,
     resolveAgentPath,
     updateBrowserAnnotationComment,
@@ -218,6 +219,11 @@
   let selectedAccessProfile = $state<AccessProfile>('restricted');
   const currentPickerModel = $derived.by(() => readOrchestratorModel());
   const mainModelReady = $derived.by(() => currentPickerModel.trim().length > 0);
+  const currentPickerModelSupportsImages = $derived.by(() => {
+    const snapshot = messagesState.settingsBootstrapSnapshot;
+    if (!settingsBootstrapMatchesCurrentWorkspace(snapshot)) return false;
+    return snapshot?.modelCapabilities?.[currentPickerModel.trim()] === 'multimodal';
+  });
   const currentPickerReasoningEffort = $derived.by(() => readOrchestratorReasoningEffort());
   const currentPickerReasoningLabel = $derived.by(() => reasoningEffortLabel(currentPickerReasoningEffort));
   // 上下文用量圆环数据：直接取 orchestrator runtime 快照里的 budgetState。
@@ -1759,6 +1765,24 @@
     }
   }
 
+  async function markPickerModelMultimodal(supportsImages: boolean) {
+    const model = currentPickerModel.trim();
+    if (!model) return;
+    try {
+      const saved = await saveAgentModelCapability(model, supportsImages);
+      const snapshot = messagesState.settingsBootstrapSnapshot;
+      if (snapshot && settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
+        messagesState.settingsBootstrapSnapshot = {
+          ...snapshot,
+          modelCapabilities: objectRecord(saved.modelCapabilities),
+        } as AgentSettingsBootstrapSnapshot;
+      }
+      addToast('success', i18n.t('input.mainModelPicker.capabilitySaved'));
+    } catch (error) {
+      addToast('error', error instanceof Error ? error.message : String(error));
+    }
+  }
+
   async function selectPickerReasoningEffort(value: ReasoningEffort) {
     const sessionId = currentSessionId?.trim() || '';
     if (!sessionId) {
@@ -2327,6 +2351,29 @@
               </div>
               <div class="ia-picker-divider"></div>
               <div class="ia-model-list-section">
+                {#if currentPickerModel}
+                  <div class="ia-model-capability-row">
+                    <span>{i18n.t('input.mainModelPicker.capabilityLabel')}</span>
+                    <button
+                      type="button"
+                      class="ia-picker-capability"
+                      class:selected={currentPickerModelSupportsImages}
+                      aria-pressed={currentPickerModelSupportsImages}
+                      onclick={() => void markPickerModelMultimodal(true)}
+                    >
+                      {i18n.t('input.mainModelPicker.capabilityMultimodal')}
+                    </button>
+                    <button
+                      type="button"
+                      class="ia-picker-capability"
+                      class:selected={!currentPickerModelSupportsImages}
+                      aria-pressed={!currentPickerModelSupportsImages}
+                      onclick={() => void markPickerModelMultimodal(false)}
+                    >
+                      {i18n.t('input.mainModelPicker.capabilityTextOnly')}
+                    </button>
+                  </div>
+                {/if}
                 <div class="ia-section-header-row">
                   <div class="ia-picker-header">{i18n.t('input.mainModelPicker.header')}</div>
                   <button
@@ -3841,6 +3888,31 @@
     .ia-send {
       flex: 0 0 28px;
     }
+  }
+
+  .ia-model-capability-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    color: var(--foreground-muted);
+    font-size: 11px;
+  }
+
+  .ia-picker-capability {
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--surface-2);
+    color: var(--foreground);
+    padding: 3px 6px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  .ia-picker-capability.selected {
+    border-color: color-mix(in srgb, var(--primary) 44%, var(--border));
+    background: color-mix(in srgb, var(--primary) 14%, var(--surface-2));
+    color: var(--primary);
   }
 
 </style>

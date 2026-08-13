@@ -11,6 +11,7 @@ const PUBLIC_RESPONSE_ALIAS_SECTIONS: &[&str] = &[
     "workerConfigs",
     "orchestratorConfig",
     "auxiliaryConfig",
+    "visionConfig",
     "imageGenerationConfig",
     "userRulesConfig",
     "registryEngines",
