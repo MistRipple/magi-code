@@ -1,6 +1,6 @@
 use crate::{
     dto::{
-        AuditUsageLedgerDto, RuntimeReadModelDto, ServiceInfo,
+        AuditUsageLedgerDto, RuntimeReadModelDto, ServiceInfo, SessionScopeKindDto,
         runtime_read_model_dto_for_session_with_usage, runtime_read_model_dto_with_usage,
     },
     errors::ApiError,
@@ -37,6 +37,9 @@ pub struct BootstrapAgentDto {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootstrapDto {
+    pub scope: SessionScopeKindDto,
+    pub workspace_id: Option<String>,
+    pub workspace_path: Option<String>,
     pub agent: BootstrapAgentDto,
     pub service: ServiceInfo,
     pub generated_at: UtcMillis,
@@ -105,6 +108,17 @@ impl BootstrapDto {
             &mut dto.runtime_read_model,
             &state.settings_store,
         );
+        if let Some(workspace_id) = dto
+            .current_session
+            .as_ref()
+            .and_then(|session| session.workspace_id.clone())
+        {
+            dto.scope = SessionScopeKindDto::Workspace;
+            dto.workspace_path = state
+                .workspace_root_path(&Some(magi_core::WorkspaceId::new(&workspace_id)))
+                .map(|path| path.to_string_lossy().to_string());
+            dto.workspace_id = Some(workspace_id);
+        }
         dto.truncate_initial_history_page();
         Ok(dto)
     }
@@ -223,6 +237,16 @@ impl BootstrapDto {
         };
 
         let mut dto = Self {
+            scope: current_session
+                .as_ref()
+                .and_then(|session| session.workspace_id.as_ref())
+                .map_or(SessionScopeKindDto::Personal, |_| {
+                    SessionScopeKindDto::Workspace
+                }),
+            workspace_id: current_session
+                .as_ref()
+                .and_then(|session| session.workspace_id.clone()),
+            workspace_path: None,
             agent: BootstrapAgentDto { runtime_epoch },
             service,
             generated_at: UtcMillis::now(),
@@ -1139,8 +1163,7 @@ mod tests {
                 .append_incident_record(NotificationRecord {
                     notification_id: notification_id.to_string(),
                     scope,
-                    workspace_id: (scope == magi_session_store::NotificationScope::Session)
-                        .then(|| "workspace-a".to_string()),
+                    workspace_id: None,
                     session_id,
                     kind: "incident".to_string(),
                     level: Some("error".to_string()),

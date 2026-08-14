@@ -3,7 +3,7 @@ use magi_core::{
     AssignmentId, MissionId, SessionId, TaskId, UtcMillis, WorkspaceId, public_runtime_excerpt,
     public_runtime_summary,
 };
-use magi_usage_authority::{UsageTokenInput, context_window_tokens_from_usage};
+use magi_usage_authority::{UsageTokenInput, provider_context_tokens_from_usage};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -326,17 +326,33 @@ pub struct SessionRuntimeTurnItemSummaryEntry {
     pub source_thread_id: String,
 }
 
-/// 会话最近一次模型请求的上下文窗口观测值。
+/// 会话最近一次主线模型请求的上下文压力观测值。
 ///
-/// 由 `from_events` 从 `model.usage.recorded` 事件提取,仅保留计算上下文预算
-/// 所需的原始口径(当前请求的上下文窗口 token 与解析模型名)。事件总线本身不
-/// 计算窗口大小,装配 DTO 的 `magi-api` 层会用 `magi-usage-authority` 把该
-/// 观测值转换为带窗口与告警级别的 [`SessionRuntimeBudgetEntry`]。
+/// `projected_request_tokens` 是下一次请求的预测上下文占用，
+/// `provider_context_tokens` 只表示 provider 返回的当前请求锚点，
+/// `context_window_limit_tokens` 是该次调用绑定模型的窗口上限。三者不能混用。
+/// `context_window_tokens` 仅保留为读取旧 ledger 的数据迁移字段，新事件不会再写入。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionRuntimeUsageObservation {
-    /// 最近一次成功请求返回的当前上下文窗口占用 token。
+    /// 旧 ledger 的字段；新代码统一读取 projected_request_tokens。
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub context_window_tokens: u64,
-    /// 该次请求解析出的模型名,用于推断上下文窗口大小。
+    /// provider 返回的当前请求上下文 token。
+    pub provider_context_tokens: Option<u64>,
+    /// 包含当前请求和附件的下一次请求预测 token。
+    pub projected_request_tokens: u64,
+    /// 观测绑定模型的上下文窗口上限。
+    pub context_window_limit_tokens: Option<u64>,
+    /// 模型 provider，和 resolved_model 一起构成不可变模型身份。
+    pub model_provider: Option<String>,
+    pub binding_revision: Option<u32>,
+    pub response_reserve_tokens: Option<u64>,
+    pub recovery_buffer_tokens: Option<u64>,
+    pub proactive_threshold_tokens: Option<u64>,
+    pub hard_request_limit_tokens: Option<u64>,
+    pub pressure_level: Option<String>,
+    pub checkpoint_generation: Option<u64>,
+    /// 该次请求解析出的模型名。
     pub resolved_model: Option<String>,
     /// 观测对应的事件时间戳。
     pub observed_at: Option<UtcMillis>,
@@ -344,8 +360,13 @@ pub struct SessionRuntimeUsageObservation {
     pub measurement: Option<String>,
     /// 观测所处阶段：prefill / streaming / completed。
     pub phase: Option<String>,
+    pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub call_id: Option<String>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// 会话上下文预算快照,由 `magi-api` 装配 DTO 时填充。
@@ -2322,57 +2343,121 @@ fn infer_worker_stage(event: &EventEnvelope) -> Option<String> {
         .map(|value| value.to_ascii_lowercase())
 }
 
-/// 从 `model.usage.recorded` 事件提取上下文窗口观测值。
+/// 从主线模型 usage/pressure 事件提取最近一次上下文压力观测。
 ///
-/// payload 是 camelCase 序列化的 `UsageCallRecordInput`。仅采集成功调用
-/// （`status == "success"`）的当前请求上下文窗口 token 与解析模型名，
-/// 窗口大小的推断交由 magi-api 装配层完成。
+/// payload 是 camelCase 序列化的 `UsageCallRecordInput` 或压力快照；event bus
+/// 只保留事件中已经给出的 provider 锚点、预测 token 和模型身份，不推导窗口或告警级别。
 fn usage_observation_from_event(event: &EventEnvelope) -> Option<SessionRuntimeUsageObservation> {
-    if event.event_type == "session.context.usage.updated" {
-        let context_window_tokens = event
-            .payload
-            .get("token_used")
-            .and_then(serde_json::Value::as_u64)?;
-        if context_window_tokens == 0 {
-            return None;
-        }
-        return Some(SessionRuntimeUsageObservation {
-            context_window_tokens,
-            resolved_model: event
-                .payload
-                .get("resolved_model")
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string),
-            observed_at: event
-                .payload
-                .get("updated_at")
-                .and_then(serde_json::Value::as_u64)
-                .map(UtcMillis)
-                .or(Some(event.occurred_at)),
-            measurement: event
-                .payload
-                .get("accuracy")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            phase: event
-                .payload
-                .get("phase")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            turn_id: event
-                .payload
-                .get("turn_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            call_id: event
-                .payload
-                .get("call_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-        });
+    if matches!(
+        event.event_type.as_str(),
+        "session.context.pressure.updated" | "session.context.usage.updated"
+    ) {
+        return pressure_observation_from_payload(&event.payload, Some(event.occurred_at));
     }
     usage_observation_from_payload(&event.event_type, &event.payload)
+}
+
+fn pressure_observation_from_payload(
+    payload: &serde_json::Value,
+    fallback_observed_at: Option<UtcMillis>,
+) -> Option<SessionRuntimeUsageObservation> {
+    if payload
+        .get("source_role")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|role| role != "orchestrator")
+    {
+        return None;
+    }
+    let projected_request_tokens = payload
+        .get("projected_request_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            payload
+                .get("token_used")
+                .and_then(serde_json::Value::as_u64)
+        })?;
+    if projected_request_tokens == 0 {
+        return None;
+    }
+    let resolved_model = payload
+        .get("resolved_model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    Some(SessionRuntimeUsageObservation {
+        context_window_tokens: payload
+            .get("token_used")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(projected_request_tokens),
+        provider_context_tokens: payload
+            .get("provider_context_tokens")
+            .and_then(serde_json::Value::as_u64),
+        projected_request_tokens,
+        context_window_limit_tokens: payload
+            .get("context_window_tokens")
+            .or_else(|| payload.get("context_window_limit_tokens"))
+            .or_else(|| payload.get("token_limit"))
+            .and_then(serde_json::Value::as_u64),
+        model_provider: payload
+            .get("model_provider")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        binding_revision: payload
+            .get("binding_revision")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as u32),
+        response_reserve_tokens: payload
+            .get("response_reserve_tokens")
+            .and_then(serde_json::Value::as_u64),
+        recovery_buffer_tokens: payload
+            .get("recovery_buffer_tokens")
+            .and_then(serde_json::Value::as_u64),
+        proactive_threshold_tokens: payload
+            .get("proactive_threshold_tokens")
+            .and_then(serde_json::Value::as_u64),
+        hard_request_limit_tokens: payload
+            .get("hard_request_limit_tokens")
+            .and_then(serde_json::Value::as_u64),
+        pressure_level: payload
+            .get("pressure_level")
+            .or_else(|| payload.get("warning_level"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        checkpoint_generation: payload
+            .get("checkpoint_generation")
+            .and_then(serde_json::Value::as_u64),
+        resolved_model,
+        observed_at: payload
+            .get("observed_at")
+            .or_else(|| payload.get("updated_at"))
+            .and_then(serde_json::Value::as_u64)
+            .map(UtcMillis)
+            .or(fallback_observed_at),
+        measurement: payload
+            .get("measurement")
+            .or_else(|| payload.get("accuracy"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        phase: payload
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        thread_id: payload
+            .get("thread_id")
+            .or_else(|| payload.get("threadId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        turn_id: payload
+            .get("turn_id")
+            .or_else(|| payload.get("turnId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        call_id: payload
+            .get("call_id")
+            .or_else(|| payload.get("callId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
 }
 
 fn context_compaction_from_event(
@@ -2426,7 +2511,8 @@ fn context_compaction_from_event(
             .get("request_token_estimate")
             .and_then(serde_json::Value::as_u64),
         context_window_tokens: payload
-            .get("context_window_tokens")
+            .get("context_window_limit_tokens")
+            .or_else(|| payload.get("context_window_tokens"))
             .and_then(serde_json::Value::as_u64),
         token_limit: payload
             .get("token_limit")
@@ -2449,9 +2535,9 @@ fn context_compaction_from_event(
 /// 审计/用量账本回放的路径(`latest_usage_observations_from_ledger`),两条
 /// 路径共用同一口径,避免重启前后预算计算出现漂移。
 ///
-/// 口径对齐 Codex:展示用的上下文窗口占用取最近一次模型调用返回的
-/// `totalTokens`；没有显式 total 时使用用量权威层的统一口径。OpenAI 缓存读
-/// 已包含在 input 中，Anthropic 的独立缓存读写则必须计入上下文窗口。
+/// 口径对齐 Codex:展示用的上下文窗口占用取最近一次模型调用返回的输入
+/// token 锚点；completion token 和累计账单 total 不参与当前窗口判断。OpenAI
+/// 缓存读已包含在 input 中，Anthropic 的独立缓存读写则计入上下文窗口。
 ///
 /// 输入区圆环展示主线 orchestrator 的上下文窗口。worker / auxiliary 的模型
 /// 调用仍进入审计账本与任务指标,但不能覆盖主线会话窗口统计。
@@ -2471,6 +2557,46 @@ fn usage_observation_from_payload(
             context_window_tokens: payload
                 .get("request_token_estimate")
                 .and_then(serde_json::Value::as_u64)?,
+            provider_context_tokens: None,
+            projected_request_tokens: payload
+                .get("projected_request_tokens")
+                .or_else(|| payload.get("request_token_estimate"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default(),
+            context_window_limit_tokens: payload
+                .get("context_window_limit_tokens")
+                .or_else(|| payload.get("context_window_tokens"))
+                .or_else(|| payload.get("token_limit"))
+                .and_then(serde_json::Value::as_u64),
+            model_provider: payload
+                .get("model_provider")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            binding_revision: payload
+                .get("binding_revision")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value as u32),
+            response_reserve_tokens: payload
+                .get("response_reserve_tokens")
+                .and_then(serde_json::Value::as_u64),
+            recovery_buffer_tokens: payload
+                .get("recovery_buffer_tokens")
+                .and_then(serde_json::Value::as_u64),
+            proactive_threshold_tokens: payload
+                .get("proactive_threshold_tokens")
+                .or_else(|| payload.get("threshold_tokens"))
+                .and_then(serde_json::Value::as_u64),
+            hard_request_limit_tokens: payload
+                .get("hard_request_limit_tokens")
+                .or_else(|| payload.get("token_limit"))
+                .and_then(serde_json::Value::as_u64),
+            pressure_level: payload
+                .get("pressure_level")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            checkpoint_generation: payload
+                .get("checkpoint_generation")
+                .and_then(serde_json::Value::as_u64),
             resolved_model: payload
                 .get("resolved_model")
                 .and_then(serde_json::Value::as_str)
@@ -2482,6 +2608,10 @@ fn usage_observation_from_payload(
                 .map(UtcMillis),
             measurement: Some("estimated".to_string()),
             phase: Some("compacted".to_string()),
+            thread_id: payload
+                .get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
             turn_id: payload
                 .get("turn_id")
                 .and_then(serde_json::Value::as_str)
@@ -2503,7 +2633,7 @@ fn usage_observation_from_payload(
     }
     let usage = payload.get("usage")?;
     let usage = serde_json::from_value::<UsageTokenInput>(usage.clone()).ok()?;
-    let context_window_tokens = context_window_tokens_from_usage(&usage);
+    let context_window_tokens = provider_context_tokens_from_usage(&usage);
     if context_window_tokens == 0 {
         return None;
     }
@@ -2518,10 +2648,35 @@ fn usage_observation_from_payload(
         .map(UtcMillis);
     Some(SessionRuntimeUsageObservation {
         context_window_tokens,
+        provider_context_tokens: Some(context_window_tokens),
+        projected_request_tokens: context_window_tokens,
+        context_window_limit_tokens: payload
+            .get("contextWindowTokens")
+            .and_then(serde_json::Value::as_u64),
+        model_provider: payload
+            .get("modelConfig")
+            .and_then(|config| config.get("provider"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        binding_revision: payload
+            .get("executionBinding")
+            .and_then(|binding| binding.get("bindingRevision"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as u32),
+        response_reserve_tokens: None,
+        recovery_buffer_tokens: None,
+        proactive_threshold_tokens: None,
+        hard_request_limit_tokens: None,
+        pressure_level: None,
+        checkpoint_generation: None,
         resolved_model,
         observed_at,
         measurement: Some("authoritative".to_string()),
         phase: Some("completed".to_string()),
+        thread_id: payload
+            .get("threadId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
         turn_id: payload
             .get("turnId")
             .and_then(serde_json::Value::as_str)
@@ -2702,6 +2857,46 @@ impl RecoveryDiagnosticSummaryEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pressure_event_projects_bound_model_window_and_projected_tokens() {
+        let event = EventEnvelope::usage(
+            EventId::new("pressure-event"),
+            "session.context.pressure.updated",
+            json!({
+                "session_id": "session-pressure",
+                "resolved_model": "gpt-5.6-luna",
+                "model_provider": "openai",
+                "binding_revision": 7,
+                "provider_context_tokens": 210_000,
+                "projected_request_tokens": 214_000,
+                "context_window_limit_tokens": 272_000,
+                "response_reserve_tokens": 16_000,
+                "recovery_buffer_tokens": 13_000,
+                "proactive_threshold_tokens": 231_200,
+                "hard_request_limit_tokens": 256_000,
+                "pressure_level": "normal",
+                "measurement": "provider",
+                "phase": "completed",
+                "observed_at": 1700000000000u64,
+                "call_id": "call-pressure"
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(SessionId::new("session-pressure")),
+            ..EventContext::default()
+        });
+        let read_model = RuntimeReadModelInput::from_events(&[event]);
+        let observation = read_model.details.sessions[0]
+            .usage_observation
+            .as_ref()
+            .expect("pressure observation should be projected");
+        assert_eq!(observation.projected_request_tokens, 214_000);
+        assert_eq!(observation.provider_context_tokens, Some(210_000));
+        assert_eq!(observation.context_window_limit_tokens, Some(272_000));
+        assert_eq!(observation.binding_revision, Some(7));
+        assert_eq!(observation.measurement.as_deref(), Some("provider"));
+    }
     use crate::EventContext;
     use magi_core::{EventId, SessionId, WorkspaceId};
     use serde_json::json;
@@ -3229,8 +3424,9 @@ mod tests {
             .as_ref()
             .expect("usage observation should be recorded");
 
-        // 上下文窗口占用按 raw input + output,cache read 仍占窗口,不能按费用口径扣减。
-        assert_eq!(observation.context_window_tokens, 15_000);
+        // 当前上下文只统计 provider 的输入锚点；completion 不属于下一请求的上下文，
+        // 已计入 input 的 cache read 也不能重复累加。
+        assert_eq!(observation.context_window_tokens, 12_000);
         assert_eq!(observation.resolved_model.as_deref(), Some("gpt-5-codex"));
         assert_eq!(observation.observed_at, Some(UtcMillis(1_700_000_000_000)));
         // event-bus 不计算窗口/告警,budget 留给 magi-api 装配。
@@ -3272,7 +3468,7 @@ mod tests {
     }
 
     #[test]
-    fn model_usage_recorded_prefers_total_tokens_for_context_window() {
+    fn model_usage_recorded_prefers_input_tokens_for_context_window() {
         let mut usage_event = EventEnvelope::audit(
             EventId::new("event-model-usage-total-tokens"),
             "model.usage.recorded",
@@ -3303,7 +3499,7 @@ mod tests {
             .and_then(|entry| entry.usage_observation.as_ref())
             .expect("usage observation should be recorded");
 
-        assert_eq!(observation.context_window_tokens, 18_000);
+        assert_eq!(observation.context_window_tokens, 12_000);
     }
 
     #[test]
@@ -3340,7 +3536,7 @@ mod tests {
             .and_then(|entry| entry.usage_observation.as_ref())
             .expect("Anthropic cache usage should be recorded");
 
-        assert_eq!(observation.context_window_tokens, 6_000);
+        assert_eq!(observation.context_window_tokens, 5_800);
     }
 
     #[test]
@@ -3485,7 +3681,7 @@ mod tests {
             .and_then(|entry| entry.usage_observation.as_ref())
             .expect("orchestrator usage observation should be retained");
 
-        assert_eq!(observation.context_window_tokens, 21_000);
+        assert_eq!(observation.context_window_tokens, 20_000);
         assert_eq!(observation.observed_at, Some(UtcMillis(700)));
     }
 
@@ -3556,8 +3752,8 @@ mod tests {
         let observation = observations
             .get("session-a")
             .expect("session-a observation should be present");
-        // timestamp 700 wins:20_000 input + 1_000 output.
-        assert_eq!(observation.context_window_tokens, 21_000);
+        // timestamp 700 wins；上下文压力只取 20_000 input，不混入 completion token。
+        assert_eq!(observation.context_window_tokens, 20_000);
         assert_eq!(observation.observed_at, Some(UtcMillis(700)));
     }
 
@@ -3611,7 +3807,7 @@ mod tests {
             .get("session-a")
             .expect("session-a observation should be present");
 
-        assert_eq!(observation.context_window_tokens, 7_072);
+        assert_eq!(observation.context_window_tokens, 7_000);
         assert_eq!(observation.observed_at, Some(UtcMillis(1_783_502_851_661)));
     }
 
@@ -3631,7 +3827,7 @@ mod tests {
             .get("session-a")
             .expect("orchestrator observation should be present");
 
-        assert_eq!(observation.context_window_tokens, 21_000);
+        assert_eq!(observation.context_window_tokens, 20_000);
         assert_eq!(observation.observed_at, Some(UtcMillis(700)));
     }
 }

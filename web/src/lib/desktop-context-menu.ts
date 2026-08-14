@@ -1,22 +1,14 @@
-import { isDesktopRuntime } from './desktop-updater';
 import { i18n } from '../stores/i18n.svelte';
 import { resolveAgentFileRevealTarget, type AgentFileRevealTarget } from '../web/agent-api';
-import type { PredefinedMenuItemOptions } from '@tauri-apps/api/menu';
 import {
   resolveDesktopContextMenuRequest,
   type DesktopContextMenuDescriptor,
-  type DesktopContextMenuKind,
   type DesktopContextMenuRequest,
 } from './desktop-context-menu-contract';
 
 type ContextAction = () => void | Promise<void>;
 
-type TauriMenu = Awaited<ReturnType<typeof import('@tauri-apps/api/menu').Menu.new>>;
-
-const menuCache = new Map<string, Promise<TauriMenu>>();
 const REVEAL_TARGET_TIMEOUT_MS = 800;
-let activeDescriptor: DesktopContextMenuDescriptor | null = null;
-let activeRevealTarget: AgentFileRevealTarget | null = null;
 let removeDocumentListener: (() => void) | null = null;
 let requestSequence = 0;
 
@@ -32,12 +24,6 @@ function copyContextValue(value: string, label: string): void {
   runContextAction(() => navigator.clipboard.writeText(value), label);
 }
 
-function currentDescriptor<T extends DesktopContextMenuDescriptor['kind']>(kind: T): Extract<DesktopContextMenuDescriptor, { kind: T }> | null {
-  return activeDescriptor?.kind === kind
-    ? activeDescriptor as Extract<DesktopContextMenuDescriptor, { kind: T }>
-    : null;
-}
-
 function descriptorFileContext(descriptor: DesktopContextMenuDescriptor | null): {
   filePath: string;
   fileScope: NonNullable<Extract<DesktopContextMenuDescriptor, { kind: 'file' | 'code' | 'image' }>['fileScope']>;
@@ -51,17 +37,6 @@ function descriptorFileContext(descriptor: DesktopContextMenuDescriptor | null):
   return { filePath, fileScope };
 }
 
-function openActiveWorkspaceFolder(): void {
-  const workspacePathRef = currentDescriptor('workspace')?.workspacePathRef.trim() ?? '';
-  if (!workspacePathRef) return;
-  runContextAction(async () => {
-    const { invoke } = await import('@tauri-apps/api/core');
-    await invoke('open_workspace_folder', {
-      request: { workspaceRootPathRef: workspacePathRef },
-    });
-  }, i18n.t('contextMenu.openFolder'));
-}
-
 async function resolveRevealTarget(
   descriptor: DesktopContextMenuDescriptor | null,
 ): Promise<AgentFileRevealTarget | null> {
@@ -70,7 +45,12 @@ async function resolveRevealTarget(
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), REVEAL_TARGET_TIMEOUT_MS);
   try {
-    return await resolveAgentFileRevealTarget(context.filePath, context.fileScope, controller.signal);
+    return await resolveAgentFileRevealTarget(context.filePath, {
+      scope: 'workspace',
+      workspaceId: context.fileScope.workspaceId?.trim() || '',
+      workspacePath: context.fileScope.workspacePath?.trim() || '',
+      sessionId: context.fileScope.sessionId?.trim() || undefined,
+    }, controller.signal);
   } catch {
     return null;
   } finally {
@@ -78,163 +58,146 @@ async function resolveRevealTarget(
   }
 }
 
-function revealActiveFile(): void {
-  if (!activeRevealTarget) return;
-  const request = {
-    targetPathRef: activeRevealTarget.targetPathRef,
-    workspaceRootPathRef: activeRevealTarget.workspaceRootPathRef,
-  };
-  runContextAction(async () => {
-    const { invoke } = await import('@tauri-apps/api/core');
-    await invoke('reveal_workspace_file', { request });
-  }, i18n.t('contextMenu.revealFile'));
+function role(role: MagiDesktopContextMenuRole): MagiDesktopContextMenuItem {
+  return { type: 'role', role };
 }
 
-async function createMenu(kind: DesktopContextMenuKind, revealAvailable: boolean): Promise<TauriMenu> {
-  const { Menu, MenuItem, PredefinedMenuItem } = await import('@tauri-apps/api/menu');
-  const predefined = (item: PredefinedMenuItemOptions['item'], key: string) =>
-    PredefinedMenuItem.new({ item, text: i18n.t(key) });
-  const separator = () => PredefinedMenuItem.new({ item: 'Separator' });
-  const custom = (key: string, action: () => void) =>
-    MenuItem.new({ text: i18n.t(key), action });
+function separator(): MagiDesktopContextMenuItem {
+  return { type: 'separator' };
+}
 
+function action(id: string, labelKey: string, enabled = true): MagiDesktopContextMenuItem {
+  return { type: 'action', id, label: i18n.t(labelKey), enabled };
+}
+
+function buildMenuItems(
+  request: DesktopContextMenuRequest,
+  revealAvailable: boolean,
+): MagiDesktopContextMenuItem[] {
+  const { kind, descriptor } = request;
   if (kind === 'editable') {
-    return Menu.new({
-      items: await Promise.all([
-        predefined('Undo', 'contextMenu.undo'),
-        predefined('Redo', 'contextMenu.redo'),
-        separator(),
-        predefined('Cut', 'contextMenu.cut'),
-        predefined('Copy', 'contextMenu.copy'),
-        predefined('Paste', 'contextMenu.paste'),
-        separator(),
-        predefined('SelectAll', 'contextMenu.selectAll'),
-      ]),
-    });
+    return [
+      role('undo'), role('redo'), separator(),
+      role('cut'), role('copy'), role('paste'), separator(),
+      role('selectAll'),
+    ];
   }
+  if (kind === 'selection') return [role('copy')];
+  if (kind === 'readonly') return [role('copy'), separator(), role('selectAll')];
+  if (kind === 'workspace') return [action('open-workspace', 'contextMenu.openFolder')];
 
-  if (kind === 'selection') {
-    return Menu.new({ items: [await predefined('Copy', 'contextMenu.copy')] });
-  }
-
-  if (kind === 'readonly') {
-    return Menu.new({
-      items: await Promise.all([
-        predefined('Copy', 'contextMenu.copy'),
-        separator(),
-        predefined('SelectAll', 'contextMenu.selectAll'),
-      ]),
-    });
-  }
-
-  if (kind === 'workspace') {
-    return Menu.new({
-      items: [await custom('contextMenu.openFolder', openActiveWorkspaceFolder)],
-    });
-  }
-
-  const items: Array<Awaited<ReturnType<typeof MenuItem.new>> | Awaited<ReturnType<typeof PredefinedMenuItem.new>>> = [];
+  const items: MagiDesktopContextMenuItem[] = [];
   if (kind.endsWith('-selection')) {
-    items.push(await predefined('Copy', 'contextMenu.copy'));
-    items.push(await separator());
+    items.push(role('copy'), separator());
   }
 
-  if (kind.startsWith('image')) {
-    const openImage = () => {
-      const descriptor = currentDescriptor('image');
-      runContextAction(descriptor?.open, i18n.t('contextMenu.openImage'));
-    };
-    if (currentDescriptor('image')?.open || kind !== 'image-open') {
-      items.push(await custom('contextMenu.openImage', openImage));
-    }
-    if (revealAvailable) {
-      items.push(await custom('contextMenu.revealFile', revealActiveFile));
-    }
+  if (descriptor?.kind === 'image') {
+    if (descriptor.open) items.push(action('open-image', 'contextMenu.openImage'));
+    if (revealAvailable) items.push(action('reveal-file', 'contextMenu.revealFile'));
     if (kind === 'image-file') {
-      items.push(await custom('contextMenu.copyPath', () => {
-        copyContextValue(currentDescriptor('image')?.filePath ?? '', i18n.t('contextMenu.copyPath'));
-      }));
+      items.push(action('copy-path', 'contextMenu.copyPath'));
     } else if (kind === 'image-source') {
-      items.push(await custom('contextMenu.copyImageAddress', () => {
-        copyContextValue(currentDescriptor('image')?.source ?? '', i18n.t('contextMenu.copyImageAddress'));
-      }));
+      items.push(action('copy-image-address', 'contextMenu.copyImageAddress'));
     }
-  } else if (kind.startsWith('link')) {
-    items.push(await custom('contextMenu.openLink', () => {
-      const descriptor = currentDescriptor('link');
-      runContextAction(descriptor?.open, i18n.t('contextMenu.openLink'));
-    }));
-    items.push(await custom('contextMenu.copyLink', () => {
-      copyContextValue(currentDescriptor('link')?.url ?? '', i18n.t('contextMenu.copyLink'));
-    }));
-  } else if (kind === 'file' || kind === 'file-copy') {
-    if (kind === 'file') {
-      items.push(await custom('contextMenu.openFile', () => {
-        const descriptor = currentDescriptor('file');
-        runContextAction(descriptor?.open, i18n.t('contextMenu.openFile'));
-      }));
-    }
-    if (revealAvailable) {
-      items.push(await custom('contextMenu.revealFile', revealActiveFile));
-    }
-    items.push(await custom('contextMenu.copyPath', () => {
-      const descriptor = currentDescriptor('file');
-      copyContextValue(descriptor?.filePath ?? '', i18n.t('contextMenu.copyPath'));
-    }));
-  } else {
-    if (!kind.endsWith('-selection')) {
-      items.push(await custom('contextMenu.copyCode', () => {
-        copyContextValue(currentDescriptor('code')?.content ?? '', i18n.t('contextMenu.copyCode'));
-      }));
-    }
-    if (kind.includes('-file')) {
-      items.push(await separator());
-      items.push(await custom('contextMenu.openFile', () => {
-        const descriptor = currentDescriptor('code');
-        runContextAction(descriptor?.openFile, i18n.t('contextMenu.openFile'));
-      }));
-      if (revealAvailable) {
-        items.push(await custom('contextMenu.revealFile', revealActiveFile));
-      }
-      items.push(await custom('contextMenu.copyPath', () => {
-        copyContextValue(currentDescriptor('code')?.filePath ?? '', i18n.t('contextMenu.copyPath'));
-      }));
-    }
+    return items;
   }
 
-  return Menu.new({ items });
+  if (descriptor?.kind === 'link') {
+    items.push(action('open-link', 'contextMenu.openLink'));
+    items.push(action('copy-link', 'contextMenu.copyLink'));
+    return items;
+  }
+
+  if (descriptor?.kind === 'file') {
+    if (descriptor.open) items.push(action('open-file', 'contextMenu.openFile'));
+    if (revealAvailable) items.push(action('reveal-file', 'contextMenu.revealFile'));
+    items.push(action('copy-path', 'contextMenu.copyPath'));
+    return items;
+  }
+
+  if (descriptor?.kind === 'code') {
+    if (!kind.endsWith('-selection')) items.push(action('copy-code', 'contextMenu.copyCode'));
+    if (descriptor.filePath) {
+      if (items.length > 0) items.push(separator());
+      if (descriptor.openFile) items.push(action('open-file', 'contextMenu.openFile'));
+      if (revealAvailable) items.push(action('reveal-file', 'contextMenu.revealFile'));
+      items.push(action('copy-path', 'contextMenu.copyPath'));
+    }
+  }
+  return items;
 }
 
-function menuFor(kind: DesktopContextMenuKind, revealAvailable: boolean): Promise<TauriMenu> {
-  const cacheKey = `${i18n.locale}:${kind}:${revealAvailable ? 'reveal' : 'plain'}`;
-  let menu = menuCache.get(cacheKey);
-  if (!menu) {
-    menu = createMenu(kind, revealAvailable);
-    menuCache.set(cacheKey, menu);
+async function executeMenuAction(
+  actionId: string | null,
+  descriptor: DesktopContextMenuDescriptor | null,
+  revealTarget: AgentFileRevealTarget | null,
+): Promise<void> {
+  if (!actionId) return;
+  const desktop = window.magiDesktop;
+  if (!desktop) throw new Error('desktop_preload_bridge_unavailable');
+  switch (actionId) {
+    case 'open-workspace':
+      if (descriptor?.kind === 'workspace') {
+        await desktop.openWorkspaceFolder(descriptor.workspacePathRef);
+      }
+      return;
+    case 'reveal-file':
+      if (revealTarget) {
+        await desktop.revealWorkspaceFile({
+          targetPathRef: revealTarget.targetPathRef,
+          workspaceRootPathRef: revealTarget.workspaceRootPathRef,
+        });
+      }
+      return;
+    case 'open-link':
+      if (descriptor?.kind === 'link') runContextAction(descriptor.open, i18n.t('contextMenu.openLink'));
+      return;
+    case 'copy-link':
+      if (descriptor?.kind === 'link') copyContextValue(descriptor.url, i18n.t('contextMenu.copyLink'));
+      return;
+    case 'open-image':
+      if (descriptor?.kind === 'image') runContextAction(descriptor.open, i18n.t('contextMenu.openImage'));
+      return;
+    case 'copy-image-address':
+      if (descriptor?.kind === 'image') copyContextValue(descriptor.source ?? '', i18n.t('contextMenu.copyImageAddress'));
+      return;
+    case 'open-file':
+      if (descriptor?.kind === 'file') runContextAction(descriptor.open, i18n.t('contextMenu.openFile'));
+      if (descriptor?.kind === 'code') runContextAction(descriptor.openFile, i18n.t('contextMenu.openFile'));
+      return;
+    case 'copy-path':
+      if (descriptor?.kind === 'file' || descriptor?.kind === 'code' || descriptor?.kind === 'image') {
+        copyContextValue(descriptor.filePath ?? '', i18n.t('contextMenu.copyPath'));
+      }
+      return;
+    case 'copy-code':
+      if (descriptor?.kind === 'code') copyContextValue(descriptor.content, i18n.t('contextMenu.copyCode'));
+      return;
   }
-  return menu;
 }
 
 async function showDesktopContextMenu(request: DesktopContextMenuRequest): Promise<void> {
+  const desktop = window.magiDesktop;
+  if (!desktop) return;
   const sequence = ++requestSequence;
   const revealTarget = await resolveRevealTarget(request.descriptor);
   if (sequence !== requestSequence) return;
-  activeDescriptor = request.descriptor;
-  activeRevealTarget = revealTarget;
-  const menu = await menuFor(request.kind, Boolean(revealTarget));
+  const items = buildMenuItems(request, Boolean(revealTarget));
+  if (items.length === 0) return;
+  const actionId = await desktop.showContextMenu({ items });
   if (sequence !== requestSequence) return;
-  await menu.popup();
+  await executeMenuAction(actionId, request.descriptor, revealTarget);
 }
 
 export function installDesktopContextMenu(): () => void {
-  if (!isDesktopRuntime() || removeDocumentListener) {
+  if (!window.magiDesktop || removeDocumentListener) {
     return removeDocumentListener ?? (() => undefined);
   }
 
   const handleContextMenu = (event: MouseEvent) => {
-    event.preventDefault();
     const request = resolveDesktopContextMenuRequest(event);
     if (!request) return;
+    event.preventDefault();
     event.stopPropagation();
     void showDesktopContextMenu(request).catch((error) => {
       console.error('[DesktopContextMenu] 原生菜单打开失败:', error);
@@ -245,8 +208,6 @@ export function installDesktopContextMenu(): () => void {
   removeDocumentListener = () => {
     document.removeEventListener('contextmenu', handleContextMenu, true);
     removeDocumentListener = null;
-    activeDescriptor = null;
-    activeRevealTarget = null;
     requestSequence += 1;
   };
   return removeDocumentListener;

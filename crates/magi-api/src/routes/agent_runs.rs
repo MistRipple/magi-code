@@ -12,9 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use super::agent_run_actions::{AgentRunActionKind, available_agent_run_actions};
-use super::session_scope::{
-    SessionWorkspaceScope, parse_session_id, require_session_workspace_scope,
-};
+use super::session_scope::{SessionRequestScope, parse_session_id, require_session_request_scope};
 use crate::{
     errors::ApiError,
     routes::settings::{load_registry_engines, resolve_registry_agents},
@@ -42,6 +40,7 @@ fn require_task_store(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SessionScopedTaskQuery {
+    scope: crate::dto::SessionScopeKindDto,
     session_id: Option<String>,
     workspace_id: Option<String>,
     #[serde(default)]
@@ -50,7 +49,7 @@ struct SessionScopedTaskQuery {
 
 #[derive(Clone, Debug)]
 struct SessionTaskScope {
-    workspace: SessionWorkspaceScope,
+    execution: SessionRequestScope,
     mission_id: Option<MissionId>,
 }
 
@@ -109,8 +108,8 @@ struct AgentRunProjectionResponseDto {
     #[serde(flatten)]
     projection: AgentRunProjection,
     session_id: String,
-    workspace_id: String,
-    workspace_path: String,
+    workspace_id: Option<String>,
+    workspace_path: Option<String>,
     agents: Vec<AgentProjectionDto>,
     outcome: String,
     available_actions: Vec<AgentRunActionKind>,
@@ -127,31 +126,32 @@ struct AgentModelBinding {
 fn require_session_task_scope(
     state: &ApiState,
     session_id_value: Option<&str>,
+    requested_scope: crate::dto::SessionScopeKindDto,
     workspace_id_value: Option<&str>,
     workspace_path_value: Option<&str>,
 ) -> Result<SessionTaskScope, ApiError> {
-    let workspace = require_session_workspace_scope(
+    let execution = require_session_request_scope(
         state,
         session_id_value,
+        requested_scope,
         workspace_id_value,
         workspace_path_value,
-        "读取代理运行投影",
     )?;
     // 投影是只读查询：活跃执行链归档后 ownership.mission_id 会被清空，
     // 但 session 一生一 mission，orchestrator thread 保留权威 mission。
     // 这里回退到 thread mission，保证终态任务的投影仍可按会话历史读取。
     let mission_id = state
         .session_store
-        .execution_ownership(&workspace.session_id)
+        .execution_ownership(&execution.session_id)
         .and_then(|ownership| ownership.mission_id)
         .or_else(|| {
             state
                 .session_store
-                .orchestrator_thread_for_session(&workspace.session_id)
+                .orchestrator_thread_for_session(&execution.session_id)
                 .map(|thread| thread.mission_id)
         });
     Ok(SessionTaskScope {
-        workspace,
+        execution,
         mission_id,
     })
 }
@@ -159,6 +159,7 @@ fn require_session_task_scope(
 fn require_session_task(
     state: &ApiState,
     session_id_value: Option<&str>,
+    requested_scope: crate::dto::SessionScopeKindDto,
     workspace_id_value: Option<&str>,
     workspace_path_value: Option<&str>,
     task_id: &TaskId,
@@ -166,6 +167,7 @@ fn require_session_task(
     let scope = require_session_task_scope(
         state,
         session_id_value,
+        requested_scope,
         workspace_id_value,
         workspace_path_value,
     )?;
@@ -180,7 +182,7 @@ fn require_session_task(
     if task.mission_id != mission_id {
         return Err(ApiError::InvalidInput(format!(
             "任务 {} 不属于当前会话 {}",
-            task_id, scope.workspace.session_id
+            task_id, scope.execution.session_id
         )));
     }
     Ok(scope)
@@ -566,6 +568,7 @@ async fn get_agent_run_projection(
     let scope = require_session_task(
         &state,
         query.session_id.as_deref(),
+        query.scope,
         query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
         &root_id,
@@ -583,12 +586,12 @@ async fn get_agent_run_projection(
     let projection = public_agent_run_projection_for_api(projection);
     let active_chain = state
         .session_store
-        .active_execution_chain(&scope.workspace.session_id)
+        .active_execution_chain(&scope.execution.session_id)
         .filter(|chain| chain.root_task_id == root_id);
     let agent_model_bindings = agent_model_bindings_for_state(&state);
     let session_threads = state
         .session_store
-        .thread_registry_snapshot(&scope.workspace.session_id);
+        .thread_registry_snapshot(&scope.execution.session_id);
     let agents = agent_read_model_for_projection(
         &projection,
         active_chain.as_ref(),
@@ -613,9 +616,9 @@ fn agent_run_projection_response(
     let failure_summary = agent_run_failure_summary(&projection);
     AgentRunProjectionResponseDto {
         projection,
-        session_id: scope.workspace.session_id.to_string(),
-        workspace_id: scope.workspace.workspace_id.to_string(),
-        workspace_path: scope.workspace.workspace_path.clone(),
+        session_id: scope.execution.session_id.to_string(),
+        workspace_id: scope.execution.workspace_id().map(|id| id.to_string()),
+        workspace_path: scope.execution.workspace_path(),
         agents,
         outcome,
         available_actions,
@@ -733,6 +736,7 @@ fn normalize_runner_status(status: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::session_scope::{RegisteredWorkspaceBinding, SessionScope};
     use crate::state::ApiState;
     use magi_core::{
         AbsolutePath, ExecutionOwnership, SessionId, TASK_RUNTIME_FAILURE_PUBLIC_OUTPUT, UtcMillis,
@@ -1110,10 +1114,12 @@ mod tests {
             recoverable_branch_count: 0,
         };
         let scope = SessionTaskScope {
-            workspace: SessionWorkspaceScope {
+            execution: SessionRequestScope {
                 session_id: session_id.clone(),
-                workspace_id: workspace_id.clone(),
-                workspace_path: "/tmp/projection-response".to_string(),
+                scope: SessionScope::Workspace(RegisteredWorkspaceBinding {
+                    workspace_id: workspace_id.clone(),
+                    workspace_path: "/tmp/projection-response".to_string(),
+                }),
             },
             mission_id: Some(mission_id),
         };
@@ -1173,6 +1179,47 @@ mod tests {
         assert!(value["agents"][0]["completedAt"].is_null());
         assert!(value["agents"][0]["responseDurationMs"].is_null());
         assert!(value["agents"][0].get("accessMode").is_none());
+    }
+
+    #[test]
+    fn agent_run_projection_response_represents_personal_scope_with_null_workspace_fields() {
+        let session_id = SessionId::new("session-projection-personal");
+        let mission_id = MissionId::new("mission-projection-personal");
+        let root = test_task("agent-run-personal-root", &mission_id);
+        let projection = AgentRunProjection {
+            root_task: root.clone(),
+            tasks: vec![root],
+            running_tasks: Vec::new(),
+            pending_tasks: Vec::new(),
+            completed_tasks: Vec::new(),
+            failed_tasks: Vec::new(),
+            killed_tasks: Vec::new(),
+            progress_summary: Default::default(),
+            aggregate_status: TaskStatus::Failed,
+            display_status: "失败".to_string(),
+            execution_mode: "execution_chain".to_string(),
+            runner_status: "error".to_string(),
+            has_recoverable_chain: false,
+            recoverable_branch_count: 0,
+        };
+        let scope = SessionTaskScope {
+            execution: SessionRequestScope {
+                session_id: session_id.clone(),
+                scope: SessionScope::Personal,
+            },
+            mission_id: Some(mission_id),
+        };
+
+        let value = serde_json::to_value(agent_run_projection_response(
+            projection,
+            &scope,
+            Vec::new(),
+        ))
+        .expect("response should serialize");
+
+        assert_eq!(value["sessionId"].as_str(), Some(session_id.as_str()));
+        assert!(value["workspaceId"].is_null());
+        assert!(value["workspacePath"].is_null());
     }
 
     #[test]
@@ -1267,6 +1314,7 @@ mod tests {
         let err = require_session_task(
             &state,
             Some(session_id.as_str()),
+            crate::dto::SessionScopeKindDto::Workspace,
             Some(workspace_b.as_str()),
             None,
             &task_id,
@@ -1281,29 +1329,70 @@ mod tests {
         let scope = require_session_task(
             &state,
             Some(session_id.as_str()),
+            crate::dto::SessionScopeKindDto::Workspace,
             Some(workspace_a.as_str()),
             None,
             &task_id,
         )
         .expect("matching workspace should pass");
-        assert_eq!(scope.workspace.workspace_id, workspace_a);
-        assert_eq!(scope.workspace.session_id, session_id);
+        assert_eq!(scope.execution.workspace_id(), Some(workspace_a.clone()));
+        assert_eq!(scope.execution.session_id, session_id);
         assert!(
             scope
-                .workspace
-                .workspace_path
+                .execution
+                .workspace_path()
+                .expect("workspace scope should expose path")
                 .ends_with("magi-task-workspace-a")
         );
 
         let scope = require_session_task(
             &state,
             Some(session_id.as_str()),
+            crate::dto::SessionScopeKindDto::Workspace,
             Some("workspace-stale-query"),
             Some("/tmp/magi-task-workspace-a"),
             &task_id,
         )
         .expect("registered workspacePath should resolve stale workspace id");
-        assert_eq!(scope.workspace.workspace_id, workspace_a);
-        assert_eq!(scope.workspace.session_id, session_id);
+        assert_eq!(scope.execution.workspace_id(), Some(workspace_a));
+        assert_eq!(scope.execution.session_id, session_id);
+    }
+
+    #[test]
+    fn require_session_task_accepts_personal_session_without_workspace_binding() {
+        let state = build_state();
+        let session_id = SessionId::new("session-task-personal");
+        let mission_id = MissionId::new("mission-task-personal");
+        let task_id = TaskId::new("root-task-personal");
+        state
+            .session_store
+            .create_session(session_id.clone(), "个人任务会话")
+            .expect("personal session should create");
+        state.session_store.bind_execution_ownership(
+            session_id.clone(),
+            ExecutionOwnership {
+                session_id: Some(session_id.clone()),
+                mission_id: Some(mission_id.clone()),
+                ..ExecutionOwnership::default()
+            },
+        );
+        state
+            .task_store()
+            .expect("task store should exist")
+            .insert_task(test_task(task_id.as_str(), &mission_id));
+
+        let scope = require_session_task(
+            &state,
+            Some(session_id.as_str()),
+            crate::dto::SessionScopeKindDto::Personal,
+            None,
+            None,
+            &task_id,
+        )
+        .expect("personal session task should be readable");
+
+        assert_eq!(scope.execution.session_id, session_id);
+        assert_eq!(scope.execution.workspace_id(), None);
+        assert_eq!(scope.execution.workspace_path(), None);
     }
 }

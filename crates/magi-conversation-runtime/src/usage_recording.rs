@@ -10,17 +10,20 @@ use magi_bridge_client::{
     BridgeClientError, ModelBridgeClient, ModelInvocationRequest, ModelResponse,
 };
 use magi_core::{
-    EventId, GoalId, MissionId, SessionId, UtcMillis, WorkspaceId, estimate_text_tokens,
+    EventId, GoalId, MissionId, SessionId, ThreadId, UtcMillis, WorkspaceId, estimate_text_tokens,
 };
-use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
+use magi_event_bus::{
+    EventContext, EventEnvelope, InMemoryEventBus, latest_usage_observations_from_ledger,
+};
 use magi_mission_metrics::{MissionMetricsStore, TurnUsage};
 use magi_orchestrator::task_worker_catalog::WorkerInfo;
 use magi_session_store::SessionStore;
 use magi_settings_store::SettingsStore;
 use magi_usage_authority::{
-    ExecutionBindingIdentity, LlmConfig, UsageCallIdentity, UsageCallRecordInput, UsageCallStatus,
+    ContextBudgetPolicy, ContextMeasurement, ContextPressureSnapshot, ExecutionBindingIdentity,
+    LlmConfig, ModelIdentitySnapshot, UsageCallIdentity, UsageCallRecordInput, UsageCallStatus,
     UsagePhase, UsageSourceRole, UsageTokenInput, context_window_tokens_from_usage,
-    evaluate_context_budget, prepare_llm_config_for_persistence,
+    prepare_llm_config_for_persistence, provider_context_tokens_from_usage,
 };
 use std::sync::Arc;
 
@@ -40,6 +43,10 @@ impl ModelUsageBinding {
     pub fn tracks_active_context(&self) -> bool {
         self.role == UsageSourceRole::Orchestrator
     }
+
+    pub fn binding_revision(&self) -> u32 {
+        self.binding_revision
+    }
 }
 
 pub struct ContextUsageRuntimeTrackerInput<'a> {
@@ -51,6 +58,10 @@ pub struct ContextUsageRuntimeTrackerInput<'a> {
     pub call_id: &'a str,
     pub resolved_model: &'a str,
     pub prefill_tokens: u64,
+    pub thread_id: Option<&'a ThreadId>,
+    pub model_provider: Option<String>,
+    pub binding_revision: u32,
+    pub checkpoint_generation: u64,
 }
 
 pub struct ContextUsageRuntimeTracker<'a> {
@@ -70,6 +81,10 @@ impl<'a> ContextUsageRuntimeTracker<'a> {
             input.call_id,
             input.resolved_model,
             input.prefill_tokens,
+            input.thread_id,
+            input.model_provider.as_deref(),
+            input.binding_revision,
+            input.checkpoint_generation,
             "prefill",
             "estimated",
         );
@@ -106,6 +121,10 @@ impl<'a> ContextUsageRuntimeTracker<'a> {
             self.input.call_id,
             self.input.resolved_model,
             estimated_context_tokens,
+            self.input.thread_id,
+            self.input.model_provider.as_deref(),
+            self.input.binding_revision,
+            self.input.checkpoint_generation,
             "streaming",
             "estimated",
         );
@@ -303,34 +322,103 @@ pub fn publish_context_usage_update(
     call_id: &str,
     resolved_model: &str,
     token_used: u64,
+    thread_id: Option<&ThreadId>,
+    model_provider: Option<&str>,
+    binding_revision: u32,
+    checkpoint_generation: u64,
     phase: &str,
     accuracy: &str,
 ) {
-    let context_window = resolve_model_context_window(settings_store, resolved_model) as i64;
-    let budget = evaluate_context_budget(token_used as i64, context_window);
+    let context_window = resolve_model_context_window(settings_store, resolved_model).max(1) as u64;
+    let previous_anchor = latest_usage_observations_from_ledger(
+        &event_bus.audit_usage_ledger_snapshot().usage_entries,
+    )
+    .remove(&session_id.to_string())
+    .filter(|observation| {
+        observation
+            .resolved_model
+            .as_deref()
+            .is_none_or(|model| model == resolved_model)
+    })
+    .filter(|observation| {
+        observation
+            .thread_id
+            .as_deref()
+            .is_none_or(|thread| thread_id.is_some_and(|current| current.as_str() == thread))
+    })
+    .filter(|observation| {
+        observation
+            .checkpoint_generation
+            .is_none_or(|generation| generation == checkpoint_generation)
+    })
+    .and_then(|observation| observation.provider_context_tokens);
+    let projected_tokens = token_used.max(previous_anchor.unwrap_or_default());
+    let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
+    let remaining_tokens = context_window.saturating_sub(projected_tokens);
+    let measurement = if accuracy == "authoritative" {
+        ContextMeasurement::Provider
+    } else {
+        ContextMeasurement::Estimated
+    };
+    let snapshot = ContextPressureSnapshot::from_projected(
+        session_id.to_string(),
+        thread_id.map(ToString::to_string),
+        ModelIdentitySnapshot::new(
+            model_provider.unwrap_or("configured"),
+            resolved_model,
+            binding_revision,
+        ),
+        policy,
+        if accuracy == "authoritative" {
+            Some(token_used)
+        } else {
+            previous_anchor
+        },
+        projected_tokens,
+        measurement,
+        Some(call_id.to_string()),
+        checkpoint_generation,
+        UtcMillis::now().0,
+    );
     let updated_at = UtcMillis::now();
     let payload = serde_json::json!({
         "session_id": session_id.to_string(),
         "workspace_id": workspace_id.as_ref().map(ToString::to_string),
+        "thread_id": thread_id.map(ToString::to_string),
         "turn_id": turn_id,
         "call_id": call_id,
         "resolved_model": resolved_model,
+        "model_provider": snapshot.model.provider,
+        "binding_revision": snapshot.model.binding_revision,
         "phase": phase,
+        "measurement": accuracy,
         "accuracy": accuracy,
-        "token_used": budget.tokens_used.max(0) as u64,
-        "remaining_tokens": budget.remaining_tokens.max(0) as u64,
-        "token_limit": budget.context_window.max(0) as u64,
-        "usage_ratio": budget.usage_ratio,
-        "warning_level": budget.warning_level.as_str(),
+        "projected_request_tokens": snapshot.projected_request_tokens,
+        "token_used": snapshot.projected_request_tokens,
+        "provider_context_tokens": snapshot.provider_context_tokens,
+        "context_window_tokens": snapshot.context_window_tokens,
+        "context_window_limit_tokens": snapshot.context_window_tokens,
+        "token_limit": snapshot.context_window_tokens,
+        "remaining_tokens": remaining_tokens,
+        "response_reserve_tokens": snapshot.response_reserve_tokens,
+        "recovery_buffer_tokens": snapshot.recovery_buffer_tokens,
+        "proactive_threshold_tokens": snapshot.proactive_threshold_tokens,
+        "hard_request_limit_tokens": snapshot.hard_request_limit_tokens,
+        "checkpoint_generation": snapshot.checkpoint_generation,
+        "source_role": "orchestrator",
+        "pressure_level": snapshot.pressure_level.as_str(),
+        "warning_level": snapshot.pressure_level.as_str(),
+        "usage_ratio": snapshot.projected_request_tokens as f64 / snapshot.context_window_tokens as f64,
         "updated_at": updated_at.0,
+        "observed_at": updated_at.0,
     });
     let _ = event_bus.publish(
-        EventEnvelope::domain(
+        EventEnvelope::usage(
             EventId::new(format!(
                 "session-context-usage-{call_id}-{phase}-{token_used}-{}",
                 updated_at.0,
             )),
-            "session.context.usage.updated",
+            "session.context.pressure.updated",
             payload,
         )
         .with_context(EventContext {
@@ -358,7 +446,7 @@ fn publish_model_usage_record_internal(
         assignment_id,
         error_code,
     } = input;
-    let mut usage = match usage_tokens_from_payload(usage) {
+    let usage = match usage_tokens_from_payload(usage) {
         Some(usage) => usage,
         None => UsageTokenInput {
             input_tokens: 0,
@@ -379,30 +467,25 @@ fn publish_model_usage_record_internal(
         );
         return;
     };
-    let authoritative_context_tokens = context_window_tokens_from_usage(&usage);
-    usage.total_tokens = Some(authoritative_context_tokens);
+    let authoritative_context_tokens = provider_context_tokens_from_usage(&usage);
     let resolved_model = model_config.model.clone();
+    let model_provider = model_config.provider.clone();
     let publishes_authoritative_context = binding.role == UsageSourceRole::Orchestrator
         && status == UsageCallStatus::Success
         && authoritative_context_tokens > 0;
-    let Some(workspace_id) = workspace_id.as_ref() else {
-        tracing::warn!(
-            session_id = %session_id,
-            call_id = %call_id,
-            "模型调用已返回用量，但缺少 workspace 绑定，跳过统计记录"
-        );
-        return;
-    };
-    let workspace_id_value = workspace_id.to_string();
+    let workspace_id_value = workspace_id.as_ref().map(ToString::to_string);
+    let usage_scope_key = workspace_id_value
+        .clone()
+        .unwrap_or_else(|| "personal".to_string());
     let input = UsageCallRecordInput {
-        workspace_id: workspace_id_value.clone(),
+        workspace_id: workspace_id_value,
         session_id: session_id.to_string(),
         turn_id: current_turn_id(session_store, session_id),
         dispatch_wave_id: None,
         assignment_id,
         event_id: Some(format!(
             "model-usage:{}:{}:{}",
-            workspace_id_value, session_id, call_id
+            usage_scope_key, session_id, call_id
         )),
         timestamp: Some(UtcMillis::now().0),
         execution_binding: ExecutionBindingIdentity {
@@ -441,7 +524,7 @@ fn publish_model_usage_record_internal(
             payload,
         )
         .with_context(EventContext {
-            workspace_id: Some(workspace_id.clone()),
+            workspace_id: workspace_id.clone(),
             session_id: Some(session_id.clone()),
             assignment_id: input
                 .assignment_id
@@ -451,15 +534,27 @@ fn publish_model_usage_record_internal(
         }),
     );
     if publishes_authoritative_context {
+        let thread_id = session_store
+            .orchestrator_thread_for_session(session_id)
+            .map(|thread| thread.thread_id);
+        let checkpoint_generation = thread_id
+            .as_ref()
+            .and_then(|thread_id| session_store.thread_context_checkpoint(thread_id))
+            .map(|checkpoint| checkpoint.generation)
+            .unwrap_or_default();
         publish_context_usage_update(
             event_bus,
             settings_store.map(Arc::as_ref),
             session_id,
-            &Some(workspace_id.clone()),
+            workspace_id,
             input.turn_id.as_deref(),
             &input.call_identity.call_id,
             &resolved_model,
             authoritative_context_tokens,
+            thread_id.as_ref(),
+            Some(&model_provider),
+            binding.binding_revision,
+            checkpoint_generation,
             "completed",
             "authoritative",
         );
@@ -615,6 +710,15 @@ pub(crate) fn resolved_model_for_usage_binding(
     usage_model_config_for_binding(settings_store, binding, session_id).map(|config| config.model)
 }
 
+pub(crate) fn resolved_provider_for_usage_binding(
+    settings_store: Option<&Arc<SettingsStore>>,
+    binding: &ModelUsageBinding,
+    session_id: &SessionId,
+) -> Option<String> {
+    usage_model_config_for_binding(settings_store, binding, session_id)
+        .map(|config| config.provider)
+}
+
 fn usage_tokens_from_payload(usage: Option<&serde_json::Value>) -> Option<UsageTokenInput> {
     let usage = usage?;
     let input_tokens = usage_u64_field(
@@ -745,6 +849,10 @@ mod tests {
             call_id: "call-context-runtime",
             resolved_model: "gpt-5.6-luna",
             prefill_tokens: 1_000,
+            thread_id: None,
+            model_provider: None,
+            binding_revision: 0,
+            checkpoint_generation: 0,
         });
 
         tracker.observe_accumulated_output("圆环实时增长", "正在思考");
@@ -753,7 +861,7 @@ mod tests {
             .snapshot()
             .recent_events
             .into_iter()
-            .filter(|event| event.event_type == "session.context.usage.updated")
+            .filter(|event| event.event_type == "session.context.pressure.updated")
             .collect::<Vec<_>>();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].payload["phase"], json!("prefill"));
@@ -946,7 +1054,7 @@ mod tests {
         let context_event = snapshot
             .recent_events
             .iter()
-            .find(|event| event.event_type == "session.context.usage.updated")
+            .find(|event| event.event_type == "session.context.pressure.updated")
             .expect("authoritative context event should exist");
         assert_eq!(usage_event.category, magi_event_bus::EventCategory::Usage);
         assert_eq!(usage_event.workspace_id.as_ref(), workspace_id.as_ref());
@@ -968,7 +1076,7 @@ mod tests {
         );
         assert_eq!(context_event.payload["accuracy"], json!("authoritative"));
         assert_eq!(context_event.payload["phase"], json!("completed"));
-        assert_eq!(context_event.payload["token_used"], json!(10));
+        assert_eq!(context_event.payload["token_used"], json!(3));
         assert_eq!(
             context_event.payload["resolved_model"],
             json!("gpt-session-test")
@@ -1312,7 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_model_usage_record_skips_usage_event_without_workspace() {
+    fn publish_model_usage_record_emits_personal_session_usage_without_workspace() {
         let event_bus = InMemoryEventBus::new(8);
         let session_store = SessionStore::new();
         let settings_store = Arc::new(SettingsStore::new());
@@ -1353,9 +1461,21 @@ mod tests {
             },
         );
 
+        let snapshot = event_bus.snapshot();
+        let usage_event = snapshot
+            .recent_events
+            .iter()
+            .find(|event| event.event_type == "model.usage.recorded")
+            .expect("personal session usage should be recorded");
+        assert!(usage_event.workspace_id.is_none());
+        assert!(usage_event.payload.get("workspaceId").is_none());
+        assert_eq!(usage_event.payload["sessionId"], json!(session_id.as_str()));
         assert!(
-            event_bus.snapshot().recent_events.is_empty(),
-            "workspace-less model usage must not be written into a synthetic workspace"
+            snapshot
+                .recent_events
+                .iter()
+                .any(|event| event.event_type == "session.context.pressure.updated"),
+            "personal session should publish authoritative context usage"
         );
     }
 }

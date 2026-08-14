@@ -148,10 +148,9 @@ await withGoldenViteServer(async (server) => {
   assert.equal(resolve(contextEvent(previewImage))?.kind, 'image-open', '内嵌图片必须至少保留打开预览操作');
 });
 
-const [bootstrap, controller, capability, workbench, codeBlock, markdownLink, markdownImage, fileReference, fileSpan, generatedImage, messageItem, toolCall, apiRoutes, desktopReveal] = await Promise.all([
+const [bootstrap, controller, workbench, codeBlock, markdownLink, markdownImage, fileReference, fileSpan, generatedImage, messageItem, toolCall, apiRoutes, desktopMain, desktopFiles, desktopPreload] = await Promise.all([
   readFile(new URL('../src/bootstrap-app.ts', import.meta.url), 'utf8'),
   readFile(new URL('../src/lib/desktop-context-menu.ts', import.meta.url), 'utf8'),
-  readFile(new URL('../../apps/desktop/capabilities/default.json', import.meta.url), 'utf8'),
   readFile(new URL('../src/web/WebWorkbenchShell.svelte', import.meta.url), 'utf8'),
   readFile(new URL('../src/components/CodeBlock.svelte', import.meta.url), 'utf8'),
   readFile(new URL('../src/components/renderers/MdLink.svelte', import.meta.url), 'utf8'),
@@ -162,32 +161,33 @@ const [bootstrap, controller, capability, workbench, codeBlock, markdownLink, ma
   readFile(new URL('../src/components/MessageItem.svelte', import.meta.url), 'utf8'),
   readFile(new URL('../src/components/ToolCall.svelte', import.meta.url), 'utf8'),
   readFile(new URL('../../crates/magi-api/src/routes/changes_files_tunnel.rs', import.meta.url), 'utf8'),
-  readFile(new URL('../../apps/desktop/src/file_reveal.rs', import.meta.url), 'utf8'),
+  readFile(new URL('../../apps/desktop/src/main/index.ts', import.meta.url), 'utf8'),
+  readFile(new URL('../../apps/desktop/src/main/desktop-files.ts', import.meta.url), 'utf8'),
+  readFile(new URL('../../apps/desktop/src/preload/index.ts', import.meta.url), 'utf8'),
 ]);
 
 assert.match(bootstrap, /installDesktopContextMenu\(\)/, '应用启动时必须注册唯一桌面上下文菜单控制器');
-assert.match(controller, /if \(!isDesktopRuntime\(\) \|\| removeDocumentListener\)/, '浏览器模式不得拦截原生右键菜单');
+assert.match(controller, /if \(!window\.magiDesktop \|\| removeDocumentListener\)/, '浏览器模式不得拦截原生右键菜单');
 assert.match(controller, /document\.addEventListener\('contextmenu', handleContextMenu, true\)/, '桌面菜单必须在捕获阶段统一接管');
-assert.match(controller, /event\.preventDefault\(\)[\s\S]*?resolveDesktopContextMenuRequest/, '桌面端必须阻止 WebView 默认菜单后再按语义解析');
-assert.match(controller, /import\('@tauri-apps\/api\/menu'\)/, '桌面端必须使用 Tauri 原生菜单，而非 HTML 浮层');
-assert.match(controller, /PredefinedMenuItem\.new/, '编辑能力必须使用系统预定义菜单项');
-assert.match(controller, /kind\.startsWith\('image'\)/, '图片必须使用独立的原生菜单分支');
+assert.match(controller, /resolveDesktopContextMenuRequest\(event\)[\s\S]*?event\.preventDefault\(\)/, '桌面端只在解析出菜单语义后阻止默认菜单');
+assert.match(controller, /desktop\.showContextMenu\(\{ items \}\)/, 'Renderer 必须通过受限 preload 契约请求原生菜单');
+assert.match(controller, /role\('undo'\)[\s\S]*?role\('copy'\)[\s\S]*?role\('paste'\)/, '编辑能力必须声明 Electron 系统角色');
+assert.match(controller, /descriptor\?\.kind === 'image'/, '图片必须使用独立的原生菜单分支');
 assert.match(controller, /contextMenu\.copyImageAddress/, '网络图片必须支持复制图片地址');
 assert.match(controller, /resolveAgentFileRevealTarget/, '文件夹定位菜单必须先通过 daemon 解析真实文件');
-assert.match(controller, /invoke\('reveal_workspace_file'/, '文件夹定位必须调用受限桌面命令');
-assert.match(controller, /invoke\('open_workspace_folder'/, '打开工作区必须调用受限桌面命令');
-assert.match(controller, /revealAvailable \? 'reveal' : 'plain'/, '菜单缓存必须区分可定位与普通文件状态');
+assert.match(controller, /desktop\.revealWorkspaceFile/, '文件夹定位必须调用受限 Electron 桥接');
+assert.match(controller, /desktop\.openWorkspaceFolder/, '打开工作区必须调用受限 Electron 桥接');
+assert.doesNotMatch(controller, /@tauri-apps|menuCache|HTML/, 'Renderer 不得保留 Tauri 菜单或第二套菜单实现');
+assert.match(desktopMain, /Menu\.buildFromTemplate[\s\S]*?menu\.popup/, 'Electron Main 必须创建并弹出系统原生菜单');
+assert.match(desktopMain, /allowedRoles[\s\S]*?undo[\s\S]*?selectAll/, 'Main 必须限制 Renderer 可请求的编辑角色');
+assert.match(desktopPreload, /showContextMenu:[\s\S]*?magi-desktop:show-context-menu/, 'preload 必须只暴露受限菜单 IPC');
 assert.match(apiRoutes, /safe_workspace_path\(&workspace_root, file_path\)/, 'daemon 必须按工作区边界规范化定位目标');
 assert.match(apiRoutes, /!target_path\.is_file\(\)/, 'daemon 不得把目录或特殊路径暴露为文件定位目标');
-assert.match(desktopReveal, /canonical_target\.starts_with\(&canonical_workspace_root\)/, '桌面命令必须再次校验工作区边界');
-assert.match(desktopReveal, /canonical_target\.is_file\(\)/, '桌面命令必须再次确认目标是文件');
-assert.match(desktopReveal, /canonical_workspace_root\.is_dir\(\)/, '打开工作区前必须再次确认目标是目录');
+assert.match(desktopFiles, /relative\(workspaceRoot, targetPath\)[\s\S]*?startsWith\(`\.\.\$\{sep\}`\)/, '桌面命令必须再次校验工作区边界');
+assert.match(desktopFiles, /canonicalPath\(input\.targetPathRef, "file"\)/, '桌面命令必须再次确认目标是文件');
+assert.match(desktopFiles, /canonicalPath\(workspaceRootPathRef, "directory"\)/, '打开工作区前必须再次确认目标是目录');
 assert.match(workbench, /use:desktopContextMenu=\{\{[\s\S]*?kind: 'workspace'[\s\S]*?workspacePathRef: workspaceBindingPath\(workspace\)/, '工作区标题必须声明打开文件夹菜单语义');
 
-const desktopCapability = JSON.parse(capability);
-assert.ok(desktopCapability.permissions.includes('core:default'), '桌面 capability 必须包含原生菜单权限');
-assert.ok(desktopCapability.permissions.includes('allow-reveal-workspace-file'), '桌面 capability 必须仅授权受限文件定位命令');
-assert.ok(desktopCapability.permissions.includes('allow-open-workspace-folder'), '桌面 capability 必须授权受限工作区目录打开命令');
 for (const [source, label] of [
   [codeBlock, '代码块'],
   [markdownLink, 'Markdown 链接'],

@@ -19,15 +19,15 @@
   import type { Snippet } from 'svelte';
   interface Props {
     onOpenSettings?: () => void;
+    onToggleRightPane?: () => void;
     children?: Snippet;
   }
 
-  let { onOpenSettings, children }: Props = $props();
+  let { onOpenSettings, onToggleRightPane, children }: Props = $props();
   const appState = getState();
-  // Web 外壳通过 context 注入 sidebar 切换能力，桌面/Tauri 路径无 context 时按钮不渲染。
+  // Web 外壳通过 context 统一处理布局；无 context 时仍可直接切换 store 中的面板状态。
   const webSidebar = getWebSidebarContext();
   const currentRightPane = $derived(getRightPaneState(rightPaneState.activeScopeKey));
-  const showRightPaneToggle = $derived(Boolean(rightPaneState.activeScopeKey));
 
   type HeaderPanel = 'notifications' | 'more' | 'lan';
   let activeHeaderPanel = $state<HeaderPanel | null>(null);
@@ -137,8 +137,11 @@
     });
     const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
     const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
-    if (!workspaceId || !workspacePath) return;
-    navigateSession({ kind: 'draft', workspaceId, workspacePath });
+    if (!workspaceId || !workspacePath) {
+      navigateSession({ kind: 'draft', scope: 'personal' });
+      return;
+    }
+    navigateSession({ kind: 'draft', scope: 'workspace', workspaceId, workspacePath });
   }
 
   // 打开设置
@@ -157,6 +160,20 @@
 
   function toggleRightPane() {
     activeHeaderPanel = null;
+    const desktop = window.magiDesktop;
+    if (desktop?.surface === 'app') {
+      void desktop.getSnapshot()
+        .then((snapshot) => desktop.submitLayoutIntent({
+          type: 'right_pane_visibility',
+          visible: !snapshot.layout.rightPaneVisible,
+        }))
+        .catch((error) => console.warn('[Header] 切换桌面右栏失败:', error));
+      return;
+    }
+    if (onToggleRightPane) {
+      onToggleRightPane();
+      return;
+    }
     if (webSidebar) {
       webSidebar.toggleRightPane();
       return;
@@ -240,17 +257,15 @@
         <span class="header-action-badge">{unreadNotificationCount > 99 ? '99+' : unreadNotificationCount}</span>
       {/if}
     </button>
-    {#if showRightPaneToggle}
-      <button
-        class="btn-icon header-action-btn header-right-pane-btn"
-        onclick={toggleRightPane}
-        title={i18n.t(currentRightPane.collapsed ? 'rightPane.expand' : 'rightPane.collapse')}
-        aria-label={i18n.t(currentRightPane.collapsed ? 'rightPane.expand' : 'rightPane.collapse')}
-        aria-expanded={!currentRightPane.collapsed}
-      >
-        <Icon name="sidebar-toggle" size={14} class="right-pane-toggle-icon" />
-      </button>
-    {/if}
+    <button
+      class="btn-icon header-action-btn header-right-pane-btn"
+      onclick={toggleRightPane}
+      title={i18n.t(currentRightPane.collapsed ? 'rightPane.expand' : 'rightPane.collapse')}
+      aria-label={i18n.t(currentRightPane.collapsed ? 'rightPane.expand' : 'rightPane.collapse')}
+      aria-expanded={!currentRightPane.collapsed}
+    >
+      <Icon name="sidebar-toggle" size={14} class="right-pane-toggle-icon" />
+    </button>
     <div class="header-remote-wrapper">
       <button
         class="btn-icon header-action-btn header-remote-btn"

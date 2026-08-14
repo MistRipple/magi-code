@@ -307,10 +307,14 @@
     const newTokenBudget = currentGoal?.status === 'budget_limited'
       ? Number.parseInt(goalBudgetDraft, 10)
       : undefined;
+    const workspaceId = currentWorkspaceIdValue();
+    const workspacePath = currentWorkspacePathValue();
+    const workspaceScoped = Boolean(workspaceId || workspacePath);
     return {
       sessionId: currentSessionIdValue() ?? '',
-      workspaceId: currentWorkspaceIdValue(),
-      workspacePath: currentWorkspacePathValue(),
+      scope: workspaceScoped ? 'workspace' as const : 'personal' as const,
+      ...(workspaceId ? { workspaceId } : {}),
+      ...(workspacePath ? { workspacePath } : {}),
       goalId: currentGoal?.goalId ?? '',
       expectedRevision: currentGoal?.controlRevision ?? 0,
       ...(currentPlan ? { expectedPlanRevision: currentPlan.revision } : {}),

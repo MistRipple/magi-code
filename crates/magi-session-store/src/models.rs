@@ -715,6 +715,49 @@ pub enum NotificationScope {
     Session,
 }
 
+/// 通知中心的查询与操作边界。
+///
+/// 个人与项目上下文在类型上互斥；调用方不能再以空字符串表示个人会话。会话级
+/// 通知只依赖 `session_id`，项目级通知只依赖 `workspace_id`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotificationContext {
+    Personal {
+        session_id: Option<SessionId>,
+    },
+    Workspace {
+        workspace_id: String,
+        session_id: Option<SessionId>,
+    },
+}
+
+impl NotificationContext {
+    pub fn personal(session_id: Option<SessionId>) -> Self {
+        Self::Personal { session_id }
+    }
+
+    pub fn workspace(workspace_id: impl Into<String>, session_id: Option<SessionId>) -> Self {
+        Self::Workspace {
+            workspace_id: workspace_id.into(),
+            session_id,
+        }
+    }
+
+    pub fn workspace_id(&self) -> Option<&str> {
+        match self {
+            Self::Personal { .. } => None,
+            Self::Workspace { workspace_id, .. } => Some(workspace_id),
+        }
+    }
+
+    pub fn session_id(&self) -> Option<&SessionId> {
+        match self {
+            Self::Personal { session_id } | Self::Workspace { session_id, .. } => {
+                session_id.as_ref()
+            }
+        }
+    }
+}
+
 fn default_notification_occurrence_count() -> u32 {
     1
 }
@@ -779,21 +822,28 @@ impl NotificationRecord {
             NotificationScope::Workspace => {
                 self.session_id = None;
             }
-            NotificationScope::Session => {}
+            // 会话级通知的唯一归属就是 session。保留 workspace_id 会让同一条
+            // 通知同时携带两套所有权，并在个人会话上迫使调用方伪造项目绑定。
+            NotificationScope::Session => {
+                self.workspace_id = None;
+            }
         }
     }
 
-    pub fn visible_in_context(&self, workspace_id: &str, session_id: Option<&SessionId>) -> bool {
+    /// 判断异常通知能否出现在一个明确的会话上下文中。
+    ///
+    /// `workspace_id = None` 是个人会话的真实领域状态，不是空字符串哨兵。会话级
+    /// 通知只按 session ID 隔离，项目级通知才以 workspace ID 为边界。
+    pub fn visible_in_context(&self, context: &NotificationContext) -> bool {
         if !self.is_incident() {
             return false;
         }
         match self.scope {
             NotificationScope::App => true,
-            NotificationScope::Workspace => self.workspace_id.as_deref() == Some(workspace_id),
-            NotificationScope::Session => {
-                self.workspace_id.as_deref() == Some(workspace_id)
-                    && self.session_id.as_ref() == session_id
-            }
+            NotificationScope::Workspace => self.workspace_id.as_deref() == context.workspace_id(),
+            NotificationScope::Session => context
+                .session_id()
+                .is_some_and(|session_id| self.session_id.as_ref() == Some(session_id)),
         }
     }
 }
@@ -1484,6 +1534,25 @@ pub struct ThreadContextCheckpoint {
     pub original_token_estimate: usize,
     pub checkpoint_token_estimate: usize,
     pub created_at: UtcMillis,
+    /// 同一 thread 的单调检查点代际，防止旧压缩结果覆盖新结果。
+    #[serde(default)]
+    pub generation: u64,
+    /// 原始 transcript 前缀指纹，源历史变化时检查点必须失效。
+    #[serde(default)]
+    pub source_fingerprint: String,
+    /// 生成该检查点时绑定的模型身份。
+    #[serde(default)]
+    pub model_provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub binding_revision: Option<u32>,
+    #[serde(default)]
+    pub projected_request_tokens: u64,
+    #[serde(default)]
+    pub context_window_limit_tokens: Option<u64>,
+    #[serde(default)]
+    pub preserved_tail_message_count: usize,
     #[serde(default)]
     pub file_fact_versions: Vec<ThreadFileFactVersion>,
 }

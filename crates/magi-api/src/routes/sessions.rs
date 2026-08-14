@@ -17,8 +17,8 @@ use magi_core::{SessionLifecycleStatus, TaskStatus};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_session_store::{
     ActiveExecutionTurn, ActiveExecutionTurnItem, CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn,
-    CanonicalTurnItemKind, NotificationRecord, NotificationScope, SessionGoal, SessionRecord,
-    TimelineEntryInput, TimelineEntryKind,
+    CanonicalTurnItemKind, NotificationContext, NotificationRecord, NotificationScope, SessionGoal,
+    SessionRecord, TimelineEntryInput, TimelineEntryKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -26,13 +26,14 @@ use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::session_scope::{
-    parse_session_id, require_registered_workspace_binding, require_session_record_in_workspace,
+    SessionScope, parse_session_id, require_session_record_in_scope, require_session_request_scope,
+    resolve_existing_session_scope, resolve_explicit_session_scope, resolve_session_scope,
     session_workspace_id,
 };
 use crate::{
     dto::{
-        BootstrapDto, NotificationsResponseDto, SessionTurnRequestDto, SessionTurnResponseDto,
-        SessionTurnResponseInput, SessionTurnRouteDto,
+        BootstrapDto, NotificationsResponseDto, SessionScopeKindDto, SessionTurnRequestDto,
+        SessionTurnResponseDto, SessionTurnResponseInput, SessionTurnRouteDto,
     },
     errors::ApiError,
     session_continue::{
@@ -46,6 +47,7 @@ use crate::{
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
+        .route("/session/materialize", post(materialize_session))
         .route("/session/turn", post(submit_session_turn))
         .route("/session/queue", get(get_session_turn_queue))
         .route(
@@ -59,6 +61,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/session/delete", post(delete_session))
         .route("/session/rename", post(rename_session))
         .route("/session/close", post(close_session))
+        .route("/session/viewed", post(mark_session_viewed))
         .route("/notifications", get(get_notifications))
         .route("/notifications/report", post(report_incident))
         .route(
@@ -72,12 +75,99 @@ pub fn routes() -> Router<ApiState> {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MaterializeSessionRequest {
+    scope: SessionScopeKindDto,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    workspace_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MaterializeSessionResponse {
+    session_id: SessionId,
+    workspace_id: Option<WorkspaceId>,
+}
+
+async fn materialize_session(
+    State(state): State<ApiState>,
+    Json(request): Json<MaterializeSessionRequest>,
+) -> Result<Json<MaterializeSessionResponse>, ApiError> {
+    let _navigation_guard = state.lock_session_navigation().await;
+    let scope = resolve_explicit_session_scope(
+        &state,
+        request.scope,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+    )?;
+    let workspace_id = scope.workspace_id();
+    let session_id = super::new_session_id();
+    state
+        .session_store
+        .create_session_for_workspace(
+            session_id.clone(),
+            crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE,
+            workspace_id.as_ref().map(ToString::to_string),
+        )
+        .map_err(|error| ApiError::internal_assembly("创建浏览器会话所属会话失败", error))?;
+    state
+        .session_store
+        .select_current_session(&session_id)
+        .map_err(|error| ApiError::internal_assembly("选择浏览器会话所属会话失败", error))?;
+    state.persist_runtime_durable_state_for_api()?;
+    publish_session_directory_event(
+        &state,
+        "session.created",
+        &session_id,
+        workspace_id.as_ref(),
+    );
+    Ok(Json(MaterializeSessionResponse {
+        session_id,
+        workspace_id,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DeleteSessionRequest {
     session_id: String,
     #[serde(default)]
     workspace_id: Option<String>,
     #[serde(default)]
     workspace_path: Option<String>,
+}
+
+/// 会话的“已查看”是会话级动作，由会话自身的 Personal | Workspace 归属决定。
+/// 它不能属于项目目录接口，否则个人会话会被迫伪装成一个空项目。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MarkSessionViewedRequest {
+    session_id: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    workspace_path: Option<String>,
+}
+
+impl MarkSessionViewedRequest {
+    fn requested_workspace_id(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_id.as_deref())
+    }
+
+    fn requested_workspace_path(&self) -> Option<&str> {
+        trimmed_non_empty(self.workspace_path.as_deref())
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MarkSessionViewedResponse {
+    runtime_epoch: String,
+    event_stream_next_sequence: u64,
+    session_id: String,
+    workspace_id: Option<String>,
+    has_unread_completion: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,7 +205,7 @@ struct QueuedSessionTurnDto {
     queue_position: usize,
     request_id: Option<String>,
     session_id: String,
-    workspace_id: String,
+    workspace_id: Option<String>,
     workspace_path: Option<String>,
     accepted_at: UtcMillis,
     content: String,
@@ -163,7 +253,10 @@ fn session_turn_queue_response(
                 queue_position: index + 1,
                 request_id: queued.request.request_id(),
                 session_id: queued.session_id.to_string(),
-                workspace_id: queued.requested_workspace_id.to_string(),
+                workspace_id: queued
+                    .requested_workspace_id
+                    .as_ref()
+                    .map(ToString::to_string),
                 workspace_path: queued.request.workspace_path.clone(),
                 accepted_at: queued.accepted_at,
                 content: queued.request.timeline_message(text.as_deref()),
@@ -188,15 +281,15 @@ fn session_turn_queue_response(
 fn require_session_turn_queue_scope(
     state: &ApiState,
     scope: &SessionTurnQueueScope,
-) -> Result<(SessionId, WorkspaceId), ApiError> {
+) -> Result<(SessionId, SessionScope), ApiError> {
     let session_id = parse_session_id(Some(&scope.session_id))?;
-    let workspace_id = require_request_workspace_id(
+    let session_scope = resolve_existing_session_scope(
         state,
+        &session_id,
         scope.requested_workspace_id(),
         scope.requested_workspace_path(),
     )?;
-    require_session_record_in_workspace(state, &session_id, Some(workspace_id.as_str()))?;
-    Ok((session_id, workspace_id))
+    Ok((session_id, session_scope))
 }
 
 async fn get_session_turn_queue(
@@ -225,7 +318,7 @@ async fn guide_session_turn_queue_item(
     State(state): State<ApiState>,
     Json(request): Json<RemoveSessionTurnQueueItemRequest>,
 ) -> Result<Json<SessionTurnQueueResponseDto>, ApiError> {
-    let (session_id, workspace_id) = require_session_turn_queue_scope(&state, &request.scope)?;
+    let (session_id, scope) = require_session_turn_queue_scope(&state, &request.scope)?;
     let queue_id = request.queue_id.trim();
     if queue_id.is_empty() {
         return Err(ApiError::InvalidInput("queueId 不能为空".to_string()));
@@ -265,13 +358,13 @@ async fn guide_session_turn_queue_item(
             })?;
         let mut steer_request = queued.request.clone();
         steer_request.session_id = Some(session_id.to_string());
-        steer_request.workspace_id = Some(workspace_id.to_string());
+        steer_request.workspace_id = scope.workspace_id().as_ref().map(ToString::to_string);
         steer_request.steer_current_turn = true;
         steer_request.expected_turn_id = Some(expected_turn_id);
         submit_steer_current_turn(
             &state,
             &steer_request,
-            &workspace_id,
+            &scope,
             super::monotonic_accepted_at(),
         )
         .await?;
@@ -297,13 +390,26 @@ async fn submit_session_turn(
     let accepted_at = super::monotonic_accepted_at();
     let requested_workspace_id = request.requested_workspace_id();
     let requested_workspace_path = request.requested_workspace_path();
-    let workspace_id = require_request_workspace_id(
-        &state,
-        requested_workspace_id.as_deref(),
-        requested_workspace_path.as_deref(),
-    )?;
+    let scope = if request.requested_session_id().is_some() {
+        require_session_request_scope(
+            &state,
+            request.session_id.as_deref(),
+            request.scope,
+            requested_workspace_id.as_deref(),
+            requested_workspace_path.as_deref(),
+        )?
+        .scope
+    } else {
+        resolve_explicit_session_scope(
+            &state,
+            request.scope,
+            requested_workspace_id.as_deref(),
+            requested_workspace_path.as_deref(),
+        )?
+    };
+    let workspace_id = scope.workspace_id();
     if request.steer_current_turn {
-        return submit_steer_current_turn(&state, &request, &workspace_id, accepted_at)
+        return submit_steer_current_turn(&state, &request, &scope, accepted_at)
             .await
             .map(Json);
     }
@@ -334,8 +440,7 @@ async fn submit_session_turn(
         SessionTurnRouteDto::Chat | SessionTurnRouteDto::Execute | SessionTurnRouteDto::Task
     ) && let Some(session_id) = request.requested_session_id()
     {
-        let session =
-            require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
+        let session = require_session_record_in_scope(&state, &session_id, &scope)?;
         let session_workspace_id = session_workspace_id(&state, &session);
         if state.queued_regular_session_turn_count(&session_id) > 0 {
             let should_schedule = state
@@ -345,7 +450,7 @@ async fn submit_session_turn(
             let response = enqueue_session_turn_response(EnqueueSessionTurnInput {
                 state: &state,
                 request,
-                requested_workspace_id: workspace_id,
+                requested_workspace_id: workspace_id.clone(),
                 accepted_at,
                 decision,
                 session_id: session_id.clone(),
@@ -383,7 +488,7 @@ async fn submit_session_turn(
                     return enqueue_session_turn_response(EnqueueSessionTurnInput {
                         state: &state,
                         request,
-                        requested_workspace_id: workspace_id,
+                        requested_workspace_id: workspace_id.clone(),
                         accepted_at,
                         decision,
                         session_id,
@@ -420,7 +525,7 @@ async fn submit_session_turn(
             let session_id = request
                 .requested_session_id()
                 .ok_or_else(|| ApiError::InvalidInput("继续会话需要明确的 session".to_string()))?;
-            require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
+            require_session_record_in_scope(&state, &session_id, &scope)?;
             let resumed_turn_id = format!("turn-session-continue-{}", accepted_at.0);
             let (accepted, signal) = continue_execution_chain_with_pre_resume(
                 &state,
@@ -508,11 +613,12 @@ struct SessionTurnIntentDecision {
 }
 
 static INCIDENT_NOTIFICATION_COUNTER: AtomicU64 = AtomicU64::new(1);
+static SESSION_VIEW_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct EnqueueSessionTurnInput<'a> {
     state: &'a ApiState,
     request: SessionTurnRequestDto,
-    requested_workspace_id: WorkspaceId,
+    requested_workspace_id: Option<WorkspaceId>,
     accepted_at: UtcMillis,
     decision: SessionTurnIntentDecision,
     session_id: SessionId,
@@ -587,11 +693,11 @@ fn enqueue_session_turn_response(
 async fn submit_steer_current_turn(
     state: &ApiState,
     request: &SessionTurnRequestDto,
-    workspace_id: &WorkspaceId,
+    scope: &SessionScope,
     accepted_at: UtcMillis,
 ) -> Result<SessionTurnResponseDto, ApiError> {
     let session_id = parse_session_id(request.session_id.as_deref())?;
-    require_session_record_in_workspace(state, &session_id, Some(workspace_id.as_str()))?;
+    require_session_record_in_scope(state, &session_id, scope)?;
     let expected_turn_id = request
         .expected_turn_id()
         .ok_or_else(|| ApiError::InvalidInput("引导当前回复必须提供 expectedTurnId".to_string()))?;
@@ -601,7 +707,7 @@ async fn submit_steer_current_turn(
         ));
     }
     state
-        .ensure_snapshot_session_for_workspace_id(&session_id, &Some(workspace_id.clone()))
+        .ensure_snapshot_session_for_workspace_id(&session_id, &scope.workspace_id())
         .await?;
     let message = request
         .trimmed_text()
@@ -657,7 +763,7 @@ async fn submit_steer_current_turn(
         state.event_bus.as_ref(),
         state.session_store.as_ref(),
         &session_id,
-        &Some(workspace_id.clone()),
+        &scope.workspace_id(),
         &user_message_item_id,
         state.task_store(),
     );
@@ -2079,7 +2185,7 @@ async fn submit_mainline_session_turn(
     state: ApiState,
     request: SessionTurnRequestDto,
     images: Vec<magi_conversation_runtime::session_images::SessionTurnImage>,
-    workspace_id: WorkspaceId,
+    workspace_id: Option<WorkspaceId>,
     accepted_at: UtcMillis,
     decision: SessionTurnIntentDecision,
 ) -> Result<SessionTurnResponseDto, ApiError> {
@@ -2342,14 +2448,14 @@ pub(crate) fn ensure_goal_continuation_runtime_available(
 pub(crate) async fn resume_active_goal_continuation_turn(
     state: ApiState,
     session_id: SessionId,
-    workspace_id: WorkspaceId,
+    workspace_id: Option<WorkspaceId>,
 ) -> Result<(), ApiError> {
     ensure_goal_continuation_runtime_available(&state, &session_id)?;
     let goal = state
         .session_store
         .active_goal(&session_id)
         .ok_or_else(|| ApiError::InvalidInput("当前目标未处于可继续状态".to_string()))?;
-    submit_goal_continuation_turn(state, session_id, Some(workspace_id), goal).await
+    submit_goal_continuation_turn(state, session_id, workspace_id, goal).await
 }
 
 async fn submit_goal_continuation_turn(
@@ -2731,6 +2837,7 @@ fn publish_session_turn_continue_event(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SessionNavigationRequest {
     target: SessionNavigationTarget,
+    scope: SessionScopeKindDto,
     #[serde(default)]
     workspace_id: Option<String>,
     #[serde(default)]
@@ -2814,7 +2921,7 @@ impl InterruptSessionTurnRequest {
 #[serde(rename_all = "camelCase")]
 pub(super) struct ContinueSessionResponseDto {
     session_id: String,
-    workspace_id: String,
+    workspace_id: Option<String>,
     mission_id: String,
     root_task_id: String,
     execution_chain_ref: String,
@@ -2852,15 +2959,19 @@ fn resolve_interrupt_session_record(
     state: &ApiState,
     request: &InterruptSessionTurnRequest,
 ) -> Result<SessionRecord, ApiError> {
-    let workspace_id = require_request_workspace_id(
-        state,
-        request.requested_workspace_id(),
-        request.requested_workspace_path(),
-    )?;
     let session_id = request
         .requested_session_id()
         .ok_or_else(|| ApiError::InvalidInput("sessionId 不能为空".to_string()))?;
-    require_session_record_in_workspace(state, &session_id, Some(workspace_id.as_str()))
+    let _scope = resolve_existing_session_scope(
+        state,
+        &session_id,
+        request.requested_workspace_id(),
+        request.requested_workspace_path(),
+    )?;
+    state
+        .session_store
+        .session(&session_id)
+        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))
 }
 
 fn turn_status_is_interruptible(status: &str) -> bool {
@@ -3111,7 +3222,7 @@ async fn interrupt_session_turn(
                 Some(&session_id),
                 None,
                 None,
-                magi_browser_runtime::BrowserLeaseEndReason::TurnStopped,
+                magi_browser_authority::BrowserLeaseEndReason::TurnStopped,
             )
             .total();
         for entry_id in &streaming_entry_ids {
@@ -3233,13 +3344,13 @@ async fn interrupt_session_turn(
 pub(crate) async fn interrupt_session_turn_for_browser_takeover(
     state: &ApiState,
     session_id: &SessionId,
-    workspace_id: &WorkspaceId,
+    workspace_id: Option<&WorkspaceId>,
 ) -> Result<(), ApiError> {
     let _ = interrupt_session_turn(
         State(state.clone()),
         Json(InterruptSessionTurnRequest {
             session_id: Some(session_id.to_string()),
-            workspace_id: Some(workspace_id.to_string()),
+            workspace_id: workspace_id.map(ToString::to_string),
             workspace_path: None,
         }),
     )
@@ -3287,11 +3398,13 @@ async fn navigate_session(
     Json(request): Json<SessionNavigationRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
     let _navigation_guard = state.lock_session_navigation().await;
-    let workspace_id = require_request_workspace_id(
+    let scope = resolve_explicit_session_scope(
         &state,
+        request.scope,
         request.requested_workspace_id(),
         request.requested_workspace_path(),
     )?;
+    let workspace_id = scope.workspace_id();
     let selected_session_id = match &request.target {
         SessionNavigationTarget::Draft => {
             if request.requested_session_id().is_some() {
@@ -3303,14 +3416,16 @@ async fn navigate_session(
         }
         SessionNavigationTarget::Session => {
             let session_id = parse_session_id(request.requested_session_id())?;
-            require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
+            require_session_record_in_scope(&state, &session_id, &scope)?;
             Some(session_id)
         }
     };
-    state
-        .workspace_registry
-        .activate(&workspace_id)
-        .map_err(|error| ApiError::internal_assembly("切换会话工作区失败", error))?;
+    if let SessionScope::Workspace(binding) = &scope {
+        state
+            .workspace_registry
+            .activate(&binding.workspace_id)
+            .map_err(|error| ApiError::internal_assembly("切换会话工作区失败", error))?;
+    }
     match selected_session_id.as_ref() {
         Some(session_id) => {
             state
@@ -3323,11 +3438,10 @@ async fn navigate_session(
         }
     }
     state.persist_runtime_durable_state_for_api()?;
-    Ok(Json(match selected_session_id.as_ref() {
-        Some(session_id) => state
-            .bootstrap_dto_for_workspace_session(Some(workspace_id.as_str()), Some(session_id))?,
-        None => state.bootstrap_dto_for_workspace_session(Some(workspace_id.as_str()), None)?,
-    }))
+    Ok(Json(state.bootstrap_dto_for_workspace_session(
+        workspace_id.as_ref().map(WorkspaceId::as_str),
+        selected_session_id.as_ref(),
+    )?))
 }
 
 async fn continue_session(
@@ -3335,12 +3449,13 @@ async fn continue_session(
     Json(request): Json<ContinueSessionRequest>,
 ) -> Result<Json<ContinueSessionResponseDto>, ApiError> {
     let session_id = SessionId::new(&request.session_id);
-    let workspace_id = require_request_workspace_id(
+    let scope = resolve_existing_session_scope(
         &state,
+        &session_id,
         request.requested_workspace_id(),
         request.requested_workspace_path(),
     )?;
-    require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
+    let workspace_id = scope.workspace_id();
     let response = execute_session_continue(
         &state,
         &session_id,
@@ -3360,7 +3475,7 @@ async fn continue_session(
 pub(super) async fn continue_agent_run(
     state: &ApiState,
     session_id: &SessionId,
-    workspace_id: &WorkspaceId,
+    workspace_id: &Option<WorkspaceId>,
 ) -> Result<ContinueSessionResponseDto, ApiError> {
     execute_session_continue(
         state,
@@ -3380,7 +3495,7 @@ pub(super) async fn continue_agent_run(
 async fn execute_session_continue(
     state: &ApiState,
     session_id: &SessionId,
-    workspace_id: &WorkspaceId,
+    workspace_id: &Option<WorkspaceId>,
     request: SessionContinueExecutionRequest,
 ) -> Result<ContinueSessionResponseDto, ApiError> {
     let requested_prompt_text = request
@@ -3447,7 +3562,7 @@ async fn execute_session_continue(
         "session.continue.executed",
         json!({
             "session_id": accepted.session_id.to_string(),
-            "workspace_id": workspace_id.to_string(),
+            "workspace_id": workspace_id.as_ref().map(ToString::to_string),
             "mission_id": accepted.mission_id.to_string(),
             "root_task_id": accepted.root_task_id.to_string(),
             "execution_chain_ref": accepted.execution_chain_ref,
@@ -3457,7 +3572,7 @@ async fn execute_session_continue(
     )
     .with_context(EventContext {
         session_id: Some(accepted.session_id.clone()),
-        workspace_id: Some(workspace_id.clone()),
+        workspace_id: workspace_id.clone(),
         mission_id: Some(accepted.mission_id.clone()),
         task_id: Some(accepted.root_task_id.clone()),
         ..EventContext::default()
@@ -3465,7 +3580,7 @@ async fn execute_session_continue(
     state.event_bus.publish(event);
     Ok(ContinueSessionResponseDto {
         session_id: accepted.session_id.to_string(),
-        workspace_id: workspace_id.to_string(),
+        workspace_id: workspace_id.as_ref().map(ToString::to_string),
         mission_id: accepted.mission_id.to_string(),
         root_task_id: accepted.root_task_id.to_string(),
         execution_chain_ref: accepted.execution_chain_ref,
@@ -3521,19 +3636,40 @@ async fn delete_session(
     State(state): State<ApiState>,
     Json(request): Json<DeleteSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
-    let workspace_id = require_request_workspace_id(
+    let session_id = SessionId::new(&request.session_id);
+    let scope = resolve_existing_session_scope(
         &state,
+        &session_id,
         request.requested_workspace_id(),
         request.requested_workspace_path(),
     )?;
-    let session_id = SessionId::new(&request.session_id);
-    require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
+    let workspace_id = scope.workspace_id();
     state.delete_session_and_resources(&session_id).await?;
     state.persist_session_durable_state_for_api()?;
-    publish_session_directory_event(&state, "session.deleted", &session_id, &workspace_id);
+    publish_session_directory_event(
+        &state,
+        "session.deleted",
+        &session_id,
+        workspace_id.as_ref(),
+    );
+    let replacement_session_id = state
+        .session_records_for_workspace(workspace_id.as_ref().map(WorkspaceId::as_str))
+        .into_iter()
+        .max_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
+        })
+        .map(|session| session.session_id);
+    if let Some(replacement_session_id) = replacement_session_id.as_ref() {
+        state
+            .session_store
+            .select_current_session(replacement_session_id)
+            .map_err(|error| ApiError::internal_assembly("选择删除后的替代会话失败", error))?;
+    }
     Ok(Json(state.bootstrap_dto_for_workspace_session(
-        Some(workspace_id.as_str()),
-        None,
+        workspace_id.as_ref().map(WorkspaceId::as_str),
+        replacement_session_id.as_ref(),
     )?))
 }
 
@@ -3562,14 +3698,18 @@ async fn rename_session(
     State(state): State<ApiState>,
     Json(request): Json<RenameSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
-    let workspace_id = require_request_workspace_id(
+    let session_id = SessionId::new(&request.session_id);
+    let scope = resolve_existing_session_scope(
         &state,
+        &session_id,
         request.requested_workspace_id(),
         request.requested_workspace_path(),
     )?;
-    let session_id = SessionId::new(&request.session_id);
-    let current =
-        require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
+    let workspace_id = scope.workspace_id();
+    let current = state
+        .session_store
+        .session(&session_id)
+        .ok_or_else(|| ApiError::session_not_found(session_id.as_str()))?;
     let renamed = state
         .session_store
         .rename_session(&session_id, &request.name)
@@ -3582,14 +3722,63 @@ async fn rename_session(
         crate::session_title::publish_session_title_updated(
             &state,
             &session_id,
-            Some(workspace_id.clone()),
+            workspace_id.clone(),
             &renamed.title,
         );
     }
     Ok(Json(state.bootstrap_dto_for_workspace_session(
-        Some(workspace_id.as_str()),
+        workspace_id.as_ref().map(WorkspaceId::as_str),
         None,
     )?))
+}
+
+async fn mark_session_viewed(
+    State(state): State<ApiState>,
+    Json(request): Json<MarkSessionViewedRequest>,
+) -> Result<Json<MarkSessionViewedResponse>, ApiError> {
+    let session_id = SessionId::new(&request.session_id);
+    let scope = resolve_existing_session_scope(
+        &state,
+        &session_id,
+        request.requested_workspace_id(),
+        request.requested_workspace_path(),
+    )?;
+    let session = state
+        .session_store
+        .mark_session_viewed(&session_id)
+        .map_err(|error| ApiError::internal_assembly("标记会话已查看失败", error))?;
+    state.persist_session_state_checkpoint("session_viewed")?;
+
+    let workspace_id = scope.workspace_id();
+    let event_suffix = SESSION_VIEW_EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let occurred_at = UtcMillis::now();
+    state.event_bus.publish(
+        EventEnvelope::domain(
+            EventId::new(format!(
+                "event-session-viewed-{session_id}-{}-{event_suffix}",
+                occurred_at.0,
+            )),
+            "session.viewed",
+            json!({
+                "sessionId": session_id.as_str(),
+                "workspaceId": workspace_id.as_ref().map(WorkspaceId::as_str),
+                "hasUnreadCompletion": session.has_unread_completion(),
+            }),
+        )
+        .with_context(EventContext {
+            session_id: Some(session_id.clone()),
+            workspace_id: workspace_id.clone(),
+            ..EventContext::default()
+        }),
+    );
+
+    Ok(Json(MarkSessionViewedResponse {
+        runtime_epoch: state.runtime_epoch().to_string(),
+        event_stream_next_sequence: state.event_bus.snapshot().next_sequence,
+        session_id: session_id.to_string(),
+        workspace_id: workspace_id.map(|workspace_id| workspace_id.to_string()),
+        has_unread_completion: session.has_unread_completion(),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3616,13 +3805,14 @@ async fn close_session(
     State(state): State<ApiState>,
     Json(request): Json<CloseSessionRequest>,
 ) -> Result<Json<BootstrapDto>, ApiError> {
-    let workspace_id = require_request_workspace_id(
+    let session_id = SessionId::new(&request.session_id);
+    let scope = resolve_existing_session_scope(
         &state,
+        &session_id,
         request.requested_workspace_id(),
         request.requested_workspace_path(),
     )?;
-    let session_id = SessionId::new(&request.session_id);
-    require_session_record_in_workspace(&state, &session_id, Some(workspace_id.as_str()))?;
+    let workspace_id = scope.workspace_id();
     let _session_turn_guard = state.lock_session_turn(&session_id).await;
     let manager = state.runner_manager();
     let _session_lifecycle_guard = match manager {
@@ -3645,9 +3835,9 @@ async fn close_session(
         .close_for_session(session_id.as_str());
     state.release_session_git_execution_lease(&session_id);
     state.persist_session_durable_state_for_api()?;
-    publish_session_directory_event(&state, "session.closed", &session_id, &workspace_id);
+    publish_session_directory_event(&state, "session.closed", &session_id, workspace_id.as_ref());
     Ok(Json(state.bootstrap_dto_for_workspace_session(
-        Some(workspace_id.as_str()),
+        workspace_id.as_ref().map(WorkspaceId::as_str),
         None,
     )?))
 }
@@ -3656,7 +3846,7 @@ fn publish_session_directory_event(
     state: &ApiState,
     event_type: &str,
     session_id: &SessionId,
-    workspace_id: &WorkspaceId,
+    workspace_id: Option<&WorkspaceId>,
 ) {
     let occurred_at = UtcMillis::now();
     state.event_bus.publish(
@@ -3665,12 +3855,12 @@ fn publish_session_directory_event(
             event_type,
             json!({
                 "session_id": session_id.to_string(),
-                "workspace_id": workspace_id.to_string(),
+                "workspace_id": workspace_id.map(WorkspaceId::to_string),
             }),
         )
         .with_context(EventContext {
             session_id: Some(session_id.clone()),
-            workspace_id: Some(workspace_id.clone()),
+            workspace_id: workspace_id.cloned(),
             ..EventContext::default()
         }),
     );
@@ -3682,7 +3872,7 @@ fn cancel_active_session_turn_for_lifecycle(state: &ApiState, session_id: &Sessi
             Some(session_id),
             None,
             None,
-            magi_browser_runtime::BrowserLeaseEndReason::SessionClosed,
+            magi_browser_authority::BrowserLeaseEndReason::SessionClosed,
         )
         .total();
     let current_turn = state
@@ -3754,19 +3944,16 @@ async fn get_notifications(
     State(state): State<ApiState>,
     Query(query): Query<NotificationsQuery>,
 ) -> Result<Json<NotificationsResponseDto>, ApiError> {
-    let workspace_id = require_request_workspace_id(
+    let scope = resolve_session_scope(
         &state,
         query.requested_workspace_id(),
         query.requested_workspace_path(),
     )?;
-    let session_id = validate_optional_notification_session(
-        &state,
-        query.requested_session_id(),
-        &workspace_id,
-    )?;
+    let session_id =
+        validate_optional_notification_session(&state, query.requested_session_id(), &scope)?;
     Ok(Json(build_notifications_response(
         &state,
-        &workspace_id,
+        &scope,
         session_id.as_ref(),
     )))
 }
@@ -3834,22 +4021,24 @@ async fn report_incident(
     State(state): State<ApiState>,
     Json(request): Json<ReportIncidentRequest>,
 ) -> Result<Json<NotificationsResponseDto>, ApiError> {
-    let workspace_id = require_request_workspace_id(
+    let scope = resolve_session_scope(
         &state,
         request.requested_workspace_id(),
         request.requested_workspace_path(),
     )?;
-    let requested_session_id = validate_optional_notification_session(
-        &state,
-        request.requested_session_id(),
-        &workspace_id,
-    )?;
+    let requested_session_id =
+        validate_optional_notification_session(&state, request.requested_session_id(), &scope)?;
     let session_id = match request.scope {
         NotificationScope::Session => Some(requested_session_id.clone().ok_or_else(|| {
             ApiError::InvalidInput("session incident 必须提供 sessionId".to_string())
         })?),
         NotificationScope::App | NotificationScope::Workspace => None,
     };
+    if matches!(request.scope, NotificationScope::Workspace) && scope.workspace_id().is_none() {
+        return Err(ApiError::InvalidInput(
+            "个人会话没有项目级通知作用域".to_string(),
+        ));
+    }
     let message = trimmed_non_empty(Some(request.message.as_str()))
         .ok_or_else(|| ApiError::InvalidInput("通知内容不能为空".to_string()))?
         .to_string();
@@ -3867,10 +4056,8 @@ async fn report_incident(
             notification_id,
             scope: request.scope,
             workspace_id: match request.scope {
-                NotificationScope::Workspace | NotificationScope::Session => {
-                    Some(workspace_id.to_string())
-                }
-                NotificationScope::App => None,
+                NotificationScope::Workspace => scope.workspace_id().map(|id| id.to_string()),
+                NotificationScope::App | NotificationScope::Session => None,
             },
             session_id: session_id.clone(),
             kind: "incident".to_string(),
@@ -3896,7 +4083,7 @@ async fn report_incident(
     state.persist_session_durable_state_for_api()?;
     Ok(Json(build_notifications_response(
         &state,
-        &workspace_id,
+        &scope,
         requested_session_id.as_ref(),
     )))
 }
@@ -3905,23 +4092,20 @@ async fn mark_all_notifications_read(
     State(state): State<ApiState>,
     Json(request): Json<NotificationScopeRequest>,
 ) -> Result<Json<NotificationsResponseDto>, ApiError> {
-    let workspace_id = require_request_workspace_id(
+    let scope = resolve_session_scope(
         &state,
         request.requested_workspace_id(),
         request.requested_workspace_path(),
     )?;
-    let session_id = validate_optional_notification_session(
-        &state,
-        request.requested_session_id(),
-        &workspace_id,
-    )?;
+    let session_id =
+        validate_optional_notification_session(&state, request.requested_session_id(), &scope)?;
     state
         .session_store
-        .mark_notifications_handled_for_context(workspace_id.as_str(), session_id.as_ref());
+        .mark_notifications_handled_for_context(&notification_context(&scope, session_id.clone()));
     state.persist_session_durable_state_for_api()?;
     Ok(Json(build_notifications_response(
         &state,
-        &workspace_id,
+        &scope,
         session_id.as_ref(),
     )))
 }
@@ -3954,23 +4138,20 @@ async fn clear_notifications(
     State(state): State<ApiState>,
     Json(request): Json<ClearNotificationsRequest>,
 ) -> Result<Json<NotificationsResponseDto>, ApiError> {
-    let workspace_id = require_request_workspace_id(
+    let scope = resolve_session_scope(
         &state,
         request.requested_workspace_id(),
         request.requested_workspace_path(),
     )?;
-    let session_id = validate_optional_notification_session(
-        &state,
-        request.requested_session_id(),
-        &workspace_id,
-    )?;
+    let session_id =
+        validate_optional_notification_session(&state, request.requested_session_id(), &scope)?;
     state
         .session_store
-        .clear_notifications_for_context(workspace_id.as_str(), session_id.as_ref());
+        .clear_notifications_for_context(&notification_context(&scope, session_id.clone()));
     state.persist_session_durable_state_for_api()?;
     Ok(Json(build_notifications_response(
         &state,
-        &workspace_id,
+        &scope,
         session_id.as_ref(),
     )))
 }
@@ -4008,24 +4189,20 @@ async fn remove_notification(
     State(state): State<ApiState>,
     Json(request): Json<RemoveNotificationRequest>,
 ) -> Result<Json<NotificationsResponseDto>, ApiError> {
-    let workspace_id = require_request_workspace_id(
+    let scope = resolve_session_scope(
         &state,
         request.requested_workspace_id(),
         request.requested_workspace_path(),
     )?;
-    let session_id = validate_optional_notification_session(
-        &state,
-        request.requested_session_id(),
-        &workspace_id,
-    )?;
+    let session_id =
+        validate_optional_notification_session(&state, request.requested_session_id(), &scope)?;
     let notification_id = request
         .requested_notification_id()
         .ok_or_else(|| ApiError::InvalidInput("notification_id 不能为空".to_string()))?;
     state
         .session_store
         .remove_notification_for_context(
-            workspace_id.as_str(),
-            session_id.as_ref(),
+            &notification_context(&scope, session_id.clone()),
             &notification_id,
         )
         .map_err(|error| match error {
@@ -4035,7 +4212,7 @@ async fn remove_notification(
     state.persist_session_durable_state_for_api()?;
     Ok(Json(build_notifications_response(
         &state,
-        &workspace_id,
+        &scope,
         session_id.as_ref(),
     )))
 }
@@ -4044,24 +4221,20 @@ async fn resolve_notification(
     State(state): State<ApiState>,
     Json(request): Json<RemoveNotificationRequest>,
 ) -> Result<Json<NotificationsResponseDto>, ApiError> {
-    let workspace_id = require_request_workspace_id(
+    let scope = resolve_session_scope(
         &state,
         request.requested_workspace_id(),
         request.requested_workspace_path(),
     )?;
-    let session_id = validate_optional_notification_session(
-        &state,
-        request.requested_session_id(),
-        &workspace_id,
-    )?;
+    let session_id =
+        validate_optional_notification_session(&state, request.requested_session_id(), &scope)?;
     let notification_id = request
         .requested_notification_id()
         .ok_or_else(|| ApiError::InvalidInput("notification_id 不能为空".to_string()))?;
     state
         .session_store
         .resolve_notification_for_context(
-            workspace_id.as_str(),
-            session_id.as_ref(),
+            &notification_context(&scope, session_id.clone()),
             &notification_id,
         )
         .map_err(|error| match error {
@@ -4071,36 +4244,56 @@ async fn resolve_notification(
     state.persist_session_durable_state_for_api()?;
     Ok(Json(build_notifications_response(
         &state,
-        &workspace_id,
+        &scope,
         session_id.as_ref(),
     )))
 }
 
 fn build_notifications_response(
     state: &ApiState,
-    requested_workspace_id: &WorkspaceId,
+    scope: &SessionScope,
     session_id: Option<&SessionId>,
 ) -> NotificationsResponseDto {
     NotificationsResponseDto::from_records(
-        requested_workspace_id.to_string(),
+        scope
+            .workspace_id()
+            .map(|workspace_id| workspace_id.to_string()),
         session_id,
         state
             .session_store
-            .notifications_for_context(requested_workspace_id.as_str(), session_id),
+            .notifications_for_context(&notification_context(scope, session_id.cloned())),
     )
+}
+
+fn notification_context(
+    scope: &SessionScope,
+    session_id: Option<SessionId>,
+) -> NotificationContext {
+    match scope {
+        SessionScope::Personal => NotificationContext::personal(session_id),
+        SessionScope::Workspace(binding) => {
+            NotificationContext::workspace(binding.workspace_id.to_string(), session_id)
+        }
+    }
 }
 
 fn validate_optional_notification_session(
     state: &ApiState,
     requested_session_id: Option<SessionId>,
-    requested_workspace_id: &WorkspaceId,
+    scope: &SessionScope,
 ) -> Result<Option<SessionId>, ApiError> {
     if let Some(session_id) = requested_session_id {
-        require_session_record_in_workspace(
+        let resolved_scope = resolve_existing_session_scope(
             state,
             &session_id,
-            Some(requested_workspace_id.as_str()),
+            scope.workspace_id().as_ref().map(WorkspaceId::as_str),
+            None,
         )?;
+        if &resolved_scope != scope {
+            return Err(ApiError::InvalidInput(
+                "会话请求作用域与通知作用域不一致".to_string(),
+            ));
+        }
         return Ok(Some(session_id));
     }
     Ok(None)
@@ -4108,19 +4301,6 @@ fn validate_optional_notification_session(
 
 fn parse_requested_session_id(value: Option<&str>) -> Option<SessionId> {
     trimmed_non_empty(value).map(SessionId::new)
-}
-
-fn require_request_workspace_id(
-    state: &ApiState,
-    requested_workspace_id: Option<&str>,
-    requested_workspace_path: Option<&str>,
-) -> Result<WorkspaceId, ApiError> {
-    Ok(require_registered_workspace_binding(
-        state,
-        requested_workspace_id,
-        requested_workspace_path,
-    )?
-    .workspace_id)
 }
 
 fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
@@ -4473,9 +4653,141 @@ mod tests {
         (status, body)
     }
 
+    #[tokio::test]
+    async fn personal_session_navigation_and_lifecycle_are_scope_isolated() {
+        let root =
+            std::env::temp_dir().join(format!("magi-personal-session-test-{}", UtcMillis::now().0));
+        std::fs::create_dir_all(&root).expect("personal state root should create");
+        let state = test_state().with_runtime_persistence(Arc::new(RuntimeStatePersistence::new(
+            root.join("sessions.json"),
+            root.join("workspaces.json"),
+            root.join("knowledge.json"),
+        )));
+        let (draft_status, draft) = post_json(
+            state.clone(),
+            "/session/navigation",
+            json!({ "target": "draft", "scope": "personal" }),
+        )
+        .await;
+        assert_eq!(draft_status, StatusCode::OK, "{draft}");
+        assert!(draft["currentSession"].is_null());
+        assert!(draft["sessions"].as_array().is_some_and(Vec::is_empty));
+
+        let (turn_status, turn) = post_json(
+            state.clone(),
+            "/session/turn",
+            json!({ "scope": "personal", "text": "创建一个个人会话", "images": [], "contextReferences": [], "browserAnnotationRefs": [] }),
+        )
+        .await;
+        assert_eq!(turn_status, StatusCode::OK, "{turn}");
+        let session_id = turn["sessionId"].as_str().expect("personal session id");
+        let session = state
+            .session_store
+            .session(&SessionId::new(session_id))
+            .expect("personal session should persist");
+        assert!(session.workspace_id.is_none());
+
+        let (navigate_status, navigate) = post_json(
+            state.clone(),
+            "/session/navigation",
+            json!({ "target": "session", "scope": "personal", "sessionId": session_id }),
+        )
+        .await;
+        assert_eq!(navigate_status, StatusCode::OK, "{navigate}");
+        assert_eq!(navigate["currentSession"]["sessionId"], session_id);
+        assert!(navigate["currentSession"]["workspaceId"].is_null());
+
+        let (rename_status, renamed) = post_json(
+            state.clone(),
+            "/session/rename",
+            json!({ "sessionId": session_id, "name": "个人会话已重命名" }),
+        )
+        .await;
+        assert_eq!(rename_status, StatusCode::OK, "{renamed}");
+        assert_eq!(
+            state
+                .session_store
+                .session(&SessionId::new(session_id))
+                .expect("session")
+                .title,
+            "个人会话已重命名"
+        );
+
+        let (delete_status, deleted) = post_json(
+            state.clone(),
+            "/session/delete",
+            json!({ "sessionId": session_id }),
+        )
+        .await;
+        assert_eq!(delete_status, StatusCode::OK, "{deleted}");
+        assert!(
+            state
+                .session_store
+                .session(&SessionId::new(session_id))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_viewed_uses_personal_session_scope_without_workspace_binding() {
+        let state = test_state();
+        let session_id = SessionId::new("session-viewed-personal");
+        state
+            .session_store
+            .create_session(session_id.clone(), "个人已查看会话")
+            .expect("personal session should create");
+        state
+            .session_store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: "turn-viewed-personal".to_string(),
+                    turn_seq: 1,
+                    accepted_at: UtcMillis(10),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("触发个人未读完成".to_string()),
+                    items: Vec::new(),
+                },
+            )
+            .expect("current turn should upsert");
+        state
+            .session_store
+            .update_current_turn_status(&session_id, "completed")
+            .expect("turn should complete");
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/viewed",
+            json!({ "sessionId": session_id.as_str() }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sessionId"], session_id.as_str());
+        assert!(body["workspaceId"].is_null());
+        assert_eq!(body["hasUnreadCompletion"], false);
+        assert!(
+            !state
+                .session_store
+                .session(&session_id)
+                .expect("personal session should exist")
+                .has_unread_completion()
+        );
+        let viewed_event = state
+            .event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "session.viewed")
+            .expect("viewed event should publish");
+        assert!(viewed_event.workspace_id.is_none());
+    }
+
     fn session_turn_request(text: &str) -> SessionTurnRequestDto {
         SessionTurnRequestDto {
             session_id: None,
+            scope: crate::dto::SessionScopeKindDto::Personal,
             workspace_id: None,
             workspace_path: None,
             text: Some(text.to_string()),
@@ -4504,13 +4816,14 @@ mod tests {
     ) -> QueuedRegularSessionTurn {
         let mut request = session_turn_request(&format!("queued {queue_id}"));
         request.session_id = Some(session_id.to_string());
+        request.scope = crate::dto::SessionScopeKindDto::Workspace;
         request.workspace_id = Some(workspace_id.to_string());
         request.request_id = Some(format!("request-{queue_id}"));
         request.user_message_id = Some(format!("user-{queue_id}"));
         request.placeholder_message_id = Some(format!("assistant-{queue_id}"));
         QueuedRegularSessionTurn {
             request,
-            requested_workspace_id: workspace_id.clone(),
+            requested_workspace_id: Some(workspace_id.clone()),
             accepted_at,
             route: SessionTurnRouteDto::Chat,
             task_title: None,
@@ -4540,6 +4853,7 @@ mod tests {
         .expect_err("session turn request 不得继续接受 snake_case 请求字段");
 
         serde_json::from_value::<SessionTurnRequestDto>(serde_json::json!({
+            "scope": "workspace",
             "workspaceId": "workspace-turn",
             "sessionId": "session-turn",
             "requestId": "request-turn",
@@ -4552,6 +4866,7 @@ mod tests {
         .expect_err("session turn image 不得继续接受 data_url 请求字段");
 
         let request = serde_json::from_value::<SessionTurnRequestDto>(serde_json::json!({
+            "scope": "workspace",
             "workspaceId": "workspace-turn",
             "sessionId": "session-turn",
             "requestId": "request-turn",
@@ -5186,12 +5501,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_turn_rejects_missing_workspace_scope() {
+    async fn session_turn_without_workspace_creates_a_personal_session() {
         let (status, body) = post_json(
             test_state(),
             "/session/turn",
             serde_json::json!({
+                "scope": "personal",
                 "text": "你好",
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert!(body["createdSession"].as_bool().unwrap_or(false));
+        assert!(body["sessionId"].as_str().is_some_and(|id| !id.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn session_turn_requires_an_explicit_scope() {
+        let response = crate::routes::build_router(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/session/turn")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "text": "不得猜测会话作用域",
+                            "images": [],
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should read"),
+        )
+        .expect("framework rejection should use canonical json error");
+        assert_eq!(body["error_code"], "REQUEST_BODY_INVALID");
+    }
+
+    #[tokio::test]
+    async fn session_turn_rejects_workspace_binding_for_personal_scope() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-personal-scope-conflict",
+            "personal-scope-conflict",
+        );
+        let (status, body) = post_json(
+            state,
+            "/session/turn",
+            serde_json::json!({
+                "scope": "personal",
+                "workspaceId": workspace_id.as_str(),
+                "text": "不得把项目绑定塞进个人作用域",
                 "images": [],
             }),
         )
@@ -5201,8 +5572,82 @@ mod tests {
         assert!(
             body["message"]
                 .as_str()
-                .unwrap_or_default()
-                .contains("workspaceId 不能为空"),
+                .is_some_and(|message| message.contains("个人会话不能携带 workspace 绑定")),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_turn_rejects_workspace_scope_for_personal_history() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-personal-history-conflict",
+            "personal-history-conflict",
+        );
+        let session_id = SessionId::new("session-personal-history-conflict");
+        state
+            .session_store
+            .create_session(session_id.clone(), "个人历史会话")
+            .expect("personal session should create");
+
+        let (status, body) = post_json(
+            state,
+            "/session/turn",
+            serde_json::json!({
+                "scope": "workspace",
+                "workspaceId": workspace_id.as_str(),
+                "sessionId": session_id.as_str(),
+                "text": "不得重解释个人历史会话",
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("不属于 workspace")),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_turn_rejects_personal_scope_for_workspace_history() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-project-history-conflict",
+            "project-history-conflict",
+        );
+        let session_id = SessionId::new("session-project-history-conflict");
+        state
+            .session_store
+            .create_session_for_workspace(
+                session_id.clone(),
+                "项目历史会话",
+                Some(workspace_id.to_string()),
+            )
+            .expect("workspace session should create");
+
+        let (status, body) = post_json(
+            state,
+            "/session/turn",
+            serde_json::json!({
+                "scope": "personal",
+                "sessionId": session_id.as_str(),
+                "text": "不得重解释项目历史会话",
+                "images": [],
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("不属于个人会话")),
             "unexpected body: {body}"
         );
     }
@@ -5221,6 +5666,7 @@ mod tests {
             state,
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.to_string(),
                 "text": "分析引用",
                 "contextReferences": [{
@@ -5261,6 +5707,7 @@ mod tests {
             state,
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.to_string(),
                 "contextReferences": [{
                     "kind": "file",
@@ -5306,6 +5753,7 @@ mod tests {
             state,
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.to_string(),
                 "text": "分析引用",
                 "contextReferences": references
@@ -6289,6 +6737,7 @@ mod tests {
             state.clone(),
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.as_str(),
                 "sessionId": session_id.as_str(),
                 "text": "优先收口，不要扩展",
@@ -6322,6 +6771,7 @@ mod tests {
             state.clone(),
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.as_str(),
                 "sessionId": session_id.as_str(),
                 "text": "迟到引导",
@@ -6850,6 +7300,7 @@ mod tests {
     #[test]
     fn structured_goal_mode_request_does_not_depend_on_prompt_keywords() {
         let request = serde_json::from_value::<SessionTurnRequestDto>(serde_json::json!({
+            "scope": "personal",
             "text": "完成当前产品稳定性验收",
             "images": [],
             "goalMode": true
@@ -6871,6 +7322,7 @@ mod tests {
     #[test]
     fn structured_goal_mode_outranks_named_builtin_tool_routing() {
         let request = serde_json::from_value::<SessionTurnRequestDto>(serde_json::json!({
+            "scope": "personal",
             "text": "创建两步任务清单，第一步调用 shell_exec 执行 sleep 30，第二步汇总结果",
             "images": [],
             "goalMode": true
@@ -7222,6 +7674,7 @@ mod tests {
             state.clone(),
             "/session/turn",
             json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.as_str(),
                 "sessionId": session_id.as_str(),
                 "text": "并发消息 A",
@@ -7234,6 +7687,7 @@ mod tests {
             state.clone(),
             "/session/turn",
             json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.as_str(),
                 "sessionId": session_id.as_str(),
                 "text": "并发消息 B",
@@ -7313,6 +7767,7 @@ mod tests {
             state.clone(),
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.as_str(),
                 "sessionId": session_id.as_str(),
                 "text": "继续检查当前项目",
@@ -7375,6 +7830,7 @@ mod tests {
             state.clone(),
             "/session/turn",
             json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.as_str(),
                 "sessionId": session_id.as_str(),
                 "text": "正在处理的消息",
@@ -7411,6 +7867,7 @@ mod tests {
                 state.clone(),
                 "/session/turn",
                 json!({
+                    "scope": "workspace",
                     "workspaceId": workspace_id.as_str(),
                     "sessionId": session_id.as_str(),
                     "text": text,
@@ -7741,7 +8198,7 @@ mod tests {
             "queue-submit-failure",
             UtcMillis(201),
         );
-        queued.requested_workspace_id = missing_workspace_id.clone();
+        queued.requested_workspace_id = Some(missing_workspace_id.clone());
         queued.request.workspace_id = Some(missing_workspace_id.to_string());
         queued.retry_count = 3;
         state
@@ -7907,6 +8364,7 @@ mod tests {
             state.clone(),
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.to_string(),
                 "sessionId": session_id.to_string(),
                 "text": "第二条应该排队",
@@ -8021,6 +8479,7 @@ mod tests {
             state.clone(),
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.to_string(),
                 "sessionId": session_id.to_string(),
                 "text": "建立目标并按步骤完成排队稳定性验收",
@@ -8102,6 +8561,7 @@ mod tests {
             state.clone(),
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_a.to_string(),
                 "sessionId": session_a.to_string(),
                 "text": "A 的下一条",
@@ -8116,6 +8576,7 @@ mod tests {
             state.clone(),
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_b.to_string(),
                 "sessionId": session_b.to_string(),
                 "text": "B 的下一条",
@@ -8173,6 +8634,7 @@ mod tests {
             state.clone(),
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.to_string(),
                 "sessionId": session_id.to_string(),
                 "text": "以任务模式整理当前问题并输出修复计划",
@@ -8212,6 +8674,7 @@ mod tests {
             state.clone(),
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.to_string(),
                 "text": "以任务模式分析这张图片并整理成待办",
                 "images": [{
@@ -8282,6 +8745,7 @@ mod tests {
             state,
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.to_string(),
                 "text": "以任务模式分析引用文件并输出结论",
                 "contextReferences": [{
@@ -8333,6 +8797,7 @@ mod tests {
             state,
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.to_string(),
                 "text": "请制定并完整执行三阶段只读计划，每完成一个阶段立即更新计划，不派发子代理。",
                 "requestId": "request-no-agent-plan",
@@ -8381,6 +8846,7 @@ mod tests {
             state,
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.to_string(),
                 "text": "建立目标和两步任务清单，第一步调用 shell_exec 执行 sleep 30，第二步汇总结果",
                 "goalMode": true,
@@ -8447,6 +8913,7 @@ mod tests {
             state,
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "sessionId": session_id.to_string(),
                 "workspaceId": workspace_id.to_string(),
                 "text": "继续按步骤推进当前目标",
@@ -8480,6 +8947,7 @@ mod tests {
             state.clone(),
             "/session/turn",
             serde_json::json!({
+                "scope": "workspace",
                 "workspaceId": workspace_id.to_string(),
                 "text": "请分析这张图片",
                 "images": [{
@@ -8647,6 +9115,7 @@ mod tests {
                 is_primary: true,
                 session_id: session_id.clone(),
                 workspace_id: Some(workspace_id.clone()),
+                execution_root: None,
                 ownership: ExecutionOwnership::default(),
                 writebacks: ExecutionWritebackPlans::default(),
                 use_tools: true,
@@ -8681,7 +9150,7 @@ mod tests {
         state
             .enqueue_regular_session_turn(QueuedRegularSessionTurn {
                 request: session_turn_request("排队消息"),
-                requested_workspace_id: workspace_id.clone(),
+                requested_workspace_id: Some(workspace_id.clone()),
                 accepted_at: UtcMillis(13),
                 route: SessionTurnRouteDto::Chat,
                 task_title: None,
@@ -9146,6 +9615,7 @@ mod tests {
             "/session/navigation",
             serde_json::json!({
                 "target": "session",
+                "scope": "personal",
                 "sessionId": session_id.as_str(),
             }),
         )
@@ -9156,9 +9626,82 @@ mod tests {
             body["message"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("workspaceId 不能为空"),
+                .contains("不属于个人会话"),
             "unexpected body: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn materialize_session_creates_selected_personal_session() {
+        let state = test_state();
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/materialize",
+            serde_json::json!({ "scope": "personal" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        let session_id = SessionId::new(
+            body["sessionId"]
+                .as_str()
+                .expect("materialized session id should exist"),
+        );
+        let session = state
+            .session_store
+            .session(&session_id)
+            .expect("materialized session should persist");
+        assert_eq!(session.workspace_id, None);
+        assert_eq!(
+            state
+                .session_store
+                .current_session()
+                .map(|item| item.session_id),
+            Some(session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_session_preserves_workspace_binding() {
+        let state = test_state();
+        let workspace_id = register_workspace(
+            &state,
+            "workspace-materialize-session",
+            "workspace-materialize-session",
+        );
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/session/materialize",
+            serde_json::json!({
+                "scope": "workspace",
+                "workspaceId": workspace_id.as_str(),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        let session_id = SessionId::new(
+            body["sessionId"]
+                .as_str()
+                .expect("materialized session id should exist"),
+        );
+        let session = state
+            .session_store
+            .session(&session_id)
+            .expect("materialized session should persist");
+        assert_eq!(session.workspace_id.as_deref(), Some(workspace_id.as_str()));
+        assert_eq!(body["workspaceId"], workspace_id.as_str());
+    }
+
+    #[test]
+    fn session_navigation_requires_explicit_scope() {
+        let result = serde_json::from_value::<SessionNavigationRequest>(
+            serde_json::json!({ "target": "draft" }),
+        );
+
+        assert!(result.is_err(), "缺少 scope 的导航请求必须在协议边界被拒绝");
     }
 
     #[tokio::test]
@@ -9189,6 +9732,7 @@ mod tests {
             "/session/navigation",
             serde_json::json!({
                 "target": "draft",
+                "scope": "workspace",
                 "workspaceId": workspace_id.as_str(),
             }),
         )
@@ -9233,6 +9777,7 @@ mod tests {
             "/session/navigation",
             serde_json::json!({
                 "target": "draft",
+                "scope": "workspace",
                 "workspaceId": workspace_id.as_str(),
                 "sessionId": session_id.as_str(),
             }),
@@ -9282,6 +9827,7 @@ mod tests {
             "/session/navigation",
             serde_json::json!({
                 "target": "session",
+                "scope": "workspace",
                 "workspaceId": workspace_b.as_str(),
                 "workspacePath": root_a.display().to_string(),
                 "sessionId": session_id.as_str(),
@@ -9332,6 +9878,7 @@ mod tests {
             "/session/navigation",
             serde_json::json!({
                 "target": "session",
+                "scope": "workspace",
                 "workspaceId": "workspace-a",
                 "sessionId": first_session_id.as_str(),
             }),
@@ -9582,7 +10129,10 @@ mod tests {
         assert!(
             !state
                 .session_store
-                .notifications_for_context("workspace-a", Some(&session_id))[0]
+                .notifications_for_context(&NotificationContext::workspace(
+                    "workspace-a",
+                    Some(session_id.clone()),
+                ))[0]
                 .handled
         );
     }
@@ -9633,7 +10183,10 @@ mod tests {
         assert!(
             state
                 .session_store
-                .notifications_for_context("workspace-owned-actions", Some(&session_id))
+                .notifications_for_context(&NotificationContext::workspace(
+                    "workspace-owned-actions",
+                    Some(session_id.clone()),
+                ))
                 .iter()
                 .all(|notification| notification.handled)
         );
@@ -9694,7 +10247,10 @@ mod tests {
         assert!(
             state
                 .session_store
-                .notifications_for_context("workspace-owned-actions", Some(&session_id))
+                .notifications_for_context(&NotificationContext::workspace(
+                    "workspace-owned-actions",
+                    Some(session_id.clone()),
+                ))
                 .is_empty()
         );
     }
@@ -9785,9 +10341,13 @@ mod tests {
         assert_eq!(records[0]["resolved"], false);
         assert_eq!(records[0]["occurrenceCount"], 1);
 
-        let stored = state
-            .session_store
-            .notifications_for_context("workspace-a", Some(&session_id));
+        let stored =
+            state
+                .session_store
+                .notifications_for_context(&NotificationContext::workspace(
+                    "workspace-a",
+                    Some(session_id.clone()),
+                ));
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].notification_id, first_notification_id);
         assert_eq!(stored[0].kind, "incident");
@@ -9846,6 +10406,70 @@ mod tests {
             .await
             .expect("route should respond");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn personal_session_incidents_are_session_owned_without_workspace_binding() {
+        let state = test_state();
+        let session_id = SessionId::new("session-personal-notification-incident");
+        state
+            .session_store
+            .create_session(session_id.clone(), "个人异常记录")
+            .expect("personal session should create");
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/notifications/report",
+            serde_json::json!({
+                "sessionId": session_id.as_str(),
+                "scope": "session",
+                "level": "error",
+                "message": "个人会话异常记录合同测试"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert!(body.get("workspaceId").is_none());
+        assert_eq!(body["sessionId"], session_id.as_str());
+        let records = body["notifications"]["records"]
+            .as_array()
+            .expect("records should be array");
+        assert_eq!(records.len(), 1);
+        assert!(records[0]["workspaceId"].is_null());
+        assert_eq!(records[0]["sessionId"], session_id.as_str());
+
+        let personal_context = NotificationContext::personal(Some(session_id.clone()));
+        let stored = state
+            .session_store
+            .notifications_for_context(&personal_context);
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].workspace_id.is_none());
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/notifications/resolve",
+            serde_json::json!({
+                "sessionId": session_id.as_str(),
+                "notificationId": stored[0].notification_id,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert_eq!(body["notifications"]["records"][0]["resolved"], true);
+
+        let (status, body) = post_json(
+            state.clone(),
+            "/notifications/clear",
+            serde_json::json!({ "sessionId": session_id.as_str() }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+        assert!(
+            body["notifications"]["records"]
+                .as_array()
+                .expect("records should be array")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -9911,7 +10535,10 @@ mod tests {
         assert!(
             !state
                 .session_store
-                .notifications_for_context("workspace-missing", Some(&session_id))[0]
+                .notifications_for_context(&NotificationContext::workspace(
+                    "workspace-missing",
+                    Some(session_id.clone()),
+                ))[0]
                 .handled
         );
 

@@ -9,18 +9,26 @@ await withGoldenViteServer(async (server) => {
   const agentApi = await server.ssrLoadModule('/src/web/agent-api.ts');
 
   binding.setAgentBindingContext({
+    scope: 'workspace',
     workspaceId: 'workspace-query-golden',
     workspacePath: '/tmp/workspace-query-golden',
     sessionId: 'session-query-golden',
   });
+  assert.equal(
+    binding.resolveAgentBindingContext().scope,
+    'workspace',
+    'workspace binding must carry an explicit workspace scope',
+  );
 
   binding.setAgentBindingContext({
+    scope: 'workspace',
     workspaceId: 'workspace-path-ref-golden',
     workspacePath: 'mhp1:u:L3RtcC93b3Jrc3BhY2UtcGF0aC1yZWYtZ29sZGVu',
     sessionId: 'session-path-ref-golden',
   });
   assert.equal(
     agentApi.settingsBootstrapMatchesCurrentWorkspace({
+      scope: 'workspace',
       workspaceId: 'workspace-path-ref-golden',
       workspacePath: '/tmp/workspace-path-ref-golden',
       sessionId: 'session-path-ref-golden',
@@ -30,6 +38,7 @@ await withGoldenViteServer(async (server) => {
   );
   assert.equal(
     agentApi.settingsBootstrapMatchesCurrentWorkspace({
+      scope: 'workspace',
       workspaceId: 'workspace-other',
       workspacePath: '/tmp/workspace-path-ref-golden',
       sessionId: 'session-path-ref-golden',
@@ -39,6 +48,7 @@ await withGoldenViteServer(async (server) => {
   );
 
   binding.setAgentBindingContext({
+    scope: 'workspace',
     workspaceId: 'workspace-query-golden',
     workspacePath: '/tmp/workspace-query-golden',
     sessionId: 'session-query-golden',
@@ -55,6 +65,22 @@ await withGoldenViteServer(async (server) => {
     false,
     'file preview must default to workspace scope to avoid stale session binding failures',
   );
+
+  binding.setAgentBindingContext({
+    scope: 'personal',
+    sessionId: 'session-personal-query-golden',
+  });
+  const personalBinding = binding.resolveAgentBindingContext();
+  assert.equal(personalBinding.scope, 'personal');
+  assert.equal('workspaceId' in personalBinding, false);
+  assert.equal('workspacePath' in personalBinding, false);
+
+  binding.setAgentBindingContext({
+    scope: 'workspace',
+    workspaceId: 'workspace-query-golden',
+    workspacePath: '/tmp/workspace-query-golden',
+    sessionId: 'session-query-golden',
+  });
 
   const sessionPreviewQuery = new URLSearchParams(
     agentApi.buildFilePreviewQuery('src/main.ts', { includeSession: true }),
@@ -144,6 +170,7 @@ await withGoldenViteServer(async (server) => {
       });
     };
     await agentApi.getAgentProjectKnowledge({
+      scope: 'workspace',
       workspaceId: 'workspace-knowledge-override',
       workspacePath: '/tmp/workspace-knowledge-override',
       sessionId: 'session-must-not-leak',
@@ -157,29 +184,14 @@ await withGoldenViteServer(async (server) => {
       'project knowledge must stay workspace-scoped even when an explicit session is present',
     );
 
-    capturedKnowledgeUrl = '';
-    await agentApi.getAgentProjectKnowledge({
-      workspaceId: '',
-      workspacePath: '',
-    });
-    const emptyOverrideQuery = new URL(capturedKnowledgeUrl).searchParams;
-    assert.equal(
-      emptyOverrideQuery.get('workspaceId'),
-      'workspace-query-golden',
-      'empty knowledge workspace override must fall back to the active workspace binding',
-    );
-    assert.equal(
-      emptyOverrideQuery.get('workspacePath'),
-      '/tmp/workspace-query-golden',
-      'empty knowledge workspace override must not erase the active workspace path',
-    );
-
     await agentApi.reindexAgentProjectKnowledge({
+      scope: 'workspace',
       workspaceId: 'workspace-knowledge-override',
       workspacePath: '/tmp/workspace-knowledge-override',
       sessionId: 'session-must-not-leak',
     });
     await agentApi.clearAgentProjectKnowledge({
+      scope: 'workspace',
       workspaceId: 'workspace-knowledge-override',
       workspacePath: '/tmp/workspace-knowledge-override',
       sessionId: 'session-must-not-leak',
@@ -207,6 +219,7 @@ await withGoldenViteServer(async (server) => {
 
     capturedKnowledgeUrl = '';
     await agentApi.getAgentPendingChanges({
+      scope: 'workspace',
       workspaceId: 'workspace-knowledge-override',
       workspacePath: '/tmp/workspace-knowledge-override',
       sessionId: 'session-changes-refresh',
@@ -281,10 +294,11 @@ await withGoldenViteServer(async (server) => {
   try {
     globalThis.window = {
       location: {
-        href: 'http://127.0.0.1:38123/web.html?workspacePath=%2Ftmp%2Fworkspace-from-url',
+        href: 'http://127.0.0.1:38123/web.html?scope=workspace&workspacePath=%2Ftmp%2Fworkspace-from-url',
       },
     };
     binding.setAgentBindingContext({
+      scope: 'workspace',
       workspaceId: 'workspace-stale-runtime',
       workspacePath: '/tmp/workspace-stale-runtime',
       sessionId: 'session-stale-runtime',
@@ -294,7 +308,7 @@ await withGoldenViteServer(async (server) => {
     assert.equal(explicitUrlBinding.workspaceId, '');
     assert.equal(
       explicitUrlBinding.sessionId,
-      '',
+      undefined,
       'explicit URL workspace without session must clear stale runtime session binding',
     );
     const explicitUrlPreviewQuery = new URLSearchParams(
@@ -312,19 +326,20 @@ await withGoldenViteServer(async (server) => {
     );
 
     binding.setAgentBindingContext({
+      scope: 'workspace',
       workspaceId: 'workspace-authoritative',
       workspacePath: '/tmp/workspace-authoritative',
       sessionId: '',
     }, {
       authoritative: true,
     });
-    globalThis.window.location.href = 'http://127.0.0.1:38123/web.html?workspaceId=workspace-authoritative&workspacePath=%2Ftmp%2Fworkspace-authoritative&sessionId=session-stale-url';
+    globalThis.window.location.href = 'http://127.0.0.1:38123/web.html?scope=workspace&workspaceId=workspace-authoritative&workspacePath=%2Ftmp%2Fworkspace-authoritative&sessionId=session-stale-url';
     const authoritativeBinding = binding.resolveAgentBindingContext();
     assert.equal(authoritativeBinding.workspaceId, 'workspace-authoritative');
     assert.equal(authoritativeBinding.workspacePath, '/tmp/workspace-authoritative');
     assert.equal(
       authoritativeBinding.sessionId,
-      '',
+      undefined,
       'authoritative backend binding must ignore stale URL sessionId after bootstrap clears current session',
     );
     const authoritativePreviewQuery = new URLSearchParams(
@@ -346,6 +361,7 @@ await withGoldenViteServer(async (server) => {
   try {
     let capturedSettingsBootstrapUrl = '';
     binding.setAgentBindingContext({
+      scope: 'workspace',
       workspaceId: 'workspace-query-golden',
       workspacePath: '/tmp/workspace-query-golden',
       sessionId: 'session-query-golden',
@@ -353,6 +369,7 @@ await withGoldenViteServer(async (server) => {
     globalThis.fetch = async (url) => {
       capturedSettingsBootstrapUrl = String(url);
       return new Response(JSON.stringify({
+        scope: 'workspace',
         workspaceId: 'workspace-query-golden',
         workspacePath: '/tmp/workspace-query-golden',
         sessionId: 'session-query-golden',
@@ -378,9 +395,10 @@ await withGoldenViteServer(async (server) => {
         headers: { 'content-type': 'application/json' },
       });
     };
-    const settingsBootstrap = await agentApi.getAgentSettingsBootstrap({ scope: 'core', accessProfile: 'read_only' });
+    const settingsBootstrap = await agentApi.getAgentSettingsBootstrap({ bootstrapScope: 'core', accessProfile: 'read_only' });
     const settingsBootstrapQuery = new URL(capturedSettingsBootstrapUrl).searchParams;
-    assert.equal(settingsBootstrapQuery.get('scope'), 'core');
+    assert.equal(settingsBootstrapQuery.get('scope'), 'workspace');
+    assert.equal(settingsBootstrapQuery.get('bootstrapScope'), 'core');
     assert.equal(
       settingsBootstrapQuery.get('accessProfile'),
       'read_only',
@@ -605,6 +623,7 @@ await withGoldenViteServer(async (server) => {
   }
 
   binding.setAgentBindingContext({
+    scope: 'workspace',
     workspaceId: 'workspace-stats-golden',
     workspacePath: '/tmp/workspace-stats-golden',
     sessionId: 'session-stats-golden',
@@ -647,11 +666,7 @@ await withGoldenViteServer(async (server) => {
     }
   }
 
-  binding.setAgentBindingContext({
-    workspaceId: '',
-    workspacePath: '',
-    sessionId: '',
-  });
+  binding.setAgentBindingContext({ scope: 'personal' });
   const fetchBeforeEmptyStats = globalThis.fetch;
   let emptyStatsRequestCount = 0;
   globalThis.fetch = async (input) => {

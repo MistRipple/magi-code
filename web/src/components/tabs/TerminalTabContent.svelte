@@ -8,7 +8,7 @@
 
   interface Props {
     terminalTabId: string;
-    workspaceId: string;
+    workspaceId?: string;
     workspacePath?: string;
     sessionId: string;
   }

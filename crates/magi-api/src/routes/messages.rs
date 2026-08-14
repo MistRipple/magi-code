@@ -8,10 +8,12 @@ use magi_session_store::{CanonicalTurn, SessionRecord, TimelineEntry};
 use serde::{Deserialize, Serialize};
 
 use super::session_scope::{
-    parse_session_id, require_registered_workspace_binding, require_session_record_in_workspace,
-    require_workspace_id,
+    parse_session_id, require_session_record_in_scope, resolve_explicit_session_scope,
 };
-use crate::{errors::ApiError, public_canonical::public_canonical_turn, state::ApiState};
+use crate::{
+    dto::SessionScopeKindDto, errors::ApiError, public_canonical::public_canonical_turn,
+    state::ApiState,
+};
 
 pub fn routes() -> Router<ApiState> {
     Router::new().route("/messages", get(get_messages))
@@ -20,6 +22,7 @@ pub fn routes() -> Router<ApiState> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MessagesQuery {
+    scope: SessionScopeKindDto,
     session_id: Option<String>,
     #[serde(default)]
     workspace_id: Option<String>,
@@ -50,25 +53,14 @@ async fn get_messages(
     State(state): State<ApiState>,
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<MessagesResponseDto>, ApiError> {
-    let requested_workspace_id = match query
-        .workspace_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|workspace_path| !workspace_path.is_empty())
-    {
-        Some(_) => {
-            require_registered_workspace_binding(
-                &state,
-                query.workspace_id.as_deref(),
-                query.workspace_path.as_deref(),
-            )?
-            .workspace_id
-        }
-        None => require_workspace_id(query.workspace_id.as_deref())?,
-    };
+    let scope = resolve_explicit_session_scope(
+        &state,
+        query.scope,
+        query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
+    )?;
     let sid = parse_session_id(query.session_id.as_deref())?;
-    let current_session =
-        require_session_record_in_workspace(&state, &sid, Some(requested_workspace_id.as_str()))?;
+    let current_session = require_session_record_in_scope(&state, &sid, &scope)?;
     let session_id = current_session.session_id.clone();
 
     let timeline = state.session_store.timeline_for_session(&session_id);
@@ -87,7 +79,9 @@ async fn get_messages(
     };
     let start = end.saturating_sub(limit);
     let page = timeline[start..end].to_vec();
-    let sessions = state.session_records_for_workspace(Some(requested_workspace_id.as_str()));
+    let requested_workspace_id = scope.workspace_id();
+    let sessions =
+        state.session_records_for_workspace(requested_workspace_id.as_ref().map(|id| id.as_str()));
     let canonical_limit = limit.min(20);
     let (canonical_turns, canonical_has_more_before, canonical_before_cursor) = state
         .session_store
@@ -165,6 +159,17 @@ mod tests {
         dir
     }
 
+    fn register_workspace(state: &ApiState, workspace_id: &str) {
+        let root = unique_temp_dir(workspace_id);
+        state
+            .workspace_registry
+            .register(
+                WorkspaceId::new(workspace_id),
+                AbsolutePath::new(root.to_string_lossy().as_ref()),
+            )
+            .expect("workspace should register");
+    }
+
     async fn read_json_response(response: axum::response::Response) -> serde_json::Value {
         serde_json::from_slice::<serde_json::Value>(
             &to_bytes(response.into_body(), usize::MAX)
@@ -175,7 +180,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messages_requires_workspace_scope() {
+    async fn messages_rejects_personal_scope_for_workspace_session() {
         let session_id = SessionId::new("session-messages-requires-workspace");
         let store = SessionStore::default();
         store
@@ -196,7 +201,7 @@ mod tests {
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/messages?sessionId=session-messages-requires-workspace")
+                    .uri("/messages?scope=personal&sessionId=session-messages-requires-workspace")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -209,7 +214,7 @@ mod tests {
             body["message"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("workspaceId 不能为空"),
+                .contains("不属于个人会话"),
             "unexpected body: {body}"
         );
     }
@@ -226,12 +231,13 @@ mod tests {
             )
             .expect("session should create");
         let state = test_state(store);
+        register_workspace(&state, "workspace-messages-required");
 
         let response = routes()
             .with_state(state)
             .oneshot(
                 Request::builder()
-                    .uri("/messages?workspaceId=workspace-messages-required")
+                    .uri("/messages?scope=workspace&workspaceId=workspace-messages-required")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -281,7 +287,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/messages?workspaceId=workspace-stale-query&workspacePath={}&sessionId={}",
+                        "/messages?scope=workspace&workspaceId=workspace-stale-query&workspacePath={}&sessionId={}",
                         urlencoding::encode(root.to_string_lossy().as_ref()),
                         session_id
                     ))
@@ -352,13 +358,14 @@ mod tests {
             },
         );
         let state = test_state(store);
+        register_workspace(&state, "workspace-sidecar-only");
 
         let response = routes()
             .with_state(state)
             .oneshot(
                 Request::builder()
                     .uri(
-                        "/messages?workspaceId=workspace-sidecar-only&sessionId=session-messages-sidecar-only",
+                        "/messages?scope=workspace&workspaceId=workspace-sidecar-only&sessionId=session-messages-sidecar-only",
                     )
                     .body(Body::empty())
                     .expect("request should build"),
@@ -396,13 +403,14 @@ mod tests {
             );
         }
         let state = test_state(store);
+        register_workspace(&state, "workspace-messages-pagination");
 
         let first = routes()
             .with_state(state.clone())
             .oneshot(
                 Request::builder()
                     .uri(
-                        "/messages?workspaceId=workspace-messages-pagination&sessionId=session-messages-pagination&limit=3",
+                        "/messages?scope=workspace&workspaceId=workspace-messages-pagination&sessionId=session-messages-pagination&limit=3",
                     )
                     .body(Body::empty())
                     .expect("request should build"),
@@ -425,7 +433,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/messages?workspaceId=workspace-messages-pagination&sessionId=session-messages-pagination&limit=3&beforeCursor={before_cursor}",
+                        "/messages?scope=workspace&workspaceId=workspace-messages-pagination&sessionId=session-messages-pagination&limit=3&beforeCursor={before_cursor}",
                     ))
                     .body(Body::empty())
                     .expect("request should build"),
@@ -486,13 +494,14 @@ mod tests {
                 .expect("turn should upsert");
         }
         let state = test_state(store);
+        register_workspace(&state, "workspace-messages-canonical-pagination");
 
         let first = routes()
             .with_state(state.clone())
             .oneshot(
                 Request::builder()
                     .uri(
-                        "/messages?workspaceId=workspace-messages-canonical-pagination&sessionId=session-messages-canonical-pagination",
+                        "/messages?scope=workspace&workspaceId=workspace-messages-canonical-pagination&sessionId=session-messages-canonical-pagination",
                     )
                     .body(Body::empty())
                     .expect("request should build"),
@@ -511,7 +520,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/messages?workspaceId=workspace-messages-canonical-pagination&sessionId=session-messages-canonical-pagination&canonicalBeforeCursor={first_cursor}"
+                        "/messages?scope=workspace&workspaceId=workspace-messages-canonical-pagination&sessionId=session-messages-canonical-pagination&canonicalBeforeCursor={first_cursor}"
                     ))
                     .body(Body::empty())
                     .expect("request should build"),
@@ -623,12 +632,13 @@ mod tests {
         );
 
         let state = test_state(store);
+        register_workspace(&state, "workspace-messages-tool-redaction");
         let response = routes()
             .with_state(state)
             .oneshot(
                 Request::builder()
                     .uri(
-                        "/messages?workspaceId=workspace-messages-tool-redaction&sessionId=session-messages-tool-redaction",
+                        "/messages?scope=workspace&workspaceId=workspace-messages-tool-redaction&sessionId=session-messages-tool-redaction",
                     )
                     .body(Body::empty())
                     .expect("request should build"),

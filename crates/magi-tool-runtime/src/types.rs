@@ -225,7 +225,7 @@ pub type BrowserToolExecutor = Arc<
         + 'static,
 >;
 pub type BrowserCapabilityProvider = Arc<
-    dyn Fn(Option<&SessionId>) -> magi_browser_runtime::BrowserCapabilitySnapshot + Send + Sync,
+    dyn Fn(Option<&SessionId>) -> magi_browser_authority::BrowserCapabilitySnapshot + Send + Sync,
 >;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

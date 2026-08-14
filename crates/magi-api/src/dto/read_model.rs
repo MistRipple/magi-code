@@ -11,7 +11,7 @@ use magi_event_bus::{
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{SessionExecutionSidecarStatus, SessionRuntimeSidecarExport};
 use magi_settings_store::SettingsStore;
-use magi_usage_authority::{evaluate_context_budget, resolve_context_window};
+use magi_usage_authority::{ContextBudgetPolicy, resolve_context_window};
 use magi_workspace::{RecoveryStatus, WorkspaceRecoverySidecarExport};
 use std::collections::{BTreeMap, HashMap};
 
@@ -131,12 +131,10 @@ pub fn ledger_dto(status: AuditUsageLedgerStatus) -> AuditUsageLedgerDto {
     RuntimeLedgerSummary::from(status)
 }
 
-/// 为每个会话计算上下文预算快照。
+/// 为每个会话投影上下文压力快照。
 ///
-/// 反孤儿：event-bus 仅采集当前上下文窗口 token 与解析模型名（`usage_observation`），
-/// 窗口推断与告警分级是 usage-authority 的责任，所以在 DTO 装配层
-/// 用 `resolve_context_window` + `evaluate_context_budget` 填充 `budget`。没有
-/// 观测值的会话保持 `budget == None`。
+/// 窗口和 projected token 优先使用事件中绑定模型的快照，不能用当前活动模型
+/// 覆盖历史调用。旧 ledger 没有新字段时才使用旧字段做一次读取迁移。
 fn merge_session_budgets(runtime_read_model: &mut RuntimeReadModelInput) {
     for session in &mut runtime_read_model.details.sessions {
         let Some(observation) = session.usage_observation.as_ref() else {
@@ -144,16 +142,27 @@ fn merge_session_budgets(runtime_read_model: &mut RuntimeReadModelInput) {
             continue;
         };
         let resolved_model = observation.resolved_model.as_deref().unwrap_or("");
-        let context_window = resolve_context_window(resolved_model);
-        let budget =
-            evaluate_context_budget(observation.context_window_tokens as i64, context_window);
+        let context_window = observation
+            .context_window_limit_tokens
+            .unwrap_or_else(|| resolve_context_window(resolved_model).max(1) as u64);
+        let projected_tokens = if observation.projected_request_tokens > 0 {
+            observation.projected_request_tokens
+        } else {
+            observation.context_window_tokens
+        };
+        let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
+        let remaining_tokens = context_window.saturating_sub(projected_tokens);
         session.budget = Some(SessionRuntimeBudgetEntry {
-            token_used: budget.tokens_used.max(0) as u64,
-            remaining_tokens: budget.remaining_tokens.max(0) as u64,
-            token_limit: budget.context_window.max(0) as u64,
-            percent_remaining: budget.percent_remaining,
-            usage_ratio: budget.usage_ratio,
-            warning_level: budget.warning_level.as_str().to_string(),
+            token_used: projected_tokens,
+            remaining_tokens,
+            token_limit: context_window,
+            percent_remaining: (remaining_tokens.saturating_mul(100) / context_window.max(1))
+                as i64,
+            usage_ratio: projected_tokens as f64 / context_window.max(1) as f64,
+            warning_level: observation
+                .pressure_level
+                .clone()
+                .unwrap_or_else(|| policy.level_for(projected_tokens).as_str().to_string()),
         });
     }
 }
@@ -174,24 +183,37 @@ pub fn apply_configured_model_context_windows(
             )
             .ok()
             .and_then(|config| config.require_model().ok().map(str::to_string));
-        let resolved_model = active_model
+        // 历史压力快照已经绑定了实际调用模型。当前活动模型只用于没有窗口快照的
+        // 冷启动，避免模型切换后把旧调用的分子套到新模型分母上。
+        let resolved_model = observation
+            .resolved_model
             .as_deref()
-            .or(observation.resolved_model.as_deref())
+            .or(active_model.as_deref())
             .unwrap_or("");
-        let context_window =
+        let context_window = observation.context_window_limit_tokens.unwrap_or_else(|| {
             magi_conversation_runtime::model_context_window::resolve_model_context_window(
                 Some(settings_store),
                 resolved_model,
-            ) as i64;
-        let budget =
-            evaluate_context_budget(observation.context_window_tokens as i64, context_window);
+            ) as u64
+        });
+        let projected_tokens = if observation.projected_request_tokens > 0 {
+            observation.projected_request_tokens
+        } else {
+            observation.context_window_tokens
+        };
+        let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
+        let remaining_tokens = context_window.saturating_sub(projected_tokens);
         session.budget = Some(SessionRuntimeBudgetEntry {
-            token_used: budget.tokens_used.max(0) as u64,
-            remaining_tokens: budget.remaining_tokens.max(0) as u64,
-            token_limit: budget.context_window.max(0) as u64,
-            percent_remaining: budget.percent_remaining,
-            usage_ratio: budget.usage_ratio,
-            warning_level: budget.warning_level.as_str().to_string(),
+            token_used: projected_tokens,
+            remaining_tokens,
+            token_limit: context_window,
+            percent_remaining: (remaining_tokens.saturating_mul(100) / context_window.max(1))
+                as i64,
+            usage_ratio: projected_tokens as f64 / context_window.max(1) as f64,
+            warning_level: observation
+                .pressure_level
+                .clone()
+                .unwrap_or_else(|| policy.level_for(projected_tokens).as_str().to_string()),
         });
     }
 }
@@ -2240,7 +2262,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_budget_keeps_session_usage_when_active_model_changes() {
+    fn configured_budget_keeps_observed_model_window_when_active_model_changes() {
         let settings_store = SettingsStore::new();
         settings_store
             .set_section(
@@ -2290,9 +2312,9 @@ mod tests {
             .as_ref()
             .expect("model switch should preserve session context budget");
         assert_eq!(budget.token_used, 64_000);
-        assert_eq!(budget.token_limit, 1_000_000);
-        assert_eq!(budget.remaining_tokens, 936_000);
-        assert!((budget.usage_ratio - 0.064).abs() < f64::EPSILON);
+        assert_eq!(budget.token_limit, 272_000);
+        assert_eq!(budget.remaining_tokens, 208_000);
+        assert!((budget.usage_ratio - (64_000.0 / 272_000.0)).abs() < f64::EPSILON);
     }
 
     #[test]

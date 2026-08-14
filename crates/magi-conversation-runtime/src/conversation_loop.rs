@@ -8,8 +8,7 @@ use crate::context_authority::{
 };
 use crate::model_config::resolve_vision_execution_config;
 use crate::model_context_window::{
-    apply_reported_context_limit, conservative_context_limit_recovery_window,
-    resolve_model_context_window_with_override,
+    conservative_context_limit_recovery_window, resolve_model_context_window_with_override,
 };
 use crate::session_writeback::{
     ContextCompactionWritebackContext, SessionStatePersistCallback, SessionTurnStreamPublishGate,
@@ -51,8 +50,8 @@ use crate::{
     model_error::{
         MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
         MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, ModelFailureDiagnostic,
-        classify_model_invocation_error, extract_model_context_limit,
-        model_empty_response_recovery_prompt, model_stream_interruption_recovery_prompt,
+        classify_model_invocation_error, model_empty_response_recovery_prompt,
+        model_stream_interruption_recovery_prompt,
     },
     prompt_utils::{
         PromptFragmentKind, current_turn_context_priority_prompt, dynamic_skill_prompt_message,
@@ -63,7 +62,8 @@ use crate::{
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
         account_active_goal_usage, current_turn_id, publish_model_usage_record,
-        record_mission_turn, resolved_model_for_usage_binding, vision_model_usage_binding,
+        record_mission_turn, resolved_model_for_usage_binding, resolved_provider_for_usage_binding,
+        vision_model_usage_binding,
     },
 };
 use magi_bridge_client::{
@@ -863,15 +863,11 @@ fn run_conversation_loop_inner(
         session_id,
     )
     .unwrap_or_default();
-    let request_contains_images = !images.is_empty()
-        || session_store
-            .thread_context_history(thread_id)
-            .iter()
-            .any(|message| !message.images.is_empty());
+    let current_turn_contains_images = !images.is_empty();
     let vision_execution_config = match resolve_vision_execution_config(
         settings_store.or(live_settings_store).map(Arc::as_ref),
         &selected_context_model,
-        request_contains_images,
+        current_turn_contains_images,
     ) {
         Ok(config) => config,
         Err(error) => {
@@ -921,7 +917,8 @@ fn run_conversation_loop_inner(
     };
     let prepare_task_history = |phase: &'static str,
                                 context_window: u64,
-                                additional_token_estimate: usize| {
+                                additional_token_estimate: usize,
+                                force_compaction: bool| {
         let compaction_item_id = new_context_compaction_item_id(task_id.as_str(), thread_id, phase);
         let compaction_writeback = ContextCompactionWritebackContext {
             event_bus,
@@ -954,6 +951,16 @@ fn run_conversation_loop_inner(
             phase,
             context_window_override: Some(context_window),
             additional_token_estimate,
+            persist_checkpoint: vision_execution_config.is_none(),
+            model_identity: Some(magi_usage_authority::ModelIdentitySnapshot::new(
+                vision_execution_config
+                    .as_ref()
+                    .map(|_| "vision")
+                    .unwrap_or("configured"),
+                resolved_context_model.clone(),
+                0,
+            )),
+            force_compaction,
         });
         if let Some(compaction) = prepared.compaction.as_ref() {
             upsert_context_compaction_completed_notice(compaction_writeback, compaction);
@@ -965,6 +972,7 @@ fn run_conversation_loop_inner(
         "pre_turn",
         effective_context_window,
         additional_token_estimate,
+        false,
     );
     if let Some(terminal) = initial_prepared_history.terminal {
         return (
@@ -1016,6 +1024,7 @@ fn run_conversation_loop_inner(
             "interrupted_tool_normalization",
             effective_context_window,
             additional_token_estimate,
+            false,
         );
         if let Some(terminal) = normalized_history.terminal {
             return (
@@ -1062,15 +1071,9 @@ fn run_conversation_loop_inner(
     if !resumed_task {
         let current_user_message = messages.last().expect("当前任务必须包含用户消息");
         let mut persisted_user_message = chat_message_to_thread_chat_message(current_user_message);
-        // 模型视图只移除图片；会话审计仍保留原始图片，后续轮次依据已生成的标记文本复用。
-        persisted_user_message.images = session_turn_image_sources(&images)
-            .into_iter()
-            .map(|image| ThreadChatImageSource {
-                kind: image.kind,
-                media_type: image.media_type,
-                data: image.data,
-            })
-            .collect();
+        // 原图由 canonical turn 负责审计与 UI 展示。thread 历史只保留文本语义，
+        // 避免后续纯文本回合把历史图片再次发送给主模型。
+        persisted_user_message.images.clear();
         append_thread_messages_checkpoint(
             session_store,
             thread_id,
@@ -1150,9 +1153,11 @@ fn run_conversation_loop_inner(
     let mut non_discovery_tool_seen = false;
     let mut discovery_wrap_up_sent = false;
     let mut last_response_observation: Option<String> = None;
-    let rebuild_task_context = |context_window: u64,
+    let rebuild_task_context = |phase: &'static str,
+                                context_window: u64,
                                 round_tools: Option<&[ChatToolDefinition]>,
-                                active_skill_name: Option<&str>| {
+                                active_skill_name: Option<&str>,
+                                force_compaction: bool| {
         let mut context_base_messages = build_task_context_base_messages(
             &static_context_messages,
             project_memory,
@@ -1169,10 +1174,11 @@ fn run_conversation_loop_inner(
             context_base_messages.push(skill_message);
         }
         let prepared = prepare_task_history(
-            "context_limit_recovery",
+            phase,
             context_window,
             estimate_chat_messages_tokens(&context_base_messages)
                 .saturating_add(estimate_tool_definition_tokens(round_tools)),
+            force_compaction,
         );
         if let Some(terminal) = prepared.terminal {
             return Err(terminal);
@@ -1330,9 +1336,11 @@ fn run_conversation_loop_inner(
         }
         if context_budget_recheck_required && !proactive_context_compaction_completed {
             match rebuild_task_context(
+                "post_tool_budget_recheck",
                 effective_context_window,
                 round_tools.as_deref(),
                 active_skill_name.as_deref(),
+                false,
             ) {
                 Ok(Some(rebuilt_messages)) => {
                     messages = rebuilt_messages;
@@ -1371,6 +1379,8 @@ fn run_conversation_loop_inner(
         let round_call_id = format!("task-{}-{}-{round}", task_id, lease_id);
         let current_turn_id = current_turn_id(session_store, session_id);
         let context_usage_tracker = usage_binding.tracks_active_context().then(|| {
+            let resolved_provider =
+                resolved_provider_for_usage_binding(settings_store, usage_binding, session_id);
             ContextUsageRuntimeTracker::start(ContextUsageRuntimeTrackerInput {
                 event_bus,
                 settings_store: settings_store.map(Arc::as_ref),
@@ -1382,6 +1392,13 @@ fn run_conversation_loop_inner(
                 prefill_tokens: estimate_chat_messages_tokens(&messages)
                     .saturating_add(estimate_tool_definition_tokens(round_tools.as_deref()))
                     as u64,
+                thread_id: Some(thread_id),
+                model_provider: resolved_provider,
+                binding_revision: usage_binding.binding_revision(),
+                checkpoint_generation: session_store
+                    .thread_context_checkpoint(thread_id)
+                    .map(|checkpoint| checkpoint.generation)
+                    .unwrap_or_default(),
             })
         });
         let invocation_request_template = invocation_request.clone();
@@ -1466,21 +1483,11 @@ fn run_conversation_loop_inner(
                                 error_code: Some(classification.code.to_string()),
                             },
                         );
-                        if classification.code == "model_context_limit"
-                            && !context_limit_recovery_attempted
-                        {
+                        if error.context_overflow().is_some() && !context_limit_recovery_attempted {
                             context_limit_recovery_attempted = true;
-                            let reported_context_limit =
-                                extract_model_context_limit(&raw_error_message);
-                            if let Some(context_limit) = reported_context_limit {
-                                let _ = apply_reported_context_limit(
-                                    event_bus,
-                                    settings_store,
-                                    live_settings_store,
-                                    &resolved_context_model,
-                                    context_limit,
-                                );
-                            }
+                            let reported_context_limit = error
+                                .context_overflow()
+                                .and_then(|info| info.context_limit_tokens);
                             effective_context_window =
                                 reported_context_limit.unwrap_or_else(|| {
                                     conservative_context_limit_recovery_window(
@@ -1488,9 +1495,11 @@ fn run_conversation_loop_inner(
                                     )
                                 });
                             match rebuild_task_context(
+                                "context_limit_recovery",
                                 effective_context_window,
                                 round_tools.as_deref(),
                                 active_skill_name.as_deref(),
+                                true,
                             ) {
                                 Ok(Some(rebuilt_messages)) => {
                                     messages = rebuilt_messages;
@@ -1774,28 +1783,20 @@ fn run_conversation_loop_inner(
                             error_code: Some(classification.code.to_string()),
                         },
                     );
-                    if classification.code == "model_context_limit"
-                        && !context_limit_recovery_attempted
-                    {
+                    if error.context_overflow().is_some() && !context_limit_recovery_attempted {
                         context_limit_recovery_attempted = true;
-                        let reported_context_limit =
-                            extract_model_context_limit(&raw_error_message);
-                        if let Some(context_limit) = reported_context_limit {
-                            let _ = apply_reported_context_limit(
-                                event_bus,
-                                settings_store,
-                                live_settings_store,
-                                &resolved_context_model,
-                                context_limit,
-                            );
-                        }
+                        let reported_context_limit = error
+                            .context_overflow()
+                            .and_then(|info| info.context_limit_tokens);
                         effective_context_window = reported_context_limit.unwrap_or_else(|| {
                             conservative_context_limit_recovery_window(effective_context_window)
                         });
                         match rebuild_task_context(
+                            "context_limit_recovery",
                             effective_context_window,
                             round_tools.as_deref(),
                             active_skill_name.as_deref(),
+                            true,
                         ) {
                             Ok(Some(rebuilt_messages)) => {
                                 messages = rebuilt_messages;
@@ -3907,23 +3908,8 @@ mod tests {
             observed_at: Some(UtcMillis(2)),
             ..SessionRuntimeUsageObservation::default()
         };
-        let decision = thread_history_compaction_decision(&history, Some(&high_usage), None, 0)
-            .expect("high context usage should trigger compaction");
-        match decision {
-            ThreadHistoryCompactionDecision::ContextWindowPressure {
-                tokens_used,
-                token_limit,
-                threshold_tokens,
-                resolved_model,
-                ..
-            } => {
-                assert_eq!(tokens_used, 245_000);
-                assert_eq!(token_limit, 272_000);
-                assert_eq!(threshold_tokens, 244_800);
-                assert_eq!(resolved_model.as_deref(), Some("gpt-5-codex"));
-            }
-            other => panic!("expected context pressure decision, got {other:?}"),
-        }
+        let decision = thread_history_compaction_decision(&history, Some(&high_usage), None, 0);
+        assert!(decision.is_none(), "历史本身低于保留目标时无需生成无效摘要");
     }
 
     #[test]
@@ -3941,7 +3927,7 @@ mod tests {
                 ..
             } => {
                 assert!(estimated_tokens >= threshold_tokens);
-                assert_eq!(threshold_tokens, 230_400);
+                assert_eq!(threshold_tokens, 217_600);
             }
             other => panic!("expected estimated prefill decision, got {other:?}"),
         }
@@ -3950,7 +3936,7 @@ mod tests {
     #[test]
     fn thread_history_compaction_counts_non_history_request_tokens() {
         let history = repeated_thread_history(40, 1_000);
-        assert!(thread_history_compaction_decision(&history, None, Some(20_000), 0).is_none());
+        assert!(thread_history_compaction_decision(&history, None, Some(20_000), 0).is_some());
         assert!(matches!(
             thread_history_compaction_decision(&history, None, Some(20_000), 12_000),
             Some(ThreadHistoryCompactionDecision::ContextWindowPressure { .. })
@@ -3969,7 +3955,7 @@ mod tests {
         else {
             panic!("small reported context should trigger pressure compaction");
         };
-        assert_eq!(target_history_tokens, 2_300);
+        assert_eq!(target_history_tokens, 220);
     }
 
     #[test]
@@ -4026,6 +4012,9 @@ mod tests {
             phase: "pre_turn",
             context_window_override: None,
             additional_token_estimate: 0,
+            persist_checkpoint: true,
+            model_identity: None,
+            force_compaction: false,
         });
         assert!(first.compaction.is_some());
         assert_eq!(
@@ -4051,6 +4040,9 @@ mod tests {
             phase: "pre_turn",
             context_window_override: None,
             additional_token_estimate: 0,
+            persist_checkpoint: true,
+            model_identity: None,
+            force_compaction: false,
         });
         assert!(second.compaction.is_none());
         assert_eq!(second.messages.len(), first.messages.len());
@@ -4089,6 +4081,9 @@ mod tests {
             phase: "runtime_budget_gate",
             context_window_override: Some(20_000),
             additional_token_estimate: 1_000,
+            persist_checkpoint: true,
+            model_identity: None,
+            force_compaction: false,
         });
         assert!(first.compaction.is_some());
         let first_source_count = session_store
@@ -4106,6 +4101,9 @@ mod tests {
             phase: "runtime_budget_gate",
             context_window_override: None,
             additional_token_estimate: 1_000,
+            persist_checkpoint: true,
+            model_identity: None,
+            force_compaction: false,
         });
 
         assert!(
@@ -4205,6 +4203,14 @@ mod tests {
                 original_token_estimate: 100,
                 checkpoint_token_estimate: 20,
                 created_at: UtcMillis(3),
+                generation: 1,
+                source_fingerprint: String::new(),
+                model_provider: None,
+                model: None,
+                binding_revision: None,
+                projected_request_tokens: 0,
+                context_window_limit_tokens: None,
+                preserved_tail_message_count: 0,
                 file_fact_versions: vec![magi_session_store::ThreadFileFactVersion {
                     path: path.display().to_string(),
                     content_hash,
@@ -4228,6 +4234,9 @@ mod tests {
             phase: "pre_turn",
             context_window_override: None,
             additional_token_estimate: 0,
+            persist_checkpoint: true,
+            model_identity: None,
+            force_compaction: false,
         });
 
         assert!(
@@ -5348,6 +5357,8 @@ mod tests {
         is_sidechain: bool,
         context_limit_error: &'static str,
         expected_recovery_window: u64,
+        configure_session_model: bool,
+        expected_compaction_calls: usize,
     ) {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(128);
@@ -5443,6 +5454,16 @@ mod tests {
         };
         let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
         let live_settings = Arc::new(SettingsStore::new());
+        if configure_session_model {
+            live_settings
+                .set_section(
+                    "orchestratorSessionDefaults",
+                    serde_json::json!({
+                        "model": "context-window-test-model"
+                    }),
+                )
+                .expect("orchestrator session defaults should save");
+        }
         live_settings
             .set_section(
                 "orchestrator",
@@ -5515,8 +5536,8 @@ mod tests {
         assert_eq!(client.main_calls.load(Ordering::SeqCst), 3);
         assert_eq!(
             client.compaction_calls.load(Ordering::SeqCst),
-            1,
-            "同一次上下文超限恢复只能执行一次有界语义压缩"
+            expected_compaction_calls,
+            "上下文压缩次数必须与主动阈值和超限恢复路径一致"
         );
         let requests = client
             .requests
@@ -5574,6 +5595,8 @@ mod tests {
             false,
             "maximum context length is 16000 tokens, however you requested 30000",
             16_000,
+            true,
+            2,
         );
     }
 
@@ -5583,6 +5606,8 @@ mod tests {
             true,
             "maximum context length is 16000 tokens, however you requested 30000",
             16_000,
+            true,
+            2,
         );
     }
 
@@ -5591,7 +5616,9 @@ mod tests {
         assert_task_loop_recovers_context_limit_after_tool(
             false,
             "context length exceeded for this request",
-            8_000,
+            243_000,
+            false,
+            1,
         );
     }
 

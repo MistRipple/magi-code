@@ -5,7 +5,6 @@
   import ThreadPanel from './components/ThreadPanel.svelte';
   import ToastContainer from './components/ToastContainer.svelte';
   import Icon from './components/Icon.svelte';
-  import { isDesktopRuntime } from './lib/desktop-updater';
   import {
     addToast,
     isPersistedSessionId,
@@ -26,6 +25,12 @@
     type AgentConnectionEventDetail,
   } from './web/agent-api';
 
+  interface Props {
+    desktopAppSurface?: boolean;
+  }
+
+  let { desktopAppSurface = false }: Props = $props();
+
   type TopTabType = 'thread' | 'edits' | 'knowledge';
 
   // 安全获取顶部 Tab（映射非顶部 Tab 到默认值）
@@ -42,11 +47,11 @@
     const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
     const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
     const sessionId = messagesState.currentSessionId?.trim() || '';
-    if (!workspaceId || !isPersistedSessionId(sessionId)) return;
+    if (!isPersistedSessionId(sessionId)) return;
 
     const request = ++browserAuthoritySyncRequest;
     try {
-      const snapshot = await getCurrentBrowserSession(workspaceId, sessionId);
+      const snapshot = await getCurrentBrowserSession(workspaceId, sessionId, workspacePath);
       if (
         request !== browserAuthoritySyncRequest
         || workspaceId !== (messagesState.currentWorkspaceId?.trim() || '')
@@ -70,11 +75,9 @@
   let EditsPanelComponent = $state<Component | null>(null);
   let KnowledgePanelComponent = $state<Component | null>(null);
   let SettingsPanelComponent = $state<Component<{ onClose: () => void }> | null>(null);
-  let DesktopRuntimeRecoveryComponent = $state<Component | null>(null);
   let editsPanelLoad: Promise<void> | null = null;
   let knowledgePanelLoad: Promise<void> | null = null;
   let settingsPanelLoad: Promise<void> | null = null;
-  let desktopRecoveryLoad: Promise<void> | null = null;
 
   function loadEditsPanel(): Promise<void> {
     if (EditsPanelComponent) return Promise.resolve();
@@ -112,26 +115,9 @@
     return settingsPanelLoad;
   }
 
-  function loadDesktopRuntimeRecovery(): Promise<void> {
-    if (DesktopRuntimeRecoveryComponent) return Promise.resolve();
-    desktopRecoveryLoad ??= import('./components/DesktopRuntimeRecovery.svelte')
-      .then((module) => {
-        DesktopRuntimeRecoveryComponent = module.default;
-      })
-      .finally(() => {
-        desktopRecoveryLoad = null;
-      });
-    return desktopRecoveryLoad;
-  }
-
   // 启动连接状态：启动数据尚未就绪时显示等待提示
   const isBootstrapping = $derived(!messagesState.bootstrapped);
   let bootstrapConnectionFailed = $state(false);
-  let runtimeRecoveryVisible = $state(false);
-  const desktopRuntime = isDesktopRuntime();
-  const showDesktopRecovery = $derived(
-    desktopRuntime && (bootstrapConnectionFailed || runtimeRecoveryVisible)
-  );
 
   function handleTabChange(tab: TopTabType) {
     setCurrentTopTab(tab);
@@ -150,32 +136,28 @@
     settingsOpen = false;
   }
 
+  function toggleDesktopRightPane(): void {
+    const desktop = window.magiDesktop;
+    if (!desktop) return;
+    void desktop.getSnapshot()
+      .then((snapshot) => desktop.submitLayoutIntent({
+        type: 'right_pane_visibility',
+        visible: !snapshot.layout.rightPaneVisible,
+      }))
+      .catch((error) => console.warn('[App] 切换桌面右栏失败:', error));
+  }
+
   onMount(() => {
-    let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
-    const clearRecoveryTimer = () => {
-      if (recoveryTimer !== null) {
-        clearTimeout(recoveryTimer);
-        recoveryTimer = null;
-      }
-    };
     const handleAgentConnection = (event: Event) => {
       const detail = (event as CustomEvent<AgentConnectionEventDetail>).detail;
       if (detail?.status === 'connected') {
-        clearRecoveryTimer();
         bootstrapConnectionFailed = false;
-        runtimeRecoveryVisible = false;
         void synchronizeCurrentBrowserAuthority();
         return;
       }
       if (!messagesState.bootstrapped) {
         bootstrapConnectionFailed = true;
         return;
-      }
-      if (desktopRuntime && recoveryTimer === null && !runtimeRecoveryVisible) {
-        recoveryTimer = setTimeout(() => {
-          recoveryTimer = null;
-          runtimeRecoveryVisible = true;
-        }, 3_000);
       }
     };
     const handleBrowserAuthorityChanged = (event: Event) => {
@@ -203,7 +185,6 @@
       handleBrowserAuthorityChanged as EventListener,
     );
     return () => {
-      clearRecoveryTimer();
       window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
       window.removeEventListener(
         BROWSER_AUTHORITY_CHANGED_EVENT,
@@ -230,14 +211,6 @@
         console.error('[App] 知识面板加载失败:', error);
         addToast('error', i18n.t('app.featureLoadFailed'));
         setCurrentTopTab('thread');
-      });
-    }
-  });
-
-  $effect(() => {
-    if (showDesktopRecovery) {
-      void loadDesktopRuntimeRecovery().catch((error) => {
-        console.error('[App] 桌面恢复面板加载失败:', error);
       });
     }
   });
@@ -288,6 +261,7 @@
       inFlight = true;
       try {
         await refreshPendingChangesProjection({
+          scope: 'workspace',
           sessionId,
           workspaceId,
           workspacePath,
@@ -341,30 +315,29 @@
 
 <div class="app-container">
   <!-- 顶部标题栏 + 导航栏 -->
-  <Header onOpenSettings={openSettings}>
+  <Header
+    onOpenSettings={openSettings}
+    onToggleRightPane={desktopAppSurface ? toggleDesktopRightPane : undefined}
+  >
     <TopTabs activeTopTab={currentTopTab} onTabChange={handleTabChange} />
   </Header>
 
   <!-- Tab 内容区域：常驻 ThreadPanel + 按需挂载的其他 top-tab -->
   <div class="tab-content-wrapper">
-    {#if isBootstrapping || runtimeRecoveryVisible}
+    {#if isBootstrapping}
       <!-- 启动连接等待层：启动数据尚未就绪 -->
       <div class="bootstrap-overlay">
-        {#if showDesktopRecovery && DesktopRuntimeRecoveryComponent}
-          <DesktopRuntimeRecoveryComponent />
-        {:else}
-          <div class="bootstrap-content" class:error={bootstrapConnectionFailed}>
-            <div class="bootstrap-spinner" class:static={bootstrapConnectionFailed}>
-              <Icon name={bootstrapConnectionFailed ? 'warning' : 'loader'} size={32} />
-            </div>
-            <p class="bootstrap-title">
-              {bootstrapConnectionFailed ? i18n.t('app.bootstrapConnectionFailed') : i18n.t('app.bootstrapConnecting')}
-            </p>
-            <p class="bootstrap-hint">
-              {bootstrapConnectionFailed ? i18n.t('app.bootstrapConnectionHint') : i18n.t('app.bootstrapConnectingHint')}
-            </p>
+        <div class="bootstrap-content" class:error={bootstrapConnectionFailed}>
+          <div class="bootstrap-spinner" class:static={bootstrapConnectionFailed}>
+            <Icon name={bootstrapConnectionFailed ? 'warning' : 'loader'} size={32} />
           </div>
-        {/if}
+          <p class="bootstrap-title">
+            {bootstrapConnectionFailed ? i18n.t('app.bootstrapConnectionFailed') : i18n.t('app.bootstrapConnecting')}
+          </p>
+          <p class="bootstrap-hint">
+            {bootstrapConnectionFailed ? i18n.t('app.bootstrapConnectionHint') : i18n.t('app.bootstrapConnectingHint')}
+          </p>
+        </div>
       </div>
     {/if}
     <div class="top-tab-pane" class:active={currentTopTab === 'thread'}>

@@ -19,21 +19,17 @@ use magi_session_store::{
 };
 use magi_settings_store::SettingsStore;
 use magi_usage_authority::{
-    AUTO_COMPACT_PERCENT, DEFAULT_CONTEXT_WINDOW, UsageCallStatus, UsagePhase,
-    resolve_context_window,
+    ContextBudgetPolicy, DEFAULT_CONTEXT_WINDOW, ModelIdentitySnapshot, UsageCallStatus,
+    UsagePhase, resolve_context_window,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::{Arc, Mutex},
 };
 
-const THREAD_HISTORY_COMPACT_TARGET_TOKENS: usize = 8_000;
-const THREAD_HISTORY_ESTIMATED_PREFILL_COMPACT_PERCENT: i64 = 90;
-const THREAD_HISTORY_RECOVERY_TARGET_PERCENT: u64 = 70;
 const THREAD_HISTORY_RECENT_MESSAGE_TARGET: usize = 12;
-const COMPACTION_INPUT_WINDOW_PERCENT: u64 = 60;
-const COMPACTION_MAX_SOURCE_TOKENS: usize = 32_000;
 const COMPACTION_PROMPT_RESERVE_TOKENS: usize = 768;
 
 #[derive(Clone, Debug)]
@@ -124,6 +120,12 @@ pub(crate) struct ContextPrepareRequest {
     pub phase: &'static str,
     pub context_window_override: Option<u64>,
     pub additional_token_estimate: usize,
+    /// 识图模型只在当前回合使用压缩后的临时视图，不能把检查点或压缩事实写回主线。
+    pub persist_checkpoint: bool,
+    /// 检查点绑定的实际模型身份；缺少时只允许从最近 provider 观测中恢复。
+    pub model_identity: Option<ModelIdentitySnapshot>,
+    /// provider 已明确返回上下文超限时，强制执行一次压缩，不再依赖主动阈值。
+    pub force_compaction: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -177,6 +179,13 @@ impl ThreadHistoryCompactionDecision {
             Self::EstimatedPrefill { .. } => DEFAULT_CONTEXT_WINDOW.max(0) as u64,
         }
     }
+
+    fn resolved_model(&self) -> Option<&str> {
+        match self {
+            Self::ContextWindowPressure { resolved_model, .. } => resolved_model.as_deref(),
+            Self::EstimatedPrefill { .. } => None,
+        }
+    }
 }
 
 impl<'a> ContextAuthority<'a> {
@@ -214,7 +223,9 @@ impl<'a> ContextAuthority<'a> {
     }
 
     pub(crate) fn prepare(&self, request: ContextPrepareRequest) -> PreparedThreadHistory {
-        if let Some(context_window) = request.context_window_override {
+        if request.persist_checkpoint
+            && let Some(context_window) = request.context_window_override
+        {
             self.session_store.record_thread_context_window_tokens(
                 self.thread_id,
                 context_window,
@@ -228,28 +239,61 @@ impl<'a> ContextAuthority<'a> {
         let mut transcript = self.session_store.thread_message_history(self.thread_id);
         if transcript.is_empty() && !request.fallback_history.is_empty() {
             transcript = request.fallback_history;
-            self.session_store.replace_thread_messages(
-                self.thread_id,
-                transcript.clone(),
-                UtcMillis::now(),
-            );
+            if request.persist_checkpoint {
+                self.session_store.replace_thread_messages(
+                    self.thread_id,
+                    transcript.clone(),
+                    UtcMillis::now(),
+                );
+            }
         }
-        if let Some(checkpoint) = self.session_store.thread_context_checkpoint(self.thread_id)
-            && !checkpoint_file_facts_are_current(&checkpoint)
+        let mut previous_checkpoint = self.session_store.thread_context_checkpoint(self.thread_id);
+        if request.persist_checkpoint
+            && let Some(checkpoint) = previous_checkpoint.as_ref()
         {
+            if !checkpoint_file_facts_are_current(&checkpoint) {
+                self.session_store
+                    .clear_thread_context_checkpoint(self.thread_id);
+                tracing::info!(
+                    thread_id = %self.thread_id,
+                    session_id = %self.session_id,
+                    checkpoint_id = checkpoint.checkpoint_id,
+                    "上下文检查点因文件事实版本变化失效，将从原始 transcript 重建"
+                );
+                previous_checkpoint = None;
+            }
+        }
+        let raw_transcript = self.session_store.thread_message_history(self.thread_id);
+        let mut history = self.session_store.thread_context_history(self.thread_id);
+        if history.is_empty() && !transcript.is_empty() {
+            history = transcript;
+        }
+        validate_workspace_file_facts(&mut history);
+        bound_model_visible_tool_results(&mut history);
+        let stale_checkpoint_id = request
+            .persist_checkpoint
+            .then(|| previous_checkpoint.as_ref())
+            .flatten()
+            .and_then(|checkpoint| {
+                let source_changed = !checkpoint.source_fingerprint.is_empty()
+                    && checkpoint.source_message_count > 0
+                    && checkpoint.source_message_count <= raw_transcript.len()
+                    && thread_history_fingerprint(
+                        &raw_transcript[..checkpoint.source_message_count],
+                    ) != checkpoint.source_fingerprint;
+                source_changed.then(|| checkpoint.checkpoint_id.clone())
+            });
+        if let Some(checkpoint_id) = stale_checkpoint_id {
             self.session_store
                 .clear_thread_context_checkpoint(self.thread_id);
+            previous_checkpoint = None;
             tracing::info!(
                 thread_id = %self.thread_id,
                 session_id = %self.session_id,
-                checkpoint_id = checkpoint.checkpoint_id,
-                "上下文检查点因文件事实版本变化失效，将从原始 transcript 重建"
+                checkpoint_id,
+                "上下文检查点因源 transcript 指纹变化失效，将从原始 transcript 重建"
             );
         }
-        let previous_checkpoint = self.session_store.thread_context_checkpoint(self.thread_id);
-        let mut history = self.session_store.thread_context_history(self.thread_id);
-        validate_workspace_file_facts(&mut history);
-        bound_model_visible_tool_results(&mut history);
         let original_count = history.len();
         let original_tokens = estimate_thread_history_tokens(&history);
         let usage_observation = latest_session_usage_observation(self.event_bus, self.session_id)
@@ -259,13 +303,47 @@ impl<'a> ContextAuthority<'a> {
                         .observed_at
                         .is_none_or(|observed_at| observed_at.0 > checkpoint.created_at.0)
                 })
+            })
+            .filter(|observation| {
+                // 模型切换或上下文窗口配置变化会使旧 provider 锚点失效；
+                // 不能把旧模型的分子套进当前模型的压缩预算。
+                effective_context_window.is_none_or(|window| {
+                    observation
+                        .context_window_limit_tokens
+                        .is_none_or(|observed_window| observed_window == window)
+                })
             });
-        let Some(decision) = thread_history_compaction_decision(
+        let decision = thread_history_compaction_decision(
             &history,
             usage_observation.as_ref(),
             effective_context_window,
             request.additional_token_estimate,
-        ) else {
+        )
+        .or_else(|| {
+            request.force_compaction.then(|| {
+                let context_window =
+                    effective_context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW.max(1) as u64);
+                let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
+                let current_history_tokens = estimate_thread_history_tokens(&history);
+                ThreadHistoryCompactionDecision::ContextWindowPressure {
+                    tokens_used: current_history_tokens
+                        .saturating_add(request.additional_token_estimate)
+                        .max(policy.proactive_threshold_tokens as usize)
+                        as u64,
+                    token_limit: context_window,
+                    threshold_tokens: policy.proactive_threshold_tokens,
+                    target_history_tokens: target_history_tokens_for_window(
+                        context_window,
+                        request.additional_token_estimate,
+                    )
+                    .min(current_history_tokens.saturating_div(2).max(1)),
+                    resolved_model: usage_observation
+                        .as_ref()
+                        .and_then(|observation| observation.resolved_model.clone()),
+                }
+            })
+        });
+        let Some(decision) = decision else {
             tracing::debug!(
                 thread_id = %self.thread_id,
                 session_id = %self.session_id,
@@ -338,9 +416,25 @@ impl<'a> ContextAuthority<'a> {
         } else {
             previous_source_count.saturating_add(split.saturating_sub(1))
         };
-        self.session_store.install_thread_context_checkpoint(
-            self.thread_id,
-            ThreadContextCheckpoint {
+        let source_message_count = source_message_count.min(raw_transcript.len());
+        if request.persist_checkpoint {
+            let model_identity = request.model_identity.clone().or_else(|| {
+                usage_observation.as_ref().and_then(|observation| {
+                    Some(ModelIdentitySnapshot::new(
+                        observation
+                            .model_provider
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        observation
+                            .resolved_model
+                            .clone()
+                            .or_else(|| decision.resolved_model().map(str::to_string))
+                            .unwrap_or_default(),
+                        observation.binding_revision.unwrap_or_default(),
+                    ))
+                })
+            });
+            let checkpoint = ThreadContextCheckpoint {
                 thread_id: self.thread_id.clone(),
                 checkpoint_id: format!("context-checkpoint-{}", compacted_at.0),
                 source_message_count,
@@ -349,34 +443,74 @@ impl<'a> ContextAuthority<'a> {
                 original_token_estimate: original_tokens,
                 checkpoint_token_estimate: compacted_tokens,
                 created_at: compacted_at,
+                generation: previous_checkpoint
+                    .as_ref()
+                    .map(|checkpoint| checkpoint.generation.saturating_add(1))
+                    .unwrap_or(1),
+                source_fingerprint: thread_history_fingerprint(
+                    &raw_transcript[..source_message_count],
+                ),
+                model_provider: model_identity
+                    .as_ref()
+                    .map(|identity| identity.provider.clone()),
+                model: model_identity
+                    .as_ref()
+                    .map(|identity| identity.model.clone()),
+                binding_revision: model_identity
+                    .as_ref()
+                    .map(|identity| identity.binding_revision),
+                projected_request_tokens: request_tokens as u64,
+                context_window_limit_tokens: Some(decision.context_window_tokens()),
+                preserved_tail_message_count: compacted.len().saturating_sub(1),
                 file_fact_versions: collect_file_fact_versions(
                     &history[..split],
                     previous_checkpoint.as_ref(),
                 ),
-            },
-            compacted_at,
-        );
-        self.publish_compaction(
-            request.phase,
-            &decision,
-            original_count,
-            compacted_count,
-            original_tokens,
-            compacted_tokens,
-            request_tokens,
-            compacted_at,
-        );
+            };
+            let installed = self
+                .session_store
+                .install_thread_context_checkpoint_if_current(
+                    self.thread_id,
+                    checkpoint,
+                    raw_transcript.len(),
+                    previous_checkpoint
+                        .as_ref()
+                        .map(|checkpoint| checkpoint.generation)
+                        .unwrap_or_default(),
+                    compacted_at,
+                );
+            if !installed {
+                self.notify_compaction(ContextCompactionProgress::Failed);
+                return PreparedThreadHistory {
+                    messages: history,
+                    compaction: None,
+                    terminal: Some(ContextCompactionTerminal::Failed),
+                };
+            }
+            self.publish_compaction(
+                request.phase,
+                &decision,
+                original_count,
+                compacted_count,
+                original_tokens,
+                compacted_tokens,
+                request_tokens,
+                compacted_at,
+            );
+        }
 
         PreparedThreadHistory {
             messages: compacted,
-            compaction: Some(ContextCompactionRecord {
-                reason: decision.reason_label(),
-                original_message_count: original_count,
-                compacted_message_count: compacted_count,
-                original_token_estimate: original_tokens,
-                compacted_token_estimate: compacted_tokens,
-                compacted_at,
-            }),
+            compaction: request
+                .persist_checkpoint
+                .then_some(ContextCompactionRecord {
+                    reason: decision.reason_label(),
+                    original_message_count: original_count,
+                    compacted_message_count: compacted_count,
+                    original_token_estimate: original_tokens,
+                    compacted_token_estimate: compacted_tokens,
+                    compacted_at,
+                }),
             terminal: None,
         }
     }
@@ -399,9 +533,12 @@ impl<'a> ContextAuthority<'a> {
         }
         let summary_target_tokens = target_history_tokens.div_ceil(3).clamp(256, 2_000);
         let tail_target_tokens = target_history_tokens.saturating_sub(summary_target_tokens);
-        let Some(split) = choose_thread_history_compaction_split(history, tail_target_tokens)
+        let source_budget =
+            compaction_source_budget(decision.context_window_tokens(), summary_target_tokens);
+        let Some(split) =
+            choose_thread_history_compaction_split(history, tail_target_tokens, source_budget)
         else {
-            return Ok(None);
+            return Err("无法在摘要模型输入预算内选择连续且工具配对完整的历史范围".to_string());
         };
         let summary = self.build_compaction_message(
             &history[..split],
@@ -436,28 +573,22 @@ impl<'a> ContextAuthority<'a> {
             .as_ref()
             .map(|client| client as &dyn ModelBridgeClient)
             .unwrap_or(self.client);
-        let source_budget =
-            (context_window_tokens.saturating_mul(COMPACTION_INPUT_WINDOW_PERCENT) / 100) as usize;
-        let source_budget = source_budget
-            .saturating_sub(COMPACTION_PROMPT_RESERVE_TOKENS)
-            .clamp(256, COMPACTION_MAX_SOURCE_TOKENS);
-        let serialized_messages = compacted_prefix
-            .iter()
-            .enumerate()
-            .map(|(index, message)| {
-                serde_json::to_string(message)
-                    .map(|serialized| format!("message_index={index}\n{serialized}"))
-                    .map_err(|error| format!("序列化待压缩上下文失败：{error}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let bounded_source = bounded_compaction_source(serialized_messages, source_budget);
+        let source_budget = compaction_source_budget(context_window_tokens, summary_target_tokens);
+        let source = serialize_compaction_source(compacted_prefix)?;
+        if estimate_text_tokens(&source) > source_budget {
+            return Err(format!(
+                "连续压缩范围超过摘要模型输入预算：{} > {} token",
+                estimate_text_tokens(&source),
+                source_budget
+            ));
+        }
         self.notify_compaction(ContextCompactionProgress::Started {
             stage: "history_summary",
             total_chunks: 1,
         });
         let summary = self.invoke_compaction_summary(
             compaction_client,
-            &bounded_source,
+            &source,
             "history_summary",
             0,
             1,
@@ -468,7 +599,7 @@ impl<'a> ContextAuthority<'a> {
             completed_chunks: 1,
             total_chunks: 1,
         });
-        let summary = truncate_text_to_token_budget(&summary, summary_target_tokens);
+        let summary = validate_compaction_summary(&summary, summary_target_tokens)?;
         let content = render_prompt_fragment(
             PromptFragmentKind::ThreadHistoryBoundary,
             format!(
@@ -624,6 +755,39 @@ impl<'a> ContextAuthority<'a> {
             "compacted_at": compacted_at.0,
             "thread_scope": thread_scope,
         });
+        let context_window_tokens = decision.context_window_tokens();
+        let policy = ContextBudgetPolicy::for_window(context_window_tokens, None, 0);
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "projected_request_tokens".to_string(),
+                (request_tokens as u64).into(),
+            );
+            object.insert(
+                "context_window_limit_tokens".to_string(),
+                context_window_tokens.into(),
+            );
+            object.insert(
+                "response_reserve_tokens".to_string(),
+                policy.response_reserve_tokens.into(),
+            );
+            object.insert(
+                "recovery_buffer_tokens".to_string(),
+                policy.recovery_buffer_tokens.into(),
+            );
+            object.insert(
+                "proactive_threshold_tokens".to_string(),
+                policy.proactive_threshold_tokens.into(),
+            );
+            object.insert(
+                "hard_request_limit_tokens".to_string(),
+                policy.hard_request_limit_tokens.into(),
+            );
+            object.insert(
+                "pressure_level".to_string(),
+                policy.level_for(request_tokens as u64).as_str().into(),
+            );
+            object.insert("measurement".to_string(), "compacted".into());
+        }
         match decision {
             ThreadHistoryCompactionDecision::ContextWindowPressure {
                 tokens_used,
@@ -633,7 +797,10 @@ impl<'a> ContextAuthority<'a> {
                 resolved_model,
             } => {
                 if let Some(object) = payload.as_object_mut() {
-                    object.insert("context_window_tokens".to_string(), (*tokens_used).into());
+                    object.insert(
+                        "pre_compaction_projected_request_tokens".to_string(),
+                        (*tokens_used).into(),
+                    );
                     object.insert("token_limit".to_string(), (*token_limit).into());
                     object.insert("threshold_tokens".to_string(), (*threshold_tokens).into());
                     object.insert(
@@ -719,78 +886,64 @@ impl<'a> ContextAuthority<'a> {
     }
 }
 
-fn bounded_compaction_source(sources: Vec<String>, token_budget: usize) -> String {
-    let source = sources.join("\n\n");
-    truncate_text_to_token_budget(&source, token_budget)
+fn compaction_source_budget(context_window_tokens: u64, summary_target_tokens: usize) -> usize {
+    // 摘要调用使用独立的输入预算：主模型窗口的 response reserve 不能把小窗口
+    // 恶化成 0 token 输入，否则 provider 超限恢复无法产生任何候选摘要。
+    context_window_tokens
+        .saturating_mul(60)
+        .saturating_div(100)
+        .saturating_sub(summary_target_tokens as u64)
+        .saturating_sub(COMPACTION_PROMPT_RESERVE_TOKENS as u64)
+        .max(256) as usize
 }
 
-fn truncate_text_to_token_budget(value: &str, token_budget: usize) -> String {
-    if token_budget == 0 || value.is_empty() {
-        return String::new();
-    }
-    let original_tokens = estimate_text_tokens(value);
-    if original_tokens <= token_budget {
-        return value.to_string();
-    }
-
-    let marker = format!(
-        "\n\n[context_compaction_omitted: 中间历史已按预算省略；原始估算 {original_tokens} token]\n\n"
-    );
-    let marker_tokens = estimate_text_tokens(&marker);
-    if marker_tokens >= token_budget {
-        return prefix_with_token_budget(value, token_budget);
-    }
-
-    let available = token_budget - marker_tokens;
-    let head_budget = available / 3;
-    let tail_budget = available - head_budget;
-    let chars = value.chars().collect::<Vec<_>>();
-    let head_count = prefix_char_count_with_token_budget(&chars, head_budget);
-    let max_tail_count = chars.len().saturating_sub(head_count);
-    let tail_count = suffix_char_count_with_token_budget(&chars, tail_budget).min(max_tail_count);
-    let head = chars[..head_count].iter().collect::<String>();
-    let tail = chars[chars.len().saturating_sub(tail_count)..]
+fn serialize_compaction_source(history: &[ThreadChatMessage]) -> Result<String, String> {
+    history
         .iter()
-        .collect::<String>();
-    let bounded = format!("{head}{marker}{tail}");
-    if estimate_text_tokens(&bounded) <= token_budget {
-        bounded
-    } else {
-        prefix_with_token_budget(&bounded, token_budget)
+        .enumerate()
+        .map(|(index, message)| {
+            serde_json::to_string(message)
+                .map(|serialized| format!("message_index={index}\n{serialized}"))
+                .map_err(|error| format!("序列化待压缩上下文失败：{error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|sources| sources.join("\n\n"))
+}
+
+fn compaction_source_token_prefix(history: &[ThreadChatMessage]) -> Result<Vec<usize>, String> {
+    let mut prefix = vec![0usize; history.len() + 1];
+    for (index, message) in history.iter().enumerate() {
+        let serialized = serde_json::to_string(message)
+            .map_err(|error| format!("序列化待压缩上下文失败：{error}"))?;
+        let source = format!("message_index={index}\n{serialized}");
+        prefix[index + 1] = prefix[index]
+            .saturating_add(estimate_text_tokens(&source))
+            .saturating_add(usize::from(index > 0) * 2);
     }
+    Ok(prefix)
 }
 
-fn prefix_with_token_budget(value: &str, token_budget: usize) -> String {
-    let chars = value.chars().collect::<Vec<_>>();
-    let count = prefix_char_count_with_token_budget(&chars, token_budget);
-    chars[..count].iter().collect()
-}
-
-fn prefix_char_count_with_token_budget(chars: &[char], token_budget: usize) -> usize {
-    char_count_with_token_budget(chars, token_budget, false)
-}
-
-fn suffix_char_count_with_token_budget(chars: &[char], token_budget: usize) -> usize {
-    char_count_with_token_budget(chars, token_budget, true)
-}
-
-fn char_count_with_token_budget(chars: &[char], token_budget: usize, from_end: bool) -> usize {
-    let mut low = 0usize;
-    let mut high = chars.len();
-    while low < high {
-        let mid = low + (high - low).div_ceil(2);
-        let candidate = if from_end {
-            chars[chars.len() - mid..].iter().collect::<String>()
-        } else {
-            chars[..mid].iter().collect::<String>()
-        };
-        if estimate_text_tokens(&candidate) <= token_budget {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
+fn validate_compaction_summary(value: &str, token_budget: usize) -> Result<String, String> {
+    let summary = value.trim();
+    if summary.is_empty() {
+        return Err("上下文压缩模型未返回摘要".to_string());
     }
-    low
+    let required_sections = ["目标", "约束", "已完成", "关键事实", "未完成", "下一步"];
+    let section_count = required_sections
+        .iter()
+        .filter(|section| summary.contains(**section))
+        .count();
+    if section_count < 2 {
+        return Err("上下文压缩摘要缺少目标、事实或后续工作结构".to_string());
+    }
+    if estimate_text_tokens(summary) > token_budget {
+        return Err(format!(
+            "上下文压缩摘要超过输出预算：{} > {} token",
+            estimate_text_tokens(summary),
+            token_budget
+        ));
+    }
+    Ok(summary.to_string())
 }
 
 fn estimate_thread_message_tokens(message: &ThreadChatMessage) -> usize {
@@ -1046,6 +1199,12 @@ fn latest_session_usage_observation(
     latest_usage_observations_from_ledger(&snapshot.usage_entries).remove(&session_id.to_string())
 }
 
+fn thread_history_fingerprint(history: &[ThreadChatMessage]) -> String {
+    let serialized = serde_json::to_vec(history).unwrap_or_default();
+    let digest = Sha256::digest(serialized);
+    format!("{digest:x}")
+}
+
 pub(crate) fn thread_history_compaction_decision(
     history: &[ThreadChatMessage],
     usage_observation: Option<&SessionRuntimeUsageObservation>,
@@ -1055,11 +1214,18 @@ pub(crate) fn thread_history_compaction_decision(
     let history_tokens = estimate_thread_history_tokens(history);
     let estimated_tokens = history_tokens.saturating_add(additional_token_estimate);
     if let Some(context_window) = context_window_override {
-        let threshold_tokens = context_window.saturating_mul(AUTO_COMPACT_PERCENT as u64) / 100;
+        let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
+        let threshold_tokens = policy.proactive_threshold_tokens;
         let target_history_tokens =
             target_history_tokens_for_window(context_window, additional_token_estimate);
         let pressure_tokens = usage_observation
-            .map(|observation| observation.context_window_tokens)
+            .map(|observation| {
+                if observation.projected_request_tokens > 0 {
+                    observation.projected_request_tokens
+                } else {
+                    observation.context_window_tokens
+                }
+            })
             .unwrap_or_default()
             .max(estimated_tokens as u64);
         if pressure_tokens >= threshold_tokens.max(1) && history_tokens > target_history_tokens {
@@ -1075,20 +1241,25 @@ pub(crate) fn thread_history_compaction_decision(
         return None;
     }
     if let Some(observation) = usage_observation {
-        let context_window =
-            resolve_context_window(observation.resolved_model.as_deref().unwrap_or(""));
-        let threshold_tokens =
-            (context_window.saturating_mul(AUTO_COMPACT_PERCENT) / 100).max(1) as u64;
+        let context_window = observation.context_window_limit_tokens.unwrap_or_else(|| {
+            resolve_context_window(observation.resolved_model.as_deref().unwrap_or("")).max(1)
+                as u64
+        });
+        let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
+        let threshold_tokens = policy.proactive_threshold_tokens;
         let target_history_tokens = target_history_tokens_for_window(
             context_window.max(0) as u64,
             additional_token_estimate,
         );
-        if observation.context_window_tokens >= threshold_tokens
-            && history_tokens > target_history_tokens
-        {
+        let observed_tokens = if observation.projected_request_tokens > 0 {
+            observation.projected_request_tokens
+        } else {
+            observation.context_window_tokens
+        };
+        if observed_tokens >= threshold_tokens && history_tokens > target_history_tokens {
             return Some(ThreadHistoryCompactionDecision::ContextWindowPressure {
-                tokens_used: observation.context_window_tokens,
-                token_limit: context_window.max(0) as u64,
+                tokens_used: observed_tokens,
+                token_limit: context_window,
                 threshold_tokens,
                 target_history_tokens,
                 resolved_model: observation.resolved_model.clone(),
@@ -1103,27 +1274,30 @@ pub(crate) fn thread_history_compaction_decision(
         }
         return None;
     }
-    let threshold_tokens = (DEFAULT_CONTEXT_WINDOW
-        .saturating_mul(THREAD_HISTORY_ESTIMATED_PREFILL_COMPACT_PERCENT)
-        / 100)
-        .max(1) as usize;
-    (estimated_tokens >= threshold_tokens && history_tokens > THREAD_HISTORY_COMPACT_TARGET_TOKENS)
-        .then_some(ThreadHistoryCompactionDecision::EstimatedPrefill {
-            estimated_tokens,
-            threshold_tokens,
-            target_history_tokens: THREAD_HISTORY_COMPACT_TARGET_TOKENS,
-        })
+    let context_window = DEFAULT_CONTEXT_WINDOW.max(1) as u64;
+    let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
+    let threshold_tokens = policy.proactive_threshold_tokens as usize;
+    (estimated_tokens >= threshold_tokens
+        && history_tokens
+            > target_history_tokens_for_window(context_window, additional_token_estimate))
+    .then_some(ThreadHistoryCompactionDecision::EstimatedPrefill {
+        estimated_tokens,
+        threshold_tokens,
+        target_history_tokens: target_history_tokens_for_window(
+            context_window,
+            additional_token_estimate,
+        ),
+    })
 }
 
 fn target_history_tokens_for_window(
     context_window: u64,
     additional_token_estimate: usize,
 ) -> usize {
-    let request_target =
-        context_window.saturating_mul(THREAD_HISTORY_RECOVERY_TARGET_PERCENT) / 100;
-    (request_target as usize)
+    let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
+    (policy.retained_history_target_tokens as usize)
         .saturating_sub(additional_token_estimate)
-        .clamp(1, THREAD_HISTORY_COMPACT_TARGET_TOKENS)
+        .max(1)
 }
 
 fn thread_history_tail_is_tool_balanced(tail: &[ThreadChatMessage]) -> bool {
@@ -1151,23 +1325,41 @@ fn thread_history_tail_is_tool_balanced(tail: &[ThreadChatMessage]) -> bool {
 fn choose_thread_history_compaction_split(
     history: &[ThreadChatMessage],
     target_history_tokens: usize,
+    source_budget: usize,
 ) -> Option<usize> {
     if history.len() <= 1 {
         return None;
     }
     let target_tail = THREAD_HISTORY_RECENT_MESSAGE_TARGET.min(history.len().saturating_sub(1));
     let initial_split = history.len().saturating_sub(target_tail).max(1);
-    let candidates = initial_split..history.len();
-    candidates
-        .clone()
-        .find(|split| {
-            thread_history_tail_is_tool_balanced(&history[*split..])
-                && estimate_thread_history_tokens(&history[*split..]) <= target_history_tokens
+    let source_token_prefix = compaction_source_token_prefix(history).ok()?;
+    let mut history_token_prefix = vec![0usize; history.len() + 1];
+    for (index, message) in history.iter().enumerate() {
+        history_token_prefix[index + 1] =
+            history_token_prefix[index].saturating_add(estimate_thread_message_tokens(message));
+    }
+    let total_history_tokens = *history_token_prefix.last().unwrap_or(&0);
+    let fits_source_budget = |split: &usize| source_token_prefix[*split] <= source_budget;
+    let keeps_target_tail = |split: &usize| {
+        thread_history_tail_is_tool_balanced(&history[*split..])
+            && total_history_tokens.saturating_sub(history_token_prefix[*split])
+                <= target_history_tokens
+    };
+    (initial_split..history.len())
+        .find(|split| keeps_target_tail(split) && fits_source_budget(split))
+        .or_else(|| {
+            // 摘要模型预算不足时缩小连续前缀，而不是跳过中间历史或头尾拼接。
+            (1..initial_split)
+                .rev()
+                .find(|split| keeps_target_tail(split) && fits_source_budget(split))
         })
         .or_else(|| {
-            candidates
-                .rev()
-                .find(|split| thread_history_tail_is_tool_balanced(&history[*split..]))
+            // 单次消息很大时仍选择最大的完整、工具配对安全前缀；尾部目标可
+            // 暂时偏大，下一轮继续压缩，但绝不发送被静默截断的摘要输入。
+            (1..history.len()).rev().find(|split| {
+                thread_history_tail_is_tool_balanced(&history[*split..])
+                    && fits_source_budget(split)
+            })
         })
 }
 
@@ -1175,31 +1367,35 @@ fn choose_thread_history_compaction_split(
 mod tests {
     use super::{
         ContextCompactionProgress, ContextCompactionProgressGate, bound_model_visible_tool_results,
-        bounded_compaction_source, estimate_text_tokens, truncate_text_to_token_budget,
+        serialize_compaction_source, validate_compaction_summary,
     };
     use magi_session_store::ThreadChatMessage;
 
     #[test]
-    fn bounded_compaction_source_preserves_early_and_recent_history_within_budget() {
+    fn compaction_source_never_silently_drops_history() {
         let sources = (0..80)
-            .map(|index| format!("message_index={index}\n{}", "x".repeat(1_000)))
+            .map(|index| ThreadChatMessage {
+                role: "user".to_string(),
+                content: Some(format!("message_index={index}\n{}", "x".repeat(1_000))),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                provider_context: Vec::new(),
+            })
             .collect::<Vec<_>>();
-        let bounded = bounded_compaction_source(sources, 2_000);
+        let serialized = serialize_compaction_source(&sources).expect("source should serialize");
 
-        assert!(estimate_text_tokens(&bounded) <= 2_000);
-        assert!(bounded.contains("message_index=0"));
-        assert!(bounded.contains("message_index=79"));
-        assert!(bounded.contains("context_compaction_omitted"));
+        assert!(serialized.contains("message_index=0"));
+        assert!(serialized.contains("message_index=79"));
+        assert!(!serialized.contains("context_compaction_boundary"));
     }
 
     #[test]
-    fn compaction_summary_is_locally_bounded_without_recursive_model_calls() {
-        let summary = format!("开头事实{}结尾事实", "内容".repeat(20_000));
-        let bounded = truncate_text_to_token_budget(&summary, 800);
-
-        assert!(estimate_text_tokens(&bounded) <= 800);
-        assert!(bounded.contains("开头事实"));
-        assert!(bounded.contains("结尾事实"));
+    fn compaction_summary_quality_gate_rejects_lossy_output() {
+        let summary = "## 已完成\n- 已完成读取\n## 未完成与下一步\n- 继续验证";
+        assert!(validate_compaction_summary(summary, 800).is_ok());
+        assert!(validate_compaction_summary("只返回了提示词复述", 800).is_err());
+        assert!(validate_compaction_summary(&"内容".repeat(10_000), 800).is_err());
     }
 
     #[test]

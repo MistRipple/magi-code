@@ -7,6 +7,7 @@
     acceptCurrentGitContext,
     clearGitContextError,
     createGitContextBranch,
+    clearGitContext,
     gitContextBindingKey,
     gitContextState,
     refreshGitContext,
@@ -27,15 +28,16 @@
   let createMode = $state(false);
   let newBranch = $state('');
 
-  const binding = $derived.by<GitContextBinding>(() => {
-    if (!workspace) return {};
+  const binding = $derived.by<GitContextBinding | null>(() => {
+    if (!workspace) return null;
     return {
+      scope: 'workspace',
       workspaceId: workspace.workspaceId,
       workspacePath: workspace.rootPathRef?.trim() || workspace.rootPath.trim(),
       sessionId: sessionId.trim() || undefined,
     };
   });
-  const bindingKey = $derived(gitContextBindingKey(binding));
+  const bindingKey = $derived(binding ? gitContextBindingKey(binding) : '');
   const stateMatches = $derived(Boolean(bindingKey) && gitContextState.bindingKey === bindingKey);
   const visible = $derived(stateMatches && gitContextState.loaded && gitContextState.isRepo);
   const busy = $derived(gitContextState.operation !== null);
@@ -66,6 +68,7 @@
   }
 
   async function toggle(): Promise<void> {
+    if (!binding) return;
     open = !open;
     if (!open) return;
     clearGitContextError();
@@ -77,6 +80,7 @@
   }
 
   async function selectBranch(branch: string): Promise<void> {
+    if (!binding) return;
     if (interactionDisabled || gitContextState.contextDrift) return;
     if (branch === gitContextState.currentBranch) {
       open = false;
@@ -97,6 +101,7 @@
   }
 
   async function createBranch(): Promise<void> {
+    if (!binding) return;
     const branch = newBranch.trim();
     if (!branch || interactionDisabled || gitContextState.contextDrift) return;
     try {
@@ -116,6 +121,7 @@
   }
 
   async function acceptContext(): Promise<void> {
+    if (!binding) return;
     if (interactionDisabled) return;
     try {
       const result = await acceptCurrentGitContext(binding);
@@ -137,8 +143,8 @@
 
   $effect(() => {
     const key = bindingKey;
-    if (!key) {
-      void refreshGitContext({});
+    if (!key || !binding) {
+      clearGitContext();
       return;
     }
     open = false;
@@ -157,6 +163,7 @@
       }
     };
     const handleWorkspaceChanged = () => {
+      if (!binding) return;
       void refreshGitContext(binding, { force: true }).catch((error) => {
         console.warn('[GitContextControl] 工作区变更后刷新 Git 上下文失败:', error);
       });
@@ -206,7 +213,10 @@
         {#if gitContextState.error}
           <div class="git-context-error">
             <span>{gitContextState.error}</span>
-            <button type="button" onclick={() => void refreshGitContext(binding, { force: true })}>{i18n.t('input.branch.retry')}</button>
+            <button
+              type="button"
+              onclick={() => binding && void refreshGitContext(binding, { force: true })}
+            >{i18n.t('input.branch.retry')}</button>
           </div>
         {/if}
 

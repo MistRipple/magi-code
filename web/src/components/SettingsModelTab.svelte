@@ -5,10 +5,7 @@
   import { resolveAgentIndicatorVariant } from '../lib/agent-status-indicator';
   import type { AgentBinding } from '../shared/types/registry-types';
   import type { RoleTemplate } from '../shared/types/role-templates';
-  import type {
-    VisionBuiltinTextModelRule,
-    VisionRoutingPreview,
-  } from '../shared/settings-bootstrap';
+  import type { VisionBuiltinTextModelRule } from '../shared/settings-bootstrap';
   import { i18n } from '../stores/i18n.svelte';
   import Icon from './Icon.svelte';
   import ModelConfigForm from './ModelConfigForm.svelte';
@@ -19,8 +16,6 @@
     compConfig = $bindable(),
     visionConfig = $bindable(),
     visionBuiltinTextModelRules,
-    visionCurrentMainModel,
-    previewVisionRouting,
     imageConfig = $bindable(),
     workerConfigs = $bindable(),
     modelConfigBaselines,
@@ -56,11 +51,6 @@
     compConfig: any;
     visionConfig: any;
     visionBuiltinTextModelRules: VisionBuiltinTextModelRule[];
-    visionCurrentMainModel: string;
-    previewVisionRouting: (
-      model: string,
-      textModelRules: Array<{ matchMode: 'exact' | 'regex'; pattern: string }>,
-    ) => Promise<VisionRoutingPreview>;
     imageConfig: any;
     workerConfigs: Record<string, any>;
     modelConfigBaselines: Record<string, any>;
@@ -415,8 +405,6 @@
             bind:config={visionConfig}
             baselineConfig={modelConfigBaselines.vision}
             {visionBuiltinTextModelRules}
-            {visionCurrentMainModel}
-            {previewVisionRouting}
             bind:keyVisible
             showAdvancedOptions={false}
             description={i18n.t('settings.model.visionDesc')}

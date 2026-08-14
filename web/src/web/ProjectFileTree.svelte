@@ -84,6 +84,7 @@
   ): Promise<void> {
     try {
       const response = await resolveAgentFileRevealTarget(filePath, {
+        scope: 'workspace',
         workspaceId: nextWorkspaceId,
         workspacePath: nextRootPath,
       });

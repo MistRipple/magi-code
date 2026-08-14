@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://magi.dev/contracts/browser-tool.schema.json",
+  "title": "Magi Browser tool call",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tool", "arguments"],
+  "properties": {
+    "tool": {
+      "type": "string",
+      "pattern": "^browser_[a-z0-9_]+$"
+    },
+    "arguments": { "type": "object" },
+    "session_id": { "type": "string", "minLength": 1 },
+    "tab_id": { "type": "string", "minLength": 1 }
+  }
+}

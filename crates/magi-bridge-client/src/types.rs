@@ -541,7 +541,50 @@ pub enum BridgeClientError {
     MissingWorkingDirectory { binding_id: String },
 }
 
+/// provider 已明确拒绝当前上下文大小时的结构化信息。
+///
+/// provider 差异只在 bridge 层归一化；上层运行时不再解析错误文本决定是否压缩。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextOverflowInfo {
+    pub context_limit_tokens: Option<u64>,
+    pub requested_tokens: Option<u64>,
+}
+
 impl BridgeClientError {
+    pub fn context_overflow(&self) -> Option<ContextOverflowInfo> {
+        let message = match self {
+            Self::CallFailed { message, .. } => message.as_str(),
+            Self::HttpStatusFailed { message, .. } => message.as_str(),
+            _ => return None,
+        };
+        let normalized = message.to_ascii_lowercase().replace([',', '_'], " ");
+        let overflow_marker = normalized.contains("context length")
+            || normalized.contains("context window")
+            || normalized.contains("prompt is too long")
+            || normalized.contains("prompt too long")
+            || normalized.contains("too many tokens")
+            || normalized.contains("maximum context")
+            || normalized.contains("token limit");
+        if !overflow_marker {
+            return None;
+        }
+        let numbers = normalized
+            .split(|character: char| !character.is_ascii_digit())
+            .filter_map(|part| part.parse::<u64>().ok())
+            .collect::<Vec<_>>();
+        let context_limit_tokens = numbers
+            .iter()
+            .copied()
+            .find(|value| (1_024..=4_000_000).contains(value));
+        let requested_tokens = numbers.iter().copied().rev().find(|value| {
+            (1_024..=10_000_000).contains(value) && Some(*value) != context_limit_tokens
+        });
+        Some(ContextOverflowInfo {
+            context_limit_tokens,
+            requested_tokens,
+        })
+    }
+
     pub fn layer(&self) -> Option<BridgeErrorLayer> {
         match self {
             Self::CallFailed { layer, .. } => Some(*layer),
@@ -647,6 +690,39 @@ pub fn model_invocation_error_is_cancelled(error: &BridgeClientError) -> bool {
             ..
         }
     )
+}
+
+#[cfg(test)]
+mod context_overflow_tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_provider_context_overflow_without_runtime_text_parsing() {
+        let error = BridgeClientError::HttpStatusFailed {
+            layer: BridgeErrorLayer::RemoteBusiness,
+            code: Some(400),
+            http_status: 400,
+            message: "maximum context length is 262144 tokens, requested 300000".to_string(),
+        };
+        assert_eq!(
+            error.context_overflow(),
+            Some(ContextOverflowInfo {
+                context_limit_tokens: Some(262_144),
+                requested_tokens: Some(300_000),
+            })
+        );
+    }
+
+    #[test]
+    fn unrelated_bad_request_is_not_context_overflow() {
+        let error = BridgeClientError::HttpStatusFailed {
+            layer: BridgeErrorLayer::RemoteBusiness,
+            code: Some(400),
+            http_status: 400,
+            message: "invalid temperature".to_string(),
+        };
+        assert_eq!(error.context_overflow(), None);
+    }
 }
 
 pub trait McpBridgeClient: Send + Sync {

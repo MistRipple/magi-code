@@ -7,21 +7,22 @@ globalThis.$state = (value) => value;
 await withGoldenViteServer(async (server) => {
   const rightPane = await server.ssrLoadModule('/src/stores/right-pane.svelte.ts');
   const filePreview = await server.ssrLoadModule('/src/lib/file-preview-utils.ts');
-  const browserViewport = await server.ssrLoadModule('/src/lib/browser-viewport.ts');
 
   assert.equal(filePreview.isHtmlFile('design/index.html'), true);
   assert.equal(filePreview.isHtmlFile('design/index.HTM'), true);
   assert.equal(filePreview.isHtmlFile('design/index.ts'), false);
-  assert.deepEqual(
-    browserViewport.automaticBrowserViewport({ width: 750, height: 628 }),
-    { width: 1280, height: 1072, deviceType: 'desktop' },
-    'automatic desktop mode must keep a full wide Chromium viewport and fit it to the panel surface',
+
+  rightPane.activateRightPaneSession('', '');
+  assert.equal(
+    rightPane.rightPaneState.activeScopeKey,
+    'personal',
+    '个人草稿必须使用稳定的 personal 右栏作用域，即使尚未打开文件或会话',
   );
-  assert.deepEqual(
-    browserViewport.automaticBrowserViewport({ width: 478, height: 628 }),
-    { width: 478, height: 628, deviceType: 'mobile' },
-    'automatic narrow mode must use the browser-native mobile viewport instead of clipping a desktop page',
-  );
+  const personalPane = rightPane.getRightPaneState('personal');
+  assert.equal(personalPane.collapsed, true, '个人草稿右栏初始应为折叠态');
+  rightPane.setRightPaneCollapsed('personal', false);
+  assert.equal(personalPane.collapsed, false, '个人草稿右栏应可在冷启动时直接展开');
+  rightPane.setRightPaneCollapsed('personal', true);
 
   const rightPaneSource = await readFile(
     new URL('../src/web/RightPane.svelte', import.meta.url),
@@ -30,6 +31,11 @@ await withGoldenViteServer(async (server) => {
   const browserPaneSource = await readFile(
     new URL('../src/components/tabs/BrowserTabContent.svelte', import.meta.url),
     'utf8',
+  );
+  await assert.rejects(
+    readFile(new URL('../src/lib/native-browser.ts', import.meta.url), 'utf8'),
+    { code: 'ENOENT' },
+    'retired Tauri/CEF native browser bridge must be deleted',
   );
   const terminalPaneSource = await readFile(
     new URL('../src/components/tabs/TerminalTabContent.svelte', import.meta.url),
@@ -41,15 +47,25 @@ await withGoldenViteServer(async (server) => {
   );
   assert.doesNotMatch(rightPaneSource, /<iframe\b/, 'HTML preview must not retain the old iframe path');
   assert.match(rightPaneSource, /createBrowserTab\(/);
-  assert.match(
-    rightPaneSource,
-    /createBrowserTab\([\s\S]*?initialBrowserViewport\(\)/,
-    'browser pages with an initial URL must load with the current pane viewport',
+  assert.match(rightPaneSource, /materializeSession\(/);
+  const browserCapabilityDeclaration = rightPaneSource.slice(
+    rightPaneSource.indexOf('const canCreateBrowserPane'),
+    rightPaneSource.indexOf('const canCreateTerminalPane'),
   );
   assert.match(
     rightPaneSource,
-    /automaticBrowserViewport\(\{[\s\S]*?rightPaneBodyElement\?\.clientWidth[\s\S]*?rightPaneBodyElement\?\.clientHeight/,
-    'the initial browser request must use the shared logical viewport and panel-surface policy',
+    /materializeSession\([\s\S]*?navigateSession\([\s\S]*?waitForSessionNavigation\([\s\S]*?createBrowserSession\(/,
+    '草稿态创建浏览器必须先实体化 Magi session，再导航并创建 Browser Session',
+  );
+  assert.doesNotMatch(
+    browserCapabilityDeclaration,
+    /rightPaneState\.activeSessionId/,
+    '浏览器入口不能把已存在 session 作为草稿态可用性的前置条件',
+  );
+  assert.doesNotMatch(
+    rightPaneSource,
+    /initialBrowserViewport|automaticBrowserViewport|rightPaneBodyElement/,
+    'new BrowserSurfaces must derive their automatic viewport from Electron Main instead of Renderer layout state',
   );
   assert.match(rightPaneSource, /agentUrl\('\/api\/files\/site-open'/);
   assert.match(rightPaneSource, /openHtmlInMagiBrowser/);
@@ -64,9 +80,14 @@ await withGoldenViteServer(async (server) => {
   assert.match(rightPaneSource, /rightPane\.addPanelBrowser/);
   assert.match(rightPaneSource, /rightPane\.addPanelTerminal/);
   assert.match(
-    rightPaneSource,
-    /BROWSER_AUTHORITY_CHANGED_EVENT[\s\S]*?browser\.runtime\.status_changed[\s\S]*?getBrowserCapabilities\(\)/,
-    'browser runtime readiness changes must refresh the right-pane capability snapshot',
+    browserCapabilityDeclaration,
+    /desktopSurface[\s\S]*?window\.magiDesktop[\s\S]*?browserCapabilities\?\.inAppBrowserEnabled/,
+    'browser pane availability must depend on Electron ownership and the user setting',
+  );
+  assert.doesNotMatch(
+    browserCapabilityDeclaration,
+    /nativeBrowserAvailable|hostStatus|runtimeStatus/,
+    'BrowserSurface creation must not depend on the retired runtime installer or Worker readiness',
   );
   assert.match(
     rightPaneSource,
@@ -98,11 +119,35 @@ await withGoldenViteServer(async (server) => {
     /runTerminalCommand|readTerminalProcess|commandPlaceholder|<textarea/,
     'the retired command-card terminal implementation must not remain in the UI',
   );
-  assert.doesNotMatch(
-    rightPaneSource,
-    /onclick=\{\(\) => void createBrowserPane\(\)\}/,
-    'the top-level add button must open the extensible pane chooser',
-  );
+assert.doesNotMatch(
+  rightPaneSource,
+  /onclick=\{\(\) => void createBrowserPane\(\)\}/,
+  'the top-level add button must open the extensible pane chooser',
+);
+assert.doesNotMatch(
+  rightPaneSource,
+  /if \(!canOpenAddPaneMenu \|\| creatingBrowserPane\) return;/,
+  'a pending browser surface must not disable the shared right-pane chooser',
+);
+assert.match(
+  rightPaneSource,
+  /disabled=\{!canOpenAddPaneMenu\}[\s\S]*?aria-busy=\{creatingBrowserPane\}/,
+  'browser creation may show a local busy indicator without blocking other panel types',
+);
+const desktopRightPaneShellSource = await readFile(
+  new URL('../src/DesktopRightPaneShell.svelte', import.meta.url),
+  'utf8',
+);
+assert.match(
+  desktopRightPaneShellSource,
+  /class="desktop-right-pane-resize-handle"[\s\S]*?onpointerdown=\{startRightPaneResize\}[\s\S]*?ondblclick=/,
+  'desktop right-pane keeps the original drag and double-click reset interaction',
+);
+assert.match(
+  desktopRightPaneShellSource,
+  /\.desktop-right-pane-resize-handle\s*\{[\s\S]*?height:\s*100%;/,
+  'right-pane resize hit area must span the whole divider instead of being limited to the tab bar',
+);
   assert.doesNotMatch(
     browserPaneSource,
     /setBrowserUserControl|toggleControl|control-button/,
@@ -135,8 +180,8 @@ await withGoldenViteServer(async (server) => {
   );
   assert.match(
     browserPaneSource,
-    /const targetBrowserSessionId = browserSessionId\.trim\(\);[\s\S]*?untrack\(\(\) => \{[\s\S]*?disconnectChannel\(\);[\s\S]*?void refreshSession\(true\);/,
-    'browser connection lifecycle must only track the session and tab ids, not socket state',
+    /const expectedSessionId = browserSessionId\.trim\(\);[\s\S]*?const expectedTabId = tabId\.trim\(\);[\s\S]*?void refreshSession\(true\)/,
+    'browser toolbar lifecycle must track only the authority session and tab identity',
   );
   assert.doesNotMatch(
     browserPaneSource,
@@ -148,75 +193,45 @@ await withGoldenViteServer(async (server) => {
     /const activationKey = `\$\{payload\.browserSessionId\}\\u0000\$\{payload\.tabId\}`;[\s\S]*?activateBrowserTab\(payload\.tabId\)/,
     'the selected top-level pane must be the single browser activation source',
   );
-  assert.match(
+  assert.doesNotMatch(
     browserPaneSource,
-    /nextSnapshot\.lifecycle !== 'ready' \|\| nextTab\?\.lifecycle !== 'ready'[\s\S]*?disconnectChannel\(\)/,
-    'the frame channel must only exist while both session and tab authority are ready',
-  );
-  assert.match(
-    browserPaneSource,
-    /renderedFrameObjectUrl = objectUrl;[\s\S]*?renderedFrameUrl = objectUrl;[\s\S]*?renderedFrameMetadata = metadata;/,
-    'the encoded Browser Host frame must be displayed directly without canvas resampling',
+    /new WebSocket|browserChannelUrl|renderedFrame|queuedFrame|frameImage|drawImage\(|getContext\(['"]2d['"]\)/,
+    'browser toolbar must not retain a websocket, bitmap frame, or canvas projection path',
   );
   assert.doesNotMatch(
     browserPaneSource,
-    /drawImage\(|getContext\(['"]2d['"]\)/,
-    'browser frames must not be resampled through a canvas',
-  );
-  assert.match(
-    browserPaneSource,
-    /queuedFrame = \{ bytes, metadata \};[\s\S]*?if \(!frameDecoderActive\) void drainFrameQueue/,
-    'high-DPI frame decoding must coalesce pending frames instead of creating parallel decoders',
-  );
-  assert.match(
-    browserPaneSource,
-    /while \(generation === frameDecoderGeneration\)[\s\S]*?const frame = queuedFrame;[\s\S]*?queuedFrame = null;/,
-    'the frame decoder must consume only the latest queued frame for the active channel generation',
-  );
-  assert.match(
-    browserPaneSource,
-    /const availableWidth = viewportSize\.width > 0 \? viewportSize\.width : frame\.surfaceWidth;[\s\S]*?const scale = Math\.min\([\s\S]*?availableHeight \/ frame\.surfaceHeight,/,
-    'the displayed frame must fit the stable Chromium surface into the panel without cropping',
-  );
-  assert.match(
-    browserPaneSource,
-    /!Number\.isSafeInteger\(surfaceWidth\) \|\| surfaceWidth < 1[\s\S]*?next\.close\(1002, 'invalid browser channel message'\)/,
-    'missing Chromium surface metadata must terminate the channel instead of falling back to a fake frame size',
+    /getBoundingClientRect|ResizeObserver|resizeNativeBrowser|createNativeBrowser|focusNativeBrowser|hideNativeBrowser/,
+    'Renderer must not measure, create, resize, focus, or hide the Electron BrowserSurface',
   );
   assert.doesNotMatch(
     browserPaneSource,
-    /Math\.max\(1, Number\(message\.(?:width|height|surfaceWidth|surfaceHeight)\) \|\| 1\)/,
-    'frame metadata must not retain the retired 1x1 compatibility fallback',
+    /@tauri-apps|\binvoke\s*\(|native_browser_|\{\s*x:\s*0,\s*y:\s*0,\s*width:\s*1,\s*height:\s*1\s*\}/,
+    'Renderer must not retain Tauri commands, CEF bridge commands, or the retired 1x1 hide path',
+  );
+  assert.match(
+    browserPaneSource,
+    /class="browser-surface-slot"[\s\S]*?\{#if !desktopRuntime\}[\s\S]*?browser\.error\.internalUnavailable/,
+    'ordinary Web entry must expose one explicit Desktop-only empty state without a second browser implementation',
   );
   assert.doesNotMatch(
     browserPaneSource,
-    /transform:\s*scale\([^)]*viewport|object-fit:\s*(fill|cover)/,
-    'the frontend must not use a non-uniform transform or crop the browser surface',
+    /transform:\s*scale\(|object-fit:\s*(fill|cover)|surfaceWidth|surfaceHeight/,
+    'the frontend must not scale, crop, or maintain a second projected browser surface',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /window\.magiDesktop\.(?:activateBrowser|activatePanel|focusBrowser|submitLayoutIntent)/,
+    'BrowserTabContent must leave BrowserSurface activation, focus, and layout ownership to RightPane and Electron Main',
   );
   assert.match(
     browserPaneSource,
-    /return document\.visibilityState === 'visible';/,
-    'the mounted visible browser pane must be able to establish viewport ownership before focus enters it',
+    /navigateBrowserTab\(tab\.tabId, action,[\s\S]*?await refreshSession\(\)/,
+    'browser toolbar navigation must use the authority API that controls the same Electron page',
   );
   assert.match(
     browserPaneSource,
-    /controllerId: viewportControllerId,/,
-    'each browser pane must carry its stable physical View identity when changing viewport',
-  );
-  assert.match(
-    browserPaneSource,
-    /browserChannelUrl\([\s\S]*?viewportControllerId,[\s\S]*?initialViewport,[\s\S]*?initialSurface,[\s\S]*?\)/,
-    'the browser channel must bind separate logical viewport and display surface sizes to the same physical View',
-  );
-  assert.match(
-    browserPaneSource,
-    /releaseBrowserTabViewportController\(targetTabId, viewportControllerId\)/,
-    'unmounting a browser pane must release only its physical View binding',
-  );
-  assert.match(
-    browserPaneSource,
-    /Math\.min\(frame\.width,[\s\S]*?frame\.width \/ rect\.width/,
-    'browser input coordinates must remain in CSS viewport units when the canvas backing store is high-DPI',
+    /window\.magiDesktop\?\.onBrowserEvent\(handleDesktopBrowserEvent\)/,
+    'browser toolbar must observe Electron page navigation without owning the physical surface',
   );
   assert.match(
     browserPaneSource,
@@ -235,33 +250,33 @@ await withGoldenViteServer(async (server) => {
   );
   assert.match(
     browserPaneSource,
-    /function deviceTypeForWidth\(width: number\)[\s\S]*?width <= 600 \? 'mobile' : 'desktop'[\s\S]*?pendingCustomViewport = \{ \.\.\.requested, deviceType \}/,
+    /pendingViewport = \{ width, height, deviceType: width <= 600 \? 'mobile' : 'desktop' \}/,
     'custom viewport width must determine the canonical wide or narrow device mode',
   );
   assert.match(
     browserPaneSource,
-    /action: 'set',[\s\S]*?surfaceWidth: surface\.width,[\s\S]*?surfaceHeight: surface\.height/,
-    'fixed viewport updates must send the panel surface to Chromium with the logical viewport',
-  );
-  assert.match(
-    browserPaneSource,
-    /action: 'sync',[\s\S]*?width: viewport\.width,[\s\S]*?height: viewport\.height,[\s\S]*?surfaceWidth: requested\.width,[\s\S]*?surfaceHeight: requested\.height/,
-    'automatic viewport updates must resize the panel surface without collapsing the desktop logical viewport',
+    /desktop\.setBrowserViewport\(\{[\s\S]*?mode === 'auto'[\s\S]*?mode: 'fixed'[\s\S]*?deviceScaleFactorMillis: 1_000/,
+    'logical viewport controls must target the current Electron Surface through Main IPC',
   );
   assert.doesNotMatch(
     browserPaneSource,
-    /annotations: candidate\.annotations\.map[\s\S]*?status: 'stale'/,
-    'resizing the browser pane must not invalidate annotations on the same document',
+    /setBrowserTabViewport|action: 'sync'|viewportControllerId|releaseBrowserTabViewportController|setBrowserTabViewportSlot|localStorage|sessionStorage/,
+    'viewport UI must not persist through BrowserAuthority or synchronize a physical slot',
   );
   assert.match(
     browserPaneSource,
-    /function selectSavedAnnotation[\s\S]*?magi:browserAnnotationCreated[\s\S]*?onclick=\{\(\) => selectSavedAnnotation\(annotation\)\}/,
-    'clicking a saved annotation must select it for the composer instead of silently resolving it',
+    /function selectSavedAnnotation[\s\S]*?magi:browserAnnotationCreated/,
+    'browser annotations must expose one composer reference event',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /setNativeBrowserAnnotationMode|listenNativeBrowserAnnotations|createBrowserElementAnnotation|createBrowserRegionAnnotation/,
+    'browser toolbar must not retain the retired native annotation bridge or create a second annotation input surface',
   );
   assert.match(
     browserPaneSource,
-    /\.browser-viewport\.marking \.annotation-marker \{ pointer-events: none; \}/,
-    'saved annotations must not intercept region selection while annotation mode is active',
+    /savedAnnotations[\s\S]*?class="annotation-menu"[\s\S]*?selectSavedAnnotation\(annotation\)/,
+    'persisted annotation history must remain available to the composer flow',
   );
   assert.match(
     markdownLinkSource,
@@ -281,7 +296,7 @@ await withGoldenViteServer(async (server) => {
   );
   assert.match(
     browserPaneSource,
-    /openCurrentPageExternally[\s\S]*?openExternalWebUrl\(url\)[\s\S]*?browser\.action\.openExternal/,
+    /openCurrentPageExternally[\s\S]*?openExternalWebUrl\(externalUrl\)[\s\S]*?browser\.action\.openExternal/,
     'the browser toolbar must expose the current page to the external browser',
   );
 
@@ -301,6 +316,17 @@ await withGoldenViteServer(async (server) => {
     'each BrowserTabId must map to one top-level right-pane tab without LRU eviction',
   );
   assert.equal(browserPane.activeTabId, 'browser:browser-session:browser-tab-7');
+
+  rightPane.activateRightPaneSession('', 'session-personal-browser');
+  rightPane.openBrowserTab('browser-session-personal', 'browser-tab-personal', {
+    sessionId: 'session-personal-browser',
+    label: '个人浏览器',
+  });
+  assert.equal(
+    rightPane.getRightPaneState(rightPane.rightPaneState.activeScopeKey).openTabs[0]?.id,
+    'browser:browser-session-personal:browser-tab-personal',
+    '个人会话浏览器 Tab 不应依赖 workspaceId',
+  );
 
   rightPane.activateRightPaneSession('workspace-terminal', 'session-terminal');
   const firstTerminalId = rightPane.openTerminalTab({

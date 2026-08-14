@@ -13,8 +13,8 @@
     type OpenUrlInBrowserRequest,
   } from '../lib/browser-navigation';
   import { normalizeExternalWebUrl } from '../lib/external-link';
-  import { automaticBrowserViewport } from '../lib/browser-viewport';
   import { addToast } from '../stores/messages.svelte';
+  import { navigateSession, waitForSessionNavigation } from '../shared/session-navigation.svelte';
   import {
     isHtmlFile,
     isKnownBinaryFile,
@@ -39,47 +39,33 @@
   } from '../stores/right-pane.svelte';
   import {
     activateBrowserTab,
-    BROWSER_AUTHORITY_CHANGED_EVENT,
     closeBrowserTab,
     closeTerminalSession,
     createBrowserSession,
     createBrowserTab,
     getBrowserCapabilities,
+    materializeSession,
     getAgentChangeDiff,
     getAgentFilePreview,
     agentUrl,
     buildFilePreviewQuery,
     isPublicTunnelAccess,
     type BrowserCapabilitiesSnapshot,
-    type BrowserViewport,
   } from './agent-api';
 
   interface Props {
     workspaceRoot: string;
     overlay?: boolean;
+    desktopSurface?: boolean;
   }
 
-  let { workspaceRoot, overlay = false }: Props = $props();
+  let { workspaceRoot, overlay = false, desktopSurface = false }: Props = $props();
 
   // ============ Tab 状态 ============
   const paneScopeKey = $derived(rightPaneState.activeScopeKey);
   const paneState = $derived(getRightPaneState(paneScopeKey));
   const openTabs = $derived(paneState.openTabs);
   let tabStripElement: HTMLDivElement | undefined;
-  let rightPaneBodyElement: HTMLDivElement | undefined;
-
-  function initialBrowserViewport(): BrowserViewport {
-    const viewport = automaticBrowserViewport({
-      width: rightPaneBodyElement?.clientWidth || 390,
-      height: rightPaneBodyElement?.clientHeight || 800,
-    });
-    return {
-      width: viewport.width,
-      height: viewport.height,
-      deviceScaleFactorMillis: 1_000,
-      deviceType: viewport.deviceType,
-    };
-  }
 
   $effect(() => {
     const activeTabId = paneState.activeTabId;
@@ -102,32 +88,26 @@
   });
 
   function closePane(): void {
+    if (desktopSurface && window.magiDesktop) {
+      void window.magiDesktop.submitLayoutIntent({
+        type: 'right_pane_visibility',
+        visible: false,
+      });
+      return;
+    }
     setRightPaneCollapsed(paneScopeKey, true);
   }
   let creatingBrowserPane = $state(false);
   let browserCapabilities = $state<BrowserCapabilitiesSnapshot | null>(null);
-  let browserCapabilitiesPollTimer: number | null = null;
   let addPaneMenuOpen = $state(false);
   let addPaneMenuElement = $state<HTMLDivElement | undefined>(undefined);
-  const browserRuntimeUsable = $derived(
-    browserCapabilities?.runtimeStatus === 'installed'
-      || browserCapabilities?.runtimeStatus === 'update_available',
-  );
   const canCreateBrowserPane = $derived(Boolean(
-    browserCapabilities?.inAppBrowserEnabled
-      && browserRuntimeUsable
-      && (
-        (browserCapabilities.hostStatus === 'ready'
-          && browserCapabilities.hostProtocolCompatible)
-        || browserCapabilities.hostStatus === 'starting'
-        || browserCapabilities.hostStatus === 'recovering'
-      )
-      && rightPaneState.activeWorkspaceId.trim()
-      && rightPaneState.activeSessionId.trim(),
+    desktopSurface
+      && window.magiDesktop
+      && browserCapabilities?.inAppBrowserEnabled
   ));
   const canCreateTerminalPane = $derived(Boolean(
     !isPublicTunnelAccess()
-      && rightPaneState.activeWorkspaceId.trim()
       && rightPaneState.activeSessionId.trim(),
   ));
 
@@ -135,57 +115,14 @@
     browserCapabilities = snapshot;
   }
 
-  function stopBrowserCapabilitiesPoll(): void {
-    if (browserCapabilitiesPollTimer === null) return;
-    window.clearInterval(browserCapabilitiesPollTimer);
-    browserCapabilitiesPollTimer = null;
-  }
-
-  function browserCapabilitiesSettled(snapshot: BrowserCapabilitiesSnapshot | null): boolean {
-    if (!snapshot) return false;
-    // Magi 启动时能力接口可能先返回默认组件状态，Host 随后才完成握手。
-    // 只有启动/恢复和安装过程结束后才停止轮询，不能把“暂不可用”误判成最终状态。
-    if (snapshot.hostStatus === 'starting' || snapshot.hostStatus === 'recovering') {
-      return false;
-    }
-    return snapshot.runtimeStatus !== 'downloading'
-      && snapshot.runtimeStatus !== 'verifying';
-  }
-
-  function pollBrowserCapabilities(): void {
-    if (browserCapabilitiesPollTimer !== null) return;
-    browserCapabilitiesPollTimer = window.setInterval(() => {
-      const current = browserCapabilities;
-      if (browserCapabilitiesSettled(current)) {
-        stopBrowserCapabilitiesPoll();
-        return;
-      }
-      void getBrowserCapabilities()
-        .then(applyBrowserCapabilities)
-        .catch((error) => console.warn('[RightPane] 刷新浏览器运行能力失败:', error));
-    }, 500);
-  }
-
   onMount(() => {
     void getBrowserCapabilities()
       .then(applyBrowserCapabilities)
-      .catch((error) => {
-        console.warn('[RightPane] 获取浏览器能力失败:', error);
-        pollBrowserCapabilities();
-      });
-    pollBrowserCapabilities();
+      .catch((error) => console.warn('[RightPane] 获取浏览器能力失败:', error));
     const handleCapabilitiesChanged = (event: Event) => {
       applyBrowserCapabilities((event as CustomEvent<BrowserCapabilitiesSnapshot>).detail);
     };
-    const handleRuntimeStatusChanged = (event: Event) => {
-      const detail = (event as CustomEvent<{ eventType?: string }>).detail;
-      if (detail?.eventType !== 'browser.runtime.status_changed') return;
-      void getBrowserCapabilities()
-        .then(applyBrowserCapabilities)
-        .catch((error) => console.warn('[RightPane] 刷新浏览器运行能力失败:', error));
-    };
     window.addEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
-    window.addEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, handleRuntimeStatusChanged);
     const handleOutsidePointer = (event: PointerEvent) => {
       const target = event.target;
       if (addPaneMenuElement && target instanceof Node && !addPaneMenuElement.contains(target)) {
@@ -195,6 +132,27 @@
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key === 'Escape') addPaneMenuOpen = false;
     };
+    const handleOverlayAction = (action: {
+      kind?: string;
+      ownerId?: string;
+      interaction?: string;
+      id?: string;
+    }) => {
+      if (
+        action.kind !== 'menu'
+        || action.ownerId !== 'right-pane'
+        || action.interaction !== 'select'
+        || typeof action.id !== 'string'
+      ) return;
+      addPaneMenuOpen = false;
+      if (action.id === 'browser' || action.id === 'terminal') chooseAddPane(action.id);
+    };
+    const unsubscribeOverlayAction = desktopSurface
+      ? window.magiDesktop?.onOverlayAction(handleOverlayAction)
+      : undefined;
+    const unsubscribeOverlayClosed = desktopSurface
+      ? window.magiDesktop?.onOverlayClosed(() => { addPaneMenuOpen = false; })
+      : undefined;
     const handleOpenUrlInBrowser = (event: Event) => {
       const request = (event as CustomEvent<OpenUrlInBrowserRequest>).detail;
       if (!request?.url) return;
@@ -205,11 +163,11 @@
     window.addEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
     return () => {
       window.removeEventListener('magi:browserCapabilitiesChanged', handleCapabilitiesChanged);
-      window.removeEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, handleRuntimeStatusChanged);
-      stopBrowserCapabilitiesPoll();
       window.removeEventListener('pointerdown', handleOutsidePointer);
       window.removeEventListener('keydown', handleEscape);
       window.removeEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
+      unsubscribeOverlayAction?.();
+      unsubscribeOverlayClosed?.();
     };
   });
 
@@ -260,14 +218,38 @@
       : normalizeExternalWebUrl(initialUrl);
     if (!targetUrl) return;
     const workspaceId = rightPaneState.activeWorkspaceId.trim();
-    const sessionId = rightPaneState.activeSessionId.trim();
     creatingBrowserPane = true;
     try {
-      const browserSession = await createBrowserSession(workspaceId, sessionId);
+      let sessionId = rightPaneState.activeSessionId.trim();
+      if (!sessionId) {
+        const materialized = await materializeSession(
+          workspaceId || null,
+          workspaceId ? workspaceRoot : undefined,
+        );
+        sessionId = materialized.sessionId;
+        const navigation = navigateSession(workspaceId
+          ? {
+              kind: 'session',
+              scope: 'workspace',
+              workspaceId,
+              workspacePath: workspaceRoot,
+              sessionId,
+            }
+          : { kind: 'session', scope: 'personal', sessionId });
+        if (!navigation) {
+          throw new Error('当前已有会话导航操作正在进行');
+        }
+        // 主视图导航与浏览器资源创建并行推进。后端会话已经由
+        // materializeSession 建立，右栏不应等待另一个 Renderer 的 URL
+        // 收敛，否则浏览器新增操作会被无期限阻塞。
+        void waitForSessionNavigation(navigation).catch((error) => {
+          console.warn('[RightPane] 浏览器会话导航收敛失败:', error);
+        });
+      }
+      const browserSession = await createBrowserSession(workspaceId, sessionId, workspaceRoot);
       const tab = await createBrowserTab(
         browserSession.browserSessionId,
         targetUrl,
-        initialBrowserViewport(),
       );
       registerBrowserPane(
         browserSession.browserSessionId,
@@ -311,12 +293,37 @@
   const canOpenAddPaneMenu = $derived(addablePaneKinds.some((item) => item.enabled));
 
   function toggleAddPaneMenu(): void {
-    if (!canOpenAddPaneMenu || creatingBrowserPane) return;
+    // 浏览器 Surface 创建是异步的，但新增面板选择器属于右栏通用能力。
+    // 浏览器正在连接时，代码、图片、终端和其他面板仍必须可以打开。
+    if (!canOpenAddPaneMenu) return;
     addPaneMenuOpen = !addPaneMenuOpen;
+    if (!desktopSurface || !window.magiDesktop) return;
+    if (!addPaneMenuOpen) {
+      void window.magiDesktop.closeOverlay();
+      return;
+    }
+    void window.magiDesktop.openOverlay({
+      kind: 'menu',
+      ownerId: 'right-pane',
+      placement: 'right-pane-add',
+      title: i18n.t('rightPane.addPanel'),
+      items: addablePaneKinds.map((item) => ({
+        id: item.kind,
+        label: item.label,
+        icon: item.icon,
+        selected: false,
+        disabled: !item.enabled,
+      })),
+      fields: [],
+    }).catch((error) => {
+      addPaneMenuOpen = false;
+      console.warn('[RightPane] 打开新增面板菜单失败:', error);
+    });
   }
 
   function chooseAddPane(kind: RightPaneCreationKind): void {
     addPaneMenuOpen = false;
+    if (desktopSurface) void window.magiDesktop?.closeOverlay();
     if (kind === 'browser') {
       void createBrowserPane();
       return;
@@ -335,13 +342,14 @@
       : null;
   });
 
-  // 右侧一级 Tab 是用户当前查看页面的唯一选择源。浏览器内容组件只读取并订阅
-  // BrowserAuthority，不再在挂载时自行激活页面，避免旧组件的迟到请求抢回 activeTab。
+  // 右侧一级 Tab 是用户当前查看页面的唯一选择源。Desktop Renderer 只向 Main
+  // 提交激活意图，物理 BrowserSurface 的创建、层级和 bounds 均由 Main 管理。
   let activeBrowserActivationKey = '';
   let activeBrowserActivationRequest = 0;
   $effect(() => {
     const current = activeTab;
     if (!current || current.kind !== 'browser') {
+      if (activeBrowserActivationKey) activeBrowserActivationRequest += 1;
       activeBrowserActivationKey = '';
       return;
     }
@@ -350,11 +358,47 @@
     if (activationKey === activeBrowserActivationKey) return;
     activeBrowserActivationKey = activationKey;
     const request = ++activeBrowserActivationRequest;
-    void activateBrowserTab(payload.tabId).catch((error) => {
-      if (request !== activeBrowserActivationRequest) return;
-      activeBrowserActivationKey = '';
-      console.warn('[RightPane] 激活浏览器面板失败:', error);
-      addToast('error', i18n.t('browser.error.openInternal'), undefined, { forceVisible: true });
+    void activateBrowserTab(payload.tabId)
+      .then(async (authority) => {
+        if (request !== activeBrowserActivationRequest || !desktopSurface) return;
+        const desktop = window.magiDesktop;
+        if (!desktop) throw new Error('desktop_preload_bridge_unavailable');
+        const tab = authority.tabs.find((candidate) => candidate.tabId === payload.tabId);
+        if (!tab) throw new Error(`browser_tab_not_found:${payload.tabId}`);
+        await desktop.activateBrowser({
+          tabId: tab.tabId,
+          browserSessionId: authority.browserSessionId,
+          url: tab.url,
+          navigationRevision: tab.navigationRevision,
+          viewport: { mode: 'auto' },
+        });
+      })
+      .catch((error) => {
+        if (request !== activeBrowserActivationRequest) return;
+        activeBrowserActivationKey = '';
+        console.warn('[RightPane] 激活浏览器面板失败:', error);
+        addToast('error', i18n.t('browser.error.openInternal'), undefined, { forceVisible: true });
+      });
+  });
+
+  let activeDesktopPanelKey = '';
+  $effect(() => {
+    if (!desktopSurface) return;
+    const current = activeTab;
+    if (current?.kind === 'browser') {
+      activeDesktopPanelKey = '';
+      return;
+    }
+    const key = current ? `${current.kind}:${current.id}` : 'empty';
+    if (key === activeDesktopPanelKey) return;
+    activeDesktopPanelKey = key;
+    void window.magiDesktop?.activatePanel({
+      kind: current?.kind ?? null,
+      tabId: current?.id ?? null,
+    }).catch((error) => {
+      if (key !== activeDesktopPanelKey) return;
+      activeDesktopPanelKey = '';
+      console.warn('[RightPane] 激活桌面右栏面板失败:', error);
     });
   });
 
@@ -440,6 +484,18 @@
     activeCodePayload?.isChangeDiff
       && (activeContentKind === 'text' || activeContentKind === 'large_text')
   ));
+  const activeChangeWorkspaceBinding = $derived.by(() => {
+    const workspaceId = activeCodePayload?.workspaceId?.trim() || '';
+    const workspacePath = activeCodePayload?.workspacePath?.trim() || '';
+    if (!workspaceId && !workspacePath) return null;
+    const sessionId = activeCodePayload?.sessionId?.trim() || '';
+    return {
+      scope: 'workspace' as const,
+      workspaceId,
+      workspacePath,
+      ...(sessionId ? { sessionId } : {}),
+    };
+  });
   const activeFilePreviewQuery = $derived.by(() => {
     if (!activeFilePath) return '';
     return buildFilePreviewQuery(activeFilePath, {
@@ -498,8 +554,8 @@
       try {
         const payload = await getAgentFilePreview(filepath, {
           sessionId: activeCodePayload?.sessionId,
-          workspaceId: activeCodePayload?.workspaceId,
-          workspacePath: activeCodePayload?.workspacePath,
+          workspaceId: activeCodePayload?.workspaceId || '',
+          workspacePath: activeCodePayload?.workspacePath || '',
         });
         if (contentRequestSeqByKey.get(cacheKey) !== requestSeq) return;
         fetchedContents = { ...fetchedContents, [cacheKey]: payload.content || '' };
@@ -523,6 +579,7 @@
     if (!filepath) return;
     if (!cacheKey) return;
     if (!activeWantsDiff) return;
+    if (!activeChangeWorkspaceBinding) return;
     if (hasExplicitDiffContents) return;
     if (fetchedDiffDetails[cacheKey]) return;
     if (typeof fetchDiffErrors[cacheKey] === 'string' && fetchDiffErrors[cacheKey].length > 0) return;
@@ -535,9 +592,7 @@
     (async () => {
       try {
         const payload = await getAgentChangeDiff(filepath, {
-          sessionId: activeCodePayload?.sessionId,
-          workspaceId: activeCodePayload?.workspaceId,
-          workspacePath: activeCodePayload?.workspacePath,
+          ...activeChangeWorkspaceBinding,
         });
         if (diffRequestSeqByKey.get(cacheKey) !== requestSeq) return;
         fetchedDiffDetails = {
@@ -742,11 +797,10 @@
     if (!htmlFile || !activeFilePreviewQuery || !workspaceId || !sessionId || openingHtmlInBrowser) return;
     openingHtmlInBrowser = true;
     try {
-      const browserSession = await createBrowserSession(workspaceId, sessionId);
+      const browserSession = await createBrowserSession(workspaceId, sessionId, workspaceRoot);
       const tab = await createBrowserTab(
         browserSession.browserSessionId,
         agentUrl('/api/files/site-open', activeFilePreviewQuery),
-        initialBrowserViewport(),
       );
       registerBrowserPane(
         browserSession.browserSessionId,
@@ -838,7 +892,7 @@
     }
     if (tab.kind === 'terminal') {
       const payload = tab.payload as TerminalTabPayload;
-      return payload.workspacePath || payload.workspaceId;
+      return payload.workspacePath || payload.workspaceId || (i18n.locale.startsWith('zh') ? 'Magi 空间' : 'Magi Space');
     }
     return tabLabel(tab);
   }
@@ -1030,7 +1084,7 @@
           class="right-pane-add-tab"
           data-open-tab-count={openTabs.length}
           onclick={toggleAddPaneMenu}
-          disabled={!canOpenAddPaneMenu || creatingBrowserPane}
+          disabled={!canOpenAddPaneMenu}
           title={i18n.t('rightPane.addPanel')}
           aria-label={i18n.t('rightPane.addPanel')}
           aria-haspopup="menu"
@@ -1039,7 +1093,7 @@
         >
           <Icon name={creatingBrowserPane ? 'loader' : 'plus'} size={14} />
         </button>
-        {#if addPaneMenuOpen}
+        {#if !desktopSurface && addPaneMenuOpen}
           <div class="right-pane-add-menu" role="menu" aria-label={i18n.t('rightPane.addPanel')}>
             {#each addablePaneKinds as item (item.kind)}
               <button
@@ -1097,7 +1151,6 @@
 
   <!-- Body：按 activeTab 路由 -->
   <div
-    bind:this={rightPaneBodyElement}
     class="right-pane-body"
     class:right-pane-body--code={codeMode}
     class:right-pane-body--browser={activeTab?.kind === 'browser'}
@@ -1122,7 +1175,6 @@
       <BrowserTabContent
         browserSessionId={browserPayload.browserSessionId}
         tabId={browserPayload.tabId}
-        sessionId={browserPayload.sessionId}
         onTitleChange={(label) => updateRightPaneTabLabel(paneScopeKey, activeTab.id, label)}
       />
     {:else if activeTab.kind === 'terminal'}

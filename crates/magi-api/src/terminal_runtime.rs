@@ -13,8 +13,9 @@ const TERMINAL_SCROLLBACK_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TerminalBinding {
     pub terminal_tab_id: String,
-    pub workspace_id: String,
-    pub workspace_path: PathBuf,
+    /// 终端继承会话作用域。个人会话在 Magi 私有执行目录中启动，不伪造项目根目录。
+    pub workspace_id: Option<String>,
+    pub execution_root: PathBuf,
     pub session_id: String,
 }
 
@@ -175,7 +176,7 @@ impl TerminalSession {
             .map_err(|error| TerminalRuntimeError::Start(error.to_string()))?;
 
         let mut command = CommandBuilder::new_default_prog();
-        command.cwd(&binding.workspace_path);
+        command.cwd(&binding.execution_root);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         command.env("TERM_PROGRAM", "Magi");
@@ -382,8 +383,8 @@ mod tests {
     fn binding(root: &std::path::Path) -> TerminalBinding {
         TerminalBinding {
             terminal_tab_id: "terminal-test".to_string(),
-            workspace_id: "workspace-test".to_string(),
-            workspace_path: root.to_path_buf(),
+            workspace_id: Some("workspace-test".to_string()),
+            execution_root: root.to_path_buf(),
             session_id: "session-test".to_string(),
         }
     }

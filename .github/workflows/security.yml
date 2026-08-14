@@ -4,14 +4,16 @@ on:
   pull_request:
     paths:
       - Cargo.lock
-      - web/package-lock.json
+      - package-lock.json
+      - "**/package.json"
       - .github/workflows/security.yml
   push:
     branches:
       - main
     paths:
       - Cargo.lock
-      - web/package-lock.json
+      - package-lock.json
+      - "**/package.json"
       - .github/workflows/security.yml
   schedule:
     - cron: "17 2 * * 1"
@@ -42,14 +44,14 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - name: 审计前端生产依赖
         shell: bash
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
-            if npm --prefix web audit --omit=dev; then
+            if npm audit --omit=dev --workspaces; then
               exit 0
             fi
             if [ "$attempt" -eq 3 ]; then

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://magi.dev/contracts/desktop-ipc.schema.json",
+  "title": "Magi Desktop renderer IPC envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["channel", "payload"],
+  "properties": {
+    "channel": {
+      "type": "string",
+      "enum": ["magi-desktop:get-snapshot", "magi-desktop:set-context", "magi-desktop:layout-intent", "magi-desktop:activate-browser", "magi-desktop:activate-panel", "magi-desktop:set-browser-viewport", "magi-desktop:open-right-pane-tab", "magi-desktop:right-pane-ready", "magi-desktop:focus-browser", "magi-desktop:open-external", "magi-desktop:show-context-menu", "magi-desktop:open-workspace-folder", "magi-desktop:reveal-workspace-file", "magi-desktop:set-appearance", "magi-desktop:get-app-version", "magi-desktop:get-browser-component-info", "magi-desktop:restart-browser-automation", "magi-desktop:clear-browser-data", "magi-desktop:check-for-updates", "magi-desktop:download-update", "magi-desktop:install-update"]
+    },
+    "payload": {}
+  }
+}

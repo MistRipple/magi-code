@@ -8,7 +8,6 @@ import type {
   SettingsCapabilityDependency,
   SettingsRuntimeSnapshot,
   VisionBuiltinTextModelRule,
-  VisionRoutingPreview,
 } from '../shared/settings-bootstrap';
 import type {
   IncidentNotificationItemDto,
@@ -26,6 +25,8 @@ import { i18n } from '../stores/i18n.svelte';
 import {
   resolveAgentBindingContext,
   type AgentBindingContext,
+  type AgentBindingOverride,
+  type WorkspaceAgentBindingOverride,
 } from './agent-binding-context';
 import { normalizeToolRuntimeStatus } from '../shared/tool-catalog';
 import {
@@ -277,6 +278,9 @@ function normalizeVisionBuiltinTextModelRules(value: unknown): VisionBuiltinText
 function normalizeSettingsBootstrapPayload(
   payload: Record<string, unknown>,
 ): AgentSettingsBootstrapSnapshot {
+  if (payload.scope !== 'personal' && payload.scope !== 'workspace') {
+    throw new Error('settings bootstrap 缺少有效的会话作用域');
+  }
   const runtimeSettings = (
     payload.runtimeSettings
     && typeof payload.runtimeSettings === 'object'
@@ -286,6 +290,7 @@ function normalizeSettingsBootstrapPayload(
   ) as SettingsRuntimeSnapshot;
 
   return {
+    scope: payload.scope,
     workspaceId: normalizeBindingString(payload.workspaceId),
     workspacePath: normalizeBindingString(payload.workspacePath),
     sessionId: normalizeBindingString(payload.sessionId),
@@ -340,22 +345,25 @@ function normalizeSettingsBootstrapPayload(
 }
 
 export function settingsBootstrapMatchesCurrentWorkspace(
-  snapshot: Pick<SettingsBootstrapPayload, 'workspaceId' | 'workspacePath' | 'sessionId'> | null | undefined,
+  snapshot: Pick<SettingsBootstrapPayload, 'scope' | 'workspaceId' | 'workspacePath' | 'sessionId'> | null | undefined,
 ): boolean {
   if (!snapshot) return false;
   const binding = resolveAgentBindingContext();
   const snapshotWorkspaceId = normalizeBindingString(snapshot.workspaceId);
   const snapshotWorkspacePath = normalizeBindingString(snapshot.workspacePath);
   const snapshotSessionId = normalizeBindingString(snapshot.sessionId);
-  if (snapshotSessionId !== binding.sessionId) {
+  if (snapshotSessionId !== normalizeBindingString(binding.sessionId)) {
     return false;
   }
-  if (snapshotWorkspaceId || binding.workspaceId) {
-    return Boolean(snapshotWorkspaceId)
-      && Boolean(binding.workspaceId)
-      && snapshotWorkspaceId === binding.workspaceId;
+  if (snapshot.scope !== binding.scope) {
+    return false;
   }
-  return snapshotWorkspacePath === binding.workspacePath;
+  if (binding.scope === 'personal') {
+    return !snapshotWorkspaceId && !snapshotWorkspacePath;
+  }
+  return snapshotWorkspaceId
+    ? snapshotWorkspaceId === binding.workspaceId
+    : snapshotWorkspacePath === binding.workspacePath;
 }
 
 export interface AgentExecutionStatsItem {
@@ -509,7 +517,7 @@ export class AgentApiError extends Error {
 }
 
 export interface AgentNotificationScope {
-  workspaceId: string;
+  workspaceId?: string;
   workspacePath?: string;
   sessionId?: string;
 }
@@ -795,7 +803,7 @@ export function agentUrl(pathname: string, query?: string): string {
 
 export interface TerminalSessionRequest {
   terminalTabId: string;
-  workspaceId: string;
+  workspaceId?: string | null;
   workspacePath?: string;
   sessionId: string;
   cols?: number;
@@ -807,7 +815,9 @@ function terminalSessionUrl(request: TerminalSessionRequest, channel: boolean): 
   const url = new URL(agentUrl(
     `/api/terminal/sessions/${encodeURIComponent(request.terminalTabId.trim())}${suffix}`,
   ));
-  url.searchParams.set('workspaceId', request.workspaceId.trim());
+  const workspaceId = request.workspaceId?.trim() || '';
+  url.searchParams.set('scope', workspaceId ? 'workspace' : 'personal');
+  if (workspaceId) url.searchParams.set('workspaceId', workspaceId);
   url.searchParams.set('sessionId', request.sessionId.trim());
   const workspacePath = request.workspacePath?.trim();
   if (workspacePath) url.searchParams.set('workspacePath', workspacePath);
@@ -903,11 +913,8 @@ export interface BrowserTabSnapshot {
   url: string;
   origin: string | null;
   title: string;
-  viewport: BrowserViewport;
-  viewportMode: BrowserViewportMode;
   navigationRevision: number;
   snapshotRevision: number;
-  frameSequence: number;
   createdAt: number;
   updatedAt: number;
   annotations: BrowserAnnotationSnapshot[];
@@ -915,7 +922,7 @@ export interface BrowserTabSnapshot {
 
 export interface BrowserSessionSnapshot {
   browserSessionId: string;
-  workspaceId: string;
+  workspaceId: string | null;
   sessionId: string;
   profileId: string;
   lifecycle: BrowserSessionLifecycle;
@@ -934,19 +941,10 @@ export interface BrowserCapabilitiesSnapshot {
   revision: number;
   inAppBrowserEnabled: boolean;
   browserUseEnabled: boolean;
-  runtimeStatus: string;
+  hostStatus: 'stopped' | 'starting' | 'ready' | 'reconnecting' | 'failed';
   hostProtocolCompatible: boolean;
   accessProfile: string;
-  runtimeMode: 'development' | 'managed' | 'unavailable';
-  hostStatus: 'stopped' | 'starting' | 'ready' | 'recovering' | 'failed';
-  runtimeVersion: string | null;
-  hostVersion: string | null;
-  playwrightVersion: string | null;
-  chromiumVersion: string | null;
-  availableRuntimeVersion: string | null;
-  requiredMagiVersion: string | null;
-  updateLevel: 'optional' | 'recommended' | 'required_security' | null;
-  componentManagementAvailable: boolean;
+  hostState: string;
   lastErrorCode: string | null;
 }
 
@@ -970,25 +968,51 @@ export async function updateBrowserSettings(settings: {
   return parseAgentJson<BrowserCapabilitiesSnapshot>(response, 'update browser settings');
 }
 
-export async function runBrowserRuntimeAction(
-  action: 'check-updates' | 'install' | 'uninstall',
-): Promise<BrowserCapabilitiesSnapshot> {
-  const response = await getTransport().request(agentUrl(`/api/browser/runtime/${action}`), {
-    method: 'POST',
-  });
-  return parseAgentJson<BrowserCapabilitiesSnapshot>(response, `run browser runtime action: ${action}`);
-}
-
 export async function createBrowserSession(
-  workspaceId: string,
+  workspaceId: string | null | undefined,
   sessionId: string,
+  workspacePath?: string,
 ): Promise<BrowserSessionSnapshot> {
+  const normalizedWorkspaceId = workspaceId?.trim() || '';
   const response = await getTransport().request(agentUrl('/api/browser/sessions'), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ workspaceId, sessionId }),
+    body: JSON.stringify({
+      scope: normalizedWorkspaceId ? 'workspace' : 'personal',
+      workspaceId: normalizedWorkspaceId || null,
+      workspacePath: normalizedWorkspaceId ? (workspacePath?.trim() || null) : null,
+      sessionId,
+    }),
   });
   return parseAgentJson<BrowserSessionSnapshot>(response, 'create browser session');
+}
+
+export async function materializeSession(
+  workspaceId?: string | null,
+  workspacePath?: string,
+): Promise<{ sessionId: string; workspaceId: string | null }> {
+  const normalizedWorkspaceId = workspaceId?.trim() || '';
+  const response = await getTransport().request(agentUrl('/api/session/materialize'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      scope: normalizedWorkspaceId ? 'workspace' : 'personal',
+      workspaceId: normalizedWorkspaceId || null,
+      workspacePath: normalizedWorkspaceId ? (workspacePath?.trim() || null) : null,
+    }),
+  });
+  const payload = await parseAgentJson<{ sessionId?: unknown; workspaceId?: unknown }>(
+    response,
+    'materialize session',
+  );
+  const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId.trim() : '';
+  if (!sessionId) throw new Error('materialize session response missing sessionId');
+  return {
+    sessionId,
+    workspaceId: typeof payload.workspaceId === 'string' && payload.workspaceId.trim()
+      ? payload.workspaceId.trim()
+      : null,
+  };
 }
 
 export async function getBrowserSession(browserSessionId: string): Promise<BrowserSessionSnapshot> {
@@ -1000,10 +1024,17 @@ export async function getBrowserSession(browserSessionId: string): Promise<Brows
 }
 
 export async function getCurrentBrowserSession(
-  workspaceId: string,
+  workspaceId: string | null | undefined,
   sessionId: string,
+  workspacePath?: string,
 ): Promise<BrowserSessionSnapshot | null> {
-  const query = new URLSearchParams({ workspaceId, sessionId }).toString();
+  const normalizedWorkspaceId = workspaceId?.trim() || '';
+  const query = new URLSearchParams({
+    scope: normalizedWorkspaceId ? 'workspace' : 'personal',
+    sessionId,
+    ...(normalizedWorkspaceId ? { workspaceId: normalizedWorkspaceId } : {}),
+    ...(normalizedWorkspaceId && workspacePath?.trim() ? { workspacePath: workspacePath.trim() } : {}),
+  }).toString();
   const response = await getTransport().request(
     agentUrl('/api/browser/sessions/current', query),
     { cache: 'no-store' },
@@ -1018,14 +1049,13 @@ export async function getCurrentBrowserSession(
 export async function createBrowserTab(
   browserSessionId: string,
   initialUrl: string,
-  viewport: BrowserViewport,
 ): Promise<BrowserTabSnapshot> {
   const response = await getTransport().request(
     agentUrl(`/api/browser/sessions/${encodeURIComponent(browserSessionId)}/tabs`),
     {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ initialUrl, viewport }),
+      body: JSON.stringify({ initialUrl }),
     },
   );
   return parseAgentJson<BrowserTabSnapshot>(response, 'create browser tab');
@@ -1037,54 +1067,6 @@ export async function activateBrowserTab(tabId: string): Promise<BrowserSessionS
     { method: 'POST' },
   );
   return parseAgentJson<BrowserSessionSnapshot>(response, 'activate browser tab');
-}
-
-export async function setBrowserTabViewport(
-  tabId: string,
-  request:
-    | {
-        action: 'sync';
-        width: number;
-        height: number;
-        surfaceWidth: number;
-        surfaceHeight: number;
-        controllerId: string;
-      }
-    | {
-        action: 'set';
-        mode: BrowserViewportMode;
-        width: number;
-        height: number;
-        surfaceWidth: number;
-        surfaceHeight: number;
-        deviceType: BrowserDeviceType;
-        controllerId?: string;
-      },
-): Promise<BrowserTabSnapshot> {
-  const response = await getTransport().request(
-    agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/viewport`),
-    {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(request),
-    },
-  );
-  return parseAgentJson<BrowserTabSnapshot>(response, 'resize browser tab viewport');
-}
-
-export async function releaseBrowserTabViewportController(
-  tabId: string,
-  controllerId: string,
-): Promise<void> {
-  const response = await getTransport().request(
-    agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/viewport-controller`),
-    {
-      method: 'DELETE',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ controllerId }),
-    },
-  );
-  if (!response.ok) await parseAgentJson(response, 'release browser viewport controller');
 }
 
 export async function closeBrowserTab(tabId: string): Promise<void> {
@@ -1099,7 +1081,6 @@ export async function navigateBrowserTab(
   tabId: string,
   action: 'url' | 'back' | 'forward' | 'reload',
   url?: string,
-  viewId?: string,
 ): Promise<BrowserTabSnapshot> {
   const response = await getTransport().request(
     agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/navigation`),
@@ -1109,7 +1090,6 @@ export async function navigateBrowserTab(
       body: JSON.stringify({
         action,
         ...(url ? { url } : {}),
-        ...(viewId ? { viewId } : {}),
       }),
     },
   );
@@ -1133,14 +1113,13 @@ export async function createBrowserAnnotation(
   tabId: string,
   selection: BrowserAnnotationSelection,
   comment: string,
-  viewId?: string,
 ): Promise<BrowserAnnotationSnapshot> {
   const response = await getTransport().request(
     agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/annotations`),
     {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ selection, comment, ...(viewId ? { viewId } : {}) }),
+      body: JSON.stringify({ selection, comment }),
     },
   );
   return parseAgentJson<BrowserAnnotationSnapshot>(response, 'create browser annotation');
@@ -1150,18 +1129,16 @@ export function createBrowserElementAnnotation(
   tabId: string,
   selection: Omit<Extract<BrowserAnnotationSelection, { kind: 'element' }>, 'kind'>,
   comment: string,
-  viewId?: string,
 ): Promise<BrowserAnnotationSnapshot> {
-  return createBrowserAnnotation(tabId, { kind: 'element', ...selection }, comment, viewId);
+  return createBrowserAnnotation(tabId, { kind: 'element', ...selection }, comment);
 }
 
 export function createBrowserRegionAnnotation(
   tabId: string,
   selection: Omit<Extract<BrowserAnnotationSelection, { kind: 'region' }>, 'kind'>,
   comment: string,
-  viewId?: string,
 ): Promise<BrowserAnnotationSnapshot> {
-  return createBrowserAnnotation(tabId, { kind: 'region', ...selection }, comment, viewId);
+  return createBrowserAnnotation(tabId, { kind: 'region', ...selection }, comment);
 }
 
 export async function updateBrowserAnnotationStatus(
@@ -1194,48 +1171,13 @@ export async function updateBrowserAnnotationComment(
   return parseAgentJson<BrowserAnnotationSnapshot>(response, 'update browser annotation comment');
 }
 
-export function browserScreenshotUrl(tabId: string, viewId?: string): string {
-  const url = new URL(agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/screenshot`));
-  if (viewId) url.searchParams.set('viewId', viewId);
-  return url.toString();
+export function browserScreenshotUrl(tabId: string): string {
+  return agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/screenshot`);
 }
 
 export function browserAnnotationArtifactUrl(annotationId: string, sessionId: string): string {
   const url = new URL(agentUrl(`/api/browser/annotations/${encodeURIComponent(annotationId)}/artifact`));
   url.searchParams.set('sessionId', sessionId.trim());
-  return url.toString();
-}
-
-export async function readBrowserClipboardText(): Promise<string> {
-  const response = await getTransport().request(agentUrl('/api/browser/clipboard/text'), {
-    cache: 'no-store',
-  });
-  const payload = await parseAgentJson<{ text: string }>(response, 'read browser clipboard');
-  return payload.text;
-}
-
-export async function writeBrowserClipboardText(text: string): Promise<void> {
-  const response = await getTransport().request(agentUrl('/api/browser/clipboard/text'), {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ text }),
-  });
-  if (!response.ok) await parseAgentJson(response, 'write browser clipboard');
-}
-
-export function browserChannelUrl(
-  tabId: string,
-  viewId: string,
-  viewport: { width: number; height: number },
-  surface: { width: number; height: number },
-): string {
-  const url = new URL(agentUrl(`/api/browser/tabs/${encodeURIComponent(tabId)}/channel`));
-  url.searchParams.set('viewId', viewId);
-  url.searchParams.set('width', String(Math.round(viewport.width)));
-  url.searchParams.set('height', String(Math.round(viewport.height)));
-  url.searchParams.set('surfaceWidth', String(Math.round(surface.width)));
-  url.searchParams.set('surfaceHeight', String(Math.round(surface.height)));
-  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   return url.toString();
 }
 
@@ -1263,84 +1205,53 @@ export function buildFilePreviewQuery(
   options: { includeSession?: boolean; sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
 ): string {
   const explicitSessionId = typeof options.sessionId === 'string' && options.sessionId.trim().length > 0;
+  const workspaceId = options.workspaceId?.trim() || '';
+  const workspacePath = options.workspacePath?.trim() || '';
+  const bindingOverride: AgentBindingOverride = workspaceId || workspacePath
+    ? { scope: 'workspace', workspaceId, workspacePath, sessionId: options.sessionId }
+    : { sessionId: options.sessionId };
   return buildBoundQueryWithOverride(
     { filePath },
-    {
-      sessionId: options.sessionId,
-      workspaceId: options.workspaceId,
-      workspacePath: options.workspacePath,
-    },
+    bindingOverride,
     { includeSession: options.includeSession === true || explicitSessionId },
   );
 }
 
-function resolveBindingOverrideValue(
-  bindingOverride: Partial<AgentBindingContext> | undefined,
-  key: keyof AgentBindingContext,
-  fallback: string,
-): string {
-  if (bindingOverride && Object.prototype.hasOwnProperty.call(bindingOverride, key)) {
-    const value = bindingOverride[key];
-    if (typeof value !== 'string') {
-      return fallback;
-    }
-    const trimmed = value.trim();
-    if (key === 'sessionId') {
-      return trimmed;
-    }
-    return trimmed || fallback;
-  }
-  return fallback;
-}
-
-function hasBindingOverrideKey(
-  bindingOverride: Partial<AgentBindingContext> | undefined,
-  key: keyof AgentBindingContext,
-): boolean {
-  if (!bindingOverride || !Object.prototype.hasOwnProperty.call(bindingOverride, key)) {
-    return false;
-  }
-  const value = bindingOverride[key];
-  if (value === undefined) {
-    return false;
-  }
-  if (key !== 'sessionId' && typeof value === 'string' && value.trim() === '') {
-    return false;
-  }
-  return true;
-}
-
 function resolveBindingWithOverride(
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): AgentBindingContext {
   const resolvedBinding = resolveAgentBindingContext();
-  const hasWorkspaceId = hasBindingOverrideKey(bindingOverride, 'workspaceId');
-  const hasWorkspacePath = hasBindingOverrideKey(bindingOverride, 'workspacePath');
-  const hasWorkspaceOverride = hasWorkspaceId || hasWorkspacePath;
+  const sessionId = bindingOverride?.sessionId === undefined
+    ? resolvedBinding.sessionId
+    : bindingOverride.sessionId.trim();
+  if (!bindingOverride?.scope) {
+    return resolvedBinding.scope === 'workspace'
+      ? { ...resolvedBinding, sessionId }
+      : { scope: 'personal', sessionId };
+  }
+  if (bindingOverride.scope === 'personal') {
+    return { scope: 'personal', sessionId };
+  }
   return {
-    workspaceId: hasWorkspaceId
-      ? resolveBindingOverrideValue(bindingOverride, 'workspaceId', '')
-      : (hasWorkspaceOverride ? '' : resolvedBinding.workspaceId),
-    workspacePath: hasWorkspacePath
-      ? resolveBindingOverrideValue(bindingOverride, 'workspacePath', '')
-      : (hasWorkspaceOverride ? '' : resolvedBinding.workspacePath),
-    sessionId: resolveBindingOverrideValue(
-      bindingOverride,
-      'sessionId',
-      hasWorkspaceOverride ? '' : resolvedBinding.sessionId,
-    ),
+    scope: 'workspace',
+    workspaceId: bindingOverride.workspaceId.trim(),
+    workspacePath: bindingOverride.workspacePath.trim(),
+    sessionId,
   };
 }
 
 function buildBoundQueryWithOverride(
   extra: Record<string, string>,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
   options: { includeSession?: boolean } = {},
 ): string {
   const binding = resolveBindingWithOverride(bindingOverride);
   const query = new URLSearchParams();
-  if (binding.workspaceId) query.set('workspaceId', binding.workspaceId);
-  if (binding.workspacePath) query.set('workspacePath', binding.workspacePath);
+  query.set('scope', binding.scope);
+  if (binding.scope === 'workspace') {
+    if (binding.workspaceId) query.set('workspaceId', binding.workspaceId);
+    if (binding.workspacePath) query.set('workspacePath', binding.workspacePath);
+  }
   if (options.includeSession !== false && binding.sessionId) query.set('sessionId', binding.sessionId);
   for (const [key, value] of Object.entries(extra)) {
     if (value) {
@@ -1350,32 +1261,28 @@ function buildBoundQueryWithOverride(
   return query.toString();
 }
 
-function createNotificationBindingOverride(scope: AgentNotificationScope): Partial<AgentBindingContext> {
+function createNotificationBindingOverride(scope: AgentNotificationScope): AgentBindingOverride {
   const sessionId = scope.sessionId?.trim() || '';
-  const workspaceId = scope.workspaceId.trim();
-  if (!workspaceId) {
-    throw new AgentApiError(400, 'workspaceId 不能为空', 'resolve notification scope');
-  }
-  return {
-    sessionId,
-    workspaceId,
-    workspacePath: scope.workspacePath?.trim() || '',
-  };
+  const workspaceId = scope.workspaceId?.trim() || '';
+  const workspacePath = scope.workspacePath?.trim() || '';
+  return workspaceId || workspacePath
+    ? { scope: 'workspace', workspaceId, workspacePath, sessionId }
+    : { scope: 'personal', sessionId };
 }
 
 async function postJsonWithBinding<T>(
   pathname: string,
   payload: Record<string, unknown>,
   action: string,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
   includeSession = true,
   signal?: AbortSignal,
 ): Promise<T> {
   try {
     const binding = resolveBindingWithOverride(bindingOverride);
     const bindingPayload = {
-      ...(binding.workspaceId ? { workspaceId: binding.workspaceId } : {}),
-      ...(binding.workspacePath ? { workspacePath: binding.workspacePath } : {}),
+      ...(binding.scope === 'workspace' && binding.workspaceId ? { workspaceId: binding.workspaceId } : {}),
+      ...(binding.scope === 'workspace' && binding.workspacePath ? { workspacePath: binding.workspacePath } : {}),
       ...(includeSession && binding.sessionId ? { sessionId: binding.sessionId } : {}),
     };
     const response = await getTransport().request(agentUrl(pathname), {
@@ -1400,7 +1307,7 @@ async function postBoundJson<T>(
   pathname: string,
   payload: Record<string, unknown>,
   action: string,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
   signal?: AbortSignal,
 ): Promise<T> {
   return await postJsonWithBinding<T>(pathname, payload, action, bindingOverride, true, signal);
@@ -1621,7 +1528,7 @@ export async function resolveAgentPath(
 
 export async function resolveAgentFileRevealTarget(
   filePath: string,
-  scope: { workspaceId?: string; workspacePath?: string; sessionId?: string },
+  scope: WorkspaceAgentBindingOverride,
   signal?: AbortSignal,
 ): Promise<AgentFileRevealTarget> {
   return await postJsonWithBinding<AgentFileRevealTarget>(
@@ -1681,20 +1588,52 @@ export async function getWorkspaceSessions(
   }
 }
 
+export async function getPersonalSessions(): Promise<{
+  runtimeEpoch: string;
+  eventStreamNextSequence: number;
+  sessions: AgentSessionSummary[];
+}> {
+  const response = await getTransport().request(agentUrl('/api/sessions/personal'));
+  const payload = await parseAgentJson<{
+    runtimeEpoch?: string;
+    eventStreamNextSequence?: number;
+    sessions?: RawAgentSessionSummary[];
+  }>(response, 'personal sessions');
+  const runtimeEpoch = payload.runtimeEpoch?.trim() || '';
+  const eventStreamNextSequence = payload.eventStreamNextSequence;
+  if (!runtimeEpoch || typeof eventStreamNextSequence !== 'number' || !Number.isFinite(eventStreamNextSequence)) {
+    throw new Error('personal sessions 缺少有效的运行时代际或事件游标');
+  }
+  return {
+    runtimeEpoch,
+    eventStreamNextSequence: Math.floor(eventStreamNextSequence),
+    sessions: Array.isArray(payload.sessions) ? payload.sessions.map(normalizeSessionSummary) : [],
+  };
+}
+
 export async function getAgentSessionMessages(options: {
   sessionId: string;
-  workspaceId: string;
+  scope: 'personal' | 'workspace';
+  workspaceId?: string;
   workspacePath?: string;
   beforeCursor?: string | null;
   canonicalBeforeCursor?: string | null;
   limit?: number;
 }): Promise<MessagesResponseDto> {
   const sessionId = options.sessionId.trim();
-  const workspaceId = options.workspaceId.trim();
-  if (!sessionId || !workspaceId) {
-    throw new AgentApiError(400, '会话和工作区不能为空', 'load older session messages');
+  const workspaceId = options.workspaceId?.trim() || '';
+  if (!sessionId || (options.scope === 'workspace' && !workspaceId && !options.workspacePath?.trim())) {
+    throw new AgentApiError(400, '会话作用域不完整', 'load older session messages');
   }
   try {
+    const bindingOverride: AgentBindingOverride = options.scope === 'workspace'
+      ? {
+          scope: 'workspace',
+          sessionId,
+          workspaceId,
+          workspacePath: options.workspacePath?.trim() || '',
+        }
+      : { scope: 'personal', sessionId };
     const query = buildBoundQueryWithOverride(
       {
         ...(options.limit ? { limit: String(options.limit) } : {}),
@@ -1703,11 +1642,7 @@ export async function getAgentSessionMessages(options: {
           ? { canonicalBeforeCursor: options.canonicalBeforeCursor }
           : {}),
       },
-      {
-        sessionId,
-        workspaceId,
-        workspacePath: options.workspacePath?.trim() || '',
-      },
+      bindingOverride,
     );
     const response = await getTransport().request(agentUrl('/api/messages', query));
     return await parseAgentJson<MessagesResponseDto>(response, 'load older session messages');
@@ -1723,14 +1658,14 @@ async function postWorkspaceBoundJson<T>(
   pathname: string,
   payload: Record<string, unknown>,
   action: string,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<T> {
   return await postJsonWithBinding<T>(pathname, payload, action, bindingOverride, false);
 }
 
 export async function deleteAgentSession(
   sessionId: string,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<unknown> {
   return await postBoundJson<unknown>(
     '/api/session/delete',
@@ -1742,20 +1677,21 @@ export async function deleteAgentSession(
 
 export async function markAgentSessionViewed(
   sessionId: string,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<{
   runtimeEpoch: string;
   eventStreamNextSequence: number;
   sessionId: string;
   hasUnreadCompletion: boolean;
 }> {
-  const result = await postWorkspaceBoundJson<{
+  const result = await postBoundJson<{
     runtimeEpoch: string;
     eventStreamNextSequence: number;
     sessionId: string;
+    workspaceId?: string | null;
     hasUnreadCompletion: boolean;
   }>(
-    '/api/workspaces/sessions/viewed',
+    '/api/session/viewed',
     { sessionId },
     'mark session viewed',
     bindingOverride,
@@ -1777,7 +1713,7 @@ export async function markAgentSessionViewed(
 export async function renameAgentSession(
   sessionId: string,
   name: string,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<unknown> {
   return await postBoundJson<unknown>(
     '/api/session/rename',
@@ -1789,7 +1725,7 @@ export async function renameAgentSession(
 
 export async function closeAgentSession(
   sessionId: string,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<unknown> {
   return await postBoundJson<unknown>(
     '/api/session/close',
@@ -1882,20 +1818,18 @@ export async function submitSessionTurn(
     expectedTurnId?: string | null;
     replaceTurnId?: string | null;
   },
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<AgentSessionTurnResult> {
   try {
     const binding = resolveBindingWithOverride(bindingOverride);
-    if (!binding.workspaceId) {
-      throw new AgentApiError(400, 'workspaceId 不能为空', 'submit session turn');
-    }
     const response = await getTransport().request(agentUrl('/api/session/turn'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         sessionId: binding.sessionId || null,
-        workspaceId: binding.workspaceId || null,
-        workspacePath: binding.workspacePath || null,
+        scope: binding.scope,
+        workspaceId: binding.scope === 'workspace' ? binding.workspaceId || null : null,
+        workspacePath: binding.scope === 'workspace' ? binding.workspacePath || null : null,
         text: payload.text ?? null,
         skillName: payload.skillName ?? null,
         locale: payload.locale ?? i18n.locale,
@@ -2001,16 +1935,20 @@ export async function submitSessionTurn(
 
 export async function getAgentSessionTurnQueue(
   sessionId: string,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<SessionTurnQueueResponseDto> {
   const normalizedSessionId = sessionId.trim();
   if (!normalizedSessionId) {
     throw new AgentApiError(400, 'sessionId 不能为空', 'get session turn queue');
   }
   const binding = resolveBindingWithOverride(bindingOverride);
-  const query = new URLSearchParams({ sessionId: normalizedSessionId });
-  if (binding.workspaceId) query.set('workspaceId', binding.workspaceId);
-  if (binding.workspacePath) query.set('workspacePath', binding.workspacePath);
+  const query = new URLSearchParams({
+    sessionId: normalizedSessionId,
+  });
+  if (binding.scope === 'workspace') {
+    if (binding.workspaceId) query.set('workspaceId', binding.workspaceId);
+    if (binding.workspacePath) query.set('workspacePath', binding.workspacePath);
+  }
   const response = await getTransport().request(agentUrl('/api/session/queue', query.toString()));
   return await parseAgentJson<SessionTurnQueueResponseDto>(response, 'get session turn queue');
 }
@@ -2018,7 +1956,7 @@ export async function getAgentSessionTurnQueue(
 export async function removeAgentSessionTurnQueueItem(
   sessionId: string,
   queueId: string,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<SessionTurnQueueResponseDto> {
   const normalizedSessionId = sessionId.trim();
   const normalizedQueueId = queueId.trim();
@@ -2036,7 +1974,7 @@ export async function removeAgentSessionTurnQueueItem(
 export async function guideAgentSessionTurnQueueItem(
   sessionId: string,
   queueId: string,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<SessionTurnQueueResponseDto> {
   const normalizedSessionId = sessionId.trim();
   const normalizedQueueId = queueId.trim();
@@ -2074,11 +2012,11 @@ export async function interruptAgentSession(
 }
 
 export async function getAgentSettingsBootstrap(
-  options: { scope?: 'core' | 'full'; accessProfile?: AccessProfile | null } = {},
+  options: { bootstrapScope?: 'core' | 'full'; accessProfile?: AccessProfile | null } = {},
 ): Promise<AgentSettingsBootstrapSnapshot> {
   try {
     const query = buildBoundQuery({
-      ...(options.scope === 'core' ? { scope: 'core' } : {}),
+      ...(options.bootstrapScope === 'core' ? { bootstrapScope: 'core' } : {}),
       accessProfile: normalizeAccessProfile(options.accessProfile ?? readStoredAccessProfile()),
     });
     const response = await getTransport().request(agentUrl('/api/settings/bootstrap', query));
@@ -2258,7 +2196,7 @@ export interface WorkspaceVcsStatus {
 }
 
 export async function fetchWorkspaceBranches(
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<WorkspaceBranchesResult> {
   return await postBoundJson<WorkspaceBranchesResult>('/api/workspace/vcs/branches', { includeRemote: true }, 'fetch workspace branches', bindingOverride);
 }
@@ -2282,7 +2220,7 @@ function gitExpectedPayload(expected?: GitExpectedContext): Record<string, unkno
 export async function checkoutWorkspaceBranch(
   branch: string,
   expected?: GitExpectedContext,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
   return await postBoundJson<GitOperationResult>('/api/workspace/vcs/branch/switch', {
     branch,
@@ -2308,7 +2246,7 @@ export interface GitOperationResult {
 export async function createWorkspaceBranch(
   branch: string,
   expected?: GitExpectedContext,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
   return await postBoundJson<GitOperationResult>('/api/workspace/vcs/branch/create', {
     branch,
@@ -2320,7 +2258,7 @@ export async function createWorkspaceBranch(
 export async function previewWorkspaceMerge(
   target: string,
   expected?: GitExpectedContext,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
   return await postBoundJson<GitOperationResult>('/api/workspace/vcs/merge/preview', {
     target,
@@ -2332,7 +2270,7 @@ export async function mergeWorkspaceBranch(
   target: string,
   ffOnly: boolean,
   expected?: GitExpectedContext,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
   return await postBoundJson<GitOperationResult>('/api/workspace/vcs/merge', {
     target,
@@ -2346,7 +2284,7 @@ export async function deleteWorkspaceBranch(
   branch: string,
   options: { remote?: string; force?: boolean; confirmForce?: boolean; confirmRemote?: boolean },
   expected?: GitExpectedContext,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
   return await postBoundJson<GitOperationResult>('/api/workspace/vcs/branch/delete', {
     branch,
@@ -2356,7 +2294,7 @@ export async function deleteWorkspaceBranch(
 }
 
 export async function fetchWorkspaceWorktrees(
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
   return await postBoundJson<GitOperationResult>('/api/workspace/vcs/worktree/list', {}, 'list workspace worktrees', bindingOverride);
 }
@@ -2365,7 +2303,7 @@ export async function createWorkspaceWorktree(
   mode: 'readOnly' | 'writable',
   options: { base?: string; branch?: string; allocationKey?: string },
   expected?: GitExpectedContext,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
   return await postBoundJson<GitOperationResult>('/api/workspace/vcs/worktree/create', {
     mode,
@@ -2378,7 +2316,7 @@ export async function removeWorkspaceWorktree(
   path: string,
   options: { force?: boolean; confirmForce?: boolean },
   expected?: GitExpectedContext,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
   return await postBoundJson<GitOperationResult>('/api/workspace/vcs/worktree/remove', {
     path,
@@ -2389,7 +2327,7 @@ export async function removeWorkspaceWorktree(
 
 export async function acceptWorkspaceGitContext(
   expectedContextRevision: number | null,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<GitOperationResult> {
   return await postBoundJson<GitOperationResult>('/api/workspace/vcs/context/accept', {
     ...(typeof expectedContextRevision === 'number'
@@ -2421,11 +2359,15 @@ export async function saveAgentOrchestratorConfig(config: Record<string, unknown
 
 export async function saveAgentOrchestratorSessionConfig(
   config: Record<string, unknown>,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<Record<string, unknown>> {
+  const binding = resolveBindingWithOverride(bindingOverride);
   return await postBoundJson<Record<string, unknown>>(
     '/api/settings/orchestrator/session/save',
-    { config },
+    {
+      scope: binding.scope,
+      config,
+    },
     'save session orchestrator config',
     bindingOverride,
   );
@@ -2448,17 +2390,6 @@ export async function saveAgentAuxiliaryConfig(config: Record<string, unknown>):
 
 export async function saveAgentVisionConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/vision/save', config, 'save vision config');
-}
-
-export async function previewAgentVisionRouting(
-  model: string,
-  textModelRules: Array<{ matchMode: 'exact' | 'regex'; pattern: string }>,
-): Promise<VisionRoutingPreview> {
-  return await postWorkspaceBoundJson<VisionRoutingPreview>(
-    '/api/settings/vision/routing-preview',
-    { model, textModelRules },
-    'preview vision routing',
-  );
 }
 
 export async function saveAgentImageGenerationConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -2533,7 +2464,7 @@ export async function fetchAgentModelList(config: Record<string, unknown>, targe
 }
 
 export async function clearAgentProjectKnowledge(
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<AgentKnowledgeMutationPayload> {
   return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>(
     '/api/knowledge/clear',
@@ -2544,7 +2475,7 @@ export async function clearAgentProjectKnowledge(
 }
 
 export async function getAgentProjectKnowledge(
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<Record<string, unknown>> {
   const query = buildBoundQueryWithOverride({}, bindingOverride, { includeSession: false });
   const response = await getTransport().request(agentUrl('/api/knowledge', query));
@@ -2552,7 +2483,7 @@ export async function getAgentProjectKnowledge(
 }
 
 export async function reindexAgentProjectKnowledge(
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<Record<string, unknown>> {
   return await postWorkspaceBoundJson<Record<string, unknown>>(
     '/api/knowledge/reindex',
@@ -2581,7 +2512,7 @@ export interface AgentKnowledgeItemPatch {
 
 export async function listAgentKnowledgeItems(
   kind?: AgentKnowledgeKind,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<Record<string, unknown>> {
   const params: Record<string, string> = {};
   if (kind) params.kind = kind;
@@ -2593,7 +2524,7 @@ export async function listAgentKnowledgeItems(
 export async function searchAgentKnowledgeItems(
   keyword: string,
   kind?: AgentKnowledgeKind,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<Record<string, unknown>> {
   const params: Record<string, string> = { q: keyword };
   if (kind) params.kind = kind;
@@ -2604,7 +2535,7 @@ export async function searchAgentKnowledgeItems(
 
 export async function addAgentKnowledgeItem(
   payload: AgentKnowledgeItemPayload,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<AgentKnowledgeMutationPayload> {
   return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>(
     '/api/knowledge/items',
@@ -2617,7 +2548,7 @@ export async function addAgentKnowledgeItem(
 export async function updateAgentKnowledgeItem(
   knowledgeId: string,
   patch: AgentKnowledgeItemPatch,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<AgentKnowledgeMutationPayload> {
   return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>(
     '/api/knowledge/items/update',
@@ -2629,7 +2560,7 @@ export async function updateAgentKnowledgeItem(
 
 export async function deleteAgentKnowledgeItem(
   knowledgeId: string,
-  bindingOverride?: Partial<AgentBindingContext>,
+  bindingOverride?: AgentBindingOverride,
 ): Promise<AgentKnowledgeMutationPayload> {
   return await postWorkspaceBoundJson<AgentKnowledgeMutationPayload>(
     '/api/knowledge/items/delete',
@@ -2784,12 +2715,9 @@ export interface AgentPendingChangesPayload {
 }
 
 export async function getAgentPendingChanges(
-  options: {
-    sessionId?: string;
-    workspaceId?: string;
-    workspacePath?: string;
+  options: WorkspaceAgentBindingOverride & {
     forceRefresh?: boolean;
-  } = {},
+  },
 ): Promise<AgentPendingChangesPayload> {
   try {
     const query = buildBoundQueryWithOverride(
@@ -2808,7 +2736,7 @@ export async function getAgentPendingChanges(
 
 export async function getAgentChangeDiff(
   filePath: string,
-  options: { sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+  options: WorkspaceAgentBindingOverride,
 ): Promise<AgentChangeDiffPayload> {
   try {
     const query = buildBoundQueryWithOverride({ filePath }, options);
@@ -2840,33 +2768,33 @@ export async function getAgentFilePreview(
 
 export async function approveAgentChange(
   filePath: string,
-  options: { sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+  options: WorkspaceAgentBindingOverride,
 ): Promise<void> {
   await postBoundJson('/api/changes/approve', { filePath }, 'approve change', options);
 }
 
 export async function revertAgentChange(
   filePath: string,
-  options: { sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+  options: WorkspaceAgentBindingOverride,
 ): Promise<void> {
   await postBoundJson('/api/changes/revert', { filePath }, 'revert change', options);
 }
 
 export async function approveAllAgentChanges(
-  options: { sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+  options: WorkspaceAgentBindingOverride,
 ): Promise<void> {
   await postBoundJson('/api/changes/approve-all', {}, 'approve all changes', options);
 }
 
 export async function revertAllAgentChanges(
-  options: { sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+  options: WorkspaceAgentBindingOverride,
 ): Promise<void> {
   await postBoundJson('/api/changes/revert-all', {}, 'revert all changes', options);
 }
 
 export async function revertAgentExecutionGroupChanges(
   executionGroupId: string,
-  options: { sessionId?: string; workspaceId?: string; workspacePath?: string } = {},
+  options: WorkspaceAgentBindingOverride,
 ): Promise<void> {
   await postBoundJson(
     '/api/changes/revert-execution-group',

@@ -9,7 +9,6 @@
   import {
     DESKTOP_CONTEXT_DROP_EVENT,
     normalizeDesktopDropPaths,
-    physicalToCssPoint,
     registerDesktopFileDropListener,
     resolveDesktopDroppedPath,
     resolveDesktopDropZone,
@@ -25,6 +24,7 @@
     canApplyWorkspaceSessionProjectionCursor,
     messagesState,
     replaceWorkspaceSessionProjection,
+    replacePersonalSessionProjection,
     updateWorkspaceSessionProjectionSessions,
     type WorkspaceSessionProjectionCursor,
   } from '../stores/messages.svelte';
@@ -50,6 +50,7 @@
     RUNTIME_CONNECTION_EVENT,
     resolveAgentPath,
     getWorkspaceSessions,
+    getPersonalSessions,
     listAgentWorkspaces,
     markAgentSessionViewed,
     registerAgentWorkspace,
@@ -60,7 +61,10 @@
     type AgentWorkspaceSummary,
   } from './agent-api';
   import {
+    agentBindingWorkspaceId,
+    agentBindingWorkspacePath,
     resolveAgentBindingContext,
+    type AgentBindingOverride,
   } from './agent-binding-context';
   import { navigateSession, sessionNavigationState } from '../shared/session-navigation.svelte';
   import {
@@ -85,11 +89,19 @@
     resolvePanelVisibility,
   } from './panel-layout';
 
-  // 这两个 storage key 必须先于下方 `$state` 初始化器声明——它们被
-  // readInitialExpandedWorkspaces / readInitialSidebarMode 在 $state 初始化时读取，
+  interface Props {
+    desktopAppSurface?: boolean;
+  }
+
+  let { desktopAppSurface = false }: Props = $props();
+
+  // 这些 storage key 必须先于下方 `$state` 初始化器声明——它们被
+  // readInitialExpandedWorkspaces / readInitialSidebarMode / readInitialRecentSessionsCollapsed
+  // 在 $state 初始化时读取，
   // 普通的 const 受 TDZ 约束，定义在文件下方会触发 ReferenceError。
   const SIDEBAR_EXPANDED_WORKSPACES_KEY = 'magi-sidebar-expanded-workspaces';
   const SIDEBAR_MODE_KEY = 'magi-sidebar-mode';
+  const SIDEBAR_RECENT_SESSIONS_COLLAPSED_KEY = 'magi-sidebar-recent-sessions-collapsed';
 
   let loading = $state(true);
   let loadError = $state('');
@@ -99,8 +111,10 @@
   let selectedWorkspaceId = $state('');
   let currentSessionId = $state<string | null>(null);
   let sessionsByWorkspace = $state<Record<string, Session[]>>({});
+  let recentSessions = $state<Session[]>([]);
   let loadingWorkspaceIds = $state<Record<string, boolean>>({});
   let expandedWorkspaceIds = $state<Record<string, boolean>>(readInitialExpandedWorkspaces());
+  let recentSessionsCollapsed = $state(readInitialRecentSessionsCollapsed());
   let workspaceSelectionPending = $state(false);
   let viewportWidth = $state(typeof window !== 'undefined' ? window.innerWidth : 1440);
   let sidebarOpen = $state(false);
@@ -110,8 +124,8 @@
   let pendingRemoveWorkspace = $state<AgentWorkspaceSummary | null>(null);
   let workspaceDialogError = $state('');
   let showDeleteSessionDialog = $state(false);
-  let pendingDeleteSession = $state<{ workspace: AgentWorkspaceSummary; session: Session } | null>(null);
-  let editingSession = $state<{ workspaceId: string; sessionId: string } | null>(null);
+  let pendingDeleteSession = $state<{ workspace: AgentWorkspaceSummary | null; session: Session } | null>(null);
+  let editingSession = $state<{ workspaceId: string | null; sessionId: string } | null>(null);
   let sessionRenameDraft = $state('');
   let sessionRenameError = $state('');
   let renamingSessionId = $state<string | null>(null);
@@ -128,6 +142,9 @@
   let sidebarCollapsed = $state(false);
   let previewPanelWidth = $state<number | null>(null);
   let isPreviewPanelResizing = $state(false);
+  let desktopRightPaneVisible = $state(false);
+  let desktopSnapshotEpoch = '';
+  let desktopSnapshotRevision = -1;
   let sidebarElement = $state<HTMLElement | null>(null);
   let desktopDropIndicator = $state<{
     zone: DesktopDropZone;
@@ -147,7 +164,7 @@
     selectedFilePath?: string | null;
     onFileSelect?: (selection: WorkspaceFileSelection) => void;
   };
-  type RightPaneProps = { workspaceRoot: string; overlay?: boolean };
+  type RightPaneProps = { workspaceRoot: string; overlay?: boolean; desktopSurface?: boolean };
   type WebFolderPickerProps = {
     title?: string;
     onSelect: (selection: WorkspaceFileSelection) => void;
@@ -221,7 +238,9 @@
     pendingNavigation?.target.kind === 'session' ? pendingNavigation.target.sessionId : null
   );
   const pendingSessionSwitchWorkspaceId = $derived(
-    pendingNavigation?.target.kind === 'session' ? pendingNavigation.target.workspaceId : null
+    pendingNavigation?.target.kind === 'session' && pendingNavigation.target.scope === 'workspace'
+      ? pendingNavigation.target.workspaceId
+      : null
   );
 
   $effect(() => {
@@ -230,6 +249,13 @@
     untrack(() => {
       syncComposerWorkspaces(nextWorkspaces, nextSelectedWorkspaceId);
     });
+  });
+
+  $effect(() => {
+    const sessions = messagesState.personalSessionProjection.sessions;
+    if (sessions.length !== recentSessions.length || sessions.some((session, index) => recentSessions[index]?.id !== session.id || recentSessions[index]?.updatedAt !== session.updatedAt)) {
+      recentSessions = sessions;
+    }
   });
 
   const shellLayoutStyle = $derived([
@@ -253,14 +279,17 @@
 
   /** 当前 session 的右栏多 tab 状态；由 right-pane store 派生 */
   const activeRightPaneState = $derived(getRightPaneState(rightPaneState.activeScopeKey));
-  /** 右侧面板是否在 DOM 中：仅看 collapsed——空 tab 时也可展开，由 RightPane 自带空态承接 */
-  const rightPaneVisible = $derived(!activeRightPaneState.collapsed);
+  /** Desktop 的窗口布局以 Main snapshot 为准；Web 客户端仍使用本地面板状态。 */
+  const rightPaneVisible = $derived(
+    desktopAppSurface ? desktopRightPaneVisible : !activeRightPaneState.collapsed,
+  );
+  const inlineRightPaneVisible = $derived(!desktopAppSurface && rightPaneVisible);
   const panelVisibility = $derived(resolvePanelVisibility({
     sidebarDrawer: sidebarIsDrawer,
     panelsCanCoexist: panelLayout.panelsCanCoexist,
     sidebarPreferredOpen: !sidebarCollapsed,
     sidebarDrawerOpen: sidebarOpen,
-    rightPaneOpen: rightPaneVisible,
+    rightPaneOpen: inlineRightPaneVisible,
   }));
   const sidebarHidden = $derived(!sidebarIsDrawer && !panelVisibility.sidebarVisible);
   /** 项目文件树高亮：active code tab 的 filepath */
@@ -279,7 +308,7 @@
         sidebarMode = 'projects';
       });
     }
-    if (rightPaneVisible) {
+    if (inlineRightPaneVisible) {
       void loadRightPane().catch((error) => {
         console.error('[WebWorkbenchShell] 右侧面板加载失败:', error);
         addToast('error', i18n.t('app.featureLoadFailed'));
@@ -294,7 +323,7 @@
       });
     }
   });
-  const previewIsOverlay = $derived(rightPaneVisible && panelLayout.previewOverlay);
+  const previewIsOverlay = $derived(inlineRightPaneVisible && panelLayout.previewOverlay);
 
   function currentBootstrapWorkspaceId(): string {
     return typeof messagesState.currentWorkspaceId === 'string'
@@ -302,12 +331,13 @@
       : '';
   }
 
-  function currentWorkspaceBinding(): { workspaceId: string; workspacePath: string; sessionId: string } {
+  function currentWorkspaceBinding(): { scope: 'personal' | 'workspace'; workspaceId: string; workspacePath: string; sessionId: string } {
     const binding = resolveAgentBindingContext();
     return {
-      workspaceId: binding.workspaceId,
-      workspacePath: binding.workspacePath,
-      sessionId: binding.sessionId,
+      scope: binding.scope,
+      workspaceId: agentBindingWorkspaceId(binding),
+      workspacePath: agentBindingWorkspacePath(binding),
+      sessionId: binding.sessionId ?? '',
     };
   }
 
@@ -394,11 +424,12 @@
     const sessionId = typeof messagesState.currentSessionId === 'string'
       ? messagesState.currentSessionId.trim()
       : '';
-    if (!workspaceId || !sessionId) {
+    if (!sessionId) {
       return;
     }
-    const session = (sessionsByWorkspace[workspaceId] ?? [])
-      .find((candidate) => candidate.id === sessionId);
+    const session = workspaceId
+      ? (sessionsByWorkspace[workspaceId] ?? []).find((candidate) => candidate.id === sessionId)
+      : recentSessions.find((candidate) => candidate.id === sessionId);
     if (!session) {
       return;
     }
@@ -406,39 +437,46 @@
     if (!shouldMarkSessionCompletionViewed({
       bootstrapped: messagesState.bootstrapped === true,
       sessionHydrating: messagesState.sessionHydrating === true,
-      isCurrentSession: workspaceId === selectedWorkspaceId && sessionId === currentSessionId,
+      isCurrentSession: sessionId === currentSessionId
+        && (!workspaceId || workspaceId === selectedWorkspaceId),
       isRunning,
       hasUnreadCompletion: session.hasUnreadCompletion === true,
     })) {
       return;
     }
-    const requestKey = `${workspaceId}:${sessionId}`;
+    const requestKey = `${workspaceId || 'personal'}:${sessionId}`;
     if (sessionViewedRequests.has(requestKey)) {
       return;
     }
     sessionViewedRequests.add(requestKey);
-    const workspacePath = workspacePathForId(workspaceId);
-    void markAgentSessionViewed(sessionId, {
-      workspaceId,
-      workspacePath,
-      sessionId,
-    }).then((result) => {
+    const workspacePath = workspaceId ? workspacePathForId(workspaceId) : '';
+    const binding: AgentBindingOverride = workspaceId
+      ? { scope: 'workspace', workspaceId, workspacePath, sessionId }
+      : { scope: 'personal', sessionId };
+    void markAgentSessionViewed(sessionId, binding).then((result) => {
       const cursor = {
         runtimeEpoch: result.runtimeEpoch,
         eventStreamNextSequence: result.eventStreamNextSequence,
       };
-      advanceWorkspaceSessionProjectionCursor(workspaceId, cursor);
-      workspaceSessionCursorByWorkspace.set(workspaceId, cursor);
-      const nextSessions = (sessionsByWorkspace[workspaceId] ?? []).map((candidate) => (
+      if (workspaceId) {
+        advanceWorkspaceSessionProjectionCursor(workspaceId, cursor);
+        workspaceSessionCursorByWorkspace.set(workspaceId, cursor);
+      }
+      const currentSessions = workspaceId ? (sessionsByWorkspace[workspaceId] ?? []) : recentSessions;
+      const nextSessions = currentSessions.map((candidate) => (
         candidate.id === sessionId
           ? { ...candidate, hasUnreadCompletion: false }
           : candidate
       ));
-      sessionsByWorkspace = {
-        ...sessionsByWorkspace,
-        [workspaceId]: nextSessions,
-      };
-      if (currentBootstrapWorkspaceId() === workspaceId) {
+      if (workspaceId) {
+        sessionsByWorkspace = {
+          ...sessionsByWorkspace,
+          [workspaceId]: nextSessions,
+        };
+      } else {
+        recentSessions = nextSessions;
+      }
+      if (workspaceId && currentBootstrapWorkspaceId() === workspaceId) {
         updateWorkspaceSessionProjectionSessions(workspaceId, nextSessions);
       }
     }).catch((error) => {
@@ -534,12 +572,46 @@
     return (sessionsByWorkspace[workspaceId] ?? []).filter((session) => !isInternalSession(session));
   }
 
+  function getPersonalSessionList(): Session[] {
+    return recentSessions.filter((session) => !isInternalSession(session));
+  }
+
+  async function refreshPersonalSessions(): Promise<void> {
+    try {
+      const snapshot = await getPersonalSessions();
+      recentSessions = snapshot.sessions;
+      replacePersonalSessionProjection(snapshot.sessions, {
+        runtimeEpoch: snapshot.runtimeEpoch,
+        eventStreamNextSequence: snapshot.eventStreamNextSequence,
+      });
+    } catch (error) {
+      console.warn('[WebWorkbenchShell] 刷新个人会话失败:', error);
+    }
+  }
+
+  function openPersonalDraft(): void {
+    if (workspaceActionPending || messagesState.sessionHydrating || pendingNavigation) return;
+    navigateSession({ kind: 'draft', scope: 'personal' });
+    if (sidebarIsDrawer) sidebarOpen = false;
+  }
+
+  function switchPersonalSession(sessionId: string): void {
+    if (!sessionId || pendingNavigation) return;
+    navigateSession({ kind: 'session', scope: 'personal', sessionId });
+    if (sidebarIsDrawer) sidebarOpen = false;
+  }
+
   function isSessionRunning(workspaceId: string, session: Session): boolean {
     const runningTaskCount = typeof session.runningTaskCount === 'number'
       ? session.runningTaskCount
       : 0;
     if (session.isRunning === true || runningTaskCount > 0) {
       return true;
+    }
+    if (!workspaceId) {
+      return !currentBootstrapWorkspaceId()
+        && session.id === currentSessionId
+        && messagesState.isProcessing === true;
     }
     return workspaceId === selectedWorkspaceId
       && session.id === currentSessionId
@@ -734,7 +806,7 @@
       viewportWidth: vw,
       sidebarWidth: effectiveSidebarWidth,
       sidebarVisible: panelVisibility.sidebarVisible,
-      rightPaneOpen: rightPaneVisible,
+      rightPaneOpen: inlineRightPaneVisible,
       previewOverlay: panelLayout.previewOverlay,
     });
     return Math.max(
@@ -754,7 +826,7 @@
   }
 
   function loadStoredPreviewPanelWidth(): void {
-    if (typeof window === 'undefined') {
+    if (typeof window === 'undefined' || desktopAppSurface) {
       return;
     }
     const stored = Number.parseInt(window.localStorage.getItem(PREVIEW_PANEL_WIDTH_STORAGE_KEY) || '', 10);
@@ -771,7 +843,7 @@
   }
 
   function persistPreviewPanelWidth(width: number): void {
-    if (typeof window === 'undefined') {
+    if (typeof window === 'undefined' || desktopAppSurface) {
       return;
     }
     window.localStorage.setItem(PREVIEW_PANEL_WIDTH_STORAGE_KEY, String(clampPreviewPanelWidth(width)));
@@ -838,6 +910,24 @@
     return stored === 'files' ? 'files' : 'projects';
   }
 
+  function readInitialRecentSessionsCollapsed(): boolean {
+    if (typeof window === 'undefined') return false;
+    return window.localStorage.getItem(SIDEBAR_RECENT_SESSIONS_COLLAPSED_KEY) === '1';
+  }
+
+  function persistRecentSessionsCollapsed(): void {
+    if (typeof window === 'undefined') return;
+    try {
+      if (recentSessionsCollapsed) {
+        window.localStorage.setItem(SIDEBAR_RECENT_SESSIONS_COLLAPSED_KEY, '1');
+      } else {
+        window.localStorage.removeItem(SIDEBAR_RECENT_SESSIONS_COLLAPSED_KEY);
+      }
+    } catch {
+      // 持久化失败不影响当前导航状态。
+    }
+  }
+
   function persistSidebarMode(): void {
     if (typeof window === 'undefined') return;
     try {
@@ -854,6 +944,13 @@
   $effect(() => {
     persistSidebarMode();
   });
+  $effect(() => {
+    persistRecentSessionsCollapsed();
+  });
+
+  function toggleRecentSessions(): void {
+    recentSessionsCollapsed = !recentSessionsCollapsed;
+  }
 
   function resetSidebarWidth(): void {
     const width = sidebarIsDrawer ? DEFAULT_SIDEBAR_WIDTH : window.innerWidth <= 1120 ? COMPACT_SIDEBAR_WIDTH : DEFAULT_SIDEBAR_WIDTH;
@@ -944,10 +1041,19 @@
       label?: string;
     } = {},
   ): boolean {
-    const sessionId = metadata.sessionId?.trim() || '';
     const workspaceId = metadata.workspaceId?.trim() || selectedWorkspace?.workspaceId?.trim() || selectedWorkspaceId.trim();
+    const currentBinding = currentWorkspaceBinding();
+    // 文件树事件不携带 session 元数据。桌面端的右栏是独立 Renderer，不能假设
+    // 它已经先于文件点击完成上下文同步；优先使用当前工作区的权威会话，再由
+    // right-pane store 处理无会话的 workspace 草稿，避免代码/图片 Tab 被投影到
+    // personal 或旧浏览器 scope 中。
+    const sessionId = metadata.sessionId?.trim()
+      || (workspaceId === currentBinding.workspaceId ? currentBinding.sessionId : '')
+      || (workspaceId === rightPaneState.activeWorkspaceId ? rightPaneState.activeSessionId : '');
     const workspacePath = metadata.workspacePath?.trim()
-      || (selectedWorkspace ? workspaceBindingPath(selectedWorkspace) : '');
+      || (selectedWorkspace ? workspaceBindingPath(selectedWorkspace) : '')
+      || workspacePathForId(workspaceId)
+      || (workspaceId === currentBinding.workspaceId ? currentBinding.workspacePath : '');
     if (!workspaceId || !workspacePath) {
       return false;
     }
@@ -1076,6 +1182,7 @@
     if (openDraft) {
       navigateSession({
         kind: 'draft',
+        scope: 'workspace',
         workspaceId: addedWorkspace.workspaceId,
         workspacePath: workspaceBindingPath(addedWorkspace),
       });
@@ -1252,14 +1359,16 @@
 
       const nextSession = getWorkspaceSessionList(workspaceId)[0];
       navigateSession(nextSession
-        ? {
+          ? {
             kind: 'session',
+            scope: 'workspace',
             workspaceId,
             workspacePath,
             sessionId: nextSession.id,
           }
-        : {
+          : {
             kind: 'draft',
+            scope: 'workspace',
             workspaceId,
             workspacePath,
           });
@@ -1319,7 +1428,7 @@
       [workspaceId]: true,
     };
     if (!alreadyCurrentDraft) {
-      navigateSession({ kind: 'draft', workspaceId, workspacePath });
+      navigateSession({ kind: 'draft', scope: 'workspace', workspaceId, workspacePath });
     }
     if (sidebarIsDrawer) {
       sidebarOpen = false;
@@ -1343,6 +1452,7 @@
     });
     navigateSession({
       kind: 'session',
+      scope: 'workspace',
       workspaceId: workspace.workspaceId,
       workspacePath: workspaceBindingPath(workspace),
       sessionId,
@@ -1355,6 +1465,10 @@
   function isEditingSession(workspaceId: string, sessionId: string): boolean {
     return editingSession?.workspaceId === workspaceId
       && editingSession.sessionId === sessionId;
+  }
+
+  function isEditingPersonalSession(sessionId: string): boolean {
+    return editingSession?.workspaceId === null && editingSession.sessionId === sessionId;
   }
 
   async function beginSessionRename(
@@ -1422,6 +1536,7 @@
     try {
       const snapshot = await runActionWithFeedback(
         () => renameAgentSession(session.id, normalizedName, {
+          scope: 'workspace',
           workspaceId: workspace.workspaceId,
           workspacePath: workspaceBindingPath(workspace),
         }),
@@ -1478,6 +1593,39 @@
     showDeleteSessionDialog = true;
   }
 
+  async function beginPersonalSessionRename(session: Session): Promise<void> {
+    if (renamingSessionId || pendingNavigation) return;
+    editingSession = { workspaceId: null, sessionId: session.id };
+    sessionRenameDraft = session.name || '';
+    sessionRenameError = '';
+    await tick();
+    sessionRenameInput?.focus();
+    sessionRenameInput?.select();
+  }
+
+  async function savePersonalSessionRename(session: Session): Promise<void> {
+    if (!isEditingPersonalSession(session.id) || renamingSessionId) return;
+    const name = sessionRenameDraft.trim();
+    const validationError = validateSessionName(name);
+    if (validationError) {
+      sessionRenameError = validationError;
+      return;
+    }
+    renamingSessionId = session.id;
+    try {
+      await renameAgentSession(session.id, name, {});
+      await refreshPersonalSessions();
+      cancelSessionRename();
+    } finally {
+      renamingSessionId = null;
+    }
+  }
+
+  function openPersonalDeleteSessionDialog(session: Session): void {
+    pendingDeleteSession = { workspace: null, session };
+    showDeleteSessionDialog = true;
+  }
+
   function closeDeleteSessionDialog(): void {
     showDeleteSessionDialog = false;
     pendingDeleteSession = null;
@@ -1497,8 +1645,10 @@
     getClientBridge().postMessage({
       type: 'deleteSession',
       sessionId: session.id,
-      workspaceId: workspace.workspaceId,
-      workspacePath: workspaceBindingPath(workspace),
+      ...(workspace ? {
+        workspaceId: workspace.workspaceId,
+        workspacePath: workspaceBindingPath(workspace),
+      } : {}),
       requireConfirm: false,
     });
     closeDeleteSessionDialog();
@@ -1511,13 +1661,27 @@
     viewportWidth = window.innerWidth;
   }
 
+  function requestRightPaneVisibility(visible: boolean): void {
+    if (desktopAppSurface) {
+      const desktop = window.magiDesktop;
+      if (!desktop) {
+        console.error('[WebWorkbenchShell] Desktop preload bridge 不可用');
+        return;
+      }
+      void desktop.submitLayoutIntent({ type: 'right_pane_visibility', visible })
+        .catch((error) => console.warn('[WebWorkbenchShell] 更新桌面右栏布局失败:', error));
+      return;
+    }
+    setRightPaneCollapsed(rightPaneState.activeScopeKey, !visible);
+  }
+
   function toggleSidebar(): void {
     const nextOpen = !sidebarOpen;
     sidebarOpen = nextOpen;
     // 窄屏 drawer 模式下打开 sidebar 抽屉时，自动折叠右侧 overlay（z=900）
     // 避免抽屉（z=800）被 overlay 遮住，造成用户操作无入口
     if (nextOpen && sidebarIsDrawer && rightPaneVisible) {
-      setRightPaneCollapsed(rightPaneState.activeScopeKey, true);
+      requestRightPaneVisibility(false);
     }
   }
 
@@ -1535,19 +1699,15 @@
     sidebarCollapsed = false;
     persistSidebarCollapsed(false);
     if (rightPaneVisible && !panelLayout.panelsCanCoexist) {
-      setRightPaneCollapsed(rightPaneState.activeScopeKey, true);
+      requestRightPaneVisibility(false);
     }
   }
 
   function toggleRightPaneFromHeader(): void {
-    const scopeKey = rightPaneState.activeScopeKey;
-    if (!scopeKey) {
-      return;
-    }
     if (!rightPaneVisible && sidebarIsDrawer) {
       sidebarOpen = false;
     }
-    setRightPaneCollapsed(scopeKey, rightPaneVisible);
+    requestRightPaneVisibility(!rightPaneVisible);
   }
 
   setWebSidebarContext({
@@ -1595,6 +1755,7 @@
   });
 
   $effect(() => {
+    if (desktopAppSurface) return;
     if (previewPanelWidth === null) {
       return;
     }
@@ -1626,7 +1787,7 @@
       desktopDropIndicator = null;
       return;
     }
-    const point = physicalToCssPoint(event.position, window.devicePixelRatio);
+    const point = event.position;
     const zones = {
       sidebar: sidebarHidden ? null : readDesktopDropRect(sidebarElement),
       conversation: readDesktopDropRect(
@@ -1661,6 +1822,46 @@
       }));
     }
   }
+
+  $effect(() => {
+    if (!desktopAppSurface) return;
+    const scopeKey = rightPaneState.activeScopeKey;
+    const pane = getRightPaneState(scopeKey);
+    const collapsed = !desktopRightPaneVisible;
+    if (pane.collapsed !== collapsed) {
+      setRightPaneCollapsed(scopeKey, collapsed);
+    }
+  });
+
+  onMount(() => {
+    if (!desktopAppSurface) return;
+    const desktop = window.magiDesktop;
+    if (!desktop) {
+      throw new Error('desktop_preload_bridge_unavailable');
+    }
+    let disposed = false;
+    const applySnapshot = (snapshot: MagiDesktopWindowSnapshot) => {
+      if (
+        snapshot.desktopEpoch === desktopSnapshotEpoch
+        && snapshot.snapshotRevision < desktopSnapshotRevision
+      ) {
+        return;
+      }
+      desktopSnapshotEpoch = snapshot.desktopEpoch;
+      desktopSnapshotRevision = snapshot.snapshotRevision;
+      desktopRightPaneVisible = snapshot.layout.rightPaneVisible;
+    };
+    void desktop.getSnapshot().then((snapshot) => {
+      if (!disposed) applySnapshot(snapshot);
+    }).catch((error) => {
+      if (!disposed) console.error('[WebWorkbenchShell] 获取桌面窗口快照失败:', error);
+    });
+    const stopSnapshot = desktop.onSnapshot(applySnapshot);
+    return () => {
+      disposed = true;
+      stopSnapshot();
+    };
+  });
 
   onMount(() => {
     applyViewportMode();
@@ -1741,7 +1942,7 @@
         return;
       }
       if (previewIsOverlay && rightPaneVisible) {
-        setRightPaneCollapsed(rightPaneState.activeScopeKey, true);
+        requestRightPaneVisibility(false);
       }
     };
     window.addEventListener('resize', handleResize);
@@ -1760,6 +1961,7 @@
         console.warn('[WebWorkbenchShell] 注册 Desktop 文件拖放监听失败:', error);
       });
     void refreshWorkspaces();
+    void refreshPersonalSessions();
     return () => {
       desktopDropDisposed = true;
       stopDesktopFileDrop?.();
@@ -1787,7 +1989,7 @@
   class:web-workbench-shell--sidebar-open={sidebarIsDrawer && sidebarOpen}
   class:web-workbench-shell--sidebar-hidden={sidebarHidden}
   class:web-workbench-shell--preview-overlay={previewIsOverlay}
-  class:web-workbench-shell--has-preview={rightPaneVisible}
+  class:web-workbench-shell--has-preview={inlineRightPaneVisible}
   class:web-workbench-shell--resizing={isSidebarResizing || isPreviewPanelResizing}
   class:web-workbench-shell--sidebar-resizing={isSidebarResizing}
   class:web-workbench-shell--preview-resizing={isPreviewPanelResizing}
@@ -1860,8 +2062,9 @@
       </div>
     </div>
 
-    {#if sidebarMode === 'projects'}
-      <section class="sidebar-section sidebar-section--workspaces">
+    <div class="sidebar-navigation-scroll">
+      {#if sidebarMode === 'projects'}
+        <section class="sidebar-section sidebar-section--workspaces">
         <div class="section-title-row">
           <div class="section-title">{i18n.t('common.workspace')}</div>
           <button
@@ -2068,9 +2271,9 @@
             {/each}
           </div>
         {/if}
-      </section>
-    {:else}
-      <section class="sidebar-section sidebar-section--file-tree-mode">
+        </section>
+      {:else}
+        <section class="sidebar-section sidebar-section--file-tree-mode">
         <div class="file-tree-mode-header">
           <button
             type="button"
@@ -2100,8 +2303,75 @@
         {:else}
           <div class="sidebar-empty">{i18n.t('common.loading')}</div>
         {/if}
-      </section>
-    {/if}
+        </section>
+      {/if}
+
+      <div class="recent-sessions-section">
+        <div class="section-title-row recent-sessions-header">
+          <button
+            type="button"
+            class="section-title-toggle"
+            aria-expanded={!recentSessionsCollapsed}
+            aria-controls="recent-session-content"
+            aria-label={recentSessionsCollapsed ? i18n.t('web.expandRecentSessions') : i18n.t('web.collapseRecentSessions')}
+            title={recentSessionsCollapsed ? i18n.t('web.expandRecentSessions') : i18n.t('web.collapseRecentSessions')}
+            onclick={toggleRecentSessions}
+          >
+            <span class="section-title">{i18n.t('web.recentSessions')}</span>
+            <span class="section-title-chevron" class:section-title-chevron--collapsed={recentSessionsCollapsed} aria-hidden="true">
+              <Icon name="chevronDown" size={11} />
+            </span>
+          </button>
+          <button
+            type="button"
+            class="sidebar-icon-btn sidebar-icon-btn--compact recent-session-new-btn"
+            data-tooltip={i18n.t('web.newPersonalSessionTitle')}
+            title={i18n.t('web.newPersonalSessionTitle')}
+            aria-label={i18n.t('web.newPersonalSessionTitle')}
+            disabled={workspaceActionPending || messagesState.sessionHydrating || Boolean(pendingNavigation)}
+            onclick={openPersonalDraft}
+          >
+            <Icon name="plus" size={13} />
+          </button>
+        </div>
+        {#if !recentSessionsCollapsed}
+          <div id="recent-session-content">
+            {#if getPersonalSessionList().length === 0}
+              <div class="sidebar-empty sidebar-empty--nested">{i18n.t('web.noRecentSessions')}</div>
+            {:else}
+              <div class="session-list session-list--nested">
+                {#each getPersonalSessionList() as session (session.id)}
+                {@const sessionRunning = isSessionRunning('', session)}
+                {@const sessionIndicator = resolveSessionActivityIndicator({ isRunning: sessionRunning, hasUnreadCompletion: session.hasUnreadCompletion === true })}
+                <div class="session-row" class:active={session.id === currentSessionId && !currentBootstrapWorkspaceId()} class:editing={isEditingPersonalSession(session.id)}>
+                  {#if isEditingPersonalSession(session.id)}
+                    <div class="session-rename-editor">
+                      <div class="session-rename-controls">
+                        <input bind:this={sessionRenameInput} bind:value={sessionRenameDraft} class:invalid={Boolean(sessionRenameError)} class="session-rename-input" maxlength={SESSION_NAME_MAX_CHARS} aria-label={i18n.t('header.renameSession')} oninput={() => { sessionRenameError = ''; }} onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void savePersonalSessionRename(session); } else if (event.key === 'Escape') { event.preventDefault(); cancelSessionRename(); } }} />
+                        <button type="button" class="session-rename-action session-rename-save" title={i18n.t('header.saveSessionName')} onclick={() => void savePersonalSessionRename(session)}><Icon name="check" size={12} /></button>
+                        <button type="button" class="session-rename-action" title={i18n.t('header.cancelSessionRename')} onclick={cancelSessionRename}><Icon name="x" size={12} /></button>
+                      </div>
+                      {#if sessionRenameError}<span class="session-rename-error">{sessionRenameError}</span>{/if}
+                    </div>
+                  {:else}
+                    <button type="button" class="session-item" class:active={session.id === currentSessionId && !currentBootstrapWorkspaceId()} class:pending={session.id === pendingSessionSwitchId && pendingSessionSwitchWorkspaceId === null} data-session-id={session.id} disabled={pendingNavigation !== null} title={session.name || i18n.t('header.unnamedSession')} onclick={() => switchPersonalSession(session.id)}>
+                      <span class="session-running-dot" class:running={sessionIndicator === 'running'} class:unread={sessionIndicator === 'unread'} aria-hidden="true"></span>
+                      <span class="session-name">{session.name || i18n.t('header.unnamedSession')}</span>
+                      <span class="session-meta"><span class="session-msg-count">{session.messageCount ?? 0}</span><span class="session-time">{formatRelativeTime(session.updatedAt || session.createdAt)}</span></span>
+                    </button>
+                    <div class="session-actions">
+                      <button type="button" class="session-action-btn session-rename-btn" title={i18n.t('header.renameSession')} onclick={() => void beginPersonalSessionRename(session)}><Icon name="pencil" size={12} /></button>
+                      <button type="button" class="session-action-btn session-delete-btn" title={i18n.t('header.deleteSession')} onclick={() => openPersonalDeleteSessionDialog(session)}><Icon name="delete" size={12} /></button>
+                    </div>
+                  {/if}
+                </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
+      </div>
+    </div>
 
     <div
       class="sidebar-resize-handle"
@@ -2121,13 +2391,13 @@
   >
     <div
       class="workbench-body"
-      class:workbench-body--with-preview={rightPaneVisible && !previewIsOverlay}
-      class:workbench-body--overlay-preview={rightPaneVisible && previewIsOverlay}
+      class:workbench-body--with-preview={inlineRightPaneVisible && !previewIsOverlay}
+      class:workbench-body--overlay-preview={inlineRightPaneVisible && previewIsOverlay}
     >
       <div class="workbench-app-pane" data-testid="workbench-app-pane">
-        <App />
+        <App {desktopAppSurface} />
       </div>
-      {#if rightPaneVisible && RightPaneComponent}
+      {#if inlineRightPaneVisible && RightPaneComponent}
         {#if !previewIsOverlay}
           <div
             class="preview-resize-handle"
@@ -2426,9 +2696,23 @@
     gap: var(--space-3);
   }
 
-  .sidebar-section--workspaces {
+  .sidebar-navigation-scroll {
+    display: flex;
     flex: 1;
     min-height: 0;
+    flex-direction: column;
+    gap: var(--space-3);
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-gutter: stable;
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb) transparent;
+  }
+
+  .sidebar-section--workspaces {
+    flex: 0 0 auto;
     overflow: visible;
   }
 
@@ -2568,6 +2852,74 @@
     gap: 2px;
   }
 
+  .recent-sessions-section {
+    flex: 0 0 auto;
+    padding-top: var(--space-2);
+    border-top: 1px solid color-mix(in srgb, var(--border-subtle) 70%, transparent);
+  }
+
+  .recent-sessions-header {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    min-height: 28px;
+    padding: 2px 0;
+    background: var(--magi-surface-sidebar);
+  }
+
+  .recent-session-new-btn {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
+  }
+
+  .recent-sessions-header:hover .recent-session-new-btn,
+  .recent-session-new-btn:focus-visible {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .recent-sessions-header:hover .recent-session-new-btn:disabled {
+    opacity: 0.35;
+    pointer-events: none;
+  }
+
+  .section-title-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    padding: 2px 4px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--foreground-muted);
+    cursor: pointer;
+    text-align: left;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+
+  .section-title-toggle:hover {
+    background: var(--surface-hover);
+    color: var(--foreground);
+  }
+
+  .section-title-toggle:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 1px;
+  }
+
+  .section-title-chevron {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform var(--transition-fast);
+  }
+
+  .section-title-chevron--collapsed {
+    transform: rotate(-90deg);
+  }
+
   .session-list {
     display: flex;
     flex-direction: column;
@@ -2575,30 +2927,22 @@
   }
 
   .workspace-tree {
-    min-height: 0;
-    flex: 1;
-    overflow-y: auto;
-    overflow-x: hidden;
-    padding-right: var(--space-1);
-    overscroll-behavior: contain;
-    -webkit-overflow-scrolling: touch;
-    scrollbar-gutter: stable;
-    scrollbar-width: thin;
-    scrollbar-color: var(--scrollbar-thumb) transparent;
+    flex: 0 0 auto;
+    overflow: visible;
   }
 
-  .workspace-tree::-webkit-scrollbar,
+  .sidebar-navigation-scroll::-webkit-scrollbar,
   .sidebar-section--file-tree-mode :global(.file-tree-list::-webkit-scrollbar) {
     width: 10px;
   }
 
-  .workspace-tree::-webkit-scrollbar-track,
+  .sidebar-navigation-scroll::-webkit-scrollbar-track,
   .sidebar-section--file-tree-mode :global(.file-tree-list::-webkit-scrollbar-track) {
     background: color-mix(in srgb, var(--surface-2) 58%, transparent);
     border-radius: 999px;
   }
 
-  .workspace-tree::-webkit-scrollbar-thumb,
+  .sidebar-navigation-scroll::-webkit-scrollbar-thumb,
   .sidebar-section--file-tree-mode :global(.file-tree-list::-webkit-scrollbar-thumb) {
     background: var(--scrollbar-thumb);
     border-radius: 999px;
@@ -2606,7 +2950,7 @@
     background-clip: content-box;
   }
 
-  .workspace-tree::-webkit-scrollbar-thumb:hover,
+  .sidebar-navigation-scroll::-webkit-scrollbar-thumb:hover,
   .sidebar-section--file-tree-mode :global(.file-tree-list::-webkit-scrollbar-thumb:hover) {
     background: var(--scrollbar-thumb-hover);
     background-clip: content-box;

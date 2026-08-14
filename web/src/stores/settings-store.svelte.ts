@@ -34,7 +34,6 @@ import {
   listAgentRoleTemplates,
   loadAgentToolCatalogDiagnostics,
   loadAgentSkillLibrary,
-  previewAgentVisionRouting,
   refreshAgentMcpTools,
   refreshAgentRepository,
   removeAgentInstalledSkill,
@@ -66,7 +65,6 @@ import {
 import type { RoleTemplate } from "../shared/types/role-templates";
 import type {
   VisionBuiltinTextModelRule,
-  VisionRoutingPreview,
 } from "../shared/settings-bootstrap";
 import type {
   ModelEngine,
@@ -730,34 +728,41 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   $effect(() => {
-    syncModelListSignature("orch", buildModelListSignature(orchConfig));
-    syncModelListSignature("comp", buildModelListSignature(compConfig));
-    syncModelListSignature("vision", buildModelListSignature(visionConfig));
-    syncModelListSignature("image", buildModelListSignature(imageConfig));
-
-    const liveWorkerKeys = new Set<string>(["orch", "comp", "vision", "image"]);
-    for (const [workerId, config] of Object.entries(workerConfigs)) {
-      liveWorkerKeys.add(workerId);
-      syncModelListSignature(workerId, buildModelListSignature(config));
-    }
-
-    let changed = false;
-    for (const key of Object.keys(modelListSignatures)) {
-      if (liveWorkerKeys.has(key)) {
-        continue;
+    const signatures = {
+      orch: buildModelListSignature(orchConfig),
+      comp: buildModelListSignature(compConfig),
+      vision: buildModelListSignature(visionConfig),
+      image: buildModelListSignature(imageConfig),
+    };
+    const workerSignatures = Object.entries(workerConfigs).map(([workerId, config]) => [
+      workerId,
+      buildModelListSignature(config),
+    ] as const);
+    untrack(() => {
+      for (const [key, signature] of Object.entries(signatures)) {
+        syncModelListSignature(key, signature);
       }
-      delete modelListSignatures[key];
-      delete modelLists[key];
-      delete modelDropdownOpen[key];
-      delete fetchingModels[key];
-      changed = true;
-    }
-    if (changed) {
-      modelListSignatures = { ...modelListSignatures };
-      modelLists = { ...modelLists };
-      modelDropdownOpen = { ...modelDropdownOpen };
-      fetchingModels = { ...fetchingModels };
-    }
+      const liveWorkerKeys = new Set<string>(Object.keys(signatures));
+      for (const [workerId, signature] of workerSignatures) {
+        liveWorkerKeys.add(workerId);
+        syncModelListSignature(workerId, signature);
+      }
+      let changed = false;
+      for (const key of Object.keys(modelListSignatures)) {
+        if (liveWorkerKeys.has(key)) continue;
+        delete modelListSignatures[key];
+        delete modelLists[key];
+        delete modelDropdownOpen[key];
+        delete fetchingModels[key];
+        changed = true;
+      }
+      if (changed) {
+        modelListSignatures = { ...modelListSignatures };
+        modelLists = { ...modelLists };
+        modelDropdownOpen = { ...modelDropdownOpen };
+        fetchingModels = { ...fetchingModels };
+      }
+    });
   });
 
   // 保存配置状态: 'idle' | 'saving' | 'saved' | 'error'
@@ -1479,7 +1484,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   async function fetchCurrentSettingsBootstrap(
-    options: { scope?: SettingsBootstrapScope } = {},
+    options: { bootstrapScope?: SettingsBootstrapScope } = {},
   ): Promise<AgentSettingsBootstrapSnapshot | null> {
     const payload = await getAgentSettingsBootstrap(options);
     return settingsBootstrapMatchesCurrentWorkspace(payload) ? payload : null;
@@ -1503,7 +1508,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
       mcpServersLoading = true;
     }
     try {
-      const payload = await fetchCurrentSettingsBootstrap({ scope });
+      const payload = await fetchCurrentSettingsBootstrap({ bootstrapScope: scope });
       if (
         requestBindingGeneration !== settingsBootstrapBindingGeneration
         || requestBindingKey !== currentSettingsBootstrapBindingKey()
@@ -1983,8 +1988,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
     fetchingModels = { ...fetchingModels };
 
     try {
-      const payload =
-        target === "worker"
+    const payload =
+      target === "worker"
           ? buildWorkerModelConfigPayload(config as WorkerModelFormConfig)
           : target === "orch"
             ? buildOrchestratorConnectionConfigPayload(config as InteractiveModelFormConfig)
@@ -3212,19 +3217,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!preserveDraft) visionConfig = persisted;
   }
 
-  async function previewVisionRouting(
-    model: string,
-    textModelRules: TextModelRule[],
-  ): Promise<VisionRoutingPreview> {
-    return await previewAgentVisionRouting(
-      model.trim(),
-      textModelRules.map((rule) => ({
-        matchMode: rule.matchMode,
-        pattern: rule.pattern.trim(),
-      })),
-    );
-  }
-
   function applyImageGenerationConfig(config: any): void {
     if (!config) {
       return;
@@ -3914,13 +3906,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     get visionBuiltinTextModelRules() {
       return visionBuiltinTextModelRules;
     },
-    get visionCurrentMainModel() {
-      const snapshot = messagesState.settingsBootstrapSnapshot as
-        | AgentSettingsBootstrapSnapshot
-        | null;
-      const model = snapshot?.effectiveOrchestratorConfig?.model;
-      return typeof model === "string" ? model.trim() : "";
-    },
     set compConfig(v) {
       compConfig = v;
     },
@@ -3939,7 +3924,6 @@ function createSettingsStore(props: { onClose?: () => void }) {
     get modelConfigBaselines() {
       return modelConfigBaselines;
     },
-    previewVisionRouting,
     get workerModelTabs() {
       return workerModelTabs;
     },

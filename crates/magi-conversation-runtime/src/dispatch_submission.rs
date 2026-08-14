@@ -79,6 +79,8 @@ pub struct DispatchSubmissionRequest {
     pub accepted_at: UtcMillis,
     pub session_id: SessionId,
     pub workspace_id: Option<WorkspaceId>,
+    /// 任务执行 cwd。项目会话使用项目根目录；个人会话使用 Magi 管理的私有目录。
+    pub execution_root: Option<std::path::PathBuf>,
     pub entry_id: String,
     pub timeline_message: String,
     pub images: Vec<SessionTurnImage>,
@@ -455,15 +457,29 @@ pub fn run_dispatch_submission(
 
     let workspace_id = request.workspace_id.clone();
     let execution_chain_ref = format!("session-action-chain-{}", accepted_at.0);
-    let worker_thread_id = session_thread::ensure_thread_for_role(
-        runtime.session_store,
-        session_id,
-        &mission_id,
-        target_role,
-        &worker_id,
-        &act_task_id,
-        now,
-    );
+    // coordinator 是 session 主线的唯一执行角色，必须复用 session 的
+    // orchestrator thread。否则每个普通回合都会生成一个空 worker thread，
+    // 上下文权威层只能看到空历史，连续对话和自动压缩都会被架空。
+    // 显式指定的非 coordinator role 仍使用独占 thread，避免 sidechain 事实
+    // 污染主线上下文。
+    let use_orchestrator_thread =
+        target_role == "coordinator" && request.recovery_checkpoint.is_none();
+    let worker_thread_id = if use_orchestrator_thread {
+        runtime
+            .session_store
+            .activate_thread(&orchestrator_thread_id, &act_task_id, now);
+        orchestrator_thread_id.clone()
+    } else {
+        session_thread::ensure_thread_for_role(
+            runtime.session_store,
+            session_id,
+            &mission_id,
+            target_role,
+            &worker_id,
+            &act_task_id,
+            now,
+        )
+    };
     if let Some(checkpoint) = interrupted_turn_checkpoint {
         install_interrupted_turn_checkpoint(
             runtime.session_store,
@@ -499,6 +515,7 @@ pub fn run_dispatch_submission(
             is_primary: true,
             session_id: session_id.clone(),
             workspace_id: workspace_id.clone(),
+            execution_root: request.execution_root.clone(),
             ownership: ownership.clone(),
             writebacks: ExecutionWritebackPlans::from_session_action_input(
                 DispatchMemoryExtractionInput {
@@ -895,6 +912,7 @@ mod tests {
             accepted_at: UtcMillis(2_000),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-fresh-thread")),
+            execution_root: None,
             entry_id: "timeline-dispatch-fresh-thread".to_string(),
             timeline_message: "创建当前任务文件".to_string(),
             images: Vec::new(),
@@ -955,6 +973,95 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_dispatch_reuses_session_orchestrator_thread_for_continuous_context() {
+        let session_store = SessionStore::new();
+        let task_store = TaskStore::new();
+        let execution_registry = TaskExecutionRegistry::default();
+        let event_bus = InMemoryEventBus::new(16);
+        let agent_role_registry = AgentRoleRegistry::load_default();
+        let spawn_graph = Mutex::new(SpawnGraph::new());
+        let session_id = SessionId::new("session-dispatch-orchestrator-thread");
+        session_store
+            .create_session(session_id.clone(), "coordinator thread")
+            .expect("session should be creatable");
+
+        let runtime = DispatchSubmissionRuntime {
+            session_store: &session_store,
+            task_store: &task_store,
+            execution_registry: &execution_registry,
+            event_bus: &event_bus,
+            agent_role_registry: &agent_role_registry,
+            spawn_graph: &spawn_graph,
+            model_bridge_client: None,
+            settings_store: None,
+            workspace_root_path: None,
+        };
+        let make_request = |accepted_at| DispatchSubmissionRequest {
+            accepted_at,
+            session_id: session_id.clone(),
+            workspace_id: None,
+            execution_root: None,
+            entry_id: format!("timeline-{}", accepted_at.0),
+            timeline_message: format!("主线回合 {}", accepted_at.0),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            browser_annotation_refs: Vec::new(),
+            created_session: false,
+            mission_title: "连续上下文".to_string(),
+            task_title: "连续上下文".to_string(),
+            trimmed_text: Some("继续处理".to_string()),
+            execution_goal: Some("继续处理当前任务".to_string()),
+            task_tier: TaskTier::ExecutionChain,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            goal_mode: false,
+            target_role: None,
+            request_id: None,
+            user_message_id: None,
+            placeholder_message_id: None,
+            replace_turn_id: None,
+            required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            denied_tools: Vec::new(),
+            turn_origin: DispatchTurnOrigin::User,
+        };
+
+        let first = run_dispatch_submission(&runtime, &make_request(UtcMillis(1_000)))
+            .expect("first coordinator dispatch should build");
+        let second = run_dispatch_submission(&runtime, &make_request(UtcMillis(2_000)))
+            .expect("second coordinator dispatch should build");
+        let orchestrator_thread_id = session_store
+            .orchestrator_thread_for_session(&session_id)
+            .expect("session should have orchestrator thread")
+            .thread_id;
+        let first_thread_id = first
+            .active_execution_chain
+            .as_ref()
+            .and_then(|chain| chain.branches.first())
+            .expect("first branch should exist")
+            .thread_id
+            .clone();
+        let second_thread_id = second
+            .active_execution_chain
+            .as_ref()
+            .and_then(|chain| chain.branches.first())
+            .expect("second branch should exist")
+            .thread_id
+            .clone();
+
+        assert_eq!(first_thread_id, orchestrator_thread_id);
+        assert_eq!(second_thread_id, orchestrator_thread_id);
+        let thread = session_store
+            .thread_registry_snapshot(&session_id)
+            .into_iter()
+            .find(|thread| thread.thread_id == orchestrator_thread_id)
+            .expect("orchestrator thread should be registered");
+        assert_eq!(thread.handled_task_ids.len(), 2);
+        assert_eq!(thread.status, ExecutionThreadStatus::Active);
+    }
+
+    #[test]
     fn dispatch_submission_persists_authoritative_browser_annotations_on_turn_and_task() {
         let session_store = SessionStore::new();
         let task_store = TaskStore::new();
@@ -984,6 +1091,7 @@ mod tests {
             accepted_at: UtcMillis(2_100),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-browser-annotation")),
+            execution_root: None,
             entry_id: "timeline-dispatch-browser-annotation".to_string(),
             timeline_message: "根据浏览器标记检查页面".to_string(),
             images: Vec::new(),
@@ -1171,6 +1279,7 @@ mod tests {
             accepted_at: UtcMillis(3_000),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-resume-checkpoint")),
+            execution_root: None,
             entry_id: "timeline-dispatch-resume-checkpoint".to_string(),
             timeline_message: "继续".to_string(),
             images: Vec::new(),
@@ -1323,6 +1432,7 @@ mod tests {
             accepted_at: UtcMillis(4_000),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-invalid-resume-checkpoint")),
+            execution_root: None,
             entry_id: "timeline-invalid-resume-checkpoint".to_string(),
             timeline_message: "继续".to_string(),
             images: Vec::new(),
@@ -1423,6 +1533,7 @@ mod tests {
             accepted_at: UtcMillis(3_000),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-exec-chain-tier")),
+            execution_root: None,
             entry_id: "timeline-exec-chain-tier".to_string(),
             timeline_message: "修复明确 bug 并跑相关验证".to_string(),
             images: Vec::new(),
@@ -1530,6 +1641,7 @@ mod tests {
             accepted_at: UtcMillis(3_100),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-plan-root-binding")),
+            execution_root: None,
             entry_id: "timeline-plan-root-binding".to_string(),
             timeline_message: "继续计划".to_string(),
             images: Vec::new(),
@@ -1597,6 +1709,7 @@ mod tests {
             accepted_at: UtcMillis(3_250),
             session_id,
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-skill-mainline-role")),
+            execution_root: None,
             entry_id: "timeline-dispatch-skill-mainline-role".to_string(),
             timeline_message: "使用 browser Skill 创建 explorer 子代理".to_string(),
             images: Vec::new(),
@@ -1670,6 +1783,7 @@ mod tests {
             accepted_at: UtcMillis(3_500),
             session_id,
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-active-skill")),
+            execution_root: None,
             entry_id: "timeline-dispatch-active-skill".to_string(),
             timeline_message: "使用代码审查 skill 检查当前改动".to_string(),
             images: Vec::new(),
@@ -1745,6 +1859,7 @@ mod tests {
             accepted_at: UtcMillis(4_000),
             session_id,
             workspace_id: Some(WorkspaceId::new("workspace-dispatch-context-reference")),
+            execution_root: None,
             entry_id: "timeline-dispatch-context-reference".to_string(),
             timeline_message: "检查引用文件".to_string(),
             images: Vec::new(),
@@ -1851,6 +1966,7 @@ mod tests {
             accepted_at: UtcMillis(5_000),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-goal-continuation-dispatch")),
+            execution_root: None,
             entry_id: "timeline-goal-continuation-dispatch".to_string(),
             timeline_message: "目标自动推进: 完成验收".to_string(),
             images: Vec::new(),
@@ -1965,6 +2081,7 @@ mod tests {
             accepted_at: UtcMillis(6_000),
             session_id: session_id.clone(),
             workspace_id: Some(WorkspaceId::new("workspace-goal-continuation-pause-race")),
+            execution_root: None,
             entry_id: "timeline-goal-continuation-pause-race".to_string(),
             timeline_message: "目标自动推进: 验证暂停竞态".to_string(),
             images: Vec::new(),

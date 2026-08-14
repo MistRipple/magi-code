@@ -481,11 +481,17 @@
   const emptyTitle = $derived(emptyState?.title || i18n.t('messageList.empty.title'));
   const emptyHint = $derived(emptyState?.hint || i18n.t('messageList.empty.hint'));
   const showSuggestions = $derived(displayContext === 'thread' && !emptyState && !messagesState.isProcessing);
-  const suggestionItems = $derived([
-    i18n.t('messageList.suggestions.s1'),
-    i18n.t('messageList.suggestions.s2'),
-    i18n.t('messageList.suggestions.s3'),
-  ]);
+  const suggestionItems = $derived(messagesState.currentWorkspaceId
+    ? [
+        i18n.t('messageList.suggestions.workspace.s1'),
+        i18n.t('messageList.suggestions.workspace.s2'),
+        i18n.t('messageList.suggestions.workspace.s3'),
+      ]
+    : [
+        i18n.t('messageList.suggestions.magiSpace.s1'),
+        i18n.t('messageList.suggestions.magiSpace.s2'),
+        i18n.t('messageList.suggestions.magiSpace.s3'),
+      ]);
   function fillComposer(text: string) {
     if (typeof window === 'undefined') return;
     window.dispatchEvent(new CustomEvent('magi:fillComposer', { detail: { text } }));
@@ -871,6 +877,7 @@
     try {
       const response = await getAgentSessionMessages({
         sessionId,
+        scope: workspaceId ? 'workspace' : 'personal',
         workspaceId,
         workspacePath: messagesState.currentWorkspacePath,
         beforeCursor: historyState.beforeCursor,

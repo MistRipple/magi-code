@@ -7,6 +7,8 @@ use magi_session_store::{CANONICAL_TURN_SCHEMA_VERSION, CanonicalTurn, Canonical
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::SessionScopeKindDto;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionTurnImageDto {
@@ -35,6 +37,7 @@ pub struct SessionContextReferenceDto {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionTurnRequestDto {
     pub session_id: Option<String>,
+    pub scope: SessionScopeKindDto,
     pub workspace_id: Option<String>,
     #[serde(default)]
     pub workspace_path: Option<String>,
@@ -245,9 +248,6 @@ impl SessionTurnRequestDto {
         if let Some(text) = trimmed_text {
             message_lines.push(text.to_string());
         }
-        if !self.images.is_empty() {
-            message_lines.push(format!("[图片 {} 张]", self.images.len()));
-        }
         if message_lines.is_empty() && !self.context_references.is_empty() {
             message_lines.push(format!("[上下文引用 {} 项]", self.context_references.len()));
         }
@@ -257,7 +257,9 @@ impl SessionTurnRequestDto {
                 self.browser_annotation_refs.len()
             ));
         }
-        if message_lines.is_empty() {
+        if message_lines.is_empty() && !self.images.is_empty() {
+            String::new()
+        } else if message_lines.is_empty() {
             "[空输入]".to_string()
         } else {
             message_lines.join("\n")
@@ -428,6 +430,7 @@ mod tests {
     fn timeline_message_uses_user_text_directly() {
         let request = SessionTurnRequestDto {
             session_id: Some("session-a".to_string()),
+            scope: SessionScopeKindDto::Workspace,
             workspace_id: Some("workspace-a".to_string()),
             workspace_path: None,
             text: Some("请分析项目".to_string()),
@@ -454,8 +457,41 @@ mod tests {
     }
 
     #[test]
+    fn timeline_message_does_not_add_image_count_to_user_content() {
+        let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope": "personal",
+            "text": "请分析这张图",
+            "images": [{
+                "name": "diagram.png",
+                "dataUrl": "data:image/png;base64,AAA"
+            }]
+        }))
+        .expect("带图会话请求必须可解析");
+
+        assert_eq!(
+            request.timeline_message(request.trimmed_text().as_deref()),
+            "请分析这张图"
+        );
+    }
+
+    #[test]
+    fn image_only_timeline_message_has_no_synthetic_text() {
+        let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope": "personal",
+            "images": [{
+                "name": "diagram.png",
+                "dataUrl": "data:image/png;base64,AAA"
+            }]
+        }))
+        .expect("纯图片会话请求必须可解析");
+
+        assert_eq!(request.timeline_message(None), "");
+    }
+
+    #[test]
     fn session_turn_request_accepts_camel_case_access_profile() {
         let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope": "personal",
             "text": "请执行当前任务",
             "images": [],
             "accessProfile": "full_access"
@@ -471,6 +507,7 @@ mod tests {
     #[test]
     fn session_turn_request_accepts_structured_goal_mode() {
         let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope": "personal",
             "text": "完成当前产品稳定性验收",
             "images": [],
             "goalMode": true
@@ -483,6 +520,7 @@ mod tests {
     #[test]
     fn timeline_message_keeps_control_fields_out_of_user_content() {
         let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope": "personal",
             "text": "完成稳定性验收",
             "skillName": "cn-engineering-standard",
             "goalMode": true,
@@ -499,6 +537,7 @@ mod tests {
     #[test]
     fn session_turn_request_accepts_structured_context_references() {
         let request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope": "personal",
             "text": "分析引用的文件",
             "images": [],
             "contextReferences": [
@@ -538,6 +577,7 @@ mod tests {
         std::fs::write(root.join("file.md"), "reference\n").expect("reference file should create");
 
         let mut request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope": "personal",
             "text": "验证引用",
             "contextReferences": [
                 { "kind": "file", "path": root.join("file.md"), "name": "file.md" },
@@ -562,6 +602,7 @@ mod tests {
         );
 
         let mut invalid: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope": "personal",
             "text": "验证错误类型",
             "contextReferences": [
                 { "kind": "directory", "path": root.join("file.md"), "name": "file.md" }
@@ -585,6 +626,7 @@ mod tests {
             .as_str()
             .to_string();
         let mut request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope": "personal",
             "text": "inspect",
             "contextReferences": [{
                 "kind": "directory",

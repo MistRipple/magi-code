@@ -173,6 +173,7 @@ pub(crate) use magi_conversation_runtime::execution_chain_recovery::{
 fn rebuild_dispatch_plan_for_branch(
     chain: &ActiveExecutionChain,
     branch: &ActiveExecutionBranch,
+    execution_root: Option<std::path::PathBuf>,
     execution_settings_snapshot: Option<Arc<SettingsStore>>,
 ) -> TaskExecutionPlan {
     let ownership = ExecutionOwnership {
@@ -212,6 +213,7 @@ fn rebuild_dispatch_plan_for_branch(
         is_primary: branch.is_primary,
         session_id: chain.session_id.clone(),
         workspace_id: chain.workspace_id.clone(),
+        execution_root,
         ownership,
         writebacks,
         use_tools: branch.use_tools,
@@ -602,6 +604,11 @@ where
     let workspace_id = state
         .session_workspace_id(&session)
         .or_else(|| chain.workspace_id.clone());
+    let execution_root = if workspace_id.is_none() {
+        Some(state.personal_session_execution_root(session_id)?)
+    } else {
+        None
+    };
     state
         .ensure_snapshot_session_for_workspace_id(session_id, &workspace_id)
         .await?;
@@ -730,7 +737,12 @@ where
     for branch in &branches_to_resume {
         state.task_execution_registry().insert(
             branch.task_id.clone(),
-            rebuild_dispatch_plan_for_branch(&chain, branch, execution_settings_snapshot.clone()),
+            rebuild_dispatch_plan_for_branch(
+                &chain,
+                branch,
+                execution_root.clone(),
+                execution_settings_snapshot.clone(),
+            ),
         );
         if let Some(worker_runtime) = worker_runtime_handle {
             sync_branch_checkpoint_to_worker_runtime(worker_runtime, branch);

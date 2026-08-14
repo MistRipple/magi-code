@@ -1,0 +1,82 @@
+appId: com.mistripple.magi
+productName: Magi
+copyright: Copyright © Magi contributors
+asar: true
+npmRebuild: false
+removePackageScripts: true
+compression: normal
+electronLanguages:
+  - en-US
+  - zh-CN
+
+directories:
+  buildResources: icons
+  output: ../../target/electron-dist
+
+files:
+  - dist/main/**
+  - dist/preload/**
+  - package.json
+  - "!**/*.map"
+
+extraResources:
+  - from: ../../target/release
+    to: daemon
+    filter:
+      - magi-daemon-app
+      - magi-daemon-app.exe
+  - from: ../../browser-automation-worker/dist/index.cjs
+    to: browser-automation-worker/index.cjs
+  - from: ../../web/dist
+    to: web/dist
+  - from: dist/resources/browser-capability-manifest.json
+    to: browser-capability-manifest.json
+  - from: dist/resources/licenses
+    to: licenses
+  - from: dist/resources/sbom/magi-desktop.cdx.json
+    to: sbom/magi-desktop.cdx.json
+
+afterPack: ./scripts/after-pack.mjs
+artifactName: Magi-${version}-${os}-${arch}.${ext}
+
+publish:
+  provider: github
+  owner: MistRipple
+  repo: magi-code
+  releaseType: release
+
+mac:
+  category: public.app-category.developer-tools
+  icon: icons/icon.icns
+  minimumSystemVersion: "12.0"
+  hardenedRuntime: true
+  notarize: true
+  gatekeeperAssess: false
+  binaries:
+    - Contents/Resources/daemon/magi-daemon-app
+  target:
+    - dmg
+    - zip
+
+dmg:
+  sign: true
+
+win:
+  icon: icons/icon.ico
+  target:
+    - nsis
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowElevation: true
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+
+linux:
+  category: Development
+  icon: icons
+  executableName: Magi
+  target:
+    - AppImage
+    - deb

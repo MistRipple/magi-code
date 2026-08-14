@@ -11,9 +11,14 @@ import {
 } from '../../web/agent-api';
 import {
   clearAgentBindingContext,
+  agentBindingWorkspaceId,
+  agentBindingWorkspacePath,
   resolveAgentBindingContext,
   seedAgentBindingContextFromWindow,
   setAgentBindingContext,
+  type AgentBindingContext,
+  type AgentBindingOverride,
+  type WorkspaceAgentBindingOverride,
 } from '../../web/agent-binding-context';
 import { i18n } from '../../stores/i18n.svelte';
 import { getHostApi, getTransport, initTransport } from '../transport';
@@ -42,6 +47,7 @@ import {
   getAgentProjectKnowledge,
   getAgentNotifications,
   getAgentSessionTurnQueue,
+  getPersonalSessions,
   guideAgentSessionTurnQueueItem,
   getWorkspaceSessions,
   interruptAgentSession,
@@ -160,6 +166,7 @@ let bridgeListenerRegistered = false;
 let currentWorkspaceId = '';
 let currentWorkspacePath = '';
 let currentSessionId = '';
+let currentSessionScope: 'personal' | 'workspace' = 'personal';
 let currentInterruptTaskId = '';
 let continueRequestId = '';
 let currentRuntimeEpoch = '';
@@ -207,7 +214,7 @@ let eventStreamSnapshotRefreshBindingKey = '';
 let eventStreamTunnelSyncInFlight: Promise<void> | null = null;
 let eventStreamTunnelSyncBindingKey = '';
 let initialWindowBindingHydrated = false;
-let workspaceSessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let sessionSummaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let terminalTaskRuntimeRefreshTimer: number | null = null;
 const inFlightChangeMutationScopes = new Set<string>();
 
@@ -451,28 +458,44 @@ function resolveWorkspaceScopeFromSource(
   };
 }
 
-type BridgeRequestScope = {
-  sessionId?: string;
-  workspaceId?: string;
-  workspacePath?: string;
-  knowledgeRequestId?: string;
-};
+type BridgeRequestScope = AgentBindingOverride & { knowledgeRequestId?: string };
 
 function requestScopeFromMessage(
   message: Record<string, unknown>,
   fallbackSessionId: string = currentSessionId,
 ): BridgeRequestScope {
   const workspaceScope = resolveWorkspaceScopeFromSource(message);
-  const scope: BridgeRequestScope = {
-    workspaceId: workspaceScope.workspaceId || undefined,
-    workspacePath: workspaceScope.workspacePath || undefined,
+  const sessionId = hasBridgeField(message, 'sessionId')
+    ? trimBridgeString(message.sessionId)
+    : (!workspaceScope.hasWorkspaceOverride ? fallbackSessionId : '');
+  return workspaceScope.workspaceId || workspaceScope.workspacePath
+    ? {
+        scope: 'workspace',
+        workspaceId: workspaceScope.workspaceId,
+        workspacePath: workspaceScope.workspacePath,
+        ...(sessionId ? { sessionId } : {}),
+      }
+    : { scope: 'personal', ...(sessionId ? { sessionId } : {}) };
+}
+
+function currentSessionBindingOverride(
+  sessionId = currentSessionId,
+  workspaceId = currentWorkspaceId,
+  workspacePath = currentWorkspacePath,
+): AgentBindingOverride {
+  return workspaceId || workspacePath
+    ? { scope: 'workspace', workspaceId, workspacePath, sessionId }
+    : { scope: 'personal', sessionId };
+}
+
+function requireWorkspaceRequestScope(scope: BridgeRequestScope): WorkspaceAgentBindingOverride {
+  const workspaceScope = resolveWorkspaceScopeFromSource(scope);
+  return {
+    scope: 'workspace',
+    workspaceId: workspaceScope.workspaceId,
+    workspacePath: workspaceScope.workspacePath,
+    sessionId: scope.sessionId,
   };
-  if (hasBridgeField(message, 'sessionId')) {
-    scope.sessionId = trimBridgeString(message.sessionId);
-  } else if (!workspaceScope.hasWorkspaceOverride && fallbackSessionId) {
-    scope.sessionId = fallbackSessionId;
-  }
-  return scope;
 }
 
 function changeMutationScopeKey(scope: BridgeRequestScope): string {
@@ -849,7 +872,7 @@ function syncTunnelRuntimeForSilentEventStream(reason: string, error: Error): vo
   }
   eventStreamTunnelSyncBindingKey = syncBindingKey;
   const request = (async (): Promise<void> => {
-    if (!binding.workspaceId || !binding.sessionId) {
+    if (binding.scope !== 'workspace' || !binding.workspaceId || !binding.sessionId) {
       return;
     }
     const snapshot = await getWorkspaceSessions(
@@ -983,53 +1006,62 @@ function ensureWindowListener(): void {
 
 function extractSessionBootstrapBinding(
   message: ClientBridgeMessage,
-): { sessionId: string; workspaceId: string; workspacePath: string } {
+): AgentBindingContext | null {
   if (message.type !== 'unifiedMessage') {
-    return { sessionId: '', workspaceId: '', workspacePath: '' };
+    return null;
   }
   const standard = message.message as StandardMessage | undefined;
   if (!standard || standard.category !== MessageCategory.DATA) {
-    return { sessionId: '', workspaceId: '', workspacePath: '' };
+    return null;
   }
   if (standard.data?.dataType !== 'sessionBootstrapLoaded') {
-    return { sessionId: '', workspaceId: '', workspacePath: '' };
+    return null;
   }
   const payload = standard.data?.payload;
   if (!payload || typeof payload !== 'object') {
-    return { sessionId: '', workspaceId: '', workspacePath: '' };
+    return null;
   }
   const payloadRecord = payload as Record<string, unknown>;
   const workspaceRecord = payloadRecord.workspace && typeof payloadRecord.workspace === 'object'
     ? payloadRecord.workspace as Record<string, unknown>
     : undefined;
-  return {
-    sessionId: typeof payloadRecord.sessionId === 'string' ? payloadRecord.sessionId.trim() : '',
-    workspaceId: typeof workspaceRecord?.workspaceId === 'string' ? workspaceRecord.workspaceId.trim() : '',
-    workspacePath: typeof workspaceRecord?.rootPath === 'string' ? workspaceRecord.rootPath.trim() : '',
-  };
+  const sessionId = typeof payloadRecord.sessionId === 'string' ? payloadRecord.sessionId.trim() : '';
+  if (payloadRecord.scope === 'workspace') {
+    const workspaceId = typeof workspaceRecord?.workspaceId === 'string'
+      ? workspaceRecord.workspaceId.trim()
+      : '';
+    const workspacePath = typeof workspaceRecord?.rootPath === 'string'
+      ? workspaceRecord.rootPath.trim()
+      : '';
+    if (!workspaceId && !workspacePath) return null;
+    return {
+        scope: 'workspace',
+        workspaceId,
+        workspacePath,
+        ...(sessionId ? { sessionId } : {}),
+      };
+  }
+  if (payloadRecord.scope !== 'personal') return null;
+  return { scope: 'personal', ...(sessionId ? { sessionId } : {}) };
 }
 
 function syncBindingFromBridgeMessage(message: ClientBridgeMessage): void {
   const binding = extractSessionBootstrapBinding(message);
+  if (!binding) return;
   const nextSessionId = binding.sessionId;
-  const nextWorkspaceId = binding.workspaceId;
-  const nextWorkspacePath = binding.workspacePath;
+  const nextWorkspaceId = agentBindingWorkspaceId(binding);
+  const nextWorkspacePath = agentBindingWorkspacePath(binding);
   if (!nextSessionId) {
     return;
   }
   const bindingChanged = nextSessionId !== currentSessionId
+    || binding.scope !== currentSessionScope
     || nextWorkspaceId !== currentWorkspaceId
     || nextWorkspacePath !== currentWorkspacePath;
   if (!bindingChanged) {
     return;
   }
-  if (!nextWorkspaceId) {
-    console.warn('[web-client-bridge] 忽略缺少 workspaceId 的会话绑定更新', {
-      sessionId: nextSessionId,
-    });
-    return;
-  }
-  persistWorkspaceBinding(nextWorkspaceId, nextWorkspacePath, nextSessionId);
+  persistWorkspaceBinding(binding.scope, nextWorkspaceId, nextWorkspacePath, nextSessionId);
   ensureEventStream();
 }
 
@@ -1453,26 +1485,27 @@ function shouldApplyCurrentSessionRustEvent(event: RustEventEnvelope): boolean {
   return true;
 }
 
-function scheduleWorkspaceSessionSummaryRefresh(reason: string): void {
-  if (workspaceSessionSummaryRefreshTimer) {
+function scheduleSessionSummaryRefresh(reason: string): void {
+  if (sessionSummaryRefreshTimer) {
     return;
   }
-  workspaceSessionSummaryRefreshTimer = setTimeout(() => {
-    workspaceSessionSummaryRefreshTimer = null;
+  sessionSummaryRefreshTimer = setTimeout(() => {
+    sessionSummaryRefreshTimer = null;
     const binding = resolveWorkspaceQuery();
-    if (!binding.workspaceId) {
-      return;
-    }
-    void getWorkspaceSessions(
-      binding.workspaceId,
-      binding.workspacePath,
-    ).then((snapshot) => {
+    const request = binding.scope === 'workspace'
+      ? getWorkspaceSessions(binding.workspaceId, binding.workspacePath)
+      : getPersonalSessions();
+    void request.then((snapshot) => {
       const currentBinding = resolveWorkspaceQuery();
-      if (currentBinding.workspaceId !== binding.workspaceId) {
+      if (
+        currentBinding.scope !== binding.scope
+        || agentBindingWorkspaceId(currentBinding) !== agentBindingWorkspaceId(binding)
+        || agentBindingWorkspacePath(currentBinding) !== agentBindingWorkspacePath(binding)
+      ) {
         return;
       }
       emitDataMessage('sessionsUpdated', {
-        workspaceId: binding.workspaceId,
+        ...(binding.scope === 'workspace' ? { workspaceId: binding.workspaceId } : {}),
         sessions: snapshot.sessions,
         runtimeEpoch: snapshot.runtimeEpoch,
         eventStreamNextSequence: snapshot.eventStreamNextSequence,
@@ -1493,7 +1526,7 @@ function shouldRefreshExternalWorkspaceSessionSummary(eventType: string, event: 
     && eventTargetsDifferentSession(event);
 }
 
-function shouldRefreshCurrentWorkspaceSessionSummary(eventType: string): boolean {
+function shouldRefreshCurrentSessionSummary(eventType: string): boolean {
   return eventType === 'message.created' || eventType === 'session.viewed';
 }
 
@@ -1516,15 +1549,18 @@ function readFiniteEventNumber(
 function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
   const payload = event.payload;
   if (!payload) return;
-  const tokenUsed = readFiniteEventNumber(payload, 'token_used', 'tokenUsed');
-  const tokenLimit = readFiniteEventNumber(payload, 'token_limit', 'tokenLimit');
+  const tokenUsed = readFiniteEventNumber(payload, 'projected_request_tokens', 'projectedRequestTokens')
+    ?? readFiniteEventNumber(payload, 'token_used', 'tokenUsed');
+  const tokenLimit = readFiniteEventNumber(payload, 'context_window_limit_tokens', 'contextWindowLimitTokens')
+    ?? readFiniteEventNumber(payload, 'context_window_tokens', 'contextWindowTokens')
+    ?? readFiniteEventNumber(payload, 'token_limit', 'tokenLimit');
   const remainingTokens = readFiniteEventNumber(payload, 'remaining_tokens', 'remainingTokens');
   const usageRatio = readFiniteEventNumber(payload, 'usage_ratio', 'usageRatio');
   if (tokenUsed === undefined || tokenLimit === undefined || tokenLimit <= 0) return;
 
   const updatedAt = readFiniteEventNumber(payload, 'updated_at', 'updatedAt')
     ?? (typeof event.occurred_at === 'number' ? event.occurred_at : Date.now());
-  const measurement = trimBridgeString(payload.accuracy) === 'authoritative'
+  const measurement = trimBridgeString(payload.measurement ?? payload.accuracy) === 'authoritative'
     ? 'authoritative'
     : 'estimated';
   const current = messagesState.orchestratorRuntimeState;
@@ -1552,7 +1588,8 @@ function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
     || warningLevelValue === 'notice'
     || warningLevelValue === 'warning'
     || warningLevelValue === 'danger'
-  ) ? warningLevelValue : undefined;
+    || warningLevelValue === 'compaction_due'
+  ) ? (warningLevelValue === 'compaction_due' ? 'danger' : warningLevelValue) : undefined;
   const budgetState: NonNullable<OrchestratorRuntimeSnapshot['budgetState']> = {
     ...currentBudget,
     tokenUsed: Math.max(0, Math.floor(tokenUsed)),
@@ -1564,12 +1601,31 @@ function applyContextBudgetRuntimeEvent(event: RustEventEnvelope): void {
     usageRatio: Math.min(1, Math.max(0, usageRatio ?? tokenUsed / tokenLimit)),
     ...(warningLevel ? { warningLevel } : {}),
     measurement,
-    phase: trimBridgeString(payload.phase) || undefined,
     updatedAt: Math.floor(updatedAt),
     eventSequence: nextEventSequence,
-    turnId: trimBridgeString(payload.turn_id ?? payload.turnId) || undefined,
-    callId: trimBridgeString(payload.call_id ?? payload.callId) || undefined,
-    resolvedModel: trimBridgeString(payload.resolved_model ?? payload.resolvedModel) || undefined,
+    projectedRequestTokens: Math.max(0, Math.floor(tokenUsed)),
+    ...(trimBridgeString(payload.phase) ? { phase: trimBridgeString(payload.phase) } : {}),
+    ...(trimBridgeString(payload.turn_id ?? payload.turnId)
+      ? { turnId: trimBridgeString(payload.turn_id ?? payload.turnId) }
+      : {}),
+    ...(trimBridgeString(payload.call_id ?? payload.callId)
+      ? { callId: trimBridgeString(payload.call_id ?? payload.callId) }
+      : {}),
+    ...(trimBridgeString(payload.resolved_model ?? payload.resolvedModel)
+      ? { resolvedModel: trimBridgeString(payload.resolved_model ?? payload.resolvedModel) }
+      : {}),
+    ...(readFiniteEventNumber(payload, 'provider_context_tokens', 'providerContextTokens') != null
+      ? { providerContextTokens: readFiniteEventNumber(payload, 'provider_context_tokens', 'providerContextTokens') }
+      : {}),
+    ...(readFiniteEventNumber(payload, 'proactive_threshold_tokens', 'proactiveThresholdTokens') != null
+      ? { proactiveThresholdTokens: readFiniteEventNumber(payload, 'proactive_threshold_tokens', 'proactiveThresholdTokens') }
+      : {}),
+    ...(readFiniteEventNumber(payload, 'hard_request_limit_tokens', 'hardRequestLimitTokens') != null
+      ? { hardRequestLimitTokens: readFiniteEventNumber(payload, 'hard_request_limit_tokens', 'hardRequestLimitTokens') }
+      : {}),
+    ...(trimBridgeString(payload.pressure_level ?? payload.pressureLevel)
+      ? { pressureLevel: trimBridgeString(payload.pressure_level ?? payload.pressureLevel) }
+      : {}),
   };
   const eventAt = Math.max(
     Math.floor(updatedAt),
@@ -1702,7 +1758,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
 
   if (!shouldApplyCurrentSessionRustEvent(event)) {
     if (shouldRefreshExternalWorkspaceSessionSummary(eventType, event)) {
-      scheduleWorkspaceSessionSummaryRefresh(`external_${eventType.replaceAll('.', '_')}`);
+      scheduleSessionSummaryRefresh(`external_${eventType.replaceAll('.', '_')}`);
     }
     return;
   }
@@ -1740,7 +1796,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     });
   }
 
-  if (eventType === 'session.context.usage.updated') {
+  if (eventType === 'session.context.pressure.updated' || eventType === 'session.context.usage.updated') {
     applyContextBudgetRuntimeEvent(event);
     return;
   }
@@ -1839,7 +1895,12 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       || currentWorkspaceId;
     const acceptedCreatedSession = event.payload.created_session ?? event.payload.createdSession ?? false;
     if (acceptedSessionId && (!currentSessionId || currentSessionId === acceptedSessionId)) {
-      persistWorkspaceBinding(acceptedWorkspaceId, currentWorkspacePath, acceptedSessionId);
+      persistWorkspaceBinding(
+        currentSessionScope,
+        acceptedWorkspaceId,
+        currentWorkspacePath,
+        acceptedSessionId,
+      );
       emitDataMessage('sessionTurnAccepted', {
         sessionId: acceptedSessionId,
         workspaceId: acceptedWorkspaceId,
@@ -1872,7 +1933,7 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
       }
     }
     if (acceptedCreatedSession === true) {
-      scheduleWorkspaceSessionSummaryRefresh('created_session_accepted');
+      scheduleSessionSummaryRefresh('created_session_accepted');
     }
   }
 
@@ -1966,8 +2027,8 @@ function handleRustEventStreamMessage(event: RustEventEnvelope): void {
     });
   }
 
-  if (shouldRefreshCurrentWorkspaceSessionSummary(eventType)) {
-    scheduleWorkspaceSessionSummaryRefresh(`current_${eventType.replaceAll('.', '_')}`);
+  if (shouldRefreshCurrentSessionSummary(eventType)) {
+    scheduleSessionSummaryRefresh(`current_${eventType.replaceAll('.', '_')}`);
   }
 
   // Notify listeners about task-domain SSE events so lightweight stores
@@ -2199,7 +2260,7 @@ function getCurrentUrl(): URL | null {
   return new URL(window.location.href);
 }
 
-function resolveWorkspaceQuery(): { workspaceId: string; workspacePath: string; sessionId: string } {
+function resolveWorkspaceQuery(): AgentBindingContext {
   return resolveAgentBindingContext();
 }
 
@@ -2209,29 +2270,32 @@ function hydrateCanonicalWorkspaceBinding(): void {
   }
   initialWindowBindingHydrated = true;
   const binding = seedAgentBindingContextFromWindow();
-  currentWorkspaceId = binding.workspaceId;
-  currentWorkspacePath = binding.workspacePath;
-  currentSessionId = binding.sessionId;
+  currentSessionScope = binding.scope;
+  currentWorkspaceId = agentBindingWorkspaceId(binding);
+  currentWorkspacePath = agentBindingWorkspacePath(binding);
+  currentSessionId = binding.sessionId ?? '';
 }
 
 function bootstrapBindingKey(
-  binding: { workspaceId: string; workspacePath: string; sessionId: string },
+  binding: AgentBindingContext,
 ): string {
   return JSON.stringify({
-    workspaceId: binding.workspaceId.trim(),
-    workspacePath: binding.workspacePath.trim(),
-    sessionId: binding.sessionId.trim(),
+    scope: binding.scope,
+    workspaceId: agentBindingWorkspaceId(binding),
+    workspacePath: agentBindingWorkspacePath(binding),
+    sessionId: binding.sessionId?.trim() ?? '',
   });
 }
 
 function buildBootstrapQuery(
-  binding: { workspaceId: string; workspacePath: string; sessionId: string },
+  binding: AgentBindingContext,
 ): string {
   const query = new URLSearchParams();
-  if (binding.workspaceId) {
+  query.set('scope', binding.scope);
+  if (binding.scope === 'workspace' && binding.workspaceId) {
     query.set('workspaceId', binding.workspaceId);
   }
-  if (binding.workspacePath) {
+  if (binding.scope === 'workspace' && binding.workspacePath) {
     query.set('workspacePath', binding.workspacePath);
   }
   if (binding.sessionId) {
@@ -2246,6 +2310,7 @@ function eventStreamBindingKey(): string {
 
 function eventStreamQuery(): string {
   const query = new URLSearchParams();
+  query.set('scope', currentSessionScope);
   if (currentWorkspaceId) {
     query.set('workspaceId', currentWorkspaceId);
   }
@@ -2260,6 +2325,7 @@ function eventStreamQuery(): string {
 
 function eventStreamScopeKey(): string {
   const query = new URLSearchParams();
+  query.set('scope', currentSessionScope);
   if (currentWorkspaceId) {
     query.set('workspaceId', currentWorkspaceId);
   }
@@ -2348,19 +2414,21 @@ function isCurrentBootstrapRequest(bindingKey: string, requestSeq: number): bool
 }
 
 function bootstrapRequestCanClearMissingSession(
-  requestBinding: { workspaceId: string; workspacePath: string; sessionId: string },
+  requestBinding: AgentBindingContext,
   requestSeq: number,
 ): boolean {
   if (requestSeq !== bootstrapRequestSeq) {
     return false;
   }
   const currentBinding = resolveWorkspaceQuery();
-  const sameWorkspace = requestBinding.workspaceId
-    ? currentBinding.workspaceId === requestBinding.workspaceId
-    : currentBinding.workspacePath === requestBinding.workspacePath;
-  if (!sameWorkspace) {
+  if (currentBinding.scope !== requestBinding.scope) {
     return false;
   }
+  const sameWorkspace = requestBinding.scope === 'personal'
+    || (requestBinding.workspaceId
+      ? agentBindingWorkspaceId(currentBinding) === requestBinding.workspaceId
+      : agentBindingWorkspacePath(currentBinding) === requestBinding.workspacePath);
+  if (!sameWorkspace) return false;
   return !currentBinding.sessionId || currentBinding.sessionId === requestBinding.sessionId;
 }
 
@@ -2404,13 +2472,19 @@ function isCurrentSettingsBootstrapRequest(bindingKey: string, requestSeq: numbe
     && bindingKey === settingsBootstrapBindingKey();
 }
 
-function persistWorkspaceBinding(workspaceId: string, workspacePath: string, sessionId: string): boolean {
+function persistWorkspaceBinding(
+  scope: 'personal' | 'workspace',
+  workspaceId: string,
+  workspacePath: string,
+  sessionId: string,
+): boolean {
   const previousWorkspaceId = currentWorkspaceId;
   const previousWorkspacePath = currentWorkspacePath;
   const previousSessionId = currentSessionId;
   const normalizedWorkspaceId = workspaceId.trim();
   const normalizedWorkspacePath = workspacePath.trim();
   const incomingSessionId = sessionId.trim();
+  const incomingScope = scope;
 
   const settingsBindingChanged = clearSettingsBootstrapCacheIfBindingChanged(
     previousWorkspaceId,
@@ -2420,6 +2494,7 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
     normalizedWorkspacePath,
     incomingSessionId,
   );
+  currentSessionScope = incomingScope;
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = incomingSessionId;
@@ -2430,9 +2505,13 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
   ) {
     clearContinueRequestInFlight();
   }
-  setAgentBindingContext({
+  setAgentBindingContext(incomingScope === 'workspace' ? {
+    scope: 'workspace',
     workspaceId: normalizedWorkspaceId,
     workspacePath: normalizedWorkspacePath,
+    sessionId: incomingSessionId,
+  } : {
+    scope: 'personal',
     sessionId: incomingSessionId,
   }, {
     authoritative: true,
@@ -2443,6 +2522,7 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
     return settingsBindingChanged;
   }
   const nextUrl = new URL(currentUrl.toString());
+  nextUrl.searchParams.set('scope', incomingScope);
   if (normalizedWorkspaceId) {
     nextUrl.searchParams.set('workspaceId', normalizedWorkspaceId);
   } else {
@@ -2464,12 +2544,17 @@ function persistWorkspaceBinding(workspaceId: string, workspacePath: string, ses
   return settingsBindingChanged;
 }
 
-function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string): boolean {
+function clearWorkspaceSessionBinding(
+  scope: 'personal' | 'workspace',
+  workspaceId: string,
+  workspacePath: string,
+): boolean {
   const previousWorkspaceId = currentWorkspaceId;
   const previousWorkspacePath = currentWorkspacePath;
   const previousSessionId = currentSessionId;
   const normalizedWorkspaceId = workspaceId.trim();
   const normalizedWorkspacePath = workspacePath.trim();
+  const incomingScope = scope;
   const settingsBindingChanged = clearSettingsBootstrapCacheIfBindingChanged(
     previousWorkspaceId,
     previousWorkspacePath,
@@ -2478,15 +2563,16 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
     normalizedWorkspacePath,
     '',
   );
+  currentSessionScope = incomingScope;
   currentWorkspaceId = normalizedWorkspaceId;
   currentWorkspacePath = normalizedWorkspacePath;
   currentSessionId = '';
   clearContinueRequestInFlight();
-  setAgentBindingContext({
+  setAgentBindingContext(incomingScope === 'workspace' ? {
+    scope: 'workspace',
     workspaceId: normalizedWorkspaceId,
     workspacePath: normalizedWorkspacePath,
-    sessionId: '',
-  }, {
+  } : { scope: 'personal' }, {
     authoritative: true,
   });
   clearCurrentInterruptTaskId();
@@ -2497,6 +2583,7 @@ function clearWorkspaceSessionBinding(workspaceId: string, workspacePath: string
     return settingsBindingChanged;
   }
   const nextUrl = new URL(currentUrl.toString());
+  nextUrl.searchParams.set('scope', incomingScope);
   if (normalizedWorkspaceId) {
     nextUrl.searchParams.set('workspaceId', normalizedWorkspaceId);
   } else {
@@ -2519,6 +2606,7 @@ function clearPersistedWorkspaceBinding(): void {
   currentWorkspaceId = '';
   currentWorkspacePath = '';
   currentSessionId = '';
+  currentSessionScope = 'personal';
   clearContinueRequestInFlight();
   clearAgentBindingContext({ authoritative: true });
   clearCurrentInterruptTaskId();
@@ -2528,6 +2616,7 @@ function clearPersistedWorkspaceBinding(): void {
     return;
   }
   const nextUrl = new URL(currentUrl.toString());
+  nextUrl.searchParams.set('scope', 'personal');
   nextUrl.searchParams.delete('workspaceId');
   nextUrl.searchParams.delete('workspacePath');
   nextUrl.searchParams.delete('sessionId');
@@ -2541,8 +2630,6 @@ function dispatchEmptyWorkspaceState(): void {
   closeEventStream();
   clearPersistedWorkspaceBinding();
   emitDataMessage('emptyWorkspaceStateLoaded', {
-    workspaceId: '',
-    workspacePath: '',
     state: buildEmptyWorkspaceAppState(now),
     workspaces: [],
   });
@@ -2779,6 +2866,7 @@ async function dispatchBootstrap(
     currentRuntimeEpoch = incomingEpoch;
   }
   const settingsBindingChanged = persistWorkspaceBinding(
+    payload.scope,
     payload.workspace.workspaceId,
     payload.workspace.rootPath,
     payload.sessionId,
@@ -2805,8 +2893,9 @@ async function dispatchBootstrap(
     canonicalHasMoreBefore: pageMeta.canonicalHasMoreBefore,
     canonicalBeforeCursor: pageMeta.canonicalBeforeCursor,
   } as Record<string, unknown>);
-  if (payload.sessionId) {
+  if (payload.sessionId && payload.workspace.workspaceId) {
     void refreshPendingChangesProjection({
+      scope: 'workspace',
       sessionId: payload.sessionId,
       workspaceId: payload.workspace.workspaceId,
       workspacePath: payload.workspace.rootPath,
@@ -2882,28 +2971,28 @@ async function fetchBootstrap(
             return;
           }
           clearWorkspaceSessionBinding(
-            effectiveBinding.workspaceId,
-            effectiveBinding.workspacePath,
+            effectiveBinding.scope,
+            agentBindingWorkspaceId(effectiveBinding),
+            agentBindingWorkspacePath(effectiveBinding),
           );
-          try {
-            const snapshot = await getWorkspaceSessions(
-              effectiveBinding.workspaceId,
-              effectiveBinding.workspacePath,
-            );
-            const currentBinding = resolveWorkspaceQuery();
-            if (
-              !currentBinding.sessionId
-              && currentBinding.workspaceId === effectiveBinding.workspaceId
-            ) {
-              emitDataMessage('sessionsUpdated', {
-                workspaceId: effectiveBinding.workspaceId,
-                sessions: snapshot.sessions,
-                runtimeEpoch: snapshot.runtimeEpoch,
-                eventStreamNextSequence: snapshot.eventStreamNextSequence,
-              });
+          if (effectiveBinding.scope === 'workspace' && effectiveBinding.workspaceId) {
+            try {
+              const snapshot = await getWorkspaceSessions(
+                effectiveBinding.workspaceId,
+                effectiveBinding.workspacePath,
+              );
+              const currentBinding = resolveWorkspaceQuery();
+              if (!currentBinding.sessionId && agentBindingWorkspaceId(currentBinding) === effectiveBinding.workspaceId) {
+                emitDataMessage('sessionsUpdated', {
+                  workspaceId: effectiveBinding.workspaceId,
+                  sessions: snapshot.sessions,
+                  runtimeEpoch: snapshot.runtimeEpoch,
+                  eventStreamNextSequence: snapshot.eventStreamNextSequence,
+                });
+              }
+            } catch (error) {
+              console.warn('[web-client-bridge] 无效会话清理后刷新会话列表失败:', error);
             }
-          } catch (error) {
-            console.warn('[web-client-bridge] 无效会话清理后刷新会话列表失败:', error);
           }
           return;
         }
@@ -2926,8 +3015,8 @@ async function fetchBootstrap(
     }
     const rawPayload = await response.json();
     let payload = normalizeBootstrapResponse(rawPayload, {
-      workspaceId: effectiveBinding.workspaceId,
-      workspacePath: effectiveBinding.workspacePath,
+      workspaceId: agentBindingWorkspaceId(effectiveBinding),
+      workspacePath: agentBindingWorkspacePath(effectiveBinding),
       sessionId: effectiveBinding.sessionId,
     });
     if (!isCurrentBootstrapRequest(requestBindingKey, requestSeq)) {
@@ -2959,6 +3048,9 @@ async function refreshWorkspaceSessionsAfterBootstrap(
   requestBindingKey: string,
   requestSeq: number,
 ): Promise<void> {
+  if (!payload.workspace.workspaceId) {
+    return;
+  }
   try {
     const snapshot = await getWorkspaceSessions(
       payload.workspace.workspaceId,
@@ -2994,12 +3086,12 @@ async function refreshWorkspaceSessionsAfterBootstrap(
 
 async function fetchSettingsBootstrap(
   force = false,
-  scope: 'core' | 'full' = 'full',
+  bootstrapScope: 'core' | 'full' = 'full',
   bindingKey = settingsBootstrapBindingKey(),
   requestSeq = settingsBootstrapRequestSeq,
 ): Promise<SettingsBootstrapPayload> {
   const cachedScopeSatisfiesRequest = cachedSettingsBootstrapScope === 'full'
-    || cachedSettingsBootstrapScope === scope;
+    || cachedSettingsBootstrapScope === bootstrapScope;
   if (
     !force
     && cachedSettingsBootstrap
@@ -3008,7 +3100,7 @@ async function fetchSettingsBootstrap(
   ) {
     return cachedSettingsBootstrap;
   }
-  const snapshot = await getAgentSettingsBootstrap({ scope });
+  const snapshot = await getAgentSettingsBootstrap({ bootstrapScope });
   if (isCurrentSettingsBootstrapRequest(bindingKey, requestSeq)) {
     cachedSettingsBootstrap = snapshot;
     cachedSettingsBootstrapScope = snapshot.bootstrapScope === 'core' ? 'core' : 'full';
@@ -3019,7 +3111,7 @@ async function fetchSettingsBootstrap(
 
 async function dispatchSettingsBootstrap(
   force = false,
-  scope: 'core' | 'full' = 'full',
+  bootstrapScope: 'core' | 'full' = 'full',
 ): Promise<void> {
   const bindingKey = settingsBootstrapBindingKey();
   if (
@@ -3034,7 +3126,7 @@ async function dispatchSettingsBootstrap(
   const doDispatch = async (): Promise<void> => {
     const snapshot: SettingsBootstrapSnapshot = await fetchSettingsBootstrap(
       force,
-      scope,
+      bootstrapScope,
       bindingKey,
       requestSeq,
     );
@@ -3113,15 +3205,15 @@ async function dispatchRegistryAgents(): Promise<void> {
   }
 }
 
-async function dispatchProjectKnowledge(scope: BridgeRequestScope = {}): Promise<void> {
+async function dispatchProjectKnowledge(scope: BridgeRequestScope = currentSessionBindingOverride()): Promise<void> {
   const requestWorkspaceScope = resolveWorkspaceScopeFromSource(scope);
   const requestWorkspaceId = requestWorkspaceScope.workspaceId;
   const requestWorkspacePath = requestWorkspaceScope.workspacePath;
   const knowledgeRequestId = trimBridgeString(scope.knowledgeRequestId);
   const payload = await getAgentProjectKnowledge({
+    scope: 'workspace',
     workspaceId: requestWorkspaceId,
     workspacePath: requestWorkspacePath,
-    sessionId: '',
   });
   const responseWorkspaceId = typeof payload.workspaceId === 'string' && payload.workspaceId.trim()
     ? payload.workspaceId.trim()
@@ -3137,18 +3229,19 @@ async function dispatchProjectKnowledge(scope: BridgeRequestScope = {}): Promise
   });
 }
 
-async function emitKnowledgePayload(scope: BridgeRequestScope = {}): Promise<void> {
+async function emitKnowledgePayload(scope: BridgeRequestScope = currentSessionBindingOverride()): Promise<void> {
   await dispatchProjectKnowledge(scope);
 }
 
 async function commitSessionNavigation(
   target: 'draft' | 'session',
-  workspaceId: string,
-  workspacePath: string,
+  binding: AgentBindingOverride,
   requestId: string,
   sessionId: string,
   carriedSessionConfig: Record<string, unknown>,
 ): Promise<void> {
+  const workspaceId = binding.scope === 'workspace' ? binding.workspaceId : '';
+  const workspacePath = binding.scope === 'workspace' ? binding.workspacePath : '';
   const previousWorkspaceId = currentWorkspaceId;
   const previousWorkspacePath = currentWorkspacePath;
   invalidateBootstrapRequests();
@@ -3157,8 +3250,8 @@ async function commitSessionNavigation(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       target,
-      workspaceId,
-      workspacePath,
+      scope: binding.scope,
+      ...(binding.scope === 'workspace' ? { workspaceId, workspacePath } : {}),
       ...(target === 'session' ? { sessionId } : {}),
     }),
   });
@@ -3173,6 +3266,7 @@ async function commitSessionNavigation(
   });
   const navigationRequestSeq = bootstrapRequestSeq;
   const navigationBindingKey = bootstrapBindingKey({
+    scope: payload.scope,
     workspaceId: payload.workspace.workspaceId,
     workspacePath: payload.workspace.rootPath,
     sessionId: payload.sessionId,
@@ -3197,17 +3291,21 @@ async function commitSessionNavigation(
 async function navigateSession(message: ClientBridgeMessage): Promise<void> {
   const requestId = trimBridgeString(message.requestId);
   const target = message.target === 'session' ? 'session' : 'draft';
-  const scope = resolveWorkspaceScopeFromSource(message);
-  if (!requestId || !scope.workspaceId || !scope.workspacePath) {
-    throw new Error('会话导航缺少 requestId 或工作区绑定');
+  if (!requestId) {
+    throw new Error('会话导航缺少 requestId');
   }
+  if (message.scope !== 'personal' && message.scope !== 'workspace') {
+    throw new Error('会话导航缺少有效的 scope');
+  }
+  const binding: AgentBindingOverride = message.scope === 'personal'
+    ? { scope: 'personal' }
+    : requireWorkspaceRequestScope(requestScopeFromMessage(message));
   if (target === 'session') {
     const sessionId = trimBridgeString(message.sessionId);
     if (!sessionId) throw new Error('会话导航缺少 sessionId');
     await commitSessionNavigation(
       'session',
-      scope.workspaceId,
-      scope.workspacePath,
+      binding,
       requestId,
       sessionId,
       {},
@@ -3221,15 +3319,14 @@ async function navigateSession(message: ClientBridgeMessage): Promise<void> {
     : {};
   await commitSessionNavigation(
     'draft',
-    scope.workspaceId,
-    scope.workspacePath,
+    binding,
     requestId,
     '',
     carriedSessionConfig,
   );
 }
 
-async function deleteSession(sessionId: string, scope: BridgeRequestScope = {}): Promise<void> {
+async function deleteSession(sessionId: string, scope: BridgeRequestScope = currentSessionBindingOverride()): Promise<void> {
   messagesState.sessionHydrating = true;
   try {
     const payload = await deleteAgentSession(sessionId, scope);
@@ -3247,14 +3344,14 @@ async function deleteSession(sessionId: string, scope: BridgeRequestScope = {}):
 async function renameSession(
   sessionId: string,
   name: string,
-  scope: BridgeRequestScope = {},
+  scope: BridgeRequestScope = currentSessionBindingOverride(),
 ): Promise<void> {
   const payload = await renameAgentSession(sessionId, name, scope);
   await dispatchBootstrap(normalizeBootstrapResponse(payload, { sessionId }), { rawPayload: payload });
   emitBridgeSuccessToast(i18n.t('bridge.action.renameSession'), i18n.t('toast.sessionRenamed'));
 }
 
-async function closeSession(sessionId: string, scope: BridgeRequestScope = {}): Promise<void> {
+async function closeSession(sessionId: string, scope: BridgeRequestScope = currentSessionBindingOverride()): Promise<void> {
   const payload = await closeAgentSession(sessionId, scope);
   // 同 deleteSession：关闭后该会话不再出现在列表里，hint 会让归一化器误清空 currentSessionId
   await dispatchBootstrap(normalizeBootstrapResponse(payload), { rawPayload: payload });
@@ -3416,9 +3513,7 @@ async function syncSessionTurnQueue(
     return;
   }
   const snapshot = await getAgentSessionTurnQueue(normalizedSessionId, {
-    workspaceId,
-    workspacePath,
-    sessionId: normalizedSessionId,
+    ...currentSessionBindingOverride(normalizedSessionId, workspaceId, workspacePath),
   });
   if (currentSessionId !== normalizedSessionId) {
     return;
@@ -3433,11 +3528,7 @@ async function removeQueuedMessageFromServer(queuedMessageId: string): Promise<v
     const snapshot = await removeAgentSessionTurnQueueItem(
       currentSessionId,
       normalizedId,
-      {
-        workspaceId: currentWorkspaceId,
-        workspacePath: currentWorkspacePath,
-        sessionId: currentSessionId,
-      },
+      currentSessionBindingOverride(),
     );
     if (snapshot.sessionId === currentSessionId) {
       applyServerQueuedTurns(snapshot.queuedTurns);
@@ -3456,11 +3547,7 @@ async function guideQueuedMessageFromServer(queuedMessageId: string): Promise<vo
     const snapshot = await guideAgentSessionTurnQueueItem(
       currentSessionId,
       normalizedId,
-      {
-        workspaceId: currentWorkspaceId,
-        workspacePath: currentWorkspacePath,
-        sessionId: currentSessionId,
-      },
+      currentSessionBindingOverride(),
     );
     if (snapshot.sessionId === currentSessionId) {
       applyServerQueuedTurns(snapshot.queuedTurns);
@@ -3483,6 +3570,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
   const targetWorkspaceScope = resolveWorkspaceScopeFromSource(input);
   const targetWorkspaceId = targetWorkspaceScope.workspaceId;
   const targetWorkspacePath = targetWorkspaceScope.workspacePath;
+  const targetScope = targetWorkspaceId || targetWorkspacePath ? 'workspace' : 'personal';
   const targetSessionId = hasBridgeField(input, 'sessionId')
     ? trimBridgeString(input.sessionId)
     : (targetWorkspaceScope.hasWorkspaceOverride ? '' : currentSessionId);
@@ -3599,11 +3687,12 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
 
   try {
     if (
-      targetWorkspaceId !== currentWorkspaceId
+      targetScope !== currentSessionScope
+      || targetWorkspaceId !== currentWorkspaceId
       || targetWorkspacePath !== currentWorkspacePath
       || targetSessionId !== currentSessionId
     ) {
-      persistWorkspaceBinding(targetWorkspaceId, targetWorkspacePath, targetSessionId);
+      persistWorkspaceBinding(targetScope, targetWorkspaceId, targetWorkspacePath, targetSessionId);
     }
     try {
       await warmLiveBridgeForSubmission('execute_task_preflight');
@@ -3627,9 +3716,13 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       userMessageId,
       placeholderMessageId,
       replaceTurnId: replaceTurnId || null,
-    }, {
+    }, targetScope === 'workspace' ? {
+      scope: 'workspace',
       workspaceId: targetWorkspaceId,
       workspacePath: targetWorkspacePath,
+      sessionId: targetSessionId,
+    } : {
+      scope: 'personal',
       sessionId: targetSessionId,
     });
 
@@ -3650,7 +3743,7 @@ async function executeTask(input: ExecuteTaskInput): Promise<boolean> {
       });
     }
     if (resolvedSessionId) {
-      persistWorkspaceBinding(targetWorkspaceId, targetWorkspacePath, resolvedSessionId);
+      persistWorkspaceBinding(targetScope, targetWorkspaceId, targetWorkspacePath, resolvedSessionId);
     }
     if (turnResult.queued) {
       clearPendingRequest(requestId);
@@ -3921,13 +4014,13 @@ async function openFilePreview(
 async function openDiffPreview(
   filePath: string,
   diffContent?: string,
-  scope: BridgeRequestScope = {},
+  scope: BridgeRequestScope = currentSessionBindingOverride(),
 ): Promise<void> {
   if (typeof diffContent === 'string') {
     openPreviewWindow(filePath, i18n.t('bridge.preview.diff'), diffContent, 'diff');
     return;
   }
-  const payload = await getAgentChangeDiff(filePath, scope);
+  const payload = await getAgentChangeDiff(filePath, requireWorkspaceRequestScope(scope));
   openPreviewWindow(payload.filePath || filePath, i18n.t('bridge.preview.diff'), payload.diff || '', 'diff');
 }
 
@@ -3953,8 +4046,8 @@ async function updateSetting(key: string, value: unknown): Promise<void> {
 type NotificationCenterOperation = 'load' | 'report' | 'mark-read' | 'clear' | 'resolve' | 'remove';
 
 interface NotificationOperationScope {
-  workspaceId: string;
-  workspacePath: string;
+  workspaceId?: string;
+  workspacePath?: string;
   sessionId?: string;
 }
 
@@ -3966,11 +4059,11 @@ async function resetExecutionStats(): Promise<void> {
 function resolveNotificationOperationScope(message: Record<string, unknown>): NotificationOperationScope | null {
   const sessionId = trimBridgeString(message.sessionId);
   const workspaceId = trimBridgeString(message.workspaceId);
-  if (!workspaceId) {
+  if (!workspaceId && !sessionId) {
     return null;
   }
   return {
-    workspaceId,
+    ...(workspaceId ? { workspaceId } : {}),
     workspacePath: trimBridgeString(message.workspacePath),
     ...(sessionId ? { sessionId } : {}),
   };
@@ -3984,7 +4077,7 @@ function emitNotificationsStatus(
 ): void {
   emitDataMessage('notificationsStatus', {
     sessionId: scope.sessionId,
-    workspaceId: scope.workspaceId,
+    workspaceId: scope.workspaceId || null,
     workspacePath: scope.workspacePath,
     operation,
     isLoading,
@@ -4376,8 +4469,8 @@ async function updateAllSkills(): Promise<void> {
   );
 }
 
-async function clearProjectKnowledge(scope: BridgeRequestScope = {}): Promise<void> {
-  await clearAgentProjectKnowledge(scope);
+async function clearProjectKnowledge(scope: BridgeRequestScope = currentSessionBindingOverride()): Promise<void> {
+  await clearAgentProjectKnowledge(requireWorkspaceRequestScope(scope));
   await emitKnowledgePayload(scope);
   emitBridgeSuccessToast(
     i18n.t('settings.toast.action.clearProjectKnowledge'),
@@ -4950,7 +5043,7 @@ export function createWebClientBridge(): ClientBridge {
             const scope = requestScopeFromMessage(message);
             const filePath = message.filePath.trim();
             void runChangeMutationOnce(scope, async () => {
-              await approveAgentChange(filePath, scope);
+              await approveAgentChange(filePath, requireWorkspaceRequestScope(scope));
               await fetchBootstrap({ forceFresh: true });
               emitBridgeSuccessToast(i18n.t('bridge.action.approveChange'), i18n.t('toast.changeApproved'));
             }).catch((error) => {
@@ -4963,7 +5056,7 @@ export function createWebClientBridge(): ClientBridge {
             const scope = requestScopeFromMessage(message);
             const filePath = message.filePath.trim();
             void runChangeMutationOnce(scope, async () => {
-              await revertAgentChange(filePath, scope);
+              await revertAgentChange(filePath, requireWorkspaceRequestScope(scope));
               await fetchBootstrap({ forceFresh: true });
               emitBridgeSuccessToast(i18n.t('bridge.action.revertChange'), i18n.t('toast.changeReverted'));
             }).catch((error) => {
@@ -4975,7 +5068,7 @@ export function createWebClientBridge(): ClientBridge {
           {
             const scope = requestScopeFromMessage(message);
             void runChangeMutationOnce(scope, async () => {
-              await approveAllAgentChanges(scope);
+              await approveAllAgentChanges(requireWorkspaceRequestScope(scope));
               await fetchBootstrap({ forceFresh: true });
               emitBridgeSuccessToast(i18n.t('bridge.action.approveAllChanges'), i18n.t('bridge.detail.allChangesApproved'));
             }).catch((error) => {
@@ -4987,7 +5080,7 @@ export function createWebClientBridge(): ClientBridge {
           {
             const scope = requestScopeFromMessage(message);
             void runChangeMutationOnce(scope, async () => {
-              await revertAllAgentChanges(scope);
+              await revertAllAgentChanges(requireWorkspaceRequestScope(scope));
               await fetchBootstrap({ forceFresh: true });
               emitBridgeSuccessToast(i18n.t('bridge.action.revertAllChanges'), i18n.t('bridge.detail.allChangesReverted'));
             }).catch((error) => {
@@ -5002,7 +5095,7 @@ export function createWebClientBridge(): ClientBridge {
             void runChangeMutationOnce(scope, async () => {
               await revertAgentExecutionGroupChanges(
                 executionGroupId,
-                scope,
+                requireWorkspaceRequestScope(scope),
               );
               await fetchBootstrap({ forceFresh: true });
               emitBridgeSuccessToast(
@@ -5206,7 +5299,7 @@ export function createWebClientBridge(): ClientBridge {
       schedulePersistedWebviewState();
     },
     getInitialSessionId(): string {
-      return resolveWorkspaceQuery().sessionId;
+      return resolveWorkspaceQuery().sessionId ?? '';
     },
     getInitialLocale(): SupportedLocale {
       if (typeof window !== 'undefined') {

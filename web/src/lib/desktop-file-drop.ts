@@ -34,15 +34,9 @@ export type DesktopDragDropEvent =
   | { type: 'drop'; paths: string[]; position: DesktopDropPoint }
   | { type: 'leave' };
 
-interface DesktopWebviewDragDropSource {
-  onDragDropEvent(
-    handler: (event: { payload: DesktopDragDropEvent }) => void,
-  ): Promise<() => void>;
-}
-
 export interface DesktopFileDropDependencies {
   isDesktopRuntime?: () => boolean;
-  loadCurrentWebview?: () => Promise<DesktopWebviewDragDropSource>;
+  subscribe?: (handler: (event: DesktopDragDropEvent) => void) => () => void;
 }
 
 function isRootPath(path: string): boolean {
@@ -69,19 +63,6 @@ function containsPoint(rect: DesktopDropRect | null | undefined, point: DesktopD
     && point.y >= rect.top
     && point.y <= rect.bottom,
   );
-}
-
-export function physicalToCssPoint(
-  position: DesktopDropPoint,
-  devicePixelRatio: number,
-): DesktopDropPoint {
-  const scale = Number.isFinite(devicePixelRatio) && devicePixelRatio > 0
-    ? devicePixelRatio
-    : 1;
-  return {
-    x: position.x / scale,
-    y: position.y / scale,
-  };
 }
 
 export function resolveDesktopDropZone(
@@ -134,8 +115,7 @@ export async function registerDesktopFileDropListener(
 ): Promise<() => void> {
   const detectDesktop = dependencies.isDesktopRuntime ?? isDesktopRuntime;
   if (!detectDesktop()) return () => {};
-  const webview = dependencies.loadCurrentWebview
-    ? await dependencies.loadCurrentWebview()
-    : (await import('@tauri-apps/api/webview')).getCurrentWebview();
-  return await webview.onDragDropEvent((event) => handler(event.payload));
+  const subscribe = dependencies.subscribe ?? window.magiDesktop?.onFileDrop;
+  if (!subscribe) throw new Error('desktop_file_drop_bridge_unavailable');
+  return subscribe(handler);
 }

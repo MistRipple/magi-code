@@ -20,8 +20,9 @@ export type GitContextOperation =
   | 'worktreeRemove';
 
 export interface GitContextBinding {
-  workspaceId?: string;
-  workspacePath?: string;
+  scope: 'workspace';
+  workspaceId: string;
+  workspacePath: string;
   sessionId?: string;
 }
 
@@ -71,13 +72,14 @@ function normalizedBinding(binding: GitContextBinding): GitContextBinding {
   const workspacePath = normalizeBindingPart(binding.workspacePath);
   const sessionId = normalizeBindingPart(binding.sessionId);
   return {
-    ...(workspaceId ? { workspaceId } : {}),
-    ...(workspacePath ? { workspacePath } : {}),
+    scope: 'workspace',
+    workspaceId,
+    workspacePath,
     ...(sessionId ? { sessionId } : {}),
   };
 }
 
-function clearGitContext(bindingKey = ''): void {
+export function clearGitContext(bindingKey = ''): void {
   gitContextState.bindingKey = bindingKey;
   gitContextState.loading = false;
   gitContextState.loaded = false;

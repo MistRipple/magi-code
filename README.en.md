@@ -134,7 +134,7 @@ When you need to move a project forward instead of receiving a one-off answer, M
 
 ### Quick start
 
-Requirements: stable Rust, Node.js 22 or newer, npm, and the Tauri 2 platform dependencies needed for desktop builds.
+Requirements: stable Rust, Node.js 22 or newer, npm, and the native packaging toolchain required by Electron Desktop builds.
 
 ~~~bash
 git clone https://github.com/MistRipple/magi-code.git
@@ -151,12 +151,13 @@ For development, start only the daemon. It starts or reuses the fixed-port Vite 
 
 ~~~bash
 npm --prefix web run build
-cargo run -p magi-desktop
+npm run build
+npm run desktop:package -- --dir
 ~~~
 
-The Tauri 2 desktop host targets macOS DMG for both Apple Silicon and Intel, Linux AppImage/Deb, and Windows NSIS. Pushing a version-matching `v*` tag triggers GitHub Actions to build the installers, signed updater archives, and a Release containing `latest.json`. Installed desktop builds check for updates at startup and periodically while running. Updates download and verify in the background, then wait for the user to choose **Restart now** or **Restart later** instead of interrupting active work. Before installation, Magi persists its state and stops the local service gracefully. Runtime data under `~/.magi` stays outside the application bundle and is preserved across updates.
+The Electron desktop host uses the same Chromium runtime for the Magi UI and embedded browser. It targets macOS DMG for both Apple Silicon and Intel, Linux AppImage/Deb, and Windows NSIS. Pushing a version-matching `v*` tag triggers GitHub Actions to build the installers, sign update metadata, and create a Release. Installed desktop builds check for desktop updates at startup and periodically while running. Updates download and verify in the background, then wait for the user to choose **Restart now** or **Restart later** instead of interrupting active work. Electron, Chromium, the daemon, and the Automation Worker are updated atomically as one desktop package. Runtime data under `~/.magi` stays outside the application bundle and is preserved across updates.
 
-Release builds require the `TAURI_SIGNING_PRIVATE_KEY` GitHub Repository Secret and may use `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The private key is used only by GitHub Actions and is never committed or bundled; the public key is stored in `apps/desktop/tauri.conf.json` for client-side verification.
+Release builds require the Electron Builder macOS/Windows signing, notarization, and Release-signing secrets configured in GitHub Actions. Private keys are used only by GitHub Actions and are never committed or bundled.
 
 ### Configure models and roles
 
@@ -168,7 +169,7 @@ Model settings are stored in the local Magi state directory and should never be 
 
 ~~~text
 apps/daemon/                         Headless service entry point
-apps/desktop/                        Tauri desktop host
+apps/desktop/                        Electron/Chromium desktop host
 crates/magi-api/                     HTTP, SSE, and public APIs
 crates/magi-conversation-runtime/   Conversation, context, and task dispatch
 crates/magi-agent-role/              Agent role definitions and registry

@@ -28,7 +28,9 @@
   const notifications = $derived.by(() => getNotifications() as Notification[]);
   const unreadCount = $derived.by(() => getUnreadNotificationCount() as number);
   const notificationStatus = $derived.by(() => getNotificationCenterStatus());
-  const hasWorkspace = $derived(Boolean(messagesState.currentWorkspaceId?.trim()));
+  const hasNotificationContext = $derived(Boolean(
+    messagesState.currentWorkspaceId?.trim() || messagesState.currentSessionId?.trim(),
+  ));
   const filteredNotifications = $derived.by(() => (
     activeFilter === 'all'
       ? notifications
@@ -38,7 +40,7 @@
   ));
 
   $effect(() => {
-    if (open && !wasOpen && messagesState.bootstrapped && hasWorkspace) {
+    if (open && !wasOpen && messagesState.bootstrapped && hasNotificationContext) {
       if (unreadCount > 0) {
         markAllNotificationsRead();
       } else {
@@ -53,21 +55,21 @@
   }
 
   function handleClearAll() {
-    if (!messagesState.bootstrapped || !hasWorkspace) {
+    if (!messagesState.bootstrapped || !hasNotificationContext) {
       return;
     }
     clearAllNotifications();
   }
 
   function handleRemove(id: string) {
-    if (!messagesState.bootstrapped || !hasWorkspace) {
+    if (!messagesState.bootstrapped || !hasNotificationContext) {
       return;
     }
     removeNotification(id);
   }
 
   function handleResolve(id: string) {
-    if (!messagesState.bootstrapped || !hasWorkspace) {
+    if (!messagesState.bootstrapped || !hasNotificationContext) {
       return;
     }
     resolveNotification(id);

@@ -496,10 +496,15 @@ export interface OrchestratorRuntimeSnapshot {
   budgetState?: {
     elapsedMs?: number;
     tokenUsed?: number;
+    projectedRequestTokens?: number;
+    providerContextTokens?: number;
     remainingTokens?: number;
     tokenLimit?: number;
     usageRatio?: number;
     warningLevel?: 'normal' | 'notice' | 'warning' | 'danger';
+    pressureLevel?: string;
+    proactiveThresholdTokens?: number;
+    hardRequestLimitTokens?: number;
     errorRate?: number;
     lastCompactionAt?: number;
     lastCompactionReason?: string;

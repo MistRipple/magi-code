@@ -82,12 +82,13 @@ use crate::{
     dto::{
         AuditUsageLedgerDto, BootstrapDto, BridgeCutoverSmokeSnapshotDto,
         BridgePreflightSnapshotDto, BridgeServicesSnapshotDto, HealthDto, RuntimeReadModelDto,
-        VersionHandshakeDto,
+        SessionScopeKindDto, VersionHandshakeDto,
     },
     errors::ApiError,
     sse,
     state::ApiState,
 };
+use session_scope::{require_session_record_in_scope, resolve_explicit_session_scope};
 
 #[cfg(test)]
 use conversation_bridge::begin_session_turn;
@@ -241,6 +242,7 @@ async fn health(State(state): State<ApiState>) -> Json<HealthDto> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BootstrapQuery {
+    scope: SessionScopeKindDto,
     session_id: Option<String>,
     workspace_id: Option<String>,
     workspace_path: Option<String>,
@@ -269,73 +271,36 @@ fn resolve_bootstrap_scope(
 ) -> Result<BootstrapScope, ApiError> {
     let workspace_id_param = trimmed_query_param(query.workspace_id.as_deref());
     let workspace_path_param = trimmed_query_param(query.workspace_path.as_deref());
-    let requested_workspace_id = state.resolve_workspace_id_from_request(
-        workspace_id_param.map(WorkspaceId::new),
-        workspace_path_param,
-    );
     let requested_session_id = trimmed_query_param(query.session_id.as_deref()).map(SessionId::new);
-
-    if let Some(workspace_id) = requested_workspace_id {
-        let session_id = match requested_session_id {
-            Some(session_id) => {
-                let session = state
-                    .session_store
-                    .session(&session_id)
-                    .ok_or_else(|| ApiError::not_found("session 不存在", session_id.as_str()))?;
-                (state.session_workspace_id(&session).as_ref() == Some(&workspace_id))
-                    .then_some(session_id)
-            }
-            None => None,
-        };
-        return Ok(BootstrapScope {
-            workspace_id: Some(workspace_id.to_string()),
-            session_id,
-        });
-    }
-
-    if workspace_id_param.is_some() || workspace_path_param.is_some() {
-        return Err(ApiError::not_found(
-            "workspace 不存在",
-            workspace_id_param
-                .or(workspace_path_param)
-                .unwrap_or_default(),
-        ));
-    }
-
-    if requested_session_id.is_none()
-        && let Some(current_session) = state.session_store.current_session()
-    {
-        let current_workspace_id = state.session_workspace_id(&current_session);
-        let workspace_is_registered = current_workspace_id.as_ref().is_none_or(|workspace_id| {
-            state
-                .workspace_registry
-                .workspaces()
-                .iter()
-                .any(|workspace| workspace.workspace_id == *workspace_id)
-        });
-        if workspace_is_registered {
-            return Ok(BootstrapScope {
-                workspace_id: current_workspace_id.map(|workspace_id| workspace_id.to_string()),
-                session_id: Some(current_session.session_id),
-            });
-        }
-    }
-
-    let scope = session_scope::resolve_optional_session_workspace_scope(
+    let scope = resolve_explicit_session_scope(
         state,
-        query.session_id.as_deref(),
-        None,
-        None,
-    )?;
-    let workspace_id = scope.workspace_id().map(ToString::to_string).or_else(|| {
-        state
-            .workspace_registry
-            .active_workspace_id()
-            .map(|workspace_id| workspace_id.to_string())
-    });
+        query.scope,
+        workspace_id_param,
+        workspace_path_param,
+    )
+    .map_err(|error| match error {
+        ApiError::InvalidInput(message)
+            if message == "workspaceId 不能为空"
+                && query.scope == SessionScopeKindDto::Workspace =>
+        {
+            ApiError::InvalidInput(
+                "工作区 bootstrap 必须提供 workspaceId 或 workspacePath".to_string(),
+            )
+        }
+        ApiError::InvalidInput(message)
+            if message == "个人会话不能携带 workspace 绑定"
+                && query.scope == SessionScopeKindDto::Personal =>
+        {
+            ApiError::InvalidInput("个人会话 bootstrap 不能携带 workspace 绑定".to_string())
+        }
+        other => other,
+    })?;
+    if let Some(session_id) = requested_session_id.as_ref() {
+        require_session_record_in_scope(state, session_id, &scope)?;
+    }
     Ok(BootstrapScope {
-        workspace_id,
-        session_id: scope.session_id().cloned(),
+        workspace_id: scope.workspace_id().map(|id| id.to_string()),
+        session_id: requested_session_id,
     })
 }
 
@@ -378,6 +343,7 @@ async fn version(State(state): State<ApiState>) -> Json<VersionHandshakeDto> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EventStreamQuery {
+    scope: SessionScopeKindDto,
     workspace_id: Option<String>,
     workspace_path: Option<String>,
     session_id: Option<String>,
@@ -388,19 +354,18 @@ async fn stream_events(
     State(state): State<ApiState>,
     Query(query): Query<EventStreamQuery>,
     headers: HeaderMap,
-) -> impl axum::response::IntoResponse {
+) -> Result<Response, crate::errors::ApiError> {
     let last_event_id = headers
         .get(HeaderName::from_static("last-event-id"))
         .and_then(|value| value.to_str().ok());
     let after_sequence = sse::resolve_after_sequence(query.after_sequence, last_event_id);
-    sse::events(
-        state,
+    let scope = sse::resolve_event_stream_scope(
+        &state,
+        query.scope,
         query.workspace_id,
         query.workspace_path,
-        query.session_id,
-        after_sequence,
-    )
-    .await
+    )?;
+    Ok(sse::events(state, scope, query.session_id, after_sequence).await)
 }
 
 #[cfg(test)]
@@ -533,7 +498,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/bootstrap?tunnel_token=secret-token")
+                    .uri("/bootstrap?scope=personal&tunnel_token=secret-token")
                     .header("host", "example.trycloudflare.com")
                     .header("cf-ray", "test-ray")
                     .body(Body::empty())
@@ -548,12 +513,14 @@ mod tests {
     #[test]
     fn public_tunnel_auth_removes_only_transport_query_parameter() {
         let uri = Uri::from_static(
-            "/bootstrap?workspacePath=%2Ftmp%2Fmagi&tunnel_token=secret-token&sessionId=session-1&tunnel_token=duplicate",
+            "/bootstrap?scope=workspace&workspacePath=%2Ftmp%2Fmagi&tunnel_token=secret-token&sessionId=session-1&tunnel_token=duplicate",
         );
 
         assert_eq!(
             without_query_parameter(&uri, "tunnel_token"),
-            Uri::from_static("/bootstrap?workspacePath=%2Ftmp%2Fmagi&sessionId=session-1")
+            Uri::from_static(
+                "/bootstrap?scope=workspace&workspacePath=%2Ftmp%2Fmagi&sessionId=session-1"
+            )
         );
     }
 
@@ -567,7 +534,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/events?afterSequence=0&tunnel_token=secret-token")
+                    .uri("/events?scope=personal&afterSequence=0&tunnel_token=secret-token")
                     .header("host", "example.trycloudflare.com")
                     .header("cf-ray", "test-ray")
                     .body(Body::empty())
@@ -645,15 +612,16 @@ mod tests {
         let result = resolve_bootstrap_scope(
             &state,
             &BootstrapQuery {
+                scope: SessionScopeKindDto::Workspace,
                 workspace_id: Some(workspace_a.to_string()),
                 workspace_path: None,
                 session_id: Some(session_b.to_string()),
             },
         );
 
-        let resolved = result.expect("bootstrap should ignore stale foreign session");
-        assert_eq!(resolved.workspace_id.as_deref(), Some(workspace_a.as_str()));
-        assert_eq!(resolved.session_id, None);
+        assert!(
+            matches!(result, Err(ApiError::InvalidInput(message)) if message.contains("不属于 workspace"))
+        );
     }
 
     #[test]
@@ -671,6 +639,7 @@ mod tests {
         let result = resolve_bootstrap_scope(
             &state,
             &BootstrapQuery {
+                scope: SessionScopeKindDto::Workspace,
                 workspace_id: Some(workspace_id.to_string()),
                 workspace_path: None,
                 session_id: Some("session-bootstrap-missing".to_string()),
@@ -678,10 +647,9 @@ mod tests {
         );
 
         match result {
-            Err(ApiError::NotFound(message)) => {
+            Err(ApiError::SessionNotFound(message)) => {
                 assert!(
-                    message.contains("session 不存在")
-                        && message.contains("session-bootstrap-missing"),
+                    message.contains("会话不存在") && message.contains("session-bootstrap-missing"),
                     "unknown session error should stay explicit: {message}"
                 );
             }
@@ -690,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_workspace_resolution_uses_session_workspace_without_explicit_workspace() {
+    fn bootstrap_workspace_scope_requires_explicit_workspace_binding() {
         let state = test_state();
         let workspace_b = WorkspaceId::new("workspace-bootstrap-session-deeplink");
         state
@@ -713,67 +681,139 @@ mod tests {
         let resolved = resolve_bootstrap_scope(
             &state,
             &BootstrapQuery {
+                scope: SessionScopeKindDto::Workspace,
                 workspace_id: None,
                 workspace_path: None,
                 session_id: Some(session_b.to_string()),
             },
         )
-        .expect("session workspace should resolve");
+        .expect_err("workspace bootstrap must not infer a binding from session");
 
-        assert_eq!(resolved.workspace_id.as_deref(), Some(workspace_b.as_str()));
+        assert!(
+            matches!(resolved, ApiError::InvalidInput(message) if message.contains("必须提供"))
+        );
     }
 
     #[test]
-    fn bootstrap_without_scope_restores_selected_session_workspace() {
+    fn bootstrap_personal_scope_never_falls_back_to_project_workspace() {
         let state = test_state();
-        let workspace_a = WorkspaceId::new("workspace-bootstrap-current-a");
-        let workspace_c = WorkspaceId::new("workspace-bootstrap-current-c");
+        let workspace = WorkspaceId::new("workspace-bootstrap-personal-isolation");
         state
             .workspace_registry
             .register(
-                workspace_a.clone(),
-                AbsolutePath::new("/tmp/magi-bootstrap-current-a"),
+                workspace.clone(),
+                AbsolutePath::new("/tmp/magi-bootstrap-personal-isolation"),
             )
-            .expect("workspace A should register");
-        state
-            .workspace_registry
-            .register(
-                workspace_c.clone(),
-                AbsolutePath::new("/tmp/magi-bootstrap-current-c"),
-            )
-            .expect("workspace C should register");
-        let session_a = SessionId::new("session-bootstrap-current-a");
-        let session_n = SessionId::new("session-bootstrap-current-n");
-        state
-            .session_store
-            .create_session_for_workspace(session_a, "A 会话", Some(workspace_a.to_string()))
-            .expect("session A should create");
+            .expect("workspace should register");
+        let workspace_session = SessionId::new("session-bootstrap-personal-project");
         state
             .session_store
             .create_session_for_workspace(
-                session_n.clone(),
-                "N 会话",
-                Some(workspace_c.to_string()),
+                workspace_session,
+                "项目会话",
+                Some(workspace.to_string()),
             )
-            .expect("session N should create");
+            .expect("workspace session should create");
+        let personal_session = SessionId::new("session-bootstrap-personal-chat");
+        state
+            .session_store
+            .create_session(personal_session.clone(), "个人会话")
+            .expect("personal session should create");
 
         let resolved = resolve_bootstrap_scope(
             &state,
             &BootstrapQuery {
+                scope: SessionScopeKindDto::Personal,
                 workspace_id: None,
+                workspace_path: None,
+                session_id: Some(personal_session.to_string()),
+            },
+        )
+        .expect("personal bootstrap should resolve");
+
+        assert_eq!(resolved.workspace_id, None);
+        assert_eq!(resolved.session_id, Some(personal_session));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_response_preserves_authoritative_scope() {
+        let personal_response = build_router(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/bootstrap?scope=personal")
+                    .body(Body::empty())
+                    .expect("personal request should build"),
+            )
+            .await
+            .expect("personal bootstrap should respond");
+        let personal = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(personal_response.into_body(), usize::MAX)
+                .await
+                .expect("personal body should read"),
+        )
+        .expect("personal body should be json");
+        assert_eq!(personal["scope"], "personal");
+
+        let state = test_state();
+        let workspace_id = WorkspaceId::new("workspace-bootstrap-scope-response");
+        state
+            .workspace_registry
+            .register(
+                workspace_id.clone(),
+                AbsolutePath::new("/tmp/magi-bootstrap-scope-response"),
+            )
+            .expect("workspace should register");
+        let workspace_response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/bootstrap?scope=workspace&workspaceId={workspace_id}"
+                    ))
+                    .body(Body::empty())
+                    .expect("workspace request should build"),
+            )
+            .await
+            .expect("workspace bootstrap should respond");
+        let workspace = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(workspace_response.into_body(), usize::MAX)
+                .await
+                .expect("workspace body should read"),
+        )
+        .expect("workspace body should be json");
+        assert_eq!(workspace["scope"], "workspace");
+    }
+
+    #[test]
+    fn bootstrap_scope_rejects_ambiguous_workspace_binding() {
+        let state = test_state();
+        let result = resolve_bootstrap_scope(
+            &state,
+            &BootstrapQuery {
+                scope: SessionScopeKindDto::Personal,
+                workspace_id: Some("workspace-should-not-be-accepted".to_string()),
                 workspace_path: None,
                 session_id: None,
             },
-        )
-        .expect("current session scope should resolve");
-
-        assert_eq!(resolved.workspace_id.as_deref(), Some(workspace_c.as_str()));
-        assert_eq!(resolved.session_id, Some(session_n));
-        assert_eq!(
-            state.workspace_registry.active_workspace_id(),
-            Some(workspace_a),
-            "bootstrap recovery must not depend on the first active workspace"
         );
+
+        assert!(
+            matches!(result, Err(ApiError::InvalidInput(message)) if message.contains("个人会话 bootstrap"))
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_missing_scope() {
+        let response = build_router(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/bootstrap")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -800,6 +840,7 @@ mod tests {
         let result = resolve_bootstrap_scope(
             &state,
             &BootstrapQuery {
+                scope: SessionScopeKindDto::Workspace,
                 workspace_id: Some("workspace-bootstrap-missing".to_string()),
                 workspace_path: None,
                 session_id: Some(session_id.to_string()),
@@ -821,7 +862,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_route_ignores_workspace_mismatched_session_scope() {
+    async fn bootstrap_route_rejects_workspace_mismatched_session_scope() {
         let state = test_state();
         let workspace_a = WorkspaceId::new("workspace-bootstrap-route-a");
         let workspace_b = WorkspaceId::new("workspace-bootstrap-route-b");
@@ -867,25 +908,18 @@ mod tests {
         let (status, body) = get_json(
             app,
             &format!(
-                "/bootstrap?workspaceId={}&sessionId={}",
+                "/bootstrap?scope=workspace&workspaceId={}&sessionId={}",
                 workspace_a, session_b
             ),
         )
         .await;
 
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body["currentSession"]["sessionId"],
-            serde_json::json!(session_a.as_str())
-        );
-        assert_eq!(
-            body["sessions"]
-                .as_array()
-                .expect("sessions should be an array")
-                .iter()
-                .map(|session| session["workspaceId"].as_str())
-                .collect::<Vec<_>>(),
-            vec![Some(workspace_a.as_str())]
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("不属于 workspace")),
+            "mismatched session must not fall back: {body}"
         );
     }
 
@@ -905,7 +939,7 @@ mod tests {
         let (status, body) = get_json(
             app,
             &format!(
-                "/bootstrap?workspaceId={}&sessionId=session-bootstrap-route-missing",
+                "/bootstrap?scope=workspace&workspaceId={}&sessionId=session-bootstrap-route-missing",
                 workspace_id
             ),
         )
@@ -915,7 +949,7 @@ mod tests {
         assert!(
             body["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("session 不存在"))
+                .is_some_and(|message| message.contains("会话不存在"))
         );
     }
 
@@ -944,7 +978,7 @@ mod tests {
         let (status, body) = get_json(
             app,
             &format!(
-                "/bootstrap?workspaceId=workspace-bootstrap-route-missing&sessionId={}",
+                "/bootstrap?scope=workspace&workspaceId=workspace-bootstrap-route-missing&sessionId={}",
                 session_id
             ),
         )

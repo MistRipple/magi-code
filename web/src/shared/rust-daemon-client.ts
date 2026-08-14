@@ -151,8 +151,8 @@ export class RustDaemonClient {
     return this.getJson<VersionHandshakeDto>('/version');
   }
 
-  public async fetchBootstrap(): Promise<BootstrapDto> {
-    return this.getJson<BootstrapDto>('/bootstrap');
+  public async fetchBootstrap(scope: 'personal' | 'workspace'): Promise<BootstrapDto> {
+    return this.getJson<BootstrapDto>(`/bootstrap?scope=${scope}`);
   }
 
   public async fetchRuntimeReadModel(): Promise<RuntimeReadModelDto> {
@@ -208,12 +208,12 @@ export class RustDaemonClient {
   }
 
   public async fetchNotifications(
-    workspaceId: string,
+    workspaceId?: string | null,
     workspacePath?: string,
     sessionId?: string,
   ): Promise<NotificationsResponseDto> {
     const params = new URLSearchParams();
-    params.set('workspaceId', workspaceId);
+    if (workspaceId?.trim()) params.set('workspaceId', workspaceId.trim());
     if (workspacePath) params.set('workspacePath', workspacePath);
     if (sessionId) params.set('sessionId', sessionId);
     const query = params.toString();
@@ -295,8 +295,16 @@ export class RustDaemonClient {
 
   // ─── Settings ─────────────────────────────────────────────────────
 
-  public async fetchSettingsBootstrap(): Promise<unknown> {
-    return this.getJson<unknown>('/api/settings/bootstrap');
+  public async fetchSettingsBootstrap(
+    scope: 'personal' | 'workspace',
+    options: { workspaceId?: string; workspacePath?: string; sessionId?: string; bootstrapScope?: 'core' | 'full' } = {},
+  ): Promise<unknown> {
+    const query = new URLSearchParams({ scope });
+    if (scope === 'workspace' && options.workspaceId) query.set('workspaceId', options.workspaceId);
+    if (scope === 'workspace' && options.workspacePath) query.set('workspacePath', options.workspacePath);
+    if (options.sessionId) query.set('sessionId', options.sessionId);
+    if (options.bootstrapScope === 'core') query.set('bootstrapScope', 'core');
+    return this.getJson<unknown>(`/api/settings/bootstrap?${query.toString()}`);
   }
 
   public async fetchRuntimeStatus(): Promise<unknown> {
@@ -583,12 +591,14 @@ export class RustDaemonClient {
 
   public async getCurrentGoal(
     sessionId: string,
+    scope: 'personal' | 'workspace',
     workspaceId?: string,
     workspacePath?: string,
     signal?: AbortSignal,
   ): Promise<CurrentGoalResponseDto> {
     const query = new URLSearchParams();
     query.set('sessionId', sessionId);
+    query.set('scope', scope);
     if (workspaceId) query.set('workspaceId', workspaceId);
     if (workspacePath) query.set('workspacePath', workspacePath);
     return this.getJson<CurrentGoalResponseDto>(
@@ -630,11 +640,13 @@ export class RustDaemonClient {
   public async getAgentRunProjection(
     rootTaskId: string,
     sessionId: string,
+    scope: 'personal' | 'workspace',
     workspaceId?: string,
     workspacePath?: string,
     signal?: AbortSignal,
   ): Promise<AgentRunProjectionDto> {
     const query = new URLSearchParams();
+    query.set('scope', scope);
     query.set('sessionId', sessionId);
     if (workspaceId) query.set('workspaceId', workspaceId);
     if (workspacePath) query.set('workspacePath', workspacePath);

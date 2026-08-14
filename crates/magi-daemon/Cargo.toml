@@ -7,19 +7,16 @@ edition.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-semver = { version = "1.0", features = ["serde"] }
-sysinfo.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 reqwest.workspace = true
-getrandom.workspace = true
 tower-http = { version = "0.6.6", features = ["fs", "set-header"] }
 magi-api = { path = "../magi-api" }
 magi-appearance = { path = "../magi-appearance" }
 magi-agent-role = { path = "../magi-agent-role" }
 magi-bridge-client = { path = "../magi-bridge-client" }
-magi-browser-runtime = { path = "../magi-browser-runtime" }
+magi-browser-authority = { path = "../magi-browser-authority" }
 magi-context-runtime = { path = "../magi-context-runtime" }
 magi-core = { path = "../magi-core" }
 magi-conversation-runtime = { path = "../magi-conversation-runtime" }

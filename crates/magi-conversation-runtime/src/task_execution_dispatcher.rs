@@ -82,6 +82,7 @@ struct DispatchPlanExecutionInput<'a> {
     lease_id: &'a LeaseId,
     session_id: SessionId,
     workspace_id: Option<WorkspaceId>,
+    execution_root: Option<PathBuf>,
     ownership: ExecutionOwnership,
     writebacks: ExecutionWritebackPlans,
     use_tools: bool,
@@ -101,6 +102,7 @@ struct TaskLlmInvocationInput<'a> {
     lease_id: &'a LeaseId,
     session_id: &'a SessionId,
     workspace_id: &'a Option<WorkspaceId>,
+    execution_root: Option<&'a PathBuf>,
     use_tools: bool,
     skill_name: Option<String>,
     images: Vec<SessionTurnImage>,
@@ -536,6 +538,7 @@ impl LlmTaskDispatcher {
             lease_id,
             session_id,
             workspace_id,
+            execution_root,
             ownership,
             writebacks,
             use_tools,
@@ -556,6 +559,7 @@ impl LlmTaskDispatcher {
             lease_id,
             session_id: &session_id,
             workspace_id: &workspace_id,
+            execution_root: execution_root.as_ref(),
             use_tools,
             skill_name,
             images,
@@ -1221,10 +1225,13 @@ impl LlmTaskDispatcher {
         task: &magi_core::Task,
         session_id: &SessionId,
         workspace_id: &Option<WorkspaceId>,
+        execution_root: Option<&PathBuf>,
         is_sidechain: bool,
         worker_id: Option<&WorkerId>,
     ) -> Result<Option<PathBuf>, String> {
-        let main_root = self.resolve_workspace_root_path(session_id, workspace_id);
+        let main_root = execution_root
+            .cloned()
+            .or_else(|| self.resolve_workspace_root_path(session_id, workspace_id));
         let context = self
             .session_code_contexts
             .as_ref()
@@ -2016,6 +2023,7 @@ impl LlmTaskDispatcher {
             lease_id,
             session_id,
             workspace_id,
+            execution_root,
             use_tools,
             skill_name,
             images,
@@ -2058,12 +2066,14 @@ impl LlmTaskDispatcher {
         let (prompt, context_summary) =
             self.assemble_prompt(execution_settings, task, session_id, workspace_id);
         let prompt = self.apply_skill_prompt_injections(prompt, skill_name.as_deref());
-        let workspace_identity_root_path =
-            self.resolve_workspace_root_path(session_id, workspace_id);
+        let workspace_identity_root_path = workspace_id
+            .as_ref()
+            .and_then(|_| self.resolve_workspace_root_path(session_id, workspace_id));
         let workspace_root_path = match self.resolve_task_execution_root(
             task,
             session_id,
             workspace_id,
+            execution_root,
             is_sidechain,
             worker_id,
         ) {
@@ -2210,6 +2220,7 @@ impl LlmTaskDispatcher {
                 is_primary,
                 session_id,
                 workspace_id,
+                execution_root,
                 ownership,
                 writebacks,
                 use_tools,
@@ -2231,6 +2242,7 @@ impl LlmTaskDispatcher {
                     lease_id: &lease.lease_id,
                     session_id,
                     workspace_id,
+                    execution_root,
                     ownership,
                     writebacks,
                     use_tools,
@@ -2802,18 +2814,18 @@ mod tests {
         let event_bus = Arc::new(InMemoryEventBus::new(64));
         let governance = Arc::new(magi_governance::GovernanceService::default());
         let mut tool_registry = ToolRegistry::new(governance, Arc::clone(&event_bus))
-            .with_browser_runtime(
+            .with_browser_automation(
                 Arc::new(|_, tool, _, _| {
                     (
                         serde_json::json!({ "tool": tool, "status": "succeeded" }).to_string(),
                         magi_core::ExecutionResultStatus::Succeeded,
                     )
                 }),
-                Arc::new(|_| magi_browser_runtime::BrowserCapabilitySnapshot {
+                Arc::new(|_| magi_browser_authority::BrowserCapabilitySnapshot {
                     revision: 11,
                     in_app_browser_enabled: true,
                     browser_use_enabled: true,
-                    runtime_status: magi_browser_runtime::BrowserRuntimeComponentStatus::Installed,
+                    host_status: magi_browser_authority::BrowserHostStatus::Ready,
                     host_protocol_compatible: true,
                     access_profile: magi_core::AccessProfile::Restricted,
                 }),
@@ -2987,6 +2999,7 @@ mod tests {
                 &task,
                 &SessionId::new("session-git-agent"),
                 &Some(WorkspaceId::new("workspace-git-agent")),
+                None,
                 true,
                 Some(&WorkerId::new("worker-git-agent")),
             )
@@ -3079,6 +3092,7 @@ mod tests {
                 &task,
                 &SessionId::new("session-git-agent-dirty"),
                 &Some(WorkspaceId::new("workspace-git-agent-dirty")),
+                None,
                 true,
                 Some(&WorkerId::new("worker-git-agent-dirty")),
             )
@@ -3843,7 +3857,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_browser_runtime_is_exposed_to_regular_execution_worker() {
+    fn ready_browser_host_is_exposed_to_regular_execution_worker() {
         let dispatcher = dispatcher_with_ready_browser_tool_surface();
         let worker = task_with_role("executor", TaskTier::ExecutionChain);
         let names = dispatcher
@@ -4679,6 +4693,47 @@ mod tests {
                 .to_usage_llm_config()
                 .and_then(|config| config.reasoning_effort),
             Some(magi_usage_authority::ReasoningEffort::Medium),
+        );
+    }
+
+    #[test]
+    fn resolve_orchestrator_model_config_uses_defaults_for_legacy_session() {
+        use magi_settings_store::{ORCHESTRATOR_SESSION_DEFAULTS_SECTION, SettingsStore};
+
+        let store = SettingsStore::new();
+        store
+            .set_section(
+                "orchestrator",
+                serde_json::json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-orch",
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat",
+                }),
+            )
+            .unwrap();
+        store
+            .set_section(
+                ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
+                serde_json::json!({
+                    "model": "model-last-used",
+                    "reasoningEffort": "high"
+                }),
+            )
+            .unwrap();
+        let legacy_session = SessionId::new("session-without-model-override");
+
+        let config = resolve_orchestrator_model_config(&store, Some(&legacy_session))
+            .expect("旧会话应继承权威的用户默认模型");
+        assert_eq!(
+            config.require_model().expect("默认模型必须可执行"),
+            "model-last-used"
+        );
+        assert_eq!(
+            config
+                .to_usage_llm_config()
+                .and_then(|config| config.reasoning_effort),
+            Some(magi_usage_authority::ReasoningEffort::High),
         );
     }
 

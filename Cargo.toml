@@ -2,9 +2,8 @@
 resolver = "2"
 members = [
   "apps/daemon",
-  "apps/desktop",
   "crates/magi-core",
-  "crates/magi-browser-runtime",
+  "crates/magi-browser-authority",
   "crates/magi-process",
   "crates/magi-daemon",
   "crates/magi-api",
@@ -40,6 +39,8 @@ members = [
 version = "3.0.43"
 edition = "2024"
 license = "Apache-2.0"
+authors = ["Magi contributors"]
+repository = "https://github.com/MistRipple/magi-code"
 
 [workspace.dependencies]
 axum = { version = "0.8.6", features = ["json", "tokio", "http1", "ws"] }

@@ -1,28 +1,10 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import path from 'node:path';
 import { withGoldenViteServer } from './golden-vite.mjs';
-
-const desktopCapability = JSON.parse(await readFile(
-  path.resolve('../apps/desktop/capabilities/default.json'),
-  'utf8',
-));
-
-assert.deepEqual(
-  desktopCapability.remote?.urls,
-  ['http://127.0.0.1:*', 'http://localhost:*'],
-  'Desktop 主窗口加载 daemon HTTP 页面时必须为本机来源启用 Tauri capability',
-);
 
 await withGoldenViteServer(async (server) => {
   const desktopDrop = await server.ssrLoadModule('/src/lib/desktop-file-drop.ts');
   const contextReferences = await server.ssrLoadModule('/src/lib/composer-context-references.ts');
-
-  assert.deepEqual(
-    desktopDrop.physicalToCssPoint({ x: 400, y: 240 }, 2),
-    { x: 200, y: 120 },
-    'Tauri 物理坐标必须按设备像素比转换为 CSS 坐标',
-  );
 
   const zones = {
     sidebar: { left: 0, top: 0, right: 280, bottom: 800, width: 280, height: 800 },
@@ -83,9 +65,9 @@ await withGoldenViteServer(async (server) => {
   let loaderCalls = 0;
   const inactiveStop = await desktopDrop.registerDesktopFileDropListener(() => {}, {
     isDesktopRuntime: () => false,
-    loadCurrentWebview: async () => {
+    subscribe: () => {
       loaderCalls += 1;
-      throw new Error('非 Desktop 不得加载 Tauri API');
+      throw new Error('非 Desktop 不得注册桌面拖放监听');
     },
   });
   inactiveStop();
@@ -98,16 +80,14 @@ await withGoldenViteServer(async (server) => {
     receivedEvents.push(event);
   }, {
     isDesktopRuntime: () => true,
-    loadCurrentWebview: async () => ({
-      onDragDropEvent: async (handler) => {
-        capturedHandler = handler;
-        return () => { unlistenCalls += 1; };
-      },
-    }),
+    subscribe: (handler) => {
+      capturedHandler = handler;
+      return () => { unlistenCalls += 1; };
+    },
   });
-  assert.equal(typeof capturedHandler, 'function', 'Desktop 必须注册当前 Webview 的拖放监听');
-  capturedHandler({ payload: { type: 'leave' } });
-  assert.deepEqual(receivedEvents, [{ type: 'leave' }], '监听适配层必须解包 Tauri 事件 payload');
+  assert.equal(typeof capturedHandler, 'function', 'Desktop 必须注册 Electron 文件拖放监听');
+  capturedHandler({ type: 'leave' });
+  assert.deepEqual(receivedEvents, [{ type: 'leave' }], '监听适配层必须转发 Electron 文件拖放事件');
   stop();
   assert.equal(unlistenCalls, 1, '组件销毁时必须解除原生拖放监听');
 
@@ -137,6 +117,14 @@ const agentApiSource = await readFile(
 );
 const threadPanelSource = await readFile(
   new URL('../src/components/ThreadPanel.svelte', import.meta.url),
+  'utf8',
+);
+const preloadSource = await readFile(
+  new URL('../../apps/desktop/src/preload/index.ts', import.meta.url),
+  'utf8',
+);
+const dropSource = await readFile(
+  new URL('../src/lib/desktop-file-drop.ts', import.meta.url),
   'utf8',
 );
 
@@ -225,5 +213,8 @@ assert.match(
   /desktopDropIndicator[\s\S]*?desktop-drop-overlay/,
   '有效拖放区域必须提供轻量视觉反馈',
 );
+assert.match(preloadSource, /webUtils\.getPathForFile[\s\S]*?clientX[\s\S]*?clientY/, 'preload 必须从用户拖入的 DOM File 安全提取路径和 CSS 坐标');
+assert.match(preloadSource, /onFileDrop:[\s\S]*?fileDropListeners\.add/, 'preload 必须通过受限订阅接口发布拖放事件');
+assert.doesNotMatch(dropSource + preloadSource + shellSource, /@tauri-apps|physicalToCssPoint|devicePixelRatio/, '拖放链路不得保留 Tauri 或物理坐标兼容层');
 
 console.log('desktop file drop golden passed');

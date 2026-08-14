@@ -1,0 +1,18 @@
+[package]
+name = "magi-browser-authority"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+futures-util.workspace = true
+magi-core = { path = "../magi-core" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite = "0.29"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"

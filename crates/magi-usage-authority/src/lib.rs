@@ -1,4 +1,5 @@
 pub mod authority;
+pub mod context_pressure;
 pub mod context_window;
 pub mod costing;
 pub mod ledger_store;
@@ -12,12 +13,17 @@ pub mod types;
 mod tests;
 
 pub use authority::{UsageAuthority, build_execution_binding_identity, build_usage_call_identity};
-pub use context_window::{
-    AUTO_COMPACT_PERCENT, BASELINE_TOKENS, BudgetWarningLevel, ContextBudget,
-    DEFAULT_CONTEXT_WINDOW, EFFECTIVE_CONTEXT_WINDOW_PERCENT, evaluate_context_budget,
-    percent_of_context_window_remaining, resolve_context_window,
+pub use context_pressure::{
+    ContextBudgetPolicy, ContextMeasurement, ContextPressureLevel, ContextPressureSnapshot,
+    DEFAULT_PROACTIVE_THRESHOLD_PERCENT, DEFAULT_RECOVERY_BUFFER_TOKENS,
+    DEFAULT_RESPONSE_RESERVE_TOKENS, DEFAULT_RETAINED_HISTORY_PERCENT, ModelIdentitySnapshot,
+    project_request_tokens,
 };
-pub use costing::{NormalizedUsageTotals, context_window_tokens_from_usage, normalize_usage_delta};
+pub use context_window::{DEFAULT_CONTEXT_WINDOW, resolve_context_window};
+pub use costing::{
+    NormalizedUsageTotals, context_window_tokens_from_usage, normalize_usage_delta,
+    provider_context_tokens_from_usage,
+};
 pub use ledger_store::InMemoryLedgerStore;
 pub use model_identity::{build_model_resolution_identity, prepare_llm_config_for_persistence};
 pub use query_service::UsageQueryService;

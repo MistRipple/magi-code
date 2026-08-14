@@ -117,7 +117,7 @@ assert.match(
 );
 assert.match(
   shellSource,
-  /async function openWorkspaceDraft\(workspace: AgentWorkspaceSummary\): Promise<void>[\s\S]*?const workspacePath = workspaceBindingPath\(workspace\)[\s\S]*?navigateSession\(\{ kind: 'draft', workspaceId, workspacePath \}\)/,
+  /async function openWorkspaceDraft\(workspace: AgentWorkspaceSummary\): Promise<void>[\s\S]*?const workspacePath = workspaceBindingPath\(workspace\)[\s\S]*?navigateSession\(\{ kind: 'draft', scope: 'workspace', workspaceId, workspacePath \}\)/,
   '工作空间快捷新会话必须使用权威 pathRef 进入统一导航事务',
 );
 assert.match(
@@ -127,7 +127,7 @@ assert.match(
 );
 assert.match(
   shellSource,
-  /async function openWorkspaceDraft[\s\S]*?navigateSession\(\{ kind: 'draft', workspaceId, workspacePath \}\)[\s\S]*?if \(!sessionsAlreadyLoaded\)[\s\S]*?loadWorkspaceSessionsForSidebar\(workspace\)/,
+  /async function openWorkspaceDraft[\s\S]*?navigateSession\(\{ kind: 'draft', scope: 'workspace', workspaceId, workspacePath \}\)[\s\S]*?if \(!sessionsAlreadyLoaded\)[\s\S]*?loadWorkspaceSessionsForSidebar\(workspace\)/,
   '工作区草稿导航与侧栏目录加载必须保持职责分离',
 );
 assert.doesNotMatch(
@@ -217,13 +217,13 @@ assert.match(
 );
 assert.match(
   bridgeSource,
-  /shouldRefreshCurrentWorkspaceSessionSummary[\s\S]*?eventType === 'session\.viewed'/,
+  /shouldRefreshCurrentSessionSummary[\s\S]*?eventType === 'session\.viewed'/,
   '当前会话的已查看事件也必须触发跨客户端状态同步',
 );
 assert.match(
   bridgeSource,
-  /function scheduleWorkspaceSessionSummaryRefresh[\s\S]*?getWorkspaceSessions\([\s\S]*?emitDataMessage\('sessionsUpdated'/,
-  '会话状态事件必须通过专用会话列表接口同步运行态和未读完成态',
+  /function scheduleSessionSummaryRefresh[\s\S]*?(?:getWorkspaceSessions|getPersonalSessions)[\s\S]*?emitDataMessage\('sessionsUpdated'/,
+  '会话状态事件必须通过对应作用域的会话目录接口同步运行态和未读完成态',
 );
 assert.doesNotMatch(
   bridgeSource,

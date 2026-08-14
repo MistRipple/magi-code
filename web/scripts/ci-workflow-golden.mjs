@@ -1,134 +1,58 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
-const [workflow, securityWorkflow, releaseWorkflow, browserRuntimeReleaseWorkflow] = await Promise.all([
+const [ci, security, release, cargo, rootPackage, webPackage, desktopPackage, lock] = await Promise.all([
   readFile(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8'),
   readFile(new URL('../../.github/workflows/security.yml', import.meta.url), 'utf8'),
   readFile(new URL('../../.github/workflows/release.yml', import.meta.url), 'utf8'),
-  readFile(new URL('../../.github/workflows/browser-runtime-release.yml', import.meta.url), 'utf8'),
+  readFile(new URL('../../Cargo.toml', import.meta.url), 'utf8'),
+  readFile(new URL('../../package.json', import.meta.url), 'utf8').then(JSON.parse),
+  readFile(new URL('../package.json', import.meta.url), 'utf8').then(JSON.parse),
+  readFile(new URL('../../apps/desktop/package.json', import.meta.url), 'utf8').then(JSON.parse),
+  readFile(new URL('../../package-lock.json', import.meta.url), 'utf8'),
 ]);
-const cargoManifest = await readFile(new URL('../../Cargo.toml', import.meta.url), 'utf8');
-const webPackage = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
-const desktopConfig = JSON.parse(await readFile(new URL('../../apps/desktop/tauri.conf.json', import.meta.url), 'utf8'));
-const productVersionScript = fileURLToPath(new URL('../../scripts/product-version.mjs', import.meta.url));
-const productVersion = execFileSync(process.execPath, [productVersionScript], { encoding: 'utf8' }).trim();
-const cargoVersion = cargoManifest.match(
-  /^\[workspace\.package\]\s*$[\s\S]*?^version\s*=\s*"([^"]+)"\s*$/m,
-)?.[1];
+const productVersion = execFileSync(process.execPath, [
+  fileURLToPath(new URL('../../scripts/product-version.mjs', import.meta.url)),
+], { encoding: 'utf8' }).trim();
+const cargoVersion = cargo.match(/^\[workspace\.package\]\s*$[\s\S]*?^version\s*=\s*"([^"]+)"\s*$/m)?.[1];
 
-assert.equal(productVersion, cargoVersion, 'product version helper must read Cargo workspace package version');
-assert.equal(webPackage.version, undefined, 'web package must not duplicate the product version');
-assert.equal(desktopConfig.version, undefined, 'Tauri config must inherit the desktop Cargo package version');
+assert.equal(productVersion, cargoVersion, '产品版本必须只来自 Cargo workspace');
+assert.equal(rootPackage.version, '0.0.0', 'npm workspace 只能使用非产品占位版本');
+assert.equal(desktopPackage.version, '0.0.0', 'Electron package 版本必须在构建时由 Cargo 注入');
+assert.equal(webPackage.version, undefined, 'Web 不得复制产品版本');
 
-assert.match(workflow, /RUST_TOOLCHAIN:\s*"1\.97\.0"/, 'CI must pin the Rust toolchain');
-assert.match(workflow, /runs-on:\s*ubuntu-22\.04/, 'Linux CI must use a pinned runner image');
-assert.match(workflow, /runs-on:\s*windows-2022/, 'Windows CI must use a pinned runner image');
-assert.match(workflow, /runs-on:\s*macos-15/, 'macOS CI must use a pinned runner image');
-assert.match(workflow, /actions\/checkout@v7/g, 'CI must use the Node 24 checkout action');
-assert.match(workflow, /actions\/setup-node@v7/, 'CI must use the Node 24 setup-node action');
+assert.match(ci, /npm ci[\s\S]*npm run check[\s\S]*npm run test/, 'CI 必须从根 lockfile 验证全部 workspace');
+assert.match(ci, /npm run release:guard/, 'CI 必须执行废码门禁');
+assert.match(ci, /cargo clippy --workspace --all-targets --locked -- -D warnings/, 'CI 必须执行 Rust 全量 Clippy');
+assert.match(ci, /cargo test --workspace --locked/, 'CI 必须执行 Rust workspace 测试');
+assert.match(security, /package-lock\.json[\s\S]*npm audit --omit=dev --workspaces/, '安全检查必须使用根 lockfile 审计生产依赖');
+
+assert.match(release, /verify-ci:[\s\S]*gh run list[\s\S]*--commit "\$GITHUB_SHA"/, '发布必须校验同一提交的 CI');
+assert.match(release, /node scripts\/product-version\.mjs/, '发布必须读取 Cargo 产品版本');
+assert.match(release, /npm run desktop:package/, '发布必须通过 Electron workspace 构建单一桌面包');
+assert.match(release, /browser-capability-manifest\.json[\s\S]*magi-desktop\.cdx\.json/, '发布包必须包含能力清单和 SBOM');
+assert.match(release, /MACOS_CSC_LINK[\s\S]*APPLE_API_KEY_BASE64[\s\S]*notarytool submit[\s\S]*stapler validate/, 'macOS 必须强制 Developer ID 签名、公证和装订');
+assert.match(release, /WINDOWS_CSC_LINK[\s\S]*Get-AuthenticodeSignature[\s\S]*Status -ne "Valid"/, 'Windows 必须强制 Authenticode 签名验证');
+assert.match(release, /RELEASE_GPG_PRIVATE_KEY[\s\S]*--detach-sign[\s\S]*--verify/, '最终发行文件必须生成并验证真实 detached signature');
+assert.match(release, /actions\/attest-build-provenance@v3/, '最终发行文件必须生成 GitHub 构建来源证明');
+assert.match(release, /latest\.yml[\s\S]*latest-linux\.yml[\s\S]*latest-mac\.yml/, 'Electron 更新元数据必须覆盖三个桌面平台');
+assert.match(release, /真实启动解包 Desktop[\s\S]*\/health[\s\S]*\/web\.html/, '发布链必须真实启动解包 Desktop');
 assert.doesNotMatch(
-  workflow,
-  /actions\/(?:checkout|setup-node)@v4/,
-  'CI must not depend on deprecated Node 20 action runtimes',
+  `${ci}\n${security}\n${release}`,
+  /@tauri-apps|\btauri\b|chromium embedded framework|\bcef\b|browser-runtime-release|browser-host|native-browser-runtime|playwright/i,
+  '工作流不得残留旧桌面宿主、独立 Runtime 或生产 Playwright',
 );
-assert.match(workflow, /cancel-in-progress:\s*true/, 'stale CI runs must be cancelled');
-assert.match(workflow, /cargo test --workspace --locked/, 'CI must run workspace tests');
-assert.match(workflow, /cargo clippy --workspace --all-targets --locked -- -D warnings/, 'CI must lint every Rust target');
-assert.match(workflow, /cargo test -p magi-desktop --all-targets --locked/, 'CI must test macOS desktop update behavior');
-assert.match(
-  workflow,
-  /macos-desktop:[\s\S]*?npm --prefix web run build[\s\S]*?cargo test -p magi-desktop --all-targets --locked/,
-  'macOS desktop tests must build the bundled frontend resources first',
-);
-assert.doesNotMatch(workflow, /cargo check --workspace --all-targets/, 'Clippy must own the all-target compilation gate');
-assert.doesNotMatch(workflow, /(?:npm|cargo)\s+(?:--prefix web\s+)?audit/, 'dependency audits must not block ordinary CI changes');
-assert.doesNotMatch(
-  workflow,
-  /cargo test --workspace --all-targets/,
-  'CI must not re-run bench and example targets as integration tests',
-);
+assert.doesNotMatch(lock, /@tauri-apps|playwright(?:-core)?|browser-host/i, '根 npm lockfile 不得包含旧生产依赖');
 
-assert.match(securityWorkflow, /schedule:[\s\S]*?cron:/, 'dependency audits must run on a schedule');
-assert.match(securityWorkflow, /web\/package-lock\.json/, 'frontend lockfile changes must trigger dependency audits');
-assert.match(securityWorkflow, /Cargo\.lock/, 'Rust lockfile changes must trigger dependency audits');
-assert.match(
-  securityWorkflow,
-  /for attempt in 1 2 3; do[\s\S]*?npm --prefix web audit --omit=dev/,
-  'transient npm audit transport failures must be retried without hiding persistent failures',
-);
-assert.match(securityWorkflow, /actions\/cache@v5[\s\S]*?~\/\.cargo\/bin\/cargo-audit/, 'cargo-audit must use a versioned binary cache');
-assert.match(securityWorkflow, /cargo audit/, 'Rust dependencies must be audited');
-
-assert.match(releaseWorkflow, /actions:\s*read/, 'the release gate must be allowed to read CI runs');
-assert.match(releaseWorkflow, /verify-ci:[\s\S]*?gh run list[\s\S]*?--commit "\$GITHUB_SHA"/, 'releases must verify CI for the exact commit');
-assert.match(releaseWorkflow, /build-web:[\s\S]*?needs:\s*verify-ci/, 'release builds must wait for the CI gate');
-assert.match(releaseWorkflow, /npm --prefix web run build/, 'release packaging must create production web assets');
-assert.doesNotMatch(releaseWorkflow, /npm --prefix web (?:run )?(?:check|test)/, 'release packaging must not repeat CI frontend validation');
-assert.doesNotMatch(releaseWorkflow, /cargo test -p magi-desktop/, 'release packaging must not repeat CI desktop tests on every platform');
-assert.match(releaseWorkflow, /node scripts\/product-version\.mjs/g, 'desktop releases must read the authoritative Cargo workspace version');
-assert.doesNotMatch(
-  releaseWorkflow,
-  /(?:web\/package\.json|apps\/desktop\/tauri\.conf\.json)'?\)\.version/,
-  'desktop releases must not read duplicate product versions',
-);
-
-assert.match(browserRuntimeReleaseWorkflow, /push:[\s\S]*?tags:[\s\S]*?-\s*"v\*"/, 'Browser Runtime must follow product release tags');
-assert.doesNotMatch(browserRuntimeReleaseWorkflow, /runtime_version:\s*\n/, 'Browser Runtime must not expose an independent version input');
-assert.doesNotMatch(browserRuntimeReleaseWorkflow, /BROWSER_RUNTIME_MANIFEST_SEQUENCE/, 'Browser Runtime must not depend on a manually maintained sequence variable');
-assert.match(browserRuntimeReleaseWorkflow, /prepare-release:[\s\S]*?manifest_sequence:/, 'Browser Runtime must create one shared manifest sequence before platform packaging');
-assert.match(browserRuntimeReleaseWorkflow, /needs\.prepare-release\.outputs\.manifest_sequence/, 'every platform package must use the prepared manifest sequence');
-assert.match(browserRuntimeReleaseWorkflow, /concurrency:[\s\S]*?browser-runtime-stable-release[\s\S]*?cancel-in-progress:\s*false/, 'Browser Runtime publications must serialize stable-feed sequence allocation');
-assert.match(browserRuntimeReleaseWorkflow, /runtime_tag="browser-runtime-v\$\{runtime_version\}"/, 'Runtime archive URLs must use the derived version');
-assert.match(
-  browserRuntimeReleaseWorkflow,
-  /magi_version="\$\(node scripts\/product-version\.mjs\)"/,
-  'Browser Runtime must derive its version from the authoritative Cargo workspace version',
-);
-assert.match(
-  browserRuntimeReleaseWorkflow,
-  /minimum_magi_version="\$magi_version"/,
-  'Browser Runtime compatibility floor must follow the same authoritative product version',
-);
-assert.doesNotMatch(
-  browserRuntimeReleaseWorkflow,
-  /gh release download magi-desktop-stable/,
-  'Runtime packaging must not derive compatibility from a different desktop release',
-);
-assert.match(
-  browserRuntimeReleaseWorkflow,
-  /--minimum-magi-version "\$minimum_magi_version"/,
-  'Runtime manifests must use the prepared compatibility floor',
-);
-assert.match(
-  browserRuntimeReleaseWorkflow,
-  /Browser Host 协议回归[\s\S]*?MAGI_BROWSER_TEST_CHROMIUM=.*npm --prefix browser-host test/,
-  'Browser Runtime CI must execute the real Chromium Host regression instead of silently skipping it',
-);
-assert.match(
-  browserRuntimeReleaseWorkflow,
-  /gh release upload "\$runtime_tag"[\s\S]*?dist\/browser-runtime\/release-\*\.json/,
-  'versioned Runtime releases must stage feed manifests for desktop release promotion',
-);
-assert.doesNotMatch(
-  browserRuntimeReleaseWorkflow,
-  /gh release upload browser-runtime-stable/,
-  'Runtime packaging must not promote the stable feed before the desktop release succeeds',
-);
-assert.match(
-  releaseWorkflow,
-  /等待并校验同版本 Browser Runtime[\s\S]*?browser-runtime-v\$\{version\}[\s\S]*?创建 Release 并上传产物[\s\S]*?更新桌面端稳定版 Feed[\s\S]*?提升 Browser Runtime 稳定版 Feed/,
-  'desktop publication must validate the matching Runtime and promote it only after the desktop feed',
-);
-assert.match(
-  releaseWorkflow,
-  /minimumVersions = new Set\(feeds\.map\(\(feed\) => feed\.release\.manifest\.minimum_magi_version\)\)/,
-  'desktop publication must require one shared Runtime compatibility floor across platforms',
-);
-
-const sequenceScript = fileURLToPath(new URL('../../scripts/browser-runtime-manifest-sequence.mjs', import.meta.url));
-const sequenceFloor = execFileSync(process.execPath, [sequenceScript, '3.0.40'], { encoding: 'utf8' }).trim();
-assert.equal(sequenceFloor, '3000000000040', 'product version must map above the legacy date-based manifest sequence range');
+for (const relativePath of [
+  '../../.github/workflows/browser-runtime-release.yml',
+  '../../browser-host',
+  '../../config/native-browser-runtime.json',
+  '../../config/browser-runtime-release.json',
+]) {
+  await assert.rejects(access(new URL(relativePath, import.meta.url)), `废弃资产必须删除: ${relativePath}`);
+}
 
 console.log('CI workflow golden replay passed');

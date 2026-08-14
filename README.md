@@ -216,7 +216,7 @@ Magi 的目标很直接：把模型能力变成一套能够长期协作、可恢
 
 ### 快速开始
 
-环境要求：Rust stable、Node.js 22 或更高版本、npm，以及桌面端对应的 Tauri 2 平台依赖。
+环境要求：Rust stable、Node.js 22 或更高版本、npm，以及 Electron 桌面构建所需的本机打包工具链。
 
 ~~~bash
 git clone https://github.com/MistRipple/magi-code.git
@@ -237,18 +237,19 @@ http://127.0.0.1:38123/web.html
 
 ~~~bash
 npm --prefix web run build
-cargo run -p magi-desktop
+npm run build
+npm run desktop:package -- --dir
 ~~~
 
-桌面端基于 Tauri 2，目标平台包括：
+桌面端基于 Electron，使用同一 Chromium 宿主承载 Magi UI 与内置浏览器，目标平台包括：
 
 - macOS DMG（Apple Silicon 与 Intel）
 - Linux AppImage 与 Deb
 - Windows NSIS 安装器
 
-推送与版本号一致的 `v*` 标签后，GitHub Actions 会构建三平台安装包、签名 updater 归档并创建 Release。已安装的桌面端会在启动时和运行期间定期检查 `latest.json`；用户可以在后台下载并校验更新，下载完成后自行选择“立即重启”或“稍后重启”，应用不会在下载结束时打断当前工作。重启安装前会先持久化状态并优雅停止本地服务。更新只替换应用本体，`~/.magi` 中的模型配置、会话、工作区、任务和知识库不会被打包或覆盖。
+推送与版本号一致的 `v*` 标签后，GitHub Actions 会构建三平台安装包、签名更新元数据并创建 Release。已安装的桌面端会在启动时和运行期间检查桌面版本更新；用户可以在后台下载并校验更新，下载完成后自行选择“立即重启”或“稍后重启”，应用不会在下载结束时打断当前工作。重启安装前会先持久化状态并优雅停止本地服务。Electron、Chromium、daemon 和 Automation Worker 作为同一桌面包原子更新，`~/.magi` 中的模型配置、会话、工作区、任务和知识库不会被打包或覆盖。
 
-发布更新需要在 GitHub Repository Secrets 中配置 `TAURI_SIGNING_PRIVATE_KEY`，可选配置 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。私钥只供 GitHub Actions 使用，不应写入仓库或桌面包；更新公钥只保存在 `apps/desktop/tauri.conf.json` 中。
+正式发布需要在 GitHub Repository Secrets 中配置 Electron Builder 使用的 macOS/Windows 签名、公证和 Release 签名凭据。私钥只供 GitHub Actions 使用，不应写入代码仓库或桌面包。
 
 ### 配置模型与角色
 
@@ -267,7 +268,7 @@ cargo run -p magi-desktop
 ~~~text
 apps/
   daemon/                         无头开发与服务入口
-  desktop/                        Tauri 桌面宿主
+  desktop/                        Electron/Chromium 桌面宿主
 crates/
   magi-api/                       HTTP、SSE 与公开 API
   magi-conversation-runtime/      主对话、上下文与任务派发

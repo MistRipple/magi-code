@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://magi.dev/contracts/capability-manifest.schema.json",
+  "title": "Magi Desktop browser capability manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "productVersion", "gitCommit", "electronVersion", "chromiumVersion", "daemonVersion", "automationWorkerVersion", "desktopProtocolVersion", "platform", "arch", "components", "files"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "productVersion": { "type": "string", "minLength": 1 },
+    "gitCommit": { "type": "string", "minLength": 7 },
+    "gitDirty": { "type": "boolean" },
+    "electronVersion": { "type": "string", "minLength": 1 },
+    "chromiumVersion": { "type": "string", "minLength": 1 },
+    "daemonVersion": { "type": "string", "minLength": 1 },
+    "automationWorkerVersion": { "type": "string", "minLength": 1 },
+    "desktopProtocolVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+    "cdpCompatibilityVersion": { "type": "string", "minLength": 1 },
+    "platform": { "type": "string", "minLength": 1 },
+    "arch": { "type": "string", "minLength": 1 },
+    "components": { "type": "object", "minProperties": 1 },
+    "files": { "type": "array", "items": { "type": "object", "required": ["path", "sha256"], "properties": { "path": { "type": "string", "minLength": 1 }, "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" } }, "additionalProperties": false } }
+  }
+}

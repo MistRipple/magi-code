@@ -1,15 +1,10 @@
-use magi_core::{EventId, UtcMillis};
-use magi_event_bus::{EventEnvelope, InMemoryEventBus};
 use magi_settings_store::SettingsStore;
 use magi_usage_authority::resolve_context_window;
 use serde_json::{Map, Value};
-use std::sync::Arc;
 
 pub const MODEL_CONTEXT_WINDOWS_SECTION: &str = "modelContextWindows";
 pub const MIN_MODEL_CONTEXT_WINDOW: u64 = 16_000;
 pub const MAX_MODEL_CONTEXT_WINDOW: u64 = 10_000_000;
-const CONTEXT_LIMIT_RECOVERY_DIVISOR: u64 = 4;
-const CONTEXT_LIMIT_RECOVERY_MAX_WINDOW: u64 = MIN_MODEL_CONTEXT_WINDOW / 2;
 
 pub fn normalize_model_context_key(model: &str) -> String {
     model.trim().to_ascii_lowercase()
@@ -47,13 +42,10 @@ pub fn resolve_model_context_window_with_override(
 }
 
 pub(crate) fn conservative_context_limit_recovery_window(current_window: u64) -> u64 {
+    let policy = magi_usage_authority::ContextBudgetPolicy::for_window(current_window, None, 0);
     current_window
-        .checked_div(CONTEXT_LIMIT_RECOVERY_DIVISOR)
-        .unwrap_or_default()
-        .clamp(
-            MIN_MODEL_CONTEXT_WINDOW / CONTEXT_LIMIT_RECOVERY_DIVISOR,
-            CONTEXT_LIMIT_RECOVERY_MAX_WINDOW,
-        )
+        .saturating_sub(policy.recovery_buffer_tokens)
+        .max(1)
 }
 
 pub fn set_model_context_window(
@@ -112,49 +104,6 @@ pub fn model_context_windows_with_update(
     Ok(entries)
 }
 
-pub(crate) fn apply_reported_context_limit(
-    event_bus: &InMemoryEventBus,
-    execution_settings_store: Option<&Arc<SettingsStore>>,
-    live_settings_store: Option<&Arc<SettingsStore>>,
-    model: &str,
-    context_limit: u64,
-) -> bool {
-    let Some(primary_store) = live_settings_store.or(execution_settings_store) else {
-        return false;
-    };
-    let entries = match set_model_context_window(primary_store.as_ref(), model, context_limit) {
-        Ok(entries) => entries,
-        Err(error) => {
-            tracing::warn!(
-                model,
-                context_limit,
-                %error,
-                "保存上游返回的模型上下文窗口失败"
-            );
-            return false;
-        }
-    };
-    if let Some(store) = execution_settings_store {
-        let _ = set_model_context_window(store.as_ref(), model, context_limit);
-    }
-    let updated_at = UtcMillis::now();
-    let _ = event_bus.publish(EventEnvelope::domain(
-        EventId::new(format!(
-            "event-model-context-window-updated-{}",
-            updated_at.0
-        )),
-        "model.context_window.updated",
-        serde_json::json!({
-            "model": model,
-            "contextWindowTokens": context_limit,
-            "modelContextWindows": entries,
-            "source": "provider_error",
-            "updatedAt": updated_at.0,
-        }),
-    ));
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,9 +128,9 @@ mod tests {
     }
 
     #[test]
-    fn context_limit_recovery_uses_a_conservative_runtime_window() {
-        assert_eq!(conservative_context_limit_recovery_window(128_000), 8_000);
-        assert_eq!(conservative_context_limit_recovery_window(16_000), 4_000);
-        assert_eq!(conservative_context_limit_recovery_window(1), 4_000);
+    fn context_limit_recovery_keeps_a_single_runtime_budget() {
+        assert!(conservative_context_limit_recovery_window(128_000) < 128_000);
+        assert!(conservative_context_limit_recovery_window(16_000) < 16_000);
+        assert_eq!(conservative_context_limit_recovery_window(1), 1);
     }
 }

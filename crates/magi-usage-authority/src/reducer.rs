@@ -64,7 +64,7 @@ fn upsert_model_snapshot(
 }
 
 pub fn rebuild_session_snapshot_from_events(
-    workspace_id: &str,
+    workspace_id: Option<&str>,
     session_id: &str,
     events: &[UsageEvent],
 ) -> SessionUsageSnapshot {

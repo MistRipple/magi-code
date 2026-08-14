@@ -219,6 +219,7 @@ export async function refreshCurrentGoal(
   try {
     const response = await createClient().getCurrentGoal(
       state.sessionId,
+      state.workspaceId || state.workspacePath ? 'workspace' : 'personal',
       state.workspaceId,
       state.workspacePath,
       controller.signal,

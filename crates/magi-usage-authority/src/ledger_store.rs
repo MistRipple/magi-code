@@ -47,7 +47,7 @@ impl InMemoryLedgerStore {
 
     pub fn read_session_snapshot(
         &self,
-        workspace_id: &str,
+        workspace_id: Option<&str>,
         session_id: &str,
     ) -> SessionUsageSnapshot {
         self.session_snapshots

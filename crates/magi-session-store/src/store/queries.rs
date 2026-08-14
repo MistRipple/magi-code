@@ -1,6 +1,6 @@
 use super::{SessionStore, cmp_sessions_newest_first, with_session_message_count};
 use crate::models::{
-    ActiveExecutionChain, NotificationRecord, SessionDurableState,
+    ActiveExecutionChain, NotificationContext, NotificationRecord, SessionDurableState,
     SessionExecutionSidecarStoreState, SessionProjectionInput, SessionRecord,
     SessionRuntimeSidecar, SessionRuntimeSidecarExport, SessionSidecarFlushMetadata, TimelineEntry,
 };
@@ -64,12 +64,34 @@ impl SessionStore {
         workspace_id: &str,
         requested_session_id: Option<&SessionId>,
     ) -> SessionProjectionInput {
-        let workspace_id = workspace_id.trim();
+        self.projection_input_for_optional_workspace_session(
+            Some(workspace_id.trim()),
+            requested_session_id,
+        )
+    }
+
+    /// 为未绑定项目的个人会话构造投影。
+    ///
+    /// `workspace_id = None` 是一个明确的会话作用域，而不是“没有筛选条件”。
+    /// 因此这里不能复用全局 projection：全局 projection 会把项目会话混入“最近”。
+    pub fn projection_input_for_personal_session(
+        &self,
+        requested_session_id: Option<&SessionId>,
+    ) -> SessionProjectionInput {
+        self.projection_input_for_optional_workspace_session(None, requested_session_id)
+    }
+
+    fn projection_input_for_optional_workspace_session(
+        &self,
+        workspace_id: Option<&str>,
+        requested_session_id: Option<&SessionId>,
+    ) -> SessionProjectionInput {
+        let workspace_id = workspace_id.map(str::trim);
         let state = self.state.read().expect("session state read lock poisoned");
         let mut sessions = state
             .sessions
             .iter()
-            .filter(|session| session.workspace_id.as_deref() == Some(workspace_id))
+            .filter(|session| session.workspace_id.as_deref() == workspace_id)
             .cloned()
             .map(|session| with_session_message_count(session, &state.timeline))
             .filter(|session| {
@@ -367,8 +389,7 @@ impl SessionStore {
 
     pub fn notifications_for_context(
         &self,
-        workspace_id: &str,
-        session_id: Option<&SessionId>,
+        context: &NotificationContext,
     ) -> Vec<NotificationRecord> {
         let mut notifications = self
             .state
@@ -376,7 +397,7 @@ impl SessionStore {
             .expect("session state read lock poisoned")
             .notifications
             .iter()
-            .filter(|notification| notification.visible_in_context(workspace_id, session_id))
+            .filter(|notification| notification.visible_in_context(context))
             .cloned()
             .collect::<Vec<_>>();
         notifications.sort_by(|left, right| {

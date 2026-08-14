@@ -167,7 +167,7 @@ impl ToolRegistry {
         self
     }
 
-    pub fn with_browser_runtime(
+    pub fn with_browser_automation(
         mut self,
         executor: BrowserToolExecutor,
         capability_provider: BrowserCapabilityProvider,
@@ -194,7 +194,7 @@ impl ToolRegistry {
         &self,
         access_profile: AccessProfile,
         session_id: Option<&magi_core::SessionId>,
-    ) -> Option<magi_browser_runtime::BrowserCapabilitySnapshot> {
+    ) -> Option<magi_browser_authority::BrowserCapabilitySnapshot> {
         let provider = self
             .runtime_resources
             .browser_capability_provider

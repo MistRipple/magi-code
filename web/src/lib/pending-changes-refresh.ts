@@ -4,9 +4,10 @@ import { getAgentPendingChanges } from '../web/agent-api';
 import type { Edit } from '../types/message';
 
 export interface PendingChangesRefreshScope {
+  scope: 'workspace';
   sessionId?: string;
-  workspaceId?: string;
-  workspacePath?: string;
+  workspaceId: string;
+  workspacePath: string;
   forceRefresh?: boolean;
 }
 

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://magi.dev/contracts/desktop-control.schema.json",
+  "title": "Magi Desktop Browser control protocol",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request_id", "protocol_version", "command"],
+  "properties": {
+    "request_id": { "$ref": "#/$defs/id" },
+    "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+    "command": { "$ref": "#/$defs/command" }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1 },
+    "protocolVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor"],
+      "properties": {
+        "major": { "type": "integer", "minimum": 0 },
+        "minor": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "surfaceBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["desktop_epoch", "window_id", "surface_id", "surface_revision", "tab_id", "web_contents_id", "target_id", "browser_context_id", "navigation_revision"],
+      "properties": {
+        "desktop_epoch": { "$ref": "#/$defs/id" },
+        "window_id": { "$ref": "#/$defs/id" },
+        "surface_id": { "$ref": "#/$defs/id" },
+        "surface_revision": { "type": "integer", "minimum": 0 },
+        "tab_id": { "$ref": "#/$defs/id" },
+        "web_contents_id": { "type": "integer", "minimum": 1 },
+        "target_id": { "$ref": "#/$defs/id" },
+        "browser_context_id": { "$ref": "#/$defs/id" },
+        "navigation_revision": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "logicalViewport": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["mode"], "properties": { "mode": { "const": "auto" } } },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "width", "height", "device_scale_factor_millis", "device_type"],
+          "properties": {
+            "mode": { "const": "fixed" },
+            "width": { "type": "integer", "minimum": 320, "maximum": 7680 },
+            "height": { "type": "integer", "minimum": 240, "maximum": 4320 },
+            "device_scale_factor_millis": { "type": "integer", "minimum": 1 },
+            "device_type": { "enum": ["desktop", "mobile"] }
+          }
+        }
+      ]
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "enum": ["ping", "create_page", "restore_page", "set_logical_viewport", "get_logical_viewport", "close_page", "navigate", "snapshot", "click", "type", "press", "scroll", "devtools", "screenshot", "hit_test", "update_control", "shutdown"]
+        },
+        "payload": { "type": "object" }
+      }
+    }
+  }
+}

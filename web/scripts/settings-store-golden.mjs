@@ -107,8 +107,13 @@ assert.doesNotMatch(
 );
 assert.match(
   modelConfigFormSource,
-  /const saveDisabled = \$derived\([\s\S]*?isSaving[\s\S]*?\|\| !isDirty[\s\S]*?visionRuleAnalysis\.syntaxInvalid \|\| routingRulesValidationError[\s\S]*?\);/,
+  /const saveDisabled = \$derived\([\s\S]*?isSaving[\s\S]*?\|\| !isDirty[\s\S]*?visionRuleAnalysis\.syntaxInvalid \|\| visionRuleAnalysis\.regexInvalid[\s\S]*?\);/,
   '模型配置发生变化后只应在保存期间或识图规则无效时禁用保存按钮',
+);
+assert.doesNotMatch(
+  modelConfigFormSource,
+  /visionCurrentMainModel|previewVisionRouting|vision-routing-test-model/,
+  '识图配置不应展示会话主模型或增加测试模型名称流程',
 );
 assert.doesNotMatch(
   modelConfigFormSource,

@@ -286,10 +286,19 @@ fn current_turn_item_renderable(
         .content
         .as_ref()
         .is_some_and(|content| !content.trim().is_empty());
+    let has_images = item
+        .metadata
+        .get("images")
+        .and_then(Value::as_array)
+        .is_some_and(|images| !images.is_empty());
     if kind == CanonicalTurnItemKind::AssistantText {
         return has_content || !status.is_terminal();
     }
-    has_content || item.tool_call_id.is_some() || item.worker_id.is_some() || item.task_id.is_some()
+    has_content
+        || has_images
+        || item.tool_call_id.is_some()
+        || item.worker_id.is_some()
+        || item.task_id.is_some()
 }
 
 fn current_turn_item_to_canonical_item(
@@ -1629,6 +1638,67 @@ impl SessionStore {
         {
             thread.last_used_at = now;
         }
+    }
+
+    /// 在一次压缩快照读取期间保持 transcript 与检查点代际不变时原子安装。
+    ///
+    /// runtime 不能在摘要模型返回后无条件覆盖新的用户消息或更新的检查点；
+    /// 调用方必须提供读取时的 transcript 长度和已有 generation，任一变化都
+    /// 让候选检查点失效，由上层重新读取并决定是否压缩。
+    pub fn install_thread_context_checkpoint_if_current(
+        &self,
+        thread_id: &ThreadId,
+        checkpoint: ThreadContextCheckpoint,
+        expected_message_count: usize,
+        expected_generation: u64,
+        now: UtcMillis,
+    ) -> bool {
+        let mut state = self
+            .state
+            .write()
+            .expect("session state write lock poisoned");
+        let Some(thread) = state
+            .thread_registry
+            .iter()
+            .find(|thread| &thread.thread_id == thread_id)
+        else {
+            return false;
+        };
+        if thread.message_history.len() != expected_message_count {
+            return false;
+        }
+        let current_generation = state
+            .thread_context_checkpoints
+            .iter()
+            .find(|existing| &existing.thread_id == thread_id)
+            .map(|existing| existing.generation)
+            .unwrap_or_default();
+        if current_generation != expected_generation || checkpoint.generation <= current_generation
+        {
+            return false;
+        }
+        let checkpoint = ThreadContextCheckpoint {
+            thread_id: thread_id.clone(),
+            source_message_count: checkpoint.source_message_count.min(expected_message_count),
+            ..checkpoint
+        };
+        if let Some(existing) = state
+            .thread_context_checkpoints
+            .iter_mut()
+            .find(|existing| &existing.thread_id == thread_id)
+        {
+            *existing = checkpoint;
+        } else {
+            state.thread_context_checkpoints.push(checkpoint);
+        }
+        if let Some(thread) = state
+            .thread_registry
+            .iter_mut()
+            .find(|thread| &thread.thread_id == thread_id)
+        {
+            thread.last_used_at = now;
+        }
+        true
     }
 
     pub fn clear_thread_context_checkpoint(&self, thread_id: &ThreadId) {

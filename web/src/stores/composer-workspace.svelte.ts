@@ -117,6 +117,10 @@ export function syncComposerWorkspaces(
 }
 
 export function selectComposerDraftWorkspace(workspaceId: string): ComposerWorkspaceOption | null {
+  if (!normalizeWorkspaceId(workspaceId)) {
+    composerWorkspaceState.draftWorkspaceId = '';
+    return null;
+  }
   const workspace = findWorkspaceById(workspaceId);
   if (!workspace) return null;
   composerWorkspaceState.draftWorkspaceId = workspace.workspaceId;

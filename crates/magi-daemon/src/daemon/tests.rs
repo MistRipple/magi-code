@@ -199,7 +199,7 @@ async fn get_agent_run_projection(
     get_json(
         app,
         &format!(
-            "/api/agent-runs/projection/{root_task_id}?workspaceId={workspace_id}&sessionId={session_id}"
+            "/api/agent-runs/projection/{root_task_id}?scope=workspace&workspaceId={workspace_id}&sessionId={session_id}"
         ),
     )
     .await
@@ -999,6 +999,7 @@ async fn daemon_runtime_recovery_preflight_executes_and_followup_router_dispatch
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "sessionId": session_id.to_string(),
             "text": "修复恢复任务后续问题，完成后运行测试并汇总验证结果",
             "skillName": "resume",
@@ -1082,6 +1083,7 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "sessionId": "test-session-bootstrap",
             "text": "修复路由解析刷新问题，完成后运行测试并汇总验证结果",
             "skillName": "refactor",
@@ -1120,6 +1122,7 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "sessionId": "test-session-bootstrap",
             "text": "继续修复路由解析刷新后续问题，完成后运行测试并汇总验证结果",
             "skillName": "refactor",
@@ -1159,7 +1162,11 @@ async fn daemon_bootstrap_exports_session_action_context_summary_after_followup_
     )
     .await;
     assert_completed_two_agent_run_projection(&second_projection);
-    let bootstrap = get_json(app.clone(), "/bootstrap").await;
+    let bootstrap = get_json(
+        app.clone(),
+        "/bootstrap?scope=workspace&workspaceId=test-workspace-001",
+    )
+    .await;
     let bootstrap_execution_group = bootstrap["runtimeReadModel"]["details"]["execution_groups"]
         .as_array()
         .expect("bootstrap execution groups should be an array")
@@ -1203,6 +1210,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "sessionId": "test-session-bootstrap-recovery",
             "text": "修复 bootstrap 恢复状态初始化问题，完成后运行测试并汇总验证结果",
             "skillName": "resume",
@@ -1290,7 +1298,11 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
     .await;
     assert_completed_two_agent_run_projection(&seed_projection);
     let after_resume_read_model = get_json(app.clone(), "/runtime/read-model").await;
-    let after_resume_bootstrap = get_json(app.clone(), "/bootstrap").await;
+    let after_resume_bootstrap = get_json(
+        app.clone(),
+        "/bootstrap?scope=workspace&workspaceId=test-workspace-001",
+    )
+    .await;
     assert_eq!(
         after_resume_bootstrap["runtimeReadModel"]["meta"], after_resume_read_model["meta"],
         "bootstrap 应保留全局运行态元信息"
@@ -1319,6 +1331,7 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "sessionId": "test-session-bootstrap-recovery",
             "text": "修复 resumed bootstrap memory 消费问题，完成后运行测试并汇总验证结果",
             "skillName": "resume",
@@ -1370,7 +1383,11 @@ async fn daemon_bootstrap_exports_recovery_context_after_resume_and_followup_dis
     )
     .await;
     assert_completed_two_agent_run_projection(&followup_projection);
-    let bootstrap = get_json(app.clone(), "/bootstrap").await;
+    let bootstrap = get_json(
+        app.clone(),
+        "/bootstrap?scope=workspace&workspaceId=test-workspace-001",
+    )
+    .await;
     let bootstrap_execution_group = bootstrap["runtimeReadModel"]["details"]["execution_groups"]
         .as_array()
         .expect("bootstrap execution groups should be an array")
@@ -2330,6 +2347,7 @@ async fn session_turn_live_events_reach_multiple_subscribers() {
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "text": "multi subscriber live event",
             "workspaceId": DEFAULT_TEST_WORKSPACE_ID,
             "requestId": "request-multi-subscriber-live",
@@ -2396,6 +2414,7 @@ async fn session_turn_persists_without_live_subscriber_and_recovers_after_restar
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "text": "no subscriber persistence",
             "workspaceId": "test-workspace-001",
             "requestId": "request-no-subscriber-recovery",
@@ -2441,7 +2460,9 @@ async fn session_turn_persists_without_live_subscriber_and_recovers_after_restar
         restarted_runtime.router_with_state_for_tests("daemon-test".to_string());
     let bootstrap = get_json(
         restarted_app.clone(),
-        &format!("/bootstrap?workspaceId=test-workspace-001&sessionId={session_id}"),
+        &format!(
+            "/bootstrap?scope=workspace&workspaceId=test-workspace-001&sessionId={session_id}"
+        ),
     )
     .await;
     assert_eq!(bootstrap["currentSession"]["sessionId"], session_id);
@@ -2456,7 +2477,9 @@ async fn session_turn_persists_without_live_subscriber_and_recovers_after_restar
 
     let messages = get_json(
         restarted_app,
-        &format!("/api/messages?workspaceId=test-workspace-001&sessionId={session_id}"),
+        &format!(
+            "/api/messages?scope=workspace&workspaceId=test-workspace-001&sessionId={session_id}"
+        ),
     )
     .await;
     assert!(
@@ -2498,6 +2521,7 @@ async fn workspace_sessions_and_events_stay_workspace_scoped() {
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "text": "workspace two isolated message",
             "workspaceId": second_workspace_id.clone(),
             "requestId": "request-workspace-two-isolated",
@@ -2533,7 +2557,11 @@ async fn workspace_sessions_and_events_stay_workspace_scoped() {
         "workspace two request events must not be scoped to the bootstrap workspace"
     );
 
-    let bootstrap_one = get_json(app.clone(), "/bootstrap?workspaceId=test-workspace-001").await;
+    let bootstrap_one = get_json(
+        app.clone(),
+        "/bootstrap?scope=workspace&workspaceId=test-workspace-001",
+    )
+    .await;
     assert!(
         !bootstrap_one["timeline"]
             .as_array()
@@ -2545,7 +2573,9 @@ async fn workspace_sessions_and_events_stay_workspace_scoped() {
 
     let bootstrap_two = get_json(
         app.clone(),
-        &format!("/bootstrap?workspaceId={second_workspace_id}&sessionId={session_id}"),
+        &format!(
+            "/bootstrap?scope=workspace&workspaceId={second_workspace_id}&sessionId={session_id}"
+        ),
     )
     .await;
     assert_eq!(bootstrap_two["currentSession"]["sessionId"], session_id);
@@ -2593,6 +2623,7 @@ async fn restart_restores_last_selected_workspace_session() {
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "text": "恢复最后打开的会话",
             "workspaceId": second_workspace_id.clone(),
             "requestId": "request-last-selected-session",
@@ -2616,6 +2647,7 @@ async fn restart_restores_last_selected_workspace_session() {
         "/api/session/navigation",
         json!({
             "target": "session",
+            "scope": "workspace",
             "workspaceId": second_workspace_id,
             "sessionId": selected_session_id,
         }),
@@ -2634,7 +2666,11 @@ async fn restart_restores_last_selected_workspace_session() {
         DaemonRuntime::restore(&config).expect("restart should recover persisted session state");
     let (restarted_app, _restarted_state) =
         restarted_runtime.router_with_state_for_tests("daemon-test".to_string());
-    let bootstrap = get_json(restarted_app, "/bootstrap").await;
+    let bootstrap = get_json(
+        restarted_app,
+        &format!("/bootstrap?scope=workspace&workspaceId={second_workspace_id}"),
+    )
+    .await;
 
     assert_eq!(
         bootstrap["currentSession"]["sessionId"],
@@ -2646,7 +2682,7 @@ async fn restart_restores_last_selected_workspace_session() {
             .expect("sessions should be an array")
             .iter()
             .all(|session| session["workspaceId"] == switch_body["currentSession"]["workspaceId"]),
-        "unscoped bootstrap should restore the selected workspace scope"
+        "selected workspace bootstrap should only restore sessions from that workspace"
     );
 }
 
@@ -2714,6 +2750,7 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "text": "修复集成测试消息链路问题，完成后运行测试并汇总验证结果",
             "skillName": "code",
             "images": [],
@@ -2752,7 +2789,7 @@ async fn session_action_happy_path_creates_tasks_and_records_timeline_messages()
 
     let messages_page = get_json(
         app.clone(),
-        &format!("/api/messages?workspaceId={DEFAULT_TEST_WORKSPACE_ID}&sessionId={session_id}"),
+        &format!("/api/messages?scope=workspace&workspaceId={DEFAULT_TEST_WORKSPACE_ID}&sessionId={session_id}"),
     )
     .await;
     let timeline = messages_page["timeline"]
@@ -2814,6 +2851,7 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "text": "修复重启持久化验证问题，完成后运行测试并汇总验证结果",
             "skillName": "code",
             "images": [],
@@ -2833,7 +2871,7 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
 
     let before_restart_messages = get_json(
         app.clone(),
-        &format!("/api/messages?workspaceId={DEFAULT_TEST_WORKSPACE_ID}&sessionId={session_id}"),
+        &format!("/api/messages?scope=workspace&workspaceId={DEFAULT_TEST_WORKSPACE_ID}&sessionId={session_id}"),
     )
     .await;
     assert_eq!(
@@ -2857,7 +2895,7 @@ async fn session_action_messages_survive_runtime_restart_and_preserve_message_co
 
     let after_restart_messages = get_json(
         restarted_app.clone(),
-        &format!("/api/messages?workspaceId={DEFAULT_TEST_WORKSPACE_ID}&sessionId={session_id}"),
+        &format!("/api/messages?scope=workspace&workspaceId={DEFAULT_TEST_WORKSPACE_ID}&sessionId={session_id}"),
     )
     .await;
     assert_eq!(
@@ -3010,6 +3048,7 @@ async fn session_continue_survives_runtime_restart_with_same_chain_and_worker_br
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "text": "修复重启继续执行链路问题，完成后运行测试并汇总验证结果",
             "skillName": "refactor",
             "images": [],
@@ -3494,6 +3533,7 @@ async fn workspace_bound_session_continue_survives_runtime_restart() {
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "text": "修复工作区绑定会话重启恢复问题，完成后运行测试并汇总验证结果",
             "skillName": "refactor",
             "images": [],
@@ -3657,6 +3697,7 @@ async fn session_action_publishes_domain_event_on_event_bus() {
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "sessionId": "session-e2e-events",
             "text": "修复事件总线任务事件发布问题，完成后运行测试并汇总验证结果",
             "skillName": "code",
@@ -3709,6 +3750,7 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "text": "修复连续会话第一阶段问题，完成后运行测试并汇总验证结果",
             "skillName": "refactor",
             "images": [],
@@ -3736,6 +3778,7 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
         app.clone(),
         "/api/session/turn",
         json!({
+            "scope": "workspace",
             "sessionId": session_id,
             "text": "修复连续会话第二阶段问题，完成后运行测试并汇总验证结果",
             "skillName": "refactor",
@@ -3763,7 +3806,7 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
 
     let messages_page = get_json(
         app.clone(),
-        &format!("/api/messages?workspaceId={DEFAULT_TEST_WORKSPACE_ID}&sessionId={session_id}"),
+        &format!("/api/messages?scope=workspace&workspaceId={DEFAULT_TEST_WORKSPACE_ID}&sessionId={session_id}"),
     )
     .await;
     let timeline = messages_page["timeline"]
@@ -3781,7 +3824,11 @@ async fn sequential_session_actions_share_session_and_accumulate_messages() {
     // session 一生一 mission：两次派发聚合到同一 execution_group。
     let session_mission_id = format!("mission-session-action-{first_accepted_at}");
 
-    let bootstrap = get_json(app, "/bootstrap").await;
+    let bootstrap = get_json(
+        app,
+        "/bootstrap?scope=workspace&workspaceId=test-workspace-001",
+    )
+    .await;
     let execution_groups = bootstrap["runtimeReadModel"]["details"]["execution_groups"]
         .as_array()
         .expect("execution groups should be an array");

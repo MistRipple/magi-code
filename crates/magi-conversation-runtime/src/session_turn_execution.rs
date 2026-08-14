@@ -10,11 +10,8 @@ use crate::context_authority::{
 };
 #[cfg(test)]
 use crate::context_authority::{ContextCompactionProgress, ContextCompactionRecord};
-#[cfg(test)]
-use crate::model_context_window::resolve_model_context_window;
 use crate::model_context_window::{
-    apply_reported_context_limit, conservative_context_limit_recovery_window,
-    resolve_model_context_window_with_override,
+    conservative_context_limit_recovery_window, resolve_model_context_window_with_override,
 };
 use crate::{
     ConversationRegistry, SessionTurnInputBoundary, UserSignal,
@@ -26,9 +23,8 @@ use crate::{
     model_error::{
         MODEL_EMPTY_RESPONSE_RECOVERY_MAX_ATTEMPTS, MODEL_PRE_OUTPUT_RECOVERY_MAX_ATTEMPTS,
         MODEL_STREAM_INTERRUPTION_RECOVERY_MAX_ATTEMPTS, ModelFailureDiagnostic,
-        classify_model_invocation_error, extract_model_context_limit,
-        model_empty_response_recovery_prompt, model_stream_interruption_recovery_prompt,
-        public_model_image_invocation_error_message,
+        classify_model_invocation_error, model_empty_response_recovery_prompt,
+        model_stream_interruption_recovery_prompt, public_model_image_invocation_error_message,
     },
     prompt_utils::{
         PromptFragmentKind, current_turn_context_priority_prompt, dynamic_skill_prompt_message,
@@ -58,7 +54,8 @@ use crate::{
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
         account_active_goal_usage, publish_model_usage_record, resolved_model_for_usage_binding,
-        session_turn_model_usage_binding, vision_model_usage_binding,
+        resolved_provider_for_usage_binding, session_turn_model_usage_binding,
+        vision_model_usage_binding,
     },
 };
 use magi_bridge_client::{
@@ -308,9 +305,25 @@ fn canonical_session_turn_history(
                         CanonicalTurnItemKind::AssistantText => "assistant",
                         _ => return None,
                     };
-                    if !item.visibility.renderable
-                        || &item.source_thread_id != orchestrator_thread_id
-                    {
+                    if !item.visibility.renderable {
+                        return None;
+                    }
+                    let is_orchestrator_item = &item.source_thread_id == orchestrator_thread_id;
+                    let is_root_final_item = item.kind == CanonicalTurnItemKind::AssistantText
+                        && item
+                            .metadata
+                            .get("assistantOutputKind")
+                            .and_then(|value| value.as_str())
+                            == Some("final")
+                        && item.worker.as_ref().is_some_and(|worker| {
+                            worker.task_id.is_some()
+                                && worker.worker_id.is_none()
+                                && worker.role_id.is_none()
+                        });
+                    // 普通 session turn 的最终回复由 coordinator task 负责落盘，
+                    // source_thread_id 可能不是 orchestrator thread；它仍是主线事实，
+                    // 必须进入后续回合上下文。带 worker/role 的 sidechain final 继续排除。
+                    if !is_orchestrator_item && !is_root_final_item {
                         return None;
                     }
                     let content = item.content?.trim().to_string();
@@ -566,6 +579,7 @@ struct RebuildMessagesForContextWindowInput<'a> {
     skill_runtime: Option<&'a magi_skill_runtime::SkillRuntime>,
     initial_skill_name: Option<&'a str>,
     active_skill_name: Option<&'a str>,
+    persist_checkpoint: bool,
 }
 
 fn rebuild_messages_for_context_window(
@@ -587,6 +601,7 @@ fn rebuild_messages_for_context_window(
         skill_runtime,
         initial_skill_name,
         active_skill_name,
+        persist_checkpoint,
     } = input;
     let mut fixed_messages = build_session_turn_messages(
         session_store,
@@ -634,6 +649,9 @@ fn rebuild_messages_for_context_window(
         context_window_override: Some(context_window),
         additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages)
             .saturating_add(estimate_tool_definition_tokens(tools)),
+        persist_checkpoint,
+        model_identity: None,
+        force_compaction: true,
     });
     if let Some(terminal) = prepared.terminal {
         return Err(terminal);
@@ -758,7 +776,7 @@ fn run_session_turn_execution_inner(
         knowledge_context_prompt,
         tools,
         persist_session_state,
-        live_settings_store,
+        live_settings_store: _live_settings_store,
     } = runtime;
 
     if !request_turn_is_writable(session_store, &request) {
@@ -784,15 +802,11 @@ fn run_session_turn_execution_inner(
         .and_then(|config| config.to_usage_llm_config())
         .map(|config| config.model)
         .unwrap_or_default();
-    let request_contains_images = !request.images.is_empty()
-        || session_store
-            .thread_context_history(&orchestrator_thread_id)
-            .iter()
-            .any(|message| !message.images.is_empty());
+    let current_turn_contains_images = !request.images.is_empty();
     let vision_execution_config = resolve_vision_execution_config(
         settings_store.map(Arc::as_ref),
         &selected_model,
-        request_contains_images,
+        current_turn_contains_images,
     )
     .map_err(|error| {
         SessionTurnExecutionError::new(SessionTurnFailureReason::ModelImageInvocationFailed, error)
@@ -862,6 +876,16 @@ fn run_session_turn_execution_inner(
         context_window_override: Some(effective_context_window),
         additional_token_estimate: estimate_chat_messages_tokens(&fixed_messages)
             .saturating_add(estimate_tool_definition_tokens(tools.as_deref())),
+        persist_checkpoint: vision_execution_config.is_none(),
+        model_identity: Some(magi_usage_authority::ModelIdentitySnapshot::new(
+            vision_execution_config
+                .as_ref()
+                .map(|_| "vision")
+                .unwrap_or("configured"),
+            resolved_context_model.clone(),
+            0,
+        )),
+        force_compaction: false,
     });
     if let Some(terminal) = prepared_history.terminal {
         return match terminal {
@@ -895,14 +919,9 @@ fn run_session_turn_execution_inner(
     }
     if let Some(current_user_message) = messages.last() {
         let mut persisted_user_message = chat_message_to_thread_chat_message(current_user_message);
-        persisted_user_message.images = session_turn_image_sources(&request.images)
-            .into_iter()
-            .map(|image| magi_session_store::ThreadChatImageSource {
-                kind: image.kind,
-                media_type: image.media_type,
-                data: image.data,
-            })
-            .collect();
+        // 原图由 canonical turn 负责审计与 UI 展示。thread 历史只保留文本语义，
+        // 避免后续纯文本回合把历史图片再次发送给主模型。
+        persisted_user_message.images.clear();
         session_store.append_thread_messages(
             &orchestrator_thread_id,
             vec![persisted_user_message],
@@ -989,6 +1008,7 @@ fn run_session_turn_execution_inner(
                     skill_runtime,
                     initial_skill_name: initial_skill_name.as_deref(),
                     active_skill_name: active_skill_name.as_deref(),
+                    persist_checkpoint: vision_execution_config.is_none(),
                 });
             match rebuild_result {
                 Ok(compacted) => {
@@ -1073,6 +1093,7 @@ fn run_session_turn_execution_inner(
             }
             Err(SessionTurnRoundError::Failed {
                 error,
+                context_overflow,
                 non_stream_fallback_attempted,
             }) => {
                 if !request_turn_is_writable(session_store, &request) {
@@ -1104,19 +1125,10 @@ fn run_session_turn_execution_inner(
                     round = round.saturating_add(1);
                     continue;
                 }
-                if classification.code == "model_context_limit" && !context_limit_recovery_attempted
-                {
+                if context_overflow.is_some() && !context_limit_recovery_attempted {
                     context_limit_recovery_attempted = true;
-                    let reported_context_limit = extract_model_context_limit(&error);
-                    if let Some(context_limit) = reported_context_limit {
-                        let _ = apply_reported_context_limit(
-                            event_bus,
-                            settings_store,
-                            live_settings_store.as_ref(),
-                            &resolved_context_model,
-                            context_limit,
-                        );
-                    }
+                    let reported_context_limit =
+                        context_overflow.and_then(|overflow| overflow.context_limit_tokens);
                     effective_context_window = reported_context_limit.unwrap_or_else(|| {
                         conservative_context_limit_recovery_window(effective_context_window)
                     });
@@ -1137,6 +1149,7 @@ fn run_session_turn_execution_inner(
                             skill_runtime,
                             initial_skill_name: initial_skill_name.as_deref(),
                             active_skill_name: active_skill_name.as_deref(),
+                            persist_checkpoint: vision_execution_config.is_none(),
                         },
                     ) {
                         Ok(compacted) => compacted,
@@ -1595,6 +1608,7 @@ struct SessionTurnRoundOutput {
 enum SessionTurnRoundError {
     Failed {
         error: String,
+        context_overflow: Option<magi_bridge_client::ContextOverflowInfo>,
         non_stream_fallback_attempted: bool,
     },
     InvalidResponse(Box<ModelFailureDiagnostic>),
@@ -1733,9 +1747,11 @@ fn stream_session_turn_round(
     let resolved_model =
         resolved_model_for_usage_binding(settings_store, usage_binding, &request.session_id)
             .unwrap_or_default();
+    let resolved_provider =
+        resolved_provider_for_usage_binding(settings_store, usage_binding, &request.session_id);
     let prefill_tokens = estimate_chat_messages_tokens(messages)
         .saturating_add(estimate_tool_definition_tokens(tools.as_deref()));
-    let context_usage_tracker =
+    let context_usage_tracker = usage_binding.tracks_active_context().then(|| {
         ContextUsageRuntimeTracker::start(ContextUsageRuntimeTrackerInput {
             event_bus,
             settings_store: settings_store.map(Arc::as_ref),
@@ -1745,13 +1761,23 @@ fn stream_session_turn_round(
             call_id: &call_id,
             resolved_model: &resolved_model,
             prefill_tokens: prefill_tokens as u64,
-        });
+            thread_id: Some(orchestrator_thread_id),
+            model_provider: resolved_provider,
+            binding_revision: usage_binding.binding_revision(),
+            checkpoint_generation: session_store
+                .thread_context_checkpoint(orchestrator_thread_id)
+                .map(|checkpoint| checkpoint.generation)
+                .unwrap_or_default(),
+        })
+    });
     let on_delta = |delta: &ModelStreamingDelta| {
         if !request_turn_is_writable(session_store, request) {
             writeback_aborted.set(true);
             return;
         }
-        context_usage_tracker.observe_accumulated_output(&delta.content, &delta.thinking);
+        if let Some(tracker) = context_usage_tracker.as_ref() {
+            tracker.observe_accumulated_output(&delta.content, &delta.thinking);
+        }
         let accumulated_thinking = delta.thinking.as_str();
         if accumulated_thinking.len() > last_thinking_len.get() {
             let stream_update = {
@@ -1928,6 +1954,7 @@ fn stream_session_turn_round(
             if classification.code != "model_stream_interrupted" {
                 return Err(SessionTurnRoundError::Failed {
                     error: raw_error,
+                    context_overflow: error.context_overflow(),
                     non_stream_fallback_attempted: false,
                 });
             }
@@ -2059,6 +2086,7 @@ fn stream_session_turn_round(
                     );
                     return Err(SessionTurnRoundError::Failed {
                         error: fallback_raw_error,
+                        context_overflow: fallback_error.context_overflow(),
                         non_stream_fallback_attempted: true,
                     });
                 }
@@ -2533,13 +2561,13 @@ mod tests {
         BridgeClientError, BridgeErrorLayer, ModelResponse, ModelRetryRuntimeEvent,
         ModelRetryRuntimePhase,
     };
-    use magi_core::SessionLifecycleStatus;
+    use magi_core::{SessionLifecycleStatus, TaskId};
     use magi_session_store::{
         ActiveExecutionTurn, CanonicalToolCall, CanonicalTurn, CanonicalTurnItem,
         CanonicalTurnItemKind, CanonicalTurnItemStatus, CanonicalTurnStatus,
-        CanonicalTurnVisibility, ExecutionThread, ExecutionThreadStatus, ORCHESTRATOR_ROLE_ID,
-        SessionRecord, SessionStoreState, ThreadChatMessage, ThreadChatToolCall,
-        ThreadChatToolFunction, TimelineEntry, TimelineEntryKind,
+        CanonicalTurnVisibility, CanonicalWorkerRef, ExecutionThread, ExecutionThreadStatus,
+        ORCHESTRATOR_ROLE_ID, SessionRecord, SessionStoreState, ThreadChatMessage,
+        ThreadChatToolCall, ThreadChatToolFunction, TimelineEntry, TimelineEntryKind,
     };
     use std::sync::{
         Mutex,
@@ -2634,6 +2662,11 @@ mod tests {
 
     struct CountingEmptyModelBridgeClient {
         calls: AtomicUsize,
+    }
+
+    struct CountingTextModelBridgeClient {
+        calls: AtomicUsize,
+        requests: Mutex<Vec<ModelInvocationRequest>>,
     }
 
     struct EmptyStreamThenRecoveredSessionModelBridgeClient {
@@ -2787,6 +2820,35 @@ mod tests {
             request: ModelInvocationRequest,
             _on_delta: &dyn Fn(&ModelStreamingDelta),
         ) -> Result<ModelResponse, BridgeClientError> {
+            self.invoke(request)
+        }
+    }
+
+    impl ModelBridgeClient for CountingTextModelBridgeClient {
+        fn invoke(
+            &self,
+            request: ModelInvocationRequest,
+        ) -> Result<ModelResponse, BridgeClientError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests
+                .lock()
+                .expect("主模型请求记录锁必须可用")
+                .push(request);
+            Ok(model_response(serde_json::json!({
+                "content": "主模型完成",
+                "finish_reason": "stop"
+            })))
+        }
+
+        fn invoke_streaming(
+            &self,
+            request: ModelInvocationRequest,
+            on_delta: &dyn Fn(&ModelStreamingDelta),
+        ) -> Result<ModelResponse, BridgeClientError> {
+            on_delta(&ModelStreamingDelta {
+                content: "主模型完成".to_string(),
+                thinking: String::new(),
+            });
             self.invoke(request)
         }
     }
@@ -3045,7 +3107,7 @@ mod tests {
     }
 
     #[test]
-    fn text_model_image_turn_is_fully_executed_by_vision_model() {
+    fn vision_model_only_takes_over_the_current_image_turn() {
         let (vision_base_url, vision_request_receiver) = spawn_vision_http_stub();
         let session_id = SessionId::new("session-vision-takeover");
         let turn_id = "turn-vision-takeover".to_string();
@@ -3136,8 +3198,9 @@ mod tests {
             .begin_session_turn_input(session_id.clone(), turn_id.clone())
             .expect("识图接管测试输入边界必须可创建");
         let plan_store = magi_plan::PlanStore::new(store.clone(), session_id.clone());
-        let main_client = CountingEmptyModelBridgeClient {
+        let main_client = CountingTextModelBridgeClient {
             calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
         };
         let tools = vec![ChatToolDefinition {
             kind: "function".to_string(),
@@ -3208,6 +3271,98 @@ mod tests {
         assert!(
             vision_request_receiver.try_recv().is_err(),
             "识图接管不得先识图再调用第二次模型"
+        );
+
+        let persisted_image_turn = store.thread_message_history(&thread_id);
+        assert!(
+            persisted_image_turn
+                .iter()
+                .filter(|message| message.content.as_deref() == Some("结合图片继续处理"))
+                .all(|message| message.images.is_empty()),
+            "图片只属于当前回合输入，不能进入后续回合的模型历史"
+        );
+
+        let follow_up_turn_id = "turn-after-vision-takeover".to_string();
+        store
+            .upsert_current_turn(
+                session_id.clone(),
+                ActiveExecutionTurn {
+                    turn_id: follow_up_turn_id.clone(),
+                    turn_seq: 2,
+                    accepted_at: ts(2_000),
+                    completed_at: None,
+                    status: "running".to_string(),
+                    user_message: Some("继续说明刚才的结论".to_string()),
+                    items: vec![session_turn_item(
+                        "user_message",
+                        "completed",
+                        None,
+                        Some("继续说明刚才的结论".to_string()),
+                        Some("user-after-vision-takeover".to_string()),
+                        thread_id.clone(),
+                    )],
+                },
+            )
+            .expect("识图后的纯文本轮次必须可写入");
+        registry
+            .begin_session_turn_input(session_id.clone(), follow_up_turn_id.clone())
+            .expect("识图后的纯文本输入边界必须可创建");
+        let follow_up_request = SessionTurnExecutionRequest {
+            session_id: session_id.clone(),
+            turn_id: follow_up_turn_id,
+            workspace_id: None,
+            prompt: "继续说明刚才的结论".to_string(),
+            images: Vec::new(),
+            context_references: Vec::new(),
+            use_tools: false,
+            access_profile: AccessProfile::Restricted,
+            skill_name: None,
+            request_id: Some("request-after-vision-takeover".to_string()),
+            user_message_id: Some("user-after-vision-takeover".to_string()),
+            placeholder_message_id: Some("assistant-after-vision-takeover".to_string()),
+            forced_tool_name: None,
+            required_tool_chain: Vec::new(),
+            goal_turn_mode: SessionGoalTurnMode::None,
+            product_locale: "zh-CN".to_string(),
+            workspace_root_path: None,
+        };
+        let follow_up_output = run_session_turn_execution(SessionTurnExecutionRuntime {
+            client: &main_client,
+            event_bus: &InMemoryEventBus::new(32),
+            session_store: store.as_ref(),
+            conversation_registry: &registry,
+            plan_store: &plan_store,
+            settings_store: Some(&settings),
+            safety_gate: None,
+            tool_registry: None,
+            skill_runtime: None,
+            skill_dispatch_runtime: None,
+            skill_name: None,
+            snapshot_manager: None,
+            request: follow_up_request,
+            prompt: "继续说明刚才的结论".to_string(),
+            knowledge_context_prompt: None,
+            tools: None,
+            persist_session_state: None,
+            live_settings_store: Some(settings.clone()),
+        })
+        .expect("识图后的纯文本轮次必须恢复主模型执行");
+
+        assert_eq!(follow_up_output.final_content, "主模型完成");
+        assert_eq!(main_client.calls.load(Ordering::SeqCst), 1);
+        let main_requests = main_client
+            .requests
+            .lock()
+            .expect("主模型请求记录锁必须可用");
+        assert_eq!(main_requests.len(), 1);
+        assert!(
+            main_requests[0]
+                .messages
+                .as_ref()
+                .expect("主模型后续轮次必须携带完整文本上下文")
+                .iter()
+                .all(|message| message.images.is_empty()),
+            "后续纯文本轮次不得向主模型重放历史图片"
         );
     }
 
@@ -5096,10 +5251,20 @@ mod tests {
                         content: Some("2+3 等于 5。".to_string()),
                         blocks: Vec::new(),
                         tool: None,
-                        worker: None,
-                        source_thread_id: magi_core::ThreadId::new("thread-test-orchestrator"),
+                        worker: Some(CanonicalWorkerRef {
+                            task_id: Some(TaskId::new("task-root-context-history")),
+                            worker_id: None,
+                            role_id: None,
+                            title: Some("最终回复".to_string()),
+                        }),
+                        source_thread_id: magi_core::ThreadId::new(
+                            "thread-coordinator-task-root-context-history",
+                        ),
                         visibility: CanonicalTurnVisibility::default(),
-                        metadata: HashMap::new(),
+                        metadata: HashMap::from([(
+                            "assistantOutputKind".to_string(),
+                            serde_json::json!("final"),
+                        )]),
                     },
                 ],
                 metadata: HashMap::new(),
@@ -6159,36 +6324,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_context_limit_updates_live_and_execution_settings() {
-        let live = Arc::new(SettingsStore::new());
-        let execution = Arc::new(live.execution_snapshot());
-        let event_bus = InMemoryEventBus::new(16);
-
-        assert!(apply_reported_context_limit(
-            &event_bus,
-            Some(&execution),
-            Some(&live),
-            "candidate-model",
-            262_144,
-        ));
-        assert_eq!(
-            resolve_model_context_window(Some(live.as_ref()), "candidate-model"),
-            262_144
-        );
-        assert_eq!(
-            resolve_model_context_window(Some(execution.as_ref()), "candidate-model"),
-            262_144
-        );
-        assert!(
-            event_bus
-                .snapshot()
-                .recent_events
-                .iter()
-                .any(|event| event.event_type == "model.context_window.updated")
-        );
-    }
-
-    #[test]
     fn context_limit_recovery_rebuilds_after_tool_fact_with_dynamic_target() {
         let session_id = SessionId::new("session-context-limit-after-tool");
         let store = SessionStore::new();
@@ -6306,6 +6441,7 @@ mod tests {
             skill_runtime: None,
             initial_skill_name: None,
             active_skill_name: None,
+            persist_checkpoint: true,
         });
 
         assert!(
@@ -6414,6 +6550,7 @@ mod tests {
             skill_runtime: None,
             initial_skill_name: None,
             active_skill_name: None,
+            persist_checkpoint: true,
         });
 
         assert_eq!(result, Err(ContextCompactionTerminal::Failed));
@@ -6519,6 +6656,7 @@ mod tests {
             skill_runtime: None,
             initial_skill_name: None,
             active_skill_name: None,
+            persist_checkpoint: true,
         });
 
         assert_eq!(result, Err(ContextCompactionTerminal::Cancelled));

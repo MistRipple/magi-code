@@ -31,9 +31,9 @@ use crate::{
     model_config::{
         DEFAULT_ORCHESTRATOR_REASONING_EFFORT, DEFAULT_VISION_CONTEXT_WINDOW,
         NormalizedModelConfig, VISION_MODEL_SECTION, builtin_text_model_rule_catalog,
-        match_text_model_rule, merge_orchestrator_session_override, parse_user_text_model_rules,
-        reject_deprecated_model_config_fields, resolve_orchestrator_model_config,
-        strip_orchestrator_session_owned_fields, validate_vision_model_settings,
+        merge_orchestrator_session_override, reject_deprecated_model_config_fields,
+        resolve_orchestrator_model_config, strip_orchestrator_session_owned_fields,
+        validate_vision_model_settings,
     },
     scope_binding::without_scope_binding_fields,
     state::ApiState,
@@ -546,10 +546,6 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/vision/save", post(save_vision_config))
         .route("/settings/vision/test", post(test_vision_connection))
         .route(
-            "/settings/vision/routing-preview",
-            post(preview_vision_routing),
-        )
-        .route(
             "/settings/image-generation/save",
             post(save_image_generation_config),
         )
@@ -980,14 +976,21 @@ async fn settings_bootstrap(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     reject_deprecated_scope_query_fields(&query)?;
     let hydrate_mcp_servers = query
-        .get("scope")
+        .get("bootstrapScope")
         .map(|value| value.trim())
         .is_none_or(|scope| scope != "core");
     let session_id = parse_optional_query_string(&query, "sessionId");
     let workspace_id = parse_optional_query_string(&query, "workspaceId");
     let workspace_path = parse_optional_query_string(&query, "workspacePath");
-    let scope = session_scope::resolve_optional_session_workspace_scope(
+    let requested_scope = query
+        .get("scope")
+        .ok_or_else(|| ApiError::InvalidInput("scope 不能为空".to_string()))?;
+    let requested_scope =
+        serde_json::from_value::<crate::dto::SessionScopeKindDto>(json!(requested_scope))
+            .map_err(ApiError::invalid_request_body)?;
+    let scope = session_scope::resolve_optional_explicit_session_scope(
         &state,
+        requested_scope,
         session_id.as_deref(),
         workspace_id.as_deref(),
         workspace_path.as_deref(),
@@ -1003,6 +1006,7 @@ async fn settings_bootstrap(
             "visionBuiltinTextModelRules".to_string(),
             json!(builtin_text_model_rule_catalog()),
         );
+        object.insert("scope".to_string(), json!(scope.scope_kind()));
         if let Some(session_id) = scope.session_id() {
             let mut effective_orchestrator_config = object
                 .get("orchestratorConfig")
@@ -1049,20 +1053,15 @@ async fn settings_bootstrap(
         );
         object.insert(
             "workspaceId".to_string(),
-            Value::String(scope.workspace_id_string()),
+            json!(scope.workspace_id_string()),
         );
         object.insert(
             "workspacePath".to_string(),
-            Value::String(scope.workspace_path_string()),
+            json!(scope.workspace_path_string()),
         );
         object.insert(
             "sessionId".to_string(),
-            Value::String(
-                scope
-                    .session_id()
-                    .map(ToString::to_string)
-                    .unwrap_or_default(),
-            ),
+            json!(scope.session_id().map(ToString::to_string)),
         );
     }
     Ok(Json(snapshot))
@@ -1180,14 +1179,18 @@ async fn save_orchestrator_session_config(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     reject_deprecated_scope_body_fields(&request)?;
     let session_id = request.get("sessionId").and_then(Value::as_str);
+    let requested_scope = serde_json::from_value::<crate::dto::SessionScopeKindDto>(
+        request.get("scope").cloned().unwrap_or(Value::Null),
+    )
+    .map_err(ApiError::invalid_request_body)?;
     let workspace_id = request.get("workspaceId").and_then(Value::as_str);
     let workspace_path = request.get("workspacePath").and_then(Value::as_str);
-    let scope = session_scope::require_session_workspace_scope(
+    let scope = session_scope::require_session_request_scope(
         &state,
         session_id,
+        requested_scope,
         workspace_id,
         workspace_path,
-        "保存会话主模型配置",
     )?;
     let override_config = save_orchestrator_session_override_for_session(
         &state,
@@ -1206,7 +1209,7 @@ async fn save_orchestrator_session_config(
     Ok(Json(serde_json::json!({
         "saved": true,
         "sessionId": scope.session_id.to_string(),
-        "workspaceId": scope.workspace_id.to_string(),
+        "workspaceId": scope.workspace_id().map(|id| id.to_string()),
         "orchestratorSessionConfig": override_config,
         "effectiveOrchestratorConfig": effective_config,
     })))
@@ -1341,41 +1344,6 @@ async fn test_vision_connection(
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     probe_connection_response(request).await
-}
-
-async fn preview_vision_routing(
-    Json(request): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let request = scoped_settings_section_request(&request)?;
-    let model = request
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("待测试模型名称不能为空".to_string()))?;
-    let user_rules = parse_user_text_model_rules(&request).map_err(ApiError::InvalidInput)?;
-    let matched = match_text_model_rule(model, &user_rules);
-
-    Ok(Json(match matched {
-        Some(rule) => json!({
-            "model": model,
-            "matched": true,
-            "source": rule.source.as_label(),
-            "ruleId": rule.rule_id,
-            "ruleName": rule.display_name,
-            "matchMode": rule.match_mode.as_label(),
-            "pattern": rule.pattern,
-        }),
-        None => json!({
-            "model": model,
-            "matched": false,
-            "source": Value::Null,
-            "ruleId": Value::Null,
-            "ruleName": Value::Null,
-            "matchMode": Value::Null,
-            "pattern": Value::Null,
-        }),
-    }))
 }
 
 fn image_generation_section_request(request: &Value) -> Result<Value, ApiError> {
@@ -1760,7 +1728,7 @@ fn usage_authority_from_model_usage_ledger(state: &ApiState) -> UsageAuthority {
         if input.timestamp.is_none() {
             input.timestamp = Some(entry.occurred_at.0);
         }
-        input.workspace_id = "all".to_string();
+        input.workspace_id = Some("all".to_string());
         authority.append_call_record(input);
     }
 
@@ -1817,7 +1785,7 @@ fn legacy_image_usage_record(
     timestamp: u64,
 ) -> UsageCallRecordInput {
     UsageCallRecordInput {
-        workspace_id: "all".to_string(),
+        workspace_id: Some("all".to_string()),
         session_id: session_id.to_string(),
         turn_id: None,
         dispatch_wave_id: None,
@@ -2598,6 +2566,7 @@ mod tests {
         let bootstrap = settings_bootstrap(
             State(state),
             Query(HashMap::from([
+                ("scope".to_string(), "workspace".to_string()),
                 ("sessionId".to_string(), session_id.as_str().to_string()),
                 ("workspaceId".to_string(), workspace_id.to_string()),
                 ("workspacePath".to_string(), workspace_path.clone()),
@@ -2640,9 +2609,13 @@ mod tests {
         ] {
             assert!(bootstrap[key].is_array(), "{key} should be an array");
         }
-        assert_eq!(
-            bootstrap["visionBuiltinTextModelRules"][0]["displayName"],
-            json!("GLM 5.2")
+        assert!(
+            bootstrap["visionBuiltinTextModelRules"]
+                .as_array()
+                .expect("vision rules should be an array")
+                .iter()
+                .any(|rule| rule["displayName"] == json!("GLM 5.2")),
+            "vision rules should retain GLM 5.2"
         );
         let builtin_tools = bootstrap["builtinTools"]
             .as_array()
@@ -2690,9 +2663,7 @@ mod tests {
             "browser_emulate",
             "browser_performance",
             "browser_lighthouse",
-            "browser_screencast",
             "browser_heap",
-            "browser_extensions",
             "browser_third_party",
             "browser_webmcp",
             "browser_pwa",
@@ -2963,10 +2934,38 @@ mod tests {
     #[tokio::test]
     async fn settings_bootstrap_reports_product_capabilities_without_tool_context() {
         let state = test_state();
-        let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
-            .await
-            .expect("settings bootstrap should build")
-            .0;
+        state
+            .settings_store
+            .set_section(
+                ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
+                json!({ "model": "model-last-used", "reasoningEffort": "high" }),
+            )
+            .unwrap();
+        let bootstrap = settings_bootstrap(
+            State(state),
+            Query(HashMap::from([(
+                "scope".to_string(),
+                "personal".to_string(),
+            )])),
+        )
+        .await
+        .expect("settings bootstrap should build")
+        .0;
+        assert!(bootstrap["workspaceId"].is_null());
+        assert!(bootstrap["workspacePath"].is_null());
+        assert!(bootstrap["sessionId"].is_null());
+        assert_eq!(
+            bootstrap["orchestratorSessionDefaults"],
+            json!({ "model": "model-last-used", "reasoningEffort": "high" })
+        );
+        assert_eq!(
+            bootstrap["orchestratorSessionConfig"], bootstrap["orchestratorSessionDefaults"],
+            "无会话草稿必须直接读取持久化的新会话默认配置"
+        );
+        assert_eq!(
+            bootstrap["effectiveOrchestratorConfig"]["model"],
+            json!("model-last-used")
+        );
         let dependencies = bootstrap["capabilityDependencies"]
             .as_array()
             .expect("capability dependencies should be listed");
@@ -2995,6 +2994,7 @@ mod tests {
         let bootstrap = settings_bootstrap(
             State(state),
             Query(HashMap::from([
+                ("scope".to_string(), "workspace".to_string()),
                 (
                     "workspaceId".to_string(),
                     "workspace-stale-query".to_string(),
@@ -3008,6 +3008,79 @@ mod tests {
 
         assert_eq!(bootstrap["workspaceId"], json!(workspace_id.as_str()));
         assert_eq!(bootstrap["workspacePath"], json!(workspace_path));
+    }
+
+    #[tokio::test]
+    async fn settings_bootstrap_uses_defaults_for_session_without_override() {
+        let state = test_state();
+        let session_id = SessionId::new("session-settings-default-model");
+        state
+            .session_store
+            .create_session(session_id.clone(), "继承默认模型")
+            .expect("personal session should be creatable");
+        state
+            .settings_store
+            .set_section(
+                ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
+                json!({ "model": "model-last-used", "reasoningEffort": "xhigh" }),
+            )
+            .unwrap();
+
+        let bootstrap = settings_bootstrap(
+            State(state),
+            Query(HashMap::from([
+                ("scope".to_string(), "personal".to_string()),
+                ("sessionId".to_string(), session_id.to_string()),
+            ])),
+        )
+        .await
+        .expect("personal settings bootstrap should build")
+        .0;
+
+        assert_eq!(
+            bootstrap["orchestratorSessionConfig"],
+            json!({ "model": "model-last-used", "reasoningEffort": "xhigh" })
+        );
+        assert_eq!(
+            bootstrap["effectiveOrchestratorConfig"]["model"],
+            json!("model-last-used")
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_bootstrap_returns_null_workspace_for_personal_session() {
+        let state = test_state();
+        let session_id = SessionId::new("session-settings-personal");
+        state
+            .session_store
+            .create_session(session_id.clone(), "个人设置会话")
+            .expect("personal session should be creatable");
+
+        let bootstrap = settings_bootstrap(
+            State(state),
+            Query(HashMap::from([
+                ("scope".to_string(), "personal".to_string()),
+                ("sessionId".to_string(), session_id.to_string()),
+            ])),
+        )
+        .await
+        .expect("personal settings bootstrap should build")
+        .0;
+
+        assert_eq!(bootstrap["sessionId"], json!(session_id.as_str()));
+        assert_eq!(bootstrap["scope"], json!("personal"));
+        assert!(bootstrap["workspaceId"].is_null());
+        assert!(bootstrap["workspacePath"].is_null());
+    }
+
+    #[tokio::test]
+    async fn settings_bootstrap_requires_explicit_session_scope() {
+        let result = settings_bootstrap(State(test_state()), Query(HashMap::new())).await;
+
+        match result {
+            Err(ApiError::InvalidInput(message)) => assert_eq!(message, "scope 不能为空"),
+            other => panic!("expected missing scope to be rejected, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3085,6 +3158,7 @@ mod tests {
         let result = settings_bootstrap(
             State(state),
             Query(HashMap::from([
+                ("scope".to_string(), "workspace".to_string()),
                 ("workspaceId".to_string(), workspace_a.to_string()),
                 ("sessionId".to_string(), session_b.to_string()),
             ])),
@@ -3148,10 +3222,16 @@ mod tests {
             )
             .unwrap();
 
-        let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
-            .await
-            .expect("settings bootstrap should build")
-            .0;
+        let bootstrap = settings_bootstrap(
+            State(state),
+            Query(HashMap::from([(
+                "scope".to_string(),
+                "personal".to_string(),
+            )])),
+        )
+        .await
+        .expect("settings bootstrap should build")
+        .0;
 
         assert!(bootstrap["orchestratorConfig"].get("provider").is_none());
         assert!(
@@ -3220,10 +3300,16 @@ mod tests {
             )
             .unwrap();
 
-        let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
-            .await
-            .expect("settings bootstrap should build")
-            .0;
+        let bootstrap = settings_bootstrap(
+            State(state),
+            Query(HashMap::from([(
+                "scope".to_string(),
+                "personal".to_string(),
+            )])),
+        )
+        .await
+        .expect("settings bootstrap should build")
+        .0;
 
         assert_eq!(
             bootstrap["orchestratorConfig"]["baseUrl"],
@@ -3283,10 +3369,16 @@ mod tests {
             )
             .unwrap();
 
-        let bootstrap = settings_bootstrap(State(state.clone()), Query(HashMap::new()))
-            .await
-            .expect("settings bootstrap should build")
-            .0;
+        let bootstrap = settings_bootstrap(
+            State(state.clone()),
+            Query(HashMap::from([(
+                "scope".to_string(),
+                "personal".to_string(),
+            )])),
+        )
+        .await
+        .expect("settings bootstrap should build")
+        .0;
 
         assert_eq!(
             bootstrap["registryEngines"][0]["llm"]["model"],
@@ -3416,10 +3508,16 @@ mod tests {
         )
         .unwrap();
 
-        let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
-            .await
-            .expect("settings bootstrap should build")
-            .0;
+        let bootstrap = settings_bootstrap(
+            State(state),
+            Query(HashMap::from([(
+                "scope".to_string(),
+                "personal".to_string(),
+            )])),
+        )
+        .await
+        .expect("settings bootstrap should build")
+        .0;
         let servers = bootstrap["mcpServers"]
             .as_array()
             .expect("mcpServers should be an array");
@@ -3467,10 +3565,16 @@ mod tests {
             )
             .unwrap();
 
-        let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
-            .await
-            .expect("settings bootstrap should build")
-            .0;
+        let bootstrap = settings_bootstrap(
+            State(state),
+            Query(HashMap::from([(
+                "scope".to_string(),
+                "personal".to_string(),
+            )])),
+        )
+        .await
+        .expect("settings bootstrap should build")
+        .0;
 
         assert_eq!(
             bootstrap["mcpServers"][0]["env"]["TOKEN"],
@@ -3501,10 +3605,16 @@ mod tests {
             )
             .unwrap();
 
-        let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
-            .await
-            .expect("settings bootstrap should build")
-            .0;
+        let bootstrap = settings_bootstrap(
+            State(state),
+            Query(HashMap::from([(
+                "scope".to_string(),
+                "personal".to_string(),
+            )])),
+        )
+        .await
+        .expect("settings bootstrap should build")
+        .0;
         let server = &bootstrap["mcpServers"][0];
 
         assert_eq!(server["connected"], json!(false));
@@ -3546,10 +3656,16 @@ mod tests {
             )
             .unwrap();
 
-        let bootstrap = settings_bootstrap(State(state), Query(HashMap::new()))
-            .await
-            .expect("settings bootstrap should build")
-            .0;
+        let bootstrap = settings_bootstrap(
+            State(state),
+            Query(HashMap::from([(
+                "scope".to_string(),
+                "personal".to_string(),
+            )])),
+        )
+        .await
+        .expect("settings bootstrap should build")
+        .0;
 
         assert_eq!(bootstrap["bootstrapScope"], json!("full"));
         assert_eq!(bootstrap["mcpServersHydrated"], json!(true));
@@ -3581,7 +3697,10 @@ mod tests {
         let state = test_state();
         let bootstrap = settings_bootstrap(
             State(state),
-            Query(HashMap::from([("scope".to_string(), "core".to_string())])),
+            Query(HashMap::from([
+                ("scope".to_string(), "personal".to_string()),
+                ("bootstrapScope".to_string(), "core".to_string()),
+            ])),
         )
         .await
         .expect("settings bootstrap should build")
@@ -3824,45 +3943,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vision_routing_preview_reports_builtin_and_custom_rule_sources() {
-        let builtin = preview_vision_routing(Json(json!({
-            "model": "GLM-5.2",
-            "textModelRules": []
-        })))
-        .await
-        .expect("builtin model should preview")
-        .0;
-        assert_eq!(builtin["matched"], json!(true));
-        assert_eq!(builtin["source"], json!("builtin"));
-        assert_eq!(builtin["ruleName"], json!("GLM 5.2"));
-
-        let custom = preview_vision_routing(Json(json!({
-            "model": "company-text-model",
-            "textModelRules": [
-                {"matchMode": "exact", "pattern": "company-text-model"}
-            ],
-            "workspaceId": "workspace-ignored"
-        })))
-        .await
-        .expect("custom model should preview")
-        .0;
-        assert_eq!(custom["matched"], json!(true));
-        assert_eq!(custom["source"], json!("custom"));
-        assert_eq!(custom["matchMode"], json!("exact"));
-        assert_eq!(custom["pattern"], json!("company-text-model"));
-
-        let unmatched = preview_vision_routing(Json(json!({
-            "model": "gpt-4.1",
-            "textModelRules": []
-        })))
-        .await
-        .expect("multimodal model should preview")
-        .0;
-        assert_eq!(unmatched["matched"], json!(false));
-        assert!(unmatched["source"].is_null());
-    }
-
-    #[tokio::test]
     async fn vision_config_save_rejects_invalid_rules_without_partial_write() {
         let state = test_state();
         state
@@ -3945,6 +4025,7 @@ mod tests {
             State(state.clone()),
             Json(json!({
                 "sessionId": session_id.as_str(),
+                "scope": "workspace",
                 "workspaceId": "workspace-session-model",
                 "config": {
                     "baseUrl": "https://malicious.example.com/v1",
@@ -3998,6 +4079,70 @@ mod tests {
             configuration_event.payload["orchestratorSessionConfig"]["model"],
             json!("session-main-model")
         );
+        assert_eq!(
+            state
+                .settings_store
+                .get_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION),
+            json!({
+                "model": "session-main-model",
+                "reasoningEffort": "high"
+            }),
+            "当前会话的最新模型选择必须原子更新为后续新会话默认值"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_orchestrator_session_config_supports_personal_session_scope() {
+        let state = test_state();
+        let session_id = SessionId::new("session-personal-model-override");
+        state
+            .session_store
+            .create_session(session_id.clone(), "个人模型配置")
+            .expect("personal session should be creatable");
+        state
+            .settings_store
+            .set_section(
+                "orchestrator",
+                json!({
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "sk-global",
+                    "model": "global-main-model",
+                    "reasoningEffort": "medium"
+                }),
+            )
+            .unwrap();
+
+        let response = save_orchestrator_session_config(
+            State(state.clone()),
+            Json(json!({
+                "sessionId": session_id.as_str(),
+                "scope": "personal",
+                "config": {
+                    "model": "personal-main-model",
+                    "reasoningEffort": "high"
+                }
+            })),
+        )
+        .await
+        .expect("personal session orchestrator override should save")
+        .0;
+
+        assert_eq!(response["saved"], json!(true));
+        assert!(response["workspaceId"].is_null());
+        assert_eq!(
+            response["orchestratorSessionConfig"]["model"],
+            json!("personal-main-model")
+        );
+        let event = state
+            .event_bus
+            .snapshot()
+            .recent_events
+            .into_iter()
+            .find(|event| event.event_type == "session.configuration.updated")
+            .expect("personal session configuration should publish");
+        assert_eq!(event.session_id.as_ref(), Some(&session_id));
+        assert!(event.workspace_id.is_none());
+        assert!(event.payload["workspaceId"].is_null());
     }
 
     #[tokio::test]
@@ -4029,6 +4174,7 @@ mod tests {
             State(state.clone()),
             Json(json!({
                 "sessionId": session_id.as_str(),
+                "scope": "workspace",
                 "workspaceId": "workspace-session-model-merge",
                 "config": {
                     "model": "model-after"
@@ -4054,48 +4200,21 @@ mod tests {
             json!("high")
         );
         assert!(saved.get("previousModel").is_none());
+        assert_eq!(
+            state
+                .settings_store
+                .get_section(ORCHESTRATOR_SESSION_DEFAULTS_SECTION),
+            json!({
+                "model": "model-after",
+                "reasoningEffort": "high"
+            }),
+            "只切换模型时默认值必须保留原会话推理强度"
+        );
         assert!(saved.get("modelSwitchPending").is_none());
     }
 
     #[test]
     fn model_reselection_keeps_only_the_user_selected_model() {
-        assert_eq!(
-            state
-                .settings_store
-                .get_section(MODEL_CONTEXT_WINDOWS_SECTION)["vision-capable-model"],
-            json!(256000)
-        );
-    }
-
-    #[tokio::test]
-    async fn vision_config_save_rejects_invalid_rules_without_partial_write() {
-        let state = test_state();
-        state
-            .settings_store
-            .set_section(
-                VISION_MODEL_SECTION,
-                json!({
-                    "baseUrl": "https://old-vision.example.com/v1",
-                    "apiKey": "old-key",
-                    "model": "old-vision-model",
-                    "urlMode": "standard",
-                    "apiProtocol": "openai_chat",
-                    "contextWindowTokens": 128000,
-                    "textModelRules": []
-                }),
-            )
-            .unwrap();
-        state
-            .settings_store
-            .set_section(
-                MODEL_CONTEXT_WINDOWS_SECTION,
-                json!({"old-vision-model": 128000}),
-            )
-            .unwrap();
-        let original_vision = state.settings_store.get_section(VISION_MODEL_SECTION);
-        let original_windows = state
-            .settings_store
-            .get_section(MODEL_CONTEXT_WINDOWS_SECTION);
         let state = test_state();
         let session_id = SessionId::new("session-model-reselection");
         state
@@ -4252,6 +4371,7 @@ mod tests {
         let bootstrap = settings_bootstrap(
             State(state.clone()),
             Query(HashMap::from([
+                ("scope".to_string(), "workspace".to_string()),
                 (
                     "workspaceId".to_string(),
                     "workspace-bootstrap-session-model".to_string(),
@@ -4685,6 +4805,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_stats_includes_personal_session_usage_without_workspace_id() {
+        let state = test_state();
+        let mut usage_payload = model_usage_payload(
+            "usage-personal-session",
+            "unused-workspace",
+            "session-personal-stats",
+            "call-personal-stats",
+            101,
+            12,
+            5,
+        );
+        usage_payload
+            .as_object_mut()
+            .expect("usage payload should be an object")
+            .remove("workspaceId");
+        state.event_bus.publish(
+            EventEnvelope::usage(
+                EventId::new("usage-personal-session"),
+                "model.usage.recorded",
+                usage_payload,
+            )
+            .with_context(EventContext {
+                workspace_id: None,
+                session_id: Some(SessionId::new("session-personal-stats")),
+                ..EventContext::default()
+            }),
+        );
+
+        let payload = execution_stats(State(state))
+            .await
+            .expect("personal session usage should be included in global stats")
+            .0;
+
+        assert_eq!(payload["totals"]["llmCallCount"], json!(1));
+        assert_eq!(payload["totals"]["netInputTokens"], json!(12));
+        assert_eq!(payload["totals"]["netOutputTokens"], json!(5));
+        assert_eq!(payload["totals"]["totalTokens"], json!(17));
+        assert_eq!(payload["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(payload["models"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
     async fn execution_stats_aggregates_usage_across_workspaces() {
         let state = test_state();
         for (event_id, workspace_id, session_id, input_tokens, output_tokens) in [
@@ -4881,20 +5043,20 @@ mod tests {
 
         let bootstrap_a = settings_bootstrap(
             State(state.clone()),
-            Query(HashMap::from([(
-                "sessionId".to_string(),
-                session_a.as_str().to_string(),
-            )])),
+            Query(HashMap::from([
+                ("scope".to_string(), "personal".to_string()),
+                ("sessionId".to_string(), session_a.as_str().to_string()),
+            ])),
         )
         .await
         .expect("settings bootstrap A should build")
         .0;
         let bootstrap_b = settings_bootstrap(
             State(state.clone()),
-            Query(HashMap::from([(
-                "sessionId".to_string(),
-                session_b.as_str().to_string(),
-            )])),
+            Query(HashMap::from([
+                ("scope".to_string(), "personal".to_string()),
+                ("sessionId".to_string(), session_b.as_str().to_string()),
+            ])),
         )
         .await
         .expect("settings bootstrap B should build")

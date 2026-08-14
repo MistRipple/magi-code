@@ -1,0 +1,22 @@
+{
+  "name": "magi-desktop-workspace",
+  "private": true,
+  "version": "0.0.0",
+  "workspaces": [
+    "apps/desktop",
+    "browser-automation-worker",
+    "contracts/desktop-browser",
+    "web"
+  ],
+  "scripts": {
+    "check": "npm run check --workspace @magi/desktop && npm run check --workspace @magi/browser-automation-worker && npm run check --workspace magi-web",
+    "test": "npm run test --workspace @magi/desktop && npm run test --workspace @magi/browser-automation-worker && npm run test --workspace magi-web",
+    "build": "npm run build --workspace @magi/desktop",
+    "desktop:dev": "npm run dev --workspace @magi/desktop",
+    "desktop:package": "npm run package --workspace @magi/desktop",
+    "release:guard": "node scripts/verify-browser-contracts.mjs && node scripts/verify-electron-release-boundary.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -23,6 +23,7 @@ import type {
 import { buildEmptyWorkspaceAppState } from './empty-workspace-state';
 
 export type BootstrapPayload = SessionBootstrapSnapshot & {
+  scope: 'personal' | 'workspace';
   agent?: {
     runtimeEpoch?: string;
   };
@@ -208,6 +209,17 @@ interface RustSessionRuntimeSummary {
 
 interface RustSessionRuntimeUsageObservation {
   context_window_tokens?: number;
+  provider_context_tokens?: number | null;
+  projected_request_tokens?: number;
+  context_window_limit_tokens?: number | null;
+  model_provider?: string | null;
+  binding_revision?: number | null;
+  response_reserve_tokens?: number | null;
+  recovery_buffer_tokens?: number | null;
+  proactive_threshold_tokens?: number | null;
+  hard_request_limit_tokens?: number | null;
+  pressure_level?: string | null;
+  checkpoint_generation?: number | null;
   resolved_model?: string | null;
   observed_at?: number | null;
   measurement?: string | null;
@@ -390,6 +402,9 @@ interface RustRuntimeReadModelDto {
 }
 
 interface RustBootstrapDto {
+  scope?: 'personal' | 'workspace';
+  workspaceId?: string | null;
+  workspacePath?: string | null;
   generatedAt?: number;
   currentSession?: RustBootstrapSessionRecord | null;
   sessions?: RustBootstrapSessionRecord[];
@@ -570,6 +585,35 @@ function normalizeRuntimeUsageObservation(raw: unknown): RustSessionRuntimeUsage
     context_window_tokens: typeof record.context_window_tokens === 'number'
       ? Math.floor(record.context_window_tokens)
       : undefined,
+    provider_context_tokens: typeof record.provider_context_tokens === 'number'
+      ? Math.floor(record.provider_context_tokens)
+      : undefined,
+    projected_request_tokens: typeof record.projected_request_tokens === 'number'
+      ? Math.floor(record.projected_request_tokens)
+      : undefined,
+    context_window_limit_tokens: typeof record.context_window_limit_tokens === 'number'
+      ? Math.floor(record.context_window_limit_tokens)
+      : undefined,
+    model_provider: normalizeString(record.model_provider) || undefined,
+    binding_revision: typeof record.binding_revision === 'number'
+      ? Math.floor(record.binding_revision)
+      : undefined,
+    response_reserve_tokens: typeof record.response_reserve_tokens === 'number'
+      ? Math.floor(record.response_reserve_tokens)
+      : undefined,
+    recovery_buffer_tokens: typeof record.recovery_buffer_tokens === 'number'
+      ? Math.floor(record.recovery_buffer_tokens)
+      : undefined,
+    proactive_threshold_tokens: typeof record.proactive_threshold_tokens === 'number'
+      ? Math.floor(record.proactive_threshold_tokens)
+      : undefined,
+    hard_request_limit_tokens: typeof record.hard_request_limit_tokens === 'number'
+      ? Math.floor(record.hard_request_limit_tokens)
+      : undefined,
+    pressure_level: normalizeString(record.pressure_level) || undefined,
+    checkpoint_generation: typeof record.checkpoint_generation === 'number'
+      ? Math.floor(record.checkpoint_generation)
+      : undefined,
     resolved_model: normalizeString(record.resolved_model) || undefined,
     observed_at: typeof record.observed_at === 'number' ? Math.floor(record.observed_at) : undefined,
     measurement: normalizeString(record.measurement) || undefined,
@@ -741,11 +785,28 @@ function resolveSelectedWorkspace(
   payload: RustBootstrapDto,
   options: { workspaceId?: string; workspacePath?: string },
 ): { workspaceId: string; rootPath: string; name: string } {
+  if (payload.scope === 'personal') {
+    return {
+      workspaceId: '',
+      rootPath: '',
+      name: '',
+    };
+  }
   const requestedWorkspaceId = normalizeString(options.workspaceId);
   const requestedWorkspacePath = normalizeString(options.workspacePath);
+  const authoritativeWorkspaceId = normalizeString(payload.workspaceId);
+  const authoritativeWorkspacePath = normalizeString(payload.workspacePath);
   const currentSessionWorkspaceId = normalizeString(payload.currentSession?.workspaceId);
   const workspaces = Array.isArray(payload.workspaces) ? payload.workspaces : [];
   const selectedWorkspace = workspaces.find((workspace) => (
+    authoritativeWorkspaceId
+    && normalizeString(workspace.workspaceId) === authoritativeWorkspaceId
+  ))
+    || workspaces.find((workspace) => (
+      authoritativeWorkspacePath
+      && normalizeString(workspace.rootPath) === authoritativeWorkspacePath
+    ))
+    || workspaces.find((workspace) => (
     requestedWorkspacePath && normalizeString(workspace.rootPath) === requestedWorkspacePath
   ))
     || workspaces.find((workspace) => (
@@ -757,12 +818,13 @@ function resolveSelectedWorkspace(
       && currentSessionWorkspaceId
       && normalizeString(workspace.workspaceId) === currentSessionWorkspaceId
     ))
-    || workspaces[0]
     || null;
   const workspaceId = normalizeString(selectedWorkspace?.workspaceId)
+    || authoritativeWorkspaceId
     || requestedWorkspaceId
     || currentSessionWorkspaceId;
   const rootPath = normalizeString(selectedWorkspace?.rootPath)
+    || authoritativeWorkspacePath
     || requestedWorkspacePath;
   return {
     workspaceId,
@@ -1818,12 +1880,33 @@ function buildRuntimeSnapshot(
       tokenLimit: budget.token_limit,
       usageRatio: budget.usage_ratio,
       warningLevel: normalizeBudgetWarningLevel(budget.warning_level),
-      lastCompactionAt: compaction?.compacted_at ?? undefined,
-      lastCompactionReason: compaction?.reason ?? undefined,
-      originalTokenEstimate: compaction?.original_token_estimate ?? undefined,
-      compactedTokenEstimate: compaction?.compacted_token_estimate ?? undefined,
-      originalMessageCount: compaction?.original_message_count ?? undefined,
-      compactedMessageCount: compaction?.compacted_message_count ?? undefined,
+      ...(usageObservation?.projected_request_tokens != null || budget.token_used != null
+        ? { projectedRequestTokens: usageObservation?.projected_request_tokens ?? budget.token_used }
+        : {}),
+      ...(usageObservation?.provider_context_tokens != null
+        ? { providerContextTokens: usageObservation.provider_context_tokens }
+        : {}),
+      ...(usageObservation?.pressure_level ? { pressureLevel: usageObservation.pressure_level } : {}),
+      ...(usageObservation?.proactive_threshold_tokens != null
+        ? { proactiveThresholdTokens: usageObservation.proactive_threshold_tokens }
+        : {}),
+      ...(usageObservation?.hard_request_limit_tokens != null
+        ? { hardRequestLimitTokens: usageObservation.hard_request_limit_tokens }
+        : {}),
+      ...(compaction?.compacted_at != null ? { lastCompactionAt: compaction.compacted_at } : {}),
+      ...(compaction?.reason ? { lastCompactionReason: compaction.reason } : {}),
+      ...(compaction?.original_token_estimate != null
+        ? { originalTokenEstimate: compaction.original_token_estimate }
+        : {}),
+      ...(compaction?.compacted_token_estimate != null
+        ? { compactedTokenEstimate: compaction.compacted_token_estimate }
+        : {}),
+      ...(compaction?.original_message_count != null
+        ? { originalMessageCount: compaction.original_message_count }
+        : {}),
+      ...(compaction?.compacted_message_count != null
+        ? { compactedMessageCount: compaction.compacted_message_count }
+        : {}),
       ...(measurement ? { measurement } : {}),
       ...(usageObservation?.phase ? { phase: usageObservation.phase } : {}),
       ...(usageObservation?.observed_at != null
@@ -2008,6 +2091,9 @@ export function normalizeRustBootstrapPayload(
   const payload = (rawPayload ?? {}) as RustBootstrapDto;
   const generatedAt = normalizeNumber(payload.generatedAt, Date.now());
   const workspace = resolveSelectedWorkspace(payload, options);
+  const scope = payload.scope === 'workspace' || payload.scope === 'personal'
+    ? payload.scope
+    : (workspace.workspaceId || workspace.rootPath ? 'workspace' : 'personal');
   const sessions = normalizeRustSessions(payload, generatedAt, workspace.workspaceId);
   const selectedSessionId = normalizeString(payload.currentSession?.sessionId);
   const currentSession = selectedSessionId
@@ -2046,6 +2132,7 @@ export function normalizeRustBootstrapPayload(
   const normalizedNotifications = normalizeNotifications(payload.notifications);
 
   return {
+    scope,
     agent: {
       runtimeEpoch: normalizeString(payload.agent?.runtimeEpoch)
         || (currentSession?.id && workspace.workspaceId ? `${workspace.workspaceId}:${currentSession.id}` : String(generatedAt)),
@@ -2056,9 +2143,9 @@ export function normalizeRustBootstrapPayload(
     state,
     canonicalTurns,
     eventStreamNextSequence: normalizeNumber(payload.eventStreamNextSequence, 0),
-    notifications: workspace.workspaceId
+    notifications: currentSession?.id || workspace.workspaceId
         ? {
-          workspaceId: workspace.workspaceId,
+          workspaceId: workspace.workspaceId || null,
           sessionId: currentSession?.id || undefined,
           notifications: {
             lastUpdatedAt: generatedAt,

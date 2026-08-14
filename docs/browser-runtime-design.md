@@ -1,978 +1,1174 @@
-# Magi 内置浏览器完整设计
+# Magi 统一 Chromium 桌面与内置浏览器完整架构
 
-> 状态：目标架构基线
+> 状态：后续开发唯一产品架构
 >
-> 更新日期：2026-08-04
+> 更新日期：2026-08-14
 >
-> 适用范围：Magi daemon、Desktop、Web 工作台、Goal、子代理、工具运行时与发布链路
+> 适用范围：Magi Desktop、Web UI、Rust daemon、Browser Automation、右侧面板、浏览器工具、发布、更新与旧实现清理
 
-## 1. 决策摘要
+## 1. 最终决策
 
-Magi 内置浏览器采用以下唯一实现：
+Magi Desktop 统一使用 Chromium 桌面宿主。现有 Svelte 业务界面和 Rust daemon 保留；Tauri 系统 WebView、独立 CEF、原生 NSView 覆盖、截图投影和 iframe 均不再属于产品架构。
 
-1. `magi-daemon` 内的 `BrowserAuthority` 是浏览器状态、控制租约和能力判定的唯一权威来源。
-2. 浏览器执行引擎使用受 daemon 管理的 Playwright Browser Host sidecar，运行独立的 Chromium 和独立的 Magi 浏览器 Profile。
-3. 右侧栏展示 Chromium 的 CDP Screencast 画面并转发用户输入，不把业务网页加载进 Magi 主 Tauri WebView。
-4. 模型通过 Magi 第一方内置工具直接调用 `BrowserAuthority`，不依赖用户配置的 MCP。
-5. MCP 只保留为未来接入远程浏览器或第三方浏览器服务的适配边界，不参与内置浏览器的核心状态链路。
-6. Browser Session 与 Goal 状态正交；Goal 暂停时撤销代理控制租约，但浏览器页面继续保留并允许用户查看。
-7. 同一 Magi Browser Profile 同一时刻最多有一个代理写控制租约；该代理可以在自己会话的多个 Tab 间切换。用户接管优先于代理，并通过统一执行中断链路暂停关联 Goal。
-8. 页面标记是后端持久化的一等领域对象，不是前端截图上的临时坐标。
-9. Chromium、Node Runtime 和 Browser Host 组成独立签名的 Browser Runtime Component，首次使用时按需安装；Magi 常规升级不重复携带该组件。
-10. 内置浏览器完成后删除右侧栏现有 HTML iframe 渲染分支；HTML 源码继续由 Code Tab 展示，HTML 运行预览统一进入 Browser Session。
+唯一实现基线：
 
-该方案参考 Codex 的产品和权限分层、OpenAI CUA Sample App 的运行与回放结构、Steel Browser 的 Session/Viewer 设计，以及 Playwright MCP 的工具语义。Magi 不复制其中任意一个项目，而是把它们收敛进现有 Goal、工具、事件和会话架构。
+- Electron `BaseWindow` 作为跨平台 Chromium Desktop Host。
+- 现有 Svelte 应用拆分为可信的 `MagiAppView`、`RightPaneChromeView` 和按需创建的 `DesktopOverlayView`。
+- 每个桌面窗口中的每个 Browser Tab 由一个独立 `BrowserSurface` 承载，页面使用真实 `WebContentsView`。
+- Electron Main Process 是物理页面、窗口布局、输入焦点、导航安全和进程生命周期的唯一所有者。
+- Rust daemon 继续拥有 BrowserAuthority、会话、工具治理、Lease、Annotation 和 Artifact。
+- 浏览器自动化通过 Electron `webContents.debugger` 的受控 CDP Gateway 执行，不开放 Chromium remote debugging port。
+- 生产运行时不再依赖 Playwright 连接已运行 Electron；Playwright 只保留为外部端到端测试工具。
+- Chromium、Desktop Host、Rust daemon 和 Browser Automation Worker 随同一个 Magi 桌面发行包签名、更新和回滚。
+- 迁移完成后一次性删除 Tauri、CEF、Native Bridge、独立 Browser Runtime 安装器和所有兼容分支。
 
-## 2. 为什么必须这样设计
+## 2. 产品目标
 
-### 2.1 不能把 MCP 当作内置浏览器内核
+### 2.1 用户体验
 
-用户 MCP 连接具有以下不确定性：
+- 右侧顶级 Tab 一个 Tab 对应一个浏览器页面，Browser Tab 内不存在第二层网页 Tab。
+- 右侧面板是多功能面板，不是浏览器专用容器；浏览器、代码、图片、终端、Agent 等内容都通过同一顶级 Tab 框架切换。浏览器只是其中一种内容类型，不能改变右栏的通用 Tab、布局和拖拽契约。
+- 浏览器 Surface 只占用右侧面板的内容区，不参与右侧面板的 Tab 栏、工具栏、拖拽边界或其他面板布局；切换到代码、图片或终端时，Browser Surface 仅隐藏，不改变右栏状态。
+- 右栏宽度、拖拽手柄、顶级 Tab 和非浏览器内容在没有 Browser Surface、Browser Surface 未就绪或浏览器导航期间行为完全不变。
+- 新增面板始终先经过可扩展的面板选择器；当前只提供浏览器，后续增加代码、图片、终端或其他类型时不得修改浏览器 Surface 的所有权边界。
+- 新增浏览器 Tab 先提交 BrowserAuthority 的逻辑 Tab，再由 Electron Main 异步创建真实 Surface；创建和网络导航不得阻塞新增菜单、右栏拖拽、已有代码/图片/终端 Tab 或其他面板操作。Surface 创建失败只影响该浏览器 Tab，并返回可操作状态，不得锁死或清空整个右栏。
+- 用户可以直接点击、输入、滚动、复制、粘贴、拖动、选择文本、打开右键菜单和使用输入法。
+- 当前会话的 Agent 可以操作用户正在查看的同一个页面，不启动隐藏浏览器或第二份 Chromium。
+- Agent 接管期间持续显示虚拟鼠标和 Tab 占用状态；用户输入立即接管当前 Surface。
+- Agent 任务完成、暂停、失败或取消后只释放控制权，不关闭 Tab，不改变最终页面。
+- `target="_blank"`、`window.open()` 和新窗口链接在当前 Browser Tab 中打开，不创建额外窗口或隐藏 Target。
+- 右侧面板可以从最小宽度拖到窗口约三分之二，浏览器始终严格位于内容区。
+- 右侧面板的宽度始终由 WindowLayoutState 约束，BrowserSurface 使用同一原生父窗口内容树中的内容区 bounds；禁止通过 DOM 测量、额外窗口、悬浮层或坐标补偿改变面板几何。
+- 页面刷新、跳转、慢请求和工具执行期间不黑屏、不闪烁、不重建页面、不显示截图投影。
+- auto、宽屏、窄屏和自定义 viewport 均由 Chromium 页面真实重排，不裁切旧桌面布局。
+- 固定 viewport 只设置 Chromium 的 CSS viewport、设备类型和触控能力，禁止使用 `pageScaleFactor`、截图缩放或按右栏大小拟合模拟设备；页面在原生 1:1 Surface 中重排，超出部分由页面自身滚动，不得被桌面壳裁切或拉伸。
+- 页面标记、截图和消息引用在刷新、重启、关闭 Browser Tab 和升级后仍可查看。
 
-- 可以被关闭、删除或配置错误。
-- 工具名称和 Schema 可能被不同模型错误调用。
-- MCP Server 自己维护页面和 Profile，Magi 无法保证 Goal 暂停、会话切换和 daemon 重启后的状态一致性。
-- 前端无法可靠判断 MCP 中的页面是否仍存在、由谁控制、是否已经崩溃。
-- 页面权限、敏感操作审批和 Magi 的访问模式会形成两套治理链路。
+多功能右栏的硬约束：
 
-因此内置浏览器必须是 Magi Runtime Capability。外部 MCP 只能是 `BrowserBackend` 的外部实现来源，不能成为默认权威状态源。
+1. `RightPaneChromeView` 是右栏唯一的通用内容壳，负责顶级 Tab、面板选择器、工具栏和非浏览器内容；Browser Surface 不是右栏的父容器，也不能替换它。
+2. `BrowserSurfaceView` 只在当前顶级 Tab 为浏览器时显示，且只覆盖内容槽；代码、图片、终端、Agent 和未来面板类型由 Chrome View 独立渲染。图片预览可以作为代码/文件 Tab 的内容模式，但不得因此创建或占用 Browser Surface。
+3. 右栏尺寸、分隔条、折叠/展开、顶级 Tab 切换和面板选择器属于 WindowLayout/RightPane 通用能力。浏览器的创建、导航、崩溃、viewport 和 CDP 状态不能写入或重置这些状态。
+4. 新建浏览器采用两阶段流程：先完成轻量的逻辑 Tab/占位状态，再异步物化 WebContentsView。等待 daemon、页面导航或 Worker 就绪期间，已有面板仍可切换、右栏仍可拖动；只有当前新建项显示 loading/error。
+5. 面板类型必须通过稳定的 `PanelKind`/能力目录扩展，禁止在浏览器组件中硬编码“浏览器是唯一面板”或为每种新面板复制一套右栏布局。
 
-### 2.2 不能复用 Magi 主 WebView
+本次目标补充的验收条件：
 
-在主 Tauri WebView 内通过 iframe 或子 WebView 打开任意网页，会带来：
+- 代码、图片、终端、Agent 和后续面板继续使用同一个 `RightPaneChromeView` 的顶级 Tab；即使浏览器正在创建、导航、崩溃恢复或等待自动化 Worker，其他面板仍可立即打开、切换和关闭。
+- 浏览器 `WebContentsView` 只能挂载到当前顶级浏览器 Tab 的内容槽，不能覆盖顶级 Tab 栏、浏览器工具栏、拖拽分隔条或把右栏变成浏览器专属窗口；内容槽还必须避开右栏左侧完整的 8px 拖拽命中区。右栏尺寸和拖拽行为由通用 `WindowLayoutState` 维护，切换浏览器不会重置或重新计算其它面板布局。
+- 新建浏览器 Tab 必须先完成逻辑 Tab 和 loading 占位，再异步创建真实 Surface；页面网络加载、DOM 快照和 Worker 握手不得阻塞新增面板选择器、右栏拖拽或已有面板交互。
+- 验收必须覆盖“浏览器创建中切换代码/图片/终端”“浏览器 Tab 与非浏览器 Tab 反复切换”“右栏拖到最大约三分之二后切换面板”和“浏览器 Surface 创建失败后其它面板仍可用”四类场景。
 
-- 页面与 Magi 自身前端处在同一宿主安全边界。
-- Cookie、下载、弹窗、导航、跨域和 CSP 行为难以统一。
-- Desktop、daemon-only Web 和远程访问的行为不一致。
-- 模型控制仍需额外接入 CDP，形成“显示一套、控制另一套”。
-- Windows WebView2、macOS WKWebView 和 Linux WebKitGTK 的行为差异较大。
+### 2.2 Agent 能力
 
-独立 Chromium 同时承担渲染和控制，右侧栏只消费画面与权威状态，才能保持跨平台一致。
+- Worker 在 Web 开发任务中自动发现 Magi Browser 能力。
+- Worker 可以启动项目服务、打开正确页面、读取 DOM/Accessibility、操作页面并验证结果。
+- 工具覆盖导航、快照、点击、输入、键盘、滚动、hover、drag、表单、截图、Console、Network、Performance、Heap、PWA、Lighthouse 和设备仿真。
+- 工具名称、schema、执行状态和 UI 卡片使用同一能力目录，不因组件启动顺序随机出现、消失或改名。
+- 工具结果包含明确页面、Surface、导航 revision、截图和诊断身份，不能把普通 HTTP path 当成无意义结果展示。
 
-### 2.3 不能再建立第二套执行状态机
+### 2.3 隐私与更新
 
-Magi 已经具备：
+- 不读取用户 Chrome、Safari、Edge 或其他浏览器 Profile。
+- 不访问系统钥匙串、密码、书签、历史、默认浏览器或浏览器同步信息。
+- Browser Session 使用 Magi 私有内存 partition，退出 Desktop 后清理浏览数据。
+- Chromium 作为 Magi Desktop 的组成部分随应用统一更新，不再单独安装、卸载或激活。
+- 设置页展示真实组件版本、状态、更新进度、重启浏览器能力和清理 Magi 浏览器数据。
 
-- `ExecutionOwnership`
-- Goal `control_revision`
-- Goal 与 Plan 原子暂停/恢复
-- canonical turn
-- daemon 重启恢复
-- 任务树中断
-- 工具执行取消
+## 3. 明确非目标
 
-浏览器只新增“执行资源租约”，不重新定义任务是否运行。Goal、Plan、Turn 和 Task 仍决定任务状态，Browser Lease 只决定某个执行所有者是否能对共享 Profile 发起写操作。
+- 不使用 `Page.startScreencast`、Canvas、图片帧或远程桌面作为用户浏览器渲染通道。
+- 不使用 iframe 加载任意外部网站，不通过代理移除 CSP 或 `X-Frame-Options`。
+- 不把外部网页加载进可信 Magi App Renderer。
+- 不使用 Electron `<webview>` 标签作为正式实现。
+- 不公开 Electron/Chromium remote debugging TCP 端口。
+- 不让 Browser Automation Worker 创建、关闭或淘汰物理 WebContents。
+- 不保留 Playwright 和直接 CDP 两套生产自动化实现。
+- 不在 Chromium Host 缺失时回退到 CEF、系统 WebView、外部浏览器或用户 MCP。
+- 不让普通 daemon Web 客户端提交物理浏览器尺寸或控制 Desktop Surface。
+- 首版不自动淘汰后台 Browser Surface；用户关闭 Tab 或窗口才销毁页面。
 
-### 2.4 与当前代码的直接接点
-
-| 当前能力 | 代码位置 | 浏览器接入方式 |
-| --- | --- | --- |
-| Goal 状态、continuation、control revision | `crates/magi-session-store/src/models.rs` | Lease 绑定当前 Goal revision，暂停/恢复仍调用现有原子状态转换 |
-| 异常中断 Goal 恢复 | `crates/magi-session-store/src/store/sidecar.rs` | daemon 重启后不恢复 Lease，只随新 continuation Turn 获取新 Lease |
-| 用户停止与 Goal 暂停 | `crates/magi-api/src/routes/sessions.rs`、`routes/goals.rs` | 统一改由 `ExecutionResourceCoordinator` 撤销 Process 与 Browser 资源 |
-| 工具资源注入 | `crates/magi-tool-runtime/src/types.rs` | 按现有 Git/Image/MCP Executor 模式注入 `BrowserToolExecutor` |
-| 工具治理与进度 | `crates/magi-tool-runtime/src/registry.rs` | 浏览器工具继续走 ToolRegistry，不建立旁路执行器 |
-| EventEnvelope 与 SSE 恢复 | `crates/magi-event-bus/src/events.rs`、`crates/magi-api/src/sse.rs` | 浏览器低频状态进入现有事件信封，高频帧走独立 WS |
-| 右侧多 Tab 面板 | `web/src/stores/right-pane.svelte.ts`、`web/src/web/RightPane.svelte` | 新增 `browser` kind，不新建第二个右侧栏容器 |
-| 跨平台进程树管理 | `crates/magi-process/src/lib.rs` | Browser Host 与 Chromium 纳入 Managed Child 生命周期 |
-
-这些接点已经存在，说明方案不需要替换 Magi 主运行链，只需要补充浏览器领域能力并收敛当前只面向 Shell 的长期工具取消接口。
-
-## 3. 产品目标
-
-- 用户可以在右侧栏打开本地或公网网页，并与代理共享同一个页面状态。
-- 主线代理和子代理可以导航、读取、点击、输入、滚动、截图和验证页面。
-- 用户可以随时查看代理操作过程、接管页面并在元素或区域上留下标记。
-- Goal 被用户打断、暂停、恢复或异常中断时，浏览器控制权与 Goal 状态保持一致。
-- daemon 或 Browser Host 重启后不会显示伪运行状态，也不会让模型无限重试工具。
-- 浏览器 Profile 与用户日常浏览器隔离，但在 Magi 内跨会话保留登录状态、Cookie 和历史记录。
-- 所有模型使用简单、稳定的 JSON Schema，不依赖某个模型特有的 Computer Use 输出格式。
-- Desktop、daemon-only Web 与后续远程客户端读取同一个 Browser Authority。
-
-### 3.1 用户需求覆盖矩阵
-
-| 用户描述的需求 | 方案覆盖 |
-| --- | --- |
-| 像 Codex Desktop 一样提供内置浏览器 | 独立 Chromium + Browser Host，由 Magi daemon 管理并与聊天共享页面 |
-| 不能只能依靠 MCP | 第一方 BrowserToolProvider 直接进入 ToolRegistry；MCP 不参与核心链路 |
-| 在右侧栏预览和操作网页 | Right Pane 新增 Browser Tab，双向 WebSocket 承载画面和用户输入 |
-| 支持页面元素/区域标记 | 持久 BrowserAnnotation、DOM 锚点、截图证据和 stale/resolved 状态 |
-| 与 Goal 暂停、继续和异常恢复一致 | ExecutionResourceCoordinator、Browser Control Lease、revision/fence 与 continuation Turn 联动 |
-| 子代理不能出现控制错位 | 真实 ExecutionOwnership 绑定，Profile 级单写者，禁止不同子代理并发修改共享浏览器状态 |
-| Magi 安装包不能因 Chromium 大幅膨胀 | Browser Runtime Component 独立按需安装，主安装包不携带 Chromium |
-| Magi 常规升级不能重复下载 Chromium | App/Host Protocol 兼容时跨版本复用独立 Runtime Component |
-| 可以检测 Chromium 更新并由用户操作安装 | Magi 签名 manifest、手动检查、分级提示、用户确认下载和原子切换 |
-| 不能再次出现工具可见性和访问模式错位 | BrowserCapabilitySnapshot 同时驱动模型工具目录和执行校验 |
-| 当前 HTML 文件预览如何处理 | 保留源码查看与安全文件服务，删除 iframe 渲染，预览动作统一打开 Browser Session |
-
-除“控制用户已有 Chrome Profile”和“模型自动上传本地文件”外，当前用户提出的内置浏览器、右侧预览、标记、Goal 稳定性、轻量打包和独立更新需求都进入目标架构。前两项明确属于非目标，不影响本次需求闭环。
-
-## 4. 非目标
-
-- 不控制用户现有 Chrome Profile；该能力未来通过 `BrowserUseExternal` 独立提供。
-- 不让模型自动读取密码、信用卡、验证码或浏览器保存的凭据。
-- 不在第一方工具中开放任意 JavaScript 执行或完整 CDP。
-- 不自动处理 CAPTCHA、系统权限弹窗和管理员认证。
-- 不让模型自动上传本地文件；文件选择由用户手动完成。
-- 不把浏览器画面、Cookie、localStorage 或网页正文上传到额外的 Magi 云服务。
-- 不同时保留 Rust CDP 和 Playwright 两套浏览器实现。
-
-## 5. 总体架构
+## 4. 总体架构
 
 ```text
-┌──────────────────────────── Magi Web UI ────────────────────────────┐
-│ RightPane/BrowserPane                                               │
-│ 地址栏 / Tab / 状态 / 标记 Overlay / Screencast Canvas / 用户输入 │
-└───────────────┬───────────────────────────────┬─────────────────────┘
-                │ REST + SSE                    │ WebSocket 二进制帧
-                ▼                               ▼
-┌──────────────────────────── magi-daemon ────────────────────────────┐
-│ Browser API Routes                                                  │
-│                │                                                    │
-│                ▼                                                    │
-│ BrowserAuthority                                                    │
-│  ├─ BrowserSession/Tab 权威状态                                     │
-│  ├─ BrowserControlLease + fencing token                             │
-│  ├─ 固定导航安全边界 + SensitiveActionPolicy                        │
-│  ├─ AnnotationStore                                                 │
-│  ├─ HostSupervisor/Recovery                                         │
-│  └─ EventBus 发布                                                   │
-│                ▲                                                    │
-│                │ 进程内调用                                         │
-│ BrowserToolProvider ─ ToolRegistry ─ Conversation/Worker Runtime    │
-│                │                     │                              │
-│                └──── ExecutionResourceCoordinator ─ Goal/Turn/Task  │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │ 私有 WS 控制协议 + 二进制帧
-                             ▼
-┌──────────────────── Playwright Browser Host ────────────────────────┐
-│ Persistent BrowserContext / Page / CDP / Screencast / Input        │
-└────────────────────────────┬────────────────────────────────────────┘
-                             ▼
-                    独立 Playwright Chromium
+Magi Electron Desktop Host
+  |
+  |-- WindowManager
+  |     BaseWindow 1..N
+  |       |-- MagiAppView
+  |       |     左侧导航、中间会话与全局应用区
+  |       |-- RightPaneChromeView
+  |       |     多功能右侧面板：顶级 Tab、浏览器工具栏、代码/图片/终端/Agent 内容
+  |       |-- BrowserSurfaceView 0..N
+  |       |     当前窗口内真实外部 Chromium 页面
+  |       `-- DesktopOverlayView 0..N
+  |             弹窗、菜单、标记选择等可信覆盖层
+  |
+  |-- WindowLayoutManager
+  |     每窗口唯一布局状态、原子 layout revision、View bounds 与层级
+  |
+  |-- BrowserSurfaceManager
+  |     Surface 创建、挂载、导航、焦点、partition、Target 和崩溃恢复
+  |
+  |-- BrowserCdpGateway
+  |     webContents.debugger、Target allowlist、CDP domain 与命令校验
+  |
+  |-- BrowserAutomationWorker (Electron utilityProcess)
+  |     DOM/AX 快照、元素引用、输入、截图、诊断和设备仿真
+  |
+  |-- DesktopControlServer
+  |     Rust daemon 与 Electron Main 的私有版本化控制协议
+  |
+  `-- Rust daemon sidecar
+        |-- BrowserAuthority
+        |-- Browser Tool Runtime
+        |-- Session/Goal/Worker Runtime
+        |-- Annotation/Artifact Store
+        `-- HTTP/SSE API
 ```
 
-## 6. 模块边界
+### 4.1 最终代码结构
 
-### 6.1 新增 `crates/magi-browser-runtime`
-
-职责：
-
-- 浏览器领域模型和状态转换。
-- `BrowserAuthority`。
-- Tab 控制租约和 fencing token。
-- Browser Host 客户端协议。
-- 固定导航安全边界与敏感动作策略接口。
-- 标记锚点、重新定位与状态。
-- Browser Session 的恢复协调。
-
-依赖边界：
-
-- 可以依赖 `magi-core` 和 `magi-event-bus`。
-- 不依赖 Web、Tauri、MCP 或具体模型 Provider。
-- 不依赖 `magi-tool-runtime`，避免形成工具运行时循环依赖。
-
-### 6.2 新增 `browser-host`
-
-这是 TypeScript/Node.js sidecar，只负责执行，不拥有产品状态：
-
-- 启动 Playwright Chromium。
-- 管理唯一持久 BrowserContext 和 Page。
-- 执行 Playwright 动作。
-- 生成 accessibility snapshot、DOM 命中结果和截图。
-- 使用 CDP `Page.startScreencast` 输出实时画面。
-- 使用 CDP `Input.*` 接收用户输入。
-- 输出 console、network、dialog、download 和 crash 事件。
-
-Host 不直接连接前端，不直接修改 Goal，不保存 Magi 权限决策，也不直接向模型暴露工具。
-
-### 6.3 `magi-tool-runtime`
-
-- `ToolRuntimeResources` 新增 `BrowserToolExecutor`。
-- 内置工具只做参数规范化、访问模式判定和结果格式化。
-- 真实浏览器操作全部交给 `BrowserAuthority`。
-- 浏览器工具沿用现有 ToolRegistry、Governance、进度、canonical tool call 和审计链路。
-
-### 6.4 `magi-api`
-
-- 新增 `routes/browser.rs`。
-- REST 提供 Browser Session、Tab、标记和用户控制命令。
-- SSE 只传播低频领域状态。
-- 双向 WebSocket 单独承载高频 Screencast 帧和接管后的用户输入，禁止将图片 Base64 或鼠标事件放进 SSE/REST。
-
-### 6.5 Web 前端
-
-- `RightPaneTabKind` 新增 `browser`。
-- 一个 Right Pane Browser Tab 只对应一个 `BrowserTabId`；同一 Browser Session 的多个网页必须表现为多个顶级 Right Pane Tab。
-- Browser Pane 内部禁止再嵌套网页 Tab 条；用户通过顶级 Right Pane Tab 栏的 `+` 创建新的网页面板。
-- 前端只持久化 `browserSessionId` 与 `tabId` 引用，不把 URL、租约、画面或运行状态写入 localStorage 作为事实源。
-- HTML 文件的 Raw/Source 模式继续复用 Code Tab。
-- HTML 文件的 Rendered/Preview 动作改为创建或复用 Browser Session，并导航到 daemon 提供的工作区站点 URL。
-- `web/src/web/RightPane.svelte` 中 `htmlPreviewRevisions`、`htmlPreviewUrl`、`htmlPreviewMode` 和 iframe 渲染分支在 Browser Preview 验收通过后删除。
-- `site-open` 一类后端工作区静态站点路由继续作为 Chromium 的受限资源入口，不再直接嵌入 Magi 主 WebView。
-- 迁移必须原子完成：Browser Preview 可用、入口切换和旧 iframe 删除进入同一交付，不长期保留双预览路径。
-
-### 6.6 Desktop 与发布层
-
-- Magi 常规安装包只携带 Browser Runtime 协议客户端和组件管理器，不携带 Chromium、Node Runtime 或 Browser Host 资源包。
-- Node Runtime、Browser Host 产物和 Playwright Chromium 组成独立签名、按平台发布的 Browser Runtime Component。
-- 首次打开内置浏览器时由用户确认下载体积，组件管理器完成下载、签名校验和原子安装。
-- daemon 使用 `magi-process` 的 Managed Child 管理已安装 Host 及其 Chromium 进程树。
-- Desktop 只负责展示安装进度和定位运行组件，不拥有 Browser Session。
-- daemon-only 开发入口使用同一版本化运行组件，不允许切换成系统 Chrome 形成双实现。
-- Magi 升级后只要 Host 协议兼容，就继续复用已安装组件；仅在组件缺失、协议不兼容或浏览器安全更新时下载新版本。
-
-## 7. 领域模型
-
-### 7.1 BrowserProfile
-
-```rust
-pub struct BrowserProfile {
-    pub profile_id: BrowserProfileId,
-    pub kind: BrowserProfileKind, // 首版只有 ManagedDefault
-    pub data_path: PathBuf,
-    pub created_at: UtcMillis,
-    pub updated_at: UtcMillis,
-}
-```
-
-首版只有一个 Magi 托管 Profile，路径为：
+迁移完成后仓库只保留下列 Browser/Desktop 模块：
 
 ```text
-~/.magi/browser/profiles/default
+apps/desktop/                         Electron 桌面宿主，不再是 Rust/Tauri crate
+  package.json
+  electron-builder.yml
+  src/main/                           Main Process 与唯一物理资源管理
+    window-manager.ts
+    window-layout.ts                   纯布局 reducer 与 bounds contract
+    browser-surface-manager.ts         WebContents 生命周期与受控 CDP gateway
+    process-supervisor.ts
+    desktop-control-server.ts
+    update-manager.ts
+  src/preload/                        按 Renderer 拆分的最小 contextBridge
+  src/renderer/                       Desktop 专用 Svelte 入口
+    app-shell/
+    right-pane/
+    overlay/
+
+browser-automation-worker/           utilityProcess 打包产物，只实现高层工具与 CDP 适配
+  package.json
+  src/
+
+contracts/desktop-browser/           唯一协议源
+  desktop-ipc.schema.json
+  desktop-control.schema.json
+  browser-tool.schema.json
+  capability-manifest.schema.json
+
+web/                                  共享 Svelte 组件、Web 客户端入口与 Desktop Renderer 构建资产
+
+crates/magi-browser-authority/        Browser Authority、持久 Tab 事实与 Lease 治理
+crates/magi-api/                      Browser HTTP/SSE/API 和 tool dispatch
+crates/magi-session-store/            BrowserTab/Annotation/Artifact 持久化
+crates/magi-tool-runtime/             内置工具目录与 schema 发布
 ```
 
-它与 Safari、Chrome、Edge 等日常浏览器完全隔离。Cookie 和 localStorage 保存在 Chromium Profile 中，不写入 Magi JSON 状态文件。
+目录收敛规则：
 
-### 7.2 BrowserSession
+- 删除 `browser-host/`，不在原目录内继续保留“Host 创建页面”的旧语义。
+- 删除 `apps/desktop` 的 Cargo workspace member 和全部 Tauri Rust 入口，同路径重建为 Electron package。
+- Node 项目使用根目录 npm workspaces 和唯一 lockfile，统一 Electron、CDP types、Svelte 和构建工具版本。
+- Rust 与 TypeScript 不手写重复 DTO；以 `contracts/desktop-browser` JSON Schema 生成类型并在 CI 校验生成结果无差异。
+- `magi-browser-authority` 不包含二进制下载、Chromium 安装、Host 启动或物理页面管理代码。
 
-```rust
-pub struct BrowserSession {
-    pub browser_session_id: BrowserSessionId,
-    pub workspace_id: WorkspaceId,
-    pub session_id: SessionId,
-    pub profile_id: BrowserProfileId,
-    pub lifecycle: BrowserSessionLifecycle,
-    pub active_tab_id: Option<BrowserTabId>,
-    pub tab_ids: Vec<BrowserTabId>,
-    pub runtime_epoch: u64,
-    pub revision: u64,
-    pub created_at: UtcMillis,
-    pub updated_at: UtcMillis,
-}
+### 4.2 权威与数据所有权
+
+| 事实 | 唯一所有者 | 是否持久化 | 禁止的第二个写入者 |
+| --- | --- | --- | --- |
+| Browser Tab URL、标题、顺序、标签 | BrowserAuthority | 是 | Renderer localStorage、Electron Main |
+| Annotation、Artifact、消息引用 | BrowserAuthority + canonical session store | 是 | Surface、Worker 本地状态 |
+| Window、右栏宽度、active panel、active Surface | Electron Main | 否 | daemon、Renderer store |
+| WebContents、Target、partition、focus、visibility | Electron Main | 否 | daemon、Worker |
+| viewport、virtual cursor、loading、Surface Lease | Electron Main + BrowserAuthority 授权状态 | 否 | BrowserTab durable record |
+| Tool schema、权限和调用审计 | Rust daemon | schema 持久，运行态不持久 | Renderer、Worker |
+| CDP session、ElementRef、snapshot revision | Automation Worker | 否 | daemon durable store |
+| 桌面版本、组件哈希和更新状态 | Electron Main | 更新日志持久 | Browser Runtime 独立状态机 |
+
+任何实现如果需要两个模块同时修改同一事实，说明边界设计错误，不得通过双向同步、时间戳覆盖或兼容字段解决。
+
+### 4.3 启动与就绪顺序
+
+```text
+Electron app ready 前应用隐私启动参数
+  -> 校验签名 capability manifest 和 resources 哈希
+  -> Main 生成 desktopEpoch 和随机 control token
+  -> 启动 Rust daemon，完成协议/版本/父进程握手
+  -> 创建 BaseWindow 和可信 Renderer Views
+  -> 启动 Automation Worker，完成 workerEpoch 握手
+  -> 注册 Browser capability = Ready
+  -> 恢复逻辑 BrowserTabRecord，首次激活时才物化 Surface
+```
+
+- manifest、daemon 或协议校验失败时，Desktop 显示唯一且可操作的启动错误，不创建半激活 Browser Surface。
+- Worker 未就绪不阻止用户浏览；只将 Agent Browser capability 置为 `AutomationStarting/Failed`。
+- 启动阶段不恢复 viewport、focus、Lease、滚动位置或旧 Target identity。
+- 同一个 `desktopEpoch` 内不允许第二个 Main Supervisor 接管子进程或 Surface。
+
+## 5. Desktop View 树
+
+所有 View 都是同一 `BaseWindow.contentView` 下的原生兄弟视图，不是额外 `BrowserWindow`、无边框子窗口或悬浮窗。`BrowserSurfaceView` 不能成为 Svelte DOM 元素，因此必须由 Electron Main 在同一原生组合树中设置 bounds 和 z-order；但几何只来自 WindowLayoutState，不来自持续 DOM 测量。
+
+稳态层级只有：
+
+```text
+DesktopOverlayView        临时需要时存在
+BrowserSurfaceView        当前 Browser Tab 的真实页面
+RightPaneChromeView       Tab 和工具栏
+MagiAppView               左侧和中间应用区
+```
+
+不允许在此树之外再建立“浏览器承载窗口”、“透明定位窗口”或“视频/截图层”。
+
+### 5.1 MagiAppView
+
+`MagiAppView` 加载现有 daemon 托管 Web 应用，但不再渲染右侧面板。它负责：
+
+- 工作区和会话导航。
+- 中间消息、编辑器和输入区。
+- 全局 Header 和不跨越右侧面板的应用 UI。
+- 将右侧展开/折叠、窗口和全局 Overlay 意图提交给 Electron Main。
+
+安全配置：
+
+- `nodeIntegration: false`
+- `contextIsolation: true`
+- `sandbox: true`
+- 固定 CSP
+- 只允许 daemon canonical origin 和签名本地资源
+- preload 仅暴露版本化、allowlisted `contextBridge` API
+
+### 5.2 RightPaneChromeView
+
+`RightPaneChromeView` 是独立可信 WebContentsView，复用现有 Svelte RightPane 业务组件，负责：
+
+- 顶级右侧 Tab 栏和 `+` 面板选择。
+- Browser 地址栏、后退、前进、刷新、外部打开、截图、标记和 viewport 控件。
+- 代码、终端、Agent 等非 Browser Panel 内容。
+- Browser 内容区占位背景和加载/错误状态。
+
+当当前 Tab 是 Browser：
+
+- RightPaneChromeView 只绘制 Tab、工具栏和内容背景。
+- BrowserSurfaceView 由 Electron Main 放在内容区上方。
+- BrowserSurfaceView 的 bounds 只来自当前 WindowLayoutSnapshot 的 `browserSurfaceBounds`，并且被严格限制在 RightPaneChromeView 的内容区内。
+
+当当前 Tab 不是 Browser：
+
+- 当前窗口的 BrowserSurfaceView 全部设为不可见。
+- RightPaneChromeView 自己渲染完整内容。
+- 代码、图片、终端和 Agent 内容直接由 RightPaneChromeView 渲染，不经过 BrowserSurfaceView，也不因为浏览器 Surface 的创建、导航或崩溃而丢失。
+
+### 5.3 BrowserSurfaceView
+
+一个 `BrowserSurfaceView` 对应一个 `BrowserSurfaceInstance`，只加载外部网页。安全配置：
+
+- `nodeIntegration: false`
+- `contextIsolation: true`
+- `sandbox: true`
+- 无 Magi preload
+- 无 Magi IPC
+- 禁止 `file:`、本地资源和内部 Scheme
+- 使用 Browser Session 对应的非持久 partition
+
+非活动 Surface 保持 WebContents 存活，但使用 Electron View 的可见性控制隐藏；不得缩放到 `1 x 1`、导航到空白页或在切换期间销毁。
+- Surface 创建、导航和加载失败都通过状态事件反馈给右栏；右栏必须保留 Tab 栏和其他内容的可操作状态，不能用全屏加载层覆盖整个 RightPaneChromeView。
+
+### 5.4 DesktopOverlayView
+
+`DesktopOverlayView` 是 Electron Main 管理的临时可信层，层级始终位于 BrowserSurfaceView 上方。它承载：
+
+- 会跨越 Browser 内容区的下拉菜单和上下文菜单。
+- 全局设置、确认和错误 Modal。
+- 元素/区域标记选择层。
+- 需要捕获浏览器区域输入的临时操作层。
+
+Overlay 只覆盖所需矩形；关闭后立即销毁或隐藏。普通浏览状态不保留全窗口透明 Overlay，避免阻断 BrowserSurface 输入。
+
+Agent 虚拟鼠标是非交互装饰，使用 Magi 包内签名的矢量光标资产，通过 CDP isolated world 中的 closed Shadow DOM 绘制，固定 `pointer-events: none`；每次 document 创建后重新注入。元素高亮使用 CDP Overlay domain，区域标记使用 DesktopOverlayView 捕获，不依赖站点 DOM。
+
+### 5.5 多 Renderer 状态协议
+
+`MagiAppView`、`RightPaneChromeView` 和 `DesktopOverlayView` 之间禁止直接访问对方 DOM、Svelte store 或 `window` 对象。三者只通过 Electron Main 的版本化 IPC 通信。
+
+Main 为每个窗口发布不可变 `DesktopWindowSnapshot`：
+
+```text
+desktopEpoch
+windowId
+snapshotRevision
+layout
+activePanel
+activeTabId
+surfacePresentation
+leasePresentation
+capabilityPresentation
+```
+
+- Renderer 只提交意图，例如 `requestRightPaneWidth`、`activatePanel`、`navigateBrowser`和 `beginAnnotation`。
+- Main 校验 intent 的 epoch、window、revision、权限和参数后 reduce 状态，再广播新 snapshot。
+- BrowserTab durable 更新由 daemon 事件进入 Main，Main 合并为展示 snapshot；Renderer 不直接把窗口状态写回 daemon。
+- Desktop 专用 active panel、right pane width、viewport 和 Surface 状态不写 `localStorage`、URL query 或 session bootstrap。
+- Web 客户端继续使用独立 `web.html` 入口；它可以查看持久 Browser 记录，但不参与 DesktopWindowSnapshot 或物理 Surface 控制。
+
+## 6. 唯一布局模型
+
+### 6.1 WindowLayoutState
+
+Electron Main 为每个窗口维护唯一状态：
+
+```text
+WindowLayoutState
+  desktopEpoch
+  windowId
+  layoutRevision
+  clientBounds
+  displayScaleFactor
+  fullscreen
+  safeAreaInsets
+  rightPaneVisible
+  rightPaneMode          side-by-side | overlay
+  rightPaneWidth
+  rightPaneTabBarHeight
+  browserToolbarHeight
+  activePanelKind
+  activeTabId
+  activeSurfaceId
+```
+
+布局算法位于独立纯 TypeScript contract 包，由 Electron Main 唯一调用。Renderer 只接收 LayoutSnapshot 和 CSS variables，不独立计算 BrowserSurface 几何。
+
+### 6.2 布局事务
+
+右栏拖动流程：
+
+```text
+RightPaneChromeView pointer intent
+  -> Desktop IPC { windowId, requestedWidth, clientSequence }
+  -> WindowLayoutManager reduce
+  -> layoutRevision + 1
+  -> 同一 Main 事件循环内：
+       set MagiAppView bounds
+       set RightPaneChromeView bounds
+       set active BrowserSurfaceView bounds
+       update View z-order/visibility
+  -> 广播同一 LayoutSnapshot 给两个可信 Renderers
 ```
 
 约束：
 
-- 每个 Magi 会话最多一个未关闭 Browser Session。
-- Browser Session 是逻辑页面集合，不等于 Chromium 进程。
-- 多个 Browser Session 可以共享同一个 Magi Browser Profile，但页面归属必须隔离。
-- 关闭聊天会话时关闭页面，不清除 Profile 登录数据。
+- 只接受当前 `desktopEpoch/windowId` 的请求。
+- 只应用单调增加的 `layoutRevision`。
+- 同一事务更新所有 View，不存在独立异步 resize 队列。
+- resize 不得触发 focus、导航、页面刷新、设备仿真或 WebContents 重建。
+- 窗口缩放、全屏、DPI、显示器切换和安全区变化经过同一 reducer。
+- Renderer 不调用 `getBoundingClientRect()` 向 Main 提交 BrowserSurface 绝对坐标。
+- Web 客户端没有 Desktop layout capability，不得写入该状态。
 
-### 7.3 BrowserTab
+### 6.3 尺寸规则
 
-```rust
-pub struct BrowserTab {
-    pub tab_id: BrowserTabId,
-    pub browser_session_id: BrowserSessionId,
-    pub lifecycle: BrowserTabLifecycle,
-    pub url: String,
-    pub origin: Option<String>,
-    pub title: String,
-    pub viewport: BrowserViewport,
-    pub navigation_revision: u64,
-    pub snapshot_revision: u64,
-    pub frame_sequence: u64,
-    pub created_at: UtcMillis,
-    pub updated_at: UtcMillis,
-}
-```
+- 中间内容区最小宽度保持可用，不要求维持完整桌面布局。
+- 右侧面板最大宽度为当前窗口可用宽度的三分之二。
+- 右侧面板最小宽度满足浏览器工具栏和 320 CSS px 内容区。
+- 小窗口进入 overlay 模式时，RightPaneChromeView 和 BrowserSurfaceView 作为同一布局事务覆盖 MagiAppView。
+- 浏览器内容 bounds 始终等于右侧内容槽，不含 Tab 栏、工具栏、分隔条和窗口安全区。
 
-### 7.4 BrowserControlLease
+## 7. 逻辑 Tab 与物理 Surface
 
-```rust
-pub struct BrowserControlLease {
-    pub lease_id: BrowserLeaseId,
-    pub profile_id: BrowserProfileId,
-    pub browser_session_id: BrowserSessionId,
-    pub owner: ExecutionOwnership,
-    pub turn_id: String,
-    pub goal_binding: Option<GoalControlBinding>,
-    pub fence: u64,
-    pub acquired_at: UtcMillis,
-    pub expires_at: UtcMillis,
-}
-```
+### 7.1 BrowserTabRecord
 
-核心规则：
-
-- 同一 Browser Profile 同一时刻最多一个有效写 Lease。
-- Lease 只能操作其绑定 Browser Session 中的 Tab，不能借共享 Profile 跨会话读取页面。
-- snapshot、screenshot 等只读命令仍校验会话归属和 revision，但不取得第二个写 Lease。
-- 每个写动作必须携带 `lease_id + fence`。
-- Lease 被撤销后永不恢复；Goal 恢复后重新申请新 Lease。
-- 用户查看页面不需要 Lease，用户输入会先进入显式接管流程。
-- 不允许通过延长旧 Lease 模拟 Goal 恢复。
-
-采用 Profile 级单写者而不是 Tab 级多写者，是因为同一 Persistent BrowserContext 中的 Tab 会共享 Cookie、localStorage、Service Worker 和登录态。即使操作不同 Tab，两个代理也可能修改同一站点状态；首版禁止这种并发，稳定性优先于浏览器写操作吞吐量。
-
-### 7.5 BrowserAnnotation
-
-```rust
-pub struct BrowserAnnotation {
-    pub annotation_id: BrowserAnnotationId,
-    pub browser_session_id: BrowserSessionId,
-    pub tab_id: BrowserTabId,
-    pub author: BrowserAnnotationAuthor,
-    pub kind: BrowserAnnotationKind, // Element | Region
-    pub anchor: BrowserAnnotationAnchor,
-    pub comment: String,
-    pub status: BrowserAnnotationStatus, // Active | Resolved | Stale | Deleted
-    pub screenshot_artifact_id: Option<String>,
-    pub created_at: UtcMillis,
-    pub updated_at: UtcMillis,
-}
-```
-
-元素锚点包含：
-
-- URL、Origin、frame path、viewport 和 scroll offset。
-- `data-testid`、稳定 id、ARIA role/name、标签名和文本摘要。
-- CSS 结构路径和祖先指纹。
-- DOM 文本/属性指纹。
-- 创建时 bounding box 和 snapshot revision。
-- 临时 CDP backend node id；该字段不能作为持久化唯一依据。
-
-区域锚点使用相对 viewport 的归一化矩形，同时保存页面滚动位置和截图，不只保存屏幕像素坐标。
-
-## 8. 状态机
-
-### 8.1 Browser Host
+BrowserAuthority 持久化逻辑对象：
 
 ```text
-NotInstalled → Downloading → Verifying → Installed
-                                      │
-                                      ▼
-Stopped → Starting → Ready
-   ▲          │        │
-   │          └→ Failed│
-   │                   ▼
-   └────── Recovering ← Degraded
+BrowserTabRecord
+  tabId
+  browserSessionId
+  order
+  canonicalUrl
+  pageTitle
+  displayLabel?
+  lifecycle
+  navigationRevision
+  annotationSequence
+  createdAt
+  updatedAt
 ```
 
-- 组件下载、校验和安装是显式状态，必须在设置页和右侧栏展示，不得表现为浏览器无限启动。
-- 心跳间隔 2 秒，连续 6 秒未响应进入 `Degraded`。
-- Authority 只进行一次有界自动重启。
-- 重启失败进入 `Failed`，禁止后台无限拉起。
-
-### 8.2 Browser Session
+`displayLabel` 是用户编辑标题，`pageTitle` 来自网页。显示优先级：
 
 ```text
-Creating → Ready → Recovering → Ready
-    │         │         └──────→ Failed
-    └─────────┴────────────────→ Closed
+displayLabel ?? pageTitle ?? canonicalUrl ?? 新建浏览器
 ```
 
-Browser Session 没有 `Paused` 状态。暂停属于 Goal/Turn，浏览器页面作为用户可见资源继续存在。
+网页标题更新不得覆盖用户编辑标题。
 
-### 8.3 Browser Control Lease
+BrowserAuthority 不再持久化：
+
+- `activeTabId`
+- WebContents id、Target id、BrowserContext id
+- viewport、scale、物理 bounds
+- Agent Lease、用户控制模式和光标
+- Window、Desktop 或 Surface identity
+
+### 7.2 BrowserSurfaceInstance
+
+每个桌面窗口按需物化：
 
 ```text
-Available → Held → Released
-                ├→ Revoked
-                └→ Expired
+BrowserSurfaceInstance
+  desktopEpoch
+  windowId
+  surfaceId
+  surfaceRevision
+  tabId
+  webContentsId
+  targetId
+  browserContextId
+  partitionId
+  currentUrl
+  viewportMode
+  viewportMetrics
+  loadingState
+  focused
+  visible
+  primary
 ```
 
-`Released`、`Revoked`、`Expired` 都是终态。新操作必须获取新 Lease。
+同一逻辑 Tab 可以在不同桌面窗口拥有独立 Surface。每个 Surface 使用自己的物理尺寸、viewport、焦点、光标和页面运行态，绝不互相 resize。
 
-### 8.4 Browser Command
+### 7.3 Primary Surface
+
+同一逻辑 Tab 同时只有一个 Primary Surface：
+
+- 用户在另一个 Surface 输入时，Electron Main 原子提升该 Surface 为 Primary。
+- 提升会增加 `surfaceRevision`、撤销旧 Surface Lease，并通知 BrowserAuthority。
+- 只有 Primary Surface 的顶级导航写入 `canonicalUrl/pageTitle/navigationRevision`。
+- Secondary Surface 保留当前页面，不因 Primary 导航被强制刷新或改尺寸。
+- Secondary Surface 显示“页面已在另一窗口更新”状态，用户可显式同步到 canonical URL。
+
+普通 Web 客户端只读取 BrowserTabRecord、Annotation 和 Artifact，不创建 BrowserSurface，不提交 viewport 或布局。
+
+### 7.4 Surface 生命周期
 
 ```text
-Queued → Running → Succeeded
-                 ├→ Failed
-                 ├→ Cancelled
-                 └→ Indeterminate
+absent -> creating -> ready -> hidden -> ready
+ready/hidden -> crashed -> recreating -> ready
+ready/hidden/crashed -> closed
 ```
 
-Host 在产生外部副作用后、回执前崩溃时，命令进入 `Indeterminate`。这类命令不得自动重试，模型必须重新读取页面状态。
+- 激活逻辑 Tab 时按窗口创建或复用 Surface。
+- 切换 Tab 只改变 visible/active，不销毁页面。
+- Browser Renderer 崩溃只影响对应 Surface。
+- 首版不因后台、任务完成或容量自动回收页面。
+- 用户关闭窗口时销毁该窗口全部 Surface，但保留逻辑 BrowserTabRecord。
+- 用户关闭逻辑 Browser Tab 时关闭全部 Surface；Annotation 和历史 Artifact 不删除。
 
-## 9. Goal、Turn 与子代理联动
+## 8. 页面所有权与导航
 
-### 9.1 统一执行资源取消
+### 8.1 唯一所有者
 
-当前 `ApiState::cancel_active_tool_executions` 实际只取消 Shell Process。浏览器接入时应将其收敛为：
+`BrowserSurfaceManager` 是 WebContents 的唯一所有者。它负责：
+
+- create、activate、hide、focus、navigate、reload、goBack、goForward、close。
+- partition、permission、download、dialog、crash 和 page event。
+- WebContents 与 Tab/Surface/Target 的绑定。
+- URL、标题和 loading 事件写回 DesktopControlServer。
+
+BrowserAutomationWorker 不得调用 `newPage()`、创建 BrowserWindow、关闭 WebContents 或淘汰页面。
+
+### 8.2 新窗口策略
+
+在每个 Browser WebContents 创建时安装 `setWindowOpenHandler()`：
+
+- `http/https` GET 请求：`deny` 新窗口，并在当前 WebContents 导航。
+- 可安全转移的 POST：`deny` 新窗口，并在当前 WebContents 重放原请求。
+- 无法安全转移的 `about:blank` 动态窗口、脚本写入窗口和不受支持 Scheme：阻止并展示明确错误。
+- OAuth、下载和外部协议由产品策略接管，不允许创建隐藏 Target。
+
+必须在 Chromium 创建新 WebContents 之前阻止请求。禁止“先创建 popup，再关闭并导航原页”。
+
+### 8.3 导航状态
+
+- 导航期间保持同一 WebContentsView 可见，不 detach、不隐藏、不替换背景层。
+- Surface 设置与主题一致的背景色，首帧到达后再显示新创建 Surface。
+- 页面刷新和慢请求使用 Chromium 正常渲染过程，不显示黑色占位。
+- 每次顶级导航增加 `navigationRevision`，旧 snapshot、元素 ref 和标记选择明确失效。
+- URL 仅允许 `http`、`https` 和 `about:blank`。
+- 禁止凭据 URL、`file`、`javascript`、`data`、Chromium 内部 Scheme 和云环境 metadata 目标。
+- `localhost`、`127.0.0.1`、`[::1]` 和经 Workspace 开发服务注册的 LAN URL 必须可用，用于 Agent 启动和验收本地 Web 项目。
+- 用户手动导航和 Agent 导航使用不同策略：用户保留正常浏览能力，Agent 访问私有网段时必须经 Workspace 开发服务注册或明确授权。
+
+## 9. Browser Session 与数据隔离
+
+### 9.1 Partition
+
+- MagiAppView、RightPaneChromeView、DesktopOverlayView 使用可信应用 partition。
+- 每个 Browser Session 使用独立、非持久 Electron partition。
+- 同一 Browser Session 在同一 Desktop 进程的多个 Surface 可以共享该内存 partition。
+- 不同 Browser Session、不同 Desktop 实例和用户外部浏览器不共享数据。
+- Desktop 退出后清理 Cookie、缓存、Service Worker、IndexedDB、localStorage 和临时下载。
+
+### 9.2 隐私启动策略
+
+Electron `app.ready` 前应用：
+
+- `--use-mock-keychain`
+- 禁用密码保存、自动填充、同步、默认浏览器检查和后台组件更新。
+- 不调用 Electron `safeStorage` 存储浏览器资料。
+- 不扫描、导入或迁移系统浏览器 Profile。
+
+系统证书信任、DNS、代理和图形设备属于网页正常运行依赖，不视为读取用户浏览器资料；不得将其结果写入会话或遥测。
+
+### 9.3 权限
+
+每个 Browser Session 同时设置 permission check 和 request handler。麦克风、摄像头、通知、地理位置、蓝牙、USB、串口、MIDI 和屏幕捕获默认拒绝并完成 callback，不弹出第二层系统错误。
+
+## 10. Desktop、daemon 与 Worker 进程
+
+### 10.1 Electron Main 是唯一 Supervisor
+
+Electron Main 管理：
+
+- Rust daemon sidecar。
+- BrowserAutomationWorker `utilityProcess`。
+- 应用更新和重启。
+- 全部子进程退出、超时和孤儿清理。
+
+daemon 和 Worker 不互相启动对方，也不从 `PATH` 搜索可执行文件。
+
+### 10.2 Rust daemon sidecar
+
+daemon 从应用签名 resources 固定路径启动，必须具备：
+
+- parent PID 绑定。
+- 随机实例 token。
+- 协议版本握手。
+- 健康检查和 canonical `38123/web.html` 入口。
+- 优雅停止、超时强制退出和端口身份校验。
+- 更新前冻结新任务并等待已有写操作结算。
+- Desktop 异常退出后的自终止机制。
+
+DesktopControlServer 使用每个 Desktop 实例独立的 Unix domain socket/macOS/Linux 或 named pipe/Windows，并校验随机 token、对端 PID、desktopEpoch 和协议版本。物理 Surface 控制不经 `38123` HTTP API，不暴露给普通 Web 客户端或其他本地进程。
+
+### 10.3 BrowserAutomationWorker
+
+Worker 使用 Electron `utilityProcess.fork()` 运行打包后的 Node 模块，继承 Electron 自带 Node Runtime，不再分发独立 Node。
+
+Worker 与 Electron Main 只通过 MessagePort 通信：
+
+- 接收经过身份校验的高层浏览器命令。
+- 通过 BrowserCdpGateway 请求允许的 CDP domain/method。
+- 不获得 `webContents` 对象、任意用户文件系统、Desktop Renderer IPC 或调试端口。
+- 只可读取签名的 Worker 自身资产，并使用按 workerEpoch 隔离的临时目录；Artifact 必须通过 daemon API 持久化。
+- 崩溃后由 Main 重启，并从 Surface Registry 重建绑定。
+
+### 10.4 故障隔离与恢复
+
+| 故障 | 用户页面 | 控制权 | 恢复动作 |
+| --- | --- | --- | --- |
+| Automation Worker 崩溃 | 原 Surface 保持可见可操作 | 立即释放全部 Worker Lease | Main 重启 Worker，重绑现有 Target |
+| Rust daemon 崩溃 | 原 Surface 保持可见可操作 | Agent 能力失效，用户保留控制 | Main 限次重启 daemon 并重做协议握手 |
+| Browser Renderer 崩溃 | 仅对应 Surface 显示明确崩溃状态 | 释放该 Surface Lease | 用新 revision 重建 Surface，只导航 canonical URL |
+| RightPaneChromeView 崩溃 | BrowserSurface 不销毁 | 暂停新 UI intent | 由 Main 用当前 DesktopWindowSnapshot 重建 ChromeView |
+| MagiAppView 崩溃 | BrowserSurface 和 RightPane 保持 | Agent Browser Lease 按任务状态决定 | 重建 AppView，不重建 Browser Surface |
+| Electron Main 崩溃 | 整个 Desktop 退出 | 所有 Lease 失效 | 父进程绑定保证子进程退出，下次启动只恢复逻辑 Tab |
+| 更新中断 | 继续使用完整旧版本 | 不启动半版本 Worker | 回滚到同一 manifest 的完整发行包 |
+
+恢复约束：
+
+- 不自动重放 click、type、submit、drag、upload 等写操作。
+- 不用销毁并重建 WebContents 作为通用“刷新”方案。
+- 每次恢复都增加对应 epoch/revision，旧命令、ElementRef、snapshot 和 Lease 必须结构化失效。
+- 重启超过预算后进入稳定 `Failed` 状态，禁止无限循环启动和 UI 闪烁。
+
+## 11. 受控 CDP 自动化
+
+### 11.1 不开放调试端口
+
+Electron Main 对指定 BrowserSurface 的 `webContents.debugger` 建立连接。`BrowserCdpGateway`：
+
+- 只允许 BrowserSurface Target，永不暴露 MagiAppView、RightPaneChromeView 或 OverlayView。
+- 校验 `desktopEpoch/windowId/surfaceId/surfaceRevision/targetId`。
+- 按工具声明 allowlist CDP domain 和 method。
+- 拒绝 Browser、Target 和 SystemInfo 等越权全局操作。
+- 记录调用 id、耗时、结果类型和错误码，不记录密码、Cookie、页面正文或调试 token。
+- 不监听 TCP，不生成可被其他本地进程访问的 DevTools URL。
+
+### 11.2 生产自动化实现
+
+BrowserAutomationWorker 使用直接 CDP，不在生产运行时使用 Playwright `connectOverCDP()`。核心实现：
+
+- `DOMSnapshot`、`DOM`、`Accessibility`：页面结构和稳定 ElementRef。
+- `Runtime`：受控查询与 WebMCP；任意 JavaScript evaluate 受独立策略限制。
+- `Input`：鼠标、触控、键盘、drag 和滚动。
+- `Page`：导航等待、截图、Dialog、生命周期和 document 注入。
+- `Network`：请求、响应、失败和 HAR 风格摘要。
+- `Emulation`：viewport、device metrics、touch、UA 和 orientation。
+- `Performance`、`Profiler`、`HeapProfiler`：诊断工具。
+- `Overlay`：元素高亮和 inspect 辅助。
+
+Lighthouse 作为 Worker 内部审计适配器运行，必须复用 BrowserCdpGateway 已授权的当前 Surface 会话；不得启动 Chromium、打开调试端口或创建隐藏 Page。
+
+Playwright 可以继续作为 Desktop E2E 测试依赖，但不得进入生产 Browser capability manifest 或运行链。
+
+### 11.3 Surface 绑定协议
+
+Desktop Surface Binding：
 
 ```text
-ExecutionResourceCoordinator.cancel(query, reason)
-  ├─ ProcessExecutionRegistry.cancel(query)
-  ├─ BrowserAuthority.revoke_leases(query, reason)
-  └─ 后续其他长期资源
+desktopEpoch
+windowId
+surfaceId
+surfaceRevision
+tabId
+webContentsId
+targetId
+browserContextId
+navigationRevision
 ```
 
-所有用户停止、Goal 暂停、会话关闭、任务树终止和 daemon shutdown 都调用这一处。禁止每个 API Route 分别拼接 Shell 与 Browser 清理逻辑。
+Worker 启动或重启：
 
-### 9.2 状态对应关系
+```text
+query Surface Registry
+  -> 接收当前 ready bindings
+  -> 为每个 Surface 建立 PageRuntime
+  -> 不创建新页面
+  -> 上报 automation-ready
+```
 
-| 运行事件 | Goal/Turn 行为 | Browser 行为 |
+Surface 崩溃并重建后 targetId 和 surfaceRevision 改变，旧命令立即失效。
+
+## 12. 工具执行与控制权
+
+### 12.1 工具流水线
+
+```text
+Tool call
+  -> 参数 schema 校验
+  -> 当前 session/workspace/worker 身份注入
+  -> 解析逻辑 Tab 与 Primary Surface
+  -> 校验 capability/desktop/worker epoch
+  -> 获取或校验 Tab+Surface Lease
+  -> 每 Surface 串行命令队列
+  -> navigation/snapshot/surface fence
+  -> CDP 执行
+  -> 规范化 canonical result
+  -> 持久 tool/result 与 browser event
+  -> UI presentation
+```
+
+每个命令携带：
+
+```text
+callId
+sessionId
+tabId
+surfaceId
+desktopEpoch
+workerEpoch
+surfaceRevision
+navigationRevision
+snapshotRevision?
+leaseId/fence?
+cancellationId
+```
+
+写操作结果不明时禁止自动重放。取消必须等待命令达到可判定终态。
+
+### 12.2 Lease
+
+Lease 绑定：
+
+```text
+tabId + surfaceId + executionOwnership + turnId + fence
+```
+
+- 不再使用 Profile 级 `BrowserProfileControlMode`。
+- 不再把同一 Browser Session 的全部 Tab 标记为 AI 占用。
+- 用户在 Surface 中产生真实输入时，Electron Main 撤销该 Surface Lease 并增加 fence。
+- Agent 后续写命令收到结构化 `browser_control_revoked`，不能继续静默输入。
+- read 工具可以按策略在无写 Lease 时运行，但必须绑定正确 Surface revision。
+- 任务终态、暂停、取消、Worker 崩溃和 Desktop 重启全部释放 Lease，不关闭页面。
+
+### 12.3 工具目录和能力状态
+
+产品内置工具 schema 稳定注册。每个 turn 的能力快照包含：
+
+```text
+DesktopStarting
+AutomationStarting
+Ready
+Restarting
+Failed
+ProtocolIncompatible
+```
+
+移除 `NotInstalled/Downloading/Verifying/UpdateAvailable/Uninstalling` 等独立 Runtime 状态。未 ready 时工具返回结构化可操作错误；`browser_status` 始终可用，Worker 可以发现并等待 Browser capability。
+
+所有失败使用稳定错误码，至少覆盖 `browser_not_ready`、`browser_protocol_incompatible`、`browser_surface_not_found`、`browser_surface_stale`、`browser_navigation_changed`、`browser_control_revoked`、`browser_element_ref_stale`、`browser_permission_denied`、`browser_screenshot_failed` 和 `browser_worker_failed`。UI、LLM 与日志使用同一 canonical error payload，禁止展示无意义 HTTP path 或内部堆栈。
+
+## 13. Viewport 与响应式调试
+
+### 13.1 Surface 级状态
+
+viewport 只属于 `BrowserSurfaceInstance`：
+
+- 不写 BrowserAuthority durable state。
+- 不跨 Tab、窗口、Desktop 实例或普通 Web 客户端同步。
+- Surface 新建或重建后默认 `auto`。
+- 同一逻辑 Tab 的两个 Surface 可以使用不同 viewport。
+
+### 13.2 auto
+
+`auto` 清除全部 device metrics override。网页 CSS viewport 由 BrowserSurfaceView 实际内容 bounds 决定，Chromium 自然触发 resize、media query、flex/grid 和 viewport 单位重排。
+
+### 13.3 fixed
+
+预设：
+
+- 宽屏 `1280 x 800`
+- 窄屏 `390 x 844`
+- 用户自定义 width/height
+
+输入短防抖动态生效，无确认按钮。Worker 使用 `Emulation.setDeviceMetricsOverride` 设置 CSS viewport、device scale factor、screen、touch、orientation、UA 和 Client Hints。
+
+为保证完整适配而非裁剪：
+
+```text
+contentScale = min(
+  1,
+  surfaceContentWidth / cssViewportWidth,
+  surfaceContentHeight / cssViewportHeight
+)
+```
+
+- 使用 Chromium device metrics `scale` 完成浏览器内部缩放。
+- 画面在内容槽内居中，剩余区域使用主题背景留白。
+- 不使用截图、Canvas、CSS transform 或外层位图缩放。
+- 用户输入由 Chromium 命中测试处理，不由 Svelte 转换坐标。
+- 工具坐标保持 CSS px；CDP 截图 clip 与 ElementRef 统一使用 CSS px。
+- viewport 修改只使当前 Surface 的 snapshot revision 失效，不导航、不刷新、不创建页面。
+
+## 14. 快捷键、焦点和输入
+
+Electron Main 维护每窗口唯一 `focusedSurface`：
+
+- 地址栏、消息输入框、终端和 BrowserSurface 焦点互斥。
+- resize、状态刷新和页面事件不得调用 focus。
+- 用户点击 Browser 内容时才将焦点交给 BrowserSurface。
+- 切换 Browser Tab 时只在用户明确激活时聚焦。
+- `Cmd/Ctrl+C/X/V/A/Z/Shift+Z` 根据 focusedSurface 路由。
+- Browser 页面使用 Chromium 原生编辑命令；Magi 文本区使用可信 Renderer 编辑命令。
+- 应用级快捷键先处理明确保留项，其余交给 focused WebContents。
+- 中文、日文、韩文 IME、死键、组合输入和系统文本服务进入真实 focused WebContents，不通过自定义键盘映射。
+
+Agent 的 CDP 输入不得改变 MagiAppView 或 RightPaneChromeView 的焦点。
+
+## 15. 标记、截图与消息
+
+### 15.1 标记
+
+元素标记：
+
+1. DesktopOverlayView 进入标记模式。
+2. 指针移动通过 Surface 本地坐标提交 hit test。
+3. Worker 使用 CDP 获取元素、frame、AX 和 bounding box。
+4. CDP Overlay domain 高亮当前元素。
+5. 用户确认并输入备注。
+6. Worker 只截取元素 bounding box。
+
+区域标记：
+
+1. DesktopOverlayView 在 Browser 内容 bounds 内捕获拖动。
+2. 生成归一化区域和当前 Surface/viewport/navigation 身份。
+3. Worker 使用 CDP clip 只截取选择区域。
+4. 保存备注、序号、Annotation 和二进制 Artifact。
+
+截图失败必须返回 `browser_screenshot_failed`，禁止退化为整页截图。
+
+### 15.2 Artifact 生命周期
+
+Artifact 授权基于创建时的 Magi `sessionId` 和 canonical message attachment，不依赖：
+
+- Browser Tab 是否仍打开。
+- Browser Session 是否 ready。
+- Surface、Target 或 Host 是否仍存在。
+
+BrowserAuthority 维护 Annotation 与 Artifact 的不可变关联；canonical session store 维护消息引用。关闭 Tab、清理 Browser 数据和升级 Desktop 不删除已进入消息的 Artifact。
+
+### 15.3 截图
+
+- 页面截图、元素截图、区域截图和全页截图使用当前 Surface 的 CDP Page capture。
+- 全页截图明确计算 content size，并允许超出当前 viewport；不得固定 `captureBeyondViewport: false`。
+- 输出保存为原始 PNG/JPEG bytes，禁止重复 base64 编码。
+- 浏览器截图按钮默认把图片加入消息编辑框，而不是静默下载。
+- 用户可以从消息附件菜单显式另存为文件。
+
+### 15.4 消息展示
+
+`browserAnnotationRefs` 写入 canonical user message metadata。消息区显示：
+
+- 标记序号。
+- 用户备注。
+- 页面 URL 和标题。
+- 元素或区域类型。
+- 图片预览和打开入口。
+- 删除/失效状态。
+
+LLM 读取的标记引用、消息展示和 Artifact API 必须指向同一 canonical 记录。
+
+## 16. 设置、版本与更新
+
+### 16.1 统一发行
+
+正式桌面包包含：
+
+```text
+Electron/Chromium Desktop Host
+Magi App/RightPane/Overlay Web assets
+Rust daemon sidecar
+BrowserAutomationWorker
+Browser capability manifest
+licenses
+```
+
+不再包含：
+
+- 独立 CEF Framework 和 Helper。
+- 独立 Playwright Chromium。
+- 独立 Node Runtime。
+- 可下载 Browser Runtime Component。
+
+### 16.2 版本来源
+
+产品版本唯一来源仍为 workspace `Cargo.toml` 的 `[workspace.package] version`。构建生成 Desktop package version。
+
+真实组件版本分别来自锁文件：
+
+- Electron version。
+- Chromium version，由 Electron 决定。
+- Rust daemon build/version。
+- BrowserAutomationWorker version。
+- Desktop Control Protocol version。
+- CDP compatibility version。
+
+同版本的含义是“来自同一 Git commit、同一签名发行包和同一 capability manifest”，不是强行使用相同 SemVer。
+
+### 16.3 capability manifest
+
+构建生成并签名：
+
+```text
+browser-capability-manifest.json
+  productVersion
+  gitCommit
+  electronVersion
+  chromiumVersion
+  daemonVersion
+  automationWorkerVersion
+  desktopProtocolVersion
+  platform/arch
+  file hashes
+```
+
+启动时校验实际文件、版本和协议；不允许跨版本半激活。
+
+### 16.4 设置页
+
+只提供：
+
+- Desktop Host、Chromium、daemon、Automation Worker 和协议版本。
+- starting、ready、restarting、failed、protocol-incompatible 状态。
+- Magi Desktop 更新检查、下载和安装进度。
+- 重启浏览器能力。
+- 清理当前或全部 Magi Browser Session 数据。
+- 诊断信息和可操作错误。
+
+删除 Chromium 安装、独立检查更新、独立激活和卸载按钮。
+
+### 16.5 更新原子性
+
+- macOS 主应用、Chromium Framework/Helper、Rust sidecar 和 Worker 使用同一 Developer ID 签名，随后 notarize 和 staple。
+- Windows 主应用、sidecar、安装器和卸载器使用 Authenticode 签名。
+- Linux AppImage、deb/rpm 分别执行哈希、签名和包管理策略。
+- 先签名最终包，再生成更新元数据和哈希。
+- 更新失败保留完整旧版本，不允许只替换某个组件。
+
+### 16.6 构建与发布链
+
+正式发布只有一条 Desktop pipeline：
+
+```text
+校验 workspace version 与 lockfiles
+  -> 生成 Rust/TypeScript contracts
+  -> 构建 Svelte Desktop Renderer assets
+  -> 构建 Automation Worker
+  -> 构建 Rust daemon sidecar
+  -> 构建 Electron Main/preload
+  -> 生成 capability manifest 和 SBOM/licenses
+  -> electron-builder 组装单一桌面包
+  -> 签名/公证
+  -> 解包自检文件、版本、哈希和协议
+  -> 安装后真实 Desktop smoke test
+  -> 生成 GitHub Release 与更新元数据
+```
+
+发布规则：
+
+- Git tag、Desktop package version、daemon product version 和 capability manifest `productVersion` 由根版本命令一次生成，禁止手工在多个文件修改。
+- Electron/Chromium 版本由唯一 npm lockfile 锁定，不在 Rust 配置、运行时 manifest 或设置页另外维护。
+- CI 不下载另一份 Chromium，不生成 Browser Runtime 独立 release asset。
+- 自动更新只识别 Desktop 发行版本；Chromium、Worker 和 daemon 不拥有独立更新 channel。
+- 发布 job 只接受签名后的最终产物，不允许本地未验证包直接上传覆盖更新元数据。
+
+## 17. Tauri 到 Electron 升级迁移
+
+### 17.1 身份连续性
+
+- 保持产品名称、应用 identifier、更新 channel 和用户数据根目录兼容。
+- Electron 首次启动只迁移 Magi 自己的会话、设置、Workspace 和 Artifact 数据。
+- 不迁移旧 CEF Cache、Cookie、Profile、Helper 状态和 Runtime 安装记录。
+- 旧 Browser Tab 只恢复逻辑 URL、标题、顺序和 Annotation；首次激活创建 auto viewport Surface。
+
+### 17.2 平台验证
+
+必须用已发布 Tauri 稳定版真实升级到 Electron 候选版：
+
+- macOS：完整 `.app` 替换、签名、公证、quarantine 和回滚。
+- Windows：NSIS 安装位置、应用 ID、卸载项、快捷方式和更新连续性。
+- Linux：AppImage 原位更新；deb/rpm 由包管理器升级。
+
+单个发行包中不得包含 Tauri 与 Electron 两个桌面宿主，也不得保留 CEF 回退。允许使用一次性迁移安装器，但迁移代码不能进入长期运行路径，迁移完成后从仓库和发布流程删除。
+
+## 18. 开发迁移阶段与闸门
+
+迁移只在独立开发分支进行。每阶段通过真实验收后才能进入下一阶段。
+
+### 阶段 0：契约冻结
+
+- Desktop IPC contract。
+- Desktop Control Protocol。
+- WindowLayoutState/LayoutSnapshot。
+- BrowserTabRecord/BrowserSurfaceInstance。
+- Surface Binding 和 Lease。
+- capability manifest。
+
+### 阶段 1：Electron Desktop POC
+
+- BaseWindow + MagiAppView + RightPaneChromeView。
+- BrowserSurfaceView 真实网页。
+- DesktopOverlayView 覆盖菜单和 Modal。
+- 右栏连续拖动、窗口 resize、DPI、全屏和多显示器。
+- 快捷键、剪贴板、中文 IME 和焦点。
+
+POC 只验证架构，不进入正式发布；失败即修正目标架构，不在旧实现上追加兼容补丁。
+
+### 阶段 2：进程与 IPC
+
+- Rust daemon sidecar supervisor。
+- utilityProcess Automation Worker。
+- 私有 Desktop Control socket/pipe。
+- parent death、健康检查、重启和更新冻结。
+
+### 阶段 3：Surface 与状态
+
+- BrowserSurfaceManager。
+- 多窗口 SurfaceInstance。
+- Primary Surface。
+- Tab/Surface 生命周期、用户接管和 Tab 级 Lease。
+- BrowserAuthority durable state 收敛。
+
+### 阶段 4：直接 CDP 工具
+
+- Snapshot/ElementRef。
+- 输入和导航。
+- viewport/emulation。
+- 标记和截图。
+- Console/Network/Performance/Heap/PWA/Lighthouse。
+- Worker 崩溃后重绑同一 Target。
+
+### 阶段 5：设置、隐私和更新
+
+- 统一设置页。
+- 非持久 partition 和权限审计。
+- mock keychain 和用户 Profile 访问审计。
+- 签名、公证、安装器和跨宿主升级。
+
+### 阶段 6：唯一切换与清理
+
+- Electron 成为唯一 Desktop entrypoint。
+- 删除旧 Tauri/CEF/Playwright 生产路径。
+- 删除独立 Browser Runtime 发布与状态机。
+- 运行废码扫描、依赖扫描、构建和真实验收。
+- 完成前不合并 main、不发布。
+
+## 19. 强制废弃代码清理
+
+### 19.1 旧新职责替换表
+
+| 旧实现 | 唯一新实现 | 删除闸门 |
 | --- | --- | --- |
-| 用户停止当前对话 | 当前 Turn 终止，关联 Goal/Plan 原子暂停 | 立即撤销执行链的 Browser Control Lease，取消未完成命令 |
-| 用户点击 Goal 暂停 | Goal/Plan 原子暂停，Turn 终止 | 撤销 Lease，页面保留 |
-| 用户点击 Goal 继续 | 创建新的 continuation Turn | 不恢复旧 Lease；后续工具重新申请，默认复用会话活动 Tab |
-| 用户在浏览器接管 | 通过统一中断入口暂停关联 Goal | 先 fence 旧 Lease，再把输入权交给用户 |
-| 子代理完成/失败 | Task 按现有状态机收口 | 释放该 Worker 持有的 Lease |
-| Goal 完成 | Goal 进入 Complete | 释放 Lease，Browser Session 保留用于复核 |
-| Browser Host 不可恢复 | 当前工具确定失败，关联 Goal 进入运行时 Blocked/Waiting | Session 进入 Failed，展示可诊断原因 |
-| daemon 重启 | 现有恢复链将非终态 Turn 标记为 interrupted | 所有 Lease 作废，Session 恢复持久页面边界后等待用户继续 Goal |
-
-### 9.3 用户接管顺序
-
-1. `BrowserAuthority` 在进程内增加 Profile fence，旧 Lease 立即失效。
-2. `ExecutionResourceCoordinator` 取消该执行所有者的浏览器命令与其他活动工具。
-3. 会话运行时使用现有原子方法暂停 Goal 和绑定 Plan，并终止当前 Turn。
-4. Authority 把控制模式切换为 `user`。
-5. UI 收到权威事件后才启用输入转发。
-
-如果第 3 步因并发 revision 冲突失败，Lease 仍保持撤销。reconciler 根据当前 Goal 真相重新决定是否需要暂停，绝不恢复已经失效的旧 Lease。
-
-### 9.4 子代理并发
-
-- 同一 Browser Profile 内的写浏览器操作串行化，不同子代理不能同时写不同 Tab。
-- Lease 冲突返回 `browser_control_lease_conflict`，不排队偷取控制权，也不让主线静默抢占。
-- 未持有浏览器 Lease 的子代理仍可并行执行 Shell、文件、搜索和其他工具，不阻塞整个代理图。
-- 主线代理不自动抢占子代理；只有用户接管或执行树终止可以强制撤销。
-- Lease owner 使用真实 `worker_id/task_id/execution_chain_ref`，不能只用角色名称。
-
-## 10. 模型工具设计
-
-为兼容 DeepSeek 等不同 Provider，工具 Schema 保持扁平，禁止大规模 `oneOf` 和任意 JavaScript。首版第一方工具固定为：
-
-| 工具 | 用途 | 外部副作用 |
-| --- | --- | --- |
-| `browser_navigate` | 创建/复用会话与 Tab，导航 URL，前进、后退、刷新 | 可能 |
-| `browser_snapshot` | 返回紧凑 accessibility/DOM 快照和稳定 ref | 无 |
-| `browser_click` | 点击 snapshot ref | 有 |
-| `browser_type` | 向可编辑 ref 输入文字 | 有 |
-| `browser_press` | 发送按键或组合键 | 有 |
-| `browser_scroll` | 页面或元素滚动 | 有 |
-| `browser_screenshot` | 截取当前页面或元素，生成 artifact | 无 |
-| `browser_tabs` | 列出、切换、新建、关闭 Tab | 本地状态 |
-| `browser_viewport` | 读取或设置设备视口；同步控制 CSS 宽高、设备类型、移动端 UA 与触控语义 | 仅改变浏览器页面环境 |
-
-Developer Mode 单独提供 `browser_inspect`，仅支持受限的 console、network、DOM、computed style 和 performance trace 子命令。它不进入默认工具集合。
-
-`browser_viewport` 的状态由 Authority 持有两种尺寸模式：`auto` 跟随右侧面板尺寸，`fixed` 保持用户或模型指定的尺寸；设备仿真收敛为由宽度决定的唯一语义：`320-600` 为 `mobile` 手机窄屏，`601` 以上为 `desktop` 电脑/平板宽屏，禁止出现 `600px + desktop` 这类会把固定宽屏页面直接裁切的矛盾状态。用户连续调整自定义宽高时，前端以防抖方式动态提交并同步切换宽屏/窄屏状态，不需要额外确认。Browser Host 对每次尺寸变化只提交一次 CDP device metrics 更新，同时应用 UA、Client Hints 和触控能力，并等待同一渲染帧完成 `resize` 与布局提交后再确认成功；当前文档只接收一次浏览器原生 `resize`，按 CSS viewport、媒体查询和 Chromium 的移动端布局规则自然重排或等比适配，禁止先写入桌面尺寸再写入手机尺寸造成画面抖动。服务端 UA 分流只在用户或模型之后显式导航、前进、后退或刷新时生效，不能通过隐藏刷新丢失当前页面状态。
-
-Screencast 的 `width` / `height` 表示页面实际 CSS 交互坐标空间，不是压缩后的设备表面尺寸；当无 viewport meta 的桌面文档在手机尺寸下由 Chromium 等比缩放时，Host 使用 `deviceWidth / pageScaleFactor` 还原完整布局坐标，前端点击、批注和画面缩放因此共享同一坐标系。图像像素仍按 Chromium 的设备缩放因子输出，以保持原生清晰度。截图统一直接读取当前 CDP 布局指标并按视觉缩放生成，不依赖 Playwright 的旧 viewport 缓存。每个新的页面画面订阅都会重新启动同一条 screencast 以立即产生首帧，静态页面在服务重连或面板重建后不再依赖刷新才能恢复画面。
-
-面板 ResizeObserver 只允许提交带页面控制器身份的 `sync` 更新；同一个 `BrowserTabId` 在服务端同时只接受一个面板控制器写入，其他窗口只能通过获得焦点、操作画面或拖动面板显式接管。服务端在 `fixed` 模式下原子忽略所有迟到同步，切换回 `auto` 必须是用户显式操作。这样既不会出现模型已设置手机视口后被面板尺寸抢回，也不会在同一会话被多个 Magi 窗口打开时形成尺寸争用和刷新循环。
-
-普通用户任务始终保留完整工具面，required tool chain 只用于完成证据，不用于逐轮隐藏其他工具。只有系统发起的确定性证据恢复轮次才收窄到目标工具；因此模型可以在同一回合中多次调用 `browser_viewport`，例如先验证桌面布局，再切换手机布局，最后读取视口复核。
-
-### 10.1 工具目录与 Runtime Readiness 必须同源
-
-浏览器工具是否出现在模型可见目录中，必须由同一个 `BrowserCapabilitySnapshot` 决定：
-
-```rust
-pub struct BrowserCapabilitySnapshot {
-    pub revision: u64,
-    pub in_app_browser_enabled: bool,
-    pub browser_use_enabled: bool,
-    pub runtime_status: BrowserRuntimeComponentStatus,
-    pub host_protocol_compatible: bool,
-    pub access_profile: AccessProfile,
-}
-```
-
-规则：
-
-- Runtime Component 未安装、校验失败、协议不兼容或被安全策略阻断时，不向模型暴露浏览器动作工具。
-- `read_only` 只暴露允许的只读工具；click、type、press 等写工具不能先暴露、执行时再伪装成“工具不存在”。
-- 工具目录构建和工具执行校验使用同一 snapshot revision，避免模型看到工具后被另一套访问模式拒绝。
-- Runtime 安装入口属于用户 UI，不允许模型静默下载和执行新的运行组件。
-- 系统上下文向模型说明 Browser Capability 的 `not_installed`、`update_required` 或 `unavailable` 状态，避免模型连续猜测工具名。
-- Runtime 在当前 Turn 中途失效时，Authority 只进行一次有界恢复；恢复失败返回 `browser_runtime_unavailable` 并让关联 Goal 进入等待，不要求模型重复调用。
-
-这条约束直接避免重现 Shell 曾出现的“模型看见或猜到工具，但当前运行表面没有该工具”的问题。
-
-### 10.2 Snapshot 输出边界
-
-- accessibility/DOM snapshot 默认最多 400 个节点、32 KiB 文本。
-- 优先返回可交互元素、当前焦点、可见文本和发生变化的子树。
-- 超出边界时返回 `truncated=true`、可继续读取的 subtree ref 和完整节点统计，禁止直接把整页 DOM 塞入模型上下文。
-- Snapshot ref 只在当前 `snapshot_revision` 有效，导航、显著 DOM 更新或 Host 恢复后全部作废。
-- 密码、隐藏字段、Token、Cookie 和请求授权头永不进入 snapshot。
-
-工具规则：
-
-- 工具调用不接受模型伪造 `worker_id`、`task_id`、`session_id` 或 Lease。
-- 执行身份全部来自 `ToolExecutionContext`。
-- `browser_snapshot` 返回 `snapshot_revision`，元素操作必须带相同 revision。
-- revision 已变化时返回 `browser_snapshot_stale`，要求重新 snapshot。
-- Host 恢复由 Authority 内部完成，模型不负责“再试一次启动浏览器”。
-- 写动作只在 Host 明确未执行时允许 Authority 内部重试一次；结果不明时返回 `Indeterminate`。
-- 工具输出提供稳定 `error_code`、`recoverable`、`requires_user_action` 和诊断字段，避免模型反复输出非生产说明。
-
-## 11. 权限与安全
-
-### 11.1 能力分层
-
-Magi 设置分别控制：
-
-- `in_app_browser`：是否显示内置浏览器 UI。
-- `browser_use`：模型是否可以使用浏览器工具。
-
-两项能力互不改写。完整 CDP 和外部浏览器不属于当前第一方工具面，也不在设置中暴露伪开关。
-
-### 11.2 无浏览器权限弹窗
-
-内置浏览器是 Magi 会话内的第一方能力。能力启用后，用户操作和模型基础浏览器工具均不触发 Origin 申请、系统权限弹窗或工具审批弹窗。浏览器工具目录与执行时校验共同读取同一轮 `BrowserCapabilitySnapshot`，不允许出现“模型看得见、运行时不可用”的错位。
-
-安全边界由固定策略执行，而不是交给用户逐站点批准：
-
-- 只允许 `http:`、`https:` 和 `about:blank`，禁止凭据 URL、`file:`、`javascript:`、`data:` 和浏览器内部 Scheme。
-- 云元数据与 link-local 目标始终阻断；重定向同样经过导航校验。
-- 工具只可访问当前 Magi 会话绑定的 Browser Session，不能跨会话读取共享 Profile 中的页面。
-- 用户始终可以直接操作页面；代理动作通过租约与 fence 保证单写者。
-
-### 11.3 访问模式
-
-| AccessProfile | 允许行为 |
-| --- | --- |
-| `read_only` | 浏览器基础工具和用户操作均可用；该模式只限制工作区与进程等外部副作用 |
-| `restricted` | 浏览器基础工具和用户操作均可用，不产生审批弹窗 |
-| `full_access` | 浏览器基础工具和用户操作均可用，不改变浏览器固定安全边界 |
-
-### 11.4 敏感动作
-
-以下模型动作不能被任何 AccessProfile 绕过：
-
-- 提交账号、身份、支付和医疗信息。
-- 购买、转账、订阅或确认订单。
-- 删除数据、改变权限、发布内容。
-- 下载可执行文件。
-- 向密码、一次性验证码或支付卡字段输入内容。
-
-Host 根据元素语义直接拒绝这些模型动作，并返回 `requires_user_action`；用户仍可在页面中手动完成，不弹出第二层 Magi 审批窗口。
-
-### 11.5 数据保护
-
-- password、credit-card、OTP 输入值不进入 snapshot、日志、事件、回放或模型上下文。
-- 模型不得向 password 类型元素输入内容，用户可以在接管模式手动输入。
-- `file:`、`javascript:`、任意 `data:` 和浏览器内部 Scheme 对模型默认禁止。
-- 阻止云元数据地址和 link-local 地址；私网 Origin 使用更高风险等级。
-- Browser Host 仅监听 loopback，使用启动时随机 Token，Token 不下发前端。
-- 公网隧道默认不能读取浏览器画面或发送浏览器输入；远程浏览器访问必须使用独立显式授权，不能只凭普通会话访问令牌继承。
-- 网页正文始终标记为不可信观察内容，不能提升为系统指令。
-
-## 12. Host 私有协议
-
-### 12.1 启动
-
-daemon 通过 `magi-process` 启动 Host：
-
-```text
-~/.magi/runtimes/browser/<runtime-version>/bin/magi-browser-node \
-  ~/.magi/runtimes/browser/<runtime-version>/host/index.cjs
-```
-
-- Host Token 通过环境变量传递，不出现在命令行。
-- Host 监听 `127.0.0.1:0`，启动后只在 stdout 输出一条 Ready JSON。
-- 后续日志只写 stderr，避免污染握手协议。
-- Ready 信息包含 `protocolVersion`、`port`、`hostEpoch` 和 Chromium 版本。
-- daemon 校验协议版本后建立唯一私有 WebSocket。
-
-### 12.2 命令信封
-
-```json
-{
-  "protocolVersion": 1,
-  "requestId": "request-id",
-  "commandId": "command-id",
-  "hostEpoch": 12,
-  "tabId": "browser-tab-id",
-  "leaseId": "lease-id",
-  "fence": 7,
-  "method": "page.click",
-  "params": {}
-}
-```
-
-Host 按 `tabId` 串行执行命令，按 `commandId` 缓存短期结果，防止网络层重复投递。
-
-### 12.3 Screencast
-
-- CDP Screencast 默认最高 10 FPS，JPEG quality 70。
-- 无前端订阅时停止 Screencast，不影响模型工具。
-- 每个订阅者只保留最新帧，慢客户端不得堆积历史图片。
-- 全质量 PNG 只由 `browser_screenshot` 按需生成。
-- Frame metadata 包含 sequence、viewport、device scale、navigation revision 和时间戳。
-
-## 13. 公共 API 与事件
-
-### 13.1 API
-
-```text
-GET    /api/browser/capabilities
-POST   /api/browser/sessions
-GET    /api/browser/sessions/:browserSessionId
-DELETE /api/browser/sessions/:browserSessionId
-POST   /api/browser/sessions/:browserSessionId/tabs
-POST   /api/browser/tabs/:tabId/navigation
-POST   /api/browser/tabs/:tabId/user-control
-GET    /api/browser/tabs/:tabId/channel         (双向 WebSocket：frame + user input)
-GET    /api/browser/tabs/:tabId/annotations
-POST   /api/browser/tabs/:tabId/annotations
-POST   /api/browser/annotations/:annotationId
-```
-
-Tool Runtime 不通过这些 HTTP API 回调 daemon，而是进程内调用同一个 Authority。
-
-### 13.2 事件
-
-```text
-browser.runtime.status_changed
-browser.session.created
-browser.session.status_changed
-browser.session.recovered
-browser.tab.created
-browser.tab.updated
-browser.tab.closed
-browser.tab.crashed
-browser.lease.granted
-browser.lease.released
-browser.lease.revoked
-browser.annotation.created
-browser.annotation.updated
-browser.command.indeterminate
-```
-
-所有事件使用现有 `EventEnvelope`，必须携带 workspace/session/task 上下文。前端通过 SSE 收到状态后，从 Browser API 拉取最新投影；Screencast 帧和用户输入不进入 EventBus。
-
-## 14. 右侧栏交互设计
-
-### 14.1 布局
-
-Browser Pane 包含：
-
-- 顶级 Right Pane Tab 中独占的单网页视图。
-- 后退、前进、刷新和地址栏。
-- 视口选择、缩放、截图和标记模式按钮。
-- 工具栏末端的连接状态灯；恢复或失败时才显示低调提示。
-- 跟随面板或固定调试分辨率的 Screencast Canvas。
-- Canvas 上层独立 Overlay，用于鼠标、代理动作提示和标记。
-
-页面不使用卡片包裹主浏览画面。工具按钮使用现有 Icon 系统并提供 tooltip。
-
-### 14.2 自动控制权
-
-- UI 不提供“用户控制 / 代理接管”选择器。
-- 用户点击、键盘或滚轮输入会自动取得用户控制 fence，并直接转发到 Chromium。
-- 模型写工具执行前自动回收代理 Lease；同一 Profile 仍保持单写者。
-- 用户输入与代理写命令通过 Authority 和 fence 串行化，过期命令不能在控制权切换后继续执行。
-- Goal 暂停、完成或异常中断会撤销代理 Lease，页面本身继续保留给用户查看和操作。
-
-### 14.3 标记流程
-
-1. 用户开启标记模式。
-2. 点击元素或拖拽区域。
-3. 前端把坐标、frame sequence 和 viewport 发送给 Authority。
-4. Authority 校验 frame/navigation revision；页面已变化时拒绝旧坐标，未变化时才让 Host 执行 hit-test。
-5. Authority 生成持久锚点和截图 artifact。
-6. 用户填写评论并保存。
-7. 发送消息时，canonical user message metadata 写入 `browserAnnotationRefs`。
-8. Context Runtime 注入结构化锚点、元素样式摘要和截图引用；模型需要视觉检查时复用 `view_image`。
-
-页面变化后的重新定位顺序：
-
-1. 稳定测试属性或 id。
-2. ARIA role/name。
-3. CSS 结构和祖先指纹。
-4. 文本、属性与几何综合匹配。
-
-置信度不足时标记 `Stale`，禁止静默迁移到错误元素。用户或代理完成修改后可以显式标记 `Resolved`。
-
-## 15. 持久化与恢复
-
-### 15.1 文件边界
-
-```text
-~/.magi/browser/state.json
-~/.magi/browser/profiles/default/
-~/.magi/browser/artifacts/<session-id>/<browser-session-id>/
-```
-
-`state.json` 只保存 Session、Tab 最后 URL、标记和 revision，不保存 Cookie、网页正文或密码。
-
-### 15.2 daemon 重启
-
-1. daemon 加载 Browser state，把上次非终态 Session 标记为 `Recovering`。
-2. 所有持久化 Lease 一律丢弃；Lease 本身不落盘。
-3. 启动 Browser Host 和持久 Profile。
-4. 按 Browser Session 恢复 Tab 顺序和最后已提交 URL。
-5. `runtime_epoch` 和 Tab navigation/snapshot revision 增长。
-6. 旧标记重新定位，无法定位的进入 `Stale`。
-7. 发布 `browser.session.recovered`。
-8. Goal 继续遵循现有 interrupted/waiting 逻辑，用户通过 Goal 卡片创建新 continuation Turn。
-
-恢复只保证持久边界，不承诺恢复页面的瞬时运行内存：
-
-- 可以恢复：Profile Cookie、localStorage、站点持久数据、Tab URL、Tab 顺序、截图和 Annotation。
-- 尽力恢复但不保证：滚动位置、浏览历史位置和可序列化表单状态。
-- 不能恢复：页面 JavaScript 堆、未提交表单输入、WebSocket 连接、内存路由临时状态、Canvas 运行态和执行中的下载。
-
-恢复后的 Tab 必须增加 navigation/snapshot revision，旧元素 ref 全部失效，Annotation 重新定位。Goal continuation 的第一条浏览器操作必须重新 snapshot，不能假设页面仍处于崩溃前的瞬时状态。
-
-恢复持久页面边界不等于恢复执行。任何代理必须通过新 Turn 获取新 Lease。
-
-### 15.3 Host 崩溃
-
-- Authority 立即 fence 全部 Lease。
-- 正在执行的只读命令可在恢复完成后重试一次。
-- 写命令只有在 Host 证明未开始执行时才可重试。
-- 无法确定是否执行的命令返回 `browser_command_indeterminate`。
-- 有界恢复失败后工具快速失败，当前 Goal 通过现有运行时失败路径进入 Blocked/Waiting，禁止模型重复尝试启动工具。
-
-## 16. 独立运行组件与更新成本
-
-### 16.1 运行组件结构
-
-每个平台独立发布：
-
-```text
-magi-browser-runtime-<runtime-version>-<target>.tar.zst
-  manifest.json
-  bin/magi-browser-node
-  host/index.cjs
-  host/resources/*
-  chromium/*
-  licenses/*
-```
-
-`manifest.json` 至少包含：
-
-- Runtime Component 版本。
-- Host 协议版本和兼容范围。
-- Node、Playwright、Chromium 版本。
-- 目标平台和架构。
-- 发布通道、单调递增的 `manifestSequence` 和 `expiresAt`。
-- 最低兼容 Magi 版本和最低安全 Runtime 版本。
-- 压缩包与每个关键文件的 SHA-256。
-- 解压后大小。
-- 签名与发布时间。
-- macOS codesign/notarization、Windows Authenticode 等平台执行签名信息。
-
-### 16.2 安装与升级策略
-
-```text
-用户打开内置浏览器
-  ↓
-检查当前平台 Runtime Component
-  ├─ 已安装且协议兼容：直接启动
-  ├─ 未安装：展示体积并由用户确认安装
-  └─ 不兼容或强制安全更新：展示更新原因并安装新版本
-```
-
-组件安装目录：
-
-```text
-~/.magi/runtimes/browser/<runtime-version>/
-~/.magi/runtimes/browser/active.json
-```
-
-安装过程必须：
-
-1. 下载到 staging 目录，并持续展示进度、速度和剩余大小。
-2. 校验发布签名、归档 SHA-256 和 manifest 文件哈希。
-3. 解压完成后执行离线启动自检。
-4. 通过原子 rename 激活 `active.json`。
-5. 成功激活后清理不再使用的旧版本；不在运行时静默回退到旧组件。
-
-Magi App 与 Browser Runtime 使用协议兼容范围解耦，例如 App 支持 Host Protocol `1.x`，已安装 Runtime 为 `1.4.2`。只要协议兼容，Magi `3.0.38`、`3.0.39` 等常规升级都复用同一组件，不重新下载 Chromium。
-
-Browser Runtime 独立更新只在以下情况发生：
-
-- Host Protocol 出现不兼容升级。
-- Chromium/Playwright 有需要强制发布的安全修复。
-- Browser Runtime 本身存在必须替换的缺陷。
-- 用户主动清除了浏览器运行组件。
-
-普通 Browser Host 业务代码变更优先保持协议兼容，并随 Runtime Component 独立发布，不强迫 Magi 主应用同步升级。
-
-### 16.3 发布形式
-
-- 默认 Magi 安装包保持轻量，不包含 Browser Runtime Component。
-- Release 同时提供独立 Browser Runtime Component 下载。
-- 有离线部署需求时可以额外提供“完整离线安装包”，其中包含完全相同的签名组件；它不是第二套运行实现。
-- 组件下载源、签名公钥和最低安全版本由 Magi 的签名 manifest 管理，不能执行任意 URL 指向的 Runtime。
-
-### 16.4 更新检测与用户操作
-
-Magi 不直接根据 Chromium 上游版本号安装浏览器。发布系统必须先完成 Playwright 兼容测试、Browser Host 回归和三平台签名，再生成 Magi 自己的 Browser Runtime 更新 manifest。
-
-更新 manifest 至少提供：
-
-- 最新 Runtime、Chromium、Playwright 和 Host Protocol 版本。
-- 当前 App 可用的 Host Protocol 兼容范围。
-- `minimumSafeRuntimeVersion`。
-- 更新级别：`optional`、`recommended` 或 `required_security`。
-- 发布说明、下载大小、目标平台 URL、SHA-256 和签名。
-
-检测时机：
-
-- 已安装 Runtime Component 时，Magi 启动后后台检查一次，但不阻塞主界面。
-- 尚未安装且用户从未启用内置浏览器时，启动过程不主动请求 Browser Runtime 更新服务。
-- 距上次成功检查超过 24 小时时，在打开内置浏览器前检查。
-- 设置页提供“检查浏览器更新”操作，用户可以随时主动检查。
-- 同一进程内合并重复请求，避免启动、设置页和浏览器同时发起下载。
-
-更新行为：
-
-| 更新级别 | 产品行为 |
-| --- | --- |
-| `optional` | 设置页和浏览器工具栏显示更新提示，用户点击后下载；旧 Runtime 可以继续使用 |
-| `recommended` | 持续展示更新提示，用户确认后下载；不打断正在运行的 Goal |
-| `required_security` | 禁止创建新的代理浏览器 Lease；关联浏览器任务进入可恢复等待，用户确认安装后继续 |
-
-任何级别都不静默安装新的可执行 Runtime。Magi 可以后台检查和预取 manifest，但下载、安装和重启 Browser Host 必须有清晰的用户操作与进度反馈。
-
-manifest 校验必须拒绝：
-
-- 签名无效、已过期或目标平台/发布通道不匹配。
-- `manifestSequence` 低于本机已接受序号的回放响应。
-- Runtime 版本低于已记录的最低安全版本。
-- Host Protocol 超出当前 Magi 声明的兼容范围。
-- macOS/Windows 可执行文件平台签名不满足发布策略。
-
-安装切换遵循：
-
-1. 下载、签名校验和自检都在 staging 目录完成，当前 Runtime 不受影响。
-2. 普通更新在 Browser Host 空闲时由用户确认切换；运行中的 Goal 不被强制中断。
-3. 安全强制更新先 fence 新 Lease，通过现有运行时失败链把关联 Goal 设置为 `Blocked/Waiting`，`blocker_key=browser_runtime_update_required`，再由用户确认安装。
-4. 新组件自检通过后原子更新 `active.json` 并启动新 Host。
-5. Profile、Browser Session、Tab URL 和 Annotation 继续保留；执行 Lease 一律重新申请。
-6. 新组件未通过自检时不得激活，也不得破坏当前已安装组件。
-
-预计影响：
-
-| 项目 | 估算 |
-| --- | --- |
-| Magi 常规安装包增量 | 约 2–5 MiB，不包含 Chromium |
-| 首次 Browser Runtime 下载 | 约 120–200 MiB，最终以三平台实测为准 |
-| Browser Runtime 安装后磁盘 | 约 250–400 MiB |
-| 后续 Magi 常规升级 | 不重复下载 Browser Runtime |
-| Browser Runtime 安全更新 | 仅下载新的独立组件 |
-| 空闲 Browser Host | 约 40–80 MiB RAM |
-| Chromium 基础占用 | 约 180–350 MiB RAM |
-| 每个复杂 Tab | 约 30–150 MiB RAM |
-
-不使用系统 Chrome 作为体积回退方案。应用更新与浏览器组件更新解耦，同时保留稳定、版本一致和可复现的运行环境。
-
-## 17. 代码落点
-
-```text
-crates/magi-core
-  browser ids、公共执行资源标识
-
-crates/magi-browser-runtime
-  authority、领域模型、host client、lease、capability、annotation、recovery
-
-browser-host
-  Playwright、CDP、screencast、input、snapshot、host protocol
-
-crates/magi-tool-runtime
-  browser builtins、schema、BrowserToolExecutor 注入
-
-crates/magi-conversation-runtime
-  完整 ToolExecutionContext owner、浏览器失败与 Goal 收口
-
-crates/magi-api
-  browser routes、DTO、WebSocket、统一执行资源取消
-
-crates/magi-daemon
-  BrowserAuthority 装配、persistence、host supervisor、shutdown/recovery
-
-apps/desktop
-  Runtime Component 安装/更新展示、资源定位和发布配置，不维护业务状态
-
-web/src/stores
-  browser projection store；right-pane 只保留 tab 引用
-
-web/src/components / web/src/web
-  BrowserPane、canvas、toolbar、annotation overlay；删除 HTML iframe 预览分支
-```
-
-完整生产实现预计新增或修改约 18,000–26,000 行人工维护代码，不包含生成协议、lockfile 和打包清单。其中浏览器运行时与 API 约 6,000–8,000 行，Browser Host 约 4,000–6,000 行，前端与标记约 5,000–7,000 行，测试与发布约 3,000–5,000 行。
-
-## 18. 实施顺序
-
-实施顺序用于降低集成风险，但最终只保留上述一套正式实现：
-
-1. 建立 `magi-browser-runtime` 的纯状态机、Lease 和 Host 协议。
-2. 完成 Browser Host、持久 Profile、snapshot、动作、screenshot 和 Screencast。
-3. 接入 daemon 生命周期、持久化、恢复、EventBus 和 API。
-4. 将 `cancel_active_tool_executions` 收敛为通用 `ExecutionResourceCoordinator`。
-5. 接入第一方浏览器工具和完整执行所有权。
-6. 接入 Right Pane Browser Tab、Canvas 输入和自动控制权切换。
-7. 将 HTML 文件预览入口切换到 Browser Session，并删除 RightPane 的 HTML iframe 渲染状态与分支。
-8. 接入标记、canonical message 引用和 Context Runtime。
-9. 完成 Runtime Component 下载、签名校验、原子安装和协议兼容复用。
-10. 完成 Goal/子代理中断恢复、Host crash 和三平台发布闭环。
-
-每一步都在同一目标架构上向前，不引入临时 MCP 实现、系统 Chrome 回退或第二套前端状态。
-
-## 19. 验收标准
-
-### 19.1 状态一致性
-
-- 用户中断 Goal 后 1 秒内 Goal/Plan 为暂停，Turn 终止，Lease 失效。
-- Goal 继续后创建新 Turn 和新 Lease，不复活旧命令。
-- 共享 Profile 下同时最多一个代理执行浏览器写操作；其他子代理的非浏览器工具仍可并行。
-- Goal 完成后浏览器仍可查看，但代理不能继续操作。
-- 当前会话不会展示其他会话的 Browser Session 或状态。
-
-### 19.2 故障恢复
-
-- 强制杀死 Browser Host 后，不出现永久 loading 或伪运行状态。
-- 写动作在未知结果时不自动重试。
-- daemon 重启后恢复 Profile 与 Tab 持久边界、清空 Lease、废弃旧 snapshot ref，Goal 等待用户继续。
-- Screencast WebSocket 断开只影响画面，不能改变 Goal 或工具执行事实。
-- SSE lagged 恢复后 Browser UI 通过权威快照收敛。
-
-### 19.3 工具与模型
-
-- OpenAI 兼容模型和 Anthropic Messages 模型都能稳定调用全部基础浏览器工具。
-- 使用项目真实配置的 DeepSeek 模型跑通导航、snapshot、点击、输入、截图和完成 Goal。
-- Runtime 未安装、更新必需和访问模式受限时，模型可见工具目录与执行时能力完全一致，不出现 `tool_not_available` 错位。
-- 模型误用 stale ref、错误 Tab、失效 Lease 时返回稳定错误，不出现重复结束或重复工具循环。
-- 所有 AccessProfile 下浏览器基础工具均无权限弹窗；固定导航边界和敏感字段阻断不能被绕过。
-
-### 19.4 UI 与标记
-
-- 桌面和窄窗口下画面、工具栏、地址栏不重叠。
-- 画面缩放后点击坐标与真实元素一致。
-- 元素标记在普通 DOM 更新后可重新定位；不确定时进入 `Stale`。
-- 标记发送到对话后，模型获得结构化锚点与截图证据。
-- 代理运行中用户接管能可靠暂停 Goal，并可通过 Goal 卡片恢复。
-- HTML 文件的源码仍可直接查看，运行预览只经过 Browser Session，RightPane 不再存在 iframe 第二渲染路径。
-
-### 19.5 发布
-
-- macOS Apple Silicon/Intel、Windows 和 Linux 都能下载并安装匹配平台的签名 Runtime Component。
-- Magi 常规升级不会在 Host Protocol 兼容时重复下载 Chromium。
-- 首次安装、下载中断、校验失败、磁盘不足和组件不兼容都有明确状态，不表现为浏览器卡死。
-- 完整离线安装包中的 Runtime Component 与独立下载组件具有相同哈希和签名。
-- 安装组件后基础浏览器可以离线启动，不依赖用户预装 Node 或 Chrome。
-- 卸载只移除 Browser Runtime Component，并保留独立 Profile 数据供后续重装复用。
-- 第三方许可证和 Chromium notices 进入发布产物。
-
-## 20. 参考依据
-
-- Codex 本地源码功能分层：`/Users/xie/code/codex/codex-rs/features/src/lib.rs`
-- [Codex/ChatGPT Browser 官方说明](https://learn.chatgpt.com/docs/browser)
-- [OpenAI CUA Sample App](https://github.com/openai/openai-cua-sample-app)
-- [Steel Browser](https://github.com/steel-dev/steel-browser)
-- [Microsoft Playwright MCP](https://github.com/microsoft/playwright-mcp)
-- [Playwright BrowserContext](https://playwright.dev/docs/browser-contexts)
-- [Tauri Sidecar](https://v2.tauri.app/develop/sidecar/)
-
-参考项目提供实现经验，Magi 的最终真相源仍是自己的 Browser Authority、Execution Ownership、Goal 和 canonical turn。
+| Tauri Window/WebView | Electron BaseWindow + MagiAppView | Electron 主窗口验收通过 |
+| CEF NSView/Helper | BrowserSurfaceView/WebContentsView | 真实页面、输入、resize 验收通过 |
+| DOM 测量 + native resize bridge | WindowLayoutManager | reducer、DPI、多窗口验收通过 |
+| browser-host 创建 Playwright Page | BrowserSurfaceManager | Worker 能绑定现有 Surface 且 Target 数稳定 |
+| Playwright connectOverCDP 产品路径 | BrowserCdpGateway + direct CDP Worker | 工具矩阵验收通过 |
+| Browser Runtime installer/updater | Desktop 原子发行和 UpdateManager | 安装、更新、回滚验收通过 |
+| Profile 级 Lease | Tab + Surface Lease | 多窗口和用户接管验收通过 |
+| viewport durable/localStorage 同步 | Surface ephemeral viewport | 多窗口不互相 resize 验收通过 |
+| Surface 相关截图引用 | canonical Artifact store | 关闭 Tab、重启和升级后可读验收通过 |
+| Renderer 双向 store 同步 | DesktopWindowSnapshot + intent reducer | 多 Renderer 崩溃恢复验收通过 |
+
+清理不得提前破坏当前开发分支验证，也不得在新路径验收后继续保留旧实现。每一行替换在同一阶段内完成“新实现验收 -> 删除旧实现 -> 废码扫描”，不设置长期 feature flag。
+
+### 19.2 必须删除的桌面代码
+
+- `apps/desktop/src/native_browser.rs`
+- `apps/desktop/src/browser_helper.rs`
+- `apps/desktop/src/cef_policy.rs`
+- Tauri Desktop main、capabilities、command ACL 和原生 Browser commands。
+- `cef`、`tauri`、Tauri plugins、objc2 Browser 嵌入依赖。
+- CEF external message pump、Native Bridge、NSView Overlay 和 Helper Bundle。
+
+### 19.3 必须删除的 Runtime 与发布代码
+
+- `config/native-browser-runtime.json`
+- CEF fetch/stage/package/sign/self-test 脚本。
+- `.github/workflows/browser-runtime-release.yml`
+- release workflow 中 Browser Runtime 独立归档、manifest 和上传步骤。
+- Browser Runtime 下载、签名校验、安装、激活、更新、卸载 manager。
+- `NotInstalled/Downloading/Verifying/Installed/UpdateAvailable/UpdateRequired` 等独立组件状态。
+- 设置页独立安装、检查、刷新、更新和卸载动作及国际化文案。
+
+### 19.4 必须删除的 Web 兼容代码
+
+- `web/src/lib/native-browser.ts`
+- `native_browser_create/resize/focus/navigate/close` bridge。
+- `getBoundingClientRect()` BrowserSurface 定位。
+- `ResizeObserver -> requestAnimationFrame -> native resize` 队列。
+- `1 x 1` 隐藏和旧 frame key/generation 逻辑。
+- CEF 页面状态、原生光标和原生 Annotation 事件兼容层。
+- Browser Runtime 安装状态驱动的 UI 分支。
+
+### 19.5 必须删除的自动化双实现
+
+- 生产 `chromium.connectOverCDP()` Electron 路径。
+- Browser Host `newPage()`、Page 创建和物理页面淘汰职责。
+- Playwright 生产依赖、运行组件和协议分支。
+- popup “先创建再关闭”处理。
+- 独立 Chromium fallback 和 headful/headless 产品切换。
+
+Playwright E2E 依赖只能存在于测试 package/devDependencies，不能被打入生产 capability manifest。
+
+### 19.6 必须清理的数据和迁移代码
+
+- 旧 CEF 临时目录、Cache 和 Runtime active 指针。
+- 旧独立 Browser Runtime 安装目录。
+- 已失效的 right-pane Browser localStorage payload。
+- viewport、activeTab、ProfileControlMode 和 Lease 的旧 durable 字段迁移器。
+- 一次性迁移完成后删除迁移代码、feature flag 和版本判断。
+
+### 19.7 禁止残留
+
+最终仓库不得存在：
+
+- `cfg`、环境变量或 feature flag 选择 Tauri/CEF 旧实现。
+- “Electron 失败时回退 CEF/Playwright Chromium”的代码。
+- Desktop 与 daemon 各自拥有 Browser 页面或 Host supervisor。
+- 两套 viewport、Annotation、工具目录或 Browser capability 状态机。
+- 注释掉的旧实现、未引用模块、死路由、失效文档和废弃测试快照。
+
+CI 增加废码门禁，扫描旧模块、旧命令、CEF/Tauri 依赖、独立 Runtime 状态和生产 Playwright 依赖；命中即失败。
+
+门禁脚本必须作为正式 CI job 运行，至少检查：
+
+- 被禁文件、目录和 workflow 不存在。
+- Cargo metadata 不含 Tauri、CEF、objc2 Browser 嵌入依赖。
+- 生产 npm dependency tree 不含 Playwright Chromium、Puppeteer Chromium 或旧 browser-host。
+- 发行包解包后不含 CEF、独立 Node、独立 Browser Runtime 和 remote-debugging 启动参数。
+- 仓库不存在 `native_browser_*`、`BrowserProfileControlMode`、`connectOverCDP`、`NotInstalled` 等旧产品符号。
+- 静态分析、TypeScript/Rust 未使用代码检查和 dependency audit 通过。
+
+## 20. 验收矩阵
+
+### 20.1 架构验收
+
+- Electron Main 是 WebContents、布局和子进程唯一所有者。
+- RightPaneChromeView 是多功能右栏的唯一通用内容壳；BrowserSurfaceView 不能成为右栏父容器，也不能阻断代码、图片、终端、Agent 或未来面板。
+- 新增浏览器的异步创建只占用该浏览器项的 pending 状态；新增菜单、右栏拖拽、已有面板切换和非浏览器面板创建不等待浏览器网络或 Worker 就绪。
+- BrowserAuthority 只持久化逻辑 Browser 事实。
+- Surface 运行态按 `desktopEpoch/windowId/surfaceId` 隔离。
+- Automation Worker 不创建页面，不获得全局 CDP 或文件权限。
+- 普通 Web 客户端无法提交 Desktop layout/viewport。
+- 仓库不存在双实现和旧回退路径。
+
+### 20.2 真实桌面验收
+
+1. 启动 Magi，右侧展开按钮始终可见。
+2. 新建 Browser Tab，打开百度并读取页面标题。
+3. 打开 Bing，搜索 GitHub 中的 `magi-code` 项目，Agent 完成输入、搜索、打开和分析。
+4. 用户快捷键、复制粘贴、右键、滚轮、拖动、文本选择和中文 IME 正常。
+5. `target="_blank"` 和 `window.open()` 全程不产生第二个 Target。
+6. 页面刷新、跳转、慢请求和导航失败期间无黑屏、闪烁、重建或投影帧。
+7. 连续拖动右栏到最小值和窗口三分之二，页面不覆盖 Tab、工具栏或中间区。
+8. 浏览器正在创建或导航时，打开代码、图片、终端和 Agent Tab，面板内容均可用；浏览器失败只显示该 Tab 的错误。
+9. 菜单、标记编辑器、图片预览和设置 Modal 始终位于页面上方并可点击。
+10. 两个桌面窗口打开同一逻辑 Tab，尺寸、viewport、焦点和光标互不影响。
+11. 用户在 Secondary Surface 操作后正确提升 Primary，Agent 不再操作旧 Surface。
+12. auto、宽屏、窄屏和自定义 viewport 动态生效，不刷新、不裁切。
+13. Agent Lease 期间虚拟鼠标持续显示；用户输入立即释放 Lease。
+14. 任务完成后 Tab、当前 URL、滚动、表单和 SPA 状态保留。
+15. 杀死 Automation Worker 后页面仍可见可操作；重启后绑定原 Target。
+16. 单个 Browser Renderer 崩溃只影响对应 Surface，其他 Tab 正常。
+17. 元素和区域标记只生成选择范围截图，序号和备注正确。
+18. 关闭 Tab、重启 Desktop 和升级后，消息中的标记图片仍能打开。
+19. 页面、元素、区域和全页截图尺寸、编码和消息附件正确。
+20. Browser Session 数据不进入系统钥匙串，不读取外部浏览器 Profile。
+21. 设置页版本、状态、更新、重启能力和清理数据真实有效。
+
+### 20.3 自动测试
+
+- Desktop IPC schema、权限和未知字段拒绝测试。
+- WindowLayout reducer 和 layout revision 竞态测试。
+- Surface Registry、多窗口、Primary 转移和崩溃恢复测试。
+- CDP method allowlist 和错误规范化测试。
+- 每 Surface 串行队列、取消和 fence 测试。
+- Popup 创建前阻断测试，CDP Target 数始终不增加。
+- viewport scale、输入坐标和截图坐标测试。
+- Annotation/Artifact 关闭 Tab 后访问测试。
+- daemon/Worker parent death 和孤儿清理测试。
+- 打包解包、manifest、哈希、签名和公证测试。
+- Tauri 已发布版本到 Electron 候选版本升级测试。
+- macOS、Windows 和 Linux 核心流程 E2E。
+- `git diff --check`、前端 check、Rust workspace check/test 和废码扫描。
+
+### 20.4 产品性能和稳定性预算
+
+- 连续拖动右栏 30 秒时，Browser Surface 不导航、不重建、不改 viewport mode，且桌面组合帧率 p95 不低于 55 FPS。
+- 新增浏览器 Tab 的点击反馈不等待页面首屏或 Worker；逻辑 Tab/占位状态应先呈现，Surface 物化和导航在后台完成。
+- 浏览器 Surface 创建期间，右栏新增菜单、已有 Tab 切换和拖拽操作的输入延迟不因浏览器网络请求增长。
+- 用户点击、输入、滚动和 IME 直达 Browser WebContents，不经 daemon、Worker 或坐标转换层。
+- Browser Tab 切换不创建新 Target；切回时保留当前 DOM、滚动、表单和 SPA 状态。
+- 页面导航和刷新期间不 detach View，不展示黑色截图或空白投影层。
+- Snapshot 和工具指标记录 queue wait、CDP time、DOM/AX parse time、result size 和 UI present time，用真实站点基线防止性能回归。
+- 工具端到端测试使用百度、Bing、GitHub 和本地响应式测试站，不只使用静态 mock 页面。
+- 连续 8 小时 Browser soak test 中不允许 Surface 数、CDP session、Renderer 进程、临时 Artifact 和 Lease 无界增长。
+
+## 21. 完成定义
+
+只有以下条件全部满足，统一 Chromium 改造才算完成：
+
+- Electron Desktop Host 是唯一桌面入口。
+- 用户和 Agent 操作同一个 BrowserSurface。
+- 所有真实桌面验收和自动测试通过。
+- macOS、Windows、Linux 打包和核心流程通过。
+- 旧 Tauri 稳定版升级到 Electron 版本通过。
+- CEF、Native Bridge、独立 Browser Runtime 和生产 Playwright 路径全部删除。
+- 旧配置、路由、状态、脚本、工作流、依赖、文档和测试快照全部清理。
+- CI 废码门禁证明不存在双实现、兼容回退和未引用旧代码。
+- 正式包不开放调试端口，不访问用户浏览器资料或系统钥匙串。
+
+在上述条件未满足前，不得合并 main、提交发布版本或宣称浏览器产品化完成。

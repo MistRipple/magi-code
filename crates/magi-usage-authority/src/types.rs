@@ -13,7 +13,8 @@ pub enum UsageSourceRole {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageScope {
-    pub workspace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     pub session_id: String,
     pub turn_id: Option<String>,
     pub dispatch_wave_id: Option<String>,
@@ -121,7 +122,8 @@ pub enum UsageCallStatus {
 pub struct UsageEvent {
     pub event_id: String,
     pub ledger_seq: u64,
-    pub workspace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
@@ -215,7 +217,8 @@ pub struct UsageModelSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionUsageSnapshot {
-    pub workspace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     pub session_id: String,
     pub version: u64,
     pub last_applied_ledger_seq: u64,
@@ -226,9 +229,9 @@ pub struct SessionUsageSnapshot {
 }
 
 impl SessionUsageSnapshot {
-    pub fn empty(workspace_id: &str, session_id: &str) -> Self {
+    pub fn empty(workspace_id: Option<&str>, session_id: &str) -> Self {
         Self {
-            workspace_id: workspace_id.to_string(),
+            workspace_id: workspace_id.map(ToOwned::to_owned),
             session_id: session_id.to_string(),
             version: 0,
             last_applied_ledger_seq: 0,
@@ -310,7 +313,8 @@ pub struct LlmConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageCallRecordInput {
-    pub workspace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,

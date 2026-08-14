@@ -8,10 +8,10 @@ use std::{
     time::Duration,
 };
 
-use magi_browser_runtime::{
+use magi_browser_authority::{
     AcquireBrowserLease, BrowserCapabilitySnapshot, BrowserDeviceType, BrowserHostClient,
     BrowserHostCommand, BrowserHostCommandError, BrowserHostCommandOutcome,
-    BrowserHostCommandResult, BrowserHostControl, BrowserHostControlMode, BrowserHostSnapshot,
+    BrowserHostCommandResult, BrowserHostControl, BrowserHostControlUpdate, BrowserHostSnapshot,
     BrowserLeaseEndReason, BrowserNavigation, BrowserSnapshotNode, BrowserSnapshotTarget,
     BrowserToolAccess, BrowserToolKind, BrowserViewport, BrowserViewportMode, CreateBrowserSession,
     CreateBrowserTab, GoalControlBinding, ValidateBrowserWrite, validate_browser_navigation_url,
@@ -24,7 +24,7 @@ use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_session_store::SessionStore;
 use serde_json::{Map, Value, json};
 
-use crate::{RuntimeStatePersistence, state::BrowserRuntimeStatusSnapshot};
+use crate::{RuntimeStatePersistence, state::BrowserHostStatusSnapshot};
 
 const DEFAULT_BROWSER_PROFILE_ID: &str = "browser-profile-default";
 const LEASE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -44,37 +44,36 @@ struct BrowserExecutionIdentity {
 struct BrowserToolCallScope<'a> {
     context: &'a magi_tool_runtime::ToolExecutionContext,
     session_id: &'a SessionId,
-    workspace_id: &'a WorkspaceId,
+    workspace_id: Option<&'a WorkspaceId>,
     call_id: &'a str,
 }
 
 #[derive(Clone)]
 pub struct BrowserToolRuntimeDependencies {
-    pub authority: Arc<Mutex<magi_browser_runtime::BrowserAuthority>>,
+    pub authority: Arc<Mutex<magi_browser_authority::BrowserAuthority>>,
     pub write_lock: Arc<Mutex<()>>,
     pub control_lock: Arc<tokio::sync::Mutex<()>>,
     pub state_writable: Arc<std::sync::atomic::AtomicBool>,
-    pub runtime_status: Arc<RwLock<BrowserRuntimeStatusSnapshot>>,
+    pub host_status: Arc<RwLock<BrowserHostStatusSnapshot>>,
     pub host_client: Arc<RwLock<Option<BrowserHostClient>>>,
     pub event_bus: Arc<InMemoryEventBus>,
     pub session_store: Arc<SessionStore>,
     pub persistence: Option<Arc<RuntimeStatePersistence>>,
-    pub(crate) browser_views: Arc<crate::state::BrowserViewRegistry>,
 }
 
 impl BrowserToolRuntimeDependencies {
     pub fn capabilities(&self, session_id: Option<&SessionId>) -> BrowserCapabilitySnapshot {
-        let runtime = self
-            .runtime_status
+        let host = self
+            .host_status
             .read()
-            .expect("browser runtime status lock poisoned")
+            .expect("browser host status lock poisoned")
             .clone();
         BrowserCapabilitySnapshot {
-            revision: runtime.revision,
-            in_app_browser_enabled: runtime.in_app_browser_enabled,
-            browser_use_enabled: runtime.browser_use_enabled,
-            runtime_status: runtime.component_status,
-            host_protocol_compatible: runtime.host_protocol_compatible,
+            revision: host.revision,
+            in_app_browser_enabled: host.in_app_browser_enabled,
+            browser_use_enabled: host.browser_use_enabled,
+            host_status: host.status,
+            host_protocol_compatible: host.protocol_compatible,
             access_profile: session_id
                 .and_then(|id| self.session_store.active_goal(id))
                 .map(|goal| goal.access_profile)
@@ -85,7 +84,7 @@ impl BrowserToolRuntimeDependencies {
     fn publish_browser_event(
         &self,
         event_type: &str,
-        session: &magi_browser_runtime::BrowserSession,
+        session: &magi_browser_authority::BrowserSession,
         payload: Value,
     ) {
         let now = UtcMillis::now();
@@ -101,14 +100,14 @@ impl BrowserToolRuntimeDependencies {
                 payload,
             )
             .with_context(EventContext {
-                workspace_id: Some(session.workspace_id.clone()),
+                workspace_id: session.workspace_id.clone(),
                 session_id: Some(session.session_id.clone()),
                 ..EventContext::default()
             }),
         );
     }
 
-    fn publish_tab_event(&self, event_type: &str, tab: &magi_browser_runtime::BrowserTab) {
+    fn publish_tab_event(&self, event_type: &str, tab: &magi_browser_authority::BrowserTab) {
         let session = self
             .authority
             .lock()
@@ -128,8 +127,6 @@ impl BrowserToolRuntimeDependencies {
                 "url": tab.url,
                 "title": tab.title,
                 "navigation_revision": tab.navigation_revision,
-                "viewport": tab.viewport,
-                "viewport_mode": tab.viewport_mode,
             }),
         );
     }
@@ -148,13 +145,7 @@ impl BrowserToolRuntimeDependencies {
                 "浏览器工具缺少 session_id",
             );
         };
-        let Some(workspace_id) = context.workspace_id.clone() else {
-            return failure(
-                tool_name,
-                "browser_workspace_scope_missing",
-                "浏览器工具缺少 workspace_id",
-            );
-        };
+        let workspace_id = context.workspace_id.clone();
         let Ok(object) = serde_json::from_str::<Value>(input) else {
             return failure(
                 tool_name,
@@ -200,7 +191,7 @@ impl BrowserToolRuntimeDependencies {
         let Some(client) = client else {
             return failure(
                 tool_name,
-                "browser_runtime_unavailable",
+                "browser_host_unavailable",
                 "浏览器 Host 尚未就绪",
             );
         };
@@ -208,7 +199,7 @@ impl BrowserToolRuntimeDependencies {
         let scope = BrowserToolCallScope {
             context,
             session_id: &session_id,
-            workspace_id: &workspace_id,
+            workspace_id: workspace_id.as_ref(),
             call_id: &call_id,
         };
         let result = block_on(self.execute_async(tool_name, arguments, scope, client));
@@ -226,38 +217,35 @@ impl BrowserToolRuntimeDependencies {
         client: BrowserHostClient,
     ) -> Result<String, BrowserToolError> {
         let BrowserToolCallScope {
-            context,
+            context: _,
             session_id,
             workspace_id,
             call_id,
         } = scope;
-        let execution_id = self.browser_execution_id(context, session_id);
         let browser_session = self.ensure_session(session_id, workspace_id)?;
         if tool_name == "browser_tabs" {
-            if string_arg(arguments, "action")?.as_str() != "list" {
-                self.reclaim_agent_control(&client, &browser_session)
-                    .await?;
-            }
             return self
                 .execute_tabs(arguments, &browser_session, scope, &client)
                 .await;
         }
-        let (tab, view_use) = self
-            .ensure_tab(&browser_session, arguments, &execution_id, &client)
+        let tab = self
+            .ensure_tab(&browser_session, arguments, &client)
             .await?;
-        let host_tab_id = view_use
-            .as_ref()
-            .map(|view| view.host_tab_id().clone())
-            .unwrap_or_else(|| tab.tab_id.clone());
-        if let Some(operation) = browser_devtools_operation(tool_name) {
+        if tool_name == "browser_pwa"
+            && optional_string(arguments, "action").as_deref() != Some("state")
+        {
+            return Err(BrowserToolError::new(
+                "browser_pwa_action_unsupported",
+                "当前内置浏览器只提供 PWA 状态审计，不会创建独立应用窗口或修改系统安装状态",
+            ));
+        }
+        if browser_devtools_operation(tool_name).is_some() {
             return self
                 .execute_devtools_operation(
                     tool_name,
-                    operation,
                     arguments,
                     &browser_session,
                     &tab,
-                    &host_tab_id,
                     scope,
                     &client,
                 )
@@ -267,12 +255,69 @@ impl BrowserToolRuntimeDependencies {
             "browser_viewport" => {
                 let action = string_arg(arguments, "action")?;
                 if action == "get" {
+                    let _control_guard = self.control_lock.lock().await;
+                    let reply = client
+                        .request(BrowserHostCommand::GetLogicalViewport {
+                            tab_id: tab.tab_id.clone(),
+                        })
+                        .await
+                        .map_err(|error| {
+                            BrowserToolError::new("browser_host_disconnected", error.to_string())
+                        })?;
+                    let BrowserHostCommandResult::Json { value } =
+                        succeeded_result(reply.response.outcome, "读取浏览器页面视口失败")?
+                    else {
+                        return Err(BrowserToolError::new(
+                            "browser_result_invalid",
+                            "浏览器页面视口返回结果无效",
+                        ));
+                    };
+                    let logical_viewport = value
+                        .get("viewport")
+                        .cloned()
+                        .ok_or_else(|| {
+                            BrowserToolError::new(
+                                "browser_result_invalid",
+                                "浏览器页面视口缺少运行态视口信息",
+                            )
+                        })
+                        .and_then(|viewport| {
+                            serde_json::from_value::<
+                                magi_browser_authority::BrowserLogicalViewport,
+                            >(viewport)
+                            .map_err(|error| {
+                                BrowserToolError::new(
+                                    "browser_result_invalid",
+                                    format!("浏览器页面视口信息无效: {error}"),
+                                )
+                            })
+                        })?;
+                    let (mode, viewport) = match logical_viewport {
+                        magi_browser_authority::BrowserLogicalViewport::Auto => {
+                            (BrowserViewportMode::Auto, Value::Null)
+                        }
+                        magi_browser_authority::BrowserLogicalViewport::Fixed {
+                            width,
+                            height,
+                            device_scale_factor_millis,
+                            device_type,
+                        } => (
+                            BrowserViewportMode::Fixed,
+                            json!(BrowserViewport {
+                                width,
+                                height,
+                                device_scale_factor_millis,
+                                device_type,
+                            }),
+                        ),
+                    };
                     return Ok(json!({
                         "tool": tool_name,
                         "status": "succeeded",
                         "tab_id": tab.tab_id,
-                        "mode": tab.viewport_mode,
-                        "viewport": tab.viewport,
+                        "mode": mode,
+                        "viewport": viewport,
+                        "surface_slot": value.get("surface_slot").cloned().unwrap_or(Value::Null),
                     })
                     .to_string());
                 }
@@ -309,41 +354,30 @@ impl BrowserToolRuntimeDependencies {
                 let viewport = BrowserViewport {
                     width,
                     height,
-                    device_scale_factor_millis: tab.viewport.device_scale_factor_millis,
+                    device_scale_factor_millis: 1_000,
                     device_type,
                 };
-                if tab.viewport != viewport {
-                    let reply = client
-                        .request(BrowserHostCommand::SetLogicalViewport {
-                            tab_id: host_tab_id.clone(),
-                            viewport: magi_browser_runtime::BrowserLogicalViewport {
-                                width,
-                                height,
-                                device_scale_factor_millis: viewport.device_scale_factor_millis,
-                                device_type: viewport.device_type,
-                            },
-                        })
-                        .await
-                        .map_err(|error| {
-                            BrowserToolError::new("browser_host_disconnected", error.to_string())
-                        })?;
-                    succeeded_result(reply.response.outcome, "调整浏览器页面视口失败")?;
-                }
-                let updated = self.mutate_transient(|authority| {
-                    authority.set_tab_viewport(
-                        &tab.tab_id,
-                        viewport,
-                        BrowserViewportMode::Fixed,
-                        UtcMillis::now(),
-                    )
-                })?;
-                self.publish_tab_event("browser.tab.viewport_changed", &updated);
+                let reply = client
+                    .request(BrowserHostCommand::SetLogicalViewport {
+                        tab_id: tab.tab_id.clone(),
+                        viewport: magi_browser_authority::BrowserLogicalViewport::Fixed {
+                            width,
+                            height,
+                            device_scale_factor_millis: viewport.device_scale_factor_millis,
+                            device_type: viewport.device_type,
+                        },
+                    })
+                    .await
+                    .map_err(|error| {
+                        BrowserToolError::new("browser_host_disconnected", error.to_string())
+                    })?;
+                succeeded_result(reply.response.outcome, "调整浏览器页面视口失败")?;
                 Ok(json!({
                     "tool": tool_name,
                     "status": "succeeded",
-                    "tab_id": updated.tab_id,
-                    "mode": updated.viewport_mode,
-                    "viewport": updated.viewport,
+                    "tab_id": tab.tab_id,
+                    "mode": BrowserViewportMode::Fixed,
+                    "viewport": viewport,
                 })
                 .to_string())
             }
@@ -413,7 +447,7 @@ impl BrowserToolRuntimeDependencies {
                     .await?;
                 let reply = client
                     .request(BrowserHostCommand::Navigate {
-                        tab_id: host_tab_id.clone(),
+                        tab_id: tab.tab_id.clone(),
                         control,
                         navigation,
                     })
@@ -424,9 +458,7 @@ impl BrowserToolRuntimeDependencies {
                 let page = page_state(reply.response.outcome, "浏览器导航失败")?;
                 let updated = self.apply_page_state(&tab.tab_id, page)?;
                 let snapshot = if bool_arg(arguments, "include_snapshot", false) {
-                    let snapshot = self
-                        .capture_snapshot(&client, &tab.tab_id, &host_tab_id, None)
-                        .await?;
+                    let snapshot = self.capture_snapshot(&client, &tab.tab_id, None).await?;
                     Some(browser_tool_snapshot_value(&snapshot, &tab.tab_id))
                 } else {
                     None
@@ -444,7 +476,6 @@ impl BrowserToolRuntimeDependencies {
                     .capture_snapshot(
                         &client,
                         &tab.tab_id,
-                        &host_tab_id,
                         optional_string(arguments, "subtree_ref"),
                     )
                     .await?;
@@ -462,12 +493,12 @@ impl BrowserToolRuntimeDependencies {
                     .await?;
                 let command = match tool_name {
                     "browser_click" => BrowserHostCommand::Click {
-                        tab_id: host_tab_id.clone(),
+                        tab_id: tab.tab_id.clone(),
                         control,
                         target: snapshot_target(arguments)?,
                     },
                     "browser_type" => BrowserHostCommand::Type {
-                        tab_id: host_tab_id.clone(),
+                        tab_id: tab.tab_id.clone(),
                         control,
                         target: snapshot_target(arguments)?,
                         text: string_arg(arguments, "text")?,
@@ -478,12 +509,12 @@ impl BrowserToolRuntimeDependencies {
                         submit_key: optional_string(arguments, "submit_key"),
                     },
                     "browser_press" => BrowserHostCommand::Press {
-                        tab_id: host_tab_id.clone(),
+                        tab_id: tab.tab_id.clone(),
                         control,
                         key: string_arg(arguments, "key")?,
                     },
                     _ => BrowserHostCommand::Scroll {
-                        tab_id: host_tab_id.clone(),
+                        tab_id: tab.tab_id.clone(),
                         control,
                         target: optional_snapshot_target(arguments)?,
                         delta_x: number_arg(arguments, "delta_x").unwrap_or(0.0),
@@ -496,9 +527,7 @@ impl BrowserToolRuntimeDependencies {
                 let page = page_state(reply.response.outcome, "浏览器交互失败")?;
                 let updated = self.apply_page_state(&tab.tab_id, page)?;
                 let snapshot = if bool_arg(arguments, "include_snapshot", false) {
-                    let snapshot = self
-                        .capture_snapshot(&client, &tab.tab_id, &host_tab_id, None)
-                        .await?;
+                    let snapshot = self.capture_snapshot(&client, &tab.tab_id, None).await?;
                     Some(browser_tool_snapshot_value(&snapshot, &tab.tab_id))
                 } else {
                     None
@@ -518,9 +547,9 @@ impl BrowserToolRuntimeDependencies {
                     .map(parse_normalized_rect)
                     .transpose()?;
                 let format = match optional_string(arguments, "format").as_deref() {
-                    None | Some("png") => magi_browser_runtime::BrowserScreenshotFormat::Png,
-                    Some("jpeg") => magi_browser_runtime::BrowserScreenshotFormat::Jpeg,
-                    Some("webp") => magi_browser_runtime::BrowserScreenshotFormat::Webp,
+                    None | Some("png") => magi_browser_authority::BrowserScreenshotFormat::Png,
+                    Some("jpeg") => magi_browser_authority::BrowserScreenshotFormat::Jpeg,
+                    Some("webp") => magi_browser_authority::BrowserScreenshotFormat::Webp,
                     Some(_) => {
                         return Err(BrowserToolError::new(
                             "invalid_screenshot_format",
@@ -541,7 +570,8 @@ impl BrowserToolRuntimeDependencies {
                     })
                     .transpose()?
                     .map(|value| value.min(100));
-                if format == magi_browser_runtime::BrowserScreenshotFormat::Png && quality.is_some()
+                if format == magi_browser_authority::BrowserScreenshotFormat::Png
+                    && quality.is_some()
                 {
                     return Err(BrowserToolError::new(
                         "invalid_screenshot_quality",
@@ -550,7 +580,7 @@ impl BrowserToolRuntimeDependencies {
                 }
                 let reply = client
                     .request(BrowserHostCommand::Screenshot {
-                        tab_id: host_tab_id.clone(),
+                        tab_id: tab.tab_id.clone(),
                         target,
                         clip,
                         full_page: arguments
@@ -576,9 +606,9 @@ impl BrowserToolRuntimeDependencies {
                     BrowserToolError::new("browser_binary_missing", "浏览器截图缺少二进制内容")
                 })?;
                 let extension = match format {
-                    magi_browser_runtime::BrowserScreenshotFormat::Png => "png",
-                    magi_browser_runtime::BrowserScreenshotFormat::Jpeg => "jpg",
-                    magi_browser_runtime::BrowserScreenshotFormat::Webp => "webp",
+                    magi_browser_authority::BrowserScreenshotFormat::Png => "png",
+                    magi_browser_authority::BrowserScreenshotFormat::Jpeg => "jpg",
+                    magi_browser_authority::BrowserScreenshotFormat::Webp => "webp",
                 };
                 let path = self.persist_artifact(session_id, call_id, &bytes, extension)?;
                 Ok(json!({ "tool": tool_name, "status": "succeeded", "path": path, "mime": metadata.mime_type, "bytes": bytes.len(), "sha256": metadata.sha256 }).to_string())
@@ -593,14 +623,15 @@ impl BrowserToolRuntimeDependencies {
     async fn execute_devtools_operation(
         &self,
         tool_name: &str,
-        operation: &str,
         arguments: &Map<String, Value>,
-        browser_session: &magi_browser_runtime::BrowserSession,
-        tab: &magi_browser_runtime::BrowserTab,
-        host_tab_id: &BrowserTabId,
+        browser_session: &magi_browser_authority::BrowserSession,
+        tab: &magi_browser_authority::BrowserTab,
         scope: BrowserToolCallScope<'_>,
         client: &BrowserHostClient,
     ) -> Result<String, BrowserToolError> {
+        let operation = browser_devtools_operation(tool_name).ok_or_else(|| {
+            BrowserToolError::new("unknown_browser_tool", "未知的浏览器 DevTools 工具")
+        })?;
         let action = optional_string(arguments, "action");
         let lighthouse_mode = optional_string(arguments, "mode");
         let requires_write = match operation {
@@ -612,10 +643,6 @@ impl BrowserToolRuntimeDependencies {
             "lighthouse" => !matches!(lighthouse_mode.as_deref(), Some("snapshot")),
             "recording" => true,
             "heap" => matches!(action.as_deref(), Some("take_snapshot")),
-            "extensions" => matches!(
-                action.as_deref(),
-                Some("install" | "reload" | "trigger_action" | "uninstall")
-            ),
             "third_party" | "webmcp" => matches!(action.as_deref(), Some("execute")),
             "pwa" => matches!(action.as_deref(), Some("install" | "launch" | "uninstall")),
             _ => false,
@@ -630,7 +657,7 @@ impl BrowserToolRuntimeDependencies {
         };
         let reply = client
             .request(BrowserHostCommand::Devtools {
-                tab_id: host_tab_id.clone(),
+                tab_id: tab.tab_id.clone(),
                 control,
                 operation: operation.to_string(),
                 arguments: Value::Object(arguments.clone()),
@@ -639,7 +666,7 @@ impl BrowserToolRuntimeDependencies {
             .map_err(|error| {
                 BrowserToolError::new("browser_host_disconnected", error.to_string())
             })?;
-        let BrowserHostCommandResult::Json(value) =
+        let BrowserHostCommandResult::Json { value } =
             succeeded_result(reply.response.outcome, "浏览器 DevTools 工具执行失败")?
         else {
             return Err(BrowserToolError::new(
@@ -649,9 +676,7 @@ impl BrowserToolRuntimeDependencies {
         };
         let snapshot = if bool_arg(arguments, "include_snapshot", false) {
             Some(browser_tool_snapshot_value(
-                &self
-                    .capture_snapshot(client, &tab.tab_id, host_tab_id, None)
-                    .await?,
+                &self.capture_snapshot(client, &tab.tab_id, None).await?,
                 &tab.tab_id,
             ))
         } else {
@@ -669,8 +694,8 @@ impl BrowserToolRuntimeDependencies {
     fn ensure_session(
         &self,
         session_id: &SessionId,
-        workspace_id: &WorkspaceId,
-    ) -> Result<magi_browser_runtime::BrowserSession, BrowserToolError> {
+        workspace_id: Option<&WorkspaceId>,
+    ) -> Result<magi_browser_authority::BrowserSession, BrowserToolError> {
         let current = self
             .authority
             .lock()
@@ -678,7 +703,7 @@ impl BrowserToolRuntimeDependencies {
             .session_for_magi_session(session_id)
             .cloned();
         if let Some(session) = current {
-            if &session.workspace_id != workspace_id {
+            if session.workspace_id.as_ref() != workspace_id {
                 return Err(BrowserToolError::new(
                     "browser_workspace_scope_mismatch",
                     "浏览器会话与当前工作区不匹配",
@@ -692,14 +717,14 @@ impl BrowserToolRuntimeDependencies {
         let session = self.mutate(|authority| {
             authority.create_session(CreateBrowserSession {
                 browser_session_id: browser_session_id.clone(),
-                workspace_id: workspace_id.clone(),
+                workspace_id: workspace_id.cloned(),
                 session_id: session_id.clone(),
                 profile_id: BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID),
                 now: UtcMillis::now(),
             })?;
             authority.transition_session(
                 &browser_session_id,
-                magi_browser_runtime::BrowserSessionLifecycle::Ready,
+                magi_browser_authority::BrowserSessionLifecycle::Ready,
                 UtcMillis::now(),
             )
         })?;
@@ -717,17 +742,10 @@ impl BrowserToolRuntimeDependencies {
 
     async fn ensure_tab(
         &self,
-        session: &magi_browser_runtime::BrowserSession,
+        session: &magi_browser_authority::BrowserSession,
         arguments: &Map<String, Value>,
-        execution_id: &str,
         client: &BrowserHostClient,
-    ) -> Result<
-        (
-            magi_browser_runtime::BrowserTab,
-            Option<crate::state::BrowserViewUse>,
-        ),
-        BrowserToolError,
-    > {
+    ) -> Result<magi_browser_authority::BrowserTab, BrowserToolError> {
         let requested_tab_id = optional_string(arguments, "tab_id").map(BrowserTabId::new);
         let initial_url = "about:blank".to_string();
         validate_browser_navigation_url(&initial_url).map_err(|error| {
@@ -753,9 +771,9 @@ impl BrowserToolRuntimeDependencies {
                 }
                 if !matches!(
                     tab.lifecycle,
-                    magi_browser_runtime::BrowserTabLifecycle::Ready
-                        | magi_browser_runtime::BrowserTabLifecycle::Suspended
-                        | magi_browser_runtime::BrowserTabLifecycle::Crashed
+                    magi_browser_authority::BrowserTabLifecycle::Ready
+                        | magi_browser_authority::BrowserTabLifecycle::Suspended
+                        | magi_browser_authority::BrowserTabLifecycle::Crashed
                 ) {
                     return Err(BrowserToolError::new(
                         "browser_tab_not_ready",
@@ -765,64 +783,44 @@ impl BrowserToolRuntimeDependencies {
                 Some(tab.clone())
             } else {
                 session
-                    .active_tab_id
-                    .as_ref()
-                    .and_then(|id| authority.tab(id).cloned())
+                    .tab_ids
+                    .iter()
+                    .find_map(|id| authority.tab(id).cloned())
                     .filter(|tab| {
                         matches!(
                             tab.lifecycle,
-                            magi_browser_runtime::BrowserTabLifecycle::Ready
-                                | magi_browser_runtime::BrowserTabLifecycle::Suspended
-                                | magi_browser_runtime::BrowserTabLifecycle::Crashed
+                            magi_browser_authority::BrowserTabLifecycle::Ready
+                                | magi_browser_authority::BrowserTabLifecycle::Suspended
+                                | magi_browser_authority::BrowserTabLifecycle::Crashed
                         )
                     })
             }
         };
         if let Some(tab) = tab {
-            match self
-                .browser_views
-                .acquire_worker_target(&tab.tab_id, execution_id)
-            {
-                Ok(Some(view_use)) => return Ok((tab, Some(view_use))),
-                Ok(None) => {}
-                Err(_) => {
-                    return Err(BrowserToolError::recoverable(
-                        "browser_page_reconnected",
-                        "浏览器页面已重新连接，请重新获取快照后继续",
-                    ));
-                }
-            }
-            return Ok((self.materialize_tab(tab, client).await?, None));
+            return self.materialize_tab(tab, client).await;
         }
         let tab_id = BrowserTabId::new(format!(
             "browser-tool-tab-{}-{}",
             UtcMillis::now().0,
             BROWSER_TAB_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        let tab = self.mutate(|authority| {
+        self.mutate(|authority| {
             authority.create_tab(CreateBrowserTab {
                 tab_id: tab_id.clone(),
                 browser_session_id: session.browser_session_id.clone(),
                 url: initial_url.clone(),
-                viewport: BrowserViewport::default(),
                 now: UtcMillis::now(),
             })
         })?;
         let reply = match client
             .request(BrowserHostCommand::CreatePage {
                 tab_id: tab_id.clone(),
+                browser_session_id: session.browser_session_id.clone(),
                 initial_url,
-                viewport: magi_browser_runtime::HostViewport {
-                    width: tab.viewport.width,
-                    height: tab.viewport.height,
-                    surface_width: tab.viewport.width,
-                    surface_height: tab.viewport.height,
-                    device_scale_factor_millis: tab.viewport.device_scale_factor_millis,
-                    device_type: tab.viewport.device_type,
-                },
+                logical_viewport: magi_browser_authority::BrowserLogicalViewport::Auto,
                 navigation_revision: 0,
                 snapshot_revision: 0,
-                allow_streaming_eviction: false,
+                allow_page_eviction: false,
             })
             .await
         {
@@ -843,33 +841,31 @@ impl BrowserToolRuntimeDependencies {
             }
         };
         let tab = self.apply_page_state(&tab_id, page)?;
-        self.browser_views
-            .pin_worker_to_logical(&tab.tab_id, execution_id);
         self.publish_tab_event("browser.tab.created", &tab);
-        Ok((tab, None))
+        Ok(tab)
     }
 
     async fn materialize_tab(
         &self,
-        tab: magi_browser_runtime::BrowserTab,
+        tab: magi_browser_authority::BrowserTab,
         client: &BrowserHostClient,
-    ) -> Result<magi_browser_runtime::BrowserTab, BrowserToolError> {
+    ) -> Result<magi_browser_authority::BrowserTab, BrowserToolError> {
         if !matches!(
             tab.lifecycle,
-            magi_browser_runtime::BrowserTabLifecycle::Ready
-                | magi_browser_runtime::BrowserTabLifecycle::Suspended
-                | magi_browser_runtime::BrowserTabLifecycle::Crashed
+            magi_browser_authority::BrowserTabLifecycle::Ready
+                | magi_browser_authority::BrowserTabLifecycle::Suspended
+                | magi_browser_authority::BrowserTabLifecycle::Crashed
         ) {
             return Err(BrowserToolError::new(
                 "browser_tab_not_ready",
                 "指定的浏览器 Tab 当前不可用",
             ));
         }
-        let tab = if tab.lifecycle == magi_browser_runtime::BrowserTabLifecycle::Crashed {
+        let tab = if tab.lifecycle == magi_browser_authority::BrowserTabLifecycle::Crashed {
             self.mutate(|authority| {
                 authority.transition_tab(
                     &tab.tab_id,
-                    magi_browser_runtime::BrowserTabLifecycle::Suspended,
+                    magi_browser_authority::BrowserTabLifecycle::Suspended,
                     UtcMillis::now(),
                 )
             })?
@@ -879,18 +875,12 @@ impl BrowserToolRuntimeDependencies {
         let reply = client
             .request(BrowserHostCommand::RestorePage {
                 tab_id: tab.tab_id.clone(),
+                browser_session_id: tab.browser_session_id.clone(),
                 initial_url: tab.url.clone(),
-                viewport: magi_browser_runtime::HostViewport {
-                    width: tab.viewport.width,
-                    height: tab.viewport.height,
-                    surface_width: tab.viewport.width,
-                    surface_height: tab.viewport.height,
-                    device_scale_factor_millis: tab.viewport.device_scale_factor_millis,
-                    device_type: tab.viewport.device_type,
-                },
+                logical_viewport: magi_browser_authority::BrowserLogicalViewport::Auto,
                 navigation_revision: tab.navigation_revision,
                 snapshot_revision: tab.snapshot_revision,
-                allow_streaming_eviction: false,
+                allow_page_eviction: false,
             })
             .await
             .map_err(|error| {
@@ -903,14 +893,17 @@ impl BrowserToolRuntimeDependencies {
     async fn prepare_agent_write(
         &self,
         client: &BrowserHostClient,
-        session: &magi_browser_runtime::BrowserSession,
-        tab: &magi_browser_runtime::BrowserTab,
+        session: &magi_browser_authority::BrowserSession,
+        tab: &magi_browser_authority::BrowserTab,
         scope: BrowserToolCallScope<'_>,
     ) -> Result<BrowserHostControl, BrowserToolError> {
         let _control_guard = self.control_lock.lock().await;
-        self.reclaim_agent_control_locked(client, session).await?;
+        // Control is scoped to one physical Surface. There is no session-wide
+        // control mode to reclaim; acquiring the target Surface lease below is
+        // the only authority transition required for an Agent write.
         let (lease, identity, lease_acquired) = self.acquire_or_reuse_lease(
             session,
+            tab,
             scope.context,
             scope.session_id,
             scope.workspace_id,
@@ -922,8 +915,8 @@ impl BrowserToolRuntimeDependencies {
             .validate_write(ValidateBrowserWrite {
                 lease_id: &lease.lease_id,
                 fence: lease.fence,
-                browser_session_id: &session.browser_session_id,
                 tab_id: &tab.tab_id,
+                surface_id: &lease.surface_id,
                 owner: &identity.owner,
                 turn_id: &identity.turn_id,
                 goal_binding: identity.goal_binding.as_ref(),
@@ -934,8 +927,12 @@ impl BrowserToolRuntimeDependencies {
             })?;
         let reply = client
             .request(BrowserHostCommand::UpdateControl {
-                fence: validated.fence,
-                mode: BrowserHostControlMode::Agent,
+                tab_id: tab.tab_id.clone(),
+                surface_id: lease.surface_id.clone(),
+                control: BrowserHostControlUpdate::Agent {
+                    lease_id: lease.lease_id.clone(),
+                    fence: validated.fence,
+                },
             })
             .await
             .map_err(|error| {
@@ -948,8 +945,8 @@ impl BrowserToolRuntimeDependencies {
                 session,
                 json!({
                     "lease_id": lease.lease_id,
-                    "browser_session_id": session.browser_session_id,
-                    "profile_id": session.profile_id,
+                    "tab_id": tab.tab_id,
+                    "surface_id": lease.surface_id,
                     "turn_id": identity.turn_id,
                     "expires_at": lease.expires_at,
                 }),
@@ -961,65 +958,16 @@ impl BrowserToolRuntimeDependencies {
         })
     }
 
-    async fn reclaim_agent_control(
-        &self,
-        client: &BrowserHostClient,
-        session: &magi_browser_runtime::BrowserSession,
-    ) -> Result<(), BrowserToolError> {
-        let _control_guard = self.control_lock.lock().await;
-        self.reclaim_agent_control_locked(client, session).await
-    }
-
-    async fn reclaim_agent_control_locked(
-        &self,
-        client: &BrowserHostClient,
-        session: &magi_browser_runtime::BrowserSession,
-    ) -> Result<(), BrowserToolError> {
-        let control = self.mutate(|authority| {
-            let current = authority.profile_control_snapshot(&session.profile_id)?;
-            if current.mode == magi_browser_runtime::BrowserProfileControlMode::Agent {
-                return Ok(None);
-            }
-            authority.release_user_control(&session.profile_id)?;
-            Ok(Some(
-                authority.profile_control_snapshot(&session.profile_id)?,
-            ))
-        })?;
-        let Some(control) = control else {
-            return Ok(());
-        };
-        let reply = client
-            .request(BrowserHostCommand::UpdateControl {
-                fence: control.fence,
-                mode: BrowserHostControlMode::Agent,
-            })
-            .await
-            .map_err(|error| {
-                BrowserToolError::new("browser_host_disconnected", error.to_string())
-            })?;
-        succeeded_result(reply.response.outcome, "恢复浏览器代理控制权失败")?;
-        self.publish_browser_event(
-            "browser.control.changed",
-            session,
-            json!({
-                "browser_session_id": session.browser_session_id,
-                "profile_id": session.profile_id,
-                "mode": control.mode,
-                "fence": control.fence,
-            }),
-        );
-        Ok(())
-    }
-
     fn acquire_or_reuse_lease(
         &self,
-        session: &magi_browser_runtime::BrowserSession,
+        _session: &magi_browser_authority::BrowserSession,
+        tab: &magi_browser_authority::BrowserTab,
         context: &magi_tool_runtime::ToolExecutionContext,
         session_id: &SessionId,
-        workspace_id: &WorkspaceId,
+        workspace_id: Option<&WorkspaceId>,
     ) -> Result<
         (
-            magi_browser_runtime::BrowserControlLease,
+            magi_browser_authority::BrowserControlLease,
             BrowserExecutionIdentity,
             bool,
         ),
@@ -1030,14 +978,14 @@ impl BrowserToolRuntimeDependencies {
             .execution_ownership(session_id)
             .unwrap_or(ExecutionOwnership {
                 session_id: Some(session_id.clone()),
-                workspace_id: Some(workspace_id.clone()),
+                workspace_id: workspace_id.cloned(),
                 mission_id: None,
                 task_id: context.task_id.clone(),
                 worker_id: context.worker_id.clone(),
                 execution_chain_ref: None,
             });
         ownership.session_id = Some(session_id.clone());
-        ownership.workspace_id = Some(workspace_id.clone());
+        ownership.workspace_id = workspace_id.cloned();
         if context.task_id.is_some() {
             ownership.task_id = context.task_id.clone();
         }
@@ -1063,8 +1011,17 @@ impl BrowserToolRuntimeDependencies {
             .authority
             .lock()
             .expect("browser authority lock poisoned");
+        let surface_id = authority
+            .primary_surface(&tab.tab_id)
+            .map(|surface| surface.surface_id.clone())
+            .ok_or_else(|| {
+                BrowserToolError::new(
+                    "browser_surface_unavailable",
+                    "浏览器 Tab 尚未绑定可控制的真实 Browser Surface",
+                )
+            })?;
         if let Some(lease) = authority
-            .active_lease_for_profile(&session.profile_id)
+            .active_lease_for_surface(&tab.tab_id, &surface_id)
             .cloned()
         {
             if lease.owner.session_id == ownership.session_id
@@ -1088,7 +1045,7 @@ impl BrowserToolRuntimeDependencies {
             } else {
                 return Err(BrowserToolError::new(
                     "browser_control_lease_conflict",
-                    "浏览器 Profile 当前由另一个执行者控制",
+                    "当前浏览器 Surface 正由另一个执行者控制",
                 ));
             }
         }
@@ -1099,8 +1056,8 @@ impl BrowserToolRuntimeDependencies {
                     now.0,
                     BROWSER_LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
                 )),
-                profile_id: session.profile_id.clone(),
-                browser_session_id: session.browser_session_id.clone(),
+                tab_id: tab.tab_id.clone(),
+                surface_id,
                 owner: ownership,
                 turn_id,
                 goal_binding,
@@ -1141,28 +1098,8 @@ impl BrowserToolRuntimeDependencies {
     fn mutate<T>(
         &self,
         mutation: impl FnOnce(
-            &mut magi_browser_runtime::BrowserAuthority,
-        ) -> Result<T, magi_browser_runtime::BrowserAuthorityError>,
-    ) -> Result<T, BrowserToolError> {
-        self.mutate_with_persistence(true, mutation)
-    }
-
-    /// 浏览器视口属于当前 Browser Tab 的运行态，不得写入会话持久状态。
-    fn mutate_transient<T>(
-        &self,
-        mutation: impl FnOnce(
-            &mut magi_browser_runtime::BrowserAuthority,
-        ) -> Result<T, magi_browser_runtime::BrowserAuthorityError>,
-    ) -> Result<T, BrowserToolError> {
-        self.mutate_with_persistence(false, mutation)
-    }
-
-    fn mutate_with_persistence<T>(
-        &self,
-        persist: bool,
-        mutation: impl FnOnce(
-            &mut magi_browser_runtime::BrowserAuthority,
-        ) -> Result<T, magi_browser_runtime::BrowserAuthorityError>,
+            &mut magi_browser_authority::BrowserAuthority,
+        ) -> Result<T, magi_browser_authority::BrowserAuthorityError>,
     ) -> Result<T, BrowserToolError> {
         if !self
             .state_writable
@@ -1182,7 +1119,7 @@ impl BrowserToolRuntimeDependencies {
         let value = mutation(&mut candidate).map_err(|error| {
             BrowserToolError::new("browser_authority_rejected", error.to_string())
         })?;
-        if persist && let Some(persistence) = self.persistence.as_ref() {
+        if let Some(persistence) = self.persistence.as_ref() {
             let state_root = persistence.state_root().ok_or_else(|| {
                 BrowserToolError::new(
                     "browser_state_persist_failed",
@@ -1211,8 +1148,8 @@ impl BrowserToolRuntimeDependencies {
     fn apply_page_state(
         &self,
         tab_id: &BrowserTabId,
-        page: magi_browser_runtime::BrowserHostPageState,
-    ) -> Result<magi_browser_runtime::BrowserTab, BrowserToolError> {
+        page: magi_browser_authority::BrowserHostPageState,
+    ) -> Result<magi_browser_authority::BrowserTab, BrowserToolError> {
         let current = self
             .authority
             .lock()
@@ -1220,7 +1157,7 @@ impl BrowserToolRuntimeDependencies {
             .tab(tab_id)
             .cloned();
         if let Some(current) = current
-            && current.lifecycle == magi_browser_runtime::BrowserTabLifecycle::Ready
+            && current.lifecycle == magi_browser_authority::BrowserTabLifecycle::Ready
             && current.navigation_revision == page.navigation_revision
             && current.url == page.url
             && current.origin == page.origin
@@ -1231,7 +1168,7 @@ impl BrowserToolRuntimeDependencies {
         let tab = self.mutate(|authority| {
             authority.transition_tab(
                 tab_id,
-                magi_browser_runtime::BrowserTabLifecycle::Ready,
+                magi_browser_authority::BrowserTabLifecycle::Ready,
                 UtcMillis::now(),
             )?;
             authority.apply_host_page_state(
@@ -1250,13 +1187,12 @@ impl BrowserToolRuntimeDependencies {
     async fn capture_snapshot(
         &self,
         client: &BrowserHostClient,
-        logical_tab_id: &BrowserTabId,
-        host_tab_id: &BrowserTabId,
+        tab_id: &BrowserTabId,
         subtree_ref: Option<String>,
-    ) -> Result<magi_browser_runtime::BrowserHostSnapshot, BrowserToolError> {
+    ) -> Result<magi_browser_authority::BrowserHostSnapshot, BrowserToolError> {
         let reply = client
             .request(BrowserHostCommand::Snapshot {
-                tab_id: host_tab_id.clone(),
+                tab_id: tab_id.clone(),
                 limits: Default::default(),
                 subtree_ref,
             })
@@ -1272,7 +1208,7 @@ impl BrowserToolRuntimeDependencies {
                 "浏览器快照结果无效",
             ));
         };
-        self.apply_snapshot_revision(logical_tab_id, snapshot.snapshot_revision)?;
+        self.apply_snapshot_revision(tab_id, snapshot.snapshot_revision)?;
         Ok(snapshot)
     }
 
@@ -1280,7 +1216,7 @@ impl BrowserToolRuntimeDependencies {
         let crashed = self.mutate(|authority| {
             authority.transition_tab(
                 tab_id,
-                magi_browser_runtime::BrowserTabLifecycle::Crashed,
+                magi_browser_authority::BrowserTabLifecycle::Crashed,
                 UtcMillis::now(),
             )
         });
@@ -1342,7 +1278,7 @@ impl BrowserToolRuntimeDependencies {
     async fn execute_tabs(
         &self,
         arguments: &Map<String, Value>,
-        session: &magi_browser_runtime::BrowserSession,
+        session: &magi_browser_authority::BrowserSession,
         scope: BrowserToolCallScope<'_>,
         client: &BrowserHostClient,
     ) -> Result<String, BrowserToolError> {
@@ -1358,7 +1294,9 @@ impl BrowserToolRuntimeDependencies {
                 .filter_map(|id| authority.tab(id))
                 .cloned()
                 .collect::<Vec<_>>();
-            return Ok(json!({ "tool": "browser_tabs", "status": "succeeded", "tabs": tabs, "active_tab_id": session.active_tab_id }).to_string());
+            return Ok(
+                json!({ "tool": "browser_tabs", "status": "succeeded", "tabs": tabs }).to_string(),
+            );
         }
         match action.as_str() {
             "new" => {
@@ -1375,30 +1313,23 @@ impl BrowserToolRuntimeDependencies {
                     UtcMillis::now().0,
                     BROWSER_TAB_SEQUENCE.fetch_add(1, Ordering::Relaxed)
                 ));
-                let created = self.mutate(|authority| {
+                self.mutate(|authority| {
                     authority.create_tab(CreateBrowserTab {
                         tab_id: tab_id.clone(),
                         browser_session_id: session.browser_session_id.clone(),
                         url: initial_url.clone(),
-                        viewport: BrowserViewport::default(),
                         now: UtcMillis::now(),
                     })
                 })?;
                 let reply = match client
                     .request(BrowserHostCommand::CreatePage {
                         tab_id: tab_id.clone(),
+                        browser_session_id: session.browser_session_id.clone(),
                         initial_url,
-                        viewport: magi_browser_runtime::HostViewport {
-                            width: created.viewport.width,
-                            height: created.viewport.height,
-                            surface_width: created.viewport.width,
-                            surface_height: created.viewport.height,
-                            device_scale_factor_millis: created.viewport.device_scale_factor_millis,
-                            device_type: created.viewport.device_type,
-                        },
+                        logical_viewport: magi_browser_authority::BrowserLogicalViewport::Auto,
                         navigation_revision: 0,
                         snapshot_revision: 0,
-                        allow_streaming_eviction: false,
+                        allow_page_eviction: false,
                     })
                     .await
                 {
@@ -1432,53 +1363,40 @@ impl BrowserToolRuntimeDependencies {
                     .await?;
                 self.prepare_agent_write(client, session, &target, scope)
                     .await?;
-                let updated = self.mutate(|authority| {
-                    authority.set_active_tab(&session.browser_session_id, &tab_id, UtcMillis::now())
-                })?;
                 self.publish_browser_event(
                     "browser.tab.activated",
-                    &updated,
+                    session,
                     json!({
-                        "browser_session_id": updated.browser_session_id,
+                        "browser_session_id": session.browser_session_id,
                         "tab_id": tab_id,
-                        "revision": updated.revision,
                     }),
                 );
-                Ok(json!({ "tool": "browser_tabs", "status": "succeeded", "active_tab_id": updated.active_tab_id }).to_string())
+                Ok(
+                    json!({ "tool": "browser_tabs", "status": "succeeded", "tab_id": tab_id })
+                        .to_string(),
+                )
             }
             "close" => {
                 let tab_id = BrowserTabId::new(string_arg(arguments, "tab_id")?);
                 let _target = tab_in_session(self, session, &tab_id)?;
-                let view_bindings = self.browser_views.remove_for_tab(&tab_id);
-                let mut host_tab_ids = Vec::with_capacity(view_bindings.len() + 1);
-                for binding in view_bindings {
-                    binding.wait_until_idle().await;
-                    host_tab_ids.push(binding.host_tab_id);
-                }
-                host_tab_ids.push(tab_id.clone());
-                let mut close_error = None;
-                for host_tab_id in host_tab_ids {
-                    if let Err(error) = client
-                        .request(BrowserHostCommand::ClosePage {
-                            tab_id: host_tab_id,
-                        })
-                        .await
-                    {
-                        close_error.get_or_insert_with(|| {
-                            BrowserToolError::new("browser_host_disconnected", error.to_string())
-                        });
-                    }
-                }
+                let close_result = client
+                    .request(BrowserHostCommand::ClosePage {
+                        tab_id: tab_id.clone(),
+                    })
+                    .await;
                 let closed = self.mutate(|authority| {
                     authority.transition_tab(
                         &tab_id,
-                        magi_browser_runtime::BrowserTabLifecycle::Closed,
+                        magi_browser_authority::BrowserTabLifecycle::Closed,
                         UtcMillis::now(),
                     )
                 })?;
                 self.publish_tab_event("browser.tab.closed", &closed);
-                if let Some(error) = close_error {
-                    return Err(error);
+                if let Err(error) = close_result {
+                    return Err(BrowserToolError::new(
+                        "browser_host_disconnected",
+                        error.to_string(),
+                    ));
                 }
                 Ok(json!({ "tool": "browser_tabs", "status": "succeeded", "closed_tab_id": tab_id }).to_string())
             }
@@ -1505,9 +1423,7 @@ fn browser_devtools_operation(tool_name: &str) -> Option<&'static str> {
         "browser_emulate" => Some("emulate"),
         "browser_performance" => Some("performance"),
         "browser_lighthouse" => Some("lighthouse"),
-        "browser_screencast" => Some("recording"),
         "browser_heap" => Some("heap"),
-        "browser_extensions" => Some("extensions"),
         "browser_third_party" => Some("third_party"),
         "browser_webmcp" => Some("webmcp"),
         "browser_pwa" => Some("pwa"),
@@ -1517,9 +1433,9 @@ fn browser_devtools_operation(tool_name: &str) -> Option<&'static str> {
 
 fn tab_in_session(
     runtime: &BrowserToolRuntimeDependencies,
-    session: &magi_browser_runtime::BrowserSession,
+    session: &magi_browser_authority::BrowserSession,
     tab_id: &BrowserTabId,
-) -> Result<magi_browser_runtime::BrowserTab, BrowserToolError> {
+) -> Result<magi_browser_authority::BrowserTab, BrowserToolError> {
     let authority = runtime
         .authority
         .lock()
@@ -1564,7 +1480,6 @@ fn browser_tool_requested_access(
             | BrowserToolKind::Performance
             | BrowserToolKind::Lighthouse
             | BrowserToolKind::Heap
-            | BrowserToolKind::Extensions
             | BrowserToolKind::ThirdParty
             | BrowserToolKind::WebMcp
             | BrowserToolKind::Pwa
@@ -1582,7 +1497,6 @@ fn browser_tool_requested_access(
                     | "object_details" | "retainers" | "retaining_paths",
                 ),
             )
-            | (BrowserToolKind::Extensions, Some("list"))
             | (BrowserToolKind::ThirdParty, Some("list"))
             | (BrowserToolKind::WebMcp, Some("list"))
             | (BrowserToolKind::Pwa, Some("state")) => BrowserToolAccess::Read,
@@ -1635,13 +1549,6 @@ impl BrowserToolError {
             requires_user_action: false,
             details: None,
             status: ExecutionResultStatus::Failed,
-        }
-    }
-
-    fn recoverable(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            recoverable: true,
-            ..Self::new(code, message)
         }
     }
 
@@ -1786,7 +1693,7 @@ fn optional_snapshot_target(
 
 fn parse_normalized_rect(
     value: &Value,
-) -> Result<magi_browser_runtime::BrowserNormalizedRect, BrowserToolError> {
+) -> Result<magi_browser_authority::BrowserNormalizedRect, BrowserToolError> {
     let object = value.as_object().ok_or_else(|| {
         BrowserToolError::new(
             "invalid_screenshot_clip",
@@ -1805,7 +1712,7 @@ fn parse_normalized_rect(
                 )
             })
     };
-    let rect = magi_browser_runtime::BrowserNormalizedRect {
+    let rect = magi_browser_authority::BrowserNormalizedRect {
         x: number("x")?,
         y: number("y")?,
         width: number("width")?,
@@ -1845,7 +1752,7 @@ fn succeeded_result(
 fn page_state(
     outcome: BrowserHostCommandOutcome,
     context: &str,
-) -> Result<magi_browser_runtime::BrowserHostPageState, BrowserToolError> {
+) -> Result<magi_browser_authority::BrowserHostPageState, BrowserToolError> {
     match succeeded_result(outcome, context)? {
         BrowserHostCommandResult::PageState(page) => Ok(page),
         _ => Err(BrowserToolError::new("browser_result_invalid", context)),
@@ -1884,11 +1791,11 @@ fn browser_tool_snapshot_value(
     const PRIORITY_BUDGETS: [usize; 7] = [4, 16, 20, 28, 12, 12, 4];
     let mut selected = Vec::with_capacity(MODEL_SNAPSHOT_ELEMENT_LIMIT);
     let mut selected_refs = HashSet::new();
-    for priority in 0..PRIORITY_BUDGETS.len() {
+    for (priority, budget) in PRIORITY_BUDGETS.iter().copied().enumerate() {
         for node in nodes
             .iter()
             .filter(|node| snapshot_node_priority(node) == priority as u8)
-            .take(PRIORITY_BUDGETS[priority])
+            .take(budget)
         {
             if selected.len() >= MODEL_SNAPSHOT_ELEMENT_LIMIT {
                 break;
@@ -2039,10 +1946,10 @@ fn block_on<F: Future>(future: F) -> F::Output {
 mod tests {
     use std::sync::{Arc, Mutex, RwLock, atomic::AtomicBool};
 
-    use magi_browser_runtime::{
+    use magi_browser_authority::{
         BrowserAuthority, BrowserHostPageState, BrowserHostRect, BrowserHostSnapshot,
         BrowserProfile, BrowserProfileKind, BrowserSessionLifecycle, BrowserSnapshotNode,
-        BrowserViewport, CreateBrowserSession, CreateBrowserTab,
+        CreateBrowserSession, CreateBrowserTab,
     };
     use magi_core::{
         BrowserProfileId, BrowserSessionId, BrowserTabId, SessionId, UtcMillis, WorkspaceId,
@@ -2053,7 +1960,7 @@ mod tests {
     use super::{
         BrowserToolRuntimeDependencies, DEFAULT_BROWSER_PROFILE_ID, browser_tool_snapshot_value,
     };
-    use crate::state::{BrowserRuntimeStatusSnapshot, BrowserViewRegistry};
+    use crate::state::BrowserHostStatusSnapshot;
 
     #[test]
     fn ensuring_browser_session_does_not_implicitly_create_page() {
@@ -2075,23 +1982,21 @@ mod tests {
             write_lock: Arc::new(Mutex::new(())),
             control_lock: Arc::new(tokio::sync::Mutex::new(())),
             state_writable: Arc::new(AtomicBool::new(true)),
-            runtime_status: Arc::new(RwLock::new(BrowserRuntimeStatusSnapshot::default())),
+            host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             host_client: Arc::new(RwLock::new(None)),
             event_bus: Arc::clone(&event_bus),
             session_store: Arc::new(SessionStore::new()),
             persistence: None,
-            browser_views: Arc::new(BrowserViewRegistry::default()),
         };
         let session_id = SessionId::new("session-browser-tabs-list");
         let workspace_id = WorkspaceId::new("workspace-browser-tabs-list");
 
         let created = runtime
-            .ensure_session(&session_id, &workspace_id)
+            .ensure_session(&session_id, Some(&workspace_id))
             .expect("browser session should create");
         assert!(created.tab_ids.is_empty());
-        assert!(created.active_tab_id.is_none());
         let existing = runtime
-            .ensure_session(&session_id, &workspace_id)
+            .ensure_session(&session_id, Some(&workspace_id))
             .expect("browser session should be idempotent");
         assert_eq!(existing.browser_session_id, created.browser_session_id);
         assert!(existing.tab_ids.is_empty());
@@ -2127,7 +2032,7 @@ mod tests {
         authority
             .create_session(CreateBrowserSession {
                 browser_session_id: browser_session_id.clone(),
-                workspace_id,
+                workspace_id: Some(workspace_id),
                 session_id,
                 profile_id: BrowserProfileId::new(DEFAULT_BROWSER_PROFILE_ID),
                 now: UtcMillis(2),
@@ -2145,7 +2050,6 @@ mod tests {
                 tab_id: tab_id.clone(),
                 browser_session_id,
                 url: "about:blank".to_string(),
-                viewport: BrowserViewport::default(),
                 now: UtcMillis(4),
             })
             .expect("browser tab should create");
@@ -2155,12 +2059,11 @@ mod tests {
             write_lock: Arc::new(Mutex::new(())),
             control_lock: Arc::new(tokio::sync::Mutex::new(())),
             state_writable: Arc::new(AtomicBool::new(true)),
-            runtime_status: Arc::new(RwLock::new(BrowserRuntimeStatusSnapshot::default())),
+            host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             host_client: Arc::new(RwLock::new(None)),
             event_bus: Arc::clone(&event_bus),
             session_store: Arc::new(SessionStore::new()),
             persistence: None,
-            browser_views: Arc::new(BrowserViewRegistry::default()),
         };
         let page = BrowserHostPageState {
             tab_id: tab_id.clone(),
@@ -2268,12 +2171,11 @@ mod tests {
             write_lock: Arc::new(Mutex::new(())),
             control_lock: Arc::new(tokio::sync::Mutex::new(())),
             state_writable: Arc::new(AtomicBool::new(true)),
-            runtime_status: Arc::new(RwLock::new(BrowserRuntimeStatusSnapshot::default())),
+            host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
             host_client: Arc::new(RwLock::new(None)),
             event_bus,
             session_store: Arc::new(SessionStore::new()),
             persistence: None,
-            browser_views: Arc::new(BrowserViewRegistry::default()),
         };
         let session_id = SessionId::new("session-browser-execution-id");
 

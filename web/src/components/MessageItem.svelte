@@ -358,6 +358,7 @@
   });
 
   const messageImages = $derived(message.images || []);
+  const hasUserText = $derived(Boolean(message.content?.trim()));
   const messageContextReferences = $derived(message.contextReferences || []);
   const messageBrowserAnnotationRefs = $derived(message.browserAnnotationRefs || []);
 
@@ -477,13 +478,15 @@
         {/each}
       </div>
     {/if}
-    <div class="user-row">
-      <div class="user-content">
-        <div class="user-plain-content">
-          <MarkdownContent content={message.content || ''} isStreaming={false} {filePreviewScope} />
+    {#if hasUserText}
+      <div class="user-row">
+        <div class="user-content">
+          <div class="user-plain-content">
+            <MarkdownContent content={message.content || ''} isStreaming={false} {filePreviewScope} />
+          </div>
         </div>
       </div>
-    </div>
+    {/if}
     <div class="user-time">
       {#if isSupplementary}<span class="supplementary-tag">{i18n.t('messageItem.supplementaryTag')}</span>{/if}
       <span class="user-timestamp">{formatTraceableTime(message.timestamp)}</span>

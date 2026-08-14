@@ -1,5 +1,5 @@
 use crate::state::ApiState;
-use magi_browser_runtime::BrowserLeaseEndReason;
+use magi_browser_authority::BrowserLeaseEndReason;
 use magi_conversation_runtime::session_writeback::SessionStatePersistCallback;
 use magi_core::{SessionId, TaskId, public_runtime_excerpt};
 use std::sync::{Arc, Condvar, Mutex};

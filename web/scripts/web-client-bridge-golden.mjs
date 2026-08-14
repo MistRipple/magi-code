@@ -1,5 +1,16 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { withGoldenViteServer } from './golden-vite.mjs';
+
+const dataMessageHandlersSource = await readFile(
+  new URL('../src/lib/data-message-handlers.ts', import.meta.url),
+  'utf8',
+);
+assert.match(
+  dataMessageHandlersSource,
+  /case 'sessionBootstrapLoaded':[\s\S]*?handleSessionBootstrapLoaded\(asMessage\(\{[\s\S]*?scope: payload\.scope,/,
+  'session bootstrap dispatch must preserve workspace or personal scope for navigation settlement',
+);
 
 const WORKSPACE_ID = 'workspace-bridge-live-adopt';
 const WORKSPACE_PATH = '/tmp/workspace-bridge-live-adopt';
@@ -109,7 +120,7 @@ function installBrowserGlobals() {
   };
   const windowObject = {
     location: {
-      href: `http://127.0.0.1:38123/web.html?workspaceId=${encodeURIComponent(WORKSPACE_ID)}&workspacePath=${encodeURIComponent(WORKSPACE_PATH)}`,
+      href: `http://127.0.0.1:38123/web.html?scope=workspace&workspaceId=${encodeURIComponent(WORKSPACE_ID)}&workspacePath=${encodeURIComponent(WORKSPACE_PATH)}`,
     },
     history: {
       state: null,
@@ -282,6 +293,7 @@ function scopedBootstrapPayloadWithPendingChange(workspaceId, workspacePath, ses
 
 function settingsBootstrapPayload() {
   return {
+    scope: 'workspace',
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
     sessionId: '',
@@ -396,7 +408,7 @@ function installFetchStub() {
         canonicalTurns: [],
       });
     }
-    if (parsed.pathname === '/api/workspaces/sessions/viewed') {
+    if (parsed.pathname === '/api/session/viewed') {
       const body = JSON.parse(String(init.body || '{}'));
       return jsonResponse({
         runtimeEpoch: RUNTIME_EPOCH,
@@ -872,7 +884,7 @@ await withGoldenViteServer(async (server) => {
   await waitFor(() => FakeEventSource.instances.length > 0, 'bootstrap must connect workspace-scoped SSE');
   const stream = FakeEventSource.instances[0];
   assert.ok(
-    stream.url.includes(`/events?workspaceId=${encodeURIComponent(WORKSPACE_ID)}`),
+    stream.url.includes(`/events?scope=workspace&workspaceId=${encodeURIComponent(WORKSPACE_ID)}`),
     'event stream must subscribe by workspace scope',
   );
   stream.onopen?.();
@@ -911,6 +923,7 @@ await withGoldenViteServer(async (server) => {
       usageRatio: 24_000 / 272_000,
       warningLevel: 'normal',
       measurement: 'estimated',
+      projectedRequestTokens: 24_000,
       phase: 'streaming',
       updatedAt: ACCEPTED_AT + 2,
       eventSequence: 3,
@@ -1158,6 +1171,7 @@ await withGoldenViteServer(async (server) => {
   bridge.postMessage({
     type: 'navigateSession',
     target: 'draft',
+    scope: 'workspace',
     requestId: 'navigation-draft-from-current-session',
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
@@ -1185,6 +1199,7 @@ await withGoldenViteServer(async (server) => {
   bridge.postMessage({
     type: 'navigateSession',
     target: 'draft',
+    scope: 'workspace',
     requestId: 'navigation-reopen-current-draft',
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
@@ -1210,6 +1225,7 @@ await withGoldenViteServer(async (server) => {
   bridge.postMessage({
     type: 'navigateSession',
     target: 'draft',
+    scope: 'workspace',
     requestId: 'navigation-idempotent-workspace-draft',
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
@@ -1280,6 +1296,7 @@ await withGoldenViteServer(async (server) => {
   bridge.postMessage({
     type: 'navigateSession',
     target: 'session',
+    scope: 'workspace',
     requestId: 'navigation-back-to-current-session',
     sessionId: SESSION_ID,
     workspaceId: WORKSPACE_ID,
@@ -1584,6 +1601,7 @@ await withGoldenViteServer(async (server) => {
   bridge.postMessage({
     type: 'navigateSession',
     target: 'session',
+    scope: 'workspace',
     requestId: 'navigation-restore-authoritative-bootstrap',
     sessionId: SESSION_ID,
     workspaceId: WORKSPACE_ID,
@@ -1656,6 +1674,7 @@ await withGoldenViteServer(async (server) => {
   bridge.postMessage({
     type: 'navigateSession',
     target: 'session',
+    scope: 'workspace',
     requestId: 'navigation-foreground-running-session',
     sessionId: SESSION_ID,
     workspaceId: WORKSPACE_ID,
@@ -1871,6 +1890,7 @@ await withGoldenViteServer(async (server) => {
   bridge.postMessage({
     type: 'navigateSession',
     target: 'draft',
+    scope: 'workspace',
     requestId: 'navigation-clear-stale-url',
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
@@ -2098,6 +2118,7 @@ await withGoldenViteServer(async (server) => {
     bridge.postMessage({
       type: 'navigateSession',
       target: 'session',
+      scope: 'workspace',
       requestId: 'navigation-bootstrap-race-latest',
       workspaceId: RACE_WORKSPACE_ID,
       workspacePath: RACE_WORKSPACE_PATH,
@@ -2136,6 +2157,7 @@ await withGoldenViteServer(async (server) => {
   bridge.postMessage({
     type: 'navigateSession',
     target: 'session',
+    scope: 'workspace',
     requestId: 'navigation-missing-session',
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,
@@ -2176,6 +2198,7 @@ await withGoldenViteServer(async (server) => {
   bridge.postMessage({
     type: 'navigateSession',
     target: 'session',
+    scope: 'workspace',
     requestId: 'navigation-after-stale-empty-bootstrap',
     workspaceId: WORKSPACE_ID,
     workspacePath: WORKSPACE_PATH,

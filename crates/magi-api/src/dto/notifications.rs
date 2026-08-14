@@ -75,7 +75,8 @@ pub struct NotificationCenterSnapshotDto {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationsResponseDto {
-    pub workspace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     pub notifications: NotificationCenterSnapshotDto,
@@ -83,7 +84,7 @@ pub struct NotificationsResponseDto {
 
 impl NotificationsResponseDto {
     pub fn from_records(
-        workspace_id: String,
+        workspace_id: Option<String>,
         session_id: Option<&SessionId>,
         records: Vec<NotificationRecord>,
     ) -> Self {

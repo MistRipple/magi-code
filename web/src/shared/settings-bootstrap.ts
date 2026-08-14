@@ -58,17 +58,8 @@ export interface VisionBuiltinTextModelRule {
   examples: string[];
 }
 
-export interface VisionRoutingPreview {
-  model: string;
-  matched: boolean;
-  source: 'builtin' | 'custom' | null;
-  ruleId: string | null;
-  ruleName: string | null;
-  matchMode: 'exact' | 'regex' | null;
-  pattern: string | null;
-}
-
 export interface SettingsBootstrapPayload {
+  scope: 'personal' | 'workspace';
   workspaceId?: string | null;
   workspacePath?: string | null;
   sessionId?: string | null;

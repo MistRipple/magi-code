@@ -263,6 +263,11 @@ assert.match(
 );
 assert.doesNotMatch(
   headerSource,
+  /\{#if\s+showRightPaneToggle\}/,
+  '右栏开关不能依赖会话或文件加载后才渲染',
+);
+assert.doesNotMatch(
+  headerSource,
   /class:active=\{!currentRightPane\.collapsed\}/,
   '右栏开关只负责展开和折叠，不得因面板已展开而持续显示选中态',
 );

@@ -33,7 +33,7 @@ pub(super) async fn accept_session_task_submission(
     state: &ApiState,
     request: &SessionTurnRequestDto,
     images: Vec<SessionTurnImage>,
-    workspace_id: WorkspaceId,
+    workspace_id: Option<WorkspaceId>,
     task_title: Option<String>,
     execution_goal: Option<String>,
     task_tier: TaskTier,
@@ -59,7 +59,7 @@ pub(super) async fn accept_session_task_submission(
 
 pub(super) struct SessionTaskSubmissionInput {
     pub images: Vec<SessionTurnImage>,
-    pub workspace_id: WorkspaceId,
+    pub workspace_id: Option<WorkspaceId>,
     pub task_title: Option<String>,
     pub execution_goal: Option<String>,
     pub task_tier: TaskTier,
@@ -138,6 +138,11 @@ pub(super) async fn accept_goal_continuation_task_submission(
     execution_goal: String,
     accepted_at: UtcMillis,
 ) -> Result<DispatchSubmissionAccepted, ApiError> {
+    let execution_root = if workspace_id.is_none() {
+        Some(state.personal_session_execution_root(&session_id)?)
+    } else {
+        None
+    };
     state
         .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
         .await?;
@@ -152,6 +157,7 @@ pub(super) async fn accept_goal_continuation_task_submission(
         accepted_at,
         session_id: session_id.clone(),
         workspace_id,
+        execution_root,
         entry_id,
         timeline_message: format!("目标自动推进: {}", goal.objective),
         images: Vec::new(),
@@ -187,7 +193,7 @@ pub(super) async fn accept_goal_continuation_task_submission(
 
 struct ExecuteDispatchSubmissionInput<'a> {
     requested_session_id: Option<SessionId>,
-    requested_workspace_id: WorkspaceId,
+    requested_workspace_id: Option<WorkspaceId>,
     mission_title: String,
     message: String,
     trimmed_text: Option<String>,
@@ -263,7 +269,7 @@ async fn execute_dispatch_submission(
     let (session_id, created_session, workspace_id) = resolve_dispatch_session(
         state,
         requested_session_id,
-        Some(requested_workspace_id),
+        requested_workspace_id,
         placeholder_title,
         accepted_at,
     )?;
@@ -279,6 +285,14 @@ async fn execute_dispatch_submission(
         )?;
         super::settings::require_orchestrator_session_model(state, &session_id)?;
     }
+    let execution_root = workspace_id
+        .as_ref()
+        .and_then(|workspace_id| state.workspace_root_path(&Some(workspace_id.clone())))
+        .or(if workspace_id.is_none() {
+            Some(state.personal_session_execution_root(&session_id)?)
+        } else {
+            None
+        });
     state
         .ensure_snapshot_session_for_workspace_id(&session_id, &workspace_id)
         .await?;
@@ -316,6 +330,7 @@ async fn execute_dispatch_submission(
         accepted_at,
         session_id: session_id.clone(),
         workspace_id: workspace_id.clone(),
+        execution_root,
         entry_id: user_timeline_entry_id,
         timeline_message: message.clone(),
         images,

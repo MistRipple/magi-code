@@ -366,6 +366,7 @@ export async function fetchAgentRunProjection(
     const projection = await client.getAgentRunProjection(
       rootTaskId,
       normalizedSessionId,
+      normalizedWorkspaceId ? 'workspace' : 'personal',
       normalizedWorkspaceId,
       normalizedWorkspacePath,
       controller.signal,
@@ -508,6 +509,7 @@ export async function performAgentRunAction(
       operationId: agentRunActionOperationId(action),
       taskId: normalizedRootTaskId,
       sessionId: normalizedSessionId,
+      scope: normalizedWorkspaceId ? 'workspace' : 'personal',
       workspaceId: normalizedWorkspaceId || undefined,
       workspacePath: normalizedWorkspacePath || undefined,
     });

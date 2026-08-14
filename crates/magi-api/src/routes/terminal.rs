@@ -43,8 +43,10 @@ pub fn routes() -> Router<ApiState> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TerminalScopeQuery {
+    scope: crate::dto::SessionScopeKindDto,
     session_id: String,
-    workspace_id: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
     #[serde(default)]
     workspace_path: Option<String>,
     #[serde(default = "default_terminal_cols")]
@@ -105,18 +107,29 @@ fn resolve_terminal_binding(
     query: &TerminalScopeQuery,
 ) -> Result<TerminalBinding, ApiError> {
     validate_terminal_tab_id(terminal_tab_id)?;
-    let scope = session_scope::require_session_workspace_scope(
+    let session_id = session_scope::parse_session_id(Some(&query.session_id))?;
+    let request_scope = session_scope::require_session_request_scope(
         state,
-        Some(&query.session_id),
-        Some(&query.workspace_id),
+        Some(session_id.as_str()),
+        query.scope,
+        query.workspace_id.as_deref(),
         query.workspace_path.as_deref(),
-        "打开本地终端",
     )?;
+    let execution_root = match &request_scope.scope {
+        session_scope::SessionScope::Personal => {
+            state.personal_session_execution_root(&session_id)?
+        }
+        session_scope::SessionScope::Workspace(binding) => {
+            std::path::PathBuf::from(&binding.workspace_path)
+        }
+    };
     Ok(TerminalBinding {
         terminal_tab_id: terminal_tab_id.to_string(),
-        workspace_id: scope.workspace_id.to_string(),
-        workspace_path: scope.workspace_path.into(),
-        session_id: scope.session_id.to_string(),
+        workspace_id: request_scope
+            .workspace_id()
+            .map(|workspace_id| workspace_id.to_string()),
+        execution_root,
+        session_id: session_id.to_string(),
     })
 }
 

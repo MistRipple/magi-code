@@ -34,9 +34,10 @@ serde_json.workspace = true
 tracing.workspace = true
 sysinfo.workspace = true
 regex = "1"
+sha2.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
-magi-browser-runtime = { path = "../magi-browser-runtime" }
+magi-browser-authority = { path = "../magi-browser-authority" }
 magi-process = { path = "../magi-process" }
 tempfile = "3"

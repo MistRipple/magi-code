@@ -37,7 +37,7 @@ impl<'a> RuntimeRecorder<'a> {
 
     pub fn record_call(&mut self, input: RuntimeCallRecordInput) -> u64 {
         let input = UsageCallRecordInput {
-            workspace_id: self.workspace_id.clone(),
+            workspace_id: Some(self.workspace_id.clone()),
             session_id: self.session_id.clone(),
             turn_id: input.turn_id,
             dispatch_wave_id: input.dispatch_wave_id,

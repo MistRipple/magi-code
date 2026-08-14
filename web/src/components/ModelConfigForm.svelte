@@ -1,9 +1,6 @@
 <script lang="ts">
   import { i18n } from '../stores/i18n.svelte';
-  import type {
-    VisionBuiltinTextModelRule,
-    VisionRoutingPreview,
-  } from '../shared/settings-bootstrap';
+  import type { VisionBuiltinTextModelRule } from '../shared/settings-bootstrap';
   import Icon from './Icon.svelte';
 
   type FormType = 'orch' | 'comp' | 'vision' | 'image' | 'worker';
@@ -18,8 +15,6 @@
     showAdvancedOptions = true,
     description = null,
     visionBuiltinTextModelRules = [],
-    visionCurrentMainModel = '',
-    previewVisionRouting = null,
     saveStatus,
     testStatus,
     fetchingModels,
@@ -44,11 +39,6 @@
     showAdvancedOptions?: boolean;
     description?: string | null;
     visionBuiltinTextModelRules?: VisionBuiltinTextModelRule[];
-    visionCurrentMainModel?: string;
-    previewVisionRouting?: ((
-      model: string,
-      textModelRules: Array<{ matchMode: 'exact' | 'regex'; pattern: string }>,
-    ) => Promise<VisionRoutingPreview>) | null;
     saveStatus: Record<string, string>;
     testStatus: Record<string, string>;
     fetchingModels: Record<string, boolean>;
@@ -137,6 +127,7 @@
   function analyzeVisionRulesText(value: string): {
     rules: Array<{ matchMode: 'exact' | 'regex'; pattern: string }>;
     syntaxInvalid: boolean;
+    regexInvalid: boolean;
   } {
     const entries: string[] = [];
     let current = '';
@@ -168,6 +159,7 @@
     if (current.trim()) entries.push(current.trim());
 
     let syntaxInvalid = inRegex;
+    let regexInvalid = false;
     const rules: Array<{ matchMode: 'exact' | 'regex'; pattern: string }> = [];
     for (const entry of entries) {
       if (entry.startsWith('/')) {
@@ -180,22 +172,27 @@
           syntaxInvalid = true;
           continue;
         }
+        try {
+          new RegExp(pattern);
+        } catch {
+          regexInvalid = true;
+          continue;
+        }
         rules.push({ matchMode: 'regex', pattern });
         continue;
       }
       const pattern = unescapeExactRule(entry).trim();
       if (pattern) rules.push({ matchMode: 'exact', pattern });
     }
-    return { rules, syntaxInvalid };
+    return { rules, syntaxInvalid, regexInvalid };
   }
 
   let visionRulesText = $state('');
   let syncedVisionRulesSignature = '';
-  let routingRulesValidationError = $state(false);
   const visionRuleAnalysis = $derived(analyzeVisionRulesText(visionRulesText));
   const visionRulesTextDirty = $derived(
     formType === 'vision'
-    && visionRuleAnalysis.syntaxInvalid
+    && (visionRuleAnalysis.syntaxInvalid || visionRuleAnalysis.regexInvalid)
     && visionRulesText.trim() !== serializeVisionRules(baselineConfig?.textModelRules ?? []),
   );
   const isDirty = $derived(
@@ -259,7 +256,7 @@
   const saveDisabled = $derived(
     isSaving
     || !isDirty
-    || (formType === 'vision' && (visionRuleAnalysis.syntaxInvalid || routingRulesValidationError)),
+    || (formType === 'vision' && (visionRuleAnalysis.syntaxInvalid || visionRuleAnalysis.regexInvalid)),
   );
   const showSavedLabel = $derived(currentSaveStatus === 'saved' && !isDirty);
   const showProtocolField = $derived(formType !== 'image');
@@ -303,6 +300,17 @@
     return 'settings.model.protocol.openaiChatBehavior';
   }
 
+  function visionContextWindowInK(): number {
+    const tokens = Number(config?.contextWindowTokens);
+    return Number.isFinite(tokens) && tokens > 0 ? tokens / 1000 : 128;
+  }
+
+  function handleVisionContextWindowInput(event: Event): void {
+    const input = event.currentTarget as HTMLInputElement;
+    if (!Number.isFinite(input.valueAsNumber)) return;
+    config.contextWindowTokens = Math.round(input.valueAsNumber * 1000);
+  }
+
   function handleVisionRulesInput(value: string) {
     visionRulesText = value;
     const analysis = analyzeVisionRulesText(value);
@@ -329,85 +337,6 @@
     return duplicates;
   });
 
-  let currentRoutingPreview = $state<VisionRoutingPreview | null>(null);
-  let currentRoutingPreviewLoading = $state(false);
-  let currentRoutingPreviewError = $state(false);
-  let currentRoutingPreviewSequence = 0;
-
-  $effect(() => {
-    const requestPreview = previewVisionRouting;
-    if (formType !== 'vision' || !requestPreview) return;
-    const model = visionCurrentMainModel.trim();
-    const rules = (config?.textModelRules ?? []).map((rule: any) => ({
-      matchMode: rule?.matchMode === 'regex' ? 'regex' as const : 'exact' as const,
-      pattern: String(rule?.pattern ?? '').trim(),
-    }));
-    const requestModel = model || '__magi_rule_validation__';
-    const requestSequence = ++currentRoutingPreviewSequence;
-    currentRoutingPreview = null;
-    currentRoutingPreviewError = false;
-    currentRoutingPreviewLoading = Boolean(model);
-    const timer = window.setTimeout(() => {
-      void requestPreview(requestModel, rules)
-        .then((preview: VisionRoutingPreview) => {
-          if (requestSequence !== currentRoutingPreviewSequence) return;
-          routingRulesValidationError = false;
-          currentRoutingPreview = model ? preview : null;
-        })
-        .catch(() => {
-          if (requestSequence !== currentRoutingPreviewSequence) return;
-          routingRulesValidationError = true;
-          currentRoutingPreviewError = Boolean(model);
-        })
-        .finally(() => {
-          if (requestSequence === currentRoutingPreviewSequence) {
-            currentRoutingPreviewLoading = false;
-          }
-        });
-    }, 180);
-    return () => window.clearTimeout(timer);
-  });
-
-  let routingTestModel = $state('');
-  let routingTestPreview = $state<VisionRoutingPreview | null>(null);
-  let routingTestLoading = $state(false);
-  let routingTestError = $state(false);
-  let routingTestSequence = 0;
-
-  $effect(() => {
-    const requestPreview = previewVisionRouting;
-    if (formType !== 'vision' || !requestPreview) return;
-    const model = routingTestModel.trim();
-    const requestSequence = ++routingTestSequence;
-    if (!model) {
-      routingTestPreview = null;
-      routingTestLoading = false;
-      routingTestError = false;
-      return;
-    }
-    const rules = (config?.textModelRules ?? []).map((rule: any) => ({
-      matchMode: rule?.matchMode === 'regex' ? 'regex' as const : 'exact' as const,
-      pattern: String(rule?.pattern ?? '').trim(),
-    }));
-    routingTestPreview = null;
-    routingTestError = false;
-    routingTestLoading = true;
-    const timer = window.setTimeout(() => {
-      void requestPreview(model, rules)
-        .then((preview: VisionRoutingPreview) => {
-          if (requestSequence !== routingTestSequence) return;
-          routingTestPreview = preview;
-        })
-        .catch(() => {
-          if (requestSequence !== routingTestSequence) return;
-          routingTestError = true;
-        })
-        .finally(() => {
-          if (requestSequence === routingTestSequence) routingTestLoading = false;
-        });
-    }, 220);
-    return () => window.clearTimeout(timer);
-  });
 </script>
 
 <!-- svelte-ignore a11y_label_has_associated_control -->
@@ -482,6 +411,7 @@
   <div
     class="llm-config-field-row credentials-row"
     class:has-level={showAdvancedOptions}
+    class:has-context-window={formType === 'vision'}
     class:key-only={!showModelField && !showAdvancedOptions}
   >
     <div class="llm-config-field">
@@ -555,6 +485,34 @@
       </div>
     {/if}
 
+    {#if formType === 'vision'}
+      <div class="llm-config-field vision-context-window-field">
+        <label class="form-label vision-context-window-label" for="vision-context-window">
+          {i18n.t('settings.model.field.contextWindow')}
+          <span
+            class="vision-context-window-help"
+            title={i18n.t('settings.model.visionContextWindowHint')}
+            aria-label={i18n.t('settings.model.visionContextWindowHint')}
+          >
+            <Icon name="info" size={12} />
+          </span>
+        </label>
+        <div class="vision-context-window-input">
+          <input
+            id="vision-context-window"
+            type="number"
+            class="form-input"
+            min="16"
+            max="10000"
+            step="1"
+            value={visionContextWindowInK()}
+            oninput={handleVisionContextWindowInput}
+          />
+          <span aria-hidden="true">K</span>
+        </div>
+      </div>
+    {/if}
+
     {#if showAdvancedOptions}
       <div class="llm-config-field">
         <label class="form-label">{i18n.t('settings.model.field.level')}</label>
@@ -569,75 +527,13 @@
   </div>
 
   {#if formType === 'vision'}
-    <div class="vision-runtime-settings">
-      <div class="llm-config-field vision-context-window-field">
-        <label class="form-label" for="vision-context-window">
-          {i18n.t('settings.model.field.contextWindow')}
-        </label>
-        <input
-          id="vision-context-window"
-          type="number"
-          class="form-input"
-          min="16000"
-          max="10000000"
-          step="1000"
-          bind:value={config.contextWindowTokens}
-        />
-        <div class="llm-config-hint">{i18n.t('settings.model.visionContextWindowHint')}</div>
-      </div>
-
-      <section class="vision-routing-settings" aria-labelledby="vision-routing-title">
+    <section class="vision-routing-settings" aria-labelledby="vision-routing-title">
         <div class="vision-routing-heading">
           <div>
             <div class="form-label" id="vision-routing-title">
               {i18n.t('settings.model.visionRoutingRules')}
             </div>
             <div class="llm-config-hint">{i18n.t('settings.model.visionRoutingRulesHint')}</div>
-          </div>
-        </div>
-
-        <div
-          class="vision-routing-current"
-          class:vision-routing-current--matched={currentRoutingPreview?.matched}
-          class:vision-routing-current--main={currentRoutingPreview && !currentRoutingPreview.matched}
-          class:vision-routing-current--error={currentRoutingPreviewError}
-        >
-          <span class="vision-routing-current__icon" aria-hidden="true">
-            {#if currentRoutingPreviewLoading}
-              <Icon name="refresh" size={14} />
-            {:else if currentRoutingPreview?.matched}
-              <Icon name="eye" size={14} />
-            {:else if currentRoutingPreviewError}
-              <Icon name="warning" size={14} />
-            {:else}
-              <Icon name="corner-down-right" size={14} />
-            {/if}
-          </span>
-          <div class="vision-routing-current__body">
-            <div class="vision-routing-current__model">
-              <span>{i18n.t('settings.model.currentMainModel')}</span>
-              <strong>{visionCurrentMainModel || i18n.t('settings.model.noCurrentMainModel')}</strong>
-            </div>
-            <div class="vision-routing-current__result" aria-live="polite">
-              {#if !visionCurrentMainModel}
-                {i18n.t('settings.model.noCurrentMainModelHint')}
-              {:else if currentRoutingPreviewLoading}
-                {i18n.t('settings.model.routingPreviewLoading')}
-              {:else if currentRoutingPreviewError}
-                {i18n.t('settings.model.routingPreviewError')}
-              {:else if currentRoutingPreview?.matched && currentRoutingPreview.source === 'builtin'}
-                {i18n.t('settings.model.routingUsesVisionBuiltin', {
-                  rule: currentRoutingPreview.ruleName ?? '',
-                  model: config.model?.trim() || i18n.t('settings.model.visionModel'),
-                })}
-              {:else if currentRoutingPreview?.matched}
-                {i18n.t('settings.model.routingUsesVisionCustom', {
-                  model: config.model?.trim() || i18n.t('settings.model.visionModel'),
-                })}
-              {:else}
-                {i18n.t('settings.model.routingUsesMain')}
-              {/if}
-            </div>
           </div>
         </div>
 
@@ -696,7 +592,7 @@
               <Icon name="warning" size={12} />
               {i18n.t('settings.model.customVisionRulesSyntaxInvalid')}
             </div>
-          {:else if routingRulesValidationError}
+          {:else if visionRuleAnalysis.regexInvalid}
             <div class="vision-rule-feedback vision-rule-feedback--error">
               <Icon name="warning" size={12} />
               {i18n.t('settings.model.customVisionRulesInvalid')}
@@ -709,58 +605,7 @@
           {/if}
         </div>
 
-        <div class="vision-routing-test">
-          <label class="form-label" for="vision-routing-test-model">
-            {i18n.t('settings.model.testVisionRouting')}
-          </label>
-          <div class="vision-routing-test__control">
-            <div class="vision-routing-test__input">
-              <Icon name="search" size={13} />
-              <input
-                id="vision-routing-test-model"
-                type="text"
-                class="form-input"
-                bind:value={routingTestModel}
-                placeholder={i18n.t('settings.model.testVisionRoutingPlaceholder')}
-                spellcheck={false}
-              />
-            </div>
-            <div
-              class="vision-routing-test__result"
-              class:vision-routing-test__result--matched={routingTestPreview?.matched}
-              class:vision-routing-test__result--main={routingTestPreview && !routingTestPreview.matched}
-              class:vision-routing-test__result--error={routingTestError}
-              aria-live="polite"
-            >
-              {#if routingTestLoading}
-                <Icon name="refresh" size={12} />
-                {i18n.t('settings.model.routingPreviewLoading')}
-              {:else if routingTestError}
-                <Icon name="warning" size={12} />
-                {i18n.t('settings.model.routingPreviewError')}
-              {:else if routingTestPreview?.matched}
-                <Icon name="eye" size={12} />
-                <span>
-                  {i18n.t('settings.model.testRoutingUsesVision', {
-                    model: config.model?.trim() || i18n.t('settings.model.visionModel'),
-                  })}
-                  {#if routingTestPreview.source === 'builtin' && routingTestPreview.ruleName}
-                    <small>{routingTestPreview.ruleName}</small>
-                  {:else if routingTestPreview.pattern}
-                    <small>{routingTestPreview.pattern}</small>
-                  {/if}
-                </span>
-              {:else if routingTestPreview}
-                <Icon name="corner-down-right" size={12} />
-                {i18n.t('settings.model.testRoutingUsesMain')}
-              {:else}
-                {i18n.t('settings.model.testVisionRoutingEmpty')}
-              {/if}
-            </div>
-          </div>
-        </div>
-      </section>
-    </div>
+    </section>
   {/if}
 
   <div
@@ -850,6 +695,9 @@
   .llm-config-field-row.credentials-row.has-level {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 96px;
   }
+  .llm-config-field-row.credentials-row.has-context-window {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(118px, 0.42fr);
+  }
   .llm-config-field-row.credentials-row.key-only {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -884,16 +732,44 @@
     min-width: 0;
   }
 
-  .vision-runtime-settings {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-5);
-    padding-top: var(--space-4);
-    border-top: 1px solid var(--border-subtle);
+  .vision-context-window-field {
+    min-width: 0;
   }
 
-  .vision-context-window-field {
-    width: min(100%, 280px);
+  .vision-context-window-label,
+  .vision-context-window-help {
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .vision-context-window-label {
+    gap: 5px;
+  }
+
+  .vision-context-window-help {
+    color: var(--foreground-muted);
+    cursor: help;
+  }
+
+  .vision-context-window-input {
+    position: relative;
+    min-width: 0;
+  }
+
+  .vision-context-window-input .form-input {
+    padding-right: 30px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .vision-context-window-input > span {
+    position: absolute;
+    top: 50%;
+    right: 10px;
+    color: var(--foreground-muted);
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+    transform: translateY(-50%);
+    pointer-events: none;
   }
 
   .vision-routing-settings {
@@ -910,88 +786,6 @@
     align-items: flex-start;
     justify-content: space-between;
     gap: var(--space-3);
-  }
-
-  .vision-routing-current {
-    display: flex;
-    align-items: flex-start;
-    gap: var(--space-3);
-    min-width: 0;
-    padding: 10px 12px;
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--surface-2) 72%, transparent);
-  }
-
-  .vision-routing-current--matched {
-    border-color: color-mix(in srgb, var(--success) 34%, var(--border-subtle));
-    background: color-mix(in srgb, var(--success-muted) 62%, transparent);
-  }
-
-  .vision-routing-current--main {
-    border-color: color-mix(in srgb, var(--primary) 25%, var(--border-subtle));
-  }
-
-  .vision-routing-current--error {
-    border-color: color-mix(in srgb, var(--error) 38%, var(--border-subtle));
-    background: color-mix(in srgb, var(--error-muted) 58%, transparent);
-  }
-
-  .vision-routing-current__icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 26px;
-    height: 26px;
-    flex: 0 0 26px;
-    border-radius: var(--radius-sm);
-    color: var(--primary);
-    background: var(--primary-muted);
-  }
-
-  .vision-routing-current--matched .vision-routing-current__icon {
-    color: var(--success);
-    background: var(--success-muted);
-  }
-
-  .vision-routing-current--error .vision-routing-current__icon {
-    color: var(--error);
-    background: var(--error-muted);
-  }
-
-  .vision-routing-current__body {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    min-width: 0;
-  }
-
-  .vision-routing-current__model {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    min-width: 0;
-    font-size: var(--text-sm);
-  }
-
-  .vision-routing-current__model span,
-  .vision-routing-current__result {
-    font-size: var(--text-xs);
-    color: var(--foreground-muted);
-  }
-
-  .vision-routing-current__model strong {
-    overflow: hidden;
-    color: var(--foreground);
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    font-weight: var(--font-semibold);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .vision-routing-current__result {
-    line-height: 1.45;
   }
 
   .vision-builtin-rules {
@@ -1120,90 +914,7 @@
     color: var(--warning);
   }
 
-  .vision-routing-test {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    padding-top: var(--space-3);
-    border-top: 1px solid var(--border-subtle);
-  }
-
-  .vision-routing-test__control {
-    display: grid;
-    grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr);
-    gap: var(--space-3);
-    align-items: stretch;
-  }
-
-  .vision-routing-test__input {
-    position: relative;
-  }
-
-  .vision-routing-test__input > :global(svg) {
-    position: absolute;
-    top: 50%;
-    left: 10px;
-    z-index: 1;
-    color: var(--foreground-muted);
-    transform: translateY(-50%);
-    pointer-events: none;
-  }
-
-  .vision-routing-test__input .form-input {
-    padding-left: 31px;
-  }
-
-  .vision-routing-test__result {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    min-width: 0;
-    min-height: var(--btn-height-md);
-    padding: 6px 10px;
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--radius-sm);
-    color: var(--foreground-muted);
-    background: color-mix(in srgb, var(--surface-2) 68%, transparent);
-    font-size: var(--text-xs);
-  }
-
-  .vision-routing-test__result--matched {
-    color: var(--success);
-    border-color: color-mix(in srgb, var(--success) 34%, var(--border-subtle));
-    background: color-mix(in srgb, var(--success-muted) 60%, transparent);
-  }
-
-  .vision-routing-test__result--main {
-    color: var(--primary);
-    border-color: color-mix(in srgb, var(--primary) 28%, var(--border-subtle));
-  }
-
-  .vision-routing-test__result--error {
-    color: var(--error);
-    border-color: color-mix(in srgb, var(--error) 36%, var(--border-subtle));
-  }
-
-  .vision-routing-test__result span {
-    display: flex;
-    align-items: baseline;
-    gap: var(--space-2);
-    min-width: 0;
-  }
-
-  .vision-routing-test__result small {
-    overflow: hidden;
-    color: var(--foreground-muted);
-    font-family: var(--font-mono);
-    font-size: 10px;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
   @media (max-width: 760px) {
-    .vision-routing-test__control {
-      grid-template-columns: 1fr;
-    }
-
     .vision-rules-summary__meta {
       max-width: 45%;
       text-align: right;
@@ -1406,6 +1117,7 @@
     .llm-config-field-row,
     .llm-config-field-row.credentials-row,
     .llm-config-field-row.credentials-row.has-level,
+    .llm-config-field-row.credentials-row.has-context-window,
     .llm-config-field-row.credentials-row.key-only,
     .llm-config-field-row.url-mode-row {
       grid-template-columns: 1fr;
@@ -1438,6 +1150,7 @@
     .llm-config-field-row,
     .llm-config-field-row.credentials-row,
     .llm-config-field-row.credentials-row.has-level,
+    .llm-config-field-row.credentials-row.has-context-window,
     .llm-config-field-row.credentials-row.key-only,
     .llm-config-field-row.url-mode-row {
       grid-template-columns: 1fr;

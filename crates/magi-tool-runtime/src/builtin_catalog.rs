@@ -51,9 +51,7 @@ pub enum BuiltinToolName {
     BrowserEmulate,
     BrowserPerformance,
     BrowserLighthouse,
-    BrowserScreencast,
     BrowserHeap,
-    BrowserExtensions,
     BrowserThirdParty,
     BrowserWebMcp,
     BrowserPwa,
@@ -120,7 +118,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 77] = [
+    pub const ALL: [Self; 75] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -164,9 +162,7 @@ impl BuiltinToolName {
         Self::BrowserEmulate,
         Self::BrowserPerformance,
         Self::BrowserLighthouse,
-        Self::BrowserScreencast,
         Self::BrowserHeap,
-        Self::BrowserExtensions,
         Self::BrowserThirdParty,
         Self::BrowserWebMcp,
         Self::BrowserPwa,
@@ -245,9 +241,7 @@ impl BuiltinToolName {
             Self::BrowserEmulate => "browser_emulate",
             Self::BrowserPerformance => "browser_performance",
             Self::BrowserLighthouse => "browser_lighthouse",
-            Self::BrowserScreencast => "browser_screencast",
             Self::BrowserHeap => "browser_heap",
-            Self::BrowserExtensions => "browser_extensions",
             Self::BrowserThirdParty => "browser_third_party",
             Self::BrowserWebMcp => "browser_webmcp",
             Self::BrowserPwa => "browser_pwa",
@@ -325,9 +319,7 @@ impl BuiltinToolName {
             | Self::BrowserEmulate
             | Self::BrowserPerformance
             | Self::BrowserLighthouse
-            | Self::BrowserScreencast
             | Self::BrowserHeap
-            | Self::BrowserExtensions
             | Self::BrowserThirdParty
             | Self::BrowserWebMcp
             | Self::BrowserPwa => "browser",
@@ -403,9 +395,7 @@ impl BuiltinToolName {
             "browser_emulate" => Some(Self::BrowserEmulate),
             "browser_performance" => Some(Self::BrowserPerformance),
             "browser_lighthouse" => Some(Self::BrowserLighthouse),
-            "browser_screencast" => Some(Self::BrowserScreencast),
             "browser_heap" => Some(Self::BrowserHeap),
-            "browser_extensions" => Some(Self::BrowserExtensions),
             "browser_third_party" => Some(Self::BrowserThirdParty),
             "browser_webmcp" => Some(Self::BrowserWebMcp),
             "browser_pwa" => Some(Self::BrowserPwa),
@@ -441,36 +431,34 @@ impl BuiltinToolName {
         }
     }
 
-    pub fn browser_tool_kind(&self) -> Option<magi_browser_runtime::BrowserToolKind> {
+    pub fn browser_tool_kind(&self) -> Option<magi_browser_authority::BrowserToolKind> {
         match self {
-            Self::BrowserNavigate => Some(magi_browser_runtime::BrowserToolKind::Navigate),
-            Self::BrowserSnapshot => Some(magi_browser_runtime::BrowserToolKind::Snapshot),
-            Self::BrowserClick => Some(magi_browser_runtime::BrowserToolKind::Click),
-            Self::BrowserType => Some(magi_browser_runtime::BrowserToolKind::Type),
-            Self::BrowserPress => Some(magi_browser_runtime::BrowserToolKind::Press),
-            Self::BrowserScroll => Some(magi_browser_runtime::BrowserToolKind::Scroll),
-            Self::BrowserScreenshot => Some(magi_browser_runtime::BrowserToolKind::Screenshot),
-            Self::BrowserTabs => Some(magi_browser_runtime::BrowserToolKind::Tabs),
-            Self::BrowserViewport => Some(magi_browser_runtime::BrowserToolKind::Viewport),
-            Self::BrowserWaitFor => Some(magi_browser_runtime::BrowserToolKind::WaitFor),
-            Self::BrowserHover => Some(magi_browser_runtime::BrowserToolKind::Hover),
-            Self::BrowserDrag => Some(magi_browser_runtime::BrowserToolKind::Drag),
-            Self::BrowserFillForm => Some(magi_browser_runtime::BrowserToolKind::FillForm),
-            Self::BrowserDialog => Some(magi_browser_runtime::BrowserToolKind::Dialog),
-            Self::BrowserUploadFile => Some(magi_browser_runtime::BrowserToolKind::UploadFile),
-            Self::BrowserClickAt => Some(magi_browser_runtime::BrowserToolKind::ClickAt),
-            Self::BrowserEvaluate => Some(magi_browser_runtime::BrowserToolKind::Evaluate),
-            Self::BrowserConsole => Some(magi_browser_runtime::BrowserToolKind::Console),
-            Self::BrowserNetwork => Some(magi_browser_runtime::BrowserToolKind::Network),
-            Self::BrowserEmulate => Some(magi_browser_runtime::BrowserToolKind::Emulate),
-            Self::BrowserPerformance => Some(magi_browser_runtime::BrowserToolKind::Performance),
-            Self::BrowserLighthouse => Some(magi_browser_runtime::BrowserToolKind::Lighthouse),
-            Self::BrowserScreencast => Some(magi_browser_runtime::BrowserToolKind::Screencast),
-            Self::BrowserHeap => Some(magi_browser_runtime::BrowserToolKind::Heap),
-            Self::BrowserExtensions => Some(magi_browser_runtime::BrowserToolKind::Extensions),
-            Self::BrowserThirdParty => Some(magi_browser_runtime::BrowserToolKind::ThirdParty),
-            Self::BrowserWebMcp => Some(magi_browser_runtime::BrowserToolKind::WebMcp),
-            Self::BrowserPwa => Some(magi_browser_runtime::BrowserToolKind::Pwa),
+            Self::BrowserNavigate => Some(magi_browser_authority::BrowserToolKind::Navigate),
+            Self::BrowserSnapshot => Some(magi_browser_authority::BrowserToolKind::Snapshot),
+            Self::BrowserClick => Some(magi_browser_authority::BrowserToolKind::Click),
+            Self::BrowserType => Some(magi_browser_authority::BrowserToolKind::Type),
+            Self::BrowserPress => Some(magi_browser_authority::BrowserToolKind::Press),
+            Self::BrowserScroll => Some(magi_browser_authority::BrowserToolKind::Scroll),
+            Self::BrowserScreenshot => Some(magi_browser_authority::BrowserToolKind::Screenshot),
+            Self::BrowserTabs => Some(magi_browser_authority::BrowserToolKind::Tabs),
+            Self::BrowserViewport => Some(magi_browser_authority::BrowserToolKind::Viewport),
+            Self::BrowserWaitFor => Some(magi_browser_authority::BrowserToolKind::WaitFor),
+            Self::BrowserHover => Some(magi_browser_authority::BrowserToolKind::Hover),
+            Self::BrowserDrag => Some(magi_browser_authority::BrowserToolKind::Drag),
+            Self::BrowserFillForm => Some(magi_browser_authority::BrowserToolKind::FillForm),
+            Self::BrowserDialog => Some(magi_browser_authority::BrowserToolKind::Dialog),
+            Self::BrowserUploadFile => Some(magi_browser_authority::BrowserToolKind::UploadFile),
+            Self::BrowserClickAt => Some(magi_browser_authority::BrowserToolKind::ClickAt),
+            Self::BrowserEvaluate => Some(magi_browser_authority::BrowserToolKind::Evaluate),
+            Self::BrowserConsole => Some(magi_browser_authority::BrowserToolKind::Console),
+            Self::BrowserNetwork => Some(magi_browser_authority::BrowserToolKind::Network),
+            Self::BrowserEmulate => Some(magi_browser_authority::BrowserToolKind::Emulate),
+            Self::BrowserPerformance => Some(magi_browser_authority::BrowserToolKind::Performance),
+            Self::BrowserLighthouse => Some(magi_browser_authority::BrowserToolKind::Lighthouse),
+            Self::BrowserHeap => Some(magi_browser_authority::BrowserToolKind::Heap),
+            Self::BrowserThirdParty => Some(magi_browser_authority::BrowserToolKind::ThirdParty),
+            Self::BrowserWebMcp => Some(magi_browser_authority::BrowserToolKind::WebMcp),
+            Self::BrowserPwa => Some(magi_browser_authority::BrowserToolKind::Pwa),
             _ => None,
         }
     }
@@ -515,11 +503,8 @@ impl BuiltinToolName {
                 | Self::BrowserClickAt
                 | Self::BrowserEvaluate
                 | Self::BrowserEmulate
-                | Self::BrowserScreencast
-                | Self::BrowserExtensions
                 | Self::BrowserThirdParty
                 | Self::BrowserWebMcp
-                | Self::BrowserPwa
         )
     }
 
@@ -644,11 +629,8 @@ impl BuiltinToolName {
             | Self::BrowserClickAt
             | Self::BrowserEvaluate
             | Self::BrowserEmulate
-            | Self::BrowserScreencast
-            | Self::BrowserExtensions
             | Self::BrowserThirdParty
-            | Self::BrowserWebMcp
-            | Self::BrowserPwa => RestrictedWriteProfilePolicy::AutoAllowed,
+            | Self::BrowserWebMcp => RestrictedWriteProfilePolicy::AutoAllowed,
             _ => return None,
         };
         Some(policy)
@@ -734,7 +716,8 @@ impl BuiltinToolName {
             | Self::BrowserNetwork
             | Self::BrowserPerformance
             | Self::BrowserLighthouse
-            | Self::BrowserHeap => RiskLevel::Low,
+            | Self::BrowserHeap
+            | Self::BrowserPwa => RiskLevel::Low,
             Self::FileWrite
             | Self::FilePatch
             | Self::ApplyPatch
@@ -758,11 +741,8 @@ impl BuiltinToolName {
             | Self::BrowserUploadFile
             | Self::BrowserClickAt
             | Self::BrowserEvaluate
-            | Self::BrowserScreencast
-            | Self::BrowserExtensions
             | Self::BrowserThirdParty
             | Self::BrowserWebMcp
-            | Self::BrowserPwa
             | Self::BrowserEmulate => RiskLevel::Medium,
             Self::FileRemove
             | Self::ShellExec
@@ -974,14 +954,12 @@ impl BuiltinToolName {
             Self::BrowserLighthouse => {
                 "对当前页面执行 Lighthouse 可访问性、SEO、最佳实践和 agentic browsing 审计；不包含性能评分。"
             }
-            Self::BrowserScreencast => {
-                "启动或停止当前浏览器页面的视频录制，并返回生成的 MP4 或 WebM 文件路径。"
-            }
             Self::BrowserHeap => "读取当前页面堆和 DOM 计数，或生成可供后续分析的堆快照文件。",
-            Self::BrowserExtensions => "列出、安装、重载或卸载当前 Chromium Profile 中的扩展。",
             Self::BrowserThirdParty => "列出或执行页面通过 window.__dtmcp 暴露的第三方开发工具。",
             Self::BrowserWebMcp => "列出或执行页面通过 navigator.modelContext 暴露的 WebMCP 工具。",
-            Self::BrowserPwa => "读取、安装、启动或卸载当前 Chromium 支持的 Progressive Web App。",
+            Self::BrowserPwa => {
+                "读取当前 Chromium 页面是否满足 PWA 条件及其安装状态；Magi 不会创建独立应用窗口或修改系统安装状态。"
+            }
             Self::DiagramRender => {
                 "渲染图表：支持 Mermaid、DOT、结构化 graph 节点/边、结构化 flow 节点/边"
             }
@@ -1609,16 +1587,6 @@ impl BuiltinToolName {
                 },
                 "required": []
             }),
-            Self::BrowserScreencast => serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "tab_id": { "type": "string" },
-                    "action": { "type": "string", "enum": ["start", "stop"] },
-                    "file_path": { "type": "string", "description": "start 时可选；输出 .mp4 或 .webm 文件路径，省略时写入 Browser Runtime 下载目录" },
-                    "ffmpeg_path": { "type": "string", "description": "start 时可选；ffmpeg 可执行文件路径，省略时从 PATH 查找" }
-                },
-                "required": ["action"]
-            }),
             Self::BrowserHeap => serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1634,16 +1602,6 @@ impl BuiltinToolName {
                     "max_depth": { "type": "integer", "minimum": 1, "maximum": 64 },
                     "max_nodes": { "type": "integer", "minimum": 1, "maximum": 10000 },
                     "max_siblings": { "type": "integer", "minimum": 1, "maximum": 1000 }
-                },
-                "required": ["action"]
-            }),
-            Self::BrowserExtensions => serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "tab_id": { "type": "string" },
-                    "action": { "type": "string", "enum": ["list", "install", "reload", "trigger_action", "uninstall"] },
-                    "path": { "type": "string" },
-                    "extension_id": { "type": "string" }
                 },
                 "required": ["action"]
             }),
@@ -1671,11 +1629,7 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "tab_id": { "type": "string" },
-                    "action": { "type": "string", "enum": ["state", "install", "launch", "uninstall"] },
-                    "manifest_id": { "type": "string" },
-                    "install_url": { "type": "string" },
-                    "display_mode": { "type": "string", "enum": ["browser", "standalone"], "description": "安装后的显示模式；browser 在标签页中打开，standalone 在独立应用窗口中打开" },
-                    "url": { "type": "string" }
+                    "action": { "type": "string", "enum": ["state"] }
                 },
                 "required": ["action"]
             }),
@@ -2466,8 +2420,9 @@ mod tests {
 
     #[test]
     fn chrome_devtools_reference_tools_have_one_magi_execution_mapping() {
-        // 当前参考项目在完整模式下暴露 57 个工具。Magi 有意将相关能力聚合到
-        // 带 action 的浏览器工具中；该映射矩阵防止目录项只有名称而没有执行路径。
+        // 参考项目的完整模式包含扩展管理等 Magi Native CEF 不提供的能力。
+        // Magi 将其余能力聚合到带 action 的浏览器工具中；该映射矩阵防止目录项
+        // 只有名称而没有执行路径。
         let mappings = [
             ("click", BuiltinToolName::BrowserClick, None),
             ("click_at", BuiltinToolName::BrowserClickAt, None),
@@ -2484,31 +2439,6 @@ mod tests {
             ("type_text", BuiltinToolName::BrowserType, None),
             ("upload_file", BuiltinToolName::BrowserUploadFile, None),
             ("emulate", BuiltinToolName::BrowserEmulate, None),
-            (
-                "install_extension",
-                BuiltinToolName::BrowserExtensions,
-                Some("install"),
-            ),
-            (
-                "uninstall_extension",
-                BuiltinToolName::BrowserExtensions,
-                Some("uninstall"),
-            ),
-            (
-                "list_extensions",
-                BuiltinToolName::BrowserExtensions,
-                Some("list"),
-            ),
-            (
-                "reload_extension",
-                BuiltinToolName::BrowserExtensions,
-                Some("reload"),
-            ),
-            (
-                "trigger_extension_action",
-                BuiltinToolName::BrowserExtensions,
-                Some("trigger_action"),
-            ),
             ("lighthouse_audit", BuiltinToolName::BrowserLighthouse, None),
             (
                 "take_heapsnapshot",
@@ -2606,27 +2536,10 @@ mod tests {
                 BuiltinToolName::BrowserPerformance,
                 Some("analyze"),
             ),
-            ("install_pwa", BuiltinToolName::BrowserPwa, Some("install")),
-            (
-                "uninstall_pwa",
-                BuiltinToolName::BrowserPwa,
-                Some("uninstall"),
-            ),
-            ("launch_pwa", BuiltinToolName::BrowserPwa, Some("launch")),
             (
                 "get_os_app_state",
                 BuiltinToolName::BrowserPwa,
                 Some("state"),
-            ),
-            (
-                "screencast_start",
-                BuiltinToolName::BrowserScreencast,
-                Some("start"),
-            ),
-            (
-                "screencast_stop",
-                BuiltinToolName::BrowserScreencast,
-                Some("stop"),
             ),
             ("take_screenshot", BuiltinToolName::BrowserScreenshot, None),
             ("evaluate_script", BuiltinToolName::BrowserEvaluate, None),
@@ -2663,7 +2576,7 @@ mod tests {
                 Some("get"),
             ),
         ];
-        assert_eq!(mappings.len(), 57);
+        assert_eq!(mappings.len(), 47);
         for (reference_name, magi_name, action) in mappings {
             assert_eq!(
                 BuiltinToolName::from_name(magi_name.as_str()),

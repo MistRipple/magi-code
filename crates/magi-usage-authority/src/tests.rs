@@ -1,7 +1,9 @@
 use crate::authority::{
     UsageAuthority, build_execution_binding_identity, build_usage_call_identity,
 };
-use crate::costing::{context_window_tokens_from_usage, normalize_usage_delta};
+use crate::costing::{
+    context_window_tokens_from_usage, normalize_usage_delta, provider_context_tokens_from_usage,
+};
 use crate::model_identity::{build_model_resolution_identity, canonicalize_base_url};
 use crate::reducer::{
     rebuild_session_snapshot_from_events, rebuild_workspace_snapshot_from_sessions,
@@ -27,7 +29,7 @@ fn make_call_record_input(
     output_tokens: u64,
 ) -> UsageCallRecordInput {
     UsageCallRecordInput {
-        workspace_id: "ws-1".to_string(),
+        workspace_id: Some("ws-1".to_string()),
         session_id: session_id.to_string(),
         turn_id: Some("turn-1".to_string()),
         dispatch_wave_id: None,
@@ -148,6 +150,19 @@ fn context_window_tokens_prefer_provider_authoritative_total() {
     };
 
     assert_eq!(context_window_tokens_from_usage(&usage), 750);
+}
+
+#[test]
+fn provider_context_tokens_do_not_include_completion_tokens() {
+    let usage = UsageTokenInput {
+        input_tokens: 10_000,
+        output_tokens: 2_000,
+        total_tokens: Some(12_000),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        cache_read_included_in_input: false,
+    };
+    assert_eq!(provider_context_tokens_from_usage(&usage), 10_000);
 }
 
 #[test]
@@ -402,7 +417,7 @@ fn test_rebuild_session_from_events() {
         UsageEvent {
             event_id: "e1".to_string(),
             ledger_seq: 1,
-            workspace_id: "ws-1".to_string(),
+            workspace_id: Some("ws-1".to_string()),
             session_id: "sess-1".to_string(),
             turn_id: Some("t1".to_string()),
             dispatch_wave_id: None,
@@ -431,7 +446,7 @@ fn test_rebuild_session_from_events() {
         UsageEvent {
             event_id: "e2".to_string(),
             ledger_seq: 2,
-            workspace_id: "ws-1".to_string(),
+            workspace_id: Some("ws-1".to_string()),
             session_id: "sess-1".to_string(),
             turn_id: Some("t1".to_string()),
             dispatch_wave_id: None,
@@ -459,7 +474,7 @@ fn test_rebuild_session_from_events() {
         },
     ];
 
-    let snapshot = rebuild_session_snapshot_from_events("ws-1", "sess-1", &events);
+    let snapshot = rebuild_session_snapshot_from_events(Some("ws-1"), "sess-1", &events);
     assert_eq!(snapshot.version, 2);
     assert_eq!(snapshot.totals.llm_call_count, 2);
     assert_eq!(snapshot.totals.raw_input_tokens, 800);
@@ -470,7 +485,7 @@ fn test_rebuild_session_from_events() {
 #[test]
 fn test_rebuild_workspace_from_sessions() {
     let s1 = SessionUsageSnapshot {
-        workspace_id: "ws-1".to_string(),
+        workspace_id: Some("ws-1".to_string()),
         session_id: "s1".to_string(),
         version: 2,
         last_applied_ledger_seq: 2,
@@ -487,7 +502,7 @@ fn test_rebuild_workspace_from_sessions() {
         by_model_identity: vec![],
     };
     let s2 = SessionUsageSnapshot {
-        workspace_id: "ws-1".to_string(),
+        workspace_id: Some("ws-1".to_string()),
         session_id: "s2".to_string(),
         version: 1,
         last_applied_ledger_seq: 1,
@@ -547,7 +562,7 @@ fn test_session_reset_rebuilds_from_events() {
         UsageEvent {
             event_id: "e1".to_string(),
             ledger_seq: 1,
-            workspace_id: "ws-1".to_string(),
+            workspace_id: Some("ws-1".to_string()),
             session_id: "sess-1".to_string(),
             turn_id: None,
             dispatch_wave_id: None,
@@ -576,7 +591,7 @@ fn test_session_reset_rebuilds_from_events() {
         UsageEvent {
             event_id: "reset-1".to_string(),
             ledger_seq: 2,
-            workspace_id: "ws-1".to_string(),
+            workspace_id: Some("ws-1".to_string()),
             session_id: "sess-1".to_string(),
             turn_id: None,
             dispatch_wave_id: None,
@@ -593,7 +608,7 @@ fn test_session_reset_rebuilds_from_events() {
         UsageEvent {
             event_id: "e2".to_string(),
             ledger_seq: 3,
-            workspace_id: "ws-1".to_string(),
+            workspace_id: Some("ws-1".to_string()),
             session_id: "sess-1".to_string(),
             turn_id: None,
             dispatch_wave_id: None,
@@ -621,7 +636,7 @@ fn test_session_reset_rebuilds_from_events() {
         },
     ];
 
-    let snapshot = rebuild_session_snapshot_from_events("ws-1", "sess-1", &events);
+    let snapshot = rebuild_session_snapshot_from_events(Some("ws-1"), "sess-1", &events);
     assert_eq!(snapshot.totals.llm_call_count, 1);
     assert_eq!(snapshot.totals.raw_input_tokens, 300);
     assert_eq!(snapshot.version, 3);
@@ -629,7 +644,7 @@ fn test_session_reset_rebuilds_from_events() {
 
 #[test]
 fn test_empty_session_snapshot() {
-    let snapshot = SessionUsageSnapshot::empty("ws-1", "sess-1");
+    let snapshot = SessionUsageSnapshot::empty(Some("ws-1"), "sess-1");
     assert_eq!(snapshot.version, 0);
     assert_eq!(snapshot.totals.llm_call_count, 0);
     assert!(snapshot.by_execution_binding.is_empty());

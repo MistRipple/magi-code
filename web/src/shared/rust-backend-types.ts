@@ -30,7 +30,8 @@ export type SessionTurnRouteDto =
 
 export interface SessionTurnRequestDto {
   sessionId?: string | null;
-  workspaceId: string;
+  scope: 'personal' | 'workspace';
+  workspaceId?: string | null;
   workspacePath?: string | null;
   text?: string | null;
   skillName?: string | null;
@@ -836,6 +837,9 @@ export interface AuditUsageLedgerDto {
 }
 
 export interface BootstrapDto {
+  scope: 'personal' | 'workspace';
+  workspaceId: string | null;
+  workspacePath: string | null;
   service: ServiceInfoDto;
   generatedAt: number;
   currentSession?: SessionDto | null;
@@ -879,7 +883,7 @@ export interface SessionCloseRequestDto {
 
 export interface SessionContinueRequestDto {
   sessionId: string;
-  workspaceId: string;
+  workspaceId?: string | null;
   workspacePath?: string | null;
   promptText?: string | null;
   requestedAgentIds?: string[];
@@ -890,7 +894,7 @@ export interface SessionContinueRequestDto {
 
 export interface SessionContinueResponseDto {
   sessionId: string;
-  workspaceId: string;
+  workspaceId?: string | null;
   missionId: string;
   rootTaskId: string;
   executionChainRef: string;
@@ -933,13 +937,13 @@ export interface NotificationCenterSnapshotDto {
 }
 
 export interface NotificationsResponseDto {
-  workspaceId: string;
+  workspaceId?: string | null;
   sessionId?: string | null;
   notifications: NotificationCenterSnapshotDto;
 }
 
 export interface NotificationContextRequestDto {
-  workspaceId: string;
+  workspaceId?: string | null;
   workspacePath?: string | null;
   sessionId?: string | null;
 }
@@ -1569,8 +1573,8 @@ export interface SessionPlanDto {
 
 export interface CurrentGoalResponseDto {
   sessionId: string;
-  workspaceId: string;
-  workspacePath: string;
+  workspaceId: string | null;
+  workspacePath: string | null;
   observedAt: number;
   goal?: SessionGoalDto | null;
   plan?: SessionPlanDto | null;
@@ -1586,7 +1590,8 @@ export interface GoalAllowedActionsDto {
 }
 
 export interface GoalActionRequestDto {
-  sessionId?: string;
+  sessionId: string;
+  scope: 'personal' | 'workspace';
   workspaceId?: string;
   workspacePath?: string;
   goalId: string;
@@ -1602,8 +1607,8 @@ export interface GoalUpdateRequestDto extends GoalActionRequestDto {
 
 export interface GoalMutationResponseDto {
   sessionId: string;
-  workspaceId: string;
-  workspacePath: string;
+  workspaceId: string | null;
+  workspacePath: string | null;
   observedAt: number;
   goal?: SessionGoalDto | null;
   plan?: SessionPlanDto | null;
@@ -1662,6 +1667,7 @@ export interface AgentRunActionRequestDto {
   operationId: string;
   taskId: string;
   sessionId: string;
+  scope: 'personal' | 'workspace';
   workspaceId?: string;
   workspacePath?: string;
 }
@@ -1670,7 +1676,7 @@ export interface AgentRunActionResponseDto {
   action: AgentRunActionKind;
   operationId: string;
   sessionId: string;
-  workspaceId: string;
+  workspaceId?: string | null;
   workspacePath?: string;
   rootTaskId: string;
   oldRootTaskId?: string;
@@ -1694,8 +1700,8 @@ export type TaskExecutionModeDto = 'session_turn' | 'execution_chain';
 
 export interface AgentRunProjectionDto {
   sessionId: string;
-  workspaceId: string;
-  workspacePath: string;
+  workspaceId?: string | null;
+  workspacePath?: string | null;
   root_task: TaskDto;
   tasks: TaskDto[];
   running_tasks: string[];

@@ -24,6 +24,7 @@
     type AgentSettingsBootstrapSnapshot,
     settingsBootstrapMatchesCurrentWorkspace,
   } from '../web/agent-api';
+  import type { AgentBindingOverride } from '../web/agent-binding-context';
   import Icon from './Icon.svelte';
   import Modal from './Modal.svelte';
   import ContextUsageRing from './ContextUsageRing.svelte';
@@ -191,6 +192,8 @@
   const MAX_IMAGES = 5;  // 最多支持 5 张图片
   const MAX_IMAGE_SIZE = 10 * 1024 * 1024;  // 单张图片最大 10MB
   const IMAGE_FILE_NAME_PATTERN = /\.(png|jpe?g|gif|webp|bmp|heic|heif)$/i;
+  const GENERATED_CLIPBOARD_IMAGE_NAME_PATTERN = /^(clipboard|image|pasted[-_ ]?image)\.[^.]+$/i;
+  const CLIPBOARD_IMAGE_TYPE_PRIORITY = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
 
   let stopLoading = $state(false);
   let enhanceLoading = $state(false);
@@ -259,12 +262,18 @@
   const currentWorkspaceId = $derived(messagesState.currentWorkspaceId);
   const currentWorkspacePath = $derived(messagesState.currentWorkspacePath);
   const isDraftSession = $derived.by(() => !currentSessionId?.trim());
+  const isPersonalSession = $derived.by(() => (
+    !currentWorkspaceId?.trim()
+    && !currentWorkspacePath?.trim()
+  ));
   const persistedSessionId = $derived.by(() => (
     isPersistedSessionId(currentSessionId) ? currentSessionId?.trim() || '' : ''
   ));
   let composerReferenceScopeKey = '';
   const composerWorkspace = $derived.by(() => (
-    resolveComposerWorkspace(currentWorkspaceId, currentWorkspacePath, isDraftSession)
+    isPersonalSession
+      ? null
+      : resolveComposerWorkspace(currentWorkspaceId, currentWorkspacePath, isDraftSession)
   ));
   const workspaceOptions = $derived.by(() => composerWorkspaceState.workspaces);
   const agentRunState = $derived(getAgentRunState(currentSessionId, currentWorkspaceId));
@@ -500,35 +509,48 @@
     return IMAGE_FILE_NAME_PATTERN.test(file.name);
   }
 
-  function clipboardFileKey(file: File): string {
+  function clipboardImageTypePriority(file: File): number {
+    const priority = CLIPBOARD_IMAGE_TYPE_PRIORITY.indexOf(file.type.toLowerCase());
+    return priority >= 0 ? priority : CLIPBOARD_IMAGE_TYPE_PRIORITY.length;
+  }
+
+  function collapseGeneratedClipboardRepresentations(files: File[]): File[] {
+    const generatedFiles = files.filter((file) => (
+      GENERATED_CLIPBOARD_IMAGE_NAME_PATTERN.test(file.name)
+    ));
+    if (generatedFiles.length <= 1) return files;
+
+    const generatedBaseNames = new Set(generatedFiles.map((file) => (
+      file.name.replace(/\.[^.]+$/, '').toLowerCase()
+    )));
+    if (generatedBaseNames.size !== 1) return files;
+    const generatedMediaTypes = new Set(generatedFiles.map((file) => file.type.toLowerCase()));
+    if (generatedMediaTypes.size <= 1) return files;
+
+    const preferred = [...generatedFiles].sort((left, right) => (
+      clipboardImageTypePriority(left) - clipboardImageTypePriority(right)
+    ))[0];
     return [
-      file.name,
-      file.type,
-      file.size,
-      file.lastModified,
-    ].join(':');
+      ...files.filter((file) => !GENERATED_CLIPBOARD_IMAGE_NAME_PATTERN.test(file.name)),
+      preferred,
+    ];
   }
 
   function collectClipboardImageFiles(data: DataTransfer | null | undefined): File[] {
     if (!data) return [];
-    const files: File[] = [];
-    const seen = new Set<string>();
-    const addFile = (file: File | null, hintedType = '') => {
-      if (!file || !isClipboardImageFile(file, hintedType)) return;
-      const key = clipboardFileKey(file);
-      if (seen.has(key)) return;
-      seen.add(key);
-      files.push(file);
-    };
+    const files = Array.from(data.files ?? []).filter((file) => isClipboardImageFile(file));
+    if (files.length > 0) {
+      return collapseGeneratedClipboardRepresentations(files);
+    }
 
-    for (const item of Array.from(data.items ?? [])) {
-      if (item.kind !== 'file') continue;
-      addFile(item.getAsFile(), item.type);
-    }
-    for (const file of Array.from(data.files ?? [])) {
-      addFile(file);
-    }
-    return files;
+    const itemFiles = Array.from(data.items ?? [])
+      .filter((item) => item.kind === 'file')
+      .map((item) => ({ file: item.getAsFile(), hintedType: item.type }))
+      .filter((entry): entry is { file: File; hintedType: string } => (
+        entry.file !== null && isClipboardImageFile(entry.file, entry.hintedType)
+      ))
+      .map((entry) => entry.file);
+    return collapseGeneratedClipboardRepresentations(itemFiles);
   }
 
   function readImageFileIntoComposer(file: File) {
@@ -953,21 +975,23 @@
   }
 
   function composerWorkspaceLabel(workspace: ComposerWorkspaceOption | null): string {
-    if (!workspace) return i18n.t('input.workspace.select');
+    if (!workspace) return i18n.locale.startsWith('zh') ? 'Magi 空间' : 'Magi Space';
     return workspace.name || workspace.rootPath;
   }
 
   function composerWorkspaceTitle(workspace: ComposerWorkspaceOption | null): string {
-    if (!workspace) return i18n.t('input.workspace.required');
+    if (!workspace) return i18n.locale.startsWith('zh') ? 'Magi 内置空间' : 'Built-in Magi Space';
     return `${i18n.t('input.workspace.title')}: ${workspace.rootPath}`;
   }
 
   function workspaceButtonLabel(workspace: ComposerWorkspaceOption | null): string {
     if (workspace) return composerWorkspaceLabel(workspace);
+    if (isPersonalSession) return composerWorkspaceLabel(null);
     return isDraftSession ? i18n.t('input.workspace.select') : i18n.t('input.workspace.title');
   }
 
   function workspaceButtonTitle(workspace: ComposerWorkspaceOption | null): string {
+    if (isPersonalSession) return composerWorkspaceTitle(null);
     if (isDraftSession) return composerWorkspaceTitle(workspace);
     if (!workspace) return i18n.t('input.workspace.lockedPending');
     return i18n.t('input.workspace.locked', { name: composerWorkspaceLabel(workspace) });
@@ -980,6 +1004,7 @@
     workspacePickerOpen = false;
     navigateSession({
       kind: 'draft',
+      scope: 'workspace',
       workspaceId: workspace.workspaceId,
       workspacePath: workspaceBindingPath(workspace),
     });
@@ -992,6 +1017,9 @@
   }
 
   function resolveSubmissionWorkspace(): ComposerWorkspaceOption | null {
+    if (!currentWorkspaceId?.trim() && !currentWorkspacePath?.trim()) {
+      return null;
+    }
     return resolveComposerWorkspace(currentWorkspaceId, currentWorkspacePath, isDraftSession);
   }
 
@@ -1073,7 +1101,7 @@
       const nextProfile = readStoredAccessProfile();
       if (nextProfile === selectedAccessProfile) return;
       selectedAccessProfile = nextProfile;
-      void getAgentSettingsBootstrap({ scope: 'core', accessProfile: nextProfile })
+      void getAgentSettingsBootstrap({ bootstrapScope: 'core', accessProfile: nextProfile })
         .then((latest) => {
           if (settingsBootstrapMatchesCurrentWorkspace(latest)) {
             messagesState.settingsBootstrapSnapshot = latest;
@@ -1131,8 +1159,8 @@
     const workspaceId = currentWorkspaceId?.trim() || '';
     const workspacePath = currentWorkspacePath?.trim() || '';
     const sessionId = currentSessionId?.trim() || '';
-    const refreshKey = `${workspaceId}|${workspacePath}|${sessionId}|${selectedAccessProfile}`;
-    if (!workspaceId && !workspacePath) return;
+    const scope = workspaceId || workspacePath ? 'workspace' : 'personal';
+    const refreshKey = `${scope}|${workspaceId}|${workspacePath}|${sessionId}|${selectedAccessProfile}`;
     if (
       messagesState.settingsBootstrapSnapshot
       && settingsBootstrapMatchesCurrentWorkspace(messagesState.settingsBootstrapSnapshot)
@@ -1143,7 +1171,7 @@
     if (settingsBootstrapRefreshKey === refreshKey) return;
     settingsBootstrapRefreshKey = refreshKey;
     const seq = ++settingsBootstrapRefreshSeq;
-    getAgentSettingsBootstrap({ scope: 'core', accessProfile: selectedAccessProfile })
+    getAgentSettingsBootstrap({ bootstrapScope: 'core', accessProfile: selectedAccessProfile })
       .then((latest) => {
         if (seq !== settingsBootstrapRefreshSeq) return;
         if (!settingsBootstrapMatchesCurrentWorkspace(latest)) return;
@@ -1196,10 +1224,6 @@
       }
 
       const targetWorkspace = resolveSubmissionWorkspace();
-      if (!targetWorkspace) {
-        addToast('warning', i18n.t('input.workspace.required'));
-        return;
-      }
 
       const orchestratorSessionConfig = resolveTurnOrchestratorSessionConfigPayload();
       if (!orchestratorSessionConfig) {
@@ -1214,8 +1238,8 @@
         type: 'executeTask',
         text: submissionText,
         requestId,
-        workspaceId: targetWorkspace.workspaceId,
-        workspacePath: workspaceBindingPath(targetWorkspace),
+        workspaceId: targetWorkspace?.workspaceId || '',
+        workspacePath: targetWorkspace ? workspaceBindingPath(targetWorkspace) : '',
         sessionId: isDraftSession ? '' : (messagesState.currentSessionId || ''),
         skillName: selectedSkill?.skillId ?? null,
         goalMode: selectedGoalMode,
@@ -1606,8 +1630,6 @@
   }
 
   function applyOrchestratorSessionDefaults(defaults: Record<string, unknown>) {
-    const defaultModel = typeof defaults.model === 'string' ? defaults.model.trim() : '';
-    if (!defaultModel) return;
     const snapshot = messagesState.settingsBootstrapSnapshot;
     if (snapshot && settingsBootstrapMatchesCurrentWorkspace(snapshot)) {
       const currentSessionConfig = objectRecord(snapshot.orchestratorSessionConfig);
@@ -1635,7 +1657,7 @@
   }
 
   async function refreshPickerSettingsSnapshot() {
-    const latest = await getAgentSettingsBootstrap({ scope: 'core', accessProfile: selectedAccessProfile });
+    const latest = await getAgentSettingsBootstrap({ bootstrapScope: 'core', accessProfile: selectedAccessProfile });
     if (!settingsBootstrapMatchesCurrentWorkspace(latest)) {
       return;
     }
@@ -1714,6 +1736,11 @@
       return;
     }
     const sessionId = currentSessionId?.trim() || '';
+    const workspaceId = currentWorkspaceId?.trim() || '';
+    const workspacePath = currentWorkspacePath?.trim() || '';
+    const binding: AgentBindingOverride = workspaceId || workspacePath
+      ? { scope: 'workspace', workspaceId, workspacePath, sessionId }
+      : { scope: 'personal', sessionId };
     const reasoningEffort = readOrchestratorReasoningEffort();
     if (!sessionId) {
       messagesState.draftOrchestratorSessionConfig = withOrchestratorReasoningEffort(
@@ -1733,11 +1760,7 @@
       { model: normalizedModel },
     );
     try {
-      const saved = await saveAgentOrchestratorSessionConfig(nextSessionConfig, {
-        sessionId,
-        workspaceId: currentWorkspaceId?.trim() || undefined,
-        workspacePath: currentWorkspacePath?.trim() || undefined,
-      });
+      const saved = await saveAgentOrchestratorSessionConfig(nextSessionConfig, binding);
       applyLocalOrchestratorSessionConfig(
         objectRecord(saved.orchestratorSessionConfig),
         objectRecord(saved.effectiveOrchestratorConfig),
@@ -1761,6 +1784,11 @@
 
   async function selectPickerReasoningEffort(value: ReasoningEffort) {
     const sessionId = currentSessionId?.trim() || '';
+    const workspaceId = currentWorkspaceId?.trim() || '';
+    const workspacePath = currentWorkspacePath?.trim() || '';
+    const binding: AgentBindingOverride = workspaceId || workspacePath
+      ? { scope: 'workspace', workspaceId, workspacePath, sessionId }
+      : { scope: 'personal', sessionId };
     if (!sessionId) {
       applyDraftOrchestratorSessionPatch({ reasoningEffort: value });
       pickerError = null;
@@ -1776,11 +1804,7 @@
       reasoningEffort: value,
     };
     try {
-      const saved = await saveAgentOrchestratorSessionConfig(nextSessionConfig, {
-        sessionId,
-        workspaceId: currentWorkspaceId?.trim() || undefined,
-        workspacePath: currentWorkspacePath?.trim() || undefined,
-      });
+      const saved = await saveAgentOrchestratorSessionConfig(nextSessionConfig, binding);
       applyLocalOrchestratorSessionConfig(
         objectRecord(saved.orchestratorSessionConfig),
         objectRecord(saved.effectiveOrchestratorConfig),
@@ -3812,7 +3836,7 @@
       justify-content: center;
     }
 
-    .ia-model-wrap {
+  .ia-model-wrap {
       flex: 0 1 132px;
       width: auto;
       min-width: 0;

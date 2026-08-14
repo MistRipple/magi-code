@@ -1299,10 +1299,10 @@ impl DaemonRuntime {
             },
         );
         // ToolRegistry 在 ApiState 之前装配；只捕获共享依赖，避免完整 ApiState 引用环。
-        let browser_runtime_holder =
+        let browser_automation_dependencies =
             Arc::new(OnceLock::<magi_api::BrowserToolRuntimeDependencies>::new());
         let browser_tool_executor: magi_tool_runtime::BrowserToolExecutor = {
-            let holder = Arc::clone(&browser_runtime_holder);
+            let holder = Arc::clone(&browser_automation_dependencies);
             Arc::new(move |tool_call_id, tool_name, input, context| {
                 holder.get().map_or_else(
                     || {
@@ -1310,7 +1310,7 @@ impl DaemonRuntime {
                             serde_json::json!({
                                 "tool": tool_name,
                                 "status": "failed",
-                                "error_code": "browser_runtime_not_initialized",
+                                "error_code": "browser_host_not_initialized",
                                 "recoverable": false,
                                 "requires_user_action": false,
                                 "error": "浏览器运行时尚未初始化",
@@ -1324,15 +1324,14 @@ impl DaemonRuntime {
             })
         };
         let browser_capability_provider: magi_tool_runtime::BrowserCapabilityProvider = {
-            let holder = Arc::clone(&browser_runtime_holder);
+            let holder = Arc::clone(&browser_automation_dependencies);
             Arc::new(move |session_id| {
                 holder.get().map_or_else(
-                    || magi_browser_runtime::BrowserCapabilitySnapshot {
+                    || magi_browser_authority::BrowserCapabilitySnapshot {
                         revision: 0,
                         in_app_browser_enabled: false,
                         browser_use_enabled: false,
-                        runtime_status:
-                            magi_browser_runtime::BrowserRuntimeComponentStatus::NotInstalled,
+                        host_status: magi_browser_authority::BrowserHostStatus::Stopped,
                         host_protocol_compatible: false,
                         access_profile: magi_core::AccessProfile::Restricted,
                     },
@@ -1350,7 +1349,7 @@ impl DaemonRuntime {
                 image_generation_readiness_provider,
             )
             .with_git_tool_executor(git_tool_executor)
-            .with_browser_runtime(browser_tool_executor, browser_capability_provider)
+            .with_browser_automation(browser_tool_executor, browser_capability_provider)
             .with_runtime_capability_dependency_provider(runtime_capability_dependency_provider);
         tool_registry.register_default_builtins();
 
@@ -1601,7 +1600,7 @@ impl DaemonRuntime {
         .with_bridge_probe_transport(BridgeServerKind::Model, model_transport)
         .with_bridge_probe_transport(BridgeServerKind::Mcp, mcp_transport)
         .with_execution_pipeline(orchestrator, execution_runtime, memory_store);
-        browser_runtime_holder
+        browser_automation_dependencies
             .set(state.browser_tool_runtime_dependencies())
             .map_err(|_| DaemonError::internal("重复装配 Browser 工具运行时依赖"))?;
 
@@ -1683,7 +1682,7 @@ impl DaemonRuntime {
                     Some(&session_id),
                     None,
                     Some(&root_task_id),
-                    magi_browser_runtime::BrowserLeaseEndReason::TaskFinished,
+                    magi_browser_authority::BrowserLeaseEndReason::TaskFinished,
                 );
                 if report.browser_lease_count > 0 {
                     tracing::debug!(
@@ -1734,7 +1733,7 @@ impl DaemonRuntime {
         // 测试可用 ApiState::new 直接构造而不调用此函数，惰性 fallback 仍兜底。
         state.install_snapshot_lifecycle_observer();
         magi_api::task_turn_finalize::schedule_restored_session_turn_queues(&state);
-        super::browser_runtime::start_controller(&state);
+        super::browser_host::start_controller(&state);
 
         Ok(state)
     }
@@ -3370,7 +3369,7 @@ done
             restored
                 .router("daemon-test".to_string())
                 .expect("测试路由应成功构造"),
-            &format!("/api/settings/bootstrap?scope=core&workspaceId={secondary_workspace_id}"),
+            &format!("/api/settings/bootstrap?scope=workspace&bootstrapScope=core&workspaceId={secondary_workspace_id}"),
         )
         .await;
         let workspace_code_index = bootstrap["capabilityDependencies"]
@@ -3460,7 +3459,7 @@ done
         get_json(
             app,
             &format!(
-                "/api/agent-runs/projection/{root_task_id}?workspaceId={workspace_id}&sessionId={session_id}"
+                "/api/agent-runs/projection/{root_task_id}?scope=workspace&workspaceId={workspace_id}&sessionId={session_id}"
             ),
         )
         .await
@@ -3708,6 +3707,7 @@ done
             app.clone(),
             "/api/session/turn",
             json!({
+                "scope": "workspace",
                 "sessionId": "test-session-001",
                 "text": "修复 parser constraint 记忆问题，完成后运行测试并汇总验证结果",
                 "skillName": "refactor",
@@ -3753,6 +3753,7 @@ done
             app.clone(),
             "/api/session/turn",
             json!({
+                "scope": "workspace",
                 "sessionId": "test-session-001",
                 "text": "修复 parser 后续工作问题，完成后运行测试并汇总验证结果",
                 "skillName": "refactor",
@@ -3821,6 +3822,7 @@ done
             app.clone(),
             "/api/session/turn",
             json!({
+                "scope": "workspace",
                 "sessionId": session_id.to_string(),
                 "text": "这是一条普通对话",
                 "skillName": null,
@@ -3914,6 +3916,7 @@ done
             app.clone(),
             "/api/session/turn",
             json!({
+                "scope": "workspace",
                 "sessionId": "test-session-001",
                 "text": "修复 recovery route 初始状态问题，完成后运行测试并汇总验证结果",
                 "skillName": "refactor",
@@ -3997,6 +4000,7 @@ done
             app.clone(),
             "/api/session/turn",
             json!({
+                "scope": "workspace",
                 "sessionId": "test-session-001",
                 "text": "修复 recovery memory 消费问题，完成后运行测试并汇总验证结果",
                 "skillName": "refactor",
@@ -4596,7 +4600,11 @@ done
             ],
         );
 
-        let bootstrap = get_json(app, "/api/settings/bootstrap?scope=core").await;
+        let bootstrap = get_json(
+            app,
+            "/api/settings/bootstrap?scope=personal&bootstrapScope=core",
+        )
+        .await;
 
         assert_eq!(
             bootstrap["orchestratorConfig"]["baseUrl"],
@@ -5379,7 +5387,7 @@ done
             .router("daemon-test".to_string())
             .expect("测试路由应成功构造");
 
-        let bootstrap = get_json(app.clone(), "/bootstrap").await;
+        let bootstrap = get_json(app.clone(), "/bootstrap?scope=personal").await;
         let bridge_services = get_json(app.clone(), "/bridges/services").await;
         let bridge_preflight = get_json(app, "/bridges/preflight").await;
 

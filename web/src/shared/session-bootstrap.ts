@@ -1,4 +1,5 @@
 export interface SessionBootstrapSnapshot {
+  scope?: 'personal' | 'workspace';
   agent?: {
     runtimeEpoch?: string;
   };
@@ -11,7 +12,7 @@ export interface SessionBootstrapSnapshot {
   sessions: unknown[];
   state: unknown;
   notifications?: {
-    workspaceId: string;
+    workspaceId: string | null;
     sessionId?: string;
     notifications: unknown;
   };

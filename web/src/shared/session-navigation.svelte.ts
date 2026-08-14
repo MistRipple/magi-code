@@ -4,8 +4,10 @@ import type { ClientBridgeMessage } from './bridges/client-bridge';
 import { copyOrchestratorSessionConfig } from './orchestrator-session-config';
 
 export type SessionNavigationTarget =
-  | { kind: 'draft'; workspaceId: string; workspacePath: string }
-  | { kind: 'session'; workspaceId: string; workspacePath: string; sessionId: string };
+  | { kind: 'draft'; scope: 'personal' }
+  | { kind: 'draft'; scope: 'workspace'; workspaceId: string; workspacePath: string }
+  | { kind: 'session'; scope: 'personal'; sessionId: string }
+  | { kind: 'session'; scope: 'workspace'; workspaceId: string; workspacePath: string; sessionId: string };
 
 export interface SessionNavigationTransaction {
   requestId: string;
@@ -18,12 +20,17 @@ export const sessionNavigationState = $state({
 });
 
 function normalizeTarget(target: SessionNavigationTarget): SessionNavigationTarget | null {
+  if (target.scope === 'personal') {
+    if (target.kind === 'draft') return { kind: 'draft', scope: 'personal' };
+    const sessionId = target.sessionId.trim();
+    return sessionId ? { kind: 'session', scope: 'personal', sessionId } : null;
+  }
   const workspaceId = target.workspaceId.trim();
   const workspacePath = target.workspacePath.trim();
   if (!workspaceId || !workspacePath) return null;
-  if (target.kind === 'draft') return { kind: 'draft', workspaceId, workspacePath };
+  if (target.kind === 'draft') return { kind: 'draft', scope: 'workspace', workspaceId, workspacePath };
   const sessionId = target.sessionId.trim();
-  return sessionId ? { kind: 'session', workspaceId, workspacePath, sessionId } : null;
+  return sessionId ? { kind: 'session', scope: 'workspace', workspaceId, workspacePath, sessionId } : null;
 }
 
 function inheritedDraftConfig(): Record<string, unknown> {
@@ -50,8 +57,10 @@ function navigationMessage(transaction: SessionNavigationTransaction): ClientBri
       type: 'navigateSession',
       requestId,
       target: 'draft',
-      workspaceId: target.workspaceId,
-      workspacePath: target.workspacePath,
+      scope: target.scope,
+      ...(target.scope === 'workspace'
+        ? { workspaceId: target.workspaceId, workspacePath: target.workspacePath }
+        : {}),
       orchestratorSessionConfig: inheritedDraftConfig(),
     };
   }
@@ -59,8 +68,10 @@ function navigationMessage(transaction: SessionNavigationTransaction): ClientBri
     type: 'navigateSession',
     requestId,
     target: 'session',
-    workspaceId: target.workspaceId,
-    workspacePath: target.workspacePath,
+    scope: target.scope,
+    ...(target.scope === 'workspace'
+      ? { workspaceId: target.workspaceId, workspacePath: target.workspacePath }
+      : {}),
     sessionId: target.sessionId,
   };
 }
@@ -81,7 +92,7 @@ export function navigateSession(target: SessionNavigationTarget): SessionNavigat
 
 export function settleSessionNavigation(
   requestId: unknown,
-  target: Pick<SessionNavigationTarget, 'workspaceId'> & { kind: SessionNavigationTarget['kind']; sessionId?: string },
+  target: { kind: SessionNavigationTarget['kind']; scope: 'personal' | 'workspace'; workspaceId?: string; sessionId?: string },
 ): boolean {
   const pending = sessionNavigationState.pending;
   if (!pending || typeof requestId !== 'string' || pending.requestId !== requestId.trim()) return false;
@@ -89,7 +100,9 @@ export function settleSessionNavigation(
   const targetSessionId = typeof target.sessionId === 'string' ? target.sessionId.trim() : '';
   if (
     pending.target.kind !== target.kind
-    || pending.target.workspaceId !== target.workspaceId.trim()
+    || pending.target.scope !== target.scope
+    || (pending.target.scope === 'workspace'
+      && pending.target.workspaceId !== (target.workspaceId?.trim() || ''))
     || pendingSessionId !== targetSessionId
   ) return false;
   sessionNavigationState.pending = null;
@@ -101,4 +114,17 @@ export function failSessionNavigation(requestId: unknown): boolean {
   if (!pending || typeof requestId !== 'string' || pending.requestId !== requestId.trim()) return false;
   sessionNavigationState.pending = null;
   return true;
+}
+
+export async function waitForSessionNavigation(
+  transaction: SessionNavigationTransaction,
+  timeoutMillis = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMillis;
+  while (sessionNavigationState.pending?.requestId === transaction.requestId) {
+    if (Date.now() >= deadline) {
+      throw new Error('会话导航超时');
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 25));
+  }
 }

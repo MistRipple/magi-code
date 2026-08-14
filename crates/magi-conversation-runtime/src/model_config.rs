@@ -36,6 +36,12 @@ pub struct BuiltinTextModelRuleDefinition {
 
 const BUILTIN_TEXT_MODEL_RULES: &[BuiltinTextModelRuleDefinition] = &[
     BuiltinTextModelRuleDefinition {
+        id: "glm-4.5-air-family",
+        display_name: "GLM 4.5 Air",
+        examples: &["glm-4.5-air", "glm 4.5 air"],
+        pattern: r"(?i)^glm[-_.: ]*4[-_.: ]*5[-_.: ]*air(?:[-_.: ].*)?$",
+    },
+    BuiltinTextModelRuleDefinition {
         id: "glm-5.2-family",
         display_name: "GLM 5.2",
         examples: &["glm-5.2", "glm 5.2-air"],
@@ -103,43 +109,12 @@ impl TextModelRuleMatchMode {
             _ => None,
         }
     }
-
-    pub fn as_label(self) -> &'static str {
-        match self {
-            Self::Exact => "exact",
-            Self::Regex => "regex",
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextModelRule {
     pub match_mode: TextModelRuleMatchMode,
     pub pattern: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TextModelRuleSource {
-    Builtin,
-    Custom,
-}
-
-impl TextModelRuleSource {
-    pub fn as_label(self) -> &'static str {
-        match self {
-            Self::Builtin => "builtin",
-            Self::Custom => "custom",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TextModelRuleMatch {
-    pub source: TextModelRuleSource,
-    pub rule_id: String,
-    pub display_name: Option<String>,
-    pub match_mode: TextModelRuleMatchMode,
-    pub pattern: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -508,59 +483,38 @@ pub fn model_matches_text_model_rule(
     settings_store: Option<&magi_settings_store::SettingsStore>,
     model: &str,
 ) -> bool {
-    let user_rules = settings_store
-        .map(|store| {
-            parse_user_text_model_rules(&store.get_section(VISION_MODEL_SECTION))
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    match_text_model_rule(model, &user_rules).is_some()
-}
-
-pub fn match_text_model_rule(
-    model: &str,
-    user_rules: &[TextModelRule],
-) -> Option<TextModelRuleMatch> {
     let model = model.trim();
     if model.is_empty() {
-        return None;
+        return false;
     }
-    if let Some((definition, _)) = BUILTIN_TEXT_MODEL_RULES
+    if builtin_text_model_regexes()
         .iter()
-        .zip(builtin_text_model_regexes())
-        .find(|(_, regex)| regex.is_match(model))
+        .any(|regex| regex.is_match(model))
     {
-        return Some(TextModelRuleMatch {
-            source: TextModelRuleSource::Builtin,
-            rule_id: definition.id.to_string(),
-            display_name: Some(definition.display_name.to_string()),
-            match_mode: TextModelRuleMatchMode::Regex,
-            pattern: None,
-        });
+        return true;
     }
-    user_rules.iter().enumerate().find_map(|(index, rule)| {
-        let matches = match rule.match_mode {
+    let Some(store) = settings_store else {
+        return false;
+    };
+    parse_user_text_model_rules(&store.get_section(VISION_MODEL_SECTION))
+        .unwrap_or_default()
+        .iter()
+        .any(|rule| match rule.match_mode {
             TextModelRuleMatchMode::Exact => rule.pattern.eq_ignore_ascii_case(model),
             TextModelRuleMatchMode::Regex => {
                 Regex::new(&rule.pattern).is_ok_and(|pattern| pattern.is_match(model))
             }
-        };
-        matches.then(|| TextModelRuleMatch {
-            source: TextModelRuleSource::Custom,
-            rule_id: format!("custom-{index}"),
-            display_name: None,
-            match_mode: rule.match_mode,
-            pattern: Some(rule.pattern.clone()),
         })
-    })
 }
 
 pub fn resolve_vision_execution_config(
     settings_store: Option<&magi_settings_store::SettingsStore>,
     selected_model: &str,
-    request_contains_images: bool,
+    current_turn_contains_images: bool,
 ) -> Result<Option<NormalizedModelConfig>, String> {
-    if !request_contains_images || !model_matches_text_model_rule(settings_store, selected_model) {
+    if !current_turn_contains_images
+        || !model_matches_text_model_rule(settings_store, selected_model)
+    {
         return Ok(None);
     }
     let store = settings_store.ok_or_else(|| {
@@ -1040,7 +994,9 @@ mod tests {
         assert!(model_matches_text_model_rule(Some(&store), "DeepSeek V4"));
         assert!(model_matches_text_model_rule(Some(&store), "GLM-5.2"));
         assert!(model_matches_text_model_rule(Some(&store), "glm 5.2-air"));
-        assert!(!model_matches_text_model_rule(Some(&store), "GLM-4.5-Air"));
+        assert!(model_matches_text_model_rule(Some(&store), "GLM-4.5-Air"));
+        assert!(model_matches_text_model_rule(Some(&store), "glm 4.5 air"));
+        assert!(!model_matches_text_model_rule(Some(&store), "GLM-4.5V"));
         assert!(!model_matches_text_model_rule(Some(&store), "gpt-4.1"));
         store
             .set_section(
@@ -1058,22 +1014,6 @@ mod tests {
             "COMPANY-TEXT-MODEL"
         ));
         assert!(model_matches_text_model_rule(Some(&store), "legacy-42"));
-
-        let builtin_match =
-            match_text_model_rule("deepseek-v4-flash", &[]).expect("内置规则应返回权威命中详情");
-        assert_eq!(builtin_match.source, TextModelRuleSource::Builtin);
-        assert_eq!(builtin_match.rule_id, "deepseek-v4-family");
-        assert_eq!(builtin_match.display_name.as_deref(), Some("DeepSeek V4"));
-        assert!(builtin_match.pattern.is_none());
-
-        let user_rules = parse_user_text_model_rules(&store.get_section(VISION_MODEL_SECTION))
-            .expect("用户规则应可解析");
-        let custom_match =
-            match_text_model_rule("legacy-42", &user_rules).expect("用户规则应返回权威命中详情");
-        assert_eq!(custom_match.source, TextModelRuleSource::Custom);
-        assert_eq!(custom_match.rule_id, "custom-1");
-        assert_eq!(custom_match.match_mode, TextModelRuleMatchMode::Regex);
-        assert_eq!(custom_match.pattern.as_deref(), Some("^legacy-[0-9]+$"));
     }
 
     #[test]
@@ -1084,6 +1024,11 @@ mod tests {
             !rule.id.is_empty() && !rule.display_name.is_empty() && !rule.examples.is_empty()
         }));
         assert!(catalog.iter().any(|rule| rule.display_name == "GLM 5.2"));
+        assert!(
+            catalog
+                .iter()
+                .any(|rule| rule.display_name == "GLM 4.5 Air")
+        );
         assert!(
             catalog
                 .iter()
@@ -1121,7 +1066,7 @@ mod tests {
                 .is_none(),
             "未命中文本模型规则时不得切换识图模型"
         );
-        let resolved = resolve_vision_execution_config(Some(&store), "GLM-5.2", true)
+        let resolved = resolve_vision_execution_config(Some(&store), "GLM-4.5-Air", true)
             .unwrap()
             .expect("图片请求命中文本模型规则时必须切换识图模型");
         assert_eq!(resolved.require_model().unwrap(), "vision-model");
@@ -1215,45 +1160,6 @@ mod tests {
             configured_role_engine_model_config(&store, "executor")
                 .expect("orchestrator inheritance is valid")
                 .is_none()
-        );
-    }
-
-    #[test]
-    fn orchestrator_model_config_uses_defaults_for_legacy_session() {
-        let store = magi_settings_store::SettingsStore::new();
-        store
-            .set_section(
-                "orchestrator",
-                json!({
-                    "baseUrl": "https://api.example.com/v1",
-                    "apiKey": "sk-orch",
-                    "urlMode": "standard",
-                    "apiProtocol": "openai_chat",
-                }),
-            )
-            .unwrap();
-        store
-            .set_section(
-                magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
-                json!({
-                    "model": "model-last-used",
-                    "reasoningEffort": "high"
-                }),
-            )
-            .unwrap();
-        let legacy_session = SessionId::new("session-without-model-override");
-
-        let config = resolve_orchestrator_model_config(&store, Some(&legacy_session))
-            .expect("旧会话应继承权威的用户默认模型");
-        assert_eq!(
-            config.require_model().expect("默认模型必须可执行"),
-            "model-last-used"
-        );
-        assert_eq!(
-            config
-                .to_usage_llm_config()
-                .and_then(|config| config.reasoning_effort),
-            Some(magi_usage_authority::ReasoningEffort::High),
         );
     }
 }

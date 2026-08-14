@@ -32,8 +32,9 @@
   let localError = $state<string | null>(null);
 
   const binding = $derived.by<GitContextBinding>(() => ({
-    workspaceId: messagesState.currentWorkspaceId?.trim() || undefined,
-    workspacePath: messagesState.currentWorkspacePath?.trim() || undefined,
+    scope: 'workspace',
+    workspaceId: messagesState.currentWorkspaceId?.trim() || '',
+    workspacePath: messagesState.currentWorkspacePath?.trim() || '',
     sessionId: messagesState.currentSessionId?.trim() || undefined,
   }));
   const bindingKey = $derived(gitContextBindingKey(binding));

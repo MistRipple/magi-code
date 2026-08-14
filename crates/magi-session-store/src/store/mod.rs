@@ -7,9 +7,9 @@ mod tests;
 
 use crate::lifecycle::SessionLifecycleObserver;
 use crate::models::{
-    NotificationRecord, NotificationScope, SessionDurableState, SessionExecutionSidecarStoreState,
-    SessionPlan, SessionRecord, SessionSidecarFlushReason, SessionStoreState, TimelineEntry,
-    TimelineEntryKind,
+    NotificationContext, NotificationRecord, NotificationScope, SessionDurableState,
+    SessionExecutionSidecarStoreState, SessionPlan, SessionRecord, SessionSidecarFlushReason,
+    SessionStoreState, TimelineEntry, TimelineEntryKind,
 };
 use magi_core::{DomainError, DomainResult, SessionId, SessionLifecycleStatus, UtcMillis};
 use std::sync::{Arc, Mutex, RwLock};
@@ -820,11 +820,9 @@ impl SessionStore {
                     message: "workspace incident requires workspace_id".to_string(),
                 });
             }
-            NotificationScope::Session
-                if notification.workspace_id.is_none() || notification.session_id.is_none() =>
-            {
+            NotificationScope::Session if notification.session_id.is_none() => {
                 return Err(DomainError::Validation {
-                    message: "session incident requires workspace_id and session_id".to_string(),
+                    message: "session incident requires session_id".to_string(),
                 });
             }
             NotificationScope::Workspace | NotificationScope::Session => {}
@@ -840,11 +838,7 @@ impl SessionStore {
         Ok(())
     }
 
-    pub fn clear_notifications_for_context(
-        &self,
-        workspace_id: &str,
-        session_id: Option<&SessionId>,
-    ) -> usize {
+    pub fn clear_notifications_for_context(&self, context: &NotificationContext) -> usize {
         let mut state = self
             .state
             .write()
@@ -852,15 +846,11 @@ impl SessionStore {
         let before = state.notifications.len();
         state
             .notifications
-            .retain(|notification| !notification.visible_in_context(workspace_id, session_id));
+            .retain(|notification| !notification.visible_in_context(context));
         before.saturating_sub(state.notifications.len())
     }
 
-    pub fn mark_notifications_handled_for_context(
-        &self,
-        workspace_id: &str,
-        session_id: Option<&SessionId>,
-    ) {
+    pub fn mark_notifications_handled_for_context(&self, context: &NotificationContext) {
         let mut state = self
             .state
             .write()
@@ -868,7 +858,7 @@ impl SessionStore {
         for notification in state
             .notifications
             .iter_mut()
-            .filter(|notification| notification.visible_in_context(workspace_id, session_id))
+            .filter(|notification| notification.visible_in_context(context))
         {
             notification.handled = true;
             notification.count_unread = false;
@@ -877,8 +867,7 @@ impl SessionStore {
 
     pub fn remove_notification_for_context(
         &self,
-        workspace_id: &str,
-        session_id: Option<&SessionId>,
+        context: &NotificationContext,
         notification_id: &str,
     ) -> DomainResult<()> {
         let mut state = self
@@ -889,7 +878,7 @@ impl SessionStore {
             .notifications
             .iter()
             .position(|notification| {
-                notification.visible_in_context(workspace_id, session_id)
+                notification.visible_in_context(context)
                     && notification.notification_id == notification_id
             })
             .ok_or(DomainError::NotFound {
@@ -901,8 +890,7 @@ impl SessionStore {
 
     pub fn resolve_notification_for_context(
         &self,
-        workspace_id: &str,
-        session_id: Option<&SessionId>,
+        context: &NotificationContext,
         notification_id: &str,
     ) -> DomainResult<()> {
         let mut state = self
@@ -914,7 +902,7 @@ impl SessionStore {
             .iter_mut()
             .find(|notification| {
                 notification.notification_id == notification_id
-                    && notification.visible_in_context(workspace_id, session_id)
+                    && notification.visible_in_context(context)
             })
             .ok_or(DomainError::NotFound {
                 entity: "notification",

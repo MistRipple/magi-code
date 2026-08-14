@@ -3,19 +3,16 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-use magi_core::{EventId, UtcMillis};
-use magi_event_bus::{EventContext, EventEnvelope};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use super::session_scope::{require_registered_workspace_binding, require_session_workspace_scope};
+use super::session_scope::require_registered_workspace_binding;
 use crate::{errors::ApiError, state::ApiState};
 
 static WORKSPACE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-static SESSION_VIEW_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
@@ -24,10 +21,7 @@ pub fn routes() -> Router<ApiState> {
         .route("/workspaces/remove", post(remove_workspace))
         .route("/workspaces/pick", get(pick_workspace))
         .route("/workspaces/sessions", get(workspace_sessions))
-        .route(
-            "/workspaces/sessions/viewed",
-            post(mark_workspace_session_viewed),
-        )
+        .route("/sessions/personal", get(personal_sessions))
 }
 
 #[derive(Debug, Serialize)]
@@ -50,7 +44,7 @@ struct WorkspaceListResponse {
 #[serde(rename_all = "camelCase")]
 struct WorkspaceSessionDto {
     session_id: String,
-    workspace_id: String,
+    workspace_id: Option<String>,
     title: String,
     status: String,
     created_at: u64,
@@ -68,6 +62,45 @@ struct WorkspaceSessionsResponse {
     event_stream_next_sequence: u64,
     workspace: WorkspaceDto,
     sessions: Vec<WorkspaceSessionDto>,
+}
+
+/// 个人会话目录与项目会话目录使用同一读模型，但没有 workspace 绑定。
+/// 这是独立端点，避免客户端把空 workspaceId 当作“所有项目”的模糊筛选。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonalSessionsResponse {
+    runtime_epoch: String,
+    event_stream_next_sequence: u64,
+    sessions: Vec<WorkspaceSessionDto>,
+}
+
+async fn personal_sessions(State(state): State<ApiState>) -> Json<PersonalSessionsResponse> {
+    let event_stream_next_sequence = state.event_bus.snapshot().next_sequence;
+    let sessions = state
+        .session_records_for_workspace(None)
+        .iter()
+        .map(|session| {
+            let sidecar = state.session_store.runtime_sidecar(&session.session_id);
+            let running_task_count = workspace_session_running_task_count(sidecar.as_ref());
+            WorkspaceSessionDto {
+                session_id: session.session_id.to_string(),
+                workspace_id: None,
+                title: session.title.clone(),
+                status: format!("{:?}", session.status),
+                created_at: session.created_at.0,
+                updated_at: session.updated_at.0,
+                message_count: session.message_count.unwrap_or(0),
+                is_running: running_task_count > 0,
+                running_task_count,
+                has_unread_completion: session.has_unread_completion(),
+            }
+        })
+        .collect();
+    Json(PersonalSessionsResponse {
+        runtime_epoch: state.runtime_epoch().to_string(),
+        event_stream_next_sequence,
+        sessions,
+    })
 }
 
 async fn list_workspaces(State(state): State<ApiState>) -> Json<WorkspaceListResponse> {
@@ -234,68 +267,6 @@ struct WorkspaceSessionsQuery {
     workspace_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MarkWorkspaceSessionViewedRequest {
-    workspace_id: Option<String>,
-    workspace_path: Option<String>,
-    session_id: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MarkWorkspaceSessionViewedResponse {
-    runtime_epoch: String,
-    event_stream_next_sequence: u64,
-    session_id: String,
-    has_unread_completion: bool,
-}
-
-async fn mark_workspace_session_viewed(
-    State(state): State<ApiState>,
-    Json(request): Json<MarkWorkspaceSessionViewedRequest>,
-) -> Result<Json<MarkWorkspaceSessionViewedResponse>, ApiError> {
-    let scope = require_session_workspace_scope(
-        &state,
-        Some(request.session_id.as_str()),
-        request.workspace_id.as_deref(),
-        request.workspace_path.as_deref(),
-        "标记为已查看",
-    )?;
-    let session = state
-        .session_store
-        .mark_session_viewed(&scope.session_id)
-        .map_err(|error| ApiError::internal_assembly("标记会话已查看失败", error))?;
-    state.persist_session_state_checkpoint("session_viewed")?;
-    let event_suffix = SESSION_VIEW_EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
-    state.event_bus.publish(
-        EventEnvelope::domain(
-            EventId::new(format!(
-                "event-session-viewed-{}-{}-{event_suffix}",
-                scope.session_id,
-                UtcMillis::now().0,
-            )),
-            "session.viewed",
-            serde_json::json!({
-                "sessionId": scope.session_id.as_str(),
-                "workspaceId": scope.workspace_id.as_str(),
-                "hasUnreadCompletion": session.has_unread_completion(),
-            }),
-        )
-        .with_context(EventContext {
-            session_id: Some(scope.session_id.clone()),
-            workspace_id: Some(scope.workspace_id.clone()),
-            ..EventContext::default()
-        }),
-    );
-    Ok(Json(MarkWorkspaceSessionViewedResponse {
-        runtime_epoch: state.runtime_epoch().to_string(),
-        event_stream_next_sequence: state.event_bus.snapshot().next_sequence,
-        session_id: scope.session_id.to_string(),
-        has_unread_completion: session.has_unread_completion(),
-    }))
-}
-
 async fn workspace_sessions(
     State(state): State<ApiState>,
     Query(query): Query<WorkspaceSessionsQuery>,
@@ -355,7 +326,7 @@ async fn workspace_sessions(
             let running_task_count = workspace_session_running_task_count(sidecar.as_ref());
             WorkspaceSessionDto {
                 session_id: session.session_id.to_string(),
-                workspace_id: scoped_workspace_id.clone(),
+                workspace_id: Some(scoped_workspace_id.clone()),
                 title: session.title.clone(),
                 status: format!("{:?}", session.status),
                 created_at: session.created_at.0,
@@ -797,7 +768,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_workspace_session_viewed_clears_unread_completion() {
+    async fn mark_session_viewed_clears_unread_completion() {
         let state = test_state();
         let workspace_id = WorkspaceId::new("workspace-mark-viewed");
         state
@@ -836,12 +807,11 @@ mod tests {
             .update_current_turn_status(&session_id, "completed")
             .expect("turn should complete");
 
-        let response = routes()
-            .with_state(state.clone())
+        let response = crate::routes::build_router(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/workspaces/sessions/viewed")
+                    .uri("/api/session/viewed")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -878,7 +848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_workspace_session_viewed_rejects_workspace_mismatch() {
+    async fn mark_session_viewed_rejects_workspace_mismatch() {
         let state = test_state();
         let workspace_id = WorkspaceId::new("workspace-viewed-owner");
         let foreign_workspace_id = WorkspaceId::new("workspace-viewed-foreign");
@@ -906,12 +876,11 @@ mod tests {
             )
             .expect("session should create");
 
-        let response = routes()
-            .with_state(state)
+        let response = crate::routes::build_router(state)
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/workspaces/sessions/viewed")
+                    .uri("/api/session/viewed")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({

@@ -38,7 +38,7 @@ export interface IncidentReportInput {
 }
 
 export interface IncidentReportRequest extends IncidentReportInput {
-  workspaceId: string;
+  workspaceId?: string;
   workspacePath?: string;
   sessionId?: string;
 }
@@ -97,16 +97,16 @@ export function buildIncidentRequest(
   context: IncidentContext,
 ): IncidentReportRequest {
   const workspaceId = optionalString(context.workspaceId);
-  if (!workspaceId) {
-    throw new Error('incident report requires workspaceId');
-  }
   const sessionId = optionalString(context.sessionId);
   if (input.scope === 'session' && !sessionId) {
     throw new Error('session incident requires sessionId');
   }
+  if (input.scope === 'workspace' && !workspaceId) {
+    throw new Error('workspace incident requires workspaceId');
+  }
   return {
     ...input,
-    workspaceId,
+    ...(workspaceId ? { workspaceId } : {}),
     ...(optionalString(context.workspacePath)
       ? { workspacePath: optionalString(context.workspacePath) }
       : {}),

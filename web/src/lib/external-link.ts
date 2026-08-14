@@ -1,5 +1,3 @@
-import { isDesktopRuntime } from './desktop-updater';
-
 const EXTERNAL_WEB_PROTOCOLS = new Set(['http:', 'https:']);
 
 export function normalizeExternalWebUrl(rawUrl: string): string | null {
@@ -21,9 +19,8 @@ export async function openExternalWebUrl(rawUrl: string): Promise<void> {
     throw new Error('仅支持打开 HTTP 或 HTTPS 网页');
   }
 
-  if (isDesktopRuntime()) {
-    const { openUrl } = await import('@tauri-apps/plugin-opener');
-    await openUrl(url);
+  if (window.magiDesktop) {
+    await window.magiDesktop.openExternal(url);
     return;
   }
 

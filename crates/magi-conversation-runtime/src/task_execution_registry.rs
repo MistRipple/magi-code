@@ -9,6 +9,7 @@
 //! 唯一所有者。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use magi_core::{
@@ -35,6 +36,9 @@ pub enum TaskExecutionPlan {
         is_primary: bool,
         session_id: SessionId,
         workspace_id: Option<WorkspaceId>,
+        /// 此任务实际执行的根目录。个人会话使用 Magi 管理的目录，项目会话使用项目根目录。
+        /// 它与 `workspace_id` 分离，避免把“是否属于项目”和“工具 cwd”混为同一概念。
+        execution_root: Option<PathBuf>,
         ownership: ExecutionOwnership,
         writebacks: ExecutionWritebackPlans,
         use_tools: bool,
@@ -278,6 +282,9 @@ impl TaskExecutionRegistry {
         let inherited_skill_name = parent_plan.as_ref().and_then(|plan| match plan {
             TaskExecutionPlan::Dispatch { skill_name, .. } => skill_name.clone(),
         });
+        let inherited_execution_root = parent_plan.as_ref().and_then(|plan| match plan {
+            TaskExecutionPlan::Dispatch { execution_root, .. } => execution_root.clone(),
+        });
         let branch = ActiveExecutionBranch {
             task_id: child_task.task_id.clone(),
             worker_id: worker_id.clone(),
@@ -338,6 +345,7 @@ impl TaskExecutionRegistry {
                 is_primary: false,
                 session_id: session_id.clone(),
                 workspace_id: workspace_id.clone(),
+                execution_root: inherited_execution_root,
                 ownership: ExecutionOwnership {
                     session_id: Some(session_id.clone()),
                     workspace_id: workspace_id.clone(),
@@ -512,6 +520,7 @@ mod tests {
                 is_primary: true,
                 session_id: session_id.clone(),
                 workspace_id: workspace_id.clone(),
+                execution_root: None,
                 ownership: ExecutionOwnership::default(),
                 writebacks: ExecutionWritebackPlans::default(),
                 use_tools: true,
@@ -628,6 +637,7 @@ mod tests {
                     is_primary: true,
                     session_id,
                     workspace_id: None,
+                    execution_root: None,
                     ownership: ExecutionOwnership::default(),
                     writebacks: ExecutionWritebackPlans::default(),
                     use_tools: true,

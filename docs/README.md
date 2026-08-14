@@ -17,8 +17,8 @@
 
 ## 运行入口
 
-- `magi-desktop` 是 Windows、Linux、macOS 的桌面产品入口，只负责系统窗口、托盘、单实例与进程生命周期。
-- `magi-daemon` 是唯一业务内核。桌面端在同一进程内启动它，桌面 WebView、浏览器、局域网设备与公网隧道共享同一个运行实例。
+- `apps/desktop` 是 Windows、Linux、macOS 的 Electron/Chromium 桌面产品入口，负责原生窗口、WebContentsView、单实例、布局和进程生命周期。
+- `magi-daemon` 是唯一业务内核。桌面端通过受控 sidecar 启动它，Magi UI 与内置浏览器共用同一 Chromium Desktop Host；浏览器自动化通过私有 Desktop Control 协议接管现有 Surface。
 - 主窗口关闭后默认隐藏到系统托盘，daemon 继续运行；只有托盘中的“退出 Magi”或操作系统显式退出动作会触发优雅关闭。
 - `magi-daemon-app` 仅保留为开发和无头部署入口，不参与桌面安装包，也不复制桌面宿主逻辑。
 
@@ -28,14 +28,15 @@
 ./scripts/dev-daemon.sh
 ```
 
-桌面宿主开发运行前先构建静态前端：
+桌面宿主开发运行前先构建前端和 Electron 入口：
 
 ```bash
 npm --prefix web run build
-cargo run -p magi-desktop
+npm run build
+npm run desktop:dev
 ```
 
-发布统一由 Tauri 生成 macOS Apple Silicon/Intel DMG、Linux AppImage/Deb 与 Windows NSIS 安装器，旧手工包装脚本已移除。
+发布统一由 Electron Builder 生成 macOS Apple Silicon/Intel DMG、Linux AppImage/Deb 与 Windows NSIS 安装器，旧手工包装脚本已移除。
 
 ## 目标与代理运行设计
 
@@ -50,4 +51,9 @@ cargo run -p magi-desktop
 ## 方案文档
 
 - [Magi Connect 与移动端方案](./magi-connect-mobile-plan.md)：账号、设备配对、连接服务、Desktop 边界及 Android/iOS 推进基线。
-- [Magi 内置浏览器完整设计](./browser-runtime-design.md)：Browser Authority、Playwright Host、Goal/子代理租约、右侧预览、页面标记与跨平台发布基线。
+- [Magi 内置浏览器完整设计](./browser-runtime-design.md)：Browser Authority、Browser Automation Worker、Goal/子代理租约、右侧预览、页面标记与跨平台发布基线。
+- [Magi 上下文压力与压缩统一架构](./context-pressure-compaction-architecture.md)：面向 Luna 后续开发的 token 语义、压力快照、连续压缩、检查点、超限恢复、模型隔离与测试门禁。
+
+## 用户场景与产品要求
+
+- [主对话图片理解补偿能力](./main-chat-image-understanding-user-scenarios.md)：描述主模型不支持图片时的用户问题、期望行为、异常边界和产品验收标准，不限定内部实现方案。

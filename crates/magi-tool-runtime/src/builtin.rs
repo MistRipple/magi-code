@@ -205,9 +205,7 @@ impl BuiltinTool for NormalizedBuiltinTool {
             | BuiltinToolName::BrowserEmulate
             | BuiltinToolName::BrowserPerformance
             | BuiltinToolName::BrowserLighthouse
-            | BuiltinToolName::BrowserScreencast
             | BuiltinToolName::BrowserHeap
-            | BuiltinToolName::BrowserExtensions
             | BuiltinToolName::BrowserThirdParty
             | BuiltinToolName::BrowserWebMcp
             | BuiltinToolName::BrowserPwa => {
@@ -280,7 +278,7 @@ fn execute_browser_tool(
         return serde_json::json!({
             "tool": tool.as_str(),
             "status": "failed",
-            "error_code": "browser_runtime_unavailable",
+            "error_code": "browser_host_unavailable",
             "recoverable": false,
             "requires_user_action": true,
             "error": "内置浏览器运行时不可用",

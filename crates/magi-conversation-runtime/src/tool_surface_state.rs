@@ -233,7 +233,7 @@ pub(crate) fn refresh_live_mcp_tool_definitions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magi_browser_runtime::{BrowserCapabilitySnapshot, BrowserRuntimeComponentStatus};
+    use magi_browser_authority::{BrowserCapabilitySnapshot, BrowserHostStatus};
     use magi_skill_runtime::{SkillDefinition, SkillMetadata, SkillRegistry};
     use std::sync::{
         Arc,
@@ -250,7 +250,7 @@ mod tests {
             Arc::new(magi_governance::GovernanceService::default()),
             Arc::new(magi_event_bus::InMemoryEventBus::new(8)),
         )
-        .with_browser_runtime(
+        .with_browser_automation(
             Arc::new(|_, tool, _, _| {
                 (
                     serde_json::json!({ "tool": tool, "status": "succeeded" }).to_string(),
@@ -261,7 +261,7 @@ mod tests {
                 revision: provider_revision.load(Ordering::Acquire),
                 in_app_browser_enabled: true,
                 browser_use_enabled: provider_enabled.load(Ordering::Acquire),
-                runtime_status: BrowserRuntimeComponentStatus::Installed,
+                host_status: BrowserHostStatus::Ready,
                 host_protocol_compatible: true,
                 access_profile: AccessProfile::Restricted,
             }),
@@ -283,15 +283,20 @@ mod tests {
         assert_eq!(first.capability_revision, Some(7));
         let browser_tool_count = BuiltinToolName::ALL
             .iter()
-            .filter(|tool| tool.browser_tool_kind().is_some())
+            .filter(|tool| {
+                tool.browser_tool_kind()
+                    .is_some_and(magi_browser_authority::BrowserToolKind::is_supported)
+            })
             .count();
         assert_eq!(
             first
                 .definitions
                 .iter()
                 .filter(|definition| {
-                    BuiltinToolName::from_name(&definition.function.name)
-                        .is_some_and(|tool| tool.browser_tool_kind().is_some())
+                    BuiltinToolName::from_name(&definition.function.name).is_some_and(|tool| {
+                        tool.browser_tool_kind()
+                            .is_some_and(magi_browser_authority::BrowserToolKind::is_supported)
+                    })
                 })
                 .count(),
             browser_tool_count
@@ -335,7 +340,10 @@ mod tests {
             .collect::<Vec<_>>();
         let expected_names = BuiltinToolName::ALL
             .iter()
-            .filter(|tool| tool.browser_tool_kind().is_some())
+            .filter(|tool| {
+                tool.browser_tool_kind()
+                    .is_some_and(magi_browser_authority::BrowserToolKind::is_supported)
+            })
             .map(BuiltinToolName::as_str)
             .collect::<Vec<_>>();
         assert_eq!(read_only.capability_revision, Some(9));

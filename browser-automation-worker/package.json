@@ -1,0 +1,22 @@
+{
+  "name": "@magi/browser-automation-worker",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=cjs --target=node22 --outfile=dist/index.cjs",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test src/**/*.test.ts"
+  },
+  "dependencies": {
+    "@magi/desktop-browser-contracts": "0.0.0",
+    "devtools-protocol": "0.0.1551306"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.30",
+    "esbuild": "0.25.12",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}

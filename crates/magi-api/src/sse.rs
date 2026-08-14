@@ -11,19 +11,36 @@ use magi_event_bus::{EventContext, EventEnvelope};
 use std::{convert::Infallible, time::Duration};
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
+use crate::dto::SessionScopeKindDto;
+use crate::errors::ApiError;
 use crate::public_canonical::public_event_envelope;
 use crate::state::ApiState;
 
+/// SSE 订阅必须显式绑定到一种会话作用域。它与会话 API 使用的 Personal / Workspace
+/// 作用域一致，避免把没有 workspace 参数误解为“订阅全部工作区”。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EventStreamScope {
+    Personal,
+    Workspace(WorkspaceId),
+}
+
+impl EventStreamScope {
+    fn workspace_id(&self) -> Option<&WorkspaceId> {
+        match self {
+            Self::Personal => None,
+            Self::Workspace(workspace_id) => Some(workspace_id),
+        }
+    }
+}
+
 pub async fn events(
     state: ApiState,
-    workspace_id: Option<String>,
-    workspace_path: Option<String>,
+    scope: EventStreamScope,
     session_id: Option<String>,
     after_sequence: Option<u64>,
 ) -> Response {
-    let workspace_id = resolve_event_stream_workspace_id(&state, workspace_id, workspace_path);
     let session_id = resolve_event_stream_session_id(session_id);
-    let stream = event_envelope_stream(state, workspace_id, session_id, after_sequence)
+    let stream = event_envelope_stream(state, scope, session_id, after_sequence)
         .map(|event| Ok::<Event, Infallible>(event_to_sse(event)));
 
     let mut response = Sse::new(stream)
@@ -62,11 +79,12 @@ pub(crate) fn resolve_after_sequence(
     }
 }
 
-fn resolve_event_stream_workspace_id(
+pub(crate) fn resolve_event_stream_scope(
     state: &ApiState,
+    requested_scope: SessionScopeKindDto,
     workspace_id: Option<String>,
     workspace_path: Option<String>,
-) -> Option<WorkspaceId> {
+) -> Result<EventStreamScope, ApiError> {
     let requested_workspace_id = workspace_id
         .as_deref()
         .map(str::trim)
@@ -75,16 +93,37 @@ fn resolve_event_stream_workspace_id(
         .as_deref()
         .map(str::trim)
         .filter(|workspace_path| !workspace_path.is_empty());
-    if requested_workspace_id.is_none() && requested_workspace_path.is_none() {
-        return None;
+    match requested_scope {
+        SessionScopeKindDto::Personal
+            if requested_workspace_id.is_none() && requested_workspace_path.is_none() =>
+        {
+            Ok(EventStreamScope::Personal)
+        }
+        SessionScopeKindDto::Personal => Err(ApiError::InvalidInput(
+            "个人事件流不能携带 workspace 绑定".to_string(),
+        )),
+        SessionScopeKindDto::Workspace
+            if requested_workspace_id.is_some() || requested_workspace_path.is_some() =>
+        {
+            state
+                .resolve_workspace_id_from_request(
+                    requested_workspace_id.map(WorkspaceId::new),
+                    requested_workspace_path,
+                )
+                .map(EventStreamScope::Workspace)
+                .ok_or_else(|| {
+                    ApiError::not_found(
+                        "workspace 不存在",
+                        requested_workspace_id
+                            .or(requested_workspace_path)
+                            .unwrap_or_default(),
+                    )
+                })
+        }
+        SessionScopeKindDto::Workspace => Err(ApiError::InvalidInput(
+            "工作区事件流必须提供 workspaceId 或 workspacePath".to_string(),
+        )),
     }
-    state
-        .resolve_workspace_id_from_request(
-            requested_workspace_id.map(WorkspaceId::new),
-            requested_workspace_path,
-        )
-        .or_else(|| requested_workspace_id.map(WorkspaceId::new))
-        .or_else(|| Some(WorkspaceId::new("__unresolved_event_stream_workspace__")))
 }
 
 fn resolve_event_stream_session_id(session_id: Option<String>) -> Option<SessionId> {
@@ -97,25 +136,25 @@ fn resolve_event_stream_session_id(session_id: Option<String>) -> Option<Session
 
 fn event_envelope_stream(
     state: ApiState,
-    workspace_id: Option<WorkspaceId>,
+    scope: EventStreamScope,
     session_id: Option<SessionId>,
     after_sequence: Option<u64>,
 ) -> impl Stream<Item = EventEnvelope> {
     let (snapshot, receiver) = state.event_bus.snapshot_and_subscribe();
     let snapshot_state = state.clone();
     let live_state = state;
-    let snapshot_workspace_id = workspace_id.clone();
-    let live_workspace_id = workspace_id;
+    let snapshot_scope = scope.clone();
+    let live_scope = scope;
     let snapshot_session_id = session_id.clone();
     let live_session_id = session_id;
     let snapshot_gap_recovery = snapshot_gap_skipped_count(&snapshot, after_sequence)
-        .map(|skipped| lagged_recovery_event(skipped, snapshot_workspace_id.as_ref()));
+        .map(|skipped| lagged_recovery_event(skipped, &snapshot_scope));
     let recent_stream = stream::iter(snapshot.recent_events.into_iter().filter(move |event| {
         after_sequence.is_none_or(|sequence| event.sequence > sequence)
             && event_matches_scope(
                 &snapshot_state,
                 event,
-                snapshot_workspace_id.as_ref(),
+                &snapshot_scope,
                 snapshot_session_id.as_ref(),
             )
     }));
@@ -128,7 +167,7 @@ fn event_envelope_stream(
         })
         .filter_map(move |event| {
             let live_state = live_state.clone();
-            let live_workspace_id = live_workspace_id.clone();
+            let live_scope = live_scope.clone();
             let live_session_id = live_session_id.clone();
             async move {
                 match event {
@@ -139,13 +178,13 @@ fn event_envelope_stream(
                             && event_matches_scope(
                                 &live_state,
                                 &envelope,
-                                live_workspace_id.as_ref(),
+                                &live_scope,
                                 live_session_id.as_ref(),
                             ))
                         .then_some(envelope)
                     }
                     Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                        Some(lagged_recovery_event(skipped, live_workspace_id.as_ref()))
+                        Some(lagged_recovery_event(skipped, &live_scope))
                     }
                 }
             }
@@ -185,40 +224,69 @@ fn snapshot_gap_skipped_count(
 fn event_matches_scope(
     state: &ApiState,
     event: &EventEnvelope,
-    requested_workspace_id: Option<&WorkspaceId>,
+    scope: &EventStreamScope,
     requested_session_id: Option<&SessionId>,
 ) -> bool {
-    event_matches_workspace(state, event, requested_workspace_id)
+    event_matches_event_stream_scope(state, event, scope)
         && event_matches_session(event, requested_session_id)
 }
 
-fn event_matches_workspace(
+fn event_matches_event_stream_scope(
     state: &ApiState,
     event: &EventEnvelope,
-    requested_workspace_id: Option<&WorkspaceId>,
+    scope: &EventStreamScope,
 ) -> bool {
-    let Some(requested_workspace_id) = requested_workspace_id else {
-        return true;
-    };
     if event_is_user_global(event) {
         return true;
     }
-    if event.workspace_id.as_ref() == Some(requested_workspace_id) {
-        return true;
+    match scope {
+        EventStreamScope::Workspace(requested_workspace_id) => {
+            if event.workspace_id.as_ref() == Some(requested_workspace_id) {
+                return true;
+            }
+            if event.workspace_id.is_some() {
+                return false;
+            }
+            if event_payload_workspace_matches(event, requested_workspace_id) {
+                return true;
+            }
+            event_session_workspace_id(state, event)
+                .is_some_and(|workspace_id| workspace_id == *requested_workspace_id)
+        }
+        EventStreamScope::Personal => event_belongs_to_personal_scope(state, event),
     }
-    if event.workspace_id.is_some() {
+}
+
+fn event_belongs_to_personal_scope(state: &ApiState, event: &EventEnvelope) -> bool {
+    if event.workspace_id.is_some() || event_payload_workspace_id(event).is_some() {
         return false;
     }
-    if event_payload_workspace_matches(event, requested_workspace_id) {
-        return true;
+    if let Some(session_id) = event_session_id(event) {
+        return state
+            .session_store
+            .session(&session_id)
+            .is_some_and(|session| session.workspace_id.is_none());
     }
-    event
-        .session_id
-        .as_ref()
-        .and_then(|session_id| state.session_store.session(session_id))
-        .is_some_and(|session| {
-            session.workspace_id.as_deref() == Some(requested_workspace_id.as_str())
-        })
+    event.mission_id.is_none() && event.assignment_id.is_none() && event.task_id.is_none()
+}
+
+fn event_session_id(event: &EventEnvelope) -> Option<SessionId> {
+    event.session_id.clone().or_else(|| {
+        event
+            .payload
+            .get("session_id")
+            .or_else(|| event.payload.get("sessionId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|session_id| !session_id.is_empty())
+            .map(SessionId::new)
+    })
+}
+
+fn event_session_workspace_id(state: &ApiState, event: &EventEnvelope) -> Option<WorkspaceId> {
+    let session_id = event_session_id(event)?;
+    let session = state.session_store.session(&session_id)?;
+    session.workspace_id.map(WorkspaceId::new)
 }
 
 fn event_is_user_global(event: &EventEnvelope) -> bool {
@@ -229,6 +297,11 @@ fn event_payload_workspace_matches(
     event: &EventEnvelope,
     requested_workspace_id: &WorkspaceId,
 ) -> bool {
+    event_payload_workspace_id(event)
+        .is_some_and(|workspace_id| workspace_id == requested_workspace_id.as_str())
+}
+
+fn event_payload_workspace_id(event: &EventEnvelope) -> Option<&str> {
     event
         .payload
         .get("workspace_id")
@@ -236,7 +309,6 @@ fn event_payload_workspace_matches(
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|workspace_id| !workspace_id.is_empty())
-        .is_some_and(|workspace_id| workspace_id == requested_workspace_id.as_str())
 }
 
 fn event_matches_session(event: &EventEnvelope, requested_session_id: Option<&SessionId>) -> bool {
@@ -298,7 +370,7 @@ fn keep_alive_event_envelope() -> EventEnvelope {
     )
 }
 
-fn lagged_recovery_event(skipped: u64, workspace_id: Option<&WorkspaceId>) -> EventEnvelope {
+fn lagged_recovery_event(skipped: u64, scope: &EventStreamScope) -> EventEnvelope {
     let now = UtcMillis::now();
     EventEnvelope::system(
         EventId::new(format!("event-stream-lagged-{}-{}", now.0, skipped)),
@@ -310,7 +382,7 @@ fn lagged_recovery_event(skipped: u64, workspace_id: Option<&WorkspaceId>) -> Ev
         }),
     )
     .with_context(EventContext {
-        workspace_id: workspace_id.cloned(),
+        workspace_id: scope.workspace_id().cloned(),
         ..EventContext::default()
     })
 }
@@ -348,8 +420,7 @@ mod tests {
     async fn events_response_disables_proxy_buffering() {
         let response = events(
             test_state(),
-            Some("workspace-a".to_string()),
-            None,
+            EventStreamScope::Workspace(workspace_id("workspace-a")),
             None,
             None,
         )
@@ -401,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn event_workspace_filter_allows_events_without_requested_workspace() {
+    fn personal_event_stream_scope_allows_unscoped_application_events() {
         let state = test_state();
         let event = EventEnvelope::domain(
             EventId::new("event-sse-unscoped"),
@@ -409,7 +480,11 @@ mod tests {
             json!({ "content": "unscoped" }),
         );
 
-        assert!(event_matches_workspace(&state, &event, None));
+        assert!(event_matches_event_stream_scope(
+            &state,
+            &event,
+            &EventStreamScope::Personal,
+        ));
     }
 
     #[test]
@@ -424,10 +499,10 @@ mod tests {
             }),
         );
 
-        assert!(event_matches_workspace(
+        assert!(event_matches_event_stream_scope(
             &state,
             &event,
-            Some(&workspace_id("workspace-a"))
+            &EventStreamScope::Workspace(workspace_id("workspace-a"))
         ));
         assert!(event_matches_session(
             &event,
@@ -458,15 +533,15 @@ mod tests {
             ..EventContext::default()
         });
 
-        assert!(event_matches_workspace(
+        assert!(event_matches_event_stream_scope(
             &state,
             &matching_event,
-            Some(&requested)
+            &EventStreamScope::Workspace(requested.clone())
         ));
-        assert!(!event_matches_workspace(
+        assert!(!event_matches_event_stream_scope(
             &state,
             &mismatched_event,
-            Some(&requested)
+            &EventStreamScope::Workspace(requested)
         ));
     }
 
@@ -499,20 +574,20 @@ mod tests {
             }),
         );
 
-        assert!(event_matches_workspace(
+        assert!(event_matches_event_stream_scope(
             &state,
             &matching_snake_event,
-            Some(&requested)
+            &EventStreamScope::Workspace(requested.clone())
         ));
-        assert!(event_matches_workspace(
+        assert!(event_matches_event_stream_scope(
             &state,
             &matching_camel_event,
-            Some(&requested)
+            &EventStreamScope::Workspace(requested.clone())
         ));
-        assert!(!event_matches_workspace(
+        assert!(!event_matches_event_stream_scope(
             &state,
             &mismatched_event,
-            Some(&requested)
+            &EventStreamScope::Workspace(requested)
         ));
     }
 
@@ -557,15 +632,64 @@ mod tests {
             ..EventContext::default()
         });
 
-        assert!(event_matches_workspace(
+        assert!(event_matches_event_stream_scope(
             &state,
             &matching_event,
-            Some(&requested)
+            &EventStreamScope::Workspace(requested.clone())
         ));
-        assert!(!event_matches_workspace(
+        assert!(!event_matches_event_stream_scope(
             &state,
             &mismatched_event,
-            Some(&requested)
+            &EventStreamScope::Workspace(requested)
+        ));
+    }
+
+    #[test]
+    fn personal_event_stream_scope_accepts_only_personal_session_events() {
+        let state = test_state();
+        let personal_session = SessionId::new("session-sse-personal");
+        let workspace_session = SessionId::new("session-sse-workspace");
+        state
+            .session_store
+            .create_session(personal_session.clone(), "personal session")
+            .expect("personal session should create");
+        state
+            .session_store
+            .create_session_for_workspace(
+                workspace_session.clone(),
+                "workspace session",
+                Some("workspace-a".to_string()),
+            )
+            .expect("workspace session should create");
+
+        let personal_event = EventEnvelope::domain(
+            EventId::new("event-sse-personal"),
+            "session.turn.item",
+            json!({ "session_id": personal_session.as_str() }),
+        )
+        .with_context(EventContext {
+            session_id: Some(personal_session),
+            ..EventContext::default()
+        });
+        let workspace_event = EventEnvelope::domain(
+            EventId::new("event-sse-workspace"),
+            "session.turn.item",
+            json!({ "session_id": workspace_session.as_str() }),
+        )
+        .with_context(EventContext {
+            session_id: Some(workspace_session),
+            ..EventContext::default()
+        });
+
+        assert!(event_matches_event_stream_scope(
+            &state,
+            &personal_event,
+            &EventStreamScope::Personal,
+        ));
+        assert!(!event_matches_event_stream_scope(
+            &state,
+            &workspace_event,
+            &EventStreamScope::Personal,
         ));
     }
 
@@ -664,42 +788,38 @@ mod tests {
             )
             .expect("workspace B should register");
 
-        let resolved = resolve_event_stream_workspace_id(
+        let resolved = resolve_event_stream_scope(
             &state,
+            SessionScopeKindDto::Workspace,
             Some(workspace_b.to_string()),
             Some("/tmp/magi-sse-path-a".to_string()),
-        );
+        )
+        .expect("registered workspace path should resolve");
 
-        assert_eq!(resolved, Some(workspace_a));
+        assert_eq!(resolved, EventStreamScope::Workspace(workspace_a));
     }
 
     #[test]
-    fn event_stream_scope_keeps_unknown_path_restricted() {
+    fn event_stream_scope_rejects_unknown_workspace_path() {
         let state = test_state();
-        let resolved = resolve_event_stream_workspace_id(
+        let error = resolve_event_stream_scope(
             &state,
+            SessionScopeKindDto::Workspace,
             None,
             Some("/tmp/magi-sse-missing-path".to_string()),
         )
-        .expect("unknown explicit path should still produce a restrictive scope");
+        .expect_err("unknown workspace path must not create a broad event stream");
 
-        let unscoped_event = EventEnvelope::domain(
-            EventId::new("event-sse-unknown-path-unscoped"),
-            "message.created",
-            json!({ "content": "unscoped" }),
+        assert_eq!(
+            error.message(),
+            "workspace 不存在: /tmp/magi-sse-missing-path"
         );
-
-        assert!(!event_matches_workspace(
-            &state,
-            &unscoped_event,
-            Some(&resolved)
-        ));
     }
 
     #[test]
     fn lagged_recovery_event_is_workspace_scoped_and_bootstrap_actionable() {
         let workspace = workspace_id("workspace-lagged");
-        let event = lagged_recovery_event(7, Some(&workspace));
+        let event = lagged_recovery_event(7, &EventStreamScope::Workspace(workspace.clone()));
 
         assert_eq!(event.event_type, "event.stream.lagged");
         assert_eq!(event.category, magi_event_bus::EventCategory::System);
@@ -714,7 +834,7 @@ mod tests {
         let workspace = workspace_id("workspace-lagged-stream");
         let mut events = Box::pin(event_envelope_stream(
             state.clone(),
-            Some(workspace.clone()),
+            EventStreamScope::Workspace(workspace.clone()),
             None,
             None,
         ));
@@ -753,7 +873,7 @@ mod tests {
         let state = test_state();
         let mut events = Box::pin(event_envelope_stream(
             state.clone(),
-            Some(workspace_id("workspace-shutdown")),
+            EventStreamScope::Workspace(workspace_id("workspace-shutdown")),
             Some(SessionId::new("session-shutdown")),
             None,
         ));
@@ -790,7 +910,7 @@ mod tests {
 
         let mut events = Box::pin(event_envelope_stream(
             state,
-            Some(workspace.clone()),
+            EventStreamScope::Workspace(workspace.clone()),
             None,
             Some(1),
         ));
@@ -816,13 +936,13 @@ mod tests {
         let other_workspace = workspace_id("workspace-multi-subscriber-other");
         let mut first_stream = Box::pin(event_envelope_stream(
             state.clone(),
-            Some(workspace.clone()),
+            EventStreamScope::Workspace(workspace.clone()),
             None,
             None,
         ));
         let mut second_stream = Box::pin(event_envelope_stream(
             state.clone(),
-            Some(workspace.clone()),
+            EventStreamScope::Workspace(workspace.clone()),
             None,
             None,
         ));
@@ -911,7 +1031,12 @@ mod tests {
             );
         }
 
-        let mut events = Box::pin(event_envelope_stream(state, Some(workspace), None, Some(2)));
+        let mut events = Box::pin(event_envelope_stream(
+            state,
+            EventStreamScope::Workspace(workspace),
+            None,
+            Some(2),
+        ));
         let event = tokio::time::timeout(Duration::from_secs(1), events.next())
             .await
             .expect("event after cursor should arrive")

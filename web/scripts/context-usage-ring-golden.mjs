@@ -363,6 +363,7 @@ await withGoldenViteServer(async (server) => {
       normalized.orchestratorRuntimeState?.runtimeSnapshot?.budgetState,
       {
         tokenUsed: 68_000,
+        projectedRequestTokens: 68_000,
         remainingTokens: 204_000,
         tokenLimit: 272_000,
         usageRatio: 0.25,

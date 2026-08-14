@@ -59,11 +59,12 @@
     currentRoundEdits.length > 0 && currentRoundEdits.every((edit) => edit.revertible === true)
   );
 
-  function editScope(edit?: Edit): { sessionId?: string; workspaceId?: string; workspacePath?: string } {
+  function editScope(edit?: Edit): { scope: 'workspace'; sessionId?: string; workspaceId: string; workspacePath: string } {
     return {
+      scope: 'workspace',
       sessionId: edit?.sessionId?.trim() || getCurrentSessionId() || undefined,
-      workspaceId: edit?.workspaceId?.trim() || messagesState.currentWorkspaceId?.trim() || undefined,
-      workspacePath: edit?.workspacePath?.trim() || messagesState.currentWorkspacePath?.trim() || undefined,
+      workspaceId: edit?.workspaceId?.trim() || messagesState.currentWorkspaceId?.trim() || '',
+      workspacePath: edit?.workspacePath?.trim() || messagesState.currentWorkspacePath?.trim() || '',
     };
   }
 

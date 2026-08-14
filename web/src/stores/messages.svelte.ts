@@ -65,8 +65,8 @@ export interface NotificationCenterStatus {
 }
 
 interface NotificationOperationScope {
-  workspaceId: string;
-  workspacePath: string;
+  workspaceId?: string;
+  workspacePath?: string;
   sessionId?: string;
 }
 
@@ -109,6 +109,11 @@ export const messagesState = $state({
   currentWorkspacePath: '' as string,
   workspaceSessionProjection: {
     workspaceId: null as string | null,
+    sessions: [] as Session[],
+    runtimeEpoch: null as string | null,
+    eventStreamNextSequence: 0,
+  },
+  personalSessionProjection: {
     sessions: [] as Session[],
     runtimeEpoch: null as string | null,
     eventStreamNextSequence: 0,
@@ -1419,6 +1424,45 @@ export function replaceWorkspaceSessionProjection(
   return true;
 }
 
+export function replacePersonalSessionProjection(
+  newSessions: Session[],
+  cursor: WorkspaceSessionProjectionCursor,
+  options: { allowRuntimeEpochChange?: boolean } = {},
+): boolean {
+  const normalizedCursor = normalizeWorkspaceSessionProjectionCursor(cursor);
+  const current = messagesState.personalSessionProjection;
+  if (
+    current.runtimeEpoch
+    && current.runtimeEpoch !== normalizedCursor.runtimeEpoch
+    && options.allowRuntimeEpochChange !== true
+  ) {
+    return false;
+  }
+  if (
+    current.runtimeEpoch === normalizedCursor.runtimeEpoch
+    && normalizedCursor.eventStreamNextSequence < current.eventStreamNextSequence
+  ) {
+    return false;
+  }
+  const seen = new Set<string>();
+  const sessions = ensureArray<Session>(newSessions)
+    .filter((session): session is Session => !!session && typeof session === 'object' && typeof session.id === 'string' && session.id.trim().length > 0)
+    .filter((session) => !normalizeWorkspaceId(session.workspaceId))
+    .filter((session) => {
+      if (seen.has(session.id)) return false;
+      seen.add(session.id);
+      return true;
+    });
+  messagesState.personalSessionProjection = {
+    sessions,
+    runtimeEpoch: normalizedCursor.runtimeEpoch,
+    eventStreamNextSequence: normalizedCursor.eventStreamNextSequence,
+  };
+  pruneSessionViewStateByKnownSessions();
+  saveWebviewState();
+  return true;
+}
+
 export function advanceWorkspaceSessionProjectionCursor(
   workspaceId: string,
   cursor: WorkspaceSessionProjectionCursor,
@@ -1684,8 +1728,9 @@ function resolveNotificationWorkspaceId(workspaceId: string | null | undefined):
   return typeof workspaceId === 'string' ? workspaceId.trim() : '';
 }
 
-function getCurrentNotificationWorkspaceId(): string {
-  return resolveNotificationWorkspaceId(messagesState.currentWorkspaceId);
+function getCurrentNotificationWorkspaceId(): string | null {
+  const workspaceId = resolveNotificationWorkspaceId(messagesState.currentWorkspaceId);
+  return workspaceId || null;
 }
 
 function createNotificationContextKey(
@@ -1693,11 +1738,11 @@ function createNotificationContextKey(
   sessionId: string | null | undefined,
 ): string {
   const normalizedWorkspaceId = resolveNotificationWorkspaceId(workspaceId);
-  if (!normalizedWorkspaceId) {
+  const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+  if (!normalizedWorkspaceId && !normalizedSessionId) {
     return '';
   }
-  const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
-  return `${normalizedWorkspaceId}\u0000${normalizedSessionId || '*'}`;
+  return `${normalizedWorkspaceId || 'personal'}\u0000${normalizedSessionId || '*'}`;
 }
 
 function notificationContextMatchesCurrent(
@@ -1708,7 +1753,7 @@ function notificationContextMatchesCurrent(
   const currentSessionId = typeof messagesState.currentSessionId === 'string'
     ? messagesState.currentSessionId.trim()
     : '';
-  return resolveNotificationWorkspaceId(workspaceId) === getCurrentNotificationWorkspaceId()
+  return (resolveNotificationWorkspaceId(workspaceId) || null) === getCurrentNotificationWorkspaceId()
     && normalizedSessionId === currentSessionId;
 }
 
@@ -1727,17 +1772,18 @@ function resetNotificationCenterStatus(): void {
 
 function getCurrentNotificationOperationScope(): NotificationOperationScope | null {
   const workspaceId = getCurrentNotificationWorkspaceId();
-  if (!workspaceId) {
-    return null;
-  }
   const sessionId = typeof messagesState.currentSessionId === 'string'
     ? messagesState.currentSessionId.trim()
     : '';
+  if (!workspaceId && !sessionId) {
+    return null;
+  }
+  const workspacePath = workspaceId && typeof messagesState.currentWorkspacePath === 'string'
+    ? messagesState.currentWorkspacePath.trim()
+    : '';
   return {
-    workspaceId,
-    workspacePath: typeof messagesState.currentWorkspacePath === 'string'
-      ? messagesState.currentWorkspacePath.trim()
-      : '',
+    ...(workspaceId ? { workspaceId } : {}),
+    ...(workspacePath ? { workspacePath } : {}),
     ...(sessionId ? { sessionId } : {}),
   };
 }

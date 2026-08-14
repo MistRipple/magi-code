@@ -12,6 +12,14 @@
  * - terminal 以 terminalTabId 作为唯一键；每次新建都是独立命令终端，不共享输出历史
  */
 
+import {
+  DESKTOP_RIGHT_PANE_INTENT_VERSION,
+  type DesktopRightPaneAgentIntent,
+  type DesktopRightPaneCodeIntent,
+  type DesktopRightPaneTabIntent,
+  type DesktopRightPaneTerminalIntent,
+} from '@magi/desktop-browser-contracts';
+
 export type RightPaneTabKind = 'agent' | 'code' | 'browser' | 'terminal';
 
 /** Agent tab payload —— 代理运行 ID，内容由 canonical projection 按 metadata.taskId 过滤运行输出 */
@@ -63,7 +71,7 @@ export interface BrowserTabPayload {
   browserSessionId: string;
   tabId: string;
   agentOccupied: boolean;
-  workspaceId: string;
+  workspaceId?: string;
   workspacePath?: string;
   sessionId: string;
 }
@@ -71,7 +79,7 @@ export interface BrowserTabPayload {
 /** Terminal tab payload —— 用户手动命令终端的稳定实例 ID，不持久化运行输出。 */
 export interface TerminalTabPayload {
   terminalTabId: string;
-  workspaceId: string;
+  workspaceId?: string;
   workspacePath?: string;
   sessionId: string;
 }
@@ -131,6 +139,8 @@ const STORAGE_KEY = 'magi-right-pane-state.v3';
 /** 持久化 session 总数硬上限：超过后按 lastActivatedAt 倒序保留最近 N 个，防止长期使用膨胀 */
 const MAX_PERSISTED_SESSIONS = 50;
 const WORKSPACE_SCOPE_PREFIX = 'workspace:';
+/** 无工作区、无会话的个人草稿也必须拥有稳定的右栏作用域。 */
+const PERSONAL_SCOPE_KEY = 'personal';
 
 interface PersistedShape {
   version: 3 | 4;
@@ -138,6 +148,13 @@ interface PersistedShape {
   activeWorkspaceId: string;
   activeSessionId: string;
   perSession: Record<string, SessionPaneState>;
+}
+
+function isDesktopRenderer(): boolean {
+  if (typeof window === 'undefined') return false;
+  const surface = window.magiDesktop?.surface
+    ?? new URLSearchParams(window.location.search).get('desktopSurface');
+  return surface === 'app' || surface === 'right-pane';
 }
 
 function normalizeWorkspaceId(workspaceId: string | null | undefined): string {
@@ -171,7 +188,9 @@ function paneScopeKey(
   workspaceId: string | null | undefined,
   sessionId: string | null | undefined,
 ): string {
-  return sessionScopeKey(workspaceId, sessionId) || workspaceScopeKey(workspaceId);
+  return sessionScopeKey(workspaceId, sessionId)
+    || workspaceScopeKey(workspaceId)
+    || PERSONAL_SCOPE_KEY;
 }
 
 function normalizeStoredScopeKey(scopeKeyOrSessionId: string | null | undefined): string {
@@ -180,7 +199,8 @@ function normalizeStoredScopeKey(scopeKeyOrSessionId: string | null | undefined)
     return '';
   }
   if (
-    rightPaneState.perSession[value]
+    value === PERSONAL_SCOPE_KEY
+    || rightPaneState.perSession[value]
     || value.includes('\u0000')
     || value.startsWith('session:')
     || value.startsWith(WORKSPACE_SCOPE_PREFIX)
@@ -239,7 +259,6 @@ function isRestorableTab(tab: RightPaneTab): boolean {
     const payload = tab.payload as TerminalTabPayload | undefined;
     return Boolean(
       payload?.terminalTabId?.trim()
-      && payload?.workspaceId?.trim()
       && payload?.sessionId?.trim(),
     );
   }
@@ -248,7 +267,7 @@ function isRestorableTab(tab: RightPaneTab): boolean {
 
 /** 从 localStorage 恢复 perSession + activeSessionId；解析/版本不符则静默回退到空状态 */
 function loadPersisted(): void {
-  if (typeof window === 'undefined') return;
+  if (typeof window === 'undefined' || isDesktopRenderer()) return;
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return;
@@ -274,8 +293,13 @@ function loadPersisted(): void {
     rightPaneState.activeWorkspaceId = normalizeWorkspaceId(parsed.activeWorkspaceId);
     rightPaneState.activeSessionId = normalizeSessionId(parsed.activeSessionId);
     const activeScopeKey = normalizeSessionId(parsed.activeScopeKey)
-      || sessionScopeKey(rightPaneState.activeWorkspaceId, rightPaneState.activeSessionId);
-    rightPaneState.activeScopeKey = recovered[activeScopeKey] ? activeScopeKey : '';
+      || paneScopeKey(rightPaneState.activeWorkspaceId, rightPaneState.activeSessionId);
+    if (!recovered[PERSONAL_SCOPE_KEY]) {
+      recovered[PERSONAL_SCOPE_KEY] = { ...EMPTY_SESSION_STATE, openTabs: [] };
+    }
+    rightPaneState.activeScopeKey = recovered[activeScopeKey]
+      ? activeScopeKey
+      : PERSONAL_SCOPE_KEY;
   } catch {
     // 解析失败 → 维持空状态，不影响应用启动
   }
@@ -283,7 +307,7 @@ function loadPersisted(): void {
 
 /** 把当前 perSession 序列化写入 localStorage；mutation 末尾同步调用 */
 function persistState(): void {
-  if (typeof window === 'undefined') return;
+  if (typeof window === 'undefined' || isDesktopRenderer()) return;
   try {
     const entries = Object.entries(rightPaneState.perSession);
     let kept: [string, SessionPaneState][] = entries;
@@ -319,10 +343,12 @@ function persistState(): void {
 }
 
 export const rightPaneState = $state<RightPaneRootState>({
-  activeScopeKey: '',
+  activeScopeKey: PERSONAL_SCOPE_KEY,
   activeWorkspaceId: '',
   activeSessionId: '',
-  perSession: {},
+  perSession: {
+    [PERSONAL_SCOPE_KEY]: { ...EMPTY_SESSION_STATE, openTabs: [] },
+  },
 });
 
 // 模块加载时立即恢复——必须放在 rightPaneState 定义之后、任何使用方读取之前
@@ -332,7 +358,7 @@ loadPersisted();
 // 的变化都会被 persistState 内部的遍历"读取"触发，从而重新写入 localStorage。
 // 用 $effect.root 创建与模块寿命同生命周期的 reactive scope；页面 unload 时浏览器自动 GC。
 // 这个收敛实现避免在每个 mutation 末尾手写一次 persist——新增 mutation 函数也不会漏。
-if (typeof window !== 'undefined') {
+if (typeof window !== 'undefined' && !isDesktopRenderer()) {
   $effect.root(() => {
     $effect(() => {
       persistState();
@@ -459,6 +485,21 @@ function upsertTab(
   return tab;
 }
 
+/**
+ * Electron 桌面端的 App Renderer 与 Right-Pane Renderer 不共享内存状态。
+ * App 侧先更新自己的投影以保持工作区交互连续，再把同一个用户意图交给
+ * Main 转发给 Right-Pane；浏览器 Tab 不经过这里，避免与 BrowserAuthority 双写。
+ */
+function forwardDesktopRightPaneIntent(intent: DesktopRightPaneTabIntent): void {
+  if (typeof window === 'undefined' || window.magiDesktop?.surface !== 'app') return;
+  void window.magiDesktop.openRightPaneTab({
+    version: DESKTOP_RIGHT_PANE_INTENT_VERSION,
+    intent,
+  }).catch((error) => {
+    console.warn('[right-pane] 转发桌面右栏面板意图失败:', error);
+  });
+}
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -481,9 +522,7 @@ export function activateRightPaneSession(
   rightPaneState.activeWorkspaceId = normalizedWorkspaceId;
   rightPaneState.activeSessionId = normalizedSessionId;
   rightPaneState.activeScopeKey = scopeKey;
-  if (scopeKey) {
-    ensureSession(scopeKey);
-  }
+  ensureSession(scopeKey);
 }
 
 /** 读取某个 session 的面板状态（响应式引用）；空 sessionId 或未初始化时返回空快照 */
@@ -537,6 +576,16 @@ export function openAgentTab(
     label,
     accentToken,
   );
+  const intent: DesktopRightPaneAgentIntent = {
+    kind: 'agent',
+    agentRunId: trimmedAgentRunId,
+    sessionId: normalizedSession,
+    workspaceId,
+    workspacePath: typeof options?.workspacePath === 'string' ? options.workspacePath.trim() : '',
+    ...(label ? { label } : {}),
+    accentToken,
+  };
+  forwardDesktopRightPaneIntent(intent);
 }
 
 /** 打开（或激活）一个 code tab；filepath 同时作为去重 key */
@@ -616,13 +665,37 @@ export function openCodeTab(
     label,
     null,
   );
+  const intent: DesktopRightPaneCodeIntent = {
+    kind: 'code',
+    filepath: trimmedFilepath,
+    sessionId: normalizedSession,
+    workspaceId,
+    workspacePath: options?.workspacePath?.trim() || '',
+    ...(label ? { label } : {}),
+    displayPath,
+    diff: options?.diff ?? null,
+    originalContent: options?.originalContent ?? null,
+    currentContent: options?.currentContent ?? null,
+    isChangeDiff: options?.isChangeDiff ?? false,
+    changeRevision: options?.changeRevision ?? null,
+    content: options?.content ?? null,
+    language: options?.language ?? null,
+    ...(options?.contentKind ? { contentKind: options.contentKind } : {}),
+    size: typeof options?.size === 'number' ? options.size : null,
+    mime: options?.mime ?? null,
+    symlinkTarget: options?.symlinkTarget ?? null,
+    headSummary: options?.headSummary ?? null,
+    tailSummary: options?.tailSummary ?? null,
+    imageDataUrl: options?.imageDataUrl ?? null,
+  };
+  forwardDesktopRightPaneIntent(intent);
 }
 
 export function openBrowserTab(
   browserSessionId: string | null | undefined,
   tabId: string | null | undefined,
   options: {
-    workspaceId: string;
+    workspaceId?: string | null;
     workspacePath?: string;
     sessionId: string;
     label?: string;
@@ -635,9 +708,12 @@ export function openBrowserTab(
   const workspaceId = normalizeWorkspaceId(options.workspaceId);
   const sessionId = normalizeSessionId(options.sessionId);
   const scopeKey = sessionScopeKey(workspaceId, sessionId);
-  if (!normalizedBrowserSessionId || !normalizedTabId || !workspaceId || !sessionId || !scopeKey) {
+  if (!normalizedBrowserSessionId || !normalizedTabId || !sessionId || !scopeKey) {
     return;
   }
+  rightPaneState.activeWorkspaceId = workspaceId;
+  rightPaneState.activeSessionId = sessionId;
+  rightPaneState.activeScopeKey = scopeKey;
   upsertTab(
     scopeKey,
     'browser',
@@ -666,20 +742,21 @@ function newTerminalTabId(): string {
 
 /**
  * 新建独立的用户命令终端 Tab。每个 Tab 的执行记录仅保留在内存中，刷新页面后不伪造
- * 旧进程或旧输出仍然可用；后台进程本身继续由 shell_exec 按 session/workspace 管理。
+ * 旧进程或旧输出仍然可用；后台进程始终按 `Personal | Workspace` 会话作用域管理。
  */
 export function openTerminalTab(options: {
-  workspaceId: string;
+  workspaceId?: string | null;
   workspacePath?: string;
   sessionId: string;
+  terminalTabId?: string;
 }): string | null {
   const workspaceId = normalizeWorkspaceId(options.workspaceId);
   const sessionId = normalizeSessionId(options.sessionId);
   const scopeKey = sessionScopeKey(workspaceId, sessionId);
-  if (!workspaceId || !sessionId || !scopeKey) {
+  if (!sessionId || !scopeKey) {
     return null;
   }
-  const terminalTabId = newTerminalTabId();
+  const terminalTabId = options.terminalTabId?.trim() || newTerminalTabId();
   upsertTab(
     scopeKey,
     'terminal',
@@ -692,6 +769,14 @@ export function openTerminalTab(options: {
     'Terminal',
     null,
   );
+  const intent: DesktopRightPaneTerminalIntent = {
+    kind: 'terminal',
+    terminalTabId,
+    sessionId,
+    workspaceId,
+    workspacePath: options.workspacePath?.trim() || '',
+  };
+  forwardDesktopRightPaneIntent(intent);
   return terminalTabId;
 }
 
@@ -984,17 +1069,27 @@ export function clearRightPaneSession(
 ): void {
   const scopeKey = sessionId === undefined
     ? normalizeStoredScopeKey(scopeKeyOrWorkspaceId)
-    : sessionScopeKey(scopeKeyOrWorkspaceId, sessionId);
+    : paneScopeKey(scopeKeyOrWorkspaceId, sessionId);
   if (!scopeKey) {
-    rightPaneState.perSession = {};
-    rightPaneState.activeScopeKey = '';
+    rightPaneState.perSession = {
+      [PERSONAL_SCOPE_KEY]: { ...EMPTY_SESSION_STATE, openTabs: [] },
+    };
+    rightPaneState.activeScopeKey = PERSONAL_SCOPE_KEY;
+    rightPaneState.activeWorkspaceId = '';
+    rightPaneState.activeSessionId = '';
+    return;
+  }
+  if (scopeKey === PERSONAL_SCOPE_KEY) {
+    rightPaneState.perSession[PERSONAL_SCOPE_KEY] = { ...EMPTY_SESSION_STATE, openTabs: [] };
+    rightPaneState.activeScopeKey = PERSONAL_SCOPE_KEY;
     rightPaneState.activeWorkspaceId = '';
     rightPaneState.activeSessionId = '';
     return;
   }
   delete rightPaneState.perSession[scopeKey];
   if (rightPaneState.activeScopeKey === scopeKey) {
-    rightPaneState.activeScopeKey = '';
+    ensureSession(PERSONAL_SCOPE_KEY);
+    rightPaneState.activeScopeKey = PERSONAL_SCOPE_KEY;
     rightPaneState.activeWorkspaceId = '';
     rightPaneState.activeSessionId = '';
   }

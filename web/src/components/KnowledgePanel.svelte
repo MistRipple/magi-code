@@ -589,8 +589,9 @@
     };
   }
 
-  function knowledgeWorkspaceScope(request: KnowledgeWorkspaceRequest): { workspaceId: string; workspacePath: string } {
+  function knowledgeWorkspaceScope(request: KnowledgeWorkspaceRequest): { scope: 'workspace'; workspaceId: string; workspacePath: string } {
     return {
+      scope: 'workspace',
       workspaceId: request.workspaceId,
       workspacePath: request.workspacePath,
     };

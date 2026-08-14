@@ -6,9 +6,13 @@ use serde_json::json;
 
 use super::{
     dispatch_flow::{accept_session_task_submission, finalize_session_task_dispatch},
-    session_scope::{SessionWorkspaceScope, require_session_workspace_scope},
+    session_scope::{SessionRequestScope, require_session_request_scope},
 };
-use crate::{dto::SessionTurnRequestDto, errors::ApiError, state::ApiState};
+use crate::{
+    dto::{SessionScopeKindDto, SessionTurnRequestDto},
+    errors::ApiError,
+    state::ApiState,
+};
 use magi_orchestrator::task_store::TaskStore;
 use magi_session_store::{ActiveExecutionTurn, SessionPlan};
 
@@ -19,13 +23,15 @@ pub fn routes() -> Router<ApiState> {
 fn require_session_owned_task(
     state: &ApiState,
     session_id_value: Option<&str>,
+    requested_scope: SessionScopeKindDto,
     workspace_id_value: Option<&str>,
     workspace_path_value: Option<&str>,
     task_id: &str,
-) -> Result<(SessionWorkspaceScope, magi_core::Task), ApiError> {
+) -> Result<(SessionRequestScope, magi_core::Task), ApiError> {
     let scope = require_task_request_scope(
         state,
         session_id_value,
+        requested_scope,
         workspace_id_value,
         workspace_path_value,
     )?;
@@ -55,15 +61,16 @@ fn require_session_owned_task(
 fn require_task_request_scope(
     state: &ApiState,
     session_id_value: Option<&str>,
+    requested_scope: SessionScopeKindDto,
     workspace_id_value: Option<&str>,
     workspace_path_value: Option<&str>,
-) -> Result<SessionWorkspaceScope, ApiError> {
-    require_session_workspace_scope(
+) -> Result<SessionRequestScope, ApiError> {
+    require_session_request_scope(
         state,
         session_id_value,
+        requested_scope,
         workspace_id_value,
         workspace_path_value,
-        "执行任务操作",
     )
 }
 
@@ -120,13 +127,15 @@ fn session_history_contains_task(
 fn require_session_historical_task(
     state: &ApiState,
     session_id_value: Option<&str>,
+    requested_scope: SessionScopeKindDto,
     workspace_id_value: Option<&str>,
     workspace_path_value: Option<&str>,
     task_id: &str,
-) -> Result<(SessionWorkspaceScope, magi_core::Task), ApiError> {
+) -> Result<(SessionRequestScope, magi_core::Task), ApiError> {
     let scope = require_task_request_scope(
         state,
         session_id_value,
+        requested_scope,
         workspace_id_value,
         workspace_path_value,
     )?;
@@ -191,6 +200,7 @@ struct TaskIdRequest {
     operation_id: String,
     task_id: String,
     session_id: Option<String>,
+    scope: SessionScopeKindDto,
     workspace_id: Option<String>,
     #[serde(default)]
     workspace_path: Option<String>,
@@ -252,7 +262,7 @@ fn restart_active_skill_id(root_task: &magi_core::Task) -> Option<String> {
 fn resume_blocked_plan_for_retry(
     state: &ApiState,
     session_id: &SessionId,
-    workspace_id: &magi_core::WorkspaceId,
+    workspace_id: Option<&magi_core::WorkspaceId>,
     root_task_id: &TaskId,
 ) -> Result<Option<SessionPlan>, ApiError> {
     let plan_store = magi_plan::PlanStore::from_store(&state.session_store, session_id.clone());
@@ -281,7 +291,7 @@ fn resume_blocked_plan_for_retry(
         &state.event_bus,
         magi_plan::plan_event_type(&resumed),
         &resumed,
-        Some(workspace_id),
+        workspace_id,
         Some(root_task_id),
         Some(&root_task.mission_id),
     );
@@ -324,6 +334,7 @@ async fn continue_task(
     let (scope, task) = require_session_owned_task(
         &state,
         request.session_id.as_deref(),
+        request.scope,
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
         task_id,
@@ -331,7 +342,8 @@ async fn continue_task(
     let root_task = ensure_terminal_root_action(&state, &task.root_task_id, "继续")?;
     ensure_supported_root_action(&root_task, AgentRunActionKind::Continue, "继续")?;
     let response =
-        super::sessions::continue_agent_run(&state, &scope.session_id, &scope.workspace_id).await?;
+        super::sessions::continue_agent_run(&state, &scope.session_id, &scope.workspace_id())
+            .await?;
     let mut payload = serde_json::to_value(response)
         .map_err(|error| ApiError::internal_assembly("序列化任务继续结果失败", error))?;
     payload["action"] = json!("continue");
@@ -352,6 +364,7 @@ async fn restart_task(
     let (scope, task) = require_session_historical_task(
         &state,
         request.session_id.as_deref(),
+        request.scope,
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
         task_id,
@@ -362,7 +375,7 @@ async fn restart_task(
     let previous_plan = resume_blocked_plan_for_retry(
         &state,
         &session_id,
-        &scope.workspace_id,
+        scope.workspace_id().as_ref(),
         &root_task.task_id,
     )?;
     let restart_text = if root_task.goal.trim().is_empty() {
@@ -372,8 +385,9 @@ async fn restart_task(
     };
     let restart_request = SessionTurnRequestDto {
         session_id: Some(session_id.to_string()),
-        workspace_id: Some(scope.workspace_id.to_string()),
-        workspace_path: Some(scope.workspace_path.clone()),
+        scope: request.scope,
+        workspace_id: scope.workspace_id().map(|id| id.to_string()),
+        workspace_path: scope.workspace_path(),
         text: Some(restart_text),
         skill_name: restart_active_skill_id(&root_task),
         locale: None,
@@ -402,7 +416,7 @@ async fn restart_task(
         &state,
         &restart_request,
         Vec::new(),
-        scope.workspace_id.clone(),
+        scope.workspace_id(),
         Some(root_task.title.clone()),
         Some(root_task.goal.clone()),
         task_tier,
@@ -428,12 +442,12 @@ async fn restart_task(
             "oldRootTaskId": task.root_task_id.to_string(),
             "newRootTaskId": accepted.root_task_id.to_string(),
             "sessionId": accepted.session_id.to_string(),
-            "workspaceId": scope.workspace_id.to_string(),
+            "workspaceId": scope.workspace_id().map(|id| id.to_string()),
             "requestedAt": now.0,
         }),
     )
     .with_context(EventContext {
-        workspace_id: Some(scope.workspace_id.clone()),
+        workspace_id: scope.workspace_id(),
         session_id: Some(accepted.session_id.clone()),
         mission_id: Some(root_task.mission_id.clone()),
         task_id: Some(accepted.root_task_id.clone()),
@@ -454,8 +468,8 @@ async fn restart_task(
         "actionTaskId": accepted.action_task_id.to_string(),
         "executionChainRef": execution_chain_ref,
         "requestedAt": now.0,
-        "workspaceId": scope.workspace_id.to_string(),
-        "workspacePath": scope.workspace_path,
+        "workspaceId": scope.workspace_id().map(|id| id.to_string()),
+        "workspacePath": scope.workspace_path(),
         "oldRootTaskId": task.root_task_id.to_string(),
         "newRootTaskId": accepted.root_task_id.to_string(),
     })))
@@ -474,6 +488,7 @@ async fn archive_task(
     let (scope, task) = require_session_owned_task(
         &state,
         request.session_id.as_deref(),
+        request.scope,
         request.workspace_id.as_deref(),
         request.workspace_path.as_deref(),
         task_id,
@@ -495,12 +510,12 @@ async fn archive_task(
             "taskId": task_id,
             "rootTaskId": root_task.task_id.to_string(),
             "sessionId": session_id.to_string(),
-            "workspaceId": scope.workspace_id.to_string(),
+            "workspaceId": scope.workspace_id().map(|id| id.to_string()),
             "requestedAt": now.0,
         }),
     )
     .with_context(EventContext {
-        workspace_id: Some(scope.workspace_id.clone()),
+        workspace_id: scope.workspace_id(),
         session_id: Some(session_id.clone()),
         mission_id: Some(root_task.mission_id.clone()),
         task_id: Some(root_task.task_id.clone()),
@@ -516,8 +531,8 @@ async fn archive_task(
         "rootTaskId": root_task.task_id.to_string(),
         "eventId": event_id.to_string(),
         "requestedAt": now.0,
-        "workspaceId": scope.workspace_id.to_string(),
-        "workspacePath": scope.workspace_path,
+        "workspaceId": scope.workspace_id().map(|id| id.to_string()),
+        "workspacePath": scope.workspace_path(),
     })))
 }
 

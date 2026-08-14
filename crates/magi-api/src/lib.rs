@@ -27,7 +27,7 @@ pub use dto::DirectHttpModelProbeConfig;
 pub use errors::{ApiError, ErrorResponseDto};
 pub use routes::build_router;
 pub use state::{
-    ApiState, BrowserRuntimeStatusSnapshot, ExecutionResourceCancellationReport,
+    ApiState, BrowserHostStatusSnapshot, ExecutionResourceCancellationReport,
     ExecutionResourceCoordinator, RunnerManager, RunnerStartError, RunnerStopError,
     RuntimeStatePersistence, build_runtime_capability_dependency_provider,
 };

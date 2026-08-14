@@ -11,6 +11,7 @@ import {
   adoptCurrentSessionIdForLiveTurn,
   advanceWorkspaceSessionProjectionCursor,
   replaceWorkspaceSessionProjection,
+  replacePersonalSessionProjection,
   clearWorkspaceSessionProjection,
   setQueuedMessages,
   setAppState,
@@ -578,6 +579,7 @@ export function handleUnifiedData(standard: StandardMessage) {
 
     case 'sessionBootstrapLoaded':
       handleSessionBootstrapLoaded(asMessage({
+        scope: payload.scope,
         agent: payload.agent,
         sessionId: payload.sessionId,
         workspace: payload.workspace,
@@ -733,7 +735,14 @@ function handleSessionsUpdated(message: ClientBridgeMessage) {
   const sessions = message.sessions as Session[];
   const workspaceId = typeof message.workspaceId === 'string' ? message.workspaceId.trim() : '';
   if (!workspaceId) {
-    console.warn('[MessageHandler] 忽略缺少 workspaceId 的会话目录更新');
+    if (sessions) {
+      replacePersonalSessionProjection(ensureArray(sessions), {
+        runtimeEpoch: typeof message.runtimeEpoch === 'string' ? message.runtimeEpoch : '',
+        eventStreamNextSequence: Number(message.eventStreamNextSequence),
+      }, {
+        allowRuntimeEpochChange: message.allowRuntimeEpochChange === true,
+      });
+    }
     return;
   }
   const currentWorkspaceId = currentWorkspaceIdValue();
@@ -1092,6 +1101,7 @@ function clearStaleSettingsBootstrapSnapshot(): void {
 
 function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
   const sessionId = typeof message.sessionId === 'string' ? message.sessionId.trim() : '';
+  const sessionScope = message.scope === 'workspace' ? 'workspace' : 'personal';
   const state = message.state as AppState | undefined;
   const workspaceRecord = (message as Record<string, unknown>).workspace;
   const workspace = workspaceRecord && typeof workspaceRecord === 'object'
@@ -1124,6 +1134,7 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     if (!navigationRequestId || !navigationTarget) return false;
     return settleSessionNavigation(navigationRequestId, {
       kind: navigationTarget,
+      scope: sessionScope,
       workspaceId,
       sessionId,
     });
@@ -1156,14 +1167,13 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
         setQueuedMessages([]);
       }
       clearCurrentSessionBeforeWorkspaceChange(workspaceId);
-      messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
+      messagesState.currentWorkspaceId = workspaceId || null;
       messagesState.currentWorkspacePath = workspacePath;
-      replaceWorkspaceSessionProjection(
-        workspaceId,
-        sessions,
-        workspaceSessionCursorFromBootstrap(message),
-        { allowRuntimeEpochChange: true },
-      );
+      if (workspaceId) {
+        replaceWorkspaceSessionProjection(workspaceId, sessions, workspaceSessionCursorFromBootstrap(message), { allowRuntimeEpochChange: true });
+      } else {
+        replacePersonalSessionProjection(sessions, workspaceSessionCursorFromBootstrap(message), { allowRuntimeEpochChange: true });
+      }
       setCurrentSessionId(null);
       messagesState.draftOrchestratorSessionConfig = navigationTarget === 'draft'
         ? { ...navigationDraftConfig }
@@ -1202,14 +1212,13 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
       messagesState.draftOrchestratorSessionConfig = {};
       const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
       const sessions = ensureArray(snapshot.sessions) as Session[];
-      messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
-      messagesState.currentWorkspacePath = workspacePath || messagesState.currentWorkspacePath;
-      replaceWorkspaceSessionProjection(
-        workspaceId,
-        sessions,
-        workspaceSessionCursorFromBootstrap(message),
-        { allowRuntimeEpochChange: true },
-      );
+      messagesState.currentWorkspaceId = workspaceId || null;
+      messagesState.currentWorkspacePath = workspacePath;
+      if (workspaceId) {
+        replaceWorkspaceSessionProjection(workspaceId, sessions, workspaceSessionCursorFromBootstrap(message), { allowRuntimeEpochChange: true });
+      } else {
+        replacePersonalSessionProjection(sessions, workspaceSessionCursorFromBootstrap(message), { allowRuntimeEpochChange: true });
+      }
       clearStaleSettingsBootstrapSnapshot();
       const hadLiveTurnBeforeSnapshot = hasActiveLocalTimelineTurn();
       const hadPendingLocalRequestBeforeSnapshot = hasPendingLocalRequest();
@@ -1295,14 +1304,13 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
     const snapshot = message as ClientBridgeMessage & SessionBootstrapSnapshot;
     const sessions = ensureArray(snapshot.sessions) as Session[];
     clearCurrentSessionBeforeWorkspaceChange(workspaceId);
-    messagesState.currentWorkspaceId = workspaceId || messagesState.currentWorkspaceId;
-    messagesState.currentWorkspacePath = workspacePath || messagesState.currentWorkspacePath;
-    replaceWorkspaceSessionProjection(
-      workspaceId,
-      sessions,
-      workspaceSessionCursorFromBootstrap(message),
-      { allowRuntimeEpochChange: true },
-    );
+    messagesState.currentWorkspaceId = workspaceId || null;
+    messagesState.currentWorkspacePath = workspacePath;
+    if (workspaceId) {
+      replaceWorkspaceSessionProjection(workspaceId, sessions, workspaceSessionCursorFromBootstrap(message), { allowRuntimeEpochChange: true });
+    } else {
+      replacePersonalSessionProjection(sessions, workspaceSessionCursorFromBootstrap(message), { allowRuntimeEpochChange: true });
+    }
 
     setCurrentSessionId(sessionId);
     clearStaleSettingsBootstrapSnapshot();
@@ -1340,8 +1348,8 @@ function handleSessionBootstrapLoaded(message: ClientBridgeMessage) {
 
 function handleNotificationsLoaded(message: ClientBridgeMessage) {
   const sessionId = typeof message.sessionId === 'string' ? message.sessionId : '';
-  const workspaceId = typeof message.workspaceId === 'string' ? message.workspaceId : '';
-  if (!workspaceId) {
+  const workspaceId = typeof message.workspaceId === 'string' ? message.workspaceId : null;
+  if (!sessionId && !workspaceId) {
     return;
   }
   applyNotificationsSnapshot(sessionId, message.notifications, workspaceId);

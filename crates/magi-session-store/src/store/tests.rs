@@ -3,7 +3,7 @@ use crate::models::{
     ActiveExecutionBranch, ActiveExecutionChain, ActiveExecutionDispatchContext,
     ActiveExecutionTurn, ActiveExecutionTurnItem, CanonicalTurnStatus, ExecutionThread,
     ExecutionThreadStatus, GoalContinuationPhase, GoalContinuationState, GoalRevisionExpectation,
-    GoalStatus, NotificationRecord, NotificationScope, SessionDurableState,
+    GoalStatus, NotificationContext, NotificationRecord, NotificationScope, SessionDurableState,
     SessionExecutionSidecarStatus, SessionExecutionSidecarStoreState, SessionPlan,
     SessionSidecarFlushReason, SessionStoreState, ThreadChatMessage, ThreadChatToolCall,
     ThreadChatToolFunction, ThreadContextCheckpoint, ThreadFileFactVersion,
@@ -2310,6 +2310,41 @@ fn current_turn_hides_runtime_internal_tool_calls_in_durable_canonical_log() {
 }
 
 #[test]
+fn image_only_user_message_is_renderable_without_synthetic_text() {
+    let store = SessionStore::new();
+    let session_id = SessionId::new("session-image-only-message");
+    store
+        .create_session(session_id.clone(), "Image Only Message")
+        .expect("session should be creatable");
+
+    let mut turn = test_turn("turn-image-only-message", "running", 10);
+    turn.items
+        .push(test_turn_item("item-image-only-message", ""));
+    let user_message = turn.items.first_mut().expect("user message must exist");
+    user_message.content = Some(String::new());
+    user_message.metadata.insert(
+        "images".to_string(),
+        json!([{
+            "name": "diagram.png",
+            "dataUrl": "data:image/png;base64,AAA"
+        }]),
+    );
+    store
+        .upsert_current_turn(session_id.clone(), turn)
+        .expect("image-only turn should upsert");
+
+    let user_message = store
+        .canonical_turns_for_session(&session_id)
+        .into_iter()
+        .find(|turn| turn.turn_id == "turn-image-only-message")
+        .and_then(|turn| turn.items.into_iter().next())
+        .expect("canonical image-only user message should exist");
+    assert!(user_message.visibility.renderable);
+    assert_eq!(user_message.content.as_deref(), Some(""));
+    assert_eq!(user_message.metadata["images"][0]["name"], "diagram.png");
+}
+
+#[test]
 fn blocked_current_turn_is_terminal_in_canonical_log() {
     let store = SessionStore::new();
     let session_id = SessionId::new("session-blocked-terminal-canonical");
@@ -2920,6 +2955,7 @@ fn incident_notifications_are_scoped_and_legacy_audits_are_removed() {
     }
 
     let session_id = SessionId::new("session-notification-scope");
+    let personal_session_id = SessionId::new("session-personal-notification-scope");
     let durable = SessionDurableState {
         notifications: vec![
             incident("app-incident", NotificationScope::App, None, None),
@@ -2934,6 +2970,12 @@ fn incident_notifications_are_scoped_and_legacy_audits_are_removed() {
                 NotificationScope::Session,
                 Some("workspace-a"),
                 Some(session_id.as_str()),
+            ),
+            incident(
+                "personal-session-incident",
+                NotificationScope::Session,
+                None,
+                Some(personal_session_id.as_str()),
             ),
             NotificationRecord {
                 kind: "audit".to_string(),
@@ -2950,7 +2992,8 @@ fn incident_notifications_are_scoped_and_legacy_audits_are_removed() {
     let store =
         SessionStore::from_persisted_parts(durable, SessionExecutionSidecarStoreState::default());
 
-    let records = store.notifications_for_context("workspace-a", Some(&session_id));
+    let workspace_context = NotificationContext::workspace("workspace-a", Some(session_id.clone()));
+    let records = store.notifications_for_context(&workspace_context);
     assert_eq!(records.len(), 3);
     assert!(
         records
@@ -2975,22 +3018,44 @@ fn incident_notifications_are_scoped_and_legacy_audits_are_removed() {
     );
     assert!(
         store
-            .notifications_for_context("workspace-b", Some(&session_id))
+            .notifications_for_context(&NotificationContext::workspace(
+                "workspace-b",
+                Some(SessionId::new("session-notification-other")),
+            ))
             .iter()
             .all(|item| item.notification_id != "session-incident"),
-        "session incident must not cross workspace boundaries"
+        "session incident must not cross session boundaries"
     );
 
     store
-        .resolve_notification_for_context("workspace-a", Some(&session_id), "session-incident")
+        .resolve_notification_for_context(&workspace_context, "session-incident")
         .expect("session incident should resolve in its context");
     let resolved = store
-        .notifications_for_context("workspace-a", Some(&session_id))
+        .notifications_for_context(&workspace_context)
         .into_iter()
         .find(|item| item.notification_id == "session-incident")
         .expect("resolved incident should remain visible");
     assert!(resolved.resolved);
     assert!(resolved.handled);
+
+    let personal_context = NotificationContext::personal(Some(personal_session_id.clone()));
+    let personal_records = store.notifications_for_context(&personal_context);
+    assert!(
+        personal_records
+            .iter()
+            .any(|item| item.notification_id == "personal-session-incident")
+    );
+    assert!(
+        personal_records
+            .iter()
+            .all(|item| item.workspace_id.is_none())
+    );
+    assert!(
+        store
+            .notifications_for_context(&NotificationContext::personal(Some(session_id.clone())))
+            .iter()
+            .all(|item| item.notification_id != "personal-session-incident")
+    );
 
     let mut first_occurrence = incident(
         "failure-occurrence-1",
@@ -3017,7 +3082,7 @@ fn incident_notifications_are_scoped_and_legacy_audits_are_removed() {
         .expect("second failure occurrence should persist");
 
     let occurrences = store
-        .notifications_for_context("workspace-a", Some(&session_id))
+        .notifications_for_context(&workspace_context)
         .into_iter()
         .filter(|item| item.fingerprint == "same-runtime-failure")
         .collect::<Vec<_>>();
@@ -4181,6 +4246,14 @@ fn thread_registry_round_trip_preserves_task_binding_and_message_history() {
             original_token_estimate: 12_000,
             checkpoint_token_estimate: 400,
             created_at: UtcMillis(2_100),
+            generation: 1,
+            source_fingerprint: String::new(),
+            model_provider: None,
+            model: None,
+            binding_revision: None,
+            projected_request_tokens: 0,
+            context_window_limit_tokens: None,
+            preserved_tail_message_count: 0,
             file_fact_versions: vec![ThreadFileFactVersion {
                 path: "/tmp/example.rs".to_string(),
                 content_hash: "hash-example".to_string(),
