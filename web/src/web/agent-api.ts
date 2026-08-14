@@ -7,6 +7,8 @@ import type {
   SettingsBuiltinTool,
   SettingsCapabilityDependency,
   SettingsRuntimeSnapshot,
+  VisionBuiltinTextModelRule,
+  VisionRoutingPreview,
 } from '../shared/settings-bootstrap';
 import type {
   IncidentNotificationItemDto,
@@ -254,6 +256,24 @@ function normalizeCapabilityDependencies(value: unknown): SettingsCapabilityDepe
   return dependencies;
 }
 
+function normalizeVisionBuiltinTextModelRules(value: unknown): VisionBuiltinTextModelRule[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+    const record = entry as Record<string, unknown>;
+    const id = typeof record.id === 'string' ? record.id.trim() : '';
+    const displayName = typeof record.displayName === 'string' ? record.displayName.trim() : '';
+    if (!id || !displayName) return [];
+    return [{
+      id,
+      displayName,
+      examples: Array.isArray(record.examples)
+        ? record.examples.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        : [],
+    }];
+  });
+}
+
 function normalizeSettingsBootstrapPayload(
   payload: Record<string, unknown>,
 ): AgentSettingsBootstrapSnapshot {
@@ -282,6 +302,7 @@ function normalizeSettingsBootstrapPayload(
     effectiveOrchestratorConfig: normalizeSettingsSectionConfig(payload.effectiveOrchestratorConfig),
     auxiliaryConfig: normalizeSettingsSectionConfig(payload.auxiliaryConfig),
     visionConfig: normalizeSettingsSectionConfig(payload.visionConfig),
+    visionBuiltinTextModelRules: normalizeVisionBuiltinTextModelRules(payload.visionBuiltinTextModelRules),
     imageGenerationConfig: normalizeSettingsSectionConfig(payload.imageGenerationConfig),
     modelContextWindows: Object.fromEntries(
       Object.entries(normalizeSettingsSectionConfig(payload.modelContextWindows))
@@ -2427,6 +2448,17 @@ export async function saveAgentAuxiliaryConfig(config: Record<string, unknown>):
 
 export async function saveAgentVisionConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
   return await postWorkspaceBoundJson<Record<string, unknown>>('/api/settings/vision/save', config, 'save vision config');
+}
+
+export async function previewAgentVisionRouting(
+  model: string,
+  textModelRules: Array<{ matchMode: 'exact' | 'regex'; pattern: string }>,
+): Promise<VisionRoutingPreview> {
+  return await postWorkspaceBoundJson<VisionRoutingPreview>(
+    '/api/settings/vision/routing-preview',
+    { model, textModelRules },
+    'preview vision routing',
+  );
 }
 
 export async function saveAgentImageGenerationConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {

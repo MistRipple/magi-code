@@ -30,7 +30,8 @@ use crate::{
     errors::{ApiError, settings_persistence_error},
     model_config::{
         DEFAULT_ORCHESTRATOR_REASONING_EFFORT, DEFAULT_VISION_CONTEXT_WINDOW,
-        NormalizedModelConfig, VISION_MODEL_SECTION, merge_orchestrator_session_override,
+        NormalizedModelConfig, VISION_MODEL_SECTION, builtin_text_model_rule_catalog,
+        match_text_model_rule, merge_orchestrator_session_override, parse_user_text_model_rules,
         reject_deprecated_model_config_fields, resolve_orchestrator_model_config,
         strip_orchestrator_session_owned_fields, validate_vision_model_settings,
     },
@@ -545,6 +546,10 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/vision/save", post(save_vision_config))
         .route("/settings/vision/test", post(test_vision_connection))
         .route(
+            "/settings/vision/routing-preview",
+            post(preview_vision_routing),
+        )
+        .route(
             "/settings/image-generation/save",
             post(save_image_generation_config),
         )
@@ -994,6 +999,10 @@ async fn settings_bootstrap(
         &tool_context,
     );
     if let Some(object) = snapshot.as_object_mut() {
+        object.insert(
+            "visionBuiltinTextModelRules".to_string(),
+            json!(builtin_text_model_rule_catalog()),
+        );
         if let Some(session_id) = scope.session_id() {
             let mut effective_orchestrator_config = object
                 .get("orchestratorConfig")
@@ -1332,6 +1341,41 @@ async fn test_vision_connection(
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     probe_connection_response(request).await
+}
+
+async fn preview_vision_routing(
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let request = scoped_settings_section_request(&request)?;
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::InvalidInput("待测试模型名称不能为空".to_string()))?;
+    let user_rules = parse_user_text_model_rules(&request).map_err(ApiError::InvalidInput)?;
+    let matched = match_text_model_rule(model, &user_rules);
+
+    Ok(Json(match matched {
+        Some(rule) => json!({
+            "model": model,
+            "matched": true,
+            "source": rule.source.as_label(),
+            "ruleId": rule.rule_id,
+            "ruleName": rule.display_name,
+            "matchMode": rule.match_mode.as_label(),
+            "pattern": rule.pattern,
+        }),
+        None => json!({
+            "model": model,
+            "matched": false,
+            "source": Value::Null,
+            "ruleId": Value::Null,
+            "ruleName": Value::Null,
+            "matchMode": Value::Null,
+            "pattern": Value::Null,
+        }),
+    }))
 }
 
 fn image_generation_section_request(request: &Value) -> Result<Value, ApiError> {
@@ -2592,9 +2636,14 @@ mod tests {
             "roleTemplates",
             "registryEngines",
             "registryAgents",
+            "visionBuiltinTextModelRules",
         ] {
             assert!(bootstrap[key].is_array(), "{key} should be an array");
         }
+        assert_eq!(
+            bootstrap["visionBuiltinTextModelRules"][0]["displayName"],
+            json!("GLM 5.2")
+        );
         let builtin_tools = bootstrap["builtinTools"]
             .as_array()
             .expect("builtin tools should be an array");
@@ -3766,6 +3815,82 @@ mod tests {
             saved["modelContextWindows"]["vision-capable-model"],
             json!(256000)
         );
+        assert_eq!(
+            state
+                .settings_store
+                .get_section(MODEL_CONTEXT_WINDOWS_SECTION)["vision-capable-model"],
+            json!(256000)
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_routing_preview_reports_builtin_and_custom_rule_sources() {
+        let builtin = preview_vision_routing(Json(json!({
+            "model": "GLM-5.2",
+            "textModelRules": []
+        })))
+        .await
+        .expect("builtin model should preview")
+        .0;
+        assert_eq!(builtin["matched"], json!(true));
+        assert_eq!(builtin["source"], json!("builtin"));
+        assert_eq!(builtin["ruleName"], json!("GLM 5.2"));
+
+        let custom = preview_vision_routing(Json(json!({
+            "model": "company-text-model",
+            "textModelRules": [
+                {"matchMode": "exact", "pattern": "company-text-model"}
+            ],
+            "workspaceId": "workspace-ignored"
+        })))
+        .await
+        .expect("custom model should preview")
+        .0;
+        assert_eq!(custom["matched"], json!(true));
+        assert_eq!(custom["source"], json!("custom"));
+        assert_eq!(custom["matchMode"], json!("exact"));
+        assert_eq!(custom["pattern"], json!("company-text-model"));
+
+        let unmatched = preview_vision_routing(Json(json!({
+            "model": "gpt-4.1",
+            "textModelRules": []
+        })))
+        .await
+        .expect("multimodal model should preview")
+        .0;
+        assert_eq!(unmatched["matched"], json!(false));
+        assert!(unmatched["source"].is_null());
+    }
+
+    #[tokio::test]
+    async fn vision_config_save_rejects_invalid_rules_without_partial_write() {
+        let state = test_state();
+        state
+            .settings_store
+            .set_section(
+                VISION_MODEL_SECTION,
+                json!({
+                    "baseUrl": "https://old-vision.example.com/v1",
+                    "apiKey": "old-key",
+                    "model": "old-vision-model",
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat",
+                    "contextWindowTokens": 128000,
+                    "textModelRules": []
+                }),
+            )
+            .unwrap();
+        state
+            .settings_store
+            .set_section(
+                MODEL_CONTEXT_WINDOWS_SECTION,
+                json!({"old-vision-model": 128000}),
+            )
+            .unwrap();
+        let original_vision = state.settings_store.get_section(VISION_MODEL_SECTION);
+        let original_windows = state
+            .settings_store
+            .get_section(MODEL_CONTEXT_WINDOWS_SECTION);
 
         let result = save_vision_config(
             State(state.clone()),

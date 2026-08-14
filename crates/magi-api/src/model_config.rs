@@ -5,7 +5,8 @@
 
 pub(crate) use magi_conversation_runtime::model_config::{
     DEFAULT_ORCHESTRATOR_REASONING_EFFORT, DEFAULT_VISION_CONTEXT_WINDOW, NormalizedModelConfig,
-    VISION_MODEL_SECTION, merge_orchestrator_session_override,
+    VISION_MODEL_SECTION, builtin_text_model_rule_catalog, match_text_model_rule,
+    merge_orchestrator_session_override, parse_user_text_model_rules,
     reject_deprecated_model_config_fields, resolve_orchestrator_model_config,
     strip_orchestrator_session_owned_fields, validate_vision_model_settings,
 };

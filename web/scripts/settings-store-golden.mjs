@@ -97,7 +97,7 @@ assert.doesNotMatch(
 );
 assert.match(
   modelConfigFormSource,
-  /const isDirty = \$derived\(editableConfigSnapshot\(config\) !== editableConfigSnapshot\(baselineConfig\)\)/,
+  /const isDirty = \$derived\([\s\S]*?editableConfigSnapshot\(config\) !== editableConfigSnapshot\(baselineConfig\)[\s\S]*?\|\| visionRulesTextDirty,[\s\S]*?\);/,
   '模型保存按钮必须直接比较当前草稿与后端持久化基线，任一可编辑字段变化都应立即启用',
 );
 assert.doesNotMatch(
@@ -107,8 +107,8 @@ assert.doesNotMatch(
 );
 assert.match(
   modelConfigFormSource,
-  /const saveDisabled = \$derived\(isSaving \|\| !isDirty\)/,
-  '模型配置发生变化后只应在保存期间禁用保存按钮，连接测试不得阻止用户保存',
+  /const saveDisabled = \$derived\([\s\S]*?isSaving[\s\S]*?\|\| !isDirty[\s\S]*?visionRuleAnalysis\.syntaxInvalid \|\| routingRulesValidationError[\s\S]*?\);/,
+  '模型配置发生变化后只应在保存期间或识图规则无效时禁用保存按钮',
 );
 assert.doesNotMatch(
   modelConfigFormSource,

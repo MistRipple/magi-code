@@ -34,6 +34,7 @@ import {
   listAgentRoleTemplates,
   loadAgentToolCatalogDiagnostics,
   loadAgentSkillLibrary,
+  previewAgentVisionRouting,
   refreshAgentMcpTools,
   refreshAgentRepository,
   removeAgentInstalledSkill,
@@ -63,6 +64,10 @@ import {
   upsertAgentRegistryEngine,
 } from "../web/agent-api";
 import type { RoleTemplate } from "../shared/types/role-templates";
+import type {
+  VisionBuiltinTextModelRule,
+  VisionRoutingPreview,
+} from "../shared/settings-bootstrap";
 import type {
   ModelEngine,
   AgentBinding,
@@ -799,6 +804,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   );
   let compConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
   let visionConfig = $state<BaseModelFormConfig>(createVisionConfig());
+  let visionBuiltinTextModelRules = $state<VisionBuiltinTextModelRule[]>([]);
   let imageConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
   let workerConfigs = $state<Record<string, WorkerModelFormConfig>>({});
   let modelConfigBaselines = $state<
@@ -1430,6 +1436,10 @@ function createSettingsStore(props: { onClose?: () => void }) {
       i18n.setLocale(runtimeLocale);
     }
     applyUserRulesConfig(payload.userRulesConfig);
+    visionBuiltinTextModelRules = payload.visionBuiltinTextModelRules.map((rule) => ({
+      ...rule,
+      examples: [...rule.examples],
+    }));
     // 主模型 / 辅助模型 / 引擎草稿不在此处派生——统一由监听
     // appState.settingsBootstrapSnapshot 的 $effect 派生（见 createSettingsStore
     // 顶部）。这样无论 snapshot 经由设置面板保存还是主线 picker 切换更新，
@@ -2179,11 +2189,11 @@ function createSettingsStore(props: { onClose?: () => void }) {
         );
       } else if (target === "vision") {
         response = await saveAgentVisionConfig(
-          buildBaseModelConfigPayload(config as BaseModelFormConfig),
+          buildVisionModelConfigPayload(config as BaseModelFormConfig),
         );
       } else if (target === "image") {
         response = await saveAgentImageGenerationConfig(
-          buildVisionModelConfigPayload(config as BaseModelFormConfig),
+          buildBaseModelConfigPayload(config as BaseModelFormConfig),
         );
       } else {
         return;
@@ -3196,17 +3206,30 @@ function createSettingsStore(props: { onClose?: () => void }) {
 
   function applyVisionConfig(config: any): void {
     if (!config) return;
-    const persisted = normalizeAuxiliaryFormConfig(config);
+    const persisted = normalizeVisionFormConfig(config);
     const preserveDraft = isModelConfigDraftDirty("vision", "vision", visionConfig);
     setModelConfigBaseline("vision", persisted);
     if (!preserveDraft) visionConfig = persisted;
+  }
+
+  async function previewVisionRouting(
+    model: string,
+    textModelRules: TextModelRule[],
+  ): Promise<VisionRoutingPreview> {
+    return await previewAgentVisionRouting(
+      model.trim(),
+      textModelRules.map((rule) => ({
+        matchMode: rule.matchMode,
+        pattern: rule.pattern.trim(),
+      })),
+    );
   }
 
   function applyImageGenerationConfig(config: any): void {
     if (!config) {
       return;
     }
-    const persisted = normalizeVisionFormConfig(config);
+    const persisted = normalizeAuxiliaryFormConfig(config);
     const preserveDraft = isModelConfigDraftDirty("image", "image", imageConfig);
     setModelConfigBaseline("image", persisted);
     if (!preserveDraft) imageConfig = persisted;
@@ -3888,6 +3911,16 @@ function createSettingsStore(props: { onClose?: () => void }) {
     set visionConfig(v) {
       visionConfig = v;
     },
+    get visionBuiltinTextModelRules() {
+      return visionBuiltinTextModelRules;
+    },
+    get visionCurrentMainModel() {
+      const snapshot = messagesState.settingsBootstrapSnapshot as
+        | AgentSettingsBootstrapSnapshot
+        | null;
+      const model = snapshot?.effectiveOrchestratorConfig?.model;
+      return typeof model === "string" ? model.trim() : "";
+    },
     set compConfig(v) {
       compConfig = v;
     },
@@ -3906,6 +3939,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     get modelConfigBaselines() {
       return modelConfigBaselines;
     },
+    previewVisionRouting,
     get workerModelTabs() {
       return workerModelTabs;
     },

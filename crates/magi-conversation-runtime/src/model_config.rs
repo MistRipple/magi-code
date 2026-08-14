@@ -16,6 +16,7 @@ use magi_core::SessionId;
 use magi_settings_store::DEPRECATED_MODEL_CONFIG_FIELDS;
 use magi_usage_authority::{LlmConfig, ReasoningEffort, UrlMode};
 use regex::Regex;
+use serde::Serialize;
 use serde_json::Value;
 use std::sync::OnceLock;
 
@@ -23,28 +24,70 @@ pub const DEFAULT_ORCHESTRATOR_REASONING_EFFORT: &str = "medium";
 pub const VISION_MODEL_SECTION: &str = "vision";
 pub const DEFAULT_VISION_CONTEXT_WINDOW: u64 = 128_000;
 
-const BUILTIN_TEXT_MODEL_RULES: &[(&str, &str)] = &[
-    ("openai-gpt-3.5", r"(?i)^gpt-3\.5(?:-turbo)?(?:[-.:].*)?$"),
-    ("openai-text-family", r"(?i)^text[-.:].+$"),
-    ("openai-o-mini", r"(?i)^(?:o1-mini|o3-mini)(?:[-.:].*)?$"),
-    (
-        "deepseek-text-family",
-        r"(?i)^deepseek-(?:chat|reasoner|coder)(?:[-.:].*)?$",
-    ),
-    (
-        "deepseek-v4-family",
-        r"(?i)^deepseek[-_.: ]*v?4(?:[-_.: ].*)?$",
-    ),
-    (
-        "glm-5.2-family",
-        r"(?i)^glm[-_.: ]*5[-_.: ]*2(?:[-_.: ].*)?$",
-    ),
-    (
-        "qwen-coder-family",
-        r"(?i)^(?:qwen|qwq)[^/]*coder(?:[-.:].*)?$",
-    ),
-    ("codestral-family", r"(?i)^codestral(?:[-.:].*)?$"),
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuiltinTextModelRuleDefinition {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub examples: &'static [&'static str],
+    #[serde(skip)]
+    pattern: &'static str,
+}
+
+const BUILTIN_TEXT_MODEL_RULES: &[BuiltinTextModelRuleDefinition] = &[
+    BuiltinTextModelRuleDefinition {
+        id: "glm-5.2-family",
+        display_name: "GLM 5.2",
+        examples: &["glm-5.2", "glm 5.2-air"],
+        pattern: r"(?i)^glm[-_.: ]*5[-_.: ]*2(?:[-_.: ].*)?$",
+    },
+    BuiltinTextModelRuleDefinition {
+        id: "deepseek-v4-family",
+        display_name: "DeepSeek V4",
+        examples: &["deepseek-v4", "deepseek-v4-flash"],
+        pattern: r"(?i)^deepseek[-_.: ]*v?4(?:[-_.: ].*)?$",
+    },
+    BuiltinTextModelRuleDefinition {
+        id: "deepseek-text-family",
+        display_name: "DeepSeek Chat / Reasoner / Coder",
+        examples: &["deepseek-chat", "deepseek-reasoner"],
+        pattern: r"(?i)^deepseek-(?:chat|reasoner|coder)(?:[-.:].*)?$",
+    },
+    BuiltinTextModelRuleDefinition {
+        id: "openai-gpt-3.5",
+        display_name: "GPT-3.5",
+        examples: &["gpt-3.5-turbo"],
+        pattern: r"(?i)^gpt-3\.5(?:-turbo)?(?:[-.:].*)?$",
+    },
+    BuiltinTextModelRuleDefinition {
+        id: "openai-o-mini",
+        display_name: "O1 Mini / O3 Mini",
+        examples: &["o1-mini", "o3-mini"],
+        pattern: r"(?i)^(?:o1-mini|o3-mini)(?:[-.:].*)?$",
+    },
+    BuiltinTextModelRuleDefinition {
+        id: "qwen-coder-family",
+        display_name: "Qwen / QwQ Coder",
+        examples: &["qwen-coder", "qwq-coder"],
+        pattern: r"(?i)^(?:qwen|qwq)[^/]*coder(?:[-.:].*)?$",
+    },
+    BuiltinTextModelRuleDefinition {
+        id: "codestral-family",
+        display_name: "Codestral",
+        examples: &["codestral-latest"],
+        pattern: r"(?i)^codestral(?:[-.:].*)?$",
+    },
+    BuiltinTextModelRuleDefinition {
+        id: "openai-text-family",
+        display_name: "OpenAI Text",
+        examples: &["text-davinci-003"],
+        pattern: r"(?i)^text[-.:].+$",
+    },
 ];
+
+pub fn builtin_text_model_rule_catalog() -> &'static [BuiltinTextModelRuleDefinition] {
+    BUILTIN_TEXT_MODEL_RULES
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextModelRuleMatchMode {
@@ -60,12 +103,43 @@ impl TextModelRuleMatchMode {
             _ => None,
         }
     }
+
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Regex => "regex",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextModelRule {
     pub match_mode: TextModelRuleMatchMode,
     pub pattern: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextModelRuleSource {
+    Builtin,
+    Custom,
+}
+
+impl TextModelRuleSource {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextModelRuleMatch {
+    pub source: TextModelRuleSource,
+    pub rule_id: String,
+    pub display_name: Option<String>,
+    pub match_mode: TextModelRuleMatchMode,
+    pub pattern: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,7 +421,7 @@ fn builtin_text_model_regexes() -> &'static [Regex] {
         .get_or_init(|| {
             BUILTIN_TEXT_MODEL_RULES
                 .iter()
-                .map(|(_, pattern)| Regex::new(pattern).expect("内置文本模型正则必须有效"))
+                .map(|rule| Regex::new(rule.pattern).expect("内置文本模型正则必须有效"))
                 .collect()
         })
         .as_slice()
@@ -434,28 +508,51 @@ pub fn model_matches_text_model_rule(
     settings_store: Option<&magi_settings_store::SettingsStore>,
     model: &str,
 ) -> bool {
+    let user_rules = settings_store
+        .map(|store| {
+            parse_user_text_model_rules(&store.get_section(VISION_MODEL_SECTION))
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    match_text_model_rule(model, &user_rules).is_some()
+}
+
+pub fn match_text_model_rule(
+    model: &str,
+    user_rules: &[TextModelRule],
+) -> Option<TextModelRuleMatch> {
     let model = model.trim();
     if model.is_empty() {
-        return false;
+        return None;
     }
-    if builtin_text_model_regexes()
+    if let Some((definition, _)) = BUILTIN_TEXT_MODEL_RULES
         .iter()
-        .any(|rule| rule.is_match(model))
+        .zip(builtin_text_model_regexes())
+        .find(|(_, regex)| regex.is_match(model))
     {
-        return true;
+        return Some(TextModelRuleMatch {
+            source: TextModelRuleSource::Builtin,
+            rule_id: definition.id.to_string(),
+            display_name: Some(definition.display_name.to_string()),
+            match_mode: TextModelRuleMatchMode::Regex,
+            pattern: None,
+        });
     }
-    let Some(store) = settings_store else {
-        return false;
-    };
-    parse_user_text_model_rules(&store.get_section(VISION_MODEL_SECTION))
-        .unwrap_or_default()
-        .iter()
-        .any(|rule| match rule.match_mode {
+    user_rules.iter().enumerate().find_map(|(index, rule)| {
+        let matches = match rule.match_mode {
             TextModelRuleMatchMode::Exact => rule.pattern.eq_ignore_ascii_case(model),
             TextModelRuleMatchMode::Regex => {
                 Regex::new(&rule.pattern).is_ok_and(|pattern| pattern.is_match(model))
             }
+        };
+        matches.then(|| TextModelRuleMatch {
+            source: TextModelRuleSource::Custom,
+            rule_id: format!("custom-{index}"),
+            display_name: None,
+            match_mode: rule.match_mode,
+            pattern: Some(rule.pattern.clone()),
         })
+    })
 }
 
 pub fn resolve_vision_execution_config(
@@ -961,6 +1058,37 @@ mod tests {
             "COMPANY-TEXT-MODEL"
         ));
         assert!(model_matches_text_model_rule(Some(&store), "legacy-42"));
+
+        let builtin_match =
+            match_text_model_rule("deepseek-v4-flash", &[]).expect("内置规则应返回权威命中详情");
+        assert_eq!(builtin_match.source, TextModelRuleSource::Builtin);
+        assert_eq!(builtin_match.rule_id, "deepseek-v4-family");
+        assert_eq!(builtin_match.display_name.as_deref(), Some("DeepSeek V4"));
+        assert!(builtin_match.pattern.is_none());
+
+        let user_rules = parse_user_text_model_rules(&store.get_section(VISION_MODEL_SECTION))
+            .expect("用户规则应可解析");
+        let custom_match =
+            match_text_model_rule("legacy-42", &user_rules).expect("用户规则应返回权威命中详情");
+        assert_eq!(custom_match.source, TextModelRuleSource::Custom);
+        assert_eq!(custom_match.rule_id, "custom-1");
+        assert_eq!(custom_match.match_mode, TextModelRuleMatchMode::Regex);
+        assert_eq!(custom_match.pattern.as_deref(), Some("^legacy-[0-9]+$"));
+    }
+
+    #[test]
+    fn builtin_text_model_rule_catalog_is_human_readable_and_complete() {
+        let catalog = builtin_text_model_rule_catalog();
+        assert_eq!(catalog.len(), BUILTIN_TEXT_MODEL_RULES.len());
+        assert!(catalog.iter().all(|rule| {
+            !rule.id.is_empty() && !rule.display_name.is_empty() && !rule.examples.is_empty()
+        }));
+        assert!(catalog.iter().any(|rule| rule.display_name == "GLM 5.2"));
+        assert!(
+            catalog
+                .iter()
+                .any(|rule| rule.display_name == "DeepSeek V4")
+        );
     }
 
     #[test]

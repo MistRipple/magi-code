@@ -52,6 +52,22 @@ export interface SettingsRuntimeSnapshot {
   locale: string;
 }
 
+export interface VisionBuiltinTextModelRule {
+  id: string;
+  displayName: string;
+  examples: string[];
+}
+
+export interface VisionRoutingPreview {
+  model: string;
+  matched: boolean;
+  source: 'builtin' | 'custom' | null;
+  ruleId: string | null;
+  ruleName: string | null;
+  matchMode: 'exact' | 'regex' | null;
+  pattern: string | null;
+}
+
 export interface SettingsBootstrapPayload {
   workspaceId?: string | null;
   workspacePath?: string | null;
@@ -63,6 +79,7 @@ export interface SettingsBootstrapPayload {
   effectiveOrchestratorConfig?: Record<string, unknown>;
   auxiliaryConfig: Record<string, unknown>;
   visionConfig: Record<string, unknown>;
+  visionBuiltinTextModelRules: VisionBuiltinTextModelRule[];
   imageGenerationConfig: Record<string, unknown>;
   modelContextWindows: Record<string, number>;
   userRulesConfig: Record<string, unknown>;
