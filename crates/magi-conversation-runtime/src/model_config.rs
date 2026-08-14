@@ -32,6 +32,14 @@ const BUILTIN_TEXT_MODEL_RULES: &[(&str, &str)] = &[
         r"(?i)^deepseek-(?:chat|reasoner|coder)(?:[-.:].*)?$",
     ),
     (
+        "deepseek-v4-family",
+        r"(?i)^deepseek[-_.: ]*v?4(?:[-_.: ].*)?$",
+    ),
+    (
+        "glm-5.2-family",
+        r"(?i)^glm[-_.: ]*5[-_.: ]*2(?:[-_.: ].*)?$",
+    ),
+    (
         "qwen-coder-family",
         r"(?i)^(?:qwen|qwq)[^/]*coder(?:[-.:].*)?$",
     ),
@@ -928,6 +936,14 @@ mod tests {
             Some(&store),
             "deepseek-reasoner"
         ));
+        assert!(model_matches_text_model_rule(
+            Some(&store),
+            "deepseek-v4-flash"
+        ));
+        assert!(model_matches_text_model_rule(Some(&store), "DeepSeek V4"));
+        assert!(model_matches_text_model_rule(Some(&store), "GLM-5.2"));
+        assert!(model_matches_text_model_rule(Some(&store), "glm 5.2-air"));
+        assert!(!model_matches_text_model_rule(Some(&store), "GLM-4.5-Air"));
         assert!(!model_matches_text_model_rule(Some(&store), "gpt-4.1"));
         store
             .set_section(
@@ -977,7 +993,7 @@ mod tests {
                 .is_none(),
             "未命中文本模型规则时不得切换识图模型"
         );
-        let resolved = resolve_vision_execution_config(Some(&store), "deepseek-chat", true)
+        let resolved = resolve_vision_execution_config(Some(&store), "GLM-5.2", true)
             .unwrap()
             .expect("图片请求命中文本模型规则时必须切换识图模型");
         assert_eq!(resolved.require_model().unwrap(), "vision-model");

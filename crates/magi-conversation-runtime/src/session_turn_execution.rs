@@ -3114,7 +3114,7 @@ mod tests {
         settings
             .set_section(
                 magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION,
-                serde_json::json!({"model": "deepseek-chat", "reasoningEffort": "medium"}),
+                serde_json::json!({"model": "deepseek-v4-flash", "reasoningEffort": "medium"}),
             )
             .expect("主模型默认配置必须可写入");
         settings
