@@ -304,14 +304,6 @@
   const isContextCompactionRunning = $derived(
     noticeKind === 'context_compaction' && compactionState === 'running',
   );
-  const imageUnderstandingState = $derived(
-    typeof message.metadata?.imageUnderstandingState === 'string'
-      ? message.metadata.imageUnderstandingState
-      : '',
-  );
-  const isImageUnderstandingRunning = $derived(
-    noticeKind === 'image_understanding' && imageUnderstandingState === 'running',
-  );
   const canContinueInterrupted = $derived(
     isInterruptedRecoveryNotice
       && recoveryState === 'ready'
@@ -361,21 +353,6 @@
         before: compactTokenLabel(message.metadata.originalTokenEstimate),
         after: compactTokenLabel(message.metadata.compactedTokenEstimate),
       });
-    }
-    if (noticeKind === 'image_understanding') {
-      const imageCount = typeof message.metadata?.imageCount === 'number'
-        ? message.metadata.imageCount
-        : 0;
-      if (imageUnderstandingState === 'running') {
-        return i18n.t('messageItem.imageUnderstandingRunning', { count: imageCount });
-      }
-      if (imageUnderstandingState === 'completed') {
-        return i18n.t('messageItem.imageUnderstandingCompleted', { count: imageCount });
-      }
-      if (imageUnderstandingState === 'cancelled') {
-        return i18n.t('messageItem.imageUnderstandingCancelled', { count: imageCount });
-      }
-      return i18n.t('messageItem.imageUnderstandingFailed', { count: imageCount });
     }
     return message.content;
   });
@@ -434,10 +411,10 @@
     {:else}
       <span
         class="notice-icon"
-        class:compacting={isContextCompactionRunning || isImageUnderstandingRunning}
+        class:compacting={isContextCompactionRunning}
         style="color: {noticeColors[noticeType] || noticeColors.info}"
       >
-        <Icon name={isContextCompactionRunning || isImageUnderstandingRunning ? 'loader' : (noticeIcons[noticeType] || 'info')} size={14} />
+        <Icon name={isContextCompactionRunning ? 'loader' : (noticeIcons[noticeType] || 'info')} size={14} />
       </span>
       <span class="notice-text">
         <ErrorDetailPopover text={noticeText} maxInlineChars={96} />

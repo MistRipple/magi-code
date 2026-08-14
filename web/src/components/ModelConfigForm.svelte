@@ -65,7 +65,18 @@
       ...(showModelField ? { model: String(value?.model ?? '') } : {}),
       ...(showAdvancedOptions
         ? { reasoningEffort: String(value?.reasoningEffort ?? 'medium') }
-        : {})
+        : {}),
+      ...(formType === 'vision'
+        ? {
+            contextWindowTokens: Math.floor(Number(value?.contextWindowTokens) || 128000),
+            textModelRules: Array.isArray(value?.textModelRules)
+              ? value.textModelRules.map((rule: any) => ({
+                  matchMode: rule?.matchMode === 'regex' ? 'regex' : 'exact',
+                  pattern: String(rule?.pattern ?? ''),
+                }))
+              : [],
+          }
+        : {}),
     };
     return JSON.stringify(normalized);
   }
@@ -157,6 +168,25 @@
     if (protocol === 'openai_responses') return 'settings.model.protocol.openaiResponsesBehavior';
     if (protocol === 'anthropic_messages') return 'settings.model.protocol.anthropicMessagesBehavior';
     return 'settings.model.protocol.openaiChatBehavior';
+  }
+
+  function addTextModelRule() {
+    config.textModelRules = [
+      ...(Array.isArray(config.textModelRules) ? config.textModelRules : []),
+      { matchMode: 'exact', pattern: '' },
+    ];
+  }
+
+  function updateTextModelRule(index: number, field: 'matchMode' | 'pattern', value: string) {
+    config.textModelRules = (Array.isArray(config.textModelRules) ? config.textModelRules : [])
+      .map((rule: any, ruleIndex: number) => ruleIndex === index
+        ? { ...rule, [field]: value }
+        : rule);
+  }
+
+  function removeTextModelRule(index: number) {
+    config.textModelRules = (Array.isArray(config.textModelRules) ? config.textModelRules : [])
+      .filter((_: unknown, ruleIndex: number) => ruleIndex !== index);
   }
 </script>
 
@@ -318,6 +348,78 @@
     {/if}
   </div>
 
+  {#if formType === 'vision'}
+    <div class="vision-runtime-settings">
+      <div class="llm-config-field vision-context-window-field">
+        <label class="form-label" for="vision-context-window">
+          {i18n.t('settings.model.field.contextWindow')}
+        </label>
+        <input
+          id="vision-context-window"
+          type="number"
+          class="form-input"
+          min="16000"
+          max="10000000"
+          step="1000"
+          bind:value={config.contextWindowTokens}
+        />
+        <div class="llm-config-hint">{i18n.t('settings.model.visionContextWindowHint')}</div>
+      </div>
+
+      <div class="vision-text-model-rules">
+        <div class="vision-rule-header">
+          <div>
+            <div class="form-label">{i18n.t('settings.model.textModelRules')}</div>
+            <div class="llm-config-hint">{i18n.t('settings.model.textModelRulesHint')}</div>
+          </div>
+          <button
+            type="button"
+            class="btn btn--secondary btn--sm"
+            onclick={addTextModelRule}
+          >
+            <Icon name="plus" size={13} />
+            {i18n.t('settings.model.addTextModelRule')}
+          </button>
+        </div>
+        {#if (config.textModelRules?.length ?? 0) > 0}
+          <div class="vision-rule-list">
+            {#each config.textModelRules as rule, index (`${index}-${rule.matchMode}`)}
+              <div class="vision-rule-row">
+                <select
+                  class="form-input vision-rule-mode"
+                  value={rule.matchMode}
+                  onchange={(event) => updateTextModelRule(index, 'matchMode', event.currentTarget.value)}
+                  aria-label={i18n.t('settings.model.textModelRuleMode')}
+                >
+                  <option value="exact">{i18n.t('settings.model.textModelRuleExact')}</option>
+                  <option value="regex">{i18n.t('settings.model.textModelRuleRegex')}</option>
+                </select>
+                <input
+                  type="text"
+                  class="form-input"
+                  value={rule.pattern}
+                  oninput={(event) => updateTextModelRule(index, 'pattern', event.currentTarget.value)}
+                  placeholder={rule.matchMode === 'regex'
+                    ? i18n.t('settings.model.textModelRuleRegexPlaceholder')
+                    : i18n.t('settings.model.textModelRuleExactPlaceholder')}
+                />
+                <button
+                  type="button"
+                  class="vision-rule-remove"
+                  onclick={() => removeTextModelRule(index)}
+                  title={i18n.t('settings.model.removeTextModelRule')}
+                  aria-label={i18n.t('settings.model.removeTextModelRule')}
+                >
+                  <Icon name="trash" size={13} />
+                </button>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
   <div
     class="apple-dashboard-bar model-form-actions"
     class:model-form-actions--buttons-only={!description}
@@ -437,6 +539,68 @@
 
   .protocol-select {
     min-width: 0;
+  }
+
+  .vision-runtime-settings {
+    display: grid;
+    grid-template-columns: minmax(180px, 240px) minmax(0, 1fr);
+    gap: var(--space-4);
+    padding-top: var(--space-2);
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  .vision-rule-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+
+  .vision-rule-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+  }
+
+  .vision-rule-row {
+    display: grid;
+    grid-template-columns: 92px minmax(0, 1fr) 32px;
+    gap: var(--space-2);
+    align-items: center;
+  }
+
+  .vision-rule-mode {
+    min-width: 0;
+  }
+
+  .vision-rule-remove {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    color: var(--foreground-muted);
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .vision-rule-remove:hover {
+    color: var(--error);
+    border-color: color-mix(in srgb, var(--error) 45%, var(--border-subtle));
+  }
+
+  @media (max-width: 760px) {
+    .vision-runtime-settings {
+      grid-template-columns: 1fr;
+    }
+
+    .vision-rule-row {
+      grid-template-columns: 84px minmax(0, 1fr) 32px;
+    }
   }
 
   .protocol-endpoint {

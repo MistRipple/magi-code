@@ -94,12 +94,19 @@ import {
 export type UrlMode = "standard" | "full";
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
+export interface TextModelRule {
+  matchMode: "exact" | "regex";
+  pattern: string;
+}
+
 export interface BaseModelFormConfig {
   baseUrl: string;
   urlMode: UrlMode;
   apiProtocol: ModelApiProtocol;
   apiKey: string;
   model: string;
+  contextWindowTokens?: number;
+  textModelRules?: TextModelRule[];
 }
 
 export interface InteractiveModelFormConfig extends BaseModelFormConfig {
@@ -384,6 +391,19 @@ function createSettingsStore(props: { onClose?: () => void }) {
     };
   }
 
+  function createVisionConfig(
+    overrides: Partial<BaseModelFormConfig> = {},
+  ): BaseModelFormConfig {
+    return {
+      ...createAuxiliaryConfig(),
+      contextWindowTokens: 128000,
+      ...overrides,
+      textModelRules: Array.isArray(overrides.textModelRules)
+        ? overrides.textModelRules.map((rule) => ({ ...rule }))
+        : [],
+    };
+  }
+
   function createWorkerConfig(
     overrides: Partial<WorkerModelFormConfig> = {},
   ): WorkerModelFormConfig {
@@ -412,6 +432,19 @@ function createSettingsStore(props: { onClose?: () => void }) {
       apiProtocol: config.apiProtocol,
       apiKey: config.apiKey,
       model: config.model,
+    };
+  }
+
+  function buildVisionModelConfigPayload(
+    config: BaseModelFormConfig,
+  ): BaseModelConfigPayload {
+    return {
+      ...buildBaseModelConfigPayload(config),
+      contextWindowTokens: Math.floor(Number(config.contextWindowTokens) || 128000),
+      textModelRules: (config.textModelRules || []).map((rule) => ({
+        matchMode: rule.matchMode === "regex" ? "regex" : "exact",
+        pattern: rule.pattern.trim(),
+      })),
     };
   }
 
@@ -460,7 +493,12 @@ function createSettingsStore(props: { onClose?: () => void }) {
   }
 
   function cloneModelFormConfig<T extends BaseModelFormConfig>(config: T): T {
-    return { ...config };
+    return {
+      ...config,
+      ...(Array.isArray(config.textModelRules)
+        ? { textModelRules: config.textModelRules.map((rule) => ({ ...rule })) }
+        : {}),
+    };
   }
 
   function buildModelConfigSignature(
@@ -471,6 +509,8 @@ function createSettingsStore(props: { onClose?: () => void }) {
       ? buildOrchestratorConnectionConfigPayload(config as InteractiveModelFormConfig)
       : target === "worker"
         ? buildWorkerModelConfigPayload(config as WorkerModelFormConfig)
+        : target === "vision"
+          ? buildVisionModelConfigPayload(config as BaseModelFormConfig)
         : buildBaseModelConfigPayload(config as BaseModelFormConfig);
     return JSON.stringify(payload);
   }
@@ -519,6 +559,29 @@ function createSettingsStore(props: { onClose?: () => void }) {
     });
   }
 
+  function normalizeVisionFormConfig(config: any): BaseModelFormConfig {
+    const rules = Array.isArray(config?.textModelRules)
+      ? config.textModelRules
+          .map((rule: any) => ({
+            matchMode: rule?.matchMode === "regex" ? "regex" as const : "exact" as const,
+            pattern: typeof rule?.pattern === "string" ? rule.pattern : "",
+          }))
+          .filter((rule: TextModelRule) => rule.pattern.trim().length > 0)
+      : [];
+    const contextWindowTokens = Number(config?.contextWindowTokens);
+    return createVisionConfig({
+      baseUrl: config?.baseUrl || "",
+      urlMode: normalizeUrlMode(config?.urlMode),
+      apiProtocol: normalizeModelApiProtocol(config?.apiProtocol),
+      apiKey: config?.apiKey || "",
+      model: config?.model || "",
+      contextWindowTokens: Number.isFinite(contextWindowTokens) && contextWindowTokens > 0
+        ? Math.floor(contextWindowTokens)
+        : 128000,
+      textModelRules: rules,
+    });
+  }
+
   function normalizeWorkerFormConfig(config: any): WorkerModelFormConfig {
     return createWorkerConfig({
       baseUrl: config?.baseUrl || "",
@@ -536,7 +599,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   ): BaseModelFormConfig | InteractiveModelFormConfig {
     if (target === "orch") return normalizeOrchestratorFormConfig(config);
     if (target === "worker") return normalizeWorkerFormConfig(config);
-    if (target === "vision") return normalizeAuxiliaryFormConfig(config);
+    if (target === "vision") return normalizeVisionFormConfig(config);
     return normalizeAuxiliaryFormConfig(config);
   }
 
@@ -735,7 +798,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     createInteractiveConfig(),
   );
   let compConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
-  let visionConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
+  let visionConfig = $state<BaseModelFormConfig>(createVisionConfig());
   let imageConfig = $state<BaseModelFormConfig>(createAuxiliaryConfig());
   let workerConfigs = $state<Record<string, WorkerModelFormConfig>>({});
   let modelConfigBaselines = $state<
@@ -743,7 +806,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
   >({
     orch: createInteractiveConfig(),
     comp: createAuxiliaryConfig(),
-    vision: createAuxiliaryConfig(),
+    vision: createVisionConfig(),
     image: createAuxiliaryConfig(),
   });
 
@@ -2120,7 +2183,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
         );
       } else if (target === "image") {
         response = await saveAgentImageGenerationConfig(
-          buildBaseModelConfigPayload(config as BaseModelFormConfig),
+          buildVisionModelConfigPayload(config as BaseModelFormConfig),
         );
       } else {
         return;
@@ -3143,7 +3206,7 @@ function createSettingsStore(props: { onClose?: () => void }) {
     if (!config) {
       return;
     }
-    const persisted = normalizeAuxiliaryFormConfig(config);
+    const persisted = normalizeVisionFormConfig(config);
     const preserveDraft = isModelConfigDraftDirty("image", "image", imageConfig);
     setModelConfigBaseline("image", persisted);
     if (!preserveDraft) imageConfig = persisted;

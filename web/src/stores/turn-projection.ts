@@ -230,7 +230,6 @@ function resolveMessageType(item: CanonicalTurnItem): Message['type'] {
   if (item.kind === 'system_notice') {
     return isAgentTaskSidechainItem(item)
       || item.metadata?.noticeKind === 'context_compaction'
-      || item.metadata?.noticeKind === 'image_understanding'
       || item.metadata?.noticeKind === 'session_interrupted'
       ? 'system-notice'
       : 'text';

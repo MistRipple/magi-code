@@ -15,11 +15,50 @@ use magi_bridge_client::{
 use magi_core::SessionId;
 use magi_settings_store::DEPRECATED_MODEL_CONFIG_FIELDS;
 use magi_usage_authority::{LlmConfig, ReasoningEffort, UrlMode};
+use regex::Regex;
 use serde_json::Value;
+use std::sync::OnceLock;
 
 pub const DEFAULT_ORCHESTRATOR_REASONING_EFFORT: &str = "medium";
 pub const VISION_MODEL_SECTION: &str = "vision";
-pub const MODEL_CAPABILITIES_SECTION: &str = "modelCapabilities";
+pub const DEFAULT_VISION_CONTEXT_WINDOW: u64 = 128_000;
+
+const BUILTIN_TEXT_MODEL_RULES: &[(&str, &str)] = &[
+    ("openai-gpt-3.5", r"(?i)^gpt-3\.5(?:-turbo)?(?:[-.:].*)?$"),
+    ("openai-text-family", r"(?i)^text[-.:].+$"),
+    ("openai-o-mini", r"(?i)^(?:o1-mini|o3-mini)(?:[-.:].*)?$"),
+    (
+        "deepseek-text-family",
+        r"(?i)^deepseek-(?:chat|reasoner|coder)(?:[-.:].*)?$",
+    ),
+    (
+        "qwen-coder-family",
+        r"(?i)^(?:qwen|qwq)[^/]*coder(?:[-.:].*)?$",
+    ),
+    ("codestral-family", r"(?i)^codestral(?:[-.:].*)?$"),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextModelRuleMatchMode {
+    Exact,
+    Regex,
+}
+
+impl TextModelRuleMatchMode {
+    fn from_label(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "exact" => Some(Self::Exact),
+            "regex" => Some(Self::Regex),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextModelRule {
+    pub match_mode: TextModelRuleMatchMode,
+    pub pattern: String,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelUrlMode {
@@ -117,6 +156,7 @@ pub struct NormalizedModelConfig {
     url_mode: ModelUrlMode,
     api_protocol: ModelApiProtocol,
     reasoning_effort: Option<ModelReasoningEffort>,
+    context_window_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +200,7 @@ impl NormalizedModelConfig {
                 .get("reasoningEffort")
                 .and_then(Value::as_str)
                 .and_then(ModelReasoningEffort::from_label),
+            context_window_tokens: value.get("contextWindowTokens").and_then(Value::as_u64),
         })
     }
 
@@ -198,6 +239,10 @@ impl NormalizedModelConfig {
 
     pub fn api_protocol(&self) -> HttpModelBridgeProtocol {
         self.api_protocol.to_http_protocol()
+    }
+
+    pub fn context_window_tokens(&self) -> Option<u64> {
+        self.context_window_tokens
     }
 
     pub fn to_http_model_client(&self) -> Option<HttpModelBridgeClient> {
@@ -288,23 +333,139 @@ impl NormalizedModelConfig {
     }
 }
 
-/// 只有显式声明为 multimodal 的模型才会直接接收图片；未知能力一律按 text-only 处理。
-pub fn model_supports_images(
+fn builtin_text_model_regexes() -> &'static [Regex] {
+    static RULES: OnceLock<Vec<Regex>> = OnceLock::new();
+    RULES
+        .get_or_init(|| {
+            BUILTIN_TEXT_MODEL_RULES
+                .iter()
+                .map(|(_, pattern)| Regex::new(pattern).expect("内置文本模型正则必须有效"))
+                .collect()
+        })
+        .as_slice()
+}
+
+pub fn parse_user_text_model_rules(value: &Value) -> Result<Vec<TextModelRule>, String> {
+    let Some(entries) = value.get("textModelRules") else {
+        return Ok(Vec::new());
+    };
+    let entries = entries
+        .as_array()
+        .ok_or_else(|| "textModelRules 必须是数组".to_string())?;
+    if entries.len() > 128 {
+        return Err("textModelRules 最多允许 128 条规则".to_string());
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let match_mode = entry
+                .get("matchMode")
+                .and_then(Value::as_str)
+                .and_then(TextModelRuleMatchMode::from_label)
+                .ok_or_else(|| {
+                    format!("textModelRules[{index}].matchMode 必须是 exact 或 regex")
+                })?;
+            let pattern = entry
+                .get("pattern")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|pattern| !pattern.is_empty())
+                .ok_or_else(|| format!("textModelRules[{index}].pattern 不能为空"))?;
+            if pattern.len() > 512 {
+                return Err(format!(
+                    "textModelRules[{index}].pattern 不能超过 512 个字符"
+                ));
+            }
+            if match_mode == TextModelRuleMatchMode::Regex {
+                Regex::new(pattern)
+                    .map_err(|error| format!("textModelRules[{index}] 正则无效：{error}"))?;
+            }
+            Ok(TextModelRule {
+                match_mode,
+                pattern: pattern.to_string(),
+            })
+        })
+        .collect()
+}
+
+pub fn validate_vision_model_settings(value: &Value) -> Result<(), String> {
+    let config = NormalizedModelConfig::from_settings_value(value)?;
+    config.require_base_url()?;
+    config.require_api_key()?;
+    config.require_model()?;
+    if value.get("contextWindowTokens").is_some()
+        && value
+            .get("contextWindowTokens")
+            .and_then(Value::as_u64)
+            .is_none()
+    {
+        return Err("识图模型上下文窗口必须是正整数".to_string());
+    }
+    let context_window = config
+        .context_window_tokens()
+        .unwrap_or(DEFAULT_VISION_CONTEXT_WINDOW);
+    if !(crate::model_context_window::MIN_MODEL_CONTEXT_WINDOW
+        ..=crate::model_context_window::MAX_MODEL_CONTEXT_WINDOW)
+        .contains(&context_window)
+    {
+        return Err(format!(
+            "识图模型上下文窗口必须在 {} 到 {} token 之间",
+            crate::model_context_window::MIN_MODEL_CONTEXT_WINDOW,
+            crate::model_context_window::MAX_MODEL_CONTEXT_WINDOW,
+        ));
+    }
+    parse_user_text_model_rules(value)?;
+    if config.to_http_vision_client().is_none() {
+        return Err("识图模型接口地址或模型配置无效".to_string());
+    }
+    Ok(())
+}
+
+pub fn model_matches_text_model_rule(
     settings_store: Option<&magi_settings_store::SettingsStore>,
     model: &str,
 ) -> bool {
-    let Some(store) = settings_store else {
-        return false;
-    };
     let model = model.trim();
     if model.is_empty() {
         return false;
     }
-    store
-        .get_section(MODEL_CAPABILITIES_SECTION)
-        .get(model)
-        .and_then(Value::as_str)
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("multimodal"))
+    if builtin_text_model_regexes()
+        .iter()
+        .any(|rule| rule.is_match(model))
+    {
+        return true;
+    }
+    let Some(store) = settings_store else {
+        return false;
+    };
+    parse_user_text_model_rules(&store.get_section(VISION_MODEL_SECTION))
+        .unwrap_or_default()
+        .iter()
+        .any(|rule| match rule.match_mode {
+            TextModelRuleMatchMode::Exact => rule.pattern.eq_ignore_ascii_case(model),
+            TextModelRuleMatchMode::Regex => {
+                Regex::new(&rule.pattern).is_ok_and(|pattern| pattern.is_match(model))
+            }
+        })
+}
+
+pub fn resolve_vision_execution_config(
+    settings_store: Option<&magi_settings_store::SettingsStore>,
+    selected_model: &str,
+    request_contains_images: bool,
+) -> Result<Option<NormalizedModelConfig>, String> {
+    if !request_contains_images || !model_matches_text_model_rule(settings_store, selected_model) {
+        return Ok(None);
+    }
+    let store = settings_store.ok_or_else(|| {
+        format!("模型 {selected_model} 只能处理文本，但当前运行环境没有识图模型配置")
+    })?;
+    let raw = store.get_section(VISION_MODEL_SECTION);
+    validate_vision_model_settings(&raw).map_err(|error| {
+        format!("模型 {selected_model} 只能处理文本，识图模型配置不可用：{error}")
+    })?;
+    NormalizedModelConfig::from_settings_value(&raw).map(Some)
 }
 
 pub fn reject_deprecated_model_config_fields(value: &Value) -> Result<(), String> {
@@ -761,17 +922,90 @@ mod tests {
     }
 
     #[test]
-    fn image_capability_requires_explicit_multimodal_declaration() {
+    fn text_model_rules_combine_builtin_and_user_entries() {
         let store = magi_settings_store::SettingsStore::new();
-        assert!(!model_supports_images(Some(&store), "gpt-test"));
+        assert!(model_matches_text_model_rule(
+            Some(&store),
+            "deepseek-reasoner"
+        ));
+        assert!(!model_matches_text_model_rule(Some(&store), "gpt-4.1"));
         store
             .set_section(
-                MODEL_CAPABILITIES_SECTION,
-                json!({"gpt-test": "multimodal", "text-test": "text"}),
+                VISION_MODEL_SECTION,
+                json!({
+                    "textModelRules": [
+                        {"matchMode": "exact", "pattern": "company-text-model"},
+                        {"matchMode": "regex", "pattern": "^legacy-[0-9]+$"}
+                    ]
+                }),
             )
             .unwrap();
-        assert!(model_supports_images(Some(&store), "gpt-test"));
-        assert!(!model_supports_images(Some(&store), "text-test"));
+        assert!(model_matches_text_model_rule(
+            Some(&store),
+            "COMPANY-TEXT-MODEL"
+        ));
+        assert!(model_matches_text_model_rule(Some(&store), "legacy-42"));
+    }
+
+    #[test]
+    fn vision_execution_requires_both_image_input_and_text_model_match() {
+        let store = magi_settings_store::SettingsStore::new();
+        store
+            .set_section(
+                VISION_MODEL_SECTION,
+                json!({
+                    "baseUrl": "https://vision.example.com/v1",
+                    "apiKey": "test-key",
+                    "model": "vision-model",
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat",
+                    "contextWindowTokens": 256000,
+                    "textModelRules": []
+                }),
+            )
+            .unwrap();
+
+        assert!(
+            resolve_vision_execution_config(Some(&store), "deepseek-chat", false)
+                .unwrap()
+                .is_none(),
+            "纯文本请求不得切换识图模型"
+        );
+        assert!(
+            resolve_vision_execution_config(Some(&store), "gpt-4.1", true)
+                .unwrap()
+                .is_none(),
+            "未命中文本模型规则时不得切换识图模型"
+        );
+        let resolved = resolve_vision_execution_config(Some(&store), "deepseek-chat", true)
+            .unwrap()
+            .expect("图片请求命中文本模型规则时必须切换识图模型");
+        assert_eq!(resolved.require_model().unwrap(), "vision-model");
+        assert_eq!(resolved.context_window_tokens(), Some(256000));
+    }
+
+    #[test]
+    fn vision_settings_reject_invalid_regex_and_context_window() {
+        let invalid_regex = json!({
+            "baseUrl": "https://vision.example.com/v1",
+            "apiKey": "test-key",
+            "model": "vision-model",
+            "urlMode": "standard",
+            "apiProtocol": "openai_chat",
+            "contextWindowTokens": 128000,
+            "textModelRules": [{"matchMode": "regex", "pattern": "("}]
+        });
+        assert!(validate_vision_model_settings(&invalid_regex).is_err());
+
+        let invalid_window = json!({
+            "baseUrl": "https://vision.example.com/v1",
+            "apiKey": "test-key",
+            "model": "vision-model",
+            "urlMode": "standard",
+            "apiProtocol": "openai_chat",
+            "contextWindowTokens": 1000
+        });
+        assert!(validate_vision_model_settings(&invalid_window).is_err());
     }
 
     #[test]

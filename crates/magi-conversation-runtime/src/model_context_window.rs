@@ -8,6 +8,8 @@ use std::sync::Arc;
 pub const MODEL_CONTEXT_WINDOWS_SECTION: &str = "modelContextWindows";
 pub const MIN_MODEL_CONTEXT_WINDOW: u64 = 16_000;
 pub const MAX_MODEL_CONTEXT_WINDOW: u64 = 10_000_000;
+const CONTEXT_LIMIT_RECOVERY_DIVISOR: u64 = 4;
+const CONTEXT_LIMIT_RECOVERY_MAX_WINDOW: u64 = MIN_MODEL_CONTEXT_WINDOW / 2;
 
 pub fn normalize_model_context_key(model: &str) -> String {
     model.trim().to_ascii_lowercase()
@@ -34,7 +36,59 @@ pub fn resolve_model_context_window(settings_store: Option<&SettingsStore>, mode
         .unwrap_or_else(|| resolve_context_window(model).max(0) as u64)
 }
 
+pub fn resolve_model_context_window_with_override(
+    settings_store: Option<&SettingsStore>,
+    model: &str,
+    configured_override: Option<u64>,
+) -> u64 {
+    configured_model_context_window(settings_store, model)
+        .or(configured_override)
+        .unwrap_or_else(|| resolve_context_window(model).max(0) as u64)
+}
+
+pub(crate) fn conservative_context_limit_recovery_window(current_window: u64) -> u64 {
+    current_window
+        .checked_div(CONTEXT_LIMIT_RECOVERY_DIVISOR)
+        .unwrap_or_default()
+        .clamp(
+            MIN_MODEL_CONTEXT_WINDOW / CONTEXT_LIMIT_RECOVERY_DIVISOR,
+            CONTEXT_LIMIT_RECOVERY_MAX_WINDOW,
+        )
+}
+
 pub fn set_model_context_window(
+    settings_store: &SettingsStore,
+    model: &str,
+    context_window_tokens: u64,
+) -> Result<Map<String, Value>, String> {
+    let entries = model_context_windows_with_update(settings_store, model, context_window_tokens)?;
+    let mut updates = vec![(
+        MODEL_CONTEXT_WINDOWS_SECTION.to_string(),
+        Value::Object(entries.clone()),
+    )];
+    let mut vision = settings_store.get_section(crate::model_config::VISION_MODEL_SECTION);
+    if vision
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|configured| configured.trim().eq_ignore_ascii_case(model.trim()))
+        && let Some(vision) = vision.as_object_mut()
+    {
+        vision.insert(
+            "contextWindowTokens".to_string(),
+            Value::from(context_window_tokens),
+        );
+        updates.push((
+            crate::model_config::VISION_MODEL_SECTION.to_string(),
+            Value::Object(vision.clone()),
+        ));
+    }
+    settings_store
+        .apply_section_changes(updates, Vec::<String>::new())
+        .map_err(|error| format!("保存模型上下文窗口失败：{error}"))?;
+    Ok(entries)
+}
+
+pub fn model_context_windows_with_update(
     settings_store: &SettingsStore,
     model: &str,
     context_window_tokens: u64,
@@ -55,12 +109,6 @@ pub fn set_model_context_window(
         .cloned()
         .unwrap_or_default();
     entries.insert(key, Value::from(context_window_tokens));
-    settings_store
-        .set_section(
-            MODEL_CONTEXT_WINDOWS_SECTION,
-            Value::Object(entries.clone()),
-        )
-        .map_err(|error| format!("保存模型上下文窗口失败：{error}"))?;
     Ok(entries)
 }
 
@@ -128,5 +176,12 @@ mod tests {
     #[test]
     fn resolver_uses_builtin_window_without_user_configuration() {
         assert_eq!(resolve_model_context_window(None, "gpt-4.1"), 1_000_000);
+    }
+
+    #[test]
+    fn context_limit_recovery_uses_a_conservative_runtime_window() {
+        assert_eq!(conservative_context_limit_recovery_window(128_000), 8_000);
+        assert_eq!(conservative_context_limit_recovery_window(16_000), 4_000);
+        assert_eq!(conservative_context_limit_recovery_window(1), 4_000);
     }
 }

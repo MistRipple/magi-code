@@ -6,18 +6,19 @@ use crate::context_authority::{
 use crate::context_authority::{
     ThreadHistoryCompactionDecision, thread_history_compaction_decision,
 };
-use crate::image_understanding::route_messages_for_model;
-use crate::model_context_window::{apply_reported_context_limit, resolve_model_context_window};
+use crate::model_config::resolve_vision_execution_config;
+use crate::model_context_window::{
+    apply_reported_context_limit, conservative_context_limit_recovery_window,
+    resolve_model_context_window_with_override,
+};
 use crate::session_writeback::{
-    ContextCompactionWritebackContext, ImageUnderstandingWritebackContext,
-    SessionStatePersistCallback, SessionTurnStreamPublishGate, SessionTurnStreamUpdate,
-    append_session_turn_item_with_task_store, apply_model_response_round,
+    ContextCompactionWritebackContext, SessionStatePersistCallback, SessionTurnStreamPublishGate,
+    SessionTurnStreamUpdate, append_session_turn_item_with_task_store, apply_model_response_round,
     new_context_compaction_item_id, persist_session_state_checkpoint,
     publish_current_session_turn_item_event, publish_model_retry_runtime_event,
     publish_session_turn_item_event, publish_session_turn_item_stream_event, session_turn_item,
     session_turn_stream_update, upsert_context_compaction_completed_notice,
-    upsert_context_compaction_progress_notice, upsert_image_understanding_notice,
-    upsert_session_turn_item_with_task_store,
+    upsert_context_compaction_progress_notice, upsert_session_turn_item_with_task_store,
 };
 use crate::task_execution_registry::TaskExecutionRegistry;
 use crate::task_runner_bridge::TaskOutcome;
@@ -62,7 +63,7 @@ use crate::{
     usage_recording::{
         ContextUsageRuntimeTracker, ContextUsageRuntimeTrackerInput, ModelUsageBinding,
         account_active_goal_usage, current_turn_id, publish_model_usage_record,
-        record_mission_turn, resolved_model_for_usage_binding,
+        record_mission_turn, resolved_model_for_usage_binding, vision_model_usage_binding,
     },
 };
 use magi_bridge_client::{
@@ -856,15 +857,49 @@ fn run_conversation_loop_inner(
     let additional_token_estimate = estimate_chat_messages_tokens(&messages)
         .saturating_add(estimate_chat_messages_tokens(&current_turn_budget_messages))
         .saturating_add(estimate_tool_definition_tokens(tools.as_deref()));
-    let resolved_context_model = resolved_model_for_usage_binding(
+    let selected_context_model = resolved_model_for_usage_binding(
         settings_store.or(live_settings_store),
         usage_binding,
         session_id,
     )
     .unwrap_or_default();
-    let mut effective_context_window = resolve_model_context_window(
+    let request_contains_images = !images.is_empty()
+        || session_store
+            .thread_context_history(thread_id)
+            .iter()
+            .any(|message| !message.images.is_empty());
+    let vision_execution_config = match resolve_vision_execution_config(
+        settings_store.or(live_settings_store).map(Arc::as_ref),
+        &selected_context_model,
+        request_contains_images,
+    ) {
+        Ok(config) => config,
+        Err(error) => {
+            return (TaskOutcome::Failed { error }, context_summary);
+        }
+    };
+    let vision_client = vision_execution_config
+        .as_ref()
+        .and_then(|config| config.to_http_vision_client());
+    let client: &dyn ModelBridgeClient = vision_client
+        .as_ref()
+        .map(|client| client as &dyn ModelBridgeClient)
+        .unwrap_or(client);
+    let vision_usage_binding = vision_execution_config
+        .as_ref()
+        .map(|_| vision_model_usage_binding());
+    let usage_binding = vision_usage_binding.as_ref().unwrap_or(usage_binding);
+    let resolved_context_model = vision_execution_config
+        .as_ref()
+        .and_then(|config| config.require_model().ok())
+        .unwrap_or(&selected_context_model)
+        .to_string();
+    let mut effective_context_window = resolve_model_context_window_with_override(
         live_settings_store.or(settings_store).map(Arc::as_ref),
         &resolved_context_model,
+        vision_execution_config
+            .as_ref()
+            .and_then(|config| config.context_window_tokens()),
     );
     let initial_skill_name = skill_name.clone();
     let turn_visibility = task_turn_visibility(
@@ -883,22 +918,6 @@ fn run_conversation_loop_inner(
         workspace_id,
         turn_visibility: &turn_visibility,
         persist_session_state,
-    };
-    let image_understanding_item_id =
-        format!("turn-item-image-understanding-{}-{}", task_id, thread_id);
-    let image_understanding_writeback = ImageUnderstandingWritebackContext {
-        event_bus,
-        session_store,
-        session_id,
-        workspace_id,
-        thread_id,
-        item_id: &image_understanding_item_id,
-        persist_session_state,
-        task: Some(task),
-        turn_visibility: Some(&turn_visibility),
-    };
-    let image_understanding_observer = |progress| {
-        upsert_image_understanding_notice(image_understanding_writeback, progress);
     };
     let prepare_task_history = |phase: &'static str,
                                 context_window: u64,
@@ -1012,28 +1031,10 @@ fn run_conversation_loop_inner(
         thread_history_snapshot = normalized_history.messages;
     }
     if !thread_history_snapshot.is_empty() {
-        let mut routed_history = thread_history_snapshot
+        let routed_history = thread_history_snapshot
             .iter()
             .map(thread_chat_message_to_chat_message)
             .collect::<Vec<_>>();
-        if let Err(error) = route_messages_for_model(
-            &mut routed_history,
-            settings_store,
-            event_bus,
-            session_store,
-            session_id,
-            workspace_id,
-            &resolved_context_model,
-            &|| !task_lease_is_current(task_store, task_id, lease_id),
-            Some(&image_understanding_observer),
-        ) {
-            return (
-                TaskOutcome::Failed {
-                    error: error.to_string(),
-                },
-                context_summary,
-            );
-        }
         messages.extend(routed_history);
         messages.push(system_prompt_fragment_message(
             PromptFragmentKind::ThreadHistoryBoundary,
@@ -1057,24 +1058,6 @@ fn run_conversation_loop_inner(
             provider_context: Vec::new(),
         };
         messages.push(current_user_message);
-    }
-    if let Err(error) = route_messages_for_model(
-        &mut messages,
-        settings_store,
-        event_bus,
-        session_store,
-        session_id,
-        workspace_id,
-        &resolved_context_model,
-        &|| !task_lease_is_current(task_store, task_id, lease_id),
-        Some(&image_understanding_observer),
-    ) {
-        return (
-            TaskOutcome::Failed {
-                error: error.to_string(),
-            },
-            context_summary,
-        );
     }
     if !resumed_task {
         let current_user_message = messages.last().expect("当前任务必须包含用户消息");
@@ -1370,24 +1353,6 @@ fn run_conversation_loop_inner(
         }
         context_budget_recheck_required = false;
         bound_model_visible_chat_tool_results(&mut messages);
-        if let Err(error) = route_messages_for_model(
-            &mut messages,
-            settings_store,
-            event_bus,
-            session_store,
-            session_id,
-            workspace_id,
-            &resolved_context_model,
-            &|| !task_lease_is_current(task_store, task_id, lease_id),
-            Some(&image_understanding_observer),
-        ) {
-            return (
-                TaskOutcome::Failed {
-                    error: error.to_string(),
-                },
-                context_summary,
-            );
-        }
         let invocation_request = ModelInvocationRequest {
             provider: LOOPBACK_MODEL_PROVIDER.to_string(),
             prompt: prompt.clone(),
@@ -1503,18 +1468,25 @@ fn run_conversation_loop_inner(
                         );
                         if classification.code == "model_context_limit"
                             && !context_limit_recovery_attempted
-                            && let Some(context_limit) =
-                                extract_model_context_limit(&raw_error_message)
                         {
                             context_limit_recovery_attempted = true;
-                            let _ = apply_reported_context_limit(
-                                event_bus,
-                                settings_store,
-                                live_settings_store,
-                                &resolved_context_model,
-                                context_limit,
-                            );
-                            effective_context_window = context_limit;
+                            let reported_context_limit =
+                                extract_model_context_limit(&raw_error_message);
+                            if let Some(context_limit) = reported_context_limit {
+                                let _ = apply_reported_context_limit(
+                                    event_bus,
+                                    settings_store,
+                                    live_settings_store,
+                                    &resolved_context_model,
+                                    context_limit,
+                                );
+                            }
+                            effective_context_window =
+                                reported_context_limit.unwrap_or_else(|| {
+                                    conservative_context_limit_recovery_window(
+                                        effective_context_window,
+                                    )
+                                });
                             match rebuild_task_context(
                                 effective_context_window,
                                 round_tools.as_deref(),
@@ -1526,8 +1498,8 @@ fn run_conversation_loop_inner(
                                     tracing::warn!(
                                         task_id = %task.task_id,
                                         round,
-                                        context_limit,
-                                        "任务模型上下文超限，已安装语义检查点并重建请求"
+                                    context_limit = effective_context_window,
+                                    "任务模型上下文超限，已安装语义检查点并重建请求"
                                     );
                                     continue 'conversation_round;
                                 }
@@ -1804,17 +1776,22 @@ fn run_conversation_loop_inner(
                     );
                     if classification.code == "model_context_limit"
                         && !context_limit_recovery_attempted
-                        && let Some(context_limit) = extract_model_context_limit(&raw_error_message)
                     {
                         context_limit_recovery_attempted = true;
-                        let _ = apply_reported_context_limit(
-                            event_bus,
-                            settings_store,
-                            live_settings_store,
-                            &resolved_context_model,
-                            context_limit,
-                        );
-                        effective_context_window = context_limit;
+                        let reported_context_limit =
+                            extract_model_context_limit(&raw_error_message);
+                        if let Some(context_limit) = reported_context_limit {
+                            let _ = apply_reported_context_limit(
+                                event_bus,
+                                settings_store,
+                                live_settings_store,
+                                &resolved_context_model,
+                                context_limit,
+                            );
+                        }
+                        effective_context_window = reported_context_limit.unwrap_or_else(|| {
+                            conservative_context_limit_recovery_window(effective_context_window)
+                        });
                         match rebuild_task_context(
                             effective_context_window,
                             round_tools.as_deref(),
@@ -1826,8 +1803,8 @@ fn run_conversation_loop_inner(
                                 tracing::warn!(
                                     task_id = %task.task_id,
                                     round,
-                                    context_limit,
-                                    "非流式任务模型上下文超限，已安装语义检查点并重建请求"
+                                context_limit = effective_context_window,
+                                "非流式任务模型上下文超限，已安装语义检查点并重建请求"
                                 );
                                 continue 'conversation_round;
                             }
@@ -3729,6 +3706,7 @@ mod tests {
         compaction_calls: AtomicUsize,
         requests: Mutex<Vec<ModelInvocationRequest>>,
         plan_store: magi_plan::PlanStore,
+        context_limit_error: &'static str,
     }
 
     struct FailingTaskModelBridgeClient;
@@ -3828,9 +3806,7 @@ mod tests {
                     Err(BridgeClientError::CallFailed {
                         layer: BridgeErrorLayer::RemoteBusiness,
                         code: Some(400),
-                        message:
-                            "maximum context length is 16000 tokens, however you requested 30000"
-                                .to_string(),
+                        message: self.context_limit_error.to_string(),
                     })
                 }
                 _ => {
@@ -5368,7 +5344,11 @@ mod tests {
         assert!(tools_enabled.iter().all(|enabled| *enabled));
     }
 
-    fn assert_task_loop_recovers_context_limit_after_tool(is_sidechain: bool) {
+    fn assert_task_loop_recovers_context_limit_after_tool(
+        is_sidechain: bool,
+        context_limit_error: &'static str,
+        expected_recovery_window: u64,
+    ) {
         let session_store = SessionStore::new();
         let event_bus = InMemoryEventBus::new(128);
         let session_id = SessionId::new("session-task-context-limit-after-tool");
@@ -5459,6 +5439,7 @@ mod tests {
             compaction_calls: AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
             plan_store: plan_store.clone(),
+            context_limit_error,
         };
         let usage_binding = crate::usage_recording::session_turn_model_usage_binding(true);
         let live_settings = Arc::new(SettingsStore::new());
@@ -5524,7 +5505,12 @@ mod tests {
 
         assert!(
             matches!(outcome, TaskOutcome::Completed { .. }),
-            "unexpected task outcome: {outcome:?}"
+            "unexpected task outcome: {outcome:?}; main_calls={}; compaction_calls={}; context_window={:?}; context_history_len={}; checkpoint={:?}",
+            client.main_calls.load(Ordering::SeqCst),
+            client.compaction_calls.load(Ordering::SeqCst),
+            session_store.thread_context_window_tokens(&thread_id),
+            session_store.thread_context_history(&thread_id).len(),
+            session_store.thread_context_checkpoint(&thread_id),
         );
         assert_eq!(client.main_calls.load(Ordering::SeqCst), 3);
         assert_eq!(
@@ -5572,7 +5558,7 @@ mod tests {
         assert_eq!(tool_result_count, 1, "恢复不得重复执行已经完成的工具");
         assert_eq!(
             session_store.thread_context_window_tokens(&thread_id),
-            Some(16_000),
+            Some(expected_recovery_window),
             "任务 thread 必须持久化实际采用的上下文窗口"
         );
         assert!(
@@ -5584,12 +5570,29 @@ mod tests {
 
     #[test]
     fn task_loop_compacts_and_continues_when_context_limit_occurs_after_tool() {
-        assert_task_loop_recovers_context_limit_after_tool(false);
+        assert_task_loop_recovers_context_limit_after_tool(
+            false,
+            "maximum context length is 16000 tokens, however you requested 30000",
+            16_000,
+        );
     }
 
     #[test]
     fn subagent_loop_compacts_and_continues_when_context_limit_occurs_after_tool() {
-        assert_task_loop_recovers_context_limit_after_tool(true);
+        assert_task_loop_recovers_context_limit_after_tool(
+            true,
+            "maximum context length is 16000 tokens, however you requested 30000",
+            16_000,
+        );
+    }
+
+    #[test]
+    fn task_loop_silently_recovers_when_context_limit_error_has_no_numeric_window() {
+        assert_task_loop_recovers_context_limit_after_tool(
+            false,
+            "context length exceeded for this request",
+            8_000,
+        );
     }
 
     #[test]

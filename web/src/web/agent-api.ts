@@ -282,7 +282,6 @@ function normalizeSettingsBootstrapPayload(
     effectiveOrchestratorConfig: normalizeSettingsSectionConfig(payload.effectiveOrchestratorConfig),
     auxiliaryConfig: normalizeSettingsSectionConfig(payload.auxiliaryConfig),
     visionConfig: normalizeSettingsSectionConfig(payload.visionConfig),
-    modelCapabilities: normalizeSettingsSectionConfig(payload.modelCapabilities),
     imageGenerationConfig: normalizeSettingsSectionConfig(payload.imageGenerationConfig),
     modelContextWindows: Object.fromEntries(
       Object.entries(normalizeSettingsSectionConfig(payload.modelContextWindows))
@@ -2419,17 +2418,6 @@ export async function saveAgentModelContextWindow(
     '/api/settings/model-context-window/save',
     { model, contextWindowTokens },
     'save model context window',
-  );
-}
-
-export async function saveAgentModelCapability(
-  model: string,
-  supportsImages: boolean,
-): Promise<Record<string, unknown>> {
-  return await postWorkspaceBoundJson<Record<string, unknown>>(
-    '/api/settings/model-capability/save',
-    { model, supportsImages },
-    'save model capability',
   );
 }
 

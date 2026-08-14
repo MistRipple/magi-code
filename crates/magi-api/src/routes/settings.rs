@@ -8,7 +8,9 @@ use magi_bridge_client::{
     ImageGenerationRequest as BridgeImageGenerationRequest, ModelBridgeClient,
     ModelInvocationRequest,
 };
-use magi_conversation_runtime::model_context_window::set_model_context_window;
+use magi_conversation_runtime::model_context_window::{
+    MODEL_CONTEXT_WINDOWS_SECTION, model_context_windows_with_update, set_model_context_window,
+};
 use magi_core::{AccessProfile, EventId, SessionId, UtcMillis};
 use magi_event_bus::{EventContext, EventEnvelope};
 use magi_settings_store::ORCHESTRATOR_SESSION_DEFAULTS_SECTION;
@@ -27,9 +29,10 @@ use super::session_scope;
 use crate::{
     errors::{ApiError, settings_persistence_error},
     model_config::{
-        DEFAULT_ORCHESTRATOR_REASONING_EFFORT, NormalizedModelConfig,
-        merge_orchestrator_session_override, reject_deprecated_model_config_fields,
-        resolve_orchestrator_model_config, strip_orchestrator_session_owned_fields,
+        DEFAULT_ORCHESTRATOR_REASONING_EFFORT, DEFAULT_VISION_CONTEXT_WINDOW,
+        NormalizedModelConfig, VISION_MODEL_SECTION, merge_orchestrator_session_override,
+        reject_deprecated_model_config_fields, resolve_orchestrator_model_config,
+        strip_orchestrator_session_owned_fields, validate_vision_model_settings,
     },
     scope_binding::without_scope_binding_fields,
     state::ApiState,
@@ -541,10 +544,6 @@ pub fn routes() -> Router<ApiState> {
         .route("/settings/auxiliary/test", post(test_auxiliary_connection))
         .route("/settings/vision/save", post(save_vision_config))
         .route("/settings/vision/test", post(test_vision_connection))
-        .route(
-            "/settings/model-capability/save",
-            post(save_model_capability),
-        )
         .route(
             "/settings/image-generation/save",
             post(save_image_generation_config),
@@ -1266,45 +1265,6 @@ async fn test_orchestrator_connection(
     })))
 }
 
-async fn save_model_capability(
-    State(state): State<ApiState>,
-    Json(request): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let model = request
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::InvalidInput("模型名称不能为空".to_string()))?;
-    let supports_images = request
-        .get("supportsImages")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| ApiError::InvalidInput("supportsImages 必须是布尔值".to_string()))?;
-    state
-        .settings_store
-        .update_section("modelCapabilities", |stored| {
-            if !stored.is_object() {
-                *stored = json!({});
-            }
-            let fields = stored
-                .as_object_mut()
-                .expect("modelCapabilities 必须是对象");
-            if supports_images {
-                fields.insert(model.to_string(), Value::String("multimodal".to_string()));
-            } else {
-                fields.remove(model);
-            }
-        })
-        .map_err(settings_persistence_error)?;
-    let entries = state.settings_store.get_section("modelCapabilities");
-    Ok(Json(json!({
-        "saved": true,
-        "model": model,
-        "supportsImages": supports_images,
-        "modelCapabilities": entries,
-    })))
-}
-
 async fn save_auxiliary_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
@@ -1328,12 +1288,43 @@ async fn save_vision_config(
     State(state): State<ApiState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let config = model_settings_section_request(&request)?;
+    let mut config = model_settings_section_request(&request)?;
+    let config_object = config
+        .as_object_mut()
+        .ok_or_else(|| ApiError::InvalidInput("识图模型配置必须是对象".to_string()))?;
+    config_object
+        .entry("contextWindowTokens".to_string())
+        .or_insert_with(|| Value::from(DEFAULT_VISION_CONTEXT_WINDOW));
+    validate_vision_model_settings(&config).map_err(ApiError::InvalidInput)?;
+    let model = config
+        .get("model")
+        .and_then(Value::as_str)
+        .expect("识图模型配置校验后必须包含 model");
+    let context_window_tokens = config
+        .get("contextWindowTokens")
+        .and_then(Value::as_u64)
+        .expect("识图模型配置校验后必须包含 contextWindowTokens");
+    let context_windows =
+        model_context_windows_with_update(&state.settings_store, model, context_window_tokens)
+            .map_err(ApiError::InvalidInput)?;
     state
         .settings_store
-        .set_section("vision", config.clone())
+        .apply_section_changes(
+            [
+                (VISION_MODEL_SECTION.to_string(), config.clone()),
+                (
+                    MODEL_CONTEXT_WINDOWS_SECTION.to_string(),
+                    Value::Object(context_windows.clone()),
+                ),
+            ],
+            Vec::<String>::new(),
+        )
         .map_err(settings_persistence_error)?;
-    Ok(Json(serde_json::json!({ "saved": true, "config": config })))
+    Ok(Json(serde_json::json!({
+        "saved": true,
+        "config": config,
+        "modelContextWindows": context_windows,
+    })))
 }
 
 async fn test_vision_connection(
@@ -3747,35 +3738,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_capability_save_returns_authoritative_persisted_map() {
+    async fn vision_config_save_persists_context_window_and_text_model_rules_atomically() {
         let state = test_state();
-        let enabled = save_model_capability(
+        let saved = save_vision_config(
             State(state.clone()),
-            Json(json!({"model": "vision-capable-model", "supportsImages": true})),
+            Json(json!({
+                "baseUrl": "https://vision.example.com/v1",
+                "apiKey": "sk-vision",
+                "model": "vision-capable-model",
+                "urlMode": "standard",
+                "apiProtocol": "openai_chat",
+                "contextWindowTokens": 256000,
+                "textModelRules": [
+                    {"matchMode": "exact", "pattern": "company-text-model"},
+                    {"matchMode": "regex", "pattern": "^legacy-[0-9]+$"}
+                ]
+            })),
         )
         .await
-        .expect("model capability should save")
+        .expect("vision config should save")
         .0;
         assert_eq!(
-            enabled["modelCapabilities"]["vision-capable-model"],
-            json!("multimodal")
+            saved["config"],
+            state.settings_store.get_section(VISION_MODEL_SECTION)
         );
         assert_eq!(
-            enabled["modelCapabilities"],
-            state.settings_store.get_section("modelCapabilities")
+            saved["modelContextWindows"]["vision-capable-model"],
+            json!(256000)
         );
 
-        let disabled = save_model_capability(
+        let result = save_vision_config(
             State(state.clone()),
-            Json(json!({"model": "vision-capable-model", "supportsImages": false})),
+            Json(json!({
+                "baseUrl": "https://new-vision.example.com/v1",
+                "apiKey": "new-key",
+                "model": "new-vision-model",
+                "urlMode": "standard",
+                "apiProtocol": "openai_chat",
+                "contextWindowTokens": 256000,
+                "textModelRules": [{"matchMode": "regex", "pattern": "("}]
+            })),
         )
-        .await
-        .expect("model capability should clear")
-        .0;
-        assert_eq!(disabled["modelCapabilities"], json!({}));
+        .await;
+
+        assert!(matches!(result, Err(ApiError::InvalidInput(_))));
         assert_eq!(
-            disabled["modelCapabilities"],
-            state.settings_store.get_section("modelCapabilities")
+            state.settings_store.get_section(VISION_MODEL_SECTION),
+            original_vision
+        );
+        assert_eq!(
+            state
+                .settings_store
+                .get_section(MODEL_CONTEXT_WINDOWS_SECTION),
+            original_windows
         );
     }
 
@@ -3919,6 +3934,43 @@ mod tests {
 
     #[test]
     fn model_reselection_keeps_only_the_user_selected_model() {
+        assert_eq!(
+            state
+                .settings_store
+                .get_section(MODEL_CONTEXT_WINDOWS_SECTION)["vision-capable-model"],
+            json!(256000)
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_config_save_rejects_invalid_rules_without_partial_write() {
+        let state = test_state();
+        state
+            .settings_store
+            .set_section(
+                VISION_MODEL_SECTION,
+                json!({
+                    "baseUrl": "https://old-vision.example.com/v1",
+                    "apiKey": "old-key",
+                    "model": "old-vision-model",
+                    "urlMode": "standard",
+                    "apiProtocol": "openai_chat",
+                    "contextWindowTokens": 128000,
+                    "textModelRules": []
+                }),
+            )
+            .unwrap();
+        state
+            .settings_store
+            .set_section(
+                MODEL_CONTEXT_WINDOWS_SECTION,
+                json!({"old-vision-model": 128000}),
+            )
+            .unwrap();
+        let original_vision = state.settings_store.get_section(VISION_MODEL_SECTION);
+        let original_windows = state
+            .settings_store
+            .get_section(MODEL_CONTEXT_WINDOWS_SECTION);
         let state = test_state();
         let session_id = SessionId::new("session-model-reselection");
         state
