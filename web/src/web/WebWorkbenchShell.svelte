@@ -2864,7 +2864,9 @@
     z-index: 3;
     min-height: 28px;
     padding: 2px 0;
-    background: var(--magi-surface-sidebar);
+    /* 侧栏自身已经承担皮肤背景；这里不能再次铺半透明背景，否则在
+       壁纸/透明主题下会产生明显的矩形叠色。 */
+    background: transparent;
   }
 
   .recent-session-new-btn {
