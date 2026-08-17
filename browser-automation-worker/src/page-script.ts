@@ -1,9 +1,10 @@
 export const MAGI_AUTOMATION_WORLD = "magi-browser-automation";
 
 export const INSTALL_PAGE_RUNTIME = String.raw`
-(() => {
-  if (globalThis.__magiBrowserAutomation) return;
+((runtimeEpoch) => {
+  if (globalThis.__magiBrowserAutomation?.runtime_epoch === runtimeEpoch) return;
   const state = {
+    runtimeEpoch,
     snapshotRevision: 0,
     nextRef: 1,
     refs: new Map(),
@@ -145,8 +146,12 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     nameFor(element) || '',
   ].join('|').slice(0, 512);
   globalThis.__magiBrowserAutomation = {
-    snapshot(maxNodes, maxTextBytes) {
-      state.snapshotRevision += 1;
+    runtime_epoch: runtimeEpoch,
+    snapshot(maxNodes, maxTextBytes, revision) {
+      if (!Number.isSafeInteger(revision) || revision <= 0) {
+        throw new Error('browser_snapshot_revision_invalid');
+      }
+      state.snapshotRevision = revision;
       state.nextRef = 1;
       state.refs = new Map();
       const budget = { nodes: 0, textBytes: 0, maxNodes, maxTextBytes };
@@ -234,5 +239,5 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
       return (0, eval)(expression);
     },
   };
-})()
+})
 `;

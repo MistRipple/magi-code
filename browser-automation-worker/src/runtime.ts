@@ -23,15 +23,24 @@ interface PageRuntimeState {
   heapSnapshotChunks: string[];
   traceActive: boolean;
   traceEvents: Array<Record<string, unknown>>;
+  cdpDomainsReady: boolean;
+  cdpDomainsPromise: Promise<void> | null;
 }
 
 export class BrowserAutomationRuntime {
   readonly #cdp: CdpClient;
   readonly #pages = new Map<string, PageRuntimeState>();
 
-  constructor(cdp: CdpClient) {
+  readonly #workerEpoch: string;
+
+  constructor(cdp: CdpClient, workerEpoch: string = randomUUID()) {
     this.#cdp = cdp;
+    this.#workerEpoch = workerEpoch;
     cdp.onEvent((binding, method, params) => this.onCdpEvent(binding, method, params));
+  }
+
+  rebind(bindings: BrowserSurfaceBinding[]): void {
+    for (const binding of bindings) this.page(binding);
   }
 
   async execute(
@@ -40,6 +49,7 @@ export class BrowserAutomationRuntime {
     command: BrowserHostCommand,
   ): Promise<WorkerCommandResponse> {
     try {
+      if (command.type !== "ping") await this.ensureCdpDomains(binding);
       const executed = await this.executeCommand(binding, command);
       return {
         type: "worker_result",
@@ -66,7 +76,12 @@ export class BrowserAutomationRuntime {
         return {
           result: {
             type: "snapshot",
-            payload: await this.snapshot(binding, command.payload.limits),
+            payload: await this.snapshot(
+              binding,
+              command.payload.limits,
+              command.payload.navigation_revision,
+              command.payload.snapshot_revision,
+            ),
           },
         };
       case "click":
@@ -116,6 +131,7 @@ export class BrowserAutomationRuntime {
       current
       && current.binding.surface_revision === binding.surface_revision
       && current.binding.target_id === binding.target_id
+      && current.binding.navigation_revision === binding.navigation_revision
     ) {
       return current;
     }
@@ -131,9 +147,28 @@ export class BrowserAutomationRuntime {
       heapSnapshotChunks: current?.heapSnapshotChunks ?? [],
       traceActive: current?.traceActive ?? false,
       traceEvents: current?.traceEvents ?? [],
+      cdpDomainsReady: false,
+      cdpDomainsPromise: null,
     };
     this.#pages.set(binding.surface_id, next);
     return next;
+  }
+
+  private async ensureCdpDomains(binding: BrowserSurfaceBinding): Promise<void> {
+    const page = this.page(binding);
+    if (page.cdpDomainsReady) return;
+    if (!page.cdpDomainsPromise) {
+      page.cdpDomainsPromise = Promise.all([
+        this.#cdp.send(binding, "Page.enable"),
+        this.#cdp.send(binding, "Runtime.enable"),
+        this.#cdp.send(binding, "Network.enable"),
+      ]).then(() => {
+        page.cdpDomainsReady = true;
+      }).finally(() => {
+        page.cdpDomainsPromise = null;
+      });
+    }
+    await page.cdpDomainsPromise;
   }
 
   private async context(binding: BrowserSurfaceBinding): Promise<number> {
@@ -152,7 +187,11 @@ export class BrowserAutomationRuntime {
       },
     );
     page.executionContextId = world.executionContextId;
-    await this.evaluate(binding, INSTALL_PAGE_RUNTIME, true);
+    await this.evaluate(
+      binding,
+      `${INSTALL_PAGE_RUNTIME}(${JSON.stringify(this.#workerEpoch)})`,
+      true,
+    );
     return world.executionContextId;
   }
 
@@ -186,13 +225,31 @@ export class BrowserAutomationRuntime {
   private async snapshot(
     binding: BrowserSurfaceBinding,
     limits: { max_nodes: number; max_text_bytes: number },
+    navigationRevision: number,
+    snapshotRevision: number,
   ): Promise<BrowserSnapshot> {
-    const value = await this.evaluate<Omit<BrowserSnapshot, "tab_id" | "continuation_refs">>(
+    if (navigationRevision !== binding.navigation_revision) {
+      throw protocolFailure(
+        "browser_navigation_revision_mismatch",
+        `expected ${binding.navigation_revision}, received ${navigationRevision}`,
+      );
+    }
+    if (!Number.isSafeInteger(snapshotRevision) || snapshotRevision < 0) {
+      throw protocolFailure("browser_snapshot_revision_invalid", "snapshot_revision is invalid");
+    }
+    const value = await this.evaluate<Omit<BrowserSnapshot, "tab_id" | "navigation_revision" | "continuation_refs">>(
       binding,
-      `globalThis.__magiBrowserAutomation.snapshot(${safeInteger(limits.max_nodes, 400)}, ${safeInteger(limits.max_text_bytes, 32768)})`,
+      `globalThis.__magiBrowserAutomation.snapshot(${safeInteger(limits.max_nodes, 400)}, ${safeInteger(limits.max_text_bytes, 32768)}, ${snapshotRevision})`,
     );
+    if (value.snapshot_revision !== snapshotRevision) {
+      throw protocolFailure(
+        "browser_snapshot_revision_mismatch",
+        `expected ${snapshotRevision}, received ${value.snapshot_revision}`,
+      );
+    }
     return {
       tab_id: binding.tab_id,
+      navigation_revision: binding.navigation_revision,
       ...value,
       continuation_refs: [],
     };
@@ -409,7 +466,10 @@ export class BrowserAutomationRuntime {
       case "pwa":
         return this.pwaAudit(binding);
       case "third_party":
-        return this.thirdPartySummary(binding);
+        throw protocolFailure(
+          "capability_unavailable",
+          "third-party developer tools are not registered until a real page tool protocol is available",
+        );
       case "heap":
         return this.heap(binding, args);
       case "scripts":
@@ -417,11 +477,14 @@ export class BrowserAutomationRuntime {
       case "overlay":
         return this.overlay(binding, args);
       case "lighthouse":
-        return this.lighthouseCompatibleAudit(binding);
+        throw protocolFailure(
+          "capability_unavailable",
+          "Lighthouse is not registered until the real Lighthouse engine is bundled",
+        );
       case "upload_file":
         throw protocolFailure(
-          "browser_file_authorization_required",
-          "file upload requires a Desktop file authorization token",
+          "capability_unavailable",
+          "file upload is not registered until the Desktop file authorization pipeline is available",
         );
       default:
         throw protocolFailure("browser_devtools_operation_unsupported", operation);
@@ -429,11 +492,19 @@ export class BrowserAutomationRuntime {
   }
 
   private async fillForm(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
-    const fields = Array.isArray(args.fields) ? args.fields : [];
+    if (!Array.isArray(args.fields) || args.fields.length === 0) {
+      throw protocolFailure("browser_fill_form_invalid", "fields must be a non-empty array");
+    }
+    const fields = args.fields;
     let filled = 0;
     for (const raw of fields) {
-      if (!raw || typeof raw !== "object") continue;
+      if (!raw || typeof raw !== "object") {
+        throw protocolFailure("browser_fill_form_invalid", "each fields item must be an object");
+      }
       const field = raw as Record<string, unknown>;
+      if (!Object.prototype.hasOwnProperty.call(field, "value")) {
+        throw protocolFailure("browser_fill_form_invalid", "each fields item must include value");
+      }
       await this.typeText(
         binding,
         snapshotTarget(field),
@@ -695,36 +766,6 @@ export class BrowserAutomationRuntime {
       highlightConfig: { showInfo: true, showStyles: false, showRulers: false, showExtensionLines: false },
     });
     return { highlighted: true, selector };
-  }
-
-  private async thirdPartySummary(binding: BrowserSurfaceBinding): Promise<unknown> {
-    return this.evaluate(binding, `(() => {
-      const origin = location.origin;
-      const hosts = new Map();
-      for (const entry of performance.getEntriesByType('resource')) {
-        try {
-          const url = new URL(entry.name);
-          if (url.origin === origin) continue;
-          hosts.set(url.host, (hosts.get(url.host) || 0) + 1);
-        } catch {}
-      }
-      return { origins: [...hosts.entries()].map(([host, requests]) => ({ host, requests })) };
-    })()`);
-  }
-
-  private async lighthouseCompatibleAudit(binding: BrowserSurfaceBinding): Promise<unknown> {
-    const [metrics, pwa, accessibility] = await Promise.all([
-      this.devtools(binding, "performance", {}),
-      this.pwaAudit(binding),
-      this.#cdp.send(binding, "Accessibility.getFullAXTree"),
-    ]);
-    return {
-      auditEngine: "magi-cdp",
-      target: binding.target_id,
-      performance: metrics,
-      pwa,
-      accessibility,
-    };
   }
 
   private onCdpEvent(

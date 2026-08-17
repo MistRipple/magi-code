@@ -1,4 +1,5 @@
 import { Arch, Platform, build } from "electron-builder";
+import { join } from "node:path";
 import { buildDesktopRelease } from "./build.mjs";
 import { desktopRoot } from "./build-support.mjs";
 
@@ -20,7 +21,13 @@ const artifacts = await build({
   publish: "never",
   config: {
     extends: null,
-    extraMetadata: { version: manifest.productVersion },
+    // electron-builder 按 process.cwd() 解析 hook；使用绝对路径保证根目录脚本和 workspace 入口一致。
+    afterPack: join(desktopRoot, "scripts", "after-pack.mjs"),
+    extraMetadata: {
+      version: manifest.productVersion,
+      // 目录包用于本地验收，不能误启用 electron-updater。
+      magiDistribution: directoryOnly ? "directory" : "release",
+    },
     ...(requireCodeSigning ? { forceCodeSigning: true } : {}),
   },
 });

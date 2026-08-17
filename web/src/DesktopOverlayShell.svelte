@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import Icon from './components/Icon.svelte';
   import type { IconName } from './lib/icons';
 
@@ -7,6 +7,7 @@
   let fieldValues: Record<string, string> = $state({});
   let dragStart = $state<{ x: number; y: number } | null>(null);
   let dragCurrent = $state<{ x: number; y: number } | null>(null);
+  let actionError = $state('');
   const desktop = window.magiDesktop;
 
   function submit(interaction: 'select' | 'input', id: string, value: string | null = null): void {
@@ -19,6 +20,10 @@
       interaction,
       id,
       value,
+    }).then(() => {
+      actionError = '';
+    }).catch((error) => {
+      actionError = error instanceof Error ? error.message : String(error);
     });
   }
 
@@ -33,16 +38,36 @@
       fieldValues = Object.fromEntries(next.fields.map((field) => [field.id, field.value]));
       dragStart = null;
       dragCurrent = null;
+      actionError = '';
+      // Main 进程先把输入焦点交给 Overlay WebContents；Renderer 等 DOM
+      // 完成更新后再聚焦根节点，键盘和辅助功能操作才会落到同一菜单。
+      void tick().then(() => {
+        window.focus();
+        document.body.tabIndex = -1;
+        document.body.focus({ preventScroll: true });
+        document.querySelector<HTMLElement>('[data-desktop-overlay-root]')?.focus({ preventScroll: true });
+      });
+    });
+    const stopClosed = desktop.onOverlayClosed(() => {
+      overlayState = null;
+      fieldValues = {};
+      dragStart = null;
+      dragCurrent = null;
+      actionError = '';
     });
     void desktop.readyOverlay().catch((error) => {
       console.warn('[DesktopOverlayShell] 覆盖层就绪握手失败:', error);
     });
     const escape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') close();
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      close();
     };
     window.addEventListener('keydown', escape);
     return () => {
       stop();
+      stopClosed();
       window.removeEventListener('keydown', escape);
     };
   });
@@ -106,6 +131,8 @@
 {#if overlayState?.kind === 'annotation' && overlayState.phase === 'select'}
   <div
     class="annotation-capture"
+    data-desktop-overlay-root="true"
+    tabindex="-1"
     role="application"
     aria-label={overlayState.title}
     onpointerdown={handleAnnotationPointerDown}
@@ -113,9 +140,10 @@
     onpointerup={handleAnnotationPointerUp}
   >
     <div class="annotation-selection" style={selectionStyle()}></div>
+    {#if actionError}<div class="overlay-error" role="alert">{actionError}</div>{/if}
   </div>
 {:else if overlayState?.kind === 'annotation' && overlayState.phase === 'comment'}
-  <div class="annotation-editor" aria-label={overlayState.title}>
+  <div class="annotation-editor" data-desktop-overlay-root="true" tabindex="-1" aria-label={overlayState.title}>
     <textarea
       value={fieldValues.comment ?? ''}
       placeholder={overlayState.title}
@@ -129,9 +157,10 @@
       <button type="button" onclick={() => submit('select', 'cancel')}>取消</button>
       <button type="button" class="primary" disabled={!fieldValues.comment?.trim()} onclick={() => submit('select', 'save', fieldValues.comment ?? '')}>保存</button>
     </div>
+    {#if actionError}<div class="overlay-error" role="alert">{actionError}</div>{/if}
   </div>
 {:else if overlayState}
-  <div class="overlay-menu" role="menu" aria-label={overlayState.title}>
+  <div class="overlay-menu" data-desktop-overlay-root="true" tabindex="-1" role="menu" aria-label={overlayState.title}>
     {#each overlayState.items as item (item.id)}
       <button
         type="button"
@@ -165,18 +194,20 @@
         {/each}
       </div>
     {/if}
+    {#if actionError}<div class="overlay-error" role="alert">{actionError}</div>{/if}
   </div>
 {/if}
 
 <style>
   :global(html), :global(body), :global(#app) { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent; }
+  :global(body) { outline: none; }
   .annotation-capture { position: relative; width: 100%; height: 100%; cursor: crosshair; background: transparent; }
   .annotation-selection { position: absolute; border: 1px solid var(--primary); background: color-mix(in srgb, var(--primary) 18%, transparent); pointer-events: none; }
   .annotation-editor { position: absolute; right: 12px; bottom: 12px; width: min(360px, calc(100% - 24px)); padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); }
   .annotation-editor textarea { box-sizing: border-box; width: 100%; min-height: 74px; resize: vertical; padding: 7px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; font-size: var(--text-xs); }
   .annotation-editor-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px; }
   .annotation-editor-actions button { min-width: 58px; height: 28px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); cursor: pointer; }
-  .annotation-editor-actions button.primary { border-color: var(--primary); background: var(--primary); color: #fff; }
+  .annotation-editor-actions button.primary { border-color: var(--primary); background: var(--primary); color: var(--primary-foreground); }
   .annotation-editor-actions button:disabled { opacity: .5; cursor: default; }
   .overlay-menu { box-sizing: border-box; width: 100%; height: 100%; overflow: auto; padding: 5px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); color: var(--foreground); }
   .overlay-item { box-sizing: border-box; display: flex; align-items: center; gap: 8px; width: 100%; min-height: 32px; padding: 0 8px; border: 0; border-radius: 4px; background: transparent; color: inherit; font: inherit; font-size: var(--text-xs); cursor: pointer; text-align: left; }
@@ -186,4 +217,6 @@
   .overlay-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; padding: 5px 3px 2px; border-top: 1px solid var(--border); margin-top: 4px; }
   .overlay-fields label { display: grid; gap: 3px; min-width: 0; color: var(--foreground-muted); font-size: 10px; }
   .overlay-fields input { box-sizing: border-box; min-width: 0; width: 100%; height: 27px; padding: 0 5px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-1); color: var(--foreground); font: inherit; }
+  .overlay-error { margin: 5px; padding: 6px 8px; border: 1px solid var(--error); border-radius: 4px; background: var(--error-muted); color: var(--error); font-size: var(--text-xs); overflow-wrap: anywhere; }
+  .annotation-capture > .overlay-error { position: absolute; right: 8px; bottom: 8px; max-width: min(360px, calc(100% - 16px)); }
 </style>

@@ -6,6 +6,8 @@ use magi_core::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::BrowserSurfaceBinding;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserProfileKind {
@@ -170,7 +172,8 @@ pub struct BrowserTab {
     pub title: String,
     pub display_label: Option<String>,
     pub navigation_revision: u64,
-    /// 页面快照版本只存在于当前 daemon 进程，不进入 durable state。
+    /// 页面快照版本由 Authority 分配并持久化，防止 daemon/Worker 重启后旧 element_ref
+    /// 与新快照复用同一个 revision。
     pub snapshot_revision: u64,
     pub annotation_sequence: u64,
     pub created_at: UtcMillis,
@@ -216,8 +219,15 @@ pub enum BrowserLeaseEndReason {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BrowserControlLease {
     pub lease_id: BrowserLeaseId,
+    pub desktop_epoch: String,
+    pub window_id: String,
+    pub surface_revision: u64,
     pub tab_id: BrowserTabId,
     pub surface_id: String,
+    pub web_contents_id: u32,
+    pub target_id: String,
+    pub browser_context_id: String,
+    pub navigation_revision: u64,
     pub owner: ExecutionOwnership,
     pub turn_id: String,
     pub goal_binding: Option<GoalControlBinding>,
@@ -227,6 +237,22 @@ pub struct BrowserControlLease {
     pub acquired_at: UtcMillis,
     pub expires_at: UtcMillis,
     pub ended_at: Option<UtcMillis>,
+}
+
+impl BrowserControlLease {
+    pub fn surface_binding(&self) -> BrowserSurfaceBinding {
+        BrowserSurfaceBinding {
+            desktop_epoch: self.desktop_epoch.clone(),
+            window_id: self.window_id.clone(),
+            surface_id: self.surface_id.clone(),
+            surface_revision: self.surface_revision,
+            tab_id: self.tab_id.clone(),
+            web_contents_id: self.web_contents_id,
+            target_id: self.target_id.clone(),
+            browser_context_id: self.browser_context_id.clone(),
+            navigation_revision: self.navigation_revision,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

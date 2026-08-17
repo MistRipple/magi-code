@@ -3831,6 +3831,9 @@ async fn close_session(
             .await;
     }
     state
+        .close_browser_session_for_magi_session(&session_id)
+        .await?;
+    state
         .terminal_sessions
         .close_for_session(session_id.as_str());
     state.release_session_git_execution_lease(&session_id);

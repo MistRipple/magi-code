@@ -1732,6 +1732,22 @@ impl DaemonRuntime {
         // 把 SnapshotManager 桥接到 session-store 生命周期事件。生产路径必装；
         // 测试可用 ApiState::new 直接构造而不调用此函数，惰性 fallback 仍兜底。
         state.install_snapshot_lifecycle_observer();
+        let reconciled_browser_sessions = state
+            .reconcile_browser_sessions_with_session_store()
+            .map_err(|error| {
+                DaemonError::internal(format!("清理孤儿 Browser Session 失败: {error:?}"))
+            })?;
+        if reconciled_browser_sessions > 0 {
+            state
+                .persist_browser_durable_state_for_api()
+                .map_err(|error| {
+                    DaemonError::internal(format!("持久化 Browser Session 清理结果失败: {error:?}"))
+                })?;
+            tracing::info!(
+                count = reconciled_browser_sessions,
+                "已清理不再属于现有 Magi 会话的 Browser Session"
+            );
+        }
         magi_api::task_turn_finalize::schedule_restored_session_turn_queues(&state);
         super::browser_host::start_controller(&state);
 

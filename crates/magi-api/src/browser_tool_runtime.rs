@@ -10,7 +10,7 @@ use std::{
 
 use magi_browser_authority::{
     AcquireBrowserLease, BrowserCapabilitySnapshot, BrowserDeviceType, BrowserHostClient,
-    BrowserHostCommand, BrowserHostCommandError, BrowserHostCommandOutcome,
+    BrowserHostClientError, BrowserHostCommand, BrowserHostCommandError, BrowserHostCommandOutcome,
     BrowserHostCommandResult, BrowserHostControl, BrowserHostControlUpdate, BrowserHostSnapshot,
     BrowserLeaseEndReason, BrowserNavigation, BrowserSnapshotNode, BrowserSnapshotTarget,
     BrowserToolAccess, BrowserToolKind, BrowserViewport, BrowserViewportMode, CreateBrowserSession,
@@ -32,6 +32,11 @@ static BROWSER_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static BROWSER_TAB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static BROWSER_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static BROWSER_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const UNSUPPORTED_BROWSER_TOOLS: &[&str] = &[
+    "browser_upload_file",
+    "browser_lighthouse",
+    "browser_third_party",
+];
 
 #[derive(Clone)]
 struct BrowserExecutionIdentity {
@@ -160,6 +165,12 @@ impl BrowserToolRuntimeDependencies {
                 "浏览器工具参数必须是 JSON 对象",
             );
         };
+        if UNSUPPORTED_BROWSER_TOOLS.contains(&tool_name) {
+            return capability_unavailable(
+                tool_name,
+                "该浏览器能力尚未接入可验证的 Desktop Host 执行路径",
+            );
+        }
         let Some(kind) = BrowserToolKind::ALL
             .into_iter()
             .find(|kind| kind.name() == tool_name)
@@ -177,11 +188,7 @@ impl BrowserToolRuntimeDependencies {
             );
         };
         if let Err(error) = capability.allows_execution(catalog_revision, kind, requested_access) {
-            return failure(
-                tool_name,
-                "browser_capability_unavailable",
-                &error.to_string(),
-            );
+            return capability_unavailable(tool_name, &error.to_string());
         }
         let client = self
             .host_client
@@ -189,11 +196,7 @@ impl BrowserToolRuntimeDependencies {
             .expect("browser Host client lock poisoned")
             .clone();
         let Some(client) = client else {
-            return failure(
-                tool_name,
-                "browser_host_unavailable",
-                "浏览器 Host 尚未就绪",
-            );
+            return capability_unavailable(tool_name, "浏览器 Host 尚未就绪");
         };
         let call_id = tool_call_id.to_string();
         let scope = BrowserToolCallScope {
@@ -261,9 +264,7 @@ impl BrowserToolRuntimeDependencies {
                             tab_id: tab.tab_id.clone(),
                         })
                         .await
-                        .map_err(|error| {
-                            BrowserToolError::new("browser_host_disconnected", error.to_string())
-                        })?;
+                        .map_err(browser_host_client_error)?;
                     let BrowserHostCommandResult::Json { value } =
                         succeeded_result(reply.response.outcome, "读取浏览器页面视口失败")?
                     else {
@@ -317,7 +318,6 @@ impl BrowserToolRuntimeDependencies {
                         "tab_id": tab.tab_id,
                         "mode": mode,
                         "viewport": viewport,
-                        "surface_slot": value.get("surface_slot").cloned().unwrap_or(Value::Null),
                     })
                     .to_string());
                 }
@@ -368,9 +368,7 @@ impl BrowserToolRuntimeDependencies {
                         },
                     })
                     .await
-                    .map_err(|error| {
-                        BrowserToolError::new("browser_host_disconnected", error.to_string())
-                    })?;
+                    .map_err(browser_host_client_error)?;
                 succeeded_result(reply.response.outcome, "调整浏览器页面视口失败")?;
                 Ok(json!({
                     "tool": tool_name,
@@ -452,9 +450,7 @@ impl BrowserToolRuntimeDependencies {
                         navigation,
                     })
                     .await
-                    .map_err(|error| {
-                        BrowserToolError::new("browser_host_disconnected", error.to_string())
-                    })?;
+                    .map_err(browser_host_client_error)?;
                 let page = page_state(reply.response.outcome, "浏览器导航失败")?;
                 let updated = self.apply_page_state(&tab.tab_id, page)?;
                 let snapshot = if bool_arg(arguments, "include_snapshot", false) {
@@ -521,9 +517,10 @@ impl BrowserToolRuntimeDependencies {
                         delta_y: number_arg(arguments, "delta_y").unwrap_or(0.0),
                     },
                 };
-                let reply = client.request(command).await.map_err(|error| {
-                    BrowserToolError::new("browser_host_disconnected", error.to_string())
-                })?;
+                let reply = client
+                    .request(command)
+                    .await
+                    .map_err(browser_host_client_error)?;
                 let page = page_state(reply.response.outcome, "浏览器交互失败")?;
                 let updated = self.apply_page_state(&tab.tab_id, page)?;
                 let snapshot = if bool_arg(arguments, "include_snapshot", false) {
@@ -591,9 +588,7 @@ impl BrowserToolRuntimeDependencies {
                         quality,
                     })
                     .await
-                    .map_err(|error| {
-                        BrowserToolError::new("browser_host_disconnected", error.to_string())
-                    })?;
+                    .map_err(browser_host_client_error)?;
                 let BrowserHostCommandResult::BinaryPayload(metadata) =
                     succeeded_result(reply.response.outcome, "浏览器截图失败")?
                 else {
@@ -632,6 +627,7 @@ impl BrowserToolRuntimeDependencies {
         let operation = browser_devtools_operation(tool_name).ok_or_else(|| {
             BrowserToolError::new("unknown_browser_tool", "未知的浏览器 DevTools 工具")
         })?;
+        validate_devtools_arguments(operation, arguments)?;
         let action = optional_string(arguments, "action");
         let lighthouse_mode = optional_string(arguments, "mode");
         let requires_write = match operation {
@@ -663,9 +659,7 @@ impl BrowserToolRuntimeDependencies {
                 arguments: Value::Object(arguments.clone()),
             })
             .await
-            .map_err(|error| {
-                BrowserToolError::new("browser_host_disconnected", error.to_string())
-            })?;
+            .map_err(browser_host_client_error)?;
         let BrowserHostCommandResult::Json { value } =
             succeeded_result(reply.response.outcome, "浏览器 DevTools 工具执行失败")?
         else {
@@ -804,7 +798,7 @@ impl BrowserToolRuntimeDependencies {
             UtcMillis::now().0,
             BROWSER_TAB_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        self.mutate(|authority| {
+        let created = self.mutate(|authority| {
             authority.create_tab(CreateBrowserTab {
                 tab_id: tab_id.clone(),
                 browser_session_id: session.browser_session_id.clone(),
@@ -812,6 +806,7 @@ impl BrowserToolRuntimeDependencies {
                 now: UtcMillis::now(),
             })
         })?;
+        self.publish_tab_event("browser.tab.created", &created);
         let reply = match client
             .request(BrowserHostCommand::CreatePage {
                 tab_id: tab_id.clone(),
@@ -883,9 +878,7 @@ impl BrowserToolRuntimeDependencies {
                 allow_page_eviction: false,
             })
             .await
-            .map_err(|error| {
-                BrowserToolError::new("browser_host_disconnected", error.to_string())
-            })?;
+            .map_err(browser_host_client_error)?;
         let page = page_state(reply.response.outcome, "恢复浏览器 Tab 失败")?;
         self.apply_page_state(&tab.tab_id, page)
     }
@@ -935,9 +928,7 @@ impl BrowserToolRuntimeDependencies {
                 },
             })
             .await
-            .map_err(|error| {
-                BrowserToolError::new("browser_host_disconnected", error.to_string())
-            })?;
+            .map_err(browser_host_client_error)?;
         succeeded_result(reply.response.outcome, "同步浏览器控制权失败")?;
         if lease_acquired {
             self.publish_browser_event(
@@ -1190,16 +1181,18 @@ impl BrowserToolRuntimeDependencies {
         tab_id: &BrowserTabId,
         subtree_ref: Option<String>,
     ) -> Result<magi_browser_authority::BrowserHostSnapshot, BrowserToolError> {
+        let (navigation_revision, snapshot_revision) =
+            self.mutate(|authority| authority.record_snapshot(tab_id, UtcMillis::now()))?;
         let reply = client
             .request(BrowserHostCommand::Snapshot {
                 tab_id: tab_id.clone(),
+                navigation_revision,
+                snapshot_revision,
                 limits: Default::default(),
                 subtree_ref,
             })
             .await
-            .map_err(|error| {
-                BrowserToolError::new("browser_host_disconnected", error.to_string())
-            })?;
+            .map_err(browser_host_client_error)?;
         let BrowserHostCommandResult::Snapshot(snapshot) =
             succeeded_result(reply.response.outcome, "浏览器快照失败")?
         else {
@@ -1208,7 +1201,19 @@ impl BrowserToolRuntimeDependencies {
                 "浏览器快照结果无效",
             ));
         };
-        self.apply_snapshot_revision(tab_id, snapshot.snapshot_revision)?;
+        if snapshot.tab_id != *tab_id {
+            return Err(BrowserToolError::new(
+                "browser_snapshot_tab_mismatch",
+                "浏览器快照返回了错误的 Tab",
+            ));
+        }
+        self.mutate(|authority| {
+            authority.validate_snapshot_result(
+                tab_id,
+                snapshot.navigation_revision,
+                snapshot.snapshot_revision,
+            )
+        })?;
         Ok(snapshot)
     }
 
@@ -1223,18 +1228,6 @@ impl BrowserToolRuntimeDependencies {
         if let Ok(tab) = crashed {
             self.publish_tab_event("browser.tab.crashed", &tab);
         }
-    }
-
-    fn apply_snapshot_revision(
-        &self,
-        tab_id: &BrowserTabId,
-        revision: u64,
-    ) -> Result<(), BrowserToolError> {
-        self.mutate(|authority| {
-            authority
-                .apply_host_snapshot_revision(tab_id, revision, UtcMillis::now())
-                .map(|_| ())
-        })
     }
 
     fn persist_artifact(
@@ -1313,7 +1306,7 @@ impl BrowserToolRuntimeDependencies {
                     UtcMillis::now().0,
                     BROWSER_TAB_SEQUENCE.fetch_add(1, Ordering::Relaxed)
                 ));
-                self.mutate(|authority| {
+                let created = self.mutate(|authority| {
                     authority.create_tab(CreateBrowserTab {
                         tab_id: tab_id.clone(),
                         browser_session_id: session.browser_session_id.clone(),
@@ -1321,6 +1314,7 @@ impl BrowserToolRuntimeDependencies {
                         now: UtcMillis::now(),
                     })
                 })?;
+                self.publish_tab_event("browser.tab.created", &created);
                 let reply = match client
                     .request(BrowserHostCommand::CreatePage {
                         tab_id: tab_id.clone(),
@@ -1429,6 +1423,112 @@ fn browser_devtools_operation(tool_name: &str) -> Option<&'static str> {
         "browser_pwa" => Some("pwa"),
         _ => None,
     }
+}
+
+fn validate_devtools_arguments(
+    operation: &str,
+    arguments: &Map<String, Value>,
+) -> Result<(), BrowserToolError> {
+    match operation {
+        "drag" => {
+            validate_nested_snapshot_target(arguments, "source")?;
+            validate_nested_snapshot_target(arguments, "target")?;
+        }
+        "fill_form" => {
+            let fields = arguments
+                .get("fields")
+                .and_then(Value::as_array)
+                .filter(|fields| !fields.is_empty())
+                .ok_or_else(|| {
+                    BrowserToolError::new(
+                        "invalid_arguments",
+                        "browser_fill_form 必须提供非空 fields 数组",
+                    )
+                })?;
+            for field in fields {
+                let field = field.as_object().ok_or_else(|| {
+                    BrowserToolError::new(
+                        "invalid_arguments",
+                        "browser_fill_form.fields 的每一项必须是对象",
+                    )
+                })?;
+                validate_snapshot_target_object(field, "browser_fill_form.fields")?;
+                if !field.contains_key("value") {
+                    return Err(BrowserToolError::new(
+                        "invalid_arguments",
+                        "browser_fill_form.fields 的每一项必须包含 value",
+                    ));
+                }
+            }
+        }
+        "evaluate" => {
+            let expression = arguments
+                .get("expression")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|expression| !expression.is_empty())
+                .ok_or_else(|| {
+                    BrowserToolError::new(
+                        "invalid_arguments",
+                        "browser_evaluate 必须提供非空 expression",
+                    )
+                })?;
+            if expression.len() > 100_000 {
+                return Err(BrowserToolError::new(
+                    "invalid_arguments",
+                    "browser_evaluate.expression 不能超过 100000 个字符",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_nested_snapshot_target(
+    arguments: &Map<String, Value>,
+    name: &str,
+) -> Result<(), BrowserToolError> {
+    let target = arguments
+        .get(name)
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            BrowserToolError::new(
+                "invalid_arguments",
+                format!("browser_drag 必须提供 {name} 快照引用"),
+            )
+        })?;
+    validate_snapshot_target_object(target, &format!("browser_drag.{name}"))
+}
+
+fn validate_snapshot_target_object(
+    target: &Map<String, Value>,
+    context: &str,
+) -> Result<(), BrowserToolError> {
+    let revision = target
+        .get("snapshot_revision")
+        .and_then(Value::as_u64)
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| {
+            BrowserToolError::new(
+                "invalid_arguments",
+                format!("{context}.snapshot_revision 必须是正整数"),
+            )
+        })?;
+    let _ = revision;
+    let element_ref = target
+        .get("element_ref")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|element_ref| !element_ref.is_empty() && *element_ref != "root")
+        .ok_or_else(|| {
+            BrowserToolError::new(
+                "invalid_arguments",
+                format!("{context}.element_ref 必须是有效的快照元素引用"),
+            )
+        })?;
+    let _ = element_ref;
+    Ok(())
 }
 
 fn tab_in_session(
@@ -1578,6 +1678,22 @@ impl BrowserToolError {
 
 fn failure(tool: &str, code: &str, message: &str) -> (String, ExecutionResultStatus) {
     failure_payload(tool, code, message, false, false, None)
+}
+
+fn capability_unavailable(tool: &str, message: &str) -> (String, ExecutionResultStatus) {
+    let details = json!({
+        "capability": "desktop_browser_surface",
+        "supported_platform": "desktop",
+        "available_fallback": "browser_records",
+    });
+    failure_payload(
+        tool,
+        "capability_unavailable",
+        message,
+        true,
+        false,
+        Some(&details),
+    )
 }
 
 fn failure_with_error(tool: &str, error: &BrowserToolError) -> (String, ExecutionResultStatus) {
@@ -1749,6 +1865,26 @@ fn succeeded_result(
     }
 }
 
+fn browser_host_client_error(error: BrowserHostClientError) -> BrowserToolError {
+    let code = match &error {
+        BrowserHostClientError::RequestTimeout(_) => "browser_host_request_timeout",
+        BrowserHostClientError::UnexpectedResponse(_)
+        | BrowserHostClientError::UnexpectedBinaryPayload
+        | BrowserHostClientError::BinarySizeMismatch { .. }
+        | BrowserHostClientError::BinaryHashMismatch
+        | BrowserHostClientError::Json(_)
+        | BrowserHostClientError::ProtocolIncompatible { .. } => "browser_host_protocol_error",
+        BrowserHostClientError::Disconnected => "browser_host_disconnected",
+        BrowserHostClientError::InvalidConfiguration(_)
+        | BrowserHostClientError::Connect(_)
+        | BrowserHostClientError::Transport(_)
+        | BrowserHostClientError::HandshakeTimeout
+        | BrowserHostClientError::DesktopEpochMismatch { .. }
+        | BrowserHostClientError::DesktopProcessMismatch { .. } => "browser_host_unavailable",
+    };
+    BrowserToolError::new(code, error.to_string())
+}
+
 fn page_state(
     outcome: BrowserHostCommandOutcome,
     context: &str,
@@ -1773,6 +1909,10 @@ fn browser_tool_snapshot_value(
     // 模型只能持有 Authority 中的逻辑 Tab ID；物理 View ID 不得越过工具边界，
     // 否则下一次点击会把内部 ID 当成 tab_id 并稳定触发 browser_tab_not_found。
     value.insert("tab_id".to_string(), json!(logical_tab_id));
+    value.insert(
+        "navigation_revision".to_string(),
+        json!(snapshot.navigation_revision),
+    );
     value.insert(
         "snapshot_revision".to_string(),
         json!(snapshot.snapshot_revision),
@@ -1952,13 +2092,16 @@ mod tests {
         CreateBrowserSession, CreateBrowserTab,
     };
     use magi_core::{
-        BrowserProfileId, BrowserSessionId, BrowserTabId, SessionId, UtcMillis, WorkspaceId,
+        BrowserProfileId, BrowserSessionId, BrowserTabId, ExecutionResultStatus, SessionId,
+        ToolCallId, UtcMillis, WorkspaceId,
     };
     use magi_event_bus::InMemoryEventBus;
     use magi_session_store::SessionStore;
+    use serde_json::{Map, Value, json};
 
     use super::{
         BrowserToolRuntimeDependencies, DEFAULT_BROWSER_PROFILE_ID, browser_tool_snapshot_value,
+        validate_devtools_arguments,
     };
     use crate::state::BrowserHostStatusSnapshot;
 
@@ -2107,6 +2250,66 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_browser_tools_return_structured_capability_unavailable() {
+        let runtime = BrowserToolRuntimeDependencies {
+            authority: Arc::new(Mutex::new(BrowserAuthority::new())),
+            write_lock: Arc::new(Mutex::new(())),
+            control_lock: Arc::new(tokio::sync::Mutex::new(())),
+            state_writable: Arc::new(AtomicBool::new(true)),
+            host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
+            host_client: Arc::new(RwLock::new(None)),
+            event_bus: Arc::new(InMemoryEventBus::new(8)),
+            session_store: Arc::new(SessionStore::new()),
+            persistence: None,
+        };
+        let context = magi_tool_runtime::ToolExecutionContext {
+            session_id: Some(SessionId::new("session-browser-capability")),
+            ..Default::default()
+        };
+        let (payload, status) = runtime.execute(
+            &ToolCallId::new("call-browser-capability"),
+            "browser_lighthouse",
+            "{}",
+            &context,
+        );
+        let payload: Value = serde_json::from_str(&payload).expect("capability payload JSON");
+        assert_eq!(status, ExecutionResultStatus::Failed);
+        assert_eq!(payload["error_code"], "capability_unavailable");
+        assert_eq!(payload["details"]["capability"], "desktop_browser_surface");
+        assert_eq!(payload["details"]["supported_platform"], "desktop");
+    }
+
+    #[test]
+    fn browser_devtools_contract_uses_source_target_fields_and_expression() {
+        let mut arguments = Map::new();
+        arguments.insert(
+            "source".to_string(),
+            json!({"snapshot_revision": 2, "element_ref": "e-1"}),
+        );
+        arguments.insert(
+            "target".to_string(),
+            json!({"snapshot_revision": 2, "element_ref": "e-2"}),
+        );
+        validate_devtools_arguments("drag", &arguments)
+            .expect("drag should use source and target snapshot references");
+        assert!(validate_devtools_arguments("drag", &Map::new()).is_err());
+
+        let mut fill_arguments = Map::new();
+        fill_arguments.insert(
+            "fields".to_string(),
+            json!([{"snapshot_revision": 2, "element_ref": "e-1", "value": "Magi"}]),
+        );
+        validate_devtools_arguments("fill_form", &fill_arguments)
+            .expect("fill_form should use fields");
+
+        let mut evaluate_arguments = Map::new();
+        evaluate_arguments.insert("expression".to_string(), json!("document.title"));
+        validate_devtools_arguments("evaluate", &evaluate_arguments)
+            .expect("evaluate should use expression");
+        assert!(validate_devtools_arguments("evaluate", &Map::new()).is_err());
+    }
+
+    #[test]
     fn model_snapshot_is_compact_and_prioritizes_interactive_elements() {
         let mut nodes = (1..=200)
             .map(|index| {
@@ -2123,6 +2326,7 @@ mod tests {
         nodes.push(searchbox);
         let snapshot = BrowserHostSnapshot {
             tab_id: BrowserTabId::new("browser-tab-compact-snapshot"),
+            navigation_revision: 1,
             snapshot_revision: 2,
             root: BrowserSnapshotNode {
                 element_ref: "root".to_string(),

@@ -276,6 +276,31 @@ assert.doesNotMatch(
   /right-pane-edge-toggle/,
   '工作台外壳不得保留脱离 Header 图标组的绝对定位右栏开关',
 );
+assert.match(
+  workbenchShellSource,
+  /\.web-workbench-shell\s*\{[\s\S]*?height:\s*100%;[\s\S]*?width:\s*100%;/,
+  '工作台必须填充 App Renderer 的实际客户区，不能用 100vw/100vh 制造额外坐标层',
+);
+assert.doesNotMatch(
+  workbenchShellSource,
+  /minmax\([^;\n]*minmax\(/,
+  '桌面三栏轨道不得嵌套非法 minmax，避免整条 grid 声明被浏览器丢弃',
+);
+assert.doesNotMatch(
+  workbenchShellSource,
+  /66\.6667%/,
+  '桌面右栏宽度只能使用 Main 快照的单一轨道值，不能在 Renderer 再次按容器比例缩放',
+);
+assert.match(
+  workbenchShellSource,
+  /web-workbench-shell--desktop-right-pane-visible \.workbench-body[\s\S]*?minmax\(var\(--preview-min-width, 320px\), var\(--desktop-right-pane-width, 480px\)\)/,
+  '桌面右栏必须直接消费权威宽度，并与中间区域共享同一 grid 坐标系',
+);
+assert.match(
+  workbenchShellSource,
+  /web-workbench-shell--desktop-preview-overlay \.workbench-body[\s\S]*?desktop-right-pane-column--overlay/,
+  '窄窗口必须由同一套布局切换到右栏覆盖模式，不能继续强行三栏挤压',
+);
 assert.doesNotMatch(
   rightPaneSource,
   /right-pane-collapse-btn/,

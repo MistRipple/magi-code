@@ -926,7 +926,6 @@ export interface BrowserSessionSnapshot {
   sessionId: string;
   profileId: string;
   lifecycle: BrowserSessionLifecycle;
-  activeTabId: string | null;
   tabs: BrowserTabSnapshot[];
   runtimeEpoch: number;
   revision: number;
@@ -946,13 +945,38 @@ export interface BrowserCapabilitiesSnapshot {
   accessProfile: string;
   hostState: string;
   lastErrorCode: string | null;
+  platformCapabilities: {
+    desktopBrowserSurface: boolean;
+    browserRecords: boolean;
+    browserAnnotations: boolean;
+    browserRemoteSurface: boolean;
+  };
+}
+
+export type BrowserClientPlatform = 'desktop' | 'web' | 'mobile-web';
+
+export function browserClientPlatform(): BrowserClientPlatform {
+  if (typeof window !== 'undefined' && window.magiDesktop?.runtime === 'electron') {
+    return 'desktop';
+  }
+  if (
+    typeof navigator !== 'undefined'
+    && /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
+  ) {
+    return 'mobile-web';
+  }
+  return 'web';
 }
 
 export async function getBrowserCapabilities(sessionId?: string): Promise<BrowserCapabilitiesSnapshot> {
-  const query = sessionId?.trim() ? `sessionId=${encodeURIComponent(sessionId.trim())}` : undefined;
-  const response = await getTransport().request(agentUrl('/api/browser/capabilities', query), {
+  const queryParams = new URLSearchParams({ clientPlatform: browserClientPlatform() });
+  if (sessionId?.trim()) queryParams.set('sessionId', sessionId.trim());
+  const response = await getTransport().request(
+    agentUrl('/api/browser/capabilities', queryParams.toString()),
+    {
     cache: 'no-store',
-  });
+    },
+  );
   return parseAgentJson<BrowserCapabilitiesSnapshot>(response, 'load browser capabilities');
 }
 
@@ -963,7 +987,7 @@ export async function updateBrowserSettings(settings: {
   const response = await getTransport().request(agentUrl('/api/browser/settings'), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(settings),
+    body: JSON.stringify({ ...settings, clientPlatform: browserClientPlatform() }),
   });
   return parseAgentJson<BrowserCapabilitiesSnapshot>(response, 'update browser settings');
 }
@@ -979,10 +1003,11 @@ export async function createBrowserSession(
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       scope: normalizedWorkspaceId ? 'workspace' : 'personal',
-      workspaceId: normalizedWorkspaceId || null,
-      workspacePath: normalizedWorkspaceId ? (workspacePath?.trim() || null) : null,
-      sessionId,
-    }),
+        workspaceId: normalizedWorkspaceId || null,
+        workspacePath: normalizedWorkspaceId ? (workspacePath?.trim() || null) : null,
+        sessionId,
+        clientPlatform: browserClientPlatform(),
+      }),
   });
   return parseAgentJson<BrowserSessionSnapshot>(response, 'create browser session');
 }
@@ -1055,10 +1080,48 @@ export async function createBrowserTab(
     {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ initialUrl }),
+      body: JSON.stringify({ initialUrl, clientPlatform: browserClientPlatform() }),
     },
   );
   return parseAgentJson<BrowserTabSnapshot>(response, 'create browser tab');
+}
+
+const BROWSER_TAB_READY_POLL_INTERVAL_MS = 100;
+const BROWSER_TAB_READY_TIMEOUT_MS = 30_000;
+
+/**
+ * 创建 Browser Tab 的 HTTP 请求只提交逻辑 Tab，Chromium Page 由 Host 异步物化。
+ * 创建后的首个 authority 事件可能早于当前会话切换完成，因此这里以权威快照作为
+ * 创建链路的确定性收敛点，不把 UI 是否刚好订阅到某个事件作为 ready 的前提。
+ */
+export async function waitForBrowserTabReady(
+  browserSessionId: string,
+  tabId: string,
+): Promise<BrowserSessionSnapshot> {
+  const deadline = Date.now() + BROWSER_TAB_READY_TIMEOUT_MS;
+  let lastError: unknown = null;
+  while (Date.now() <= deadline) {
+    try {
+      const snapshot = await getBrowserSession(browserSessionId);
+      const tab = snapshot.tabs.find((candidate) => candidate.tabId === tabId);
+      if (!tab) {
+        throw new Error(`browser_tab_not_found:${tabId}`);
+      }
+      if (tab.lifecycle !== 'creating') {
+        return snapshot;
+      }
+      lastError = null;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise<void>((resolve) => {
+      globalThis.setTimeout(resolve, BROWSER_TAB_READY_POLL_INTERVAL_MS);
+    });
+  }
+  if (lastError instanceof Error) {
+    throw lastError;
+  }
+  throw new Error(`browser_tab_ready_timeout:${tabId}`);
 }
 
 export async function activateBrowserTab(tabId: string): Promise<BrowserSessionSnapshot> {
@@ -1090,6 +1153,7 @@ export async function navigateBrowserTab(
       body: JSON.stringify({
         action,
         ...(url ? { url } : {}),
+        clientPlatform: browserClientPlatform(),
       }),
     },
   );

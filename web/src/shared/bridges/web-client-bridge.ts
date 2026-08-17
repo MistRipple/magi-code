@@ -2994,6 +2994,10 @@ async function fetchBootstrap(
               console.warn('[web-client-bridge] 无效会话清理后刷新会话列表失败:', error);
             }
           }
+          await fetchBootstrap({
+            ...options,
+            forceFresh: true,
+          });
           return;
         }
         const workspaces = await listAgentWorkspaces();

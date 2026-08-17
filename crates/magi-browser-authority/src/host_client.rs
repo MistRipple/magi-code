@@ -11,7 +11,7 @@ use std::{
 use std::path::Path;
 
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
-use magi_core::{BrowserCommandId, UtcMillis};
+use magi_core::{BrowserCommandId, BrowserTabId, UtcMillis};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -64,6 +64,7 @@ pub struct BrowserHostIncomingEvent {
 pub struct BrowserHostClient {
     sink: Arc<tokio::sync::Mutex<HostWebSocketSink>>,
     pending: Arc<Mutex<HashMap<BrowserCommandId, PendingResponse>>>,
+    tab_locks: Arc<Mutex<HashMap<BrowserTabId, Arc<tokio::sync::Mutex<()>>>>>,
     events: broadcast::Sender<BrowserHostIncomingEvent>,
     command_sequence: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
@@ -125,6 +126,7 @@ impl BrowserHostClient {
         let client = Self {
             sink: Arc::new(tokio::sync::Mutex::new(sink)),
             pending,
+            tab_locks: Arc::new(Mutex::new(HashMap::new())),
             events,
             command_sequence: Arc::new(AtomicU64::new(1)),
             closed,
@@ -164,6 +166,18 @@ impl BrowserHostClient {
     }
 
     pub async fn request(
+        &self,
+        command: BrowserHostCommand,
+    ) -> Result<BrowserHostCommandReply, BrowserHostClientError> {
+        if let Some(tab_id) = command_tab_id(&command) {
+            let lock = self.tab_lock(tab_id);
+            let _guard = lock.lock().await;
+            return self.request_inner(command).await;
+        }
+        self.request_inner(command).await
+    }
+
+    async fn request_inner(
         &self,
         command: BrowserHostCommand,
     ) -> Result<BrowserHostCommandReply, BrowserHostClientError> {
@@ -208,9 +222,23 @@ impl BrowserHostClient {
                     .lock()
                     .expect("browser Host pending response lock poisoned")
                     .remove(&request_id);
+                // A request timeout invalidates the WebSocket command stream. The
+                // Host may still be executing the timed-out command, so sending
+                // later commands on this connection would only queue behind an
+                // unknown operation and turn one timeout into a tab-wide stall.
+                self.close().await;
                 Err(BrowserHostClientError::RequestTimeout(request_id))
             }
         }
+    }
+
+    fn tab_lock(&self, tab_id: &BrowserTabId) -> Arc<tokio::sync::Mutex<()>> {
+        self.tab_locks
+            .lock()
+            .expect("browser Host tab lock map poisoned")
+            .entry(tab_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     pub async fn close(&self) {
@@ -219,6 +247,27 @@ impl BrowserHostClient {
         }
         let _ = self.sink.lock().await.send(Message::Close(None)).await;
         fail_pending(&self.pending, BrowserHostClientError::Disconnected);
+    }
+}
+
+fn command_tab_id(command: &BrowserHostCommand) -> Option<&BrowserTabId> {
+    match command {
+        BrowserHostCommand::Ping | BrowserHostCommand::Shutdown => None,
+        BrowserHostCommand::CreatePage { tab_id, .. }
+        | BrowserHostCommand::RestorePage { tab_id, .. }
+        | BrowserHostCommand::SetLogicalViewport { tab_id, .. }
+        | BrowserHostCommand::GetLogicalViewport { tab_id }
+        | BrowserHostCommand::ClosePage { tab_id }
+        | BrowserHostCommand::Navigate { tab_id, .. }
+        | BrowserHostCommand::Snapshot { tab_id, .. }
+        | BrowserHostCommand::Click { tab_id, .. }
+        | BrowserHostCommand::Type { tab_id, .. }
+        | BrowserHostCommand::Press { tab_id, .. }
+        | BrowserHostCommand::Scroll { tab_id, .. }
+        | BrowserHostCommand::Devtools { tab_id, .. }
+        | BrowserHostCommand::Screenshot { tab_id, .. }
+        | BrowserHostCommand::HitTest { tab_id, .. }
+        | BrowserHostCommand::UpdateControl { tab_id, .. } => Some(tab_id),
     }
 }
 
@@ -336,7 +385,9 @@ fn handle_text_message(
             .expect("browser Host pending response lock poisoned")
             .remove(&response.request_id);
         let Some(sender) = sender else {
-            return Ok(());
+            return Err(BrowserHostClientError::UnexpectedResponse(
+                response.request_id,
+            ));
         };
         if let Some(metadata) = response_binary_metadata(&response) {
             binary_queue.push_back(PendingBinary::Response {
@@ -506,6 +557,8 @@ pub enum BrowserHostClientError {
     DesktopProcessMismatch { expected: u32, received: u32 },
     #[error("browser Host request timed out: {0}")]
     RequestTimeout(BrowserCommandId),
+    #[error("browser Host response does not match a pending request: {0}")]
+    UnexpectedResponse(BrowserCommandId),
     #[error("browser Host sent an unexpected binary payload")]
     UnexpectedBinaryPayload,
     #[error("browser Host binary size mismatch: expected={expected}, received={received}")]
@@ -600,6 +653,34 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn unmatched_response_is_a_protocol_failure_instead_of_being_dropped() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(4);
+        let mut binary_queue = VecDeque::new();
+        let response = BrowserHostResponseEnvelope {
+            request_id: BrowserCommandId::new("unknown-request"),
+            protocol_version: BrowserHostProtocolVersion::CURRENT,
+            outcome: BrowserHostCommandOutcome::Succeeded(Box::new(
+                BrowserHostCommandResult::Empty,
+            )),
+        };
+
+        let error = handle_text_message(
+            &serde_json::to_string(&response).expect("serialize response"),
+            &pending,
+            &events,
+            &mut binary_queue,
+            &mut None,
+        )
+        .expect_err("unknown response must poison the protocol stream");
+        assert!(matches!(
+            error,
+            BrowserHostClientError::UnexpectedResponse(request_id)
+                if request_id == BrowserCommandId::new("unknown-request")
+        ));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::result_large_err)]
@@ -687,6 +768,63 @@ mod tests {
             reply.response.outcome,
             BrowserHostCommandOutcome::Succeeded(result)
                 if matches!(*result, BrowserHostCommandResult::Pong { monotonic_millis: 123 })
+        ));
+        server.await.expect("join Desktop control server");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn request_timeout_closes_the_command_stream_and_later_requests_fail_fast() {
+        use tokio::net::UnixListener;
+        use tokio_tungstenite::accept_async;
+
+        let temp_dir = tempfile::tempdir().expect("create temporary socket directory");
+        let socket_path = temp_dir.path().join("desktop-control.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind Desktop control socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept Desktop client");
+            let mut websocket = accept_async(stream)
+                .await
+                .expect("upgrade Desktop control websocket");
+            let ready = BrowserHostEventEnvelope {
+                protocol_version: BrowserHostProtocolVersion::CURRENT,
+                sequence: 1,
+                event: BrowserHostEvent::Ready(handshake()),
+            };
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&ready)
+                        .expect("serialize ready event")
+                        .into(),
+                ))
+                .await
+                .expect("send ready event");
+            let _request = websocket
+                .next()
+                .await
+                .expect("receive timed out request")
+                .expect("read timed out request");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let (client, _) = BrowserHostClient::connect_desktop_socket(
+            socket_path.to_str().expect("UTF-8 socket path"),
+            "test-token",
+            "desktop-epoch",
+            42,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("connect Desktop client");
+        let client = client.with_request_timeout(Duration::from_millis(20));
+
+        assert!(matches!(
+            client.request(BrowserHostCommand::Ping).await,
+            Err(BrowserHostClientError::RequestTimeout(_))
+        ));
+        assert!(matches!(
+            client.request(BrowserHostCommand::Ping).await,
+            Err(BrowserHostClientError::Disconnected)
         ));
         server.await.expect("join Desktop control server");
     }

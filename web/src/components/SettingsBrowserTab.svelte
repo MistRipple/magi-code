@@ -8,12 +8,15 @@
     updateBrowserSettings,
     type BrowserCapabilitiesSnapshot,
   } from '../web/agent-api';
+  import {
+    checkForDesktopUpdate,
+    desktopUpdaterState,
+  } from '../stores/desktop-updater.svelte';
 
   type DesktopAction = 'refresh-components' | 'restart-automation' | 'clear-data' | 'check-updates';
 
   let capabilitySnapshot = $state<BrowserCapabilitiesSnapshot | null>(null);
-  let desktopInfo = $state<MagiDesktopBrowserComponentInfo | null>(null);
-  let desktopUpdate = $state<MagiDesktopUpdateSnapshot | null>(null);
+  let desktopInfo = $state<MagiDesktopBrowserComponentSnapshot | null>(null);
   let isDesktop = $state(false);
   let capabilityLoading = $state(false);
   let desktopLoading = $state(false);
@@ -120,18 +123,17 @@
         await desktop.clearBrowserData();
         showActionNotice(i18n.t('settings.browser.clearDataSucceeded'));
       } else {
-        const next = await desktop.checkForUpdates();
-        desktopUpdate = next;
-        if (next.status === 'failed') {
-          throw new Error(next.error || i18n.t('settings.browser.actionFailed'));
+        const result = await checkForDesktopUpdate('manual');
+        if (result === 'error') {
+          throw new Error(desktopUpdaterState.error || i18n.t('settings.browser.actionFailed'));
         }
-        if (next.status === 'unsupported') {
-          showActionNotice(i18n.t('settings.browser.updateStatus.unsupported'));
-          return;
+        if (result === 'available') {
+          showActionNotice(i18n.t('settings.browser.desktopUpdateAvailable', {
+            version: desktopUpdaterState.update?.version || '',
+          }));
+        } else if (result === 'latest') {
+          showActionNotice(i18n.t('settings.browser.desktopUpToDate'));
         }
-        showActionNotice(next.availableVersion
-          ? i18n.t('settings.browser.desktopUpdateAvailable', { version: next.availableVersion })
-          : i18n.t('settings.browser.desktopUpToDate'));
       }
     } catch (error) {
       console.warn(`[SettingsBrowserTab] 桌面浏览器操作失败: ${action}`, error);
@@ -142,20 +144,29 @@
   }
 
   function componentStatus(
-    status: 'starting' | 'ready' | 'restarting' | 'failed' | 'stopped' | 'protocol-incompatible' | undefined,
+    status: MagiDesktopBrowserComponentStatus | 'protocol-incompatible' | undefined,
   ): string {
     if (desktopLoading) return i18n.t('settings.browser.status.loading');
     return i18n.t(`settings.browser.status.${status ?? 'unavailable'}`);
   }
 
   function protocolVersion(): string {
-    const version = desktopInfo?.protocol_version;
+    const version = desktopInfo?.protocol.version;
     return version ? `${version.major}.${version.minor}` : '-';
   }
 
   function updateStatusText(): string {
-    if (!desktopUpdate) return i18n.t('settings.browser.updateStatus.notChecked');
-    return i18n.t(`settings.browser.updateStatus.${desktopUpdate.status}`);
+    const status = desktopUpdaterState.phase;
+    if (status === 'idle') {
+      return desktopUpdaterState.lastCheckedAt > 0
+        ? i18n.t('settings.browser.updateStatus.idle')
+        : i18n.t('settings.browser.updateStatus.notChecked');
+    }
+    if (status === 'latest') return i18n.t('settings.browser.updateStatus.idle');
+    if (status === 'ready') return i18n.t('settings.browser.updateStatus.downloaded');
+    if (status === 'error') return i18n.t('settings.browser.updateStatus.failed');
+    if (status === 'installing') return i18n.t('settings.browser.updateStatus.downloaded');
+    return i18n.t(`settings.browser.updateStatus.${status}`);
   }
 
   function actionLabel(action: DesktopAction): string {
@@ -176,16 +187,16 @@
     isDesktop = desktop?.runtime === 'electron';
     void loadCapabilities();
 
-    let unsubscribeUpdate: (() => void) | null = null;
+    let unsubscribeComponent: (() => void) | null = null;
     if (isDesktop && desktop) {
       void loadDesktopInfo();
-      unsubscribeUpdate = desktop.onUpdate((next) => {
-        desktopUpdate = next;
+      unsubscribeComponent = desktop.onBrowserComponent((next) => {
+        desktopInfo = next;
       });
     }
 
     return () => {
-      unsubscribeUpdate?.();
+      unsubscribeComponent?.();
       if (actionNoticeTimer !== null) clearTimeout(actionNoticeTimer);
     };
   });
@@ -256,7 +267,7 @@
         <div class="component-list" aria-live="polite">
           <div class="component-row">
             <div><strong>{i18n.t('settings.browser.component.desktopHost')}</strong><span>{componentStatus(desktopInfo ? 'ready' : undefined)}</span></div>
-            <code>{desktopInfo?.desktop_version ?? '-'}</code>
+            <code>{desktopInfo?.product_version ?? '-'}</code>
           </div>
           <div class="component-row">
             <div><strong>{i18n.t('settings.browser.component.electron')}</strong><span>{componentStatus(desktopInfo ? 'ready' : undefined)}</span></div>
@@ -267,18 +278,24 @@
             <code>{desktopInfo?.chromium_version ?? '-'}</code>
           </div>
           <div class="component-row">
-            <div><strong>{i18n.t('settings.browser.component.daemon')}</strong><span>{componentStatus(desktopInfo?.daemon_status)}</span></div>
-            <code>{desktopInfo?.daemon_version ?? '-'}</code>
+            <div><strong>{i18n.t('settings.browser.component.daemon')}</strong><span>{componentStatus(desktopInfo?.daemon.status)}</span></div>
+            <code>{desktopInfo?.daemon.version ?? '-'}</code>
           </div>
           <div class="component-row">
-            <div><strong>{i18n.t('settings.browser.component.automationWorker')}</strong><span>{componentStatus(desktopInfo?.automation_worker_status)}</span></div>
-            <code>{desktopInfo?.automation_worker_version ?? '-'}</code>
+            <div><strong>{i18n.t('settings.browser.component.automationWorker')}</strong><span>{componentStatus(desktopInfo?.worker.status)}</span></div>
+            <code>{desktopInfo?.worker.version ?? '-'}</code>
           </div>
           <div class="component-row">
-            <div><strong>{i18n.t('settings.browser.component.protocol')}</strong><span>{componentStatus(desktopInfo?.protocol_compatible ? 'ready' : 'protocol-incompatible')}</span></div>
+            <div><strong>{i18n.t('settings.browser.component.protocol')}</strong><span>{componentStatus(desktopInfo?.protocol.compatible ? 'ready' : 'protocol-incompatible')}</span></div>
             <code>{protocolVersion()}</code>
           </div>
         </div>
+        {#if desktopInfo?.error}
+          <div class="status-message status-message--error" role="status" aria-live="assertive">
+            <Icon name="alert-circle" size={14} />
+            <span>{desktopInfo.error.target}: <code>{desktopInfo.error.message}</code></span>
+          </div>
+        {/if}
       </section>
 
       <section class="settings-section desktop-actions" aria-labelledby="browser-actions-title">

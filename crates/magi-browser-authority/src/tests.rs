@@ -9,8 +9,8 @@ use crate::{
     AcquireBrowserLease, BrowserAnnotation, BrowserAnnotationAnchor, BrowserAnnotationAuthor,
     BrowserAnnotationKind, BrowserAuthority, BrowserDeviceType, BrowserDurableState,
     BrowserLeaseEndReason, BrowserLeaseLifecycle, BrowserProfile, BrowserProfileKind,
-    BrowserSessionLifecycle, BrowserTabLifecycle, BrowserViewport, CreateBrowserSession,
-    CreateBrowserTab, GoalControlBinding, ValidateBrowserWrite,
+    BrowserSessionLifecycle, BrowserSurfaceBinding, BrowserTabLifecycle, BrowserViewport,
+    CreateBrowserSession, CreateBrowserTab, GoalControlBinding, ValidateBrowserWrite,
 };
 
 fn at(value: u64) -> UtcMillis {
@@ -73,6 +73,24 @@ fn surface_id() -> String {
     "surface-1".to_string()
 }
 
+fn binding(
+    tab_id: &BrowserTabId,
+    surface_id: &str,
+    surface_revision: u64,
+) -> BrowserSurfaceBinding {
+    BrowserSurfaceBinding {
+        desktop_epoch: "desktop-epoch".to_string(),
+        window_id: "window-1".to_string(),
+        surface_id: surface_id.to_string(),
+        surface_revision,
+        tab_id: tab_id.clone(),
+        web_contents_id: 23,
+        target_id: "target-1".to_string(),
+        browser_context_id: "context-1".to_string(),
+        navigation_revision: 0,
+    }
+}
+
 fn owner() -> ExecutionOwnership {
     ExecutionOwnership {
         session_id: Some(SessionId::new("session-1")),
@@ -88,7 +106,7 @@ fn durable_tab_contains_only_user_visible_page_state() {
     let browser_session_id = ready_session(&mut authority);
     let tab_id = ready_tab(&mut authority, &browser_session_id);
     authority
-        .set_primary_surface(&tab_id, surface_id(), 1, at(6))
+        .set_primary_surface(binding(&tab_id, &surface_id(), 1), at(6))
         .expect("surface should bind");
 
     let durable = authority.durable_state();
@@ -147,7 +165,7 @@ fn lease_is_scoped_to_one_tab_and_surface() {
     let browser_session_id = ready_session(&mut authority);
     let tab_id = ready_tab(&mut authority, &browser_session_id);
     authority
-        .set_primary_surface(&tab_id, surface_id(), 1, at(6))
+        .set_primary_surface(binding(&tab_id, &surface_id(), 1), at(6))
         .expect("surface should bind");
     let goal_binding = GoalControlBinding {
         goal_id: magi_core::GoalId::new("goal-1"),
@@ -206,7 +224,7 @@ fn surface_replacement_revokes_only_that_surface() {
     let browser_session_id = ready_session(&mut authority);
     let tab_id = ready_tab(&mut authority, &browser_session_id);
     authority
-        .set_primary_surface(&tab_id, surface_id(), 1, at(6))
+        .set_primary_surface(binding(&tab_id, &surface_id(), 1), at(6))
         .expect("surface should bind");
     authority
         .acquire_lease(AcquireBrowserLease {
@@ -221,7 +239,7 @@ fn surface_replacement_revokes_only_that_surface() {
         })
         .expect("lease should acquire");
     let revoked = authority
-        .set_primary_surface(&tab_id, "surface-2".to_string(), 2, at(9))
+        .set_primary_surface(binding(&tab_id, "surface-2", 2), at(9))
         .expect("surface replacement should succeed");
     assert_eq!(revoked.len(), 1);
     assert!(
@@ -238,13 +256,183 @@ fn surface_replacement_revokes_only_that_surface() {
 }
 
 #[test]
+fn stale_primary_surface_events_cannot_rewind_the_binding() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+
+    authority
+        .set_primary_surface(binding(&tab_id, "surface-current", 8), at(6))
+        .expect("current surface should bind");
+    authority
+        .set_primary_surface(binding(&tab_id, "surface-old", 7), at(7))
+        .expect("stale surface event should be ignored");
+    assert_eq!(
+        authority
+            .primary_surface(&tab_id)
+            .map(|surface| (surface.surface_id.as_str(), surface.surface_revision)),
+        Some(("surface-current", 8))
+    );
+
+    authority
+        .set_primary_surface(binding(&tab_id, "surface-other", 8), at(8))
+        .expect("same-revision replacement should be ignored");
+    assert_eq!(
+        authority
+            .primary_surface(&tab_id)
+            .map(|surface| (surface.surface_id.as_str(), surface.surface_revision)),
+        Some(("surface-current", 8))
+    );
+
+    authority
+        .set_primary_surface(binding(&tab_id, "surface-next", 9), at(9))
+        .expect("newer surface event should replace the binding");
+    assert_eq!(
+        authority
+            .primary_surface(&tab_id)
+            .map(|surface| (surface.surface_id.as_str(), surface.surface_revision)),
+        Some(("surface-next", 9))
+    );
+}
+
+#[test]
+fn stale_epoch_and_window_bindings_cannot_replace_the_current_surface() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+
+    authority
+        .set_primary_surface(binding(&tab_id, "surface-current", 8), at(6))
+        .expect("current surface should bind");
+
+    let mut stale_epoch = binding(&tab_id, "surface-old-epoch", 9);
+    stale_epoch.desktop_epoch = "desktop-old-epoch".to_string();
+    assert!(
+        authority
+            .set_primary_surface(stale_epoch, at(7))
+            .expect("stale epoch event should be ignored")
+            .is_empty()
+    );
+
+    let mut stale_window = binding(&tab_id, "surface-old-window", 8);
+    stale_window.window_id = "window-old".to_string();
+    assert!(
+        authority
+            .set_primary_surface(stale_window, at(8))
+            .expect("same epoch stale window event should be ignored")
+            .is_empty()
+    );
+
+    assert_eq!(
+        authority.primary_surface(&tab_id),
+        Some(&binding(&tab_id, "surface-current", 8))
+    );
+
+    let revoked = authority.accept_desktop_epoch("desktop-next".to_string(), at(9));
+    assert!(revoked.is_empty());
+    let mut next = binding(&tab_id, "surface-next", 1);
+    next.desktop_epoch = "desktop-next".to_string();
+    assert!(
+        authority
+            .set_primary_surface(next.clone(), at(10))
+            .expect("new desktop epoch should bind")
+            .is_empty()
+    );
+    assert_eq!(authority.primary_surface(&tab_id), Some(&next));
+
+    let mut delayed_old = binding(&tab_id, "surface-delayed-old", 100);
+    delayed_old.desktop_epoch = "desktop-epoch".to_string();
+    assert!(
+        authority
+            .set_primary_surface(delayed_old, at(11))
+            .expect("delayed old epoch event should be ignored")
+            .is_empty()
+    );
+    assert_eq!(authority.primary_surface(&tab_id), Some(&next));
+}
+
+#[test]
+fn page_binding_updates_navigation_only_for_the_current_window_surface() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+    authority
+        .set_primary_surface(binding(&tab_id, "surface-page", 4), at(6))
+        .expect("surface should bind");
+
+    let mut current = binding(&tab_id, "surface-page", 4);
+    current.navigation_revision = 2;
+    assert!(
+        authority
+            .accept_page_binding(&current, at(7))
+            .expect("current page binding should be accepted")
+            .0
+    );
+    assert_eq!(
+        authority
+            .primary_surface(&tab_id)
+            .map(|surface| surface.navigation_revision),
+        Some(2)
+    );
+
+    let mut stale = current.clone();
+    stale.navigation_revision = 1;
+    assert!(
+        !authority
+            .accept_page_binding(&stale, at(8))
+            .expect("stale page binding should be rejected")
+            .0
+    );
+
+    let mut other_window = current;
+    other_window.window_id = "window-other".to_string();
+    other_window.navigation_revision = 3;
+    assert!(
+        !authority
+            .accept_page_binding(&other_window, at(9))
+            .expect("other window page binding should be rejected")
+            .0
+    );
+}
+
+#[test]
+fn agent_lease_retains_the_complete_surface_identity() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+    let mut surface = binding(&tab_id, "surface-lease", 5);
+    surface.navigation_revision = 3;
+    authority
+        .set_primary_surface(surface.clone(), at(6))
+        .expect("surface should bind");
+
+    let lease = authority
+        .acquire_lease(AcquireBrowserLease {
+            lease_id: BrowserLeaseId::new("lease-full-binding"),
+            tab_id: tab_id.clone(),
+            surface_id: surface.surface_id.clone(),
+            owner: owner(),
+            turn_id: "turn-full-binding".to_string(),
+            goal_binding: None,
+            acquired_at: at(8),
+            expires_at: at(100),
+        })
+        .expect("lease should acquire");
+    assert_eq!(lease.surface_binding(), surface);
+}
+
+#[test]
 fn crashed_tab_releases_surface_control_without_deleting_the_logical_tab() {
     let mut authority = BrowserAuthority::new();
     register_profile(&mut authority);
     let browser_session_id = ready_session(&mut authority);
     let tab_id = ready_tab(&mut authority, &browser_session_id);
     authority
-        .set_primary_surface(&tab_id, surface_id(), 1, at(6))
+        .set_primary_surface(binding(&tab_id, &surface_id(), 1), at(6))
         .expect("surface should bind");
     let lease_id = BrowserLeaseId::new("lease-crash");
     authority
@@ -311,13 +499,82 @@ fn browser_tab_document_updates_are_revisioned_without_viewport_state() {
 }
 
 #[test]
+fn snapshot_revision_is_authority_owned_and_survives_restart() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+
+    let first = authority
+        .record_snapshot(&tab_id, at(6))
+        .expect("authority should allocate the first snapshot revision");
+    assert_eq!(first, (0, 1));
+    authority
+        .apply_host_snapshot_revision(&tab_id, 1, at(7))
+        .expect("Host must echo the authority revision exactly");
+    assert!(
+        authority
+            .apply_host_snapshot_revision(&tab_id, 0, at(7))
+            .is_err()
+    );
+    assert!(
+        authority
+            .apply_host_snapshot_revision(&tab_id, 2, at(7))
+            .is_err()
+    );
+
+    let durable = authority.durable_state();
+    assert_eq!(durable.tabs[0].snapshot_revision, 1);
+    let restored = BrowserAuthority::restore_durable(durable, at(8))
+        .expect("durable browser state should restore");
+    let restored_tab = restored.tab(&tab_id).expect("tab should survive restart");
+    assert_eq!(restored_tab.snapshot_revision, 2);
+    assert!(restored_tab.snapshot_revision > first.1);
+}
+
+#[test]
+fn old_snapshot_revision_is_rejected_after_navigation() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let tab_id = ready_tab(&mut authority, &browser_session_id);
+
+    let old = authority
+        .record_snapshot(&tab_id, at(6))
+        .expect("authority should allocate the first snapshot revision");
+    authority
+        .apply_host_page_state(
+            &tab_id,
+            1,
+            "https://example.com/".to_string(),
+            Some("https://example.com".to_string()),
+            "Example".to_string(),
+            at(7),
+        )
+        .expect("navigation should advance the document revision");
+    assert!(
+        authority
+            .validate_snapshot_result(&tab_id, old.0, old.1)
+            .is_err()
+    );
+
+    let current = authority
+        .record_snapshot(&tab_id, at(8))
+        .expect("authority should allocate the post-navigation revision");
+    assert_eq!(current, (1, 3));
+    authority
+        .validate_snapshot_result(&tab_id, current.0, current.1)
+        .expect("current navigation and snapshot revisions should validate");
+}
+
+#[test]
 fn closing_tab_revokes_surface_lease_and_removes_membership() {
     let mut authority = BrowserAuthority::new();
     register_profile(&mut authority);
     let browser_session_id = ready_session(&mut authority);
     let tab_id = ready_tab(&mut authority, &browser_session_id);
     authority
-        .set_primary_surface(&tab_id, surface_id(), 1, at(6))
+        .set_primary_surface(binding(&tab_id, &surface_id(), 1), at(6))
         .expect("surface should bind");
     let lease_id = BrowserLeaseId::new("lease-close");
     authority

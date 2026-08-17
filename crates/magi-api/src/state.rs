@@ -21,10 +21,11 @@ use magi_bridge_client::{
     ModelBridgeClient,
 };
 use magi_browser_authority::{
-    BrowserAuthority, BrowserAuthorityError, BrowserCapabilitySnapshot, BrowserDurableState,
-    BrowserHostClient, BrowserHostCommand, BrowserHostCommandOutcome, BrowserHostControlUpdate,
-    BrowserHostStatus, BrowserLeaseEndReason, BrowserLeaseSelector, BrowserProfile,
-    BrowserProfileKind, BrowserSurfaceControlSnapshot,
+    BrowserAuthority, BrowserAuthorityError, BrowserCapabilitySnapshot, BrowserControlLease,
+    BrowserDurableState, BrowserHostClient, BrowserHostCommand, BrowserHostCommandOutcome,
+    BrowserHostControlUpdate, BrowserHostStatus, BrowserLeaseEndReason, BrowserLeaseSelector,
+    BrowserProfile, BrowserProfileKind, BrowserSession, BrowserSessionLifecycle,
+    BrowserSurfaceControlSnapshot,
 };
 use magi_conversation_runtime::{
     ConversationRegistry,
@@ -38,8 +39,8 @@ use magi_conversation_runtime::{
     },
 };
 use magi_core::{
-    AccessProfile, BrowserProfileId, SessionId, SessionLifecycleStatus, TaskId, TaskTier,
-    UtcMillis, WorkspaceId, public_runtime_excerpt,
+    AccessProfile, BrowserProfileId, BrowserTabId, SessionId, SessionLifecycleStatus, TaskId,
+    TaskTier, UtcMillis, WorkspaceId, public_runtime_excerpt,
 };
 use magi_event_bus::{
     EventContext, EventEnvelope, InMemoryEventBus, latest_usage_observations_from_ledger,
@@ -70,6 +71,9 @@ use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use tokio::sync::watch;
+
+static RUNTIME_EPOCH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Tracks the state of a single running Runner instance.
 pub struct RunnerHandle {
@@ -791,6 +795,25 @@ pub struct BrowserHostStatusSnapshot {
     pub last_error_code: Option<String>,
 }
 
+/// Electron Desktop 控制通道的运行时注册信息。
+///
+/// 正式包由 Electron 启动 daemon 时通过环境变量提供；开发模式先启动的
+/// daemon 则由 Electron 在启动后注册。两条路径最终都收敛到同一个状态，
+/// 不再要求 daemon 重启或启动第二个端口实例。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserHostConnectionConfig {
+    pub socket_path: String,
+    pub auth_token: String,
+    pub desktop_epoch: String,
+    pub parent_pid: u32,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrowserHostConnectionRegistrationError {
+    Conflict { current_generation: u64 },
+}
+
 impl Default for BrowserHostStatusSnapshot {
     fn default() -> Self {
         Self {
@@ -919,6 +942,42 @@ impl ExecutionResourceCoordinator {
         }
     }
 
+    fn cancel_surface(
+        &self,
+        tab_id: &BrowserTabId,
+        surface_id: &str,
+        reason: BrowserLeaseEndReason,
+        now: UtcMillis,
+    ) -> Vec<BrowserControlLease> {
+        let selector = BrowserLeaseSelector {
+            tab_id: Some(tab_id.clone()),
+            surface_id: Some(surface_id.to_string()),
+            ..BrowserLeaseSelector::default()
+        };
+        let (revoked, controls) = {
+            let _write_guard = self
+                .browser_write_lock
+                .lock()
+                .expect("browser authority write lock poisoned");
+            let mut authority = self
+                .browser_authority
+                .lock()
+                .expect("browser authority lock poisoned");
+            let revoked = authority.revoke_leases(&selector, reason, now);
+            let controls = revoked
+                .iter()
+                .filter_map(|lease| {
+                    authority
+                        .surface_control_snapshot(&lease.tab_id, &lease.surface_id)
+                        .ok()
+                })
+                .collect::<Vec<_>>();
+            (revoked, controls)
+        };
+        self.synchronize_browser_controls(controls);
+        revoked
+    }
+
     fn synchronize_browser_controls(&self, controls: Vec<BrowserSurfaceControlSnapshot>) {
         let client = self
             .browser_host_client
@@ -1018,6 +1077,8 @@ pub struct ApiState {
     pub(crate) browser_control_lock: Arc<tokio::sync::Mutex<()>>,
     browser_state_writable: Arc<AtomicBool>,
     browser_host_status: Arc<RwLock<BrowserHostStatusSnapshot>>,
+    browser_host_connection: Arc<watch::Sender<Option<BrowserHostConnectionConfig>>>,
+    browser_host_connection_generation: Arc<AtomicU64>,
     browser_host_client: Arc<RwLock<Option<BrowserHostClient>>>,
     browser_host_generation: Arc<AtomicU64>,
     execution_resources: ExecutionResourceCoordinator,
@@ -1277,7 +1338,12 @@ impl ApiState {
                 service_name: service_name.into(),
                 api_version: "v0".to_string(),
             },
-            runtime_epoch: format!("runtime-{}", UtcMillis::now().0),
+            runtime_epoch: format!(
+                "runtime-{}-{}-{}",
+                UtcMillis::now().0,
+                std::process::id(),
+                RUNTIME_EPOCH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ),
             event_bus,
             session_store,
             workspace_registry,
@@ -1308,6 +1374,8 @@ impl ApiState {
             browser_control_lock,
             browser_state_writable: Arc::new(AtomicBool::new(true)),
             browser_host_status: Arc::new(RwLock::new(BrowserHostStatusSnapshot::default())),
+            browser_host_connection: Arc::new(watch::channel(None).0),
+            browser_host_connection_generation: Arc::new(AtomicU64::new(0)),
             browser_host_client,
             browser_host_generation: Arc::new(AtomicU64::new(0)),
             execution_resources,
@@ -1747,6 +1815,16 @@ impl ApiState {
         )
     }
 
+    pub fn cancel_browser_surface_control(
+        &self,
+        tab_id: &BrowserTabId,
+        surface_id: &str,
+        reason: BrowserLeaseEndReason,
+    ) -> Vec<BrowserControlLease> {
+        self.execution_resources
+            .cancel_surface(tab_id, surface_id, reason, UtcMillis::now())
+    }
+
     pub fn execution_resource_coordinator(&self) -> &ExecutionResourceCoordinator {
         &self.execution_resources
     }
@@ -1756,6 +1834,96 @@ impl ApiState {
             .read()
             .expect("browser host status lock poisoned")
             .clone()
+    }
+
+    /// 返回 BrowserAuthority 当前记录的唯一主 Surface。
+    ///
+    /// Surface 属于桌面运行态，不进入持久化状态；所有 API 和 Host 事件
+    /// 都必须从 Authority 读取，不能在各层维护自己的 Surface 缓存。
+    pub fn browser_primary_surface_id(&self, tab_id: &BrowserTabId) -> Option<String> {
+        self.browser_authority
+            .lock()
+            .expect("browser authority lock poisoned")
+            .primary_surface(tab_id)
+            .map(|surface| surface.surface_id.clone())
+    }
+
+    pub fn browser_host_connection_config(&self) -> Option<BrowserHostConnectionConfig> {
+        self.browser_host_connection.borrow().clone()
+    }
+
+    pub fn set_browser_host_connection_config(&self, config: Option<BrowserHostConnectionConfig>) {
+        if let Some(config) = config.as_ref() {
+            self.browser_host_connection_generation
+                .fetch_max(config.generation, Ordering::AcqRel);
+        }
+        self.browser_host_connection.send_replace(config);
+    }
+
+    pub fn browser_host_connection_receiver(
+        &self,
+    ) -> watch::Receiver<Option<BrowserHostConnectionConfig>> {
+        self.browser_host_connection.subscribe()
+    }
+
+    pub fn browser_host_connection_generation(&self) -> u64 {
+        self.browser_host_connection_generation
+            .load(Ordering::Acquire)
+    }
+
+    pub fn register_browser_host_connection(
+        &self,
+        candidate: BrowserHostConnectionConfig,
+        expected_generation: u64,
+    ) -> Result<(BrowserHostConnectionConfig, bool), BrowserHostConnectionRegistrationError> {
+        let mut outcome = Ok((candidate.clone(), false));
+        self.browser_host_connection.send_if_modified(|current| {
+            let next_generation = || {
+                self.browser_host_connection_generation
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1)
+            };
+            match current {
+                Some(existing)
+                    if existing.desktop_epoch == candidate.desktop_epoch
+                        && existing.parent_pid == candidate.parent_pid
+                        && existing.socket_path == candidate.socket_path
+                        && existing.auth_token == candidate.auth_token
+                        && expected_generation == existing.generation
+                        && existing.generation != 0 =>
+                {
+                    outcome = Ok((existing.clone(), false));
+                    false
+                }
+                Some(existing) if expected_generation == existing.generation => {
+                    let mut accepted = candidate.clone();
+                    accepted.generation = next_generation();
+                    outcome = Ok((accepted.clone(), true));
+                    *current = Some(accepted);
+                    true
+                }
+                Some(existing) => {
+                    outcome = Err(BrowserHostConnectionRegistrationError::Conflict {
+                        current_generation: existing.generation,
+                    });
+                    false
+                }
+                None if expected_generation == self.browser_host_connection_generation() => {
+                    let mut accepted = candidate.clone();
+                    accepted.generation = next_generation();
+                    outcome = Ok((accepted.clone(), true));
+                    *current = Some(accepted);
+                    true
+                }
+                None => {
+                    outcome = Err(BrowserHostConnectionRegistrationError::Conflict {
+                        current_generation: self.browser_host_connection_generation(),
+                    });
+                    false
+                }
+            }
+        });
+        outcome
     }
 
     pub fn set_browser_host_status(&self, mut status: BrowserHostStatusSnapshot) {
@@ -1809,6 +1977,105 @@ impl ApiState {
             .clone()
     }
 
+    /// 关闭一个 Magi 会话拥有的 Browser Session 及其物理 Page。
+    ///
+    /// Browser Session 不是独立于 Magi 会话的全局资源。会话关闭或删除时，
+    /// 必须先让 Host 释放 Chromium Page，再收口 Authority，避免历史逻辑 Tab
+    /// 在重启后继续占用全局容量。
+    pub async fn close_browser_session_for_magi_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<BrowserSession>, ApiError> {
+        let _control_guard = self.browser_control_lock.lock().await;
+        let browser_session = self
+            .browser_authority
+            .lock()
+            .expect("browser authority lock poisoned")
+            .session_for_magi_session(session_id)
+            .cloned();
+        let Some(browser_session) = browser_session else {
+            return Ok(None);
+        };
+
+        if let Some(client) = self.browser_host_client() {
+            for tab_id in &browser_session.tab_ids {
+                match client
+                    .request(BrowserHostCommand::ClosePage {
+                        tab_id: tab_id.clone(),
+                    })
+                    .await
+                {
+                    Ok(reply)
+                        if matches!(
+                            reply.response.outcome,
+                            BrowserHostCommandOutcome::Succeeded(_)
+                        ) => {}
+                    Ok(reply) => tracing::warn!(
+                        %tab_id,
+                        outcome = ?reply.response.outcome,
+                        "会话生命周期结束时 Host 未能关闭浏览器 Page，继续收口权威状态"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %tab_id,
+                        ?error,
+                        "会话生命周期结束时 Browser Host 不可用，继续收口权威状态"
+                    ),
+                }
+            }
+        }
+
+        self.mutate_browser_authority(|authority| {
+            authority.transition_session(
+                &browser_session.browser_session_id,
+                BrowserSessionLifecycle::Closed,
+                UtcMillis::now(),
+            )
+        })
+        .map(Some)
+    }
+
+    /// 清理旧版本遗留的孤儿 Browser Session。
+    ///
+    /// Browser Authority 的持久化状态可能早于对应 Magi 会话被删除或归档，
+    /// 这些状态不能继续参与恢复和全局 Tab 容量计算。只保留当前 SessionStore
+    /// 中仍为 Active 的 Magi 会话，所有其他打开状态一次性转为 Closed。
+    pub fn reconcile_browser_sessions_with_session_store(&self) -> Result<usize, ApiError> {
+        let active_session_ids = self
+            .session_store
+            .sessions()
+            .into_iter()
+            .filter(|session| session.status == SessionLifecycleStatus::Active)
+            .map(|session| session.session_id)
+            .collect::<HashSet<_>>();
+        let orphan_browser_session_ids = self
+            .browser_authority
+            .lock()
+            .expect("browser authority lock poisoned")
+            .snapshot()
+            .sessions
+            .into_iter()
+            .filter(|session| {
+                session.lifecycle.is_open() && !active_session_ids.contains(&session.session_id)
+            })
+            .map(|session| session.browser_session_id)
+            .collect::<Vec<_>>();
+        if orphan_browser_session_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let now = UtcMillis::now();
+        self.mutate_browser_authority(|authority| {
+            for browser_session_id in &orphan_browser_session_ids {
+                authority.transition_session(
+                    browser_session_id,
+                    BrowserSessionLifecycle::Closed,
+                    now,
+                )?;
+            }
+            Ok(orphan_browser_session_ids.len())
+        })
+    }
+
     pub fn browser_host_generation(&self) -> u64 {
         self.browser_host_generation.load(Ordering::Acquire)
     }
@@ -1850,7 +2117,7 @@ impl ApiState {
     }
 
     pub fn health_dto(&self) -> HealthDto {
-        HealthDto::from_service_info(&self.service_info)
+        HealthDto::from_service_info(&self.service_info, &self.runtime_epoch)
     }
 
     pub fn runtime_epoch(&self) -> &str {
@@ -3241,6 +3508,8 @@ impl ApiState {
                 .unbind_session_after_lifecycle_lock(session_id)
                 .await;
         }
+        self.close_browser_session_for_magi_session(session_id)
+            .await?;
         self.terminal_sessions
             .close_for_session(session_id.as_str());
         self.cleanup_session_git_resources(session_id).await;
@@ -3892,9 +4161,17 @@ mod tests {
                     now,
                 )?;
                 authority.set_primary_surface(
-                    &tab_id,
-                    "surface-resource-coordinator".to_string(),
-                    1,
+                    magi_browser_authority::BrowserSurfaceBinding {
+                        desktop_epoch: "desktop-resource-coordinator".to_string(),
+                        window_id: "window-resource-coordinator".to_string(),
+                        surface_id: "surface-resource-coordinator".to_string(),
+                        surface_revision: 1,
+                        tab_id: tab_id.clone(),
+                        web_contents_id: 23,
+                        target_id: "target-resource-coordinator".to_string(),
+                        browser_context_id: "context-resource-coordinator".to_string(),
+                        navigation_revision: 0,
+                    },
                     now,
                 )?;
                 authority.acquire_lease(magi_browser_authority::AcquireBrowserLease {

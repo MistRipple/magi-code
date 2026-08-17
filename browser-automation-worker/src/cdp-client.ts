@@ -7,7 +7,7 @@ import type {
   WorkerToMainMessage,
 } from "@magi/desktop-browser-contracts";
 
-interface ParentPort {
+export interface ParentPort {
   on(event: "message", listener: (event: { data: MainToWorkerMessage }) => void): void;
   postMessage(message: WorkerToMainMessage): void;
 }
@@ -106,9 +106,14 @@ export class CdpClient {
 
 function sameBinding(left: BrowserSurfaceBinding, right: BrowserSurfaceBinding): boolean {
   return left.desktop_epoch === right.desktop_epoch
+    && left.window_id === right.window_id
     && left.surface_id === right.surface_id
     && left.surface_revision === right.surface_revision
-    && left.target_id === right.target_id;
+    && left.tab_id === right.tab_id
+    && left.web_contents_id === right.web_contents_id
+    && left.target_id === right.target_id
+    && left.browser_context_id === right.browser_context_id
+    && left.navigation_revision === right.navigation_revision;
 }
 
 function commandError(value: BrowserCommandError): Error {

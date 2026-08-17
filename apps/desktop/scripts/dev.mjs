@@ -25,6 +25,9 @@ const child = spawn(executable, [join(repositoryRoot, "apps", "desktop")], {
   env: {
     ...process.env,
     NODE_ENV: "development",
+    // 开发 daemon 由 scripts/dev-daemon.sh 托管；Electron 只连接它，
+    // 避免桌面宿主再启动第二个实例争抢 38123 端口。
+    MAGI_DESKTOP_REUSE_DAEMON: "1",
   },
   stdio: "inherit",
 });

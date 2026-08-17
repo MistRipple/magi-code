@@ -32,6 +32,12 @@ pub enum ApiError {
     InternalAssemblyError(String),
     /// 资源状态冲突（如 runner 已启动）
     Conflict(String),
+    /// 当前客户端平台不具备所请求的能力。
+    CapabilityUnavailable {
+        capability: String,
+        platform: String,
+        message: String,
+    },
     /// 当前 Turn 前置条件冲突。携带服务端权威 Turn ID，供客户端仅重试一次。
     TurnConflict {
         message: String,
@@ -53,6 +59,10 @@ pub struct ErrorResponseDto {
     pub conflict_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
 }
 
 impl ApiError {
@@ -106,6 +116,7 @@ impl ApiError {
             ApiError::ModelInvocationFailed(_) => "MODEL_INVOCATION_FAILED",
             ApiError::InternalAssemblyError(_) => "INTERNAL_ASSEMBLY_ERROR",
             ApiError::Conflict(_) => "CONFLICT",
+            ApiError::CapabilityUnavailable { .. } => "CAPABILITY_UNAVAILABLE",
             ApiError::TurnConflict { .. } => "TURN_CONFLICT",
         }
     }
@@ -120,6 +131,7 @@ impl ApiError {
             ApiError::ModelInvocationFailed(_) => StatusCode::BAD_GATEWAY,
             ApiError::InternalAssemblyError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::CapabilityUnavailable { .. } => StatusCode::NOT_IMPLEMENTED,
             ApiError::TurnConflict { .. } => StatusCode::CONFLICT,
         }
     }
@@ -134,6 +146,7 @@ impl ApiError {
             ApiError::ModelInvocationFailed(message) => message,
             ApiError::InternalAssemblyError(message) => message,
             ApiError::Conflict(message) => message,
+            ApiError::CapabilityUnavailable { message, .. } => message,
             ApiError::TurnConflict { message, .. } => message,
         }
     }
@@ -144,6 +157,7 @@ impl ApiError {
             ApiError::ModelInvocationFailed(_)
                 | ApiError::InternalAssemblyError(_)
                 | ApiError::Conflict(_)
+                | ApiError::CapabilityUnavailable { .. }
                 | ApiError::TurnConflict { .. }
         )
     }
@@ -188,6 +202,14 @@ impl IntoResponse for ApiError {
             .includes_diagnostic_detail()
             .then(|| public_runtime_excerpt(&private_message, 4096));
         let (conflict_kind, active_turn_id) = self.turn_conflict_context();
+        let (capability, platform) = match &self {
+            ApiError::CapabilityUnavailable {
+                capability,
+                platform,
+                ..
+            } => (Some(capability.clone()), Some(platform.clone())),
+            _ => (None, None),
+        };
         if self.includes_diagnostic_detail() {
             tracing::warn!(
                 error_code,
@@ -201,6 +223,8 @@ impl IntoResponse for ApiError {
             detail,
             conflict_kind,
             active_turn_id,
+            capability,
+            platform,
         };
         (status, Json(body)).into_response()
     }
@@ -363,6 +387,8 @@ mod tests {
             detail: None,
             conflict_kind: None,
             active_turn_id: None,
+            capability: None,
+            platform: None,
         };
         let json = serde_json::to_string(&dto).unwrap();
         assert!(!json.contains("detail"));
@@ -376,6 +402,8 @@ mod tests {
             detail: Some("field 'text' is required".to_string()),
             conflict_kind: None,
             active_turn_id: None,
+            capability: None,
+            platform: None,
         };
         let json = serde_json::to_string(&dto).unwrap();
         assert!(json.contains("detail"));
@@ -400,6 +428,17 @@ mod tests {
         assert_eq!(payload["error_code"], "TURN_CONFLICT");
         assert_eq!(payload["conflict_kind"], "expected_turn_mismatch");
         assert_eq!(payload["active_turn_id"], "turn-current");
+    }
+
+    #[test]
+    fn capability_unavailable_response_exposes_platform_and_capability() {
+        let response = ApiError::CapabilityUnavailable {
+            capability: "desktop_browser_surface".to_string(),
+            platform: "web".to_string(),
+            message: "网页端不能操作真实内置浏览器".to_string(),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[test]

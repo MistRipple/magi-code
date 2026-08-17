@@ -1332,7 +1332,7 @@
   }
 
   .command-environment-command.command-unavailable {
-    color: var(--foreground-subtle);
+    color: var(--foreground-muted);
   }
 
   .command-environment-dot {
@@ -1349,7 +1349,7 @@
 
   .command-environment-empty {
     margin-top: 8px;
-    color: var(--foreground-subtle);
+    color: var(--foreground-muted);
     font-size: 10px;
   }
 
@@ -2030,7 +2030,7 @@
   .skill-row:hover { background: rgba(var(--foreground-rgb), 0.025); }
   .skill-row.disabled .skill-avatar {
     background: var(--surface-3);
-    color: var(--foreground-subtle);
+    color: var(--foreground-muted);
   }
   .skill-row.disabled .skill-desc,
   .skill-row.disabled .skill-meta { opacity: 0.72; }
@@ -2046,7 +2046,7 @@
   .skill-status-tag.error { color: var(--error); background: rgba(var(--error-rgb, 255, 59, 48), 0.1); }
   .skill-status-tag.disabled { color: var(--foreground-muted); background: var(--surface-3); }
   .skill-desc { margin: 3px 0 0; font-size: 11px; color: var(--foreground-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .skill-meta { display: flex; gap: 10px; margin-top: 3px; min-width: 0; font-size: 10px; color: var(--foreground-subtle); }
+  .skill-meta { display: flex; gap: 10px; margin-top: 3px; min-width: 0; font-size: 10px; color: var(--foreground-muted); }
   .skill-meta span { min-width: 0; max-width: 38%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .skill-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; }
   .skill-action-btn { min-width: 28px; height: 28px; padding: 0 8px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--foreground-muted); font: inherit; font-size: 11px; cursor: pointer; }

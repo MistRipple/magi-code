@@ -448,6 +448,18 @@ body.theme-dark,
   /* 页面级滚动防护：与 html/body 双重保险 */
 }
 
+/* Desktop 的唯一 App Renderer 外壳使用主题材质填充窗口边缘和面板间隙。
+   壁纸仍由 body::before 唯一绘制，避免外壳与内容各自 cover 出不同裁切。 */
+[data-magi-desktop-surface='app'] #app {
+  background: var(--magi-desktop-shell-background, var(--magi-canvas)) !important;
+  background-clip: border-box;
+}
+
+/* Overlay 是透明原生兄弟视图，只承载临时菜单和标记交互，不能拥有外壳底色。 */
+[data-magi-desktop-surface='overlay'] #app {
+  background: transparent !important;
+}
+
 /* 滚动条样式 — 精致细窄风格 */
 ::-webkit-scrollbar {
   width: 5px;

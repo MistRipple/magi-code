@@ -109,13 +109,18 @@ export class DesktopControlServer {
         break;
       case "page_updated":
         if (this.#surfaceManager.isPrimary(event.binding)) {
-          this.emit({ type: "page_updated", payload: event.page });
+          this.emit({
+            type: "page_updated",
+            payload: { binding: event.binding, page_state: event.page },
+          });
         }
         break;
       case "page_crashed":
         if (this.#surfaceManager.isPrimary(event.binding)) {
           this.emit({ type: "page_crashed", payload: { binding: event.binding, diagnostic: event.reason } });
         }
+        break;
+      case "page_failed":
         break;
       case "popup_blocked":
         this.emit({ type: "popup_blocked", payload: { tab_id: event.binding.tab_id } });
@@ -185,9 +190,21 @@ export class DesktopControlServer {
       }
       const previous = this.#queues.get(queueKey) ?? Promise.resolve();
       const next = previous.then(run, run);
-      this.#queues.set(queueKey, next);
-      void next.finally(() => {
-        if (this.#queues.get(queueKey) === next) this.#queues.delete(queueKey);
+      // Queue 的尾部必须始终是 fulfilled Promise。这样某条命令因窗口销毁
+      // 或发送失败而 reject 时，后续同 Tab 命令仍能按顺序执行，不会把错误
+      // Promise 永久留在队列里；这里不做重试，只收敛队列生命周期。
+      const tail = next.then(
+        () => undefined,
+        (error) => {
+          console.error("[DesktopControlServer] Browser command queue failed", {
+            tabId: queueKey,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        },
+      );
+      this.#queues.set(queueKey, tail);
+      void tail.then(() => {
+        if (this.#queues.get(queueKey) === tail) this.#queues.delete(queueKey);
       });
     });
     websocket.on("close", () => {
@@ -225,22 +242,26 @@ export class DesktopControlServer {
         return succeeded({ type: "pong", payload: { monotonic_millis: Math.floor(performance.now()) } });
       case "create_page":
       case "restore_page": {
+        const current = this.#surfaceManager.primaryBindingForTab(command.payload.tab_id);
+        // 已物化的逻辑 Tab 始终复用 Primary Surface。只有首个物理 Surface
+        // 尚不存在时，才以当前窗口作为初始放置入口；后续命令不再读取焦点窗口。
+        const windowId = current?.window_id ?? this.#activeWindowId();
         const binding = await this.#surfaceManager.materialize({
-          windowId: this.#activeWindowId(),
+          windowId,
           tabId: command.payload.tab_id,
           browserSessionId: command.payload.browser_session_id,
           initialUrl: command.payload.initial_url,
           navigationRevision: command.payload.navigation_revision,
           viewport: command.payload.logical_viewport,
         });
-        const view = this.#surfaceManager.recordForBinding(binding);
+        const contents = this.#surfaceManager.recordForBinding(binding);
         return succeeded({
           type: "page_state",
           payload: {
             tab_id: binding.tab_id,
-            url: view.webContents.getURL() || "about:blank",
-            origin: safeOrigin(view.webContents.getURL()),
-            title: view.webContents.getTitle(),
+            url: contents.getURL() || "about:blank",
+            origin: safeOrigin(contents.getURL()),
+            title: contents.getTitle(),
             navigation_revision: binding.navigation_revision,
           },
         });
@@ -249,17 +270,17 @@ export class DesktopControlServer {
         await this.#surfaceManager.closeTab(command.payload.tab_id);
         return succeeded({ type: "empty" });
       case "navigate": {
-        const binding = requireBinding(this.#surfaceManager, command.payload.tab_id);
+        const binding = requirePrimaryBinding(this.#surfaceManager, command.payload.tab_id);
         const page = await this.#surfaceManager.navigate(binding, command.payload.navigation);
         return succeeded({ type: "page_state", payload: page });
       }
       case "set_logical_viewport": {
-        const binding = requireBinding(this.#surfaceManager, command.payload.tab_id);
+        const binding = requirePrimaryBinding(this.#surfaceManager, command.payload.tab_id);
         await this.#surfaceManager.setViewport(binding, command.payload.viewport);
         return succeeded({ type: "empty" });
       }
       case "get_logical_viewport": {
-        const binding = requireBinding(this.#surfaceManager, command.payload.tab_id);
+        const binding = requirePrimaryBinding(this.#surfaceManager, command.payload.tab_id);
         const state = this.#surfaceManager.viewportStateForSurface(binding.surface_id);
         if (!state) throw new Error("browser_surface_not_found");
         return succeeded({
@@ -268,7 +289,6 @@ export class DesktopControlServer {
             value: {
               tab_id: binding.tab_id,
               viewport: state.viewport,
-              surface_slot: state.slot,
             },
           },
         });
@@ -285,7 +305,7 @@ export class DesktopControlServer {
       default: {
         const tabId = commandTabId(command);
         if (!tabId) throw new Error("browser_tab_id_missing");
-        const binding = requireBinding(this.#surfaceManager, tabId);
+        const binding = requirePrimaryBinding(this.#surfaceManager, tabId);
         return this.#worker.execute(binding, command);
       }
     }
@@ -323,8 +343,8 @@ function commandTabId(command: BrowserHostCommand): string | null {
     : null;
 }
 
-function requireBinding(manager: BrowserSurfaceManager, tabId: string) {
-  const binding = manager.bindingForTab(tabId);
+function requirePrimaryBinding(manager: BrowserSurfaceManager, tabId: string) {
+  const binding = manager.primaryBindingForTab(tabId);
   if (!binding) throw new Error("browser_surface_not_found");
   return binding;
 }

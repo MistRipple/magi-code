@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { access, readFile } from 'node:fs/promises';
 
-const [mainWeb, runtime, desktopAppearance, desktopMain, desktopPreload, appearanceContract, client, settingsPanel, settingsAppearance, modal, modelConfigForm, enginePicker, knowledgePanel, runtimeStatePanel, settingsRules, settingsTools, webFolderPicker, workbenchShell, globalCss, settingsCss, bridge] = await Promise.all([
+const [mainWeb, runtime, desktopAppearance, desktopMain, desktopPreload, desktopWindowManager, appearanceContract, client, settingsPanel, settingsAppearance, modal, modelConfigForm, enginePicker, knowledgePanel, runtimeStatePanel, settingsRules, settingsTools, webFolderPicker, workbenchShell, globalCss, settingsCss, bridge] = await Promise.all([
   readFile(new URL('../src/main-web.ts', import.meta.url), 'utf8'),
   readFile(new URL('../src/appearance/runtime.ts', import.meta.url), 'utf8'),
   readFile(new URL('../src/lib/desktop-appearance.ts', import.meta.url), 'utf8'),
   readFile(new URL('../../apps/desktop/src/main/index.ts', import.meta.url), 'utf8'),
   readFile(new URL('../../apps/desktop/src/preload/index.ts', import.meta.url), 'utf8'),
+  readFile(new URL('../../apps/desktop/src/main/window-manager.ts', import.meta.url), 'utf8'),
   readFile(new URL('../src/appearance/contract.ts', import.meta.url), 'utf8'),
   readFile(new URL('../src/appearance/client.ts', import.meta.url), 'utf8'),
   readFile(new URL('../src/components/SettingsPanel.svelte', import.meta.url), 'utf8'),
@@ -32,12 +33,23 @@ assert.ok(
 );
 assert.doesNotMatch(runtime, /localStorage\.setItem/, '外观运行时不得把 localStorage 作为主题权威');
 assert.match(runtime, /fetchAppearanceSnapshot[\s\S]*?applyAppearanceSnapshot/, '主题恢复必须从 daemon 快照进入唯一应用链路');
-assert.match(runtime, /synchronizeDesktopAppearance[\s\S]*?backgroundColor: scheme\.background[\s\S]*?mode: nextMode/, '权威主题应用链路必须同步桌面壳背景与实际明暗模式');
+assert.match(runtime, /synchronizeDesktopAppearance[\s\S]*?backgroundColor: desktopAppearance\.nativeBackgroundColor[\s\S]*?accentColor: scheme\.accent[\s\S]*?material: pack\.material[\s\S]*?mode: nextMode/, '权威主题应用链路必须同步桌面外壳的原生底色、强调色、材质与明暗模式');
+assert.match(runtime, /sequence !== applySequence[\s\S]*?emit\(\)/, '异步主题同步返回后必须丢弃过期主题快照');
+assert.match(runtime, /desktopSurface === 'app'[\s\S]*?synchronizeDesktopAppearance/, '透明 Overlay 不得覆盖 App Renderer 已同步的窗口外壳主题');
 assert.match(desktopAppearance, /isDesktopRuntime[\s\S]*?desktop\.setAppearance\(appearance\)/, 'Renderer 必须通过 preload 同步桌面壳外观');
+assert.match(desktopAppearance, /accentColor[\s\S]*?material/, '桌面外观载荷必须包含主题强调色与材质');
 assert.match(desktopPreload, /setAppearance:[\s\S]*?magi-desktop:set-appearance/, 'preload 必须暴露受限外观 IPC');
 assert.match(desktopMain, /nativeTheme\.themeSource = mode[\s\S]*?manager\.setAppearance/, 'Electron Main 必须统一设置原生主题与窗口背景');
+assert.match(desktopWindowManager, /backgroundColor: this\.#appearance\.backgroundColor[\s\S]*?show: false/, '桌面窗口必须先使用当前主题材质并在主题握手前保持隐藏');
+assert.match(desktopWindowManager, /handleRightPaneReady[\s\S]*?record\.window\.show\(\)/, '桌面窗口必须在 App Renderer 完成主题握手后显示');
+assert.match(desktopWindowManager, /this\.#appearance = \{ \.\.\.appearance \}[\s\S]*?for \(const record of this\.#records\.values\(\)/, '主题切换必须同步所有现有桌面窗口并作为新窗口的初始材质');
+assert.match(desktopMain, /isDesktopBackgroundColor[\s\S]*?rgba/, 'Electron Main 必须接受主题材质生成的 rgba 外壳背景');
+assert.match(desktopWindowManager, /setAccentColor[\s\S]*?setBackgroundMaterial[\s\S]*?setVibrancy/, '桌面外壳必须将主题强调色和材质同步到可用的原生窗口层');
 assert.doesNotMatch(desktopAppearance + desktopPreload + desktopMain, /@tauri-apps|getCurrentWebviewWindow/, '外观链路不得保留 Tauri 实现');
 assert.match(runtime, /--magi-surface-dialog[\s\S]*?--magi-surface-popover[\s\S]*?--magi-surface-critical[\s\S]*?--magi-window-overlay[\s\S]*?--magi-popover-overlay[\s\S]*?--magi-critical-overlay/, '主题必须提供完整的语义材质表面');
+assert.match(runtime, /desktopShellBackground[\s\S]*?--magi-desktop-shell-background/, 'Desktop 外壳必须从同一主题配色和材质生成背景令牌');
+assert.match(runtime, /desktopSurface === 'overlay' \? '' : wallpaperUrl/, 'Desktop App Renderer 必须保留整窗壁纸，只有透明 Overlay 禁止重复绘制壁纸');
+assert.match(mainWeb, /desktopSurface === 'app' \|\| desktopSurface === 'overlay'[\s\S]*?magiDesktopSurface/, 'Desktop App 与 Overlay 必须显式声明 Surface 身份以应用统一材质策略');
 assert.match(runtime, /pruneAssetUrls[\s\S]*?URL\.revokeObjectURL/, '切换背景后必须释放未使用的 Blob URL');
 assert.match(runtime, /resolveAppearanceAssetUrl[\s\S]*?referencedAppearanceAssetIds[\s\S]*?library\?\.themes/, '主题卡片与运行时必须共享资源 URL，并按主题库引用统一管理生命周期');
 assert.match(client, /themes\/import[\s\S]*?themes\/\$\{encodeURIComponent\(themeId\)\}\/export/, '用户主题必须支持导入和导出');
@@ -89,7 +101,14 @@ assert.doesNotMatch(
 assert.doesNotMatch(settingsCss, /\.btn-icon\s*\{|\.form-field\s+(?:input|textarea)/, '设置样式不得覆盖全局基础控件外观');
 assert.doesNotMatch(settingsCss, /\.modal-(?:overlay|dialog|header|body|footer)|\.dialog-(?:overlay|content|header|body|footer)/, '设置样式不得保留重复弹窗系统');
 assert.match(globalCss, /body::before[\s\S]*?background-image: var\(--magi-wallpaper-image\)/, '页面根背景必须复用权威壁纸变量');
+assert.match(globalCss, /data-magi-desktop-surface='app'[\s\S]*?magi-desktop-shell-background/, 'Desktop App 外壳必须消费主题材质令牌');
+assert.match(globalCss, /data-magi-desktop-surface='overlay'[\s\S]*?background: transparent !important/, 'Overlay 外壳必须保持透明，不能重复绘制 Desktop 背景');
 assert.match(workbenchShell, /workbench-app-pane" data-testid="workbench-app-pane"[\s\S]*?\.workbench-app-pane \{[\s\S]*?border-radius: var\(--radius-lg\)[\s\S]*?overflow: hidden/, '主对话容器必须具备统一圆角和裁切边界');
+assert.match(
+  workbenchShell,
+  /web-workbench-shell--desktop \.sidebar[\s\S]*?background: transparent;[\s\S]*?web-workbench-shell--desktop \.workbench-content,[\s\S]*?background: transparent;[\s\S]*?web-workbench-shell--desktop \.workbench-app-pane[\s\S]*?background: transparent;/,
+  '桌面三栏子面板必须共享 App Renderer 唯一外壳材质，不能各自叠加一层背景造成断层',
+);
 assert.match(bridge, /eventType === 'appearance\.changed'[\s\S]*?magi:appearanceChanged/, 'daemon 外观事件必须同步到所有窗口');
 
 await assert.rejects(

@@ -118,7 +118,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 75] = [
+    pub const ALL: [Self; 72] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -154,16 +154,13 @@ impl BuiltinToolName {
         Self::BrowserDrag,
         Self::BrowserFillForm,
         Self::BrowserDialog,
-        Self::BrowserUploadFile,
         Self::BrowserClickAt,
         Self::BrowserEvaluate,
         Self::BrowserConsole,
         Self::BrowserNetwork,
         Self::BrowserEmulate,
         Self::BrowserPerformance,
-        Self::BrowserLighthouse,
         Self::BrowserHeap,
-        Self::BrowserThirdParty,
         Self::BrowserWebMcp,
         Self::BrowserPwa,
         Self::DiagramRender,
@@ -387,16 +384,13 @@ impl BuiltinToolName {
             "browser_drag" => Some(Self::BrowserDrag),
             "browser_fill_form" => Some(Self::BrowserFillForm),
             "browser_dialog" => Some(Self::BrowserDialog),
-            "browser_upload_file" => Some(Self::BrowserUploadFile),
             "browser_click_at" => Some(Self::BrowserClickAt),
             "browser_evaluate" => Some(Self::BrowserEvaluate),
             "browser_console" => Some(Self::BrowserConsole),
             "browser_network" => Some(Self::BrowserNetwork),
             "browser_emulate" => Some(Self::BrowserEmulate),
             "browser_performance" => Some(Self::BrowserPerformance),
-            "browser_lighthouse" => Some(Self::BrowserLighthouse),
             "browser_heap" => Some(Self::BrowserHeap),
-            "browser_third_party" => Some(Self::BrowserThirdParty),
             "browser_webmcp" => Some(Self::BrowserWebMcp),
             "browser_pwa" => Some(Self::BrowserPwa),
             "diagram_render" => Some(Self::DiagramRender),
@@ -935,14 +929,16 @@ impl BuiltinToolName {
                 "等待当前页面出现指定文本、选择器或 URL，适合等待异步页面稳定。"
             }
             Self::BrowserHover => "将鼠标悬停到当前浏览器快照中的元素。",
-            Self::BrowserDrag => "把当前浏览器快照中的一个元素拖到另一个元素。",
-            Self::BrowserFillForm => "按快照引用一次性填写多个输入框、选择框、复选框或单选框。",
+            Self::BrowserDrag => {
+                "把当前浏览器快照中的 source 元素拖到 target 元素。两个引用必须来自同一个 snapshot_revision。"
+            }
+            Self::BrowserFillForm => "按 fields 中的统一快照引用一次性填写多个可编辑控件。",
             Self::BrowserDialog => {
                 "列出或处理当前页面待处理的 alert、confirm、prompt 对话框；必须先列出，再用 accept 或 dismiss。"
             }
-            Self::BrowserUploadFile => "通过当前浏览器页面的文件输入控件上传本地文件。",
+            Self::BrowserUploadFile => "当前版本未注册文件上传工具；需要文件授权管线接入后再开放。",
             Self::BrowserClickAt => "在当前浏览器页面的坐标位置点击，支持双击。",
-            Self::BrowserEvaluate => "在当前浏览器页面中执行一个可序列化结果的 JavaScript 函数。",
+            Self::BrowserEvaluate => "在当前浏览器页面中执行 expression，并返回可序列化结果。",
             Self::BrowserConsole => "读取、筛选、查看或清理当前浏览器页面的控制台消息。",
             Self::BrowserNetwork => "读取、筛选、查看请求体或清理当前浏览器页面的网络请求记录。",
             Self::BrowserEmulate => {
@@ -952,10 +948,12 @@ impl BuiltinToolName {
                 "读取性能指标，或启动、停止并分析当前页面的 Chromium 性能追踪。"
             }
             Self::BrowserLighthouse => {
-                "对当前页面执行 Lighthouse 可访问性、SEO、最佳实践和 agentic browsing 审计；不包含性能评分。"
+                "当前版本未注册 Lighthouse 工具；需要真实 Lighthouse 执行引擎接入后再开放。"
             }
             Self::BrowserHeap => "读取当前页面堆和 DOM 计数，或生成可供后续分析的堆快照文件。",
-            Self::BrowserThirdParty => "列出或执行页面通过 window.__dtmcp 暴露的第三方开发工具。",
+            Self::BrowserThirdParty => {
+                "当前版本未注册第三方开发工具；需要真实的页面工具协议接入后再开放。"
+            }
             Self::BrowserWebMcp => "列出或执行页面通过 navigator.modelContext 暴露的 WebMCP 工具。",
             Self::BrowserPwa => {
                 "读取当前 Chromium 页面是否满足 PWA 条件及其安装状态；Magi 不会创建独立应用窗口或修改系统安装状态。"
@@ -1472,20 +1470,20 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "tab_id": { "type": "string" },
-                    "from": { "type": "object", "properties": { "snapshot_revision": { "type": "integer" }, "element_ref": { "type": "string" } }, "required": ["snapshot_revision", "element_ref"] },
-                    "to": { "type": "object", "properties": { "snapshot_revision": { "type": "integer" }, "element_ref": { "type": "string" } }, "required": ["snapshot_revision", "element_ref"] },
+                    "source": { "type": "object", "properties": { "snapshot_revision": { "type": "integer", "minimum": 1 }, "element_ref": { "type": "string", "minLength": 1 } }, "required": ["snapshot_revision", "element_ref"] },
+                    "target": { "type": "object", "properties": { "snapshot_revision": { "type": "integer", "minimum": 1 }, "element_ref": { "type": "string", "minLength": 1 } }, "required": ["snapshot_revision", "element_ref"] },
                     "include_snapshot": { "type": "boolean" }
                 },
-                "required": ["from", "to"]
+                "required": ["source", "target"]
             }),
             Self::BrowserFillForm => serde_json::json!({
                 "type": "object",
                 "properties": {
                     "tab_id": { "type": "string" },
-                    "elements": { "type": "array", "items": { "type": "object", "properties": { "snapshot_revision": { "type": "integer" }, "element_ref": { "type": "string" }, "value": {} }, "required": ["snapshot_revision", "element_ref", "value"] }, "minItems": 1 },
+                    "fields": { "type": "array", "items": { "type": "object", "properties": { "snapshot_revision": { "type": "integer", "minimum": 1 }, "element_ref": { "type": "string", "minLength": 1 }, "value": {}, "replace": { "type": "boolean" } }, "required": ["snapshot_revision", "element_ref", "value"] }, "minItems": 1 },
                     "include_snapshot": { "type": "boolean" }
                 },
-                "required": ["elements"]
+                "required": ["fields"]
             }),
             Self::BrowserDialog => serde_json::json!({
                 "type": "object",
@@ -1522,11 +1520,9 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "tab_id": { "type": "string" },
-                    "function": { "type": "string" },
-                    "args": { "type": "array", "items": {} },
-                    "wait_for_stable_dom": { "type": "boolean" }
+                    "expression": { "type": "string", "minLength": 1, "maxLength": 100000 }
                 },
-                "required": ["function"]
+                "required": ["expression"]
             }),
             Self::BrowserConsole => serde_json::json!({
                 "type": "object",
@@ -2420,7 +2416,7 @@ mod tests {
 
     #[test]
     fn chrome_devtools_reference_tools_have_one_magi_execution_mapping() {
-        // 参考项目的完整模式包含扩展管理等 Magi Native CEF 不提供的能力。
+        // 参考项目的完整模式包含扩展管理等当前 Magi Chromium Host 未开放的能力。
         // Magi 将其余能力聚合到带 action 的浏览器工具中；该映射矩阵防止目录项
         // 只有名称而没有执行路径。
         let mappings = [
@@ -2437,9 +2433,7 @@ mod tests {
             ("hover", BuiltinToolName::BrowserHover, None),
             ("press_key", BuiltinToolName::BrowserPress, None),
             ("type_text", BuiltinToolName::BrowserType, None),
-            ("upload_file", BuiltinToolName::BrowserUploadFile, None),
             ("emulate", BuiltinToolName::BrowserEmulate, None),
-            ("lighthouse_audit", BuiltinToolName::BrowserLighthouse, None),
             (
                 "take_heapsnapshot",
                 BuiltinToolName::BrowserHeap,
@@ -2546,16 +2540,6 @@ mod tests {
             ("take_snapshot", BuiltinToolName::BrowserSnapshot, None),
             ("wait_for", BuiltinToolName::BrowserWaitFor, None),
             (
-                "list_3p_developer_tools",
-                BuiltinToolName::BrowserThirdParty,
-                Some("list"),
-            ),
-            (
-                "execute_3p_developer_tool",
-                BuiltinToolName::BrowserThirdParty,
-                Some("execute"),
-            ),
-            (
                 "list_webmcp_tools",
                 BuiltinToolName::BrowserWebMcp,
                 Some("list"),
@@ -2576,7 +2560,7 @@ mod tests {
                 Some("get"),
             ),
         ];
-        assert_eq!(mappings.len(), 47);
+        assert_eq!(mappings.len(), 43);
         for (reference_name, magi_name, action) in mappings {
             assert_eq!(
                 BuiltinToolName::from_name(magi_name.as_str()),

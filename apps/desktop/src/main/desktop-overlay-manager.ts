@@ -1,13 +1,11 @@
-import { randomUUID } from "node:crypto";
-import type { BaseWindow, Rectangle, WebContentsView } from "electron";
+import type { BaseWindow, Rectangle, View, WebContentsView } from "electron";
 import { WebContentsView as ElectronWebContentsView } from "electron";
 import type { WindowLayoutSnapshot } from "./window-layout.js";
 
 export type DesktopOverlayPlacement =
   | "right-pane-add"
   | "browser-viewport"
-  | "browser-annotations"
-  | "browser-content";
+  | "browser-annotations";
 
 export interface DesktopOverlayItem {
   id: string;
@@ -32,6 +30,7 @@ export interface DesktopOverlayState {
   phase: "menu" | "select" | "comment";
   ownerId: string;
   placement: DesktopOverlayPlacement;
+  anchorBounds: Rectangle | null;
   title: string;
   items: DesktopOverlayItem[];
   fields: DesktopOverlayField[];
@@ -50,23 +49,26 @@ interface OverlayRecord {
   windowId: string;
   window: BaseWindow;
   view: WebContentsView;
+  layer: View;
   state: DesktopOverlayState | null;
   visible: boolean;
   loaded: boolean;
+  loadFailed: boolean;
   ready: boolean;
+  mounted: boolean;
+  browserContentBounds: Rectangle | null;
+  loadPromise: Promise<void> | null;
 }
 
 const OVERLAY_WIDTH: Record<DesktopOverlayPlacement, number> = {
   "right-pane-add": 184,
   "browser-viewport": 264,
   "browser-annotations": 320,
-  "browser-content": 1,
 };
 
 export class DesktopOverlayManager {
   readonly #preloadPath: string;
   readonly #agentOrigin: string;
-  readonly #windows: Map<string, BaseWindow>;
   readonly #records = new Map<string, OverlayRecord>();
   readonly #onAction: (windowId: string, action: DesktopOverlayAction) => void;
   readonly #onClosed: (windowId: string) => void;
@@ -74,18 +76,16 @@ export class DesktopOverlayManager {
   constructor(input: {
     preloadPath: string;
     agentOrigin: string;
-    windows: Map<string, BaseWindow>;
     onAction: (windowId: string, action: DesktopOverlayAction) => void;
     onClosed: (windowId: string) => void;
   }) {
     this.#preloadPath = input.preloadPath;
     this.#agentOrigin = input.agentOrigin;
-    this.#windows = input.windows;
     this.#onAction = input.onAction;
     this.#onClosed = input.onClosed;
   }
 
-  create(windowId: string, window: BaseWindow): void {
+  create(windowId: string, window: BaseWindow, layer: View): void {
     if (this.#records.has(windowId)) return;
     const view = new ElectronWebContentsView({
       webPreferences: {
@@ -105,46 +105,86 @@ export class DesktopOverlayManager {
       windowId,
       window,
       view,
+      layer,
       state: null,
       visible: false,
       loaded: false,
+      loadFailed: false,
       ready: false,
+      mounted: false,
+      browserContentBounds: null,
+      loadPromise: null,
     };
     this.#records.set(windowId, record);
-    window.contentView.addChildView(view);
-    view.setVisible(false);
+    // OverlayLayer 固定存在于窗口层级中，但空闲时必须隐藏整个层，不能
+    // 让一个没有子内容的原生 View 覆盖 App Renderer 的交互区域。
+    this.syncVisibility(record);
+    view.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    view.webContents.on("will-navigate", (event, url) => {
+      if (!this.isTrustedRendererUrl(url, windowId)) event.preventDefault();
+    });
     view.webContents.on("did-finish-load", () => {
+      if (record.loadFailed) return;
       record.loaded = true;
-      if (record.state && record.visible) this.publishState(record);
+      this.syncVisibility(record);
+      if (record.state && record.visible && record.ready) this.publishState(record);
+    });
+    view.webContents.on("did-fail-load", (_event, _errorCode, _errorDescription, _validatedURL, isMainFrame) => {
+      if (!isMainFrame) return;
+      record.loaded = false;
+      record.ready = false;
+      record.loadFailed = true;
+      this.syncVisibility(record);
     });
     view.webContents.on("render-process-gone", () => {
+      record.loaded = false;
       record.ready = false;
+      record.loadFailed = true;
+      this.syncVisibility(record);
       if (record.visible && !window.isDestroyed()) {
-        try {
-          view.webContents.reload();
-        } catch {
-          // 进程退出竞态由下一次打开 Overlay 时重新加载处理。
-        }
+        void this.loadRenderer(record);
       }
     });
-    void view.webContents.loadURL(this.rendererUrl(windowId)).catch(() => undefined);
+    void this.loadRenderer(record);
   }
 
-  open(windowId: string, state: DesktopOverlayState, layout: WindowLayoutSnapshot): void {
+  async restoreAfterDaemonReady(): Promise<void> {
+    const failed = [...this.#records.values()].filter((record) => (
+      record.loadFailed && !record.view.webContents.isDestroyed()
+    ));
+    await Promise.all(failed.map((record) => this.loadRenderer(record)));
+  }
+
+  open(
+    windowId: string,
+    state: DesktopOverlayState,
+    layout: WindowLayoutSnapshot,
+    browserContentBounds: Rectangle | null = null,
+  ): void {
     const record = this.requireRecord(windowId);
-    const bounds = overlayBounds(layout, state);
     record.state = state;
     record.visible = true;
-    record.window.contentView.addChildView(record.view);
-    record.view.setBounds(bounds);
-    record.view.setVisible(true);
+    record.browserContentBounds = browserContentBounds ? { ...browserContentBounds } : null;
+    this.mountOnLayer(record);
+    record.view.setBounds(overlayBounds(layout, state, record.browserContentBounds));
+    this.syncVisibility(record);
+    if (record.loadFailed && !record.view.webContents.isDestroyed()) {
+      // Overlay Renderer 可能在 daemon/Vite 刚重启的瞬间加载失败。下一次
+      // 打开必须主动重试，不能把一次瞬时失败永久变成“按钮无响应”。
+      void this.loadRenderer(record);
+    }
     if (record.loaded && record.ready) this.publishState(record);
   }
 
   handleReady(windowId: string): void {
     const record = this.#records.get(windowId);
-    if (!record || !record.loaded || record.view.webContents.isDestroyed()) return;
+    // Renderer 的握手可能早于 did-finish-load 事件抵达主进程。就绪是
+    // Renderer 自身的状态，不能因为主进程尚未刷新 loaded 标记而丢弃；
+    // syncVisibility 会在两个状态都满足后再显示视图，did-finish-load
+    // 也会负责补发当前状态。
+    if (!record || record.loadFailed || record.view.webContents.isDestroyed()) return;
     record.ready = true;
+    this.syncVisibility(record);
     if (record.visible && record.state) this.publishState(record);
   }
 
@@ -153,18 +193,45 @@ export class DesktopOverlayManager {
     if (!record) return;
     record.visible = false;
     record.state = null;
-    record.view.setVisible(false);
+    record.browserContentBounds = null;
+    if (!record.view.webContents.isDestroyed()) {
+      record.view.webContents.send("magi-desktop:overlay-closed", null);
+    }
+    this.syncVisibility(record);
+    // 仅隐藏会让原生 Accessibility 树继续保留已关闭菜单并让焦点停在
+    // Overlay Renderer。移除视图但保留 WebContents，下一次打开仍复用同一
+    // Renderer，不会重建页面或引入闪烁。
+    if (record.mounted) {
+      record.layer.removeChildView(record.view);
+      record.mounted = false;
+    }
     this.#onClosed(windowId);
   }
 
-  updateLayout(windowId: string, layout: WindowLayoutSnapshot): void {
+  updateLayout(
+    windowId: string,
+    layout: WindowLayoutSnapshot,
+    browserContentBounds: Rectangle | null = null,
+  ): void {
     const record = this.#records.get(windowId);
     if (!record || !record.visible || !record.state) return;
-    if (!layout.rightPaneBounds) {
+    record.browserContentBounds = browserContentBounds ? { ...browserContentBounds } : null;
+    // rightPaneBounds 是几何轨道，即使右栏当前折叠也会存在；可见性必须
+    // 由 rightPaneVisible 判断。切换到其他面板时，浏览器弹出层也必须
+    // 立即关闭，避免旧菜单留在主 Renderer 之外继续拦截输入。
+    const browserOverlay = record.state.ownerId.startsWith("browser:");
+    if (
+      !layout.rightPaneVisible
+      || (browserOverlay && layout.activePanelKind !== "browser")
+      || (browserOverlay && layout.activeTabId !== record.state.ownerId.slice("browser:".length))
+      || (record.state.kind === "annotation" && !record.browserContentBounds)
+    ) {
       this.close(windowId);
       return;
     }
-    record.view.setBounds(overlayBounds(layout, record.state));
+    this.mountOnLayer(record);
+    record.view.setBounds(overlayBounds(layout, record.state, record.browserContentBounds));
+    this.syncVisibility(record);
   }
 
   handleAction(windowId: string, action: DesktopOverlayAction): void {
@@ -205,8 +272,14 @@ export class DesktopOverlayManager {
     const record = this.#records.get(windowId);
     if (!record) return;
     record.visible = false;
+    record.state = null;
+    record.browserContentBounds = null;
+    this.syncVisibility(record);
+    if (!record.window.isDestroyed() && record.mounted) {
+      record.layer.removeChildView(record.view);
+      record.mounted = false;
+    }
     if (!record.view.webContents.isDestroyed()) record.view.webContents.close();
-    if (!record.window.isDestroyed()) record.window.contentView.removeChildView(record.view);
     this.#records.delete(windowId);
   }
 
@@ -215,8 +288,70 @@ export class DesktopOverlayManager {
   }
 
   private publishState(record: OverlayRecord): void {
-    if (!record.state || record.view.webContents.isDestroyed()) return;
+    if (
+      !record.state
+      || !record.visible
+      || !record.loaded
+      || !record.ready
+      || record.loadFailed
+      || record.view.webContents.isDestroyed()
+    ) return;
     record.view.webContents.send("magi-desktop:overlay-state", record.state);
+  }
+
+  private async loadRenderer(record: OverlayRecord): Promise<void> {
+    if (record.window.isDestroyed() || record.view.webContents.isDestroyed()) return;
+    if (record.loadPromise) return record.loadPromise;
+    record.loaded = false;
+    record.ready = false;
+    record.loadFailed = false;
+    const load = (async () => {
+      try {
+        await record.view.webContents.loadURL(this.rendererUrl(record.windowId));
+        if (record.window.isDestroyed() || record.view.webContents.isDestroyed()) return;
+        record.loaded = true;
+        record.loadFailed = false;
+        this.syncVisibility(record);
+        if (record.state && record.visible && record.ready) this.publishState(record);
+      } catch {
+        if (record.window.isDestroyed() || record.view.webContents.isDestroyed()) return;
+        record.loaded = false;
+        record.ready = false;
+        record.loadFailed = true;
+        this.syncVisibility(record);
+      }
+    })();
+    record.loadPromise = load;
+    await load.finally(() => {
+      if (record.loadPromise === load) record.loadPromise = null;
+    });
+  }
+
+  private syncVisibility(record: OverlayRecord): void {
+    if (record.window.isDestroyed()) return;
+    const visible = (
+      !record.view.webContents.isDestroyed()
+      && record.visible
+      && record.loaded
+      && record.ready
+      && !record.loadFailed
+    );
+    record.layer.setVisible(visible);
+    record.view.setVisible(visible);
+    if (visible && !record.view.webContents.isFocused()) record.view.webContents.focus();
+  }
+
+  private mountOnLayer(record: OverlayRecord): void {
+    if (record.window.isDestroyed()) return;
+    if (!record.mounted) {
+      // Overlay WebContentsView 只允许作为 OverlayLayer 的子视图存在，
+      // 这样它不会绕过主 Renderer 的右栏框架。
+      record.layer.addChildView(record.view);
+      record.mounted = true;
+    }
+    // OverlayLayer 在 WindowManager 创建窗口时就以固定的最后层级挂在
+    // contentView 上。这里只挂载 Overlay WebContentsView，不重新插入
+    // OverlayLayer，避免原生层级在窗口拖动/重排时被重复重建。
   }
 
   private rendererUrl(windowId: string): string {
@@ -226,6 +361,18 @@ export class DesktopOverlayManager {
     return url.href;
   }
 
+  private isTrustedRendererUrl(value: string, windowId: string): boolean {
+    try {
+      const url = new URL(value);
+      return url.origin === this.#agentOrigin
+        && url.pathname === "/web.html"
+        && url.searchParams.get("desktopSurface") === "overlay"
+        && url.searchParams.get("desktopWindowId") === windowId;
+    } catch {
+      return false;
+    }
+  }
+
   private requireRecord(windowId: string): OverlayRecord {
     const record = this.#records.get(windowId);
     if (!record || record.window.isDestroyed()) throw new Error("desktop_overlay_not_found");
@@ -233,14 +380,25 @@ export class DesktopOverlayManager {
   }
 }
 
-function overlayBounds(layout: WindowLayoutSnapshot, state: DesktopOverlayState): Rectangle {
-  if (state.placement === "browser-content") {
-    if (!layout.browserSurfaceBounds) throw new Error("desktop_overlay_browser_surface_unavailable");
-    return { ...layout.browserSurfaceBounds };
+function overlayBounds(
+  layout: WindowLayoutSnapshot,
+  state: DesktopOverlayState,
+  browserContentBounds: Rectangle | null,
+): Rectangle {
+  // 标记选择和备注编辑都属于当前页面内容，不是顶部菜单。二者使用同一
+  // Browser 内容槽，选择框与最终截图才会保持相同坐标系。
+  if (state.kind === "annotation") {
+    if (!browserContentBounds) throw new Error("desktop_overlay_browser_content_unavailable");
+    return { ...browserContentBounds };
   }
   const pane = layout.rightPaneBounds;
   if (!pane) throw new Error("desktop_overlay_right_pane_unavailable");
-  const width = Math.min(OVERLAY_WIDTH[state.placement], Math.max(160, pane.width - 12));
+  const anchor = state.anchorBounds;
+  if (!anchor) throw new Error("desktop_overlay_anchor_unavailable");
+  const width = Math.min(
+    OVERLAY_WIDTH[state.placement],
+    Math.max(160, pane.width - 12),
+  );
   const itemHeight = 32;
   const fieldHeight = 58;
   const contentHeight = 12
@@ -248,9 +406,21 @@ function overlayBounds(layout: WindowLayoutSnapshot, state: DesktopOverlayState)
     + state.fields.length * fieldHeight
     + (state.items.length > 0 && state.fields.length > 0 ? 8 : 0);
   const height = Math.min(420, Math.max(42, contentHeight));
-  const x = pane.x + pane.width - width - 4;
-  const y = state.placement === "right-pane-add"
-    ? pane.y + 38
-    : pane.y + 1 + 38 + 36;
+  const paneRight = pane.x + pane.width;
+  const paneBottom = pane.y + pane.height;
+  const x = clamp(
+    anchor.x + anchor.width - width,
+    pane.x + 4,
+    paneRight - width - 4,
+  );
+  const below = anchor.y + anchor.height + 4;
+  const above = anchor.y - height - 4;
+  const y = below + height <= paneBottom - 4
+    ? below
+    : Math.max(pane.y + 4, above);
   return { x, y, width, height };
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(Math.max(minimum, maximum), Math.max(minimum, value));
 }

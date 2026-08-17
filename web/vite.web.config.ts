@@ -73,6 +73,8 @@ export default defineConfig(({ mode }) => {
       exclude: ['mermaid'],
       include: [
         '@braintree/sanitize-url',
+        '@xterm/addon-fit',
+        '@xterm/xterm',
         'cytoscape-cose-bilkent',
         'cytoscape-fcose',
         'dayjs',

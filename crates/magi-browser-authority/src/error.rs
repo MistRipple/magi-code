@@ -104,6 +104,8 @@ pub enum BrowserAuthorityError {
         tab_id: BrowserTabId,
         surface_id: String,
     },
+    #[error("browser surface binding is invalid")]
+    InvalidSurfaceBinding,
     #[error("browser lease goal binding does not match the current execution")]
     GoalBindingMismatch,
     #[error("browser lease owner does not match the current execution")]

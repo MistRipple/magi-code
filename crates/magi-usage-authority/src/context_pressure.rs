@@ -165,36 +165,39 @@ pub struct ContextPressureSnapshot {
     pub observed_at: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextPressureProjection {
+    pub session_id: String,
+    pub thread_id: Option<String>,
+    pub model: ModelIdentitySnapshot,
+    pub policy: ContextBudgetPolicy,
+    pub provider_context_tokens: Option<u64>,
+    pub projected_request_tokens: u64,
+    pub measurement: ContextMeasurement,
+    pub anchor_call_id: Option<String>,
+    pub checkpoint_generation: u64,
+    pub observed_at: u64,
+}
+
 impl ContextPressureSnapshot {
-    pub fn from_projected(
-        session_id: impl Into<String>,
-        thread_id: Option<String>,
-        model: ModelIdentitySnapshot,
-        policy: ContextBudgetPolicy,
-        provider_context_tokens: Option<u64>,
-        projected_request_tokens: u64,
-        measurement: ContextMeasurement,
-        anchor_call_id: Option<String>,
-        checkpoint_generation: u64,
-        observed_at: u64,
-    ) -> Self {
+    pub fn from_projected(input: ContextPressureProjection) -> Self {
         Self {
-            session_id: session_id.into(),
-            thread_id,
-            model,
-            context_window_tokens: policy.context_window_tokens,
-            provider_context_tokens,
-            projected_request_tokens,
-            response_reserve_tokens: policy.response_reserve_tokens,
-            recovery_buffer_tokens: policy.recovery_buffer_tokens,
-            proactive_threshold_tokens: policy.proactive_threshold_tokens,
-            hard_request_limit_tokens: policy.hard_request_limit_tokens,
-            retained_history_target_tokens: policy.retained_history_target_tokens,
-            measurement,
-            pressure_level: policy.level_for(projected_request_tokens),
-            anchor_call_id,
-            checkpoint_generation,
-            observed_at,
+            session_id: input.session_id,
+            thread_id: input.thread_id,
+            model: input.model,
+            context_window_tokens: input.policy.context_window_tokens,
+            provider_context_tokens: input.provider_context_tokens,
+            projected_request_tokens: input.projected_request_tokens,
+            response_reserve_tokens: input.policy.response_reserve_tokens,
+            recovery_buffer_tokens: input.policy.recovery_buffer_tokens,
+            proactive_threshold_tokens: input.policy.proactive_threshold_tokens,
+            hard_request_limit_tokens: input.policy.hard_request_limit_tokens,
+            retained_history_target_tokens: input.policy.retained_history_target_tokens,
+            measurement: input.measurement,
+            pressure_level: input.policy.level_for(input.projected_request_tokens),
+            anchor_call_id: input.anchor_call_id,
+            checkpoint_generation: input.checkpoint_generation,
+            observed_at: input.observed_at,
         }
     }
 

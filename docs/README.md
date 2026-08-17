@@ -17,8 +17,8 @@
 
 ## 运行入口
 
-- `apps/desktop` 是 Windows、Linux、macOS 的 Electron/Chromium 桌面产品入口，负责原生窗口、WebContentsView、单实例、布局和进程生命周期。
-- `magi-daemon` 是唯一业务内核。桌面端通过受控 sidecar 启动它，Magi UI 与内置浏览器共用同一 Chromium Desktop Host；浏览器自动化通过私有 Desktop Control 协议接管现有 Surface。
+- `apps/desktop` 是 Windows、Linux、macOS 的 Electron/Chromium 桌面产品入口，负责原生窗口、单实例、布局和进程生命周期。主 Renderer 管理右栏 DOM；当前 Browser Tab 由 Main 进程创建的原生 `WebContentsView` 绑定到右栏当前内容槽，Main 同时负责 Chromium 页面生命周期与自动化控制。
+- `magi-daemon` 是唯一业务内核。桌面端通过受控 sidecar 启动它，Magi UI 与内置浏览器共用同一 Chromium Desktop Host；浏览器自动化通过私有 Desktop Control 协议接管当前 Browser WebContents。
 - 主窗口关闭后默认隐藏到系统托盘，daemon 继续运行；只有托盘中的“退出 Magi”或操作系统显式退出动作会触发优雅关闭。
 - `magi-daemon-app` 仅保留为开发和无头部署入口，不参与桌面安装包，也不复制桌面宿主逻辑。
 
@@ -35,6 +35,8 @@ npm --prefix web run build
 npm run build
 npm run desktop:dev
 ```
+
+`desktop:dev` 只连接已经由 `scripts/dev-daemon.sh` 启动的 daemon，不会再启动第二个 daemon；正式发行包才由 Electron Main 自己托管 daemon sidecar。
 
 发布统一由 Electron Builder 生成 macOS Apple Silicon/Intel DMG、Linux AppImage/Deb 与 Windows NSIS 安装器，旧手工包装脚本已移除。
 

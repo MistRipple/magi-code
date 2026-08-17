@@ -71,7 +71,11 @@
     rightPaneState,
     getRightPaneState,
     openCodeTab,
+    setActiveRightPaneTabFromDesktop,
+    pendingBrowserTabIntentFor,
+    clearPendingBrowserTabIntent,
     setRightPaneCollapsed,
+    type BrowserTabPayload,
     type CodeTabPayload,
   } from '../stores/right-pane.svelte';
   import {
@@ -96,11 +100,13 @@
   let { desktopAppSurface = false }: Props = $props();
 
   // 这些 storage key 必须先于下方 `$state` 初始化器声明——它们被
-  // readInitialExpandedWorkspaces / readInitialSidebarMode / readInitialRecentSessionsCollapsed
+  // readInitialExpandedWorkspaces / readInitialSidebarMode / readInitialWorkspacesCollapsed /
+  // readInitialRecentSessionsCollapsed
   // 在 $state 初始化时读取，
   // 普通的 const 受 TDZ 约束，定义在文件下方会触发 ReferenceError。
   const SIDEBAR_EXPANDED_WORKSPACES_KEY = 'magi-sidebar-expanded-workspaces';
   const SIDEBAR_MODE_KEY = 'magi-sidebar-mode';
+  const SIDEBAR_WORKSPACES_COLLAPSED_KEY = 'magi-sidebar-workspaces-collapsed';
   const SIDEBAR_RECENT_SESSIONS_COLLAPSED_KEY = 'magi-sidebar-recent-sessions-collapsed';
 
   let loading = $state(true);
@@ -114,6 +120,7 @@
   let recentSessions = $state<Session[]>([]);
   let loadingWorkspaceIds = $state<Record<string, boolean>>({});
   let expandedWorkspaceIds = $state<Record<string, boolean>>(readInitialExpandedWorkspaces());
+  let workspacesCollapsed = $state(readInitialWorkspacesCollapsed());
   let recentSessionsCollapsed = $state(readInitialRecentSessionsCollapsed());
   let workspaceSelectionPending = $state(false);
   let viewportWidth = $state(typeof window !== 'undefined' ? window.innerWidth : 1440);
@@ -143,8 +150,30 @@
   let previewPanelWidth = $state<number | null>(null);
   let isPreviewPanelResizing = $state(false);
   let desktopRightPaneVisible = $state(false);
+  let desktopSnapshot = $state<MagiDesktopWindowSnapshot | null>(null);
+  let pendingDesktopRightPaneWidth: number | null = null;
+  let desktopRightPaneResizeFrame: number | null = null;
   let desktopSnapshotEpoch = '';
   let desktopSnapshotRevision = -1;
+  type DesktopVisibilityTarget = {
+    scopeKey: string;
+    visible: boolean;
+  };
+  type DesktopVisibilitySyncRequest = DesktopVisibilityTarget & {
+    requestId: number;
+  };
+  type DesktopVisibilitySyncFailure = DesktopVisibilityTarget & {
+    desktopEpoch: string;
+    snapshotRevision: number;
+  };
+  // 右栏可见性只允许一条 IPC 请求在途。这个状态不是 UI 状态：
+  // - target 来自当前 Renderer 的 rightPaneState；
+  // - acknowledged 来自 Main 返回/推送的 desktopSnapshot；
+  // - 下一次请求必须等待上一条请求完成，避免旧响应覆盖新意图。
+  let desktopVisibilitySyncRequest: DesktopVisibilitySyncRequest | null = null;
+  let desktopVisibilitySyncFailure: DesktopVisibilitySyncFailure | null = null;
+  let desktopVisibilityRequestId = 0;
+  let desktopVisibilitySyncEpoch = $state(0);
   let sidebarElement = $state<HTMLElement | null>(null);
   let desktopDropIndicator = $state<{
     zone: DesktopDropZone;
@@ -164,7 +193,12 @@
     selectedFilePath?: string | null;
     onFileSelect?: (selection: WorkspaceFileSelection) => void;
   };
-  type RightPaneProps = { workspaceRoot: string; overlay?: boolean; desktopSurface?: boolean };
+  type RightPaneProps = {
+    workspaceRoot: string;
+    overlay?: boolean;
+    desktopSurface?: boolean;
+    desktopSnapshot?: MagiDesktopWindowSnapshot | null;
+  };
   type WebFolderPickerProps = {
     title?: string;
     onSelect: (selection: WorkspaceFileSelection) => void;
@@ -227,7 +261,9 @@
   const COMPACT_SIDEBAR_WIDTH = 240;
   const MIN_SIDEBAR_WIDTH = 220;
   const MAX_SIDEBAR_WIDTH = 520;
-  const DEFAULT_PREVIEW_PANEL_WIDTH = 360;
+  // Desktop Main 的默认右栏宽度是 480px。Renderer 在快照到达前也使用同一
+  // 个值，避免首帧先按 360px 排版、再跳到 Main 的宽度而造成窗口闪动。
+  const DEFAULT_PREVIEW_PANEL_WIDTH = 480;
   const SESSION_NAME_MAX_CHARS = 40;
 
   const selectedWorkspace = $derived(
@@ -261,15 +297,25 @@
   const shellLayoutStyle = $derived([
     sidebarWidth ? `--sidebar-width: ${sidebarWidth}px` : '',
     previewPanelWidth ? `--preview-panel-width: ${previewPanelWidth}px` : '',
+    desktopSnapshot?.layout.rightPaneWidth
+      ? `--desktop-right-pane-width: ${desktopSnapshot.layout.rightPaneWidth}px`
+      : '',
     `--workbench-min-content-width: ${PANEL_LAYOUT.minContentWidth}px`,
     `--preview-min-width: ${PANEL_LAYOUT.minPreviewWidth}px`,
     `--preview-handle-width: ${PANEL_LAYOUT.previewHandleWidth}px`,
+    `--shell-padding: ${PANEL_LAYOUT.shellPadding}px`,
+    `--shell-gap: ${PANEL_LAYOUT.shellGap}px`,
+    `--desktop-right-pane-divider-width: ${PANEL_LAYOUT.previewHandleWidth}px`,
   ].filter(Boolean).join('; '));
 
   const effectiveSidebarWidth = $derived(
     sidebarWidth ?? (viewportWidth <= 1120 ? COMPACT_SIDEBAR_WIDTH : DEFAULT_SIDEBAR_WIDTH)
   );
-  const effectivePreviewPanelWidth = $derived(previewPanelWidth ?? DEFAULT_PREVIEW_PANEL_WIDTH);
+  const effectivePreviewPanelWidth = $derived(
+    desktopAppSurface
+      ? (desktopSnapshot?.layout.rightPaneWidth ?? DEFAULT_PREVIEW_PANEL_WIDTH)
+      : (previewPanelWidth ?? DEFAULT_PREVIEW_PANEL_WIDTH),
+  );
   const panelLayout = $derived(resolvePanelLayout({
     viewportWidth,
     sidebarWidth: effectiveSidebarWidth,
@@ -279,19 +325,73 @@
 
   /** 当前 session 的右栏多 tab 状态；由 right-pane store 派生 */
   const activeRightPaneState = $derived(getRightPaneState(rightPaneState.activeScopeKey));
+  $effect(() => {
+    if (!desktopAppSurface || desktopSnapshot?.layout.activePanelKind !== 'browser') return;
+    const logicalTabId = desktopSnapshot.layout.activeTabId?.trim() || '';
+    if (!logicalTabId) return;
+    const pane = activeRightPaneState;
+    const target = pane.openTabs.find((tab) => (
+      tab.kind === 'browser'
+      && (tab.payload as BrowserTabPayload).tabId === logicalTabId
+    ));
+    const pendingTabId = pendingBrowserTabIntentFor(rightPaneState.activeScopeKey);
+    if (pendingTabId) {
+      if (pendingTabId === logicalTabId) {
+        clearPendingBrowserTabIntent(rightPaneState.activeScopeKey, pendingTabId);
+      }
+      // 用户已经选择了另一个 Browser Tab，等待 Main 完成同一激活事务。
+      // 这里不能用旧 desktopSnapshot 把选择项写回去，否则每次点击都会
+      // 立刻跳回旧 Tab，表现为“浏览器 Tab 无法切换”。
+      return;
+    }
+    if (target && pane.activeTabId !== target.id) {
+      setActiveRightPaneTabFromDesktop(rightPaneState.activeScopeKey, target.id);
+    }
+  });
   /** Desktop 的窗口布局以 Main snapshot 为准；Web 客户端仍使用本地面板状态。 */
   const rightPaneVisible = $derived(
     desktopAppSurface ? desktopRightPaneVisible : !activeRightPaneState.collapsed,
   );
   const inlineRightPaneVisible = $derived(!desktopAppSurface && rightPaneVisible);
+  const desktopRightPaneOverlay = $derived(
+    desktopAppSurface
+      && rightPaneVisible
+      && desktopSnapshot?.layout.rightPaneMode === 'overlay',
+  );
   const panelVisibility = $derived(resolvePanelVisibility({
     sidebarDrawer: sidebarIsDrawer,
     panelsCanCoexist: panelLayout.panelsCanCoexist,
     sidebarPreferredOpen: !sidebarCollapsed,
     sidebarDrawerOpen: sidebarOpen,
-    rightPaneOpen: inlineRightPaneVisible,
+    rightPaneOpen: rightPaneVisible,
   }));
   const sidebarHidden = $derived(!sidebarIsDrawer && !panelVisibility.sidebarVisible);
+
+  function applyDesktopSnapshot(snapshot: MagiDesktopWindowSnapshot): boolean {
+    if (
+      snapshot.desktopEpoch === desktopSnapshotEpoch
+      && snapshot.snapshotRevision < desktopSnapshotRevision
+    ) {
+      return false;
+    }
+    desktopSnapshotEpoch = snapshot.desktopEpoch;
+    desktopSnapshotRevision = snapshot.snapshotRevision;
+    desktopSnapshot = snapshot;
+    desktopRightPaneVisible = snapshot.layout.rightPaneVisible;
+    // Main 已经产生了新的确认快照，之前针对旧快照的失败状态不再阻塞
+    // 当前目标；是否需要再次提交由下面的单向状态机重新判断。
+    desktopVisibilitySyncFailure = null;
+    return true;
+  }
+
+  function sameDesktopVisibilityTarget(
+    left: DesktopVisibilityTarget | null,
+    right: DesktopVisibilityTarget,
+  ): boolean {
+    return Boolean(left)
+      && left?.scopeKey === right.scopeKey
+      && left.visible === right.visible;
+  }
   /** 项目文件树高亮：active code tab 的 filepath */
   const activeCodeTabFilePath = $derived.by<string>(() => {
     if (!activeRightPaneState.activeTabId) return '';
@@ -308,11 +408,11 @@
         sidebarMode = 'projects';
       });
     }
-    if (inlineRightPaneVisible) {
+    if (inlineRightPaneVisible || (desktopAppSurface && desktopRightPaneVisible)) {
       void loadRightPane().catch((error) => {
         console.error('[WebWorkbenchShell] 右侧面板加载失败:', error);
         addToast('error', i18n.t('app.featureLoadFailed'));
-        setRightPaneCollapsed(rightPaneState.activeScopeKey, true);
+        if (!desktopAppSurface) setRightPaneCollapsed(rightPaneState.activeScopeKey, true);
       });
     }
     if (workspaceOnboardingState.open) {
@@ -915,6 +1015,24 @@
     return window.localStorage.getItem(SIDEBAR_RECENT_SESSIONS_COLLAPSED_KEY) === '1';
   }
 
+  function readInitialWorkspacesCollapsed(): boolean {
+    if (typeof window === 'undefined') return false;
+    return window.localStorage.getItem(SIDEBAR_WORKSPACES_COLLAPSED_KEY) === '1';
+  }
+
+  function persistWorkspacesCollapsed(): void {
+    if (typeof window === 'undefined') return;
+    try {
+      if (workspacesCollapsed) {
+        window.localStorage.setItem(SIDEBAR_WORKSPACES_COLLAPSED_KEY, '1');
+      } else {
+        window.localStorage.removeItem(SIDEBAR_WORKSPACES_COLLAPSED_KEY);
+      }
+    } catch {
+      // 持久化失败不影响当前导航状态。
+    }
+  }
+
   function persistRecentSessionsCollapsed(): void {
     if (typeof window === 'undefined') return;
     try {
@@ -947,9 +1065,16 @@
   $effect(() => {
     persistRecentSessionsCollapsed();
   });
+  $effect(() => {
+    persistWorkspacesCollapsed();
+  });
 
   function toggleRecentSessions(): void {
     recentSessionsCollapsed = !recentSessionsCollapsed;
+  }
+
+  function toggleWorkspaces(): void {
+    workspacesCollapsed = !workspacesCollapsed;
   }
 
   function resetSidebarWidth(): void {
@@ -1017,6 +1142,87 @@
 
     window.addEventListener('pointermove', handlePointerMove);
     window.addEventListener('pointerup', handlePointerUp);
+  }
+
+  function submitPendingDesktopRightPaneWidth(): void {
+    desktopRightPaneResizeFrame = null;
+    const width = pendingDesktopRightPaneWidth;
+    pendingDesktopRightPaneWidth = null;
+    if (width === null || !window.magiDesktop) return;
+    void window.magiDesktop.submitLayoutIntent({ type: 'right_pane_width', width })
+      .catch((error) => console.warn('[WebWorkbenchShell] 调整桌面右栏宽度失败:', error));
+  }
+
+  function resetDesktopRightPaneWidth(): void {
+    if (!desktopAppSurface) return;
+    void window.magiDesktop?.submitLayoutIntent({ type: 'right_pane_reset_width' })
+      .catch((error) => console.warn('[WebWorkbenchShell] 重置桌面右栏宽度失败:', error));
+  }
+
+  function startDesktopRightPaneResize(event: PointerEvent): void {
+    if (!desktopAppSurface) return;
+    if (!window.magiDesktop) return;
+    if (desktopSnapshot?.layout.rightPaneMode === 'overlay') return;
+    const handle = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+    if (!handle) return;
+    // Main 与 Renderer 使用同一个定义：这里的宽度只代表右栏内容轨道，
+    // 分隔条和 shell 外边距不再混入拖动值。
+    const widthBounds = resolvePreviewPanelWidthBounds({
+      viewportWidth,
+      sidebarWidth: effectiveSidebarWidth,
+      sidebarVisible: panelVisibility.sidebarVisible,
+      rightPaneOpen: true,
+      previewOverlay: false,
+    });
+    const minWidth = widthBounds.minWidth;
+    const maxWidth = widthBounds.maxWidth;
+    const initialWidth = Math.round(
+      desktopSnapshot?.layout.rightPaneWidth ?? DEFAULT_PREVIEW_PANEL_WIDTH,
+    );
+    if (!initialWidth) return;
+    event.preventDefault();
+    isPreviewPanelResizing = true;
+    const startClientX = event.clientX;
+    const pointerId = event.pointerId;
+    let stopped = false;
+    try {
+      handle.setPointerCapture(pointerId);
+    } catch {
+      // 指针捕获不是所有桌面 WebView 都支持，窗口级监听仍是唯一拖拽事件源。
+    }
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    const move = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
+      pendingDesktopRightPaneWidth = Math.min(
+        maxWidth,
+        Math.max(minWidth, initialWidth - (moveEvent.clientX - startClientX)),
+      );
+      if (desktopRightPaneResizeFrame === null) {
+        desktopRightPaneResizeFrame = requestAnimationFrame(submitPendingDesktopRightPaneWidth);
+      }
+    };
+    const stop = (stopEvent: PointerEvent) => {
+      if (stopEvent.pointerId !== pointerId) return;
+      if (stopped) return;
+      stopped = true;
+      isPreviewPanelResizing = false;
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', stop);
+      window.removeEventListener('pointercancel', stop);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      if (desktopRightPaneResizeFrame !== null) cancelAnimationFrame(desktopRightPaneResizeFrame);
+      submitPendingDesktopRightPaneWidth();
+      try {
+        if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
+      } catch {
+        // 捕获未建立时无需释放。
+      }
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop);
+    window.addEventListener('pointercancel', stop);
   }
 
   /**
@@ -1663,13 +1869,11 @@
 
   function requestRightPaneVisibility(visible: boolean): void {
     if (desktopAppSurface) {
-      const desktop = window.magiDesktop;
-      if (!desktop) {
-        console.error('[WebWorkbenchShell] Desktop preload bridge 不可用');
-        return;
-      }
-      void desktop.submitLayoutIntent({ type: 'right_pane_visibility', visible })
-        .catch((error) => console.warn('[WebWorkbenchShell] 更新桌面右栏布局失败:', error));
+      // Renderer 只提交本地意图；下面唯一的 desktop visibility effect 负责
+      // IPC，避免一次点击产生两次 layoutRevision 和两次 Surface 重排。
+      desktopVisibilitySyncFailure = null;
+      desktopVisibilitySyncEpoch += 1;
+      setRightPaneCollapsed(rightPaneState.activeScopeKey, !visible);
       return;
     }
     setRightPaneCollapsed(rightPaneState.activeScopeKey, !visible);
@@ -1827,10 +2031,60 @@
     if (!desktopAppSurface) return;
     const scopeKey = rightPaneState.activeScopeKey;
     const pane = getRightPaneState(scopeKey);
-    const collapsed = !desktopRightPaneVisible;
-    if (pane.collapsed !== collapsed) {
-      setRightPaneCollapsed(scopeKey, collapsed);
+    const desiredVisible = !pane.collapsed;
+    const target: DesktopVisibilityTarget = { scopeKey, visible: desiredVisible };
+    void desktopVisibilitySyncEpoch;
+    const snapshot = desktopSnapshot;
+    if (!snapshot) return;
+
+    // 快照已经确认当前目标时进入 idle。即使快照先于 IPC Promise 到达，
+    // 也不能提前清理在途请求，否则下一次用户操作会与旧请求并发。
+    if (desktopRightPaneVisible === desiredVisible) {
+      return;
     }
+
+    const failure = desktopVisibilitySyncFailure;
+    if (
+      failure
+      && sameDesktopVisibilityTarget(failure, target)
+      && failure.desktopEpoch === desktopSnapshotEpoch
+      && failure.snapshotRevision === desktopSnapshotRevision
+    ) {
+      // 当前 Main 快照和目标都没有变化时，失败请求保持 failed，避免
+      // IPC 异常触发反馈式重试；用户下一次显式点击会清除该状态。
+      return;
+    }
+
+    // 在途请求必须先完成。目标若已变化，只保留 rightPaneState 中的最新
+    // 目标，完成回调通过 syncEpoch 触发下一轮收敛，避免响应乱序。
+    if (desktopVisibilitySyncRequest) return;
+
+    const desktop = window.magiDesktop;
+    if (!desktop) return;
+    const request: DesktopVisibilitySyncRequest = {
+      ...target,
+      requestId: ++desktopVisibilityRequestId,
+    };
+    desktopVisibilitySyncRequest = request;
+    void desktop.submitLayoutIntent({
+      type: 'right_pane_visibility',
+      visible: desiredVisible,
+    }).then((nextSnapshot) => {
+      if (desktopVisibilitySyncRequest?.requestId !== request.requestId) return;
+      applyDesktopSnapshot(nextSnapshot);
+      desktopVisibilitySyncRequest = null;
+      desktopVisibilitySyncEpoch += 1;
+    }).catch((error) => {
+      if (desktopVisibilitySyncRequest?.requestId !== request.requestId) return;
+      desktopVisibilitySyncFailure = {
+        ...request,
+        desktopEpoch: desktopSnapshotEpoch,
+        snapshotRevision: desktopSnapshotRevision,
+      };
+      desktopVisibilitySyncRequest = null;
+      desktopVisibilitySyncEpoch += 1;
+      console.warn('[WebWorkbenchShell] 恢复桌面右栏可见性失败:', error);
+    });
   });
 
   onMount(() => {
@@ -1840,26 +2094,24 @@
       throw new Error('desktop_preload_bridge_unavailable');
     }
     let disposed = false;
-    const applySnapshot = (snapshot: MagiDesktopWindowSnapshot) => {
-      if (
-        snapshot.desktopEpoch === desktopSnapshotEpoch
-        && snapshot.snapshotRevision < desktopSnapshotRevision
-      ) {
-        return;
-      }
-      desktopSnapshotEpoch = snapshot.desktopEpoch;
-      desktopSnapshotRevision = snapshot.snapshotRevision;
-      desktopRightPaneVisible = snapshot.layout.rightPaneVisible;
-    };
     void desktop.getSnapshot().then((snapshot) => {
-      if (!disposed) applySnapshot(snapshot);
+      if (!disposed) applyDesktopSnapshot(snapshot);
     }).catch((error) => {
       if (!disposed) console.error('[WebWorkbenchShell] 获取桌面窗口快照失败:', error);
     });
-    const stopSnapshot = desktop.onSnapshot(applySnapshot);
+    const stopSnapshot = desktop.onSnapshot(applyDesktopSnapshot);
+    // 这只是 App Renderer 的首次绘制/窗口显示握手，不携带任何右栏 Tab
+    // 或面板意图；右栏状态仍由本地 rightPaneState 唯一管理。
+    void desktop.readyRightPane().catch((error) => {
+      if (!disposed) console.error('[WebWorkbenchShell] 桌面 Renderer 就绪握手失败:', error);
+    });
     return () => {
       disposed = true;
       stopSnapshot();
+      if (desktopRightPaneResizeFrame !== null) {
+        cancelAnimationFrame(desktopRightPaneResizeFrame);
+        desktopRightPaneResizeFrame = null;
+      }
     };
   });
 
@@ -1988,8 +2240,11 @@
   class:web-workbench-shell--sidebar-drawer={sidebarIsDrawer}
   class:web-workbench-shell--sidebar-open={sidebarIsDrawer && sidebarOpen}
   class:web-workbench-shell--sidebar-hidden={sidebarHidden}
+  class:web-workbench-shell--desktop={desktopAppSurface}
   class:web-workbench-shell--preview-overlay={previewIsOverlay}
   class:web-workbench-shell--has-preview={inlineRightPaneVisible}
+  class:web-workbench-shell--desktop-right-pane-visible={desktopAppSurface && desktopRightPaneVisible}
+  class:web-workbench-shell--desktop-preview-overlay={desktopRightPaneOverlay}
   class:web-workbench-shell--resizing={isSidebarResizing || isPreviewPanelResizing}
   class:web-workbench-shell--sidebar-resizing={isSidebarResizing}
   class:web-workbench-shell--preview-resizing={isPreviewPanelResizing}
@@ -2066,7 +2321,20 @@
       {#if sidebarMode === 'projects'}
         <section class="sidebar-section sidebar-section--workspaces">
         <div class="section-title-row">
-          <div class="section-title">{i18n.t('common.workspace')}</div>
+          <button
+            type="button"
+            class="section-title-toggle"
+            aria-expanded={!workspacesCollapsed}
+            aria-controls="workspace-section-content"
+            aria-label={workspacesCollapsed ? i18n.t('web.expandWorkspaces') : i18n.t('web.collapseWorkspaces')}
+            title={workspacesCollapsed ? i18n.t('web.expandWorkspaces') : i18n.t('web.collapseWorkspaces')}
+            onclick={toggleWorkspaces}
+          >
+            <span class="section-title">{i18n.t('common.workspace')}</span>
+            <span class="section-title-chevron" class:section-title-chevron--collapsed={workspacesCollapsed} aria-hidden="true">
+              <Icon name="chevronDown" size={11} />
+            </span>
+          </button>
           <button
             type="button"
             class="sidebar-icon-btn sidebar-icon-btn--compact"
@@ -2079,6 +2347,8 @@
             <Icon name="list" size={13} />
           </button>
         </div>
+        <div id="workspace-section-content">
+        {#if !workspacesCollapsed}
         {#if loading}
           <div class="sidebar-empty">{i18n.t('common.loading')}</div>
         {:else if agentRecovering}
@@ -2271,6 +2541,8 @@
             {/each}
           </div>
         {/if}
+        {/if}
+        </div>
         </section>
       {:else}
         <section class="sidebar-section sidebar-section--file-tree-mode">
@@ -2395,7 +2667,7 @@
       class:workbench-body--overlay-preview={inlineRightPaneVisible && previewIsOverlay}
     >
       <div class="workbench-app-pane" data-testid="workbench-app-pane">
-        <App {desktopAppSurface} />
+        <App />
       </div>
       {#if inlineRightPaneVisible && RightPaneComponent}
         {#if !previewIsOverlay}
@@ -2412,6 +2684,27 @@
           workspaceRoot={selectedWorkspace?.rootPath || ''}
           overlay={previewIsOverlay}
         />
+      {:else if desktopAppSurface && desktopRightPaneVisible && RightPaneComponent}
+        {#if !desktopRightPaneOverlay}
+          <div
+            class="desktop-right-pane-resize-handle"
+            role="separator"
+            aria-orientation="vertical"
+            title={i18n.t('web.filePreviewResizeReset')}
+            onpointerdown={startDesktopRightPaneResize}
+            ondblclick={resetDesktopRightPaneWidth}
+          ></div>
+        {/if}
+        <div
+          class="desktop-right-pane-column"
+          class:desktop-right-pane-column--overlay={desktopRightPaneOverlay}
+        >
+          <RightPaneComponent
+            workspaceRoot={selectedWorkspace?.rootPath || ''}
+            overlay={desktopRightPaneOverlay}
+            desktopSurface={true}
+          />
+        </div>
       {/if}
     </div>
   </main>
@@ -2483,15 +2776,89 @@
   .web-workbench-shell {
     display: grid;
     grid-template-columns: var(--sidebar-width, 320px) minmax(0, 1fr);
-    gap: 8px;
-    height: 100vh;
-    width: 100vw;
-    padding: 8px;
+    gap: var(--shell-gap, 8px);
+    height: 100%;
+    width: 100%;
+    padding: var(--shell-padding, 8px);
     box-sizing: border-box;
     background: transparent;
     color: var(--foreground);
     isolation: isolate;
     overflow: hidden;
+  }
+
+  .web-workbench-shell--desktop-right-pane-visible .workbench-body {
+    grid-template-columns:
+      minmax(var(--workbench-min-content-width, 448px), 1fr)
+      var(--desktop-right-pane-divider-width, 8px)
+      minmax(var(--preview-min-width, 320px), var(--desktop-right-pane-width, 480px));
+  }
+
+  .web-workbench-shell--desktop-preview-overlay .workbench-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .web-workbench-shell--desktop-right-pane-visible .workbench-app-pane {
+    grid-column: 1;
+  }
+
+  .desktop-right-pane-resize-handle {
+    grid-column: 2;
+    position: relative;
+    z-index: 2;
+    min-width: 0;
+    min-height: 0;
+    cursor: col-resize;
+    touch-action: none;
+  }
+
+  .desktop-right-pane-resize-handle::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    width: 1px;
+    margin: 0 auto;
+    background: var(--border);
+    opacity: 0.72;
+  }
+
+  .desktop-right-pane-resize-handle:hover {
+    background: color-mix(in srgb, var(--primary) 8%, transparent);
+  }
+
+  .desktop-right-pane-column {
+    grid-column: 3;
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .desktop-right-pane-column--overlay {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: var(--z-overlay-preview);
+    grid-column: auto;
+    width: min(var(--desktop-right-pane-width, 480px), 100%);
+    border-left: 1px solid var(--border);
+    background: var(--magi-desktop-shell-background, var(--magi-canvas));
+  }
+
+  .desktop-right-pane-column :global(.right-pane) {
+    box-sizing: border-box;
+    width: 100%;
+    height: 100%;
+  }
+
+  .web-workbench-shell--desktop .desktop-right-pane-column :global(.right-pane) {
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
   }
 
   .desktop-drop-overlay {
@@ -3076,7 +3443,7 @@
 
   .workspace-new-session-btn:disabled {
     cursor: default;
-    color: var(--foreground-subtle);
+    color: var(--foreground-muted);
   }
 
   .workspace-row:hover .workspace-new-session-btn:disabled,
@@ -3435,6 +3802,30 @@
     z-index: 2;
   }
 
+  .web-workbench-shell--desktop {
+    gap: 0;
+    padding: 0;
+    background: transparent;
+  }
+
+  .web-workbench-shell--desktop .sidebar {
+    border: 0;
+    border-right: 1px solid var(--border);
+    border-radius: 0;
+    background: transparent;
+  }
+
+  .web-workbench-shell--desktop .workbench-content,
+  .web-workbench-shell--desktop .workbench-body {
+    background: transparent;
+  }
+
+  .web-workbench-shell--desktop .workbench-app-pane {
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+  }
+
   .preview-resize-handle::before {
     content: '';
     position: absolute;
@@ -3487,9 +3878,9 @@
 
   .web-workbench-shell--sidebar-drawer .sidebar {
     position: fixed;
-    top: 8px;
-    left: 8px;
-    bottom: 8px;
+    top: 0;
+    left: 0;
+    bottom: 0;
     width: min(86vw, 320px);
     max-width: 320px;
     z-index: var(--z-overlay-sidebar);

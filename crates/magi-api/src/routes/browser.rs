@@ -6,18 +6,18 @@ use std::{
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header::USER_AGENT},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use magi_browser_authority::{
     BrowserAnnotation, BrowserAnnotationAnchor, BrowserAnnotationAuthor, BrowserAnnotationKind,
-    BrowserAnnotationStatus, BrowserElementAnnotationAnchor, BrowserHostCommand,
+    BrowserAnnotationStatus, BrowserAuthority, BrowserElementAnnotationAnchor, BrowserHostCommand,
     BrowserHostCommandOutcome, BrowserHostCommandResult, BrowserHostControl,
-    BrowserHostControlUpdate, BrowserHostHitTest, BrowserHostRect, BrowserNavigation,
-    BrowserNormalizedRect, BrowserRegionAnnotationAnchor, BrowserSession, BrowserSessionLifecycle,
-    BrowserSurfaceControlSnapshot, BrowserTab, BrowserTabLifecycle, BrowserViewport,
-    CreateBrowserSession, CreateBrowserTab, validate_browser_navigation_url,
+    BrowserHostControlUpdate, BrowserHostHitTest, BrowserHostRect, BrowserHostStatus,
+    BrowserNavigation, BrowserNormalizedRect, BrowserRegionAnnotationAnchor, BrowserSession,
+    BrowserSessionLifecycle, BrowserSurfaceControlSnapshot, BrowserTab, BrowserTabLifecycle,
+    BrowserViewport, CreateBrowserSession, CreateBrowserTab, validate_browser_navigation_url,
 };
 use magi_core::{
     BrowserAnnotationId, BrowserProfileId, BrowserSessionId, BrowserTabId, EventId, SessionId,
@@ -30,7 +30,7 @@ use serde_json::Value;
 use crate::{
     errors::ApiError,
     routes::session_scope::{self, SessionScope},
-    state::ApiState,
+    state::{ApiState, BrowserHostConnectionConfig, BrowserHostStatusSnapshot},
 };
 
 static BROWSER_SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -43,6 +43,12 @@ pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/browser/capabilities", get(capabilities))
         .route("/browser/settings", post(update_browser_settings))
+        .route(
+            "/browser/desktop/connection",
+            get(get_desktop_connection)
+                .post(register_desktop_connection)
+                .delete(clear_desktop_connection),
+        )
         .route("/browser/sessions", post(create_session))
         .route("/browser/sessions/current", get(get_current_session))
         .route("/browser/sessions/{browser_session_id}", get(get_session))
@@ -74,6 +80,118 @@ pub fn routes() -> Router<ApiState> {
             "/browser/annotations/{annotation_id}/artifact",
             get(annotation_artifact),
         )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesktopConnectionRequest {
+    socket_path: String,
+    auth_token: String,
+    desktop_epoch: String,
+    parent_pid: u32,
+    expected_generation: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesktopConnectionClearRequest {
+    desktop_epoch: String,
+    parent_pid: u32,
+    generation: u64,
+}
+
+async fn get_desktop_connection(
+    State(state): State<ApiState>,
+) -> Json<BrowserCapabilitiesResponse> {
+    Json(browser_capabilities_response(
+        &state,
+        None,
+        BrowserClientPlatform::Desktop,
+    ))
+}
+
+async fn register_desktop_connection(
+    State(state): State<ApiState>,
+    Json(request): Json<DesktopConnectionRequest>,
+) -> Result<Json<BrowserCapabilitiesResponse>, ApiError> {
+    let socket_path = bounded_connection_value(request.socket_path, "socketPath")?;
+    let auth_token = bounded_connection_value(request.auth_token, "authToken")?;
+    let desktop_epoch = bounded_connection_value(request.desktop_epoch, "desktopEpoch")?;
+    if request.parent_pid == 0 {
+        return Err(ApiError::InvalidInput("parentPid 必须是正整数".to_string()));
+    }
+    let candidate = BrowserHostConnectionConfig {
+        socket_path,
+        auth_token,
+        desktop_epoch,
+        parent_pid: request.parent_pid,
+        generation: 0,
+    };
+    let (_, changed) = state
+        .register_browser_host_connection(candidate, request.expected_generation)
+        .map_err(|error| match error {
+            crate::state::BrowserHostConnectionRegistrationError::Conflict {
+                current_generation,
+            } => ApiError::Conflict(format!(
+                "桌面浏览器连接所有权冲突，当前代次为 {current_generation}"
+            )),
+        })?;
+    if changed {
+        let previous = state.browser_host_status();
+        state.set_browser_host_status(BrowserHostStatusSnapshot {
+            revision: previous.revision,
+            in_app_browser_enabled: previous.in_app_browser_enabled,
+            browser_use_enabled: previous.browser_use_enabled,
+            status: BrowserHostStatus::Starting,
+            protocol_compatible: false,
+            last_error_code: None,
+        });
+    }
+    Ok(Json(browser_capabilities_response(
+        &state,
+        None,
+        BrowserClientPlatform::Desktop,
+    )))
+}
+
+async fn clear_desktop_connection(
+    State(state): State<ApiState>,
+    Json(request): Json<DesktopConnectionClearRequest>,
+) -> Result<Json<BrowserCapabilitiesResponse>, ApiError> {
+    let desktop_epoch = bounded_connection_value(request.desktop_epoch, "desktopEpoch")?;
+    if request.parent_pid == 0 {
+        return Err(ApiError::InvalidInput("parentPid 必须是正整数".to_string()));
+    }
+    let current = state.browser_host_connection_config();
+    if current.as_ref().is_some_and(|config| {
+        config.desktop_epoch == desktop_epoch
+            && config.parent_pid == request.parent_pid
+            && config.generation == request.generation
+    }) {
+        state.set_browser_host_connection_config(None);
+        let previous = state.browser_host_status();
+        state.set_browser_host_status(BrowserHostStatusSnapshot {
+            revision: previous.revision,
+            in_app_browser_enabled: previous.in_app_browser_enabled,
+            browser_use_enabled: previous.browser_use_enabled,
+            status: BrowserHostStatus::Stopped,
+            protocol_compatible: false,
+            last_error_code: None,
+        });
+    }
+    Ok(Json(browser_capabilities_response(
+        &state,
+        None,
+        BrowserClientPlatform::Desktop,
+    )))
+}
+
+fn bounded_connection_value(value: String, field: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 4096 {
+        return Err(ApiError::InvalidInput(format!("{field} 无效")));
+    }
+    Ok(value.to_string())
 }
 
 fn browser_annotation_artifact_path(
@@ -206,6 +324,80 @@ pub(crate) fn resolve_browser_annotation_context(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BrowserCapabilitiesQuery {
     session_id: Option<String>,
+    client_platform: Option<BrowserClientPlatform>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum BrowserClientPlatform {
+    Desktop,
+    #[default]
+    Web,
+    #[serde(rename = "mobile-web")]
+    MobileWeb,
+}
+
+impl BrowserClientPlatform {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Desktop => "desktop",
+            Self::Web => "web",
+            Self::MobileWeb => "mobile-web",
+        }
+    }
+
+    fn is_desktop(self) -> bool {
+        matches!(self, Self::Desktop)
+    }
+}
+
+fn request_client_platform(
+    headers: &HeaderMap,
+    declared: Option<BrowserClientPlatform>,
+) -> BrowserClientPlatform {
+    if let Some(platform) = declared {
+        return platform;
+    }
+    let user_agent = headers
+        .get(USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if user_agent.contains("Electron/") {
+        BrowserClientPlatform::Desktop
+    } else if user_agent
+        .as_bytes()
+        .windows(6)
+        .any(|window| window.eq_ignore_ascii_case(b"mobile"))
+    {
+        BrowserClientPlatform::MobileWeb
+    } else {
+        BrowserClientPlatform::Web
+    }
+}
+
+fn require_desktop_browser_capability(
+    headers: &HeaderMap,
+    declared: Option<BrowserClientPlatform>,
+) -> Result<(), ApiError> {
+    let platform = request_client_platform(headers, declared);
+    if platform.is_desktop() {
+        return Ok(());
+    }
+    Err(ApiError::CapabilityUnavailable {
+        capability: "desktop_browser_surface".to_string(),
+        platform: platform.label().to_string(),
+        message: "真实内置浏览器仅在 Magi Desktop 中可用，Web 和移动 Web 端仅支持浏览器记录"
+            .to_string(),
+    })
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserPlatformCapabilities {
+    desktop_browser_surface: bool,
+    browser_records: bool,
+    browser_annotations: bool,
+    browser_remote_surface: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -219,6 +411,8 @@ struct BrowserCapabilitiesResponse {
     access_profile: magi_core::AccessProfile,
     host_state: String,
     last_error_code: Option<String>,
+    desktop_connection_generation: u64,
+    platform_capabilities: BrowserPlatformCapabilities,
 }
 
 async fn capabilities(
@@ -226,27 +420,45 @@ async fn capabilities(
     Query(query): Query<BrowserCapabilitiesQuery>,
 ) -> Json<BrowserCapabilitiesResponse> {
     let session_id = query.session_id.as_deref().map(SessionId::new);
-    Json(browser_capabilities_response(&state, session_id.as_ref()))
+    Json(browser_capabilities_response(
+        &state,
+        session_id.as_ref(),
+        query.client_platform.unwrap_or_default(),
+    ))
 }
 
 fn browser_capabilities_response(
     state: &ApiState,
     session_id: Option<&SessionId>,
+    client_platform: BrowserClientPlatform,
 ) -> BrowserCapabilitiesResponse {
-    let capability = state.browser_capability_snapshot(session_id);
     let host = state.browser_host_status();
+    let capability = state.browser_capability_snapshot(session_id);
     BrowserCapabilitiesResponse {
-        revision: capability.revision,
+        revision: host.revision,
         in_app_browser_enabled: capability.in_app_browser_enabled,
         browser_use_enabled: capability.browser_use_enabled,
-        host_status: capability.host_status,
-        host_protocol_compatible: capability.host_protocol_compatible,
+        host_status: host.status,
+        host_protocol_compatible: host.protocol_compatible,
         access_profile: capability.access_profile,
         host_state: serde_json::to_value(host.status)
             .ok()
             .and_then(|value| value.as_str().map(ToOwned::to_owned))
             .unwrap_or_else(|| "stopped".to_string()),
         last_error_code: host.last_error_code,
+        desktop_connection_generation: state.browser_host_connection_generation(),
+        platform_capabilities: browser_platform_capabilities(client_platform),
+    }
+}
+
+fn browser_platform_capabilities(
+    client_platform: BrowserClientPlatform,
+) -> BrowserPlatformCapabilities {
+    BrowserPlatformCapabilities {
+        desktop_browser_surface: matches!(client_platform, BrowserClientPlatform::Desktop),
+        browser_records: true,
+        browser_annotations: true,
+        browser_remote_surface: false,
     }
 }
 
@@ -255,6 +467,7 @@ fn browser_capabilities_response(
 struct UpdateBrowserSettingsRequest {
     in_app_browser_enabled: bool,
     browser_use_enabled: bool,
+    client_platform: Option<BrowserClientPlatform>,
 }
 
 async fn update_browser_settings(
@@ -265,7 +478,8 @@ async fn update_browser_settings(
         request.in_app_browser_enabled,
         request.browser_use_enabled,
     )?;
-    let response = browser_capabilities_response(&state, None);
+    let response =
+        browser_capabilities_response(&state, None, request.client_platform.unwrap_or_default());
     state.event_bus.publish(EventEnvelope::system(
         EventId::new(format!(
             "event-browser-settings-updated-{}",
@@ -290,6 +504,8 @@ struct CreateBrowserSessionRequest {
     #[serde(default)]
     workspace_path: Option<String>,
     session_id: String,
+    #[serde(default)]
+    client_platform: Option<BrowserClientPlatform>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,7 +539,6 @@ struct BrowserSessionResponse {
     session_id: SessionId,
     profile_id: BrowserProfileId,
     lifecycle: BrowserSessionLifecycle,
-    active_tab_id: Option<BrowserTabId>,
     tabs: Vec<BrowserTabResponse>,
     runtime_epoch: u64,
     revision: u64,
@@ -543,8 +758,10 @@ impl From<BrowserTab> for BrowserTabResponse {
 
 async fn create_session(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(request): Json<CreateBrowserSessionRequest>,
 ) -> Result<(StatusCode, Json<BrowserSessionResponse>), ApiError> {
+    require_desktop_browser_capability(&headers, request.client_platform)?;
     let (scope, session_id) = validate_session_scope(
         &state,
         request.scope,
@@ -717,6 +934,8 @@ async fn close_session(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateBrowserTabRequest {
     initial_url: String,
+    #[serde(default)]
+    client_platform: Option<BrowserClientPlatform>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -759,17 +978,11 @@ struct UpdateBrowserAnnotationCommentRequest {
 async fn create_tab(
     State(state): State<ApiState>,
     Path(browser_session_id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<CreateBrowserTabRequest>,
 ) -> Result<(StatusCode, Json<BrowserTabResponse>), ApiError> {
+    require_desktop_browser_capability(&headers, request.client_platform)?;
     let browser_session_id = BrowserSessionId::new(browser_session_id);
-    let session = state
-        .browser_authority
-        .lock()
-        .expect("browser authority lock poisoned")
-        .session(&browser_session_id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("浏览器会话不存在", browser_session_id.as_str()))?;
-    ensure_browser_ui_ready(&state, &session.session_id)?;
     let session = wait_for_browser_session_ready(&state, &browser_session_id).await?;
     validate_navigation_url(&request.initial_url)?;
     let now = UtcMillis::now();
@@ -778,7 +991,6 @@ async fn create_tab(
         now.0,
         BROWSER_TAB_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    let client = require_browser_host(&state)?;
     let created = state.mutate_browser_authority(|authority| {
         authority.create_tab(CreateBrowserTab {
             tab_id: tab_id.clone(),
@@ -787,56 +999,9 @@ async fn create_tab(
             now,
         })
     })?;
-    let page_state = match require_host_success(
-        client
-            .request(BrowserHostCommand::CreatePage {
-                tab_id: tab_id.clone(),
-                browser_session_id: browser_session_id.clone(),
-                initial_url: request.initial_url,
-                logical_viewport: magi_browser_authority::BrowserLogicalViewport::Auto,
-                navigation_revision: created.navigation_revision,
-                snapshot_revision: created.snapshot_revision,
-                allow_page_eviction: true,
-            })
-            .await,
-        "创建浏览器页面失败",
-    ) {
-        Ok(BrowserHostCommandResult::PageState(page_state)) => page_state,
-        Ok(_) => {
-            let _ = state.mutate_browser_authority(|authority| {
-                authority.transition_tab(&tab_id, BrowserTabLifecycle::Closed, UtcMillis::now())
-            });
-            return Err(ApiError::InternalAssemblyError(
-                "浏览器 Host 创建页面结果缺少页面状态".to_string(),
-            ));
-        }
-        Err(error) => {
-            let _ = state.mutate_browser_authority(|authority| {
-                authority.transition_tab(&tab_id, BrowserTabLifecycle::Closed, UtcMillis::now())
-            });
-            return Err(error);
-        }
-    };
-    let tab = state.mutate_browser_authority(|authority| {
-        authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, UtcMillis::now())?;
-        authority.apply_host_page_state(
-            &tab_id,
-            page_state.navigation_revision,
-            page_state.url,
-            page_state.origin,
-            page_state.title,
-            UtcMillis::now(),
-        )
-    });
-    let tab = match tab {
-        Ok(tab) => tab,
-        Err(error) => {
-            let _ = state.mutate_browser_authority(|authority| {
-                authority.transition_tab(&tab_id, BrowserTabLifecycle::Closed, UtcMillis::now())
-            });
-            return Err(error);
-        }
-    };
+    // 浏览器页面由 Electron Main 持有的 WebContentsView 承载，并且只绑定
+    // 当前桌面右栏 Browser Tab 的内容槽。先发布逻辑 Tab，再要求 Host 物化
+    // 真实 Chromium 页面，使统一 App Renderer 可以立即渲染加载状态。
     publish_browser_event(
         &state,
         "browser.tab.created",
@@ -845,10 +1010,169 @@ async fn create_tab(
         serde_json::json!({
             "browser_session_id": browser_session_id,
             "tab_id": tab_id,
-            "url": tab.url,
+            "url": created.url.clone(),
+            "lifecycle": created.lifecycle.clone(),
         }),
     );
-    Ok((StatusCode::CREATED, Json(tab.into())))
+    // HTTP 创建只负责提交逻辑 Tab，不能等待 Host 的首帧。
+    // Host 通过私有控制通道异步完成 Chromium Page 物化；这样逻辑 Tab、
+    // 右栏选择器和主窗口布局不会被网络导航或 Renderer 首次布局阻塞。
+    let state_for_host = state.clone();
+    let created_response = created.clone();
+    let workspace_id = session.workspace_id.clone();
+    let session_id = session.session_id.clone();
+    let browser_session_id_for_host = browser_session_id.clone();
+    let tab_id_for_host = tab_id.clone();
+    let initial_url = request.initial_url;
+    let client = state.browser_host_client();
+    tokio::spawn(async move {
+        let Some(client) = client else {
+            finish_browser_tab_creation(
+                &state_for_host,
+                &workspace_id,
+                &session_id,
+                &browser_session_id_for_host,
+                &tab_id_for_host,
+                "桌面浏览器控制通道尚未启动",
+            );
+            return;
+        };
+        let result = client
+            .request(BrowserHostCommand::CreatePage {
+                tab_id: tab_id_for_host.clone(),
+                browser_session_id: browser_session_id_for_host.clone(),
+                initial_url,
+                logical_viewport: magi_browser_authority::BrowserLogicalViewport::Auto,
+                navigation_revision: created.navigation_revision,
+                snapshot_revision: created.snapshot_revision,
+                allow_page_eviction: true,
+            })
+            .await;
+        let page_state = match result {
+            Ok(reply) => match reply.response.outcome {
+                BrowserHostCommandOutcome::Succeeded(result) => match *result {
+                    BrowserHostCommandResult::PageState(page_state) => page_state,
+                    _ => {
+                        finish_browser_tab_creation(
+                            &state_for_host,
+                            &workspace_id,
+                            &session_id,
+                            &browser_session_id_for_host,
+                            &tab_id_for_host,
+                            "浏览器 Host 创建页面结果缺少页面状态",
+                        );
+                        return;
+                    }
+                },
+                BrowserHostCommandOutcome::Failed(error)
+                | BrowserHostCommandOutcome::Indeterminate(error) => {
+                    finish_browser_tab_creation(
+                        &state_for_host,
+                        &workspace_id,
+                        &session_id,
+                        &browser_session_id_for_host,
+                        &tab_id_for_host,
+                        &format!("{} ({})", error.message, error.code),
+                    );
+                    return;
+                }
+                BrowserHostCommandOutcome::Cancelled => {
+                    finish_browser_tab_creation(
+                        &state_for_host,
+                        &workspace_id,
+                        &session_id,
+                        &browser_session_id_for_host,
+                        &tab_id_for_host,
+                        "浏览器 Host 创建页面已取消",
+                    );
+                    return;
+                }
+            },
+            Err(error) => {
+                finish_browser_tab_creation(
+                    &state_for_host,
+                    &workspace_id,
+                    &session_id,
+                    &browser_session_id_for_host,
+                    &tab_id_for_host,
+                    &error.to_string(),
+                );
+                return;
+            }
+        };
+        let tab = state_for_host.mutate_browser_authority(|authority| {
+            authority.transition_tab(
+                &tab_id_for_host,
+                BrowserTabLifecycle::Ready,
+                UtcMillis::now(),
+            )?;
+            authority.apply_host_page_state(
+                &tab_id_for_host,
+                page_state.navigation_revision,
+                page_state.url,
+                page_state.origin,
+                page_state.title,
+                UtcMillis::now(),
+            )
+        });
+        match tab {
+            Ok(tab) => {
+                let surface_id = state_for_host.browser_primary_surface_id(&tab_id_for_host);
+                publish_browser_event(
+                    &state_for_host,
+                    "browser.tab.updated",
+                    workspace_id.as_ref(),
+                    &session_id,
+                    serde_json::json!({
+                        "browser_session_id": browser_session_id_for_host,
+                        "tab_id": tab_id_for_host,
+                        "url": tab.url,
+                        "title": tab.title,
+                        "lifecycle": tab.lifecycle,
+                        "surface_id": surface_id,
+                    }),
+                );
+            }
+            Err(error) => finish_browser_tab_creation(
+                &state_for_host,
+                &workspace_id,
+                &session_id,
+                &browser_session_id_for_host,
+                &tab_id_for_host,
+                &format!("浏览器逻辑状态收敛失败: {error:?}"),
+            ),
+        }
+    });
+    Ok((StatusCode::CREATED, Json(created_response.into())))
+}
+
+fn finish_browser_tab_creation(
+    state: &ApiState,
+    workspace_id: &Option<WorkspaceId>,
+    session_id: &SessionId,
+    browser_session_id: &BrowserSessionId,
+    tab_id: &BrowserTabId,
+    reason: &str,
+) {
+    if let Err(error) = state.mutate_browser_authority(|authority| {
+        authority.transition_tab(tab_id, BrowserTabLifecycle::Crashed, UtcMillis::now())
+    }) {
+        tracing::error!(%tab_id, ?error, "浏览器逻辑 Tab 创建失败后无法收敛为 crashed 状态");
+    }
+    tracing::warn!(%tab_id, %reason, "浏览器逻辑 Tab 创建失败，保留为 crashed 状态");
+    publish_browser_event(
+        state,
+        "browser.tab.updated",
+        workspace_id.as_ref(),
+        session_id,
+        serde_json::json!({
+            "browser_session_id": browser_session_id,
+            "tab_id": tab_id,
+            "lifecycle": "crashed",
+            "surface_id": null,
+            "reason": reason,
+        }),
+    );
 }
 
 async fn list_annotations(
@@ -884,8 +1208,7 @@ async fn create_annotation(
     }
     let _control_guard = state.browser_control_lock.lock().await;
     ensure_user_control_for_ui_locked(&state, &session, &tab_id).await?;
-    // Re-read the authoritative tab after acquiring the control lock. A panel
-    // resize or navigation may have completed while the request was waiting.
+    // 获得控制锁后重新读取权威 Tab；请求等待期间可能已完成面板调整或导航。
     let (tab, session) = browser_tab_scope(&state, &tab_id)?;
     let (kind, navigation_revision, hit_x, hit_y, region) = match request.selection {
         BrowserAnnotationSelectionRequest::Element {
@@ -1301,7 +1624,10 @@ async fn activate_tab(
     ensure_browser_ui_ready(&state, &session.session_id)?;
     if !matches!(
         tab.lifecycle,
-        BrowserTabLifecycle::Ready | BrowserTabLifecycle::Suspended | BrowserTabLifecycle::Crashed
+        BrowserTabLifecycle::Creating
+            | BrowserTabLifecycle::Ready
+            | BrowserTabLifecycle::Suspended
+            | BrowserTabLifecycle::Crashed
     ) {
         return Err(ApiError::Conflict("浏览器 Tab 当前不可激活".to_string()));
     }
@@ -1335,7 +1661,9 @@ async fn activate_tab(
         if authority.tab(&tab_id).is_some_and(|tab| {
             matches!(
                 tab.lifecycle,
-                BrowserTabLifecycle::Suspended | BrowserTabLifecycle::Crashed
+                BrowserTabLifecycle::Creating
+                    | BrowserTabLifecycle::Suspended
+                    | BrowserTabLifecycle::Crashed
             )
         }) {
             authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, UtcMillis::now())?;
@@ -1424,13 +1752,17 @@ async fn close_tab(
 struct NavigateBrowserTabRequest {
     action: String,
     url: Option<String>,
+    #[serde(default)]
+    client_platform: Option<BrowserClientPlatform>,
 }
 
 async fn navigate_tab(
     State(state): State<ApiState>,
     Path(tab_id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<NavigateBrowserTabRequest>,
 ) -> Result<Json<BrowserTabResponse>, ApiError> {
+    require_desktop_browser_capability(&headers, request.client_platform)?;
     let tab_id = BrowserTabId::new(tab_id);
     let (_, session) = browser_tab_scope(&state, &tab_id)?;
     let _control_guard = state.browser_control_lock.lock().await;
@@ -1504,9 +1836,17 @@ async fn navigate_tab(
             "tab_id": tab.tab_id,
             "url": tab.url,
             "navigation_revision": tab.navigation_revision,
+            "surface_id": state.browser_primary_surface_id(&tab.tab_id),
         }),
     );
-    Ok(Json(tab.into()))
+    let response = {
+        let authority = state
+            .browser_authority
+            .lock()
+            .expect("browser authority lock poisoned");
+        browser_tab_response_from_authority(&authority, tab)
+    };
+    Ok(Json(response))
 }
 
 fn validate_navigation_url(url: &str) -> Result<(), ApiError> {
@@ -1519,13 +1859,17 @@ fn validate_navigation_url(url: &str) -> Result<(), ApiError> {
 struct ScreenshotBrowserTabRequest {
     #[serde(default)]
     full_page: bool,
+    #[serde(default)]
+    client_platform: Option<BrowserClientPlatform>,
 }
 
 async fn screenshot_tab(
     State(state): State<ApiState>,
     Path(tab_id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<ScreenshotBrowserTabRequest>,
 ) -> Result<Response, ApiError> {
+    require_desktop_browser_capability(&headers, request.client_platform)?;
     let tab_id = BrowserTabId::new(tab_id);
     let (_tab, session) = browser_tab_scope(&state, &tab_id)?;
     ensure_browser_ui_ready(&state, &session.session_id)?;
@@ -1815,24 +2159,10 @@ fn browser_session_response(
         .iter()
         .filter_map(|tab_id| authority.tab(tab_id).cloned())
         .map(|tab| {
-            let mut response = BrowserTabResponse::from(tab.clone());
-            response.annotations = authority
-                .annotations_for_tab(&tab.tab_id)
-                .into_iter()
-                .map(BrowserAnnotationResponse::from)
-                .collect();
-            if let Some(surface) = authority.primary_surface(&tab.tab_id) {
-                response.surface_id = Some(surface.surface_id.clone());
-                if let Some(lease) =
-                    authority.active_lease_for_surface(&tab.tab_id, &surface.surface_id)
-                    && lease.lifecycle == magi_browser_authority::BrowserLeaseLifecycle::Held
-                    && lease.expires_at > UtcMillis::now()
-                {
-                    response.agent_occupied = true;
-                    response.control_fence = lease.fence;
-                    agent_occupied = true;
-                    control_fence = control_fence.max(lease.fence);
-                }
+            let response = browser_tab_response_from_authority(&authority, tab);
+            if response.agent_occupied {
+                agent_occupied = true;
+                control_fence = control_fence.max(response.control_fence);
             }
             response
         })
@@ -1843,7 +2173,6 @@ fn browser_session_response(
         session_id: session.session_id,
         profile_id: session.profile_id,
         lifecycle: session.lifecycle,
-        active_tab_id: None,
         tabs,
         runtime_epoch: session.runtime_epoch,
         revision: session.revision,
@@ -1853,6 +2182,29 @@ fn browser_session_response(
         created_at: session.created_at,
         updated_at: session.updated_at,
     })
+}
+
+fn browser_tab_response_from_authority(
+    authority: &BrowserAuthority,
+    tab: BrowserTab,
+) -> BrowserTabResponse {
+    let mut response = BrowserTabResponse::from(tab.clone());
+    response.annotations = authority
+        .annotations_for_tab(&tab.tab_id)
+        .into_iter()
+        .map(BrowserAnnotationResponse::from)
+        .collect();
+    if let Some(surface) = authority.primary_surface(&tab.tab_id) {
+        response.surface_id = Some(surface.surface_id.clone());
+        if let Some(lease) = authority.active_lease_for_surface(&tab.tab_id, &surface.surface_id)
+            && lease.lifecycle == magi_browser_authority::BrowserLeaseLifecycle::Held
+            && lease.expires_at > UtcMillis::now()
+        {
+            response.agent_occupied = true;
+            response.control_fence = lease.fence;
+        }
+    }
+    response
 }
 
 fn host_command_succeeded(outcome: &BrowserHostCommandOutcome) -> bool {
@@ -1885,6 +2237,7 @@ fn publish_browser_event(
 mod tests {
     use std::sync::Arc;
 
+    use axum::http::{HeaderMap, header::USER_AGENT};
     use magi_browser_authority::{
         BrowserAnnotation, BrowserAnnotationAnchor, BrowserAnnotationAuthor, BrowserAnnotationKind,
         BrowserAnnotationStatus, BrowserProfile, BrowserProfileKind, BrowserRegionAnnotationAnchor,
@@ -1901,10 +2254,17 @@ mod tests {
     use magi_workspace::WorkspaceStore;
 
     use super::{
-        BrowserAnnotationAnchorResponse, BrowserElementAnnotationAnchorResponse,
-        BrowserRegionAnnotationAnchorResponse, resolve_browser_annotation_context,
+        BrowserAnnotationAnchorResponse, BrowserClientPlatform,
+        BrowserElementAnnotationAnchorResponse, BrowserRegionAnnotationAnchorResponse,
+        DesktopConnectionClearRequest, DesktopConnectionRequest, browser_platform_capabilities,
+        browser_session_response, clear_desktop_connection, finish_browser_tab_creation,
+        register_desktop_connection, require_desktop_browser_capability,
+        resolve_browser_annotation_context,
     };
-    use crate::{errors::ApiError, state::ApiState};
+    use crate::{
+        errors::ApiError,
+        state::{ApiState, BrowserHostConnectionConfig},
+    };
 
     fn annotation_fixture() -> (ApiState, SessionId, SessionId, BrowserAnnotationId) {
         let state = ApiState::new(
@@ -1991,6 +2351,134 @@ mod tests {
             })
             .expect("annotation authority fixture should create");
         (state, current_session_id, other_session_id, annotation_id)
+    }
+
+    #[tokio::test]
+    async fn stale_desktop_process_cannot_clear_the_current_connection() {
+        let state = ApiState::new(
+            "browser-desktop-connection-owner-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        state.set_browser_host_connection_config(Some(BrowserHostConnectionConfig {
+            socket_path: "/tmp/magi-current.sock".to_string(),
+            auth_token: "current-token".to_string(),
+            desktop_epoch: "desktop-current".to_string(),
+            parent_pid: 200,
+            generation: 3,
+        }));
+
+        let _ = clear_desktop_connection(
+            axum::extract::State(state.clone()),
+            axum::Json(DesktopConnectionClearRequest {
+                desktop_epoch: "desktop-stale".to_string(),
+                parent_pid: 100,
+                generation: 3,
+            }),
+        )
+        .await
+        .expect("stale unregister should be an idempotent no-op");
+        let current = state
+            .browser_host_connection_config()
+            .expect("current desktop connection should remain registered");
+        assert_eq!(current.desktop_epoch, "desktop-current");
+        assert_eq!(current.parent_pid, 200);
+
+        let _ = clear_desktop_connection(
+            axum::extract::State(state.clone()),
+            axum::Json(DesktopConnectionClearRequest {
+                desktop_epoch: "desktop-current".to_string(),
+                parent_pid: 200,
+                generation: 3,
+            }),
+        )
+        .await
+        .expect("current desktop should unregister itself");
+        assert!(state.browser_host_connection_config().is_none());
+    }
+
+    #[tokio::test]
+    async fn desktop_connection_registration_requires_generation_cas() {
+        let state = ApiState::new(
+            "browser-desktop-connection-cas-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+
+        let first = register_desktop_connection(
+            axum::extract::State(state.clone()),
+            axum::Json(DesktopConnectionRequest {
+                socket_path: "/tmp/magi-first.sock".to_string(),
+                auth_token: "first-token".to_string(),
+                desktop_epoch: "desktop-first".to_string(),
+                parent_pid: 101,
+                expected_generation: 0,
+            }),
+        )
+        .await
+        .expect("first desktop registration should succeed");
+        assert_eq!(first.0.desktop_connection_generation, 1);
+
+        let stale = register_desktop_connection(
+            axum::extract::State(state.clone()),
+            axum::Json(DesktopConnectionRequest {
+                socket_path: "/tmp/magi-stale.sock".to_string(),
+                auth_token: "stale-token".to_string(),
+                desktop_epoch: "desktop-stale".to_string(),
+                parent_pid: 102,
+                expected_generation: 0,
+            }),
+        )
+        .await;
+        assert!(matches!(stale, Err(ApiError::Conflict(_))));
+
+        let idempotent = register_desktop_connection(
+            axum::extract::State(state.clone()),
+            axum::Json(DesktopConnectionRequest {
+                socket_path: "/tmp/magi-first.sock".to_string(),
+                auth_token: "first-token".to_string(),
+                desktop_epoch: "desktop-first".to_string(),
+                parent_pid: 101,
+                expected_generation: 1,
+            }),
+        )
+        .await
+        .expect("same owner registration should be idempotent");
+        assert_eq!(idempotent.0.desktop_connection_generation, 1);
+
+        let replacement = register_desktop_connection(
+            axum::extract::State(state.clone()),
+            axum::Json(DesktopConnectionRequest {
+                socket_path: "/tmp/magi-second.sock".to_string(),
+                auth_token: "second-token".to_string(),
+                desktop_epoch: "desktop-second".to_string(),
+                parent_pid: 103,
+                expected_generation: 1,
+            }),
+        )
+        .await
+        .expect("CAS replacement should succeed");
+        assert_eq!(replacement.0.desktop_connection_generation, 2);
+
+        let _ = clear_desktop_connection(
+            axum::extract::State(state.clone()),
+            axum::Json(DesktopConnectionClearRequest {
+                desktop_epoch: "desktop-first".to_string(),
+                parent_pid: 101,
+                generation: 1,
+            }),
+        )
+        .await
+        .expect("stale clear should be an idempotent no-op");
+        let current = state
+            .browser_host_connection_config()
+            .expect("replacement owner should remain registered");
+        assert_eq!(current.desktop_epoch, "desktop-second");
+        assert_eq!(current.generation, 2);
     }
 
     #[test]
@@ -2108,5 +2596,202 @@ mod tests {
         assert_eq!(element["snapshotRevision"], 8);
         assert!(element.get("bounding_box").is_none());
         assert!(element.get("snapshot_revision").is_none());
+    }
+
+    #[test]
+    fn browser_tab_response_preserves_primary_surface_after_navigation() {
+        let state = ApiState::new(
+            "browser-tab-response-surface-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let profile_id = BrowserProfileId::new("browser-profile-response-surface");
+        let browser_session_id = BrowserSessionId::new("browser-session-response-surface");
+        let tab_id = BrowserTabId::new("browser-tab-response-surface");
+        let session_id = SessionId::new("session-response-surface");
+
+        state
+            .mutate_browser_authority(|authority| {
+                authority.register_profile(BrowserProfile {
+                    profile_id: profile_id.clone(),
+                    kind: BrowserProfileKind::ManagedDefault,
+                    data_path: tempfile::tempdir()
+                        .expect("surface response profile should create")
+                        .keep(),
+                    created_at: UtcMillis(1),
+                    updated_at: UtcMillis(1),
+                })?;
+                authority.create_session(CreateBrowserSession {
+                    browser_session_id: browser_session_id.clone(),
+                    workspace_id: None,
+                    session_id,
+                    profile_id,
+                    now: UtcMillis(1),
+                })?;
+                authority.transition_session(
+                    &browser_session_id,
+                    BrowserSessionLifecycle::Ready,
+                    UtcMillis(2),
+                )?;
+                authority.create_tab(CreateBrowserTab {
+                    tab_id: tab_id.clone(),
+                    browser_session_id: browser_session_id.clone(),
+                    url: "https://example.com/old".to_string(),
+                    now: UtcMillis(2),
+                })?;
+                authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, UtcMillis(2))?;
+                authority.set_primary_surface(
+                    magi_browser_authority::BrowserSurfaceBinding {
+                        desktop_epoch: "desktop-response".to_string(),
+                        window_id: "window-response".to_string(),
+                        surface_id: "surface-response".to_string(),
+                        surface_revision: 3,
+                        tab_id: tab_id.clone(),
+                        web_contents_id: 23,
+                        target_id: "target-response".to_string(),
+                        browser_context_id: "context-response".to_string(),
+                        navigation_revision: 0,
+                    },
+                    UtcMillis(3),
+                )?;
+                authority.apply_host_page_state(
+                    &tab_id,
+                    1,
+                    "https://example.com/new".to_string(),
+                    Some("https://example.com".to_string()),
+                    "New page".to_string(),
+                    UtcMillis(4),
+                )?;
+                Ok(())
+            })
+            .expect("surface response fixture should create");
+
+        let session = state
+            .browser_authority
+            .lock()
+            .expect("browser authority lock should hold")
+            .session(&browser_session_id)
+            .cloned()
+            .expect("browser session should exist");
+        let response = browser_session_response(&state, session)
+            .expect("browser session response should assemble");
+        assert_eq!(response.tabs.len(), 1);
+        assert_eq!(
+            response.tabs[0].surface_id.as_deref(),
+            Some("surface-response")
+        );
+        assert_eq!(response.tabs[0].url, "https://example.com/new");
+    }
+
+    #[test]
+    fn platform_capabilities_are_explicit_for_each_client() {
+        let desktop = serde_json::to_value(browser_platform_capabilities(
+            BrowserClientPlatform::Desktop,
+        ))
+        .expect("desktop capabilities should serialize");
+        assert_eq!(desktop["desktopBrowserSurface"], true);
+        assert_eq!(desktop["browserRecords"], true);
+        assert_eq!(desktop["browserAnnotations"], true);
+        assert_eq!(desktop["browserRemoteSurface"], false);
+
+        let mobile = serde_json::to_value(browser_platform_capabilities(
+            BrowserClientPlatform::MobileWeb,
+        ))
+        .expect("mobile web capabilities should serialize");
+        assert_eq!(mobile["desktopBrowserSurface"], false);
+        assert_eq!(mobile["browserRecords"], true);
+        assert_eq!(mobile["browserAnnotations"], true);
+        assert_eq!(mobile["browserRemoteSurface"], false);
+    }
+
+    #[test]
+    fn real_browser_operations_are_unavailable_to_web_clients() {
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, "Mozilla/5.0".parse().unwrap());
+        let error = require_desktop_browser_capability(&headers, None)
+            .expect_err("web clients must not operate the Desktop browser host");
+        assert!(matches!(error, ApiError::CapabilityUnavailable { .. }));
+
+        headers.insert(USER_AGENT, "Mozilla/5.0 Electron/40.0".parse().unwrap());
+        require_desktop_browser_capability(&headers, None)
+            .expect("Electron clients should be able to operate the Desktop browser host");
+    }
+
+    #[test]
+    fn explicit_non_desktop_platform_cannot_be_overridden_by_a_desktop_user_agent() {
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, "Mozilla/5.0 Electron/40.0".parse().unwrap());
+        let error =
+            require_desktop_browser_capability(&headers, Some(BrowserClientPlatform::MobileWeb))
+                .expect_err("explicit mobile platform must remain record-only");
+        assert!(matches!(error, ApiError::CapabilityUnavailable { .. }));
+    }
+
+    #[test]
+    fn failed_host_materialization_keeps_logical_tab_recoverable() {
+        let state = ApiState::new(
+            "browser-tab-materialization-failure-test",
+            Arc::new(InMemoryEventBus::new(32)),
+            Arc::new(SessionStore::new()),
+            Arc::new(WorkspaceStore::default()),
+            Arc::new(GovernanceService::default()),
+        );
+        let session_id = SessionId::new("session-browser-tab-materialization-failure");
+        let browser_session_id = BrowserSessionId::new("browser-session-materialization-failure");
+        let tab_id = BrowserTabId::new("browser-tab-materialization-failure");
+        let profile_id = BrowserProfileId::new("browser-profile-materialization-failure");
+
+        state
+            .mutate_browser_authority(|authority| {
+                authority.register_profile(BrowserProfile {
+                    profile_id: profile_id.clone(),
+                    kind: BrowserProfileKind::ManagedDefault,
+                    data_path: tempfile::tempdir()
+                        .expect("materialization failure profile should create")
+                        .keep(),
+                    created_at: UtcMillis(1),
+                    updated_at: UtcMillis(1),
+                })?;
+                authority.create_session(CreateBrowserSession {
+                    browser_session_id: browser_session_id.clone(),
+                    workspace_id: None,
+                    session_id: session_id.clone(),
+                    profile_id,
+                    now: UtcMillis(1),
+                })?;
+                authority.transition_session(
+                    &browser_session_id,
+                    BrowserSessionLifecycle::Ready,
+                    UtcMillis(2),
+                )?;
+                authority.create_tab(CreateBrowserTab {
+                    tab_id: tab_id.clone(),
+                    browser_session_id: browser_session_id.clone(),
+                    url: "https://example.com".to_string(),
+                    now: UtcMillis(2),
+                })?;
+                Ok(())
+            })
+            .expect("creating browser tab fixture should succeed");
+
+        finish_browser_tab_creation(
+            &state,
+            &None,
+            &session_id,
+            &browser_session_id,
+            &tab_id,
+            "surface unavailable",
+        );
+
+        let tab = state
+            .browser_authority
+            .lock()
+            .expect("browser authority lock should hold")
+            .tab(&tab_id)
+            .cloned()
+            .expect("failed tab should remain in authority");
+        assert_eq!(tab.lifecycle, BrowserTabLifecycle::Crashed);
     }
 }

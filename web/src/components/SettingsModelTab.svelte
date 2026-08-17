@@ -782,17 +782,17 @@
   .model-status-dot.checking { background: var(--warning, #d97706); }
   .model-status-dot.warning { background: var(--warning, #d97706); }
   .model-status-dot.error { background: var(--error, #dc2626); }
-  .model-status-dot.disabled { background: var(--foreground-subtle, #94a3b8); }
+  .model-status-dot.disabled { background: var(--foreground-muted, #94a3b8); }
 
   .worker-dot {
     width: 7px;
     height: 7px;
     border-radius: var(--radius-full);
     flex-shrink: 0;
-    background: var(--foreground-subtle, #94a3b8);
+    background: var(--foreground-muted, #94a3b8);
   }
   .worker-dot.brand { background: var(--worker-brand-color); }
-  .worker-dot.disabled { background: var(--foreground-subtle, #94a3b8); }
+  .worker-dot.disabled { background: var(--foreground-muted, #94a3b8); }
   .worker-dot.warning { background: var(--warning, #d97706); }
   .worker-dot.error { background: var(--error, #dc2626); }
 

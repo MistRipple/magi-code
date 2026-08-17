@@ -239,6 +239,16 @@ assert.match(
   /autoUpdater\.quitAndInstall\(false, true\)/,
   'Electron Main must atomically install and restart the desktop release',
 );
+assert.match(
+  desktopMainSource,
+  /const DESKTOP_UPDATE_FEED = \{[\s\S]*provider: "github"[\s\S]*owner: "MistRipple"[\s\S]*repo: "magi-code"[\s\S]*releaseType: "release"[\s\S]*\}[\s\S]*autoUpdater\.setFeedURL\(DESKTOP_UPDATE_FEED\)/,
+  'Electron updater must always override stale config with the unified Magi Desktop Release feed',
+);
+assert.doesNotMatch(
+  desktopMainSource,
+  /browser-runtime-stable|browser-runtime-release|channel:\s*["']/,
+  'Electron updater must not retain a Browser Runtime channel',
+);
 assert.doesNotMatch(updaterSource + desktopMainSource, /@tauri-apps|\binvoke\(|\brelaunch\(|stage_desktop_update/, '更新链不得保留旧宿主实现');
 
 assert.match(

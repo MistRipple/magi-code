@@ -6,10 +6,19 @@ const dataMessageHandlersSource = await readFile(
   new URL('../src/lib/data-message-handlers.ts', import.meta.url),
   'utf8',
 );
+const webClientBridgeSource = await readFile(
+  new URL('../src/shared/bridges/web-client-bridge.ts', import.meta.url),
+  'utf8',
+);
 assert.match(
   dataMessageHandlersSource,
   /case 'sessionBootstrapLoaded':[\s\S]*?handleSessionBootstrapLoaded\(asMessage\(\{[\s\S]*?scope: payload\.scope,/,
   'session bootstrap dispatch must preserve workspace or personal scope for navigation settlement',
+);
+assert.match(
+  webClientBridgeSource,
+  /clearWorkspaceSessionBinding\([\s\S]*?await fetchBootstrap\(\{[\s\S]*?forceFresh: true,[\s\S]*?\}\);[\s\S]*?return;/,
+  'missing persisted session must restart bootstrap after clearing the stale binding',
 );
 
 const WORKSPACE_ID = 'workspace-bridge-live-adopt';

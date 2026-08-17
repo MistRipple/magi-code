@@ -2,8 +2,8 @@ use crate::{BrowserDeviceType, BrowserNormalizedRect};
 use magi_core::{BrowserCommandId, BrowserLeaseId, BrowserSessionId, BrowserTabId};
 use serde::{Deserialize, Serialize};
 
-pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 2;
-pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 0;
+pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 3;
+pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 1;
 pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 160;
 pub const DEFAULT_BROWSER_SNAPSHOT_TEXT_LIMIT_BYTES: u32 = 16 * 1024;
 
@@ -112,6 +112,8 @@ pub enum BrowserHostCommand {
     },
     Snapshot {
         tab_id: BrowserTabId,
+        navigation_revision: u64,
+        snapshot_revision: u64,
         limits: BrowserSnapshotLimits,
         subtree_ref: Option<String>,
     },
@@ -317,6 +319,7 @@ pub struct BrowserHostPageState {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BrowserHostSnapshot {
     pub tab_id: BrowserTabId,
+    pub navigation_revision: u64,
     pub snapshot_revision: u64,
     pub root: BrowserSnapshotNode,
     pub returned_nodes: u32,
@@ -417,7 +420,10 @@ pub enum BrowserHostEvent {
         binding: BrowserSurfaceBinding,
         reason: String,
     },
-    PageUpdated(BrowserHostPageState),
+    PageUpdated {
+        binding: BrowserSurfaceBinding,
+        page_state: BrowserHostPageState,
+    },
     PageCrashed {
         binding: BrowserSurfaceBinding,
         diagnostic: Option<String>,
@@ -493,7 +499,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(handshake).expect("serialize desktop handshake"),
             serde_json::json!({
-                "protocol_version": { "major": 2, "minor": 0 },
+                "protocol_version": { "major": 3, "minor": 1 },
                 "desktop_version": "desktop-test",
                 "electron_version": "electron-test",
                 "chromium_version": "chromium-test",
@@ -621,6 +627,52 @@ mod tests {
                         "navigation_revision": 11
                     },
                     "diagnostic": "render-process-gone"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(BrowserHostEvent::PageUpdated {
+                binding: BrowserSurfaceBinding {
+                    desktop_epoch: "desktop-epoch".to_string(),
+                    window_id: "window-1".to_string(),
+                    surface_id: "surface-1".to_string(),
+                    surface_revision: 7,
+                    tab_id: BrowserTabId::new("tab-1"),
+                    web_contents_id: 23,
+                    target_id: "target-1".to_string(),
+                    browser_context_id: "context-1".to_string(),
+                    navigation_revision: 11,
+                },
+                page_state: BrowserHostPageState {
+                    tab_id: BrowserTabId::new("tab-1"),
+                    url: "https://example.com/".to_string(),
+                    origin: Some("https://example.com".to_string()),
+                    title: "Example".to_string(),
+                    navigation_revision: 11,
+                },
+            })
+            .expect("serialize page updated event"),
+            serde_json::json!({
+                "type": "page_updated",
+                "payload": {
+                    "binding": {
+                        "desktop_epoch": "desktop-epoch",
+                        "window_id": "window-1",
+                        "surface_id": "surface-1",
+                        "surface_revision": 7,
+                        "tab_id": "tab-1",
+                        "web_contents_id": 23,
+                        "target_id": "target-1",
+                        "browser_context_id": "context-1",
+                        "navigation_revision": 11
+                    },
+                    "page_state": {
+                        "tab_id": "tab-1",
+                        "url": "https://example.com/",
+                        "origin": "https://example.com",
+                        "title": "Example",
+                        "navigation_revision": 11
+                    }
                 }
             })
         );

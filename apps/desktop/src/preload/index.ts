@@ -3,6 +3,7 @@ import { contextBridge, ipcRenderer, webUtils } from "electron";
 const SNAPSHOT_EVENT = "magi-desktop:snapshot";
 const CONTEXT_EVENT = "magi-desktop:context";
 const BROWSER_EVENT = "magi-desktop:browser-event";
+const BROWSER_COMPONENT_EVENT = "magi-desktop:browser-component";
 const UPDATE_EVENT = "magi-desktop:update";
 const OVERLAY_STATE_EVENT = "magi-desktop:overlay-state";
 const OVERLAY_CLOSED_EVENT = "magi-desktop:overlay-closed";
@@ -77,7 +78,7 @@ window.addEventListener("drop", (event) => {
 
 contextBridge.exposeInMainWorld("magiDesktop", {
   runtime: "electron",
-  surface: desktopSurface === "app" || desktopSurface === "right-pane" || desktopSurface === "overlay"
+  surface: desktopSurface === "app" || desktopSurface === "overlay"
     ? desktopSurface
     : null,
   windowId: desktopWindowId,
@@ -85,15 +86,15 @@ contextBridge.exposeInMainWorld("magiDesktop", {
   setContext: (context: unknown) => ipcRenderer.invoke("magi-desktop:set-context", context),
   submitLayoutIntent: (intent: unknown) => ipcRenderer.invoke("magi-desktop:layout-intent", intent),
   activateBrowser: (request: unknown) => ipcRenderer.invoke("magi-desktop:activate-browser", request),
+  updateBrowserSlot: (request: unknown) => ipcRenderer.invoke("magi-desktop:browser-slot", request),
   activatePanel: (request: unknown) => ipcRenderer.invoke("magi-desktop:activate-panel", request),
   setBrowserViewport: (request: unknown) => ipcRenderer.invoke("magi-desktop:set-browser-viewport", request),
-  openRightPaneTab: (request: unknown) => ipcRenderer.invoke("magi-desktop:open-right-pane-tab", request),
   readyRightPane: () => ipcRenderer.invoke("magi-desktop:right-pane-ready"),
   openOverlay: (state: unknown) => ipcRenderer.invoke("magi-desktop:open-overlay", state),
   closeOverlay: () => ipcRenderer.invoke("magi-desktop:close-overlay"),
+  setBlockingOverlay: (request: unknown) => ipcRenderer.invoke("magi-desktop:set-blocking-overlay", request),
   readyOverlay: () => ipcRenderer.invoke("magi-desktop:overlay-ready"),
   submitOverlayAction: (action: unknown) => ipcRenderer.invoke("magi-desktop:overlay-action", action),
-  focusBrowser: (surfaceId: string) => ipcRenderer.invoke("magi-desktop:focus-browser", surfaceId),
   openExternal: (url: string) => ipcRenderer.invoke("magi-desktop:open-external", url),
   showContextMenu: (request: unknown) => ipcRenderer.invoke("magi-desktop:show-context-menu", request),
   openWorkspaceFolder: (workspaceRootPathRef: string) => ipcRenderer.invoke(
@@ -115,7 +116,7 @@ contextBridge.exposeInMainWorld("magiDesktop", {
   onSnapshot: (listener: (snapshot: unknown) => void) => subscribe(SNAPSHOT_EVENT, listener),
   onContext: (listener: (context: unknown) => void) => subscribe(CONTEXT_EVENT, listener),
   onBrowserEvent: (listener: (event: unknown) => void) => subscribe(BROWSER_EVENT, listener),
-  onRightPaneIntent: (listener: (request: unknown) => void) => subscribe("magi-desktop:right-pane-intent", listener),
+  onBrowserComponent: (listener: (snapshot: unknown) => void) => subscribe(BROWSER_COMPONENT_EVENT, listener),
   onOverlayState: (listener: (state: unknown) => void) => subscribe(OVERLAY_STATE_EVENT, listener),
   onOverlayClosed: (listener: () => void) => subscribe(OVERLAY_CLOSED_EVENT, listener),
   onOverlayAction: (listener: (action: unknown) => void) => subscribe(OVERLAY_ACTION_EVENT, listener),

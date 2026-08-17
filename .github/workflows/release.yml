@@ -339,6 +339,30 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: Magi ${{ github.ref_name }}
           body_path: dist/release-notes.md
+          make_latest: true
           prerelease: ${{ contains(github.ref_name, 'test') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
           files: dist/release-assets/*
           fail_on_unmatched_files: true
+      - name: 验证 GitHub Desktop 更新源
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          expected_tag="$GITHUB_REF_NAME"
+          latest="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest")"
+          actual_tag="$(jq -r '.tag_name // ""' <<<"$latest")"
+          test "$actual_tag" = "$expected_tag" || {
+            echo "GitHub latest Release 不是当前 Desktop 版本：expected=$expected_tag actual=$actual_tag" >&2
+            exit 1
+          }
+          for asset in latest-mac.yml latest.yml latest-linux.yml; do
+            jq -e --arg asset "$asset" '.assets | any(.[]; .name == $asset)' <<<"$latest" >/dev/null || {
+              echo "GitHub Release 缺少 Electron 更新元数据：$asset" >&2
+              exit 1
+            }
+          done
+          if jq -e '.tag_name | test("browser-runtime|magi-desktop-stable"; "i")' <<<"$latest" >/dev/null; then
+            echo "GitHub latest Release 不得是 Browser Runtime 或旧 Desktop channel" >&2
+            exit 1
+          fi

@@ -19,6 +19,7 @@ export const webDist = join(repositoryRoot, "web", "dist");
 const runtimePackages = ["electron", "electron-updater", "ws", "devtools-protocol"];
 
 export async function buildDesktopJavaScript({ development = false } = {}) {
+  const productVersion = await readProductVersion();
   await Promise.all([
     mkdir(join(desktopDist, "main"), { recursive: true }),
     mkdir(join(desktopDist, "preload"), { recursive: true }),
@@ -45,6 +46,7 @@ export async function buildDesktopJavaScript({ development = false } = {}) {
       define: {
         "import.meta.url": "__magiImportMetaUrl",
         "process.env.NODE_ENV": JSON.stringify(development ? "development" : "production"),
+        "process.env.MAGI_PRODUCT_VERSION": JSON.stringify(productVersion),
       },
       banner: {
         js: "const __magiImportMetaUrl = require('node:url').pathToFileURL(__filename).href;",

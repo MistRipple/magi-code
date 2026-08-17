@@ -32,6 +32,38 @@ await withGoldenViteServer(async (server) => {
     new URL('../src/components/tabs/BrowserTabContent.svelte', import.meta.url),
     'utf8',
   );
+  const rightPaneStoreSource = await readFile(
+    new URL('../src/stores/right-pane.svelte.ts', import.meta.url),
+    'utf8',
+  );
+  const appSource = await readFile(
+    new URL('../src/App.svelte', import.meta.url),
+    'utf8',
+  );
+  const modalSource = await readFile(
+    new URL('../src/components/Modal.svelte', import.meta.url),
+    'utf8',
+  );
+  const overlayShellSource = await readFile(
+    new URL('../src/DesktopOverlayShell.svelte', import.meta.url),
+    'utf8',
+  );
+  const overlayContractSource = await readFile(
+    new URL('../src/shared/desktop-overlay-contract.ts', import.meta.url),
+    'utf8',
+  );
+  const workbenchSource = await readFile(
+    new URL('../src/web/WebWorkbenchShell.svelte', import.meta.url),
+    'utf8',
+  );
+  const overlayManagerSource = await readFile(
+    new URL('../../apps/desktop/src/main/desktop-overlay-manager.ts', import.meta.url),
+    'utf8',
+  );
+  const windowManagerSource = await readFile(
+    new URL('../../apps/desktop/src/main/window-manager.ts', import.meta.url),
+    'utf8',
+  );
   await assert.rejects(
     readFile(new URL('../src/lib/native-browser.ts', import.meta.url), 'utf8'),
     { code: 'ENOENT' },
@@ -48,6 +80,42 @@ await withGoldenViteServer(async (server) => {
   assert.doesNotMatch(rightPaneSource, /<iframe\b/, 'HTML preview must not retain the old iframe path');
   assert.match(rightPaneSource, /createBrowserTab\(/);
   assert.match(rightPaneSource, /materializeSession\(/);
+  assert.match(
+    appSource,
+    /async function synchronizeCurrentBrowserAuthority\(revealTabId = ''\): Promise<void> \{\s*if \(!messagesState\.bootstrapped\) return;/,
+    'BrowserAuthority 首轮同步必须等待消息状态完成 bootstrap，避免启动阶段把工作区会话误判为 personal',
+  );
+  assert.match(
+    appSource,
+    /setDesktopBlockingOverlay\('app-settings', settingsOpen\)/,
+    'Settings 必须通过统一阻塞覆盖层契约撤下当前 Browser Surface，而不是依赖局部 z-index',
+  );
+  assert.match(
+    modalSource,
+    /setDesktopBlockingOverlay\(overlayId, true\)[\s\S]*?setDesktopBlockingOverlay\(overlayId, false\)/,
+    '所有通用 DOM Modal 必须自动加入 Browser Surface 阻塞生命周期',
+  );
+  assert.match(
+    overlayContractSource,
+    /activeOverlayIds = new Set[\s\S]*?wasVisible[\s\S]*?notify\(\)[\s\S]*?onDesktopBlockingOverlayChange/,
+    '阻塞覆盖层必须使用共享引用集合，支持嵌套弹窗而不提前恢复 Browser Surface',
+  );
+  assert.match(
+    browserPaneSource,
+    /onDesktopBlockingOverlayChange\([\s\S]*?browserSurfaceHiddenByOverlay = visible/,
+    'App Renderer 必须接收统一阻塞状态，原生 Surface 的显示生命周期由 Main 管理',
+  );
+  assert.match(
+    overlayContractSource,
+    /desktop\.setBlockingOverlay\(\{ active: visible \}\)/,
+    '阻塞状态必须同步到 Electron Main，不能只修改 Renderer 本地状态',
+  );
+  assert.match(
+    overlayShellSource,
+    /window\.focus\(\)[\s\S]*?key !== 'Escape'[\s\S]*?close\(\)/,
+    'Desktop Overlay 必须在打开后取得焦点并确定性处理 Escape 关闭',
+  );
+  assert.match(overlayShellSource, /data-desktop-overlay-root/);
   const browserCapabilityDeclaration = rightPaneSource.slice(
     rightPaneSource.indexOf('const canCreateBrowserPane'),
     rightPaneSource.indexOf('const canCreateTerminalPane'),
@@ -134,19 +202,140 @@ assert.match(
   /disabled=\{!canOpenAddPaneMenu\}[\s\S]*?aria-busy=\{creatingBrowserPane\}/,
   'browser creation may show a local busy indicator without blocking other panel types',
 );
-const desktopRightPaneShellSource = await readFile(
-  new URL('../src/DesktopRightPaneShell.svelte', import.meta.url),
-  'utf8',
+assert.match(
+  rightPaneSource,
+  /function registerBrowserPane\([\s\S]*?openBrowserTab\([\s\S]*?reconcileCreatedBrowserPane\(/,
+  'every newly created browser tab must reconcile through the authority snapshot so it becomes the selected tab',
+);
+assert.doesNotMatch(
+  rightPaneSource,
+  /if \(!lifecycle \|\| lifecycle === 'creating'\) \{[\s\S]*?reconcileCreatedBrowserPane/,
+  'ready browser creation responses must not skip the reveal/reconciliation path',
 );
 assert.match(
-  desktopRightPaneShellSource,
-  /class="desktop-right-pane-resize-handle"[\s\S]*?onpointerdown=\{startRightPaneResize\}[\s\S]*?ondblclick=/,
-  'desktop right-pane keeps the original drag and double-click reset interaction',
+  rightPaneSource,
+  /\{#if addPaneMenuOpen && !desktopSurface\}[\s\S]*?right-pane-add-menu[\s\S]*?chooseAddPane\(item\.kind\)/,
+  'ordinary Web must keep the extensible pane chooser in the unified App Renderer DOM',
 );
 assert.match(
-  desktopRightPaneShellSource,
-  /\.desktop-right-pane-resize-handle\s*\{[\s\S]*?height:\s*100%;/,
+  rightPaneSource,
+  /onOverlayAction\([\s\S]*?openOverlay\([\s\S]*?placement:\s*'right-pane-add'/,
+  'Desktop pane chooser must use the native overlay only for the popup that can cross the Browser Surface',
+);
+assert.match(
+  workbenchSource,
+  /class="desktop-right-pane-resize-handle"[\s\S]*?onpointerdown=\{startDesktopRightPaneResize\}[\s\S]*?ondblclick=/,
+  'desktop right-pane keeps drag and double-click reset in the unified workbench renderer',
+);
+assert.match(
+  workbenchSource,
+  /\.desktop-right-pane-resize-handle\s*\{[\s\S]*?touch-action:\s*none;/,
   'right-pane resize hit area must span the whole divider instead of being limited to the tab bar',
+);
+assert.match(
+  workbenchSource,
+  /function startDesktopRightPaneResize\([\s\S]*?window\.addEventListener\('pointermove', move\)[\s\S]*?window\.addEventListener\('pointerup', stop\)/,
+  'right-pane resize must keep the pointer stream at window level after leaving the divider hit area',
+);
+assert.match(
+  workbenchSource,
+  /\.desktop-right-pane-column :global\(\.right-pane\)\s*\{[\s\S]*?box-sizing:\s*border-box;/,
+  'right-pane content must include its border in the allocated track and cannot overflow the outer gutter',
+);
+assert.match(
+  workbenchSource,
+  /desktop-right-pane-column[\s\S]*?desktopSurface=\{true\}/,
+  'desktop right-pane UI must live in the same renderer as the left and middle panes',
+);
+assert.match(
+  workbenchSource,
+  /desktopSnapshot\?\.layout\.rightPaneWidth[\s\S]*?--desktop-right-pane-width/,
+  'the unified renderer must consume the right-pane width without measuring the browser surface',
+);
+assert.match(
+  workbenchSource,
+  /const effectivePreviewPanelWidth = \$derived\([\s\S]*?desktopSnapshot\?\.layout\.rightPaneWidth[\s\S]*?resolvePanelLayout/,
+  'desktop panel coexistence must use the authoritative right-pane width',
+);
+assert.match(
+  workbenchSource,
+  /resolvePanelVisibility\([\s\S]*?rightPaneOpen:\s*rightPaneVisible/,
+  'desktop right-pane expansion must participate in sidebar coexistence instead of over-constraining the middle pane',
+);
+assert.doesNotMatch(
+  workbenchSource,
+  /workbenchBodyElement|getBoundingClientRect\(\)[\s\S]{0,700}?startDesktopRightPaneResize/,
+  'right-pane drag bounds must come from the shared panel layout model rather than a second DOM measurement path',
+);
+assert.doesNotMatch(
+  workbenchSource,
+  /desktopWorkbenchWidth|bodyResizeObserver|const desktopRightPaneOverlay = \$derived\([\s\S]{0,500}getBoundingClientRect/,
+  'desktop overlay mode must come from the Main layout snapshot, not a Renderer feedback loop based on body measurement',
+);
+assert.match(
+  workbenchSource,
+  /\.web-workbench-shell--desktop-right-pane-visible \.workbench-body[\s\S]*?var\(--desktop-right-pane-width, 480px\)/,
+  'desktop right-pane grid must consume the Main-provided content-track width directly',
+);
+assert.match(
+  workbenchSource,
+  /\.web-workbench-shell--desktop-right-pane-visible \.workbench-body[\s\S]*?grid-template-columns:[\s\S]*?minmax\(var\(--workbench-min-content-width, 448px\),\s*1fr\)[\s\S]*?var\(--desktop-right-pane-width, 480px\)/,
+  'desktop right-pane grid must preserve the conversation minimum and consume the Main-provided right track',
+);
+assert.doesNotMatch(
+  workbenchSource,
+  /minmax\(var\(--workbench-min-content-width, 448px\),\s*minmax\(0,\s*1fr\)\)/,
+  'desktop grid tracks must use valid CSS Grid grammar instead of nested minmax expressions',
+);
+assert.match(
+  workbenchSource,
+  /desktopSnapshot\?\.layout\.rightPaneMode === 'overlay'[\s\S]*?web-workbench-shell--desktop-preview-overlay[\s\S]*?desktop-right-pane-column--overlay/,
+  'desktop overlay mode must be consumed from the authoritative Main layout snapshot',
+);
+assert.doesNotMatch(
+  workbenchSource,
+  /--desktop-right-pane-width, 480px\)[\s\S]*?--shell-padding/,
+  'desktop right-pane width must not subtract the shell inset a second time',
+);
+assert.doesNotMatch(
+  workbenchSource,
+  /\.web-workbench-shell--desktop-right-pane-visible\s*\{\s*padding-right:\s*0;/,
+  'desktop layout must keep the shell right outer inset instead of moving the pane to the window edge',
+);
+assert.match(
+  workbenchSource,
+  /\.desktop-right-pane-column\s*\{[\s\S]*?width:\s*100%;[\s\S]*?min-width:\s*0;/,
+  'right-pane column must fill its grid track without a second padding-based geometry system',
+);
+assert.match(
+  workbenchSource,
+  /\.web-workbench-shell--desktop \.sidebar[\s\S]*?background:\s*transparent;[\s\S]*?\.web-workbench-shell--desktop \.workbench-app-pane[\s\S]*?background:\s*transparent;/,
+  'desktop three-column surfaces must share the App shell background instead of stacking independent translucent panels',
+);
+assert.match(
+  overlayManagerSource,
+  /updateLayout\([\s\S]*?!layout\.rightPaneVisible[\s\S]*?this\.close\(windowId\);[\s\S]*?this\.mountOnLayer\(record\);[\s\S]*?record\.view\.setBounds\(/,
+  'overlay layout updates must keep the fixed OverlayLayer while updating bounds',
+);
+assert.match(
+  overlayManagerSource,
+  /private mountOnLayer\([\s\S]*?record\.layer\.addChildView\(record\.view\)[\s\S]*?record\.mounted = true/,
+  'overlay mounting must add the live WebContentsView only to the fixed OverlayLayer',
+);
+assert.doesNotMatch(
+  overlayManagerSource,
+  /contentView\.addChildView|mountOnTop/,
+  'overlay updates must not reparent the view to the window root or use the retired z-order workaround',
+);
+assert.match(
+  windowManagerSource,
+  /const appLayer = new View\(\);[\s\S]*?const browserLayer = new View\(\);[\s\S]*?const overlayLayer = new View\(\);[\s\S]*?contentView\.addChildView\(appLayer\)[\s\S]*?contentView\.addChildView\(browserLayer\)[\s\S]*?contentView\.addChildView\(overlayLayer\)/,
+  'WindowManager must create the App, Browser, and Overlay layers once in stable native order',
+);
+assert.match(
+  windowManagerSource,
+  /attachWindow\(windowId, window, browserLayer\)[\s\S]*?overlayManager\.create\(windowId, window, overlayLayer\)/,
+  'Browser Surface and Overlay must receive their dedicated native layer instead of sharing contentView',
 );
   assert.doesNotMatch(
     browserPaneSource,
@@ -188,11 +377,96 @@ assert.match(
     /activateBrowserTab/,
     'browser content must not mutate the authority active tab while mounting or polling',
   );
+assert.match(
+  rightPaneSource,
+  /const activationIdentity = `\$\{payload\.browserSessionId\}\\u0000\$\{payload\.tabId\}`;[\s\S]*?const activationKey = `\$\{activationIdentity\}\\u0000\$\{payload\.lifecycle\}`;[\s\S]*?activateBrowserTab\(payload\.tabId\)/,
+  'the selected top-level pane must be the single browser activation source while lifecycle remains a state transition, not an identity',
+);
+assert.doesNotMatch(
+  rightPaneSource,
+  /nativeSurfaceAlreadyActive|if \(nativeSurfaceAlreadyActive/,
+  'Browser activation must not skip Authority activation merely because Main already has a Surface',
+);
+assert.match(
+  workbenchSource,
+  /desktopSnapshot\?\.layout\.activePanelKind !== 'browser'[\s\S]*?BrowserTabPayload[\s\S]*?\.tabId === logicalTabId[\s\S]*?setActiveRightPaneTab/,
+  'each desktop window must restore its right-pane Browser Tab from its own Main snapshot',
+);
+assert.doesNotMatch(
+  rightPaneStoreSource,
+  /activeTabId:\s*snapshot\.activeTabId|revealActiveTab/,
+  'BrowserAuthority projection must not expose a global UI active Tab',
+);
+assert.match(
+  rightPaneSource,
+  /waitForBrowserTabReady\([\s\S]*?synchronizeBrowserSessionSnapshot\(/,
+  'browser creation must reconcile through an authority snapshot instead of depending on one event',
+);
+assert.match(
+  rightPaneSource,
+  /function registerBrowserPane\([\s\S]*?openBrowserTab\([\s\S]*?reconcileCreatedBrowserPane\(/,
+  'every browser creation entry point must use the same authority reconciliation path',
+);
+assert.doesNotMatch(
+  rightPaneSource,
+  /if \(!lifecycle \|\| lifecycle === 'creating'\)[\s\S]*?reconcileCreatedBrowserPane\(/,
+  'ready browser creation responses must not skip authority reconciliation',
+);
+assert.match(
+  rightPaneSource,
+  /lifecycle: 'crashed'[\s\S]*?权威状态收敛失败/,
+  'browser creation timeout must leave an explicit crashed state instead of permanent connecting',
+);
+assert.match(
+  browserPaneSource,
+  /synchronizeBrowserSessionSnapshot\(next, workspacePath,\s*\{[\s\S]*?workspaceId[\s\S]*?sessionId/,
+  'the active browser tab must project its fetched authority snapshot back into the right-pane lifecycle',
+);
+assert.match(
+  browserPaneSource,
+  /const identityKey = `\$\{expectedSessionId\}\\u0000\$\{expectedTabId\}`;[\s\S]*?identityKey === activeBrowserIdentityKey[\s\S]*?activeBrowserIdentityKey = identityKey/,
+  'browser metadata refresh must run once per logical browser identity instead of once per projected payload object',
+);
+assert.match(
+  rightPaneStoreSource,
+  /function sameBrowserTabPayload\([\s\S]*?left\.browserSessionId === right\.browserSessionId[\s\S]*?left\.sessionId === right\.sessionId/,
+  'authority projection must preserve an unchanged browser payload object',
+);
+assert.match(
+  rightPaneStoreSource,
+  /const retainedTabs = pane\.openTabs\.filter\([\s\S]*?retainedTabs\.length !== pane\.openTabs\.length[\s\S]*?pane\.openTabs = retainedTabs/,
+  'authority projection must preserve the open tab array when no browser tab was removed',
+);
+assert.match(
+  rightPaneSource,
+  /if \(payload\.lifecycle === 'creating'\) \{[\s\S]*?activeBrowserActivationRequest \+= 1;[\s\S]*?activeBrowserActivationKey = '';[\s\S]*?return;[\s\S]*?\}/,
+  'a logical Browser Tab must finish Host materialization before the UI asks the authority to activate it',
+);
+assert.match(
+  rightPaneSource,
+  /activeBrowserActivationKey = `\$\{activationIdentity\}\\u0000\$\{tab\.lifecycle\}`;[\s\S]*?synchronizeBrowserSessionSnapshot\(authority, payload\.workspacePath,[\s\S]*?desktop\.activateBrowser/,
+  'the activation response must project the authoritative ready lifecycle before the native surface publishes its content slot',
+);
+assert.match(
+  browserPaneSource,
+  /const lifecycleFailure = \$derived\([\s\S]*?activeTab\?\.lifecycle === 'crashed'[\s\S]*?browser\.status\.unavailable/,
+  'a crashed browser lifecycle must render an explicit failure state instead of permanent connecting',
+);
   assert.match(
     rightPaneSource,
-    /const activationKey = `\$\{payload\.browserSessionId\}\\u0000\$\{payload\.tabId\}`;[\s\S]*?activateBrowserTab\(payload\.tabId\)/,
-    'the selected top-level pane must be the single browser activation source',
+    /activeTab\.kind === 'browser'[\s\S]*?<BrowserTabContent[\s\S]*?browserPayload\.tabId/,
+    'the selected top-level browser tab must render exactly one BrowserTabContent slot',
   );
+  assert.match(
+    rightPaneSource,
+    /<BrowserTabContent[\s\S]*?lifecycle=\{browserPayload\.lifecycle\}/,
+    'BrowserTabContent must receive the canonical BrowserAuthority lifecycle projection',
+  );
+assert.match(
+  rightPaneSource,
+  /\{:else if activeTab\.kind === 'browser'\}[\s\S]*?<BrowserTabContent[\s\S]*?\{:else if activeTab\.kind === 'terminal'\}/,
+  'switching to code, image, terminal, or agent tabs must replace only the right-pane body content',
+);
   assert.doesNotMatch(
     browserPaneSource,
     /new WebSocket|browserChannelUrl|renderedFrame|queuedFrame|frameImage|drawImage\(|getContext\(['"]2d['"]\)/,
@@ -200,18 +474,225 @@ assert.match(
   );
   assert.doesNotMatch(
     browserPaneSource,
-    /getBoundingClientRect|ResizeObserver|resizeNativeBrowser|createNativeBrowser|focusNativeBrowser|hideNativeBrowser/,
-    'Renderer must not measure, create, resize, focus, or hide the Electron BrowserSurface',
+    /setBrowserSurfaceBounds|set-browser-surface-bounds/,
+    'Browser content must not use the retired independent overlay-bounds bridge',
   );
   assert.doesNotMatch(
     browserPaneSource,
     /@tauri-apps|\binvoke\s*\(|native_browser_|\{\s*x:\s*0,\s*y:\s*0,\s*width:\s*1,\s*height:\s*1\s*\}/,
     'Renderer must not retain Tauri commands, CEF bridge commands, or the retired 1x1 hide path',
   );
+assert.match(
+  browserPaneSource,
+  /class="browser-surface-slot"[\s\S]*?class="browser-native-surface"[\s\S]*?browser\.status\.recordOnly/,
+  'Desktop must expose a native Chromium content slot while ordinary Web keeps a read-only Browser record state',
+);
+assert.match(
+  browserPaneSource,
+  /\.status-light\s*\{[\s\S]*?background:\s*var\(--foreground-muted\)/,
+  'Browser connection status must use a defined theme token in every state',
+);
+assert.match(
+  rightPaneSource,
+  /\.browser-control-status\s*\{[\s\S]*?background:\s*var\(--foreground-muted\)/,
+  'Browser Tab ownership status must remain visible when the agent has released the tab',
+);
   assert.match(
     browserPaneSource,
-    /class="browser-surface-slot"[\s\S]*?\{#if !desktopRuntime\}[\s\S]*?browser\.error\.internalUnavailable/,
-    'ordinary Web entry must expose one explicit Desktop-only empty state without a second browser implementation',
+    /desktopRuntime && !browserReady[\s\S]*?browser-native-surface/,
+    'the native Browser Surface must be presented only after the logical tab is ready',
+  );
+  assert.match(
+    browserPaneSource,
+    /const browserSurfaceAvailable = \$derived\([\s\S]*?browserSlotHostAvailable[\s\S]*?desktopSnapshot\?\.layout\.activeSurfaceId[\s\S]*?const browserReady = \$derived\(browserSurfaceAvailable && browserSlotPublished\)/,
+    'BrowserSurface availability and content-slot mounting must remain separate states',
+  );
+  const browserSlotPublicationSource = browserPaneSource.slice(
+    browserPaneSource.indexOf('function publishBrowserSlotBounds()'),
+    browserPaneSource.indexOf('function scheduleBrowserSlotBounds()'),
+  );
+  assert.ok(
+    browserSlotPublicationSource.length > 0,
+    'BrowserTabContent must keep an explicit content-slot publication function',
+  );
+  assert.match(
+    browserSlotPublicationSource,
+    /if \(!browserSlotHostAvailable \|\| !desktop \|\| !slot \|\| !currentTab \|\| currentTab\.tabId !== tabId\) return;/,
+    'initial slot geometry publication must be gated by the active DOM slot host, not by a materialized Chromium Surface',
+  );
+  const browserSlotInitialPublicationSource = browserSlotPublicationSource.slice(
+    0,
+    browserSlotPublicationSource.indexOf('      .then((next) => {'),
+  );
+  assert.doesNotMatch(
+    browserSlotInitialPublicationSource,
+    /browserSurfaceAvailable|activeSurfaceId/,
+    'initial slot geometry publication must not wait for activeSurfaceId; Main receives bounds before showing the Surface',
+  );
+  const browserSlotHostAvailabilitySource = browserPaneSource.slice(
+    browserPaneSource.indexOf('const browserSlotHostAvailable'),
+    browserPaneSource.indexOf('const browserSurfaceAvailable'),
+  );
+  const browserSlotHostExpressionSource = browserSlotHostAvailabilitySource.replace(/\/\/.*$/gm, '');
+  assert.doesNotMatch(
+    browserSlotHostExpressionSource,
+    /activeSurfaceId/,
+    'the DOM content-slot host availability contract must remain valid while activeSurfaceId is still null',
+  );
+  assert.match(
+    browserPaneSource,
+    /function clearPublishedBrowserSlot\([\s\S]*?slotRevision: revision[\s\S]*?bounds: null/,
+    'switching or unmounting a Browser Tab must explicitly clear the previous content slot',
+  );
+assert.match(
+  browserPaneSource,
+  /const accepted = next\.layout\.activePanelKind === 'browser'[\s\S]*?next\.layout\.rightPaneVisible[\s\S]*?browserSlotPublished = accepted/,
+  'a stale slot response must not make an old Browser Surface visible again',
+);
+assert.match(
+  browserPaneSource,
+  /let slotLifecycleGeneration = 0;[\s\S]*?let slotOwnerTabId = '';[\s\S]*?let componentDisposed = false;/,
+  'Browser content-slot publication must have an explicit lifecycle generation and disposal state',
+);
+assert.match(
+  browserPaneSource,
+  /componentDisposed[\s\S]*?publicationGeneration !== slotLifecycleGeneration[\s\S]*?publicationTabId !== tabId/,
+  'a late slot response must be ignored after Browser Tab replacement or component disposal',
+);
+assert.match(
+  browserPaneSource,
+  /componentDisposed = true;[\s\S]*?ownedSlotTabId = slotOwnerTabId \|\| publishedSlotTabId[\s\S]*?invalidateBrowserSlotPublication\(\)/,
+  'unmount must invalidate pending slot requests even before an acknowledgement populated publishedSlotTabId',
+);
+  assert.match(
+    browserPaneSource,
+    /desktopRuntime && !browserReady[\s\S]*?aria-live="polite"[\s\S]*?desktopRuntime && Boolean\(error\)[\s\S]*?role="alert"[\s\S]*?desktopRuntime && browserReady[\s\S]*?browser-native-surface/,
+    'the content slot must expose loading and error states before yielding to the native Surface',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /src="about:blank"/,
+    'the Browser Tab content slot must not hard-code an about:blank Guest source',
+  );
+  assert.match(
+    browserPaneSource,
+    /\.browser-pane\s*\{[\s\S]*?flex:\s*1 1 auto;[\s\S]*?width:\s*100%;[\s\S]*?min-width:\s*0;/,
+    'BrowserTabContent must stretch as a normal DOM flex item instead of retaining the webview intrinsic width after right-pane resize',
+  );
+  assert.match(
+    rightPaneSource,
+    /\.right-pane-body--browser\s*\{[\s\S]*?display:\s*flex;[\s\S]*?width:\s*100%;/,
+    'Browser body must provide a full-width flex layout for its DOM content slot',
+  );
+  assert.match(
+    rightPaneSource,
+    /\.right-pane-body--browser\s*\{[\s\S]*?display:\s*flex;[\s\S]*?width:\s*100%;[\s\S]*?overflow:\s*hidden;/,
+    'The Browser Tab body must fill and clip only the selected content slot when the right pane is resized',
+  );
+  assert.match(
+    browserPaneSource,
+    /class="viewport-menu"[\s\S]*?class="viewport-custom"[\s\S]*?scheduleCustomViewportUpdate\(\)/,
+    'browser viewport controls must stay in the current Browser Tab toolbar DOM and update dynamically',
+  );
+  assert.match(
+    browserPaneSource,
+    /class="annotation-menu"[\s\S]*?selectSavedAnnotation\(annotation\)/,
+    'browser annotation history must stay in the current Browser Tab toolbar DOM',
+  );
+  assert.match(
+    browserPaneSource,
+    /openOverlay\([\s\S]*?placement:\s*'browser-viewport'[\s\S]*?openOverlay\([\s\S]*?placement:\s*'browser-annotations'/,
+    'Desktop browser toolbar menus must use the native overlay above Chromium content',
+  );
+  const overlayCalls = [
+    ...rightPaneSource.matchAll(/openOverlay\(\{[\s\S]*?\}\)\.catch/g),
+    ...browserPaneSource.matchAll(/openOverlay\(\{[\s\S]*?\}\)\.catch/g),
+  ].map((match) => match[0]);
+  assert.equal(
+    overlayCalls.length,
+    5,
+    'Web 侧必须只有右栏新增、浏览器视口、标记历史、标记选择和标记备注五个 Overlay 调用',
+  );
+  assert.ok(
+    overlayCalls.every((call) => /anchorBounds:\s*(?:null|\{)/.test(call)),
+    '每个 openOverlay 调用都必须显式声明 anchorBounds，禁止遗漏位置契约',
+  );
+  const menuOverlayCalls = overlayCalls.filter((call) => /kind:\s*'menu'/.test(call));
+  assert.equal(menuOverlayCalls.length, 3, '三个菜单 Overlay 必须全部经过 DOM 锚点定位');
+  assert.ok(
+    menuOverlayCalls.every((call) => /anchorBounds:\s*\{[\s\S]*?x:\s*anchor\.left[\s\S]*?y:\s*anchor\.top[\s\S]*?width:\s*anchor\.width[\s\S]*?height:\s*anchor\.height/.test(call)),
+    '菜单 Overlay 必须把真实 DOM getBoundingClientRect 结果原样转换为 anchorBounds',
+  );
+  assert.match(
+    rightPaneSource,
+    /const anchor = addPaneButtonElement\?\.getBoundingClientRect\(\);[\s\S]*?openOverlay\(\{[\s\S]*?placement:\s*'right-pane-add'[\s\S]*?anchorBounds:\s*\{[\s\S]*?x:\s*anchor\.left[\s\S]*?y:\s*anchor\.top[\s\S]*?width:\s*anchor\.width[\s\S]*?height:\s*anchor\.height/,
+    '右栏新增菜单必须锚定顶级右栏新增按钮，不能用固定坐标或浏览器内容槽',
+  );
+  assert.match(
+    browserPaneSource,
+    /const anchor = viewportMenuButton\?\.getBoundingClientRect\(\);[\s\S]*?openOverlay\(\{[\s\S]*?placement:\s*'browser-viewport'[\s\S]*?anchorBounds:\s*\{[\s\S]*?x:\s*anchor\.left[\s\S]*?y:\s*anchor\.top[\s\S]*?width:\s*anchor\.width[\s\S]*?height:\s*anchor\.height/,
+    '浏览器视口菜单必须锚定当前 Browser Tab 的视口按钮',
+  );
+  assert.match(
+    browserPaneSource,
+    /const anchor = annotationHistoryButton\?\.getBoundingClientRect\(\);[\s\S]*?openOverlay\(\{[\s\S]*?placement:\s*'browser-annotations'[\s\S]*?anchorBounds:\s*\{[\s\S]*?x:\s*anchor\.left[\s\S]*?y:\s*anchor\.top[\s\S]*?width:\s*anchor\.width[\s\S]*?height:\s*anchor\.height/,
+    '浏览器标记历史菜单必须锚定当前 Browser Tab 的标记按钮',
+  );
+  const annotationOverlayCalls = overlayCalls.filter((call) => /kind:\s*'annotation'/.test(call));
+  assert.equal(annotationOverlayCalls.length, 2, '标记选择和标记备注必须复用同一 Annotation Overlay');
+  assert.ok(
+    annotationOverlayCalls.every((call) => /placement:\s*'browser-annotations'[\s\S]*?anchorBounds:\s*null/.test(call)),
+    '标记 select/note 不得锚定工具栏按钮，必须交给完整浏览器内容槽定位',
+  );
+  assert.match(
+    browserPaneSource,
+    /bind:this=\{browserSurfaceSlot\}/,
+    '浏览器必须提供唯一的 DOM 内容槽作为原生 Chromium Surface 的宿主区域',
+  );
+  assert.match(
+    browserPaneSource,
+    /function publishBrowserSlotBounds\([\s\S]*?const slot = browserSurfaceSlot[\s\S]*?slot\.getBoundingClientRect\(\)[\s\S]*?updateBrowserSlot\([\s\S]*?bounds/,
+    '标记 Overlay 的内容槽必须来自当前 Browser Tab 的真实 DOM 槽位边界',
+  );
+  assert.match(
+    overlayManagerSource,
+    /if \(state\.kind === "annotation"\)\s*\{[\s\S]*?if \(!browserContentBounds\) throw new Error\("desktop_overlay_browser_content_unavailable"\);[\s\S]*?return \{ \.\.\.browserContentBounds \};/,
+    'Main 必须将标记 select/note 的 Overlay 直接铺满完整浏览器内容槽，保持选择和截图坐标系一致',
+  );
+  assert.match(
+    browserPaneSource,
+    /onOverlayAction\([\s\S]*?onOverlayClosed\(/,
+    'Desktop browser toolbar menus must receive actions and close notifications from the overlay surface',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /placement:\s*'right-pane-add'/,
+    'browser toolbar overlays must not take ownership of the unified right-pane chooser',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /\{#if !desktopRuntime && viewportMenuOpen/,
+    'ordinary Web entry must not expose Desktop viewport controls or a no-op viewport menu',
+  );
+  assert.match(
+    rightPaneSource,
+    /platformCapabilities\.desktopBrowserSurface === true/,
+    'browser creation must be gated by the explicit platform capability directory',
+  );
+  assert.match(
+    rightPaneSource,
+    /browser\.error\.desktopRequired/,
+    'ordinary Web entry must explain that real browser interaction requires Magi Desktop',
+  );
+  assert.match(
+    rightPaneSource,
+    /if \(desktopSurface\)[\s\S]*?createBrowserPane\(request\.url\)[\s\S]*?openExternalWebUrl\(externalUrl\)/,
+    'ordinary Web links must remain usable by opening in the external browser when no BrowserSurface exists',
+  );
+  assert.match(
+    rightPaneSource,
+    /\.\.\.\(canCreateBrowserPane \? \[\{[\s\S]*?kind: 'browser'/,
+    'unsupported Web clients must not expose a no-op browser item in the add-pane chooser',
   );
   assert.doesNotMatch(
     browserPaneSource,
@@ -230,6 +711,46 @@ assert.match(
   );
   assert.match(
     browserPaneSource,
+    /const browserSurfaceAvailable = \$derived\([\s\S]*?browserSlotHostAvailable[\s\S]*?desktopSnapshot\?\.layout\.activeSurfaceId[\s\S]*?const browserReady = \$derived\(browserSurfaceAvailable && browserSlotPublished\)/,
+    'browser readiness must use the current Main Surface and content-slot state',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /const browserSurfaceAvailable = \$derived\([\s\S]*?lifecycle === 'ready'/,
+    'an Authority lifecycle value must not gate the Desktop Surface before the Main snapshot converges',
+  );
+  assert.match(
+    browserPaneSource,
+    /const lifecycleFailure = \$derived\(lifecycle === 'crashed' \|\| activeTab\?\.lifecycle === 'crashed'\)/,
+    'Authority lifecycle failures must remain visible as an explicit crashed state',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /browserLoading \? i18n\.t\('browser\.status\.connecting'\)/,
+    'page loading must not be presented as a BrowserSurface connection failure',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /if \(loading \|\| !browserReady\) return 'connecting'/,
+    'metadata refresh must not block an already active BrowserSurface',
+  );
+  assert.match(
+    browserPaneSource,
+    /finally \{[\s\S]*?if \(desktopRuntime\) \{[\s\S]*?synchronizeDesktopSurface\(\)/,
+    'authority refresh completion must deterministically reconcile the active desktop surface without waiting for stale lifecycle metadata',
+  );
+  assert.match(
+    browserPaneSource,
+    /let addressEditing = \$state\(false\)[\s\S]*?if \(initialLoad \|\| !addressEditing\) address = nextUrl/,
+    'the address bar must synchronize authority URLs unless the user is actively editing',
+  );
+  assert.doesNotMatch(
+    browserPaneSource,
+    /address === lastObservedUrl/,
+    'address synchronization must not infer edit state from stale URL equality',
+  );
+  assert.match(
+    browserPaneSource,
     /window\.magiDesktop\?\.onBrowserEvent\(handleDesktopBrowserEvent\)/,
     'browser toolbar must observe Electron page navigation without owning the physical surface',
   );
@@ -245,7 +766,7 @@ assert.match(
   );
   assert.match(
     browserPaneSource,
-    /CUSTOM_VIEWPORT_DEBOUNCE_MILLIS[\s\S]*?oninput=\{scheduleCustomViewportUpdate\}/,
+    /CUSTOM_VIEWPORT_DEBOUNCE_MILLIS[\s\S]*?scheduleCustomViewportUpdate\(\)/,
     'custom viewport dimensions must update dynamically through one debounced path',
   );
   assert.match(
@@ -267,6 +788,26 @@ assert.match(
     browserPaneSource,
     /function selectSavedAnnotation[\s\S]*?magi:browserAnnotationCreated/,
     'browser annotations must expose one composer reference event',
+  );
+  assert.match(
+    browserPaneSource,
+    /openDesktopAnnotationCreation[\s\S]*?kind: 'annotation'[\s\S]*?phase: 'select'/,
+    'Browser Tab 必须提供可达的创建标记入口，并进入通用 annotation selection overlay',
+  );
+  assert.match(
+    browserPaneSource,
+    /parseAnnotationSelection[\s\S]*?navigationRevision[\s\S]*?openAnnotationCommentOverlay\(\)/,
+    '标记选择必须绑定当前导航版本并进入备注阶段',
+  );
+  assert.match(
+    browserPaneSource,
+    /createBrowserAnnotation\(tab\.tabId, selection, comment\)[\s\S]*?magi:browserAnnotationCreated/,
+    '标记备注保存必须 POST 权威 annotation，并把结果送入消息引用流程',
+  );
+  assert.match(
+    browserPaneSource,
+    /openDesktopAnnotationCreation[\s\S]*?browser\.action\.annotate/,
+    '添加标记按钮必须在 Browser Tab 工具栏可见且可操作',
   );
   assert.doesNotMatch(
     browserPaneSource,
@@ -316,6 +857,50 @@ assert.match(
     'each BrowserTabId must map to one top-level right-pane tab without LRU eviction',
   );
   assert.equal(browserPane.activeTabId, 'browser:browser-session:browser-tab-7');
+
+  rightPane.activateRightPaneSession('workspace-browser-lifecycle', 'session-browser-lifecycle');
+  rightPane.openBrowserTab('browser-session-lifecycle', 'browser-tab-lifecycle', {
+    workspaceId: 'workspace-browser-lifecycle',
+    workspacePath: '/tmp/workspace-browser-lifecycle',
+    sessionId: 'session-browser-lifecycle',
+    lifecycle: 'ready',
+  });
+  const lifecyclePane = rightPane.getRightPaneState(rightPane.rightPaneState.activeScopeKey);
+  assert.equal(
+    lifecyclePane.openTabs[0]?.payload.lifecycle,
+    'ready',
+    '创建响应中的 authority ready 必须直接进入右栏生命周期投影',
+  );
+  rightPane.openBrowserTab('browser-session-lifecycle', 'browser-tab-lifecycle', {
+    workspaceId: 'workspace-browser-lifecycle',
+    workspacePath: '/tmp/workspace-browser-lifecycle',
+    sessionId: 'session-browser-lifecycle',
+  });
+  assert.equal(
+    lifecyclePane.openTabs[0]?.payload.lifecycle,
+    'ready',
+    '本地 creating 注册不能覆盖已经到达的 authority ready',
+  );
+  rightPane.synchronizeBrowserSessionSnapshot({
+    browserSessionId: 'browser-session-lifecycle',
+    workspaceId: 'authority-workspace-id',
+    sessionId: 'session-browser-lifecycle',
+    agentOccupied: false,
+    tabs: [{
+      tabId: 'browser-tab-lifecycle',
+      lifecycle: 'ready',
+      url: 'https://example.com/lifecycle',
+      title: 'Lifecycle page',
+    }],
+  }, '/tmp/workspace-browser-lifecycle', {
+    workspaceId: 'workspace-browser-lifecycle',
+    sessionId: 'session-browser-lifecycle',
+  });
+  assert.equal(
+    lifecyclePane.openTabs[0]?.label,
+    'Lifecycle page',
+    '完整 authority 快照必须同时更新 Browser Tab 标签和生命周期',
+  );
 
   rightPane.activateRightPaneSession('', 'session-personal-browser');
   rightPane.openBrowserTab('browser-session-personal', 'browser-tab-personal', {
@@ -375,7 +960,6 @@ assert.match(
     'session-browser-sync',
     {
       browserSessionId: 'browser-session-sync',
-      activeTabId: 'browser-tab-sync-1',
       agentOccupied: false,
       tabs: [
         {
@@ -406,7 +990,6 @@ assert.match(
     'session-browser-sync',
     {
       browserSessionId: 'browser-session-sync',
-      activeTabId: 'browser-tab-sync-2',
       agentOccupied: true,
       tabs: [
         {
@@ -423,12 +1006,12 @@ assert.match(
         },
       ],
     },
-    { revealActiveTab: true, newTabLabel: '新标签页' },
+    { revealTabId: 'browser-tab-sync-2', newTabLabel: '新标签页' },
   );
   assert.equal(
     browserSyncPane.activeTabId,
     'browser:browser-session-sync:browser-tab-sync-2',
-    'a newly created authority Page must reveal its matching top-level pane',
+    'an explicitly created Page must reveal its matching top-level pane',
   );
   assert.equal(
     browserSyncPane.openTabs.find((tab) => tab.id.endsWith('browser-tab-sync-2'))?.label,
@@ -446,7 +1029,6 @@ assert.match(
     'session-browser-sync',
     {
       browserSessionId: 'browser-session-sync',
-      activeTabId: 'browser-tab-sync-1',
       agentOccupied: false,
       tabs: [
         {
@@ -467,7 +1049,7 @@ assert.match(
   assert.equal(
     browserSyncPane.activeTabId,
     'browser:browser-session-sync:browser-tab-sync-1',
-    'closing the active Page must follow BrowserAuthority activeTabId',
+    'closing the local active Page must choose a remaining local pane',
   );
   assert.equal(
     browserSyncPane.openTabs.find((tab) => tab.id.endsWith('browser-tab-sync-1'))?.payload.agentOccupied,

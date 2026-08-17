@@ -12,7 +12,7 @@
     OPEN_URL_IN_BROWSER_EVENT,
     type OpenUrlInBrowserRequest,
   } from '../lib/browser-navigation';
-  import { normalizeExternalWebUrl } from '../lib/external-link';
+  import { normalizeExternalWebUrl, openExternalWebUrl } from '../lib/external-link';
   import { addToast } from '../stores/messages.svelte';
   import { navigateSession, waitForSessionNavigation } from '../shared/session-navigation.svelte';
   import {
@@ -29,12 +29,14 @@
     setActiveRightPaneTab,
     updateRightPaneTabLabel,
     setRightPaneCollapsed,
+    clearPendingBrowserTabIntent,
     type RightPaneTab,
     type CodeTabPayload,
     type AgentTabPayload,
     type BrowserTabPayload,
     type TerminalTabPayload,
     openBrowserTab,
+    synchronizeBrowserSessionSnapshot,
     openTerminalTab,
   } from '../stores/right-pane.svelte';
   import {
@@ -43,6 +45,7 @@
     closeTerminalSession,
     createBrowserSession,
     createBrowserTab,
+    waitForBrowserTabReady,
     getBrowserCapabilities,
     materializeSession,
     getAgentChangeDiff,
@@ -59,7 +62,11 @@
     desktopSurface?: boolean;
   }
 
-  let { workspaceRoot, overlay = false, desktopSurface = false }: Props = $props();
+  let {
+    workspaceRoot,
+    overlay = false,
+    desktopSurface = false,
+  }: Props = $props();
 
   // ============ Tab 状态 ============
   const paneScopeKey = $derived(rightPaneState.activeScopeKey);
@@ -88,22 +95,17 @@
   });
 
   function closePane(): void {
-    if (desktopSurface && window.magiDesktop) {
-      void window.magiDesktop.submitLayoutIntent({
-        type: 'right_pane_visibility',
-        visible: false,
-      });
-      return;
-    }
     setRightPaneCollapsed(paneScopeKey, true);
   }
   let creatingBrowserPane = $state(false);
   let browserCapabilities = $state<BrowserCapabilitiesSnapshot | null>(null);
   let addPaneMenuOpen = $state(false);
   let addPaneMenuElement = $state<HTMLDivElement | undefined>(undefined);
+  let addPaneButtonElement = $state<HTMLButtonElement | undefined>(undefined);
   const canCreateBrowserPane = $derived(Boolean(
     desktopSurface
       && window.magiDesktop
+      && browserCapabilities?.platformCapabilities.desktopBrowserSurface === true
       && browserCapabilities?.inAppBrowserEnabled
   ));
   const canCreateTerminalPane = $derived(Boolean(
@@ -127,36 +129,51 @@
       const target = event.target;
       if (addPaneMenuElement && target instanceof Node && !addPaneMenuElement.contains(target)) {
         addPaneMenuOpen = false;
+        if (desktopSurface) void desktop?.closeOverlay();
       }
     };
     const handleEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') addPaneMenuOpen = false;
+      if (event.key === 'Escape') {
+        addPaneMenuOpen = false;
+        if (desktopSurface) void desktop?.closeOverlay();
+      }
     };
-    const handleOverlayAction = (action: {
-      kind?: string;
-      ownerId?: string;
-      interaction?: string;
-      id?: string;
-    }) => {
+    const desktop = desktopSurface ? window.magiDesktop : undefined;
+    const handleOverlayState = (state: MagiDesktopOverlayState) => {
+      if (!desktopSurface) return;
+      addPaneMenuOpen = state.ownerId === 'right-pane'
+        && state.placement === 'right-pane-add';
+    };
+    const handleOverlayAction = (action: MagiDesktopOverlayAction) => {
       if (
         action.kind !== 'menu'
         || action.ownerId !== 'right-pane'
         || action.interaction !== 'select'
-        || typeof action.id !== 'string'
       ) return;
       addPaneMenuOpen = false;
-      if (action.id === 'browser' || action.id === 'terminal') chooseAddPane(action.id);
+      if (action.id === 'browser' || action.id === 'terminal') {
+        chooseAddPane(action.id);
+      }
     };
-    const unsubscribeOverlayAction = desktopSurface
-      ? window.magiDesktop?.onOverlayAction(handleOverlayAction)
-      : undefined;
-    const unsubscribeOverlayClosed = desktopSurface
-      ? window.magiDesktop?.onOverlayClosed(() => { addPaneMenuOpen = false; })
-      : undefined;
+    const unsubscribeOverlayState = desktop?.onOverlayState(handleOverlayState);
+    const unsubscribeOverlayAction = desktop?.onOverlayAction(handleOverlayAction);
+    const unsubscribeOverlayClosed = desktop?.onOverlayClosed(() => {
+      addPaneMenuOpen = false;
+    });
     const handleOpenUrlInBrowser = (event: Event) => {
       const request = (event as CustomEvent<OpenUrlInBrowserRequest>).detail;
       if (!request?.url) return;
-      void createBrowserPane(request.url);
+      if (desktopSurface) {
+        void createBrowserPane(request.url);
+        return;
+      }
+      // Web 和手机 Web 没有物理 BrowserSurface。链接仍需保持可用，
+      // 直接交给系统浏览器，避免点击后只得到一条无法继续操作的提示。
+      const externalUrl = normalizeExternalWebUrl(request.url);
+      if (!externalUrl) return;
+      void openExternalWebUrl(externalUrl).catch(() => {
+        addToast('error', i18n.t('browser.error.openExternal'), undefined, { forceVisible: true });
+      });
     };
     window.addEventListener('pointerdown', handleOutsidePointer);
     window.addEventListener('keydown', handleEscape);
@@ -166,6 +183,7 @@
       window.removeEventListener('pointerdown', handleOutsidePointer);
       window.removeEventListener('keydown', handleEscape);
       window.removeEventListener(OPEN_URL_IN_BROWSER_EVENT, handleOpenUrlInBrowser);
+      unsubscribeOverlayState?.();
       unsubscribeOverlayAction?.();
       unsubscribeOverlayClosed?.();
     };
@@ -198,19 +216,73 @@
     workspaceId: string,
     sessionId: string,
     workspacePath?: string,
+    lifecycle?: BrowserTabPayload['lifecycle'],
   ): void {
     openBrowserTab(browserSessionId, tabId, {
       workspaceId,
       workspacePath,
       sessionId,
       label: i18n.t('browser.tab.new'),
+      lifecycle,
     });
+    // 创建响应和 Authority 事件可能以任意顺序到达。无论响应已经是 ready
+    // 还是仍处于 creating，都必须走一次同一条权威收敛链路并显式 reveal
+    // 新 Tab，否则后台事件只会把 Tab 插入列表，当前选中项仍停留在旧 Tab。
+    // waitForBrowserTabReady 对 ready 结果会立即返回，因此这里不会额外阻塞
+    // 已经完成的创建。
+    reconcileCreatedBrowserPane(
+      browserSessionId,
+      tabId,
+      workspaceId,
+      sessionId,
+      workspacePath,
+    );
+  }
+
+  function reconcileCreatedBrowserPane(
+    browserSessionId: string,
+    tabId: string,
+    workspaceId: string,
+    sessionId: string,
+    workspacePath?: string,
+  ): void {
+    void waitForBrowserTabReady(browserSessionId, tabId)
+      .then((snapshot) => {
+        synchronizeBrowserSessionSnapshot(snapshot, workspacePath, {
+          workspaceId,
+          sessionId,
+          revealTabId: tabId,
+          newTabLabel: i18n.t('browser.tab.new'),
+        });
+      })
+      .catch((error) => {
+        // 超时或权威请求失败不能继续保留 creating，否则 UI 会永久显示“正在连接”。
+        // crashed 是 Authority 已定义的明确失败态；后续用户再次激活时仍可通过
+        // activateBrowserTab 走恢复流程，不会丢失逻辑 Tab。
+        openBrowserTab(browserSessionId, tabId, {
+          workspaceId,
+          workspacePath,
+          sessionId,
+          label: i18n.t('browser.tab.new'),
+          lifecycle: 'crashed',
+        });
+        console.warn('[RightPane] 浏览器 Tab 权威状态收敛失败，已进入失败态:', {
+          browserSessionId,
+          tabId,
+          workspaceId,
+          sessionId,
+          error,
+        });
+      });
   }
 
   async function createBrowserPane(initialUrl = 'about:blank'): Promise<void> {
     if (creatingBrowserPane) return;
     if (!canCreateBrowserPane) {
-      addToast('warning', i18n.t('browser.error.internalUnavailable'), undefined, { forceVisible: true });
+      const message = desktopSurface
+        ? i18n.t('browser.error.internalUnavailable')
+        : i18n.t('browser.error.desktopRequired');
+      addToast('warning', message, undefined, { forceVisible: true });
       return;
     }
     const targetUrl = initialUrl === 'about:blank'
@@ -257,6 +329,7 @@
         workspaceId,
         sessionId,
         workspaceRoot,
+        tab.lifecycle,
       );
     } catch (error) {
       console.warn('[RightPane] 新建浏览器面板失败:', error);
@@ -283,12 +356,12 @@
       icon: 'terminal' as const,
       enabled: canCreateTerminalPane,
     },
-    {
+    ...(canCreateBrowserPane ? [{
       kind: 'browser' as const,
       label: i18n.t('rightPane.addPanelBrowser'),
       icon: 'globe' as const,
-      enabled: canCreateBrowserPane,
-    },
+      enabled: true,
+    }] : []),
   ]);
   const canOpenAddPaneMenu = $derived(addablePaneKinds.some((item) => item.enabled));
 
@@ -296,16 +369,30 @@
     // 浏览器 Surface 创建是异步的，但新增面板选择器属于右栏通用能力。
     // 浏览器正在连接时，代码、图片、终端和其他面板仍必须可以打开。
     if (!canOpenAddPaneMenu) return;
-    addPaneMenuOpen = !addPaneMenuOpen;
-    if (!desktopSurface || !window.magiDesktop) return;
-    if (!addPaneMenuOpen) {
+    if (!desktopSurface || !window.magiDesktop) {
+      addPaneMenuOpen = !addPaneMenuOpen;
+      return;
+    }
+    if (addPaneMenuOpen) {
+      addPaneMenuOpen = false;
       void window.magiDesktop.closeOverlay();
       return;
     }
+    const anchor = addPaneButtonElement?.getBoundingClientRect();
+    if (!anchor || anchor.width <= 0 || anchor.height <= 0) return;
+    addPaneMenuOpen = true;
     void window.magiDesktop.openOverlay({
+      overlayId: 'right-pane-add',
       kind: 'menu',
+      phase: 'menu',
       ownerId: 'right-pane',
       placement: 'right-pane-add',
+      anchorBounds: {
+        x: anchor.left,
+        y: anchor.top,
+        width: anchor.width,
+        height: anchor.height,
+      },
       title: i18n.t('rightPane.addPanel'),
       items: addablePaneKinds.map((item) => ({
         id: item.kind,
@@ -323,7 +410,6 @@
 
   function chooseAddPane(kind: RightPaneCreationKind): void {
     addPaneMenuOpen = false;
-    if (desktopSurface) void window.magiDesktop?.closeOverlay();
     if (kind === 'browser') {
       void createBrowserPane();
       return;
@@ -343,7 +429,8 @@
   });
 
   // 右侧一级 Tab 是用户当前查看页面的唯一选择源。Desktop Renderer 只向 Main
-  // 提交激活意图，物理 BrowserSurface 的创建、层级和 bounds 均由 Main 管理。
+  // 提交逻辑激活意图；原生 WebContentsView 由 Main 进程持有，Renderer 只
+  // 提供当前浏览器 Tab 的内容槽位。
   let activeBrowserActivationKey = '';
   let activeBrowserActivationRequest = 0;
   $effect(() => {
@@ -354,8 +441,17 @@
       return;
     }
     const payload = current.payload as BrowserTabPayload;
-    const activationKey = `${payload.browserSessionId}\u0000${payload.tabId}`;
+    const activationIdentity = `${payload.browserSessionId}\u0000${payload.tabId}`;
+    const activationKey = `${activationIdentity}\u0000${payload.lifecycle}`;
     if (activationKey === activeBrowserActivationKey) return;
+    if (payload.lifecycle === 'creating') {
+      // 创建请求只注册逻辑 Tab，必须等待 waitForBrowserTabReady 的权威
+      // 快照把状态推进到 ready 后再激活。清空 key 也会取消同一 Tab
+      // 上一次尚未完成的激活，避免旧请求重新抢占当前内容槽。
+      activeBrowserActivationRequest += 1;
+      activeBrowserActivationKey = '';
+      return;
+    }
     activeBrowserActivationKey = activationKey;
     const request = ++activeBrowserActivationRequest;
     void activateBrowserTab(payload.tabId)
@@ -365,6 +461,16 @@
         if (!desktop) throw new Error('desktop_preload_bridge_unavailable');
         const tab = authority.tabs.find((candidate) => candidate.tabId === payload.tabId);
         if (!tab) throw new Error(`browser_tab_not_found:${payload.tabId}`);
+        // activateBrowserTab 已经完成 Host RestorePage 并将恢复的 suspended/
+        // crashed Tab 收敛为 ready。接口返回的快照是这次激活的权威结果，
+        // 必须在等待 Main 原生 Surface 布局前先回写右栏，否则
+        // BrowserTabContent 仍会以旧 lifecycle 阻止内容槽发布，表现为
+        // “正在连接”，直到用户新建另一个 Tab 才被全量同步掩盖。
+        activeBrowserActivationKey = `${activationIdentity}\u0000${tab.lifecycle}`;
+        synchronizeBrowserSessionSnapshot(authority, payload.workspacePath, {
+          workspaceId: payload.workspaceId,
+          sessionId: payload.sessionId,
+        });
         await desktop.activateBrowser({
           tabId: tab.tabId,
           browserSessionId: authority.browserSessionId,
@@ -375,6 +481,7 @@
       })
       .catch((error) => {
         if (request !== activeBrowserActivationRequest) return;
+        clearPendingBrowserTabIntent(paneScopeKey, payload.tabId);
         activeBrowserActivationKey = '';
         console.warn('[RightPane] 激活浏览器面板失败:', error);
         addToast('error', i18n.t('browser.error.openInternal'), undefined, { forceVisible: true });
@@ -792,6 +899,13 @@
 
   let openingHtmlInBrowser = $state(false);
   async function openHtmlInMagiBrowser(): Promise<void> {
+    if (!canCreateBrowserPane) {
+      const message = desktopSurface
+        ? i18n.t('browser.error.internalUnavailable')
+        : i18n.t('browser.error.desktopRequired');
+      addToast('warning', message, undefined, { forceVisible: true });
+      return;
+    }
     const workspaceId = activeCodePayload?.workspaceId?.trim() || '';
     const sessionId = activeCodePayload?.sessionId?.trim() || '';
     if (!htmlFile || !activeFilePreviewQuery || !workspaceId || !sessionId || openingHtmlInBrowser) return;
@@ -1080,6 +1194,7 @@
     {#if canOpenAddPaneMenu}
       <div bind:this={addPaneMenuElement} class="right-pane-add-wrap">
         <button
+          bind:this={addPaneButtonElement}
           type="button"
           class="right-pane-add-tab"
           data-open-tab-count={openTabs.length}
@@ -1093,7 +1208,7 @@
         >
           <Icon name={creatingBrowserPane ? 'loader' : 'plus'} size={14} />
         </button>
-        {#if !desktopSurface && addPaneMenuOpen}
+        {#if addPaneMenuOpen && !desktopSurface}
           <div class="right-pane-add-menu" role="menu" aria-label={i18n.t('rightPane.addPanel')}>
             {#each addablePaneKinds as item (item.kind)}
               <button
@@ -1134,7 +1249,7 @@
                 onclick={() => setDocumentMode('raw')}
               >{i18n.t('web.filePreviewRaw')}</button>
             </div>
-          {:else if htmlFile}
+          {:else if htmlFile && canCreateBrowserPane}
             <button
               type="button"
               class="right-pane-document-icon-action"
@@ -1175,6 +1290,11 @@
       <BrowserTabContent
         browserSessionId={browserPayload.browserSessionId}
         tabId={browserPayload.tabId}
+        lifecycle={browserPayload.lifecycle}
+        workspaceId={browserPayload.workspaceId}
+        workspacePath={browserPayload.workspacePath}
+        sessionId={browserPayload.sessionId}
+        desktopSurface={desktopSurface}
         onTitleChange={(label) => updateRightPaneTabLabel(paneScopeKey, activeTab.id, label)}
       />
     {:else if activeTab.kind === 'terminal'}
@@ -1523,7 +1643,7 @@
     height: 7px;
     flex: 0 0 auto;
     border-radius: 50%;
-    background: var(--foreground-subtle);
+    background: var(--foreground-muted);
   }
 
   .browser-control-status.occupied {
@@ -1627,6 +1747,7 @@
 
   /* ============ Body ============ */
   .right-pane-body {
+    min-width: 0;
     min-height: 0;
     flex: 1;
     overflow: auto;
@@ -1641,6 +1762,9 @@
   }
 
   .right-pane-body--browser {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
     overflow: hidden;
     padding: 0;
   }

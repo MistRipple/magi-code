@@ -13,14 +13,16 @@ pub struct HealthDto {
     pub status: String,
     pub service_name: String,
     pub api_version: String,
+    pub runtime_epoch: String,
 }
 
 impl HealthDto {
-    pub fn from_service_info(service_info: &ServiceInfo) -> Self {
+    pub fn from_service_info(service_info: &ServiceInfo, runtime_epoch: &str) -> Self {
         Self {
             status: "ok".to_string(),
             service_name: service_info.service_name.clone(),
             api_version: service_info.api_version.clone(),
+            runtime_epoch: runtime_epoch.to_string(),
         }
     }
 }
@@ -56,11 +58,12 @@ mod tests {
 
     #[test]
     fn health_dto_is_derived_from_service_info() {
-        let dto = HealthDto::from_service_info(&service_info());
+        let dto = HealthDto::from_service_info(&service_info(), "runtime-test");
 
         assert_eq!(dto.status, "ok");
         assert_eq!(dto.service_name, "magi");
         assert_eq!(dto.api_version, "v0");
+        assert_eq!(dto.runtime_epoch, "runtime-test");
     }
 
     #[test]

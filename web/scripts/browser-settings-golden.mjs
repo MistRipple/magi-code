@@ -6,6 +6,22 @@ const source = fs.readFileSync(
   path.resolve('src/components/SettingsBrowserTab.svelte'),
   'utf8',
 );
+const desktopMainSource = fs.readFileSync(
+  path.resolve('../apps/desktop/src/main/index.ts'),
+  'utf8',
+);
+const desktopPreloadSource = fs.readFileSync(
+  path.resolve('../apps/desktop/src/preload/index.ts'),
+  'utf8',
+);
+const desktopTypesSource = fs.readFileSync(
+  path.resolve('src/types/magi-desktop.d.ts'),
+  'utf8',
+);
+const agentApiSource = fs.readFileSync(
+  path.resolve('src/web/agent-api.ts'),
+  'utf8',
+);
 const zhCN = JSON.parse(fs.readFileSync(path.resolve('src/i18n/zh-CN.json'), 'utf8'));
 const enUS = JSON.parse(fs.readFileSync(path.resolve('src/i18n/en-US.json'), 'utf8'));
 
@@ -14,6 +30,10 @@ assert.doesNotMatch(source, /runtimeStatus|runtimeMode|playwrightVersion|hostVer
 
 assert.match(source, /getBrowserCapabilities\(\)/);
 assert.match(source, /updateBrowserSettings\(/);
+assert.match(agentApiSource, /browserClientPlatform\(\)/);
+assert.match(agentApiSource, /platformCapabilities/);
+assert.match(agentApiSource, /clientPlatform/);
+assert.match(agentApiSource, /'desktop' \| 'web' \| 'mobile-web'/);
 assert.match(source, /inAppBrowserEnabled/);
 assert.match(source, /browserUseEnabled/);
 
@@ -21,8 +41,16 @@ assert.match(source, /const desktop = window\.magiDesktop;[\s\S]*?desktop\?\.run
 assert.match(source, /desktop\.getBrowserComponentInfo\(\)/);
 assert.match(source, /desktop\.restartBrowserAutomation\(\)/);
 assert.match(source, /desktop\.clearBrowserData\(\)/);
-assert.match(source, /desktop\.checkForUpdates\(\)/);
-assert.match(source, /desktop\.onUpdate\(/);
+assert.match(source, /checkForDesktopUpdate\('manual'\)/);
+assert.doesNotMatch(source, /desktop\.checkForUpdates\(\)/);
+assert.match(source, /desktop\.onBrowserComponent\(/);
+assert.match(source, /MagiDesktopBrowserComponentSnapshot/);
+assert.match(desktopMainSource, /function browserComponentSnapshot\(/);
+assert.match(desktopMainSource, /broadcastAll\("magi-desktop:browser-component"/);
+assert.doesNotMatch(desktopMainSource, /app\.getVersion\(\)/);
+assert.match(desktopPreloadSource, /onBrowserComponent/);
+assert.match(desktopTypesSource, /interface MagiDesktopBrowserComponentSnapshot/);
+assert.match(desktopTypesSource, /onBrowserComponent\(/);
 
 assert.match(source, /activeAction === 'refresh-components'/);
 assert.match(source, /activeAction !== action/);

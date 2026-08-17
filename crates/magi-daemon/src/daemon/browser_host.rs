@@ -1,13 +1,15 @@
 use std::{env, fmt, time::Duration};
 
-use magi_api::{ApiState, BrowserHostStatusSnapshot};
+use magi_api::{ApiState, BrowserHostConnectionConfig, BrowserHostStatusSnapshot};
 use magi_browser_authority::{
     BrowserHostClient, BrowserHostClientError, BrowserHostEvent, BrowserHostHandshake,
     BrowserHostIncomingEvent, BrowserHostStatus, BrowserLeaseEndReason, BrowserSessionLifecycle,
 };
 use magi_core::{BrowserTabId, EventId, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
-use tokio::sync::broadcast;
+use magi_tool_runtime::ToolRegistry;
+use sysinfo::{Pid, ProcessesToUpdate, System};
+use tokio::sync::{broadcast, watch};
 
 const DESKTOP_CONTROL_SOCKET_ENV: &str = "MAGI_DESKTOP_CONTROL_SOCKET";
 const DESKTOP_CONTROL_TOKEN_ENV: &str = "MAGI_DESKTOP_CONTROL_TOKEN";
@@ -17,6 +19,8 @@ const DESKTOP_CONNECT_ATTEMPTS: usize = 3;
 const DESKTOP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DESKTOP_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(8);
 const DESKTOP_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const DESKTOP_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+const DESKTOP_PARENT_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DesktopBrowserConnectionConfig {
@@ -24,6 +28,7 @@ struct DesktopBrowserConnectionConfig {
     auth_token: String,
     desktop_epoch: String,
     parent_pid: u32,
+    generation: u64,
 }
 
 impl DesktopBrowserConnectionConfig {
@@ -59,7 +64,31 @@ impl DesktopBrowserConnectionConfig {
             auth_token,
             desktop_epoch,
             parent_pid,
+            generation: 0,
         })
+    }
+
+    fn from_runtime(
+        config: BrowserHostConnectionConfig,
+    ) -> Result<Self, DesktopBrowserConfigError> {
+        let mut runtime = Self::from_values(
+            config.socket_path,
+            config.auth_token,
+            config.desktop_epoch,
+            config.parent_pid.to_string(),
+        )?;
+        runtime.generation = config.generation;
+        Ok(runtime)
+    }
+
+    fn public(&self) -> BrowserHostConnectionConfig {
+        BrowserHostConnectionConfig {
+            socket_path: self.socket_path.clone(),
+            auth_token: self.auth_token.clone(),
+            desktop_epoch: self.desktop_epoch.clone(),
+            parent_pid: self.parent_pid,
+            generation: self.generation,
+        }
     }
 }
 
@@ -106,10 +135,11 @@ pub(super) fn start_controller(state: &ApiState) {
         tracing::error!(%error, "恢复浏览器逻辑会话失败");
     }
 
-    let config = match DesktopBrowserConnectionConfig::from_env() {
-        Ok(config) => config,
+    match DesktopBrowserConnectionConfig::from_env() {
+        Ok(config) => state.set_browser_host_connection_config(Some(config.public())),
         Err(error) => {
             tracing::warn!(%error, "Electron Desktop 浏览器控制上下文不可用");
+            state.set_browser_host_connection_config(None);
             set_host_status(
                 state,
                 BrowserHostStatus::Failed,
@@ -119,19 +149,8 @@ pub(super) fn start_controller(state: &ApiState) {
                 None,
             );
             publish_host_status(state);
-            return;
         }
-    };
-
-    set_host_status(
-        state,
-        BrowserHostStatus::Starting,
-        "starting",
-        false,
-        None,
-        None,
-    );
-    publish_host_status(state);
+    }
 
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         set_host_status(
@@ -148,18 +167,99 @@ pub(super) fn start_controller(state: &ApiState) {
     };
 
     let state = state.clone();
-    handle.spawn(async move {
-        run_desktop_browser_controller(state, config).await;
-    });
+    handle.spawn(monitor_desktop_parent_process(state.clone()));
+    handle.spawn(async move { run_desktop_browser_controller(state).await });
 }
 
-async fn run_desktop_browser_controller(state: ApiState, config: DesktopBrowserConnectionConfig) {
-    let mut reconnecting = false;
+/// Electron owns the daemon in Desktop mode. The connection socket alone is
+/// not sufficient as a lifecycle boundary: a hard Electron crash can leave a
+/// daemon listening on the development port with stale browser leases. Keep a
+/// process-level watchdog tied to the registered parent PID and terminate the
+/// daemon after synchronously closing its execution resources.
+async fn monitor_desktop_parent_process(state: ApiState) {
+    let mut system = System::new();
     loop {
-        let Some((client, handshake)) = connect_with_retries(&state, &config, reconnecting).await
-        else {
-            return;
+        let Some(config) = state.browser_host_connection_config() else {
+            tokio::time::sleep(DESKTOP_PARENT_PROCESS_POLL_INTERVAL).await;
+            continue;
         };
+        let parent_pid = Pid::from_u32(config.parent_pid);
+        if !is_process_alive(&mut system, parent_pid) {
+            let still_owned = state
+                .browser_host_connection_config()
+                .is_some_and(|current| {
+                    current.parent_pid == config.parent_pid
+                        && current.desktop_epoch == config.desktop_epoch
+                        && current.generation == config.generation
+                });
+            if still_owned {
+                tracing::error!(
+                    parent_pid = config.parent_pid,
+                    desktop_epoch = %config.desktop_epoch,
+                    "Electron Desktop 已退出，daemon 正在收口浏览器运行资源"
+                );
+                interrupt_browser_tasks_for_runtime_failure(&state);
+                let cancelled_process_count = ToolRegistry::cancel_all_active_processes();
+                let cancelled_managed_process_count =
+                    magi_process::terminate_all_managed_processes();
+                tracing::info!(
+                    cancelled_process_count,
+                    cancelled_managed_process_count,
+                    "Desktop parent death 清理已完成，daemon 即将退出"
+                );
+                std::process::exit(0);
+            }
+        }
+        tokio::time::sleep(DESKTOP_PARENT_PROCESS_POLL_INTERVAL).await;
+    }
+}
+
+fn is_process_alive(system: &mut System, pid: Pid) -> bool {
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    system.process(pid).is_some()
+}
+
+async fn run_desktop_browser_controller(state: ApiState) {
+    let mut reconnecting = false;
+    let mut active_config: Option<DesktopBrowserConnectionConfig> = None;
+    let mut config_rx = state.browser_host_connection_receiver();
+    loop {
+        let Some(config) = state
+            .browser_host_connection_config()
+            .and_then(|config| DesktopBrowserConnectionConfig::from_runtime(config).ok())
+        else {
+            active_config = None;
+            reconnecting = false;
+            set_waiting_status(&state);
+            if config_rx.changed().await.is_err() {
+                return;
+            }
+            continue;
+        };
+        if active_config.as_ref() != Some(&config) {
+            active_config = Some(config.clone());
+            reconnecting = false;
+        }
+        let Some((client, handshake)) =
+            connect_with_retries(&state, &config, reconnecting, &mut config_rx).await
+        else {
+            continue;
+        };
+        if state
+            .browser_host_connection_config()
+            .and_then(|current| DesktopBrowserConnectionConfig::from_runtime(current).ok())
+            .as_ref()
+            != Some(&config)
+        {
+            client.close().await;
+            continue;
+        }
+        state
+            .mutate_browser_authority(|authority| {
+                authority.accept_desktop_epoch(handshake.desktop_epoch.clone(), UtcMillis::now());
+                Ok(())
+            })
+            .expect("Desktop epoch should be accepted by BrowserAuthority");
         let mut events = client.subscribe();
         let generation = state.set_browser_host_client(Some(client.clone()));
         set_host_status(
@@ -172,12 +272,23 @@ async fn run_desktop_browser_controller(state: ApiState, config: DesktopBrowserC
         );
         publish_host_status(&state);
 
-        let disconnect = monitor_desktop_connection(&state, &client, &mut events, generation).await;
+        let disconnect =
+            monitor_desktop_connection(&state, &client, &mut events, generation, &mut config_rx)
+                .await;
         if state.browser_host_generation() == generation {
             state.set_browser_host_client(None);
         }
         client.close().await;
         tracing::warn!(reason = disconnect, "Electron Desktop 浏览器控制连接中断");
+
+        if disconnect == "configuration_changed" {
+            // 清理连接也可能由 Worker 崩溃触发。配置通道变化意味着旧
+            // Desktop 运行边界已经失效，必须先撤销所有 Agent Lease，
+            // 再等待新的 Worker/Host 注册，避免旧 Lease 跨代残留。
+            interrupt_browser_tasks_for_runtime_failure(&state);
+            reconnecting = false;
+            continue;
+        }
 
         // Desktop 页面由 Electron Main 持有。daemon 断线只撤销 Agent 控制边界，
         // 不关闭逻辑 Tab、不销毁 Surface，也不改变页面当前状态。
@@ -195,10 +306,32 @@ async fn run_desktop_browser_controller(state: ApiState, config: DesktopBrowserC
     }
 }
 
+fn set_waiting_status(state: &ApiState) {
+    let current = state.browser_host_status();
+    if current.status == BrowserHostStatus::Stopped && current.last_error_code.is_none() {
+        return;
+    }
+    if current.status == BrowserHostStatus::Failed
+        && current.last_error_code.as_deref() == Some("browser_desktop_context_missing")
+    {
+        return;
+    }
+    set_host_status(
+        state,
+        BrowserHostStatus::Failed,
+        "failed",
+        false,
+        Some("browser_desktop_context_missing".to_string()),
+        None,
+    );
+    publish_host_status(state);
+}
+
 async fn connect_with_retries(
     state: &ApiState,
     config: &DesktopBrowserConnectionConfig,
     reconnecting: bool,
+    config_rx: &mut watch::Receiver<Option<BrowserHostConnectionConfig>>,
 ) -> Option<(BrowserHostClient, BrowserHostHandshake)> {
     let mut last_error = None;
     for attempt in 1..=DESKTOP_CONNECT_ATTEMPTS {
@@ -221,15 +354,22 @@ async fn connect_with_retries(
         );
         publish_host_status(state);
 
-        match BrowserHostClient::connect_desktop_socket(
-            &config.socket_path,
-            &config.auth_token,
-            &config.desktop_epoch,
-            config.parent_pid,
-            DESKTOP_HANDSHAKE_TIMEOUT,
-        )
-        .await
-        {
+        let connection = tokio::select! {
+            result = BrowserHostClient::connect_desktop_socket(
+                &config.socket_path,
+                &config.auth_token,
+                &config.desktop_epoch,
+                config.parent_pid,
+                DESKTOP_HANDSHAKE_TIMEOUT,
+            ) => result,
+            changed = config_rx.changed() => {
+                if changed.is_ok() {
+                    return None;
+                }
+                return None;
+            }
+        };
+        match connection {
             Ok(connection) => return Some(connection),
             Err(error) => {
                 let error_code = desktop_connection_error_code(&error);
@@ -239,7 +379,15 @@ async fn connect_with_retries(
         }
 
         if attempt < DESKTOP_CONNECT_ATTEMPTS {
-            tokio::time::sleep(DESKTOP_RETRY_BASE_DELAY * attempt as u32).await;
+            tokio::select! {
+                _ = tokio::time::sleep(DESKTOP_RETRY_BASE_DELAY * attempt as u32) => {}
+                changed = config_rx.changed() => {
+                    if changed.is_ok() {
+                        return None;
+                    }
+                    return None;
+                }
+            }
         }
     }
 
@@ -248,8 +396,8 @@ async fn connect_with_retries(
         .map_or("browser_not_ready", |(code, _)| *code);
     set_host_status(
         state,
-        BrowserHostStatus::Failed,
-        "failed",
+        BrowserHostStatus::Reconnecting,
+        "reconnecting",
         false,
         Some(error_code.to_string()),
         None,
@@ -257,6 +405,14 @@ async fn connect_with_retries(
     publish_host_status(state);
     if let Some((_, error)) = last_error {
         tracing::error!(error = %error, "Electron Desktop 浏览器有限重连已耗尽");
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(DESKTOP_RECONNECT_BACKOFF) => {}
+        changed = config_rx.changed() => {
+            if changed.is_err() {
+                return None;
+            }
+        }
     }
     None
 }
@@ -275,6 +431,7 @@ fn desktop_connection_error_code(error: &BrowserHostClientError) -> &'static str
         | BrowserHostClientError::Json(_)
         | BrowserHostClientError::Disconnected
         | BrowserHostClientError::RequestTimeout(_)
+        | BrowserHostClientError::UnexpectedResponse(_)
         | BrowserHostClientError::UnexpectedBinaryPayload
         | BrowserHostClientError::BinarySizeMismatch { .. }
         | BrowserHostClientError::BinaryHashMismatch => "browser_not_ready",
@@ -286,17 +443,30 @@ async fn monitor_desktop_connection(
     client: &BrowserHostClient,
     events: &mut broadcast::Receiver<BrowserHostIncomingEvent>,
     generation: u64,
+    config_rx: &mut watch::Receiver<Option<BrowserHostConnectionConfig>>,
 ) -> &'static str {
     loop {
-        match tokio::time::timeout(DESKTOP_HEARTBEAT_TIMEOUT, events.recv()).await {
-            Ok(Ok(event)) => handle_host_event(state, event, generation),
-            Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
-                tracing::warn!(skipped, "Electron Desktop 浏览器事件接收滞后");
+        tokio::select! {
+            event = tokio::time::timeout(DESKTOP_HEARTBEAT_TIMEOUT, events.recv()) => {
+                match event {
+                    Ok(Ok(event)) => handle_host_event(state, event, generation),
+                    Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                        tracing::warn!(skipped, "Electron Desktop 浏览器事件接收滞后");
+                    }
+                    Ok(Err(broadcast::error::RecvError::Closed)) => return "event_stream_closed",
+                    Err(_) => {
+                        client.close().await;
+                        return "heartbeat_timeout";
+                    }
+                }
             }
-            Ok(Err(broadcast::error::RecvError::Closed)) => return "event_stream_closed",
-            Err(_) => {
+            changed = config_rx.changed() => {
+                if changed.is_ok() {
+                    client.close().await;
+                    return "configuration_changed";
+                }
                 client.close().await;
-                return "heartbeat_timeout";
+                return "configuration_channel_closed";
             }
         }
     }
@@ -364,16 +534,15 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
     match event.envelope.event {
         BrowserHostEvent::PrimarySurfaceChanged { binding } => {
             let context = browser_tab_context(state, &binding.tab_id);
-            let revoked = state.mutate_browser_authority(|authority| {
-                authority.set_primary_surface(
-                    &binding.tab_id,
-                    binding.surface_id.clone(),
-                    binding.surface_revision,
-                    UtcMillis::now(),
-                )
+            let result = state.mutate_browser_authority(|authority| {
+                let revoked = authority.set_primary_surface(binding.clone(), UtcMillis::now())?;
+                let accepted = authority
+                    .primary_surface(&binding.tab_id)
+                    .is_some_and(|surface| surface == &binding);
+                Ok((revoked, accepted))
             });
-            match revoked {
-                Ok(revoked) => {
+            match result {
+                Ok((revoked, true)) => {
                     publish_tab_event(
                         state,
                         "browser.surface.primary_changed",
@@ -393,6 +562,12 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
                         );
                     }
                 }
+                Ok((_, false)) => tracing::debug!(
+                    tab_id = %binding.tab_id,
+                    surface_id = %binding.surface_id,
+                    surface_revision = binding.surface_revision,
+                    "忽略旧 Browser Surface 主页面事件"
+                ),
                 Err(error) => tracing::debug!(
                     tab_id = %binding.tab_id,
                     ?error,
@@ -403,40 +578,81 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
         BrowserHostEvent::UserTakeover { binding } => {
             revoke_surface_control(
                 state,
-                &binding.tab_id,
+                &binding,
                 BrowserLeaseEndReason::UserTakeover,
                 "user_takeover",
             );
         }
         BrowserHostEvent::ControlRevoked { binding, reason } => {
             let lease_reason = control_revocation_reason(&reason);
-            revoke_surface_control(state, &binding.tab_id, lease_reason, &reason);
+            revoke_surface_control(state, &binding, lease_reason, &reason);
         }
-        BrowserHostEvent::PageUpdated(page_state) => {
-            let context = browser_tab_context(state, &page_state.tab_id);
+        BrowserHostEvent::PageUpdated {
+            binding,
+            page_state,
+        } => {
+            if page_state.tab_id != binding.tab_id
+                || page_state.navigation_revision != binding.navigation_revision
+            {
+                tracing::debug!(
+                    tab_id = %binding.tab_id,
+                    "忽略页面状态与 Surface binding 不一致的事件"
+                );
+                return;
+            }
+            let context = browser_tab_context(state, &binding.tab_id);
             match state.mutate_browser_authority(|authority| {
-                authority.apply_host_page_state(
-                    &page_state.tab_id,
-                    page_state.navigation_revision,
-                    page_state.url.clone(),
-                    page_state.origin.clone(),
-                    page_state.title.clone(),
-                    UtcMillis::now(),
-                )
+                let (accepted, revoked) =
+                    authority.accept_page_binding(&binding, UtcMillis::now())?;
+                if !accepted {
+                    return Ok((None, revoked));
+                }
+                authority
+                    .apply_host_page_state(
+                        &page_state.tab_id,
+                        page_state.navigation_revision,
+                        page_state.url.clone(),
+                        page_state.origin.clone(),
+                        page_state.title.clone(),
+                        UtcMillis::now(),
+                    )
+                    .map(|tab| (Some(tab), revoked))
             }) {
-                Ok(_) => publish_tab_event(
-                    state,
-                    "browser.tab.updated",
-                    context,
-                    serde_json::json!({
-                        "tab_id": page_state.tab_id,
-                        "url": page_state.url,
-                        "title": page_state.title,
-                        "navigation_revision": page_state.navigation_revision,
-                    }),
+                Ok((Some(_), revoked)) => {
+                    publish_tab_event(
+                        state,
+                        "browser.tab.updated",
+                        context.clone(),
+                        serde_json::json!({
+                            "tab_id": page_state.tab_id,
+                            "url": page_state.url,
+                            "title": page_state.title,
+                            "navigation_revision": page_state.navigation_revision,
+                            "binding": binding,
+                        }),
+                    );
+                    if !revoked.is_empty() {
+                        publish_tab_event(
+                            state,
+                            "browser.control.revoked",
+                            context,
+                            serde_json::json!({
+                                "tab_id": binding.tab_id,
+                                "binding": binding,
+                                "reason": "navigation_changed",
+                                "revoked_lease_count": revoked.len(),
+                            }),
+                        );
+                    }
+                }
+                Ok((None, _)) => tracing::debug!(
+                    tab_id = %binding.tab_id,
+                    surface_id = %binding.surface_id,
+                    surface_revision = binding.surface_revision,
+                    "忽略旧 Browser Surface 页面事件"
                 ),
                 Err(error) => tracing::debug!(
-                    tab_id = %page_state.tab_id,
+                    tab_id = %binding.tab_id,
                     ?error,
                     "忽略无法应用的旧页面状态"
                 ),
@@ -568,29 +784,35 @@ fn control_revocation_reason(reason: &str) -> BrowserLeaseEndReason {
 
 fn revoke_surface_control(
     state: &ApiState,
-    tab_id: &BrowserTabId,
+    binding: &magi_browser_authority::BrowserSurfaceBinding,
     lease_reason: BrowserLeaseEndReason,
     reason: &str,
 ) {
-    let context = browser_tab_context(state, tab_id);
+    if !is_current_primary_binding(state, binding) {
+        tracing::debug!(
+            tab_id = %binding.tab_id,
+            surface_id = %binding.surface_id,
+            surface_revision = binding.surface_revision,
+            "忽略已失效 Browser Surface 的控制权撤销事件"
+        );
+        return;
+    }
+    let context = browser_tab_context(state, &binding.tab_id);
     let Some(context) = context.clone() else {
-        tracing::debug!(%tab_id, "忽略未知 Browser Surface 的控制权撤销事件");
+        tracing::debug!(tab_id = %binding.tab_id, "忽略未知 Browser Surface 的控制权撤销事件");
         return;
     };
-    let report = state.cancel_execution_resources(
-        Some(&context.session_id),
-        context.workspace_id.as_ref(),
-        None,
-        lease_reason,
-    );
+    let revoked =
+        state.cancel_browser_surface_control(&binding.tab_id, &binding.surface_id, lease_reason);
     publish_tab_event(
         state,
         "browser.control.revoked",
         Some(context),
         serde_json::json!({
-            "tab_id": tab_id,
+            "tab_id": binding.tab_id,
+            "binding": binding,
             "reason": reason,
-            "revoked_lease_count": report.browser_lease_count,
+            "revoked_lease_count": revoked.len(),
         }),
     );
 }
@@ -616,12 +838,7 @@ fn is_current_primary_binding(
         .browser_authority
         .lock()
         .expect("browser authority lock poisoned");
-    authority
-        .primary_surface(&binding.tab_id)
-        .is_some_and(|primary| {
-            primary.surface_id == binding.surface_id
-                && primary.surface_revision == binding.surface_revision
-        })
+    authority.is_current_surface_binding(binding)
 }
 
 fn publish_tab_event(
@@ -740,7 +957,7 @@ fn interrupt_browser_tasks_for_runtime_failure(state: &ApiState) {
                 state.event_bus.publish(
                     EventEnvelope::domain(
                         EventId::new(format!(
-                            "event-browser-runtime-turn-interrupted-{}-{}",
+                            "event-browser-turn-interrupted-{}-{}",
                             browser_session.session_id,
                             UtcMillis::now().0
                         )),
@@ -813,7 +1030,8 @@ mod tests {
 
     use magi_api::ApiState;
     use magi_browser_authority::{
-        AcquireBrowserLease, BrowserLeaseLifecycle, BrowserProfile, BrowserProfileKind,
+        AcquireBrowserLease, BrowserHostEventEnvelope, BrowserHostPageState,
+        BrowserHostProtocolVersion, BrowserLeaseLifecycle, BrowserProfile, BrowserProfileKind,
         BrowserSessionLifecycle, BrowserTabLifecycle, CreateBrowserSession, CreateBrowserTab,
     };
     use magi_core::{
@@ -860,6 +1078,16 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn desktop_parent_liveness_check_distinguishes_live_and_missing_processes() {
+        let mut system = System::new();
+        assert!(is_process_alive(
+            &mut system,
+            Pid::from_u32(std::process::id())
+        ));
+        assert!(!is_process_alive(&mut system, Pid::from_u32(u32::MAX)));
     }
 
     #[test]
@@ -925,6 +1153,106 @@ mod tests {
     }
 
     #[test]
+    fn page_updated_does_not_drop_the_current_primary_surface() {
+        let state = test_state();
+        let profile_id = BrowserProfileId::new("browser-profile-page-update");
+        let browser_session_id = BrowserSessionId::new("browser-session-page-update");
+        let tab_id = BrowserTabId::new("browser-tab-page-update");
+        state
+            .mutate_browser_authority(|authority| {
+                authority.register_profile(BrowserProfile {
+                    profile_id: profile_id.clone(),
+                    kind: BrowserProfileKind::ManagedDefault,
+                    data_path: std::env::temp_dir().join("magi-browser-page-update-test"),
+                    created_at: UtcMillis(1),
+                    updated_at: UtcMillis(1),
+                })?;
+                authority.create_session(CreateBrowserSession {
+                    browser_session_id: browser_session_id.clone(),
+                    workspace_id: None,
+                    session_id: SessionId::new("session-page-update"),
+                    profile_id,
+                    now: UtcMillis(1),
+                })?;
+                authority.transition_session(
+                    &browser_session_id,
+                    BrowserSessionLifecycle::Ready,
+                    UtcMillis(2),
+                )?;
+                authority.create_tab(CreateBrowserTab {
+                    tab_id: tab_id.clone(),
+                    browser_session_id,
+                    url: "https://example.com/old".to_string(),
+                    now: UtcMillis(2),
+                })?;
+                authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, UtcMillis(2))?;
+                authority.set_primary_surface(
+                    magi_browser_authority::BrowserSurfaceBinding {
+                        desktop_epoch: "desktop-page-update".to_string(),
+                        window_id: "window-page-update".to_string(),
+                        surface_id: "surface-page-update".to_string(),
+                        surface_revision: 4,
+                        tab_id: tab_id.clone(),
+                        web_contents_id: 23,
+                        target_id: "target-page-update".to_string(),
+                        browser_context_id: "context-page-update".to_string(),
+                        navigation_revision: 0,
+                    },
+                    UtcMillis(3),
+                )?;
+                Ok(())
+            })
+            .expect("page update fixture should create");
+
+        handle_host_event(
+            &state,
+            BrowserHostIncomingEvent {
+                envelope: BrowserHostEventEnvelope {
+                    protocol_version: BrowserHostProtocolVersion::CURRENT,
+                    sequence: 1,
+                    event: BrowserHostEvent::PageUpdated {
+                        binding: magi_browser_authority::BrowserSurfaceBinding {
+                            desktop_epoch: "desktop-page-update".to_string(),
+                            window_id: "window-page-update".to_string(),
+                            surface_id: "surface-page-update".to_string(),
+                            surface_revision: 4,
+                            tab_id: tab_id.clone(),
+                            web_contents_id: 23,
+                            target_id: "target-page-update".to_string(),
+                            browser_context_id: "context-page-update".to_string(),
+                            navigation_revision: 1,
+                        },
+                        page_state: BrowserHostPageState {
+                            tab_id: tab_id.clone(),
+                            url: "https://example.com/new".to_string(),
+                            origin: Some("https://example.com".to_string()),
+                            title: "New page".to_string(),
+                            navigation_revision: 1,
+                        },
+                    },
+                },
+                binary: None,
+            },
+            0,
+        );
+
+        let authority = state
+            .browser_authority
+            .lock()
+            .expect("browser authority lock should hold");
+        assert_eq!(
+            authority
+                .primary_surface(&tab_id)
+                .map(|surface| surface.surface_id.as_str()),
+            Some("surface-page-update")
+        );
+        assert_eq!(
+            authority.tab(&tab_id).map(|tab| tab.url.as_str()),
+            Some("https://example.com/new")
+        );
+    }
+
+    #[test]
     fn desktop_disconnect_revokes_lease_without_closing_logical_tab() {
         let state = test_state();
         let profile_id = BrowserProfileId::new("browser-profile-disconnect");
@@ -962,9 +1290,17 @@ mod tests {
                 })?;
                 authority.transition_tab(&tab_id, BrowserTabLifecycle::Ready, UtcMillis(2))?;
                 authority.set_primary_surface(
-                    &tab_id,
-                    "surface-disconnect".to_string(),
-                    1,
+                    magi_browser_authority::BrowserSurfaceBinding {
+                        desktop_epoch: "desktop-disconnect".to_string(),
+                        window_id: "window-disconnect".to_string(),
+                        surface_id: "surface-disconnect".to_string(),
+                        surface_revision: 1,
+                        tab_id: tab_id.clone(),
+                        web_contents_id: 23,
+                        target_id: "target-disconnect".to_string(),
+                        browser_context_id: "context-disconnect".to_string(),
+                        navigation_revision: 0,
+                    },
                     UtcMillis(3),
                 )?;
                 authority.acquire_lease(AcquireBrowserLease {

@@ -20,10 +20,11 @@ use magi_orchestrator::task_worker_catalog::WorkerInfo;
 use magi_session_store::SessionStore;
 use magi_settings_store::SettingsStore;
 use magi_usage_authority::{
-    ContextBudgetPolicy, ContextMeasurement, ContextPressureSnapshot, ExecutionBindingIdentity,
-    LlmConfig, ModelIdentitySnapshot, UsageCallIdentity, UsageCallRecordInput, UsageCallStatus,
-    UsagePhase, UsageSourceRole, UsageTokenInput, context_window_tokens_from_usage,
-    prepare_llm_config_for_persistence, provider_context_tokens_from_usage,
+    ContextBudgetPolicy, ContextMeasurement, ContextPressureProjection, ContextPressureSnapshot,
+    ExecutionBindingIdentity, LlmConfig, ModelIdentitySnapshot, UsageCallIdentity,
+    UsageCallRecordInput, UsageCallStatus, UsagePhase, UsageSourceRole, UsageTokenInput,
+    context_window_tokens_from_usage, prepare_llm_config_for_persistence,
+    provider_context_tokens_from_usage,
 };
 use std::sync::Arc;
 
@@ -329,7 +330,7 @@ pub fn publish_context_usage_update(
     phase: &str,
     accuracy: &str,
 ) {
-    let context_window = resolve_model_context_window(settings_store, resolved_model).max(1) as u64;
+    let context_window = resolve_model_context_window(settings_store, resolved_model).max(1);
     let previous_anchor = latest_usage_observations_from_ledger(
         &event_bus.audit_usage_ledger_snapshot().usage_entries,
     )
@@ -360,26 +361,26 @@ pub fn publish_context_usage_update(
     } else {
         ContextMeasurement::Estimated
     };
-    let snapshot = ContextPressureSnapshot::from_projected(
-        session_id.to_string(),
-        thread_id.map(ToString::to_string),
-        ModelIdentitySnapshot::new(
+    let snapshot = ContextPressureSnapshot::from_projected(ContextPressureProjection {
+        session_id: session_id.to_string(),
+        thread_id: thread_id.map(ToString::to_string),
+        model: ModelIdentitySnapshot::new(
             model_provider.unwrap_or("configured"),
             resolved_model,
             binding_revision,
         ),
         policy,
-        if accuracy == "authoritative" {
+        provider_context_tokens: if accuracy == "authoritative" {
             Some(token_used)
         } else {
             previous_anchor
         },
-        projected_tokens,
+        projected_request_tokens: projected_tokens,
         measurement,
-        Some(call_id.to_string()),
+        anchor_call_id: Some(call_id.to_string()),
         checkpoint_generation,
-        UtcMillis::now().0,
-    );
+        observed_at: UtcMillis::now().0,
+    });
     let updated_at = UtcMillis::now();
     let payload = serde_json::json!({
         "session_id": session_id.to_string(),

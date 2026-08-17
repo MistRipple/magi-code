@@ -1,4 +1,4 @@
-export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 2, minor: 0 } as const;
+export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 1 } as const;
 
 export type DesktopEpoch = string;
 export type WindowId = string;
@@ -33,69 +33,6 @@ export interface DesktopBrowserHandshake {
 }
 
 export type BrowserDeviceType = "desktop" | "mobile";
-
-/**
- * 右侧多功能面板的跨 Renderer 打开意图。
- *
- * App Renderer 和 Right-Pane Renderer 使用独立的 Svelte 状态树，不能直接共享
- * tab 对象。所有非浏览器面板都通过这个版本化意图交给 Electron Main 转发，
- * 浏览器 Tab 仍由 BrowserAuthority 管理，不走这里的双写路径。
- */
-export const DESKTOP_RIGHT_PANE_INTENT_VERSION = 1 as const;
-
-export type RightPaneCodeContentKind = "text" | "binary" | "large_text" | "symlink" | "special";
-
-export interface DesktopRightPaneAgentIntent {
-  kind: "agent";
-  agentRunId: string;
-  sessionId: string;
-  workspaceId: string;
-  workspacePath: string;
-  label?: string;
-  accentToken?: string | null;
-}
-
-export interface DesktopRightPaneCodeIntent {
-  kind: "code";
-  filepath: string;
-  sessionId: string;
-  workspaceId: string;
-  workspacePath: string;
-  label?: string;
-  displayPath?: string;
-  diff?: string | null;
-  originalContent?: string | null;
-  currentContent?: string | null;
-  isChangeDiff?: boolean;
-  changeRevision?: string | null;
-  content?: string | null;
-  language?: string | null;
-  contentKind?: RightPaneCodeContentKind;
-  size?: number | null;
-  mime?: string | null;
-  symlinkTarget?: string | null;
-  headSummary?: string | null;
-  tailSummary?: string | null;
-  imageDataUrl?: string | null;
-}
-
-export interface DesktopRightPaneTerminalIntent {
-  kind: "terminal";
-  terminalTabId: string;
-  sessionId: string;
-  workspaceId: string;
-  workspacePath: string;
-}
-
-export type DesktopRightPaneTabIntent =
-  | DesktopRightPaneAgentIntent
-  | DesktopRightPaneCodeIntent
-  | DesktopRightPaneTerminalIntent;
-
-export interface DesktopRightPaneIntentEnvelope {
-  version: typeof DESKTOP_RIGHT_PANE_INTENT_VERSION;
-  intent: DesktopRightPaneTabIntent;
-}
 
 export type BrowserLogicalViewport =
   | { mode: "auto" }
@@ -176,6 +113,8 @@ export type BrowserHostCommand =
       type: "snapshot";
       payload: {
         tab_id: BrowserTabId;
+        navigation_revision: number;
+        snapshot_revision: number;
         limits: { max_nodes: number; max_text_bytes: number };
         subtree_ref?: string | null;
       };
@@ -303,6 +242,7 @@ export interface BrowserSnapshotNode {
 
 export interface BrowserSnapshot {
   tab_id: BrowserTabId;
+  navigation_revision: number;
   snapshot_revision: number;
   root: BrowserSnapshotNode;
   returned_nodes: number;
@@ -346,7 +286,10 @@ export type BrowserHostEvent =
       type: "control_revoked";
       payload: { binding: BrowserSurfaceBinding; reason: string };
     }
-  | { type: "page_updated"; payload: BrowserPageState }
+  | {
+      type: "page_updated";
+      payload: { binding: BrowserSurfaceBinding; page_state: BrowserPageState };
+    }
   | { type: "page_crashed"; payload: { binding: BrowserSurfaceBinding; diagnostic?: string | null } }
   | { type: "console"; payload: { tab_id: BrowserTabId; level: string; text: string } }
   | { type: "dialog"; payload: { tab_id: BrowserTabId; dialog_id: number; dialog_type: string; message: string } }
@@ -401,11 +344,16 @@ export interface WorkerCdpEvent {
   params: Record<string, unknown>;
 }
 
+export interface WorkerRebindRequest {
+  type: "worker_rebind";
+  bindings: BrowserSurfaceBinding[];
+}
+
 export interface WorkerReadyMessage {
   type: "worker_ready";
   worker_epoch: string;
   protocol_version: ProtocolVersion;
 }
 
-export type MainToWorkerMessage = WorkerCommandRequest | WorkerCdpResponse | WorkerCdpEvent;
+export type MainToWorkerMessage = WorkerCommandRequest | WorkerCdpResponse | WorkerCdpEvent | WorkerRebindRequest;
 export type WorkerToMainMessage = WorkerCommandResponse | WorkerCdpRequest | WorkerReadyMessage;

@@ -2,7 +2,7 @@
 
 > 状态：后续开发唯一产品架构
 >
-> 更新日期：2026-08-14
+> 更新日期：2026-08-15
 >
 > 适用范围：Magi Desktop、Web UI、Rust daemon、Browser Automation、右侧面板、浏览器工具、发布、更新与旧实现清理
 
@@ -13,9 +13,9 @@ Magi Desktop 统一使用 Chromium 桌面宿主。现有 Svelte 业务界面和 
 唯一实现基线：
 
 - Electron `BaseWindow` 作为跨平台 Chromium Desktop Host。
-- 现有 Svelte 应用拆分为可信的 `MagiAppView`、`RightPaneChromeView` 和按需创建的 `DesktopOverlayView`。
-- 每个桌面窗口中的每个 Browser Tab 由一个独立 `BrowserSurface` 承载，页面使用真实 `WebContentsView`。
-- Electron Main Process 是物理页面、窗口布局、输入焦点、导航安全和进程生命周期的唯一所有者。
+- 现有 Svelte 应用在一个全窗口可信 `MagiAppView` 中统一渲染左侧导航、中间会话和右侧多功能面板；右栏菜单和工具状态也属于这个 Renderer 的 DOM。
+- 每个桌面窗口中的每个 Browser Tab 都由 Main Process 持有一个独立的 Electron `WebContentsView`。它是真实 Chromium 页面视图，不是截图投影，也不是覆盖右栏的独立窗口；它只在当前 Browser Tab 的内容槽矩形内可见。
+- Electron Main Process 负责 Browser `WebContentsView` 的安全策略、CDP、输入接管和生命周期；右栏外框、Tab 栏、工具栏、代码/图片/终端内容以及 Browser 内容槽仍全部由主 Renderer 的 DOM/CSS 所有。Renderer 只上报当前内容槽的 DOM 矩形，Main 将对应 Surface 绑定到这个矩形，不能创建第二套右栏布局。
 - Rust daemon 继续拥有 BrowserAuthority、会话、工具治理、Lease、Annotation 和 Artifact。
 - 浏览器自动化通过 Electron `webContents.debugger` 的受控 CDP Gateway 执行，不开放 Chromium remote debugging port。
 - 生产运行时不再依赖 Playwright 连接已运行 Electron；Playwright 只保留为外部端到端测试工具。
@@ -38,7 +38,7 @@ Magi Desktop 统一使用 Chromium 桌面宿主。现有 Svelte 业务界面和 
 - Agent 任务完成、暂停、失败或取消后只释放控制权，不关闭 Tab，不改变最终页面。
 - `target="_blank"`、`window.open()` 和新窗口链接在当前 Browser Tab 中打开，不创建额外窗口或隐藏 Target。
 - 右侧面板可以从最小宽度拖到窗口约三分之二，浏览器始终严格位于内容区。
-- 右侧面板的宽度始终由 WindowLayoutState 约束，BrowserSurface 使用同一原生父窗口内容树中的内容区 bounds；禁止通过 DOM 测量、额外窗口、悬浮层或坐标补偿改变面板几何。
+- 右栏宽度和拖拽手柄由主 Renderer 的 DOM/CSS 约束；当前 Browser Tab 的 `WebContentsView` 只消费内容槽通过 `ResizeObserver` 报出的矩形。禁止额外窗口、悬浮层、全右栏覆盖或浏览器专用几何计算改变面板几何。
 - 页面刷新、跳转、慢请求和工具执行期间不黑屏、不闪烁、不重建页面、不显示截图投影。
 - auto、宽屏、窄屏和自定义 viewport 均由 Chromium 页面真实重排，不裁切旧桌面布局。
 - 固定 viewport 只设置 Chromium 的 CSS viewport、设备类型和触控能力，禁止使用 `pageScaleFactor`、截图缩放或按右栏大小拟合模拟设备；页面在原生 1:1 Surface 中重排，超出部分由页面自身滚动，不得被桌面壳裁切或拉伸。
@@ -46,16 +46,16 @@ Magi Desktop 统一使用 Chromium 桌面宿主。现有 Svelte 业务界面和 
 
 多功能右栏的硬约束：
 
-1. `RightPaneChromeView` 是右栏唯一的通用内容壳，负责顶级 Tab、面板选择器、工具栏和非浏览器内容；Browser Surface 不是右栏的父容器，也不能替换它。
-2. `BrowserSurfaceView` 只在当前顶级 Tab 为浏览器时显示，且只覆盖内容槽；代码、图片、终端、Agent 和未来面板类型由 Chrome View 独立渲染。图片预览可以作为代码/文件 Tab 的内容模式，但不得因此创建或占用 Browser Surface。
+1. `MagiAppView` 内的右栏 DOM 是唯一的通用内容壳，负责顶级 Tab、面板选择器、工具栏和非浏览器内容；Browser `WebContentsView` 不是右栏的父容器，也不能替换它。
+2. Browser `WebContentsView` 只在当前顶级 Tab 为浏览器时绑定到右栏内容槽；代码、图片、终端、Agent 和未来面板类型由同一个 App Renderer 独立渲染。图片预览可以作为代码/文件 Tab 的内容模式，但不得因此创建或占用 Browser Surface。
 3. 右栏尺寸、分隔条、折叠/展开、顶级 Tab 切换和面板选择器属于 WindowLayout/RightPane 通用能力。浏览器的创建、导航、崩溃、viewport 和 CDP 状态不能写入或重置这些状态。
-4. 新建浏览器采用两阶段流程：先完成轻量的逻辑 Tab/占位状态，再异步物化 WebContentsView。等待 daemon、页面导航或 Worker 就绪期间，已有面板仍可切换、右栏仍可拖动；只有当前新建项显示 loading/error。
+4. 新建浏览器采用两阶段流程：先完成轻量的逻辑 Tab/占位状态，再由 Main 异步创建对应 `WebContentsView`。等待 daemon、页面导航或 Worker 就绪期间，已有面板仍可切换、右栏仍可拖动；只有当前新建项显示 loading/error。
 5. 面板类型必须通过稳定的 `PanelKind`/能力目录扩展，禁止在浏览器组件中硬编码“浏览器是唯一面板”或为每种新面板复制一套右栏布局。
 
 本次目标补充的验收条件：
 
-- 代码、图片、终端、Agent 和后续面板继续使用同一个 `RightPaneChromeView` 的顶级 Tab；即使浏览器正在创建、导航、崩溃恢复或等待自动化 Worker，其他面板仍可立即打开、切换和关闭。
-- 浏览器 `WebContentsView` 只能挂载到当前顶级浏览器 Tab 的内容槽，不能覆盖顶级 Tab 栏、浏览器工具栏、拖拽分隔条或把右栏变成浏览器专属窗口；内容槽还必须避开右栏左侧完整的 8px 拖拽命中区。右栏尺寸和拖拽行为由通用 `WindowLayoutState` 维护，切换浏览器不会重置或重新计算其它面板布局。
+- 代码、图片、终端、Agent 和后续面板继续使用同一个 `MagiAppView` 内右栏 DOM 的顶级 Tab；即使浏览器正在创建、导航、崩溃恢复或等待自动化 Worker，其他面板仍可立即打开、切换和关闭。
+- 浏览器 `WebContentsView` 只能绑定到对应 Browser Tab 的 DOM 内容槽矩形；不能覆盖顶级 Tab 栏、浏览器工具栏、拖拽分隔条或把右栏变成浏览器专属窗口。非当前浏览器 Tab 的 Surface 隐藏但保持 WebContents 和页面状态，切换浏览器不会重置或重新计算其它面板布局。
 - 新建浏览器 Tab 必须先完成逻辑 Tab 和 loading 占位，再异步创建真实 Surface；页面网络加载、DOM 快照和 Worker 握手不得阻塞新增面板选择器、右栏拖拽或已有面板交互。
 - 验收必须覆盖“浏览器创建中切换代码/图片/终端”“浏览器 Tab 与非浏览器 Tab 反复切换”“右栏拖到最大约三分之二后切换面板”和“浏览器 Surface 创建失败后其它面板仍可用”四类场景。
 
@@ -75,12 +75,37 @@ Magi Desktop 统一使用 Chromium 桌面宿主。现有 Svelte 业务界面和 
 - Chromium 作为 Magi Desktop 的组成部分随应用统一更新，不再单独安装、卸载或激活。
 - 设置页展示真实组件版本、状态、更新进度、重启浏览器能力和清理 Magi 浏览器数据。
 
+### 2.4 Desktop、Web 与手机 Web 的平台边界
+
+Magi 的浏览器产品不是“所有客户端都用同一个嵌入控件”。真实页面的承载方式必须服从客户端的安全模型和窗口模型：
+
+| 客户端 | 真实浏览器页面 | LLM 浏览器工具 | 共享能力 | 不提供的能力 |
+| --- | --- | --- | --- | --- |
+| Magi Desktop | 支持。Main 的 `WebContentsView` 承载 Magi 自带 Chromium，并绑定到右栏 Browser Tab 内容槽 | 支持。Worker 通过 Desktop 私有 CDP Gateway 操作当前 Browser WebContents | Browser Tab 记录、URL/标题、标记、截图 Artifact、消息引用、任务状态 | 不读取用户外部浏览器资料，不公开调试端口 |
+| Magi Web | 当前方案不创建物理 Browser Surface | 当前方案不把普通 Web 客户端伪装成浏览器 Host | 可读取已持久化的 Browser 记录、标记、截图 Artifact 和消息引用；可请求在 Desktop 中打开 | 不把任意外部网页 iframe 到 Magi Web，不提交 Desktop 的窗口尺寸、Surface 或 viewport 控制 |
+| 手机 Web | 当前方案不创建物理 Browser Surface | 当前方案不在手机端直接驱动 Desktop Surface | 共享会话中的 URL、标题、标记、截图 Artifact 和消息记录；可使用系统浏览器打开 URL | 不把 Desktop 的原生嵌入视图、桌面布局或固定设备仿真强行搬到手机 Web |
+
+这里的“共享”只表示 daemon 的持久事实和消息数据共享，不表示共享 Chromium 页面实例、Cookie、缓存、viewport、焦点、滚动位置或控制 Lease。Browser Surface 运行态始终只属于一个 Desktop 窗口和一个 `surfaceId`。
+
+因此，当前统一 Chromium 方案已经支持三端的产品数据闭环，但只有 Desktop 提供真正的内置浏览器交互。这是有意的架构边界，不是遗漏：普通浏览器无法安全地把任意外部网站变成 Magi Web 的同源 DOM；`iframe`、代理移除 CSP/X-Frame-Options 或截图投影都会重新引入当前已明确淘汰的卡顿、失真、黑屏和权限问题。
+
+如果未来产品要求“用户只用手机 Web，也能让 LLM 操作真实网页”，必须新增独立的服务端 Remote Browser Surface：每个远程 Surface 在隔离的浏览器容器中运行，由服务端 Browser Gateway 提供 DOM/Accessibility、输入、截图、Console/Network 和 Lease；Web/Mobile Web 只连接该 Surface 的受控会话。它与 Desktop Browser Surface 共享 `BrowserTool` 协议、BrowserAuthority、Annotation/Artifact 和消息契约，但不共享物理 WebContents，也不能通过兼容分支复用 Desktop 的 DOM 布局代码。本阶段不实现该远程服务，避免把两种渲染通道混成第三套投影方案。
+
+平台能力必须由 `/api/browser/capabilities?clientPlatform=...` 的能力目录明确返回，而不是依赖“是否存在 `window.magiDesktop`”猜测。客户端必须发送 `desktop`、`web` 或 `mobile-web`，服务端返回 `platformCapabilities`：
+
+- `desktopBrowserSurface`: Desktop 为 `true`，Web 和手机 Web 为 `false`；它只表示客户端具备原生 Surface 宿主，不代表 Host 当前已经 ready。
+- `browserRecords`: 三端均可按授权读取持久 Browser 记录。
+- `browserAnnotations`: 三端均可读取，写入遵循会话和消息授权。
+- `browserRemoteSurface`: 本阶段三端均为 `false`；未来 Remote Browser Surface 上线后按服务端会话能力返回。
+
+UI 契约：Web 和手机 Web 必须隐藏“新建内置浏览器”“响应式视口”“控制当前 Surface”等 Desktop 专属动作，保留“查看记录/标记/截图”和“使用外部浏览器打开”。当用户从 Web 发起需要真实浏览器的任务时，必须明确提示“请在 Magi Desktop 中打开”，不得显示一个永远连接中的假面板或把失败伪装成网络错误。
+
 ## 3. 明确非目标
 
 - 不使用 `Page.startScreencast`、Canvas、图片帧或远程桌面作为用户浏览器渲染通道。
 - 不使用 iframe 加载任意外部网站，不通过代理移除 CSP 或 `X-Frame-Options`。
 - 不把外部网页加载进可信 Magi App Renderer。
-- 不使用 Electron `<webview>` 标签作为正式实现。
+- 不使用额外 BrowserWindow、BrowserView、iframe 或截图层承载浏览器页面；右栏浏览器唯一使用 Main 进程的 Electron `WebContentsView`，并且只能位于当前 Browser Tab 内容槽矩形。
 - 不公开 Electron/Chromium remote debugging TCP 端口。
 - 不让 Browser Automation Worker 创建、关闭或淘汰物理 WebContents。
 - 不保留 Playwright 和直接 CDP 两套生产自动化实现。
@@ -95,20 +120,17 @@ Magi Electron Desktop Host
   |
   |-- WindowManager
   |     BaseWindow 1..N
-  |       |-- MagiAppView
-  |       |     左侧导航、中间会话与全局应用区
-  |       |-- RightPaneChromeView
-  |       |     多功能右侧面板：顶级 Tab、浏览器工具栏、代码/图片/终端/Agent 内容
-  |       |-- BrowserSurfaceView 0..N
-  |       |     当前窗口内真实外部 Chromium 页面
+  |       |-- MagiAppView（全窗口单一可信 Renderer）
+  |       |     左侧导航、中间会话、右栏顶级 Tab 与代码/图片/终端/Agent 内容
+  |       |     `-- Browser Tab 内容槽 -> Electron WebContentsView 0..N（Renderer ResizeObserver 绑定）
   |       `-- DesktopOverlayView 0..N
   |             弹窗、菜单、标记选择等可信覆盖层
   |
   |-- WindowLayoutManager
-  |     每窗口唯一布局状态、原子 layout revision、View bounds 与层级
+  |     每窗口唯一可见性/模式状态、原子 layout revision 与宽度约束
   |
   |-- BrowserSurfaceManager
-  |     Surface 创建、挂载、导航、焦点、partition、Target 和崩溃恢复
+  |     Browser Surface 创建/挂载、导航、焦点、partition、Target 和崩溃恢复
   |
   |-- BrowserCdpGateway
   |     webContents.debugger、Target allowlist、CDP domain 与命令校验
@@ -209,25 +231,27 @@ Electron app ready 前应用隐私启动参数
 
 ## 5. Desktop View 树
 
-所有 View 都是同一 `BaseWindow.contentView` 下的原生兄弟视图，不是额外 `BrowserWindow`、无边框子窗口或悬浮窗。`BrowserSurfaceView` 不能成为 Svelte DOM 元素，因此必须由 Electron Main 在同一原生组合树中设置 bounds 和 z-order；但几何只来自 WindowLayoutState，不来自持续 DOM 测量。
+桌面业务 UI 只有一个全窗口 `MagiAppView`，不是额外 `BrowserWindow`、无边框子窗口或悬浮窗。浏览器页面由 Main 进程的 `WebContentsView` 承载；它只绑定到当前 Browser Tab 的内容槽矩形，Tab 栏、工具栏和非浏览器面板仍由 `MagiAppView` 管理。`BaseWindow.contentView` 下的 App View 与 Browser Surface 是同一窗口中的兄弟原生视图，Browser Surface 不参与右栏外框布局。
 
 稳态层级只有：
 
 ```text
-DesktopOverlayView        临时需要时存在
-BrowserSurfaceView        当前 Browser Tab 的真实页面
-RightPaneChromeView       Tab 和工具栏
-MagiAppView               左侧和中间应用区
+DesktopOverlayView        仅用于不属于右栏的可信临时覆盖层
+MagiAppView               左侧、中间和右栏多功能面板
+  RightPane DOM
+    Browser Tab 内容槽（普通 DOM flex/grid 槽位）
+      Electron WebContentsView  当前 Browser Tab 的真实页面
 ```
 
 不允许在此树之外再建立“浏览器承载窗口”、“透明定位窗口”或“视频/截图层”。
 
 ### 5.1 MagiAppView
 
-`MagiAppView` 加载现有 daemon 托管 Web 应用，但不再渲染右侧面板。它负责：
+`MagiAppView` 加载现有 daemon 托管 Web 应用，并在同一 DOM 容器内渲染三栏。它负责：
 
 - 工作区和会话导航。
 - 中间消息、编辑器和输入区。
+- 右侧顶级 Tab、面板选择器、浏览器工具栏以及代码/图片/终端/Agent 面板。
 - 全局 Header 和不跨越右侧面板的应用 UI。
 - 将右侧展开/折叠、窗口和全局 Overlay 意图提交给 Electron Main。
 
@@ -240,9 +264,9 @@ MagiAppView               左侧和中间应用区
 - 只允许 daemon canonical origin 和签名本地资源
 - preload 仅暴露版本化、allowlisted `contextBridge` API
 
-### 5.2 RightPaneChromeView
+### 5.2 右栏 DOM Chrome
 
-`RightPaneChromeView` 是独立可信 WebContentsView，复用现有 Svelte RightPane 业务组件，负责：
+右栏 Chrome 是 `MagiAppView` 内的普通 Svelte DOM，复用现有 `RightPane` 业务组件，负责：
 
 - 顶级右侧 Tab 栏和 `+` 面板选择。
 - Browser 地址栏、后退、前进、刷新、外部打开、截图、标记和 viewport 控件。
@@ -251,19 +275,19 @@ MagiAppView               左侧和中间应用区
 
 当当前 Tab 是 Browser：
 
-- RightPaneChromeView 只绘制 Tab、工具栏和内容背景。
-- BrowserSurfaceView 由 Electron Main 放在内容区上方。
-- BrowserSurfaceView 的 bounds 只来自当前 WindowLayoutSnapshot 的 `browserSurfaceBounds`，并且被严格限制在 RightPaneChromeView 的内容区内。
+- 右栏 DOM 只绘制 Tab、工具栏和内容背景。
+- 当前 Browser Tab 的内容槽是普通 DOM 元素，使用 `width: 100%`、`height: 100%` 和 flex/grid 正常布局；Renderer 用 `ResizeObserver` 将该槽的 CSS 矩形一次性同步给 Main。
+- 每个 Browser Tab 有自己的 Electron `WebContentsView`；切换 Tab 只更新 Main 侧的可见 Surface 和自动化 Primary，不创建覆盖窗口，也不改变右栏外框。
 
 当当前 Tab 不是 Browser：
 
-- 当前窗口的 BrowserSurfaceView 全部设为不可见。
-- RightPaneChromeView 自己渲染完整内容。
-- 代码、图片、终端和 Agent 内容直接由 RightPaneChromeView 渲染，不经过 BrowserSurfaceView，也不因为浏览器 Surface 的创建、导航或崩溃而丢失。
+- 当前窗口的非活动 Browser Surface 由 Main 隐藏但保持 WebContents 存活。
+- 右栏 DOM 自己渲染完整内容。
+- 代码、图片、终端和 Agent 内容直接由右栏 DOM 渲染，不经过 Browser Surface，也不因为浏览器 Surface 的创建、导航或崩溃而丢失。
 
-### 5.3 BrowserSurfaceView
+### 5.3 Browser `WebContentsView` Surface
 
-一个 `BrowserSurfaceView` 对应一个 `BrowserSurfaceInstance`，只加载外部网页。安全配置：
+一个 Browser Tab 对应一个 Main 侧 `WebContentsView` 和一个 `BrowserSurfaceRecord`，只加载外部网页。Surface 只有在逻辑 Tab 记录已经读取后才创建，首次 `loadURL` 必须取该记录的 URL（空地址才是 `about:blank`）；后续页面导航只由同一个 WebContents 完成，不能用 authority 的 URL 更新反复改写页面，也不能用 `about:blank` 作为所有恢复页面的固定初始地址。Surface 创建和页面导航由 Main 统一管理，因此不存在 Renderer 注册竞态，也不会在重定向、刷新或恢复过程中产生第二次导航。安全配置：
 
 - `nodeIntegration: false`
 - `contextIsolation: true`
@@ -273,25 +297,19 @@ MagiAppView               左侧和中间应用区
 - 禁止 `file:`、本地资源和内部 Scheme
 - 使用 Browser Session 对应的非持久 partition
 
-非活动 Surface 保持 WebContents 存活，但使用 Electron View 的可见性控制隐藏；不得缩放到 `1 x 1`、导航到空白页或在切换期间销毁。
-- Surface 创建、导航和加载失败都通过状态事件反馈给右栏；右栏必须保留 Tab 栏和其他内容的可操作状态，不能用全屏加载层覆盖整个 RightPaneChromeView。
+非活动 `WebContentsView` 保持 WebContents 存活，由 Main 只切换原生视图的可见性并保留现有导航状态；不得缩放到 `1 x 1`、导航到空白页或在切换期间销毁。Surface 创建、导航和加载失败都通过状态事件反馈给右栏；右栏必须保留 Tab 栏和其他内容的可操作状态，不能用全屏加载层覆盖整个右栏 DOM。
 
 ### 5.4 DesktopOverlayView
 
-`DesktopOverlayView` 是 Electron Main 管理的临时可信层，层级始终位于 BrowserSurfaceView 上方。它承载：
+`DesktopOverlayView` 只承载临时可信弹出层，不承载右栏外框、Tab 栏、工具栏主体或代码/图片/终端内容。右栏的按钮和菜单触发器始终由 `MagiAppView` 的 DOM 管理；会跨入原生 Chromium 内容槽的新增面板选择器、浏览器 viewport 菜单、标记历史菜单和标记选择/编辑层使用同一份原生 Overlay Renderer，以确保它们位于 Browser Surface 之上。普通 Web/手机 Web 没有原生 Browser Surface，继续使用对应 DOM 菜单。
 
-- 会跨越 Browser 内容区的下拉菜单和上下文菜单。
-- 全局设置、确认和错误 Modal。
-- 元素/区域标记选择层。
-- 需要捕获浏览器区域输入的临时操作层。
-
-Overlay 只覆盖所需矩形；关闭后立即销毁或隐藏。普通浏览状态不保留全窗口透明 Overlay，避免阻断 BrowserSurface 输入。
+Overlay 只覆盖当前标记操作所需矩形；关闭后立即移除视图但保留已加载的可信 Renderer，避免重新创建造成闪烁。普通浏览状态不保留全窗口透明 Overlay，也不阻断 Browser Surface 输入。
 
 Agent 虚拟鼠标是非交互装饰，使用 Magi 包内签名的矢量光标资产，通过 CDP isolated world 中的 closed Shadow DOM 绘制，固定 `pointer-events: none`；每次 document 创建后重新注入。元素高亮使用 CDP Overlay domain，区域标记使用 DesktopOverlayView 捕获，不依赖站点 DOM。
 
 ### 5.5 多 Renderer 状态协议
 
-`MagiAppView`、`RightPaneChromeView` 和 `DesktopOverlayView` 之间禁止直接访问对方 DOM、Svelte store 或 `window` 对象。三者只通过 Electron Main 的版本化 IPC 通信。
+`MagiAppView`、Browser Surface 和 `DesktopOverlayView` 之间禁止直接访问对方 DOM、Svelte store 或 `window` 对象。右栏主体仍属于 `MagiAppView`；需要跨越 Browser Surface 的弹出层只通过版本化 Overlay IPC 传递状态和动作，不把右栏主体迁移到 Overlay Renderer。标记捕获 Overlay 通过同一协议提交归一化选择，Browser Surface 仍只通过 Electron Main 的版本化控制面通信。
 
 Main 为每个窗口发布不可变 `DesktopWindowSnapshot`：
 
@@ -338,23 +356,22 @@ WindowLayoutState
   activeSurfaceId
 ```
 
-布局算法位于独立纯 TypeScript contract 包，由 Electron Main 唯一调用。Renderer 只接收 LayoutSnapshot 和 CSS variables，不独立计算 BrowserSurface 几何。
+窗口可见性、模式和面板身份由 Electron Main 维护；右栏实际宽度由主 Renderer 的 DOM/CSS 负责，Renderer 只把右栏宽度意图提交给 Main 做持久约束，不提交浏览器绝对坐标。
 
 ### 6.2 布局事务
 
 右栏拖动流程：
 
 ```text
-RightPaneChromeView pointer intent
+右栏 DOM pointer intent
   -> Desktop IPC { windowId, requestedWidth, clientSequence }
   -> WindowLayoutManager reduce
   -> layoutRevision + 1
-  -> 同一 Main 事件循环内：
-       set MagiAppView bounds
-       set RightPaneChromeView bounds
-       set active BrowserSurfaceView bounds
-       update View z-order/visibility
-  -> 广播同一 LayoutSnapshot 给两个可信 Renderers
+  -> WindowLayoutState 校验可见性、模式和宽度意图
+  -> 广播 LayoutSnapshot 给 App Renderer
+  -> App Renderer 更新 RightPane DOM 的 grid/flex 宽度
+  -> Renderer 通过 DOM flex/grid 得到当前 Browser Tab 的内容槽矩形
+  -> Main 将对应 WebContentsView 绑定到该矩形，并维护 CDP/Worker
 ```
 
 约束：
@@ -363,8 +380,20 @@ RightPaneChromeView pointer intent
 - 只应用单调增加的 `layoutRevision`。
 - 同一事务更新所有 View，不存在独立异步 resize 队列。
 - resize 不得触发 focus、导航、页面刷新、设备仿真或 WebContents 重建。
+
+### 6.3 Desktop 三栏容器边界
+
+Desktop 的左侧工作区、中间工作区和右侧多功能面板在视觉上属于同一个窗口容器：
+
+- Main 只维护全窗口 App View 的宿主生命周期，不创建第二套右栏 Renderer 或 BrowserSurface 坐标系统。
+- 右栏 DOM 保留统一的 8px 外框间距和左侧拖拽命中区；右栏卡片与主区卡片共享上下基线，不能从主区再扣一份分隔宽度。
+- Browser `WebContentsView` 只位于右栏 Browser Tab 内容区，不能覆盖 Tab 栏、工具栏、外框或拖拽区；代码、图片、终端等非浏览器 Tab 复用同一右栏几何。
+- Desktop 只有 App View 负责窗口背景和材质，右栏不再拥有独立 Renderer、壁纸裁切或模糊层，彻底消除栏间断层。
+- Desktop App 的最外层壳消费与 App View 相同的主题材质令牌；壁纸仍只有 body 背景层绘制，透明 Overlay 不得创建自己的壳背景。
+- 原生窗口外壳也必须接收同一份外观快照：明暗模式同步 Electron `nativeTheme`，背景色作为不透明首帧底色，主题强调色同步 Windows 原生 accent，通透/沉浸材质分别映射到 Windows Acrylic/Mica 与 macOS Vibrancy；平台不支持时保留 Renderer 主题，不得阻塞启动。
+- 右栏宽度完全由主 Renderer 的 DOM/CSS 约束完成；Renderer 只提交当前内容槽 bounds，Main 不能据此改变右栏外框或拖拽几何。
 - 窗口缩放、全屏、DPI、显示器切换和安全区变化经过同一 reducer。
-- Renderer 不调用 `getBoundingClientRect()` 向 Main 提交 BrowserSurface 绝对坐标。
+- Desktop Renderer 只通过内容槽 IPC 告知 Main 当前 Browser Tab 的矩形；Web 和手机 Web 不创建 Browser Surface，也不具备此 IPC。
 - Web 客户端没有 Desktop layout capability，不得写入该状态。
 
 ### 6.3 尺寸规则
@@ -372,8 +401,8 @@ RightPaneChromeView pointer intent
 - 中间内容区最小宽度保持可用，不要求维持完整桌面布局。
 - 右侧面板最大宽度为当前窗口可用宽度的三分之二。
 - 右侧面板最小宽度满足浏览器工具栏和 320 CSS px 内容区。
-- 小窗口进入 overlay 模式时，RightPaneChromeView 和 BrowserSurfaceView 作为同一布局事务覆盖 MagiAppView。
-- 浏览器内容 bounds 始终等于右侧内容槽，不含 Tab 栏、工具栏、分隔条和窗口安全区。
+- 小窗口进入 overlay 模式时，右栏 DOM 在 App View 内覆盖中间内容区，Browser `WebContentsView` 仍只绑定当前 Browser Tab 内容槽。
+- 浏览器内容尺寸始终由右栏内容槽的 CSS 布局决定，不含 Tab 栏、工具栏、分隔条和窗口安全区。
 
 ## 7. 逻辑 Tab 与物理 Surface
 
@@ -412,7 +441,7 @@ BrowserAuthority 不再持久化：
 - Agent Lease、用户控制模式和光标
 - Window、Desktop 或 Surface identity
 
-### 7.2 BrowserSurfaceInstance
+### 7.2 Browser Surface 运行态
 
 每个桌面窗口按需物化：
 
@@ -432,11 +461,11 @@ BrowserSurfaceInstance
   viewportMetrics
   loadingState
   focused
-  visible
+  visible                 由主 Renderer 当前 Tab DOM 状态决定
   primary
 ```
 
-同一逻辑 Tab 可以在不同桌面窗口拥有独立 Surface。每个 Surface 使用自己的物理尺寸、viewport、焦点、光标和页面运行态，绝不互相 resize。
+同一逻辑 Tab 可以在不同桌面窗口拥有独立 Browser Surface。每个 Surface 使用自己的 viewport、焦点、光标和页面运行态，绝不互相 resize；右栏物理尺寸由各窗口自己的 DOM 内容槽决定。
 
 ### 7.3 Primary Surface
 
@@ -448,7 +477,7 @@ BrowserSurfaceInstance
 - Secondary Surface 保留当前页面，不因 Primary 导航被强制刷新或改尺寸。
 - Secondary Surface 显示“页面已在另一窗口更新”状态，用户可显式同步到 canonical URL。
 
-普通 Web 客户端只读取 BrowserTabRecord、Annotation 和 Artifact，不创建 BrowserSurface，不提交 viewport 或布局。
+普通 Web 客户端只读取 BrowserTabRecord、Annotation 和 Artifact，不创建 Browser Surface，不提交 viewport 或布局。
 
 ### 7.4 Surface 生命周期
 
@@ -459,19 +488,19 @@ ready/hidden/crashed -> closed
 ```
 
 - 激活逻辑 Tab 时按窗口创建或复用 Surface。
-- 切换 Tab 只改变 visible/active，不销毁页面。
-- Browser Renderer 崩溃只影响对应 Surface。
+- 切换 Tab 只改变 Main Surface 的 visible/active，不销毁 WebContents 页面。
+- Browser Surface 崩溃只影响对应 Surface。
 - 首版不因后台、任务完成或容量自动回收页面。
-- 用户关闭窗口时销毁该窗口全部 Surface，但保留逻辑 BrowserTabRecord。
-- 用户关闭逻辑 Browser Tab 时关闭全部 Surface；Annotation 和历史 Artifact 不删除。
+- 用户关闭窗口时销毁该窗口全部 Browser Surface，但保留逻辑 BrowserTabRecord。
+- 用户关闭逻辑 Browser Tab 时关闭全部 Browser Surface；Annotation 和历史 Artifact 不删除。
 
 ## 8. 页面所有权与导航
 
 ### 8.1 唯一所有者
 
-`BrowserSurfaceManager` 是 WebContents 的唯一所有者。它负责：
+`BrowserSurfaceManager` 是浏览器 WebContentsView/WebContents 的唯一 Main 侧所有者。它负责：
 
-- create、activate、hide、focus、navigate、reload、goBack、goForward、close。
+- create、attach、activate、focus、navigate、reload、goBack、goForward、close。
 - partition、permission、download、dialog、crash 和 page event。
 - WebContents 与 Tab/Surface/Target 的绑定。
 - URL、标题和 loading 事件写回 DesktopControlServer。
@@ -480,7 +509,7 @@ BrowserAutomationWorker 不得调用 `newPage()`、创建 BrowserWindow、关闭
 
 ### 8.2 新窗口策略
 
-在每个 Browser WebContents 创建时安装 `setWindowOpenHandler()`：
+在每个 Browser Surface 的 WebContents 创建时安装 `setWindowOpenHandler()`：
 
 - `http/https` GET 请求：`deny` 新窗口，并在当前 WebContents 导航。
 - 可安全转移的 POST：`deny` 新窗口，并在当前 WebContents 重放原请求。
@@ -491,8 +520,8 @@ BrowserAutomationWorker 不得调用 `newPage()`、创建 BrowserWindow、关闭
 
 ### 8.3 导航状态
 
-- 导航期间保持同一 WebContentsView 可见，不 detach、不隐藏、不替换背景层。
-- Surface 设置与主题一致的背景色，首帧到达后再显示新创建 Surface。
+- 导航期间保持同一 WebContentsView，不 detach、不重建、不替换背景层。
+- Surface 的显示状态由 Main 根据 RightPane 当前 Tab 的内容槽 IPC 控制，页面加载不会改变右栏外框。
 - 页面刷新和慢请求使用 Chromium 正常渲染过程，不显示黑色占位。
 - 每次顶级导航增加 `navigationRevision`，旧 snapshot、元素 ref 和标记选择明确失效。
 - URL 仅允许 `http`、`https` 和 `about:blank`。
@@ -504,7 +533,7 @@ BrowserAutomationWorker 不得调用 `newPage()`、创建 BrowserWindow、关闭
 
 ### 9.1 Partition
 
-- MagiAppView、RightPaneChromeView、DesktopOverlayView 使用可信应用 partition。
+- MagiAppView、DesktopOverlayView 使用可信应用 partition；右栏不再有独立 Renderer。
 - 每个 Browser Session 使用独立、非持久 Electron partition。
 - 同一 Browser Session 在同一 Desktop 进程的多个 Surface 可以共享该内存 partition。
 - 不同 Browser Session、不同 Desktop 实例和用户外部浏览器不共享数据。
@@ -568,11 +597,10 @@ Worker 与 Electron Main 只通过 MessagePort 通信：
 
 | 故障 | 用户页面 | 控制权 | 恢复动作 |
 | --- | --- | --- | --- |
-| Automation Worker 崩溃 | 原 Surface 保持可见可操作 | 立即释放全部 Worker Lease | Main 重启 Worker，重绑现有 Target |
-| Rust daemon 崩溃 | 原 Surface 保持可见可操作 | Agent 能力失效，用户保留控制 | Main 限次重启 daemon 并重做协议握手 |
+| Automation Worker 崩溃 | 原 Browser Surface 保持可见可操作 | 立即释放全部 Worker Lease | Main 重启 Worker，重绑现有 Target |
+| Rust daemon 崩溃 | 原 Browser Surface 保持可见可操作 | Agent 能力失效，用户保留控制 | Main 限次重启 daemon 并重做协议握手 |
 | Browser Renderer 崩溃 | 仅对应 Surface 显示明确崩溃状态 | 释放该 Surface Lease | 用新 revision 重建 Surface，只导航 canonical URL |
-| RightPaneChromeView 崩溃 | BrowserSurface 不销毁 | 暂停新 UI intent | 由 Main 用当前 DesktopWindowSnapshot 重建 ChromeView |
-| MagiAppView 崩溃 | BrowserSurface 和 RightPane 保持 | Agent Browser Lease 按任务状态决定 | 重建 AppView，不重建 Browser Surface |
+| MagiAppView 崩溃 | Browser Surface 由 Main 运行态保留，右栏重建后重新绑定同一 Surface | Agent Browser Lease 按任务状态决定 | 重建 AppView 并重新绑定同一个 Surface，不创建第二个页面 |
 | Electron Main 崩溃 | 整个 Desktop 退出 | 所有 Lease 失效 | 父进程绑定保证子进程退出，下次启动只恢复逻辑 Tab |
 | 更新中断 | 继续使用完整旧版本 | 不启动半版本 Worker | 回滚到同一 manifest 的完整发行包 |
 
@@ -589,7 +617,7 @@ Worker 与 Electron Main 只通过 MessagePort 通信：
 
 Electron Main 对指定 BrowserSurface 的 `webContents.debugger` 建立连接。`BrowserCdpGateway`：
 
-- 只允许 BrowserSurface Target，永不暴露 MagiAppView、RightPaneChromeView 或 OverlayView。
+- 只允许 BrowserSurface Target，永不暴露 MagiAppView 或 OverlayView。
 - 校验 `desktopEpoch/windowId/surfaceId/surfaceRevision/targetId`。
 - 按工具声明 allowlist CDP domain 和 method。
 - 拒绝 Browser、Target 和 SystemInfo 等越权全局操作。
@@ -632,11 +660,11 @@ navigationRevision
 Worker 启动或重启：
 
 ```text
-query Surface Registry
-  -> 接收当前 ready bindings
-  -> 为每个 Surface 建立 PageRuntime
-  -> 不创建新页面
-  -> 上报 automation-ready
+worker_ready
+  -> Main 通过 MessagePort 发送 worker_rebind(current ready bindings)
+  -> Worker 为每个 Surface 建立 PageRuntime
+  -> 不创建新页面、不重新导航
+  -> 下一条命令直接复用原 Target，并按需重建 execution context
 ```
 
 Surface 崩溃并重建后 targetId 和 surfaceRevision 改变，旧命令立即失效。
@@ -723,7 +751,7 @@ viewport 只属于 `BrowserSurfaceInstance`：
 
 ### 13.2 auto
 
-`auto` 清除全部 device metrics override。网页 CSS viewport 由 BrowserSurfaceView 实际内容 bounds 决定，Chromium 自然触发 resize、media query、flex/grid 和 viewport 单位重排。
+`auto` 清除全部 device metrics override。网页 CSS viewport 由 `WebContentsView` 的实际内容槽矩形决定，Chromium 自然触发 resize、media query、flex/grid 和 viewport 单位重排。
 
 ### 13.3 fixed
 
@@ -735,20 +763,8 @@ viewport 只属于 `BrowserSurfaceInstance`：
 
 输入短防抖动态生效，无确认按钮。Worker 使用 `Emulation.setDeviceMetricsOverride` 设置 CSS viewport、device scale factor、screen、touch、orientation、UA 和 Client Hints。
 
-为保证完整适配而非裁剪：
-
-```text
-contentScale = min(
-  1,
-  surfaceContentWidth / cssViewportWidth,
-  surfaceContentHeight / cssViewportHeight
-)
-```
-
-- 使用 Chromium device metrics `scale` 完成浏览器内部缩放。
-- 画面在内容槽内居中，剩余区域使用主题背景留白。
-- 不使用截图、Canvas、CSS transform 或外层位图缩放。
-- 用户输入由 Chromium 命中测试处理，不由 Svelte 转换坐标。
+- 不对页面截图、Canvas 或 DOM 做外层缩放；宽屏/窄屏/自定义模式只通过 Chromium device metrics 改变 CSS viewport。
+- 用户输入由 Chromium `WebContentsView` 命中测试处理，不由 Svelte 转换坐标。
 - 工具坐标保持 CSS px；CDP 截图 clip 与 ElementRef 统一使用 CSS px。
 - viewport 修改只使当前 Surface 的 snapshot revision 失效，不导航、不刷新、不创建页面。
 
@@ -756,16 +772,16 @@ contentScale = min(
 
 Electron Main 维护每窗口唯一 `focusedSurface`：
 
-- 地址栏、消息输入框、终端和 BrowserSurface 焦点互斥。
+- 地址栏、消息输入框、终端和当前 Browser Surface 焦点互斥。
 - resize、状态刷新和页面事件不得调用 focus。
-- 用户点击 Browser 内容时才将焦点交给 BrowserSurface。
+- 用户点击 Browser 内容时才将焦点交给当前 Browser Surface。
 - 切换 Browser Tab 时只在用户明确激活时聚焦。
 - `Cmd/Ctrl+C/X/V/A/Z/Shift+Z` 根据 focusedSurface 路由。
 - Browser 页面使用 Chromium 原生编辑命令；Magi 文本区使用可信 Renderer 编辑命令。
 - 应用级快捷键先处理明确保留项，其余交给 focused WebContents。
 - 中文、日文、韩文 IME、死键、组合输入和系统文本服务进入真实 focused WebContents，不通过自定义键盘映射。
 
-Agent 的 CDP 输入不得改变 MagiAppView 或 RightPaneChromeView 的焦点。
+Agent 的 CDP 输入不得改变 MagiAppView 中非浏览器区域的焦点。
 
 ## 15. 标记、截图与消息
 
@@ -958,8 +974,8 @@ browser-capability-manifest.json
 
 ### 阶段 1：Electron Desktop POC
 
-- BaseWindow + MagiAppView + RightPaneChromeView。
-- BrowserSurfaceView 真实网页。
+- BaseWindow + 全窗口 MagiAppView + 右栏 DOM。
+- Browser `WebContentsView` 真实网页，并位于右栏内容槽。
 - DesktopOverlayView 覆盖菜单和 Modal。
 - 右栏连续拖动、窗口 resize、DPI、全屏和多显示器。
 - 快捷键、剪贴板、中文 IME 和焦点。
@@ -1012,8 +1028,8 @@ POC 只验证架构，不进入正式发布；失败即修正目标架构，不�
 | 旧实现 | 唯一新实现 | 删除闸门 |
 | --- | --- | --- |
 | Tauri Window/WebView | Electron BaseWindow + MagiAppView | Electron 主窗口验收通过 |
-| CEF NSView/Helper | BrowserSurfaceView/WebContentsView | 真实页面、输入、resize 验收通过 |
-| DOM 测量 + native resize bridge | WindowLayoutManager | reducer、DPI、多窗口验收通过 |
+| CEF NSView/Helper 或旧 guest | Electron Main `WebContentsView` | 真实页面、输入、DOM resize 验收通过 |
+| 独立覆盖层/坐标补偿 | RightPane DOM slot + Surface bounds IPC | 多面板、窗口 resize、多窗口验收通过 |
 | browser-host 创建 Playwright Page | BrowserSurfaceManager | Worker 能绑定现有 Surface 且 Target 数稳定 |
 | Playwright connectOverCDP 产品路径 | BrowserCdpGateway + direct CDP Worker | 工具矩阵验收通过 |
 | Browser Runtime installer/updater | Desktop 原子发行和 UpdateManager | 安装、更新、回滚验收通过 |
@@ -1047,8 +1063,8 @@ POC 只验证架构，不进入正式发布；失败即修正目标架构，不�
 
 - `web/src/lib/native-browser.ts`
 - `native_browser_create/resize/focus/navigate/close` bridge。
-- `getBoundingClientRect()` BrowserSurface 定位。
-- `ResizeObserver -> requestAnimationFrame -> native resize` 队列。
+- 旧 Browser guest 注册、独立 native bridge 和 `1 x 1` 定位兼容层。
+- 没有跨模块的 viewport/截图缩放队列；浏览器尺寸完全由 RightPane DOM 的正常布局传播。
 - `1 x 1` 隐藏和旧 frame key/generation 逻辑。
 - CEF 页面状态、原生光标和原生 Annotation 事件兼容层。
 - Browser Runtime 安装状态驱动的 UI 分支。
@@ -1097,7 +1113,7 @@ CI 增加废码门禁，扫描旧模块、旧命令、CEF/Tauri 依赖、独立 
 ### 20.1 架构验收
 
 - Electron Main 是 WebContents、布局和子进程唯一所有者。
-- RightPaneChromeView 是多功能右栏的唯一通用内容壳；BrowserSurfaceView 不能成为右栏父容器，也不能阻断代码、图片、终端、Agent 或未来面板。
+- MagiAppView 内的右栏 DOM 是多功能右栏的唯一通用内容壳；Browser WebContentsView 只能绑定当前 Browser Tab 的内容槽，不能成为右栏父容器，也不能阻断代码、图片、终端、Agent 或未来面板。
 - 新增浏览器的异步创建只占用该浏览器项的 pending 状态；新增菜单、右栏拖拽、已有面板切换和非浏览器面板创建不等待浏览器网络或 Worker 就绪。
 - BrowserAuthority 只持久化逻辑 Browser 事实。
 - Surface 运行态按 `desktopEpoch/windowId/surfaceId` 隔离。
@@ -1129,7 +1145,16 @@ CI 增加废码门禁，扫描旧模块、旧命令、CEF/Tauri 依赖、独立 
 20. Browser Session 数据不进入系统钥匙串，不读取外部浏览器 Profile。
 21. 设置页版本、状态、更新、重启能力和清理数据真实有效。
 
-### 20.3 自动测试
+### 20.3 Web 与手机 Web 验收
+
+1. 普通 Web 和手机 Web 以 `clientPlatform=web/mobile-web` 加载能力目录后，明确得到 `platformCapabilities.desktopBrowserSurface=false`，不显示新建内置浏览器、响应式视口和 Desktop Surface 控制按钮；Desktop 以 `clientPlatform=desktop` 得到 `true`。
+2. 普通 Web 和手机 Web 可以读取有权限的 Browser Tab 记录、当前 URL/标题、标记、截图 Artifact 和消息引用；刷新后不丢失这些持久事实。
+3. Web 和手机 Web 点击 URL 时可以选择系统外部浏览器；需要真实内置浏览器时给出“请在 Magi Desktop 中打开”的明确提示，不出现永远连接、黑屏或伪造的 Browser Surface。
+4. Web/Mobile Web 的窗口尺寸、CSS viewport、滚动、焦点和布局不会写入 DesktopWindowSnapshot，也不会影响任何 Desktop Surface。
+5. Desktop、Web 和手机 Web 同时查看同一 Browser Tab 时，只同步 URL/标题、标记、Artifact 和消息事实；不共享 Cookie、缓存、viewport、焦点、滚动位置或页面运行态。
+6. 未实现 Remote Browser Surface 前，普通 Web 和手机 Web 不得声称能够让 LLM 直接操作真实网页；相关工具必须返回结构化的 `capability_unavailable`，而不是通用 HTTP 或 DOM 错误。
+
+### 20.4 自动测试
 
 - Desktop IPC schema、权限和未知字段拒绝测试。
 - WindowLayout reducer 和 layout revision 竞态测试。
@@ -1145,7 +1170,7 @@ CI 增加废码门禁，扫描旧模块、旧命令、CEF/Tauri 依赖、独立 
 - macOS、Windows 和 Linux 核心流程 E2E。
 - `git diff --check`、前端 check、Rust workspace check/test 和废码扫描。
 
-### 20.4 产品性能和稳定性预算
+### 20.5 产品性能和稳定性预算
 
 - 连续拖动右栏 30 秒时，Browser Surface 不导航、不重建、不改 viewport mode，且桌面组合帧率 p95 不低于 55 FPS。
 - 新增浏览器 Tab 的点击反馈不等待页面首屏或 Worker；逻辑 Tab/占位状态应先呈现，Surface 物化和导航在后台完成。
@@ -1162,8 +1187,9 @@ CI 增加废码门禁，扫描旧模块、旧命令、CEF/Tauri 依赖、独立 
 只有以下条件全部满足，统一 Chromium 改造才算完成：
 
 - Electron Desktop Host 是唯一桌面入口。
-- 用户和 Agent 操作同一个 BrowserSurface。
+- 用户和 Agent 操作同一个 Browser Surface WebContents。
 - 所有真实桌面验收和自动测试通过。
+- Web 与手机 Web 的能力目录、只读记录、Artifact、外部打开和不可用降级验收通过；不得把它们误标为 Desktop 内置浏览器。
 - macOS、Windows、Linux 打包和核心流程通过。
 - 旧 Tauri 稳定版升级到 Electron 版本通过。
 - CEF、Native Bridge、独立 Browser Runtime 和生产 Playwright 路径全部删除。

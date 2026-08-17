@@ -13,7 +13,7 @@
     "test": "npm run test --workspace @magi/desktop && npm run test --workspace @magi/browser-automation-worker && npm run test --workspace magi-web",
     "build": "npm run build --workspace @magi/desktop",
     "desktop:dev": "npm run dev --workspace @magi/desktop",
-    "desktop:package": "npm run package --workspace @magi/desktop",
+    "desktop:package": "npm run package --workspace @magi/desktop --",
     "release:guard": "node scripts/verify-browser-contracts.mjs && node scripts/verify-electron-release-boundary.mjs"
   },
   "engines": {

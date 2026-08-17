@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -10,12 +11,10 @@ import {
   nativeTheme,
   shell,
   type MenuItemConstructorOptions,
+  type Rectangle,
 } from "electron";
 import {
   DESKTOP_BROWSER_PROTOCOL_VERSION,
-  DESKTOP_RIGHT_PANE_INTENT_VERSION,
-  type DesktopRightPaneIntentEnvelope,
-  type DesktopRightPaneTabIntent,
   type BrowserLogicalViewport,
   type DesktopBrowserHandshake,
 } from "@magi/desktop-browser-contracts";
@@ -45,6 +44,12 @@ app.commandLine.appendSwitch(
 );
 
 const AGENT_ORIGIN = "http://127.0.0.1:38123";
+const BROWSER_CAPABILITY_MANIFEST = readBrowserCapabilityManifest();
+const PRODUCT_VERSION = process.env.MAGI_PRODUCT_VERSION
+  || BROWSER_CAPABILITY_MANIFEST.productVersion
+  || "unknown";
+const DAEMON_VERSION = BROWSER_CAPABILITY_MANIFEST.daemonVersion || PRODUCT_VERSION;
+const AUTOMATION_WORKER_VERSION = BROWSER_CAPABILITY_MANIFEST.automationWorkerVersion || PRODUCT_VERSION;
 const desktopEpoch = `desktop-${randomUUID()}`;
 const controlToken = randomBytes(32).toString("hex");
 const controlSocket = process.platform === "win32"
@@ -58,28 +63,34 @@ let automationWorker: AutomationWorker | null = null;
 let controlServer: DesktopControlServer | null = null;
 let processSupervisor: ProcessSupervisor | null = null;
 let updateManager: UpdateManager | null = null;
+let desktopConnectionGeneration: number | null = null;
+let workerInvalidatedDesktopConnection = false;
+let browserComponentError: BrowserComponentError | null = null;
+let browserComponentSnapshotTimer: NodeJS.Timeout | null = null;
+let lastBrowserComponentSnapshot = "";
 let shuttingDown = false;
 
 const singleInstance = app.requestSingleInstanceLock();
 if (!singleInstance) app.quit();
 
-app.on("second-instance", () => {
-  const manager = windowManager;
-  if (!manager) return;
-  const window = windows.get(manager.activeWindowId());
-  if (!window || window.isDestroyed()) return;
-  if (window.isMinimized()) window.restore();
-  window.show();
-  window.focus();
-});
+if (singleInstance) {
+  app.on("second-instance", () => {
+    const manager = windowManager;
+    if (!manager) return;
+    const window = windows.get(manager.activeWindowId());
+    if (!window || window.isDestroyed()) return;
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+  });
 
-app.whenReady().then(async () => {
+  app.whenReady().then(async () => {
   const paths = resolveRuntimePaths();
   let control: DesktopControlServer | null = null;
   let worker: AutomationWorker | null = null;
   const surfaces = new BrowserSurfaceManager({
     desktopEpoch,
-    windows,
+    partitionRegistryPath: join(app.getPath("userData"), "browser-partitions.json"),
     onEvent: (event) => {
       control?.handleSurfaceEvent(event);
       publishBrowserEvent(event);
@@ -89,7 +100,6 @@ app.whenReady().then(async () => {
   const overlays = new DesktopOverlayManager({
     preloadPath: paths.preload,
     agentOrigin: AGENT_ORIGIN,
-    windows,
     onAction: (windowId, action) => {
       windowManager?.broadcast(windowId, "magi-desktop:overlay-action", action);
     },
@@ -97,8 +107,25 @@ app.whenReady().then(async () => {
       windowManager?.broadcast(windowId, "magi-desktop:overlay-closed", null);
     },
   });
-  worker = new AutomationWorker({ entryPath: paths.workerEntry, surfaceManager: surfaces });
-  worker.start();
+  worker = new AutomationWorker({
+    entryPath: paths.workerEntry,
+    surfaceManager: surfaces,
+    onFailure: async (cause) => {
+      if (shuttingDown) return;
+      workerInvalidatedDesktopConnection = desktopConnectionGeneration !== null;
+      browserComponentError = componentError("worker", "browser_worker_failed", cause);
+      // Releasing the local Surface flag is not enough: the daemon owns the
+      // authoritative Browser Lease. Removing this Desktop registration makes
+      // the daemon revoke every lease before the recovered Worker reconnects.
+      await unregisterDesktopBrowserConnection();
+    },
+    onReady: async () => {
+      if (shuttingDown || !workerInvalidatedDesktopConnection) return;
+      await registerDesktopBrowserConnection();
+      workerInvalidatedDesktopConnection = false;
+      await windowManager?.restoreAfterDaemonReady();
+    },
+  });
   automationWorker = worker;
   const manager = new WindowManager({
     desktopEpoch,
@@ -129,6 +156,7 @@ app.whenReady().then(async () => {
   processSupervisor = new ProcessSupervisor({
     daemonPath: paths.daemon,
     agentOrigin: AGENT_ORIGIN,
+    onReady: handleDaemonReady,
     environment: {
       ...process.env,
       MAGI_HOST: "127.0.0.1",
@@ -145,15 +173,23 @@ app.whenReady().then(async () => {
     },
   });
   await processSupervisor.start();
-  updateManager = new UpdateManager(app.getVersion(), (snapshot) => {
+  // daemon、窗口控制端点和 Renderer 生命周期先建立，再启动 Worker。
+  // 这样启动失败时不会留下一个脱离桌面宿主的浏览器自动化进程。
+  worker.start();
+  updateManager = new UpdateManager(PRODUCT_VERSION, (snapshot) => {
     broadcastAll("magi-desktop:update", snapshot);
   });
   registerIpc();
   manager.createWindow();
-}).catch((error) => {
-  console.error("Magi Desktop 启动失败", error);
-  app.exit(1);
-});
+  startBrowserComponentSnapshots();
+  }).catch(async (error) => {
+    console.error("Magi Desktop 启动失败", error);
+    await shutdown().catch((cleanupError) => {
+      console.error("Magi Desktop 启动清理失败", cleanupError);
+    });
+    app.exit(1);
+  });
+}
 
 app.on("window-all-closed", () => app.quit());
 app.on("before-quit", (event) => {
@@ -165,19 +201,20 @@ app.on("before-quit", (event) => {
 
 function registerIpc(): void {
   ipcMain.handle("magi-desktop:get-snapshot", (event) => {
-    const { manager, windowId } = trustedSender(event.sender.id);
+    const { manager, windowId } = trustedAppSender(event.sender.id);
     return manager.snapshot(windowId);
   });
   ipcMain.handle("magi-desktop:layout-intent", (event, value: unknown) => {
-    const { manager, windowId } = trustedSender(event.sender.id);
+    const { manager, windowId } = trustedAppSender(event.sender.id);
     return manager.submitLayoutIntent(windowId, parseLayoutIntent(value));
   });
   ipcMain.handle("magi-desktop:set-context", (event, value: unknown) => {
-    const { manager, windowId } = trustedSender(event.sender.id);
-    if (manager.rendererRoleForWebContents(event.sender.id) !== "app") {
-      throw new Error("desktop_context_sender_denied");
-    }
-    const request = object(value);
+    const { manager, windowId } = trustedAppSender(event.sender.id);
+    const request = rejectUnknownFields(
+      object(value),
+      ["workspaceId", "workspacePath", "sessionId"],
+      "context",
+    );
     return manager.setRendererContext(windowId, {
       workspaceId: optionalText(request.workspaceId, "workspaceId"),
       workspacePath: optionalText(request.workspacePath, "workspacePath"),
@@ -185,13 +222,35 @@ function registerIpc(): void {
     });
   });
   ipcMain.handle("magi-desktop:activate-browser", async (event, value: unknown) => {
-    const { manager, windowId } = trustedSender(event.sender.id);
+    const { manager, windowId } = trustedAppSender(event.sender.id);
     const request = parseBrowserActivation(value);
     return manager.activateBrowser({ windowId, ...request });
   });
+  ipcMain.handle("magi-desktop:browser-slot", (event, value: unknown) => {
+    const { manager, windowId } = trustedAppSender(event.sender.id);
+    const input = rejectUnknownFields(object(value), ["tabId", "slotRevision", "layoutRevision", "bounds"], "browserSlot");
+    const rawBounds = input.bounds;
+    let bounds: Rectangle | null = null;
+    if (rawBounds !== null && rawBounds !== undefined) {
+      const valueBounds = object(rawBounds);
+      bounds = {
+        x: finite(valueBounds.x, "bounds.x"),
+        y: finite(valueBounds.y, "bounds.y"),
+        width: finite(valueBounds.width, "bounds.width"),
+        height: finite(valueBounds.height, "bounds.height"),
+      };
+    }
+    return manager.updateBrowserSlot(
+      windowId,
+      text(input.tabId, "tabId"),
+      positiveInteger(input.slotRevision, "slotRevision"),
+      nonNegativeInteger(input.layoutRevision, "layoutRevision"),
+      bounds,
+    );
+  });
   ipcMain.handle("magi-desktop:activate-panel", (event, value: unknown) => {
-    const { manager, windowId } = trustedSender(event.sender.id);
-    const request = object(value);
+    const { manager, windowId } = trustedAppSender(event.sender.id);
+    const request = rejectUnknownFields(object(value), ["kind", "tabId"], "activatePanel");
     return manager.activatePanel(
       windowId,
       parsePanelKind(request.kind),
@@ -199,38 +258,31 @@ function registerIpc(): void {
     );
   });
   ipcMain.handle("magi-desktop:set-browser-viewport", async (event, value: unknown) => {
-    const { manager, windowId } = trustedSender(event.sender.id);
-    const request = object(value);
+    const { manager, windowId } = trustedAppSender(event.sender.id);
+    const request = rejectUnknownFields(object(value), ["tabId", "viewport"], "browserViewport");
     return manager.setBrowserViewport(
       windowId,
       text(request.tabId, "tabId"),
       parseViewport(request.viewport),
     );
   });
-  ipcMain.handle("magi-desktop:open-right-pane-tab", (event, value: unknown) => {
-    const { manager, windowId } = trustedSender(event.sender.id);
-    if (manager.rendererRoleForWebContents(event.sender.id) !== "app") {
-      throw new Error("desktop_right_pane_intent_sender_denied");
-    }
-    return manager.openRightPaneTab(windowId, parseRightPaneIntent(value));
-  });
   ipcMain.handle("magi-desktop:right-pane-ready", (event) => {
-    const { manager, windowId } = trustedSender(event.sender.id);
-    if (manager.rendererRoleForWebContents(event.sender.id) !== "right-pane") {
-      throw new Error("desktop_right_pane_ready_sender_denied");
-    }
+    const { manager, windowId } = trustedAppSender(event.sender.id);
     manager.handleRightPaneReady(windowId);
   });
   ipcMain.handle("magi-desktop:open-overlay", (event, value: unknown) => {
-    const { manager, windowId } = trustedSender(event.sender.id);
-    if (manager.rendererRoleForWebContents(event.sender.id) !== "right-pane") {
-      throw new Error("desktop_overlay_sender_denied");
-    }
+    const { manager, windowId } = trustedAppSender(event.sender.id);
     manager.openOverlay(windowId, parseOverlayState(value));
   });
   ipcMain.handle("magi-desktop:close-overlay", (event) => {
-    const { manager, windowId } = trustedSender(event.sender.id);
+    const { manager, windowId } = trustedAppSender(event.sender.id);
     manager.closeOverlay(windowId);
+  });
+  ipcMain.handle("magi-desktop:set-blocking-overlay", (event, value: unknown) => {
+    const { manager, windowId } = trustedAppSender(event.sender.id);
+    const request = rejectUnknownFields(object(value), ["active"], "blockingOverlay");
+    if (typeof request.active !== "boolean") throw new Error("desktop_blocking_overlay_invalid");
+    return manager.setBlockingOverlay(windowId, request.active);
   });
   ipcMain.handle("magi-desktop:overlay-ready", (event) => {
     const { manager, windowId } = trustedSender(event.sender.id);
@@ -246,73 +298,90 @@ function registerIpc(): void {
     }
     manager.handleOverlayAction(windowId, parseOverlayAction(value));
   });
-  ipcMain.handle("magi-desktop:focus-browser", (event, surfaceId: unknown) => {
-    trustedSender(event.sender.id);
-    if (typeof surfaceId !== "string" || !surfaceId.trim()) throw new Error("browser_surface_id_invalid");
-    surfaceManager!.focus(surfaceId.trim());
-  });
   ipcMain.handle("magi-desktop:open-external", async (event, value: unknown) => {
-    trustedSender(event.sender.id);
+    trustedAppSender(event.sender.id);
     if (typeof value !== "string") throw new Error("external_url_invalid");
     const url = new URL(value);
     if (!["http:", "https:"].includes(url.protocol)) throw new Error("external_url_invalid");
     await shell.openExternal(url.href);
   });
   ipcMain.handle("magi-desktop:show-context-menu", async (event, value: unknown) => {
-    const { windowId } = trustedSender(event.sender.id);
+    const { windowId } = trustedAppSender(event.sender.id);
     return showContextMenu(windowId, parseContextMenuItems(value));
   });
   ipcMain.handle("magi-desktop:open-workspace-folder", async (event, value: unknown) => {
-    trustedSender(event.sender.id);
+    trustedAppSender(event.sender.id);
     await openWorkspaceFolder(text(value, "workspaceRootPathRef"));
   });
   ipcMain.handle("magi-desktop:reveal-workspace-file", async (event, value: unknown) => {
-    trustedSender(event.sender.id);
-    const request = object(value);
+    trustedAppSender(event.sender.id);
+    const request = rejectUnknownFields(
+      object(value),
+      ["targetPathRef", "workspaceRootPathRef"],
+      "revealWorkspaceFile",
+    );
     await revealWorkspaceFile({
       targetPathRef: text(request.targetPathRef, "targetPathRef"),
       workspaceRootPathRef: text(request.workspaceRootPathRef, "workspaceRootPathRef"),
     });
   });
   ipcMain.handle("magi-desktop:set-appearance", (event, value: unknown) => {
-    const { manager, windowId } = trustedSender(event.sender.id);
-    const request = object(value);
+    const { manager, windowId } = trustedAppSender(event.sender.id);
+    const request = rejectUnknownFields(
+      object(value),
+      ["mode", "backgroundColor", "accentColor", "material"],
+      "appearance",
+    );
     const mode = request.mode;
     const backgroundColor = text(request.backgroundColor, "backgroundColor");
+    const accentColor = text(request.accentColor, "accentColor");
+    const material = request.material;
     if (mode !== "light" && mode !== "dark") throw new Error("desktop_appearance_mode_invalid");
-    if (!/^#[0-9a-f]{6}$/iu.test(backgroundColor)) {
+    if (!isDesktopBackgroundColor(backgroundColor)) {
       throw new Error("desktop_appearance_background_invalid");
     }
+    if (!isDesktopBackgroundColor(accentColor)) {
+      throw new Error("desktop_appearance_accent_invalid");
+    }
+    if (material !== "clear" && material !== "translucent" && material !== "immersive") {
+      throw new Error("desktop_appearance_material_invalid");
+    }
     nativeTheme.themeSource = mode;
-    manager.setAppearance(windowId, backgroundColor);
+    manager.setAppearance(windowId, { mode, backgroundColor, accentColor, material });
   });
   ipcMain.handle("magi-desktop:get-app-version", (event) => {
-    trustedSender(event.sender.id);
-    return app.getVersion();
+    trustedAppSender(event.sender.id);
+    return PRODUCT_VERSION;
   });
   ipcMain.handle("magi-desktop:get-browser-component-info", (event) => {
-    trustedSender(event.sender.id);
-    return browserComponentInfo();
+    trustedAppSender(event.sender.id);
+    return browserComponentSnapshot();
   });
-  ipcMain.handle("magi-desktop:restart-browser-automation", (event) => {
-    trustedSender(event.sender.id);
-    automationWorker!.restart();
-    return browserComponentInfo();
+  ipcMain.handle("magi-desktop:restart-browser-automation", async (event) => {
+    trustedAppSender(event.sender.id);
+    try {
+      await automationWorker!.restart();
+      browserComponentError = null;
+      return browserComponentSnapshot();
+    } catch (cause) {
+      browserComponentError = componentError("worker", "browser_worker_restart_failed", cause);
+      throw cause;
+    }
   });
   ipcMain.handle("magi-desktop:clear-browser-data", async (event) => {
-    trustedSender(event.sender.id);
+    trustedAppSender(event.sender.id);
     await surfaceManager!.clearBrowsingData();
   });
   ipcMain.handle("magi-desktop:check-for-updates", (event) => {
-    trustedSender(event.sender.id);
+    trustedAppSender(event.sender.id);
     return updateManager!.check();
   });
   ipcMain.handle("magi-desktop:download-update", (event) => {
-    trustedSender(event.sender.id);
+    trustedAppSender(event.sender.id);
     return updateManager!.download();
   });
   ipcMain.handle("magi-desktop:install-update", (event) => {
-    trustedSender(event.sender.id);
+    trustedAppSender(event.sender.id);
     return updateManager!.install();
   });
 }
@@ -349,7 +418,7 @@ function showContextMenu(windowId: string, items: ContextMenuItem[]): Promise<st
 }
 
 function parseContextMenuItems(value: unknown): ContextMenuItem[] {
-  const request = object(value);
+  const request = rejectUnknownFields(object(value), ["items"], "contextMenu");
   if (!Array.isArray(request.items) || request.items.length === 0 || request.items.length > 32) {
     throw new Error("desktop_context_menu_items_invalid");
   }
@@ -363,11 +432,16 @@ function parseContextMenuItems(value: unknown): ContextMenuItem[] {
   ]);
   return request.items.map((rawItem) => {
     const item = object(rawItem);
-    if (item.type === "separator") return { type: "separator" };
+    if (item.type === "separator") {
+      rejectUnknownFields(item, ["type"], "contextMenu.separator");
+      return { type: "separator" };
+    }
     if (item.type === "role" && allowedRoles.has(item.role as ContextMenuRole)) {
+      rejectUnknownFields(item, ["type", "role"], "contextMenu.role");
       return { type: "role", role: item.role as ContextMenuRole };
     }
     if (item.type !== "action") throw new Error("desktop_context_menu_item_invalid");
+    rejectUnknownFields(item, ["type", "id", "label", "enabled"], "contextMenu.action");
     const id = text(item.id, "contextMenu.id");
     const label = text(item.label, "contextMenu.label");
     if (!/^[a-z][a-z0-9-]{0,63}$/u.test(id) || label.length > 160) {
@@ -380,7 +454,7 @@ function parseContextMenuItems(value: unknown): ContextMenuItem[] {
 function handshake(worker: AutomationWorker): DesktopBrowserHandshake {
   return {
     protocol_version: DESKTOP_BROWSER_PROTOCOL_VERSION,
-    desktop_version: app.getVersion(),
+    desktop_version: PRODUCT_VERSION,
     electron_version: process.versions.electron,
     chromium_version: process.versions.chrome,
     process_id: process.pid,
@@ -389,18 +463,133 @@ function handshake(worker: AutomationWorker): DesktopBrowserHandshake {
   };
 }
 
-function browserComponentInfo() {
-  const worker = automationWorker!;
-  const daemon = processSupervisor!;
+type BrowserComponentStatus = "starting" | "ready" | "restarting" | "failed" | "stopped";
+type BrowserComponentErrorTarget = "daemon" | "worker" | "protocol";
+
+interface BrowserComponentError {
+  target: BrowserComponentErrorTarget;
+  code: string;
+  message: string;
+}
+
+interface BrowserCapabilityManifest {
+  productVersion?: string;
+  daemonVersion?: string;
+  automationWorkerVersion?: string;
+}
+
+function browserComponentSnapshot() {
+  const worker = automationWorker;
+  const daemon = processSupervisor;
+  const daemonStatus = daemon?.status ?? "stopped";
+  const workerStatus = worker?.status ?? "stopped";
+  const protocolCompatible = daemonStatus === "ready" && desktopConnectionGeneration !== null;
+  const error = currentBrowserComponentError(daemonStatus, workerStatus, protocolCompatible);
   return {
-    ...handshake(worker),
-    daemon_version: app.getVersion(),
-    daemon_status: daemon.status,
-    daemon_process_id: daemon.processId,
-    automation_worker_version: app.getVersion(),
-    automation_worker_status: worker.status,
-    protocol_compatible: true,
+    product_version: PRODUCT_VERSION,
+    electron_version: process.versions.electron,
+    chromium_version: process.versions.chrome,
+    process_id: process.pid,
+    desktop_epoch: desktopEpoch,
+    daemon: {
+      version: DAEMON_VERSION,
+      status: daemonStatus,
+      process_id: daemon?.processId ?? null,
+    },
+    worker: {
+      version: AUTOMATION_WORKER_VERSION,
+      epoch: worker?.workerEpoch ?? "",
+      status: workerStatus,
+    },
+    protocol: {
+      version: DESKTOP_BROWSER_PROTOCOL_VERSION,
+      compatible: protocolCompatible,
+      error: protocolCompatible ? null : error?.target === "protocol" ? error : null,
+    },
+    error,
   };
+}
+
+function currentBrowserComponentError(
+  daemonStatus: BrowserComponentStatus,
+  workerStatus: BrowserComponentStatus,
+  protocolCompatible: boolean,
+): BrowserComponentError | null {
+  if (daemonStatus === "failed") {
+    return browserComponentError?.target === "daemon"
+      ? browserComponentError
+      : { target: "daemon", code: "browser_daemon_failed", message: "Browser daemon failed" };
+  }
+  if (workerStatus === "failed") {
+    return browserComponentError?.target === "worker"
+      ? browserComponentError
+      : { target: "worker", code: "browser_worker_failed", message: "Browser automation worker failed" };
+  }
+  if (!protocolCompatible && daemonStatus === "ready") {
+    return browserComponentError
+      || { target: "protocol", code: "browser_protocol_incompatible", message: "Browser protocol is incompatible" };
+  }
+  if (daemonStatus !== "ready") {
+    return browserComponentError?.target === "daemon"
+      ? browserComponentError
+      : {
+        target: "daemon",
+        code: `browser_daemon_${daemonStatus}`,
+        message: `Browser daemon is ${daemonStatus}`,
+      };
+  }
+  if (workerStatus !== "ready") {
+    return browserComponentError?.target === "worker"
+      ? browserComponentError
+      : {
+        target: "worker",
+        code: `browser_worker_${workerStatus}`,
+        message: `Browser automation worker is ${workerStatus}`,
+      };
+  }
+  return null;
+}
+
+function componentError(target: BrowserComponentErrorTarget, code: string, cause: unknown): BrowserComponentError {
+  return {
+    target,
+    code,
+    message: cause instanceof Error ? cause.message : String(cause),
+  };
+}
+
+function startBrowserComponentSnapshots(): void {
+  if (browserComponentSnapshotTimer) return;
+  publishBrowserComponentSnapshot();
+  browserComponentSnapshotTimer = setInterval(() => publishBrowserComponentSnapshot(), 250);
+  browserComponentSnapshotTimer.unref();
+}
+
+function publishBrowserComponentSnapshot(): void {
+  const snapshot = browserComponentSnapshot();
+  const serialized = JSON.stringify(snapshot);
+  if (serialized === lastBrowserComponentSnapshot) return;
+  lastBrowserComponentSnapshot = serialized;
+  broadcastAll("magi-desktop:browser-component", snapshot);
+}
+
+function readBrowserCapabilityManifest(): BrowserCapabilityManifest {
+  const path = join(process.resourcesPath, "browser-capability-manifest.json");
+  if (!existsSync(path)) return {};
+  try {
+    const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!value || typeof value !== "object") return {};
+    const record = value as Record<string, unknown>;
+    return {
+      ...(typeof record.productVersion === "string" ? { productVersion: record.productVersion } : {}),
+      ...(typeof record.daemonVersion === "string" ? { daemonVersion: record.daemonVersion } : {}),
+      ...(typeof record.automationWorkerVersion === "string"
+        ? { automationWorkerVersion: record.automationWorkerVersion }
+        : {}),
+    };
+  } catch {
+    return {};
+  }
 }
 
 function trustedSender(webContentsId: number): { manager: WindowManager; windowId: string } {
@@ -411,8 +600,22 @@ function trustedSender(webContentsId: number): { manager: WindowManager; windowI
   return { manager, windowId };
 }
 
+function trustedAppSender(webContentsId: number): { manager: WindowManager; windowId: string } {
+  const sender = trustedSender(webContentsId);
+  if (sender.manager.rendererRoleForWebContents(webContentsId) !== "app") {
+    throw new Error("desktop_app_sender_denied");
+  }
+  return sender;
+}
+
 function publishBrowserEvent(event: BrowserSurfaceEvent): void {
-  broadcastAll("magi-desktop:browser-event", event);
+  // Surface 事件属于创建它的窗口。广播给所有窗口会让同一逻辑 Tab 的
+  // Secondary Surface 污染另一个窗口的地址、加载状态和 Agent 光标。
+  try {
+    windowManager?.broadcast(event.binding.window_id, "magi-desktop:browser-event", event);
+  } catch {
+    // 目标窗口可能刚好关闭，WindowManager 会负责清理它的 Surface。
+  }
 }
 
 function broadcastAll(channel: string, value: unknown): void {
@@ -428,11 +631,85 @@ function broadcastAll(channel: string, value: unknown): void {
 }
 
 async function shutdown(): Promise<void> {
+  if (browserComponentSnapshotTimer) clearInterval(browserComponentSnapshotTimer);
+  browserComponentSnapshotTimer = null;
+  lastBrowserComponentSnapshot = "";
   windowManager?.closeAll();
   surfaceManager?.closeAll();
   automationWorker?.stop();
   await processSupervisor?.stop();
+  await unregisterDesktopBrowserConnection();
   await controlServer?.close();
+}
+
+async function registerDesktopBrowserConnection(): Promise<void> {
+  const currentResponse = await fetch(`${AGENT_ORIGIN}/api/browser/desktop/connection`, {
+    cache: "no-store",
+  });
+  if (!currentResponse.ok) {
+    throw new Error(`browser_desktop_connection_snapshot_failed:${currentResponse.status}`);
+  }
+  const currentPayload: unknown = await currentResponse.json();
+  const expectedGeneration = browserConnectionGeneration(currentPayload);
+  const response = await fetch(`${AGENT_ORIGIN}/api/browser/desktop/connection`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      socketPath: controlSocket,
+      authToken: controlToken,
+      desktopEpoch,
+      parentPid: process.pid,
+      expectedGeneration,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`browser_desktop_connection_register_failed:${response.status}`);
+  }
+  desktopConnectionGeneration = browserConnectionGeneration(await response.json());
+}
+
+async function handleDaemonReady(): Promise<void> {
+  try {
+    await registerDesktopBrowserConnection();
+    browserComponentError = null;
+    await windowManager?.restoreAfterDaemonReady();
+  } catch (cause) {
+    browserComponentError = componentError("daemon", "browser_daemon_registration_failed", cause);
+    throw cause;
+  }
+}
+
+async function unregisterDesktopBrowserConnection(): Promise<void> {
+  if (desktopConnectionGeneration === null) return;
+  try {
+    const response = await fetch(`${AGENT_ORIGIN}/api/browser/desktop/connection`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        desktopEpoch,
+        parentPid: process.pid,
+        generation: desktopConnectionGeneration,
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(`browser_desktop_connection_unregister_failed:${response.status}`);
+    }
+    desktopConnectionGeneration = null;
+  } catch {
+    // daemon 可能已经随桌面端退出；关闭流程不因注册清理失败阻塞。
+  }
+}
+
+function browserConnectionGeneration(value: unknown): number {
+  if (!value || typeof value !== "object") {
+    throw new Error("browser_desktop_connection_generation_missing");
+  }
+  const generation = (value as { desktopConnectionGeneration?: unknown })
+    .desktopConnectionGeneration;
+  if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0) {
+    throw new Error("browser_desktop_connection_generation_invalid");
+  }
+  return generation;
 }
 
 function resolveRuntimePaths(): {
@@ -463,7 +740,7 @@ function resolveRuntimePaths(): {
 }
 
 function parseLayoutIntent(value: unknown): WindowLayoutIntent {
-  const input = object(value);
+  const input = rejectUnknownFields(object(value), ["type", "width", "visible"], "layoutIntent");
   switch (input.type) {
     case "right_pane_width":
       return { type: "right_pane_width", width: finite(input.width, "width") };
@@ -483,7 +760,11 @@ function parseBrowserActivation(value: unknown): {
   navigationRevision: number;
   viewport: BrowserLogicalViewport;
 } {
-  const input = object(value);
+  const input = rejectUnknownFields(
+    object(value),
+    ["tabId", "browserSessionId", "url", "navigationRevision", "viewport"],
+    "browserActivation",
+  );
   const tabId = text(input.tabId, "tabId");
   const browserSessionId = text(input.browserSessionId, "browserSessionId");
   const url = text(input.url, "url");
@@ -492,83 +773,19 @@ function parseBrowserActivation(value: unknown): {
   return { tabId, browserSessionId, url, navigationRevision, viewport };
 }
 
-function parseRightPaneIntent(value: unknown): DesktopRightPaneIntentEnvelope {
-  const input = object(value);
-  if (input.version !== DESKTOP_RIGHT_PANE_INTENT_VERSION) {
-    throw new Error("desktop_right_pane_intent_version_invalid");
-  }
-  const raw = object(input.intent);
-  const kind = raw.kind;
-  if (kind === "agent") {
-    return {
-      version: DESKTOP_RIGHT_PANE_INTENT_VERSION,
-      intent: stripUndefined({
-        kind: "agent",
-        agentRunId: boundedText(raw.agentRunId, "rightPane.agentRunId", 512),
-        sessionId: boundedOptionalText(raw.sessionId, "rightPane.sessionId", 512),
-        workspaceId: boundedOptionalText(raw.workspaceId, "rightPane.workspaceId", 512),
-        workspacePath: boundedOptionalText(raw.workspacePath, "rightPane.workspacePath", 16_384),
-        label: boundedOptionalTextOrUndefined(raw.label, "rightPane.label", 512),
-        accentToken: boundedNullableText(raw.accentToken, "rightPane.accentToken", 128),
-      }) as unknown as DesktopRightPaneTabIntent,
-    };
-  }
-  if (kind === "code") {
-    const contentKind = raw.contentKind;
-    if (contentKind !== undefined
-      && contentKind !== "text"
-      && contentKind !== "binary"
-      && contentKind !== "large_text"
-      && contentKind !== "symlink"
-      && contentKind !== "special") {
-      throw new Error("desktop_right_pane_content_kind_invalid");
-    }
-    return {
-      version: DESKTOP_RIGHT_PANE_INTENT_VERSION,
-      intent: stripUndefined({
-        kind: "code",
-        filepath: boundedText(raw.filepath, "rightPane.filepath", 16_384),
-        sessionId: boundedOptionalText(raw.sessionId, "rightPane.sessionId", 512),
-        workspaceId: boundedOptionalText(raw.workspaceId, "rightPane.workspaceId", 512),
-        workspacePath: boundedOptionalText(raw.workspacePath, "rightPane.workspacePath", 16_384),
-        label: boundedOptionalTextOrUndefined(raw.label, "rightPane.label", 512),
-        displayPath: boundedOptionalTextOrUndefined(raw.displayPath, "rightPane.displayPath", 16_384),
-        diff: boundedNullableText(raw.diff, "rightPane.diff", 2_000_000),
-        originalContent: boundedNullableText(raw.originalContent, "rightPane.originalContent", 2_000_000),
-        currentContent: boundedNullableText(raw.currentContent, "rightPane.currentContent", 2_000_000),
-        isChangeDiff: raw.isChangeDiff === true ? true : raw.isChangeDiff === false ? false : undefined,
-        changeRevision: boundedNullableText(raw.changeRevision, "rightPane.changeRevision", 512),
-        content: boundedNullableText(raw.content, "rightPane.content", 2_000_000),
-        language: boundedNullableText(raw.language, "rightPane.language", 128),
-        contentKind,
-        size: nullableFinite(raw.size, "rightPane.size"),
-        mime: boundedNullableText(raw.mime, "rightPane.mime", 256),
-        symlinkTarget: boundedNullableText(raw.symlinkTarget, "rightPane.symlinkTarget", 16_384),
-        headSummary: boundedNullableText(raw.headSummary, "rightPane.headSummary", 512_000),
-        tailSummary: boundedNullableText(raw.tailSummary, "rightPane.tailSummary", 512_000),
-        imageDataUrl: boundedNullableText(raw.imageDataUrl, "rightPane.imageDataUrl", 8_000_000),
-      }) as unknown as DesktopRightPaneTabIntent,
-    };
-  }
-  if (kind === "terminal") {
-    return {
-      version: DESKTOP_RIGHT_PANE_INTENT_VERSION,
-      intent: {
-        kind,
-        terminalTabId: boundedText(raw.terminalTabId, "rightPane.terminalTabId", 512),
-        sessionId: boundedOptionalText(raw.sessionId, "rightPane.sessionId", 512),
-        workspaceId: boundedOptionalText(raw.workspaceId, "rightPane.workspaceId", 512),
-        workspacePath: boundedOptionalText(raw.workspacePath, "rightPane.workspacePath", 16_384),
-      },
-    };
-  }
-  throw new Error("desktop_right_pane_intent_kind_invalid");
-}
-
 function parseViewport(value: unknown): BrowserLogicalViewport {
   const viewportInput = object(value);
-  return viewportInput.mode === "fixed"
-    ? {
+  if (viewportInput.mode === "auto") {
+    rejectUnknownFields(viewportInput, ["mode"], "viewport");
+    return { mode: "auto" };
+  }
+  if (viewportInput.mode !== "fixed") throw new Error("desktop_ipc_viewport_mode_invalid");
+  rejectUnknownFields(
+    viewportInput,
+    ["mode", "width", "height", "deviceScaleFactorMillis", "device_scale_factor_millis", "deviceType", "device_type"],
+    "viewport",
+  );
+  return {
         mode: "fixed",
         width: finite(viewportInput.width, "viewport.width"),
         height: finite(viewportInput.height, "viewport.height"),
@@ -579,8 +796,19 @@ function parseViewport(value: unknown): BrowserLogicalViewport {
         device_type: viewportInput.deviceType === "mobile" || viewportInput.device_type === "mobile"
           ? "mobile"
           : "desktop",
-      }
-    : { mode: "auto" };
+      };
+}
+
+function positiveInteger(value: unknown, name: string): number {
+  const number = finite(value, name);
+  if (!Number.isInteger(number) || number < 1) throw new Error(`${name}_invalid`);
+  return number;
+}
+
+function nonNegativeInteger(value: unknown, name: string): number {
+  const number = finite(value, name);
+  if (!Number.isInteger(number) || number < 0) throw new Error(`${name}_invalid`);
+  return number;
 }
 
 function parsePanelKind(value: unknown): PanelKind {
@@ -590,9 +818,13 @@ function parsePanelKind(value: unknown): PanelKind {
 }
 
 function parseOverlayState(value: unknown): import("./desktop-overlay-manager.js").DesktopOverlayState {
-  const input = object(value);
+  const input = rejectUnknownFields(
+    object(value),
+    ["overlayId", "kind", "phase", "ownerId", "placement", "anchorBounds", "title", "items", "fields"],
+    "overlay",
+  );
   const placement = input.placement;
-  if (placement !== "right-pane-add" && placement !== "browser-viewport" && placement !== "browser-annotations" && placement !== "browser-content") {
+  if (placement !== "right-pane-add" && placement !== "browser-viewport" && placement !== "browser-annotations") {
     throw new Error("desktop_overlay_placement_invalid");
   }
   const kind = input.kind === "annotation" ? "annotation" : input.kind === "menu" ? "menu" : null;
@@ -604,7 +836,11 @@ function parseOverlayState(value: unknown): import("./desktop-overlay-manager.js
   const rawFields = Array.isArray(input.fields) ? input.fields : [];
   if (rawItems.length > 50 || rawFields.length > 4) throw new Error("desktop_overlay_items_invalid");
   const items = rawItems.map((value) => {
-    const item = object(value);
+    const item = rejectUnknownFields(
+      object(value),
+      ["id", "label", "type", "icon", "selected", "disabled"],
+      "overlay.item",
+    );
     const id = text(item.id, "overlay.item.id");
     const label = text(item.label, "overlay.item.label");
     if (id.length > 120 || label.length > 240) throw new Error("desktop_overlay_item_invalid");
@@ -618,7 +854,11 @@ function parseOverlayState(value: unknown): import("./desktop-overlay-manager.js
     };
   });
   const fields = rawFields.map((value) => {
-    const field = object(value);
+    const field = rejectUnknownFields(
+      object(value),
+      ["id", "label", "type", "value", "min", "max"],
+      "overlay.field",
+    );
     const id = text(field.id, "overlay.field.id");
     const label = text(field.label, "overlay.field.label");
     const fieldValue = typeof field.value === "string" ? field.value : String(field.value ?? "");
@@ -632,6 +872,24 @@ function parseOverlayState(value: unknown): import("./desktop-overlay-manager.js
       max: finiteOrNull(field.max),
     };
   });
+  let anchorBounds: Rectangle | null = null;
+  if (input.anchorBounds !== null && input.anchorBounds !== undefined) {
+    const bounds = rejectUnknownFields(
+      object(input.anchorBounds),
+      ["x", "y", "width", "height"],
+      "overlay.anchorBounds",
+    );
+    anchorBounds = {
+      x: finite(bounds.x, "overlay.anchorBounds.x"),
+      y: finite(bounds.y, "overlay.anchorBounds.y"),
+      width: finite(bounds.width, "overlay.anchorBounds.width"),
+      height: finite(bounds.height, "overlay.anchorBounds.height"),
+    };
+    if (anchorBounds.width <= 0 || anchorBounds.height <= 0) {
+      throw new Error("desktop_overlay_anchor_invalid");
+    }
+  }
+  if (kind === "menu" && !anchorBounds) throw new Error("desktop_overlay_anchor_required");
   return {
     overlayId: typeof input.overlayId === "string" && input.overlayId.trim()
       ? input.overlayId.trim()
@@ -640,6 +898,7 @@ function parseOverlayState(value: unknown): import("./desktop-overlay-manager.js
     phase,
     ownerId: text(input.ownerId, "overlay.ownerId"),
     placement,
+    anchorBounds,
     title: text(input.title, "overlay.title"),
     items,
     fields,
@@ -647,7 +906,11 @@ function parseOverlayState(value: unknown): import("./desktop-overlay-manager.js
 }
 
 function parseOverlayAction(value: unknown): import("./desktop-overlay-manager.js").DesktopOverlayAction {
-  const input = object(value);
+  const input = rejectUnknownFields(
+    object(value),
+    ["overlayId", "kind", "ownerId", "interaction", "id", "value"],
+    "overlayAction",
+  );
   const interaction = input.interaction;
   if (interaction !== "select" && interaction !== "input") throw new Error("desktop_overlay_interaction_invalid");
   const kind = input.kind === "annotation" ? "annotation" : input.kind === "menu" ? "menu" : null;
@@ -671,6 +934,21 @@ function object(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function isDesktopBackgroundColor(value: string): boolean {
+  return /^(?:#[0-9a-f]{6}(?:[0-9a-f]{2})?|rgba?\(\s*(?:\d{1,3}\s*,\s*){2}\d{1,3}(?:\s*,\s*(?:0(?:\.\d+)?|1(?:\.0+)?|0?\.\d+))?\s*\))$/iu.test(value);
+}
+
+function rejectUnknownFields(
+  input: Record<string, unknown>,
+  allowed: readonly string[],
+  scope: string,
+): Record<string, unknown> {
+  const allowedFields = new Set(allowed);
+  const unknown = Object.keys(input).find((key) => !allowedFields.has(key));
+  if (unknown) throw new Error(`desktop_ipc_${scope}_unknown_field:${unknown}`);
+  return input;
+}
+
 function text(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`desktop_ipc_${name}_invalid`);
   return value.trim();
@@ -682,43 +960,6 @@ function optionalText(value: unknown, name: string): string {
   const normalized = value.trim();
   if (normalized.length > 16_384) throw new Error(`desktop_ipc_${name}_invalid`);
   return normalized;
-}
-
-function boundedText(value: unknown, name: string, maxLength: number): string {
-  const normalized = text(value, name);
-  if (normalized.length > maxLength) throw new Error(`desktop_ipc_${name}_invalid`);
-  return normalized;
-}
-
-function boundedOptionalText(value: unknown, name: string, maxLength: number): string {
-  const normalized = optionalText(value, name);
-  if (normalized.length > maxLength) throw new Error(`desktop_ipc_${name}_invalid`);
-  return normalized;
-}
-
-function boundedOptionalTextOrUndefined(value: unknown, name: string, maxLength: number): string | undefined {
-  if (value === undefined || value === null || value === "") return undefined;
-  return boundedText(value, name, maxLength);
-}
-
-function boundedNullableText(value: unknown, name: string, maxLength: number): string | null | undefined {
-  if (value === undefined) return undefined;
-  if (value === null || value === "") return null;
-  return boundedText(value, name, maxLength);
-}
-
-function nullableFinite(value: unknown, name: string): number | null | undefined {
-  if (value === undefined) return undefined;
-  if (value === null) return null;
-  const normalized = finite(value, name);
-  if (normalized < 0) throw new Error(`desktop_ipc_${name}_invalid`);
-  return normalized;
-}
-
-function stripUndefined(value: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(
-    Object.entries(value).filter(([, entry]) => entry !== undefined),
-  );
 }
 
 function finite(value: unknown, name: string): number {

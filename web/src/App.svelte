@@ -17,6 +17,7 @@
     synchronizeBrowserTabs,
   } from './stores/right-pane.svelte';
   import { i18n } from './stores/i18n.svelte';
+  import { setDesktopBlockingOverlay } from './shared/desktop-overlay-contract';
   import {
     RUNTIME_CONNECTION_EVENT,
     BROWSER_AUTHORITY_CHANGED_EVENT,
@@ -24,12 +25,6 @@
     isWebAgentMode,
     type AgentConnectionEventDetail,
   } from './web/agent-api';
-
-  interface Props {
-    desktopAppSurface?: boolean;
-  }
-
-  let { desktopAppSurface = false }: Props = $props();
 
   type TopTabType = 'thread' | 'edits' | 'knowledge';
 
@@ -43,7 +38,8 @@
   const changeRefreshIntervalMs = 1000;
   let browserAuthoritySyncRequest = 0;
 
-  async function synchronizeCurrentBrowserAuthority(revealActiveTab = false): Promise<void> {
+  async function synchronizeCurrentBrowserAuthority(revealTabId = ''): Promise<void> {
+    if (!messagesState.bootstrapped) return;
     const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
     const workspacePath = messagesState.currentWorkspacePath?.trim() || '';
     const sessionId = messagesState.currentSessionId?.trim() || '';
@@ -60,7 +56,7 @@
         return;
       }
       synchronizeBrowserTabs(workspaceId, workspacePath, sessionId, snapshot, {
-        revealActiveTab,
+        revealTabId,
         newTabLabel: i18n.t('browser.tab.new'),
       });
     } catch (error) {
@@ -136,16 +132,12 @@
     settingsOpen = false;
   }
 
-  function toggleDesktopRightPane(): void {
-    const desktop = window.magiDesktop;
-    if (!desktop) return;
-    void desktop.getSnapshot()
-      .then((snapshot) => desktop.submitLayoutIntent({
-        type: 'right_pane_visibility',
-        visible: !snapshot.layout.rightPaneVisible,
-      }))
-      .catch((error) => console.warn('[App] 切换桌面右栏失败:', error));
-  }
+  // Settings 是 App Renderer 的全局阻塞层。它不靠 z-index 压过原生
+  // WebContentsView，而是通过统一契约让当前 Browser Surface 先退出内容槽。
+  $effect(() => {
+    setDesktopBlockingOverlay('app-settings', settingsOpen);
+    return () => setDesktopBlockingOverlay('app-settings', false);
+  });
 
   onMount(() => {
     const handleAgentConnection = (event: Event) => {
@@ -165,6 +157,7 @@
         eventType?: string;
         workspaceId?: string;
         sessionId?: string;
+        payload?: Record<string, unknown>;
       }>).detail;
       const workspaceId = messagesState.currentWorkspaceId?.trim() || '';
       const sessionId = messagesState.currentSessionId?.trim() || '';
@@ -175,8 +168,11 @@
         return;
       }
       const eventType = detail?.eventType?.trim() || '';
+      const createdTabId = typeof detail?.payload?.tab_id === 'string'
+        ? detail.payload.tab_id.trim()
+        : '';
       void synchronizeCurrentBrowserAuthority(
-        eventType === 'browser.tab.created' || eventType === 'browser.tab.activated',
+        eventType === 'browser.tab.created' ? createdTabId : '',
       );
     };
     window.addEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
@@ -317,7 +313,6 @@
   <!-- 顶部标题栏 + 导航栏 -->
   <Header
     onOpenSettings={openSettings}
-    onToggleRightPane={desktopAppSurface ? toggleDesktopRightPane : undefined}
   >
     <TopTabs activeTopTab={currentTopTab} onTabChange={handleTabChange} />
   </Header>

@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BrowserAnnotation, BrowserAnnotationAnchor, BrowserAnnotationStatus, BrowserAuthorityError,
     BrowserControlLease, BrowserLeaseEndReason, BrowserLeaseLifecycle, BrowserLeaseSelector,
-    BrowserProfile, BrowserSession, BrowserSessionLifecycle, BrowserTab, BrowserTabLifecycle,
-    GoalControlBinding, normalize_browser_page_state,
+    BrowserProfile, BrowserSession, BrowserSessionLifecycle, BrowserSurfaceBinding, BrowserTab,
+    BrowserTabLifecycle, GoalControlBinding, normalize_browser_page_state,
 };
 
 const MAX_BROWSER_TABS_PER_SESSION: usize = 32;
@@ -67,18 +67,20 @@ pub struct ValidatedBrowserWrite {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSurfaceControlSnapshot {
+    pub desktop_epoch: String,
+    pub window_id: String,
     pub tab_id: BrowserTabId,
     pub surface_id: String,
+    pub surface_revision: u64,
+    pub web_contents_id: u32,
+    pub target_id: String,
+    pub browser_context_id: String,
+    pub navigation_revision: u64,
     pub fence: u64,
     pub lease_id: Option<BrowserLeaseId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BrowserPrimarySurface {
-    pub tab_id: BrowserTabId,
-    pub surface_id: String,
-    pub surface_revision: u64,
-}
+pub type BrowserPrimarySurface = BrowserSurfaceBinding;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BrowserAuthoritySnapshot {
@@ -113,6 +115,9 @@ pub struct BrowserDurableTab {
     pub page_title: String,
     pub display_label: Option<String>,
     pub navigation_revision: u64,
+    /// Authority 分配的快照 revision。它属于 element_ref 失效协议，必须跨 daemon 重启持久化。
+    #[serde(default)]
+    pub snapshot_revision: u64,
     #[serde(default)]
     pub annotation_sequence: u64,
     pub created_at: UtcMillis,
@@ -132,6 +137,7 @@ impl From<&BrowserTab> for BrowserDurableTab {
             page_title: title,
             display_label: tab.display_label.clone(),
             navigation_revision: tab.navigation_revision,
+            snapshot_revision: tab.snapshot_revision,
             annotation_sequence: tab.annotation_sequence,
             created_at: tab.created_at,
             updated_at: tab.updated_at,
@@ -153,7 +159,7 @@ impl BrowserDurableTab {
             title,
             display_label: self.display_label,
             navigation_revision: self.navigation_revision,
-            snapshot_revision: 0,
+            snapshot_revision: self.snapshot_revision,
             annotation_sequence: self.annotation_sequence,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -161,8 +167,9 @@ impl BrowserDurableTab {
     }
 }
 
-pub const BROWSER_DURABLE_STATE_SCHEMA_VERSION: u16 = 5;
-const PREVIOUS_BROWSER_DURABLE_STATE_SCHEMA_VERSION: u16 = 4;
+pub const BROWSER_DURABLE_STATE_SCHEMA_VERSION: u16 = 6;
+const PREVIOUS_BROWSER_DURABLE_STATE_SCHEMA_VERSION: u16 = 5;
+const LEGACY_BROWSER_DURABLE_STATE_SCHEMA_VERSION: u16 = 4;
 
 #[derive(Clone, Debug, Default)]
 pub struct BrowserAuthority {
@@ -175,6 +182,7 @@ pub struct BrowserAuthority {
     active_surface_leases: HashMap<(BrowserTabId, String), BrowserLeaseId>,
     surface_fences: HashMap<(BrowserTabId, String), u64>,
     primary_surfaces: HashMap<BrowserTabId, BrowserPrimarySurface>,
+    active_desktop_epoch: Option<String>,
 }
 
 impl BrowserAuthority {
@@ -344,49 +352,164 @@ impl BrowserAuthority {
     ) -> Result<BrowserSurfaceControlSnapshot, BrowserAuthorityError> {
         self.require_tab(tab_id)?;
         let key = (tab_id.clone(), surface_id.to_string());
+        let binding = self
+            .primary_surfaces
+            .get(tab_id)
+            .filter(|binding| binding.surface_id == surface_id)
+            .cloned()
+            .ok_or_else(|| BrowserAuthorityError::SurfaceNotPrimary {
+                tab_id: tab_id.clone(),
+                surface_id: surface_id.to_string(),
+            })?;
         Ok(BrowserSurfaceControlSnapshot {
-            tab_id: tab_id.clone(),
-            surface_id: surface_id.to_string(),
+            desktop_epoch: binding.desktop_epoch,
+            window_id: binding.window_id,
+            tab_id: binding.tab_id,
+            surface_id: binding.surface_id,
+            surface_revision: binding.surface_revision,
+            web_contents_id: binding.web_contents_id,
+            target_id: binding.target_id,
+            browser_context_id: binding.browser_context_id,
+            navigation_revision: binding.navigation_revision,
             fence: self.surface_fences.get(&key).copied().unwrap_or_default(),
             lease_id: self.active_surface_leases.get(&key).cloned(),
         })
     }
 
-    pub fn set_primary_surface(
+    /// 切换 Desktop 运行边界时，旧窗口的 Surface 和 Lease 立即失效；逻辑
+    /// Browser Tab 仍保留，由新 Desktop 重新物化。相同 epoch 的重连不清空
+    /// 现有 Surface，避免 daemon 短暂断线造成页面闪断。
+    pub fn accept_desktop_epoch(
         &mut self,
-        tab_id: &BrowserTabId,
-        surface_id: String,
-        surface_revision: u64,
+        desktop_epoch: String,
         now: UtcMillis,
-    ) -> Result<Vec<BrowserControlLease>, BrowserAuthorityError> {
-        self.require_tab(tab_id)?;
-        let next = BrowserPrimarySurface {
-            tab_id: tab_id.clone(),
-            surface_id,
-            surface_revision,
-        };
-        if self.primary_surfaces.get(tab_id) == Some(&next) {
-            return Ok(Vec::new());
+    ) -> Vec<BrowserControlLease> {
+        if self.active_desktop_epoch.as_deref() == Some(desktop_epoch.as_str()) {
+            return Vec::new();
         }
-        let revoked = self.revoke_leases(
-            &BrowserLeaseSelector {
-                tab_id: Some(tab_id.clone()),
-                ..BrowserLeaseSelector::default()
-            },
-            BrowserLeaseEndReason::RuntimeUnavailable,
-            now,
-        );
-        self.primary_surfaces.insert(tab_id.clone(), next);
-        Ok(revoked)
-    }
-
-    pub fn clear_primary_surfaces(&mut self, now: UtcMillis) -> Vec<BrowserControlLease> {
         let revoked = self.revoke_leases(
             &BrowserLeaseSelector::default(),
             BrowserLeaseEndReason::RuntimeUnavailable,
             now,
         );
         self.primary_surfaces.clear();
+        self.active_desktop_epoch = Some(desktop_epoch);
+        self.bump_revision();
+        revoked
+    }
+
+    pub fn set_primary_surface(
+        &mut self,
+        binding: BrowserSurfaceBinding,
+        now: UtcMillis,
+    ) -> Result<Vec<BrowserControlLease>, BrowserAuthorityError> {
+        self.require_tab(&binding.tab_id)?;
+        if binding.desktop_epoch.trim().is_empty()
+            || binding.window_id.trim().is_empty()
+            || binding.surface_id.trim().is_empty()
+            || binding.target_id.trim().is_empty()
+            || binding.browser_context_id.trim().is_empty()
+            || binding.web_contents_id == 0
+        {
+            return Err(BrowserAuthorityError::InvalidSurfaceBinding);
+        }
+        if let Some(active_epoch) = &self.active_desktop_epoch {
+            if active_epoch != &binding.desktop_epoch {
+                return Ok(Vec::new());
+            }
+        } else {
+            self.active_desktop_epoch = Some(binding.desktop_epoch.clone());
+        }
+
+        if let Some(current) = self.primary_surfaces.get(&binding.tab_id).cloned() {
+            if binding.surface_revision < current.surface_revision {
+                return Ok(Vec::new());
+            }
+            if binding.surface_revision == current.surface_revision {
+                if !same_physical_surface(&current, &binding) {
+                    return Ok(Vec::new());
+                }
+                if binding.navigation_revision > current.navigation_revision {
+                    let revoked = self.revoke_surface_leases(
+                        &binding.tab_id,
+                        &binding.surface_id,
+                        BrowserLeaseEndReason::RuntimeUnavailable,
+                        now,
+                    );
+                    self.primary_surfaces
+                        .insert(binding.tab_id.clone(), binding);
+                    self.bump_revision();
+                    return Ok(revoked);
+                }
+                return Ok(Vec::new());
+            }
+        }
+
+        let revoked = self.revoke_leases(
+            &BrowserLeaseSelector {
+                tab_id: Some(binding.tab_id.clone()),
+                ..BrowserLeaseSelector::default()
+            },
+            BrowserLeaseEndReason::RuntimeUnavailable,
+            now,
+        );
+        self.primary_surfaces
+            .insert(binding.tab_id.clone(), binding);
+        self.bump_revision();
+        Ok(revoked)
+    }
+
+    pub fn accept_page_binding(
+        &mut self,
+        binding: &BrowserSurfaceBinding,
+        now: UtcMillis,
+    ) -> Result<(bool, Vec<BrowserControlLease>), BrowserAuthorityError> {
+        self.require_tab(&binding.tab_id)?;
+        let Some(current) = self.primary_surfaces.get(&binding.tab_id).cloned() else {
+            return Ok((false, Vec::new()));
+        };
+        if !same_physical_surface(&current, binding)
+            || binding.navigation_revision < current.navigation_revision
+        {
+            return Ok((false, Vec::new()));
+        }
+        let mut revoked = Vec::new();
+        if binding.navigation_revision > current.navigation_revision {
+            revoked = self.revoke_surface_leases(
+                &binding.tab_id,
+                &binding.surface_id,
+                BrowserLeaseEndReason::RuntimeUnavailable,
+                now,
+            );
+            self.primary_surfaces
+                .insert(binding.tab_id.clone(), binding.clone());
+            self.bump_revision();
+        }
+        Ok((true, revoked))
+    }
+
+    pub fn is_current_surface_binding(&self, binding: &BrowserSurfaceBinding) -> bool {
+        self.primary_surfaces
+            .get(&binding.tab_id)
+            .is_some_and(|current| {
+                same_physical_surface(current, binding)
+                    && binding.navigation_revision == current.navigation_revision
+            })
+    }
+
+    pub fn clear_primary_surfaces(&mut self, now: UtcMillis) -> Vec<BrowserControlLease> {
+        if self.primary_surfaces.is_empty() {
+            self.active_desktop_epoch = None;
+            return Vec::new();
+        }
+        let revoked = self.revoke_leases(
+            &BrowserLeaseSelector::default(),
+            BrowserLeaseEndReason::RuntimeUnavailable,
+            now,
+        );
+        self.primary_surfaces.clear();
+        self.active_desktop_epoch = None;
+        self.bump_revision();
         revoked
     }
 
@@ -729,7 +852,7 @@ impl BrowserAuthority {
         &mut self,
         tab_id: &BrowserTabId,
         now: UtcMillis,
-    ) -> Result<u64, BrowserAuthorityError> {
+    ) -> Result<(u64, u64), BrowserAuthorityError> {
         self.require_ready_tab(tab_id)?;
         let tab = self
             .tabs
@@ -737,40 +860,51 @@ impl BrowserAuthority {
             .expect("browser tab was validated before mutation");
         tab.snapshot_revision = tab.snapshot_revision.saturating_add(1);
         tab.updated_at = now;
-        let revision = tab.snapshot_revision;
+        let revisions = (tab.navigation_revision, tab.snapshot_revision);
         self.bump_revision();
-        Ok(revision)
+        Ok(revisions)
     }
 
     pub fn apply_host_snapshot_revision(
         &mut self,
         tab_id: &BrowserTabId,
         host_snapshot_revision: u64,
-        now: UtcMillis,
+        _now: UtcMillis,
     ) -> Result<u64, BrowserAuthorityError> {
         self.require_ready_tab(tab_id)?;
         let tab = self
             .tabs
             .get_mut(tab_id)
             .expect("browser tab was validated before mutation");
-        if host_snapshot_revision < tab.snapshot_revision {
+        if host_snapshot_revision != tab.snapshot_revision {
             return Err(BrowserAuthorityError::SnapshotRevisionMismatch {
                 expected: tab.snapshot_revision,
                 provided: host_snapshot_revision,
             });
         }
-        let changed = host_snapshot_revision > tab.snapshot_revision;
-        let revision = if changed {
-            tab.snapshot_revision = host_snapshot_revision;
-            tab.updated_at = now;
-            host_snapshot_revision
-        } else {
-            tab.snapshot_revision
-        };
-        if changed {
-            self.bump_revision();
+        Ok(tab.snapshot_revision)
+    }
+
+    pub fn validate_snapshot_result(
+        &self,
+        tab_id: &BrowserTabId,
+        navigation_revision: u64,
+        snapshot_revision: u64,
+    ) -> Result<(), BrowserAuthorityError> {
+        let tab = self.require_ready_tab(tab_id)?;
+        if tab.navigation_revision != navigation_revision {
+            return Err(BrowserAuthorityError::NavigationRevisionRegression {
+                current: tab.navigation_revision,
+                received: navigation_revision,
+            });
         }
-        Ok(revision)
+        if tab.snapshot_revision != snapshot_revision {
+            return Err(BrowserAuthorityError::SnapshotRevisionMismatch {
+                expected: tab.snapshot_revision,
+                provided: snapshot_revision,
+            });
+        }
+        Ok(())
     }
 
     pub fn validate_snapshot_ref(
@@ -830,9 +964,13 @@ impl BrowserAuthority {
         let tab = self.require_ready_tab(&input.tab_id)?;
         let session = self.require_ready_session(&tab.browser_session_id)?;
         validate_lease_owner(&input.owner, session)?;
-        let primary = self.primary_surfaces.get(&input.tab_id).ok_or_else(|| {
-            BrowserAuthorityError::PrimarySurfaceUnavailable(input.tab_id.clone())
-        })?;
+        let primary = self
+            .primary_surfaces
+            .get(&input.tab_id)
+            .cloned()
+            .ok_or_else(|| {
+                BrowserAuthorityError::PrimarySurfaceUnavailable(input.tab_id.clone())
+            })?;
         if primary.surface_id != input.surface_id {
             return Err(BrowserAuthorityError::SurfaceNotPrimary {
                 tab_id: input.tab_id,
@@ -854,8 +992,15 @@ impl BrowserAuthority {
         let fence = self.advance_surface_fence(&input.tab_id, &input.surface_id);
         let lease = BrowserControlLease {
             lease_id: input.lease_id,
+            desktop_epoch: primary.desktop_epoch,
+            window_id: primary.window_id,
+            surface_revision: primary.surface_revision,
             tab_id: input.tab_id,
             surface_id: input.surface_id,
+            web_contents_id: primary.web_contents_id,
+            target_id: primary.target_id,
+            browser_context_id: primary.browser_context_id,
+            navigation_revision: primary.navigation_revision,
             owner: input.owner,
             turn_id: input.turn_id,
             goal_binding: input.goal_binding,
@@ -929,7 +1074,10 @@ impl BrowserAuthority {
         let primary = self.primary_surfaces.get(request.tab_id).ok_or_else(|| {
             BrowserAuthorityError::PrimarySurfaceUnavailable(request.tab_id.clone())
         })?;
-        if primary.surface_id != request.surface_id {
+        let lease_binding = lease.surface_binding();
+        if primary.surface_id != request.surface_id
+            || !same_physical_surface(primary, &lease_binding)
+        {
             return Err(BrowserAuthorityError::SurfaceNotPrimary {
                 tab_id: request.tab_id.clone(),
                 surface_id: request.surface_id.to_string(),
@@ -986,6 +1134,28 @@ impl BrowserAuthority {
                     .ok()
             })
             .collect()
+    }
+
+    fn revoke_surface_leases(
+        &mut self,
+        tab_id: &BrowserTabId,
+        surface_id: &str,
+        reason: BrowserLeaseEndReason,
+        now: UtcMillis,
+    ) -> Vec<BrowserControlLease> {
+        let revoked = self.revoke_leases(
+            &BrowserLeaseSelector {
+                tab_id: Some(tab_id.clone()),
+                surface_id: Some(surface_id.to_string()),
+                ..BrowserLeaseSelector::default()
+            },
+            reason,
+            now,
+        );
+        if revoked.is_empty() {
+            self.advance_surface_fence(tab_id, surface_id);
+        }
+        revoked
     }
 
     pub fn expire_leases(&mut self, now: UtcMillis) -> Vec<BrowserControlLease> {
@@ -1076,6 +1246,7 @@ impl BrowserAuthority {
     ) -> Result<Self, BrowserAuthorityError> {
         if state.schema_version != BROWSER_DURABLE_STATE_SCHEMA_VERSION
             && state.schema_version != PREVIOUS_BROWSER_DURABLE_STATE_SCHEMA_VERSION
+            && state.schema_version != LEGACY_BROWSER_DURABLE_STATE_SCHEMA_VERSION
         {
             return Err(BrowserAuthorityError::InvalidSnapshot(format!(
                 "unsupported browser durable state schema: {}",
@@ -1090,7 +1261,9 @@ impl BrowserAuthority {
             mut tabs,
             annotations,
         } = state;
-        if schema_version == PREVIOUS_BROWSER_DURABLE_STATE_SCHEMA_VERSION {
+        if schema_version == PREVIOUS_BROWSER_DURABLE_STATE_SCHEMA_VERSION
+            || schema_version == LEGACY_BROWSER_DURABLE_STATE_SCHEMA_VERSION
+        {
             migrate_legacy_tab_order(&mut tabs, &sessions);
         }
         Self::restore(
@@ -1115,6 +1288,7 @@ impl BrowserAuthority {
             now,
         );
         self.primary_surfaces.clear();
+        self.active_desktop_epoch = None;
         let recovering_session_ids = self
             .sessions
             .values()
@@ -1553,6 +1727,17 @@ fn annotation_snapshot_revision(anchor: &BrowserAnnotationAnchor) -> u64 {
         BrowserAnnotationAnchor::Element(anchor) => anchor.snapshot_revision,
         BrowserAnnotationAnchor::Region(anchor) => anchor.snapshot_revision,
     }
+}
+
+fn same_physical_surface(left: &BrowserSurfaceBinding, right: &BrowserSurfaceBinding) -> bool {
+    left.desktop_epoch == right.desktop_epoch
+        && left.window_id == right.window_id
+        && left.surface_id == right.surface_id
+        && left.surface_revision == right.surface_revision
+        && left.tab_id == right.tab_id
+        && left.web_contents_id == right.web_contents_id
+        && left.target_id == right.target_id
+        && left.browser_context_id == right.browser_context_id
 }
 
 fn validate_lease_owner(

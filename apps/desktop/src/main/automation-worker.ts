@@ -18,12 +18,16 @@ interface PendingCommand {
 
 export type AutomationWorkerStatus = "starting" | "ready" | "restarting" | "failed" | "stopped";
 
+type WorkerLifecycleCallback = (error?: Error) => Promise<void> | void;
+
 const MAX_RECOVERY_ATTEMPTS = 3;
 const RECOVERY_STABLE_MILLIS = 30_000;
 
 export class AutomationWorker {
   readonly #entryPath: string;
   readonly #surfaceManager: BrowserSurfaceManager;
+  readonly #onFailure: WorkerLifecycleCallback | undefined;
+  readonly #onReady: WorkerLifecycleCallback | undefined;
   readonly #pending = new Map<string, PendingCommand>();
   #process: UtilityProcess | null = null;
   #workerEpoch = "";
@@ -34,10 +38,19 @@ export class AutomationWorker {
   #recoveryAttempts = 0;
   #recoveryTimer: NodeJS.Timeout | null = null;
   #stabilityTimer: NodeJS.Timeout | null = null;
+  #failureNotified = false;
+  #failureNotification: Promise<void> | null = null;
 
-  constructor(input: { entryPath: string; surfaceManager: BrowserSurfaceManager }) {
+  constructor(input: {
+    entryPath: string;
+    surfaceManager: BrowserSurfaceManager;
+    onFailure?: WorkerLifecycleCallback;
+    onReady?: WorkerLifecycleCallback;
+  }) {
     this.#entryPath = input.entryPath;
     this.#surfaceManager = input.surfaceManager;
+    this.#onFailure = input.onFailure;
+    this.#onReady = input.onReady;
   }
 
   get workerEpoch(): string {
@@ -58,6 +71,7 @@ export class AutomationWorker {
   private launch(status: "starting" | "restarting"): void {
     this.#status = status;
     this.#ready = false;
+    this.#failureNotified = false;
     this.#workerEpoch = `worker-${randomUUID()}`;
     let child: UtilityProcess;
     try {
@@ -70,16 +84,27 @@ export class AutomationWorker {
       });
     } catch (cause) {
       this.#status = "failed";
-      this.scheduleRecovery(cause);
+      const error = asError(cause, "browser_worker_fork_failed");
+      void this.handleFailure(error);
+      this.scheduleRecovery(error);
       return;
     }
-    child.on("message", (message) => this.accept(message as WorkerToMainMessage));
+    child.on("message", (message) => {
+      // A killed UtilityProcess can flush one last IPC message after a new
+      // Worker has already been launched. Never let that stale process alter
+      // the new Worker epoch or resolve its pending commands.
+      if (this.#process !== child) return;
+      this.accept(message as WorkerToMainMessage);
+    });
     child.on("exit", (code) => {
       if (this.#process !== child) return;
       this.#process = null;
       this.clearStabilityTimer();
-      this.failPending(new Error(`browser_worker_exited:${code}`));
-      if (!this.#stopping) this.scheduleRecovery(new Error(`browser_worker_exited:${code}`));
+      const error = new Error(`browser_worker_exited:${code ?? "unknown"}`);
+      this.failPending(error);
+      this.failReadyWaiters(error);
+      void this.handleFailure(error);
+      if (!this.#stopping) this.scheduleRecovery(error);
     });
     child.stdout?.on("data", (chunk) => process.stdout.write(`[browser-worker] ${chunk}`));
     child.stderr?.on("data", (chunk) => process.stderr.write(`[browser-worker] ${chunk}`));
@@ -114,7 +139,7 @@ export class AutomationWorker {
   }
 
   forwardSurfaceEvent(event: BrowserSurfaceEvent): void {
-    if (event.type !== "cdp_event" || !this.#process) return;
+    if (event.type !== "cdp_event" || !this.#process || !this.#ready) return;
     const message: MainToWorkerMessage = {
       type: "cdp_event",
       binding: event.binding,
@@ -132,16 +157,18 @@ export class AutomationWorker {
     this.#process = null;
     this.#ready = false;
     if (child) child.kill();
+    void this.releaseSurfaceControls();
     this.failPending(new Error("browser_worker_stopped"));
     this.failReadyWaiters(new Error("browser_worker_stopped"));
     this.#status = "stopped";
   }
 
-  restart(): void {
+  async restart(): Promise<void> {
     this.stop();
     this.#stopping = false;
     this.#recoveryAttempts = 0;
     this.start();
+    await this.waitUntilReady();
   }
 
   private scheduleRecovery(cause: unknown): void {
@@ -176,15 +203,7 @@ export class AutomationWorker {
         this.failReadyWaiters(new Error("browser_worker_epoch_mismatch"));
         return;
       }
-      this.#ready = true;
-      this.#status = "ready";
-      for (const waiter of this.#readyWaiters) waiter.resolve();
-      this.#readyWaiters.clear();
-      this.#stabilityTimer = setTimeout(() => {
-        this.#recoveryAttempts = 0;
-        this.#stabilityTimer = null;
-      }, RECOVERY_STABLE_MILLIS);
-      this.#stabilityTimer.unref();
+      void this.finishReadyHandshake();
       return;
     }
     if (message.type === "worker_result") {
@@ -205,7 +224,7 @@ export class AutomationWorker {
       return;
     }
     const child = this.#process;
-    if (!child) return;
+    if (!child || !this.#ready) return;
     void this.#surfaceManager.sendCdp(message.binding, message.method, message.params ?? {})
       .then((result) => {
         const response: MainToWorkerMessage = {
@@ -239,6 +258,67 @@ export class AutomationWorker {
       pending.reject(error);
     }
     this.#pending.clear();
+  }
+
+  private async finishReadyHandshake(): Promise<void> {
+    try {
+      // A failed Worker first fences the old Desktop connection. Waiting here
+      // makes the next worker_ready a real lifecycle boundary instead of a
+      // local process restart that races the daemon's lease revocation.
+      await this.#failureNotification?.catch(() => undefined);
+      await this.#onReady?.();
+      if (this.#stopping || !this.#process) return;
+      this.#ready = true;
+      this.#status = "ready";
+      const process = this.#process;
+      process.postMessage({
+        type: "worker_rebind",
+        bindings: this.#surfaceManager.bindings(),
+      } satisfies MainToWorkerMessage);
+      for (const waiter of this.#readyWaiters) waiter.resolve();
+      this.#readyWaiters.clear();
+      this.#stabilityTimer = setTimeout(() => {
+        this.#recoveryAttempts = 0;
+        this.#stabilityTimer = null;
+      }, RECOVERY_STABLE_MILLIS);
+      this.#stabilityTimer.unref();
+    } catch (cause) {
+      const error = asError(cause, "browser_worker_ready_callback_failed");
+      this.#status = "failed";
+      this.failReadyWaiters(error);
+      void this.handleFailure(error);
+      if (!this.#stopping) this.scheduleRecovery(error);
+    }
+  }
+
+  private async handleFailure(error: Error): Promise<void> {
+    if (this.#failureNotified) return this.#failureNotification ?? Promise.resolve();
+    this.#failureNotified = true;
+    this.#ready = false;
+    this.failPending(error);
+    this.failReadyWaiters(error);
+    const notification = (async () => {
+      await this.releaseSurfaceControls();
+      await this.#onFailure?.(error);
+    })();
+    this.#failureNotification = notification.catch((cause) => {
+      console.error("Browser Automation Worker 生命周期收口失败", errorMessage(cause));
+    });
+    return this.#failureNotification;
+  }
+
+  private async releaseSurfaceControls(): Promise<void> {
+    await Promise.all(this.#surfaceManager.bindings().map(async (binding) => {
+      try {
+        await this.#surfaceManager.updateControl(
+          binding.tab_id,
+          binding.surface_id,
+          { mode: "released", fence: 0 },
+        );
+      } catch {
+        // Surface may have been closed or replaced during worker failure.
+      }
+    }));
   }
 
   private waitUntilReady(): Promise<void> {
@@ -287,4 +367,12 @@ function errorCode(cause: unknown): string {
   if (!(cause instanceof Error)) return "browser_cdp_failed";
   const code = cause.message.split(":", 1)[0];
   return code?.startsWith("browser_") ? code : "browser_cdp_failed";
+}
+
+function asError(cause: unknown, fallback: string): Error {
+  return cause instanceof Error ? cause : new Error(`${fallback}:${String(cause)}`);
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
 }

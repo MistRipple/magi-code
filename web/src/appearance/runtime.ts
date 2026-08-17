@@ -97,6 +97,7 @@ async function applyTheme(pack: ThemePack): Promise<void> {
   const sequence = ++applySequence;
   const nextMode = resolveMode(pack);
   const scheme = resolveScheme(pack, nextMode);
+  const desktopSurface = document.documentElement.dataset.magiDesktopSurface;
   const wallpaperUrl = pack.wallpaper ? await resolveAppearanceAssetUrl(pack.wallpaper.assetId) : '';
   if (sequence !== applySequence) {
     pruneAssetUrls(referencedAppearanceAssetIds(activeTheme?.wallpaper?.assetId));
@@ -104,15 +105,28 @@ async function applyTheme(pack: ThemePack): Promise<void> {
   }
   activeTheme = pack;
   mode = nextMode;
-  applyRootTheme(pack, scheme, wallpaperUrl);
+  const desktopAppearance = applyRootTheme(pack, scheme, wallpaperUrl);
   pruneAssetUrls(referencedAppearanceAssetIds(pack.wallpaper?.assetId));
+  // 只有 App Renderer 拥有窗口外壳。Overlay 是同一窗口里的透明原生兄弟
+  // 视图，不能再次用“无壁纸”的局部主题覆盖 App 已同步的外壳材质。
+  if (desktopSurface === 'app') {
+    try {
+      // 在初始化完成前等待 native 外壳确认材质，WindowManager 才会放行
+      // 首次显示，避免浅色主题启动时短暂露出深色默认背景。
+      await synchronizeDesktopAppearance({
+        backgroundColor: desktopAppearance.nativeBackgroundColor,
+        accentColor: scheme.accent,
+        material: pack.material,
+        mode: nextMode,
+      });
+    } catch (error) {
+      console.error('[appearance] 同步桌面壳外观失败', error);
+    }
+  }
+  // 外观预览可能在 native IPC 返回前再次切换；旧请求不能在新主题之后
+  // 发布过期快照，避免桌面壳与 Renderer 短暂回跳。
+  if (sequence !== applySequence) return;
   emit();
-  void synchronizeDesktopAppearance({
-    backgroundColor: scheme.background,
-    mode: nextMode,
-  }).catch((error) => {
-    console.error('[appearance] 同步桌面壳外观失败', error);
-  });
 }
 
 function resolveMode(pack: ThemePack): EffectiveAppearanceMode {
@@ -154,9 +168,17 @@ function pruneAssetUrls(retainedAssetIds: ReadonlySet<string>): void {
   }
 }
 
-function applyRootTheme(pack: ThemePack, scheme: ThemeScheme, wallpaperUrl: string): void {
+function applyRootTheme(
+  pack: ThemePack,
+  scheme: ThemeScheme,
+  wallpaperUrl: string,
+): { desktopShellBackground: string; nativeBackgroundColor: string } {
   const root = document.documentElement;
   const body = document.body;
+  const desktopSurface = root.dataset.magiDesktopSurface;
+  // App Renderer 是 Desktop 唯一的窗口背景所有者，必须绘制完整壁纸；
+  // 只有透明 Overlay 不拥有背景，避免它在自己的原生视图中再次裁切壁纸。
+  const effectiveWallpaperUrl = desktopSurface === 'overlay' ? '' : wallpaperUrl;
   root.classList.remove('theme-light', 'theme-dark');
   body.classList.remove('theme-light', 'theme-dark');
   root.classList.add(`theme-${mode}`);
@@ -171,16 +193,22 @@ function applyRootTheme(pack: ThemePack, scheme: ThemeScheme, wallpaperUrl: stri
   const muted = mix(background, foreground, mode === 'dark' ? 0.62 : 0.58);
   const contrastFactor = Math.max(0.2, Math.min(0.9, scheme.contrast / 100));
   const materialAlpha = pack.material === 'clear' ? 0.98 : pack.material === 'translucent' ? 0.84 : 0.7;
-  const panel = rgba(background, wallpaperUrl ? materialAlpha : 1);
-  const elevated = rgba(background, wallpaperUrl ? Math.min(0.98, materialAlpha + 0.1) : 1);
-  const critical = rgba(background, wallpaperUrl ? 0.96 : 1);
-  const windowOverlay = rgba(background, wallpaperUrl
+  const panel = rgba(background, effectiveWallpaperUrl ? materialAlpha : 1);
+  const elevated = rgba(background, effectiveWallpaperUrl ? Math.min(0.98, materialAlpha + 0.1) : 1);
+  const critical = rgba(background, effectiveWallpaperUrl ? 0.96 : 1);
+  const windowOverlay = rgba(background, effectiveWallpaperUrl
     ? pack.material === 'clear' ? 0.96 : pack.material === 'translucent' ? 0.78 : 0.68
     : 1);
-  const popoverOverlay = rgba(background, wallpaperUrl
+  const popoverOverlay = rgba(background, effectiveWallpaperUrl
     ? pack.material === 'clear' ? 0.98 : pack.material === 'translucent' ? 0.9 : 0.84
     : 1);
-  const criticalOverlay = rgba(background, wallpaperUrl ? 0.97 : 1);
+  const criticalOverlay = rgba(background, effectiveWallpaperUrl ? 0.97 : 1);
+  // Desktop App 的最外层壳只负责承接窗口边缘和面板间隙，必须与主题材质
+  // 使用同一透明度；壁纸由 body 的唯一背景层绘制，不能在壳层再次加载。
+  const desktopShellBackground = rgba(
+    background,
+    effectiveWallpaperUrl ? materialAlpha : 1,
+  );
   const primaryForeground = relativeLuminance(accent) > 0.44 ? '#111827' : '#FFFFFF';
 
   const variables: Record<string, string> = {
@@ -221,10 +249,11 @@ function applyRootTheme(pack: ThemePack, scheme: ThemeScheme, wallpaperUrl: stri
     '--magi-surface-dialog': elevated,
     '--magi-surface-popover': elevated,
     '--magi-surface-critical': critical,
+    '--magi-desktop-shell-background': desktopShellBackground,
     '--magi-window-overlay': windowOverlay,
     '--magi-popover-overlay': popoverOverlay,
     '--magi-critical-overlay': criticalOverlay,
-    '--magi-wallpaper-image': wallpaperUrl ? `url("${wallpaperUrl}")` : 'none',
+    '--magi-wallpaper-image': effectiveWallpaperUrl ? `url("${effectiveWallpaperUrl}")` : 'none',
     '--magi-wallpaper-position': `${(pack.wallpaper?.focusX ?? 0.5) * 100}% ${(pack.wallpaper?.focusY ?? 0.5) * 100}%`,
     '--magi-wallpaper-dim': String(pack.wallpaper?.dim ?? 0),
     '--magi-wallpaper-blur': `${pack.wallpaper?.blur ?? 0}px`,
@@ -257,6 +286,13 @@ function applyRootTheme(pack: ThemePack, scheme: ThemeScheme, wallpaperUrl: stri
     '--vscode-inputOption-activeBackground': rgba(accent, 0.18),
   };
   for (const [name, value] of Object.entries(variables)) root.style.setProperty(name, value);
+  return {
+    desktopShellBackground,
+    // Electron 的原生非客户区没有办法读取 Renderer 的壁纸层；使用主题
+    // 背景色作为不透明首帧和窗口框架底色，材质透明度仍由 App Renderer
+    // 的 CSS 壳层消费，避免原生层透出桌面或出现黑色闪烁。
+    nativeBackgroundColor: toHex(background),
+  };
 }
 
 function parseHex(value: string): [number, number, number] {

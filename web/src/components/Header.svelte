@@ -19,15 +19,22 @@
   import type { Snippet } from 'svelte';
   interface Props {
     onOpenSettings?: () => void;
-    onToggleRightPane?: () => void;
     children?: Snippet;
   }
 
-  let { onOpenSettings, onToggleRightPane, children }: Props = $props();
+  let { onOpenSettings, children }: Props = $props();
   const appState = getState();
   // Web 外壳通过 context 统一处理布局；无 context 时仍可直接切换 store 中的面板状态。
   const webSidebar = getWebSidebarContext();
   const currentRightPane = $derived(getRightPaneState(rightPaneState.activeScopeKey));
+  let desktopRightPaneVisible = $state<boolean | null>(null);
+  const rightPaneCollapsed = $derived(
+    typeof window !== 'undefined'
+      && window.magiDesktop?.surface === 'app'
+      && desktopRightPaneVisible !== null
+      ? !desktopRightPaneVisible
+      : currentRightPane.collapsed,
+  );
 
   type HeaderPanel = 'notifications' | 'more' | 'lan';
   let activeHeaderPanel = $state<HeaderPanel | null>(null);
@@ -160,20 +167,6 @@
 
   function toggleRightPane() {
     activeHeaderPanel = null;
-    const desktop = window.magiDesktop;
-    if (desktop?.surface === 'app') {
-      void desktop.getSnapshot()
-        .then((snapshot) => desktop.submitLayoutIntent({
-          type: 'right_pane_visibility',
-          visible: !snapshot.layout.rightPaneVisible,
-        }))
-        .catch((error) => console.warn('[Header] 切换桌面右栏失败:', error));
-      return;
-    }
-    if (onToggleRightPane) {
-      onToggleRightPane();
-      return;
-    }
     if (webSidebar) {
       webSidebar.toggleRightPane();
       return;
@@ -196,6 +189,13 @@
     window.addEventListener('pointerdown', closeHeaderPanel);
     window.addEventListener('keydown', closeHeaderPanelOnEscape);
 
+    const desktop = window.magiDesktop?.surface === 'app' ? window.magiDesktop : undefined;
+    const applyDesktopSnapshot = (snapshot: MagiDesktopWindowSnapshot) => {
+      desktopRightPaneVisible = snapshot.layout.rightPaneVisible;
+    };
+    void desktop?.getSnapshot().then(applyDesktopSnapshot).catch(() => undefined);
+    const stopDesktopSnapshot = desktop?.onSnapshot(applyDesktopSnapshot);
+
     scheduleHeaderLayoutMeasurement();
 
     let resizeObserver: ResizeObserver | null = null;
@@ -211,6 +211,7 @@
     return () => {
       window.removeEventListener('pointerdown', closeHeaderPanel);
       window.removeEventListener('keydown', closeHeaderPanelOnEscape);
+      stopDesktopSnapshot?.();
       resizeObserver?.disconnect();
       if (headerLayoutFrame) {
         cancelAnimationFrame(headerLayoutFrame);
@@ -260,9 +261,9 @@
     <button
       class="btn-icon header-action-btn header-right-pane-btn"
       onclick={toggleRightPane}
-      title={i18n.t(currentRightPane.collapsed ? 'rightPane.expand' : 'rightPane.collapse')}
-      aria-label={i18n.t(currentRightPane.collapsed ? 'rightPane.expand' : 'rightPane.collapse')}
-      aria-expanded={!currentRightPane.collapsed}
+      title={i18n.t(rightPaneCollapsed ? 'rightPane.expand' : 'rightPane.collapse')}
+      aria-label={i18n.t(rightPaneCollapsed ? 'rightPane.expand' : 'rightPane.collapse')}
+      aria-expanded={!rightPaneCollapsed}
     >
       <Icon name="sidebar-toggle" size={14} class="right-pane-toggle-icon" />
     </button>

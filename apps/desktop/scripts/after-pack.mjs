@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile, readdir } from "node:fs/promises";
+import { access, readFile, readdir } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { extractFile, listPackage } from "@electron/asar";
 
@@ -14,6 +14,11 @@ export async function afterPack(context) {
   const packageMetadata = JSON.parse(extractFile(asarPath, "package.json").toString("utf8"));
   if (packageMetadata.version !== manifest.productVersion) {
     throw new Error("app.asar 版本与 Browser capability manifest 不一致");
+  }
+  // 目录包只用于本地验收，package.mjs 已明确将其标记为不可在线更新；
+  // 正式 dmg/zip/nsis/AppImage 仍必须携带统一 Magi Desktop 更新清单。
+  if (packageMetadata.magiDistribution !== "directory") {
+    await verifyDesktopUpdateFeed(join(resources, "app-update.yml"));
   }
 
   verifyAsarComponent(asarPath, "dist/main/index.cjs", manifest.components.desktopMain);
@@ -57,6 +62,28 @@ async function walkResources(root, directory = root) {
     else if (entry.isFile()) output.push(toPosix(relative(root, path)));
   }
   return output;
+}
+
+async function verifyDesktopUpdateFeed(path) {
+  let source;
+  try {
+    await access(path);
+    source = await readFile(path, "utf8");
+  } catch {
+    throw new Error("发行包缺少 app-update.yml，无法使用统一 Magi Desktop 更新源");
+  }
+  const required = [
+    /^\s*provider:\s*github\s*$/m,
+    /^\s*owner:\s*MistRipple\s*$/m,
+    /^\s*repo:\s*magi-code\s*$/m,
+    /^\s*releaseType:\s*release\s*$/m,
+  ];
+  if (required.some((pattern) => !pattern.test(source))) {
+    throw new Error("发行包 app-update.yml 必须指向统一 Magi Desktop GitHub Release");
+  }
+  if (/^\s*channel\s*:/m.test(source) || /browser-runtime-stable|browser-runtime-release/i.test(source)) {
+    throw new Error("发行包 app-update.yml 不得包含 Browser Runtime channel");
+  }
 }
 
 function toPosix(path) {

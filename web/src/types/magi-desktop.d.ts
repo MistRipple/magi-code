@@ -29,7 +29,8 @@ interface MagiDesktopOverlayState {
   kind: 'menu' | 'annotation';
   phase: 'menu' | 'select' | 'comment';
   ownerId: string;
-  placement: 'right-pane-add' | 'browser-viewport' | 'browser-annotations' | 'browser-content';
+  placement: 'right-pane-add' | 'browser-viewport' | 'browser-annotations';
+  anchorBounds: MagiDesktopRectangle | null;
   title: string;
   items: MagiDesktopOverlayItem[];
   fields: MagiDesktopOverlayField[];
@@ -60,7 +61,6 @@ interface MagiDesktopWindowLayoutSnapshot {
   appBounds: MagiDesktopRectangle;
   dividerBounds: MagiDesktopRectangle | null;
   rightPaneBounds: MagiDesktopRectangle | null;
-  browserSurfaceBounds: MagiDesktopRectangle | null;
 }
 
 interface MagiDesktopWindowSnapshot {
@@ -112,8 +112,6 @@ interface MagiDesktopBrowserActivationRequest {
   viewport: MagiDesktopViewportIntent;
 }
 
-type MagiDesktopRightPaneIntentEnvelope = import('@magi/desktop-browser-contracts').DesktopRightPaneIntentEnvelope;
-
 interface MagiDesktopUpdateSnapshot {
   status: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'failed' | 'unsupported';
   currentVersion: string;
@@ -124,20 +122,36 @@ interface MagiDesktopUpdateSnapshot {
   error: string | null;
 }
 
-interface MagiDesktopBrowserComponentInfo {
-  protocol_version: { major: number; minor: number };
-  desktop_version: string;
+type MagiDesktopBrowserComponentStatus = 'starting' | 'ready' | 'restarting' | 'failed' | 'stopped';
+
+interface MagiDesktopBrowserComponentError {
+  target: 'daemon' | 'worker' | 'protocol';
+  code: string;
+  message: string;
+}
+
+interface MagiDesktopBrowserComponentSnapshot {
+  product_version: string;
   electron_version: string;
   chromium_version: string;
   process_id: number;
   desktop_epoch: string;
-  worker_epoch: string;
-  daemon_version: string;
-  daemon_status: 'starting' | 'ready' | 'restarting' | 'failed' | 'stopped';
-  daemon_process_id: number | null;
-  automation_worker_version: string;
-  automation_worker_status: 'starting' | 'ready' | 'restarting' | 'failed' | 'stopped';
-  protocol_compatible: boolean;
+  daemon: {
+    version: string;
+    status: MagiDesktopBrowserComponentStatus;
+    process_id: number | null;
+  };
+  worker: {
+    version: string;
+    epoch: string;
+    status: MagiDesktopBrowserComponentStatus;
+  };
+  protocol: {
+    version: { major: number; minor: number };
+    compatible: boolean;
+    error: MagiDesktopBrowserComponentError | null;
+  };
+  error: MagiDesktopBrowserComponentError | null;
 }
 
 type MagiDesktopContextMenuRole = 'undo' | 'redo' | 'cut' | 'copy' | 'paste' | 'selectAll';
@@ -155,7 +169,7 @@ type MagiDesktopFileDropEvent =
 
 interface MagiDesktopBridge {
   readonly runtime: 'electron';
-  readonly surface: 'app' | 'right-pane' | 'overlay' | null;
+  readonly surface: 'app' | 'overlay' | null;
   readonly windowId: string | null;
   getSnapshot(): Promise<MagiDesktopWindowSnapshot>;
   setContext(context: {
@@ -165,18 +179,23 @@ interface MagiDesktopBridge {
   }): Promise<MagiDesktopContextSnapshot>;
   submitLayoutIntent(intent: MagiDesktopLayoutIntent): Promise<MagiDesktopWindowSnapshot>;
   activateBrowser(request: MagiDesktopBrowserActivationRequest): Promise<MagiDesktopWindowSnapshot>;
+  updateBrowserSlot(request: {
+    tabId: string;
+    slotRevision: number;
+    layoutRevision: number;
+    bounds: { x: number; y: number; width: number; height: number } | null;
+  }): Promise<MagiDesktopWindowSnapshot>;
   activatePanel(request: { kind: MagiDesktopPanelKind; tabId: string | null }): Promise<MagiDesktopWindowSnapshot>;
   setBrowserViewport(request: {
     tabId: string;
     viewport: MagiDesktopViewportIntent;
   }): Promise<MagiDesktopWindowSnapshot>;
-  openRightPaneTab(request: MagiDesktopRightPaneIntentEnvelope): Promise<MagiDesktopWindowSnapshot>;
   readyRightPane(): Promise<void>;
   openOverlay(state: Omit<MagiDesktopOverlayState, 'overlayId' | 'phase'> & { overlayId?: string; phase?: MagiDesktopOverlayState['phase'] }): Promise<void>;
   closeOverlay(): Promise<void>;
+  setBlockingOverlay(request: { active: boolean }): Promise<MagiDesktopWindowSnapshot>;
   readyOverlay(): Promise<void>;
   submitOverlayAction(action: MagiDesktopOverlayAction): Promise<void>;
-  focusBrowser(surfaceId: string): Promise<void>;
   openExternal(url: string): Promise<void>;
   showContextMenu(request: { items: MagiDesktopContextMenuItem[] }): Promise<string | null>;
   openWorkspaceFolder(workspaceRootPathRef: string): Promise<void>;
@@ -184,10 +203,15 @@ interface MagiDesktopBridge {
     targetPathRef: string;
     workspaceRootPathRef: string;
   }): Promise<void>;
-  setAppearance(appearance: { backgroundColor: string; mode: 'light' | 'dark' }): Promise<void>;
+  setAppearance(appearance: {
+    backgroundColor: string;
+    accentColor: string;
+    material: 'clear' | 'translucent' | 'immersive';
+    mode: 'light' | 'dark';
+  }): Promise<void>;
   getAppVersion(): Promise<string>;
-  getBrowserComponentInfo(): Promise<MagiDesktopBrowserComponentInfo>;
-  restartBrowserAutomation(): Promise<MagiDesktopBrowserComponentInfo>;
+  getBrowserComponentInfo(): Promise<MagiDesktopBrowserComponentSnapshot>;
+  restartBrowserAutomation(): Promise<MagiDesktopBrowserComponentSnapshot>;
   clearBrowserData(): Promise<void>;
   checkForUpdates(): Promise<MagiDesktopUpdateSnapshot>;
   downloadUpdate(): Promise<MagiDesktopUpdateSnapshot>;
@@ -195,7 +219,7 @@ interface MagiDesktopBridge {
   onSnapshot(listener: (snapshot: MagiDesktopWindowSnapshot) => void): () => void;
   onContext(listener: (context: MagiDesktopContextSnapshot) => void): () => void;
   onBrowserEvent(listener: (event: unknown) => void): () => void;
-  onRightPaneIntent(listener: (request: MagiDesktopRightPaneIntentEnvelope) => void): () => void;
+  onBrowserComponent(listener: (snapshot: MagiDesktopBrowserComponentSnapshot) => void): () => void;
   onOverlayState(listener: (state: MagiDesktopOverlayState) => void): () => void;
   onOverlayClosed(listener: () => void): () => void;
   onOverlayAction(listener: (action: MagiDesktopOverlayAction) => void): () => void;

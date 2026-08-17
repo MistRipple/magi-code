@@ -12,9 +12,14 @@ const [releaseWorkflow, builderConfig] = await Promise.all([
 ]);
 
 assert.match(builderConfig, /publish:[\s\S]*provider: github[\s\S]*owner: MistRipple[\s\S]*repo: magi-code/, 'Electron updater 必须使用产品 GitHub Release');
+assert.match(builderConfig, /releaseType: release/, 'Electron updater 必须使用正式 Desktop Release');
+assert.doesNotMatch(builderConfig, /^\s*channel\s*:/m, 'Electron updater 不得声明独立 channel');
 assert.match(builderConfig, /notarize: true[\s\S]*dmg:[\s\S]*sign: true/, 'macOS 包必须签名并公证');
 assert.match(releaseWorkflow, /latest\.yml[\s\S]*latest-linux\.yml[\s\S]*latest-mac\.yml/, 'Release 必须发布 Electron 原生更新元数据');
-assert.doesNotMatch(releaseWorkflow, /latest\.json|magi-desktop-stable|\.AppImage\.sig|\.exe\.sig/, '不得保留旧更新清单和更新 feed');
+assert.match(releaseWorkflow, /make_latest:\s*true/, 'Desktop Release 必须显式成为 GitHub latest Release');
+assert.match(releaseWorkflow, /releases\/latest[\s\S]*latest-mac\.yml[\s\S]*latest-linux\.yml/, 'Release 必须验证 GitHub latest 指向统一 Desktop 更新源');
+assert.doesNotMatch(releaseWorkflow, /latest\.json|\.AppImage\.sig|\.exe\.sig/, '不得保留旧更新清单和更新 feed');
+assert.match(releaseWorkflow, /browser-runtime|magi-desktop-stable/, 'Release 必须拒绝旧 Browser Runtime 或 Desktop channel 成为 latest');
 
 const directory = await mkdtemp(join(tmpdir(), 'magi-electron-update-'));
 try {

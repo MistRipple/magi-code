@@ -8,8 +8,173 @@
   "properties": {
     "channel": {
       "type": "string",
-      "enum": ["magi-desktop:get-snapshot", "magi-desktop:set-context", "magi-desktop:layout-intent", "magi-desktop:activate-browser", "magi-desktop:activate-panel", "magi-desktop:set-browser-viewport", "magi-desktop:open-right-pane-tab", "magi-desktop:right-pane-ready", "magi-desktop:focus-browser", "magi-desktop:open-external", "magi-desktop:show-context-menu", "magi-desktop:open-workspace-folder", "magi-desktop:reveal-workspace-file", "magi-desktop:set-appearance", "magi-desktop:get-app-version", "magi-desktop:get-browser-component-info", "magi-desktop:restart-browser-automation", "magi-desktop:clear-browser-data", "magi-desktop:check-for-updates", "magi-desktop:download-update", "magi-desktop:install-update"]
+      "enum": [
+        "magi-desktop:get-snapshot", "magi-desktop:set-context", "magi-desktop:layout-intent",
+        "magi-desktop:activate-browser",
+        "magi-desktop:activate-panel", "magi-desktop:set-browser-viewport",
+        "magi-desktop:right-pane-ready",
+        "magi-desktop:open-overlay", "magi-desktop:close-overlay", "magi-desktop:overlay-ready",
+        "magi-desktop:overlay-action", "magi-desktop:focus-browser", "magi-desktop:open-external",
+        "magi-desktop:show-context-menu", "magi-desktop:open-workspace-folder",
+        "magi-desktop:reveal-workspace-file", "magi-desktop:set-appearance",
+        "magi-desktop:get-app-version", "magi-desktop:get-browser-component-info",
+        "magi-desktop:restart-browser-automation", "magi-desktop:clear-browser-data",
+        "magi-desktop:check-for-updates", "magi-desktop:download-update", "magi-desktop:install-update"
+      ]
     },
-    "payload": {}
+    "payload": { "$ref": "#/$defs/anyPayload" }
+  },
+  "allOf": [
+    { "$ref": "#/$defs/emptyChannels" },
+    { "$ref": "#/$defs/objectChannel" },
+    { "$ref": "#/$defs/stringChannels" }
+  ],
+  "$defs": {
+    "anyPayload": {
+      "oneOf": [
+        { "type": "object" }, { "type": "array" }, { "type": "string" },
+        { "type": "number" }, { "type": "boolean" }, { "type": "null" }
+      ]
+    },
+    "id": { "type": "string", "minLength": 1 },
+    "optionalText": { "type": ["string", "null"] },
+    "empty": { "type": "null" },
+    "emptyChannels": {
+      "if": {
+        "properties": {
+          "channel": {
+            "enum": [
+              "magi-desktop:get-snapshot", "magi-desktop:right-pane-ready",
+              "magi-desktop:close-overlay", "magi-desktop:overlay-ready",
+              "magi-desktop:get-app-version", "magi-desktop:get-browser-component-info",
+              "magi-desktop:restart-browser-automation", "magi-desktop:clear-browser-data",
+              "magi-desktop:check-for-updates", "magi-desktop:download-update",
+              "magi-desktop:install-update"
+            ]
+          }
+        },
+        "required": ["channel"]
+      },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/empty" } } }
+    },
+    "objectChannel": {
+      "allOf": [
+        { "$ref": "#/$defs/contextChannel" }, { "$ref": "#/$defs/layoutChannel" },
+        { "$ref": "#/$defs/browserActivationChannel" },
+        { "$ref": "#/$defs/panelChannel" }, { "$ref": "#/$defs/viewportChannel" },
+        { "$ref": "#/$defs/overlayChannel" },
+        { "$ref": "#/$defs/contextMenuChannel" }, { "$ref": "#/$defs/revealFileChannel" },
+        { "$ref": "#/$defs/appearanceChannel" }
+      ]
+    },
+    "stringChannels": {
+      "if": {
+        "properties": {
+          "channel": {
+            "enum": ["magi-desktop:focus-browser", "magi-desktop:open-external", "magi-desktop:open-workspace-folder"]
+          }
+        },
+        "required": ["channel"]
+      },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/id" } } }
+    },
+    "contextChannel": {
+      "if": { "properties": { "channel": { "const": "magi-desktop:set-context" } }, "required": ["channel"] },
+      "then": { "properties": { "payload": {
+        "type": "object", "additionalProperties": false,
+        "properties": { "workspaceId": { "$ref": "#/$defs/optionalText" }, "workspacePath": { "$ref": "#/$defs/optionalText" }, "sessionId": { "$ref": "#/$defs/optionalText" } }
+      } } }
+    },
+    "layoutChannel": {
+      "if": { "properties": { "channel": { "const": "magi-desktop:layout-intent" } }, "required": ["channel"] },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/layoutIntent" } } }
+    },
+    "browserActivationChannel": {
+      "if": { "properties": { "channel": { "const": "magi-desktop:activate-browser" } }, "required": ["channel"] },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/browserActivation" } } }
+    },
+    "panelChannel": {
+      "if": { "properties": { "channel": { "const": "magi-desktop:activate-panel" } }, "required": ["channel"] },
+      "then": { "properties": { "payload": {
+        "type": "object", "additionalProperties": false, "required": ["kind", "tabId"],
+        "properties": { "kind": { "enum": ["agent", "browser", "code", "terminal", null] }, "tabId": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] } }
+      } } }
+    },
+    "viewportChannel": {
+      "if": { "properties": { "channel": { "const": "magi-desktop:set-browser-viewport" } }, "required": ["channel"] },
+      "then": { "properties": { "payload": {
+        "type": "object", "additionalProperties": false, "required": ["tabId", "viewport"],
+        "properties": { "tabId": { "$ref": "#/$defs/id" }, "viewport": { "$ref": "#/$defs/viewport" } }
+      } } }
+    },
+    "overlayChannel": {
+      "allOf": [
+        {
+          "if": { "properties": { "channel": { "const": "magi-desktop:open-overlay" } }, "required": ["channel"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/overlayState" } } }
+        },
+        {
+          "if": { "properties": { "channel": { "const": "magi-desktop:overlay-action" } }, "required": ["channel"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/overlayAction" } } }
+        }
+      ]
+    },
+    "contextMenuChannel": {
+      "if": { "properties": { "channel": { "const": "magi-desktop:show-context-menu" } }, "required": ["channel"] },
+      "then": { "properties": { "payload": {
+        "type": "object", "additionalProperties": false, "required": ["items"],
+        "properties": { "items": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "type": "object" } } }
+      } } }
+    },
+    "revealFileChannel": {
+      "if": { "properties": { "channel": { "const": "magi-desktop:reveal-workspace-file" } }, "required": ["channel"] },
+      "then": { "properties": { "payload": {
+        "type": "object", "additionalProperties": false, "required": ["targetPathRef", "workspaceRootPathRef"],
+        "properties": { "targetPathRef": { "$ref": "#/$defs/id" }, "workspaceRootPathRef": { "$ref": "#/$defs/id" } }
+      } } }
+    },
+    "appearanceChannel": {
+      "if": { "properties": { "channel": { "const": "magi-desktop:set-appearance" } }, "required": ["channel"] },
+      "then": { "properties": { "payload": {
+        "type": "object", "additionalProperties": false, "required": ["mode", "backgroundColor"],
+        "properties": { "mode": { "enum": ["light", "dark"] }, "backgroundColor": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" } }
+      } } }
+    },
+    "layoutIntent": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["type", "width"], "properties": { "type": { "const": "right_pane_width" }, "width": { "type": "number" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type"], "properties": { "type": { "const": "right_pane_reset_width" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type", "visible"], "properties": { "type": { "const": "right_pane_visibility" }, "visible": { "type": "boolean" } } }
+      ]
+    },
+    "viewport": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["mode"], "properties": { "mode": { "const": "auto" } } },
+        {
+          "type": "object", "additionalProperties": false, "required": ["mode", "width", "height"],
+          "properties": {
+            "mode": { "const": "fixed" }, "width": { "type": "number", "minimum": 320 }, "height": { "type": "number", "minimum": 240 },
+            "deviceScaleFactorMillis": { "type": "number", "minimum": 1 }, "device_scale_factor_millis": { "type": "number", "minimum": 1 },
+            "deviceType": { "enum": ["desktop", "mobile"] }, "device_type": { "enum": ["desktop", "mobile"] }
+          }
+        }
+      ]
+    },
+    "browserActivation": {
+      "type": "object", "additionalProperties": false, "required": ["tabId", "browserSessionId", "url", "navigationRevision", "viewport"],
+      "properties": { "tabId": { "$ref": "#/$defs/id" }, "browserSessionId": { "$ref": "#/$defs/id" }, "url": { "$ref": "#/$defs/id" }, "navigationRevision": { "type": "number", "minimum": 0 }, "viewport": { "$ref": "#/$defs/viewport" } }
+    },
+    "overlayState": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "ownerId", "placement", "title"],
+      "properties": {
+        "overlayId": { "$ref": "#/$defs/optionalText" }, "kind": { "enum": ["annotation", "menu"] }, "phase": { "enum": ["menu", "select", "comment"] },
+        "ownerId": { "$ref": "#/$defs/id" }, "placement": { "enum": ["right-pane-add", "browser-viewport", "browser-annotations"] }, "title": { "$ref": "#/$defs/id" },
+        "items": { "type": "array", "items": { "type": "object" } }, "fields": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "overlayAction": {
+      "type": "object", "additionalProperties": false, "required": ["overlayId", "kind", "ownerId", "interaction", "id"],
+      "properties": { "overlayId": { "$ref": "#/$defs/id" }, "kind": { "enum": ["annotation", "menu"] }, "ownerId": { "$ref": "#/$defs/id" }, "interaction": { "enum": ["select", "input"] }, "id": { "$ref": "#/$defs/id" }, "value": { "type": ["string", "null"] } }
+    }
   }
 }

@@ -1,10 +1,13 @@
 export const WINDOW_LAYOUT = {
-  dividerWidth: 8,
-  minAppWidth: 360,
+  // Desktop 的 appView 覆盖整窗，左栏和中栏由 Renderer 自己按实际 DOM
+  // 几何排布。rightPaneWidth 只表示右栏内容轨道宽度；分隔条是唯一的
+  // 独立轨道。Desktop Renderer 的根网格没有额外外边距，Main 必须使用
+  // 同一坐标系，否则原生 Surface 和右栏 DOM 会产生固定偏移。
   minRightPaneWidth: 320,
   defaultRightPaneWidth: 480,
   maxRightPaneRatio: 2 / 3,
   overlayBreakpoint: 840,
+  minWorkbenchContentWidth: 448,
   rightPaneBorder: 1,
   rightPaneResizeHandleWidth: 8,
   rightPaneTabBarHeight: 38,
@@ -40,7 +43,6 @@ export interface WindowLayoutSnapshot extends WindowLayoutState {
   appBounds: Rectangle;
   dividerBounds: Rectangle | null;
   rightPaneBounds: Rectangle | null;
-  browserSurfaceBounds: Rectangle | null;
 }
 
 export type WindowLayoutIntent =
@@ -145,45 +147,48 @@ export function snapshotWindowLayout(state: WindowLayoutState): WindowLayoutSnap
     state.rightPaneMode,
   );
   const sideBySide = state.rightPaneMode === "side-by-side";
-  const dividerWidth = sideBySide ? WINDOW_LAYOUT.dividerWidth : 0;
   const rightPaneX = Math.max(0, width - rightPaneWidth);
-  const appWidth = sideBySide ? Math.max(0, rightPaneX - dividerWidth) : width;
-  const rightPaneBounds = { x: rightPaneX, y: 0, width: rightPaneWidth, height };
-  const browserTop = WINDOW_LAYOUT.rightPaneBorder
-    + WINDOW_LAYOUT.rightPaneTabBarHeight
-    + WINDOW_LAYOUT.browserToolbarHeight;
-  const browserSurfaceBounds = state.rightPaneVisible
-    && state.activePanelKind === "browser"
-    && state.activeSurfaceId
-      ? {
-        // 拖拽手柄位于 RightPaneChromeView 左边缘。原生 BrowserSurface 必须从
-        // 命中区之后开始，否则浏览器 Tab 激活后会因 z-order 覆盖分隔条。
-        x: rightPaneX + WINDOW_LAYOUT.rightPaneResizeHandleWidth,
-        y: browserTop,
-        width: Math.max(
-          1,
-          rightPaneWidth
-            - WINDOW_LAYOUT.rightPaneResizeHandleWidth
-            - WINDOW_LAYOUT.rightPaneBorder,
-        ),
-        height: Math.max(1, height - browserTop - WINDOW_LAYOUT.rightPaneBorder),
-      }
-    : null;
-
+  // rightPaneBounds 与 Renderer 的右栏内容轨道一一对应，不包含分隔条和
+  // 任何窗口外边距。这样 Overlay 可以直接使用与 Renderer 相同的坐标系。
+  const rightPaneBounds = {
+    x: rightPaneX,
+    y: 0,
+    width: rightPaneWidth,
+    height,
+  };
   return {
     ...state,
     rightPaneWidth,
-    appBounds: state.rightPaneVisible ? { x: 0, y: 0, width: appWidth, height } : fullBounds,
+    // 桌面端只保留一个可信 Renderer，它覆盖整个窗口并在 DOM 中排布左、中、右三栏。
+    // 右栏的几何只由主 Renderer 的 DOM 布局消费；浏览器 Guest 是当前
+    // Browser Tab 的 DOM 子节点，不在 Main 侧维护第二套内容槽坐标。
+    appBounds: fullBounds,
+    // 分隔条紧贴右栏内容轨道左侧，不占用 rightPaneWidth。
     dividerBounds: state.rightPaneVisible && sideBySide
-      ? { x: appWidth, y: 0, width: dividerWidth, height }
+      ? {
+        x: Math.max(0, rightPaneX - WINDOW_LAYOUT.rightPaneResizeHandleWidth),
+        y: 0,
+        width: WINDOW_LAYOUT.rightPaneResizeHandleWidth,
+        height,
+      }
       : null,
     rightPaneBounds,
-    browserSurfaceBounds,
   };
 }
 
 export function resolveRightPaneMode(windowWidth: number): RightPaneMode {
   return windowWidth < WINDOW_LAYOUT.overlayBreakpoint ? "overlay" : "side-by-side";
+}
+
+export function shouldShowBrowserSurface(
+  layout: WindowLayoutSnapshot,
+  hasBrowserSlot: boolean,
+): boolean {
+  return layout.rightPaneVisible
+    && layout.activePanelKind === "browser"
+    && Boolean(layout.activeTabId)
+    && Boolean(layout.activeSurfaceId)
+    && hasBrowserSlot;
 }
 
 export function clampRightPaneWidth(
@@ -193,12 +198,14 @@ export function clampRightPaneWidth(
 ): number {
   const available = Math.max(1, Math.round(windowWidth));
   const maxByRatio = Math.floor(available * WINDOW_LAYOUT.maxRightPaneRatio);
-  const maxByApp = mode === "side-by-side"
-    ? available - WINDOW_LAYOUT.dividerWidth - WINDOW_LAYOUT.minAppWidth
+  const maxByWorkbench = mode === "side-by-side"
+    ? available
+      - WINDOW_LAYOUT.rightPaneResizeHandleWidth
+      - WINDOW_LAYOUT.minWorkbenchContentWidth
     : available;
   const maximum = Math.max(
     Math.min(WINDOW_LAYOUT.minRightPaneWidth, available),
-    Math.min(maxByRatio, maxByApp),
+    Math.min(maxByRatio, maxByWorkbench),
   );
   const minimum = Math.min(WINDOW_LAYOUT.minRightPaneWidth, maximum);
   return Math.min(maximum, Math.max(minimum, Math.round(requestedWidth)));

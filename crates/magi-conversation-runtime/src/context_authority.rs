@@ -250,18 +250,17 @@ impl<'a> ContextAuthority<'a> {
         let mut previous_checkpoint = self.session_store.thread_context_checkpoint(self.thread_id);
         if request.persist_checkpoint
             && let Some(checkpoint) = previous_checkpoint.as_ref()
+            && !checkpoint_file_facts_are_current(checkpoint)
         {
-            if !checkpoint_file_facts_are_current(&checkpoint) {
-                self.session_store
-                    .clear_thread_context_checkpoint(self.thread_id);
-                tracing::info!(
-                    thread_id = %self.thread_id,
-                    session_id = %self.session_id,
-                    checkpoint_id = checkpoint.checkpoint_id,
-                    "上下文检查点因文件事实版本变化失效，将从原始 transcript 重建"
-                );
-                previous_checkpoint = None;
-            }
+            self.session_store
+                .clear_thread_context_checkpoint(self.thread_id);
+            tracing::info!(
+                thread_id = %self.thread_id,
+                session_id = %self.session_id,
+                checkpoint_id = checkpoint.checkpoint_id,
+                "上下文检查点因文件事实版本变化失效，将从原始 transcript 重建"
+            );
+            previous_checkpoint = None;
         }
         let raw_transcript = self.session_store.thread_message_history(self.thread_id);
         let mut history = self.session_store.thread_context_history(self.thread_id);
@@ -272,7 +271,7 @@ impl<'a> ContextAuthority<'a> {
         bound_model_visible_tool_results(&mut history);
         let stale_checkpoint_id = request
             .persist_checkpoint
-            .then(|| previous_checkpoint.as_ref())
+            .then_some(previous_checkpoint.as_ref())
             .flatten()
             .and_then(|checkpoint| {
                 let source_changed = !checkpoint.source_fingerprint.is_empty()
@@ -419,8 +418,8 @@ impl<'a> ContextAuthority<'a> {
         let source_message_count = source_message_count.min(raw_transcript.len());
         if request.persist_checkpoint {
             let model_identity = request.model_identity.clone().or_else(|| {
-                usage_observation.as_ref().and_then(|observation| {
-                    Some(ModelIdentitySnapshot::new(
+                usage_observation.as_ref().map(|observation| {
+                    ModelIdentitySnapshot::new(
                         observation
                             .model_provider
                             .clone()
@@ -431,7 +430,7 @@ impl<'a> ContextAuthority<'a> {
                             .or_else(|| decision.resolved_model().map(str::to_string))
                             .unwrap_or_default(),
                         observation.binding_revision.unwrap_or_default(),
-                    ))
+                    )
                 })
             });
             let checkpoint = ThreadContextCheckpoint {
@@ -1247,10 +1246,8 @@ pub(crate) fn thread_history_compaction_decision(
         });
         let policy = ContextBudgetPolicy::for_window(context_window, None, 0);
         let threshold_tokens = policy.proactive_threshold_tokens;
-        let target_history_tokens = target_history_tokens_for_window(
-            context_window.max(0) as u64,
-            additional_token_estimate,
-        );
+        let target_history_tokens =
+            target_history_tokens_for_window(context_window, additional_token_estimate);
         let observed_tokens = if observation.projected_request_tokens > 0 {
             observation.projected_request_tokens
         } else {

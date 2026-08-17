@@ -7,6 +7,10 @@ const config = await readFile(join(desktopRoot, "electron-builder.yml"), "utf8")
 const requiredConfig = [
   "appId: com.mistripple.magi",
   "asar: true",
+  "provider: github",
+  "owner: MistRipple",
+  "repo: magi-code",
+  "releaseType: release",
   "browser-automation-worker",
   "magi-daemon-app",
   "browser-capability-manifest.json",
@@ -17,6 +21,9 @@ for (const requirement of requiredConfig) {
 }
 if (/tauri|cef|playwright|native-browser|browser-runtime/i.test(config)) {
   throw new Error("Electron Builder 配置不得包含 Tauri、CEF、Playwright 或独立 Browser Runtime");
+}
+if (/^\s*channel\s*:/m.test(config)) {
+  throw new Error("Electron 更新不得声明独立 channel，必须使用统一 Magi Desktop Release");
 }
 await readProductVersion();
 

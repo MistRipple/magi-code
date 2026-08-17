@@ -5,20 +5,15 @@
  * - 状态以 workspace/session 为边界，跨会话隔离；workspace 文件预览允许无 session
  * - 三个正交轴：openTabs / activeTabId / collapsed
  * - collapsed 与 openTabs 正交：折叠不销毁 tabs，关闭单 tab 才销毁
- * - 全部 tab 关闭 → 强制 collapsed = true（下一次展开为空白 Pane）
+ * - 用户关闭最后一个 tab → collapsed = true；BrowserAuthority 同步不能
+ *   因为当前暂时没有浏览器 Tab 就覆盖用户显式打开的空面板。
  * - togglePane() 仅切 collapsed；openTab*() 触发自动展开
  * - 同 kind 同 key（agent: agentRunId / code: filepath / browser: BrowserTabId）幂等：复用现有 tab 并激活
  * - 浏览器 Tab 的存在性只由 BrowserAuthority 决定，前端 localStorage 只保存布局，不保存浏览器 Tab 实体
  * - terminal 以 terminalTabId 作为唯一键；每次新建都是独立命令终端，不共享输出历史
  */
 
-import {
-  DESKTOP_RIGHT_PANE_INTENT_VERSION,
-  type DesktopRightPaneAgentIntent,
-  type DesktopRightPaneCodeIntent,
-  type DesktopRightPaneTabIntent,
-  type DesktopRightPaneTerminalIntent,
-} from '@magi/desktop-browser-contracts';
+import type { BrowserSessionSnapshot } from '../web/agent-api';
 
 export type RightPaneTabKind = 'agent' | 'code' | 'browser' | 'terminal';
 
@@ -70,6 +65,7 @@ export interface CodeTabPayload {
 export interface BrowserTabPayload {
   browserSessionId: string;
   tabId: string;
+  lifecycle: BrowserAuthorityTabProjection['lifecycle'];
   agentOccupied: boolean;
   workspaceId?: string;
   workspacePath?: string;
@@ -93,7 +89,6 @@ export interface BrowserAuthorityTabProjection {
 
 export interface BrowserAuthoritySessionProjection {
   browserSessionId: string;
-  activeTabId: string | null;
   agentOccupied: boolean;
   tabs: BrowserAuthorityTabProjection[];
 }
@@ -154,7 +149,7 @@ function isDesktopRenderer(): boolean {
   if (typeof window === 'undefined') return false;
   const surface = window.magiDesktop?.surface
     ?? new URLSearchParams(window.location.search).get('desktopSurface');
-  return surface === 'app' || surface === 'right-pane';
+  return surface === 'app';
 }
 
 function normalizeWorkspaceId(workspaceId: string | null | undefined): string {
@@ -351,6 +346,8 @@ export const rightPaneState = $state<RightPaneRootState>({
   },
 });
 
+let pendingBrowserTabIntent: { scopeKey: string; tabId: string } | null = null;
+
 // 模块加载时立即恢复——必须放在 rightPaneState 定义之后、任何使用方读取之前
 loadPersisted();
 
@@ -453,14 +450,31 @@ function upsertTab(
     rightPaneState.activeSessionId = normalizeSessionId(terminalPayload.sessionId);
   }
   const session = ensureSession(scopeKey);
-  const id = tabKey(kind, payload);
-  const existing = session.openTabs.find((tab) => tab.id === id);
+  const existingId = tabKey(kind, payload);
+  const existing = session.openTabs.find((tab) => tab.id === existingId);
+  const effectivePayload = kind === 'browser'
+    && existing?.kind === 'browser'
+    && (payload as BrowserTabPayload).lifecycle === 'creating'
+    && (existing.payload as BrowserTabPayload).lifecycle !== 'creating'
+    ? {
+        ...(payload as BrowserTabPayload),
+        lifecycle: (existing.payload as BrowserTabPayload).lifecycle,
+        agentOccupied: (existing.payload as BrowserTabPayload).agentOccupied,
+      }
+    : payload;
+  const id = tabKey(kind, effectivePayload);
   const timestamp = now();
 
   if (existing) {
     existing.label = label;
     existing.accentToken = accentToken;
-    existing.payload = payload;
+    const browserPayloadUnchanged = kind === 'browser'
+      && existing.kind === 'browser'
+      && sameBrowserTabPayload(
+        existing.payload as BrowserTabPayload,
+        effectivePayload as BrowserTabPayload,
+      );
+    if (!browserPayloadUnchanged) existing.payload = effectivePayload;
     if (activate) {
       existing.lastActivatedAt = timestamp;
       session.activeTabId = id;
@@ -474,7 +488,7 @@ function upsertTab(
     kind,
     label,
     accentToken,
-    payload,
+    payload: effectivePayload,
     lastActivatedAt: timestamp,
   };
   session.openTabs = [...session.openTabs, tab];
@@ -485,19 +499,14 @@ function upsertTab(
   return tab;
 }
 
-/**
- * Electron 桌面端的 App Renderer 与 Right-Pane Renderer 不共享内存状态。
- * App 侧先更新自己的投影以保持工作区交互连续，再把同一个用户意图交给
- * Main 转发给 Right-Pane；浏览器 Tab 不经过这里，避免与 BrowserAuthority 双写。
- */
-function forwardDesktopRightPaneIntent(intent: DesktopRightPaneTabIntent): void {
-  if (typeof window === 'undefined' || window.magiDesktop?.surface !== 'app') return;
-  void window.magiDesktop.openRightPaneTab({
-    version: DESKTOP_RIGHT_PANE_INTENT_VERSION,
-    intent,
-  }).catch((error) => {
-    console.warn('[right-pane] 转发桌面右栏面板意图失败:', error);
-  });
+function sameBrowserTabPayload(left: BrowserTabPayload, right: BrowserTabPayload): boolean {
+  return left.browserSessionId === right.browserSessionId
+    && left.tabId === right.tabId
+    && left.lifecycle === right.lifecycle
+    && left.agentOccupied === right.agentOccupied
+    && left.workspaceId === right.workspaceId
+    && left.workspacePath === right.workspacePath
+    && left.sessionId === right.sessionId;
 }
 
 // ============================================================================
@@ -576,16 +585,6 @@ export function openAgentTab(
     label,
     accentToken,
   );
-  const intent: DesktopRightPaneAgentIntent = {
-    kind: 'agent',
-    agentRunId: trimmedAgentRunId,
-    sessionId: normalizedSession,
-    workspaceId,
-    workspacePath: typeof options?.workspacePath === 'string' ? options.workspacePath.trim() : '',
-    ...(label ? { label } : {}),
-    accentToken,
-  };
-  forwardDesktopRightPaneIntent(intent);
 }
 
 /** 打开（或激活）一个 code tab；filepath 同时作为去重 key */
@@ -665,30 +664,6 @@ export function openCodeTab(
     label,
     null,
   );
-  const intent: DesktopRightPaneCodeIntent = {
-    kind: 'code',
-    filepath: trimmedFilepath,
-    sessionId: normalizedSession,
-    workspaceId,
-    workspacePath: options?.workspacePath?.trim() || '',
-    ...(label ? { label } : {}),
-    displayPath,
-    diff: options?.diff ?? null,
-    originalContent: options?.originalContent ?? null,
-    currentContent: options?.currentContent ?? null,
-    isChangeDiff: options?.isChangeDiff ?? false,
-    changeRevision: options?.changeRevision ?? null,
-    content: options?.content ?? null,
-    language: options?.language ?? null,
-    ...(options?.contentKind ? { contentKind: options.contentKind } : {}),
-    size: typeof options?.size === 'number' ? options.size : null,
-    mime: options?.mime ?? null,
-    symlinkTarget: options?.symlinkTarget ?? null,
-    headSummary: options?.headSummary ?? null,
-    tailSummary: options?.tailSummary ?? null,
-    imageDataUrl: options?.imageDataUrl ?? null,
-  };
-  forwardDesktopRightPaneIntent(intent);
 }
 
 export function openBrowserTab(
@@ -699,6 +674,7 @@ export function openBrowserTab(
     workspacePath?: string;
     sessionId: string;
     label?: string;
+    lifecycle?: BrowserAuthorityTabProjection['lifecycle'];
   },
 ): void {
   const normalizedBrowserSessionId = typeof browserSessionId === 'string'
@@ -720,6 +696,7 @@ export function openBrowserTab(
     {
       browserSessionId: normalizedBrowserSessionId,
       tabId: normalizedTabId,
+      lifecycle: options.lifecycle ?? 'creating',
       agentOccupied: false,
       workspaceId,
       workspacePath: options.workspacePath?.trim() || undefined,
@@ -727,6 +704,42 @@ export function openBrowserTab(
     },
     options.label?.trim() || 'Browser',
     null,
+  );
+  // 该入口只用于用户/应用主动创建 Browser Tab。标记为待提交的窗口级
+  // 选择意图，避免旧 Main snapshot 在 activateBrowser 完成前把新 Tab
+  // 立即改回旧 Tab。
+  pendingBrowserTabIntent = { scopeKey, tabId: normalizedTabId };
+}
+
+/** 将完整的 BrowserAuthority 快照收敛为右栏唯一的浏览器 Tab 投影。 */
+export function synchronizeBrowserSessionSnapshot(
+  snapshot: Pick<
+    BrowserSessionSnapshot,
+    'browserSessionId' | 'workspaceId' | 'sessionId' | 'agentOccupied' | 'tabs'
+  >,
+  workspacePath?: string | null,
+  options?: {
+    workspaceId?: string | null;
+    sessionId?: string | null;
+    revealTabId?: string;
+    newTabLabel?: string;
+  },
+): void {
+  synchronizeBrowserTabs(
+    options?.workspaceId ?? snapshot.workspaceId,
+    workspacePath,
+    options?.sessionId ?? snapshot.sessionId,
+    {
+      browserSessionId: snapshot.browserSessionId,
+      agentOccupied: snapshot.agentOccupied,
+      tabs: snapshot.tabs.map((tab) => ({
+        tabId: tab.tabId,
+        lifecycle: tab.lifecycle,
+        url: tab.url,
+        title: tab.title,
+      })),
+    },
+    options,
   );
 }
 
@@ -769,14 +782,6 @@ export function openTerminalTab(options: {
     'Terminal',
     null,
   );
-  const intent: DesktopRightPaneTerminalIntent = {
-    kind: 'terminal',
-    terminalTabId,
-    sessionId,
-    workspaceId,
-    workspacePath: options.workspacePath?.trim() || '',
-  };
-  forwardDesktopRightPaneIntent(intent);
   return terminalTabId;
 }
 
@@ -790,7 +795,7 @@ export function synchronizeBrowserTabs(
   sessionId: string | null | undefined,
   snapshot: BrowserAuthoritySessionProjection | null,
   options?: {
-    revealActiveTab?: boolean;
+    revealTabId?: string;
     newTabLabel?: string;
   },
 ): void {
@@ -801,7 +806,6 @@ export function synchronizeBrowserTabs(
 
   const pane = ensureSession(scopeKey);
   const previousActiveTabId = pane.activeTabId;
-  const previousActiveTab = pane.openTabs.find((tab) => tab.id === previousActiveTabId);
   const browserSessionId = snapshot?.browserSessionId.trim() || '';
   const authorityTabs = (snapshot?.tabs ?? []).filter((tab) => (
     tab.tabId.trim() && tab.lifecycle !== 'closed'
@@ -810,9 +814,10 @@ export function synchronizeBrowserTabs(
     authorityTabs.map((tab) => `browser:${browserSessionId}:${tab.tabId.trim()}`),
   );
 
-  pane.openTabs = pane.openTabs.filter((tab) => (
+  const retainedTabs = pane.openTabs.filter((tab) => (
     tab.kind !== 'browser' || authorityPaneIds.has(tab.id)
   ));
+  if (retainedTabs.length !== pane.openTabs.length) pane.openTabs = retainedTabs;
 
   for (const tab of authorityTabs) {
     const normalizedTabId = tab.tabId.trim();
@@ -826,6 +831,7 @@ export function synchronizeBrowserTabs(
       {
         browserSessionId,
         tabId: normalizedTabId,
+        lifecycle: tab.lifecycle,
         agentOccupied: snapshot?.agentOccupied === true,
         workspaceId: normalizedWorkspaceId,
         workspacePath: normalizeWorkspaceId(workspacePath) || undefined,
@@ -837,46 +843,42 @@ export function synchronizeBrowserTabs(
     );
   }
 
-  const authorityActivePaneId = snapshot?.activeTabId?.trim()
-    ? `browser:${browserSessionId}:${snapshot.activeTabId.trim()}`
+  const requestedPaneId = options?.revealTabId?.trim()
+    ? `browser:${browserSessionId}:${options.revealTabId.trim()}`
     : null;
-  const authorityActiveExists = Boolean(
-    authorityActivePaneId
-      && pane.openTabs.some((tab) => tab.id === authorityActivePaneId),
-  );
+  if (requestedPaneId && pane.openTabs.some((tab) => tab.id === requestedPaneId)) {
+    pane.activeTabId = requestedPaneId;
+    pane.collapsed = false;
+    const active = pane.openTabs.find((tab) => tab.id === requestedPaneId);
+    if (active) active.lastActivatedAt = now();
+    return;
+  }
   const previousActiveStillExists = Boolean(
     previousActiveTabId
       && pane.openTabs.some((tab) => tab.id === previousActiveTabId),
   );
-
-  if (options?.revealActiveTab && authorityActivePaneId && authorityActiveExists) {
-    pane.activeTabId = authorityActivePaneId;
-    pane.collapsed = false;
-    const active = pane.openTabs.find((tab) => tab.id === authorityActivePaneId);
-    if (active) active.lastActivatedAt = now();
-    return;
-  }
-
-  if (previousActiveTab?.kind === 'browser' && authorityActivePaneId && authorityActiveExists) {
-    pane.activeTabId = authorityActivePaneId;
-    return;
-  }
 
   if (previousActiveStillExists) {
     pane.activeTabId = previousActiveTabId;
     return;
   }
 
-  // 页面刷新后浏览器 Tab 不从 localStorage 恢复，首轮权威投影没有本地
-  // activeTabId。此时使用 BrowserAuthority 的活动 Tab，但不改变 collapsed。
-  if (!previousActiveTabId && authorityActiveExists) {
-    pane.activeTabId = authorityActivePaneId;
+  // BrowserAuthority 不持有窗口级选中项。首次投影按持久 Tab 顺序选择第一个；
+  // Desktop Renderer 随后使用当前窗口的 Main snapshot 恢复该窗口自己的选择。
+  const firstAuthorityPaneId = authorityTabs[0]
+    ? `browser:${browserSessionId}:${authorityTabs[0].tabId.trim()}`
+    : null;
+  if (
+    !previousActiveTabId
+    && firstAuthorityPaneId
+    && pane.openTabs.some((tab) => tab.id === firstAuthorityPaneId)
+  ) {
+    pane.activeTabId = firstAuthorityPaneId;
     return;
   }
 
   if (pane.openTabs.length === 0) {
     pane.activeTabId = null;
-    pane.collapsed = true;
     return;
   }
 
@@ -1031,6 +1033,45 @@ export function setActiveRightPaneTab(
   scopeKeyOrSessionId: string | null | undefined,
   tabId: string,
 ): void {
+  setActiveRightPaneTabInternal(scopeKeyOrSessionId, tabId, true);
+}
+
+/** Main 快照回写当前窗口选中项时使用，不应覆盖用户尚未完成的 Tab 激活意图。 */
+export function setActiveRightPaneTabFromDesktop(
+  scopeKeyOrSessionId: string | null | undefined,
+  tabId: string,
+): void {
+  setActiveRightPaneTabInternal(scopeKeyOrSessionId, tabId, false);
+}
+
+export function pendingBrowserTabIntentFor(
+  scopeKeyOrSessionId: string | null | undefined,
+): string | null {
+  const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
+  return pendingBrowserTabIntent?.scopeKey === scopeKey
+    ? pendingBrowserTabIntent.tabId
+    : null;
+}
+
+export function clearPendingBrowserTabIntent(
+  scopeKeyOrSessionId: string | null | undefined,
+  tabId: string,
+): void {
+  const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
+  if (
+    pendingBrowserTabIntent
+    && pendingBrowserTabIntent.scopeKey === scopeKey
+    && pendingBrowserTabIntent.tabId === tabId
+  ) {
+    pendingBrowserTabIntent = null;
+  }
+}
+
+function setActiveRightPaneTabInternal(
+  scopeKeyOrSessionId: string | null | undefined,
+  tabId: string,
+  userInitiated: boolean,
+): void {
   const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
   if (!scopeKey) {
     return;
@@ -1045,6 +1086,14 @@ export function setActiveRightPaneTab(
   }
   session.activeTabId = tabId;
   tab.lastActivatedAt = now();
+  if (userInitiated && tab.kind === 'browser') {
+    pendingBrowserTabIntent = {
+      scopeKey,
+      tabId: (tab.payload as BrowserTabPayload).tabId,
+    };
+  } else if (userInitiated) {
+    pendingBrowserTabIntent = null;
+  }
 }
 
 /** 更新 tab 的展示标题，不改变激活顺序。 */

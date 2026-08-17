@@ -4,7 +4,7 @@ import { BrowserAutomationRuntime } from "./runtime.js";
 
 const port = parentPort();
 const cdp = new CdpClient(port);
-const runtime = new BrowserAutomationRuntime(cdp);
+const runtime = new BrowserAutomationRuntime(cdp, process.env.MAGI_BROWSER_WORKER_EPOCH ?? "");
 
 const ready: WorkerReadyMessage = {
   type: "worker_ready",
@@ -15,6 +15,10 @@ port.postMessage(ready);
 
 port.on("message", (event) => {
   const message: MainToWorkerMessage = event.data;
+  if (message.type === "worker_rebind") {
+    runtime.rebind(message.bindings);
+    return;
+  }
   if (message.type !== "worker_command") return;
   void runtime.execute(message.call_id, message.binding, message.command)
     .then((result) => port.postMessage(result));

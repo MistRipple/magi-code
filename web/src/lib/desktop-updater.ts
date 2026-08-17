@@ -79,6 +79,9 @@ export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
     }
   }
   if (!snapshot) throw lastError ?? new Error('桌面端更新检查失败');
+  if (snapshot.status === 'failed' || snapshot.status === 'unsupported') {
+    throw new Error(snapshot.error || '当前构建不支持在线更新');
+  }
   if (!snapshot.availableVersion) return null;
 
   return {

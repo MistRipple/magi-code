@@ -5474,16 +5474,13 @@ fn public_builtin_specs_exclude_shell_internal_process_tools() {
             "browser_drag",
             "browser_fill_form",
             "browser_dialog",
-            "browser_upload_file",
             "browser_click_at",
             "browser_evaluate",
             "browser_console",
             "browser_network",
             "browser_emulate",
             "browser_performance",
-            "browser_lighthouse",
             "browser_heap",
-            "browser_third_party",
             "browser_webmcp",
             "browser_pwa",
             "diagram_render",
@@ -5574,6 +5571,38 @@ fn browser_viewport_exposes_only_wide_and_narrow_device_semantics() {
         schema["properties"]["device_type"]["enum"],
         serde_json::json!(["desktop", "mobile"])
     );
+}
+
+#[test]
+fn browser_catalog_excludes_unimplemented_capabilities() {
+    for tool in BuiltinToolName::ALL {
+        assert!(!matches!(
+            tool,
+            BuiltinToolName::BrowserUploadFile
+                | BuiltinToolName::BrowserLighthouse
+                | BuiltinToolName::BrowserThirdParty
+        ));
+    }
+    assert!(BuiltinToolName::from_name("browser_upload_file").is_none());
+    assert!(BuiltinToolName::from_name("browser_lighthouse").is_none());
+    assert!(BuiltinToolName::from_name("browser_third_party").is_none());
+}
+
+#[test]
+fn browser_interaction_schemas_match_worker_parameter_contracts() {
+    let drag = BuiltinToolName::BrowserDrag.parameters_schema();
+    assert!(drag["properties"].get("source").is_some());
+    assert!(drag["properties"].get("target").is_some());
+    assert!(drag["properties"].get("from").is_none());
+    assert!(drag["properties"].get("to").is_none());
+
+    let fill = BuiltinToolName::BrowserFillForm.parameters_schema();
+    assert!(fill["properties"].get("fields").is_some());
+    assert!(fill["properties"].get("elements").is_none());
+
+    let evaluate = BuiltinToolName::BrowserEvaluate.parameters_schema();
+    assert!(evaluate["properties"].get("expression").is_some());
+    assert!(evaluate["properties"].get("function").is_none());
 }
 
 #[test]
