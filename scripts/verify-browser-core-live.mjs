@@ -17,6 +17,8 @@ for (let index = 2; index < process.argv.length; index += 1) {
 
 const sessionId = String(args.get("session-id") || process.env.MAGI_ACCEPTANCE_SESSION_ID || "").trim();
 const requestedTabId = String(args.get("tab-id") || process.env.MAGI_ACCEPTANCE_TAB_ID || "").trim();
+const scope = String(args.get("scope") || process.env.MAGI_ACCEPTANCE_SCOPE || "personal").trim();
+const workspaceId = String(args.get("workspace-id") || process.env.MAGI_ACCEPTANCE_WORKSPACE_ID || "").trim();
 const writeAnnotation = args.has("write-annotation");
 const lifecycleRegression = args.has("lifecycle-regression");
 const checks = [];
@@ -87,6 +89,12 @@ async function activateAndReadTab(tabId) {
 if (!sessionId) {
   throw new Error("必须提供 --session-id，示例：--session-id session-...");
 }
+if (scope !== "personal" && scope !== "workspace") {
+  throw new Error("--scope 只能是 personal 或 workspace");
+}
+if (scope === "workspace" && !workspaceId) {
+  throw new Error("workspace 作用域必须提供 --workspace-id");
+}
 
 const health = await readJson("/health");
 record("daemon health", health.response.ok, `HTTP ${health.response.status}`);
@@ -101,7 +109,9 @@ record(
   `hostStatus=${connection.body?.hostStatus ?? "unknown"}, protocol=${String(connection.body?.hostProtocolCompatible)}`,
 );
 
-const sessionPath = `/api/browser/sessions/current?scope=personal&sessionId=${encodeURIComponent(sessionId)}`;
+const sessionQuery = new URLSearchParams({ scope, sessionId });
+if (workspaceId) sessionQuery.set("workspaceId", workspaceId);
+const sessionPath = `/api/browser/sessions/current?${sessionQuery.toString()}`;
 const current = await readJson(sessionPath);
 let session = current.body?.session;
 record("浏览器会话可读取", current.response.ok && Boolean(session), `HTTP ${current.response.status}`);
