@@ -143,6 +143,10 @@ if (singleInstance) {
     },
   });
   windowManager = manager;
+  // Overlay Renderer 会在加载完成后立即发送 ready 握手。IPC 必须先于
+  // 创建窗口注册，否则启动阶段的握手会落在“无 handler”窗口期，Overlay
+  // 永远保持零尺寸，菜单和标记选择都会表现为可见但无法交互。
+  registerIpc();
   control = new DesktopControlServer({
     socketPath: controlSocket,
     token: controlToken,
@@ -182,7 +186,6 @@ if (singleInstance) {
   updateManager = new UpdateManager(PRODUCT_VERSION, (snapshot) => {
     broadcastAll("magi-desktop:update", snapshot);
   });
-  registerIpc();
   startBrowserComponentSnapshots();
   }).catch(async (error) => {
     console.error("Magi Desktop 启动失败", error);

@@ -349,7 +349,16 @@ export const rightPaneState = $state<RightPaneRootState>({
   },
 });
 
-let pendingBrowserTabIntent: { scopeKey: string; tabId: string } | null = null;
+interface PendingDesktopPanelIntent {
+  scopeKey: string;
+  kind: RightPaneTabKind;
+  tabId: string;
+}
+
+// Main 的布局快照是已提交状态，Renderer 的 Tab 选择是用户意图。两者之间
+// 存在异步 IPC 窗口，必须保留统一的在途意图，否则旧的 Browser 快照会把
+// 用户刚选中的文件/终端 Tab 立即写回，表现为“浏览器能看但其他 Tab 点不开”。
+let pendingDesktopPanelIntent: PendingDesktopPanelIntent | null = null;
 
 // 模块加载时立即恢复——必须放在 rightPaneState 定义之后、任何使用方读取之前
 loadPersisted();
@@ -482,6 +491,7 @@ function upsertTab(
       existing.lastActivatedAt = timestamp;
       session.activeTabId = id;
       session.collapsed = false;
+      rememberDesktopPanelIntent(scopeKey, existing);
     }
     return existing;
   }
@@ -498,6 +508,7 @@ function upsertTab(
   if (activate) {
     session.activeTabId = id;
     session.collapsed = false;
+    rememberDesktopPanelIntent(scopeKey, tab);
   }
   return tab;
 }
@@ -510,6 +521,21 @@ function sameBrowserTabPayload(left: BrowserTabPayload, right: BrowserTabPayload
     && left.workspaceId === right.workspaceId
     && left.workspacePath === right.workspacePath
     && left.sessionId === right.sessionId;
+}
+
+function desktopPanelTabId(tab: RightPaneTab): string {
+  return tab.kind === 'browser'
+    ? (tab.payload as BrowserTabPayload).tabId
+    : tab.id;
+}
+
+function rememberDesktopPanelIntent(scopeKey: string, tab: RightPaneTab): void {
+  if (!isDesktopRenderer()) return;
+  pendingDesktopPanelIntent = {
+    scopeKey,
+    kind: tab.kind,
+    tabId: desktopPanelTabId(tab),
+  };
 }
 
 // ============================================================================
@@ -714,10 +740,6 @@ export function openBrowserTab(
     options.label?.trim() || 'Browser',
     null,
   );
-  // 该入口只用于用户/应用主动创建 Browser Tab。标记为待提交的窗口级
-  // 选择意图，避免旧 Main snapshot 在 activateBrowser 完成前把新 Tab
-  // 立即改回旧 Tab。
-  pendingBrowserTabIntent = { scopeKey, tabId: normalizedTabId };
 }
 
 /** 将完整的 BrowserAuthority 快照收敛为右栏唯一的浏览器 Tab 投影。 */
@@ -1056,26 +1078,28 @@ export function setActiveRightPaneTabFromDesktop(
   setActiveRightPaneTabInternal(scopeKeyOrSessionId, tabId, false);
 }
 
-export function pendingBrowserTabIntentFor(
+export function pendingDesktopPanelIntentFor(
   scopeKeyOrSessionId: string | null | undefined,
-): string | null {
+): PendingDesktopPanelIntent | null {
   const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
-  return pendingBrowserTabIntent?.scopeKey === scopeKey
-    ? pendingBrowserTabIntent.tabId
+  return pendingDesktopPanelIntent?.scopeKey === scopeKey
+    ? pendingDesktopPanelIntent
     : null;
 }
 
-export function clearPendingBrowserTabIntent(
+export function clearPendingDesktopPanelIntent(
   scopeKeyOrSessionId: string | null | undefined,
+  kind: RightPaneTabKind,
   tabId: string,
 ): void {
   const scopeKey = normalizeStoredScopeKey(scopeKeyOrSessionId);
   if (
-    pendingBrowserTabIntent
-    && pendingBrowserTabIntent.scopeKey === scopeKey
-    && pendingBrowserTabIntent.tabId === tabId
+    pendingDesktopPanelIntent
+    && pendingDesktopPanelIntent.scopeKey === scopeKey
+    && pendingDesktopPanelIntent.kind === kind
+    && pendingDesktopPanelIntent.tabId === tabId
   ) {
-    pendingBrowserTabIntent = null;
+    pendingDesktopPanelIntent = null;
   }
 }
 
@@ -1098,14 +1122,7 @@ function setActiveRightPaneTabInternal(
   }
   session.activeTabId = tabId;
   tab.lastActivatedAt = now();
-  if (userInitiated && tab.kind === 'browser') {
-    pendingBrowserTabIntent = {
-      scopeKey,
-      tabId: (tab.payload as BrowserTabPayload).tabId,
-    };
-  } else if (userInitiated) {
-    pendingBrowserTabIntent = null;
-  }
+  if (userInitiated) rememberDesktopPanelIntent(scopeKey, tab);
 }
 
 /** 更新 tab 的展示标题，不改变激活顺序。 */

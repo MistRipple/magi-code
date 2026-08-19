@@ -72,8 +72,8 @@
     getRightPaneState,
     openCodeTab,
     setActiveRightPaneTabFromDesktop,
-    pendingBrowserTabIntentFor,
-    clearPendingBrowserTabIntent,
+    pendingDesktopPanelIntentFor,
+    clearPendingDesktopPanelIntent,
     setRightPaneCollapsed,
     type BrowserTabPayload,
     type CodeTabPayload,
@@ -326,7 +326,25 @@
   /** 当前 session 的右栏多 tab 状态；由 right-pane store 派生 */
   const activeRightPaneState = $derived(getRightPaneState(rightPaneState.activeScopeKey));
   $effect(() => {
-    if (!desktopAppSurface || desktopSnapshot?.layout.activePanelKind !== 'browser') return;
+    if (!desktopAppSurface || !desktopSnapshot) return;
+    const pendingIntent = pendingDesktopPanelIntentFor(rightPaneState.activeScopeKey);
+    if (pendingIntent) {
+      const committed = desktopSnapshot.layout.activePanelKind === pendingIntent.kind
+        && desktopSnapshot.layout.activeTabId === pendingIntent.tabId;
+      if (committed) {
+        clearPendingDesktopPanelIntent(
+          rightPaneState.activeScopeKey,
+          pendingIntent.kind,
+          pendingIntent.tabId,
+        );
+      } else {
+        // 用户已经选择了另一个右栏 Tab，等待 Main 完成同一激活事务。
+        // 这里不能用旧 desktopSnapshot 把选择项写回去，否则文件 Tab 会
+        // 在浏览器激活期间瞬间跳回旧的 Browser Tab。
+        return;
+      }
+    }
+    if (desktopSnapshot.layout.activePanelKind !== 'browser') return;
     const logicalTabId = desktopSnapshot.layout.activeTabId?.trim() || '';
     if (!logicalTabId) return;
     const pane = activeRightPaneState;
@@ -334,16 +352,6 @@
       tab.kind === 'browser'
       && (tab.payload as BrowserTabPayload).tabId === logicalTabId
     ));
-    const pendingTabId = pendingBrowserTabIntentFor(rightPaneState.activeScopeKey);
-    if (pendingTabId) {
-      if (pendingTabId === logicalTabId) {
-        clearPendingBrowserTabIntent(rightPaneState.activeScopeKey, pendingTabId);
-      }
-      // 用户已经选择了另一个 Browser Tab，等待 Main 完成同一激活事务。
-      // 这里不能用旧 desktopSnapshot 把选择项写回去，否则每次点击都会
-      // 立刻跳回旧 Tab，表现为“浏览器 Tab 无法切换”。
-      return;
-    }
     if (target && pane.activeTabId !== target.id) {
       setActiveRightPaneTabFromDesktop(rightPaneState.activeScopeKey, target.id);
     }

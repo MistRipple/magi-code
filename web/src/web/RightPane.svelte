@@ -29,7 +29,7 @@
     setActiveRightPaneTab,
     updateRightPaneTabLabel,
     setRightPaneCollapsed,
-    clearPendingBrowserTabIntent,
+    clearPendingDesktopPanelIntent,
     type RightPaneTab,
     type CodeTabPayload,
     type AgentTabPayload,
@@ -510,7 +510,7 @@
     const request = ++activeBrowserActivationRequest;
     void activateVisibleBrowserSurface(payload, request).catch((error) => {
         if (request !== activeBrowserActivationRequest) return;
-        clearPendingBrowserTabIntent(paneScopeKey, payload.tabId);
+        clearPendingDesktopPanelIntent(paneScopeKey, 'browser', payload.tabId);
         activeBrowserActivationKey = '';
         console.warn('[RightPane] 激活浏览器面板失败:', error);
         addToast('error', i18n.t('browser.error.openInternal'), undefined, { forceVisible: true });
