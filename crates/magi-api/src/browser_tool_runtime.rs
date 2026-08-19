@@ -1469,6 +1469,26 @@ fn validate_devtools_arguments(
                 ));
             }
         }
+        "upload_file" => {
+            validate_snapshot_target_object(arguments, "browser_upload_file")?;
+            let file_path = arguments
+                .get("file_path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let file_paths = arguments
+                .get("file_paths")
+                .and_then(Value::as_array)
+                .filter(|values| !values.is_empty())
+                .filter(|values| values.len() <= 20)
+                .and_then(|values| values.iter().map(Value::as_str).collect::<Option<Vec<_>>>());
+            if file_path.is_none() && file_paths.is_none() {
+                return Err(BrowserToolError::new(
+                    "invalid_arguments",
+                    "browser_upload_file 必须提供 file_path 或非空 file_paths",
+                ));
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -2242,7 +2262,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_browser_tools_return_structured_capability_unavailable() {
+    fn browser_tools_return_structured_error_when_host_is_not_ready() {
         let runtime = BrowserToolRuntimeDependencies {
             authority: Arc::new(Mutex::new(BrowserAuthority::new())),
             write_lock: Arc::new(Mutex::new(())),
@@ -2256,6 +2276,7 @@ mod tests {
         };
         let context = magi_tool_runtime::ToolExecutionContext {
             session_id: Some(SessionId::new("session-browser-capability")),
+            browser_capability_revision: Some(1),
             ..Default::default()
         };
         let (payload, status) = runtime.execute(

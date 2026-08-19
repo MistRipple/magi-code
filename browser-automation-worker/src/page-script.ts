@@ -377,6 +377,9 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     cssPath(element) {
       return cssPath(element);
     },
+    elementRef(element) {
+      return element instanceof Element && element.isConnected ? refFor(element) : null;
+    },
     evaluate(expression) {
       return (0, eval)(expression);
     },

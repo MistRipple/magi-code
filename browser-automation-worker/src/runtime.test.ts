@@ -60,6 +60,17 @@ class ScriptedPort implements ParentPort {
       });
     });
   }
+
+  emit(method: string, params: Record<string, unknown> = {}): void {
+    this.#listener?.({
+      data: {
+        type: "cdp_event",
+        binding,
+        method,
+        params,
+      },
+    });
+  }
 }
 
 const binding: BrowserSurfaceBinding = {
@@ -358,4 +369,60 @@ test("性能工具支持 CPU profile 和 precise coverage 生命周期", async (
   assert.equal(stop.outcome.status, "succeeded");
   assert.ok(port.requests.some((request) => request.method === "Profiler.start"));
   assert.ok(port.requests.some((request) => request.method === "Profiler.stop"));
+});
+
+test("第三方分析只统计 response，并使用 loadingFinished 的编码字节数", async () => {
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") {
+      const expression = String(params.expression);
+      return { result: { value: expression.includes("location.origin") ? "https://app.test" : null } };
+    }
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  port.emit("Network.requestWillBeSent", { requestId: "r1", type: "Script", request: { url: "https://cdn.test/app.js" } });
+  port.emit("Network.responseReceived", { requestId: "r1", type: "Script", response: { url: "https://cdn.test/app.js" } });
+  port.emit("Network.loadingFinished", { requestId: "r1", encodedDataLength: 321 });
+  const result = await runtime.execute("third-party-accurate", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "third_party", arguments: { action: "list" } },
+  });
+  assert.equal(result.outcome.status, "succeeded");
+  const value = result.outcome.payload.type === "json" ? result.outcome.payload.payload.value as Record<string, any> : null;
+  assert.deepEqual(value, { page_origin: "https://app.test", entries: [{ origin: "https://cdn.test", requests: 1, bytes: 321, resource_types: { Script: 1 }, urls: ["https://cdn.test/app.js"] }], total_requests: 1 });
+  assert.equal(value?.entries?.[0]?.requests, 1);
+  assert.equal(value?.entries?.[0]?.bytes, 321);
+  assert.equal(value?.entries?.[0]?.resource_types?.Script, 1);
+});
+
+test("Heap 快照按 Chrome 的连续 edge 数组索引解析对象关系", async () => {
+  const snapshot = JSON.stringify({
+    snapshot: { meta: {
+      node_fields: ["type", "name", "id", "self_size", "edge_count", "trace_node_id"],
+      node_types: [["hidden", "object"]],
+      edge_fields: ["type", "name_or_index", "to_node"],
+      edge_types: [["context", "element", "property"]],
+    } },
+    nodes: [0, 0, 1, 8, 1, 0, 1, 1, 2, 16, 0, 0],
+    edges: [2, 1, 6],
+    strings: ["root", "child"],
+  });
+  const port = new ScriptedPort((method) => {
+    if (method === "Runtime.getHeapUsage") return { usedSize: 1 };
+    if (method === "HeapProfiler.takeHeapSnapshot") {
+      queueMicrotask(() => port.emit("HeapProfiler.addHeapSnapshotChunk", { chunk: snapshot }));
+    }
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const take = await runtime.execute("heap-take", binding, {
+    type: "devtools", payload: { tab_id: binding.tab_id, operation: "heap", arguments: { action: "take_snapshot" } },
+  });
+  assert.equal(take.outcome.status, "succeeded");
+  const edges = await runtime.execute("heap-edges", binding, {
+    type: "devtools", payload: { tab_id: binding.tab_id, operation: "heap", arguments: { action: "edges", node_id: 0 } },
+  });
+  assert.equal(edges.outcome.status, "succeeded");
 });

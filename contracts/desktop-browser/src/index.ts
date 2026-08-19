@@ -259,6 +259,7 @@ export interface BrowserSnapshot {
 
 export interface BrowserAccessibilityNode {
   node_id: string;
+  element_ref?: string | null;
   parent_id?: string | null;
   child_ids: string[];
   role?: string | null;
@@ -346,6 +347,7 @@ export interface WorkerCdpRequest {
   binding: BrowserSurfaceBinding;
   method: string;
   params?: Record<string, unknown>;
+  session_id?: string;
 }
 
 export interface WorkerCdpResponse {
@@ -361,6 +363,7 @@ export interface WorkerCdpEvent {
   binding: BrowserSurfaceBinding;
   method: string;
   params: Record<string, unknown>;
+  session_id?: string;
 }
 
 export interface WorkerRebindRequest {

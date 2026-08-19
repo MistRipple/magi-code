@@ -1506,7 +1506,11 @@ impl BuiltinToolName {
                     "file_paths": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 20 },
                     "include_snapshot": { "type": "boolean" }
                 },
-                "required": ["snapshot_revision", "element_ref", "file_path"]
+                "required": ["snapshot_revision", "element_ref"],
+                "anyOf": [
+                    { "required": ["file_path"] },
+                    { "required": ["file_paths"] }
+                ]
             }),
             Self::BrowserClickAt => serde_json::json!({
                 "type": "object",

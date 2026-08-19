@@ -43,6 +43,14 @@ interface HeapSnapshotData {
   edgeTypes: string[];
   nodeFieldCount: number;
   edgeFieldCount: number;
+  edgeStarts: number[];
+}
+
+interface HeapEdgeRecord {
+  type: string;
+  name: string | number;
+  to_node: number;
+  to: ReturnType<typeof heapNode>;
 }
 
 export class BrowserAutomationRuntime {
@@ -278,7 +286,7 @@ export class BrowserAutomationRuntime {
         `expected ${snapshotRevision}, received ${value.snapshot_revision}`,
       );
     }
-    const accessibilityTree = await this.accessibilityTree(binding, safeInteger(limits.max_nodes, 400));
+    const accessibilityTree = await this.accessibilityTree(binding, safeInteger(limits.max_nodes, 400), snapshotRevision);
     return {
       tab_id: binding.tab_id,
       navigation_revision: binding.navigation_revision,
@@ -288,15 +296,22 @@ export class BrowserAutomationRuntime {
     };
   }
 
-  private async accessibilityTree(binding: BrowserSurfaceBinding, maxNodes: number): Promise<BrowserAccessibilityNode[]> {
+  private async accessibilityTree(binding: BrowserSurfaceBinding, maxNodes: number, snapshotRevision: number): Promise<BrowserAccessibilityNode[]> {
     const response = await this.#cdp.send<{ nodes?: Array<Record<string, unknown>> }>(
       binding,
       "Accessibility.getFullAXTree",
       {},
     );
     const nodes = Array.isArray(response.nodes) ? response.nodes : [];
-    return nodes.slice(0, maxNodes).map((node) => ({
+    const mapped = [];
+    for (const node of nodes.slice(0, maxNodes)) {
+      const backendDomNodeId = typeof node.backendDOMNodeId === "number" ? node.backendDOMNodeId : null;
+      const elementRef = backendDomNodeId === null
+        ? null
+        : await this.accessibilityElementRef(binding, backendDomNodeId, snapshotRevision);
+      mapped.push({
       node_id: String(node.nodeId ?? ""),
+      element_ref: elementRef,
       parent_id: node.parentId == null ? null : String(node.parentId),
       child_ids: Array.isArray(node.childIds) ? node.childIds.map(String) : [],
       role: axValue(node.role),
@@ -312,8 +327,34 @@ export class BrowserAutomationRuntime {
       actions: Array.isArray(node.actions)
         ? node.actions.map((action) => typeof action === "object" && action !== null ? String((action as { name?: unknown }).name ?? "") : String(action)).filter(Boolean)
         : [],
-      backend_dom_node_id: typeof node.backendDOMNodeId === "number" ? node.backendDOMNodeId : null,
-    }));
+      backend_dom_node_id: backendDomNodeId,
+      });
+    }
+    return mapped;
+  }
+
+  private async accessibilityElementRef(
+    binding: BrowserSurfaceBinding,
+    backendDomNodeId: number,
+    snapshotRevision: number,
+  ): Promise<string | null> {
+    try {
+      const described = await this.#cdp.send<{ node?: { nodeId?: number } }>(binding, "DOM.describeNode", { backendNodeId: backendDomNodeId });
+      if (!described.node?.nodeId) return null;
+      const resolved = await this.#cdp.send<{ object?: { objectId?: string } }>(binding, "DOM.resolveNode", { nodeId: described.node.nodeId });
+      const objectId = resolved.object?.objectId;
+      if (!objectId) return null;
+      const result = await this.#cdp.send<{ result?: { value?: unknown } }>(binding, "Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: `function() { return globalThis.__magiBrowserAutomation.elementRef(this); }`,
+        returnByValue: true,
+        awaitPromise: false,
+        arguments: [],
+      });
+      return typeof result.result?.value === "string" ? result.result.value : null;
+    } catch {
+      return null;
+    }
   }
 
   private async setAnnotations(binding: BrowserSurfaceBinding, annotations: unknown[]): Promise<unknown> {
@@ -568,6 +609,11 @@ export class BrowserAutomationRuntime {
       ? args.file_paths.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
       : typeof args.file_path === "string" && args.file_path.trim() ? [args.file_path.trim()] : [];
     if (!paths.length) throw protocolFailure("browser_upload_file_invalid", "file_path or file_paths is required");
+    for (const path of paths) {
+      if (path.includes("\0") || path.length > 4096) {
+        throw protocolFailure("browser_upload_file_invalid", "file path is invalid");
+      }
+    }
     if (!target.editable) throw protocolFailure("browser_upload_target_invalid", "target must be a file input");
     const document = await this.#cdp.send<{ root: { nodeId: number } }>(binding, "DOM.getDocument", { depth: -1, pierce: true });
     const selector = await this.evaluate<string | null>(
@@ -588,7 +634,7 @@ export class BrowserAutomationRuntime {
       page.network.length = 0;
       return { cleared: true };
     }
-    const entries = page.network.filter((entry) => entry.type === "response" || entry.requestId);
+    const entries = page.network.filter((entry) => entry.event_type === "response");
     const origin = await this.evaluate<string>(binding, "location.origin");
     const groups = new Map<string, { origin: string; requests: number; bytes: number; resource_types: Record<string, number>; urls: string[] }>();
     for (const entry of entries) {
@@ -600,7 +646,7 @@ export class BrowserAutomationRuntime {
       const group = groups.get(resourceOrigin) ?? { origin: resourceOrigin, requests: 0, bytes: 0, resource_types: {}, urls: [] };
       group.requests += 1;
       group.bytes += Number(entry.encodedDataLength ?? entry.encoded_data_length ?? 0) || 0;
-      const type = String(entry.type ?? entry.resourceType ?? "other");
+      const type = String(entry.resource_type ?? entry.resourceType ?? "other");
       group.resource_types[type] = (group.resource_types[type] ?? 0) + 1;
       if (group.urls.length < 20) group.urls.push(url);
       groups.set(resourceOrigin, group);
@@ -704,7 +750,7 @@ export class BrowserAutomationRuntime {
     }
     const entries = page.network.slice(-safeInteger(args.page_size ?? args.limit, 100));
     if (args.action === "failed") {
-      return { entries: entries.filter((entry) => entry.type === "failed") };
+      return { entries: entries.filter((entry) => entry.event_type === "failed") };
     }
     return { entries };
   }
@@ -952,6 +998,7 @@ export class BrowserAutomationRuntime {
     binding: BrowserSurfaceBinding,
     method: string,
     params: Record<string, unknown>,
+    sessionId?: string,
   ): void {
     const page = this.page(binding);
     if (method === "Runtime.executionContextsCleared") {
@@ -964,30 +1011,39 @@ export class BrowserAutomationRuntime {
       return;
     }
     if (method === "Network.requestWillBeSent") {
-      page.network.push({ id: page.nextNetworkId++, timestamp: Date.now(), ...params });
+      page.network.push({ event_type: "request", id: page.nextNetworkId++, timestamp: Date.now(), ...params, ...(params.request && typeof params.request === "object" ? params.request : {}), resource_type: params.type ?? null });
       if (page.network.length > 500) page.network.splice(0, page.network.length - 500);
     }
     if (method === "Network.responseReceived") {
-      page.network.push({ type: "response", timestamp: Date.now(), ...params, ...(params.response && typeof params.response === "object" ? params.response : {}) });
+      page.network.push({ event_type: "response", timestamp: Date.now(), ...params, ...(params.response && typeof params.response === "object" ? params.response : {}), resource_type: params.type ?? null });
       if (page.network.length > 500) page.network.splice(0, page.network.length - 500);
     }
     if (method === "Network.loadingFailed") {
-      page.network.push({ type: "failed", timestamp: Date.now(), ...params });
+      page.network.push({ event_type: "failed", timestamp: Date.now(), ...params });
       if (page.network.length > 500) page.network.splice(0, page.network.length - 500);
     }
-    if (method === "Tracing.dataCollected" && page.traceActive && Array.isArray(params.value)) {
+    if (method === "Network.loadingFinished") {
+      const requestId = String(params.requestId ?? "");
+      const encodedDataLength = Number(params.encodedDataLength ?? 0);
+      const request = [...page.network].reverse().find((entry) => entry.event_type === "request" && String(entry.requestId ?? "") === requestId);
+      const response = [...page.network].reverse().find((entry) => entry.event_type === "response" && String(entry.requestId ?? "") === requestId);
+      if (Number.isFinite(encodedDataLength)) {
+        if (request) request.encodedDataLength = encodedDataLength;
+        if (response) response.encodedDataLength = encodedDataLength;
+      }
+    }
+    if (!sessionId && method === "Tracing.dataCollected" && page.traceActive && Array.isArray(params.value)) {
       page.traceEvents.push(...params.value.filter((value): value is Record<string, unknown> => Boolean(value && typeof value === "object")));
       if (page.traceEvents.length > 10_000) page.traceEvents.splice(0, page.traceEvents.length - 10_000);
     }
-    if (method === "Tracing.tracingComplete") page.traceActive = false;
-    if (method === "Tracing.tracingComplete") page.traceActive = false;
-    if (method === "Page.javascriptDialogOpening") page.dialog = params;
-    if (method === "Page.javascriptDialogClosed") page.dialog = null;
-    if (method === "HeapProfiler.addHeapSnapshotChunk") {
+    if (!sessionId && method === "Tracing.tracingComplete") page.traceActive = false;
+    if (!sessionId && method === "Page.javascriptDialogOpening") page.dialog = params;
+    if (!sessionId && method === "Page.javascriptDialogClosed") page.dialog = null;
+    if (!sessionId && method === "HeapProfiler.addHeapSnapshotChunk") {
       const chunk = typeof params.chunk === "string" ? params.chunk : "";
       if (chunk) page.heapSnapshotChunks.push(chunk);
     }
-    if (method === "Profiler.consoleProfileFinished") {
+    if (!sessionId && method === "Profiler.consoleProfileFinished") {
       page.traceEvents.push({ type: "cpu_profile", ...params });
     }
   }
@@ -1048,6 +1104,17 @@ function parseHeapSnapshot(raw: string): HeapSnapshotData {
   const edgeTypesValue = meta.edge_types;
   const nodeTypes = Array.isArray(nodeTypesValue) && Array.isArray(nodeTypesValue[0]) ? (nodeTypesValue[0] as unknown[]).map(String) : [];
   const edgeTypes = Array.isArray(edgeTypesValue) && Array.isArray(edgeTypesValue[0]) ? (edgeTypesValue[0] as unknown[]).map(String) : [];
+  const nodeFieldCount = nodeFields.length;
+  const edgeFieldCount = edgeFields.length;
+  const edgeCountIndex = nodeFields.indexOf("edge_count");
+  const edgeStarts: number[] = [];
+  let edgeStart = 0;
+  const nodeValues = Array.isArray(parsed.nodes) ? parsed.nodes : [];
+  const nodeCount = nodeFieldCount ? Math.floor(nodeValues.length / nodeFieldCount) : 0;
+  for (let index = 0; index < nodeCount; index += 1) {
+    edgeStarts.push(edgeStart);
+    edgeStart += edgeCountIndex >= 0 ? Number(nodeValues[index * nodeFieldCount + edgeCountIndex] ?? 0) : 0;
+  }
   return {
     meta,
     nodes: Array.isArray(parsed.nodes) ? parsed.nodes : [],
@@ -1057,8 +1124,9 @@ function parseHeapSnapshot(raw: string): HeapSnapshotData {
     edgeFieldIndex: Object.fromEntries(edgeFields.map((field, index) => [field, index])),
     nodeTypes,
     edgeTypes,
-    nodeFieldCount: nodeFields.length,
-    edgeFieldCount: edgeFields.length,
+    nodeFieldCount,
+    edgeFieldCount,
+    edgeStarts,
   };
 }
 
@@ -1110,13 +1178,16 @@ function analyzeHeap(snapshot: HeapSnapshotData, previous: HeapSnapshotData | nu
   const count = snapshot.nodeFieldCount ? Math.floor(snapshot.nodes.length / snapshot.nodeFieldCount) : 0;
   const pageIndex = safeInteger(args.page_index, 0);
   const pageSize = Math.min(500, Math.max(1, safeInteger(args.page_size, 100)));
-  if (action === "details" || action === "class_nodes" || action === "dominators") {
+  if (action === "details" || action === "class_nodes") {
     const className = typeof args.class_name === "string" ? args.class_name : null;
     const classId = typeof args.class_id === "number" ? args.class_id : null;
     const nodes = Array.from({ length: count }, (_, index) => heapNode(snapshot, index))
       .filter((node) => action !== "class_nodes" || (className ? node.name === className : classId == null || node.id === classId))
       .sort((left, right) => right.self_size - left.self_size);
     return { action, page_index: pageIndex, page_size: pageSize, nodes: nodes.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize) };
+  }
+  if (action === "dominators") {
+    return { action, page_index: pageIndex, page_size: pageSize, nodes: heapDominators(snapshot).slice(pageIndex * pageSize, (pageIndex + 1) * pageSize) };
   }
   if (action === "duplicate_strings") {
     const counts = new Map<string, number>();
@@ -1134,19 +1205,68 @@ function analyzeHeap(snapshot: HeapSnapshotData, previous: HeapSnapshotData | nu
   return { action, page_index: pageIndex, page_size: pageSize, nodes: [] };
 }
 
-function heapEdges(snapshot: HeapSnapshotData, nodeIndex: number): Array<Record<string, unknown>> {
+function heapEdges(snapshot: HeapSnapshotData, nodeIndex: number): HeapEdgeRecord[] {
   const offset = nodeIndex * snapshot.nodeFieldCount;
-  const start = Number(snapshot.nodes[offset + (snapshot.nodeFieldIndex.edge_start ?? 5)] ?? 0);
+  if (nodeIndex < 0 || offset < 0 || offset >= snapshot.nodes.length || snapshot.edgeFieldCount <= 0) return [];
+  const start = Number(snapshot.edgeStarts[nodeIndex] ?? 0);
   const count = Number(snapshot.nodes[offset + (snapshot.nodeFieldIndex.edge_count ?? 4)] ?? 0);
-  const edges: Array<Record<string, unknown>> = [];
+  const edges: HeapEdgeRecord[] = [];
   for (let index = 0; index < count; index += 1) {
     const edgeOffset = start + index * snapshot.edgeFieldCount;
+    if (edgeOffset < 0 || edgeOffset + snapshot.edgeFieldCount > snapshot.edges.length) break;
     const type = snapshot.edgeTypes[Number(snapshot.edges[edgeOffset + (snapshot.edgeFieldIndex.type ?? 0)] ?? 0)] ?? "unknown";
     const nameId = Number(snapshot.edges[edgeOffset + (snapshot.edgeFieldIndex.name_or_index ?? 1)] ?? 0);
     const toNode = Number(snapshot.edges[edgeOffset + (snapshot.edgeFieldIndex.to_node ?? 2)] ?? 0) / snapshot.nodeFieldCount;
-    edges.push({ type, name: snapshot.strings[nameId] ?? String(nameId), to_node: toNode, to: heapNode(snapshot, toNode) });
+    const edgeType = String(type);
+    const name = edgeType === "element" || edgeType === "hidden" || edgeType === "weak"
+      ? nameId
+      : snapshot.strings[nameId] ?? String(nameId);
+    if (Number.isInteger(toNode) && toNode >= 0 && toNode < snapshot.nodes.length / snapshot.nodeFieldCount) {
+      edges.push({ type, name, to_node: toNode, to: heapNode(snapshot, toNode) });
+    }
   }
   return edges;
+}
+
+function heapDominators(snapshot: HeapSnapshotData): Array<Record<string, unknown>> {
+  const count = snapshot.nodeFieldCount ? Math.floor(snapshot.nodes.length / snapshot.nodeFieldCount) : 0;
+  if (!count) return [];
+  const predecessors = Array.from({ length: count }, () => new Set<number>());
+  for (let source = 0; source < count; source += 1) {
+    for (const edge of heapEdges(snapshot, source)) predecessors[edge.to_node]?.add(source);
+  }
+  const root = 0;
+  const dominators = Array.from({ length: count }, (_, index) => new Set(index === root ? [root] : Array.from({ length: count }, (_, candidate) => candidate)));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let node = 0; node < count; node += 1) {
+      if (node === root) continue;
+      const parents = [...(predecessors[node] ?? [])].filter((parent) => parent !== node);
+      if (!parents.length) continue;
+      const next = new Set<number>(dominatorSetIntersection(parents.map((parent) => dominators[parent] ?? new Set<number>())));
+      next.add(node);
+      if (!sameNumberSet(next, dominators[node] ?? new Set<number>())) {
+        dominators[node] = next;
+        changed = true;
+      }
+    }
+  }
+  return dominators.map((set, node) => {
+    const strict = [...set].filter((candidate) => candidate !== node);
+    const immediate = strict.find((candidate) => strict.every((other) => other === candidate || !dominators[other]?.has(candidate))) ?? null;
+    return { ...heapNode(snapshot, node), dominator_count: set.size, immediate_dominator: immediate };
+  }).sort((left, right) => Number(right.self_size) - Number(left.self_size));
+}
+
+function dominatorSetIntersection(sets: Array<Set<number>>): number[] {
+  const first = sets[0];
+  if (!first) return [];
+  return [...first].filter((value) => sets.every((set) => set.has(value)));
+}
+
+function sameNumberSet(left: Set<number>, right: Set<number>): boolean {
+  return left.size === right.size && [...left].every((value) => right.has(value));
 }
 
 function heapRetainingPaths(snapshot: HeapSnapshotData, target: number, maxDepth: number, maxPaths: number): number[][] {
@@ -1183,21 +1303,31 @@ type LighthouseListener = (...args: unknown[]) => void;
 class LighthouseCdpSession {
   readonly #cdp: CdpClient;
   readonly #binding: BrowserSurfaceBinding;
+  readonly #sessionId: string | undefined;
+  readonly #targetInfo: Record<string, unknown>;
   readonly #listeners = new Map<string, Set<LighthouseListener>>();
   readonly #unsubscribe: () => void;
 
-  constructor(cdp: CdpClient, binding: BrowserSurfaceBinding) {
+  constructor(
+    cdp: CdpClient,
+    binding: BrowserSurfaceBinding,
+    sessionId?: string,
+    targetInfo?: Record<string, unknown>,
+  ) {
     this.#cdp = cdp;
     this.#binding = binding;
-    this.#unsubscribe = cdp.onEvent((eventBinding, method, params) => {
+    this.#sessionId = sessionId;
+    this.#targetInfo = targetInfo ?? { targetId: binding.target_id, type: "page" };
+    this.#unsubscribe = cdp.onEvent((eventBinding, method, params, eventSessionId) => {
       if (eventBinding.surface_id !== binding.surface_id || eventBinding.surface_revision !== binding.surface_revision) return;
-      for (const listener of this.#listeners.get("*") ?? []) listener(method, params);
-      for (const listener of this.#listeners.get(method) ?? []) listener(params);
+      if (eventBinding.navigation_revision !== binding.navigation_revision) return;
+      if (eventSessionId !== this.#sessionId) return;
+      this.emit(method, params);
     });
   }
 
   id(): string {
-    return "magi-lighthouse-" + this.#binding.target_id;
+    return this.#sessionId ?? "magi-lighthouse-" + this.#binding.target_id;
   }
 
   on(event: string, listener: LighthouseListener): this {
@@ -1212,15 +1342,32 @@ class LighthouseCdpSession {
     return this;
   }
 
+  private emit(event: string, params: Record<string, unknown>): void {
+    for (const listener of this.#listeners.get("*") ?? []) listener(event, params);
+    for (const listener of this.#listeners.get(event) ?? []) listener(params);
+    if (event === "Target.attachedToTarget") {
+      const sessionId = typeof params.sessionId === "string" ? params.sessionId : "";
+      const targetInfo = params.targetInfo && typeof params.targetInfo === "object"
+        ? params.targetInfo as Record<string, unknown>
+        : undefined;
+      if (sessionId) {
+        const child = new LighthouseCdpSession(this.#cdp, this.#binding, sessionId, targetInfo);
+        for (const listener of this.#listeners.get("sessionattached") ?? []) listener(child);
+      }
+    }
+  }
+
   async send(method: string, params: Record<string, unknown> = {}, options?: { timeout?: number }): Promise<unknown> {
     if (method === "Target.getTargetInfo") {
-      return { targetInfo: { targetId: this.#binding.target_id, type: "page", url: await this.pageUrl() } };
+      return { targetInfo: { ...this.#targetInfo, url: this.#targetInfo.url ?? await this.pageUrl() } };
     }
-    if (method === "Target.setAutoAttach" || method === "Runtime.runIfWaitingForDebugger") return {};
-    return this.#cdp.send(this.#binding, method, params, options?.timeout ?? 30_000);
+    return this.#cdp.send(this.#binding, method, params, options?.timeout ?? 30_000, this.#sessionId);
   }
 
   async detach(): Promise<void> {
+    if (this.#sessionId) {
+      await this.#cdp.send(this.#binding, "Target.detachFromTarget", { sessionId: this.#sessionId }).catch(() => undefined);
+    }
     this.#unsubscribe();
     this.#listeners.clear();
   }
@@ -1240,7 +1387,7 @@ class LighthouseCdpSession {
       expression: "location.href",
       returnByValue: true,
       awaitPromise: false,
-    });
+    }, 30_000, this.#sessionId);
     return typeof response?.result?.value === "string" ? response.result.value : "about:blank";
   }
 }

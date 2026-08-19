@@ -40,6 +40,7 @@ export type BrowserSurfaceEvent =
       binding: BrowserSurfaceBinding;
       method: string;
       params: Record<string, unknown>;
+      sessionId?: string;
     };
 
 export interface MaterializeSurfaceInput {
@@ -94,6 +95,7 @@ interface BrowserSurfaceRecord {
   viewportApplyPromise: Promise<void> | null;
   viewportApplyDirty: boolean;
   debuggerListenersInstalled: boolean;
+  cdpSessionIds: Set<string>;
   debuggerReadyPromise: Promise<void> | null;
   recoveryPromise: Promise<void> | null;
   loadPromise: Promise<void> | null;
@@ -117,6 +119,7 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
   "DOM.resolveNode",
   "DOM.pushNodeByPathToFrontend",
   "DOM.getOuterHTML",
+  "DOMDebugger.getEventListeners",
   "DOM.setFileInputFiles",
   "DOM.focus",
   "Accessibility.getFullAXTree",
@@ -124,8 +127,14 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
   "IO.read",
   "IO.close",
   "Network.loadNetworkResource",
+  "Network.setUserAgentOverride",
+  "Network.setBlockedURLs",
+  "Network.setCacheDisabled",
+  "Network.clearBrowserCache",
+  "Network.getResponseBody",
   "Target.getTargetInfo",
   "Target.setAutoAttach",
+  "Target.detachFromTarget",
   "Page.navigate",
   "Page.getNavigationHistory",
   "Page.navigateToHistoryEntry",
@@ -143,6 +152,7 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
   "Runtime.addBinding",
   "Runtime.removeBinding",
   "Runtime.terminateExecution",
+  "Runtime.releaseObject",
   "Profiler.enable",
   "Profiler.disable",
   "Profiler.start",
@@ -150,9 +160,17 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
   "Profiler.startPreciseCoverage",
   "Profiler.stopPreciseCoverage",
   "Profiler.takePreciseCoverage",
+  "Debugger.getScriptSource",
+  "Log.startViolationsReport",
+  "Log.stopViolationsReport",
+  "Animation.enable",
+  "Animation.disable",
+  "WebMCP.enable",
+  "WebMCP.disable",
   "Debugger.enable",
   "Debugger.disable",
   "Debugger.setAsyncCallStackDepth",
+  "Debugger.resume",
   "Debugger.setSkipAllPauses",
   "Log.enable",
   "Log.disable",
@@ -209,6 +227,7 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
   "Network.enable",
   "Tracing.end",
   "Tracing.start",
+  "Tracing.recordClockSyncMarker",
 ]);
 
 const DEFAULT_CDP_COMMAND_TIMEOUT_MS = 15_000;
@@ -348,6 +367,7 @@ export class BrowserSurfaceManager {
       viewportApplyPromise: null,
       viewportApplyDirty: false,
       debuggerListenersInstalled: false,
+      cdpSessionIds: new Set(),
       debuggerReadyPromise: null,
       recoveryPromise: null,
       loadPromise: null,
@@ -488,6 +508,7 @@ export class BrowserSurfaceManager {
     binding: BrowserSurfaceBinding,
     method: string,
     params: Record<string, unknown> = {},
+    sessionId?: string,
   ): Promise<unknown> {
     if (!ALLOWED_WORKER_CDP_METHODS.has(method)) {
       throw new Error(`browser_cdp_method_denied:${method}`);
@@ -495,6 +516,9 @@ export class BrowserSurfaceManager {
     const record = this.requireRecord(binding.surface_id);
     await this.waitForDebugger(record);
     const contents = this.recordForBinding(binding);
+    if (sessionId && !record.cdpSessionIds.has(sessionId)) {
+      throw staleSurfaceError("browser_cdp_session_stale");
+    }
     if (method === "Page.captureScreenshot" && !this.isRenderable(record)) {
       throw browserSurfaceError("browser_surface_no_content_slot");
     }
@@ -511,6 +535,7 @@ export class BrowserSurfaceManager {
         method === "Page.captureScreenshot"
           ? SCREENSHOT_CDP_COMMAND_TIMEOUT_MS
           : DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        sessionId,
       );
       if (injectsInput && record.agentControlled) {
         const input = params as { type?: string; x?: number; y?: number };
@@ -1000,13 +1025,21 @@ export class BrowserSurfaceManager {
     if (!debuggerApi.isAttached()) debuggerApi.attach("1.3");
     if (record.debuggerListenersInstalled) return;
     record.debuggerListenersInstalled = true;
-    debuggerApi.on("message", (_event, method, params) => {
+    debuggerApi.on("message", (_event, method, params, sessionId) => {
       if (record.closed) return;
+      const eventParams = (params ?? {}) as Record<string, unknown>;
+      if (method === "Target.attachedToTarget" && typeof eventParams.sessionId === "string") {
+        record.cdpSessionIds.add(eventParams.sessionId);
+      }
+      if (method === "Target.detachedFromTarget" && typeof eventParams.sessionId === "string") {
+        record.cdpSessionIds.delete(eventParams.sessionId);
+      }
       this.#onEvent({
         type: "cdp_event",
         binding: this.binding(record),
         method,
-        params: (params ?? {}) as Record<string, unknown>,
+        params: eventParams,
+        ...(sessionId ? { sessionId } : {}),
       });
     });
     debuggerApi.on("detach", (_event, reason) => {
@@ -1036,6 +1069,7 @@ export class BrowserSurfaceManager {
     const reconnect = (async () => {
       if (record.closed || record.contents.isDestroyed()) return;
       if (!record.contents.debugger.isAttached()) record.contents.debugger.attach("1.3");
+      record.cdpSessionIds.clear();
       record.cursorExecutionContextId = null;
       if (record.primary) this.#onEvent({ type: "primary_changed", binding: this.binding(record) });
       void reason;
@@ -1391,8 +1425,9 @@ async function sendCdpCommandWithTimeout(
   method: string,
   params: Record<string, unknown>,
   timeoutMs: number,
+  sessionId?: string,
 ): Promise<unknown> {
-  return withTimeout(contents.debugger.sendCommand(method, params), timeoutMs, method);
+  return withTimeout(contents.debugger.sendCommand(method, params, sessionId), timeoutMs, method);
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, method: string): Promise<T> {

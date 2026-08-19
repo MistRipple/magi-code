@@ -26,6 +26,7 @@ export class CdpClient {
     binding: BrowserSurfaceBinding,
     method: string,
     params: Record<string, unknown>,
+    sessionId?: string,
   ) => void>();
 
   constructor(port: ParentPort) {
@@ -38,6 +39,7 @@ export class CdpClient {
     method: string,
     params: Record<string, unknown> = {},
     timeoutMs = 30_000,
+    sessionId?: string,
   ): Promise<T> {
     const requestId = `cdp-${randomUUID()}`;
     const request: WorkerCdpRequest = {
@@ -46,6 +48,7 @@ export class CdpClient {
       binding,
       method,
       params,
+      ...(sessionId ? { session_id: sessionId } : {}),
     };
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -67,6 +70,7 @@ export class CdpClient {
     binding: BrowserSurfaceBinding,
     method: string,
     params: Record<string, unknown>,
+    sessionId?: string,
   ) => void): () => void {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
@@ -98,7 +102,7 @@ export class CdpClient {
     }
     if (message.type === "cdp_event") {
       for (const listener of this.#listeners) {
-        listener(message.binding, message.method, message.params);
+        listener(message.binding, message.method, message.params, message.session_id);
       }
     }
   }

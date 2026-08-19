@@ -145,6 +145,7 @@ export class AutomationWorker {
       binding: event.binding,
       method: event.method,
       params: event.params,
+      ...(event.sessionId ? { session_id: event.sessionId } : {}),
     };
     this.#process.postMessage(message);
   }
@@ -225,7 +226,12 @@ export class AutomationWorker {
     }
     const child = this.#process;
     if (!child || !this.#ready) return;
-    void this.#surfaceManager.sendCdp(message.binding, message.method, message.params ?? {})
+    void this.#surfaceManager.sendCdp(
+      message.binding,
+      message.method,
+      message.params ?? {},
+      message.session_id,
+    )
       .then((result) => {
         const response: MainToWorkerMessage = {
           type: "cdp_response",
