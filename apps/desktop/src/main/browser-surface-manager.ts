@@ -566,13 +566,36 @@ export class BrowserSurfaceManager {
     await this.waitForDebugger(record);
     const contents = this.recordForBinding(binding);
     switch (navigation.action) {
-      case "url":
-        await this.loadPage(
-          this.requireRecord(binding.surface_id),
-          normalizeNavigableUrl(navigation.url),
-          navigation.timeout_ms,
-        );
+      case "url": {
+        let initScriptId: string | null = null;
+        if (navigation.init_script?.trim()) {
+          const installed = await sendCdpCommandWithTimeout(
+            contents,
+            "Page.addScriptToEvaluateOnNewDocument",
+            { source: navigation.init_script },
+            DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+          ) as { identifier?: string };
+          initScriptId = typeof installed.identifier === "string" ? installed.identifier : null;
+        }
+        try {
+          await this.loadPage(
+            this.requireRecord(binding.surface_id),
+            normalizeNavigableUrl(navigation.url),
+            navigation.timeout_ms,
+            navigation.handle_before_unload,
+          );
+        } finally {
+          if (initScriptId) {
+            await sendCdpCommandWithTimeout(
+              contents,
+              "Page.removeScriptToEvaluateOnNewDocument",
+              { identifier: initScriptId },
+              DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+            ).catch(() => undefined);
+          }
+        }
         break;
+      }
       case "back":
         if (contents.navigationHistory.canGoBack()) {
         await this.waitForNavigation(
@@ -596,6 +619,7 @@ export class BrowserSurfaceManager {
           contents,
           navigation.ignore_cache === true,
           navigation.timeout_ms,
+          navigation.handle_before_unload,
         );
         break;
     }
@@ -724,6 +748,7 @@ export class BrowserSurfaceManager {
     record: BrowserSurfaceRecord,
     url: string,
     timeoutMs = DEFAULT_NAVIGATION_TIMEOUT_MS,
+    handleBeforeUnload?: "accept" | "dismiss",
   ): Promise<void> {
     if (record.closed || record.contents.isDestroyed()) {
       throw staleSurfaceError("browser_surface_not_found");
@@ -743,6 +768,10 @@ export class BrowserSurfaceManager {
         // 通过 operationId 成为唯一有效导航。
       }
     }
+    const allowBeforeUnload = handleBeforeUnload === "accept"
+      ? (event: Electron.Event) => event.preventDefault()
+      : null;
+    if (allowBeforeUnload) record.contents.on("will-prevent-unload", allowBeforeUnload);
     try {
       await withNavigationTimeout(
         record.contents.loadURL(url),
@@ -768,6 +797,8 @@ export class BrowserSurfaceManager {
         }
       }
       throw error;
+    } finally {
+      if (allowBeforeUnload) record.contents.off("will-prevent-unload", allowBeforeUnload);
     }
     if (record.closed) throw staleSurfaceError("browser_surface_not_found");
     if (record.navigationOperationId !== operationId) {
@@ -1511,6 +1542,7 @@ async function reloadAndWait(
   contents: WebContents,
   ignoreCache: boolean,
   timeoutMs?: number,
+  handleBeforeUnload?: "accept" | "dismiss",
 ): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -1525,6 +1557,7 @@ async function reloadAndWait(
       clearTimeout(timer);
       contents.off("did-stop-loading", done);
       contents.off("did-fail-load", failed);
+      if (allowBeforeUnload) contents.off("will-prevent-unload", allowBeforeUnload);
     };
     const finish = () => {
       if (settled) return;
@@ -1532,6 +1565,9 @@ async function reloadAndWait(
       cleanup();
       resolve();
     };
+    const allowBeforeUnload = handleBeforeUnload === "accept"
+      ? (event: Electron.Event) => event.preventDefault()
+      : null;
     const failed = (_event: Electron.Event, errorCode: number, errorDescription: string, _validatedURL: string, isMainFrame: boolean) => {
       if (!isMainFrame || errorCode === -3) return;
       if (settled) return;
@@ -1540,6 +1576,7 @@ async function reloadAndWait(
       reject(new Error(`browser_navigation_failed:${errorCode}:${errorDescription}`));
     };
     const done = () => finish();
+    if (allowBeforeUnload) contents.on("will-prevent-unload", allowBeforeUnload);
     contents.once("did-stop-loading", done);
     contents.once("did-fail-load", failed);
     if (ignoreCache) contents.reloadIgnoringCache();

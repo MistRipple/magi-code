@@ -24,6 +24,8 @@ interface PageRuntimeState {
   heapSnapshotChunks: string[];
   traceActive: boolean;
   traceEvents: Array<Record<string, unknown>>;
+  traceCompletionPromise: Promise<void> | null;
+  traceCompletionResolve: (() => void) | null;
   profilerActive: boolean;
   coverageActive: boolean;
   heapSnapshot: HeapSnapshotData | null;
@@ -135,7 +137,12 @@ export class BrowserAutomationRuntime {
         await this.press(binding, command.payload.key);
         return empty();
       case "scroll":
-        await this.scroll(binding, command.payload.delta_x, command.payload.delta_y);
+        await this.scroll(
+          binding,
+          command.payload.target ?? null,
+          command.payload.delta_x,
+          command.payload.delta_y,
+        );
         return empty();
       case "screenshot":
         return this.screenshot(binding, command.payload);
@@ -170,22 +177,30 @@ export class BrowserAutomationRuntime {
     ) {
       return current;
     }
+    const navigationChanged = Boolean(
+      current
+      && current.binding.surface_revision === binding.surface_revision
+      && current.binding.target_id === binding.target_id
+      && current.binding.navigation_revision !== binding.navigation_revision,
+    );
     const next: PageRuntimeState = {
       binding,
       executionContextId: null,
-      console: current?.console ?? [],
-      nextConsoleId: current?.nextConsoleId ?? 1,
-      network: current?.network ?? [],
-      nextNetworkId: current?.nextNetworkId ?? 1,
-      dialog: current?.dialog ?? null,
+      console: navigationChanged ? [] : current?.console ?? [],
+      nextConsoleId: navigationChanged ? 1 : current?.nextConsoleId ?? 1,
+      network: navigationChanged ? [] : current?.network ?? [],
+      nextNetworkId: navigationChanged ? 1 : current?.nextNetworkId ?? 1,
+      dialog: null,
       newDocumentScripts: current?.newDocumentScripts ?? new Set(),
-      heapSnapshotChunks: current?.heapSnapshotChunks ?? [],
+      heapSnapshotChunks: [],
       traceActive: current?.traceActive ?? false,
-      traceEvents: current?.traceEvents ?? [],
+      traceEvents: navigationChanged ? [] : current?.traceEvents ?? [],
+      traceCompletionPromise: null,
+      traceCompletionResolve: null,
       profilerActive: current?.profilerActive ?? false,
       coverageActive: current?.coverageActive ?? false,
-      heapSnapshot: current?.heapSnapshot ?? null,
-      previousHeapSnapshot: current?.previousHeapSnapshot ?? null,
+      heapSnapshot: null,
+      previousHeapSnapshot: null,
       cdpDomainsReady: false,
       cdpDomainsPromise: null,
     };
@@ -341,7 +356,11 @@ export class BrowserAutomationRuntime {
     try {
       const described = await this.#cdp.send<{ node?: { nodeId?: number } }>(binding, "DOM.describeNode", { backendNodeId: backendDomNodeId });
       if (!described.node?.nodeId) return null;
-      const resolved = await this.#cdp.send<{ object?: { objectId?: string } }>(binding, "DOM.resolveNode", { nodeId: described.node.nodeId });
+      const executionContextId = await this.context(binding);
+      const resolved = await this.#cdp.send<{ object?: { objectId?: string } }>(binding, "DOM.resolveNode", {
+        nodeId: described.node.nodeId,
+        executionContextId,
+      });
       const objectId = resolved.object?.objectId;
       if (!objectId) return null;
       const result = await this.#cdp.send<{ result?: { value?: unknown } }>(binding, "Runtime.callFunctionOn", {
@@ -432,12 +451,18 @@ export class BrowserAutomationRuntime {
     });
   }
 
-  private async scroll(binding: BrowserSurfaceBinding, deltaX: number, deltaY: number): Promise<void> {
+  private async scroll(
+    binding: BrowserSurfaceBinding,
+    target: BrowserSnapshotTarget | null,
+    deltaX: number,
+    deltaY: number,
+  ): Promise<void> {
     const viewport = await this.pageViewport(binding);
+    const point = target ? await this.target(binding, target) : null;
     await this.#cdp.send(binding, "Input.dispatchMouseEvent", {
       type: "mouseWheel",
-      x: viewport.width / 2,
-      y: viewport.height / 2,
+      x: point?.x ?? viewport.width / 2,
+      y: point?.y ?? viewport.height / 2,
       deltaX,
       deltaY,
     });
@@ -533,10 +558,15 @@ export class BrowserAutomationRuntime {
       case "click_at": {
         const x = finiteNumber(args.x, "x");
         const y = finiteNumber(args.y, "y");
+        const doubleClick = args.double_click === true;
         await this.pointer(binding, "mouseMoved", x, y);
-        await this.pointer(binding, "mousePressed", x, y, { button: "left", buttons: 1, clickCount: 1 });
-        await this.pointer(binding, "mouseReleased", x, y, { button: "left", buttons: 0, clickCount: 1 });
-        return { clicked: true };
+        const clicks = doubleClick ? 2 : 1;
+        for (let index = 0; index < clicks; index += 1) {
+          const clickCount = doubleClick ? index + 1 : 1;
+          await this.pointer(binding, "mousePressed", x, y, { button: "left", buttons: 1, clickCount });
+          await this.pointer(binding, "mouseReleased", x, y, { button: "left", buttons: 0, clickCount });
+        }
+        return { clicked: true, double_click: doubleClick };
       }
       case "drag": {
         const source = await this.target(binding, snapshotTarget(args, "source"));
@@ -559,13 +589,19 @@ export class BrowserAutomationRuntime {
       case "console": {
         const page = this.page(binding);
         if (args.action === "clear") page.console.length = 0;
+        const levels = Array.isArray(args.levels)
+          ? new Set(args.levels.filter((level): level is string => typeof level === "string").map((level) => level.toLowerCase()))
+          : null;
+        const entries = levels && levels.size > 0
+          ? page.console.filter((entry) => levels.has(String(entry.type ?? entry.level ?? "").toLowerCase()))
+          : page.console;
         if (args.action === "get") {
           const messageId = Number(args.message_id);
           return {
-            entry: page.console.find((entry) => entry.id === messageId || entry.messageId === messageId) ?? null,
+            entry: entries.find((entry) => entry.id === messageId || entry.messageId === messageId) ?? null,
           };
         }
-        return { entries: page.console.slice(-safeInteger(args.page_size ?? args.limit, 100)) };
+        return { entries: entries.slice(-safeInteger(args.page_size ?? args.limit, 100)) };
       }
       case "network":
         return this.network(binding, args);
@@ -576,6 +612,13 @@ export class BrowserAutomationRuntime {
         return this.emulate(binding, args);
       case "dialog":
         if (args.action === "list") return { dialog: this.page(binding).dialog };
+        if (args.action === "clear") {
+          this.page(binding).dialog = null;
+          return { cleared: true };
+        }
+        if (args.action !== "accept" && args.action !== "dismiss") {
+          throw protocolFailure("browser_dialog_action_invalid", "action must be list, clear, accept, or dismiss");
+        }
         await this.#cdp.send(binding, "Page.handleJavaScriptDialog", {
           accept: args.action !== "dismiss",
           ...(typeof args.prompt_text === "string" ? { promptText: args.prompt_text } : {}),
@@ -703,15 +746,31 @@ export class BrowserAutomationRuntime {
 
   private async waitFor(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
     const selector = typeof args.selector === "string" ? args.selector.trim() : "";
-    const text = typeof args.text === "string" ? args.text : "";
+    const textValues = [
+      ...(typeof args.text === "string" ? [args.text] : Array.isArray(args.text) ? args.text : []),
+      ...(Array.isArray(args.texts) ? args.texts : []),
+    ].filter((value): value is string => typeof value === "string" && value.length > 0);
+    const url = typeof args.url === "string" ? args.url.trim() : "";
+    if (!selector && textValues.length === 0 && !url) {
+      throw protocolFailure("browser_wait_invalid", "selector, text, texts, or url is required");
+    }
     const timeoutMs = Math.min(30_000, Math.max(0, safeInteger(args.timeout_ms, 5_000)));
     const deadline = Date.now() + timeoutMs;
     do {
       const found = await this.evaluate<unknown>(
         binding,
-        selector
-          ? `globalThis.__magiBrowserAutomation.query(${JSON.stringify(selector)})`
-          : `document.body?.innerText?.includes(${JSON.stringify(text)}) || false`,
+        `(() => {
+          const selector = ${JSON.stringify(selector)};
+          const texts = ${JSON.stringify(textValues)};
+          const url = ${JSON.stringify(url)};
+          if (selector && !globalThis.__magiBrowserAutomation.query(selector)) return false;
+          if (url && !location.href.includes(url)) return false;
+          if (texts.length > 0) {
+            const body = document.body?.innerText || '';
+            if (!texts.some((text) => body.includes(text))) return false;
+          }
+          return true;
+        })()`,
       );
       if (found) return { matched: true, value: found };
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -734,6 +793,14 @@ export class BrowserAutomationRuntime {
 
   private async network(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
     const page = this.page(binding);
+    const resourceTypes = Array.isArray(args.resource_types)
+      ? new Set(args.resource_types.filter((type): type is string => typeof type === "string").map((type) => type.toLowerCase()))
+      : null;
+    const matchesResourceType = (entry: Record<string, unknown>): boolean => (
+      !resourceTypes
+      || resourceTypes.size === 0
+      || resourceTypes.has(String(entry.resource_type ?? entry.resourceType ?? "other").toLowerCase())
+    );
     if (args.action === "clear") {
       page.network.length = 0;
       return { entries: [] };
@@ -741,14 +808,14 @@ export class BrowserAutomationRuntime {
     if (args.action === "get") {
       const requestId = String(args.request_id ?? "").trim();
       if (!requestId) throw protocolFailure("browser_network_request_id_required", "request_id is required");
-      const entry = page.network.find((candidate) => String(candidate.requestId ?? candidate.id) === requestId) ?? null;
+      const entry = page.network.find((candidate) => matchesResourceType(candidate) && String(candidate.requestId ?? candidate.id) === requestId) ?? null;
       if (args.include_body) {
         const body = await this.#cdp.send(binding, "Network.getResponseBody", { requestId });
         return { entry, body };
       }
       return { entry };
     }
-    const entries = page.network.slice(-safeInteger(args.page_size ?? args.limit, 100));
+    const entries = page.network.filter(matchesResourceType).slice(-safeInteger(args.page_size ?? args.limit, 100));
     if (args.action === "failed") {
       return { entries: entries.filter((entry) => entry.event_type === "failed") };
     }
@@ -865,6 +932,9 @@ export class BrowserAutomationRuntime {
     if (action === "start") {
       page.traceEvents = [];
       page.traceActive = true;
+      page.traceCompletionPromise = new Promise<void>((resolve) => {
+        page.traceCompletionResolve = resolve;
+      });
       await this.#cdp.send(binding, "Tracing.start", {
         transferMode: "ReportEvents",
         categories: "-*,devtools.timeline,v8.execute,blink.user_timing,loading",
@@ -872,8 +942,14 @@ export class BrowserAutomationRuntime {
       return { started: true };
     }
     if (action === "stop") {
-      if (page.traceActive) await this.#cdp.send(binding, "Tracing.end");
+      if (page.traceActive) {
+        const completion = page.traceCompletionPromise;
+        await this.#cdp.send(binding, "Tracing.end");
+        if (completion) await withTraceTimeout(completion);
+      }
       page.traceActive = false;
+      page.traceCompletionPromise = null;
+      page.traceCompletionResolve = null;
       return { stopped: true, events: page.traceEvents };
     }
     if (action === "profile_start") {
@@ -942,12 +1018,38 @@ export class BrowserAutomationRuntime {
   }
 
   private async webmcp(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
-    if (args.action !== "execute") {
-      return this.evaluate(binding, "({ available: typeof navigator.modelContext !== 'undefined' })");
+    const action = String(args.action ?? "list");
+    const contextExpression = "document.modelContext || navigator.modelContext";
+    if (action !== "execute") {
+      return this.evaluate(binding, `(() => {
+        const context = ${contextExpression};
+        if (!context || typeof context.getTools !== 'function') return { available: false, tools: [] };
+        return Promise.resolve(context.getTools()).then((tools) => ({
+          available: true,
+          tools: (Array.isArray(tools) ? tools : []).map((tool) => ({
+            name: String(tool.name || ''),
+            description: String(tool.description || ''),
+            input_schema: typeof tool.inputSchema === 'string' ? (() => { try { return JSON.parse(tool.inputSchema); } catch { return tool.inputSchema; } })() : tool.inputSchema || {},
+            annotations: tool.annotations || null,
+            origin: tool.origin || location.origin,
+          })),
+        }));
+      })()`);
     }
-    const expression = String(args.expression ?? "").trim();
-    if (!expression) throw protocolFailure("browser_webmcp_expression_required", "expression is required");
-    return this.evaluate(binding, `globalThis.__magiBrowserAutomation.evaluate(${JSON.stringify(expression)})`);
+    const toolName = typeof args.tool_name === "string" ? args.tool_name.trim() : "";
+    if (!toolName) throw protocolFailure("browser_webmcp_tool_name_required", "tool_name is required");
+    const input = args.input && typeof args.input === "object" ? args.input : {};
+    return this.evaluate(binding, `(() => {
+      const context = ${contextExpression};
+      if (!context || typeof context.getTools !== 'function' || typeof context.executeTool !== 'function') {
+        throw new Error('browser_webmcp_unavailable');
+      }
+      return Promise.resolve(context.getTools()).then((tools) => {
+        const tool = (Array.isArray(tools) ? tools : []).find((candidate) => candidate && candidate.name === ${JSON.stringify(toolName)});
+        if (!tool) throw new Error('browser_webmcp_tool_not_found');
+        return context.executeTool(tool, ${JSON.stringify(input)});
+      });
+    })()`);
   }
 
   private async newDocumentScript(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
@@ -1003,6 +1105,13 @@ export class BrowserAutomationRuntime {
     const page = this.page(binding);
     if (method === "Runtime.executionContextsCleared") {
       page.executionContextId = null;
+      page.console.length = 0;
+      page.network.length = 0;
+      page.dialog = null;
+      page.heapSnapshotChunks = [];
+      page.heapSnapshot = null;
+      page.previousHeapSnapshot = null;
+      page.traceEvents = [];
       return;
     }
     if (method === "Runtime.consoleAPICalled") {
@@ -1036,7 +1145,12 @@ export class BrowserAutomationRuntime {
       page.traceEvents.push(...params.value.filter((value): value is Record<string, unknown> => Boolean(value && typeof value === "object")));
       if (page.traceEvents.length > 10_000) page.traceEvents.splice(0, page.traceEvents.length - 10_000);
     }
-    if (!sessionId && method === "Tracing.tracingComplete") page.traceActive = false;
+    if (!sessionId && method === "Tracing.tracingComplete") {
+      page.traceActive = false;
+      page.traceCompletionResolve?.();
+      page.traceCompletionPromise = null;
+      page.traceCompletionResolve = null;
+    }
     if (!sessionId && method === "Page.javascriptDialogOpening") page.dialog = params;
     if (!sessionId && method === "Page.javascriptDialogClosed") page.dialog = null;
     if (!sessionId && method === "HeapProfiler.addHeapSnapshotChunk") {
@@ -1071,6 +1185,21 @@ function protocolFailure(code: string, message: string): Error {
   const error = new Error(`${code}:${message}`);
   error.name = "BrowserAutomationError";
   return error;
+}
+
+async function withTraceTimeout(promise: Promise<void>): Promise<void> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    await Promise.race([
+      promise,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 10_000);
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function safeInteger(value: unknown, fallback: number): number {
@@ -1231,42 +1360,141 @@ function heapEdges(snapshot: HeapSnapshotData, nodeIndex: number): HeapEdgeRecor
 function heapDominators(snapshot: HeapSnapshotData): Array<Record<string, unknown>> {
   const count = snapshot.nodeFieldCount ? Math.floor(snapshot.nodes.length / snapshot.nodeFieldCount) : 0;
   if (!count) return [];
-  const predecessors = Array.from({ length: count }, () => new Set<number>());
+  const edgeTypeIndex = snapshot.edgeFieldIndex.type ?? 0;
+  const toNodeIndex = snapshot.edgeFieldIndex.to_node ?? 2;
+  const edgeCount = snapshot.edgeFieldCount ? Math.floor(snapshot.edges.length / snapshot.edgeFieldCount) : 0;
+  const outgoingHead = new Int32Array(count);
+  const predecessorHead = new Int32Array(count);
+  outgoingHead.fill(-1);
+  predecessorHead.fill(-1);
+  const outgoingTo = new Int32Array(edgeCount);
+  const outgoingNext = new Int32Array(edgeCount);
+  const predecessorFrom = new Int32Array(edgeCount);
+  const predecessorNext = new Int32Array(edgeCount);
+  let graphEdgeCount = 0;
   for (let source = 0; source < count; source += 1) {
-    for (const edge of heapEdges(snapshot, source)) predecessors[edge.to_node]?.add(source);
-  }
-  const root = 0;
-  const dominators = Array.from({ length: count }, (_, index) => new Set(index === root ? [root] : Array.from({ length: count }, (_, candidate) => candidate)));
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (let node = 0; node < count; node += 1) {
-      if (node === root) continue;
-      const parents = [...(predecessors[node] ?? [])].filter((parent) => parent !== node);
-      if (!parents.length) continue;
-      const next = new Set<number>(dominatorSetIntersection(parents.map((parent) => dominators[parent] ?? new Set<number>())));
-      next.add(node);
-      if (!sameNumberSet(next, dominators[node] ?? new Set<number>())) {
-        dominators[node] = next;
-        changed = true;
-      }
+    const nodeOffset = source * snapshot.nodeFieldCount;
+    const edgeStart = snapshot.edgeStarts[source] ?? 0;
+    const sourceEdgeCount = Number(snapshot.nodes[nodeOffset + (snapshot.nodeFieldIndex.edge_count ?? 4)] ?? 0);
+    for (let offset = 0; offset < sourceEdgeCount; offset += 1) {
+      const edgeOffset = edgeStart + offset * snapshot.edgeFieldCount;
+      if (edgeOffset < 0 || edgeOffset + snapshot.edgeFieldCount > snapshot.edges.length) break;
+      const type = snapshot.edgeTypes[Number(snapshot.edges[edgeOffset + edgeTypeIndex] ?? 0)] ?? "unknown";
+      if (type === "weak") continue;
+      const target = Number(snapshot.edges[edgeOffset + toNodeIndex] ?? -1) / snapshot.nodeFieldCount;
+      if (!Number.isInteger(target) || target < 0 || target >= count) continue;
+      if (graphEdgeCount >= edgeCount) break;
+      outgoingTo[graphEdgeCount] = target;
+      outgoingNext[graphEdgeCount] = outgoingHead[source] ?? -1;
+      outgoingHead[source] = graphEdgeCount;
+      predecessorFrom[graphEdgeCount] = source;
+      predecessorNext[graphEdgeCount] = predecessorHead[target] ?? -1;
+      predecessorHead[target] = graphEdgeCount;
+      graphEdgeCount += 1;
     }
   }
-  return dominators.map((set, node) => {
-    const strict = [...set].filter((candidate) => candidate !== node);
-    const immediate = strict.find((candidate) => strict.every((other) => other === candidate || !dominators[other]?.has(candidate))) ?? null;
-    return { ...heapNode(snapshot, node), dominator_count: set.size, immediate_dominator: immediate };
-  }).sort((left, right) => Number(right.self_size) - Number(left.self_size));
-}
 
-function dominatorSetIntersection(sets: Array<Set<number>>): number[] {
-  const first = sets[0];
-  if (!first) return [];
-  return [...first].filter((value) => sets.every((set) => set.has(value)));
-}
+  // Lengauer-Tarjan：只遍历 root 可达的强引用图，避免每个节点分配一个
+  // 包含全量节点的 Set。堆快照通常包含数十万节点，这里必须保持 O(N+E)
+  // 的内存上界，否则 dominators 本身会耗尽 Worker 内存。
+  const root = 0;
+  const parent = new Int32Array(count);
+  const semi = new Int32Array(count);
+  const label = new Int32Array(count);
+  const ancestor = new Int32Array(count);
+  const vertex = new Int32Array(count + 1);
+  parent.fill(-1);
+  ancestor.fill(-1);
+  let dfsCount = 0;
+  const visit = (node: number): void => {
+    dfsCount += 1;
+    semi[node] = dfsCount;
+    vertex[dfsCount] = node;
+    label[node] = node;
+  };
+  visit(root);
+  const stackNodes: number[] = [root];
+  const stackEdges: number[] = [outgoingHead[root] ?? -1];
+  while (stackNodes.length) {
+    const frame = stackNodes.length - 1;
+    const source = stackNodes[frame]!;
+    const edge = stackEdges[frame]!;
+    if (edge < 0) {
+      stackNodes.pop();
+      stackEdges.pop();
+      continue;
+    }
+    stackEdges[frame] = outgoingNext[edge] ?? -1;
+    const target = outgoingTo[edge]!;
+    if (semi[target] !== 0) continue;
+    parent[target] = source;
+    visit(target);
+    stackNodes.push(target);
+    stackEdges.push(outgoingHead[target] ?? -1);
+  }
 
-function sameNumberSet(left: Set<number>, right: Set<number>): boolean {
-  return left.size === right.size && [...left].every((value) => right.has(value));
+  const idom = new Int32Array(count);
+  const bucketHead = new Int32Array(count);
+  const bucketNext = new Int32Array(count);
+  const dominatorCount = new Int32Array(count);
+  idom.fill(-1);
+  bucketHead.fill(-1);
+  bucketNext.fill(-1);
+
+  const compress = (node: number): void => {
+    const parentNode = ancestor[node] ?? -1;
+    if (parentNode < 0) return;
+    const grandparent = ancestor[parentNode] ?? -1;
+    if (grandparent >= 0) {
+      compress(parentNode);
+      const parentLabel = label[parentNode]!;
+      const nodeLabel = label[node]!;
+      if (semi[parentLabel]! < semi[nodeLabel]!) label[node] = parentLabel;
+      ancestor[node] = grandparent;
+    }
+  };
+  const evaluateNode = (node: number): number => {
+    if ((ancestor[node] ?? -1) < 0) return label[node]!;
+    compress(node);
+    return label[node]!;
+  };
+
+  for (let order = dfsCount; order >= 2; order -= 1) {
+    const node = vertex[order]!;
+    for (let edge = predecessorHead[node] ?? -1; edge >= 0; edge = predecessorNext[edge] ?? -1) {
+      const predecessor = predecessorFrom[edge]!;
+      if (semi[predecessor] === 0) continue;
+      const candidate = evaluateNode(predecessor);
+      if (semi[candidate]! < semi[node]!) semi[node] = semi[candidate]!;
+    }
+    const bucketNode = vertex[semi[node]!];
+    bucketNext[node] = bucketHead[bucketNode!] ?? -1;
+    bucketHead[bucketNode!] = node;
+    const parentNode = parent[node]!;
+    ancestor[node] = parentNode;
+    for (let bucket = bucketHead[parentNode] ?? -1; bucket >= 0; bucket = bucketNext[bucket] ?? -1) {
+      const candidate = evaluateNode(bucket);
+      idom[bucket] = semi[candidate]! < semi[bucket]! ? candidate : parentNode;
+    }
+    bucketHead[parentNode] = -1;
+  }
+  for (let order = 2; order <= dfsCount; order += 1) {
+    const node = vertex[order]!;
+    if (idom[node] !== vertex[semi[node]!]) idom[node] = idom[idom[node]!] ?? -1;
+  }
+
+  dominatorCount[root] = 1;
+  const output: Array<Record<string, unknown>> = [];
+  for (let order = 1; order <= dfsCount; order += 1) {
+    const node = vertex[order]!;
+    if (node !== root) dominatorCount[node] = dominatorCount[idom[node]!]! + 1;
+    output.push({
+      ...heapNode(snapshot, node),
+      dominator_count: dominatorCount[node],
+      immediate_dominator: idom[node]! < 0 ? null : idom[node]!,
+    });
+  }
+  return output.sort((left, right) => Number(right.self_size) - Number(left.self_size));
 }
 
 function heapRetainingPaths(snapshot: HeapSnapshotData, target: number, maxDepth: number, maxPaths: number): number[][] {
@@ -1306,6 +1534,7 @@ class LighthouseCdpSession {
   readonly #sessionId: string | undefined;
   readonly #targetInfo: Record<string, unknown>;
   readonly #listeners = new Map<string, Set<LighthouseListener>>();
+  readonly #children = new Set<LighthouseCdpSession>();
   readonly #unsubscribe: () => void;
 
   constructor(
@@ -1352,6 +1581,7 @@ class LighthouseCdpSession {
         : undefined;
       if (sessionId) {
         const child = new LighthouseCdpSession(this.#cdp, this.#binding, sessionId, targetInfo);
+        this.#children.add(child);
         for (const listener of this.#listeners.get("sessionattached") ?? []) listener(child);
       }
     }
@@ -1365,11 +1595,25 @@ class LighthouseCdpSession {
   }
 
   async detach(): Promise<void> {
+    await Promise.all([...this.#children].map((child) => child.detach()));
+    this.#children.clear();
     if (this.#sessionId) {
+      // Puppeteer 的 CDPSession.detach 通过根连接发送 Target.detachFromTarget；
+      // 子 session 本身不能再把该命令路由给自己，否则 OOPIF/Worker 会残留。
       await this.#cdp.send(this.#binding, "Target.detachFromTarget", { sessionId: this.#sessionId }).catch(() => undefined);
+    } else {
+      await this.#cdp.send(this.#binding, "Target.setAutoAttach", {
+        autoAttach: false,
+        flatten: true,
+        waitForDebuggerOnStart: false,
+      }).catch(() => undefined);
     }
     this.#unsubscribe();
     this.#listeners.clear();
+  }
+
+  dispose(): Promise<void> {
+    return this.detach();
   }
 
   setTargetInfo(_targetInfo: unknown): void {}
@@ -1398,12 +1642,12 @@ function createLighthousePage(cdp: CdpClient, binding: BrowserSurfaceBinding, pa
 } {
   return {
     async url() {
-      const session = new LighthouseCdpSession(cdp, binding);
-      try {
-        return await session.pageUrl();
-      } finally {
-        await session.detach();
-      }
+      const response = await cdp.send<{ result?: { value?: unknown } }>(binding, "Runtime.evaluate", {
+        expression: "location.href",
+        returnByValue: true,
+        awaitPromise: false,
+      }, 30_000);
+      return typeof response?.result?.value === "string" ? response.result.value : "about:blank";
     },
     target() {
       return {

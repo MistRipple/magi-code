@@ -1450,7 +1450,7 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "tab_id": { "type": "string" },
-                    "text": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "text": { "type": ["string", "array"], "items": { "type": "string" }, "minItems": 1 },
                     "texts": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
                     "selector": { "type": "string" },
                     "url": { "type": "string" },
@@ -1546,8 +1546,8 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "tab_id": { "type": "string" },
-                    "action": { "type": "string", "enum": ["list", "get", "clear"] },
-                    "request_id": { "type": "integer", "minimum": 1 },
+                    "action": { "type": "string", "enum": ["list", "get", "failed", "clear"] },
+                    "request_id": { "type": ["string", "integer"], "description": "Network.requestId；可传字符串或数字" },
                     "resource_types": { "type": "array", "items": { "type": "string" } },
                     "page_size": { "type": "integer", "minimum": 1, "maximum": 500 },
                     "include_body": { "type": "boolean" }

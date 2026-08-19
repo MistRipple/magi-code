@@ -1596,7 +1596,7 @@ fn browser_tool_requested_access(
         return match (kind, action) {
             (BrowserToolKind::Dialog, Some("list"))
             | (BrowserToolKind::Console, Some("list" | "get"))
-            | (BrowserToolKind::Network, Some("list" | "get"))
+            | (BrowserToolKind::Network, Some("list" | "get" | "failed"))
             | (BrowserToolKind::Performance, Some("metrics" | "analyze"))
             | (
                 BrowserToolKind::Heap,
