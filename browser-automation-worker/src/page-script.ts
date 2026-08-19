@@ -8,6 +8,12 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     snapshotRevision: 0,
     nextRef: 1,
     refs: new Map(),
+    annotations: [],
+    annotationLayer: null,
+    annotationShadow: null,
+    annotationFrame: 0,
+    annotationObserver: null,
+    annotationListenersInstalled: false,
   };
   const roleFor = (element) => {
     const explicit = element.getAttribute?.('role');
@@ -145,8 +151,141 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     element.getAttribute?.('data-testid') || '',
     nameFor(element) || '',
   ].join('|').slice(0, 512);
+  const field = (value, snake, camel) => value?.[snake] ?? value?.[camel];
+  const sameAnnotationDocument = (anchor) => {
+    const rawUrl = String(field(anchor, 'url', 'url') || '').trim();
+    if (!rawUrl) return true;
+    try {
+      const target = new URL(rawUrl, location.href);
+      const current = new URL(location.href);
+      return target.origin === current.origin
+        && target.pathname === current.pathname
+        && target.search === current.search;
+    } catch {
+      return false;
+    }
+  };
+  const resolveAnnotationElement = (anchor) => {
+    const stableId = String(field(anchor, 'stable_id', 'stableId') || '').trim();
+    if (stableId) {
+      const element = document.getElementById(stableId);
+      if (element instanceof Element) return element;
+    }
+    const testId = String(field(anchor, 'test_id', 'testId') || '').trim();
+    if (testId) {
+      try {
+        const element = document.querySelector('[data-testid="' + CSS.escape(testId) + '"]');
+        if (element instanceof Element) return element;
+      } catch {}
+    }
+    const css = String(field(anchor, 'css_path', 'cssPath') || '').trim();
+    if (css) {
+      try {
+        const element = document.querySelector(css);
+        if (element instanceof Element) return element;
+      } catch {}
+    }
+    const expected = String(field(anchor, 'dom_fingerprint', 'domFingerprint') || '').trim();
+    if (!expected) return null;
+    for (const element of document.querySelectorAll('*')) {
+      if (fingerprint(element) === expected) return element;
+    }
+    return null;
+  };
+  const annotationRect = (annotation) => {
+    const anchor = annotation?.anchor || {};
+    if (!sameAnnotationDocument(anchor)) return null;
+    if (annotation.kind === 'element') {
+      const element = resolveAnnotationElement(anchor);
+      if (!(element instanceof Element)) return null;
+      const rect = rectFor(element);
+      return rect.width > 0 && rect.height > 0 ? rect : null;
+    }
+    if (annotation.kind !== 'region') return null;
+    const rect = anchor.rect || {};
+    const viewport = anchor.viewport || {};
+    const sourceWidth = Number(field(viewport, 'width', 'width')) || innerWidth;
+    const sourceHeight = Number(field(viewport, 'height', 'height')) || innerHeight;
+    const scrollXAtCapture = Number(field(anchor, 'scroll_x', 'scrollX')) || 0;
+    const scrollYAtCapture = Number(field(anchor, 'scroll_y', 'scrollY')) || 0;
+    const width = Number(rect.width) * sourceWidth;
+    const height = Number(rect.height) * sourceHeight;
+    if (!(width > 0 && height > 0)) return null;
+    return {
+      x: Number(rect.x) * sourceWidth + scrollXAtCapture - scrollX,
+      y: Number(rect.y) * sourceHeight + scrollYAtCapture - scrollY,
+      width,
+      height,
+    };
+  };
+  const ensureAnnotationLayer = () => {
+    if (state.annotationLayer?.isConnected && state.annotationShadow) return state.annotationShadow;
+    const host = document.createElement('div');
+    host.id = 'magi-browser-annotations';
+    host.setAttribute('aria-hidden', 'true');
+    host.style.cssText = 'position:fixed;inset:0;z-index:2147483646;pointer-events:none;overflow:hidden;';
+    const shadow = host.attachShadow({ mode: 'closed' });
+    (document.documentElement || document.body)?.append(host);
+    state.annotationLayer = host;
+    state.annotationShadow = shadow;
+    return shadow;
+  };
+  const renderAnnotations = () => {
+    state.annotationFrame = 0;
+    const shadow = ensureAnnotationLayer();
+    while (shadow.firstChild) shadow.firstChild.remove();
+    const style = document.createElement('style');
+    style.textContent = '.magi-annotation{position:fixed;box-sizing:border-box;border:2px solid #e8590c;background:rgba(255,146,43,.12);border-radius:4px;pointer-events:none}.magi-annotation-badge{position:absolute;left:-2px;top:-2px;display:grid;place-items:center;min-width:20px;height:20px;padding:0 4px;border-radius:10px;background:#e8590c;color:#fff;font:700 12px/20px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;box-shadow:0 1px 3px rgba(0,0,0,.35)}.magi-annotation-label{position:absolute;left:20px;top:-2px;max-width:260px;overflow:hidden;padding:2px 6px;border-radius:3px;background:#e8590c;color:#fff;font:500 11px/16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-overflow:ellipsis;white-space:nowrap;box-shadow:0 1px 3px rgba(0,0,0,.35)}';
+    shadow.append(style);
+    for (const annotation of state.annotations) {
+      if (!annotation || (annotation.status !== 'active' && annotation.status !== 'stale')) continue;
+      const rect = annotationRect(annotation);
+      if (!rect || rect.x > innerWidth || rect.y > innerHeight || rect.x + rect.width < 0 || rect.y + rect.height < 0) continue;
+      const marker = document.createElement('div');
+      marker.className = 'magi-annotation';
+      marker.style.left = rect.x + 'px';
+      marker.style.top = rect.y + 'px';
+      marker.style.width = rect.width + 'px';
+      marker.style.height = rect.height + 'px';
+      const sequence = Number(annotation.sequence) || 0;
+      const comment = String(annotation.comment || '').replace(/\s+/g, ' ').trim();
+      marker.dataset.annotationId = String(annotation.annotation_id || annotation.annotationId || '');
+      marker.setAttribute('aria-label', sequence + '. ' + comment);
+      const badge = document.createElement('span');
+      badge.className = 'magi-annotation-badge';
+      badge.textContent = String(sequence || '•');
+      marker.append(badge);
+      if (comment) {
+        const label = document.createElement('span');
+        label.className = 'magi-annotation-label';
+        label.textContent = comment.slice(0, 180);
+        marker.append(label);
+      }
+      shadow.append(marker);
+    }
+  };
+  const scheduleAnnotationRender = () => {
+    if (state.annotationFrame) return;
+    state.annotationFrame = requestAnimationFrame(renderAnnotations);
+  };
+  const installAnnotationObservers = () => {
+    if (state.annotationListenersInstalled) return;
+    state.annotationListenersInstalled = true;
+    addEventListener('scroll', scheduleAnnotationRender, true);
+    addEventListener('resize', scheduleAnnotationRender, true);
+    state.annotationObserver = new MutationObserver((records) => {
+      if (records.some((record) => !(state.annotationLayer && state.annotationLayer.contains(record.target)))) {
+        scheduleAnnotationRender();
+      }
+    });
+    const root = document.documentElement || document;
+    state.annotationObserver.observe(root, { childList: true, subtree: true, attributes: true });
+  };
   globalThis.__magiBrowserAutomation = {
     runtime_epoch: runtimeEpoch,
+    viewport() {
+      return { width: innerWidth, height: innerHeight };
+    },
     snapshot(maxNodes, maxTextBytes, revision) {
       if (!Number.isSafeInteger(revision) || revision <= 0) {
         throw new Error('browser_snapshot_revision_invalid');
@@ -237,6 +376,12 @@ export const INSTALL_PAGE_RUNTIME = String.raw`
     },
     evaluate(expression) {
       return (0, eval)(expression);
+    },
+    setAnnotations(annotations) {
+      state.annotations = Array.isArray(annotations) ? annotations : [];
+      installAnnotationObservers();
+      renderAnnotations();
+      return { rendered: state.annotations.length };
     },
   };
 })

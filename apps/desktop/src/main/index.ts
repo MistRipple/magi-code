@@ -226,28 +226,6 @@ function registerIpc(): void {
     const request = parseBrowserActivation(value);
     return manager.activateBrowser({ windowId, ...request });
   });
-  ipcMain.handle("magi-desktop:browser-slot", (event, value: unknown) => {
-    const { manager, windowId } = trustedAppSender(event.sender.id);
-    const input = rejectUnknownFields(object(value), ["tabId", "slotRevision", "layoutRevision", "bounds"], "browserSlot");
-    const rawBounds = input.bounds;
-    let bounds: Rectangle | null = null;
-    if (rawBounds !== null && rawBounds !== undefined) {
-      const valueBounds = object(rawBounds);
-      bounds = {
-        x: finite(valueBounds.x, "bounds.x"),
-        y: finite(valueBounds.y, "bounds.y"),
-        width: finite(valueBounds.width, "bounds.width"),
-        height: finite(valueBounds.height, "bounds.height"),
-      };
-    }
-    return manager.updateBrowserSlot(
-      windowId,
-      text(input.tabId, "tabId"),
-      positiveInteger(input.slotRevision, "slotRevision"),
-      nonNegativeInteger(input.layoutRevision, "layoutRevision"),
-      bounds,
-    );
-  });
   ipcMain.handle("magi-desktop:activate-panel", (event, value: unknown) => {
     const { manager, windowId } = trustedAppSender(event.sender.id);
     const request = rejectUnknownFields(object(value), ["kind", "tabId"], "activatePanel");
@@ -270,12 +248,20 @@ function registerIpc(): void {
     const { manager, windowId } = trustedAppSender(event.sender.id);
     manager.handleRightPaneReady(windowId);
   });
+  ipcMain.handle("magi-desktop:focus-app", (event) => {
+    const { manager, windowId } = trustedAppSender(event.sender.id);
+    manager.focusApp(windowId);
+  });
   ipcMain.handle("magi-desktop:open-overlay", (event, value: unknown) => {
     const { manager, windowId } = trustedAppSender(event.sender.id);
     manager.openOverlay(windowId, parseOverlayState(value));
   });
   ipcMain.handle("magi-desktop:close-overlay", (event) => {
-    const { manager, windowId } = trustedAppSender(event.sender.id);
+    const { manager, windowId } = trustedSender(event.sender.id);
+    const role = manager.rendererRoleForWebContents(event.sender.id);
+    if (role !== "app" && role !== "overlay") {
+      throw new Error("desktop_overlay_close_sender_denied");
+    }
     manager.closeOverlay(windowId);
   });
   ipcMain.handle("magi-desktop:set-blocking-overlay", (event, value: unknown) => {

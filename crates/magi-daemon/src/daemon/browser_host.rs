@@ -2,8 +2,9 @@ use std::{env, fmt, time::Duration};
 
 use magi_api::{ApiState, BrowserHostConnectionConfig, BrowserHostStatusSnapshot};
 use magi_browser_authority::{
-    BrowserHostClient, BrowserHostClientError, BrowserHostEvent, BrowserHostHandshake,
-    BrowserHostIncomingEvent, BrowserHostStatus, BrowserLeaseEndReason, BrowserSessionLifecycle,
+    BrowserHostClient, BrowserHostClientError, BrowserHostCommand, BrowserHostEvent,
+    BrowserHostHandshake, BrowserHostIncomingEvent, BrowserHostStatus, BrowserLeaseEndReason,
+    BrowserSessionLifecycle,
 };
 use magi_core::{BrowserTabId, EventId, SessionId, UtcMillis, WorkspaceId};
 use magi_event_bus::{EventContext, EventEnvelope};
@@ -619,6 +620,7 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
                     .map(|tab| (Some(tab), revoked))
             }) {
                 Ok((Some(_), revoked)) => {
+                    schedule_browser_annotation_sync(state, &binding.tab_id);
                     publish_tab_event(
                         state,
                         "browser.tab.updated",
@@ -839,6 +841,32 @@ fn is_current_primary_binding(
         .lock()
         .expect("browser authority lock poisoned");
     authority.is_current_surface_binding(binding)
+}
+
+fn schedule_browser_annotation_sync(state: &ApiState, tab_id: &BrowserTabId) {
+    let Some(client) = state.browser_host_client() else {
+        return;
+    };
+    let annotations = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned")
+        .annotations_for_tab(tab_id)
+        .into_iter()
+        .filter_map(|annotation| serde_json::to_value(annotation).ok())
+        .collect::<Vec<_>>();
+    let tab_id = tab_id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = client
+            .request(BrowserHostCommand::SetAnnotations {
+                tab_id: tab_id.clone(),
+                annotations,
+            })
+            .await
+        {
+            tracing::debug!(%tab_id, ?error, "页面状态更新后同步浏览器标记失败");
+        }
+    });
 }
 
 fn publish_tab_event(

@@ -94,6 +94,7 @@ interface BrowserSurfaceRecord {
   viewportApplyPromise: Promise<void> | null;
   viewportApplyDirty: boolean;
   debuggerListenersInstalled: boolean;
+  debuggerReadyPromise: Promise<void> | null;
   recoveryPromise: Promise<void> | null;
   loadPromise: Promise<void> | null;
 }
@@ -193,11 +194,10 @@ export class BrowserSurfaceManager {
     this.assertActivationCurrent(input.windowId, input.activationGeneration);
     let record = this.surfaceForTab(input.tabId, input.windowId);
     const created = !record;
-    if (!record) record = await this.createSurface(input);
+    if (!record) record = this.createSurface(input);
     if (input.activationGeneration !== undefined) {
       record.activationGeneration = input.activationGeneration;
     }
-    if (record.recoveryPromise) await record.recoveryPromise;
     try {
       this.assertActivationCurrent(input.windowId, input.activationGeneration);
     } catch (error) {
@@ -224,14 +224,14 @@ export class BrowserSurfaceManager {
       )
     ) {
       const load = this.startLoad(record, initialUrl);
-      if (input.awaitPageLoad !== false) await load;
+      if (input.awaitPageLoad === true) await load;
       else void load.catch(() => undefined);
     } else if (!record.contents.isLoadingMainFrame()) {
       this.scheduleViewportApply(record);
     }
     return this.binding(record);
   }
-  private async createSurface(input: MaterializeSurfaceInput): Promise<BrowserSurfaceRecord> {
+  private createSurface(input: MaterializeSurfaceInput): BrowserSurfaceRecord {
     const window = this.#windows.get(input.windowId);
     const layer = this.#layers.get(input.windowId);
     if (!window || window.isDestroyed()) throw new Error("desktop_window_not_found");
@@ -265,7 +265,9 @@ export class BrowserSurfaceManager {
       activationGeneration: input.activationGeneration ?? null,
       priming: true,
       loadFailed: false,
-      targetId: "",
+      // CDP target 查询是异步握手，不参与 Surface 绑定。这个 ID 只用于
+      // binding 一致性校验，使用 WebContents 生命周期内稳定的宿主 ID。
+      targetId: `webcontents-${contents.id}`,
       navigationRevision: input.navigationRevision,
       navigationOperationId: 0,
       navigationTargetUrl: null,
@@ -281,6 +283,7 @@ export class BrowserSurfaceManager {
       viewportApplyPromise: null,
       viewportApplyDirty: false,
       debuggerListenersInstalled: false,
+      debuggerReadyPromise: null,
       recoveryPromise: null,
       loadPromise: null,
     };
@@ -297,17 +300,27 @@ export class BrowserSurfaceManager {
       this.removeRecordIndexes(record);
       this.promoteFallback(record.tabId);
     });
-    try {
-      await this.attachDebugger(record);
-      this.installSurfacePolicy(record);
-      return record;
-    } catch (error) {
-      this.closeRecord(record);
-      throw error;
-    }
+    this.installSurfacePolicy(record);
+    const debuggerReady = this.attachDebugger(record);
+    record.debuggerReadyPromise = debuggerReady;
+    void debuggerReady.then(
+      () => {
+        if (record.debuggerReadyPromise === debuggerReady) record.debuggerReadyPromise = null;
+      },
+      (error) => {
+        if (record.debuggerReadyPromise === debuggerReady) record.debuggerReadyPromise = null;
+        if (!record.closed) {
+          console.error("[BrowserSurfaceManager] Browser Surface 调试器初始化失败", {
+            surfaceId: record.surfaceId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      },
+    );
+    return record;
   }
 
-  updateBrowserSlot(windowId: string, tabId: string, bounds: Rectangle | null): void {
+  bindContentSurface(windowId: string, tabId: string, bounds: Rectangle | null): void {
     const window = this.#windows.get(windowId);
     for (const record of this.#surfaces.values()) {
       if (record.windowId !== windowId || record.closed) continue;
@@ -331,6 +344,20 @@ export class BrowserSurfaceManager {
   bindingForTabInWindow(tabId: string, windowId: string): BrowserSurfaceBinding | null {
     const record = this.#surfaces.forWindowTab(windowId, tabId);
     return record && !record.closed ? this.binding(record) : null;
+  }
+
+  contentBoundsForTab(windowId: string, tabId: string): Rectangle | null {
+    const record = this.#surfaces.forWindowTab(windowId, tabId);
+    if (!record || !this.isRenderable(record)) return null;
+    return { ...record.slotBounds };
+  }
+
+  focusTab(windowId: string, tabId: string): boolean {
+    const record = this.#surfaces.forWindowTab(windowId, tabId);
+    if (!record || !this.isRenderable(record) || record.contents.isDestroyed()) return false;
+    this.promote(record.surfaceId);
+    record.contents.focus();
+    return true;
   }
 
   primaryBindingForTab(tabId: string): BrowserSurfaceBinding | null {
@@ -397,12 +424,13 @@ export class BrowserSurfaceManager {
     method: string,
     params: Record<string, unknown> = {},
   ): Promise<unknown> {
-    const contents = this.recordForBinding(binding);
     if (!ALLOWED_WORKER_CDP_METHODS.has(method)) {
       throw new Error(`browser_cdp_method_denied:${method}`);
     }
     const record = this.requireRecord(binding.surface_id);
-    if (method === "Page.captureScreenshot" && (!record.slotVisible || !record.slotBounds || !record.mounted)) {
+    await this.waitForDebugger(record);
+    const contents = this.recordForBinding(binding);
+    if (method === "Page.captureScreenshot" && !this.isRenderable(record)) {
       throw browserSurfaceError("browser_surface_no_content_slot");
     }
     if (!contents.debugger.isAttached()) {
@@ -444,6 +472,8 @@ export class BrowserSurfaceManager {
     binding: BrowserSurfaceBinding,
     navigation: BrowserNavigation,
   ): Promise<BrowserPageState> {
+    const record = this.requireRecord(binding.surface_id);
+    await this.waitForDebugger(record);
     const contents = this.recordForBinding(binding);
     switch (navigation.action) {
       case "url":
@@ -479,8 +509,8 @@ export class BrowserSurfaceManager {
         );
         break;
     }
-    const record = this.requireRecord(binding.surface_id);
-    return this.pageState(record);
+    const currentRecord = this.requireRecord(binding.surface_id);
+    return this.pageState(currentRecord);
   }
 
   async setViewport(
@@ -488,6 +518,7 @@ export class BrowserSurfaceManager {
     viewport: BrowserLogicalViewport,
   ): Promise<void> {
     const record = this.requireRecord(binding.surface_id);
+    await this.waitForDebugger(record);
     this.recordForBinding(binding);
     record.viewport = viewport;
     record.viewportApplied = false;
@@ -577,20 +608,25 @@ export class BrowserSurfaceManager {
       this.detachSurface(record, window);
       return;
     }
-    const wasMounted = record.mounted;
     if (!record.mounted) {
       // Browser Surface 只能挂在固定 BrowserLayer。层级由 WindowManager
       // 一次性建立，Surface 生命周期不得通过 addChildView 重排整窗原生层。
       record.layer.addChildView(record.view);
       record.mounted = true;
     }
-    if (bounds && !sameBounds(record.view.getBounds(), bounds)) record.view.setBounds(bounds);
-    const visible = bounds !== null && !record.priming && !record.loadFailed;
+    if (bounds) {
+      // BrowserLayer 本身也必须只占当前内容槽。若父层仍保持整窗 bounds，
+      // 即使 WebContentsView 只有右栏大小，父层仍可能参与全窗口命中测试，
+      // 让主 Renderer 的左栏和中间区域无法点击。子视图改用父层内坐标。
+      record.layer.setBounds(bounds);
+      const localBounds = { x: 0, y: 0, width: bounds.width, height: bounds.height };
+      if (!sameBounds(record.view.getBounds(), localBounds)) record.view.setBounds(localBounds);
+    }
+    // 页面加载和调试器初始化是 Surface 内部状态，不能阻塞真实浏览器
+    // 视图进入内容槽。Chromium 自行展示当前文档及加载过程；只有失败页
+    // 才隐藏，避免激活流程变成“正在连接浏览器”的空白等待层。
+    const visible = bounds !== null && !record.loadFailed;
     record.view.setVisible(visible);
-    // 新挂载的真实页面必须成为当前输入目标，否则第一次打开 Browser Tab
-    // 后键盘/剪贴板事件仍留在 App Renderer，表现为“页面能看但不能操作”。
-    // 后续仅调整 bounds 不重新抢焦点，避免拖动右栏时打断用户正在操作的工具栏。
-    if (!wasMounted && visible) record.contents.focus();
     this.syncLayerVisibility(record.windowId);
   }
 
@@ -700,14 +736,20 @@ export class BrowserSurfaceManager {
     const layer = this.#layers.get(windowId);
     if (!layer) return;
     const visible = [...this.#surfaces.values()].some((record) => (
-      record.windowId === windowId
-      && !record.closed
-      && record.mounted
-      && record.slotVisible
-      && !record.priming
-      && !record.loadFailed
+      record.windowId === windowId && this.isRenderable(record)
     ));
     layer.setVisible(visible);
+  }
+
+  private isRenderable(record: BrowserSurfaceRecord): record is BrowserSurfaceRecord & {
+    slotBounds: Rectangle;
+  } {
+    return !record.closed
+      && record.mounted
+      && record.slotVisible
+      && record.slotBounds !== null
+      && !record.loadFailed
+      && record.view.getVisible();
   }
 
   private configurePartition(partitionId: string): void {
@@ -809,7 +851,7 @@ export class BrowserSurfaceManager {
         // Chromium 会在 did-fail-load 后加载 chrome-error:// 页面。它不是用户
         // 请求页面的成功首帧，必须保持 Surface 隐藏，让 Renderer 展示结构化
         // 错误状态，避免错误页白屏重新覆盖右栏。
-        record.view.setVisible(false);
+        this.unmountSurface(record, this.#windows.get(record.windowId));
         return;
       }
       record.navigationTargetUrl = null;
@@ -858,10 +900,39 @@ export class BrowserSurfaceManager {
     });
   }
 
+  private async waitForDebugger(record: BrowserSurfaceRecord): Promise<void> {
+    if (record.recoveryPromise) {
+      try {
+        await record.recoveryPromise;
+      } catch {
+        // Recovery owns its terminal error state. The command below performs
+        // the final lifecycle validation and returns a stable surface error.
+      }
+    }
+    const debuggerReady = record.debuggerReadyPromise;
+    if (debuggerReady) {
+      try {
+        await debuggerReady;
+      } catch {
+        // A transient attach failure must not poison the Surface forever.
+      } finally {
+        if (record.debuggerReadyPromise === debuggerReady) record.debuggerReadyPromise = null;
+      }
+    }
+    if (!record.contents.debugger.isAttached()) {
+      await this.reconnectDebugger(record, "on-demand");
+    }
+    if (record.closed || record.contents.isDestroyed()) {
+      throw staleSurfaceError("browser_surface_not_found");
+    }
+    if (!record.contents.debugger.isAttached()) {
+      throw staleSurfaceError("browser_debugger_detached");
+    }
+  }
+
   private async attachDebugger(record: BrowserSurfaceRecord): Promise<void> {
     const debuggerApi = record.contents.debugger;
     if (!debuggerApi.isAttached()) debuggerApi.attach("1.3");
-    await this.refreshDebuggerTarget(record);
     if (record.debuggerListenersInstalled) return;
     record.debuggerListenersInstalled = true;
     debuggerApi.on("message", (_event, method, params) => {
@@ -881,20 +952,34 @@ export class BrowserSurfaceManager {
         binding,
         reason: `debugger-detached:${reason}`,
       });
-      this.invalidateAndRecover(record, `debugger-detached:${reason}`);
+      // 调试器是自动化通道，不是页面本身。短暂 detach 不能隐藏或 reload
+      // 用户正在看的 Chromium 文档；仅后台重新 attach，页面继续保持可见。
+      void this.reconnectDebugger(record, `debugger-detached:${reason}`).catch((error) => {
+        if (!record.closed) {
+          console.error("[BrowserSurfaceManager] Browser Surface 调试器重连失败", {
+            surfaceId: record.surfaceId,
+            reason,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
     });
   }
 
-  private async refreshDebuggerTarget(record: BrowserSurfaceRecord): Promise<void> {
-    const target = await record.contents.debugger.sendCommand("Target.getTargetInfo") as {
-      targetInfo?: { targetId?: string };
-    };
-    const targetId = target.targetInfo?.targetId?.trim() || `webcontents-${record.contents.id}`;
-    if (record.targetId !== targetId) {
-      record.surfaceRevision = this.#surfaces.nextRevision(record.tabId);
+  private reconnectDebugger(record: BrowserSurfaceRecord, reason: string): Promise<void> {
+    if (record.debuggerReadyPromise) return record.debuggerReadyPromise;
+    const reconnect = (async () => {
+      if (record.closed || record.contents.isDestroyed()) return;
+      if (!record.contents.debugger.isAttached()) record.contents.debugger.attach("1.3");
       record.cursorExecutionContextId = null;
-    }
-    record.targetId = targetId;
+      if (record.primary) this.#onEvent({ type: "primary_changed", binding: this.binding(record) });
+      void reason;
+    })();
+    record.debuggerReadyPromise = reconnect;
+    void reconnect.finally(() => {
+      if (record.debuggerReadyPromise === reconnect) record.debuggerReadyPromise = null;
+    });
+    return reconnect;
   }
 
   private invalidateAndRecover(record: BrowserSurfaceRecord, reason: string): void {
@@ -902,10 +987,10 @@ export class BrowserSurfaceManager {
     record.priming = true;
     record.loadFailed = false;
     this.unmountSurface(record, this.#windows.get(record.windowId));
-    record.targetId = "";
     record.surfaceRevision = this.#surfaces.nextRevision(record.tabId);
     const recovery = this.recover(record, reason);
     record.recoveryPromise = recovery;
+    record.debuggerReadyPromise = recovery;
     void recovery.then(
       () => {
         if (record.recoveryPromise === recovery) record.recoveryPromise = null;
@@ -920,8 +1005,7 @@ export class BrowserSurfaceManager {
     try {
       await reloadAndWait(record.contents, true);
       if (record.closed) return;
-      if (!record.contents.debugger.isAttached()) record.contents.debugger.attach("1.3");
-      await this.refreshDebuggerTarget(record);
+      await this.attachDebugger(record);
       record.priming = false;
       record.loadFailed = false;
       record.viewportApplied = false;

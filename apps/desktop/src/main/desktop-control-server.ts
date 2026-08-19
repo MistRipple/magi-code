@@ -253,6 +253,11 @@ export class DesktopControlServer {
           initialUrl: command.payload.initial_url,
           navigationRevision: command.payload.navigation_revision,
           viewport: command.payload.logical_viewport,
+          // Host RestorePage/CreatePage 只负责把真实 WebContentsView 物化
+          // 并返回当前页面状态，不能把网络导航放在右栏激活的关键路径上。
+          // Chromium 页面继续在原生视图中加载，页面加载状态由 Surface 事件
+          // 单独上报，避免用户看到“正在连接浏览器”而不是实际加载过程。
+          awaitPageLoad: false,
         });
         const contents = this.#surfaceManager.recordForBinding(binding);
         return succeeded({

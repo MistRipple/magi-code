@@ -45,6 +45,7 @@
     closeTerminalSession,
     createBrowserSession,
     createBrowserTab,
+    getBrowserSession,
     waitForBrowserTabReady,
     getBrowserCapabilities,
     materializeSession,
@@ -151,6 +152,7 @@
         || action.interaction !== 'select'
       ) return;
       addPaneMenuOpen = false;
+      void desktop?.closeOverlay().catch(() => undefined);
       if (action.id === 'browser' || action.id === 'terminal') {
         chooseAddPane(action.id);
       }
@@ -217,6 +219,8 @@
     sessionId: string,
     workspacePath?: string,
     lifecycle?: BrowserTabPayload['lifecycle'],
+    url = 'about:blank',
+    navigationRevision = 0,
   ): void {
     openBrowserTab(browserSessionId, tabId, {
       workspaceId,
@@ -224,6 +228,8 @@
       sessionId,
       label: i18n.t('browser.tab.new'),
       lifecycle,
+      url,
+      navigationRevision,
     });
     // 创建响应和 Authority 事件可能以任意顺序到达。无论响应已经是 ready
     // 还是仍处于 creating，都必须走一次同一条权威收敛链路并显式 reveal
@@ -265,6 +271,8 @@
           sessionId,
           label: i18n.t('browser.tab.new'),
           lifecycle: 'crashed',
+          url: 'about:blank',
+          navigationRevision: 0,
         });
         console.warn('[RightPane] 浏览器 Tab 权威状态收敛失败，已进入失败态:', {
           browserSessionId,
@@ -330,6 +338,8 @@
         sessionId,
         workspaceRoot,
         tab.lifecycle,
+        tab.url,
+        tab.navigationRevision,
       );
     } catch (error) {
       console.warn('[RightPane] 新建浏览器面板失败:', error);
@@ -433,6 +443,59 @@
   // 提供当前浏览器 Tab 的内容槽位。
   let activeBrowserActivationKey = '';
   let activeBrowserActivationRequest = 0;
+
+  async function activateVisibleBrowserSurface(
+    payload: BrowserTabPayload,
+    request: number,
+  ): Promise<void> {
+    if (request !== activeBrowserActivationRequest || !desktopSurface) return;
+    const desktop = window.magiDesktop;
+    if (!desktop) throw new Error('desktop_preload_bridge_unavailable');
+    // 先把真实 WebContentsView 挂入右栏内容槽。这里不能等待 daemon 的
+    // RestorePage：Host 控制链路负责 LLM 接管，用户可见的 Chromium 页面
+    // 必须先出现并自行显示加载过程。
+    await desktop.activateBrowser({
+      tabId: payload.tabId,
+      browserSessionId: payload.browserSessionId,
+      url: payload.url || 'about:blank',
+      navigationRevision: payload.navigationRevision,
+      viewport: { mode: 'auto' },
+    });
+
+    // 元数据同步独立于可见 Surface 的激活，不再把 Authority/daemon 请求
+    // 放在用户看到浏览器页面的关键路径上。
+    void getBrowserSession(payload.browserSessionId)
+      .then((next) => {
+        if (request !== activeBrowserActivationRequest) return;
+        synchronizeBrowserSessionSnapshot(next, payload.workspacePath, {
+          workspaceId: payload.workspaceId,
+          sessionId: payload.sessionId,
+        });
+      })
+      .catch((error) => {
+        if (request === activeBrowserActivationRequest) {
+          console.warn('[RightPane] 浏览器元数据后台同步失败:', error);
+        }
+      });
+
+    // 只有 suspended/crashed 逻辑 Tab 需要额外让 Authority 完成恢复。
+    // 该操作放到可见 Surface 建立之后，不能阻塞用户看到和操作页面。
+    if (payload.lifecycle === 'suspended' || payload.lifecycle === 'crashed') {
+      void activateBrowserTab(payload.tabId)
+        .then((next) => {
+          if (request !== activeBrowserActivationRequest) return;
+          synchronizeBrowserSessionSnapshot(next, payload.workspacePath, {
+            workspaceId: payload.workspaceId,
+            sessionId: payload.sessionId,
+          });
+        })
+        .catch((error) => {
+          if (request !== activeBrowserActivationRequest) return;
+          console.warn('[RightPane] 浏览器 Authority 后台恢复失败:', error);
+        });
+    }
+  }
+
   $effect(() => {
     const current = activeTab;
     if (!current || current.kind !== 'browser') {
@@ -442,44 +505,10 @@
     }
     const payload = current.payload as BrowserTabPayload;
     const activationIdentity = `${payload.browserSessionId}\u0000${payload.tabId}`;
-    const activationKey = `${activationIdentity}\u0000${payload.lifecycle}`;
-    if (activationKey === activeBrowserActivationKey) return;
-    if (payload.lifecycle === 'creating') {
-      // 创建请求只注册逻辑 Tab，必须等待 waitForBrowserTabReady 的权威
-      // 快照把状态推进到 ready 后再激活。清空 key 也会取消同一 Tab
-      // 上一次尚未完成的激活，避免旧请求重新抢占当前内容槽。
-      activeBrowserActivationRequest += 1;
-      activeBrowserActivationKey = '';
-      return;
-    }
-    activeBrowserActivationKey = activationKey;
+    if (activationIdentity === activeBrowserActivationKey) return;
+    activeBrowserActivationKey = activationIdentity;
     const request = ++activeBrowserActivationRequest;
-    void activateBrowserTab(payload.tabId)
-      .then(async (authority) => {
-        if (request !== activeBrowserActivationRequest || !desktopSurface) return;
-        const desktop = window.magiDesktop;
-        if (!desktop) throw new Error('desktop_preload_bridge_unavailable');
-        const tab = authority.tabs.find((candidate) => candidate.tabId === payload.tabId);
-        if (!tab) throw new Error(`browser_tab_not_found:${payload.tabId}`);
-        // activateBrowserTab 已经完成 Host RestorePage 并将恢复的 suspended/
-        // crashed Tab 收敛为 ready。接口返回的快照是这次激活的权威结果，
-        // 必须在等待 Main 原生 Surface 布局前先回写右栏，否则
-        // BrowserTabContent 仍会以旧 lifecycle 阻止内容槽发布，表现为
-        // “正在连接”，直到用户新建另一个 Tab 才被全量同步掩盖。
-        activeBrowserActivationKey = `${activationIdentity}\u0000${tab.lifecycle}`;
-        synchronizeBrowserSessionSnapshot(authority, payload.workspacePath, {
-          workspaceId: payload.workspaceId,
-          sessionId: payload.sessionId,
-        });
-        await desktop.activateBrowser({
-          tabId: tab.tabId,
-          browserSessionId: authority.browserSessionId,
-          url: tab.url,
-          navigationRevision: tab.navigationRevision,
-          viewport: { mode: 'auto' },
-        });
-      })
-      .catch((error) => {
+    void activateVisibleBrowserSurface(payload, request).catch((error) => {
         if (request !== activeBrowserActivationRequest) return;
         clearPendingBrowserTabIntent(paneScopeKey, payload.tabId);
         activeBrowserActivationKey = '';
@@ -922,6 +951,9 @@
         workspaceId,
         sessionId,
         activeCodePayload?.workspacePath,
+        tab.lifecycle,
+        tab.url,
+        tab.navigationRevision,
       );
     } finally {
       openingHtmlInBrowser = false;

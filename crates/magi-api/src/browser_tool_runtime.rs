@@ -2101,7 +2101,7 @@ mod tests {
 
     use super::{
         BrowserToolRuntimeDependencies, DEFAULT_BROWSER_PROFILE_ID, browser_tool_snapshot_value,
-        validate_devtools_arguments,
+        optional_snapshot_target, parse_normalized_rect, validate_devtools_arguments,
     };
     use crate::state::BrowserHostStatusSnapshot;
 
@@ -2307,6 +2307,44 @@ mod tests {
         validate_devtools_arguments("evaluate", &evaluate_arguments)
             .expect("evaluate should use expression");
         assert!(validate_devtools_arguments("evaluate", &Map::new()).is_err());
+    }
+
+    #[test]
+    fn browser_screenshot_root_is_page_scope_and_normalized_clip_is_validated() {
+        let root = json!({ "element_ref": "root", "snapshot_revision": 4 });
+        assert_eq!(
+            optional_snapshot_target(root.as_object().expect("root target object"))
+                .expect("root target should parse"),
+            None
+        );
+
+        let element = json!({ "element_ref": "e:4:1", "snapshot_revision": 4 });
+        assert_eq!(
+            optional_snapshot_target(element.as_object().expect("element target object"))
+                .expect("element target should parse")
+                .expect("non-root target should remain addressable")
+                .element_ref,
+            "e:4:1"
+        );
+
+        let clip = parse_normalized_rect(&json!({
+            "x": 0.25,
+            "y": 0.1,
+            "width": 0.5,
+            "height": 0.25
+        }))
+        .expect("normalized clip should be accepted");
+        assert_eq!(clip.x, 0.25);
+        assert_eq!(clip.width, 0.5);
+        assert!(
+            parse_normalized_rect(&json!({
+                "x": 0.8,
+                "y": 0.1,
+                "width": 0.5,
+                "height": 0.25
+            }))
+            .is_err()
+        );
     }
 
     #[test]

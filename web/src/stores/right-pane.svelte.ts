@@ -66,6 +66,8 @@ export interface BrowserTabPayload {
   browserSessionId: string;
   tabId: string;
   lifecycle: BrowserAuthorityTabProjection['lifecycle'];
+  url: string;
+  navigationRevision: number;
   agentOccupied: boolean;
   workspaceId?: string;
   workspacePath?: string;
@@ -85,6 +87,7 @@ export interface BrowserAuthorityTabProjection {
   lifecycle: 'creating' | 'ready' | 'suspended' | 'crashed' | 'closed';
   url: string;
   title: string;
+  navigationRevision: number;
 }
 
 export interface BrowserAuthoritySessionProjection {
@@ -675,6 +678,8 @@ export function openBrowserTab(
     sessionId: string;
     label?: string;
     lifecycle?: BrowserAuthorityTabProjection['lifecycle'];
+    url?: string;
+    navigationRevision?: number;
   },
 ): void {
   const normalizedBrowserSessionId = typeof browserSessionId === 'string'
@@ -697,6 +702,10 @@ export function openBrowserTab(
       browserSessionId: normalizedBrowserSessionId,
       tabId: normalizedTabId,
       lifecycle: options.lifecycle ?? 'creating',
+      url: options.url?.trim() || 'about:blank',
+      navigationRevision: Number.isSafeInteger(options.navigationRevision)
+        ? Math.max(0, Number(options.navigationRevision))
+        : 0,
       agentOccupied: false,
       workspaceId,
       workspacePath: options.workspacePath?.trim() || undefined,
@@ -737,6 +746,7 @@ export function synchronizeBrowserSessionSnapshot(
         lifecycle: tab.lifecycle,
         url: tab.url,
         title: tab.title,
+        navigationRevision: tab.navigationRevision,
       })),
     },
     options,
@@ -832,6 +842,8 @@ export function synchronizeBrowserTabs(
         browserSessionId,
         tabId: normalizedTabId,
         lifecycle: tab.lifecycle,
+        url,
+        navigationRevision: tab.navigationRevision,
         agentOccupied: snapshot?.agentOccupied === true,
         workspaceId: normalizedWorkspaceId,
         workspacePath: normalizeWorkspaceId(workspacePath) || undefined,

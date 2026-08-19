@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick, untrack } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import Icon from '../Icon.svelte';
   import { i18n } from '../../stores/i18n.svelte';
   import { normalizeExternalWebUrl, openExternalWebUrl } from '../../lib/external-link';
@@ -20,7 +20,6 @@
     BROWSER_AUTHORITY_CHANGED_EVENT,
   } from '../../web/agent-api';
   import { synchronizeBrowserSessionSnapshot } from '../../stores/right-pane.svelte';
-  import { onDesktopBlockingOverlayChange } from '../../shared/desktop-overlay-contract';
 
   interface Props {
     browserSessionId: string;
@@ -35,7 +34,7 @@
 
   interface DesktopBrowserEvent {
     type?: string;
-    binding?: { tab_id?: string };
+    binding?: { tab_id?: string; surface_id?: string };
     page?: { url?: string; title?: string };
     loading?: boolean;
     reason?: string;
@@ -58,11 +57,10 @@
     desktopSurface = false,
   }: Props = $props();
   // Browser Tab 的运行通道由右栏宿主显式决定。Desktop 使用 Main 进程创建的
-  // WebContentsView；Renderer 只负责提供当前 Browser Tab 的内容槽几何。
+  // WebContentsView；右栏 DOM 只负责保留内容槽，物理 Surface 的几何由
+  // WindowManager 在同一个布局事务中计算。
   const desktopRuntime = $derived(desktopSurface);
-  let browserSurfaceSlot = $state<HTMLDivElement | null>(null);
   let desktopSnapshot = $state<MagiDesktopWindowSnapshot | null>(null);
-  let browserSlotPublished = $state(false);
   let snapshot = $state<BrowserSessionSnapshot | null>(null);
   let address = $state('');
   let addressEditing = $state(false);
@@ -86,37 +84,32 @@
   let desktopOverlayId = $state<string | null>(null);
   let annotationSelection = $state<BrowserAnnotationSelection | null>(null);
   let annotationComment = $state('');
-  let browserSurfaceHiddenByOverlay = $state(false);
+  let pageError = $state('');
   let refreshGeneration = 0;
   let desktopSurfaceSyncGeneration = 0;
   let activeBrowserIdentityKey = '';
-  let publishedSlotTabId = '';
 
   const activeTab = $derived.by<BrowserTabSnapshot | null>(() => (
     snapshot?.tabs.find((tab) => tab.tabId === tabId && tab.lifecycle !== 'closed') ?? null
   ));
   const savedAnnotations = $derived((activeTab?.annotations ?? []).filter((annotation) => annotation.status !== 'deleted'));
   const externalUrl = $derived(normalizeExternalWebUrl(activeTab?.url || address));
-  const browserSlotHostAvailable = $derived(
-    // Main snapshot 是右栏宿主布局的唯一几何权威。内容槽必须先发布
-    // 几何，Main 才能在异步物化 Chromium Surface 后重新绑定它；不能用
-    // activeSurfaceId 反向门控首个槽位发布，否则会形成初始化死锁。
+  const browserSurfaceAvailable = $derived(
     desktopRuntime
       && desktopSnapshot?.layout.rightPaneVisible === true
       && desktopSnapshot?.layout.activePanelKind === 'browser'
       && desktopSnapshot.layout.activeTabId === tabId
-      && !browserSurfaceHiddenByOverlay,
+      && Boolean(desktopSnapshot?.layout.activeSurfaceId),
   );
-  const browserSurfaceAvailable = $derived(
-    browserSlotHostAvailable && Boolean(desktopSnapshot?.layout.activeSurfaceId),
-  );
-  const browserReady = $derived(browserSurfaceAvailable && browserSlotPublished);
-  const error = $derived(actionError || sessionError);
+  // activeSurfaceId 由 Main 在完成物理挂载和 bounds 更新后发布。它不是
+  // Authority/Worker 握手状态，也不会因页面刷新或右栏拖动而重置。
+  const browserReady = $derived(browserSurfaceAvailable);
+  const error = $derived(actionError || pageError || sessionError);
   const lifecycleFailure = $derived(lifecycle === 'crashed' || activeTab?.lifecycle === 'crashed');
   const connectionState = $derived.by<'ready' | 'connecting' | 'error'>(() => {
     if (error || lifecycleFailure || !desktopRuntime) return 'error';
-    // 元数据刷新属于页面信息同步，不代表 Chromium Surface 的连接状态。
-    // 真实 Surface 已经由 Main 激活后，地址栏和页面操作必须立即可用。
+    // 这里只表示当前 Chromium Surface 是否已绑定到右栏内容槽。
+    // Authority、daemon、Worker 的握手和页面导航都不参与这个状态。
     if (!browserReady) return 'connecting';
     return 'ready';
   });
@@ -208,18 +201,6 @@
 
   function applyDesktopViewport(next: MagiDesktopWindowSnapshot): void {
     desktopSnapshot = next;
-    latestLayoutRevision = next.layout.layoutRevision;
-    const slotHostMatchesTab = next.layout.rightPaneVisible
-      && next.layout.activePanelKind === 'browser'
-      && next.layout.activeTabId === tabId;
-    if (!slotHostMatchesTab) {
-      invalidateBrowserSlotPublication();
-    } else {
-      // Surface 物化会让 activeSurfaceId 先为空、再切换为有效值；布局快照
-      // 是这一状态变化的唯一可靠通知。每次收到当前宿主快照都重新提交
-      // 当前 DOM 槽位，确保异步物化完成后原生 Surface 一定能接上。
-      scheduleBrowserSlotBounds();
-    }
     if (next.layout.activeTabId !== tabId || !next.activeBrowserViewport) return;
     const viewport = next.activeBrowserViewport;
     localViewportMode = viewport.mode;
@@ -242,13 +223,6 @@
       const next = await desktop.getSnapshot();
       if (generation !== desktopSurfaceSyncGeneration || expectedTabId !== tabId) return;
       applyDesktopViewport(next);
-      if (
-        next.layout.activePanelKind === 'browser'
-        && next.layout.rightPaneVisible
-        && next.layout.activeTabId === expectedTabId
-      ) {
-        scheduleBrowserSlotBounds();
-      }
     } catch (cause) {
       if (generation === desktopSurfaceSyncGeneration) {
         actionError = errorMessage(cause);
@@ -591,143 +565,25 @@
     if (!value || typeof value !== 'object') return;
     const event = value as DesktopBrowserEvent;
     if (event.binding?.tab_id !== tabId) return;
+    const activeSurfaceId = desktopSnapshot?.layout.activeSurfaceId;
+    if (event.binding?.surface_id && activeSurfaceId && event.binding.surface_id !== activeSurfaceId) return;
     if (event.type === 'loading_changed') {
       browserLoading = event.loading === true;
+      if (browserLoading) pageError = '';
       return;
     }
     if (event.type === 'page_failed') {
-      actionError = event.reason?.trim() || i18n.t('browser.error.pageLoadFailed');
+      pageError = event.reason?.trim() || i18n.t('browser.error.pageLoadFailed');
       browserLoading = false;
       return;
     }
     if (event.type !== 'page_updated' || !event.page) return;
-    actionError = '';
+    pageError = '';
     if (event.page.url?.trim()) {
       if (!addressEditing) address = event.page.url;
     }
     if (event.page.title?.trim()) onTitleChange?.(event.page.title);
   }
-
-  let slotPublishTimer: number | null = null;
-  let lastPublishedSlot = '';
-  let pendingPublishedSlot = '';
-  let slotRevision = 0;
-  let slotLifecycleGeneration = 0;
-  let slotOwnerTabId = '';
-  let componentDisposed = false;
-  let latestLayoutRevision = 0;
-
-  function invalidateBrowserSlotPublication(): number {
-    slotLifecycleGeneration += 1;
-    slotRevision += 1;
-    browserSlotPublished = false;
-    publishedSlotTabId = '';
-    slotOwnerTabId = '';
-    lastPublishedSlot = '';
-    pendingPublishedSlot = '';
-    return slotRevision;
-  }
-
-  function clearPublishedBrowserSlot(tabId: string): void {
-    const desktop = window.magiDesktop;
-    const revision = invalidateBrowserSlotPublication();
-    if (!desktop || !tabId) return;
-    void desktop.updateBrowserSlot({
-      tabId,
-      slotRevision: revision,
-      layoutRevision: latestLayoutRevision,
-      bounds: null,
-    }).catch(() => undefined);
-  }
-
-  function publishBrowserSlotBounds(): void {
-    slotPublishTimer = null;
-    const desktop = window.magiDesktop;
-    const slot = browserSurfaceSlot;
-    const currentTab = activeTab;
-    if (!browserSlotHostAvailable || !desktop || !slot || !currentTab || currentTab.tabId !== tabId) return;
-    const rect = slot.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return;
-    const bounds = {
-      x: Math.round(rect.left),
-      y: Math.round(rect.top),
-      width: Math.round(rect.width),
-      height: Math.round(rect.height),
-    };
-    const publicationGeneration = slotLifecycleGeneration;
-    const publicationTabId = tabId;
-    const boundsKey = `${publicationTabId}:${bounds.x}:${bounds.y}:${bounds.width}:${bounds.height}`;
-    const publicationKey = `${publicationGeneration}:${boundsKey}`;
-    if (boundsKey === lastPublishedSlot || publicationKey === pendingPublishedSlot) return;
-    slotOwnerTabId = publicationTabId;
-    pendingPublishedSlot = publicationKey;
-    const nextSlotRevision = ++slotRevision;
-    void desktop.updateBrowserSlot({
-      tabId: publicationTabId,
-      slotRevision: nextSlotRevision,
-      layoutRevision: latestLayoutRevision,
-      bounds,
-    })
-      .then((next) => {
-        if (
-          componentDisposed
-          || publicationGeneration !== slotLifecycleGeneration
-          || nextSlotRevision !== slotRevision
-          || publicationTabId !== tabId
-          || publicationTabId !== currentTab.tabId
-        ) return;
-        const accepted = next.layout.activePanelKind === 'browser'
-          && next.layout.rightPaneVisible
-          && next.layout.activeTabId === publicationTabId
-          && Boolean(next.layout.activeSurfaceId);
-        browserSlotPublished = accepted;
-        if (accepted) {
-          publishedSlotTabId = publicationTabId;
-          lastPublishedSlot = boundsKey;
-        }
-        applyDesktopViewport(next);
-      })
-      .catch((cause) => {
-        if (
-          !componentDisposed
-          && publicationGeneration === slotLifecycleGeneration
-          && nextSlotRevision === slotRevision
-          && publicationTabId === tabId
-        ) {
-          actionError = errorMessage(cause);
-        }
-      })
-      .finally(() => {
-        if (pendingPublishedSlot === publicationKey) pendingPublishedSlot = '';
-      });
-  }
-
-  function scheduleBrowserSlotBounds(): void {
-    if (slotPublishTimer !== null) return;
-    // requestAnimationFrame 在隐藏的 Electron WebContents 中会暂停，导致
-    // 窗口首次显示前或系统切换窗口时永远无法提交内容槽。用短定时器合并
-    // 同一事件循环内的布局变化，既不触发页面刷新，也不依赖窗口可见性。
-    slotPublishTimer = window.setTimeout(publishBrowserSlotBounds, 0);
-  }
-
-  // 内容槽是在 Browser Tab 激活后才挂载的，不能只在 onMount 时读取一次
-  // browserSurfaceSlot。懒绑定 ResizeObserver，确保右栏拖动、布局切换和
-  // 首次物化都沿同一条内容槽发布链路更新原生 WebContentsView。
-  $effect(() => {
-    const slot = browserSurfaceSlot;
-    if (!slot || typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(scheduleBrowserSlotBounds);
-    observer.observe(slot);
-    return () => observer.disconnect();
-  });
-
-  $effect(() => {
-    const slot = browserSurfaceSlot;
-    const currentTab = activeTab;
-    const available = browserSlotHostAvailable;
-    if (!desktopRuntime || !slot || !currentTab || !available) return;
-    void tick().then(scheduleBrowserSlotBounds);
-  });
 
   $effect(() => {
     if (!desktopRuntime) return;
@@ -746,14 +602,8 @@
       addressEditing = false;
       sessionError = '';
       actionError = '';
+      pageError = '';
       browserLoading = false;
-    browserSlotPublished = false;
-      const previousSlotTabId = slotOwnerTabId || publishedSlotTabId;
-      if (previousSlotTabId && previousSlotTabId !== expectedTabId) {
-        clearPublishedBrowserSlot(previousSlotTabId);
-      } else {
-        invalidateBrowserSlotPublication();
-      }
       loading = Boolean(expectedSessionId && expectedTabId);
       if (!expectedSessionId || !expectedTabId) return;
       void refreshSession(true);
@@ -763,8 +613,6 @@
   onMount(() => {
     const desktop = window.magiDesktop;
     if (desktop) void synchronizeDesktopSurface();
-    window.addEventListener('resize', scheduleBrowserSlotBounds);
-    window.visualViewport?.addEventListener('resize', scheduleBrowserSlotBounds);
     const pointerDown = (event: PointerEvent) => {
       const target = event.target;
       if (viewportMenuElement && target instanceof Node && !viewportMenuElement.contains(target)) viewportMenuOpen = false;
@@ -825,10 +673,14 @@
           annotationSelection = null;
           annotationComment = '';
           desktopOverlayId = null;
+          void desktop?.closeOverlay().catch(() => undefined);
           return;
         }
       }
       desktopOverlayId = null;
+      // 菜单项的最终关闭由主进程负责；这里同步关闭 Renderer 侧的
+      // 原生 Overlay，确保即使 IPC 回执晚到，焦点和点击区域也立即归还。
+      void desktop?.closeOverlay().catch(() => undefined);
       if (action.id === 'auto') {
         useAutomaticViewport();
         return;
@@ -851,20 +703,12 @@
     });
     const unsubscribeDesktopSnapshot = desktop?.onSnapshot((next) => {
       applyDesktopViewport(next);
-      if (
-        next.layout.activePanelKind === 'browser'
-        && next.layout.rightPaneVisible
-        && next.layout.activeTabId === tabId
-      ) {
-        scheduleBrowserSlotBounds();
-      }
     });
     const unsubscribeBrowserEvent = window.magiDesktop?.onBrowserEvent(handleDesktopBrowserEvent);
     window.addEventListener('pointerdown', pointerDown);
     window.addEventListener('keydown', keyboard);
     window.addEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, browserAuthorityChanged);
     return () => {
-      componentDisposed = true;
       unsubscribeBrowserEvent?.();
       unsubscribeOverlayAction?.();
       unsubscribeOverlayState?.();
@@ -872,14 +716,7 @@
       unsubscribeDesktopSnapshot?.();
       window.removeEventListener('pointerdown', pointerDown);
       window.removeEventListener('keydown', keyboard);
-      window.removeEventListener('resize', scheduleBrowserSlotBounds);
-      window.visualViewport?.removeEventListener('resize', scheduleBrowserSlotBounds);
-      if (slotPublishTimer !== null) window.clearTimeout(slotPublishTimer);
-      slotPublishTimer = null;
       if (desktop) {
-        const ownedSlotTabId = slotOwnerTabId || publishedSlotTabId;
-        if (ownedSlotTabId) clearPublishedBrowserSlot(ownedSlotTabId);
-        else invalidateBrowserSlotPublication();
         if (desktopOverlayId) void desktop.closeOverlay().catch(() => undefined);
       }
       window.removeEventListener(BROWSER_AUTHORITY_CHANGED_EVENT, browserAuthorityChanged);
@@ -889,10 +726,6 @@
     };
   });
 
-  onMount(() => onDesktopBlockingOverlayChange((visible) => {
-    if (!desktopRuntime) return;
-    browserSurfaceHiddenByOverlay = visible;
-  }));
 </script>
 
 <section
@@ -911,10 +744,7 @@
           spellcheck="false"
           disabled={!browserReady || busy}
           onfocus={() => { addressEditing = true; }}
-          onblur={() => {
-            addressEditing = false;
-            if (activeTab?.url) address = activeTab.url;
-          }}
+          onblur={() => { addressEditing = false; }}
           onkeydown={(event) => { if (event.key !== 'Enter' || event.isComposing) return; event.preventDefault(); navigate('url'); }}
         />
         <button type="submit" class="address-submit" disabled={!browserReady || busy} title={i18n.t('browser.navigation.go')} aria-label={i18n.t('browser.navigation.go')}><Icon name="chevron-right" size={12} /></button>
@@ -965,7 +795,9 @@
       {#if desktopRuntime}
         <button type="button" class="icon-button" onclick={openDesktopAnnotationCreation} disabled={!browserReady || busy || Boolean(desktopOverlayId)} title={i18n.t('browser.action.annotate')} aria-label={i18n.t('browser.action.annotate')}><Icon name="target" size={13} /></button>
       {/if}
-      <button bind:this={annotationHistoryButton} type="button" class="icon-button annotation-history-button" class:active={annotationMenuOpen} onclick={toggleAnnotationMenu} disabled={savedAnnotations.length === 0} title={i18n.t('browser.annotation.history')} aria-label={i18n.t('browser.annotation.history')}><Icon name="target" size={13} />{#if savedAnnotations.length}<span class="annotation-count">{savedAnnotations.length}</span>{/if}</button>
+      {#if savedAnnotations.length > 0}
+        <button bind:this={annotationHistoryButton} type="button" class="icon-button annotation-history-button" class:active={annotationMenuOpen} onclick={toggleAnnotationMenu} title={i18n.t('browser.annotation.history')} aria-label={i18n.t('browser.annotation.history')}><Icon name="list" size={13} /><span class="annotation-count">{savedAnnotations.length}</span></button>
+      {/if}
       {#if annotationMenuOpen && !desktopRuntime}
         <div class="annotation-menu" role="menu">
           {#each savedAnnotations as annotation (annotation.annotationId)}
@@ -981,11 +813,9 @@
     {/if}
   </div>
 
-  <div bind:this={browserSurfaceSlot} class="browser-surface-slot" aria-label={i18n.t('browser.viewport.label')}>
+  <div class="browser-surface-slot" aria-label={i18n.t('browser.viewport.label')}>
     {#if desktopRuntime && !browserReady}
       <div class="browser-placeholder" class:error={connectionState === 'error'} aria-live="polite">{connectionStatusText}</div>
-    {:else if desktopRuntime && Boolean(error)}
-      <div class="browser-placeholder error" role="alert">{connectionStatusText}</div>
     {:else if desktopRuntime && browserReady}
       <div class="browser-native-surface" aria-hidden="true"></div>
     {:else}

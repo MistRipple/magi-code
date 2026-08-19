@@ -1326,6 +1326,7 @@ async fn create_annotation(
             updated_at: now,
         })
     })?;
+    sync_browser_annotations_to_host(&state, &annotation.tab_id).await?;
     publish_browser_event(
         &state,
         "browser.annotation.created",
@@ -1512,6 +1513,7 @@ async fn update_annotation_status(
     let updated = state.mutate_browser_authority(|authority| {
         authority.update_annotation_status(&annotation_id, request.status, UtcMillis::now())
     })?;
+    sync_browser_annotations_to_host(&state, &updated.tab_id).await?;
     publish_browser_event(
         &state,
         "browser.annotation.status_changed",
@@ -1551,6 +1553,7 @@ async fn update_annotation_comment(
     let updated = state.mutate_browser_authority(|authority| {
         authority.update_annotation_comment(&annotation_id, comment, UtcMillis::now())
     })?;
+    sync_browser_annotations_to_host(&state, &updated.tab_id).await?;
     publish_browser_event(
         &state,
         "browser.annotation.updated",
@@ -1685,6 +1688,7 @@ async fn activate_tab(
                 )
             })
     })?;
+    sync_browser_annotations_to_host(&state, &tab_id).await?;
     publish_browser_event(
         &state,
         "browser.tab.activated",
@@ -1826,6 +1830,7 @@ async fn navigate_tab(
             UtcMillis::now(),
         )
     })?;
+    sync_browser_annotations_to_host(&state, &tab_id).await?;
     publish_browser_event(
         &state,
         "browser.tab.updated",
@@ -1930,6 +1935,36 @@ fn require_browser_host(
     state
         .browser_host_client()
         .ok_or_else(|| ApiError::Conflict("桌面浏览器控制通道尚未启动".to_string()))
+}
+
+async fn sync_browser_annotations_to_host(
+    state: &ApiState,
+    tab_id: &BrowserTabId,
+) -> Result<(), ApiError> {
+    let Some(client) = state.browser_host_client() else {
+        return Ok(());
+    };
+    let annotations = state
+        .browser_authority
+        .lock()
+        .expect("browser authority lock poisoned")
+        .annotations_for_tab(tab_id)
+        .into_iter()
+        .map(|annotation| {
+            serde_json::to_value(annotation)
+                .map_err(|error| ApiError::internal_assembly("序列化浏览器标记失败", error))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    require_host_success(
+        client
+            .request(BrowserHostCommand::SetAnnotations {
+                tab_id: tab_id.clone(),
+                annotations,
+            })
+            .await,
+        "同步浏览器标记到页面失败",
+    )?;
+    Ok(())
 }
 
 async fn ensure_user_control_for_ui_locked(

@@ -84,6 +84,15 @@ export class BrowserAutomationRuntime {
             ),
           },
         };
+      case "set_annotations":
+        return {
+          result: {
+            type: "json",
+            payload: {
+              value: await this.setAnnotations(binding, command.payload.annotations),
+            },
+          },
+        };
       case "click":
         await this.click(binding, command.payload.target);
         return empty();
@@ -255,6 +264,16 @@ export class BrowserAutomationRuntime {
     };
   }
 
+  private async setAnnotations(binding: BrowserSurfaceBinding, annotations: unknown[]): Promise<unknown> {
+    if (!Array.isArray(annotations)) {
+      throw protocolFailure("browser_annotations_invalid", "annotations must be an array");
+    }
+    return this.evaluate(
+      binding,
+      `globalThis.__magiBrowserAutomation.setAnnotations(${JSON.stringify(annotations)})`,
+    );
+  }
+
   private async target(
     binding: BrowserSurfaceBinding,
     target: BrowserSnapshotTarget,
@@ -321,16 +340,26 @@ export class BrowserAutomationRuntime {
   }
 
   private async scroll(binding: BrowserSurfaceBinding, deltaX: number, deltaY: number): Promise<void> {
-    const metrics = await this.#cdp.send<{
-      layoutViewport: { clientWidth: number; clientHeight: number };
-    }>(binding, "Page.getLayoutMetrics");
+    const viewport = await this.pageViewport(binding);
     await this.#cdp.send(binding, "Input.dispatchMouseEvent", {
       type: "mouseWheel",
-      x: metrics.layoutViewport.clientWidth / 2,
-      y: metrics.layoutViewport.clientHeight / 2,
+      x: viewport.width / 2,
+      y: viewport.height / 2,
       deltaX,
       deltaY,
     });
+  }
+
+  private async pageViewport(binding: BrowserSurfaceBinding): Promise<{ width: number; height: number }> {
+    const viewport = await this.evaluate<{ width: number; height: number }>(
+      binding,
+      "globalThis.__magiBrowserAutomation.viewport()",
+    );
+    if (!Number.isFinite(viewport?.width) || !Number.isFinite(viewport?.height)
+      || viewport.width <= 0 || viewport.height <= 0) {
+      throw protocolFailure("browser_viewport_invalid", "page viewport is unavailable");
+    }
+    return viewport;
   }
 
   private async pointer(
@@ -352,14 +381,12 @@ export class BrowserAutomationRuntime {
       const target = await this.target(binding, input.target);
       clip = { ...target.bounds, scale: 1 };
     } else if (input.clip) {
-      const metrics = await this.#cdp.send<{
-        layoutViewport: { clientWidth: number; clientHeight: number };
-      }>(binding, "Page.getLayoutMetrics");
+      const viewport = await this.pageViewport(binding);
       clip = {
-        x: input.clip.x * metrics.layoutViewport.clientWidth,
-        y: input.clip.y * metrics.layoutViewport.clientHeight,
-        width: input.clip.width * metrics.layoutViewport.clientWidth,
-        height: input.clip.height * metrics.layoutViewport.clientHeight,
+        x: input.clip.x * viewport.width,
+        y: input.clip.y * viewport.height,
+        width: input.clip.width * viewport.width,
+        height: input.clip.height * viewport.height,
         scale: 1,
       };
     } else if (input.full_page) {

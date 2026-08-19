@@ -56,6 +56,7 @@ interface OverlayRecord {
   loadFailed: boolean;
   ready: boolean;
   mounted: boolean;
+  layout: WindowLayoutSnapshot | null;
   browserContentBounds: Rectangle | null;
   loadPromise: Promise<void> | null;
 }
@@ -65,6 +66,7 @@ const OVERLAY_WIDTH: Record<DesktopOverlayPlacement, number> = {
   "browser-viewport": 264,
   "browser-annotations": 320,
 };
+const TRANSPARENT_VIEW_BACKGROUND = "rgba(0, 0, 0, 0)";
 
 export class DesktopOverlayManager {
   readonly #preloadPath: string;
@@ -112,10 +114,16 @@ export class DesktopOverlayManager {
       loadFailed: false,
       ready: false,
       mounted: false,
+      layout: null,
       browserContentBounds: null,
       loadPromise: null,
     };
     this.#records.set(windowId, record);
+    // Overlay 是浏览器内容槽上的透明交互层。Electron 的原生 View 默认
+    // 会绘制不透明背景；仅依赖 DOM 的 background: transparent 不足以让
+    // 下方 WebContentsView 可见，最终表现为打开标记后整个页面黑屏。
+    layer.setBackgroundColor(TRANSPARENT_VIEW_BACKGROUND);
+    view.setBackgroundColor(TRANSPARENT_VIEW_BACKGROUND);
     // OverlayLayer 固定存在于窗口层级中，但空闲时必须隐藏整个层，不能
     // 让一个没有子内容的原生 View 覆盖 App Renderer 的交互区域。
     this.syncVisibility(record);
@@ -126,6 +134,9 @@ export class DesktopOverlayManager {
     view.webContents.on("did-finish-load", () => {
       if (record.loadFailed) return;
       record.loaded = true;
+      if (record.state && record.visible) {
+        this.setOverlayBounds(record, overlayBoundsForRecord(record));
+      }
       this.syncVisibility(record);
       if (record.state && record.visible && record.ready) this.publishState(record);
     });
@@ -164,9 +175,10 @@ export class DesktopOverlayManager {
     const record = this.requireRecord(windowId);
     record.state = state;
     record.visible = true;
+    record.layout = layout;
     record.browserContentBounds = browserContentBounds ? { ...browserContentBounds } : null;
     this.mountOnLayer(record);
-    record.view.setBounds(overlayBounds(layout, state, record.browserContentBounds));
+    this.setOverlayBounds(record, overlayBounds(layout, state, record.browserContentBounds));
     this.syncVisibility(record);
     if (record.loadFailed && !record.view.webContents.isDestroyed()) {
       // Overlay Renderer 可能在 daemon/Vite 刚重启的瞬间加载失败。下一次
@@ -184,6 +196,9 @@ export class DesktopOverlayManager {
     // 也会负责补发当前状态。
     if (!record || record.loadFailed || record.view.webContents.isDestroyed()) return;
     record.ready = true;
+    if (record.state && record.visible) {
+      this.setOverlayBounds(record, overlayBoundsForRecord(record));
+    }
     this.syncVisibility(record);
     if (record.visible && record.state) this.publishState(record);
   }
@@ -193,6 +208,7 @@ export class DesktopOverlayManager {
     if (!record) return;
     record.visible = false;
     record.state = null;
+    record.layout = null;
     record.browserContentBounds = null;
     if (!record.view.webContents.isDestroyed()) {
       record.view.webContents.send("magi-desktop:overlay-closed", null);
@@ -215,6 +231,7 @@ export class DesktopOverlayManager {
   ): void {
     const record = this.#records.get(windowId);
     if (!record || !record.visible || !record.state) return;
+    record.layout = layout;
     record.browserContentBounds = browserContentBounds ? { ...browserContentBounds } : null;
     // rightPaneBounds 是几何轨道，即使右栏当前折叠也会存在；可见性必须
     // 由 rightPaneVisible 判断。切换到其他面板时，浏览器弹出层也必须
@@ -230,7 +247,7 @@ export class DesktopOverlayManager {
       return;
     }
     this.mountOnLayer(record);
-    record.view.setBounds(overlayBounds(layout, record.state, record.browserContentBounds));
+    this.setOverlayBounds(record, overlayBounds(layout, record.state, record.browserContentBounds));
     this.syncVisibility(record);
   }
 
@@ -336,9 +353,22 @@ export class DesktopOverlayManager {
       && record.ready
       && !record.loadFailed
     );
+    // Electron 的原生 View 即使设为不可见，也可能继续参与父窗口的命中测试。
+    // OverlayLayer 是 App Renderer 的最后一层，隐藏时必须同时收敛为零尺寸，
+    // 确保启动阶段、关闭弹层和 Renderer 恢复期间不会挡住整窗 DOM。
+    if (!visible) {
+      record.layer.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+    }
     record.layer.setVisible(visible);
     record.view.setVisible(visible);
     if (visible && !record.view.webContents.isFocused()) record.view.webContents.focus();
+  }
+
+  private setOverlayBounds(record: OverlayRecord, bounds: Rectangle): void {
+    // OverlayLayer 只覆盖真实弹层区域，避免一个可见的整窗父层拦截
+    // App Renderer 在弹层之外的鼠标事件。子视图使用父层内坐标。
+    record.layer.setBounds(bounds);
+    record.view.setBounds({ x: 0, y: 0, width: bounds.width, height: bounds.height });
   }
 
   private mountOnLayer(record: OverlayRecord): void {
@@ -378,6 +408,13 @@ export class DesktopOverlayManager {
     if (!record || record.window.isDestroyed()) throw new Error("desktop_overlay_not_found");
     return record;
   }
+}
+
+function overlayBoundsForRecord(record: OverlayRecord): Rectangle {
+  if (!record.layout || !record.state) {
+    return { x: 0, y: 0, width: 0, height: 0 };
+  }
+  return overlayBounds(record.layout, record.state, record.browserContentBounds);
 }
 
 function overlayBounds(

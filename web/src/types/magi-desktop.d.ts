@@ -179,18 +179,13 @@ interface MagiDesktopBridge {
   }): Promise<MagiDesktopContextSnapshot>;
   submitLayoutIntent(intent: MagiDesktopLayoutIntent): Promise<MagiDesktopWindowSnapshot>;
   activateBrowser(request: MagiDesktopBrowserActivationRequest): Promise<MagiDesktopWindowSnapshot>;
-  updateBrowserSlot(request: {
-    tabId: string;
-    slotRevision: number;
-    layoutRevision: number;
-    bounds: { x: number; y: number; width: number; height: number } | null;
-  }): Promise<MagiDesktopWindowSnapshot>;
   activatePanel(request: { kind: MagiDesktopPanelKind; tabId: string | null }): Promise<MagiDesktopWindowSnapshot>;
   setBrowserViewport(request: {
     tabId: string;
     viewport: MagiDesktopViewportIntent;
   }): Promise<MagiDesktopWindowSnapshot>;
   readyRightPane(): Promise<void>;
+  focusApp(): Promise<void>;
   openOverlay(state: Omit<MagiDesktopOverlayState, 'overlayId' | 'phase'> & { overlayId?: string; phase?: MagiDesktopOverlayState['phase'] }): Promise<void>;
   closeOverlay(): Promise<void>;
   setBlockingOverlay(request: { active: boolean }): Promise<MagiDesktopWindowSnapshot>;

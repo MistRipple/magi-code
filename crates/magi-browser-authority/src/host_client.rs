@@ -257,6 +257,7 @@ fn command_tab_id(command: &BrowserHostCommand) -> Option<&BrowserTabId> {
         | BrowserHostCommand::RestorePage { tab_id, .. }
         | BrowserHostCommand::SetLogicalViewport { tab_id, .. }
         | BrowserHostCommand::GetLogicalViewport { tab_id }
+        | BrowserHostCommand::SetAnnotations { tab_id, .. }
         | BrowserHostCommand::ClosePage { tab_id }
         | BrowserHostCommand::Navigate { tab_id, .. }
         | BrowserHostCommand::Snapshot { tab_id, .. }

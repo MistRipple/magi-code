@@ -182,13 +182,31 @@ export function resolveRightPaneMode(windowWidth: number): RightPaneMode {
 
 export function shouldShowBrowserSurface(
   layout: WindowLayoutSnapshot,
-  hasBrowserSlot: boolean,
+  hasBrowserSurface: boolean,
 ): boolean {
   return layout.rightPaneVisible
     && layout.activePanelKind === "browser"
     && Boolean(layout.activeTabId)
     && Boolean(layout.activeSurfaceId)
-    && hasBrowserSlot;
+    && hasBrowserSurface;
+}
+
+/**
+ * Browser Surface 的物理内容槽由 Main 的布局事务唯一计算。
+ * 右栏 DOM 使用同一组固定 Chrome 高度，因此不再把 ResizeObserver 的
+ * 窗口坐标往返给 Main，也不会在拖动期间产生两个几何所有者。
+ */
+export function browserContentBounds(layout: WindowLayoutSnapshot): Rectangle | null {
+  if (!layout.rightPaneBounds) return null;
+  const chromeHeight = WINDOW_LAYOUT.rightPaneTabBarHeight + WINDOW_LAYOUT.browserToolbarHeight;
+  const height = layout.rightPaneBounds.height - chromeHeight;
+  if (layout.rightPaneBounds.width <= 0 || height <= 0) return null;
+  return {
+    x: layout.rightPaneBounds.x,
+    y: layout.rightPaneBounds.y + chromeHeight,
+    width: layout.rightPaneBounds.width,
+    height,
+  };
 }
 
 export function clampRightPaneWidth(

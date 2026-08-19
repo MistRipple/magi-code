@@ -92,15 +92,15 @@ assert.doesNotMatch(
   '浏览器不得保留旧的 Guest 注册或投影路径',
 );
 const materializeStart = surfaceManagerSource.indexOf('async materialize(');
-const materializeEnd = surfaceManagerSource.indexOf('private async createSurface(', materializeStart);
+const materializeEnd = surfaceManagerSource.indexOf('private createSurface(', materializeStart);
 const materializeSource = surfaceManagerSource.slice(materializeStart, materializeEnd);
 const loadPageStart = surfaceManagerSource.indexOf('private async loadPage(');
 const loadPageEnd = surfaceManagerSource.indexOf('private async waitForNavigation(', loadPageStart);
 const loadPageSource = surfaceManagerSource.slice(loadPageStart, loadPageEnd);
 assert.match(
   materializeSource,
-  /const initialUrl = normalizeNavigableUrl\(input\.initialUrl\);[\s\S]*?const load = this\.startLoad\(record, initialUrl\)[\s\S]*?if \(input\.awaitPageLoad !== false\) await load/,
-  'Surface materialize 必须先规范化 canonical URL，再交给唯一 loadPage 导航所有者；窗口激活可异步等待网络',
+  /const initialUrl = normalizeNavigableUrl\(input\.initialUrl\);[\s\S]*?const load = this\.startLoad\(record, initialUrl\)[\s\S]*?if \(input\.awaitPageLoad === true\) await load[\s\S]*?else void load\.catch/,
+  'Surface materialize 必须先规范化 canonical URL，再交给唯一 loadPage 导航所有者；窗口激活默认不等待网络',
 );
 assert.doesNotMatch(
   materializeSource,

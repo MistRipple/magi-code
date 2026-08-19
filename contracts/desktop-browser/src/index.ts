@@ -1,4 +1,4 @@
-export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 1 } as const;
+export const DESKTOP_BROWSER_PROTOCOL_VERSION = { major: 3, minor: 2 } as const;
 
 export type DesktopEpoch = string;
 export type WindowId = string;
@@ -103,6 +103,10 @@ export type BrowserHostCommand =
   | {
       type: "get_logical_viewport";
       payload: { tab_id: BrowserTabId };
+    }
+  | {
+      type: "set_annotations";
+      payload: { tab_id: BrowserTabId; annotations: unknown[] };
     }
   | { type: "close_page"; payload: { tab_id: BrowserTabId } }
   | {

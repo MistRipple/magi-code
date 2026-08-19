@@ -3,7 +3,7 @@ use magi_core::{BrowserCommandId, BrowserLeaseId, BrowserSessionId, BrowserTabId
 use serde::{Deserialize, Serialize};
 
 pub const BROWSER_HOST_PROTOCOL_MAJOR: u16 = 3;
-pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 1;
+pub const BROWSER_HOST_PROTOCOL_MINOR: u16 = 2;
 pub const DEFAULT_BROWSER_SNAPSHOT_NODE_LIMIT: u32 = 160;
 pub const DEFAULT_BROWSER_SNAPSHOT_TEXT_LIMIT_BYTES: u32 = 16 * 1024;
 
@@ -101,6 +101,12 @@ pub enum BrowserHostCommand {
     /// 读取当前桌面 Surface 的运行态视口。该数据不进入 Authority 持久化。
     GetLogicalViewport {
         tab_id: BrowserTabId,
+    },
+    /// 将 Authority 中的持久化标记同步到当前 Chromium 文档的页面标记层。
+    /// 这是浏览器 UI 状态，不改变页面内容，也不进入会话共享布局状态。
+    SetAnnotations {
+        tab_id: BrowserTabId,
+        annotations: Vec<serde_json::Value>,
     },
     ClosePage {
         tab_id: BrowserTabId,
@@ -499,7 +505,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(handshake).expect("serialize desktop handshake"),
             serde_json::json!({
-                "protocol_version": { "major": 3, "minor": 1 },
+                "protocol_version": { "major": 3, "minor": 2 },
                 "desktop_version": "desktop-test",
                 "electron_version": "electron-test",
                 "chromium_version": "chromium-test",

@@ -18,6 +18,7 @@ import {
 import {
   createWindowLayoutState,
   reduceWindowLayout,
+  browserContentBounds,
   shouldShowBrowserSurface,
   snapshotWindowLayout,
   type PanelKind,
@@ -36,9 +37,6 @@ interface DesktopWindowRecord {
   layout: WindowLayoutState;
   context: DesktopRendererContext;
   browserActivationRevision: number;
-  browserSlotRevision: number;
-  browserSlotLayoutRevision: number;
-  browserSlot: { tabId: string; bounds: Rectangle } | null;
   blockingOverlayActive: boolean;
   rendererLoadFailed: boolean;
   rendererRecoveryUrl: string | null;
@@ -158,9 +156,6 @@ export class WindowManager {
         sessionId: "",
       },
       browserActivationRevision: 0,
-      browserSlotRevision: 0,
-      browserSlotLayoutRevision: -1,
-      browserSlot: null,
       blockingOverlayActive: false,
       rendererLoadFailed: false,
       rendererRecoveryUrl: null,
@@ -226,6 +221,7 @@ export class WindowManager {
     const record = this.requireWindow(input.windowId);
     const activationRevision = ++record.browserActivationRevision;
     this.#surfaceManager.setActivationGeneration(input.windowId, activationRevision);
+    const existingBinding = this.#surfaceManager.bindingForTabInWindow(input.tabId, input.windowId);
     // 先原子切换逻辑面板并卸载旧 Surface，避免新 WebContents 异步物化期间
     // 旧页面继续覆盖当前 Tab 的 loading 状态或其他右栏内容。
     record.layout = reduceWindowLayout(record.layout, {
@@ -236,12 +232,11 @@ export class WindowManager {
       type: "active_panel",
       kind: "browser",
       tabId: input.tabId,
-      surfaceId: null,
+      // 已经物化的 Browser Tab 直接复用现有原生 Surface。这样切换时
+      // 只发生显隐和内容槽绑定，不需要等待 Surface/Host 初始化。
+      surfaceId: existingBinding?.surface_id ?? null,
     });
-    record.browserSlot = null;
-    record.browserSlotRevision = 0;
-    record.browserSlotLayoutRevision = -1;
-    this.#surfaceManager.updateBrowserSlot(input.windowId, "", null);
+    this.#surfaceManager.bindContentSurface(input.windowId, "", null);
     this.applyLayout(record);
     let binding;
     try {
@@ -274,88 +269,7 @@ export class WindowManager {
       tabId: input.tabId,
       surfaceId: binding?.surface_id ?? null,
     });
-    const browserSlot = readBrowserSlot(record);
-    const snapshot = this.applyLayout(record);
-    // Renderer 可能在物化等待期间已经上报过内容槽。该槽位属于当前
-    // Browser Tab，不能因为 activeSurfaceId 当时还是 null 而丢失；物化
-    // 完成后必须显式把已有槽位重新交给 Surface Manager，确保 ready
-    // Surface 从 BaseWindow 子视图树卸载后能再次挂载并显示。
-    if (browserSlot?.tabId === input.tabId) {
-      this.#surfaceManager.updateBrowserSlot(
-        input.windowId,
-        input.tabId,
-        browserSlot.bounds,
-      );
-    }
-    return snapshot;
-  }
-
-  updateBrowserSlot(
-    windowId: string,
-    tabId: string,
-    slotRevision: number,
-    layoutRevision: number,
-    bounds: Rectangle | null,
-  ): DesktopWindowSnapshot {
-    const record = this.requireWindow(windowId);
-    if (
-      bounds
-      && (!Number.isFinite(bounds.x) || !Number.isFinite(bounds.y)
-        || !Number.isFinite(bounds.width) || !Number.isFinite(bounds.height)
-        || bounds.width <= 0 || bounds.height <= 0)
-    ) {
-      throw new Error("browser_slot_bounds_invalid");
-    }
-    if (!record.layout.rightPaneVisible) {
-      // 折叠右栏时，即使 Renderer 的旧 ResizeObserver 晚到，也必须撤下
-      // 全部原生 Surface，避免失效 View 拦截主 Renderer 的设置和工具栏点击。
-      this.#surfaceManager.updateBrowserSlot(windowId, "", null);
-      return this.snapshot(windowId);
-    }
-    if (record.blockingOverlayActive) {
-      // Modal 打开后，Renderer 的 ResizeObserver 仍可能晚到。阻塞期间只
-      // 隐藏原生 Surface，不接受任何新的显示槽位，避免 Surface 重新盖住 Modal。
-      this.#surfaceManager.updateBrowserSlot(windowId, "", null);
-      return this.snapshot(windowId);
-    }
-    if (
-      record.layout.activePanelKind !== "browser"
-      || record.layout.activeTabId !== tabId
-    ) {
-      if (!bounds) this.#surfaceManager.updateBrowserSlot(windowId, tabId, null);
-      return this.snapshot(windowId);
-    }
-    if (layoutRevision !== record.layout.layoutRevision) return this.snapshot(windowId);
-    if (slotRevision <= record.browserSlotRevision) return this.snapshot(windowId);
-    record.browserSlotRevision = slotRevision;
-    if (!bounds) {
-      record.browserSlot = null;
-      this.#surfaceManager.updateBrowserSlot(windowId, tabId, null);
-      this.#overlayManager.close(windowId);
-      return this.snapshot(windowId);
-    }
-    const normalizedBounds = bounds
-      ? normalizeBrowserSlotBoundsWithinPane(
-          normalizeBrowserSlotBounds(bounds),
-          snapshotWindowLayout(record.layout).rightPaneBounds,
-        )
-      : null;
-    if (bounds && !normalizedBounds) throw new Error("browser_slot_outside_right_pane");
-    record.browserSlot = normalizedBounds ? { tabId, bounds: normalizedBounds } : null;
-    record.browserSlotLayoutRevision = normalizedBounds ? layoutRevision : -1;
-    // 激活请求尚未完成时先保留 DOM 槽位，但不允许旧 Surface 提前显示。
-    // activateBrowser 成功后会用同一槽位重新绑定当前 Surface。
-    this.#surfaceManager.updateBrowserSlot(
-      windowId,
-      tabId,
-      record.layout.activeSurfaceId ? normalizedBounds : null,
-    );
-    // 内容槽只负责定位原生 Surface。它可能因为内容边框、CSS 内边距或
-    // 子布局收敛而小于右栏轨道，不能反向改写 rightPaneWidth，否则会形成
-    // ResizeObserver -> Main -> DOM -> ResizeObserver 的几何反馈环。
-    const snapshot = this.snapshot(windowId);
-    this.#overlayManager.updateLayout(windowId, snapshot.layout, normalizedBounds);
-    return snapshot;
+    return this.applyLayout(record);
   }
 
   activatePanel(windowId: string, kind: PanelKind, tabId: string | null): DesktopWindowSnapshot {
@@ -368,9 +282,6 @@ export class WindowManager {
       tabId,
       surfaceId: null,
     });
-    record.browserSlot = null;
-    record.browserSlotRevision = 0;
-    record.browserSlotLayoutRevision = -1;
     return this.applyLayout(record);
   }
 
@@ -400,6 +311,18 @@ export class WindowManager {
     return record.context;
   }
 
+  /**
+   * App Renderer 是应用 DOM 的唯一原生焦点所有者。
+   *
+   * Browser WebContentsView 与 App Renderer 处于同一 BaseWindow 的原生
+   * 合成树，DOM 的 activeElement 不能代表原生 WebContents 焦点。因此
+   * App Renderer 在收到 pointerdown/focusin 后必须显式把焦点交还给自己。
+   */
+  focusApp(windowId: string): void {
+    const record = this.requireWindow(windowId);
+    if (!record.appView.webContents.isDestroyed()) record.appView.webContents.focus();
+  }
+
   async setBrowserViewport(
     windowId: string,
     tabId: string,
@@ -416,17 +339,31 @@ export class WindowManager {
 
   openOverlay(windowId: string, state: DesktopOverlayState): void {
     const record = this.requireWindow(windowId);
+    const browserTabId = state.ownerId.startsWith("browser:")
+      ? state.ownerId.slice("browser:".length)
+      : null;
+    const layout = snapshotWindowLayout(record.layout);
+    const currentBrowserContentBounds = browserTabId
+      && layout.activePanelKind === "browser"
+      && layout.activeTabId === browserTabId
+      ? browserContentBounds(layout)
+      : null;
     this.#overlayManager.open(
       windowId,
       state,
-      snapshotWindowLayout(record.layout),
-      record.browserSlot?.bounds ?? null,
+      layout,
+      currentBrowserContentBounds,
     );
   }
 
   closeOverlay(windowId: string): void {
-    this.requireWindow(windowId);
+    const record = this.requireWindow(windowId);
     this.#overlayManager.close(windowId);
+    const activeBrowserTabId = record.layout.activePanelKind === "browser"
+      ? record.layout.activeTabId
+      : null;
+    if (activeBrowserTabId && this.#surfaceManager.focusTab(windowId, activeBrowserTabId)) return;
+    if (!record.appView.webContents.isDestroyed()) record.appView.webContents.focus();
   }
 
   setBlockingOverlay(windowId: string, active: boolean): DesktopWindowSnapshot {
@@ -604,10 +541,7 @@ export class WindowManager {
         if (record.closed || !isMainFrame) return;
         record.rendererLoadFailed = true;
         record.rendererRecoveryUrl = this.trustedRendererUrl(record.windowId, validatedURL);
-        record.browserSlot = null;
-        record.browserSlotRevision = 0;
-        record.browserSlotLayoutRevision = -1;
-        this.#surfaceManager.updateBrowserSlot(record.windowId, "", null);
+        this.#surfaceManager.bindContentSurface(record.windowId, "", null);
         this.#overlayManager.close(record.windowId);
         console.error("[WindowManager] 可信 Renderer 加载失败", {
           windowId: record.windowId,
@@ -632,18 +566,15 @@ export class WindowManager {
         if (record.closed) return;
         record.rendererLoadFailed = true;
         record.rendererRecoveryUrl = this.trustedRendererUrl(record.windowId, view.webContents.getURL());
-        record.browserSlot = null;
-        record.browserSlotRevision = 0;
-        record.browserSlotLayoutRevision = -1;
-        this.#surfaceManager.updateBrowserSlot(record.windowId, "", null);
+        this.#surfaceManager.bindContentSurface(record.windowId, "", null);
         this.#overlayManager.close(record.windowId);
         console.error("[WindowManager] 可信 Renderer 进程退出", {
           windowId: record.windowId,
           reason: details.reason,
           exitCode: details.exitCode,
         });
-        // Renderer 已经丢失旧 DOM，必须先撤下旧槽位，再恢复 Renderer。
-        // 恢复完成后由新的 ResizeObserver 重新发布槽位，禁止旧坐标复活。
+        // Renderer 已经丢失旧 DOM，必须先撤下旧 Surface，再恢复 Renderer。
+        // 恢复完成后由 Main 的布局事务重新绑定当前 Browser Surface。
         void this.loadAppRenderer(
           record,
           record.rendererRecoveryUrl ?? this.rendererUrl(record.windowId),
@@ -707,39 +638,25 @@ export class WindowManager {
     const snapshot = this.snapshot(record.windowId);
     const { layout } = snapshot;
     record.appLayer.setBounds(layout.appBounds as Rectangle);
-    record.browserLayer.setBounds(layout.appBounds as Rectangle);
     record.overlayLayer.setBounds(layout.appBounds as Rectangle);
     record.appView.setBounds(layout.appBounds as Rectangle);
     record.appView.setVisible(true);
-    const browserSlot = record.browserSlot;
-    const browserSlotMatchesActiveTab = browserSlot?.tabId === layout.activeTabId;
-    const browserSlotMatchesLayout = browserSlotMatchesActiveTab
-      && record.browserSlotLayoutRevision === layout.layoutRevision;
     const showBrowserSurface = !record.blockingOverlayActive
-      && shouldShowBrowserSurface(layout, browserSlotMatchesLayout);
-    if (browserSlot && browserSlotMatchesActiveTab && !browserSlotMatchesLayout) {
-      record.browserSlot = null;
-      record.browserSlotLayoutRevision = -1;
-    }
+      && shouldShowBrowserSurface(layout, Boolean(layout.activeSurfaceId));
+    const currentBrowserContentBounds = showBrowserSurface ? browserContentBounds(layout) : null;
     if (!showBrowserSurface) {
-      this.#surfaceManager.updateBrowserSlot(record.windowId, "", null);
-      // 右栏折叠时不能保留旧内容槽。否则 App Renderer 已经移除右栏 DOM 后，
-      // 上一次的 WebContentsView 仍会作为 BaseWindow 的兄弟视图留在窗口上，
-      // 形成“右栏已经关闭但浏览器还覆盖着窗口”的悬浮层。
-      if (!layout.rightPaneVisible) record.browserSlot = null;
-    } else if (browserSlot && browserSlotMatchesLayout) {
-      // 恢复全局 modal 后只使用 Renderer 最近一次上报的槽位，不能重新
-      // 计算或持久化浏览器视口几何。
-      this.#surfaceManager.updateBrowserSlot(
+      this.#surfaceManager.bindContentSurface(record.windowId, "", null);
+    } else if (layout.activeTabId && currentBrowserContentBounds) {
+      // 右栏几何和原生 Surface 在同一个 Main 布局事务中更新。Renderer
+      // 不再通过 ResizeObserver 反向提交坐标，因此拖动期间不会出现
+      // “整窗父层 -> 内容槽父层”的中间状态，也不会隐藏页面等待下一帧。
+      this.#surfaceManager.bindContentSurface(
         record.windowId,
-        browserSlot.tabId,
-        browserSlot.bounds,
+        layout.activeTabId,
+        currentBrowserContentBounds,
       );
     }
-    // BrowserLayer 的可见性只由 BrowserSurfaceManager 根据真实 Surface 状态
-    // 收敛。WindowManager 只负责提交当前内容槽，避免布局状态提前显示一个
-    // 空的父层并拦截 App Renderer 的输入。
-    this.#overlayManager.updateLayout(record.windowId, layout, browserSlot?.bounds ?? null);
+    this.#overlayManager.updateLayout(record.windowId, layout, currentBrowserContentBounds);
     this.#onSnapshot(snapshot);
     return snapshot;
   }
@@ -769,49 +686,10 @@ export class WindowManager {
   }
 }
 
-function normalizeBrowserSlotBounds(bounds: Rectangle): Rectangle {
-  return {
-    x: Math.round(bounds.x),
-    y: Math.round(bounds.y),
-    width: Math.max(1, Math.round(bounds.width)),
-    height: Math.max(1, Math.round(bounds.height)),
-  };
-}
-
-function normalizeBrowserSlotBoundsWithinPane(
-  bounds: Rectangle,
-  rightPaneBounds: Rectangle | null,
-): Rectangle | null {
-  if (!rightPaneBounds) return null;
-  const epsilon = 2;
-  const right = bounds.x + bounds.width;
-  const bottom = bounds.y + bounds.height;
-  const paneRight = rightPaneBounds.x + rightPaneBounds.width;
-  const paneBottom = rightPaneBounds.y + rightPaneBounds.height;
-  if (
-    bounds.x < rightPaneBounds.x - epsilon
-    || bounds.y < rightPaneBounds.y - epsilon
-    || right > paneRight + epsilon
-    || bottom > paneBottom + epsilon
-  ) return null;
-  // 仅消除 DIP/CSS 四舍五入产生的 1~2px 误差；真实越界必须拒绝，不能
-  // 静默裁剪成一个看似有效但内容不完整的浏览器 Surface。
-  const x = Math.max(bounds.x, rightPaneBounds.x);
-  const y = Math.max(bounds.y, rightPaneBounds.y);
-  const clippedRight = Math.min(right, paneRight);
-  const clippedBottom = Math.min(bottom, paneBottom);
-  if (clippedRight <= x || clippedBottom <= y) return null;
-  return { x, y, width: clippedRight - x, height: clippedBottom - y };
-}
-
 function isStaleActivationError(error: unknown): boolean {
   return error instanceof Error
     && error.name === "BrowserSurfaceError"
     && error.message === "browser_surface_activation_stale";
-}
-
-function readBrowserSlot(record: DesktopWindowRecord): DesktopWindowRecord["browserSlot"] {
-  return record.browserSlot;
 }
 
 function nativeWindowsMaterial(
