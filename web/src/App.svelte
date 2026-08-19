@@ -307,25 +307,6 @@
     };
   });
 
-  // Electron 的 Browser WebContentsView 与 App Renderer 是两个独立的
-  // 原生焦点上下文。仅依赖 DOM 的 activeElement 不足以切回应用焦点：
-  // 输入框可能仍显示为 focused，但键盘事件实际还在浏览器页面中。
-  // 所有 App DOM 的用户点击和程序化聚焦都通过同一入口恢复原生焦点；
-  // 浏览器内容位于另一个 WebContents，不会触发这里的事件。
-  onMount(() => {
-    const desktop = window.magiDesktop;
-    if (!desktop || desktop.surface !== 'app') return;
-    const restoreAppFocus = () => {
-      void desktop.focusApp().catch(() => undefined);
-    };
-    document.addEventListener('pointerdown', restoreAppFocus, true);
-    document.addEventListener('focusin', restoreAppFocus, true);
-    return () => {
-      document.removeEventListener('pointerdown', restoreAppFocus, true);
-      document.removeEventListener('focusin', restoreAppFocus, true);
-    };
-  });
-
 </script>
 
 <div class="app-container">

@@ -152,6 +152,9 @@ if (singleInstance) {
     handshake: () => handshake(worker!),
   });
   controlServer = control;
+  // ProcessSupervisor 的 ready 回调会恢复窗口状态；窗口必须先建立，才能
+  // 接管已经运行的 daemon，否则外部复用路径会在启动阶段找不到活动窗口。
+  manager.createWindow();
   await control.start();
   processSupervisor = new ProcessSupervisor({
     daemonPath: paths.daemon,
@@ -180,7 +183,6 @@ if (singleInstance) {
     broadcastAll("magi-desktop:update", snapshot);
   });
   registerIpc();
-  manager.createWindow();
   startBrowserComponentSnapshots();
   }).catch(async (error) => {
     console.error("Magi Desktop 启动失败", error);
@@ -247,10 +249,6 @@ function registerIpc(): void {
   ipcMain.handle("magi-desktop:right-pane-ready", (event) => {
     const { manager, windowId } = trustedAppSender(event.sender.id);
     manager.handleRightPaneReady(windowId);
-  });
-  ipcMain.handle("magi-desktop:focus-app", (event) => {
-    const { manager, windowId } = trustedAppSender(event.sender.id);
-    manager.focusApp(windowId);
   });
   ipcMain.handle("magi-desktop:open-overlay", (event, value: unknown) => {
     const { manager, windowId } = trustedAppSender(event.sender.id);

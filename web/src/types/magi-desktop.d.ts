@@ -185,7 +185,6 @@ interface MagiDesktopBridge {
     viewport: MagiDesktopViewportIntent;
   }): Promise<MagiDesktopWindowSnapshot>;
   readyRightPane(): Promise<void>;
-  focusApp(): Promise<void>;
   openOverlay(state: Omit<MagiDesktopOverlayState, 'overlayId' | 'phase'> & { overlayId?: string; phase?: MagiDesktopOverlayState['phase'] }): Promise<void>;
   closeOverlay(): Promise<void>;
   setBlockingOverlay(request: { active: boolean }): Promise<MagiDesktopWindowSnapshot>;

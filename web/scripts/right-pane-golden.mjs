@@ -70,11 +70,11 @@ await withGoldenViteServer(async (server) => {
   assert.match(windowManagerSource, /this\.#surfaceManager\.bindContentSurface\(/u);
   assert.match(windowManagerSource, /record\.appView\.setBounds\(layout\.appBounds/u);
   assert.doesNotMatch(windowManagerSource, /updateBrowserSlot/u);
-  assert.doesNotMatch(surfaceManagerSource, /contentView\.(?:addChildView|removeChildView)\(/u);
+  assert.match(surfaceManagerSource, /record\.host\.addChildView\(record\.view, 1\)/u);
   assert.match(surfaceManagerSource, /bindContentSurface\(windowId: string, tabId: string, bounds: Rectangle \| null\)/u);
-  assert.match(surfaceManagerSource, /record\.layer\.setBounds\(bounds\)[\s\S]*?record\.view\.setBounds\(localBounds\)/u);
+  assert.match(surfaceManagerSource, /record\.view\.setBounds\(bounds\)/u);
   assert.match(surfaceManagerSource, /const visible = bounds !== null && !record\.loadFailed/u);
-  assert.match(surfaceManagerSource, /private unmountSurface\([\s\S]*?保留最后有效的非零 bounds/u);
+  assert.match(surfaceManagerSource, /private unmountSurface\([\s\S]*?只解绑原生 View，不关闭 WebContents/u);
   assert.match(surfaceManagerSource, /private async waitForDebugger\(/u);
   assert.match(surfaceManagerSource, /debugger-detached:[\s\S]*?reconnectDebugger/u);
   assert.match(surfaceManagerSource, /Page\.captureScreenshot/u);

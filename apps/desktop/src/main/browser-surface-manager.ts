@@ -68,10 +68,10 @@ interface BrowserSurfaceRecord {
   partitionId: string;
   view: WebContentsView;
   contents: WebContents;
-  layer: View;
+  host: View;
   /**
-   * 每个 Browser Tab 保留独立 WebContents，后台 Surface 仍挂在同一窗口的
-   * 内容层但保持零尺寸和不可见，不销毁页面状态，也不允许覆盖 App Renderer。
+   * 每个 Browser Tab 保留独立 WebContents；非当前 Surface 从窗口内容视图
+   * 解绑但不销毁 WebContents，重新激活时再挂回，不丢失页面状态。
    */
   mounted: boolean;
   slotVisible: boolean;
@@ -241,7 +241,6 @@ export class BrowserSurfaceManager {
   readonly #knownPartitions = new Set<string>();
   readonly #partitionRegistryPath: string | null;
   readonly #windows = new Map<string, BaseWindow>();
-  readonly #layers = new Map<string, View>();
   readonly #activationGenerations = new Map<string, number>();
   readonly #onEvent: (event: BrowserSurfaceEvent) => void;
 
@@ -258,11 +257,9 @@ export class BrowserSurfaceManager {
     }
   }
 
-  attachWindow(windowId: string, window: BaseWindow, layer: View): void {
+  attachWindow(windowId: string, window: BaseWindow): void {
     this.#windows.set(windowId, window);
-    this.#layers.set(windowId, layer);
     this.#activationGenerations.set(windowId, 0);
-    layer.setVisible(false);
   }
 
   setActivationGeneration(windowId: string, generation: number): void {
@@ -317,9 +314,8 @@ export class BrowserSurfaceManager {
   }
   private createSurface(input: MaterializeSurfaceInput): BrowserSurfaceRecord {
     const window = this.#windows.get(input.windowId);
-    const layer = this.#layers.get(input.windowId);
     if (!window || window.isDestroyed()) throw new Error("desktop_window_not_found");
-    if (!layer) throw new Error("desktop_browser_layer_not_found");
+    const host = window.contentView;
     const partitionId = browserPartitionId(input.browserSessionId);
     this.configurePartition(partitionId);
     const view = new WebContentsView({
@@ -342,7 +338,7 @@ export class BrowserSurfaceManager {
       partitionId,
       view,
       contents,
-      layer,
+      host,
       mounted: false,
       slotVisible: false,
       slotBounds: null,
@@ -373,10 +369,8 @@ export class BrowserSurfaceManager {
       loadPromise: null,
     };
     this.#surfaces.add(record);
-    // 每个真实 Browser Surface 都必须挂在所属 BaseWindow 的内容层，但没有
-    // 当前 DOM 内容槽时只能以零尺寸、不可见状态存在。这样 Chromium 页面
-    // 生命周期和 CDP 文档树不会依赖右栏 ResizeObserver 的时序，同时绝不
-    // 创建覆盖窗口的隐藏预渲染层。
+    // WebContents 的生命周期独立于原生 View 的挂载生命周期。没有当前
+    // 内容槽时不挂载 View，避免隐藏的 Chromium 原生子视图继续参与命中测试。
     this.applySlot(record, null, window);
     contents.once("destroyed", () => {
       if (record.closed) return;
@@ -417,13 +411,13 @@ export class BrowserSurfaceManager {
         this.applySlot(record, bounds, window);
       } else if (bounds) {
         // 一个窗口只能有一个当前 Browser Surface；切换到新的内容槽时，
-        // 其他 WebContents 保留状态并以零尺寸留在 BaseWindow 子视图树中。
+        // 其他 WebContents 保留状态，但从窗口内容视图解绑以彻底退出
+        // 原生命中树。
         record.slotBounds = null;
         record.slotVisible = false;
         this.unmountSurface(record, window);
       }
     }
-    this.syncLayerVisibility(windowId);
   }
 
   bindingForTabInWindow(tabId: string, windowId: string): BrowserSurfaceBinding | null {
@@ -677,7 +671,6 @@ export class BrowserSurfaceManager {
       if (record.windowId === windowId) this.closeRecord(record);
     }
     this.#windows.delete(windowId);
-    this.#layers.delete(windowId);
     this.#activationGenerations.delete(windowId);
   }
 
@@ -685,7 +678,6 @@ export class BrowserSurfaceManager {
     for (const record of [...this.#surfaces.values()]) this.closeRecord(record, false);
     this.#surfaces.clear();
     this.#windows.clear();
-    this.#layers.clear();
     this.#activationGenerations.clear();
   }
 
@@ -722,26 +714,25 @@ export class BrowserSurfaceManager {
       this.detachSurface(record, window);
       return;
     }
+    if (!bounds) {
+      this.detachSurface(record, window);
+      return;
+    }
     if (!record.mounted) {
-      // Browser Surface 只能挂在固定 BrowserLayer。层级由 WindowManager
-      // 一次性建立，Surface 生命周期不得通过 addChildView 重排整窗原生层。
-      record.layer.addChildView(record.view);
+      // Browser Surface 与 App Layer、Overlay Layer 是 contentView 的同级
+      // 原生视图。固定插入到 App Layer 之后、Overlay Layer 之前，避免
+      // 嵌套 View 在 Electron 43/macOS 下扩大 WebContents 的命中区域。
+      record.host.addChildView(record.view, 1);
       record.mounted = true;
     }
-    if (bounds) {
-      // BrowserLayer 本身也必须只占当前内容槽。若父层仍保持整窗 bounds，
-      // 即使 WebContentsView 只有右栏大小，父层仍可能参与全窗口命中测试，
-      // 让主 Renderer 的左栏和中间区域无法点击。子视图改用父层内坐标。
-      record.layer.setBounds(bounds);
-      const localBounds = { x: 0, y: 0, width: bounds.width, height: bounds.height };
-      if (!sameBounds(record.view.getBounds(), localBounds)) record.view.setBounds(localBounds);
-    }
+    // WebContentsView 直接使用 contentView 坐标，命中区域与内容槽严格
+    // 一致，不经过额外父 View 的坐标转换或命中测试。
+    if (!sameBounds(record.view.getBounds(), bounds)) record.view.setBounds(bounds);
     // 页面加载和调试器初始化是 Surface 内部状态，不能阻塞真实浏览器
     // 视图进入内容槽。Chromium 自行展示当前文档及加载过程；只有失败页
     // 才隐藏，避免激活流程变成“正在连接浏览器”的空白等待层。
     const visible = bounds !== null && !record.loadFailed;
     record.view.setVisible(visible);
-    this.syncLayerVisibility(record.windowId);
   }
 
   private async loadPage(
@@ -836,30 +827,18 @@ export class BrowserSurfaceManager {
   }
 
   private unmountSurface(record: BrowserSurfaceRecord, window: BaseWindow | undefined): void {
-    if (!record.mounted) return;
-    record.view.setVisible(false);
-    // 隐藏 Surface 时保留最后有效的非零 bounds。将 WebContentsView 改成 0x0
-    // 会触发 Chromium 的 viewport 重排，导致页面滚动、媒体查询和 SPA 状态
-    // 在切换 Tab、模态层或窗口尺寸时反复变化；Surface 关闭时才从宿主移除。
-    void window;
-    this.syncLayerVisibility(record.windowId);
+    // 只解绑原生 View，不关闭 WebContents。这样切换 Tab、面板或失败恢复
+    // 都不会让后台页面进入命中树，也不会因为反复改成 0x0 而触发 Chromium
+    // viewport 重排；重新获得内容槽时 applySlot 会复用同一个 WebContents。
+    this.detachSurface(record, window);
   }
 
   private detachSurface(record: BrowserSurfaceRecord, window: BaseWindow | undefined): void {
-    if (!record.mounted) return;
-    record.view.setVisible(false);
-    if (window && !window.isDestroyed()) record.layer.removeChildView(record.view);
-    record.mounted = false;
-    this.syncLayerVisibility(record.windowId);
-  }
-
-  private syncLayerVisibility(windowId: string): void {
-    const layer = this.#layers.get(windowId);
-    if (!layer) return;
-    const visible = [...this.#surfaces.values()].some((record) => (
-      record.windowId === windowId && this.isRenderable(record)
-    ));
-    layer.setVisible(visible);
+    if (record.mounted) {
+      record.view.setVisible(false);
+      if (window && !window.isDestroyed()) record.host.removeChildView(record.view);
+      record.mounted = false;
+    }
   }
 
   private isRenderable(record: BrowserSurfaceRecord): record is BrowserSurfaceRecord & {

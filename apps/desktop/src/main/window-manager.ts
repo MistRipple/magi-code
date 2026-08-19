@@ -31,7 +31,6 @@ interface DesktopWindowRecord {
   windowId: string;
   window: BaseWindow;
   appLayer: View;
-  browserLayer: View;
   overlayLayer: View;
   appView: WebContentsView;
   layout: WindowLayoutState;
@@ -119,19 +118,16 @@ export class WindowManager {
     });
     this.applyNativeAppearance(window, this.#appearance);
     const appLayer = new View();
-    const browserLayer = new View();
     const overlayLayer = new View();
     window.contentView.addChildView(appLayer);
-    window.contentView.addChildView(browserLayer);
     window.contentView.addChildView(overlayLayer);
-    // 空的原生层不能参与窗口命中测试。它们仍固定挂在 contentView 上，
-    // 但只有真正拥有可见子视图时才打开；否则会挡住 App Renderer 的 DOM
-    // 点击，表现为“按钮能看到但点击没有响应”。
-    browserLayer.setVisible(false);
+    // Browser Surface 由 SurfaceManager 直接作为 contentView 的同级子视图
+    // 插入到 App Layer 与 Overlay Layer 之间。空闲时不存在会覆盖 DOM 的
+    // 空 BrowserLayer。
     overlayLayer.setVisible(false);
     const appView = this.createTrustedView("app", windowId);
     appLayer.addChildView(appView);
-    this.#surfaceManager.attachWindow(windowId, window, browserLayer);
+    this.#surfaceManager.attachWindow(windowId, window);
     this.#overlayManager.create(windowId, window, overlayLayer);
     const contentBounds = window.getContentBounds();
     const layout = createWindowLayoutState({
@@ -144,7 +140,6 @@ export class WindowManager {
       windowId,
       window,
       appLayer,
-      browserLayer,
       overlayLayer,
       appView,
       layout,
@@ -282,7 +277,14 @@ export class WindowManager {
       tabId,
       surfaceId: null,
     });
-    return this.applyLayout(record);
+    const snapshot = this.applyLayout(record);
+    // 面板身份已经在 Main 事务中完成切换。非浏览器面板的键盘和后续
+    // DOM 交互必须回到 App Renderer，不能由 Renderer 在 pointerdown/focusin
+    // 中再次抢焦点，否则原生 WebContents 切换会打断当前 click 事件。
+    if (kind !== "browser" && !record.appView.webContents.isDestroyed()) {
+      record.appView.webContents.focus();
+    }
+    return snapshot;
   }
 
   handleRightPaneReady(windowId: string): void {
@@ -309,18 +311,6 @@ export class WindowManager {
       record.appView.webContents.send("magi-desktop:context", record.context);
     }
     return record.context;
-  }
-
-  /**
-   * App Renderer 是应用 DOM 的唯一原生焦点所有者。
-   *
-   * Browser WebContentsView 与 App Renderer 处于同一 BaseWindow 的原生
-   * 合成树，DOM 的 activeElement 不能代表原生 WebContents 焦点。因此
-   * App Renderer 在收到 pointerdown/focusin 后必须显式把焦点交还给自己。
-   */
-  focusApp(windowId: string): void {
-    const record = this.requireWindow(windowId);
-    if (!record.appView.webContents.isDestroyed()) record.appView.webContents.focus();
   }
 
   async setBrowserViewport(
@@ -676,7 +666,6 @@ export class WindowManager {
     this.#surfaceManager.closeWindow(record.windowId);
     if (!record.window.isDestroyed()) {
       record.window.contentView.removeChildView(record.appLayer);
-      record.window.contentView.removeChildView(record.browserLayer);
       record.window.contentView.removeChildView(record.overlayLayer);
     }
     if (!record.appView.webContents.isDestroyed()) record.appView.webContents.close();

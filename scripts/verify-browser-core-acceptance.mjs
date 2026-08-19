@@ -119,8 +119,16 @@ assert.doesNotMatch(tabSource, /updateBrowserSlot|bindContentSurface/u);
 assert.doesNotMatch(tabSource, /transform:\s*scale\(|object-fit:\s*(fill|cover)|surfaceWidth|surfaceHeight/u);
 assert.match(windowManager, /browserContentBounds\(layout\)[\s\S]*?bindContentSurface\(/u);
 assert.match(windowManager, /record\.appLayer\.setBounds\(layout\.appBounds[\s\S]*?record\.appView\.setBounds\(layout\.appBounds/u);
-assert.match(surfaceManager, /record\.layer\.setBounds\(bounds\)[\s\S]*?record\.view\.setBounds\(localBounds\)/u);
-assert.doesNotMatch(surfaceManager, /contentView\.(?:addChildView|removeChildView)\(/u);
+assert.match(
+  surfaceManager,
+  /record\.host\.addChildView\(record\.view, 1\)[\s\S]*?record\.view\.setBounds\(bounds\)/u,
+  "Browser Surface 必须作为 contentView 的同级视图使用绝对内容槽坐标",
+);
+assert.match(
+  surfaceManager,
+  /record\.host\.removeChildView\(record\.view\)/u,
+  "非当前 Browser Surface 必须从原生命中树解绑但保留 WebContents",
+);
 
 assert.match(
   workerSource,

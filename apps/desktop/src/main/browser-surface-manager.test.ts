@@ -32,10 +32,9 @@ function section(value: string, startMarker: string, endMarker: string): string 
 
 test("Browser Surface 只接受 Main 布局计算出的内容槽", () => {
   assert.match(source, /bindContentSurface\(windowId: string, tabId: string, bounds: Rectangle \| null\)/u);
-  assert.match(source, /record\.layer\.setBounds\(bounds\)/u);
-  assert.match(source, /const localBounds = \{ x: 0, y: 0, width: bounds\.width, height: bounds\.height \}/u);
-  assert.match(source, /record\.view\.setBounds\(localBounds\)/u);
-  assert.doesNotMatch(source, /contentView\.(?:addChildView|removeChildView)\(/u);
+  assert.match(source, /record\.host\.addChildView\(record\.view, 1\)/u);
+  assert.match(source, /record\.view\.setBounds\(bounds\)/u);
+  assert.match(source, /record\.host\.removeChildView\(record\.view\)/u);
 });
 
 test("右栏布局和原生 Surface 使用同一 Main 事务", () => {
@@ -80,17 +79,15 @@ test("页面导航期间保持原生页面可见，只有明确失败才撤下",
   assert.match(source, /did-start-navigation[\s\S]*?loading_changed/u);
   assert.match(source, /did-fail-load[\s\S]*?record\.loadFailed = true[\s\S]*?this\.unmountSurface\(record/u);
   assert.match(source, /did-finish-load[\s\S]*?this\.applySlot\(\s*record/u);
-  assert.match(source, /private unmountSurface\([\s\S]*?保留最后有效的非零 bounds/u);
+  assert.match(source, /private unmountSurface\([\s\S]*?只解绑原生 View，不关闭 WebContents/u);
   assert.doesNotMatch(source, /did-start-navigation[\s\S]*?setBounds\(\{ x: 0, y: 0, width: 0/u);
 });
 
 test("Surface 布局和加载回调不隐式抢占 App Renderer 焦点", () => {
   const applySlot = section(source, "private applySlot(", "private async loadPage(");
   assert.doesNotMatch(applySlot, /contents\.focus\(\)/u);
-  assert.match(windowManagerSource, /focusApp\(windowId: string\)/u);
-  assert.match(indexSource, /magi-desktop:focus-app/u);
-  assert.match(readFileSync(new URL("../../../../apps/desktop/src/preload/index.ts", import.meta.url), "utf8"), /focusApp:/u);
-  assert.match(readFileSync(new URL("../../../../web/src/App.svelte", import.meta.url), "utf8"), /document\.addEventListener\('pointerdown', restoreAppFocus, true\)/u);
+  assert.match(windowManagerSource, /activatePanel\([\s\S]*?record\.appView\.webContents\.focus\(\)/u);
+  assert.doesNotMatch(readFileSync(new URL("../../../../web/src/App.svelte", import.meta.url), "utf8"), /restoreAppFocus|document\.addEventListener\('pointerdown'/u);
 });
 
 test("debugger detach 只后台重连，不把页面当成崩溃刷新", () => {
@@ -104,7 +101,7 @@ test("切换 Browser Tab 保留各自 WebContents，非当前 Surface 不参与�
   assert.match(source, /record\.tabId === tabId[\s\S]*?this\.applySlot\(record, bounds, window\)/u);
   assert.match(source, /else if \(bounds\) \{[\s\S]*?this\.unmountSurface\(record, window\)/u);
   assert.match(source, /private unmountSurface\([\s\S]*?record\.view\.setVisible\(false\)/u);
-  assert.match(source, /private detachSurface\([\s\S]*?record\.layer\.removeChildView\(record\.view\)/u);
+  assert.match(source, /private detachSurface\([\s\S]*?record\.host\.removeChildView\(record\.view\)/u);
   assert.match(windowManagerSource, /activateBrowser\([\s\S]*?bindContentSurface\(input\.windowId, "", null\)/u);
 });
 
@@ -166,8 +163,9 @@ test("权限和安全边界不读取外部浏览器资料", () => {
   assert.doesNotMatch(source, /chrome-user-data|Default\/Cookies|app\.getPath\("userData"\).*Chrome/u);
 });
 
-test("原生 View 层级固定，关闭 Overlay 后恢复焦点", () => {
-  assert.match(windowManagerSource, /const appLayer = new View\(\);[\s\S]*?const browserLayer = new View\(\);[\s\S]*?const overlayLayer = new View\(\)/u);
-  assert.match(windowManagerSource, /window\.contentView\.addChildView\(appLayer\)[\s\S]*?window\.contentView\.addChildView\(browserLayer\)[\s\S]*?window\.contentView\.addChildView\(overlayLayer\)/u);
+test("原生 View 层级固定，浏览器与 App、Overlay 同级", () => {
+  assert.match(windowManagerSource, /const appLayer = new View\(\);[\s\S]*?const overlayLayer = new View\(\)/u);
+  assert.match(windowManagerSource, /window\.contentView\.addChildView\(appLayer\)[\s\S]*?window\.contentView\.addChildView\(overlayLayer\)/u);
+  assert.match(source, /record\.host\.addChildView\(record\.view, 1\)/u);
   assert.match(windowManagerSource, /closeOverlay\([\s\S]*?record\.appView\.webContents\.focus\(\)/u);
 });

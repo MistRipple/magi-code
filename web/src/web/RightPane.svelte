@@ -518,17 +518,18 @@
   });
 
   let activeDesktopPanelKey = '';
-  $effect(() => {
+  function synchronizeDesktopPanel(current: RightPaneTab | null): void {
     if (!desktopSurface) return;
-    const current = activeTab;
     if (current?.kind === 'browser') {
       activeDesktopPanelKey = '';
       return;
     }
     const key = current ? `${current.kind}:${current.id}` : 'empty';
     if (key === activeDesktopPanelKey) return;
+    const desktop = window.magiDesktop;
+    if (!desktop) return;
     activeDesktopPanelKey = key;
-    void window.magiDesktop?.activatePanel({
+    void desktop.activatePanel({
       kind: current?.kind ?? null,
       tabId: current?.id ?? null,
     }).catch((error) => {
@@ -536,6 +537,10 @@
       activeDesktopPanelKey = '';
       console.warn('[RightPane] 激活桌面右栏面板失败:', error);
     });
+  }
+
+  $effect(() => {
+    synchronizeDesktopPanel(activeTab);
   });
 
   // ============ Code tab：内容拉取 ============
