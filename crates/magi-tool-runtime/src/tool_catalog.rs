@@ -349,12 +349,6 @@ impl RuntimeHealth {
                 self.agent_role_tool_status()
             }
             BuiltinToolName::ImageGenerate => self.image_generation_tool_status(),
-            BuiltinToolName::BrowserUploadFile => RuntimeToolStatus {
-                status: "unsupported",
-                warnings: vec![
-                    "文件上传需要显式 Desktop 文件授权，当前版本不会隐式读取本地文件".to_string(),
-                ],
-            },
             _ => RuntimeToolStatus {
                 status: "ready",
                 warnings: Vec::new(),

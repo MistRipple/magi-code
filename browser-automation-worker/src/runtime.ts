@@ -5,6 +5,7 @@ import type {
   BrowserHostCommand,
   BrowserSnapshot,
   BrowserSnapshotTarget,
+  BrowserAccessibilityNode,
   BrowserSurfaceBinding,
   WorkerCommandResponse,
 } from "@magi/desktop-browser-contracts";
@@ -23,8 +24,25 @@ interface PageRuntimeState {
   heapSnapshotChunks: string[];
   traceActive: boolean;
   traceEvents: Array<Record<string, unknown>>;
+  profilerActive: boolean;
+  coverageActive: boolean;
+  heapSnapshot: HeapSnapshotData | null;
+  previousHeapSnapshot: HeapSnapshotData | null;
   cdpDomainsReady: boolean;
   cdpDomainsPromise: Promise<void> | null;
+}
+
+interface HeapSnapshotData {
+  meta: Record<string, unknown>;
+  nodes: number[];
+  edges: number[];
+  strings: string[];
+  nodeFieldIndex: Record<string, number>;
+  edgeFieldIndex: Record<string, number>;
+  nodeTypes: string[];
+  edgeTypes: string[];
+  nodeFieldCount: number;
+  edgeFieldCount: number;
 }
 
 export class BrowserAutomationRuntime {
@@ -156,6 +174,10 @@ export class BrowserAutomationRuntime {
       heapSnapshotChunks: current?.heapSnapshotChunks ?? [],
       traceActive: current?.traceActive ?? false,
       traceEvents: current?.traceEvents ?? [],
+      profilerActive: current?.profilerActive ?? false,
+      coverageActive: current?.coverageActive ?? false,
+      heapSnapshot: current?.heapSnapshot ?? null,
+      previousHeapSnapshot: current?.previousHeapSnapshot ?? null,
       cdpDomainsReady: false,
       cdpDomainsPromise: null,
     };
@@ -256,12 +278,42 @@ export class BrowserAutomationRuntime {
         `expected ${snapshotRevision}, received ${value.snapshot_revision}`,
       );
     }
+    const accessibilityTree = await this.accessibilityTree(binding, safeInteger(limits.max_nodes, 400));
     return {
       tab_id: binding.tab_id,
       navigation_revision: binding.navigation_revision,
       ...value,
       continuation_refs: [],
+      accessibility_tree: accessibilityTree,
     };
+  }
+
+  private async accessibilityTree(binding: BrowserSurfaceBinding, maxNodes: number): Promise<BrowserAccessibilityNode[]> {
+    const response = await this.#cdp.send<{ nodes?: Array<Record<string, unknown>> }>(
+      binding,
+      "Accessibility.getFullAXTree",
+      {},
+    );
+    const nodes = Array.isArray(response.nodes) ? response.nodes : [];
+    return nodes.slice(0, maxNodes).map((node) => ({
+      node_id: String(node.nodeId ?? ""),
+      parent_id: node.parentId == null ? null : String(node.parentId),
+      child_ids: Array.isArray(node.childIds) ? node.childIds.map(String) : [],
+      role: axValue(node.role),
+      name: axValue(node.name),
+      value: axValue(node.value),
+      description: axValue(node.description),
+      ignored: Boolean(node.ignored),
+      properties: Array.isArray(node.properties)
+        ? Object.fromEntries(node.properties
+          .filter((property): property is { name: string; value?: unknown } => Boolean(property && typeof property === "object" && typeof (property as { name?: unknown }).name === "string"))
+          .map((property) => [property.name, axValueObject(property.value)]))
+        : {},
+      actions: Array.isArray(node.actions)
+        ? node.actions.map((action) => typeof action === "object" && action !== null ? String((action as { name?: unknown }).name ?? "") : String(action)).filter(Boolean)
+        : [],
+      backend_dom_node_id: typeof node.backendDOMNodeId === "number" ? node.backendDOMNodeId : null,
+    }));
   }
 
   private async setAnnotations(binding: BrowserSurfaceBinding, annotations: unknown[]): Promise<unknown> {
@@ -493,10 +545,7 @@ export class BrowserAutomationRuntime {
       case "pwa":
         return this.pwaAudit(binding);
       case "third_party":
-        throw protocolFailure(
-          "capability_unavailable",
-          "third-party developer tools are not registered until a real page tool protocol is available",
-        );
+        return this.thirdParty(binding, args);
       case "heap":
         return this.heap(binding, args);
       case "scripts":
@@ -504,18 +553,80 @@ export class BrowserAutomationRuntime {
       case "overlay":
         return this.overlay(binding, args);
       case "lighthouse":
-        throw protocolFailure(
-          "capability_unavailable",
-          "Lighthouse is not registered until the real Lighthouse engine is bundled",
-        );
+        return this.lighthouse(binding, args);
       case "upload_file":
-        throw protocolFailure(
-          "capability_unavailable",
-          "file upload is not registered until the Desktop file authorization pipeline is available",
-        );
+        return this.uploadFile(binding, args);
       default:
         throw protocolFailure("browser_devtools_operation_unsupported", operation);
     }
+  }
+
+  private async uploadFile(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
+    const snapshot = snapshotTarget(args);
+    const target = await this.target(binding, snapshot);
+    const paths = Array.isArray(args.file_paths)
+      ? args.file_paths.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      : typeof args.file_path === "string" && args.file_path.trim() ? [args.file_path.trim()] : [];
+    if (!paths.length) throw protocolFailure("browser_upload_file_invalid", "file_path or file_paths is required");
+    if (!target.editable) throw protocolFailure("browser_upload_target_invalid", "target must be a file input");
+    const document = await this.#cdp.send<{ root: { nodeId: number } }>(binding, "DOM.getDocument", { depth: -1, pierce: true });
+    const selector = await this.evaluate<string | null>(
+      binding,
+      "(() => { const e = globalThis.__magiBrowserAutomation.resolve(" + JSON.stringify(snapshot.element_ref) + ", " + safeInteger(snapshot.snapshot_revision, 0) + "); return e instanceof HTMLInputElement && e.type === 'file' ? globalThis.__magiBrowserAutomation.cssPath(e) : null; })()",
+    );
+    if (!selector) throw protocolFailure("browser_upload_target_invalid", "target must be a file input");
+    const node = await this.#cdp.send<{ nodeId?: number }>(binding, "DOM.querySelector", { nodeId: document.root.nodeId, selector });
+    if (!node.nodeId) throw protocolFailure("browser_upload_target_invalid", "file input is no longer connected");
+    await this.#cdp.send(binding, "DOM.setFileInputFiles", { nodeId: node.nodeId, files: paths });
+    await this.#cdp.send(binding, "DOM.focus", { nodeId: node.nodeId });
+    return { uploaded: paths.map((path) => path.split(/[\\\\/]/).pop() || path), count: paths.length };
+  }
+
+  private async thirdParty(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
+    const page = this.page(binding);
+    if (args.action === "clear") {
+      page.network.length = 0;
+      return { cleared: true };
+    }
+    const entries = page.network.filter((entry) => entry.type === "response" || entry.requestId);
+    const origin = await this.evaluate<string>(binding, "location.origin");
+    const groups = new Map<string, { origin: string; requests: number; bytes: number; resource_types: Record<string, number>; urls: string[] }>();
+    for (const entry of entries) {
+      const url = typeof entry.url === "string" ? entry.url : "";
+      if (!url) continue;
+      let resourceOrigin: string;
+      try { resourceOrigin = new URL(url).origin; } catch { continue; }
+      if (resourceOrigin === origin || resourceOrigin === "null") continue;
+      const group = groups.get(resourceOrigin) ?? { origin: resourceOrigin, requests: 0, bytes: 0, resource_types: {}, urls: [] };
+      group.requests += 1;
+      group.bytes += Number(entry.encodedDataLength ?? entry.encoded_data_length ?? 0) || 0;
+      const type = String(entry.type ?? entry.resourceType ?? "other");
+      group.resource_types[type] = (group.resource_types[type] ?? 0) + 1;
+      if (group.urls.length < 20) group.urls.push(url);
+      groups.set(resourceOrigin, group);
+    }
+    return { page_origin: origin, entries: [...groups.values()].sort((a, b) => b.bytes - a.bytes || b.requests - a.requests), total_requests: entries.length };
+  }
+
+  private async lighthouse(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
+    const mode = String(args.mode ?? "snapshot");
+    if (mode !== "snapshot" && mode !== "navigation") throw protocolFailure("browser_lighthouse_invalid", "mode must be snapshot or navigation");
+    const lighthouseModule = await import("lighthouse");
+    const lighthouse = lighthouseModule.default;
+    const pageHandle = createLighthousePage(this.#cdp, binding, () => this.page(binding));
+    const page = pageHandle as unknown as NonNullable<Parameters<typeof lighthouse>[3]>;
+    const flags = {
+      logLevel: "error" as const,
+      disableStorageReset: true,
+      output: "json" as const,
+      ...(args.device === "desktop" ? { preset: "desktop" as const } : {}),
+    };
+    const result = mode === "navigation"
+      ? await lighthouse(await page.url(), flags, undefined, page)
+      : await lighthouseModule.snapshot(page, { flags });
+    if (!result) throw protocolFailure("browser_lighthouse_failed", "Lighthouse returned no result");
+    const lhr = (result as unknown as { lhr?: Record<string, unknown> }).lhr ?? {};
+    return { mode, url: await pageHandle.url(), lighthouse_version: lhr.lighthouseVersion ?? null, categories: lhr.categories ?? {}, audits: lhr.audits ?? {}, timing: lhr.timing ?? null };
   }
 
   private async fillForm(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
@@ -563,12 +674,16 @@ export class BrowserAutomationRuntime {
   }
 
   private async pwaAudit(binding: BrowserSurfaceBinding): Promise<unknown> {
-    return this.evaluate(binding, `(() => ({
+    const manifest = await this.#cdp.send<Record<string, unknown>>(binding, "Page.getAppManifest").catch(() => ({}));
+    const pageState = await this.evaluate<Record<string, unknown>>(binding, `(() => ({
       manifest: document.querySelector('link[rel="manifest"]')?.href || null,
       serviceWorkerControlled: Boolean(navigator.serviceWorker?.controller),
       secureContext: globalThis.isSecureContext,
-      displayMode: matchMedia('(display-mode: standalone)').matches ? 'standalone' : 'browser'
+      displayMode: matchMedia('(display-mode: standalone)').matches ? 'standalone' : 'browser',
+      hasServiceWorker: Boolean(navigator.serviceWorker),
+      scope: navigator.serviceWorker?.controller?.scriptURL || null
     }))()`);
+    return { ...pageState, app_manifest: manifest };
   }
 
   private async network(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
@@ -715,6 +830,39 @@ export class BrowserAutomationRuntime {
       page.traceActive = false;
       return { stopped: true, events: page.traceEvents };
     }
+    if (action === "profile_start") {
+      if (page.profilerActive) return { started: true, already_active: true };
+      await this.#cdp.send(binding, "Profiler.enable");
+      await this.#cdp.send(binding, "Profiler.start");
+      page.profilerActive = true;
+      return { started: true, type: "cpu_profile" };
+    }
+    if (action === "profile_stop") {
+      if (!page.profilerActive) return { stopped: false, profile: null };
+      const profile = await this.#cdp.send(binding, "Profiler.stop");
+      page.profilerActive = false;
+      await this.#cdp.send(binding, "Profiler.disable");
+      return { stopped: true, profile };
+    }
+    if (action === "coverage_start") {
+      if (page.coverageActive) return { started: true, already_active: true };
+      await this.#cdp.send(binding, "Profiler.enable");
+      await this.#cdp.send(binding, "Profiler.startPreciseCoverage", { callCount: true, detailed: true });
+      page.coverageActive = true;
+      return { started: true, type: "precise_coverage" };
+    }
+    if (action === "coverage_take") {
+      if (!page.coverageActive) throw protocolFailure("browser_coverage_not_started", "coverage_start must run first");
+      return this.#cdp.send(binding, "Profiler.takePreciseCoverage");
+    }
+    if (action === "coverage_stop") {
+      if (!page.coverageActive) return { stopped: false, coverage: [] };
+      const coverage = await this.#cdp.send(binding, "Profiler.takePreciseCoverage");
+      await this.#cdp.send(binding, "Profiler.stopPreciseCoverage");
+      await this.#cdp.send(binding, "Profiler.disable");
+      page.coverageActive = false;
+      return { stopped: true, coverage };
+    }
     await this.#cdp.send(binding, "Performance.enable");
     const metrics = await this.#cdp.send(binding, "Performance.getMetrics");
     return { metrics, traceActive: page.traceActive, events: action === "analyze" ? page.traceEvents : undefined };
@@ -729,17 +877,22 @@ export class BrowserAutomationRuntime {
       await this.#cdp.send(binding, "HeapProfiler.enable");
       await this.#cdp.send(binding, "HeapProfiler.takeHeapSnapshot", { reportProgress: false });
       const snapshot = page.heapSnapshotChunks.join("");
-      return { snapshot, byte_length: Buffer.byteLength(snapshot, "utf8") };
+      const parsed = parseHeapSnapshot(snapshot);
+      page.previousHeapSnapshot = page.heapSnapshot;
+      page.heapSnapshot = parsed;
+      return { byte_length: Buffer.byteLength(snapshot, "utf8"), ...heapSummary(parsed) };
     }
     if (action === "close_snapshot") {
       page.heapSnapshotChunks = [];
+      page.heapSnapshot = null;
+      page.previousHeapSnapshot = null;
       await this.#cdp.send(binding, "HeapProfiler.disable");
       return { closed: true };
     }
-    if (page.heapSnapshotChunks.length === 0) {
+    if (!page.heapSnapshot) {
       throw protocolFailure("browser_heap_snapshot_missing", "take_snapshot must run before heap analysis");
     }
-    return { action, snapshot: page.heapSnapshotChunks.join(""), page_size: safeInteger(args.page_size, 100) };
+    return analyzeHeap(page.heapSnapshot, page.previousHeapSnapshot, action, args);
   }
 
   private async webmcp(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
@@ -815,7 +968,7 @@ export class BrowserAutomationRuntime {
       if (page.network.length > 500) page.network.splice(0, page.network.length - 500);
     }
     if (method === "Network.responseReceived") {
-      page.network.push({ type: "response", timestamp: Date.now(), ...params });
+      page.network.push({ type: "response", timestamp: Date.now(), ...params, ...(params.response && typeof params.response === "object" ? params.response : {}) });
       if (page.network.length > 500) page.network.splice(0, page.network.length - 500);
     }
     if (method === "Network.loadingFailed") {
@@ -833,6 +986,9 @@ export class BrowserAutomationRuntime {
     if (method === "HeapProfiler.addHeapSnapshotChunk") {
       const chunk = typeof params.chunk === "string" ? params.chunk : "";
       if (chunk) page.heapSnapshotChunks.push(chunk);
+    }
+    if (method === "Profiler.consoleProfileFinished") {
+      page.traceEvents.push({ type: "cpu_profile", ...params });
     }
   }
 }
@@ -865,6 +1021,252 @@ function safeInteger(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
     : fallback;
+}
+
+function axValue(value: unknown): string | null {
+  const raw = axValueObject(value);
+  return raw == null ? null : String(raw);
+}
+
+function axValueObject(value: unknown): unknown {
+  if (!value || typeof value !== "object") return value ?? null;
+  const candidate = value as { value?: unknown };
+  return "value" in candidate ? candidate.value : value;
+}
+
+function parseHeapSnapshot(raw: string): HeapSnapshotData {
+  let parsed: { snapshot?: { meta?: Record<string, unknown> }; nodes?: number[]; edges?: number[]; strings?: string[] };
+  try {
+    parsed = JSON.parse(raw) as typeof parsed;
+  } catch {
+    throw protocolFailure("browser_heap_snapshot_invalid", "heap snapshot is not valid JSON");
+  }
+  const meta = parsed.snapshot?.meta ?? {};
+  const nodeFields = Array.isArray(meta.node_fields) ? meta.node_fields.map(String) : [];
+  const edgeFields = Array.isArray(meta.edge_fields) ? meta.edge_fields.map(String) : [];
+  const nodeTypesValue = meta.node_types;
+  const edgeTypesValue = meta.edge_types;
+  const nodeTypes = Array.isArray(nodeTypesValue) && Array.isArray(nodeTypesValue[0]) ? (nodeTypesValue[0] as unknown[]).map(String) : [];
+  const edgeTypes = Array.isArray(edgeTypesValue) && Array.isArray(edgeTypesValue[0]) ? (edgeTypesValue[0] as unknown[]).map(String) : [];
+  return {
+    meta,
+    nodes: Array.isArray(parsed.nodes) ? parsed.nodes : [],
+    edges: Array.isArray(parsed.edges) ? parsed.edges : [],
+    strings: Array.isArray(parsed.strings) ? parsed.strings : [],
+    nodeFieldIndex: Object.fromEntries(nodeFields.map((field, index) => [field, index])),
+    edgeFieldIndex: Object.fromEntries(edgeFields.map((field, index) => [field, index])),
+    nodeTypes,
+    edgeTypes,
+    nodeFieldCount: nodeFields.length,
+    edgeFieldCount: edgeFields.length,
+  };
+}
+
+function heapNode(snapshot: HeapSnapshotData, index: number): { id: number; type: string; name: string; self_size: number; edge_count: number } {
+  const offset = index * snapshot.nodeFieldCount;
+  const node = snapshot.nodes;
+  const stringId = Number(node[offset + (snapshot.nodeFieldIndex.name ?? 1)] ?? 0);
+  return {
+    id: index,
+    type: snapshot.nodeTypes[Number(node[offset + (snapshot.nodeFieldIndex.type ?? 0)] ?? 0)] ?? "unknown",
+    name: snapshot.strings[stringId] ?? "",
+    self_size: Number(node[offset + (snapshot.nodeFieldIndex.self_size ?? 3)] ?? 0),
+    edge_count: Number(node[offset + (snapshot.nodeFieldIndex.edge_count ?? 4)] ?? 0),
+  };
+}
+
+function heapSummary(snapshot: HeapSnapshotData): Record<string, unknown> {
+  const count = snapshot.nodeFieldCount ? Math.floor(snapshot.nodes.length / snapshot.nodeFieldCount) : 0;
+  const types: Record<string, { count: number; self_size: number }> = {};
+  let selfSize = 0;
+  for (let index = 0; index < count; index += 1) {
+    const node = heapNode(snapshot, index);
+    const group = types[node.type] ?? { count: 0, self_size: 0 };
+    group.count += 1;
+    group.self_size += node.self_size;
+    types[node.type] = group;
+    selfSize += node.self_size;
+  }
+  return {
+    node_count: count,
+    edge_count: snapshot.edgeFieldCount ? Math.floor(snapshot.edges.length / snapshot.edgeFieldCount) : 0,
+    self_size: selfSize,
+    types,
+    snapshot_format: snapshot.meta,
+  };
+}
+
+function analyzeHeap(snapshot: HeapSnapshotData, previous: HeapSnapshotData | null, action: string, args: Record<string, unknown>): Record<string, unknown> {
+  if (action === "summary") return heapSummary(snapshot);
+  if (action === "compare_snapshots") {
+    const current = heapSummary(snapshot);
+    const base = previous ? heapSummary(previous) : null;
+    return { current, base, delta: base ? {
+      node_count: Number(current.node_count) - Number(base.node_count),
+      edge_count: Number(current.edge_count) - Number(base.edge_count),
+      self_size: Number(current.self_size) - Number(base.self_size),
+    } : null };
+  }
+  const count = snapshot.nodeFieldCount ? Math.floor(snapshot.nodes.length / snapshot.nodeFieldCount) : 0;
+  const pageIndex = safeInteger(args.page_index, 0);
+  const pageSize = Math.min(500, Math.max(1, safeInteger(args.page_size, 100)));
+  if (action === "details" || action === "class_nodes" || action === "dominators") {
+    const className = typeof args.class_name === "string" ? args.class_name : null;
+    const classId = typeof args.class_id === "number" ? args.class_id : null;
+    const nodes = Array.from({ length: count }, (_, index) => heapNode(snapshot, index))
+      .filter((node) => action !== "class_nodes" || (className ? node.name === className : classId == null || node.id === classId))
+      .sort((left, right) => right.self_size - left.self_size);
+    return { action, page_index: pageIndex, page_size: pageSize, nodes: nodes.slice(pageIndex * pageSize, (pageIndex + 1) * pageSize) };
+  }
+  if (action === "duplicate_strings") {
+    const counts = new Map<string, number>();
+    for (const value of snapshot.strings) counts.set(value, (counts.get(value) ?? 0) + 1);
+    return { strings: [...counts.entries()].filter(([, count]) => count > 1).map(([value, count]) => ({ value, count })).sort((a, b) => b.count - a.count).slice(0, pageSize) };
+  }
+  const nodeId = typeof args.node_id === "number" ? args.node_id : 0;
+  if (action === "edges") {
+    return { node_id: nodeId, edges: heapEdges(snapshot, nodeId).slice(0, pageSize) };
+  }
+  if (action === "object_details") return { node: heapNode(snapshot, Math.max(0, Math.min(count - 1, nodeId))), edges: heapEdges(snapshot, nodeId).slice(0, pageSize) };
+  if (action === "retainers" || action === "retaining_paths") {
+    return { node_id: nodeId, paths: heapRetainingPaths(snapshot, nodeId, Math.min(64, Math.max(1, safeInteger(args.max_depth, 8))), pageSize) };
+  }
+  return { action, page_index: pageIndex, page_size: pageSize, nodes: [] };
+}
+
+function heapEdges(snapshot: HeapSnapshotData, nodeIndex: number): Array<Record<string, unknown>> {
+  const offset = nodeIndex * snapshot.nodeFieldCount;
+  const start = Number(snapshot.nodes[offset + (snapshot.nodeFieldIndex.edge_start ?? 5)] ?? 0);
+  const count = Number(snapshot.nodes[offset + (snapshot.nodeFieldIndex.edge_count ?? 4)] ?? 0);
+  const edges: Array<Record<string, unknown>> = [];
+  for (let index = 0; index < count; index += 1) {
+    const edgeOffset = start + index * snapshot.edgeFieldCount;
+    const type = snapshot.edgeTypes[Number(snapshot.edges[edgeOffset + (snapshot.edgeFieldIndex.type ?? 0)] ?? 0)] ?? "unknown";
+    const nameId = Number(snapshot.edges[edgeOffset + (snapshot.edgeFieldIndex.name_or_index ?? 1)] ?? 0);
+    const toNode = Number(snapshot.edges[edgeOffset + (snapshot.edgeFieldIndex.to_node ?? 2)] ?? 0) / snapshot.nodeFieldCount;
+    edges.push({ type, name: snapshot.strings[nameId] ?? String(nameId), to_node: toNode, to: heapNode(snapshot, toNode) });
+  }
+  return edges;
+}
+
+function heapRetainingPaths(snapshot: HeapSnapshotData, target: number, maxDepth: number, maxPaths: number): number[][] {
+  const reverse = new Map<number, number[]>();
+  const count = snapshot.nodeFieldCount ? Math.floor(snapshot.nodes.length / snapshot.nodeFieldCount) : 0;
+  for (let source = 0; source < count; source += 1) {
+    for (const edge of heapEdges(snapshot, source)) {
+      const destination = Number(edge.to_node);
+      const parents = reverse.get(destination) ?? [];
+      if (parents.length < 16) parents.push(source);
+      reverse.set(destination, parents);
+    }
+  }
+  const paths: number[][] = [];
+  const queue: number[][] = [[target]];
+  const visited = new Set<string>();
+  while (queue.length && paths.length < maxPaths) {
+    const path = queue.shift()!;
+    const current = path[path.length - 1] ?? target;
+    const parents = reverse.get(current) ?? [];
+    if (!parents.length || path.length >= maxDepth) { paths.push(path); continue; }
+    for (const parent of parents) {
+      if (path.includes(parent)) continue;
+      const next = [parent, ...path];
+      const key = next.join(",");
+      if (!visited.has(key)) { visited.add(key); queue.push(next); }
+    }
+  }
+  return paths;
+}
+
+type LighthouseListener = (...args: unknown[]) => void;
+
+class LighthouseCdpSession {
+  readonly #cdp: CdpClient;
+  readonly #binding: BrowserSurfaceBinding;
+  readonly #listeners = new Map<string, Set<LighthouseListener>>();
+  readonly #unsubscribe: () => void;
+
+  constructor(cdp: CdpClient, binding: BrowserSurfaceBinding) {
+    this.#cdp = cdp;
+    this.#binding = binding;
+    this.#unsubscribe = cdp.onEvent((eventBinding, method, params) => {
+      if (eventBinding.surface_id !== binding.surface_id || eventBinding.surface_revision !== binding.surface_revision) return;
+      for (const listener of this.#listeners.get("*") ?? []) listener(method, params);
+      for (const listener of this.#listeners.get(method) ?? []) listener(params);
+    });
+  }
+
+  id(): string {
+    return "magi-lighthouse-" + this.#binding.target_id;
+  }
+
+  on(event: string, listener: LighthouseListener): this {
+    const listeners = this.#listeners.get(event) ?? new Set<LighthouseListener>();
+    listeners.add(listener);
+    this.#listeners.set(event, listeners);
+    return this;
+  }
+
+  off(event: string, listener: LighthouseListener): this {
+    this.#listeners.get(event)?.delete(listener);
+    return this;
+  }
+
+  async send(method: string, params: Record<string, unknown> = {}, options?: { timeout?: number }): Promise<unknown> {
+    if (method === "Target.getTargetInfo") {
+      return { targetInfo: { targetId: this.#binding.target_id, type: "page", url: await this.pageUrl() } };
+    }
+    if (method === "Target.setAutoAttach" || method === "Runtime.runIfWaitingForDebugger") return {};
+    return this.#cdp.send(this.#binding, method, params, options?.timeout ?? 30_000);
+  }
+
+  async detach(): Promise<void> {
+    this.#unsubscribe();
+    this.#listeners.clear();
+  }
+
+  setTargetInfo(_targetInfo: unknown): void {}
+  hasNextProtocolTimeout(): boolean { return false; }
+  getNextProtocolTimeout(): number { return 30_000; }
+  setNextProtocolTimeout(_timeout: number): void {}
+  sendCommand(method: string, params?: Record<string, unknown>): Promise<unknown> { return this.send(method, params ?? {}); }
+  sendCommandAndIgnore(method: string, params?: Record<string, unknown>): Promise<void> {
+    return this.send(method, params ?? {}).then(() => undefined).catch(() => undefined);
+  }
+  onCrashPromise(): Promise<never> { return new Promise(() => undefined); }
+
+  async pageUrl(): Promise<string> {
+    const response = await this.#cdp.send<{ result?: { value?: unknown } }>(this.#binding, "Runtime.evaluate", {
+      expression: "location.href",
+      returnByValue: true,
+      awaitPromise: false,
+    });
+    return typeof response?.result?.value === "string" ? response.result.value : "about:blank";
+  }
+}
+
+function createLighthousePage(cdp: CdpClient, binding: BrowserSurfaceBinding, pageState: () => PageRuntimeState): {
+  url(): Promise<string>;
+  target(): { createCDPSession(): Promise<LighthouseCdpSession> };
+} {
+  return {
+    async url() {
+      const session = new LighthouseCdpSession(cdp, binding);
+      try {
+        return await session.pageUrl();
+      } finally {
+        await session.detach();
+      }
+    },
+    target() {
+      return {
+        async createCDPSession() {
+          pageState();
+          return new LighthouseCdpSession(cdp, binding);
+        },
+      };
+    },
+  };
 }
 
 function finiteNumber(value: unknown, name: string): number {

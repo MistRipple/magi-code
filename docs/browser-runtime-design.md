@@ -63,7 +63,7 @@ Magi Desktop 统一使用 Chromium 桌面宿主。现有 Svelte 业务界面和 
 
 - Worker 在 Web 开发任务中自动发现 Magi Browser 能力。
 - Worker 可以启动项目服务、打开正确页面、读取 DOM/Accessibility、操作页面并验证结果。
-- 工具覆盖导航、快照、点击、输入、键盘、滚动、hover、drag、表单、截图、Console、Network、Performance、Heap、PWA、Lighthouse 和设备仿真。
+- 工具覆盖导航、DOM/Accessibility 快照、点击、输入、键盘、滚动、hover、drag、表单、文件上传、截图、Console、Network、Performance/Profiler、Heap、PWA、Third-party 资源分析、Lighthouse 和设备仿真。
 - 工具名称、schema、执行状态和 UI 卡片使用同一能力目录，不因组件启动顺序随机出现、消失或改名。
 - 工具结果包含明确页面、Surface、导航 revision、截图和诊断身份，不能把普通 HTTP path 当成无意义结果展示。
 
@@ -628,16 +628,16 @@ Electron Main 对指定 BrowserSurface 的 `webContents.debugger` 建立连接�
 
 BrowserAutomationWorker 使用直接 CDP，不在生产运行时使用 Playwright `connectOverCDP()`。核心实现：
 
-- `DOMSnapshot`、`DOM`、`Accessibility`：页面结构和稳定 ElementRef。
+- `DOMSnapshot`、`DOM`、`Accessibility`：页面结构、完整 AX Tree 和稳定 ElementRef。
 - `Runtime`：受控查询与 WebMCP；任意 JavaScript evaluate 受独立策略限制。
 - `Input`：鼠标、触控、键盘、drag 和滚动。
 - `Page`：导航等待、截图、Dialog、生命周期和 document 注入。
 - `Network`：请求、响应、失败和 HAR 风格摘要。
 - `Emulation`：viewport、device metrics、touch、UA 和 orientation。
-- `Performance`、`Profiler`、`HeapProfiler`：诊断工具。
+- `Performance`、`Profiler`、`HeapProfiler`：性能指标、CPU profile、precise coverage、堆快照解析和对象关系诊断。
 - `Overlay`：元素高亮和 inspect 辅助。
 
-Lighthouse 作为 Worker 内部审计适配器运行，必须复用 BrowserCdpGateway 已授权的当前 Surface 会话；不得启动 Chromium、打开调试端口或创建隐藏 Page。
+Lighthouse 作为 Worker 内部审计适配器运行，复用 BrowserCdpGateway 已授权的当前 Surface 会话；不得启动 Chromium、打开调试端口或创建隐藏 Page。支持当前页面 snapshot 审计和复用当前 URL 的 navigation 审计，保留当前 Session 状态。
 
 Playwright 可以继续作为 Desktop E2E 测试依赖，但不得进入生产 Browser capability manifest 或运行链。
 

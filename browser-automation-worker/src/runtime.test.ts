@@ -108,22 +108,26 @@ test("CDP 响应的完整 Surface 身份变化必须被拒绝", async () => {
   );
 });
 
-test("未注册的浏览器能力返回结构化 capability_unavailable", async () => {
-  const port = new FakePort();
+test("扩展浏览器能力已经进入 Worker 执行链", async () => {
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") {
+      return { result: { value: String(params.expression).includes("location.origin") ? "https://example.test" : null } };
+    }
+    return {};
+  });
   const runtime = new BrowserAutomationRuntime(new CdpClient(port));
-
-  for (const operation of ["upload_file", "third_party", "lighthouse"]) {
-    const result = await runtime.execute("unsupported-call", binding, {
-      type: "devtools",
-      payload: {
-        tab_id: binding.tab_id,
-        operation,
-        arguments: {},
-      },
-    });
-    assert.equal(result.outcome.status, "failed");
-    assert.equal(result.outcome.payload.code, "capability_unavailable");
-  }
+  const result = await runtime.execute("third-party-call", binding, {
+    type: "devtools",
+    payload: {
+      tab_id: binding.tab_id,
+      operation: "third_party",
+      arguments: { action: "list" },
+    },
+  });
+  assert.equal(result.outcome.status, "succeeded");
+  assert.ok(port.requests.some((request) => request.method === "Runtime.evaluate"));
 });
 
 test("浏览器截图的归一化区域必须转换为当前布局视口的真实裁剪区域", async () => {
@@ -317,4 +321,41 @@ test("持久化浏览器标记通过 Host 同步到当前 Chromium 文档", asyn
     String(port.requests.find((request) => request.method === "Runtime.evaluate")?.params.expression),
     /setAnnotations/u,
   );
+});
+
+test("第三方分析按响应来源聚合请求和字节数", async () => {
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") {
+      const expression = String(params.expression);
+      return { result: { value: expression.includes("location.origin") ? "https://app.test" : null } };
+    }
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  await runtime.execute("network-response", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "console", arguments: { action: "list" } },
+  });
+  const result = await runtime.execute("third-party", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "third_party", arguments: { action: "list" } },
+  });
+  assert.equal(result.outcome.status, "succeeded");
+});
+
+test("性能工具支持 CPU profile 和 precise coverage 生命周期", async () => {
+  const port = new ScriptedPort(() => ({}));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const start = await runtime.execute("profile-start", binding, {
+    type: "devtools", payload: { tab_id: binding.tab_id, operation: "performance", arguments: { action: "profile_start" } },
+  });
+  assert.equal(start.outcome.status, "succeeded");
+  const stop = await runtime.execute("profile-stop", binding, {
+    type: "devtools", payload: { tab_id: binding.tab_id, operation: "performance", arguments: { action: "profile_stop" } },
+  });
+  assert.equal(stop.outcome.status, "succeeded");
+  assert.ok(port.requests.some((request) => request.method === "Profiler.start"));
+  assert.ok(port.requests.some((request) => request.method === "Profiler.stop"));
 });

@@ -254,6 +254,21 @@ export interface BrowserSnapshot {
   text_bytes: number;
   truncated: boolean;
   continuation_refs: string[];
+  accessibility_tree?: BrowserAccessibilityNode[];
+}
+
+export interface BrowserAccessibilityNode {
+  node_id: string;
+  parent_id?: string | null;
+  child_ids: string[];
+  role?: string | null;
+  name?: string | null;
+  value?: string | null;
+  description?: string | null;
+  ignored: boolean;
+  properties: Record<string, unknown>;
+  actions: string[];
+  backend_dom_node_id?: number | null;
 }
 
 export interface BrowserBinaryPayload {

@@ -118,7 +118,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 72] = [
+    pub const ALL: [Self; 75] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -154,13 +154,16 @@ impl BuiltinToolName {
         Self::BrowserDrag,
         Self::BrowserFillForm,
         Self::BrowserDialog,
+        Self::BrowserUploadFile,
         Self::BrowserClickAt,
         Self::BrowserEvaluate,
         Self::BrowserConsole,
         Self::BrowserNetwork,
         Self::BrowserEmulate,
         Self::BrowserPerformance,
+        Self::BrowserLighthouse,
         Self::BrowserHeap,
+        Self::BrowserThirdParty,
         Self::BrowserWebMcp,
         Self::BrowserPwa,
         Self::DiagramRender,
@@ -384,13 +387,16 @@ impl BuiltinToolName {
             "browser_drag" => Some(Self::BrowserDrag),
             "browser_fill_form" => Some(Self::BrowserFillForm),
             "browser_dialog" => Some(Self::BrowserDialog),
+            "browser_upload_file" => Some(Self::BrowserUploadFile),
             "browser_click_at" => Some(Self::BrowserClickAt),
             "browser_evaluate" => Some(Self::BrowserEvaluate),
             "browser_console" => Some(Self::BrowserConsole),
             "browser_network" => Some(Self::BrowserNetwork),
             "browser_emulate" => Some(Self::BrowserEmulate),
             "browser_performance" => Some(Self::BrowserPerformance),
+            "browser_lighthouse" => Some(Self::BrowserLighthouse),
             "browser_heap" => Some(Self::BrowserHeap),
+            "browser_third_party" => Some(Self::BrowserThirdParty),
             "browser_webmcp" => Some(Self::BrowserWebMcp),
             "browser_pwa" => Some(Self::BrowserPwa),
             "diagram_render" => Some(Self::DiagramRender),
@@ -906,7 +912,7 @@ impl BuiltinToolName {
                 - 构建成功、curl 成功或静态阅读都不能替代真实浏览器验收"
             }
             Self::BrowserSnapshot => {
-                "读取当前浏览器页面的高价值可访问性快照，优先用于读取文本、标题、计数、控件和状态。返回的元素 ref 只在同一 snapshot_revision 内有效。不要用截图替代文本快照。"
+                "读取当前浏览器页面的 DOM 交互快照和 Chromium Accessibility Tree，优先用于读取文本、标题、计数、控件和状态。返回的元素 ref 只在同一 snapshot_revision 内有效。不要用截图替代文本快照。"
             }
             Self::BrowserClick => {
                 "点击当前浏览器快照中的元素。必须传入 browser_snapshot 返回的 element_ref 和 snapshot_revision。"
@@ -936,7 +942,7 @@ impl BuiltinToolName {
             Self::BrowserDialog => {
                 "列出或处理当前页面待处理的 alert、confirm、prompt 对话框；必须先列出，再用 accept 或 dismiss。"
             }
-            Self::BrowserUploadFile => "当前版本未注册文件上传工具；需要文件授权管线接入后再开放。",
+            Self::BrowserUploadFile => "将一个或多个本地文件设置到当前页面的 file input。元素必须来自当前浏览器快照。",
             Self::BrowserClickAt => "在当前浏览器页面的坐标位置点击，支持双击。",
             Self::BrowserEvaluate => "在当前浏览器页面中执行 expression，并返回可序列化结果。",
             Self::BrowserConsole => "读取、筛选、查看或清理当前浏览器页面的控制台消息。",
@@ -947,13 +953,9 @@ impl BuiltinToolName {
             Self::BrowserPerformance => {
                 "读取性能指标，或启动、停止并分析当前页面的 Chromium 性能追踪。"
             }
-            Self::BrowserLighthouse => {
-                "当前版本未注册 Lighthouse 工具；需要真实 Lighthouse 执行引擎接入后再开放。"
-            }
+            Self::BrowserLighthouse => "复用当前 Browser Surface 执行 Lighthouse 页面审计，不创建新的浏览器页面。",
             Self::BrowserHeap => "读取当前页面堆和 DOM 计数，或生成可供后续分析的堆快照文件。",
-            Self::BrowserThirdParty => {
-                "当前版本未注册第三方开发工具；需要真实的页面工具协议接入后再开放。"
-            }
+            Self::BrowserThirdParty => "按请求来源统计当前页面加载的第三方资源、请求数、字节数和资源类型。",
             Self::BrowserWebMcp => "列出或执行页面通过 navigator.modelContext 暴露的 WebMCP 工具。",
             Self::BrowserPwa => {
                 "读取当前 Chromium 页面是否满足 PWA 条件及其安装状态；Magi 不会创建独立应用窗口或修改系统安装状态。"
@@ -1501,6 +1503,7 @@ impl BuiltinToolName {
                     "snapshot_revision": { "type": "integer", "minimum": 1 },
                     "element_ref": { "type": "string" },
                     "file_path": { "type": "string" },
+                    "file_paths": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 20 },
                     "include_snapshot": { "type": "boolean" }
                 },
                 "required": ["snapshot_revision", "element_ref", "file_path"]
@@ -1564,7 +1567,7 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "tab_id": { "type": "string" },
-                    "action": { "type": "string", "enum": ["start", "stop", "metrics", "analyze"] },
+                    "action": { "type": "string", "enum": ["start", "stop", "metrics", "analyze", "profile_start", "profile_stop", "coverage_start", "coverage_take", "coverage_stop"] },
                     "reload": { "type": "boolean" },
                     "auto_stop": { "type": "boolean" },
                     "file_path": { "type": "string" },
@@ -1592,6 +1595,7 @@ impl BuiltinToolName {
                     "base_file_path": { "type": "string" },
                     "current_file_path": { "type": "string" },
                     "class_id": { "type": "integer", "minimum": 1 },
+                    "class_name": { "type": "string" },
                     "node_id": { "type": "integer", "minimum": 1 },
                     "page_index": { "type": "integer", "minimum": 0 },
                     "page_size": { "type": "integer", "minimum": 1, "maximum": 500 },
@@ -1605,7 +1609,7 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "tab_id": { "type": "string" },
-                    "action": { "type": "string", "enum": ["list", "execute"] },
+                    "action": { "type": "string", "enum": ["list", "clear"] },
                     "tool_name": { "type": "string" },
                     "params": { "type": "object" }
                 },

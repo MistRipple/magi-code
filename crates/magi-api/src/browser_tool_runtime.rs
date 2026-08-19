@@ -32,11 +32,6 @@ static BROWSER_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static BROWSER_TAB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static BROWSER_ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static BROWSER_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-const UNSUPPORTED_BROWSER_TOOLS: &[&str] = &[
-    "browser_upload_file",
-    "browser_lighthouse",
-    "browser_third_party",
-];
 
 #[derive(Clone)]
 struct BrowserExecutionIdentity {
@@ -165,12 +160,6 @@ impl BrowserToolRuntimeDependencies {
                 "浏览器工具参数必须是 JSON 对象",
             );
         };
-        if UNSUPPORTED_BROWSER_TOOLS.contains(&tool_name) {
-            return capability_unavailable(
-                tool_name,
-                "该浏览器能力尚未接入可验证的 Desktop Host 执行路径",
-            );
-        }
         let Some(kind) = BrowserToolKind::ALL
             .into_iter()
             .find(|kind| kind.name() == tool_name)
@@ -635,7 +624,7 @@ impl BrowserToolRuntimeDependencies {
             | "emulate" => true,
             "dialog" => !matches!(action.as_deref(), Some("list")),
             "console" | "network" => matches!(action.as_deref(), Some("clear")),
-            "performance" => matches!(action.as_deref(), Some("start" | "stop")),
+            "performance" => matches!(action.as_deref(), Some("start" | "stop" | "profile_start" | "profile_stop" | "coverage_start" | "coverage_stop")),
             "lighthouse" => !matches!(lighthouse_mode.as_deref(), Some("snapshot")),
             "recording" => true,
             "heap" => matches!(action.as_deref(), Some("take_snapshot")),
@@ -2002,6 +1991,9 @@ fn browser_tool_snapshot_value(
         .collect::<Vec<_>>();
 
     value.insert("elements".to_string(), Value::Array(elements));
+    if !snapshot.accessibility_tree.is_empty() {
+        value.insert("accessibility_tree".to_string(), Value::Array(snapshot.accessibility_tree.clone()));
+    }
     Value::Object(value)
 }
 
@@ -2385,6 +2377,7 @@ mod tests {
             text_bytes: 20,
             truncated: true,
             continuation_refs: vec!["e-2-1".to_string()],
+            accessibility_tree: Vec::new(),
         };
 
         let logical_tab_id = BrowserTabId::new("browser-logical-tab");

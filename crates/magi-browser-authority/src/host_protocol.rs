@@ -333,6 +333,8 @@ pub struct BrowserHostSnapshot {
     pub text_bytes: u32,
     pub truncated: bool,
     pub continuation_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accessibility_tree: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

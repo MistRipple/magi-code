@@ -11,7 +11,8 @@
   },
   "dependencies": {
     "@magi/desktop-browser-contracts": "0.0.0",
-    "devtools-protocol": "0.0.1551306"
+    "devtools-protocol": "0.0.1551306",
+    "lighthouse": "^13.4.1"
   },
   "devDependencies": {
     "@types/node": "22.15.30",

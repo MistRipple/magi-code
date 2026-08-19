@@ -117,7 +117,7 @@ impl BrowserToolKind {
 
     /// 文件系统授权需要独立的 Desktop 授权管线，当前版本不会隐式读取本地文件。
     pub fn is_supported(self) -> bool {
-        !matches!(self, Self::UploadFile)
+        true
     }
 
     pub fn catalog_access(self) -> BrowserToolAccess {
