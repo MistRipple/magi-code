@@ -1073,6 +1073,7 @@ export class BrowserAutomationRuntime {
         });
         return { applied: true, action };
       case "clear":
+        await this.#cdp.send(binding, "Emulation.setUserAgentOverride", { userAgent: "" });
         await this.#cdp.send(binding, "Emulation.clearGeolocationOverride");
         await this.#cdp.send(binding, "Emulation.setEmulatedMedia", { media: "", features: [] });
         await this.#cdp.send(binding, "Emulation.setCPUThrottlingRate", { rate: 1 });
@@ -1082,6 +1083,7 @@ export class BrowserAutomationRuntime {
           downloadThroughput: -1,
           uploadThroughput: -1,
         });
+        await this.#cdp.send(binding, "Network.setExtraHTTPHeaders", { headers: {} });
         return { applied: true, action };
       default:
         throw protocolFailure("browser_emulation_operation_unsupported", action || "missing action");

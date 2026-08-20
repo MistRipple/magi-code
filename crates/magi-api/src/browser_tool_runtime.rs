@@ -309,9 +309,43 @@ impl BrowserToolRuntimeDependencies {
                         "browser_viewport action 不合法",
                     ));
                 }
+                let mode = optional_string(arguments, "mode")
+                    .unwrap_or_else(|| "fixed".to_string());
+                if mode == "auto" {
+                    let _control_guard = self.control_lock.lock().await;
+                    let tab = tab_in_session(self, &browser_session, &tab.tab_id)?;
+                    let reply = client
+                        .request(BrowserHostCommand::SetLogicalViewport {
+                            tab_id: tab.tab_id.clone(),
+                            viewport: magi_browser_authority::BrowserLogicalViewport::Auto,
+                        })
+                        .await
+                        .map_err(browser_host_client_error)?;
+                    succeeded_result(reply.response.outcome, "恢复浏览器页面自适应视口失败")?;
+                    return Ok(json!({
+                        "tool": tool_name,
+                        "status": "succeeded",
+                        "tab_id": tab.tab_id,
+                        "mode": BrowserViewportMode::Auto,
+                        "viewport": Value::Null,
+                    })
+                    .to_string());
+                }
+                if mode != "fixed" {
+                    return Err(BrowserToolError::new(
+                        "browser_viewport_mode_invalid",
+                        "browser_viewport mode 必须是 auto 或 fixed",
+                    ));
+                }
                 let width = u32_arg(arguments, "width")?;
                 let height = u32_arg(arguments, "height")?;
                 validate_viewport_dimensions(width, height)?;
+                let device_scale_factor_millis = arguments
+                    .get("device_scale_factor_millis")
+                    .map(|_| u32_arg(arguments, "device_scale_factor_millis"))
+                    .transpose()?
+                    .unwrap_or(1_000);
+                validate_device_scale_factor(device_scale_factor_millis)?;
                 let requested_device_type =
                     match optional_string(arguments, "device_type").as_deref() {
                         Some("desktop") => Some(BrowserDeviceType::Desktop),
@@ -336,7 +370,7 @@ impl BrowserToolRuntimeDependencies {
                 let viewport = BrowserViewport {
                     width,
                     height,
-                    device_scale_factor_millis: 1_000,
+                    device_scale_factor_millis,
                     device_type,
                 };
                 let reply = client
@@ -1755,6 +1789,16 @@ fn validate_viewport_dimensions(width: u32, height: u32) -> Result<(), BrowserTo
         return Err(BrowserToolError::new(
             "browser_viewport_invalid",
             "浏览器页面视口尺寸超出支持范围",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_device_scale_factor(value: u32) -> Result<(), BrowserToolError> {
+    if !(500..=4_000).contains(&value) {
+        return Err(BrowserToolError::new(
+            "browser_viewport_invalid",
+            "浏览器页面设备像素比超出支持范围",
         ));
     }
     Ok(())

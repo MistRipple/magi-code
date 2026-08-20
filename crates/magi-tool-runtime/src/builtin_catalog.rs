@@ -935,7 +935,7 @@ impl BuiltinToolName {
                 "列出、激活或新建当前 Magi 会话的内置浏览器标签页；任务完成时必须保留标签及其当前页面，不得把 close 当作清理动作。只有用户明确要求关闭指定标签时才允许使用 close。"
             }
             Self::BrowserViewport => {
-                "读取或设置当前内置浏览器页面的设备视口。设置时会同步应用 CSS 视口、宽屏或窄屏设备类型、移动端 UA 与触控语义；适合验证电脑/平板宽屏和手机窄屏响应式布局，而不是裁切桌面页面。"
+                "读取或设置当前内置浏览器页面的设备视口。使用 action=set、mode=auto 恢复跟随右侧内容槽的自适应布局；使用 mode=fixed 并传入 width/height 验证电脑/平板宽屏或手机窄屏响应式布局。可选 device_scale_factor_millis 调整设备像素比（500-4000，默认 1000）。该工具只通过 Chromium 原生 device metrics、设备类型和触控语义改变页面 CSS 视口，不修改页面 DOM，也不使用 Magi 外层缩放。"
             }
             Self::BrowserWaitFor => {
                 "等待当前页面出现指定文本、选择器或 URL，适合等待异步页面稳定。"
@@ -1458,9 +1458,11 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["get", "set"] },
+                    "mode": { "type": "string", "enum": ["auto", "fixed"], "description": "action=set 时可选；auto 跟随右侧内容槽，fixed 使用 width/height 进行 Chromium 响应式设备仿真。省略时兼容旧调用，按 fixed 处理。" },
                     "tab_id": { "type": "string", "description": "可选；省略时使用活动标签页" },
                     "width": { "type": "integer", "minimum": 320, "maximum": 7680, "description": "action=set 时必填" },
                     "height": { "type": "integer", "minimum": 240, "maximum": 4320, "description": "action=set 时必填" },
+                    "device_scale_factor_millis": { "type": "integer", "minimum": 500, "maximum": 4000, "description": "action=set、mode=fixed 时可选，设备像素比乘以 1000，默认 1000。" },
                     "device_type": { "type": "string", "enum": ["desktop", "mobile"], "description": "action=set 时可选；宽度 320-600 固定为 mobile，601 以上固定为 desktop，传入值必须与 width 一致。mobile 启用手机窄屏仿真，desktop 表示电脑/平板宽屏。" }
                 },
                 "required": ["action"]
@@ -1577,11 +1579,24 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "tab_id": { "type": "string" },
+                    "action": { "type": "string", "enum": ["set_user_agent", "set_geolocation", "clear_geolocation", "set_color_scheme", "set_cpu_throttling", "set_network_conditions", "set_headers", "clear"], "description": "可选的原子仿真操作；省略时按传入的批量字段应用。" },
                     "network_conditions": { "type": "string", "enum": ["offline", "slow 3g", "fast 3g", "slow 4g", "fast 4g"] },
                     "cpu_throttling_rate": { "type": "number", "minimum": 1, "maximum": 20 },
                     "geolocation": { "type": ["object", "null"] },
                     "user_agent": { "type": ["string", "null"] },
+                    "accept_language": { "type": "string" },
+                    "platform": { "type": "string" },
                     "color_scheme": { "type": "string", "enum": ["dark", "light", "auto"] },
+                    "scheme": { "type": "string", "enum": ["dark", "light"] },
+                    "rate": { "type": "number", "minimum": 1, "maximum": 20 },
+                    "latitude": { "type": "number" },
+                    "longitude": { "type": "number" },
+                    "accuracy": { "type": "number", "minimum": 0 },
+                    "offline": { "type": "boolean" },
+                    "latency": { "type": "number", "minimum": 0 },
+                    "download_throughput": { "type": "number", "minimum": -1 },
+                    "upload_throughput": { "type": "number", "minimum": -1 },
+                    "headers": { "type": "object" },
                     "extra_http_headers": { "type": ["object", "null"] }
                 },
                 "required": []

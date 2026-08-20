@@ -759,6 +759,24 @@ test("浏览器自动化的响应式仿真必须通过 CDP 原生设备能力改
   );
 });
 
+test("浏览器仿真 clear 会清理 UA 和额外请求头", async () => {
+  const port = new ScriptedPort(() => ({}));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+
+  const result = await runtime.execute("emulate-clear", binding, {
+    type: "devtools",
+    payload: {
+      tab_id: binding.tab_id,
+      operation: "emulate",
+      arguments: { action: "clear" },
+    },
+  });
+
+  assert.equal(result.outcome.status, "succeeded");
+  assert.ok(port.requests.some((request) => request.method === "Emulation.setUserAgentOverride" && request.params.userAgent === ""));
+  assert.ok(port.requests.some((request) => request.method === "Network.setExtraHTTPHeaders" && JSON.stringify(request.params.headers) === "{}"));
+});
+
 test("持久化浏览器标记通过 Host 同步到当前 Chromium 文档", async () => {
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };

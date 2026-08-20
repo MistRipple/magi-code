@@ -21,6 +21,8 @@ const [workerSource, tabSource, inputSource, messageSource, browserRoutes, brows
     read("apps/desktop/src/main/window-manager.ts"),
     read("apps/desktop/src/main/desktop-control-server.ts"),
   ]);
+const workbenchShell = await read("web/src/web/WebWorkbenchShell.svelte");
+const rightPaneSource = await read("web/src/web/RightPane.svelte");
 
 function section(source, startMarker, endMarker, label) {
   const start = source.indexOf(startMarker);
@@ -119,10 +121,22 @@ assert.doesNotMatch(tabSource, /updateBrowserSlot|bindContentSurface/u);
 assert.doesNotMatch(tabSource, /transform:\s*scale\(|object-fit:\s*(fill|cover)|surfaceWidth|surfaceHeight/u);
 assert.match(windowManager, /browserContentBounds\(layout\)[\s\S]*?bindContentSurface\(/u);
 assert.match(windowManager, /record\.appLayer\.setBounds\(layout\.appBounds[\s\S]*?record\.appView\.setBounds\(layout\.appBounds/u);
+assert.match(workbenchShell, /desktop-right-pane-column--overlay[\s\S]*?box-shadow:\s*inset 1px 0 var\(--border\)/u);
+assert.doesNotMatch(workbenchShell, /desktop-right-pane-column--overlay[\s\S]*?border-left:/u);
 assert.match(
   surfaceManager,
-  /record\.host\.addChildView\(record\.view, 1\)[\s\S]*?record\.view\.setBounds\(bounds\)/u,
-  "Browser Surface 必须作为 contentView 的同级视图使用绝对内容槽坐标",
+  /record\.host\.addChildView\(record\.view, 0\)[\s\S]*?const localBounds = \{ x: 0, y: 0, width: bounds\.width, height: bounds\.height \}[\s\S]*?record\.view\.setBounds\(localBounds\)/u,
+  "Browser Surface 必须挂载到当前内容槽宿主并使用局部内容槽坐标",
+);
+assert.match(
+  surfaceManager,
+  /Emulation\.setDeviceMetricsOverride[\s\S]*?scale: fitScale/u,
+  "固定响应式视口必须使用 Chromium 原生 scale 等比适配右栏内容槽",
+);
+assert.match(
+  surfaceManager,
+  /record\.viewport\.mode === "fixed"[\s\S]*?scheduleViewportApply\(record\)/u,
+  "右栏尺寸变化必须重新应用固定视口的原生适配比例",
 );
 assert.match(
   surfaceManager,
@@ -145,6 +159,11 @@ assert.match(
   /Emulation\.setUserAgentOverride[\s\S]*?Emulation\.setEmulatedMedia[\s\S]*?Network\.emulateNetworkConditions/u,
   "浏览器仿真工具必须调用 Chromium CDP 原生仿真能力",
 );
+assert.match(
+  workerSource,
+  /case "clear":[\s\S]*?Emulation\.setUserAgentOverride[\s\S]*?Network\.setExtraHTTPHeaders/u,
+  "清理浏览器仿真必须同时清除 UA 和额外请求头",
+);
 
 assert.match(
   tabSource,
@@ -155,6 +174,16 @@ assert.match(tabSource, /CUSTOM_VIEWPORT_DEBOUNCE_MILLIS = 180/u);
 assert.match(tabSource, /useAutomaticViewport\(\)[\s\S]*?updateLogicalViewport\('auto'\)/u);
 assert.match(tabSource, /VIEWPORT_DEVICE_MODES = \[[\s\S]*?id: 'wide'[\s\S]*?id: 'narrow'/u);
 assert.match(tabSource, /fields:[\s\S]*?id: 'width'[\s\S]*?id: 'height'/u);
+assert.match(
+  browserTools,
+  /if action != "set"[\s\S]*?let mode = optional_string[\s\S]*?mode == "auto"[\s\S]*?BrowserLogicalViewport::Auto/u,
+  "LLM 必须能通过 browser_viewport 的 auto 模式恢复跟随内容槽",
+);
+assert.match(
+  browserTools,
+  /device_scale_factor_millis/u,
+  "LLM 浏览器视口工具必须暴露设备像素比控制",
+);
 assert.match(
   tabSource,
   /onblur=\{\(\) => \{ addressEditing = false; \}\}/u,
@@ -184,6 +213,11 @@ assert.match(
   tabSource,
   /action\.id === 'selection'[\s\S]*?openAnnotationCommentOverlay\(\)/u,
   "标记选择成功后必须切换到备注编辑层",
+);
+assert.match(
+  rightPaneSource,
+  /function isClosedBrowserTabError[\s\S]*?resyncAfterClosedBrowserTab/u,
+  "已关闭 Browser Tab 必须通过权威快照收敛，不能进入激活重试循环",
 );
 
 assert.match(

@@ -62,12 +62,14 @@
     workspaceRoot: string;
     overlay?: boolean;
     desktopSurface?: boolean;
+    desktopSnapshot?: MagiDesktopWindowSnapshot | null;
   }
 
   let {
     workspaceRoot,
     overlay = false,
     desktopSurface = false,
+    desktopSnapshot = null,
   }: Props = $props();
 
   // ============ Tab 状态 ============
@@ -155,6 +157,7 @@
       addPaneMenuOpen = false;
       if (action.id === 'browser' || action.id === 'terminal') {
         chooseAddPane(action.id);
+        void desktop?.closeOverlay().catch(() => undefined);
       }
     };
     const unsubscribeOverlayState = desktop?.onOverlayState(handleOverlayState);
@@ -444,6 +447,30 @@
   let activeBrowserActivationKey = '';
   let activeBrowserActivationRequest = 0;
 
+  function isClosedBrowserTabError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /browser tab is not ready:[\s\S]*\(Closed\)/u.test(message);
+  }
+
+  function resyncAfterClosedBrowserTab(
+    payload: BrowserTabPayload,
+    request: number,
+  ): void {
+    if (request !== activeBrowserActivationRequest) return;
+    // Tab 关闭和 Renderer 的激活请求可能同时完成。关闭态不是可重试的
+    // 激活失败，保持当前 activation identity，主动拉取权威快照收敛掉
+    // 已关闭 Tab，避免 $effect 反复重试同一个无效 Tab。
+    void getBrowserSession(payload.browserSessionId)
+      .then((next) => {
+        if (request !== activeBrowserActivationRequest) return;
+        synchronizeBrowserSessionSnapshot(next, payload.workspacePath, {
+          workspaceId: payload.workspaceId,
+          sessionId: payload.sessionId,
+        });
+      })
+      .catch(() => undefined);
+  }
+
   async function activateVisibleBrowserSurface(
     payload: BrowserTabPayload,
     request: number,
@@ -464,6 +491,10 @@
     try {
       await setActiveBrowserTab(payload.browserSessionId, payload.tabId);
     } catch (error) {
+      if (isClosedBrowserTabError(error)) {
+        resyncAfterClosedBrowserTab(payload, request);
+        return;
+      }
       // 页面已经成功挂入右栏时不能因为焦点同步失败而把可用浏览器标记为失败；
       // 下一次右栏激活会再次同步，工具显式传 tab_id 也不受影响。
       console.warn('[RightPane] 同步浏览器工具默认 Tab 失败:', error);
@@ -517,6 +548,10 @@
     const request = ++activeBrowserActivationRequest;
     void activateVisibleBrowserSurface(payload, request).catch((error) => {
         if (request !== activeBrowserActivationRequest) return;
+        if (isClosedBrowserTabError(error)) {
+          resyncAfterClosedBrowserTab(payload, request);
+          return;
+        }
         clearPendingDesktopPanelIntent(paneScopeKey, 'browser', payload.tabId);
         activeBrowserActivationKey = '';
         console.warn('[RightPane] 激活浏览器面板失败:', error);
@@ -529,6 +564,16 @@
     if (!desktopSurface) return;
     if (current?.kind === 'browser') {
       activeDesktopPanelKey = '';
+      return;
+    }
+    // BrowserAuthority/窗口恢复可能先于 Renderer 的 Browser Tab 投影到达。
+    // 此时 Main 已经有真实 Browser Surface，空的本地 Tab 状态不能把它
+    // 误收敛成隐藏面板；等 authority 快照补齐后再由当前 Tab 决定面板。
+    if (
+      !current
+      && desktopSnapshot?.layout.activePanelKind === 'browser'
+      && desktopSnapshot.layout.activeTabId
+    ) {
       return;
     }
     const key = current ? `${current.kind}:${current.id}` : 'empty';
@@ -1086,6 +1131,12 @@
     if (tab?.kind === 'browser') {
       const browserTabId = (tab.payload as BrowserTabPayload).tabId;
       void closeBrowserPanelResource(browserTabId);
+      if (desktopSurface && getRightPaneState(paneScopeKey).openTabs.length === 0) {
+        activeDesktopPanelKey = 'empty';
+        void window.magiDesktop?.activatePanel({ kind: null, tabId: null }).catch((error) => {
+          console.warn('[RightPane] 关闭最后一个浏览器 Tab 后隐藏面板失败:', error);
+        });
+      }
     } else if (tab?.kind === 'terminal') {
       void closeTerminalPanelResources(tab.payload as TerminalTabPayload);
     }
@@ -1490,8 +1541,10 @@
   /* ============ Tab 条 ============ */
   .right-pane-tabbar {
     position: relative;
+    z-index: 1;
     display: flex;
     align-items: stretch;
+    box-sizing: border-box;
     height: 38px;
     flex-shrink: 0;
     border-bottom: 1px solid var(--border);
@@ -1806,10 +1859,12 @@
   }
 
   .right-pane-body--browser {
+    position: relative;
+    z-index: 2;
     display: flex;
     flex-direction: column;
     width: 100%;
-    overflow: hidden;
+    overflow: visible;
     padding: 0;
   }
 

@@ -98,6 +98,14 @@ if (singleInstance) {
     partitionRegistryPath: join(app.getPath("userData"), "browser-partitions.json"),
     onEvent: (event) => {
       control?.handleSurfaceEvent(event);
+      if (event.type === "user_takeover") {
+        try {
+          windowManager?.closeBrowserOverlay(event.binding.window_id, event.binding.tab_id);
+        } catch {
+          // 用户点击和窗口关闭可能并发发生；此时窗口清理优先，忽略过期的
+          // Overlay 收口请求，不能让输入事件回调反向阻断桌面退出。
+        }
+      }
       publishBrowserEvent(event);
     },
   });

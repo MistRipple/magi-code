@@ -459,6 +459,11 @@
     });
   }
 
+  function closeDesktopOverlay(): void {
+    desktopOverlayId = null;
+    void window.magiDesktop?.closeOverlay().catch(() => undefined);
+  }
+
   function submitCreatedAnnotation(): void {
     const tab = activeTab;
     const selection = annotationSelection;
@@ -471,6 +476,7 @@
       window.dispatchEvent(new CustomEvent('magi:browserAnnotationCreated', { detail: created }));
       annotationSelection = null;
       annotationComment = '';
+      closeDesktopOverlay();
     });
   }
 
@@ -657,7 +663,7 @@
           const selection = parseAnnotationSelection(action.value);
           if (!selection) {
             actionError = i18n.t('browser.annotation.pageChanged');
-            desktopOverlayId = null;
+            closeDesktopOverlay();
             return;
           }
           annotationSelection = selection;
@@ -672,26 +678,34 @@
         if (action.id === 'cancel') {
           annotationSelection = null;
           annotationComment = '';
-          desktopOverlayId = null;
-          void desktop?.closeOverlay().catch(() => undefined);
+          closeDesktopOverlay();
           return;
         }
       }
-      desktopOverlayId = null;
-      // 菜单项的最终关闭由主进程负责；这里同步关闭 Renderer 侧的
-      // 原生 Overlay，确保即使 IPC 回执晚到，焦点和点击区域也立即归还。
-      void desktop?.closeOverlay().catch(() => undefined);
       if (action.id === 'auto') {
-        useAutomaticViewport();
+        void run(async () => {
+          await updateLogicalViewport('auto');
+          closeDesktopOverlay();
+        });
         return;
       }
       const preset = VIEWPORT_DEVICE_MODES.find((mode) => mode.id === action.id);
       if (preset) {
-        useFixedViewport(preset.width, preset.height);
+        void run(async () => {
+          await updateLogicalViewport('fixed', {
+            width: preset.width,
+            height: preset.height,
+            deviceType: preset.width <= 600 ? 'mobile' : 'desktop',
+          });
+          closeDesktopOverlay();
+        });
         return;
       }
       const annotation = savedAnnotations.find((item) => item.annotationId === action.id);
-      if (annotation) selectSavedAnnotation(annotation);
+      if (annotation) {
+        selectSavedAnnotation(annotation);
+        closeDesktopOverlay();
+      }
     });
     const unsubscribeOverlayState = desktop?.onOverlayState((state) => {
       if (state.ownerId !== `browser:${tabId}`) desktopOverlayId = null;
@@ -734,9 +748,9 @@
 >
   <div class="browser-toolbar">
     {#if desktopRuntime}
-      <button type="button" class="icon-button flip" onclick={() => navigate('back')} disabled={!browserReady || busy} title={i18n.t('browser.navigation.back')} aria-label={i18n.t('browser.navigation.back')}><Icon name="chevron-right" size={13} /></button>
-      <button type="button" class="icon-button" onclick={() => navigate('forward')} disabled={!browserReady || busy} title={i18n.t('browser.navigation.forward')} aria-label={i18n.t('browser.navigation.forward')}><Icon name="chevron-right" size={13} /></button>
-      <button type="button" class="icon-button" onclick={() => navigate('reload')} disabled={!browserReady || busy} title={i18n.t('browser.navigation.reload')} aria-label={i18n.t('browser.navigation.reload')}><Icon name="refresh" size={13} /></button>
+      <button type="button" class="icon-button flip" onclick={() => navigate('back')} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.navigation.back')} aria-label={i18n.t('browser.navigation.back')}><Icon name="chevron-right" size={13} /></button>
+      <button type="button" class="icon-button" onclick={() => navigate('forward')} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.navigation.forward')} aria-label={i18n.t('browser.navigation.forward')}><Icon name="chevron-right" size={13} /></button>
+      <button type="button" class="icon-button" onclick={() => navigate('reload')} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.navigation.reload')} aria-label={i18n.t('browser.navigation.reload')}><Icon name="refresh" size={13} /></button>
       <form class="address-form" onsubmit={(event) => { event.preventDefault(); navigate('url'); }}>
         <input
           bind:value={address}
@@ -747,10 +761,10 @@
           onblur={() => { addressEditing = false; }}
           onkeydown={(event) => { if (event.key !== 'Enter' || event.isComposing) return; event.preventDefault(); navigate('url'); }}
         />
-        <button type="submit" class="address-submit" disabled={!browserReady || busy} title={i18n.t('browser.navigation.go')} aria-label={i18n.t('browser.navigation.go')}><Icon name="chevron-right" size={12} /></button>
+        <button type="submit" class="address-submit" disabled={!browserReady || busy} data-tooltip={i18n.t('browser.navigation.go')} aria-label={i18n.t('browser.navigation.go')}><Icon name="chevron-right" size={12} /></button>
       </form>
       <div class="menu-wrap" bind:this={viewportMenuElement}>
-        <button bind:this={viewportMenuButton} type="button" class="icon-button" class:active={localViewportMode === 'fixed'} onclick={toggleViewportMenu} disabled={!browserReady || busy} title={i18n.t('browser.viewport.control')} aria-label={i18n.t('browser.viewport.control')}><Icon name="monitor" size={13} /></button>
+        <button bind:this={viewportMenuButton} type="button" class="icon-button" class:active={localViewportMode === 'fixed'} onclick={toggleViewportMenu} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.viewport.control')} aria-label={i18n.t('browser.viewport.control')}><Icon name="monitor" size={13} /></button>
         {#if viewportMenuOpen && !desktopRuntime}
           <div class="viewport-menu" role="menu" aria-label={i18n.t('browser.viewport.control')}>
             <button type="button" class:selected={localViewportMode === 'auto'} role="menuitem" onclick={() => { viewportMenuOpen = false; useAutomaticViewport(); }}>
@@ -787,16 +801,16 @@
         <span>{activeTab?.title || activeTab?.url || i18n.t('browser.status.noTab')}</span>
       </div>
     {/if}
-    <button type="button" class="icon-button" onclick={openCurrentPageExternally} disabled={!externalUrl || busy} title={i18n.t('browser.action.openExternal')} aria-label={i18n.t('browser.action.openExternal')}><Icon name="external-link" size={13} /></button>
+    <button type="button" class="icon-button toolbar-edge-button" onclick={openCurrentPageExternally} disabled={!externalUrl || busy} data-tooltip={i18n.t('browser.action.openExternal')} aria-label={i18n.t('browser.action.openExternal')}><Icon name="external-link" size={13} /></button>
     {#if desktopRuntime}
-      <button type="button" class="icon-button" onclick={captureScreenshotForMessage} disabled={!browserReady || busy} title={i18n.t('browser.action.screenshot')} aria-label={i18n.t('browser.action.screenshot')}><Icon name="file-plus" size={13} /></button>
+      <button type="button" class="icon-button toolbar-edge-button" onclick={captureScreenshotForMessage} disabled={!browserReady || busy} data-tooltip={i18n.t('browser.action.screenshot')} aria-label={i18n.t('browser.action.screenshot')}><Icon name="file-plus" size={13} /></button>
     {/if}
     <div class="menu-wrap" bind:this={annotationMenuElement}>
       {#if desktopRuntime}
-        <button type="button" class="icon-button" onclick={openDesktopAnnotationCreation} disabled={!browserReady || busy || Boolean(desktopOverlayId)} title={i18n.t('browser.action.annotate')} aria-label={i18n.t('browser.action.annotate')}><Icon name="target" size={13} /></button>
+        <button type="button" class="icon-button toolbar-edge-button" onclick={openDesktopAnnotationCreation} disabled={!browserReady || busy || Boolean(desktopOverlayId)} data-tooltip={i18n.t('browser.action.annotate')} aria-label={i18n.t('browser.action.annotate')}><Icon name="target" size={13} /></button>
       {/if}
       {#if savedAnnotations.length > 0}
-        <button bind:this={annotationHistoryButton} type="button" class="icon-button annotation-history-button" class:active={annotationMenuOpen} onclick={toggleAnnotationMenu} title={i18n.t('browser.annotation.history')} aria-label={i18n.t('browser.annotation.history')}><Icon name="list" size={13} /><span class="annotation-count">{savedAnnotations.length}</span></button>
+        <button bind:this={annotationHistoryButton} type="button" class="icon-button annotation-history-button toolbar-edge-button" class:active={annotationMenuOpen} onclick={toggleAnnotationMenu} data-tooltip={i18n.t('browser.annotation.history')} aria-label={i18n.t('browser.annotation.history')}><Icon name="list" size={13} /><span class="annotation-count">{savedAnnotations.length}</span></button>
       {/if}
       {#if annotationMenuOpen && !desktopRuntime}
         <div class="annotation-menu" role="menu">
@@ -855,19 +869,70 @@
 
 <style>
   .browser-pane { position: relative; display: flex; flex: 1 1 auto; flex-direction: column; width: 100%; min-width: 0; min-height: 0; height: 100%; background: var(--background); }
-  .browser-toolbar { z-index: 2; box-sizing: border-box; display: flex; align-items: center; width: 100%; min-width: 0; height: 36px; min-height: 36px; gap: 3px; padding: 4px 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; overflow: hidden; }
+  /* Main 的 browserContentBounds 使用的是内容槽外框高度。显式采用
+     border-box，确保 padding 和底边框不会把工具栏撑高后侵入 Chromium
+     Surface，避免拖动/刷新时出现工具栏被页面覆盖。 */
+  .browser-toolbar { position: relative; z-index: 2; box-sizing: border-box; display: flex; align-items: center; width: 100%; min-width: 0; height: 36px; min-height: 36px; gap: 3px; padding: 4px 6px; border-bottom: 1px solid var(--border); flex-shrink: 0; overflow: visible; }
+  .icon-button, .address-submit { position: relative; }
   .icon-button { width: 27px; height: 27px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--foreground-muted); cursor: pointer; }
   .icon-button:hover:not(:disabled) { background: var(--surface-2); color: var(--foreground); }
   .icon-button.active { color: var(--primary); background: var(--surface-2); }
   .icon-button:disabled { opacity: .45; cursor: default; }
-  .flip { transform: scaleX(-1); }
+  .flip :global(svg) { transform: scaleX(-1); }
+  /* 原生 title 提示在 Electron 的分层视图中不稳定：提示层可能落到
+     Browser Surface 后面。把说明绘制在工具栏上方，始终留在 App Renderer
+     的可见区域内，同时保留 aria-label 供键盘和辅助技术使用。 */
+  .icon-button[data-tooltip]::after,
+  .address-submit[data-tooltip]::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    z-index: var(--z-tooltip, 1200);
+    right: auto;
+    bottom: calc(100% - 1px);
+    left: 50%;
+    max-width: min(240px, calc(100vw - 16px));
+    padding: 4px 7px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--glass-bg, var(--dropdown-bg));
+    box-shadow: var(--shadow-sm);
+    color: var(--foreground);
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium, 500);
+    line-height: 1.25;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    visibility: hidden;
+    transform: translate(-50%, 3px);
+    transition: opacity var(--transition-fast), visibility var(--transition-fast), transform var(--transition-fast);
+  }
+  .toolbar-edge-button[data-tooltip]::after {
+    right: 0;
+    left: auto;
+    transform: translate(0, 3px);
+  }
+  .icon-button[data-tooltip]:hover:not(:disabled)::after,
+  .address-submit[data-tooltip]:hover:not(:disabled)::after,
+  .icon-button[data-tooltip]:focus-visible::after,
+  .address-submit[data-tooltip]:focus-visible::after {
+    opacity: 1;
+    visibility: visible;
+    transform: translate(-50%, 0);
+  }
+  .toolbar-edge-button[data-tooltip]:hover:not(:disabled)::after,
+  .toolbar-edge-button[data-tooltip]:focus-visible::after {
+    transform: translate(0, 0);
+  }
+  .icon-button[data-tooltip]:disabled::after,
+  .address-submit[data-tooltip]:disabled::after { display: none; }
   .address-form { display: flex; flex: 1 1 0; min-width: 0; }
   .address-form input { box-sizing: border-box; width: 100%; min-width: 0; height: 27px; padding: 0 8px; border: 1px solid var(--border); border-right: 0; border-radius: var(--radius-sm) 0 0 var(--radius-sm); background: var(--surface-1); color: var(--foreground); font: inherit; }
   .address-submit { display: grid; place-items: center; width: 27px; height: 27px; flex: 0 0 27px; padding: 0; border: 1px solid var(--border); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; background: var(--surface-1); color: var(--foreground-muted); cursor: pointer; }
   .record-address { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; height: 27px; padding: 0 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-1); color: var(--foreground-muted); font-size: var(--text-xs); }
   .record-address span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .menu-wrap { position: relative; display: flex; flex: 0 0 auto; }
-  .viewport-menu, .annotation-menu { position: absolute; z-index: 10; top: calc(100% + 5px); right: 0; width: min(300px, calc(100vw - 24px)); max-height: 300px; overflow: auto; padding: 5px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); }
+  .viewport-menu, .annotation-menu { position: absolute; z-index: 10; top: calc(100% + 5px); right: 0; box-sizing: border-box; width: min(300px, calc(100vw - 24px)); overflow: hidden; padding: 5px; border: 1px solid var(--border); border-radius: 6px; background: var(--dropdown-bg); box-shadow: var(--shadow-lg); }
   .viewport-menu > button, .annotation-menu > button { box-sizing: border-box; display: flex; align-items: center; gap: 7px; width: 100%; min-height: 30px; padding: 0 8px; border: 0; border-radius: 4px; background: transparent; color: var(--foreground); font: inherit; font-size: var(--text-xs); cursor: pointer; text-align: left; }
   .viewport-menu > button:hover, .viewport-menu > button.selected, .annotation-menu > button:hover { background: var(--surface-hover); }
   .viewport-menu > button.selected { color: var(--primary); }

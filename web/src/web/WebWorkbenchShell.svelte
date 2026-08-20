@@ -41,6 +41,7 @@
   import { normalizeRustBootstrapPayload } from '../shared/bridges/rust-daemon-contract';
   import { i18n } from '../stores/i18n.svelte';
   import type { EditContentKind, Session } from '../types/message';
+  import { resolveFilePreviewScope } from '../lib/file-preview-scope';
   import {
     cycleBuiltinAppearance,
     subscribeAppearanceRuntime,
@@ -1255,20 +1256,27 @@
       label?: string;
     } = {},
   ): boolean {
-    const workspaceId = metadata.workspaceId?.trim() || selectedWorkspace?.workspaceId?.trim() || selectedWorkspaceId.trim();
     const currentBinding = currentWorkspaceBinding();
+    const { workspaceId, workspacePath, sessionId, imageDataUrl } = resolveFilePreviewScope({
+      metadataWorkspaceId: metadata.workspaceId,
+      metadataWorkspacePath: metadata.workspacePath,
+      metadataSessionId: metadata.sessionId,
+      imageDataUrl: metadata.imageDataUrl,
+      currentBinding,
+      selectedWorkspaceId: selectedWorkspace?.workspaceId || selectedWorkspaceId,
+      selectedWorkspacePath: selectedWorkspace ? workspaceBindingPath(selectedWorkspace) : '',
+      workspacePathForId,
+      activeWorkspaceId: rightPaneState.activeWorkspaceId,
+      activeSessionId: rightPaneState.activeSessionId,
+    });
     // 文件树事件不携带 session 元数据。桌面端的右栏是独立 Renderer，不能假设
     // 它已经先于文件点击完成上下文同步；优先使用当前工作区的权威会话，再由
     // right-pane store 处理无会话的 workspace 草稿，避免代码/图片 Tab 被投影到
     // personal 或旧浏览器 scope 中。
-    const sessionId = metadata.sessionId?.trim()
-      || (workspaceId === currentBinding.workspaceId ? currentBinding.sessionId : '')
-      || (workspaceId === rightPaneState.activeWorkspaceId ? rightPaneState.activeSessionId : '');
-    const workspacePath = metadata.workspacePath?.trim()
-      || (selectedWorkspace ? workspaceBindingPath(selectedWorkspace) : '')
-      || workspacePathForId(workspaceId)
-      || (workspaceId === currentBinding.workspaceId ? currentBinding.workspacePath : '');
-    if (!workspaceId || !workspacePath) {
+    // 浏览器 view_image 的结果已经携带内存中的 PNG，不属于工作区文件。
+    // 个人会话也必须能在右栏直接打开它，不能继续落到 bridge 的文件预览
+    // 请求，否则后端会把绝对 artifact 路径误送进 workspace 变更投影。
+    if ((!workspaceId || !workspacePath) && !imageDataUrl) {
       return false;
     }
     const normalizedFilePath = filePath.trim();
@@ -1287,7 +1295,7 @@
       symlinkTarget: metadata.symlinkTarget,
       headSummary: metadata.headSummary,
       tailSummary: metadata.tailSummary,
-      imageDataUrl: metadata.imageDataUrl,
+      imageDataUrl: imageDataUrl || undefined,
     });
     if (sidebarIsDrawer) {
       sidebarOpen = false;
@@ -2691,6 +2699,7 @@
         <RightPaneComponent
           workspaceRoot={selectedWorkspace?.rootPath || ''}
           overlay={previewIsOverlay}
+          desktopSnapshot={desktopSnapshot}
         />
       {:else if desktopAppSurface && desktopRightPaneVisible && RightPaneComponent}
         {#if !desktopRightPaneOverlay}
@@ -2711,6 +2720,7 @@
             workspaceRoot={selectedWorkspace?.rootPath || ''}
             overlay={desktopRightPaneOverlay}
             desktopSurface={true}
+            desktopSnapshot={desktopSnapshot}
           />
         </div>
       {/if}
@@ -2852,7 +2862,10 @@
     z-index: var(--z-overlay-preview);
     grid-column: auto;
     width: min(var(--desktop-right-pane-width, 480px), 100%);
-    border-left: 1px solid var(--border);
+    /* 用内阴影表达分界线，不占用内容轨道宽度。Main 的
+       browserContentBounds 与右栏 DOM 必须共享同一 x/width，否则原生
+       WebContentsView 会在 overlay 模式向左错一像素并遮住工具栏。 */
+    box-shadow: inset 1px 0 var(--border);
     background: var(--magi-desktop-shell-background, var(--magi-canvas));
   }
 

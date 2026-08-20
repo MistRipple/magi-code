@@ -838,6 +838,7 @@ export function synchronizeBrowserTabs(
 
   const pane = ensureSession(scopeKey);
   const previousActiveTabId = pane.activeTabId;
+  const hadBrowserProjection = pane.openTabs.some((tab) => tab.kind === 'browser');
   const browserSessionId = snapshot?.browserSessionId.trim() || '';
   const authorityTabs = (snapshot?.tabs ?? []).filter((tab) => (
     tab.tabId.trim() && tab.lifecycle !== 'closed'
@@ -908,6 +909,10 @@ export function synchronizeBrowserTabs(
     && pane.openTabs.some((tab) => tab.id === firstAuthorityPaneId)
   ) {
     pane.activeTabId = firstAuthorityPaneId;
+    // Browser Tab 不写入 localStorage。首次从 BrowserAuthority 恢复时，
+    // 右栏状态仍是空面板的 collapsed=true，必须把权威存在的 Browser
+    // Tab 投影为可见面板；已有本地 active Tab 或用户手动折叠时不抢占。
+    if (!hadBrowserProjection) pane.collapsed = false;
     return;
   }
 

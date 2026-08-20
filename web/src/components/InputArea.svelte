@@ -2556,7 +2556,9 @@
     flex-direction: column;
     gap: var(--space-2);
     flex-shrink: 0;
-    padding: var(--space-3) var(--space-4) var(--space-4) var(--space-4);
+    /* 输入列随中间面板自适应铺满，仅保留基础安全留白。 */
+    padding-block: var(--space-3) var(--space-4);
+    padding-inline: var(--space-4);
     background: var(--glass-bg);
     backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
@@ -3741,7 +3743,8 @@
 
   @media (max-width: 640px) {
     .ia-container {
-      padding: var(--space-2) 10px calc(var(--space-2) + env(safe-area-inset-bottom));
+      /* 移动端只压缩上下留白，横向继续保持全宽自适应。 */
+      padding-block: var(--space-2) calc(var(--space-2) + env(safe-area-inset-bottom));
     }
 
     .ia-wrapper {

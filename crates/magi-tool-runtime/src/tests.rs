@@ -5653,6 +5653,14 @@ fn browser_tools_do_not_depend_on_workspace_access_permissions() {
 fn browser_viewport_exposes_only_wide_and_narrow_device_semantics() {
     let schema = BuiltinToolName::BrowserViewport.parameters_schema();
     assert_eq!(
+        schema["properties"]["mode"]["enum"],
+        serde_json::json!(["auto", "fixed"])
+    );
+    assert_eq!(
+        schema["properties"]["device_scale_factor_millis"]["minimum"],
+        serde_json::json!(500)
+    );
+    assert_eq!(
         schema["properties"]["device_type"]["enum"],
         serde_json::json!(["desktop", "mobile"])
     );
@@ -5680,6 +5688,12 @@ fn browser_interaction_schemas_match_worker_parameter_contracts() {
     let evaluate = BuiltinToolName::BrowserEvaluate.parameters_schema();
     assert!(evaluate["properties"].get("expression").is_some());
     assert!(evaluate["properties"].get("function").is_none());
+
+    let emulate = BuiltinToolName::BrowserEmulate.parameters_schema();
+    assert_eq!(
+        emulate["properties"]["action"]["enum"],
+        serde_json::json!(["set_user_agent", "set_geolocation", "clear_geolocation", "set_color_scheme", "set_cpu_throttling", "set_network_conditions", "set_headers", "clear"])
+    );
 }
 
 #[test]

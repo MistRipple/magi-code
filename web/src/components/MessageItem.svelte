@@ -812,8 +812,8 @@
     position: relative;
     display: flex;
     flex-direction: column;
+    /* 左右内边距对称，与用户气泡、输入框共用消息列的同一条居中轴 */
     padding: 0 var(--space-4);
-    margin-right: var(--space-2);
     flex-shrink: 0;
     height: auto;
     overflow: visible;

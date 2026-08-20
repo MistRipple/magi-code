@@ -62,8 +62,8 @@ interface OverlayRecord {
 }
 
 const OVERLAY_WIDTH: Record<DesktopOverlayPlacement, number> = {
-  "right-pane-add": 184,
-  "browser-viewport": 264,
+  "right-pane-add": 208,
+  "browser-viewport": 224,
   "browser-annotations": 320,
 };
 const TRANSPARENT_VIEW_BACKGROUND = "rgba(0, 0, 0, 0)";
@@ -227,6 +227,13 @@ export class DesktopOverlayManager {
     this.#onClosed(windowId);
   }
 
+  closeBrowserOverlay(windowId: string, tabId: string): boolean {
+    const record = this.#records.get(windowId);
+    if (!record?.visible || record.state?.ownerId !== `browser:${tabId}`) return false;
+    this.close(windowId);
+    return true;
+  }
+
   updateLayout(
     windowId: string,
     layout: WindowLayoutSnapshot,
@@ -271,15 +278,10 @@ export class DesktopOverlayManager {
     ) {
       return;
     }
-    const shouldCloseBeforeDispatch = (
-      action.interaction === "select"
-      && !(state.kind === "annotation" && action.id === "selection")
-    );
-    // 先收口原生 Overlay，再把选择事件交给 App Renderer。选择事件通常会
-    // 立即切换右栏 Tab、物化 Browser Surface 或重新布局窗口；如果先广播，
-    // 这些布局事务会与 Overlay 的关闭/卸载重入，导致菜单残留并继续拦截
-    // 鼠标和键盘输入。
-    if (shouldCloseBeforeDispatch) this.close(windowId);
+    // Overlay Manager 只负责验证并分发动作。关闭属于业务动作的一部分，
+    // 必须由 App Renderer 在完成视口更新、面板切换或标记保存后显式执行。
+    // 这样 overlay-closed 不会在业务处理前清空 desktopOverlayId，也不会
+    // 在 Browser Surface 尚未完成切换时抢先恢复旧焦点。
     this.#onAction(windowId, action);
   }
 
@@ -444,29 +446,42 @@ function overlayBounds(
   if (!pane) throw new Error("desktop_overlay_right_pane_unavailable");
   const anchor = state.anchorBounds;
   if (!anchor) throw new Error("desktop_overlay_anchor_unavailable");
+  // Overlay 必须完全落在右栏几何区域内。固定最小宽度在极窄窗口下会
+  // 让菜单越过右栏边界，遮住中间面板；宽度不足时由菜单自身滚动和换行。
   const width = Math.min(
     OVERLAY_WIDTH[state.placement],
-    Math.max(160, pane.width - 12),
+    Math.max(1, pane.width - 8),
   );
-  const itemHeight = 32;
-  const fieldHeight = 58;
-  const contentHeight = 12
-    + state.items.length * itemHeight
-    + state.fields.length * fieldHeight
-    + (state.items.length > 0 && state.fields.length > 0 ? 8 : 0);
-  const height = Math.min(420, Math.max(42, contentHeight));
+  const itemHeight = 36;
+  const fieldHeight = 60;
+  // 字段在 Renderer 中是两列网格；按字段数量直接累加会把同一行的
+  // 宽度/高度输入重复计算，导致弹层底部出现一整块无意义留白。
+  const fieldRows = Math.ceil(state.fields.length / 2);
+  const contentHeight = state.items.length * itemHeight
+    + fieldRows * fieldHeight
+    + (state.items.length > 0 && state.fields.length > 0 ? 7 : 0)
+    + 12;
+  // 菜单按真实内容计算高度，视口菜单不会出现多余标题和滚动条；
+  // 内容超过右栏高度时，其他菜单仍可无滚动条访问其内容。
+  const height = Math.min(
+    380,
+    Math.max(1, pane.height - 16),
+    Math.max(80, contentHeight),
+  );
   const paneRight = pane.x + pane.width;
   const paneBottom = pane.y + pane.height;
+  const horizontalInset = Math.min(4, Math.max(0, (pane.width - width) / 2));
+  const verticalInset = Math.min(4, Math.max(0, (pane.height - height) / 2));
   const x = clamp(
     anchor.x + anchor.width - width,
-    pane.x + 4,
-    paneRight - width - 4,
+    pane.x + horizontalInset,
+    paneRight - width - horizontalInset,
   );
   const below = anchor.y + anchor.height + 4;
   const above = anchor.y - height - 4;
-  const y = below + height <= paneBottom - 4
+  const y = below + height <= paneBottom - verticalInset
     ? below
-    : Math.max(pane.y + 4, above);
+    : clamp(above, pane.y + verticalInset, paneBottom - height - verticalInset);
   return { x, y, width, height };
 }
 

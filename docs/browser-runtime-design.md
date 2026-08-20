@@ -763,10 +763,15 @@ viewport 只属于 `BrowserSurfaceInstance`：
 
 输入短防抖动态生效，无确认按钮。Worker 使用 `Emulation.setDeviceMetricsOverride` 设置 CSS viewport、device scale factor、screen、touch、orientation、UA 和 Client Hints。
 
-- 不对页面截图、Canvas 或 DOM 做外层缩放；宽屏/窄屏/自定义模式只通过 Chromium device metrics 改变 CSS viewport。
+- 不对页面截图、Canvas 或 DOM 做外层缩放；宽屏/窄屏/自定义模式只通过 Chromium device metrics 改变 CSS viewport，并使用 `Emulation.setDeviceMetricsOverride.scale` 将仿真视口的合成结果等比适配当前内容槽。该 scale 是 Chromium 内部设备仿真参数，不是 Magi DOM transform，不改变 CSS px、元素坐标或页面布局。
 - 用户输入由 Chromium `WebContentsView` 命中测试处理，不由 Svelte 转换坐标。
 - 工具坐标保持 CSS px；CDP 截图 clip 与 ElementRef 统一使用 CSS px。
 - viewport 修改只使当前 Surface 的 snapshot revision 失效，不导航、不刷新、不创建页面。
+
+LLM 通过唯一的 `browser_viewport` 工具控制这一状态：`action=set, mode=auto`
+恢复跟随当前右栏内容槽的自适应布局，`mode=fixed` 配合 `width`/`height` 执行
+Chromium 原生设备视口仿真。`browser_emulate` 继续只负责 UA、颜色、网络、地理位置
+等独立仿真，不复制 viewport 状态或再实现一套尺寸逻辑。
 
 ## 14. 快捷键、焦点和输入
 

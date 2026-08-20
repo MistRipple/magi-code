@@ -244,6 +244,7 @@ const ALLOWED_WORKER_CDP_METHODS = new Set([
 
 const DEFAULT_CDP_COMMAND_TIMEOUT_MS = 15_000;
 const SCREENSHOT_CDP_COMMAND_TIMEOUT_MS = 10_000;
+const SCREENSHOT_READINESS_TIMEOUT_MS = 5_000;
 const CURSOR_CDP_COMMAND_TIMEOUT_MS = 5_000;
 const DEFAULT_NAVIGATION_TIMEOUT_MS = 120_000;
 export class BrowserSurfaceManager {
@@ -537,6 +538,13 @@ export class BrowserSurfaceManager {
     if (!contents.debugger.isAttached()) {
       throw staleSurfaceError("browser_debugger_detached");
     }
+    if (method === "Page.captureScreenshot") {
+      // 激活 Browser Tab 的导航是非阻塞的，截图可能紧跟在 Surface
+      // 物化之后到达。先给 Chromium 当前文档一个有限的稳定窗口，避免
+      // 在首帧/导航切换阶段直接让 Page.captureScreenshot 卡满超时；
+      // 超时后仍继续截图，不能把慢站点变成永远不可操作。
+      await this.waitForScreenshotReadiness(record);
+    }
     const injectsInput = method.startsWith("Input.");
     if (injectsInput) record.automationInputDepth += 1;
     try {
@@ -562,7 +570,7 @@ export class BrowserSurfaceManager {
           typeof input.x === "number" ? input.x : record.cursor.x,
           typeof input.y === "number" ? input.y : record.cursor.y,
           action,
-        );
+        ).catch(() => undefined);
       }
       return result;
     } finally {
@@ -585,6 +593,31 @@ export class BrowserSurfaceManager {
     );
     record.cdpLane = settled.then(() => undefined, () => undefined);
     return run;
+  }
+
+  private async waitForScreenshotReadiness(record: BrowserSurfaceRecord): Promise<void> {
+    if (record.closed || record.contents.isDestroyed() || !record.contents.isLoadingMainFrame()) {
+      return;
+    }
+    const loading = record.loadPromise ?? new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        record.contents.off("did-stop-loading", finish);
+        record.contents.off("did-fail-load", finish);
+        resolve();
+      };
+      record.contents.once("did-stop-loading", finish);
+      record.contents.once("did-fail-load", finish);
+    });
+    await Promise.race([
+      loading.then(() => undefined, () => undefined),
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, SCREENSHOT_READINESS_TIMEOUT_MS);
+        timer.unref();
+      }),
+    ]);
   }
 
   async navigate(
@@ -745,6 +778,7 @@ export class BrowserSurfaceManager {
     bounds: Rectangle | null,
     window: BaseWindow | undefined,
   ): void {
+    const previousBounds = record.slotBounds;
     record.slotBounds = bounds ? { ...bounds } : null;
     record.slotVisible = bounds !== null;
     if (!window || window.isDestroyed()) {
@@ -762,6 +796,9 @@ export class BrowserSurfaceManager {
       record.host.addChildView(record.view, 0);
       record.mounted = true;
     }
+    // Browser Host 是 WindowManager 按当前右栏内容槽设置边界的独立
+    // 原生容器。WebContentsView 只在 Host 的局部坐标中占满内容槽，
+    // 不再把窗口坐标直接交给 WebContentsView。
     const localBounds = { x: 0, y: 0, width: bounds.width, height: bounds.height };
     if (!sameBounds(record.view.getBounds(), localBounds)) record.view.setBounds(localBounds);
     // 页面加载和调试器初始化是 Surface 内部状态，不能阻塞真实浏览器
@@ -770,6 +807,18 @@ export class BrowserSurfaceManager {
     // 导航过程由 Chromium 自己绘制。只有 Surface 生命周期失败才解绑，
     // 页面导航失败仍保留真实 WebContentsView，避免右栏黑屏或空槽。
     record.view.setVisible(true);
+    // 固定响应式视口的 CSS 尺寸属于页面仿真，显示比例则必须重新适配
+    // 当前右栏内容槽。只在槽位实际变化时重新提交 CDP，避免普通布局
+    // 事务重复触发页面重排；队列会合并连续拖动中的过期尺寸。
+    if (
+      record.viewport.mode === "fixed"
+      && (!previousBounds
+        || previousBounds.width !== bounds.width
+        || previousBounds.height !== bounds.height)
+    ) {
+      record.viewportApplied = false;
+      this.scheduleViewportApply(record);
+    }
   }
 
   private async loadPage(
@@ -1083,7 +1132,8 @@ export class BrowserSurfaceManager {
         this.scheduleViewportApply(record);
       }
       if (record.closed || !record.agentControlled) return;
-      void this.setAgentCursor(record, true, record.cursor.x, record.cursor.y, record.cursor.action);
+      void this.setAgentCursor(record, true, record.cursor.x, record.cursor.y, record.cursor.action)
+        .catch(() => undefined);
     });
     webContents.on("before-input-event", (_event, input) => {
       if (
@@ -1092,7 +1142,7 @@ export class BrowserSurfaceManager {
         || !["rawKeyDown", "keyDown"].includes(input.type)
       ) return;
       this.promote(record.surfaceId);
-      void this.setAgentCursor(record, false, null, null, null);
+      void this.setAgentCursor(record, false, null, null, null).catch(() => undefined);
       this.#onEvent({ type: "user_takeover", binding: this.binding(record) });
     });
     webContents.on("before-mouse-event", (_event, input) => {
@@ -1102,7 +1152,7 @@ export class BrowserSurfaceManager {
         || !["mouseDown", "contextMenu", "mouseWheel"].includes(input.type)
       ) return;
       this.promote(record.surfaceId);
-      void this.setAgentCursor(record, false, null, null, null);
+      void this.setAgentCursor(record, false, null, null, null).catch(() => undefined);
       this.#onEvent({ type: "user_takeover", binding: this.binding(record) });
     });
     webContents.on("render-process-gone", (_event, details) => {
@@ -1185,6 +1235,10 @@ export class BrowserSurfaceManager {
         });
       });
     }
+    // 内容槽可能先于调试器握手完成。固定视口在这段竞态中不能因为
+    // 首次 CDP apply 提前返回而永久失效，握手完成后补交同一 Surface
+    // 的最新 viewport 和 fit scale。
+    if (record.slotVisible) this.scheduleViewportApply(record);
   }
 
   private reconnectDebugger(record: BrowserSurfaceRecord, reason: string): Promise<void> {
@@ -1198,9 +1252,14 @@ export class BrowserSurfaceManager {
       void reason;
     });
     record.debuggerReadyPromise = reconnect;
-    void reconnect.finally(() => {
-      if (record.debuggerReadyPromise === reconnect) record.debuggerReadyPromise = null;
-    });
+    void reconnect.then(
+      () => {
+        if (record.debuggerReadyPromise === reconnect) record.debuggerReadyPromise = null;
+      },
+      () => {
+        if (record.debuggerReadyPromise === reconnect) record.debuggerReadyPromise = null;
+      },
+    );
     return reconnect;
   }
 
@@ -1280,6 +1339,16 @@ export class BrowserSurfaceManager {
     const width = Math.max(320, Math.round(viewport.width));
     const height = Math.max(240, Math.round(viewport.height));
     const mobile = viewport.device_type === "mobile";
+    const availableWidth = record.slotBounds?.width ?? width;
+    const availableHeight = record.slotBounds?.height ?? height;
+    // 这是 Chromium Emulation 的原生 scale 参数，只缩放仿真视口的合成
+    // 结果，不改变页面 DOM、CSS px、截图裁剪或输入坐标。这样 1280x800
+    // 等调试视口在窄右栏中仍完整可见，不会出现右侧/底部被宿主裁掉。
+    const fitScale = Math.min(
+      1,
+      Math.max(0.01, availableWidth / width),
+      Math.max(0.01, availableHeight / height),
+    );
     await sendCdpCommandWithTimeout(
       record.contents,
       "Emulation.setDeviceMetricsOverride",
@@ -1290,6 +1359,7 @@ export class BrowserSurfaceManager {
         mobile,
         screenWidth: width,
         screenHeight: height,
+        scale: fitScale,
         screenOrientation: {
           type: width > height ? "landscapePrimary" : "portraitPrimary",
           angle: width > height ? 90 : 0,
@@ -1316,9 +1386,22 @@ export class BrowserSurfaceManager {
   private scheduleViewportApply(record: BrowserSurfaceRecord): void {
     record.viewportApplyDirty = true;
     if (record.viewportApplyPromise) return;
-    record.viewportApplyPromise = this.flushViewportApply(record).finally(() => {
+    const applyPromise = this.flushViewportApply(record);
+    const settledPromise = applyPromise.finally(() => {
       record.viewportApplyPromise = null;
       if (!record.closed && record.viewportApplyDirty) this.scheduleViewportApply(record);
+    });
+    record.viewportApplyPromise = settledPromise;
+    // 保留调用方对 CDP 失败的感知，同时为没有调用方等待的后台布局任务
+    // 安装 rejection handler。Surface 关闭时的 target 销毁不应形成未处理
+    // Promise，更不能污染同一 Host 的其他 Browser Tab。
+    void settledPromise.catch((error) => {
+      if (!record.closed) {
+        console.warn("[BrowserSurfaceManager] Browser Surface 视口更新失败", {
+          surfaceId: record.surfaceId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     });
   }
 

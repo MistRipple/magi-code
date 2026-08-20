@@ -21,6 +21,28 @@ await withGoldenViteServer(async (server) => {
   assert.equal(personalPane.collapsed, false);
   rightPane.setRightPaneCollapsed('personal', true);
 
+  rightPane.activateRightPaneSession('workspace-restore-golden', 'session-restore-golden');
+  rightPane.synchronizeBrowserTabs(
+    'workspace-restore-golden',
+    '/tmp/workspace-restore-golden',
+    'session-restore-golden',
+    {
+      browserSessionId: 'browser-session-restore-golden',
+      agentOccupied: false,
+      tabs: [{
+        tabId: 'browser-tab-restore-golden',
+        lifecycle: 'ready',
+        url: 'https://example.com/',
+        title: 'Example',
+        navigationRevision: 1,
+      }],
+    },
+  );
+  const restoredPane = rightPane.getRightPaneState('workspace-restore-golden\u0000session-restore-golden');
+  assert.equal(restoredPane.collapsed, false, '首次恢复权威 Browser Tab 必须展开右栏');
+  assert.equal(restoredPane.openTabs.length, 1, '首次恢复权威 Browser Tab 必须投影到右栏');
+  assert.equal(restoredPane.activeTabId, restoredPane.openTabs[0].id, '首次恢复必须激活权威 Browser Tab');
+
   const [rightPaneSource, browserPaneSource, appSource, modalSource, overlayContractSource,
     overlayShellSource, overlayManagerSource, windowManagerSource, surfaceManagerSource,
     layoutSource, desktopTypesSource, terminalPaneSource] = await Promise.all([
@@ -92,6 +114,8 @@ await withGoldenViteServer(async (server) => {
   // The browser remains a peer panel: terminal and future right-pane tabs
   // keep the same shared body and do not depend on browser activation.
   assert.match(rightPaneSource, /activatePanel\(/u);
+  assert.match(rightPaneSource, /desktopSnapshot\?\.layout\.activePanelKind === 'browser'/u);
+  assert.match(rightPaneSource, /关闭最后一个浏览器 Tab 后隐藏面板失败/u);
   assert.match(rightPaneSource, /kind === 'browser'|kind: 'browser'/u);
   assert.match(terminalPaneSource, /class="terminal-pane"|class='terminal-pane'/u);
   assert.match(desktopTypesSource, /activatePanel\(request: \{ kind: MagiDesktopPanelKind/u);

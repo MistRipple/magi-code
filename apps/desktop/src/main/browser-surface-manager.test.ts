@@ -59,6 +59,19 @@ test("Renderer 不再发布原生内容槽坐标", () => {
   assert.doesNotMatch(browserTabSource, /transform:\s*scale\(|object-fit:\s*(fill|cover)|surfaceWidth|surfaceHeight/u);
 });
 
+test("右栏固定 Chrome 高度不会因 CSS content-box 把原生 Surface 顶开", () => {
+  assert.match(rightPaneSource, /\.right-pane-tabbar\s*\{[\s\S]*?box-sizing:\s*border-box/u);
+  assert.match(browserTabSource, /\.browser-toolbar\s*\{[\s\S]*?box-sizing:\s*border-box/u);
+  assert.match(layoutSource, /rightPaneTabBarHeight:\s*38/u);
+  assert.match(layoutSource, /browserToolbarHeight:\s*36/u);
+});
+
+test("右栏 Overlay 的宽高始终受当前面板边界约束", () => {
+  assert.match(overlayManagerSource, /Math\.max\(1, pane\.width - 8\)/u);
+  assert.match(overlayManagerSource, /Math\.max\(1, pane\.height - 16\)/u);
+  assert.match(overlayManagerSource, /paneBottom - height - verticalInset/u);
+});
+
 test("物化只创建一次 Surface，导航默认脱离激活关键路径", () => {
   const materialize = section(source, "async materialize(", "private createSurface(");
   assert.equal([...materialize.matchAll(/this\.createSurface\(input\)/gu)].length, 1);
@@ -152,11 +165,15 @@ test("Surface 激活使用代次，过期请求不能抢占当前槽", () => {
 test("viewport 只作用于当前 Surface，不改变右栏或 DOM 尺寸", () => {
   assert.match(source, /Emulation\.clearDeviceMetricsOverride/u);
   assert.match(source, /Emulation\.setDeviceMetricsOverride/u);
+  assert.match(source, /scale: fitScale/u);
+  assert.match(source, /record\.viewport\.mode === "fixed"[\s\S]*?scheduleViewportApply\(record\)/u);
+  assert.match(source, /if \(record\.slotVisible\) this\.scheduleViewportApply\(record\)/u);
   assert.match(source, /Emulation\.setTouchEmulationEnabled/u);
   const viewportMethods = section(source, "private async applyViewport(", "private scheduleViewportApply(");
   assert.doesNotMatch(viewportMethods, /capturePage\(|startScreencast|drawImage\(/u);
   assert.match(browserTabSource, /VIEWPORT_DEVICE_MODES = \[[\s\S]*?id: 'wide'[\s\S]*?id: 'narrow'/u);
   assert.match(browserTabSource, /scheduleCustomViewportUpdate\(\)/u);
+  assert.match(browserTabSource, /viewport: mode === 'auto'\s*\n?\s*\? \{ mode: 'auto' \}/u);
 });
 
 test("截图统一通过同一 WebContents 的 Chromium CDP，root 不依赖 DOM ref", () => {
@@ -193,7 +210,9 @@ test("后台截图复用同一个 WebContents 的 CDP，不创建隐藏窗口或
 test("所有工具截图都从真实 WebContents 读取，并通过 Surface CDP lane 串行化", () => {
   const cdpSection = section(source, "async sendCdp(", "private enqueueCdp<T>(");
   assert.doesNotMatch(cdpSection, /capturePage\(/u);
+  assert.match(cdpSection, /method === "Page\.captureScreenshot"[\s\S]*?waitForScreenshotReadiness\(record\)/u);
   assert.match(cdpSection, /this\.enqueueCdp\(record/u);
+  assert.match(source, /private async waitForScreenshotReadiness\(record: BrowserSurfaceRecord\)/u);
 });
 
 test("render-process-gone 才触发页面崩溃恢复", () => {
@@ -212,9 +231,19 @@ test("标记 Overlay 只覆盖当前浏览器内容槽并保持菜单层级", ()
   assert.match(browserTabSource, /openAnnotationCommentOverlay\(\)/u);
 });
 
-test("Overlay 菜单先卸载再分发选择，避免新建浏览器 Tab 时残留遮挡层", () => {
+test("Overlay Manager 只分发动作，业务 Renderer 完成处理后再关闭", () => {
   const handleAction = section(overlayManagerSource, "handleAction(windowId", "isWebContents(");
-  assert.match(handleAction, /if \(shouldCloseBeforeDispatch\) this\.close\(windowId\);[\s\S]*?this\.#onAction\(windowId, action\)/u);
+  assert.match(handleAction, /this\.#onAction\(windowId, action\);/u);
+  assert.doesNotMatch(handleAction, /this\.close\(windowId\)/u);
+  assert.match(browserTabSource, /await updateLogicalViewport\('auto'\);[\s\S]*?closeDesktopOverlay\(\)/u);
+  assert.match(rightPaneSource, /chooseAddPane\(action\.id\);[\s\S]*?desktop\?\.closeOverlay\(\)/u);
+});
+
+test("原生浏览器页面接管时关闭同一 Browser Tab 的菜单 Overlay", () => {
+  assert.match(overlayManagerSource, /closeBrowserOverlay\(windowId: string, tabId: string\)/u);
+  assert.match(overlayManagerSource, /record\.state\?\.ownerId !== `browser:\$\{tabId\}`/u);
+  assert.match(windowManagerSource, /closeBrowserOverlay\(windowId: string, tabId: string\)[\s\S]*?applyLayout\(record\)/u);
+  assert.match(indexSource, /event\.type === "user_takeover"[\s\S]*?closeBrowserOverlay\(event\.binding\.window_id, event\.binding\.tab_id\)/u);
 });
 
 test("右栏非浏览器面板不依赖 Browser Surface", () => {
@@ -247,6 +276,7 @@ test("原生 View 层级固定，浏览器与 App、Overlay 同级", () => {
   assert.match(windowManagerSource, /window\.contentView\.addChildView\(appLayer\)[\s\S]*?window\.contentView\.addChildView\(appView\)[\s\S]*?window\.contentView\.addChildView\(browserLayer\)[\s\S]*?window\.contentView\.addChildView\(overlayLayer\)/u);
   assert.match(source, /record\.host\.addChildView\(record\.view, 0\)/u);
   assert.match(windowManagerSource, /closeOverlay\([\s\S]*?record\.appView\.webContents\.focus\(\)/u);
+  assert.match(windowManagerSource, /closeOverlay\([\s\S]*?this\.applyLayout\(record\)/u);
 });
 
 test("清理浏览数据等待每个活动页面完成刷新", () => {

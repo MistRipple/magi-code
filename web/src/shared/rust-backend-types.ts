@@ -1351,6 +1351,35 @@ export interface EnhancePromptRequestDto extends Record<string, unknown> {
   locale?: string | null;
 }
 
+export type SessionSuggestionCategory =
+  | 'understand'
+  | 'inspect'
+  | 'plan'
+  | 'execute'
+  | 'record'
+  | 'learn';
+
+export interface SessionSuggestionDto {
+  category: SessionSuggestionCategory;
+  label: string;
+  prompt: string;
+}
+
+export interface SessionSuggestionGroupDto {
+  suggestions: SessionSuggestionDto[];
+}
+
+export interface SessionSuggestionsResponseDto {
+  groups: SessionSuggestionGroupDto[];
+}
+
+export interface GenerateSessionSuggestionsRequestDto extends Record<string, unknown> {
+  locale?: string | null;
+  count?: number;
+  requestedGroups?: number;
+  excludePrompts?: string[];
+}
+
 export interface MessagesResponseDto {
   generatedAt: number;
   currentSession?: SessionDto | null;

@@ -397,11 +397,22 @@ export class WindowManager {
   closeOverlay(windowId: string): void {
     const record = this.requireWindow(windowId);
     this.#overlayManager.close(windowId);
+    // 关闭原生 Overlay 后重新提交同一布局事务，显式恢复 Browser Layer
+    // 的边界和可见性。Overlay 与 Browser Surface 是同一窗口内容树中的
+    // 兄弟视图，不能假定移除 Overlay 子视图会让 Chromium 视图自动回到
+    // 原来的合成状态；否则菜单第一次打开/关闭后，右栏会留下空白内容槽。
+    this.applyLayout(record);
     const activeBrowserTabId = record.layout.activePanelKind === "browser"
       ? record.layout.activeTabId
       : null;
     if (activeBrowserTabId && this.#surfaceManager.focusTab(windowId, activeBrowserTabId)) return;
     if (!record.appView.webContents.isDestroyed()) record.appView.webContents.focus();
+  }
+
+  closeBrowserOverlay(windowId: string, tabId: string): void {
+    const record = this.requireWindow(windowId);
+    if (!this.#overlayManager.closeBrowserOverlay(windowId, tabId)) return;
+    this.applyLayout(record);
   }
 
   setBlockingOverlay(windowId: string, active: boolean): DesktopWindowSnapshot {

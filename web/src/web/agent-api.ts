@@ -17,6 +17,8 @@ import type {
   SessionTurnQueueResponseDto,
   FetchModelsResponseDto,
   EnhancePromptRequestDto,
+  GenerateSessionSuggestionsRequestDto,
+  SessionSuggestionsResponseDto,
   SkillsLibraryResponseDto,
   MessagesResponseDto,
 } from '../shared/rust-backend-types';
@@ -2189,6 +2191,20 @@ export async function enhanceAgentPrompt(
     request,
     'enhance prompt',
     undefined,
+    signal,
+  );
+}
+
+export async function generateSessionSuggestions(
+  request: GenerateSessionSuggestionsRequestDto = {},
+  signal?: AbortSignal,
+  bindingOverride?: AgentBindingOverride,
+): Promise<SessionSuggestionsResponseDto> {
+  return await postBoundJson<SessionSuggestionsResponseDto>(
+    '/api/prompt/suggestions',
+    request,
+    'generate session suggestions',
+    bindingOverride,
     signal,
   );
 }
