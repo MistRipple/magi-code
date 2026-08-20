@@ -15,9 +15,12 @@
   interface Props {
     graph: DiagramPayload['graph'];
     layout?: string;
+    rootNodeId?: string | null;
+    onNodeClick?: (node: Record<string, unknown>) => void;
+    onEdgeClick?: (edge: Record<string, unknown>) => void;
   }
 
-  let { graph, layout = 'auto' }: Props = $props();
+  let { graph, layout = 'auto', rootNodeId = null, onNodeClick, onEdgeClick }: Props = $props();
 
   let container: HTMLDivElement;
   let cy: Core | null = null;
@@ -28,9 +31,10 @@
 
   const normalized = $derived(normalizeDiagramGraph(graph));
   const graphKey = $derived(JSON.stringify({
-    nodes: normalized.nodes.map((node) => [node.id, node.label, node.position]),
-    edges: normalized.edges.map((edge) => [edge.id, edge.source, edge.target, edge.label]),
+    nodes: normalized.nodes.map((node) => [node.id, node.label, node.type, node.position]),
+    edges: normalized.edges.map((edge) => [edge.id, edge.source, edge.target, edge.label, edge.type, edge.data.status]),
     layout,
+    rootNodeId,
   }));
 
   function readThemeToken(name: string, fallback: string): string {
@@ -65,28 +69,93 @@
           'text-valign': 'center',
           'text-halign': 'center',
           'text-wrap': 'wrap',
-          'text-max-width': '130px',
-          width: 124,
-          height: 44,
-          padding: '12px',
+          // CJK 文本没有空格，必须允许按任意字符换行；预留四行中文标题的高度，
+          // 避免长标题从固定尺寸节点中溢出，形成“文字脱离卡片”的错觉。
+          'text-overflow-wrap': 'anywhere',
+          'text-justification': 'center',
+          'line-height': 1.2,
+          'text-max-width': '140px',
+          width: 160,
+          height: 64,
+          padding: '8px',
+          'z-index': 10,
           shape: 'round-rectangle',
+        },
+      },
+      {
+        selector: 'node[type="knowledge"]',
+        style: {
+          'background-color': readThemeToken('--knowledge-graph-knowledge-bg', '#e7f0ff'),
+          'border-color': readThemeToken('--knowledge-graph-knowledge-border', '#2563eb'),
+        },
+      },
+      {
+        selector: 'node[type="file"]',
+        style: {
+          'background-color': readThemeToken('--knowledge-graph-file-bg', '#edf7f2'),
+          'border-color': readThemeToken('--knowledge-graph-file-border', '#16825d'),
+        },
+      },
+      {
+        selector: 'node[type="symbol"]',
+        style: {
+          'background-color': readThemeToken('--knowledge-graph-symbol-bg', '#fff4df'),
+          'border-color': readThemeToken('--knowledge-graph-symbol-border', '#c47700'),
         },
       },
       {
         selector: 'edge',
         style: {
-          label: 'data(label)',
+          label: '',
           'line-color': connector,
           'target-arrow-color': connector,
           'target-arrow-shape': 'triangle',
           'curve-style': 'bezier',
-          width: 2,
+          'control-point-step-size': 56,
+          'edge-distances': 'intersection',
+          'line-cap': 'round',
+          opacity: 0.5,
+          width: 1.6,
           color: muted,
           'font-size': 11,
           'font-family': 'ui-sans-serif, system-ui, sans-serif',
           'text-background-color': codeBg,
           'text-background-opacity': 0.85,
           'text-background-padding': '3px',
+          'text-rotation': 'autorotate',
+          'z-index': 1,
+        },
+      },
+      {
+        selector: 'edge[origin="deterministic_code"]',
+        style: {
+          opacity: 0.32,
+          width: 1.2,
+        },
+      },
+      {
+        selector: 'edge[status="candidate"]',
+        style: {
+          'line-style': 'dashed',
+          'line-color': readThemeToken('--knowledge-graph-candidate', '#c47700'),
+          'target-arrow-color': readThemeToken('--knowledge-graph-candidate', '#c47700'),
+          opacity: 0.78,
+          width: 1.9,
+        },
+      },
+      {
+        selector: 'edge[status="rejected"]',
+        style: {
+          opacity: 0.35,
+          'line-style': 'dotted',
+        },
+      },
+      {
+        selector: 'edge[status="dangling"]',
+        style: {
+          'line-style': 'dashed',
+          'line-color': readThemeToken('--knowledge-graph-dangling', '#b42318'),
+          'target-arrow-color': readThemeToken('--knowledge-graph-dangling', '#b42318'),
         },
       },
       {
@@ -96,6 +165,12 @@
           'border-color': border,
           'line-color': border,
           'target-arrow-color': border,
+          label: 'data(label)',
+          opacity: 1,
+          width: 2.4,
+          'text-background-opacity': 0.95,
+          'text-margin-y': -7,
+          'z-index': 20,
         },
       },
     ];
@@ -113,6 +188,8 @@
       case 'elk':
       case 'tidy-tree':
         return 'breadthfirst';
+      case 'breadthfirst':
+        return 'concentric';
       case 'force':
       case 'fcose':
         return 'fcose';
@@ -170,6 +247,7 @@
         ...node.data,
         id: node.id,
         label: node.label,
+        type: node.type || '',
       },
       position: node.position,
       locked: false,
@@ -184,10 +262,44 @@
         source: edge.source,
         target: edge.target,
         label: edge.label || '',
+        type: edge.type || '',
+        status: typeof edge.data.status === 'string' ? edge.data.status : '',
       },
       selectable: true,
     }));
     return [...nodes, ...edges];
+  }
+
+  function resolveRootNodeId(): string | null {
+    const nodeIds = new Set(normalized.nodes.map((node) => node.id));
+    return rootNodeId && nodeIds.has(rootNodeId)
+      ? rootNodeId
+      : normalized.nodes.find((node) => node.type === 'knowledge')?.id ?? normalized.nodes[0]?.id;
+  }
+
+  function nodeDepths(root: string | null): Map<string, number> {
+    if (!root) return new Map();
+    const adjacency = new Map<string, Set<string>>();
+    for (const node of normalized.nodes) adjacency.set(node.id, new Set());
+    for (const edge of normalized.edges) {
+      adjacency.get(edge.source)?.add(edge.target);
+      adjacency.get(edge.target)?.add(edge.source);
+    }
+
+    const depths = new Map<string, number>([[root, 0]]);
+    const queue = [root];
+    for (let index = 0; index < queue.length; index += 1) {
+      const current = queue[index];
+      const nextDepth = (depths.get(current) ?? 0) + 1;
+      for (const neighbor of [...(adjacency.get(current) ?? [])].sort()) {
+        if (!depths.has(neighbor)) {
+          depths.set(neighbor, nextDepth);
+          queue.push(neighbor);
+        }
+      }
+    }
+
+    return depths;
   }
 
   async function updateGraph(): Promise<void> {
@@ -210,18 +322,60 @@
       return;
     }
     if (!cy || currentRenderToken !== renderToken) return;
+    const elements: ElementDefinition[] = toElements();
+    const focusRootId = layoutName === 'concentric' ? resolveRootNodeId() : null;
+    const depths = nodeDepths(focusRootId);
     cy.batch(() => {
       cy?.elements().remove();
-      cy?.add(toElements());
+      cy?.add(elements);
       cy?.style(createStyle());
     });
     cy.layout({
       name: layoutName,
       fit: true,
       padding: 32,
-      ...(layoutName === 'breadthfirst' ? { directed: true, spacingFactor: 1.15 } : {}),
-      ...(layoutName === 'fcose' ? { animate: false, quality: 'proof', nodeRepulsion: 6500, idealEdgeLength: 100 } : {}),
-      ...(layoutName === 'cose-bilkent' ? { animate: false, quality: 'proof', nodeRepulsion: 6500, idealEdgeLength: 100 } : {}),
+      ...(layoutName === 'breadthfirst' ? {
+        directed: true,
+        direction: 'rightward',
+        spacingFactor: 1.45,
+        avoidOverlap: true,
+        nodeDimensionsIncludeLabels: true,
+      } : {}),
+      ...(layoutName === 'concentric' ? {
+        animate: false,
+        avoidOverlap: true,
+        nodeDimensionsIncludeLabels: true,
+        minNodeSpacing: 28,
+        startAngle: -Math.PI / 2,
+        clockwise: true,
+        concentric: (node: { id: () => string }) => {
+          const depth = depths.get(node.id()) ?? 1;
+          return Math.max(1, 3 - Math.min(depth, 2));
+        },
+        levelWidth: () => 1,
+      } : {}),
+      ...(layoutName === 'fcose' ? {
+        animate: false,
+        quality: 'proof',
+        nodeDimensionsIncludeLabels: true,
+        nodeRepulsion: 12000,
+        idealEdgeLength: 160,
+        edgeElasticity: 0.22,
+        gravity: 0.15,
+        numIter: 3200,
+        tilingPaddingHorizontal: 28,
+        tilingPaddingVertical: 28,
+      } : {}),
+      ...(layoutName === 'cose-bilkent' ? {
+        animate: false,
+        quality: 'proof',
+        nodeDimensionsIncludeLabels: true,
+        nodeRepulsion: 12000,
+        idealEdgeLength: 160,
+        edgeElasticity: 0.22,
+        gravity: 0.15,
+        numIter: 3200,
+      } : {}),
     } as LayoutOptions).run();
     requestAnimationFrame(() => {
       cy?.resize();
@@ -248,6 +402,12 @@
       autounselectify: false,
       style: createStyle(),
     });
+    cy.on('tap', 'node', (event) => {
+      onNodeClick?.(event.target.data() as Record<string, unknown>);
+    });
+    cy.on('tap', 'edge', (event) => {
+      onEdgeClick?.(event.target.data() as Record<string, unknown>);
+    });
     void updateGraph();
 
     const observer = new MutationObserver(() => {
@@ -265,9 +425,16 @@
       });
     }
 
+    const resizeObserver = new ResizeObserver(() => {
+      cy?.resize();
+      cy?.fit(undefined, 32);
+    });
+    resizeObserver.observe(container);
+
     return () => {
       renderToken += 1;
       observer.disconnect();
+      resizeObserver.disconnect();
       cy?.destroy();
       cy = null;
     };

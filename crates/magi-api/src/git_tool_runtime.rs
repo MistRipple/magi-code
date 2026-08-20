@@ -564,14 +564,10 @@ fn schedule_code_index_refresh(
         return;
     }
     let knowledge_store = deps.knowledge_store.clone();
-    let persistence = deps.runtime_persistence.clone();
     let workspace_root = workspace_root.to_path_buf();
     std::thread::spawn(move || {
         knowledge_store.build_workspace_index(&workspace_id, &workspace_root);
         knowledge_store.finish_workspace_index_build(&workspace_id);
-        if let Err(error) = persistence.save_knowledge_store(&knowledge_store) {
-            tracing::warn!(workspace_id = %workspace_id, ?error, "Git context 变化后持久化代码索引失败");
-        }
     });
 }
 

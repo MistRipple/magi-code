@@ -26,6 +26,7 @@ import {
   approveAgentChange,
   approveAllAgentChanges,
   addAgentKnowledgeItem,
+  listAgentKnowledgeRelations,
   reportAgentIncident,
   addAgentCustomTool,
   addAgentMcpServer,
@@ -3214,11 +3215,18 @@ async function dispatchProjectKnowledge(scope: BridgeRequestScope = currentSessi
   const requestWorkspaceId = requestWorkspaceScope.workspaceId;
   const requestWorkspacePath = requestWorkspaceScope.workspacePath;
   const knowledgeRequestId = trimBridgeString(scope.knowledgeRequestId);
-  const payload = await getAgentProjectKnowledge({
-    scope: 'workspace',
-    workspaceId: requestWorkspaceId,
-    workspacePath: requestWorkspacePath,
-  });
+  const [payload, relationPayload] = await Promise.all([
+    getAgentProjectKnowledge({
+      scope: 'workspace',
+      workspaceId: requestWorkspaceId,
+      workspacePath: requestWorkspacePath,
+    }),
+    listAgentKnowledgeRelations({
+      scope: 'workspace',
+      workspaceId: requestWorkspaceId,
+      workspacePath: requestWorkspacePath,
+    }),
+  ]);
   const responseWorkspaceId = typeof payload.workspaceId === 'string' && payload.workspaceId.trim()
     ? payload.workspaceId.trim()
     : requestWorkspaceId;
@@ -3227,6 +3235,11 @@ async function dispatchProjectKnowledge(scope: BridgeRequestScope = currentSessi
     : requestWorkspacePath;
   emitDataMessage('projectKnowledgeLoaded', {
     ...payload,
+    relations: relationPayload.relations,
+    relationMeta: {
+      totalRelations: relationPayload.totalRelations,
+      truncated: relationPayload.truncated,
+    },
     ...(knowledgeRequestId ? { knowledgeRequestId } : {}),
     workspaceId: responseWorkspaceId,
     workspacePath: responseWorkspacePath,

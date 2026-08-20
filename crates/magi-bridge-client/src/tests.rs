@@ -300,6 +300,9 @@ fn tool_concurrency_read_only_safe() {
     assert!(crate::tool_concurrency::is_concurrency_safe(
         "knowledge_query"
     ));
+    assert!(crate::tool_concurrency::is_concurrency_safe(
+        "knowledge_graph_query"
+    ));
     assert!(crate::tool_concurrency::is_concurrency_safe("code_symbols"));
     assert!(crate::tool_concurrency::is_concurrency_safe("tool_catalog"));
     assert!(crate::tool_concurrency::is_concurrency_safe("web_search"));

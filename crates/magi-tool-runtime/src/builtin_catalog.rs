@@ -61,6 +61,7 @@ pub enum BuiltinToolName {
     ImageGenerate,
     // ── 知识库 ──
     KnowledgeQuery,
+    KnowledgeGraphQuery,
     // ── 代码符号导航（基于本地索引引擎的符号表）──
     /// 符号导航：按符号名查定义、或列出某文件的全部符号。
     CodeSymbols,
@@ -118,7 +119,7 @@ pub(crate) enum RestrictedWriteProfilePolicy {
 }
 
 impl BuiltinToolName {
-    pub const ALL: [Self; 75] = [
+    pub const ALL: [Self; 76] = [
         Self::FileRead,
         Self::ViewImage,
         Self::FileWrite,
@@ -169,6 +170,7 @@ impl BuiltinToolName {
         Self::DiagramRender,
         Self::ImageGenerate,
         Self::KnowledgeQuery,
+        Self::KnowledgeGraphQuery,
         Self::CodeSymbols,
         Self::ToolCatalog,
         Self::GitStatus,
@@ -248,6 +250,7 @@ impl BuiltinToolName {
             Self::DiagramRender => "diagram_render",
             Self::ImageGenerate => "image_generate",
             Self::KnowledgeQuery => "knowledge_query",
+            Self::KnowledgeGraphQuery => "knowledge_graph_query",
             Self::CodeSymbols => "code_symbols",
             Self::ToolCatalog => "tool_catalog",
             Self::GitStatus => "git_status",
@@ -324,7 +327,7 @@ impl BuiltinToolName {
             | Self::BrowserWebMcp
             | Self::BrowserPwa => "browser",
             Self::DiagramRender | Self::ImageGenerate => "visualization",
-            Self::KnowledgeQuery => "knowledge",
+            Self::KnowledgeQuery | Self::KnowledgeGraphQuery => "knowledge",
             Self::ToolCatalog => "tooling",
             Self::GitStatus
             | Self::GitBranchList
@@ -402,6 +405,7 @@ impl BuiltinToolName {
             "diagram_render" => Some(Self::DiagramRender),
             "image_generate" => Some(Self::ImageGenerate),
             "knowledge_query" => Some(Self::KnowledgeQuery),
+            "knowledge_graph_query" => Some(Self::KnowledgeGraphQuery),
             "code_symbols" => Some(Self::CodeSymbols),
             "tool_catalog" => Some(Self::ToolCatalog),
             "git_status" => Some(Self::GitStatus),
@@ -524,6 +528,7 @@ impl BuiltinToolName {
                 | Self::WebSearch
                 | Self::WebFetch
                 | Self::KnowledgeQuery
+                | Self::KnowledgeGraphQuery
                 | Self::CodeSymbols
                 | Self::ToolCatalog
                 | Self::GitStatus
@@ -691,6 +696,7 @@ impl BuiltinToolName {
             | Self::WebFetch
             | Self::DiagramRender
             | Self::KnowledgeQuery
+            | Self::KnowledgeGraphQuery
             | Self::CodeSymbols
             | Self::ToolCatalog
             | Self::GitStatus
@@ -938,11 +944,15 @@ impl BuiltinToolName {
             Self::BrowserDrag => {
                 "把当前浏览器快照中的 source 元素拖到 target 元素。两个引用必须来自同一个 snapshot_revision。"
             }
-            Self::BrowserFillForm => "按 fields 中的统一快照引用一次性填写多个可编辑控件。",
+            Self::BrowserFillForm => {
+                "按 fields 中的统一快照引用一次性填写多个控件；文本框使用文本值，select 使用选项值或值数组，checkbox/radio 使用布尔值。"
+            }
             Self::BrowserDialog => {
                 "列出或处理当前页面待处理的 alert、confirm、prompt 对话框；必须先列出，再用 accept 或 dismiss。"
             }
-            Self::BrowserUploadFile => "将一个或多个本地文件设置到当前页面的 file input。元素必须来自当前浏览器快照。",
+            Self::BrowserUploadFile => {
+                "将一个或多个本地文件设置到当前页面的 file input。元素必须来自当前浏览器快照。"
+            }
             Self::BrowserClickAt => "在当前浏览器页面的坐标位置点击，支持双击。",
             Self::BrowserEvaluate => "在当前浏览器页面中执行 expression，并返回可序列化结果。",
             Self::BrowserConsole => "读取、筛选、查看或清理当前浏览器页面的控制台消息。",
@@ -951,11 +961,17 @@ impl BuiltinToolName {
                 "使用 Chromium DevTools 协议仿真颜色、CPU、网络、地理位置、UA 和请求头。"
             }
             Self::BrowserPerformance => {
-                "读取性能指标，或启动、停止并分析当前页面的 Chromium 性能追踪。"
+                "读取性能指标，或启动、停止并分析当前页面的 Chromium 性能追踪；analyze 返回 Magi 支持的聚合指标。"
             }
-            Self::BrowserLighthouse => "复用当前 Browser Surface 执行 Lighthouse 页面审计，不创建新的浏览器页面。",
-            Self::BrowserHeap => "读取当前页面堆和 DOM 计数，或生成可供后续分析的堆快照文件。",
-            Self::BrowserThirdParty => "按请求来源统计当前页面加载的第三方资源、请求数、字节数和资源类型。",
+            Self::BrowserLighthouse => {
+                "复用当前 Browser Surface 执行 Lighthouse 页面审计，不创建新的浏览器页面。"
+            }
+            Self::BrowserHeap => {
+                "读取当前页面堆和 DOM 计数，或在当前浏览器 Tab 内生成和分析内存快照。"
+            }
+            Self::BrowserThirdParty => {
+                "按请求来源统计当前页面加载的第三方资源、请求数、字节数和资源类型。"
+            }
             Self::BrowserWebMcp => "列出或执行页面通过 navigator.modelContext 暴露的 WebMCP 工具。",
             Self::BrowserPwa => {
                 "读取当前 Chromium 页面是否满足 PWA 条件及其安装状态；Magi 不会创建独立应用窗口或修改系统安装状态。"
@@ -974,6 +990,9 @@ impl BuiltinToolName {
                 - 不覆盖已有文件；如果目标文件已存在，会自动生成带序号的新文件名；需要检查图片内容时继续调用 view_image"
             }
             Self::KnowledgeQuery => "查询项目知识库：检索 README、文档与代码文档",
+            Self::KnowledgeGraphQuery => {
+                "查询当前工作区知识图谱：按焦点节点读取有限深度的邻居、关系、来源、状态和证据"
+            }
             Self::CodeSymbols => {
                 "代码符号导航：按符号名查定义（goto_definition），或列出某文件的全部符号（list_file_symbols）"
             }
@@ -1482,7 +1501,7 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "tab_id": { "type": "string" },
-                    "fields": { "type": "array", "items": { "type": "object", "properties": { "snapshot_revision": { "type": "integer", "minimum": 1 }, "element_ref": { "type": "string", "minLength": 1 }, "value": {}, "replace": { "type": "boolean" } }, "required": ["snapshot_revision", "element_ref", "value"] }, "minItems": 1 },
+                    "fields": { "type": "array", "items": { "type": "object", "properties": { "snapshot_revision": { "type": "integer", "minimum": 1 }, "element_ref": { "type": "string", "minLength": 1 }, "value": { "anyOf": [{ "type": "string" }, { "type": "number" }, { "type": "boolean" }, { "type": "array", "items": { "type": ["string", "number"] } }] }, "replace": { "type": "boolean" } }, "required": ["snapshot_revision", "element_ref", "value"] }, "minItems": 1 },
                     "include_snapshot": { "type": "boolean" }
                 },
                 "required": ["fields"]
@@ -1572,11 +1591,7 @@ impl BuiltinToolName {
                 "properties": {
                     "tab_id": { "type": "string" },
                     "action": { "type": "string", "enum": ["start", "stop", "metrics", "analyze", "profile_start", "profile_stop", "coverage_start", "coverage_take", "coverage_stop"] },
-                    "reload": { "type": "boolean" },
-                    "auto_stop": { "type": "boolean" },
-                    "file_path": { "type": "string" },
-                    "insight_name": { "type": "string" },
-                    "insight_set_id": { "type": "string" }
+                    "include_events": { "type": "boolean", "description": "analyze 时是否同时返回原始追踪事件" }
                 },
                 "required": ["action"]
             }),
@@ -1595,17 +1610,12 @@ impl BuiltinToolName {
                 "properties": {
                     "tab_id": { "type": "string" },
                     "action": { "type": "string", "enum": ["usage", "take_snapshot", "close_snapshot", "compare_snapshots", "summary", "details", "class_nodes", "dominators", "duplicate_strings", "edges", "object_details", "retainers", "retaining_paths"] },
-                    "file_path": { "type": "string" },
-                    "base_file_path": { "type": "string" },
-                    "current_file_path": { "type": "string" },
-                    "class_id": { "type": "integer", "minimum": 1 },
+                    "class_id": { "type": "integer", "minimum": 0 },
                     "class_name": { "type": "string" },
-                    "node_id": { "type": "integer", "minimum": 1 },
+                    "node_id": { "type": "integer", "minimum": 0 },
                     "page_index": { "type": "integer", "minimum": 0 },
                     "page_size": { "type": "integer", "minimum": 1, "maximum": 500 },
-                    "max_depth": { "type": "integer", "minimum": 1, "maximum": 64 },
-                    "max_nodes": { "type": "integer", "minimum": 1, "maximum": 10000 },
-                    "max_siblings": { "type": "integer", "minimum": 1, "maximum": 1000 }
+                    "max_depth": { "type": "integer", "minimum": 1, "maximum": 64 }
                 },
                 "required": ["action"]
             }),
@@ -1613,9 +1623,7 @@ impl BuiltinToolName {
                 "type": "object",
                 "properties": {
                     "tab_id": { "type": "string" },
-                    "action": { "type": "string", "enum": ["list", "clear"] },
-                    "tool_name": { "type": "string" },
-                    "params": { "type": "object" }
+                    "action": { "type": "string", "enum": ["list", "clear"] }
                 },
                 "required": ["action"]
             }),
@@ -1740,6 +1748,41 @@ impl BuiltinToolName {
                     "limit": { "type": "integer", "description": "最多返回多少个匹配（默认 10，最大 50）" }
                 },
                 "required": ["query"]
+            }),
+            Self::KnowledgeGraphQuery => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "focus": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "必填焦点节点 ID，例如 knowledge:adr-runtime、file:src/app.ts 或 symbol:src/app.ts:App:class"
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 2,
+                        "description": "从焦点展开的层数，默认 1，最大 2"
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["forward", "reverse", "both"],
+                        "description": "关系方向，默认 both"
+                    },
+                    "node_kinds": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["workspace", "file", "symbol", "knowledge"] },
+                        "description": "可选节点类型过滤"
+                    },
+                    "edge_kinds": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["contains", "depends_on", "applies_to", "explains", "references", "related_to", "supersedes", "contradicts"] },
+                        "description": "可选关系类型过滤"
+                    },
+                    "max_nodes": { "type": "integer", "minimum": 1, "maximum": 80, "description": "最多返回节点数，默认 40" },
+                    "max_edges": { "type": "integer", "minimum": 1, "maximum": 160, "description": "最多返回关系数，默认 80" },
+                    "max_context_tokens": { "type": "integer", "minimum": 256, "maximum": 8000, "description": "图谱结果的最大估算 token 预算，默认 4000" }
+                },
+                "required": ["focus"]
             }),
             Self::CodeSymbols => serde_json::json!({
                 "type": "object",
@@ -2423,6 +2466,33 @@ mod tests {
     }
 
     #[test]
+    fn browser_diagnostics_schemas_only_expose_worker_actions() {
+        let third_party = BuiltinToolName::BrowserThirdParty.parameters_schema();
+        let third_party_properties = third_party["properties"]
+            .as_object()
+            .expect("third_party properties should be an object");
+        assert_eq!(
+            third_party_properties
+                .get("action")
+                .and_then(|value| value["enum"].as_array())
+                .expect("third_party action enum should be present"),
+            &vec![serde_json::json!("list"), serde_json::json!("clear")]
+        );
+        assert!(!third_party_properties.contains_key("tool_name"));
+        assert!(!third_party_properties.contains_key("params"));
+
+        let heap = BuiltinToolName::BrowserHeap.parameters_schema();
+        assert_eq!(heap["properties"]["node_id"]["minimum"], 0);
+        assert_eq!(heap["properties"]["class_id"]["minimum"], 0);
+
+        let pwa = BuiltinToolName::BrowserPwa.parameters_schema();
+        assert_eq!(
+            pwa["properties"]["action"]["enum"],
+            serde_json::json!(["state"])
+        );
+    }
+
+    #[test]
     fn chrome_devtools_reference_tools_have_one_magi_execution_mapping() {
         // 参考项目的完整模式包含扩展管理等当前 Magi Chromium Host 未开放的能力。
         // Magi 将其余能力聚合到带 action 的浏览器工具中；该映射矩阵防止目录项
@@ -2534,11 +2604,6 @@ mod tests {
                 Some("stop"),
             ),
             (
-                "performance_analyze_insight",
-                BuiltinToolName::BrowserPerformance,
-                Some("analyze"),
-            ),
-            (
                 "get_os_app_state",
                 BuiltinToolName::BrowserPwa,
                 Some("state"),
@@ -2568,7 +2633,7 @@ mod tests {
                 Some("get"),
             ),
         ];
-        assert_eq!(mappings.len(), 43);
+        assert_eq!(mappings.len(), 42);
         for (reference_name, magi_name, action) in mappings {
             assert_eq!(
                 BuiltinToolName::from_name(magi_name.as_str()),

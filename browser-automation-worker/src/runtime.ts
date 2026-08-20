@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import { realpath, stat } from "node:fs/promises";
+import { isAbsolute, relative, resolve } from "node:path";
 import type {
   BrowserCommandOutcome,
   BrowserCommandResult,
@@ -20,7 +22,6 @@ interface PageRuntimeState {
   network: Array<Record<string, unknown>>;
   nextNetworkId: number;
   dialog: Record<string, unknown> | null;
-  newDocumentScripts: Set<string>;
   heapSnapshotChunks: string[];
   traceActive: boolean;
   traceEvents: Array<Record<string, unknown>>;
@@ -58,12 +59,19 @@ interface HeapEdgeRecord {
 export class BrowserAutomationRuntime {
   readonly #cdp: CdpClient;
   readonly #pages = new Map<string, PageRuntimeState>();
+  readonly #uploadRoot: string | null;
 
   readonly #workerEpoch: string;
 
-  constructor(cdp: CdpClient, workerEpoch: string = randomUUID()) {
+  constructor(
+    cdp: CdpClient,
+    workerEpoch: string = randomUUID(),
+    options: { uploadRoot?: string } = {},
+  ) {
     this.#cdp = cdp;
     this.#workerEpoch = workerEpoch;
+    const configuredUploadRoot = options.uploadRoot ?? process.env.MAGI_BROWSER_UPLOAD_ROOT ?? "";
+    this.#uploadRoot = configuredUploadRoot.trim() ? resolve(configuredUploadRoot) : null;
     cdp.onEvent((binding, method, params) => this.onCdpEvent(binding, method, params));
   }
 
@@ -177,32 +185,43 @@ export class BrowserAutomationRuntime {
     ) {
       return current;
     }
-    const navigationChanged = Boolean(
+    const sameSurface = Boolean(
       current
       && current.binding.surface_revision === binding.surface_revision
-      && current.binding.target_id === binding.target_id
+      && current.binding.target_id === binding.target_id,
+    );
+    const navigationChanged = Boolean(
+      current
+      && sameSurface
       && current.binding.navigation_revision !== binding.navigation_revision,
     );
+    const lifecycleChanged = Boolean(current && !sameSurface);
+    const resetRuntimeState = navigationChanged || lifecycleChanged;
     const next: PageRuntimeState = {
       binding,
       executionContextId: null,
-      console: navigationChanged ? [] : current?.console ?? [],
-      nextConsoleId: navigationChanged ? 1 : current?.nextConsoleId ?? 1,
-      network: navigationChanged ? [] : current?.network ?? [],
-      nextNetworkId: navigationChanged ? 1 : current?.nextNetworkId ?? 1,
+      console: resetRuntimeState ? [] : current?.console ?? [],
+      nextConsoleId: resetRuntimeState ? 1 : current?.nextConsoleId ?? 1,
+      network: resetRuntimeState ? [] : current?.network ?? [],
+      nextNetworkId: resetRuntimeState ? 1 : current?.nextNetworkId ?? 1,
       dialog: null,
-      newDocumentScripts: current?.newDocumentScripts ?? new Set(),
       heapSnapshotChunks: [],
-      traceActive: current?.traceActive ?? false,
-      traceEvents: navigationChanged ? [] : current?.traceEvents ?? [],
+      traceActive: resetRuntimeState ? false : current?.traceActive ?? false,
+      traceEvents: resetRuntimeState ? [] : current?.traceEvents ?? [],
       traceCompletionPromise: null,
       traceCompletionResolve: null,
-      profilerActive: current?.profilerActive ?? false,
-      coverageActive: current?.coverageActive ?? false,
+      profilerActive: resetRuntimeState ? false : current?.profilerActive ?? false,
+      coverageActive: resetRuntimeState ? false : current?.coverageActive ?? false,
       heapSnapshot: null,
       previousHeapSnapshot: null,
-      cdpDomainsReady: false,
-      cdpDomainsPromise: null,
+      // Page/Runtime/Network domains belong to the same WebContents target,
+      // not to a single document. Navigation resets document-bound runtime
+      // state above, but re-enabling the domains for every navigation can
+      // leave Chromium's debugger command stream waiting during a transition.
+      // Keep the domain handshake for the target and only start it for a new
+      // Surface lifecycle.
+      cdpDomainsReady: sameSurface ? current?.cdpDomainsReady ?? false : false,
+      cdpDomainsPromise: sameSurface ? current?.cdpDomainsPromise ?? null : null,
     };
     this.#pages.set(binding.surface_id, next);
     return next;
@@ -494,9 +513,18 @@ export class BrowserAutomationRuntime {
     binding: BrowserSurfaceBinding,
     input: Extract<BrowserHostCommand, { type: "screenshot" }>["payload"],
   ): Promise<{ result: BrowserCommandResult; binary: Buffer }> {
+    const hasElementTarget = Boolean(input.target && input.target.element_ref !== "root");
+    const hasElementScope = Boolean(input.target);
+    const hasClip = Boolean(input.clip);
+    if ((hasElementScope && hasClip) || (hasElementScope && input.full_page) || (hasClip && input.full_page)) {
+      throw protocolFailure(
+        "invalid_screenshot_scope",
+        "element_ref、clip、full_page 三者只能选择一个截图范围",
+      );
+    }
     let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined;
-    if (input.target && input.target.element_ref !== "root") {
-      const target = await this.target(binding, input.target);
+    if (hasElementTarget) {
+      const target = await this.screenshotTarget(binding, input.target!);
       clip = { ...target.bounds, scale: 1 };
     } else if (input.clip) {
       const viewport = await this.pageViewport(binding);
@@ -517,11 +545,14 @@ export class BrowserAutomationRuntime {
       format: input.format,
       ...(input.quality !== undefined ? { quality: input.quality } : {}),
       ...(clip ? { clip } : {}),
-      captureBeyondViewport: input.full_page,
+      captureBeyondViewport: input.full_page || hasElementTarget,
+      // 截图走同一 WebContents 的 Chromium surface，显示视图和标记裁剪
+      // 使用同一套 CSS 坐标，避免非 surface 截图忽略 clip 导致标记退化成整页。
       fromSurface: true,
     });
     const binary = Buffer.from(captured.data, "base64");
-    const mime = input.format === "png" ? "image/png" : `image/${input.format}`;
+    const mime = screenshotMime(input.format);
+    validateScreenshotBytes(binary, input.format);
     return {
       result: {
         type: "binary_payload",
@@ -534,6 +565,25 @@ export class BrowserAutomationRuntime {
       },
       binary,
     };
+  }
+
+  private async screenshotTarget(
+    binding: BrowserSurfaceBinding,
+    target: BrowserSnapshotTarget,
+  ): Promise<{ bounds: { x: number; y: number; width: number; height: number } }> {
+    await this.evaluate(
+      binding,
+      `(() => { const e = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)}); e.scrollIntoView({ block: "center", inline: "center" }); })()`,
+    );
+    const resolved = await this.evaluate<{ bounds: { x: number; y: number; width: number; height: number } }>(
+      binding,
+      `(() => { const e = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)}); const r = e.getBoundingClientRect(); return { bounds: { x: r.x, y: r.y, width: r.width, height: r.height } }; })()`,
+    );
+    const bounds = resolved?.bounds;
+    if (!bounds || ![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite) || bounds.width <= 0 || bounds.height <= 0) {
+      throw protocolFailure("browser_element_bounds_invalid", "截图元素当前没有有效可见区域");
+    }
+    return { bounds };
   }
 
   private async hitTest(binding: BrowserSurfaceBinding, x: number, y: number) {
@@ -626,16 +676,16 @@ export class BrowserAutomationRuntime {
         return { handled: true };
       case "webmcp":
         return this.webmcp(binding, args);
-      case "pwa":
+      case "pwa": {
+        if (args.action !== "state") {
+          throw protocolFailure("browser_pwa_action_unsupported", "only the state action is supported");
+        }
         return this.pwaAudit(binding);
+      }
       case "third_party":
         return this.thirdParty(binding, args);
       case "heap":
         return this.heap(binding, args);
-      case "scripts":
-        return this.newDocumentScript(binding, args);
-      case "overlay":
-        return this.overlay(binding, args);
       case "lighthouse":
         return this.lighthouse(binding, args);
       case "upload_file":
@@ -666,14 +716,51 @@ export class BrowserAutomationRuntime {
     if (!selector) throw protocolFailure("browser_upload_target_invalid", "target must be a file input");
     const node = await this.#cdp.send<{ nodeId?: number }>(binding, "DOM.querySelector", { nodeId: document.root.nodeId, selector });
     if (!node.nodeId) throw protocolFailure("browser_upload_target_invalid", "file input is no longer connected");
-    await this.#cdp.send(binding, "DOM.setFileInputFiles", { nodeId: node.nodeId, files: paths });
+    const authorizedPaths = await this.authorizeUploadPaths(paths);
+    await this.#cdp.send(binding, "DOM.setFileInputFiles", { nodeId: node.nodeId, files: authorizedPaths });
     await this.#cdp.send(binding, "DOM.focus", { nodeId: node.nodeId });
-    return { uploaded: paths.map((path) => path.split(/[\\\\/]/).pop() || path), count: paths.length };
+    return { uploaded: authorizedPaths.map((path) => path.split(/[\\\\/]/).pop() || path), count: authorizedPaths.length };
+  }
+
+  private async authorizeUploadPaths(paths: string[]): Promise<string[]> {
+    if (!this.#uploadRoot) {
+      throw protocolFailure(
+        "browser_upload_authorization_required",
+        "browser uploads require an explicit Magi staging directory",
+      );
+    }
+    const root = await realpath(this.#uploadRoot).catch(() => null);
+    if (!root) {
+      throw protocolFailure(
+        "browser_upload_authorization_unavailable",
+        "the configured Magi upload staging directory is unavailable",
+      );
+    }
+    const authorized: string[] = [];
+    for (const requestedPath of paths) {
+      if (!isAbsolute(requestedPath)) {
+        throw protocolFailure("browser_upload_path_outside_boundary", "upload paths must be absolute");
+      }
+      const canonicalPath = await realpath(requestedPath).catch(() => null);
+      if (!canonicalPath || !isWithinPath(root, canonicalPath)) {
+        throw protocolFailure("browser_upload_path_outside_boundary", "upload path is outside Magi staging directory");
+      }
+      const metadata = await stat(canonicalPath).catch(() => null);
+      if (!metadata?.isFile()) {
+        throw protocolFailure("browser_upload_file_invalid", "upload path must be a regular file");
+      }
+      authorized.push(canonicalPath);
+    }
+    return authorized;
   }
 
   private async thirdParty(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
     const page = this.page(binding);
-    if (args.action === "clear") {
+    const action = String(args.action ?? "").trim();
+    if (action !== "list" && action !== "clear") {
+      throw protocolFailure("browser_third_party_action_unsupported", `unsupported action: ${action}`);
+    }
+    if (action === "clear") {
       page.network.length = 0;
       return { cleared: true };
     }
@@ -732,16 +819,91 @@ export class BrowserAutomationRuntime {
       if (!Object.prototype.hasOwnProperty.call(field, "value")) {
         throw protocolFailure("browser_fill_form_invalid", "each fields item must include value");
       }
-      await this.typeText(
+      const target = snapshotTarget(field);
+      const targetExpression = `globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)})`;
+      const selectControl = await this.evaluate<{ kind: "select"; multiple: boolean } | null>(
         binding,
-        snapshotTarget(field),
-        String(field.value ?? ""),
-        field.replace !== false,
-        null,
+        `(() => { const element = ${targetExpression}; if (element instanceof HTMLSelectElement && !element.disabled) return { kind: 'select', multiple: element.multiple }; if (element instanceof HTMLSelectElement) throw new Error('browser_fill_form_target_disabled'); return null; })()`,
       );
+      const checkboxControl = selectControl ? null : await this.evaluate<{ kind: "checkbox" } | null>(
+        binding,
+        `(() => { const element = ${targetExpression}; if (element instanceof HTMLInputElement && element.type === 'checkbox' && !element.disabled) return { kind: 'checkbox' }; if (element instanceof HTMLInputElement && element.type === 'checkbox') throw new Error('browser_fill_form_target_disabled'); return null; })()`,
+      );
+      const radioControl = selectControl || checkboxControl ? null : await this.evaluate<{ kind: "radio" } | null>(
+        binding,
+        `(() => { const element = ${targetExpression}; if (element instanceof HTMLInputElement && element.type === 'radio' && !element.disabled) return { kind: 'radio' }; if (element instanceof HTMLInputElement && element.type === 'radio') throw new Error('browser_fill_form_target_disabled'); return null; })()`,
+      );
+      const control = selectControl || checkboxControl || radioControl || { kind: "text" as const };
+      if (control.kind === "text") {
+        if (Array.isArray(field.value)) {
+          throw protocolFailure("browser_fill_form_invalid", "text controls require a scalar value");
+        }
+        await this.typeText(binding, target, String(field.value ?? ""), field.replace !== false, null);
+      } else if (control.kind === "select") {
+        await this.setSelectValue(binding, target, field.value, Boolean(control.multiple));
+      } else {
+        await this.setBooleanControl(binding, target, control.kind, field.value);
+      }
       filled += 1;
     }
     return { filled };
+  }
+
+  private async setSelectValue(
+    binding: BrowserSurfaceBinding,
+    target: BrowserSnapshotTarget,
+    value: unknown,
+    multiple: boolean,
+  ): Promise<void> {
+    const values = Array.isArray(value) ? value : [value];
+    if (!multiple && values.length !== 1) {
+      throw protocolFailure("browser_fill_form_invalid", "single-select controls require one value");
+    }
+    if (!values.every((item) => typeof item === "string" || typeof item === "number")) {
+      throw protocolFailure("browser_fill_form_invalid", "select values must be strings or numbers");
+    }
+    const serialized = values.map(String);
+    await this.evaluate(
+      binding,
+      `(() => {
+        const element = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)});
+        if (!(element instanceof HTMLSelectElement)) throw new Error('browser_fill_form_target_stale');
+        const values = ${JSON.stringify(serialized)};
+        const options = [...element.options];
+        if (values.some((value) => !options.some((option) => option.value === value))) throw new Error('browser_fill_form_select_option_not_found');
+        if (element.multiple) {
+          for (const option of options) option.selected = values.includes(option.value);
+        } else {
+          element.value = values[0];
+        }
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+        return { value: element.value };
+      })()`,
+    );
+  }
+
+  private async setBooleanControl(
+    binding: BrowserSurfaceBinding,
+    target: BrowserSnapshotTarget,
+    kind: "checkbox" | "radio",
+    value: unknown,
+  ): Promise<void> {
+    if (typeof value !== "boolean") {
+      throw protocolFailure("browser_fill_form_invalid", `${kind} controls require a boolean value`);
+    }
+    if (kind === "radio" && value !== true) {
+      throw protocolFailure("browser_fill_form_invalid", "radio controls can only be selected with true");
+    }
+    await this.evaluate(
+      binding,
+      `(() => {
+        const element = globalThis.__magiBrowserAutomation.resolve(${JSON.stringify(target.element_ref)}, ${safeInteger(target.snapshot_revision, 0)});
+        if (!(element instanceof HTMLInputElement) || element.type !== ${JSON.stringify(kind)}) throw new Error('browser_fill_form_target_stale');
+        if (element.checked !== ${value}) element.click();
+        return { checked: element.checked };
+      })()`,
+    );
   }
 
   private async waitFor(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
@@ -929,6 +1091,13 @@ export class BrowserAutomationRuntime {
   private async performance(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
     const page = this.page(binding);
     const action = String(args.action ?? "metrics");
+    const supportedActions = new Set([
+      "start", "stop", "metrics", "analyze", "profile_start", "profile_stop",
+      "coverage_start", "coverage_take", "coverage_stop",
+    ]);
+    if (!supportedActions.has(action)) {
+      throw protocolFailure("browser_performance_action_unsupported", `unsupported action: ${action}`);
+    }
     if (action === "start") {
       page.traceEvents = [];
       page.traceActive = true;
@@ -987,12 +1156,30 @@ export class BrowserAutomationRuntime {
     }
     await this.#cdp.send(binding, "Performance.enable");
     const metrics = await this.#cdp.send(binding, "Performance.getMetrics");
-    return { metrics, traceActive: page.traceActive, events: action === "analyze" ? page.traceEvents : undefined };
+    return action === "analyze"
+      ? {
+        metrics,
+        traceActive: page.traceActive,
+        insights: analyzeTrace(page.traceEvents),
+        ...(args.include_events === true ? { events: page.traceEvents } : {}),
+      }
+      : { metrics, traceActive: page.traceActive };
   }
 
   private async heap(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
     const page = this.page(binding);
-    const action = String(args.action ?? "usage");
+    const action = String(args.action ?? "").trim();
+    if (!action) {
+      throw protocolFailure("browser_heap_action_required", "action is required");
+    }
+    const supportedActions = new Set([
+      "usage", "take_snapshot", "close_snapshot", "compare_snapshots", "summary", "details",
+      "class_nodes", "dominators", "duplicate_strings", "edges", "object_details", "retainers",
+      "retaining_paths",
+    ]);
+    if (!supportedActions.has(action)) {
+      throw protocolFailure("browser_heap_action_unsupported", `unsupported action: ${action}`);
+    }
     if (action === "usage") return this.#cdp.send(binding, "Runtime.getHeapUsage");
     if (action === "take_snapshot") {
       page.heapSnapshotChunks = [];
@@ -1052,49 +1239,6 @@ export class BrowserAutomationRuntime {
     })()`);
   }
 
-  private async newDocumentScript(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
-    const page = this.page(binding);
-    const action = String(args.action ?? "add");
-    if (action === "clear") {
-      for (const identifier of page.newDocumentScripts) {
-        await this.#cdp.send(binding, "Page.removeScriptToEvaluateOnNewDocument", { identifier });
-      }
-      page.newDocumentScripts.clear();
-      return { cleared: true };
-    }
-    if (action === "remove") {
-      const identifier = String(args.identifier ?? "").trim();
-      if (!identifier) throw protocolFailure("browser_script_identifier_required", "identifier is required");
-      await this.#cdp.send(binding, "Page.removeScriptToEvaluateOnNewDocument", { identifier });
-      page.newDocumentScripts.delete(identifier);
-      return { removed: true, identifier };
-    }
-    const source = String(args.source ?? "").trim();
-    if (!source) throw protocolFailure("browser_script_source_required", "source is required");
-    const response = await this.#cdp.send<{ identifier: string }>(binding, "Page.addScriptToEvaluateOnNewDocument", { source });
-    page.newDocumentScripts.add(response.identifier);
-    return response;
-  }
-
-  private async overlay(binding: BrowserSurfaceBinding, args: Record<string, unknown>): Promise<unknown> {
-    if (args.action === "hide") {
-      await this.#cdp.send(binding, "Overlay.hideHighlight");
-      return { hidden: true };
-    }
-    const selector = String(args.selector ?? "").trim();
-    if (!selector) throw protocolFailure("browser_overlay_selector_required", "selector is required");
-    const document = await this.#cdp.send<{ root: { nodeId: number } }>(binding, "DOM.getDocument", { depth: 1 });
-    const node = await this.#cdp.send<{ nodeId: number }>(binding, "DOM.querySelector", {
-      nodeId: document.root.nodeId,
-      selector,
-    });
-    if (!node.nodeId) throw protocolFailure("browser_overlay_target_not_found", "selector did not match");
-    await this.#cdp.send(binding, "Overlay.highlightNode", {
-      nodeId: node.nodeId,
-      highlightConfig: { showInfo: true, showStyles: false, showRulers: false, showExtensionLines: false },
-    });
-    return { highlighted: true, selector };
-  }
 
   private onCdpEvent(
     binding: BrowserSurfaceBinding,
@@ -1104,6 +1248,10 @@ export class BrowserAutomationRuntime {
   ): void {
     const page = this.page(binding);
     if (method === "Runtime.executionContextsCleared") {
+      // Renderer 进程重启或页面导航会清掉 Chromium 中的所有 CDP 运行态。
+      // Worker 自己保存的活动标志必须同步清零，否则下一次调用会误以为
+      // Trace/Profile/Coverage 仍在运行，并向已经不存在的 CDP 会话发送 stop。
+      page.traceCompletionResolve?.();
       page.executionContextId = null;
       page.console.length = 0;
       page.network.length = 0;
@@ -1111,7 +1259,13 @@ export class BrowserAutomationRuntime {
       page.heapSnapshotChunks = [];
       page.heapSnapshot = null;
       page.previousHeapSnapshot = null;
+      page.traceActive = false;
       page.traceEvents = [];
+      page.traceCompletionPromise = null;
+      page.traceCompletionResolve = null;
+      page.profilerActive = false;
+      page.coverageActive = false;
+      page.cdpDomainsReady = false;
       return;
     }
     if (method === "Runtime.consoleAPICalled") {
@@ -1331,7 +1485,29 @@ function analyzeHeap(snapshot: HeapSnapshotData, previous: HeapSnapshotData | nu
   if (action === "retainers" || action === "retaining_paths") {
     return { node_id: nodeId, paths: heapRetainingPaths(snapshot, nodeId, Math.min(64, Math.max(1, safeInteger(args.max_depth, 8))), pageSize) };
   }
-  return { action, page_index: pageIndex, page_size: pageSize, nodes: [] };
+  throw protocolFailure("browser_heap_action_unsupported", `unsupported action: ${action}`);
+}
+
+function analyzeTrace(events: Array<Record<string, unknown>>): Record<string, unknown> {
+  const durations = events
+    .filter((event) => Number.isFinite(Number(event.dur)) && Number(event.dur) > 0)
+    .map((event) => ({
+      name: String(event.name ?? "unknown"),
+      duration_ms: Number(event.dur) / 1000,
+      timestamp_ms: Number.isFinite(Number(event.ts)) ? Number(event.ts) / 1000 : null,
+    }));
+  const longTasks = durations
+    .filter((event) => event.duration_ms >= 50)
+    .sort((left, right) => right.duration_ms - left.duration_ms)
+    .slice(0, 50);
+  const paint = events.find((event) => /firstcontentfulpaint|firstMeaningfulPaint/i.test(String(event.name ?? "")));
+  return {
+    event_count: events.length,
+    total_duration_ms: durations.reduce((total, event) => total + event.duration_ms, 0),
+    long_task_count: longTasks.length,
+    long_tasks: longTasks,
+    first_contentful_paint_ms: paint && Number.isFinite(Number(paint.ts)) ? Number(paint.ts) / 1000 : null,
+  };
 }
 
 function heapEdges(snapshot: HeapSnapshotData, nodeIndex: number): HeapEdgeRecord[] {
@@ -1667,6 +1843,27 @@ function finiteNumber(value: unknown, name: string): number {
   return value;
 }
 
+function screenshotMime(format: "png" | "jpeg" | "webp"): string {
+  return format === "png" ? "image/png" : format === "jpeg" ? "image/jpeg" : "image/webp";
+}
+
+function validateScreenshotBytes(binary: Buffer, format: "png" | "jpeg" | "webp"): void {
+  const valid = format === "png"
+    ? binary.length >= 8
+      && binary.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    : format === "jpeg"
+      ? binary.length >= 3 && binary[0] === 0xff && binary[1] === 0xd8 && binary[2] === 0xff
+      : binary.length >= 12
+        && binary.subarray(0, 4).equals(Buffer.from("RIFF"))
+        && binary.subarray(8, 12).equals(Buffer.from("WEBP"));
+  if (!valid) {
+    throw protocolFailure(
+      "browser_screenshot_format_mismatch",
+      `截图二进制内容与 ${format} 格式不一致`,
+    );
+  }
+}
+
 function networkConditions(value: string): Record<string, unknown> {
   const presets: Record<string, { latency: number; downloadThroughput: number; uploadThroughput: number }> = {
     "slow 3g": { latency: 400, downloadThroughput: 500_000, uploadThroughput: 500_000 },
@@ -1678,6 +1875,14 @@ function networkConditions(value: string): Record<string, unknown> {
   const preset = presets[value.toLowerCase()];
   if (!preset) throw protocolFailure("browser_network_preset_invalid", `unknown network preset: ${value}`);
   return { offline: false, ...preset };
+}
+
+function isWithinPath(root: string, candidate: string): boolean {
+  const child = relative(root, candidate);
+  return child !== ""
+    && child !== ".."
+    && !child.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)
+    && !isAbsolute(child);
 }
 
 function snapshotTarget(args: Record<string, unknown>, prefix = ""): BrowserSnapshotTarget {

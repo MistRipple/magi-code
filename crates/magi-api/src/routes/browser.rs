@@ -60,6 +60,10 @@ pub fn routes() -> Router<ApiState> {
             "/browser/sessions/{browser_session_id}/tabs",
             post(create_tab),
         )
+        .route(
+            "/browser/sessions/{browser_session_id}/active-tab",
+            post(set_active_tab),
+        )
         .route("/browser/tabs/{tab_id}", delete(close_tab))
         .route("/browser/tabs/{tab_id}/activate", post(activate_tab))
         .route("/browser/tabs/{tab_id}/navigation", post(navigate_tab))
@@ -539,6 +543,7 @@ struct BrowserSessionResponse {
     session_id: SessionId,
     profile_id: BrowserProfileId,
     lifecycle: BrowserSessionLifecycle,
+    active_tab_id: Option<BrowserTabId>,
     tabs: Vec<BrowserTabResponse>,
     runtime_epoch: u64,
     revision: u64,
@@ -940,6 +945,12 @@ struct CreateBrowserTabRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetActiveBrowserTabRequest {
+    tab_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateBrowserAnnotationRequest {
     selection: BrowserAnnotationSelectionRequest,
     comment: String,
@@ -1146,6 +1157,43 @@ async fn create_tab(
     Ok((StatusCode::CREATED, Json(created_response.into())))
 }
 
+/// 记录右侧面板当前选中的 Browser Tab。
+///
+/// 这是 UI 焦点同步，不会恢复或创建 Chromium Page，也不会改变控制 Lease。
+/// 浏览器工具在没有显式 tab_id 时使用该运行态焦点作为默认目标。
+async fn set_active_tab(
+    State(state): State<ApiState>,
+    Path(browser_session_id): Path<String>,
+    Json(request): Json<SetActiveBrowserTabRequest>,
+) -> Result<Json<BrowserSessionResponse>, ApiError> {
+    let browser_session_id = BrowserSessionId::new(browser_session_id);
+    wait_for_browser_session_ready(&state, &browser_session_id).await?;
+    let tab_id = BrowserTabId::new(request.tab_id);
+    let session = state.mutate_browser_authority(|authority| {
+        authority.set_active_tab(&browser_session_id, &tab_id)?;
+        authority
+            .session(&browser_session_id)
+            .cloned()
+            .ok_or_else(|| {
+                magi_browser_authority::BrowserAuthorityError::UnknownSession(
+                    browser_session_id.clone(),
+                )
+            })
+    })?;
+    publish_browser_event(
+        &state,
+        "browser.tab.focused",
+        session.workspace_id.as_ref(),
+        &session.session_id,
+        serde_json::json!({
+            "browser_session_id": browser_session_id,
+            "tab_id": tab_id,
+            "revision": session.revision,
+        }),
+    );
+    Ok(Json(browser_session_response(&state, session)?))
+}
+
 fn finish_browser_tab_creation(
     state: &ApiState,
     workspace_id: &Option<WorkspaceId>,
@@ -1300,8 +1348,9 @@ async fn create_annotation(
         &tab_id,
     )
     .await?;
+    let artifact_id_for_cleanup = screenshot_artifact_id.clone();
     let now = UtcMillis::now();
-    let annotation = state.mutate_browser_authority(|authority| {
+    let annotation = match state.mutate_browser_authority(|authority| {
         authority.validate_navigation_ref(
             &session.browser_session_id,
             &tab_id,
@@ -1325,7 +1374,13 @@ async fn create_annotation(
             created_at: now,
             updated_at: now,
         })
-    })?;
+    }) {
+        Ok(annotation) => annotation,
+        Err(error) => {
+            let _ = delete_browser_annotation_artifact(&state, &artifact_id_for_cleanup);
+            return Err(error);
+        }
+    };
     sync_browser_annotations_to_host(&state, &annotation.tab_id).await?;
     publish_browser_event(
         &state,
@@ -1407,6 +1462,20 @@ async fn persist_browser_annotation_screenshot(
         "已持久化浏览器标记截图 artifact"
     );
     Ok(relative_id)
+}
+
+fn delete_browser_annotation_artifact(state: &ApiState, artifact_id: &str) -> Result<(), ApiError> {
+    let Some(path) = browser_annotation_artifact_path(state, artifact_id)? else {
+        return Ok(());
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ApiError::internal_assembly(
+            "清理失败的浏览器标记截图 artifact 失败",
+            error,
+        )),
+    }
 }
 
 async fn browser_hit_test(
@@ -2202,12 +2271,14 @@ fn browser_session_response(
             response
         })
         .collect();
+    let active_tab_id = authority.active_tab(&session.browser_session_id).cloned();
     Ok(BrowserSessionResponse {
         browser_session_id: session.browser_session_id,
         workspace_id: session.workspace_id,
         session_id: session.session_id,
         profile_id: session.profile_id,
         lifecycle: session.lifecycle,
+        active_tab_id,
         tabs,
         runtime_epoch: session.runtime_epoch,
         revision: session.revision,

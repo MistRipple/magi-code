@@ -140,6 +140,20 @@
   });
 
   onMount(() => {
+    const focusAppRenderer = () => {
+      if (window.magiDesktop?.focusApp) {
+        void window.magiDesktop.focusApp().catch(() => undefined);
+      }
+    };
+    // 原生 Browser Surface 不属于 App DOM。用户从浏览器回到对话、设置、
+    // 代码或终端时，捕获阶段明确回收 App Renderer 焦点，避免键盘输入继续
+    // 落入上一个网页输入框。
+    document.addEventListener('pointerdown', focusAppRenderer, true);
+    // 原生 Browser Surface 与 App Renderer 是两个独立的 WebContents。
+    // 某些 macOS 命中路径会把 pointerdown 交给 App DOM，却保留网页
+    // WebContents 的键盘焦点；focusin 是 DOM 确认应用控件已接管输入
+    // 的稳定边界，必须同步通知 Main 完成 WebContents 焦点切换。
+    document.addEventListener('focusin', focusAppRenderer, true);
     const handleAgentConnection = (event: Event) => {
       const detail = (event as CustomEvent<AgentConnectionEventDetail>).detail;
       if (detail?.status === 'connected') {
@@ -181,6 +195,8 @@
       handleBrowserAuthorityChanged as EventListener,
     );
     return () => {
+      document.removeEventListener('pointerdown', focusAppRenderer, true);
+      document.removeEventListener('focusin', focusAppRenderer, true);
       window.removeEventListener(RUNTIME_CONNECTION_EVENT, handleAgentConnection as EventListener);
       window.removeEventListener(
         BROWSER_AUTHORITY_CHANGED_EVENT,

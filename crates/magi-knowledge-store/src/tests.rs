@@ -1,10 +1,442 @@
 use crate::{
-    CodeIndexIngestion, CodeIndexSource, CodeIndexSymbol, CodeSymbolKind, KnowledgeAuditLink,
+    CodeIndexIngestion, CodeIndexSource, CodeIndexSymbol, CodeSymbolKind, GraphEdgeKind,
+    GraphEdgeOrigin, GraphEdgeStatus, GraphNodeRef, GraphQuery, KnowledgeAuditLink,
     KnowledgeGovernanceLink, KnowledgeGovernanceOutcome, KnowledgeKind, KnowledgeQuery,
-    KnowledgeRecord, KnowledgeStore,
+    KnowledgeRecord, KnowledgeRelation, KnowledgeStore,
     code_scanner::{CodeIndexFile, CodeIndexScanStatus, CodeIndexSummary},
 };
 use magi_core::{UtcMillis, WorkspaceId};
+
+#[test]
+fn knowledge_relations_are_workspace_scoped_persisted_and_cascaded() {
+    let store = KnowledgeStore::new();
+    let workspace_id = WorkspaceId::new("relation-workspace");
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "adr-relation".into(),
+        kind: KnowledgeKind::Adr,
+        title: "Relation decision".into(),
+        content: "Keep this relation".into(),
+        tags: Vec::new(),
+        workspace_id: Some(workspace_id.clone()),
+        source_ref: None,
+        created_at: UtcMillis(1),
+        updated_at: UtcMillis(1),
+    });
+    let relation = KnowledgeRelation {
+        relation_id: "relation-persisted".into(),
+        workspace_id: workspace_id.clone(),
+        source: GraphNodeRef::Knowledge {
+            knowledge_id: "adr-relation".into(),
+        },
+        kind: GraphEdgeKind::AppliesTo,
+        target: GraphNodeRef::File {
+            path: "src/feature.ts".into(),
+        },
+        origin: GraphEdgeOrigin::ExplicitUser,
+        confidence: Some(0.9),
+        status: GraphEdgeStatus::Active,
+        evidence: vec!["manual association".into()],
+        discovery_key: None,
+        discovery_evidence: None,
+        reviewed_at: None,
+        created_at: UtcMillis(2),
+        updated_at: UtcMillis(2),
+    };
+
+    store
+        .upsert_relation(relation.clone())
+        .expect("valid relation should be accepted");
+    assert_eq!(store.list_relations(&workspace_id), vec![relation.clone()]);
+
+    let restored = KnowledgeStore::from_state(store.export_state());
+    assert_eq!(restored.list_relations(&workspace_id), vec![relation]);
+    restored
+        .delete_in_workspace("adr-relation", &workspace_id)
+        .expect("knowledge should delete");
+    assert!(restored.list_relations(&workspace_id).is_empty());
+}
+
+#[test]
+fn knowledge_relations_reject_cross_workspace_and_invalid_confidence() {
+    let store = KnowledgeStore::new();
+    let workspace_a = WorkspaceId::new("relation-workspace-a");
+    let workspace_b = WorkspaceId::new("relation-workspace-b");
+    for (workspace_id, knowledge_id) in [(&workspace_a, "adr-a"), (&workspace_b, "adr-b")] {
+        store.upsert(KnowledgeRecord {
+            knowledge_id: knowledge_id.into(),
+            kind: KnowledgeKind::Adr,
+            title: knowledge_id.into(),
+            content: "content".into(),
+            tags: Vec::new(),
+            workspace_id: Some(workspace_id.clone()),
+            source_ref: None,
+            created_at: UtcMillis(1),
+            updated_at: UtcMillis(1),
+        });
+    }
+    let base = KnowledgeRelation {
+        relation_id: "relation-invalid".into(),
+        workspace_id: workspace_a.clone(),
+        source: GraphNodeRef::Knowledge {
+            knowledge_id: "adr-a".into(),
+        },
+        kind: GraphEdgeKind::References,
+        target: GraphNodeRef::Knowledge {
+            knowledge_id: "adr-b".into(),
+        },
+        origin: GraphEdgeOrigin::ExplicitUser,
+        confidence: Some(1.2),
+        status: GraphEdgeStatus::Active,
+        evidence: Vec::new(),
+        discovery_key: None,
+        discovery_evidence: None,
+        reviewed_at: None,
+        created_at: UtcMillis(1),
+        updated_at: UtcMillis(1),
+    };
+    assert!(store.upsert_relation(base).is_err());
+}
+
+#[test]
+fn inferred_relations_are_stable_candidates_and_rejected_candidates_are_deduplicated() {
+    let root = std::env::temp_dir().join(format!(
+        "magi-ks-inferred-relations-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).expect("create source directory");
+    std::fs::write(
+        root.join("src/feature_relation.rs"),
+        "pub fn feature_relation_probe() -> bool { true }\n",
+    )
+    .expect("write source file");
+
+    let workspace_id = WorkspaceId::new("workspace-inferred-relations");
+    let store = KnowledgeStore::new();
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "faq-feature-relation".into(),
+        kind: KnowledgeKind::Faq,
+        title: "Feature relation".into(),
+        content: "This FAQ explains the feature relation implementation.".into(),
+        tags: vec!["feature".into()],
+        workspace_id: Some(workspace_id.clone()),
+        source_ref: None,
+        created_at: UtcMillis(1),
+        updated_at: UtcMillis(1),
+    });
+
+    assert_eq!(
+        store.ensure_workspace_index_available(
+            &workspace_id,
+            &root,
+            std::time::Duration::from_secs(1),
+        ),
+        crate::WorkspaceIndexEnsureResult::Ready
+    );
+    let candidates = store
+        .list_relations(&workspace_id)
+        .into_iter()
+        .filter(|relation| relation.origin == GraphEdgeOrigin::Inferred)
+        .collect::<Vec<_>>();
+    assert!(!candidates.is_empty(), "索引完成后应生成自动候选关系");
+    assert!(candidates.iter().all(|relation| {
+        relation.status == GraphEdgeStatus::Candidate
+            && relation.discovery_key.is_some()
+            && relation.reviewed_at.is_none()
+            && relation
+                .evidence
+                .iter()
+                .any(|item| item.starts_with("matched_tokens:"))
+    }));
+    let candidate_ids = candidates
+        .iter()
+        .map(|relation| relation.relation_id.clone())
+        .collect::<Vec<_>>();
+    let candidate_updated_at = candidates[0].updated_at;
+
+    store.refresh_inferred_relations_for_workspace(&workspace_id);
+    let refreshed = store
+        .list_relations(&workspace_id)
+        .into_iter()
+        .filter(|relation| relation.origin == GraphEdgeOrigin::Inferred)
+        .collect::<Vec<_>>();
+    assert_eq!(refreshed.len(), candidates.len());
+    assert_eq!(
+        refreshed
+            .iter()
+            .map(|relation| relation.relation_id.clone())
+            .collect::<Vec<_>>(),
+        candidate_ids
+    );
+    assert_eq!(refreshed[0].updated_at, candidate_updated_at);
+
+    let mut rejected = candidates[0].clone();
+    rejected.status = GraphEdgeStatus::Rejected;
+    rejected.reviewed_at = Some(UtcMillis::now());
+    store
+        .upsert_relation(rejected.clone())
+        .expect("已审阅的推断关系可以忽略");
+    store.refresh_inferred_relations_for_workspace(&workspace_id);
+    let after_reject = store.list_relations(&workspace_id);
+    assert_eq!(
+        after_reject
+            .iter()
+            .filter(|relation| relation.origin == GraphEdgeOrigin::Inferred)
+            .count(),
+        candidates.len()
+    );
+    assert_eq!(
+        after_reject
+            .iter()
+            .find(|relation| relation.relation_id == rejected.relation_id)
+            .map(|relation| relation.status),
+        Some(GraphEdgeStatus::Rejected)
+    );
+
+    let restored = KnowledgeStore::from_state(store.export_state());
+    assert_eq!(
+        restored
+            .relation(&rejected.relation_id, &workspace_id)
+            .and_then(|relation| relation.reviewed_at),
+        rejected.reviewed_at
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn inferred_relation_changes_notify_persistence_once_after_unlock() {
+    let root = std::env::temp_dir().join(format!(
+        "magi-ks-inferred-persistence-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).expect("create source directory");
+    std::fs::write(
+        root.join("src/persistence_probe.rs"),
+        "pub fn persistence_probe() {}\n",
+    )
+    .expect("write source file");
+
+    let workspace_id = WorkspaceId::new("workspace-inferred-persistence");
+    let store = KnowledgeStore::new();
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "faq-persistence-probe".into(),
+        kind: KnowledgeKind::Faq,
+        title: "Persistence probe".into(),
+        content: "The persistence probe is documented here.".into(),
+        tags: vec!["persistence".into()],
+        workspace_id: Some(workspace_id.clone()),
+        source_ref: None,
+        created_at: UtcMillis(1),
+        updated_at: UtcMillis(1),
+    });
+
+    let persisted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let persisted_for_callback = persisted.clone();
+    store.set_index_persistence_callback(move |store| {
+        let state = store.export_state();
+        assert!(!state.relations().is_empty());
+        persisted_for_callback.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    assert_eq!(
+        store.ensure_workspace_index_available(
+            &workspace_id,
+            &root,
+            std::time::Duration::from_secs(1),
+        ),
+        crate::WorkspaceIndexEnsureResult::Ready
+    );
+    assert_eq!(
+        persisted.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "首次自动候选变更应触发一次持久化"
+    );
+
+    store.refresh_inferred_relations_for_workspace(&workspace_id);
+    assert_eq!(
+        persisted.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "无变化刷新不应重复持久化"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn empty_workspace_index_keeps_runtime_summary_without_persisting_zero_projection() {
+    let root = std::env::temp_dir().join(format!(
+        "magi-ks-empty-projection-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create workspace directory");
+    let workspace_id = WorkspaceId::new("workspace-empty-projection");
+    let store = KnowledgeStore::new();
+    store.build_workspace_index(&workspace_id, &root);
+    assert!(store.workspace_index_available(&workspace_id));
+    assert_eq!(
+        store
+            .code_index_summary_for_workspace(&workspace_id)
+            .map(|summary| summary.files.len()),
+        Some(0)
+    );
+    assert!(
+        store
+            .get("project-code-index:workspace-empty-projection")
+            .is_none()
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn inferred_candidate_reconciliation_removes_unmatched_unreviewed_candidates() {
+    let root = std::env::temp_dir().join(format!(
+        "magi-ks-stale-candidate-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).expect("create source directory");
+    std::fs::write(root.join("src/legacy.rs"), "pub fn legacy_probe() {}\n")
+        .expect("write source file");
+
+    let workspace_id = WorkspaceId::new("workspace-stale-candidate");
+    let store = KnowledgeStore::new();
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "faq-legacy".into(),
+        kind: KnowledgeKind::Faq,
+        title: "Legacy behavior".into(),
+        content: "legacy behavior is documented here".into(),
+        tags: vec!["legacy".into()],
+        workspace_id: Some(workspace_id.clone()),
+        source_ref: None,
+        created_at: UtcMillis(1),
+        updated_at: UtcMillis(1),
+    });
+    store.build_workspace_index(&workspace_id, &root);
+    assert!(
+        store
+            .list_relations(&workspace_id)
+            .iter()
+            .any(|relation| relation.origin == GraphEdgeOrigin::Inferred)
+    );
+
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "faq-legacy".into(),
+        kind: KnowledgeKind::Faq,
+        title: "Current behavior".into(),
+        content: "current behavior is documented here".into(),
+        tags: vec!["current".into()],
+        workspace_id: Some(workspace_id.clone()),
+        source_ref: None,
+        created_at: UtcMillis(1),
+        updated_at: UtcMillis(2),
+    });
+
+    assert!(
+        store
+            .list_relations(&workspace_id)
+            .iter()
+            .all(|relation| relation.origin != GraphEdgeOrigin::Inferred)
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn inferred_candidate_survives_code_removal_and_projects_as_dangling() {
+    let root = std::env::temp_dir().join(format!(
+        "magi-ks-stale-candidate-dangling-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).expect("create source directory");
+    let source_path = root.join("src/legacy.rs");
+    std::fs::write(&source_path, "pub fn legacy_probe() {}\n").expect("write source file");
+
+    let workspace_id = WorkspaceId::new("workspace-stale-candidate-dangling");
+    let store = KnowledgeStore::new();
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "faq-legacy-dangling".into(),
+        kind: KnowledgeKind::Faq,
+        title: "Legacy behavior".into(),
+        content: "legacy behavior is documented here".into(),
+        tags: vec!["legacy".into()],
+        workspace_id: Some(workspace_id.clone()),
+        source_ref: None,
+        created_at: UtcMillis(1),
+        updated_at: UtcMillis(1),
+    });
+    store.build_workspace_index(&workspace_id, &root);
+    let candidate_id = store
+        .list_relations(&workspace_id)
+        .into_iter()
+        .find(|relation| relation.origin == GraphEdgeOrigin::Inferred)
+        .map(|relation| relation.relation_id)
+        .expect("initial index should create a candidate");
+
+    std::fs::remove_file(source_path).expect("remove source file");
+    store.build_workspace_index(&workspace_id, &root);
+
+    let relation = store
+        .relation(&candidate_id, &workspace_id)
+        .expect("dangling candidate should remain auditable");
+    assert_eq!(relation.status, GraphEdgeStatus::Candidate);
+    assert!(relation.reviewed_at.is_none());
+    let graph = store
+        .query_workspace_graph(&workspace_id, &GraphQuery::default())
+        .expect("empty rebuilt index should remain queryable");
+    assert!(
+        graph
+            .edges
+            .iter()
+            .any(|edge| { edge.id == candidate_id && edge.status == GraphEdgeStatus::Dangling })
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn inferred_relation_requires_review_before_activation() {
+    let workspace_id = WorkspaceId::new("workspace-inferred-review");
+    let store = KnowledgeStore::new();
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "faq-review".into(),
+        kind: KnowledgeKind::Faq,
+        title: "Review candidate".into(),
+        content: "Candidate review content".into(),
+        tags: Vec::new(),
+        workspace_id: Some(workspace_id.clone()),
+        source_ref: None,
+        created_at: UtcMillis(1),
+        updated_at: UtcMillis(1),
+    });
+    let relation = KnowledgeRelation {
+        relation_id: "inferred-review-invalid".into(),
+        workspace_id: workspace_id.clone(),
+        source: GraphNodeRef::Knowledge {
+            knowledge_id: "faq-review".into(),
+        },
+        kind: GraphEdgeKind::AppliesTo,
+        target: GraphNodeRef::File {
+            path: "src/review.rs".into(),
+        },
+        origin: GraphEdgeOrigin::Inferred,
+        confidence: Some(0.7),
+        status: GraphEdgeStatus::Active,
+        evidence: vec!["automatic".into()],
+        discovery_key: Some("review-key".into()),
+        discovery_evidence: None,
+        reviewed_at: None,
+        created_at: UtcMillis(1),
+        updated_at: UtcMillis(1),
+    };
+    assert!(store.upsert_relation(relation).is_err());
+}
 
 #[test]
 fn business_knowledge_query_matches_natural_chinese_phrases() {
@@ -974,6 +1406,96 @@ fn watcher_incrementally_refreshes_index_on_file_change() {
             .collect::<Vec<_>>()
     );
 
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn watcher_file_deletion_projects_knowledge_relation_as_dangling() {
+    use std::fs;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    let base = std::env::temp_dir().join(format!(
+        "magi-ks-graph-dangling-test-{}-{}",
+        std::process::id(),
+        UtcMillis::now().0
+    ));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(base.join("src")).expect("create temp project dir");
+    let source_path = base.join("src/feature.rs");
+    fs::write(&source_path, "pub fn feature_symbol() -> bool { true }\n")
+        .expect("write source file");
+
+    let store = KnowledgeStore::new();
+    let workspace_id = WorkspaceId::new("ws-graph-dangling-test");
+    store.upsert(KnowledgeRecord {
+        knowledge_id: "faq-graph-dangling".into(),
+        kind: KnowledgeKind::Faq,
+        title: "Feature relation".into(),
+        content: "The feature file is related to this FAQ".into(),
+        tags: Vec::new(),
+        workspace_id: Some(workspace_id.clone()),
+        source_ref: None,
+        created_at: UtcMillis(1),
+        updated_at: UtcMillis(1),
+    });
+    store
+        .upsert_relation(KnowledgeRelation {
+            relation_id: "relation-graph-dangling".into(),
+            workspace_id: workspace_id.clone(),
+            source: GraphNodeRef::Knowledge {
+                knowledge_id: "faq-graph-dangling".into(),
+            },
+            kind: GraphEdgeKind::AppliesTo,
+            target: GraphNodeRef::File {
+                path: "src/feature.rs".into(),
+            },
+            origin: GraphEdgeOrigin::ExplicitUser,
+            confidence: None,
+            status: GraphEdgeStatus::Active,
+            evidence: vec!["watcher deletion test".into()],
+            discovery_key: None,
+            discovery_evidence: None,
+            reviewed_at: None,
+            created_at: UtcMillis(1),
+            updated_at: UtcMillis(1),
+        })
+        .expect("relation should be accepted");
+
+    let _guard = runtime.enter();
+    store.build_workspace_index(&workspace_id, &base);
+    let query = GraphQuery::default();
+    let initial = store
+        .query_workspace_graph(&workspace_id, &query)
+        .expect("graph should be queryable");
+    assert_eq!(
+        initial
+            .edges
+            .iter()
+            .find(|edge| edge.id == "relation-graph-dangling")
+            .map(|edge| edge.status),
+        Some(GraphEdgeStatus::Active)
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    fs::remove_file(source_path).expect("remove source file");
+    let mut dangling = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let graph = store
+            .query_workspace_graph(&workspace_id, &query)
+            .expect("graph should remain queryable");
+        if graph.edges.iter().any(|edge| {
+            edge.id == "relation-graph-dangling" && edge.status == GraphEdgeStatus::Dangling
+        }) {
+            dangling = true;
+            break;
+        }
+    }
+    assert!(dangling, "删除文件后显式关系应由 active 投影为 dangling");
     let _ = fs::remove_dir_all(&base);
 }
 

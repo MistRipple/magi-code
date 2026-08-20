@@ -23,6 +23,7 @@ use magi_core::{
 use magi_event_bus::{EventContext, EventEnvelope, InMemoryEventBus};
 use magi_session_store::SessionStore;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::{RuntimeStatePersistence, state::BrowserHostStatusSnapshot};
 
@@ -223,14 +224,6 @@ impl BrowserToolRuntimeDependencies {
         let tab = self
             .ensure_tab(&browser_session, arguments, &client)
             .await?;
-        if tool_name == "browser_pwa"
-            && optional_string(arguments, "action").as_deref() != Some("state")
-        {
-            return Err(BrowserToolError::new(
-                "browser_pwa_action_unsupported",
-                "当前内置浏览器只提供 PWA 状态审计，不会创建独立应用窗口或修改系统安装状态",
-            ));
-        }
         if browser_devtools_operation(tool_name).is_some() {
             return self
                 .execute_devtools_operation(
@@ -527,11 +520,17 @@ impl BrowserToolRuntimeDependencies {
                 .to_string())
             }
             "browser_screenshot" => {
+                let has_element_scope = optional_string(arguments, "element_ref").is_some();
                 let target = optional_snapshot_target(arguments)?;
                 let clip = arguments
                     .get("clip")
                     .map(parse_normalized_rect)
                     .transpose()?;
+                let full_page = arguments
+                    .get("full_page")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                validate_screenshot_scope(has_element_scope, clip.is_some(), full_page)?;
                 let format = match optional_string(arguments, "format").as_deref() {
                     None | Some("png") => magi_browser_authority::BrowserScreenshotFormat::Png,
                     Some("jpeg") => magi_browser_authority::BrowserScreenshotFormat::Jpeg,
@@ -569,10 +568,7 @@ impl BrowserToolRuntimeDependencies {
                         tab_id: tab.tab_id.clone(),
                         target,
                         clip,
-                        full_page: arguments
-                            .get("full_page")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
+                        full_page,
                         format,
                         quality,
                     })
@@ -589,6 +585,7 @@ impl BrowserToolRuntimeDependencies {
                 let bytes = reply.binary.ok_or_else(|| {
                     BrowserToolError::new("browser_binary_missing", "浏览器截图缺少二进制内容")
                 })?;
+                validate_screenshot_binary(&format, &metadata, &bytes)?;
                 let extension = match format {
                     magi_browser_authority::BrowserScreenshotFormat::Png => "png",
                     magi_browser_authority::BrowserScreenshotFormat::Jpeg => "jpg",
@@ -624,12 +621,22 @@ impl BrowserToolRuntimeDependencies {
             | "emulate" => true,
             "dialog" => !matches!(action.as_deref(), Some("list")),
             "console" | "network" => matches!(action.as_deref(), Some("clear")),
-            "performance" => matches!(action.as_deref(), Some("start" | "stop" | "profile_start" | "profile_stop" | "coverage_start" | "coverage_stop")),
+            "performance" => matches!(
+                action.as_deref(),
+                Some(
+                    "start"
+                        | "stop"
+                        | "profile_start"
+                        | "profile_stop"
+                        | "coverage_start"
+                        | "coverage_stop"
+                )
+            ),
             "lighthouse" => !matches!(lighthouse_mode.as_deref(), Some("snapshot")),
-            "recording" => true,
-            "heap" => matches!(action.as_deref(), Some("take_snapshot")),
-            "third_party" | "webmcp" => matches!(action.as_deref(), Some("execute")),
-            "pwa" => matches!(action.as_deref(), Some("install" | "launch" | "uninstall")),
+            "heap" => matches!(action.as_deref(), Some("take_snapshot" | "close_snapshot")),
+            "third_party" => matches!(action.as_deref(), Some("clear")),
+            "webmcp" => matches!(action.as_deref(), Some("execute")),
+            "pwa" => false,
             _ => false,
         };
         let control = if requires_write {
@@ -765,9 +772,10 @@ impl BrowserToolRuntimeDependencies {
                 }
                 Some(tab.clone())
             } else {
-                session
-                    .tab_ids
-                    .iter()
+                authority
+                    .active_tab(&session.browser_session_id)
+                    .into_iter()
+                    .chain(session.tab_ids.iter())
                     .find_map(|id| authority.tab(id).cloned())
                     .filter(|tab| {
                         matches!(
@@ -780,6 +788,9 @@ impl BrowserToolRuntimeDependencies {
             }
         };
         if let Some(tab) = tab {
+            self.mutate(|authority| {
+                authority.set_active_tab(&session.browser_session_id, &tab.tab_id)
+            })?;
             return self.materialize_tab(tab, client).await;
         }
         let tab_id = BrowserTabId::new(format!(
@@ -788,12 +799,14 @@ impl BrowserToolRuntimeDependencies {
             BROWSER_TAB_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         let created = self.mutate(|authority| {
-            authority.create_tab(CreateBrowserTab {
+            let created = authority.create_tab(CreateBrowserTab {
                 tab_id: tab_id.clone(),
                 browser_session_id: session.browser_session_id.clone(),
                 url: initial_url.clone(),
                 now: UtcMillis::now(),
-            })
+            })?;
+            authority.set_active_tab(&session.browser_session_id, &tab_id)?;
+            Ok(created)
         })?;
         self.publish_tab_event("browser.tab.created", &created);
         let reply = match client
@@ -1276,9 +1289,13 @@ impl BrowserToolRuntimeDependencies {
                 .filter_map(|id| authority.tab(id))
                 .cloned()
                 .collect::<Vec<_>>();
-            return Ok(
-                json!({ "tool": "browser_tabs", "status": "succeeded", "tabs": tabs }).to_string(),
-            );
+            return Ok(json!({
+                "tool": "browser_tabs",
+                "status": "succeeded",
+                "active_tab_id": authority.active_tab(&session.browser_session_id),
+                "tabs": tabs,
+            })
+            .to_string());
         }
         match action.as_str() {
             "new" => {
@@ -1296,12 +1313,14 @@ impl BrowserToolRuntimeDependencies {
                     BROWSER_TAB_SEQUENCE.fetch_add(1, Ordering::Relaxed)
                 ));
                 let created = self.mutate(|authority| {
-                    authority.create_tab(CreateBrowserTab {
+                    let created = authority.create_tab(CreateBrowserTab {
                         tab_id: tab_id.clone(),
                         browser_session_id: session.browser_session_id.clone(),
                         url: initial_url.clone(),
                         now: UtcMillis::now(),
-                    })
+                    })?;
+                    authority.set_active_tab(&session.browser_session_id, &tab_id)?;
+                    Ok(created)
                 })?;
                 self.publish_tab_event("browser.tab.created", &created);
                 let reply = match client
@@ -1346,6 +1365,9 @@ impl BrowserToolRuntimeDependencies {
                     .await?;
                 self.prepare_agent_write(client, session, &target, scope)
                     .await?;
+                self.mutate(|authority| {
+                    authority.set_active_tab(&session.browser_session_id, &tab_id)
+                })?;
                 self.publish_browser_event(
                     "browser.tab.activated",
                     session,
@@ -1448,6 +1470,95 @@ fn validate_devtools_arguments(
                         "browser_fill_form.fields 的每一项必须包含 value",
                     ));
                 }
+                let value = field.get("value").expect("value was checked above");
+                if !is_supported_fill_value(value) {
+                    return Err(BrowserToolError::new(
+                        "invalid_arguments",
+                        "browser_fill_form.fields.value 必须是字符串、数字、布尔值或字符串/数字数组",
+                    ));
+                }
+            }
+        }
+        "performance" => {
+            let action = arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    BrowserToolError::new(
+                        "invalid_arguments",
+                        "browser_performance 必须提供 action",
+                    )
+                })?;
+            if !matches!(
+                action,
+                "start"
+                    | "stop"
+                    | "metrics"
+                    | "analyze"
+                    | "profile_start"
+                    | "profile_stop"
+                    | "coverage_start"
+                    | "coverage_take"
+                    | "coverage_stop"
+            ) {
+                return Err(BrowserToolError::new(
+                    "invalid_arguments",
+                    format!("browser_performance 不支持 action: {action}"),
+                ));
+            }
+        }
+        "heap" => {
+            let action = arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    BrowserToolError::new("invalid_arguments", "browser_heap 必须提供 action")
+                })?;
+            if !matches!(
+                action,
+                "usage"
+                    | "take_snapshot"
+                    | "close_snapshot"
+                    | "compare_snapshots"
+                    | "summary"
+                    | "details"
+                    | "class_nodes"
+                    | "dominators"
+                    | "duplicate_strings"
+                    | "edges"
+                    | "object_details"
+                    | "retainers"
+                    | "retaining_paths"
+            ) {
+                return Err(BrowserToolError::new(
+                    "invalid_arguments",
+                    format!("browser_heap 不支持 action: {action}"),
+                ));
+            }
+        }
+        "pwa" => {
+            if arguments.get("action").and_then(Value::as_str) != Some("state") {
+                return Err(BrowserToolError::new(
+                    "invalid_arguments",
+                    "browser_pwa 只支持 state 状态审计，不会安装、启动或卸载系统 PWA",
+                ));
+            }
+        }
+        "third_party" => {
+            let action = arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    BrowserToolError::new(
+                        "invalid_arguments",
+                        "browser_third_party 必须提供 action",
+                    )
+                })?;
+            if !matches!(action, "list" | "clear") {
+                return Err(BrowserToolError::new(
+                    "invalid_arguments",
+                    format!("browser_third_party 不支持 action: {action}"),
+                ));
             }
         }
         "evaluate" => {
@@ -1492,6 +1603,16 @@ fn validate_devtools_arguments(
         _ => {}
     }
     Ok(())
+}
+
+fn is_supported_fill_value(value: &Value) -> bool {
+    match value {
+        Value::String(_) | Value::Number(_) | Value::Bool(_) => true,
+        Value::Array(values) => values
+            .iter()
+            .all(|item| item.is_string() || item.is_number()),
+        Value::Null | Value::Object(_) => false,
+    }
 }
 
 fn validate_nested_snapshot_target(
@@ -1601,9 +1722,9 @@ fn browser_tool_requested_access(
             | (
                 BrowserToolKind::Heap,
                 Some(
-                    "usage" | "close_snapshot" | "compare_snapshots" | "summary" | "details"
-                    | "class_nodes" | "dominators" | "duplicate_strings" | "edges"
-                    | "object_details" | "retainers" | "retaining_paths",
+                    "usage" | "compare_snapshots" | "summary" | "details" | "class_nodes"
+                    | "dominators" | "duplicate_strings" | "edges" | "object_details" | "retainers"
+                    | "retaining_paths",
                 ),
             )
             | (BrowserToolKind::ThirdParty, Some("list"))
@@ -1858,6 +1979,57 @@ fn parse_normalized_rect(
     Ok(rect)
 }
 
+fn validate_screenshot_scope(
+    has_element_ref: bool,
+    has_clip: bool,
+    full_page: bool,
+) -> Result<(), BrowserToolError> {
+    let scopes = [has_element_ref, has_clip, full_page]
+        .into_iter()
+        .filter(|value| *value)
+        .count();
+    if scopes > 1 {
+        return Err(BrowserToolError::new(
+            "invalid_screenshot_scope",
+            "element_ref、clip、full_page 三者只能选择一个截图范围",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_screenshot_binary(
+    format: &magi_browser_authority::BrowserScreenshotFormat,
+    metadata: &magi_browser_authority::BrowserHostBinaryPayload,
+    bytes: &[u8],
+) -> Result<(), BrowserToolError> {
+    let (mime, valid_header) = match format {
+        magi_browser_authority::BrowserScreenshotFormat::Png => (
+            "image/png",
+            bytes.len() >= 8 && bytes[..8] == [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+        ),
+        magi_browser_authority::BrowserScreenshotFormat::Jpeg => (
+            "image/jpeg",
+            bytes.len() >= 3 && bytes[0..3] == [0xff, 0xd8, 0xff],
+        ),
+        magi_browser_authority::BrowserScreenshotFormat::Webp => (
+            "image/webp",
+            bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        ),
+    };
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    if metadata.mime_type != mime
+        || metadata.byte_length != bytes.len() as u64
+        || metadata.sha256 != digest
+        || !valid_header
+    {
+        return Err(BrowserToolError::new(
+            "browser_screenshot_format_mismatch",
+            "截图 MIME、文件头、长度或 SHA-256 校验不一致",
+        ));
+    }
+    Ok(())
+}
+
 fn succeeded_result(
     outcome: BrowserHostCommandOutcome,
     context: &str,
@@ -2012,7 +2184,10 @@ fn browser_tool_snapshot_value(
 
     value.insert("elements".to_string(), Value::Array(elements));
     if !snapshot.accessibility_tree.is_empty() {
-        value.insert("accessibility_tree".to_string(), Value::Array(snapshot.accessibility_tree.clone()));
+        value.insert(
+            "accessibility_tree".to_string(),
+            Value::Array(snapshot.accessibility_tree.clone()),
+        );
     }
     Value::Object(value)
 }
@@ -2112,10 +2287,12 @@ mod tests {
     use serde_json::{Map, Value, json};
 
     use super::{
-        BrowserToolRuntimeDependencies, DEFAULT_BROWSER_PROFILE_ID, browser_tool_snapshot_value,
-        optional_snapshot_target, parse_normalized_rect, validate_devtools_arguments,
+        BrowserToolRuntimeDependencies, DEFAULT_BROWSER_PROFILE_ID, browser_tool_requested_access,
+        browser_tool_snapshot_value, optional_snapshot_target, parse_normalized_rect,
+        validate_devtools_arguments, validate_screenshot_binary, validate_screenshot_scope,
     };
     use crate::state::BrowserHostStatusSnapshot;
+    use magi_browser_authority::{BrowserToolAccess, BrowserToolKind};
 
     #[test]
     fn ensuring_browser_session_does_not_implicitly_create_page() {
@@ -2315,6 +2492,50 @@ mod tests {
         validate_devtools_arguments("fill_form", &fill_arguments)
             .expect("fill_form should use fields");
 
+        let mut invalid_fill = Map::new();
+        invalid_fill.insert(
+            "fields".to_string(),
+            json!([{"snapshot_revision": 2, "element_ref": "e-1", "value": {"unexpected": true}}]),
+        );
+        assert!(validate_devtools_arguments("fill_form", &invalid_fill).is_err());
+
+        let mut invalid_pwa = Map::new();
+        invalid_pwa.insert("action".to_string(), json!("install"));
+        assert!(validate_devtools_arguments("pwa", &invalid_pwa).is_err());
+
+        let mut invalid_heap = Map::new();
+        invalid_heap.insert("action".to_string(), json!("query_objects"));
+        assert!(validate_devtools_arguments("heap", &invalid_heap).is_err());
+
+        let mut invalid_third_party = Map::new();
+        invalid_third_party.insert("action".to_string(), json!("execute"));
+        assert!(validate_devtools_arguments("third_party", &invalid_third_party).is_err());
+
+        assert!(validate_devtools_arguments("third_party", &Map::new()).is_err());
+
+        let mut third_party_list = Map::new();
+        third_party_list.insert("action".to_string(), json!("list"));
+        validate_devtools_arguments("third_party", &third_party_list)
+            .expect("third_party list should be supported");
+        assert_eq!(
+            browser_tool_requested_access(BrowserToolKind::ThirdParty, &third_party_list),
+            BrowserToolAccess::Read
+        );
+        let mut third_party_clear = Map::new();
+        third_party_clear.insert("action".to_string(), json!("clear"));
+        validate_devtools_arguments("third_party", &third_party_clear)
+            .expect("third_party clear should be supported");
+        assert_eq!(
+            browser_tool_requested_access(BrowserToolKind::ThirdParty, &third_party_clear),
+            BrowserToolAccess::Write
+        );
+        let mut pwa_state = Map::new();
+        pwa_state.insert("action".to_string(), json!("state"));
+        assert_eq!(
+            browser_tool_requested_access(BrowserToolKind::Pwa, &pwa_state),
+            BrowserToolAccess::Read
+        );
+
         let mut evaluate_arguments = Map::new();
         evaluate_arguments.insert("expression".to_string(), json!("document.title"));
         validate_devtools_arguments("evaluate", &evaluate_arguments)
@@ -2358,6 +2579,51 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn browser_screenshot_scope_is_explicitly_mutually_exclusive() {
+        assert!(validate_screenshot_scope(true, false, false).is_ok());
+        assert!(validate_screenshot_scope(false, true, false).is_ok());
+        assert!(validate_screenshot_scope(false, false, true).is_ok());
+        for (element, clip, full_page) in [
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            let error = validate_screenshot_scope(element, clip, full_page)
+                .expect_err("screenshot scopes must not be combined");
+            assert_eq!(error.code, "invalid_screenshot_scope");
+        }
+    }
+
+    #[test]
+    fn browser_screenshot_metadata_and_file_header_must_match() {
+        use sha2::{Digest, Sha256};
+
+        let bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        let metadata = magi_browser_authority::BrowserHostBinaryPayload {
+            payload_id: "payload-1".to_string(),
+            mime_type: "image/png".to_string(),
+            byte_length: bytes.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        };
+        validate_screenshot_binary(
+            &magi_browser_authority::BrowserScreenshotFormat::Png,
+            &metadata,
+            &bytes,
+        )
+        .expect("valid PNG metadata should pass");
+
+        let mut invalid = metadata;
+        invalid.mime_type = "image/webp".to_string();
+        let error = validate_screenshot_binary(
+            &magi_browser_authority::BrowserScreenshotFormat::Png,
+            &invalid,
+            &bytes,
+        )
+        .expect_err("MIME mismatch must fail");
+        assert_eq!(error.code, "browser_screenshot_format_mismatch");
     }
 
     #[test]

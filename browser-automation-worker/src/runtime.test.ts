@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type {
   BrowserHostCommand,
   BrowserSurfaceBinding,
@@ -8,6 +11,16 @@ import type {
 } from "@magi/desktop-browser-contracts";
 import { CdpClient, type ParentPort } from "./cdp-client.js";
 import { BrowserAutomationRuntime } from "./runtime.js";
+
+function assertScreenshotHeader(binary: Buffer, format: "png" | "jpeg" | "webp"): void {
+  const valid = format === "png"
+    ? binary.subarray(0, 8).equals(PNG_BYTES)
+    : format === "jpeg"
+      ? binary.subarray(0, 3).equals(JPEG_BYTES.subarray(0, 3))
+      : binary.subarray(0, 4).equals(WEBP_BYTES.subarray(0, 4))
+        && binary.subarray(8, 12).equals(WEBP_BYTES.subarray(8, 12));
+  assert.equal(valid, true, `${format} header should be valid`);
+}
 
 class FakePort implements ParentPort {
   #listener: ((event: { data: MainToWorkerMessage }) => void) | null = null;
@@ -86,6 +99,10 @@ const binding: BrowserSurfaceBinding = {
   navigation_revision: 1,
 };
 
+const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const JPEG_BYTES = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+const WEBP_BYTES = Buffer.from("RIFF....WEBP", "ascii");
+
 function consoleCommand(): BrowserHostCommand {
   return {
     type: "devtools",
@@ -140,6 +157,37 @@ test("扩展浏览器能力已经进入 Worker 执行链", async () => {
   });
   assert.equal(result.outcome.status, "succeeded");
   assert.ok(port.requests.some((request) => request.method === "Runtime.evaluate"));
+});
+
+test("第三方资源工具只接受 list 和 clear action", async () => {
+  const port = new ScriptedPort(() => ({}));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port));
+  const result = await runtime.execute("third-party-invalid", binding, {
+    type: "devtools",
+    payload: {
+      tab_id: binding.tab_id,
+      operation: "third_party",
+      arguments: { action: "execute" },
+    },
+  });
+  assert.equal(result.outcome.status, "failed");
+  assert.equal(result.outcome.payload.code, "browser_third_party_action_unsupported");
+  assert.equal(port.requests.some((request) => request.method === "Runtime.evaluate"), false);
+});
+
+test("PWA 工具只接受 state action", async () => {
+  const port = new ScriptedPort(() => ({}));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port));
+  const result = await runtime.execute("pwa-invalid", binding, {
+    type: "devtools",
+    payload: {
+      tab_id: binding.tab_id,
+      operation: "pwa",
+      arguments: { action: "install" },
+    },
+  });
+  assert.equal(result.outcome.status, "failed");
+  assert.equal(result.outcome.payload.code, "browser_pwa_action_unsupported");
 });
 
 test("WebMCP 执行工具时传递结构化输入而不是 JSON 字符串", async () => {
@@ -216,7 +264,7 @@ test("浏览器截图的归一化区域必须转换为当前布局视口的真�
       };
     }
     if (method === "Page.captureScreenshot") {
-      return { data: Buffer.from("png-bytes").toString("base64") };
+      return { data: PNG_BYTES.toString("base64") };
     }
     return {};
   });
@@ -233,7 +281,7 @@ test("浏览器截图的归一化区域必须转换为当前布局视口的真�
   });
 
   assert.equal(result.outcome.status, "succeeded");
-  assert.equal(result.binary_base64, Buffer.from("png-bytes").toString("base64"));
+  assert.equal(result.binary_base64, PNG_BYTES.toString("base64"));
   const capture = port.requests.find((request) => request.method === "Page.captureScreenshot");
   assert.deepEqual(capture?.params, {
     format: "png",
@@ -264,7 +312,7 @@ test("截图和滚动使用页面脚本视口坐标，不把 CDP layoutViewport 
       };
     }
     if (method === "Page.captureScreenshot") {
-      return { data: Buffer.from("png-bytes").toString("base64") };
+      return { data: PNG_BYTES.toString("base64") };
     }
     return {};
   });
@@ -354,7 +402,79 @@ test("click_at 的 double_click 产生完整双击序列", async () => {
   );
 });
 
+test("fill_form 按原生控件语义处理 select、checkbox 和 radio", async () => {
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") {
+      const expression = String(params.expression);
+      if (expression.includes("e:1:radio") && expression.includes("element.type === 'radio'")) return { result: { value: { kind: "radio" } } };
+      if (expression.includes("e:1:checkbox") && expression.includes("element.type === 'checkbox'")) return { result: { value: { kind: "checkbox" } } };
+      if (expression.includes("e:1:select") && expression.includes("element instanceof HTMLSelectElement")) return { result: { value: { kind: "select", multiple: true } } };
+      return { result: { value: null } };
+    }
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("fill-controls", binding, {
+    type: "devtools",
+    payload: {
+      tab_id: binding.tab_id,
+      operation: "fill_form",
+      arguments: {
+        fields: [
+          { snapshot_revision: 1, element_ref: "e:1:select", value: ["one", "two"] },
+          { snapshot_revision: 1, element_ref: "e:1:checkbox", value: true },
+          { snapshot_revision: 1, element_ref: "e:1:radio", value: true },
+        ],
+      },
+    },
+  });
+  assert.equal(result.outcome.status, "succeeded");
+  assert.equal(result.outcome.payload.type, "json");
+  const fillResult = result.outcome.payload.type === "json"
+    ? result.outcome.payload.payload.value as { filled?: number }
+    : null;
+  assert.equal(fillResult?.filled, 3);
+  const evaluateCalls = port.requests.filter((request) => request.method === "Runtime.evaluate");
+  assert.ok(evaluateCalls.some((request) => String(request.params.expression).includes("element.options")));
+  assert.ok(evaluateCalls.some((request) => String(request.params.expression).includes("element.click()")));
+});
+
+test("性能和堆工具拒绝未实现 action，而不是返回空结果", async () => {
+  const port = new ScriptedPort(() => ({}));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const performance = await runtime.execute("bad-performance", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "performance", arguments: { action: "insight" } },
+  });
+  const heap = await runtime.execute("bad-heap", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "heap", arguments: { action: "query_objects" } },
+  });
+  assert.equal(performance.outcome.status, "failed");
+  assert.equal(performance.outcome.payload.code, "browser_performance_action_unsupported");
+  assert.equal(heap.outcome.status, "failed");
+  assert.equal(heap.outcome.payload.code, "browser_heap_action_unsupported");
+});
+
+test("堆工具要求显式 action，不使用未声明的默认 action", async () => {
+  const port = new ScriptedPort(() => ({}));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("heap-missing-action", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "heap", arguments: {} },
+  });
+  assert.equal(result.outcome.status, "failed");
+  assert.equal(result.outcome.payload.code, "browser_heap_action_required");
+});
+
 test("文件上传支持单文件和多文件 file input", async () => {
+  const uploadRoot = await mkdtemp(join(tmpdir(), "magi-browser-upload-"));
+  const firstPath = join(uploadRoot, "first.txt");
+  const secondPath = join(uploadRoot, "second.txt");
+  await writeFile(firstPath, "first");
+  await writeFile(secondPath, "second");
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
     if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
@@ -370,7 +490,7 @@ test("文件上传支持单文件和多文件 file input", async () => {
     if (method === "DOM.querySelector") return { nodeId: 2 };
     return {};
   });
-  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test", { uploadRoot });
   const result = await runtime.execute("upload-files", binding, {
     type: "devtools",
     payload: {
@@ -379,18 +499,22 @@ test("文件上传支持单文件和多文件 file input", async () => {
       arguments: {
         snapshot_revision: 1,
         element_ref: "e:1:1",
-        file_paths: ["/tmp/first.txt", "/tmp/second.txt"],
+        file_paths: [firstPath, secondPath],
       },
     },
   });
   assert.equal(result.outcome.status, "succeeded");
   assert.deepEqual(
     port.requests.find((request) => request.method === "DOM.setFileInputFiles")?.params,
-    { nodeId: 2, files: ["/tmp/first.txt", "/tmp/second.txt"] },
+    { nodeId: 2, files: [await realpath(firstPath), await realpath(secondPath)] },
   );
+  await rm(uploadRoot, { recursive: true, force: true });
 });
 
 test("文件上传拒绝无法解析为 file input 的快照目标", async () => {
+  const uploadRoot = await mkdtemp(join(tmpdir(), "magi-browser-upload-"));
+  const filePath = join(uploadRoot, "first.txt");
+  await writeFile(filePath, "first");
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
     if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
@@ -405,23 +529,62 @@ test("文件上传拒绝无法解析为 file input 的快照目标", async () =>
     if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
     return {};
   });
-  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test", { uploadRoot });
   const result = await runtime.execute("upload-text-input", binding, {
     type: "devtools",
     payload: {
       tab_id: binding.tab_id,
       operation: "upload_file",
-      arguments: { snapshot_revision: 1, element_ref: "e:1:1", file_path: "/tmp/first.txt" },
+      arguments: { snapshot_revision: 1, element_ref: "e:1:1", file_path: filePath },
     },
   });
   assert.equal(result.outcome.status, "failed");
   assert.equal(result.outcome.payload.code, "browser_upload_target_invalid");
+  await rm(uploadRoot, { recursive: true, force: true });
+});
+
+test("文件上传拒绝 Magi staging 目录之外的路径", async () => {
+  const uploadRoot = await mkdtemp(join(tmpdir(), "magi-browser-upload-root-"));
+  const outsideRoot = await mkdtemp(join(tmpdir(), "magi-browser-upload-outside-"));
+  const outsidePath = join(outsideRoot, "outside.txt");
+  await writeFile(outsidePath, "outside");
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") {
+      const expression = String(params.expression);
+      if (expression.includes("__magiBrowserAutomation.target")) {
+        return { result: { value: { x: 30, y: 40, bounds: { x: 10, y: 20, width: 40, height: 40 }, editable: true, sensitive: null } } };
+      }
+      if (expression.includes("__magiBrowserAutomation.resolve")) return { result: { value: "input[type=file]" } };
+      return { result: { value: null } };
+    }
+    if (method === "DOM.getDocument") return { root: { nodeId: 1 } };
+    if (method === "DOM.querySelector") return { nodeId: 2 };
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test", { uploadRoot });
+  const result = await runtime.execute("upload-outside", binding, {
+    type: "devtools",
+    payload: {
+      tab_id: binding.tab_id,
+      operation: "upload_file",
+      arguments: { snapshot_revision: 1, element_ref: "e:1:1", file_path: outsidePath },
+    },
+  });
+  assert.equal(result.outcome.status, "failed");
+  assert.equal(result.outcome.payload.code, "browser_upload_path_outside_boundary");
+  assert.equal(port.requests.some((request) => request.method === "DOM.setFileInputFiles"), false);
+  await Promise.all([
+    rm(uploadRoot, { recursive: true, force: true }),
+    rm(outsideRoot, { recursive: true, force: true }),
+  ]);
 });
 
 test("浏览器截图收到快照根节点时必须捕获整页范围而不是把 root 当成 DOM ref", async () => {
   const port = new ScriptedPort((method) => (
     method === "Page.captureScreenshot"
-      ? { data: Buffer.from("root-screenshot").toString("base64") }
+      ? { data: PNG_BYTES.toString("base64") }
       : {}
   ));
   const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
@@ -437,11 +600,134 @@ test("浏览器截图收到快照根节点时必须捕获整页范围而不是�
   });
 
   assert.equal(result.outcome.status, "succeeded");
-  assert.equal(result.binary_base64, Buffer.from("root-screenshot").toString("base64"));
+  assert.equal(result.binary_base64, PNG_BYTES.toString("base64"));
   assert.equal(port.requests.some((request) => request.method === "Runtime.evaluate"), false);
   assert.deepEqual(
     port.requests.find((request) => request.method === "Page.captureScreenshot")?.params,
     { format: "png", captureBeyondViewport: false, fromSurface: true },
+  );
+});
+
+test("浏览器截图必须拒绝互斥范围组合，并校验图片文件头", async () => {
+  const port = new ScriptedPort((method) => (
+    method === "Page.captureScreenshot" ? { data: PNG_BYTES.toString("base64") } : {}
+  ));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const invalid = await runtime.execute("scope-conflict", binding, {
+    type: "screenshot",
+    payload: {
+      tab_id: binding.tab_id,
+      target: { snapshot_revision: 1, element_ref: "e:1:1" },
+      clip: { x: 0, y: 0, width: 1, height: 1 },
+      full_page: false,
+      format: "png",
+    },
+  });
+  assert.equal(invalid.outcome.status, "failed");
+  assert.equal(invalid.outcome.payload.code, "invalid_screenshot_scope");
+  assert.equal(port.requests.some((request) => request.method === "Page.captureScreenshot"), false);
+
+  const mismatched = await runtime.execute("format-mismatch", binding, {
+    type: "screenshot",
+    payload: {
+      tab_id: binding.tab_id,
+      full_page: false,
+      format: "webp",
+    },
+  });
+  assert.equal(mismatched.outcome.status, "failed");
+  assert.equal(mismatched.outcome.payload.code, "browser_screenshot_format_mismatch");
+
+  assertScreenshotHeader(PNG_BYTES, "png");
+  assertScreenshotHeader(JPEG_BYTES, "jpeg");
+  assertScreenshotHeader(WEBP_BYTES, "webp");
+  assert.notEqual(PNG_BYTES.subarray(0, 4).toString("ascii"), "RIFF");
+
+  const formatPort = new ScriptedPort((method, params) => {
+    if (method !== "Page.captureScreenshot") return {};
+    const bytes = params.format === "jpeg" ? JPEG_BYTES : params.format === "webp" ? WEBP_BYTES : PNG_BYTES;
+    return { data: bytes.toString("base64") };
+  });
+  const formatRuntime = new BrowserAutomationRuntime(new CdpClient(formatPort), "worker-test");
+  for (const [format, bytes, mime] of [
+    ["png", PNG_BYTES, "image/png"],
+    ["jpeg", JPEG_BYTES, "image/jpeg"],
+    ["webp", WEBP_BYTES, "image/webp"],
+  ] as const) {
+    const captured = await formatRuntime.execute(`format-${format}`, binding, {
+      type: "screenshot",
+      payload: { tab_id: binding.tab_id, full_page: false, format },
+    });
+    assert.equal(captured.outcome.status, "succeeded");
+    assert.equal(captured.binary_base64, bytes.toString("base64"));
+    if (captured.outcome.status === "succeeded" && captured.outcome.payload.type === "binary_payload") {
+      assert.equal(captured.outcome.payload.payload.mime_type, mime);
+    }
+  }
+});
+
+test("整页截图使用 Chromium contentSize 和 captureBeyondViewport", async () => {
+  const port = new ScriptedPort((method) => {
+    if (method === "Page.getLayoutMetrics") {
+      return { contentSize: { x: 0, y: 0, width: 1400, height: 3000 } };
+    }
+    if (method === "Page.captureScreenshot") return { data: PNG_BYTES.toString("base64") };
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("full-page", binding, {
+    type: "screenshot",
+    payload: { tab_id: binding.tab_id, full_page: true, format: "png" },
+  });
+  assert.equal(result.outcome.status, "succeeded");
+  assert.deepEqual(
+    port.requests.find((request) => request.method === "Page.captureScreenshot")?.params,
+    {
+      format: "png",
+      clip: { x: 0, y: 0, width: 1400, height: 3000, scale: 1 },
+      captureBeyondViewport: true,
+      fromSurface: true,
+    },
+  );
+});
+
+test("元素截图先滚动到元素并重新读取最终 bounds", async () => {
+  const port = new ScriptedPort((method, params) => {
+    if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
+    if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+    if (method === "Runtime.evaluate") {
+      const expression = String(params.expression);
+      if (expression.includes("getBoundingClientRect")) {
+        return { result: { value: { bounds: { x: 20, y: 30, width: 400, height: 200 } } } };
+      }
+      return { result: { value: null } };
+    }
+    if (method === "Page.captureScreenshot") return { data: PNG_BYTES.toString("base64") };
+    return {};
+  });
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const result = await runtime.execute("element-shot", binding, {
+    type: "screenshot",
+    payload: {
+      tab_id: binding.tab_id,
+      target: { snapshot_revision: 1, element_ref: "e:1:1" },
+      full_page: false,
+      format: "png",
+    },
+  });
+  assert.equal(result.outcome.status, "succeeded");
+  const expressions = port.requests
+    .filter((request) => request.method === "Runtime.evaluate")
+    .map((request) => String(request.params.expression));
+  assert.ok(expressions.some((expression) => expression.includes("scrollIntoView")));
+  assert.deepEqual(
+    port.requests.find((request) => request.method === "Page.captureScreenshot")?.params,
+    {
+      format: "png",
+      clip: { x: 20, y: 30, width: 400, height: 200, scale: 1 },
+      captureBeyondViewport: true,
+      fromSurface: true,
+    },
   );
 });
 
@@ -568,6 +854,54 @@ test("导航 revision 变化后不会复用上一文档的 Console 和 Network �
   assert.deepEqual(value, { entries: [] });
 });
 
+test("Renderer 重启清理 Worker 保存的 CDP 运行态，避免复用失效会话", async () => {
+  const port = new ScriptedPort(() => ({}));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+
+  for (const action of ["start", "profile_start", "coverage_start"] as const) {
+    const result = await runtime.execute(`lifecycle-${action}`, binding, {
+      type: "devtools",
+      payload: { tab_id: binding.tab_id, operation: "performance", arguments: { action } },
+    });
+    assert.equal(result.outcome.status, "succeeded");
+  }
+  port.emit("Tracing.dataCollected", { value: [{ name: "RunTask", dur: 75_000 }] });
+  port.emit("Runtime.executionContextsCleared");
+
+  const analyze = await runtime.execute("lifecycle-analyze", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "performance", arguments: { action: "analyze" } },
+  });
+  assert.equal(analyze.outcome.status, "succeeded");
+  const analyzeValue = analyze.outcome.payload.type === "json"
+    ? analyze.outcome.payload.payload.value as Record<string, unknown>
+    : null;
+  assert.equal(analyzeValue?.traceActive, false);
+  assert.deepEqual(analyzeValue?.insights && (analyzeValue.insights as Record<string, unknown>).event_count, 0);
+
+  const profileStop = await runtime.execute("lifecycle-profile-stop", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "performance", arguments: { action: "profile_stop" } },
+  });
+  assert.equal(profileStop.outcome.status, "succeeded");
+  const profileValue = profileStop.outcome.payload.type === "json"
+    ? profileStop.outcome.payload.payload.value as Record<string, unknown>
+    : null;
+  assert.equal(profileValue?.stopped, false);
+
+  const coverageStop = await runtime.execute("lifecycle-coverage-stop", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "performance", arguments: { action: "coverage_stop" } },
+  });
+  assert.equal(coverageStop.outcome.status, "succeeded");
+  const coverageValue = coverageStop.outcome.payload.type === "json"
+    ? coverageStop.outcome.payload.payload.value as Record<string, unknown>
+    : null;
+  assert.equal(coverageValue?.stopped, false);
+  assert.equal(port.requests.filter((request) => request.method === "Profiler.stop").length, 0);
+  assert.equal(port.requests.filter((request) => request.method === "Profiler.stopPreciseCoverage").length, 0);
+});
+
 test("第三方分析按响应来源聚合请求和字节数", async () => {
   const port = new ScriptedPort((method, params) => {
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "frame-1" } } };
@@ -603,6 +937,36 @@ test("性能工具支持 CPU profile 和 precise coverage 生命周期", async (
   assert.equal(stop.outcome.status, "succeeded");
   assert.ok(port.requests.some((request) => request.method === "Profiler.start"));
   assert.ok(port.requests.some((request) => request.method === "Profiler.stop"));
+});
+
+test("性能 analyze 返回聚合洞察，并仅按需返回原始事件", async () => {
+  const port = new ScriptedPort(() => ({}));
+  const runtime = new BrowserAutomationRuntime(new CdpClient(port), "worker-test");
+  const start = await runtime.execute("insight-start", binding, {
+    type: "devtools",
+    payload: { tab_id: binding.tab_id, operation: "performance", arguments: { action: "start" } },
+  });
+  assert.equal(start.outcome.status, "succeeded");
+  port.emit("Tracing.dataCollected", {
+    value: [
+      { name: "RunTask", dur: 75_000, ts: 1_000_000 },
+      { name: "firstContentfulPaint", ts: 1_050_000 },
+    ],
+  });
+  const result = await runtime.execute("insight-analyze", binding, {
+    type: "devtools",
+    payload: {
+      tab_id: binding.tab_id,
+      operation: "performance",
+      arguments: { action: "analyze", include_events: false },
+    },
+  });
+  assert.equal(result.outcome.status, "succeeded");
+  const value = result.outcome.payload.type === "json" ? result.outcome.payload.payload.value as Record<string, unknown> : null;
+  const insights = value?.insights as Record<string, unknown>;
+  assert.equal(insights?.event_count, 2);
+  assert.equal(insights?.long_task_count, 1);
+  assert.equal("events" in (value ?? {}), false);
 });
 
 test("第三方分析只统计 response，并使用 loadingFinished 的编码字节数", async () => {

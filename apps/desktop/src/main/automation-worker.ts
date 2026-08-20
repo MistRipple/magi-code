@@ -26,6 +26,7 @@ const RECOVERY_STABLE_MILLIS = 30_000;
 export class AutomationWorker {
   readonly #entryPath: string;
   readonly #surfaceManager: BrowserSurfaceManager;
+  readonly #uploadRoot: string | undefined;
   readonly #onFailure: WorkerLifecycleCallback | undefined;
   readonly #onReady: WorkerLifecycleCallback | undefined;
   readonly #pending = new Map<string, PendingCommand>();
@@ -44,11 +45,13 @@ export class AutomationWorker {
   constructor(input: {
     entryPath: string;
     surfaceManager: BrowserSurfaceManager;
+    uploadRoot?: string;
     onFailure?: WorkerLifecycleCallback;
     onReady?: WorkerLifecycleCallback;
   }) {
     this.#entryPath = input.entryPath;
     this.#surfaceManager = input.surfaceManager;
+    this.#uploadRoot = input.uploadRoot;
     this.#onFailure = input.onFailure;
     this.#onReady = input.onReady;
   }
@@ -80,6 +83,7 @@ export class AutomationWorker {
         stdio: "pipe",
         env: {
           MAGI_BROWSER_WORKER_EPOCH: this.#workerEpoch,
+          ...(this.#uploadRoot ? { MAGI_BROWSER_UPLOAD_ROOT: this.#uploadRoot } : {}),
         },
       });
     } catch (cause) {

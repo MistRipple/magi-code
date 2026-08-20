@@ -88,6 +88,7 @@ contextBridge.exposeInMainWorld("magiDesktop", {
   activateBrowser: (request: unknown) => ipcRenderer.invoke("magi-desktop:activate-browser", request),
   activatePanel: (request: unknown) => ipcRenderer.invoke("magi-desktop:activate-panel", request),
   setBrowserViewport: (request: unknown) => ipcRenderer.invoke("magi-desktop:set-browser-viewport", request),
+  focusApp: () => ipcRenderer.invoke("magi-desktop:focus-app"),
   readyRightPane: () => ipcRenderer.invoke("magi-desktop:right-pane-ready"),
   openOverlay: (state: unknown) => ipcRenderer.invoke("magi-desktop:open-overlay", state),
   closeOverlay: () => ipcRenderer.invoke("magi-desktop:close-overlay"),

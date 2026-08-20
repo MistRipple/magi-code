@@ -70,15 +70,24 @@ await withGoldenViteServer(async (server) => {
   assert.match(windowManagerSource, /this\.#surfaceManager\.bindContentSurface\(/u);
   assert.match(windowManagerSource, /record\.appView\.setBounds\(layout\.appBounds/u);
   assert.doesNotMatch(windowManagerSource, /updateBrowserSlot/u);
-  assert.match(surfaceManagerSource, /record\.host\.addChildView\(record\.view, 1\)/u);
+  assert.match(surfaceManagerSource, /record\.host\.addChildView\(record\.view, 0\)/u);
   assert.match(surfaceManagerSource, /bindContentSurface\(windowId: string, tabId: string, bounds: Rectangle \| null\)/u);
-  assert.match(surfaceManagerSource, /record\.view\.setBounds\(bounds\)/u);
-  assert.match(surfaceManagerSource, /const visible = bounds !== null && !record\.loadFailed/u);
+  assert.match(surfaceManagerSource, /const localBounds = \{ x: 0, y: 0, width: bounds\.width, height: bounds\.height \}/u);
+  assert.match(surfaceManagerSource, /record\.view\.setBounds\(localBounds\)/u);
+  assert.match(surfaceManagerSource, /record\.view\.setVisible\(true\)/u);
+  assert.match(surfaceManagerSource, /did-fail-load[\s\S]*?this\.applySlot\(/u);
+  const failedLoadHandler = surfaceManagerSource.match(
+    /webContents\.on\("did-fail-load"[\s\S]*?\n\s*\}\);\n\s*webContents\.on\("did-finish-load"/u,
+  )?.[0];
+  assert.ok(failedLoadHandler, 'did-fail-load handler should remain explicit');
+  assert.doesNotMatch(failedLoadHandler, /this\.unmountSurface\(/u);
   assert.match(surfaceManagerSource, /private unmountSurface\([\s\S]*?只解绑原生 View，不关闭 WebContents/u);
   assert.match(surfaceManagerSource, /private async waitForDebugger\(/u);
   assert.match(surfaceManagerSource, /debugger-detached:[\s\S]*?reconnectDebugger/u);
-  assert.match(surfaceManagerSource, /Page\.captureScreenshot/u);
-  assert.doesNotMatch(surfaceManagerSource, /capturePage\(|startScreencast|drawImage\(/u);
+  assert.match(surfaceManagerSource, /method === "Page\.captureScreenshot"/u);
+  assert.match(surfaceManagerSource, /sendCdpCommandWithTimeout\([\s\S]*?Page\.captureScreenshot/u);
+  assert.doesNotMatch(surfaceManagerSource, /record\.contents\.capturePage\(|stayHidden:\s*true/u);
+  assert.doesNotMatch(surfaceManagerSource, /startScreencast|drawImage\(/u);
 
   // The browser remains a peer panel: terminal and future right-pane tabs
   // keep the same shared body and do not depend on browser activation.

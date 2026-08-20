@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -68,6 +68,11 @@ let workerInvalidatedDesktopConnection = false;
 let browserComponentError: BrowserComponentError | null = null;
 let browserComponentSnapshotTimer: NodeJS.Timeout | null = null;
 let lastBrowserComponentSnapshot = "";
+let daemonHostStatus: BrowserComponentStatus | null = null;
+let daemonHostProtocolCompatible = false;
+let daemonHostErrorCode: string | null = null;
+let daemonHostProbeAt = 0;
+let daemonHostProbe: Promise<void> | null = null;
 let shuttingDown = false;
 
 const singleInstance = app.requestSingleInstanceLock();
@@ -96,10 +101,13 @@ if (singleInstance) {
       publishBrowserEvent(event);
     },
   });
+  const browserUploadRoot = join(app.getPath("userData"), "browser-uploads");
+  mkdirSync(browserUploadRoot, { recursive: true });
   surfaceManager = surfaces;
   const overlays = new DesktopOverlayManager({
     preloadPath: paths.preload,
     agentOrigin: AGENT_ORIGIN,
+    desktopEpoch,
     onAction: (windowId, action) => {
       windowManager?.broadcast(windowId, "magi-desktop:overlay-action", action);
     },
@@ -110,6 +118,7 @@ if (singleInstance) {
   worker = new AutomationWorker({
     entryPath: paths.workerEntry,
     surfaceManager: surfaces,
+    uploadRoot: browserUploadRoot,
     onFailure: async (cause) => {
       if (shuttingDown) return;
       workerInvalidatedDesktopConnection = desktopConnectionGeneration !== null;
@@ -156,9 +165,6 @@ if (singleInstance) {
     handshake: () => handshake(worker!),
   });
   controlServer = control;
-  // ProcessSupervisor 的 ready 回调会恢复窗口状态；窗口必须先建立，才能
-  // 接管已经运行的 daemon，否则外部复用路径会在启动阶段找不到活动窗口。
-  manager.createWindow();
   await control.start();
   processSupervisor = new ProcessSupervisor({
     daemonPath: paths.daemon,
@@ -180,6 +186,11 @@ if (singleInstance) {
     },
   });
   await processSupervisor.start();
+  // 先让 daemon、桌面控制端点和前端入口全部就绪，再创建唯一桌面窗口。
+  // 如果窗口早于 daemon 加载 Renderer，首次 loadURL 会收到 connection refused；
+  // 这会留下一个只有原生外框的空白窗口，并把后续 Browser Surface 恢复带入竞态。
+  // 外部 daemon 复用路径同样在这里完成注册，因此不需要提前创建窗口。
+  manager.createWindow();
   // daemon、窗口控制端点和 Renderer 生命周期先建立，再启动 Worker。
   // 这样启动失败时不会留下一个脱离桌面宿主的浏览器自动化进程。
   worker.start();
@@ -248,6 +259,10 @@ function registerIpc(): void {
       text(request.tabId, "tabId"),
       parseViewport(request.viewport),
     );
+  });
+  ipcMain.handle("magi-desktop:focus-app", (event) => {
+    const { manager, windowId } = trustedAppSender(event.sender.id);
+    manager.focusApp(windowId);
   });
   ipcMain.handle("magi-desktop:right-pane-ready", (event) => {
     const { manager, windowId } = trustedAppSender(event.sender.id);
@@ -451,7 +466,8 @@ function handshake(worker: AutomationWorker): DesktopBrowserHandshake {
 }
 
 type BrowserComponentStatus = "starting" | "ready" | "restarting" | "failed" | "stopped";
-type BrowserComponentErrorTarget = "daemon" | "worker" | "protocol";
+type BrowserProtocolStatus = BrowserComponentStatus | "incompatible";
+type BrowserComponentErrorTarget = "daemon" | "worker" | "protocol" | "version";
 
 interface BrowserComponentError {
   target: BrowserComponentErrorTarget;
@@ -470,8 +486,28 @@ function browserComponentSnapshot() {
   const daemon = processSupervisor;
   const daemonStatus = daemon?.status ?? "stopped";
   const workerStatus = worker?.status ?? "stopped";
-  const protocolCompatible = daemonStatus === "ready" && desktopConnectionGeneration !== null;
-  const error = currentBrowserComponentError(daemonStatus, workerStatus, protocolCompatible);
+  const protocolCompatible = daemonStatus === "ready"
+    && desktopConnectionGeneration !== null
+    && daemonHostProtocolCompatible;
+  const protocolStatus = browserProtocolStatus(
+    daemonStatus,
+    daemonHostStatus,
+    protocolCompatible,
+    daemonHostErrorCode,
+  );
+  const versionCompatible = componentVersionsCompatible();
+  const error = currentBrowserComponentError(
+    daemonStatus,
+    workerStatus,
+    protocolStatus,
+    versionCompatible,
+  );
+  const runtimeStatus = browserRuntimeStatus(
+    daemonStatus,
+    workerStatus,
+    protocolStatus,
+    versionCompatible,
+  );
   return {
     product_version: PRODUCT_VERSION,
     electron_version: process.versions.electron,
@@ -490,17 +526,65 @@ function browserComponentSnapshot() {
     },
     protocol: {
       version: DESKTOP_BROWSER_PROTOCOL_VERSION,
+      status: protocolStatus,
       compatible: protocolCompatible,
-      error: protocolCompatible ? null : error?.target === "protocol" ? error : null,
+      error: (protocolStatus === "incompatible" || protocolStatus === "failed")
+        && error?.target === "protocol" ? error : null,
+    },
+    runtime: {
+      status: runtimeStatus,
+      ready: runtimeStatus === "ready",
+      version_compatible: versionCompatible,
+      error,
     },
     error,
   };
 }
 
+function componentVersionsCompatible(): boolean {
+  return PRODUCT_VERSION !== "unknown"
+    && DAEMON_VERSION !== "unknown"
+    && AUTOMATION_WORKER_VERSION !== "unknown"
+    && PRODUCT_VERSION === DAEMON_VERSION
+    && PRODUCT_VERSION === AUTOMATION_WORKER_VERSION;
+}
+
+function browserProtocolStatus(
+  daemonStatus: BrowserComponentStatus,
+  hostStatus: BrowserComponentStatus | null,
+  protocolCompatible: boolean,
+  hostErrorCode: string | null,
+): BrowserProtocolStatus {
+  if (daemonStatus !== "ready") return daemonStatus;
+  if (hostErrorCode === "browser_protocol_incompatible") return "incompatible";
+  if (hostStatus === "failed") return "failed";
+  if (hostStatus === "restarting") return "restarting";
+  if (hostStatus === "stopped") return "stopped";
+  if (hostStatus === "ready" && protocolCompatible) return "ready";
+  return "starting";
+}
+
+function browserRuntimeStatus(
+  daemonStatus: BrowserComponentStatus,
+  workerStatus: BrowserComponentStatus,
+  protocolStatus: BrowserProtocolStatus,
+  versionCompatible: boolean,
+): BrowserComponentStatus {
+  if (daemonStatus !== "ready") return daemonStatus;
+  if (workerStatus !== "ready") return workerStatus;
+  if (!versionCompatible || protocolStatus === "incompatible") return "failed";
+  if (protocolStatus === "failed") return "failed";
+  if (protocolStatus === "restarting") return "restarting";
+  if (protocolStatus === "stopped") return "stopped";
+  if (protocolStatus !== "ready") return "starting";
+  return "ready";
+}
+
 function currentBrowserComponentError(
   daemonStatus: BrowserComponentStatus,
   workerStatus: BrowserComponentStatus,
-  protocolCompatible: boolean,
+  protocolStatus: BrowserProtocolStatus,
+  versionCompatible: boolean,
 ): BrowserComponentError | null {
   if (daemonStatus === "failed") {
     return browserComponentError?.target === "daemon"
@@ -512,27 +596,27 @@ function currentBrowserComponentError(
       ? browserComponentError
       : { target: "worker", code: "browser_worker_failed", message: "Browser automation worker failed" };
   }
-  if (!protocolCompatible && daemonStatus === "ready") {
-    return browserComponentError
-      || { target: "protocol", code: "browser_protocol_incompatible", message: "Browser protocol is incompatible" };
-  }
-  if (daemonStatus !== "ready") {
-    return browserComponentError?.target === "daemon"
+  // starting/restarting/stopped 是生命周期状态，不应被当成错误；界面会
+  // 为每个组件单独展示这些状态。
+  if (daemonStatus !== "ready" || workerStatus !== "ready") return null;
+  if (!versionCompatible) {
+    return browserComponentError?.target === "version"
       ? browserComponentError
       : {
-        target: "daemon",
-        code: `browser_daemon_${daemonStatus}`,
-        message: `Browser daemon is ${daemonStatus}`,
+        target: "version",
+        code: "browser_component_version_mismatch",
+        message: `Browser component versions are inconsistent: product=${PRODUCT_VERSION}, daemon=${DAEMON_VERSION}, worker=${AUTOMATION_WORKER_VERSION}`,
       };
   }
-  if (workerStatus !== "ready") {
-    return browserComponentError?.target === "worker"
+  if (protocolStatus === "incompatible") {
+    return browserComponentError?.target === "protocol"
       ? browserComponentError
-      : {
-        target: "worker",
-        code: `browser_worker_${workerStatus}`,
-        message: `Browser automation worker is ${workerStatus}`,
-      };
+      : { target: "protocol", code: "browser_protocol_incompatible", message: "Browser protocol is incompatible" };
+  }
+  if (protocolStatus === "failed") {
+    return browserComponentError?.target === "protocol"
+      ? browserComponentError
+      : { target: "protocol", code: "browser_protocol_failed", message: "Browser protocol failed" };
   }
   return null;
 }
@@ -548,7 +632,11 @@ function componentError(target: BrowserComponentErrorTarget, code: string, cause
 function startBrowserComponentSnapshots(): void {
   if (browserComponentSnapshotTimer) return;
   publishBrowserComponentSnapshot();
-  browserComponentSnapshotTimer = setInterval(() => publishBrowserComponentSnapshot(), 250);
+  void refreshDaemonHostStatus(true);
+  browserComponentSnapshotTimer = setInterval(() => {
+    void refreshDaemonHostStatus();
+    publishBrowserComponentSnapshot();
+  }, 250);
   browserComponentSnapshotTimer.unref();
 }
 
@@ -558,6 +646,54 @@ function publishBrowserComponentSnapshot(): void {
   if (serialized === lastBrowserComponentSnapshot) return;
   lastBrowserComponentSnapshot = serialized;
   broadcastAll("magi-desktop:browser-component", snapshot);
+}
+
+async function refreshDaemonHostStatus(force = false): Promise<void> {
+  const daemon = processSupervisor;
+  if (!daemon || daemon.status !== "ready") return;
+  const now = Date.now();
+  if (!force && now - daemonHostProbeAt < 500) return;
+  if (daemonHostProbe) return daemonHostProbe;
+  daemonHostProbeAt = now;
+  daemonHostProbe = (async () => {
+    try {
+      const response = await fetch(`${AGENT_ORIGIN}/api/browser/desktop/connection`, {
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error(`browser_host_status_failed:${response.status}`);
+      const payload: unknown = await response.json();
+      updateDaemonHostStatus(payload);
+      publishBrowserComponentSnapshot();
+    } catch {
+      // A short polling failure must not turn a healthy component into a
+      // false failure. The process supervisor remains the source of daemon
+      // process state; keep the last host state until the next successful read.
+    } finally {
+      daemonHostProbe = null;
+    }
+  })();
+  return daemonHostProbe;
+}
+
+function updateDaemonHostStatus(value: unknown): void {
+  if (!value || typeof value !== "object") throw new Error("browser_host_status_invalid");
+  const record = value as Record<string, unknown>;
+  const status = normalizeDaemonHostStatus(record.hostStatus);
+  if (!status) throw new Error("browser_host_status_invalid");
+  daemonHostStatus = status;
+  daemonHostProtocolCompatible = record.hostProtocolCompatible === true;
+  daemonHostErrorCode = typeof record.lastErrorCode === "string" ? record.lastErrorCode : null;
+}
+
+function normalizeDaemonHostStatus(value: unknown): BrowserComponentStatus | null {
+  switch (value) {
+    case "stopped": return "stopped";
+    case "starting": return "starting";
+    case "ready": return "ready";
+    case "reconnecting": return "restarting";
+    case "failed": return "failed";
+    default: return null;
+  }
 }
 
 function readBrowserCapabilityManifest(): BrowserCapabilityManifest {
@@ -652,7 +788,9 @@ async function registerDesktopBrowserConnection(): Promise<void> {
   if (!response.ok) {
     throw new Error(`browser_desktop_connection_register_failed:${response.status}`);
   }
-  desktopConnectionGeneration = browserConnectionGeneration(await response.json());
+  const payload: unknown = await response.json();
+  updateDaemonHostStatus(payload);
+  desktopConnectionGeneration = browserConnectionGeneration(payload);
 }
 
 async function handleDaemonReady(): Promise<void> {
@@ -682,6 +820,9 @@ async function unregisterDesktopBrowserConnection(): Promise<void> {
       throw new Error(`browser_desktop_connection_unregister_failed:${response.status}`);
     }
     desktopConnectionGeneration = null;
+    daemonHostStatus = "stopped";
+    daemonHostProtocolCompatible = false;
+    daemonHostErrorCode = null;
   } catch {
     // daemon 可能已经随桌面端退出；关闭流程不因注册清理失败阻塞。
   }

@@ -55,6 +55,7 @@ npm run desktop:dev
 - [Magi Connect 与移动端方案](./magi-connect-mobile-plan.md)：账号、设备配对、连接服务、Desktop 边界及 Android/iOS 推进基线。
 - [Magi 内置浏览器完整设计](./browser-runtime-design.md)：Browser Authority、Browser Automation Worker、Goal/子代理租约、右侧预览、页面标记与跨平台发布基线。
 - [Magi 上下文压力与压缩统一架构](./context-pressure-compaction-architecture.md)：面向 Luna 后续开发的 token 语义、压力快照、连续压缩、检查点、超限恢复、模型隔离与测试门禁。
+- [知识图谱开发与验收计划](./knowledge-graph-plan.md)：知识、代码文件、符号和 Agent 图谱能力的分阶段实现边界与验收标准。
 
 ## 用户场景与产品要求
 

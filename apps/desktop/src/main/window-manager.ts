@@ -31,6 +31,7 @@ interface DesktopWindowRecord {
   windowId: string;
   window: BaseWindow;
   appLayer: View;
+  browserLayer: View;
   overlayLayer: View;
   appView: WebContentsView;
   layout: WindowLayoutState;
@@ -39,6 +40,7 @@ interface DesktopWindowRecord {
   blockingOverlayActive: boolean;
   rendererLoadFailed: boolean;
   rendererRecoveryUrl: string | null;
+  rendererLoadPromise: Promise<void> | null;
   closed: boolean;
 }
 
@@ -118,16 +120,22 @@ export class WindowManager {
     });
     this.applyNativeAppearance(window, this.#appearance);
     const appLayer = new View();
+    const browserLayer = new View();
     const overlayLayer = new View();
-    window.contentView.addChildView(appLayer);
-    window.contentView.addChildView(overlayLayer);
-    // Browser Surface 由 SurfaceManager 直接作为 contentView 的同级子视图
-    // 插入到 App Layer 与 Overlay Layer 之间。空闲时不存在会覆盖 DOM 的
-    // 空 BrowserLayer。
-    overlayLayer.setVisible(false);
     const appView = this.createTrustedView("app", windowId);
-    appLayer.addChildView(appView);
-    this.#surfaceManager.attachWindow(windowId, window);
+    window.contentView.addChildView(appLayer);
+    // WebContents 直接挂到窗口内容树，保证 Electron 可以在同一
+    // BaseWindow 内可靠切换 App Renderer 与 Browser Surface 的键盘焦点。
+    // appLayer 仍保留为主界面背景层，不承载另一个 WebContents。
+    window.contentView.addChildView(appView);
+    window.contentView.addChildView(browserLayer);
+    window.contentView.addChildView(overlayLayer);
+    // Browser Surface 只挂在当前右栏内容槽宿主内。宿主由 Main 布局设置
+    // 边界，WebContentsView 使用局部坐标，避免原生 View 的命中区域扩散
+    // 到对话区，造成键盘焦点落入网页输入框。
+    browserLayer.setVisible(false);
+    overlayLayer.setVisible(false);
+    this.#surfaceManager.attachWindow(windowId, window, browserLayer);
     this.#overlayManager.create(windowId, window, overlayLayer);
     const contentBounds = window.getContentBounds();
     const layout = createWindowLayoutState({
@@ -140,6 +148,7 @@ export class WindowManager {
       windowId,
       window,
       appLayer,
+      browserLayer,
       overlayLayer,
       appView,
       layout,
@@ -154,6 +163,7 @@ export class WindowManager {
       blockingOverlayActive: false,
       rendererLoadFailed: false,
       rendererRecoveryUrl: null,
+      rendererLoadPromise: null,
       closed: false,
     };
     this.#records.set(windowId, record);
@@ -167,6 +177,11 @@ export class WindowManager {
 
   async restoreAfterDaemonReady(): Promise<void> {
     await this.#overlayManager.restoreAfterDaemonReady();
+    // Electron 开发启动可早于 daemon。此时首次 loadURL 仍在 reject 路径中
+    // 而 daemon 的 ready 回调已经到达，直接筛选 rendererLoadFailed 会漏掉
+    // 这一次恢复机会，留下只有原生窗口外框的空白界面。先等待当前加载
+    // 结算，再对确认失败的 Renderer 做一次权威恢复。
+    await Promise.all([...this.#records.values()].map((record) => record.rendererLoadPromise));
     const failed = [...this.#records.values()].filter((record) => (
       !record.closed
       && record.rendererLoadFailed
@@ -311,6 +326,39 @@ export class WindowManager {
       record.appView.webContents.send("magi-desktop:context", record.context);
     }
     return record.context;
+  }
+
+  focusApp(windowId: string): void {
+    const record = this.requireWindow(windowId);
+    if (record.window.isDestroyed() || record.appView.webContents.isDestroyed()) return;
+    // Browser Surface 是 contentView 的同级原生视图。仅调用 WebContents.focus
+    // 在 macOS 上不能可靠地把宿主窗口从 Guest WebContents 切回 App Renderer，
+    // 因此焦点切换事务先暂时移除浏览器宿主的命中树，再显式恢复可信
+    // App View 的输入焦点，最后恢复浏览器的可见性。这样不会改变页面状态，
+    // 但能避免 macOS 保留上一个 WebContents 的键盘焦点。
+    const browserWasVisible = record.browserLayer.getVisible();
+    if (browserWasVisible) record.browserLayer.setVisible(false);
+    record.window.focus();
+    record.appView.setVisible(true);
+    record.appView.webContents.focus();
+    if (browserWasVisible) {
+      setImmediate(() => {
+        if (record.closed || record.window.isDestroyed()) return;
+        record.browserLayer.setVisible(
+          !record.blockingOverlayActive
+            && shouldShowBrowserSurface(
+              snapshotWindowLayout(record.layout),
+              Boolean(record.layout.activeSurfaceId),
+            ),
+        );
+        // 恢复可见性不能改变最终键盘归属。macOS 在重新加入可见的
+        // WebContentsView 时可能把焦点重新交给 Browser Surface，故在
+        // 原生层级恢复完成后再次提交 App Renderer 焦点。
+        if (!record.appView.webContents.isDestroyed()) {
+          record.appView.webContents.focus();
+        }
+      });
+    }
   }
 
   async setBrowserViewport(
@@ -465,6 +513,9 @@ export class WindowManager {
     const url = new URL("/web.html", this.#agentOrigin);
     url.searchParams.set("desktopSurface", "app");
     url.searchParams.set("desktopWindowId", windowId);
+    // 每次桌面端启动都使用新的 URL，避免持久化 Renderer Session 继续
+    // 命中旧的 web.html，导致桌面端实际运行的前端与当前源码不一致。
+    url.searchParams.set("desktopEpoch", this.#desktopEpoch);
     return url.href;
   }
 
@@ -573,7 +624,18 @@ export class WindowManager {
     }
   }
 
-  private async loadAppRenderer(record: DesktopWindowRecord, url: string): Promise<void> {
+  private loadAppRenderer(record: DesktopWindowRecord, url: string): Promise<void> {
+    const inFlight = record.rendererLoadPromise;
+    if (inFlight) return inFlight;
+    const load = this.loadAppRendererInternal(record, url);
+    record.rendererLoadPromise = load;
+    void load.finally(() => {
+      if (record.rendererLoadPromise === load) record.rendererLoadPromise = null;
+    });
+    return load;
+  }
+
+  private async loadAppRendererInternal(record: DesktopWindowRecord, url: string): Promise<void> {
     if (record.closed || record.appView.webContents.isDestroyed()) return;
     record.rendererLoadFailed = false;
     record.rendererRecoveryUrl = null;
@@ -628,12 +690,19 @@ export class WindowManager {
     const snapshot = this.snapshot(record.windowId);
     const { layout } = snapshot;
     record.appLayer.setBounds(layout.appBounds as Rectangle);
+    record.browserLayer.setBounds((browserContentBounds(layout) ?? {
+      x: 0,
+      y: 0,
+      width: 0,
+      height: 0,
+    }) as Rectangle);
     record.overlayLayer.setBounds(layout.appBounds as Rectangle);
     record.appView.setBounds(layout.appBounds as Rectangle);
     record.appView.setVisible(true);
     const showBrowserSurface = !record.blockingOverlayActive
       && shouldShowBrowserSurface(layout, Boolean(layout.activeSurfaceId));
     const currentBrowserContentBounds = showBrowserSurface ? browserContentBounds(layout) : null;
+    record.browserLayer.setVisible(Boolean(currentBrowserContentBounds));
     if (!showBrowserSurface) {
       this.#surfaceManager.bindContentSurface(record.windowId, "", null);
     } else if (layout.activeTabId && currentBrowserContentBounds) {
@@ -643,7 +712,12 @@ export class WindowManager {
       this.#surfaceManager.bindContentSurface(
         record.windowId,
         layout.activeTabId,
-        currentBrowserContentBounds,
+        {
+          x: 0,
+          y: 0,
+          width: currentBrowserContentBounds.width,
+          height: currentBrowserContentBounds.height,
+        },
       );
     }
     this.#overlayManager.updateLayout(record.windowId, layout, currentBrowserContentBounds);
@@ -666,6 +740,8 @@ export class WindowManager {
     this.#surfaceManager.closeWindow(record.windowId);
     if (!record.window.isDestroyed()) {
       record.window.contentView.removeChildView(record.appLayer);
+      record.window.contentView.removeChildView(record.appView);
+      record.window.contentView.removeChildView(record.browserLayer);
       record.window.contentView.removeChildView(record.overlayLayer);
     }
     if (!record.appView.webContents.isDestroyed()) record.appView.webContents.close();

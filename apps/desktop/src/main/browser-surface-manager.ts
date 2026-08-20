@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import {
   BaseWindow,
@@ -26,6 +26,14 @@ export type BrowserSurfaceEvent =
   | { type: "page_crashed"; binding: BrowserSurfaceBinding; reason: string }
   | { type: "loading_changed"; binding: BrowserSurfaceBinding; loading: boolean }
   | { type: "popup_blocked"; binding: BrowserSurfaceBinding; url: string }
+  | {
+      type: "download";
+      binding: BrowserSurfaceBinding;
+      suggestedFilename: string;
+      state: "started" | "progressing" | "completed" | "cancelled" | "interrupted";
+      byteLength?: number;
+      error?: string;
+    }
   | { type: "user_takeover"; binding: BrowserSurfaceBinding }
   | {
       type: "agent_cursor";
@@ -78,10 +86,10 @@ interface BrowserSurfaceRecord {
   slotBounds: Rectangle | null;
   activationGeneration: number | null;
   priming: boolean;
-  loadFailed: boolean;
   targetId: string;
   navigationRevision: number;
   navigationOperationId: number;
+  navigationFailureReportedRevision: number | null;
   navigationTargetUrl: string | null;
   viewport: BrowserLogicalViewport;
   primary: boolean;
@@ -90,7 +98,7 @@ interface BrowserSurfaceRecord {
   agentControlled: boolean;
   cursor: { visible: boolean; x: number | null; y: number | null; action: string | null };
   cursorExecutionContextId: number | null;
-  cursorUpdatePromise: Promise<void> | null;
+  cdpLane: Promise<void>;
   viewportApplied: boolean;
   viewportApplyPromise: Promise<void> | null;
   viewportApplyDirty: boolean;
@@ -99,6 +107,10 @@ interface BrowserSurfaceRecord {
   debuggerReadyPromise: Promise<void> | null;
   recoveryPromise: Promise<void> | null;
   loadPromise: Promise<void> | null;
+}
+
+interface SurfaceLaneContext {
+  track(promise: Promise<unknown>): void;
 }
 
 const ALLOWED_NAVIGATION_PROTOCOLS = new Set(["http:", "https:", "about:"]);
@@ -240,7 +252,9 @@ export class BrowserSurfaceManager {
   readonly #configuredPartitions = new Set<string>();
   readonly #knownPartitions = new Set<string>();
   readonly #partitionRegistryPath: string | null;
+  readonly #downloadRoot: string | null;
   readonly #windows = new Map<string, BaseWindow>();
+  readonly #browserHosts = new Map<string, View>();
   readonly #activationGenerations = new Map<string, number>();
   readonly #onEvent: (event: BrowserSurfaceEvent) => void;
 
@@ -252,13 +266,17 @@ export class BrowserSurfaceManager {
     this.#desktopEpoch = input.desktopEpoch;
     this.#onEvent = input.onEvent;
     this.#partitionRegistryPath = input.partitionRegistryPath?.trim() || null;
+    this.#downloadRoot = this.#partitionRegistryPath
+      ? join(dirname(this.#partitionRegistryPath), "browser-downloads")
+      : null;
     for (const partitionId of readPartitionRegistry(this.#partitionRegistryPath)) {
       this.#knownPartitions.add(partitionId);
     }
   }
 
-  attachWindow(windowId: string, window: BaseWindow): void {
+  attachWindow(windowId: string, window: BaseWindow, browserHost: View): void {
     this.#windows.set(windowId, window);
+    this.#browserHosts.set(windowId, browserHost);
     this.#activationGenerations.set(windowId, 0);
   }
 
@@ -315,7 +333,8 @@ export class BrowserSurfaceManager {
   private createSurface(input: MaterializeSurfaceInput): BrowserSurfaceRecord {
     const window = this.#windows.get(input.windowId);
     if (!window || window.isDestroyed()) throw new Error("desktop_window_not_found");
-    const host = window.contentView;
+    const host = this.#browserHosts.get(input.windowId);
+    if (!host) throw new Error("browser_surface_host_not_found");
     const partitionId = browserPartitionId(input.browserSessionId);
     this.configurePartition(partitionId);
     const view = new WebContentsView({
@@ -344,12 +363,12 @@ export class BrowserSurfaceManager {
       slotBounds: null,
       activationGeneration: input.activationGeneration ?? null,
       priming: true,
-      loadFailed: false,
       // CDP target 查询是异步握手，不参与 Surface 绑定。这个 ID 只用于
       // binding 一致性校验，使用 WebContents 生命周期内稳定的宿主 ID。
       targetId: `webcontents-${contents.id}`,
       navigationRevision: input.navigationRevision,
       navigationOperationId: 0,
+      navigationFailureReportedRevision: null,
       navigationTargetUrl: null,
       viewport: input.viewport,
       primary: false,
@@ -358,7 +377,7 @@ export class BrowserSurfaceManager {
       agentControlled: false,
       cursor: { visible: false, x: null, y: null, action: null },
       cursorExecutionContextId: null,
-      cursorUpdatePromise: null,
+      cdpLane: Promise.resolve(),
       viewportApplied: false,
       viewportApplyPromise: null,
       viewportApplyDirty: false,
@@ -373,14 +392,12 @@ export class BrowserSurfaceManager {
     // 内容槽时不挂载 View，避免隐藏的 Chromium 原生子视图继续参与命中测试。
     this.applySlot(record, null, window);
     contents.once("destroyed", () => {
-      if (record.closed) return;
-      record.closed = true;
-      this.detachSurface(record, window);
-      this.removeRecordIndexes(record);
-      this.promoteFallback(record.tabId);
+      // destroyed 可能发生在自动化命令期间。复用统一关闭入口，确保
+      // Surface 挂载和注册索引按同一顺序收敛。
+      this.closeRecord(record);
     });
     this.installSurfacePolicy(record);
-    const debuggerReady = this.attachDebugger(record);
+    const debuggerReady = this.enqueueCdp(record, () => this.attachDebugger(record));
     record.debuggerReadyPromise = debuggerReady;
     void debuggerReady.then(
       () => {
@@ -513,24 +530,25 @@ export class BrowserSurfaceManager {
     if (sessionId && !record.cdpSessionIds.has(sessionId)) {
       throw staleSurfaceError("browser_cdp_session_stale");
     }
-    if (method === "Page.captureScreenshot" && !this.isRenderable(record)) {
-      throw browserSurfaceError("browser_surface_no_content_slot");
-    }
+    // 自动化面向逻辑 Browser Tab 的真实 WebContents，而不是右栏当前是否
+    // 正在展示该 Tab。切换到代码、图片或另一个 Browser Tab 时，Surface 会
+    // 暂时从内容槽解绑，但 Chromium 页面仍然是有效的自动化目标；截图、
+    // 命中检测和 DOM 操作不应因此被错误收敛为 no_content_slot。
     if (!contents.debugger.isAttached()) {
       throw staleSurfaceError("browser_debugger_detached");
     }
     const injectsInput = method.startsWith("Input.");
     if (injectsInput) record.automationInputDepth += 1;
     try {
-      const result = await sendCdpCommandWithTimeout(
+      const screenshotParams = params;
+      const result = await this.enqueueCdp(record, ({ track }) => sendCdpCommandWithTimeout(
         contents,
         method,
-        params,
-        method === "Page.captureScreenshot"
-          ? SCREENSHOT_CDP_COMMAND_TIMEOUT_MS
-          : DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        screenshotParams,
+        method === "Page.captureScreenshot" ? SCREENSHOT_CDP_COMMAND_TIMEOUT_MS : DEFAULT_CDP_COMMAND_TIMEOUT_MS,
         sessionId,
-      );
+        track,
+      ));
       if (injectsInput && record.agentControlled) {
         const input = params as { type?: string; x?: number; y?: number };
         const action = method === "Input.insertText"
@@ -552,6 +570,23 @@ export class BrowserSurfaceManager {
     }
   }
 
+  private enqueueCdp<T>(
+    record: BrowserSurfaceRecord,
+    operation: (context: SurfaceLaneContext) => Promise<T>,
+  ): Promise<T> {
+    const previous = record.cdpLane;
+    const tracked: Promise<unknown>[] = [];
+    const run = previous.catch(() => undefined).then(() => operation({
+      track: (promise) => tracked.push(promise),
+    }));
+    const settled = run.then(
+      async () => { await Promise.allSettled(tracked); },
+      async () => { await Promise.allSettled(tracked); },
+    );
+    record.cdpLane = settled.then(() => undefined, () => undefined);
+    return run;
+  }
+
   async navigate(
     binding: BrowserSurfaceBinding,
     navigation: BrowserNavigation,
@@ -563,12 +598,12 @@ export class BrowserSurfaceManager {
       case "url": {
         let initScriptId: string | null = null;
         if (navigation.init_script?.trim()) {
-          const installed = await sendCdpCommandWithTimeout(
+          const installed = await this.enqueueCdp(record, () => sendCdpCommandWithTimeout(
             contents,
             "Page.addScriptToEvaluateOnNewDocument",
             { source: navigation.init_script },
             DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-          ) as { identifier?: string };
+          )) as { identifier?: string };
           initScriptId = typeof installed.identifier === "string" ? installed.identifier : null;
         }
         try {
@@ -580,19 +615,19 @@ export class BrowserSurfaceManager {
           );
         } finally {
           if (initScriptId) {
-            await sendCdpCommandWithTimeout(
+            await this.enqueueCdp(record, () => sendCdpCommandWithTimeout(
               contents,
               "Page.removeScriptToEvaluateOnNewDocument",
               { identifier: initScriptId },
               DEFAULT_CDP_COMMAND_TIMEOUT_MS,
-            ).catch(() => undefined);
+            )).catch(() => undefined);
           }
         }
         break;
       }
       case "back":
         if (contents.navigationHistory.canGoBack()) {
-        await this.waitForNavigation(
+          await this.waitForNavigation(
             contents,
             () => contents.navigationHistory.goBack(),
             navigation.timeout_ms,
@@ -601,7 +636,7 @@ export class BrowserSurfaceManager {
         break;
       case "forward":
         if (contents.navigationHistory.canGoForward()) {
-        await this.waitForNavigation(
+          await this.waitForNavigation(
             contents,
             () => contents.navigationHistory.goForward(),
             navigation.timeout_ms,
@@ -671,6 +706,7 @@ export class BrowserSurfaceManager {
       if (record.windowId === windowId) this.closeRecord(record);
     }
     this.#windows.delete(windowId);
+    this.#browserHosts.delete(windowId);
     this.#activationGenerations.delete(windowId);
   }
 
@@ -678,6 +714,7 @@ export class BrowserSurfaceManager {
     for (const record of [...this.#surfaces.values()]) this.closeRecord(record, false);
     this.#surfaces.clear();
     this.#windows.clear();
+    this.#browserHosts.clear();
     this.#activationGenerations.clear();
   }
 
@@ -693,9 +730,9 @@ export class BrowserSurfaceManager {
         browserSession.clearStorageData(),
       ]);
     }));
-    for (const record of this.#surfaces.values()) {
-      if (!record.closed) record.contents.reloadIgnoringCache();
-    }
+    await Promise.all([...this.#surfaces.values()]
+      .filter((record) => !record.closed && !record.contents.isDestroyed())
+      .map((record) => reloadAndWait(record.contents, true)));
   }
 
   private surfaceForTab(tabId: string, windowId: string): BrowserSurfaceRecord | null {
@@ -719,20 +756,20 @@ export class BrowserSurfaceManager {
       return;
     }
     if (!record.mounted) {
-      // Browser Surface 与 App Layer、Overlay Layer 是 contentView 的同级
-      // 原生视图。固定插入到 App Layer 之后、Overlay Layer 之前，避免
-      // 嵌套 View 在 Electron 43/macOS 下扩大 WebContents 的命中区域。
-      record.host.addChildView(record.view, 1);
+      // Browser Host 是 WindowManager 按当前右栏内容槽设置边界的独立
+      // 原生容器。WebContentsView 只在 Host 的局部坐标中占满内容槽，
+      // 不再把窗口坐标直接交给 WebContentsView。
+      record.host.addChildView(record.view, 0);
       record.mounted = true;
     }
-    // WebContentsView 直接使用 contentView 坐标，命中区域与内容槽严格
-    // 一致，不经过额外父 View 的坐标转换或命中测试。
-    if (!sameBounds(record.view.getBounds(), bounds)) record.view.setBounds(bounds);
+    const localBounds = { x: 0, y: 0, width: bounds.width, height: bounds.height };
+    if (!sameBounds(record.view.getBounds(), localBounds)) record.view.setBounds(localBounds);
     // 页面加载和调试器初始化是 Surface 内部状态，不能阻塞真实浏览器
     // 视图进入内容槽。Chromium 自行展示当前文档及加载过程；只有失败页
     // 才隐藏，避免激活流程变成“正在连接浏览器”的空白等待层。
-    const visible = bounds !== null && !record.loadFailed;
-    record.view.setVisible(visible);
+    // 导航过程由 Chromium 自己绘制。只有 Surface 生命周期失败才解绑，
+    // 页面导航失败仍保留真实 WebContentsView，避免右栏黑屏或空槽。
+    record.view.setVisible(true);
   }
 
   private async loadPage(
@@ -740,14 +777,15 @@ export class BrowserSurfaceManager {
     url: string,
     timeoutMs = DEFAULT_NAVIGATION_TIMEOUT_MS,
     handleBeforeUnload?: "accept" | "dismiss",
+    track?: (promise: Promise<unknown>) => void,
   ): Promise<void> {
     if (record.closed || record.contents.isDestroyed()) {
       throw staleSurfaceError("browser_surface_not_found");
     }
     const operationId = ++record.navigationOperationId;
     record.navigationTargetUrl = url;
+    record.navigationFailureReportedRevision = null;
     record.priming = true;
-    record.loadFailed = false;
     // 新导航必须先终止旧导航。旧 loadURL 的 Promise 和迟到事件仍可能
     // 返回，但下面所有收敛动作都会校验 operationId，不能再把当前页面
     // 隐藏成失败态或重新显示旧 Surface。
@@ -764,8 +802,10 @@ export class BrowserSurfaceManager {
       : null;
     if (allowBeforeUnload) record.contents.on("will-prevent-unload", allowBeforeUnload);
     try {
+      const loadPromise = record.contents.loadURL(url);
+      track?.(loadPromise);
       await withNavigationTimeout(
-        record.contents.loadURL(url),
+        loadPromise,
         clampNavigationTimeout(timeoutMs),
       );
     } catch (error) {
@@ -773,19 +813,16 @@ export class BrowserSurfaceManager {
         throw staleSurfaceError("browser_navigation_superseded");
       }
       if (!record.closed) {
-        record.priming = true;
-        record.loadFailed = true;
-        this.unmountSurface(record, this.#windows.get(record.windowId));
-        this.#onEvent({
-          type: "page_failed",
-          binding: this.binding(record),
-          reason: error instanceof Error ? error.message : String(error),
-        });
-        try {
-          record.contents.stop();
-        } catch {
-          // WebContents 销毁竞态下 stop() 可能同步失败，失败状态已收敛。
-        }
+        // 导航失败不代表原生 Surface 失效。保留 WebContentsView 在内容槽中，
+        // 让 Chromium 自己展示当前文档或错误页，避免右栏收敛成黑屏。
+        record.priming = false;
+        record.navigationTargetUrl = null;
+        this.applySlot(
+          record,
+          record.slotVisible ? record.slotBounds : null,
+          this.#windows.get(record.windowId),
+        );
+        this.publishNavigationFailure(record, error instanceof Error ? error.message : String(error));
       }
       throw error;
     } finally {
@@ -797,7 +834,6 @@ export class BrowserSurfaceManager {
     }
     record.navigationTargetUrl = null;
     record.priming = false;
-    record.loadFailed = false;
     this.applySlot(
       record,
       record.slotVisible ? record.slotBounds : null,
@@ -808,6 +844,9 @@ export class BrowserSurfaceManager {
 
   private startLoad(record: BrowserSurfaceRecord, url: string): Promise<void> {
     if (record.loadPromise) return record.loadPromise;
+    // 初始导航是 Chromium 的原生加载过程，不得占用 CDP 命令队列。
+    // 页面可以继续加载，同时截图、快照和输入仍然必须立即进入同一个
+    // WebContents；否则慢页面会把整个 Browser Tab 锁在“正在连接”状态。
     const load = this.loadPage(record, url);
     record.loadPromise = load;
     void load.then(() => {
@@ -816,6 +855,16 @@ export class BrowserSurfaceManager {
       if (record.loadPromise === load) record.loadPromise = null;
     });
     return load;
+  }
+
+  private publishNavigationFailure(record: BrowserSurfaceRecord, reason: string): void {
+    if (record.closed || record.navigationFailureReportedRevision === record.navigationRevision) return;
+    record.navigationFailureReportedRevision = record.navigationRevision;
+    this.#onEvent({
+      type: "page_failed",
+      binding: this.binding(record),
+      reason,
+    });
   }
 
   private async waitForNavigation(
@@ -834,11 +883,18 @@ export class BrowserSurfaceManager {
   }
 
   private detachSurface(record: BrowserSurfaceRecord, window: BaseWindow | undefined): void {
-    if (record.mounted) {
+    if (!record.mounted) return;
+    try {
       record.view.setVisible(false);
-      if (window && !window.isDestroyed()) record.host.removeChildView(record.view);
-      record.mounted = false;
+    } catch {
+      // WebContentsView 可能已随宿主窗口销毁。
     }
+    try {
+      if (window || record.host) record.host.removeChildView(record.view);
+    } catch {
+      // destroyed 与 closeRecord 可能交错到达，解绑必须幂等。
+    }
+    record.mounted = false;
   }
 
   private isRenderable(record: BrowserSurfaceRecord): record is BrowserSurfaceRecord & {
@@ -848,7 +904,6 @@ export class BrowserSurfaceManager {
       && record.mounted
       && record.slotVisible
       && record.slotBounds !== null
-      && !record.loadFailed
       && record.view.getVisible();
   }
 
@@ -862,6 +917,75 @@ export class BrowserSurfaceManager {
     browserSession.setPermissionRequestHandler((_webContents, _permission, callback) => {
       callback(false);
     });
+    browserSession.on("will-download", (event, item, webContents) => {
+      this.handleDownload(event, item, webContents);
+    });
+  }
+
+  private handleDownload(
+    event: Electron.Event,
+    item: Electron.DownloadItem,
+    webContents: WebContents,
+  ): void {
+    const record = this.surfaceForContents(webContents);
+    if (!record || record.closed || !this.#downloadRoot) {
+      // Downloads never fall back to the user's Downloads directory. A
+      // browser download is either stored in Magi's private data directory or
+      // explicitly rejected, so the host cannot write outside its boundary.
+      event.preventDefault();
+      if (record && !record.closed) {
+        this.emitDownload(record, "download", "interrupted", "browser_download_storage_unavailable");
+      }
+      return;
+    }
+    const filename = safeDownloadFilename(item.getFilename());
+    const directory = join(this.#downloadRoot, safeDownloadSegment(record.browserSessionId));
+    try {
+      mkdirSync(directory, { recursive: true });
+      item.setSavePath(join(directory, `${Date.now()}-${randomUUID()}-${filename}`));
+    } catch (error) {
+      event.preventDefault();
+      this.emitDownload(
+        record,
+        filename,
+        "interrupted",
+        error instanceof Error ? error.message : "browser_download_storage_failed",
+      );
+      return;
+    }
+    this.emitDownload(record, filename, "started", undefined, item.getTotalBytes());
+    item.on("updated", (_event, state) => {
+      if (!record.closed) {
+        this.emitDownload(record, filename, state === "progressing" ? "progressing" : "interrupted", undefined, downloadBytes(item));
+      }
+    });
+    item.once("done", (_event, state) => {
+      if (!record.closed) this.emitDownload(record, filename, state, undefined, downloadBytes(item));
+    });
+  }
+
+  private emitDownload(
+    record: BrowserSurfaceRecord,
+    suggestedFilename: string,
+    state: "started" | "progressing" | "completed" | "cancelled" | "interrupted",
+    error?: string,
+    byteLength?: number,
+  ): void {
+    this.#onEvent({
+      type: "download",
+      binding: this.binding(record),
+      suggestedFilename,
+      state,
+      ...(byteLength !== undefined && byteLength > 0 ? { byteLength } : {}),
+      ...(error ? { error } : {}),
+    });
+  }
+
+  private surfaceForContents(contents: WebContents): BrowserSurfaceRecord | null {
+    for (const record of this.#surfaces.values()) {
+      if (!record.closed && record.contents === contents) return record;
+    }
+    return null;
   }
 
   private installSurfacePolicy(record: BrowserSurfaceRecord): void {
@@ -869,7 +993,7 @@ export class BrowserSurfaceManager {
     webContents.setWindowOpenHandler((details) => {
       try {
         const url = normalizeNavigableUrl(details.url);
-        void loadPopupInCurrentPage(webContents, url, details).catch(() => {
+        void this.enqueueCdp(record, () => loadPopupInCurrentPage(webContents, url, details)).catch(() => {
           if (!record.closed) {
             this.#onEvent({
               type: "popup_blocked",
@@ -899,9 +1023,8 @@ export class BrowserSurfaceManager {
     webContents.on("did-start-navigation", (_event, _url, _isInPlace, isMainFrame) => {
       if (!isMainFrame) return;
       record.navigationRevision += 1;
-      const wasFailed = record.loadFailed;
-      record.loadFailed = false;
-      if (wasFailed) record.priming = true;
+      record.navigationFailureReportedRevision = null;
+      record.priming = true;
       record.cursorExecutionContextId = null;
       this.#onEvent({
         type: "loading_changed",
@@ -912,7 +1035,6 @@ export class BrowserSurfaceManager {
     const publishPage = () => {
       if (
         record.closed
-        || record.loadFailed
         || (record.navigationTargetUrl && webContents.isLoadingMainFrame())
       ) return;
       this.#onEvent({
@@ -934,26 +1056,22 @@ export class BrowserSurfaceManager {
       publishPage();
     });
     webContents.on("did-fail-load", (_event, errorCode, errorDescription, _validatedURL, isMainFrame) => {
-      if (record.closed || !isMainFrame || errorCode === -3 || record.loadFailed) return;
+      if (record.closed || !isMainFrame || errorCode === -3) return;
       if (record.navigationTargetUrl && webContents.isLoadingMainFrame()) return;
-      record.loadFailed = true;
-      record.priming = true;
-      this.unmountSurface(record, this.#windows.get(record.windowId));
-      this.#onEvent({
-        type: "page_failed",
-        binding: this.binding(record),
-        reason: errorDescription || `net_error_${errorCode}`,
-      });
+      // did-fail-load 是页面导航结果，不是原生 Surface 崩溃。保持 View
+      // 挂载和可见，避免失败页期间出现黑屏或重新计算内容槽。
+      record.priming = false;
+      record.navigationTargetUrl = null;
+      this.applySlot(
+        record,
+        record.slotVisible ? record.slotBounds : null,
+        this.#windows.get(record.windowId),
+      );
+      this.publishNavigationFailure(record, errorDescription || `net_error_${errorCode}`);
+      this.scheduleViewportApply(record);
     });
     webContents.on("did-finish-load", () => {
       if (record.navigationTargetUrl && webContents.isLoadingMainFrame()) return;
-      if (record.loadFailed) {
-        // Chromium 会在 did-fail-load 后加载 chrome-error:// 页面。它不是用户
-        // 请求页面的成功首帧，必须保持 Surface 隐藏，让 Renderer 展示结构化
-        // 错误状态，避免错误页白屏重新覆盖右栏。
-        this.unmountSurface(record, this.#windows.get(record.windowId));
-        return;
-      }
       record.navigationTargetUrl = null;
       record.priming = false;
       this.applySlot(
@@ -1033,57 +1151,52 @@ export class BrowserSurfaceManager {
   private async attachDebugger(record: BrowserSurfaceRecord): Promise<void> {
     const debuggerApi = record.contents.debugger;
     if (!debuggerApi.isAttached()) debuggerApi.attach("1.3");
-    if (record.debuggerListenersInstalled) return;
-    record.debuggerListenersInstalled = true;
-    debuggerApi.on("message", (_event, method, params, sessionId) => {
-      if (record.closed) return;
-      const eventParams = (params ?? {}) as Record<string, unknown>;
-      if (method === "Target.attachedToTarget" && typeof eventParams.sessionId === "string") {
-        record.cdpSessionIds.add(eventParams.sessionId);
-      }
-      if (method === "Target.detachedFromTarget" && typeof eventParams.sessionId === "string") {
-        record.cdpSessionIds.delete(eventParams.sessionId);
-      }
-      this.#onEvent({
-        type: "cdp_event",
-        binding: this.binding(record),
-        method,
-        params: eventParams,
-        ...(sessionId ? { sessionId } : {}),
-      });
-    });
-    debuggerApi.on("detach", (_event, reason) => {
-      if (record.closed) return;
-      const binding = this.binding(record);
-      this.#onEvent({
-        type: "page_crashed",
-        binding,
-        reason: `debugger-detached:${reason}`,
-      });
-      // 调试器是自动化通道，不是页面本身。短暂 detach 不能隐藏或 reload
-      // 用户正在看的 Chromium 文档；仅后台重新 attach，页面继续保持可见。
-      void this.reconnectDebugger(record, `debugger-detached:${reason}`).catch((error) => {
-        if (!record.closed) {
-          console.error("[BrowserSurfaceManager] Browser Surface 调试器重连失败", {
-            surfaceId: record.surfaceId,
-            reason,
-            error: error instanceof Error ? error.message : String(error),
-          });
+    if (!record.debuggerListenersInstalled) {
+      record.debuggerListenersInstalled = true;
+      debuggerApi.on("message", (_event, method, params, sessionId) => {
+        if (record.closed) return;
+        const eventParams = (params ?? {}) as Record<string, unknown>;
+        if (method === "Target.attachedToTarget" && typeof eventParams.sessionId === "string") {
+          record.cdpSessionIds.add(eventParams.sessionId);
         }
+        if (method === "Target.detachedFromTarget" && typeof eventParams.sessionId === "string") {
+          record.cdpSessionIds.delete(eventParams.sessionId);
+        }
+        this.#onEvent({
+          type: "cdp_event",
+          binding: this.binding(record),
+          method,
+          params: eventParams,
+          ...(sessionId ? { sessionId } : {}),
+        });
       });
-    });
+      debuggerApi.on("detach", (_event, reason) => {
+        if (record.closed) return;
+        // 调试器是自动化通道，不是页面本身。短暂 detach 不能隐藏或 reload
+        // 用户正在看的 Chromium 文档；仅后台重新 attach，页面继续保持可见。
+        void this.reconnectDebugger(record, `debugger-detached:${reason}`).catch((error) => {
+          if (!record.closed) {
+            console.error("[BrowserSurfaceManager] Browser Surface 调试器重连失败", {
+              surfaceId: record.surfaceId,
+              reason,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        });
+      });
+    }
   }
 
   private reconnectDebugger(record: BrowserSurfaceRecord, reason: string): Promise<void> {
     if (record.debuggerReadyPromise) return record.debuggerReadyPromise;
-    const reconnect = (async () => {
+    const reconnect = this.enqueueCdp(record, async () => {
       if (record.closed || record.contents.isDestroyed()) return;
-      if (!record.contents.debugger.isAttached()) record.contents.debugger.attach("1.3");
+      await this.attachDebugger(record);
       record.cdpSessionIds.clear();
       record.cursorExecutionContextId = null;
       if (record.primary) this.#onEvent({ type: "primary_changed", binding: this.binding(record) });
       void reason;
-    })();
+    });
     record.debuggerReadyPromise = reconnect;
     void reconnect.finally(() => {
       if (record.debuggerReadyPromise === reconnect) record.debuggerReadyPromise = null;
@@ -1094,10 +1207,9 @@ export class BrowserSurfaceManager {
   private invalidateAndRecover(record: BrowserSurfaceRecord, reason: string): void {
     if (record.recoveryPromise || record.closed || record.contents.isDestroyed()) return;
     record.priming = true;
-    record.loadFailed = false;
     this.unmountSurface(record, this.#windows.get(record.windowId));
     record.surfaceRevision = this.#surfaces.nextRevision(record.tabId);
-    const recovery = this.recover(record, reason);
+    const recovery = this.enqueueCdp(record, () => this.recover(record, reason));
     record.recoveryPromise = recovery;
     record.debuggerReadyPromise = recovery;
     void recovery.then(
@@ -1116,7 +1228,6 @@ export class BrowserSurfaceManager {
       if (record.closed) return;
       await this.attachDebugger(record);
       record.priming = false;
-      record.loadFailed = false;
       record.viewportApplied = false;
       this.scheduleViewportApply(record);
       this.applySlot(
@@ -1138,36 +1249,67 @@ export class BrowserSurfaceManager {
     }
   }
 
-  private async applyViewport(record: BrowserSurfaceRecord): Promise<void> {
+  private async applyViewport(
+    record: BrowserSurfaceRecord,
+    track?: (promise: Promise<unknown>) => void,
+  ): Promise<void> {
     if (record.closed || !record.contents.debugger.isAttached()) return;
     if (record.contents.isLoadingMainFrame()) return;
     if (record.viewport.mode === "auto") {
-      await record.contents.debugger.sendCommand("Emulation.clearDeviceMetricsOverride");
-      await record.contents.debugger.sendCommand("Emulation.setTouchEmulationEnabled", {
-        enabled: false,
-      });
+      await sendCdpCommandWithTimeout(
+        record.contents,
+        "Emulation.clearDeviceMetricsOverride",
+        {},
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        undefined,
+        track,
+      );
+      await sendCdpCommandWithTimeout(
+        record.contents,
+        "Emulation.setTouchEmulationEnabled",
+        { enabled: false },
+        DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+        undefined,
+        track,
+      );
       record.viewportApplied = true;
       return;
     }
-    const width = Math.max(320, Math.round(record.viewport.width));
-    const height = Math.max(240, Math.round(record.viewport.height));
-    const mobile = record.viewport.device_type === "mobile";
-    await record.contents.debugger.sendCommand("Emulation.setDeviceMetricsOverride", {
-      width,
-      height,
-      deviceScaleFactor: record.viewport.device_scale_factor_millis / 1_000,
-      mobile,
-      screenWidth: width,
-      screenHeight: height,
-      screenOrientation: {
-        type: width > height ? "landscapePrimary" : "portraitPrimary",
-        angle: width > height ? 90 : 0,
+    const viewport = record.viewport;
+    if (viewport.mode !== "fixed") return;
+    const width = Math.max(320, Math.round(viewport.width));
+    const height = Math.max(240, Math.round(viewport.height));
+    const mobile = viewport.device_type === "mobile";
+    await sendCdpCommandWithTimeout(
+      record.contents,
+      "Emulation.setDeviceMetricsOverride",
+      {
+        width,
+        height,
+        deviceScaleFactor: viewport.device_scale_factor_millis / 1_000,
+        mobile,
+        screenWidth: width,
+        screenHeight: height,
+        screenOrientation: {
+          type: width > height ? "landscapePrimary" : "portraitPrimary",
+          angle: width > height ? 90 : 0,
+        },
       },
-    });
-    await record.contents.debugger.sendCommand("Emulation.setTouchEmulationEnabled", {
-      enabled: mobile,
-      maxTouchPoints: mobile ? 5 : 1,
-    });
+      DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+      undefined,
+      track,
+    );
+    await sendCdpCommandWithTimeout(
+      record.contents,
+      "Emulation.setTouchEmulationEnabled",
+      {
+        enabled: mobile,
+        maxTouchPoints: mobile ? 5 : 1,
+      },
+      DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+      undefined,
+      track,
+    );
     record.viewportApplied = true;
   }
 
@@ -1184,7 +1326,7 @@ export class BrowserSurfaceManager {
     while (!record.closed && record.viewportApplyDirty) {
       record.viewportApplyDirty = false;
       if (record.contents.isLoadingMainFrame()) return;
-      await this.applyViewport(record);
+      await this.enqueueCdp(record, ({ track }) => this.applyViewport(record, track));
     }
   }
 
@@ -1205,7 +1347,7 @@ export class BrowserSurfaceManager {
       y,
       action,
     });
-    const update = async () => {
+    const update = async ({ track }: SurfaceLaneContext) => {
       if (record.closed || record.contents.isDestroyed()) return;
       // Page.getFrameTree 对尚未建立首个文档的 WebContents 不会返回。首个
       // 文档由 materialize 统一完成；导航期间则由 did-finish-load 重新应用
@@ -1219,6 +1361,8 @@ export class BrowserSurfaceManager {
             "Page.getFrameTree",
             {},
             CURSOR_CDP_COMMAND_TIMEOUT_MS,
+            undefined,
+            track,
           ) as {
             frameTree?: { frame?: { id?: string } };
           };
@@ -1228,7 +1372,7 @@ export class BrowserSurfaceManager {
             frameId,
             worldName: "magi-agent-cursor",
             grantUniveralAccess: false,
-          }, CURSOR_CDP_COMMAND_TIMEOUT_MS) as { executionContextId?: number };
+          }, CURSOR_CDP_COMMAND_TIMEOUT_MS, undefined, track) as { executionContextId?: number };
           if (!world.executionContextId) return;
           record.cursorExecutionContextId = world.executionContextId;
         }
@@ -1258,18 +1402,13 @@ export class BrowserSurfaceManager {
             }
             return true;
           })()`,
-        }, CURSOR_CDP_COMMAND_TIMEOUT_MS);
+        }, CURSOR_CDP_COMMAND_TIMEOUT_MS, undefined, track);
       } catch {
         // 导航会清理 isolated world；did-finish-load 会按最新状态重建它。
         record.cursorExecutionContextId = null;
       }
     };
-    const previous = record.cursorUpdatePromise ?? Promise.resolve();
-    const next = previous.catch(() => undefined).then(update);
-    record.cursorUpdatePromise = next;
-    await next.finally(() => {
-      if (record.cursorUpdatePromise === next) record.cursorUpdatePromise = null;
-    });
+    await this.enqueueCdp(record, update);
   }
 
   private promote(surfaceId: string): void {
@@ -1325,9 +1464,9 @@ export class BrowserSurfaceManager {
   }
 
   private closeRecord(record: BrowserSurfaceRecord, promoteFallback = true): void {
-    if (record.closed) return;
+    const wasClosed = record.closed;
     record.closed = true;
-    if (!record.contents.isDestroyed() && record.contents.debugger.isAttached()) {
+    if (!wasClosed && !record.contents.isDestroyed() && record.contents.debugger.isAttached()) {
       try {
         record.contents.debugger.detach();
       } catch {
@@ -1336,9 +1475,9 @@ export class BrowserSurfaceManager {
     }
     const window = this.#windows.get(record.windowId);
     this.detachSurface(record, window);
-    if (!record.contents.isDestroyed()) record.contents.close();
+    if (!wasClosed && !record.contents.isDestroyed()) record.contents.close();
     this.removeRecordIndexes(record);
-    if (promoteFallback) this.promoteFallback(record.tabId);
+    if (!wasClosed && promoteFallback) this.promoteFallback(record.tabId);
   }
 
   private removeRecordIndexes(record: BrowserSurfaceRecord): void {
@@ -1417,12 +1556,6 @@ function staleSurfaceError(code: string): Error {
   return error;
 }
 
-function browserSurfaceError(code: string): Error {
-  const error = new Error(code);
-  error.name = "BrowserSurfaceError";
-  return error;
-}
-
 function sameBounds(left: Rectangle, right: Rectangle): boolean {
   return left.x === right.x
     && left.y === right.y
@@ -1436,8 +1569,20 @@ async function sendCdpCommandWithTimeout(
   params: Record<string, unknown>,
   timeoutMs: number,
   sessionId?: string,
+  track?: (promise: Promise<unknown>) => void,
 ): Promise<unknown> {
-  return withTimeout(contents.debugger.sendCommand(method, params, sessionId), timeoutMs, method);
+  let command: Promise<unknown>;
+  try {
+    command = contents.debugger.sendCommand(method, params, sessionId);
+  } catch (error) {
+    throw error;
+  }
+  // 不要把原始 CDP Promise 放进 Surface lane。Chromium 在页面销毁、视图
+  // 解绑或某些截图参数不被当前宿主接受时，sendCommand 可能永远不结算；
+  // 如果 lane 继续等待它，单次超时就会永久阻塞后续快照、输入和标记。
+  const timed = withTimeout(command, timeoutMs, method);
+  track?.(timed.then(() => undefined, () => undefined));
+  return timed;
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, method: string): Promise<T> {
@@ -1529,6 +1674,11 @@ async function reloadAndWait(
       if (settled) return;
       settled = true;
       cleanup();
+      try {
+        contents.stop();
+      } catch {
+        // WebContents 销毁竞态下 stop() 可能同步失败，超时状态仍已收敛。
+      }
       reject(new Error("browser_navigation_timeout"));
     }, clampNavigationTimeout(timeoutMs));
     timer.unref();
@@ -1538,11 +1688,12 @@ async function reloadAndWait(
       contents.off("did-fail-load", failed);
       if (allowBeforeUnload) contents.off("will-prevent-unload", allowBeforeUnload);
     };
-    const finish = () => {
+    const finish = (error?: Error) => {
       if (settled) return;
       settled = true;
       cleanup();
-      resolve();
+      if (error) reject(error);
+      else resolve();
     };
     const allowBeforeUnload = handleBeforeUnload === "accept"
       ? (event: Electron.Event) => event.preventDefault()
@@ -1558,8 +1709,12 @@ async function reloadAndWait(
     if (allowBeforeUnload) contents.on("will-prevent-unload", allowBeforeUnload);
     contents.once("did-stop-loading", done);
     contents.once("did-fail-load", failed);
-    if (ignoreCache) contents.reloadIgnoringCache();
-    else contents.reload();
+    try {
+      if (ignoreCache) contents.reloadIgnoringCache();
+      else contents.reload();
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)));
+    }
   });
 }
 
@@ -1577,4 +1732,19 @@ async function loadPopupInCurrentPage(
     ...(postBody ? { postData: postBody.data } : {}),
     ...(contentType ? { extraHeaders: `Content-Type: ${contentType}` } : {}),
   });
+}
+
+function downloadBytes(item: Electron.DownloadItem): number {
+  const total = item.getTotalBytes();
+  return total > 0 ? total : item.getReceivedBytes();
+}
+
+function safeDownloadFilename(value: string): string {
+  const filename = basename(value).replace(/[\\/:*?"<>|\u0000-\u001f]/gu, "_").trim();
+  return filename || "download";
+}
+
+function safeDownloadSegment(value: string): string {
+  const segment = value.replace(/[^A-Za-z0-9._-]/gu, "_").replace(/^\.+$/u, "_");
+  return segment || "session";
 }

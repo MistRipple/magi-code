@@ -660,6 +660,30 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
                 ),
             }
         }
+        BrowserHostEvent::PageFailed { binding, reason } => {
+            publish_tab_event(
+                state,
+                "browser.automation.page_failed",
+                browser_tab_context(state, &binding.tab_id),
+                serde_json::json!({
+                    "tab_id": binding.tab_id,
+                    "binding": binding,
+                    "reason": magi_core::public_runtime_excerpt(&reason, 1024),
+                }),
+            );
+        }
+        BrowserHostEvent::LoadingChanged { binding, loading } => {
+            publish_tab_event(
+                state,
+                "browser.tab.loading_changed",
+                browser_tab_context(state, &binding.tab_id),
+                serde_json::json!({
+                    "tab_id": binding.tab_id,
+                    "binding": binding,
+                    "loading": loading,
+                }),
+            );
+        }
         BrowserHostEvent::PageCrashed {
             binding,
             diagnostic,
@@ -750,20 +774,12 @@ fn handle_host_event(state: &ApiState, event: BrowserHostIncomingEvent, generati
                 }),
             );
         }
-        BrowserHostEvent::FileChooser { tab_id } => {
-            publish_tab_event(
-                state,
-                "browser.file_chooser.cancelled",
-                browser_tab_context(state, &tab_id),
-                serde_json::json!({ "tab_id": tab_id }),
-            );
-        }
-        BrowserHostEvent::PopupBlocked { tab_id } => {
+        BrowserHostEvent::PopupBlocked { binding, url } => {
             publish_tab_event(
                 state,
                 "browser.popup.blocked",
-                browser_tab_context(state, &tab_id),
-                serde_json::json!({ "tab_id": tab_id }),
+                browser_tab_context(state, &binding.tab_id),
+                serde_json::json!({ "tab_id": binding.tab_id, "binding": binding, "url": url }),
             );
         }
         BrowserHostEvent::Ready(_)

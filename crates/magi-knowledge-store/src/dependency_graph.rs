@@ -145,6 +145,10 @@ impl DependencyGraph {
             .unwrap_or_default()
     }
 
+    pub fn edges(&self) -> Vec<DependencyEdge> {
+        self.edges.clone()
+    }
+
     pub fn get_centrality(&self, file_path: &str) -> f64 {
         self.centrality_cache.get(file_path).copied().unwrap_or(0.0)
     }

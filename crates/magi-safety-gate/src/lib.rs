@@ -439,6 +439,7 @@ fn operation_text_for_tool(tool_name: &str, arguments_json: &str) -> Option<Stri
         "web_search",
         "web_fetch",
         "knowledge_query",
+        "knowledge_graph_query",
         "code_symbols",
         "tool_catalog",
         "git_status",

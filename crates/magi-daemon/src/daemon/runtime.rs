@@ -1069,7 +1069,6 @@ impl DaemonRuntime {
             return;
         }
         let knowledge_store = self.knowledge_store.clone();
-        let state_repository = StateRepository::new(self.state_root.clone());
         let scan_root = active_workspace.native_root_path();
         tokio::spawn(async move {
             let build_store = knowledge_store.clone();
@@ -1078,21 +1077,8 @@ impl DaemonRuntime {
                 build_store.build_workspace_index(&build_workspace_id, &scan_root)
             })
             .await;
-            let cancelled_before_persist =
-                knowledge_store.workspace_index_build_cancelled(&active_workspace_id);
             match build_result {
-                Ok(_) => {
-                    if !cancelled_before_persist
-                        && let Err(error) =
-                            state_repository.save_knowledge_state(&knowledge_store.export_state())
-                    {
-                        warn!(
-                            workspace_id = %active_workspace_id,
-                            error = %error,
-                            "活动工作区代码索引持久化失败"
-                        );
-                    }
-                }
+                Ok(_) => {}
                 Err(error) => {
                     warn!(
                         workspace_id = %active_workspace_id,
@@ -1101,16 +1087,7 @@ impl DaemonRuntime {
                     );
                 }
             }
-            if knowledge_store.finish_workspace_index_build(&active_workspace_id)
-                && let Err(error) =
-                    state_repository.save_knowledge_state(&knowledge_store.export_state())
-            {
-                warn!(
-                    workspace_id = %active_workspace_id,
-                    error = %error,
-                    "已取消的活动工作区代码索引清理结果持久化失败"
-                );
-            }
+            knowledge_store.finish_workspace_index_build(&active_workspace_id);
         });
     }
 

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::code_tokenizer::CodeTokenizer;
 use crate::dependency_graph::DependencyGraph;
+use crate::graph::CodeGraphSnapshot;
 use crate::index_persistence::{IndexPersistence, PersistenceSnapshot};
 use crate::inverted_index::{IndexSearchHit, InvertedIndex};
 use crate::query_expander::QueryExpander;
@@ -427,6 +428,31 @@ impl LocalSearchEngine {
         self.symbol_index.get_symbols_for_file(file_path)
     }
 
+    pub(crate) fn graph_snapshot(&self) -> CodeGraphSnapshot {
+        let mut files = self
+            .indexed_files
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        files.sort();
+        files.dedup();
+        let mut symbols = files
+            .iter()
+            .flat_map(|path| self.symbol_index.get_symbols_for_file(path))
+            .collect::<Vec<_>>();
+        symbols.sort_by(|left, right| {
+            left.file_path
+                .cmp(&right.file_path)
+                .then_with(|| left.line.cmp(&right.line))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        CodeGraphSnapshot {
+            files,
+            dependency_edges: self.dependency_graph.edges(),
+            symbols,
+        }
+    }
+
     pub fn on_file_created(&mut self, file_path: &str) {
         if !self.is_ready {
             return;
@@ -825,6 +851,60 @@ impl LocalSearchEngine {
             self.refresh_project_vocabulary_if_needed();
             self.bump_index_version();
         }
+    }
+
+    /// 使用与全量建索引相同的扫描规则补齐可能漏掉的新增文件，再复用已有的
+    /// 文件状态对账处理已跟踪文件的修改与删除。
+    pub(crate) fn reconcile_workspace_files(&mut self) {
+        if !self.is_ready {
+            return;
+        }
+
+        let outcome = crate::code_scanner::scan_workspace(Path::new(&self.project_root));
+        let scanned_files = match outcome.status {
+            crate::code_scanner::CodeIndexScanStatus::Failed => return,
+            crate::code_scanner::CodeIndexScanStatus::Empty => Vec::new(),
+            crate::code_scanner::CodeIndexScanStatus::Indexed => outcome
+                .summary
+                .map(|summary| summary.files)
+                .unwrap_or_default(),
+        };
+        let scanned_paths = scanned_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<HashSet<_>>();
+        let indexed_paths = self
+            .indexed_files
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<HashSet<_>>();
+        let mut events = Vec::new();
+
+        for file in scanned_files {
+            if !indexed_paths.contains(file.path.as_str()) {
+                events.push((
+                    Path::new(&self.project_root)
+                        .join(file.path)
+                        .to_string_lossy()
+                        .to_string(),
+                    FileIndexEventKind::Created,
+                ));
+            }
+        }
+        for (path, _) in &self.indexed_files {
+            if !scanned_paths.contains(path) {
+                events.push((
+                    Path::new(&self.project_root)
+                        .join(path)
+                        .to_string_lossy()
+                        .to_string(),
+                    FileIndexEventKind::Deleted,
+                ));
+            }
+        }
+
+        self.apply_file_events(events);
+        self.reconcile_indexed_files();
     }
 
     fn record_recent_edit(&mut self, file_path: &str) {

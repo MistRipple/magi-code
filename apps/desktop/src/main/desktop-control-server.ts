@@ -120,10 +120,8 @@ export class DesktopControlServer {
           this.emit({ type: "page_crashed", payload: { binding: event.binding, diagnostic: event.reason } });
         }
         break;
-      case "page_failed":
-        break;
       case "popup_blocked":
-        this.emit({ type: "popup_blocked", payload: { tab_id: event.binding.tab_id } });
+        this.emit({ type: "popup_blocked", payload: { binding: event.binding, url: event.url } });
         break;
       case "user_takeover":
         this.emit({ type: "user_takeover", payload: { binding: event.binding } });
@@ -141,6 +139,23 @@ export class DesktopControlServer {
         });
         break;
       case "loading_changed":
+        this.emit({ type: "loading_changed", payload: { binding: event.binding, loading: event.loading } });
+        break;
+      case "page_failed":
+        this.emit({ type: "page_failed", payload: { binding: event.binding, reason: event.reason } });
+        break;
+      case "download":
+        this.emit({
+          type: "download",
+          payload: {
+            tab_id: event.binding.tab_id,
+            suggested_filename: event.suggestedFilename,
+            state: event.state,
+            ...(event.byteLength !== undefined ? { byte_length: event.byteLength } : {}),
+            ...(event.error ? { error: event.error } : {}),
+          },
+        });
+        break;
       case "cdp_event":
         break;
     }
@@ -165,6 +180,16 @@ export class DesktopControlServer {
   private acceptClient(websocket: WebSocket): void {
     this.#client = websocket;
     this.emit({ type: "ready", payload: this.#handshake() });
+    // daemon 可能在 Electron 已经创建并提升 Browser Surface 之后才建立
+    // 控制连接。连接握手只发送 ready 会丢失既有 Primary，导致 daemon
+    // 认为逻辑 Tab 没有 Surface，随后截图、标记和自动化都会拿到空绑定。
+    // 连接建立后立即重放当前 Primary，使远端 Authority 与 Main 的真实
+    // Surface 注册状态收敛到同一代次。
+    for (const binding of this.#surfaceManager.bindings()) {
+      if (this.#surfaceManager.isPrimary(binding)) {
+        this.emit({ type: "primary_surface_changed", payload: { binding } });
+      }
+    }
     websocket.on("message", (data, binary) => {
       if (binary) {
         websocket.close(1003, "binary requests are not supported");

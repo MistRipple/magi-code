@@ -2,28 +2,30 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
+const repositoryRoot = path.resolve(new URL('../..', import.meta.url).pathname);
+
 const source = fs.readFileSync(
-  path.resolve('src/components/SettingsBrowserTab.svelte'),
+  path.join(repositoryRoot, 'web/src/components/SettingsBrowserTab.svelte'),
   'utf8',
 );
 const desktopMainSource = fs.readFileSync(
-  path.resolve('../apps/desktop/src/main/index.ts'),
+  path.join(repositoryRoot, 'apps/desktop/src/main/index.ts'),
   'utf8',
 );
 const desktopPreloadSource = fs.readFileSync(
-  path.resolve('../apps/desktop/src/preload/index.ts'),
+  path.join(repositoryRoot, 'apps/desktop/src/preload/index.ts'),
   'utf8',
 );
 const desktopTypesSource = fs.readFileSync(
-  path.resolve('src/types/magi-desktop.d.ts'),
+  path.join(repositoryRoot, 'web/src/types/magi-desktop.d.ts'),
   'utf8',
 );
 const agentApiSource = fs.readFileSync(
-  path.resolve('src/web/agent-api.ts'),
+  path.join(repositoryRoot, 'web/src/web/agent-api.ts'),
   'utf8',
 );
-const zhCN = JSON.parse(fs.readFileSync(path.resolve('src/i18n/zh-CN.json'), 'utf8'));
-const enUS = JSON.parse(fs.readFileSync(path.resolve('src/i18n/en-US.json'), 'utf8'));
+const zhCN = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'web/src/i18n/zh-CN.json'), 'utf8'));
+const enUS = JSON.parse(fs.readFileSync(path.join(repositoryRoot, 'web/src/i18n/en-US.json'), 'utf8'));
 
 assert.doesNotMatch(source, /runBrowserRuntimeAction|AgentApiError|@tauri-apps|pollRuntimeStatus/);
 assert.doesNotMatch(source, /runtimeStatus|runtimeMode|playwrightVersion|hostVersion|restartRequired/);

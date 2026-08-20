@@ -46,6 +46,7 @@
     createBrowserSession,
     createBrowserTab,
     getBrowserSession,
+    setActiveBrowserTab,
     waitForBrowserTabReady,
     getBrowserCapabilities,
     materializeSession,
@@ -152,7 +153,6 @@
         || action.interaction !== 'select'
       ) return;
       addPaneMenuOpen = false;
-      void desktop?.closeOverlay().catch(() => undefined);
       if (action.id === 'browser' || action.id === 'terminal') {
         chooseAddPane(action.id);
       }
@@ -461,6 +461,13 @@
       navigationRevision: payload.navigationRevision,
       viewport: { mode: 'auto' },
     });
+    try {
+      await setActiveBrowserTab(payload.browserSessionId, payload.tabId);
+    } catch (error) {
+      // 页面已经成功挂入右栏时不能因为焦点同步失败而把可用浏览器标记为失败；
+      // 下一次右栏激活会再次同步，工具显式传 tab_id 也不受影响。
+      console.warn('[RightPane] 同步浏览器工具默认 Tab 失败:', error);
+    }
 
     // 元数据同步独立于可见 Surface 的激活，不再把 Authority/daemon 请求
     // 放在用户看到浏览器页面的关键路径上。

@@ -1106,6 +1106,8 @@ pub struct RuntimeStatePersistence {
     workspace_path: PathBuf,
     knowledge_path: PathBuf,
     write_lock: Arc<Mutex<()>>,
+    knowledge_save_scheduled: Arc<AtomicBool>,
+    knowledge_save_dirty: Arc<AtomicBool>,
 }
 
 const SESSION_PERSISTENCE_PUBLIC_ERROR: &str = "会话状态暂不可保存，请稍后重试";
@@ -1125,6 +1127,8 @@ impl RuntimeStatePersistence {
             workspace_path: workspace_path.into(),
             knowledge_path: knowledge_path.into(),
             write_lock: Arc::new(Mutex::new(())),
+            knowledge_save_scheduled: Arc::new(AtomicBool::new(false)),
+            knowledge_save_dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1140,6 +1144,13 @@ impl RuntimeStatePersistence {
             .write_lock
             .lock()
             .expect("runtime persistence write lock poisoned");
+        Self::write_json(path, value)
+    }
+
+    fn write_json<T>(path: &Path, value: &T) -> Result<(), ApiError>
+    where
+        T: serde::Serialize,
+    {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| ApiError::internal_assembly("创建运行态持久化目录失败", error))?;
@@ -1156,7 +1167,54 @@ impl RuntimeStatePersistence {
     }
 
     pub(crate) fn save_knowledge_store(&self, store: &KnowledgeStore) -> Result<(), ApiError> {
-        self.save_json(&self.knowledge_path, &store.export_state())
+        let _write_guard = self
+            .write_lock
+            .lock()
+            .expect("runtime persistence write lock poisoned");
+        let snapshot = store.export_state();
+        Self::write_json(&self.knowledge_path, &snapshot)
+    }
+
+    pub(crate) fn schedule_knowledge_store_save(&self, store: KnowledgeStore) {
+        self.knowledge_save_dirty.store(true, Ordering::Release);
+        if self
+            .knowledge_save_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let persistence = self.clone();
+        std::thread::spawn(move || {
+            loop {
+                persistence
+                    .knowledge_save_dirty
+                    .store(false, Ordering::Release);
+                if let Err(error) = persistence.save_knowledge_store(&store) {
+                    tracing::warn!(?error, "异步持久化索引维护后的知识状态失败");
+                }
+                if persistence.knowledge_save_dirty.load(Ordering::Acquire) {
+                    continue;
+                }
+                if persistence
+                    .knowledge_save_scheduled
+                    .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                if persistence.knowledge_save_dirty.load(Ordering::Acquire) {
+                    if persistence
+                        .knowledge_save_scheduled
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                }
+                break;
+            }
+        });
     }
 }
 
@@ -2601,6 +2659,12 @@ impl ApiState {
             .map(load_browser_authority)
             .transpose();
         self.runtime_persistence = Some(persistence);
+        if let Some(persistence) = self.runtime_persistence.clone() {
+            let store = self.knowledge_store.clone();
+            store.set_index_persistence_callback(move |store| {
+                persistence.schedule_knowledge_store_save(store.clone());
+            });
+        }
         match browser_load {
             Ok(Some((authority, is_new))) => {
                 *self
@@ -3162,20 +3226,8 @@ impl ApiState {
                     .build_workspace_index(&build_workspace_id, &workspace_root)
             })
             .await;
-            let cancelled_before_persist = state
-                .knowledge_store
-                .workspace_index_build_cancelled(&workspace_id);
             match build_result {
-                Ok(_) => {
-                    if !cancelled_before_persist && let Err(error) = state.persist_knowledge_state()
-                    {
-                        tracing::warn!(
-                            workspace_id = %workspace_id,
-                            error = ?error,
-                            "后台代码索引持久化失败"
-                        );
-                    }
-                }
+                Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(
                         workspace_id = %workspace_id,

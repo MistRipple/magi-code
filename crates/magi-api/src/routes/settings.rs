@@ -2670,6 +2670,7 @@ mod tests {
             "diagram_render",
             "image_generate",
             "knowledge_query",
+            "knowledge_graph_query",
             "code_symbols",
             "tool_catalog",
             "git_status",
@@ -2797,7 +2798,12 @@ mod tests {
         );
         assert_eq!(
             capability_dependencies[0]["requiredBy"],
-            serde_json::json!(["knowledge_query", "search_semantic", "code_symbols"])
+            serde_json::json!([
+                "knowledge_query",
+                "knowledge_graph_query",
+                "search_semantic",
+                "code_symbols"
+            ])
         );
         assert!(
             capability_dependencies[0].get("required_by").is_none(),

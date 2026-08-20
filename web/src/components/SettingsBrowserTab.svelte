@@ -50,6 +50,10 @@
     return i18n.t('settings.browser.actionFailed');
   }
 
+  function versionText(value: string | null | undefined): string {
+    return value?.trim() || i18n.t('settings.browser.versionUnavailable');
+  }
+
   async function loadCapabilities(): Promise<void> {
     if (capabilityLoading) return;
     capabilityLoading = true;
@@ -64,19 +68,28 @@
     }
   }
 
-  async function loadDesktopInfo(): Promise<void> {
+  async function fetchDesktopInfo(): Promise<MagiDesktopBrowserComponentSnapshot> {
     const desktop = window.magiDesktop;
-    if (!isDesktop || !desktop || desktopLoading) return;
+    if (!isDesktop || !desktop) throw new Error('desktop_runtime_unavailable');
     desktopLoading = true;
     desktopError = '';
     try {
-      desktopInfo = await desktop.getBrowserComponentInfo();
+      const next = await desktop.getBrowserComponentInfo();
+      desktopInfo = next;
+      return next;
+    } finally {
+      desktopLoading = false;
+    }
+  }
+
+  async function loadDesktopInfo(): Promise<void> {
+    if (!isDesktop || !window.magiDesktop || desktopLoading) return;
+    try {
+      await fetchDesktopInfo();
     } catch (error) {
       console.warn('[SettingsBrowserTab] 获取桌面浏览器组件状态失败:', error);
       desktopInfo = null;
       desktopError = errorMessage(error);
-    } finally {
-      desktopLoading = false;
     }
   }
 
@@ -114,12 +127,13 @@
     clearActionFeedback();
     try {
       if (action === 'refresh-components') {
-        desktopInfo = await desktop.getBrowserComponentInfo();
+        await fetchDesktopInfo();
         showActionNotice(i18n.t('settings.browser.refreshSucceeded'));
       } else if (action === 'restart-automation') {
         desktopInfo = await desktop.restartBrowserAutomation();
         showActionNotice(i18n.t('settings.browser.restartAutomationSucceeded'));
       } else if (action === 'clear-data') {
+        if (!window.confirm(i18n.t('settings.browser.clearDataConfirm'))) return;
         await desktop.clearBrowserData();
         showActionNotice(i18n.t('settings.browser.clearDataSucceeded'));
       } else {
@@ -133,6 +147,8 @@
           }));
         } else if (result === 'latest') {
           showActionNotice(i18n.t('settings.browser.desktopUpToDate'));
+        } else if (result === 'ignored') {
+          showActionNotice(updateStatusText());
         }
       }
     } catch (error) {
@@ -148,6 +164,69 @@
   ): string {
     if (desktopLoading) return i18n.t('settings.browser.status.loading');
     return i18n.t(`settings.browser.status.${status ?? 'unavailable'}`);
+  }
+
+  function browserRuntimeReady(): boolean {
+    return desktopInfo?.runtime.ready === true
+      && capabilitySnapshot?.hostStatus === 'ready'
+      && capabilitySnapshot.hostProtocolCompatible;
+  }
+
+  function hostComponentStatus(): string {
+    if (desktopLoading) return i18n.t('settings.browser.status.loading');
+    if (!desktopInfo) return i18n.t('settings.browser.status.unavailable');
+    if (desktopInfo.runtime.status !== 'ready') return componentStatus(desktopInfo.runtime.status);
+    if (!capabilitySnapshot) return i18n.t('settings.browser.status.unavailable');
+    if (capabilitySnapshot.lastErrorCode === 'browser_protocol_incompatible') {
+      return i18n.t('settings.browser.status.protocol-incompatible');
+    }
+    if (capabilitySnapshot.hostStatus !== 'ready') {
+      return componentStatus(capabilityHostStatus());
+    }
+    if (!capabilitySnapshot.hostProtocolCompatible) {
+      return i18n.t('settings.browser.status.protocol-incompatible');
+    }
+    return browserRuntimeReady()
+      ? i18n.t('settings.browser.status.ready')
+      : componentStatus(desktopInfo.runtime.status);
+  }
+
+  function browserEngineStatus(): string {
+    if (desktopLoading) return i18n.t('settings.browser.status.loading');
+    return desktopInfo
+      ? i18n.t('settings.browser.status.ready')
+      : i18n.t('settings.browser.status.unavailable');
+  }
+
+  function capabilityHostStatus(): MagiDesktopBrowserComponentStatus {
+    switch (capabilitySnapshot?.hostStatus) {
+      case 'starting': return 'starting';
+      case 'reconnecting': return 'restarting';
+      case 'failed': return 'failed';
+      case 'stopped': return 'stopped';
+      case 'ready': return 'ready';
+      default: return 'failed';
+    }
+  }
+
+  function protocolComponentStatus(): string {
+    if (desktopLoading) return i18n.t('settings.browser.status.loading');
+    if (!desktopInfo) return i18n.t('settings.browser.status.unavailable');
+    if (desktopInfo.protocol.status === 'incompatible') {
+      return i18n.t('settings.browser.status.protocol-incompatible');
+    }
+    return componentStatus(desktopInfo.protocol.status);
+  }
+
+  function componentActionDisabled(action: DesktopAction): boolean {
+    if (!isDesktop || !window.magiDesktop || desktopLoading || Boolean(activeAction)) return true;
+    if (
+      action === 'check-updates'
+      && ['checking', 'downloading', 'ready', 'installing'].includes(desktopUpdaterState.phase)
+    ) {
+      return true;
+    }
+    return false;
   }
 
   function protocolVersion(): string {
@@ -258,7 +337,8 @@
             class="icon-action"
             class:icon-action--loading={activeAction === 'refresh-components' || desktopLoading}
             onclick={() => void runDesktopAction('refresh-components')}
-            disabled={desktopLoading || Boolean(activeAction)}
+            disabled={componentActionDisabled('refresh-components')}
+            aria-busy={desktopLoading || activeAction === 'refresh-components'}
             title={i18n.t('settings.browser.refreshComponents')}
             aria-label={i18n.t('settings.browser.refreshComponents')}
           ><Icon name="refresh" size={14} /></button>
@@ -266,28 +346,28 @@
 
         <div class="component-list" aria-live="polite">
           <div class="component-row">
-            <div><strong>{i18n.t('settings.browser.component.desktopHost')}</strong><span>{componentStatus(desktopInfo ? 'ready' : undefined)}</span></div>
-            <code>{desktopInfo?.product_version ?? '-'}</code>
+            <div><strong>{i18n.t('settings.browser.component.desktopHost')}</strong><span>{hostComponentStatus()}</span></div>
+            <code>{versionText(desktopInfo?.product_version)}</code>
           </div>
           <div class="component-row">
-            <div><strong>{i18n.t('settings.browser.component.electron')}</strong><span>{componentStatus(desktopInfo ? 'ready' : undefined)}</span></div>
-            <code>{desktopInfo?.electron_version ?? '-'}</code>
+            <div><strong>{i18n.t('settings.browser.component.electron')}</strong><span>{browserEngineStatus()}</span></div>
+            <code>{versionText(desktopInfo?.electron_version)}</code>
           </div>
           <div class="component-row">
-            <div><strong>{i18n.t('settings.browser.component.chromium')}</strong><span>{componentStatus(desktopInfo ? 'ready' : undefined)}</span></div>
-            <code>{desktopInfo?.chromium_version ?? '-'}</code>
+            <div><strong>{i18n.t('settings.browser.component.chromium')}</strong><span>{browserEngineStatus()}</span></div>
+            <code>{versionText(desktopInfo?.chromium_version)}</code>
           </div>
           <div class="component-row">
             <div><strong>{i18n.t('settings.browser.component.daemon')}</strong><span>{componentStatus(desktopInfo?.daemon.status)}</span></div>
-            <code>{desktopInfo?.daemon.version ?? '-'}</code>
+            <code>{versionText(desktopInfo?.daemon.version)}</code>
           </div>
           <div class="component-row">
             <div><strong>{i18n.t('settings.browser.component.automationWorker')}</strong><span>{componentStatus(desktopInfo?.worker.status)}</span></div>
-            <code>{desktopInfo?.worker.version ?? '-'}</code>
+            <code>{versionText(desktopInfo?.worker.version)}</code>
           </div>
           <div class="component-row">
-            <div><strong>{i18n.t('settings.browser.component.protocol')}</strong><span>{componentStatus(desktopInfo?.protocol.compatible ? 'ready' : 'protocol-incompatible')}</span></div>
-            <code>{protocolVersion()}</code>
+            <div><strong>{i18n.t('settings.browser.component.protocol')}</strong><span>{protocolComponentStatus()}</span></div>
+            <code>{desktopInfo ? protocolVersion() : i18n.t('settings.browser.versionUnavailable')}</code>
           </div>
         </div>
         {#if desktopInfo?.error}
@@ -315,7 +395,8 @@
             <button
               type="button"
               onclick={() => void runDesktopAction('restart-automation')}
-              disabled={Boolean(activeAction) || !desktopInfo}
+              disabled={componentActionDisabled('restart-automation')}
+              aria-busy={activeAction === 'restart-automation'}
             >{actionLabel('restart-automation')}</button>
           </div>
           <div class="action-row">
@@ -327,7 +408,8 @@
               type="button"
               class="danger"
               onclick={() => void runDesktopAction('clear-data')}
-              disabled={Boolean(activeAction) || !desktopInfo}
+              disabled={componentActionDisabled('clear-data')}
+              aria-busy={activeAction === 'clear-data'}
             >{actionLabel('clear-data')}</button>
           </div>
           <div class="action-row">
@@ -339,7 +421,8 @@
             <button
               type="button"
               onclick={() => void runDesktopAction('check-updates')}
-              disabled={Boolean(activeAction) || !desktopInfo}
+              disabled={componentActionDisabled('check-updates')}
+              aria-busy={activeAction === 'check-updates'}
             >{actionLabel('check-updates')}</button>
           </div>
         </div>

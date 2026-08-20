@@ -342,7 +342,9 @@ impl RuntimeHealth {
 
     fn tool_status(&self, tool: BuiltinToolName) -> RuntimeToolStatus {
         match tool {
-            BuiltinToolName::KnowledgeQuery => self.knowledge_tool_status(),
+            BuiltinToolName::KnowledgeQuery | BuiltinToolName::KnowledgeGraphQuery => {
+                self.knowledge_tool_status()
+            }
             BuiltinToolName::SearchSemantic => self.code_index_tool_status(),
             BuiltinToolName::CodeSymbols => self.code_index_tool_status(),
             BuiltinToolName::AgentSpawn | BuiltinToolName::AgentWait => {
@@ -420,12 +422,12 @@ impl RuntimeHealth {
             serde_json::json!({
                 "name": "knowledge_store",
                 "status": if self.knowledge_store_available { "available" } else { "unavailable" },
-                "required_by": ["knowledge_query", "search_semantic", "code_symbols"],
+                "required_by": ["knowledge_query", "knowledge_graph_query", "search_semantic", "code_symbols"],
             }),
             serde_json::json!({
                 "name": "workspace_code_index",
                 "status": if self.knowledge_store_available { "ready" } else { "unavailable" },
-                "required_by": ["search_semantic", "code_symbols"],
+                "required_by": ["knowledge_graph_query", "search_semantic", "code_symbols"],
             }),
             serde_json::json!({
                 "name": "agent_role_registry",
@@ -1595,7 +1597,12 @@ mod tests {
 
         let payload = build_tool_catalog_value("{}", &ToolExecutionContext::default(), &resources);
         let tools = payload["tools"].as_array().expect("tools should be listed");
-        for name in ["knowledge_query", "search_semantic", "code_symbols"] {
+        for name in [
+            "knowledge_query",
+            "knowledge_graph_query",
+            "search_semantic",
+            "code_symbols",
+        ] {
             let tool = tools
                 .iter()
                 .find(|tool| tool["name"] == name)

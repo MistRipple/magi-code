@@ -31,6 +31,7 @@ pub fn is_concurrency_safe_call(input: &ToolConcurrencyInput<'_>) -> bool {
             | "web_fetch"
             | "diagram_render"
             | "knowledge_query"
+            | "knowledge_graph_query"
             | "code_symbols"
             | "tool_catalog"
             | "diff_preview"

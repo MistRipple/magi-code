@@ -926,6 +926,7 @@ export interface BrowserSessionSnapshot {
   sessionId: string;
   profileId: string;
   lifecycle: BrowserSessionLifecycle;
+  activeTabId: string | null;
   tabs: BrowserTabSnapshot[];
   runtimeEpoch: number;
   revision: number;
@@ -1130,6 +1131,22 @@ export async function activateBrowserTab(tabId: string): Promise<BrowserSessionS
     { method: 'POST' },
   );
   return parseAgentJson<BrowserSessionSnapshot>(response, 'activate browser tab');
+}
+
+/** 同步右侧面板当前选中的 Browser Tab，供 LLM 工具默认目标选择使用。 */
+export async function setActiveBrowserTab(
+  browserSessionId: string,
+  tabId: string,
+): Promise<BrowserSessionSnapshot> {
+  const response = await getTransport().request(
+    agentUrl(`/api/browser/sessions/${encodeURIComponent(browserSessionId)}/active-tab`),
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ tabId }),
+    },
+  );
+  return parseAgentJson<BrowserSessionSnapshot>(response, 'set active browser tab');
 }
 
 export async function closeBrowserTab(tabId: string): Promise<void> {
@@ -2546,6 +2563,34 @@ export async function getAgentProjectKnowledge(
   return await parseAgentJson<Record<string, unknown>>(response, 'load project knowledge');
 }
 
+export interface AgentKnowledgeGraphQuery {
+  focus?: string;
+  depth?: number;
+  direction?: 'forward' | 'reverse' | 'both';
+  nodeKinds?: string[];
+  edgeKinds?: string[];
+  maxNodes?: number;
+  maxEdges?: number;
+}
+
+/** 按节点重新加载知识图谱局部视图，避免前端从首屏全量图中做假聚焦。 */
+export async function getAgentKnowledgeGraph(
+  graphQuery: AgentKnowledgeGraphQuery = {},
+  bindingOverride?: AgentBindingOverride,
+): Promise<Record<string, unknown>> {
+  const params: Record<string, string> = {};
+  if (graphQuery.focus?.trim()) params.focus = graphQuery.focus.trim();
+  if (typeof graphQuery.depth === 'number' && Number.isFinite(graphQuery.depth)) params.depth = String(Math.trunc(graphQuery.depth));
+  if (graphQuery.direction) params.direction = graphQuery.direction;
+  if (graphQuery.nodeKinds?.length) params.nodeKinds = graphQuery.nodeKinds.join(',');
+  if (graphQuery.edgeKinds?.length) params.edgeKinds = graphQuery.edgeKinds.join(',');
+  if (typeof graphQuery.maxNodes === 'number' && Number.isFinite(graphQuery.maxNodes)) params.maxNodes = String(Math.trunc(graphQuery.maxNodes));
+  if (typeof graphQuery.maxEdges === 'number' && Number.isFinite(graphQuery.maxEdges)) params.maxEdges = String(Math.trunc(graphQuery.maxEdges));
+  const query = buildBoundQueryWithOverride(params, bindingOverride, { includeSession: false });
+  const response = await getTransport().request(agentUrl('/api/knowledge/graph', query));
+  return await parseAgentJson<Record<string, unknown>>(response, 'load knowledge graph');
+}
+
 export async function reindexAgentProjectKnowledge(
   bindingOverride?: AgentBindingOverride,
 ): Promise<Record<string, unknown>> {
@@ -2572,6 +2617,55 @@ export interface AgentKnowledgeItemPatch {
   content?: string;
   tags?: string[];
   context?: string;
+}
+
+export type AgentGraphNodeRef =
+  | { kind: 'knowledge'; knowledgeId: string }
+  | { kind: 'file'; path: string }
+  | { kind: 'symbol'; path: string; qualifiedName: string; symbolKind: string };
+
+export type AgentKnowledgeRelationKind =
+  | 'applies_to'
+  | 'explains'
+  | 'references'
+  | 'related_to'
+  | 'supersedes'
+  | 'contradicts';
+
+export type AgentKnowledgeRelationStatus = 'active' | 'candidate' | 'dangling' | 'rejected';
+
+export interface AgentKnowledgeRelation {
+  relationId: string;
+  workspaceId: string;
+  source: AgentGraphNodeRef;
+  kind: AgentKnowledgeRelationKind;
+  target: AgentGraphNodeRef;
+  origin: 'deterministic_code' | 'explicit_user' | 'explicit_agent' | 'inferred';
+  confidence?: number;
+  status: AgentKnowledgeRelationStatus;
+  evidence: string[];
+  discoveryKey?: string;
+  discoveryEvidence?: string[];
+  reviewedAt?: number;
+  createdAt?: number;
+  updatedAt?: number;
+}
+
+export interface AgentKnowledgeRelationDraft {
+  relationId?: string;
+  source: AgentGraphNodeRef;
+  kind: AgentKnowledgeRelationKind;
+  target: AgentGraphNodeRef;
+  origin?: AgentKnowledgeRelation['origin'];
+  confidence?: number;
+  status?: AgentKnowledgeRelationStatus;
+  evidence?: string[];
+}
+
+export interface AgentKnowledgeRelationsResponse {
+  relations: AgentKnowledgeRelation[];
+  totalRelations: number;
+  truncated: boolean;
 }
 
 export async function listAgentKnowledgeItems(
@@ -2630,6 +2724,72 @@ export async function deleteAgentKnowledgeItem(
     '/api/knowledge/items/delete',
     { knowledgeId },
     'delete knowledge item',
+    bindingOverride,
+  );
+}
+
+export async function listAgentKnowledgeRelations(
+  bindingOverride?: AgentBindingOverride,
+): Promise<AgentKnowledgeRelationsResponse> {
+  const query = buildBoundQueryWithOverride({}, bindingOverride, { includeSession: false });
+  const response = await getTransport().request(agentUrl('/api/knowledge/relations', query));
+  const payload = await parseAgentJson<Partial<AgentKnowledgeRelationsResponse>>(response, 'list knowledge relations');
+  const relations = Array.isArray(payload.relations)
+    ? payload.relations.map((relation) => ({
+        ...relation,
+        evidence: Array.isArray(relation.evidence) ? relation.evidence : [],
+      }))
+    : [];
+  const totalRelations = typeof payload.totalRelations === 'number' && Number.isFinite(payload.totalRelations)
+    ? Math.max(relations.length, Math.trunc(payload.totalRelations))
+    : relations.length;
+  return {
+    relations,
+    totalRelations,
+    truncated: payload.truncated === true || totalRelations > relations.length,
+  };
+}
+
+export async function addAgentKnowledgeRelation(
+  relation: AgentKnowledgeRelationDraft,
+  bindingOverride?: AgentBindingOverride,
+): Promise<AgentKnowledgeRelation> {
+  const payload = await postWorkspaceBoundJson<{ relation?: AgentKnowledgeRelation }>(
+    '/api/knowledge/relations',
+    relation as unknown as Record<string, unknown>,
+    'add knowledge relation',
+    bindingOverride,
+  );
+  if (!payload.relation) {
+    throw new Error('知识关系创建响应缺少 relation');
+  }
+  return payload.relation;
+}
+
+export async function updateAgentKnowledgeRelation(
+  relation: AgentKnowledgeRelationDraft & { relationId: string },
+  bindingOverride?: AgentBindingOverride,
+): Promise<AgentKnowledgeRelation> {
+  const payload = await postWorkspaceBoundJson<{ relation?: AgentKnowledgeRelation }>(
+    '/api/knowledge/relations/update',
+    relation as unknown as Record<string, unknown>,
+    'update knowledge relation',
+    bindingOverride,
+  );
+  if (!payload.relation) {
+    throw new Error('知识关系更新响应缺少 relation');
+  }
+  return payload.relation;
+}
+
+export async function deleteAgentKnowledgeRelation(
+  relationId: string,
+  bindingOverride?: AgentBindingOverride,
+): Promise<void> {
+  await postWorkspaceBoundJson<Record<string, unknown>>(
+    '/api/knowledge/relations/delete',
+    { relationId },
+    'delete knowledge relation',
     bindingOverride,
   );
 }

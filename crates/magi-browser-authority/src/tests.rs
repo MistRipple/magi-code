@@ -131,6 +131,44 @@ fn durable_tab_contains_only_user_visible_page_state() {
 }
 
 #[test]
+fn active_browser_tab_is_runtime_focus_and_does_not_persist() {
+    let mut authority = BrowserAuthority::new();
+    register_profile(&mut authority);
+    let browser_session_id = ready_session(&mut authority);
+    let first_tab_id = ready_tab(&mut authority, &browser_session_id);
+    let second_tab_id = BrowserTabId::new("browser-tab-2");
+    authority
+        .create_tab(CreateBrowserTab {
+            tab_id: second_tab_id.clone(),
+            browser_session_id: browser_session_id.clone(),
+            url: "https://example.com".to_string(),
+            now: at(6),
+        })
+        .expect("second tab should create");
+    authority
+        .transition_tab(&second_tab_id, BrowserTabLifecycle::Ready, at(7))
+        .expect("second tab should become ready");
+
+    authority
+        .set_active_tab(&browser_session_id, &second_tab_id)
+        .expect("active tab should be recorded");
+    assert_eq!(
+        authority.active_tab(&browser_session_id),
+        Some(&second_tab_id)
+    );
+
+    let durable = authority.durable_state();
+    let restored = BrowserAuthority::restore_durable(durable, at(8)).expect("state should restore");
+    assert_eq!(restored.active_tab(&browser_session_id), None);
+
+    authority
+        .transition_tab(&second_tab_id, BrowserTabLifecycle::Closed, at(9))
+        .expect("second tab should close");
+    assert_eq!(authority.active_tab(&browser_session_id), None);
+    assert!(authority.tab(&first_tab_id).is_some());
+}
+
+#[test]
 fn previous_durable_schema_without_tab_order_is_migrated() {
     let mut authority = BrowserAuthority::new();
     register_profile(&mut authority);

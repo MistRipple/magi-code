@@ -5,17 +5,26 @@
   import { MessageCategory } from '../shared/protocol/message-protocol';
   import { ensureArray } from '../lib/utils';
   import Icon from './Icon.svelte';
+  import KnowledgeGraphPanel from './KnowledgeGraphPanel.svelte';
   import { i18n } from '../stores/i18n.svelte';
   import { getState, messagesState } from '../stores/messages.svelte';
   import { openCodeTab } from '../stores/right-pane.svelte';
   import {
     addAgentKnowledgeItem,
+    addAgentKnowledgeRelation,
     clearAgentProjectKnowledge,
     deleteAgentKnowledgeItem,
+    deleteAgentKnowledgeRelation,
+    getAgentKnowledgeGraph,
     getAgentProjectKnowledge,
+    listAgentKnowledgeRelations,
     isWebAgentMode,
     reindexAgentProjectKnowledge,
+    updateAgentKnowledgeRelation,
     updateAgentKnowledgeItem,
+    type AgentKnowledgeRelation,
+    type AgentKnowledgeRelationDraft,
+    type AgentKnowledgeRelationsResponse,
   } from '../web/agent-api';
 
   // 知识类型定义
@@ -71,7 +80,7 @@
     const workspacePath = typeof appState.currentWorkspacePath === 'string' ? appState.currentWorkspacePath.trim() : '';
     return `${workspaceId}::${workspacePath}`;
   });
-  let currentTab = $state<'overview' | 'adr' | 'faq' | 'learning'>('overview');
+  let currentTab = $state<'overview' | 'adr' | 'faq' | 'learning' | 'graph'>('overview');
   let isLoading = $state(false);
   let hasRequestedKnowledge = $state(false);
   let lastWorkspaceKey = $state('');
@@ -83,6 +92,11 @@
   let loadError = $state('');
   let codeIndex = $state<CodeIndex | null>(null);
   let codeIndexStatus = $state<CodeIndexStatus | null>(null);
+  let graphPayload = $state<Record<string, unknown> | null>(null);
+  let graphLoading = $state(false);
+  let graphRequestSeq = 0;
+  let knowledgeRelations = $state<AgentKnowledgeRelation[]>([]);
+  let knowledgeRelationsMeta = $state<Pick<AgentKnowledgeRelationsResponse, 'totalRelations' | 'truncated'>>({ totalRelations: 0, truncated: false });
   let adrs = $state<ADR[]>([]);
   let faqs = $state<FAQ[]>([]);
   let learnings = $state<Learning[]>([]);
@@ -188,6 +202,21 @@
       workspaceId: messagesState.currentWorkspaceId ?? undefined,
       workspacePath: messagesState.currentWorkspacePath || undefined,
     });
+  }
+
+  function openKnowledgeRecord(knowledgeId: string): void {
+    const id = knowledgeId.trim();
+    if (!id) return;
+    if (adrs.some((item) => item.id === id)) {
+      currentTab = 'adr';
+      expandedAdrId = id;
+    } else if (faqs.some((item) => item.id === id)) {
+      currentTab = 'faq';
+      expandedFaqId = id;
+    } else if (learnings.some((item) => item.id === id)) {
+      currentTab = 'learning';
+      expandedLearningId = id;
+    }
   }
 
   function splitTags(value: string): string[] {
@@ -410,8 +439,13 @@
   }
 
   function clearKnowledgeContent() {
+    graphRequestSeq += 1;
+    graphLoading = false;
     codeIndex = null;
     codeIndexStatus = null;
+    graphPayload = null;
+    knowledgeRelations = [];
+    knowledgeRelationsMeta = { totalRelations: 0, truncated: false };
     adrs = [];
     faqs = [];
     learnings = [];
@@ -478,6 +512,10 @@
       ? payload.codeIndex as Record<string, unknown>
       : null;
     codeIndexStatus = normalizeCodeIndexStatus(payload?.codeIndexStatus);
+    graphPayload = payload?.graph && typeof payload.graph === 'object' && !Array.isArray(payload.graph)
+      ? payload.graph as Record<string, unknown>
+      : null;
+    applyKnowledgeRelationsPayload(payload);
 
     const items = ensureArray(payload?.items) as Array<Record<string, unknown>>;
     adrs = items
@@ -589,6 +627,10 @@
     };
   }
 
+  function hasKnowledgeWorkspaceScope(request: KnowledgeWorkspaceRequest = currentKnowledgeWorkspaceRequest()): boolean {
+    return Boolean(request.workspaceId || request.workspacePath);
+  }
+
   function knowledgeWorkspaceScope(request: KnowledgeWorkspaceRequest): { scope: 'workspace'; workspaceId: string; workspacePath: string } {
     return {
       scope: 'workspace',
@@ -650,11 +692,46 @@
     vscode.postMessage({ type: 'loadSettingsBootstrap', force: true });
   }
 
+  function applyKnowledgeRelationsPayload(payload: Record<string, unknown> | null | undefined): void {
+    const rawRelations = Array.isArray(payload?.relations) ? payload.relations : [];
+    knowledgeRelations = rawRelations.flatMap((value) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+      const relation = value as Partial<AgentKnowledgeRelation>;
+      if (typeof relation.relationId !== 'string' || !relation.source || !relation.target || typeof relation.kind !== 'string') {
+        return [];
+      }
+      return [{
+        ...relation,
+        relationId: relation.relationId,
+        source: relation.source,
+        kind: relation.kind as AgentKnowledgeRelation['kind'],
+        target: relation.target,
+        origin: relation.origin ?? 'inferred',
+        status: relation.status ?? 'candidate',
+        evidence: ensureArray(relation.evidence).filter((item): item is string => typeof item === 'string'),
+      } as AgentKnowledgeRelation];
+    });
+    const rawMeta = payload?.relationMeta && typeof payload.relationMeta === 'object' && !Array.isArray(payload.relationMeta)
+      ? payload.relationMeta as Record<string, unknown>
+      : {};
+    const rawTotal = rawMeta.totalRelations ?? payload?.totalRelations;
+    const totalRelations = typeof rawTotal === 'number' && Number.isFinite(rawTotal)
+      ? Math.max(knowledgeRelations.length, Math.trunc(rawTotal))
+      : knowledgeRelations.length;
+    knowledgeRelationsMeta = {
+      totalRelations,
+      truncated: rawMeta.truncated === true || payload?.truncated === true || totalRelations > knowledgeRelations.length,
+    };
+  }
+
   async function fetchKnowledgeViaApi(request: KnowledgeLoadRequest, reindex: boolean) {
     if (reindex) {
       await reindexAgentProjectKnowledge(knowledgeWorkspaceScope(request));
     }
-    const res = await getAgentProjectKnowledge(knowledgeWorkspaceScope(request));
+    const [res, relationPayload] = await Promise.all([
+      getAgentProjectKnowledge(knowledgeWorkspaceScope(request)),
+      listAgentKnowledgeRelations(knowledgeWorkspaceScope(request)),
+    ]);
     if (!isCurrentKnowledgeLoadRequest(request)) {
       return;
     }
@@ -663,11 +740,54 @@
       finishKnowledgeLoad();
       return;
     }
+    knowledgeRelations = relationPayload.relations;
+    knowledgeRelationsMeta = {
+      totalRelations: relationPayload.totalRelations,
+      truncated: relationPayload.truncated,
+    };
     refreshSettingsAfterKnowledgePayload();
+  }
+
+  async function loadKnowledgeGraph(focus: string | null): Promise<void> {
+    const request = currentKnowledgeWorkspaceRequest();
+    if (!hasKnowledgeWorkspaceScope(request)) return;
+    const requestSeq = ++graphRequestSeq;
+    graphLoading = true;
+    try {
+      const payload = await getAgentKnowledgeGraph(
+        {
+          focus: focus?.trim() || undefined,
+          depth: 1,
+          direction: 'both',
+          maxNodes: 120,
+          maxEdges: 240,
+        },
+        knowledgeWorkspaceScope(request),
+      );
+      if (requestSeq !== graphRequestSeq || !isCurrentKnowledgeWorkspaceRequest(request)) return;
+      if (payloadMatchesCurrentWorkspace(payload)) {
+        graphPayload = payload;
+      }
+    } catch (error) {
+      if (requestSeq === graphRequestSeq && isCurrentKnowledgeWorkspaceRequest(request)) {
+        console.warn('[KnowledgePanel] load focused knowledge graph failed:', error);
+      }
+    } finally {
+      if (requestSeq === graphRequestSeq && isCurrentKnowledgeWorkspaceRequest(request)) {
+        graphLoading = false;
+      }
+    }
   }
 
   function requestKnowledgeLoad(reindex = false, background = false) {
     const request = nextKnowledgeLoadRequest();
+    if (!hasKnowledgeWorkspaceScope(request)) {
+      hasRequestedKnowledge = false;
+      isLoading = false;
+      loadError = '';
+      clearKnowledgeContent();
+      return;
+    }
     clearKnowledgeIndexPollTimeout();
     hasRequestedKnowledge = true;
     if (!background) {
@@ -734,6 +854,30 @@
     }
   }
 
+  async function createKnowledgeRelation(relation: AgentKnowledgeRelationDraft): Promise<void> {
+    const request = currentKnowledgeWorkspaceRequest();
+    await addAgentKnowledgeRelation(relation, knowledgeWorkspaceScope(request));
+    if (isCurrentKnowledgeWorkspaceRequest(request)) {
+      requestKnowledgeLoad(false);
+    }
+  }
+
+  async function editKnowledgeRelation(relation: AgentKnowledgeRelationDraft & { relationId: string }): Promise<void> {
+    const request = currentKnowledgeWorkspaceRequest();
+    await updateAgentKnowledgeRelation(relation, knowledgeWorkspaceScope(request));
+    if (isCurrentKnowledgeWorkspaceRequest(request)) {
+      requestKnowledgeLoad(false);
+    }
+  }
+
+  async function removeKnowledgeRelation(relationId: string): Promise<void> {
+    const request = currentKnowledgeWorkspaceRequest();
+    await deleteAgentKnowledgeRelation(relationId, knowledgeWorkspaceScope(request));
+    if (isCurrentKnowledgeWorkspaceRequest(request)) {
+      requestKnowledgeLoad(false);
+    }
+  }
+
   function confirmClear() {
     showClearConfirm = true;
   }
@@ -779,7 +923,7 @@
   });
 
   $effect(() => {
-    if (!isKnowledgeActive || hasRequestedKnowledge) {
+    if (!isKnowledgeActive || hasRequestedKnowledge || !hasKnowledgeWorkspaceScope()) {
       return;
     }
     requestKnowledgeLoad();
@@ -843,6 +987,10 @@
         <span class="kp-tab-count">{learnings.length}</span>
       {/if}
     </button>
+    <button class="kp-tab" class:active={currentTab === 'graph'} onclick={() => switchTab('graph')}>
+      <Icon name="git-branch" size={13} />
+      <span>{i18n.t('knowledge.tabs.graph')}</span>
+    </button>
     <div class="kp-tab-actions">
       <button class="kp-icon-btn" onclick={refresh} disabled={isLoading} title={i18n.t('knowledge.actions.refreshTitle')}>
         <Icon name="refresh" size={14} class={isLoading ? 'spinning' : ''} />
@@ -859,7 +1007,7 @@
   </div>
 
   <!-- 搜索栏（Tab 下方独立行） -->
-  {#if currentTab !== 'overview'}
+  {#if currentTab !== 'overview' && currentTab !== 'graph'}
     <div class="kp-search-bar">
       <Icon name="search" size={13} />
       <input
@@ -1064,6 +1212,27 @@
           </div>
         {/if}
       </div>
+
+    {:else if currentTab === 'graph'}
+      <KnowledgeGraphPanel
+        payload={graphPayload as { status?: 'indexing' | 'ready' | 'empty' | 'failed'; reasonCode?: string | null; nodes?: unknown[]; edges?: unknown[]; stats?: Record<string, number>; truncated?: boolean } | null}
+        knowledgeOptions={[
+          ...adrs.map((item) => ({ id: item.id, label: item.title, kind: 'adr' })),
+          ...faqs.map((item) => ({ id: item.id, label: item.question, kind: 'faq' })),
+          ...learnings.map((item) => ({ id: item.id, label: formatLearningTitle(item.content), kind: 'learning' })),
+        ]}
+        relations={knowledgeRelations}
+        relationMeta={knowledgeRelationsMeta}
+        editable={hasKnowledgeWorkspaceScope()}
+        graphLoading={graphLoading}
+        onRefresh={refresh}
+        onFocusNode={loadKnowledgeGraph}
+        onOpenCode={previewEntryPoint}
+        onOpenKnowledge={openKnowledgeRecord}
+        onCreateRelation={createKnowledgeRelation}
+        onUpdateRelation={editKnowledgeRelation}
+        onDeleteRelation={removeKnowledgeRelation}
+      />
 
     {:else if currentTab === 'adr'}
       <!-- ADR Tab -->

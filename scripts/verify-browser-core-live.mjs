@@ -86,6 +86,23 @@ async function activateAndReadTab(tabId) {
   };
 }
 
+async function focusBrowserTab(browserSessionId, tabId) {
+  const focused = await readJson(
+    `/api/browser/sessions/${encodeURIComponent(browserSessionId)}/active-tab`,
+    {
+      method: "POST",
+      body: jsonBody({ tabId }),
+    },
+  );
+  const focusedSession = sessionFromResponse(focused.body);
+  record(
+    `当前 Browser Tab 焦点同步 ${tabId}`,
+    focused.response.ok && focusedSession?.activeTabId === tabId,
+    `HTTP ${focused.response.status}, activeTabId=${focusedSession?.activeTabId ?? "none"}`,
+  );
+  return focusedSession;
+}
+
 if (!sessionId) {
   throw new Error("必须提供 --session-id，示例：--session-id session-...");
 }
@@ -120,9 +137,9 @@ let tab = null;
 if (session) {
   tab = requestedTabId
     ? session.tabs.find((candidate) => candidate.tabId === requestedTabId)
-    : session.tabs.find((candidate) => candidate.lifecycle === "ready" && candidate.surfaceId);
+    : session.tabs.find((candidate) => candidate.lifecycle !== "closed");
 }
-if (tab && (!tab.surfaceId || tab.lifecycle !== "ready")) {
+if (tab && (tab.lifecycle !== "ready" || !tab.surfaceId)) {
   const activated = await readJson(`/api/browser/tabs/${encodeURIComponent(tab.tabId)}/activate`, {
     method: "POST",
     body: jsonBody({}),
@@ -131,6 +148,14 @@ if (tab && (!tab.surfaceId || tab.lifecycle !== "ready")) {
   const refreshed = await readJson(sessionPath);
   session = refreshed.body?.session;
   tab = session?.tabs.find((candidate) => candidate.tabId === tab.tabId) ?? tab;
+}
+if (tab?.tabId && connectionReady) {
+  const activated = await activateAndReadTab(tab.tabId);
+  session = activated.session ?? session;
+  tab = activated.tab ?? tab;
+  if (session?.browserSessionId && tab.tabId) {
+    session = await focusBrowserTab(session.browserSessionId, tab.tabId) ?? session;
+  }
 }
 record(
   "当前 Tab 具有真实 Surface",

@@ -310,12 +310,13 @@ export type BrowserHostEvent =
       type: "page_updated";
       payload: { binding: BrowserSurfaceBinding; page_state: BrowserPageState };
     }
+  | { type: "page_failed"; payload: { binding: BrowserSurfaceBinding; reason: string } }
+  | { type: "loading_changed"; payload: { binding: BrowserSurfaceBinding; loading: boolean } }
   | { type: "page_crashed"; payload: { binding: BrowserSurfaceBinding; diagnostic?: string | null } }
   | { type: "console"; payload: { tab_id: BrowserTabId; level: string; text: string } }
   | { type: "dialog"; payload: { tab_id: BrowserTabId; dialog_id: number; dialog_type: string; message: string } }
   | { type: "download"; payload: { tab_id: BrowserTabId; suggested_filename: string; state: string; byte_length?: number; error?: string } }
-  | { type: "file_chooser"; payload: { tab_id: BrowserTabId } }
-  | { type: "popup_blocked"; payload: { tab_id: BrowserTabId } }
+  | { type: "popup_blocked"; payload: { binding: BrowserSurfaceBinding; url: string } }
   | { type: "agent_cursor"; payload: { tab_id: BrowserTabId; visible: boolean; x: number | null; y: number | null; action: string | null } }
   | { type: "binary_payload_ready"; payload: BrowserBinaryPayload }
   | { type: "heartbeat"; payload: { monotonic_millis: number } };

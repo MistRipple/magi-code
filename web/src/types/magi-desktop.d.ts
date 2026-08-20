@@ -123,9 +123,10 @@ interface MagiDesktopUpdateSnapshot {
 }
 
 type MagiDesktopBrowserComponentStatus = 'starting' | 'ready' | 'restarting' | 'failed' | 'stopped';
+type MagiDesktopBrowserProtocolStatus = MagiDesktopBrowserComponentStatus | 'incompatible';
 
 interface MagiDesktopBrowserComponentError {
-  target: 'daemon' | 'worker' | 'protocol';
+  target: 'daemon' | 'worker' | 'protocol' | 'version';
   code: string;
   message: string;
 }
@@ -148,7 +149,14 @@ interface MagiDesktopBrowserComponentSnapshot {
   };
   protocol: {
     version: { major: number; minor: number };
+    status: MagiDesktopBrowserProtocolStatus;
     compatible: boolean;
+    error: MagiDesktopBrowserComponentError | null;
+  };
+  runtime: {
+    status: MagiDesktopBrowserComponentStatus;
+    ready: boolean;
+    version_compatible: boolean;
     error: MagiDesktopBrowserComponentError | null;
   };
   error: MagiDesktopBrowserComponentError | null;
@@ -184,6 +192,7 @@ interface MagiDesktopBridge {
     tabId: string;
     viewport: MagiDesktopViewportIntent;
   }): Promise<MagiDesktopWindowSnapshot>;
+  focusApp(): Promise<void>;
   readyRightPane(): Promise<void>;
   openOverlay(state: Omit<MagiDesktopOverlayState, 'overlayId' | 'phase'> & { overlayId?: string; phase?: MagiDesktopOverlayState['phase'] }): Promise<void>;
   closeOverlay(): Promise<void>;

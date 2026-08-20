@@ -1,4 +1,7 @@
-use crate::{CodeIndexSource, KnowledgeAuditLink, KnowledgeGovernanceLink, KnowledgeRecord};
+use crate::{
+    CodeIndexSource, KnowledgeAuditLink, KnowledgeGovernanceLink, KnowledgeRecord,
+    KnowledgeRelation,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -11,6 +14,8 @@ pub struct KnowledgeState {
     pub(crate) code_sources: HashMap<String, CodeIndexSource>,
     pub(crate) audit_links: HashMap<String, KnowledgeAuditLink>,
     pub(crate) governance_links: HashMap<String, KnowledgeGovernanceLink>,
+    #[serde(default)]
+    pub(crate) relations: HashMap<String, KnowledgeRelation>,
 }
 
 impl KnowledgeState {
@@ -55,7 +60,49 @@ impl KnowledgeState {
         self.code_sources.remove(knowledge_id);
         self.audit_links.remove(knowledge_id);
         self.governance_links.remove(knowledge_id);
+        self.relations.retain(|_, relation| {
+            !matches!(
+                (&relation.source, &relation.target),
+                (
+                    crate::graph::GraphNodeRef::Knowledge { knowledge_id: source_id },
+                    _
+                ) if source_id == knowledge_id
+            ) && !matches!(
+                &relation.target,
+                crate::graph::GraphNodeRef::Knowledge { knowledge_id: target_id }
+                    if target_id == knowledge_id
+            )
+        });
         true
+    }
+
+    pub(crate) fn upsert_relation(&mut self, mut relation: KnowledgeRelation) {
+        if let Some(existing) = self.relations.get(&relation.relation_id) {
+            relation.created_at = existing.created_at;
+            if relation.discovery_key.is_none() {
+                relation.discovery_key = existing.discovery_key.clone();
+            }
+            if relation.discovery_evidence.is_none() {
+                relation.discovery_evidence = existing.discovery_evidence.clone();
+            }
+            if relation.status != crate::graph::GraphEdgeStatus::Candidate
+                && relation.reviewed_at.is_none()
+            {
+                relation.reviewed_at = existing.reviewed_at;
+            }
+        }
+        self.relations
+            .insert(relation.relation_id.clone(), relation);
+    }
+
+    pub(crate) fn delete_relation(&mut self, relation_id: &str) -> bool {
+        self.relations.remove(relation_id).is_some()
+    }
+
+    pub(crate) fn relations(&self) -> Vec<KnowledgeRelation> {
+        let mut relations = self.relations.values().cloned().collect::<Vec<_>>();
+        relations.sort_by(|left, right| left.relation_id.cmp(&right.relation_id));
+        relations
     }
 
     pub(crate) fn rebuild_term_postings(&mut self) {

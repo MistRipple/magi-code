@@ -432,6 +432,14 @@ pub enum BrowserHostEvent {
         binding: BrowserSurfaceBinding,
         page_state: BrowserHostPageState,
     },
+    PageFailed {
+        binding: BrowserSurfaceBinding,
+        reason: String,
+    },
+    LoadingChanged {
+        binding: BrowserSurfaceBinding,
+        loading: bool,
+    },
     PageCrashed {
         binding: BrowserSurfaceBinding,
         diagnostic: Option<String>,
@@ -456,11 +464,9 @@ pub enum BrowserHostEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
-    FileChooser {
-        tab_id: BrowserTabId,
-    },
     PopupBlocked {
-        tab_id: BrowserTabId,
+        binding: BrowserSurfaceBinding,
+        url: String,
     },
     AgentCursor(BrowserAgentCursor),
     BinaryPayloadReady(BrowserHostBinaryPayload),

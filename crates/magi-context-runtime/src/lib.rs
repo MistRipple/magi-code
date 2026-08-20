@@ -20,7 +20,8 @@ use std::{
 pub use execution_context::{ExecutionContextAssemblyRequest, ExecutionContextClues};
 pub use knowledge_context::{
     KnowledgeConsumer, KnowledgeContextDecision, KnowledgeContextRequest,
-    KnowledgeContextSelection, SelectedKnowledgeContext,
+    KnowledgeContextSelection, KnowledgeGraphContext, KnowledgeGraphContextEdge,
+    KnowledgeGraphContextNode, SelectedKnowledgeContext,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

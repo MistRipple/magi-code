@@ -183,6 +183,12 @@ pub struct BrowserAuthority {
     surface_fences: HashMap<(BrowserTabId, String), u64>,
     primary_surfaces: HashMap<BrowserTabId, BrowserPrimarySurface>,
     active_desktop_epoch: Option<String>,
+    /// 当前 Magi 会话在 UI 中选中的 Browser Tab。
+    ///
+    /// 这是运行态焦点，不进入 durable state。页面地址和标记需要持久化，
+    /// 但“哪个 Tab 当前被 UI 选中”不能在 daemon 重启后伪造恢复，否则
+    /// 浏览器工具会把任务发送到错误的页面。
+    active_tabs: HashMap<BrowserSessionId, BrowserTabId>,
 }
 
 impl BrowserAuthority {
@@ -651,6 +657,38 @@ impl BrowserAuthority {
         Ok(tab)
     }
 
+    /// 记录当前会话在右侧面板中选中的 Browser Tab。
+    ///
+    /// 该状态只用于运行时默认工具目标选择，不改变 Tab 生命周期，也不物化
+    /// Chromium Page。显式传入 tab_id 的工具调用仍然拥有更高优先级。
+    pub fn set_active_tab(
+        &mut self,
+        browser_session_id: &BrowserSessionId,
+        tab_id: &BrowserTabId,
+    ) -> Result<(), BrowserAuthorityError> {
+        self.require_session(browser_session_id)?;
+        let tab = self.require_tab(tab_id)?;
+        if tab.browser_session_id != *browser_session_id {
+            return Err(BrowserAuthorityError::TabSessionMismatch {
+                tab_id: tab_id.clone(),
+                browser_session_id: browser_session_id.clone(),
+            });
+        }
+        if tab.lifecycle == BrowserTabLifecycle::Closed {
+            return Err(BrowserAuthorityError::TabNotReady {
+                tab_id: tab_id.clone(),
+                lifecycle: tab.lifecycle,
+            });
+        }
+        self.active_tabs
+            .insert(browser_session_id.clone(), tab_id.clone());
+        Ok(())
+    }
+
+    pub fn active_tab(&self, browser_session_id: &BrowserSessionId) -> Option<&BrowserTabId> {
+        self.active_tabs.get(browser_session_id)
+    }
+
     pub fn transition_tab(
         &mut self,
         tab_id: &BrowserTabId,
@@ -697,6 +735,13 @@ impl BrowserAuthority {
             session.tab_ids.retain(|candidate| candidate != tab_id);
             session.revision = session.revision.saturating_add(1);
             session.updated_at = now;
+            if self
+                .active_tabs
+                .get(&browser_session_id)
+                .is_some_and(|active| active == tab_id)
+            {
+                self.active_tabs.remove(&browser_session_id);
+            }
         } else if lifecycle == BrowserTabLifecycle::Suspended {
             self.revoke_leases(
                 &BrowserLeaseSelector {
@@ -1548,6 +1593,7 @@ impl BrowserAuthority {
             .get_mut(browser_session_id)
             .expect("browser session was validated before mutation");
         session.tab_ids.clear();
+        self.active_tabs.remove(browser_session_id);
         Ok(())
     }
 

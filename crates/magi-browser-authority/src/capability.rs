@@ -117,28 +117,24 @@ impl BrowserToolKind {
 
     /// 文件系统授权需要独立的 Desktop 授权管线，当前版本不会隐式读取本地文件。
     pub fn is_supported(self) -> bool {
-        true
+        Self::ALL.contains(&self)
     }
 
     pub fn catalog_access(self) -> BrowserToolAccess {
         match self {
-            Self::Navigate
-            | Self::Snapshot
-            | Self::Screenshot
-            | Self::WaitFor
-            | Self::Console
+            Self::Snapshot | Self::Screenshot | Self::WaitFor => BrowserToolAccess::Read,
+            Self::Console
             | Self::Network
             | Self::Performance
             | Self::Lighthouse
-            | Self::Heap => BrowserToolAccess::Read,
-            Self::Tabs
-            | Self::Viewport
-            | Self::Dialog
-            | Self::Emulate
-            | Self::ThirdParty
-            | Self::WebMcp => BrowserToolAccess::Mixed,
+            | Self::Heap
+            | Self::Dialog => BrowserToolAccess::Mixed,
+            Self::Tabs | Self::Viewport | Self::Emulate | Self::ThirdParty | Self::WebMcp => {
+                BrowserToolAccess::Mixed
+            }
             Self::Pwa => BrowserToolAccess::Read,
-            Self::Click
+            Self::Navigate
+            | Self::Click
             | Self::Type
             | Self::Press
             | Self::Scroll
@@ -213,7 +209,7 @@ impl BrowserCapabilitySnapshot {
         &self,
         catalog_revision: u64,
         tool: BrowserToolKind,
-        _requested_access: BrowserToolAccess,
+        requested_access: BrowserToolAccess,
     ) -> Result<(), BrowserCapabilityRejection> {
         if catalog_revision != self.revision {
             return Err(BrowserCapabilityRejection::SnapshotRevisionMismatch {
@@ -227,7 +223,24 @@ impl BrowserCapabilitySnapshot {
         if !self.allows_catalog_tool(tool) {
             return Err(BrowserCapabilityRejection::ToolNotVisible { tool });
         }
+        let catalog_access = tool.catalog_access();
+        if !catalog_access.allows(requested_access) {
+            return Err(BrowserCapabilityRejection::AccessNotAllowed {
+                tool,
+                requested_access,
+                catalog_access,
+            });
+        }
         Ok(())
+    }
+}
+
+impl BrowserToolAccess {
+    fn allows(self, requested: Self) -> bool {
+        matches!(
+            (self, requested),
+            (Self::Mixed, _) | (Self::Read, Self::Read) | (Self::Write, Self::Write)
+        )
     }
 }
 
@@ -244,4 +257,72 @@ pub enum BrowserCapabilityRejection {
     Unavailable(BrowserCapabilityUnavailableReason),
     #[error("browser tool is not visible in this capability snapshot: {tool:?}")]
     ToolNotVisible { tool: BrowserToolKind },
+    #[error(
+        "browser tool access is not allowed: tool={tool:?}, requested={requested_access:?}, catalog={catalog_access:?}"
+    )]
+    AccessNotAllowed {
+        tool: BrowserToolKind,
+        requested_access: BrowserToolAccess,
+        catalog_access: BrowserToolAccess,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready_snapshot() -> BrowserCapabilitySnapshot {
+        BrowserCapabilitySnapshot {
+            revision: 1,
+            in_app_browser_enabled: true,
+            browser_use_enabled: true,
+            host_status: BrowserHostStatus::Ready,
+            host_protocol_compatible: true,
+            access_profile: AccessProfile::default(),
+        }
+    }
+
+    #[test]
+    fn read_only_pwa_cannot_be_called_with_write_action() {
+        let snapshot = ready_snapshot();
+        let error = snapshot
+            .allows_execution(1, BrowserToolKind::Pwa, BrowserToolAccess::Write)
+            .expect_err("PWA write operations are not part of the exposed capability");
+        assert!(matches!(
+            error,
+            BrowserCapabilityRejection::AccessNotAllowed {
+                tool: BrowserToolKind::Pwa,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mixed_diagnostic_tools_allow_both_read_and_write_actions() {
+        let snapshot = ready_snapshot();
+        for tool in [BrowserToolKind::Heap, BrowserToolKind::ThirdParty] {
+            snapshot
+                .allows_execution(1, tool, BrowserToolAccess::Read)
+                .expect("diagnostic reads should be allowed");
+            snapshot
+                .allows_execution(1, tool, BrowserToolAccess::Write)
+                .expect("diagnostic state changes should be allowed");
+        }
+    }
+
+    #[test]
+    fn navigation_is_write_and_read_only_tools_remain_read_only() {
+        let snapshot = ready_snapshot();
+        snapshot
+            .allows_execution(1, BrowserToolKind::Navigate, BrowserToolAccess::Write)
+            .expect("navigation should be a write operation");
+        snapshot
+            .allows_execution(1, BrowserToolKind::Snapshot, BrowserToolAccess::Read)
+            .expect("snapshot should be a read operation");
+        assert!(
+            snapshot
+                .allows_execution(1, BrowserToolKind::Snapshot, BrowserToolAccess::Write)
+                .is_err()
+        );
+    }
 }

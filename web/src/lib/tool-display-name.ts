@@ -52,6 +52,7 @@ const TOOL_DISPLAY_NAME_KEYS: Record<string, string> = {
   browser_pwa: 'toolCall.displayName.browserPwa',
   diagram_render: 'toolCall.displayName.diagramRender',
   knowledge_query: 'toolCall.displayName.knowledgeQuery',
+  knowledge_graph_query: 'toolCall.displayName.knowledgeGraphQuery',
   code_symbols: 'toolCall.displayName.codeSymbols',
   tool_catalog: 'toolCall.displayName.toolCatalog',
   agent_spawn: 'toolCall.displayName.agentSpawn',

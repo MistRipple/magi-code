@@ -5,7 +5,8 @@ use axum::{
 };
 use magi_core::{DomainError, UtcMillis, WorkspaceId};
 use magi_knowledge_store::{
-    KnowledgeKind, KnowledgeQuery, KnowledgeRecord,
+    GraphDirection, GraphEdgeKind, GraphEdgeOrigin, GraphEdgeStatus, GraphNodeKind, GraphNodeRef,
+    GraphQuery, KnowledgeKind, KnowledgeQuery, KnowledgeRecord, KnowledgeRelation,
     code_scanner::{
         CodeIndexScanOutcome, CodeIndexScanStatus, CodeIndexSummary, workspace_root_scan_failure,
     },
@@ -17,11 +18,24 @@ use std::{
 };
 
 use super::session_scope;
-use crate::{errors::ApiError, state::ApiState};
+use crate::{dto::SessionScopeKindDto, errors::ApiError, state::ApiState};
 
 pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/knowledge", get(get_project_knowledge))
+        .route("/knowledge/graph", get(get_knowledge_graph))
+        .route(
+            "/knowledge/relations",
+            get(list_knowledge_relations).post(add_knowledge_relation),
+        )
+        .route(
+            "/knowledge/relations/update",
+            post(update_knowledge_relation),
+        )
+        .route(
+            "/knowledge/relations/delete",
+            post(delete_knowledge_relation),
+        )
         .route("/knowledge/reindex", post(reindex_knowledge))
         .route("/knowledge/clear", post(clear_knowledge))
         .route(
@@ -35,6 +49,8 @@ pub fn routes() -> Router<ApiState> {
 
 const MIN_LEARNING_CONTENT_LENGTH: usize = 12;
 const MAX_TAGS: usize = 8;
+const DEFAULT_KNOWLEDGE_RELATION_LIMIT: usize = 1_000;
+const MAX_KNOWLEDGE_RELATION_LIMIT: usize = 1_000;
 static KNOWLEDGE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -175,10 +191,25 @@ fn new_knowledge_id(prefix: &str) -> String {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct KnowledgeWorkspaceRequest {
+    #[serde(rename = "scope", default)]
+    _scope: Option<SessionScopeKindDto>,
     #[serde(default)]
     workspace_id: Option<String>,
     #[serde(default)]
     workspace_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KnowledgeRelationsQuery {
+    #[serde(rename = "scope", default)]
+    _scope: Option<SessionScopeKindDto>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    workspace_path: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 async fn clear_knowledge(
@@ -198,6 +229,8 @@ async fn clear_knowledge(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct KnowledgeItemsQuery {
+    #[serde(rename = "scope", default)]
+    _scope: Option<SessionScopeKindDto>,
     kind: Option<KnowledgeKindParam>,
     #[serde(default)]
     workspace_id: Option<String>,
@@ -238,12 +271,375 @@ async fn list_knowledge_items(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct KnowledgeSearchQuery {
+    #[serde(rename = "scope", default)]
+    _scope: Option<SessionScopeKindDto>,
     kind: Option<KnowledgeKindParam>,
     #[serde(default)]
     workspace_id: Option<String>,
     #[serde(default)]
     workspace_path: Option<String>,
     q: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KnowledgeGraphQuery {
+    #[serde(rename = "scope", default)]
+    _scope: Option<SessionScopeKindDto>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    workspace_path: Option<String>,
+    #[serde(default)]
+    focus: Option<String>,
+    #[serde(default)]
+    depth: Option<usize>,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    node_kinds: Option<String>,
+    #[serde(default)]
+    edge_kinds: Option<String>,
+    #[serde(default)]
+    max_nodes: Option<usize>,
+    #[serde(default)]
+    max_edges: Option<usize>,
+}
+
+fn parse_graph_csv<T>(
+    value: Option<&str>,
+    field: &str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<Vec<T>, ApiError> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            parse(item)
+                .ok_or_else(|| ApiError::InvalidInput(format!("{field} 包含不支持的值：{item}")))
+        })
+        .collect()
+}
+
+async fn get_knowledge_graph(
+    State(state): State<ApiState>,
+    Query(query): Query<KnowledgeGraphQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (workspace_id, workspace_path) = require_registered_workspace_binding(
+        &state,
+        query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
+    )?;
+    let load_state = ensure_workspace_code_index(&state, &workspace_id)?;
+    let node_kinds = parse_graph_csv(
+        query.node_kinds.as_deref(),
+        "nodeKinds",
+        GraphNodeKind::parse,
+    )?;
+    let edge_kinds = parse_graph_csv(
+        query.edge_kinds.as_deref(),
+        "edgeKinds",
+        GraphEdgeKind::parse,
+    )?;
+    let direction = match query.direction.as_deref() {
+        Some(value) => GraphDirection::parse(value)
+            .ok_or_else(|| ApiError::InvalidInput("direction 包含不支持的值".to_string()))?,
+        None => GraphDirection::default(),
+    };
+    let graph_query = GraphQuery {
+        focus: query.focus.filter(|value| !value.trim().is_empty()),
+        depth: query.depth.unwrap_or(1),
+        direction,
+        node_kinds,
+        edge_kinds,
+        max_nodes: query.max_nodes.unwrap_or(120),
+        max_edges: query.max_edges.unwrap_or(240),
+    };
+
+    let graph = graph_payload_for_workspace(&state, &workspace_id, &load_state, &graph_query)?;
+    let mut response = graph.as_object().cloned().ok_or_else(|| {
+        ApiError::internal_assembly("知识图谱响应无效", "graph payload is not an object")
+    })?;
+    response.insert(
+        "workspaceId".to_string(),
+        serde_json::json!(workspace_id.as_str()),
+    );
+    response.insert(
+        "workspacePath".to_string(),
+        serde_json::json!(workspace_path),
+    );
+    Ok(Json(serde_json::Value::Object(response)))
+}
+
+fn empty_graph_payload(status: &str, reason_code: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "status": status,
+        "reasonCode": reason_code,
+        "nodes": [],
+        "edges": [],
+        "stats": { "totalNodes": 0, "totalEdges": 0, "returnedNodes": 0, "returnedEdges": 0 },
+        "truncated": false,
+    })
+}
+
+fn graph_payload_for_workspace(
+    state: &ApiState,
+    workspace_id: &WorkspaceId,
+    load_state: &WorkspaceCodeIndexLoadState,
+    query: &magi_knowledge_store::GraphQuery,
+) -> Result<serde_json::Value, ApiError> {
+    let WorkspaceCodeIndexLoadState::Ready(outcome) = load_state else {
+        return Ok(empty_graph_payload("indexing", None));
+    };
+    if outcome.status != CodeIndexScanStatus::Indexed {
+        return Ok(empty_graph_payload(
+            outcome.status.as_str(),
+            outcome.reason_code.as_ref().map(|reason| reason.as_str()),
+        ));
+    }
+    let graph = state
+        .knowledge_store
+        .query_workspace_graph(workspace_id, query)
+        .ok_or_else(|| {
+            ApiError::internal_assembly("知识图谱索引不可用", "workspace graph index missing")
+        })?;
+    Ok(serde_json::json!({
+        "status": "ready",
+        "reasonCode": serde_json::Value::Null,
+        "nodes": graph.nodes,
+        "edges": graph.edges,
+        "stats": graph.stats,
+        "truncated": graph.truncated,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KnowledgeRelationRequest {
+    #[serde(rename = "scope", default)]
+    _scope: Option<SessionScopeKindDto>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    workspace_path: Option<String>,
+    relation_id: Option<String>,
+    source: GraphNodeRef,
+    kind: GraphEdgeKind,
+    target: GraphNodeRef,
+    #[serde(default)]
+    origin: Option<GraphEdgeOrigin>,
+    #[serde(default)]
+    confidence: Option<f32>,
+    #[serde(default)]
+    status: Option<GraphEdgeStatus>,
+    #[serde(default)]
+    evidence: Vec<String>,
+}
+
+fn relation_json(relation: &KnowledgeRelation) -> serde_json::Value {
+    serde_json::to_value(relation).expect("knowledge relation should serialize")
+}
+
+fn relation_from_request(
+    request: KnowledgeRelationRequest,
+    workspace_id: WorkspaceId,
+    existing: Option<&KnowledgeRelation>,
+) -> Result<KnowledgeRelation, ApiError> {
+    let now = UtcMillis::now();
+    let relation_id = request
+        .relation_id
+        .or_else(|| existing.map(|relation| relation.relation_id.clone()))
+        .unwrap_or_else(|| {
+            format!(
+                "relation-{}-{}",
+                now.0,
+                KNOWLEDGE_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
+            )
+        });
+    let origin = request.origin.unwrap_or(GraphEdgeOrigin::ExplicitUser);
+    let status = request.status.unwrap_or(GraphEdgeStatus::Active);
+    if origin == GraphEdgeOrigin::Inferred
+        && !matches!(
+            existing.map(|relation| relation.origin),
+            Some(GraphEdgeOrigin::Inferred)
+        )
+    {
+        return Err(ApiError::InvalidInput(
+            "自动推断关系只能由系统生成并通过待审阅流程更新".to_string(),
+        ));
+    }
+    let reviewed_at = if status == GraphEdgeStatus::Candidate {
+        None
+    } else {
+        existing
+            .and_then(|relation| relation.reviewed_at)
+            .or_else(|| (origin == GraphEdgeOrigin::Inferred).then_some(now))
+    };
+    Ok(KnowledgeRelation {
+        relation_id,
+        workspace_id,
+        source: request.source,
+        kind: request.kind,
+        target: request.target,
+        origin,
+        confidence: request.confidence,
+        status,
+        evidence: request.evidence,
+        discovery_key: existing.and_then(|relation| relation.discovery_key.clone()),
+        discovery_evidence: existing.and_then(|relation| relation.discovery_evidence.clone()),
+        reviewed_at,
+        created_at: existing.map(|relation| relation.created_at).unwrap_or(now),
+        updated_at: now,
+    })
+}
+
+async fn list_knowledge_relations(
+    State(state): State<ApiState>,
+    Query(query): Query<KnowledgeRelationsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (workspace_id, workspace_path) = require_registered_workspace_binding(
+        &state,
+        query.workspace_id.as_deref(),
+        query.workspace_path.as_deref(),
+    )?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_KNOWLEDGE_RELATION_LIMIT)
+        .clamp(1, MAX_KNOWLEDGE_RELATION_LIMIT);
+    let mut relations = state.knowledge_store.list_relations(&workspace_id);
+    let total_relations = relations.len();
+    relations.sort_by(|left, right| {
+        relation_status_priority(left.status)
+            .cmp(&relation_status_priority(right.status))
+            .then_with(|| {
+                right
+                    .confidence
+                    .unwrap_or_default()
+                    .total_cmp(&left.confidence.unwrap_or_default())
+            })
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.relation_id.cmp(&right.relation_id))
+    });
+    relations.truncate(limit);
+    Ok(Json(serde_json::json!({
+        "workspaceId": workspace_id.as_str(),
+        "workspacePath": workspace_path,
+        "relations": relations.iter().map(relation_json).collect::<Vec<_>>(),
+        "totalRelations": total_relations,
+        "truncated": total_relations > limit,
+    })))
+}
+
+fn relation_status_priority(status: GraphEdgeStatus) -> u8 {
+    match status {
+        GraphEdgeStatus::Candidate => 0,
+        GraphEdgeStatus::Dangling => 1,
+        GraphEdgeStatus::Active => 2,
+        GraphEdgeStatus::Rejected => 3,
+    }
+}
+
+async fn add_knowledge_relation(
+    State(state): State<ApiState>,
+    Json(request): Json<KnowledgeRelationRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (workspace_id, workspace_path) = require_registered_workspace_binding(
+        &state,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+    )?;
+    let relation = relation_from_request(request, workspace_id.clone(), None)?;
+    state
+        .knowledge_store
+        .upsert_relation(relation.clone())
+        .map_err(map_relation_error)?;
+    state.persist_knowledge_state_for_api()?;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "workspaceId": workspace_id.as_str(),
+        "workspacePath": workspace_path,
+        "relation": relation_json(&relation),
+    })))
+}
+
+async fn update_knowledge_relation(
+    State(state): State<ApiState>,
+    Json(request): Json<KnowledgeRelationRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (workspace_id, workspace_path) = require_registered_workspace_binding(
+        &state,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+    )?;
+    let relation_id = request
+        .relation_id
+        .as_deref()
+        .ok_or_else(|| ApiError::InvalidInput("relationId 不能为空".to_string()))?;
+    let existing = state
+        .knowledge_store
+        .relation(relation_id, &workspace_id)
+        .ok_or_else(|| ApiError::not_found("关系不存在", relation_id))?;
+    let relation = relation_from_request(request, workspace_id.clone(), Some(&existing))?;
+    state
+        .knowledge_store
+        .replace_relation(relation.clone(), &workspace_id)
+        .map_err(map_relation_error)?;
+    state.persist_knowledge_state_for_api()?;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "workspaceId": workspace_id.as_str(),
+        "workspacePath": workspace_path,
+        "relation": relation_json(&relation),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeleteKnowledgeRelationRequest {
+    #[serde(rename = "scope", default)]
+    _scope: Option<SessionScopeKindDto>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    workspace_path: Option<String>,
+    relation_id: String,
+}
+
+async fn delete_knowledge_relation(
+    State(state): State<ApiState>,
+    Json(request): Json<DeleteKnowledgeRelationRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (workspace_id, workspace_path) = require_registered_workspace_binding(
+        &state,
+        request.workspace_id.as_deref(),
+        request.workspace_path.as_deref(),
+    )?;
+    state
+        .knowledge_store
+        .delete_relation_in_workspace(&request.relation_id, &workspace_id)
+        .map_err(map_relation_error)?;
+    state.persist_knowledge_state_for_api()?;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "workspaceId": workspace_id.as_str(),
+        "workspacePath": workspace_path,
+        "relationId": request.relation_id,
+    })))
+}
+
+fn map_relation_error(error: DomainError) -> ApiError {
+    match error {
+        DomainError::NotFound {
+            entity: "knowledge",
+        } => ApiError::NotFound("关系引用的知识记录不存在".to_string()),
+        DomainError::NotFound { .. } => ApiError::NotFound("关系不存在".to_string()),
+        DomainError::InvalidState { message } | DomainError::Validation { message } => {
+            ApiError::InvalidInput(message)
+        }
+        other => ApiError::internal_assembly("知识关系操作失败", other),
+    }
 }
 
 async fn search_knowledge_items(
@@ -330,12 +726,20 @@ async fn get_project_knowledge(
         })
         .unwrap_or(serde_json::Value::Null);
 
+    let graph = graph_payload_for_workspace(
+        &state,
+        &workspace_id,
+        &index_load_state,
+        &magi_knowledge_store::GraphQuery::default(),
+    )?;
+
     Ok(Json(serde_json::json!({
         "workspaceId": workspace_id.as_str(),
         "workspacePath": workspace_path,
         "items": items,
         "codeIndex": code_index,
         "codeIndexStatus": code_index_status,
+        "graph": graph,
     })))
 }
 
@@ -773,6 +1177,211 @@ mod tests {
         assert_workspace_binding(&payload, &workspace_a);
         assert_eq!(payload["codeIndex"]["files"][0]["path"], "src/a.rs");
         assert!(payload["items"].is_array(), "items 字段必须存在且为数组");
+    }
+
+    #[tokio::test]
+    async fn knowledge_graph_is_workspace_scoped_and_supports_query_limits() {
+        let state = state_with_knowledge_store(KnowledgeStore::new());
+        let workspace_a = WorkspaceId::new("workspace-graph-a");
+        let workspace_b = WorkspaceId::new("workspace-graph-b");
+        let root_a = register_test_workspace(&state, &workspace_a);
+        let root_b = register_test_workspace(&state, &workspace_b);
+        fs::create_dir_all(root_a.join("src")).expect("workspace a source dir should create");
+        fs::create_dir_all(root_b.join("src")).expect("workspace b source dir should create");
+        fs::write(
+            root_a.join("src/a.ts"),
+            "import { beta } from './b';\nexport function alpha() { return beta(); }\n",
+        )
+        .expect("workspace a entry source should write");
+        fs::write(
+            root_a.join("src/b.ts"),
+            "export function beta() { return 1; }\n",
+        )
+        .expect("workspace a dependency source should write");
+        fs::write(
+            root_b.join("src/other.ts"),
+            "export function other() { return 2; }\n",
+        )
+        .expect("workspace b source should write");
+
+        let first_response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/knowledge/graph?workspaceId=workspace-graph-a")
+                    .body(Body::empty())
+                    .expect("graph request should build"),
+            )
+            .await
+            .expect("graph route should respond");
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_payload = read_json(first_response).await;
+        assert_eq!(first_payload["status"], "indexing");
+
+        wait_for_index_build(&state, &workspace_a).await;
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/knowledge/graph?workspaceId=workspace-graph-a&focus=file:src/a.ts&depth=1&direction=forward&maxNodes=1&maxEdges=1")
+                    .body(Body::empty())
+                    .expect("bounded graph request should build"),
+            )
+            .await
+            .expect("bounded graph route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = read_json(response).await;
+        assert_workspace_binding(&payload, &workspace_a);
+        assert_eq!(payload["status"], "ready");
+        assert_eq!(payload["nodes"].as_array().map(Vec::len), Some(1));
+        assert_eq!(payload["edges"].as_array().map(Vec::len), Some(0));
+        assert_eq!(payload["truncated"], true);
+        let node_ids = payload["nodes"]
+            .as_array()
+            .expect("graph nodes should be an array")
+            .iter()
+            .filter_map(|node| node["id"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            node_ids.iter().all(|id| !id.contains("workspace-graph-b")),
+            "graph must not expose another workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn knowledge_relation_routes_round_trip_with_workspace_scope() {
+        let state = state_with_knowledge_store(KnowledgeStore::new());
+        let workspace_id = WorkspaceId::new("workspace-relation-api");
+        let root = register_test_workspace(&state, &workspace_id);
+        state.knowledge_store.upsert(KnowledgeRecord {
+            knowledge_id: "adr-relation-api".into(),
+            kind: KnowledgeKind::Adr,
+            title: "Relation API".into(),
+            content: "API relation test".into(),
+            tags: Vec::new(),
+            workspace_id: Some(workspace_id.clone()),
+            source_ref: None,
+            created_at: UtcMillis(1),
+            updated_at: UtcMillis(1),
+        });
+
+        let create_response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/knowledge/relations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "scope": "workspace",
+                            "workspaceId": workspace_id.as_str(),
+                            "workspacePath": root.to_string_lossy(),
+                            "source": { "kind": "knowledge", "knowledgeId": "adr-relation-api" },
+                            "kind": "applies_to",
+                            "target": { "kind": "file", "path": "src/feature.ts" },
+                            "origin": "explicit_user",
+                            "confidence": 0.9,
+                            "evidence": ["manual association"],
+                        })
+                        .to_string(),
+                    ))
+                    .expect("relation create request should build"),
+            )
+            .await
+            .expect("relation create route should respond");
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_payload = read_json(create_response).await;
+        let relation_id = create_payload["relation"]["relationId"]
+            .as_str()
+            .expect("created relation should have an id")
+            .to_string();
+        assert_eq!(
+            create_payload["relation"]["source"]["knowledgeId"],
+            "adr-relation-api"
+        );
+
+        let list_response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/knowledge/relations?scope=workspace&workspaceId={}&workspacePath={}",
+                        workspace_id.as_str(),
+                        root.to_string_lossy()
+                    ))
+                    .body(Body::empty())
+                    .expect("relation list request should build"),
+            )
+            .await
+            .expect("relation list route should respond");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_payload = read_json(list_response).await;
+        assert_eq!(list_payload["relations"].as_array().map(Vec::len), Some(1));
+
+        let update_response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/knowledge/relations/update")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "scope": "workspace",
+                            "workspaceId": workspace_id.as_str(),
+                            "workspacePath": root.to_string_lossy(),
+                            "relationId": relation_id,
+                            "source": { "kind": "knowledge", "knowledgeId": "adr-relation-api" },
+                            "kind": "references",
+                            "target": {
+                                "kind": "symbol",
+                                "path": "src/feature.ts",
+                                "qualifiedName": "feature",
+                                "symbolKind": "function"
+                            },
+                            "origin": "explicit_user",
+                            "status": "active",
+                            "confidence": 1.0,
+                            "evidence": ["updated"],
+                        })
+                        .to_string(),
+                    ))
+                    .expect("relation update request should build"),
+            )
+            .await
+            .expect("relation update route should respond");
+        assert_eq!(update_response.status(), StatusCode::OK);
+        let update_payload = read_json(update_response).await;
+        assert_eq!(update_payload["relation"]["kind"], "references");
+
+        let delete_response = routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/knowledge/relations/delete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "scope": "workspace",
+                            "workspaceId": workspace_id.as_str(),
+                            "workspacePath": root.to_string_lossy(),
+                            "relationId": relation_id,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("relation delete request should build"),
+            )
+            .await
+            .expect("relation delete route should respond");
+        assert_eq!(delete_response.status(), StatusCode::OK);
+        assert!(
+            state
+                .knowledge_store
+                .list_relations(&workspace_id)
+                .is_empty()
+        );
     }
 
     #[tokio::test]

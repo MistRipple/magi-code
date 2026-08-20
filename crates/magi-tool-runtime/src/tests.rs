@@ -5175,6 +5175,87 @@ fn knowledge_query_uses_business_chinese_recall_and_typed_fields() {
 }
 
 #[test]
+fn knowledge_graph_query_returns_scoped_candidates_and_requires_focus() {
+    let root = unique_temp_dir("magi-tool-knowledge-graph");
+    fs::create_dir_all(root.join("src")).expect("create source directory");
+    fs::write(
+        root.join("src/feature_relation.rs"),
+        "pub fn feature_relation_probe() -> bool { true }\n",
+    )
+    .expect("write source");
+    let workspace_id = WorkspaceId::new("workspace-knowledge-graph-query");
+    let store = Arc::new(magi_knowledge_store::KnowledgeStore::new());
+    store.upsert(magi_knowledge_store::KnowledgeRecord {
+        knowledge_id: "faq-feature-relation".to_string(),
+        kind: magi_knowledge_store::KnowledgeKind::Faq,
+        title: "Feature relation".to_string(),
+        content: "This FAQ describes the feature relation implementation.".to_string(),
+        tags: vec!["feature".to_string()],
+        workspace_id: Some(workspace_id.clone()),
+        source_ref: None,
+        created_at: UtcMillis(100),
+        updated_at: UtcMillis(100),
+    });
+
+    let governance = Arc::new(GovernanceService::default());
+    let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(16));
+    let mut registry = ToolRegistry::new(governance, event_bus).with_knowledge_store(store);
+    registry.register_default_builtins();
+
+    let output = registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-knowledge-graph-query"),
+            tool_name: BuiltinToolName::KnowledgeGraphQuery.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: serde_json::json!({
+                "focus": "knowledge:faq-feature-relation",
+                "depth": 1,
+                "max_nodes": 20,
+                "max_edges": 20,
+            })
+            .to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        ToolExecutionContext {
+            workspace_id: Some(workspace_id.clone()),
+            working_directory: Some(root.clone()),
+            ..ToolExecutionContext::default()
+        },
+        &ToolExecutionPolicy::default(),
+    );
+    assert_eq!(output.status, ExecutionResultStatus::Succeeded);
+    let payload: Value = serde_json::from_str(&output.payload).expect("graph payload json");
+    assert_eq!(payload["tool"], "knowledge_graph_query");
+    assert_eq!(payload["workspace_id"], workspace_id.as_str());
+    assert_eq!(payload["focus"], "knowledge:faq-feature-relation");
+    assert!(
+        payload["edges"]
+            .as_array()
+            .expect("edges")
+            .iter()
+            .any(|edge| edge["origin"] == "inferred" && edge["status"] == "candidate")
+    );
+    assert!(payload["candidate_edges"].as_u64().unwrap_or(0) > 0);
+
+    let missing_focus = registry.execute_with_policy(
+        ToolExecutionInput {
+            tool_call_id: ToolCallId::new("tool-call-knowledge-graph-query-missing-focus"),
+            tool_name: BuiltinToolName::KnowledgeGraphQuery.as_str().to_string(),
+            tool_kind: ToolKind::Builtin,
+            input: "{}".to_string(),
+            approval_requirement: ApprovalRequirement::None,
+            risk_level: RiskLevel::Low,
+        },
+        ToolExecutionContext::default(),
+        &ToolExecutionPolicy::default(),
+    );
+    assert_eq!(missing_focus.status, ExecutionResultStatus::Failed);
+    assert!(missing_focus.payload.contains("缺少 focus 字段"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn skill_apply_is_not_registered_as_builtin() {
     let registry = make_registry();
     assert!(registry.builtin_access_mode("skill_apply").is_none());
@@ -5489,6 +5570,7 @@ fn public_builtin_specs_exclude_shell_internal_process_tools() {
             "diagram_render",
             "image_generate",
             "knowledge_query",
+            "knowledge_graph_query",
             "code_symbols",
             "tool_catalog",
             "git_status",

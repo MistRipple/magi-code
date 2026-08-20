@@ -213,6 +213,9 @@ impl BuiltinTool for NormalizedBuiltinTool {
             }
             BuiltinToolName::DiagramRender => execute_diagram_render(input),
             BuiltinToolName::KnowledgeQuery => execute_knowledge_query(input, context, resources),
+            BuiltinToolName::KnowledgeGraphQuery => {
+                execute_knowledge_graph_query(input, context, resources)
+            }
             BuiltinToolName::CodeSymbols => execute_code_symbols(input, context, resources),
             BuiltinToolName::ToolCatalog => execute_tool_catalog(input, context, resources),
             BuiltinToolName::GitStatus
@@ -4236,6 +4239,274 @@ fn execute_knowledge_query(
         "summary": format!("在当前工作区知识库中搜索 \"{}\"，返回 {} 个匹配项", query, results.len())
     })
     .to_string()
+}
+
+fn execute_knowledge_graph_query(
+    input: &str,
+    context: &ToolExecutionContext,
+    resources: &ToolRuntimeResources,
+) -> String {
+    let request = parse_json_object(input);
+    let focus = match required_string_field(
+        request.as_ref(),
+        &["focus"],
+        "knowledge_graph_query",
+        "缺少 focus 字段",
+    ) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let Some(store) = resources.knowledge_store.as_ref() else {
+        return builtin_error("knowledge_graph_query", "知识库不可用");
+    };
+    let Some(workspace_id) = context.workspace_id.as_ref() else {
+        return builtin_error(
+            "knowledge_graph_query",
+            "缺少 workspace 上下文，无法查询知识图谱",
+        );
+    };
+    let Some(workspace_root) = context.working_directory.as_deref() else {
+        return builtin_error(
+            "knowledge_graph_query",
+            "缺少工作区路径，无法初始化知识图谱索引",
+        );
+    };
+
+    match store.ensure_workspace_index_available(
+        workspace_id,
+        workspace_root,
+        Duration::from_secs(15),
+    ) {
+        magi_knowledge_store::WorkspaceIndexEnsureResult::Ready => {}
+        magi_knowledge_store::WorkspaceIndexEnsureResult::TimedOut => {
+            return builtin_error_with_code(
+                "knowledge_graph_query",
+                "knowledge_graph_query_index_building",
+                "代码索引正在构建，请稍后重试",
+            );
+        }
+        magi_knowledge_store::WorkspaceIndexEnsureResult::Failed { reason_code } => {
+            let reason = reason_code
+                .map(|code| format!("代码索引构建失败：{}", code.as_str()))
+                .unwrap_or_else(|| "代码索引构建失败，无法查询知识图谱".to_string());
+            return builtin_error_with_code(
+                "knowledge_graph_query",
+                "knowledge_graph_query_index_failed",
+                reason,
+            );
+        }
+    }
+
+    let direction = match request
+        .as_ref()
+        .and_then(|object| field_string(object, &["direction"]))
+    {
+        Some(value) => match magi_knowledge_store::GraphDirection::parse(&value) {
+            Some(direction) => direction,
+            None => {
+                return builtin_error(
+                    "knowledge_graph_query",
+                    "direction 仅支持 forward、reverse 或 both",
+                );
+            }
+        },
+        None => magi_knowledge_store::GraphDirection::Both,
+    };
+    let node_kinds = match parse_graph_node_kinds(request.as_ref()) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let edge_kinds = match parse_graph_edge_kinds(request.as_ref()) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let depth = request
+        .as_ref()
+        .and_then(|object| field_usize(object, &["depth"]))
+        .unwrap_or(1)
+        .min(2);
+    let max_nodes = request
+        .as_ref()
+        .and_then(|object| field_usize(object, &["max_nodes"]))
+        .unwrap_or(40)
+        .clamp(1, 80);
+    let max_edges = request
+        .as_ref()
+        .and_then(|object| field_usize(object, &["max_edges"]))
+        .unwrap_or(80)
+        .clamp(1, 160);
+    let max_context_tokens = request
+        .as_ref()
+        .and_then(|object| field_usize(object, &["max_context_tokens"]))
+        .unwrap_or(4_000)
+        .clamp(256, 8_000);
+
+    let graph_query = magi_knowledge_store::GraphQuery {
+        focus: Some(focus.clone()),
+        depth,
+        direction,
+        node_kinds,
+        edge_kinds,
+        max_nodes,
+        max_edges,
+    };
+    let Some(graph) = store.query_workspace_graph(workspace_id, &graph_query) else {
+        return builtin_error_with_code(
+            "knowledge_graph_query",
+            "knowledge_graph_query_index_invalid_state",
+            "知识图谱索引状态异常，请重新构建索引",
+        );
+    };
+    let graph = limit_graph_context(graph, &focus, max_context_tokens);
+    let candidate_edges = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.status == magi_knowledge_store::GraphEdgeStatus::Candidate)
+        .count();
+    let determined_edges = graph
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.status == magi_knowledge_store::GraphEdgeStatus::Active
+                && edge.origin != magi_knowledge_store::GraphEdgeOrigin::Inferred
+        })
+        .count();
+    let returned_nodes = graph.stats.returned_nodes;
+    let returned_edges = graph.stats.returned_edges;
+
+    serde_json::json!({
+        "tool": "knowledge_graph_query",
+        "status": "succeeded",
+        "access_mode": BuiltinToolAccessMode::ReadOnly.as_str(),
+        "workspace_id": workspace_id.as_str(),
+        "focus": focus,
+        "depth": depth,
+        "direction": direction,
+        "candidate_edges": candidate_edges,
+        "determined_edges": determined_edges,
+        "nodes": graph.nodes,
+        "edges": graph.edges,
+        "stats": graph.stats,
+        "truncated": graph.truncated,
+        "summary": format!("读取焦点 {} 的知识图谱邻居，返回 {} 个节点和 {} 条关系", focus, returned_nodes, returned_edges)
+    })
+    .to_string()
+}
+
+fn parse_graph_node_kinds(
+    request: Option<&serde_json::Map<String, Value>>,
+) -> Result<Vec<magi_knowledge_store::GraphNodeKind>, String> {
+    parse_graph_kind_array(
+        request,
+        "node_kinds",
+        magi_knowledge_store::GraphNodeKind::parse,
+        "node_kinds",
+    )
+}
+
+fn parse_graph_edge_kinds(
+    request: Option<&serde_json::Map<String, Value>>,
+) -> Result<Vec<magi_knowledge_store::GraphEdgeKind>, String> {
+    parse_graph_kind_array(
+        request,
+        "edge_kinds",
+        magi_knowledge_store::GraphEdgeKind::parse,
+        "edge_kinds",
+    )
+}
+
+fn parse_graph_kind_array<T>(
+    request: Option<&serde_json::Map<String, Value>>,
+    field: &str,
+    parse: fn(&str) -> Option<T>,
+    label: &str,
+) -> Result<Vec<T>, String>
+where
+    T: PartialEq,
+{
+    let Some(values) = request.and_then(|object| object.get(field)) else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = values.as_array() else {
+        return Err(builtin_error(
+            "knowledge_graph_query",
+            format!("{label} 必须是字符串数组"),
+        ));
+    };
+    let mut result = Vec::new();
+    for value in values {
+        let Some(value) = value.as_str() else {
+            return Err(builtin_error(
+                "knowledge_graph_query",
+                format!("{label} 必须只包含字符串"),
+            ));
+        };
+        let Some(parsed) = parse(value) else {
+            return Err(builtin_error(
+                "knowledge_graph_query",
+                format!("{label} 包含不支持的值：{value}"),
+            ));
+        };
+        if !result.iter().any(|item| item == &parsed) {
+            result.push(parsed);
+        }
+    }
+    Ok(result)
+}
+
+fn limit_graph_context(
+    mut graph: magi_knowledge_store::KnowledgeGraph,
+    focus: &str,
+    max_context_tokens: usize,
+) -> magi_knowledge_store::KnowledgeGraph {
+    let original_nodes = graph.nodes.len();
+    let original_edges = graph.edges.len();
+    let mut ordered_nodes = Vec::with_capacity(original_nodes);
+    if let Some(index) = graph.nodes.iter().position(|node| node.id == focus) {
+        ordered_nodes.push(graph.nodes[index].clone());
+    }
+    ordered_nodes.extend(graph.nodes.iter().filter(|node| node.id != focus).cloned());
+
+    let mut used_tokens = 0usize;
+    let mut kept_nodes = Vec::new();
+    for node in ordered_nodes {
+        let cost = estimated_json_tokens(&node);
+        if !kept_nodes.is_empty() && used_tokens.saturating_add(cost) > max_context_tokens {
+            break;
+        }
+        used_tokens = used_tokens.saturating_add(cost);
+        kept_nodes.push(node);
+    }
+    let kept_ids = kept_nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut kept_edges = Vec::new();
+    for edge in graph.edges {
+        if !kept_ids.contains(edge.source.as_str()) || !kept_ids.contains(edge.target.as_str()) {
+            continue;
+        }
+        let cost = estimated_json_tokens(&edge);
+        if !kept_edges.is_empty() && used_tokens.saturating_add(cost) > max_context_tokens {
+            break;
+        }
+        used_tokens = used_tokens.saturating_add(cost);
+        kept_edges.push(edge);
+    }
+    graph.nodes = kept_nodes;
+    graph.edges = kept_edges;
+    graph.stats.returned_nodes = graph.nodes.len();
+    graph.stats.returned_edges = graph.edges.len();
+    graph.truncated = graph.truncated
+        || original_nodes != graph.nodes.len()
+        || original_edges != graph.edges.len();
+    graph
+}
+
+fn estimated_json_tokens<T: serde::Serialize>(value: &T) -> usize {
+    serde_json::to_string(value)
+        .map(|value| (value.len() / 4).max(1))
+        .unwrap_or(64)
 }
 
 fn parse_knowledge_kind(

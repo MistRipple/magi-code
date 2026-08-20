@@ -71,6 +71,7 @@ const TRANSPARENT_VIEW_BACKGROUND = "rgba(0, 0, 0, 0)";
 export class DesktopOverlayManager {
   readonly #preloadPath: string;
   readonly #agentOrigin: string;
+  readonly #desktopEpoch: string;
   readonly #records = new Map<string, OverlayRecord>();
   readonly #onAction: (windowId: string, action: DesktopOverlayAction) => void;
   readonly #onClosed: (windowId: string) => void;
@@ -78,11 +79,13 @@ export class DesktopOverlayManager {
   constructor(input: {
     preloadPath: string;
     agentOrigin: string;
+    desktopEpoch: string;
     onAction: (windowId: string, action: DesktopOverlayAction) => void;
     onClosed: (windowId: string) => void;
   }) {
     this.#preloadPath = input.preloadPath;
     this.#agentOrigin = input.agentOrigin;
+    this.#desktopEpoch = input.desktopEpoch;
     this.#onAction = input.onAction;
     this.#onClosed = input.onClosed;
   }
@@ -268,10 +271,16 @@ export class DesktopOverlayManager {
     ) {
       return;
     }
+    const shouldCloseBeforeDispatch = (
+      action.interaction === "select"
+      && !(state.kind === "annotation" && action.id === "selection")
+    );
+    // 先收口原生 Overlay，再把选择事件交给 App Renderer。选择事件通常会
+    // 立即切换右栏 Tab、物化 Browser Surface 或重新布局窗口；如果先广播，
+    // 这些布局事务会与 Overlay 的关闭/卸载重入，导致菜单残留并继续拦截
+    // 鼠标和键盘输入。
+    if (shouldCloseBeforeDispatch) this.close(windowId);
     this.#onAction(windowId, action);
-    if (action.interaction === "select" && !(state.kind === "annotation" && action.id === "selection")) {
-      this.close(windowId);
-    }
   }
 
   isWebContents(webContentsId: number): boolean {
@@ -388,6 +397,9 @@ export class DesktopOverlayManager {
     const url = new URL("/web.html", this.#agentOrigin);
     url.searchParams.set("desktopSurface", "overlay");
     url.searchParams.set("desktopWindowId", windowId);
+    // Overlay Renderer 与 App Renderer 必须使用同一桌面启动代次，避免
+    // 持久化 partition 让弹层继续运行旧的前端代码。
+    url.searchParams.set("desktopEpoch", this.#desktopEpoch);
     return url.href;
   }
 
