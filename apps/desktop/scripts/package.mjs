@@ -9,7 +9,6 @@ if (unknownArgument) throw new Error(`不支持的打包参数: ${unknownArgumen
 const directoryOnly = arguments_.includes("--dir");
 const manifest = await buildDesktopRelease();
 const host = hostTarget();
-const requireCodeSigning = process.env.MAGI_REQUIRE_CODE_SIGNING === "1";
 const targets = host.platform.createTarget(
   directoryOnly ? ["dir"] : host.targets,
   host.arch,
@@ -28,9 +27,9 @@ const artifacts = await build({
       // 目录包用于本地验收，不能误启用 electron-updater。
       magiDistribution: directoryOnly ? "directory" : "release",
     },
-    // 未签名发行物不应尝试读取本机证书、提交公证或给 DMG 重新签名。
-    ...(!requireCodeSigning ? { mac: { notarize: false }, dmg: { sign: false } } : {}),
-    ...(requireCodeSigning ? { forceCodeSigning: true } : {}),
+    // 当前发行流程明确发布未签名安装包，不读取本机证书或提交公证。
+    mac: { notarize: false },
+    dmg: { sign: false },
   },
 });
 

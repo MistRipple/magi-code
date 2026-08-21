@@ -136,7 +136,6 @@ jobs:
       - name: 构建 Web、Worker、daemon、Electron 并组装安装包
         shell: bash
         env:
-          MAGI_REQUIRE_CODE_SIGNING: "0"
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run desktop:package
       - name: 真实启动解包 Desktop
@@ -185,7 +184,7 @@ jobs:
           cp apps/desktop/dist/resources/browser-capability-manifest.json "$output/Magi-${version}-${{ matrix.platform }}-browser-capability-manifest.json"
           cp apps/desktop/dist/resources/sbom/magi-desktop.cdx.json "$output/Magi-${version}-${{ matrix.platform }}.cdx.json"
           test "$(find "$output" -maxdepth 1 -type f | wc -l | tr -d ' ')" -ge 4
-      - name: 上传签名发行产物
+      - name: 上传未签名发行产物
         uses: actions/upload-artifact@v7
         with:
           name: magi-electron-${{ matrix.platform }}

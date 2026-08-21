@@ -33,9 +33,12 @@ assert.match(release, /verify-ci:[\s\S]*gh run list[\s\S]*--commit "\$GITHUB_SHA
 assert.match(release, /node scripts\/product-version\.mjs/, '发布必须读取 Cargo 产品版本');
 assert.match(release, /npm run desktop:package/, '发布必须通过 Electron workspace 构建单一桌面包');
 assert.match(release, /browser-capability-manifest\.json[\s\S]*magi-desktop\.cdx\.json/, '发布包必须包含能力清单和 SBOM');
-assert.match(release, /MACOS_CSC_LINK[\s\S]*APPLE_API_KEY_BASE64[\s\S]*notarytool submit[\s\S]*stapler validate/, 'macOS 必须强制 Developer ID 签名、公证和装订');
-assert.match(release, /WINDOWS_CSC_LINK[\s\S]*Get-AuthenticodeSignature[\s\S]*Status -ne "Valid"/, 'Windows 必须强制 Authenticode 签名验证');
-assert.match(release, /RELEASE_GPG_PRIVATE_KEY[\s\S]*--detach-sign[\s\S]*--verify/, '最终发行文件必须生成并验证真实 detached signature');
+assert.match(release, /CSC_IDENTITY_AUTO_DISCOVERY:\s*"false"/, '未签名发行必须关闭 macOS 证书自动发现');
+assert.doesNotMatch(
+  release,
+  /MACOS_CSC_LINK|APPLE_API_KEY|WINDOWS_CSC_LINK|Get-AuthenticodeSignature|RELEASE_GPG_PRIVATE_KEY|--detach-sign|notarytool|stapler validate/,
+  '未签名发行流程不得读取证书、执行公证、验证 Authenticode 或生成 GPG 签名',
+);
 assert.match(release, /actions\/attest-build-provenance@v3/, '最终发行文件必须生成 GitHub 构建来源证明');
 assert.match(release, /latest\.yml[\s\S]*latest-linux\.yml[\s\S]*latest-mac\.yml/, 'Electron 更新元数据必须覆盖三个桌面平台');
 assert.match(release, /make_latest:\s*true/, 'Desktop Release 必须显式成为 GitHub latest Release');
