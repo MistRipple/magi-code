@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = resolve(new URL("..", import.meta.url).pathname);
+const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
 const read = (path) => readFile(join(root, path), "utf8");
 const [workerSource, tabSource, inputSource, messageSource, browserRoutes, browserTools, controlSchema, overlayShell, overlayManager, desktopIndex, surfaceManager, windowManager, desktopControlServer] =
