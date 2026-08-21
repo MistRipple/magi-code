@@ -198,6 +198,8 @@ export async function run(command, args, cwd = repositoryRoot, options = {}) {
     const child = execFile(command, args, {
       cwd,
       env: { ...process.env, ...options.env },
+      // Windows 的 npm.cmd 不是可直接由 CreateProcess 启动的 PE 文件，必须交给 cmd.exe。
+      shell: process.platform === "win32" && command.toLowerCase().endsWith(".cmd"),
       maxBuffer: 16 * 1024 * 1024,
     });
     child.stdout?.pipe(process.stdout);
