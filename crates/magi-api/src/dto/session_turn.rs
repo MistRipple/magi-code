@@ -8,6 +8,7 @@ use magi_session_store::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::SessionScopeKindDto;
 
@@ -316,6 +317,55 @@ impl SessionTurnRequestDto {
                 SessionTurnImage::from_data_url(image.name.clone(), image.data_url.clone())
             })
             .collect()
+    }
+
+    /// 生成 App Server Turn 的稳定幂等指纹。
+    ///
+    /// 指纹只描述用户提交的完整请求，不包含服务端补齐的队列身份或解析后的浏览器
+    /// 标记对象。这样请求在 HTTP、WebSocket、排队和重启恢复之间仍然使用同一身份，
+    /// 同时不会把图片内容或会话配置原文写入持久化元数据。
+    pub fn request_fingerprint(&self) -> Result<String, String> {
+        let mut normalized = self.clone();
+        normalized.validate_context_references()?;
+        let context_references = normalized
+            .context_references()
+            .into_iter()
+            .map(|reference| {
+                serde_json::json!({
+                    "kind": match reference.kind {
+                        SessionContextReferenceKind::File => "file",
+                        SessionContextReferenceKind::Directory => "directory",
+                    },
+                    "path": reference.path,
+                    "name": reference.name,
+                })
+            })
+            .collect::<Vec<_>>();
+        let canonical_request = serde_json::json!({
+            "sessionId": normalized.requested_session_id().map(|id| id.to_string()),
+            "scope": normalized.scope,
+            "workspaceId": normalized.requested_workspace_id(),
+            "workspacePath": normalized.requested_workspace_path(),
+            "text": normalized.trimmed_text(),
+            "skillName": trimmed_non_empty(normalized.skill_name.as_deref()),
+            "locale": trimmed_non_empty(normalized.locale.as_deref()),
+            "goalMode": normalized.goal_mode,
+            "images": normalized.images,
+            "contextReferences": context_references,
+            "browserAnnotationRefs": normalized.browser_annotation_refs(),
+            "accessProfile": normalized.requested_access_profile(),
+            "orchestratorSessionConfig": normalized.orchestrator_session_config,
+            "requestId": normalized.request_id(),
+            "userMessageId": normalized.user_message_id(),
+            "placeholderMessageId": normalized.placeholder_message_id(),
+            "steerCurrentTurn": normalized.steer_current_turn,
+            "expectedTurnId": normalized.expected_turn_id(),
+            "replaceTurnId": normalized.replace_turn_id(),
+        });
+        let bytes = serde_json::to_vec(&canonical_request)
+            .map_err(|error| format!("序列化 Turn 请求指纹失败: {error}"))?;
+        let digest = Sha256::digest(bytes);
+        Ok(format!("sha256:{digest:x}"))
     }
 }
 
@@ -695,5 +745,41 @@ mod tests {
             .validate_context_references()
             .expect("path ref should validate");
         assert_eq!(references[0].path, root.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn request_fingerprint_covers_control_fields_and_normalizes_transport_whitespace() {
+        let mut request: SessionTurnRequestDto = serde_json::from_value(serde_json::json!({
+            "scope": "personal",
+            "text": "  inspect  ",
+            "skillName": "  browser  ",
+            "locale": "  zh-CN  ",
+            "requestId": "request-fingerprint",
+            "browserAnnotationRefs": [" annotation-1 "],
+            "orchestratorSessionConfig": {"model": "test-model"}
+        }))
+        .expect("request should deserialize");
+        let fingerprint = request
+            .request_fingerprint()
+            .expect("fingerprint should be generated");
+
+        request.text = Some("inspect".to_string());
+        request.skill_name = Some("browser".to_string());
+        request.locale = Some("zh-CN".to_string());
+        request.browser_annotation_refs = vec!["annotation-1".to_string()];
+        assert_eq!(
+            request
+                .request_fingerprint()
+                .expect("normalized request should hash"),
+            fingerprint
+        );
+
+        request.steer_current_turn = true;
+        assert_ne!(
+            request
+                .request_fingerprint()
+                .expect("changed request should hash"),
+            fingerprint
+        );
     }
 }

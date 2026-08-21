@@ -388,6 +388,9 @@ pub(crate) async fn submit_session_turn(
     let images = request
         .parsed_images()
         .map_err(|error| ApiError::InvalidInput(format!("图片输入无效: {error}")))?;
+    let request_fingerprint = request
+        .request_fingerprint()
+        .map_err(ApiError::InvalidInput)?;
     let accepted_at = super::monotonic_accepted_at();
     let requested_workspace_id = request.requested_workspace_id();
     let requested_workspace_path = request.requested_workspace_path();
@@ -571,6 +574,7 @@ pub(crate) async fn submit_session_turn(
                     request_id: signal.request_id,
                     user_message_id: signal.user_message_id,
                     placeholder_message_id: signal.placeholder_message_id,
+                    request_fingerprint: Some(request_fingerprint),
                     orchestrator_thread_id,
                 })?;
             finalize_continue_session(state.clone(), accepted.clone(), accepted_at);
@@ -639,6 +643,9 @@ fn enqueue_session_turn_response(
         workspace_id,
     } = input;
     let queue_id = format!("queued-session-turn-{}-{}", session_id, accepted_at.0);
+    let request_fingerprint = request
+        .request_fingerprint()
+        .map_err(ApiError::InvalidInput)?;
     if request.request_id().is_none() {
         request.request_id = Some(format!("request-{queue_id}"));
     }
@@ -648,6 +655,7 @@ fn enqueue_session_turn_response(
     request.user_message_id = Some(user_message_item_id.clone());
     let queue_position = state.enqueue_regular_session_turn(QueuedRegularSessionTurn {
         request,
+        request_fingerprint: Some(request_fingerprint),
         requested_workspace_id,
         accepted_at,
         route: decision.route,
@@ -721,6 +729,9 @@ async fn submit_steer_current_turn(
     let entry_id = format!("timeline-{}-{}", session_id, accepted_at.0);
     let request_id = request.request_id();
     let user_message_id = request.user_message_id();
+    let request_fingerprint = request
+        .request_fingerprint()
+        .map_err(ApiError::InvalidInput)?;
     let (user_message_item_id, mut user_message_item) =
         build_user_message_turn_item(UserMessageTurnItemInput {
             accepted_at,
@@ -729,10 +740,18 @@ async fn submit_steer_current_turn(
             request_id: request_id.clone(),
             user_message_id: user_message_id.clone(),
             placeholder_message_id: None,
-            metadata: std::collections::HashMap::from([(
-                "route".to_string(),
-                serde_json::Value::String("steer".to_string()),
-            )]),
+            metadata: {
+                std::collections::HashMap::from([
+                    (
+                        "route".to_string(),
+                        serde_json::Value::String("steer".to_string()),
+                    ),
+                    (
+                        "requestFingerprint".to_string(),
+                        serde_json::Value::String(request_fingerprint),
+                    ),
+                ])
+            },
             task_id: None,
             source_thread_id: orchestrator_thread_id,
         });
@@ -2254,7 +2273,10 @@ async fn submit_mainline_session_turn(
             completion_contract: decision.completion_contract.clone(),
             recovery_checkpoint: decision.recovery_checkpoint.clone(),
             denied_tools: session_turn_denied_tools(&request),
-            route: Some(session_turn_route_name(route).to_string()),
+            user_message_metadata: std::collections::HashMap::from([(
+                "route".to_string(),
+                serde_json::Value::String(session_turn_route_name(route).to_string()),
+            )]),
         },
     )
     .await?;
@@ -3055,6 +3077,7 @@ struct ContinueUserMessageInput<'a> {
     request_id: Option<String>,
     user_message_id: Option<String>,
     placeholder_message_id: Option<String>,
+    request_fingerprint: Option<String>,
     orchestrator_thread_id: magi_core::ThreadId,
 }
 
@@ -3069,6 +3092,7 @@ fn write_continue_user_message(
         request_id,
         user_message_id,
         placeholder_message_id,
+        request_fingerprint,
         orchestrator_thread_id,
     } = input;
     let entry_id = format!("timeline-{}-{}", accepted.session_id, continued_at.0);
@@ -3083,10 +3107,19 @@ fn write_continue_user_message(
             request_id,
             user_message_id,
             placeholder_message_id,
-            metadata: std::collections::HashMap::from([(
-                "route".to_string(),
-                serde_json::Value::String("continue".to_string()),
-            )]),
+            metadata: {
+                let mut metadata = std::collections::HashMap::from([(
+                    "route".to_string(),
+                    serde_json::Value::String("continue".to_string()),
+                )]);
+                if let Some(request_fingerprint) = request_fingerprint {
+                    metadata.insert(
+                        "requestFingerprint".to_string(),
+                        serde_json::Value::String(request_fingerprint),
+                    );
+                }
+                metadata
+            },
             task_id: Some(accepted.action_task_id.clone()),
             source_thread_id: orchestrator_thread_id,
         });
@@ -3562,6 +3595,7 @@ async fn execute_session_continue(
         request_id,
         user_message_id,
         placeholder_message_id,
+        request_fingerprint: None,
         orchestrator_thread_id,
     })?;
     finalize_continue_session(state.clone(), accepted.clone(), continued_at);
@@ -4838,6 +4872,7 @@ mod tests {
         request.placeholder_message_id = Some(format!("assistant-{queue_id}"));
         QueuedRegularSessionTurn {
             request,
+            request_fingerprint: None,
             requested_workspace_id: Some(workspace_id.clone()),
             accepted_at,
             route: SessionTurnRouteDto::Chat,
@@ -6687,6 +6722,7 @@ mod tests {
             request_id: None,
             user_message_id: None,
             placeholder_message_id: None,
+            request_fingerprint: None,
             orchestrator_thread_id: magi_core::ThreadId::new(
                 "thread-orchestrator-continue-new-turn",
             ),
@@ -9165,6 +9201,7 @@ mod tests {
         state
             .enqueue_regular_session_turn(QueuedRegularSessionTurn {
                 request: session_turn_request("排队消息"),
+                request_fingerprint: None,
                 requested_workspace_id: Some(workspace_id.clone()),
                 accepted_at: UtcMillis(13),
                 route: SessionTurnRouteDto::Chat,

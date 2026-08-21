@@ -668,7 +668,7 @@ async fn start_turn_once(
             .session_store
             .canonical_turn_for_request_id(request_id)
     }) {
-        if !request_matches_canonical_turn(state, &request, &existing_turn) {
+        if !request_matches_canonical_turn(&request, &existing_turn) {
             return error_response(
                 request_id,
                 ErrorObject::new(
@@ -760,28 +760,9 @@ async fn start_turn_once(
 }
 
 fn request_matches_canonical_turn(
-    state: &ApiState,
     request: &crate::dto::SessionTurnRequestDto,
     turn: &magi_session_store::CanonicalTurn,
 ) -> bool {
-    if let Some(requested_session_id) = request.requested_session_id()
-        && requested_session_id != turn.session_id
-    {
-        return false;
-    }
-    let Some(session) = state.session_store.session(&turn.session_id) else {
-        return false;
-    };
-    let requested_workspace_id = request.requested_workspace_id();
-    let scope_matches = match request.scope {
-        crate::dto::SessionScopeKindDto::Personal => session.workspace_id.is_none(),
-        crate::dto::SessionScopeKindDto::Workspace => {
-            session.workspace_id.as_deref() == requested_workspace_id.as_deref()
-        }
-    };
-    if !scope_matches {
-        return false;
-    }
     let Some(user_item) = turn
         .items
         .iter()
@@ -789,87 +770,24 @@ fn request_matches_canonical_turn(
     else {
         return false;
     };
-    if user_item.content.as_deref()
-        != Some(
-            request
-                .timeline_message(request.trimmed_text().as_deref())
-                .as_str(),
-        )
-    {
+    let Some(request_fingerprint) = request.request_fingerprint().ok() else {
         return false;
-    }
-    let metadata = &user_item.metadata;
-    if let Some(user_message_id) = request.user_message_id()
-        && metadata.get("userMessageId").and_then(Value::as_str) != Some(user_message_id.as_str())
-    {
-        return false;
-    }
-    if let Some(placeholder_message_id) = request.placeholder_message_id()
-        && metadata.get("placeholderMessageId").and_then(Value::as_str)
-            != Some(placeholder_message_id.as_str())
-    {
-        return false;
-    }
-    if request
-        .skill_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        != metadata.get("skillName").and_then(Value::as_str)
-    {
-        return false;
-    }
-    if request.goal_mode
-        != metadata
-            .get("goalMode")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    {
-        return false;
-    }
-    let request_images = serde_json::to_value(&request.images).unwrap_or_else(|_| json!([]));
-    let stored_images = metadata.get("images").cloned().unwrap_or_else(|| json!([]));
-    if request_images != stored_images {
-        return false;
-    }
-    let request_annotations = json!(request.browser_annotation_refs);
-    let stored_annotations = metadata
-        .get("browserAnnotationRefs")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    if request_annotations != stored_annotations {
-        return false;
-    }
-    true
+    };
+    user_item
+        .metadata
+        .get("requestFingerprint")
+        .and_then(Value::as_str)
+        == Some(request_fingerprint.as_str())
 }
 
 fn request_matches_queued_turn(
     request: &crate::dto::SessionTurnRequestDto,
     queued: &crate::state::QueuedRegularSessionTurn,
 ) -> bool {
-    if let Some(requested_session_id) = request.requested_session_id()
-        && requested_session_id != queued.session_id
-    {
+    let Some(request_fingerprint) = request.request_fingerprint().ok() else {
         return false;
-    }
-    if request.scope == crate::dto::SessionScopeKindDto::Personal && queued.workspace_id.is_some() {
-        return false;
-    }
-    if request.scope == crate::dto::SessionScopeKindDto::Workspace {
-        let requested_workspace_id = request.requested_workspace_id();
-        let queued_workspace_id = queued.workspace_id.as_ref().map(ToString::to_string);
-        if queued_workspace_id.as_deref() != requested_workspace_id.as_deref() {
-            return false;
-        }
-    }
-    request.timeline_message(request.trimmed_text().as_deref())
-        == queued
-            .request
-            .timeline_message(queued.request.trimmed_text().as_deref())
-        && request.user_message_id() == queued.request.user_message_id()
-        && request.skill_name.as_deref().map(str::trim)
-            == queued.request.skill_name.as_deref().map(str::trim)
-        && request.goal_mode == queued.request.goal_mode
+    };
+    queued.request_fingerprint.as_deref() == Some(request_fingerprint.as_str())
 }
 
 async fn handle_notification(
@@ -1078,11 +996,15 @@ fn send_protocol_error(
 mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
-    use magi_core::{EventId, UtcMillis};
+    use magi_core::{EventId, TaskCompletionContract, TaskTier, ThreadId, UtcMillis};
     use magi_event_bus::EventCategory;
     use magi_governance::GovernanceService;
-    use magi_session_store::SessionStore;
+    use magi_session_store::{
+        CanonicalTurn, CanonicalTurnItem, CanonicalTurnItemKind, CanonicalTurnItemStatus,
+        CanonicalTurnStatus, CanonicalTurnVisibility, SessionStore,
+    };
     use magi_workspace::WorkspaceStore;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -1147,6 +1069,102 @@ mod tests {
         assert!(snapshot_requires_resync(&snapshot, 3));
         assert!(!snapshot_requires_resync(&snapshot, 4));
         assert!(!snapshot_requires_resync(&snapshot, 0));
+    }
+
+    #[test]
+    fn queued_turn_replay_requires_the_persisted_complete_request_fingerprint() {
+        let request: crate::dto::SessionTurnRequestDto = serde_json::from_value(json!({
+            "scope": "personal",
+            "text": "inspect browser",
+            "requestId": "request-queued-fingerprint"
+        }))
+        .expect("request should deserialize");
+        let fingerprint = request
+            .request_fingerprint()
+            .expect("request fingerprint should generate");
+        let queued = crate::state::QueuedRegularSessionTurn {
+            request: request.clone(),
+            request_fingerprint: Some(fingerprint),
+            requested_workspace_id: None,
+            accepted_at: UtcMillis(1),
+            route: crate::dto::SessionTurnRouteDto::Chat,
+            task_title: None,
+            execution_goal: None,
+            task_tier: TaskTier::ExecutionChain,
+            tool_intent: None,
+            forced_tool_name: None,
+            goal_mode: false,
+            required_tool_chain: Vec::new(),
+            completion_contract: TaskCompletionContract::default(),
+            recovery_checkpoint: None,
+            session_id: SessionId::new("session-queued-fingerprint"),
+            workspace_id: None,
+            queue_id: "queue-fingerprint".to_string(),
+            retry_count: 0,
+        };
+        assert!(request_matches_queued_turn(&request, &queued));
+
+        let mut changed = request.clone();
+        changed.locale = Some("en-US".to_string());
+        assert!(!request_matches_queued_turn(&changed, &queued));
+
+        let mut legacy = queued;
+        legacy.request_fingerprint = None;
+        assert!(!request_matches_queued_turn(&request, &legacy));
+    }
+
+    #[test]
+    fn canonical_turn_replay_requires_the_same_complete_request_fingerprint() {
+        let request: crate::dto::SessionTurnRequestDto = serde_json::from_value(json!({
+            "scope": "personal",
+            "text": "inspect browser",
+            "requestId": "request-canonical-fingerprint"
+        }))
+        .expect("request should deserialize");
+        let fingerprint = request
+            .request_fingerprint()
+            .expect("request fingerprint should generate");
+        let session_id = SessionId::new("session-canonical-fingerprint");
+        let turn = CanonicalTurn {
+            session_id: session_id.clone(),
+            turn_id: "turn-canonical-fingerprint".to_string(),
+            turn_seq: 1,
+            accepted_at: UtcMillis(1),
+            completed_at: None,
+            status: CanonicalTurnStatus::Running,
+            response_duration_ms: None,
+            usage: None,
+            items: vec![CanonicalTurnItem {
+                session_id,
+                turn_id: "turn-canonical-fingerprint".to_string(),
+                turn_seq: 1,
+                item_id: "user-canonical-fingerprint".to_string(),
+                item_seq: 0,
+                kind: CanonicalTurnItemKind::UserMessage,
+                created_at: UtcMillis(1),
+                status: CanonicalTurnItemStatus::Completed,
+                item_version: None,
+                updated_at: UtcMillis(1),
+                title: None,
+                content: Some("inspect browser".to_string()),
+                blocks: Vec::new(),
+                tool: None,
+                worker: None,
+                source_thread_id: ThreadId::new("thread-canonical-fingerprint"),
+                visibility: CanonicalTurnVisibility::default(),
+                metadata: HashMap::from([("requestFingerprint".to_string(), json!(fingerprint))]),
+            }],
+            metadata: HashMap::new(),
+        };
+        assert!(request_matches_canonical_turn(&request, &turn));
+
+        let mut changed = request.clone();
+        changed.access_profile = Some(magi_core::AccessProfile::ReadOnly);
+        assert!(!request_matches_canonical_turn(&changed, &turn));
+
+        let mut legacy = turn;
+        legacy.items[0].metadata.remove("requestFingerprint");
+        assert!(!request_matches_canonical_turn(&request, &legacy));
     }
 
     #[tokio::test]
@@ -1227,13 +1245,25 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_route_completes_handshake_subscription_and_control_ping() {
+        let event_bus = Arc::new(magi_event_bus::InMemoryEventBus::new(32));
+        let session_store = Arc::new(SessionStore::default());
+        let session_id = SessionId::new("session-app-server-read");
+        session_store
+            .create_session_for_workspace_at(
+                session_id.clone(),
+                "App Server integration",
+                Some("workspace-test".to_string()),
+                UtcMillis(1),
+            )
+            .expect("集成测试会话应创建");
         let state = ApiState::new(
             "magi-test",
-            Arc::new(magi_event_bus::InMemoryEventBus::new(32)),
-            Arc::new(SessionStore::default()),
+            event_bus,
+            session_store,
             Arc::new(WorkspaceStore::default()),
             Arc::new(GovernanceService::default()),
         );
+        let event_state = state.clone();
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("测试监听器应绑定");
@@ -1321,8 +1351,31 @@ mod tests {
         assert_eq!(listed["id"], 2);
         assert_eq!(
             listed["result"]["sessions"].as_array().map(Vec::len),
-            Some(0)
+            Some(1)
         );
+
+        let read = send_request(
+            &mut socket,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "read-1",
+                "method": "session/read",
+                "params": {"sessionId": session_id, "includeTurns": true}
+            }),
+            "read-1",
+        )
+        .await;
+        assert_eq!(read["result"]["session"]["title"], "App Server integration");
+        assert_eq!(read["result"]["turns"].as_array().map(Vec::len), Some(0));
+
+        event_state.event_bus.publish(event(
+            1,
+            Some("session-app-server-read"),
+            Some("workspace-test"),
+        ));
+        let event_notification = next_text_message(&mut socket).await;
+        assert_eq!(event_notification["method"], "event/session.changed");
+        assert_eq!(event_notification["params"]["event"]["sequence"], 1);
 
         socket
             .send(ClientMessage::Ping(vec![1, 2, 3].into()))

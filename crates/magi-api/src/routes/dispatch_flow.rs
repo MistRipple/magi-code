@@ -62,7 +62,7 @@ pub(super) async fn accept_session_task_submission(
             completion_contract: TaskCompletionContract::default(),
             recovery_checkpoint: None,
             denied_tools: Vec::new(),
-            route: None,
+            user_message_metadata: Default::default(),
         },
     )
     .await
@@ -79,8 +79,8 @@ pub(super) struct SessionTaskSubmissionInput {
     pub completion_contract: TaskCompletionContract,
     pub recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
     pub denied_tools: Vec<String>,
-    /// 提交路由属于 API 语义，写入 canonical user item 供 App Server 重放。
-    pub route: Option<String>,
+    /// API 语义元数据与幂等指纹一起原子写入 canonical user item。
+    pub user_message_metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
 pub(super) async fn accept_session_task_submission_at(
@@ -99,8 +99,15 @@ pub(super) async fn accept_session_task_submission_at(
         completion_contract,
         recovery_checkpoint,
         denied_tools,
-        route,
+        mut user_message_metadata,
     } = input;
+    let request_fingerprint = request
+        .request_fingerprint()
+        .map_err(ApiError::InvalidInput)?;
+    user_message_metadata.insert(
+        "requestFingerprint".to_string(),
+        serde_json::Value::String(request_fingerprint),
+    );
     let trimmed_text = request.trimmed_text();
     let message = request.timeline_message(trimmed_text.as_deref());
     let mission_title = task_title
@@ -134,7 +141,7 @@ pub(super) async fn accept_session_task_submission_at(
             completion_contract,
             recovery_checkpoint,
             denied_tools,
-            route,
+            user_message_metadata,
         },
     )
     .await
@@ -224,7 +231,7 @@ struct ExecuteDispatchSubmissionInput<'a> {
     completion_contract: TaskCompletionContract,
     recovery_checkpoint: Option<TaskRecoveryCheckpoint>,
     denied_tools: Vec<String>,
-    route: Option<String>,
+    user_message_metadata: std::collections::HashMap<String, serde_json::Value>,
 }
 
 fn initial_session_orchestrator_config(
@@ -281,7 +288,7 @@ async fn execute_dispatch_submission(
         completion_contract,
         recovery_checkpoint,
         denied_tools,
-        route,
+        user_message_metadata,
     } = input;
     let placeholder_title = crate::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
     let (session_id, created_session, workspace_id) = resolve_dispatch_session(
@@ -373,14 +380,7 @@ async fn execute_dispatch_submission(
         recovery_checkpoint,
         denied_tools,
         turn_origin: DispatchTurnOrigin::User,
-        user_message_metadata: route
-            .map(|route| {
-                std::collections::HashMap::from([(
-                    "route".to_string(),
-                    serde_json::Value::String(route),
-                )])
-            })
-            .unwrap_or_default(),
+        user_message_metadata,
     };
     let accepted = match submit_dispatch_submission(state, dispatch) {
         Ok(accepted) => accepted,

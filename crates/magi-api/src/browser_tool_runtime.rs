@@ -309,8 +309,8 @@ impl BrowserToolRuntimeDependencies {
                         "browser_viewport action 不合法",
                     ));
                 }
-                let mode = optional_string(arguments, "mode")
-                    .unwrap_or_else(|| "fixed".to_string());
+                let mode =
+                    optional_string(arguments, "mode").unwrap_or_else(|| "fixed".to_string());
                 if mode == "auto" {
                     let _control_guard = self.control_lock.lock().await;
                     let tab = tab_in_session(self, &browser_session, &tab.tab_id)?;

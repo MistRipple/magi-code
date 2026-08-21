@@ -155,6 +155,10 @@ fn snapshot_baseline_patch(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct QueuedRegularSessionTurn {
     pub request: SessionTurnRequestDto,
+    /// 用户提交请求的完整幂等指纹。服务端补齐 requestId/userMessageId 前计算，
+    /// 重启恢复后只允许同一份原始请求重放，不再依赖被 normalize 的 request 做猜测。
+    #[serde(default)]
+    pub request_fingerprint: Option<String>,
     /// 请求所属会话作用域。`None` 明确表示个人会话，不能在出队时补成当前项目。
     pub requested_workspace_id: Option<WorkspaceId>,
     pub accepted_at: UtcMillis,
@@ -3432,6 +3436,13 @@ impl ApiState {
         &self,
         mut turn: QueuedRegularSessionTurn,
     ) -> Result<usize, ApiError> {
+        if turn.request_fingerprint.is_none() {
+            turn.request_fingerprint = Some(
+                turn.request
+                    .request_fingerprint()
+                    .map_err(ApiError::InvalidInput)?,
+            );
+        }
         turn.normalize_identity();
         let session_id = turn.session_id.clone();
         let mut queues = self
@@ -4235,6 +4246,7 @@ mod tests {
                 expected_turn_id: None,
                 replace_turn_id: None,
             },
+            request_fingerprint: None,
             requested_workspace_id: Some(workspace_id.clone()),
             accepted_at: UtcMillis(accepted_at),
             route: SessionTurnRouteDto::Chat,
